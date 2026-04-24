@@ -1,0 +1,20 @@
+{
+  "test_id": "play-casa1-tetris",
+  "build_id": "casa1-0.1.0",
+  "os_build": "macos-aarch64",
+  "stdout": "",
+  "stderr": "",
+  "exit_code": 0,
+  "guest_exceptions": [],
+  "file_manifest_delta": [],
+  "registry_delta": [],
+  "network_summary": [],
+  "gfx_frames": [],
+  "perf": [
+    {
+      "metric_id": "pe_runtime_steps",
+      "value": 391441.0,
+      "unit": "instructions"
+    }
+  ]
+}

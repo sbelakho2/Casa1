@@ -1,0 +1,51 @@
+[package]
+name = "casa1-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.casa1]
+path = ".."
+
+[[bin]]
+name = "pe_parser"
+path = "fuzz_targets/pe_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dxil_parser"
+path = "fuzz_targets/dxil_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "msi_parser"
+path = "fuzz_targets/msi_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "media_container"
+path = "fuzz_targets/media_container.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "http_headers"
+path = "fuzz_targets/http_headers.rs"
+test = false
+doc = false
+bench = false

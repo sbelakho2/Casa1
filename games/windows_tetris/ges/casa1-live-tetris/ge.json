@@ -1,0 +1,28 @@
+{
+  "schema_version": 2,
+  "name": "casa1-live-tetris",
+  "arch": "x64",
+  "winver": "win11-23h2",
+  "user_name": "casa1",
+  "long_paths_enabled": false,
+  "drive_mappings": [
+    {
+      "drive": "C",
+      "target": "<GE>/drive_c",
+      "read_only": false,
+      "enabled": true,
+      "requires_permission": false
+    },
+    {
+      "drive": "Z",
+      "target": "/",
+      "read_only": true,
+      "enabled": false,
+      "requires_permission": true
+    }
+  ],
+  "override_profiles": [],
+  "fs_state": {
+    "entries": {}
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "schema_version": 1,
+  "name": "replay",
+  "arch": "x64",
+  "winver": "win11-23h2"
+}

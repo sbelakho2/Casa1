@@ -1,0 +1,32 @@
+# Rust build outputs
+target/
+
+# cargo-fuzz outputs
+fuzz/artifacts/
+fuzz/coverage/
+fuzz/target/
+
+# Coverage and profiling byproducts
+coverage/
+*.profraw
+*.profdata
+
+# Local editor and OS noise
+.DS_Store
+.idea/
+*.swp
+*.swo
+*~
+
+# Scratch space in the repo root
+tmp/
+
+# Runtime GE outputs under checked-in fixtures.
+# Keep ge.json and drive_c/ trackable; ignore generated runtime churn.
+ges/*/cache/
+ges/*/logs/
+ges/*/tmp/
+ges/*/traces/
+ges/*/reports/
+ges/*/diagnostics/
+ges/*/registry/*.db
