@@ -129,6 +129,9 @@ pub struct FindData {
     pub is_directory: bool,
     pub size: u64,
     pub attributes: Vec<String>,
+    pub creation_time_ticks: u64,
+    pub last_access_time_ticks: u64,
+    pub last_write_time_ticks: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -143,6 +146,8 @@ pub struct OverlappedResult {
 pub struct CreateProcessResult {
     pub process_handle: Handle,
     pub thread_handle: Handle,
+    pub process_id: u32,
+    pub thread_id: u32,
     pub argv: Vec<String>,
     pub environment_block_utf16: Vec<u16>,
 }
@@ -448,6 +453,46 @@ impl Win32Subsystem {
         &self.ge
     }
 
+    pub fn current_thread_handle(&mut self) -> Handle {
+        if let Some(handle) = self.handles.iter().find_map(|(handle, entry)| match &entry.object {
+            KernelObject::Thread(thread) if thread.thread_id == self.current_thread_id => Some(*handle),
+            _ => None,
+        }) {
+            handle
+        } else {
+            self.insert_object(
+                ObjectType::Thread,
+                0x1F03FF,
+                false,
+                KernelObject::Thread(ThreadObject {
+                    thread_id: self.current_thread_id,
+                    exit_code: None,
+                    priority: 0,
+                    tls: BTreeMap::new(),
+                }),
+            )
+        }
+    }
+
+    pub fn guest_path_to_host_path(&self, path: &str) -> AppResult<PathBuf> {
+        let (_, host_path) = self.resolve_host_path(path)?;
+        Ok(host_path)
+    }
+
+    pub fn stage_host_file_w(&mut self, source: &Path, guest_path: &str) -> AppResult<PathBuf> {
+        let (normalized_path, host_path) = self.resolve_host_path(guest_path)?;
+        self.ensure_parent_exists(&host_path)?;
+        fs::copy(source, &host_path).map_err(|error| {
+            AppError::from_io(
+                ReasonCode::RcIo,
+                format!("failed to copy {} to {}", source.display(), host_path.display()),
+                &error,
+            )
+        })?;
+        self.sync_entry(&normalized_path, &host_path, false)?;
+        Ok(host_path)
+    }
+
     pub fn describe_handle(&self, handle: Handle) -> AppResult<HandleDescriptor> {
         Ok(self.handle_entry(handle)?.descriptor.clone())
     }
@@ -721,9 +766,30 @@ impl Win32Subsystem {
         creation: CreationDisposition,
         inheritable: bool,
         overlapped: bool,
+        backup_semantics: bool,
     ) -> AppResult<Handle> {
         let (normalized_path, host_path) = self.resolve_host_path(path)?;
         let exists = host_path.exists();
+        if exists && host_path.is_dir() {
+            if !backup_semantics || !matches!(creation, CreationDisposition::OpenExisting | CreationDisposition::OpenAlways) {
+                return Err(AppError::new(
+                    ReasonCode::RcIo,
+                    format!("directory handle requires backup semantics: {}", normalized_path),
+                ));
+            }
+            return Ok(self.insert_object(
+                ObjectType::File,
+                0x12019f,
+                inheritable,
+                KernelObject::File(FileObject {
+                    normalized_path,
+                    host_path,
+                    ge_handle: None,
+                    position: 0,
+                    overlapped,
+                }),
+            ));
+        }
         match creation {
             CreationDisposition::CreateNew if exists => {
                 return Err(AppError::new(
@@ -894,6 +960,28 @@ impl Win32Subsystem {
         }
     }
 
+    pub fn set_file_time(
+        &mut self,
+        handle: Handle,
+        creation_time_ticks: Option<u64>,
+        last_access_time_ticks: Option<u64>,
+        last_write_time_ticks: Option<u64>,
+    ) -> AppResult<()> {
+        let normalized_path = {
+            let entry = self.handle_entry(handle)?;
+            match &entry.object {
+                KernelObject::File(file) => file.normalized_path.clone(),
+                _ => return invalid_handle("handle is not a file"),
+            }
+        };
+        self.ge.set_file_times(
+            &normalized_path,
+            creation_time_ticks,
+            last_access_time_ticks,
+            last_write_time_ticks,
+        )
+    }
+
     pub fn get_file_attributes_w(&self, path: &str) -> AppResult<Vec<String>> {
         Ok(self.ge.get_file_metadata(path)?.attributes)
     }
@@ -906,6 +994,22 @@ impl Win32Subsystem {
         self.ge.create_directory(path, self.time.dtm)
     }
 
+    pub fn write_file_overwrite_w(&mut self, path: &str, contents: &[u8]) -> AppResult<String> {
+        self.ge.write_file_overwrite(path, contents, self.time.dtm)
+    }
+
+    pub fn sync_existing_path_w(&mut self, path: &str) -> AppResult<()> {
+        let (normalized_path, host_path) = self.resolve_host_path(path)?;
+        let metadata = fs::metadata(&host_path).map_err(|error| {
+            AppError::from_io(
+                ReasonCode::RcFsNotFound,
+                format!("failed to stat {}", host_path.display()),
+                &error,
+            )
+        })?;
+        self.sync_entry(&normalized_path, &host_path, metadata.is_dir())
+    }
+
     pub fn remove_directory_w(&mut self, path: &str) -> AppResult<()> {
         let (normalized_path, host_path) = self.resolve_host_path(path)?;
         fs::remove_dir(&host_path).map_err(|error| {
@@ -916,15 +1020,23 @@ impl Win32Subsystem {
     }
 
     pub fn find_first_file_w(&mut self, path: &str) -> AppResult<(Handle, FindData)> {
-        let (normalized_path, _) = self.resolve_host_path(path)?;
-        let entries = self
-            .ge
-            .enumerate_directory(path)?
-            .into_iter()
-            .map(|name| self.find_data_for_child(&normalized_path, &name))
-            .collect::<AppResult<Vec<_>>>()?;
+        let (directory_path, pattern) = split_find_search_pattern(path);
+        let (normalized_directory, _) = self.resolve_host_path(&directory_path)?;
+        let entries = if contains_find_wildcards(&pattern) {
+            self.ge
+                .enumerate_directory(&directory_path)?
+                .into_iter()
+                .filter(|name| windows_pattern_matches(&pattern, name))
+                .map(|name| self.find_data_for_child(&normalized_directory, &name))
+                .collect::<AppResult<Vec<_>>>()?
+        } else {
+            vec![self.find_data_for_child(&normalized_directory, &pattern)?]
+        };
         let first = entries.first().cloned().ok_or_else(|| {
-            AppError::new(ReasonCode::RcFsNotFound, format!("{} is empty", normalized_path))
+            AppError::new(
+                ReasonCode::RcFsNotFound,
+                format!("{} matched no entries", path),
+            )
         })?;
         let handle = self.insert_object(
             ObjectType::DirectorySearch,
@@ -1007,18 +1119,26 @@ impl Win32Subsystem {
     }
 
     pub fn get_temp_path_w(&mut self) -> AppResult<String> {
-        let path = format!("C:\\users\\{}\\AppData\\Local\\Temp", self.ge.config.user_name);
-        let host = self.ge.root.join("tmp");
-        fs::create_dir_all(&host).map_err(|error| {
-            AppError::from_io(ReasonCode::RcIo, format!("failed to create {}", host.display()), &error)
+        let path = format!("C:\\users\\{}\\AppData\\Local\\Temp\\", self.ge.config.user_name);
+        let (_, host_path) = self.resolve_host_path(path.trim_end_matches(['\\', '/']))?;
+        fs::create_dir_all(&host_path).map_err(|error| {
+            AppError::from_io(ReasonCode::RcIo, format!("failed to create {}", host_path.display()), &error)
         })?;
         Ok(path)
     }
 
-    pub fn get_temp_file_name_w(&mut self, prefix: &str) -> AppResult<String> {
-        let temp_path = self.get_temp_path_w()?;
+    pub fn get_temp_file_name_w(&mut self, directory: &str, prefix: &str) -> AppResult<String> {
+        let temp_path = if directory.is_empty() {
+            self.get_temp_path_w()?
+        } else {
+            directory.to_string()
+        };
+        let (normalized_directory, host_directory) = self.resolve_host_path(temp_path.trim_end_matches(['\\', '/']))?;
+        fs::create_dir_all(&host_directory).map_err(|error| {
+            AppError::from_io(ReasonCode::RcIo, format!("failed to create {}", host_directory.display()), &error)
+        })?;
         let name = format!("{}{:04}.tmp", prefix, self.next_handle);
-        let full = format!("{}\\{}", temp_path, name);
+        let full = format!("{}\\{}", normalized_directory.trim_end_matches(['\\', '/']), name);
         let (normalized_path, host_path) = self.resolve_host_path(&full)?;
         self.ensure_parent_exists(&host_path)?;
         fs::write(&host_path, []).map_err(|error| {
@@ -1448,6 +1568,8 @@ impl Win32Subsystem {
         Ok(CreateProcessResult {
             process_handle,
             thread_handle,
+            process_id,
+            thread_id,
             argv,
             environment_block_utf16: build_environment_block_utf16(env),
         })
@@ -1461,6 +1583,17 @@ impl Win32Subsystem {
                 Ok(())
             }
             _ => invalid_handle("handle is not a process"),
+        }
+    }
+
+    pub fn set_thread_exit_code(&mut self, handle: Handle, exit_code: u32) -> AppResult<()> {
+        let entry = self.handle_entry_mut(handle)?;
+        match &mut entry.object {
+            KernelObject::Thread(thread) => {
+                thread.exit_code = Some(exit_code);
+                Ok(())
+            }
+            _ => invalid_handle("handle is not a thread"),
         }
     }
 
@@ -1672,6 +1805,57 @@ impl Win32Subsystem {
         )
     }
 
+    pub fn registry_key_exists(&self, hive: &str, key: &str, view: RegistryView) -> AppResult<bool> {
+        self.ge.registry_key_exists(hive, key, view)
+    }
+
+    pub fn create_registry_key(&self, hive: &str, key: &str, view: RegistryView) -> AppResult<bool> {
+        self.ge.registry_create_key(hive, key, view)
+    }
+
+    pub fn registry_get_value(
+        &self,
+        hive: &str,
+        key: &str,
+        value_name: &str,
+        view: RegistryView,
+    ) -> AppResult<Option<crate::ge::StoredRegistryValue>> {
+        self.ge.registry_get_value(hive, key, value_name, view)
+    }
+
+    pub fn ensure_default_locale_registry(&self) -> AppResult<()> {
+        self.ensure_registry_string_value(
+            "HKCU",
+            "Control Panel\\Desktop\\ResourceLocale",
+            "",
+            "00000409",
+            RegistryView::Native,
+        )?;
+        self.ensure_registry_string_value(
+            "HKCU",
+            "Control Panel\\International",
+            "Locale",
+            "00000409",
+            RegistryView::Native,
+        )?;
+        Ok(())
+    }
+
+    fn ensure_registry_string_value(
+        &self,
+        hive: &str,
+        key: &str,
+        value_name: &str,
+        value: &str,
+        view: RegistryView,
+    ) -> AppResult<()> {
+        if self.ge.registry_get_value(hive, key, value_name, view)?.is_none() {
+            self.ge
+                .registry_set_value(hive, key, value_name, "REG_SZ", json!(value), view)?;
+        }
+        Ok(())
+    }
+
     pub fn register_com_class(
         &mut self,
         clsid: &str,
@@ -1823,12 +2007,16 @@ impl Win32Subsystem {
             .get(normalized_path)
             .map(|entry| entry.attributes.clone())
             .unwrap_or_default();
+        let mut attributes = existing_attrs;
+        if kind == FsEntryKind::Directory && !attributes.iter().any(|value| value == "directory") {
+            attributes.push("directory".to_string());
+        }
         self.ge.config.fs_state.entries.insert(
             normalized_path.to_string(),
             FsMetadataRecord {
                 kind,
                 original_case,
-                attributes: existing_attrs,
+                attributes,
                 creation_time_ticks: ticks,
                 last_access_time_ticks: ticks,
                 last_write_time_ticks: ticks,
@@ -1848,11 +2036,18 @@ impl Win32Subsystem {
         let host = fs::metadata(host_path).map_err(|error| {
             AppError::from_io(ReasonCode::RcIo, format!("failed to stat {child_path}"), &error)
         })?;
+        let mut attributes = metadata.attributes;
+        if metadata.kind == FsEntryKind::Directory && !attributes.iter().any(|value| value == "directory") {
+            attributes.push("directory".to_string());
+        }
         Ok(FindData {
             file_name: child_name.to_string(),
             is_directory: metadata.kind == FsEntryKind::Directory,
             size: host.len(),
-            attributes: metadata.attributes,
+            attributes,
+            creation_time_ticks: metadata.creation_time_ticks,
+            last_access_time_ticks: metadata.last_access_time_ticks,
+            last_write_time_ticks: metadata.last_write_time_ticks,
         })
     }
 
@@ -2028,12 +2223,8 @@ fn current_ticks(dtm: bool, ticks_ms: u64) -> u64 {
     }
 }
 
-fn paced_sleep_duration_ms(requested_ms: u64, live_pacing: bool) -> u64 {
-    if !live_pacing || requested_ms == 0 {
-        requested_ms
-    } else {
-        requested_ms.max(16)
-    }
+fn paced_sleep_duration_ms(requested_ms: u64, _live_pacing: bool) -> u64 {
+    requested_ms
 }
 
 fn align_up(value: u64, alignment: u64) -> u64 {
@@ -2121,6 +2312,11 @@ fn encode_cp1252(ch: char) -> AppResult<u8> {
         'œ' => Ok(0x9C),
         'ž' => Ok(0x9E),
         'Ÿ' => Ok(0x9F),
+        '\u{0081}' => Ok(0x81),
+        '\u{008d}' => Ok(0x8D),
+        '\u{008f}' => Ok(0x8F),
+        '\u{0090}' => Ok(0x90),
+        '\u{009d}' => Ok(0x9D),
         other if (other as u32) < 0x80 || (other as u32) >= 0xA0 && (other as u32) <= 0xFF => {
             Ok(other as u8)
         }
@@ -2149,9 +2345,89 @@ fn request_id_len_inner(_request: &OverlappedRequest) -> usize {
     0
 }
 
+fn split_find_search_pattern(path: &str) -> (String, String) {
+    let trimmed = path.trim_end_matches(['\\', '/']);
+    if let Some(index) = trimmed.rfind(['\\', '/']) {
+        let directory = if index == 2 && trimmed.as_bytes().get(1) == Some(&b':') {
+            trimmed[..=index].to_string()
+        } else {
+            trimmed[..index].to_string()
+        };
+        let pattern = trimmed[index + 1..].to_string();
+        (
+            directory,
+            if pattern.is_empty() {
+                "*".to_string()
+            } else {
+                pattern
+            },
+        )
+    } else {
+        (
+            path.to_string(),
+            "*".to_string(),
+        )
+    }
+}
+
+fn contains_find_wildcards(pattern: &str) -> bool {
+    pattern.contains('*') || pattern.contains('?')
+}
+
+fn windows_pattern_matches(pattern: &str, candidate: &str) -> bool {
+    if pattern == "*.*" {
+        return true;
+    }
+    if let Some(prefix) = pattern.strip_suffix(".*") {
+        if !candidate.contains('.') && windows_pattern_matches(prefix, candidate) {
+            return true;
+        }
+    }
+    let pattern_chars = pattern.chars().collect::<Vec<_>>();
+    let candidate_chars = candidate.chars().collect::<Vec<_>>();
+    let mut pattern_index = 0;
+    let mut candidate_index = 0;
+    let mut star_index = None;
+    let mut retry_index = 0;
+
+    while candidate_index < candidate_chars.len() {
+        if pattern_index < pattern_chars.len()
+            && (pattern_chars[pattern_index] == '?'
+                || find_pattern_char_eq(pattern_chars[pattern_index], candidate_chars[candidate_index]))
+        {
+            pattern_index += 1;
+            candidate_index += 1;
+        } else if pattern_index < pattern_chars.len() && pattern_chars[pattern_index] == '*' {
+            star_index = Some(pattern_index);
+            pattern_index += 1;
+            retry_index = candidate_index;
+        } else if let Some(saved_star_index) = star_index {
+            pattern_index = saved_star_index + 1;
+            retry_index += 1;
+            candidate_index = retry_index;
+        } else {
+            return false;
+        }
+    }
+
+    while pattern_index < pattern_chars.len() && pattern_chars[pattern_index] == '*' {
+        pattern_index += 1;
+    }
+
+    pattern_index == pattern_chars.len()
+}
+
+fn find_pattern_char_eq(left: char, right: char) -> bool {
+    if left.is_ascii() && right.is_ascii() {
+        left.eq_ignore_ascii_case(&right)
+    } else {
+        left == right
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::paced_sleep_duration_ms;
+    use super::{paced_sleep_duration_ms, split_find_search_pattern, windows_pattern_matches};
 
     #[test]
     fn paced_sleep_duration_preserves_non_live_requests() {
@@ -2161,11 +2437,27 @@ mod tests {
     }
 
     #[test]
-    fn paced_sleep_duration_uses_live_quantum_floor() {
+    fn paced_sleep_duration_preserves_live_requests() {
         assert_eq!(paced_sleep_duration_ms(0, true), 0);
-        assert_eq!(paced_sleep_duration_ms(1, true), 16);
-        assert_eq!(paced_sleep_duration_ms(8, true), 16);
+        assert_eq!(paced_sleep_duration_ms(1, true), 1);
+        assert_eq!(paced_sleep_duration_ms(8, true), 8);
         assert_eq!(paced_sleep_duration_ms(16, true), 16);
         assert_eq!(paced_sleep_duration_ms(33, true), 33);
+    }
+
+    #[test]
+    fn split_find_search_pattern_keeps_root_and_defaults_empty_pattern() {
+        assert_eq!(split_find_search_pattern("C:\\Steam\\*"), ("C:\\Steam".to_string(), "*".to_string()));
+        assert_eq!(split_find_search_pattern("C:\\*.*"), ("C:\\".to_string(), "*.*".to_string()));
+        assert_eq!(split_find_search_pattern("C:\\Steam\\"), ("C:\\Steam".to_string(), "*".to_string()));
+    }
+
+    #[test]
+    fn windows_pattern_matches_is_case_insensitive_and_supports_wildcards() {
+        assert!(windows_pattern_matches("*.dll", "Kernel32.DLL"));
+        assert!(windows_pattern_matches("steam??.tmp", "Steam01.tmp"));
+        assert!(windows_pattern_matches("*.*", "Steam"));
+        assert!(windows_pattern_matches("steam.*", "Steam"));
+        assert!(!windows_pattern_matches("steam??.tmp", "Steam001.tmp"));
     }
 }

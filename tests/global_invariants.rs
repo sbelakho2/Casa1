@@ -1,6 +1,6 @@
 use casa1::canonical::{CanonicalTestOutput, GuestException};
 use casa1::ge::{GameEnvironment, RegistryView};
-use casa1::gfx::{DxgiFormat, GraphicsBackend, HeapType, ResourceDesc, ResourceState, SceneSpec, SwapchainDesc};
+use casa1::gfx::{DxgiFormat, GraphicsBackend, HeapType, ResourceDesc, ResourceState, ResourceUsageHint, SceneSpec, SwapchainDesc};
 use casa1::network::secure_random;
 use casa1::reason::ReasonCode;
 use casa1::security::{collect_crash_artifact, CrashModule, CrashSnapshot, CrashThread};
@@ -118,6 +118,7 @@ fn i5_1_soak_gate_keeps_rss_growth_under_five_percent_and_gpu_live_set_stable() 
                 size: 64,
                 subresources: 1,
                 initial_state: ResourceState::Common,
+                usage_hint: ResourceUsageHint::Generic,
             })
             .expect("create warmup resource");
         backend.destroy_resource(resource).expect("destroy warmup resource");
@@ -135,6 +136,7 @@ fn i5_1_soak_gate_keeps_rss_growth_under_five_percent_and_gpu_live_set_stable() 
                 size: 128,
                 subresources: 1,
                 initial_state: ResourceState::Common,
+                usage_hint: ResourceUsageHint::Generic,
             })
             .expect("create soak resource");
         backend.destroy_resource(resource).expect("destroy soak resource");
@@ -164,6 +166,8 @@ fn i5_2_curated_rotation_24_logical_hours_records_guest_crashes_without_host_fai
             game_name: "Rotation Game".to_string(),
             install_dir: "Rotation Game".to_string(),
             launch_exe: "Bin/TestGame.exe".to_string(),
+            library_root: None,
+            prerequisites: Vec::new(),
             files: BTreeMap::from([(
                 "Bin/TestGame.exe".to_string(),
                 b"rotation-game".to_vec(),

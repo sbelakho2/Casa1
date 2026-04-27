@@ -8,19 +8,9 @@
     "winver": "win11-23h2"
   },
   "categories": [
-    "file",
-    "registry",
-    "process",
-    "thread",
-    "time",
-    "input",
-    "network",
-    "d3d12",
-    "dxgi",
-    "shader",
-    "audio"
+    "process"
   ],
-  "env_fingerprint": "a379532eff87c2200d2d2e65b5fde16ea1d87c03f1a562f49d61d4f61051af73",
+  "env_fingerprint": "4ce0c2fdce0e34ca5373d5ca4adcc62a3f0315fa6a47ca7236a1f71263cf7a39",
   "resources": {
     "ge_config_sha256": "57cd9a5b4e2fa6914629727d80e8f0df29e07a3157faf3df3f4b0986632803ae",
     "program_sha256": "81b16a55acac4a680ea522090e4810d14f7ac9d0e69ea25565e04a8f7d5a1d0a",
@@ -32,14 +22,16 @@
     "cwd": "/Users/sabelakhoua/IdeaProjects/Casa1/games/windows_tetris/ges/casa1-live-tetris",
     "env": {
       "CASA1_DTM": "0",
-      "CASA1_FIXED_GUID": "9602EFD8-D118-5D74-8043-D307F7F0F5DF",
+      "CASA1_FIXED_GUID": "4A216BF7-941E-5D42-9969-352AEBCBB835",
       "CASA1_GE_ROOT": "/Users/sabelakhoua/IdeaProjects/Casa1/games/windows_tetris/ges/casa1-live-tetris",
       "CASA1_INSTALL_SILENT": "0",
+      "CASA1_KEYBOARD_REPLAY_JSON": "[\n  { \"scancode\": 57 },\n  { \"scancode\": 32 },\n  { \"scancode\": 57 }\n]",
       "CASA1_REGISTRY_HKCR": "/Users/sabelakhoua/IdeaProjects/Casa1/games/windows_tetris/ges/casa1-live-tetris/registry/HKCR.db",
       "CASA1_REGISTRY_HKCU": "/Users/sabelakhoua/IdeaProjects/Casa1/games/windows_tetris/ges/casa1-live-tetris/registry/HKCU.db",
       "CASA1_REGISTRY_HKLM": "/Users/sabelakhoua/IdeaProjects/Casa1/games/windows_tetris/ges/casa1-live-tetris/registry/HKLM.db",
       "CASA1_RUN_INTENT": "play",
       "CASA1_TEST_ID": "play-casa1-tetris-smoke",
+      "CASA1_TRACE_CATEGORIES": "process",
       "CASA1_TRACE_FILE": "/Users/sabelakhoua/IdeaProjects/Casa1/games/windows_tetris/ges/casa1-live-tetris/traces/play-casa1-tetris-smoke-guest.json"
     },
     "dtm": false,
@@ -56,25 +48,11 @@
     "file_manifest_delta": [],
     "registry_delta": [],
     "network_summary": [],
-    "gfx_frames": [
-      {
-        "scene_id": "pe-runtime-d3d11",
-        "frame_index": 0,
-        "hash": "1244b2a9b8144efc82b6a002c476c405245b2610786e6f93bb2c3a29c0410ee9",
-        "ssim": 1.0,
-        "metadata": {
-          "displayed_frame_index": "1",
-          "format": "B8G8R8A8Unorm",
-          "height": "96",
-          "submission_hash": "1370f4f0f29b2f31b1d979d485db68f8068fd61d2e05937f5713807d2d253d0b",
-          "width": "64"
-        }
-      }
-    ],
+    "gfx_frames": [],
     "perf": [
       {
         "metric_id": "pe_runtime_steps",
-        "value": 104135.0,
+        "value": 104189.0,
         "unit": "instructions"
       }
     ]
@@ -90,7 +68,7 @@
         "exe": "/Users/sabelakhoua/IdeaProjects/Casa1/games/windows_tetris/dist/casa1-tetris-smoke.exe",
         "intent": "play"
       },
-      "return_value": 71223,
+      "return_value": 104965,
       "get_last_error": null,
       "side_effect_hashes": []
     },
@@ -99,7 +77,7 @@
       "category": "process",
       "call_id": "NtContinue",
       "parameters": {
-        "entrypoint": "0x279da7eb1000",
+        "entrypoint": "0x24314acb1000",
         "mode": "pe-runtime"
       },
       "return_value": 0,
@@ -110,366 +88,6 @@
     },
     {
       "event_index": 2,
-      "category": "input",
-      "call_id": "RegisterClassExW",
-      "parameters": {
-        "class_name": "Casa1StandaloneTetris"
-      },
-      "return_value": 1,
-      "get_last_error": null,
-      "side_effect_hashes": []
-    },
-    {
-      "event_index": 3,
-      "category": "input",
-      "call_id": "CreateWindowExW",
-      "parameters": {
-        "class_name": "Casa1StandaloneTetris",
-        "height": 820,
-        "title": "Casa1 Standalone Tetris",
-        "width": 520
-      },
-      "return_value": 1,
-      "get_last_error": null,
-      "side_effect_hashes": []
-    },
-    {
-      "event_index": 4,
-      "category": "dxgi",
-      "call_id": "D3D11CreateDeviceAndSwapChain",
-      "parameters": {
-        "buffer_count": 2,
-        "format": "B8G8R8A8Unorm",
-        "height": 96,
-        "width": 64
-      },
-      "return_value": 0,
-      "get_last_error": null,
-      "side_effect_hashes": []
-    },
-    {
-      "event_index": 5,
-      "category": "d3d12",
-      "call_id": "ID3D11Device::GetImmediateContext",
-      "parameters": {},
-      "return_value": 0,
-      "get_last_error": null,
-      "side_effect_hashes": []
-    },
-    {
-      "event_index": 6,
-      "category": "dxgi",
-      "call_id": "IDXGISwapChain::GetBuffer",
-      "parameters": {
-        "index": 0
-      },
-      "return_value": 0,
-      "get_last_error": null,
-      "side_effect_hashes": []
-    },
-    {
-      "event_index": 7,
-      "category": "audio",
-      "call_id": "XAudio2Create",
-      "parameters": {
-        "flags": 0,
-        "processor": 1
-      },
-      "return_value": 0,
-      "get_last_error": null,
-      "side_effect_hashes": []
-    },
-    {
-      "event_index": 8,
-      "category": "audio",
-      "call_id": "IXAudio2::CreateMasteringVoice",
-      "parameters": {
-        "channels": 2,
-        "flags": 0,
-        "sample_rate": 48000
-      },
-      "return_value": 0,
-      "get_last_error": null,
-      "side_effect_hashes": []
-    },
-    {
-      "event_index": 9,
-      "category": "audio",
-      "call_id": "IXAudio2::CreateSourceVoice",
-      "parameters": {
-        "channels": 2,
-        "flags": 0,
-        "max_frequency_ratio_bits": 1065353216,
-        "sample_format": "Pcm16",
-        "sample_rate": 48000
-      },
-      "return_value": 0,
-      "get_last_error": null,
-      "side_effect_hashes": []
-    },
-    {
-      "event_index": 10,
-      "category": "audio",
-      "call_id": "IXAudio2::StartEngine",
-      "parameters": {},
-      "return_value": 0,
-      "get_last_error": null,
-      "side_effect_hashes": []
-    },
-    {
-      "event_index": 11,
-      "category": "audio",
-      "call_id": "IXAudio2SourceVoice::Stop",
-      "parameters": {
-        "flags": 0
-      },
-      "return_value": 0,
-      "get_last_error": null,
-      "side_effect_hashes": []
-    },
-    {
-      "event_index": 12,
-      "category": "audio",
-      "call_id": "IXAudio2SourceVoice::FlushSourceBuffers",
-      "parameters": {},
-      "return_value": 0,
-      "get_last_error": null,
-      "side_effect_hashes": []
-    },
-    {
-      "event_index": 13,
-      "category": "audio",
-      "call_id": "IXAudio2SourceVoice::SubmitSourceBuffer",
-      "parameters": {
-        "audio_bytes": 128
-      },
-      "return_value": 0,
-      "get_last_error": null,
-      "side_effect_hashes": []
-    },
-    {
-      "event_index": 14,
-      "category": "audio",
-      "call_id": "XAudio2Render",
-      "parameters": {
-        "callbacks": 1,
-        "frames": 32,
-        "latency_ms": 11
-      },
-      "return_value": 2034994327,
-      "get_last_error": null,
-      "side_effect_hashes": []
-    },
-    {
-      "event_index": 15,
-      "category": "audio",
-      "call_id": "IXAudio2SourceVoice::Start",
-      "parameters": {
-        "flags": 0
-      },
-      "return_value": 0,
-      "get_last_error": null,
-      "side_effect_hashes": []
-    },
-    {
-      "event_index": 16,
-      "category": "input",
-      "call_id": "PeekMessageW",
-      "parameters": {
-        "remove": true
-      },
-      "return_value": 129,
-      "get_last_error": null,
-      "side_effect_hashes": []
-    },
-    {
-      "event_index": 17,
-      "category": "input",
-      "call_id": "DispatchMessageW",
-      "parameters": {
-        "message": 129
-      },
-      "return_value": 0,
-      "get_last_error": null,
-      "side_effect_hashes": []
-    },
-    {
-      "event_index": 18,
-      "category": "input",
-      "call_id": "PeekMessageW",
-      "parameters": {
-        "remove": true
-      },
-      "return_value": 1,
-      "get_last_error": null,
-      "side_effect_hashes": []
-    },
-    {
-      "event_index": 19,
-      "category": "input",
-      "call_id": "DispatchMessageW",
-      "parameters": {
-        "message": 1
-      },
-      "return_value": 0,
-      "get_last_error": null,
-      "side_effect_hashes": []
-    },
-    {
-      "event_index": 20,
-      "category": "input",
-      "call_id": "PeekMessageW",
-      "parameters": {
-        "remove": true
-      },
-      "return_value": 24,
-      "get_last_error": null,
-      "side_effect_hashes": []
-    },
-    {
-      "event_index": 21,
-      "category": "input",
-      "call_id": "DispatchMessageW",
-      "parameters": {
-        "message": 24
-      },
-      "return_value": 0,
-      "get_last_error": null,
-      "side_effect_hashes": []
-    },
-    {
-      "event_index": 22,
-      "category": "input",
-      "call_id": "PeekMessageW",
-      "parameters": {
-        "remove": true
-      },
-      "return_value": 70,
-      "get_last_error": null,
-      "side_effect_hashes": []
-    },
-    {
-      "event_index": 23,
-      "category": "input",
-      "call_id": "DispatchMessageW",
-      "parameters": {
-        "message": 70
-      },
-      "return_value": 0,
-      "get_last_error": null,
-      "side_effect_hashes": []
-    },
-    {
-      "event_index": 24,
-      "category": "input",
-      "call_id": "PeekMessageW",
-      "parameters": {
-        "remove": true
-      },
-      "return_value": 5,
-      "get_last_error": null,
-      "side_effect_hashes": []
-    },
-    {
-      "event_index": 25,
-      "category": "input",
-      "call_id": "DispatchMessageW",
-      "parameters": {
-        "message": 5
-      },
-      "return_value": 0,
-      "get_last_error": null,
-      "side_effect_hashes": []
-    },
-    {
-      "event_index": 26,
-      "category": "input",
-      "call_id": "PeekMessageW",
-      "parameters": {
-        "remove": true
-      },
-      "return_value": 6,
-      "get_last_error": null,
-      "side_effect_hashes": []
-    },
-    {
-      "event_index": 27,
-      "category": "input",
-      "call_id": "DispatchMessageW",
-      "parameters": {
-        "message": 6
-      },
-      "return_value": 0,
-      "get_last_error": null,
-      "side_effect_hashes": []
-    },
-    {
-      "event_index": 28,
-      "category": "input",
-      "call_id": "PeekMessageW",
-      "parameters": {
-        "remove": true
-      },
-      "return_value": 7,
-      "get_last_error": null,
-      "side_effect_hashes": []
-    },
-    {
-      "event_index": 29,
-      "category": "input",
-      "call_id": "DispatchMessageW",
-      "parameters": {
-        "message": 7
-      },
-      "return_value": 0,
-      "get_last_error": null,
-      "side_effect_hashes": []
-    },
-    {
-      "event_index": 30,
-      "category": "d3d12",
-      "call_id": "ID3D11DeviceContext::UpdateSubresource",
-      "parameters": {
-        "bytes": 24576,
-        "row_pitch": 256
-      },
-      "return_value": 0,
-      "get_last_error": null,
-      "side_effect_hashes": []
-    },
-    {
-      "event_index": 31,
-      "category": "dxgi",
-      "call_id": "IDXGISwapChain::Present",
-      "parameters": {
-        "allow_tearing": false,
-        "queued_frames": 1,
-        "sync_interval": 1
-      },
-      "return_value": 1,
-      "get_last_error": null,
-      "side_effect_hashes": []
-    },
-    {
-      "event_index": 32,
-      "category": "audio",
-      "call_id": "IXAudio2Voice::DestroyVoice",
-      "parameters": {},
-      "return_value": 0,
-      "get_last_error": null,
-      "side_effect_hashes": []
-    },
-    {
-      "event_index": 33,
-      "category": "audio",
-      "call_id": "IXAudio2Voice::DestroyVoice",
-      "parameters": {},
-      "return_value": 0,
-      "get_last_error": null,
-      "side_effect_hashes": []
-    },
-    {
-      "event_index": 34,
       "category": "process",
       "call_id": "ExitProcess",
       "parameters": {
@@ -480,7 +98,7 @@
       "side_effect_hashes": []
     },
     {
-      "event_index": 35,
+      "event_index": 3,
       "category": "process",
       "call_id": "WaitForSingleObject",
       "parameters": {

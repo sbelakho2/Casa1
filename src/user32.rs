@@ -7,6 +7,22 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 pub type Atom = u16;
 pub type Hwnd = u32;
 
+pub const GWL_WNDPROC: i32 = -4;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowClassInfo {
+    pub style: u32,
+    pub wnd_proc: u64,
+    pub cls_extra: i32,
+    pub wnd_extra: i32,
+    pub instance: u64,
+    pub icon: u64,
+    pub cursor: u64,
+    pub background: u64,
+    pub menu_name: u64,
+    pub class_name_ptr: u64,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Rect {
     pub left: i32,
@@ -361,16 +377,19 @@ pub struct WindowState {
 struct WindowClass {
     atom: Atom,
     name: String,
+    info: WindowClassInfo,
 }
 
 #[derive(Debug, Clone)]
 struct WindowRecord {
     hwnd: Hwnd,
+    parent: Option<Hwnd>,
     class_name: String,
     title: String,
     width: u32,
     height: u32,
     visible: bool,
+    enabled: bool,
     fullscreen: FullscreenState,
     monitor_id: u32,
     dpi: u32,
@@ -401,11 +420,15 @@ struct ControllerRecord {
 pub struct User32Subsystem {
     next_atom: Atom,
     next_hwnd: Hwnd,
+    next_image_handle: u32,
     layout: KeyboardLayoutId,
     key_repeat: KeyRepeatConfig,
     dpi_context: DpiAwarenessContext,
     classes: BTreeMap<String, WindowClass>,
     windows: BTreeMap<Hwnd, WindowRecord>,
+    dialog_items: BTreeMap<(Hwnd, i32), Hwnd>,
+    dialog_results: BTreeMap<Hwnd, i64>,
+    window_longs: BTreeMap<(Hwnd, i32), u64>,
     message_queue: VecDeque<Message>,
     message_log: Vec<Message>,
     capture: Option<Hwnd>,
@@ -468,6 +491,7 @@ impl User32Subsystem {
         Self {
             next_atom: 1,
             next_hwnd: 1,
+            next_image_handle: 0x1_0000,
             layout,
             key_repeat: KeyRepeatConfig {
                 delay_ms: 250,
@@ -476,6 +500,9 @@ impl User32Subsystem {
             dpi_context: DpiAwarenessContext::SystemAware,
             classes: BTreeMap::new(),
             windows: BTreeMap::new(),
+            dialog_items: BTreeMap::new(),
+            dialog_results: BTreeMap::new(),
+            window_longs: BTreeMap::new(),
             message_queue: VecDeque::new(),
             message_log: Vec::new(),
             capture: None,
@@ -497,6 +524,24 @@ impl User32Subsystem {
     }
 
     pub fn register_class_ex_w(&mut self, class_name: &str) -> Atom {
+        self.register_class_info(
+            class_name,
+            WindowClassInfo {
+                style: 0,
+                wnd_proc: 0,
+                cls_extra: 0,
+                wnd_extra: 0,
+                instance: 0,
+                icon: 0,
+                cursor: 0,
+                background: 0,
+                menu_name: 0,
+                class_name_ptr: 0,
+            },
+        )
+    }
+
+    pub fn register_class_info(&mut self, class_name: &str, info: WindowClassInfo) -> Atom {
         if let Some(existing) = self.classes.get(class_name) {
             return existing.atom;
         }
@@ -507,9 +552,24 @@ impl User32Subsystem {
             WindowClass {
                 atom,
                 name: class_name.to_string(),
+                info,
             },
         );
         atom
+    }
+
+    pub fn class_info(&self, class_name: &str) -> Option<WindowClassInfo> {
+        self.classes.get(class_name).map(|class| class.info)
+    }
+
+    pub fn ensure_class_available(&mut self, class_name: &str) -> Option<Atom> {
+        if let Some(existing) = self.classes.get(class_name) {
+            return Some(existing.atom);
+        }
+        if is_builtin_window_class(class_name) {
+            return Some(self.register_class_ex_w(class_name));
+        }
+        None
     }
 
     pub fn create_window_ex_w(
@@ -520,12 +580,14 @@ impl User32Subsystem {
         height: u32,
         visible: bool,
         requested_exclusive_fullscreen: bool,
+        parent: Option<Hwnd>,
         monitor_id: u32,
     ) -> AppResult<Hwnd> {
-        let class = self.classes.get(class_name).ok_or_else(|| {
+        let atom = self.ensure_class_available(class_name).ok_or_else(|| {
             AppError::new(ReasonCode::RcCliInvalid, format!("unregistered class {class_name}"))
         })?;
-        let _ = (&class.atom, &class.name);
+        let class_info = self.classes.get(class_name).map(|class| class.info);
+        let _ = atom;
         let hwnd = self.next_hwnd;
         self.next_hwnd += 1;
         let fullscreen = self.map_fullscreen_state(title, requested_exclusive_fullscreen);
@@ -534,17 +596,24 @@ impl User32Subsystem {
             hwnd,
             WindowRecord {
                 hwnd,
+                parent,
                 class_name: class_name.to_string(),
                 title: title.to_string(),
                 width,
                 height,
                 visible,
+                enabled: true,
                 fullscreen,
                 monitor_id,
                 dpi,
                 destroyed: false,
             },
         );
+        if let Some(class_info) = class_info {
+            if class_info.wnd_proc != 0 {
+                self.window_longs.insert((hwnd, GWL_WNDPROC), class_info.wnd_proc);
+            }
+        }
         self.enqueue(Message {
             hwnd: Some(hwnd),
             kind: MessageKind::NcCreate,
@@ -595,8 +664,112 @@ impl User32Subsystem {
         Ok(hwnd)
     }
 
-    pub fn destroy_window(&mut self, hwnd: Hwnd) -> AppResult<()> {
-        self.window(hwnd)?;
+    pub fn show_window(&mut self, hwnd: Hwnd, command: i32) -> AppResult<bool> {
+        let Some(existing) = self.windows.get(&hwnd) else {
+            return Ok(false);
+        };
+        let was_visible = existing.visible;
+        let should_show = command != 0;
+        if was_visible == should_show {
+            return Ok(was_visible);
+        }
+
+        {
+            let window = self.window_mut(hwnd)?;
+            window.visible = should_show;
+        }
+
+        self.enqueue(Message {
+            hwnd: Some(hwnd),
+            kind: MessageKind::ShowWindow,
+            wparam: i64::from(should_show),
+            lparam: 0,
+            translated: false,
+            device_id: None,
+        })?;
+
+        if should_show {
+            let (width, height) = {
+                let window = self.window(hwnd)?;
+                (window.width, window.height)
+            };
+            self.queue_resize(hwnd, width, height)?;
+            if self.foreground.is_none() {
+                self.foreground = Some(hwnd);
+                self.focus = Some(hwnd);
+                self.enqueue(Message {
+                    hwnd: Some(hwnd),
+                    kind: MessageKind::Activate,
+                    wparam: 1,
+                    lparam: 0,
+                    translated: false,
+                    device_id: None,
+                })?;
+                self.enqueue(Message {
+                    hwnd: Some(hwnd),
+                    kind: MessageKind::SetFocus,
+                    wparam: 0,
+                    lparam: 0,
+                    translated: false,
+                    device_id: None,
+                })?;
+            }
+        } else {
+            if self.focus == Some(hwnd) {
+                self.focus = None;
+                self.enqueue(Message {
+                    hwnd: Some(hwnd),
+                    kind: MessageKind::KillFocus,
+                    wparam: 0,
+                    lparam: 0,
+                    translated: false,
+                    device_id: None,
+                })?;
+            }
+            if self.foreground == Some(hwnd) {
+                self.foreground = None;
+            }
+        }
+
+        Ok(was_visible)
+    }
+
+    pub fn enable_window(&mut self, hwnd: Hwnd, enabled: bool) -> AppResult<bool> {
+        let window = self.window_mut(hwnd)?;
+        let was_enabled = window.enabled;
+        window.enabled = enabled;
+        Ok(was_enabled)
+    }
+
+    pub fn is_window_enabled(&self, hwnd: Hwnd) -> bool {
+        self.window(hwnd).map(|window| window.enabled).unwrap_or(false)
+    }
+
+    pub fn set_window_text_w(&mut self, hwnd: Hwnd, title: &str) -> bool {
+        let Some(window) = self.windows.get_mut(&hwnd) else {
+            return false;
+        };
+        window.title = title.to_string();
+        true
+    }
+
+    pub fn load_image_w(
+        &mut self,
+        _source: &str,
+        _image_type: u32,
+        _width: i32,
+        _height: i32,
+        _flags: u32,
+    ) -> u32 {
+        let handle = self.next_image_handle;
+        self.next_image_handle += 4;
+        handle
+    }
+
+    pub fn destroy_window(&mut self, hwnd: Hwnd) -> AppResult<bool> {
+        if !self.windows.contains_key(&hwnd) {
+            return Ok(false);
+        }
         if self.focus == Some(hwnd) {
             self.focus = None;
             self.enqueue(Message {
@@ -633,14 +806,123 @@ impl User32Subsystem {
             translated: false,
             device_id: None,
         })?;
-        Ok(())
+        Ok(true)
     }
 
     pub fn def_window_proc_w(&mut self, message: &Message) -> AppResult<i64> {
         if let Some(hwnd) = message.hwnd {
-            let _ = self.window(hwnd)?;
+            if self.windows.contains_key(&hwnd) {
+                let _ = self.window(hwnd)?;
+            }
         }
         Ok(0)
+    }
+
+    pub fn has_window(&self, hwnd: Hwnd) -> bool {
+        self.windows.contains_key(&hwnd)
+    }
+
+    pub fn find_window_ex_w(
+        &self,
+        parent: Hwnd,
+        after: Hwnd,
+        class_name: Option<&str>,
+        title: Option<&str>,
+    ) -> Option<Hwnd> {
+        let mut handles = self.windows.keys().copied().collect::<Vec<_>>();
+        handles.sort_unstable();
+        let mut after_seen = after == 0;
+        for hwnd in handles {
+            let window = self.windows.get(&hwnd)?;
+            if window.destroyed {
+                continue;
+            }
+            if parent == 0 {
+                if window.parent.is_some() {
+                    continue;
+                }
+            } else if window.parent != Some(parent) {
+                continue;
+            }
+            if !after_seen {
+                if hwnd == after {
+                    after_seen = true;
+                }
+                continue;
+            }
+            if let Some(expected) = class_name {
+                if !window.class_name.eq_ignore_ascii_case(expected) {
+                    continue;
+                }
+            }
+            if let Some(expected) = title {
+                if window.title != expected {
+                    continue;
+                }
+            }
+            return Some(hwnd);
+        }
+        None
+    }
+
+    pub fn get_dlg_item(&mut self, parent: Hwnd, item_id: i32) -> AppResult<Option<Hwnd>> {
+        let Some(parent_window) = self.windows.get(&parent).cloned() else {
+            return Ok(None);
+        };
+        if item_id <= 0 {
+            return Ok(None);
+        }
+        if let Some(existing) = self.dialog_items.get(&(parent, item_id)) {
+            return Ok(Some(*existing));
+        }
+
+        let hwnd = self.next_hwnd;
+        self.next_hwnd += 1;
+        self.windows.insert(
+            hwnd,
+            WindowRecord {
+                hwnd,
+                parent: Some(parent),
+                class_name: "static".to_string(),
+                title: format!("dlg-item-{item_id}"),
+                width: 1,
+                height: 1,
+                visible: true,
+                enabled: true,
+                fullscreen: parent_window.fullscreen,
+                monitor_id: parent_window.monitor_id,
+                dpi: parent_window.dpi,
+                destroyed: false,
+            },
+        );
+        self.dialog_items.insert((parent, item_id), hwnd);
+        Ok(Some(hwnd))
+    }
+
+    pub fn end_dialog(&mut self, hwnd: Hwnd, result: i64) -> AppResult<bool> {
+        if !self.windows.contains_key(&hwnd) {
+            return Ok(false);
+        }
+        self.dialog_results.insert(hwnd, result);
+        self.destroy_window(hwnd)
+    }
+
+    pub fn take_dialog_result(&mut self, hwnd: Hwnd) -> Option<i64> {
+        self.dialog_results.remove(&hwnd)
+    }
+
+    pub fn set_window_long_w(&mut self, hwnd: Hwnd, index: i32, value: u64) -> Option<u64> {
+        if !self.windows.contains_key(&hwnd) {
+            return None;
+        }
+        Some(self.window_longs.insert((hwnd, index), value).unwrap_or(0))
+    }
+
+    pub fn get_window_long_w(&self, hwnd: Hwnd, index: i32) -> Option<u64> {
+        if !self.windows.contains_key(&hwnd) {
+            return None;
+        }
+        Some(*self.window_longs.get(&(hwnd, index)).unwrap_or(&0))
     }
 
     pub fn post_message_w(
@@ -893,7 +1175,14 @@ impl User32Subsystem {
                     device_id,
                     scancode,
                     modifiers,
-                } => self.inject_keyboard_input_internal(*hwnd, device_id, *scancode, *modifiers, false)?,
+                } => self.inject_keyboard_input_internal(
+                    *hwnd,
+                    device_id,
+                    *scancode,
+                    *modifiers,
+                    MessageKind::KeyDown,
+                    false,
+                )?,
                 InputReplayEvent::Mouse {
                     hwnd,
                     device_id,
@@ -986,7 +1275,17 @@ impl User32Subsystem {
         scancode: u16,
         modifiers: KeyModifiers,
     ) -> AppResult<()> {
-        self.inject_keyboard_input_internal(hwnd, device_id, scancode, modifiers, true)
+        self.inject_keyboard_input_internal(hwnd, device_id, scancode, modifiers, MessageKind::KeyDown, true)
+    }
+
+    pub fn inject_keyboard_input_up(
+        &mut self,
+        hwnd: Hwnd,
+        device_id: &str,
+        scancode: u16,
+        modifiers: KeyModifiers,
+    ) -> AppResult<()> {
+        self.inject_keyboard_input_internal(hwnd, device_id, scancode, modifiers, MessageKind::KeyUp, false)
     }
 
     fn inject_keyboard_input_internal(
@@ -995,6 +1294,7 @@ impl User32Subsystem {
         device_id: &str,
         scancode: u16,
         modifiers: KeyModifiers,
+        kind: MessageKind,
         record: bool,
     ) -> AppResult<()> {
         self.window(hwnd)?;
@@ -1004,7 +1304,7 @@ impl User32Subsystem {
                 format!("unknown keyboard device {device_id}"),
             ));
         }
-        if record {
+        if record && kind == MessageKind::KeyDown {
             self.recorded_input.push(InputReplayEvent::Keyboard {
                 hwnd,
                 device_id: device_id.to_string(),
@@ -1014,7 +1314,7 @@ impl User32Subsystem {
         }
         self.enqueue(Message {
             hwnd: Some(hwnd),
-            kind: MessageKind::KeyDown,
+            kind,
             wparam: modifiers.to_bits(),
             lparam: scancode as i64,
             translated: false,
@@ -1139,13 +1439,17 @@ impl User32Subsystem {
         })
     }
 
-    pub fn attach_controller(&mut self, target_window: Option<Hwnd>, spec: ControllerSpec) -> AppResult<String> {
-        let guid = stable_device_id(
-            "di",
+    pub fn add_controller(
+        &mut self,
+        target_window: Option<Hwnd>,
+        spec: ControllerSpec,
+    ) -> AppResult<String> {
+        let guid = util::deterministic_guid(
             &format!(
                 "{:04x}:{:04x}:{}:{}:{:?}",
                 spec.vendor_id, spec.product_id, spec.serial, spec.name, spec.kind
             ),
+            true,
         );
         let record = ControllerRecord {
             spec,
@@ -1510,6 +1814,13 @@ impl User32Subsystem {
             }
         }
     }
+}
+
+fn is_builtin_window_class(class_name: &str) -> bool {
+    matches!(
+        class_name.to_ascii_lowercase().as_str(),
+        "#32770" | "button" | "edit" | "static" | "richedit" | "riched20w" | "riched32"
+    )
 }
 
 fn stable_device_id(prefix: &str, source: &str) -> String {

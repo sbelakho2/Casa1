@@ -27,7 +27,7 @@ fn pe_parser_validates_headers_directories_load_config_and_resources() {
     assert!(image.directory(pe::IMAGE_DIRECTORY_ENTRY_DEBUG).virtual_address > 0);
     assert!(image.directory(pe::IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG).virtual_address > 0);
 
-    let load_config = image.load_config.expect("load config present");
+    let load_config = image.load_config.as_ref().expect("load config present");
     assert_eq!(load_config.guard_flags, 0x500);
     assert_eq!(load_config.se_handler_count, 1);
     assert_eq!(image.debug_entries.len(), 1);
@@ -40,6 +40,38 @@ fn pe_parser_validates_headers_directories_load_config_and_resources() {
         .supported_os
         .iter()
         .any(|value| value == "{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"));
+}
+
+#[test]
+fn pe32_parser_accepts_32_bit_optional_headers_and_mapping() {
+    let bytes = support::sample_pe32_bytes();
+    let image = pe::parse(&bytes).expect("parse synthetic PE32 fixture");
+
+    assert_eq!(image.machine, 0x014c);
+    assert_eq!(image.pointer_bytes(), 4);
+    assert_eq!(image.image_base, support::SAMPLE_IMAGE_BASE_X86);
+    assert_eq!(image.imports[0].imports[1].iat_rva - image.imports[0].imports[0].iat_rva, 4);
+
+    let load_config = image.load_config.as_ref().expect("load config present");
+    assert_eq!(load_config.guard_flags, 0x500);
+    assert_eq!(load_config.se_handler_count, 1);
+
+    let tls_directory = image.tls_directory.as_ref().expect("TLS directory present");
+    assert_eq!(
+        tls_directory.callbacks,
+        vec![support::SAMPLE_IMAGE_BASE_X86 + support::SAMPLE_TLS_CALLBACK_RVA as u64]
+    );
+
+    let mapped = pe::map_image(&bytes, &image, support::SAMPLE_HASH, true)
+        .expect("map deterministic PE32 image");
+    assert!(mapped.selected_base <= u32::MAX as u64);
+
+    let relocated = u32::from_le_bytes(
+        mapped.memory[support::SAMPLE_RELOC_TARGET_RVA as usize..support::SAMPLE_RELOC_TARGET_RVA as usize + 4]
+            .try_into()
+            .expect("relocated dword"),
+    );
+    assert_eq!(relocated as u64, mapped.selected_base + 0x1234);
 }
 
 #[test]

@@ -9,6 +9,8 @@ use std::process::{Command as HostCommand, Stdio};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+const GPU_COMPAT_VENDOR_ENV: &str = "CASA1_GPU_COMPAT_VENDOR";
+
 pub type AdapterId = u64;
 pub type OutputId = u64;
 pub type SwapchainId = u64;
@@ -96,6 +98,39 @@ pub struct HostGpuProfile {
     pub capabilities: MetalCapabilities,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReportedGpuVendor {
+    Apple,
+    Nvidia,
+    Amd,
+}
+
+impl ReportedGpuVendor {
+    fn vendor_id(self) -> u32 {
+        match self {
+            Self::Apple => 0x106b,
+            Self::Nvidia => 0x10de,
+            Self::Amd => 0x1002,
+        }
+    }
+
+    fn synthetic_device_id(self, family: u8) -> u32 {
+        match self {
+            Self::Apple => 0x1000 + family as u32,
+            Self::Nvidia => 0x2000 + family as u32,
+            Self::Amd => 0x7000 + family as u32,
+        }
+    }
+
+    fn compatibility_adapter_name(self, original: &str) -> String {
+        match self {
+            Self::Apple => original.to_string(),
+            Self::Nvidia => format!("NVIDIA Compatibility Adapter ({original})"),
+            Self::Amd => format!("AMD Compatibility Adapter ({original})"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DisplayMode {
     pub width: u32,
@@ -177,6 +212,33 @@ pub enum ResourceState {
     GenericRead,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BufferRole {
+    Generic,
+    Constant,
+    Vertex,
+    Index,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceUsageHint {
+    Generic,
+    SwapchainBackbuffer,
+    DepthStencil,
+    Buffer {
+        role: BufferRole,
+        cpu_write_frequent: bool,
+    },
+    Texture {
+        sampled: bool,
+        render_target: bool,
+        depth_stencil: bool,
+        cpu_write_frequent: bool,
+    },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ResourceDesc {
     pub name: String,
@@ -185,6 +247,7 @@ pub struct ResourceDesc {
     pub size: usize,
     pub subresources: u32,
     pub initial_state: ResourceState,
+    pub usage_hint: ResourceUsageHint,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -266,6 +329,12 @@ pub enum Command {
     SetRootConstants {
         values: Vec<u32>,
     },
+    BeginRenderPass {
+        color_formats: Vec<DxgiFormat>,
+        depth_format: Option<DxgiFormat>,
+        load_action: String,
+        store_action: String,
+    },
     ClearRtv {
         heap: DescriptorHeapId,
         index: usize,
@@ -276,6 +345,10 @@ pub enum Command {
     },
     Draw {
         vertices: u32,
+    },
+    DrawInstanced {
+        vertices: u32,
+        instances: u32,
     },
     Dispatch {
         x: u32,
@@ -489,6 +562,7 @@ impl GraphicsBackend {
             ));
         }
         let id = self.alloc_id();
+        let max_frame_latency = if self.capabilities.unified_memory { 1 } else { 3 };
         let backbuffers = (0..desc.buffer_count)
             .map(|index| {
                 self.create_resource(ResourceDesc {
@@ -498,6 +572,7 @@ impl GraphicsBackend {
                     size: (desc.width as usize) * (desc.height as usize) * 4,
                     subresources: 1,
                     initial_state: ResourceState::Present,
+                    usage_hint: ResourceUsageHint::SwapchainBackbuffer,
                 })
             })
             .collect::<AppResult<Vec<_>>>()?;
@@ -509,7 +584,7 @@ impl GraphicsBackend {
                     desc,
                     backbuffers,
                     queued_frames: 0,
-                    max_frame_latency: 3,
+                    max_frame_latency,
                 },
                 next_present_index: 0,
                 presented_backbuffer_index: 0,
@@ -629,6 +704,7 @@ impl GraphicsBackend {
                     size: (width as usize) * (height as usize) * 4,
                     subresources: 1,
                     initial_state: ResourceState::Present,
+                    usage_hint: ResourceUsageHint::SwapchainBackbuffer,
                 })
             })
             .collect::<AppResult<Vec<_>>>()?;
@@ -865,6 +941,23 @@ impl GraphicsBackend {
         Ok(())
     }
 
+    pub fn record_begin_render_pass(
+        &mut self,
+        list: CommandListId,
+        color_formats: Vec<DxgiFormat>,
+        depth_format: Option<DxgiFormat>,
+        load_action: &str,
+        store_action: &str,
+    ) -> AppResult<()> {
+        self.command_list_mut(list)?.commands.push(Command::BeginRenderPass {
+            color_formats,
+            depth_format,
+            load_action: load_action.to_string(),
+            store_action: store_action.to_string(),
+        });
+        Ok(())
+    }
+
     pub fn record_clear_rtv(&mut self, list: CommandListId, heap: DescriptorHeapId, index: usize) -> AppResult<()> {
         self.validate_rtv_descriptor(heap, index)?;
         self.command_list_mut(list)?.commands.push(Command::ClearRtv { heap, index });
@@ -879,6 +972,16 @@ impl GraphicsBackend {
 
     pub fn record_draw(&mut self, list: CommandListId, vertices: u32) -> AppResult<()> {
         self.command_list_mut(list)?.commands.push(Command::Draw { vertices });
+        Ok(())
+    }
+
+    pub fn record_draw_instanced(
+        &mut self,
+        list: CommandListId,
+        vertices: u32,
+        instances: u32,
+    ) -> AppResult<()> {
+        self.command_list_mut(list)?.commands.push(Command::DrawInstanced { vertices, instances });
         Ok(())
     }
 
@@ -937,6 +1040,48 @@ impl GraphicsBackend {
                         }
                         root_constants_log.push(values.clone());
                     }
+                    Command::BeginRenderPass {
+                        color_formats,
+                        depth_format,
+                        load_action,
+                        store_action,
+                    } => {
+                        let mapped_color_formats = color_formats
+                            .iter()
+                            .map(|format| format_mapping(*format).map(|mapping| mapping.metal))
+                            .collect::<AppResult<Vec<_>>>()?;
+                        let mapped_depth_format = depth_format
+                            .map(|format| format_mapping(format).map(|mapping| mapping.metal))
+                            .transpose()?;
+                        match &mut active_pass {
+                            Some(pass)
+                                if pass.color_formats == mapped_color_formats
+                                    && pass.depth_format == mapped_depth_format
+                                    && self.capabilities.mesh_shaders =>
+                            {
+                                pass.store_action = store_action.clone();
+                            }
+                            Some(_) => {
+                                render_passes.push(active_pass.take().expect("active pass"));
+                                active_pass = Some(RenderPassPlan {
+                                    color_formats: mapped_color_formats,
+                                    depth_format: mapped_depth_format,
+                                    draw_calls: 0,
+                                    load_action: load_action.clone(),
+                                    store_action: store_action.clone(),
+                                });
+                            }
+                            None => {
+                                active_pass = Some(RenderPassPlan {
+                                    color_formats: mapped_color_formats,
+                                    depth_format: mapped_depth_format,
+                                    draw_calls: 0,
+                                    load_action: load_action.clone(),
+                                    store_action: store_action.clone(),
+                                });
+                            }
+                        }
+                    }
                     Command::ClearRtv { heap, index } => {
                         let descriptor = self.descriptor_at(*heap, *index)?;
                         let ViewDescriptor::Rtv { format, .. } = descriptor else {
@@ -956,6 +1101,8 @@ impl GraphicsBackend {
                                         load_action: "clear".to_string(),
                                         store_action: "store".to_string(),
                                     });
+                                } else {
+                                    pass.load_action = "clear".to_string();
                                 }
                             }
                             None => {
@@ -970,7 +1117,7 @@ impl GraphicsBackend {
                         }
                     }
                     Command::ClearDsv { .. } => {}
-                    Command::Draw { .. } => {
+                    Command::Draw { .. } | Command::DrawInstanced { .. } => {
                         if let Some(pass) = &mut active_pass {
                             pass.draw_calls += 1;
                         } else {
@@ -1079,6 +1226,20 @@ impl GraphicsBackend {
 
     pub fn resource_storage_mode(&self, resource: ResourceId) -> AppResult<MetalStorageMode> {
         Ok(self.resource(resource)?.storage_mode)
+    }
+
+    pub fn set_resource_usage_hint(
+        &mut self,
+        resource: ResourceId,
+        usage_hint: ResourceUsageHint,
+    ) -> AppResult<()> {
+        let mut desc = self.resource(resource)?.desc.clone();
+        desc.usage_hint = usage_hint;
+        let storage_mode = self.storage_mode_for_resource(&desc);
+        let record = self.resource_mut(resource)?;
+        record.desc = desc;
+        record.storage_mode = storage_mode;
+        Ok(())
     }
 
     pub fn create_query_heap(&mut self, ty: QueryType, count: usize) -> QueryHeapId {
@@ -1200,9 +1361,49 @@ impl GraphicsBackend {
         if self.capabilities.memoryless_render_targets
             && desc.heap == HeapType::Default
             && desc.format == DxgiFormat::D24UnormS8Uint
-            && desc.initial_state == ResourceState::DepthWrite
+            && matches!(
+                desc.usage_hint,
+                ResourceUsageHint::DepthStencil
+                    | ResourceUsageHint::Texture {
+                        depth_stencil: true,
+                        ..
+                    }
+            )
         {
             return MetalStorageMode::Memoryless;
+        }
+
+        if self.capabilities.unified_memory
+            && desc.heap == HeapType::Default
+            && desc.format == DxgiFormat::R32Float
+            && desc.subresources == 1
+            && desc.size <= 64 * 1024
+            && matches!(
+                desc.usage_hint,
+                ResourceUsageHint::Buffer {
+                    cpu_write_frequent: true,
+                    ..
+                }
+            )
+        {
+            return MetalStorageMode::Shared;
+        }
+
+        if self.capabilities.unified_memory
+            && desc.heap == HeapType::Default
+            && desc.subresources == 1
+            && desc.size <= 256 * 1024
+            && matches!(
+                desc.usage_hint,
+                ResourceUsageHint::Texture {
+                    sampled: true,
+                    render_target: false,
+                    depth_stencil: false,
+                    cpu_write_frequent: true,
+                }
+            )
+        {
+            return MetalStorageMode::Shared;
         }
 
         match desc.heap {
@@ -1440,23 +1641,35 @@ pub fn detected_host_gpu_profile() -> HostGpuProfile {
 }
 
 fn detect_host_gpu_profile() -> HostGpuProfile {
+    let profile = {
     #[cfg(target_os = "macos")]
     {
         if let Some(chip_name) = detect_macos_apple_chip_name() {
-            return host_gpu_profile_from_name(&chip_name);
+            host_gpu_profile_from_name(&chip_name)
+        } else {
+            host_gpu_profile_from_name("Apple GPU")
         }
     }
-    host_gpu_profile_from_name("Apple GPU")
+    #[cfg(not(target_os = "macos"))]
+    {
+        host_gpu_profile_from_name("Apple GPU")
+    }
+    };
+    match reported_gpu_vendor_override() {
+        Some(vendor) => apply_reported_gpu_vendor_compatibility(profile, vendor),
+        None => profile,
+    }
 }
 
 pub(crate) fn host_gpu_profile_from_name(name: &str) -> HostGpuProfile {
     let normalized = normalize_gpu_name(name);
     let family = metal_family_for_gpu_name(&normalized).unwrap_or(8);
+    let vendor = reported_gpu_vendor_for_name(&normalized);
     HostGpuProfile {
         adapter: AdapterInfo {
             id: 1,
-            vendor_id: 0x106b,
-            device_id: 0x1000 + family as u32,
+            vendor_id: vendor.vendor_id(),
+            device_id: vendor.synthetic_device_id(family),
             name: normalized.clone(),
             metal_family: format!("apple{family}"),
         },
@@ -1468,6 +1681,46 @@ pub(crate) fn host_gpu_profile_from_name(name: &str) -> HostGpuProfile {
             mesh_shaders: family >= 9,
         },
     }
+}
+
+fn reported_gpu_vendor_for_name(name: &str) -> ReportedGpuVendor {
+    let upper = name.to_ascii_uppercase();
+    if upper.contains("NVIDIA") || upper.contains("GEFORCE") || upper.contains("QUADRO") || upper.contains("RTX") || upper.contains("GTX") {
+        ReportedGpuVendor::Nvidia
+    } else if upper.starts_with("AMD ") || upper.contains("RADEON") {
+        ReportedGpuVendor::Amd
+    } else {
+        ReportedGpuVendor::Apple
+    }
+}
+
+fn reported_gpu_vendor_override() -> Option<ReportedGpuVendor> {
+    let value = std::env::var(GPU_COMPAT_VENDOR_ENV).ok()?;
+    match value.trim().to_ascii_lowercase().as_str() {
+        "auto" | "" => None,
+        "apple" => Some(ReportedGpuVendor::Apple),
+        "nvidia" | "geforce" => Some(ReportedGpuVendor::Nvidia),
+        "amd" | "radeon" => Some(ReportedGpuVendor::Amd),
+        _ => None,
+    }
+}
+
+fn apply_reported_gpu_vendor_compatibility(
+    mut profile: HostGpuProfile,
+    vendor: ReportedGpuVendor,
+) -> HostGpuProfile {
+    let family = profile
+        .adapter
+        .metal_family
+        .strip_prefix("apple")
+        .and_then(|value| value.parse::<u8>().ok())
+        .unwrap_or(8);
+    profile.adapter.vendor_id = vendor.vendor_id();
+    profile.adapter.device_id = vendor.synthetic_device_id(family);
+    if vendor != ReportedGpuVendor::Apple && profile.adapter.name.starts_with("Apple ") {
+        profile.adapter.name = vendor.compatibility_adapter_name(&profile.adapter.name);
+    }
+    profile
 }
 
 fn normalize_gpu_name(name: &str) -> String {
@@ -1545,6 +1798,7 @@ mod tests {
     fn apple_m_series_profiles_map_to_expected_metal_families() {
         let m1 = host_gpu_profile_from_name("Apple M1 Max");
         assert_eq!(m1.adapter.name, "Apple M1 Max");
+        assert_eq!(m1.adapter.vendor_id, 0x106b);
         assert_eq!(m1.adapter.metal_family, "apple7");
         assert!(m1.capabilities.unified_memory);
         assert!(m1.capabilities.argument_buffers);
@@ -1565,6 +1819,44 @@ mod tests {
     }
 
     #[test]
+    fn nvidia_and_amd_profiles_report_vendor_compatible_adapter_ids() {
+        let nvidia = host_gpu_profile_from_name("NVIDIA GeForce RTX 4080");
+        assert_eq!(nvidia.adapter.vendor_id, 0x10de);
+        assert_eq!(nvidia.adapter.device_id, 0x2008);
+        assert_eq!(nvidia.adapter.name, "NVIDIA GeForce RTX 4080");
+        assert_eq!(nvidia.adapter.metal_family, "apple8");
+        assert!(!nvidia.capabilities.unified_memory);
+        assert!(!nvidia.capabilities.memoryless_render_targets);
+
+        let amd = host_gpu_profile_from_name("AMD Radeon RX 7900 XTX");
+        assert_eq!(amd.adapter.vendor_id, 0x1002);
+        assert_eq!(amd.adapter.device_id, 0x7008);
+        assert_eq!(amd.adapter.name, "AMD Radeon RX 7900 XTX");
+        assert_eq!(amd.adapter.metal_family, "apple8");
+        assert!(!amd.capabilities.unified_memory);
+        assert!(!amd.capabilities.memoryless_render_targets);
+    }
+
+    #[test]
+    fn reported_vendor_compatibility_override_preserves_underlying_metal_capabilities() {
+        let apple = host_gpu_profile_from_name("Apple M3 Pro");
+        let nvidia = apply_reported_gpu_vendor_compatibility(apple.clone(), ReportedGpuVendor::Nvidia);
+        let amd = apply_reported_gpu_vendor_compatibility(apple.clone(), ReportedGpuVendor::Amd);
+
+        assert_eq!(nvidia.adapter.vendor_id, 0x10de);
+        assert_eq!(nvidia.adapter.device_id, 0x2009);
+        assert_eq!(nvidia.adapter.name, "NVIDIA Compatibility Adapter (Apple M3 Pro)");
+        assert_eq!(nvidia.adapter.metal_family, "apple9");
+        assert_eq!(nvidia.capabilities, apple.capabilities);
+
+        assert_eq!(amd.adapter.vendor_id, 0x1002);
+        assert_eq!(amd.adapter.device_id, 0x7009);
+        assert_eq!(amd.adapter.name, "AMD Compatibility Adapter (Apple M3 Pro)");
+        assert_eq!(amd.adapter.metal_family, "apple9");
+        assert_eq!(amd.capabilities, apple.capabilities);
+    }
+
+    #[test]
     fn graphics_backend_uses_capability_profile_for_features_and_storage_modes() {
         let mut backend = GraphicsBackend::with_host_profile(host_gpu_profile_from_name("Apple M3 Ultra"));
 
@@ -1581,6 +1873,7 @@ mod tests {
                 size: 256,
                 subresources: 1,
                 initial_state: ResourceState::GenericRead,
+                usage_hint: ResourceUsageHint::Generic,
             })
             .expect("create upload resource");
         assert_eq!(
@@ -1596,11 +1889,162 @@ mod tests {
                 size: 4096,
                 subresources: 1,
                 initial_state: ResourceState::DepthWrite,
+                usage_hint: ResourceUsageHint::DepthStencil,
             })
             .expect("create depth resource");
         assert_eq!(
             backend.resource_storage_mode(depth).expect("depth storage mode"),
             MetalStorageMode::Memoryless
         );
+    }
+
+    #[test]
+    fn graphics_backend_prefers_shared_storage_for_small_dynamic_buffers_on_unified_memory_apple_gpus() {
+        let mut backend = GraphicsBackend::with_host_profile(host_gpu_profile_from_name("Apple M5 Pro"));
+
+        let small_dynamic_buffer = backend
+            .create_resource(ResourceDesc {
+                name: "small-dynamic-vertex-buffer".to_string(),
+                format: DxgiFormat::R32Float,
+                heap: HeapType::Default,
+                size: 4096,
+                subresources: 1,
+                initial_state: ResourceState::Common,
+                usage_hint: ResourceUsageHint::Buffer {
+                    role: BufferRole::Vertex,
+                    cpu_write_frequent: true,
+                },
+            })
+            .expect("create small dynamic vertex buffer");
+        assert_eq!(
+            backend
+                .resource_storage_mode(small_dynamic_buffer)
+                .expect("small dynamic buffer storage mode"),
+            MetalStorageMode::Shared
+        );
+
+        let small_static_buffer = backend
+            .create_resource(ResourceDesc {
+                name: "small-static-vertex-buffer".to_string(),
+                format: DxgiFormat::R32Float,
+                heap: HeapType::Default,
+                size: 4096,
+                subresources: 1,
+                initial_state: ResourceState::Common,
+                usage_hint: ResourceUsageHint::Buffer {
+                    role: BufferRole::Vertex,
+                    cpu_write_frequent: false,
+                },
+            })
+            .expect("create small static vertex buffer");
+        assert_eq!(
+            backend
+                .resource_storage_mode(small_static_buffer)
+                .expect("small static buffer storage mode"),
+            MetalStorageMode::Private
+        );
+
+        let large_dynamic_buffer = backend
+            .create_resource(ResourceDesc {
+                name: "large-dynamic-vertex-buffer".to_string(),
+                format: DxgiFormat::R32Float,
+                heap: HeapType::Default,
+                size: 256 * 1024,
+                subresources: 1,
+                initial_state: ResourceState::Common,
+                usage_hint: ResourceUsageHint::Buffer {
+                    role: BufferRole::Vertex,
+                    cpu_write_frequent: true,
+                },
+            })
+            .expect("create large dynamic vertex buffer");
+        assert_eq!(
+            backend
+                .resource_storage_mode(large_dynamic_buffer)
+                .expect("large dynamic buffer storage mode"),
+            MetalStorageMode::Private
+        );
+
+        let streamed_texture = backend
+            .create_resource(ResourceDesc {
+                name: "streamed-texture".to_string(),
+                format: DxgiFormat::R8G8B8A8Unorm,
+                heap: HeapType::Default,
+                size: 128 * 128 * 4,
+                subresources: 1,
+                initial_state: ResourceState::Common,
+                usage_hint: ResourceUsageHint::Texture {
+                    sampled: true,
+                    render_target: false,
+                    depth_stencil: false,
+                    cpu_write_frequent: true,
+                },
+            })
+            .expect("create streamed texture");
+        assert_eq!(
+            backend
+                .resource_storage_mode(streamed_texture)
+                .expect("streamed texture storage mode"),
+            MetalStorageMode::Shared
+        );
+
+        let render_target_texture = backend
+            .create_resource(ResourceDesc {
+                name: "render-target-texture".to_string(),
+                format: DxgiFormat::B8G8R8A8Unorm,
+                heap: HeapType::Default,
+                size: 128 * 128 * 4,
+                subresources: 1,
+                initial_state: ResourceState::Common,
+                usage_hint: ResourceUsageHint::Texture {
+                    sampled: false,
+                    render_target: true,
+                    depth_stencil: false,
+                    cpu_write_frequent: true,
+                },
+            })
+            .expect("create render target texture");
+        assert_eq!(
+            backend
+                .resource_storage_mode(render_target_texture)
+                .expect("render target texture storage mode"),
+            MetalStorageMode::Private
+        );
+    }
+
+    #[test]
+    fn graphics_backend_uses_low_latency_swapchain_defaults_on_apple_silicon() {
+        let mut backend = GraphicsBackend::with_host_profile(host_gpu_profile_from_name("Apple M5 Pro"));
+
+        let swapchain = backend
+            .create_swapchain(SwapchainDesc {
+                width: 1920,
+                height: 1080,
+                format: DxgiFormat::B8G8R8A8Unorm,
+                buffer_count: 2,
+            })
+            .expect("create swapchain");
+
+        let state = backend.swapchain_state(swapchain).expect("swapchain state");
+
+        assert_eq!(state.max_frame_latency, 1);
+    }
+
+    #[test]
+    fn graphics_backend_preserves_deeper_swapchain_latency_for_non_unified_profiles() {
+        let mut backend = GraphicsBackend::with_host_profile(host_gpu_profile_from_name("Generic Discrete GPU"));
+
+        let swapchain = backend
+            .create_swapchain(SwapchainDesc {
+                width: 1280,
+                height: 720,
+                format: DxgiFormat::R8G8B8A8Unorm,
+                buffer_count: 2,
+            })
+            .expect("create swapchain");
+
+        let state = backend.swapchain_state(swapchain).expect("swapchain state");
+
+        assert_eq!(state.max_frame_latency, 3);
     }
 }

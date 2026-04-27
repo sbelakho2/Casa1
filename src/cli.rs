@@ -79,6 +79,24 @@ enum HostCommand {
         #[arg(long)]
         dtm: bool,
         #[arg(long)]
+        steam_update_plan: Option<PathBuf>,
+        #[arg(long)]
+        steam_cert_chain: Option<PathBuf>,
+        #[arg(long)]
+        steam_appmanifest: Option<PathBuf>,
+        #[arg(long)]
+        steam_installscript: Option<PathBuf>,
+        #[arg(long)]
+        steam_payload_root: Option<PathBuf>,
+        #[arg(long)]
+        steam_libraryfolders: Option<PathBuf>,
+        #[arg(long)]
+        steam_library_root: Option<String>,
+        #[arg(long)]
+        steam_library_host_root: Option<PathBuf>,
+        #[arg(long)]
+        steam_library_host_map: Option<PathBuf>,
+        #[arg(long)]
         trace_categories: Option<String>,
     },
     #[command(name = "ge:export-diagnostics")]
@@ -207,6 +225,15 @@ where
             installer,
             silent,
             dtm,
+            steam_update_plan,
+            steam_cert_chain,
+            steam_appmanifest,
+            steam_installscript,
+            steam_payload_root,
+            steam_libraryfolders,
+            steam_library_root,
+            steam_library_host_root,
+            steam_library_host_map,
             trace_categories,
         } => {
             let ge = GameEnvironment::open(&ge)?;
@@ -214,10 +241,19 @@ where
             if silent {
                 env.insert("CASA1_INSTALL_SILENT".to_string(), "1".to_string());
             }
-            let mut args = Vec::new();
-            if silent {
-                args.push("--silent".to_string());
-            }
+            insert_steam_zero_touch_inputs(
+                &mut env,
+                steam_update_plan.as_deref(),
+                steam_cert_chain.as_deref(),
+                steam_appmanifest.as_deref(),
+                steam_installscript.as_deref(),
+                steam_payload_root.as_deref(),
+                steam_libraryfolders.as_deref(),
+                steam_library_root.as_deref(),
+                steam_library_host_root.as_deref(),
+                steam_library_host_map.as_deref(),
+            )?;
+            let args = install_args(&installer, silent)?;
             let job = RunnerJob {
                 ge_name: ge.config.name.clone(),
                 ge_root: ge.root.clone(),
@@ -376,6 +412,42 @@ fn parse_env_pairs(values: &[String]) -> AppResult<BTreeMap<String, String>> {
     Ok(pairs)
 }
 
+fn install_args(installer: &Path, silent: bool) -> AppResult<Vec<String>> {
+    if !silent {
+        return Ok(Vec::new());
+    }
+
+    let bytes = fs::read(installer).map_err(|error| {
+        AppError::from_io(
+            ReasonCode::RcIo,
+            format!("failed to read {}", installer.display()),
+            &error,
+        )
+    })?;
+    Ok(detect_installer_silent_args(&bytes))
+}
+
+fn detect_installer_silent_args(bytes: &[u8]) -> Vec<String> {
+    if contains_ascii_marker(bytes, b"Nullsoft.NSIS.exehead")
+        || contains_ascii_marker(bytes, b"Nullsoft Install System")
+        || contains_ascii_marker(bytes, b"NullsoftInst")
+    {
+        return vec!["/S".to_string()];
+    }
+    if contains_ascii_marker(bytes, b"Inno Setup Setup Data")
+        || contains_ascii_marker(bytes, b"inno setup")
+    {
+        return vec!["/VERYSILENT".to_string(), "/SUPPRESSMSGBOXES".to_string()];
+    }
+    vec!["--silent".to_string()]
+}
+
+fn contains_ascii_marker(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle))
+}
+
 fn resolve_trace_categories(raw: Option<&str>, intent: RunIntent) -> AppResult<Vec<trace::TraceCategory>> {
     match raw {
         Some(value) => trace::parse_categories(Some(value)),
@@ -389,6 +461,110 @@ fn insert_input_replay(env: &mut BTreeMap<String, String>, input_replay: Option<
         env.insert(
             "CASA1_KEYBOARD_REPLAY_JSON".to_string(),
             read_input_replay(input_replay)?,
+        );
+    }
+    Ok(())
+}
+
+fn insert_steam_zero_touch_inputs(
+    env: &mut BTreeMap<String, String>,
+    steam_update_plan: Option<&Path>,
+    steam_cert_chain: Option<&Path>,
+    steam_appmanifest: Option<&Path>,
+    steam_installscript: Option<&Path>,
+    steam_payload_root: Option<&Path>,
+    steam_libraryfolders: Option<&Path>,
+    steam_library_root: Option<&str>,
+    steam_library_host_root: Option<&Path>,
+    steam_library_host_map: Option<&Path>,
+) -> AppResult<()> {
+    let required_steam_args = [
+        steam_update_plan.is_some(),
+        steam_cert_chain.is_some(),
+        steam_appmanifest.is_some(),
+        steam_installscript.is_some(),
+        steam_payload_root.is_some(),
+    ];
+    let has_any_steam_inputs = required_steam_args.iter().any(|present| *present)
+        || steam_libraryfolders.is_some()
+        || steam_library_root.is_some()
+        || steam_library_host_root.is_some()
+        || steam_library_host_map.is_some();
+    if !has_any_steam_inputs {
+        return Ok(());
+    }
+    if !required_steam_args.iter().all(|present| *present) {
+        return Err(AppError::new(
+            ReasonCode::RcCliInvalid,
+            "Steam zero-touch install requires all Steam metadata flags together",
+        )
+        .with_hint("required flags: --steam-update-plan, --steam-cert-chain, --steam-appmanifest, --steam-installscript, --steam-payload-root"));
+    }
+    if steam_library_host_root.is_some() && steam_library_root.is_none() {
+        return Err(AppError::new(
+            ReasonCode::RcCliInvalid,
+            "Steam library host root requires --steam-library-root",
+        )
+        .with_hint("provide both --steam-library-root and --steam-library-host-root to map a guest Steam library drive onto an external host path"));
+    }
+    if steam_library_host_map.is_some() && steam_library_root.is_none() && steam_libraryfolders.is_none() {
+        return Err(AppError::new(
+            ReasonCode::RcCliInvalid,
+            "Steam library host map requires --steam-library-root or --steam-libraryfolders",
+        )
+        .with_hint("provide --steam-libraryfolders for metadata-driven selection, or --steam-library-root for an explicit library target"));
+    }
+    if steam_library_host_root.is_some() && steam_library_host_map.is_some() {
+        return Err(AppError::new(
+            ReasonCode::RcCliInvalid,
+            "Steam library host root and host map are mutually exclusive",
+        )
+        .with_hint("use --steam-library-host-root for one explicit library, or --steam-library-host-map for metadata-driven multi-library selection"));
+    }
+
+    env.insert("CASA1_STEAM_ZERO_TOUCH".to_string(), "1".to_string());
+    env.insert(
+        "CASA1_STEAM_UPDATE_PLAN_PATH".to_string(),
+        steam_update_plan.expect("validated").display().to_string(),
+    );
+    env.insert(
+        "CASA1_STEAM_CERT_CHAIN_PATH".to_string(),
+        steam_cert_chain.expect("validated").display().to_string(),
+    );
+    env.insert(
+        "CASA1_STEAM_APPMANIFEST_PATH".to_string(),
+        steam_appmanifest.expect("validated").display().to_string(),
+    );
+    env.insert(
+        "CASA1_STEAM_INSTALLSCRIPT_PATH".to_string(),
+        steam_installscript.expect("validated").display().to_string(),
+    );
+    env.insert(
+        "CASA1_STEAM_PAYLOAD_ROOT".to_string(),
+        steam_payload_root.expect("validated").display().to_string(),
+    );
+    if let Some(steam_libraryfolders) = steam_libraryfolders {
+        env.insert(
+            "CASA1_STEAM_LIBRARYFOLDERS_PATH".to_string(),
+            steam_libraryfolders.display().to_string(),
+        );
+    }
+    if let Some(steam_library_root) = steam_library_root {
+        env.insert(
+            "CASA1_STEAM_LIBRARY_ROOT".to_string(),
+            steam_library_root.to_string(),
+        );
+    }
+    if let Some(steam_library_host_root) = steam_library_host_root {
+        env.insert(
+            "CASA1_STEAM_LIBRARY_HOST_ROOT".to_string(),
+            steam_library_host_root.display().to_string(),
+        );
+    }
+    if let Some(steam_library_host_map) = steam_library_host_map {
+        env.insert(
+            "CASA1_STEAM_LIBRARY_HOST_MAP_PATH".to_string(),
+            steam_library_host_map.display().to_string(),
         );
     }
     Ok(())
@@ -468,5 +644,11 @@ mod tests {
     fn ge_run_defaults_to_all_trace_categories() {
         let categories = resolve_trace_categories(None, RunIntent::Run).expect("default run trace categories");
         assert_eq!(categories, trace::all_categories());
+    }
+
+    #[test]
+    fn detect_installer_silent_args_prefers_nsis_switches() {
+        let args = detect_installer_silent_args(b"Nullsoft.NSIS.exehead\0Nullsoft Install System v3.0");
+        assert_eq!(args, vec!["/S".to_string()]);
     }
 }

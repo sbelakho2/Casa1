@@ -2,6 +2,7 @@ pub mod audio;
 pub mod canonical;
 pub mod cli;
 pub mod cpu;
+pub mod d3d12;
 pub mod d3d11;
 pub mod diagnostics;
 pub mod error;

@@ -1,7 +1,8 @@
 use casa1::gfx::{
     format_mapping, Command, DescriptorHeapType, DxgiFormat, EmulationStrategy, FeatureQuery,
     FilterMode, FrameArtifact, GraphicsBackend, HeapType, PipelineStateDesc, QueryType,
-    ResourceDesc, ResourceState, RootSignatureDesc, SceneSpec, SwapchainDesc, ViewDescriptor,
+    ResourceDesc, ResourceState, ResourceUsageHint, RootSignatureDesc, SceneSpec, SwapchainDesc,
+    ViewDescriptor,
 };
 use casa1::reason::ReasonCode;
 use std::fs;
@@ -28,13 +29,16 @@ fn reference_frame_hash(scene: &SceneSpec) -> String {
 fn t7_1_dxgi_swapchain_oracle_suite_matches_expected_present_resize_and_latency_behavior() {
     let mut backend = GraphicsBackend::new();
     assert_eq!(backend.adapter().vendor_id, 0x106b);
-    assert_eq!(backend.adapter().device_id, 0x0001);
+    assert!(backend.adapter().device_id >= 0x1000);
     assert_eq!(backend.outputs().len(), 2);
     assert_eq!(backend.outputs()[0].modes[0].width, 2560);
     assert_eq!(backend.outputs()[0].modes[0].refresh_numerator, 60_000);
     assert!(backend.query_feature(FeatureQuery::Tearing));
     assert!(backend.query_feature(FeatureQuery::TimestampQueries));
-    assert!(!backend.query_feature(FeatureQuery::MeshShaders));
+    assert_eq!(
+        backend.query_feature(FeatureQuery::MeshShaders),
+        backend.adapter().metal_family != "apple7" && backend.adapter().metal_family != "apple8"
+    );
     assert_eq!(
         backend.query_format_support(DxgiFormat::Bc1Unorm).expect("BC1 support").strategy,
         EmulationStrategy::ConversionShader
@@ -113,6 +117,7 @@ fn t7_2_d3d12_microtests_cover_barriers_descriptors_aliasing_root_constants_quer
             size: 64,
             subresources: 2,
             initial_state: ResourceState::Common,
+            usage_hint: ResourceUsageHint::Generic,
         })
         .expect("create color resource");
     let depth = backend
@@ -123,6 +128,7 @@ fn t7_2_d3d12_microtests_cover_barriers_descriptors_aliasing_root_constants_quer
             size: 64,
             subresources: 1,
             initial_state: ResourceState::DepthWrite,
+            usage_hint: ResourceUsageHint::DepthStencil,
         })
         .expect("create depth resource");
     let upload = backend
@@ -133,6 +139,7 @@ fn t7_2_d3d12_microtests_cover_barriers_descriptors_aliasing_root_constants_quer
             size: 16,
             subresources: 1,
             initial_state: ResourceState::GenericRead,
+            usage_hint: ResourceUsageHint::Generic,
         })
         .expect("create upload resource");
     let readback = backend
@@ -143,6 +150,7 @@ fn t7_2_d3d12_microtests_cover_barriers_descriptors_aliasing_root_constants_quer
             size: 16,
             subresources: 1,
             initial_state: ResourceState::CopyDest,
+            usage_hint: ResourceUsageHint::Generic,
         })
         .expect("create readback resource");
 
@@ -447,6 +455,7 @@ fn t7_5_resource_create_destroy_soak_keeps_live_set_bounded_and_frame_times_stab
                 size: 32,
                 subresources: 1,
                 initial_state: ResourceState::Common,
+                usage_hint: ResourceUsageHint::Generic,
             })
             .expect("create transient resource");
         backend.destroy_resource(resource).expect("destroy transient resource");

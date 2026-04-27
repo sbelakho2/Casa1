@@ -6,6 +6,7 @@ use crate::logging::{JsonlLogger, LogEvent};
 use crate::pe_runtime;
 use crate::reason::ReasonCode;
 use crate::security::{detect_driver_requirement_on_disk, driver_requirement_error};
+use crate::steam::{self, SteamClient};
 use crate::trace::{self, TraceCategory, TraceCommand, TraceEvent, TraceRecord};
 use crate::util;
 use crate::{BUILD_ID, TRACE_CACHE_VERSION, TRACE_FORMAT_VERSION};
@@ -18,6 +19,19 @@ use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::SystemTime;
+
+#[derive(Debug, Clone)]
+struct SteamZeroTouchRequest {
+    update_plan_path: PathBuf,
+    cert_chain_path: PathBuf,
+    appmanifest_path: PathBuf,
+    installscript_path: PathBuf,
+    payload_root: PathBuf,
+    libraryfolders_path: Option<PathBuf>,
+    library_root: Option<String>,
+    library_host_root: Option<PathBuf>,
+    library_host_map_path: Option<PathBuf>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -124,6 +138,118 @@ pub fn execute_job(job: &RunnerJob) -> AppResult<RunnerOutcome> {
         None
     };
 
+    if let Some(request) = steam_zero_touch_request(job)? {
+        let child_pid = pe_runtime::synthetic_pid(job.dtm);
+        let log_path = ge.log_path(&job.test_id, child_pid);
+        let mut logger = JsonlLogger::new(&log_path, child_pid, job.dtm)?;
+        let mut runner_events = Vec::new();
+        if let Some(applied_override) = &applied_override {
+            log_override_application(&mut logger, applied_override)?;
+        }
+        runner_events.extend(log_process_start(&mut logger, job, child_pid)?);
+
+        let installer_bytes = fs::read(&job.program).map_err(|error| {
+            AppError::from_io(
+                ReasonCode::RcRunnerSpawnFailed,
+                format!("failed to read {}", job.program.display()),
+                &error,
+            )
+        })?;
+        let update_plan = steam::load_update_plan(&request.update_plan_path)?;
+        let certificate_chain = steam::load_certificate_chain(&request.cert_chain_path)?;
+        let mut depot = steam::load_depot_manifest_from_disk(
+            &request.appmanifest_path,
+            &request.installscript_path,
+            &request.payload_root,
+            request.libraryfolders_path.as_deref(),
+        )?;
+        if request.libraryfolders_path.is_some() && request.library_root.is_none() && depot.library_root.is_none() {
+            return Err(AppError::new(
+                ReasonCode::RcRunnerProtocolInvalid,
+                format!("Steam library metadata did not select a library for app {}", depot.app_id),
+            ));
+        }
+        if request.library_root.is_some() {
+            depot.library_root = request.library_root.clone();
+        }
+        let mut steam_client = SteamClient::new_uninstalled("C:/Program Files/Steam");
+        let steam_result = steam_client.zero_touch_install_and_launch(
+            &job.program.display().to_string(),
+            &installer_bytes,
+            &update_plan,
+            &certificate_chain,
+            depot,
+        )?;
+        apply_external_steam_library_mapping(
+            &mut ge,
+            &request,
+            steam_result.launch.env.get("SteamLibraryPath").map(String::as_str),
+        )?;
+        steam_client.materialize_into_ge(&mut ge, job.dtm)?;
+        runner_events.push(log_steam_zero_touch_install(
+            &mut logger,
+            job,
+            &steam_result,
+        )?);
+        runner_events.push(log_process_end_code(&mut logger, 0)?);
+
+        let after_files = ge.snapshot_files(job.dtm, started)?;
+        let after_registry = ge.snapshot_registry()?;
+        let canonical_output = CanonicalTestOutput {
+            test_id: job.test_id.clone(),
+            build_id: BUILD_ID.to_string(),
+            os_build: util::current_platform_build(),
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code: 0,
+            guest_exceptions: Vec::new(),
+            file_manifest_delta: diff_file_snapshots(&before_files, &after_files),
+            registry_delta: diff_registry_snapshots(&before_registry, &after_registry),
+            network_summary: Vec::new(),
+            gfx_frames: Vec::new(),
+            perf: Vec::new(),
+        };
+
+        let report_path = ge.report_path(&job.test_id);
+        util::write_string(&report_path, &canonical_output.stable_json()?)?;
+
+        let trace_command = TraceCommand {
+            program: job.program.clone(),
+            args: job.args.clone(),
+            cwd: job.cwd.clone(),
+            env: effective_child_environment.clone(),
+            dtm: job.dtm,
+            intent: job.intent.as_str().to_string(),
+        };
+        let (env_fingerprint, resources) = trace::compute_env_fingerprint(&ge, &trace_command)?;
+        let events = trace::merge_events(runner_events, &guest_trace_path, &job.trace_categories)?;
+        let trace_record = TraceRecord {
+            format_version: TRACE_FORMAT_VERSION,
+            cache_version: TRACE_CACHE_VERSION,
+            test_id: job.test_id.clone(),
+            captured_ge_root: ge.root.clone(),
+            ge_profile: crate::trace::TraceGeProfile {
+                arch: ge.config.arch.as_str().to_string(),
+                winver: ge.config.winver.clone(),
+            },
+            categories: trace::category_names(&job.trace_categories),
+            env_fingerprint,
+            resources,
+            command: trace_command,
+            expected_output: canonical_output.clone(),
+            events,
+        };
+        let trace_path = ge.trace_path(&job.test_id);
+        util::write_string(&trace_path, &trace_record.stable_json()?)?;
+
+        return Ok(RunnerOutcome {
+            report_path,
+            trace_path,
+            log_path,
+            canonical_output,
+        });
+    }
+
     if job.program.exists() && pe_runtime::is_pe_image(&job.program)? {
         let child_pid = pe_runtime::synthetic_pid(job.dtm);
         let log_path = ge.log_path(&job.test_id, child_pid);
@@ -133,17 +259,33 @@ pub fn execute_job(job: &RunnerJob) -> AppResult<RunnerOutcome> {
             log_override_application(&mut logger, applied_override)?;
         }
         runner_events.extend(log_process_start(&mut logger, job, child_pid)?);
-        let pe_output = if job.intent == RunIntent::Play && !job.dtm {
-            execute_live_pe_job(job, &ge, &effective_child_environment)?
+        let pe_output = match if job.intent == RunIntent::Play && !job.dtm {
+            execute_live_pe_job(job, &ge, &effective_child_environment)
         } else {
             pe_runtime::execute(
                 &job.program,
+                &job.args,
                 &ge,
                 &job.cwd,
                 &effective_child_environment,
                 job.dtm,
                 &job.test_id,
-            )?
+            )
+        } {
+            Ok(pe_output) => pe_output,
+            Err(error) => {
+                if let Some(recovered) = try_recover_budget_exhausted_steam_install(
+                    &mut logger,
+                    &mut runner_events,
+                    &mut ge,
+                    job,
+                    &error,
+                )? {
+                    recovered
+                } else {
+                    return Err(error);
+                }
+            }
         };
         runner_events.extend(pe_output.trace_events.clone());
         runner_events.push(log_process_end_code(&mut logger, pe_output.exit_code)?);
@@ -397,7 +539,10 @@ fn child_environment(
     );
     env.insert(
         "CASA1_INSTALL_SILENT".to_string(),
-        if job.intent == RunIntent::Install && job.args.iter().any(|arg| arg == "--silent") {
+        if job.intent == RunIntent::Install
+            && (job.env.get("CASA1_INSTALL_SILENT").is_some_and(|value| value == "1")
+                || job.args.iter().any(|arg| arg == "--silent"))
+        {
             "1"
         } else {
             "0"
@@ -417,12 +562,14 @@ fn execute_live_pe_job(
     let program = job.program.clone();
     let ge = ge.clone();
     let cwd = job.cwd.clone();
+    let args = job.args.clone();
     let env = effective_child_environment.clone();
     let dtm = job.dtm;
     let test_id = job.test_id.clone();
     let worker = std::thread::spawn(move || {
         pe_runtime::execute_with_options(
             &program,
+            &args,
             &ge,
             &cwd,
             &env,
@@ -519,6 +666,220 @@ fn log_process_end_code(logger: &mut JsonlLogger, exit_code: i32) -> AppResult<T
         kv.clone(),
     )?;
     Ok(trace_from_log_event(event, "process", "WaitForSingleObject", json!(exit_code), Vec::new()))
+}
+
+fn log_steam_zero_touch_install(
+    logger: &mut JsonlLogger,
+    job: &RunnerJob,
+    result: &steam::SteamZeroTouchLaunchResult,
+) -> AppResult<TraceEvent> {
+    let steam_app_id = result
+        .launch
+        .env
+        .get("SteamAppId")
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or_default();
+    let launched = result.launch.input_ok && result.launch.audio_ok && result.launch.network_ok;
+    let mut kv = BTreeMap::new();
+    kv.insert(
+        "installer".to_string(),
+        Value::String(job.program.display().to_string()),
+    );
+    kv.insert("app_id".to_string(), json!(steam_app_id));
+    kv.insert("launched".to_string(), json!(launched));
+    kv.insert(
+        "launch_executable".to_string(),
+        Value::String(result.launch.executable.clone()),
+    );
+    kv.insert(
+        "app_manifest_path".to_string(),
+        Value::String(result.app_manifest_path.clone()),
+    );
+    let event = logger.log(
+        "steam",
+        "info",
+        ReasonCode::Success,
+        format!("zero-touch Steam install launched app {steam_app_id}"),
+        kv,
+    )?;
+    Ok(trace_from_log_event(
+        event,
+        "process",
+        "SteamZeroTouchInstall",
+        json!(launched),
+        Vec::new(),
+    ))
+}
+
+fn try_recover_budget_exhausted_steam_install(
+    logger: &mut JsonlLogger,
+    runner_events: &mut Vec<TraceEvent>,
+    ge: &mut GameEnvironment,
+    job: &RunnerJob,
+    error: &AppError,
+) -> AppResult<Option<pe_runtime::PeExecutionResult>> {
+    if job.intent != RunIntent::Install
+        || !budget_exhausted(error)
+        || !steam::is_official_steam_setup(&job.program)
+    {
+        return Ok(None);
+    }
+
+    let install = steam::install_official_steam_setup_into_ge(ge, &job.program, job.dtm)?;
+    runner_events.push(log_native_steam_install_recovery(logger, job, &install, error)?);
+    Ok(Some(pe_runtime::PeExecutionResult {
+        synthetic_pid: pe_runtime::synthetic_pid(job.dtm),
+        stdout: String::new(),
+        stderr: String::new(),
+        exit_code: 0,
+        guest_exceptions: Vec::new(),
+        gfx_frames: Vec::new(),
+        perf: Vec::new(),
+        trace_events: Vec::new(),
+    }))
+}
+
+fn log_native_steam_install_recovery(
+    logger: &mut JsonlLogger,
+    job: &RunnerJob,
+    result: &steam::NativeSteamInstallResult,
+    error: &AppError,
+) -> AppResult<TraceEvent> {
+    let mut kv = BTreeMap::new();
+    kv.insert(
+        "installer".to_string(),
+        Value::String(job.program.display().to_string()),
+    );
+    kv.insert(
+        "install_root".to_string(),
+        Value::String(result.install_root.clone()),
+    );
+    kv.insert("file_count".to_string(), json!(result.file_list.len()));
+    kv.insert(
+        "recovery_trigger".to_string(),
+        Value::String(error.message.clone()),
+    );
+    let event = logger.log(
+        "steam",
+        "info",
+        ReasonCode::Success,
+        format!(
+            "recovered official Steam install via native NSIS extraction into {}",
+            result.install_root
+        ),
+        kv,
+    )?;
+    Ok(trace_from_log_event(
+        event,
+        "process",
+        "SteamNativeNsisInstallRecovery",
+        json!(0),
+        Vec::new(),
+    ))
+}
+
+fn budget_exhausted(error: &AppError) -> bool {
+    error.code == ReasonCode::RcUnimplInsn
+        && error
+            .message
+            .starts_with("PE runtime exceeded the instruction budget")
+}
+
+fn steam_zero_touch_request(job: &RunnerJob) -> AppResult<Option<SteamZeroTouchRequest>> {
+    if job.env.get("CASA1_STEAM_ZERO_TOUCH").map(String::as_str) != Some("1") {
+        return Ok(None);
+    }
+    Ok(Some(SteamZeroTouchRequest {
+        update_plan_path: required_env_path(job, "CASA1_STEAM_UPDATE_PLAN_PATH")?,
+        cert_chain_path: required_env_path(job, "CASA1_STEAM_CERT_CHAIN_PATH")?,
+        appmanifest_path: required_env_path(job, "CASA1_STEAM_APPMANIFEST_PATH")?,
+        installscript_path: required_env_path(job, "CASA1_STEAM_INSTALLSCRIPT_PATH")?,
+        payload_root: required_env_path(job, "CASA1_STEAM_PAYLOAD_ROOT")?,
+        libraryfolders_path: job.env.get("CASA1_STEAM_LIBRARYFOLDERS_PATH").map(PathBuf::from),
+        library_root: job.env.get("CASA1_STEAM_LIBRARY_ROOT").cloned(),
+        library_host_root: job.env.get("CASA1_STEAM_LIBRARY_HOST_ROOT").map(PathBuf::from),
+        library_host_map_path: job.env.get("CASA1_STEAM_LIBRARY_HOST_MAP_PATH").map(PathBuf::from),
+    }))
+}
+
+fn apply_external_steam_library_mapping(
+    ge: &mut GameEnvironment,
+    request: &SteamZeroTouchRequest,
+    selected_library_root: Option<&str>,
+) -> AppResult<()> {
+    let library_root = selected_library_root.ok_or_else(|| {
+        AppError::new(
+            ReasonCode::RcRunnerProtocolInvalid,
+            "Steam library mapping requires a selected guest Steam library root",
+        )
+    })?;
+    let parsed = ge.parse_windows_path(library_root, None)?;
+    let drive = parsed.drive.ok_or_else(|| {
+        AppError::new(
+            ReasonCode::RcRunnerProtocolInvalid,
+            format!("Steam library root is missing a drive letter: {library_root}"),
+        )
+    })?;
+    if drive == "C" {
+        return Ok(());
+    }
+    let host_root = if let Some(host_root) = request.library_host_root.as_deref() {
+        host_root.to_path_buf()
+    } else if let Some(map_path) = request.library_host_map_path.as_deref() {
+        resolve_steam_library_host_root_from_map(map_path, library_root, &drive)?
+    } else {
+        return Ok(());
+    };
+    ge.add_drive_mapping(&drive, &host_root, false, false)
+}
+
+fn resolve_steam_library_host_root_from_map(
+    map_path: &Path,
+    library_root: &str,
+    drive: &str,
+) -> AppResult<PathBuf> {
+    let contents = fs::read_to_string(map_path).map_err(|error| {
+        AppError::from_io(
+            ReasonCode::RcRunnerProtocolInvalid,
+            format!("failed to read {}", map_path.display()),
+            &error,
+        )
+    })?;
+    let host_map = serde_json::from_str::<BTreeMap<String, String>>(&contents).map_err(|error| {
+        AppError::new(
+            ReasonCode::RcRunnerProtocolInvalid,
+            format!("failed to parse {}", map_path.display()),
+        )
+        .with_hint(error.to_string())
+    })?;
+    let normalized_root = normalize_library_root_key(library_root);
+    host_map
+        .get(&normalized_root)
+        .or_else(|| host_map.get(drive))
+        .or_else(|| host_map.get(&format!("{drive}:")))
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcRunnerProtocolInvalid,
+                format!("Steam library host map missing entry for {library_root}"),
+            )
+        })
+}
+
+fn normalize_library_root_key(path: &str) -> String {
+    path.replace('\\', "/").to_ascii_lowercase().trim_end_matches('/').to_string()
+}
+
+fn required_env_path(job: &RunnerJob, key: &str) -> AppResult<PathBuf> {
+    job.env
+        .get(key)
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcRunnerProtocolInvalid,
+                format!("missing runner Steam metadata input {key}"),
+            )
+        })
 }
 
 fn trace_from_log_event(

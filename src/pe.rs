@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 const IMAGE_DOS_SIGNATURE: u16 = 0x5a4d;
 const IMAGE_NT_SIGNATURE: u32 = 0x0000_4550;
+const IMAGE_NT_OPTIONAL_HDR32_MAGIC: u16 = 0x10b;
 const IMAGE_NT_OPTIONAL_HDR64_MAGIC: u16 = 0x20b;
 const IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE: u16 = 0x0040;
 const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
@@ -249,6 +250,7 @@ pub struct ParsedPe {
     pub machine: u16,
     pub number_of_sections: u16,
     pub characteristics: u16,
+    pub optional_header_magic: u16,
     pub dll_characteristics: u16,
     pub address_of_entry_point: u32,
     pub image_base: u64,
@@ -273,6 +275,14 @@ pub struct ParsedPe {
 impl ParsedPe {
     pub fn directory(&self, index: usize) -> DataDirectory {
         self.data_directories.get(index).copied().unwrap_or_default()
+    }
+
+    pub fn pointer_bytes(&self) -> usize {
+        if self.optional_header_magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC {
+            8
+        } else {
+            4
+        }
     }
 
     pub fn dynamic_base(&self) -> bool {
@@ -370,25 +380,29 @@ pub fn parse(bytes: &[u8]) -> AppResult<ParsedPe> {
     checked_range(bytes, optional_offset, size_of_optional_header, "optional header")?;
 
     let magic = read_u16(bytes, optional_offset, "optional header magic")?;
-    if magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC {
-        return invalid("only PE32+ images are supported");
-    }
-    if size_of_optional_header < 112 {
-        return invalid("optional header is too small for PE32+");
+    let (pointer_bytes, minimum_optional_header_size, image_base_offset, data_directory_offset, data_directory_count_offset, format_name) =
+        match magic {
+            IMAGE_NT_OPTIONAL_HDR32_MAGIC => (4_usize, 96_usize, 28_usize, 96_usize, 92_usize, "PE32"),
+            IMAGE_NT_OPTIONAL_HDR64_MAGIC => (8_usize, 112_usize, 24_usize, 112_usize, 108_usize, "PE32+"),
+            _ => return invalid(format!("unsupported optional header magic 0x{magic:04x}")),
+        };
+    if size_of_optional_header < minimum_optional_header_size {
+        return invalid(format!("optional header is too small for {format_name}"));
     }
 
     let address_of_entry_point = read_u32(bytes, optional_offset + 16, "entry point")?;
-    let image_base = read_u64(bytes, optional_offset + 24, "image base")?;
+    let image_base = read_pointer(bytes, optional_offset + image_base_offset, pointer_bytes, "image base")?;
     let section_alignment = read_u32(bytes, optional_offset + 32, "section alignment")?;
     let file_alignment = read_u32(bytes, optional_offset + 36, "file alignment")?;
     let size_of_image = read_u32(bytes, optional_offset + 56, "size of image")?;
     let size_of_headers = read_u32(bytes, optional_offset + 60, "size of headers")?;
     let dll_characteristics = read_u16(bytes, optional_offset + 70, "DLL characteristics")?;
-    let number_of_rva_and_sizes = read_u32(bytes, optional_offset + 108, "data directory count")? as usize;
-    let available_directories = ((size_of_optional_header - 112) / 8).min(number_of_rva_and_sizes);
+    let number_of_rva_and_sizes =
+        read_u32(bytes, optional_offset + data_directory_count_offset, "data directory count")? as usize;
+    let available_directories = ((size_of_optional_header - data_directory_offset) / 8).min(number_of_rva_and_sizes);
     let mut data_directories = vec![DataDirectory::default(); 16.max(available_directories)];
     for index in 0..available_directories {
-        let directory_offset = optional_offset + 112 + index * 8;
+        let directory_offset = optional_offset + data_directory_offset + index * 8;
         data_directories[index] = DataDirectory {
             virtual_address: read_u32(bytes, directory_offset, "data directory RVA")?,
             size: read_u32(bytes, directory_offset + 4, "data directory size")?,
@@ -432,12 +446,12 @@ pub fn parse(bytes: &[u8]) -> AppResult<ParsedPe> {
     }
 
     let debug_entries = parse_debug_entries(bytes, &sections, &data_directories, size_of_headers)?;
-    let load_config = parse_load_config(bytes, &sections, &data_directories)?;
-    let imports = parse_import_directory(bytes, &sections, &data_directories, false, image_base)?;
-    let delay_imports = parse_delay_import_directory(bytes, &sections, &data_directories, image_base)?;
+    let load_config = parse_load_config(bytes, &sections, &data_directories, pointer_bytes)?;
+    let imports = parse_import_directory(bytes, &sections, &data_directories, false, image_base, pointer_bytes)?;
+    let delay_imports = parse_delay_import_directory(bytes, &sections, &data_directories, image_base, pointer_bytes)?;
     let exports = parse_export_directory(bytes, &sections, &data_directories)?;
     let relocations = parse_relocations(bytes, &sections, &data_directories)?;
-    let tls_directory = parse_tls_directory(bytes, &sections, &data_directories, image_base)?;
+    let tls_directory = parse_tls_directory(bytes, &sections, &data_directories, image_base, pointer_bytes)?;
     let version_info = parse_version_resource(bytes, &sections, &data_directories)?;
     let embedded_manifest = parse_embedded_manifest(bytes, &sections, &data_directories)?;
 
@@ -445,6 +459,7 @@ pub fn parse(bytes: &[u8]) -> AppResult<ParsedPe> {
         machine,
         number_of_sections,
         characteristics,
+        optional_header_magic: magic,
         dll_characteristics,
         address_of_entry_point,
         image_base,
@@ -468,17 +483,21 @@ pub fn parse(bytes: &[u8]) -> AppResult<ParsedPe> {
 }
 
 pub fn select_image_base(image: &ParsedPe, image_hash: &str, dtm: bool) -> u64 {
-    if !image.dynamic_base() {
+    if !image.dynamic_base() || image.relocations.is_empty() {
         return image.image_base;
     }
     let alignment = 0x1_0000_u64;
-    let preferred_region = 0x0000_1800_0000_0000_u64;
     let seed = hash_seed(image_hash);
     let randomized_seed = if dtm {
         seed
     } else {
         seed ^ runtime_seed()
     };
+    if image.pointer_bytes() == 4 {
+        let preferred_region = 0x1000_0000_u64;
+        return preferred_region + ((randomized_seed & 0x0000_0000_0fff_0000) / alignment) * alignment;
+    }
+    let preferred_region = 0x0000_1800_0000_0000_u64;
     preferred_region + ((randomized_seed & 0x0000_0fff_ffff_0000) / alignment) * alignment
 }
 
@@ -779,25 +798,110 @@ fn parse_load_config(
     bytes: &[u8],
     sections: &[PeSection],
     directories: &[DataDirectory],
+    pointer_bytes: usize,
 ) -> AppResult<Option<LoadConfig>> {
     let directory = directories.get(IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG).copied().unwrap_or_default();
     if directory.virtual_address == 0 || directory.size == 0 {
         return Ok(None);
     }
-    let offset = rva_to_file_offset(directory.virtual_address, directory.size, sections, 0)?;
-    if directory.size < 0x94 {
-        return invalid("load config directory is smaller than IMAGE_LOAD_CONFIG_DIRECTORY64");
-    }
-    checked_range(bytes, offset, 0x94, "load config directory")?;
+    let offset = rva_to_file_offset(directory.virtual_address, 4, sections, 0)?;
+    let load_config_size = read_u32(bytes, offset, "load config size")? as usize;
+    let section = section_for_rva(sections, directory.virtual_address, 1, false)
+        .ok_or_else(|| pe_error("load config directory is not backed by file data"))?;
+    let relative = directory
+        .virtual_address
+        .checked_sub(section.virtual_address)
+        .ok_or_else(|| pe_error("load config directory underflow"))? as usize;
+    let available_size = section.raw_data_size as usize - relative;
+    let present_size = load_config_size
+        .max(directory.size as usize)
+        .min(available_size);
+    let (se_handler_table_offset, se_handler_count_offset, guard_cf_check_offset, guard_cf_dispatch_offset, guard_cf_function_table_offset, guard_cf_function_count_offset, guard_flags_offset) =
+        if pointer_bytes == 8 {
+            (0x60_usize, 0x68_usize, 0x70_usize, 0x78_usize, 0x80_usize, 0x88_usize, 0x90_usize)
+        } else if present_size >= 0x48 {
+            (0x40_usize, 0x44_usize, 0x48_usize, 0x4c_usize, 0x50_usize, 0x54_usize, 0x58_usize)
+        } else {
+            (0x38_usize, 0x3c_usize, 0x48_usize, 0x4c_usize, 0x50_usize, 0x54_usize, 0x58_usize)
+        };
     Ok(Some(LoadConfig {
-        guard_flags: read_u32(bytes, offset + 0x90, "GuardFlags")?,
-        se_handler_table: read_u64(bytes, offset + 0x60, "SEHandlerTable")?,
-        se_handler_count: read_u64(bytes, offset + 0x68, "SEHandlerCount")?,
-        guard_cf_check_function_pointer: read_u64(bytes, offset + 0x70, "GuardCFCheckFunctionPointer")?,
-        guard_cf_dispatch_function_pointer: read_u64(bytes, offset + 0x78, "GuardCFDispatchFunctionPointer")?,
-        guard_cf_function_table: read_u64(bytes, offset + 0x80, "GuardCFFunctionTable")?,
-        guard_cf_function_count: read_u64(bytes, offset + 0x88, "GuardCFFunctionCount")?,
+        guard_flags: read_load_config_u32(bytes, offset, present_size, guard_flags_offset, "GuardFlags")?,
+        se_handler_table: read_load_config_pointer(
+            bytes,
+            offset,
+            present_size,
+            se_handler_table_offset,
+            pointer_bytes,
+            "SEHandlerTable",
+        )?,
+        se_handler_count: read_load_config_pointer(
+            bytes,
+            offset,
+            present_size,
+            se_handler_count_offset,
+            pointer_bytes,
+            "SEHandlerCount",
+        )?,
+        guard_cf_check_function_pointer: read_load_config_pointer(
+            bytes,
+            offset,
+            present_size,
+            guard_cf_check_offset,
+            pointer_bytes,
+            "GuardCFCheckFunctionPointer",
+        )?,
+        guard_cf_dispatch_function_pointer: read_load_config_pointer(
+            bytes,
+            offset,
+            present_size,
+            guard_cf_dispatch_offset,
+            pointer_bytes,
+            "GuardCFDispatchFunctionPointer",
+        )?,
+        guard_cf_function_table: read_load_config_pointer(
+            bytes,
+            offset,
+            present_size,
+            guard_cf_function_table_offset,
+            pointer_bytes,
+            "GuardCFFunctionTable",
+        )?,
+        guard_cf_function_count: read_load_config_pointer(
+            bytes,
+            offset,
+            present_size,
+            guard_cf_function_count_offset,
+            pointer_bytes,
+            "GuardCFFunctionCount",
+        )?,
     }))
+}
+
+fn read_load_config_u32(
+    bytes: &[u8],
+    load_config_offset: usize,
+    present_size: usize,
+    field_offset: usize,
+    label: &str,
+) -> AppResult<u32> {
+    if field_offset + 4 > present_size {
+        return Ok(0);
+    }
+    read_u32(bytes, load_config_offset + field_offset, label)
+}
+
+fn read_load_config_pointer(
+    bytes: &[u8],
+    load_config_offset: usize,
+    present_size: usize,
+    field_offset: usize,
+    pointer_bytes: usize,
+    label: &str,
+) -> AppResult<u64> {
+    if field_offset + pointer_bytes > present_size {
+        return Ok(0);
+    }
+    read_pointer(bytes, load_config_offset + field_offset, pointer_bytes, label)
 }
 
 fn parse_import_directory(
@@ -806,6 +910,7 @@ fn parse_import_directory(
     directories: &[DataDirectory],
     delay_load: bool,
     image_base: u64,
+    pointer_bytes: usize,
 ) -> AppResult<Vec<ImportDescriptor>> {
     let directory = directories.get(IMAGE_DIRECTORY_ENTRY_IMPORT).copied().unwrap_or_default();
     if directory.virtual_address == 0 || directory.size == 0 {
@@ -828,7 +933,7 @@ fn parse_import_directory(
         }
         let dll_name = read_c_string_from_rva(bytes, sections, name_rva, "import DLL name")?;
         let thunk_rva = if original_first_thunk != 0 { original_first_thunk } else { first_thunk };
-        let thunk_addresses = read_import_thunks(bytes, sections, thunk_rva, first_thunk, image_base)?;
+        let thunk_addresses = read_import_thunks(bytes, sections, thunk_rva, first_thunk, image_base, pointer_bytes)?;
         imports.push(ImportDescriptor {
             dll_name,
             imports: thunk_addresses,
@@ -844,6 +949,7 @@ fn parse_delay_import_directory(
     sections: &[PeSection],
     directories: &[DataDirectory],
     image_base: u64,
+    pointer_bytes: usize,
 ) -> AppResult<Vec<ImportDescriptor>> {
     let directory = directories.get(13).copied().unwrap_or_default();
     if directory.virtual_address == 0 || directory.size == 0 {
@@ -866,7 +972,7 @@ fn parse_delay_import_directory(
         let thunk_rva = if int_rva != 0 { int_rva } else { iat_rva };
         descriptors.push(ImportDescriptor {
             dll_name,
-            imports: read_import_thunks(bytes, sections, thunk_rva, iat_rva, image_base)?,
+            imports: read_import_thunks(bytes, sections, thunk_rva, iat_rva, image_base, pointer_bytes)?,
             delay_load: true,
         });
         offset += 32;
@@ -971,24 +1077,31 @@ fn parse_tls_directory(
     sections: &[PeSection],
     directories: &[DataDirectory],
     image_base: u64,
+    pointer_bytes: usize,
 ) -> AppResult<Option<TlsDirectory>> {
     let directory = directories.get(IMAGE_DIRECTORY_ENTRY_TLS).copied().unwrap_or_default();
     if directory.virtual_address == 0 || directory.size == 0 {
         return Ok(None);
     }
-    let offset = rva_to_file_offset(directory.virtual_address, 40, sections, 0)?;
-    checked_range(bytes, offset, 40, "TLS directory")?;
-    let raw_data_start = read_u64(bytes, offset, "TLS raw data start")?;
-    let raw_data_end = read_u64(bytes, offset + 8, "TLS raw data end")?;
-    let address_of_index = read_u64(bytes, offset + 16, "TLS address of index")?;
-    let address_of_callbacks = read_u64(bytes, offset + 24, "TLS address of callbacks")?;
+    let directory_size = if pointer_bytes == 8 { 40 } else { 24 };
+    let offset = rva_to_file_offset(directory.virtual_address, directory_size, sections, 0)?;
+    checked_range(bytes, offset, directory_size as usize, "TLS directory")?;
+    let raw_data_start = read_pointer(bytes, offset, pointer_bytes, "TLS raw data start")?;
+    let raw_data_end = read_pointer(bytes, offset + pointer_bytes, pointer_bytes, "TLS raw data end")?;
+    let address_of_index = read_pointer(bytes, offset + pointer_bytes * 2, pointer_bytes, "TLS address of index")?;
+    let address_of_callbacks = read_pointer(
+        bytes,
+        offset + pointer_bytes * 3,
+        pointer_bytes,
+        "TLS address of callbacks",
+    )?;
     let callbacks = if address_of_callbacks == 0 {
         Vec::new()
     } else {
         let callbacks_rva = address_of_callbacks
             .checked_sub(image_base)
             .ok_or_else(|| pe_error("TLS callback VA is below image base"))? as u32;
-        read_callback_array(bytes, sections, callbacks_rva)?
+        read_callback_array(bytes, sections, callbacks_rva, pointer_bytes)?
     };
     Ok(Some(TlsDirectory {
         raw_data_start,
@@ -1295,18 +1408,20 @@ fn read_import_thunks(
     table_rva: u32,
     iat_rva: u32,
     image_base: u64,
+    pointer_bytes: usize,
 ) -> AppResult<Vec<ImportThunk>> {
     let mut imports = Vec::new();
     let mut index = 0usize;
+    let ordinal_flag = 1_u64 << (pointer_bytes * 8 - 1);
     loop {
         if index > 8192 {
             return invalid("import thunk table exceeded the safety limit");
         }
-        let thunk_value = read_u64_at_rva(bytes, sections, table_rva, index, "import thunk")?;
+        let thunk_value = read_pointer_at_rva(bytes, sections, table_rva, index, pointer_bytes, "import thunk")?;
         if thunk_value == 0 {
             break;
         }
-        let symbol = if thunk_value & (1_u64 << 63) != 0 {
+        let symbol = if thunk_value & ordinal_flag != 0 {
             ImportSymbol::ByOrdinal {
                 ordinal: (thunk_value & 0xffff) as u16,
             }
@@ -1327,21 +1442,26 @@ fn read_import_thunks(
         };
         imports.push(ImportThunk {
             symbol,
-            iat_rva: iat_rva + (index as u32 * 8),
+            iat_rva: iat_rva + (index as u32 * pointer_bytes as u32),
         });
         index += 1;
     }
     Ok(imports)
 }
 
-fn read_callback_array(bytes: &[u8], sections: &[PeSection], callbacks_rva: u32) -> AppResult<Vec<u64>> {
+fn read_callback_array(
+    bytes: &[u8],
+    sections: &[PeSection],
+    callbacks_rva: u32,
+    pointer_bytes: usize,
+) -> AppResult<Vec<u64>> {
     let mut callbacks = Vec::new();
     let mut index = 0usize;
     loop {
         if index > 256 {
             return invalid("TLS callback array exceeded the safety limit");
         }
-        let callback = read_u64_at_rva(bytes, sections, callbacks_rva, index, "TLS callback")?;
+        let callback = read_pointer_at_rva(bytes, sections, callbacks_rva, index, pointer_bytes, "TLS callback")?;
         if callback == 0 {
             break;
         }
@@ -1592,9 +1712,32 @@ fn read_u32_at_rva(bytes: &[u8], sections: &[PeSection], rva: u32, index: usize,
     read_u32(bytes, offset, label)
 }
 
+fn read_pointer_at_rva(
+    bytes: &[u8],
+    sections: &[PeSection],
+    rva: u32,
+    index: usize,
+    pointer_bytes: usize,
+    label: &str,
+) -> AppResult<u64> {
+    match pointer_bytes {
+        4 => Ok(read_u32_at_rva(bytes, sections, rva, index, label)? as u64),
+        8 => read_u64_at_rva(bytes, sections, rva, index, label),
+        _ => invalid(format!("unsupported pointer width {pointer_bytes}")),
+    }
+}
+
 fn read_u64_at_rva(bytes: &[u8], sections: &[PeSection], rva: u32, index: usize, label: &str) -> AppResult<u64> {
     let offset = rva_to_file_offset(rva + (index * 8) as u32, 8, sections, 0)?;
     read_u64(bytes, offset, label)
+}
+
+fn read_pointer(bytes: &[u8], offset: usize, pointer_bytes: usize, label: &str) -> AppResult<u64> {
+    match pointer_bytes {
+        4 => Ok(read_u32(bytes, offset, label)? as u64),
+        8 => read_u64(bytes, offset, label),
+        _ => invalid(format!("unsupported pointer width {pointer_bytes}")),
+    }
 }
 
 fn read_c_string_from_rva(bytes: &[u8], sections: &[PeSection], rva: u32, label: &str) -> AppResult<String> {
@@ -1725,4 +1868,42 @@ fn invalid<T>(message: impl Into<String>) -> AppResult<T> {
 fn _external_manifest_path(path: &Path) -> PathBuf {
     let file_name = path.file_name().and_then(|value| value.to_str()).unwrap_or_default();
     path.with_file_name(format!("{file_name}.manifest"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_load_config_accepts_older_x86_layout() {
+        let mut bytes = vec![0_u8; 0x80];
+        write_u32(&mut bytes, 0x00, 0x40).expect("write load config size");
+        write_u32(&mut bytes, 0x38, 0x007b_7358).expect("write SEH table");
+        write_u32(&mut bytes, 0x3c, 625).expect("write SEH count");
+        let sections = vec![PeSection {
+            name: ".rdata".to_string(),
+            virtual_address: 0x1000,
+            virtual_size: bytes.len() as u32,
+            raw_data_ptr: 0,
+            raw_data_size: bytes.len() as u32,
+            characteristics: IMAGE_SCN_MEM_READ,
+        }];
+        let mut directories = vec![DataDirectory::default(); IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG + 1];
+        directories[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG] = DataDirectory {
+            virtual_address: 0x1000,
+            size: 0x40,
+        };
+
+        let load_config = parse_load_config(&bytes, &sections, &directories, 4)
+            .expect("parse load config")
+            .expect("load config present");
+
+        assert_eq!(load_config.guard_flags, 0);
+        assert_eq!(load_config.se_handler_table, 0x007b_7358);
+        assert_eq!(load_config.se_handler_count, 625);
+        assert_eq!(load_config.guard_cf_check_function_pointer, 0);
+        assert_eq!(load_config.guard_cf_dispatch_function_pointer, 0);
+        assert_eq!(load_config.guard_cf_function_table, 0);
+        assert_eq!(load_config.guard_cf_function_count, 0);
+    }
 }

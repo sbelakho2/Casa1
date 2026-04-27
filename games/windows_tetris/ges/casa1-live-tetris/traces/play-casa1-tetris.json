@@ -10,10 +10,10 @@
   "categories": [
     "process"
   ],
-  "env_fingerprint": "f6339f1581ba4f3327ebc677de08d8d2d1fcb423ea07c7e0d0eaa098ea611f36",
+  "env_fingerprint": "1654d3400cedba19cf5a4df10ad3608b4d8289babb2c9e492162bb4c412bf7b6",
   "resources": {
     "ge_config_sha256": "57cd9a5b4e2fa6914629727d80e8f0df29e07a3157faf3df3f4b0986632803ae",
-    "program_sha256": "9c105b1013955178e74acea122af904dcc0e508d9764955dee28436f0b70c06b",
+    "program_sha256": "500d9ae85b1c206acaf5bf3a950d49eed97af57f50e887c321dbc3344cf5e8b8",
     "trace_cache_version": "1"
   },
   "command": {
@@ -22,8 +22,7 @@
     "cwd": "/Users/sabelakhoua/IdeaProjects/Casa1/games/windows_tetris/ges/casa1-live-tetris",
     "env": {
       "CASA1_DTM": "0",
-      "CASA1_EXPORT_FINAL_FRAME": "/Users/sabelakhoua/IdeaProjects/Casa1/tmp/tetris-pause-frame.ppm",
-      "CASA1_FIXED_GUID": "5EFBF870-A69C-5508-A6EE-375F2640E58F",
+      "CASA1_FIXED_GUID": "75346EFE-7070-5341-9804-B26232F37A72",
       "CASA1_GE_ROOT": "/Users/sabelakhoua/IdeaProjects/Casa1/games/windows_tetris/ges/casa1-live-tetris",
       "CASA1_INSTALL_SILENT": "0",
       "CASA1_KEYBOARD_REPLAY_JSON": "[\n  { \"scancode\": 28 },\n  { \"scancode\": 25 }\n]",
@@ -53,7 +52,7 @@
     "perf": [
       {
         "metric_id": "pe_runtime_steps",
-        "value": 391441.0,
+        "value": 10298702.0,
         "unit": "instructions"
       }
     ]
@@ -69,7 +68,7 @@
         "exe": "/Users/sabelakhoua/IdeaProjects/Casa1/games/windows_tetris/dist/casa1-tetris.exe",
         "intent": "play"
       },
-      "return_value": 12785,
+      "return_value": 77961,
       "get_last_error": null,
       "side_effect_hashes": []
     },
@@ -78,13 +77,13 @@
       "category": "process",
       "call_id": "NtContinue",
       "parameters": {
-        "entrypoint": "0x1ac9fe2a1000",
+        "entrypoint": "0x233242671000",
         "mode": "pe-runtime"
       },
       "return_value": 0,
       "get_last_error": null,
       "side_effect_hashes": [
-        "9c105b1013955178e74acea122af904dcc0e508d9764955dee28436f0b70c06b"
+        "500d9ae85b1c206acaf5bf3a950d49eed97af57f50e887c321dbc3344cf5e8b8"
       ]
     },
     {

@@ -2,22 +2,28 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define FRAME_W 64
-#define FRAME_H 96
+#define FRAME_W 128
+#define FRAME_H 144
 #define BOARD_W 10
 #define BOARD_H 20
-#define CELL 2
-#define BOARD_X 4
-#define BOARD_Y 4
+#define CELL 6
+#define BOARD_X 8
+#define BOARD_Y 8
 #define BOARD_CENTER_X (BOARD_X + (BOARD_W * CELL) / 2)
-#define PANEL_X 30
-#define PANEL_Y 4
-#define PANEL_W 30
-#define PANEL_H 80
+#define PANEL_X 76
+#define PANEL_Y 8
+#define PANEL_W 44
+#define PANEL_H 120
 #define BOTTOM_PANEL_X 4
 #define BOTTOM_PANEL_Y 52
 #define BOTTOM_PANEL_W 56
 #define BOTTOM_PANEL_H 40
+#define WINDOW_SCALE 5
+#define WINDOW_W (FRAME_W * WINDOW_SCALE + 32)
+#define WINDOW_H (FRAME_H * WINDOW_SCALE + 54)
+#define HORIZONTAL_DAS_MS 150u
+#define HORIZONTAL_ARR_MS 55u
+#define SOFT_DROP_STEP_MS 30u
 #define MAX_HIGH_SCORES 5
 #ifdef TETRIS_SMOKE
 #define MAX_FRAMES 1
@@ -34,6 +40,7 @@
 
 #define WM_QUIT 0x0012u
 #define WM_KEYDOWN 0x0100u
+#define WM_KEYUP 0x0101u
 #define PM_REMOVE 0x0001u
 
 #define WS_VISIBLE 0x10000000u
@@ -216,6 +223,7 @@ __declspec(dllimport) HWND CreateWindowExW(
 __declspec(dllimport) BOOL PeekMessageW(MSG *message, HWND hwnd, UINT min, UINT max, UINT remove);
 __declspec(dllimport) intptr_t DispatchMessageW(const MSG *message);
 __declspec(dllimport) intptr_t DefWindowProcW(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam);
+__declspec(dllimport) DWORD GetTickCount(void);
 __declspec(dllimport) void Sleep(DWORD milliseconds);
 __declspec(dllimport) void ExitProcess(UINT code);
 __declspec(dllimport) HANDLE CreateFileW(
@@ -297,10 +305,24 @@ typedef struct {
     uint8_t running;
     uint8_t score_saved;
     uint8_t bag_index;
+    uint8_t left_seen;
+    uint8_t right_seen;
+    uint8_t down_seen;
+    uint8_t horizontal_repeat_armed;
+    uint8_t soft_drop_active;
+    uint8_t frame_dirty;
+    uint8_t hold_used;
     int8_t new_high_score_rank;
+    int8_t hold_piece;
+    int8_t horizontal_hold_direction;
     ScreenState screen;
     uint32_t frame_counter;
     uint32_t gravity_counter;
+    uint32_t last_tick_ms;
+    uint32_t gravity_elapsed_ms;
+    uint32_t horizontal_hold_ms;
+    uint32_t horizontal_repeat_ms;
+    uint32_t soft_drop_elapsed_ms;
     uint32_t lines_cleared;
     uint32_t pieces_locked;
     uint32_t score;
@@ -412,6 +434,10 @@ static void zero_bytes(void *ptr, size_t len) {
 
 static uint32_t color_rgb(uint8_t red, uint8_t green, uint8_t blue) {
     return 0xff000000u | ((uint32_t)red << 16) | ((uint32_t)green << 8) | (uint32_t)blue;
+}
+
+static void mark_frame_dirty(void) {
+    g_app.frame_dirty = 1u;
 }
 
 static uint32_t com_release(void *object) {
@@ -619,11 +645,35 @@ static uint32_t current_level(void) {
     return (g_app.level == 0u) ? 1u : g_app.level;
 }
 
-static uint32_t gravity_frames_for_level(void) {
+static uint32_t gravity_ms_for_level(void) {
+    static const uint16_t k_gravity_ms[] = {
+        0u,
+        800u,
+        716u,
+        633u,
+        550u,
+        466u,
+        383u,
+        300u,
+        216u,
+        133u,
+        100u,
+        83u,
+        83u,
+        83u,
+        66u,
+        66u,
+        50u,
+        50u,
+        33u,
+        33u,
+        16u
+    };
     uint32_t level = current_level();
-    uint32_t base = 18u;
-    uint32_t drop = (level > 1u) ? (level - 1u) : 0u;
-    return (base > drop) ? (base - drop) : 4u;
+    if (level < (uint32_t)(sizeof(k_gravity_ms) / sizeof(k_gravity_ms[0]))) {
+        return k_gravity_ms[level];
+    }
+    return 16u;
 }
 
 static uint32_t line_clear_score(uint32_t cleared) {
@@ -687,6 +737,7 @@ static void fill_rect(int x, int y, int width, int height, uint32_t color) {
     int py;
     int px;
     for (py = 0; py < height; ++py) {
+        int px;
         for (px = 0; px < width; ++px) {
             put_pixel(x + px, y + py, color);
         }
@@ -841,21 +892,46 @@ static void finish_game(void) {
         g_app.score_saved = 1u;
     }
     g_app.screen = SCREEN_GAME_OVER;
+    g_app.left_seen = 0u;
+    g_app.right_seen = 0u;
+    g_app.down_seen = 0u;
+    g_app.horizontal_repeat_armed = 0u;
+    g_app.soft_drop_active = 0u;
+    g_app.horizontal_hold_direction = 0;
+    g_app.horizontal_hold_ms = 0u;
+    g_app.horizontal_repeat_ms = 0u;
+    g_app.soft_drop_elapsed_ms = 0u;
+    mark_frame_dirty();
 }
 
 static void update_level_from_lines(void) {
     g_app.level = 1u + g_app.lines_cleared / 10u;
 }
 
-static void spawn_piece(void) {
-    g_app.current.kind = g_app.next_piece;
+static void activate_piece(int kind) {
+    g_app.current.kind = kind;
     g_app.current.rotation = 0;
     g_app.current.x = 3;
     g_app.current.y = 0;
-    g_app.next_piece = next_piece_kind();
+    g_app.gravity_elapsed_ms = 0u;
+    g_app.horizontal_repeat_armed = 0u;
+    g_app.horizontal_hold_direction = 0;
+    g_app.horizontal_hold_ms = 0u;
+    g_app.horizontal_repeat_ms = 0u;
+    g_app.soft_drop_active = 0u;
+    g_app.soft_drop_elapsed_ms = 0u;
     if (!can_place_piece(g_app.current.kind, g_app.current.rotation, g_app.current.x, g_app.current.y)) {
         finish_game();
+        return;
     }
+    mark_frame_dirty();
+}
+
+static void spawn_piece(void) {
+    int next_kind = g_app.next_piece;
+    g_app.next_piece = next_piece_kind();
+    g_app.hold_used = 0u;
+    activate_piece(next_kind);
 }
 
 static uint32_t clear_complete_lines(void) {
@@ -922,6 +998,7 @@ static void lock_piece(void) {
         return;
     }
     spawn_piece();
+    mark_frame_dirty();
 }
 
 static int try_move_current_piece(int dx, int dy) {
@@ -930,6 +1007,7 @@ static int try_move_current_piece(int dx, int dy) {
     if (can_place_piece(g_app.current.kind, g_app.current.rotation, next_x, next_y)) {
         g_app.current.x = next_x;
         g_app.current.y = next_y;
+        mark_frame_dirty();
         return 1;
     }
     return 0;
@@ -938,6 +1016,7 @@ static int try_move_current_piece(int dx, int dy) {
 static void soft_drop_current_piece(void) {
     if (try_move_current_piece(0, 1)) {
         g_app.score += 1u;
+        mark_frame_dirty();
     } else {
         lock_piece();
     }
@@ -947,16 +1026,19 @@ static void rotate_current_piece(int delta) {
     int next_rotation = (g_app.current.rotation + delta) & 3;
     if (can_place_piece(g_app.current.kind, next_rotation, g_app.current.x, g_app.current.y)) {
         g_app.current.rotation = next_rotation;
+        mark_frame_dirty();
         return;
     }
     if (can_place_piece(g_app.current.kind, next_rotation, g_app.current.x - 1, g_app.current.y)) {
         g_app.current.x -= 1;
         g_app.current.rotation = next_rotation;
+        mark_frame_dirty();
         return;
     }
     if (can_place_piece(g_app.current.kind, next_rotation, g_app.current.x + 1, g_app.current.y)) {
         g_app.current.x += 1;
         g_app.current.rotation = next_rotation;
+        mark_frame_dirty();
     }
 }
 
@@ -967,6 +1049,29 @@ static void hard_drop_current_piece(void) {
     }
     g_app.score += steps * 2u;
     lock_piece();
+}
+
+static void hold_current_piece(void) {
+    int swap_kind;
+
+    if (g_app.hold_used || g_app.screen != SCREEN_PLAYING) {
+        return;
+    }
+
+    swap_kind = g_app.current.kind;
+    g_app.hold_used = 1u;
+    if (g_app.hold_piece < 0) {
+        g_app.hold_piece = (int8_t)swap_kind;
+        spawn_piece();
+        g_app.hold_used = 1u;
+        mark_frame_dirty();
+        return;
+    }
+
+    g_app.current.kind = g_app.hold_piece;
+    g_app.hold_piece = (int8_t)swap_kind;
+    activate_piece(g_app.current.kind);
+    mark_frame_dirty();
 }
 
 static void start_new_game(void) {
@@ -980,11 +1085,50 @@ static void start_new_game(void) {
     g_app.level = 1u;
     g_app.pieces_locked = 0u;
     g_app.gravity_counter = 0u;
+    g_app.gravity_elapsed_ms = 0u;
     g_app.frame_counter = 0u;
+    g_app.last_tick_ms = GetTickCount();
+    g_app.left_seen = 0u;
+    g_app.right_seen = 0u;
+    g_app.down_seen = 0u;
+    g_app.horizontal_repeat_armed = 0u;
+    g_app.soft_drop_active = 0u;
+    g_app.hold_used = 0u;
+    g_app.hold_piece = -1;
+    g_app.horizontal_hold_direction = 0;
+    g_app.horizontal_hold_ms = 0u;
+    g_app.horizontal_repeat_ms = 0u;
+    g_app.soft_drop_elapsed_ms = 0u;
     g_app.bag_index = 7u;
     g_app.next_piece = next_piece_kind();
     spawn_piece();
     play_lock_sound();
+    mark_frame_dirty();
+}
+
+static uint32_t poll_elapsed_ms(void) {
+    uint32_t now = GetTickCount();
+    uint32_t elapsed = now - g_app.last_tick_ms;
+    g_app.last_tick_ms = now;
+    if (elapsed == 0u) {
+        return 1u;
+    }
+    if (elapsed > 250u) {
+        return 250u;
+    }
+    return elapsed;
+}
+
+static void reset_live_input_state(void) {
+    g_app.left_seen = 0u;
+    g_app.right_seen = 0u;
+    g_app.down_seen = 0u;
+    g_app.horizontal_repeat_armed = 0u;
+    g_app.soft_drop_active = 0u;
+    g_app.horizontal_hold_direction = 0;
+    g_app.horizontal_hold_ms = 0u;
+    g_app.horizontal_repeat_ms = 0u;
+    g_app.soft_drop_elapsed_ms = 0u;
 }
 
 static void tick_input_cooldowns(void) {
@@ -1004,6 +1148,7 @@ static int consume_one_shot(uint16_t scancode) {
     case 0x13:
     case 0x19:
     case 0x1c:
+    case 0x2e:
     case 0x31:
     case 0x39:
         if (*cooldown != 0u) {
@@ -1021,6 +1166,11 @@ static void handle_scancode(uint16_t scancode) {
         return;
     }
 
+    if (scancode == 0x01) {
+        g_app.running = 0u;
+        return;
+    }
+
     if (scancode == 0x13 || scancode == 0x31) {
         start_new_game();
         return;
@@ -1031,6 +1181,7 @@ static void handle_scancode(uint16_t scancode) {
             start_new_game();
         } else if (g_app.screen == SCREEN_PAUSED) {
             g_app.screen = SCREEN_PLAYING;
+            mark_frame_dirty();
         }
         return;
     }
@@ -1038,8 +1189,11 @@ static void handle_scancode(uint16_t scancode) {
     if (scancode == 0x19) {
         if (g_app.screen == SCREEN_PLAYING) {
             g_app.screen = SCREEN_PAUSED;
+            reset_live_input_state();
+            mark_frame_dirty();
         } else if (g_app.screen == SCREEN_PAUSED) {
             g_app.screen = SCREEN_PLAYING;
+            mark_frame_dirty();
         }
         return;
     }
@@ -1071,6 +1225,9 @@ static void handle_scancode(uint16_t scancode) {
     case 0x10:
         rotate_current_piece(-1);
         break;
+    case 0x2e:
+        hold_current_piece();
+        break;
     case 0x39:
         hard_drop_current_piece();
         break;
@@ -1085,6 +1242,73 @@ static int current_ghost_y(void) {
         ghost_y += 1;
     }
     return ghost_y;
+}
+
+static void update_horizontal_input(uint32_t elapsed_ms) {
+    int direction = 0;
+
+    if (g_app.left_seen && !g_app.right_seen) {
+        direction = -1;
+    } else if (g_app.right_seen && !g_app.left_seen) {
+        direction = 1;
+    }
+
+    if (direction == 0) {
+        g_app.horizontal_repeat_armed = 0u;
+        g_app.horizontal_hold_direction = 0;
+        g_app.horizontal_hold_ms = 0u;
+        g_app.horizontal_repeat_ms = 0u;
+        return;
+    }
+
+    if (g_app.horizontal_hold_direction != direction) {
+        g_app.horizontal_hold_direction = (int8_t)direction;
+        g_app.horizontal_repeat_armed = 0u;
+        g_app.horizontal_hold_ms = 0u;
+        g_app.horizontal_repeat_ms = 0u;
+        try_move_current_piece(direction, 0);
+        return;
+    }
+
+    if (!g_app.horizontal_repeat_armed) {
+        g_app.horizontal_hold_ms += elapsed_ms;
+        if (g_app.horizontal_hold_ms >= HORIZONTAL_DAS_MS) {
+            g_app.horizontal_repeat_armed = 1u;
+            g_app.horizontal_repeat_ms = 0u;
+            try_move_current_piece(direction, 0);
+        }
+        return;
+    }
+
+    g_app.horizontal_repeat_ms += elapsed_ms;
+    if (g_app.horizontal_repeat_ms >= HORIZONTAL_ARR_MS) {
+        g_app.horizontal_repeat_ms = 0u;
+        try_move_current_piece(direction, 0);
+    }
+}
+
+static void update_soft_drop_input(uint32_t elapsed_ms) {
+    uint32_t steps = 0u;
+
+    if (!g_app.down_seen) {
+        g_app.soft_drop_active = 0u;
+        g_app.soft_drop_elapsed_ms = 0u;
+        return;
+    }
+
+    if (!g_app.soft_drop_active) {
+        g_app.soft_drop_active = 1u;
+        g_app.soft_drop_elapsed_ms = 0u;
+        soft_drop_current_piece();
+        return;
+    }
+
+    g_app.soft_drop_elapsed_ms += elapsed_ms;
+    while (g_app.soft_drop_elapsed_ms >= SOFT_DROP_STEP_MS && steps < 6u && g_app.screen == SCREEN_PLAYING) {
+        g_app.soft_drop_elapsed_ms -= SOFT_DROP_STEP_MS;
+        soft_drop_current_piece();
+        steps += 1u;
+    }
 }
 
 static void draw_well(void) {
@@ -1169,30 +1393,37 @@ static void draw_panel_shell(void) {
     fill_rect(PANEL_X, PANEL_Y, PANEL_W, PANEL_H, color_rgb(20, 26, 38));
 }
 
-static void draw_preview_piece(void) {
-    int preview_x = PANEL_X + 8;
-    int preview_y = PANEL_Y + 10;
+static void draw_preview_box(int x, int y, const char *label, int kind) {
     int py;
     int px;
-    draw_text(PANEL_X + 5, PANEL_Y + 3, "NEXT", 1, color_rgb(220, 231, 244));
-    fill_rect(preview_x - 1, preview_y - 1, 10, 10, color_rgb(12, 16, 24));
+
+    draw_text(x, PANEL_Y + 4, label, 1, color_rgb(220, 231, 244));
+    fill_rect(x - 2, y - 2, 20, 20, color_rgb(12, 16, 24));
+    if (kind < 0) {
+        return;
+    }
     for (py = 0; py < 4; ++py) {
         for (px = 0; px < 4; ++px) {
-            if (!piece_cell(g_app.next_piece, 0, px, py)) {
+            if (!piece_cell(kind, 0, px, py)) {
                 continue;
             }
-            fill_rect(preview_x + px * 2, preview_y + py * 2, 2, 2, k_piece_colors[g_app.next_piece + 1]);
+            fill_rect(x + px * 4, y + py * 4, 4, 4, k_piece_colors[kind + 1]);
         }
     }
 }
 
+static void draw_preview_piece(void) {
+    draw_preview_box(PANEL_X + 2, PANEL_Y + 16, "HOLD", g_app.hold_piece);
+    draw_preview_box(PANEL_X + 24, PANEL_Y + 16, "NEXT", g_app.next_piece);
+}
+
 static void draw_stats_panel(void) {
-    draw_text(PANEL_X + 5, PANEL_Y + 24, "SCORE", 1, color_rgb(180, 194, 210));
-    draw_u32(PANEL_X + 5, PANEL_Y + 30, g_app.score, color_rgb(244, 208, 84));
-    draw_text(PANEL_X + 5, PANEL_Y + 38, "LINES", 1, color_rgb(180, 194, 210));
-    draw_u32(PANEL_X + 5, PANEL_Y + 44, g_app.lines_cleared, color_rgb(99, 227, 139));
-    draw_text(PANEL_X + 5, PANEL_Y + 52, "LEVEL", 1, color_rgb(180, 194, 210));
-    draw_u32(PANEL_X + 5, PANEL_Y + 58, current_level(), color_rgb(176, 112, 255));
+    draw_text(PANEL_X + 6, PANEL_Y + 44, "SCORE", 1, color_rgb(180, 194, 210));
+    draw_u32(PANEL_X + 6, PANEL_Y + 52, g_app.score, color_rgb(244, 208, 84));
+    draw_text(PANEL_X + 6, PANEL_Y + 62, "LINES", 1, color_rgb(180, 194, 210));
+    draw_u32(PANEL_X + 6, PANEL_Y + 70, g_app.lines_cleared, color_rgb(99, 227, 139));
+    draw_text(PANEL_X + 6, PANEL_Y + 80, "LEVEL", 1, color_rgb(180, 194, 210));
+    draw_u32(PANEL_X + 6, PANEL_Y + 88, current_level(), color_rgb(176, 112, 255));
 }
 
 static void draw_high_score_table(int x, int y) {
@@ -1202,44 +1433,45 @@ static void draw_high_score_table(int x, int y) {
         rank[0] = (char)('1' + index);
         rank[1] = ':';
         rank[2] = 0;
-        draw_text(x, y + index * 7, rank, 1, color_rgb(180, 194, 210));
-        draw_u32(x + 10, y + index * 7, g_app.high_scores[index], color_rgb(244, 208, 84));
+        draw_text(x, y + index * 10, rank, 1, color_rgb(180, 194, 210));
+        draw_u32(x + 12, y + index * 10, g_app.high_scores[index], color_rgb(244, 208, 84));
     }
 }
 
 static void draw_playing_help(void) {
-    draw_text(PANEL_X + 5, PANEL_Y + 68, "A D  S", 1, color_rgb(220, 231, 244));
-    draw_text(PANEL_X + 5, PANEL_Y + 74, "W Q SPC", 1, color_rgb(220, 231, 244));
-    draw_text(PANEL_X + 5, PANEL_Y + 80, "P EN N R", 1, color_rgb(180, 194, 210));
+    draw_text(PANEL_X + 6, PANEL_Y + 98, "MOVE A D", 1, color_rgb(220, 231, 244));
+    draw_text(PANEL_X + 6, PANEL_Y + 106, "DROP S SPC", 1, color_rgb(220, 231, 244));
+    draw_text(PANEL_X + 6, PANEL_Y + 114, "TURN W Q", 1, color_rgb(220, 231, 244));
+    draw_text(PANEL_X + 6, PANEL_Y + 122, "C HOLD P EN", 1, color_rgb(180, 194, 210));
 }
 
 static void draw_score_help(void) {
-    draw_text(PANEL_X + 5, PANEL_Y + 3, "TOP5", 1, color_rgb(220, 231, 244));
-    draw_high_score_table(PANEL_X + 5, PANEL_Y + 13);
+    draw_text(PANEL_X + 6, PANEL_Y + 6, "TOP5", 1, color_rgb(220, 231, 244));
+    draw_high_score_table(PANEL_X + 6, PANEL_Y + 20);
 }
 
 static void draw_title_overlay(void) {
-    fill_rect(BOARD_X - 2, 10, BOARD_W * CELL + 4, 34, color_rgb(24, 34, 48));
-    draw_centered_text(BOARD_CENTER_X, 14, "TETRIS", 1, color_rgb(244, 208, 84));
-    draw_centered_text(BOARD_CENTER_X, 25, "ENTER", 1, color_rgb(220, 231, 244));
-    draw_centered_text(BOARD_CENTER_X, 32, "OR SPC", 1, color_rgb(180, 194, 210));
-    draw_centered_text(BOARD_CENTER_X, 39, "START", 1, color_rgb(220, 231, 244));
+    fill_rect(BOARD_X - 2, 24, BOARD_W * CELL + 4, 54, color_rgb(24, 34, 48));
+    draw_centered_text(BOARD_CENTER_X, 30, "TETRIS", 2, color_rgb(244, 208, 84));
+    draw_centered_text(BOARD_CENTER_X, 58, "ENTER", 1, color_rgb(220, 231, 244));
+    draw_centered_text(BOARD_CENTER_X, 66, "OR SPACE", 1, color_rgb(180, 194, 210));
+    draw_centered_text(BOARD_CENTER_X, 74, "TO START", 1, color_rgb(220, 231, 244));
 }
 
 static void draw_pause_overlay(void) {
-    fill_rect(BOARD_X - 2, 24, BOARD_W * CELL + 4, 18, color_rgb(22, 26, 40));
-    draw_centered_text(BOARD_CENTER_X, 28, "PAUSED", 1, color_rgb(220, 231, 244));
-    draw_centered_text(BOARD_CENTER_X, 35, "P OR EN", 1, color_rgb(180, 194, 210));
+    fill_rect(BOARD_X - 2, 50, BOARD_W * CELL + 4, 24, color_rgb(22, 26, 40));
+    draw_centered_text(BOARD_CENTER_X, 56, "PAUSED", 1, color_rgb(220, 231, 244));
+    draw_centered_text(BOARD_CENTER_X, 64, "P OR EN", 1, color_rgb(180, 194, 210));
 }
 
 static void draw_game_over_overlay(void) {
-    fill_rect(BOARD_X - 2, 10, BOARD_W * CELL + 4, 38, color_rgb(56, 20, 34));
-    draw_centered_text(BOARD_CENTER_X, 14, "GAME", 1, color_rgb(255, 214, 214));
-    draw_centered_text(BOARD_CENTER_X, 21, "OVER", 1, color_rgb(255, 214, 214));
-    draw_centered_text(BOARD_CENTER_X, 30, "SCORE", 1, color_rgb(220, 231, 244));
-    draw_centered_u32(BOARD_CENTER_X, 37, g_app.score, color_rgb(244, 208, 84));
+    fill_rect(BOARD_X - 2, 24, BOARD_W * CELL + 4, 58, color_rgb(56, 20, 34));
+    draw_centered_text(BOARD_CENTER_X, 30, "GAME", 2, color_rgb(255, 214, 214));
+    draw_centered_text(BOARD_CENTER_X, 50, "OVER", 2, color_rgb(255, 214, 214));
+    draw_centered_text(BOARD_CENTER_X, 70, "SCORE", 1, color_rgb(220, 231, 244));
+    draw_centered_u32(BOARD_CENTER_X, 78, g_app.score, color_rgb(244, 208, 84));
     if (g_app.new_high_score_rank >= 0) {
-        draw_centered_text(BOARD_CENTER_X, 44, "TOP5", 1, color_rgb(99, 227, 139));
+        draw_centered_text(BOARD_CENTER_X, 88, "TOP5", 1, color_rgb(99, 227, 139));
     }
 }
 
@@ -1274,19 +1506,34 @@ static void render_frame(void) {
 }
 
 static void update_game(void) {
+    uint32_t elapsed_ms = 0u;
+
     g_app.frame_counter += 1u;
     tick_input_cooldowns();
     if (!g_app.running) {
         return;
     }
     if (g_app.screen == SCREEN_PLAYING) {
-        g_app.gravity_counter += 1u;
-        if (g_app.gravity_counter >= gravity_frames_for_level()) {
-            g_app.gravity_counter = 0u;
+        uint32_t steps = 0u;
+
+        elapsed_ms = poll_elapsed_ms();
+
+        update_horizontal_input(elapsed_ms);
+        update_soft_drop_input(elapsed_ms);
+
+        g_app.gravity_elapsed_ms += elapsed_ms;
+        while (g_app.gravity_elapsed_ms >= gravity_ms_for_level() && steps < 4u && g_app.screen == SCREEN_PLAYING) {
+            g_app.gravity_elapsed_ms -= gravity_ms_for_level();
             if (!try_move_current_piece(0, 1)) {
+                g_app.gravity_elapsed_ms = 0u;
                 lock_piece();
+                break;
             }
+            steps += 1u;
         }
+    } else {
+        g_app.last_tick_ms = GetTickCount();
+        reset_live_input_state();
     }
     if (MAX_FRAMES != 0 && g_app.frame_counter >= MAX_FRAMES) {
         g_app.running = 0u;
@@ -1295,9 +1542,39 @@ static void update_game(void) {
 
 static void process_messages(void) {
     MSG message;
+
     while (PeekMessageW(&message, 0, 0, 0, PM_REMOVE)) {
         if (message.message == WM_KEYDOWN) {
-            handle_scancode((uint16_t)(message.lParam & 0xffffu));
+            uint16_t scancode = (uint16_t)(message.lParam & 0xffffu);
+            switch (scancode) {
+            case 0x1e:
+                g_app.left_seen = 1u;
+                break;
+            case 0x20:
+                g_app.right_seen = 1u;
+                break;
+            case 0x1f:
+                g_app.down_seen = 1u;
+                break;
+            default:
+                handle_scancode(scancode);
+                break;
+            }
+        } else if (message.message == WM_KEYUP) {
+            uint16_t scancode = (uint16_t)(message.lParam & 0xffffu);
+            switch (scancode) {
+            case 0x1e:
+                g_app.left_seen = 0u;
+                break;
+            case 0x20:
+                g_app.right_seen = 0u;
+                break;
+            case 0x1f:
+                g_app.down_seen = 0u;
+                break;
+            default:
+                break;
+            }
         } else if (message.message == WM_QUIT) {
             g_app.running = 0u;
         }
@@ -1336,8 +1613,8 @@ static HWND create_window(void) {
         WS_OVERLAPPEDWINDOW | WS_VISIBLE,
         64,
         64,
-        520,
-        820,
+        WINDOW_W,
+        WINDOW_H,
         0,
         0,
         0,
@@ -1419,10 +1696,37 @@ static void init_game(void) {
     g_app.running = 1u;
     g_app.screen = SCREEN_TITLE;
     g_app.level = 1u;
-    g_app.rng_state = 0x31415926u;
+    g_app.rng_state = GetTickCount() ^ 0x31415926u;
+    g_app.last_tick_ms = GetTickCount();
     g_app.bag_index = 7u;
     g_app.new_high_score_rank = -1;
+    g_app.hold_piece = -1;
+    g_app.frame_dirty = 1u;
     load_high_scores();
+}
+
+static DWORD idle_sleep_ms(void) {
+    uint32_t delay;
+
+    if (g_app.screen != SCREEN_PLAYING) {
+        return 16u;
+    }
+    if (g_app.left_seen || g_app.right_seen || g_app.down_seen) {
+        return 1u;
+    }
+    delay = gravity_ms_for_level();
+    if (g_app.gravity_elapsed_ms < delay) {
+        delay -= g_app.gravity_elapsed_ms;
+    } else {
+        delay = 1u;
+    }
+    if (delay > 16u) {
+        delay = 16u;
+    }
+    if (delay == 0u) {
+        delay = 1u;
+    }
+    return (DWORD)delay;
 }
 
 static void present_frame(void) {
@@ -1483,6 +1787,12 @@ static int main(void) {
 
     init_game();
 
+#ifndef TETRIS_SMOKE
+    render_frame();
+    present_frame();
+    g_app.frame_dirty = 0u;
+#endif
+
 #ifdef TETRIS_SMOKE
     start_new_game();
     process_messages_smoke();
@@ -1493,9 +1803,14 @@ static int main(void) {
     while (g_app.running) {
         process_messages();
         update_game();
-        render_frame();
-        present_frame();
-        Sleep(1);
+        if (g_app.frame_dirty) {
+            render_frame();
+            present_frame();
+            g_app.frame_dirty = 0u;
+            Sleep(1);
+        } else {
+            Sleep(idle_sleep_ms());
+        }
     }
 #endif
 

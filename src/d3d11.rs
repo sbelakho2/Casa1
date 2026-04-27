@@ -2,7 +2,7 @@ use crate::error::{AppError, AppResult};
 use crate::gfx::{
     CommandAllocatorId, CommandQueueId, DescriptorHeapId, DescriptorHeapType, DxgiFormat,
     FilterMode, GraphicsBackend, PipelineStateDesc, RenderPassPlan, ResourceDesc,
-    ResourceId as GfxResourceId, ResourceState,
+    ResourceId as GfxResourceId, ResourceState, ResourceUsageHint,
     RootSignatureDesc, SwapchainDesc, SwapchainId, SwapchainState, ViewDescriptor,
 };
 use crate::reason::ReasonCode;
@@ -64,6 +64,7 @@ pub struct D3d11ResourceDesc {
     pub height: u32,
     pub depth: u32,
     pub byte_width: usize,
+    pub usage_hint: ResourceUsageHint,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -142,6 +143,14 @@ pub struct Viewport {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScissorRect {
+    pub left: i32,
+    pub top: i32,
+    pub right: i32,
+    pub bottom: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SubmissionResult {
     pub feature_level: FeatureLevel,
     pub draw_calls: u32,
@@ -154,10 +163,11 @@ pub struct SubmissionResult {
     pub backend_plan: crate::gfx::MetalCommandBufferPlan,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct D3d11CommandList {
     pub binding_signature: String,
     pub commands: Vec<RecordedCommand>,
+    bindings: ContextBindings,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -173,6 +183,18 @@ pub struct FixedFunctionScene {
 pub struct D3d9Frame {
     pub signature: String,
     pub hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum DrawCallKind {
+    Regular,
+    Instanced { instances: u32 },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum IndexedDrawCallKind {
+    Regular,
+    Instanced { instances: u32 },
 }
 
 #[derive(Debug, Clone)]
@@ -203,13 +225,15 @@ struct ShaderRecord {
     artifact: Option<ShaderArtifact>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 struct ContextBindings {
     render_targets: Vec<D3d11ViewId>,
     depth_target: Option<D3d11ViewId>,
     viewport: Option<Viewport>,
+    scissor_rect: Option<ScissorRect>,
     vertex_buffers: Vec<D3d11ResourceId>,
     index_buffer: Option<D3d11ResourceId>,
+    primitive_topology: Option<u32>,
     input_layout: Option<InputLayoutId>,
     blend_state: Option<BlendStateId>,
     rasterizer_state: Option<RasterizerStateId>,
@@ -254,9 +278,11 @@ pub enum RecordedCommand {
     },
     Draw {
         vertices: u32,
+        kind: DrawCallKind,
     },
     DrawIndexed {
         indices: u32,
+        kind: IndexedDrawCallKind,
     },
     Dispatch {
         x: u32,
@@ -340,7 +366,12 @@ impl D3d11Device {
             .ok_or_else(|| AppError::new(ReasonCode::RcD3dInvalidState, "swapchain buffer index out of range"))
     }
 
-    pub fn create_buffer(&mut self, label: &str, byte_width: usize) -> AppResult<D3d11ResourceId> {
+    pub fn create_buffer(
+        &mut self,
+        label: &str,
+        byte_width: usize,
+        usage_hint: ResourceUsageHint,
+    ) -> AppResult<D3d11ResourceId> {
         self.create_resource(D3d11ResourceDesc {
             label: label.to_string(),
             dimension: ResourceDimension::Buffer,
@@ -349,10 +380,21 @@ impl D3d11Device {
             height: 1,
             depth: 1,
             byte_width,
+            usage_hint,
         })
     }
 
     pub fn create_texture_1d(&mut self, label: &str, width: u32, format: DxgiFormat) -> AppResult<D3d11ResourceId> {
+        self.create_texture_1d_with_usage(label, width, format, ResourceUsageHint::Generic)
+    }
+
+    pub fn create_texture_1d_with_usage(
+        &mut self,
+        label: &str,
+        width: u32,
+        format: DxgiFormat,
+        usage_hint: ResourceUsageHint,
+    ) -> AppResult<D3d11ResourceId> {
         self.create_resource(D3d11ResourceDesc {
             label: label.to_string(),
             dimension: ResourceDimension::Texture1D,
@@ -361,6 +403,7 @@ impl D3d11Device {
             height: 1,
             depth: 1,
             byte_width: width as usize * 4,
+            usage_hint,
         })
     }
 
@@ -371,6 +414,17 @@ impl D3d11Device {
         height: u32,
         format: DxgiFormat,
     ) -> AppResult<D3d11ResourceId> {
+        self.create_texture_2d_with_usage(label, width, height, format, ResourceUsageHint::Generic)
+    }
+
+    pub fn create_texture_2d_with_usage(
+        &mut self,
+        label: &str,
+        width: u32,
+        height: u32,
+        format: DxgiFormat,
+        usage_hint: ResourceUsageHint,
+    ) -> AppResult<D3d11ResourceId> {
         self.create_resource(D3d11ResourceDesc {
             label: label.to_string(),
             dimension: ResourceDimension::Texture2D,
@@ -379,6 +433,7 @@ impl D3d11Device {
             height,
             depth: 1,
             byte_width: width as usize * height as usize * 4,
+            usage_hint,
         })
     }
 
@@ -390,6 +445,18 @@ impl D3d11Device {
         depth: u32,
         format: DxgiFormat,
     ) -> AppResult<D3d11ResourceId> {
+        self.create_texture_3d_with_usage(label, width, height, depth, format, ResourceUsageHint::Generic)
+    }
+
+    pub fn create_texture_3d_with_usage(
+        &mut self,
+        label: &str,
+        width: u32,
+        height: u32,
+        depth: u32,
+        format: DxgiFormat,
+        usage_hint: ResourceUsageHint,
+    ) -> AppResult<D3d11ResourceId> {
         self.create_resource(D3d11ResourceDesc {
             label: label.to_string(),
             dimension: ResourceDimension::Texture3D,
@@ -398,6 +465,7 @@ impl D3d11Device {
             height,
             depth,
             byte_width: width as usize * height as usize * depth as usize * 4,
+            usage_hint,
         })
     }
 
@@ -518,16 +586,40 @@ impl D3d11Device {
         self.immediate.bindings.blend_state = Some(state);
     }
 
+    pub fn om_clear_blend_state(&mut self) {
+        self.immediate.bindings.blend_state = None;
+    }
+
     pub fn om_set_depth_stencil_state(&mut self, state: DepthStencilStateId) {
         self.immediate.bindings.depth_stencil_state = Some(state);
+    }
+
+    pub fn om_clear_depth_stencil_state(&mut self) {
+        self.immediate.bindings.depth_stencil_state = None;
     }
 
     pub fn rs_set_state(&mut self, state: RasterizerStateId) {
         self.immediate.bindings.rasterizer_state = Some(state);
     }
 
+    pub fn rs_clear_state(&mut self) {
+        self.immediate.bindings.rasterizer_state = None;
+    }
+
     pub fn rs_set_viewports(&mut self, viewport: Viewport) {
         self.immediate.bindings.viewport = Some(viewport);
+    }
+
+    pub fn rs_clear_viewports(&mut self) {
+        self.immediate.bindings.viewport = None;
+    }
+
+    pub fn rs_set_scissor_rects(&mut self, scissor_rect: ScissorRect) {
+        self.immediate.bindings.scissor_rect = Some(scissor_rect);
+    }
+
+    pub fn rs_clear_scissor_rects(&mut self) {
+        self.immediate.bindings.scissor_rect = None;
     }
 
     pub fn ia_set_vertex_buffers(&mut self, buffers: Vec<D3d11ResourceId>) {
@@ -536,6 +628,14 @@ impl D3d11Device {
 
     pub fn ia_set_index_buffer(&mut self, buffer: D3d11ResourceId) {
         self.immediate.bindings.index_buffer = Some(buffer);
+    }
+
+    pub fn ia_clear_index_buffer(&mut self) {
+        self.immediate.bindings.index_buffer = None;
+    }
+
+    pub fn ia_set_primitive_topology(&mut self, topology: u32) {
+        self.immediate.bindings.primitive_topology = Some(topology);
     }
 
     pub fn ia_set_input_layout(&mut self, layout: InputLayoutId) {
@@ -592,6 +692,7 @@ impl D3d11Device {
 
     pub fn update_subresource(&mut self, resource: D3d11ResourceId, bytes: &[u8]) -> AppResult<()> {
         self.validate_resource_write(resource, bytes.len())?;
+        self.promote_texture_cpu_write_usage(resource)?;
         self.immediate.commands.push(RecordedCommand::UpdateSubresource {
             resource,
             bytes: bytes.to_vec(),
@@ -624,6 +725,7 @@ impl D3d11Device {
             record.mapped = false;
             record.backend_id
         };
+        self.promote_texture_cpu_write_usage(resource)?;
         self.backend.overwrite_resource_bytes(backend_id, bytes)?;
         Ok(())
     }
@@ -668,11 +770,31 @@ impl D3d11Device {
     }
 
     pub fn draw(&mut self, vertices: u32) {
-        self.immediate.commands.push(RecordedCommand::Draw { vertices });
+        self.immediate.commands.push(RecordedCommand::Draw {
+            vertices,
+            kind: DrawCallKind::Regular,
+        });
+    }
+
+    pub fn draw_instanced(&mut self, vertices: u32, instances: u32) {
+        self.immediate.commands.push(RecordedCommand::Draw {
+            vertices,
+            kind: DrawCallKind::Instanced { instances },
+        });
     }
 
     pub fn draw_indexed(&mut self, indices: u32) {
-        self.immediate.commands.push(RecordedCommand::DrawIndexed { indices });
+        self.immediate.commands.push(RecordedCommand::DrawIndexed {
+            indices,
+            kind: IndexedDrawCallKind::Regular,
+        });
+    }
+
+    pub fn draw_indexed_instanced(&mut self, indices: u32, instances: u32) {
+        self.immediate.commands.push(RecordedCommand::DrawIndexed {
+            indices,
+            kind: IndexedDrawCallKind::Instanced { instances },
+        });
     }
 
     pub fn dispatch(&mut self, x: u32, y: u32, z: u32) {
@@ -687,16 +809,18 @@ impl D3d11Device {
 
     pub fn submit_immediate(&mut self) -> AppResult<SubmissionResult> {
         let bindings = self.immediate.bindings.clone();
-        let commands = self.immediate.commands.clone();
-        self.immediate.commands.clear();
+        let commands = std::mem::take(&mut self.immediate.commands);
         self.submit_sequences(vec![(bindings, commands)])
     }
 
     fn submit_immediate_without_digests(&mut self) -> AppResult<()> {
         let bindings = self.immediate.bindings.clone();
-        let commands = self.immediate.commands.clone();
-        self.immediate.commands.clear();
+        let commands = std::mem::take(&mut self.immediate.commands);
         self.submit_sequences_without_digests(vec![(bindings, commands)])
+    }
+
+    pub fn has_pending_immediate_commands(&self) -> bool {
+        !self.immediate.commands.is_empty()
     }
 
     pub fn present_swapchain(
@@ -754,7 +878,7 @@ impl D3d11Device {
     pub fn execute_deferred_command_lists(&mut self, lists: &[D3d11CommandList]) -> AppResult<SubmissionResult> {
         let sequences = lists
             .iter()
-            .map(|list| (ContextBindings::default(), list.commands.clone()))
+            .map(|list| (list.bindings.clone(), list.commands.clone()))
             .collect::<Vec<_>>();
         self.submit_sequences_with_signatures(
             sequences,
@@ -776,6 +900,7 @@ impl D3d11Device {
             size: desc.byte_width,
             subresources: 1,
             initial_state: ResourceState::Common,
+            usage_hint: desc.usage_hint,
         })?;
         self.resources.insert(
             id,
@@ -791,6 +916,7 @@ impl D3d11Device {
     }
 
     fn create_view(&mut self, resource: D3d11ResourceId, kind: ViewKind, format: DxgiFormat) -> AppResult<D3d11ViewId> {
+        self.promote_texture_usage_for_view(resource, kind)?;
         let backend_resource = self.resource(resource)?.backend_id;
         let heap = match kind {
             ViewKind::Rtv => {
@@ -834,6 +960,141 @@ impl D3d11Device {
         Ok(id)
     }
 
+    fn render_pass_formats(&self, bindings: &ContextBindings) -> AppResult<(Vec<DxgiFormat>, Option<DxgiFormat>)> {
+        let color_formats = bindings
+            .render_targets
+            .iter()
+            .map(|view| self.view(*view).map(|view| view.info.format))
+            .collect::<AppResult<Vec<_>>>()?;
+        let depth_format = bindings
+            .depth_target
+            .map(|view| self.view(view).map(|view| view.info.format))
+            .transpose()?;
+        Ok((color_formats, depth_format))
+    }
+
+    fn render_pass_actions(&self, bindings: &ContextBindings) -> AppResult<(&'static str, &'static str)> {
+        let load_action = "load";
+        let store_action = if let Some(depth_target) = bindings.depth_target {
+            let depth_view = self.view(depth_target)?;
+            let resource = self.resource(depth_view.info.resource)?;
+            match self.backend.resource_storage_mode(resource.backend_id)? {
+                crate::gfx::MetalStorageMode::Memoryless => "store+depth-discard",
+                _ => "store",
+            }
+        } else {
+            "store"
+        };
+        Ok((load_action, store_action))
+    }
+
+    fn record_sequence_to_command_list(
+        &mut self,
+        list: crate::gfx::CommandListId,
+        bindings: &ContextBindings,
+        commands: &[RecordedCommand],
+        draw_calls: &mut u32,
+        indexed_draw_calls: &mut u32,
+        dispatch_calls: &mut u32,
+    ) -> AppResult<()> {
+        if commands
+            .iter()
+            .any(|command| matches!(command, RecordedCommand::Draw { .. } | RecordedCommand::DrawIndexed { .. }))
+            && (!bindings.render_targets.is_empty() || bindings.depth_target.is_some())
+        {
+            let (color_formats, depth_format) = self.render_pass_formats(bindings)?;
+            let (load_action, store_action) = self.render_pass_actions(bindings)?;
+            self.backend
+                .record_begin_render_pass(list, color_formats, depth_format, load_action, store_action)?;
+        }
+
+        for command in commands {
+            match command {
+                RecordedCommand::UpdateSubresource { resource, bytes } => {
+                    let backend_id = {
+                        let record = self.resource_mut(*resource)?;
+                        record.bytes[..bytes.len()].copy_from_slice(bytes);
+                        record.backend_id
+                    };
+                    self.backend.overwrite_resource_bytes(backend_id, bytes)?;
+                }
+                RecordedCommand::CopyResource { src, dst } => {
+                    let source_bytes = self.resource(*src)?.bytes.clone();
+                    let src_backend = self.resource(*src)?.backend_id;
+                    let dst_backend = self.resource(*dst)?.backend_id;
+                    let destination = self.resource_mut(*dst)?;
+                    destination.bytes = source_bytes;
+                    self.backend.record_copy_resource(list, src_backend, dst_backend)?;
+                }
+                RecordedCommand::CopySubresourceRegion {
+                    src,
+                    dst,
+                    src_offset,
+                    dst_offset,
+                    size,
+                } => {
+                    let source = self.resource(*src)?.bytes.clone();
+                    let destination = self.resource_mut(*dst)?;
+                    let src_end = src_offset + size;
+                    let dst_end = dst_offset + size;
+                    if src_end > source.len() || dst_end > destination.bytes.len() {
+                        return Err(AppError::new(
+                            ReasonCode::RcD3dInvalidState,
+                            "copy subresource region out of bounds",
+                        ));
+                    }
+                    destination.bytes[*dst_offset..dst_end].copy_from_slice(&source[*src_offset..src_end]);
+                }
+                RecordedCommand::ClearRenderTargetView { view, color } => {
+                    let (resource_id, heap) = {
+                        let view = self.view(*view)?;
+                        (view.info.resource, view.heap.expect("RTV heap"))
+                    };
+                    let resource = self.resource_mut(resource_id)?;
+                    for chunk in resource.bytes.chunks_mut(4) {
+                        chunk.copy_from_slice(color);
+                    }
+                    self.backend.record_clear_rtv(list, heap, 0)?;
+                }
+                RecordedCommand::ClearDepthStencilView { view, depth, stencil } => {
+                    let depth_bytes = [
+                        (*depth & 0xff) as u8,
+                        ((*depth >> 8) & 0xff) as u8,
+                        ((*depth >> 16) & 0xff) as u8,
+                        ((*depth >> 24) & 0xff) as u8,
+                    ];
+                    let (resource_id, heap) = {
+                        let view = self.view(*view)?;
+                        (view.info.resource, view.heap.expect("DSV heap"))
+                    };
+                    let resource = self.resource_mut(resource_id)?;
+                    for chunk in resource.bytes.chunks_mut(5) {
+                        if chunk.len() >= 4 {
+                            chunk[..4].copy_from_slice(&depth_bytes);
+                        }
+                        if chunk.len() == 5 {
+                            chunk[4] = *stencil;
+                        }
+                    }
+                    self.backend.record_clear_dsv(list, heap, 0)?;
+                }
+                RecordedCommand::Draw { vertices, .. } => {
+                    *draw_calls += 1;
+                    self.backend.record_draw(list, *vertices)?;
+                }
+                RecordedCommand::DrawIndexed { indices, .. } => {
+                    *indexed_draw_calls += 1;
+                    self.backend.record_draw(list, *indices)?;
+                }
+                RecordedCommand::Dispatch { x, y, z } => {
+                    *dispatch_calls += 1;
+                    self.backend.record_dispatch(list, *x, *y, *z)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn submit_sequences(&mut self, sequences: Vec<(ContextBindings, Vec<RecordedCommand>)>) -> AppResult<SubmissionResult> {
         let binding_signatures = sequences
             .iter()
@@ -860,96 +1121,46 @@ impl D3d11Device {
         let mut draw_calls = 0;
         let mut indexed_draw_calls = 0;
         let mut dispatch_calls = 0;
+        let all_sequences_empty = sequences.iter().all(|(_, commands)| commands.is_empty());
 
-        for (_bindings, commands) in &sequences {
+        let coalesce_sequences = self.backend.capabilities().unified_memory
+            && self.backend.capabilities().argument_buffers
+            && self.backend.capabilities().mesh_shaders
+            && sequences.len() > 1
+            && sequences.iter().all(|(_, commands)| commands.len() <= 8);
+
+        if all_sequences_empty {
+            // Bare presents should not synthesize empty command lists.
+        } else if coalesce_sequences {
             let list = self
                 .backend
                 .create_graphics_command_list(self.graphics_allocator, self.graphics_pipeline);
-            for command in commands {
-                match command {
-                    RecordedCommand::UpdateSubresource { resource, bytes } => {
-                        let backend_id = {
-                            let record = self.resource_mut(*resource)?;
-                            record.bytes[..bytes.len()].copy_from_slice(bytes);
-                            record.backend_id
-                        };
-                        self.backend.overwrite_resource_bytes(backend_id, bytes)?;
-                    }
-                    RecordedCommand::CopyResource { src, dst } => {
-                        let source_bytes = self.resource(*src)?.bytes.clone();
-                        let src_backend = self.resource(*src)?.backend_id;
-                        let dst_backend = self.resource(*dst)?.backend_id;
-                        let destination = self.resource_mut(*dst)?;
-                        destination.bytes = source_bytes;
-                        self.backend.record_copy_resource(list, src_backend, dst_backend)?;
-                    }
-                    RecordedCommand::CopySubresourceRegion {
-                        src,
-                        dst,
-                        src_offset,
-                        dst_offset,
-                        size,
-                    } => {
-                        let source = self.resource(*src)?.bytes.clone();
-                        let destination = self.resource_mut(*dst)?;
-                        let src_end = src_offset + size;
-                        let dst_end = dst_offset + size;
-                        if src_end > source.len() || dst_end > destination.bytes.len() {
-                            return Err(AppError::new(
-                                ReasonCode::RcD3dInvalidState,
-                                "copy subresource region out of bounds",
-                            ));
-                        }
-                        destination.bytes[*dst_offset..dst_end].copy_from_slice(&source[*src_offset..src_end]);
-                    }
-                    RecordedCommand::ClearRenderTargetView { view, color } => {
-                        let (resource_id, heap) = {
-                            let view = self.view(*view)?;
-                            (view.info.resource, view.heap.expect("RTV heap"))
-                        };
-                        let resource = self.resource_mut(resource_id)?;
-                        for chunk in resource.bytes.chunks_mut(4) {
-                            chunk.copy_from_slice(color);
-                        }
-                        self.backend.record_clear_rtv(list, heap, 0)?;
-                    }
-                    RecordedCommand::ClearDepthStencilView { view, depth, stencil } => {
-                        let depth_bytes = [
-                            (*depth & 0xff) as u8,
-                            ((*depth >> 8) & 0xff) as u8,
-                            ((*depth >> 16) & 0xff) as u8,
-                            ((*depth >> 24) & 0xff) as u8,
-                        ];
-                        let (resource_id, heap) = {
-                            let view = self.view(*view)?;
-                            (view.info.resource, view.heap.expect("DSV heap"))
-                        };
-                        let resource = self.resource_mut(resource_id)?;
-                        for chunk in resource.bytes.chunks_mut(5) {
-                            if chunk.len() >= 4 {
-                                chunk[..4].copy_from_slice(&depth_bytes);
-                            }
-                            if chunk.len() == 5 {
-                                chunk[4] = *stencil;
-                            }
-                        }
-                        self.backend.record_clear_dsv(list, heap, 0)?;
-                    }
-                    RecordedCommand::Draw { vertices } => {
-                        draw_calls += 1;
-                        self.backend.record_draw(list, *vertices)?;
-                    }
-                    RecordedCommand::DrawIndexed { indices } => {
-                        indexed_draw_calls += 1;
-                        self.backend.record_draw(list, *indices)?;
-                    }
-                    RecordedCommand::Dispatch { x, y, z } => {
-                        dispatch_calls += 1;
-                        self.backend.record_dispatch(list, *x, *y, *z)?;
-                    }
-                }
+            for (bindings, commands) in &sequences {
+                self.record_sequence_to_command_list(
+                    list,
+                    bindings,
+                    commands,
+                    &mut draw_calls,
+                    &mut indexed_draw_calls,
+                    &mut dispatch_calls,
+                )?;
             }
             immutable_streams.push(self.backend.close_command_list(list)?);
+        } else {
+            for (bindings, commands) in &sequences {
+                let list = self
+                    .backend
+                    .create_graphics_command_list(self.graphics_allocator, self.graphics_pipeline);
+                self.record_sequence_to_command_list(
+                    list,
+                    bindings,
+                    commands,
+                    &mut draw_calls,
+                    &mut indexed_draw_calls,
+                    &mut dispatch_calls,
+                )?;
+                immutable_streams.push(self.backend.close_command_list(list)?);
+            }
         }
 
         self.next_fence_value += 1;
@@ -967,7 +1178,7 @@ impl D3d11Device {
                 draw_calls,
                 indexed_draw_calls,
                 dispatch_calls,
-                sequences.len(),
+                immutable_streams.len(),
                 &binding_signatures,
                 &resource_digests,
                 &backend_plan,
@@ -982,7 +1193,7 @@ impl D3d11Device {
             draw_calls,
             indexed_draw_calls,
             dispatch_calls,
-            executed_command_lists: sequences.len(),
+            executed_command_lists: immutable_streams.len(),
             resource_digests,
             hash,
             signature,
@@ -1073,6 +1284,9 @@ impl D3d11Device {
         let viewport = bindings.viewport.as_ref().map(|viewport| {
             format!("{:.1},{:.1},{:.1},{:.1}", viewport.x, viewport.y, viewport.width, viewport.height)
         }).unwrap_or_else(|| "none".to_string());
+        let scissor = bindings.scissor_rect.as_ref().map(|rect| {
+            format!("{},{},{},{}", rect.left, rect.top, rect.right, rect.bottom)
+        }).unwrap_or_else(|| "none".to_string());
         let vertex_buffers = bindings
             .vertex_buffers
             .iter()
@@ -1094,6 +1308,10 @@ impl D3d11Device {
                 })
                 .ok_or_else(|| AppError::new(ReasonCode::RcD3dInvalidState, format!("unknown input layout {layout}")))
         }).transpose()?.unwrap_or_else(|| "none".to_string());
+        let primitive_topology = bindings
+            .primitive_topology
+            .map(|topology| topology.to_string())
+            .unwrap_or_else(|| "none".to_string());
         let blend = bindings.blend_state.map(|id| {
             self.blend_states
                 .get(&id)
@@ -1143,13 +1361,15 @@ impl D3d11Device {
                 .ok_or_else(|| AppError::new(ReasonCode::RcD3dInvalidState, format!("unknown sampler {id}")))
         })?;
         Ok(format!(
-            "gpu={}|rtv=[{}]|dsv={}|vp={}|vb=[{}]|ib={}|il={}|blend={}|rast={}|depth={}|shaders=[{}]|cb=[{}]|srv=[{}]|samp=[{}]",
+            "gpu={}|rtv=[{}]|dsv={}|vp={}|scissor={}|vb=[{}]|ib={}|topo={}|il={}|blend={}|rast={}|depth={}|shaders=[{}]|cb=[{}]|srv=[{}]|samp=[{}]",
             gpu_profile,
             render_targets.join(","),
             depth_target.unwrap_or_else(|| "none".to_string()),
             viewport,
+            scissor,
             vertex_buffers.join(","),
             index_buffer.unwrap_or_else(|| "none".to_string()),
+            primitive_topology,
             input_layout,
             blend,
             rasterizer,
@@ -1169,6 +1389,78 @@ impl D3d11Device {
                 format!("write exceeds resource {}", record.desc.label),
             ));
         }
+        Ok(())
+    }
+
+    fn promote_texture_usage_for_view(&mut self, resource: D3d11ResourceId, kind: ViewKind) -> AppResult<()> {
+        let current_hint = self.resource(resource)?.desc.usage_hint;
+        let cpu_write_frequent = texture_cpu_write_frequent(current_hint);
+        let promoted_hint = match kind {
+            ViewKind::Srv => ResourceUsageHint::Texture {
+                sampled: true,
+                render_target: false,
+                depth_stencil: false,
+                cpu_write_frequent,
+            },
+            ViewKind::Rtv => ResourceUsageHint::Texture {
+                sampled: false,
+                render_target: true,
+                depth_stencil: false,
+                cpu_write_frequent,
+            },
+            ViewKind::Dsv => ResourceUsageHint::Texture {
+                sampled: false,
+                render_target: false,
+                depth_stencil: true,
+                cpu_write_frequent,
+            },
+            ViewKind::Uav => return Ok(()),
+        };
+        self.promote_resource_usage_hint(resource, promoted_hint)
+    }
+
+    fn promote_texture_cpu_write_usage(&mut self, resource: D3d11ResourceId) -> AppResult<()> {
+        let current_hint = self.resource(resource)?.desc.usage_hint;
+        let promoted_hint = match current_hint {
+            ResourceUsageHint::Texture {
+                sampled,
+                render_target,
+                depth_stencil,
+                ..
+            } => ResourceUsageHint::Texture {
+                sampled,
+                render_target,
+                depth_stencil,
+                cpu_write_frequent: true,
+            },
+            _ => ResourceUsageHint::Texture {
+                sampled: false,
+                render_target: false,
+                depth_stencil: matches!(current_hint, ResourceUsageHint::DepthStencil),
+                cpu_write_frequent: true,
+            },
+        };
+        self.promote_resource_usage_hint(resource, promoted_hint)
+    }
+
+    fn promote_resource_usage_hint(
+        &mut self,
+        resource: D3d11ResourceId,
+        promoted_hint: ResourceUsageHint,
+    ) -> AppResult<()> {
+        let (dimension, backend_id, current_hint) = {
+            let record = self.resource(resource)?;
+            (record.desc.dimension, record.backend_id, record.desc.usage_hint)
+        };
+        if dimension == ResourceDimension::Buffer {
+            return Ok(());
+        }
+        let merged_hint = merge_texture_usage_hint(current_hint, promoted_hint);
+        if merged_hint == current_hint {
+            return Ok(());
+        }
+        self.resource_mut(resource)?.desc.usage_hint = merged_hint;
+        self.backend.set_resource_usage_hint(backend_id, merged_hint)?;
         Ok(())
     }
 
@@ -1227,6 +1519,21 @@ impl DeferredContext {
         Ok(())
     }
 
+    pub fn rs_clear_viewports(&self) -> AppResult<()> {
+        self.lock()?.bindings.viewport = None;
+        Ok(())
+    }
+
+    pub fn rs_set_scissor_rects(&self, scissor_rect: ScissorRect) -> AppResult<()> {
+        self.lock()?.bindings.scissor_rect = Some(scissor_rect);
+        Ok(())
+    }
+
+    pub fn rs_clear_scissor_rects(&self) -> AppResult<()> {
+        self.lock()?.bindings.scissor_rect = None;
+        Ok(())
+    }
+
     pub fn ia_set_vertex_buffers(&self, buffers: Vec<D3d11ResourceId>) -> AppResult<()> {
         self.lock()?.bindings.vertex_buffers = buffers;
         Ok(())
@@ -1234,6 +1541,16 @@ impl DeferredContext {
 
     pub fn ia_set_index_buffer(&self, buffer: D3d11ResourceId) -> AppResult<()> {
         self.lock()?.bindings.index_buffer = Some(buffer);
+        Ok(())
+    }
+
+    pub fn ia_clear_index_buffer(&self) -> AppResult<()> {
+        self.lock()?.bindings.index_buffer = None;
+        Ok(())
+    }
+
+    pub fn ia_set_primitive_topology(&self, topology: u32) -> AppResult<()> {
+        self.lock()?.bindings.primitive_topology = Some(topology);
         Ok(())
     }
 
@@ -1252,13 +1569,28 @@ impl DeferredContext {
         Ok(())
     }
 
+    pub fn om_clear_blend_state(&self) -> AppResult<()> {
+        self.lock()?.bindings.blend_state = None;
+        Ok(())
+    }
+
     pub fn rs_set_state(&self, state: RasterizerStateId) -> AppResult<()> {
         self.lock()?.bindings.rasterizer_state = Some(state);
         Ok(())
     }
 
+    pub fn rs_clear_state(&self) -> AppResult<()> {
+        self.lock()?.bindings.rasterizer_state = None;
+        Ok(())
+    }
+
     pub fn om_set_depth_stencil_state(&self, state: DepthStencilStateId) -> AppResult<()> {
         self.lock()?.bindings.depth_stencil_state = Some(state);
+        Ok(())
+    }
+
+    pub fn om_clear_depth_stencil_state(&self) -> AppResult<()> {
+        self.lock()?.bindings.depth_stencil_state = None;
         Ok(())
     }
 
@@ -1331,12 +1663,34 @@ impl DeferredContext {
     }
 
     pub fn draw(&self, vertices: u32) -> AppResult<()> {
-        self.lock()?.commands.push(RecordedCommand::Draw { vertices });
+        self.lock()?.commands.push(RecordedCommand::Draw {
+            vertices,
+            kind: DrawCallKind::Regular,
+        });
+        Ok(())
+    }
+
+    pub fn draw_instanced(&self, vertices: u32, instances: u32) -> AppResult<()> {
+        self.lock()?.commands.push(RecordedCommand::Draw {
+            vertices,
+            kind: DrawCallKind::Instanced { instances },
+        });
         Ok(())
     }
 
     pub fn draw_indexed(&self, indices: u32) -> AppResult<()> {
-        self.lock()?.commands.push(RecordedCommand::DrawIndexed { indices });
+        self.lock()?.commands.push(RecordedCommand::DrawIndexed {
+            indices,
+            kind: IndexedDrawCallKind::Regular,
+        });
+        Ok(())
+    }
+
+    pub fn draw_indexed_instanced(&self, indices: u32, instances: u32) -> AppResult<()> {
+        self.lock()?.commands.push(RecordedCommand::DrawIndexed {
+            indices,
+            kind: IndexedDrawCallKind::Instanced { instances },
+        });
         Ok(())
     }
 
@@ -1350,6 +1704,7 @@ impl DeferredContext {
         Ok(D3d11CommandList {
             binding_signature: device.binding_signature(&recording.bindings)?,
             commands: recording.commands.clone(),
+            bindings: recording.bindings.clone(),
         })
     }
 
@@ -1466,6 +1821,7 @@ fn create_device_internal_with_backend(
                         height: state.desc.height,
                         depth: 1,
                         byte_width: state.desc.width as usize * state.desc.height as usize * 4,
+                        usage_hint: ResourceUsageHint::SwapchainBackbuffer,
                     },
                 },
             );
@@ -1569,6 +1925,61 @@ where
         parts.push(format!("{:?}=[{}]", stage, labels.join(",")));
     }
     Ok(parts.join(";"))
+}
+
+fn texture_cpu_write_frequent(hint: ResourceUsageHint) -> bool {
+    match hint {
+        ResourceUsageHint::Buffer {
+            cpu_write_frequent,
+            ..
+        }
+        | ResourceUsageHint::Texture {
+            cpu_write_frequent,
+            ..
+        } => cpu_write_frequent,
+        ResourceUsageHint::Generic | ResourceUsageHint::SwapchainBackbuffer | ResourceUsageHint::DepthStencil => {
+            false
+        }
+    }
+}
+
+fn merge_texture_usage_hint(
+    current: ResourceUsageHint,
+    promoted: ResourceUsageHint,
+) -> ResourceUsageHint {
+    if matches!(current, ResourceUsageHint::SwapchainBackbuffer | ResourceUsageHint::Buffer { .. }) {
+        return current;
+    }
+
+    let (current_sampled, current_render_target, current_depth_stencil, current_cpu_write) =
+        texture_usage_flags(current);
+    let (promoted_sampled, promoted_render_target, promoted_depth_stencil, promoted_cpu_write) =
+        texture_usage_flags(promoted);
+
+    ResourceUsageHint::Texture {
+        sampled: current_sampled || promoted_sampled,
+        render_target: current_render_target || promoted_render_target,
+        depth_stencil: current_depth_stencil || promoted_depth_stencil,
+        cpu_write_frequent: current_cpu_write || promoted_cpu_write,
+    }
+}
+
+fn texture_usage_flags(hint: ResourceUsageHint) -> (bool, bool, bool, bool) {
+    match hint {
+        ResourceUsageHint::Generic => (false, false, false, false),
+        ResourceUsageHint::SwapchainBackbuffer => (false, true, false, false),
+        ResourceUsageHint::DepthStencil => (false, false, true, false),
+        ResourceUsageHint::Buffer {
+            cpu_write_frequent,
+            ..
+        } => (false, false, false, cpu_write_frequent),
+        ResourceUsageHint::Texture {
+            sampled,
+            render_target,
+            depth_stencil,
+            cpu_write_frequent,
+        } => (sampled, render_target, depth_stencil, cpu_write_frequent),
+    }
 }
 
 fn build_submission_signature(
@@ -1846,6 +2257,178 @@ mod tests {
     }
 
     #[test]
+    fn bare_present_does_not_emit_empty_command_list_submission() {
+        let mut device = d3d11_create_device_and_swapchain(
+            DeviceCreationRequest {
+                requested_feature_levels: vec![FeatureLevel::Level10_1],
+            },
+            SwapchainDesc {
+                width: 2,
+                height: 1,
+                format: DxgiFormat::B8G8R8A8Unorm,
+                buffer_count: 2,
+            },
+        )
+        .expect("create device and swapchain");
+
+        let (submission, present) = device
+            .present_swapchain(1, false, true)
+            .expect("present without pending commands");
+        let submission = submission.expect("captured submission");
+
+        assert_eq!(submission.executed_command_lists, 0);
+        assert_eq!(submission.draw_calls, 0);
+        assert_eq!(submission.indexed_draw_calls, 0);
+        assert_eq!(submission.dispatch_calls, 0);
+        assert!(submission.backend_plan.render_passes.is_empty());
+        assert_eq!(submission.backend_plan.compute_passes, 0);
+        assert_eq!(submission.backend_plan.blit_passes, 0);
+        assert_eq!(present.queued_frames, 1);
+    }
+
+    #[test]
+    fn draw_submission_with_bound_render_targets_creates_render_pass_without_validation_errors() {
+        let mut device = d3d11_create_device_and_swapchain(
+            DeviceCreationRequest {
+                requested_feature_levels: vec![FeatureLevel::Level10_1],
+            },
+            SwapchainDesc {
+                width: 2,
+                height: 2,
+                format: DxgiFormat::B8G8R8A8Unorm,
+                buffer_count: 2,
+            },
+        )
+        .expect("create device and swapchain");
+
+        let backbuffer = device.swapchain_backbuffer(0).expect("swapchain backbuffer");
+        let rtv = device
+            .create_render_target_view(backbuffer, DxgiFormat::B8G8R8A8Unorm)
+            .expect("create render target view");
+
+        device.om_set_render_targets(vec![rtv], None);
+        device.ia_set_primitive_topology(4);
+        device.draw(3);
+
+        let submission = device.submit_immediate().expect("submit draw workload");
+
+        assert_eq!(submission.draw_calls, 1);
+        assert!(submission.backend_plan.validation_errors.is_empty());
+        assert_eq!(submission.backend_plan.render_passes.len(), 1);
+        assert_eq!(submission.backend_plan.render_passes[0].draw_calls, 1);
+        assert!(submission.signature.contains("topo=4"));
+    }
+
+    #[test]
+    fn binding_signature_tracks_scissor_rects() {
+        let mut device = d3d11_create_device(DeviceCreationRequest {
+            requested_feature_levels: vec![FeatureLevel::Level10_1],
+        })
+        .expect("create device");
+
+        device.rs_set_scissor_rects(ScissorRect {
+            left: 1,
+            top: 2,
+            right: 17,
+            bottom: 19,
+        });
+
+        let signature = device
+            .binding_signature(&device.immediate.bindings)
+            .expect("binding signature");
+
+        assert!(signature.contains("scissor=1,2,17,19"));
+    }
+
+    #[test]
+    fn frequently_updated_shader_resource_textures_prefer_shared_storage_on_unified_memory_apple_gpus() {
+        let mut device = create_device_internal_with_backend(
+            DeviceCreationRequest {
+                requested_feature_levels: vec![FeatureLevel::Level10_1],
+            },
+            None,
+            test_backend(host_gpu_profile_from_name("Apple M5 Pro")),
+        )
+        .expect("create apple11 device");
+
+        let texture = device
+            .create_texture_2d("streamed-srv-texture", 64, 64, DxgiFormat::R8G8B8A8Unorm)
+            .expect("create texture");
+        device
+            .create_shader_resource_view(texture, DxgiFormat::R8G8B8A8Unorm)
+            .expect("create srv");
+        device
+            .update_subresource(texture, &vec![0x7f; 64 * 64 * 4])
+            .expect("update texture");
+
+        let backend_id = device.resource(texture).expect("texture record").backend_id;
+        assert_eq!(
+            device
+                .backend
+                .resource_storage_mode(backend_id)
+                .expect("texture storage mode"),
+            crate::gfx::MetalStorageMode::Shared
+        );
+        assert!(matches!(
+            device.resource(texture).expect("texture record").desc.usage_hint,
+            ResourceUsageHint::Texture {
+                sampled: true,
+                render_target: false,
+                depth_stencil: false,
+                cpu_write_frequent: true,
+            }
+        ));
+    }
+
+    #[test]
+    fn render_target_and_depth_stencil_textures_keep_expected_apple_storage_modes() {
+        let mut device = create_device_internal_with_backend(
+            DeviceCreationRequest {
+                requested_feature_levels: vec![FeatureLevel::Level10_1],
+            },
+            None,
+            test_backend(host_gpu_profile_from_name("Apple M5 Pro")),
+        )
+        .expect("create apple11 device");
+
+        let render_target = device
+            .create_texture_2d("render-target", 64, 64, DxgiFormat::B8G8R8A8Unorm)
+            .expect("create render target");
+        device
+            .create_render_target_view(render_target, DxgiFormat::B8G8R8A8Unorm)
+            .expect("create rtv");
+        let render_target_backend = device
+            .resource(render_target)
+            .expect("render target record")
+            .backend_id;
+        assert_eq!(
+            device
+                .backend
+                .resource_storage_mode(render_target_backend)
+                .expect("render target storage mode"),
+            crate::gfx::MetalStorageMode::Private
+        );
+
+        let depth_target = device
+            .create_texture_2d("depth-target", 64, 64, DxgiFormat::D24UnormS8Uint)
+            .expect("create depth target");
+        device
+            .create_depth_stencil_view(depth_target, DxgiFormat::D24UnormS8Uint)
+            .expect("create dsv");
+        let depth_backend = device
+            .resource(depth_target)
+            .expect("depth target record")
+            .backend_id;
+        assert_eq!(
+            device
+                .backend
+                .resource_storage_mode(depth_backend)
+                .expect("depth target storage mode"),
+            crate::gfx::MetalStorageMode::Memoryless
+        );
+    }
+
+    #[test]
     fn submission_signature_changes_with_detected_gpu_family_profile() {
         let mut apple7 = create_device_internal_with_backend(
             DeviceCreationRequest {
@@ -1883,6 +2466,77 @@ mod tests {
         assert!(apple11_submission.signature.contains("mesh=true"));
         assert_ne!(apple7_submission.signature, apple11_submission.signature);
         assert_ne!(apple7_submission.hash, apple11_submission.hash);
+    }
+
+    #[test]
+    fn newer_apple_families_coalesce_small_draw_submission_bursts() {
+        fn build_draw_sequences(
+            device: &mut D3d11Device,
+        ) -> (Vec<(ContextBindings, Vec<RecordedCommand>)>, Vec<String>) {
+            let render_target = device
+                .create_texture_2d("draw-target", 2, 2, DxgiFormat::B8G8R8A8Unorm)
+                .expect("create draw target");
+            let rtv = device
+                .create_render_target_view(render_target, DxgiFormat::B8G8R8A8Unorm)
+                .expect("create draw rtv");
+            let bindings = ContextBindings {
+                render_targets: vec![rtv],
+                primitive_topology: Some(4),
+                ..Default::default()
+            };
+            let signature = device.binding_signature(&bindings).expect("binding signature");
+            (
+                vec![
+                    (
+                        bindings.clone(),
+                        vec![RecordedCommand::Draw {
+                            vertices: 3,
+                            kind: DrawCallKind::Regular,
+                        }],
+                    ),
+                    (
+                        bindings,
+                        vec![RecordedCommand::Draw {
+                            vertices: 3,
+                            kind: DrawCallKind::Regular,
+                        }],
+                    ),
+                ],
+                vec![signature.clone(), signature],
+            )
+        }
+
+        let mut apple7 = create_device_internal_with_backend(
+            DeviceCreationRequest {
+                requested_feature_levels: vec![FeatureLevel::Level10_1],
+            },
+            None,
+            test_backend(host_gpu_profile_from_name("Apple M1 Max")),
+        )
+        .expect("create apple7 device");
+        let (apple7_sequences, apple7_signatures) = build_draw_sequences(&mut apple7);
+        let apple7_submission = apple7
+            .submit_sequences_with_signatures(apple7_sequences, apple7_signatures, true)
+            .expect("submit apple7 sequences");
+
+        let mut apple11 = create_device_internal_with_backend(
+            DeviceCreationRequest {
+                requested_feature_levels: vec![FeatureLevel::Level10_1],
+            },
+            None,
+            test_backend(host_gpu_profile_from_name("Apple M5 Pro")),
+        )
+        .expect("create apple11 device");
+        let (apple11_sequences, apple11_signatures) = build_draw_sequences(&mut apple11);
+        let apple11_submission = apple11
+            .submit_sequences_with_signatures(apple11_sequences, apple11_signatures, true)
+            .expect("submit apple11 sequences");
+
+        assert_eq!(apple7_submission.executed_command_lists, 2);
+        assert_eq!(apple7_submission.backend_plan.render_passes.len(), 2);
+        assert_eq!(apple11_submission.executed_command_lists, 1);
+        assert_eq!(apple11_submission.backend_plan.render_passes.len(), 1);
+        assert_ne!(apple7_submission.signature, apple11_submission.signature);
     }
 
     #[test]

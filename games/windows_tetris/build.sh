@@ -20,6 +20,10 @@ set -- \
   -fno-sanitize=undefined \
   -fno-asynchronous-unwind-tables \
   -fno-unwind-tables \
+  -falign-functions=1 \
+  -falign-jumps=1 \
+  -falign-labels=1 \
+  -falign-loops=1 \
   -fno-ident \
   -fomit-frame-pointer \
   -nostdlib \

@@ -5,10 +5,13 @@ use casa1::diagnostics::{DoctorReport, ExportSummary};
 use casa1::error::ErrorResponse;
 use casa1::ge::GameEnvironment;
 use casa1::logging::LogEvent;
+use casa1::network::Certificate;
 use casa1::reason::ReasonCode;
 use casa1::runner::replay_trace;
+use casa1::steam::SteamUpdatePlan;
 use casa1::trace::TraceRecord;
 use serde::de::DeserializeOwned;
+use std::collections::BTreeMap;
 use std::fs;
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -386,6 +389,1115 @@ fn indirect_import_calls_land_on_pe_host_thunks() {
 }
 
 #[test]
+fn ge_install_steam_zero_touch_bootstraps_and_launches_game_from_real_ge_fail_first() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    create_ge(&temp_dir, "steam-zero-touch-cli");
+
+    let installer_path = temp_dir.path().join("SteamSetup.exe");
+    fs::write(&installer_path, support::sample_pe_bytes()).expect("write steam setup probe");
+
+    let payload_root = temp_dir.path().join("steam-payload");
+    fs::create_dir_all(payload_root.join("Bin")).expect("create payload bin");
+    fs::write(payload_root.join("Bin/ZeroTouch.exe"), b"zero-touch-game").expect("write payload exe");
+    fs::write(payload_root.join("steam_api64.dll"), b"steam-api64").expect("write steam api");
+
+    let appmanifest_path = temp_dir.path().join("appmanifest_570.acf");
+    fs::write(
+        &appmanifest_path,
+        concat!(
+            "\"AppState\"\n",
+            "{\n",
+            "\t\"appid\"\t\"570\"\n",
+            "\t\"name\"\t\"Zero Touch Game\"\n",
+            "\t\"installdir\"\t\"Zero Touch Game\"\n",
+            "}\n"
+        ),
+    )
+    .expect("write appmanifest");
+
+    let installscript_path = temp_dir.path().join("installscript.vdf");
+    fs::write(
+        &installscript_path,
+        concat!(
+            "\"InstallScript\"\n",
+            "{\n",
+            "\t\"Launch\"\n",
+            "\t{\n",
+            "\t\t\"Executable\"\t\"Bin/ZeroTouch.exe\"\n",
+            "\t}\n",
+            "\t\"Redistributables\"\n",
+            "\t{\n",
+            "\t\t\"DirectX\"\n",
+            "\t\t{\n",
+            "\t\t\t\"Dll\"\t\"xinput1_3.dll\"\n",
+            "\t\t}\n",
+            "\t\t\"VisualCpp\"\n",
+            "\t\t{\n",
+            "\t\t\t\"Version\"\t\"vc143\"\n",
+            "\t\t\t\"Dlls\"\t\"vcruntime140.dll,msvcp140.dll\"\n",
+            "\t\t}\n",
+            "\t\t\"DotNet\"\n",
+            "\t\t{\n",
+            "\t\t\t\"Version\"\t\"net8.0\"\n",
+            "\t\t}\n",
+            "\t}\n",
+            "}\n"
+        ),
+    )
+    .expect("write installscript");
+
+    let update_plan_path = temp_dir.path().join("steam-update-plan.json");
+    fs::write(
+        &update_plan_path,
+        casa1::util::stable_json(&SteamUpdatePlan {
+            files: BTreeMap::from([
+                (
+                    "C:/Program Files/Steam/steam.exe".to_string(),
+                    b"steam-bootstrap-v2".to_vec(),
+                ),
+                (
+                    "C:/Program Files/Steam/package/steamui.dll".to_string(),
+                    b"steam-ui-v2".to_vec(),
+                ),
+            ]),
+            fail_after_write: None,
+        })
+        .expect("encode update plan"),
+    )
+    .expect("write update plan");
+
+    let cert_chain_path = temp_dir.path().join("steam-certs.json");
+    fs::write(
+        &cert_chain_path,
+        casa1::util::stable_json(&vec![
+            Certificate {
+                subject: "api.example.com".to_string(),
+                issuer: "Casa1 Root".to_string(),
+                fingerprint: "leaf-1".to_string(),
+                valid_hostnames: vec!["api.example.com".to_string(), "launcher.example.com".to_string()],
+                not_after_day: 10_000,
+                revoked: false,
+                supported_ciphers: vec!["TLS_AES_128_GCM_SHA256".to_string()],
+            },
+            Certificate {
+                subject: "Casa1 Root".to_string(),
+                issuer: "Casa1 Root".to_string(),
+                fingerprint: "root-1".to_string(),
+                valid_hostnames: vec!["api.example.com".to_string(), "launcher.example.com".to_string()],
+                not_after_day: 10_000,
+                revoked: false,
+                supported_ciphers: vec!["TLS_AES_128_GCM_SHA256".to_string()],
+            },
+        ])
+        .expect("encode cert chain"),
+    )
+    .expect("write cert chain");
+
+    let install_output = run_macwin(
+        &temp_dir,
+        &[
+            "ge:install",
+            "--ge",
+            "steam-zero-touch-cli",
+            "--installer",
+            &installer_path.display().to_string(),
+            "--silent",
+            "--dtm",
+            "--steam-update-plan",
+            &update_plan_path.display().to_string(),
+            "--steam-cert-chain",
+            &cert_chain_path.display().to_string(),
+            "--steam-appmanifest",
+            &appmanifest_path.display().to_string(),
+            "--steam-installscript",
+            &installscript_path.display().to_string(),
+            "--steam-payload-root",
+            &payload_root.display().to_string(),
+            "--trace-categories",
+            "file,registry,process,time",
+        ],
+    );
+    let install_report: CanonicalTestOutput = parse_stdout_json(&install_output);
+
+    assert_eq!(install_report.exit_code, 0);
+    assert!(install_report.guest_exceptions.is_empty());
+    assert!(install_report
+        .file_manifest_delta
+        .iter()
+        .any(|delta| delta.path_norm == "C:\\program files\\steam\\steam.exe"));
+    assert!(install_report
+        .file_manifest_delta
+        .iter()
+        .any(|delta| delta.path_norm == "C:\\program files\\steam\\steamapps\\appmanifest_570.acf"));
+    assert!(install_report
+        .file_manifest_delta
+        .iter()
+        .any(|delta| delta.path_norm == "C:\\program files\\steam\\steamapps\\common\\zero touch game\\bin\\zerotouch.exe"));
+    assert!(install_report
+        .file_manifest_delta
+        .iter()
+        .any(|delta| delta.path_norm == "C:\\windows\\system32\\xinput1_3.dll"));
+    assert!(install_report
+        .file_manifest_delta
+        .iter()
+        .any(|delta| delta.path_norm == "C:\\windows\\winsxs\\vc143\\vcruntime140.dll"));
+    assert!(install_report
+        .registry_delta
+        .iter()
+        .any(|delta| delta.hive == "HKCU" && delta.key_norm == "Software\\Valve\\Steam" && delta.value == "SteamPath"));
+    assert!(install_report
+        .registry_delta
+        .iter()
+        .any(|delta| delta.hive == "HKCU" && delta.key_norm == "Software\\Valve\\Steam" && delta.value == "SteamExe"));
+
+    let ge_root = ge_root(&temp_dir, "steam-zero-touch-cli");
+    let trace_path = ge_root.join("traces/install-SteamSetup.json");
+    let trace_record: TraceRecord = read_json(&trace_path);
+    assert!(trace_record.events.iter().any(|event| {
+        event.category == "process"
+            && event.call_id == "SteamZeroTouchInstall"
+            && event.parameters.get("app_id") == Some(&serde_json::json!(570))
+            && event.parameters.get("launched") == Some(&serde_json::json!(true))
+    }));
+}
+
+#[test]
+fn ge_install_steam_zero_touch_supports_secondary_steam_library_without_user_input() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    create_ge(&temp_dir, "steam-zero-touch-secondary-cli");
+
+    let installer_path = temp_dir.path().join("SteamSetup.exe");
+    fs::write(&installer_path, support::sample_pe_bytes()).expect("write steam setup probe");
+
+    let payload_root = temp_dir.path().join("steam-secondary-payload");
+    fs::create_dir_all(payload_root.join("Bin")).expect("create payload bin");
+    fs::write(payload_root.join("Bin/LibraryGame.exe"), b"library-game").expect("write payload exe");
+    fs::write(payload_root.join("steam_api64.dll"), b"steam-api64").expect("write steam api");
+
+    let appmanifest_path = temp_dir.path().join("appmanifest_571.acf");
+    fs::write(
+        &appmanifest_path,
+        concat!(
+            "\"AppState\"\n",
+            "{\n",
+            "\t\"appid\"\t\"571\"\n",
+            "\t\"name\"\t\"Zero Touch Library Game\"\n",
+            "\t\"installdir\"\t\"Zero Touch Library Game\"\n",
+            "}\n"
+        ),
+    )
+    .expect("write appmanifest");
+
+    let installscript_path = temp_dir.path().join("installscript.vdf");
+    fs::write(
+        &installscript_path,
+        concat!(
+            "\"InstallScript\"\n",
+            "{\n",
+            "\t\"Launch\"\n",
+            "\t{\n",
+            "\t\t\"Executable\"\t\"Bin/LibraryGame.exe\"\n",
+            "\t}\n",
+            "\t\"Redistributables\"\n",
+            "\t{\n",
+            "\t\t\"DirectX\"\n",
+            "\t\t{\n",
+            "\t\t\t\"Dll\"\t\"xinput1_3.dll\"\n",
+            "\t\t}\n",
+            "\t}\n",
+            "}\n"
+        ),
+    )
+    .expect("write installscript");
+
+    let update_plan_path = temp_dir.path().join("steam-update-plan.json");
+    fs::write(
+        &update_plan_path,
+        casa1::util::stable_json(&SteamUpdatePlan {
+            files: BTreeMap::from([
+                (
+                    "C:/Program Files/Steam/steam.exe".to_string(),
+                    b"steam-bootstrap-v2".to_vec(),
+                ),
+                (
+                    "C:/Program Files/Steam/package/steamui.dll".to_string(),
+                    b"steam-ui-v2".to_vec(),
+                ),
+            ]),
+            fail_after_write: None,
+        })
+        .expect("encode update plan"),
+    )
+    .expect("write update plan");
+
+    let cert_chain_path = temp_dir.path().join("steam-certs.json");
+    fs::write(
+        &cert_chain_path,
+        casa1::util::stable_json(&vec![
+            Certificate {
+                subject: "api.example.com".to_string(),
+                issuer: "Casa1 Root".to_string(),
+                fingerprint: "leaf-1".to_string(),
+                valid_hostnames: vec!["api.example.com".to_string(), "launcher.example.com".to_string()],
+                not_after_day: 10_000,
+                revoked: false,
+                supported_ciphers: vec!["TLS_AES_128_GCM_SHA256".to_string()],
+            },
+            Certificate {
+                subject: "Casa1 Root".to_string(),
+                issuer: "Casa1 Root".to_string(),
+                fingerprint: "root-1".to_string(),
+                valid_hostnames: vec!["api.example.com".to_string(), "launcher.example.com".to_string()],
+                not_after_day: 10_000,
+                revoked: false,
+                supported_ciphers: vec!["TLS_AES_128_GCM_SHA256".to_string()],
+            },
+        ])
+        .expect("encode cert chain"),
+    )
+    .expect("write cert chain");
+
+    let install_output = run_macwin(
+        &temp_dir,
+        &[
+            "ge:install",
+            "--ge",
+            "steam-zero-touch-secondary-cli",
+            "--installer",
+            &installer_path.display().to_string(),
+            "--silent",
+            "--dtm",
+            "--steam-update-plan",
+            &update_plan_path.display().to_string(),
+            "--steam-cert-chain",
+            &cert_chain_path.display().to_string(),
+            "--steam-appmanifest",
+            &appmanifest_path.display().to_string(),
+            "--steam-installscript",
+            &installscript_path.display().to_string(),
+            "--steam-payload-root",
+            &payload_root.display().to_string(),
+            "--steam-library-root",
+            "C:/SteamLibraryArcade",
+            "--trace-categories",
+            "file,registry,process,time",
+        ],
+    );
+    let install_report: CanonicalTestOutput = parse_stdout_json(&install_output);
+
+    assert_eq!(install_report.exit_code, 0);
+    assert!(install_report
+        .file_manifest_delta
+        .iter()
+        .any(|delta| delta.path_norm == "C:\\steamlibraryarcade\\steamapps\\appmanifest_571.acf"));
+    assert!(install_report
+        .file_manifest_delta
+        .iter()
+        .any(|delta| delta.path_norm == "C:\\steamlibraryarcade\\steamapps\\common\\zero touch library game\\bin\\librarygame.exe"));
+    assert!(install_report
+        .file_manifest_delta
+        .iter()
+        .any(|delta| delta.path_norm == "C:\\program files\\steam\\steamapps\\libraryfolders.vdf"));
+    assert!(install_report
+        .file_manifest_delta
+        .iter()
+        .all(|delta| delta.path_norm != "C:\\program files\\steam\\steamapps\\common\\zero touch library game\\bin\\librarygame.exe"));
+
+    let ge_root = ge_root(&temp_dir, "steam-zero-touch-secondary-cli");
+    let trace_path = ge_root.join("traces/install-SteamSetup.json");
+    let trace_record: TraceRecord = read_json(&trace_path);
+    assert!(trace_record.events.iter().any(|event| {
+        event.category == "process"
+            && event.call_id == "SteamZeroTouchInstall"
+            && event.parameters.get("app_id") == Some(&serde_json::json!(571))
+            && event.parameters.get("launched") == Some(&serde_json::json!(true))
+    }));
+}
+
+#[test]
+fn ge_install_steam_zero_touch_supports_secondary_drive_library_without_user_input() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    create_ge(&temp_dir, "steam-zero-touch-drive-d-cli");
+
+    let installer_path = temp_dir.path().join("SteamSetup.exe");
+    fs::write(&installer_path, support::sample_pe_bytes()).expect("write steam setup probe");
+
+    let payload_root = temp_dir.path().join("steam-drive-d-payload");
+    fs::create_dir_all(payload_root.join("Bin")).expect("create payload bin");
+    fs::write(payload_root.join("Bin/DriveGame.exe"), b"drive-game").expect("write payload exe");
+    fs::write(payload_root.join("steam_api64.dll"), b"steam-api64").expect("write steam api");
+
+    let appmanifest_path = temp_dir.path().join("appmanifest_572.acf");
+    fs::write(
+        &appmanifest_path,
+        concat!(
+            "\"AppState\"\n",
+            "{\n",
+            "\t\"appid\"\t\"572\"\n",
+            "\t\"name\"\t\"Zero Touch Drive Game\"\n",
+            "\t\"installdir\"\t\"Zero Touch Drive Game\"\n",
+            "}\n"
+        ),
+    )
+    .expect("write appmanifest");
+
+    let installscript_path = temp_dir.path().join("installscript.vdf");
+    fs::write(
+        &installscript_path,
+        concat!(
+            "\"InstallScript\"\n",
+            "{\n",
+            "\t\"Launch\"\n",
+            "\t{\n",
+            "\t\t\"Executable\"\t\"Bin/DriveGame.exe\"\n",
+            "\t}\n",
+            "\t\"Redistributables\"\n",
+            "\t{\n",
+            "\t\t\"DirectX\"\n",
+            "\t	{\n",
+            "\t\t\t\"Dll\"\t\"xinput1_3.dll\"\n",
+            "\t\t}\n",
+            "\t}\n",
+            "}\n"
+        ),
+    )
+    .expect("write installscript");
+
+    let update_plan_path = temp_dir.path().join("steam-update-plan.json");
+    fs::write(
+        &update_plan_path,
+        casa1::util::stable_json(&SteamUpdatePlan {
+            files: BTreeMap::from([
+                (
+                    "C:/Program Files/Steam/steam.exe".to_string(),
+                    b"steam-bootstrap-v2".to_vec(),
+                ),
+                (
+                    "C:/Program Files/Steam/package/steamui.dll".to_string(),
+                    b"steam-ui-v2".to_vec(),
+                ),
+            ]),
+            fail_after_write: None,
+        })
+        .expect("encode update plan"),
+    )
+    .expect("write update plan");
+
+    let cert_chain_path = temp_dir.path().join("steam-certs.json");
+    fs::write(
+        &cert_chain_path,
+        casa1::util::stable_json(&vec![
+            Certificate {
+                subject: "api.example.com".to_string(),
+                issuer: "Casa1 Root".to_string(),
+                fingerprint: "leaf-1".to_string(),
+                valid_hostnames: vec!["api.example.com".to_string(), "launcher.example.com".to_string()],
+                not_after_day: 10_000,
+                revoked: false,
+                supported_ciphers: vec!["TLS_AES_128_GCM_SHA256".to_string()],
+            },
+            Certificate {
+                subject: "Casa1 Root".to_string(),
+                issuer: "Casa1 Root".to_string(),
+                fingerprint: "root-1".to_string(),
+                valid_hostnames: vec!["api.example.com".to_string(), "launcher.example.com".to_string()],
+                not_after_day: 10_000,
+                revoked: false,
+                supported_ciphers: vec!["TLS_AES_128_GCM_SHA256".to_string()],
+            },
+        ])
+        .expect("encode cert chain"),
+    )
+    .expect("write cert chain");
+
+    let install_output = run_macwin(
+        &temp_dir,
+        &[
+            "ge:install",
+            "--ge",
+            "steam-zero-touch-drive-d-cli",
+            "--installer",
+            &installer_path.display().to_string(),
+            "--silent",
+            "--dtm",
+            "--steam-update-plan",
+            &update_plan_path.display().to_string(),
+            "--steam-cert-chain",
+            &cert_chain_path.display().to_string(),
+            "--steam-appmanifest",
+            &appmanifest_path.display().to_string(),
+            "--steam-installscript",
+            &installscript_path.display().to_string(),
+            "--steam-payload-root",
+            &payload_root.display().to_string(),
+            "--steam-library-root",
+            "D:/SteamLibraryArcade",
+            "--trace-categories",
+            "file,registry,process,time",
+        ],
+    );
+    let install_report: CanonicalTestOutput = parse_stdout_json(&install_output);
+
+    assert_eq!(install_report.exit_code, 0);
+    assert!(install_report
+        .file_manifest_delta
+        .iter()
+        .any(|delta| delta.path_norm == "D:\\steamlibraryarcade\\steamapps\\appmanifest_572.acf"));
+    assert!(install_report
+        .file_manifest_delta
+        .iter()
+        .any(|delta| delta.path_norm == "D:\\steamlibraryarcade\\steamapps\\common\\zero touch drive game\\bin\\drivegame.exe"));
+    assert!(install_report
+        .file_manifest_delta
+        .iter()
+        .any(|delta| delta.path_norm == "C:\\program files\\steam\\steamapps\\libraryfolders.vdf"));
+    assert!(install_report
+        .file_manifest_delta
+        .iter()
+        .any(|delta| delta.path_norm == "C:\\windows\\system32\\xinput1_3.dll"));
+
+    let ge_root = ge_root(&temp_dir, "steam-zero-touch-drive-d-cli");
+    let trace_path = ge_root.join("traces/install-SteamSetup.json");
+    let trace_record: TraceRecord = read_json(&trace_path);
+    assert!(trace_record.events.iter().any(|event| {
+        event.category == "process"
+            && event.call_id == "SteamZeroTouchInstall"
+            && event.parameters.get("app_id") == Some(&serde_json::json!(572))
+            && event.parameters.get("launched") == Some(&serde_json::json!(true))
+    }));
+}
+
+#[test]
+fn ge_install_steam_zero_touch_supports_external_host_volume_for_secondary_library() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    create_ge(&temp_dir, "steam-zero-touch-external-volume-cli");
+
+    let installer_path = temp_dir.path().join("SteamSetup.exe");
+    fs::write(&installer_path, support::sample_pe_bytes()).expect("write steam setup probe");
+
+    let payload_root = temp_dir.path().join("steam-external-volume-payload");
+    fs::create_dir_all(payload_root.join("Bin")).expect("create payload bin");
+    fs::write(payload_root.join("Bin/ExternalGame.exe"), b"external-game").expect("write payload exe");
+    fs::write(payload_root.join("steam_api64.dll"), b"steam-api64").expect("write steam api");
+
+    let external_host_root = temp_dir.path().join("mounted-arcade-volume");
+    fs::create_dir_all(&external_host_root).expect("create external host root");
+
+    let appmanifest_path = temp_dir.path().join("appmanifest_573.acf");
+    fs::write(
+        &appmanifest_path,
+        concat!(
+            "\"AppState\"\n",
+            "{\n",
+            "\t\"appid\"\t\"573\"\n",
+            "\t\"name\"\t\"Zero Touch External Game\"\n",
+            "\t\"installdir\"\t\"Zero Touch External Game\"\n",
+            "}\n"
+        ),
+    )
+    .expect("write appmanifest");
+
+    let installscript_path = temp_dir.path().join("installscript.vdf");
+    fs::write(
+        &installscript_path,
+        concat!(
+            "\"InstallScript\"\n",
+            "{\n",
+            "\t\"Launch\"\n",
+            "\t{\n",
+            "\t\t\"Executable\"\t\"Bin/ExternalGame.exe\"\n",
+            "\t}\n",
+            "\t\"Redistributables\"\n",
+            "\t{\n",
+            "\t\t\"DirectX\"\n",
+            "\t\t{\n",
+            "\t\t\t\"Dll\"\t\"xinput1_3.dll\"\n",
+            "\t\t}\n",
+            "\t}\n",
+            "}\n"
+        ),
+    )
+    .expect("write installscript");
+
+    let update_plan_path = temp_dir.path().join("steam-update-plan.json");
+    fs::write(
+        &update_plan_path,
+        casa1::util::stable_json(&SteamUpdatePlan {
+            files: BTreeMap::from([
+                (
+                    "C:/Program Files/Steam/steam.exe".to_string(),
+                    b"steam-bootstrap-v2".to_vec(),
+                ),
+                (
+                    "C:/Program Files/Steam/package/steamui.dll".to_string(),
+                    b"steam-ui-v2".to_vec(),
+                ),
+            ]),
+            fail_after_write: None,
+        })
+        .expect("encode update plan"),
+    )
+    .expect("write update plan");
+
+    let cert_chain_path = temp_dir.path().join("steam-certs.json");
+    fs::write(
+        &cert_chain_path,
+        casa1::util::stable_json(&vec![
+            Certificate {
+                subject: "api.example.com".to_string(),
+                issuer: "Casa1 Root".to_string(),
+                fingerprint: "leaf-1".to_string(),
+                valid_hostnames: vec!["api.example.com".to_string(), "launcher.example.com".to_string()],
+                not_after_day: 10_000,
+                revoked: false,
+                supported_ciphers: vec!["TLS_AES_128_GCM_SHA256".to_string()],
+            },
+            Certificate {
+                subject: "Casa1 Root".to_string(),
+                issuer: "Casa1 Root".to_string(),
+                fingerprint: "root-1".to_string(),
+                valid_hostnames: vec!["api.example.com".to_string(), "launcher.example.com".to_string()],
+                not_after_day: 10_000,
+                revoked: false,
+                supported_ciphers: vec!["TLS_AES_128_GCM_SHA256".to_string()],
+            },
+        ])
+        .expect("encode cert chain"),
+    )
+    .expect("write cert chain");
+
+    let install_output = run_macwin(
+        &temp_dir,
+        &[
+            "ge:install",
+            "--ge",
+            "steam-zero-touch-external-volume-cli",
+            "--installer",
+            &installer_path.display().to_string(),
+            "--silent",
+            "--dtm",
+            "--steam-update-plan",
+            &update_plan_path.display().to_string(),
+            "--steam-cert-chain",
+            &cert_chain_path.display().to_string(),
+            "--steam-appmanifest",
+            &appmanifest_path.display().to_string(),
+            "--steam-installscript",
+            &installscript_path.display().to_string(),
+            "--steam-payload-root",
+            &payload_root.display().to_string(),
+            "--steam-library-root",
+            "D:/SteamLibraryArcade",
+            "--steam-library-host-root",
+            &external_host_root.display().to_string(),
+            "--trace-categories",
+            "file,registry,process,time",
+        ],
+    );
+    let install_report: CanonicalTestOutput = parse_stdout_json(&install_output);
+
+    assert_eq!(install_report.exit_code, 0);
+    assert!(install_report
+        .file_manifest_delta
+        .iter()
+        .any(|delta| delta.path_norm == "D:\\steamlibraryarcade\\steamapps\\appmanifest_573.acf"));
+    assert!(install_report
+        .file_manifest_delta
+        .iter()
+        .any(|delta| delta.path_norm == "D:\\steamlibraryarcade\\steamapps\\common\\zero touch external game\\bin\\externalgame.exe"));
+
+    let external_game_host_path = external_host_root.join("SteamLibraryArcade/steamapps/common/Zero Touch External Game/Bin/ExternalGame.exe");
+    assert!(external_game_host_path.is_file());
+    let external_manifest_host_path = external_host_root.join("SteamLibraryArcade/steamapps/appmanifest_573.acf");
+    assert!(external_manifest_host_path.is_file());
+
+    let ge = GameEnvironment::from_root(ge_root(&temp_dir, "steam-zero-touch-external-volume-cli")).expect("reopen GE");
+    assert!(ge
+        .active_drive_mappings()
+        .iter()
+        .any(|mapping| mapping.drive == "D" && mapping.target == external_host_root.display().to_string()));
+}
+
+#[test]
+fn ge_install_steam_zero_touch_selects_library_from_parsed_libraryfolders_metadata() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    create_ge(&temp_dir, "steam-zero-touch-libraryfolders-cli");
+
+    let installer_path = temp_dir.path().join("SteamSetup.exe");
+    fs::write(&installer_path, support::sample_pe_bytes()).expect("write steam setup probe");
+
+    let payload_root = temp_dir.path().join("steam-libraryfolders-payload");
+    fs::create_dir_all(payload_root.join("Bin")).expect("create payload bin");
+    fs::write(payload_root.join("Bin/RacingGame.exe"), b"racing-game").expect("write payload exe");
+    fs::write(payload_root.join("steam_api64.dll"), b"steam-api64").expect("write steam api");
+
+    let external_d_root = temp_dir.path().join("mounted-arcade-volume");
+    let external_e_root = temp_dir.path().join("mounted-racing-volume");
+    fs::create_dir_all(&external_d_root).expect("create D volume root");
+    fs::create_dir_all(&external_e_root).expect("create E volume root");
+
+    let appmanifest_path = temp_dir.path().join("appmanifest_574.acf");
+    fs::write(
+        &appmanifest_path,
+        concat!(
+            "\"AppState\"\n",
+            "{\n",
+            "\t\"appid\"\t\"574\"\n",
+            "\t\"name\"\t\"Zero Touch Racing Game\"\n",
+            "\t\"installdir\"\t\"Zero Touch Racing Game\"\n",
+            "}\n"
+        ),
+    )
+    .expect("write appmanifest");
+
+    let installscript_path = temp_dir.path().join("installscript.vdf");
+    fs::write(
+        &installscript_path,
+        concat!(
+            "\"InstallScript\"\n",
+            "{\n",
+            "\t\"Launch\"\n",
+            "\t{\n",
+            "\t\t\"Executable\"\t\"Bin/RacingGame.exe\"\n",
+            "\t}\n",
+            "\t\"Redistributables\"\n",
+            "\t{\n",
+            "\t\t\"DirectX\"\n",
+            "\t\t{\n",
+            "\t\t\t\"Dll\"\t\"xinput1_3.dll\"\n",
+            "\t\t}\n",
+            "\t}\n",
+            "}\n"
+        ),
+    )
+    .expect("write installscript");
+
+    let libraryfolders_path = temp_dir.path().join("libraryfolders.vdf");
+    fs::write(
+        &libraryfolders_path,
+        concat!(
+            "\"libraryfolders\"\n",
+            "{\n",
+            "\t\"0\"\n",
+            "\t{\n",
+            "\t\t\"path\"\t\"C:\\\\Program Files\\\\Steam\"\n",
+            "\t}\n",
+            "\t\"1\"\n",
+            "\t{\n",
+            "\t\t\"path\"\t\"D:\\\\SteamLibraryArcade\"\n",
+            "\t\t\"apps\"\n",
+            "\t\t{\n",
+            "\t\t\t\"573\"\t\"1\"\n",
+            "\t\t}\n",
+            "\t}\n",
+            "\t\"2\"\n",
+            "\t{\n",
+            "\t\t\"path\"\t\"E:\\\\SteamLibraryRacing\"\n",
+            "\t\t\"apps\"\n",
+            "\t\t{\n",
+            "\t\t\t\"574\"\t\"1\"\n",
+            "\t\t}\n",
+            "\t}\n",
+            "}\n"
+        ),
+    )
+    .expect("write libraryfolders");
+
+    let library_host_map_path = temp_dir.path().join("steam-library-host-map.json");
+    fs::write(
+        &library_host_map_path,
+        casa1::util::stable_json(&BTreeMap::from([
+            ("D".to_string(), external_d_root.display().to_string()),
+            ("E".to_string(), external_e_root.display().to_string()),
+        ]))
+        .expect("encode library host map"),
+    )
+    .expect("write library host map");
+
+    let update_plan_path = temp_dir.path().join("steam-update-plan.json");
+    fs::write(
+        &update_plan_path,
+        casa1::util::stable_json(&SteamUpdatePlan {
+            files: BTreeMap::from([
+                (
+                    "C:/Program Files/Steam/steam.exe".to_string(),
+                    b"steam-bootstrap-v2".to_vec(),
+                ),
+                (
+                    "C:/Program Files/Steam/package/steamui.dll".to_string(),
+                    b"steam-ui-v2".to_vec(),
+                ),
+            ]),
+            fail_after_write: None,
+        })
+        .expect("encode update plan"),
+    )
+    .expect("write update plan");
+
+    let cert_chain_path = temp_dir.path().join("steam-certs.json");
+    fs::write(
+        &cert_chain_path,
+        casa1::util::stable_json(&vec![
+            Certificate {
+                subject: "api.example.com".to_string(),
+                issuer: "Casa1 Root".to_string(),
+                fingerprint: "leaf-1".to_string(),
+                valid_hostnames: vec!["api.example.com".to_string(), "launcher.example.com".to_string()],
+                not_after_day: 10_000,
+                revoked: false,
+                supported_ciphers: vec!["TLS_AES_128_GCM_SHA256".to_string()],
+            },
+            Certificate {
+                subject: "Casa1 Root".to_string(),
+                issuer: "Casa1 Root".to_string(),
+                fingerprint: "root-1".to_string(),
+                valid_hostnames: vec!["api.example.com".to_string(), "launcher.example.com".to_string()],
+                not_after_day: 10_000,
+                revoked: false,
+                supported_ciphers: vec!["TLS_AES_128_GCM_SHA256".to_string()],
+            },
+        ])
+        .expect("encode cert chain"),
+    )
+    .expect("write cert chain");
+
+    let install_output = run_macwin(
+        &temp_dir,
+        &[
+            "ge:install",
+            "--ge",
+            "steam-zero-touch-libraryfolders-cli",
+            "--installer",
+            &installer_path.display().to_string(),
+            "--silent",
+            "--dtm",
+            "--steam-update-plan",
+            &update_plan_path.display().to_string(),
+            "--steam-cert-chain",
+            &cert_chain_path.display().to_string(),
+            "--steam-appmanifest",
+            &appmanifest_path.display().to_string(),
+            "--steam-installscript",
+            &installscript_path.display().to_string(),
+            "--steam-payload-root",
+            &payload_root.display().to_string(),
+            "--steam-libraryfolders",
+            &libraryfolders_path.display().to_string(),
+            "--steam-library-host-map",
+            &library_host_map_path.display().to_string(),
+            "--trace-categories",
+            "file,registry,process,time",
+        ],
+    );
+    let install_report: CanonicalTestOutput = parse_stdout_json(&install_output);
+
+    assert_eq!(install_report.exit_code, 0);
+    assert!(install_report
+        .file_manifest_delta
+        .iter()
+        .any(|delta| delta.path_norm == "E:\\steamlibraryracing\\steamapps\\appmanifest_574.acf"));
+    assert!(install_report
+        .file_manifest_delta
+        .iter()
+        .any(|delta| delta.path_norm == "E:\\steamlibraryracing\\steamapps\\common\\zero touch racing game\\bin\\racinggame.exe"));
+    assert!(install_report
+        .file_manifest_delta
+        .iter()
+        .all(|delta| delta.path_norm != "D:\\steamlibraryarcade\\steamapps\\common\\zero touch racing game\\bin\\racinggame.exe"));
+
+    let external_e_game_host_path = external_e_root.join("SteamLibraryRacing/steamapps/common/Zero Touch Racing Game/Bin/RacingGame.exe");
+    assert!(external_e_game_host_path.is_file());
+    assert!(!external_d_root.join("SteamLibraryArcade/steamapps/common/Zero Touch Racing Game/Bin/RacingGame.exe").exists());
+
+    let ge = GameEnvironment::from_root(ge_root(&temp_dir, "steam-zero-touch-libraryfolders-cli")).expect("reopen GE");
+    assert!(ge
+        .active_drive_mappings()
+        .iter()
+        .any(|mapping| mapping.drive == "E" && mapping.target == external_e_root.display().to_string()));
+}
+
+#[test]
+fn ge_install_steam_zero_touch_reuses_persisted_external_library_mapping_without_new_host_map() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    create_ge(&temp_dir, "steam-zero-touch-persisted-library-cli");
+
+    let installer_path = temp_dir.path().join("SteamSetup.exe");
+    fs::write(&installer_path, support::sample_pe_bytes()).expect("write steam setup probe");
+
+    let first_payload_root = temp_dir.path().join("steam-persisted-first-payload");
+    fs::create_dir_all(first_payload_root.join("Bin")).expect("create first payload bin");
+    fs::write(first_payload_root.join("Bin/ArcadeGame.exe"), b"arcade-game").expect("write first payload exe");
+    fs::write(first_payload_root.join("steam_api64.dll"), b"steam-api64").expect("write first steam api");
+
+    let second_payload_root = temp_dir.path().join("steam-persisted-second-payload");
+    fs::create_dir_all(second_payload_root.join("Bin")).expect("create second payload bin");
+    fs::write(second_payload_root.join("Bin/RacingGame.exe"), b"racing-game").expect("write second payload exe");
+    fs::write(second_payload_root.join("steam_api64.dll"), b"steam-api64" ).expect("write second steam api");
+
+    let external_e_root = temp_dir.path().join("mounted-racing-volume");
+    fs::create_dir_all(&external_e_root).expect("create external host root");
+
+    let first_appmanifest_path = temp_dir.path().join("appmanifest_576.acf");
+    fs::write(
+        &first_appmanifest_path,
+        concat!(
+            "\"AppState\"\n",
+            "{\n",
+            "\t\"appid\"\t\"576\"\n",
+            "\t\"name\"\t\"Persisted Arcade Game\"\n",
+            "\t\"installdir\"\t\"Persisted Arcade Game\"\n",
+            "}\n"
+        ),
+    )
+    .expect("write first appmanifest");
+
+    let second_appmanifest_path = temp_dir.path().join("appmanifest_577.acf");
+    fs::write(
+        &second_appmanifest_path,
+        concat!(
+            "\"AppState\"\n",
+            "{\n",
+            "\t\"appid\"\t\"577\"\n",
+            "\t\"name\"\t\"Persisted Racing Game\"\n",
+            "\t\"installdir\"\t\"Persisted Racing Game\"\n",
+            "}\n"
+        ),
+    )
+    .expect("write second appmanifest");
+
+    let first_installscript_path = temp_dir.path().join("installscript-first.vdf");
+    fs::write(
+        &first_installscript_path,
+        concat!(
+            "\"InstallScript\"\n",
+            "{\n",
+            "\t\"Launch\"\n",
+            "\t{\n",
+            "\t\t\"Executable\"\t\"Bin/ArcadeGame.exe\"\n",
+            "\t}\n",
+            "\t\"Redistributables\"\n",
+            "\t{\n",
+            "\t\t\"DirectX\"\n",
+            "\t\t{\n",
+            "\t\t\t\"Dll\"\t\"xinput1_3.dll\"\n",
+            "\t\t}\n",
+            "\t}\n",
+            "}\n"
+        ),
+    )
+    .expect("write first installscript");
+
+    let second_installscript_path = temp_dir.path().join("installscript-second.vdf");
+    fs::write(
+        &second_installscript_path,
+        concat!(
+            "\"InstallScript\"\n",
+            "{\n",
+            "\t\"Launch\"\n",
+            "\t{\n",
+            "\t\t\"Executable\"\t\"Bin/RacingGame.exe\"\n",
+            "\t}\n",
+            "\t\"Redistributables\"\n",
+            "\t{\n",
+            "\t\t\"DirectX\"\n",
+            "\t\t{\n",
+            "\t\t\t\"Dll\"\t\"xinput1_3.dll\"\n",
+            "\t\t}\n",
+            "\t}\n",
+            "}\n"
+        ),
+    )
+    .expect("write second installscript");
+
+    let libraryfolders_path = temp_dir.path().join("libraryfolders.vdf");
+    fs::write(
+        &libraryfolders_path,
+        concat!(
+            "\"libraryfolders\"\n",
+            "{\n",
+            "\t\"0\"\n",
+            "\t{\n",
+            "\t\t\"path\"\t\"C:\\\\Program Files\\\\Steam\"\n",
+            "\t}\n",
+            "\t\"1\"\n",
+            "\t{\n",
+            "\t\t\"path\"\t\"E:\\\\SteamLibraryRacing\"\n",
+            "\t\t\"apps\"\n",
+            "\t\t{\n",
+            "\t\t\t\"576\"\t\"1\"\n",
+            "\t\t}\n",
+            "\t}\n",
+            "}\n"
+        ),
+    )
+    .expect("write initial libraryfolders");
+
+    let library_host_map_path = temp_dir.path().join("steam-library-host-map.json");
+    fs::write(
+        &library_host_map_path,
+        casa1::util::stable_json(&BTreeMap::from([(
+            "e:/steamlibraryracing".to_string(),
+            external_e_root.display().to_string(),
+        )]))
+        .expect("encode library host map"),
+    )
+    .expect("write library host map");
+
+    let update_plan_path = temp_dir.path().join("steam-update-plan.json");
+    fs::write(
+        &update_plan_path,
+        casa1::util::stable_json(&SteamUpdatePlan {
+            files: BTreeMap::from([
+                (
+                    "C:/Program Files/Steam/steam.exe".to_string(),
+                    b"steam-bootstrap-v2".to_vec(),
+                ),
+                (
+                    "C:/Program Files/Steam/package/steamui.dll".to_string(),
+                    b"steam-ui-v2".to_vec(),
+                ),
+            ]),
+            fail_after_write: None,
+        })
+        .expect("encode update plan"),
+    )
+    .expect("write update plan");
+
+    let cert_chain_path = temp_dir.path().join("steam-certs.json");
+    fs::write(
+        &cert_chain_path,
+        casa1::util::stable_json(&vec![
+            Certificate {
+                subject: "api.example.com".to_string(),
+                issuer: "Casa1 Root".to_string(),
+                fingerprint: "leaf-1".to_string(),
+                valid_hostnames: vec!["api.example.com".to_string(), "launcher.example.com".to_string()],
+                not_after_day: 10_000,
+                revoked: false,
+                supported_ciphers: vec!["TLS_AES_128_GCM_SHA256".to_string()],
+            },
+            Certificate {
+                subject: "Casa1 Root".to_string(),
+                issuer: "Casa1 Root".to_string(),
+                fingerprint: "root-1".to_string(),
+                valid_hostnames: vec!["api.example.com".to_string(), "launcher.example.com".to_string()],
+                not_after_day: 10_000,
+                revoked: false,
+                supported_ciphers: vec!["TLS_AES_128_GCM_SHA256".to_string()],
+            },
+        ])
+        .expect("encode cert chain"),
+    )
+    .expect("write cert chain");
+
+    let first_install = run_macwin(
+        &temp_dir,
+        &[
+            "ge:install",
+            "--ge",
+            "steam-zero-touch-persisted-library-cli",
+            "--installer",
+            &installer_path.display().to_string(),
+            "--silent",
+            "--dtm",
+            "--steam-update-plan",
+            &update_plan_path.display().to_string(),
+            "--steam-cert-chain",
+            &cert_chain_path.display().to_string(),
+            "--steam-appmanifest",
+            &first_appmanifest_path.display().to_string(),
+            "--steam-installscript",
+            &first_installscript_path.display().to_string(),
+            "--steam-payload-root",
+            &first_payload_root.display().to_string(),
+            "--steam-libraryfolders",
+            &libraryfolders_path.display().to_string(),
+            "--steam-library-host-map",
+            &library_host_map_path.display().to_string(),
+            "--trace-categories",
+            "file,registry,process,time",
+        ],
+    );
+    let first_report: CanonicalTestOutput = parse_stdout_json(&first_install);
+    assert_eq!(first_report.exit_code, 0);
+
+    fs::write(
+        &libraryfolders_path,
+        concat!(
+            "\"libraryfolders\"\n",
+            "{\n",
+            "\t\"0\"\n",
+            "\t{\n",
+            "\t\t\"path\"\t\"C:\\\\Program Files\\\\Steam\"\n",
+            "\t}\n",
+            "\t\"1\"\n",
+            "\t{\n",
+            "\t\t\"path\"\t\"E:\\\\SteamLibraryRacing\"\n",
+            "\t\t\"apps\"\n",
+            "\t\t{\n",
+            "\t\t\t\"576\"\t\"1\"\n",
+            "\t\t\t\"577\"\t\"1\"\n",
+            "\t\t}\n",
+            "\t}\n",
+            "}\n"
+        ),
+    )
+    .expect("write updated libraryfolders");
+
+    let second_install = run_macwin(
+        &temp_dir,
+        &[
+            "ge:install",
+            "--ge",
+            "steam-zero-touch-persisted-library-cli",
+            "--installer",
+            &installer_path.display().to_string(),
+            "--silent",
+            "--dtm",
+            "--steam-update-plan",
+            &update_plan_path.display().to_string(),
+            "--steam-cert-chain",
+            &cert_chain_path.display().to_string(),
+            "--steam-appmanifest",
+            &second_appmanifest_path.display().to_string(),
+            "--steam-installscript",
+            &second_installscript_path.display().to_string(),
+            "--steam-payload-root",
+            &second_payload_root.display().to_string(),
+            "--steam-libraryfolders",
+            &libraryfolders_path.display().to_string(),
+            "--trace-categories",
+            "file,registry,process,time",
+        ],
+    );
+    let second_report: CanonicalTestOutput = parse_stdout_json(&second_install);
+
+    assert_eq!(second_report.exit_code, 0);
+    assert!(second_report
+        .file_manifest_delta
+        .iter()
+        .any(|delta| delta.path_norm == "E:\\steamlibraryracing\\steamapps\\appmanifest_577.acf"));
+    assert!(second_report
+        .file_manifest_delta
+        .iter()
+        .any(|delta| delta.path_norm == "E:\\steamlibraryracing\\steamapps\\common\\persisted racing game\\bin\\racinggame.exe"));
+    assert!(second_report
+        .file_manifest_delta
+        .iter()
+        .any(|delta| delta.path_norm == "C:\\program files\\steam\\steamapps\\libraryfolders.vdf"));
+
+    let external_second_game = external_e_root.join("SteamLibraryRacing/steamapps/common/Persisted Racing Game/Bin/RacingGame.exe");
+    assert!(external_second_game.is_file());
+
+    let reopened_ge = GameEnvironment::from_root(ge_root(&temp_dir, "steam-zero-touch-persisted-library-cli"))
+        .expect("reopen GE");
+    assert!(reopened_ge
+        .active_drive_mappings()
+        .iter()
+        .any(|mapping| mapping.drive == "E" && mapping.target == external_e_root.display().to_string()));
+}
+
+#[test]
 fn stock_crt_linked_windows_pe_runs_through_pe_runtime() {
     let temp_dir = TempDir::new().expect("temp dir");
     create_ge(&temp_dir, "pe-runtime-crt");
@@ -563,15 +1675,36 @@ fn real_external_windows_d3d11_shader_bindings_trace_through_pe_runtime() {
     assert!(trace_record.events.iter().any(|event| event.category == "dxgi" && event.call_id == "D3D11CreateDeviceAndSwapChain"));
     assert!(trace_record.events.iter().any(|event| event.category == "dxgi" && event.call_id == "IDXGISwapChain::GetBuffer"));
     assert!(trace_record.events.iter().any(|event| event.category == "d3d12" && event.call_id == "ID3D11Device::CreateBuffer"));
+    assert!(trace_record.events.iter().any(|event| event.category == "d3d12" && event.call_id == "ID3D11Device::CreateTexture2D"));
     assert!(trace_record.events.iter().any(|event| event.category == "d3d12" && event.call_id == "ID3D11Device::CreateShaderResourceView"));
+    assert!(trace_record.events.iter().any(|event| event.category == "d3d12" && event.call_id == "ID3D11Device::CreateRenderTargetView"));
+    assert!(trace_record.events.iter().any(|event| event.category == "d3d12" && event.call_id == "ID3D11Device::CreateDepthStencilView"));
+    assert!(trace_record.events.iter().any(|event| event.category == "d3d12" && event.call_id == "ID3D11Device::CreateBlendState"));
+    assert!(trace_record.events.iter().any(|event| event.category == "d3d12" && event.call_id == "ID3D11Device::CreateDepthStencilState"));
+    assert!(trace_record.events.iter().any(|event| event.category == "d3d12" && event.call_id == "ID3D11Device::CreateRasterizerState"));
+    assert!(trace_record.events.iter().any(|event| event.category == "d3d12" && event.call_id == "ID3D11Device::CreateSamplerState"));
     assert!(trace_record.events.iter().any(|event| event.category == "d3d12" && event.call_id == "ID3D11Device::CreateInputLayout"));
     assert!(trace_record.events.iter().any(|event| event.category == "d3d12" && event.call_id == "ID3D11Device::CreateVertexShader"));
     assert!(trace_record.events.iter().any(|event| event.category == "d3d12" && event.call_id == "ID3D11Device::CreatePixelShader"));
+    assert!(trace_record.events.iter().any(|event| event.category == "d3d12" && event.call_id == "ID3D11DeviceContext::OMSetRenderTargets"));
+    assert!(trace_record.events.iter().any(|event| event.category == "d3d12" && event.call_id == "ID3D11DeviceContext::OMSetBlendState"));
+    assert!(trace_record.events.iter().any(|event| event.category == "d3d12" && event.call_id == "ID3D11DeviceContext::OMSetDepthStencilState"));
     assert!(trace_record.events.iter().any(|event| event.category == "d3d12" && event.call_id == "ID3D11DeviceContext::VSSetConstantBuffers"));
     assert!(trace_record.events.iter().any(|event| event.category == "d3d12" && event.call_id == "ID3D11DeviceContext::PSSetShaderResources"));
+    assert!(trace_record.events.iter().any(|event| event.category == "d3d12" && event.call_id == "ID3D11DeviceContext::PSSetSamplers"));
     assert!(trace_record.events.iter().any(|event| event.category == "d3d12" && event.call_id == "ID3D11DeviceContext::IASetInputLayout"));
+    assert!(trace_record.events.iter().any(|event| event.category == "d3d12" && event.call_id == "ID3D11DeviceContext::IASetVertexBuffers"));
+    assert!(trace_record.events.iter().any(|event| event.category == "d3d12" && event.call_id == "ID3D11DeviceContext::IASetIndexBuffer"));
+    assert!(trace_record.events.iter().any(|event| event.category == "d3d12" && event.call_id == "ID3D11DeviceContext::IASetPrimitiveTopology"));
+    assert!(trace_record.events.iter().any(|event| event.category == "d3d12" && event.call_id == "ID3D11DeviceContext::RSSetState"));
+    assert!(trace_record.events.iter().any(|event| event.category == "d3d12" && event.call_id == "ID3D11DeviceContext::RSSetViewports"));
+    assert!(trace_record.events.iter().any(|event| event.category == "d3d12" && event.call_id == "ID3D11DeviceContext::RSSetScissorRects"));
     assert!(trace_record.events.iter().any(|event| event.category == "d3d12" && event.call_id == "ID3D11DeviceContext::VSSetShader"));
     assert!(trace_record.events.iter().any(|event| event.category == "d3d12" && event.call_id == "ID3D11DeviceContext::PSSetShader"));
+    assert!(trace_record.events.iter().any(|event| event.category == "d3d12" && event.call_id == "ID3D11DeviceContext::Draw"));
+    assert!(trace_record.events.iter().any(|event| event.category == "d3d12" && event.call_id == "ID3D11DeviceContext::DrawIndexed"));
+    assert!(trace_record.events.iter().any(|event| event.category == "d3d12" && event.call_id == "ID3D11DeviceContext::DrawInstanced"));
+    assert!(trace_record.events.iter().any(|event| event.category == "d3d12" && event.call_id == "ID3D11DeviceContext::DrawIndexedInstanced"));
     assert!(trace_record.events.iter().any(|event| event.category == "dxgi" && event.call_id == "IDXGISwapChain::Present"));
     assert!(trace_record.events.iter().any(|event| event.category == "process" && event.call_id == "ExitProcess"));
 }

@@ -10,10 +10,17 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub const SAMPLE_IMAGE_BASE: u64 = 0x0000_0001_4000_0000;
+pub const SAMPLE_IMAGE_BASE_X86: u64 = 0x0040_0000;
 pub const SAMPLE_ENTRY_RVA: u32 = 0x1000;
 pub const SAMPLE_TLS_CALLBACK_RVA: u32 = 0x1010;
 pub const SAMPLE_RELOC_TARGET_RVA: u32 = 0x3000;
 pub const SAMPLE_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SamplePeFormat {
+    Pe32,
+    Pe32Plus,
+}
 
 #[derive(Debug, Clone)]
 struct TestSection {
@@ -77,8 +84,29 @@ impl TestSection {
 }
 
 pub fn sample_pe_bytes() -> Vec<u8> {
+    sample_pe_bytes_with_format(SamplePeFormat::Pe32Plus)
+}
+
+pub fn sample_pe32_bytes() -> Vec<u8> {
+    sample_pe_bytes_with_format(SamplePeFormat::Pe32)
+}
+
+fn sample_pe_bytes_with_format(format: SamplePeFormat) -> Vec<u8> {
     let file_alignment = 0x200;
     let section_alignment = 0x1000;
+    let (machine, image_base, pointer_bytes, optional_header_size, load_config_size, tls_directory_size, optional_magic) =
+        match format {
+            SamplePeFormat::Pe32 => (0x014c, SAMPLE_IMAGE_BASE_X86, 4_usize, 0xe0_u32, 0x5c_u32, 24_usize, 0x10b_u16),
+            SamplePeFormat::Pe32Plus => (0x8664, SAMPLE_IMAGE_BASE, 8_usize, 0xf0_u32, 0x94_u32, 40_usize, 0x20b_u16),
+        };
+    let import_table_size = pointer_bytes * 3;
+    let delay_import_table_size = pointer_bytes * 2;
+    let callback_array_size = pointer_bytes * 2;
+    let ordinal_flag = if pointer_bytes == 8 {
+        0x8000_0000_0000_0000_u64
+    } else {
+        0x8000_0000_u64
+    };
 
     let mut text = TestSection::new(".text", 0x1000, 0x6000_0020);
     let entry_rva = text.alloc(&[0xc3], 1);
@@ -90,12 +118,12 @@ pub fn sample_pe_bytes() -> Vec<u8> {
     let mut data = TestSection::new(".data", 0x3000, 0xc000_0040);
     let mut reloc = TestSection::new(".reloc", 0x4000, 0x4200_0040);
 
-    let reloc_target_rva = data.alloc(&(SAMPLE_IMAGE_BASE + 0x1234).to_le_bytes(), 8);
+    let reloc_target_rva = data.alloc(&encode_pointer_le(image_base + 0x1234, pointer_bytes), pointer_bytes);
     assert_eq!(reloc_target_rva, SAMPLE_RELOC_TARGET_RVA);
     let tls_index_rva = data.alloc(&0_u32.to_le_bytes(), 4);
-    let callback_array_rva = data.reserve(16, 8);
-    data.patch_u64(callback_array_rva, SAMPLE_IMAGE_BASE + SAMPLE_TLS_CALLBACK_RVA as u64);
-    data.patch_u64(callback_array_rva + 8, 0);
+    let callback_array_rva = data.reserve(callback_array_size, pointer_bytes);
+    patch_pointer_le(&mut data, callback_array_rva, image_base + SAMPLE_TLS_CALLBACK_RVA as u64, pointer_bytes);
+    patch_pointer_le(&mut data, callback_array_rva + pointer_bytes as u32, 0, pointer_bytes);
 
     let export_directory_rva = rdata.reserve(40, 4);
     let export_dll_name_rva = rdata.alloc(b"sample.dll\0", 1);
@@ -123,12 +151,12 @@ pub fn sample_pe_bytes() -> Vec<u8> {
 
     let import_dll_name_rva = rdata.alloc(b"api-ms-win-core-file-l1-1-0.dll\0", 1);
     let create_file_name_rva = rdata.alloc(&hint_name_bytes("CreateFileW"), 2);
-    let import_int_rva = rdata.reserve(24, 8);
-    let import_iat_rva = rdata.reserve(24, 8);
-    rdata.patch_u64(import_int_rva, create_file_name_rva as u64);
-    rdata.patch_u64(import_int_rva + 8, 0x8000_0000_0000_0011);
-    rdata.patch_u64(import_iat_rva, create_file_name_rva as u64);
-    rdata.patch_u64(import_iat_rva + 8, 0x8000_0000_0000_0011);
+    let import_int_rva = rdata.reserve(import_table_size, pointer_bytes);
+    let import_iat_rva = rdata.reserve(import_table_size, pointer_bytes);
+    patch_pointer_le(&mut rdata, import_int_rva, create_file_name_rva as u64, pointer_bytes);
+    patch_pointer_le(&mut rdata, import_int_rva + pointer_bytes as u32, ordinal_flag | 17, pointer_bytes);
+    patch_pointer_le(&mut rdata, import_iat_rva, create_file_name_rva as u64, pointer_bytes);
+    patch_pointer_le(&mut rdata, import_iat_rva + pointer_bytes as u32, ordinal_flag | 17, pointer_bytes);
     let import_descriptor_rva = rdata.reserve(40, 4);
     rdata.patch_u32(import_descriptor_rva, import_int_rva);
     rdata.patch_u32(import_descriptor_rva + 12, import_dll_name_rva);
@@ -136,35 +164,55 @@ pub fn sample_pe_bytes() -> Vec<u8> {
 
     let delay_dll_name_rva = rdata.alloc(b"kernel32.dll\0", 1);
     let forwarded_name_rva = rdata.alloc(&hint_name_bytes("Forwarded"), 2);
-    let delay_int_rva = rdata.reserve(16, 8);
-    let delay_iat_rva = rdata.reserve(16, 8);
-    rdata.patch_u64(delay_int_rva, forwarded_name_rva as u64);
-    rdata.patch_u64(delay_iat_rva, forwarded_name_rva as u64);
+    let delay_int_rva = rdata.reserve(delay_import_table_size, pointer_bytes);
+    let delay_iat_rva = rdata.reserve(delay_import_table_size, pointer_bytes);
+    patch_pointer_le(&mut rdata, delay_int_rva, forwarded_name_rva as u64, pointer_bytes);
+    patch_pointer_le(&mut rdata, delay_iat_rva, forwarded_name_rva as u64, pointer_bytes);
     let delay_descriptor_rva = rdata.reserve(64, 4);
     rdata.patch_u32(delay_descriptor_rva + 4, delay_dll_name_rva);
     rdata.patch_u32(delay_descriptor_rva + 12, delay_iat_rva);
     rdata.patch_u32(delay_descriptor_rva + 16, delay_int_rva);
 
-    let load_config_rva = rdata.reserve(0x94, 8);
-    rdata.patch_u32(load_config_rva, 0x94);
-    rdata.patch_u64(load_config_rva + 0x60, SAMPLE_IMAGE_BASE + SAMPLE_RELOC_TARGET_RVA as u64);
-    rdata.patch_u64(load_config_rva + 0x68, 1);
-    rdata.patch_u64(load_config_rva + 0x70, SAMPLE_IMAGE_BASE + SAMPLE_ENTRY_RVA as u64);
-    rdata.patch_u64(load_config_rva + 0x78, SAMPLE_IMAGE_BASE + SAMPLE_TLS_CALLBACK_RVA as u64);
-    rdata.patch_u64(load_config_rva + 0x80, SAMPLE_IMAGE_BASE + 0x2080);
-    rdata.patch_u64(load_config_rva + 0x88, 2);
-    rdata.patch_u32(load_config_rva + 0x90, 0x500);
+    let load_config_rva = rdata.reserve(load_config_size as usize, pointer_bytes);
+    rdata.patch_u32(load_config_rva, load_config_size);
+    if pointer_bytes == 8 {
+        patch_pointer_le(&mut rdata, load_config_rva + 0x60, image_base + SAMPLE_RELOC_TARGET_RVA as u64, pointer_bytes);
+        patch_pointer_le(&mut rdata, load_config_rva + 0x68, 1, pointer_bytes);
+        patch_pointer_le(&mut rdata, load_config_rva + 0x70, image_base + SAMPLE_ENTRY_RVA as u64, pointer_bytes);
+        patch_pointer_le(&mut rdata, load_config_rva + 0x78, image_base + SAMPLE_TLS_CALLBACK_RVA as u64, pointer_bytes);
+        patch_pointer_le(&mut rdata, load_config_rva + 0x80, image_base + 0x2080, pointer_bytes);
+        patch_pointer_le(&mut rdata, load_config_rva + 0x88, 2, pointer_bytes);
+        rdata.patch_u32(load_config_rva + 0x90, 0x500);
+    } else {
+        patch_pointer_le(&mut rdata, load_config_rva + 0x40, image_base + SAMPLE_RELOC_TARGET_RVA as u64, pointer_bytes);
+        patch_pointer_le(&mut rdata, load_config_rva + 0x44, 1, pointer_bytes);
+        patch_pointer_le(&mut rdata, load_config_rva + 0x48, image_base + SAMPLE_ENTRY_RVA as u64, pointer_bytes);
+        patch_pointer_le(&mut rdata, load_config_rva + 0x4c, image_base + SAMPLE_TLS_CALLBACK_RVA as u64, pointer_bytes);
+        patch_pointer_le(&mut rdata, load_config_rva + 0x50, image_base + 0x2080, pointer_bytes);
+        patch_pointer_le(&mut rdata, load_config_rva + 0x54, 2, pointer_bytes);
+        rdata.patch_u32(load_config_rva + 0x58, 0x500);
+    }
 
     let debug_directory_rva = rdata.reserve(28, 4);
     rdata.patch_u32(debug_directory_rva + 12, 2);
     rdata.patch_u32(debug_directory_rva + 16, 0x20);
     rdata.patch_u32(debug_directory_rva + 20, SAMPLE_ENTRY_RVA);
 
-    let tls_directory_rva = rdata.reserve(40, 8);
-    rdata.patch_u64(tls_directory_rva, SAMPLE_IMAGE_BASE + reloc_target_rva as u64);
-    rdata.patch_u64(tls_directory_rva + 8, SAMPLE_IMAGE_BASE + reloc_target_rva as u64 + 8);
-    rdata.patch_u64(tls_directory_rva + 16, SAMPLE_IMAGE_BASE + tls_index_rva as u64);
-    rdata.patch_u64(tls_directory_rva + 24, SAMPLE_IMAGE_BASE + callback_array_rva as u64);
+    let tls_directory_rva = rdata.reserve(tls_directory_size, pointer_bytes);
+    patch_pointer_le(&mut rdata, tls_directory_rva, image_base + reloc_target_rva as u64, pointer_bytes);
+    patch_pointer_le(
+        &mut rdata,
+        tls_directory_rva + pointer_bytes as u32,
+        image_base + reloc_target_rva as u64 + pointer_bytes as u64,
+        pointer_bytes,
+    );
+    patch_pointer_le(&mut rdata, tls_directory_rva + (pointer_bytes as u32 * 2), image_base + tls_index_rva as u64, pointer_bytes);
+    patch_pointer_le(
+        &mut rdata,
+        tls_directory_rva + (pointer_bytes as u32 * 3),
+        image_base + callback_array_rva as u64,
+        pointer_bytes,
+    );
 
     reloc.alloc(&relocation_block(SAMPLE_RELOC_TARGET_RVA & !0xfff, SAMPLE_RELOC_TARGET_RVA & 0xfff), 4);
 
@@ -176,7 +224,6 @@ pub fn sample_pe_bytes() -> Vec<u8> {
     let mut sections = vec![text, rdata, data, reloc, rsrc];
 
     let dos_stub_size = 0x80;
-    let optional_header_size = 0xf0;
     let nt_headers_size = 4 + 20 + optional_header_size;
     let section_headers_size = sections.len() as u32 * 40;
     let size_of_headers = align_u32(dos_stub_size + nt_headers_size + section_headers_size, file_alignment);
@@ -207,35 +254,47 @@ pub fn sample_pe_bytes() -> Vec<u8> {
     write_u32(&mut bytes, 0x3c, dos_stub_size);
     let pe_offset = dos_stub_size as usize;
     bytes[pe_offset..pe_offset + 4].copy_from_slice(b"PE\0\0");
-    write_u16(&mut bytes, pe_offset + 4, 0x8664);
+    write_u16(&mut bytes, pe_offset + 4, machine);
     write_u16(&mut bytes, pe_offset + 6, sections.len() as u16);
     write_u32(&mut bytes, pe_offset + 16, 0);
     write_u16(&mut bytes, pe_offset + 20, optional_header_size as u16);
     write_u16(&mut bytes, pe_offset + 22, 0x2022);
 
     let optional = pe_offset + 24;
-    write_u16(&mut bytes, optional, 0x20b);
+    write_u16(&mut bytes, optional, optional_magic);
     bytes[optional + 2] = 14;
     bytes[optional + 3] = 0;
     write_u32(&mut bytes, optional + 4, sections[0].raw_size_aligned(file_alignment));
     write_u32(&mut bytes, optional + 8, sections[1..].iter().map(|section| section.raw_size_aligned(file_alignment)).sum());
     write_u32(&mut bytes, optional + 16, SAMPLE_ENTRY_RVA);
     write_u32(&mut bytes, optional + 20, 0x1000);
-    write_u64(&mut bytes, optional + 24, SAMPLE_IMAGE_BASE);
     write_u32(&mut bytes, optional + 32, section_alignment);
     write_u32(&mut bytes, optional + 36, file_alignment);
     write_u32(&mut bytes, optional + 56, size_of_image);
     write_u32(&mut bytes, optional + 60, size_of_headers);
     write_u16(&mut bytes, optional + 68, 3);
     write_u16(&mut bytes, optional + 70, 0x8140);
-    write_u64(&mut bytes, optional + 72, 0x20_0000);
-    write_u64(&mut bytes, optional + 80, 0x4000);
-    write_u64(&mut bytes, optional + 88, 0x20_0000);
-    write_u64(&mut bytes, optional + 96, 0x4000);
-    write_u32(&mut bytes, optional + 108, 16);
+    let directory_offset = if pointer_bytes == 8 {
+        write_u64(&mut bytes, optional + 24, image_base);
+        write_u64(&mut bytes, optional + 72, 0x20_0000);
+        write_u64(&mut bytes, optional + 80, 0x4000);
+        write_u64(&mut bytes, optional + 88, 0x20_0000);
+        write_u64(&mut bytes, optional + 96, 0x4000);
+        write_u32(&mut bytes, optional + 108, 16);
+        112_usize
+    } else {
+        write_u32(&mut bytes, optional + 24, 0x3000);
+        write_u32(&mut bytes, optional + 28, image_base as u32);
+        write_u32(&mut bytes, optional + 72, 0x20_0000);
+        write_u32(&mut bytes, optional + 76, 0x4000);
+        write_u32(&mut bytes, optional + 80, 0x20_0000);
+        write_u32(&mut bytes, optional + 84, 0x4000);
+        write_u32(&mut bytes, optional + 92, 16);
+        96_usize
+    };
     for index in 0..16_u32 {
         if let Some((rva, size)) = directories.get(&index) {
-            let offset = optional + 112 + index as usize * 8;
+            let offset = optional + directory_offset + index as usize * 8;
             write_u32(&mut bytes, offset, *rva);
             write_u32(&mut bytes, offset + 4, *size);
         }
@@ -479,6 +538,22 @@ fn write_u32(bytes: &mut [u8], offset: usize, value: u32) {
 
 fn write_u64(bytes: &mut [u8], offset: usize, value: u64) {
     bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+fn encode_pointer_le(value: u64, pointer_bytes: usize) -> Vec<u8> {
+    match pointer_bytes {
+        4 => (value as u32).to_le_bytes().to_vec(),
+        8 => value.to_le_bytes().to_vec(),
+        _ => panic!("unsupported pointer width {pointer_bytes}"),
+    }
+}
+
+fn patch_pointer_le(section: &mut TestSection, rva: u32, value: u64, pointer_bytes: usize) {
+    match pointer_bytes {
+        4 => section.patch_u32(rva, value as u32),
+        8 => section.patch_u64(rva, value),
+        _ => panic!("unsupported pointer width {pointer_bytes}"),
+    }
 }
 
 pub fn build_real_windows_sleep_probe(output: &Path) {
@@ -1388,15 +1463,33 @@ swapchain_ptr:
     .quad 0
 texture_ptr:
     .quad 0
+depth_texture_ptr:
+    .quad 0
+rtv_ptr:
+    .quad 0
+dsv_ptr:
+    .quad 0
 srv_ptr:
     .quad 0
-buffer_ptr:
+constant_buffer_ptr:
+    .quad 0
+vertex_buffer_ptr:
+    .quad 0
+index_buffer_ptr:
     .quad 0
 input_layout_ptr:
     .quad 0
 vs_ptr:
     .quad 0
 ps_ptr:
+    .quad 0
+blend_state_ptr:
+    .quad 0
+depth_stencil_state_ptr:
+    .quad 0
+rasterizer_state_ptr:
+    .quad 0
+sampler_state_ptr:
     .quad 0
 feature_level:
     .long 0
@@ -1406,6 +1499,17 @@ constant_buffer_bindings:
     .quad 0
 shader_resource_bindings:
     .quad 0
+render_target_bindings:
+    .quad 0
+sampler_bindings:
+    .quad 0
+vertex_buffer_bindings:
+    .quad 0
+
+vertex_buffer_strides:
+    .long 12
+vertex_buffer_offsets:
+    .long 0
 
 class_name:
     .short 'C','a','s','a','1','D','3','D',0
@@ -1454,13 +1558,112 @@ swapchain_desc:
     .long 0
 
 .align 8
-buffer_desc:
+constant_buffer_desc:
     .long 16
     .long 0
     .long 4
     .long 0
     .long 0
     .long 0
+
+.align 8
+vertex_buffer_desc:
+    .long 36
+    .long 0
+    .long 1
+    .long 0
+    .long 0
+    .long 0
+
+.align 8
+index_buffer_desc:
+    .long 12
+    .long 0
+    .long 2
+    .long 0
+    .long 0
+
+.align 8
+depth_texture_desc:
+    .long 2
+    .long 2
+    .long 1
+    .long 1
+    .long 45
+    .long 1
+    .long 0
+    .long 0
+    .long 64
+    .long 0
+    .long 0
+    .long 0
+
+.align 8
+blend_desc:
+    .long 1
+    .long 0
+    .long 1
+    .long 0
+    .long 5
+    .long 6
+    .long 1
+    .long 5
+    .long 6
+    .long 1
+    .long 0
+    .byte 0x0f
+
+.align 8
+depth_stencil_desc:
+    .long 1
+    .long 1
+    .long 2
+    .long 0
+    .byte 0xff
+    .byte 0xff
+    .long 8
+    .long 1
+    .long 8
+    .long 1
+    .long 8
+    .long 1
+    .long 8
+
+.align 8
+rasterizer_desc:
+    .long 3
+    .long 3
+    .long 0
+    .float 0.0
+    .float 0.0
+    .long 1
+    .long 0
+    .long 0
+    .long 0
+    .long 0
+
+.align 8
+sampler_desc:
+    .long 21
+    .long 1
+    .long 1
+    .long 1
+
+.align 8
+scissor_rect_desc:
+    .long 0
+    .long 0
+    .long 2
+    .long 2
+
+.align 8
+viewport_desc:
+    .float 0.0
+    .float 0.0
+    .float 2.0
+    .float 2.0
+    .float 0.0
+    .float 1.0
 
 .align 8
 input_element_desc:
@@ -1539,16 +1742,102 @@ mainCRTStartup:
     jne exit_four
 
     mov rcx, qword ptr [rip + device_ptr]
-    lea rdx, [rip + buffer_desc]
+    lea rdx, [rip + constant_buffer_desc]
     xor r8d, r8d
-    lea r9, [rip + buffer_ptr]
+    lea r9, [rip + constant_buffer_ptr]
     mov rax, qword ptr [rcx]
     call qword ptr [rax + 24]
     test eax, eax
     jne exit_five
 
-    mov rax, qword ptr [rip + buffer_ptr]
+    mov rax, qword ptr [rip + constant_buffer_ptr]
     mov qword ptr [rip + constant_buffer_bindings], rax
+
+    mov rcx, qword ptr [rip + device_ptr]
+    lea rdx, [rip + vertex_buffer_desc]
+    xor r8d, r8d
+    lea r9, [rip + vertex_buffer_ptr]
+    mov rax, qword ptr [rcx]
+    call qword ptr [rax + 24]
+    test eax, eax
+    jne exit_six
+
+    mov rax, qword ptr [rip + vertex_buffer_ptr]
+    mov qword ptr [rip + vertex_buffer_bindings], rax
+
+    mov rcx, qword ptr [rip + device_ptr]
+    lea rdx, [rip + index_buffer_desc]
+    xor r8d, r8d
+    lea r9, [rip + index_buffer_ptr]
+    mov rax, qword ptr [rcx]
+    call qword ptr [rax + 24]
+    test eax, eax
+    jne exit_seven
+
+    mov rcx, qword ptr [rip + device_ptr]
+    mov rdx, qword ptr [rip + texture_ptr]
+    xor r8d, r8d
+    lea r9, [rip + rtv_ptr]
+    mov rax, qword ptr [rcx]
+    call qword ptr [rax + 72]
+    test eax, eax
+    jne exit_eight
+
+    mov rax, qword ptr [rip + rtv_ptr]
+    mov qword ptr [rip + render_target_bindings], rax
+
+    mov rcx, qword ptr [rip + device_ptr]
+    lea rdx, [rip + depth_texture_desc]
+    xor r8d, r8d
+    lea r9, [rip + depth_texture_ptr]
+    mov rax, qword ptr [rcx]
+    call qword ptr [rax + 40]
+    test eax, eax
+    jne exit_seventeen
+
+    mov rcx, qword ptr [rip + device_ptr]
+    mov rdx, qword ptr [rip + depth_texture_ptr]
+    xor r8d, r8d
+    lea r9, [rip + dsv_ptr]
+    mov rax, qword ptr [rcx]
+    call qword ptr [rax + 80]
+    test eax, eax
+    jne exit_eighteen
+
+    mov rcx, qword ptr [rip + device_ptr]
+    lea rdx, [rip + blend_desc]
+    lea r8, [rip + blend_state_ptr]
+    mov rax, qword ptr [rcx]
+    call qword ptr [rax + 160]
+    test eax, eax
+    jne exit_fourteen
+
+    mov rcx, qword ptr [rip + device_ptr]
+    lea rdx, [rip + depth_stencil_desc]
+    lea r8, [rip + depth_stencil_state_ptr]
+    mov rax, qword ptr [rcx]
+    call qword ptr [rax + 168]
+    test eax, eax
+    jne exit_fifteen
+
+    mov rcx, qword ptr [rip + device_ptr]
+    lea rdx, [rip + rasterizer_desc]
+    lea r8, [rip + rasterizer_state_ptr]
+    mov rax, qword ptr [rcx]
+    call qword ptr [rax + 176]
+    test eax, eax
+    jne exit_sixteen
+
+    mov rcx, qword ptr [rip + device_ptr]
+    lea rdx, [rip + sampler_desc]
+    lea r8, [rip + sampler_state_ptr]
+    mov rax, qword ptr [rcx]
+    call qword ptr [rax + 184]
+    test eax, eax
+    jne exit_nineteen
+
+    mov rax, qword ptr [rip + sampler_state_ptr]
+    mov qword ptr [rip + sampler_bindings], rax
 
     mov rcx, qword ptr [rip + device_ptr]
     mov rdx, qword ptr [rip + texture_ptr]
@@ -1557,7 +1846,7 @@ mainCRTStartup:
     mov rax, qword ptr [rcx]
     call qword ptr [rax + 56]
     test eax, eax
-    jne exit_six
+    jne exit_nine
 
     mov rax, qword ptr [rip + srv_ptr]
     mov qword ptr [rip + shader_resource_bindings], rax
@@ -1572,7 +1861,7 @@ mainCRTStartup:
     mov rax, qword ptr [rcx]
     call qword ptr [rax + 88]
     test eax, eax
-    jne exit_seven
+    jne exit_ten
 
     mov rcx, qword ptr [rip + device_ptr]
     lea rdx, [rip + vs_dxil_blob]
@@ -1583,7 +1872,7 @@ mainCRTStartup:
     mov rax, qword ptr [rcx]
     call qword ptr [rax + 96]
     test eax, eax
-    jne exit_eight
+    jne exit_eleven
 
     mov rcx, qword ptr [rip + device_ptr]
     lea rdx, [rip + ps_dxil_blob]
@@ -1594,7 +1883,7 @@ mainCRTStartup:
     mov rax, qword ptr [rcx]
     call qword ptr [rax + 120]
     test eax, eax
-    jne exit_nine
+    jne exit_twelve
 
     mov rcx, qword ptr [rip + context_ptr]
     xor edx, edx
@@ -1611,9 +1900,76 @@ mainCRTStartup:
     call qword ptr [rax + 64]
 
     mov rcx, qword ptr [rip + context_ptr]
+    xor edx, edx
+    mov r8d, 1
+    lea r9, [rip + sampler_bindings]
+    mov rax, qword ptr [rcx]
+    call qword ptr [rax + 80]
+
+    mov rcx, qword ptr [rip + context_ptr]
+    mov edx, 1
+    lea r8, [rip + render_target_bindings]
+    mov r9, qword ptr [rip + dsv_ptr]
+    mov rax, qword ptr [rcx]
+    call qword ptr [rax + 264]
+
+    mov rcx, qword ptr [rip + context_ptr]
+    mov rdx, qword ptr [rip + blend_state_ptr]
+    xor r8d, r8d
+    mov r9d, -1
+    mov rax, qword ptr [rcx]
+    call qword ptr [rax + 280]
+
+    mov rcx, qword ptr [rip + context_ptr]
+    mov rdx, qword ptr [rip + depth_stencil_state_ptr]
+    mov r8d, 1
+    mov rax, qword ptr [rcx]
+    call qword ptr [rax + 288]
+
+    mov rcx, qword ptr [rip + context_ptr]
+    mov rdx, qword ptr [rip + rasterizer_state_ptr]
+    mov rax, qword ptr [rcx]
+    call qword ptr [rax + 344]
+
+    mov rcx, qword ptr [rip + context_ptr]
+    mov edx, 1
+    lea r8, [rip + viewport_desc]
+    mov rax, qword ptr [rcx]
+    call qword ptr [rax + 352]
+
+    mov rcx, qword ptr [rip + context_ptr]
+    mov edx, 1
+    lea r8, [rip + scissor_rect_desc]
+    mov rax, qword ptr [rcx]
+    call qword ptr [rax + 360]
+
+    mov rcx, qword ptr [rip + context_ptr]
     mov rdx, qword ptr [rip + input_layout_ptr]
     mov rax, qword ptr [rcx]
     call qword ptr [rax + 136]
+
+    mov rcx, qword ptr [rip + context_ptr]
+    xor edx, edx
+    mov r8d, 1
+    lea r9, [rip + vertex_buffer_bindings]
+    lea rax, [rip + vertex_buffer_strides]
+    mov qword ptr [rsp + 0x20], rax
+    lea rax, [rip + vertex_buffer_offsets]
+    mov qword ptr [rsp + 0x28], rax
+    mov rax, qword ptr [rcx]
+    call qword ptr [rax + 144]
+
+    mov rcx, qword ptr [rip + context_ptr]
+    mov rdx, qword ptr [rip + index_buffer_ptr]
+    mov r8d, 57
+    xor r9d, r9d
+    mov rax, qword ptr [rcx]
+    call qword ptr [rax + 152]
+
+    mov rcx, qword ptr [rip + context_ptr]
+    mov edx, 4
+    mov rax, qword ptr [rcx]
+    call qword ptr [rax + 192]
 
     mov rcx, qword ptr [rip + context_ptr]
     mov rdx, qword ptr [rip + vs_ptr]
@@ -1629,15 +1985,49 @@ mainCRTStartup:
     mov rax, qword ptr [rcx]
     call qword ptr [rax + 72]
 
+    mov rcx, qword ptr [rip + context_ptr]
+    mov edx, 3
+    xor r8d, r8d
+    mov rax, qword ptr [rcx]
+    call qword ptr [rax + 104]
+
+    mov rcx, qword ptr [rip + context_ptr]
+    mov edx, 3
+    xor r8d, r8d
+    xor r9d, r9d
+    mov rax, qword ptr [rcx]
+    call qword ptr [rax + 96]
+
+    mov rcx, qword ptr [rip + context_ptr]
+    mov edx, 3
+    mov r8d, 2
+    xor r9d, r9d
+    mov qword ptr [rsp + 0x20], 0
+    mov rax, qword ptr [rcx]
+    call qword ptr [rax + 168]
+
+    mov rcx, qword ptr [rip + context_ptr]
+    mov edx, 3
+    mov r8d, 2
+    xor r9d, r9d
+    mov qword ptr [rsp + 0x20], 0
+    mov qword ptr [rsp + 0x28], 0
+    mov rax, qword ptr [rcx]
+    call qword ptr [rax + 160]
+
     mov rcx, qword ptr [rip + swapchain_ptr]
     mov edx, 1
     xor r8d, r8d
     mov rax, qword ptr [rcx]
     call qword ptr [rax + 64]
     test eax, eax
-    jne exit_ten
+    jne exit_thirteen
 
     mov rcx, qword ptr [rip + ps_ptr]
+    mov rax, qword ptr [rcx]
+    call qword ptr [rax + 16]
+
+    mov rcx, qword ptr [rip + sampler_state_ptr]
     mov rax, qword ptr [rcx]
     call qword ptr [rax + 16]
 
@@ -1645,7 +2035,27 @@ mainCRTStartup:
     mov rax, qword ptr [rcx]
     call qword ptr [rax + 16]
 
+    mov rcx, qword ptr [rip + rasterizer_state_ptr]
+    mov rax, qword ptr [rcx]
+    call qword ptr [rax + 16]
+
+    mov rcx, qword ptr [rip + depth_stencil_state_ptr]
+    mov rax, qword ptr [rcx]
+    call qword ptr [rax + 16]
+
+    mov rcx, qword ptr [rip + dsv_ptr]
+    mov rax, qword ptr [rcx]
+    call qword ptr [rax + 16]
+
+    mov rcx, qword ptr [rip + blend_state_ptr]
+    mov rax, qword ptr [rcx]
+    call qword ptr [rax + 16]
+
     mov rcx, qword ptr [rip + input_layout_ptr]
+    mov rax, qword ptr [rcx]
+    call qword ptr [rax + 16]
+
+    mov rcx, qword ptr [rip + rtv_ptr]
     mov rax, qword ptr [rcx]
     call qword ptr [rax + 16]
 
@@ -1653,7 +2063,19 @@ mainCRTStartup:
     mov rax, qword ptr [rcx]
     call qword ptr [rax + 16]
 
-    mov rcx, qword ptr [rip + buffer_ptr]
+    mov rcx, qword ptr [rip + index_buffer_ptr]
+    mov rax, qword ptr [rcx]
+    call qword ptr [rax + 16]
+
+    mov rcx, qword ptr [rip + depth_texture_ptr]
+    mov rax, qword ptr [rcx]
+    call qword ptr [rax + 16]
+
+    mov rcx, qword ptr [rip + vertex_buffer_ptr]
+    mov rax, qword ptr [rcx]
+    call qword ptr [rax + 16]
+
+    mov rcx, qword ptr [rip + constant_buffer_ptr]
     mov rax, qword ptr [rcx]
     call qword ptr [rax + 16]
 
@@ -1714,6 +2136,42 @@ exit_nine:
 
 exit_ten:
     mov ecx, 10
+    call ExitProcess
+
+exit_eleven:
+    mov ecx, 11
+    call ExitProcess
+
+exit_twelve:
+    mov ecx, 12
+    call ExitProcess
+
+exit_thirteen:
+    mov ecx, 13
+    call ExitProcess
+
+exit_fourteen:
+    mov ecx, 14
+    call ExitProcess
+
+exit_fifteen:
+    mov ecx, 15
+    call ExitProcess
+
+exit_sixteen:
+    mov ecx, 16
+    call ExitProcess
+
+exit_seventeen:
+    mov ecx, 17
+    call ExitProcess
+
+exit_eighteen:
+    mov ecx, 18
+    call ExitProcess
+
+exit_nineteen:
+    mov ecx, 19
     call ExitProcess
 "#,
         vs_dxil_block = asm_byte_block("vs_dxil_blob", &vs_dxil),

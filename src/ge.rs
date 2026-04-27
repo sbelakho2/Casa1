@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::fs::OpenOptions;
 use std::os::fd::AsRawFd;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
@@ -602,27 +602,70 @@ impl GameEnvironment {
         self.save_config()
     }
 
+    pub fn host_path_for_windows_path(&self, windows_path: &str) -> AppResult<PathBuf> {
+        let parsed = self.parse_windows_path(windows_path, None)?;
+        if parsed.device_namespace {
+            return Ok(PathBuf::from(parsed.normalized_path));
+        }
+
+        let drive = parsed.drive.ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcFsPathInvalid,
+                format!("missing drive designator in {windows_path}"),
+            )
+        })?;
+        let mapping = self.resolve_drive_mapping(&drive)?;
+        let mut host_path = self.resolve_drive_target(&mapping);
+        for component in parsed.components {
+            host_path.push(component);
+        }
+        Ok(host_path)
+    }
+
+    pub fn normalize_host_path(&self, path: &Path) -> String {
+        for mapping in self.active_drive_mappings() {
+            let drive_root = self.resolve_drive_target(&mapping);
+            if let Ok(relative) = path.strip_prefix(&drive_root) {
+                return windows_path_for_drive(&mapping.drive, relative);
+            }
+        }
+        util::normalize_windows_path(&self.root, path)
+    }
+
     pub fn set_override_profiles(&mut self, profiles: Vec<OverrideProfile>) -> AppResult<()> {
         self.config.override_profiles = profiles;
         self.save_config()
     }
 
     pub fn snapshot_files(&self, dtm: bool, epoch: SystemTime) -> AppResult<BTreeMap<String, FileSnapshotEntry>> {
-        let root = self.drive_c();
-        if !root.exists() {
-            return Ok(BTreeMap::new());
-        }
-
         let mut paths = Vec::new();
-        for entry in WalkDir::new(&root).sort_by_file_name() {
-            let entry = entry.map_err(|error| {
-                AppError::new(ReasonCode::RcIo, "failed to walk drive_c snapshot")
-                    .with_hint(error.to_string())
-            })?;
-            if entry.path() == root {
+        let mut roots = self
+            .active_drive_mappings()
+            .into_iter()
+            .filter(|mapping| !mapping.read_only)
+            .map(|mapping| self.resolve_drive_target(&mapping))
+            .collect::<Vec<_>>();
+        roots.sort();
+        roots.dedup();
+
+        for root in roots {
+            if !root.exists() {
                 continue;
             }
-            paths.push(entry.into_path());
+            for entry in WalkDir::new(&root).sort_by_file_name() {
+                let entry = entry.map_err(|error| {
+                    AppError::new(ReasonCode::RcIo, "failed to walk GE drive snapshot")
+                        .with_hint(error.to_string())
+                })?;
+                if entry.path() == root {
+                    continue;
+                }
+                paths.push(entry.into_path());
+            }
+        }
+
+        if paths.is_empty() {
+            return Ok(BTreeMap::new());
         }
 
         let mut snapshot = BTreeMap::new();
@@ -634,7 +677,7 @@ impl GameEnvironment {
                     &error,
                 )
             })?;
-            let path_norm = util::normalize_windows_path(&self.root, &path);
+            let path_norm = self.normalize_host_path(&path);
             let mut attrs = Vec::new();
             if let Some(record) = self.config.fs_state.entries.get(&path_norm) {
                 attrs = record.attributes.clone();
@@ -739,6 +782,38 @@ impl GameEnvironment {
         Ok(normalized_path)
     }
 
+    pub fn write_file_overwrite(&mut self, windows_path: &str, contents: &[u8], dtm: bool) -> AppResult<String> {
+        match self.resolve_existing_path(windows_path, None, 0) {
+            Ok(resolved) => {
+                fs::write(&resolved.host_path, contents).map_err(|error| {
+                    AppError::from_io(
+                        ReasonCode::RcIo,
+                        format!("failed to write {}", resolved.host_path.display()),
+                        &error,
+                    )
+                })?;
+                let requested_name = self
+                    .parse_windows_path(windows_path, None)?
+                    .components
+                    .last()
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        resolved
+                            .host_path
+                            .file_name()
+                            .map(|value| value.to_string_lossy().to_string())
+                            .unwrap_or_else(|| "file".to_string())
+                    });
+                self.upsert_fs_entry(&resolved.normalized_path, &requested_name, FsEntryKind::File, dtm)?;
+                Ok(resolved.normalized_path)
+            }
+            Err(error) if error.code == ReasonCode::RcFsNotFound => {
+                self.write_file(windows_path, contents, dtm)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     pub fn enumerate_directory(&self, windows_path: &str) -> AppResult<Vec<String>> {
         let resolved = self.resolve_existing_path(windows_path, None, 0)?;
         let mut entries = fs::read_dir(&resolved.host_path)
@@ -762,6 +837,65 @@ impl GameEnvironment {
             entry.attributes = attrs.iter().map(|value| (*value).to_string()).collect();
             entry.attributes.sort();
             entry.attributes.dedup();
+        }
+        self.save_config()
+    }
+
+    pub fn set_file_times(
+        &mut self,
+        windows_path: &str,
+        creation_time_ticks: Option<u64>,
+        last_access_time_ticks: Option<u64>,
+        last_write_time_ticks: Option<u64>,
+    ) -> AppResult<()> {
+        let resolved = self.resolve_existing_path(windows_path, None, 0)?;
+        let host_metadata = fs::metadata(&resolved.host_path).map_err(|error| {
+            AppError::from_io(
+                ReasonCode::RcIo,
+                format!("failed to stat {}", resolved.host_path.display()),
+                &error,
+            )
+        })?;
+        let kind = if host_metadata.is_dir() {
+            FsEntryKind::Directory
+        } else {
+            FsEntryKind::File
+        };
+        let original_case = resolved
+            .host_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_string();
+        let fallback_ticks = creation_time_ticks
+            .or(last_access_time_ticks)
+            .or(last_write_time_ticks)
+            .unwrap_or_else(|| current_windows_ticks(false));
+        let entry = self
+            .config
+            .fs_state
+            .entries
+            .entry(resolved.normalized_path)
+            .or_insert_with(|| FsMetadataRecord {
+                kind: kind.clone(),
+                original_case,
+                attributes: if kind == FsEntryKind::Directory {
+                    vec!["directory".to_string()]
+                } else {
+                    Vec::new()
+                },
+                creation_time_ticks: fallback_ticks,
+                last_access_time_ticks: fallback_ticks,
+                last_write_time_ticks: fallback_ticks,
+            });
+        if let Some(value) = creation_time_ticks {
+            entry.creation_time_ticks = value;
+        }
+        if let Some(value) = last_access_time_ticks {
+            entry.last_access_time_ticks = value;
+        }
+        if let Some(value) = last_write_time_ticks {
+            entry.last_write_time_ticks = value;
         }
         self.save_config()
     }
@@ -955,6 +1089,44 @@ impl GameEnvironment {
         Ok(db.get(&actual_key).and_then(|values| values.get(value_name)).cloned())
     }
 
+    pub fn registry_key_exists(&self, hive: &str, key: &str, view: RegistryView) -> AppResult<bool> {
+        if normalize_hive(hive)? == "HKCR" {
+            for (merged_hive, merged_key) in self.hkcr_merged_keys(key, view)? {
+                let db = load_registry_db(&self.registry_file(&merged_hive))?;
+                if db.contains_key(&merged_key) {
+                    return Ok(true);
+                }
+                let prefix = format!("{}\\", normalize_registry_key(&merged_key));
+                if db.keys().any(|existing| existing.starts_with(&prefix)) {
+                    return Ok(true);
+                }
+            }
+            return Ok(false);
+        }
+
+        let (actual_hive, actual_key) = self.redirect_registry_path(hive, key, view, false)?;
+        let db = load_registry_db(&self.registry_file(&actual_hive))?;
+        if db.contains_key(&actual_key) {
+            return Ok(true);
+        }
+        let prefix = format!("{}\\", normalize_registry_key(&actual_key));
+        Ok(db.keys().any(|existing| existing.starts_with(&prefix)))
+    }
+
+    pub fn registry_create_key(&self, hive: &str, key: &str, view: RegistryView) -> AppResult<bool> {
+        let (actual_hive, actual_key) = self.redirect_registry_path(hive, key, view, true)?;
+        let path = self.registry_file(&actual_hive);
+        let mut db = load_registry_db(&path)?;
+        let existing = db.remove(&actual_key);
+        let created = existing.is_none();
+        db.insert(actual_key.clone(), existing.unwrap_or_default());
+        if created {
+            store_registry_db(&path, &db)?;
+            self.notify_registry_watchers(&actual_hive, &actual_key);
+        }
+        Ok(created)
+    }
+
     pub fn registry_delete_value(
         &self,
         hive: &str,
@@ -1069,7 +1241,7 @@ impl GameEnvironment {
     }
 
     pub fn executable_identity(&self, program: &Path) -> AppResult<ExecutableIdentity> {
-        let normalized_install_path = util::normalize_windows_path(&self.root, program);
+        let normalized_install_path = self.normalize_host_path(program);
         let pe_version = pe::maybe_version_info_from_file(program)?;
         let version_sidecar = read_version_sidecar(program)?;
         let product_name = pe_version
@@ -1662,6 +1834,21 @@ fn default_drive_mappings() -> Vec<DriveMapping> {
             requires_permission: true,
         },
     ]
+}
+
+fn windows_path_for_drive(prefix: &str, relative: &Path) -> String {
+    let mut pieces = Vec::new();
+    for component in relative.components() {
+        if let Component::Normal(value) = component {
+            pieces.push(value.to_string_lossy().to_lowercase());
+        }
+    }
+
+    if pieces.is_empty() {
+        format!("{prefix}:\\")
+    } else {
+        format!("{prefix}:\\{}", pieces.join("\\"))
+    }
 }
 
 fn parse_windows_path_impl(

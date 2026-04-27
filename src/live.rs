@@ -5,7 +5,7 @@ use crate::reason::ReasonCode;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use minifb::{Key, KeyRepeat, Scale, Window, WindowOptions};
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -28,6 +28,11 @@ pub struct LiveAudioChunk {
 #[derive(Debug, Clone)]
 pub enum LiveInputEvent {
     KeyDown {
+        scancode: u16,
+        shift: bool,
+        altgr: bool,
+    },
+    KeyUp {
         scancode: u16,
         shift: bool,
         altgr: bool,
@@ -79,6 +84,7 @@ pub fn run_live_host_session<T>(
     let mut frame_height = 0_usize;
     let mut latest_frame: Option<LiveFrame> = None;
     let mut close_requested = false;
+    let mut held_scancodes = BTreeSet::new();
 
     loop {
         audio.drain(&session.audio_rx);
@@ -91,7 +97,7 @@ pub fn run_live_host_session<T>(
                 if worker.is_finished() {
                     break;
                 }
-                match session.frame_rx.recv_timeout(Duration::from_millis(16)) {
+                match session.frame_rx.recv_timeout(Duration::from_millis(4)) {
                     Ok(frame) => {
                         latest_frame = Some(frame);
                     }
@@ -103,7 +109,7 @@ pub fn run_live_host_session<T>(
                 let mut created_window = create_window(title, frame.width as usize, frame.height as usize)?;
                 frame_width = frame.width as usize;
                 frame_height = frame.height as usize;
-                frame_buffer = decode_frame_buffer(&frame)?;
+                decode_frame_buffer_into(&frame, &mut frame_buffer)?;
                 created_window
                     .update_with_buffer(&frame_buffer, frame_width, frame_height)
                     .map_err(|error| {
@@ -120,33 +126,42 @@ pub fn run_live_host_session<T>(
             continue;
         };
 
+        let mut frame_changed = false;
+
         if let Some(frame) = latest_frame.take() {
             if frame.width as usize != frame_width || frame.height as usize != frame_height {
                 *window_ref = create_window(title, frame.width as usize, frame.height as usize)?;
                 frame_width = frame.width as usize;
                 frame_height = frame.height as usize;
             }
-            frame_buffer = decode_frame_buffer(&frame)?;
+            decode_frame_buffer_into(&frame, &mut frame_buffer)?;
+            frame_changed = true;
         }
 
-        pump_keyboard(window_ref, &session.input_tx);
+        pump_keyboard(window_ref, &session.input_tx, &mut held_scancodes);
         if window_ref.is_key_down(Key::Escape) && !close_requested {
+            release_held_keys(&session.input_tx, &mut held_scancodes);
             let _ = session.input_tx.send(LiveInputEvent::CloseRequested);
             close_requested = true;
         }
 
         if frame_width != 0 && frame_height != 0 {
-            window_ref
-                .update_with_buffer(&frame_buffer, frame_width, frame_height)
-                .map_err(|error| {
-                    AppError::new(
-                        ReasonCode::RcIo,
-                        format!("failed to present live frame: {error}"),
-                    )
-                })?;
+            if frame_changed {
+                window_ref
+                    .update_with_buffer(&frame_buffer, frame_width, frame_height)
+                    .map_err(|error| {
+                        AppError::new(
+                            ReasonCode::RcIo,
+                            format!("failed to present live frame: {error}"),
+                        )
+                    })?;
+            } else {
+                window_ref.update();
+            }
         }
 
         if !window_ref.is_open() && !close_requested {
+            release_held_keys(&session.input_tx, &mut held_scancodes);
             let _ = session.input_tx.send(LiveInputEvent::CloseRequested);
             close_requested = true;
         }
@@ -182,50 +197,112 @@ fn create_window(title: &str, width: usize, height: usize) -> AppResult<Window> 
     })?;
     #[cfg(target_os = "macos")]
     window.topmost(true);
-    window.set_target_fps(60);
+    window.set_target_fps(240);
     Ok(window)
 }
 
-fn collect_scancodes_for_frame<F, I>(mut is_key_down: F, pressed_keys: I) -> Vec<u16>
+fn collect_scancodes_for_frame<F>(mut is_key_down: F) -> BTreeSet<u16>
 where
     F: FnMut(Key) -> bool,
-    I: IntoIterator<Item = Key>,
 {
-    let mut scancodes = Vec::new();
+    let mut scancodes = BTreeSet::new();
 
     if is_key_down(Key::A) || is_key_down(Key::Left) {
-        scancodes.push(0x1e);
+        scancodes.insert(0x1e);
     }
     if is_key_down(Key::D) || is_key_down(Key::Right) {
-        scancodes.push(0x20);
+        scancodes.insert(0x20);
     }
     if is_key_down(Key::S) || is_key_down(Key::Down) {
-        scancodes.push(0x1f);
+        scancodes.insert(0x1f);
     }
 
-    for key in pressed_keys {
-        let Some(scancode) = map_action_key_to_scancode(key) else {
-            continue;
-        };
-        scancodes.push(scancode);
+    for key in [
+        Key::W,
+        Key::Up,
+        Key::Q,
+        Key::C,
+        Key::P,
+        Key::N,
+        Key::R,
+        Key::Enter,
+        Key::Space,
+    ] {
+        if let Some(scancode) = map_action_key_to_scancode(key).filter(|_| is_key_down(key)) {
+            scancodes.insert(scancode);
+        }
     }
 
     scancodes
 }
 
-fn pump_keyboard(window: &Window, input_tx: &Sender<LiveInputEvent>) {
-    let shift = window.is_key_down(Key::LeftShift) || window.is_key_down(Key::RightShift);
-    let altgr = window.is_key_down(Key::RightAlt);
-
-    for scancode in collect_scancodes_for_frame(
-        |key| window.is_key_down(key),
-        window.get_keys_pressed(KeyRepeat::No),
-    ) {
-        send_key(input_tx, scancode, shift, altgr);
-    }
+fn collect_scancodes_from_keys<I>(keys: I) -> BTreeSet<u16>
+where
+    I: IntoIterator<Item = Key>,
+{
+    let keys = keys.into_iter().collect::<BTreeSet<_>>();
+    collect_scancodes_for_frame(|key| keys.contains(&key))
 }
 
-fn send_key(input_tx: &Sender<LiveInputEvent>, scancode: u16, shift: bool, altgr: bool) {
+fn scancode_transitions(
+    previous: &BTreeSet<u16>,
+    current: &BTreeSet<u16>,
+) -> (Vec<u16>, Vec<u16>) {
+    let pressed = current.difference(previous).copied().collect();
+    let released = previous.difference(current).copied().collect();
+    (pressed, released)
+}
+
+fn scancode_events_for_frame(
+    previous: &BTreeSet<u16>,
+    current: &BTreeSet<u16>,
+    pressed_keys: &[Key],
+    released_keys: &[Key],
+) -> (Vec<u16>, Vec<u16>) {
+    let (mut pressed, mut released) = scancode_transitions(previous, current);
+    let mut pressed_set = pressed.iter().copied().collect::<BTreeSet<_>>();
+    let mut released_set = released.iter().copied().collect::<BTreeSet<_>>();
+
+    for scancode in collect_scancodes_from_keys(pressed_keys.iter().copied()) {
+        if pressed_set.insert(scancode) {
+            pressed.push(scancode);
+        }
+    }
+    for scancode in collect_scancodes_from_keys(released_keys.iter().copied()) {
+        if released_set.insert(scancode) {
+            released.push(scancode);
+        }
+    }
+
+    pressed.sort_unstable();
+    released.sort_unstable();
+    (pressed, released)
+}
+
+fn pump_keyboard(window: &Window, input_tx: &Sender<LiveInputEvent>, held_scancodes: &mut BTreeSet<u16>) {
+    let shift = window.is_key_down(Key::LeftShift) || window.is_key_down(Key::RightShift);
+    let altgr = window.is_key_down(Key::RightAlt);
+    let current_scancodes = collect_scancodes_for_frame(|key| window.is_key_down(key));
+    let pressed_keys = window.get_keys_pressed(KeyRepeat::No);
+    let released_keys = window.get_keys_released();
+    let (pressed, released) = scancode_events_for_frame(
+        held_scancodes,
+        &current_scancodes,
+        &pressed_keys,
+        &released_keys,
+    );
+
+    for scancode in pressed {
+        send_key_down(input_tx, scancode, shift, altgr);
+    }
+    for scancode in released {
+        send_key_up(input_tx, scancode, shift, altgr);
+    }
+
+    *held_scancodes = current_scancodes;
+}
+
+fn send_key_down(input_tx: &Sender<LiveInputEvent>, scancode: u16, shift: bool, altgr: bool) {
     let _ = input_tx.send(LiveInputEvent::KeyDown {
         scancode,
         shift,
@@ -233,10 +310,26 @@ fn send_key(input_tx: &Sender<LiveInputEvent>, scancode: u16, shift: bool, altgr
     });
 }
 
+fn send_key_up(input_tx: &Sender<LiveInputEvent>, scancode: u16, shift: bool, altgr: bool) {
+    let _ = input_tx.send(LiveInputEvent::KeyUp {
+        scancode,
+        shift,
+        altgr,
+    });
+}
+
+fn release_held_keys(input_tx: &Sender<LiveInputEvent>, held_scancodes: &mut BTreeSet<u16>) {
+    for scancode in held_scancodes.iter().copied().collect::<Vec<_>>() {
+        send_key_up(input_tx, scancode, false, false);
+    }
+    held_scancodes.clear();
+}
+
 fn map_action_key_to_scancode(key: Key) -> Option<u16> {
     match key {
         Key::W | Key::Up => Some(0x11),
         Key::Q => Some(0x10),
+        Key::C => Some(0x2e),
         Key::P => Some(0x19),
         Key::N => Some(0x31),
         Key::R => Some(0x13),
@@ -246,7 +339,7 @@ fn map_action_key_to_scancode(key: Key) -> Option<u16> {
     }
 }
 
-fn decode_frame_buffer(frame: &LiveFrame) -> AppResult<Vec<u32>> {
+fn decode_frame_buffer_into(frame: &LiveFrame, buffer: &mut Vec<u32>) -> AppResult<()> {
     let expected_bytes = (frame.width as usize)
         .checked_mul(frame.height as usize)
         .and_then(|pixel_count| pixel_count.checked_mul(4))
@@ -261,7 +354,8 @@ fn decode_frame_buffer(frame: &LiveFrame) -> AppResult<Vec<u32>> {
         ));
     }
 
-    let mut buffer = Vec::with_capacity(frame.width as usize * frame.height as usize);
+    buffer.clear();
+    buffer.reserve(frame.width as usize * frame.height as usize);
     match frame.format {
         DxgiFormat::B8G8R8A8Unorm => {
             for chunk in frame.bytes[..expected_bytes].chunks_exact(4) {
@@ -280,7 +374,7 @@ fn decode_frame_buffer(frame: &LiveFrame) -> AppResult<Vec<u32>> {
             ))
         }
     }
-    Ok(buffer)
+    Ok(())
 }
 
 struct LiveAudioOutput {
@@ -465,31 +559,56 @@ mod tests {
 
     #[test]
     fn collect_scancodes_for_frame_emits_held_movement_and_pressed_actions() {
-        let held = [Key::Left, Key::Down];
-        let pressed = [Key::Space, Key::P];
+        let held = [Key::Left, Key::Down, Key::Space, Key::P];
 
-        let scancodes = collect_scancodes_for_frame(|key| held.contains(&key), pressed);
+        let scancodes = collect_scancodes_for_frame(|key| held.contains(&key));
 
-        assert_eq!(scancodes, vec![0x1e, 0x1f, 0x39, 0x19]);
+        assert_eq!(scancodes.into_iter().collect::<Vec<_>>(), vec![0x19, 0x1e, 0x1f, 0x39]);
     }
 
     #[test]
-    fn collect_scancodes_for_frame_keeps_rotate_one_shot() {
-        let held = [Key::Up];
+    fn scancode_transitions_emit_press_once_until_release() {
+        let current = collect_scancodes_for_frame(|key| [Key::Up, Key::Left].contains(&key));
+        let (pressed, released) = scancode_transitions(&BTreeSet::new(), &current);
+        let (pressed_again, released_again) = scancode_transitions(&current, &current);
+        let (pressed_final, released_final) = scancode_transitions(&current, &BTreeSet::new());
 
-        let held_only = collect_scancodes_for_frame(|key| held.contains(&key), std::iter::empty());
-        let pressed = collect_scancodes_for_frame(|_| false, [Key::Up]);
-
-        assert!(held_only.is_empty());
-        assert_eq!(pressed, vec![0x11]);
+        assert_eq!(pressed, vec![0x11, 0x1e]);
+        assert!(released.is_empty());
+        assert!(pressed_again.is_empty());
+        assert!(released_again.is_empty());
+        assert!(pressed_final.is_empty());
+        assert_eq!(released_final, vec![0x11, 0x1e]);
     }
 
     #[test]
     fn collect_scancodes_for_frame_supports_arrow_aliases_for_movement() {
         let held = [Key::Right];
 
-        let scancodes = collect_scancodes_for_frame(|key| held.contains(&key), std::iter::empty());
+        let scancodes = collect_scancodes_for_frame(|key| held.contains(&key));
 
-        assert_eq!(scancodes, vec![0x20]);
+        assert_eq!(scancodes.into_iter().collect::<Vec<_>>(), vec![0x20]);
+    }
+
+    #[test]
+    fn scancode_events_for_frame_capture_taps_between_snapshots() {
+        let current = BTreeSet::new();
+
+        let (pressed, released) =
+            scancode_events_for_frame(&BTreeSet::new(), &current, &[Key::Enter], &[Key::Enter]);
+
+        assert_eq!(pressed, vec![0x1c]);
+        assert_eq!(released, vec![0x1c]);
+    }
+
+    #[test]
+    fn scancode_events_for_frame_deduplicate_alias_keys() {
+        let current = collect_scancodes_for_frame(|key| [Key::Left].contains(&key));
+
+        let (pressed, released) =
+            scancode_events_for_frame(&BTreeSet::new(), &current, &[Key::A, Key::Left], &[]);
+
+        assert_eq!(pressed, vec![0x1e]);
+        assert!(released.is_empty());
     }
 }
