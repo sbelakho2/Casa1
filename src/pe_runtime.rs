@@ -25,6 +25,7 @@ use crate::gfx::{
 };
 use crate::pe::{self, ApiSetResolver, ExportSymbol, ExportTarget, ImportSymbol, ResolvedImport};
 use crate::live::{LiveAudioChunk, LiveFrame, LiveInputEvent, LivePeSession};
+use crate::network::{AddressFamily, NetworkStack, SockAddr};
 use crate::reason::ReasonCode;
 use crate::shader::parse_dxil_container;
 use crate::trace::TraceEvent;
@@ -34,12 +35,15 @@ use crate::user32::{
     WindowClassInfo, GWL_WNDPROC,
 };
 use crate::util;
-use crate::win32::{ApartmentModel, CreationDisposition, FindData, SeekOrigin, Win32Subsystem};
+use crate::win32::{ApartmentModel, CreationDisposition, FileInformation, FindData, SeekOrigin, Win32Subsystem};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::ffi::CStr;
 use std::fs;
-use std::hash::{BuildHasher, Hasher};
+use std::hash::{BuildHasher, Hash, Hasher};
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -55,9 +59,46 @@ const CRT_DATA_BASE: u64 = 0x0000_7fff_8100_0000;
 const X86_CRT_DATA_BASE: u64 = 0x7200_0000;
 const CRT_HEAP_BASE: u64 = 0x0000_7fff_8200_0000;
 const X86_CRT_HEAP_BASE: u64 = 0x7300_0000;
+const AF_INET: i32 = 2;
+const AF_INET6: i32 = 23;
+const FIONBIO: u32 = 0x8004_667e;
+const FIONREAD: u32 = 0x4004_667f;
+const SIO_BASE_HANDLE: u32 = 0x4800_0022;
+const SIO_GET_EXTENSION_FUNCTION_POINTER: u32 = 0xc800_0006;
+const WSAEAFNOSUPPORT: i32 = 10047;
+const WSAEINVAL: i32 = 10022;
+const WSAENOTSOCK: i32 = 10038;
 const DESCRIPTOR_HANDLE_BASE: u64 = 0x0000_7fff_8300_0000;
 const DESCRIPTOR_HANDLE_STRIDE: u64 = 0x20;
+const MEMORY_BASIC_INFORMATION32_SIZE: u64 = 28;
 const MEMORY_BASIC_INFORMATION64_SIZE: u64 = 48;
+const TIME_ZONE_INFORMATION_SIZE: usize = 172;
+const TIME_ZONE_NAME_CAPACITY: usize = 32;
+const TIME_ZONE_ID_UNKNOWN: u32 = 0;
+const TIME_ZONE_ID_STANDARD: u32 = 1;
+const TIME_ZONE_ID_DAYLIGHT: u32 = 2;
+const X86_EXCEPTION_RECORD_SIZE: u64 = 80;
+const X86_CONTEXT_SIZE: u64 = 716;
+const X86_EXCEPTION_CHAIN_END: u64 = 0xffff_ffff;
+const X86_CONTEXT_FLAGS_FULL: u32 = 0x0001_0007;
+const X86_CONTEXT_OFFSET_SEG_GS: u64 = 0x8c;
+const X86_CONTEXT_OFFSET_SEG_FS: u64 = 0x90;
+const X86_CONTEXT_OFFSET_SEG_ES: u64 = 0x94;
+const X86_CONTEXT_OFFSET_SEG_DS: u64 = 0x98;
+const X86_CONTEXT_OFFSET_EDI: u64 = 0x9c;
+const X86_CONTEXT_OFFSET_ESI: u64 = 0xa0;
+const X86_CONTEXT_OFFSET_EBX: u64 = 0xa4;
+const X86_CONTEXT_OFFSET_EDX: u64 = 0xa8;
+const X86_CONTEXT_OFFSET_ECX: u64 = 0xac;
+const X86_CONTEXT_OFFSET_EAX: u64 = 0xb0;
+const X86_CONTEXT_OFFSET_EBP: u64 = 0xb4;
+const X86_CONTEXT_OFFSET_EIP: u64 = 0xb8;
+const X86_CONTEXT_OFFSET_SEG_CS: u64 = 0xbc;
+const X86_CONTEXT_OFFSET_EFLAGS: u64 = 0xc0;
+const X86_CONTEXT_OFFSET_ESP: u64 = 0xc4;
+const X86_CONTEXT_OFFSET_SEG_SS: u64 = 0xc8;
+const X86_EXCEPTION_CONTINUE_EXECUTION: u32 = 0;
+const X86_EXCEPTION_CONTINUE_SEARCH: u32 = 1;
 const PAGE_EXECUTE_READWRITE: u32 = 0x40;
 const MEM_COMMIT: u32 = 0x1000;
 const MEM_RESERVE: u32 = 0x2000;
@@ -117,12 +158,37 @@ const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
 const ERROR_FILE_NOT_FOUND: u32 = 2;
 const ERROR_NO_MORE_FILES: u32 = 18;
 const ERROR_PATH_NOT_FOUND: u32 = 3;
+const ERROR_MOD_NOT_FOUND: u32 = 126;
 const ERROR_INVALID_HANDLE: u32 = 6;
 const ERROR_INVALID_WINDOW_HANDLE: u32 = 1_400;
 const ERROR_CLASS_DOES_NOT_EXIST: u32 = 1_411;
 const ERROR_ACCESS_DENIED: u32 = 5;
 const ERROR_INVALID_PARAMETER: u32 = 87;
 const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
+const ERROR_ENVVAR_NOT_FOUND: u32 = 203;
+const ERROR_OLD_WIN_VERSION: u32 = 1_150;
+const ERROR_TIMEOUT: u32 = 1460;
+const APPMODEL_ERROR_NO_PACKAGE: u32 = 15_700;
+const VER_MINORVERSION: u32 = 0x0000_0001;
+const VER_MAJORVERSION: u32 = 0x0000_0002;
+const VER_BUILDNUMBER: u32 = 0x0000_0004;
+const VER_PLATFORMID: u32 = 0x0000_0008;
+const VER_SERVICEPACKMINOR: u32 = 0x0000_0010;
+const VER_SERVICEPACKMAJOR: u32 = 0x0000_0020;
+const VER_SUITENAME: u32 = 0x0000_0040;
+const VER_PRODUCT_TYPE: u32 = 0x0000_0080;
+const VER_EQUAL: u8 = 1;
+const VER_GREATER: u8 = 2;
+const VER_GREATER_EQUAL: u8 = 3;
+const VER_LESS: u8 = 4;
+const VER_LESS_EQUAL: u8 = 5;
+const VER_AND: u8 = 6;
+const VER_OR: u8 = 7;
+const VER_PLATFORM_WIN32_NT: u32 = 2;
+const VER_NT_WORKSTATION: u8 = 1;
+const OSVERSIONINFOW_SIZE: u32 = 20;
+const OSVERSIONINFOEXW_SIZE: u32 = 284;
+const LOCALE_EN_US: u32 = 0x0409;
 const E_NOINTERFACE: u64 = 0x8000_4002;
 const E_ACCESSDENIED: u64 = 0x8007_0005;
 const S_FALSE: u64 = 1;
@@ -206,16 +272,24 @@ const ERROR_MORE_DATA: u32 = 234;
 const ERROR_SHARING_VIOLATION: u32 = 32;
 const ERROR_LOCK_VIOLATION: u32 = 33;
 const ERROR_ALREADY_EXISTS: u32 = 183;
+const ERROR_UNKNOWN_REVISION: u32 = 1305;
 const STILL_ACTIVE: u32 = 259;
+const GET_MODULE_HANDLE_EX_FLAG_PIN: u32 = 0x0000_0001;
+const GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT: u32 = 0x0000_0002;
+const GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS: u32 = 0x0000_0004;
+const DLL_PROCESS_ATTACH: u64 = 1;
 const INIT_ONCE_CHECK_ONLY: u32 = 0x0000_0001;
 const INIT_ONCE_INIT_FAILED: u32 = 0x0000_0004;
 const IDOK: i32 = 1;
 const IDCANCEL: i32 = 2;
+#[allow(dead_code)]
 const IDABORT: i32 = 3;
 const IDRETRY: i32 = 4;
 const IDIGNORE: i32 = 5;
 const IDYES: i32 = 6;
+#[allow(dead_code)]
 const IDNO: i32 = 7;
+#[allow(dead_code)]
 const IDTRYAGAIN: i32 = 10;
 const IDCONTINUE: i32 = 11;
 const CP_ACP: u32 = 0;
@@ -234,6 +308,7 @@ const C1_XDIGIT: u16 = 0x0080;
 const C1_ALPHA: u16 = 0x0100;
 const LCMAP_LOWERCASE: u32 = 0x0000_0100;
 const LCMAP_UPPERCASE: u32 = 0x0000_0200;
+#[allow(dead_code)]
 const LCMAP_LINGUISTIC_CASING: u32 = 0x0100_0000;
 const HKEY_CLASSES_ROOT: u32 = 0x8000_0000;
 const HKEY_CURRENT_USER: u32 = 0x8000_0001;
@@ -248,6 +323,8 @@ const REG_SZ: u32 = 1;
 const REG_EXPAND_SZ: u32 = 2;
 const REG_BINARY: u32 = 3;
 const REG_DWORD: u32 = 4;
+const DEFAULT_SECURITY_COOKIE_X86: u64 = 0xbb40_e64e;
+const DEFAULT_SECURITY_COOKIE_X64: u64 = 0x0000_2b99_2ddf_a232;
 const REG_MULTI_SZ: u32 = 7;
 const REG_QWORD: u32 = 11;
 const INVALID_FILE_ATTRIBUTES: u64 = 0xFFFF_FFFF;
@@ -379,6 +456,7 @@ enum HostThunk {
     RegisterClassW,
     RegisterClassExW,
     GetClassInfoW,
+    GetClassInfoExW,
     GetDlgItem,
     GetClientRect,
     GetWindowRect,
@@ -404,6 +482,7 @@ enum HostThunk {
     ScreenToClient,
     SetWindowPos,
     GetSysColor,
+    LoadIconW,
     LoadCursorW,
     LoadBitmapW,
     CheckDlgButton,
@@ -432,6 +511,7 @@ enum HostThunk {
     SendMessageW,
     GetDeviceCaps,
     SelectObject,
+    CreateFontW,
     CreateFontIndirectW,
     DeleteObject,
     SetBkMode,
@@ -439,8 +519,10 @@ enum HostThunk {
     DrawTextW,
     MulDiv,
     SetCurrentDirectoryW,
+    GetCurrentDirectoryW,
     GetFullPathNameW,
     GetFileAttributesW,
+    GetFileAttributesExW,
     SetFileAttributesW,
     SetErrorMode,
     GetACP,
@@ -448,11 +530,14 @@ enum HostThunk {
     GetCPInfo,
     GetStringTypeW,
     LCMapStringW,
+    LCMapStringEx,
+    LocaleNameToLCID,
     SetDefaultDllDirectories,
     GetSystemDirectoryW,
     GetWindowsDirectoryW,
     GetTempPathW,
     GetTempFileNameW,
+    GetModuleFileNameA,
     GetModuleFileNameW,
     GetDiskFreeSpaceW,
     GetFileSize,
@@ -461,14 +546,20 @@ enum HostThunk {
     FindClose,
     LoadLibraryA,
     LoadLibraryW,
+    LoadLibraryExA,
     LoadLibraryExW,
     FreeLibrary,
+    GetModuleHandleExA,
+    GetModuleHandleExW,
     InitCommonControls,
+    InitCommonControlsEx,
     OleInitialize,
     OleUninitialize,
     CoCreateInstance,
     CoTaskMemFree,
+    VariantClear,
     CommandLineToArgvW,
+    IsUserAnAdmin,
     SHGetFileInfoW,
     SHGetFolderPathW,
     SHGetPathFromIDListW,
@@ -510,6 +601,10 @@ enum HostThunk {
     LstrcatW,
     GetCommandLineA,
     GetCommandLineW,
+    OutputDebugStringA,
+    OutputDebugStringW,
+    SetEnvironmentVariableW,
+    GetEnvironmentVariableW,
     GetEnvironmentStringsW,
     FreeEnvironmentStringsW,
     CharNextW,
@@ -519,7 +614,14 @@ enum HostThunk {
     DeleteFileW,
     WritePrivateProfileStringW,
     CreateProcessW,
+    CreateIoCompletionPort,
+    PostQueuedCompletionStatus,
+    GetQueuedCompletionStatus,
+    GetQueuedCompletionStatusEx,
+    CreateEventA,
     CreateEventW,
+    OpenEventA,
+    OpenEventW,
     SetEvent,
     ResetEvent,
     IsDebuggerPresent,
@@ -534,28 +636,49 @@ enum HostThunk {
     TryAcquireSRWLockShared,
     WaitForSingleObject,
     GetExitCodeProcess,
+    TerminateProcess,
     GetModuleHandleA,
     GetModuleHandleW,
     GetProcAddress,
+    EnumProcesses,
+    EnumProcessModules,
+    GetModuleBaseNameA,
     WsprintfW,
     CreateFileW,
+    AreFileApisANSI,
+    FlushFileBuffers,
+    GetCurrentPackageId,
     GetSystemTimeAsFileTime,
+    GetSystemTimePreciseAsFileTime,
+    GetTimeZoneInformation,
+    GetTempPath2W,
     CompareFileTime,
     SetFileTime,
+    RegCreateKeyExA,
     RegCreateKeyExW,
+    RegOpenKeyA,
+    RegOpenKeyExA,
     RegOpenKeyExW,
+    RegSetValueExA,
     RegSetValueExW,
+    RegQueryValueExA,
     RegQueryValueExW,
     RegCloseKey,
+    InitializeSecurityDescriptor,
+    SetSecurityDescriptorDacl,
     SetFilePointer,
     ReadFile,
     WriteFile,
     LocalAlloc,
+    LocalLock,
+    LocalUnlock,
+    LocalFree,
     GlobalAlloc,
     GlobalLock,
     GlobalUnlock,
     GlobalFree,
     CloseHandle,
+    SetHandleInformation,
     Calloc,
     Free,
     Malloc,
@@ -586,13 +709,36 @@ enum HostThunk {
     SetUserMathErr,
     DeleteCriticalSection,
     EnterCriticalSection,
+    TryEnterCriticalSection,
     GetVersion,
     GetLastError,
     SetLastError,
+    WsaStartup,
+    WsaCleanup,
+    WsaGetLastError,
+    WsaSetLastError,
+    Htonl,
+    Htons,
+    ConnectEx,
+    DisconnectEx,
+    Ioctlsocket,
+    Ntohl,
+    Ntohs,
+    Closesocket,
+    Select,
+    Shutdown,
+    Socket,
+    WsaFdIsSet,
+    WsaIoctl,
+    WsaSocketA,
     GetCurrentThreadId,
     GetCurrentProcessId,
+    ProcessIdToSessionId,
+    GetCurrentProcess,
     QueryPerformanceCounter,
     QueryPerformanceFrequency,
+    VerSetConditionMask,
+    VerifyVersionInfoW,
     IsProcessorFeaturePresent,
     GetProcessHeap,
     GetProcessHeaps,
@@ -604,10 +750,17 @@ enum HostThunk {
     InitializeSListHead,
     GetStdHandle,
     GetFileType,
+    GetFileInformationByHandle,
     GetTickCount,
     InitializeCriticalSection,
     InitializeCriticalSectionAndSpinCount,
+    InitializeCriticalSectionEx,
     LeaveCriticalSection,
+    SleepConditionVariableCS,
+    WakeAllConditionVariable,
+    EncodePointer,
+    DecodePointer,
+    UnhandledExceptionFilter,
     SetUnhandledExceptionFilter,
     Beep,
     Sleep,
@@ -615,6 +768,12 @@ enum HostThunk {
     TlsGetValue,
     TlsSetValue,
     TlsFree,
+    FlsAlloc,
+    FlsGetValue,
+    FlsSetValue,
+    FlsFree,
+    SetFileCompletionNotificationModes,
+    RtlNtStatusToDosError,
     VirtualAlloc,
     VirtualProtect,
     VirtualQuery,
@@ -632,6 +791,12 @@ struct CrtGlobals {
     commode_ptr: u64,
     fmode_ptr: u64,
     iob_streams: [u64; 3],
+}
+
+#[derive(Debug, Clone, Default)]
+struct ConditionVariableState {
+    waiters: usize,
+    wake_generation: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -678,6 +843,7 @@ enum ShellLinkInterfaceKind {
 #[derive(Debug, Clone, Copy)]
 struct GuestShellLinkInterface {
     state_id: u64,
+    #[allow(dead_code)]
     kind: ShellLinkInterfaceKind,
 }
 
@@ -904,15 +1070,21 @@ struct PeHostRuntime {
     next_heap_address: u64,
     heap_allocations: BTreeMap<u64, usize>,
     critical_sections: BTreeMap<u64, usize>,
+    condition_variables: BTreeMap<u64, ConditionVariableState>,
     srw_locks: BTreeMap<u64, i32>,
     signal_handlers: BTreeMap<i32, u64>,
     tls_slots: BTreeMap<u32, u64>,
+    fls_slots: BTreeMap<u32, u64>,
     tls_vector_ptr: u64,
     init_once_pending: BTreeSet<u64>,
     init_once_completed: BTreeMap<u64, u64>,
     atexit_handlers: Vec<u64>,
     module_handles: BTreeMap<String, u64>,
     module_names_by_handle: BTreeMap<u64, String>,
+    module_paths_by_handle: BTreeMap<u64, String>,
+    synthetic_module_handles: BTreeSet<u64>,
+    materialized_synthetic_modules: BTreeSet<u64>,
+    network: NetworkStack,
     device_contexts: BTreeMap<u64, Option<u32>>,
     dialog_procs: BTreeMap<u32, u64>,
     dc_selected_objects: BTreeMap<u64, u64>,
@@ -924,6 +1096,8 @@ struct PeHostRuntime {
     last_error: u32,
     invalid_parameter_handler: u64,
     unhandled_exception_filter: u64,
+    main_module_security_cookie_address: Option<u64>,
+    process_pointer_cookie: u64,
     mapped_image_base: u64,
     mapped_image_size: u64,
     teb_base: u64,
@@ -935,6 +1109,7 @@ struct PeHostRuntime {
     command_line: String,
     command_line_ansi_ptr: u64,
     command_line_wide_ptr: u64,
+    configured_narrow_argv_mode: Option<u32>,
     process_environment: BTreeMap<String, String>,
     current_directory: String,
     stdout: String,
@@ -942,11 +1117,24 @@ struct PeHostRuntime {
     steam_401389_recent_blocks: VecDeque<String>,
     steam_401389_first_over_0x1000: Option<String>,
     steam_401389_expected_esi_after_401434: Option<u32>,
+    recent_main_block_rvas: VecDeque<u32>,
+    recent_main_cc400_count: usize,
+    steam_final_assert_recent_blocks: VecDeque<String>,
+    steam_final_assert_global_history: VecDeque<String>,
+    steam_pre_report_blocks: VecDeque<String>,
     steam_401389_saved_esi_slot_addr: Option<u64>,
+    steam_convar_memcpy_watch_this: Option<u64>,
+    steam_565af0_recent_blocks: VecDeque<String>,
+    steam_4dea00_expected_edi: Option<u64>,
+    steam_install_dir_expected_edi: Option<u64>,
+    steam_final_status_writer_blocks: VecDeque<String>,
+    steam_final_lock_blocks: VecDeque<String>,
     next_frame_index: u32,
     next_audio_buffer_tag: u64,
     published_live_frame: bool,
+    delivering_guest_exception: bool,
     dtm: bool,
+    jit_runtime: Option<crate::jit::JitRuntime>,
 }
 
 #[derive(Debug)]
@@ -1071,8 +1259,26 @@ pub fn execute_with_options(
         mapped.selected_base,
         image.size_of_image as u64,
     )?;
+    runtime.initialize_security_cookie(&mut memory, &image, mapped.selected_base)?;
     runtime.initialize_main_thread_tls(&mut memory, &image, mapped.selected_base)?;
     runtime.bind_imports(mapped.selected_base, &mut memory, &resolved_imports)?;
+    if guest_arch == GuestArch::X86 && staged_program_path.ends_with("Steam.exe") {
+        eprintln!(
+            "steam-initial-globals startup_state={} term_flag={} array_count={} array_ptr={}",
+            probe_read_guest_u32(&memory, mapped.selected_base + 0x0045_715c)
+                .map(|value| format!("{value:#x}"))
+                .unwrap_or_else(|| "<unavailable>".to_string()),
+            probe_read_guest_u32(&memory, mapped.selected_base + 0x0045_7620)
+                .map(|value| format!("{value:#x}"))
+                .unwrap_or_else(|| "<unavailable>".to_string()),
+            probe_read_guest_u32(&memory, mapped.selected_base + 0x0045_7624)
+                .map(|value| format!("{value:#x}"))
+                .unwrap_or_else(|| "<unavailable>".to_string()),
+            probe_read_guest_u32(&memory, mapped.selected_base + 0x0045_7628)
+                .map(|value| format!("{value:#x}"))
+                .unwrap_or_else(|| "<unavailable>".to_string()),
+        );
+    }
 
     let config = CpuEngineConfig::from_profile(guest_arch, &ge.config.winver, env!("CARGO_PKG_VERSION"), None)?;
     let mut engine = CpuExecutionEngine::new(config);
@@ -1090,12 +1296,18 @@ pub fn execute_with_options(
     } else {
         state.segment_bases.fs = runtime.teb_base;
     }
+    eprintln!("steam-pre-tls-callbacks tls_dir={:#?}", image.tls_directory);
+    runtime.execute_main_image_tls_process_attach_callbacks(&mut state, &mut memory, &image, mapped.selected_base)?;
+    eprintln!("steam-post-tls-callbacks");
     state.rip = mapped.selected_base + image.address_of_entry_point as u64;
 
-    let mut steps = 0_u64;
+    eprintln!("steam-entry-point entry_rip={:#x} mapped_base={:#x} image_size={:#x} stack_bottom={:#x} stack_top={:#x} teb_base={:#x}",
+        state.rip, mapped.selected_base, image.size_of_image, stack_bottom, stack_top, runtime.teb_base);
+
     let mut exit_code = 0_i32;
+    let mut steps = 0_u64;
     loop {
-        if runtime.host_thunks.contains_key(&state.rip) {
+        if let Some(result) = runtime.dispatch_import_if_present(state.rip, &mut state, &mut memory)? {
             advance_runtime_steps(
                 &mut runtime,
                 &mut steps,
@@ -1105,7 +1317,7 @@ pub fn execute_with_options(
                 &state,
                 test_id,
             )?;
-            if let Some(code) = runtime.dispatch_import(state.rip, &mut state, &mut memory)? {
+            if let Some(code) = result {
                 exit_code = code;
                 break;
             }
@@ -1134,21 +1346,20 @@ pub fn execute_with_options(
                         read_u32(&memory, state.rip + 2)? as u64
                     };
                     let target = read_guest_pointer(&memory, slot_address, guest_arch)?;
+                    let is_call = memory.read_u8(state.rip + 1)? == 0x15;
 
-                    if runtime.host_thunks.contains_key(&target) {
-                        if memory.read_u8(state.rip + 1)? == 0x15 {
-                            let call_rsp = state.get(Register::Rsp).wrapping_sub(guest_pointer_bytes);
-                            write_guest_pointer(&mut memory, call_rsp, next_rip, guest_arch)?;
-                            state.set(Register::Rsp, call_rsp);
-                        }
-                        if let Some(code) = runtime.dispatch_import(target, &mut state, &mut memory)? {
-                            exit_code = code;
-                            break;
-                        }
-                    } else if memory.read_u8(state.rip + 1)? == 0x15 {
+                    if is_call {
                         let call_rsp = state.get(Register::Rsp).wrapping_sub(guest_pointer_bytes);
                         write_guest_pointer(&mut memory, call_rsp, next_rip, guest_arch)?;
                         state.set(Register::Rsp, call_rsp);
+                    }
+
+                    if let Some(result) = runtime.dispatch_import_if_present(target, &mut state, &mut memory)? {
+                        if let Some(code) = result {
+                            exit_code = code;
+                            break;
+                        }
+                    } else if is_call {
                         state.rip = target;
                     } else {
                         state.rip = target;
@@ -1225,7 +1436,541 @@ pub fn execute_with_options(
         )
         .map_err(|error| annotate_guest_fault(error, &memory, &state))?;
         let block_start_rip = state.rip;
+        let block_rva = if block_start_rip >= runtime.mapped_image_base
+            && block_start_rip < runtime.mapped_image_base + runtime.mapped_image_size
+        {
+            let block_rva = block_start_rip.saturating_sub(runtime.mapped_image_base) as u32;
+            if guest_arch == GuestArch::X86 && runtime.recent_main_block_rvas.is_empty() {
+                eprintln!("steam-first-main-block block_rva={block_rva:#x} rip={block_start_rip:#x}");
+            }
+            if guest_arch == GuestArch::X86 && runtime.recent_main_block_rvas.len() < 64 {
+                eprintln!("steam-main-block-seq index={} block_rva={block_rva:#x} rip={block_start_rip:#x}", runtime.recent_main_block_rvas.len());
+            }
+            if runtime.recent_main_block_rvas.len() == 32 {
+                if runtime.recent_main_block_rvas.pop_front() == Some(0x000c_c400) {
+                    runtime.recent_main_cc400_count = runtime.recent_main_cc400_count.saturating_sub(1);
+                }
+            }
+            runtime.recent_main_block_rvas.push_back(block_rva);
+            if block_rva == 0x000c_c400 {
+                runtime.recent_main_cc400_count += 1;
+            }
+            Some(block_rva)
+        } else {
+            None
+        };
+        if let Some(block_rva) = block_rva {
+            if guest_arch == GuestArch::X86 {
+                let cookie_watch_site = match block_rva {
+                    0x0017_5f4e => Some("after_get_module_file_name_w"),
+                    0x0017_5f94 => Some("after_175f8f_call"),
+                    0x0017_5faf => Some("after_175faa_call"),
+                    0x0017_5fb8 => Some("before_security_check"),
+                    _ => None,
+                };
+                if let Some(site) = cookie_watch_site {
+                    let ebp = state.get(Register::Rbp) as u32;
+                    let frame_cookie_addr = ebp.wrapping_sub(4) as u64;
+                    let frame_cookie = read_guest_u32(&memory, frame_cookie_addr).ok();
+                    let global_cookie_addr = runtime.mapped_image_base + 0x003c_bfd4;
+                    let global_cookie = read_guest_u32(&memory, global_cookie_addr).ok();
+                    let decoded_cookie = frame_cookie.map(|value| value ^ ebp);
+                    runtime.push_trace(
+                        "process",
+                        "SteamCookieWatch",
+                        BTreeMap::from([
+                            ("site".to_string(), json!(site)),
+                            ("ebp".to_string(), json!(format!("{ebp:#x}"))),
+                            ("esp".to_string(), json!(format!("{:#x}", state.get(Register::Rsp)))),
+                            ("frame_cookie_addr".to_string(), json!(format!("{frame_cookie_addr:#x}"))),
+                            (
+                                "frame_cookie".to_string(),
+                                json!(frame_cookie.map(|value| format!("{value:#x}")).unwrap_or_else(|| "<unavailable>".to_string())),
+                            ),
+                            (
+                                "decoded_cookie".to_string(),
+                                json!(decoded_cookie.map(|value| format!("{value:#x}")).unwrap_or_else(|| "<unavailable>".to_string())),
+                            ),
+                            (
+                                "global_cookie".to_string(),
+                                json!(global_cookie.map(|value| format!("{value:#x}")).unwrap_or_else(|| "<unavailable>".to_string())),
+                            ),
+                        ]),
+                        json!(site),
+                    );
+                }
+            }
+            let in_final_assert_window = (0x0013_6400..=0x0013_6f00).contains(&block_rva)
+                || (0x0013_d180..=0x0013_d1b0).contains(&block_rva)
+                || (0x0013_ea00..=0x0013_f800).contains(&block_rva)
+                || (0x0014_ca80..=0x0014_cd50).contains(&block_rva);
+            let in_pre_report_window = (0x0014_dee0..=0x0014_df40).contains(&block_rva)
+                || (0x0015_e6d0..=0x0015_e720).contains(&block_rva)
+                || (0x0016_c040..=0x0016_c0c0).contains(&block_rva)
+                || (0x0016_ddf0..=0x0016_e120).contains(&block_rva);
+            runtime.trace_steam_pre_report_pointer_state(&memory, &state, block_rva);
+            if in_final_assert_window || in_pre_report_window {
+                let decoded_instructions = cached_block
+                    .translated
+                    .decoded
+                    .iter()
+                    .map(|instruction| {
+                        format!(
+                            "{:#x}:{:?} {:?}",
+                            instruction.address.saturating_sub(runtime.mapped_image_base),
+                            instruction.opcode,
+                            instruction.operands
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+                let return_addr = read_guest_u32(&memory, state.get(Register::Rsp))
+                    .ok()
+                    .map(u64::from)
+                    .map(|value| format!("{:#x}", value.saturating_sub(runtime.mapped_image_base)))
+                    .unwrap_or_else(|| "<unavailable>".to_string());
+                let final_assert_tls_state = if guest_arch == GuestArch::X86 && block_rva == 0x0013_ea80 {
+                    let format_opt = |value: Option<u64>| {
+                        value
+                            .map(|value| format!("{value:#x}"))
+                            .unwrap_or_else(|| "<unavailable>".to_string())
+                    };
+                    let tls_index_address = runtime.mapped_image_base + 0x0045_71a8;
+                    let compare_left_address = runtime.mapped_image_base + 0x0042_6400;
+                    let tls_vector = read_guest_pointer(&memory, runtime.teb_base + 0x2c, guest_arch).ok();
+                    let tls_index = read_guest_u32(&memory, tls_index_address).ok().map(u64::from);
+                    let tls_slot = match (tls_vector, tls_index) {
+                        (Some(vector), Some(index)) if vector != 0 => read_guest_pointer(
+                            &memory,
+                            vector + index * guest_arch.pointer_bytes() as u64,
+                            guest_arch,
+                        )
+                        .ok(),
+                        _ => None,
+                    };
+                    let compare_left = read_guest_u32(&memory, compare_left_address).ok().map(u64::from);
+                    let compare_right = match tls_slot {
+                        Some(slot) if slot != 0 => read_guest_u32(&memory, slot + 0x480).ok().map(u64::from),
+                        _ => None,
+                    };
+                    format!(
+                        " tls_index={} tls_vector={} tls_slot={} compare_lhs={} compare_rhs={}",
+                        format_opt(tls_index),
+                        format_opt(tls_vector),
+                        format_opt(tls_slot),
+                        format_opt(compare_left),
+                        format_opt(compare_right),
+                    )
+                } else {
+                    String::new()
+                };
+                let block_summary = format!(
+                    "block_start={block_rva:#x} ret_rva={return_addr} eax={:#x} ecx={:#x} edx={:#x} esi={:#x} edi={:#x} esp={:#x} ebp={:#x}{final_assert_tls_state} decoded=[{decoded_instructions}]",
+                    state.get(Register::Rax),
+                    state.get(Register::Rcx),
+                    state.get(Register::Rdx),
+                    state.get(Register::Rsi),
+                    state.get(Register::Rdi),
+                    state.get(Register::Rsp),
+                    state.get(Register::Rbp),
+                );
+                if in_final_assert_window {
+                    if runtime.steam_final_assert_recent_blocks.len() == 32 {
+                        runtime.steam_final_assert_recent_blocks.pop_front();
+                    }
+                    runtime.steam_final_assert_recent_blocks.push_back(block_summary.clone());
+                    if (0x0013_eaf0..=0x0013_eb10).contains(&block_rva)
+                        || (0x0014_ca80..=0x0014_cd80).contains(&block_rva)
+                    {
+                        if runtime.steam_final_status_writer_blocks.len() == 40 {
+                            runtime.steam_final_status_writer_blocks.pop_front();
+                        }
+                        runtime.steam_final_status_writer_blocks.push_back(block_summary.clone());
+                    } else if (0x0013_c3d0..=0x0013_c410).contains(&block_rva)
+                        || (0x0013_d190..=0x0013_d197).contains(&block_rva)
+                        || (0x0013_f0a0..=0x0013_f0d0).contains(&block_rva)
+                        || (0x0013_f560..=0x0013_f790).contains(&block_rva)
+                    {
+                        if runtime.steam_final_lock_blocks.len() == 64 {
+                            runtime.steam_final_lock_blocks.pop_front();
+                        }
+                        runtime.steam_final_lock_blocks.push_back(block_summary.clone());
+                    }
+                }
+                if in_pre_report_window {
+                    if runtime.steam_pre_report_blocks.len() == 64 {
+                        runtime.steam_pre_report_blocks.pop_front();
+                    }
+                    runtime.steam_pre_report_blocks.push_back(block_summary);
+                }
+            }
+        }
         let esi_before = state.get(Register::Rsi) as u32;
+        let steam_565af0_range_start = runtime.mapped_image_base + 0x0016_5ab5;
+        let steam_565af0_range_end = runtime.mapped_image_base + 0x0016_5d10;
+        let steam_565ac1 = runtime.mapped_image_base + 0x0016_5ac1;
+        let steam_565af0 = runtime.mapped_image_base + 0x0016_5af0;
+        let steam_565c46 = runtime.mapped_image_base + 0x0016_5c46;
+        let trace_steam_final_assert_globals = guest_arch == GuestArch::X86
+            && matches!(
+                block_rva,
+                Some(rva)
+                    if (0x0013_6400..=0x0013_6f00).contains(&rva)
+                        || (0x0013_d180..=0x0013_d1b0).contains(&rva)
+                        || (0x0013_ea00..=0x0013_f800).contains(&rva)
+                        || (0x0014_ca80..=0x0014_cd50).contains(&rva)
+                        || (0x0014_dee0..=0x0014_df40).contains(&rva)
+                        || (0x0015_e6d0..=0x0015_e720).contains(&rva)
+                        || (0x0016_c040..=0x0016_c0c0).contains(&rva)
+                        || (0x0016_ddf0..=0x0016_e120).contains(&rva)
+            );
+        let final_assert_globals_before = if trace_steam_final_assert_globals {
+            Some([
+                (
+                    runtime.mapped_image_base + 0x003c_bfc4,
+                    probe_read_guest_u32(&memory, runtime.mapped_image_base + 0x003c_bfc4),
+                ),
+                (
+                    runtime.mapped_image_base + 0x003c_bfd4,
+                    probe_read_guest_u32(&memory, runtime.mapped_image_base + 0x003c_bfd4),
+                ),
+                (
+                    runtime.mapped_image_base + 0x0042_3a34,
+                    probe_read_guest_u32(&memory, runtime.mapped_image_base + 0x0042_3a34),
+                ),
+                (
+                    runtime.mapped_image_base + 0x0042_3a38,
+                    probe_read_guest_u32(&memory, runtime.mapped_image_base + 0x0042_3a38),
+                ),
+                (
+                    runtime.mapped_image_base + 0x0042_3fbc,
+                    probe_read_guest_u32(&memory, runtime.mapped_image_base + 0x0042_3fbc),
+                ),
+                (
+                    runtime.mapped_image_base + 0x0042_6130,
+                    probe_read_guest_u32(&memory, runtime.mapped_image_base + 0x0042_6130),
+                ),
+                (
+                    runtime.mapped_image_base + 0x0042_63e8,
+                    probe_read_guest_u32(&memory, runtime.mapped_image_base + 0x0042_63e8),
+                ),
+                (
+                    runtime.mapped_image_base + 0x0042_6400,
+                    probe_read_guest_u32(&memory, runtime.mapped_image_base + 0x0042_6400),
+                ),
+                (
+                    runtime.mapped_image_base + 0x0042_6404,
+                    probe_read_guest_u32(&memory, runtime.mapped_image_base + 0x0042_6404),
+                ),
+            ])
+        } else {
+            None
+        };
+        let trace_steam_136b50_entry = guest_arch == GuestArch::X86 && block_rva == Some(0x0013_6b50);
+        let steam_136b50_esp_before = trace_steam_136b50_entry.then_some(state.get(Register::Rsp));
+        let steam_136b50_arg0_before = steam_136b50_esp_before
+            .and_then(|esp| probe_read_guest_u32(&memory, esp + 4).map(u64::from));
+        let steam_136b50_arg1_before = steam_136b50_esp_before
+            .and_then(|esp| probe_read_guest_u32(&memory, esp + 8).map(u64::from));
+        let steam_136b50_global_423fbc_before = trace_steam_136b50_entry
+            .then(|| probe_read_guest_u32(&memory, runtime.mapped_image_base + 0x0042_3fbc).map(u64::from))
+            .flatten();
+        let steam_136b50_global_423fb8_before = trace_steam_136b50_entry
+            .then(|| probe_read_guest_u32(&memory, runtime.mapped_image_base + 0x0042_3fb8).map(u64::from))
+            .flatten();
+        let steam_136b50_global_423a30_before = trace_steam_136b50_entry
+            .then(|| probe_read_guest_u32(&memory, runtime.mapped_image_base + 0x0042_3a30).map(u64::from))
+            .flatten();
+        let steam_136b50_global_423a38_before = trace_steam_136b50_entry
+            .then(|| probe_read_guest_u32(&memory, runtime.mapped_image_base + 0x0042_3a38).map(u64::from))
+            .flatten();
+        let trace_steam_136e80_entry = guest_arch == GuestArch::X86 && block_rva == Some(0x0013_6e80);
+        let steam_136e80_esp_before = trace_steam_136e80_entry.then_some(state.get(Register::Rsp));
+        let steam_136e80_args_before = steam_136e80_esp_before.map(|esp| {
+            [
+                probe_read_guest_u32(&memory, esp + 4).map(u64::from),
+                probe_read_guest_u32(&memory, esp + 8).map(u64::from),
+                probe_read_guest_u32(&memory, esp + 12).map(u64::from),
+                probe_read_guest_u32(&memory, esp + 16).map(u64::from),
+                probe_read_guest_u32(&memory, esp + 20).map(u64::from),
+            ]
+        });
+        let steam_136e80_global_423e4c_before = trace_steam_136e80_entry
+            .then(|| probe_read_guest_u32(&memory, runtime.mapped_image_base + 0x0042_3e4c).map(u64::from))
+            .flatten();
+        let steam_136e80_global_423e6c_before = trace_steam_136e80_entry
+            .then(|| probe_read_guest_u32(&memory, runtime.mapped_image_base + 0x0042_3e6c).map(u64::from))
+            .flatten();
+        let steam_136e80_tls_index_before = trace_steam_136e80_entry
+            .then(|| probe_read_guest_u32(&memory, runtime.mapped_image_base + 0x0045_71a8).map(u64::from))
+            .flatten();
+        let steam_136e80_tls_vector_before = trace_steam_136e80_entry
+            .then(|| probe_read_guest_pointer(&memory, runtime.teb_base + 0x2c, guest_arch))
+            .flatten();
+        let steam_136e80_tls_slot_before = match (steam_136e80_tls_vector_before, steam_136e80_tls_index_before) {
+            (Some(vector), Some(index)) if vector != 0 => {
+                probe_read_guest_pointer(&memory, vector + index * guest_arch.pointer_bytes() as u64, guest_arch)
+            }
+            _ => None,
+        };
+        let steam_136e80_tls_slot_480_before = steam_136e80_tls_slot_before
+            .and_then(|slot| {
+                (slot != 0).then(|| probe_read_guest_u32(&memory, slot + 0x480).map(u64::from))
+            })
+            .flatten();
+        let trace_steam_memstd_oom_entry = guest_arch == GuestArch::X86 && block_rva == Some(0x0013_4bd0);
+        let steam_memstd_oom_esp_before = trace_steam_memstd_oom_entry.then_some(state.get(Register::Rsp));
+        let steam_memstd_oom_size_before = steam_memstd_oom_esp_before
+            .and_then(|esp| probe_read_guest_u32(&memory, esp + 4).map(u64::from));
+        let steam_memstd_oom_return_rva_before = steam_memstd_oom_esp_before
+            .and_then(|esp| probe_read_guest_u32(&memory, esp).map(u64::from))
+            .map(|value| value.saturating_sub(runtime.mapped_image_base));
+        let steam_memstd_oom_this_before = trace_steam_memstd_oom_entry.then_some(state.get(Register::Rcx));
+        let trace_steam_memstd_oom_caller = guest_arch == GuestArch::X86 && block_rva == Some(0x0013_4b56);
+        let steam_memstd_caller_this_before = trace_steam_memstd_oom_caller.then_some(state.get(Register::Rdi));
+        let steam_memstd_caller_old_address_before = trace_steam_memstd_oom_caller.then_some(state.get(Register::Rsi));
+        let steam_memstd_caller_requested_size_before = trace_steam_memstd_oom_caller.then_some(state.get(Register::Rbx));
+        let steam_memstd_caller_mode_before = steam_memstd_caller_this_before
+            .and_then(|this_ptr| probe_read_guest_u32(&memory, this_ptr + 0x5918).map(u64::from));
+        let steam_memstd_caller_range1_table_before = steam_memstd_caller_this_before
+            .and_then(|this_ptr| probe_read_guest_u32(&memory, this_ptr + 0x0c58).map(u64::from));
+        let steam_memstd_caller_range2_table_before = steam_memstd_caller_this_before
+            .and_then(|this_ptr| probe_read_guest_u32(&memory, this_ptr + 0x5910).map(u64::from));
+        let steam_global_array_watch = guest_arch == GuestArch::X86
+            && matches!(
+                block_rva,
+                Some(
+                    0x0015_e9b1
+                        | 0x0015_e9c5
+                        | 0x0015_e9d0
+                        | 0x0015_e9f0
+                        | 0x0015_ea1b
+                        | 0x0015_ea89
+                        | 0x0015_ea98
+                        | 0x0015_eac0
+                        | 0x0017_21d1
+                        | 0x0017_21f0
+                )
+            );
+        let steam_global_array_count_before = steam_global_array_watch
+            .then(|| probe_read_guest_u32(&memory, runtime.mapped_image_base + 0x0045_7624).map(u64::from))
+            .flatten();
+        let steam_global_array_ptr_before = steam_global_array_watch
+            .then(|| probe_read_guest_u32(&memory, runtime.mapped_image_base + 0x0045_7628).map(u64::from))
+            .flatten();
+        let steam_global_array_return_before = steam_global_array_watch
+            .then(|| probe_read_guest_u32(&memory, state.get(Register::Rsp)).map(u64::from))
+            .flatten()
+            .map(|value| value.saturating_sub(runtime.mapped_image_base));
+        let steam_early_termination_watch = guest_arch == GuestArch::X86
+            && matches!(block_rva, Some(rva) if (0x0015_e740..=0x0015_e7a5).contains(&rva));
+        let steam_early_termination_return_before = steam_early_termination_watch
+            .then(|| probe_read_guest_u32(&memory, state.get(Register::Rsp)).map(u64::from))
+            .flatten()
+            .map(|value| value.saturating_sub(runtime.mapped_image_base));
+        let steam_global_state_watch = guest_arch == GuestArch::X86 && block_rva.is_some();
+        let steam_global_state_before = steam_global_state_watch.then(|| {
+            [
+                (
+                    runtime.mapped_image_base + 0x0045_715c,
+                    probe_read_guest_u32(&memory, runtime.mapped_image_base + 0x0045_715c),
+                ),
+                (
+                    runtime.mapped_image_base + 0x0045_7624,
+                    probe_read_guest_u32(&memory, runtime.mapped_image_base + 0x0045_7624),
+                ),
+                (
+                    runtime.mapped_image_base + 0x0045_7628,
+                    probe_read_guest_u32(&memory, runtime.mapped_image_base + 0x0045_7628),
+                ),
+            ]
+        });
+        let steam_initterm_e_watch = guest_arch == GuestArch::X86
+            && matches!(block_rva, Some(rva) if (0x0016_e34b..=0x0016_e371).contains(&rva));
+        let steam_initterm_e_start_before = steam_initterm_e_watch
+            .then(|| probe_read_guest_u32(&memory, state.get(Register::Rsp) + 4).map(u64::from))
+            .flatten();
+        let steam_initterm_e_end_before = steam_initterm_e_watch
+            .then(|| probe_read_guest_u32(&memory, state.get(Register::Rsp) + 8).map(u64::from))
+            .flatten();
+        let steam_startup_init_watch = guest_arch == GuestArch::X86
+            && matches!(block_rva, Some(rva) if (0x0014_d105..=0x0014_d17b).contains(&rva));
+        let steam_startup_failure_watch = guest_arch == GuestArch::X86
+            && matches!(block_rva, Some(rva) if (0x0014_d257..=0x0014_d264).contains(&rva));
+        let steam_callback_walk_watch = guest_arch == GuestArch::X86 && block_rva == Some(0x0017_7827);
+        let steam_callback_walk_entry_before = steam_callback_walk_watch.then(|| {
+            let entry = state.get(Register::Rsi);
+            (
+                entry,
+                probe_read_guest_u32(&memory, entry).map(u64::from),
+                probe_read_guest_u32(&memory, entry + 4).map(u64::from),
+            )
+        });
+        let steam_post_577113_watch = guest_arch == GuestArch::X86
+            && matches!(block_rva, Some(0x0017_6f61 | 0x0017_6f84));
+        let steam_post_56ee10_watch = guest_arch == GuestArch::X86 && block_rva == Some(0x0017_6f3c);
+        let steam_post_576ca8_watch = guest_arch == GuestArch::X86 && block_rva == Some(0x0017_7133);
+        let steam_post_576d7e_watch = guest_arch == GuestArch::X86 && block_rva == Some(0x0017_71a9);
+        let steam_577113_epilogue_watch = guest_arch == GuestArch::X86 && block_rva == Some(0x0017_72f4);
+        let steam_577113_epilogue_before = steam_577113_epilogue_watch.then(|| {
+            let rsp = state.get(Register::Rsp);
+            (
+                rsp,
+                probe_read_guest_u32(&memory, rsp).map(u64::from),
+                probe_read_guest_u32(&memory, rsp + 4).map(u64::from),
+                probe_read_guest_u32(&memory, rsp + 8).map(u64::from),
+                probe_read_guest_u32(&memory, rsp + 12).map(u64::from),
+                state.get(Register::Rdi),
+                state.get(Register::Rsi),
+            )
+        });
+        let steam_saved_edi_slot_watch = guest_arch == GuestArch::X86
+            && matches!(block_rva, Some(rva) if (0x0016_ca8..=0x0017_304).contains(&rva));
+        let steam_saved_edi_slot_before = steam_saved_edi_slot_watch
+            .then(|| probe_read_guest_u32(&memory, 0x7000_ff1c).map(u64::from))
+            .flatten();
+        let trace_steam_convar_create = guest_arch == GuestArch::X86 && block_rva == Some(0x000c_c542);
+        let trace_steam_convar_create_start = guest_arch == GuestArch::X86 && block_rva == Some(0x000c_c400);
+        let steam_convar_trace_active = trace_steam_convar_create || trace_steam_convar_create_start;
+        let steam_convar_this_before = if trace_steam_convar_create_start {
+            Some(state.get(Register::Rcx))
+        } else if trace_steam_convar_create {
+            Some(state.get(Register::Rsi))
+        } else {
+            None
+        };
+        let steam_convar_frame_before = steam_convar_trace_active.then_some(state.get(Register::Rbp));
+        let steam_convar_name_ptr_before = steam_convar_frame_before
+            .and_then(|frame| probe_read_guest_u32(&memory, frame + 0x08).map(u64::from));
+        let steam_convar_flags_before = steam_convar_frame_before
+            .and_then(|frame| probe_read_guest_u32(&memory, frame + 0x10).map(u64::from));
+        let steam_convar_help_ptr_before = steam_convar_frame_before
+            .and_then(|frame| probe_read_guest_u32(&memory, frame + 0x14).map(u64::from));
+        let steam_convar_parent_ptr_before = steam_convar_frame_before
+            .and_then(|frame| probe_read_guest_u32(&memory, frame + 0x18).map(u64::from));
+        let steam_convar_callback_ptr_before = steam_convar_frame_before
+            .and_then(|frame| probe_read_guest_u32(&memory, frame + 0x2c).map(u64::from));
+        let steam_convar_vector_ptr_before = steam_convar_this_before.and_then(|this_ptr| this_ptr.checked_add(0x84));
+        let steam_convar_vector_bytes_before = steam_convar_vector_ptr_before
+            .and_then(|vector_ptr| probe_read_window(&memory, vector_ptr, 0x14));
+        let recent_main_has_cc400 = guest_arch == GuestArch::X86 && runtime.recent_main_cc400_count != 0;
+        let steam_convar_helper_watch = if recent_main_has_cc400 {
+            match block_rva {
+                Some(0x0014_c88e) => Some("0x14c88e"),
+                Some(0x0014_e980) => Some("0x14e980"),
+                Some(0x0014_6200) => Some("0x146200"),
+                Some(0x0016_00aa) => Some("0x1600aa"),
+                Some(0x0016_0033) => Some("0x160033"),
+                Some(0x0014_6570) => Some("0x146570"),
+                Some(0x0016_6127) => Some("0x166127"),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let steam_convar_helper_this_before = if steam_convar_helper_watch.is_some() {
+            Some(state.get(Register::Rsi))
+        } else {
+            None
+        };
+        let steam_convar_helper_vector_ptr_before = steam_convar_helper_this_before.and_then(|this_ptr| this_ptr.checked_add(0x84));
+        let steam_convar_helper_vector_bytes_before = steam_convar_helper_vector_ptr_before
+            .and_then(|vector_ptr| probe_read_window(&memory, vector_ptr, 0x14));
+        let steam_convar_helper_arg0_before = steam_convar_helper_watch
+            .and_then(|_| probe_read_guest_u32(&memory, state.get(Register::Rsp) + 4).map(u64::from));
+        let steam_convar_helper_arg1_before = steam_convar_helper_watch
+            .and_then(|_| probe_read_guest_u32(&memory, state.get(Register::Rsp) + 8).map(u64::from));
+        let steam_convar_helper_arg2_before = steam_convar_helper_watch
+            .and_then(|_| probe_read_guest_u32(&memory, state.get(Register::Rsp) + 12).map(u64::from));
+        let steam_convar_helper_return_before = steam_convar_helper_watch
+            .and_then(|_| probe_read_guest_u32(&memory, state.get(Register::Rsp)).map(u64::from))
+            .map(|value| value.saturating_sub(runtime.mapped_image_base));
+        if matches!(steam_convar_helper_watch, Some("0x14e980")) {
+            runtime.steam_convar_memcpy_watch_this = steam_convar_helper_this_before;
+        }
+        let steam_convar_memcpy_byte_watch = if recent_main_has_cc400 {
+            match block_rva {
+                Some(0x0014_ee9d) => Some("0x14ee9d"),
+                Some(0x0014_eea6) => Some("0x14eea6"),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let steam_convar_memcpy_byte_this_before = steam_convar_memcpy_byte_watch
+            .and(runtime.steam_convar_memcpy_watch_this);
+        let steam_convar_memcpy_byte_vector_ptr_before = steam_convar_memcpy_byte_this_before
+            .and_then(|this_ptr| this_ptr.checked_add(0x84));
+        let steam_convar_memcpy_byte_vector_bytes_before = steam_convar_memcpy_byte_vector_ptr_before
+            .and_then(|vector_ptr| probe_read_window(&memory, vector_ptr, 0x14));
+        let steam_convar_memcpy_return_watch = if recent_main_has_cc400 {
+            match block_rva {
+                Some(0x0014_eeb0) => Some("0x14eeb0"),
+                Some(0x000c_c474) => Some("0xcc474"),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let steam_convar_memcpy_return_this_before = steam_convar_memcpy_return_watch
+            .and(runtime.steam_convar_memcpy_watch_this);
+        let steam_convar_memcpy_return_vector_ptr_before = steam_convar_memcpy_return_this_before
+            .and_then(|this_ptr| this_ptr.checked_add(0x84));
+        let steam_convar_memcpy_return_vector_bytes_before = steam_convar_memcpy_return_vector_ptr_before
+            .and_then(|vector_ptr| probe_read_window(&memory, vector_ptr, 0x14));
+        let trace_steam_vector_grow_request = guest_arch == GuestArch::X86 && block_rva == Some(0x0009_968b);
+        let steam_vector_this_before = trace_steam_vector_grow_request.then_some(state.get(Register::Rdi));
+        let steam_vector_element_size_before = steam_vector_this_before
+            .and_then(|vector_ptr| probe_read_guest_u32(&memory, vector_ptr).map(u64::from));
+        let steam_vector_old_address_before = steam_vector_this_before
+            .and_then(|vector_ptr| probe_read_guest_u32(&memory, vector_ptr + 0x4).map(u64::from));
+        let steam_vector_capacity_before = steam_vector_this_before
+            .and_then(|vector_ptr| probe_read_guest_u32(&memory, vector_ptr + 0x8).map(u64::from));
+        let steam_vector_grow_size_before = steam_vector_this_before
+            .and_then(|vector_ptr| probe_read_guest_u32(&memory, vector_ptr + 0x0c).map(u64::from));
+        let steam_vector_count_before = steam_vector_this_before
+            .and_then(|vector_ptr| probe_read_guest_u32(&memory, vector_ptr + 0x10).map(u64::from));
+        let decode_steam_convar_vector_fields = |bytes: &[u8]| -> BTreeMap<String, Value> {
+            let read_u32_at = |offset: usize| -> u64 {
+                u64::from(u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()))
+            };
+            BTreeMap::from([
+                ("element_size".to_string(), json!(format!("{:#x}", read_u32_at(0)))),
+                ("memory_ptr".to_string(), json!(format!("{:#x}", read_u32_at(4)))),
+                ("allocation_count".to_string(), json!(format!("{:#x}", read_u32_at(8)))),
+                ("grow_size".to_string(), json!(format!("{:#x}", read_u32_at(12)))),
+                ("count".to_string(), json!(format!("{:#x}", read_u32_at(16)))),
+            ])
+        };
+        let steam_convar_precise_watch = if guest_arch == GuestArch::X86 {
+            match block_rva {
+                Some(0x000c_c400) => Some("0xcc400"),
+                Some(0x000c_c447) => Some("0xcc447"),
+                Some(0x000c_c457) => Some("0xcc457"),
+                Some(0x000c_c465) => Some("0xcc465"),
+                Some(0x000c_c474) => Some("0xcc474"),
+                Some(0x000c_c4ac) => Some("0xcc4ac"),
+                Some(0x000c_c514) => Some("0xcc514"),
+                Some(0x000c_c542) => Some("0xcc542"),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let steam_convar_precise_this_before = steam_convar_precise_watch.and_then(|_| {
+            let this_ptr = if block_rva == Some(0x000c_c400) {
+                state.get(Register::Rcx)
+            } else {
+                state.get(Register::Rsi)
+            };
+            (this_ptr != 0).then_some(this_ptr)
+        });
+        let steam_convar_precise_vector_before = steam_convar_precise_this_before
+            .and_then(|this_ptr| this_ptr.checked_add(0x84))
+            .and_then(|vector_ptr| read_window(&memory, vector_ptr, 0x14).ok())
+            .map(|bytes| decode_steam_convar_vector_fields(&bytes));
+        let steam_convar_precise_field_94_before = steam_convar_precise_this_before
+            .and_then(|this_ptr| read_guest_u32(&memory, this_ptr + 0x94).ok().map(u64::from));
         let contains_steam_4013c0 = cached_block
             .translated
             .decoded
@@ -1246,6 +1991,43 @@ pub fn execute_with_options(
             .decoded
             .iter()
             .any(|instruction| instruction.address == 0x402a57);
+        let touches_steam_565af0_helper = guest_arch == GuestArch::X86
+            && cached_block
+                .translated
+                .decoded
+                .iter()
+                .any(|instruction| (steam_565af0_range_start..=steam_565af0_range_end).contains(&instruction.address));
+        let contains_steam_565ac1 = cached_block
+            .translated
+            .decoded
+            .iter()
+            .any(|instruction| instruction.address == steam_565ac1);
+        let contains_steam_565af0 = cached_block
+            .translated
+            .decoded
+            .iter()
+            .any(|instruction| instruction.address == steam_565af0);
+        let contains_steam_565c46 = cached_block
+            .translated
+            .decoded
+            .iter()
+            .any(|instruction| instruction.address == steam_565c46);
+        let watch_steam_adf60_edi_preservation = guest_arch == GuestArch::X86
+            && matches!(block_rva, Some(rva) if (0x000a_df67..=0x000a_e239).contains(&rva));
+        let enter_steam_4dea00 = guest_arch == GuestArch::X86 && block_rva == Some(0x000a_ea00);
+        let watch_steam_4dea00_edi_preservation = guest_arch == GuestArch::X86
+            && matches!(block_rva, Some(rva) if (0x000a_ea09..=0x000a_ec80).contains(&rva));
+        let steam_install_dir_set_edi = guest_arch == GuestArch::X86
+            && cached_block
+                .translated
+                .decoded
+                .iter()
+                .any(|instruction| instruction.address == runtime.mapped_image_base + 0x0005_47c4);
+        let watch_steam_install_dir_edi_preservation = guest_arch == GuestArch::X86
+            && cached_block.translated.decoded.iter().any(|instruction| {
+                let instruction_rva = instruction.address.saturating_sub(runtime.mapped_image_base);
+                (0x0005_47c6..=0x0005_4a33).contains(&instruction_rva)
+            });
         let watched_esi_slot_before = runtime
             .steam_401389_saved_esi_slot_addr
             .and_then(|address| read_guest_u32(&memory, address).ok().map(|value| (address, value)));
@@ -1255,6 +2037,207 @@ pub fn execute_with_options(
                 .decoded
                 .iter()
                 .any(|instruction| (0x401389..=0x4013fc).contains(&instruction.address));
+        if guest_arch == GuestArch::X86 && contains_steam_565af0 {
+            runtime.steam_565af0_recent_blocks.clear();
+        }
+        if enter_steam_4dea00 {
+            runtime.steam_4dea00_expected_edi = Some(state.get(Register::Rdi));
+        } else if guest_arch == GuestArch::X86 && !watch_steam_4dea00_edi_preservation {
+            runtime.steam_4dea00_expected_edi = None;
+        }
+        if watch_steam_4dea00_edi_preservation {
+            if let Some(expected_edi) = runtime.steam_4dea00_expected_edi {
+                let actual_edi = state.get(Register::Rdi);
+                if actual_edi != expected_edi {
+                    return Err(AppError::new(
+                        ReasonCode::RcUnimplInsn,
+                        format!(
+                            "steam 0x4dea00 callee lost edi inside block={block_start_rip:#x}: expected {expected_edi:#x}, actual {actual_edi:#x}, ebp={:#x}",
+                            state.get(Register::Rbp),
+                        ),
+                    )
+                    .with_hint(format!(
+                        "steam-0x4dea00 esp={:#x} return={} eax={:#x} ecx={:#x} edx={:#x}",
+                        state.get(Register::Rsp),
+                        read_guest_u32(&memory, state.get(Register::Rsp))
+                            .ok()
+                            .map(|value| format!("{:#x}", u64::from(value)))
+                            .unwrap_or_else(|| "<unavailable>".to_string()),
+                        state.get(Register::Rax),
+                        state.get(Register::Rcx),
+                        state.get(Register::Rdx),
+                    )));
+                }
+            }
+        }
+        if watch_steam_install_dir_edi_preservation {
+            if let Some(expected_edi) = runtime.steam_install_dir_expected_edi {
+                let actual_edi = state.get(Register::Rdi);
+                if actual_edi != expected_edi {
+                    let decoded_addresses = cached_block
+                        .translated
+                        .decoded
+                        .iter()
+                        .map(|instruction| format!("{:#x}", instruction.address))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    return Err(AppError::new(
+                        ReasonCode::RcUnimplInsn,
+                        format!(
+                            "steam install-dir callee lost edi before block {block_start_rip:#x}: expected {expected_edi:#x}, actual {actual_edi:#x}"
+                        ),
+                    )
+                    .with_hint(format!(
+                        "steam-install-dir block_addrs=[{decoded_addresses}] recent_main_block_rvas=[{}] ebp={:#x} esp={:#x}",
+                        runtime
+                            .recent_main_block_rvas
+                            .iter()
+                            .map(|value| format!("{value:#x}"))
+                            .collect::<Vec<_>>()
+                            .join(","),
+                        state.get(Register::Rbp),
+                        state.get(Register::Rsp),
+                    )));
+                }
+            }
+        }
+        if watch_steam_adf60_edi_preservation {
+            let expected_edi = read_guest_u32(&memory, state.get(Register::Rbp).wrapping_add(12))
+                .ok()
+                .map(u64::from)
+                .unwrap_or(0);
+            let actual_edi = state.get(Register::Rdi);
+            if expected_edi != 0 && actual_edi != expected_edi {
+                return Err(AppError::new(
+                    ReasonCode::RcUnimplInsn,
+                    format!(
+                        "steam 0xadf60 wrapper lost edi before call block={block_start_rip:#x}: expected {expected_edi:#x}, actual {actual_edi:#x}, ebp={:#x}",
+                        state.get(Register::Rbp),
+                    ),
+                )
+                .with_hint(format!(
+                    "steam-0xadf60 frame return={} arg0={} arg1={} arg2={} ecx={:#x} esi={:#x}",
+                    read_guest_u32(&memory, state.get(Register::Rbp).wrapping_add(4))
+                        .ok()
+                        .map(|value| format!("{:#x}", u64::from(value)))
+                        .unwrap_or_else(|| "<unavailable>".to_string()),
+                    read_guest_u32(&memory, state.get(Register::Rbp).wrapping_add(8))
+                        .ok()
+                        .map(|value| format!("{:#x}", u64::from(value)))
+                        .unwrap_or_else(|| "<unavailable>".to_string()),
+                    read_guest_u32(&memory, state.get(Register::Rbp).wrapping_add(12))
+                        .ok()
+                        .map(|value| format!("{:#x}", u64::from(value)))
+                        .unwrap_or_else(|| "<unavailable>".to_string()),
+                    read_guest_u32(&memory, state.get(Register::Rbp).wrapping_add(16))
+                        .ok()
+                        .map(|value| format!("{:#x}", u64::from(value)))
+                        .unwrap_or_else(|| "<unavailable>".to_string()),
+                    state.get(Register::Rcx),
+                    state.get(Register::Rsi),
+                )));
+            }
+        }
+        if touches_steam_565af0_helper {
+            let decoded_addresses = cached_block
+                .translated
+                .decoded
+                .iter()
+                .map(|instruction| format!("{:#x}", instruction.address))
+                .collect::<Vec<_>>()
+                .join(",");
+            let esp = state.get(Register::Rsp);
+            let ebp = state.get(Register::Rbp);
+            let return_addr = read_guest_u32(&memory, esp).ok().map(u64::from);
+            let arg_from_esp = read_guest_u32(&memory, esp + 4).ok().map(u64::from);
+            let arg_from_ebp = read_guest_u32(&memory, ebp.wrapping_add(8)).ok().map(u64::from);
+            let preview_ascii = |pointer: Option<u64>| -> String {
+                let Some(pointer) = pointer else {
+                    return "<unavailable>".to_string();
+                };
+                if pointer == 0 {
+                    return "<null>".to_string();
+                }
+                let mut bytes = Vec::new();
+                for offset in 0..32_u64 {
+                    match memory.read_u8(pointer + offset) {
+                        Ok(0) => break,
+                        Ok(byte) => bytes.push(byte),
+                        Err(_) if bytes.is_empty() => return "<unreadable>".to_string(),
+                        Err(_) => break,
+                    }
+                }
+                bytes
+                    .iter()
+                    .map(|byte| {
+                        if byte.is_ascii_graphic() || *byte == b' ' {
+                            char::from(*byte)
+                        } else {
+                            '.'
+                        }
+                    })
+                    .collect::<String>()
+            };
+            let eax_ascii = preview_ascii(Some(state.get(Register::Rax)));
+            let esp_arg0_ascii = preview_ascii(arg_from_esp);
+            let esi_deref_ascii = preview_ascii(
+                read_guest_u32(&memory, state.get(Register::Rsi))
+                    .ok()
+                    .map(u64::from),
+            );
+            let block_summary = format!(
+                "block_start={block_start_rip:#x} addrs=[{decoded_addresses}] esp={esp:#x} ebp={ebp:#x} eax={:#x} eax_ascii={} ecx={:#x} edx={:#x} esi_deref_ascii={} return_addr={} esp_arg0={} esp_arg0_ascii={} ebp_arg0={} pre_call_eax={}",
+                state.get(Register::Rax),
+                eax_ascii,
+                state.get(Register::Rcx),
+                state.get(Register::Rdx),
+                esi_deref_ascii,
+                return_addr
+                    .map(|value| format!("{value:#x}"))
+                    .unwrap_or_else(|| "<unavailable>".to_string()),
+                arg_from_esp
+                    .map(|value| format!("{value:#x}"))
+                    .unwrap_or_else(|| "<unavailable>".to_string()),
+                esp_arg0_ascii,
+                arg_from_ebp
+                    .map(|value| format!("{value:#x}"))
+                    .unwrap_or_else(|| "<unavailable>".to_string()),
+                if contains_steam_565ac1 {
+                    format!("{:#x}", state.get(Register::Rax))
+                } else {
+                    "<n/a>".to_string()
+                },
+            );
+            if runtime.steam_565af0_recent_blocks.len() == 20 {
+                runtime.steam_565af0_recent_blocks.pop_front();
+            }
+            runtime.steam_565af0_recent_blocks.push_back(block_summary);
+        }
+        if guest_arch == GuestArch::X86 && contains_steam_565c46 {
+            let frame_ebp = state.get(Register::Rbp);
+            let frame_arg0 = read_guest_u32(&memory, frame_ebp.wrapping_add(8))
+                .ok()
+                .map(u64::from)
+                .unwrap_or(0);
+            if frame_arg0 == 0 || read_guest_u32(&memory, frame_arg0).is_err() {
+                let recent_blocks = runtime
+                    .steam_565af0_recent_blocks
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(" || ");
+                return Err(
+                    AppError::new(
+                        ReasonCode::RcUnimplInsn,
+                        format!(
+                            "steam 565c46 entered with invalid arg0 {frame_arg0:#x} (ebp={frame_ebp:#x}, esp={:#x})",
+                            state.get(Register::Rsp),
+                        ),
+                    )
+                    .with_hint(format!("steam-565af0 recent-blocks {recent_blocks}")),
+                );
+            }
+        }
         if guest_arch == GuestArch::X86 && contains_steam_402a57 {
             if let Some(expected_esi) = runtime.steam_401389_expected_esi_after_401434 {
                 let saved_esi = read_guest_u32(&memory, state.get(Register::Rbp).wrapping_sub(0x2b8))
@@ -1292,9 +2275,19 @@ pub fn execute_with_options(
             &state,
             test_id,
         )?;
-        let _ = engine
-            .execute_ir_without_memory_hash(&mut state, &mut memory, &cached_block.translated.ir)
-            .map_err(|error| {
+        // DEBUG: log block being executed
+        if guest_arch == GuestArch::X86 && steps < 10 {
+            eprintln!("steam-exec-block steps={steps} rip={:#x} block_rva={block_rva:#x?}", state.rip);
+        }
+        let continue_after_execute = match runtime.execute_ir_with_guest_exception_delivery(
+            &engine,
+            &mut state,
+            &mut memory,
+            &cached_block.translated.ir,
+            test_id,
+        ) {
+            Ok(should_continue) => should_continue,
+            Err(error) => {
                 let mut wrapped = annotate_guest_fault(error, &memory, &state);
                 if !runtime.steam_401389_recent_blocks.is_empty() {
                     wrapped = wrapped.with_hint(format!(
@@ -1310,8 +2303,1021 @@ pub fn execute_with_options(
                 if let Some(block) = runtime.steam_401389_first_over_0x1000.as_deref() {
                     wrapped = wrapped.with_hint(format!("steam-401389 first-over-0x1000 {block}"));
                 }
-                wrapped
-            })?;
+                if let Some(mode) = runtime.configured_narrow_argv_mode {
+                    wrapped = wrapped.with_hint(format!("crt-configure-narrow-argv mode={mode:#x}"));
+                }
+                if !runtime.module_paths_by_handle.is_empty() {
+                    wrapped = wrapped.with_hint(format!(
+                        "loaded-modules {}",
+                        runtime
+                            .module_paths_by_handle
+                            .iter()
+                            .map(|(handle, path)| format!("{handle:#x}={path}"))
+                            .collect::<Vec<_>>()
+                            .join(" || ")
+                    ));
+                }
+                if !runtime.steam_565af0_recent_blocks.is_empty() {
+                    wrapped = wrapped.with_hint(format!(
+                        "steam-565af0 recent-blocks {}",
+                        runtime
+                            .steam_565af0_recent_blocks
+                            .iter()
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(" || ")
+                    ));
+                }
+                return Err(wrapped);
+            }
+        };
+        if let Some(block_label) = steam_convar_precise_watch {
+            let decoded_instructions = cached_block
+                .translated
+                .decoded
+                .iter()
+                .map(|instruction| {
+                    format!(
+                        "{:#x}:{:?} {:?}",
+                        instruction.address.saturating_sub(runtime.mapped_image_base),
+                        instruction.opcode,
+                        instruction.operands
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" | ");
+            let steam_convar_precise_vector_after = steam_convar_precise_this_before
+                .and_then(|this_ptr| this_ptr.checked_add(0x84))
+                .and_then(|vector_ptr| read_window(&memory, vector_ptr, 0x14).ok())
+                .map(|bytes| decode_steam_convar_vector_fields(&bytes));
+            let steam_convar_precise_field_94_after = steam_convar_precise_this_before
+                .and_then(|this_ptr| read_guest_u32(&memory, this_ptr + 0x94).ok().map(u64::from));
+            runtime.push_trace(
+                "process",
+                "SteamConVarVectorState",
+                BTreeMap::from([
+                    ("block_rva".to_string(), json!(block_label)),
+                    (
+                        "this_ptr".to_string(),
+                        json!(steam_convar_precise_this_before.map(|value| format!("{value:#x}"))),
+                    ),
+                    (
+                        "field_0x94_before".to_string(),
+                        json!(steam_convar_precise_field_94_before.map(|value| format!("{value:#x}"))),
+                    ),
+                    (
+                        "field_0x94_after".to_string(),
+                        json!(steam_convar_precise_field_94_after.map(|value| format!("{value:#x}"))),
+                    ),
+                    ("vector_before".to_string(), json!(steam_convar_precise_vector_before)),
+                    ("vector_after".to_string(), json!(steam_convar_precise_vector_after)),
+                    (
+                        "recent_main_block_rvas".to_string(),
+                        json!(runtime.recent_main_block_rvas.iter().map(|value| format!("{value:#x}")).collect::<Vec<_>>()),
+                    ),
+                ]),
+                json!(decoded_instructions),
+            );
+        }
+        if let Some(steam_global_state_before) = steam_global_state_before {
+            for (address, before_value) in steam_global_state_before {
+                let after_value = probe_read_guest_u32(&memory, address);
+                if after_value != before_value {
+                    eprintln!(
+                        "steam-global-write block_rva={} address={} before={} after={} rip_after={:#x}",
+                        block_rva
+                            .map(|value| format!("{value:#x}"))
+                            .unwrap_or_else(|| "<non-main>".to_string()),
+                        format!("{:#x}", address.saturating_sub(runtime.mapped_image_base)),
+                        before_value
+                            .map(|value| format!("{value:#x}"))
+                            .unwrap_or_else(|| "<unmapped>".to_string()),
+                        after_value
+                            .map(|value| format!("{value:#x}"))
+                            .unwrap_or_else(|| "<unmapped>".to_string()),
+                        state.rip.saturating_sub(runtime.mapped_image_base),
+                    );
+                }
+            }
+        }
+        if continue_after_execute {
+            continue;
+        }
+        if let Some(final_assert_globals_before) = final_assert_globals_before {
+            for (address, before_value) in final_assert_globals_before {
+                let after_value = probe_read_guest_u32(&memory, address);
+                if after_value != before_value {
+                    let stack_return_addr = probe_read_guest_u32(&memory, state.get(Register::Rsp)).map(u64::from);
+                    let decoded_instructions = cached_block
+                        .translated
+                        .decoded
+                        .iter()
+                        .map(|instruction| {
+                            format!(
+                                "{:#x}:{:?} {:?}",
+                                instruction.address.saturating_sub(runtime.mapped_image_base),
+                                instruction.opcode,
+                                instruction.operands
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" | ");
+                    let history_entry = format!(
+                        "addr={:#x} block_rva={} return_rva={} before={} after={} decoded=[{}]",
+                        address.saturating_sub(runtime.mapped_image_base),
+                        block_rva
+                            .map(|value| format!("{value:#x}"))
+                            .unwrap_or_else(|| "<non-main>".to_string()),
+                        stack_return_addr
+                            .map(|value| format!("{value:#x}"))
+                            .unwrap_or_else(|| "<unavailable>".to_string()),
+                        before_value
+                            .map(|value| format!("{value:#x}"))
+                            .unwrap_or_else(|| "<unmapped>".to_string()),
+                        after_value
+                            .map(|value| format!("{value:#x}"))
+                            .unwrap_or_else(|| "<unmapped>".to_string()),
+                        decoded_instructions,
+                    );
+                    if runtime.steam_final_assert_global_history.len() == 20 {
+                        runtime.steam_final_assert_global_history.pop_front();
+                    }
+                    runtime.steam_final_assert_global_history.push_back(history_entry);
+                    runtime.push_trace(
+                        "process",
+                        "SteamFinalAssertGlobalWrite",
+                        BTreeMap::from([
+                            (
+                                "address".to_string(),
+                                json!(format!("{:#x}", address.saturating_sub(runtime.mapped_image_base))),
+                            ),
+                            (
+                                "block_rva".to_string(),
+                                json!(block_rva.map(|value| format!("{value:#x}")).unwrap_or_else(|| "<non-main>".to_string())),
+                            ),
+                            ("return_rva".to_string(), json!(stack_return_addr)),
+                            (
+                                "before".to_string(),
+                                json!(before_value.map(|value| format!("{value:#x}")).unwrap_or_else(|| "<unmapped>".to_string())),
+                            ),
+                            (
+                                "after".to_string(),
+                                json!(after_value.map(|value| format!("{value:#x}")).unwrap_or_else(|| "<unmapped>".to_string())),
+                            ),
+                            (
+                                "recent_main_block_rvas".to_string(),
+                                json!(runtime.recent_main_block_rvas.iter().map(|value| format!("{value:#x}")).collect::<Vec<_>>()),
+                            ),
+                        ]),
+                        json!(decoded_instructions),
+                    );
+                    if after_value == Some(0x8000_000d) {
+                        runtime.push_trace(
+                            "process",
+                            "SteamFinalStatusCode",
+                            BTreeMap::from([
+                                (
+                                    "address".to_string(),
+                                    json!(format!("{:#x}", address.saturating_sub(runtime.mapped_image_base))),
+                                ),
+                                (
+                                    "block_rva".to_string(),
+                                    json!(block_rva.map(|value| format!("{value:#x}")).unwrap_or_else(|| "<non-main>".to_string())),
+                                ),
+                                ("return_rva".to_string(), json!(stack_return_addr)),
+                                (
+                                    "before".to_string(),
+                                    json!(before_value.map(|value| format!("{value:#x}")).unwrap_or_else(|| "<unmapped>".to_string())),
+                                ),
+                                (
+                                    "after".to_string(),
+                                    json!(after_value.map(|value| format!("{value:#x}")).unwrap_or_else(|| "<unmapped>".to_string())),
+                                ),
+                                (
+                                    "recent_main_block_rvas".to_string(),
+                                    json!(runtime.recent_main_block_rvas.iter().map(|value| format!("{value:#x}")).collect::<Vec<_>>()),
+                                ),
+                            ]),
+                            json!(decoded_instructions),
+                        );
+                    }
+                }
+            }
+        }
+        if trace_steam_136b50_entry {
+            let decoded_instructions = cached_block
+                .translated
+                .decoded
+                .iter()
+                .map(|instruction| {
+                    format!(
+                        "{:#x}:{:?} {:?}",
+                        instruction.address.saturating_sub(runtime.mapped_image_base),
+                        instruction.opcode,
+                        instruction.operands
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" | ");
+            let format_opt = |value: Option<u64>| {
+                value
+                    .map(|value| format!("{value:#x}"))
+                    .unwrap_or_else(|| "<unavailable>".to_string())
+            };
+            runtime.push_trace(
+                "process",
+                "SteamLateGate136b50Entry",
+                BTreeMap::from([
+                    ("block_rva".to_string(), json!("0x136b50")),
+                    ("arg0".to_string(), json!(format_opt(steam_136b50_arg0_before))),
+                    ("arg1".to_string(), json!(format_opt(steam_136b50_arg1_before))),
+                    (
+                        "global_0x423fbc_before".to_string(),
+                        json!(format_opt(steam_136b50_global_423fbc_before)),
+                    ),
+                    (
+                        "global_0x423fb8_before".to_string(),
+                        json!(format_opt(steam_136b50_global_423fb8_before)),
+                    ),
+                    (
+                        "global_0x423a30_before".to_string(),
+                        json!(format_opt(steam_136b50_global_423a30_before)),
+                    ),
+                    (
+                        "global_0x423a38_before".to_string(),
+                        json!(format_opt(steam_136b50_global_423a38_before)),
+                    ),
+                    ("eax_after".to_string(), json!(format!("{:#x}", state.get(Register::Rax)))),
+                    ("rip_after".to_string(), json!(format!("{:#x}", state.rip.saturating_sub(runtime.mapped_image_base)))),
+                    (
+                        "recent_main_block_rvas".to_string(),
+                        json!(runtime.recent_main_block_rvas.iter().map(|value| format!("{value:#x}")).collect::<Vec<_>>()),
+                    ),
+                ]),
+                json!(decoded_instructions),
+            );
+        }
+        if trace_steam_136e80_entry {
+            let decoded_instructions = cached_block
+                .translated
+                .decoded
+                .iter()
+                .map(|instruction| {
+                    format!(
+                        "{:#x}:{:?} {:?}",
+                        instruction.address.saturating_sub(runtime.mapped_image_base),
+                        instruction.opcode,
+                        instruction.operands
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" | ");
+            let format_opt = |value: Option<u64>| {
+                value
+                    .map(|value| format!("{value:#x}"))
+                    .unwrap_or_else(|| "<unavailable>".to_string())
+            };
+            let args_before = steam_136e80_args_before.unwrap_or([None, None, None, None, None]);
+            runtime.push_trace(
+                "process",
+                "SteamLateGate136e80Entry",
+                BTreeMap::from([
+                    ("block_rva".to_string(), json!("0x136e80")),
+                    ("arg0".to_string(), json!(format_opt(args_before[0]))),
+                    ("arg1".to_string(), json!(format_opt(args_before[1]))),
+                    ("arg2".to_string(), json!(format_opt(args_before[2]))),
+                    ("arg3".to_string(), json!(format_opt(args_before[3]))),
+                    ("arg4".to_string(), json!(format_opt(args_before[4]))),
+                    (
+                        "global_0x423e4c_before".to_string(),
+                        json!(format_opt(steam_136e80_global_423e4c_before)),
+                    ),
+                    (
+                        "global_0x423e6c_before".to_string(),
+                        json!(format_opt(steam_136e80_global_423e6c_before)),
+                    ),
+                    (
+                        "tls_index_before".to_string(),
+                        json!(format_opt(steam_136e80_tls_index_before)),
+                    ),
+                    (
+                        "tls_vector_before".to_string(),
+                        json!(format_opt(steam_136e80_tls_vector_before)),
+                    ),
+                    (
+                        "tls_slot_before".to_string(),
+                        json!(format_opt(steam_136e80_tls_slot_before)),
+                    ),
+                    (
+                        "tls_slot_plus_0x480_before".to_string(),
+                        json!(format_opt(steam_136e80_tls_slot_480_before)),
+                    ),
+                    ("eax_after".to_string(), json!(format!("{:#x}", state.get(Register::Rax)))),
+                    ("rip_after".to_string(), json!(format!("{:#x}", state.rip.saturating_sub(runtime.mapped_image_base)))),
+                    (
+                        "recent_main_block_rvas".to_string(),
+                        json!(runtime.recent_main_block_rvas.iter().map(|value| format!("{value:#x}")).collect::<Vec<_>>()),
+                    ),
+                ]),
+                json!(decoded_instructions),
+            );
+        }
+        if trace_steam_memstd_oom_entry {
+            let decoded_instructions = cached_block
+                .translated
+                .decoded
+                .iter()
+                .map(|instruction| {
+                    format!(
+                        "{:#x}:{:?} {:?}",
+                        instruction.address.saturating_sub(runtime.mapped_image_base),
+                        instruction.opcode,
+                        instruction.operands
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" | ");
+            let format_opt = |value: Option<u64>| {
+                value
+                    .map(|value| format!("{value:#x}"))
+                    .unwrap_or_else(|| "<unavailable>".to_string())
+            };
+            runtime.push_trace(
+                "process",
+                "SteamMemstdOomEntry",
+                BTreeMap::from([
+                    ("block_rva".to_string(), json!("0x134bd0")),
+                    (
+                        "caller_rva".to_string(),
+                        json!(steam_memstd_oom_return_rva_before
+                            .map(|value| format!("{value:#x}"))
+                            .unwrap_or_else(|| "<unavailable>".to_string())),
+                    ),
+                    (
+                        "requested_size".to_string(),
+                        json!(format_opt(steam_memstd_oom_size_before)),
+                    ),
+                    (
+                        "this_ptr".to_string(),
+                        json!(format_opt(steam_memstd_oom_this_before)),
+                    ),
+                    ("eax_after".to_string(), json!(format!("{:#x}", state.get(Register::Rax)))),
+                    ("rip_after".to_string(), json!(format!("{:#x}", state.rip.saturating_sub(runtime.mapped_image_base)))),
+                    (
+                        "recent_main_block_rvas".to_string(),
+                        json!(runtime.recent_main_block_rvas.iter().map(|value| format!("{value:#x}")).collect::<Vec<_>>()),
+                    ),
+                ]),
+                json!(decoded_instructions),
+            );
+        }
+        if trace_steam_memstd_oom_caller {
+            let decoded_instructions = cached_block
+                .translated
+                .decoded
+                .iter()
+                .map(|instruction| {
+                    format!(
+                        "{:#x}:{:?} {:?}",
+                        instruction.address.saturating_sub(runtime.mapped_image_base),
+                        instruction.opcode,
+                        instruction.operands
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" | ");
+            let format_opt = |value: Option<u64>| {
+                value
+                    .map(|value| format!("{value:#x}"))
+                    .unwrap_or_else(|| "<unavailable>".to_string())
+            };
+            runtime.push_trace(
+                "process",
+                "SteamMemstdOomCaller",
+                BTreeMap::from([
+                    ("block_rva".to_string(), json!("0x134b56")),
+                    (
+                        "this_ptr".to_string(),
+                        json!(format_opt(steam_memstd_caller_this_before)),
+                    ),
+                    (
+                        "old_address".to_string(),
+                        json!(format_opt(steam_memstd_caller_old_address_before)),
+                    ),
+                    (
+                        "requested_size".to_string(),
+                        json!(format_opt(steam_memstd_caller_requested_size_before)),
+                    ),
+                    (
+                        "mode".to_string(),
+                        json!(format_opt(steam_memstd_caller_mode_before)),
+                    ),
+                    (
+                        "range1_table".to_string(),
+                        json!(format_opt(steam_memstd_caller_range1_table_before)),
+                    ),
+                    (
+                        "range2_table".to_string(),
+                        json!(format_opt(steam_memstd_caller_range2_table_before)),
+                    ),
+                    (
+                        "recent_main_block_rvas".to_string(),
+                        json!(runtime.recent_main_block_rvas.iter().map(|value| format!("{value:#x}")).collect::<Vec<_>>()),
+                    ),
+                ]),
+                json!(decoded_instructions),
+            );
+        }
+        if steam_global_array_watch {
+            let decoded_instructions = cached_block
+                .translated
+                .decoded
+                .iter()
+                .map(|instruction| {
+                    format!(
+                        "{:#x}:{:?} {:?}",
+                        instruction.address.saturating_sub(runtime.mapped_image_base),
+                        instruction.opcode,
+                        instruction.operands
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" | ");
+            let format_opt = |value: Option<u64>| {
+                value
+                    .map(|value| format!("{value:#x}"))
+                    .unwrap_or_else(|| "<unavailable>".to_string())
+            };
+            let steam_global_array_count_after = probe_read_guest_u32(&memory, runtime.mapped_image_base + 0x0045_7624)
+                .map(u64::from);
+            let steam_global_array_ptr_after = probe_read_guest_u32(&memory, runtime.mapped_image_base + 0x0045_7628)
+                .map(u64::from);
+            eprintln!(
+                "steam-global-array-lifecycle block_rva={} return_rva={} count_before={} ptr_before={} count_after={} ptr_after={} eax_after={:#x} esi_after={:#x} edi_after={:#x} esp_after={:#x}",
+                block_rva
+                    .map(|value| format!("{value:#x}"))
+                    .unwrap_or_else(|| "<non-main>".to_string()),
+                steam_global_array_return_before
+                    .map(|value| format!("{value:#x}"))
+                    .unwrap_or_else(|| "<unavailable>".to_string()),
+                format_opt(steam_global_array_count_before),
+                format_opt(steam_global_array_ptr_before),
+                format_opt(steam_global_array_count_after),
+                format_opt(steam_global_array_ptr_after),
+                state.get(Register::Rax),
+                state.get(Register::Rsi),
+                state.get(Register::Rdi),
+                state.get(Register::Rsp),
+            );
+            runtime.push_trace(
+                "process",
+                "SteamGlobalArrayLifecycle",
+                BTreeMap::from([
+                    (
+                        "block_rva".to_string(),
+                        json!(block_rva
+                            .map(|value| format!("{value:#x}"))
+                            .unwrap_or_else(|| "<non-main>".to_string())),
+                    ),
+                    (
+                        "return_rva".to_string(),
+                        json!(steam_global_array_return_before
+                            .map(|value| format!("{value:#x}"))
+                            .unwrap_or_else(|| "<unavailable>".to_string())),
+                    ),
+                    (
+                        "count_before".to_string(),
+                        json!(format_opt(steam_global_array_count_before)),
+                    ),
+                    (
+                        "ptr_before".to_string(),
+                        json!(format_opt(steam_global_array_ptr_before)),
+                    ),
+                    (
+                        "count_after".to_string(),
+                        json!(format_opt(steam_global_array_count_after)),
+                    ),
+                    (
+                        "ptr_after".to_string(),
+                        json!(format_opt(steam_global_array_ptr_after)),
+                    ),
+                    ("eax_after".to_string(), json!(format!("{:#x}", state.get(Register::Rax)))),
+                    ("esi_after".to_string(), json!(format!("{:#x}", state.get(Register::Rsi)))),
+                    ("edi_after".to_string(), json!(format!("{:#x}", state.get(Register::Rdi)))),
+                    ("esp_after".to_string(), json!(format!("{:#x}", state.get(Register::Rsp)))),
+                ]),
+                json!(decoded_instructions),
+            );
+        }
+        if steam_early_termination_watch {
+            eprintln!(
+                "steam-early-termination block_rva={} return_rva={} eax_before={:#x} ebx_before={:#x} esi_before={:#x} edi_before={:#x} esp_before={:#x}",
+                block_rva
+                    .map(|value| format!("{value:#x}"))
+                    .unwrap_or_else(|| "<non-main>".to_string()),
+                steam_early_termination_return_before
+                    .map(|value| format!("{value:#x}"))
+                    .unwrap_or_else(|| "<unavailable>".to_string()),
+                state.get(Register::Rax),
+                state.get(Register::Rbx),
+                state.get(Register::Rsi),
+                state.get(Register::Rdi),
+                state.get(Register::Rsp),
+            );
+        }
+        if steam_initterm_e_watch {
+            eprintln!(
+                "steam-initterm-e block_rva={} start={} end={} esi_after={:#x} edi_after={:#x} eax_after={:#x}",
+                block_rva
+                    .map(|value| format!("{value:#x}"))
+                    .unwrap_or_else(|| "<non-main>".to_string()),
+                steam_initterm_e_start_before
+                    .map(|value| format!("{:#x}", value.saturating_sub(runtime.mapped_image_base)))
+                    .unwrap_or_else(|| "<unavailable>".to_string()),
+                steam_initterm_e_end_before
+                    .map(|value| format!("{:#x}", value.saturating_sub(runtime.mapped_image_base)))
+                    .unwrap_or_else(|| "<unavailable>".to_string()),
+                state.get(Register::Rsi),
+                state.get(Register::Rdi),
+                state.get(Register::Rax),
+            );
+        }
+        if steam_startup_init_watch {
+            eprintln!(
+                "steam-startup-init block_rva={} eax_after={:#x} ecx_after={:#x} state_0x45715c={} rsp_after={:#x}",
+                block_rva
+                    .map(|value| format!("{value:#x}"))
+                    .unwrap_or_else(|| "<non-main>".to_string()),
+                state.get(Register::Rax),
+                state.get(Register::Rcx),
+                probe_read_guest_u32(&memory, runtime.mapped_image_base + 0x0045_715c)
+                    .map(|value| format!("{value:#x}"))
+                    .unwrap_or_else(|| "<unavailable>".to_string()),
+                state.get(Register::Rsp),
+            );
+        }
+        if steam_startup_failure_watch {
+            eprintln!(
+                "steam-startup-failure block_rva={} eax_after={:#x} esi_after={:#x} state_0x45715c={} rsp_after={:#x}",
+                block_rva
+                    .map(|value| format!("{value:#x}"))
+                    .unwrap_or_else(|| "<non-main>".to_string()),
+                state.get(Register::Rax),
+                state.get(Register::Rsi),
+                probe_read_guest_u32(&memory, runtime.mapped_image_base + 0x0045_715c)
+                    .map(|value| format!("{value:#x}"))
+                    .unwrap_or_else(|| "<unavailable>".to_string()),
+                state.get(Register::Rsp),
+            );
+        }
+        if let Some((entry, callback, unwind)) = steam_callback_walk_entry_before {
+            let get_process_heap_slot = runtime.mapped_image_base + 0x002e_230c;
+            let get_process_heap_target = if callback == Some(runtime.mapped_image_base + 0x0016_b18c) {
+                read_guest_pointer(&memory, get_process_heap_slot, runtime.guest_arch).ok()
+            } else {
+                None
+            };
+            let get_process_heap_binding = get_process_heap_target.and_then(|target| {
+                runtime
+                    .host_thunks
+                    .get(&target)
+                    .map(|thunk| format!("{thunk:?}"))
+            });
+            eprintln!(
+                "steam-callback-walk entry={:#x} callback={} unwind={} al_after={:#x} next_rva={:#x} get_process_heap_target={} get_process_heap_binding={}",
+                entry,
+                callback
+                    .map(|value| format!("{value:#x}"))
+                    .unwrap_or_else(|| "<unavailable>".to_string()),
+                unwind
+                    .map(|value| format!("{value:#x}"))
+                    .unwrap_or_else(|| "<unavailable>".to_string()),
+                state.get(Register::Rax) & 0xff,
+                state.rip.saturating_sub(runtime.mapped_image_base),
+                get_process_heap_target
+                    .map(|value| format!("{value:#x}"))
+                    .unwrap_or_else(|| "<n/a>".to_string()),
+                get_process_heap_binding.unwrap_or_else(|| "<n/a>".to_string()),
+            );
+        }
+        if steam_post_577113_watch {
+            eprintln!(
+                "steam-post-577113 block_rva={} eax={:#x} esi={:#x} edi={:#x} arg_obj={} heap_handle={} rsp={:#x}",
+                block_rva
+                    .map(|value| format!("{value:#x}"))
+                    .unwrap_or_else(|| "<non-main>".to_string()),
+                state.get(Register::Rax),
+                state.get(Register::Rsi),
+                state.get(Register::Rdi),
+                probe_read_guest_u32(&memory, state.get(Register::Rbp) + 0x10)
+                    .map(|value| format!("{value:#x}"))
+                    .unwrap_or_else(|| "<unavailable>".to_string()),
+                probe_read_guest_u32(&memory, runtime.mapped_image_base + 0x0045_7664)
+                    .map(|value| format!("{value:#x}"))
+                    .unwrap_or_else(|| "<unavailable>".to_string()),
+                state.get(Register::Rsp),
+            );
+        }
+        if steam_post_56ee10_watch {
+            eprintln!(
+                "steam-post-56ee10 eax={:#x} edi={:#x} heap_handle={} rsp={:#x}",
+                state.get(Register::Rax),
+                state.get(Register::Rdi),
+                probe_read_guest_u32(&memory, runtime.mapped_image_base + 0x0045_7664)
+                    .map(|value| format!("{value:#x}"))
+                    .unwrap_or_else(|| "<unavailable>".to_string()),
+                state.get(Register::Rsp),
+            );
+        }
+        if steam_post_576ca8_watch || steam_post_576d7e_watch {
+            eprintln!(
+                "steam-post-helper block_rva={} rsp={:#x} stack0={} stack1={} stack2={} edi={:#x} esi={:#x} ebx={:#x}",
+                block_rva
+                    .map(|value| format!("{value:#x}"))
+                    .unwrap_or_else(|| "<non-main>".to_string()),
+                state.get(Register::Rsp),
+                probe_read_guest_u32(&memory, state.get(Register::Rsp))
+                    .map(|value| format!("{value:#x}"))
+                    .unwrap_or_else(|| "<unavailable>".to_string()),
+                probe_read_guest_u32(&memory, state.get(Register::Rsp) + 4)
+                    .map(|value| format!("{value:#x}"))
+                    .unwrap_or_else(|| "<unavailable>".to_string()),
+                probe_read_guest_u32(&memory, state.get(Register::Rsp) + 8)
+                    .map(|value| format!("{value:#x}"))
+                    .unwrap_or_else(|| "<unavailable>".to_string()),
+                state.get(Register::Rdi),
+                state.get(Register::Rsi),
+                state.get(Register::Rbx),
+            );
+        }
+        if let Some((rsp_before, stack0, stack1, stack2, stack3, edi_before, esi_before)) =
+            steam_577113_epilogue_before
+        {
+            eprintln!(
+                "steam-577113-epilogue rsp_before={:#x} stack0={} stack1={} stack2={} stack3={} edi_before={:#x} esi_before={:#x} rsp_after={:#x} edi_after={:#x} esi_after={:#x}",
+                rsp_before,
+                stack0
+                    .map(|value| format!("{value:#x}"))
+                    .unwrap_or_else(|| "<unavailable>".to_string()),
+                stack1
+                    .map(|value| format!("{value:#x}"))
+                    .unwrap_or_else(|| "<unavailable>".to_string()),
+                stack2
+                    .map(|value| format!("{value:#x}"))
+                    .unwrap_or_else(|| "<unavailable>".to_string()),
+                stack3
+                    .map(|value| format!("{value:#x}"))
+                    .unwrap_or_else(|| "<unavailable>".to_string()),
+                edi_before,
+                esi_before,
+                state.get(Register::Rsp),
+                state.get(Register::Rdi),
+                state.get(Register::Rsi),
+            );
+        }
+        if let Some(saved_edi_before) = steam_saved_edi_slot_before {
+            let saved_edi_after = probe_read_guest_u32(&memory, 0x7000_ff1c).map(u64::from);
+            if saved_edi_after != Some(saved_edi_before) {
+                eprintln!(
+                    "steam-saved-edi-slot-write block_rva={} before={:#x} after={} rsp_after={:#x} rbp_after={:#x}",
+                    block_rva
+                        .map(|value| format!("{value:#x}"))
+                        .unwrap_or_else(|| "<non-main>".to_string()),
+                    saved_edi_before,
+                    saved_edi_after
+                        .map(|value| format!("{value:#x}"))
+                        .unwrap_or_else(|| "<unavailable>".to_string()),
+                    state.get(Register::Rsp),
+                    state.get(Register::Rbp),
+                );
+            }
+        }
+        if trace_steam_convar_create || trace_steam_convar_create_start {
+            let decoded_instructions = cached_block
+                .translated
+                .decoded
+                .iter()
+                .map(|instruction| {
+                    format!(
+                        "{:#x}:{:?} {:?}",
+                        instruction.address.saturating_sub(runtime.mapped_image_base),
+                        instruction.opcode,
+                        instruction.operands
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" | ");
+            let format_opt = |value: Option<u64>| {
+                value
+                    .map(|value| format!("{value:#x}"))
+                    .unwrap_or_else(|| "<unavailable>".to_string())
+            };
+            let read_c_string_opt = |ptr: Option<u64>| {
+                ptr.and_then(|ptr| {
+                    if ptr == 0 {
+                        Some(String::new())
+                    } else {
+                        read_c_string(&memory, ptr).ok()
+                    }
+                })
+                .unwrap_or_else(|| "<unavailable>".to_string())
+            };
+            let vector_fields = steam_convar_vector_bytes_before.map(|bytes| {
+                let read_u32_at = |offset: usize| -> u64 {
+                    u64::from(u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()))
+                };
+                BTreeMap::from([
+                    ("element_size".to_string(), json!(format!("{:#x}", read_u32_at(0)))),
+                    ("memory_ptr".to_string(), json!(format!("{:#x}", read_u32_at(4)))),
+                    ("allocation_count".to_string(), json!(format!("{:#x}", read_u32_at(8)))),
+                    ("grow_size".to_string(), json!(format!("{:#x}", read_u32_at(12)))),
+                    ("count".to_string(), json!(format!("{:#x}", read_u32_at(16)))),
+                ])
+            });
+            let mut parameters = BTreeMap::from([
+                (
+                    "block_rva".to_string(),
+                    json!(if trace_steam_convar_create_start { "0xcc400" } else { "0xcc542" }),
+                ),
+                ("this_ptr".to_string(), json!(format_opt(steam_convar_this_before))),
+                ("frame_ptr".to_string(), json!(format_opt(steam_convar_frame_before))),
+                ("name_ptr".to_string(), json!(format_opt(steam_convar_name_ptr_before))),
+                ("name".to_string(), json!(read_c_string_opt(steam_convar_name_ptr_before))),
+                ("flags".to_string(), json!(format_opt(steam_convar_flags_before))),
+                ("help_ptr".to_string(), json!(format_opt(steam_convar_help_ptr_before))),
+                ("help".to_string(), json!(read_c_string_opt(steam_convar_help_ptr_before))),
+                ("parent_ptr".to_string(), json!(format_opt(steam_convar_parent_ptr_before))),
+                ("callback_ptr".to_string(), json!(format_opt(steam_convar_callback_ptr_before))),
+                ("vector_ptr".to_string(), json!(format_opt(steam_convar_vector_ptr_before))),
+                (
+                    "recent_main_block_rvas".to_string(),
+                    json!(runtime.recent_main_block_rvas.iter().map(|value| format!("{value:#x}")).collect::<Vec<_>>()),
+                ),
+            ]);
+            if let Some(vector_fields) = vector_fields {
+                parameters.insert("vector_fields".to_string(), json!(vector_fields));
+            }
+            runtime.push_trace(
+                "process",
+                if trace_steam_convar_create_start {
+                    "SteamConVarCreateStart"
+                } else {
+                    "SteamConVarCreateEntry"
+                },
+                parameters,
+                json!(decoded_instructions),
+            );
+        }
+        if let Some(helper_rva) = steam_convar_helper_watch {
+            let decoded_instructions = cached_block
+                .translated
+                .decoded
+                .iter()
+                .map(|instruction| {
+                    format!(
+                        "{:#x}:{:?} {:?}",
+                        instruction.address.saturating_sub(runtime.mapped_image_base),
+                        instruction.opcode,
+                        instruction.operands
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" | ");
+            let format_opt = |value: Option<u64>| {
+                value
+                    .map(|value| format!("{value:#x}"))
+                    .unwrap_or_else(|| "<unavailable>".to_string())
+            };
+            let vector_fields = steam_convar_helper_vector_bytes_before.map(|bytes| {
+                let read_u32_at = |offset: usize| -> u64 {
+                    u64::from(u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()))
+                };
+                BTreeMap::from([
+                    ("element_size".to_string(), json!(format!("{:#x}", read_u32_at(0)))),
+                    ("memory_ptr".to_string(), json!(format!("{:#x}", read_u32_at(4)))),
+                    ("allocation_count".to_string(), json!(format!("{:#x}", read_u32_at(8)))),
+                    ("grow_size".to_string(), json!(format!("{:#x}", read_u32_at(12)))),
+                    ("count".to_string(), json!(format!("{:#x}", read_u32_at(16)))),
+                ])
+            });
+            let mut parameters = BTreeMap::from([
+                ("helper_rva".to_string(), json!(helper_rva)),
+                ("this_ptr".to_string(), json!(format_opt(steam_convar_helper_this_before))),
+                (
+                    "vector_ptr".to_string(),
+                    json!(format_opt(steam_convar_helper_vector_ptr_before)),
+                ),
+                ("arg0".to_string(), json!(format_opt(steam_convar_helper_arg0_before))),
+                ("arg1".to_string(), json!(format_opt(steam_convar_helper_arg1_before))),
+                ("arg2".to_string(), json!(format_opt(steam_convar_helper_arg2_before))),
+                (
+                    "return_rva".to_string(),
+                    json!(steam_convar_helper_return_before
+                        .map(|value| format!("{value:#x}"))
+                        .unwrap_or_else(|| "<unavailable>".to_string())),
+                ),
+                (
+                    "recent_main_block_rvas".to_string(),
+                    json!(runtime.recent_main_block_rvas.iter().map(|value| format!("{value:#x}")).collect::<Vec<_>>()),
+                ),
+            ]);
+            if let Some(vector_fields) = vector_fields {
+                parameters.insert("vector_fields".to_string(), json!(vector_fields));
+            }
+            runtime.push_trace(
+                "process",
+                "SteamConVarHelperEntry",
+                parameters,
+                json!(decoded_instructions),
+            );
+        }
+        if let Some(block_label) = steam_convar_memcpy_byte_watch {
+            let decoded_instructions = cached_block
+                .translated
+                .decoded
+                .iter()
+                .map(|instruction| {
+                    format!(
+                        "{:#x}:{:?} {:?}",
+                        instruction.address.saturating_sub(runtime.mapped_image_base),
+                        instruction.opcode,
+                        instruction.operands
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" | ");
+            let format_opt = |value: Option<u64>| {
+                value
+                    .map(|value| format!("{value:#x}"))
+                    .unwrap_or_else(|| "<unavailable>".to_string())
+            };
+            let vector_fields = steam_convar_memcpy_byte_vector_bytes_before.map(|bytes| {
+                let read_u32_at = |offset: usize| -> u64 {
+                    u64::from(u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()))
+                };
+                BTreeMap::from([
+                    ("element_size".to_string(), json!(format!("{:#x}", read_u32_at(0)))),
+                    ("memory_ptr".to_string(), json!(format!("{:#x}", read_u32_at(4)))),
+                    ("allocation_count".to_string(), json!(format!("{:#x}", read_u32_at(8)))),
+                    ("grow_size".to_string(), json!(format!("{:#x}", read_u32_at(12)))),
+                    ("count".to_string(), json!(format!("{:#x}", read_u32_at(16)))),
+                ])
+            });
+            let mut parameters = BTreeMap::from([
+                ("block_rva".to_string(), json!(block_label)),
+                ("this_ptr".to_string(), json!(format_opt(steam_convar_memcpy_byte_this_before))),
+                (
+                    "vector_ptr".to_string(),
+                    json!(format_opt(steam_convar_memcpy_byte_vector_ptr_before)),
+                ),
+                ("eax".to_string(), json!(format!("{:#x}", state.get(Register::Rax)))),
+                ("ecx".to_string(), json!(format!("{:#x}", state.get(Register::Rcx)))),
+                ("edx".to_string(), json!(format!("{:#x}", state.get(Register::Rdx)))),
+                ("edi".to_string(), json!(format!("{:#x}", state.get(Register::Rdi)))),
+                (
+                    "recent_main_block_rvas".to_string(),
+                    json!(runtime.recent_main_block_rvas.iter().map(|value| format!("{value:#x}")).collect::<Vec<_>>()),
+                ),
+            ]);
+            if let Some(vector_fields) = vector_fields {
+                parameters.insert("vector_fields".to_string(), json!(vector_fields));
+            }
+            runtime.push_trace(
+                "process",
+                "SteamConVarMemcpyByteBlock",
+                parameters,
+                json!(decoded_instructions),
+            );
+        }
+        if let Some(block_label) = steam_convar_memcpy_return_watch {
+            let decoded_instructions = cached_block
+                .translated
+                .decoded
+                .iter()
+                .map(|instruction| {
+                    format!(
+                        "{:#x}:{:?} {:?}",
+                        instruction.address.saturating_sub(runtime.mapped_image_base),
+                        instruction.opcode,
+                        instruction.operands
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" | ");
+            let format_opt = |value: Option<u64>| {
+                value
+                    .map(|value| format!("{value:#x}"))
+                    .unwrap_or_else(|| "<unavailable>".to_string())
+            };
+            let vector_fields = steam_convar_memcpy_return_vector_bytes_before.map(|bytes| {
+                let read_u32_at = |offset: usize| -> u64 {
+                    u64::from(u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()))
+                };
+                BTreeMap::from([
+                    ("element_size".to_string(), json!(format!("{:#x}", read_u32_at(0)))),
+                    ("memory_ptr".to_string(), json!(format!("{:#x}", read_u32_at(4)))),
+                    ("allocation_count".to_string(), json!(format!("{:#x}", read_u32_at(8)))),
+                    ("grow_size".to_string(), json!(format!("{:#x}", read_u32_at(12)))),
+                    ("count".to_string(), json!(format!("{:#x}", read_u32_at(16)))),
+                ])
+            });
+            let mut parameters = BTreeMap::from([
+                ("block_rva".to_string(), json!(block_label)),
+                ("this_ptr".to_string(), json!(format_opt(steam_convar_memcpy_return_this_before))),
+                (
+                    "vector_ptr".to_string(),
+                    json!(format_opt(steam_convar_memcpy_return_vector_ptr_before)),
+                ),
+                ("eax".to_string(), json!(format!("{:#x}", state.get(Register::Rax)))),
+                ("ecx".to_string(), json!(format!("{:#x}", state.get(Register::Rcx)))),
+                ("edx".to_string(), json!(format!("{:#x}", state.get(Register::Rdx)))),
+                ("esi".to_string(), json!(format!("{:#x}", state.get(Register::Rsi)))),
+                ("edi".to_string(), json!(format!("{:#x}", state.get(Register::Rdi)))),
+                (
+                    "recent_main_block_rvas".to_string(),
+                    json!(runtime.recent_main_block_rvas.iter().map(|value| format!("{value:#x}")).collect::<Vec<_>>()),
+                ),
+            ]);
+            if let Some(vector_fields) = vector_fields {
+                parameters.insert("vector_fields".to_string(), json!(vector_fields));
+            }
+            runtime.push_trace(
+                "process",
+                "SteamConVarMemcpyReturnBlock",
+                parameters,
+                json!(decoded_instructions),
+            );
+        }
+        if trace_steam_vector_grow_request {
+            let decoded_instructions = cached_block
+                .translated
+                .decoded
+                .iter()
+                .map(|instruction| {
+                    format!(
+                        "{:#x}:{:?} {:?}",
+                        instruction.address.saturating_sub(runtime.mapped_image_base),
+                        instruction.opcode,
+                        instruction.operands
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" | ");
+            let format_opt = |value: Option<u64>| {
+                value
+                    .map(|value| format!("{value:#x}"))
+                    .unwrap_or_else(|| "<unavailable>".to_string())
+            };
+            let requested_bytes = match (steam_vector_element_size_before, steam_vector_capacity_before) {
+                (Some(element_size), Some(capacity)) => element_size.checked_mul(capacity),
+                _ => None,
+            };
+            let owner_ptr_candidate = steam_vector_this_before.and_then(|vector_ptr| vector_ptr.checked_sub(0x84));
+            runtime.push_trace(
+                "process",
+                "SteamVectorGrowRequest",
+                BTreeMap::from([
+                    ("block_rva".to_string(), json!("0x9968b")),
+                    (
+                        "vector_ptr".to_string(),
+                        json!(format_opt(steam_vector_this_before)),
+                    ),
+                    (
+                        "owner_ptr_candidate".to_string(),
+                        json!(format_opt(owner_ptr_candidate)),
+                    ),
+                    (
+                        "old_address".to_string(),
+                        json!(format_opt(steam_vector_old_address_before)),
+                    ),
+                    (
+                        "element_size".to_string(),
+                        json!(format_opt(steam_vector_element_size_before)),
+                    ),
+                    (
+                        "capacity".to_string(),
+                        json!(format_opt(steam_vector_capacity_before)),
+                    ),
+                    (
+                        "grow_size".to_string(),
+                        json!(format_opt(steam_vector_grow_size_before)),
+                    ),
+                    (
+                        "count".to_string(),
+                        json!(format_opt(steam_vector_count_before)),
+                    ),
+                    (
+                        "requested_bytes".to_string(),
+                        json!(format_opt(requested_bytes)),
+                    ),
+                    (
+                        "recent_main_block_rvas".to_string(),
+                        json!(runtime.recent_main_block_rvas.iter().map(|value| format!("{value:#x}")).collect::<Vec<_>>()),
+                    ),
+                ]),
+                json!(decoded_instructions),
+            );
+        }
         if guest_arch == GuestArch::X86
             && runtime.steam_401389_expected_esi_after_401434.is_some()
             && runtime.steam_401389_saved_esi_slot_addr.is_none()
@@ -1340,6 +3346,29 @@ pub fn execute_with_options(
                         ),
                     ));
                 }
+            }
+        }
+        if steam_install_dir_set_edi {
+            let expected_edi = runtime.mapped_image_base + 0x003d_6168;
+            let actual_edi = state.get(Register::Rdi);
+            runtime.steam_install_dir_expected_edi = Some(expected_edi);
+            if actual_edi != expected_edi {
+                let decoded_addresses = cached_block
+                    .translated
+                    .decoded
+                    .iter()
+                    .map(|instruction| format!("{:#x}", instruction.address))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                return Err(AppError::new(
+                    ReasonCode::RcUnimplInsn,
+                    format!(
+                        "steam install-dir setup block failed to leave edi on the relocated install-dir buffer: expected {expected_edi:#x}, actual {actual_edi:#x}"
+                    ),
+                )
+                .with_hint(format!(
+                    "steam-install-dir set-block={block_start_rip:#x} addrs=[{decoded_addresses}]"
+                )));
             }
         }
         if touches_steam_401389_helper {
@@ -1641,15 +3670,21 @@ impl PeHostRuntime {
             next_heap_address: CRT_HEAP_BASE,
             heap_allocations: BTreeMap::new(),
             critical_sections: BTreeMap::new(),
+            condition_variables: BTreeMap::new(),
             srw_locks: BTreeMap::new(),
             signal_handlers: BTreeMap::new(),
             tls_slots: BTreeMap::new(),
+            fls_slots: BTreeMap::new(),
             tls_vector_ptr: 0,
             init_once_pending: BTreeSet::new(),
             init_once_completed: BTreeMap::new(),
             atexit_handlers: Vec::new(),
             module_handles: BTreeMap::new(),
             module_names_by_handle: BTreeMap::new(),
+            module_paths_by_handle: BTreeMap::new(),
+            synthetic_module_handles: BTreeSet::new(),
+            materialized_synthetic_modules: BTreeSet::new(),
+            network: NetworkStack::new(),
             device_contexts: BTreeMap::new(),
             dialog_procs: BTreeMap::new(),
             dc_selected_objects: BTreeMap::new(),
@@ -1661,6 +3696,8 @@ impl PeHostRuntime {
             last_error: 0,
             invalid_parameter_handler: 0,
             unhandled_exception_filter: 0,
+            main_module_security_cookie_address: None,
+            process_pointer_cookie: 0,
             mapped_image_base: 0,
             mapped_image_size: 0,
             teb_base: 0,
@@ -1672,6 +3709,7 @@ impl PeHostRuntime {
             command_line: String::new(),
             command_line_ansi_ptr: 0,
             command_line_wide_ptr: 0,
+            configured_narrow_argv_mode: None,
             process_environment: BTreeMap::new(),
             current_directory: "C:\\".to_string(),
             stdout: String::new(),
@@ -1679,11 +3717,24 @@ impl PeHostRuntime {
             steam_401389_recent_blocks: VecDeque::new(),
             steam_401389_first_over_0x1000: None,
             steam_401389_expected_esi_after_401434: None,
+            steam_565af0_recent_blocks: VecDeque::new(),
+            recent_main_block_rvas: VecDeque::new(),
+            recent_main_cc400_count: 0,
+            steam_final_assert_recent_blocks: VecDeque::new(),
+            steam_final_assert_global_history: VecDeque::new(),
+            steam_pre_report_blocks: VecDeque::new(),
             steam_401389_saved_esi_slot_addr: None,
+            steam_convar_memcpy_watch_this: None,
+            steam_final_status_writer_blocks: VecDeque::new(),
+            steam_final_lock_blocks: VecDeque::new(),
+            steam_4dea00_expected_edi: None,
+            steam_install_dir_expected_edi: None,
             next_frame_index: 0,
             next_audio_buffer_tag: 1,
             published_live_frame: false,
+            delivering_guest_exception: false,
             dtm,
+            jit_runtime: None,
         }
     }
 
@@ -1692,15 +3743,44 @@ impl PeHostRuntime {
         self.next_thunk_address = thunk_base_for_arch(guest_arch);
         self.next_data_address = data_base_for_arch(guest_arch);
         self.next_heap_address = heap_base_for_arch(guest_arch);
+        self.jit_runtime = Some(crate::jit::JitRuntime::new(guest_arch));
     }
 
     fn stage_main_module(&mut self, source_program: &Path) -> AppResult<String> {
+        let source_program = if source_program.is_absolute() {
+            source_program.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map_err(|error| {
+                    AppError::from_io(
+                        ReasonCode::RcIo,
+                        format!("failed to resolve working directory for {}", source_program.display()),
+                        &error,
+                    )
+                })?
+                .join(source_program)
+        };
+        let normalized_source = runtime_guest_path(self.win32.ge(), &source_program);
+        if is_windows_absolute_path(&normalized_source) {
+            if let Some(drive_prefix) = windows_drive_prefix(&normalized_source) {
+                let drive = &drive_prefix[..1];
+                if self
+                    .win32
+                    .ge()
+                    .active_drive_mappings()
+                    .iter()
+                    .any(|mapping| mapping.drive.eq_ignore_ascii_case(drive))
+                {
+                    return Ok(normalized_source);
+                }
+            }
+        }
         let file_name = source_program
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("program.exe");
         let guest_program_path = format!("{}\\{}", self.win32.get_temp_path_w()?, file_name);
-        self.win32.stage_host_file_w(source_program, &guest_program_path)?;
+        self.win32.stage_host_file_w(&source_program, &guest_program_path)?;
         Ok(guest_program_path)
     }
 
@@ -1712,6 +3792,8 @@ impl PeHostRuntime {
         if !main_module_name.is_empty() {
             self.module_handles.insert(main_module_name.clone(), mapped_image_base);
             self.module_names_by_handle.insert(mapped_image_base, main_module_name);
+            self.module_paths_by_handle
+                .insert(mapped_image_base, guest_program_path.to_string());
         }
     }
 
@@ -1723,11 +3805,66 @@ impl PeHostRuntime {
         if let Some(&handle) = self.module_handles.get(&normalized) {
             return handle;
         }
-        let handle = self.next_data_address;
-        self.next_data_address += self.guest_arch.pointer_bytes() as u64;
+        let handle = align_up_u64(self.next_data_address, 0x1000);
+        self.next_data_address = handle + 0x1000;
         self.module_names_by_handle.insert(handle, normalized.clone());
+        self.module_paths_by_handle
+            .insert(handle, resolve_full_guest_path(&self.current_directory, module_name));
         self.module_handles.insert(normalized, handle);
+        self.synthetic_module_handles.insert(handle);
         handle
+    }
+
+    fn ensure_synthetic_module_image(&mut self, memory: &mut MemoryImage, module_handle: u64) {
+        if module_handle == 0
+            || module_handle == self.mapped_image_base
+            || !self.synthetic_module_handles.contains(&module_handle)
+            || !self.materialized_synthetic_modules.insert(module_handle)
+        {
+            return;
+        }
+        memory.map_bytes(
+            module_handle,
+            &minimal_synthetic_module_image(module_handle, self.guest_arch),
+        );
+    }
+
+    fn lookup_module_handle(&self, module_name: &str) -> Option<u64> {
+        let normalized = normalize_module_name(module_name);
+        if normalized.is_empty() || normalized.ends_with(".exe") {
+            return Some(self.mapped_image_base);
+        }
+        self.module_handles.get(&normalized).copied()
+    }
+
+    fn can_synthesize_module(&self, module_name: &str) -> bool {
+        let normalized = normalize_module_name(module_name);
+        !normalized.is_empty()
+            && (normalized.starts_with("api-ms-")
+                || normalized.starts_with("ext-ms-")
+                || export_tables().contains_key(&normalized))
+    }
+
+    fn resolve_load_library_handle(&mut self, module_name: &str) -> (u64, u32) {
+        if module_name.trim().is_empty() {
+            return (0, 0);
+        }
+        if let Some(handle) = self.lookup_module_handle(module_name) {
+            return (handle, 0);
+        }
+        if self.can_synthesize_module(module_name) {
+            return (self.get_or_create_module_handle(module_name), 0);
+        }
+        let guest_path = resolve_full_guest_path(&self.current_directory, module_name);
+        let host_path = match self.win32.guest_path_to_host_path(&guest_path) {
+            Ok(path) => path,
+            Err(_) => return (0, ERROR_MOD_NOT_FOUND),
+        };
+        if !host_path.exists() {
+            return (0, ERROR_MOD_NOT_FOUND);
+        }
+        // Non-system guest DLLs need real image loading; do not fabricate success handles.
+        (0, ERROR_MOD_NOT_FOUND)
     }
 
     fn resolve_main_module_export(&self, symbol: &ImportSymbol) -> u64 {
@@ -1768,6 +3905,43 @@ impl PeHostRuntime {
         self.next_thunk_address += 0x10;
         self.host_thunks.insert(thunk_address, thunk);
         thunk_address
+    }
+
+    fn current_process_module_handles(&self) -> Vec<u64> {
+        let mut handles = self.module_handles.values().copied().collect::<Vec<_>>();
+        handles.sort_unstable();
+        handles.dedup();
+        handles.retain(|handle| *handle != 0 && *handle != self.mapped_image_base);
+        handles.insert(0, self.mapped_image_base);
+        handles
+    }
+
+    fn module_handle_from_address(&self, address: u64) -> Option<u64> {
+        if address >= self.mapped_image_base && address < self.mapped_image_base + self.mapped_image_size {
+            return Some(self.mapped_image_base);
+        }
+        self.current_process_module_handles().into_iter().find(|handle| {
+            *handle != self.mapped_image_base && address >= *handle && address < *handle + 0x1000
+        })
+    }
+
+    fn winsock_extension_function(&mut self, guid: &str) -> Option<u64> {
+        match guid.to_ascii_uppercase().as_str() {
+            "{25A207B9-DDF3-4660-8EE9-76E58C74063E}" => Some(self.alloc_host_thunk(HostThunk::ConnectEx)),
+            "{7FDA2E11-8630-436F-A031-F536A6EEC157}" => Some(self.alloc_host_thunk(HostThunk::DisconnectEx)),
+            _ => None,
+        }
+    }
+
+    fn module_base_name(&self, module_handle: u64) -> String {
+        if module_handle == 0 || module_handle == self.mapped_image_base {
+            return module_file_name(&self.main_module_path).to_string();
+        }
+        self.module_paths_by_handle
+            .get(&module_handle)
+            .map(|path| module_file_name(path).to_string())
+            .or_else(|| self.module_names_by_handle.get(&module_handle).cloned())
+            .unwrap_or_default()
     }
 
     fn launch_guest_child_process(
@@ -2080,6 +4254,7 @@ impl PeHostRuntime {
         write_guest_pointer(memory, teb_base + 0x30, peb_base, self.guest_arch)?;
         write_guest_pointer(memory, peb_base + 0x08, startup_owner, self.guest_arch)?;
         if self.guest_arch == GuestArch::X86 {
+            write_guest_pointer(memory, teb_base + 0x18, teb_base, self.guest_arch)?;
             let tls_vector_ptr = self.alloc_zeroed(memory, 4096 * self.guest_arch.pointer_bytes(), 16)?;
             let static_tls_block = self.alloc_zeroed(memory, 0x2000, 16)?;
             write_guest_pointer(memory, teb_base + 0x2c, tls_vector_ptr, self.guest_arch)?;
@@ -2146,12 +4321,129 @@ impl PeHostRuntime {
         Ok(())
     }
 
+    fn execute_main_image_tls_process_attach_callbacks(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+        image: &pe::ParsedPe,
+        mapped_image_base: u64,
+    ) -> AppResult<()> {
+        if self.guest_arch != GuestArch::X86 {
+            return Ok(());
+        }
+        let Some(tls_directory) = image.tls_directory.as_ref() else {
+            return Ok(());
+        };
+
+        for callback in &tls_directory.callbacks {
+            let relocated_callback = mapped_image_base.wrapping_add(callback.saturating_sub(image.image_base));
+            self.push_trace(
+                "process",
+                "TlsProcessAttachCallback",
+                BTreeMap::from([
+                    ("callback".to_string(), json!(format!("{relocated_callback:#x}"))),
+                    ("preferred_callback".to_string(), json!(format!("{callback:#x}"))),
+                    ("image_base".to_string(), json!(format!("{mapped_image_base:#x}"))),
+                ]),
+                json!(DLL_PROCESS_ATTACH),
+            );
+            let _ = self.execute_guest_callback(
+                state,
+                memory,
+                relocated_callback,
+                &[mapped_image_base, DLL_PROCESS_ATTACH, 0],
+                "tls_process_attach",
+            )?;
+        }
+
+        Ok(())
+    }
+
+    fn initialize_security_cookie(
+        &mut self,
+        memory: &mut MemoryImage,
+        image: &pe::ParsedPe,
+        mapped_image_base: u64,
+    ) -> AppResult<()> {
+        let Some(load_config) = image.load_config.as_ref() else {
+            return Ok(());
+        };
+        if load_config.security_cookie == 0 {
+            return Ok(());
+        }
+
+        let cookie_size = self.guest_arch.pointer_bytes() as u64;
+        let image_end = image.image_base.saturating_add(image.size_of_image as u64);
+        if load_config.security_cookie < image.image_base
+            || load_config.security_cookie.saturating_add(cookie_size) > image_end
+        {
+            return Ok(());
+        }
+
+        let cookie_address = mapped_image_base + (load_config.security_cookie - image.image_base);
+        let existing_cookie = read_guest_pointer(memory, cookie_address, self.guest_arch)?;
+        let default_cookie = default_security_cookie(self.guest_arch);
+        self.main_module_security_cookie_address = Some(cookie_address);
+        if existing_cookie != 0 && existing_cookie != default_cookie {
+            self.process_pointer_cookie = existing_cookie;
+            return Ok(());
+        }
+
+        let cookie = initial_guest_security_cookie(
+            self.dtm,
+            self.guest_arch,
+            mapped_image_base,
+            self.peb_base,
+            self.teb_base,
+        );
+        write_guest_pointer(memory, cookie_address, cookie, self.guest_arch)?;
+        self.process_pointer_cookie = cookie;
+        self.push_trace(
+            "process",
+            "InitializeSecurityCookie",
+            BTreeMap::from([
+                ("address".to_string(), json!(format!("{cookie_address:#x}"))),
+                ("existing".to_string(), json!(format!("{existing_cookie:#x}"))),
+                ("value".to_string(), json!(format!("{cookie:#x}"))),
+            ]),
+            json!(format!("{cookie:#x}")),
+        );
+        Ok(())
+    }
+
+    fn pointer_encoding_cookie(&mut self, memory: &mut MemoryImage) -> AppResult<u64> {
+        if let Some(address) = self.main_module_security_cookie_address {
+            let cookie = read_guest_pointer(memory, address, self.guest_arch)?;
+            if cookie != 0 {
+                self.process_pointer_cookie = cookie;
+                return Ok(cookie);
+            }
+        }
+        if self.process_pointer_cookie == 0 {
+            self.process_pointer_cookie = initial_guest_security_cookie(
+                self.dtm,
+                self.guest_arch,
+                self.mapped_image_base,
+                self.peb_base,
+                self.teb_base,
+            );
+        }
+        Ok(self.process_pointer_cookie)
+    }
+
     fn bind_imports(
         &mut self,
         selected_base: u64,
         memory: &mut MemoryImage,
         resolved_imports: &[ResolvedImport],
     ) -> AppResult<()> {
+        let mut registered_modules = BTreeSet::new();
+        for import in resolved_imports {
+            if registered_modules.insert(import.resolved_module.clone()) {
+                let handle = self.get_or_create_module_handle(&import.resolved_module);
+                self.ensure_synthetic_module_image(memory, handle);
+            }
+        }
         for import in resolved_imports {
             let slot_va = selected_base + import.iat_rva as u64;
             let thunk_address = self.next_thunk_address;
@@ -2161,6 +4453,18 @@ impl PeHostRuntime {
             write_guest_pointer(memory, slot_va, thunk_address, self.guest_arch)?;
         }
         Ok(())
+    }
+
+    fn dispatch_import_if_present(
+        &mut self,
+        thunk_address: u64,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<Option<Option<i32>>> {
+        if !self.host_thunks.contains_key(&thunk_address) {
+            return Ok(None);
+        }
+        self.dispatch_import(thunk_address, state, memory).map(Some)
     }
 
     fn dispatch_import(
@@ -2187,10 +4491,49 @@ impl PeHostRuntime {
             None
         };
         let return_address = read_guest_pointer(memory, state.get(Register::Rsp), self.guest_arch)?;
+        let caller_rva = return_address.saturating_sub(self.mapped_image_base);
         state.set(
             Register::Rsp,
             state.get(Register::Rsp).wrapping_add(self.guest_arch.pointer_bytes() as u64),
         );
+        if self.guest_arch == GuestArch::X86
+            && matches!(caller_rva, 0x0013_d197 | 0x0013_f650 | 0x0013_f78d)
+        {
+            let arg0 = guest_call_arg(state, memory, 0).ok();
+            let mut params = BTreeMap::from([
+                ("caller_rva".to_string(), json!(format!("{caller_rva:#x}"))),
+                (
+                    "thunk_address".to_string(),
+                    json!(format!("{thunk_address:#x}")),
+                ),
+                ("thunk".to_string(), json!(thunk_name.clone())),
+            ]);
+            if let Some(arg0) = arg0 {
+                params.insert("arg0".to_string(), json!(format!("{arg0:#x}")));
+                if matches!(
+                    thunk,
+                    HostThunk::TryEnterCriticalSection
+                        | HostThunk::EnterCriticalSection
+                        | HostThunk::LeaveCriticalSection
+                ) {
+                    let depth_before = self.critical_sections.get(&arg0).copied();
+                    params.insert(
+                        "critical_section_known_before".to_string(),
+                        json!(depth_before.is_some()),
+                    );
+                    params.insert(
+                        "critical_section_depth_before".to_string(),
+                        json!(depth_before),
+                    );
+                }
+            }
+            self.push_trace(
+                "process",
+                "SteamFinalThunkCall",
+                params,
+                json!(null),
+            );
+        }
 
         match thunk {
             HostThunk::CreateDXGIFactory1 => {
@@ -2815,6 +5158,7 @@ impl PeHostRuntime {
                         background: guest_class.background,
                         menu_name: guest_class.menu_name,
                         class_name_ptr: guest_class.class_name_ptr,
+                        icon_small: 0,
                     },
                 );
                 state.set(Register::Rax, atom as u64);
@@ -2846,6 +5190,7 @@ impl PeHostRuntime {
                         background: guest_class.background,
                         menu_name: guest_class.menu_name,
                         class_name_ptr: guest_class.class_name_ptr,
+                        icon_small: guest_class.icon_small,
                     },
                 );
                 state.set(Register::Rax, atom as u64);
@@ -2884,14 +5229,55 @@ impl PeHostRuntime {
                         background: 0,
                         menu_name: 0,
                         class_name_ptr,
+                        icon_small: 0,
                     });
-                    write_guest_window_class(memory, class_info_ptr, self.guest_arch, class_info)?;
+                    write_guest_window_class(memory, class_info_ptr, self.guest_arch, class_info, false)?;
                 }
                 state.set(Register::Rax, u64::from(found));
                 self.last_error = if found { 0 } else { ERROR_CLASS_DOES_NOT_EXIST };
                 self.push_trace(
                     "input",
                     "GetClassInfoW",
+                    BTreeMap::from([
+                        ("instance".to_string(), json!(instance)),
+                        ("class_name".to_string(), json!(class_name)),
+                    ]),
+                    json!(found),
+                );
+            }
+            HostThunk::GetClassInfoExW => {
+                let instance = guest_call_arg(state, memory, 0)?;
+                let class_name_ptr = guest_call_arg(state, memory, 1)?;
+                let class_info_ptr = guest_call_arg(state, memory, 2)?;
+                let class_name = if class_name_ptr == 0 {
+                    String::new()
+                } else if class_name_ptr >> 16 == 0 {
+                    format!("#{}", class_name_ptr & 0xffff)
+                } else {
+                    read_utf16_string(memory, class_name_ptr)?
+                };
+                let found = self.user32.ensure_class_available(&class_name).is_some();
+                if found && class_info_ptr != 0 {
+                    let class_info = self.user32.class_info(&class_name).unwrap_or(WindowClassInfo {
+                        style: 0,
+                        wnd_proc: 0,
+                        cls_extra: 0,
+                        wnd_extra: 0,
+                        instance: 0,
+                        icon: 0,
+                        cursor: 0,
+                        background: 0,
+                        menu_name: 0,
+                        class_name_ptr,
+                        icon_small: 0,
+                    });
+                    write_guest_window_class(memory, class_info_ptr, self.guest_arch, class_info, true)?;
+                }
+                state.set(Register::Rax, u64::from(found));
+                self.last_error = if found { 0 } else { ERROR_CLASS_DOES_NOT_EXIST };
+                self.push_trace(
+                    "input",
+                    "GetClassInfoExW",
                     BTreeMap::from([
                         ("instance".to_string(), json!(instance)),
                         ("class_name".to_string(), json!(class_name)),
@@ -3527,6 +5913,29 @@ impl PeHostRuntime {
                     json!(handle),
                 );
             }
+            HostThunk::LoadIconW => {
+                let instance = guest_call_arg(state, memory, 0)?;
+                let name_ptr = guest_call_arg(state, memory, 1)?;
+                let source = if name_ptr == 0 {
+                    String::new()
+                } else if name_ptr >> 16 == 0 {
+                    format!("resource#{}", name_ptr & 0xffff)
+                } else {
+                    read_utf16_string(memory, name_ptr)?
+                };
+                let handle = self.user32.load_image_w(&source, 1, 0, 0, 0) as u64;
+                state.set(Register::Rax, handle);
+                self.last_error = 0;
+                self.push_trace(
+                    "input",
+                    "LoadIconW",
+                    BTreeMap::from([
+                        ("instance".to_string(), json!(instance)),
+                        ("source".to_string(), json!(source)),
+                    ]),
+                    json!(handle),
+                );
+            }
             HostThunk::LoadBitmapW => {
                 let instance = guest_call_arg(state, memory, 0)?;
                 let name_ptr = guest_call_arg(state, memory, 1)?;
@@ -4067,6 +6476,29 @@ impl PeHostRuntime {
                     json!(handle),
                 );
             }
+            HostThunk::CreateFontW => {
+                let height = guest_call_arg(state, memory, 0)? as i32;
+                let face_name_ptr = guest_call_arg(state, memory, 13)?;
+                let face_name = if face_name_ptr == 0 {
+                    String::new()
+                } else {
+                    read_utf16_string(memory, face_name_ptr).unwrap_or_default()
+                };
+                let handle = self.next_gdi_object_handle;
+                self.next_gdi_object_handle = self.next_gdi_object_handle.wrapping_add(4);
+                self.gdi_objects.insert(handle, "font".to_string());
+                state.set(Register::Rax, handle);
+                self.last_error = 0;
+                self.push_trace(
+                    "input",
+                    "CreateFontW",
+                    BTreeMap::from([
+                        ("height".to_string(), json!(height)),
+                        ("face_name".to_string(), json!(face_name)),
+                    ]),
+                    json!(handle),
+                );
+            }
             HostThunk::DeleteObject => {
                 let object = guest_call_arg(state, memory, 0)?;
                 let deleted = self.gdi_objects.remove(&object).is_some();
@@ -4306,6 +6738,19 @@ impl PeHostRuntime {
                     json!(1),
                 );
             }
+            HostThunk::GetCurrentDirectoryW => {
+                let size = guest_call_arg_u32(state, memory, 0)?;
+                let buffer = guest_call_arg(state, memory, 1)?;
+                let result = write_utf16_api_string(memory, buffer, size, &self.current_directory)?;
+                state.set(Register::Rax, result as u64);
+                self.last_error = 0;
+                self.push_trace(
+                    "file",
+                    "GetCurrentDirectoryW",
+                    BTreeMap::from([("path".to_string(), json!(self.current_directory.clone()))]),
+                    json!(result),
+                );
+            }
             HostThunk::GetFullPathNameW => {
                 let raw_path = read_utf16_string(memory, guest_call_arg(state, memory, 0)?)?;
                 let size = guest_call_arg_u32(state, memory, 1)?;
@@ -4365,6 +6810,67 @@ impl PeHostRuntime {
                         self.last_error = last_error_from_app_error(&error);
                     }
                 }
+            }
+            HostThunk::GetFileAttributesExW => {
+                let path_ptr = guest_call_arg(state, memory, 0)?;
+                let info_level = guest_call_arg_u32(state, memory, 1)?;
+                let information_ptr = guest_call_arg(state, memory, 2)?;
+                let raw_path = read_utf16_string(memory, path_ptr)?;
+                let path = resolve_guest_path(&self.current_directory, &raw_path);
+                if info_level != 0 {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                } else {
+                    match self.win32.ge().get_file_metadata(&path) {
+                        Ok(metadata) => {
+                            let host_path = self.win32.guest_path_to_host_path(&path)?;
+                            let host_metadata = fs::metadata(&host_path).map_err(|error| {
+                                AppError::from_io(
+                                    ReasonCode::RcIo,
+                                    format!("failed to stat {}", host_path.display()),
+                                    &error,
+                                )
+                            })?;
+                            let info = FileInformation {
+                                normalized_path: path.clone(),
+                                size: if metadata.kind == crate::ge::FsEntryKind::Directory {
+                                    0
+                                } else {
+                                    host_metadata.len()
+                                },
+                                attributes: metadata.attributes,
+                                creation_time_ticks: metadata.creation_time_ticks,
+                                last_access_time_ticks: metadata.last_access_time_ticks,
+                                last_write_time_ticks: metadata.last_write_time_ticks,
+                                is_directory: metadata.kind == crate::ge::FsEntryKind::Directory,
+                            };
+                            if information_ptr != 0 {
+                                write_file_attribute_data(memory, information_ptr, &info);
+                            }
+                            state.set(Register::Rax, 1);
+                            self.last_error = 0;
+                        }
+                        Err(error) => {
+                            state.set(Register::Rax, 0);
+                            self.last_error = last_error_from_app_error(&error);
+                        }
+                    }
+                }
+                self.push_trace(
+                    "file",
+                    "GetFileAttributesExW",
+                    BTreeMap::from([
+                        ("path_ptr".to_string(), json!(format!("{path_ptr:#x}"))),
+                        ("path_raw".to_string(), json!(raw_path)),
+                        ("path".to_string(), json!(path)),
+                        ("info_level".to_string(), json!(info_level)),
+                        (
+                            "file_information".to_string(),
+                            json!(format!("{information_ptr:#x}")),
+                        ),
+                    ]),
+                    json!(state.get(Register::Rax)),
+                );
             }
             HostThunk::FindFirstFileW => {
                 let path_ptr = guest_call_arg(state, memory, 0)?;
@@ -4551,6 +7057,20 @@ impl PeHostRuntime {
                     json!(result),
                 );
             }
+            HostThunk::GetTempPath2W => {
+                let buffer = guest_call_arg(state, memory, 0)?;
+                let size = guest_call_arg_u32(state, memory, 1)?;
+                let path = self.win32.get_temp_path_w()?;
+                let result = write_utf16_api_string(memory, buffer, size, &path)?;
+                state.set(Register::Rax, result as u64);
+                self.last_error = 0;
+                self.push_trace(
+                    "file",
+                    "GetTempPath2W",
+                    BTreeMap::from([("path".to_string(), json!(path))]),
+                    json!(result),
+                );
+            }
             HostThunk::GetTempFileNameW => {
                 let path_ptr = guest_call_arg(state, memory, 0)?;
                 let prefix_ptr = guest_call_arg(state, memory, 1)?;
@@ -4595,6 +7115,36 @@ impl PeHostRuntime {
                     state.get(Register::Rax).into(),
                 );
             }
+            HostThunk::GetModuleFileNameA => {
+                let module_handle = guest_call_arg(state, memory, 0)?;
+                let buffer = guest_call_arg(state, memory, 1)?;
+                let size = guest_call_arg_u32(state, memory, 2)?;
+                let path = if module_handle == 0 || module_handle == self.mapped_image_base {
+                    self.main_module_path.clone()
+                } else {
+                    self.module_paths_by_handle
+                        .get(&module_handle)
+                        .cloned()
+                        .unwrap_or_default()
+                };
+                let result = write_ansi_api_string(memory, buffer, size, &path)?;
+                state.set(Register::Rax, result as u64);
+                self.last_error = 0;
+                self.push_trace(
+                    "file",
+                    "GetModuleFileNameA",
+                    BTreeMap::from([
+                        ("caller_rip".to_string(), json!(format!("{return_address:#x}"))),
+                        (
+                            "caller_rva".to_string(),
+                            json!(format!("{:#x}", return_address.saturating_sub(self.mapped_image_base))),
+                        ),
+                        ("module_handle".to_string(), json!(format!("{module_handle:#x}"))),
+                        ("path".to_string(), json!(path)),
+                    ]),
+                    json!(result),
+                );
+            }
             HostThunk::GetModuleFileNameW => {
                 let module_handle = guest_call_arg(state, memory, 0)?;
                 let buffer = guest_call_arg(state, memory, 1)?;
@@ -4602,7 +7152,7 @@ impl PeHostRuntime {
                 let path = if module_handle == 0 || module_handle == self.mapped_image_base {
                     self.main_module_path.clone()
                 } else {
-                    self.module_names_by_handle
+                    self.module_paths_by_handle
                         .get(&module_handle)
                         .cloned()
                         .unwrap_or_default()
@@ -4614,6 +7164,11 @@ impl PeHostRuntime {
                     "file",
                     "GetModuleFileNameW",
                     BTreeMap::from([
+                        ("caller_rip".to_string(), json!(format!("{return_address:#x}"))),
+                        (
+                            "caller_rva".to_string(),
+                            json!(format!("{:#x}", return_address.saturating_sub(self.mapped_image_base))),
+                        ),
                         ("module_handle".to_string(), json!(format!("{module_handle:#x}"))),
                         ("path".to_string(), json!(path)),
                     ]),
@@ -4707,15 +7262,18 @@ impl PeHostRuntime {
                 } else {
                     read_c_string(memory, path_ptr)?
                 };
-                let handle = if path.is_empty() {
-                    0
-                } else {
-                    self.get_or_create_module_handle(&path)
-                };
+                let (handle, last_error) = self.resolve_load_library_handle(&path);
+                self.ensure_synthetic_module_image(memory, handle);
                 state.set(Register::Rax, handle);
-                self.last_error = 0;
+                self.last_error = last_error;
                 self.push_trace(
                     "kernel32",
+                    "LoadLibraryA",
+                    BTreeMap::from([("path".to_string(), json!(path))]),
+                    json!(handle),
+                );
+                self.push_trace(
+                    "process",
                     "LoadLibraryA",
                     BTreeMap::from([("path".to_string(), json!(path))]),
                     json!(handle),
@@ -4728,17 +7286,51 @@ impl PeHostRuntime {
                 } else {
                     read_utf16_string(memory, path_ptr)?
                 };
-                let handle = if path.is_empty() {
-                    0
-                } else {
-                    self.get_or_create_module_handle(&path)
-                };
+                let (handle, last_error) = self.resolve_load_library_handle(&path);
+                self.ensure_synthetic_module_image(memory, handle);
                 state.set(Register::Rax, handle);
-                self.last_error = 0;
+                self.last_error = last_error;
                 self.push_trace(
                     "kernel32",
                     "LoadLibraryW",
                     BTreeMap::from([("path".to_string(), json!(path))]),
+                    json!(handle),
+                );
+                self.push_trace(
+                    "process",
+                    "LoadLibraryW",
+                    BTreeMap::from([("path".to_string(), json!(path))]),
+                    json!(handle),
+                );
+            }
+            HostThunk::LoadLibraryExA => {
+                let path_ptr = guest_call_arg(state, memory, 0)?;
+                let flags = guest_call_arg_u32(state, memory, 2)?;
+                let path = if path_ptr == 0 {
+                    String::new()
+                } else {
+                    read_c_string(memory, path_ptr)?
+                };
+                let (handle, last_error) = self.resolve_load_library_handle(&path);
+                self.ensure_synthetic_module_image(memory, handle);
+                state.set(Register::Rax, handle);
+                self.last_error = last_error;
+                self.push_trace(
+                    "kernel32",
+                    "LoadLibraryExA",
+                    BTreeMap::from([
+                        ("path".to_string(), json!(path)),
+                        ("flags".to_string(), json!(flags)),
+                    ]),
+                    json!(handle),
+                );
+                self.push_trace(
+                    "process",
+                    "LoadLibraryExA",
+                    BTreeMap::from([
+                        ("path".to_string(), json!(path)),
+                        ("flags".to_string(), json!(flags)),
+                    ]),
                     json!(handle),
                 );
             }
@@ -4750,13 +7342,10 @@ impl PeHostRuntime {
                 } else {
                     read_utf16_string(memory, path_ptr)?
                 };
-                let handle = if path.is_empty() {
-                    0
-                } else {
-                    self.get_or_create_module_handle(&path)
-                };
+                let (handle, last_error) = self.resolve_load_library_handle(&path);
+                self.ensure_synthetic_module_image(memory, handle);
                 state.set(Register::Rax, handle);
-                self.last_error = 0;
+                self.last_error = last_error;
                 self.push_trace(
                     "kernel32",
                     "LoadLibraryExW",
@@ -4766,11 +7355,47 @@ impl PeHostRuntime {
                     ]),
                     json!(handle),
                 );
+                self.push_trace(
+                    "process",
+                    "LoadLibraryExW",
+                    BTreeMap::from([
+                        ("path".to_string(), json!(path)),
+                        ("flags".to_string(), json!(flags)),
+                    ]),
+                    json!(handle),
+                );
             }
             HostThunk::InitCommonControls => {
+                self.user32.register_common_control_classes();
                 state.set(Register::Rax, 0);
                 self.last_error = 0;
                 self.push_trace("comctl32", "InitCommonControls", BTreeMap::new(), json!(0));
+            }
+            HostThunk::InitCommonControlsEx => {
+                let init_controls = guest_call_arg(state, memory, 0)?;
+                let size = if init_controls == 0 {
+                    0
+                } else {
+                    read_u32(memory, init_controls).unwrap_or(0)
+                };
+                let classes = if init_controls == 0 {
+                    0
+                } else {
+                    read_u32(memory, init_controls + 4).unwrap_or(0)
+                };
+                self.user32.register_common_control_classes();
+                state.set(Register::Rax, 1);
+                self.last_error = 0;
+                self.push_trace(
+                    "comctl32",
+                    "InitCommonControlsEx",
+                    BTreeMap::from([
+                        ("init_controls".to_string(), json!(format!("{init_controls:#x}"))),
+                        ("size".to_string(), json!(size)),
+                        ("classes".to_string(), json!(format!("0x{classes:08x}"))),
+                    ]),
+                    json!(1),
+                );
             }
             HostThunk::OleInitialize => {
                 let thread_handle = self.win32.current_thread_handle();
@@ -4842,6 +7467,30 @@ impl PeHostRuntime {
                 self.last_error = 0;
                 self.push_trace("ole32", "CoTaskMemFree", BTreeMap::new(), json!(0));
             }
+            HostThunk::VariantClear => {
+                let variant_ptr = guest_call_arg(state, memory, 0)?;
+                if variant_ptr == 0 {
+                    state.set(Register::Rax, E_INVALIDARG);
+                } else {
+                    let variant_size = match self.guest_arch {
+                        GuestArch::X86 => 16,
+                        GuestArch::X64 => 24,
+                    };
+                    let vt = memory.read_u16(variant_ptr).unwrap_or(0);
+                    memory.map_bytes(variant_ptr, &vec![0_u8; variant_size]);
+                    state.set(Register::Rax, 0);
+                    self.push_trace(
+                        "oleaut32",
+                        "VariantClear",
+                        BTreeMap::from([
+                            ("variant".to_string(), json!(format!("{variant_ptr:#x}"))),
+                            ("vt".to_string(), json!(format!("0x{vt:04x}"))),
+                        ]),
+                        json!(0),
+                    );
+                }
+                self.last_error = 0;
+            }
             HostThunk::CommandLineToArgvW => {
                 let command_line_ptr = guest_call_arg(state, memory, 0)?;
                 let argc_ptr = guest_call_arg(state, memory, 1)?;
@@ -4868,6 +7517,11 @@ impl PeHostRuntime {
                     BTreeMap::from([("command_line".to_string(), json!(command_line))]),
                     json!(argv),
                 );
+            }
+            HostThunk::IsUserAnAdmin => {
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+                self.push_trace("shell32", "IsUserAnAdmin", BTreeMap::new(), json!(0));
             }
             HostThunk::SHGetFileInfoW => {
                 let path = guest_call_arg(state, memory, 0)?;
@@ -5468,6 +8122,14 @@ impl PeHostRuntime {
                 };
                 if destination != 0 {
                     memory.map_bytes(destination, &text);
+                    let page_tail = 0x1000_usize - (destination as usize & 0xfff);
+                    if page_tail > text.len() {
+                        memory.map_zeroed_if_unmapped(destination + text.len() as u64, page_tail - text.len());
+                    }
+                    let page_tail = 0x1000_usize - (destination as usize & 0xfff);
+                    if page_tail > text.len() {
+                        memory.map_zeroed_if_unmapped(destination + text.len() as u64, page_tail - text.len());
+                    }
                 }
                 state.set(Register::Rax, destination);
                 self.last_error = 0;
@@ -5599,6 +8261,114 @@ impl PeHostRuntime {
                 state.set(Register::Rax, self.command_line_wide_ptr);
                 self.last_error = 0;
             }
+            HostThunk::OutputDebugStringA => {
+                let string_ptr = guest_call_arg(state, memory, 0)?;
+                let message = if string_ptr == 0 {
+                    String::new()
+                } else {
+                    read_c_string(memory, string_ptr)?
+                };
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+                self.push_trace(
+                    "debug",
+                    "OutputDebugStringA",
+                    BTreeMap::from([("message".to_string(), json!(message))]),
+                    json!(0),
+                );
+            }
+            HostThunk::OutputDebugStringW => {
+                let string_ptr = guest_call_arg(state, memory, 0)?;
+                let message = if string_ptr == 0 {
+                    String::new()
+                } else {
+                    read_utf16_string(memory, string_ptr)?
+                };
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+                self.push_trace(
+                    "debug",
+                    "OutputDebugStringW",
+                    BTreeMap::from([("message".to_string(), json!(message))]),
+                    json!(0),
+                );
+            }
+            HostThunk::SetEnvironmentVariableW => {
+                let name_ptr = guest_call_arg(state, memory, 0)?;
+                let value_ptr = guest_call_arg(state, memory, 1)?;
+                if name_ptr == 0 {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                } else {
+                    let name = read_utf16_string(memory, name_ptr)?;
+                    let existing_key = self
+                        .process_environment
+                        .keys()
+                        .find(|key| key.eq_ignore_ascii_case(&name))
+                        .cloned();
+                    if let Some(key) = existing_key {
+                        self.process_environment.remove(&key);
+                    }
+                    let value = if value_ptr == 0 {
+                        None
+                    } else {
+                        Some(read_utf16_string(memory, value_ptr)?)
+                    };
+                    if let Some(value) = &value {
+                        self.process_environment.insert(name.clone(), value.clone());
+                    }
+                    state.set(Register::Rax, 1);
+                    self.last_error = 0;
+                    self.push_trace(
+                        "process",
+                        "SetEnvironmentVariableW",
+                        BTreeMap::from([
+                            ("name".to_string(), json!(name)),
+                            ("value".to_string(), json!(value)),
+                        ]),
+                        json!(1),
+                    );
+                }
+            }
+            HostThunk::GetEnvironmentVariableW => {
+                let name_ptr = guest_call_arg(state, memory, 0)?;
+                let buffer_ptr = guest_call_arg(state, memory, 1)?;
+                let buffer_len = guest_call_arg_u32(state, memory, 2)? as usize;
+                if name_ptr == 0 || (buffer_ptr == 0 && buffer_len != 0) {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                } else {
+                    let name = read_utf16_string(memory, name_ptr)?;
+                    let value = self
+                        .process_environment
+                        .iter()
+                        .find(|(key, _)| key.eq_ignore_ascii_case(&name))
+                        .map(|(_, value)| value.clone());
+                    if let Some(value) = value {
+                        let required = value.encode_utf16().count() + 1;
+                        if buffer_len == 0 {
+                            state.set(Register::Rax, required as u64);
+                            self.last_error = 0;
+                        } else if required > buffer_len {
+                            state.set(Register::Rax, required as u64);
+                            self.last_error = ERROR_INSUFFICIENT_BUFFER;
+                        } else {
+                            let bytes = value
+                                .encode_utf16()
+                                .chain(std::iter::once(0))
+                                .flat_map(|unit| unit.to_le_bytes())
+                                .collect::<Vec<_>>();
+                            memory.map_bytes(buffer_ptr, &bytes);
+                            self.recent_wide_writes.insert(buffer_ptr, value.clone());
+                            state.set(Register::Rax, value.encode_utf16().count() as u64);
+                            self.last_error = 0;
+                        }
+                    } else {
+                        state.set(Register::Rax, 0);
+                        self.last_error = ERROR_ENVVAR_NOT_FOUND;
+                    }
+                }
+            }
             HostThunk::GetEnvironmentStringsW => {
                 let environment = self.process_environment.clone();
                 let address = self.alloc_utf16_environment_block(memory, &environment)?;
@@ -5685,76 +8455,60 @@ impl PeHostRuntime {
                 let source_len = guest_call_arg(state, memory, 3)? as i32;
                 let destination_ptr = guest_call_arg(state, memory, 4)?;
                 let destination_len = guest_call_arg(state, memory, 5)? as i32;
-
-                if source_ptr == 0 || source_len == 0 || (flags & (LCMAP_LOWERCASE | LCMAP_UPPERCASE)) == (LCMAP_LOWERCASE | LCMAP_UPPERCASE) {
+                let result = self.lcmap_string(
+                    memory,
+                    flags,
+                    source_ptr,
+                    source_len,
+                    destination_ptr,
+                    destination_len,
+                )?;
+                state.set(Register::Rax, result);
+            }
+            HostThunk::LCMapStringEx => {
+                let locale_name_ptr = guest_call_arg(state, memory, 0)?;
+                let flags = guest_call_arg_u32(state, memory, 1)?;
+                let source_ptr = guest_call_arg(state, memory, 2)?;
+                let source_len = guest_call_arg(state, memory, 3)? as i32;
+                let destination_ptr = guest_call_arg(state, memory, 4)?;
+                let destination_len = guest_call_arg(state, memory, 5)? as i32;
+                let locale_name = if locale_name_ptr == 0 {
+                    None
+                } else {
+                    Some(read_utf16_string(memory, locale_name_ptr)?)
+                };
+                if locale_name
+                    .as_deref()
+                    .is_some_and(|name| locale_name_to_lcid(name).is_none())
+                {
                     state.set(Register::Rax, 0);
                     self.last_error = ERROR_INVALID_PARAMETER;
                 } else {
-                    let source_units = if source_len < 0 {
-                        read_utf16_string(memory, source_ptr)?
-                            .encode_utf16()
-                            .chain(std::iter::once(0))
-                            .collect::<Vec<_>>()
-                    } else {
-                        (0..source_len as usize)
-                            .map(|index| read_guest_u16(memory, source_ptr + (index as u64 * 2)))
-                            .collect::<AppResult<Vec<_>>>()?
-                    };
-                    let mapped_units = if flags & (LCMAP_LOWERCASE | LCMAP_UPPERCASE) != 0 {
-                        source_units
-                            .iter()
-                            .copied()
-                            .map(|unit| {
-                                let Some(original) = char::from_u32(unit as u32) else {
-                                    return unit;
-                                };
-                                let mapped = if flags & LCMAP_UPPERCASE != 0 {
-                                    original.to_uppercase().collect::<Vec<_>>()
-                                } else {
-                                    original.to_lowercase().collect::<Vec<_>>()
-                                };
-                                let Some(&candidate) = mapped.first() else {
-                                    return unit;
-                                };
-                                if mapped.len() != 1 {
-                                    return unit;
-                                }
-                                let mut encoded = [0_u16; 2];
-                                if candidate.encode_utf16(&mut encoded).len() != 1 {
-                                    return unit;
-                                }
-                                if self
-                                    .win32
-                                    .wide_char_to_multi_byte(DEFAULT_ANSI_CODE_PAGE, &encoded[..1])
-                                    .is_err()
-                                {
-                                    return unit;
-                                }
-                                encoded[0]
-                            })
-                            .collect::<Vec<_>>()
-                    } else {
-                        source_units.clone()
-                    };
-                    let required = mapped_units.len() as u32;
-                    if destination_ptr == 0 || destination_len == 0 {
-                        state.set(Register::Rax, required as u64);
+                    let result = self.lcmap_string(
+                        memory,
+                        flags,
+                        source_ptr,
+                        source_len,
+                        destination_ptr,
+                        destination_len,
+                    )?;
+                    state.set(Register::Rax, result);
+                }
+            }
+            HostThunk::LocaleNameToLCID => {
+                let locale_name_ptr = guest_call_arg(state, memory, 0)?;
+                let _flags = guest_call_arg_u32(state, memory, 1)?;
+                if locale_name_ptr == 0 {
+                    state.set(Register::Rax, LOCALE_EN_US as u64);
+                    self.last_error = 0;
+                } else {
+                    let locale_name = read_utf16_string(memory, locale_name_ptr)?;
+                    if let Some(result) = locale_name_to_lcid(&locale_name) {
+                        state.set(Register::Rax, result as u64);
                         self.last_error = 0;
-                    } else if destination_len < required as i32 {
+                    } else {
                         state.set(Register::Rax, 0);
-                        self.last_error = ERROR_INSUFFICIENT_BUFFER;
-                    } else {
-                        let encoded = mapped_units
-                            .iter()
-                            .flat_map(|unit| unit.to_le_bytes())
-                            .collect::<Vec<_>>();
-                        if !encoded.is_empty() {
-                            memory.map_bytes(destination_ptr, &encoded);
-                            self.recent_wide_writes
-                                .insert(destination_ptr, String::from_utf16_lossy(&mapped_units));
-                        }
-                        state.set(Register::Rax, required as u64);
-                        self.last_error = 0;
+                        self.last_error = ERROR_INVALID_PARAMETER;
                     }
                 }
             }
@@ -6031,20 +8785,246 @@ impl PeHostRuntime {
                     json!(exit_code),
                 );
             }
-            HostThunk::CreateEventW => {
+            HostThunk::CreateIoCompletionPort => {
+                let file_handle = guest_call_arg_u32(state, memory, 0)?;
+                let existing_completion_port = guest_call_arg_u32(state, memory, 1)?;
+                let completion_key = guest_call_arg(state, memory, 2)?;
+                let concurrent_threads = guest_call_arg_u32(state, memory, 3)?;
+                let file_handle = (file_handle != INVALID_HANDLE_VALUE as u32).then_some(file_handle);
+                let existing_completion_port = (existing_completion_port != 0).then_some(existing_completion_port);
+
+                match self.win32.create_io_completion_port(
+                    file_handle,
+                    existing_completion_port,
+                    completion_key,
+                    concurrent_threads,
+                ) {
+                    Ok(handle) => {
+                        state.set(Register::Rax, u64::from(handle));
+                        self.last_error = 0;
+                        self.push_trace(
+                            "sync",
+                            "CreateIoCompletionPort",
+                            BTreeMap::from([
+                                ("file_handle".to_string(), json!(file_handle)),
+                                ("existing_completion_port".to_string(), json!(existing_completion_port)),
+                                ("completion_key".to_string(), json!(completion_key)),
+                                ("concurrent_threads".to_string(), json!(concurrent_threads)),
+                            ]),
+                            json!(handle),
+                        );
+                    }
+                    Err(error) => {
+                        state.set(Register::Rax, 0);
+                        self.last_error = last_error_from_app_error(&error);
+                    }
+                }
+            }
+            HostThunk::PostQueuedCompletionStatus => {
+                let completion_port = guest_call_arg_u32(state, memory, 0)?;
+                let bytes_transferred = guest_call_arg_u32(state, memory, 1)?;
+                let completion_key = guest_call_arg(state, memory, 2)?;
+                let overlapped = guest_call_arg(state, memory, 3)?;
+
+                match self.win32.post_queued_completion_status(
+                    completion_port,
+                    bytes_transferred,
+                    completion_key,
+                    overlapped,
+                ) {
+                    Ok(()) => {
+                        state.set(Register::Rax, 1);
+                        self.last_error = 0;
+                        self.push_trace(
+                            "sync",
+                            "PostQueuedCompletionStatus",
+                            BTreeMap::from([
+                                ("completion_port".to_string(), json!(completion_port)),
+                                ("bytes_transferred".to_string(), json!(bytes_transferred)),
+                                ("completion_key".to_string(), json!(completion_key)),
+                                ("overlapped".to_string(), json!(overlapped)),
+                            ]),
+                            json!(1),
+                        );
+                    }
+                    Err(error) => {
+                        state.set(Register::Rax, 0);
+                        self.last_error = last_error_from_app_error(&error);
+                    }
+                }
+            }
+            HostThunk::GetQueuedCompletionStatus => {
+                let completion_port = guest_call_arg_u32(state, memory, 0)?;
+                let bytes_transferred_ptr = guest_call_arg(state, memory, 1)?;
+                let completion_key_ptr = guest_call_arg(state, memory, 2)?;
+                let overlapped_ptr = guest_call_arg(state, memory, 3)?;
+                let timeout_ms = guest_call_arg_u32(state, memory, 4)?;
+
+                match self.win32.dequeue_io_completion_packets(completion_port, 1) {
+                    Ok(mut packets) => {
+                        let packet = packets.remove(0);
+                        if bytes_transferred_ptr != 0 {
+                            write_u32(memory, bytes_transferred_ptr, packet.bytes_transferred);
+                        }
+                        if completion_key_ptr != 0 {
+                            write_guest_pointer(memory, completion_key_ptr, packet.completion_key, self.guest_arch)?;
+                        }
+                        if overlapped_ptr != 0 {
+                            write_guest_pointer(memory, overlapped_ptr, packet.overlapped, self.guest_arch)?;
+                        }
+                        state.set(Register::Rax, 1);
+                        self.last_error = 0;
+                        self.push_trace(
+                            "sync",
+                            "GetQueuedCompletionStatus",
+                            BTreeMap::from([
+                                ("completion_port".to_string(), json!(completion_port)),
+                                ("timeout_ms".to_string(), json!(timeout_ms)),
+                            ]),
+                            json!({
+                                "bytes_transferred": packet.bytes_transferred,
+                                "completion_key": packet.completion_key,
+                                "overlapped": packet.overlapped,
+                            }),
+                        );
+                    }
+                    Err(error) if error.code == ReasonCode::RcWin32Timeout => {
+                        if bytes_transferred_ptr != 0 {
+                            write_u32(memory, bytes_transferred_ptr, 0);
+                        }
+                        if completion_key_ptr != 0 {
+                            write_guest_pointer(memory, completion_key_ptr, 0, self.guest_arch)?;
+                        }
+                        if overlapped_ptr != 0 {
+                            write_guest_pointer(memory, overlapped_ptr, 0, self.guest_arch)?;
+                        }
+                        state.set(Register::Rax, 0);
+                        self.last_error = crate::win32::WAIT_TIMEOUT;
+                    }
+                    Err(error) => {
+                        state.set(Register::Rax, 0);
+                        self.last_error = last_error_from_app_error(&error);
+                    }
+                }
+            }
+            HostThunk::GetQueuedCompletionStatusEx => {
+                let completion_port = guest_call_arg_u32(state, memory, 0)?;
+                let entries_ptr = guest_call_arg(state, memory, 1)?;
+                let entry_count = guest_call_arg_u32(state, memory, 2)? as usize;
+                let removed_count_ptr = guest_call_arg(state, memory, 3)?;
+                let timeout_ms = guest_call_arg_u32(state, memory, 4)?;
+                let _alertable = guest_call_arg_u32(state, memory, 5)? != 0;
+
+                match self.win32.dequeue_io_completion_packets(completion_port, entry_count) {
+                    Ok(packets) => {
+                        let pointer_bytes = if self.guest_arch == GuestArch::X64 { 8 } else { 4 };
+                        let entry_stride = if self.guest_arch == GuestArch::X64 { 32 } else { 16 };
+                        for (index, packet) in packets.iter().enumerate() {
+                            let entry = entries_ptr + (index * entry_stride) as u64;
+                            write_guest_pointer(memory, entry, packet.completion_key, self.guest_arch)?;
+                            write_guest_pointer(memory, entry + pointer_bytes as u64, packet.overlapped, self.guest_arch)?;
+                            write_guest_pointer(memory, entry + (pointer_bytes as u64 * 2), packet.internal, self.guest_arch)?;
+                            write_u32(memory, entry + (pointer_bytes as u64 * 3), packet.bytes_transferred);
+                        }
+                        if removed_count_ptr != 0 {
+                            write_u32(memory, removed_count_ptr, packets.len() as u32);
+                        }
+                        state.set(Register::Rax, 1);
+                        self.last_error = 0;
+                        self.push_trace(
+                            "sync",
+                            "GetQueuedCompletionStatusEx",
+                            BTreeMap::from([
+                                ("completion_port".to_string(), json!(completion_port)),
+                                ("timeout_ms".to_string(), json!(timeout_ms)),
+                                ("requested_entries".to_string(), json!(entry_count)),
+                            ]),
+                            json!(packets.len() as u32),
+                        );
+                    }
+                    Err(error) if error.code == ReasonCode::RcWin32Timeout => {
+                        if removed_count_ptr != 0 {
+                            write_u32(memory, removed_count_ptr, 0);
+                        }
+                        state.set(Register::Rax, 0);
+                        self.last_error = crate::win32::WAIT_TIMEOUT;
+                    }
+                    Err(error) => {
+                        state.set(Register::Rax, 0);
+                        self.last_error = last_error_from_app_error(&error);
+                    }
+                }
+            }
+            HostThunk::SetFileCompletionNotificationModes => {
+                let handle = guest_call_arg_u32(state, memory, 0)?;
+                let flags = guest_call_arg_u32(state, memory, 1)?;
+                let success = handle != 0 && handle != INVALID_HANDLE_VALUE as u32;
+                state.set(Register::Rax, u64::from(success));
+                self.last_error = if success { 0 } else { ERROR_INVALID_HANDLE };
+                self.push_trace(
+                    "process",
+                    "SetFileCompletionNotificationModes",
+                    BTreeMap::from([
+                        ("handle".to_string(), json!(handle)),
+                        ("flags".to_string(), json!(flags)),
+                    ]),
+                    json!(success),
+                );
+            }
+            HostThunk::CreateEventA => {
                 let security_attributes_ptr = guest_call_arg(state, memory, 0)?;
                 let manual_reset = guest_call_arg_u32(state, memory, 1)? != 0;
                 let initial_state = guest_call_arg_u32(state, memory, 2)? != 0;
-                let _name_ptr = guest_call_arg(state, memory, 3)?;
+                let name_ptr = guest_call_arg(state, memory, 3)?;
                 let inherit_offset = if self.guest_arch == GuestArch::X64 { 16 } else { 8 };
                 let inheritable = if security_attributes_ptr == 0 {
                     false
                 } else {
                     read_u32(memory, security_attributes_ptr + inherit_offset)? != 0
                 };
-                let handle = self.win32.create_event(manual_reset, initial_state, inheritable);
+                let name = if name_ptr == 0 {
+                    None
+                } else {
+                    Some(read_c_string(memory, name_ptr)?)
+                };
+                let (handle, already_exists) =
+                    self.win32
+                        .create_event(manual_reset, initial_state, inheritable, name.as_deref());
                 state.set(Register::Rax, u64::from(handle));
-                self.last_error = 0;
+                self.last_error = if already_exists { ERROR_ALREADY_EXISTS } else { 0 };
+                self.push_trace(
+                    "sync",
+                    "CreateEventA",
+                    BTreeMap::from([
+                        ("manual_reset".to_string(), json!(manual_reset)),
+                        ("initial_state".to_string(), json!(initial_state)),
+                        ("inheritable".to_string(), json!(inheritable)),
+                        ("name".to_string(), json!(name)),
+                    ]),
+                    json!(handle),
+                );
+            }
+            HostThunk::CreateEventW => {
+                let security_attributes_ptr = guest_call_arg(state, memory, 0)?;
+                let manual_reset = guest_call_arg_u32(state, memory, 1)? != 0;
+                let initial_state = guest_call_arg_u32(state, memory, 2)? != 0;
+                let name_ptr = guest_call_arg(state, memory, 3)?;
+                let inherit_offset = if self.guest_arch == GuestArch::X64 { 16 } else { 8 };
+                let inheritable = if security_attributes_ptr == 0 {
+                    false
+                } else {
+                    read_u32(memory, security_attributes_ptr + inherit_offset)? != 0
+                };
+                let name = if name_ptr == 0 {
+                    None
+                } else {
+                    Some(read_utf16_string(memory, name_ptr)?)
+                };
+                let (handle, already_exists) =
+                    self.win32
+                        .create_event(manual_reset, initial_state, inheritable, name.as_deref());
+                state.set(Register::Rax, u64::from(handle));
+                self.last_error = if already_exists { ERROR_ALREADY_EXISTS } else { 0 };
                 self.push_trace(
                     "sync",
                     "CreateEventW",
@@ -6052,9 +9032,60 @@ impl PeHostRuntime {
                         ("manual_reset".to_string(), json!(manual_reset)),
                         ("initial_state".to_string(), json!(initial_state)),
                         ("inheritable".to_string(), json!(inheritable)),
+                        ("name".to_string(), json!(name)),
                     ]),
                     json!(handle),
                 );
+            }
+            HostThunk::OpenEventA => {
+                let desired_access = guest_call_arg_u32(state, memory, 0)?;
+                let inheritable = guest_call_arg_u32(state, memory, 1)? != 0;
+                let name = read_c_string(memory, guest_call_arg(state, memory, 2)?)?;
+                match self.win32.open_event(desired_access, inheritable, &name) {
+                    Ok(handle) => {
+                        state.set(Register::Rax, u64::from(handle));
+                        self.last_error = 0;
+                        self.push_trace(
+                            "sync",
+                            "OpenEventA",
+                            BTreeMap::from([
+                                ("desired_access".to_string(), json!(desired_access)),
+                                ("inheritable".to_string(), json!(inheritable)),
+                                ("name".to_string(), json!(name)),
+                            ]),
+                            json!(handle),
+                        );
+                    }
+                    Err(error) => {
+                        state.set(Register::Rax, 0);
+                        self.last_error = last_error_from_app_error(&error);
+                    }
+                }
+            }
+            HostThunk::OpenEventW => {
+                let desired_access = guest_call_arg_u32(state, memory, 0)?;
+                let inheritable = guest_call_arg_u32(state, memory, 1)? != 0;
+                let name = read_utf16_string(memory, guest_call_arg(state, memory, 2)?)?;
+                match self.win32.open_event(desired_access, inheritable, &name) {
+                    Ok(handle) => {
+                        state.set(Register::Rax, u64::from(handle));
+                        self.last_error = 0;
+                        self.push_trace(
+                            "sync",
+                            "OpenEventW",
+                            BTreeMap::from([
+                                ("desired_access".to_string(), json!(desired_access)),
+                                ("inheritable".to_string(), json!(inheritable)),
+                                ("name".to_string(), json!(name)),
+                            ]),
+                            json!(handle),
+                        );
+                    }
+                    Err(error) => {
+                        state.set(Register::Rax, 0);
+                        self.last_error = last_error_from_app_error(&error);
+                    }
+                }
             }
             HostThunk::SetEvent => {
                 let handle = guest_call_arg_u32(state, memory, 0)?;
@@ -6196,6 +9227,61 @@ impl PeHostRuntime {
                     json!(exit_code),
                 );
             }
+            HostThunk::TerminateProcess => {
+                let handle = guest_call_arg_u32(state, memory, 0)?;
+                let exit_code = guest_call_arg_u32(state, memory, 1)?;
+                let process = self.win32.process_state(handle)?;
+                self.win32.set_process_exit_code(handle, exit_code)?;
+                let current_process_handle = self.win32.current_process_handle();
+                self.last_error = 0;
+                self.push_trace(
+                    "process",
+                    "TerminateProcess",
+                    BTreeMap::from([
+                        ("caller_rip".to_string(), json!(format!("{return_address:#x}"))),
+                        (
+                            "caller_rva".to_string(),
+                            json!(format!("{:#x}", return_address.saturating_sub(self.mapped_image_base))),
+                        ),
+                        (
+                            "recent_main_block_rvas".to_string(),
+                            json!(
+                                self.recent_main_block_rvas
+                                    .iter()
+                                    .map(|rva| format!("{rva:#x}"))
+                                    .collect::<Vec<_>>()
+                            ),
+                        ),
+                        (
+                            "final_assert_recent_blocks".to_string(),
+                            json!(self.steam_final_assert_recent_blocks.iter().cloned().collect::<Vec<_>>()),
+                        ),
+                        (
+                            "final_assert_global_history".to_string(),
+                            json!(self.steam_final_assert_global_history.iter().cloned().collect::<Vec<_>>()),
+                        ),
+                        (
+                            "pre_report_blocks".to_string(),
+                            json!(self.steam_pre_report_blocks.iter().cloned().collect::<Vec<_>>()),
+                        ),
+                        (
+                            "final_status_writer_blocks".to_string(),
+                            json!(self.steam_final_status_writer_blocks.iter().cloned().collect::<Vec<_>>()),
+                        ),
+                        (
+                            "final_lock_blocks".to_string(),
+                            json!(self.steam_final_lock_blocks.iter().cloned().collect::<Vec<_>>()),
+                        ),
+                        ("handle".to_string(), json!(format!("{handle:#x}"))),
+                        ("exit_code".to_string(), json!(exit_code)),
+                    ]),
+                    json!(1),
+                );
+                if handle == current_process_handle || process.process_id == std::process::id() {
+                    return Ok(Some(exit_code as i32));
+                }
+                state.set(Register::Rax, 1);
+            }
             HostThunk::CreateFileW => {
                 let path_ptr = guest_call_arg(state, memory, 0)?;
                 let raw_path = read_utf16_string(memory, path_ptr)?;
@@ -6298,6 +9384,83 @@ impl PeHostRuntime {
                     }
                 }
             }
+            HostThunk::RegCreateKeyExA => {
+                let hkey = guest_call_arg_u32(state, memory, 0)?;
+                let subkey_ptr = guest_call_arg(state, memory, 1)?;
+                let _reserved = guest_call_arg_u32(state, memory, 2)?;
+                let _class_ptr = guest_call_arg(state, memory, 3)?;
+                let _options = guest_call_arg_u32(state, memory, 4)?;
+                let sam_desired = guest_call_arg_u32(state, memory, 5)?;
+                let _security_attributes_ptr = guest_call_arg(state, memory, 6)?;
+                let result_ptr = guest_call_arg(state, memory, 7)?;
+                let disposition_ptr = guest_call_arg(state, memory, 8)?;
+
+                if result_ptr == 0 {
+                    state.set(Register::Rax, ERROR_INVALID_PARAMETER as u64);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                } else {
+                    let subkey = if subkey_ptr == 0 {
+                        String::new()
+                    } else {
+                        read_c_string(memory, subkey_ptr)?
+                    };
+                    let view = registry_view_from_sam_desired(sam_desired, self.guest_arch);
+                    match resolve_registry_root_key(&self.win32, hkey, view).and_then(|(hive, base_key, key_view)| {
+                        let full_key = normalize_registry_runtime_key(&hive, &join_registry_subkey(&base_key, &subkey));
+                        let created = if full_key.is_empty() {
+                            false
+                        } else {
+                            self.win32.create_registry_key(&hive, &full_key, key_view)?
+                        };
+                        Ok((hive, full_key, key_view, created))
+                    }) {
+                        Ok((hive, full_key, key_view, created)) => {
+                            let handle = self.win32.open_registry_key(&hive, &full_key, key_view, false);
+                            write_u32(memory, result_ptr, handle);
+                            if disposition_ptr != 0 {
+                                write_u32(
+                                    memory,
+                                    disposition_ptr,
+                                    if created {
+                                        REG_CREATED_NEW_KEY
+                                    } else {
+                                        REG_OPENED_EXISTING_KEY
+                                    },
+                                );
+                            }
+                            state.set(Register::Rax, 0);
+                            self.last_error = 0;
+                            self.push_trace(
+                                "registry",
+                                "RegCreateKeyExA",
+                                BTreeMap::from([
+                                    ("hive".to_string(), json!(hive)),
+                                    ("subkey".to_string(), json!(full_key)),
+                                    ("sam_desired".to_string(), json!(sam_desired)),
+                                    (
+                                        "disposition".to_string(),
+                                        json!(if created {
+                                            REG_CREATED_NEW_KEY
+                                        } else {
+                                            REG_OPENED_EXISTING_KEY
+                                        }),
+                                    ),
+                                ]),
+                                json!(handle),
+                            );
+                        }
+                        Err(error) => {
+                            write_u32(memory, result_ptr, 0);
+                            if disposition_ptr != 0 {
+                                write_u32(memory, disposition_ptr, 0);
+                            }
+                            let status = last_error_from_app_error(&error);
+                            state.set(Register::Rax, status as u64);
+                            self.last_error = status;
+                        }
+                    }
+                }
+            }
             HostThunk::RegCreateKeyExW => {
                 let hkey = guest_call_arg_u32(state, memory, 0)?;
                 let subkey_ptr = guest_call_arg(state, memory, 1)?;
@@ -6375,6 +9538,105 @@ impl PeHostRuntime {
                     }
                 }
             }
+            HostThunk::RegOpenKeyA => {
+                let hkey = guest_call_arg_u32(state, memory, 0)?;
+                let subkey_ptr = guest_call_arg(state, memory, 1)?;
+                let result_ptr = guest_call_arg(state, memory, 2)?;
+
+                if result_ptr == 0 {
+                    state.set(Register::Rax, ERROR_INVALID_PARAMETER as u64);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                } else {
+                    let subkey = if subkey_ptr == 0 {
+                        String::new()
+                    } else {
+                        read_c_string(memory, subkey_ptr)?
+                    };
+                    let view = registry_view_from_sam_desired(0, self.guest_arch);
+                    match resolve_registry_root_key(&self.win32, hkey, view).and_then(|(hive, base_key, key_view)| {
+                        let full_key = normalize_registry_runtime_key(&hive, &join_registry_subkey(&base_key, &subkey));
+                        let exists = full_key.is_empty() || self.win32.registry_key_exists(&hive, &full_key, key_view)?;
+                        if exists {
+                            Ok((hive, full_key, key_view))
+                        } else {
+                            Err(AppError::new(ReasonCode::RcFsNotFound, "registry key not found"))
+                        }
+                    }) {
+                        Ok((hive, full_key, key_view)) => {
+                            let handle = self.win32.open_registry_key(&hive, &full_key, key_view, false);
+                            write_u32(memory, result_ptr, handle);
+                            state.set(Register::Rax, 0);
+                            self.last_error = 0;
+                            self.push_trace(
+                                "registry",
+                                "RegOpenKeyA",
+                                BTreeMap::from([
+                                    ("hive".to_string(), json!(hive)),
+                                    ("subkey".to_string(), json!(full_key)),
+                                ]),
+                                json!(handle),
+                            );
+                        }
+                        Err(error) => {
+                            write_u32(memory, result_ptr, 0);
+                            let status = last_error_from_app_error(&error);
+                            state.set(Register::Rax, status as u64);
+                            self.last_error = status;
+                        }
+                    }
+                }
+            }
+            HostThunk::RegOpenKeyExA => {
+                let hkey = guest_call_arg_u32(state, memory, 0)?;
+                let subkey_ptr = guest_call_arg(state, memory, 1)?;
+                let _options = guest_call_arg_u32(state, memory, 2)?;
+                let sam_desired = guest_call_arg_u32(state, memory, 3)?;
+                let result_ptr = guest_call_arg(state, memory, 4)?;
+
+                if result_ptr == 0 {
+                    state.set(Register::Rax, ERROR_INVALID_PARAMETER as u64);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                } else {
+                    let subkey = if subkey_ptr == 0 {
+                        String::new()
+                    } else {
+                        read_c_string(memory, subkey_ptr)?
+                    };
+                    let view = registry_view_from_sam_desired(sam_desired, self.guest_arch);
+                    match resolve_registry_root_key(&self.win32, hkey, view).and_then(|(hive, base_key, key_view)| {
+                        let full_key = normalize_registry_runtime_key(&hive, &join_registry_subkey(&base_key, &subkey));
+                        let exists = full_key.is_empty() || self.win32.registry_key_exists(&hive, &full_key, key_view)?;
+                        if exists {
+                            Ok((hive, full_key, key_view))
+                        } else {
+                            Err(AppError::new(ReasonCode::RcFsNotFound, "registry key not found"))
+                        }
+                    }) {
+                        Ok((hive, full_key, key_view)) => {
+                            let handle = self.win32.open_registry_key(&hive, &full_key, key_view, false);
+                            write_u32(memory, result_ptr, handle);
+                            state.set(Register::Rax, 0);
+                            self.last_error = 0;
+                            self.push_trace(
+                                "registry",
+                                "RegOpenKeyExA",
+                                BTreeMap::from([
+                                    ("hive".to_string(), json!(hive)),
+                                    ("subkey".to_string(), json!(full_key)),
+                                    ("sam_desired".to_string(), json!(sam_desired)),
+                                ]),
+                                json!(handle),
+                            );
+                        }
+                        Err(error) => {
+                            write_u32(memory, result_ptr, 0);
+                            let status = last_error_from_app_error(&error);
+                            state.set(Register::Rax, status as u64);
+                            self.last_error = status;
+                        }
+                    }
+                }
+            }
             HostThunk::RegOpenKeyExW => {
                 let hkey = guest_call_arg_u32(state, memory, 0)?;
                 let subkey_ptr = guest_call_arg(state, memory, 1)?;
@@ -6419,6 +9681,57 @@ impl PeHostRuntime {
                         }
                         Err(error) => {
                             write_u32(memory, result_ptr, 0);
+                            let status = last_error_from_app_error(&error);
+                            state.set(Register::Rax, status as u64);
+                            self.last_error = status;
+                        }
+                    }
+                }
+            }
+            HostThunk::RegSetValueExA => {
+                let hkey = guest_call_arg_u32(state, memory, 0)?;
+                let value_name_ptr = guest_call_arg(state, memory, 1)?;
+                let reserved = guest_call_arg_u32(state, memory, 2)?;
+                let value_type = guest_call_arg_u32(state, memory, 3)?;
+                let data_ptr = guest_call_arg(state, memory, 4)?;
+                let data_len = guest_call_arg_u32(state, memory, 5)?;
+
+                if reserved != 0 || (data_ptr == 0 && data_len != 0) {
+                    state.set(Register::Rax, ERROR_INVALID_PARAMETER as u64);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                } else {
+                    let value_name = if value_name_ptr == 0 {
+                        String::new()
+                    } else {
+                        read_c_string(memory, value_name_ptr)?
+                    };
+                    let (hive, key_path, key_view) = resolve_registry_root_key(
+                        &self.win32,
+                        hkey,
+                        registry_view_from_sam_desired(0, self.guest_arch),
+                    )?;
+                    let normalized_key = normalize_registry_runtime_key(&hive, &key_path);
+                    match decode_registry_value_data_ansi(memory, data_ptr, data_len, value_type).and_then(|(kind, data)| {
+                        self.win32
+                            .ge()
+                            .registry_set_value(&hive, &normalized_key, &value_name, &kind, data, key_view)
+                    }) {
+                        Ok(()) => {
+                            state.set(Register::Rax, 0);
+                            self.last_error = 0;
+                            self.push_trace(
+                                "registry",
+                                "RegSetValueExA",
+                                BTreeMap::from([
+                                    ("hive".to_string(), json!(hive)),
+                                    ("subkey".to_string(), json!(normalized_key)),
+                                    ("value_name".to_string(), json!(value_name)),
+                                    ("value_type".to_string(), json!(value_type)),
+                                ]),
+                                json!(0),
+                            );
+                        }
+                        Err(error) => {
                             let status = last_error_from_app_error(&error);
                             state.set(Register::Rax, status as u64);
                             self.last_error = status;
@@ -6473,6 +9786,73 @@ impl PeHostRuntime {
                             let status = last_error_from_app_error(&error);
                             state.set(Register::Rax, status as u64);
                             self.last_error = status;
+                        }
+                    }
+                }
+            }
+            HostThunk::RegQueryValueExA => {
+                let hkey = guest_call_arg_u32(state, memory, 0)?;
+                let value_name_ptr = guest_call_arg(state, memory, 1)?;
+                let reserved_ptr = guest_call_arg(state, memory, 2)?;
+                let value_type_ptr = guest_call_arg(state, memory, 3)?;
+                let data_ptr = guest_call_arg(state, memory, 4)?;
+                let data_len_ptr = guest_call_arg(state, memory, 5)?;
+
+                if reserved_ptr != 0 || data_len_ptr == 0 {
+                    state.set(Register::Rax, ERROR_INVALID_PARAMETER as u64);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                } else {
+                    let value_name = if value_name_ptr == 0 {
+                        String::new()
+                    } else {
+                        read_c_string(memory, value_name_ptr)?
+                    };
+                    let (hive, key_path, key_view) = resolve_registry_root_key(
+                        &self.win32,
+                        hkey,
+                        registry_view_from_sam_desired(0, self.guest_arch),
+                    )?;
+                    let normalized_key = normalize_registry_runtime_key(&hive, &key_path);
+                    match self
+                        .win32
+                        .registry_get_value(&hive, &normalized_key, &value_name, key_view)?
+                    {
+                        Some(value) => {
+                            let type_code = registry_value_type_to_win32(&value.value_type)?;
+                            let encoded = encode_registry_value_data_ansi(&value)?;
+                            let buffer_capacity = read_u32(memory, data_len_ptr)?;
+                            write_u32(memory, data_len_ptr, encoded.len() as u32);
+                            if value_type_ptr != 0 {
+                                write_u32(memory, value_type_ptr, type_code);
+                            }
+                            if data_ptr != 0 && buffer_capacity < encoded.len() as u32 {
+                                state.set(Register::Rax, ERROR_MORE_DATA as u64);
+                                self.last_error = ERROR_MORE_DATA;
+                            } else {
+                                if data_ptr != 0 && !encoded.is_empty() {
+                                    memory.map_bytes(data_ptr, &encoded);
+                                }
+                                state.set(Register::Rax, 0);
+                                self.last_error = 0;
+                                self.push_trace(
+                                    "registry",
+                                    "RegQueryValueExA",
+                                    BTreeMap::from([
+                                        ("hive".to_string(), json!(hive)),
+                                        ("subkey".to_string(), json!(normalized_key)),
+                                        ("value_name".to_string(), json!(value_name)),
+                                    ]),
+                                    json!(value.data),
+                                );
+                            }
+                        }
+                        None => {
+                            write_u32(memory, data_len_ptr, 0);
+                            if value_type_ptr != 0 {
+                                write_u32(memory, value_type_ptr, 0);
+                            }
+                            state.set(Register::Rax, ERROR_FILE_NOT_FOUND as u64);
+                            self.last_error = ERROR_FILE_NOT_FOUND;
                         }
                     }
                 }
@@ -6563,6 +9943,80 @@ impl PeHostRuntime {
                         "RegCloseKey",
                         BTreeMap::from([("handle".to_string(), json!(hkey))]),
                         json!(0),
+                    );
+                }
+            }
+            HostThunk::InitializeSecurityDescriptor => {
+                let security_descriptor_ptr = guest_call_arg(state, memory, 0)?;
+                let revision = guest_call_arg_u32(state, memory, 1)?;
+                if security_descriptor_ptr == 0 {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                } else if revision != 1 {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_UNKNOWN_REVISION;
+                } else {
+                    let owner_offset = if self.guest_arch == GuestArch::X64 { 8 } else { 4 };
+                    let group_offset = owner_offset + self.guest_arch.pointer_bytes() as u64;
+                    let sacl_offset = group_offset + self.guest_arch.pointer_bytes() as u64;
+                    let dacl_offset = sacl_offset + self.guest_arch.pointer_bytes() as u64;
+                    memory.map_bytes(security_descriptor_ptr, &[1, 0, 0, 0]);
+                    if self.guest_arch == GuestArch::X64 {
+                        memory.map_bytes(security_descriptor_ptr + 4, &[0, 0, 0, 0]);
+                    }
+                    write_guest_pointer(memory, security_descriptor_ptr + owner_offset, 0, self.guest_arch)?;
+                    write_guest_pointer(memory, security_descriptor_ptr + group_offset, 0, self.guest_arch)?;
+                    write_guest_pointer(memory, security_descriptor_ptr + sacl_offset, 0, self.guest_arch)?;
+                    write_guest_pointer(memory, security_descriptor_ptr + dacl_offset, 0, self.guest_arch)?;
+                    state.set(Register::Rax, 1);
+                    self.last_error = 0;
+                    self.push_trace(
+                        "security",
+                        "InitializeSecurityDescriptor",
+                        BTreeMap::from([
+                            ("descriptor".to_string(), json!(security_descriptor_ptr)),
+                            ("revision".to_string(), json!(revision)),
+                        ]),
+                        json!(1),
+                    );
+                }
+            }
+            HostThunk::SetSecurityDescriptorDacl => {
+                let security_descriptor_ptr = guest_call_arg(state, memory, 0)?;
+                let dacl_present = guest_call_arg_u32(state, memory, 1)? != 0;
+                let dacl_ptr = guest_call_arg(state, memory, 2)?;
+                let dacl_defaulted = guest_call_arg_u32(state, memory, 3)? != 0;
+                if security_descriptor_ptr == 0 {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                } else {
+                    let dacl_offset = if self.guest_arch == GuestArch::X64 { 32 } else { 16 };
+                    let existing_control = u16::from_le_bytes(
+                        memory.read_bytes(security_descriptor_ptr + 2, 2)?
+                            .try_into()
+                            .expect("security descriptor control"),
+                    );
+                    let mut control = existing_control & !(0x0004 | 0x0008);
+                    if dacl_present {
+                        control |= 0x0004;
+                    }
+                    if dacl_defaulted {
+                        control |= 0x0008;
+                    }
+                    memory.map_bytes(security_descriptor_ptr + 2, &control.to_le_bytes());
+                    write_guest_pointer(memory, security_descriptor_ptr + dacl_offset, dacl_ptr, self.guest_arch)?;
+                    state.set(Register::Rax, 1);
+                    self.last_error = 0;
+                    self.push_trace(
+                        "security",
+                        "SetSecurityDescriptorDacl",
+                        BTreeMap::from([
+                            ("descriptor".to_string(), json!(security_descriptor_ptr)),
+                            ("dacl_present".to_string(), json!(dacl_present)),
+                            ("dacl".to_string(), json!(dacl_ptr)),
+                            ("dacl_defaulted".to_string(), json!(dacl_defaulted)),
+                        ]),
+                        json!(1),
                     );
                 }
             }
@@ -6780,6 +10234,25 @@ impl PeHostRuntime {
                     }
                 }
             }
+            HostThunk::FlushFileBuffers => {
+                let handle = guest_call_arg_u32(state, memory, 0)?;
+                match self.win32.flush_file_buffers(handle) {
+                    Ok(()) => {
+                        state.set(Register::Rax, 1);
+                        self.last_error = 0;
+                        self.push_trace(
+                            "file",
+                            "FlushFileBuffers",
+                            BTreeMap::from([("handle".to_string(), json!(handle))]),
+                            json!(1),
+                        );
+                    }
+                    Err(error) => {
+                        state.set(Register::Rax, 0);
+                        self.last_error = last_error_from_app_error(&error);
+                    }
+                }
+            }
             HostThunk::LocalAlloc | HostThunk::GlobalAlloc => {
                 let _flags = guest_call_arg_u32(state, memory, 0)?;
                 let bytes = guest_call_arg(state, memory, 1)? as usize;
@@ -6796,7 +10269,7 @@ impl PeHostRuntime {
                     json!(handle),
                 );
             }
-            HostThunk::GlobalLock => {
+            HostThunk::LocalLock | HostThunk::GlobalLock => {
                 let handle = guest_call_arg(state, memory, 0)?;
                 let result = if handle == 0 || !self.heap_allocations.contains_key(&handle) {
                     self.last_error = ERROR_INVALID_HANDLE;
@@ -6808,12 +10281,15 @@ impl PeHostRuntime {
                 state.set(Register::Rax, result);
                 self.push_trace(
                     "memory",
-                    "GlobalLock",
+                    match thunk {
+                        HostThunk::LocalLock => "LocalLock",
+                        _ => "GlobalLock",
+                    },
                     BTreeMap::from([("handle".to_string(), json!(handle))]),
                     json!(result),
                 );
             }
-            HostThunk::GlobalUnlock => {
+            HostThunk::LocalUnlock | HostThunk::GlobalUnlock => {
                 let handle = guest_call_arg(state, memory, 0)?;
                 if handle == 0 || !self.heap_allocations.contains_key(&handle) {
                     state.set(Register::Rax, 0);
@@ -6824,12 +10300,15 @@ impl PeHostRuntime {
                 }
                 self.push_trace(
                     "memory",
-                    "GlobalUnlock",
+                    match thunk {
+                        HostThunk::LocalUnlock => "LocalUnlock",
+                        _ => "GlobalUnlock",
+                    },
                     BTreeMap::from([("handle".to_string(), json!(handle))]),
                     json!(0),
                 );
             }
-            HostThunk::GlobalFree => {
+            HostThunk::LocalFree | HostThunk::GlobalFree => {
                 let handle = guest_call_arg(state, memory, 0)?;
                 if handle != 0 {
                     self.heap_allocations.remove(&handle);
@@ -6838,7 +10317,10 @@ impl PeHostRuntime {
                 self.last_error = 0;
                 self.push_trace(
                     "memory",
-                    "GlobalFree",
+                    match thunk {
+                        HostThunk::LocalFree => "LocalFree",
+                        _ => "GlobalFree",
+                    },
                     BTreeMap::from([("handle".to_string(), json!(handle))]),
                     json!(0),
                 );
@@ -6862,6 +10344,31 @@ impl PeHostRuntime {
                     }
                 }
             }
+            HostThunk::SetHandleInformation => {
+                let handle = guest_call_arg_u32(state, memory, 0)?;
+                let mask = guest_call_arg_u32(state, memory, 1)?;
+                let flags = guest_call_arg_u32(state, memory, 2)?;
+                match self.win32.set_handle_information(handle, mask, flags) {
+                    Ok(()) => {
+                        state.set(Register::Rax, 1);
+                        self.last_error = 0;
+                        self.push_trace(
+                            "file",
+                            "SetHandleInformation",
+                            BTreeMap::from([
+                                ("handle".to_string(), json!(handle)),
+                                ("mask".to_string(), json!(mask)),
+                                ("flags".to_string(), json!(flags)),
+                            ]),
+                            json!(1),
+                        );
+                    }
+                    Err(error) => {
+                        state.set(Register::Rax, 0);
+                        self.last_error = last_error_from_app_error(&error);
+                    }
+                }
+            }
             HostThunk::Calloc => {
                 let count = guest_call_arg(state, memory, 0)?;
                 let size = guest_call_arg(state, memory, 1)?;
@@ -6869,18 +10376,40 @@ impl PeHostRuntime {
                 let address = self.alloc_heap(memory, total as usize, true)?;
                 state.set(Register::Rax, address);
                 self.last_error = 0;
+                self.push_trace(
+                    "memory",
+                    "calloc",
+                    BTreeMap::from([
+                        ("count".to_string(), json!(count)),
+                        ("size".to_string(), json!(size)),
+                        ("total".to_string(), json!(total)),
+                    ]),
+                    json!(address),
+                );
             }
             HostThunk::Free => {
                 let address = guest_call_arg(state, memory, 0)?;
                 self.heap_allocations.remove(&address);
                 state.set(Register::Rax, 0);
                 self.last_error = 0;
+                self.push_trace(
+                    "memory",
+                    "free",
+                    BTreeMap::from([("address".to_string(), json!(format!("{address:#x}")))]),
+                    json!(0),
+                );
             }
             HostThunk::Malloc => {
                 let size = guest_call_arg(state, memory, 0)?.max(1);
                 let address = self.alloc_heap(memory, size as usize, true)?;
                 state.set(Register::Rax, address);
                 self.last_error = 0;
+                self.push_trace(
+                    "memory",
+                    "malloc",
+                    BTreeMap::from([("size".to_string(), json!(size))]),
+                    json!(address),
+                );
             }
             HostThunk::SetNewMode => {
                 state.set(Register::Rax, 0);
@@ -6903,6 +10432,7 @@ impl PeHostRuntime {
                 self.last_error = 0;
             }
             HostThunk::ConfigureNarrowArgv => {
+                self.configured_narrow_argv_mode = Some(guest_call_arg_u32(state, memory, 0)?);
                 state.set(Register::Rax, 0);
                 self.last_error = 0;
             }
@@ -6922,6 +10452,7 @@ impl PeHostRuntime {
                 self.last_error = 0;
             }
             HostThunk::Initterm => {
+                let mut callbacks_executed = 0_u64;
                 if self.guest_arch == GuestArch::X86 {
                     let first = guest_call_arg(state, memory, 0)?;
                     let last = guest_call_arg(state, memory, 1)?;
@@ -6931,15 +10462,27 @@ impl PeHostRuntime {
                         let callback = read_guest_pointer(memory, cursor, self.guest_arch)?;
                         if callback != 0 {
                             let _ = self.execute_guest_callback(state, memory, callback, &[], "_initterm")?;
+                            callbacks_executed += 1;
                         }
                         cursor = cursor.wrapping_add(stride);
                     }
+                    self.push_trace(
+                        "process",
+                        "Initterm",
+                        BTreeMap::from([
+                            ("first".to_string(), json!(format!("{first:#x}"))),
+                            ("last".to_string(), json!(format!("{last:#x}"))),
+                            ("callbacks_executed".to_string(), json!(callbacks_executed)),
+                        ]),
+                        json!(0),
+                    );
                 }
                 state.set(Register::Rax, 0);
                 self.last_error = 0;
             }
             HostThunk::InittermE => {
                 let mut result = 0_u64;
+                let mut callbacks_executed = 0_u64;
                 if self.guest_arch == GuestArch::X86 {
                     let first = guest_call_arg(state, memory, 0)?;
                     let last = guest_call_arg(state, memory, 1)?;
@@ -6949,12 +10492,23 @@ impl PeHostRuntime {
                         let callback = read_guest_pointer(memory, cursor, self.guest_arch)?;
                         if callback != 0 {
                             result = self.execute_guest_callback(state, memory, callback, &[], "_initterm_e")?;
+                            callbacks_executed += 1;
                             if result != 0 {
                                 break;
                             }
                         }
                         cursor = cursor.wrapping_add(stride);
                     }
+                    self.push_trace(
+                        "process",
+                        "InittermE",
+                        BTreeMap::from([
+                            ("first".to_string(), json!(format!("{first:#x}"))),
+                            ("last".to_string(), json!(format!("{last:#x}"))),
+                            ("callbacks_executed".to_string(), json!(callbacks_executed)),
+                        ]),
+                        json!(result),
+                    );
                 }
                 state.set(Register::Rax, result);
                 self.last_error = 0;
@@ -7044,15 +10598,72 @@ impl PeHostRuntime {
                 self.last_error = 0;
             }
             HostThunk::DeleteCriticalSection => {
-                self.critical_sections.remove(&state.get(Register::Rcx));
+                let address = guest_call_arg(state, memory, 0)?;
+                let before = self.critical_sections.remove(&address);
+                self.sync_guest_critical_section(memory, address, 0, 0, Some(0));
+                self.trace_steam_critical_section_state(
+                    "DeleteCriticalSection",
+                    caller_rva,
+                    address,
+                    before,
+                    None,
+                );
                 state.set(Register::Rax, 0);
                 self.last_error = 0;
             }
             HostThunk::EnterCriticalSection => {
-                let address = state.get(Register::Rcx);
-                *self.critical_sections.entry(address).or_insert(0) += 1;
+                let address = guest_call_arg(state, memory, 0)?;
+                let before = self.critical_sections.get(&address).copied();
+                let depth = {
+                    let depth = self.critical_sections.entry(address).or_insert(0);
+                    *depth += 1;
+                    *depth
+                };
+                self.sync_guest_critical_section(memory, address, depth, 1, None);
+                self.trace_steam_critical_section_state(
+                    "EnterCriticalSection",
+                    caller_rva,
+                    address,
+                    before,
+                    Some(depth),
+                );
                 state.set(Register::Rax, 0);
                 self.last_error = 0;
+                self.push_trace(
+                    "process",
+                    "EnterCriticalSection",
+                    BTreeMap::from([("critical_section".to_string(), json!(format!("{address:#x}")))]),
+                    json!(0),
+                );
+            }
+            HostThunk::TryEnterCriticalSection => {
+                let address = guest_call_arg(state, memory, 0)?;
+                let before = self.critical_sections.get(&address).copied();
+                let acquired_depth = if let Some(depth) = self.critical_sections.get_mut(&address) {
+                    *depth += 1;
+                    Some(*depth)
+                } else {
+                    None
+                };
+                if let Some(depth) = acquired_depth {
+                    self.sync_guest_critical_section(memory, address, depth, 1, None);
+                }
+                let acquired = acquired_depth.is_some();
+                self.trace_steam_critical_section_state(
+                    "TryEnterCriticalSection",
+                    caller_rva,
+                    address,
+                    before,
+                    acquired_depth.or(before),
+                );
+                state.set(Register::Rax, u64::from(acquired));
+                self.last_error = 0;
+                self.push_trace(
+                    "process",
+                    "TryEnterCriticalSection",
+                    BTreeMap::from([("critical_section".to_string(), json!(format!("{address:#x}")))]),
+                    json!(u64::from(acquired)),
+                );
             }
             HostThunk::GetModuleHandleA => {
                 let name_ptr = guest_call_arg(state, memory, 0)?;
@@ -7060,13 +10671,25 @@ impl PeHostRuntime {
                     (None, self.mapped_image_base)
                 } else {
                     let module_name = read_c_string(memory, name_ptr)?;
-                    let handle = self.get_or_create_module_handle(&module_name);
+                    let handle = if self.can_synthesize_module(&module_name) {
+                        self.lookup_module_handle(&module_name)
+                            .unwrap_or_else(|| self.get_or_create_module_handle(&module_name))
+                    } else {
+                        self.lookup_module_handle(&module_name).unwrap_or(0)
+                    };
                     (Some(module_name), handle)
                 };
+                self.ensure_synthetic_module_image(memory, handle);
                 state.set(Register::Rax, handle);
                 self.last_error = 0;
                 self.push_trace(
                     "kernel32",
+                    "GetModuleHandleA",
+                    BTreeMap::from([("module".to_string(), json!(module_name))]),
+                    json!(handle),
+                );
+                self.push_trace(
+                    "process",
                     "GetModuleHandleA",
                     BTreeMap::from([("module".to_string(), json!(module_name))]),
                     json!(handle),
@@ -7078,9 +10701,15 @@ impl PeHostRuntime {
                     (None, self.mapped_image_base)
                 } else {
                     let module_name = read_utf16_string(memory, name_ptr)?;
-                    let handle = self.get_or_create_module_handle(&module_name);
+                    let handle = if self.can_synthesize_module(&module_name) {
+                        self.lookup_module_handle(&module_name)
+                            .unwrap_or_else(|| self.get_or_create_module_handle(&module_name))
+                    } else {
+                        self.lookup_module_handle(&module_name).unwrap_or(0)
+                    };
                     (Some(module_name), handle)
                 };
+                self.ensure_synthetic_module_image(memory, handle);
                 state.set(Register::Rax, handle);
                 self.last_error = 0;
                 self.push_trace(
@@ -7089,6 +10718,108 @@ impl PeHostRuntime {
                     BTreeMap::from([("module".to_string(), json!(module_name))]),
                     json!(handle),
                 );
+                self.push_trace(
+                    "process",
+                    "GetModuleHandleW",
+                    BTreeMap::from([("module".to_string(), json!(module_name))]),
+                    json!(handle),
+                );
+            }
+            HostThunk::GetModuleHandleExA => {
+                let flags = guest_call_arg_u32(state, memory, 0)?;
+                let module_ptr_or_address = guest_call_arg(state, memory, 1)?;
+                let module_handle_ptr = guest_call_arg(state, memory, 2)?;
+                let supported_flags = GET_MODULE_HANDLE_EX_FLAG_PIN
+                    | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT
+                    | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS;
+                if module_handle_ptr == 0 || flags & !supported_flags != 0 {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                } else {
+                    let from_address = flags & GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS != 0;
+                    let (module_name, handle) = if from_address {
+                        (None, self.module_handle_from_address(module_ptr_or_address).unwrap_or(0))
+                    } else if module_ptr_or_address == 0 {
+                        (None, self.mapped_image_base)
+                    } else {
+                        let module_name = read_c_string(memory, module_ptr_or_address)?;
+                        let handle = if self.can_synthesize_module(&module_name) {
+                            self.lookup_module_handle(&module_name)
+                                .unwrap_or_else(|| self.get_or_create_module_handle(&module_name))
+                        } else {
+                            self.lookup_module_handle(&module_name).unwrap_or(0)
+                        };
+                        (Some(module_name), handle)
+                    };
+                    if handle == 0 {
+                        write_guest_pointer(memory, module_handle_ptr, 0, self.guest_arch)?;
+                        state.set(Register::Rax, 0);
+                        self.last_error = ERROR_MOD_NOT_FOUND;
+                    } else {
+                        self.ensure_synthetic_module_image(memory, handle);
+                        write_guest_pointer(memory, module_handle_ptr, handle, self.guest_arch)?;
+                        state.set(Register::Rax, 1);
+                        self.last_error = 0;
+                    }
+                    self.push_trace(
+                        "kernel32",
+                        "GetModuleHandleExA",
+                        BTreeMap::from([
+                            ("flags".to_string(), json!(flags)),
+                            ("module".to_string(), json!(module_name)),
+                            ("handle".to_string(), json!(handle)),
+                        ]),
+                        json!(handle),
+                    );
+                }
+            }
+            HostThunk::GetModuleHandleExW => {
+                let flags = guest_call_arg_u32(state, memory, 0)?;
+                let module_ptr_or_address = guest_call_arg(state, memory, 1)?;
+                let module_handle_ptr = guest_call_arg(state, memory, 2)?;
+                let supported_flags = GET_MODULE_HANDLE_EX_FLAG_PIN
+                    | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT
+                    | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS;
+                if module_handle_ptr == 0 || flags & !supported_flags != 0 {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                } else {
+                    let from_address = flags & GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS != 0;
+                    let (module_name, handle) = if from_address {
+                        (None, self.module_handle_from_address(module_ptr_or_address).unwrap_or(0))
+                    } else if module_ptr_or_address == 0 {
+                        (None, self.mapped_image_base)
+                    } else {
+                        let module_name = read_utf16_string(memory, module_ptr_or_address)?;
+                        let handle = if self.can_synthesize_module(&module_name) {
+                            self.lookup_module_handle(&module_name)
+                                .unwrap_or_else(|| self.get_or_create_module_handle(&module_name))
+                        } else {
+                            self.lookup_module_handle(&module_name).unwrap_or(0)
+                        };
+                        (Some(module_name), handle)
+                    };
+                    if handle == 0 {
+                        write_guest_pointer(memory, module_handle_ptr, 0, self.guest_arch)?;
+                        state.set(Register::Rax, 0);
+                        self.last_error = ERROR_MOD_NOT_FOUND;
+                    } else {
+                        self.ensure_synthetic_module_image(memory, handle);
+                        write_guest_pointer(memory, module_handle_ptr, handle, self.guest_arch)?;
+                        state.set(Register::Rax, 1);
+                        self.last_error = 0;
+                    }
+                    self.push_trace(
+                        "kernel32",
+                        "GetModuleHandleExW",
+                        BTreeMap::from([
+                            ("flags".to_string(), json!(flags)),
+                            ("module".to_string(), json!(module_name)),
+                            ("handle".to_string(), json!(handle)),
+                        ]),
+                        json!(handle),
+                    );
+                }
             }
             HostThunk::GetProcAddress => {
                 let module_handle = guest_call_arg(state, memory, 0)?;
@@ -7121,6 +10852,15 @@ impl PeHostRuntime {
                 self.last_error = 0;
                 self.push_trace(
                     "kernel32",
+                    "GetProcAddress",
+                    BTreeMap::from([
+                        ("module".to_string(), json!(module_name)),
+                        ("symbol".to_string(), json!(symbol_name)),
+                    ]),
+                    json!(address),
+                );
+                self.push_trace(
+                    "process",
                     "GetProcAddress",
                     BTreeMap::from([
                         ("module".to_string(), json!(module_name)),
@@ -7163,6 +10903,552 @@ impl PeHostRuntime {
                 state.set(Register::Rax, 0);
                 self.push_trace("kernel32", "SetLastError", BTreeMap::new(), json!(value));
             }
+            HostThunk::WsaStartup => {
+                let version_requested = guest_call_arg_u32(state, memory, 0)?;
+                let data_ptr = guest_call_arg(state, memory, 1)?;
+                self.network.wsa_startup();
+                if data_ptr != 0 {
+                    let data_size = if self.guest_arch == GuestArch::X86 { 400 } else { 408 };
+                    memory.map_bytes(data_ptr, &vec![0_u8; data_size]);
+                    memory.map_bytes(data_ptr, &(version_requested as u16).to_le_bytes());
+                    memory.map_bytes(data_ptr + 2, &0x0202_u16.to_le_bytes());
+                }
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+                self.push_trace(
+                    "network",
+                    "WSAStartup",
+                    BTreeMap::from([("version_requested".to_string(), json!(format!("{version_requested:#x}")))]),
+                    json!(0),
+                );
+            }
+            HostThunk::WsaCleanup => {
+                self.network.wsa_cleanup();
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+                self.push_trace("network", "WSACleanup", BTreeMap::new(), json!(0));
+            }
+            HostThunk::WsaGetLastError => {
+                let error = self.network.wsa_get_last_error();
+                state.set(Register::Rax, error as u64);
+                self.last_error = 0;
+                self.push_trace("network", "WSAGetLastError", BTreeMap::new(), json!(error));
+            }
+            HostThunk::WsaSetLastError => {
+                let value = guest_call_arg(state, memory, 0)? as i32;
+                self.network.wsa_set_last_error(value);
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+                self.push_trace("network", "WSASetLastError", BTreeMap::new(), json!(value));
+            }
+            HostThunk::Htonl => {
+                let value = guest_call_arg_u32(state, memory, 0)?;
+                let converted = value.to_be();
+                state.set(Register::Rax, u64::from(converted));
+                self.last_error = 0;
+                self.push_trace(
+                    "network",
+                    "htonl",
+                    BTreeMap::from([("value".to_string(), json!(value))]),
+                    json!(converted),
+                );
+            }
+            HostThunk::Htons => {
+                let value = guest_call_arg_u32(state, memory, 0)? as u16;
+                let converted = value.to_be();
+                state.set(Register::Rax, u64::from(converted));
+                self.last_error = 0;
+                self.push_trace(
+                    "network",
+                    "htons",
+                    BTreeMap::from([("value".to_string(), json!(value))]),
+                    json!(converted),
+                );
+            }
+            HostThunk::ConnectEx => {
+                let socket = guest_call_arg(state, memory, 0)?;
+                let sockaddr_ptr = guest_call_arg(state, memory, 1)?;
+                let sockaddr_len = guest_call_arg_u32(state, memory, 2)?;
+                let send_buffer = guest_call_arg(state, memory, 3)?;
+                let send_length = guest_call_arg_u32(state, memory, 4)?;
+                let bytes_sent_ptr = guest_call_arg(state, memory, 5)?;
+                let _overlapped = guest_call_arg(state, memory, 6)?;
+                let result = (|| -> AppResult<u32> {
+                    let addr = read_guest_sockaddr(memory, sockaddr_ptr, sockaddr_len)?;
+                    self.network.connect(socket, addr.clone())?;
+                    let bytes_sent = if send_buffer != 0 && send_length != 0 {
+                        let payload = read_guest_bytes(memory, send_buffer, send_length as usize)?;
+                        self.network.send(socket, &payload)? as u32
+                    } else {
+                        0
+                    };
+                    if bytes_sent_ptr != 0 {
+                        write_u32(memory, bytes_sent_ptr, bytes_sent);
+                    }
+                    Ok(bytes_sent)
+                })();
+                match result {
+                    Ok(bytes_sent) => {
+                        state.set(Register::Rax, 1);
+                        self.last_error = 0;
+                        self.push_trace(
+                            "network",
+                            "ConnectEx",
+                            BTreeMap::from([
+                                ("socket".to_string(), json!(socket)),
+                                ("sockaddr".to_string(), json!(read_guest_sockaddr(memory, sockaddr_ptr, sockaddr_len).ok())),
+                                ("send_length".to_string(), json!(send_length)),
+                            ]),
+                            json!(bytes_sent),
+                        );
+                    }
+                    Err(error) => {
+                        if self.network.wsa_get_last_error() == 0 {
+                            let code = match error.code {
+                                ReasonCode::RcWin32InvalidHandle => WSAENOTSOCK,
+                                _ => WSAEINVAL,
+                            };
+                            self.network.wsa_set_last_error(code);
+                        }
+                        self.push_trace(
+                            "network",
+                            "ConnectEx",
+                            BTreeMap::from([
+                                ("socket".to_string(), json!(socket)),
+                                ("sockaddr".to_string(), json!(read_guest_sockaddr(memory, sockaddr_ptr, sockaddr_len).ok())),
+                                ("send_length".to_string(), json!(send_length)),
+                                ("error".to_string(), json!(error.message)),
+                                ("wsa_error".to_string(), json!(self.network.wsa_get_last_error())),
+                            ]),
+                            json!(0),
+                        );
+                        state.set(Register::Rax, 0);
+                        self.last_error = 0;
+                    }
+                }
+            }
+            HostThunk::DisconnectEx => {
+                let socket = guest_call_arg(state, memory, 0)?;
+                let _overlapped = guest_call_arg(state, memory, 1)?;
+                let flags = guest_call_arg_u32(state, memory, 2)?;
+                let _reserved = guest_call_arg_u32(state, memory, 3)?;
+                let result = self
+                    .network
+                    .shutdown(socket)
+                    .and_then(|_| self.network.closesocket(socket));
+                match result {
+                    Ok(()) => {
+                        state.set(Register::Rax, 1);
+                        self.last_error = 0;
+                        self.push_trace(
+                            "network",
+                            "DisconnectEx",
+                            BTreeMap::from([
+                                ("socket".to_string(), json!(socket)),
+                                ("flags".to_string(), json!(flags)),
+                            ]),
+                            json!(1),
+                        );
+                    }
+                    Err(error) => {
+                        if self.network.wsa_get_last_error() == 0 {
+                            let code = match error.code {
+                                ReasonCode::RcWin32InvalidHandle => WSAENOTSOCK,
+                                _ => WSAEINVAL,
+                            };
+                            self.network.wsa_set_last_error(code);
+                        }
+                        self.push_trace(
+                            "network",
+                            "DisconnectEx",
+                            BTreeMap::from([
+                                ("socket".to_string(), json!(socket)),
+                                ("flags".to_string(), json!(flags)),
+                                ("error".to_string(), json!(error.message)),
+                                ("wsa_error".to_string(), json!(self.network.wsa_get_last_error())),
+                            ]),
+                            json!(0),
+                        );
+                        state.set(Register::Rax, 0);
+                        self.last_error = 0;
+                    }
+                }
+            }
+            HostThunk::Ioctlsocket => {
+                let socket = guest_call_arg(state, memory, 0)?;
+                let code = guest_call_arg_u32(state, memory, 1)?;
+                let arg_ptr = guest_call_arg(state, memory, 2)?;
+                let result = match code {
+                    FIONBIO => {
+                        if arg_ptr == 0 {
+                            self.network.wsa_set_last_error(WSAEINVAL);
+                            Err(AppError::new(ReasonCode::RcCliInvalid, "ioctlsocket FIONBIO requires argp"))
+                        } else {
+                            let nonblocking = read_guest_u32(memory, arg_ptr)? != 0;
+                            self.network.ioctlsocket_fionbio(socket, nonblocking).map(|_| 0_u32)
+                        }
+                    }
+                    FIONREAD => {
+                        if arg_ptr == 0 {
+                            self.network.wsa_set_last_error(WSAEINVAL);
+                            Err(AppError::new(ReasonCode::RcCliInvalid, "ioctlsocket FIONREAD requires argp"))
+                        } else {
+                            let available = self.network.ioctlsocket_fionread(socket)?;
+                            write_u32(memory, arg_ptr, available);
+                            Ok(4)
+                        }
+                    }
+                    _ => {
+                        self.network.wsa_set_last_error(WSAEINVAL);
+                        Err(AppError::new(
+                            ReasonCode::RcCliInvalid,
+                            format!("unsupported ioctlsocket code 0x{code:08x}"),
+                        ))
+                    }
+                };
+                match result {
+                    Ok(_) => {
+                        state.set(Register::Rax, 0);
+                        self.last_error = 0;
+                        self.push_trace(
+                            "network",
+                            "ioctlsocket",
+                            BTreeMap::from([
+                                ("socket".to_string(), json!(socket)),
+                                ("code".to_string(), json!(format!("0x{code:08x}"))),
+                            ]),
+                            json!(0),
+                        );
+                    }
+                    Err(error) => {
+                        if self.network.wsa_get_last_error() == 0 {
+                            let code = match error.code {
+                                ReasonCode::RcWin32InvalidHandle => WSAENOTSOCK,
+                                _ => WSAEINVAL,
+                            };
+                            self.network.wsa_set_last_error(code);
+                        }
+                        self.push_trace(
+                            "network",
+                            "ioctlsocket",
+                            BTreeMap::from([
+                                ("socket".to_string(), json!(socket)),
+                                ("code".to_string(), json!(format!("0x{code:08x}"))),
+                                ("error".to_string(), json!(error.message.clone())),
+                                (
+                                    "wsa_error".to_string(),
+                                    json!(self.network.wsa_get_last_error()),
+                                ),
+                            ]),
+                            json!(INVALID_HANDLE_VALUE),
+                        );
+                        state.set(Register::Rax, INVALID_HANDLE_VALUE);
+                        self.last_error = 0;
+                    }
+                }
+            }
+            HostThunk::Ntohl => {
+                let value = guest_call_arg_u32(state, memory, 0)?;
+                let converted = u32::from_be(value);
+                state.set(Register::Rax, u64::from(converted));
+                self.last_error = 0;
+                self.push_trace(
+                    "network",
+                    "ntohl",
+                    BTreeMap::from([("value".to_string(), json!(value))]),
+                    json!(converted),
+                );
+            }
+            HostThunk::Ntohs => {
+                let value = guest_call_arg_u32(state, memory, 0)? as u16;
+                let converted = u16::from_be(value);
+                state.set(Register::Rax, u64::from(converted));
+                self.last_error = 0;
+                self.push_trace(
+                    "network",
+                    "ntohs",
+                    BTreeMap::from([("value".to_string(), json!(value))]),
+                    json!(converted),
+                );
+            }
+            HostThunk::Closesocket => {
+                let socket = guest_call_arg(state, memory, 0)?;
+                let result = self.network.closesocket(socket);
+                let success = result.is_ok();
+                if !success {
+                    self.network.wsa_set_last_error(WSAENOTSOCK);
+                }
+                state.set(Register::Rax, if success { 0 } else { INVALID_HANDLE_VALUE });
+                self.last_error = 0;
+                self.push_trace(
+                    "network",
+                    "closesocket",
+                    BTreeMap::from([("socket".to_string(), json!(socket))]),
+                    json!(success),
+                );
+            }
+            HostThunk::Select => {
+                let _nfds = guest_call_arg(state, memory, 0)?;
+                let readfds_ptr = guest_call_arg(state, memory, 1)?;
+                let writefds_ptr = guest_call_arg(state, memory, 2)?;
+                let exceptfds_ptr = guest_call_arg(state, memory, 3)?;
+                let readfds = fd_set_sockets(memory, readfds_ptr, self.guest_arch)?;
+                let writefds = fd_set_sockets(memory, writefds_ptr, self.guest_arch)?;
+                let mut sockets = readfds.clone();
+                for socket in &writefds {
+                    if !sockets.contains(socket) {
+                        sockets.push(*socket);
+                    }
+                }
+                let result = self.network.select(&sockets);
+                match result {
+                    Ok((readable, writable)) => {
+                        let ready_read = readfds
+                            .into_iter()
+                            .filter(|socket| readable.contains(socket))
+                            .collect::<Vec<_>>();
+                        let ready_write = writefds
+                            .into_iter()
+                            .filter(|socket| writable.contains(socket))
+                            .collect::<Vec<_>>();
+                        write_fd_set_sockets(memory, readfds_ptr, self.guest_arch, &ready_read)?;
+                        write_fd_set_sockets(memory, writefds_ptr, self.guest_arch, &ready_write)?;
+                        write_fd_set_sockets(memory, exceptfds_ptr, self.guest_arch, &[])?;
+                        let ready_count = ready_read.len() + ready_write.len();
+                        state.set(Register::Rax, ready_count as u64);
+                        self.last_error = 0;
+                        self.push_trace(
+                            "network",
+                            "select",
+                            BTreeMap::from([("socket_count".to_string(), json!(sockets.len()))]),
+                            json!(ready_count),
+                        );
+                    }
+                    Err(_) => {
+                        self.network.wsa_set_last_error(WSAENOTSOCK);
+                        state.set(Register::Rax, INVALID_HANDLE_VALUE);
+                        self.last_error = 0;
+                    }
+                }
+            }
+            HostThunk::Shutdown => {
+                let socket = guest_call_arg(state, memory, 0)?;
+                let _how = guest_call_arg(state, memory, 1)?;
+                let result = self.network.shutdown(socket);
+                let success = result.is_ok();
+                if !success {
+                    self.network.wsa_set_last_error(WSAENOTSOCK);
+                }
+                state.set(Register::Rax, if success { 0 } else { INVALID_HANDLE_VALUE });
+                self.last_error = 0;
+                self.push_trace(
+                    "network",
+                    "shutdown",
+                    BTreeMap::from([("socket".to_string(), json!(socket))]),
+                    json!(success),
+                );
+            }
+            HostThunk::Socket => {
+                let family = guest_call_arg(state, memory, 0)? as i32;
+                let _socket_type = guest_call_arg(state, memory, 1)?;
+                let _protocol = guest_call_arg(state, memory, 2)?;
+                let handle = match winsock_address_family(family) {
+                    Some(family) => match self.network.socket(family) {
+                        Ok(handle) => handle,
+                        Err(_) => {
+                            self.network.wsa_set_last_error(WSAEAFNOSUPPORT);
+                            INVALID_HANDLE_VALUE
+                        }
+                    },
+                    None => {
+                        self.network.wsa_set_last_error(WSAEAFNOSUPPORT);
+                        INVALID_HANDLE_VALUE
+                    }
+                };
+                state.set(Register::Rax, handle);
+                self.last_error = 0;
+                self.push_trace(
+                    "network",
+                    "socket",
+                    BTreeMap::from([("family".to_string(), json!(family))]),
+                    json!(handle),
+                );
+            }
+            HostThunk::WsaFdIsSet => {
+                let socket = guest_call_arg(state, memory, 0)?;
+                let fd_set_ptr = guest_call_arg(state, memory, 1)?;
+                let present = fd_set_sockets(memory, fd_set_ptr, self.guest_arch)?.contains(&socket);
+                state.set(Register::Rax, u64::from(present));
+                self.last_error = 0;
+                self.push_trace(
+                    "network",
+                    "__WSAFDIsSet",
+                    BTreeMap::from([("socket".to_string(), json!(socket))]),
+                    json!(present),
+                );
+            }
+            HostThunk::WsaIoctl => {
+                let socket = guest_call_arg(state, memory, 0)?;
+                let code = guest_call_arg_u32(state, memory, 1)?;
+                let in_buffer = guest_call_arg(state, memory, 2)?;
+                let in_length = guest_call_arg_u32(state, memory, 3)?;
+                let out_buffer = guest_call_arg(state, memory, 4)?;
+                let out_length = guest_call_arg_u32(state, memory, 5)?;
+                let bytes_returned_ptr = guest_call_arg(state, memory, 6)?;
+                let _overlapped = guest_call_arg(state, memory, 7)?;
+                let _completion_routine = guest_call_arg(state, memory, 8)?;
+                let extension_guid = if code == SIO_GET_EXTENSION_FUNCTION_POINTER && in_buffer != 0 && in_length >= 16 {
+                    read_guid_string(memory, in_buffer).ok()
+                } else {
+                    None
+                };
+                let result = match code {
+                    FIONBIO => {
+                        if in_buffer == 0 || in_length < 4 {
+                            self.network.wsa_set_last_error(WSAEINVAL);
+                            Err(AppError::new(ReasonCode::RcCliInvalid, "WSAIoctl FIONBIO requires a 4-byte input buffer"))
+                        } else {
+                            let nonblocking = read_guest_u32(memory, in_buffer)? != 0;
+                            self.network.ioctlsocket_fionbio(socket, nonblocking).map(|_| 0_u32)
+                        }
+                    }
+                    FIONREAD => {
+                        if out_buffer == 0 || out_length < 4 {
+                            self.network.wsa_set_last_error(WSAEINVAL);
+                            Err(AppError::new(ReasonCode::RcCliInvalid, "WSAIoctl FIONREAD requires a 4-byte output buffer"))
+                        } else {
+                            let available = self.network.ioctlsocket_fionread(socket)?;
+                            write_u32(memory, out_buffer, available);
+                            Ok(4)
+                        }
+                    }
+                    SIO_BASE_HANDLE => {
+                        let pointer_bytes = self.guest_arch.pointer_bytes() as u32;
+                        if out_buffer == 0 || out_length < pointer_bytes {
+                            self.network.wsa_set_last_error(WSAEINVAL);
+                            Err(AppError::new(
+                                ReasonCode::RcCliInvalid,
+                                "WSAIoctl SIO_BASE_HANDLE requires a socket-sized output buffer",
+                            ))
+                        } else {
+                            write_guest_pointer(memory, out_buffer, socket, self.guest_arch)?;
+                            Ok(pointer_bytes)
+                        }
+                    }
+                    SIO_GET_EXTENSION_FUNCTION_POINTER => {
+                        let pointer_bytes = self.guest_arch.pointer_bytes() as u32;
+                        if out_buffer == 0 || out_length < pointer_bytes {
+                            self.network.wsa_set_last_error(WSAEINVAL);
+                            Err(AppError::new(
+                                ReasonCode::RcCliInvalid,
+                                "WSAIoctl SIO_GET_EXTENSION_FUNCTION_POINTER requires a function-pointer output buffer",
+                            ))
+                        } else if let Some(guid) = extension_guid.as_deref() {
+                            if let Some(thunk_address) = self.winsock_extension_function(guid) {
+                                write_guest_pointer(memory, out_buffer, thunk_address, self.guest_arch)?;
+                                Ok(pointer_bytes)
+                            } else {
+                                self.network.wsa_set_last_error(WSAEINVAL);
+                                Err(AppError::new(
+                                    ReasonCode::RcCliInvalid,
+                                    format!("unsupported Winsock extension GUID {guid}"),
+                                ))
+                            }
+                        } else {
+                            self.network.wsa_set_last_error(WSAEINVAL);
+                            Err(AppError::new(
+                                ReasonCode::RcCliInvalid,
+                                "WSAIoctl SIO_GET_EXTENSION_FUNCTION_POINTER requires a GUID input buffer",
+                            ))
+                        }
+                    }
+                    _ => {
+                        self.network.wsa_set_last_error(WSAEINVAL);
+                        Err(AppError::new(
+                            ReasonCode::RcCliInvalid,
+                            format!("unsupported WSAIoctl code 0x{code:08x}"),
+                        ))
+                    }
+                };
+                match result {
+                    Ok(bytes_returned) => {
+                        if bytes_returned_ptr != 0 {
+                            write_u32(memory, bytes_returned_ptr, bytes_returned);
+                        }
+                        state.set(Register::Rax, 0);
+                        self.last_error = 0;
+                        self.push_trace(
+                            "network",
+                            "WSAIoctl",
+                            BTreeMap::from([
+                                ("socket".to_string(), json!(socket)),
+                                ("code".to_string(), json!(format!("0x{code:08x}"))),
+                                ("guid".to_string(), json!(extension_guid)),
+                                ("in_length".to_string(), json!(in_length)),
+                                ("out_length".to_string(), json!(out_length)),
+                            ]),
+                            json!(bytes_returned),
+                        );
+                    }
+                    Err(error) => {
+                        if self.network.wsa_get_last_error() == 0 {
+                            let code = match error.code {
+                                ReasonCode::RcWin32InvalidHandle => WSAENOTSOCK,
+                                _ => WSAEINVAL,
+                            };
+                            self.network.wsa_set_last_error(code);
+                        }
+                        self.push_trace(
+                            "network",
+                            "WSAIoctl",
+                            BTreeMap::from([
+                                ("socket".to_string(), json!(socket)),
+                                ("code".to_string(), json!(format!("0x{code:08x}"))),
+                                ("guid".to_string(), json!(extension_guid)),
+                                ("in_length".to_string(), json!(in_length)),
+                                ("out_length".to_string(), json!(out_length)),
+                                ("error".to_string(), json!(error.message.clone())),
+                                (
+                                    "wsa_error".to_string(),
+                                    json!(self.network.wsa_get_last_error()),
+                                ),
+                            ]),
+                            json!(INVALID_HANDLE_VALUE),
+                        );
+                        state.set(Register::Rax, INVALID_HANDLE_VALUE);
+                        self.last_error = 0;
+                    }
+                }
+            }
+            HostThunk::WsaSocketA => {
+                let family = guest_call_arg(state, memory, 0)? as i32;
+                let _socket_type = guest_call_arg(state, memory, 1)?;
+                let _protocol = guest_call_arg(state, memory, 2)?;
+                let _protocol_info = guest_call_arg(state, memory, 3)?;
+                let _group = guest_call_arg(state, memory, 4)?;
+                let _flags = guest_call_arg(state, memory, 5)?;
+                let handle = match winsock_address_family(family) {
+                    Some(family) => match self.network.socket(family) {
+                        Ok(handle) => handle,
+                        Err(_) => {
+                            self.network.wsa_set_last_error(WSAEAFNOSUPPORT);
+                            INVALID_HANDLE_VALUE
+                        }
+                    },
+                    None => {
+                        self.network.wsa_set_last_error(WSAEAFNOSUPPORT);
+                        INVALID_HANDLE_VALUE
+                    }
+                };
+                state.set(Register::Rax, handle);
+                self.last_error = 0;
+                self.push_trace(
+                    "network",
+                    "WSASocketA",
+                    BTreeMap::from([("family".to_string(), json!(family))]),
+                    json!(handle),
+                );
+            }
             HostThunk::GetCurrentThreadId => {
                 let thread_id = 1_u32;
                 state.set(Register::Rax, u64::from(thread_id));
@@ -7174,6 +11460,145 @@ impl PeHostRuntime {
                 state.set(Register::Rax, u64::from(process_id));
                 self.last_error = 0;
                 self.push_trace("process", "GetCurrentProcessId", BTreeMap::new(), json!(process_id));
+            }
+            HostThunk::ProcessIdToSessionId => {
+                let process_id = guest_call_arg_u32(state, memory, 0)?;
+                let session_id_ptr = guest_call_arg(state, memory, 1)?;
+                if session_id_ptr == 0 {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                } else {
+                    let snapshot = self.win32.create_toolhelp_snapshot();
+                    let found = snapshot
+                        .processes
+                        .iter()
+                        .any(|process| process.process_id == process_id);
+                    if found {
+                        write_u32(memory, session_id_ptr, 1);
+                        state.set(Register::Rax, 1);
+                        self.last_error = 0;
+                        self.push_trace(
+                            "process",
+                            "ProcessIdToSessionId",
+                            BTreeMap::from([("process_id".to_string(), json!(process_id))]),
+                            json!(1),
+                        );
+                    } else {
+                        write_u32(memory, session_id_ptr, 0);
+                        state.set(Register::Rax, 0);
+                        self.last_error = ERROR_INVALID_PARAMETER;
+                    }
+                }
+            }
+            HostThunk::GetCurrentProcess => {
+                let handle = self.win32.current_process_handle();
+                state.set(Register::Rax, u64::from(handle));
+                self.last_error = 0;
+                self.push_trace("process", "GetCurrentProcess", BTreeMap::new(), json!(format!("{handle:#x}")));
+            }
+            HostThunk::EnumProcesses => {
+                let process_ids_ptr = guest_call_arg(state, memory, 0)?;
+                let buffer_bytes = guest_call_arg_u32(state, memory, 1)?;
+                let bytes_needed_ptr = guest_call_arg(state, memory, 2)?;
+                let snapshot = self.win32.create_toolhelp_snapshot();
+                let process_ids = snapshot
+                    .processes
+                    .iter()
+                    .map(|process| process.process_id)
+                    .collect::<Vec<_>>();
+                let bytes_needed = process_ids.len().saturating_mul(std::mem::size_of::<u32>()) as u32;
+                if bytes_needed_ptr != 0 {
+                    write_u32(memory, bytes_needed_ptr, bytes_needed);
+                }
+                if process_ids_ptr != 0 && buffer_bytes != 0 {
+                    let capacity = buffer_bytes as usize / std::mem::size_of::<u32>();
+                    for (index, process_id) in process_ids.iter().take(capacity).enumerate() {
+                        write_u32(
+                            memory,
+                            process_ids_ptr + (index as u64 * std::mem::size_of::<u32>() as u64),
+                            *process_id,
+                        );
+                    }
+                }
+                state.set(Register::Rax, 1);
+                self.last_error = 0;
+                self.push_trace(
+                    "process",
+                    "EnumProcesses",
+                    BTreeMap::from([("process_count".to_string(), json!(process_ids.len()))]),
+                    json!(bytes_needed),
+                );
+            }
+            HostThunk::EnumProcessModules => {
+                let process_handle = guest_call_arg(state, memory, 0)?;
+                let modules_ptr = guest_call_arg(state, memory, 1)?;
+                let buffer_bytes = guest_call_arg_u32(state, memory, 2)?;
+                let bytes_needed_ptr = guest_call_arg(state, memory, 3)?;
+                let current_process_handle = u64::from(self.win32.current_process_handle());
+                if process_handle != current_process_handle {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_HANDLE;
+                } else {
+                    let module_handles = self.current_process_module_handles();
+                    let pointer_bytes = self.guest_arch.pointer_bytes() as u32;
+                    let bytes_needed = module_handles.len().saturating_mul(pointer_bytes as usize) as u32;
+                    if bytes_needed_ptr != 0 {
+                        write_u32(memory, bytes_needed_ptr, bytes_needed);
+                    }
+                    if modules_ptr != 0 && buffer_bytes != 0 {
+                        let capacity = buffer_bytes / pointer_bytes;
+                        for (index, module_handle) in module_handles.iter().take(capacity as usize).enumerate() {
+                            write_guest_pointer(
+                                memory,
+                                modules_ptr + (index as u64 * pointer_bytes as u64),
+                                *module_handle,
+                                self.guest_arch,
+                            )?;
+                        }
+                    }
+                    state.set(Register::Rax, 1);
+                    self.last_error = 0;
+                    self.push_trace(
+                        "process",
+                        "EnumProcessModules",
+                        BTreeMap::from([
+                            ("process_handle".to_string(), json!(format!("{process_handle:#x}"))),
+                            ("module_count".to_string(), json!(module_handles.len())),
+                        ]),
+                        json!(bytes_needed),
+                    );
+                }
+            }
+            HostThunk::GetModuleBaseNameA => {
+                let process_handle = guest_call_arg(state, memory, 0)?;
+                let module_handle = guest_call_arg(state, memory, 1)?;
+                let buffer = guest_call_arg(state, memory, 2)?;
+                let size = guest_call_arg_u32(state, memory, 3)?;
+                let current_process_handle = u64::from(self.win32.current_process_handle());
+                let (written, last_error, module_name) = if process_handle != current_process_handle {
+                    (0, ERROR_INVALID_HANDLE, String::new())
+                } else if buffer == 0 || size == 0 {
+                    (0, ERROR_INVALID_PARAMETER, String::new())
+                } else {
+                    let module_name = self.module_base_name(module_handle);
+                    if module_name.is_empty() {
+                        (0, ERROR_INVALID_HANDLE, module_name)
+                    } else {
+                        (write_ansi_api_string(memory, buffer, size, &module_name)?, 0, module_name)
+                    }
+                };
+                state.set(Register::Rax, written as u64);
+                self.last_error = last_error;
+                self.push_trace(
+                    "process",
+                    "GetModuleBaseNameA",
+                    BTreeMap::from([
+                        ("process_handle".to_string(), json!(format!("{process_handle:#x}"))),
+                        ("module_handle".to_string(), json!(format!("{module_handle:#x}"))),
+                        ("module_name".to_string(), json!(module_name)),
+                    ]),
+                    json!(written),
+                );
             }
             HostThunk::QueryPerformanceCounter => {
                 let counter_ptr = guest_call_arg(state, memory, 0)?;
@@ -7209,6 +11634,74 @@ impl PeHostRuntime {
                         BTreeMap::from([("frequency".to_string(), json!(format!("{frequency_ptr:#x}")))]),
                         json!(frequency),
                     );
+                }
+            }
+            HostThunk::VerSetConditionMask => {
+                let (existing_mask, type_mask, condition_mask) = match self.guest_arch {
+                    GuestArch::X64 => (
+                        state.get(Register::Rcx),
+                        state.get(Register::Rdx) as u32,
+                        (state.get(Register::R8) & 0xff) as u8,
+                    ),
+                    GuestArch::X86 => (
+                        read_guest_u64(memory, state.get(Register::Rsp))?,
+                        read_u32(memory, state.get(Register::Rsp).wrapping_add(8))?,
+                        (read_u32(memory, state.get(Register::Rsp).wrapping_add(12))? & 0xff) as u8,
+                    ),
+                };
+                let updated_mask = apply_ver_condition_mask(existing_mask, type_mask, condition_mask);
+                if self.guest_arch == GuestArch::X86 {
+                    state.set(Register::Rax, updated_mask as u32 as u64);
+                    state.set(Register::Rdx, updated_mask >> 32);
+                } else {
+                    state.set(Register::Rax, updated_mask);
+                }
+                self.last_error = 0;
+                self.push_trace(
+                    "version",
+                    "VerSetConditionMask",
+                    BTreeMap::from([
+                        ("existing_mask".to_string(), json!(format!("{existing_mask:#x}"))),
+                        ("type_mask".to_string(), json!(format!("0x{type_mask:08x}"))),
+                        ("condition_mask".to_string(), json!(condition_mask)),
+                    ]),
+                    json!(format!("{updated_mask:#x}")),
+                );
+            }
+            HostThunk::VerifyVersionInfoW => {
+                let version_info_ptr = guest_call_arg(state, memory, 0)?;
+                let type_mask = guest_call_arg_u32(state, memory, 1)?;
+                let condition_mask = match self.guest_arch {
+                    GuestArch::X64 => state.get(Register::R8),
+                    GuestArch::X86 => guest_call_arg(state, memory, 2)? | (guest_call_arg(state, memory, 3)? << 32),
+                };
+                let extended_mask = VER_SERVICEPACKMINOR | VER_SERVICEPACKMAJOR | VER_SUITENAME | VER_PRODUCT_TYPE;
+                if version_info_ptr == 0 {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                } else {
+                    let info_size = read_u32(memory, version_info_ptr)?;
+                    if info_size < OSVERSIONINFOW_SIZE || (type_mask & extended_mask != 0 && info_size < OSVERSIONINFOEXW_SIZE) {
+                        state.set(Register::Rax, 0);
+                        self.last_error = ERROR_INVALID_PARAMETER;
+                    } else {
+                        let requested = read_guest_version_info(memory, version_info_ptr)?;
+                        let actual = guest_version_info_from_profile(&self.win32.ge().config.winver)?;
+                        let matches = verify_version_info(&actual, &requested, type_mask, condition_mask)?;
+                        state.set(Register::Rax, if matches { 1 } else { 0 });
+                        self.last_error = if matches { 0 } else { ERROR_OLD_WIN_VERSION };
+                        self.push_trace(
+                            "version",
+                            "VerifyVersionInfoW",
+                            BTreeMap::from([
+                                ("version_info".to_string(), json!(format!("{version_info_ptr:#x}"))),
+                                ("type_mask".to_string(), json!(format!("{type_mask:#x}"))),
+                                ("condition_mask".to_string(), json!(format!("{condition_mask:#x}"))),
+                                ("profile".to_string(), json!(self.win32.ge().config.winver.clone())),
+                            ]),
+                            json!(matches),
+                        );
+                    }
                 }
             }
             HostThunk::IsProcessorFeaturePresent => {
@@ -7295,10 +11788,46 @@ impl PeHostRuntime {
                 if heap != PROCESS_HEAP_HANDLE {
                     state.set(Register::Rax, 0);
                     self.last_error = ERROR_INVALID_PARAMETER;
+                    self.push_trace(
+                        "memory",
+                        "HeapReAlloc",
+                        BTreeMap::from([
+                            ("heap".to_string(), json!(format!("{heap:#x}"))),
+                            ("flags".to_string(), json!(flags)),
+                            ("old_address".to_string(), json!(format!("{address:#x}"))),
+                            ("bytes".to_string(), json!(bytes as u64)),
+                            ("status".to_string(), json!("invalid-heap")),
+                        ]),
+                        json!(0),
+                    );
+                    self.push_trace(
+                        "process",
+                        "HeapReAllocFailure",
+                        BTreeMap::from([
+                            ("heap".to_string(), json!(format!("{heap:#x}"))),
+                            ("flags".to_string(), json!(flags)),
+                            ("old_address".to_string(), json!(format!("{address:#x}"))),
+                            ("bytes".to_string(), json!(bytes as u64)),
+                            ("status".to_string(), json!("invalid-heap")),
+                        ]),
+                        json!(0),
+                    );
                 } else if address == 0 {
                     let new_address = self.alloc_heap(memory, bytes.max(1), (flags & HEAP_ZERO_MEMORY) != 0)?;
                     state.set(Register::Rax, new_address);
                     self.last_error = 0;
+                    self.push_trace(
+                        "memory",
+                        "HeapReAlloc",
+                        BTreeMap::from([
+                            ("heap".to_string(), json!(format!("{heap:#x}"))),
+                            ("flags".to_string(), json!(flags)),
+                            ("old_address".to_string(), json!(format!("{address:#x}"))),
+                            ("bytes".to_string(), json!(bytes as u64)),
+                            ("status".to_string(), json!("allocate")),
+                        ]),
+                        json!(new_address),
+                    );
                 } else if let Some(old_size) = self.heap_allocations.remove(&address) {
                     let new_address = self.alloc_heap(memory, bytes.max(1), (flags & HEAP_ZERO_MEMORY) != 0)?;
                     let copy_len = old_size.min(bytes.max(1));
@@ -7323,6 +11852,30 @@ impl PeHostRuntime {
                 } else {
                     state.set(Register::Rax, 0);
                     self.last_error = ERROR_INVALID_PARAMETER;
+                    self.push_trace(
+                        "memory",
+                        "HeapReAlloc",
+                        BTreeMap::from([
+                            ("heap".to_string(), json!(format!("{heap:#x}"))),
+                            ("flags".to_string(), json!(flags)),
+                            ("old_address".to_string(), json!(format!("{address:#x}"))),
+                            ("bytes".to_string(), json!(bytes as u64)),
+                            ("status".to_string(), json!("unknown-address")),
+                        ]),
+                        json!(0),
+                    );
+                    self.push_trace(
+                        "process",
+                        "HeapReAllocFailure",
+                        BTreeMap::from([
+                            ("heap".to_string(), json!(format!("{heap:#x}"))),
+                            ("flags".to_string(), json!(flags)),
+                            ("old_address".to_string(), json!(format!("{address:#x}"))),
+                            ("bytes".to_string(), json!(bytes as u64)),
+                            ("status".to_string(), json!("unknown-address")),
+                        ]),
+                        json!(0),
+                    );
                 }
             }
             HostThunk::HeapSize => {
@@ -7399,6 +11952,84 @@ impl PeHostRuntime {
                 };
                 self.push_trace("file", "GetFileType", BTreeMap::new(), json!(file_type));
             }
+            HostThunk::GetFileInformationByHandle => {
+                let handle = guest_call_arg_u32(state, memory, 0)?;
+                let information_ptr = guest_call_arg(state, memory, 1)?;
+                match self.win32.get_file_information_by_handle_ex(handle) {
+                    Ok(info) => {
+                        if information_ptr != 0 {
+                            write_file_information_by_handle(memory, information_ptr, &info);
+                        }
+                        state.set(Register::Rax, 1);
+                        self.last_error = 0;
+                        self.push_trace(
+                            "file",
+                            "GetFileInformationByHandle",
+                            BTreeMap::from([
+                                ("handle".to_string(), json!(format!("{handle:#x}"))),
+                                (
+                                    "file_information".to_string(),
+                                    json!(format!("{information_ptr:#x}")),
+                                ),
+                                ("path".to_string(), json!(info.normalized_path.clone())),
+                            ]),
+                            json!(1),
+                        );
+                    }
+                    Err(error) => {
+                        state.set(Register::Rax, 0);
+                        self.last_error = last_error_from_app_error(&error);
+                        self.push_trace(
+                            "file",
+                            "GetFileInformationByHandle",
+                            BTreeMap::from([
+                                ("handle".to_string(), json!(format!("{handle:#x}"))),
+                                (
+                                    "file_information".to_string(),
+                                    json!(format!("{information_ptr:#x}")),
+                                ),
+                                ("error".to_string(), json!(error.message.clone())),
+                            ]),
+                            json!(0),
+                        );
+                    }
+                }
+            }
+            HostThunk::AreFileApisANSI => {
+                state.set(Register::Rax, 1);
+                self.last_error = 0;
+                self.push_trace("file", "AreFileApisANSI", BTreeMap::new(), json!(1));
+            }
+            HostThunk::GetCurrentPackageId => {
+                let buffer_length_ptr = guest_call_arg(state, memory, 0)?;
+                let _buffer = guest_call_arg(state, memory, 1)?;
+                if buffer_length_ptr != 0 {
+                    write_u32(memory, buffer_length_ptr, 0);
+                }
+                state.set(Register::Rax, APPMODEL_ERROR_NO_PACKAGE as u64);
+                self.last_error = 0;
+                self.push_trace(
+                    "process",
+                    "GetCurrentPackageId",
+                    BTreeMap::from([(
+                        "buffer_length_ptr".to_string(),
+                        json!(format!("{buffer_length_ptr:#x}")),
+                    )]),
+                    json!(APPMODEL_ERROR_NO_PACKAGE),
+                );
+            }
+            HostThunk::RtlNtStatusToDosError => {
+                let status = guest_call_arg_u32(state, memory, 0)?;
+                let error = ntstatus_to_dos_error(status);
+                state.set(Register::Rax, error as u64);
+                self.last_error = 0;
+                self.push_trace(
+                    "process",
+                    "RtlNtStatusToDosError",
+                    BTreeMap::from([("status".to_string(), json!(format!("{status:#x}")))]),
+                    json!(error),
+                );
+            }
             HostThunk::GetSystemTimeAsFileTime => {
                 let file_time_ptr = guest_call_arg(state, memory, 0)?;
                 let ticks = current_guest_filetime_ticks(self.dtm);
@@ -7414,6 +12045,44 @@ impl PeHostRuntime {
                     json!(ticks),
                 );
             }
+            HostThunk::GetSystemTimePreciseAsFileTime => {
+                let file_time_ptr = guest_call_arg(state, memory, 0)?;
+                let ticks = current_guest_filetime_ticks(self.dtm);
+                if file_time_ptr != 0 {
+                    write_u64(memory, file_time_ptr, ticks);
+                }
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+                self.push_trace(
+                    "time",
+                    "GetSystemTimePreciseAsFileTime",
+                    BTreeMap::from([("file_time".to_string(), json!(format!("{file_time_ptr:#x}")))]),
+                    json!(ticks),
+                );
+            }
+            HostThunk::GetTimeZoneInformation => {
+                let time_zone_information_ptr = guest_call_arg(state, memory, 0)?;
+                let info = current_host_time_zone_information(self.dtm);
+                if time_zone_information_ptr != 0 {
+                    write_time_zone_information(memory, time_zone_information_ptr, &info);
+                }
+                state.set(Register::Rax, u64::from(info.result));
+                self.last_error = 0;
+                self.push_trace(
+                    "time",
+                    "GetTimeZoneInformation",
+                    BTreeMap::from([
+                        (
+                            "time_zone_information".to_string(),
+                            json!(format!("{time_zone_information_ptr:#x}")),
+                        ),
+                        ("bias_minutes".to_string(), json!(info.bias_minutes)),
+                        ("standard_name".to_string(), json!(info.standard_name.clone())),
+                        ("daylight_name".to_string(), json!(info.daylight_name.clone())),
+                    ]),
+                    json!(info.result),
+                );
+            }
             HostThunk::GetTickCount => {
                 let milliseconds = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
@@ -7425,14 +12094,39 @@ impl PeHostRuntime {
                 self.push_trace("time", "GetTickCount", BTreeMap::new(), json!(milliseconds));
             }
             HostThunk::InitializeCriticalSection => {
-                self.critical_sections.entry(state.get(Register::Rcx)).or_insert(0);
+                let critical_section = guest_call_arg(state, memory, 0)?;
+                let before = self.critical_sections.get(&critical_section).copied();
+                self.critical_sections.entry(critical_section).or_insert(0);
+                self.sync_guest_critical_section(memory, critical_section, 0, 0, Some(0));
+                self.trace_steam_critical_section_state(
+                    "InitializeCriticalSection",
+                    caller_rva,
+                    critical_section,
+                    before,
+                    Some(0),
+                );
                 state.set(Register::Rax, 1);
                 self.last_error = 0;
+                self.push_trace(
+                    "process",
+                    "InitializeCriticalSection",
+                    BTreeMap::from([("critical_section".to_string(), json!(format!("{critical_section:#x}")))]),
+                    json!(1),
+                );
             }
             HostThunk::InitializeCriticalSectionAndSpinCount => {
                 let critical_section = guest_call_arg(state, memory, 0)?;
                 let spin_count = guest_call_arg_u32(state, memory, 1)?;
+                let before = self.critical_sections.get(&critical_section).copied();
                 self.critical_sections.entry(critical_section).or_insert(0);
+                self.sync_guest_critical_section(memory, critical_section, 0, 0, Some(spin_count));
+                self.trace_steam_critical_section_state(
+                    "InitializeCriticalSectionAndSpinCount",
+                    caller_rva,
+                    critical_section,
+                    before,
+                    Some(0),
+                );
                 state.set(Register::Rax, 1);
                 self.last_error = 0;
                 self.push_trace(
@@ -7445,19 +12139,243 @@ impl PeHostRuntime {
                     json!(1),
                 );
             }
+            HostThunk::InitializeCriticalSectionEx => {
+                let critical_section = guest_call_arg(state, memory, 0)?;
+                let spin_count = guest_call_arg_u32(state, memory, 1)?;
+                let flags = guest_call_arg_u32(state, memory, 2)?;
+                let before = self.critical_sections.get(&critical_section).copied();
+                self.critical_sections.entry(critical_section).or_insert(0);
+                self.sync_guest_critical_section(memory, critical_section, 0, 0, Some(spin_count));
+                self.trace_steam_critical_section_state(
+                    "InitializeCriticalSectionEx",
+                    caller_rva,
+                    critical_section,
+                    before,
+                    Some(0),
+                );
+                state.set(Register::Rax, 1);
+                self.last_error = 0;
+                self.push_trace(
+                    "process",
+                    "InitializeCriticalSectionEx",
+                    BTreeMap::from([
+                        ("critical_section".to_string(), json!(format!("{critical_section:#x}"))),
+                        ("spin_count".to_string(), json!(spin_count)),
+                        ("flags".to_string(), json!(flags)),
+                    ]),
+                    json!(1),
+                );
+            }
             HostThunk::LeaveCriticalSection => {
-                let address = state.get(Register::Rcx);
-                if let Some(depth) = self.critical_sections.get_mut(&address) {
-                    *depth = depth.saturating_sub(1);
+                let address = guest_call_arg(state, memory, 0)?;
+                let before = self.critical_sections.get(&address).copied();
+                let after = if let Some(depth) = self.critical_sections.get_mut(&address) {
+                    let depth = {
+                        *depth = depth.saturating_sub(1);
+                        *depth
+                    };
+                    self.sync_guest_critical_section(memory, address, depth, 1, None);
+                    Some(depth)
+                } else {
+                    self.sync_guest_critical_section(memory, address, 0, 0, None);
+                    None
+                };
+                self.trace_steam_critical_section_state(
+                    "LeaveCriticalSection",
+                    caller_rva,
+                    address,
+                    before,
+                    after,
+                );
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+                self.push_trace(
+                    "process",
+                    "LeaveCriticalSection",
+                    BTreeMap::from([("critical_section".to_string(), json!(format!("{address:#x}")))]),
+                    json!(0),
+                );
+            }
+            HostThunk::SleepConditionVariableCS => {
+                let condition_variable = guest_call_arg(state, memory, 0)?;
+                let critical_section = guest_call_arg(state, memory, 1)?;
+                let timeout_ms = guest_call_arg_u32(state, memory, 2)?;
+                let held_depth = self.critical_sections.get(&critical_section).copied().unwrap_or(0);
+
+                if condition_variable == 0 || critical_section == 0 || held_depth == 0 {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                    self.push_trace(
+                        "sync",
+                        "SleepConditionVariableCS",
+                        BTreeMap::from([
+                            ("condition_variable".to_string(), json!(format!("{condition_variable:#x}"))),
+                            ("critical_section".to_string(), json!(format!("{critical_section:#x}"))),
+                            ("timeout_ms".to_string(), json!(timeout_ms)),
+                            ("held_depth".to_string(), json!(held_depth)),
+                        ]),
+                        json!(false),
+                    );
+                } else {
+                    let observed_generation = {
+                        let condition = self.condition_variables.entry(condition_variable).or_default();
+                        condition.waiters += 1;
+                        condition.wake_generation
+                    };
+
+                    let before_release = self.critical_sections.get(&critical_section).copied();
+                    self.critical_sections.insert(critical_section, 0);
+                    self.sync_guest_critical_section(memory, critical_section, 0, 0, None);
+                    self.trace_steam_critical_section_state(
+                        "SleepConditionVariableCSRelease",
+                        caller_rva,
+                        critical_section,
+                        before_release,
+                        Some(0),
+                    );
+
+                    let woke = self
+                        .condition_variables
+                        .get(&condition_variable)
+                        .map(|condition| condition.wake_generation > observed_generation)
+                        .unwrap_or(false);
+                    if !woke && timeout_ms != 0 && timeout_ms != u32::MAX {
+                        self.win32.sleep(timeout_ms as u64);
+                    }
+
+                    let remove_condition = if let Some(condition) = self.condition_variables.get_mut(&condition_variable) {
+                        condition.waiters = condition.waiters.saturating_sub(1);
+                        condition.waiters == 0 && condition.wake_generation == 0
+                    } else {
+                        false
+                    };
+                    if remove_condition {
+                        self.condition_variables.remove(&condition_variable);
+                    }
+
+                    let before_reacquire = self.critical_sections.get(&critical_section).copied();
+                    self.critical_sections.insert(critical_section, held_depth);
+                    self.sync_guest_critical_section(memory, critical_section, held_depth, 1, None);
+                    self.trace_steam_critical_section_state(
+                        "SleepConditionVariableCSReacquire",
+                        caller_rva,
+                        critical_section,
+                        before_reacquire,
+                        Some(held_depth),
+                    );
+                    state.set(Register::Rax, u64::from(woke));
+                    self.last_error = if woke { 0 } else { ERROR_TIMEOUT };
+                    self.push_trace(
+                        "sync",
+                        "SleepConditionVariableCS",
+                        BTreeMap::from([
+                            ("condition_variable".to_string(), json!(format!("{condition_variable:#x}"))),
+                            ("critical_section".to_string(), json!(format!("{critical_section:#x}"))),
+                            ("timeout_ms".to_string(), json!(timeout_ms)),
+                            ("held_depth".to_string(), json!(held_depth)),
+                            ("woke".to_string(), json!(woke)),
+                        ]),
+                        json!(woke),
+                    );
+                }
+            }
+            HostThunk::WakeAllConditionVariable => {
+                let condition_variable = guest_call_arg(state, memory, 0)?;
+                let waiters = self
+                    .condition_variables
+                    .get(&condition_variable)
+                    .map(|condition| condition.waiters)
+                    .unwrap_or(0);
+                if let Some(condition) = self.condition_variables.get_mut(&condition_variable) {
+                    if condition.waiters != 0 {
+                        condition.wake_generation = condition.wake_generation.wrapping_add(1);
+                    }
                 }
                 state.set(Register::Rax, 0);
                 self.last_error = 0;
+                self.push_trace(
+                    "sync",
+                    "WakeAllConditionVariable",
+                    BTreeMap::from([
+                        ("condition_variable".to_string(), json!(format!("{condition_variable:#x}"))),
+                        ("waiters".to_string(), json!(waiters)),
+                    ]),
+                    json!(0),
+                );
+            }
+            HostThunk::EncodePointer => {
+                let value = guest_call_arg(state, memory, 0)?;
+                let cookie = self.pointer_encoding_cookie(memory)?;
+                let encoded = encode_pointer_value(value, cookie, self.guest_arch);
+                state.set(Register::Rax, encoded);
+                self.last_error = 0;
+                self.push_trace(
+                    "process",
+                    "EncodePointer",
+                    BTreeMap::from([
+                        ("value".to_string(), json!(format!("{value:#x}"))),
+                        ("cookie".to_string(), json!(format!("{cookie:#x}"))),
+                    ]),
+                    json!(format!("{encoded:#x}")),
+                );
+            }
+            HostThunk::DecodePointer => {
+                let value = guest_call_arg(state, memory, 0)?;
+                let cookie = self.pointer_encoding_cookie(memory)?;
+                let decoded = decode_pointer_value(value, cookie, self.guest_arch);
+                state.set(Register::Rax, decoded);
+                self.last_error = 0;
+                self.push_trace(
+                    "process",
+                    "DecodePointer",
+                    BTreeMap::from([
+                        ("value".to_string(), json!(format!("{value:#x}"))),
+                        ("cookie".to_string(), json!(format!("{cookie:#x}"))),
+                    ]),
+                    json!(format!("{decoded:#x}")),
+                );
+            }
+            HostThunk::UnhandledExceptionFilter => {
+                let exception_info = guest_call_arg(state, memory, 0)?;
+                let installed_filter = self.unhandled_exception_filter;
+                let result = if installed_filter != 0 {
+                    self.execute_guest_callback(
+                        state,
+                        memory,
+                        installed_filter,
+                        &[exception_info],
+                        "UnhandledExceptionFilter",
+                    )?
+                } else {
+                    0
+                };
+                state.set(Register::Rax, result);
+                self.last_error = 0;
+                self.push_trace(
+                    "process",
+                    "UnhandledExceptionFilter",
+                    BTreeMap::from([
+                        ("exception_info".to_string(), json!(format!("{exception_info:#x}"))),
+                        ("installed_filter".to_string(), json!(format!("{installed_filter:#x}"))),
+                    ]),
+                    json!(format!("{result:#x}")),
+                );
             }
             HostThunk::SetUnhandledExceptionFilter => {
+                let new_filter = guest_call_arg(state, memory, 0)?;
                 let previous = self.unhandled_exception_filter;
-                self.unhandled_exception_filter = state.get(Register::Rcx);
+                self.unhandled_exception_filter = new_filter;
                 state.set(Register::Rax, previous);
                 self.last_error = 0;
+                self.push_trace(
+                    "process",
+                    "SetUnhandledExceptionFilter",
+                    BTreeMap::from([
+                        ("previous".to_string(), json!(format!("{previous:#x}"))),
+                        ("new".to_string(), json!(format!("{new_filter:#x}"))),
+                    ]),
+                    json!(format!("{previous:#x}")),
+                );
             }
             HostThunk::GetVersion => {
                 const WINDOWS_10_BUILD_22H2: u32 = (19045u32 << 16) | 10u32;
@@ -7548,6 +12466,57 @@ impl PeHostRuntime {
                     json!(freed),
                 );
             }
+            HostThunk::FlsAlloc => {
+                let _callback = guest_call_arg(state, memory, 0)?;
+                if let Some(slot) = (0_u32..4096).find(|slot| !self.fls_slots.contains_key(slot)) {
+                    self.fls_slots.insert(slot, 0);
+                    state.set(Register::Rax, u64::from(slot));
+                    self.last_error = 0;
+                    self.push_trace("thread", "FlsAlloc", BTreeMap::new(), json!(slot));
+                } else {
+                    state.set(Register::Rax, u32::MAX as u64);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                }
+            }
+            HostThunk::FlsGetValue => {
+                let slot = guest_call_arg_u32(state, memory, 0)?;
+                let value = self.fls_slots.get(&slot).copied().unwrap_or(0);
+                state.set(Register::Rax, value);
+                self.last_error = 0;
+            }
+            HostThunk::FlsSetValue => {
+                let slot = guest_call_arg_u32(state, memory, 0)?;
+                let value = guest_call_arg(state, memory, 1)?;
+                let stored = if let Some(entry) = self.fls_slots.get_mut(&slot) {
+                    *entry = value;
+                    true
+                } else {
+                    false
+                };
+                state.set(Register::Rax, u64::from(stored));
+                self.last_error = if stored { 0 } else { ERROR_INVALID_PARAMETER };
+                self.push_trace(
+                    "thread",
+                    "FlsSetValue",
+                    BTreeMap::from([
+                        ("slot".to_string(), json!(slot)),
+                        ("value".to_string(), json!(format!("{value:#x}"))),
+                    ]),
+                    json!(stored),
+                );
+            }
+            HostThunk::FlsFree => {
+                let slot = guest_call_arg_u32(state, memory, 0)?;
+                let freed = self.fls_slots.remove(&slot).is_some();
+                state.set(Register::Rax, u64::from(freed));
+                self.last_error = if freed { 0 } else { ERROR_INVALID_PARAMETER };
+                self.push_trace(
+                    "thread",
+                    "FlsFree",
+                    BTreeMap::from([("slot".to_string(), json!(slot))]),
+                    json!(freed),
+                );
+            }
             HostThunk::VirtualAlloc => {
                 let requested_address = guest_call_arg(state, memory, 0)?;
                 let bytes = guest_call_arg(state, memory, 1)? as usize;
@@ -7574,47 +12543,113 @@ impl PeHostRuntime {
                 }
             }
             HostThunk::VirtualProtect => {
+                let address = guest_call_arg(state, memory, 0)?;
+                let bytes = guest_call_arg(state, memory, 1)?;
+                let new_protect = guest_call_arg_u32(state, memory, 2)?;
                 let old_protect_ptr = guest_call_arg(state, memory, 3)?;
                 if old_protect_ptr != 0 {
                     write_u32(memory, old_protect_ptr, PAGE_EXECUTE_READWRITE);
                 }
                 state.set(Register::Rax, 1);
                 self.last_error = 0;
+                self.push_trace(
+                    "memory",
+                    "VirtualProtect",
+                    BTreeMap::from([
+                        ("caller_rip".to_string(), json!(format!("{return_address:#x}"))),
+                        ("address".to_string(), json!(format!("{address:#x}"))),
+                        ("bytes".to_string(), json!(bytes)),
+                        ("new_protect".to_string(), json!(format!("0x{new_protect:08x}"))),
+                        ("old_protect_ptr".to_string(), json!(format!("{old_protect_ptr:#x}"))),
+                    ]),
+                    json!(1),
+                );
             }
             HostThunk::VirtualQuery => {
                 let address = guest_call_arg(state, memory, 0)?;
                 let buffer = guest_call_arg(state, memory, 1)?;
                 let length = guest_call_arg(state, memory, 2)?;
-                if length < MEMORY_BASIC_INFORMATION64_SIZE {
+                let structure_size = match self.guest_arch {
+                    GuestArch::X86 => MEMORY_BASIC_INFORMATION32_SIZE,
+                    GuestArch::X64 => MEMORY_BASIC_INFORMATION64_SIZE,
+                };
+                if length < structure_size {
                     state.set(Register::Rax, 0);
                     self.last_error = 24;
+                    self.push_trace(
+                        "memory",
+                        "VirtualQuery",
+                        BTreeMap::from([
+                            ("caller_rip".to_string(), json!(format!("{return_address:#x}"))),
+                            ("address".to_string(), json!(format!("{address:#x}"))),
+                            ("buffer".to_string(), json!(format!("{buffer:#x}"))),
+                            ("length".to_string(), json!(length)),
+                            ("required_size".to_string(), json!(structure_size)),
+                        ]),
+                        json!(0),
+                    );
                 } else {
-                    let (allocation_base, region_size, ty) = if address >= self.mapped_image_base
+                    let (base_address, allocation_base, region_size, ty) = if address >= self.mapped_image_base
                         && address < self.mapped_image_base + self.mapped_image_size
                     {
                         (
+                            self.mapped_image_base,
                             self.mapped_image_base,
                             self.mapped_image_size - (address - self.mapped_image_base),
                             MEM_IMAGE,
                         )
                     } else if address >= STACK_BASE && address < STACK_BASE + STACK_SIZE as u64 {
-                        (STACK_BASE, STACK_BASE + STACK_SIZE as u64 - address, MEM_PRIVATE)
+                        (
+                            STACK_BASE,
+                            STACK_BASE,
+                            STACK_BASE + STACK_SIZE as u64 - address,
+                            MEM_PRIVATE,
+                        )
                     } else {
                         let allocation_base = self.heap_allocations.range(..=address).next_back().map(|(base, _)| *base).unwrap_or(address);
                         let allocation_size = self.heap_allocations.get(&allocation_base).copied().unwrap_or(0x1000) as u64;
-                        (allocation_base, allocation_size, MEM_PRIVATE)
+                        (allocation_base, allocation_base, allocation_size, MEM_PRIVATE)
                     };
-                    write_u64(memory, buffer, address);
-                    write_u64(memory, buffer + 8, allocation_base);
-                    write_u32(memory, buffer + 16, PAGE_EXECUTE_READWRITE);
-                    write_u32(memory, buffer + 20, 0);
-                    write_u64(memory, buffer + 24, region_size.max(0x1000));
-                    write_u32(memory, buffer + 32, MEM_COMMIT);
-                    write_u32(memory, buffer + 36, PAGE_EXECUTE_READWRITE);
-                    write_u32(memory, buffer + 40, ty);
-                    write_u32(memory, buffer + 44, 0);
-                    state.set(Register::Rax, MEMORY_BASIC_INFORMATION64_SIZE);
+                    let region_size = region_size.max(0x1000);
+                    match self.guest_arch {
+                        GuestArch::X86 => {
+                            write_u32(memory, buffer, base_address as u32);
+                            write_u32(memory, buffer + 4, allocation_base as u32);
+                            write_u32(memory, buffer + 8, PAGE_EXECUTE_READWRITE);
+                            write_u32(memory, buffer + 12, region_size as u32);
+                            write_u32(memory, buffer + 16, MEM_COMMIT);
+                            write_u32(memory, buffer + 20, PAGE_EXECUTE_READWRITE);
+                            write_u32(memory, buffer + 24, ty);
+                        }
+                        GuestArch::X64 => {
+                            write_u64(memory, buffer, base_address);
+                            write_u64(memory, buffer + 8, allocation_base);
+                            write_u32(memory, buffer + 16, PAGE_EXECUTE_READWRITE);
+                            write_u32(memory, buffer + 20, 0);
+                            write_u64(memory, buffer + 24, region_size);
+                            write_u32(memory, buffer + 32, MEM_COMMIT);
+                            write_u32(memory, buffer + 36, PAGE_EXECUTE_READWRITE);
+                            write_u32(memory, buffer + 40, ty);
+                            write_u32(memory, buffer + 44, 0);
+                        }
+                    }
+                    state.set(Register::Rax, structure_size);
                     self.last_error = 0;
+                    self.push_trace(
+                        "memory",
+                        "VirtualQuery",
+                        BTreeMap::from([
+                            ("caller_rip".to_string(), json!(format!("{return_address:#x}"))),
+                            ("address".to_string(), json!(format!("{address:#x}"))),
+                            ("buffer".to_string(), json!(format!("{buffer:#x}"))),
+                            ("length".to_string(), json!(length)),
+                            ("base_address".to_string(), json!(format!("{base_address:#x}"))),
+                            ("allocation_base".to_string(), json!(format!("{allocation_base:#x}"))),
+                            ("region_size".to_string(), json!(region_size)),
+                            ("type".to_string(), json!(format!("0x{ty:08x}"))),
+                        ]),
+                        json!(structure_size),
+                    );
                 }
             }
             HostThunk::ExitProcess => {
@@ -7711,6 +12746,16 @@ impl PeHostRuntime {
                     format!("unsupported PE import {dll}!{symbol}"),
                 ));
             }
+        }
+
+        if self.guest_arch == GuestArch::X86 && caller_rva == 0x0016_b192 {
+            eprintln!(
+                "steam-failing-callback-import thunk={} thunk_address={:#x} eax_after={:#x} esp_after={:#x}",
+                thunk_name,
+                thunk_address,
+                state.get(Register::Rax),
+                state.get(Register::Rsp),
+            );
         }
 
         if self.guest_arch == GuestArch::X86 {
@@ -7875,18 +12920,22 @@ impl PeHostRuntime {
         }
         state.set(Register::Rsp, callback_rsp);
         state.rip = entrypoint;
+        eprintln!("steam-tls-callback-start entrypoint={entrypoint:#x} callback_rsp={callback_rsp:#x} original_rsp={original_rsp:#x} args_len={} arg0={:#x} arg1={:#x} arg2={:#x}",
+            args.len(), args.first().copied().unwrap_or(0), args.get(1).copied().unwrap_or(0), args.get(2).copied().unwrap_or(0));
 
         let mut steps = 0_u64;
         loop {
-            if self.host_thunks.contains_key(&state.rip) {
+            eprintln!("steam-tls-cb-A steps={steps} rip={:#x}", state.rip);
+            if let Some(result) = self.dispatch_import_if_present(state.rip, state, memory)? {
                 advance_runtime_steps(self, &mut steps, instruction_budget, 1, memory, state, label)?;
-                if let Some(code) = self.dispatch_import(state.rip, state, memory)? {
+                if let Some(code) = result {
                     state.set(Register::Rax, code as u64);
                     break;
                 }
                 continue;
             }
 
+            eprintln!("steam-tls-cb-B steps={steps} opcode={:#x} at rip={:#x}", memory.read_u8(state.rip).unwrap_or(0xFF), state.rip);
             let opcode = memory
                 .read_u8(state.rip)
                 .map_err(|error| annotate_guest_fault(error, memory, state))?;
@@ -7897,21 +12946,20 @@ impl PeHostRuntime {
                         let next_rip = state.rip + 6;
                         let slot_address = read_u32(memory, state.rip + 2)? as u64;
                         let target = read_guest_pointer(memory, slot_address, self.guest_arch)?;
+                        let is_call = memory.read_u8(state.rip + 1)? == 0x15;
 
-                        if self.host_thunks.contains_key(&target) {
-                            if memory.read_u8(state.rip + 1)? == 0x15 {
-                                let call_rsp = state.get(Register::Rsp).wrapping_sub(guest_pointer_bytes);
-                                write_guest_pointer(memory, call_rsp, next_rip, self.guest_arch)?;
-                                state.set(Register::Rsp, call_rsp);
-                            }
-                            if let Some(code) = self.dispatch_import(target, state, memory)? {
-                                state.set(Register::Rax, code as u64);
-                                break;
-                            }
-                        } else if memory.read_u8(state.rip + 1)? == 0x15 {
+                        if is_call {
                             let call_rsp = state.get(Register::Rsp).wrapping_sub(guest_pointer_bytes);
                             write_guest_pointer(memory, call_rsp, next_rip, self.guest_arch)?;
                             state.set(Register::Rsp, call_rsp);
+                        }
+
+                        if let Some(result) = self.dispatch_import_if_present(target, state, memory)? {
+                            if let Some(code) = result {
+                                state.set(Register::Rax, code as u64);
+                                break;
+                            }
+                        } else if is_call {
                             state.rip = target;
                         } else {
                             state.rip = target;
@@ -7923,6 +12971,7 @@ impl PeHostRuntime {
                 _ => {}
             }
 
+            eprintln!("steam-tls-cb-C steps={steps} decoding at {:#x}", state.rip);
             let cached_block = decode_basic_block_cached(
                 &mut engine,
                 memory,
@@ -7947,9 +12996,12 @@ impl PeHostRuntime {
                 state,
                 label,
             )?;
-            let _ = engine
-                .execute_ir_without_memory_hash(state, memory, &cached_block.translated.ir)
-                .map_err(|error| annotate_guest_fault(error, memory, state))?;
+            if self
+                .execute_ir_with_guest_exception_delivery(&engine, state, memory, &cached_block.translated.ir, label)
+                .map_err(|error| annotate_guest_fault(error, memory, state))?
+            {
+                continue;
+            }
             let last_instruction = cached_block
                 .translated
                 .decoded
@@ -7966,6 +13018,205 @@ impl PeHostRuntime {
 
         state.set(Register::Rsp, original_rsp);
         Ok(state.get(Register::Rax))
+    }
+
+    fn execute_ir_with_guest_exception_delivery(
+        &mut self,
+        engine: &CpuExecutionEngine,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+        ir: &[crate::cpu::IrInstruction],
+        label: &str,
+    ) -> AppResult<bool> {
+        match engine.execute_with_jit(state, memory, ir, self.jit_runtime.as_mut()) {
+            Ok(_) => Ok(false),
+            Err(error) => {
+                if self.try_deliver_x86_access_violation(state, memory, &error, label)? {
+                    Ok(true)
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    fn try_deliver_x86_access_violation(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+        error: &AppError,
+        label: &str,
+    ) -> AppResult<bool> {
+        if self.guest_arch != GuestArch::X86 || self.delivering_guest_exception {
+            self.push_trace(
+                "process",
+                "GuestExceptionAttempt",
+                BTreeMap::from([
+                    ("label".to_string(), json!(label)),
+                    ("reason".to_string(), json!("arch_or_reentrant")),
+                    ("guest_arch".to_string(), json!(format!("{:?}", self.guest_arch))),
+                    ("delivering_guest_exception".to_string(), json!(self.delivering_guest_exception)),
+                    ("fault_message".to_string(), json!(error.message.clone())),
+                ]),
+                json!(false),
+            );
+            return Ok(false);
+        }
+        let Some(fault_address) = guest_access_violation_address(error) else {
+            self.push_trace(
+                "process",
+                "GuestExceptionAttempt",
+                BTreeMap::from([
+                    ("label".to_string(), json!(label)),
+                    ("reason".to_string(), json!("not_access_violation")),
+                    ("fault_message".to_string(), json!(error.message.clone())),
+                ]),
+                json!(false),
+            );
+            return Ok(false);
+        };
+        if state.segment_bases.fs == 0 {
+            self.push_trace(
+                "process",
+                "GuestExceptionAttempt",
+                BTreeMap::from([
+                    ("label".to_string(), json!(label)),
+                    ("reason".to_string(), json!("missing_fs_base")),
+                    ("fault_address".to_string(), json!(format!("{fault_address:#x}"))),
+                    ("fault_rip".to_string(), json!(format!("{:#x}", state.rip))),
+                ]),
+                json!(false),
+            );
+            return Ok(false);
+        }
+        let mut registration = match read_guest_pointer(memory, state.segment_bases.fs, GuestArch::X86) {
+            Ok(value) => value,
+            Err(_) => {
+                self.push_trace(
+                    "process",
+                    "GuestExceptionAttempt",
+                    BTreeMap::from([
+                        ("label".to_string(), json!(label)),
+                        ("reason".to_string(), json!("unreadable_registration_head")),
+                        ("fault_address".to_string(), json!(format!("{fault_address:#x}"))),
+                        ("fault_rip".to_string(), json!(format!("{:#x}", state.rip))),
+                        ("fs_base".to_string(), json!(format!("{:#x}", state.segment_bases.fs))),
+                    ]),
+                    json!(false),
+                );
+                return Ok(false);
+            }
+        };
+        self.push_trace(
+            "process",
+            "GuestExceptionAttempt",
+            BTreeMap::from([
+                ("label".to_string(), json!(label)),
+                ("reason".to_string(), json!("dispatch_entry")),
+                ("fault_address".to_string(), json!(format!("{fault_address:#x}"))),
+                ("fault_rip".to_string(), json!(format!("{:#x}", state.rip))),
+                ("registration".to_string(), json!(format!("{registration:#x}"))),
+                ("fs_base".to_string(), json!(format!("{:#x}", state.segment_bases.fs))),
+            ]),
+            json!(true),
+        );
+        while registration != 0 && registration != X86_EXCEPTION_CHAIN_END {
+            let next = match read_guest_u32(memory, registration) {
+                Ok(value) => u64::from(value),
+                Err(_) => return Ok(false),
+            };
+            let handler = match read_guest_u32(memory, registration + 4) {
+                Ok(value) => u64::from(value),
+                Err(_) => return Ok(false),
+            };
+            if handler == 0 {
+                registration = next;
+                continue;
+            }
+            if label == "run-Steam" {
+                eprintln!(
+                    "steam-seh-dispatch fault_rip={:#x} fault_address={:#x} registration={:#x} next={:#x} handler={:#x}",
+                    state.rip,
+                    fault_address,
+                    registration,
+                    next,
+                    handler,
+                );
+            }
+
+            let exception_record = self.alloc_zeroed(memory, X86_EXCEPTION_RECORD_SIZE as usize, 4)?;
+            let context_record = self.alloc_zeroed(memory, X86_CONTEXT_SIZE as usize, 4)?;
+            write_x86_exception_record(memory, exception_record, fault_address, state.rip as u32);
+            write_x86_context(memory, context_record, state);
+            let saved_state = state.clone();
+
+            let was_delivering = std::mem::replace(&mut self.delivering_guest_exception, true);
+            let disposition = self.execute_guest_callback(
+                state,
+                memory,
+                handler,
+                &[exception_record, registration, context_record, 0],
+                label,
+            );
+            self.delivering_guest_exception = was_delivering;
+            let disposition = match disposition {
+                Ok(value) => value as u32,
+                Err(error) => {
+                    *state = saved_state;
+                    return Err(error);
+                }
+            };
+            let context_eip = read_guest_u32(memory, context_record + X86_CONTEXT_OFFSET_EIP)
+                .ok()
+                .map(u64::from);
+            if label == "run-Steam" {
+                eprintln!(
+                    "steam-seh-dispatch-result handler={:#x} disposition={} context_eip={}",
+                    handler,
+                    disposition,
+                    context_eip
+                        .map(|value| format!("{value:#x}"))
+                        .unwrap_or_else(|| "<unavailable>".to_string()),
+                );
+            }
+            self.push_trace(
+                "process",
+                "GuestExceptionDispatch",
+                BTreeMap::from([
+                    ("fault_address".to_string(), json!(format!("{fault_address:#x}"))),
+                    ("fault_rip".to_string(), json!(format!("{:#x}", saved_state.rip))),
+                    ("registration".to_string(), json!(format!("{registration:#x}"))),
+                    ("handler".to_string(), json!(format!("{handler:#x}"))),
+                    ("disposition".to_string(), json!(disposition)),
+                    (
+                        "context_eip".to_string(),
+                        json!(context_eip.map(|value| format!("{value:#x}")).unwrap_or_else(|| "<unavailable>".to_string())),
+                    ),
+                ]),
+                json!(disposition),
+            );
+
+            match disposition {
+                X86_EXCEPTION_CONTINUE_EXECUTION => {
+                    read_x86_context(memory, context_record, state)?;
+                    state.segment_bases = saved_state.segment_bases.clone();
+                    if state.rip == 0 {
+                        *state = saved_state;
+                        return Ok(false);
+                    }
+                    return Ok(true);
+                }
+                X86_EXCEPTION_CONTINUE_SEARCH => {
+                    *state = saved_state;
+                    registration = next;
+                }
+                _ => {
+                    *state = saved_state;
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(false)
     }
 
     fn push_trace(
@@ -7989,6 +13240,174 @@ impl PeHostRuntime {
             Vec::new(),
         ));
         self.next_trace_index += 1;
+    }
+
+    fn trace_steam_critical_section_state(
+        &mut self,
+        site: &str,
+        caller_rva: u64,
+        address: u64,
+        before: Option<usize>,
+        after: Option<usize>,
+    ) {
+        self.push_trace(
+            "process",
+            "SteamCriticalSectionState",
+            BTreeMap::from([
+                ("site".to_string(), json!(site)),
+                ("caller_rva".to_string(), json!(format!("{caller_rva:#x}"))),
+                ("critical_section".to_string(), json!(format!("{address:#x}"))),
+                ("before".to_string(), json!(before)),
+                ("after".to_string(), json!(after)),
+                ("known_before".to_string(), json!(before.is_some())),
+                ("known_after".to_string(), json!(after.is_some())),
+            ]),
+            json!(after.unwrap_or(0)),
+        );
+    }
+
+    fn trace_steam_pre_report_pointer_state(
+        &mut self,
+        memory: &MemoryImage,
+        state: &CpuState,
+        block_rva: u32,
+    ) {
+        if self.guest_arch != GuestArch::X86 {
+            return;
+        }
+
+        if !matches!(block_rva, 0x0016_de51 | 0x0016_de6d | 0x0016_e0c0) {
+            return;
+        }
+
+        let cookie_address = self.mapped_image_base + 0x003c_bfd4;
+        let cookie = probe_read_guest_u32(memory, cookie_address);
+        let decode_field = |raw: u32, cookie: u32| (raw ^ cookie).rotate_right(cookie & 31);
+        match block_rva {
+            0x0016_de51 => {
+                let context_ptr = state.get(Register::Rcx);
+                let first_ptr = probe_read_guest_u32(memory, context_ptr).map(u64::from);
+                let second_ptr = first_ptr
+                    .and_then(|value| probe_read_guest_u32(memory, value))
+                    .map(u64::from);
+                self.push_trace(
+                    "process",
+                    "SteamPreReportPointerState",
+                    BTreeMap::from([
+                        ("site".to_string(), json!(format!("{block_rva:#x}"))),
+                        ("cookie_address".to_string(), json!(format!("{cookie_address:#x}"))),
+                        (
+                            "cookie".to_string(),
+                            json!(cookie.map(|value| format!("{value:#x}")).unwrap_or_else(|| "<unavailable>".to_string())),
+                        ),
+                        ("context_ptr".to_string(), json!(format!("{context_ptr:#x}"))),
+                        (
+                            "first_ptr".to_string(),
+                            json!(first_ptr.map(|value| format!("{value:#x}")).unwrap_or_else(|| "<unavailable>".to_string())),
+                        ),
+                        (
+                            "second_ptr".to_string(),
+                            json!(second_ptr.map(|value| format!("{value:#x}")).unwrap_or_else(|| "<unavailable>".to_string())),
+                        ),
+                    ]),
+                    json!(format!("{block_rva:#x}")),
+                );
+            }
+            0x0016_de6d => {
+                let node_ptr = state.get(Register::Rsi);
+                let raw_values = (0..3)
+                    .map(|slot| probe_read_guest_u32(memory, node_ptr + slot * 4))
+                    .collect::<Vec<_>>();
+                let raw_fields = raw_values
+                    .iter()
+                    .map(|value| {
+                        value
+                            .map(|value| format!("{value:#x}"))
+                            .unwrap_or_else(|| "<unavailable>".to_string())
+                    })
+                    .collect::<Vec<_>>();
+                let decoded_values = if let Some(cookie) = cookie {
+                    raw_values
+                        .iter()
+                        .map(|value| value.map(|value| decode_field(value, cookie)))
+                        .collect::<Vec<_>>()
+                } else {
+                    vec![None, None, None]
+                };
+                let decoded_fields = decoded_values
+                    .iter()
+                    .map(|value| {
+                        value
+                            .map(|value| format!("{value:#x}"))
+                            .unwrap_or_else(|| "<unavailable>".to_string())
+                    })
+                    .collect::<Vec<_>>();
+                let probe_addresses = [
+                    decoded_values.first().copied().flatten(),
+                    decoded_values.get(1).copied().flatten().and_then(|value| value.checked_sub(4)),
+                    decoded_values.get(2).copied().flatten().and_then(|value| value.checked_sub(4)),
+                ];
+                let decoded_probe_readable = probe_addresses
+                    .iter()
+                    .map(|address| {
+                        address
+                            .map(|address| probe_read_guest_u32(memory, u64::from(address)).is_some())
+                            .unwrap_or(false)
+                    })
+                    .collect::<Vec<_>>();
+                let decoded_probe_addresses = probe_addresses
+                    .iter()
+                    .map(|address| {
+                        address
+                            .map(|address| format!("{address:#x}"))
+                            .unwrap_or_else(|| "<unavailable>".to_string())
+                    })
+                    .collect::<Vec<_>>();
+                self.push_trace(
+                    "process",
+                    "SteamPreReportPointerState",
+                    BTreeMap::from([
+                        ("site".to_string(), json!(format!("{block_rva:#x}"))),
+                        ("cookie_address".to_string(), json!(format!("{cookie_address:#x}"))),
+                        (
+                            "cookie".to_string(),
+                            json!(cookie.map(|value| format!("{value:#x}")).unwrap_or_else(|| "<unavailable>".to_string())),
+                        ),
+                        ("node_ptr".to_string(), json!(format!("{node_ptr:#x}"))),
+                        ("raw_fields".to_string(), json!(raw_fields)),
+                        ("decoded_fields".to_string(), json!(decoded_fields)),
+                        ("decoded_probe_addresses".to_string(), json!(decoded_probe_addresses)),
+                        ("decoded_probe_readable".to_string(), json!(decoded_probe_readable)),
+                    ]),
+                    json!(format!("{block_rva:#x}")),
+                );
+            }
+            0x0016_e0c0 => {
+                let stack_arg0 = probe_read_guest_u32(memory, state.get(Register::Rsp) + 4).map(u64::from);
+                let stack_arg1 = probe_read_guest_u32(memory, state.get(Register::Rsp) + 8).map(u64::from);
+                self.push_trace(
+                    "process",
+                    "SteamPreReportPointerState",
+                    BTreeMap::from([
+                        ("site".to_string(), json!(format!("{block_rva:#x}"))),
+                        (
+                            "cookie".to_string(),
+                            json!(cookie.map(|value| format!("{value:#x}")).unwrap_or_else(|| "<unavailable>".to_string())),
+                        ),
+                        (
+                            "stack_arg0".to_string(),
+                            json!(stack_arg0.map(|value| format!("{value:#x}")).unwrap_or_else(|| "<unavailable>".to_string())),
+                        ),
+                        (
+                            "stack_arg1".to_string(),
+                            json!(stack_arg1.map(|value| format!("{value:#x}")).unwrap_or_else(|| "<unavailable>".to_string())),
+                        ),
+                    ]),
+                    json!(format!("{block_rva:#x}")),
+                );
+            }
+            _ => {}
+        }
     }
 
     fn alloc_zeroed(&mut self, memory: &mut MemoryImage, size: usize, align: u64) -> AppResult<u64> {
@@ -8031,17 +13450,19 @@ impl PeHostRuntime {
     }
 
     fn alloc_heap(&mut self, memory: &mut MemoryImage, size: usize, zeroed: bool) -> AppResult<u64> {
+        let requested_size = size.max(1);
+        let mapped_size = align_up_u64(requested_size as u64 + 15, 16) as usize;
         let address = align_up_u64(self.next_heap_address, 16);
         self.next_heap_address = address
-            .checked_add(size.max(1) as u64)
+            .checked_add(mapped_size as u64)
             .ok_or_else(|| AppError::new(ReasonCode::RcUnimplInsn, "PE runtime heap allocation overflow"))?;
         let bytes = if zeroed {
-            vec![0; size.max(1)]
+            vec![0; mapped_size]
         } else {
-            vec![0; size.max(1)]
+            vec![0; mapped_size]
         };
         memory.map_bytes(address, &bytes);
-        self.heap_allocations.insert(address, size.max(1));
+        self.heap_allocations.insert(address, requested_size);
         Ok(address)
     }
 
@@ -8084,6 +13505,115 @@ impl PeHostRuntime {
             write_guest_pointer(memory, slot_address, value, self.guest_arch)?;
         }
         Ok(())
+    }
+
+    fn lcmap_string(
+        &mut self,
+        memory: &mut MemoryImage,
+        flags: u32,
+        source_ptr: u64,
+        source_len: i32,
+        destination_ptr: u64,
+        destination_len: i32,
+    ) -> AppResult<u64> {
+        if source_ptr == 0
+            || source_len == 0
+            || (flags & (LCMAP_LOWERCASE | LCMAP_UPPERCASE))
+                == (LCMAP_LOWERCASE | LCMAP_UPPERCASE)
+        {
+            self.last_error = ERROR_INVALID_PARAMETER;
+            return Ok(0);
+        }
+
+        let source_units = if source_len < 0 {
+            read_utf16_string(memory, source_ptr)?
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect::<Vec<_>>()
+        } else {
+            (0..source_len as usize)
+                .map(|index| read_guest_u16(memory, source_ptr + (index as u64 * 2)))
+                .collect::<AppResult<Vec<_>>>()?
+        };
+        let mapped_units = if flags & (LCMAP_LOWERCASE | LCMAP_UPPERCASE) != 0 {
+            source_units
+                .iter()
+                .copied()
+                .map(|unit| {
+                    let Some(original) = char::from_u32(unit as u32) else {
+                        return unit;
+                    };
+                    let mapped = if flags & LCMAP_UPPERCASE != 0 {
+                        original.to_uppercase().collect::<Vec<_>>()
+                    } else {
+                        original.to_lowercase().collect::<Vec<_>>()
+                    };
+                    let Some(&candidate) = mapped.first() else {
+                        return unit;
+                    };
+                    if mapped.len() != 1 {
+                        return unit;
+                    }
+                    let mut encoded = [0_u16; 2];
+                    if candidate.encode_utf16(&mut encoded).len() != 1 {
+                        return unit;
+                    }
+                    if self
+                        .win32
+                        .wide_char_to_multi_byte(DEFAULT_ANSI_CODE_PAGE, &encoded[..1])
+                        .is_err()
+                    {
+                        return unit;
+                    }
+                    encoded[0]
+                })
+                .collect::<Vec<_>>()
+        } else {
+            source_units.clone()
+        };
+        let required = mapped_units.len() as u32;
+        if destination_ptr == 0 || destination_len == 0 {
+            self.last_error = 0;
+            return Ok(required as u64);
+        }
+        if destination_len < required as i32 {
+            self.last_error = ERROR_INSUFFICIENT_BUFFER;
+            return Ok(0);
+        }
+
+        let encoded = mapped_units
+            .iter()
+            .flat_map(|unit| unit.to_le_bytes())
+            .collect::<Vec<_>>();
+        if !encoded.is_empty() {
+            memory.map_bytes(destination_ptr, &encoded);
+            self.recent_wide_writes
+                .insert(destination_ptr, String::from_utf16_lossy(&mapped_units));
+        }
+        self.last_error = 0;
+        Ok(required as u64)
+    }
+
+    fn sync_guest_critical_section(
+        &self,
+        memory: &mut MemoryImage,
+        address: u64,
+        depth: usize,
+        owner_thread_id: u32,
+        spin_count: Option<u32>,
+    ) {
+        if self.guest_arch != GuestArch::X86 || address == 0 {
+            return;
+        }
+        let spin_count = spin_count
+            .or_else(|| read_u32(memory, address + 20).ok())
+            .unwrap_or(0);
+        write_u32(memory, address, 0);
+        write_u32(memory, address + 4, if depth == 0 { u32::MAX } else { depth.saturating_sub(1) as u32 });
+        write_u32(memory, address + 8, depth as u32);
+        write_u32(memory, address + 12, if depth == 0 { 0 } else { owner_thread_id });
+        write_u32(memory, address + 16, 0);
+        write_u32(memory, address + 20, spin_count);
     }
 
     fn alloc_guest_object(
@@ -12164,6 +17694,9 @@ impl HostThunk {
             ("user32.dll", ImportSymbol::ByName { name, .. }) if name == "GetClassInfoW" => {
                 Self::GetClassInfoW
             }
+            ("user32.dll", ImportSymbol::ByName { name, .. }) if name == "GetClassInfoExW" => {
+                Self::GetClassInfoExW
+            }
             ("user32.dll", ImportSymbol::ByName { name, .. }) if name == "GetDlgItem" => Self::GetDlgItem,
             ("user32.dll", ImportSymbol::ByName { name, .. }) if name == "GetClientRect" => {
                 Self::GetClientRect
@@ -12203,6 +17736,9 @@ impl HostThunk {
             }
             ("user32.dll", ImportSymbol::ByName { name, .. }) if name == "GetSysColor" => {
                 Self::GetSysColor
+            }
+            ("user32.dll", ImportSymbol::ByName { name, .. }) if name == "LoadIconW" => {
+                Self::LoadIconW
             }
             ("user32.dll", ImportSymbol::ByName { name, .. }) if name == "LoadCursorW" => {
                 Self::LoadCursorW
@@ -12319,6 +17855,9 @@ impl HostThunk {
             ("gdi32.dll", ImportSymbol::ByName { name, .. }) if name == "SelectObject" => {
                 Self::SelectObject
             }
+            ("gdi32.dll", ImportSymbol::ByName { name, .. }) if name == "CreateFontW" => {
+                Self::CreateFontW
+            }
             ("gdi32.dll", ImportSymbol::ByName { name, .. }) if name == "CreateFontIndirectW" => {
                 Self::CreateFontIndirectW
             }
@@ -12336,12 +17875,18 @@ impl HostThunk {
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "SetCurrentDirectoryW" => {
                 Self::SetCurrentDirectoryW
             }
+            ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "GetCurrentDirectoryW" => {
+                Self::GetCurrentDirectoryW
+            }
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "GetFullPathNameW" => {
                 Self::GetFullPathNameW
             }
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "MulDiv" => Self::MulDiv,
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "GetFileAttributesW" => {
                 Self::GetFileAttributesW
+            }
+            ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "GetFileAttributesExW" => {
+                Self::GetFileAttributesExW
             }
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "FindFirstFileW" => {
                 Self::FindFirstFileW
@@ -12370,8 +17915,14 @@ impl HostThunk {
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "GetTempPathW" => {
                 Self::GetTempPathW
             }
+            ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "GetTempPath2W" => {
+                Self::GetTempPath2W
+            }
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "GetTempFileNameW" => {
                 Self::GetTempFileNameW
+            }
+            ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "GetModuleFileNameA" => {
+                Self::GetModuleFileNameA
             }
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "GetModuleFileNameW" => {
                 Self::GetModuleFileNameW
@@ -12391,9 +17942,29 @@ impl HostThunk {
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "CreateProcessW" => {
                 Self::CreateProcessW
             }
+            ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "CreateIoCompletionPort" => {
+                Self::CreateIoCompletionPort
+            }
+            ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "PostQueuedCompletionStatus" => {
+                Self::PostQueuedCompletionStatus
+            }
+            ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "GetQueuedCompletionStatus" => {
+                Self::GetQueuedCompletionStatus
+            }
+            ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "GetQueuedCompletionStatusEx" => {
+                Self::GetQueuedCompletionStatusEx
+            }
+            ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "SetFileCompletionNotificationModes" => {
+                Self::SetFileCompletionNotificationModes
+            }
+            ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "CreateEventA" => {
+                Self::CreateEventA
+            }
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "CreateEventW" => {
                 Self::CreateEventW
             }
+            ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "OpenEventA" => Self::OpenEventA,
+            ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "OpenEventW" => Self::OpenEventW,
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "SetEvent" => Self::SetEvent,
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "ResetEvent" => Self::ResetEvent,
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "IsDebuggerPresent" => {
@@ -12432,11 +18003,17 @@ impl HostThunk {
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "GetExitCodeProcess" => {
                 Self::GetExitCodeProcess
             }
+            ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "TerminateProcess" => {
+                Self::TerminateProcess
+            }
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "LoadLibraryA" => {
                 Self::LoadLibraryA
             }
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "LoadLibraryW" => {
                 Self::LoadLibraryW
+            }
+            ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "LoadLibraryExA" => {
+                Self::LoadLibraryExA
             }
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "LoadLibraryExW" => {
                 Self::LoadLibraryExW
@@ -12447,15 +18024,26 @@ impl HostThunk {
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "lstrlenA" => Self::Strlen,
             ("kernel32.dll", ImportSymbol::ByOrdinal { ordinal: 17 }) => Self::CreateFileW,
             ("comctl32.dll", ImportSymbol::ByOrdinal { ordinal: 17 }) => Self::InitCommonControls,
+            ("comctl32.dll", ImportSymbol::ByName { name, .. }) if name == "InitCommonControlsEx" => {
+                Self::InitCommonControlsEx
+            }
             ("ole32.dll", ImportSymbol::ByName { name, .. }) if name == "OleInitialize" => Self::OleInitialize,
             ("ole32.dll", ImportSymbol::ByName { name, .. }) if name == "OleUninitialize" => Self::OleUninitialize,
             ("ole32.dll", ImportSymbol::ByName { name, .. }) if name == "CoCreateInstance" => {
                 Self::CoCreateInstance
             }
             ("ole32.dll", ImportSymbol::ByName { name, .. }) if name == "CoTaskMemFree" => Self::CoTaskMemFree,
+            ("oleaut32.dll", ImportSymbol::ByName { name, .. }) if name == "VariantClear" => {
+                Self::VariantClear
+            }
+            ("oleaut32.dll", ImportSymbol::ByOrdinal { ordinal: 9 }) => Self::VariantClear,
             ("shell32.dll", ImportSymbol::ByName { name, .. }) if name == "CommandLineToArgvW" => {
                 Self::CommandLineToArgvW
             }
+            ("shell32.dll", ImportSymbol::ByName { name, .. }) if name == "IsUserAnAdmin" => {
+                Self::IsUserAnAdmin
+            }
+            ("shell32.dll", ImportSymbol::ByOrdinal { ordinal: 680 }) => Self::IsUserAnAdmin,
             ("shell32.dll", ImportSymbol::ByName { name, .. }) if name == "SHGetFileInfoW" => Self::SHGetFileInfoW,
             ("shell32.dll", ImportSymbol::ByName { name, .. }) if name == "SHGetFolderPathW" => {
                 Self::SHGetFolderPathW
@@ -12480,6 +18068,18 @@ impl HostThunk {
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "lstrcatW" => Self::LstrcatW,
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "GetCommandLineA" => Self::GetCommandLineA,
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "GetCommandLineW" => Self::GetCommandLineW,
+            ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "OutputDebugStringA" => {
+                Self::OutputDebugStringA
+            }
+            ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "OutputDebugStringW" => {
+                Self::OutputDebugStringW
+            }
+            ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "SetEnvironmentVariableW" => {
+                Self::SetEnvironmentVariableW
+            }
+            ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "GetEnvironmentVariableW" => {
+                Self::GetEnvironmentVariableW
+            }
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "GetEnvironmentStringsW" => {
                 Self::GetEnvironmentStringsW
             }
@@ -12491,23 +18091,41 @@ impl HostThunk {
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "GetCPInfo" => Self::GetCPInfo,
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "GetStringTypeW" => Self::GetStringTypeW,
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "LCMapStringW" => Self::LCMapStringW,
+            ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "LCMapStringEx" => Self::LCMapStringEx,
+            ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "LocaleNameToLCID" => Self::LocaleNameToLCID,
             ("user32.dll", ImportSymbol::ByName { name, .. }) if name == "CharNextW" => Self::CharNextW,
             ("user32.dll", ImportSymbol::ByName { name, .. }) if name == "CharPrevW" => Self::CharPrevW,
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "CreateDirectoryW" => Self::CreateDirectoryW,
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "RemoveDirectoryW" => Self::RemoveDirectoryW,
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "CreateFileW" => Self::CreateFileW,
+            ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "AreFileApisANSI" => {
+                Self::AreFileApisANSI
+            }
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "CompareFileTime" => {
                 Self::CompareFileTime
             }
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "SetFileTime" => Self::SetFileTime,
+            ("advapi32.dll", ImportSymbol::ByName { name, .. }) if name == "RegCreateKeyExA" => {
+                Self::RegCreateKeyExA
+            }
             ("advapi32.dll", ImportSymbol::ByName { name, .. }) if name == "RegCreateKeyExW" => {
                 Self::RegCreateKeyExW
+            }
+            ("advapi32.dll", ImportSymbol::ByName { name, .. }) if name == "RegOpenKeyA" => Self::RegOpenKeyA,
+            ("advapi32.dll", ImportSymbol::ByName { name, .. }) if name == "RegOpenKeyExA" => {
+                Self::RegOpenKeyExA
             }
             ("advapi32.dll", ImportSymbol::ByName { name, .. }) if name == "RegOpenKeyExW" => {
                 Self::RegOpenKeyExW
             }
+            ("advapi32.dll", ImportSymbol::ByName { name, .. }) if name == "RegSetValueExA" => {
+                Self::RegSetValueExA
+            }
             ("advapi32.dll", ImportSymbol::ByName { name, .. }) if name == "RegSetValueExW" => {
                 Self::RegSetValueExW
+            }
+            ("advapi32.dll", ImportSymbol::ByName { name, .. }) if name == "RegQueryValueExA" => {
+                Self::RegQueryValueExA
             }
             ("advapi32.dll", ImportSymbol::ByName { name, .. }) if name == "RegQueryValueExW" => {
                 Self::RegQueryValueExW
@@ -12515,12 +18133,24 @@ impl HostThunk {
             ("advapi32.dll", ImportSymbol::ByName { name, .. }) if name == "RegCloseKey" => {
                 Self::RegCloseKey
             }
+            ("advapi32.dll", ImportSymbol::ByName { name, .. }) if name == "InitializeSecurityDescriptor" => {
+                Self::InitializeSecurityDescriptor
+            }
+            ("advapi32.dll", ImportSymbol::ByName { name, .. }) if name == "SetSecurityDescriptorDacl" => {
+                Self::SetSecurityDescriptorDacl
+            }
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "SetFilePointer" => {
                 Self::SetFilePointer
             }
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "ReadFile" => Self::ReadFile,
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "WriteFile" => Self::WriteFile,
+            ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "FlushFileBuffers" => {
+                Self::FlushFileBuffers
+            }
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "LocalAlloc" => Self::LocalAlloc,
+            ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "LocalLock" => Self::LocalLock,
+            ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "LocalUnlock" => Self::LocalUnlock,
+            ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "LocalFree" => Self::LocalFree,
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "GlobalAlloc" => Self::GlobalAlloc,
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "GlobalLock" => Self::GlobalLock,
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "GlobalUnlock" => {
@@ -12528,35 +18158,124 @@ impl HostThunk {
             }
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "GlobalFree" => Self::GlobalFree,
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "CloseHandle" => Self::CloseHandle,
+            ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "SetHandleInformation" => {
+                Self::SetHandleInformation
+            }
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "DeleteCriticalSection" => {
                 Self::DeleteCriticalSection
             }
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "EnterCriticalSection" => {
                 Self::EnterCriticalSection
             }
+            ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "TryEnterCriticalSection" => {
+                Self::TryEnterCriticalSection
+            }
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "GetModuleHandleA" => {
                 Self::GetModuleHandleA
+            }
+            ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "GetModuleHandleExA" => {
+                Self::GetModuleHandleExA
             }
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "GetModuleHandleW" => {
                 Self::GetModuleHandleW
             }
+            ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "GetModuleHandleExW" => {
+                Self::GetModuleHandleExW
+            }
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "GetProcAddress" => {
                 Self::GetProcAddress
+            }
+            ("psapi.dll", ImportSymbol::ByName { name, .. }) if name == "EnumProcesses" => {
+                Self::EnumProcesses
+            }
+            ("psapi.dll", ImportSymbol::ByName { name, .. }) if name == "EnumProcessModules" => {
+                Self::EnumProcessModules
+            }
+            ("psapi.dll", ImportSymbol::ByName { name, .. }) if name == "GetModuleBaseNameA" => {
+                Self::GetModuleBaseNameA
             }
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "GetVersion" => Self::GetVersion,
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "GetLastError" => Self::GetLastError,
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "SetLastError" => Self::SetLastError,
+            ("ws2_32.dll", ImportSymbol::ByOrdinal { ordinal: 8 })
+            | ("wsock32.dll", ImportSymbol::ByOrdinal { ordinal: 8 }) => Self::Htonl,
+            ("ws2_32.dll", ImportSymbol::ByOrdinal { ordinal: 9 })
+            | ("wsock32.dll", ImportSymbol::ByOrdinal { ordinal: 9 }) => Self::Htons,
+            ("ws2_32.dll", ImportSymbol::ByName { name, .. }) if name == "ioctlsocket" => {
+                Self::Ioctlsocket
+            }
+            ("ws2_32.dll", ImportSymbol::ByOrdinal { ordinal: 14 })
+            | ("wsock32.dll", ImportSymbol::ByOrdinal { ordinal: 14 }) => Self::Ntohl,
+            ("ws2_32.dll", ImportSymbol::ByOrdinal { ordinal: 15 })
+            | ("wsock32.dll", ImportSymbol::ByOrdinal { ordinal: 15 }) => Self::Ntohs,
+            ("ws2_32.dll", ImportSymbol::ByOrdinal { ordinal: 3 })
+            | ("wsock32.dll", ImportSymbol::ByOrdinal { ordinal: 3 }) => Self::Closesocket,
+            ("ws2_32.dll", ImportSymbol::ByName { name, .. }) if name == "closesocket" => {
+                Self::Closesocket
+            }
+            ("ws2_32.dll", ImportSymbol::ByOrdinal { ordinal: 18 })
+            | ("wsock32.dll", ImportSymbol::ByOrdinal { ordinal: 18 }) => Self::Select,
+            ("ws2_32.dll", ImportSymbol::ByName { name, .. }) if name == "select" => Self::Select,
+            ("ws2_32.dll", ImportSymbol::ByOrdinal { ordinal: 22 })
+            | ("wsock32.dll", ImportSymbol::ByOrdinal { ordinal: 22 }) => Self::Shutdown,
+            ("ws2_32.dll", ImportSymbol::ByName { name, .. }) if name == "shutdown" => {
+                Self::Shutdown
+            }
+            ("ws2_32.dll", ImportSymbol::ByOrdinal { ordinal: 23 })
+            | ("wsock32.dll", ImportSymbol::ByOrdinal { ordinal: 23 }) => Self::Socket,
+            ("ws2_32.dll", ImportSymbol::ByName { name, .. }) if name == "socket" => Self::Socket,
+            ("ws2_32.dll", ImportSymbol::ByOrdinal { ordinal: 111 })
+            | ("wsock32.dll", ImportSymbol::ByOrdinal { ordinal: 111 }) => Self::WsaGetLastError,
+            ("ws2_32.dll", ImportSymbol::ByName { name, .. }) if name == "WSAGetLastError" => {
+                Self::WsaGetLastError
+            }
+            ("ws2_32.dll", ImportSymbol::ByOrdinal { ordinal: 112 })
+            | ("wsock32.dll", ImportSymbol::ByOrdinal { ordinal: 112 }) => Self::WsaSetLastError,
+            ("ws2_32.dll", ImportSymbol::ByName { name, .. }) if name == "WSASetLastError" => {
+                Self::WsaSetLastError
+            }
+            ("ws2_32.dll", ImportSymbol::ByOrdinal { ordinal: 115 })
+            | ("wsock32.dll", ImportSymbol::ByOrdinal { ordinal: 115 }) => Self::WsaStartup,
+            ("ws2_32.dll", ImportSymbol::ByName { name, .. }) if name == "WSAStartup" => {
+                Self::WsaStartup
+            }
+            ("ws2_32.dll", ImportSymbol::ByOrdinal { ordinal: 116 })
+            | ("wsock32.dll", ImportSymbol::ByOrdinal { ordinal: 116 }) => Self::WsaCleanup,
+            ("ws2_32.dll", ImportSymbol::ByName { name, .. }) if name == "WSACleanup" => {
+                Self::WsaCleanup
+            }
+            ("ws2_32.dll", ImportSymbol::ByOrdinal { ordinal: 151 })
+            | ("wsock32.dll", ImportSymbol::ByOrdinal { ordinal: 151 }) => Self::WsaFdIsSet,
+            ("ws2_32.dll", ImportSymbol::ByName { name, .. }) if name == "__WSAFDIsSet" => {
+                Self::WsaFdIsSet
+            }
+            ("ws2_32.dll", ImportSymbol::ByName { name, .. }) if name == "WSAIoctl" => Self::WsaIoctl,
+            ("ws2_32.dll", ImportSymbol::ByName { name, .. }) if name == "WSASocketA" => {
+                Self::WsaSocketA
+            }
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "GetCurrentThreadId" => {
                 Self::GetCurrentThreadId
             }
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "GetCurrentProcessId" => {
                 Self::GetCurrentProcessId
             }
+            ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "GetCurrentProcess" => {
+                Self::GetCurrentProcess
+            }
+            ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "ProcessIdToSessionId" => {
+                Self::ProcessIdToSessionId
+            }
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "QueryPerformanceCounter" => {
                 Self::QueryPerformanceCounter
             }
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "QueryPerformanceFrequency" => {
                 Self::QueryPerformanceFrequency
+            }
+            ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "VerSetConditionMask" => {
+                Self::VerSetConditionMask
+            }
+            ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "VerifyVersionInfoW" => {
+                Self::VerifyVersionInfoW
             }
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "IsProcessorFeaturePresent" => {
                 Self::IsProcessorFeaturePresent
@@ -12571,15 +18290,45 @@ impl HostThunk {
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "InitializeSListHead" => Self::InitializeSListHead,
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "GetStdHandle" => Self::GetStdHandle,
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "GetFileType" => Self::GetFileType,
+            ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "GetFileInformationByHandle" => {
+                Self::GetFileInformationByHandle
+            }
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "GetSystemTimeAsFileTime" => {
                 Self::GetSystemTimeAsFileTime
             }
+            ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "GetSystemTimePreciseAsFileTime" => {
+                Self::GetSystemTimePreciseAsFileTime
+            }
+            ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "GetTimeZoneInformation" => {
+                Self::GetTimeZoneInformation
+            }
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "GetTickCount" => Self::GetTickCount,
+            ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "GetCurrentPackageId" => {
+                Self::GetCurrentPackageId
+            }
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "InitializeCriticalSection" => {
                 Self::InitializeCriticalSection
             }
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "InitializeCriticalSectionAndSpinCount" => {
                 Self::InitializeCriticalSectionAndSpinCount
+            }
+            ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "InitializeCriticalSectionEx" => {
+                Self::InitializeCriticalSectionEx
+            }
+            ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "EncodePointer" => {
+                Self::EncodePointer
+            }
+            ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "DecodePointer" => {
+                Self::DecodePointer
+            }
+            ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "UnhandledExceptionFilter" => {
+                Self::UnhandledExceptionFilter
+            }
+            ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "SleepConditionVariableCS" => {
+                Self::SleepConditionVariableCS
+            }
+            ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "WakeAllConditionVariable" => {
+                Self::WakeAllConditionVariable
             }
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "LeaveCriticalSection" => {
                 Self::LeaveCriticalSection
@@ -12595,6 +18344,10 @@ impl HostThunk {
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "TlsGetValue" => Self::TlsGetValue,
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "TlsSetValue" => Self::TlsSetValue,
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "TlsFree" => Self::TlsFree,
+            ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "FlsAlloc" => Self::FlsAlloc,
+            ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "FlsGetValue" => Self::FlsGetValue,
+            ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "FlsSetValue" => Self::FlsSetValue,
+            ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "FlsFree" => Self::FlsFree,
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "VirtualAlloc" => Self::VirtualAlloc,
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "VirtualProtect" => Self::VirtualProtect,
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "VirtualQuery" => Self::VirtualQuery,
@@ -12604,11 +18357,23 @@ impl HostThunk {
             ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "GetCurrentProcessId" => {
                 Self::GetCurrentProcessId
             }
+            ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "GetCurrentProcess" => {
+                Self::GetCurrentProcess
+            }
+            ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "ProcessIdToSessionId" => {
+                Self::ProcessIdToSessionId
+            }
             ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "QueryPerformanceCounter" => {
                 Self::QueryPerformanceCounter
             }
             ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "QueryPerformanceFrequency" => {
                 Self::QueryPerformanceFrequency
+            }
+            ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "VerSetConditionMask" => {
+                Self::VerSetConditionMask
+            }
+            ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "VerifyVersionInfoW" => {
+                Self::VerifyVersionInfoW
             }
             ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "IsProcessorFeaturePresent" => {
                 Self::IsProcessorFeaturePresent
@@ -12623,7 +18388,13 @@ impl HostThunk {
             ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "InitializeSListHead" => Self::InitializeSListHead,
             ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "GetStdHandle" => Self::GetStdHandle,
             ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "GetFileType" => Self::GetFileType,
+            ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "GetFileInformationByHandle" => {
+                Self::GetFileInformationByHandle
+            }
             ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "GetACP" => Self::GetACP,
+            ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "GetFileAttributesExW" => {
+                Self::GetFileAttributesExW
+            }
             ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "FindFirstFileW" => {
                 Self::FindFirstFileW
             }
@@ -12636,6 +18407,12 @@ impl HostThunk {
             ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "GetEnvironmentStringsW" => {
                 Self::GetEnvironmentStringsW
             }
+            ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "SetEnvironmentVariableW" => {
+                Self::SetEnvironmentVariableW
+            }
+            ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "GetEnvironmentVariableW" => {
+                Self::GetEnvironmentVariableW
+            }
             ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "FreeEnvironmentStringsW" => {
                 Self::FreeEnvironmentStringsW
             }
@@ -12643,26 +18420,102 @@ impl HostThunk {
             ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "GetCPInfo" => Self::GetCPInfo,
             ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "GetStringTypeW" => Self::GetStringTypeW,
             ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "LCMapStringW" => Self::LCMapStringW,
+            ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "LCMapStringEx" => Self::LCMapStringEx,
+            ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "LocaleNameToLCID" => Self::LocaleNameToLCID,
             ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "GetSystemTimeAsFileTime" => {
                 Self::GetSystemTimeAsFileTime
             }
+            ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "GetSystemTimePreciseAsFileTime" => {
+                Self::GetSystemTimePreciseAsFileTime
+            }
+            ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "GetTimeZoneInformation" => {
+                Self::GetTimeZoneInformation
+            }
             ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "GetTickCount" => Self::GetTickCount,
+            ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "GetCurrentPackageId" => {
+                Self::GetCurrentPackageId
+            }
+            ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "GetTempPath2W" => {
+                Self::GetTempPath2W
+            }
+            ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "AreFileApisANSI" => {
+                Self::AreFileApisANSI
+            }
+            ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "TryEnterCriticalSection" => {
+                Self::TryEnterCriticalSection
+            }
             ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "InitializeCriticalSectionAndSpinCount" => {
                 Self::InitializeCriticalSectionAndSpinCount
+            }
+            ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "InitializeCriticalSectionEx" => {
+                Self::InitializeCriticalSectionEx
+            }
+            ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "EncodePointer" => {
+                Self::EncodePointer
+            }
+            ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "DecodePointer" => {
+                Self::DecodePointer
+            }
+            ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "SleepConditionVariableCS" => {
+                Self::SleepConditionVariableCS
+            }
+            ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "WakeAllConditionVariable" => {
+                Self::WakeAllConditionVariable
+            }
+            ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "CreateIoCompletionPort" => {
+                Self::CreateIoCompletionPort
+            }
+            ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "PostQueuedCompletionStatus" => {
+                Self::PostQueuedCompletionStatus
+            }
+            ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "GetQueuedCompletionStatus" => {
+                Self::GetQueuedCompletionStatus
+            }
+            ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "GetQueuedCompletionStatusEx" => {
+                Self::GetQueuedCompletionStatusEx
+            }
+            ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "SetFileCompletionNotificationModes" => {
+                Self::SetFileCompletionNotificationModes
+            }
+            ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "CreateEventA" => {
+                Self::CreateEventA
             }
             ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "CreateEventW" => {
                 Self::CreateEventW
             }
+            ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "SetHandleInformation" => {
+                Self::SetHandleInformation
+            }
+            ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "OpenEventA" => Self::OpenEventA,
+            ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "OpenEventW" => Self::OpenEventW,
             ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "SetEvent" => Self::SetEvent,
             ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "ResetEvent" => Self::ResetEvent,
             ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "IsDebuggerPresent" => {
                 Self::IsDebuggerPresent
+            }
+            ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "OutputDebugStringA" => {
+                Self::OutputDebugStringA
+            }
+            ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "OutputDebugStringW" => {
+                Self::OutputDebugStringW
             }
             ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "LoadLibraryA" => {
                 Self::LoadLibraryA
             }
             ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "LoadLibraryW" => {
                 Self::LoadLibraryW
+            }
+            ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "LoadLibraryExA" => {
+                Self::LoadLibraryExA
+            }
+            ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "LoadLibraryExW" => {
+                Self::LoadLibraryExW
+            }
+            ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "GetModuleHandleExA" => {
+                Self::GetModuleHandleExA
+            }
+            ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "GetModuleHandleExW" => {
+                Self::GetModuleHandleExW
             }
             ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "InitOnceBeginInitialize" => {
                 Self::InitOnceBeginInitialize
@@ -12692,12 +18545,41 @@ impl HostThunk {
                 Self::TryAcquireSRWLockShared
             }
             ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "Sleep" => Self::Sleep,
+            ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "TerminateProcess" => {
+                Self::TerminateProcess
+            }
             ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "TlsAlloc" => Self::TlsAlloc,
             ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "TlsGetValue" => Self::TlsGetValue,
             ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "TlsSetValue" => Self::TlsSetValue,
             ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "TlsFree" => Self::TlsFree,
+            ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "FlsAlloc" => Self::FlsAlloc,
+            ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "FlsGetValue" => Self::FlsGetValue,
+            ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "FlsSetValue" => Self::FlsSetValue,
+            ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "FlsFree" => Self::FlsFree,
             ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "VirtualAlloc" => Self::VirtualAlloc,
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "ExitProcess" => Self::ExitProcess,
+            ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "RtlNtStatusToDosError" => {
+                Self::RtlNtStatusToDosError
+            }
+            ("api-ms-win-core-synch-l1-2-0.dll", ImportSymbol::ByName { name, .. }) if name == "InitializeCriticalSectionEx" => {
+                Self::InitializeCriticalSectionEx
+            }
+            ("api-ms-win-core-synch-l1-2-0.dll", ImportSymbol::ByName { name, .. }) if name == "SleepConditionVariableCS" => {
+                Self::SleepConditionVariableCS
+            }
+            ("api-ms-win-core-synch-l1-2-0.dll", ImportSymbol::ByName { name, .. }) if name == "WakeAllConditionVariable" => {
+                Self::WakeAllConditionVariable
+            }
+            ("api-ms-win-core-fibers-l1-1-1.dll", ImportSymbol::ByName { name, .. }) if name == "FlsAlloc" => Self::FlsAlloc,
+            ("api-ms-win-core-fibers-l1-1-1.dll", ImportSymbol::ByName { name, .. }) if name == "FlsGetValue" => Self::FlsGetValue,
+            ("api-ms-win-core-fibers-l1-1-1.dll", ImportSymbol::ByName { name, .. }) if name == "FlsSetValue" => Self::FlsSetValue,
+            ("api-ms-win-core-fibers-l1-1-1.dll", ImportSymbol::ByName { name, .. }) if name == "FlsFree" => Self::FlsFree,
+            ("api-ms-win-core-localization-l1-2-1.dll", ImportSymbol::ByName { name, .. }) if name == "LCMapStringEx" => {
+                Self::LCMapStringEx
+            }
+            ("api-ms-win-core-localization-l1-2-1.dll", ImportSymbol::ByName { name, .. }) if name == "LocaleNameToLCID" => {
+                Self::LocaleNameToLCID
+            }
             ("ucrtbase.dll", ImportSymbol::ByName { name, .. }) if name == "_set_new_mode" => Self::SetNewMode,
             ("ucrtbase.dll", ImportSymbol::ByName { name, .. }) if name == "calloc" => Self::Calloc,
             ("ucrtbase.dll", ImportSymbol::ByName { name, .. }) if name == "free" => Self::Free,
@@ -12759,6 +18641,7 @@ impl HostThunk {
             | Self::GetLastError
             | Self::GetCurrentThreadId
             | Self::GetCurrentProcessId
+            | Self::GetCurrentProcess
             | Self::GetProcessHeap
             | Self::GetTickCount
             | Self::WsprintfW
@@ -12766,6 +18649,7 @@ impl HostThunk {
             | Self::GetCommandLineA
             | Self::GetCommandLineW
             | Self::GetEnvironmentStringsW
+            | Self::IsUserAnAdmin
             | Self::GetACP
             | Self::IsValidCodePage
             | Self::PArgc
@@ -12794,7 +18678,12 @@ impl HostThunk {
             | Self::GetMessagePos
             | Self::CreatePopupMenu
             | Self::SetUserMathErr
-            | Self::TlsAlloc => 0,
+            | Self::AreFileApisANSI
+            | Self::TlsAlloc
+            | Self::WsaCleanup
+            | Self::WsaGetLastError => 0,
+            Self::SetEnvironmentVariableW => 8,
+            Self::GetEnvironmentVariableW => 12,
             Self::QueryPerformanceCounter
             | Self::QueryPerformanceFrequency
             | Self::IsProcessorFeaturePresent
@@ -12803,12 +18692,38 @@ impl HostThunk {
             | Self::InitializeSListHead
             | Self::GetStdHandle
             | Self::GetFileType
-            | Self::FreeEnvironmentStringsW => 4,
-            Self::GetCPInfo => 8,
+            | Self::EncodePointer
+            | Self::DecodePointer
+            | Self::FreeEnvironmentStringsW
+            | Self::Closesocket
+            | Self::WsaSetLastError
+            | Self::Htonl
+            | Self::Htons
+            | Self::Ntohl
+            | Self::Ntohs => 4,
+            Self::GetCPInfo
+            | Self::LocaleNameToLCID
+            | Self::SetFileCompletionNotificationModes
+            | Self::WsaStartup
+            | Self::Shutdown
+            | Self::WsaFdIsSet => 8,
+            Self::SetHandleInformation
+            | Self::Ioctlsocket
+            | Self::Socket
+            | Self::GetModuleHandleExA
+            | Self::GetModuleHandleExW => 12,
+            Self::DisconnectEx => 16,
             Self::GetStringTypeW => 16,
             Self::LCMapStringW => 24,
-            Self::CreateEventW => 16,
+            Self::WsaSocketA => 24,
+            Self::LCMapStringEx => 36,
+            Self::CreateIoCompletionPort | Self::PostQueuedCompletionStatus => 16,
+            Self::GetQueuedCompletionStatus => 20,
+            Self::GetQueuedCompletionStatusEx => 24,
+            Self::CreateEventA | Self::CreateEventW => 16,
+            Self::OpenEventA | Self::OpenEventW => 12,
             Self::IsDebuggerPresent => 0,
+            Self::Select => 20,
             Self::InitOnceBeginInitialize => 16,
             Self::InitOnceComplete => 12,
             Self::InitializeSRWLock
@@ -12818,22 +18733,28 @@ impl HostThunk {
             | Self::ReleaseSRWLockShared
             | Self::TryAcquireSRWLockExclusive
             | Self::TryAcquireSRWLockShared => 4,
-            Self::SetEvent | Self::ResetEvent => 4,
+            Self::SetEvent | Self::ResetEvent | Self::FlsAlloc => 4,
             Self::GetProcessHeaps => 8,
             Self::HeapAlloc | Self::HeapFree | Self::HeapSize => 12,
             Self::HeapReAlloc => 16,
+            Self::GetCurrentPackageId => 8,
             Self::InitializeCriticalSectionAndSpinCount => 8,
-            Self::GetSystemTimeAsFileTime => 4,
+            Self::InitializeCriticalSectionEx | Self::SleepConditionVariableCS | Self::GetFileAttributesExW => 12,
+            Self::GetSystemTimeAsFileTime
+            | Self::GetSystemTimePreciseAsFileTime
+            | Self::GetTimeZoneInformation => 4,
             Self::SetFileAttributesW | Self::FindFirstFileW | Self::FindNextFileW => 8,
             Self::FindClose => 4,
             Self::ShellLinkAddRef | Self::ShellLinkRelease | Self::ShellLinkPersistIsDirty => 4,
-            Self::SetCurrentDirectoryW
-            | Self::GetFullPathNameW
-            | Self::GetFileAttributesW
+            Self::SetCurrentDirectoryW => 4,
+            Self::GetCurrentDirectoryW => 8,
+            Self::GetFullPathNameW => 16,
+            Self::GetFileAttributesW
             | Self::SetErrorMode
             | Self::SetDefaultDllDirectories
             | Self::FreeLibrary
             | Self::RegisterClassW
+            | Self::RegisterClassExW
             | Self::IsWindowEnabled
             | Self::GetWindowLongW
             | Self::GetModuleHandleA
@@ -12842,13 +18763,18 @@ impl HostThunk {
             | Self::CrtExit
             | Self::DeleteCriticalSection
             | Self::EnterCriticalSection
+            | Self::TryEnterCriticalSection
             | Self::InitializeCriticalSection
             | Self::LeaveCriticalSection
+            | Self::WakeAllConditionVariable
+            | Self::UnhandledExceptionFilter
             | Self::SetUnhandledExceptionFilter
             | Self::Sleep
             | Self::ExitProcess
+            | Self::InitCommonControlsEx
             | Self::OleInitialize
             | Self::CoTaskMemFree
+            | Self::VariantClear
             | Self::LstrlenW
             | Self::CharNextW
             | Self::GetDC
@@ -12862,16 +18788,21 @@ impl HostThunk {
             | Self::GetSystemMetrics
             | Self::IsWindow
             | Self::PostQuitMessage
+            | Self::OutputDebugStringA
+            | Self::OutputDebugStringW
             | Self::LoadLibraryA
             | Self::LoadLibraryW
             => 4,
-            Self::TlsGetValue | Self::TlsFree => 4,
-            Self::TlsSetValue => 8,
+            Self::ProcessIdToSessionId => 8,
+            Self::EnumProcesses => 12,
+            Self::TlsGetValue | Self::TlsFree | Self::FlsGetValue | Self::FlsFree | Self::RtlNtStatusToDosError => 4,
+            Self::TlsSetValue | Self::FlsSetValue => 8,
             Self::MessageBoxIndirectW => 4,
             Self::CSpecificHandler
             | Self::Beep
             | Self::GetProcAddress
             | Self::GetFileSize
+            | Self::GetFileInformationByHandle
             | Self::LocalAlloc
             | Self::GlobalAlloc
             | Self::LstrcmpiW
@@ -12887,6 +18818,7 @@ impl HostThunk {
             | Self::EndDialog
             | Self::ReleaseDC
             | Self::ScreenToClient
+            | Self::LoadIconW
             | Self::LoadCursorW
             | Self::LoadBitmapW
             | Self::GetDeviceCaps
@@ -12896,12 +18828,16 @@ impl HostThunk {
             | Self::CreateDirectoryW
             | Self::WaitForSingleObject
             | Self::ExitWindowsEx
-            | Self::GetExitCodeProcess => 8,
-            Self::GetSystemDirectoryW | Self::GetWindowsDirectoryW | Self::GetTempPathW => 8,
-            Self::GetModuleFileNameW => 12,
+            | Self::GetExitCodeProcess
+            | Self::TerminateProcess => 8,
+            Self::EnumProcessModules | Self::GetModuleBaseNameA => 16,
+            Self::GetSystemDirectoryW | Self::GetWindowsDirectoryW | Self::GetTempPathW | Self::GetTempPath2W => 8,
+            Self::GetModuleFileNameA | Self::GetModuleFileNameW => 12,
             Self::GetTempFileNameW => 16,
-            Self::LoadLibraryExW
+            Self::LoadLibraryExA
+            | Self::LoadLibraryExW
             | Self::GetClassInfoW
+            | Self::GetClassInfoExW
             | Self::SetDlgItemTextW
             | Self::SetClassLongW
             | Self::SetWindowLongW
@@ -12913,7 +18849,6 @@ impl HostThunk {
             | Self::VirtualQuery
             | Self::FindWindowExW
             | Self::AppendMenuW
-            | Self::SetTimer
             | Self::SystemParametersInfoW
             | Self::LstrcpynW => 12,
             Self::MessageBoxW
@@ -12921,6 +18856,10 @@ impl HostThunk {
             | Self::VirtualProtect
             | Self::GetDlgItemTextW
             | Self::WritePrivateProfileStringW => 16,
+            Self::VerSetConditionMask => 16,
+            Self::VerifyVersionInfoW => 16,
+            Self::CreateFontW => 56,
+            Self::CreateWindowExW => 48,
             Self::CreateProcessW => 40,
             Self::DrawTextW => 20,
             Self::CallWindowProcW => 20,
@@ -12936,14 +18875,24 @@ impl HostThunk {
             Self::LoadImageW => 24,
             Self::DispatchMessageW => 4,
             Self::SendMessageW => 16,
-            Self::GlobalLock | Self::GlobalUnlock | Self::GlobalFree => 4,
+            Self::SetTimer => 16,
+            Self::LocalLock
+            | Self::LocalUnlock
+            | Self::LocalFree
+            | Self::GlobalLock
+            | Self::GlobalUnlock
+            | Self::GlobalFree => 4,
             Self::PeekMessageW => 20,
-            Self::RegCreateKeyExW => 36,
-            Self::RegOpenKeyExW => 20,
-            Self::RegSetValueExW => 24,
-            Self::RegQueryValueExW => 24,
+            Self::RegCreateKeyExA | Self::RegCreateKeyExW => 36,
+            Self::RegOpenKeyA => 12,
+            Self::RegOpenKeyExA | Self::RegOpenKeyExW => 20,
+            Self::RegSetValueExA | Self::RegSetValueExW => 24,
+            Self::RegQueryValueExA | Self::RegQueryValueExW => 24,
             Self::RegCloseKey => 4,
+            Self::InitializeSecurityDescriptor => 8,
+            Self::SetSecurityDescriptorDacl => 16,
             Self::SetFilePointer => 16,
+            Self::FlushFileBuffers => 4,
             Self::ReadFile
             | Self::WriteFile
             | Self::SHGetFileInfoW
@@ -12975,10 +18924,12 @@ impl HostThunk {
             Self::ShellLinkSetPathW => 8,
             Self::CommandLineToArgvW | Self::SHGetPathFromIDListW => 8,
             Self::CreateFileW
+            | Self::ConnectEx
             | Self::StdioCommonVfprintf
             | Self::SetWindowPos
             | Self::TrackPopupMenu
             | Self::SendMessageTimeoutW => 28,
+            Self::WsaIoctl => 36,
             Self::MultiByteToWideChar => 24,
             Self::WideCharToMultiByte => 32,
             Self::SHGetSpecialFolderLocation => 12,
@@ -13025,7 +18976,8 @@ fn decode_current_instruction(
     memory: &MemoryImage,
     rip: u64,
 ) -> AppResult<DecodedInstruction> {
-    let bytes = read_window(memory, rip, 15)?;
+    let mut bytes = [0_u8; 15];
+    memory.read_into_slice(rip, &mut bytes)?;
     for len in (1..=bytes.len()).rev() {
         if let Ok(decoded) = engine.decode_block(&bytes[..len], rip) {
             if decoded.len() == 1 && decoded[0].size == len {
@@ -13054,7 +19006,7 @@ fn decode_current_instruction_cached(
     rip: u64,
 ) -> AppResult<Arc<CachedInstruction>> {
     if let Some(cached) = instruction_cache.get_mut(&rip) {
-        if read_window(memory, rip, cached.cached.decoded.size)? == cached.cached.bytes.as_slice() {
+        if read_window_matches(memory, rip, cached.cached.bytes.as_slice())? {
             *instruction_cache_generation = instruction_cache_generation.saturating_add(1);
             cached.generation = *instruction_cache_generation;
             instruction_cache_lru.push_back((rip, cached.generation));
@@ -13063,7 +19015,8 @@ fn decode_current_instruction_cached(
     }
 
     let decoded = decode_current_instruction(engine, memory, rip)?;
-    let bytes = read_window(memory, rip, decoded.size)?;
+    let mut bytes = vec![0; decoded.size];
+    memory.read_into_slice(rip, &mut bytes)?;
     *instruction_cache_generation = instruction_cache_generation.saturating_add(1);
     let cached = Arc::new(CachedInstruction {
         bytes,
@@ -13097,7 +19050,7 @@ fn decode_basic_block_cached(
     rip: u64,
 ) -> AppResult<Arc<CachedBlock>> {
     if let Some(cached) = basic_block_cache.get_mut(&rip) {
-        if read_window(memory, rip, cached.cached.bytes.len())? == cached.cached.bytes.as_slice() {
+        if read_window_matches(memory, rip, cached.cached.bytes.as_slice())? {
             *basic_block_cache_generation = basic_block_cache_generation.saturating_add(1);
             cached.generation = *basic_block_cache_generation;
             basic_block_cache_lru.push_back((rip, cached.generation));
@@ -13212,8 +19165,9 @@ fn annotate_guest_fault(error: AppError, memory: &MemoryImage, state: &CpuState)
         })
         .unwrap_or_else(|_| "<unavailable>".to_string());
     let registers = format!(
-        "rax={:#x} rcx={:#x} rdx={:#x} rsi={:#x} rdi={:#x} rsp={:#x} rbp={:#x}",
+        "rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x} rsi={:#x} rdi={:#x} rsp={:#x} rbp={:#x}",
         state.get(Register::Rax),
+        state.get(Register::Rbx),
         state.get(Register::Rcx),
         state.get(Register::Rdx),
         state.get(Register::Rsi),
@@ -13225,6 +19179,92 @@ fn annotate_guest_fault(error: AppError, memory: &MemoryImage, state: &CpuState)
         error.code,
         format!("{} while executing guest instruction at {rip:#x}: {window} | {registers}", error.message),
     );
+    if let Ok(bytes) = read_window(memory, rip, 64) {
+        let raw_block = bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        match crate::cpu::decode_block(&bytes, rip, state.arch) {
+            Ok(decoded) => {
+                let summary = decoded
+                    .iter()
+                    .take(8)
+                    .map(|instruction| {
+                        format!(
+                            "{:#x}:{:?} {:?}",
+                            instruction.address,
+                            instruction.opcode,
+                            instruction.operands,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" || ");
+                if !summary.is_empty() {
+                    wrapped = wrapped.with_hint(format!("fault-block {summary}"));
+                }
+            }
+            Err(decode_error) => {
+                wrapped = wrapped.with_hint(format!(
+                    "fault-block decode-failed={} bytes={raw_block}",
+                    decode_error.message,
+                ));
+            }
+        }
+    }
+    if let Ok(bytes) = read_window(memory, rip, 16) {
+        if bytes.starts_with(&[0xc5, 0xf5, 0x74, 0x01, 0xc5, 0xfd, 0xd7, 0xc0]) {
+            let caller = read_guest_u32(memory, state.get(Register::Rbp) + 4)
+                .ok()
+                .map(u64::from);
+            let arg0 = read_guest_u32(memory, state.get(Register::Rbp) + 8)
+                .ok()
+                .map(u64::from)
+                .unwrap_or(0);
+            let arg1 = read_guest_u32(memory, state.get(Register::Rbp) + 12)
+                .ok()
+                .map(u64::from)
+                .unwrap_or(0);
+            let mut mapped = Vec::new();
+            let mut first_unmapped = None;
+            if arg0 != 0 {
+                for offset in 0..64_u64 {
+                    match memory.read_u8(arg0 + offset) {
+                        Ok(byte) => mapped.push(byte),
+                        Err(_) => {
+                            first_unmapped = Some(arg0 + offset);
+                            break;
+                        }
+                    }
+                }
+            }
+            let hex = mapped
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let ascii = mapped
+                .iter()
+                .map(|byte| {
+                    if byte.is_ascii_graphic() || *byte == b' ' {
+                        char::from(*byte)
+                    } else {
+                        '.'
+                    }
+                })
+                .collect::<String>();
+            wrapped = wrapped.with_hint(format!(
+                "steam-avx-strscan caller={} arg0={arg0:#x} arg1={arg1:#x} mapped_len={} first_unmapped={} hex=[{hex}] ascii={ascii}",
+                caller
+                    .map(|value| format!("{value:#x}"))
+                    .unwrap_or_else(|| "<unavailable>".to_string()),
+                mapped.len(),
+                first_unmapped
+                    .map(|value| format!("{value:#x}"))
+                    .unwrap_or_else(|| "<none>".to_string()),
+            ));
+        }
+    }
     if rip == 0x401390 {
         let state_table = read_guest_u32(memory, 0x42a250).ok().map(u64::from);
         let record_base = read_guest_u32(memory, 0x42a270).ok().map(u64::from);
@@ -13298,10 +19338,206 @@ fn annotate_guest_fault(error: AppError, memory: &MemoryImage, state: &CpuState)
             current_record,
         ));
     }
+    if let Some(fault_address) = guest_access_violation_address(&error) {
+        if fault_address < 0x1000 {
+            let frame_probe = [
+                state.get(Register::Rbp) + 4,
+                state.get(Register::Rbp) + 8,
+                state.get(Register::Rbp) + 12,
+                state.get(Register::Rbp) + 16,
+            ]
+            .into_iter()
+            .map(|address| {
+                let value = read_guest_u32(memory, address)
+                    .ok()
+                    .map(u64::from)
+                    .unwrap_or(0);
+                format!("{address:#x}={value:#x}")
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+            let parent_ebp = read_guest_u32(memory, state.get(Register::Rbp))
+                .ok()
+                .map(u64::from)
+                .unwrap_or(0);
+            let parent_arg1 = if parent_ebp != 0 {
+                read_guest_u32(memory, parent_ebp + 12).ok().map(u64::from)
+            } else {
+                None
+            };
+            let parent_arg2 = if parent_ebp != 0 {
+                read_guest_u32(memory, parent_ebp + 16).ok().map(u64::from)
+            } else {
+                None
+            };
+            let parent_frame_probe = if parent_ebp != 0 {
+                [parent_ebp + 4, parent_ebp + 8, parent_ebp + 12, parent_ebp + 16]
+                    .into_iter()
+                    .map(|address| {
+                        let value = read_guest_u32(memory, address)
+                            .ok()
+                            .map(u64::from)
+                            .unwrap_or(0);
+                        format!("{address:#x}={value:#x}")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",")
+            } else {
+                "<unavailable>".to_string()
+            };
+            let parent_arg1_probe = match (parent_arg1, parent_arg2) {
+                (Some(address), Some(length)) if address != 0 && length != 0 && length <= 64 => {
+                    match read_window(memory, address, length as usize) {
+                        Ok(bytes) => {
+                            let hex = bytes
+                                .iter()
+                                .map(|byte| format!("{byte:02x}"))
+                                .collect::<Vec<_>>()
+                                .join(" ");
+                            let ascii = bytes
+                                .iter()
+                                .map(|byte| {
+                                    if byte.is_ascii_graphic() || *byte == b' ' {
+                                        char::from(*byte)
+                                    } else {
+                                        '.'
+                                    }
+                                })
+                                .collect::<String>();
+                            let first_entry_probe = if bytes.len() >= 4 {
+                                let first_entry = u64::from(u32::from_le_bytes(bytes[0..4].try_into().unwrap()));
+                                if first_entry != 0 {
+                                    match read_window(memory, first_entry, 64) {
+                                        Ok(pointed_bytes) => {
+                                            let end = pointed_bytes
+                                                .iter()
+                                                .position(|byte| *byte == 0)
+                                                .unwrap_or(pointed_bytes.len());
+                                            let pointed_ascii = pointed_bytes[..end]
+                                                .iter()
+                                                .map(|byte| {
+                                                    if byte.is_ascii_graphic() || *byte == b' ' {
+                                                        char::from(*byte)
+                                                    } else {
+                                                        '.'
+                                                    }
+                                                })
+                                                .collect::<String>();
+                                            format!(" first_entry={first_entry:#x} first_ascii={pointed_ascii}")
+                                        }
+                                        Err(_) => format!(" first_entry={first_entry:#x} unreadable"),
+                                    }
+                                } else {
+                                    String::new()
+                                }
+                            } else {
+                                String::new()
+                            };
+                            format!("addr={address:#x} len={length:#x} hex=[{hex}] ascii={ascii}{first_entry_probe}")
+                        }
+                        Err(_) => format!("addr={address:#x} len={length:#x} unreadable"),
+                    }
+                }
+                _ => "<unavailable>".to_string(),
+            };
+            wrapped = wrapped.with_hint(format!(
+                "low-fault probe fault={fault_address:#x} rbx={:#x} frame=[{}] parent_ebp={parent_ebp:#x} parent_frame=[{}] parent_arg1={parent_arg1_probe}",
+                state.get(Register::Rbx),
+                frame_probe,
+                parent_frame_probe,
+            ));
+        }
+    }
     for hint in error.reproduction_hints {
         wrapped = wrapped.with_hint(hint);
     }
     wrapped
+}
+
+fn guest_access_violation_address(error: &AppError) -> Option<u64> {
+    if error.code != ReasonCode::RcUnimplInsn {
+        return None;
+    }
+    let encoded = error.message.strip_prefix("unmapped guest memory at ")?;
+    let hex = encoded.split_whitespace().next()?.strip_prefix("0x")?;
+    u64::from_str_radix(hex, 16).ok()
+}
+
+fn pack_x86_eflags(state: &CpuState) -> u32 {
+    let mut value = 0x2_u32 | ((state.eflags_extra & !0x8d7_u64) as u32);
+    if state.flags.cf {
+        value |= 1 << 0;
+    }
+    if state.flags.pf {
+        value |= 1 << 2;
+    }
+    if state.flags.af {
+        value |= 1 << 4;
+    }
+    if state.flags.zf {
+        value |= 1 << 6;
+    }
+    if state.flags.sf {
+        value |= 1 << 7;
+    }
+    if state.flags.of {
+        value |= 1 << 11;
+    }
+    value
+}
+
+fn unpack_x86_eflags(state: &mut CpuState, value: u32) {
+    state.flags.cf = value & (1 << 0) != 0;
+    state.flags.pf = value & (1 << 2) != 0;
+    state.flags.af = value & (1 << 4) != 0;
+    state.flags.zf = value & (1 << 6) != 0;
+    state.flags.sf = value & (1 << 7) != 0;
+    state.flags.of = value & (1 << 11) != 0;
+    state.eflags_extra = u64::from(value & !0x8d7_u32);
+}
+
+fn write_x86_exception_record(memory: &mut MemoryImage, base: u64, fault_address: u64, exception_rip: u32) {
+    write_u32(memory, base, crate::cpu::EXCEPTION_ACCESS_VIOLATION);
+    write_u32(memory, base + 4, 0);
+    write_u32(memory, base + 8, 0);
+    write_u32(memory, base + 12, exception_rip);
+    write_u32(memory, base + 16, 2);
+    write_u32(memory, base + 20, 0);
+    write_u32(memory, base + 24, fault_address as u32);
+}
+
+fn write_x86_context(memory: &mut MemoryImage, base: u64, state: &CpuState) {
+    write_u32(memory, base, X86_CONTEXT_FLAGS_FULL);
+    write_u32(memory, base + X86_CONTEXT_OFFSET_SEG_GS, 0);
+    write_u32(memory, base + X86_CONTEXT_OFFSET_SEG_FS, 0);
+    write_u32(memory, base + X86_CONTEXT_OFFSET_SEG_ES, 0x23);
+    write_u32(memory, base + X86_CONTEXT_OFFSET_SEG_DS, 0x23);
+    write_u32(memory, base + X86_CONTEXT_OFFSET_EDI, state.get(Register::Rdi) as u32);
+    write_u32(memory, base + X86_CONTEXT_OFFSET_ESI, state.get(Register::Rsi) as u32);
+    write_u32(memory, base + X86_CONTEXT_OFFSET_EBX, state.get(Register::Rbx) as u32);
+    write_u32(memory, base + X86_CONTEXT_OFFSET_EDX, state.get(Register::Rdx) as u32);
+    write_u32(memory, base + X86_CONTEXT_OFFSET_ECX, state.get(Register::Rcx) as u32);
+    write_u32(memory, base + X86_CONTEXT_OFFSET_EAX, state.get(Register::Rax) as u32);
+    write_u32(memory, base + X86_CONTEXT_OFFSET_EBP, state.get(Register::Rbp) as u32);
+    write_u32(memory, base + X86_CONTEXT_OFFSET_EIP, state.rip as u32);
+    write_u32(memory, base + X86_CONTEXT_OFFSET_SEG_CS, 0x1b);
+    write_u32(memory, base + X86_CONTEXT_OFFSET_EFLAGS, pack_x86_eflags(state));
+    write_u32(memory, base + X86_CONTEXT_OFFSET_ESP, state.get(Register::Rsp) as u32);
+    write_u32(memory, base + X86_CONTEXT_OFFSET_SEG_SS, 0x23);
+}
+
+fn read_x86_context(memory: &MemoryImage, base: u64, state: &mut CpuState) -> AppResult<()> {
+    state.set(Register::Rdi, u64::from(read_guest_u32(memory, base + X86_CONTEXT_OFFSET_EDI)?));
+    state.set(Register::Rsi, u64::from(read_guest_u32(memory, base + X86_CONTEXT_OFFSET_ESI)?));
+    state.set(Register::Rbx, u64::from(read_guest_u32(memory, base + X86_CONTEXT_OFFSET_EBX)?));
+    state.set(Register::Rdx, u64::from(read_guest_u32(memory, base + X86_CONTEXT_OFFSET_EDX)?));
+    state.set(Register::Rcx, u64::from(read_guest_u32(memory, base + X86_CONTEXT_OFFSET_ECX)?));
+    state.set(Register::Rax, u64::from(read_guest_u32(memory, base + X86_CONTEXT_OFFSET_EAX)?));
+    state.set(Register::Rbp, u64::from(read_guest_u32(memory, base + X86_CONTEXT_OFFSET_EBP)?));
+    state.rip = u64::from(read_guest_u32(memory, base + X86_CONTEXT_OFFSET_EIP)?);
+    state.set(Register::Rsp, u64::from(read_guest_u32(memory, base + X86_CONTEXT_OFFSET_ESP)?));
+    unpack_x86_eflags(state, read_guest_u32(memory, base + X86_CONTEXT_OFFSET_EFLAGS)?);
+    Ok(())
 }
 
 fn instruction_controls_rip(opcode: DecodedOpcode) -> bool {
@@ -13629,8 +19865,129 @@ fn encode_registry_value_data(value: &crate::ge::StoredRegistryValue) -> AppResu
     }
 }
 
+fn decode_registry_value_data_ansi(
+    memory: &MemoryImage,
+    data_ptr: u64,
+    data_len: u32,
+    value_type: u32,
+) -> AppResult<(String, Value)> {
+    let bytes = if data_ptr == 0 || data_len == 0 {
+        Vec::new()
+    } else {
+        memory.read_bytes(data_ptr, data_len as usize)?
+    };
+    match value_type {
+        REG_SZ | REG_EXPAND_SZ => {
+            let trimmed = bytes
+                .iter()
+                .copied()
+                .take_while(|byte| *byte != 0)
+                .map(char::from)
+                .collect::<String>();
+            Ok((
+                if value_type == REG_SZ {
+                    "REG_SZ".to_string()
+                } else {
+                    "REG_EXPAND_SZ".to_string()
+                },
+                json!(trimmed),
+            ))
+        }
+        REG_DWORD | REG_QWORD | REG_BINARY => decode_registry_value_data(memory, data_ptr, data_len, value_type),
+        REG_MULTI_SZ => {
+            let mut items = Vec::new();
+            let mut current = Vec::new();
+            for byte in bytes {
+                if byte == 0 {
+                    if current.is_empty() {
+                        break;
+                    }
+                    items.push(current.iter().copied().map(char::from).collect::<String>());
+                    current.clear();
+                } else {
+                    current.push(byte);
+                }
+            }
+            Ok(("REG_MULTI_SZ".to_string(), json!(items)))
+        }
+        other => Err(AppError::new(
+            ReasonCode::RcCliInvalid,
+            format!("unsupported registry value type code {other}"),
+        )),
+    }
+}
+
+fn encode_registry_value_data_ansi(value: &crate::ge::StoredRegistryValue) -> AppResult<Vec<u8>> {
+    match value.value_type.to_ascii_uppercase().as_str() {
+        "REG_SZ" | "REG_EXPAND_SZ" => {
+            let text = value.data.as_str().ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcCliInvalid,
+                    format!("registry string value has non-string data: {:?}", value.data),
+                )
+            })?;
+            let mut encoded = text
+                .chars()
+                .map(|ch| if ch.is_ascii() { ch as u8 } else { b'?' })
+                .collect::<Vec<_>>();
+            encoded.push(0);
+            Ok(encoded)
+        }
+        "REG_DWORD" | "REG_QWORD" | "REG_BINARY" => encode_registry_value_data(value),
+        "REG_MULTI_SZ" => {
+            let items = value.data.as_array().ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcCliInvalid,
+                    format!("registry multi-string value has non-array data: {:?}", value.data),
+                )
+            })?;
+            let mut encoded = Vec::new();
+            for item in items {
+                let text = item.as_str().ok_or_else(|| {
+                    AppError::new(
+                        ReasonCode::RcCliInvalid,
+                        format!("registry multi-string value contains non-string data: {item:?}"),
+                    )
+                })?;
+                encoded.extend(text.chars().map(|ch| if ch.is_ascii() { ch as u8 } else { b'?' }));
+                encoded.push(0);
+            }
+            encoded.push(0);
+            Ok(encoded)
+        }
+        other => Err(AppError::new(
+            ReasonCode::RcCliInvalid,
+            format!("unsupported registry value type {other}"),
+        )),
+    }
+}
+
 fn read_window(memory: &MemoryImage, address: u64, len: usize) -> AppResult<Vec<u8>> {
-    memory.read_bytes(address, len)
+    let mut bytes = vec![0; len];
+    memory.read_into_slice(address, &mut bytes)?;
+    Ok(bytes)
+}
+
+fn read_window_matches(memory: &MemoryImage, address: u64, expected: &[u8]) -> AppResult<bool> {
+    let mut offset = 0_usize;
+    let mut scratch = [0_u8; 64];
+    while offset < expected.len() {
+        let chunk_len = (expected.len() - offset).min(scratch.len());
+        let chunk = &mut scratch[..chunk_len];
+        memory.read_into_slice(address + offset as u64, chunk)?;
+        if chunk != &expected[offset..offset + chunk_len] {
+            return Ok(false);
+        }
+        offset += chunk_len;
+    }
+    Ok(true)
+}
+
+fn probe_read_window(memory: &MemoryImage, address: u64, len: usize) -> Option<Vec<u8>> {
+    if !memory.is_range_mapped(address, len) {
+        return None;
+    }
+    read_window(memory, address, len).ok()
 }
 
 fn read_i32_from_memory(memory: &MemoryImage, address: u64) -> AppResult<i32> {
@@ -13650,6 +20007,7 @@ struct GuestWindowClass {
     background: u64,
     menu_name: u64,
     class_name_ptr: u64,
+    icon_small: u64,
 }
 
 fn read_guest_window_class(
@@ -13671,6 +20029,11 @@ fn read_guest_window_class(
             background: read_guest_u32(memory, address + base + 28)? as u64,
             menu_name: read_guest_u32(memory, address + base + 32)? as u64,
             class_name_ptr: read_guest_u32(memory, address + base + 36)? as u64,
+            icon_small: if extended {
+                read_guest_u32(memory, address + base + 40)? as u64
+            } else {
+                0
+            },
         },
         GuestArch::X64 => GuestWindowClass {
             style: read_guest_u32(memory, address + base)?,
@@ -13683,6 +20046,11 @@ fn read_guest_window_class(
             background: read_guest_pointer(memory, address + 48, guest_arch)?,
             menu_name: read_guest_pointer(memory, address + 56, guest_arch)?,
             class_name_ptr: read_guest_pointer(memory, address + 64, guest_arch)?,
+            icon_small: if extended {
+                read_guest_pointer(memory, address + 72, guest_arch)?
+            } else {
+                0
+            },
         },
     })
 }
@@ -13692,32 +20060,55 @@ fn write_guest_window_class(
     address: u64,
     guest_arch: GuestArch,
     class_info: WindowClassInfo,
+    extended: bool,
 ) -> AppResult<()> {
     match guest_arch {
         GuestArch::X86 => {
-            write_u32(memory, address, class_info.style);
-            write_u32(memory, address + 4, class_info.wnd_proc as u32);
-            write_u32(memory, address + 8, class_info.cls_extra as u32);
-            write_u32(memory, address + 12, class_info.wnd_extra as u32);
-            write_u32(memory, address + 16, class_info.instance as u32);
-            write_u32(memory, address + 20, class_info.icon as u32);
-            write_u32(memory, address + 24, class_info.cursor as u32);
-            write_u32(memory, address + 28, class_info.background as u32);
-            write_u32(memory, address + 32, class_info.menu_name as u32);
-            write_u32(memory, address + 36, class_info.class_name_ptr as u32);
+            let base = if extended { 4 } else { 0 };
+            if extended {
+                write_u32(memory, address, 48);
+            }
+            write_u32(memory, address + base, class_info.style);
+            write_u32(memory, address + base + 4, class_info.wnd_proc as u32);
+            write_u32(memory, address + base + 8, class_info.cls_extra as u32);
+            write_u32(memory, address + base + 12, class_info.wnd_extra as u32);
+            write_u32(memory, address + base + 16, class_info.instance as u32);
+            write_u32(memory, address + base + 20, class_info.icon as u32);
+            write_u32(memory, address + base + 24, class_info.cursor as u32);
+            write_u32(memory, address + base + 28, class_info.background as u32);
+            write_u32(memory, address + base + 32, class_info.menu_name as u32);
+            write_u32(memory, address + base + 36, class_info.class_name_ptr as u32);
+            if extended {
+                write_u32(memory, address + base + 40, class_info.icon_small as u32);
+            }
         }
         GuestArch::X64 => {
-            write_u32(memory, address, class_info.style);
-            write_u32(memory, address + 4, 0);
-            write_guest_pointer(memory, address + 8, class_info.wnd_proc, guest_arch)?;
-            write_u32(memory, address + 16, class_info.cls_extra as u32);
-            write_u32(memory, address + 20, class_info.wnd_extra as u32);
-            write_guest_pointer(memory, address + 24, class_info.instance, guest_arch)?;
-            write_guest_pointer(memory, address + 32, class_info.icon, guest_arch)?;
-            write_guest_pointer(memory, address + 40, class_info.cursor, guest_arch)?;
-            write_guest_pointer(memory, address + 48, class_info.background, guest_arch)?;
-            write_guest_pointer(memory, address + 56, class_info.menu_name, guest_arch)?;
-            write_guest_pointer(memory, address + 64, class_info.class_name_ptr, guest_arch)?;
+            if extended {
+                write_u32(memory, address, 80);
+                write_u32(memory, address + 4, class_info.style);
+                write_guest_pointer(memory, address + 8, class_info.wnd_proc, guest_arch)?;
+                write_u32(memory, address + 16, class_info.cls_extra as u32);
+                write_u32(memory, address + 20, class_info.wnd_extra as u32);
+                write_guest_pointer(memory, address + 24, class_info.instance, guest_arch)?;
+                write_guest_pointer(memory, address + 32, class_info.icon, guest_arch)?;
+                write_guest_pointer(memory, address + 40, class_info.cursor, guest_arch)?;
+                write_guest_pointer(memory, address + 48, class_info.background, guest_arch)?;
+                write_guest_pointer(memory, address + 56, class_info.menu_name, guest_arch)?;
+                write_guest_pointer(memory, address + 64, class_info.class_name_ptr, guest_arch)?;
+                write_guest_pointer(memory, address + 72, class_info.icon_small, guest_arch)?;
+            } else {
+                write_u32(memory, address, class_info.style);
+                write_u32(memory, address + 4, 0);
+                write_guest_pointer(memory, address + 8, class_info.wnd_proc, guest_arch)?;
+                write_u32(memory, address + 16, class_info.cls_extra as u32);
+                write_u32(memory, address + 20, class_info.wnd_extra as u32);
+                write_guest_pointer(memory, address + 24, class_info.instance, guest_arch)?;
+                write_guest_pointer(memory, address + 32, class_info.icon, guest_arch)?;
+                write_guest_pointer(memory, address + 40, class_info.cursor, guest_arch)?;
+                write_guest_pointer(memory, address + 48, class_info.background, guest_arch)?;
+                write_guest_pointer(memory, address + 56, class_info.menu_name, guest_arch)?;
+                write_guest_pointer(memory, address + 64, class_info.class_name_ptr, guest_arch)?;
+            }
         }
     }
     Ok(())
@@ -13880,6 +20271,338 @@ fn last_error_from_app_error(error: &AppError) -> u32 {
         ReasonCode::RcCliInvalid => ERROR_INVALID_PARAMETER,
         _ => ERROR_ACCESS_DENIED,
     }
+}
+
+fn apply_ver_condition_mask(existing_mask: u64, type_mask: u32, condition_mask: u8) -> u64 {
+    let mut updated_mask = existing_mask;
+    let condition_bits = u64::from(condition_mask & 0x7);
+    for bit in [
+        VER_MINORVERSION,
+        VER_MAJORVERSION,
+        VER_BUILDNUMBER,
+        VER_PLATFORMID,
+        VER_SERVICEPACKMINOR,
+        VER_SERVICEPACKMAJOR,
+        VER_SUITENAME,
+        VER_PRODUCT_TYPE,
+    ] {
+        if type_mask & bit != 0 {
+            let shift = ver_condition_shift(bit).expect("known version type bit");
+            updated_mask &= !(0x7_u64 << shift);
+            updated_mask |= condition_bits << shift;
+        }
+    }
+    updated_mask
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GuestVersionInfo {
+    major: u32,
+    minor: u32,
+    build: u32,
+    platform_id: u32,
+    service_pack_major: u16,
+    service_pack_minor: u16,
+    suite_mask: u16,
+    product_type: u8,
+}
+
+fn ver_condition_shift(type_bit: u32) -> Option<u32> {
+    match type_bit {
+        VER_MINORVERSION => Some(0),
+        VER_MAJORVERSION => Some(3),
+        VER_BUILDNUMBER => Some(6),
+        VER_PLATFORMID => Some(9),
+        VER_SERVICEPACKMINOR => Some(12),
+        VER_SERVICEPACKMAJOR => Some(15),
+        VER_SUITENAME => Some(18),
+        VER_PRODUCT_TYPE => Some(21),
+        _ => None,
+    }
+}
+
+fn ver_condition_for_type(condition_mask: u64, type_bit: u32) -> AppResult<u8> {
+    let shift = ver_condition_shift(type_bit).ok_or_else(|| {
+        AppError::new(
+            ReasonCode::RcCliInvalid,
+            format!("unsupported version type bit {type_bit:#x}"),
+        )
+    })?;
+    let condition = ((condition_mask >> shift) & 0x7) as u8;
+    if condition == 0 {
+        return Err(AppError::new(
+            ReasonCode::RcCliInvalid,
+            format!("missing version condition for type bit {type_bit:#x}"),
+        ));
+    }
+    Ok(condition)
+}
+
+fn guest_version_info_from_profile(profile: &str) -> AppResult<GuestVersionInfo> {
+    match profile {
+        "win7" => Ok(GuestVersionInfo {
+            major: 6,
+            minor: 1,
+            build: 7600,
+            platform_id: VER_PLATFORM_WIN32_NT,
+            service_pack_major: 0,
+            service_pack_minor: 0,
+            suite_mask: 0,
+            product_type: VER_NT_WORKSTATION,
+        }),
+        "win7-sp1" => Ok(GuestVersionInfo {
+            major: 6,
+            minor: 1,
+            build: 7601,
+            platform_id: VER_PLATFORM_WIN32_NT,
+            service_pack_major: 1,
+            service_pack_minor: 0,
+            suite_mask: 0,
+            product_type: VER_NT_WORKSTATION,
+        }),
+        "win8" => Ok(GuestVersionInfo {
+            major: 6,
+            minor: 2,
+            build: 9200,
+            platform_id: VER_PLATFORM_WIN32_NT,
+            service_pack_major: 0,
+            service_pack_minor: 0,
+            suite_mask: 0,
+            product_type: VER_NT_WORKSTATION,
+        }),
+        "win8.1" => Ok(GuestVersionInfo {
+            major: 6,
+            minor: 3,
+            build: 9600,
+            platform_id: VER_PLATFORM_WIN32_NT,
+            service_pack_major: 0,
+            service_pack_minor: 0,
+            suite_mask: 0,
+            product_type: VER_NT_WORKSTATION,
+        }),
+        "win10-2004" => Ok(GuestVersionInfo {
+            major: 10,
+            minor: 0,
+            build: 19041,
+            platform_id: VER_PLATFORM_WIN32_NT,
+            service_pack_major: 0,
+            service_pack_minor: 0,
+            suite_mask: 0,
+            product_type: VER_NT_WORKSTATION,
+        }),
+        "win10-20h2" => Ok(GuestVersionInfo {
+            build: 19042,
+            ..guest_version_info_from_profile("win10-2004")?
+        }),
+        "win10-21h1" => Ok(GuestVersionInfo {
+            build: 19043,
+            ..guest_version_info_from_profile("win10-2004")?
+        }),
+        "win10-21h2" => Ok(GuestVersionInfo {
+            build: 19044,
+            ..guest_version_info_from_profile("win10-2004")?
+        }),
+        "win10-22h2" => Ok(GuestVersionInfo {
+            build: 19045,
+            ..guest_version_info_from_profile("win10-2004")?
+        }),
+        "win11-22h2" => Ok(GuestVersionInfo {
+            major: 10,
+            minor: 0,
+            build: 22621,
+            platform_id: VER_PLATFORM_WIN32_NT,
+            service_pack_major: 0,
+            service_pack_minor: 0,
+            suite_mask: 0,
+            product_type: VER_NT_WORKSTATION,
+        }),
+        "win11-23h2" => Ok(GuestVersionInfo {
+            build: 22631,
+            ..guest_version_info_from_profile("win11-22h2")?
+        }),
+        "win11-24h2" => Ok(GuestVersionInfo {
+            build: 26100,
+            ..guest_version_info_from_profile("win11-22h2")?
+        }),
+        _ => Err(AppError::new(
+            ReasonCode::RcCliInvalid,
+            format!("unsupported GE winver profile {profile} for version APIs"),
+        )),
+    }
+}
+
+fn read_guest_version_info(memory: &MemoryImage, address: u64) -> AppResult<GuestVersionInfo> {
+    Ok(GuestVersionInfo {
+        major: read_u32(memory, address + 4)?,
+        minor: read_u32(memory, address + 8)?,
+        build: read_u32(memory, address + 12)?,
+        platform_id: read_u32(memory, address + 16)?,
+        service_pack_major: if read_u32(memory, address)? >= OSVERSIONINFOEXW_SIZE {
+            read_guest_u16(memory, address + 276)?
+        } else {
+            0
+        },
+        service_pack_minor: if read_u32(memory, address)? >= OSVERSIONINFOEXW_SIZE {
+            read_guest_u16(memory, address + 278)?
+        } else {
+            0
+        },
+        suite_mask: if read_u32(memory, address)? >= OSVERSIONINFOEXW_SIZE {
+            read_guest_u16(memory, address + 280)?
+        } else {
+            0
+        },
+        product_type: if read_u32(memory, address)? >= OSVERSIONINFOEXW_SIZE {
+            memory.read_u8(address + 282)?
+        } else {
+            0
+        },
+    })
+}
+
+fn version_field_value(info: &GuestVersionInfo, type_bit: u32) -> u64 {
+    match type_bit {
+        VER_MAJORVERSION => u64::from(info.major),
+        VER_MINORVERSION => u64::from(info.minor),
+        VER_BUILDNUMBER => u64::from(info.build),
+        VER_PLATFORMID => u64::from(info.platform_id),
+        VER_SERVICEPACKMAJOR => u64::from(info.service_pack_major),
+        VER_SERVICEPACKMINOR => u64::from(info.service_pack_minor),
+        VER_SUITENAME => u64::from(info.suite_mask),
+        VER_PRODUCT_TYPE => u64::from(info.product_type),
+        _ => 0,
+    }
+}
+
+fn compare_ordering(ordering: Ordering, condition: u8) -> AppResult<bool> {
+    match condition {
+        VER_EQUAL => Ok(ordering == Ordering::Equal),
+        VER_GREATER => Ok(ordering == Ordering::Greater),
+        VER_GREATER_EQUAL => Ok(matches!(ordering, Ordering::Greater | Ordering::Equal)),
+        VER_LESS => Ok(ordering == Ordering::Less),
+        VER_LESS_EQUAL => Ok(matches!(ordering, Ordering::Less | Ordering::Equal)),
+        _ => Err(AppError::new(
+            ReasonCode::RcCliInvalid,
+            format!("unsupported version comparison condition {condition}"),
+        )),
+    }
+}
+
+fn compare_numeric_version_field(actual: u64, requested: u64, condition: u8) -> AppResult<bool> {
+    compare_ordering(actual.cmp(&requested), condition)
+}
+
+fn compare_suite_mask(actual: u16, requested: u16, condition: u8) -> AppResult<bool> {
+    match condition {
+        VER_AND => Ok(actual & requested == requested),
+        VER_OR => Ok(requested == 0 || actual & requested != 0),
+        VER_EQUAL => Ok(actual == requested),
+        _ => Err(AppError::new(
+            ReasonCode::RcCliInvalid,
+            format!("unsupported suite comparison condition {condition}"),
+        )),
+    }
+}
+
+fn compare_selected_version_fields(
+    actual: &GuestVersionInfo,
+    requested: &GuestVersionInfo,
+    type_mask: u32,
+) -> Ordering {
+    for bit in [
+        VER_MAJORVERSION,
+        VER_MINORVERSION,
+        VER_BUILDNUMBER,
+        VER_SERVICEPACKMAJOR,
+        VER_SERVICEPACKMINOR,
+    ] {
+        if type_mask & bit != 0 {
+            let ordering = version_field_value(actual, bit).cmp(&version_field_value(requested, bit));
+            if ordering != Ordering::Equal {
+                return ordering;
+            }
+        }
+    }
+    Ordering::Equal
+}
+
+fn verify_version_info(
+    actual: &GuestVersionInfo,
+    requested: &GuestVersionInfo,
+    type_mask: u32,
+    condition_mask: u64,
+) -> AppResult<bool> {
+    let ordered_bits = [
+        VER_MAJORVERSION,
+        VER_MINORVERSION,
+        VER_BUILDNUMBER,
+        VER_SERVICEPACKMAJOR,
+        VER_SERVICEPACKMINOR,
+    ];
+    let mut shared_ordered_condition = None;
+    let mut ordered_conditions_match = true;
+    for bit in ordered_bits {
+        if type_mask & bit == 0 {
+            continue;
+        }
+        let condition = ver_condition_for_type(condition_mask, bit)?;
+        if let Some(existing) = shared_ordered_condition {
+            if existing != condition {
+                ordered_conditions_match = false;
+            }
+        } else {
+            shared_ordered_condition = Some(condition);
+        }
+    }
+    if let Some(condition) = shared_ordered_condition {
+        let ordered_match = if ordered_conditions_match {
+            compare_ordering(compare_selected_version_fields(actual, requested, type_mask), condition)?
+        } else {
+            let mut fields_match = true;
+            for bit in ordered_bits {
+                if type_mask & bit == 0 {
+                    continue;
+                }
+                fields_match &= compare_numeric_version_field(
+                    version_field_value(actual, bit),
+                    version_field_value(requested, bit),
+                    ver_condition_for_type(condition_mask, bit)?,
+                )?;
+            }
+            fields_match
+        };
+        if !ordered_match {
+            return Ok(false);
+        }
+    }
+    if type_mask & VER_PLATFORMID != 0
+        && !compare_numeric_version_field(
+            u64::from(actual.platform_id),
+            u64::from(requested.platform_id),
+            ver_condition_for_type(condition_mask, VER_PLATFORMID)?,
+        )?
+    {
+        return Ok(false);
+    }
+    if type_mask & VER_SUITENAME != 0
+        && !compare_suite_mask(
+            actual.suite_mask,
+            requested.suite_mask,
+            ver_condition_for_type(condition_mask, VER_SUITENAME)?,
+        )?
+    {
+        return Ok(false);
+    }
+    if type_mask & VER_PRODUCT_TYPE != 0
+        && !compare_numeric_version_field(
+            u64::from(actual.product_type),
+            u64::from(requested.product_type),
+            ver_condition_for_type(condition_mask, VER_PRODUCT_TYPE)?,
+        )?
+    {
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 fn load_keyboard_replay(env: &BTreeMap<String, String>) -> AppResult<Vec<KeyboardReplayEvent>> {
@@ -14235,6 +20958,100 @@ mod tests {
     }
 
     #[test]
+    fn get_class_info_ex_w_writes_extended_class_layout_in_x86_runtime() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "class-info-ex", GeArch::X86, "win11-23h2")
+            .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        let class_name_ptr = runtime
+            .alloc_utf16_string(&mut memory, "SteamMainWindow")
+            .expect("class name");
+        runtime.user32.register_class_info(
+            "SteamMainWindow",
+            WindowClassInfo {
+                style: 0x1234_5678,
+                wnd_proc: 0x0040_1000,
+                cls_extra: 12,
+                wnd_extra: 16,
+                instance: 0x2000,
+                icon: 0x3000,
+                cursor: 0x4000,
+                background: 0x5000,
+                menu_name: 0x6000,
+                class_name_ptr,
+                icon_small: 0x7000,
+            },
+        );
+
+        let class_info_ptr = 0x41_000;
+        memory.map_bytes(class_info_ptr, &[0; 48]);
+
+        let thunk = runtime.alloc_host_thunk(HostThunk::GetClassInfoExW);
+        let result = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            thunk,
+            &[0, class_name_ptr as u32, class_info_ptr as u32],
+        );
+
+        assert_eq!(result, 1);
+        assert_eq!(read_guest_u32(&memory, class_info_ptr).expect("cbSize"), 48);
+        assert_eq!(read_guest_u32(&memory, class_info_ptr + 4).expect("style"), 0x1234_5678);
+        assert_eq!(read_guest_u32(&memory, class_info_ptr + 8).expect("wnd proc"), 0x0040_1000);
+        assert_eq!(read_guest_u32(&memory, class_info_ptr + 44).expect("small icon"), 0x7000);
+    }
+
+    #[test]
+    fn get_module_file_name_a_returns_main_module_path_in_x86_runtime() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "module-file-name-a", GeArch::X86, "win11-23h2")
+            .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        runtime.main_module_path = "C:\\Program Files (x86)\\Steam\\Steam.exe".to_string();
+        let mut memory = MemoryImage::default();
+        let buffer_ptr = 0x42_000;
+        memory.map_bytes(buffer_ptr, &[0; 64]);
+
+        let thunk = runtime.alloc_host_thunk(HostThunk::GetModuleFileNameA);
+        let written = dispatch_x86_thunk(&mut runtime, &mut memory, thunk, &[0, buffer_ptr as u32, 64]);
+
+        assert_eq!(written as usize, runtime.main_module_path.len());
+        let bytes = memory
+            .read_bytes(buffer_ptr, runtime.main_module_path.len() + 1)
+            .expect("module path bytes");
+        assert_eq!(&bytes[..runtime.main_module_path.len()], runtime.main_module_path.as_bytes());
+        assert_eq!(bytes[runtime.main_module_path.len()], 0);
+    }
+
+    #[test]
+    fn synthetic_module_handles_materialize_minimal_pe_headers() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "synthetic-modules", GeArch::X86, "win11-23h2")
+            .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        let module_handle = runtime.get_or_create_module_handle("ws2_32.dll");
+        runtime.ensure_synthetic_module_image(&mut memory, module_handle);
+
+        assert_eq!(read_guest_u16(&memory, module_handle).expect("dos signature"), 0x5a4d);
+        assert_eq!(read_guest_u32(&memory, module_handle + 0x3c).expect("e_lfanew"), 0x80);
+        assert_eq!(
+            read_guest_u32(&memory, module_handle + 0x80).expect("nt signature"),
+            0x0000_4550
+        );
+        assert_eq!(
+            read_guest_u32(&memory, module_handle + 0x100).expect("import directory rva"),
+            0
+        );
+    }
+
+    #[test]
     fn write_private_profile_string_w_updates_ini_file_in_x86_runtime() {
         let temp_dir = TempDir::new().expect("temp dir");
         let ge = GameEnvironment::create_in(temp_dir.path(), "ini-write", GeArch::X86, "win11-23h2")
@@ -14435,6 +21252,439 @@ mod tests {
 
         assert_ne!(handle, 0);
         assert_eq!(runtime.heap_allocations.get(&handle).copied(), Some(64));
+    }
+
+    #[test]
+    fn ver_set_condition_mask_updates_selected_x86_fields() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "ver-set-condition-mask", GeArch::X86, "win11-23h2")
+            .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+        let thunk = runtime.alloc_host_thunk(HostThunk::VerSetConditionMask);
+        let stack = 0x50_000;
+        memory.map_bytes(stack, &vec![0_u8; 0x200]);
+        write_u32(&mut memory, stack, 0xDEAD_BEEF);
+        for (index, arg) in [0x7654_3210_u32, 0xfedc_ba98, 0x0000_0003, 0x0000_0005]
+            .into_iter()
+            .enumerate()
+        {
+            write_u32(&mut memory, stack + 4 + (index as u64 * 4), arg);
+        }
+        let mut state = CpuState::new(GuestArch::X86);
+        state.set(Register::Rsp, stack);
+
+        runtime
+            .dispatch_import(thunk, &mut state, &mut memory)
+            .expect("dispatch x86 VerSetConditionMask thunk");
+
+        assert_eq!((state.get(Register::Rdx) << 32) | state.get(Register::Rax), 0xfedc_ba98_7654_322d);
+    }
+
+    #[test]
+    fn verify_version_info_w_matches_win11_profile_and_rejects_higher_build_x86() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "verify-version-info", GeArch::X86, "win11-23h2")
+            .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        let info = runtime
+            .alloc_heap(&mut memory, OSVERSIONINFOEXW_SIZE as usize, true)
+            .expect("version info buffer");
+        write_u32(&mut memory, info, OSVERSIONINFOEXW_SIZE);
+        write_u32(&mut memory, info + 4, 10);
+        write_u32(&mut memory, info + 8, 0);
+        write_u32(&mut memory, info + 12, 22621);
+        write_u32(&mut memory, info + 16, VER_PLATFORM_WIN32_NT);
+        memory.map_bytes(info + 276, &0_u16.to_le_bytes());
+        memory.map_bytes(info + 278, &0_u16.to_le_bytes());
+        memory.map_bytes(info + 280, &0_u16.to_le_bytes());
+        memory.map_bytes(info + 282, &[VER_NT_WORKSTATION, 0]);
+
+        let mut condition_mask = 0;
+        condition_mask = apply_ver_condition_mask(
+            condition_mask,
+            VER_MAJORVERSION | VER_MINORVERSION | VER_BUILDNUMBER,
+            VER_GREATER_EQUAL,
+        );
+        condition_mask = apply_ver_condition_mask(
+            condition_mask,
+            VER_PLATFORMID | VER_PRODUCT_TYPE,
+            VER_EQUAL,
+        );
+        let thunk = runtime.alloc_host_thunk(HostThunk::VerifyVersionInfoW);
+        let type_mask = VER_MAJORVERSION | VER_MINORVERSION | VER_BUILDNUMBER | VER_PLATFORMID | VER_PRODUCT_TYPE;
+
+        let result = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            thunk,
+            &[
+                info as u32,
+                type_mask,
+                condition_mask as u32,
+                (condition_mask >> 32) as u32,
+            ],
+        );
+        assert_eq!(result, 1);
+        assert_eq!(runtime.last_error, 0);
+
+        write_u32(&mut memory, info + 12, 22640);
+        let result = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            thunk,
+            &[
+                info as u32,
+                type_mask,
+                condition_mask as u32,
+                (condition_mask >> 32) as u32,
+            ],
+        );
+        assert_eq!(result, 0);
+        assert_eq!(runtime.last_error, ERROR_OLD_WIN_VERSION);
+    }
+
+    #[test]
+    fn local_alloc_maps_simd_slack_for_small_x86_heap_strings() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "local-alloc-simd-slack", GeArch::X86, "win11-23h2")
+            .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        let thunk = runtime.alloc_host_thunk(HostThunk::LocalAlloc);
+        let handle = dispatch_x86_thunk(&mut runtime, &mut memory, thunk, &[0, 1]);
+
+        assert_ne!(handle, 0);
+        assert_eq!(runtime.heap_allocations.get(&handle).copied(), Some(1));
+        assert!(memory.read_u8(handle + 15).is_ok());
+    }
+
+    #[test]
+    fn get_time_zone_information_populates_x86_structure() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "get-time-zone-information", GeArch::X86, "win11-23h2")
+            .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+        let buffer = runtime
+            .alloc_heap(&mut memory, TIME_ZONE_INFORMATION_SIZE, true)
+            .expect("time zone buffer");
+
+        let thunk = runtime.alloc_host_thunk(HostThunk::GetTimeZoneInformation);
+        let result = dispatch_x86_thunk(&mut runtime, &mut memory, thunk, &[buffer as u32]);
+
+        assert!(
+            result == u64::from(TIME_ZONE_ID_UNKNOWN)
+                || result == u64::from(TIME_ZONE_ID_STANDARD)
+                || result == u64::from(TIME_ZONE_ID_DAYLIGHT)
+        );
+        let bias_minutes = read_u32(&memory, buffer).expect("bias") as i32;
+        assert!((-24 * 60..=24 * 60).contains(&bias_minutes));
+        assert_eq!(memory.read_bytes(buffer + 68, 16).expect("standard date"), vec![0; 16]);
+        assert_eq!(memory.read_bytes(buffer + 152, 16).expect("daylight date"), vec![0; 16]);
+    }
+
+    #[test]
+    fn local_free_releases_local_alloc_handle_in_x86_runtime() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "local-free", GeArch::X86, "win11-23h2")
+            .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        let local_alloc = runtime.alloc_host_thunk(HostThunk::LocalAlloc);
+        let local_free = runtime.alloc_host_thunk(HostThunk::LocalFree);
+        let handle = dispatch_x86_thunk(&mut runtime, &mut memory, local_alloc, &[0, 64]);
+        assert_ne!(handle, 0);
+
+        assert_eq!(dispatch_x86_thunk(&mut runtime, &mut memory, local_free, &[handle as u32]), 0);
+        assert!(!runtime.heap_allocations.contains_key(&handle));
+    }
+
+    #[test]
+    fn terminate_process_exits_current_guest_process_in_x86_runtime() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "terminate-process", GeArch::X86, "win11-23h2")
+            .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        let current_process_handle = runtime.win32.current_process_handle();
+        let thunk = runtime.alloc_host_thunk(HostThunk::TerminateProcess);
+        let stack = 0x50_000;
+        memory.map_bytes(stack, &vec![0_u8; 0x200]);
+        write_u32(&mut memory, stack, 0xDEAD_BEEF);
+        write_u32(&mut memory, stack + 4, current_process_handle);
+        write_u32(&mut memory, stack + 8, 0x1234);
+
+        let mut state = CpuState::new(GuestArch::X86);
+        state.set(Register::Rsp, stack);
+
+        let result = runtime
+            .dispatch_import(thunk, &mut state, &mut memory)
+            .expect("dispatch TerminateProcess");
+
+        assert_eq!(result, Some(0x1234));
+        assert_eq!(
+            runtime
+                .win32
+                .process_state(current_process_handle)
+                .expect("current process state")
+                .exit_code,
+            Some(0x1234)
+        );
+    }
+
+    #[test]
+    fn virtual_query_writes_x86_memory_basic_information_layout() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "virtual-query", GeArch::X86, "win11-23h2")
+            .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        let virtual_alloc = runtime.alloc_host_thunk(HostThunk::VirtualAlloc);
+        let virtual_query = runtime.alloc_host_thunk(HostThunk::VirtualQuery);
+        let allocation = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            virtual_alloc,
+            &[0, 0x2000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE],
+        );
+        assert_ne!(allocation, 0);
+
+        let buffer = 0x41_000;
+        memory.map_bytes(buffer, &[0; MEMORY_BASIC_INFORMATION32_SIZE as usize]);
+        let result = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            virtual_query,
+            &[
+                allocation as u32 + 0x100,
+                buffer as u32,
+                MEMORY_BASIC_INFORMATION32_SIZE as u32,
+            ],
+        );
+
+        assert_eq!(result, MEMORY_BASIC_INFORMATION32_SIZE);
+        assert_eq!(read_u32(&memory, buffer).expect("base address"), allocation as u32);
+        assert_eq!(read_u32(&memory, buffer + 4).expect("allocation base"), allocation as u32);
+        assert_eq!(read_u32(&memory, buffer + 8).expect("allocation protect"), PAGE_EXECUTE_READWRITE);
+        assert_eq!(read_u32(&memory, buffer + 12).expect("region size"), 0x2000);
+        assert_eq!(read_u32(&memory, buffer + 16).expect("state"), MEM_COMMIT);
+        assert_eq!(read_u32(&memory, buffer + 20).expect("protect"), PAGE_EXECUTE_READWRITE);
+        assert_eq!(read_u32(&memory, buffer + 24).expect("type"), MEM_PRIVATE);
+        assert_eq!(runtime.last_error, 0);
+    }
+
+    #[test]
+    fn execute_guest_callback_delivers_x86_access_violation_to_seh_handler() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "seh-dispatch", GeArch::X86, "win11-23h2")
+            .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+
+        let mut memory = MemoryImage::default();
+        runtime
+            .seed_process_state(&mut memory, "C:\\seh-probe.exe", &[], 0x400000, 0x1000)
+            .expect("seed process state");
+
+        let stack_base = 0x60_000;
+        memory.map_bytes(stack_base, &vec![0_u8; 0x1000]);
+
+        let entrypoint = 0x40_000;
+        let handler = 0x40_100;
+        let registration = 0x41_000;
+        let resume_rip = entrypoint + 5;
+
+        memory.map_bytes(entrypoint, &vec![0x90_u8; 0x40]);
+        memory.map_bytes(
+            entrypoint,
+            &[
+                0x33, 0xC0,
+                0x8B, 0x40, 0x3C,
+                0xB8, 0x34, 0x12, 0x00, 0x00,
+                0xC3,
+            ],
+        );
+        memory.map_bytes(handler, &vec![0x90_u8; 0x40]);
+        let mut handler_bytes = vec![
+            0x8B, 0x4C, 0x24, 0x0C,
+            0xC7, 0x81, 0xB8, 0x00, 0x00, 0x00,
+        ];
+        handler_bytes.extend_from_slice(&(resume_rip as u32).to_le_bytes());
+        handler_bytes.extend_from_slice(&[
+            0x31, 0xC0,
+            0xC2, 0x10, 0x00,
+        ]);
+        memory.map_bytes(handler, &handler_bytes);
+        write_u32(&mut memory, registration, u32::MAX);
+        write_u32(&mut memory, registration + 4, handler as u32);
+        write_u32(&mut memory, runtime.teb_base, registration as u32);
+
+        let mut state = CpuState::new(GuestArch::X86);
+        state.set(Register::Rsp, stack_base + 0x800);
+        state.segment_bases.fs = runtime.teb_base;
+
+        let result = runtime
+            .execute_guest_callback(&mut state, &mut memory, entrypoint, &[], "seh-dispatch")
+            .expect("execute guest callback with SEH");
+
+        assert_eq!(result, 0x1234);
+    }
+
+    #[test]
+    fn seed_process_state_sets_x86_teb_self_pointer() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "teb-self", GeArch::X86, "win11-23h2")
+            .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        runtime
+            .seed_process_state(&mut memory, "C:\\teb-self.exe", &[], 0x400000, 0x1000)
+            .expect("seed process state");
+
+        assert_eq!(read_u32(&memory, runtime.teb_base + 0x18).expect("teb self pointer"), runtime.teb_base as u32);
+    }
+
+    #[test]
+    fn stage_main_module_preserves_mapped_guest_path() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "stage-main", GeArch::X86, "win11-23h2")
+            .expect("create ge");
+        let program = ge
+            .host_path_for_windows_path("C:\\Steam\\Steam.exe")
+            .expect("program host path");
+        fs::create_dir_all(program.parent().expect("program parent")).expect("create program dir");
+        fs::write(&program, b"MZ").expect("write program");
+
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        let staged = runtime.stage_main_module(&program).expect("stage main module");
+
+        assert_eq!(staged, "C:\\Steam\\Steam.exe");
+    }
+
+    #[test]
+    fn stage_main_module_preserves_mapped_guest_path_for_relative_host_path() {
+        let cwd = std::env::current_dir().expect("cwd");
+        let temp_dir = TempDir::new_in(&cwd).expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "stage-main-relative", GeArch::X86, "win11-23h2")
+            .expect("create ge");
+        let program = ge
+            .host_path_for_windows_path("C:\\Steam\\Steam.exe")
+            .expect("program host path");
+        fs::create_dir_all(program.parent().expect("program parent")).expect("create program dir");
+        fs::write(&program, b"MZ").expect("write program");
+        let relative_program = program
+            .strip_prefix(&cwd)
+            .expect("relative program path")
+            .to_path_buf();
+
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        let staged = runtime
+            .stage_main_module(&relative_program)
+            .expect("stage main module");
+
+        assert_eq!(staged, "C:\\Steam\\Steam.exe");
+    }
+
+    #[test]
+    fn critical_section_thunks_use_x86_stack_argument() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "critical-sections", GeArch::X86, "win11-23h2")
+            .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+        let critical_section = 0x41_000_u32;
+        memory.map_bytes(critical_section as u64, &[0; 24]);
+
+        let initialize = runtime.alloc_host_thunk(HostThunk::InitializeCriticalSection);
+        let enter = runtime.alloc_host_thunk(HostThunk::EnterCriticalSection);
+        let try_enter = runtime.alloc_host_thunk(HostThunk::TryEnterCriticalSection);
+        let leave = runtime.alloc_host_thunk(HostThunk::LeaveCriticalSection);
+        let delete = runtime.alloc_host_thunk(HostThunk::DeleteCriticalSection);
+
+        assert_eq!(dispatch_x86_thunk(&mut runtime, &mut memory, initialize, &[critical_section]), 1);
+        assert_eq!(runtime.critical_sections.get(&(critical_section as u64)).copied(), Some(0));
+        assert_eq!(read_u32(&memory, critical_section as u64 + 4).expect("lock count"), u32::MAX);
+        assert_eq!(read_u32(&memory, critical_section as u64 + 8).expect("recursion count"), 0);
+        assert_eq!(read_u32(&memory, critical_section as u64 + 12).expect("owner thread"), 0);
+
+        assert_eq!(dispatch_x86_thunk(&mut runtime, &mut memory, enter, &[critical_section]), 0);
+        assert_eq!(runtime.critical_sections.get(&(critical_section as u64)).copied(), Some(1));
+        assert_eq!(read_u32(&memory, critical_section as u64 + 4).expect("lock count after enter"), 0);
+        assert_eq!(read_u32(&memory, critical_section as u64 + 8).expect("recursion after enter"), 1);
+        assert_eq!(read_u32(&memory, critical_section as u64 + 12).expect("owner after enter"), 1);
+
+        assert_eq!(dispatch_x86_thunk(&mut runtime, &mut memory, try_enter, &[critical_section]), 1);
+        assert_eq!(runtime.critical_sections.get(&(critical_section as u64)).copied(), Some(2));
+        assert_eq!(read_u32(&memory, critical_section as u64 + 4).expect("lock count after try enter"), 1);
+        assert_eq!(read_u32(&memory, critical_section as u64 + 8).expect("recursion after try enter"), 2);
+
+        assert_eq!(dispatch_x86_thunk(&mut runtime, &mut memory, leave, &[critical_section]), 0);
+        assert_eq!(runtime.critical_sections.get(&(critical_section as u64)).copied(), Some(1));
+        assert_eq!(read_u32(&memory, critical_section as u64 + 4).expect("lock count after leave"), 0);
+        assert_eq!(read_u32(&memory, critical_section as u64 + 8).expect("recursion after leave"), 1);
+        assert_eq!(read_u32(&memory, critical_section as u64 + 12).expect("owner after leave"), 1);
+
+        assert_eq!(dispatch_x86_thunk(&mut runtime, &mut memory, delete, &[critical_section]), 0);
+        assert!(!runtime.critical_sections.contains_key(&(critical_section as u64)));
+        assert_eq!(read_u32(&memory, critical_section as u64 + 4).expect("lock count after delete"), u32::MAX);
+        assert_eq!(read_u32(&memory, critical_section as u64 + 8).expect("recursion after delete"), 0);
+        assert_eq!(read_u32(&memory, critical_section as u64 + 12).expect("owner after delete"), 0);
+    }
+
+    #[test]
+    fn condition_variable_thunks_use_x86_stack_arguments() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "condition-variables", GeArch::X86, "win11-23h2")
+            .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+        let critical_section = 0x41_000_u32;
+        let condition_variable = 0x42_000_u32;
+        memory.map_bytes(critical_section as u64, &[0; 24]);
+        memory.map_bytes(condition_variable as u64, &[0; 4]);
+
+        let initialize = runtime.alloc_host_thunk(HostThunk::InitializeCriticalSection);
+        let enter = runtime.alloc_host_thunk(HostThunk::EnterCriticalSection);
+        let sleep_condition = runtime.alloc_host_thunk(HostThunk::SleepConditionVariableCS);
+        let wake_all = runtime.alloc_host_thunk(HostThunk::WakeAllConditionVariable);
+
+        assert_eq!(dispatch_x86_thunk(&mut runtime, &mut memory, initialize, &[critical_section]), 1);
+        assert_eq!(dispatch_x86_thunk(&mut runtime, &mut memory, enter, &[critical_section]), 0);
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                sleep_condition,
+                &[condition_variable, critical_section, 0],
+            ),
+            0
+        );
+        assert_eq!(runtime.last_error, ERROR_TIMEOUT);
+        assert_eq!(runtime.critical_sections.get(&(critical_section as u64)).copied(), Some(1));
+        assert_eq!(read_u32(&memory, critical_section as u64 + 4).expect("lock count after sleep"), 0);
+        assert_eq!(read_u32(&memory, critical_section as u64 + 8).expect("recursion after sleep"), 1);
+        assert_eq!(read_u32(&memory, critical_section as u64 + 12).expect("owner after sleep"), 1);
+
+        assert_eq!(dispatch_x86_thunk(&mut runtime, &mut memory, wake_all, &[condition_variable]), 0);
+        assert_eq!(runtime.last_error, 0);
     }
 
     fn dispatch_feature_support_query(
@@ -15134,6 +22384,133 @@ mod tests {
         };
 
         assert!(matches!(HostThunk::from_import(&import), HostThunk::VirtualAlloc));
+    }
+
+    #[test]
+    fn host_thunk_from_import_maps_flush_file_buffers() {
+        let import = ResolvedImport {
+            requested_module: "kernel32.dll".to_string(),
+            resolved_module: "kernel32.dll".to_string(),
+            symbol: ImportSymbol::ByName {
+                hint: 0,
+                name: "FlushFileBuffers".to_string(),
+            },
+            iat_rva: 0x1028,
+            export: ExportSymbol {
+                ordinal: 0x0201,
+                name: Some("FlushFileBuffers".to_string()),
+                target: ExportTarget::Rva(0x2000),
+            },
+        };
+
+        assert!(matches!(HostThunk::from_import(&import), HostThunk::FlushFileBuffers));
+    }
+
+    #[test]
+    fn host_thunk_from_import_maps_unhandled_exception_filter() {
+        let import = ResolvedImport {
+            requested_module: "kernel32.dll".to_string(),
+            resolved_module: "kernel32.dll".to_string(),
+            symbol: ImportSymbol::ByName {
+                hint: 0,
+                name: "UnhandledExceptionFilter".to_string(),
+            },
+            iat_rva: 0x1024,
+            export: ExportSymbol {
+                ordinal: 119,
+                name: Some("UnhandledExceptionFilter".to_string()),
+                target: ExportTarget::Rva(0x1120),
+            },
+        };
+
+        assert!(matches!(HostThunk::from_import(&import), HostThunk::UnhandledExceptionFilter));
+    }
+
+    #[test]
+    fn host_thunk_from_import_maps_shell32_ordinal_680() {
+        let import = ResolvedImport {
+            requested_module: "shell32.dll".to_string(),
+            resolved_module: "shell32.dll".to_string(),
+            symbol: ImportSymbol::ByOrdinal { ordinal: 680 },
+            iat_rva: 0x1020,
+            export: ExportSymbol {
+                ordinal: 680,
+                name: None,
+                target: ExportTarget::Rva(0x1110),
+            },
+        };
+
+        assert!(matches!(HostThunk::from_import(&import), HostThunk::IsUserAnAdmin));
+    }
+
+    #[test]
+    fn host_thunk_from_import_maps_oleaut32_ordinal_9() {
+        let import = ResolvedImport {
+            requested_module: "oleaut32.dll".to_string(),
+            resolved_module: "oleaut32.dll".to_string(),
+            symbol: ImportSymbol::ByOrdinal { ordinal: 9 },
+            iat_rva: 0x1030,
+            export: ExportSymbol {
+                ordinal: 9,
+                name: None,
+                target: ExportTarget::Rva(0x1110),
+            },
+        };
+
+        assert!(matches!(HostThunk::from_import(&import), HostThunk::VariantClear));
+    }
+
+    #[test]
+    fn host_thunk_from_import_maps_psapi_imports() {
+        for name in ["EnumProcesses", "EnumProcessModules", "GetModuleBaseNameA"] {
+            let import = ResolvedImport {
+                requested_module: "psapi.dll".to_string(),
+                resolved_module: "psapi.dll".to_string(),
+                symbol: ImportSymbol::ByName {
+                    hint: 0,
+                    name: name.to_string(),
+                },
+                iat_rva: 0x1020,
+                export: ExportSymbol {
+                    ordinal: 1,
+                    name: Some(name.to_string()),
+                    target: ExportTarget::Rva(0x1110),
+                },
+            };
+
+            match name {
+                "EnumProcesses" => assert!(matches!(HostThunk::from_import(&import), HostThunk::EnumProcesses)),
+                "EnumProcessModules" => {
+                    assert!(matches!(HostThunk::from_import(&import), HostThunk::EnumProcessModules))
+                }
+                "GetModuleBaseNameA" => {
+                    assert!(matches!(HostThunk::from_import(&import), HostThunk::GetModuleBaseNameA))
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_proc_address_supports_psapi_imports() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "psapi-resolve", GeArch::X86, "win11-23h2")
+            .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        runtime.set_guest_arch(GuestArch::X86);
+        runtime.mapped_image_base = 0x400000;
+        let module_handle = runtime.get_or_create_module_handle("psapi.dll");
+
+        for name in ["EnumProcesses", "EnumProcessModules", "GetModuleBaseNameA"] {
+            let address = runtime.resolve_proc_address(
+                module_handle,
+                ImportSymbol::ByName {
+                    hint: 0,
+                    name: name.to_string(),
+                },
+            );
+            assert_ne!(address, 0, "expected {name} to resolve");
+        }
     }
 
     #[test]
@@ -16953,29 +24330,188 @@ fn align_up_u64(value: u64, align: u64) -> u64 {
     (value + mask) & !mask
 }
 
+fn minimal_synthetic_module_image(module_base: u64, guest_arch: GuestArch) -> Vec<u8> {
+    let mut image = vec![0_u8; 0x1000];
+    image[0..2].copy_from_slice(b"MZ");
+    image[0x3c..0x40].copy_from_slice(&(0x80_u32).to_le_bytes());
+    image[0x80..0x84].copy_from_slice(b"PE\0\0");
+
+    let machine = match guest_arch {
+        GuestArch::X86 => 0x014c_u16,
+        GuestArch::X64 => 0x8664_u16,
+    };
+    image[0x84..0x86].copy_from_slice(&machine.to_le_bytes());
+    image[0x94..0x96].copy_from_slice(
+        &match guest_arch {
+            GuestArch::X86 => 0x00e0_u16,
+            GuestArch::X64 => 0x00f0_u16,
+        }
+        .to_le_bytes(),
+    );
+    image[0x96..0x98].copy_from_slice(
+        &match guest_arch {
+            GuestArch::X86 => 0x2102_u16,
+            GuestArch::X64 => 0x2022_u16,
+        }
+        .to_le_bytes(),
+    );
+
+    let optional = 0x98;
+    match guest_arch {
+        GuestArch::X86 => {
+            image[optional..optional + 2].copy_from_slice(&0x010b_u16.to_le_bytes());
+            image[optional + 0x1c..optional + 0x20]
+                .copy_from_slice(&(module_base as u32).to_le_bytes());
+            image[optional + 0x20..optional + 0x24].copy_from_slice(&0x1000_u32.to_le_bytes());
+            image[optional + 0x24..optional + 0x28].copy_from_slice(&0x200_u32.to_le_bytes());
+            image[optional + 0x38..optional + 0x3c].copy_from_slice(&0x1000_u32.to_le_bytes());
+            image[optional + 0x3c..optional + 0x40].copy_from_slice(&0x200_u32.to_le_bytes());
+            image[optional + 0x44..optional + 0x46].copy_from_slice(&2_u16.to_le_bytes());
+            image[optional + 0x48..optional + 0x4c].copy_from_slice(&0x10_0000_u32.to_le_bytes());
+            image[optional + 0x4c..optional + 0x50].copy_from_slice(&0x1000_u32.to_le_bytes());
+            image[optional + 0x50..optional + 0x54].copy_from_slice(&0x10_0000_u32.to_le_bytes());
+            image[optional + 0x54..optional + 0x58].copy_from_slice(&0x1000_u32.to_le_bytes());
+            image[optional + 0x5c..optional + 0x60].copy_from_slice(&16_u32.to_le_bytes());
+        }
+        GuestArch::X64 => {
+            image[optional..optional + 2].copy_from_slice(&0x020b_u16.to_le_bytes());
+            image[optional + 0x18..optional + 0x20].copy_from_slice(&module_base.to_le_bytes());
+            image[optional + 0x20..optional + 0x24].copy_from_slice(&0x1000_u32.to_le_bytes());
+            image[optional + 0x24..optional + 0x28].copy_from_slice(&0x200_u32.to_le_bytes());
+            image[optional + 0x38..optional + 0x3c].copy_from_slice(&0x1000_u32.to_le_bytes());
+            image[optional + 0x3c..optional + 0x40].copy_from_slice(&0x200_u32.to_le_bytes());
+            image[optional + 0x44..optional + 0x46].copy_from_slice(&2_u16.to_le_bytes());
+            image[optional + 0x48..optional + 0x50].copy_from_slice(&0x10_0000_u64.to_le_bytes());
+            image[optional + 0x50..optional + 0x58].copy_from_slice(&0x1000_u64.to_le_bytes());
+            image[optional + 0x58..optional + 0x60].copy_from_slice(&0x10_0000_u64.to_le_bytes());
+            image[optional + 0x60..optional + 0x68].copy_from_slice(&0x1000_u64.to_le_bytes());
+            image[optional + 0x6c..optional + 0x70].copy_from_slice(&16_u32.to_le_bytes());
+        }
+    }
+
+    image
+}
+
+fn winsock_address_family(value: i32) -> Option<AddressFamily> {
+    match value {
+        AF_INET => Some(AddressFamily::Ipv4),
+        AF_INET6 => Some(AddressFamily::Ipv6),
+        _ => None,
+    }
+}
+
+fn fd_set_sockets(memory: &MemoryImage, address: u64, guest_arch: GuestArch) -> AppResult<Vec<u64>> {
+    if address == 0 {
+        return Ok(Vec::new());
+    }
+    let count = read_guest_u32(memory, address)? as usize;
+    let pointer_bytes = guest_arch.pointer_bytes() as u64;
+    let array_base = align_up_u64(address + 4, pointer_bytes);
+    let mut sockets = Vec::with_capacity(count);
+    for index in 0..count {
+        sockets.push(read_guest_pointer(
+            memory,
+            array_base + index as u64 * pointer_bytes,
+            guest_arch,
+        )?);
+    }
+    Ok(sockets)
+}
+
+fn write_fd_set_sockets(
+    memory: &mut MemoryImage,
+    address: u64,
+    guest_arch: GuestArch,
+    sockets: &[u64],
+) -> AppResult<()> {
+    if address == 0 {
+        return Ok(());
+    }
+    let pointer_bytes = guest_arch.pointer_bytes() as u64;
+    let array_base = align_up_u64(address + 4, pointer_bytes);
+    write_u32(memory, address, sockets.len() as u32);
+    for (index, socket) in sockets.iter().enumerate() {
+        write_guest_pointer(memory, array_base + index as u64 * pointer_bytes, *socket, guest_arch)?;
+    }
+    Ok(())
+}
+
+fn read_guest_sockaddr(memory: &MemoryImage, address: u64, length: u32) -> AppResult<SockAddr> {
+    if address == 0 || length < 8 {
+        return Err(AppError::new(
+            ReasonCode::RcCliInvalid,
+            "sockaddr pointer must reference at least 8 bytes",
+        ));
+    }
+    match i32::from(read_guest_u16(memory, address)?) {
+        AF_INET => {
+            if length < 16 {
+                return Err(AppError::new(
+                    ReasonCode::RcCliInvalid,
+                    "sockaddr_in requires 16 bytes",
+                ));
+            }
+            let port = u16::from_be(read_guest_u16(memory, address + 2)?);
+            let octets = [
+                memory.read_u8(address + 4)?,
+                memory.read_u8(address + 5)?,
+                memory.read_u8(address + 6)?,
+                memory.read_u8(address + 7)?,
+            ];
+            Ok(SockAddr {
+                family: AddressFamily::Ipv4,
+                host: Ipv4Addr::from(octets).to_string(),
+                port,
+            })
+        }
+        AF_INET6 => {
+            if length < 28 {
+                return Err(AppError::new(
+                    ReasonCode::RcCliInvalid,
+                    "sockaddr_in6 requires 28 bytes",
+                ));
+            }
+            let port = u16::from_be(read_guest_u16(memory, address + 2)?);
+            let octets = memory.read_bytes(address + 8, 16)?;
+            let mut bytes = [0_u8; 16];
+            bytes.copy_from_slice(&octets);
+            Ok(SockAddr {
+                family: AddressFamily::Ipv6,
+                host: Ipv6Addr::from(bytes).to_string(),
+                port,
+            })
+        }
+        family => Err(AppError::new(
+            ReasonCode::RcCliInvalid,
+            format!("unsupported sockaddr family {family}"),
+        )),
+    }
+}
+
 fn read_guest_u16(memory: &MemoryImage, address: u64) -> AppResult<u16> {
-    Ok(u16::from_le_bytes([
-        memory.read_u8(address)?,
-        memory.read_u8(address + 1)?,
-    ]))
+    memory.read_u16(address)
 }
 
 fn read_guest_u32(memory: &MemoryImage, address: u64) -> AppResult<u32> {
-    Ok(u32::from_le_bytes([
-        memory.read_u8(address)?,
-        memory.read_u8(address + 1)?,
-        memory.read_u8(address + 2)?,
-        memory.read_u8(address + 3)?,
-    ]))
+    memory.read_u32(address)
+}
+
+fn probe_read_guest_u32(memory: &MemoryImage, address: u64) -> Option<u32> {
+    if !memory.is_range_mapped(address, 4) {
+        return None;
+    }
+    read_guest_u32(memory, address).ok()
+}
+
+fn probe_read_guest_pointer(memory: &MemoryImage, address: u64, guest_arch: GuestArch) -> Option<u64> {
+    if !memory.is_range_mapped(address, guest_arch.pointer_bytes()) {
+        return None;
+    }
+    read_guest_pointer(memory, address, guest_arch).ok()
 }
 
 fn read_guest_i32(memory: &MemoryImage, address: u64) -> AppResult<i32> {
-    Ok(i32::from_le_bytes([
-        memory.read_u8(address)?,
-        memory.read_u8(address + 1)?,
-        memory.read_u8(address + 2)?,
-        memory.read_u8(address + 3)?,
-    ]))
+    Ok(memory.read_u32(address)? as i32)
 }
 
 fn read_guest_f32(memory: &MemoryImage, address: u64) -> AppResult<f32> {
@@ -16983,24 +24519,11 @@ fn read_guest_f32(memory: &MemoryImage, address: u64) -> AppResult<f32> {
 }
 
 fn read_guest_u64(memory: &MemoryImage, address: u64) -> AppResult<u64> {
-    Ok(u64::from_le_bytes([
-        memory.read_u8(address)?,
-        memory.read_u8(address + 1)?,
-        memory.read_u8(address + 2)?,
-        memory.read_u8(address + 3)?,
-        memory.read_u8(address + 4)?,
-        memory.read_u8(address + 5)?,
-        memory.read_u8(address + 6)?,
-        memory.read_u8(address + 7)?,
-    ]))
+    memory.read_u64(address)
 }
 
 fn read_guest_bytes(memory: &MemoryImage, address: u64, len: usize) -> AppResult<Vec<u8>> {
-    let mut bytes = Vec::with_capacity(len);
-    for offset in 0..len {
-        bytes.push(memory.read_u8(address + offset as u64)?);
-    }
-    Ok(bytes)
+    memory.read_bytes(address, len)
 }
 
 fn read_filetime(memory: &MemoryImage, address: u64) -> AppResult<u64> {
@@ -17052,6 +24575,165 @@ fn current_guest_filetime_ticks(dtm: bool) -> u64 {
     }
 }
 
+struct HostTimeZoneInformation {
+    bias_minutes: i32,
+    standard_name: String,
+    daylight_name: String,
+    result: u32,
+}
+
+fn current_host_time_zone_information(dtm: bool) -> HostTimeZoneInformation {
+    if dtm {
+        return HostTimeZoneInformation {
+            bias_minutes: 0,
+            standard_name: "UTC".to_string(),
+            daylight_name: "UTC".to_string(),
+            result: TIME_ZONE_ID_UNKNOWN,
+        };
+    }
+
+    unsafe {
+        let mut now: libc::time_t = 0;
+        if libc::time(&mut now as *mut _) == -1 {
+            return HostTimeZoneInformation {
+                bias_minutes: 0,
+                standard_name: String::new(),
+                daylight_name: String::new(),
+                result: TIME_ZONE_ID_UNKNOWN,
+            };
+        }
+
+        let mut local_tm: libc::tm = std::mem::zeroed();
+        if libc::localtime_r(&now, &mut local_tm as *mut _).is_null() {
+            return HostTimeZoneInformation {
+                bias_minutes: 0,
+                standard_name: String::new(),
+                daylight_name: String::new(),
+                result: TIME_ZONE_ID_UNKNOWN,
+            };
+        }
+
+        let local_as_utc = libc::timegm(&mut local_tm as *mut _);
+        let bias_minutes = if local_as_utc == -1 {
+            0
+        } else {
+            (now as i64 - local_as_utc as i64).div_euclid(60) as i32
+        };
+        let zone_name = format_time_zone_name(&local_tm);
+        let result = if local_tm.tm_isdst > 0 {
+            TIME_ZONE_ID_DAYLIGHT
+        } else if local_tm.tm_isdst == 0 {
+            TIME_ZONE_ID_STANDARD
+        } else {
+            TIME_ZONE_ID_UNKNOWN
+        };
+        HostTimeZoneInformation {
+            bias_minutes,
+            standard_name: zone_name.clone(),
+            daylight_name: zone_name,
+            result,
+        }
+    }
+}
+
+fn format_time_zone_name(local_tm: &libc::tm) -> String {
+    let mut buffer = [0_i8; 64];
+    let written = unsafe {
+        libc::strftime(
+            buffer.as_mut_ptr(),
+            buffer.len(),
+            b"%Z\0".as_ptr().cast(),
+            local_tm as *const _,
+        )
+    };
+    if written == 0 {
+        String::new()
+    } else {
+        unsafe { CStr::from_ptr(buffer.as_ptr()) }
+            .to_string_lossy()
+            .into_owned()
+    }
+}
+
+fn write_time_zone_information(memory: &mut MemoryImage, address: u64, info: &HostTimeZoneInformation) {
+    memory.map_bytes(address, &vec![0; TIME_ZONE_INFORMATION_SIZE]);
+    write_i32(memory, address, info.bias_minutes);
+    write_utf16_fixed(memory, address + 4, TIME_ZONE_NAME_CAPACITY, &info.standard_name);
+    write_i32(memory, address + 84, 0);
+    write_utf16_fixed(memory, address + 88, TIME_ZONE_NAME_CAPACITY, &info.daylight_name);
+    write_i32(memory, address + 168, 0);
+}
+
+fn default_security_cookie(guest_arch: GuestArch) -> u64 {
+    match guest_arch {
+        GuestArch::X86 => DEFAULT_SECURITY_COOKIE_X86,
+        GuestArch::X64 => DEFAULT_SECURITY_COOKIE_X64,
+    }
+}
+
+fn sanitize_security_cookie(guest_arch: GuestArch, mut cookie: u64) -> u64 {
+    match guest_arch {
+        GuestArch::X86 => {
+            cookie &= u64::from(u32::MAX);
+            if cookie == 0 || cookie == DEFAULT_SECURITY_COOKIE_X86 {
+                cookie = DEFAULT_SECURITY_COOKIE_X86 + 1;
+            } else if cookie & 0xffff_0000 == 0 {
+                cookie |= (cookie | 0x4711) << 16;
+                cookie &= u64::from(u32::MAX);
+            }
+            cookie
+        }
+        GuestArch::X64 => {
+            cookie &= 0x0000_ffff_ffff_ffff;
+            if cookie == 0 || cookie == DEFAULT_SECURITY_COOKIE_X64 {
+                cookie = DEFAULT_SECURITY_COOKIE_X64 + 1;
+            }
+            cookie
+        }
+    }
+}
+
+fn encode_pointer_value(value: u64, cookie: u64, guest_arch: GuestArch) -> u64 {
+    match guest_arch {
+        GuestArch::X86 => {
+            let cookie32 = cookie as u32;
+            u64::from((value as u32).rotate_left(cookie32 & 31) ^ cookie32)
+        }
+        GuestArch::X64 => value.rotate_left((cookie & 63) as u32) ^ cookie,
+    }
+}
+
+fn decode_pointer_value(value: u64, cookie: u64, guest_arch: GuestArch) -> u64 {
+    match guest_arch {
+        GuestArch::X86 => {
+            let cookie32 = cookie as u32;
+            u64::from(((value as u32) ^ cookie32).rotate_right(cookie32 & 31))
+        }
+        GuestArch::X64 => (value ^ cookie).rotate_right((cookie & 63) as u32),
+    }
+}
+
+fn initial_guest_security_cookie(
+    dtm: bool,
+    guest_arch: GuestArch,
+    mapped_image_base: u64,
+    peb_base: u64,
+    teb_base: u64,
+) -> u64 {
+    let entropy = if dtm {
+        mapped_image_base.rotate_left(17) ^ peb_base.rotate_left(7) ^ teb_base.rotate_left(29) ^ 0x4711_5eed
+    } else {
+        current_guest_filetime_ticks(false)
+            ^ current_host_ticks_100ns().rotate_left(13)
+            ^ u64::from(std::process::id())
+            ^ 1
+            ^ mapped_image_base.rotate_left(17)
+            ^ peb_base.rotate_left(7)
+            ^ teb_base.rotate_left(29)
+    };
+    sanitize_security_cookie(guest_arch, entropy)
+}
+
 fn current_host_ticks_100ns() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -17099,6 +24781,19 @@ fn read_u32(memory: &MemoryImage, address: u64) -> AppResult<u32> {
         memory.read_u8(address + 2)?,
         memory.read_u8(address + 3)?,
     ]))
+}
+
+fn write_i32(memory: &mut MemoryImage, address: u64, value: i32) {
+    write_u32(memory, address, value as u32);
+}
+
+fn write_utf16_fixed(memory: &mut MemoryImage, address: u64, capacity: usize, value: &str) {
+    let mut bytes = vec![0_u8; capacity * 2];
+    for (index, unit) in value.encode_utf16().take(capacity.saturating_sub(1)).enumerate() {
+        let offset = index * 2;
+        bytes[offset..offset + 2].copy_from_slice(&unit.to_le_bytes());
+    }
+    memory.map_bytes(address, &bytes);
 }
 
 fn write_u32(memory: &mut MemoryImage, address: u64, value: u32) {
@@ -17180,18 +24875,39 @@ fn guest_call_arg_u32(state: &CpuState, memory: &MemoryImage, index: usize) -> A
     Ok(guest_call_arg(state, memory, index)? as u32)
 }
 
+fn write_ansi_api_string(memory: &mut MemoryImage, buffer: u64, size: u32, value: &str) -> AppResult<u32> {
+    if buffer == 0 || size == 0 {
+        return Ok(0);
+    }
+    let bytes = value.as_bytes();
+    let copy_len = bytes.len().min(size.saturating_sub(1) as usize);
+    let written_len = copy_len + 1;
+    let page_tail = 0x1000_usize - (buffer as usize & 0xfff);
+    let mut output = vec![0_u8; written_len];
+    output[..copy_len].copy_from_slice(&bytes[..copy_len]);
+    memory.map_bytes(buffer, &output);
+    if page_tail > written_len {
+        memory.map_zeroed_if_unmapped(buffer + written_len as u64, page_tail - written_len);
+    }
+    Ok(copy_len as u32)
+}
+
 fn write_utf16_api_string(memory: &mut MemoryImage, buffer: u64, size: u32, value: &str) -> AppResult<u32> {
     let units = value.encode_utf16().collect::<Vec<_>>();
     let required_without_nul = units.len() as u32;
     let required_with_nul = required_without_nul + 1;
     if buffer != 0 && size != 0 {
         let copy_units = units.len().min(size.saturating_sub(1) as usize);
-        let mut bytes = Vec::with_capacity((copy_units + 1) * 2);
-        for unit in units.iter().take(copy_units) {
-            bytes.extend_from_slice(&unit.to_le_bytes());
+        let written_len = (copy_units + 1) * 2;
+        let page_tail = 0x1000_usize - (buffer as usize & 0xfff);
+        let mut bytes = vec![0_u8; written_len];
+        for (index, unit) in units.iter().take(copy_units).enumerate() {
+            bytes[index * 2..index * 2 + 2].copy_from_slice(&unit.to_le_bytes());
         }
-        bytes.extend_from_slice(&0_u16.to_le_bytes());
         memory.map_bytes(buffer, &bytes);
+        if page_tail > written_len {
+            memory.map_zeroed_if_unmapped(buffer + written_len as u64, page_tail - written_len);
+        }
     }
     Ok(if size <= required_without_nul {
         required_with_nul
@@ -17225,6 +24941,43 @@ fn write_find_data_w(memory: &mut MemoryImage, address: u64, data: &FindData) ->
         "",
     );
     Ok(())
+}
+
+fn write_file_information_by_handle(memory: &mut MemoryImage, address: u64, data: &FileInformation) {
+    let mut attributes = file_attributes_mask(&data.attributes);
+    if data.is_directory {
+        attributes |= FILE_ATTRIBUTE_DIRECTORY;
+    }
+    let file_index = synthetic_file_index(&data.normalized_path);
+    write_u32(memory, address, attributes);
+    write_filetime(memory, address + 4, data.creation_time_ticks);
+    write_filetime(memory, address + 12, data.last_access_time_ticks);
+    write_filetime(memory, address + 20, data.last_write_time_ticks);
+    write_u32(memory, address + 28, 0x4341_5341);
+    write_u32(memory, address + 32, (data.size >> 32) as u32);
+    write_u32(memory, address + 36, data.size as u32);
+    write_u32(memory, address + 40, 1);
+    write_u32(memory, address + 44, (file_index >> 32) as u32);
+    write_u32(memory, address + 48, file_index as u32);
+}
+
+fn write_file_attribute_data(memory: &mut MemoryImage, address: u64, data: &FileInformation) {
+    let mut attributes = file_attributes_mask(&data.attributes);
+    if data.is_directory {
+        attributes |= FILE_ATTRIBUTE_DIRECTORY;
+    }
+    write_u32(memory, address, attributes);
+    write_filetime(memory, address + 4, data.creation_time_ticks);
+    write_filetime(memory, address + 12, data.last_access_time_ticks);
+    write_filetime(memory, address + 20, data.last_write_time_ticks);
+    write_u32(memory, address + 28, (data.size >> 32) as u32);
+    write_u32(memory, address + 32, data.size as u32);
+}
+
+fn synthetic_file_index(path: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    path.hash(&mut hasher);
+    hasher.finish()
 }
 
 fn message_box_response(style: u32) -> i32 {
@@ -17420,8 +25173,34 @@ fn normalize_unc_windows_path(path: &str) -> String {
     }
 }
 
+fn runtime_guest_path(ge: &GameEnvironment, host_path: &Path) -> String {
+    for mapping in ge.active_drive_mappings() {
+        let Ok(drive_root) = ge.host_path_for_windows_path(&format!("{}:\\", mapping.drive)) else {
+            continue;
+        };
+        if let Ok(relative) = host_path.strip_prefix(&drive_root) {
+            return runtime_windows_path_for_drive(&mapping.drive, relative);
+        }
+    }
+    ge.normalize_host_path(host_path)
+}
+
+fn runtime_windows_path_for_drive(prefix: &str, relative: &Path) -> String {
+    let mut pieces = Vec::new();
+    for component in relative.components() {
+        if let std::path::Component::Normal(value) = component {
+            pieces.push(value.to_string_lossy().to_string());
+        }
+    }
+    if pieces.is_empty() {
+        format!("{prefix}:\\")
+    } else {
+        format!("{prefix}:\\{}", pieces.join("\\"))
+    }
+}
+
 fn initial_guest_current_directory(ge: &GameEnvironment, host_cwd: &Path, guest_program_path: &str) -> String {
-    let candidate = ge.normalize_host_path(host_cwd);
+    let candidate = runtime_guest_path(ge, host_cwd);
     if is_windows_absolute_path(&candidate) {
         if let Some(drive_prefix) = windows_drive_prefix(&candidate) {
             let drive = &drive_prefix[..1];
@@ -17503,6 +25282,29 @@ fn normalize_module_name(module_name: &str) -> String {
         normalized
     } else {
         format!("{normalized}.dll")
+    }
+}
+
+fn locale_name_to_lcid(locale_name: &str) -> Option<u32> {
+    let normalized = locale_name.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "" | "en" | "en-us" | "english" | "!x-user-default-locale" | "!x-sys-default-locale" => {
+            Some(LOCALE_EN_US)
+        }
+        _ if normalized.starts_with("en-") => Some(LOCALE_EN_US),
+        _ => None,
+    }
+}
+
+fn ntstatus_to_dos_error(status: u32) -> u32 {
+    match status {
+        0 => 0,
+        0xC000_0005 => 998,
+        0xC000_0008 => ERROR_INVALID_HANDLE,
+        0xC000_000D => ERROR_INVALID_PARAMETER,
+        0xC000_000F | 0xC000_0034 => ERROR_FILE_NOT_FOUND,
+        0xC000_0022 => ERROR_ACCESS_DENIED,
+        _ => ERROR_INVALID_PARAMETER,
     }
 }
 
@@ -18019,6 +25821,11 @@ fn export_tables() -> BTreeMap<String, Vec<ExportSymbol>> {
             target: ExportTarget::Rva(0x1090),
         },
         ExportSymbol {
+            ordinal: 119,
+            name: Some("UnhandledExceptionFilter".to_string()),
+            target: ExportTarget::Rva(0x1120),
+        },
+        ExportSymbol {
             ordinal: 110,
             name: Some("Beep".to_string()),
             target: ExportTarget::Rva(0x10a0),
@@ -18064,22 +25871,41 @@ fn export_tables() -> BTreeMap<String, Vec<ExportSymbol>> {
         0x0200,
         0x2000,
         &[
+            "GetCurrentDirectoryW",
             "GetFullPathNameW",
             "GetFileSize",
+            "FlushFileBuffers",
             "MoveFileW",
             "SetFileAttributesW",
+            "GetModuleFileNameA",
             "GetModuleFileNameW",
             "CopyFileW",
             "SetEnvironmentVariableW",
+            "GetEnvironmentVariableW",
             "GetEnvironmentStringsW",
             "FreeEnvironmentStringsW",
             "GetWindowsDirectoryW",
             "GetTempPathW",
             "GetCommandLineW",
             "GetVersion",
+            "VerifyVersionInfoW",
             "SetErrorMode",
             "GetSystemTimeAsFileTime",
+            "GetTimeZoneInformation",
+            "GetFileInformationByHandle",
+            "GetFileAttributesExW",
+            "CreateIoCompletionPort",
+            "PostQueuedCompletionStatus",
+            "GetQueuedCompletionStatus",
+            "GetQueuedCompletionStatusEx",
+            "CreateEventA",
             "CreateEventW",
+            "OpenEventA",
+            "OpenEventW",
+            "ProcessIdToSessionId",
+            "OutputDebugStringA",
+            "OutputDebugStringW",
+            "TryEnterCriticalSection",
             "SetEvent",
             "ResetEvent",
             "IsDebuggerPresent",
@@ -18122,6 +25948,7 @@ fn export_tables() -> BTreeMap<String, Vec<ExportSymbol>> {
             "lstrlenW",
             "lstrcpynW",
             "GetExitCodeProcess",
+            "TerminateProcess",
             "FindFirstFileW",
             "FindNextFileW",
             "DeleteFileW",
@@ -18136,6 +25963,7 @@ fn export_tables() -> BTreeMap<String, Vec<ExportSymbol>> {
             "FreeLibrary",
             "LoadLibraryA",
             "LoadLibraryW",
+            "LoadLibraryExA",
             "LoadLibraryExW",
             "GetModuleHandleW",
         ],
@@ -18163,7 +25991,31 @@ fn export_tables() -> BTreeMap<String, Vec<ExportSymbol>> {
                     name: Some("GetSystemTimeAsFileTime".to_string()),
                     target: ExportTarget::Rva(0x2020),
                 },
+                ExportSymbol {
+                    ordinal: 4,
+                    name: Some("GetTimeZoneInformation".to_string()),
+                    target: ExportTarget::Rva(0x2030),
+                },
+                ExportSymbol {
+                    ordinal: 5,
+                    name: Some("GetFileInformationByHandle".to_string()),
+                    target: ExportTarget::Rva(0x2040),
+                },
+                ExportSymbol {
+                    ordinal: 6,
+                    name: Some("GetFileAttributesExW".to_string()),
+                    target: ExportTarget::Rva(0x2050),
+                },
+                ExportSymbol {
+                    ordinal: 7,
+                    name: Some("VerifyVersionInfoW".to_string()),
+                    target: ExportTarget::Rva(0x2060),
+                },
             ],
+        ),
+        (
+            "psapi.dll".to_string(),
+            Vec::new(),
         ),
         (
             "ucrtbase.dll".to_string(),
@@ -18311,6 +26163,14 @@ fn export_tables() -> BTreeMap<String, Vec<ExportSymbol>> {
             ],
         ),
         (
+            "ntdll.dll".to_string(),
+            vec![ExportSymbol {
+                ordinal: 1,
+                name: Some("RtlNtStatusToDosError".to_string()),
+                target: ExportTarget::Rva(0x2300),
+            }],
+        ),
+        (
             "user32.dll".to_string(),
             vec![
                 ExportSymbol {
@@ -18342,6 +26202,11 @@ fn export_tables() -> BTreeMap<String, Vec<ExportSymbol>> {
                     ordinal: 6,
                     name: Some("MessageBoxW".to_string()),
                     target: ExportTarget::Rva(0x3040),
+                },
+                ExportSymbol {
+                    ordinal: 7,
+                    name: Some("LoadIconW".to_string()),
+                    target: ExportTarget::Rva(0x3050),
                 },
             ],
         ),

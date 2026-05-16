@@ -121,14 +121,20 @@ pub fn execute_job(job: &RunnerJob) -> AppResult<RunnerOutcome> {
     let before_files = ge.snapshot_files(job.dtm, started)?;
     let before_registry = ge.snapshot_registry()?;
     let guest_trace_path = ge.guest_trace_path(&job.test_id);
-    if guest_trace_path.exists() {
-        fs::remove_file(&guest_trace_path).map_err(|error| {
-            AppError::from_io(
-                ReasonCode::RcIo,
-                format!("failed to remove {}", guest_trace_path.display()),
-                &error,
-            )
-        })?;
+    for path in [
+        guest_trace_path.clone(),
+        ge.report_path(&job.test_id),
+        ge.trace_path(&job.test_id),
+    ] {
+        if path.exists() {
+            fs::remove_file(&path).map_err(|error| {
+                AppError::from_io(
+                    ReasonCode::RcIo,
+                    format!("failed to remove {}", path.display()),
+                    &error,
+                )
+            })?;
+        }
     }
 
     let mut effective_child_environment = child_environment(job, &ge, &guest_trace_path);

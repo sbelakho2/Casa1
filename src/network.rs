@@ -533,6 +533,13 @@ impl NetworkStack {
         Ok(())
     }
 
+    pub fn ioctlsocket_fionread(&mut self, socket: SocketId) -> AppResult<u32> {
+        self.ensure_wsa_started()?;
+        let available = self.socket_record(socket)?.recv_queue.len().min(u32::MAX as usize) as u32;
+        self.last_wsa_error = 0;
+        Ok(available)
+    }
+
     pub fn select(&self, sockets: &[SocketId]) -> AppResult<(Vec<SocketId>, Vec<SocketId>)> {
         let mut readable = Vec::new();
         let mut writable = Vec::new();
@@ -595,6 +602,10 @@ impl NetworkStack {
 
     pub fn wsa_get_last_error(&self) -> i32 {
         self.last_wsa_error
+    }
+
+    pub fn wsa_set_last_error(&mut self, error: i32) {
+        self.last_wsa_error = error;
     }
 
     pub fn win_http_open(&mut self, _user_agent: &str) -> HttpSessionId {

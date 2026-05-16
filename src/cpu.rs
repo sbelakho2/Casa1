@@ -3,7 +3,7 @@ use crate::ge::CpuProfile;
 use crate::reason::ReasonCode;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 pub const EXCEPTION_ACCESS_VIOLATION: u32 = 0xC000_0005;
 pub const EXCEPTION_ILLEGAL_INSTRUCTION: u32 = 0xC000_001D;
@@ -314,7 +314,7 @@ pub enum Register {
 }
 
 impl Register {
-    fn index(self) -> usize {
+    pub fn index(self) -> usize {
         match self {
             Self::Rax => 0,
             Self::Rcx => 1,
@@ -435,6 +435,8 @@ pub struct CpuState {
     #[serde(default)]
     pub ymm_upper: [XmmValue; 16],
     pub flags: Flags,
+    #[serde(default)]
+    pub eflags_extra: u64,
     pub x87: X87State,
     #[serde(default = "default_mxcsr")]
     pub mxcsr: u32,
@@ -458,6 +460,7 @@ impl CpuState {
                 sf: false,
                 of: false,
             },
+            eflags_extra: 0,
             x87: X87State::default(),
             mxcsr: default_mxcsr(),
             segment_bases: SegmentBases::default(),
@@ -474,12 +477,20 @@ impl CpuState {
     }
 
     pub fn get_byte(&self, reg: ByteRegister) -> u8 {
-        (self.get(reg.full_register()) & 0xff) as u8
+        let shift = match reg {
+            ByteRegister::Ah | ByteRegister::Ch | ByteRegister::Dh | ByteRegister::Bh => 8,
+            _ => 0,
+        };
+        ((self.get(reg.full_register()) >> shift) & 0xff) as u8
     }
 
     pub fn set_byte(&mut self, reg: ByteRegister, value: u8) {
         let full = reg.full_register();
-        let next = (self.get(full) & !0xff) | value as u64;
+        let (mask, shift) = match reg {
+            ByteRegister::Ah | ByteRegister::Ch | ByteRegister::Dh | ByteRegister::Bh => (!0xff00_u64, 8),
+            _ => (!0xff_u64, 0),
+        };
+        let next = (self.get(full) & mask) | ((value as u64) << shift);
         self.set(full, next);
     }
 
@@ -519,21 +530,70 @@ impl CpuState {
     }
 }
 
+const EFLAGS_CF: u64 = 1 << 0;
+const EFLAGS_PF: u64 = 1 << 2;
+const EFLAGS_AF: u64 = 1 << 4;
+const EFLAGS_ZF: u64 = 1 << 6;
+const EFLAGS_SF: u64 = 1 << 7;
+const EFLAGS_OF: u64 = 1 << 11;
+const EFLAGS_ALWAYS_SET: u64 = 1 << 1;
+const EFLAGS_ARITHMETIC_MASK: u64 = EFLAGS_CF | EFLAGS_PF | EFLAGS_AF | EFLAGS_ZF | EFLAGS_SF | EFLAGS_OF;
+
+fn pack_eflags(state: &CpuState) -> u64 {
+    let mut value = EFLAGS_ALWAYS_SET | (state.eflags_extra & !(EFLAGS_ARITHMETIC_MASK | EFLAGS_ALWAYS_SET));
+    if state.flags.cf {
+        value |= EFLAGS_CF;
+    }
+    if state.flags.pf {
+        value |= EFLAGS_PF;
+    }
+    if state.flags.af {
+        value |= EFLAGS_AF;
+    }
+    if state.flags.zf {
+        value |= EFLAGS_ZF;
+    }
+    if state.flags.sf {
+        value |= EFLAGS_SF;
+    }
+    if state.flags.of {
+        value |= EFLAGS_OF;
+    }
+    value
+}
+
+fn unpack_eflags(state: &mut CpuState, value: u64) {
+    state.flags.cf = value & EFLAGS_CF != 0;
+    state.flags.pf = value & EFLAGS_PF != 0;
+    state.flags.af = value & EFLAGS_AF != 0;
+    state.flags.zf = value & EFLAGS_ZF != 0;
+    state.flags.sf = value & EFLAGS_SF != 0;
+    state.flags.of = value & EFLAGS_OF != 0;
+    state.eflags_extra = value & !(EFLAGS_ARITHMETIC_MASK | EFLAGS_ALWAYS_SET);
+}
+
 const MEMORY_PAGE_SIZE: usize = 4096;
+const MEMORY_PAGE_SHIFT: usize = 12;
 const MEMORY_PAGE_BITMAP_WORDS: usize = MEMORY_PAGE_SIZE / 64;
 const MEMORY_PAGE_MASK: u64 = !(MEMORY_PAGE_SIZE as u64 - 1);
+const LOW_PAGE_DIRECTORY_LEN: usize = (u32::MAX as usize / MEMORY_PAGE_SIZE) + 1;
+const LOW_PAGE_DIRECTORY_MISSING: u32 = u32::MAX;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MemoryPage {
     bytes: Box<[u8; MEMORY_PAGE_SIZE]>,
     mapped: Box<[u64; MEMORY_PAGE_BITMAP_WORDS]>,
+    fully_mapped: bool,
 }
+
+type PageLookup = HashMap<u64, usize>;
 
 impl Default for MemoryPage {
     fn default() -> Self {
         Self {
             bytes: Box::new([0; MEMORY_PAGE_SIZE]),
             mapped: Box::new([0; MEMORY_PAGE_BITMAP_WORDS]),
+            fully_mapped: false,
         }
     }
 }
@@ -557,9 +617,23 @@ impl MemoryPage {
             return;
         }
 
+        if self.fully_mapped {
+            return;
+        }
+
+        if start == 0 && len == MEMORY_PAGE_SIZE {
+            self.mark_fully_mapped();
+            return;
+        }
+
         let end = start + len;
         let start_word = start / 64;
         let end_word = (end - 1) / 64;
+        if start_word == end_word {
+            self.mapped[start_word] |= Self::bit_mask(start % 64, ((end - 1) % 64) + 1);
+            self.fully_mapped = self.mapped.iter().all(|word| *word == u64::MAX);
+            return;
+        }
         for word_index in start_word..=end_word {
             let word_start = if word_index == start_word { start % 64 } else { 0 };
             let word_end = if word_index == end_word {
@@ -569,6 +643,7 @@ impl MemoryPage {
             };
             self.mapped[word_index] |= Self::bit_mask(word_start, word_end);
         }
+        self.fully_mapped = self.mapped.iter().all(|word| *word == u64::MAX);
     }
 
     fn first_unmapped_offset(&self, start: usize, len: usize) -> Option<usize> {
@@ -600,9 +675,17 @@ impl MemoryPage {
             return true;
         }
 
+        if self.fully_mapped {
+            return true;
+        }
+
         let end = start + len;
         let start_word = start / 64;
         let end_word = (end - 1) / 64;
+        if start_word == end_word {
+            let mask = Self::bit_mask(start % 64, ((end - 1) % 64) + 1);
+            return self.mapped[start_word] & mask == mask;
+        }
         for word_index in start_word..=end_word {
             let word_start = if word_index == start_word { start % 64 } else { 0 };
             let word_end = if word_index == end_word {
@@ -617,33 +700,103 @@ impl MemoryPage {
         }
         true
     }
+
+    fn is_fully_mapped(&self) -> bool {
+        self.fully_mapped
+    }
+
+    fn mark_fully_mapped(&mut self) {
+        self.mapped.fill(u64::MAX);
+        self.fully_mapped = true;
+    }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct MemoryImage {
     pages: Vec<(u64, MemoryPage)>,
+    high_page_lookup: PageLookup,
+    low_page_lookup: Box<[u32]>,
 }
 
+impl Clone for MemoryImage {
+    fn clone(&self) -> Self {
+        Self {
+            pages: self.pages.clone(),
+            high_page_lookup: self.high_page_lookup.clone(),
+            low_page_lookup: self.low_page_lookup.clone(),
+        }
+    }
+}
+
+impl Default for MemoryImage {
+    fn default() -> Self {
+        Self {
+            pages: Vec::new(),
+            high_page_lookup: PageLookup::default(),
+            low_page_lookup: vec![LOW_PAGE_DIRECTORY_MISSING; LOW_PAGE_DIRECTORY_LEN].into_boxed_slice(),
+        }
+    }
+}
+
+impl PartialEq for MemoryImage {
+    fn eq(&self, other: &Self) -> bool {
+        self.pages.len() == other.pages.len()
+            && self
+                .pages
+                .iter()
+                .all(|(page_base, page)| matches!(other.page(*page_base), Some(other_page) if other_page == page))
+    }
+}
+
+impl Eq for MemoryImage {}
+
 impl MemoryImage {
-    fn page_index(&self, page_base: u64) -> Result<usize, usize> {
-        self.pages
-            .binary_search_by_key(&page_base, |(mapped_base, _)| *mapped_base)
+    fn low_page_slot(page_base: u64) -> Option<usize> {
+        (page_base <= u32::MAX as u64).then_some((page_base as usize) >> MEMORY_PAGE_SHIFT)
+    }
+
+    fn page_lookup_index(&self, page_base: u64) -> Option<usize> {
+        let index = if let Some(slot) = Self::low_page_slot(page_base) {
+            let index = self.low_page_lookup[slot];
+            if index == LOW_PAGE_DIRECTORY_MISSING {
+                return None;
+            }
+            index as usize
+        } else {
+            *self.high_page_lookup.get(&page_base)?
+        };
+        let (mapped_base, _) = self.pages.get(index)?;
+        if *mapped_base != page_base {
+            return None;
+        }
+        Some(index)
+    }
+
+    fn record_page_index(&mut self, page_base: u64, index: usize) {
+        if let Some(slot) = Self::low_page_slot(page_base) {
+            self.low_page_lookup[slot] = index as u32;
+        } else {
+            self.high_page_lookup.insert(page_base, index);
+        }
+    }
+
+    fn page_index(&self, page_base: u64) -> Option<usize> {
+        self.page_lookup_index(page_base)
     }
 
     fn page(&self, page_base: u64) -> Option<&MemoryPage> {
-        self.page_index(page_base)
-            .ok()
-            .map(|index| &self.pages[index].1)
+        self.page_index(page_base).map(|index| &self.pages[index].1)
     }
 
     fn page_mut_or_insert(&mut self, page_base: u64) -> &mut MemoryPage {
-        match self.page_index(page_base) {
-            Ok(index) => &mut self.pages[index].1,
-            Err(index) => {
-                self.pages.insert(index, (page_base, MemoryPage::default()));
-                &mut self.pages[index].1
-            }
+        if let Some(index) = self.page_index(page_base) {
+            return &mut self.pages[index].1;
         }
+
+        let index = self.pages.len();
+        self.pages.push((page_base, MemoryPage::default()));
+        self.record_page_index(page_base, index);
+        &mut self.pages[index].1
     }
 
     pub fn map_bytes(&mut self, address: u64, bytes: &[u8]) {
@@ -661,6 +814,45 @@ impl MemoryImage {
         }
     }
 
+    pub fn map_zeroed_if_unmapped(&mut self, address: u64, len: usize) {
+        let mut current_address = address;
+        let mut remaining = len;
+        while remaining != 0 {
+            let page_base = current_address & MEMORY_PAGE_MASK;
+            let page_offset = (current_address - page_base) as usize;
+            let chunk_len = (MEMORY_PAGE_SIZE - page_offset).min(remaining);
+            let page = self.page_mut_or_insert(page_base);
+            for offset in page_offset..page_offset + chunk_len {
+                if !page.is_mapped(offset) {
+                    page.bytes[offset] = 0;
+                }
+            }
+            page.mark_mapped_range(page_offset, chunk_len);
+            current_address = current_address.wrapping_add(chunk_len as u64);
+            remaining -= chunk_len;
+        }
+    }
+
+    pub fn commit_zeroed_pages(&mut self, address: u64, len: usize) -> AppResult<()> {
+        let mut current_address = address;
+        let mut remaining = len;
+        while remaining != 0 {
+            let page_base = current_address & MEMORY_PAGE_MASK;
+            let page_offset = (current_address - page_base) as usize;
+            let chunk_len = (MEMORY_PAGE_SIZE - page_offset).min(remaining);
+            let page = self
+                .page_index(page_base)
+                .map(|index| &mut self.pages[index].1)
+                .ok_or_else(|| Self::unmapped_memory_error(current_address))?;
+            if !page.is_fully_mapped() {
+                page.mark_fully_mapped();
+            }
+            current_address = current_address.wrapping_add(chunk_len as u64);
+            remaining -= chunk_len;
+        }
+        Ok(())
+    }
+
     fn unmapped_memory_error(address: u64) -> AppError {
         AppError::new(
             ReasonCode::RcUnimplInsn,
@@ -674,7 +866,25 @@ impl MemoryImage {
         Ok(bytes)
     }
 
-    fn read_into(&self, address: u64, target: &mut [u8]) -> AppResult<()> {
+    fn write_fixed<const N: usize>(&mut self, address: u64, bytes: [u8; N]) {
+        let page_base = address & MEMORY_PAGE_MASK;
+        let page_offset = (address - page_base) as usize;
+        if page_offset + N <= MEMORY_PAGE_SIZE {
+            if let Some(index) = self.page_index(page_base) {
+                let page = &mut self.pages[index].1;
+                page.bytes[page_offset..page_offset + N].copy_from_slice(&bytes);
+                page.mark_mapped_range(page_offset, N);
+                return;
+            }
+            let page = self.page_mut_or_insert(page_base);
+            page.bytes[page_offset..page_offset + N].copy_from_slice(&bytes);
+            page.mark_mapped_range(page_offset, N);
+            return;
+        }
+        self.map_bytes(address, &bytes);
+    }
+
+    pub fn read_into(&self, address: u64, target: &mut [u8]) -> AppResult<()> {
         if target.is_empty() {
             return Ok(());
         }
@@ -702,6 +912,34 @@ impl MemoryImage {
         Ok(())
     }
 
+    pub fn read_into_slice(&self, address: u64, target: &mut [u8]) -> AppResult<()> {
+        self.read_into(address, target)
+    }
+
+    pub fn is_range_mapped(&self, address: u64, len: usize) -> bool {
+        if len == 0 {
+            return true;
+        }
+
+        let mut checked = 0;
+        let mut current_address = address;
+        while checked < len {
+            let page_base = current_address & MEMORY_PAGE_MASK;
+            let page_offset = (current_address - page_base) as usize;
+            let chunk_len = (MEMORY_PAGE_SIZE - page_offset).min(len - checked);
+            let Some(page) = self.page(page_base) else {
+                return false;
+            };
+            if !page.range_is_mapped(page_offset, chunk_len) {
+                return false;
+            }
+            checked += chunk_len;
+            current_address = current_address.wrapping_add(chunk_len as u64);
+        }
+
+        true
+    }
+
     pub fn read_bytes(&self, address: u64, len: usize) -> AppResult<Vec<u8>> {
         if len == 0 {
             return Ok(Vec::new());
@@ -715,6 +953,13 @@ impl MemoryImage {
     pub fn read_u8(&self, address: u64) -> AppResult<u8> {
         let page_base = address & MEMORY_PAGE_MASK;
         let page_offset = (address - page_base) as usize;
+        if let Some(index) = self.page_index(page_base) {
+            let page = &self.pages[index].1;
+            if !page.is_mapped(page_offset) {
+                return Err(Self::unmapped_memory_error(address));
+            }
+            return Ok(page.bytes[page_offset]);
+        }
         let page = self
             .page(page_base)
             .ok_or_else(|| Self::unmapped_memory_error(address))?;
@@ -728,6 +973,19 @@ impl MemoryImage {
         let page_base = address & MEMORY_PAGE_MASK;
         let page_offset = (address - page_base) as usize;
         if page_offset + 2 <= MEMORY_PAGE_SIZE {
+            if let Some(index) = self.page_index(page_base) {
+                let page = &self.pages[index].1;
+                if page.range_is_mapped(page_offset, 2) {
+                    return Ok(u16::from_le_bytes([
+                        page.bytes[page_offset],
+                        page.bytes[page_offset + 1],
+                    ]));
+                }
+                let missing_offset = page
+                    .first_unmapped_offset(page_offset, 2)
+                    .expect("range_is_mapped mismatch");
+                return Err(Self::unmapped_memory_error(page_base + missing_offset as u64));
+            }
             if let Some(page) = self.page(page_base) {
                 if page.range_is_mapped(page_offset, 2) {
                     return Ok(u16::from_le_bytes([
@@ -748,6 +1006,21 @@ impl MemoryImage {
         let page_base = address & MEMORY_PAGE_MASK;
         let page_offset = (address - page_base) as usize;
         if page_offset + 4 <= MEMORY_PAGE_SIZE {
+            if let Some(index) = self.page_index(page_base) {
+                let page = &self.pages[index].1;
+                if page.range_is_mapped(page_offset, 4) {
+                    return Ok(u32::from_le_bytes([
+                        page.bytes[page_offset],
+                        page.bytes[page_offset + 1],
+                        page.bytes[page_offset + 2],
+                        page.bytes[page_offset + 3],
+                    ]));
+                }
+                let missing_offset = page
+                    .first_unmapped_offset(page_offset, 4)
+                    .expect("range_is_mapped mismatch");
+                return Err(Self::unmapped_memory_error(page_base + missing_offset as u64));
+            }
             if let Some(page) = self.page(page_base) {
                 if page.range_is_mapped(page_offset, 4) {
                     return Ok(u32::from_le_bytes([
@@ -766,8 +1039,20 @@ impl MemoryImage {
         Ok(u32::from_le_bytes(self.read_fixed::<4>(address)?))
     }
 
+    pub fn write_u8(&mut self, address: u64, value: u8) {
+        self.write_fixed(address, [value]);
+    }
+
+    pub fn write_u16(&mut self, address: u64, value: u16) {
+        self.write_fixed(address, value.to_le_bytes());
+    }
+
+    pub fn write_u32(&mut self, address: u64, value: u32) {
+        self.write_fixed(address, value.to_le_bytes());
+    }
+
     pub fn map_u64(&mut self, address: u64, value: u64) {
-        self.map_bytes(address, &value.to_le_bytes());
+        self.write_u64(address, value);
     }
 
     pub fn map_xmm(&mut self, address: u64, value: XmmValue) {
@@ -790,6 +1075,25 @@ impl MemoryImage {
         let page_base = address & MEMORY_PAGE_MASK;
         let page_offset = (address - page_base) as usize;
         if page_offset + 8 <= MEMORY_PAGE_SIZE {
+            if let Some(index) = self.page_index(page_base) {
+                let page = &self.pages[index].1;
+                if page.range_is_mapped(page_offset, 8) {
+                    return Ok(u64::from_le_bytes([
+                        page.bytes[page_offset],
+                        page.bytes[page_offset + 1],
+                        page.bytes[page_offset + 2],
+                        page.bytes[page_offset + 3],
+                        page.bytes[page_offset + 4],
+                        page.bytes[page_offset + 5],
+                        page.bytes[page_offset + 6],
+                        page.bytes[page_offset + 7],
+                    ]));
+                }
+                let missing_offset = page
+                    .first_unmapped_offset(page_offset, 8)
+                    .expect("range_is_mapped mismatch");
+                return Err(Self::unmapped_memory_error(page_base + missing_offset as u64));
+            }
             if let Some(page) = self.page(page_base) {
                 if page.range_is_mapped(page_offset, 8) {
                     return Ok(u64::from_le_bytes([
@@ -826,12 +1130,14 @@ impl MemoryImage {
     }
 
     pub fn write_u64(&mut self, address: u64, value: u64) {
-        self.map_u64(address, value);
+        self.write_fixed(address, value.to_le_bytes());
     }
 
     pub fn stable_hash(&self) -> String {
         let mut hasher = Sha256::new();
-        for (page_base, page) in &self.pages {
+        let mut pages = self.pages.iter().collect::<Vec<_>>();
+        pages.sort_unstable_by_key(|(page_base, _)| *page_base);
+        for (page_base, page) in pages {
             for (word_index, word) in page.mapped.iter().copied().enumerate() {
                 let mut remaining = word;
                 while remaining != 0 {
@@ -870,6 +1176,10 @@ pub enum ByteRegister {
     Cl,
     Dl,
     Bl,
+    Ah,
+    Ch,
+    Dh,
+    Bh,
     Spl,
     Bpl,
     Sil,
@@ -885,16 +1195,40 @@ pub enum ByteRegister {
 }
 
 impl ByteRegister {
-    fn from_modrm(code: u8) -> Self {
+    fn from_modrm(code: u8, rex: Option<RexPrefix>, arch: GuestArch) -> Self {
         match code & 0x0f {
             0 => Self::Al,
             1 => Self::Cl,
             2 => Self::Dl,
             3 => Self::Bl,
-            4 => Self::Spl,
-            5 => Self::Bpl,
-            6 => Self::Sil,
-            7 => Self::Dil,
+            4 => {
+                if arch == GuestArch::X64 && rex.is_some() {
+                    Self::Spl
+                } else {
+                    Self::Ah
+                }
+            }
+            5 => {
+                if arch == GuestArch::X64 && rex.is_some() {
+                    Self::Bpl
+                } else {
+                    Self::Ch
+                }
+            }
+            6 => {
+                if arch == GuestArch::X64 && rex.is_some() {
+                    Self::Sil
+                } else {
+                    Self::Dh
+                }
+            }
+            7 => {
+                if arch == GuestArch::X64 && rex.is_some() {
+                    Self::Dil
+                } else {
+                    Self::Bh
+                }
+            }
             8 => Self::R8b,
             9 => Self::R9b,
             10 => Self::R10b,
@@ -906,12 +1240,16 @@ impl ByteRegister {
         }
     }
 
-    fn full_register(self) -> Register {
+    pub fn full_register(self) -> Register {
         match self {
             Self::Al => Register::Rax,
             Self::Cl => Register::Rcx,
             Self::Dl => Register::Rdx,
             Self::Bl => Register::Rbx,
+            Self::Ah => Register::Rax,
+            Self::Ch => Register::Rcx,
+            Self::Dh => Register::Rdx,
+            Self::Bh => Register::Rbx,
             Self::Spl => Register::Rsp,
             Self::Bpl => Register::Rbp,
             Self::Sil => Register::Rsi,
@@ -938,6 +1276,8 @@ pub struct SegmentBases {
 pub enum ConditionCode {
     Equal,
     NotEqual,
+    Overflow,
+    NotOverflow,
     Below,
     NotBelow,
     Above,
@@ -1023,6 +1363,8 @@ pub enum DecodedOpcode {
     AndReg,
     AndReg8,
     BitTest,
+    RolImm,
+    RolCl,
     ShlImm,
     ShrImm,
     SarImm,
@@ -1035,6 +1377,7 @@ pub enum DecodedOpcode {
     ShrdImm,
     ImulImm,
     ImulReg,
+    MulAcc,
     Div,
     Idiv,
     SubReg8,
@@ -1045,6 +1388,7 @@ pub enum DecodedOpcode {
     Stos,
     SubReg,
     SbbReg,
+    SbbReg8,
     Cmp,
     Test,
     Xchg,
@@ -1076,15 +1420,22 @@ pub enum DecodedOpcode {
     PushReg,
     PushMemory,
     PushImm,
+    PushFlags,
     PopReg,
+    PopMemory,
+    PopFlags,
+    Cld,
     Leave,
     Ret,
     Popcnt,
     Lzcnt,
+    Bsf,
     Movsx,
     MovdToXmm,
     MovdFromXmm,
     Pshufd,
+    Pshuflw,
+    Movlhps,
     Cvtpd2ps,
     Cvtdq2pd,
     Addsd,
@@ -1095,15 +1446,33 @@ pub enum DecodedOpcode {
     XmmMove,
     VectorMove,
     Pxor,
+    VectorOr,
     VectorXor,
     Paddq,
     VectorAddQ,
+    VectorCompareEqBytes,
+    VectorMoveMaskBytes,
     VzeroUpper,
     Fnclex,
     FldConst,
+    FildI32,
+    FildI64,
+    FldReal32,
+    FldReal64,
     Fldcw,
+    Fchs,
+    Fxch,
     Fstcw,
+    FstReal32,
+    FstpReal32,
+    FstpSt,
     FstpReal,
+    Faddp,
+    FmulReal64,
+    FdivReal64,
+    Fmul,
+    Fdiv,
+    Fdivp,
     Fninit,
     Ldmxcsr,
     Stmxcsr,
@@ -1147,6 +1516,7 @@ pub enum IrInstruction {
     MovReg8 { dst: ByteRegister, src: ByteRegister },
     MovdFromXmm { dst: Register, src: u8 },
     AddImm { dst: Register, value: u64, width: usize },
+    AddReg8 { dst: ByteRegister, src: ByteRegister },
     AddOperand { dst: Register, src: CompareOperand, width: usize },
     AddMemory { address: MemoryOperand, src: Register, width: usize },
     AddImmMemory {
@@ -1184,12 +1554,15 @@ pub enum IrInstruction {
     },
     AndReg { dst: Register, src: CompareOperand, width: usize },
     AndMemory { address: MemoryOperand, src: Register, width: usize },
+    RolImm { dst: Register, count: u8, width: usize },
+    RolImmMemory { address: MemoryOperand, count: u8, width: usize },
     ShlImm { dst: Register, count: u8, width: usize },
     ShrImm { dst: Register, count: u8, width: usize },
     SarImm { dst: Register, count: u8, width: usize },
     ShlImmMemory { address: MemoryOperand, count: u8, width: usize },
     ShrImmMemory { address: MemoryOperand, count: u8, width: usize },
     SarImmMemory { address: MemoryOperand, count: u8, width: usize },
+    RolCl { dst: Register, width: usize },
     ShlCl { dst: Register, width: usize },
     RorCl { dst: Register, width: usize },
     ShrCl { dst: Register, width: usize },
@@ -1222,6 +1595,10 @@ pub enum IrInstruction {
         src: CompareOperand,
         width: usize,
     },
+    MulAcc {
+        src: CompareOperand,
+        width: usize,
+    },
     ImulAcc {
         src: CompareOperand,
         width: usize,
@@ -1229,9 +1606,11 @@ pub enum IrInstruction {
     Div { src: CompareOperand, width: usize },
     Idiv { src: CompareOperand, width: usize },
     SubReg8 { dst: ByteRegister, src: CompareOperand },
+    SbbReg8 { dst: ByteRegister, src: CompareOperand },
     NegReg { dst: Register, width: usize },
     NegReg8 { dst: ByteRegister },
     NotReg { dst: Register, width: usize },
+    NotReg8 { dst: ByteRegister },
     Cdq { width: usize },
     Movs { width: usize, repeat: bool },
     Stos { width: usize, repeat: bool },
@@ -1291,6 +1670,8 @@ pub enum IrInstruction {
     OrReg8 { dst: ByteRegister, src: ByteRegister },
     IncReg { dst: Register, width: usize },
     DecReg { dst: Register, width: usize },
+    IncReg8 { dst: ByteRegister },
+    DecReg8 { dst: ByteRegister },
     IncMemory { address: MemoryOperand, width: usize },
     DecMemory { address: MemoryOperand, width: usize },
     Cmov {
@@ -1310,6 +1691,7 @@ pub enum IrInstruction {
     JumpRegister { src: Register },
     JumpMemory { address: MemoryOperand },
     Setcc { condition: ConditionCode, dst: ByteRegister },
+    SetccMemory { condition: ConditionCode, address: MemoryOperand },
     JumpIf {
         condition: ConditionCode,
         target: u64,
@@ -1321,13 +1703,20 @@ pub enum IrInstruction {
     PushReg { src: Register },
     PushMemory { address: MemoryOperand, width: usize },
     PushImm { value: u64, width: usize },
+    PushFlags { width: usize },
     PopReg { dst: Register },
+    PopMemory { address: MemoryOperand, width: usize },
+    PopFlags { width: usize },
+    Cld,
     Leave,
     Return { stack_adjust: u64 },
     Popcnt { dst: Register, src: Register },
     Lzcnt { dst: Register, src: Register },
+    Bsf { dst: Register, src: Register },
     MovdToXmm { dst: u8, src: Register },
     Pshufd { dst: u8, src: u8, imm: u8 },
+    Pshuflw { dst: u8, src: u8, imm: u8 },
+    Movlhps { dst: u8, src: u8 },
     MoveXmm { dst: u8, src: u8 },
     LoadXmm { dst: u8, address: MemoryOperand },
     StoreXmm { src: u8, address: MemoryOperand },
@@ -1335,6 +1724,12 @@ pub enum IrInstruction {
     LoadVector { dst: u8, address: MemoryOperand, width: usize },
     StoreVector { src: u8, address: MemoryOperand, width: usize },
     Pxor { dst: u8, src: u8 },
+    VectorOr {
+        dst: u8,
+        lhs: u8,
+        rhs: VectorOperand,
+        width: usize,
+    },
     VectorXor {
         dst: u8,
         lhs: u8,
@@ -1348,10 +1743,30 @@ pub enum IrInstruction {
         rhs: VectorOperand,
         width: usize,
     },
+    VectorCompareEqBytes {
+        dst: u8,
+        lhs: u8,
+        rhs: VectorOperand,
+        width: usize,
+    },
+    VectorMoveMaskBytes {
+        dst: Register,
+        src: u8,
+        width: usize,
+    },
     VzeroUpper,
     X87ClearExceptions,
+    X87LoadInt32 { address: MemoryOperand },
+    X87LoadInt64 { address: MemoryOperand },
+    X87Load { address: MemoryOperand, width: usize },
     X87LoadControlWord { address: MemoryOperand },
+    X87NegateTop,
+    X87MulMemory { address: MemoryOperand, width: usize },
+    X87DivMemory { address: MemoryOperand, width: usize },
+    X87Swap { index: usize },
     X87StoreControlWord { address: MemoryOperand },
+    X87Store { address: MemoryOperand, width: usize, pop: bool },
+    X87StorePopRegister { index: usize },
     X87StorePop { address: MemoryOperand },
     X87Init,
     LoadMxcsr { address: MemoryOperand },
@@ -1384,6 +1799,10 @@ pub enum IrInstruction {
     },
     Mfence,
     X87LoadConst { value: f64 },
+    X87AddPop { index: usize },
+    X87Mul { index: usize },
+    X87DivRegister { index: usize },
+    X87DivPop { index: usize },
     X87Add,
     X87Div,
 }
@@ -1582,6 +2001,71 @@ impl CpuExecutionEngine {
         execute_ir_with_hashing(state, memory, ir, Some(&self.config.virtualization), true)
     }
 
+    /// Execute a block via JIT if available, falling back to IR interpretation.
+    /// The JIT runtime is optional — if None is provided, this is equivalent to
+    /// `execute_ir_without_memory_hash`.
+    pub fn execute_with_jit(
+        &self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+        ir: &[IrInstruction],
+        jit_runtime: Option<&mut crate::jit::JitRuntime>,
+    ) -> AppResult<ExecutionSummary> {
+        // Try JIT execution first if runtime is available
+        if let Some(runtime) = jit_runtime {
+            // Compile the block and extract what we need, releasing the borrow
+            let jit_info = {
+                let compile_result = runtime.get_or_compile(ir, state.rip, self.config.arch);
+                match compile_result {
+                    Ok(block) => Some((block.entry, block.code_size)),
+                    Err(_) => None,
+                }
+            };
+
+            if let Some((entry_ptr, _code_size)) = jit_info {
+                // Sync relevant memory pages to flat region for JIT access
+                let page_addr = state.rip & !0xfff;
+                runtime.sync_page_to_flat(memory, page_addr);
+
+                let mem_base = runtime.flat_memory.base();
+
+                // Execute the JIT block
+                let result = unsafe {
+                    let entry_fn: unsafe extern "C" fn(
+                        *mut CpuState, u64, *mut MemoryImage, *mut u64,
+                    ) -> u64 = std::mem::transmute(entry_ptr);
+
+                    let mut exit_reason: u64 = 0;
+                    let _ret = entry_fn(
+                        state as *mut CpuState,
+                        mem_base,
+                        memory as *mut MemoryImage,
+                        &mut exit_reason as *mut u64,
+                    );
+                    exit_reason
+                };
+
+                match result {
+                    0 => {
+                        // EXIT_NORMAL
+                        return Ok(ExecutionSummary {
+                            flags: state.flags.clone(),
+                            memory_hash: String::new(),
+                            ordering_log: Vec::new(),
+                        });
+                    }
+                    _ => {
+                        // JIT couldn't handle this block, fall through to IR interpreter
+                        runtime.interpreter_fallbacks += 1;
+                    }
+                }
+            }
+        }
+
+        // Fallback to IR interpretation
+        execute_ir_with_hashing(state, memory, ir, Some(&self.config.virtualization), false)
+    }
+
     pub fn register_veh(&mut self, handler: ExceptionHandler) {
         self.dispatcher.veh.push(handler);
     }
@@ -1776,6 +2260,39 @@ pub fn decode_block(bytes: &[u8], start_address: u64, arch: GuestArch) -> AppRes
                 ))],
                 precise_faulting_memory: false,
             },
+            0x9C => {
+                let width = operand_width(rex, &prefixes, arch);
+                DecodedInstruction {
+                    address,
+                    size: local - cursor,
+                    prefixes,
+                    rex,
+                    opcode: DecodedOpcode::PushFlags,
+                    operands: vec![Operand::ImmediateU64(width as u64)],
+                    precise_faulting_memory: false,
+                }
+            }
+            0x9D => {
+                let width = operand_width(rex, &prefixes, arch);
+                DecodedInstruction {
+                    address,
+                    size: local - cursor,
+                    prefixes,
+                    rex,
+                    opcode: DecodedOpcode::PopFlags,
+                    operands: vec![Operand::ImmediateU64(width as u64)],
+                    precise_faulting_memory: false,
+                }
+            }
+            0xFC => DecodedInstruction {
+                address,
+                size: local - cursor,
+                prefixes,
+                rex,
+                opcode: DecodedOpcode::Cld,
+                operands: vec![],
+                precise_faulting_memory: false,
+            },
             0x40..=0x47 if arch == GuestArch::X86 => {
                 let width = operand_width(rex, &prefixes, arch);
                 DecodedInstruction {
@@ -1893,7 +2410,7 @@ pub fn decode_block(bytes: &[u8], start_address: u64, arch: GuestArch) -> AppRes
             0xB0..=0xB7 => {
                 let imm = read_immediate(bytes, local, 1)?;
                 local += 1;
-                let dst = ByteRegister::from_modrm(((opcode - 0xB0) & 0x07) | rex_register_low(rex));
+                let dst = ByteRegister::from_modrm(((opcode - 0xB0) & 0x07) | rex_register_low(rex), rex, arch);
                 DecodedInstruction {
                     address,
                     size: local - cursor,
@@ -2044,6 +2561,23 @@ pub fn decode_block(bytes: &[u8], start_address: u64, arch: GuestArch) -> AppRes
                     precise_faulting_memory: false,
                 }
             }
+            0x34 => {
+                let value = read_immediate(bytes, local, 1)?;
+                local += 1;
+                DecodedInstruction {
+                    address,
+                    size: local - cursor,
+                    prefixes,
+                    rex,
+                    opcode: DecodedOpcode::XorImm,
+                    operands: vec![
+                        Operand::Register(Register::Rax),
+                        Operand::ImmediateU64(value),
+                        Operand::ImmediateU64(1),
+                    ],
+                    precise_faulting_memory: false,
+                }
+            }
             0x19 | 0x1B | 0x29 | 0x2B => {
                 let (modrm, consumed) = parse_modrm(bytes, local, arch, rex, address_size_32)?;
                 local += consumed;
@@ -2146,6 +2680,35 @@ pub fn decode_block(bytes: &[u8], start_address: u64, arch: GuestArch) -> AppRes
                     precise_faulting_memory,
                 }
             }
+            0x00 | 0x02 => {
+                let (modrm, consumed) = parse_modrm(bytes, local, arch, rex, address_size_32)?;
+                local += consumed;
+                if modrm.mod_bits != 0b11 {
+                    return Err(AppError::new(
+                        ReasonCode::RcUnimplInsn,
+                        format!("opcode 0x{opcode:02x} currently requires register operands"),
+                    ));
+                }
+                let dst = if opcode == 0x00 {
+                    ByteRegister::from_modrm(modrm.rm_register(), rex, arch)
+                } else {
+                    ByteRegister::from_modrm(modrm.reg, rex, arch)
+                };
+                let src = if opcode == 0x00 {
+                    ByteRegister::from_modrm(modrm.reg, rex, arch)
+                } else {
+                    ByteRegister::from_modrm(modrm.rm_register(), rex, arch)
+                };
+                DecodedInstruction {
+                    address,
+                    size: local - cursor,
+                    prefixes,
+                    rex,
+                    opcode: DecodedOpcode::AddReg,
+                    operands: vec![Operand::Register8(dst), Operand::Register8(src)],
+                    precise_faulting_memory: false,
+                }
+            }
             0x13 => {
                 let (modrm, consumed) = parse_modrm(bytes, local, arch, rex, address_size_32)?;
                 local += consumed;
@@ -2168,6 +2731,27 @@ pub fn decode_block(bytes: &[u8], start_address: u64, arch: GuestArch) -> AppRes
                         Operand::ImmediateU64(width as u64),
                     ],
                     precise_faulting_memory: !matches!(source, CompareOperand::Register(_)),
+                }
+            }
+            0x1A => {
+                let (modrm, consumed) = parse_modrm(bytes, local, arch, rex, address_size_32)?;
+                local += consumed;
+                let source = if modrm.mod_bits == 0b11 {
+                    Operand::Register8(ByteRegister::from_modrm(modrm.rm_register(), rex, arch))
+                } else {
+                    modrm_operand(&modrm, arch, &prefixes, address + (local - cursor) as u64)
+                };
+                DecodedInstruction {
+                    address,
+                    size: local - cursor,
+                    prefixes,
+                    rex,
+                    opcode: DecodedOpcode::SbbReg8,
+                    operands: vec![
+                        Operand::Register8(ByteRegister::from_modrm(modrm.reg, rex, arch)),
+                        source,
+                    ],
+                    precise_faulting_memory: modrm.mod_bits != 0b11,
                 }
             }
             0x35 => {
@@ -2209,8 +2793,30 @@ pub fn decode_block(bytes: &[u8], start_address: u64, arch: GuestArch) -> AppRes
                     rex,
                     opcode: DecodedOpcode::OrReg8,
                     operands: vec![
-                        Operand::Register8(ByteRegister::from_modrm(modrm.rm_register())),
-                        Operand::Register8(ByteRegister::from_modrm(modrm.reg)),
+                        Operand::Register8(ByteRegister::from_modrm(modrm.rm_register(), rex, arch)),
+                        Operand::Register8(ByteRegister::from_modrm(modrm.reg, rex, arch)),
+                    ],
+                    precise_faulting_memory: false,
+                }
+            }
+            0x0A => {
+                let (modrm, consumed) = parse_modrm(bytes, local, arch, rex, address_size_32)?;
+                local += consumed;
+                if modrm.mod_bits != 0b11 {
+                    return Err(AppError::new(
+                        ReasonCode::RcUnimplInsn,
+                        "opcode 0x0a currently requires register operands",
+                    ));
+                }
+                DecodedInstruction {
+                    address,
+                    size: local - cursor,
+                    prefixes,
+                    rex,
+                    opcode: DecodedOpcode::OrReg8,
+                    operands: vec![
+                        Operand::Register8(ByteRegister::from_modrm(modrm.reg, rex, arch)),
+                        Operand::Register8(ByteRegister::from_modrm(modrm.rm_register(), rex, arch)),
                     ],
                     precise_faulting_memory: false,
                 }
@@ -2231,8 +2837,8 @@ pub fn decode_block(bytes: &[u8], start_address: u64, arch: GuestArch) -> AppRes
                     rex,
                     opcode: DecodedOpcode::AndReg8,
                     operands: vec![
-                        Operand::Register8(ByteRegister::from_modrm(modrm.rm_register())),
-                        Operand::Register8(ByteRegister::from_modrm(modrm.reg)),
+                        Operand::Register8(ByteRegister::from_modrm(modrm.rm_register(), rex, arch)),
+                        Operand::Register8(ByteRegister::from_modrm(modrm.reg, rex, arch)),
                     ],
                     precise_faulting_memory: false,
                 }
@@ -2248,13 +2854,13 @@ pub fn decode_block(bytes: &[u8], start_address: u64, arch: GuestArch) -> AppRes
                 }
                 let (dst, src) = if opcode == 0x30 {
                     (
-                        ByteRegister::from_modrm(modrm.rm_register()),
-                        ByteRegister::from_modrm(modrm.reg),
+                        ByteRegister::from_modrm(modrm.rm_register(), rex, arch),
+                        ByteRegister::from_modrm(modrm.reg, rex, arch),
                     )
                 } else {
                     (
-                        ByteRegister::from_modrm(modrm.reg),
-                        ByteRegister::from_modrm(modrm.rm_register()),
+                        ByteRegister::from_modrm(modrm.reg, rex, arch),
+                        ByteRegister::from_modrm(modrm.rm_register(), rex, arch),
                     )
                 };
                 DecodedInstruction {
@@ -2271,7 +2877,7 @@ pub fn decode_block(bytes: &[u8], start_address: u64, arch: GuestArch) -> AppRes
                 let (modrm, consumed) = parse_modrm(bytes, local, arch, rex, address_size_32)?;
                 local += consumed;
                 let source = if modrm.mod_bits == 0b11 {
-                    Operand::Register8(ByteRegister::from_modrm(modrm.rm_register()))
+                    Operand::Register8(ByteRegister::from_modrm(modrm.rm_register(), rex, arch))
                 } else {
                     modrm_operand(&modrm, arch, &prefixes, address + (local - cursor) as u64)
                 };
@@ -2282,7 +2888,7 @@ pub fn decode_block(bytes: &[u8], start_address: u64, arch: GuestArch) -> AppRes
                     rex,
                     opcode: DecodedOpcode::SubReg8,
                     operands: vec![
-                        Operand::Register8(ByteRegister::from_modrm(modrm.reg)),
+                        Operand::Register8(ByteRegister::from_modrm(modrm.reg, rex, arch)),
                         source,
                     ],
                     precise_faulting_memory: modrm.mod_bits != 0b11,
@@ -2613,12 +3219,12 @@ pub fn decode_block(bytes: &[u8], start_address: u64, arch: GuestArch) -> AppRes
                     operand_width(rex, &prefixes, arch)
                 };
                 let reg = if width == 1 {
-                    CompareOperand::Register8(ByteRegister::from_modrm(modrm.reg))
+                    CompareOperand::Register8(ByteRegister::from_modrm(modrm.reg, rex, arch))
                 } else {
                     CompareOperand::Register(Register::from_modrm(modrm.reg))
                 };
                 let rm = if width == 1 && modrm.mod_bits == 0b11 {
-                    CompareOperand::Register8(ByteRegister::from_modrm(modrm.rm_register()))
+                    CompareOperand::Register8(ByteRegister::from_modrm(modrm.rm_register(), rex, arch))
                 } else {
                     compare_operand(modrm_operand(&modrm, arch, &prefixes, address + (local - cursor) as u64))
                 };
@@ -2716,10 +3322,17 @@ pub fn decode_block(bytes: &[u8], start_address: u64, arch: GuestArch) -> AppRes
                 })? as i8 as i64 as u64;
                 local += 1;
                 let width = operand_width(rex, &prefixes, arch);
+                if modrm.reg == 3 && modrm.mod_bits != 0b11 {
+                    return Err(AppError::new(
+                        ReasonCode::RcUnimplInsn,
+                        "opcode 0x83 /3 currently requires a register destination",
+                    ));
+                }
                 let opcode_kind = match modrm.reg {
                     0 => DecodedOpcode::AddImm,
                     1 => DecodedOpcode::OrImm,
                     2 => DecodedOpcode::AdcImm,
+                    3 => DecodedOpcode::SbbReg,
                     4 => DecodedOpcode::AndImm,
                     5 => DecodedOpcode::SubImm,
                     6 => DecodedOpcode::XorImm,
@@ -2763,6 +3376,38 @@ pub fn decode_block(bytes: &[u8], start_address: u64, arch: GuestArch) -> AppRes
                     }
                 }
             }
+            0xC0 => {
+                let (modrm, consumed) = parse_modrm(bytes, local, arch, rex, address_size_32)?;
+                local += consumed;
+                let imm = read_immediate(bytes, local, 1)?;
+                local += 1;
+                let opcode_kind = match modrm.reg {
+                    0 => DecodedOpcode::RolImm,
+                    4 => DecodedOpcode::ShlImm,
+                    5 => DecodedOpcode::ShrImm,
+                    7 => DecodedOpcode::SarImm,
+                    other => {
+                        return Err(AppError::new(
+                            ReasonCode::RcUnimplInsn,
+                            format!("unsupported opcode 0xc0 group selector {other}"),
+                        ))
+                    }
+                };
+                let destination = modrm_operand(&modrm, arch, &prefixes, address + (local - cursor) as u64);
+                DecodedInstruction {
+                    address,
+                    size: local - cursor,
+                    prefixes,
+                    rex,
+                    opcode: opcode_kind,
+                    operands: vec![
+                        destination,
+                        Operand::ImmediateU64(imm),
+                        Operand::ImmediateU64(1),
+                    ],
+                    precise_faulting_memory: modrm.mod_bits != 0b11,
+                }
+            }
             0xC1 | 0xD1 => {
                 let (modrm, consumed) = parse_modrm(bytes, local, arch, rex, address_size_32)?;
                 local += consumed;
@@ -2774,6 +3419,7 @@ pub fn decode_block(bytes: &[u8], start_address: u64, arch: GuestArch) -> AppRes
                     1
                 };
                 let opcode_kind = match modrm.reg {
+                    0 => DecodedOpcode::RolImm,
                     4 => DecodedOpcode::ShlImm,
                     5 => DecodedOpcode::ShrImm,
                     7 => DecodedOpcode::SarImm,
@@ -2810,6 +3456,7 @@ pub fn decode_block(bytes: &[u8], start_address: u64, arch: GuestArch) -> AppRes
                     ));
                 }
                 let opcode_kind = match modrm.reg {
+                    0 => DecodedOpcode::RolImm,
                     4 => DecodedOpcode::ShlImm,
                     5 => DecodedOpcode::ShrImm,
                     7 => DecodedOpcode::SarImm,
@@ -2845,6 +3492,7 @@ pub fn decode_block(bytes: &[u8], start_address: u64, arch: GuestArch) -> AppRes
                     ));
                 }
                 let opcode_kind = match modrm.reg {
+                    0 => DecodedOpcode::RolCl,
                     1 => DecodedOpcode::RorCl,
                     4 => DecodedOpcode::ShlCl,
                     5 => DecodedOpcode::ShrCl,
@@ -2897,13 +3545,22 @@ pub fn decode_block(bytes: &[u8], start_address: u64, arch: GuestArch) -> AppRes
                             precise_faulting_memory: modrm.mod_bits != 0b11,
                         }
                     }
+                    2 if modrm.mod_bits == 0b11 => DecodedInstruction {
+                        address,
+                        size: local - cursor,
+                        prefixes,
+                        rex,
+                        opcode: DecodedOpcode::Not,
+                        operands: vec![Operand::Register8(ByteRegister::from_modrm(modrm.rm_register(), rex, arch))],
+                        precise_faulting_memory: false,
+                    },
                     3 if modrm.mod_bits == 0b11 => DecodedInstruction {
                         address,
                         size: local - cursor,
                         prefixes,
                         rex,
                         opcode: DecodedOpcode::Neg,
-                        operands: vec![Operand::Register8(ByteRegister::from_modrm(modrm.rm_register()))],
+                        operands: vec![Operand::Register8(ByteRegister::from_modrm(modrm.rm_register(), rex, arch))],
                         precise_faulting_memory: false,
                     },
                     7 => {
@@ -2977,6 +3634,18 @@ pub fn decode_block(bytes: &[u8], start_address: u64, arch: GuestArch) -> AppRes
                             Operand::ImmediateU64(width as u64),
                         ],
                         precise_faulting_memory: false,
+                    },
+                    4 => DecodedInstruction {
+                        address,
+                        size: local - cursor,
+                        prefixes,
+                        rex,
+                        opcode: DecodedOpcode::MulAcc,
+                        operands: vec![
+                            compare_operand_to_operand(operand),
+                            Operand::ImmediateU64(width as u64),
+                        ],
+                        precise_faulting_memory: modrm.mod_bits != 0b11,
                     },
                     5 => DecodedInstruction {
                         address,
@@ -3083,7 +3752,7 @@ pub fn decode_block(bytes: &[u8], start_address: u64, arch: GuestArch) -> AppRes
                         rex,
                         opcode: DecodedOpcode::OrImm,
                         operands: vec![
-                            Operand::Register8(ByteRegister::from_modrm(modrm.rm_register())),
+                            Operand::Register8(ByteRegister::from_modrm(modrm.rm_register(), rex, arch)),
                             Operand::ImmediateU64(imm),
                         ],
                         precise_faulting_memory: false,
@@ -3124,7 +3793,7 @@ pub fn decode_block(bytes: &[u8], start_address: u64, arch: GuestArch) -> AppRes
                         rex,
                         opcode: DecodedOpcode::AdcImm,
                         operands: vec![
-                            Operand::Register8(ByteRegister::from_modrm(modrm.rm_register())),
+                            Operand::Register8(ByteRegister::from_modrm(modrm.rm_register(), rex, arch)),
                             Operand::ImmediateU64(imm),
                         ],
                         precise_faulting_memory: false,
@@ -3158,6 +3827,37 @@ pub fn decode_block(bytes: &[u8], start_address: u64, arch: GuestArch) -> AppRes
                             precise_faulting_memory: true,
                         }
                     },
+                    3 if opcode == 0x80 && modrm.mod_bits == 0b11 => DecodedInstruction {
+                        address,
+                        size: local - cursor,
+                        prefixes,
+                        rex,
+                        opcode: DecodedOpcode::SbbReg8,
+                        operands: vec![
+                            Operand::Register8(ByteRegister::from_modrm(modrm.rm_register(), rex, arch)),
+                            Operand::ImmediateU64(imm),
+                        ],
+                        precise_faulting_memory: false,
+                    },
+                    3 if modrm.mod_bits == 0b11 => DecodedInstruction {
+                        address,
+                        size: local - cursor,
+                        prefixes,
+                        rex,
+                        opcode: DecodedOpcode::SbbReg,
+                        operands: vec![
+                            Operand::Register(Register::from_modrm(modrm.rm_register())),
+                            Operand::ImmediateU64(imm_value),
+                            Operand::ImmediateU64(width as u64),
+                        ],
+                        precise_faulting_memory: false,
+                    },
+                    3 => {
+                        return Err(AppError::new(
+                            ReasonCode::RcUnimplInsn,
+                            format!("opcode 0x{opcode:02x} /3 currently requires a register destination"),
+                        ))
+                    }
                     4 if modrm.mod_bits == 0b11 => DecodedInstruction {
                         address,
                         size: local - cursor,
@@ -3310,12 +4010,12 @@ pub fn decode_block(bytes: &[u8], start_address: u64, arch: GuestArch) -> AppRes
                 let rm_operand = modrm_operand(&modrm, arch, &prefixes, address + (local - cursor) as u64);
                 let (opcode_kind, operands, precise_faulting_memory) = match opcode {
                     0x88 => {
-                        let reg = ByteRegister::from_modrm(modrm.reg);
+                        let reg = ByteRegister::from_modrm(modrm.reg, rex, arch);
                         match rm_operand {
                             Operand::Register(_) => (
                                 DecodedOpcode::MovReg8,
                                 vec![
-                                    Operand::Register8(ByteRegister::from_modrm(modrm.rm_register())),
+                                    Operand::Register8(ByteRegister::from_modrm(modrm.rm_register(), rex, arch)),
                                     Operand::Register8(reg),
                                     Operand::ImmediateU64(1),
                                 ],
@@ -3330,13 +4030,13 @@ pub fn decode_block(bytes: &[u8], start_address: u64, arch: GuestArch) -> AppRes
                         }
                     }
                     0x8A => {
-                        let reg = ByteRegister::from_modrm(modrm.reg);
+                        let reg = ByteRegister::from_modrm(modrm.reg, rex, arch);
                         match rm_operand {
                             Operand::Register(_) => (
                                 DecodedOpcode::MovReg8,
                                 vec![
                                     Operand::Register8(reg),
-                                    Operand::Register8(ByteRegister::from_modrm(modrm.rm_register())),
+                                    Operand::Register8(ByteRegister::from_modrm(modrm.rm_register(), rex, arch)),
                                     Operand::ImmediateU64(1),
                                 ],
                                 false,
@@ -3399,6 +4099,67 @@ pub fn decode_block(bytes: &[u8], start_address: u64, arch: GuestArch) -> AppRes
                     opcode: opcode_kind,
                     operands,
                     precise_faulting_memory,
+                }
+            }
+            0x8C => {
+                if arch != GuestArch::X86 {
+                    return Err(AppError::new(
+                        ReasonCode::RcUnimplInsn,
+                        "MOV r/m16,Sreg is only implemented for x86",
+                    ));
+                }
+                let (modrm, consumed) = parse_modrm(bytes, local, arch, rex, address_size_32)?;
+                local += consumed;
+                let Operand::Memory(address_operand) = modrm_operand(&modrm, arch, &prefixes, address + (local - cursor) as u64) else {
+                    return Err(AppError::new(
+                        ReasonCode::RcUnimplInsn,
+                        "MOV r/m16,Sreg currently requires a memory destination",
+                    ));
+                };
+                let Some(selector) = x86_segment_selector_value(modrm.reg) else {
+                    return Err(AppError::new(
+                        ReasonCode::RcUnimplInsn,
+                        format!("unsupported segment register selector {}", modrm.reg),
+                    ));
+                };
+                DecodedInstruction {
+                    address,
+                    size: local - cursor,
+                    prefixes,
+                    rex,
+                    opcode: DecodedOpcode::MovStoreImm,
+                    operands: vec![
+                        Operand::Memory(address_operand),
+                        Operand::ImmediateU64(selector as u64),
+                        Operand::ImmediateU64(2),
+                    ],
+                    precise_faulting_memory: true,
+                }
+            }
+            0x8F => {
+                let (modrm, consumed) = parse_modrm(bytes, local, arch, rex, address_size_32)?;
+                local += consumed;
+                if modrm.reg != 0 {
+                    return Err(AppError::new(
+                        ReasonCode::RcUnimplInsn,
+                        format!("unsupported opcode 0x8f group selector {}", modrm.reg),
+                    ));
+                }
+                let width = operand_width(rex, &prefixes, arch);
+                let Operand::Memory(address_operand) = modrm_operand(&modrm, arch, &prefixes, address + (local - cursor) as u64) else {
+                    return Err(AppError::new(
+                        ReasonCode::RcUnimplInsn,
+                        "POP r/m currently requires a memory destination",
+                    ));
+                };
+                DecodedInstruction {
+                    address,
+                    size: local - cursor,
+                    prefixes,
+                    rex,
+                    opcode: DecodedOpcode::PopMemory,
+                    operands: vec![Operand::Memory(address_operand), Operand::ImmediateU64(width as u64)],
+                    precise_faulting_memory: true,
                 }
             }
             0xC6 | 0xC7 => {
@@ -3508,69 +4269,171 @@ pub fn decode_block(bytes: &[u8], start_address: u64, arch: GuestArch) -> AppRes
                 let secondary = *bytes.get(local).ok_or_else(|| {
                     AppError::new(ReasonCode::RcUnimplInsn, "missing secondary opcode for 0xdb")
                 })?;
-                local += 1;
                 match secondary {
-                    0xE2 => DecodedInstruction {
-                        address,
-                        size: local - cursor,
-                        prefixes,
-                        rex,
-                        opcode: DecodedOpcode::Fnclex,
-                        operands: Vec::new(),
-                        precise_faulting_memory: false,
-                    },
-                    0xE3 => DecodedInstruction {
-                        address,
-                        size: local - cursor,
-                        prefixes,
-                        rex,
-                        opcode: DecodedOpcode::Fninit,
-                        operands: Vec::new(),
-                        precise_faulting_memory: false,
-                    },
-                    other => {
-                        return Err(AppError::new(
-                            ReasonCode::RcUnimplInsn,
-                            format!("unsupported opcode 0xdb secondary {other:#x}"),
-                        ))
+                    0xE2 => {
+                        local += 1;
+                        DecodedInstruction {
+                            address,
+                            size: local - cursor,
+                            prefixes,
+                            rex,
+                            opcode: DecodedOpcode::Fnclex,
+                            operands: Vec::new(),
+                            precise_faulting_memory: false,
+                        }
                     }
+                    0xE3 => {
+                        local += 1;
+                        DecodedInstruction {
+                            address,
+                            size: local - cursor,
+                            prefixes,
+                            rex,
+                            opcode: DecodedOpcode::Fninit,
+                            operands: Vec::new(),
+                            precise_faulting_memory: false,
+                        }
+                    }
+                    _ => {
+                        let (modrm, consumed) = parse_modrm(bytes, local, arch, rex, address_size_32)?;
+                        local += consumed;
+                        if modrm.reg != 0 || modrm.mod_bits == 0b11 {
+                            return Err(AppError::new(
+                                ReasonCode::RcUnimplInsn,
+                                format!("unsupported opcode 0xdb /{}", modrm.reg),
+                            ));
+                        }
+                        let Operand::Memory(address_operand) =
+                            modrm_operand(&modrm, arch, &prefixes, address + (local - cursor) as u64)
+                        else {
+                            return Err(AppError::new(
+                                ReasonCode::RcUnimplInsn,
+                                "opcode 0xdb /0 requires a memory operand",
+                            ));
+                        };
+                        DecodedInstruction {
+                            address,
+                            size: local - cursor,
+                            prefixes,
+                            rex,
+                            opcode: DecodedOpcode::FildI32,
+                            operands: vec![Operand::Memory(address_operand)],
+                            precise_faulting_memory: true,
+                        }
+                    }
+                }
+            }
+            0xD8 => {
+                let (modrm, consumed) = parse_modrm(bytes, local, arch, rex, address_size_32)?;
+                local += consumed;
+                if modrm.mod_bits != 0b11 || !matches!(modrm.reg, 1 | 6) {
+                    return Err(AppError::new(
+                        ReasonCode::RcUnimplInsn,
+                        format!("unsupported opcode 0xd8 reg={} mod={}", modrm.reg, modrm.mod_bits),
+                    ));
+                }
+                DecodedInstruction {
+                    address,
+                    size: local - cursor,
+                    prefixes,
+                    rex,
+                    opcode: if modrm.reg == 1 {
+                        DecodedOpcode::Fmul
+                    } else {
+                        DecodedOpcode::Fdiv
+                    },
+                    operands: vec![Operand::ImmediateU64(u64::from(modrm.rm))],
+                    precise_faulting_memory: false,
+                }
+            }
+            0xDC => {
+                let (modrm, consumed) = parse_modrm(bytes, local, arch, rex, address_size_32)?;
+                local += consumed;
+                if modrm.mod_bits == 0b11 || !matches!(modrm.reg, 1 | 6) {
+                    return Err(AppError::new(
+                        ReasonCode::RcUnimplInsn,
+                        format!("unsupported opcode 0xdc reg={} mod={}", modrm.reg, modrm.mod_bits),
+                    ));
+                }
+                let Operand::Memory(address_operand) =
+                    modrm_operand(&modrm, arch, &prefixes, address + (local - cursor) as u64)
+                else {
+                    return Err(AppError::new(
+                        ReasonCode::RcUnimplInsn,
+                        "opcode 0xdc /1 requires a memory operand",
+                    ));
+                };
+                DecodedInstruction {
+                    address,
+                    size: local - cursor,
+                    prefixes,
+                    rex,
+                    opcode: if modrm.reg == 1 {
+                        DecodedOpcode::FmulReal64
+                    } else {
+                        DecodedOpcode::FdivReal64
+                    },
+                    operands: vec![Operand::Memory(address_operand)],
+                    precise_faulting_memory: true,
                 }
             }
             0xD9 => {
                 let (modrm, consumed) = parse_modrm(bytes, local, arch, rex, address_size_32)?;
                 local += consumed;
                 if modrm.mod_bits == 0b11 {
-                    let constant = if modrm.reg == 5 {
-                        match modrm.rm {
-                            0 => Some(1.0),
-                            1 => Some(std::f64::consts::LOG2_10),
-                            2 => Some(std::f64::consts::LOG2_E),
-                            3 => Some(std::f64::consts::PI),
-                            4 => Some(std::f64::consts::LOG10_2),
-                            5 => Some(std::f64::consts::LN_2),
-                            6 => Some(0.0),
-                            _ => None,
+                    if modrm.reg == 1 {
+                        DecodedInstruction {
+                            address,
+                            size: local - cursor,
+                            prefixes,
+                            rex,
+                            opcode: DecodedOpcode::Fxch,
+                            operands: vec![Operand::ImmediateU64(u64::from(modrm.rm))],
+                            precise_faulting_memory: false,
+                        }
+                    } else if modrm.reg == 4 && modrm.rm == 0 {
+                        DecodedInstruction {
+                            address,
+                            size: local - cursor,
+                            prefixes,
+                            rex,
+                            opcode: DecodedOpcode::Fchs,
+                            operands: Vec::new(),
+                            precise_faulting_memory: false,
                         }
                     } else {
-                        None
-                    };
-                    let Some(constant) = constant else {
-                        return Err(AppError::new(
-                            ReasonCode::RcUnimplInsn,
-                            format!("unsupported opcode 0xd9 register form reg={} rm={}", modrm.reg, modrm.rm),
-                        ));
-                    };
-                    DecodedInstruction {
-                        address,
-                        size: local - cursor,
-                        prefixes,
-                        rex,
-                        opcode: DecodedOpcode::FldConst,
-                        operands: vec![Operand::ImmediateU64(constant.to_bits())],
-                        precise_faulting_memory: false,
+                        let constant = if modrm.reg == 5 {
+                            match modrm.rm {
+                                0 => Some(1.0),
+                                1 => Some(std::f64::consts::LOG2_10),
+                                2 => Some(std::f64::consts::LOG2_E),
+                                3 => Some(std::f64::consts::PI),
+                                4 => Some(std::f64::consts::LOG10_2),
+                                5 => Some(std::f64::consts::LN_2),
+                                6 => Some(0.0),
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        };
+                        let Some(constant) = constant else {
+                            return Err(AppError::new(
+                                ReasonCode::RcUnimplInsn,
+                                format!("unsupported opcode 0xd9 register form reg={} rm={}", modrm.reg, modrm.rm),
+                            ));
+                        };
+                        DecodedInstruction {
+                            address,
+                            size: local - cursor,
+                            prefixes,
+                            rex,
+                            opcode: DecodedOpcode::FldConst,
+                            operands: vec![Operand::ImmediateU64(constant.to_bits())],
+                            precise_faulting_memory: false,
+                        }
                     }
                 } else {
-                    if !matches!(modrm.reg, 5 | 7) {
+                    if !matches!(modrm.reg, 0 | 2 | 3 | 5 | 7) {
                         return Err(AppError::new(
                             ReasonCode::RcUnimplInsn,
                             format!("unsupported opcode 0xd9 /{}", modrm.reg),
@@ -3589,10 +4452,12 @@ pub fn decode_block(bytes: &[u8], start_address: u64, arch: GuestArch) -> AppRes
                         size: local - cursor,
                         prefixes,
                         rex,
-                        opcode: if modrm.reg == 5 {
-                            DecodedOpcode::Fldcw
-                        } else {
-                            DecodedOpcode::Fstcw
+                        opcode: match modrm.reg {
+                            0 => DecodedOpcode::FldReal32,
+                            2 => DecodedOpcode::FstReal32,
+                            3 => DecodedOpcode::FstpReal32,
+                            5 => DecodedOpcode::Fldcw,
+                            _ => DecodedOpcode::Fstcw,
                         },
                         operands: vec![Operand::Memory(address_operand)],
                         precise_faulting_memory: true,
@@ -3602,10 +4467,82 @@ pub fn decode_block(bytes: &[u8], start_address: u64, arch: GuestArch) -> AppRes
             0xDD => {
                 let (modrm, consumed) = parse_modrm(bytes, local, arch, rex, address_size_32)?;
                 local += consumed;
-                if modrm.reg != 3 || modrm.mod_bits == 0b11 {
+                if !matches!(modrm.reg, 0 | 3) {
                     return Err(AppError::new(
                         ReasonCode::RcUnimplInsn,
                         format!("unsupported opcode 0xdd /{}", modrm.reg),
+                    ));
+                }
+                if modrm.mod_bits == 0b11 {
+                    if modrm.reg != 3 {
+                        return Err(AppError::new(
+                            ReasonCode::RcUnimplInsn,
+                            format!("unsupported opcode 0xdd register form reg={} rm={}", modrm.reg, modrm.rm),
+                        ));
+                    }
+                    DecodedInstruction {
+                        address,
+                        size: local - cursor,
+                        prefixes,
+                        rex,
+                        opcode: DecodedOpcode::FstpSt,
+                        operands: vec![Operand::ImmediateU64(u64::from(modrm.rm))],
+                        precise_faulting_memory: false,
+                    }
+                } else {
+                    let Operand::Memory(address_operand) =
+                        modrm_operand(&modrm, arch, &prefixes, address + (local - cursor) as u64)
+                    else {
+                        return Err(AppError::new(
+                            ReasonCode::RcUnimplInsn,
+                            "opcode 0xdd /3 requires a memory operand",
+                        ));
+                    };
+                    DecodedInstruction {
+                        address,
+                        size: local - cursor,
+                        prefixes,
+                        rex,
+                        opcode: if modrm.reg == 0 {
+                            DecodedOpcode::FldReal64
+                        } else {
+                            DecodedOpcode::FstpReal
+                        },
+                        operands: vec![Operand::Memory(address_operand)],
+                        precise_faulting_memory: true,
+                    }
+                }
+            }
+            0xDE => {
+                let (modrm, consumed) = parse_modrm(bytes, local, arch, rex, address_size_32)?;
+                local += consumed;
+                if modrm.mod_bits != 0b11 || !matches!(modrm.reg, 0 | 6) {
+                    return Err(AppError::new(
+                        ReasonCode::RcUnimplInsn,
+                        format!("unsupported opcode 0xde reg={} mod={}", modrm.reg, modrm.mod_bits),
+                    ));
+                }
+                DecodedInstruction {
+                    address,
+                    size: local - cursor,
+                    prefixes,
+                    rex,
+                    opcode: if modrm.reg == 0 {
+                        DecodedOpcode::Faddp
+                    } else {
+                        DecodedOpcode::Fdivp
+                    },
+                    operands: vec![Operand::ImmediateU64(u64::from(modrm.rm))],
+                    precise_faulting_memory: false,
+                }
+            }
+            0xDF => {
+                let (modrm, consumed) = parse_modrm(bytes, local, arch, rex, address_size_32)?;
+                local += consumed;
+                if modrm.reg != 5 || modrm.mod_bits == 0b11 {
+                    return Err(AppError::new(
+                        ReasonCode::RcUnimplInsn,
+                        format!("unsupported opcode 0xdf /{}", modrm.reg),
                     ));
                 }
                 let Operand::Memory(address_operand) =
@@ -3613,7 +4550,7 @@ pub fn decode_block(bytes: &[u8], start_address: u64, arch: GuestArch) -> AppRes
                 else {
                     return Err(AppError::new(
                         ReasonCode::RcUnimplInsn,
-                        "opcode 0xdd /3 requires a memory operand",
+                        "opcode 0xdf /5 requires a memory operand",
                     ));
                 };
                 DecodedInstruction {
@@ -3621,7 +4558,7 @@ pub fn decode_block(bytes: &[u8], start_address: u64, arch: GuestArch) -> AppRes
                     size: local - cursor,
                     prefixes,
                     rex,
-                    opcode: DecodedOpcode::FstpReal,
+                    opcode: DecodedOpcode::FildI64,
                     operands: vec![Operand::Memory(address_operand)],
                     precise_faulting_memory: true,
                 }
@@ -3671,7 +4608,7 @@ pub fn decode_block(bytes: &[u8], start_address: u64, arch: GuestArch) -> AppRes
                     precise_faulting_memory: false,
                 }
             }
-            0x72 | 0x73 | 0x74 | 0x75 | 0x76 | 0x77 | 0x78 | 0x79 | 0x7C | 0x7D | 0x7E | 0x7F => {
+            0x70 | 0x71 | 0x72 | 0x73 | 0x74 | 0x75 | 0x76 | 0x77 | 0x78 | 0x79 | 0x7C | 0x7D | 0x7E | 0x7F => {
                 let displacement = *bytes.get(local).ok_or_else(|| {
                     AppError::new(ReasonCode::RcUnimplInsn, "truncated rel8 for conditional jump")
                 })? as i8 as i64;
@@ -3679,6 +4616,8 @@ pub fn decode_block(bytes: &[u8], start_address: u64, arch: GuestArch) -> AppRes
                 let fallthrough = address + (local - cursor) as u64;
                 let target = (fallthrough as i128 + displacement as i128) as u64;
                 let condition = match opcode {
+                    0x70 => 12,
+                    0x71 => 13,
                     0x72 => 2,
                     0x73 => 3,
                     0x77 => 4,
@@ -3774,35 +4713,54 @@ pub fn decode_block(bytes: &[u8], start_address: u64, arch: GuestArch) -> AppRes
                     0xAE => {
                         let (modrm, consumed) = parse_modrm(bytes, local, arch, rex, address_size_32)?;
                         local += consumed;
-                        if !matches!(modrm.reg, 2 | 3) || modrm.mod_bits == 0b11 {
-                            return Err(AppError::new(
-                                ReasonCode::RcUnimplInsn,
-                                format!("unsupported opcode 0x0f 0xae /{}", modrm.reg),
-                            ));
-                        }
-                        let Operand::Memory(address_operand) = modrm_operand(
-                            &modrm,
-                            arch,
-                            &prefixes,
-                            address + (local - cursor) as u64,
-                        ) else {
-                            return Err(AppError::new(
-                                ReasonCode::RcUnimplInsn,
-                                "opcode 0x0f 0xae /2,/3 requires a memory operand",
-                            ));
-                        };
-                        DecodedInstruction {
-                            address,
-                            size: local - cursor,
-                            prefixes,
-                            rex,
-                            opcode: if modrm.reg == 2 {
-                                DecodedOpcode::Ldmxcsr
+                        if modrm.mod_bits == 0b11 {
+                            if matches!((modrm.reg, modrm.rm_register()), (5 | 6 | 7, 0)) {
+                                DecodedInstruction {
+                                    address,
+                                    size: local - cursor,
+                                    prefixes,
+                                    rex,
+                                    opcode: DecodedOpcode::Nop,
+                                    operands: Vec::new(),
+                                    precise_faulting_memory: false,
+                                }
                             } else {
-                                DecodedOpcode::Stmxcsr
-                            },
-                            operands: vec![Operand::Memory(address_operand)],
-                            precise_faulting_memory: true,
+                                return Err(AppError::new(
+                                    ReasonCode::RcUnimplInsn,
+                                    format!("unsupported opcode 0x0f 0xae /{}", modrm.reg),
+                                ));
+                            }
+                        } else {
+                            if !matches!(modrm.reg, 2 | 3) {
+                                return Err(AppError::new(
+                                    ReasonCode::RcUnimplInsn,
+                                    format!("unsupported opcode 0x0f 0xae /{}", modrm.reg),
+                                ));
+                            }
+                            let Operand::Memory(address_operand) = modrm_operand(
+                                &modrm,
+                                arch,
+                                &prefixes,
+                                address + (local - cursor) as u64,
+                            ) else {
+                                return Err(AppError::new(
+                                    ReasonCode::RcUnimplInsn,
+                                    "opcode 0x0f 0xae /2,/3 requires a memory operand",
+                                ));
+                            };
+                            DecodedInstruction {
+                                address,
+                                size: local - cursor,
+                                prefixes,
+                                rex,
+                                opcode: if modrm.reg == 2 {
+                                    DecodedOpcode::Ldmxcsr
+                                } else {
+                                    DecodedOpcode::Stmxcsr
+                                },
+                                operands: vec![Operand::Memory(address_operand)],
+                                precise_faulting_memory: true,
+                            }
                         }
                     }
                     0x42 | 0x43 | 0x44 | 0x45 | 0x46 | 0x47 | 0x48 | 0x49 | 0x4C | 0x4D | 0x4E | 0x4F => {
@@ -3844,12 +4802,14 @@ pub fn decode_block(bytes: &[u8], start_address: u64, arch: GuestArch) -> AppRes
                             precise_faulting_memory: modrm.mod_bits != 0b11,
                         }
                     }
-                    0x82 | 0x83 | 0x84 | 0x85 | 0x86 | 0x87 | 0x88 | 0x89 | 0x8C | 0x8D | 0x8E | 0x8F => {
+                    0x80 | 0x81 | 0x82 | 0x83 | 0x84 | 0x85 | 0x86 | 0x87 | 0x88 | 0x89 | 0x8C | 0x8D | 0x8E | 0x8F => {
                         let displacement = read_i32(bytes, local)?;
                         local += 4;
                         let fallthrough = address + (local - cursor) as u64;
                         let target = (fallthrough as i128 + displacement as i128) as u64;
                         let condition = match next {
+                            0x80 => 12,
+                            0x81 => 13,
                             0x82 => 2,
                             0x83 => 3,
                             0x87 => 4,
@@ -3957,13 +4917,17 @@ pub fn decode_block(bytes: &[u8], start_address: u64, arch: GuestArch) -> AppRes
                             precise_faulting_memory: false,
                         }
                     }
-                    0x92 | 0x93 | 0x94 | 0x95 | 0x96 | 0x97 | 0x98 | 0x99 | 0x9C | 0x9D | 0x9E | 0x9F => {
+                    0xBC
+                        if !prefixes.contains(&InstructionPrefix::OperandSize)
+                            && !prefixes.contains(&InstructionPrefix::Rep)
+                            && !prefixes.contains(&InstructionPrefix::Repne) =>
+                    {
                         let (modrm, consumed) = parse_modrm(bytes, local, arch, rex, address_size_32)?;
                         local += consumed;
                         if modrm.mod_bits != 0b11 {
                             return Err(AppError::new(
                                 ReasonCode::RcUnimplInsn,
-                                "SETcc currently requires register operands",
+                                "BSF currently requires register operands",
                             ));
                         }
                         DecodedInstruction {
@@ -3971,9 +4935,28 @@ pub fn decode_block(bytes: &[u8], start_address: u64, arch: GuestArch) -> AppRes
                             size: local - cursor,
                             prefixes,
                             rex,
-                            opcode: DecodedOpcode::Setcc,
+                            opcode: DecodedOpcode::Bsf,
                             operands: vec![
-                                Operand::ImmediateU64(match next {
+                                Operand::Register(Register::from_modrm(modrm.reg)),
+                                Operand::Register(Register::from_modrm(modrm.rm_register())),
+                            ],
+                            precise_faulting_memory: false,
+                        }
+                    }
+                    0x90 | 0x91 | 0x92 | 0x93 | 0x94 | 0x95 | 0x96 | 0x97 | 0x98 | 0x99 | 0x9C | 0x9D | 0x9E | 0x9F => {
+                        let (modrm, consumed) = parse_modrm(bytes, local, arch, rex, address_size_32)?;
+                        local += consumed;
+                        let rm_operand = modrm_operand(&modrm, arch, &prefixes, address + (local - cursor) as u64);
+                        DecodedInstruction {
+                            address,
+                            size: local - cursor,
+                            prefixes,
+                            rex,
+                            opcode: DecodedOpcode::Setcc,
+                            operands: {
+                                let condition = Operand::ImmediateU64(match next {
+                                    0x90 => 12,
+                                    0x91 => 13,
                                     0x92 => 2,
                                     0x93 => 3,
                                     0x97 => 4,
@@ -3987,10 +4970,17 @@ pub fn decode_block(bytes: &[u8], start_address: u64, arch: GuestArch) -> AppRes
                                     0x94 => 0,
                                     0x95 => 1,
                                     _ => unreachable!("covered setcc opcode"),
-                                }),
-                                Operand::Register8(ByteRegister::from_modrm(modrm.rm_register())),
-                            ],
-                            precise_faulting_memory: false,
+                                });
+                                match rm_operand {
+                                    Operand::Register(_) => vec![
+                                        condition,
+                                        Operand::Register8(ByteRegister::from_modrm(modrm.rm_register(), rex, arch)),
+                                    ],
+                                    Operand::Memory(address_operand) => vec![condition, Operand::Memory(address_operand)],
+                                    other => panic!("unexpected rm operand for setcc: {other:?}"),
+                                }
+                            },
+                            precise_faulting_memory: modrm.mod_bits != 0b11,
                         }
                     }
                     0x1F => {
@@ -4028,13 +5018,25 @@ pub fn decode_block(bytes: &[u8], start_address: u64, arch: GuestArch) -> AppRes
                             precise_faulting_memory: false,
                         }
                     }
-                    0x70 if prefixes.contains(&InstructionPrefix::OperandSize) => {
+                    0x70
+                        if prefixes.contains(&InstructionPrefix::OperandSize)
+                            || prefixes.contains(&InstructionPrefix::Repne) =>
+                    {
+                        let opcode = if prefixes.contains(&InstructionPrefix::OperandSize) {
+                            DecodedOpcode::Pshufd
+                        } else {
+                            DecodedOpcode::Pshuflw
+                        };
                         let (modrm, consumed) = parse_modrm(bytes, local, arch, rex, address_size_32)?;
                         local += consumed;
                         if modrm.mod_bits != 0b11 {
                             return Err(AppError::new(
                                 ReasonCode::RcUnimplInsn,
-                                "PSHUFD currently requires register operands",
+                                if prefixes.contains(&InstructionPrefix::OperandSize) {
+                                    "PSHUFD currently requires register operands"
+                                } else {
+                                    "PSHUFLW currently requires register operands"
+                                },
                             ));
                         }
                         let imm = read_immediate(bytes, local, 1)? as u8;
@@ -4044,9 +5046,75 @@ pub fn decode_block(bytes: &[u8], start_address: u64, arch: GuestArch) -> AppRes
                             size: local - cursor,
                             prefixes,
                             rex,
-                            opcode: DecodedOpcode::Pshufd,
+                            opcode,
                             operands: vec![Operand::Xmm(modrm.reg), Operand::Xmm(modrm.rm), Operand::ImmediateU64(imm.into())],
                             precise_faulting_memory: false,
+                        }
+                    }
+                    0x16
+                        if !prefixes.contains(&InstructionPrefix::OperandSize)
+                            && !prefixes.contains(&InstructionPrefix::Rep)
+                            && !prefixes.contains(&InstructionPrefix::Repne) =>
+                    {
+                        let (modrm, consumed) = parse_modrm(bytes, local, arch, rex, address_size_32)?;
+                        local += consumed;
+                        if modrm.mod_bits != 0b11 {
+                            return Err(AppError::new(
+                                ReasonCode::RcUnimplInsn,
+                                "MOVHPS currently requires register operands",
+                            ));
+                        }
+                        DecodedInstruction {
+                            address,
+                            size: local - cursor,
+                            prefixes,
+                            rex,
+                            opcode: DecodedOpcode::Movlhps,
+                            operands: vec![Operand::Xmm(modrm.reg), Operand::Xmm(modrm.rm)],
+                            precise_faulting_memory: false,
+                        }
+                    }
+                    0x10 | 0x11 if prefixes.contains(&InstructionPrefix::Rep) || prefixes.contains(&InstructionPrefix::Repne) => {
+                        let (modrm, consumed) = parse_modrm(bytes, local, arch, rex, address_size_32)?;
+                        local += consumed;
+                        let source = if next == 0x10 {
+                            if modrm.mod_bits == 0b11 {
+                                Operand::Xmm(modrm.rm)
+                            } else {
+                                modrm_operand(&modrm, arch, &prefixes, address + (local - cursor) as u64)
+                            }
+                        } else {
+                            Operand::Xmm(modrm.reg)
+                        };
+                        let destination = if next == 0x10 {
+                            Operand::Xmm(modrm.reg)
+                        } else if modrm.mod_bits == 0b11 {
+                            Operand::Xmm(modrm.rm)
+                        } else {
+                            modrm_operand(&modrm, arch, &prefixes, address + (local - cursor) as u64)
+                        };
+                        let precise_faulting_memory = !matches!(source, Operand::Xmm(_)) || !matches!(destination, Operand::Xmm(_));
+                        let width = if prefixes.contains(&InstructionPrefix::Rep) { 4 } else { 8 };
+                        if matches!(source, Operand::Memory(_)) || matches!(destination, Operand::Memory(_)) {
+                            DecodedInstruction {
+                                address,
+                                size: local - cursor,
+                                prefixes,
+                                rex,
+                                opcode: DecodedOpcode::VectorMove,
+                                operands: vec![destination, source, Operand::ImmediateU64(width)],
+                                precise_faulting_memory,
+                            }
+                        } else {
+                            DecodedInstruction {
+                                address,
+                                size: local - cursor,
+                                prefixes,
+                                rex,
+                                opcode: DecodedOpcode::XmmMove,
+                                operands: vec![destination, source],
+                                precise_faulting_memory,
+                            }
                         }
                     }
                     0x10 | 0x11 | 0x28 | 0x29 | 0x6F | 0x7F => {
@@ -4235,6 +5303,77 @@ pub fn decode_block(bytes: &[u8], start_address: u64, arch: GuestArch) -> AppRes
                             rex,
                             opcode: DecodedOpcode::Comiss,
                             operands: vec![Operand::Xmm(modrm.reg), rhs],
+                            precise_faulting_memory,
+                        }
+                    }
+                    0x74 if prefixes.contains(&InstructionPrefix::OperandSize) => {
+                        let (modrm, consumed) = parse_modrm(bytes, local, arch, rex, address_size_32)?;
+                        local += consumed;
+                        let rhs = if modrm.mod_bits == 0b11 {
+                            Operand::Xmm(modrm.rm)
+                        } else {
+                            modrm_operand(&modrm, arch, &prefixes, address + (local - cursor) as u64)
+                        };
+                        let precise_faulting_memory = !matches!(rhs, Operand::Xmm(_));
+                        DecodedInstruction {
+                            address,
+                            size: local - cursor,
+                            prefixes,
+                            rex,
+                            opcode: DecodedOpcode::VectorCompareEqBytes,
+                            operands: vec![
+                                Operand::Xmm(modrm.reg),
+                                Operand::Xmm(modrm.reg),
+                                rhs.clone(),
+                                Operand::ImmediateU64(16),
+                            ],
+                            precise_faulting_memory,
+                        }
+                    }
+                    0xD7 if prefixes.contains(&InstructionPrefix::OperandSize) => {
+                        let (modrm, consumed) = parse_modrm(bytes, local, arch, rex, address_size_32)?;
+                        local += consumed;
+                        if modrm.mod_bits != 0b11 {
+                            return Err(AppError::new(
+                                ReasonCode::RcUnimplInsn,
+                                "PMOVMSKB currently requires a register source",
+                            ));
+                        }
+                        DecodedInstruction {
+                            address,
+                            size: local - cursor,
+                            prefixes,
+                            rex,
+                            opcode: DecodedOpcode::VectorMoveMaskBytes,
+                            operands: vec![
+                                Operand::Register(Register::from_modrm(modrm.reg)),
+                                Operand::Xmm(modrm.rm),
+                                Operand::ImmediateU64(16),
+                            ],
+                            precise_faulting_memory: false,
+                        }
+                    }
+                    0xEB if prefixes.contains(&InstructionPrefix::OperandSize) => {
+                        let (modrm, consumed) = parse_modrm(bytes, local, arch, rex, address_size_32)?;
+                        local += consumed;
+                        let rhs = if modrm.mod_bits == 0b11 {
+                            Operand::Xmm(modrm.rm)
+                        } else {
+                            modrm_operand(&modrm, arch, &prefixes, address + (local - cursor) as u64)
+                        };
+                        let precise_faulting_memory = !matches!(rhs, Operand::Xmm(_));
+                        DecodedInstruction {
+                            address,
+                            size: local - cursor,
+                            prefixes,
+                            rex,
+                            opcode: DecodedOpcode::VectorOr,
+                            operands: vec![
+                                Operand::Xmm(modrm.reg),
+                                Operand::Xmm(modrm.reg),
+                                rhs.clone(),
+                                Operand::ImmediateU64(16),
+                            ],
                             precise_faulting_memory,
                         }
                     }
@@ -4674,6 +5813,66 @@ pub fn decode_block(bytes: &[u8], start_address: u64, arch: GuestArch) -> AppRes
                     }
                 }
             }
+            0xFE => {
+                let (modrm, consumed) = parse_modrm(bytes, local, arch, rex, address_size_32)?;
+                local += consumed;
+                match modrm.reg {
+                    0 => match modrm_operand(&modrm, arch, &prefixes, address + (local - cursor) as u64) {
+                        Operand::Register(_) if modrm.mod_bits == 0b11 => DecodedInstruction {
+                            address,
+                            size: local - cursor,
+                            prefixes,
+                            rex,
+                            opcode: DecodedOpcode::IncReg,
+                            operands: vec![
+                                Operand::Register8(ByteRegister::from_modrm(modrm.rm_register(), rex, arch)),
+                                Operand::ImmediateU64(1),
+                            ],
+                            precise_faulting_memory: false,
+                        },
+                        Operand::Memory(address_operand) => DecodedInstruction {
+                            address,
+                            size: local - cursor,
+                            prefixes,
+                            rex,
+                            opcode: DecodedOpcode::IncReg,
+                            operands: vec![Operand::Memory(address_operand), Operand::ImmediateU64(1)],
+                            precise_faulting_memory: true,
+                        },
+                        other => panic!("unexpected operand for opcode 0xfe /0: {other:?}"),
+                    },
+                    1 => match modrm_operand(&modrm, arch, &prefixes, address + (local - cursor) as u64) {
+                        Operand::Register(_) if modrm.mod_bits == 0b11 => DecodedInstruction {
+                            address,
+                            size: local - cursor,
+                            prefixes,
+                            rex,
+                            opcode: DecodedOpcode::DecReg,
+                            operands: vec![
+                                Operand::Register8(ByteRegister::from_modrm(modrm.rm_register(), rex, arch)),
+                                Operand::ImmediateU64(1),
+                            ],
+                            precise_faulting_memory: false,
+                        },
+                        Operand::Memory(address_operand) => DecodedInstruction {
+                            address,
+                            size: local - cursor,
+                            prefixes,
+                            rex,
+                            opcode: DecodedOpcode::DecReg,
+                            operands: vec![Operand::Memory(address_operand), Operand::ImmediateU64(1)],
+                            precise_faulting_memory: true,
+                        },
+                        other => panic!("unexpected operand for opcode 0xfe /1: {other:?}"),
+                    },
+                    other => {
+                        return Err(AppError::new(
+                            ReasonCode::RcUnimplInsn,
+                            format!("unsupported opcode 0xfe group selector {other}"),
+                        ))
+                    }
+                }
+            }
             _ => {
                 return Err(AppError::new(
                     ReasonCode::RcUnimplInsn,
@@ -4689,9 +5888,7 @@ pub fn decode_block(bytes: &[u8], start_address: u64, arch: GuestArch) -> AppRes
 }
 
 fn parse_vex_prefix(bytes: &[u8], offset: usize, arch: GuestArch) -> AppResult<Option<(VexPrefix, usize)>> {
-    if arch != GuestArch::X64 {
-        return Ok(None);
-    }
+    let _ = arch;
     match bytes.get(offset).copied() {
         Some(0xC5) => {
             let second = *bytes.get(offset + 1).ok_or_else(|| {
@@ -4865,6 +6062,64 @@ fn decode_vex_instruction(
                 precise_faulting_memory: !matches!(rhs, Operand::Xmm(_)),
             })
         }
+        0x74 => {
+            if vex.pp != 1 {
+                return Err(AppError::new(
+                    ReasonCode::RcUnimplInsn,
+                    format!("unsupported VEX byte compare prefix pp={} for opcode 0x74", vex.pp),
+                ));
+            }
+            let (modrm, consumed) = parse_modrm(bytes, local, arch, vex.rex(), address_size_32)?;
+            local += consumed;
+            let rhs = if modrm.mod_bits == 0b11 {
+                Operand::Xmm(modrm.rm)
+            } else {
+                modrm_operand(&modrm, arch, prefixes, address + (local - cursor) as u64)
+            };
+            Ok(DecodedInstruction {
+                address,
+                size: local - cursor,
+                prefixes: prefixes.to_vec(),
+                rex: vex.rex(),
+                opcode: DecodedOpcode::VectorCompareEqBytes,
+                operands: vec![
+                    Operand::Xmm(modrm.reg),
+                    Operand::Xmm(vex.vvvv),
+                    rhs.clone(),
+                    Operand::ImmediateU64(width as u64),
+                ],
+                precise_faulting_memory: !matches!(rhs, Operand::Xmm(_)),
+            })
+        }
+        0xD7 => {
+            if vex.pp != 1 {
+                return Err(AppError::new(
+                    ReasonCode::RcUnimplInsn,
+                    format!("unsupported VEX movemask prefix pp={} for opcode 0xd7", vex.pp),
+                ));
+            }
+            let (modrm, consumed) = parse_modrm(bytes, local, arch, vex.rex(), address_size_32)?;
+            local += consumed;
+            if modrm.mod_bits != 0b11 {
+                return Err(AppError::new(
+                    ReasonCode::RcUnimplInsn,
+                    "VPMOVMSKB currently requires a register source",
+                ));
+            }
+            Ok(DecodedInstruction {
+                address,
+                size: local - cursor,
+                prefixes: prefixes.to_vec(),
+                rex: vex.rex(),
+                opcode: DecodedOpcode::VectorMoveMaskBytes,
+                operands: vec![
+                    Operand::Register(Register::from_modrm(modrm.reg)),
+                    Operand::Xmm(modrm.rm),
+                    Operand::ImmediateU64(width as u64),
+                ],
+                precise_faulting_memory: false,
+            })
+        }
         other => Err(AppError::new(
             ReasonCode::RcUnimplInsn,
             format!("unsupported VEX opcode 0x{other:02x}"),
@@ -4980,6 +6235,9 @@ pub fn lower_to_ir(decoded: &[DecodedInstruction]) -> AppResult<Vec<IrInstructio
             }
             DecodedOpcode::AddReg => {
                 match instruction.operands.as_slice() {
+                    [Operand::Register8(dst), Operand::Register8(src)] => {
+                        ir.push(IrInstruction::AddReg8 { dst: *dst, src: *src });
+                    }
                     [Operand::Register(dst), src, Operand::ImmediateU64(width)] => {
                         ir.push(IrInstruction::AddOperand {
                             dst: *dst,
@@ -5059,6 +6317,25 @@ pub fn lower_to_ir(decoded: &[DecodedInstruction]) -> AppResult<Vec<IrInstructio
                         ir.push(IrInstruction::AndMemory {
                             address: *address,
                             src: *src,
+                            width: *width as usize,
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            DecodedOpcode::RolImm => {
+                match instruction.operands.as_slice() {
+                    [Operand::Register(dst), Operand::ImmediateU64(count), Operand::ImmediateU64(width)] => {
+                        ir.push(IrInstruction::RolImm {
+                            dst: *dst,
+                            count: *count as u8,
+                            width: *width as usize,
+                        });
+                    }
+                    [Operand::Memory(address), Operand::ImmediateU64(count), Operand::ImmediateU64(width)] => {
+                        ir.push(IrInstruction::RolImmMemory {
+                            address: *address,
+                            count: *count as u8,
                             width: *width as usize,
                         });
                     }
@@ -5158,6 +6435,14 @@ pub fn lower_to_ir(decoded: &[DecodedInstruction]) -> AppResult<Vec<IrInstructio
                     });
                 }
             }
+            DecodedOpcode::RolCl => {
+                if let [Operand::Register(dst), Operand::ImmediateU64(width)] = instruction.operands.as_slice() {
+                    ir.push(IrInstruction::RolCl {
+                        dst: *dst,
+                        width: *width as usize,
+                    });
+                }
+            }
             DecodedOpcode::RorCl => {
                 if let [Operand::Register(dst), Operand::ImmediateU64(width)] = instruction.operands.as_slice() {
                     ir.push(IrInstruction::RorCl {
@@ -5244,6 +6529,14 @@ pub fn lower_to_ir(decoded: &[DecodedInstruction]) -> AppResult<Vec<IrInstructio
                     });
                 }
             }
+            DecodedOpcode::MulAcc => {
+                if let [src, Operand::ImmediateU64(width)] = instruction.operands.as_slice() {
+                    ir.push(IrInstruction::MulAcc {
+                        src: compare_operand(src.clone()),
+                        width: *width as usize,
+                    });
+                }
+            }
             DecodedOpcode::ImulAcc => {
                 if let [src, Operand::ImmediateU64(width)] = instruction.operands.as_slice() {
                     ir.push(IrInstruction::ImulAcc {
@@ -5291,11 +6584,17 @@ pub fn lower_to_ir(decoded: &[DecodedInstruction]) -> AppResult<Vec<IrInstructio
                 }
             }
             DecodedOpcode::Not => {
-                if let [Operand::Register(dst), Operand::ImmediateU64(width)] = instruction.operands.as_slice() {
-                    ir.push(IrInstruction::NotReg {
-                        dst: *dst,
-                        width: *width as usize,
-                    });
+                match instruction.operands.as_slice() {
+                    [Operand::Register(dst), Operand::ImmediateU64(width)] => {
+                        ir.push(IrInstruction::NotReg {
+                            dst: *dst,
+                            width: *width as usize,
+                        });
+                    }
+                    [Operand::Register8(dst)] => {
+                        ir.push(IrInstruction::NotReg8 { dst: *dst });
+                    }
+                    _ => {}
                 }
             }
             DecodedOpcode::Movs => {
@@ -5346,6 +6645,14 @@ pub fn lower_to_ir(decoded: &[DecodedInstruction]) -> AppResult<Vec<IrInstructio
                         dst: *dst,
                         src: compare_operand(src.clone()),
                         width: *width as usize,
+                    });
+                }
+            }
+            DecodedOpcode::SbbReg8 => {
+                if let [Operand::Register8(dst), src] = instruction.operands.as_slice() {
+                    ir.push(IrInstruction::SbbReg8 {
+                        dst: *dst,
+                        src: compare_operand(src.clone()),
                     });
                 }
             }
@@ -5489,6 +6796,9 @@ pub fn lower_to_ir(decoded: &[DecodedInstruction]) -> AppResult<Vec<IrInstructio
                             width: *width as usize,
                         });
                     }
+                    [Operand::Register8(dst), Operand::ImmediateU64(_)] => {
+                        ir.push(IrInstruction::IncReg8 { dst: *dst });
+                    }
                     [Operand::Memory(address), Operand::ImmediateU64(width)] => {
                         ir.push(IrInstruction::IncMemory {
                             address: *address,
@@ -5505,6 +6815,9 @@ pub fn lower_to_ir(decoded: &[DecodedInstruction]) -> AppResult<Vec<IrInstructio
                             dst: *dst,
                             width: *width as usize,
                         });
+                    }
+                    [Operand::Register8(dst), Operand::ImmediateU64(_)] => {
+                        ir.push(IrInstruction::DecReg8 { dst: *dst });
                     }
                     [Operand::Memory(address), Operand::ImmediateU64(width)] => {
                         ir.push(IrInstruction::DecMemory {
@@ -5606,11 +6919,19 @@ pub fn lower_to_ir(decoded: &[DecodedInstruction]) -> AppResult<Vec<IrInstructio
                 }
             }
             DecodedOpcode::Setcc => {
-                if let [Operand::ImmediateU64(condition), Operand::Register8(dst)] = instruction.operands.as_slice() {
-                    ir.push(IrInstruction::Setcc {
-                        condition: decode_condition(*condition)?,
-                        dst: *dst,
-                    });
+                if let [Operand::ImmediateU64(condition), dst] = instruction.operands.as_slice() {
+                    let condition = decode_condition(*condition)?;
+                    match dst {
+                        Operand::Register8(dst) => ir.push(IrInstruction::Setcc {
+                            condition,
+                            dst: *dst,
+                        }),
+                        Operand::Memory(address) => ir.push(IrInstruction::SetccMemory {
+                            condition,
+                            address: *address,
+                        }),
+                        _ => {}
+                    }
                 }
             }
             DecodedOpcode::Ldmxcsr => {
@@ -5667,11 +6988,34 @@ pub fn lower_to_ir(decoded: &[DecodedInstruction]) -> AppResult<Vec<IrInstructio
                     });
                 }
             }
+            DecodedOpcode::PushFlags => {
+                if let [Operand::ImmediateU64(width)] = instruction.operands.as_slice() {
+                    ir.push(IrInstruction::PushFlags {
+                        width: *width as usize,
+                    });
+                }
+            }
             DecodedOpcode::PopReg => {
                 if let [Operand::Register(dst)] = instruction.operands.as_slice() {
                     ir.push(IrInstruction::PopReg { dst: *dst });
                 }
             }
+            DecodedOpcode::PopMemory => {
+                if let [Operand::Memory(address), Operand::ImmediateU64(width)] = instruction.operands.as_slice() {
+                    ir.push(IrInstruction::PopMemory {
+                        address: *address,
+                        width: *width as usize,
+                    });
+                }
+            }
+            DecodedOpcode::PopFlags => {
+                if let [Operand::ImmediateU64(width)] = instruction.operands.as_slice() {
+                    ir.push(IrInstruction::PopFlags {
+                        width: *width as usize,
+                    });
+                }
+            }
+            DecodedOpcode::Cld => ir.push(IrInstruction::Cld),
             DecodedOpcode::Leave => ir.push(IrInstruction::Leave),
             DecodedOpcode::Ret => {
                 let stack_adjust = match instruction.operands.as_slice() {
@@ -5697,6 +7041,14 @@ pub fn lower_to_ir(decoded: &[DecodedInstruction]) -> AppResult<Vec<IrInstructio
                     });
                 }
             }
+            DecodedOpcode::Bsf => {
+                if let [Operand::Register(dst), Operand::Register(src)] = instruction.operands.as_slice() {
+                    ir.push(IrInstruction::Bsf {
+                        dst: *dst,
+                        src: *src,
+                    });
+                }
+            }
             DecodedOpcode::MovdToXmm => {
                 if let [Operand::Xmm(dst), Operand::Register(src)] = instruction.operands.as_slice() {
                     ir.push(IrInstruction::MovdToXmm { dst: *dst, src: *src });
@@ -5714,6 +7066,20 @@ pub fn lower_to_ir(decoded: &[DecodedInstruction]) -> AppResult<Vec<IrInstructio
                         src: *src,
                         imm: *imm as u8,
                     });
+                }
+            }
+            DecodedOpcode::Pshuflw => {
+                if let [Operand::Xmm(dst), Operand::Xmm(src), Operand::ImmediateU64(imm)] = instruction.operands.as_slice() {
+                    ir.push(IrInstruction::Pshuflw {
+                        dst: *dst,
+                        src: *src,
+                        imm: *imm as u8,
+                    });
+                }
+            }
+            DecodedOpcode::Movlhps => {
+                if let [Operand::Xmm(dst), Operand::Xmm(src)] = instruction.operands.as_slice() {
+                    ir.push(IrInstruction::Movlhps { dst: *dst, src: *src });
                 }
             }
             DecodedOpcode::XmmMove => match instruction.operands.as_slice() {
@@ -5763,6 +7129,23 @@ pub fn lower_to_ir(decoded: &[DecodedInstruction]) -> AppResult<Vec<IrInstructio
                     ir.push(IrInstruction::Pxor { dst: *dst, src: *src });
                 }
             }
+            DecodedOpcode::VectorOr => {
+                if let [Operand::Xmm(dst), Operand::Xmm(lhs), rhs, Operand::ImmediateU64(width)] = instruction.operands.as_slice() {
+                    let rhs = match rhs {
+                        Operand::Xmm(src) => Some(VectorOperand::Register(*src)),
+                        Operand::Memory(address) => Some(VectorOperand::Memory(*address)),
+                        _ => None,
+                    };
+                    if let Some(rhs) = rhs {
+                        ir.push(IrInstruction::VectorOr {
+                            dst: *dst,
+                            lhs: *lhs,
+                            rhs,
+                            width: *width as usize,
+                        });
+                    }
+                }
+            }
             DecodedOpcode::VectorXor => {
                 if let [Operand::Xmm(dst), Operand::Xmm(lhs), rhs, Operand::ImmediateU64(width)] = instruction.operands.as_slice() {
                     let rhs = match rhs {
@@ -5803,6 +7186,32 @@ pub fn lower_to_ir(decoded: &[DecodedInstruction]) -> AppResult<Vec<IrInstructio
                 }
             }
             DecodedOpcode::VzeroUpper => ir.push(IrInstruction::VzeroUpper),
+            DecodedOpcode::VectorCompareEqBytes => {
+                if let [Operand::Xmm(dst), Operand::Xmm(lhs), rhs, Operand::ImmediateU64(width)] = instruction.operands.as_slice() {
+                    let rhs = match rhs {
+                        Operand::Xmm(src) => Some(VectorOperand::Register(*src)),
+                        Operand::Memory(address) => Some(VectorOperand::Memory(*address)),
+                        _ => None,
+                    };
+                    if let Some(rhs) = rhs {
+                        ir.push(IrInstruction::VectorCompareEqBytes {
+                            dst: *dst,
+                            lhs: *lhs,
+                            rhs,
+                            width: *width as usize,
+                        });
+                    }
+                }
+            }
+            DecodedOpcode::VectorMoveMaskBytes => {
+                if let [Operand::Register(dst), Operand::Xmm(src), Operand::ImmediateU64(width)] = instruction.operands.as_slice() {
+                    ir.push(IrInstruction::VectorMoveMaskBytes {
+                        dst: *dst,
+                        src: *src,
+                        width: *width as usize,
+                    });
+                }
+            }
             DecodedOpcode::Fnclex => ir.push(IrInstruction::X87ClearExceptions),
             DecodedOpcode::FldConst => {
                 if let [Operand::ImmediateU64(bits)] = instruction.operands.as_slice() {
@@ -5811,9 +7220,51 @@ pub fn lower_to_ir(decoded: &[DecodedInstruction]) -> AppResult<Vec<IrInstructio
                     });
                 }
             }
+            DecodedOpcode::FildI32 => {
+                if let [Operand::Memory(address)] = instruction.operands.as_slice() {
+                    ir.push(IrInstruction::X87LoadInt32 { address: *address });
+                }
+            }
+            DecodedOpcode::FildI64 => {
+                if let [Operand::Memory(address)] = instruction.operands.as_slice() {
+                    ir.push(IrInstruction::X87LoadInt64 { address: *address });
+                }
+            }
+            DecodedOpcode::Fchs => ir.push(IrInstruction::X87NegateTop),
+            DecodedOpcode::FldReal32 => {
+                if let [Operand::Memory(address)] = instruction.operands.as_slice() {
+                    ir.push(IrInstruction::X87Load {
+                        address: *address,
+                        width: 4,
+                    });
+                }
+            }
+            DecodedOpcode::FldReal64 => {
+                if let [Operand::Memory(address)] = instruction.operands.as_slice() {
+                    ir.push(IrInstruction::X87Load {
+                        address: *address,
+                        width: 8,
+                    });
+                }
+            }
             DecodedOpcode::Fldcw => {
                 if let [Operand::Memory(address)] = instruction.operands.as_slice() {
                     ir.push(IrInstruction::X87LoadControlWord { address: *address });
+                }
+            }
+            DecodedOpcode::FdivReal64 => {
+                if let [Operand::Memory(address)] = instruction.operands.as_slice() {
+                    ir.push(IrInstruction::X87DivMemory {
+                        address: *address,
+                        width: 8,
+                    });
+                }
+            }
+            DecodedOpcode::Fxch => {
+                if let [Operand::ImmediateU64(index)] = instruction.operands.as_slice() {
+                    ir.push(IrInstruction::X87Swap {
+                        index: *index as usize,
+                    });
                 }
             }
             DecodedOpcode::Cvtpd2ps => {
@@ -5897,9 +7348,70 @@ pub fn lower_to_ir(decoded: &[DecodedInstruction]) -> AppResult<Vec<IrInstructio
                     ir.push(IrInstruction::X87StoreControlWord { address: *address });
                 }
             }
+            DecodedOpcode::FstReal32 => {
+                if let [Operand::Memory(address)] = instruction.operands.as_slice() {
+                    ir.push(IrInstruction::X87Store {
+                        address: *address,
+                        width: 4,
+                        pop: false,
+                    });
+                }
+            }
+            DecodedOpcode::FstpReal32 => {
+                if let [Operand::Memory(address)] = instruction.operands.as_slice() {
+                    ir.push(IrInstruction::X87Store {
+                        address: *address,
+                        width: 4,
+                        pop: true,
+                    });
+                }
+            }
+            DecodedOpcode::FstpSt => {
+                if let [Operand::ImmediateU64(index)] = instruction.operands.as_slice() {
+                    ir.push(IrInstruction::X87StorePopRegister {
+                        index: *index as usize,
+                    });
+                }
+            }
             DecodedOpcode::FstpReal => {
                 if let [Operand::Memory(address)] = instruction.operands.as_slice() {
                     ir.push(IrInstruction::X87StorePop { address: *address });
+                }
+            }
+            DecodedOpcode::Faddp => {
+                if let [Operand::ImmediateU64(index)] = instruction.operands.as_slice() {
+                    ir.push(IrInstruction::X87AddPop {
+                        index: *index as usize,
+                    });
+                }
+            }
+            DecodedOpcode::FmulReal64 => {
+                if let [Operand::Memory(address)] = instruction.operands.as_slice() {
+                    ir.push(IrInstruction::X87MulMemory {
+                        address: *address,
+                        width: 8,
+                    });
+                }
+            }
+            DecodedOpcode::Fmul => {
+                if let [Operand::ImmediateU64(index)] = instruction.operands.as_slice() {
+                    ir.push(IrInstruction::X87Mul {
+                        index: *index as usize,
+                    });
+                }
+            }
+            DecodedOpcode::Fdiv => {
+                if let [Operand::ImmediateU64(index)] = instruction.operands.as_slice() {
+                    ir.push(IrInstruction::X87DivRegister {
+                        index: *index as usize,
+                    });
+                }
+            }
+            DecodedOpcode::Fdivp => {
+                if let [Operand::ImmediateU64(index)] = instruction.operands.as_slice() {
+                    ir.push(IrInstruction::X87DivPop {
+                        index: *index as usize,
+                    });
                 }
             }
             DecodedOpcode::Fninit => ir.push(IrInstruction::X87Init),
@@ -6011,6 +7523,13 @@ fn execute_ir_with_hashing(
                 state.set(*dst, merge_register_result(state.get(*dst), result, *width));
                 state.flags = add_flags(lhs, rhs, result, *width * 8);
             }
+            IrInstruction::AddReg8 { dst, src } => {
+                let lhs = state.get_byte(*dst);
+                let rhs = state.get_byte(*src);
+                let result = lhs.wrapping_add(rhs);
+                state.set_byte(*dst, result);
+                state.flags = add_flags(u64::from(lhs), u64::from(rhs), u64::from(result), 8);
+            }
             IrInstruction::AdcImm { dst, value, width } => {
                 let mask = width_mask(*width);
                 let lhs = state.get(*dst) & mask;
@@ -6037,11 +7556,10 @@ fn execute_ir_with_hashing(
                 state.flags = add_flags(lhs, rhs, result, *width * 8);
             }
             IrInstruction::AddMemory { address, src, width } => {
-                let mask = width_mask(*width);
                 let target = resolve_memory_operand(state, address, *width)?;
-                let lhs = read_memory_value(memory, target, *width)? & mask;
-                let rhs = state.get(*src) & mask;
-                let result = lhs.wrapping_add(rhs) & mask;
+                let lhs = read_memory_value(memory, target, *width)? & width_mask(*width);
+                let rhs = state.get(*src) & width_mask(*width);
+                let result = lhs.wrapping_add(rhs) & width_mask(*width);
                 write_memory_value(memory, target, result, *width)?;
                 state.flags = add_flags(lhs, rhs, result, *width * 8);
             }
@@ -6260,6 +7778,20 @@ fn execute_ir_with_hashing(
                     false,
                 )?;
             }
+            IrInstruction::RolCl { dst, width } => {
+                let count = state.get_byte(ByteRegister::Cl);
+                execute_ir_with_hashing(
+                    state,
+                    memory,
+                    &[IrInstruction::RolImm {
+                        dst: *dst,
+                        count,
+                        width: *width,
+                    }],
+                    virtualization,
+                    false,
+                )?;
+            }
             IrInstruction::RorCl { dst, width } => {
                 let bits = (*width * 8) as u32;
                 let count = u32::from(state.get_byte(ByteRegister::Cl)) & if bits == 64 { 63 } else { 31 };
@@ -6322,7 +7854,7 @@ fn execute_ir_with_hashing(
             }
             IrInstruction::ImulImm { dst, src, imm, width } => {
                 let lhs = sign_extend(read_compare_operand(state, memory, src, *width)?, *width) as i64 as i128;
-                let rhs = sign_extend(*imm, 4) as i64 as i128;
+                let rhs = sign_extend(*imm, *width) as i64 as i128;
                 let product = lhs * rhs;
                 let truncated = (product as u64) & width_mask(*width);
                 state.set(*dst, merge_register_result(state.get(*dst), truncated, *width));
@@ -6343,6 +7875,36 @@ fn execute_ir_with_hashing(
                 let truncated = (product as u64) & width_mask(*width);
                 state.set(*dst, merge_register_result(state.get(*dst), truncated, *width));
                 let overflow = product != sign_extend(truncated, *width) as i64 as i128;
+                state.flags = Flags {
+                    cf: overflow,
+                    pf: false,
+                    af: false,
+                    zf: false,
+                    sf: false,
+                    of: overflow,
+                };
+            }
+            IrInstruction::MulAcc { src, width } => {
+                let multiplicand = state.get(Register::Rax) & width_mask(*width);
+                let multiplier = read_compare_operand(state, memory, src, *width)? & width_mask(*width);
+                let product = (multiplicand as u128) * (multiplier as u128);
+                let width_bits = *width * 8;
+                let low_mask = if width_bits == 64 {
+                    u128::from(u64::MAX)
+                } else {
+                    (1_u128 << width_bits) - 1
+                };
+                let low = (product & low_mask) as u64;
+                let high = ((product >> width_bits) & low_mask) as u64;
+                state.set(
+                    Register::Rax,
+                    merge_register_result(state.get(Register::Rax), low, *width),
+                );
+                state.set(
+                    Register::Rdx,
+                    merge_register_result(state.get(Register::Rdx), high, *width),
+                );
+                let overflow = high != 0;
                 state.flags = Flags {
                     cf: overflow,
                     pf: false,
@@ -6515,6 +8077,19 @@ fn execute_ir_with_hashing(
                 state.set_byte(*dst, result);
                 state.flags = sub_flags(u64::from(lhs), u64::from(rhs), u64::from(result), 8);
             }
+            IrInstruction::SbbReg8 { dst, src } => {
+                let lhs = state.get_byte(*dst);
+                let rhs = read_compare_operand(state, memory, src, 1)? as u8;
+                let borrow = u8::from(state.flags.cf);
+                let result = lhs.wrapping_sub(rhs).wrapping_sub(borrow);
+                state.set_byte(*dst, result);
+                state.flags = sub_flags(
+                    u64::from(lhs),
+                    u64::from(rhs).wrapping_add(u64::from(borrow)),
+                    u64::from(result),
+                    8,
+                );
+            }
             IrInstruction::NegReg { dst, width } => {
                 let original = state.get(*dst) & width_mask(*width);
                 let result = 0_u64.wrapping_sub(original) & width_mask(*width);
@@ -6530,6 +8105,10 @@ fn execute_ir_with_hashing(
             IrInstruction::NotReg { dst, width } => {
                 let result = (!state.get(*dst)) & width_mask(*width);
                 state.set(*dst, merge_register_result(state.get(*dst), result, *width));
+            }
+            IrInstruction::NotReg8 { dst } => {
+                let result = !state.get_byte(*dst);
+                state.set_byte(*dst, result);
             }
             IrInstruction::Movs { width, repeat } => {
                 let count = if *repeat {
@@ -6700,6 +8279,49 @@ fn execute_ir_with_hashing(
                 state.set_byte(*dst, result);
                 state.flags = logic_flags(result as u64, 8);
             }
+            IrInstruction::RolImm { dst, count, width } => {
+                let bits = (*width * 8) as u32;
+                let rotate = if bits == 0 {
+                    0
+                } else {
+                    (u32::from(*count) & if bits == 64 { 63 } else { 31 }) % bits
+                };
+                if rotate != 0 {
+                    let mask = width_mask(*width);
+                    let value = state.get(*dst) & mask;
+                    let result = ((value << rotate) | (value >> (bits - rotate))) & mask;
+                    state.set(*dst, merge_register_result(state.get(*dst), result, *width));
+                    let mut flags = state.flags;
+                    flags.cf = (result & 1) != 0;
+                    if rotate == 1 {
+                        let msb = (result >> (bits - 1)) & 1;
+                        flags.of = (msb ^ u64::from(flags.cf)) != 0;
+                    }
+                    state.flags = flags;
+                }
+            }
+            IrInstruction::RolImmMemory { address, count, width } => {
+                let bits = (*width * 8) as u32;
+                let rotate = if bits == 0 {
+                    0
+                } else {
+                    (u32::from(*count) & if bits == 64 { 63 } else { 31 }) % bits
+                };
+                if rotate != 0 {
+                    let mask = width_mask(*width);
+                    let target = resolve_memory_operand(state, address, *width)?;
+                    let value = read_memory_value(memory, target, *width)? & mask;
+                    let result = ((value << rotate) | (value >> (bits - rotate))) & mask;
+                    write_memory_value(memory, target, result, *width)?;
+                    let mut flags = state.flags;
+                    flags.cf = (result & 1) != 0;
+                    if rotate == 1 {
+                        let msb = (result >> (bits - 1)) & 1;
+                        flags.of = (msb ^ u64::from(flags.cf)) != 0;
+                    }
+                    state.flags = flags;
+                }
+            }
             IrInstruction::AndReg8 { dst, src } => {
                 let result = state.get_byte(*dst) & state.get_byte(*src);
                 state.set_byte(*dst, result);
@@ -6770,6 +8392,22 @@ fn execute_ir_with_hashing(
                 let carry = state.flags.cf;
                 state.set(*dst, merge_register_result(state.get(*dst), result, *width));
                 state.flags = sub_flags(lhs, 1, result, *width * 8);
+                state.flags.cf = carry;
+            }
+            IrInstruction::IncReg8 { dst } => {
+                let lhs = state.get_byte(*dst);
+                let result = lhs.wrapping_add(1);
+                let carry = state.flags.cf;
+                state.set_byte(*dst, result);
+                state.flags = add_flags(u64::from(lhs), 1, u64::from(result), 8);
+                state.flags.cf = carry;
+            }
+            IrInstruction::DecReg8 { dst } => {
+                let lhs = state.get_byte(*dst);
+                let result = lhs.wrapping_sub(1);
+                let carry = state.flags.cf;
+                state.set_byte(*dst, result);
+                state.flags = sub_flags(u64::from(lhs), 1, u64::from(result), 8);
                 state.flags.cf = carry;
             }
             IrInstruction::IncMemory { address, width } => {
@@ -6853,6 +8491,10 @@ fn execute_ir_with_hashing(
             IrInstruction::Setcc { condition, dst } => {
                 state.set_byte(*dst, condition_holds(state.flags, *condition) as u8);
             }
+            IrInstruction::SetccMemory { condition, address } => {
+                let target = resolve_memory_operand(state, address, 1)?;
+                write_memory_value(memory, target, condition_holds(state.flags, *condition) as u64, 1)?;
+            }
             IrInstruction::JumpIf {
                 condition,
                 target,
@@ -6887,11 +8529,32 @@ fn execute_ir_with_hashing(
                 write_memory_value(memory, next_rsp, *value, *width)?;
                 state.set(Register::Rsp, next_rsp);
             }
+            IrInstruction::PushFlags { width } => {
+                let next_rsp = state.get(Register::Rsp).wrapping_sub(*width as u64);
+                write_memory_value(memory, next_rsp, pack_eflags(state), *width)?;
+                state.set(Register::Rsp, next_rsp);
+            }
             IrInstruction::PopReg { dst } => {
                 let rsp = state.get(Register::Rsp);
                 let value = read_memory_value(memory, rsp, state.arch.pointer_bytes())?;
                 state.set(*dst, value);
                 state.set(Register::Rsp, rsp.wrapping_add(state.arch.pointer_bytes() as u64));
+            }
+            IrInstruction::PopMemory { address, width } => {
+                let rsp = state.get(Register::Rsp);
+                let value = read_memory_value(memory, rsp, *width)?;
+                let target = resolve_memory_operand(state, address, *width)?;
+                write_memory_value(memory, target, value, *width)?;
+                state.set(Register::Rsp, rsp.wrapping_add(*width as u64));
+            }
+            IrInstruction::PopFlags { width } => {
+                let rsp = state.get(Register::Rsp);
+                let value = read_memory_value(memory, rsp, *width)?;
+                unpack_eflags(state, value);
+                state.set(Register::Rsp, rsp.wrapping_add(*width as u64));
+            }
+            IrInstruction::Cld => {
+                state.eflags_extra &= !(1 << 10);
             }
             IrInstruction::Leave => {
                 let frame_base = state.get(Register::Rbp);
@@ -6939,6 +8602,21 @@ fn execute_ir_with_hashing(
                     of: false,
                 };
             }
+            IrInstruction::Bsf { dst, src } => {
+                let value = state.get(*src);
+                if value == 0 {
+                    state.flags.zf = true;
+                } else {
+                    let width = (state.arch.pointer_bytes() * 8) as u32;
+                    let result = if width == 64 {
+                        value.trailing_zeros() as u64
+                    } else {
+                        (value as u32).trailing_zeros() as u64
+                    };
+                    state.set(*dst, result);
+                    state.flags.zf = false;
+                }
+            }
             IrInstruction::MovdToXmm { dst, src } => {
                 state.set_xmm(
                     *dst,
@@ -6961,6 +8639,24 @@ fn execute_ir_with_hashing(
                     lanes[((imm >> 6) & 0x03) as usize],
                 ];
                 state.set_xmm(*dst, u32x4_to_xmm(shuffled));
+            }
+            IrInstruction::Pshuflw { dst, src, imm } => {
+                let source = xmm_to_bytes(state.get_xmm(*src));
+                let mut shuffled = source;
+                for lane in 0..4 {
+                    let source_lane = ((imm >> (lane * 2)) & 0x03) as usize;
+                    let destination_offset = lane * 2;
+                    let source_offset = source_lane * 2;
+                    shuffled[destination_offset..destination_offset + 2]
+                        .copy_from_slice(&source[source_offset..source_offset + 2]);
+                }
+                state.set_xmm(*dst, bytes_to_xmm(shuffled));
+            }
+            IrInstruction::Movlhps { dst, src } => {
+                let mut destination = xmm_to_bytes(state.get_xmm(*dst));
+                let source = xmm_to_bytes(state.get_xmm(*src));
+                destination[8..16].copy_from_slice(&source[0..8]);
+                state.set_xmm(*dst, bytes_to_xmm(destination));
             }
             IrInstruction::MoveXmm { dst, src } => {
                 state.set_xmm(*dst, state.get_xmm(*src));
@@ -6998,6 +8694,18 @@ fn execute_ir_with_hashing(
                     },
                 );
             }
+            IrInstruction::VectorOr { dst, lhs, rhs, width } => {
+                let lhs = read_vector_register(state, *lhs, *width)?;
+                let rhs = read_vector_operand(state, memory, rhs, *width)?;
+                let lhs_bytes = ymm_to_bytes(lhs);
+                let rhs_bytes = ymm_to_bytes(rhs);
+                let byte_count = if *width == 16 { 16 } else { 32 };
+                let mut output = [0_u8; 32];
+                for index in 0..byte_count {
+                    output[index] = lhs_bytes[index] | rhs_bytes[index];
+                }
+                write_vector_register(state, *dst, bytes_to_ymm(output), *width)?;
+            }
             IrInstruction::VectorXor { dst, lhs, rhs, width } => {
                 let lhs = read_vector_register(state, *lhs, *width)?;
                 let rhs = read_vector_operand(state, memory, rhs, *width)?;
@@ -7032,6 +8740,28 @@ fn execute_ir_with_hashing(
                     output[index] = lhs_words[index].wrapping_add(rhs_words[index]);
                 }
                 write_vector_register(state, *dst, u64x4_to_ymm(output), *width)?;
+            }
+            IrInstruction::VectorCompareEqBytes { dst, lhs, rhs, width } => {
+                let lhs = read_vector_register(state, *lhs, *width)?;
+                let rhs = read_vector_operand(state, memory, rhs, *width)?;
+                let lhs_bytes = ymm_to_bytes(lhs);
+                let rhs_bytes = ymm_to_bytes(rhs);
+                let byte_count = if *width == 16 { 16 } else { 32 };
+                let mut output = [0_u8; 32];
+                for index in 0..byte_count {
+                    output[index] = if lhs_bytes[index] == rhs_bytes[index] { 0xff } else { 0x00 };
+                }
+                write_vector_register(state, *dst, bytes_to_ymm(output), *width)?;
+            }
+            IrInstruction::VectorMoveMaskBytes { dst, src, width } => {
+                let vector = read_vector_register(state, *src, *width)?;
+                let bytes = ymm_to_bytes(vector);
+                let byte_count = if *width == 16 { 16 } else { 32 };
+                let mut mask = 0_u64;
+                for index in 0..byte_count {
+                    mask |= u64::from((bytes[index] >> 7) & 1) << index;
+                }
+                state.set(*dst, merge_register_result(state.get(*dst), mask, 4));
             }
             IrInstruction::VzeroUpper => state.clear_all_ymm_upper(),
             IrInstruction::HaddPs { dst, src } => {
@@ -7145,6 +8875,36 @@ fn execute_ir_with_hashing(
                 state.x87.divide_by_zero = false;
                 state.x87.precision = false;
             }
+            IrInstruction::X87LoadInt32 { address } => {
+                let target = resolve_memory_operand(state, address, 4)?;
+                let value = read_memory_value(memory, target, 4)? as u32 as i32;
+                state.x87.stack.push(f64::from(value));
+            }
+            IrInstruction::X87LoadInt64 { address } => {
+                let target = resolve_memory_operand(state, address, 8)?;
+                let value = read_memory_value(memory, target, 8)? as i64;
+                state.x87.stack.push(value as f64);
+            }
+            IrInstruction::X87NegateTop => {
+                let top = state.x87.stack.last_mut().ok_or_else(|| {
+                    AppError::new(ReasonCode::RcUnimplInsn, "x87 stack underflow")
+                })?;
+                *top = -*top;
+            }
+            IrInstruction::X87Load { address, width } => {
+                let target = resolve_memory_operand(state, address, *width)?;
+                let value = match *width {
+                    4 => f32::from_bits(read_memory_value(memory, target, 4)? as u32) as f64,
+                    8 => f64::from_bits(read_memory_value(memory, target, 8)?),
+                    other => {
+                        return Err(AppError::new(
+                            ReasonCode::RcUnimplInsn,
+                            format!("unsupported x87 load width {other}"),
+                        ));
+                    }
+                };
+                state.x87.stack.push(value);
+            }
             IrInstruction::X87LoadControlWord { address } => {
                 let target = resolve_memory_operand(state, address, 2)?;
                 let control = read_memory_value(memory, target, 2)? as u16;
@@ -7155,9 +8915,91 @@ fn execute_ir_with_hashing(
                     _ => X87RoundingMode::Nearest,
                 };
             }
+            IrInstruction::X87MulMemory { address, width } => {
+                let target = resolve_memory_operand(state, address, *width)?;
+                let rhs = match *width {
+                    4 => f32::from_bits(read_memory_value(memory, target, 4)? as u32) as f64,
+                    8 => f64::from_bits(read_memory_value(memory, target, 8)?),
+                    other => {
+                        return Err(AppError::new(
+                            ReasonCode::RcUnimplInsn,
+                            format!("unsupported x87 memory multiply width {other}"),
+                        ));
+                    }
+                };
+                let lhs = state.x87.stack.pop().ok_or_else(|| {
+                    AppError::new(ReasonCode::RcUnimplInsn, "x87 stack underflow")
+                })?;
+                let result = apply_rounding(lhs * rhs, state.x87.rounding_mode);
+                state.x87.precision |= result != lhs * rhs;
+                state.x87.stack.push(result);
+            }
+            IrInstruction::X87DivMemory { address, width } => {
+                let target = resolve_memory_operand(state, address, *width)?;
+                let rhs = match *width {
+                    4 => f32::from_bits(read_memory_value(memory, target, 4)? as u32) as f64,
+                    8 => f64::from_bits(read_memory_value(memory, target, 8)?),
+                    other => {
+                        return Err(AppError::new(
+                            ReasonCode::RcUnimplInsn,
+                            format!("unsupported x87 memory divide width {other}"),
+                        ));
+                    }
+                };
+                let lhs = state.x87.stack.pop().ok_or_else(|| {
+                    AppError::new(ReasonCode::RcUnimplInsn, "x87 stack underflow")
+                })?;
+                let result = apply_rounding(lhs / rhs, state.x87.rounding_mode);
+                state.x87.precision |= result != lhs / rhs;
+                state.x87.stack.push(result);
+            }
+            IrInstruction::X87Swap { index } => {
+                let len = state.x87.stack.len();
+                let top = len.checked_sub(1).ok_or_else(|| {
+                    AppError::new(ReasonCode::RcUnimplInsn, "x87 stack underflow")
+                })?;
+                let other = len.checked_sub(1 + *index).ok_or_else(|| {
+                    AppError::new(ReasonCode::RcUnimplInsn, "x87 stack underflow")
+                })?;
+                state.x87.stack.swap(top, other);
+            }
             IrInstruction::X87StoreControlWord { address } => {
                 let target = resolve_memory_operand(state, address, 2)?;
                 write_memory_value(memory, target, u64::from(x87_control_word(&state.x87)), 2)?;
+            }
+            IrInstruction::X87Store { address, width, pop } => {
+                let target = resolve_memory_operand(state, address, *width)?;
+                let value = if *pop {
+                    state.x87.stack.pop().ok_or_else(|| {
+                        AppError::new(ReasonCode::RcUnimplInsn, "x87 stack underflow")
+                    })?
+                } else {
+                    *state.x87.stack.last().ok_or_else(|| {
+                        AppError::new(ReasonCode::RcUnimplInsn, "x87 stack underflow")
+                    })?
+                };
+                match *width {
+                    4 => write_memory_value(memory, target, u64::from((value as f32).to_bits()), 4)?,
+                    8 => write_memory_value(memory, target, value.to_bits(), 8)?,
+                    other => {
+                        return Err(AppError::new(
+                            ReasonCode::RcUnimplInsn,
+                            format!("unsupported x87 store width {other}"),
+                        ));
+                    }
+                }
+            }
+            IrInstruction::X87StorePopRegister { index } => {
+                let len = state.x87.stack.len();
+                let top = len.checked_sub(1).ok_or_else(|| {
+                    AppError::new(ReasonCode::RcUnimplInsn, "x87 stack underflow")
+                })?;
+                let other = len.checked_sub(1 + *index).ok_or_else(|| {
+                    AppError::new(ReasonCode::RcUnimplInsn, "x87 stack underflow")
+                })?;
+                let value = state.x87.stack[top];
+                state.x87.stack[other] = value;
+                state.x87.stack.pop();
             }
             IrInstruction::X87StorePop { address } => {
                 let target = resolve_memory_operand(state, address, 8)?;
@@ -7174,6 +9016,74 @@ fn execute_ir_with_hashing(
             IrInstruction::StoreMxcsr { address } => {
                 let target = resolve_memory_operand(state, address, 4)?;
                 write_memory_value(memory, target, u64::from(state.mxcsr), 4)?;
+            }
+            IrInstruction::X87AddPop { index } => {
+                let len = state.x87.stack.len();
+                let top = len.checked_sub(1).ok_or_else(|| {
+                    AppError::new(ReasonCode::RcUnimplInsn, "x87 stack underflow")
+                })?;
+                let other = len.checked_sub(1 + *index).ok_or_else(|| {
+                    AppError::new(ReasonCode::RcUnimplInsn, "x87 stack underflow")
+                })?;
+                let lhs = state.x87.stack[other];
+                let rhs = state.x87.stack[top];
+                let result = apply_rounding(lhs + rhs, state.x87.rounding_mode);
+                state.x87.precision |= result != lhs + rhs;
+                state.x87.stack[other] = result;
+                state.x87.stack.pop();
+            }
+            IrInstruction::X87Mul { index } => {
+                let len = state.x87.stack.len();
+                let top = len.checked_sub(1).ok_or_else(|| {
+                    AppError::new(ReasonCode::RcUnimplInsn, "x87 stack underflow")
+                })?;
+                let other = len.checked_sub(1 + *index).ok_or_else(|| {
+                    AppError::new(ReasonCode::RcUnimplInsn, "x87 stack underflow")
+                })?;
+                let lhs = state.x87.stack[top];
+                let rhs = state.x87.stack[other];
+                let result = apply_rounding(lhs * rhs, state.x87.rounding_mode);
+                state.x87.precision |= result != lhs * rhs;
+                state.x87.stack[top] = result;
+            }
+            IrInstruction::X87DivRegister { index } => {
+                let len = state.x87.stack.len();
+                let top = len.checked_sub(1).ok_or_else(|| {
+                    AppError::new(ReasonCode::RcUnimplInsn, "x87 stack underflow")
+                })?;
+                let other = len.checked_sub(1 + *index).ok_or_else(|| {
+                    AppError::new(ReasonCode::RcUnimplInsn, "x87 stack underflow")
+                })?;
+                let lhs = state.x87.stack[top];
+                let rhs = state.x87.stack[other];
+                if rhs == 0.0 {
+                    state.x87.divide_by_zero = true;
+                    state.x87.stack[top] = f64::INFINITY;
+                } else {
+                    let result = apply_rounding(lhs / rhs, state.x87.rounding_mode);
+                    state.x87.precision |= result != lhs / rhs;
+                    state.x87.stack[top] = result;
+                }
+            }
+            IrInstruction::X87DivPop { index } => {
+                let len = state.x87.stack.len();
+                let top = len.checked_sub(1).ok_or_else(|| {
+                    AppError::new(ReasonCode::RcUnimplInsn, "x87 stack underflow")
+                })?;
+                let other = len.checked_sub(1 + *index).ok_or_else(|| {
+                    AppError::new(ReasonCode::RcUnimplInsn, "x87 stack underflow")
+                })?;
+                let lhs = state.x87.stack[other];
+                let rhs = state.x87.stack[top];
+                if rhs == 0.0 {
+                    state.x87.divide_by_zero = true;
+                    state.x87.stack[other] = f64::INFINITY;
+                } else {
+                    let result = apply_rounding(lhs / rhs, state.x87.rounding_mode);
+                    state.x87.precision |= result != lhs / rhs;
+                    state.x87.stack[other] = result;
+                }
+                state.x87.stack.pop();
             }
             IrInstruction::Cvtpd2ps { dst, src } => {
                 let source = read_vector_operand(state, memory, src, 16)?;
@@ -7438,6 +9348,12 @@ fn lower_to_arm64(ir: &[IrInstruction]) -> Vec<String> {
             IrInstruction::AndImmMemory { value, .. } => {
                 instructions.push(format!("ldr xtmp, [mem]; and xtmp, xtmp, #{value:#x}; str xtmp, [mem]"));
             }
+            IrInstruction::RolImm { dst, count, .. } => {
+                instructions.push(format!("rol x{}, x{}, #{}", dst.index(), dst.index(), count));
+            }
+            IrInstruction::RolImmMemory { count, .. } => {
+                instructions.push(format!("rol xrol_addr, xrol_addr, #{}", count));
+            }
             IrInstruction::ShlImm { dst, count, .. } => {
                 instructions.push(format!("lsl x{}, x{}, #{count}", dst.index(), dst.index()));
             }
@@ -7449,6 +9365,9 @@ fn lower_to_arm64(ir: &[IrInstruction]) -> Vec<String> {
             }
             IrInstruction::ShrImmMemory { count, .. } => {
                 instructions.push(format!("lsr xshr_addr, xshr_addr, #{count}"));
+            }
+            IrInstruction::RolCl { dst, .. } => {
+                instructions.push(format!("rol x{}, x{}, xcl", dst.index(), dst.index()));
             }
             IrInstruction::SarImm { dst, count, .. } => {
                 instructions.push(format!("asr x{}, x{}, #{count}", dst.index(), dst.index()));
@@ -7483,6 +9402,9 @@ fn lower_to_arm64(ir: &[IrInstruction]) -> Vec<String> {
             IrInstruction::ImulReg { dst, .. } => {
                 instructions.push(format!("mul x{}, x{}, ximul_src", dst.index(), dst.index()));
             }
+            IrInstruction::MulAcc { .. } => {
+                instructions.push("umull xmul_lo, w0, wmul_src".to_string());
+            }
             IrInstruction::ImulAcc { .. } => {
                 instructions.push("smull xmul_lo, w0, wimul_src".to_string());
             }
@@ -7499,6 +9421,19 @@ fn lower_to_arm64(ir: &[IrInstruction]) -> Vec<String> {
                     dst.full_register().index()
                 ));
             }
+            IrInstruction::SbbReg8 { dst, .. } => {
+                instructions.push(format!(
+                    "sbc w{}, w{}, wsbb8_src",
+                    dst.full_register().index(),
+                    dst.full_register().index()
+                ));
+            }
+            IrInstruction::IncReg8 { dst } => {
+                instructions.push(format!("add w{}, w{}, #1", dst.full_register().index(), dst.full_register().index()));
+            }
+            IrInstruction::DecReg8 { dst } => {
+                instructions.push(format!("sub w{}, w{}, #1", dst.full_register().index(), dst.full_register().index()));
+            }
             IrInstruction::IncMemory { .. } => {
                 instructions.push("add xinc_addr, xinc_addr, #1".to_string());
             }
@@ -7513,6 +9448,9 @@ fn lower_to_arm64(ir: &[IrInstruction]) -> Vec<String> {
             }
             IrInstruction::NotReg { dst, .. } => {
                 instructions.push(format!("mvn x{}, x{}", dst.index(), dst.index()));
+            }
+            IrInstruction::NotReg8 { dst } => {
+                instructions.push(format!("mvn w{}, w{}", dst.full_register().index(), dst.full_register().index()));
             }
             IrInstruction::Movs { repeat, .. } => {
                 instructions.push(if *repeat {
@@ -7551,6 +9489,14 @@ fn lower_to_arm64(ir: &[IrInstruction]) -> Vec<String> {
             }
             IrInstruction::ZeroExtendTo64 { dst, .. } => {
                 instructions.push(format!("uxtw x{}, wsrc", dst.index()));
+            }
+            IrInstruction::AddReg8 { dst, src } => {
+                instructions.push(format!(
+                    "add w{}, w{}, w{}",
+                    dst.full_register().index(),
+                    dst.full_register().index(),
+                    src.full_register().index()
+                ));
             }
             IrInstruction::XorImm { dst, value, .. } => {
                 instructions.push(format!("eor x{}, x{}, #{:#x}", dst.index(), dst.index(), value));
@@ -7645,6 +9591,9 @@ fn lower_to_arm64(ir: &[IrInstruction]) -> Vec<String> {
             IrInstruction::Setcc { dst, .. } => {
                 instructions.push(format!("cset w{}, eq", dst.full_register().index()));
             }
+            IrInstruction::SetccMemory { .. } => {
+                instructions.push("cset wtmp, eq; strb wtmp, [mem]".to_string());
+            }
             IrInstruction::JumpIf { target, .. } => instructions.push(format!("b.cond {target:#x}")),
             IrInstruction::Jump { target } => instructions.push(format!("b {target:#x}")),
             IrInstruction::Nop => instructions.push("nop".to_string()),
@@ -7660,8 +9609,20 @@ fn lower_to_arm64(ir: &[IrInstruction]) -> Vec<String> {
             IrInstruction::PushImm { value, width } => {
                 instructions.push(format!("push{width} #{value:#x}"));
             }
+            IrInstruction::PushFlags { width } => {
+                instructions.push(format!("pushf{width}"));
+            }
             IrInstruction::PopReg { dst } => {
                 instructions.push(format!("ldr x{}, [sp], #8", dst.index()));
+            }
+            IrInstruction::PopMemory { width, .. } => {
+                instructions.push(format!("pop_mem{width}"));
+            }
+            IrInstruction::PopFlags { width } => {
+                instructions.push(format!("popf{width}"));
+            }
+            IrInstruction::Cld => {
+                instructions.push("cld".to_string());
             }
             IrInstruction::Leave => {
                 instructions.push("leave".to_string());
@@ -7679,6 +9640,9 @@ fn lower_to_arm64(ir: &[IrInstruction]) -> Vec<String> {
             IrInstruction::Lzcnt { dst, src } => {
                 instructions.push(format!("clz x{}, x{}", dst.index(), src.index()));
             }
+            IrInstruction::Bsf { dst, src } => {
+                instructions.push(format!("bsf x{}, x{}", dst.index(), src.index()));
+            }
             IrInstruction::MovdToXmm { dst, src } => {
                 instructions.push(format!("movd v{dst}.4s, w{}", src.index()));
             }
@@ -7687,6 +9651,12 @@ fn lower_to_arm64(ir: &[IrInstruction]) -> Vec<String> {
             }
             IrInstruction::Pshufd { dst, src, imm } => {
                 instructions.push(format!("pshufd v{dst}.4s, v{src}.4s, #0x{imm:02x}"));
+            }
+            IrInstruction::Pshuflw { dst, src, imm } => {
+                instructions.push(format!("pshuflw v{dst}.8h, v{src}.8h, #0x{imm:02x}"));
+            }
+            IrInstruction::Movlhps { dst, src } => {
+                instructions.push(format!("movlhps v{dst}.16b, v{src}.16b"));
             }
             IrInstruction::MoveXmm { dst, src } => {
                 instructions.push(format!("mov v{dst}.16b, v{src}.16b"));
@@ -7709,6 +9679,14 @@ fn lower_to_arm64(ir: &[IrInstruction]) -> Vec<String> {
             IrInstruction::Pxor { dst, src } => {
                 instructions.push(format!("eor v{dst}.16b, v{dst}.16b, v{src}.16b"));
             }
+            IrInstruction::VectorOr { dst, lhs, rhs, width } => match rhs {
+                VectorOperand::Register(src) => {
+                    instructions.push(format!("orr vector{width} v{dst}.16b, v{lhs}.16b, v{src}.16b"));
+                }
+                VectorOperand::Memory(_) => {
+                    instructions.push(format!("ldr vector{width} vtmp, [mem]; orr vector{width} v{dst}.16b, v{lhs}.16b, vtmp.16b"));
+                }
+            },
             IrInstruction::VectorXor { dst, lhs, rhs, width } => match rhs {
                 VectorOperand::Register(src) => {
                     instructions.push(format!("eor vector{width} v{dst}, v{lhs}, v{src}"));
@@ -7717,6 +9695,17 @@ fn lower_to_arm64(ir: &[IrInstruction]) -> Vec<String> {
                     instructions.push(format!("ldr vector{width} vtmp, [mem]; eor vector{width} v{dst}, v{lhs}, vtmp"));
                 }
             },
+            IrInstruction::VectorCompareEqBytes { dst, lhs, rhs, width } => match rhs {
+                VectorOperand::Register(src) => {
+                    instructions.push(format!("cmeq vector{width} v{dst}.16b, v{lhs}.16b, v{src}.16b"));
+                }
+                VectorOperand::Memory(_) => {
+                    instructions.push(format!("ldr vector{width} vtmp, [mem]; cmeq vector{width} v{dst}.16b, v{lhs}.16b, vtmp.16b"));
+                }
+            },
+            IrInstruction::VectorMoveMaskBytes { dst, src, width } => {
+                instructions.push(format!("movmask{width} x{}, v{src}", dst.index()));
+            }
             IrInstruction::Paddq { dst, src } => {
                 instructions.push(format!("add v{dst}.2d, v{dst}.2d, v{src}.2d"));
             }
@@ -7730,11 +9719,46 @@ fn lower_to_arm64(ir: &[IrInstruction]) -> Vec<String> {
             },
             IrInstruction::VzeroUpper => instructions.push("bl __casa1_vzeroupper".to_string()),
             IrInstruction::X87ClearExceptions => instructions.push("bl __casa1_x87_clear_exceptions".to_string()),
+            IrInstruction::X87LoadInt32 { .. } => instructions.push("bl __casa1_x87_fild_i32".to_string()),
+            IrInstruction::X87LoadInt64 { .. } => instructions.push("bl __casa1_x87_fild_i64".to_string()),
+            IrInstruction::X87Load { width, .. } => {
+                instructions.push(match *width {
+                    4 => "bl __casa1_x87_load_f32".to_string(),
+                    _ => "bl __casa1_x87_load_f64".to_string(),
+                })
+            }
             IrInstruction::X87LoadControlWord { .. } => {
                 instructions.push("bl __casa1_x87_load_control_word".to_string())
             }
+            IrInstruction::X87NegateTop => instructions.push("bl __casa1_x87_fchs".to_string()),
+            IrInstruction::X87MulMemory { width, .. } => {
+                instructions.push(match *width {
+                    4 => "bl __casa1_x87_fmul_m32".to_string(),
+                    _ => "bl __casa1_x87_fmul_m64".to_string(),
+                })
+            }
+            IrInstruction::X87DivMemory { width, .. } => {
+                instructions.push(match *width {
+                    4 => "bl __casa1_x87_fdiv_m32".to_string(),
+                    _ => "bl __casa1_x87_fdiv_m64".to_string(),
+                })
+            }
+            IrInstruction::X87Swap { index, .. } => {
+                instructions.push(format!("bl __casa1_x87_fxch_st{}", index))
+            }
             IrInstruction::X87StoreControlWord { .. } => {
                 instructions.push("bl __casa1_x87_store_control_word".to_string())
+            }
+            IrInstruction::X87Store { width, pop, .. } => {
+                instructions.push(match (*width, *pop) {
+                    (4, false) => "bl __casa1_x87_store_f32".to_string(),
+                    (4, true) => "bl __casa1_x87_store_pop_f32".to_string(),
+                    (8, false) => "bl __casa1_x87_store_f64".to_string(),
+                    _ => "bl __casa1_x87_store_pop".to_string(),
+                })
+            }
+            IrInstruction::X87StorePopRegister { index } => {
+                instructions.push(format!("bl __casa1_x87_fstp_st{}", index))
             }
             IrInstruction::X87StorePop { .. } => {
                 instructions.push("bl __casa1_x87_store_pop".to_string())
@@ -7742,6 +9766,18 @@ fn lower_to_arm64(ir: &[IrInstruction]) -> Vec<String> {
             IrInstruction::X87Init => instructions.push("bl __casa1_x87_init".to_string()),
             IrInstruction::LoadMxcsr { .. } => instructions.push("bl __casa1_load_mxcsr".to_string()),
             IrInstruction::StoreMxcsr { .. } => instructions.push("bl __casa1_store_mxcsr".to_string()),
+            IrInstruction::X87AddPop { index } => {
+                instructions.push(format!("bl __casa1_x87_faddp_st{}", index))
+            }
+            IrInstruction::X87Mul { index } => {
+                instructions.push(format!("bl __casa1_x87_fmul_st{}", index))
+            }
+            IrInstruction::X87DivRegister { index } => {
+                instructions.push(format!("bl __casa1_x87_fdiv_st{}", index))
+            }
+            IrInstruction::X87DivPop { index } => {
+                instructions.push(format!("bl __casa1_x87_fdivp_st{}", index))
+            }
             IrInstruction::Cvtpd2ps { dst, src } => match src {
                 VectorOperand::Register(src) => {
                     instructions.push(format!("fcvtn v{dst}.2s, v{src}.2d"));
@@ -7969,6 +10005,18 @@ fn segment_from_prefixes(prefixes: &[InstructionPrefix]) -> Option<SegmentRegist
     })
 }
 
+fn x86_segment_selector_value(segment: u8) -> Option<u16> {
+    match segment {
+        0 => Some(0x23),
+        1 => Some(0x1b),
+        2 => Some(0x23),
+        3 => Some(0x23),
+        4 => Some(0x3b),
+        5 => Some(0x00),
+        _ => None,
+    }
+}
+
 fn operand_width(rex: Option<RexPrefix>, prefixes: &[InstructionPrefix], arch: GuestArch) -> usize {
     if arch == GuestArch::X64 && rex.map(|value| value.w).unwrap_or(false) {
         8
@@ -8031,6 +10079,8 @@ fn decode_condition(value: u64) -> AppResult<ConditionCode> {
     match value {
         0 => Ok(ConditionCode::Equal),
         1 => Ok(ConditionCode::NotEqual),
+        12 => Ok(ConditionCode::Overflow),
+        13 => Ok(ConditionCode::NotOverflow),
         2 => Ok(ConditionCode::Below),
         3 => Ok(ConditionCode::NotBelow),
         4 => Ok(ConditionCode::Above),
@@ -8052,6 +10102,8 @@ fn condition_holds(flags: Flags, condition: ConditionCode) -> bool {
     match condition {
         ConditionCode::Equal => flags.zf,
         ConditionCode::NotEqual => !flags.zf,
+        ConditionCode::Overflow => flags.of,
+        ConditionCode::NotOverflow => !flags.of,
         ConditionCode::Below => flags.cf,
         ConditionCode::NotBelow => !flags.cf,
         ConditionCode::Above => !flags.cf && !flags.zf,
@@ -8165,10 +10217,11 @@ fn read_memory_value(memory: &MemoryImage, address: u64, width: usize) -> AppRes
 }
 
 fn write_memory_value(memory: &mut MemoryImage, address: u64, value: u64, width: usize) -> AppResult<()> {
+    memory.commit_zeroed_pages(address, width)?;
     match width {
-        1 => memory.map_bytes(address, &[value as u8]),
-        2 => memory.map_bytes(address, &(value as u16).to_le_bytes()),
-        4 => memory.map_bytes(address, &(value as u32).to_le_bytes()),
+        1 => memory.write_u8(address, value as u8),
+        2 => memory.write_u16(address, value as u16),
+        4 => memory.write_u32(address, value as u32),
         8 => memory.write_u64(address, value),
         other => {
             return Err(AppError::new(
@@ -8369,10 +10422,24 @@ fn xmm_to_bytes(value: XmmValue) -> [u8; 16] {
     bytes
 }
 
+fn ymm_to_bytes(value: YmmValue) -> [u8; 32] {
+    let mut bytes = [0_u8; 32];
+    bytes[..16].copy_from_slice(&xmm_to_bytes(value.low));
+    bytes[16..].copy_from_slice(&xmm_to_bytes(value.high));
+    bytes
+}
+
 fn bytes_to_xmm(bytes: [u8; 16]) -> XmmValue {
     XmmValue {
         low: u64::from_le_bytes(bytes[..8].try_into().expect("low xmm bytes")),
         high: u64::from_le_bytes(bytes[8..].try_into().expect("high xmm bytes")),
+    }
+}
+
+fn bytes_to_ymm(bytes: [u8; 32]) -> YmmValue {
+    YmmValue {
+        low: bytes_to_xmm(bytes[..16].try_into().expect("low ymm bytes")),
+        high: bytes_to_xmm(bytes[16..].try_into().expect("high ymm bytes")),
     }
 }
 
@@ -8384,7 +10451,7 @@ fn execute_pcmpistri_implicit_u8(lhs: [u8; 16], rhs: [u8; 16], imm: u8) -> AppRe
     let format = imm & 0x03;
     let aggregation = (imm >> 2) & 0x03;
     let polarity = (imm >> 4) & 0x03;
-    if format != 0 || aggregation != 0x03 || polarity != 0 {
+    if format != 0 || !matches!(aggregation, 0x00 | 0x03) || polarity != 0 {
         return Err(AppError::new(
             ReasonCode::RcUnimplInsn,
             format!("PCMPISTRI mode 0x{imm:02x} is not supported"),
@@ -8394,14 +10461,26 @@ fn execute_pcmpistri_implicit_u8(lhs: [u8; 16], rhs: [u8; 16], imm: u8) -> AppRe
     let lhs_len = implicit_string_len_u8(&lhs);
     let rhs_len = implicit_string_len_u8(&rhs);
     let mut bitmask = 0_u16;
-    if lhs_len == 0 {
-        bitmask = 1;
-    } else if lhs_len <= rhs_len {
-        for start in 0..=rhs_len - lhs_len {
-            if lhs[..lhs_len] == rhs[start..start + lhs_len] {
-                bitmask |= 1_u16 << start;
+    match aggregation {
+        0x00 => {
+            for (index, byte) in rhs[..rhs_len].iter().enumerate() {
+                if lhs[..lhs_len].iter().any(|needle| needle == byte) {
+                    bitmask |= 1_u16 << index;
+                }
             }
         }
+        0x03 => {
+            if lhs_len == 0 {
+                bitmask = 1;
+            } else if lhs_len <= rhs_len {
+                for start in 0..=rhs_len - lhs_len {
+                    if lhs[..lhs_len] == rhs[start..start + lhs_len] {
+                        bitmask |= 1_u16 << start;
+                    }
+                }
+            }
+        }
+        _ => unreachable!("aggregation filtered above"),
     }
 
     let index = if bitmask == 0 {
@@ -8502,6 +10581,16 @@ fn read_vector_register(state: &CpuState, index: u8, width: usize) -> AppResult<
 
 fn write_vector_register(state: &mut CpuState, index: u8, value: YmmValue, width: usize) -> AppResult<()> {
     match width {
+        4 => {
+            state.set_xmm(
+                index,
+                XmmValue {
+                    low: value.low.low & 0xffff_ffff,
+                    high: 0,
+                },
+            );
+            state.clear_ymm_upper(index);
+        }
         8 => {
             state.set_xmm(
                 index,
@@ -8557,6 +10646,7 @@ fn read_vector_memory(memory: &MemoryImage, address: u64, width: usize) -> AppRe
 
 fn write_vector_memory(memory: &mut MemoryImage, address: u64, value: YmmValue, width: usize) -> AppResult<()> {
     match width {
+        4 => memory.map_bytes(address, &(value.low.low as u32).to_le_bytes()),
         8 => memory.map_bytes(address, &value.low.low.to_le_bytes()),
         16 => memory.map_xmm(address, value.low),
         32 => memory.map_ymm(address, value),
@@ -8637,6 +10727,51 @@ mod tests {
     }
 
     #[test]
+    fn memory_image_page_index_handles_out_of_order_low_pages() {
+        let mut memory = MemoryImage::default();
+        let hot_page = 0x2000_u64;
+        let earlier_page = hot_page - MEMORY_PAGE_SIZE as u64;
+        let later_page = hot_page + MEMORY_PAGE_SIZE as u64;
+
+        memory.map_bytes(hot_page, &[0x10, 0x20, 0x30, 0x40]);
+        assert_eq!(memory.page_index(hot_page), Some(0));
+        assert_eq!(memory.read_u32(hot_page).unwrap(), 0x4030_2010);
+        assert_eq!(memory.read_u16(hot_page + 2).unwrap(), 0x4030);
+
+        memory.map_bytes(earlier_page, &[0xAA]);
+        assert_eq!(memory.page_index(earlier_page), Some(1));
+        assert_eq!(memory.page_index(hot_page), Some(0));
+        assert_eq!(memory.read_u32(hot_page).unwrap(), 0x4030_2010);
+
+        memory.map_bytes(later_page, &[0x55, 0x66, 0x77, 0x88]);
+        assert_eq!(memory.page_index(later_page), Some(2));
+        assert_eq!(memory.read_u32(later_page).unwrap(), 0x8877_6655);
+    }
+
+    #[test]
+    fn memory_image_high_pages_use_fallback_lookup() {
+        let mut memory = MemoryImage::default();
+        let high_page = 0x1_0000_2000_u64;
+
+        memory.map_bytes(high_page, &[0x11, 0x22, 0x33, 0x44]);
+
+        assert_eq!(memory.page_index(high_page), Some(0));
+        assert_eq!(memory.read_u32(high_page).unwrap(), 0x4433_2211);
+    }
+
+    #[test]
+    fn memory_image_scalar_writes_handle_same_and_cross_page_ranges() {
+        let mut memory = MemoryImage::default();
+
+        memory.write_u32(0x2000, 0x4433_2211);
+        assert_eq!(memory.read_bytes(0x2000, 4).unwrap(), vec![0x11, 0x22, 0x33, 0x44]);
+
+        let boundary = 0x2fff_u64;
+        memory.write_u32(boundary, 0xDDCC_BBAA);
+        assert_eq!(memory.read_bytes(boundary, 4).unwrap(), vec![0xAA, 0xBB, 0xCC, 0xDD]);
+    }
+
+    #[test]
     fn memory_image_reads_across_page_boundaries() {
         let mut memory = MemoryImage::default();
         let address = 0x2fff;
@@ -8649,6 +10784,38 @@ mod tests {
         let error = memory.read_u32(address + 1).expect_err("missing last byte should fail");
         assert_eq!(error.code, ReasonCode::RcUnimplInsn);
         assert!(error.message.contains("0x3003"));
+    }
+
+    #[test]
+    fn memory_image_commit_zeroed_pages_commits_page_without_clobbering_bytes() {
+        let mut memory = MemoryImage::default();
+        let page_base = 0x3000_u64;
+
+        memory.map_bytes(page_base + 2, &[0xAA, 0xBB]);
+        memory.commit_zeroed_pages(page_base + 2, 1).unwrap();
+
+        let page = memory.page(page_base).expect("page present after commit");
+        assert!(page.is_fully_mapped());
+        assert_eq!(memory.read_u8(page_base).unwrap(), 0);
+        assert_eq!(memory.read_u8(page_base + 2).unwrap(), 0xAA);
+        assert_eq!(memory.read_u8(page_base + 3).unwrap(), 0xBB);
+        assert_eq!(memory.read_u8(page_base + (MEMORY_PAGE_SIZE as u64 - 1)).unwrap(), 0);
+
+        memory.commit_zeroed_pages(page_base + 8, 1).unwrap();
+        assert_eq!(memory.read_u8(page_base + 2).unwrap(), 0xAA);
+        assert_eq!(memory.read_u8(page_base + 3).unwrap(), 0xBB);
+    }
+
+    #[test]
+    fn memory_image_commit_zeroed_pages_rejects_unmapped_pages() {
+        let mut memory = MemoryImage::default();
+
+        let error = memory
+            .commit_zeroed_pages(0x5000, 1)
+            .expect_err("committing an unmapped page should fail");
+
+        assert_eq!(error.code, ReasonCode::RcUnimplInsn);
+        assert!(error.message.contains("0x5000"));
     }
 
     #[test]
@@ -8757,6 +10924,28 @@ mod tests {
         execute_ir(&mut state, &mut memory, &ir).expect("execute movd/pshufd/movups");
 
         assert_eq!(memory.read_xmm(0x7000).expect("stored xmm"), u32x4_to_xmm([0x1122_3344; 4]));
+    }
+
+    #[test]
+    fn decode_and_execute_live_steam_pshuflw_then_movlhps_broadcasts_word() {
+        let start_address = 0x18ff_e213;
+        let bytes = [0x66, 0x0f, 0x6e, 0xda, 0xf2, 0x0f, 0x70, 0xdb, 0x00, 0x0f, 0x16, 0xdb];
+        let decoded = decode_block(&bytes, start_address, GuestArch::X86).expect("decode live steam pshuflw block");
+        let ir = lower_to_ir(&decoded).expect("lower live steam pshuflw block");
+        let mut state = CpuState::new(GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        state.set(Register::Rdx, 0xabcd_1122);
+
+        execute_ir(&mut state, &mut memory, &ir).expect("execute live steam pshuflw block");
+
+        assert!(matches!(decoded[0].opcode, DecodedOpcode::MovdToXmm), "decoded={decoded:?}");
+        assert!(matches!(decoded[1].opcode, DecodedOpcode::Pshuflw), "decoded={decoded:?}");
+        assert!(matches!(decoded[2].opcode, DecodedOpcode::Movlhps), "decoded={decoded:?}");
+        assert_eq!(state.get_xmm(3), bytes_to_xmm([
+            0x22, 0x11, 0x22, 0x11, 0x22, 0x11, 0x22, 0x11,
+            0x22, 0x11, 0x22, 0x11, 0x22, 0x11, 0x22, 0x11,
+        ]));
     }
 
     #[test]
@@ -8872,6 +11061,181 @@ mod tests {
         memory.map_bytes(0x7000_fed8, &[0; 16]);
 
         execute_ir(&mut state, &mut memory, &ir).expect("execute movq [edi+0x84], xmm0");
+
+        assert_eq!(read_memory_value(&memory, 0x7000_fed8, 8).expect("stored qword"), 0x1122_3344_5566_7788);
+        assert_eq!(read_memory_value(&memory, 0x7000_fee0, 8).expect("following qword"), 0);
+    }
+
+    #[test]
+    fn decode_and_execute_movss_m32_xmm_stores_low_dword() {
+        let start_address = 0x1904_cca2;
+        let bytes = [0xF3, 0x0F, 0x11, 0x87, 0x7C, 0x00, 0x00, 0x00];
+        let decoded = decode_block(&bytes, start_address, GuestArch::X86).expect("decode movss m32, xmm");
+        let ir = lower_to_ir(&decoded).expect("lower movss m32, xmm");
+        assert!(matches!(decoded[0].opcode, DecodedOpcode::VectorMove), "decoded={decoded:?}");
+        assert!(matches!(
+            ir.as_slice(),
+            [IrInstruction::StoreVector {
+                src: 0,
+                width: 4,
+                ..
+            }]
+        ));
+        let mut state = CpuState::new(GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        state.set(Register::Rdi, 0x7000_fe54);
+        state.set_xmm(
+            0,
+            XmmValue {
+                low: 0x5566_7788_1122_3344,
+                high: 0x99aa_bbcc_ddee_ff00,
+            },
+        );
+        memory.map_bytes(0x7000_fed0, &[0; 16]);
+
+        execute_ir(&mut state, &mut memory, &ir).expect("execute movss [edi+0x7c], xmm0");
+
+        assert_eq!(read_memory_value(&memory, 0x7000_fed0, 8).expect("stored qword"), 0x0000_0000_1122_3344);
+        assert_eq!(read_memory_value(&memory, 0x7000_fed8, 8).expect("following qword"), 0);
+    }
+
+    #[test]
+    fn decode_and_execute_live_steam_movss_block_preserves_neighbor_vector_fields() {
+        let start_address = 0x1904_cc74;
+        let bytes = [
+            0x8A, 0x45, 0x1C,
+            0xF3, 0x0F, 0x10, 0x45, 0x20,
+            0x88, 0x46, 0x70,
+            0x8A, 0x45, 0x24,
+            0xF3, 0x0F, 0x11, 0x46, 0x74,
+            0xF3, 0x0F, 0x10, 0x45, 0x28,
+            0x6A, 0x00,
+            0xFF, 0x76, 0x38,
+            0xC7, 0x46, 0x30, 0x00, 0x00, 0x00, 0x00,
+            0xC7, 0x46, 0x34, 0x00, 0x00, 0x00, 0x00,
+            0x88, 0x46, 0x78,
+            0xF3, 0x0F, 0x11, 0x46, 0x7C,
+        ];
+        let decoded = decode_block(&bytes, start_address, GuestArch::X86).expect("decode live steam movss block");
+        let ir = lower_to_ir(&decoded).expect("lower live steam movss block");
+
+        let vector_moves = decoded
+            .iter()
+            .filter_map(|instruction| match (&instruction.opcode, instruction.operands.as_slice()) {
+                (
+                    DecodedOpcode::VectorMove,
+                    [Operand::Memory(_), Operand::Xmm(_), Operand::ImmediateU64(width)],
+                ) => Some((instruction.address, *width)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            vector_moves,
+            vec![(start_address + 14, 4), (start_address + 46, 4)],
+            "decoded={decoded:?}"
+        );
+
+        let mut state = CpuState::new(GuestArch::X86);
+        let mut memory = MemoryImage::default();
+        let frame_base = 0x7000_ff00;
+        let this_ptr = 0x7000_fe00;
+
+        state.set(Register::Rbp, frame_base);
+        state.set(Register::Rsp, 0x7001_0000);
+        state.set(Register::Rsi, this_ptr);
+
+        memory.map_bytes(frame_base + 0x1c, &[0x12]);
+        memory.map_bytes(frame_base + 0x20, &0x1122_3344u32.to_le_bytes());
+        memory.map_bytes(frame_base + 0x24, &[0x34]);
+        memory.map_bytes(frame_base + 0x28, &0x5566_7788u32.to_le_bytes());
+
+        memory.map_bytes(this_ptr + 0x30, &[0xaa; 0x60]);
+        memory.map_bytes(this_ptr + 0x84, &[0xcc; 0x10]);
+
+        execute_ir(&mut state, &mut memory, &ir).expect("execute live steam movss block");
+
+        assert_eq!(
+            read_memory_value(&memory, this_ptr + 0x74, 4).expect("store at +0x74"),
+            0x1122_3344,
+        );
+        assert_eq!(
+            read_memory_value(&memory, this_ptr + 0x7c, 4).expect("store at +0x7c"),
+            0x5566_7788,
+        );
+        assert_eq!(
+            read_memory_value(&memory, this_ptr + 0x84, 8).expect("neighbor vector field low qword"),
+            0xcccc_cccc_cccc_cccc,
+        );
+        assert_eq!(
+            read_memory_value(&memory, this_ptr + 0x8c, 8).expect("neighbor vector field high qword"),
+            0xcccc_cccc_cccc_cccc,
+        );
+    }
+
+    #[test]
+    fn decode_and_execute_movss_xmm_m32_loads_low_dword() {
+        let start_address = 0x1904_cc77;
+        let bytes = [0xF3, 0x0F, 0x10, 0x87, 0x7C, 0x00, 0x00, 0x00];
+        let decoded = decode_block(&bytes, start_address, GuestArch::X86).expect("decode movss xmm, m32");
+        let ir = lower_to_ir(&decoded).expect("lower movss xmm, m32");
+        assert!(matches!(decoded[0].opcode, DecodedOpcode::VectorMove), "decoded={decoded:?}");
+        assert!(matches!(
+            ir.as_slice(),
+            [IrInstruction::LoadVector {
+                dst: 0,
+                width: 4,
+                ..
+            }]
+        ));
+        let mut state = CpuState::new(GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        state.set(Register::Rdi, 0x7000_fe54);
+        state.set_xmm(
+            0,
+            XmmValue {
+                low: 0xffff_ffff_ffff_ffff,
+                high: 0xffff_ffff_ffff_ffff,
+            },
+        );
+        memory.map_bytes(0x7000_fed0, &0x1122_3344u32.to_le_bytes());
+
+        execute_ir(&mut state, &mut memory, &ir).expect("execute movss xmm0, [edi+0x7c]");
+
+        assert_eq!(state.get_xmm(0).low, 0x1122_3344);
+        assert_eq!(state.get_xmm(0).high, 0);
+    }
+
+    #[test]
+    fn decode_and_execute_movsd_m64_xmm_stores_low_qword() {
+        let start_address = 0x1904_cc82;
+        let bytes = [0xF2, 0x0F, 0x11, 0x87, 0x84, 0x00, 0x00, 0x00];
+        let decoded = decode_block(&bytes, start_address, GuestArch::X86).expect("decode movsd m64, xmm");
+        let ir = lower_to_ir(&decoded).expect("lower movsd m64, xmm");
+        assert!(matches!(decoded[0].opcode, DecodedOpcode::VectorMove), "decoded={decoded:?}");
+        assert!(matches!(
+            ir.as_slice(),
+            [IrInstruction::StoreVector {
+                src: 0,
+                width: 8,
+                ..
+            }]
+        ));
+        let mut state = CpuState::new(GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        state.set(Register::Rdi, 0x7000_fe54);
+        state.set_xmm(
+            0,
+            XmmValue {
+                low: 0x1122_3344_5566_7788,
+                high: 0x99aa_bbcc_ddee_ff00,
+            },
+        );
+        memory.map_bytes(0x7000_fed8, &[0; 16]);
+
+        execute_ir(&mut state, &mut memory, &ir).expect("execute movsd [edi+0x84], xmm0");
 
         assert_eq!(read_memory_value(&memory, 0x7000_fed8, 8).expect("stored qword"), 0x1122_3344_5566_7788);
         assert_eq!(read_memory_value(&memory, 0x7000_fee0, 8).expect("following qword"), 0);
@@ -9090,6 +11454,34 @@ mod tests {
     }
 
     #[test]
+    fn decode_and_execute_live_steam_pcmpistri_equal_any_most_significant_match() {
+        let start_address = 0x18ff_f114;
+        let bytes = [0x66, 0x0F, 0x3A, 0x63, 0x47, 0xF0, 0x40];
+        let decoded = decode_block(&bytes, start_address, GuestArch::X86).expect("decode live steam pcmpistri equal-any");
+        let ir = lower_to_ir(&decoded).expect("lower live steam pcmpistri equal-any");
+        let mut state = CpuState::new(GuestArch::X86);
+        let mut memory = MemoryImage::default();
+        let mut needle = [0_u8; 16];
+        let mut haystack = [0_u8; 16];
+
+        needle[0] = b'\\';
+        haystack[..5].copy_from_slice(b"a\\b\\\0");
+
+        state.set(Register::Rdi, 0x8010);
+        state.set_xmm(0, bytes_to_xmm(needle));
+        memory.map_bytes(0x8000, &haystack);
+
+        execute_ir(&mut state, &mut memory, &ir).expect("execute live steam pcmpistri equal-any");
+
+        assert!(matches!(decoded[0].opcode, DecodedOpcode::Pcmpistri), "decoded={decoded:?}");
+        assert_eq!(state.get(Register::Rcx), 3);
+        assert!(state.flags.cf);
+        assert!(state.flags.zf);
+        assert!(state.flags.sf);
+        assert!(!state.flags.of);
+    }
+
+    #[test]
     fn decode_and_execute_movzx_xor_cmp_jz_prefix_updates_ebx_and_flags() {
         let start_address = 0x1909_4d70;
         let bytes = [
@@ -9233,6 +11625,142 @@ mod tests {
     }
 
     #[test]
+    fn decode_and_execute_x86_vpxor_uses_two_byte_vex_prefix() {
+        let start_address = 0x1901_c16b;
+        let bytes = [0xC5, 0xF1, 0xEF, 0xC9];
+        let decoded = decode_block(&bytes, start_address, GuestArch::X86).expect("decode block");
+        let ir = lower_to_ir(&decoded).expect("lower ir");
+        let mut state = CpuState::new(GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        state.set_xmm(
+            1,
+            XmmValue {
+                low: 0x0123_4567_89ab_cdef,
+                high: 0xfedc_ba98_7654_3210,
+            },
+        );
+
+        execute_ir(&mut state, &mut memory, &ir).expect("execute vpxor");
+
+        assert_eq!(state.get_xmm(1), XmmValue::default());
+    }
+
+    #[test]
+    fn decode_and_execute_x86_vpcmpeqb_then_vpmovmskb_updates_eax() {
+        let start_address = 0x1901_c173;
+        let bytes = [0xC5, 0xF5, 0x74, 0x01, 0xC5, 0xFD, 0xD7, 0xC0];
+        let decoded = decode_block(&bytes, start_address, GuestArch::X86).expect("decode block");
+        let ir = lower_to_ir(&decoded).expect("lower ir");
+        let mut state = CpuState::new(GuestArch::X86);
+        let mut memory = MemoryImage::default();
+        let mut lhs = [0_u8; 32];
+        let mut rhs = [0_u8; 32];
+        for index in 0..32 {
+            lhs[index] = index as u8;
+            rhs[index] = index as u8;
+        }
+        rhs[3] = 0xff;
+        rhs[31] = 0xff;
+
+        state.set(Register::Rcx, 0x5000);
+        state.set_ymm(1, bytes_to_ymm(lhs));
+        memory.map_bytes(0x5000, &rhs);
+
+        execute_ir(&mut state, &mut memory, &ir).expect("execute vpcmpeqb/vpmovmskb");
+
+        assert_eq!(state.get(Register::Rax), 0x7fff_fff7);
+    }
+
+    #[test]
+    fn decode_and_execute_live_steam_pcmp_eq_por_pmovmskb_updates_mask() {
+        let start_address = 0x18ff_e23b;
+        let bytes = [
+            0x66, 0x0f, 0x74, 0xd1,
+            0x66, 0x0f, 0x74, 0xcb,
+            0x66, 0x0f, 0xeb, 0xd1,
+            0x66, 0x0f, 0xd7, 0xca,
+        ];
+        let decoded = decode_block(&bytes, start_address, GuestArch::X86).expect("decode live steam compare/mask block");
+        let ir = lower_to_ir(&decoded).expect("lower live steam compare/mask block");
+        let mut state = CpuState::new(GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        state.set_xmm(1, bytes_to_xmm([
+            0x11, 0x22, 0x00, 0x00, 0x11, 0x22, 0x33, 0x44,
+            0x00, 0x00, 0x11, 0x22, 0x55, 0x66, 0x00, 0x00,
+        ]));
+        state.set_xmm(2, XmmValue::default());
+        state.set_xmm(3, bytes_to_xmm([
+            0x11, 0x22, 0x11, 0x22, 0x11, 0x22, 0x11, 0x22,
+            0x11, 0x22, 0x11, 0x22, 0x11, 0x22, 0x11, 0x22,
+        ]));
+
+        execute_ir(&mut state, &mut memory, &ir).expect("execute live steam compare/mask block");
+
+        assert!(matches!(decoded[0].opcode, DecodedOpcode::VectorCompareEqBytes), "decoded={decoded:?}");
+        assert!(matches!(decoded[1].opcode, DecodedOpcode::VectorCompareEqBytes), "decoded={decoded:?}");
+        assert!(matches!(decoded[2].opcode, DecodedOpcode::VectorOr), "decoded={decoded:?}");
+        assert!(matches!(decoded[3].opcode, DecodedOpcode::VectorMoveMaskBytes), "decoded={decoded:?}");
+        assert_eq!(state.get(Register::Rcx), 0xcf3f);
+    }
+
+    #[test]
+    fn decode_and_execute_live_steam_bsf_updates_index_and_zf() {
+        let start_address = 0x18ff_e257;
+        let bytes = [0x0f, 0xbc, 0xc1];
+        let decoded = decode_block(&bytes, start_address, GuestArch::X86).expect("decode live steam bsf block");
+        let ir = lower_to_ir(&decoded).expect("lower live steam bsf block");
+        let mut state = CpuState::new(GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        state.set(Register::Rax, 0xffff_ffff);
+        state.set(Register::Rcx, 0x0000_00e0);
+
+        execute_ir(&mut state, &mut memory, &ir).expect("execute live steam bsf block");
+
+        assert!(matches!(decoded[0].opcode, DecodedOpcode::Bsf), "decoded={decoded:?}");
+        assert_eq!(state.get(Register::Rax), 5);
+        assert!(!state.flags.zf);
+    }
+
+    #[test]
+    fn decode_and_execute_live_steam_not_al_then_test_sets_low_byte() {
+        let start_address = 0x1902_0613;
+        let bytes = [0xf6, 0xd0, 0xa8, 0x01];
+        let decoded = decode_block(&bytes, start_address, GuestArch::X86).expect("decode live steam not/test block");
+        let ir = lower_to_ir(&decoded).expect("lower live steam not/test block");
+        let mut state = CpuState::new(GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        state.set(Register::Rax, 0);
+
+        execute_ir(&mut state, &mut memory, &ir).expect("execute live steam not/test block");
+
+        assert!(matches!(decoded[0].opcode, DecodedOpcode::Not), "decoded={decoded:?}");
+        assert_eq!(state.get_byte(ByteRegister::Al), 0xff);
+        assert!(!state.flags.zf);
+    }
+
+    #[test]
+    fn decode_and_execute_live_steam_shr_cl_imm8_then_test_updates_low_byte() {
+        let start_address = 0x18f1_4838;
+        let bytes = [0xc0, 0xe9, 0x07, 0x84, 0xc9];
+        let decoded = decode_block(&bytes, start_address, GuestArch::X86).expect("decode live steam shr/test block");
+        let ir = lower_to_ir(&decoded).expect("lower live steam shr/test block");
+        let mut state = CpuState::new(GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        state.set(Register::Rcx, 0xfe);
+
+        execute_ir(&mut state, &mut memory, &ir).expect("execute live steam shr/test block");
+
+        assert!(matches!(decoded[0].opcode, DecodedOpcode::ShrImm), "decoded={decoded:?}");
+        assert_eq!(state.get_byte(ByteRegister::Cl), 0x01);
+        assert!(!state.flags.zf);
+    }
+
+    #[test]
     fn decode_and_execute_vpaddq_ymm_updates_all_qword_lanes() {
         let start_address = 0x3200;
         let bytes = [0xC5, 0xD5, 0xD4, 0xE6];
@@ -9363,6 +11891,28 @@ mod tests {
     }
 
     #[test]
+    fn decode_and_execute_mul_memory_updates_edx_eax() {
+        let start_address = 0x1909_39b0;
+        let bytes = [0xF7, 0x25, 0x00, 0x20, 0x00, 0x00];
+        let decoded = decode_block(&bytes, start_address, GuestArch::X86).expect("decode mul [0x2000]");
+        let ir = lower_to_ir(&decoded).expect("lower mul [0x2000]");
+        assert!(matches!(decoded[0].opcode, DecodedOpcode::MulAcc), "decoded={decoded:?}");
+        assert!(matches!(ir.as_slice(), [IrInstruction::MulAcc { width: 4, .. }]));
+        let mut state = CpuState::new(GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        state.set(Register::Rax, 0x8000_0000);
+        memory.map_bytes(0x2000, &4_u32.to_le_bytes());
+
+        execute_ir(&mut state, &mut memory, &ir).expect("execute mul [0x2000]");
+
+        assert_eq!(state.get(Register::Rax), 0);
+        assert_eq!(state.get(Register::Rdx), 2);
+        assert!(state.flags.cf);
+        assert!(state.flags.of);
+    }
+
+    #[test]
     fn decode_and_execute_sub_al_imm8_updates_accumulator() {
         let start_address = 0x1909_790a;
         let bytes = [0x2C, 0x61];
@@ -9396,6 +11946,23 @@ mod tests {
         execute_ir(&mut state, &mut memory, &ir).expect("execute add imm32 and movzx");
 
         assert_eq!(state.get(Register::Rdx), 0x36b0);
+    }
+
+    #[test]
+    fn decode_and_execute_xor_al_imm8_updates_accumulator() {
+        let start_address = 0x1909_790c;
+        let bytes = [0x34, 0x01];
+        let decoded = decode_block(&bytes, start_address, GuestArch::X86).expect("decode xor al, 1");
+        let ir = lower_to_ir(&decoded).expect("lower xor al, 1");
+        let mut state = CpuState::new(GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        state.set(Register::Rax, 0x92);
+
+        execute_ir(&mut state, &mut memory, &ir).expect("execute xor al, 1");
+
+        assert_eq!(state.get(Register::Rax), 0x93);
+        assert!(!state.flags.zf);
     }
 
     #[test]
@@ -9468,6 +12035,69 @@ mod tests {
 
         assert_eq!(state.get(Register::R9) & 0xff, 1);
         assert_eq!(state.get(Register::R11) & 0xff, 1);
+    }
+
+
+    #[test]
+    fn decode_and_execute_seto_cl_materializes_overflow_in_x86() {
+        let bytes = [0xB8, 0xFF, 0xFF, 0xFF, 0x7F, 0x83, 0xC0, 0x01, 0x0F, 0x90, 0xC1];
+        let decoded = decode_block(&bytes, 0x6000, GuestArch::X86).expect("decode block");
+        let ir = lower_to_ir(&decoded).expect("lower ir");
+        let mut state = CpuState::new(GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        execute_ir(&mut state, &mut memory, &ir).expect("execute seto cl");
+
+        assert_eq!(state.get(Register::Rcx) & 0xff, 1);
+        assert!(state.flags.of);
+    }
+
+    #[test]
+    fn decode_and_execute_setg_m8_writes_memory_byte_in_x86() {
+        let bytes = [
+            0xB8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1
+            0x83, 0xF8, 0x00, // cmp eax, 0
+            0x0F, 0x9F, 0x45, 0xFC, // setg byte ptr [ebp-4]
+        ];
+        let decoded = decode_block(&bytes, 0x6000, GuestArch::X86).expect("decode block");
+        let ir = lower_to_ir(&decoded).expect("lower ir");
+        let mut state = CpuState::new(GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        state.set(Register::Rbp, 0x7000);
+        memory.map_bytes(0x6ffc, &[0; 1]);
+
+        execute_ir(&mut state, &mut memory, &ir).expect("execute setg [ebp-4]");
+
+        assert_eq!(read_memory_value(&memory, 0x6ffc, 1).expect("setg target"), 1);
+    }
+
+    #[test]
+    fn decode_and_execute_or_ah_ah_updates_flags_in_x86() {
+        let bytes = [0xB4, 0x80, 0x0A, 0xE4];
+        let decoded = decode_block(&bytes, 0x6000, GuestArch::X86).expect("decode block");
+        let ir = lower_to_ir(&decoded).expect("lower ir");
+        let mut state = CpuState::new(GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        execute_ir(&mut state, &mut memory, &ir).expect("execute or ah, ah");
+
+        assert_eq!(state.get(Register::Rax), 0x8000);
+        assert!(!state.flags.zf);
+        assert!(state.flags.sf);
+    }
+    #[test]
+    fn decode_and_execute_add_ah_dh_updates_high_bytes_in_x86() {
+        let bytes = [0xB6, 0x01, 0xB4, 0x02, 0x02, 0xE6];
+        let decoded = decode_block(&bytes, 0x6000, GuestArch::X86).expect("decode block");
+        let ir = lower_to_ir(&decoded).expect("lower ir");
+        let mut state = CpuState::new(GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        execute_ir(&mut state, &mut memory, &ir).expect("execute add ah, dh");
+
+        assert_eq!(state.get(Register::Rax), 0x0300);
+        assert!(!state.flags.zf);
     }
 
     #[test]
@@ -9598,6 +12228,7 @@ mod tests {
         let mut memory = MemoryImage::default();
 
         state.set(Register::Rbp, 0x7000_ff90);
+        memory.map_bytes(0x7000_ff88, &[0; 2]);
 
         execute_ir(&mut state, &mut memory, &ir).expect("execute fwait; fstcw [ebp-8]");
 
@@ -9619,6 +12250,347 @@ mod tests {
         execute_ir(&mut state, &mut memory, &ir).expect("execute fldcw [ebp-4]");
 
         assert_eq!(state.x87.rounding_mode, X87RoundingMode::TowardZero);
+    }
+
+    #[test]
+    fn decode_and_execute_fldz_fst_and_fstp_store_f32_values() {
+        let start_address = 0x1902_8120;
+        let bytes = [
+            0xD9, 0xEE, // fldz
+            0xD9, 0x15, 0x00, 0x20, 0x00, 0x00, // fst dword ptr [0x2000]
+            0xD9, 0x1D, 0x04, 0x20, 0x00, 0x00, // fstp dword ptr [0x2004]
+        ];
+        let decoded = decode_block(&bytes, start_address, GuestArch::X86).expect("decode block");
+        let ir = lower_to_ir(&decoded).expect("lower ir");
+        let mut state = CpuState::new(GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        memory.map_bytes(0x2000, &[0; 8]);
+
+        execute_ir(&mut state, &mut memory, &ir).expect("execute fldz/fst/fstp sequence");
+
+        assert_eq!(read_memory_value(&memory, 0x2000, 4).expect("fst target"), 0);
+        assert_eq!(read_memory_value(&memory, 0x2004, 4).expect("fstp target"), 0);
+        assert!(state.x87.stack.is_empty());
+    }
+
+    #[test]
+    fn decode_and_execute_fld_m64real_round_trips_through_fstp() {
+        let start_address = 0x1902_8130;
+        let bytes = [
+            0xDD, 0x05, 0x00, 0x20, 0x00, 0x00, // fld qword ptr [0x2000]
+            0xDD, 0x1D, 0x08, 0x20, 0x00, 0x00, // fstp qword ptr [0x2008]
+        ];
+        let decoded = decode_block(&bytes, start_address, GuestArch::X86).expect("decode block");
+        let ir = lower_to_ir(&decoded).expect("lower ir");
+        let mut state = CpuState::new(GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        memory.map_bytes(0x2000, &1.5_f64.to_bits().to_le_bytes());
+
+        execute_ir(&mut state, &mut memory, &ir).expect("execute fld/fstp m64real sequence");
+
+        assert_eq!(read_memory_value(&memory, 0x2008, 8).expect("fstp target"), 1.5_f64.to_bits());
+        assert!(state.x87.stack.is_empty());
+    }
+
+    #[test]
+    fn decode_and_execute_fild_i32_round_trips_through_fstp() {
+        let start_address = 0x1902_8140;
+        let bytes = [
+            0xDB, 0x05, 0x00, 0x20, 0x00, 0x00, // fild dword ptr [0x2000]
+            0xDD, 0x1D, 0x08, 0x20, 0x00, 0x00, // fstp qword ptr [0x2008]
+        ];
+        let decoded = decode_block(&bytes, start_address, GuestArch::X86).expect("decode block");
+        let ir = lower_to_ir(&decoded).expect("lower ir");
+        let mut state = CpuState::new(GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        memory.map_bytes(0x2000, &42_i32.to_le_bytes());
+
+        execute_ir(&mut state, &mut memory, &ir).expect("execute fild/fstp sequence");
+
+        assert_eq!(read_memory_value(&memory, 0x2008, 8).expect("fstp target"), 42.0_f64.to_bits());
+        assert!(state.x87.stack.is_empty());
+    }
+
+    #[test]
+    fn decode_and_execute_fild_i64_round_trips_through_fstp() {
+        let start_address = 0x1902_814c;
+        let bytes = [
+            0xDF, 0x2D, 0x00, 0x20, 0x00, 0x00, // fild qword ptr [0x2000]
+            0xDD, 0x1D, 0x08, 0x20, 0x00, 0x00, // fstp qword ptr [0x2008]
+        ];
+        let decoded = decode_block(&bytes, start_address, GuestArch::X86).expect("decode block");
+        let ir = lower_to_ir(&decoded).expect("lower ir");
+        let mut state = CpuState::new(GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        memory.map_bytes(0x2000, &42_i64.to_le_bytes());
+
+        execute_ir(&mut state, &mut memory, &ir).expect("execute fild/fstp sequence");
+
+        assert_eq!(read_memory_value(&memory, 0x2008, 8).expect("fstp target"), 42.0_f64.to_bits());
+        assert!(state.x87.stack.is_empty());
+    }
+
+    #[test]
+    fn decode_and_execute_fchs_negates_top_of_x87_stack() {
+        let start_address = 0x1902_8158;
+        let bytes = [
+            0xD9, 0xE8, // fld1
+            0xD9, 0xE0, // fchs
+            0xDD, 0x1D, 0x00, 0x20, 0x00, 0x00, // fstp qword ptr [0x2000]
+        ];
+        let decoded = decode_block(&bytes, start_address, GuestArch::X86).expect("decode block");
+        let ir = lower_to_ir(&decoded).expect("lower ir");
+        let mut state = CpuState::new(GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        memory.map_bytes(0x2000, &[0; 8]);
+
+        execute_ir(&mut state, &mut memory, &ir).expect("execute fchs sequence");
+
+        assert_eq!(read_memory_value(&memory, 0x2000, 8).expect("fstp target"), (-1.0_f64).to_bits());
+        assert!(state.x87.stack.is_empty());
+    }
+
+    #[test]
+    fn decode_and_execute_fdiv_m64real_divides_st0_by_memory_operand() {
+        let start_address = 0x1902_815f;
+        let bytes = [
+            0xDD, 0x05, 0x00, 0x20, 0x00, 0x00, // fld qword ptr [0x2000]
+            0xDC, 0x35, 0x08, 0x20, 0x00, 0x00, // fdiv qword ptr [0x2008]
+            0xDD, 0x1D, 0x10, 0x20, 0x00, 0x00, // fstp qword ptr [0x2010]
+        ];
+        let decoded = decode_block(&bytes, start_address, GuestArch::X86).expect("decode block");
+        let ir = lower_to_ir(&decoded).expect("lower ir");
+        let mut state = CpuState::new(GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        memory.map_bytes(0x2000, &6.0_f64.to_bits().to_le_bytes());
+        memory.map_bytes(0x2008, &2.0_f64.to_bits().to_le_bytes());
+
+        execute_ir(&mut state, &mut memory, &ir).expect("execute fdiv sequence");
+
+        assert_eq!(read_memory_value(&memory, 0x2010, 8).expect("fstp target"), 3.0_f64.to_bits());
+        assert!(state.x87.stack.is_empty());
+    }
+
+    #[test]
+    fn decode_and_execute_fxch_swaps_top_with_selected_register() {
+        let start_address = 0x1902_8150;
+        let bytes = [
+            0xD9, 0xE8, // fld1
+            0xD9, 0xEE, // fldz
+            0xD9, 0xEB, // fldpi
+            0xD9, 0xCA, // fxch st(2)
+            0xDD, 0x1D, 0x00, 0x20, 0x00, 0x00, // fstp qword ptr [0x2000]
+        ];
+        let decoded = decode_block(&bytes, start_address, GuestArch::X86).expect("decode block");
+        let ir = lower_to_ir(&decoded).expect("lower ir");
+        let mut state = CpuState::new(GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        memory.map_bytes(0x2000, &[0; 8]);
+
+        execute_ir(&mut state, &mut memory, &ir).expect("execute fxch sequence");
+
+        assert_eq!(read_memory_value(&memory, 0x2000, 8).expect("fstp target"), 1.0_f64.to_bits());
+    }
+
+
+    #[test]
+    fn decode_and_execute_pushfd_and_popfd_round_trip_id_bit() {
+        let start_address = 0x1902_8186;
+        let bytes = [
+            0x9C, // pushfd
+            0x58, // pop eax
+            0x35, 0x00, 0x00, 0x20, 0x00, // xor eax, 0x200000
+            0x50, // push eax
+            0x9D, // popfd
+            0x9C, // pushfd
+            0x58, // pop eax
+        ];
+        let decoded = decode_block(&bytes, start_address, GuestArch::X86).expect("decode block");
+        let ir = lower_to_ir(&decoded).expect("lower ir");
+        let mut state = CpuState::new(GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        state.set(Register::Rsp, 0x8000);
+        state.flags.cf = true;
+
+        memory.map_bytes(0x7ffc, &[0; 4]);
+
+        execute_ir(&mut state, &mut memory, &ir).expect("execute pushfd/popf sequence");
+
+        assert_eq!(state.get(Register::Rax) & 0x200000, 0x200000);
+        assert_eq!(state.get(Register::Rax) & 0x1, 0x1);
+        assert_eq!(state.get(Register::Rsp), 0x8000);
+    }
+
+    #[test]
+    fn decode_and_execute_cld_clears_direction_flag() {
+        let start_address = 0x18ff_fe7a;
+        let bytes = [0xFC];
+        let decoded = decode_block(&bytes, start_address, GuestArch::X86).expect("decode block");
+        let ir = lower_to_ir(&decoded).expect("lower ir");
+        let mut state = CpuState::new(GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        state.eflags_extra = 1 << 10;
+
+        execute_ir(&mut state, &mut memory, &ir).expect("execute cld");
+
+        assert_eq!(state.eflags_extra & (1 << 10), 0);
+    }
+
+    #[test]
+    fn decode_and_execute_fmul_multiplies_st0_by_selected_register() {
+        let start_address = 0x1902_8160;
+        let bytes = [
+            0xD9, 0xEB, // fldpi
+            0xD9, 0xEA, // fldl2e
+            0xD8, 0xC9, // fmul st(0), st(1)
+            0xDD, 0x1D, 0x00, 0x20, 0x00, 0x00, // fstp qword ptr [0x2000]
+        ];
+        let decoded = decode_block(&bytes, start_address, GuestArch::X86).expect("decode block");
+        let ir = lower_to_ir(&decoded).expect("lower ir");
+        let mut state = CpuState::new(GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        memory.map_bytes(0x2000, &[0; 8]);
+
+        execute_ir(&mut state, &mut memory, &ir).expect("execute fmul sequence");
+
+        let expected = (std::f64::consts::PI * std::f64::consts::LOG2_E).to_bits();
+        assert_eq!(read_memory_value(&memory, 0x2000, 8).expect("fstp target"), expected);
+    }
+
+    #[test]
+    fn decode_and_execute_faddp_accumulates_into_selected_register_and_pops() {
+        let start_address = 0x1902_8170;
+        let bytes = [
+            0xD9, 0xE8, // fld1
+            0xD9, 0xEE, // fldz
+            0xD9, 0xEB, // fldpi
+            0xDE, 0xC2, // faddp st(2), st(0)
+        ];
+        let decoded = decode_block(&bytes, start_address, GuestArch::X86).expect("decode block");
+        let ir = lower_to_ir(&decoded).expect("lower ir");
+        let mut state = CpuState::new(GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        execute_ir(&mut state, &mut memory, &ir).expect("execute faddp sequence");
+
+        assert_eq!(state.x87.stack.len(), 2);
+        assert_eq!(state.x87.stack[0].to_bits(), (1.0_f64 + std::f64::consts::PI).to_bits());
+        assert_eq!(state.x87.stack[1].to_bits(), 0.0_f64.to_bits());
+    }
+
+    #[test]
+    fn decode_and_execute_fdiv_divides_st0_by_selected_register() {
+        let start_address = 0x1902_8169;
+        let bytes = [
+            0xDD, 0x05, 0x00, 0x20, 0x00, 0x00, // fld qword ptr [0x2000]
+            0xDD, 0x05, 0x08, 0x20, 0x00, 0x00, // fld qword ptr [0x2008]
+            0xD8, 0xF1, // fdiv st(0), st(1)
+            0xDD, 0x1D, 0x10, 0x20, 0x00, 0x00, // fstp qword ptr [0x2010]
+        ];
+        let decoded = decode_block(&bytes, start_address, GuestArch::X86).expect("decode block");
+        let ir = lower_to_ir(&decoded).expect("lower ir");
+        let mut state = CpuState::new(GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        memory.map_bytes(0x2000, &6.0_f64.to_bits().to_le_bytes());
+        memory.map_bytes(0x2008, &2.0_f64.to_bits().to_le_bytes());
+
+        execute_ir(&mut state, &mut memory, &ir).expect("execute fdiv register sequence");
+
+        assert_eq!(read_memory_value(&memory, 0x2010, 8).expect("fstp target"), (2.0_f64 / 6.0_f64).to_bits());
+    }
+
+    #[test]
+    fn decode_and_execute_fdivp_divides_selected_register_and_pops() {
+        let start_address = 0x1902_817a;
+        let bytes = [
+            0xDD, 0x05, 0x00, 0x20, 0x00, 0x00, // fld qword ptr [0x2000]
+            0xDD, 0x05, 0x08, 0x20, 0x00, 0x00, // fld qword ptr [0x2008]
+            0xDE, 0xF1, // fdivp st(1), st(0)
+            0xDD, 0x1D, 0x10, 0x20, 0x00, 0x00, // fstp qword ptr [0x2010]
+        ];
+        let decoded = decode_block(&bytes, start_address, GuestArch::X86).expect("decode block");
+        let ir = lower_to_ir(&decoded).expect("lower ir");
+        let mut state = CpuState::new(GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        memory.map_bytes(0x2000, &6.0_f64.to_bits().to_le_bytes());
+        memory.map_bytes(0x2008, &2.0_f64.to_bits().to_le_bytes());
+
+        execute_ir(&mut state, &mut memory, &ir).expect("execute fdivp sequence");
+
+        assert_eq!(read_memory_value(&memory, 0x2010, 8).expect("fstp target"), 3.0_f64.to_bits());
+        assert!(state.x87.stack.is_empty());
+    }
+
+    #[test]
+    fn decode_and_execute_fstp_st_replaces_target_and_pops() {
+        let start_address = 0x1902_8180;
+        let bytes = [
+            0xD9, 0xE8, // fld1
+            0xD9, 0xEB, // fldpi
+            0xDD, 0xD9, // fstp st(1)
+        ];
+        let decoded = decode_block(&bytes, start_address, GuestArch::X86).expect("decode block");
+        let ir = lower_to_ir(&decoded).expect("lower ir");
+        let mut state = CpuState::new(GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        execute_ir(&mut state, &mut memory, &ir).expect("execute fstp st(i) sequence");
+
+        assert_eq!(state.x87.stack.len(), 1);
+        assert_eq!(state.x87.stack[0].to_bits(), std::f64::consts::PI.to_bits());
+    }
+
+    #[test]
+    fn decode_and_execute_fld_m32real_round_trips_through_fstp() {
+        let start_address = 0x1902_8190;
+        let bytes = [
+            0xD9, 0x05, 0x00, 0x20, 0x00, 0x00, // fld dword ptr [0x2000]
+            0xDD, 0x1D, 0x08, 0x20, 0x00, 0x00, // fstp qword ptr [0x2008]
+        ];
+        let decoded = decode_block(&bytes, start_address, GuestArch::X86).expect("decode block");
+        let ir = lower_to_ir(&decoded).expect("lower ir");
+        let mut state = CpuState::new(GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        memory.map_bytes(0x2000, &1.25_f32.to_bits().to_le_bytes());
+
+        execute_ir(&mut state, &mut memory, &ir).expect("execute fld m32real sequence");
+
+        assert_eq!(read_memory_value(&memory, 0x2008, 8).expect("fstp target"), 1.25_f64.to_bits());
+        assert!(state.x87.stack.is_empty());
+    }
+
+    #[test]
+    fn decode_and_execute_fmul_m64real_multiplies_st0() {
+        let start_address = 0x1902_81a0;
+        let bytes = [
+            0xD9, 0xEB, // fldpi
+            0xDC, 0x0D, 0x00, 0x20, 0x00, 0x00, // fmul qword ptr [0x2000]
+            0xDD, 0x1D, 0x08, 0x20, 0x00, 0x00, // fstp qword ptr [0x2008]
+        ];
+        let decoded = decode_block(&bytes, start_address, GuestArch::X86).expect("decode block");
+        let ir = lower_to_ir(&decoded).expect("lower ir");
+        let mut state = CpuState::new(GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        memory.map_bytes(0x2000, &2.0_f64.to_bits().to_le_bytes());
+
+        execute_ir(&mut state, &mut memory, &ir).expect("execute fmul m64real sequence");
+
+        assert_eq!(read_memory_value(&memory, 0x2008, 8).expect("fstp target"), (std::f64::consts::PI * 2.0).to_bits());
+        assert!(state.x87.stack.is_empty());
     }
 
     #[test]
@@ -9871,6 +12843,8 @@ mod tests {
         state.set(Register::R10, 0x30);
         state.set(Register::R8, 0xABCD);
 
+        memory.map_bytes(0x2070, &[0; 1]);
+
         execute_ir(&mut state, &mut memory, &ir).expect("execute byte mov store");
 
         assert_eq!(memory.read_u8(0x2070).expect("read stored byte"), 0xCD);
@@ -9911,11 +12885,44 @@ mod tests {
 
         state.set(Register::Rcx, 4);
         state.set(Register::Rdx, 0x1234_5678);
-
         execute_ir(&mut state, &mut memory, &ir).expect("execute ror edx, cl");
 
         assert_eq!(state.get(Register::Rdx), 0x8123_4567);
         assert!(state.flags.cf);
+    }
+
+    #[test]
+    fn decode_and_execute_rol_esi_cl_rotates_left() {
+        let start_address = 0x190b_af64;
+        let bytes = [0xD3, 0xC6];
+        let decoded = decode_block(&bytes, start_address, GuestArch::X86).expect("decode block");
+        let ir = lower_to_ir(&decoded).expect("lower ir");
+        let mut state = CpuState::new(GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        state.set(Register::Rcx, 4);
+        state.set(Register::Rsi, 0x1234_5678);
+        execute_ir(&mut state, &mut memory, &ir).expect("execute rol esi, cl");
+
+        assert_eq!(state.get(Register::Rsi), 0x2345_6781);
+        assert!(state.flags.cf);
+    }
+
+    #[test]
+    fn decode_and_execute_rol_eax_imm8_rotates_left() {
+        let start_address = 0x18f6_fd5b;
+        let bytes = [0xC1, 0xC0, 0x0F];
+        let decoded = decode_block(&bytes, start_address, GuestArch::X86).expect("decode block");
+        let ir = lower_to_ir(&decoded).expect("lower ir");
+        let mut state = CpuState::new(GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        state.set(Register::Rax, 0x1234_5678);
+
+        execute_ir(&mut state, &mut memory, &ir).expect("execute rol eax, 0x0f");
+
+        assert_eq!(state.get(Register::Rax), 0x2b3c_091a);
+        assert!(!state.flags.cf);
     }
 
     #[test]
@@ -10130,6 +13137,96 @@ mod tests {
     }
 
     #[test]
+    fn decode_and_execute_sbb_edx_imm8_uses_carry_flag() {
+        let start_address = 0x21ba_1574_2720;
+        let bytes = [0x83, 0xDA, 0x00];
+        let decoded = decode_block(&bytes, start_address, GuestArch::X64).expect("decode block");
+        let ir = lower_to_ir(&decoded).expect("lower ir");
+        let mut state = CpuState::new(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+
+        state.set(Register::Rdx, 5);
+        state.flags.cf = true;
+
+        execute_ir(&mut state, &mut memory, &ir).expect("execute sbb edx, 0");
+
+        assert_eq!(state.get(Register::Rdx), 4);
+        assert!(!state.flags.cf);
+        assert!(!state.flags.zf);
+    }
+
+    #[test]
+    fn decode_and_execute_sbb_ebx_imm32_uses_carry_flag() {
+        let start_address = 0x1901_4e4b;
+        let bytes = [0x81, 0xDB, 0xDE, 0xB1, 0x9D, 0x01];
+        let decoded = decode_block(&bytes, start_address, GuestArch::X86).expect("decode block");
+        let ir = lower_to_ir(&decoded).expect("lower ir");
+        let mut state = CpuState::new(GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        state.set(Register::Rbx, 0x0200_0000);
+        state.flags.cf = true;
+
+        execute_ir(&mut state, &mut memory, &ir).expect("execute sbb ebx, imm32");
+
+        assert_eq!(state.get(Register::Rbx), 0x0062_4e21);
+        assert!(!state.flags.cf);
+        assert!(!state.flags.zf);
+    }
+
+    #[test]
+    fn decode_and_execute_sbb_al_al_then_inc_al_materializes_borrow() {
+        let start_address = 0x1902_1ead;
+        let bytes = [0x1A, 0xC0, 0xFE, 0xC0];
+        let decoded = decode_block(&bytes, start_address, GuestArch::X86).expect("decode block");
+        let ir = lower_to_ir(&decoded).expect("lower ir");
+        let mut state = CpuState::new(GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        state.set(Register::Rax, 0x01);
+        state.flags.cf = true;
+
+        execute_ir(&mut state, &mut memory, &ir).expect("execute sbb/inc sequence");
+
+        assert_eq!(state.get(Register::Rax) & 0xff, 0);
+        assert!(state.flags.zf);
+    }
+
+    #[test]
+    fn decode_and_execute_mov_ch_imm8_updates_ecx_high_byte_in_x86() {
+        let start_address = 0x21ba_1574_2724;
+        let bytes = [0xB5, 0x01];
+        let decoded = decode_block(&bytes, start_address, GuestArch::X86).expect("decode block");
+        let ir = lower_to_ir(&decoded).expect("lower ir");
+        let mut state = CpuState::new(GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        state.set(Register::Rcx, 0x1234_5678);
+        state.set(Register::Rbp, 0x7000_fb00);
+
+        execute_ir(&mut state, &mut memory, &ir).expect("execute mov ch, 1");
+
+        assert_eq!(state.get(Register::Rcx), 0x1234_0178);
+        assert_eq!(state.get(Register::Rbp), 0x7000_fb00);
+    }
+
+    #[test]
+    fn decode_and_execute_rex_mov_bpl_imm8_updates_ebp_low_byte_in_x64() {
+        let start_address = 0x21ba_1574_2728;
+        let bytes = [0x40, 0xB5, 0x01];
+        let decoded = decode_block(&bytes, start_address, GuestArch::X64).expect("decode block");
+        let ir = lower_to_ir(&decoded).expect("lower ir");
+        let mut state = CpuState::new(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+
+        state.set(Register::Rbp, 0x1234_5678_9abc_00ef);
+
+        execute_ir(&mut state, &mut memory, &ir).expect("execute rex mov bpl, 1");
+
+        assert_eq!(state.get(Register::Rbp), 0x1234_5678_9abc_0001);
+    }
+
+    #[test]
     fn decode_and_execute_or_r10b_imm8_preserves_upper_bits() {
         let start_address = 0x266b_ceb3_2749;
         let bytes = [0x41, 0x80, 0xCA, 0x30];
@@ -10211,6 +13308,24 @@ mod tests {
     }
 
     #[test]
+    fn decode_and_execute_lfence_decodes_as_noop_barrier() {
+        let start_address = 0x1900_9597;
+        let bytes = [0x0F, 0xAE, 0xE8];
+        let decoded = decode_block(&bytes, start_address, GuestArch::X86).expect("decode block");
+        let ir = lower_to_ir(&decoded).expect("lower ir");
+        let mut state = CpuState::new(GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        state.set(Register::Rax, 0x7000_e505);
+        state.set(Register::Rcx, 0x7000_e525);
+
+        execute_ir(&mut state, &mut memory, &ir).expect("execute lfence");
+
+        assert_eq!(state.get(Register::Rax), 0x7000_e505);
+        assert_eq!(state.get(Register::Rcx), 0x7000_e525);
+    }
+
+    #[test]
     fn decode_and_execute_mov_al_imm8_preserves_upper_bits() {
         let start_address = 0x2a6b_ceb3_2749;
         let bytes = [0xB0, 0x01];
@@ -10277,6 +13392,45 @@ mod tests {
         execute_ir(&mut state, &mut memory, &ir).expect("execute mov eax, fs:[0]");
 
         assert_eq!(state.get(Register::Rax), 0x1234_5678);
+    }
+
+    #[test]
+    fn decode_and_execute_mov_segment_selector_store_to_memory() {
+        let start_address = 0x18ff_d534;
+        let bytes = [
+            0x66, 0x8C, 0x15, 0x00, 0x20, 0x00, 0x00,
+            0x66, 0x8C, 0x25, 0x02, 0x20, 0x00, 0x00,
+        ];
+        let decoded = decode_block(&bytes, start_address, GuestArch::X86).expect("decode mov r/m16, sreg");
+        let ir = lower_to_ir(&decoded).expect("lower mov r/m16, sreg");
+        let mut state = CpuState::new(GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        memory.map_bytes(0x2000, &[0; 4]);
+
+        execute_ir(&mut state, &mut memory, &ir).expect("execute mov r/m16, sreg");
+
+        assert_eq!(read_memory_value(&memory, 0x2000, 2).expect("read saved ss"), 0x23);
+        assert_eq!(read_memory_value(&memory, 0x2002, 2).expect("read saved fs"), 0x3b);
+    }
+
+    #[test]
+    fn decode_and_execute_pop_memory_stores_stack_value() {
+        let start_address = 0x18ff_d55f;
+        let bytes = [0x8F, 0x05, 0x00, 0x20, 0x00, 0x00];
+        let decoded = decode_block(&bytes, start_address, GuestArch::X86).expect("decode pop [disp32]");
+        let ir = lower_to_ir(&decoded).expect("lower pop [disp32]");
+        let mut state = CpuState::new(GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        state.set(Register::Rsp, 0x7000_fff0);
+        memory.map_bytes(0x7000_fff0, &0x1122_3344_u32.to_le_bytes());
+        memory.map_bytes(0x2000, &[0; 4]);
+
+        execute_ir(&mut state, &mut memory, &ir).expect("execute pop [disp32]");
+
+        assert_eq!(read_memory_value(&memory, 0x2000, 4).expect("read stored value"), 0x1122_3344);
+        assert_eq!(state.get(Register::Rsp), 0x7000_fff4);
     }
 
     #[test]

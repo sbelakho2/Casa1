@@ -21,6 +21,7 @@ pub struct WindowClassInfo {
     pub background: u64,
     pub menu_name: u64,
     pub class_name_ptr: u64,
+    pub icon_small: u64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -376,6 +377,7 @@ pub struct WindowState {
 #[derive(Debug, Clone)]
 struct WindowClass {
     atom: Atom,
+    #[allow(dead_code)]
     name: String,
     info: WindowClassInfo,
 }
@@ -537,8 +539,33 @@ impl User32Subsystem {
                 background: 0,
                 menu_name: 0,
                 class_name_ptr: 0,
+                icon_small: 0,
             },
         )
+    }
+
+    pub fn register_common_control_classes(&mut self) {
+        for class_name in [
+            "toolbarwindow32",
+            "tooltips_class32",
+            "statusclass32",
+            "syslistview32",
+            "systreeview32",
+            "sysheader32",
+            "systabcontrol32",
+            "msctls_updown32",
+            "msctls_progress32",
+            "msctls_hotkey32",
+            "sysanimate32",
+            "sysmonthcal32",
+            "sysdatetimepick32",
+            "rebarwindow32",
+            "comboboxex32",
+            "syspager",
+            "syslink",
+        ] {
+            self.register_class_ex_w(class_name);
+        }
     }
 
     pub fn register_class_info(&mut self, class_name: &str, info: WindowClassInfo) -> Atom {

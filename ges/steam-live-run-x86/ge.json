@@ -1,0 +1,1125 @@
+{
+  "schema_version": 2,
+  "name": "steam-live-run-x86",
+  "arch": "x86",
+  "winver": "win11-23h2",
+  "user_name": "casa1",
+  "long_paths_enabled": false,
+  "drive_mappings": [
+    {
+      "drive": "C",
+      "target": "<GE>/drive_c",
+      "read_only": false,
+      "enabled": true,
+      "requires_permission": false
+    },
+    {
+      "drive": "Z",
+      "target": "/",
+      "read_only": true,
+      "enabled": false,
+      "requires_permission": true
+    }
+  ],
+  "override_profiles": [],
+  "fs_state": {
+    "entries": {
+      "C:\\": {
+        "kind": "Directory",
+        "original_case": "drive_c",
+        "attributes": [
+          "directory"
+        ],
+        "creation_time_ticks": 133105159660000000,
+        "last_access_time_ticks": 133105159660000000,
+        "last_write_time_ticks": 133105159660000000
+      },
+      "C:\\modern-header.bmp": {
+        "kind": "File",
+        "original_case": "modern-header.bmp",
+        "attributes": [],
+        "creation_time_ticks": 133105159660000000,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 133105159660000000
+      },
+      "C:\\modern-wizard.bmp": {
+        "kind": "File",
+        "original_case": "modern-wizard.bmp",
+        "attributes": [],
+        "creation_time_ticks": 133105159660000000,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 133105159660000000
+      },
+      "C:\\nsc0008.tmp": {
+        "kind": "File",
+        "original_case": "nsc0008.tmp",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\nsc0012.tmp": {
+        "kind": "File",
+        "original_case": "nsc0012.tmp",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\nsd0012.tmp": {
+        "kind": "File",
+        "original_case": "nsd0012.tmp",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\nsdialogs.dll": {
+        "kind": "File",
+        "original_case": "nsDialogs.dll",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\nse0012.tmp": {
+        "kind": "File",
+        "original_case": "nse0012.tmp",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\nsexec.dll": {
+        "kind": "File",
+        "original_case": "nsExec.dll",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\nsf0012.tmp": {
+        "kind": "File",
+        "original_case": "nsf0012.tmp",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\nsg0012.tmp": {
+        "kind": "File",
+        "original_case": "nsg0012.tmp",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\nsi0012.tmp": {
+        "kind": "File",
+        "original_case": "nsi0012.tmp",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\nsj0012.tmp": {
+        "kind": "File",
+        "original_case": "nsj0012.tmp",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\nsk0012.tmp": {
+        "kind": "File",
+        "original_case": "nsk0012.tmp",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\nsl0012.tmp": {
+        "kind": "File",
+        "original_case": "nsl0012.tmp",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\nsm0012.tmp": {
+        "kind": "File",
+        "original_case": "nsm0012.tmp",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\nsn0012.tmp": {
+        "kind": "File",
+        "original_case": "nsn0012.tmp",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\nso0012.tmp": {
+        "kind": "File",
+        "original_case": "nso0012.tmp",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\nsp0012.tmp": {
+        "kind": "File",
+        "original_case": "nsp0012.tmp",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\nsq0012.tmp": {
+        "kind": "File",
+        "original_case": "nsq0012.tmp",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\nss0008.tmp": {
+        "kind": "File",
+        "original_case": "nss0008.tmp",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\nss0012.tmp": {
+        "kind": "File",
+        "original_case": "nss0012.tmp",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\nst0012.tmp": {
+        "kind": "File",
+        "original_case": "nst0012.tmp",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\nsv0012.tmp": {
+        "kind": "File",
+        "original_case": "nsv0012.tmp",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\nsx0012.tmp": {
+        "kind": "File",
+        "original_case": "nsx0012.tmp",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\nsy0012.tmp": {
+        "kind": "File",
+        "original_case": "nsy0012.tmp",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\steam.exe": {
+        "kind": "File",
+        "original_case": "Steam.exe",
+        "attributes": [],
+        "creation_time_ticks": 133607153160000000,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 133607153160000000
+      },
+      "C:\\steam\\bin\\steamservice.exe": {
+        "kind": "File",
+        "original_case": "SteamService.exe",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\steam\\logs": {
+        "kind": "Directory",
+        "original_case": "logs",
+        "attributes": [
+          "directory"
+        ],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\steam\\public\\steambootstrapper_brazilian.txt": {
+        "kind": "File",
+        "original_case": "steambootstrapper_brazilian.txt",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\steam\\public\\steambootstrapper_bulgarian.txt": {
+        "kind": "File",
+        "original_case": "steambootstrapper_bulgarian.txt",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\steam\\public\\steambootstrapper_czech.txt": {
+        "kind": "File",
+        "original_case": "steambootstrapper_czech.txt",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\steam\\public\\steambootstrapper_danish.txt": {
+        "kind": "File",
+        "original_case": "steambootstrapper_danish.txt",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\steam\\public\\steambootstrapper_dutch.txt": {
+        "kind": "File",
+        "original_case": "steambootstrapper_dutch.txt",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\steam\\public\\steambootstrapper_english.txt": {
+        "kind": "File",
+        "original_case": "steambootstrapper_english.txt",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\steam\\public\\steambootstrapper_finnish.txt": {
+        "kind": "File",
+        "original_case": "steambootstrapper_finnish.txt",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\steam\\public\\steambootstrapper_french.txt": {
+        "kind": "File",
+        "original_case": "steambootstrapper_french.txt",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\steam\\public\\steambootstrapper_german.txt": {
+        "kind": "File",
+        "original_case": "steambootstrapper_german.txt",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\steam\\public\\steambootstrapper_greek.txt": {
+        "kind": "File",
+        "original_case": "steambootstrapper_greek.txt",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\steam\\public\\steambootstrapper_hungarian.txt": {
+        "kind": "File",
+        "original_case": "steambootstrapper_hungarian.txt",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\steam\\public\\steambootstrapper_indonesian.txt": {
+        "kind": "File",
+        "original_case": "steambootstrapper_indonesian.txt",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\steam\\public\\steambootstrapper_italian.txt": {
+        "kind": "File",
+        "original_case": "steambootstrapper_italian.txt",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\steam\\public\\steambootstrapper_japanese.txt": {
+        "kind": "File",
+        "original_case": "steambootstrapper_japanese.txt",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\steam\\public\\steambootstrapper_korean.txt": {
+        "kind": "File",
+        "original_case": "steambootstrapper_korean.txt",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\steam\\public\\steambootstrapper_koreana.txt": {
+        "kind": "File",
+        "original_case": "steambootstrapper_koreana.txt",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\steam\\public\\steambootstrapper_latam.txt": {
+        "kind": "File",
+        "original_case": "steambootstrapper_latam.txt",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\steam\\public\\steambootstrapper_norwegian.txt": {
+        "kind": "File",
+        "original_case": "steambootstrapper_norwegian.txt",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\steam\\public\\steambootstrapper_polish.txt": {
+        "kind": "File",
+        "original_case": "steambootstrapper_polish.txt",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\steam\\public\\steambootstrapper_portuguese.txt": {
+        "kind": "File",
+        "original_case": "steambootstrapper_portuguese.txt",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\steam\\public\\steambootstrapper_romanian.txt": {
+        "kind": "File",
+        "original_case": "steambootstrapper_romanian.txt",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\steam\\public\\steambootstrapper_russian.txt": {
+        "kind": "File",
+        "original_case": "steambootstrapper_russian.txt",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\steam\\public\\steambootstrapper_schinese.txt": {
+        "kind": "File",
+        "original_case": "steambootstrapper_schinese.txt",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\steam\\public\\steambootstrapper_spanish.txt": {
+        "kind": "File",
+        "original_case": "steambootstrapper_spanish.txt",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\steam\\public\\steambootstrapper_swedish.txt": {
+        "kind": "File",
+        "original_case": "steambootstrapper_swedish.txt",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\steam\\public\\steambootstrapper_tchinese.txt": {
+        "kind": "File",
+        "original_case": "steambootstrapper_tchinese.txt",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\steam\\public\\steambootstrapper_thai.txt": {
+        "kind": "File",
+        "original_case": "steambootstrapper_thai.txt",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\steam\\public\\steambootstrapper_turkish.txt": {
+        "kind": "File",
+        "original_case": "steambootstrapper_turkish.txt",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\steam\\public\\steambootstrapper_ukrainian.txt": {
+        "kind": "File",
+        "original_case": "steambootstrapper_ukrainian.txt",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\steam\\public\\steambootstrapper_vietnamese.txt": {
+        "kind": "File",
+        "original_case": "steambootstrapper_vietnamese.txt",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\steam\\steam.exe": {
+        "kind": "File",
+        "original_case": "Steam.exe",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\steam\\uninstall.exe": {
+        "kind": "File",
+        "original_case": "uninstall.exe",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\steambootstrapper_brazilian.txt": {
+        "kind": "File",
+        "original_case": "steambootstrapper_brazilian.txt",
+        "attributes": [],
+        "creation_time_ticks": 133340989940000000,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 133340989940000000
+      },
+      "C:\\steambootstrapper_bulgarian.txt": {
+        "kind": "File",
+        "original_case": "steambootstrapper_bulgarian.txt",
+        "attributes": [],
+        "creation_time_ticks": 133340989940000000,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 133340989940000000
+      },
+      "C:\\steambootstrapper_czech.txt": {
+        "kind": "File",
+        "original_case": "steambootstrapper_czech.txt",
+        "attributes": [],
+        "creation_time_ticks": 133409290140000000,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 133409290140000000
+      },
+      "C:\\steambootstrapper_danish.txt": {
+        "kind": "File",
+        "original_case": "steambootstrapper_danish.txt",
+        "attributes": [],
+        "creation_time_ticks": 133340989940000000,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 133340989940000000
+      },
+      "C:\\steambootstrapper_dutch.txt": {
+        "kind": "File",
+        "original_case": "steambootstrapper_dutch.txt",
+        "attributes": [],
+        "creation_time_ticks": 133340989940000000,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 133340989940000000
+      },
+      "C:\\steambootstrapper_english.txt": {
+        "kind": "File",
+        "original_case": "steambootstrapper_english.txt",
+        "attributes": [],
+        "creation_time_ticks": 133510448360000000,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 133510448360000000
+      },
+      "C:\\steambootstrapper_finnish.txt": {
+        "kind": "File",
+        "original_case": "steambootstrapper_finnish.txt",
+        "attributes": [],
+        "creation_time_ticks": 133540669360000000,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 133540669360000000
+      },
+      "C:\\steambootstrapper_french.txt": {
+        "kind": "File",
+        "original_case": "steambootstrapper_french.txt",
+        "attributes": [],
+        "creation_time_ticks": 133540669360000000,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 133540669360000000
+      },
+      "C:\\steambootstrapper_german.txt": {
+        "kind": "File",
+        "original_case": "steambootstrapper_german.txt",
+        "attributes": [],
+        "creation_time_ticks": 133340989940000000,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 133340989940000000
+      },
+      "C:\\steambootstrapper_greek.txt": {
+        "kind": "File",
+        "original_case": "steambootstrapper_greek.txt",
+        "attributes": [],
+        "creation_time_ticks": 133367783120000000,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 133367783120000000
+      },
+      "C:\\steambootstrapper_hungarian.txt": {
+        "kind": "File",
+        "original_case": "steambootstrapper_hungarian.txt",
+        "attributes": [],
+        "creation_time_ticks": 133340989940000000,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 133340989940000000
+      },
+      "C:\\steambootstrapper_indonesian.txt": {
+        "kind": "File",
+        "original_case": "steambootstrapper_indonesian.txt",
+        "attributes": [],
+        "creation_time_ticks": 133367783120000000,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 133367783120000000
+      },
+      "C:\\steambootstrapper_italian.txt": {
+        "kind": "File",
+        "original_case": "steambootstrapper_italian.txt",
+        "attributes": [],
+        "creation_time_ticks": 133340989940000000,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 133340989940000000
+      },
+      "C:\\steambootstrapper_japanese.txt": {
+        "kind": "File",
+        "original_case": "steambootstrapper_japanese.txt",
+        "attributes": [],
+        "creation_time_ticks": 133340989940000000,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 133340989940000000
+      },
+      "C:\\steambootstrapper_korean.txt": {
+        "kind": "File",
+        "original_case": "steambootstrapper_korean.txt",
+        "attributes": [],
+        "creation_time_ticks": 133510448360000000,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 133510448360000000
+      },
+      "C:\\steambootstrapper_koreana.txt": {
+        "kind": "File",
+        "original_case": "steambootstrapper_koreana.txt",
+        "attributes": [],
+        "creation_time_ticks": 133510448360000000,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 133510448360000000
+      },
+      "C:\\steambootstrapper_latam.txt": {
+        "kind": "File",
+        "original_case": "steambootstrapper_latam.txt",
+        "attributes": [],
+        "creation_time_ticks": 133340989940000000,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 133340989940000000
+      },
+      "C:\\steambootstrapper_norwegian.txt": {
+        "kind": "File",
+        "original_case": "steambootstrapper_norwegian.txt",
+        "attributes": [],
+        "creation_time_ticks": 133510448360000000,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 133510448360000000
+      },
+      "C:\\steambootstrapper_polish.txt": {
+        "kind": "File",
+        "original_case": "steambootstrapper_polish.txt",
+        "attributes": [],
+        "creation_time_ticks": 133340989940000000,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 133340989940000000
+      },
+      "C:\\steambootstrapper_portuguese.txt": {
+        "kind": "File",
+        "original_case": "steambootstrapper_portuguese.txt",
+        "attributes": [],
+        "creation_time_ticks": 133340989940000000,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 133340989940000000
+      },
+      "C:\\steambootstrapper_romanian.txt": {
+        "kind": "File",
+        "original_case": "steambootstrapper_romanian.txt",
+        "attributes": [],
+        "creation_time_ticks": 133340989940000000,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 133340989940000000
+      },
+      "C:\\steambootstrapper_russian.txt": {
+        "kind": "File",
+        "original_case": "steambootstrapper_russian.txt",
+        "attributes": [],
+        "creation_time_ticks": 133340989940000000,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 133340989940000000
+      },
+      "C:\\steambootstrapper_schinese.txt": {
+        "kind": "File",
+        "original_case": "steambootstrapper_schinese.txt",
+        "attributes": [],
+        "creation_time_ticks": 133340989940000000,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 133340989940000000
+      },
+      "C:\\steambootstrapper_spanish.txt": {
+        "kind": "File",
+        "original_case": "steambootstrapper_spanish.txt",
+        "attributes": [],
+        "creation_time_ticks": 133428317000000000,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 133428317000000000
+      },
+      "C:\\steambootstrapper_swedish.txt": {
+        "kind": "File",
+        "original_case": "steambootstrapper_swedish.txt",
+        "attributes": [],
+        "creation_time_ticks": 133340989940000000,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 133340989940000000
+      },
+      "C:\\steambootstrapper_tchinese.txt": {
+        "kind": "File",
+        "original_case": "steambootstrapper_tchinese.txt",
+        "attributes": [],
+        "creation_time_ticks": 133340989940000000,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 133340989940000000
+      },
+      "C:\\steambootstrapper_thai.txt": {
+        "kind": "File",
+        "original_case": "steambootstrapper_thai.txt",
+        "attributes": [],
+        "creation_time_ticks": 133510448360000000,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 133510448360000000
+      },
+      "C:\\steambootstrapper_turkish.txt": {
+        "kind": "File",
+        "original_case": "steambootstrapper_turkish.txt",
+        "attributes": [],
+        "creation_time_ticks": 133340989940000000,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 133340989940000000
+      },
+      "C:\\steambootstrapper_ukrainian.txt": {
+        "kind": "File",
+        "original_case": "steambootstrapper_ukrainian.txt",
+        "attributes": [],
+        "creation_time_ticks": 133340989940000000,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 133340989940000000
+      },
+      "C:\\steambootstrapper_vietnamese.txt": {
+        "kind": "File",
+        "original_case": "steambootstrapper_vietnamese.txt",
+        "attributes": [],
+        "creation_time_ticks": 133445677480000000,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 133445677480000000
+      },
+      "C:\\steamservice.exe": {
+        "kind": "File",
+        "original_case": "SteamService.exe",
+        "attributes": [],
+        "creation_time_ticks": 133607153160000000,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 133607153160000000
+      },
+      "C:\\system.dll": {
+        "kind": "File",
+        "original_case": "System.dll",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\uninstall.exe": {
+        "kind": "File",
+        "original_case": "uninstall.exe",
+        "attributes": [],
+        "creation_time_ticks": 133607156180000000,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 133607156180000000
+      },
+      "C:\\users": {
+        "kind": "Directory",
+        "original_case": "users",
+        "attributes": [
+          "directory"
+        ],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\users\\casa1": {
+        "kind": "Directory",
+        "original_case": "casa1",
+        "attributes": [
+          "directory"
+        ],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\users\\casa1\\appdata": {
+        "kind": "Directory",
+        "original_case": "AppData",
+        "attributes": [
+          "directory"
+        ],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\users\\casa1\\appdata\\local\\temp": {
+        "kind": "Directory",
+        "original_case": "Temp",
+        "attributes": [
+          "directory"
+        ],
+        "creation_time_ticks": 133105159660000000,
+        "last_access_time_ticks": 133105159660000000,
+        "last_write_time_ticks": 133105159660000000
+      },
+      "C:\\users\\casa1\\appdata\\local\\temp\\nsa0008.tmp": {
+        "kind": "File",
+        "original_case": "nsa0008.tmp",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\users\\casa1\\appdata\\local\\temp\\nsb0008.tmp": {
+        "kind": "File",
+        "original_case": "nsb0008.tmp",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\users\\casa1\\appdata\\local\\temp\\nsc0008.tmp": {
+        "kind": "File",
+        "original_case": "nsc0008.tmp",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\users\\casa1\\appdata\\local\\temp\\nse0008.tmp": {
+        "kind": "File",
+        "original_case": "nse0008.tmp",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\users\\casa1\\appdata\\local\\temp\\nsf0008.tmp": {
+        "kind": "File",
+        "original_case": "nsf0008.tmp",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\users\\casa1\\appdata\\local\\temp\\nsg0008.tmp": {
+        "kind": "File",
+        "original_case": "nsg0008.tmp",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\users\\casa1\\appdata\\local\\temp\\nsh0008.tmp": {
+        "kind": "File",
+        "original_case": "nsh0008.tmp",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\users\\casa1\\appdata\\local\\temp\\nsi0008.tmp": {
+        "kind": "File",
+        "original_case": "nsi0008.tmp",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\users\\casa1\\appdata\\local\\temp\\nsj0008.tmp": {
+        "kind": "File",
+        "original_case": "nsj0008.tmp",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\users\\casa1\\appdata\\local\\temp\\nsk0008.tmp": {
+        "kind": "File",
+        "original_case": "nsk0008.tmp",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\users\\casa1\\appdata\\local\\temp\\nsl0008.tmp": {
+        "kind": "File",
+        "original_case": "nsl0008.tmp",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\users\\casa1\\appdata\\local\\temp\\nsm0008.tmp": {
+        "kind": "File",
+        "original_case": "nsm0008.tmp",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\users\\casa1\\appdata\\local\\temp\\nsn0008.tmp": {
+        "kind": "File",
+        "original_case": "nsn0008.tmp",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\users\\casa1\\appdata\\local\\temp\\nso0008.tmp": {
+        "kind": "File",
+        "original_case": "nso0008.tmp",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\users\\casa1\\appdata\\local\\temp\\nsp0008.tmp": {
+        "kind": "File",
+        "original_case": "nsp0008.tmp",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\users\\casa1\\appdata\\local\\temp\\nsq0008.tmp": {
+        "kind": "File",
+        "original_case": "nsq0008.tmp",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\users\\casa1\\appdata\\local\\temp\\nsr0008.tmp": {
+        "kind": "File",
+        "original_case": "nsr0008.tmp",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\users\\casa1\\appdata\\local\\temp\\nss0008.tmp": {
+        "kind": "File",
+        "original_case": "nss0008.tmp",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\users\\casa1\\appdata\\local\\temp\\nst0008.tmp": {
+        "kind": "File",
+        "original_case": "nst0008.tmp",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\users\\casa1\\appdata\\local\\temp\\nsu0008.tmp": {
+        "kind": "File",
+        "original_case": "nsu0008.tmp",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\users\\casa1\\appdata\\local\\temp\\nsv0008.tmp": {
+        "kind": "File",
+        "original_case": "nsv0008.tmp",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\users\\casa1\\appdata\\local\\temp\\nsw0008.tmp": {
+        "kind": "File",
+        "original_case": "nsw0008.tmp",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\users\\casa1\\appdata\\local\\temp\\nsx0008.tmp": {
+        "kind": "File",
+        "original_case": "nsx0008.tmp",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\users\\casa1\\appdata\\local\\temp\\nsy0008.tmp": {
+        "kind": "File",
+        "original_case": "nsy0008.tmp",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\users\\casa1\\appdata\\local\\temp\\nsz0008.tmp": {
+        "kind": "File",
+        "original_case": "nsz0008.tmp",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\users\\casa1\\appdata\\local\\temp\\steam.exe": {
+        "kind": "File",
+        "original_case": "Steam.exe",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\users\\casa1\\appdata\\local\\temp\\steamsetup.exe": {
+        "kind": "File",
+        "original_case": "SteamSetup.exe",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\users\\casa1\\appdata\\roaming": {
+        "kind": "Directory",
+        "original_case": "Roaming",
+        "attributes": [
+          "directory"
+        ],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\users\\casa1\\appdata\\roaming\\microsoft": {
+        "kind": "Directory",
+        "original_case": "Microsoft",
+        "attributes": [
+          "directory"
+        ],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\users\\casa1\\appdata\\roaming\\microsoft\\windows": {
+        "kind": "Directory",
+        "original_case": "Windows",
+        "attributes": [
+          "directory"
+        ],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\users\\casa1\\appdata\\roaming\\microsoft\\windows\\start menu": {
+        "kind": "Directory",
+        "original_case": "Start Menu",
+        "attributes": [
+          "directory"
+        ],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\users\\casa1\\appdata\\roaming\\microsoft\\windows\\start menu\\programs": {
+        "kind": "Directory",
+        "original_case": "Programs",
+        "attributes": [
+          "directory"
+        ],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "C:\\users\\casa1\\desktop": {
+        "kind": "Directory",
+        "original_case": "Desktop",
+        "attributes": [
+          "directory"
+        ],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "\\\\?\\C:\\Steam\\.crash": {
+        "kind": "File",
+        "original_case": ".crash",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "\\\\?\\C:\\Steam\\logs\\%s.txt": {
+        "kind": "File",
+        "original_case": "%s.txt",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "\\\\?\\C:\\steam\\logs\\%s.txt": {
+        "kind": "File",
+        "original_case": "%s.txt",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      }
+    }
+  }
+}

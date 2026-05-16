@@ -6,9 +6,11 @@ use crate::ge::{
 use crate::reason::ReasonCode;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
+use std::rc::{Rc, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub type Handle = u32;
@@ -18,11 +20,14 @@ pub const WAIT_ABANDONED: u32 = 0x0000_0080;
 pub const WAIT_TIMEOUT: u32 = 0x0000_0102;
 pub const WAIT_IO_COMPLETION: u32 = 0x0000_00C0;
 pub const CP_UTF8: u32 = 65_001;
+const HANDLE_FLAG_INHERIT: u32 = 0x0000_0001;
+const HANDLE_FLAG_PROTECT_FROM_CLOSE: u32 = 0x0000_0002;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ObjectType {
     File,
     Event,
+    IoCompletionPort,
     Mutex,
     Semaphore,
     Thread,
@@ -247,7 +252,8 @@ struct HandleEntry {
 #[derive(Debug, Clone)]
 enum KernelObject {
     File(FileObject),
-    Event(EventObject),
+    Event(EventHandle),
+    IoCompletionPort(IoCompletionPortObject),
     Mutex(MutexObject),
     Semaphore(SemaphoreObject),
     Thread(ThreadObject),
@@ -272,6 +278,23 @@ struct FileObject {
 struct EventObject {
     manual_reset: bool,
     signaled: bool,
+}
+
+type EventHandle = Rc<RefCell<EventObject>>;
+type EventWeak = Weak<RefCell<EventObject>>;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IoCompletionPacket {
+    pub bytes_transferred: u32,
+    pub completion_key: u64,
+    pub overlapped: u64,
+    pub internal: u64,
+}
+
+#[derive(Debug, Clone)]
+struct IoCompletionPortObject {
+    concurrent_threads: u32,
+    queue: VecDeque<IoCompletionPacket>,
 }
 
 #[derive(Debug, Clone)]
@@ -353,6 +376,14 @@ struct OverlappedRequest {
     state: OverlappedState,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct IoCompletionAssociation {
+    #[allow(dead_code)]
+    port_handle: Handle,
+    #[allow(dead_code)]
+    completion_key: u64,
+}
+
 #[derive(Debug, Clone)]
 struct VirtualRegion {
     base_address: u64,
@@ -400,9 +431,12 @@ pub struct Win32Subsystem {
     next_overlapped_id: u64,
     next_tls_slot: u32,
     handles: BTreeMap<Handle, HandleEntry>,
+    protected_close_handles: BTreeSet<Handle>,
     overlapped: BTreeMap<u64, OverlappedRequest>,
+    io_completion_associations: BTreeMap<Handle, IoCompletionAssociation>,
     memory_regions: BTreeMap<u64, VirtualRegion>,
     heaps: BTreeMap<Handle, HeapState>,
+    named_events: BTreeMap<String, EventWeak>,
     time: TimeState,
     locale: LocaleState,
     thread_apcs: BTreeMap<u32, VecDeque<String>>,
@@ -429,9 +463,12 @@ impl Win32Subsystem {
             next_overlapped_id: 1,
             next_tls_slot: 0,
             handles: BTreeMap::new(),
+            protected_close_handles: BTreeSet::new(),
             overlapped: BTreeMap::new(),
+            io_completion_associations: BTreeMap::new(),
             memory_regions: BTreeMap::new(),
             heaps: BTreeMap::new(),
+            named_events: BTreeMap::new(),
             time: TimeState {
                 dtm,
                 live_pacing: live_pacing && !dtm,
@@ -474,6 +511,31 @@ impl Win32Subsystem {
         }
     }
 
+    pub fn current_process_handle(&mut self) -> Handle {
+        if let Some(handle) = self.handles.iter().find_map(|(handle, entry)| match &entry.object {
+            KernelObject::Process(process) if process.process_id == self.current_process_id => Some(*handle),
+            _ => None,
+        }) {
+            handle
+        } else {
+            self.insert_object(
+                ObjectType::Process,
+                0x1F0FFF,
+                false,
+                KernelObject::Process(ProcessObject {
+                    process_id: self.current_process_id,
+                    executable: "macwin".to_string(),
+                    argv: vec!["macwin".to_string()],
+                    cwd: "C:\\".to_string(),
+                    environment: BTreeMap::new(),
+                    inherited_handles: Vec::new(),
+                    modules: vec!["macwin".to_string(), "kernel32.dll".to_string(), "ntdll.dll".to_string()],
+                    exit_code: None,
+                }),
+            )
+        }
+    }
+
     pub fn guest_path_to_host_path(&self, path: &str) -> AppResult<PathBuf> {
         let (_, host_path) = self.resolve_host_path(path)?;
         Ok(host_path)
@@ -495,6 +557,23 @@ impl Win32Subsystem {
 
     pub fn describe_handle(&self, handle: Handle) -> AppResult<HandleDescriptor> {
         Ok(self.handle_entry(handle)?.descriptor.clone())
+    }
+
+    pub fn set_handle_information(&mut self, handle: Handle, mask: u32, flags: u32) -> AppResult<()> {
+        {
+            let entry = self.handle_entry_mut(handle)?;
+            if mask & HANDLE_FLAG_INHERIT != 0 {
+                entry.descriptor.inheritable = flags & HANDLE_FLAG_INHERIT != 0;
+            }
+        }
+        if mask & HANDLE_FLAG_PROTECT_FROM_CLOSE != 0 {
+            if flags & HANDLE_FLAG_PROTECT_FROM_CLOSE != 0 {
+                self.protected_close_handles.insert(handle);
+            } else {
+                self.protected_close_handles.remove(&handle);
+            }
+        }
+        Ok(())
     }
 
     pub fn file_state(&self, handle: Handle) -> AppResult<FileHandleState> {
@@ -550,23 +629,167 @@ impl Win32Subsystem {
         }
     }
 
-    pub fn create_event(&mut self, manual_reset: bool, initial_state: bool, inheritable: bool) -> Handle {
-        self.insert_object(
+    pub fn create_event(
+        &mut self,
+        manual_reset: bool,
+        initial_state: bool,
+        inheritable: bool,
+        name: Option<&str>,
+    ) -> (Handle, bool) {
+        if let Some(name) = name {
+            if let Some(event) = self.named_events.get(name).and_then(Weak::upgrade) {
+                let handle = self.insert_object(
+                    ObjectType::Event,
+                    0x1F0003,
+                    inheritable,
+                    KernelObject::Event(event),
+                );
+                return (handle, true);
+            }
+        }
+
+        let event = Rc::new(RefCell::new(EventObject {
+            manual_reset,
+            signaled: initial_state,
+        }));
+        if let Some(name) = name {
+            self.named_events
+                .insert(name.to_string(), Rc::downgrade(&event));
+        }
+        let handle = self.insert_object(ObjectType::Event, 0x1F0003, inheritable, KernelObject::Event(event));
+        (handle, false)
+    }
+
+    pub fn open_event(&mut self, desired_access: u32, inheritable: bool, name: &str) -> AppResult<Handle> {
+        let Some(event) = self.named_events.get(name).and_then(Weak::upgrade) else {
+            self.named_events.remove(name);
+            return Err(AppError::new(
+                ReasonCode::RcFsNotFound,
+                format!("event {name} not found"),
+            ));
+        };
+
+        Ok(self.insert_object(
             ObjectType::Event,
-            0x1F0003,
+            desired_access,
             inheritable,
-            KernelObject::Event(EventObject {
-                manual_reset,
-                signaled: initial_state,
-            }),
-        )
+            KernelObject::Event(event),
+        ))
+    }
+
+    pub fn create_io_completion_port(
+        &mut self,
+        file_handle: Option<Handle>,
+        existing_completion_port: Option<Handle>,
+        completion_key: u64,
+        concurrent_threads: u32,
+    ) -> AppResult<Handle> {
+        if file_handle.is_none() && existing_completion_port.is_some() {
+            return Err(AppError::new(
+                ReasonCode::RcCliInvalid,
+                "CreateIoCompletionPort requires a file handle when reusing an existing port",
+            ));
+        }
+
+        let port_handle = if let Some(port_handle) = existing_completion_port {
+            match &self.handle_entry(port_handle)?.object {
+                KernelObject::IoCompletionPort(_) => port_handle,
+                _ => return invalid_handle("handle is not an I/O completion port"),
+            }
+        } else {
+            self.insert_object(
+                ObjectType::IoCompletionPort,
+                0x1F0003,
+                false,
+                KernelObject::IoCompletionPort(IoCompletionPortObject {
+                    concurrent_threads,
+                    queue: VecDeque::new(),
+                }),
+            )
+        };
+
+        if let Some(file_handle) = file_handle {
+            self.handle_entry(file_handle)?;
+            if self.io_completion_associations.contains_key(&file_handle) {
+                return Err(AppError::new(
+                    ReasonCode::RcCliInvalid,
+                    format!("handle {file_handle} is already associated with an I/O completion port"),
+                ));
+            }
+            self.io_completion_associations.insert(
+                file_handle,
+                IoCompletionAssociation {
+                    port_handle,
+                    completion_key,
+                },
+            );
+        }
+
+        Ok(port_handle)
+    }
+
+    pub fn post_queued_completion_status(
+        &mut self,
+        completion_port: Handle,
+        bytes_transferred: u32,
+        completion_key: u64,
+        overlapped: u64,
+    ) -> AppResult<()> {
+        let entry = self.handle_entry_mut(completion_port)?;
+        match &mut entry.object {
+            KernelObject::IoCompletionPort(port) => {
+                let _ = port.concurrent_threads;
+                port.queue.push_back(IoCompletionPacket {
+                    bytes_transferred,
+                    completion_key,
+                    overlapped,
+                    internal: 0,
+                });
+                Ok(())
+            }
+            _ => invalid_handle("handle is not an I/O completion port"),
+        }
+    }
+
+    pub fn dequeue_io_completion_packets(
+        &mut self,
+        completion_port: Handle,
+        max_packets: usize,
+    ) -> AppResult<Vec<IoCompletionPacket>> {
+        if max_packets == 0 {
+            return Err(AppError::new(
+                ReasonCode::RcCliInvalid,
+                "GetQueuedCompletionStatusEx requires a non-zero entry count",
+            ));
+        }
+        let entry = self.handle_entry_mut(completion_port)?;
+        match &mut entry.object {
+            KernelObject::IoCompletionPort(port) => {
+                let mut packets = Vec::new();
+                while packets.len() < max_packets {
+                    let Some(packet) = port.queue.pop_front() else {
+                        break;
+                    };
+                    packets.push(packet);
+                }
+                if packets.is_empty() {
+                    Err(AppError::new(
+                        ReasonCode::RcWin32Timeout,
+                        format!("I/O completion port {completion_port} has no queued packets"),
+                    ))
+                } else {
+                    Ok(packets)
+                }
+            }
+            _ => invalid_handle("handle is not an I/O completion port"),
+        }
     }
 
     pub fn set_event(&mut self, handle: Handle) -> AppResult<()> {
         let entry = self.handle_entry_mut(handle)?;
         match &mut entry.object {
             KernelObject::Event(event) => {
-                event.signaled = true;
+                event.borrow_mut().signaled = true;
                 Ok(())
             }
             _ => invalid_handle("handle is not an event"),
@@ -577,7 +800,7 @@ impl Win32Subsystem {
         let entry = self.handle_entry_mut(handle)?;
         match &mut entry.object {
             KernelObject::Event(event) => {
-                event.signaled = false;
+                event.borrow_mut().signaled = false;
                 Ok(())
             }
             _ => invalid_handle("handle is not an event"),
@@ -691,6 +914,7 @@ impl Win32Subsystem {
         let entry = self.handle_entry_mut(handle)?;
         match &mut entry.object {
             KernelObject::Event(event) => {
+                let mut event = event.borrow_mut();
                 if event.signaled {
                     if !event.manual_reset {
                         event.signaled = false;
@@ -839,9 +1063,16 @@ impl Win32Subsystem {
     }
 
     pub fn close_handle(&mut self, handle: Handle) -> AppResult<()> {
+        if self.protected_close_handles.contains(&handle) {
+            return Err(AppError::new(
+                ReasonCode::RcHelperPermissionDenied,
+                format!("handle {handle} is protected from close"),
+            ));
+        }
         let mut entry = self.handles.remove(&handle).ok_or_else(|| {
             AppError::new(ReasonCode::RcWin32InvalidHandle, format!("invalid handle {handle}"))
         })?;
+        self.protected_close_handles.remove(&handle);
         if let KernelObject::File(file) = &mut entry.object {
             if let Some(ge_handle) = &file.ge_handle {
                 self.ge.close_file_handle(ge_handle)?;
@@ -901,6 +1132,35 @@ impl Win32Subsystem {
         };
         self.sync_entry(&normalized_path, &host_path, false)?;
         Ok(bytes.len() as u32)
+    }
+
+    pub fn flush_file_buffers(&mut self, handle: Handle) -> AppResult<()> {
+        let entry = self.handle_entry(handle)?;
+        match &entry.object {
+            KernelObject::File(file) => {
+                if file.host_path.is_dir() {
+                    return invalid_handle("handle is not a file");
+                }
+                let file_handle = OpenOptions::new()
+                    .read(true)
+                    .open(&file.host_path)
+                    .map_err(|error| {
+                        AppError::from_io(
+                            ReasonCode::RcIo,
+                            format!("failed to open {} for flush", file.host_path.display()),
+                            &error,
+                        )
+                    })?;
+                file_handle.sync_all().map_err(|error| {
+                    AppError::from_io(
+                        ReasonCode::RcIo,
+                        format!("failed to flush {}", file.host_path.display()),
+                        &error,
+                    )
+                })
+            }
+            _ => invalid_handle("handle is not a file"),
+        }
     }
 
     pub fn get_file_size_ex(&self, handle: Handle) -> AppResult<u64> {
@@ -2347,6 +2607,10 @@ fn request_id_len_inner(_request: &OverlappedRequest) -> usize {
 
 fn split_find_search_pattern(path: &str) -> (String, String) {
     let trimmed = path.trim_end_matches(['\\', '/']);
+    if trimmed.len() < path.len() {
+        // Path ended with separator — entire trimmed part is the directory.
+        return (trimmed.to_string(), "*".to_string());
+    }
     if let Some(index) = trimmed.rfind(['\\', '/']) {
         let directory = if index == 2 && trimmed.as_bytes().get(1) == Some(&b':') {
             trimmed[..=index].to_string()
@@ -2427,7 +2691,11 @@ fn find_pattern_char_eq(left: char, right: char) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{paced_sleep_duration_ms, split_find_search_pattern, windows_pattern_matches};
+    use super::{
+        paced_sleep_duration_ms, split_find_search_pattern, windows_pattern_matches, IoCompletionPacket,
+        Win32Subsystem,
+    };
+    use crate::ge::{GameEnvironment, GeArch};
 
     #[test]
     fn paced_sleep_duration_preserves_non_live_requests() {
@@ -2459,5 +2727,34 @@ mod tests {
         assert!(windows_pattern_matches("*.*", "Steam"));
         assert!(windows_pattern_matches("steam.*", "Steam"));
         assert!(!windows_pattern_matches("steam??.tmp", "Steam001.tmp"));
+    }
+
+    #[test]
+    fn io_completion_port_posts_and_dequeues_packets() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "iocp", GeArch::X86, "win11-23h2")
+            .expect("create game environment");
+        let mut win32 = Win32Subsystem::new(ge, false);
+
+        let port = win32
+            .create_io_completion_port(None, None, 0, 0)
+            .expect("create completion port");
+        win32
+            .post_queued_completion_status(port, 7, 0x1234, 0x5678)
+            .expect("post completion status");
+
+        let packets = win32
+            .dequeue_io_completion_packets(port, 4)
+            .expect("dequeue completion packet");
+
+        assert_eq!(
+            packets,
+            vec![IoCompletionPacket {
+                bytes_transferred: 7,
+                completion_key: 0x1234,
+                overlapped: 0x5678,
+                internal: 0,
+            }]
+        );
     }
 }

@@ -57,6 +57,7 @@ pub struct DebugDirectoryEntry {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LoadConfig {
+    pub security_cookie: u64,
     pub guard_flags: u32,
     pub se_handler_table: u64,
     pub se_handler_count: u64,
@@ -816,15 +817,63 @@ fn parse_load_config(
     let present_size = load_config_size
         .max(directory.size as usize)
         .min(available_size);
-    let (se_handler_table_offset, se_handler_count_offset, guard_cf_check_offset, guard_cf_dispatch_offset, guard_cf_function_table_offset, guard_cf_function_count_offset, guard_flags_offset) =
-        if pointer_bytes == 8 {
-            (0x60_usize, 0x68_usize, 0x70_usize, 0x78_usize, 0x80_usize, 0x88_usize, 0x90_usize)
-        } else if present_size >= 0x48 {
-            (0x40_usize, 0x44_usize, 0x48_usize, 0x4c_usize, 0x50_usize, 0x54_usize, 0x58_usize)
-        } else {
-            (0x38_usize, 0x3c_usize, 0x48_usize, 0x4c_usize, 0x50_usize, 0x54_usize, 0x58_usize)
-        };
+    let (
+        security_cookie_offset,
+        se_handler_table_offset,
+        se_handler_count_offset,
+        guard_cf_check_offset,
+        guard_cf_dispatch_offset,
+        guard_cf_function_table_offset,
+        guard_cf_function_count_offset,
+        guard_flags_offset,
+    ) = if pointer_bytes == 8 {
+        (
+            Some(0x58_usize),
+            0x60_usize,
+            0x68_usize,
+            0x70_usize,
+            0x78_usize,
+            0x80_usize,
+            0x88_usize,
+            0x90_usize,
+        )
+    } else if present_size >= 0x48 {
+        (
+            Some(0x3c_usize),
+            0x40_usize,
+            0x44_usize,
+            0x48_usize,
+            0x4c_usize,
+            0x50_usize,
+            0x54_usize,
+            0x58_usize,
+        )
+    } else {
+        (
+            None,
+            0x38_usize,
+            0x3c_usize,
+            0x48_usize,
+            0x4c_usize,
+            0x50_usize,
+            0x54_usize,
+            0x58_usize,
+        )
+    };
     Ok(Some(LoadConfig {
+        security_cookie: security_cookie_offset
+            .map(|field_offset| {
+                read_load_config_pointer(
+                    bytes,
+                    offset,
+                    present_size,
+                    field_offset,
+                    pointer_bytes,
+                    "SecurityCookie",
+                )
+            })
+            .transpose()?
+            .unwrap_or(0),
         guard_flags: read_load_config_u32(bytes, offset, present_size, guard_flags_offset, "GuardFlags")?,
         se_handler_table: read_load_config_pointer(
             bytes,
@@ -1898,6 +1947,7 @@ mod tests {
             .expect("parse load config")
             .expect("load config present");
 
+        assert_eq!(load_config.security_cookie, 0);
         assert_eq!(load_config.guard_flags, 0);
         assert_eq!(load_config.se_handler_table, 0x007b_7358);
         assert_eq!(load_config.se_handler_count, 625);
@@ -1905,5 +1955,35 @@ mod tests {
         assert_eq!(load_config.guard_cf_dispatch_function_pointer, 0);
         assert_eq!(load_config.guard_cf_function_table, 0);
         assert_eq!(load_config.guard_cf_function_count, 0);
+    }
+
+    #[test]
+    fn parse_load_config_reads_x86_security_cookie() {
+        let mut bytes = vec![0_u8; 0x80];
+        write_u32(&mut bytes, 0x00, 0x60).expect("write load config size");
+        write_u32(&mut bytes, 0x3c, 0x0123_4567).expect("write security cookie");
+        write_u32(&mut bytes, 0x40, 0x007b_7358).expect("write SEH table");
+        write_u32(&mut bytes, 0x44, 625).expect("write SEH count");
+        let sections = vec![PeSection {
+            name: ".rdata".to_string(),
+            virtual_address: 0x1000,
+            virtual_size: bytes.len() as u32,
+            raw_data_ptr: 0,
+            raw_data_size: bytes.len() as u32,
+            characteristics: IMAGE_SCN_MEM_READ,
+        }];
+        let mut directories = vec![DataDirectory::default(); IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG + 1];
+        directories[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG] = DataDirectory {
+            virtual_address: 0x1000,
+            size: 0x60,
+        };
+
+        let load_config = parse_load_config(&bytes, &sections, &directories, 4)
+            .expect("parse load config")
+            .expect("load config present");
+
+        assert_eq!(load_config.security_cookie, 0x0123_4567);
+        assert_eq!(load_config.se_handler_table, 0x007b_7358);
+        assert_eq!(load_config.se_handler_count, 625);
     }
 }
