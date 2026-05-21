@@ -4,11 +4,16 @@ use crate::gfx::DxgiFormat;
 use crate::reason::ReasonCode;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
-use minifb::{Key, KeyRepeat, Scale, Window, WindowOptions};
+use minifb::{Key, KeyRepeat, MouseButton as MinifbMouseButton, MouseMode, Scale, Window, WindowOptions};
+use std::fs;
 use std::collections::{BTreeSet, VecDeque};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+
+const PLACEHOLDER_FRAME_WIDTH: usize = 160;
+const PLACEHOLDER_FRAME_HEIGHT: usize = 90;
+const LIVE_WINDOW_OFFSET: isize = 32;
 
 #[derive(Debug, Clone)]
 pub struct LiveFrame {
@@ -37,6 +42,12 @@ pub enum LiveInputEvent {
         shift: bool,
         altgr: bool,
     },
+    MouseInput {
+        x: i32,
+        y: i32,
+        left_pressed: bool,
+        left_released: bool,
+    },
     CloseRequested,
 }
 
@@ -53,6 +64,8 @@ pub struct LiveHostSession {
     pub audio_rx: Receiver<LiveAudioChunk>,
     pub input_tx: Sender<LiveInputEvent>,
 }
+
+const EXPORT_LIVE_FRAME_ENV: &str = "CASA1_EXPORT_LIVE_FRAME";
 
 pub fn new_live_session() -> (LiveHostSession, LivePeSession) {
     let (frame_tx, frame_rx) = bounded(4);
@@ -78,13 +91,28 @@ pub fn run_live_host_session<T>(
     worker: JoinHandle<AppResult<T>>,
 ) -> AppResult<T> {
     let audio = LiveAudioOutput::new()?;
-    let mut window: Option<Window> = None;
-    let mut frame_buffer = Vec::new();
-    let mut frame_width = 0_usize;
-    let mut frame_height = 0_usize;
+    let export_live_frame_path = std::env::var(EXPORT_LIVE_FRAME_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let mut window = create_window(title, PLACEHOLDER_FRAME_WIDTH, PLACEHOLDER_FRAME_HEIGHT)?;
+    let mut frame_buffer = vec![0; PLACEHOLDER_FRAME_WIDTH * PLACEHOLDER_FRAME_HEIGHT];
+    let mut frame_width = PLACEHOLDER_FRAME_WIDTH;
+    let mut frame_height = PLACEHOLDER_FRAME_HEIGHT;
     let mut latest_frame: Option<LiveFrame> = None;
     let mut close_requested = false;
     let mut held_scancodes = BTreeSet::new();
+    let mut showing_placeholder = true;
+    let mut previous_mouse_pos = None;
+    let mut left_mouse_down = false;
+
+    window
+        .update_with_buffer(&frame_buffer, frame_width, frame_height)
+        .map_err(|error| {
+            AppError::new(
+                ReasonCode::RcIo,
+                format!("failed to draw initial live placeholder frame: {error}"),
+            )
+        })?;
 
     loop {
         audio.drain(&session.audio_rx);
@@ -92,75 +120,56 @@ pub fn run_live_host_session<T>(
             latest_frame = Some(frame);
         }
 
-        if window.is_none() {
-            if latest_frame.is_none() {
-                if worker.is_finished() {
-                    break;
-                }
-                match session.frame_rx.recv_timeout(Duration::from_millis(4)) {
-                    Ok(frame) => {
-                        latest_frame = Some(frame);
-                    }
-                    Err(_) => continue,
-                }
-            }
-
-            if let Some(frame) = latest_frame.take() {
-                let mut created_window = create_window(title, frame.width as usize, frame.height as usize)?;
-                frame_width = frame.width as usize;
-                frame_height = frame.height as usize;
-                decode_frame_buffer_into(&frame, &mut frame_buffer)?;
-                created_window
-                    .update_with_buffer(&frame_buffer, frame_width, frame_height)
-                    .map_err(|error| {
-                        AppError::new(
-                            ReasonCode::RcIo,
-                            format!("failed to draw initial live frame: {error}"),
-                        )
-                    })?;
-                window = Some(created_window);
-            }
+        if latest_frame.is_none() && worker.is_finished() {
+            break;
         }
-
-        let Some(window_ref) = window.as_mut() else {
-            continue;
-        };
 
         let mut frame_changed = false;
 
         if let Some(frame) = latest_frame.take() {
-            if frame.width as usize != frame_width || frame.height as usize != frame_height {
-                *window_ref = create_window(title, frame.width as usize, frame.height as usize)?;
+            if showing_placeholder
+                || frame.width as usize != frame_width
+                || frame.height as usize != frame_height
+            {
+                window = create_window(title, frame.width as usize, frame.height as usize)?;
                 frame_width = frame.width as usize;
                 frame_height = frame.height as usize;
             }
+            if let Some(path) = export_live_frame_path.as_deref() {
+                export_live_frame(&frame, Path::new(path))?;
+            }
             decode_frame_buffer_into(&frame, &mut frame_buffer)?;
             frame_changed = true;
+            showing_placeholder = false;
         }
 
-        pump_keyboard(window_ref, &session.input_tx, &mut held_scancodes);
-        if window_ref.is_key_down(Key::Escape) && !close_requested {
+        pump_keyboard(&window, &session.input_tx, &mut held_scancodes);
+        pump_mouse(
+            &window,
+            &session.input_tx,
+            &mut previous_mouse_pos,
+            &mut left_mouse_down,
+        );
+        if window.is_key_down(Key::Escape) && !close_requested {
             release_held_keys(&session.input_tx, &mut held_scancodes);
             let _ = session.input_tx.send(LiveInputEvent::CloseRequested);
             close_requested = true;
         }
 
-        if frame_width != 0 && frame_height != 0 {
-            if frame_changed {
-                window_ref
-                    .update_with_buffer(&frame_buffer, frame_width, frame_height)
-                    .map_err(|error| {
-                        AppError::new(
-                            ReasonCode::RcIo,
-                            format!("failed to present live frame: {error}"),
-                        )
-                    })?;
-            } else {
-                window_ref.update();
-            }
+        if frame_changed {
+            window
+                .update_with_buffer(&frame_buffer, frame_width, frame_height)
+                .map_err(|error| {
+                    AppError::new(
+                        ReasonCode::RcIo,
+                        format!("failed to present live frame: {error}"),
+                    )
+                })?;
+        } else {
+            window.update();
         }
 
-        if !window_ref.is_open() && !close_requested {
+        if !window.is_open() && !close_requested {
             release_held_keys(&session.input_tx, &mut held_scancodes);
             let _ = session.input_tx.send(LiveInputEvent::CloseRequested);
             close_requested = true;
@@ -185,7 +194,7 @@ fn create_window(title: &str, width: usize, height: usize) -> AppResult<Window> 
         height,
         WindowOptions {
             resize: true,
-            scale: Scale::X8,
+            scale: Scale::FitScreen,
             ..WindowOptions::default()
         },
     )
@@ -196,7 +205,10 @@ fn create_window(title: &str, width: usize, height: usize) -> AppResult<Window> 
         )
     })?;
     #[cfg(target_os = "macos")]
-    window.topmost(true);
+    {
+        window.topmost(true);
+        window.set_position(LIVE_WINDOW_OFFSET, LIVE_WINDOW_OFFSET);
+    }
     window.set_target_fps(240);
     Ok(window)
 }
@@ -302,6 +314,34 @@ fn pump_keyboard(window: &Window, input_tx: &Sender<LiveInputEvent>, held_scanco
     *held_scancodes = current_scancodes;
 }
 
+fn pump_mouse(
+    window: &Window,
+    input_tx: &Sender<LiveInputEvent>,
+    previous_mouse_pos: &mut Option<(i32, i32)>,
+    left_mouse_down: &mut bool,
+) {
+    let current_mouse_pos = window
+        .get_mouse_pos(MouseMode::Clamp)
+        .map(|(x, y)| (x.round() as i32, y.round() as i32));
+    let current_left_down = window.get_mouse_down(MinifbMouseButton::Left);
+    let left_pressed = current_left_down && !*left_mouse_down;
+    let left_released = !current_left_down && *left_mouse_down;
+
+    if let Some((x, y)) = current_mouse_pos {
+        if current_mouse_pos != *previous_mouse_pos || left_pressed || left_released {
+            let _ = input_tx.send(LiveInputEvent::MouseInput {
+                x,
+                y,
+                left_pressed,
+                left_released,
+            });
+        }
+    }
+
+    *previous_mouse_pos = current_mouse_pos;
+    *left_mouse_down = current_left_down;
+}
+
 fn send_key_down(input_tx: &Sender<LiveInputEvent>, scancode: u16, shift: bool, altgr: bool) {
     let _ = input_tx.send(LiveInputEvent::KeyDown {
         scancode,
@@ -375,6 +415,59 @@ fn decode_frame_buffer_into(frame: &LiveFrame, buffer: &mut Vec<u32>) -> AppResu
         }
     }
     Ok(())
+}
+
+fn export_live_frame(frame: &LiveFrame, path: &Path) -> AppResult<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            AppError::new(
+                ReasonCode::RcIo,
+                format!("failed to create {}: {error}", parent.display()),
+            )
+        })?;
+    }
+
+    let expected_bytes = (frame.width as usize)
+        .checked_mul(frame.height as usize)
+        .and_then(|pixel_count| pixel_count.checked_mul(4))
+        .ok_or_else(|| AppError::new(ReasonCode::RcD3dInvalidState, "live frame dimensions overflow"))?;
+    if frame.bytes.len() < expected_bytes {
+        return Err(AppError::new(
+            ReasonCode::RcD3dInvalidState,
+            format!(
+                "live frame buffer is too small for {}x{} {:?}",
+                frame.width, frame.height, frame.format
+            ),
+        ));
+    }
+
+    let mut ppm = format!("P6\n{} {}\n255\n", frame.width, frame.height).into_bytes();
+    ppm.reserve(frame.width as usize * frame.height as usize * 3);
+    match frame.format {
+        DxgiFormat::B8G8R8A8Unorm => {
+            for chunk in frame.bytes[..expected_bytes].chunks_exact(4) {
+                ppm.extend_from_slice(&[chunk[2], chunk[1], chunk[0]]);
+            }
+        }
+        DxgiFormat::R8G8B8A8Unorm => {
+            for chunk in frame.bytes[..expected_bytes].chunks_exact(4) {
+                ppm.extend_from_slice(&chunk[..3]);
+            }
+        }
+        other => {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!("live frame export does not support {other:?}"),
+            ))
+        }
+    }
+
+    fs::write(path, ppm).map_err(|error| {
+        AppError::new(
+            ReasonCode::RcIo,
+            format!("failed to write {}: {error}", path.display()),
+        )
+    })
 }
 
 struct LiveAudioOutput {

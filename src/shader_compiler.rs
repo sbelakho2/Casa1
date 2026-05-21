@@ -7,6 +7,7 @@
 use crate::error::{AppError, AppResult};
 use crate::reason::ReasonCode;
 use crate::shader::{ShaderStage, ReflectionResource};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -643,12 +644,14 @@ fn sanitize_name(name: &str) -> String {
     result
 }
 
-/// Compute a simple hash of DXIL bytes for cache lookup.
+/// Compute a SHA-256 hash of DXIL bytes for cache lookup.
+///
+/// Uses SHA-256 instead of DefaultHasher for deterministic, collision-resistant
+/// content addressing across process restarts.
 pub fn dxil_hash(dxil: &[u8]) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    dxil.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+    let mut hasher = Sha256::new();
+    hasher.update(dxil);
+    format!("{:x}", hasher.finalize())
 }
 
 // ---------------------------------------------------------------------------
@@ -750,7 +753,7 @@ mod tests {
         let hash1 = dxil_hash(data);
         let hash2 = dxil_hash(data);
         assert_eq!(hash1, hash2);
-        assert_eq!(hash1.len(), 16);
+        assert_eq!(hash1.len(), 64); // SHA-256 produces 64 hex chars
     }
 
     #[test]

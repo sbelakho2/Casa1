@@ -1,0 +1,762 @@
+steam-initial-globals startup_state=0x0 term_flag=0x0 array_count=0x0 array_ptr=0x0
+steam-callback-walk entry=0x155550f8 callback=0x1537e0f3 unwind=0x0 al_after=0x1 next_rva=0x17782b get_process_heap_target=<n/a> get_process_heap_binding=<n/a>
+steam-callback-walk entry=0x15555100 callback=0x1537e122 unwind=0x0 al_after=0x1 next_rva=0x17782b get_process_heap_target=<n/a> get_process_heap_binding=<n/a>
+steam-callback-walk entry=0x15555108 callback=0x153814cd unwind=0x15381597 al_after=0x1 next_rva=0x17782b get_process_heap_target=<n/a> get_process_heap_binding=<n/a>
+steam-callback-walk entry=0x15555110 callback=0x1526b670 unwind=0x1526b670 al_after=0x1 next_rva=0x17782b get_process_heap_target=<n/a> get_process_heap_binding=<n/a>
+steam-callback-walk entry=0x15555118 callback=0x1537c011 unwind=0x1537c069 al_after=0x1 next_rva=0x17782b get_process_heap_target=<n/a> get_process_heap_binding=<n/a>
+steam-failing-callback-import thunk=GetProcessHeap thunk_address=0x71000970 eax_after=0x1000 esp_after=0x7000ff94
+steam-callback-walk entry=0x15555120 callback=0x1537b18c unwind=0x1537b19d al_after=0x1 next_rva=0x17782b get_process_heap_target=0x71000970 get_process_heap_binding=GetProcessHeap
+steam-callback-walk entry=0x15555130 callback=0x1537f67c unwind=0x1537f6a8 al_after=0x1 next_rva=0x17782b get_process_heap_target=<n/a> get_process_heap_binding=<n/a>
+steam-callback-walk entry=0x15555138 callback=0x1538048e unwind=0x153804ee al_after=0x1 next_rva=0x17782b get_process_heap_target=<n/a> get_process_heap_binding=<n/a>
+steam-callback-walk entry=0x15555140 callback=0x15375548 unwind=0x1526b670 al_after=0x1 next_rva=0x17782b get_process_heap_target=<n/a> get_process_heap_binding=<n/a>
+steam-post-56ee10 eax=0x73001700 edi=0x73001700 esi=0x15555148 ebx=0xffffffff heap_handle=0x1000 rsp=0x7000ff5c decoded=[0x176f3c:MovReg [Register(Rdi), Register(Rax), ImmediateU64(4)] | 0x176f3e:OrImm [Register(Rbx), ImmediateU64(18446744073709551615), ImmediateU64(4)] | 0x176f41:PopReg [Register(Rcx)] | 0x176f42:Test [Register(Rdi), Register(Rdi), ImmediateU64(4)] | 0x176f44:Jcc [ImmediateU64(0), ImmediateU64(356020084), ImmediateU64(356020038)]]
+steam-post-helper block_rva=0x177133 rsp=0x7000ff20 stack0=0x73001700 stack1=0x155dc648 stack2=0xffffffff edi=0x73001700 esi=0x73001700 ebx=0x4e4 decoded=[0x177133:MovReg [Register(Rbx), Register(Rax), ImmediateU64(4)] | 0x177135:PopReg [Register(Rcx)] | 0x177136:Test [Register(Rbx), Register(Rbx), ImmediateU64(4)] | 0x177138:Jcc [ImmediateU64(0), ImmediateU64(356020974), ImmediateU64(356020542)]]
+steam-post-helper block_rva=0x1771a9 rsp=0x7000ff1c stack0=0x73001700 stack1=0x73001700 stack2=0x155dc648 edi=0x73001718 esi=0x73001700 ebx=0x4e4 decoded=[0x1771a9:JmpRel [ImmediateU64(356020980)]]
+steam-577113-epilogue rsp_before=0x7000ff1c stack0=0x73001700 stack1=0x73001700 stack2=0x155dc648 stack3=0xffffffff edi_before=0x73001718 esi_before=0x73001700 rsp_after=0x7000ff28 edi_after=0x73001700 esi_after=0x155dc648
+steam-post-577113 block_rva=0x176f61 eax=0x0 esi=0x0 edi=0x73001700 arg_obj=0x15555148 heap_handle=0x1000 rsp=0x7000ff5c decoded=[0x176f61:MovReg [Register(Rsi), Register(Rax), ImmediateU64(4)] | 0x176f63:PopReg [Register(Rcx)] | 0x176f64:PopReg [Register(Rcx)] | 0x176f65:Cmp [Register(Rsi), Register(Rbx), ImmediateU64(4)] | 0x176f67:Jcc [ImmediateU64(1), ImmediateU64(356020100), ImmediateU64(356020073)]]
+steam-post-577113 block_rva=0x176f84 eax=0x0 esi=0x0 edi=0x73001700 arg_obj=0x15555148 heap_handle=0x1000 rsp=0x7000ff5c decoded=[0x176f84:Cmp [Memory(MemoryOperand { base: Some(Rbp), index: None, scale: 1, displacement: 12, rip_relative: false, rip_base: 356020104, segment: None, address_size_32: false }), ImmediateU64(0), ImmediateU64(1)] | 0x176f88:Jcc [ImmediateU64(1), ImmediateU64(356020111), ImmediateU64(356020106)]]
+steam-callback-walk entry=0x15555148 callback=0x153870b8 unwind=0x0 al_after=0x1 next_rva=0x17782b get_process_heap_target=<n/a> get_process_heap_binding=<n/a>
+steam-callback-walk entry=0x15555168 callback=0x1526b670 unwind=0x1537e11a al_after=0x1 next_rva=0x17782b get_process_heap_target=<n/a> get_process_heap_binding=<n/a>
+steam-callback-walk entry=0x15555170 callback=0x1537e100 unwind=0x1526b670 al_after=0x1 next_rva=0x17782b get_process_heap_target=<n/a> get_process_heap_binding=<n/a>
+steam-startup-init block_rva=0x14d10d eax_after=0x1 ecx_after=0x1 state_0x45715c=0x0 rsp_after=0x7000ffc0
+steam-startup-init block_rva=0x14d11b eax_after=0x0 ecx_after=0x1 state_0x45715c=0x0 rsp_after=0x7000ffc4
+steam-startup-init block_rva=0x14d12e eax_after=0x0 ecx_after=0x1 state_0x45715c=0x0 rsp_after=0x7000ffc4
+steam-global-write block_rva=0x14d132 address=0x45715c before=0x0 after=0x1 rip_after=0x16e34b
+steam-startup-init block_rva=0x14d132 eax_after=0x0 ecx_after=0x1 state_0x45715c=0x1 rsp_after=0x7000ffb8
+steam-initterm-e block_rva=0x16e34b start=0x2e2994 end=0x2e29b8 esi_after=0x154f2994 edi_after=0x0 eax_after=0x0
+steam-initterm-e block_rva=0x16e36e start=0x0 end=0x5adffff8 esi_after=0x154f2994 edi_after=0x0 eax_after=0x0
+steam-initterm-e block_rva=0x16e357 start=0x0 end=0x5adffff8 esi_after=0x154f2994 edi_after=0x0 eax_after=0x0
+steam-initterm-e block_rva=0x16e36b start=0x0 end=0x5adffff8 esi_after=0x154f2998 edi_after=0x0 eax_after=0x0
+steam-initterm-e block_rva=0x16e357 start=0x0 end=0x5adffff8 esi_after=0x154f2998 edi_after=0x1535d02c eax_after=0x0
+steam-initterm-e block_rva=0x16e35d start=0x0 end=0x5adffff8 esi_after=0x154f2998 edi_after=0x1535d02c eax_after=0x0
+steam-initterm-e block_rva=0x16e365 start=0x0 end=0x5adffff8 esi_after=0x154f2998 edi_after=0x1535d02c eax_after=0x0
+steam-initterm-e block_rva=0x16e367 start=0x0 end=0x5adffff8 esi_after=0x154f2998 edi_after=0x1535d02c eax_after=0x0
+steam-initterm-e block_rva=0x16e36b start=0x0 end=0x5adffff8 esi_after=0x154f299c edi_after=0x1535d02c eax_after=0x0
+steam-initterm-e block_rva=0x16e357 start=0x0 end=0x5adffff8 esi_after=0x154f299c edi_after=0x1535d0d7 eax_after=0x0
+steam-initterm-e block_rva=0x16e35d start=0x0 end=0x5adffff8 esi_after=0x154f299c edi_after=0x1535d0d7 eax_after=0x0
+steam-initterm-e block_rva=0x16e365 start=0x0 end=0x5adffff8 esi_after=0x154f299c edi_after=0x1535d0d7 eax_after=0x0
+steam-initterm-e block_rva=0x16e367 start=0x0 end=0x5adffff8 esi_after=0x154f299c edi_after=0x1535d0d7 eax_after=0x0
+steam-initterm-e block_rva=0x16e36b start=0x0 end=0x5adffff8 esi_after=0x154f29a0 edi_after=0x1535d0d7 eax_after=0x0
+steam-initterm-e block_rva=0x16e357 start=0x0 end=0x5adffff8 esi_after=0x154f29a0 edi_after=0x1535c7e5 eax_after=0x0
+steam-initterm-e block_rva=0x16e35d start=0x0 end=0x5adffff8 esi_after=0x154f29a0 edi_after=0x1535c7e5 eax_after=0x0
+steam-initterm-e block_rva=0x16e365 start=0x0 end=0x5adffff8 esi_after=0x154f29a0 edi_after=0x1535c7e5 eax_after=0x0
+steam-initterm-e block_rva=0x16e367 start=0x0 end=0x5adffff8 esi_after=0x154f29a0 edi_after=0x1535c7e5 eax_after=0x0
+steam-initterm-e block_rva=0x16e36b start=0x0 end=0x5adffff8 esi_after=0x154f29a4 edi_after=0x1535c7e5 eax_after=0x0
+steam-initterm-e block_rva=0x16e357 start=0x0 end=0x5adffff8 esi_after=0x154f29a4 edi_after=0x1535cbfe eax_after=0x0
+steam-initterm-e block_rva=0x16e35d start=0x0 end=0x5adffff8 esi_after=0x154f29a4 edi_after=0x1535cbfe eax_after=0x0
+steam-initterm-e block_rva=0x16e365 start=0x0 end=0x5adffff8 esi_after=0x154f29a4 edi_after=0x1535cbfe eax_after=0x0
+steam-initterm-e block_rva=0x16e367 start=0x0 end=0x5adffff8 esi_after=0x154f29a4 edi_after=0x1535cbfe eax_after=0x0
+steam-initterm-e block_rva=0x16e36b start=0x0 end=0x5adffff8 esi_after=0x154f29a8 edi_after=0x1535cbfe eax_after=0x0
+steam-initterm-e block_rva=0x16e357 start=0x0 end=0x5adffff8 esi_after=0x154f29a8 edi_after=0x1536e9b1 eax_after=0x0
+steam-initterm-e block_rva=0x16e35d start=0x0 end=0x5adffff8 esi_after=0x154f29a8 edi_after=0x1536e9b1 eax_after=0x0
+steam-initterm-e block_rva=0x16e365 start=0x0 end=0x5adffff8 esi_after=0x154f29a8 edi_after=0x1536e9b1 eax_after=0x0
+steam-global-array-lifecycle block_rva=0x15e9b1 return_rva=0x16e367 count_before=0x0 ptr_before=0x0 count_after=0x0 ptr_after=0x0 eax_after=0x0 esi_after=0x3 edi_after=0x1536e9b1 esp_after=0x7000ffa4
+steam-global-write block_rva=0x15e9cb address=0x457624 before=0x0 after=0x200 rip_after=0x1720a3
+steam-global-write block_rva=0x15e9d8 address=0x457628 before=0x0 after=0x73002630 rip_after=0x16edd6
+steam-global-array-lifecycle block_rva=0x15ea1b return_rva=0x2e29a8 count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x155dc060 esi_after=0x155dc040 edi_after=0x0 esp_after=0x7000ff90
+steam-initterm-e block_rva=0x16e367 start=0x0 end=0x5adffff8 esi_after=0x154f29a8 edi_after=0x1536e9b1 eax_after=0x0
+steam-initterm-e block_rva=0x16e36b start=0x0 end=0x5adffff8 esi_after=0x154f29ac edi_after=0x1536e9b1 eax_after=0x0
+steam-initterm-e block_rva=0x16e357 start=0x0 end=0x5adffff8 esi_after=0x154f29ac edi_after=0x1537aa24 eax_after=0x0
+steam-initterm-e block_rva=0x16e35d start=0x0 end=0x5adffff8 esi_after=0x154f29ac edi_after=0x1537aa24 eax_after=0x0
+steam-initterm-e block_rva=0x16e365 start=0x0 end=0x5adffff8 esi_after=0x154f29ac edi_after=0x1537aa24 eax_after=0x0
+steam-initterm-e block_rva=0x16e367 start=0x0 end=0x5adffff8 esi_after=0x154f29ac edi_after=0x1537aa24 eax_after=0x0
+steam-initterm-e block_rva=0x16e36b start=0x0 end=0x5adffff8 esi_after=0x154f29b0 edi_after=0x1537aa24 eax_after=0x0
+steam-initterm-e block_rva=0x16e357 start=0x0 end=0x5adffff8 esi_after=0x154f29b0 edi_after=0x15382692 eax_after=0x0
+steam-initterm-e block_rva=0x16e35d start=0x0 end=0x5adffff8 esi_after=0x154f29b0 edi_after=0x15382692 eax_after=0x0
+steam-initterm-e block_rva=0x16e365 start=0x0 end=0x5adffff8 esi_after=0x154f29b0 edi_after=0x15382692 eax_after=0x0
+steam-initterm-e block_rva=0x16e367 start=0x0 end=0x5adffff8 esi_after=0x154f29b0 edi_after=0x15382692 eax_after=0x0
+steam-initterm-e block_rva=0x16e36b start=0x0 end=0x5adffff8 esi_after=0x154f29b4 edi_after=0x15382692 eax_after=0x0
+steam-initterm-e block_rva=0x16e357 start=0x0 end=0x5adffff8 esi_after=0x154f29b4 edi_after=0x1538a64b eax_after=0x0
+steam-initterm-e block_rva=0x16e35d start=0x0 end=0x5adffff8 esi_after=0x154f29b4 edi_after=0x1538a64b eax_after=0x0
+steam-initterm-e block_rva=0x16e365 start=0x0 end=0x5adffff8 esi_after=0x154f29b4 edi_after=0x1538a64b eax_after=0x0
+steam-initterm-e block_rva=0x16e367 start=0x0 end=0x5adffff8 esi_after=0x154f29b4 edi_after=0x1538a64b eax_after=0x0
+steam-initterm-e block_rva=0x16e36b start=0x0 end=0x5adffff8 esi_after=0x154f29b8 edi_after=0x1538a64b eax_after=0x0
+steam-startup-init block_rva=0x14d147 eax_after=0x0 ecx_after=0x154f29b8 state_0x45715c=0x1 rsp_after=0x7000ffc4
+steam-startup-init block_rva=0x14d15e eax_after=0x0 ecx_after=0x154f29b8 state_0x45715c=0x1 rsp_after=0x7000ffb8
+steam-global-write block_rva=0x14d16d address=0x45715c before=0x1 after=0x2 rip_after=0x14d180
+steam-startup-init block_rva=0x14d16d eax_after=0x4000001 ecx_after=0x154f2988 state_0x45715c=0x2 rsp_after=0x7000ffc4
+casa1-live-ui create-window hwnd=0x1 class="BootstrapUpdateUIClass" title="" style=0xca0000 pos=-2147483648,0 size=400x129 control_id=0 visible=false
+casa1-live-ui create-window hwnd=0x2 class="STATIC" title="" style=0x50000000 pos=15,15 size=365x25 control_id=0 visible=true
+DWM hwnd=0x2 msg=0x0030 wp=0xa000 lp=0x0 class="STATIC" label=SendMessageW::WindowProc
+DWM -> GWL_WNDPROC=0 (cleared) hwnd=0x2 msg=0x0030
+DWM -> default user32 hwnd=0x2 msg=0x0030 kind=Other(48)
+casa1-live-ui create-window hwnd=0x3 class="BUTTON" title="Cancel" style=0x50000000 pos=305,64 size=75x25 control_id=0 visible=true
+DWM hwnd=0x3 msg=0x0030 wp=0xa000 lp=0x0 class="BUTTON" label=SendMessageW::WindowProc
+DWM -> GWL_WNDPROC=0 (cleared) hwnd=0x3 msg=0x0030
+DWM -> default user32 hwnd=0x3 msg=0x0030 kind=Other(48)
+casa1-live-ui create-window hwnd=0x4 class="msctls_progress32" title="" style=0x50000000 pos=15,40 size=365x14 control_id=0 visible=true
+DWM hwnd=0x4 msg=0x0406 wp=0x0 lp=0x64 class="msctls_progress32" label=SendMessageW::WindowProc
+DWM -> GWL_WNDPROC=0 (cleared) hwnd=0x4 msg=0x0406
+DWM -> builtin hwnd=0x4 msg=0x0406 result=0
+casa1-live-ui create-window hwnd=0x5 class="STATIC" title="" style=0x50000000 pos=15,64 size=270x25 control_id=0 visible=true
+DWM hwnd=0x5 msg=0x0030 wp=0xa000 lp=0x0 class="STATIC" label=SendMessageW::WindowProc
+DWM -> GWL_WNDPROC=0 (cleared) hwnd=0x5 msg=0x0030
+DWM -> default user32 hwnd=0x5 msg=0x0030 kind=Other(48)
+DWM hwnd=0x1 msg=0x0081 wp=0x0 lp=0x0 class="BootstrapUpdateUIClass" label=DispatchMessageW::WindowProc
+DWM -> GWL_WNDPROC=0x1527abe0 hwnd=0x1 msg=0x0081
+DWM hwnd=0x1 msg=0x0001 wp=0x0 lp=0x0 class="BootstrapUpdateUIClass" label=DispatchMessageW::WindowProc
+DWM -> GWL_WNDPROC=0x1527abe0 hwnd=0x1 msg=0x0001
+DWM hwnd=0x2 msg=0x0081 wp=0x0 lp=0x0 class="STATIC" label=DispatchMessageW::WindowProc
+DWM -> GWL_WNDPROC=0 (cleared) hwnd=0x2 msg=0x0081
+DWM -> default user32 hwnd=0x2 msg=0x0081 kind=NcCreate
+DWM hwnd=0x2 msg=0x0001 wp=0x0 lp=0x0 class="STATIC" label=DispatchMessageW::WindowProc
+DWM -> GWL_WNDPROC=0 (cleared) hwnd=0x2 msg=0x0001
+DWM -> default user32 hwnd=0x2 msg=0x0001 kind=Create
+DWM hwnd=0x2 msg=0x0018 wp=0x1 lp=0x0 class="STATIC" label=DispatchMessageW::WindowProc
+DWM -> GWL_WNDPROC=0 (cleared) hwnd=0x2 msg=0x0018
+DWM -> default user32 hwnd=0x2 msg=0x0018 kind=ShowWindow
+DWM hwnd=0x2 msg=0x0046 wp=0x16d lp=0x19 class="STATIC" label=DispatchMessageW::WindowProc
+DWM -> GWL_WNDPROC=0 (cleared) hwnd=0x2 msg=0x0046
+DWM -> default user32 hwnd=0x2 msg=0x0046 kind=WindowPosChanging
+DWM hwnd=0x2 msg=0x0005 wp=0x16d lp=0x19 class="STATIC" label=DispatchMessageW::WindowProc
+DWM -> GWL_WNDPROC=0 (cleared) hwnd=0x2 msg=0x0005
+DWM -> default user32 hwnd=0x2 msg=0x0005 kind=Size
+casa1-live-ui dispatch-paint hwnd=0x2
+DWM hwnd=0x2 msg=0x000f wp=0x0 lp=0x0 class="STATIC" label=DispatchMessageW::WindowProc
+DWM -> GWL_WNDPROC=0 (cleared) hwnd=0x2 msg=0x000f
+DWM -> builtin hwnd=0x2 msg=0x000f result=0
+DWM hwnd=0x2 msg=0x0006 wp=0x1 lp=0x0 class="STATIC" label=DispatchMessageW::WindowProc
+DWM -> GWL_WNDPROC=0 (cleared) hwnd=0x2 msg=0x0006
+DWM -> default user32 hwnd=0x2 msg=0x0006 kind=Activate
+DWM hwnd=0x2 msg=0x0007 wp=0x0 lp=0x0 class="STATIC" label=DispatchMessageW::WindowProc
+DWM -> GWL_WNDPROC=0 (cleared) hwnd=0x2 msg=0x0007
+DWM -> default user32 hwnd=0x2 msg=0x0007 kind=SetFocus
+DWM hwnd=0x3 msg=0x0081 wp=0x0 lp=0x0 class="BUTTON" label=DispatchMessageW::WindowProc
+DWM -> GWL_WNDPROC=0 (cleared) hwnd=0x3 msg=0x0081
+DWM -> default user32 hwnd=0x3 msg=0x0081 kind=NcCreate
+DWM hwnd=0x3 msg=0x0001 wp=0x0 lp=0x0 class="BUTTON" label=DispatchMessageW::WindowProc
+DWM -> GWL_WNDPROC=0 (cleared) hwnd=0x3 msg=0x0001
+DWM -> default user32 hwnd=0x3 msg=0x0001 kind=Create
+DWM hwnd=0x3 msg=0x0018 wp=0x1 lp=0x0 class="BUTTON" label=DispatchMessageW::WindowProc
+DWM -> GWL_WNDPROC=0 (cleared) hwnd=0x3 msg=0x0018
+DWM -> default user32 hwnd=0x3 msg=0x0018 kind=ShowWindow
+DWM hwnd=0x3 msg=0x0046 wp=0x4b lp=0x19 class="BUTTON" label=DispatchMessageW::WindowProc
+DWM -> GWL_WNDPROC=0 (cleared) hwnd=0x3 msg=0x0046
+DWM -> default user32 hwnd=0x3 msg=0x0046 kind=WindowPosChanging
+DWM hwnd=0x3 msg=0x0005 wp=0x4b lp=0x19 class="BUTTON" label=DispatchMessageW::WindowProc
+DWM -> GWL_WNDPROC=0 (cleared) hwnd=0x3 msg=0x0005
+DWM -> default user32 hwnd=0x3 msg=0x0005 kind=Size
+casa1-live-ui dispatch-paint hwnd=0x3
+DWM hwnd=0x3 msg=0x000f wp=0x0 lp=0x0 class="BUTTON" label=DispatchMessageW::WindowProc
+DWM -> GWL_WNDPROC=0 (cleared) hwnd=0x3 msg=0x000f
+DWM -> builtin hwnd=0x3 msg=0x000f result=0
+DWM hwnd=0x4 msg=0x0081 wp=0x0 lp=0x0 class="msctls_progress32" label=DispatchMessageW::WindowProc
+DWM -> GWL_WNDPROC=0 (cleared) hwnd=0x4 msg=0x0081
+DWM -> default user32 hwnd=0x4 msg=0x0081 kind=NcCreate
+DWM hwnd=0x4 msg=0x0001 wp=0x0 lp=0x0 class="msctls_progress32" label=DispatchMessageW::WindowProc
+DWM -> GWL_WNDPROC=0 (cleared) hwnd=0x4 msg=0x0001
+DWM -> default user32 hwnd=0x4 msg=0x0001 kind=Create
+DWM hwnd=0x4 msg=0x0018 wp=0x1 lp=0x0 class="msctls_progress32" label=DispatchMessageW::WindowProc
+DWM -> GWL_WNDPROC=0 (cleared) hwnd=0x4 msg=0x0018
+DWM -> default user32 hwnd=0x4 msg=0x0018 kind=ShowWindow
+DWM hwnd=0x4 msg=0x0046 wp=0x16d lp=0xe class="msctls_progress32" label=DispatchMessageW::WindowProc
+DWM -> GWL_WNDPROC=0 (cleared) hwnd=0x4 msg=0x0046
+DWM -> default user32 hwnd=0x4 msg=0x0046 kind=WindowPosChanging
+DWM hwnd=0x4 msg=0x0005 wp=0x16d lp=0xe class="msctls_progress32" label=DispatchMessageW::WindowProc
+DWM -> GWL_WNDPROC=0 (cleared) hwnd=0x4 msg=0x0005
+DWM -> default user32 hwnd=0x4 msg=0x0005 kind=Size
+casa1-live-ui dispatch-paint hwnd=0x4
+DWM hwnd=0x4 msg=0x000f wp=0x0 lp=0x0 class="msctls_progress32" label=DispatchMessageW::WindowProc
+DWM -> GWL_WNDPROC=0 (cleared) hwnd=0x4 msg=0x000f
+DWM -> builtin hwnd=0x4 msg=0x000f result=0
+DWM hwnd=0x1 msg=0x00ff wp=0x0 lp=0x0 class="BootstrapUpdateUIClass" label=DispatchMessageW::WindowProc
+DWM -> GWL_WNDPROC=0x1527abe0 hwnd=0x1 msg=0x00ff
+DWM hwnd=0x1 msg=0x0200 wp=0x0 lp=0x0 class="BootstrapUpdateUIClass" label=DispatchMessageW::WindowProc
+DWM -> GWL_WNDPROC=0x1527abe0 hwnd=0x1 msg=0x0200
+DWM hwnd=0x5 msg=0x0081 wp=0x0 lp=0x0 class="STATIC" label=DispatchMessageW::WindowProc
+DWM -> GWL_WNDPROC=0 (cleared) hwnd=0x5 msg=0x0081
+DWM -> default user32 hwnd=0x5 msg=0x0081 kind=NcCreate
+DWM hwnd=0x5 msg=0x0001 wp=0x0 lp=0x0 class="STATIC" label=DispatchMessageW::WindowProc
+DWM -> GWL_WNDPROC=0 (cleared) hwnd=0x5 msg=0x0001
+DWM -> default user32 hwnd=0x5 msg=0x0001 kind=Create
+DWM hwnd=0x5 msg=0x0018 wp=0x1 lp=0x0 class="STATIC" label=DispatchMessageW::WindowProc
+DWM -> GWL_WNDPROC=0 (cleared) hwnd=0x5 msg=0x0018
+DWM -> default user32 hwnd=0x5 msg=0x0018 kind=ShowWindow
+DWM hwnd=0x5 msg=0x0046 wp=0x10e lp=0x19 class="STATIC" label=DispatchMessageW::WindowProc
+DWM -> GWL_WNDPROC=0 (cleared) hwnd=0x5 msg=0x0046
+DWM -> default user32 hwnd=0x5 msg=0x0046 kind=WindowPosChanging
+DWM hwnd=0x5 msg=0x0005 wp=0x10e lp=0x19 class="STATIC" label=DispatchMessageW::WindowProc
+DWM -> GWL_WNDPROC=0 (cleared) hwnd=0x5 msg=0x0005
+DWM -> default user32 hwnd=0x5 msg=0x0005 kind=Size
+casa1-live-ui dispatch-paint hwnd=0x5
+DWM hwnd=0x5 msg=0x000f wp=0x0 lp=0x0 class="STATIC" label=DispatchMessageW::WindowProc
+DWM -> GWL_WNDPROC=0 (cleared) hwnd=0x5 msg=0x000f
+DWM -> builtin hwnd=0x5 msg=0x000f result=0
+DWM hwnd=0x1 msg=0x00ff wp=0x13d lp=0x9f class="BootstrapUpdateUIClass" label=DispatchMessageW::WindowProc
+DWM -> GWL_WNDPROC=0x1527abe0 hwnd=0x1 msg=0x00ff
+DWM hwnd=0x1 msg=0x0200 wp=0x13d lp=0x9f class="BootstrapUpdateUIClass" label=DispatchMessageW::WindowProc
+DWM -> GWL_WNDPROC=0x1527abe0 hwnd=0x1 msg=0x0200
+DWM hwnd=0x1 msg=0x0018 wp=0x1 lp=0x0 class="BootstrapUpdateUIClass" label=DispatchMessageW::WindowProc
+DWM -> GWL_WNDPROC=0x1527abe0 hwnd=0x1 msg=0x0018
+DWM hwnd=0x1 msg=0x0046 wp=0x190 lp=0x81 class="BootstrapUpdateUIClass" label=DispatchMessageW::WindowProc
+DWM -> GWL_WNDPROC=0x1527abe0 hwnd=0x1 msg=0x0046
+DWM hwnd=0x1 msg=0x0005 wp=0x190 lp=0x81 class="BootstrapUpdateUIClass" label=DispatchMessageW::WindowProc
+DWM -> GWL_WNDPROC=0x1527abe0 hwnd=0x1 msg=0x0005
+casa1-live-ui dispatch-paint hwnd=0x1
+DWM hwnd=0x1 msg=0x000f wp=0x0 lp=0x0 class="BootstrapUpdateUIClass" label=DispatchMessageW::WindowProc
+DWM -> GWL_WNDPROC=0x1527abe0 hwnd=0x1 msg=0x000f
+casa1-live-ui begin-paint hwnd=0x1 hdc=0x9000 paint_ptr=0x7000fcb0
+DWM hwnd=0x1 msg=0x00ff wp=0xfffffffe lp=0x0 class="BootstrapUpdateUIClass" label=DispatchMessageW::WindowProc
+DWM -> GWL_WNDPROC=0x1527abe0 hwnd=0x1 msg=0x00ff
+DWM hwnd=0x1 msg=0x0200 wp=0x13b lp=0x9f class="BootstrapUpdateUIClass" label=DispatchMessageW::WindowProc
+DWM -> GWL_WNDPROC=0x1527abe0 hwnd=0x1 msg=0x0200
+steam-startup-failure block_rva=0x14d25e eax_after=0x100 esi_after=0xfffffffe state_0x45715c=0x2 rsp_after=0x7000ffbc
+steam-early-termination block_rva=0x15e760 return_rva=0x7fd4907 eax_before=0x6d1eb64f ebx_before=0x0 esi_before=0x7000ff8c edi_before=0x6d1eb64f esp_before=0x7000ff1c
+steam-early-termination block_rva=0x15e771 return_rva=0x4578d8 eax_before=0x6d1eb64f ebx_before=0x0 esi_before=0x7000ff8c edi_before=0x6d1eb64f esp_before=0x7000ff18
+steam-early-termination block_rva=0x15e776 return_rva=0x4578d8 eax_before=0x7000ffb0 ebx_before=0x0 esi_before=0x7000ff8c edi_before=0x6d1eb64f esp_before=0x7000ff20
+steam-early-termination block_rva=0x15e784 return_rva=0x7fd4907 eax_before=0x7000ffb0 ebx_before=0x0 esi_before=0x7000ff8c edi_before=0x6d1eb64f esp_before=0x7000ff14
+steam-global-array-lifecycle block_rva=0x15ea89 return_rva=0x16e33e count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x1536ea89 esi_after=0x154f29d4 edi_after=0x3 esp_after=0x7000fef4
+steam-global-array-lifecycle block_rva=0x1721d1 return_rva=0x15ea96 count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x3 esi_after=0x154f29d4 edi_after=0x3 esp_after=0x7000fee8
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x73002630 esi_after=0x4 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x5 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x6 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x7 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x8 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x9 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xa edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xb edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xc edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xd edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xe edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xf edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x10 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x11 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x12 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x13 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x14 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x15 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x16 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x17 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x18 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x19 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1a edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1b edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1c edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1d edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1e edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1f edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x20 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x21 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x22 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x23 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x24 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x25 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x26 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x27 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x28 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x29 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x2a edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x2b edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x2c edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x2d edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x2e edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x2f edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x30 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x31 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x32 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x33 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x34 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x35 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x36 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x37 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x38 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x39 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x3a edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x3b edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x3c edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x3d edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x3e edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x3f edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x40 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x41 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x42 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x43 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x44 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x45 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x46 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x47 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x48 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x49 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x4a edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x4b edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x4c edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x4d edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x4e edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x4f edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x50 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x51 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x52 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x53 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x54 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x55 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x56 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x57 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x58 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x59 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x5a edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x5b edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x5c edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x5d edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x5e edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x5f edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x60 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x61 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x62 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x63 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x64 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x65 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x66 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x67 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x68 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x69 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x6a edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x6b edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x6c edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x6d edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x6e edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x6f edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x70 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x71 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x72 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x73 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x74 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x75 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x76 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x77 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x78 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x79 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x7a edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x7b edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x7c edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x7d edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x7e edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x7f edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x80 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x81 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x82 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x83 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x84 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x85 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x86 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x87 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x88 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x89 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x8a edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x8b edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x8c edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x8d edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x8e edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x8f edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x90 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x91 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x92 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x93 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x94 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x95 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x96 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x97 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x98 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x99 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x9a edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x9b edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x9c edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x9d edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x9e edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x9f edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xa0 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xa1 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xa2 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xa3 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xa4 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xa5 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xa6 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xa7 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xa8 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xa9 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xaa edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xab edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xac edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xad edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xae edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xaf edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xb0 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xb1 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xb2 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xb3 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xb4 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xb5 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xb6 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xb7 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xb8 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xb9 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xba edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xbb edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xbc edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xbd edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xbe edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xbf edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xc0 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xc1 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xc2 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xc3 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xc4 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xc5 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xc6 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xc7 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xc8 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xc9 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xca edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xcb edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xcc edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xcd edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xce edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xcf edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xd0 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xd1 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xd2 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xd3 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xd4 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xd5 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xd6 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xd7 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xd8 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xd9 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xda edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xdb edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xdc edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xdd edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xde edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xdf edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xe0 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xe1 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xe2 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xe3 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xe4 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xe5 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xe6 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xe7 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xe8 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xe9 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xea edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xeb edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xec edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xed edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xee edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xef edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xf0 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xf1 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xf2 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xf3 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xf4 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xf5 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xf6 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xf7 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xf8 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xf9 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xfa edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xfb edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xfc edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xfd edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xfe edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xff edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x100 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x101 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x102 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x103 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x104 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x105 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x106 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x107 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x108 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x109 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x10a edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x10b edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x10c edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x10d edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x10e edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x10f edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x110 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x111 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x112 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x113 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x114 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x115 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x116 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x117 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x118 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x119 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x11a edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x11b edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x11c edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x11d edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x11e edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x11f edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x120 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x121 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x122 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x123 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x124 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x125 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x126 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x127 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x128 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x129 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x12a edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x12b edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x12c edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x12d edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x12e edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x12f edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x130 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x131 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x132 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x133 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x134 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x135 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x136 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x137 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x138 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x139 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x13a edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x13b edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x13c edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x13d edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x13e edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x13f edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x140 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x141 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x142 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x143 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x144 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x145 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x146 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x147 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x148 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x149 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x14a edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x14b edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x14c edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x14d edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x14e edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x14f edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x150 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x151 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x152 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x153 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x154 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x155 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x156 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x157 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x158 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x159 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x15a edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x15b edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x15c edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x15d edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x15e edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x15f edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x160 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x161 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x162 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x163 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x164 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x165 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x166 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x167 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x168 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x169 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x16a edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x16b edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x16c edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x16d edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x16e edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x16f edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x170 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x171 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x172 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x173 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x174 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x175 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x176 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x177 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x178 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x179 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x17a edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x17b edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x17c edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x17d edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x17e edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x17f edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x180 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x181 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x182 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x183 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x184 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x185 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x186 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x187 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x188 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x189 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x18a edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x18b edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x18c edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x18d edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x18e edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x18f edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x190 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x191 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x192 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x193 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x194 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x195 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x196 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x197 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x198 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x199 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x19a edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x19b edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x19c edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x19d edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x19e edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x19f edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1a0 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1a1 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1a2 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1a3 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1a4 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1a5 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1a6 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1a7 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1a8 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1a9 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1aa edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1ab edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1ac edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1ad edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1ae edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1af edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1b0 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1b1 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1b2 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1b3 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1b4 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1b5 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1b6 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1b7 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1b8 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1b9 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1ba edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1bb edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1bc edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1bd edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1be edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1bf edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1c0 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1c1 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1c2 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1c3 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1c4 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1c5 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1c6 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1c7 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1c8 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1c9 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1ca edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1cb edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1cc edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1cd edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1ce edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1cf edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1d0 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1d1 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1d2 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1d3 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1d4 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1d5 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1d6 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1d7 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1d8 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1d9 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1da edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1db edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1dc edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1dd edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1de edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1df edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1e0 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1e1 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1e2 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1e3 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1e4 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1e5 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1e6 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1e7 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1e8 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1e9 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1ea edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1eb edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1ec edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1ed edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1ee edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1ef edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1f0 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1f1 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1f2 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1f3 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1f4 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1f5 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1f6 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1f7 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1f8 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1f9 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1fa edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1fb edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1fc edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1fd edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1fe edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x1ff edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x1721f0 return_rva=0x7fd48bf count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0x200 edi_after=0x3 esp_after=0x7000fec0
+steam-global-array-lifecycle block_rva=0x15ea98 return_rva=0x2e29d4 count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x73002630 esi_after=0x4 edi_after=0x3 esp_after=0x7000fef0
+steam-global-array-lifecycle block_rva=0x15ea98 return_rva=0x2e29d4 count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x73002630 esi_after=0x8 edi_after=0x3 esp_after=0x7000fef0
+steam-global-array-lifecycle block_rva=0x15eac0 return_rva=0x2e29d4 count_before=0x200 ptr_before=0x73002630 count_after=0x200 ptr_after=0x73002630 eax_after=0x0 esi_after=0xc edi_after=0x3 esp_after=0x7000fef0
+steam-global-write block_rva=0x15eacb address=0x457628 before=0x73002630 after=0x0 rip_after=0x16e33e
+steam-early-termination block_rva=0x15e793 return_rva=0x2e29c8 eax_before=0x1 ebx_before=0x0 esi_before=0x7000ff8c edi_before=0x6d1eb64f esp_before=0x7000ff14
+steam-early-termination block_rva=0x15e7a4 return_rva=0x2e29dc eax_before=0x7000ffb4 ebx_before=0x0 esi_before=0x7000ff8c edi_before=0x6d1eb64f esp_before=0x7000ff20
+{
+  "report_path": "/Users/sabelakhoua/IdeaProjects/Casa1/ges/steam-live-run-x86/reports/play-Steam-filetrace.json",
+  "trace_path": "/Users/sabelakhoua/IdeaProjects/Casa1/ges/steam-live-run-x86/traces/play-Steam-filetrace.json",
+  "log_path": "/Users/sabelakhoua/IdeaProjects/Casa1/ges/steam-live-run-x86/logs/play-Steam-filetrace-guest-108767.jsonl",
+  "canonical_output": {
+    "test_id": "play-Steam-filetrace",
+    "build_id": "casa1-0.1.0",
+    "os_build": "macos-aarch64",
+    "stdout": "src\\common\\globals.cpp (199) : Assertion Failed: Invalid CRT parameter : file , line 0\r\nsrc\\common\\globals.cpp (199) : Assertion Failed: Invalid CRT parameter : file , line 0\r\n[2026-05-19 18:46:12] Startup - updater built May 20 2024 14:26:54\r\n[2026-05-19 18:46:12] Startup - Steam Client launched with: C:\\Steam.exe\r\nsrc\\common\\globals.cpp (199) : Assertion Failed: Invalid CRT parameter : file , line 0\r\nILocalize::AddFile() failed to load file \"public/steambootstrapper_%language%.txt\".\r\nsrc\\common\\globals.cpp (199) : Assertion Failed: Invalid CRT parameter : file , line 0\r\nsrc\\common\\globals.cpp (199) : Assertion Failed: Invalid CRT parameter : file , line 0\r\n[2026-05-19 18:46:14] Failed to load cached hosts file (File 'update_hosts_cached.vdf' not found), using defaults\r\n[2026-05-19 18:46:14] Using the following download hosts for Public, Realm steamglobal\r\n[2026-05-19 18:46:14] 1. https://cdn.steamstatic.com, /client/, Realm 'steamglobal', weight was 1, source = 'baked in'\r\nsrc\\common\\globals.cpp (199) : Assertion Failed: Invalid CRT parameter : file , line 0\r\n[2026-05-19 18:46:14] Verifying installation...\r\nsrc\\common\\globals.cpp (199) : Assertion Failed: Invalid CRT parameter : file , line 0\r\n[2026-05-19 18:46:14] Unable to read and verify install manifest C:\\package\\steam_client_win32.installed\r\n[2026-05-19 18:46:14] Verification complete\r\n[2026-05-19 18:46:14] Downloading Update...\r\nsrc\\common\\globals.cpp (199) : Assertion Failed: Invalid CRT parameter : file , line 0\r\n[2026-05-19 18:46:14] Error: Directory C:\\package not writable.\r\n[2026-05-19 18:46:14] Error: Steam needs to be online to update.\t Please confirm your network connection and try again.\r\n[2026-05-19 18:46:54] Shutdown\r\nsrc\\tier0\\threadtools.cpp (3465) : Assertion Failed: Illegal termination of worker thread 'Thread(0x73099390/0x00000064/0x'\r\n",
+    "stderr": "src\\common\\globals.cpp (199) : Assertion Failed: Invalid CRT parameter : file , line 0\r\nsrc\\common\\globals.cpp (199) : Assertion Failed: Invalid CRT parameter : file , line 0\r\nsrc\\common\\globals.cpp (199) : Assertion Failed: Invalid CRT parameter : file , line 0\r\nsrc\\common\\globals.cpp (199) : Assertion Failed: Invalid CRT parameter : file , line 0\r\nsrc\\common\\globals.cpp (199) : Assertion Failed: Invalid CRT parameter : file , line 0\r\nsrc\\common\\globals.cpp (199) : Assertion Failed: Invalid CRT parameter : file , line 0\r\nsrc\\common\\globals.cpp (199) : Assertion Failed: Invalid CRT parameter : file , line 0\r\nsrc\\common\\globals.cpp (199) : Assertion Failed: Invalid CRT parameter : file , line 0\r\nsrc\\tier0\\threadtools.cpp (3465) : Assertion Failed: Illegal termination of worker thread 'Thread(0x73099390/0x00000064/0x'\r\n",
+    "exit_code": -2,
+    "guest_exceptions": [],
+    "file_manifest_delta": [
+      {
+        "op": "modify",
+        "path_norm": "C:\\logs\\bootstrap_log.txt",
+        "sha256": "6012b8a0408b2fc11ec26fb167f84709cf27b208057a7a77a348fc1295526bd0",
+        "size": 31323,
+        "times_norm": {
+          "created_ms": 0,
+          "accessed_ms": 50103,
+          "modified_ms": 50103
+        },
+        "attrs": []
+      }
+    ],
+    "registry_delta": [],
+    "network_summary": [],
+    "gfx_frames": [],
+    "perf": [
+      {
+        "metric_id": "pe_runtime_steps",
+        "value": 8472055.0,
+        "unit": "instructions"
+      }
+    ]
+  }
+}

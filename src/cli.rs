@@ -1,6 +1,8 @@
+use crate::app_bundle::{create_app_bundle, AppBundleConfig, is_app_registered, list_installed_apps, register_with_launch_services, uninstall_app};
 use crate::diagnostics::{doctor, export_diagnostics};
 use crate::error::{AppError, AppResult, ErrorResponse};
 use crate::ge::{GameEnvironment, GeArch};
+use crate::icon::extract_icon_from_pe;
 use crate::reason::ReasonCode;
 use crate::runner::{RunIntent, RunnerJob, RunnerOutcome};
 use crate::security::audit_embedded_entitlements;
@@ -119,6 +121,32 @@ enum HostCommand {
         binaries: Vec<PathBuf>,
         #[arg(long)]
         require_approved: bool,
+    },
+    #[command(name = "apps:install")]
+    AppsInstall {
+        #[arg(long)]
+        ge: String,
+        #[arg(long)]
+        exe: PathBuf,
+        #[arg(long)]
+        app_name: Option<String>,
+        #[arg(long)]
+        bundle_id: Option<String>,
+        #[arg(long)]
+        args: Option<String>,
+        #[arg(long)]
+        icon_source: Option<PathBuf>,
+        #[arg(long)]
+        skip_launch_services: bool,
+        #[arg(long)]
+        url_schemes: Vec<String>,
+    },
+    #[command(name = "apps:list")]
+    AppsList,
+    #[command(name = "apps:uninstall")]
+    AppsUninstall {
+        #[arg(long)]
+        app_name: String,
     },
 }
 
@@ -298,8 +326,88 @@ where
             }
             util::stable_json(&report)
         }
+        HostCommand::AppsInstall {
+            ge,
+            exe,
+            app_name,
+            bundle_id,
+            args,
+            icon_source,
+            skip_launch_services,
+            url_schemes,
+        } => {
+                let ge = GameEnvironment::open(&ge)?;
+                let name = app_name.unwrap_or_else(|| {
+                    exe.file_stem()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "Unnamed".to_string())
+                });
+                let apps_dir = ge.root.join("apps");
+                fs::create_dir_all(&apps_dir).map_err(|e| {
+                    AppError::from_io(ReasonCode::RcIo, format!("failed to create apps dir"), &e)
+                })?;
+    
+                // Extract icon from the PE executable if no external icon source
+                let icon_data = if let Some(icon_path) = icon_source {
+                    Some(fs::read(&icon_path).map_err(|e| {
+                        AppError::from_io(ReasonCode::RcIo, format!("failed to read icon file"), &e)
+                    })?)
+                } else {
+                    extract_icon_from_pe(&exe)
+                        .ok()
+                        .flatten()
+                        .and_then(|icon_img| crate::icon::icons_to_icns(&[icon_img]).ok())
+                };
+    
+                let config = AppBundleConfig {
+                    app_name: name.clone(),
+                    executable_path: exe.to_string_lossy().to_string(),
+                    args,
+                    ge_name: ge.config.name.clone(),
+                    icon_data,
+                    bundle_id,
+                    min_system_version: None,
+                    high_resolution: None,
+                    url_schemes,
+                    app_category: None,
+                };
+    
+                let app_path = create_app_bundle(&config, &apps_dir)?;
+    
+                if !skip_launch_services {
+                    match register_with_launch_services(&app_path) {
+                        Ok(_) => {},
+                        Err(e) => {
+                            eprintln!("Warning: Launch Services registration failed: {:?}", e);
+                        }
+                    }
+                }
+    
+                util::stable_json(&serde_json::json!({
+                    "app_name": name,
+                    "app_path": app_path.to_string_lossy(),
+                    "launch_services_registered": !skip_launch_services,
+                }))
+            }
+            HostCommand::AppsList => {
+                let apps_dir = find_apps_dir()?;
+                let apps = list_installed_apps(&apps_dir)?;
+                util::stable_json(&serde_json::json!({
+                    "apps": apps,
+                    "apps_dir": apps_dir.to_string_lossy(),
+                }))
+            }
+            HostCommand::AppsUninstall { app_name } => {
+                let apps_dir = find_apps_dir()?;
+                let app_path = apps_dir.join(&app_name).with_extension("app");
+                uninstall_app(&app_path)?;
+                util::stable_json(&serde_json::json!({
+                    "app_name": app_name,
+                    "uninstalled": true,
+                }))
+            }
+        }
     }
-}
 
 fn dispatch_runner(ge: &GameEnvironment, job: &RunnerJob) -> AppResult<RunnerOutcome> {
     let runner_binary = util::sibling_binary("casa1-runner")?;
@@ -584,6 +692,25 @@ fn executable_stem(path: &Path) -> String {
     path.file_stem()
         .map(|value| value.to_string_lossy().to_string())
         .unwrap_or_else(|| "guest".to_string())
+}
+
+/// Find the apps directory for Casa1 app bundles.
+fn find_apps_dir() -> AppResult<PathBuf> {
+    if let Ok(apps_dir) = std::env::var("CASA1_APPS_DIR") {
+        let path = PathBuf::from(apps_dir);
+        fs::create_dir_all(&path).map_err(|e| {
+            AppError::from_io(ReasonCode::RcIo, "failed to create CASA1_APPS_DIR", &e)
+        })?;
+        return Ok(path);
+    }
+    let home = std::env::var("HOME").map_err(|_| {
+        AppError::new(ReasonCode::RcIo, "HOME not set")
+    })?;
+    let apps_dir = PathBuf::from(home).join(".casa1").join("apps");
+    fs::create_dir_all(&apps_dir).map_err(|e| {
+        AppError::from_io(ReasonCode::RcIo, "failed to create ~/.casa1/apps", &e)
+    })?;
+    Ok(apps_dir)
 }
 
 #[cfg(test)]

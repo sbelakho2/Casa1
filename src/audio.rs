@@ -2,7 +2,7 @@ use crate::error::{AppError, AppResult};
 use crate::reason::ReasonCode;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::Path;
 use std::process::{Command as HostCommand, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -46,6 +46,9 @@ pub enum AudioSamples {
 pub struct SourceBuffer {
     pub tag: String,
     pub samples: AudioSamples,
+    pub loop_begin: Option<u32>,
+    pub loop_length: Option<u32>,
+    pub loop_count: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -86,6 +89,10 @@ struct QueuedBuffer {
     samples: Vec<f32>,
     frames: usize,
     cursor: usize,
+    loop_begin: Option<usize>,
+    loop_length: Option<usize>,
+    loop_count: u32,
+    played_loops: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -106,6 +113,7 @@ struct VoiceRecord {
     volume: f32,
     channel_volumes: Vec<f32>,
     output_matrix: Vec<f32>,
+    frequency_ratio: f32,
     kind: VoiceKind,
 }
 
@@ -136,6 +144,120 @@ struct DirectSoundBufferRecord {
     playing: bool,
 }
 
+// ── DirectSound3D constants ────────────────────────────────────────────────
+
+/// Default distance factor (meters per world unit).
+pub const DS3D_DEFAULT_DISTANCE_FACTOR: f32 = 1.0;
+/// Default Doppler factor (normal).
+pub const DS3D_DEFAULT_DOPPLER_FACTOR: f32 = 1.0;
+/// Default rolloff factor (normal).
+pub const DS3D_DEFAULT_ROLLOFF_FACTOR: f32 = 1.0;
+/// Default cone inside angle (360° = omnidirectional).
+pub const DS3D_DEFAULT_CONE_INSIDE_ANGLE: u32 = 360;
+/// Default cone outside angle (360° = omnidirectional).
+pub const DS3D_DEFAULT_CONE_OUTSIDE_ANGLE: u32 = 360;
+/// Default cone outside volume attenuation (0 dB).
+pub const DS3D_DEFAULT_CONE_OUTSIDE_VOLUME: i32 = 0;
+/// Default minimum distance.
+pub const DS3D_DEFAULT_MIN_DISTANCE: f32 = 1.0;
+/// Default maximum distance.
+pub const DS3D_DEFAULT_MAX_DISTANCE: f32 = 1_000_000_000.0;
+/// Default number of speakers (auto-detect).
+pub const DS3D_DEFAULT_NUM_SPEAKERS: i32 = -1;
+/// Speed of sound in meters per second (used for Doppler calculation).
+pub const DS3D_SPEED_OF_SOUND: f32 = 343.0;
+
+/// DirectSound3D buffer mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ds3dMode {
+    /// Normal 3D processing.
+    Normal,
+    /// 3D processing disabled; no positional effects applied.
+    Disable,
+    /// Buffer position is relative to the listener's head.
+    HeadRelative,
+}
+
+/// Per-buffer state for DirectSound3D positional audio.
+///
+/// Tracks position, velocity, cone angles, distance boundaries, and
+/// processing mode for a single `IDirectSound3DBuffer8`.
+#[derive(Debug, Clone)]
+pub struct Ds3dBufferState {
+    /// Position in 3D space (x, y, z) in world units.
+    pub position: [f32; 3],
+    /// Velocity vector (x, y, z) for Doppler effect.
+    pub velocity: [f32; 3],
+    /// Cone inner angle in degrees (default 360 = omnidirectional).
+    pub cone_inside_angle: u32,
+    /// Cone outer angle in degrees.
+    pub cone_outside_angle: u32,
+    /// Cone outside volume attenuation in dB (negative values).
+    pub cone_outside_volume: i32,
+    /// Minimum distance before distance attenuation begins.
+    pub min_distance: f32,
+    /// Maximum distance beyond which no further attenuation occurs.
+    pub max_distance: f32,
+    /// 3D processing mode.
+    pub mode: Ds3dMode,
+}
+
+impl Default for Ds3dBufferState {
+    fn default() -> Self {
+        Self {
+            position: [0.0; 3],
+            velocity: [0.0; 3],
+            cone_inside_angle: DS3D_DEFAULT_CONE_INSIDE_ANGLE,
+            cone_outside_angle: DS3D_DEFAULT_CONE_OUTSIDE_ANGLE,
+            cone_outside_volume: DS3D_DEFAULT_CONE_OUTSIDE_VOLUME,
+            min_distance: DS3D_DEFAULT_MIN_DISTANCE,
+            max_distance: DS3D_DEFAULT_MAX_DISTANCE,
+            mode: Ds3dMode::Normal,
+        }
+    }
+}
+
+/// Listener state for DirectSound3D positional audio.
+///
+/// There is one listener per `IDirectSound8` object.  It defines the
+/// position, orientation, velocity, and environmental scaling factors
+/// used to compute 3D audio effects for all buffers in the same sound
+/// object.
+#[derive(Debug, Clone)]
+pub struct Ds3dListenerState {
+    /// Listener position in 3D space (x, y, z).
+    pub position: [f32; 3],
+    /// Listener velocity vector (x, y, z) for Doppler.
+    pub velocity: [f32; 3],
+    /// Forward orientation vector (x, y, z) — must be normalised.
+    pub forward: [f32; 3],
+    /// Up orientation vector (x, y, z) — must be normalised.
+    pub up: [f32; 3],
+    /// Distance factor (meters per world unit).
+    pub distance_factor: f32,
+    /// Doppler factor (0 = no Doppler, 1 = normal).
+    pub doppler_factor: f32,
+    /// Rolloff factor (1 = normal, >1 = steeper attenuation).
+    pub rolloff_factor: f32,
+    /// Number of stereo speakers (2 for headphones, 2+ for speakers).
+    pub num_speakers: i32,
+}
+
+impl Default for Ds3dListenerState {
+    fn default() -> Self {
+        Self {
+            position: [0.0; 3],
+            velocity: [0.0; 3],
+            forward: [0.0, 0.0, 1.0],  // +Z forward
+            up: [0.0, 1.0, 0.0],        // +Y up
+            distance_factor: DS3D_DEFAULT_DISTANCE_FACTOR,
+            doppler_factor: DS3D_DEFAULT_DOPPLER_FACTOR,
+            rolloff_factor: DS3D_DEFAULT_ROLLOFF_FACTOR,
+            num_speakers: DS3D_DEFAULT_NUM_SPEAKERS,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AudioSubsystem {
     next_id: u64,
@@ -145,6 +267,10 @@ pub struct AudioSubsystem {
     audio_clients: BTreeMap<AudioClientId, AudioClientRecord>,
     direct_sound: BTreeMap<DirectSoundId, DirectSoundRecord>,
     direct_sound_buffers: BTreeMap<DirectSoundBufferId, DirectSoundBufferRecord>,
+    /// Per-buffer DirectSound3D positional state.
+    ds3d_buffer_states: HashMap<DirectSoundBufferId, Ds3dBufferState>,
+    /// Per-`IDirectSound8` listener state (keyed by DirectSoundId).
+    ds3d_listener_state: HashMap<DirectSoundId, Ds3dListenerState>,
     notifications: Vec<String>,
     latency_log: Vec<LatencyRecord>,
 }
@@ -192,6 +318,8 @@ impl AudioSubsystem {
             audio_clients: BTreeMap::new(),
             direct_sound: BTreeMap::new(),
             direct_sound_buffers: BTreeMap::new(),
+            ds3d_buffer_states: HashMap::new(),
+            ds3d_listener_state: HashMap::new(),
             notifications: Vec::new(),
             latency_log: Vec::new(),
         }
@@ -318,6 +446,7 @@ impl AudioSubsystem {
                 output_matrix: Vec::new(),
                 started: false,
                 volume: 1.0,
+                frequency_ratio: 1.0,
             },
         );
         Ok(id)
@@ -339,6 +468,7 @@ impl AudioSubsystem {
                 output_matrix: Vec::new(),
                 started: false,
                 volume: 1.0,
+                frequency_ratio: 1.0,
             },
         );
         Ok(id)
@@ -361,6 +491,7 @@ impl AudioSubsystem {
                 output_matrix: Vec::new(),
                 started: false,
                 volume: 1.0,
+                frequency_ratio: 1.0,
             },
         );
         Ok(id)
@@ -402,7 +533,7 @@ impl AudioSubsystem {
     }
 
     pub fn submit_source_buffer(&mut self, voice: VoiceId, buffer: SourceBuffer) -> AppResult<()> {
-        let (source_format, destination) = {
+        let (source_format, destination, loop_begin, loop_length, loop_count) = {
             let voice_record = self.voice(voice)?;
             let destination = match voice_record.kind {
                 VoiceKind::Source { destination, .. } => destination,
@@ -413,7 +544,7 @@ impl AudioSubsystem {
                     ));
                 }
             };
-            (voice_record.format.clone(), destination)
+            (voice_record.format.clone(), destination, buffer.loop_begin, buffer.loop_length, buffer.loop_count)
         };
         let destination_rate = self.voice(destination)?.format.sample_rate;
         let samples = convert_samples(buffer.samples);
@@ -424,6 +555,9 @@ impl AudioSubsystem {
             destination_rate,
         );
         let frame_count = resampled.len() / source_format.channels as usize;
+        let src_to_dst_ratio = destination_rate as f64 / source_format.sample_rate as f64;
+        let loop_begin_frame = loop_begin.map(|lb| (lb as f64 * src_to_dst_ratio) as usize);
+        let loop_length_frames = loop_length.map(|ll| (ll as f64 * src_to_dst_ratio) as usize);
         let record = self.voice_mut(voice)?;
         match &mut record.kind {
             VoiceKind::Source { queue, .. } => queue.push_back(QueuedBuffer {
@@ -431,6 +565,10 @@ impl AudioSubsystem {
                 samples: resampled,
                 frames: frame_count,
                 cursor: 0,
+                loop_begin: loop_begin_frame,
+                loop_length: loop_length_frames,
+                loop_count: loop_count.unwrap_or(0),
+                played_loops: 0,
             }),
             _ => unreachable!(),
         }
@@ -496,6 +634,58 @@ impl AudioSubsystem {
             }
         }
         self.voice_mut(voice)?.output_matrix = matrix;
+        Ok(())
+    }
+
+    pub fn volume(&self, voice: VoiceId) -> AppResult<f32> {
+        Ok(self.voice(voice)?.volume)
+    }
+
+    pub fn channel_volume(&self, voice: VoiceId, channel: usize) -> AppResult<f32> {
+        Ok(self.voice(voice)?.channel_volumes.get(channel).copied().unwrap_or(0.0))
+    }
+
+    pub fn set_channel_volume(&mut self, voice: VoiceId, channel: usize, volume: f32) -> AppResult<()> {
+        let record = self.voice_mut(voice)?;
+        if channel < record.channel_volumes.len() {
+            record.channel_volumes[channel] = volume;
+        }
+        Ok(())
+    }
+
+    pub fn exit_loop(&mut self, voice: VoiceId) -> AppResult<()> {
+        let record = self.voice_mut(voice)?;
+        match &mut record.kind {
+            VoiceKind::Source { queue, .. } => {
+                if let Some(buffer) = queue.front_mut() {
+                    buffer.loop_count = 0;
+                    buffer.played_loops = buffer.loop_count;
+                }
+                Ok(())
+            }
+            _ => Err(AppError::new(
+                ReasonCode::RcAudioUnsupported,
+                "exit_loop requires a source voice",
+            )),
+        }
+    }
+
+    pub fn played_frames(&self, voice: VoiceId) -> AppResult<u64> {
+        match &self.voice(voice)?.kind {
+            VoiceKind::Source { played_frames, .. } => Ok(*played_frames),
+            _ => Err(AppError::new(
+                ReasonCode::RcAudioUnsupported,
+                "played_frames requires a source voice",
+            )),
+        }
+    }
+
+    pub fn frequency_ratio(&self, voice: VoiceId) -> AppResult<f32> {
+        Ok(self.voice(voice)?.frequency_ratio)
+    }
+
+    pub fn set_frequency_ratio(&mut self, voice: VoiceId, ratio: f32) -> AppResult<()> {
+        self.voice_mut(voice)?.frequency_ratio = ratio.clamp(0.5, 2.0);
         Ok(())
     }
 
@@ -753,9 +943,120 @@ impl AudioSubsystem {
         Ok(())
     }
 
+    // ── DirectSound3D positional audio methods ──────────────────────────
+
+    /// Set the 3D buffer state for a DirectSound buffer.
+    ///
+    /// Called when the guest calls `IDirectSound3DBuffer8::SetAllParameters`,
+    /// `SetPosition`, `SetVelocity`, `SetConeAngles`, `SetMinDistance`,
+    /// `SetMaxDistance`, or `SetMode`.
+    pub fn set_ds3d_buffer_state(
+        &mut self,
+        buffer: DirectSoundBufferId,
+        state: Ds3dBufferState,
+    ) -> AppResult<()> {
+        // Validate the buffer exists.
+        self.direct_sound_buffer_mut(buffer)?;
+        self.ds3d_buffer_states.insert(buffer, state);
+        Ok(())
+    }
+
+    /// Return the current 3D buffer state for a DirectSound buffer.
+    ///
+    /// If no state has been set yet, returns the default state.
+    pub fn get_ds3d_buffer_state(&self, buffer: DirectSoundBufferId) -> AppResult<Ds3dBufferState> {
+        // Validate the buffer exists.
+        if !self.direct_sound_buffers.contains_key(&buffer) {
+            return Err(AppError::new(
+                ReasonCode::RcAudioUnsupported,
+                format!("unknown DirectSound buffer {buffer}"),
+            ));
+        }
+        Ok(self
+            .ds3d_buffer_states
+            .get(&buffer)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    /// Set the 3D listener state for a DirectSound object.
+    ///
+    /// Called when the guest calls `IDirectSound3DListener8::SetAllParameters`,
+    /// `SetPosition`, `SetVelocity`, `SetOrientation`, `SetDistanceFactor`,
+    /// `SetDopplerFactor`, or `SetRolloffFactor`.
+    pub fn set_ds3d_listener_state(
+        &mut self,
+        direct_sound: DirectSoundId,
+        state: Ds3dListenerState,
+    ) -> AppResult<()> {
+        // Validate the DirectSound object exists.
+        if !self.direct_sound.contains_key(&direct_sound) {
+            return Err(AppError::new(
+                ReasonCode::RcAudioUnsupported,
+                format!("unknown DirectSound object {direct_sound}"),
+            ));
+        }
+        self.ds3d_listener_state.insert(direct_sound, state);
+        Ok(())
+    }
+
+    /// Return the current 3D listener state for a DirectSound object.
+    ///
+    /// If no state has been set yet, returns the default state.
+    pub fn get_ds3d_listener_state(&self, direct_sound: DirectSoundId) -> AppResult<Ds3dListenerState> {
+        if !self.direct_sound.contains_key(&direct_sound) {
+            return Err(AppError::new(
+                ReasonCode::RcAudioUnsupported,
+                format!("unknown DirectSound object {direct_sound}"),
+            ));
+        }
+        Ok(self
+            .ds3d_listener_state
+            .get(&direct_sound)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    // ── Mixing ──────────────────────────────────────────────────────────
+
     pub fn mix_direct_sound_buffer(&mut self, buffer: DirectSoundBufferId, frames: usize) -> AppResult<RenderOutput> {
+        // ── Gather immutable state before mutating ──────────────────────
+        let (channels, sample_rate, device_id) = {
+            let record = self
+                .direct_sound_buffers
+                .get(&buffer)
+                .ok_or_else(|| {
+                    AppError::new(
+                        ReasonCode::RcAudioUnsupported,
+                        format!("unknown DirectSound buffer {buffer}"),
+                    )
+                })?;
+            (
+                record.format.channels as usize,
+                record.format.sample_rate,
+                record.device_id,
+            )
+        };
+
+        // Find the DirectSound object that owns this buffer (for listener lookup).
+        let ds_id = self
+            .direct_sound
+            .iter()
+            .find(|(_, ds)| ds.device_id == device_id)
+            .map(|(id, _)| *id);
+
+        // Retrieve 3D state (defaults if unset).
+        let ds3d_state = self
+            .ds3d_buffer_states
+            .get(&buffer)
+            .cloned()
+            .unwrap_or_default();
+        let listener = ds_id
+            .and_then(|id| self.ds3d_listener_state.get(&id).cloned())
+            .unwrap_or_default();
+
+        // ── Generate raw samples (now we can mutably borrow) ────────────
         let record = self.direct_sound_buffer_mut(buffer)?;
-        let channels = record.format.channels as usize;
         let mut samples = Vec::with_capacity(frames * channels);
         for _ in 0..frames {
             for channel in 0..channels {
@@ -771,8 +1072,59 @@ impl AudioSubsystem {
                 record.cursor += 1;
             }
         }
-        let latency_ms = measure_latency_ms(record.format.sample_rate, frames);
-        let device_id = record.device_id;
+        let latency_ms = measure_latency_ms(sample_rate, frames);
+
+        // ── Apply 3D positional audio effects ───────────────────────────
+        if ds3d_state.mode != Ds3dMode::Disable && record.playing {
+            // Distance attenuation
+            let mut volume_multiplier = compute_distance_attenuation(
+                &ds3d_state,
+                &listener,
+            );
+
+            // Cone attenuation
+            volume_multiplier *= compute_cone_attenuation(
+                &ds3d_state,
+                &listener,
+            );
+
+            // Doppler shift (frequency ratio) – we store it, the guest
+            // reads it via IDirectSound3DBuffer8::GetFrequency.
+            let _frequency_ratio = compute_doppler_shift(
+                &ds3d_state,
+                &listener,
+            );
+
+            // Channel panning: project the buffer position relative to the
+            // listener and pan between left/right based on the azimuth angle.
+            if channels >= 2 {
+                let pan = compute_channel_pan(
+                    &ds3d_state,
+                    &listener,
+                );
+                // pan is in [-1, 1]; -1 = full left, +1 = full right
+                for frame in 0..frames {
+                    let base = frame * channels;
+                    // Apply distance & cone volume to all channels
+                    for ch in 0..channels {
+                        samples[base + ch] *= volume_multiplier;
+                    }
+                    // Stereo pan for the first two channels
+                    let left_gain = (1.0 - pan) * 0.5;
+                    let right_gain = (1.0 + pan) * 0.5;
+                    samples[base] *= left_gain;
+                    if channels > 1 {
+                        samples[base + 1] *= right_gain;
+                    }
+                }
+            } else {
+                // Mono: just apply volume
+                for sample in samples.iter_mut() {
+                    *sample *= volume_multiplier;
+                }
+            }
+        }
+
         self.latency_log.push(LatencyRecord {
             subsystem: "directsound".to_string(),
             device_id,
@@ -862,7 +1214,26 @@ impl AudioSubsystem {
             } => {
                 for frame_index in 0..frames {
                     while matches!(queue.front(), Some(buffer) if buffer.cursor >= buffer.frames) {
-                        queue.pop_front();
+                        // Buffer completed — fire OnBufferEnd only if no looping
+                        let finished = queue.front().unwrap();
+                        let will_loop = finished.loop_begin.is_some()
+                            && finished.loop_length.unwrap_or(0) > 0
+                            && (finished.loop_count == 0 || finished.played_loops < finished.loop_count);
+                        if will_loop {
+                            // Rewind to loop start
+                            let buf = queue.front_mut().unwrap();
+                            buf.cursor = buf.loop_begin.unwrap_or(0);
+                            buf.played_loops += 1;
+                            break;
+                        } else {
+                            callbacks.push(VoiceCallbackEvent {
+                                voice,
+                                event: "OnBufferEnd".to_string(),
+                                tag: finished.tag.clone(),
+                                sample_offset: *played_frames + frame_index as u64 + 1,
+                            });
+                            queue.pop_front();
+                        }
                     }
                     let Some(buffer) = queue.front_mut() else {
                         *underflow_frames += 1;
@@ -873,14 +1244,6 @@ impl AudioSubsystem {
                     let write_offset = frame_index * channels;
                     mix[write_offset..write_offset + channels].copy_from_slice(frame_samples);
                     buffer.cursor += 1;
-                    if buffer.cursor == buffer.frames {
-                        callbacks.push(VoiceCallbackEvent {
-                            voice,
-                            event: "OnBufferEnd".to_string(),
-                            tag: buffer.tag.clone(),
-                            sample_offset: *played_frames + frame_index as u64 + 1,
-                        });
-                    }
                 }
                 *played_frames += frames as u64;
             }
@@ -931,12 +1294,20 @@ impl AudioSubsystem {
     }
 
     fn validate_format(&self, format: &WaveFormat) -> AppResult<()> {
-        let sample_rate_supported = matches!(format.sample_rate, 44_100 | 48_000 | 24_000);
-        let channels_supported = matches!(format.channels, 1 | 2);
+        // Support common sample rates: 22.05K, 24K, 44.1K, 48K, 96K, 192K
+        let sample_rate_supported = matches!(
+            format.sample_rate,
+            22_050 | 24_000 | 44_100 | 48_000 | 96_000 | 192_000
+        );
+        // Support 1 (mono), 2 (stereo), 4 (quad), 6 (5.1), 8 (7.1)
+        let channels_supported = matches!(format.channels, 1 | 2 | 4 | 6 | 8);
         if !sample_rate_supported || !channels_supported {
             return Err(AppError::new(
                 ReasonCode::RcAudioUnsupported,
-                "unsupported audio format requested",
+                format!(
+                    "unsupported audio format: {} channels, {} Hz",
+                    format.channels, format.sample_rate
+                ),
             ));
         }
         match format.sample_format {
@@ -1079,7 +1450,7 @@ fn resample_interleaved(
     resampled
 }
 
-fn default_output_matrix(source_channels: usize, destination_channels: usize) -> Vec<f32> {
+pub(crate) fn default_output_matrix(source_channels: usize, destination_channels: usize) -> Vec<f32> {
     if source_channels == 1 && destination_channels == 2 {
         return vec![1.0, 1.0];
     }
@@ -1113,6 +1484,192 @@ fn mix_in_place(destination: &mut [f32], source: &[f32]) {
     for (dst, src) in destination.iter_mut().zip(source.iter()) {
         *dst += *src;
     }
+}
+
+// ── DirectSound3D positional audio helper functions ─────────────────────
+
+/// Compute the distance-based volume attenuation using inverse-distance
+/// clamped rolloff (DS3D default).
+///
+/// Returns a multiplier in `[0, 1]` that should be applied to all channels.
+fn compute_distance_attenuation(state: &Ds3dBufferState, listener: &Ds3dListenerState) -> f32 {
+    let dx = state.position[0] - listener.position[0];
+    let dy = state.position[1] - listener.position[1];
+    let dz = state.position[2] - listener.position[2];
+    let distance = (dx * dx + dy * dy + dz * dz).sqrt();
+
+    if distance < state.min_distance {
+        return 1.0;
+    }
+    if distance > state.max_distance {
+        return 0.0;
+    }
+
+    // Inverse-distance clamped rolloff
+    // volume = min_distance / (min_distance + rolloff_factor * (distance - min_distance))
+    let rolloff = listener.rolloff_factor;
+    let denom = state.min_distance + rolloff * (distance - state.min_distance);
+    if denom <= f32::EPSILON {
+        return 1.0;
+    }
+    (state.min_distance / denom).clamp(0.0, 1.0)
+}
+
+/// Compute cone attenuation based on the angle between the listener and
+/// the buffer's cone orientation.
+///
+/// The buffer's cone is defined by its inner and outer angles.  If the
+/// listener lies within the inner cone, no attenuation is applied.
+/// If outside the outer cone, the outside volume (in dB) is applied.
+/// Between inner and outer, the attenuation is linearly interpolated.
+///
+/// Returns a multiplier in `[0, 1]`.
+fn compute_cone_attenuation(state: &Ds3dBufferState, listener: &Ds3dListenerState) -> f32 {
+    // Omnidirectional — no cone effect.
+    if state.cone_inside_angle >= 360 {
+        return 1.0;
+    }
+
+    // Vector from buffer to listener.
+    let dx = listener.position[0] - state.position[0];
+    let dy = listener.position[1] - state.position[1];
+    let dz = listener.position[2] - state.position[2];
+    let len = (dx * dx + dy * dy + dz * dz).sqrt();
+    if len <= f32::EPSILON {
+        // Listener is at the buffer position — inside the cone.
+        return 1.0;
+    }
+
+    // DirectSound3D uses the buffer's negative-Z axis as the cone
+    // direction (i.e., the sound projects in the -Z direction).
+    // The buffer has no explicit cone direction field in the standard
+    // DS3DBUFFER; instead the sound's direction is always -Z in the
+    // buffer's local space.  For world-space we treat the direction
+    // as -Z (since no orientation matrix is stored on the buffer).
+    let cone_dir = [0.0, 0.0, -1.0];
+
+    // Normalise the listener-to-buffer vector.
+    let nx = dx / len;
+    let ny = dy / len;
+    let nz = dz / len;
+
+    // Dot product between cone direction and listener direction.
+    let dot = nx * cone_dir[0] + ny * cone_dir[1] + nz * cone_dir[2];
+    // Clamp to [-1, 1] for numerical safety.
+    let dot = dot.clamp(-1.0, 1.0);
+
+    // Angle between cone axis and listener (in degrees).
+    let angle_deg = dot.acos().to_degrees();
+
+    let inside = state.cone_inside_angle as f32;
+    let outside = state.cone_outside_angle.max(state.cone_inside_angle) as f32;
+
+    if angle_deg <= inside {
+        // Inside the inner cone — no attenuation.
+        1.0
+    } else if angle_deg >= outside {
+        // Outside the outer cone — apply outside volume (dB -> linear).
+        let db = state.cone_outside_volume as f32;
+        if db <= -96.0 {
+            0.0
+        } else {
+            10.0_f32.powf(db / 20.0)
+        }
+    } else {
+        // Between inner and outer — linearly interpolate dB.
+        let t = (angle_deg - inside) / (outside - inside);
+        let db = t * state.cone_outside_volume as f32;
+        if db <= -96.0 {
+            0.0
+        } else {
+            10.0_f32.powf(db / 20.0)
+        }
+    }
+}
+
+/// Compute the Doppler shift frequency ratio.
+///
+/// Returns a frequency multiplier (e.g., 1.0 = no shift, >1 = higher pitch,
+/// <1 = lower pitch).  The guest should read this via
+/// `IDirectSound3DBuffer8::GetFrequency`.
+fn compute_doppler_shift(state: &Ds3dBufferState, listener: &Ds3dListenerState) -> f32 {
+    let doppler = listener.doppler_factor;
+    if doppler <= f32::EPSILON {
+        return 1.0; // Doppler disabled
+    }
+
+    // Vector from listener to source.
+    let dx = state.position[0] - listener.position[0];
+    let dy = state.position[1] - listener.position[1];
+    let dz = state.position[2] - listener.position[2];
+    let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+    if dist <= f32::EPSILON {
+        return 1.0;
+    }
+
+    // Normalised direction from listener to source.
+    let nx = dx / dist;
+    let ny = dy / dist;
+    let nz = dz / dist;
+
+    // Project source and listener velocities onto the listener→source axis.
+    let v_source = state.velocity[0] * nx + state.velocity[1] * ny + state.velocity[2] * nz;
+    let v_listener = listener.velocity[0] * nx + listener.velocity[1] * ny + listener.velocity[2] * nz;
+
+    let c = DS3D_SPEED_OF_SOUND;
+    let numerator = c + doppler * v_listener;
+    let denominator = c + doppler * v_source;
+
+    if denominator <= f32::EPSILON {
+        return 1.0;
+    }
+    (numerator / denominator).clamp(0.5, 2.0)
+}
+
+/// Compute the stereo pan value in `[-1, 1]` based on the azimuth angle
+/// of the buffer relative to the listener's forward vector.
+///
+/// - `-1` = full left
+/// - `0` = centre
+/// - `+1` = full right
+fn compute_channel_pan(state: &Ds3dBufferState, listener: &Ds3dListenerState) -> f32 {
+    // Vector from listener to buffer.
+    let dx = state.position[0] - listener.position[0];
+    let dy = state.position[1] - listener.position[1];
+    let dz = state.position[2] - listener.position[2];
+    let len = (dx * dx + dy * dy + dz * dz).sqrt();
+    if len <= f32::EPSILON {
+        return 0.0; // at listener position → centre
+    }
+
+    let nx = dx / len;
+    let ny = dy / len;
+    let nz = dz / len;
+
+    // Forward and up vectors from the listener.
+    let fw = listener.forward;
+    let up = listener.up;
+
+    // Compute the right vector as cross product of forward and up.
+    let right = [
+        fw[1] * up[2] - fw[2] * up[1],
+        fw[2] * up[0] - fw[0] * up[2],
+        fw[0] * up[1] - fw[1] * up[0],
+    ];
+
+    // Project the buffer direction onto the forward and right axes.
+    let fwd_dot = nx * fw[0] + ny * fw[1] + nz * fw[2];
+    let right_dot = nx * right[0] + ny * right[1] + nz * right[2];
+
+    // Azimuth angle in radians.  atan2(right_dot, fwd_dot) gives the
+    // horizontal angle: 0 = front, π/2 = right, π = behind, -π/2 = left.
+    let azimuth = fwd_dot.atan2(right_dot);
+
+    // Map azimuth from [-π, π] to [-1, 1] pan.
+    // Negative = left, Positive = right.
+    // Clamp to [-π/2, π/2] so sounds behind are still panned sensibly.
+    let clamped = azimuth.clamp(-std::f32::consts::FRAC_PI_2, std::f32::consts::FRAC_PI_2);
+    clamped / std::f32::consts::FRAC_PI_2
 }
 
 fn measure_latency_ms(sample_rate: u32, buffered_frames: usize) -> u32 {

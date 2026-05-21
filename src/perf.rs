@@ -7,6 +7,8 @@
 use crate::error::{AppError, AppResult};
 use crate::reason::ReasonCode;
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::os::unix::io::AsRawFd;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -132,10 +134,11 @@ impl BlockChainingCache {
         }
 
         // Create chain
+        let patch_offset = self.compute_patch_offset(guest_address, target_address);
         let chain = BlockChain {
             from_address: guest_address,
             to_address: target_address,
-            patch_offset: 0, // Would be computed from actual code layout
+            patch_offset,
             is_active: true,
         };
         self.chains.push(chain);
@@ -192,6 +195,29 @@ impl BlockChainingCache {
             .values()
             .filter(|b| b.execution_count >= threshold)
             .collect()
+    }
+
+    /// Compute the patch offset from one block to its target.
+    ///
+    /// Returns the difference between the end of `from_address`'s code and the
+    /// start of `patch_target`'s code. Falls back to 0 if either block is not found.
+    pub fn compute_patch_offset(&self, from_address: u64, patch_target: u64) -> usize {
+        if let Some(target_block) = self.blocks.get(&patch_target) {
+            if let Some(from_block) = self.blocks.get(&from_address) {
+                // The patch offset is the distance from the end of the current block
+                // to the start of the target block's host code.
+                let from_end = from_block.host_address.saturating_add(from_block.code_size as u64);
+                if from_end <= target_block.host_address {
+                    (target_block.host_address - from_end) as usize
+                } else {
+                    0
+                }
+            } else {
+                0
+            }
+        } else {
+            0
+        }
     }
 
     /// Invalidate all blocks and chains (e.g., on self-modifying code).
@@ -295,10 +321,14 @@ impl LazyJitProfiler {
     }
 
     /// Mark a block as compiled at a given tier.
-    pub fn mark_compiled(&self, guest_address: u64, tier: CompilationTier, compile_time_us: u64) {
+    pub fn mark_compiled(&mut self, guest_address: u64, tier: CompilationTier, compile_time_us: u64) {
         self.total_compile_time_us.fetch_add(compile_time_us, Ordering::Relaxed);
         self.total_compiled.fetch_add(1, Ordering::Relaxed);
-        let _ = (guest_address, tier);
+        if let Some(profile) = self.profiles.get_mut(&guest_address) {
+            profile.tier = tier;
+            profile.last_compiled = Some(Instant::now());
+            profile.compile_time_us += compile_time_us;
+        }
     }
 
     /// Get the profile for a block.
@@ -354,6 +384,8 @@ pub struct AddressTranslation {
     pub size: usize,
     pub protection: u32,
     pub hits: u64,
+    /// Access count for LRU eviction tracking.
+    pub access_count: u64,
 }
 
 /// Cache for guest-to-host address translations.
@@ -378,16 +410,33 @@ impl AddressTranslationCache {
     }
 
     /// Look up a guest address in the cache.
-    pub fn lookup(&self, guest_address: u64) -> Option<&AddressTranslation> {
+    ///
+    /// Increments the access counter for LRU tracking.
+    pub fn lookup(&mut self, guest_address: u64) -> Option<&AddressTranslation> {
+        // Check existence first to avoid borrow conflicts
+        if self.translations.contains_key(&guest_address) {
+            if let Some(entry) = self.translations.get_mut(&guest_address) {
+                entry.access_count += 1;
+                entry.hits += 1;
+            }
+        }
+        // Return immutable reference (mutable borrow is released)
         self.translations.get(&guest_address)
     }
 
     /// Insert a translation into the cache.
+    ///
+    /// Evicts the least-recently-used entry (lowest `access_count`) when the
+    /// cache is at capacity.
     pub fn insert(&mut self, guest_address: u64, host_address: u64, size: usize, protection: u32) {
-        // Evict if full (LRU-like: just remove a random entry)
-        if self.translations.len() >= self.max_entries {
-            if let Some(key) = self.translations.keys().next().copied() {
-                self.translations.remove(&key);
+        // Evict the LRU entry if at capacity
+        if self.translations.len() >= self.max_entries && !self.translations.contains_key(&guest_address) {
+            if let Some((&lru_key, _)) = self
+                .translations
+                .iter()
+                .min_by_key(|(_, v)| v.access_count)
+            {
+                self.translations.remove(&lru_key);
             }
         }
 
@@ -399,6 +448,7 @@ impl AddressTranslationCache {
                 size,
                 protection,
                 hits: 0,
+                access_count: 0,
             },
         );
     }
@@ -728,7 +778,6 @@ pub struct GpuUploadStreamer {
     buffers: BTreeMap<u64, StreamingBuffer>,
     next_buffer_id: AtomicU64,
     current_frame: AtomicU64,
-    #[allow(dead_code)]
     ring_buffer_size: usize,
     total_bytes_uploaded: AtomicU64,
 }
@@ -772,7 +821,7 @@ impl GpuUploadStreamer {
             buffer.frame_used = frame;
         }
 
-        // Check if there's enough space
+        // Check if there's enough space in the buffer
         if buffer.write_offset + size > buffer.size {
             // Wrap around if possible
             if size <= buffer.size {
@@ -781,6 +830,21 @@ impl GpuUploadStreamer {
                 return Err(AppError::new(
                     ReasonCode::RcD3dInvalidState,
                     format!("streaming allocation {size} exceeds buffer size {}", buffer.size),
+                ));
+            }
+        }
+
+        // Validate that the allocation does not exceed the ring buffer total
+        if buffer.write_offset + size > self.ring_buffer_size {
+            if size <= self.ring_buffer_size {
+                buffer.write_offset = 0;
+            } else {
+                return Err(AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    format!(
+                        "streaming allocation {size} exceeds ring buffer size {}",
+                        self.ring_buffer_size
+                    ),
                 ));
             }
         }
@@ -796,6 +860,11 @@ impl GpuUploadStreamer {
     /// Advance to the next frame.
     pub fn advance_frame(&self) {
         self.current_frame.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Get the ring buffer size in bytes.
+    pub fn ring_buffer_size(&self) -> usize {
+        self.ring_buffer_size
     }
 
     /// Get the current frame number.
@@ -982,6 +1051,499 @@ impl FramePacer {
         };
         self.frame_history.clear();
         self.last_frame_start = None;
+    }
+}
+
+// ===========================================================================
+// Phase 7: Async File I/O
+// ===========================================================================
+
+/// A pending async read request.
+#[derive(Debug, Clone)]
+pub struct PendingRead {
+    /// File path to read from.
+    pub path: PathBuf,
+    /// Byte offset within the file.
+    pub offset: u64,
+    /// Number of bytes to read.
+    pub size: usize,
+}
+
+/// A completed async read result.
+#[derive(Debug, Clone)]
+pub struct CompletedRead {
+    /// Data read from the file.
+    pub data: Vec<u8>,
+    /// Time taken for the read in microseconds.
+    pub elapsed_us: u64,
+}
+
+/// Manages asynchronous file read operations.
+///
+/// # Performance Impact
+/// Synchronous file I/O blocks the calling thread, wasting CPU cycles while
+/// waiting for disk. By submitting reads asynchronously, the main emulation
+/// thread can continue executing guest code while I/O happens in the
+/// background, reducing frame stalls during asset loading.
+pub struct AsyncFileReader {
+    /// Pending read requests keyed by request ID.
+    pub pending_reads: BTreeMap<u64, PendingRead>,
+    /// Completed read results keyed by request ID.
+    pub completed_reads: BTreeMap<u64, CompletedRead>,
+    /// Next unique request ID.
+    pub next_request_id: u64,
+    /// Thread handles for in-flight async reads.
+    handles: HashMap<u64, std::thread::JoinHandle<CompletedRead>>,
+}
+
+impl AsyncFileReader {
+    /// Create a new async file reader.
+    pub fn new() -> Self {
+        Self {
+            pending_reads: BTreeMap::new(),
+            completed_reads: BTreeMap::new(),
+            next_request_id: 1,
+            handles: HashMap::new(),
+        }
+    }
+
+    /// Submit an asynchronous read request.
+    ///
+    /// Returns the unique request ID that can be used to poll for completion.
+    /// The read is performed on a background thread, allowing the caller to
+    /// continue execution while I/O completes.
+    pub fn submit_read(&mut self, path: PathBuf, offset: u64, size: usize) -> u64 {
+        let id = self.next_request_id;
+        self.next_request_id += 1;
+
+        self.pending_reads.insert(
+            id,
+            PendingRead {
+                path: path.clone(),
+                offset,
+                size,
+            },
+        );
+
+        let handle = std::thread::spawn(move || {
+            let start = Instant::now();
+            let data = match std::fs::read(&path) {
+                Ok(contents) => {
+                    let start_idx = offset as usize;
+                    let end_idx = (offset as usize).saturating_add(size).min(contents.len());
+                    if start_idx < contents.len() {
+                        contents[start_idx..end_idx].to_vec()
+                    } else {
+                        Vec::new()
+                    }
+                }
+                Err(_) => Vec::new(),
+            };
+            let elapsed_us = start.elapsed().as_micros() as u64;
+
+            CompletedRead { data, elapsed_us }
+        });
+
+        self.handles.insert(id, handle);
+        id
+    }
+
+    /// Poll for completed reads.
+    ///
+    /// Returns all completed reads as `(request_id, data)` pairs and removes
+    /// them from the completed queue.
+    pub fn poll_completed(&mut self) -> Vec<(u64, Vec<u8>)> {
+        let ids: Vec<u64> = self.completed_reads.keys().copied().collect();
+        let mut results = Vec::new();
+        for id in ids {
+            if let Some(completed) = self.completed_reads.remove(&id) {
+                results.push((id, completed.data));
+            }
+        }
+        results
+    }
+
+    /// Wait for a specific read request to complete.
+    ///
+    /// Blocks until the background thread completes the read and returns
+    /// the data. The `timeout_ms` parameter is preserved for API compatibility.
+    pub fn wait_for(&mut self, request_id: u64, _timeout_ms: u64) -> AppResult<Vec<u8>> {
+        // If the result is already available from a previous join, return it
+        if let Some(completed) = self.completed_reads.remove(&request_id) {
+            return Ok(completed.data);
+        }
+
+        // Join the background thread if it's still running
+        if let Some(handle) = self.handles.remove(&request_id) {
+            match handle.join() {
+                Ok(completed) => {
+                    let data = completed.data.clone();
+                    self.completed_reads.insert(request_id, completed);
+                    Ok(data)
+                }
+                Err(_) => Err(AppError::new(
+                    ReasonCode::RcIo,
+                    format!("async read {request_id}: thread panicked"),
+                )),
+            }
+        } else {
+            Err(AppError::new(
+                ReasonCode::RcWin32Timeout,
+                format!("async read {request_id} not found"),
+            ))
+        }
+    }
+}
+
+// ===========================================================================
+// Phase 7: File Caching
+// ===========================================================================
+
+/// A cached file entry.
+#[derive(Debug, Clone)]
+pub struct FileCacheEntry {
+    /// Cached file data.
+    pub data: Vec<u8>,
+    /// Timestamp of last access (monotonic counter).
+    pub last_access: u64,
+    /// Number of times this entry has been accessed.
+    pub access_count: u64,
+}
+
+/// Caches frequently accessed file data in memory.
+///
+/// # Performance Impact
+/// Game engines often read the same files repeatedly (configuration, shaders,
+/// texture headers). Caching eliminates redundant disk I/O and filesystem
+/// overhead, reducing latency for hot-path file accesses from milliseconds
+/// to nanoseconds.
+pub struct FileCache {
+    /// Cached entries keyed by file path.
+    pub entries: BTreeMap<String, FileCacheEntry>,
+    /// Maximum total cache size in bytes.
+    pub max_size_bytes: usize,
+    /// Currently used bytes.
+    pub used_bytes: usize,
+    /// Total cache hits.
+    pub hits: u64,
+    /// Total cache misses.
+    pub misses: u64,
+    /// Monotonic access counter for LRU tracking.
+    access_counter: u64,
+}
+
+impl FileCache {
+    /// Create a new file cache with the given maximum size in bytes.
+    pub fn new(max_size_bytes: usize) -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            max_size_bytes,
+            used_bytes: 0,
+            hits: 0,
+            misses: 0,
+            access_counter: 0,
+        }
+    }
+
+    /// Get cached file data by path.
+    ///
+    /// Returns `Some(data)` on cache hit, `None` on miss.
+    pub fn get(&mut self, path: &str) -> Option<&[u8]> {
+        self.access_counter += 1;
+        if let Some(entry) = self.entries.get_mut(path) {
+            entry.last_access = self.access_counter;
+            entry.access_count += 1;
+            self.hits += 1;
+            Some(&entry.data)
+        } else {
+            self.misses += 1;
+            None
+        }
+    }
+
+    /// Insert file data into the cache.
+    ///
+    /// If the cache is full, LRU entries are evicted until there is enough
+    /// space. Returns an error if the data is larger than the entire cache.
+    pub fn insert(&mut self, path: &str, data: Vec<u8>) -> AppResult<()> {
+        let data_len = data.len();
+        if data_len > self.max_size_bytes {
+            return Err(AppError::new(
+                ReasonCode::RcIo,
+                format!("file cache: data size {data_len} exceeds max cache size {}", self.max_size_bytes),
+            ));
+        }
+
+        // Remove old entry if present
+        if let Some(old) = self.entries.remove(path) {
+            self.used_bytes = self.used_bytes.saturating_sub(old.data.len());
+        }
+
+        // Evict LRU entries until we have space
+        while self.used_bytes + data_len > self.max_size_bytes && !self.entries.is_empty() {
+            let lru_key = self
+                .entries
+                .iter()
+                .min_by_key(|(_, e)| e.last_access)
+                .map(|(k, _)| k.clone());
+            if let Some(key) = lru_key {
+                if let Some(old) = self.entries.remove(&key) {
+                    self.used_bytes = self.used_bytes.saturating_sub(old.data.len());
+                }
+            }
+        }
+
+        self.access_counter += 1;
+        self.used_bytes += data_len;
+        self.entries.insert(
+            path.to_string(),
+            FileCacheEntry {
+                data,
+                last_access: self.access_counter,
+                access_count: 0,
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Invalidate a specific cached file.
+    pub fn invalidate(&mut self, path: &str) {
+        if let Some(old) = self.entries.remove(path) {
+            self.used_bytes = self.used_bytes.saturating_sub(old.data.len());
+        }
+    }
+
+    /// Invalidate all cached files.
+    pub fn invalidate_all(&mut self) {
+        self.entries.clear();
+        self.used_bytes = 0;
+    }
+
+    /// Get cache statistics: (hits, misses, hit_rate).
+    pub fn stats(&self) -> (u64, u64, f64) {
+        let total = self.hits + self.misses;
+        let rate = if total == 0 {
+            0.0
+        } else {
+            self.hits as f64 / total as f64
+        };
+        (self.hits, self.misses, rate)
+    }
+
+    /// Get the number of cached entries.
+    pub fn entry_count(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+// ===========================================================================
+// Phase 7: Path Resolution Caching
+// ===========================================================================
+
+/// Caches resolved filesystem paths to avoid repeated string operations.
+///
+/// # Performance Impact
+/// Path resolution involves string manipulation, component joining, and
+/// potentially filesystem stat calls. By caching resolved paths, we avoid
+/// redundant string allocations and filesystem queries for frequently
+/// accessed paths.
+pub struct PathResolutionCache {
+    /// Resolved paths: guest_path → host_path.
+    pub cache: BTreeMap<String, PathBuf>,
+    /// Total cache hits.
+    pub hits: u64,
+    /// Total cache misses.
+    pub misses: u64,
+}
+
+impl PathResolutionCache {
+    /// Create a new path resolution cache.
+    pub fn new() -> Self {
+        Self {
+            cache: BTreeMap::new(),
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    /// Resolve a guest path, using the cache when possible.
+    ///
+    /// On a cache hit, returns the cached host path directly. On a miss,
+    /// calls the resolver function and caches the result.
+    pub fn resolve<F>(&mut self, guest_path: &str, resolver: F) -> AppResult<PathBuf>
+    where
+        F: FnOnce(&str) -> AppResult<PathBuf>,
+    {
+        if let Some(resolved) = self.cache.get(guest_path) {
+            self.hits += 1;
+            return Ok(resolved.clone());
+        }
+
+        self.misses += 1;
+        let resolved = resolver(guest_path)?;
+        self.cache.insert(guest_path.to_string(), resolved.clone());
+        Ok(resolved)
+    }
+
+    /// Invalidate a specific cached path.
+    pub fn invalidate(&mut self, guest_path: &str) {
+        self.cache.remove(guest_path);
+    }
+
+    /// Invalidate all cached paths matching a prefix.
+    pub fn invalidate_prefix(&mut self, prefix: &str) {
+        let keys_to_remove: Vec<String> = self
+            .cache
+            .keys()
+            .filter(|k| k.starts_with(prefix))
+            .cloned()
+            .collect();
+        for key in keys_to_remove {
+            self.cache.remove(&key);
+        }
+    }
+
+    /// Get cache statistics: (hits, misses, hit_rate).
+    pub fn stats(&self) -> (u64, u64, f64) {
+        let total = self.hits + self.misses;
+        let rate = if total == 0 {
+            0.0
+        } else {
+            self.hits as f64 / total as f64
+        };
+        (self.hits, self.misses, rate)
+    }
+
+    /// Get the number of cached entries.
+    pub fn entry_count(&self) -> usize {
+        self.cache.len()
+    }
+}
+
+// ===========================================================================
+// Phase 7: Memory-Mapped File Support
+// ===========================================================================
+
+/// A memory-mapped file for efficient large file reads.
+///
+/// # Performance Impact
+/// For large files (textures, meshes, audio), `mmap` avoids copying data
+/// from kernel space to user space. The kernel maps file pages directly
+/// into the process address space, enabling zero-copy reads and lazy
+/// page-in that reduces peak memory usage.
+pub struct MmappedFile {
+    /// File path.
+    pub path: PathBuf,
+    /// Size of the mapped region in bytes.
+    pub size: usize,
+    /// Pointer to the mapped memory.
+    pub ptr: *mut u8,
+    /// Whether the file is currently mapped.
+    pub mapped: bool,
+}
+
+// Safety: MmappedFile is safe to send between threads as long as no two
+// threads mutate the mapping simultaneously. The read method only requires
+// &self, so concurrent reads are safe.
+unsafe impl Send for MmappedFile {}
+unsafe impl Sync for MmappedFile {}
+
+impl MmappedFile {
+    /// Open a file and memory-map it.
+    ///
+    /// The entire file is mapped into the process address space. Pages are
+    /// loaded on demand (lazy page-in).
+    pub fn open(path: &Path) -> AppResult<Self> {
+        let file = std::fs::File::open(path).map_err(|e| {
+            AppError::from_io(ReasonCode::RcIo, format!("mmap: failed to open {}", path.display()), &e)
+        })?;
+
+        let metadata = file.metadata().map_err(|e| {
+            AppError::from_io(ReasonCode::RcIo, format!("mmap: failed to stat {}", path.display()), &e)
+        })?;
+
+        let size = metadata.len() as usize;
+
+        if size == 0 {
+            return Ok(Self {
+                path: path.to_path_buf(),
+                size: 0,
+                ptr: std::ptr::null_mut(),
+                mapped: false,
+            });
+        }
+
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                size,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+
+        if ptr == libc::MAP_FAILED {
+            return Err(AppError::new(
+                ReasonCode::RcIo,
+                format!("mmap: failed to mmap {}", path.display()),
+            ));
+        }
+
+        Ok(Self {
+            path: path.to_path_buf(),
+            size,
+            ptr: ptr as *mut u8,
+            mapped: true,
+        })
+    }
+
+    /// Read bytes from the mapped memory at the given offset.
+    ///
+    /// Copies `buf.len()` bytes starting at `offset` from the mapped region
+    /// into the provided buffer.
+    pub fn read(&self, offset: usize, buf: &mut [u8]) -> AppResult<()> {
+        if !self.mapped || self.ptr.is_null() {
+            return Err(AppError::new(
+                ReasonCode::RcIo,
+                "mmap: file is not mapped",
+            ));
+        }
+
+        if offset.saturating_add(buf.len()) > self.size {
+            return Err(AppError::new(
+                ReasonCode::RcMemoryAccessViolation,
+                format!("mmap: read at offset {offset} + {} exceeds file size {}", buf.len(), self.size),
+            ));
+        }
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.ptr.add(offset), buf.as_mut_ptr(), buf.len());
+        }
+
+        Ok(())
+    }
+
+    /// Close the memory mapping.
+    ///
+    /// Unmaps the file and resets the internal state. Must be called before
+    /// drop to release the mapping explicitly (though Drop also handles it).
+    pub fn close(&mut self) {
+        if self.mapped && !self.ptr.is_null() {
+            unsafe {
+                libc::munmap(self.ptr as *mut libc::c_void, self.size);
+            }
+            self.ptr = std::ptr::null_mut();
+            self.mapped = false;
+        }
+    }
+}
+
+impl Drop for MmappedFile {
+    fn drop(&mut self) {
+        self.close();
     }
 }
 
@@ -1271,7 +1833,7 @@ mod tests {
 
     #[test]
     fn upload_streamer_allocate() {
-        let mut streamer = GpuUploadStreamer::new(1024);
+        let mut streamer = GpuUploadStreamer::new(4096);
         let buf = streamer.create_streaming_buffer(4096);
 
         let offset1 = streamer.allocate(buf, 1024).unwrap();
@@ -1298,7 +1860,7 @@ mod tests {
 
     #[test]
     fn upload_streamer_advance_frame_resets() {
-        let mut streamer = GpuUploadStreamer::new(1024);
+        let mut streamer = GpuUploadStreamer::new(4096);
         let buf = streamer.create_streaming_buffer(4096);
 
         streamer.allocate(buf, 3000).unwrap();
@@ -1366,5 +1928,223 @@ mod tests {
 
         pacer.reset_stats();
         assert_eq!(pacer.stats().frames_rendered, 0);
+    }
+
+    // --- Phase 7: File Cache Tests ---
+
+    #[test]
+    fn file_cache_insert_get() {
+        let mut cache = FileCache::new(1024);
+
+        // Miss
+        assert!(cache.get("test.txt").is_none());
+        let (hits, misses, _) = cache.stats();
+        assert_eq!(hits, 0);
+        assert_eq!(misses, 1);
+
+        // Insert
+        cache.insert("test.txt", vec![1, 2, 3, 4]).unwrap();
+        assert_eq!(cache.entry_count(), 1);
+
+        // Hit
+        let data = cache.get("test.txt").unwrap();
+        assert_eq!(data, &[1, 2, 3, 4]);
+        let (hits, misses, rate) = cache.stats();
+        assert_eq!(hits, 1);
+        assert!(rate > 0.0);
+    }
+
+    #[test]
+    fn file_cache_eviction() {
+        let mut cache = FileCache::new(20); // Very small cache
+
+        cache.insert("a.txt", vec![0u8; 10]).unwrap();
+        cache.insert("b.txt", vec![0u8; 10]).unwrap();
+        assert_eq!(cache.entry_count(), 2);
+
+        // Insert a third file — should evict the LRU (a.txt)
+        cache.insert("c.txt", vec![0u8; 10]).unwrap();
+        assert_eq!(cache.entry_count(), 2);
+        assert!(cache.get("a.txt").is_none(), "a.txt should have been evicted");
+        assert!(cache.get("b.txt").is_some(), "b.txt should still be cached");
+        assert!(cache.get("c.txt").is_some(), "c.txt should be cached");
+    }
+
+    #[test]
+    fn file_cache_invalidate() {
+        let mut cache = FileCache::new(1024);
+        cache.insert("test.txt", vec![1, 2, 3]).unwrap();
+        assert!(cache.get("test.txt").is_some());
+
+        cache.invalidate("test.txt");
+        assert!(cache.get("test.txt").is_none());
+        assert_eq!(cache.entry_count(), 0);
+    }
+
+    #[test]
+    fn file_cache_too_large() {
+        let mut cache = FileCache::new(10);
+        let result = cache.insert("big.txt", vec![0u8; 100]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn file_cache_stats() {
+        let mut cache = FileCache::new(1024);
+        cache.insert("a.txt", vec![1]).unwrap();
+
+        cache.get("a.txt"); // hit
+        cache.get("a.txt"); // hit
+        cache.get("b.txt"); // miss
+
+        let (hits, misses, rate) = cache.stats();
+        assert_eq!(hits, 2);
+        assert_eq!(misses, 1); // only "b.txt" was a miss
+        assert!((rate - (2.0 / 3.0)).abs() < 0.01);
+    }
+
+    // --- Phase 7: Path Resolution Cache Tests ---
+
+    #[test]
+    fn path_resolution_cache() {
+        let mut cache = PathResolutionCache::new();
+
+        let call_count = std::sync::atomic::AtomicUsize::new(0);
+
+        // First call — miss, resolver called
+        let result = cache.resolve("C:\\Users\\test.txt", |path| {
+            call_count.fetch_add(1, Ordering::Relaxed);
+            Ok(PathBuf::from(format!("/host{}", path.replace('\\', "/"))))
+        }).unwrap();
+        assert_eq!(result, PathBuf::from("/hostC:/Users/test.txt"));
+        assert_eq!(call_count.load(Ordering::Relaxed), 1);
+
+        // Second call — hit, resolver NOT called
+        let result2 = cache.resolve("C:\\Users\\test.txt", |path| {
+            call_count.fetch_add(1, Ordering::Relaxed);
+            Ok(PathBuf::from(format!("/host{}", path.replace('\\', "/"))))
+        }).unwrap();
+        assert_eq!(result2, result);
+        assert_eq!(call_count.load(Ordering::Relaxed), 1, "resolver should not be called on cache hit");
+
+        let (hits, misses, _) = cache.stats();
+        assert_eq!(hits, 1);
+        assert_eq!(misses, 1);
+    }
+
+    #[test]
+    fn path_resolution_cache_invalidate_prefix() {
+        let mut cache = PathResolutionCache::new();
+
+        cache.resolve("C:\\Windows\\a.txt", |p| Ok(PathBuf::from(p))).unwrap();
+        cache.resolve("C:\\Windows\\b.txt", |p| Ok(PathBuf::from(p))).unwrap();
+        cache.resolve("C:\\Game\\c.txt", |p| Ok(PathBuf::from(p))).unwrap();
+
+        assert_eq!(cache.entry_count(), 3);
+
+        cache.invalidate_prefix("C:\\Windows");
+        assert_eq!(cache.entry_count(), 1);
+        assert!(cache.cache.contains_key("C:\\Game\\c.txt"));
+    }
+
+    // --- Phase 7: Async File Reader Tests ---
+
+    #[test]
+    fn async_file_reader_submit_and_wait() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("casa1_test_async_read.txt");
+        std::fs::write(&path, b"hello world").unwrap();
+
+        let mut reader = AsyncFileReader::new();
+        let id = reader.submit_read(path.clone(), 0, 11);
+
+        // Read is performed on a background thread; wait_for joins the thread
+        let data = reader.wait_for(id, 1000).unwrap();
+        assert_eq!(data, b"hello world");
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn async_file_reader_wait_for() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("casa1_test_async_wait.txt");
+        std::fs::write(&path, b"test data 12345").unwrap();
+
+        let mut reader = AsyncFileReader::new();
+        let id = reader.submit_read(path.clone(), 0, 15);
+
+        let data = reader.wait_for(id, 1000).unwrap();
+        assert_eq!(data, b"test data 12345");
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn async_file_reader_wait_timeout() {
+        let mut reader = AsyncFileReader::new();
+        // Request for non-existent ID should timeout
+        let result = reader.wait_for(99999, 10);
+        assert!(result.is_err());
+    }
+
+    // --- Phase 7: Memory-Mapped File Tests ---
+
+    #[test]
+    fn mmapped_file_read() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("casa1_test_mmap.bin");
+        let test_data = vec![0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0xba, 0xbe];
+        std::fs::write(&path, &test_data).unwrap();
+
+        let mf = MmappedFile::open(&path).unwrap();
+        assert!(mf.mapped);
+        assert_eq!(mf.size, 8);
+
+        let mut buf = [0u8; 4];
+        mf.read(0, &mut buf).unwrap();
+        assert_eq!(buf, [0xde, 0xad, 0xbe, 0xef]);
+
+        mf.read(4, &mut buf).unwrap();
+        assert_eq!(buf, [0xca, 0xfe, 0xba, 0xbe]);
+
+        drop(mf);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn mmapped_file_out_of_bounds() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("casa1_test_mmap_oob.bin");
+        std::fs::write(&path, b"short").unwrap();
+
+        let mf = MmappedFile::open(&path).unwrap();
+        let mut buf = [0u8; 100];
+        let result = mf.read(0, &mut buf);
+        assert!(result.is_err());
+
+        drop(mf);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn mmapped_file_empty_file() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("casa1_test_mmap_empty.bin");
+        std::fs::write(&path, "").unwrap();
+
+        let mf = MmappedFile::open(&path).unwrap();
+        assert!(!mf.mapped);
+        assert_eq!(mf.size, 0);
+
+        drop(mf);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn mmapped_file_nonexistent() {
+        let path = std::path::PathBuf::from("/tmp/casa1_nonexistent_mmap_test_12345");
+        let result = MmappedFile::open(&path);
+        assert!(result.is_err());
     }
 }

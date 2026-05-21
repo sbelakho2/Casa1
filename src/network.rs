@@ -1,4 +1,5 @@
 use crate::error::{AppError, AppResult};
+use std::time::Duration;
 use crate::reason::ReasonCode;
 use aes::Aes128;
 use aes_gcm::aead::{AeadInPlace, KeyInit};
@@ -17,6 +18,9 @@ use serde::{Deserialize, Serialize};
 use sha1::{Digest as _, Sha1};
 use sha2::Sha256;
 use std::collections::{BTreeMap, VecDeque};
+use std::io::{Read, Write};
+use std::net::{Shutdown as NetShutdown, SocketAddr as NetSocketAddr, TcpStream, ToSocketAddrs};
+use std::os::fd::AsRawFd;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -27,6 +31,9 @@ pub type HttpRequestId = u64;
 
 const WSAEWOULDBLOCK: i32 = 10035;
 const WSAEADDRINUSE: i32 = 10048;
+const WSAECONNRESET: i32 = 10054;
+const WSAENOTCONN: i32 = 10057;
+const WSAETIMEDOUT: i32 = 10060;
 const WSAECONNREFUSED: i32 = 10061;
 const WSANOTINITIALISED: i32 = 10093;
 const WSAHOST_NOT_FOUND: i32 = 11001;
@@ -94,6 +101,7 @@ pub struct HttpTrace {
 struct SocketRecord {
     family: AddressFamily,
     nonblocking: bool,
+    bound_addr: Option<SockAddr>,
     state: SocketState,
     recv_queue: VecDeque<u8>,
 }
@@ -104,6 +112,7 @@ enum SocketState {
     Bound(SockAddr),
     Listening { _addr: SockAddr, _backlog: usize },
     Connected { peer: SocketId },
+    ConnectedReal { _peer: SockAddr },
     Shutdown,
     Closed,
 }
@@ -160,12 +169,13 @@ struct AddressFamilyRecord {
     host: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct NetworkStack {
     next_id: u64,
     wsa_refcount: u32,
     last_wsa_error: i32,
     sockets: BTreeMap<SocketId, SocketRecord>,
+    real_tcp_streams: BTreeMap<SocketId, TcpStream>,
     listeners: BTreeMap<SockAddr, SocketId>,
     pending_accept: BTreeMap<SocketId, VecDeque<SocketId>>,
     dns_records: BTreeMap<String, Vec<AddressFamilyRecord>>,
@@ -185,6 +195,231 @@ pub struct NetworkStack {
 impl Default for NetworkStack {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// A simple HTTP GET response for content server communication.
+#[derive(Debug, Clone)]
+pub struct SimpleHttpResponse {
+    pub status: u16,
+    pub headers: BTreeMap<String, String>,
+    pub body: Vec<u8>,
+}
+
+impl NetworkStack {
+    /// Perform a simple HTTP GET request to a content server.
+    ///
+    /// This uses a real TCP connection and sends an HTTP/1.1 GET request,
+    /// returning the parsed response. Used by the content manager to fetch
+    /// CDN server lists, depot manifests, and chunks from Steam content servers.
+    pub fn http_get(&mut self, url_str: &str) -> AppResult<SimpleHttpResponse> {
+        let url = url::Url::parse(url_str).map_err(|e| {
+            AppError::new(
+                ReasonCode::RcNetDnsResolutionFailed,
+                format!("NetworkStack: invalid URL: {e}"),
+            )
+        })?;
+
+        let host = url.host_str().ok_or_else(|| {
+            AppError::new(ReasonCode::RcNetDnsResolutionFailed, "NetworkStack: no host in URL")
+        })?;
+
+        let port = url.port().unwrap_or(if url.scheme() == "https" { 443 } else { 80 });
+        let path = url.path();
+        let query = url.query().map(|q| format!("?{q}")).unwrap_or_default();
+        let request_path = format!("{path}{query}");
+
+        let addr_str = format!("{host}:{port}");
+        let addr = addr_str.to_socket_addrs().map_err(|e| {
+            AppError::new(
+                ReasonCode::RcNetDnsResolutionFailed,
+                format!("NetworkStack: DNS resolution for {host} failed: {e}"),
+            )
+        })?
+        .next()
+        .ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcNetDnsResolutionFailed,
+                format!("NetworkStack: no address for {host}"),
+            )
+        })?;
+
+        let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(15)).map_err(|e| {
+            AppError::new(
+                ReasonCode::RcNetConnectionFailed,
+                format!("NetworkStack: connect to {host} failed: {e}"),
+            )
+        })?;
+
+        // For HTTPS, we'd need TLS. For Steam content servers, both HTTP and HTTPS are used.
+        // If HTTPS, use native-tls for a TLS connection.
+        let use_tls = url.scheme() == "https";
+
+        if use_tls {
+            #[cfg(feature = "native-tls")]
+            {
+                let connector = native_tls::TlsConnector::new().map_err(|e| {
+                    AppError::new(
+                        ReasonCode::RcNetConnectionFailed,
+                        format!("NetworkStack: TLS connector creation failed: {e}"),
+                    )
+                })?;
+                let mut tls_stream = connector.connect(host, stream).map_err(|e| {
+                    AppError::new(
+                        ReasonCode::RcNetConnectionFailed,
+                        format!("NetworkStack: TLS handshake with {host} failed: {e}"),
+                    )
+                })?;
+
+                let request = format!(
+                    "GET {request_path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nUser-Agent: Casa1/0.1.0\r\nAccept: */*\r\n\r\n"
+                );
+                tls_stream.write_all(request.as_bytes()).map_err(|e| {
+                    AppError::new(
+                        ReasonCode::RcNetWriteFailed,
+                        format!("NetworkStack: HTTP GET (TLS) failed: {e}"),
+                    )
+                })?;
+
+                let mut response = Vec::new();
+                let mut buf = [0u8; 16384];
+                loop {
+                    match tls_stream.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => response.extend_from_slice(&buf[..n]),
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(e) => {
+                            return Err(AppError::new(
+                                ReasonCode::RcNetReadFailed,
+                                format!("NetworkStack: TLS read failed: {e}"),
+                            ));
+                        }
+                    }
+                }
+                return parse_http_response(&response);
+            }
+
+            #[cfg(not(feature = "native-tls"))]
+            {
+                let _ = stream;
+                return Err(AppError::new(
+                    ReasonCode::RcNetConnectionFailed,
+                    "NetworkStack: HTTPS not supported without native-tls feature",
+                ));
+            }
+        }
+
+        // Plain HTTP
+        let mut tcp_stream = stream;
+        let request = format!(
+            "GET {request_path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nUser-Agent: Casa1/0.1.0\r\nAccept: */*\r\n\r\n"
+        );
+        tcp_stream.write_all(request.as_bytes()).map_err(|e| {
+            AppError::new(
+                ReasonCode::RcNetWriteFailed,
+                format!("NetworkStack: HTTP GET failed: {e}"),
+            )
+        })?;
+
+        let mut response = Vec::new();
+        let mut buf = [0u8; 16384];
+        loop {
+            match tcp_stream.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => response.extend_from_slice(&buf[..n]),
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => {
+                    return Err(AppError::new(
+                        ReasonCode::RcNetReadFailed,
+                        format!("NetworkStack: HTTP read failed: {e}"),
+                    ));
+                }
+            }
+        }
+        parse_http_response(&response)
+    }
+}
+
+/// Parse an HTTP response into a SimpleHttpResponse.
+fn parse_http_response(raw: &[u8]) -> AppResult<SimpleHttpResponse> {
+    let response_str = String::from_utf8_lossy(raw);
+
+    // Parse status line: HTTP/1.1 200 OK
+    let status = if let Some(end_of_line) = response_str.find("\r\n") {
+        let status_line = &response_str[..end_of_line];
+        let parts: Vec<&str> = status_line.split(' ').collect();
+        if parts.len() >= 2 {
+            parts[1].parse::<u16>().unwrap_or(0)
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+
+    // Find headers and body separator
+    let mut headers = BTreeMap::new();
+    let body_start;
+
+    if let Some(header_end) = response_str.find("\r\n\r\n") {
+        let header_section = &response_str[..header_end];
+        // Skip the status line, parse headers
+        for line in header_section.lines().skip(1) {
+            if let Some(colon) = line.find(':') {
+                let key = line[..colon].trim().to_string();
+                let value = line[colon + 1..].trim().to_string();
+                headers.insert(key.to_lowercase(), value);
+            }
+        }
+        body_start = header_end + 4;
+    } else {
+        body_start = response_str.len();
+    };
+
+    let body = raw[body_start..].to_vec();
+
+    Ok(SimpleHttpResponse {
+        status,
+        headers,
+        body,
+    })
+}
+
+impl Clone for NetworkStack {
+    fn clone(&self) -> Self {
+        let real_tcp_streams = self
+            .real_tcp_streams
+            .iter()
+            .map(|(socket, stream)| {
+                (
+                    *socket,
+                    stream
+                        .try_clone()
+                        .expect("failed to clone host TCP stream for NetworkStack"),
+                )
+            })
+            .collect();
+        Self {
+            next_id: self.next_id,
+            wsa_refcount: self.wsa_refcount,
+            last_wsa_error: self.last_wsa_error,
+            sockets: self.sockets.clone(),
+            real_tcp_streams,
+            listeners: self.listeners.clone(),
+            pending_accept: self.pending_accept.clone(),
+            dns_records: self.dns_records.clone(),
+            http_sessions: self.http_sessions.clone(),
+            http_connections: self.http_connections.clone(),
+            http_requests: self.http_requests.clone(),
+            routes: self.routes.clone(),
+            cookie_jar: self.cookie_jar.clone(),
+            proxy_settings: self.proxy_settings.clone(),
+            trust_store: self.trust_store.clone(),
+            keychain_mapping_enabled: self.keychain_mapping_enabled,
+            current_day: self.current_day,
+            http_traces: self.http_traces.clone(),
+            cipher_log: self.cipher_log.clone(),
+        }
     }
 }
 
@@ -228,10 +463,11 @@ impl NetworkStack {
             },
         );
         Self {
-            next_id: 1,
+            next_id: 0x1000,
             wsa_refcount: 0,
             last_wsa_error: 0,
             sockets: BTreeMap::new(),
+            real_tcp_streams: BTreeMap::new(),
             listeners: BTreeMap::new(),
             pending_accept: BTreeMap::new(),
             dns_records: BTreeMap::from([
@@ -367,6 +603,7 @@ impl NetworkStack {
             SocketRecord {
                 family,
                 nonblocking: false,
+                bound_addr: None,
                 state: SocketState::Created,
                 recv_queue: VecDeque::new(),
             },
@@ -389,7 +626,9 @@ impl NetworkStack {
                 format!("address already in use: {}:{}", addr.host, addr.port),
             ));
         }
-        self.socket_record_mut(socket)?.state = SocketState::Bound(addr);
+        let record = self.socket_record_mut(socket)?;
+        record.bound_addr = Some(addr.clone());
+        record.state = SocketState::Bound(addr);
         self.last_wsa_error = 0;
         Ok(())
     }
@@ -443,35 +682,99 @@ impl NetworkStack {
 
     pub fn connect(&mut self, socket: SocketId, addr: SockAddr) -> AppResult<()> {
         self.ensure_wsa_started()?;
-        let Some(listener) = self.listeners.get(&addr).copied() else {
-            self.last_wsa_error = WSAECONNREFUSED;
-            return Err(AppError::new(
-                ReasonCode::RcIo,
-                format!("connection refused for {}:{}", addr.host, addr.port),
-            ));
+        if let Some(listener) = self.listeners.get(&addr).copied() {
+            let server_socket = self.alloc_id();
+            let family = self.socket_record(socket)?.family;
+            self.sockets.insert(
+                server_socket,
+                SocketRecord {
+                    family,
+                    nonblocking: false,
+                    bound_addr: Some(addr.clone()),
+                    state: SocketState::Connected { peer: socket },
+                    recv_queue: VecDeque::new(),
+                },
+            );
+            let record = self.socket_record_mut(socket)?;
+            if record.bound_addr.is_none() {
+                record.bound_addr = Some(default_sockaddr(family));
+            }
+            record.state = SocketState::Connected { peer: server_socket };
+            self.pending_accept
+                .entry(listener)
+                .or_default()
+                .push_back(server_socket);
+            self.last_wsa_error = 0;
+            return Ok(());
+        }
+
+        let (family, nonblocking) = {
+            let record = self.socket_record(socket)?;
+            (record.family, record.nonblocking)
         };
-        let server_socket = self.alloc_id();
-        let family = self.socket_record(socket)?.family;
-        self.sockets.insert(
-            server_socket,
-            SocketRecord {
-                family,
-                nonblocking: false,
-                state: SocketState::Connected { peer: socket },
-                recv_queue: VecDeque::new(),
-            },
-        );
-        self.socket_record_mut(socket)?.state = SocketState::Connected { peer: server_socket };
-        self.pending_accept
-            .entry(listener)
-            .or_default()
-            .push_back(server_socket);
+        let mut addrs = (addr.host.as_str(), addr.port).to_socket_addrs().map_err(|error| {
+            self.last_wsa_error = WSAHOST_NOT_FOUND;
+            AppError::new(
+                ReasonCode::RcDnsNotFound,
+                format!("DNS lookup failed for {}:{}: {error}", addr.host, addr.port),
+            )
+        })?;
+        let candidate = addrs
+            .find(|candidate| socket_addr_matches_family(candidate, family))
+            .ok_or_else(|| {
+                self.last_wsa_error = WSAECONNREFUSED;
+                AppError::new(
+                    ReasonCode::RcIo,
+                    format!("no {family:?} address available for {}:{}", addr.host, addr.port),
+                )
+            })?;
+        let stream = TcpStream::connect(candidate).map_err(|error| {
+            self.last_wsa_error = map_wsa_error(&error);
+            AppError::new(
+                ReasonCode::RcIo,
+                format!("TCP connect to {}:{} failed: {error}", addr.host, addr.port),
+            )
+        })?;
+        stream.set_nonblocking(nonblocking).map_err(|error| {
+            self.last_wsa_error = map_wsa_error(&error);
+            AppError::new(
+                ReasonCode::RcIo,
+                format!("failed to set nonblocking mode on {}:{}: {error}", addr.host, addr.port),
+            )
+        })?;
+        let local_addr = stream.local_addr().ok().map(sockaddr_from_std);
+        self.real_tcp_streams.insert(socket, stream);
+
+        let record = self.socket_record_mut(socket)?;
+        if record.bound_addr.is_none() {
+            record.bound_addr = local_addr.or_else(|| Some(default_sockaddr(family)));
+        }
+        record.state = SocketState::ConnectedReal { _peer: addr };
         self.last_wsa_error = 0;
         Ok(())
     }
 
+    pub fn getsockname(&mut self, socket: SocketId) -> AppResult<SockAddr> {
+        self.ensure_wsa_started()?;
+        let record = self.socket_record(socket)?;
+        let addr = record
+            .bound_addr
+            .clone()
+            .unwrap_or_else(|| default_sockaddr(record.family));
+        self.last_wsa_error = 0;
+        Ok(addr)
+    }
+
     pub fn send(&mut self, socket: SocketId, bytes: &[u8]) -> AppResult<usize> {
         self.ensure_wsa_started()?;
+        if let Some(stream) = self.real_tcp_streams.get_mut(&socket) {
+            let written = stream.write(bytes).map_err(|error| {
+                self.last_wsa_error = map_wsa_error(&error);
+                AppError::new(ReasonCode::RcIo, format!("TCP send failed on socket {socket}: {error}"))
+            })?;
+            self.last_wsa_error = 0;
+            return Ok(written);
+        }
         let peer = match self.socket_record(socket)?.state {
             SocketState::Connected { peer } => peer,
             _ => {
@@ -490,6 +793,16 @@ impl NetworkStack {
 
     pub fn recv(&mut self, socket: SocketId, length: usize) -> AppResult<Vec<u8>> {
         self.ensure_wsa_started()?;
+        if let Some(stream) = self.real_tcp_streams.get_mut(&socket) {
+            let mut bytes = vec![0; length.max(1)];
+            let read = stream.read(&mut bytes).map_err(|error| {
+                self.last_wsa_error = map_wsa_error(&error);
+                AppError::new(ReasonCode::RcIo, format!("TCP recv failed on socket {socket}: {error}"))
+            })?;
+            bytes.truncate(read);
+            self.last_wsa_error = 0;
+            return Ok(bytes);
+        }
         let nonblocking = self.socket_record(socket)?.nonblocking;
         if self.socket_record(socket)?.recv_queue.is_empty() {
             if nonblocking {
@@ -512,8 +825,21 @@ impl NetworkStack {
         Ok(bytes)
     }
 
+    pub fn setsockopt(&mut self, socket: SocketId, _level: i32, _option_name: i32, _value: &[u8]) -> AppResult<()> {
+        self.ensure_wsa_started()?;
+        let _ = self.socket_record(socket)?;
+        self.last_wsa_error = 0;
+        Ok(())
+    }
+
     pub fn shutdown(&mut self, socket: SocketId) -> AppResult<()> {
         self.ensure_wsa_started()?;
+        if let Some(stream) = self.real_tcp_streams.get(&socket) {
+            stream.shutdown(NetShutdown::Both).map_err(|error| {
+                self.last_wsa_error = map_wsa_error(&error);
+                AppError::new(ReasonCode::RcIo, format!("shutdown failed on socket {socket}: {error}"))
+            })?;
+        }
         self.socket_record_mut(socket)?.state = SocketState::Shutdown;
         self.last_wsa_error = 0;
         Ok(())
@@ -521,6 +847,9 @@ impl NetworkStack {
 
     pub fn closesocket(&mut self, socket: SocketId) -> AppResult<()> {
         self.ensure_wsa_started()?;
+        if let Some(stream) = self.real_tcp_streams.remove(&socket) {
+            let _ = stream.shutdown(NetShutdown::Both);
+        }
         self.socket_record_mut(socket)?.state = SocketState::Closed;
         self.last_wsa_error = 0;
         Ok(())
@@ -529,12 +858,26 @@ impl NetworkStack {
     pub fn ioctlsocket_fionbio(&mut self, socket: SocketId, nonblocking: bool) -> AppResult<()> {
         self.ensure_wsa_started()?;
         self.socket_record_mut(socket)?.nonblocking = nonblocking;
+        if let Some(stream) = self.real_tcp_streams.get_mut(&socket) {
+            stream.set_nonblocking(nonblocking).map_err(|error| {
+                self.last_wsa_error = map_wsa_error(&error);
+                AppError::new(
+                    ReasonCode::RcIo,
+                    format!("failed to set nonblocking mode on socket {socket}: {error}"),
+                )
+            })?;
+        }
         self.last_wsa_error = 0;
         Ok(())
     }
 
     pub fn ioctlsocket_fionread(&mut self, socket: SocketId) -> AppResult<u32> {
         self.ensure_wsa_started()?;
+        if let Some(stream) = self.real_tcp_streams.get(&socket) {
+            let available = bytes_available(stream)?;
+            self.last_wsa_error = 0;
+            return Ok(available);
+        }
         let available = self.socket_record(socket)?.recv_queue.len().min(u32::MAX as usize) as u32;
         self.last_wsa_error = 0;
         Ok(available)
@@ -545,14 +888,20 @@ impl NetworkStack {
         let mut writable = Vec::new();
         for socket in sockets {
             let record = self.socket_record(*socket)?;
-            let can_read = !record.recv_queue.is_empty()
-                || self
-                    .pending_accept
-                    .get(socket)
-                    .is_some_and(|pending| !pending.is_empty());
+            let can_read = if let Some(stream) = self.real_tcp_streams.get(socket) {
+                bytes_available(stream)? > 0
+            } else {
+                !record.recv_queue.is_empty()
+                    || self
+                        .pending_accept
+                        .get(socket)
+                        .is_some_and(|pending| !pending.is_empty())
+            };
             let can_write = matches!(
                 record.state,
-                SocketState::Connected { .. } | SocketState::Listening { .. }
+                SocketState::Connected { .. }
+                    | SocketState::ConnectedReal { .. }
+                    | SocketState::Listening { .. }
             );
             if can_read {
                 readable.push(*socket);
@@ -578,22 +927,45 @@ impl NetworkStack {
 
     pub fn getaddrinfo(&mut self, host: &str, port: u16) -> AppResult<Vec<ResolvedAddr>> {
         self.ensure_wsa_started()?;
-        let Some(records) = self.dns_records.get(host) else {
+        if let Some(records) = self.dns_records.get(host) {
+            self.last_wsa_error = 0;
+            return Ok(records
+                .iter()
+                .map(|record| ResolvedAddr {
+                    family: record.family,
+                    host: record.host.clone(),
+                    port,
+                })
+                .collect());
+        }
+
+        let addrs = (host, port).to_socket_addrs().map_err(|error| {
+            self.last_wsa_error = WSAHOST_NOT_FOUND;
+            AppError::new(
+                ReasonCode::RcDnsNotFound,
+                format!("DNS lookup failed for {host}: {error}"),
+            )
+        })?;
+        let resolved = addrs
+            .map(|addr| ResolvedAddr {
+                family: if addr.is_ipv6() {
+                    AddressFamily::Ipv6
+                } else {
+                    AddressFamily::Ipv4
+                },
+                host: addr.ip().to_string(),
+                port: addr.port(),
+            })
+            .collect::<Vec<_>>();
+        if resolved.is_empty() {
             self.last_wsa_error = WSAHOST_NOT_FOUND;
             return Err(AppError::new(
                 ReasonCode::RcDnsNotFound,
-                format!("DNS lookup failed for {host}"),
+                format!("DNS lookup returned no addresses for {host}"),
             ));
-        };
+        }
         self.last_wsa_error = 0;
-        Ok(records
-            .iter()
-            .map(|record| ResolvedAddr {
-                family: record.family,
-                host: record.host.clone(),
-                port,
-            })
-            .collect())
+        Ok(resolved)
     }
 
     pub fn freeaddrinfo(&mut self) {
@@ -961,8 +1333,62 @@ impl NetworkStack {
 
     fn alloc_id(&mut self) -> u64 {
         let id = self.next_id;
-        self.next_id += 1;
+        self.next_id += 4;
         id
+    }
+}
+
+fn default_sockaddr(family: AddressFamily) -> SockAddr {
+    match family {
+        AddressFamily::Ipv4 => SockAddr {
+            family,
+            host: "0.0.0.0".to_string(),
+            port: 0,
+        },
+        AddressFamily::Ipv6 => SockAddr {
+            family,
+            host: "::".to_string(),
+            port: 0,
+        },
+    }
+}
+
+fn socket_addr_matches_family(addr: &NetSocketAddr, family: AddressFamily) -> bool {
+    matches!((addr, family), (NetSocketAddr::V4(_), AddressFamily::Ipv4) | (NetSocketAddr::V6(_), AddressFamily::Ipv6))
+}
+
+fn sockaddr_from_std(addr: NetSocketAddr) -> SockAddr {
+    SockAddr {
+        family: if addr.is_ipv6() {
+            AddressFamily::Ipv6
+        } else {
+            AddressFamily::Ipv4
+        },
+        host: addr.ip().to_string(),
+        port: addr.port(),
+    }
+}
+
+fn bytes_available(stream: &TcpStream) -> AppResult<u32> {
+    let mut available: i32 = 0;
+    unsafe {
+        let result = libc::ioctl(stream.as_raw_fd(), libc::FIONREAD, &mut available);
+        if result < 0 {
+            return Err(AppError::new(ReasonCode::RcIo, "FIONREAD ioctl failed"));
+        }
+    }
+    Ok(available.max(0) as u32)
+}
+
+fn map_wsa_error(error: &std::io::Error) -> i32 {
+    match error.kind() {
+        std::io::ErrorKind::WouldBlock => WSAEWOULDBLOCK,
+        std::io::ErrorKind::AddrInUse => WSAEADDRINUSE,
+        std::io::ErrorKind::ConnectionRefused => WSAECONNREFUSED,
+        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe => WSAECONNRESET,
+        std::io::ErrorKind::NotConnected => WSAENOTCONN,
+        std::io::ErrorKind::TimedOut => WSAETIMEDOUT,
+        _ => 0,
     }
 }
 
@@ -1121,4 +1547,86 @@ fn cookie_matches(cookie: &Cookie, host: &str, path: &str, secure: bool) -> bool
     let path_matches = path.starts_with(&cookie.path);
     let secure_matches = !cookie.secure || secure;
     domain_matches && path_matches && secure_matches
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AddressFamily, NetworkStack, SockAddr};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    #[test]
+    fn winsock_round_trip_preserves_socket_names() {
+        let mut network = NetworkStack::new();
+        network.wsa_startup();
+
+        let listener = network.socket(AddressFamily::Ipv4).expect("listener socket");
+        assert_eq!(listener & 0x3, 0);
+        assert!(listener >= 0x1000);
+        let listener_addr = SockAddr {
+            family: AddressFamily::Ipv4,
+            host: "127.0.0.1".to_string(),
+            port: 27015,
+        };
+        network.bind(listener, listener_addr.clone()).expect("bind listener");
+        network.listen(listener, 1).expect("listen");
+
+        let client = network.socket(AddressFamily::Ipv4).expect("client socket");
+        assert_eq!(client & 0x3, 0);
+        assert!(client >= 0x1000);
+        network.connect(client, listener_addr.clone()).expect("connect");
+        let server = network.accept(listener).expect("accept");
+
+        assert_eq!(network.getsockname(listener).expect("listener name"), listener_addr);
+        assert_eq!(network.getsockname(server).expect("server name"), listener_addr);
+
+        network.send(client, b"ping").expect("send");
+        assert_eq!(network.recv(server, 4).expect("recv"), b"ping");
+
+        network.setsockopt(client, 0, 0, &[]).expect("setsockopt");
+    }
+
+    #[test]
+    fn winsock_getaddrinfo_falls_back_to_host_dns() {
+        let mut network = NetworkStack::new();
+        network.wsa_startup();
+
+        let addrs = network.getaddrinfo("localhost", 80).expect("resolve localhost");
+
+        assert!(!addrs.is_empty());
+        assert!(addrs.iter().any(|addr| addr.family == AddressFamily::Ipv4 || addr.family == AddressFamily::Ipv6));
+    }
+
+    #[test]
+    fn winsock_real_tcp_connect_round_trip() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind host listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let worker = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept host connection");
+            let mut buf = [0_u8; 4];
+            stream.read_exact(&mut buf).expect("read ping");
+            assert_eq!(&buf, b"ping");
+            stream.write_all(b"pong").expect("write pong");
+        });
+
+        let mut network = NetworkStack::new();
+        network.wsa_startup();
+        let socket = network.socket(AddressFamily::Ipv4).expect("client socket");
+        network
+            .connect(
+                socket,
+                SockAddr {
+                    family: AddressFamily::Ipv4,
+                    host: addr.ip().to_string(),
+                    port: addr.port(),
+                },
+            )
+            .expect("connect to host listener");
+
+        network.send(socket, b"ping").expect("send ping");
+        assert_eq!(network.recv(socket, 4).expect("recv pong"), b"pong");
+
+        worker.join().expect("join host listener");
+    }
 }

@@ -19,6 +19,21 @@ const IMAGE_REL_BASED_HIGHLOW: u16 = 3;
 const IMAGE_REL_BASED_DIR64: u16 = 10;
 const RT_VERSION: u32 = 16;
 const RT_MANIFEST: u32 = 24;
+const RT_ICON: u32 = 3;
+const RT_GROUP_ICON: u32 = 14;
+pub const RT_CURSOR: u32 = 1;
+pub const RT_BITMAP: u32 = 2;
+pub const RT_MENU: u32 = 4;
+pub const RT_DIALOG: u32 = 5;
+pub const RT_STRING: u32 = 6;
+pub const RT_FONTDIR: u32 = 7;
+pub const RT_FONT: u32 = 8;
+pub const RT_ACCELERATOR: u32 = 9;
+pub const RT_RCDATA: u32 = 10;
+pub const RT_MESSAGETABLE: u32 = 11;
+pub const RT_GROUP_CURSOR: u32 = 12;
+pub const RT_ANICURSOR: u32 = 21;
+pub const RT_ANIICON: u32 = 22;
 
 pub const STATUS_DLL_NOT_FOUND: u32 = 0xc000_0135;
 pub const STATUS_ENTRYPOINT_NOT_FOUND: u32 = 0xc000_0139;
@@ -345,6 +360,27 @@ pub fn parse_from_file(path: &Path) -> AppResult<ParsedPe> {
     let mut parsed = parse(&bytes)?;
     parsed.external_manifest = parse_external_manifest(path)?;
     Ok(parsed)
+}
+
+/// Extracts the raw RT_VERSION resource blob bytes from a PE file at the given path.
+/// Returns `Ok(Some(Vec<u8>))` if the version resource was found, `Ok(None)` if not
+/// (or if the file is not a valid PE), and `Err(...)` on actual I/O or parse errors.
+pub fn version_resource_blob_from_file(path: &Path) -> AppResult<Option<Vec<u8>>> {
+    let bytes = match fs::read(path) {
+        Ok(data) => data,
+        Err(error) => {
+            return Err(AppError::from_io(
+                ReasonCode::RcPeParseInvalid,
+                format!("failed to read {}", path.display()),
+                &error,
+            ));
+        }
+    };
+    if bytes.len() < 2 || read_u16(&bytes, 0, "DOS signature").unwrap_or_default() != IMAGE_DOS_SIGNATURE {
+        return Ok(None);
+    }
+    let parsed = parse(&bytes)?;
+    find_resource_blob(&bytes, &parsed.sections, &parsed.data_directories, RT_VERSION)
 }
 
 pub fn maybe_version_info_from_file(path: &Path) -> AppResult<Option<VersionInfo>> {
@@ -1364,7 +1400,7 @@ fn read_utf16_value(bytes: &[u8], mut offset: usize, end: usize) -> String {
     String::from_utf16_lossy(&words).trim().to_string()
 }
 
-fn find_resource_blob(
+pub fn find_resource_blob(
     bytes: &[u8],
     sections: &[PeSection],
     directories: &[DataDirectory],

@@ -28,12 +28,47 @@ pub type PipelineStateId = u64;
 #[serde(rename_all = "snake_case")]
 pub enum DxgiFormat {
     R8G8B8A8Unorm,
+    R8G8B8A8UnormSrgb,
+    R8G8B8A8Uint,
     B8G8R8A8Unorm,
+    B8G8R8A8UnormSrgb,
+    B8G8R8X8Unorm,
+    R8Unorm,
+    R8Uint,
     R16Float,
+    R16Unorm,
+    R16Uint,
+    R16Snorm,
     R32Float,
+    R32Uint,
+    R32Sint,
     R10G10B10A2Unorm,
+    R10G10B10A2Uint,
+    R11G11B10Float,
+    R16G16Float,
+    R16G16Unorm,
+    R16G16Uint,
+    R16G16Snorm,
+    R32G32Float,
+    R32G32Uint,
+    R16G16B16A16Float,
+    R16G16B16A16Unorm,
+    R16G16B16A16Uint,
+    R32G32B32A32Float,
+    R32G32B32A32Uint,
     D24UnormS8Uint,
+    D32Float,
+    D32FloatS8Uint,
     Bc1Unorm,
+    Bc1UnormSrgb,
+    Bc2Unorm,
+    Bc2UnormSrgb,
+    Bc3Unorm,
+    Bc3UnormSrgb,
+    Bc4Unorm,
+    Bc5Unorm,
+    Bc7Unorm,
+    Bc7UnormSrgb,
     B5G6R5Unorm,
 }
 
@@ -41,12 +76,46 @@ pub enum DxgiFormat {
 #[serde(rename_all = "snake_case")]
 pub enum MtlPixelFormat {
     Rgba8Unorm,
+    Rgba8UnormSrgb,
+    Rgba8Uint,
     Bgra8Unorm,
+    Bgra8UnormSrgb,
+    R8Unorm,
+    R8Uint,
     R16Float,
+    R16Unorm,
+    R16Uint,
+    R16Snorm,
     R32Float,
+    R32Uint,
+    R32Sint,
     Rgb10A2Unorm,
+    Rgb10A2Uint,
+    Rg11B10Float,
+    Rg16Float,
+    Rg16Unorm,
+    Rg16Uint,
+    Rg16Snorm,
+    Rg32Float,
+    Rg32Uint,
+    Rgba16Float,
+    Rgba16Unorm,
+    Rgba16Uint,
+    Rgba32Float,
+    Rgba32Uint,
     Depth24UnormStencil8,
+    Depth32Float,
+    Depth32FloatStencil8,
     Bc1Rgba,
+    Bc1RgbaSrgb,
+    Bc2Rgba,
+    Bc2RgbaSrgb,
+    Bc3Rgba,
+    Bc3RgbaSrgb,
+    Bc4RUnorm,
+    Bc5RgUnorm,
+    Bc7RgbaUnorm,
+    Bc7RgbaUnormSrgb,
     B5G6R5Unorm,
 }
 
@@ -1498,12 +1567,12 @@ fn encode_ppm(width: u32, height: u32, format: DxgiFormat, bytes: &[u8]) -> AppR
     let mut ppm = format!("P6\n{width} {height}\n255\n").into_bytes();
     ppm.reserve(pixel_count * 3);
     match format {
-        DxgiFormat::R8G8B8A8Unorm => {
+        DxgiFormat::R8G8B8A8Unorm | DxgiFormat::R8G8B8A8UnormSrgb => {
             for chunk in bytes[..expected_bytes].chunks_exact(4) {
                 ppm.extend_from_slice(&chunk[..3]);
             }
         }
-        DxgiFormat::B8G8R8A8Unorm => {
+        DxgiFormat::B8G8R8A8Unorm | DxgiFormat::B8G8R8A8UnormSrgb | DxgiFormat::B8G8R8X8Unorm => {
             for chunk in bytes[..expected_bytes].chunks_exact(4) {
                 ppm.extend_from_slice(&[chunk[2], chunk[1], chunk[0]]);
             }
@@ -1525,9 +1594,39 @@ pub fn format_mapping(format: DxgiFormat) -> AppResult<FormatMapping> {
             metal: MtlPixelFormat::Rgba8Unorm,
             strategy: EmulationStrategy::Direct,
         },
+        DxgiFormat::R8G8B8A8UnormSrgb => FormatMapping {
+            dxgi: format,
+            metal: MtlPixelFormat::Rgba8UnormSrgb,
+            strategy: EmulationStrategy::Direct,
+        },
+        DxgiFormat::R8G8B8A8Uint => FormatMapping {
+            dxgi: format,
+            metal: MtlPixelFormat::Rgba8Uint,
+            strategy: EmulationStrategy::Direct,
+        },
         DxgiFormat::B8G8R8A8Unorm => FormatMapping {
             dxgi: format,
             metal: MtlPixelFormat::Bgra8Unorm,
+            strategy: EmulationStrategy::Direct,
+        },
+        DxgiFormat::B8G8R8A8UnormSrgb => FormatMapping {
+            dxgi: format,
+            metal: MtlPixelFormat::Bgra8UnormSrgb,
+            strategy: EmulationStrategy::Direct,
+        },
+        DxgiFormat::B8G8R8X8Unorm => FormatMapping {
+            dxgi: format,
+            metal: MtlPixelFormat::Bgra8Unorm,
+            strategy: EmulationStrategy::Direct,
+        },
+        DxgiFormat::R8Unorm => FormatMapping {
+            dxgi: format,
+            metal: MtlPixelFormat::R8Unorm,
+            strategy: EmulationStrategy::Direct,
+        },
+        DxgiFormat::R8Uint => FormatMapping {
+            dxgi: format,
+            metal: MtlPixelFormat::R8Uint,
             strategy: EmulationStrategy::Direct,
         },
         DxgiFormat::R16Float => FormatMapping {
@@ -1535,9 +1634,34 @@ pub fn format_mapping(format: DxgiFormat) -> AppResult<FormatMapping> {
             metal: MtlPixelFormat::R16Float,
             strategy: EmulationStrategy::Direct,
         },
+        DxgiFormat::R16Unorm => FormatMapping {
+            dxgi: format,
+            metal: MtlPixelFormat::R16Unorm,
+            strategy: EmulationStrategy::Direct,
+        },
+        DxgiFormat::R16Uint => FormatMapping {
+            dxgi: format,
+            metal: MtlPixelFormat::R16Uint,
+            strategy: EmulationStrategy::Direct,
+        },
+        DxgiFormat::R16Snorm => FormatMapping {
+            dxgi: format,
+            metal: MtlPixelFormat::R16Snorm,
+            strategy: EmulationStrategy::Direct,
+        },
         DxgiFormat::R32Float => FormatMapping {
             dxgi: format,
             metal: MtlPixelFormat::R32Float,
+            strategy: EmulationStrategy::Direct,
+        },
+        DxgiFormat::R32Uint => FormatMapping {
+            dxgi: format,
+            metal: MtlPixelFormat::R32Uint,
+            strategy: EmulationStrategy::Direct,
+        },
+        DxgiFormat::R32Sint => FormatMapping {
+            dxgi: format,
+            metal: MtlPixelFormat::R32Sint,
             strategy: EmulationStrategy::Direct,
         },
         DxgiFormat::R10G10B10A2Unorm => FormatMapping {
@@ -1545,14 +1669,134 @@ pub fn format_mapping(format: DxgiFormat) -> AppResult<FormatMapping> {
             metal: MtlPixelFormat::Rgb10A2Unorm,
             strategy: EmulationStrategy::Direct,
         },
+        DxgiFormat::R10G10B10A2Uint => FormatMapping {
+            dxgi: format,
+            metal: MtlPixelFormat::Rgb10A2Uint,
+            strategy: EmulationStrategy::Direct,
+        },
+        DxgiFormat::R11G11B10Float => FormatMapping {
+            dxgi: format,
+            metal: MtlPixelFormat::Rg11B10Float,
+            strategy: EmulationStrategy::Direct,
+        },
+        DxgiFormat::R16G16Float => FormatMapping {
+            dxgi: format,
+            metal: MtlPixelFormat::Rg16Float,
+            strategy: EmulationStrategy::Direct,
+        },
+        DxgiFormat::R16G16Unorm => FormatMapping {
+            dxgi: format,
+            metal: MtlPixelFormat::Rg16Unorm,
+            strategy: EmulationStrategy::Direct,
+        },
+        DxgiFormat::R16G16Uint => FormatMapping {
+            dxgi: format,
+            metal: MtlPixelFormat::Rg16Uint,
+            strategy: EmulationStrategy::Direct,
+        },
+        DxgiFormat::R16G16Snorm => FormatMapping {
+            dxgi: format,
+            metal: MtlPixelFormat::Rg16Snorm,
+            strategy: EmulationStrategy::Direct,
+        },
+        DxgiFormat::R32G32Float => FormatMapping {
+            dxgi: format,
+            metal: MtlPixelFormat::Rg32Float,
+            strategy: EmulationStrategy::Direct,
+        },
+        DxgiFormat::R32G32Uint => FormatMapping {
+            dxgi: format,
+            metal: MtlPixelFormat::Rg32Uint,
+            strategy: EmulationStrategy::Direct,
+        },
+        DxgiFormat::R16G16B16A16Float => FormatMapping {
+            dxgi: format,
+            metal: MtlPixelFormat::Rgba16Float,
+            strategy: EmulationStrategy::Direct,
+        },
+        DxgiFormat::R16G16B16A16Unorm => FormatMapping {
+            dxgi: format,
+            metal: MtlPixelFormat::Rgba16Unorm,
+            strategy: EmulationStrategy::Direct,
+        },
+        DxgiFormat::R16G16B16A16Uint => FormatMapping {
+            dxgi: format,
+            metal: MtlPixelFormat::Rgba16Uint,
+            strategy: EmulationStrategy::Direct,
+        },
+        DxgiFormat::R32G32B32A32Float => FormatMapping {
+            dxgi: format,
+            metal: MtlPixelFormat::Rgba32Float,
+            strategy: EmulationStrategy::Direct,
+        },
+        DxgiFormat::R32G32B32A32Uint => FormatMapping {
+            dxgi: format,
+            metal: MtlPixelFormat::Rgba32Uint,
+            strategy: EmulationStrategy::Direct,
+        },
         DxgiFormat::D24UnormS8Uint => FormatMapping {
             dxgi: format,
             metal: MtlPixelFormat::Depth24UnormStencil8,
             strategy: EmulationStrategy::DepthStencilEmulation,
         },
+        DxgiFormat::D32Float => FormatMapping {
+            dxgi: format,
+            metal: MtlPixelFormat::Depth32Float,
+            strategy: EmulationStrategy::Direct,
+        },
+        DxgiFormat::D32FloatS8Uint => FormatMapping {
+            dxgi: format,
+            metal: MtlPixelFormat::Depth32FloatStencil8,
+            strategy: EmulationStrategy::DepthStencilEmulation,
+        },
         DxgiFormat::Bc1Unorm => FormatMapping {
             dxgi: format,
             metal: MtlPixelFormat::Bc1Rgba,
+            strategy: EmulationStrategy::ConversionShader,
+        },
+        DxgiFormat::Bc1UnormSrgb => FormatMapping {
+            dxgi: format,
+            metal: MtlPixelFormat::Bc1RgbaSrgb,
+            strategy: EmulationStrategy::ConversionShader,
+        },
+        DxgiFormat::Bc2Unorm => FormatMapping {
+            dxgi: format,
+            metal: MtlPixelFormat::Bc2Rgba,
+            strategy: EmulationStrategy::ConversionShader,
+        },
+        DxgiFormat::Bc2UnormSrgb => FormatMapping {
+            dxgi: format,
+            metal: MtlPixelFormat::Bc2RgbaSrgb,
+            strategy: EmulationStrategy::ConversionShader,
+        },
+        DxgiFormat::Bc3Unorm => FormatMapping {
+            dxgi: format,
+            metal: MtlPixelFormat::Bc3Rgba,
+            strategy: EmulationStrategy::ConversionShader,
+        },
+        DxgiFormat::Bc3UnormSrgb => FormatMapping {
+            dxgi: format,
+            metal: MtlPixelFormat::Bc3RgbaSrgb,
+            strategy: EmulationStrategy::ConversionShader,
+        },
+        DxgiFormat::Bc4Unorm => FormatMapping {
+            dxgi: format,
+            metal: MtlPixelFormat::Bc4RUnorm,
+            strategy: EmulationStrategy::ConversionShader,
+        },
+        DxgiFormat::Bc5Unorm => FormatMapping {
+            dxgi: format,
+            metal: MtlPixelFormat::Bc5RgUnorm,
+            strategy: EmulationStrategy::ConversionShader,
+        },
+        DxgiFormat::Bc7Unorm => FormatMapping {
+            dxgi: format,
+            metal: MtlPixelFormat::Bc7RgbaUnorm,
+            strategy: EmulationStrategy::ConversionShader,
+        },
+        DxgiFormat::Bc7UnormSrgb => FormatMapping {
+            dxgi: format,
+            metal: MtlPixelFormat::Bc7RgbaUnormSrgb,
             strategy: EmulationStrategy::ConversionShader,
         },
         DxgiFormat::B5G6R5Unorm => FormatMapping {

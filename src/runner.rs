@@ -7,6 +7,7 @@ use crate::pe_runtime;
 use crate::reason::ReasonCode;
 use crate::security::{detect_driver_requirement_on_disk, driver_requirement_error};
 use crate::steam::{self, SteamClient};
+use crate::steam_integration::SteamProtocolIntegration;
 use crate::trace::{self, TraceCategory, TraceCommand, TraceEvent, TraceRecord};
 use crate::util;
 use crate::{BUILD_ID, TRACE_CACHE_VERSION, TRACE_FORMAT_VERSION};
@@ -254,6 +255,39 @@ pub fn execute_job(job: &RunnerJob) -> AppResult<RunnerOutcome> {
             log_path,
             canonical_output,
         });
+    }
+
+    // Check for steam:// protocol URLs in the job arguments and dispatch them
+    // before proceeding with PE execution. This handles the case where the runner
+    // is invoked with a steam:// URL directly (e.g., from a macOS URL event).
+    let steam_protocol_urls: Vec<String> = job.args.iter()
+        .filter(|a| a.starts_with("steam://"))
+        .cloned()
+        .collect();
+    if !steam_protocol_urls.is_empty() {
+        let integration = SteamProtocolIntegration::new();
+        for url in &steam_protocol_urls {
+            let dispatched = integration.dispatch_url(url);
+            eprintln!(
+                "[runner] steam:// protocol dispatch: {} -> {}",
+                url,
+                if dispatched { "handled" } else { "failed" },
+            );
+        }
+    }
+
+    // Parse Steam command-line flags from job arguments when running Steam.exe.
+    if job.program.to_string_lossy().contains("Steam.exe")
+        || job.program.to_string_lossy().contains("steam.exe")
+    {
+        let steam_flags = pe_runtime::process_steam_command_line(&job.args);
+        if steam_flags.has_launch_command() {
+            eprintln!(
+                "[runner] Steam -applaunch {} detected, args={:?}",
+                steam_flags.launch_app_id().unwrap_or(0),
+                steam_flags.applaunch_args,
+            );
+        }
     }
 
     if job.program.exists() && pe_runtime::is_pe_image(&job.program)? {

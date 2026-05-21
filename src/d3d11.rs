@@ -126,6 +126,9 @@ pub enum ShaderStage {
     Vs,
     Ps,
     Cs,
+    Gs,
+    Hs,
+    Ds,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -670,12 +673,56 @@ impl D3d11Device {
         self.immediate.bindings.shaders.remove(&ShaderStage::Cs);
     }
 
+    pub fn gs_set_shader(&mut self, shader: ShaderId) {
+        self.immediate.bindings.shaders.insert(ShaderStage::Gs, shader);
+    }
+
+    pub fn gs_clear_shader(&mut self) {
+        self.immediate.bindings.shaders.remove(&ShaderStage::Gs);
+    }
+
+    pub fn hs_set_shader(&mut self, shader: ShaderId) {
+        self.immediate.bindings.shaders.insert(ShaderStage::Hs, shader);
+    }
+
+    pub fn hs_clear_shader(&mut self) {
+        self.immediate.bindings.shaders.remove(&ShaderStage::Hs);
+    }
+
+    pub fn ds_set_shader(&mut self, shader: ShaderId) {
+        self.immediate.bindings.shaders.insert(ShaderStage::Ds, shader);
+    }
+
+    pub fn ds_clear_shader(&mut self) {
+        self.immediate.bindings.shaders.remove(&ShaderStage::Ds);
+    }
+
     pub fn vs_set_constant_buffers(&mut self, buffers: Vec<D3d11ResourceId>) {
         self.immediate.bindings.constant_buffers.insert(ShaderStage::Vs, buffers);
     }
 
     pub fn ps_set_constant_buffers(&mut self, buffers: Vec<D3d11ResourceId>) {
         self.immediate.bindings.constant_buffers.insert(ShaderStage::Ps, buffers);
+    }
+
+    pub fn cs_set_constant_buffers(&mut self, buffers: Vec<D3d11ResourceId>) {
+        self.immediate.bindings.constant_buffers.insert(ShaderStage::Cs, buffers);
+    }
+
+    pub fn gs_set_constant_buffers(&mut self, buffers: Vec<D3d11ResourceId>) {
+        self.immediate.bindings.constant_buffers.insert(ShaderStage::Gs, buffers);
+    }
+
+    pub fn hs_set_constant_buffers(&mut self, buffers: Vec<D3d11ResourceId>) {
+        self.immediate.bindings.constant_buffers.insert(ShaderStage::Hs, buffers);
+    }
+
+    pub fn ds_set_constant_buffers(&mut self, buffers: Vec<D3d11ResourceId>) {
+        self.immediate.bindings.constant_buffers.insert(ShaderStage::Ds, buffers);
+    }
+
+    pub fn vs_set_shader_resources(&mut self, resources: Vec<D3d11ViewId>) {
+        self.immediate.bindings.shader_resources.insert(ShaderStage::Vs, resources);
     }
 
     pub fn ps_set_shader_resources(&mut self, resources: Vec<D3d11ViewId>) {
@@ -686,8 +733,36 @@ impl D3d11Device {
         self.immediate.bindings.shader_resources.insert(ShaderStage::Cs, resources);
     }
 
+    pub fn gs_set_shader_resources(&mut self, resources: Vec<D3d11ViewId>) {
+        self.immediate.bindings.shader_resources.insert(ShaderStage::Gs, resources);
+    }
+
+    pub fn hs_set_shader_resources(&mut self, resources: Vec<D3d11ViewId>) {
+        self.immediate.bindings.shader_resources.insert(ShaderStage::Hs, resources);
+    }
+
+    pub fn ds_set_shader_resources(&mut self, resources: Vec<D3d11ViewId>) {
+        self.immediate.bindings.shader_resources.insert(ShaderStage::Ds, resources);
+    }
+
     pub fn ps_set_samplers(&mut self, samplers: Vec<SamplerStateId>) {
         self.immediate.bindings.samplers.insert(ShaderStage::Ps, samplers);
+    }
+
+    pub fn cs_set_samplers(&mut self, samplers: Vec<SamplerStateId>) {
+        self.immediate.bindings.samplers.insert(ShaderStage::Cs, samplers);
+    }
+
+    pub fn gs_set_samplers(&mut self, samplers: Vec<SamplerStateId>) {
+        self.immediate.bindings.samplers.insert(ShaderStage::Gs, samplers);
+    }
+
+    pub fn hs_set_samplers(&mut self, samplers: Vec<SamplerStateId>) {
+        self.immediate.bindings.samplers.insert(ShaderStage::Hs, samplers);
+    }
+
+    pub fn ds_set_samplers(&mut self, samplers: Vec<SamplerStateId>) {
+        self.immediate.bindings.samplers.insert(ShaderStage::Ds, samplers);
     }
 
     pub fn update_subresource(&mut self, resource: D3d11ResourceId, bytes: &[u8]) -> AppResult<()> {
@@ -1330,7 +1405,7 @@ impl D3d11Device {
                 .map(|state| format!("{}:{}", state.depth_enable, state.depth_write))
                 .ok_or_else(|| AppError::new(ReasonCode::RcD3dInvalidState, format!("unknown depth state {id}")))
         }).transpose()?.unwrap_or_else(|| "none".to_string());
-        let shaders = [ShaderStage::Vs, ShaderStage::Ps, ShaderStage::Cs]
+        let shaders = [ShaderStage::Vs, ShaderStage::Ps, ShaderStage::Cs, ShaderStage::Gs, ShaderStage::Hs, ShaderStage::Ds]
             .iter()
             .map(|stage| {
                 bindings.shaders.get(stage).map(|id| {
@@ -1504,6 +1579,84 @@ impl D3d11Device {
         self.next_id += 1;
         id
     }
+
+    // ── Device query methods ──────────────────────────────────────────
+
+    pub fn check_format_support(&self, format: DxgiFormat) -> AppResult<crate::gfx::FormatMapping> {
+        self.backend.query_format_support(format)
+    }
+
+    pub fn check_feature_support(&self) -> FeatureCaps {
+        self.caps.clone()
+    }
+
+    pub fn check_multisample_quality_levels(&self, _format: DxgiFormat, _sample_count: u32) -> u32 {
+        // Metal does not support MSAA quality levels beyond the default (0)
+        0
+    }
+
+    pub fn create_class_linkage(&mut self) -> ShaderId {
+        // Class linkage is not used on Metal; return a dummy shader ID
+        self.create_shader(ShaderModuleDesc {
+            stage: ShaderStage::Vs,
+            entry: "__class_linkage_stub".to_string(),
+        })
+    }
+
+    pub fn create_predicate(&mut self) -> u64 {
+        // Predicates are not supported on Metal; return a dummy handle
+        self.alloc_id()
+    }
+
+    pub fn create_counter(&mut self) -> u64 {
+        // Counters are not supported on Metal; return a dummy handle
+        self.alloc_id()
+    }
+
+    // ── Context methods ───────────────────────────────────────────────
+
+    pub fn clear_state(&mut self) {
+        self.immediate.bindings = ContextBindings::default();
+        self.immediate.commands.clear();
+    }
+
+    pub fn cs_set_unordered_access_views(&mut self, uavs: Vec<D3d11ViewId>) {
+        // Store UAVs in shader_resources under Cs stage
+        self.immediate.bindings.shader_resources.insert(ShaderStage::Cs, uavs);
+    }
+
+    pub fn om_set_render_targets_and_unordered_access_views(
+        &mut self,
+        render_targets: Vec<D3d11ViewId>,
+        depth_target: Option<D3d11ViewId>,
+        _uav_start_slot: u32,
+        uavs: Vec<D3d11ViewId>,
+    ) {
+        self.immediate.bindings.render_targets = render_targets;
+        self.immediate.bindings.depth_target = depth_target;
+        if !uavs.is_empty() {
+            self.immediate.bindings.shader_resources.insert(ShaderStage::Cs, uavs);
+        }
+    }
+
+    pub fn generate_mips(&mut self, _view_srv: D3d11ViewId) {
+        // MIP generation is a no-op in the software backend;
+        // textures are created with full mip chains if needed.
+    }
+
+    pub fn draw_auto(&mut self) {
+        // DrawAuto uses the stream output buffer's fill count as vertex count.
+        // On Metal, this is emulated by drawing with a stored count (0 = no-op).
+        self.immediate.commands.push(RecordedCommand::Draw {
+            vertices: 0,
+            kind: DrawCallKind::Regular,
+        });
+    }
+
+    pub fn copy_structure_count(&mut self, _dst: D3d11ResourceId, _src: D3d11ResourceId, _aligned_byte_offset: u32) {
+        // CopyStructureCount copies the append/consume counter from a UAV
+        // to a buffer. This is not directly supported on Metal; treated as no-op.
+    }
 }
 
 impl DeferredContext {
@@ -1636,6 +1789,145 @@ impl DeferredContext {
 
     pub fn ps_set_samplers(&self, samplers: Vec<SamplerStateId>) -> AppResult<()> {
         self.lock()?.bindings.samplers.insert(ShaderStage::Ps, samplers);
+        Ok(())
+    }
+
+    pub fn gs_set_shader(&self, shader: ShaderId) -> AppResult<()> {
+        self.lock()?.bindings.shaders.insert(ShaderStage::Gs, shader);
+        Ok(())
+    }
+
+    pub fn gs_clear_shader(&self) -> AppResult<()> {
+        self.lock()?.bindings.shaders.remove(&ShaderStage::Gs);
+        Ok(())
+    }
+
+    pub fn hs_set_shader(&self, shader: ShaderId) -> AppResult<()> {
+        self.lock()?.bindings.shaders.insert(ShaderStage::Hs, shader);
+        Ok(())
+    }
+
+    pub fn hs_clear_shader(&self) -> AppResult<()> {
+        self.lock()?.bindings.shaders.remove(&ShaderStage::Hs);
+        Ok(())
+    }
+
+    pub fn ds_set_shader(&self, shader: ShaderId) -> AppResult<()> {
+        self.lock()?.bindings.shaders.insert(ShaderStage::Ds, shader);
+        Ok(())
+    }
+
+    pub fn ds_clear_shader(&self) -> AppResult<()> {
+        self.lock()?.bindings.shaders.remove(&ShaderStage::Ds);
+        Ok(())
+    }
+
+    pub fn vs_set_shader_resources(&self, resources: Vec<D3d11ViewId>) -> AppResult<()> {
+        self.lock()?.bindings.shader_resources.insert(ShaderStage::Vs, resources);
+        Ok(())
+    }
+
+    pub fn cs_set_shader_resources(&self, resources: Vec<D3d11ViewId>) -> AppResult<()> {
+        self.lock()?.bindings.shader_resources.insert(ShaderStage::Cs, resources);
+        Ok(())
+    }
+
+    pub fn gs_set_shader_resources(&self, resources: Vec<D3d11ViewId>) -> AppResult<()> {
+        self.lock()?.bindings.shader_resources.insert(ShaderStage::Gs, resources);
+        Ok(())
+    }
+
+    pub fn hs_set_shader_resources(&self, resources: Vec<D3d11ViewId>) -> AppResult<()> {
+        self.lock()?.bindings.shader_resources.insert(ShaderStage::Hs, resources);
+        Ok(())
+    }
+
+    pub fn ds_set_shader_resources(&self, resources: Vec<D3d11ViewId>) -> AppResult<()> {
+        self.lock()?.bindings.shader_resources.insert(ShaderStage::Ds, resources);
+        Ok(())
+    }
+
+    pub fn cs_set_constant_buffers(&self, buffers: Vec<D3d11ResourceId>) -> AppResult<()> {
+        self.lock()?.bindings.constant_buffers.insert(ShaderStage::Cs, buffers);
+        Ok(())
+    }
+
+    pub fn gs_set_constant_buffers(&self, buffers: Vec<D3d11ResourceId>) -> AppResult<()> {
+        self.lock()?.bindings.constant_buffers.insert(ShaderStage::Gs, buffers);
+        Ok(())
+    }
+
+    pub fn hs_set_constant_buffers(&self, buffers: Vec<D3d11ResourceId>) -> AppResult<()> {
+        self.lock()?.bindings.constant_buffers.insert(ShaderStage::Hs, buffers);
+        Ok(())
+    }
+
+    pub fn ds_set_constant_buffers(&self, buffers: Vec<D3d11ResourceId>) -> AppResult<()> {
+        self.lock()?.bindings.constant_buffers.insert(ShaderStage::Ds, buffers);
+        Ok(())
+    }
+
+    pub fn cs_set_samplers(&self, samplers: Vec<SamplerStateId>) -> AppResult<()> {
+        self.lock()?.bindings.samplers.insert(ShaderStage::Cs, samplers);
+        Ok(())
+    }
+
+    pub fn gs_set_samplers(&self, samplers: Vec<SamplerStateId>) -> AppResult<()> {
+        self.lock()?.bindings.samplers.insert(ShaderStage::Gs, samplers);
+        Ok(())
+    }
+
+    pub fn hs_set_samplers(&self, samplers: Vec<SamplerStateId>) -> AppResult<()> {
+        self.lock()?.bindings.samplers.insert(ShaderStage::Hs, samplers);
+        Ok(())
+    }
+
+    pub fn ds_set_samplers(&self, samplers: Vec<SamplerStateId>) -> AppResult<()> {
+        self.lock()?.bindings.samplers.insert(ShaderStage::Ds, samplers);
+        Ok(())
+    }
+
+    pub fn clear_state(&self) -> AppResult<()> {
+        let mut recording = self.lock()?;
+        recording.bindings = ContextBindings::default();
+        recording.commands.clear();
+        Ok(())
+    }
+
+    pub fn cs_set_unordered_access_views(&self, uavs: Vec<D3d11ViewId>) -> AppResult<()> {
+        self.lock()?.bindings.shader_resources.insert(ShaderStage::Cs, uavs);
+        Ok(())
+    }
+
+    pub fn om_set_render_targets_and_unordered_access_views(
+        &self,
+        render_targets: Vec<D3d11ViewId>,
+        depth_target: Option<D3d11ViewId>,
+        _uav_start_slot: u32,
+        uavs: Vec<D3d11ViewId>,
+    ) -> AppResult<()> {
+        let mut recording = self.lock()?;
+        recording.bindings.render_targets = render_targets;
+        recording.bindings.depth_target = depth_target;
+        if !uavs.is_empty() {
+            recording.bindings.shader_resources.insert(ShaderStage::Cs, uavs);
+        }
+        Ok(())
+    }
+
+    pub fn generate_mips(&self, _view_srv: D3d11ViewId) -> AppResult<()> {
+        Ok(())
+    }
+
+    pub fn draw_auto(&self) -> AppResult<()> {
+        self.lock()?.commands.push(RecordedCommand::Draw {
+            vertices: 0,
+            kind: DrawCallKind::Regular,
+        });
+        Ok(())
+    }
+
+    pub fn copy_structure_count(&self, _dst: D3d11ResourceId, _src: D3d11ResourceId, _aligned_byte_offset: u32) -> AppResult<()> {
         Ok(())
     }
 
@@ -1850,15 +2142,16 @@ fn create_device_internal_with_backend(
         },
     );
     let fence = backend.create_fence(0);
+    let caps = FeatureCaps {
+        geometry_shader: backend.capabilities().mesh_shaders,
+        hull_shader: backend.capabilities().mesh_shaders,
+        domain_shader: backend.capabilities().mesh_shaders,
+    };
     Ok(D3d11Device {
         next_id,
         backend,
         feature_level,
-        caps: FeatureCaps {
-            geometry_shader: false,
-            hull_shader: false,
-            domain_shader: false,
-        },
+        caps,
         swapchain,
         queue,
         graphics_allocator: allocator,
@@ -1884,6 +2177,9 @@ fn translate_shader_stage(stage: ShaderStage) -> TranslationShaderStage {
         ShaderStage::Vs => TranslationShaderStage::Vs,
         ShaderStage::Ps => TranslationShaderStage::Ps,
         ShaderStage::Cs => TranslationShaderStage::Cs,
+        ShaderStage::Gs => TranslationShaderStage::Gs,
+        ShaderStage::Hs => TranslationShaderStage::Hs,
+        ShaderStage::Ds => TranslationShaderStage::Ds,
     }
 }
 
@@ -1916,7 +2212,7 @@ where
     F: FnMut(T) -> AppResult<String>,
 {
     let mut parts = Vec::new();
-    for stage in [ShaderStage::Vs, ShaderStage::Ps, ShaderStage::Cs] {
+    for stage in [ShaderStage::Vs, ShaderStage::Ps, ShaderStage::Cs, ShaderStage::Gs, ShaderStage::Hs, ShaderStage::Ds] {
         let labels = bindings
             .get(&stage)
             .map(|values| values.iter().copied().map(&mut formatter).collect::<AppResult<Vec<_>>>())

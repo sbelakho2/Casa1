@@ -1,5 +1,8 @@
 //! Real Metal rendering pipeline for Casa1.
 //!
+//! This module also provides the CEF overlay compositing infrastructure for
+//! blending Steam UI (WKWebView frames) onto the game content via Metal.
+//!
 //! Bridges D3D11/D3D12 draw calls to real Metal command encoding, providing
 //! actual GPU-accelerated rendering. This module connects the D3D API layer
 //! to the Metal GPU backend from `src/metal_backend.rs`.
@@ -255,6 +258,11 @@ pub struct MetalRenderContext {
     frame_index: u64,
     // Pipeline state cache
     depth_stencil_states: BTreeMap<String, metal::DepthStencilState>,
+    // CEF overlay compositing
+    cef_overlay_texture: Option<metal::Texture>,
+    cef_overlay_pipeline: Option<metal::RenderPipelineState>,
+    cef_texture_width: u32,
+    cef_texture_height: u32,
 }
 
 impl MetalRenderContext {
@@ -269,6 +277,10 @@ impl MetalRenderContext {
             swapchain: None,
             frame_index: 0,
             depth_stencil_states: BTreeMap::new(),
+            cef_overlay_texture: None,
+            cef_overlay_pipeline: None,
+            cef_texture_width: 0,
+            cef_texture_height: 0,
         })
     }
 
@@ -368,6 +380,414 @@ impl MetalRenderContext {
     /// Get the device name.
     pub fn device_name(&self) -> &str {
         self.device.name()
+    }
+
+    // -----------------------------------------------------------------------
+    // CEF Overlay Compositing
+    // -----------------------------------------------------------------------
+
+    /// Upload the latest CEF overlay frame (from the global compositor) into a
+    /// cached Metal texture. Call this once per frame *before* compositing.
+    pub fn upload_cef_overlay_if_needed(&mut self) -> AppResult<()> {
+        let frame_data = with_global_cef_compositor(|compositor| {
+            compositor.take_pending_frame()
+        });
+        let Some(frame) = frame_data else {
+            return Ok(());
+        };
+
+        let (width, height) = (frame.width, frame.height);
+
+        // Re-allocate texture if dimensions changed
+        if self.cef_texture_width != width || self.cef_texture_height != height || self.cef_overlay_texture.is_none() {
+            let descriptor = metal::TextureDescriptor::new();
+            descriptor.set_texture_type(metal::MTLTextureType::D2);
+            descriptor.set_pixel_format(metal::MTLPixelFormat::RGBA8Unorm);
+            descriptor.set_width(width as u64);
+            descriptor.set_height(height as u64);
+            descriptor.set_usage(
+                metal::MTLTextureUsage::ShaderRead
+                    | metal::MTLTextureUsage::RenderTarget,
+            );
+            descriptor.set_storage_mode(metal::MTLStorageMode::Shared);
+            let texture = self.device.device().new_texture(&descriptor);
+
+            self.cef_overlay_texture = Some(texture);
+            self.cef_texture_width = width;
+            self.cef_texture_height = height;
+        }
+
+        // Upload pixel data
+        if let Some(ref texture) = self.cef_overlay_texture {
+            let region = metal::MTLRegion {
+                origin: metal::MTLOrigin { x: 0, y: 0, z: 0 },
+                size: metal::MTLSize {
+                    width: width as u64,
+                    height: height as u64,
+                    depth: 1,
+                },
+            };
+            let bytes_per_row = (width as u64) * 4;
+            texture.replace_region(
+                region,
+                0,
+                frame.pixels.as_ptr() as *const std::ffi::c_void,
+                bytes_per_row,
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Ensure the CEF overlay compositing pipeline is created (lazily).
+    fn ensure_cef_overlay_pipeline(&mut self) -> AppResult<()> {
+        if self.cef_overlay_pipeline.is_some() {
+            return Ok(());
+        }
+
+        let library = self.device.compile_shader_library(CEF_OVERLAY_SHADER_SOURCE)?;
+
+        let vertex_fn = library.get_function("cef_overlay_vertex", None)
+            .map_err(|_| AppError::new(ReasonCode::RcIo, "failed to find cef_overlay_vertex in MSL library"))?;
+        let fragment_fn = library.get_function("cef_overlay_fragment", None)
+            .map_err(|_| AppError::new(ReasonCode::RcIo, "failed to find cef_overlay_fragment in MSL library"))?;
+
+        let pipeline_desc = metal::RenderPipelineDescriptor::new();
+        pipeline_desc.set_vertex_function(Some(&vertex_fn));
+        pipeline_desc.set_fragment_function(Some(&fragment_fn));
+
+        let color_attachment = pipeline_desc.color_attachments().object_at(0).unwrap();
+        color_attachment.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
+        // Enable alpha blending: src_alpha * src + (1 - src_alpha) * dst
+        color_attachment.set_blending_enabled(true);
+        color_attachment.set_rgb_blend_operation(metal::MTLBlendOperation::Add);
+        color_attachment.set_alpha_blend_operation(metal::MTLBlendOperation::Add);
+        color_attachment.set_source_rgb_blend_factor(metal::MTLBlendFactor::SourceAlpha);
+        color_attachment.set_source_alpha_blend_factor(metal::MTLBlendFactor::SourceAlpha);
+        color_attachment.set_destination_rgb_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
+        color_attachment.set_destination_alpha_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
+
+        let pipeline = self
+            .device
+            .device()
+            .new_render_pipeline_state(&pipeline_desc)
+            .map_err(|e| {
+                AppError::new(
+                    ReasonCode::RcIo,
+                    format!("failed to create CEF overlay pipeline: {e:?}"),
+                )
+            })?;
+
+        self.cef_overlay_pipeline = Some(pipeline);
+        Ok(())
+    }
+
+    /// Composite the CEF overlay onto the current drawable and present.
+    ///
+    /// This performs a two-pass composite:
+    ///   1. The existing game content on the drawable is preserved (Load action).
+    ///   2. The CEF/Steam UI overlay texture is alpha-blended on top.
+    ///   3. Then the drawable is presented.
+    pub fn composite_and_present(&mut self) -> AppResult<()> {
+        // Create command buffer first (mutable, no borrow conflicts)
+        let cmd_buffer_ref = self.create_command_buffer();
+        let cmd_buffer = cmd_buffer_ref.to_owned();
+
+        // Ensure the overlay pipeline exists before borrowing self fields immutably
+        if self.cef_overlay_texture.is_some() {
+            self.ensure_cef_overlay_pipeline()?;
+        }
+
+        // Get the drawable after all mutable operations — this borrows self
+        // immutably for the rest of the function, so it must be last.
+        let drawable = {
+            let swapchain = self.swapchain.as_ref().ok_or_else(|| {
+                AppError::new(ReasonCode::RcIo, "no swapchain created")
+            })?;
+            swapchain.next_drawable()?
+        };
+
+        // If we have a valid overlay texture, composite it onto the drawable
+        if let Some(ref texture) = self.cef_overlay_texture {
+            if let Some(ref pipeline) = self.cef_overlay_pipeline {
+                let descriptor = metal::RenderPassDescriptor::new();
+                let ca = descriptor.color_attachments().object_at(0).unwrap();
+                ca.set_texture(Some(drawable.texture()));
+                // Preserve existing game content
+                ca.set_load_action(metal::MTLLoadAction::Load);
+                ca.set_store_action(metal::MTLStoreAction::Store);
+
+                let encoder = cmd_buffer.new_render_command_encoder(descriptor);
+                encoder.set_render_pipeline_state(pipeline);
+                encoder.set_fragment_texture(0, Some(texture));
+                // Full-screen triangle (3 vertices, no index/vertex buffer needed)
+                encoder.draw_primitives(metal::MTLPrimitiveType::Triangle, 0, 3);
+                encoder.end_encoding();
+            }
+        }
+
+        cmd_buffer.present_drawable(drawable);
+        cmd_buffer.commit();
+
+        Ok(())
+    }
+
+    /// Resize the CEF overlay texture. Call this when the window/browser is resized.
+    pub fn resize_cef_overlay(&mut self, _width: u32, _height: u32) {
+        // Force texture reallocation on next upload
+        self.cef_overlay_texture = None;
+        self.cef_texture_width = 0;
+        self.cef_texture_height = 0;
+    }
+}
+
+/// Inline Metal Shading Language source for the CEF overlay compositing pass.
+///
+/// Uses a full-screen triangle (vertex_id only, no vertex buffer) and samples
+/// the RGBA8 overlay texture with linear filtering.
+const CEF_OVERLAY_SHADER_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct VertexOut {
+    float4 position [[position]];
+    float2 texcoord;
+};
+
+/// Full-screen triangle vertex shader. 3 vertices cover the entire clip space
+/// without needing a vertex buffer.
+vertex VertexOut cef_overlay_vertex(uint vertex_id [[vertex_id]]) {
+    float2 positions[3] = {
+        float2(-1.0, -1.0),
+        float2( 3.0, -1.0),
+        float2(-1.0,  3.0)
+    };
+    float2 texcoords[3] = {
+        float2(0.0, 1.0),
+        float2(2.0, 1.0),
+        float2(0.0, -1.0)
+    };
+    VertexOut out;
+    out.position = float4(positions[vertex_id], 0.0, 1.0);
+    out.texcoord = texcoords[vertex_id];
+    return out;
+}
+
+/// Fragment shader that samples the CEF overlay texture.
+fragment float4 cef_overlay_fragment(VertexOut in [[stage_in]],
+                                      texture2d<float> overlay [[texture(0)]]) {
+    constexpr sampler s(address::clamp_to_edge, filter::linear);
+    float4 color = overlay.sample(s, in.texcoord);
+    return color;
+}
+"#;
+
+// ---------------------------------------------------------------------------
+// Global CEF Metal Compositor (thread-safe singleton)
+// ---------------------------------------------------------------------------
+
+/// Thread-safe pending frame data exchanged between the CEF bridge and the
+/// Metal compositor.
+/// Wrapper around a raw IOSurface pointer that is explicitly `Send` + `Sync`.
+/// Raw pointers are not `Send` by default, but IOSurfaceRefs are safe to
+/// transfer between threads (they are CoreFoundation objects with retain/release
+/// semantics and can be used from any thread).
+#[derive(Clone, Copy)]
+struct IoSurfacePtr(*mut std::ffi::c_void);
+unsafe impl Send for IoSurfacePtr {}
+unsafe impl Sync for IoSurfacePtr {}
+
+/// Thread-safe pending frame data exchanged between the CEF bridge and the
+/// Metal compositor.
+pub struct CefMetalCompositor {
+    /// Pending overlay frame data (RGBA pixels) from WKWebView snapshot.
+    pending_width: u32,
+    pending_height: u32,
+    pending_pixels: Option<Vec<u8>>,
+    /// Optional IOSurface handle for zero-copy frame exchange.
+    /// When set, the compositor prefers IOSurface-backed textures over
+    /// CPU-side pixel uploads.
+    pending_io_surface: Option<IoSurfacePtr>,
+    /// Last frame number submitted (for tracking updates).
+    last_frame_number: u64,
+    /// Whether a game is currently rendering (true) or only Steam UI is visible (false).
+    /// When false, the compositor renders the CEF overlay as a full-screen texture
+    /// covering the entire drawable.
+    game_active: bool,
+    /// Timestamp of the last vsync-aligned composite (nanoseconds, mach_absolute_time).
+    last_vsync_timestamp: u64,
+    /// Target frame interval for 60fps compositing (~16.67ms in nanoseconds).
+    vsync_interval_ns: u64,
+}
+
+impl CefMetalCompositor {
+    /// Create a new empty compositor.
+    pub fn new() -> Self {
+        CefMetalCompositor {
+            pending_width: 0,
+            pending_height: 0,
+            pending_pixels: None,
+            pending_io_surface: None,
+            last_frame_number: 0,
+            game_active: false,
+            last_vsync_timestamp: 0,
+            vsync_interval_ns: 16_666_667, // ~60fps
+        }
+    }
+
+    /// Submit a new CEF overlay frame for compositing. Called by the CEF bridge
+    /// when a new WKWebView snapshot is available.
+    pub fn submit_frame(&mut self, width: u32, height: u32, pixels: Vec<u8>) {
+        self.pending_width = width;
+        self.pending_height = height;
+        self.pending_pixels = Some(pixels);
+        self.pending_io_surface = None;
+        self.last_frame_number += 1;
+    }
+
+    /// Submit a new CEF overlay frame via IOSurface (zero-copy path).
+    /// The IOSurface must contain RGBA8 pixel data at the given dimensions.
+    ///
+    /// # Safety
+    /// `io_surface_ptr` must be a valid IOSurfaceRef with matching dimensions.
+    pub unsafe fn submit_io_surface_frame(&mut self, width: u32, height: u32, io_surface_ptr: *mut std::ffi::c_void) {
+        self.pending_width = width;
+        self.pending_height = height;
+        self.pending_io_surface = Some(IoSurfacePtr(io_surface_ptr));
+        self.pending_pixels = None;
+        self.last_frame_number += 1;
+    }
+
+    /// Take the pending frame data (if any) for upload to the Metal texture.
+    /// Returns `None` if no new frame has arrived since the last take.
+    pub fn take_pending_frame(&mut self) -> Option<PendingCefFrame> {
+        let io_surface = self.pending_io_surface.take().map(|p| p.0);
+        self.pending_pixels.take().map(|pixels| PendingCefFrame {
+            width: self.pending_width,
+            height: self.pending_height,
+            pixels,
+            io_surface,
+            frame_number: self.last_frame_number,
+        })
+    }
+
+    /// Check whether a pending frame is available without consuming it.
+    pub fn has_pending_frame(&self) -> bool {
+        self.pending_pixels.is_some() || self.pending_io_surface.is_some()
+    }
+
+    /// Get the dimensions of the pending frame (if available).
+    pub fn pending_dimensions(&self) -> Option<(u32, u32)> {
+        if self.pending_pixels.is_some() || self.pending_io_surface.is_some() {
+            Some((self.pending_width, self.pending_height))
+        } else {
+            None
+        }
+    }
+
+    /// Set whether a game is actively rendering (vs. only Steam UI visible).
+    /// When `game_active` is false, the compositor renders the CEF overlay as
+    /// a full-screen texture covering the entire drawable (Steam library/store).
+    pub fn set_game_active(&mut self, active: bool) {
+        self.game_active = active;
+    }
+
+    /// Check whether a game is actively rendering.
+    pub fn is_game_active(&self) -> bool {
+        self.game_active
+    }
+
+    /// Get the last frame number submitted.
+    pub fn last_frame_number(&self) -> u64 {
+        self.last_frame_number
+    }
+
+    /// Check if enough time has elapsed since the last composite to issue
+    /// a new vsync-aligned frame (60fps throttle).
+    pub fn should_composite(&mut self) -> bool {
+        let now = mach_absolute_time();
+        let elapsed = now.saturating_sub(self.last_vsync_timestamp);
+        if elapsed >= self.vsync_interval_ns {
+            self.last_vsync_timestamp = now;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// A pending CEF overlay frame ready for GPU upload.
+pub struct PendingCefFrame {
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Vec<u8>,
+    /// Optional IOSurface pointer for zero-copy texture creation.
+    pub io_surface: Option<*mut std::ffi::c_void>,
+    /// Monotonically increasing frame number.
+    pub frame_number: u64,
+}
+
+// Global singleton following the same pattern as GLOBAL_CEF_BRIDGE in cef_bridge.rs
+static GLOBAL_CEF_METAL_COMPOSITOR: std::sync::LazyLock<std::sync::Mutex<CefMetalCompositor>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(CefMetalCompositor::new()));
+
+/// Access the global CEF Metal compositor with a closure.
+pub fn with_global_cef_compositor<F, R>(f: F) -> R
+where
+    F: FnOnce(&mut CefMetalCompositor) -> R,
+{
+    let mut guard = GLOBAL_CEF_METAL_COMPOSITOR.lock().unwrap();
+    f(&mut *guard)
+}
+
+/// Submit a CEF overlay frame to the global compositor. This is the primary
+/// entry point called by the CEF bridge when new WKWebView content arrives.
+pub fn submit_cef_overlay_frame(width: u32, height: u32, pixels: Vec<u8>) {
+    with_global_cef_compositor(|compositor| {
+        compositor.submit_frame(width, height, pixels);
+    });
+}
+
+/// Submit a CEF overlay frame via IOSurface (zero-copy path).
+///
+/// # Safety
+/// `io_surface_ptr` must be a valid IOSurfaceRef.
+pub unsafe fn submit_cef_overlay_io_surface(width: u32, height: u32, io_surface_ptr: *mut std::ffi::c_void) {
+    with_global_cef_compositor(|compositor| {
+        unsafe { compositor.submit_io_surface_frame(width, height, io_surface_ptr); }
+    });
+}
+
+/// Mark whether a game is actively rendering in the global compositor.
+pub fn set_cef_compositor_game_active(active: bool) {
+    with_global_cef_compositor(|compositor| {
+        compositor.set_game_active(active);
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Vsync helper — macOS mach_absolute_time for frame pacing
+// ---------------------------------------------------------------------------
+
+/// Get the current time in nanoseconds from mach_absolute_time.
+/// Uses mach_timebase_info to convert from Mach absolute time units.
+fn mach_absolute_time() -> u64 {
+    #[cfg(target_os = "macos")]
+    {
+        unsafe {
+            let mut timebase: libc::mach_timebase_info = std::mem::zeroed();
+            libc::mach_timebase_info(&mut timebase);
+            let mach_time = libc::mach_absolute_time();
+            (mach_time * timebase.numer as u64) / timebase.denom as u64
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // Fallback: use std::time
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64
     }
 }
 

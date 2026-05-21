@@ -34,6 +34,16 @@
         "last_access_time_ticks": 133105159660000000,
         "last_write_time_ticks": 133105159660000000
       },
+      "C:\\logs": {
+        "kind": "Directory",
+        "original_case": "logs",
+        "attributes": [
+          "directory"
+        ],
+        "creation_time_ticks": 17789816637641400,
+        "last_access_time_ticks": 17789816637641400,
+        "last_write_time_ticks": 17789816637641400
+      },
       "C:\\modern-header.bmp": {
         "kind": "File",
         "original_case": "modern-header.bmp",
@@ -233,6 +243,16 @@
         "creation_time_ticks": 0,
         "last_access_time_ticks": 0,
         "last_write_time_ticks": 0
+      },
+      "C:\\package": {
+        "kind": "Directory",
+        "original_case": "package",
+        "attributes": [
+          "directory"
+        ],
+        "creation_time_ticks": 17790514937043860,
+        "last_access_time_ticks": 17790514937043860,
+        "last_write_time_ticks": 17790514937043860
       },
       "C:\\steam.exe": {
         "kind": "File",
@@ -820,6 +840,16 @@
         "last_access_time_ticks": 133105159660000000,
         "last_write_time_ticks": 133105159660000000
       },
+      "C:\\users\\casa1\\appdata\\local\\temp\\logs": {
+        "kind": "Directory",
+        "original_case": "logs",
+        "attributes": [
+          "directory"
+        ],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
       "C:\\users\\casa1\\appdata\\local\\temp\\nsa0008.tmp": {
         "kind": "File",
         "original_case": "nsa0008.tmp",
@@ -1096,6 +1126,14 @@
         "last_access_time_ticks": 0,
         "last_write_time_ticks": 0
       },
+      "\\\\?\\C:\\.crash": {
+        "kind": "File",
+        "original_case": ".crash",
+        "attributes": [],
+        "creation_time_ticks": 134237419486415600,
+        "last_access_time_ticks": 134237419486415600,
+        "last_write_time_ticks": 134237419486415600
+      },
       "\\\\?\\C:\\Steam\\.crash": {
         "kind": "File",
         "original_case": ".crash",
@@ -1112,9 +1150,41 @@
         "last_access_time_ticks": 0,
         "last_write_time_ticks": 0
       },
+      "\\\\?\\C:\\Steam\\logs\\bootstrap_log.txt": {
+        "kind": "File",
+        "original_case": "bootstrap_log.txt",
+        "attributes": [],
+        "creation_time_ticks": 134236866690913950,
+        "last_access_time_ticks": 134236866690913950,
+        "last_write_time_ticks": 134236866690913950
+      },
+      "\\\\?\\C:\\logs\\bootstrap_log.txt": {
+        "kind": "File",
+        "original_case": "bootstrap_log.txt",
+        "attributes": [],
+        "creation_time_ticks": 134237439965011330,
+        "last_access_time_ticks": 134237439965011330,
+        "last_write_time_ticks": 134237439965011330
+      },
       "\\\\?\\C:\\steam\\logs\\%s.txt": {
         "kind": "File",
         "original_case": "%s.txt",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "\\\\?\\C:\\users\\casa1\\AppData\\Local\\Temp\\.crash": {
+        "kind": "File",
+        "original_case": ".crash",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      },
+      "\\\\?\\C:\\users\\casa1\\AppData\\Local\\Temp\\logs\\bootstrap_log.txt": {
+        "kind": "File",
+        "original_case": "bootstrap_log.txt",
         "attributes": [],
         "creation_time_ticks": 0,
         "last_access_time_ticks": 0,

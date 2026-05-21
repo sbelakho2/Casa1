@@ -2,9 +2,13 @@ use crate::audio::AudioSubsystem;
 use crate::error::{AppError, AppResult};
 use crate::ge::{GameEnvironment, RegistryView};
 use crate::installer::{GuiWindowPlan, InstallerEngine, InstallerFramework, InstallerSpec, InstallerTelemetry, RuntimeAssembly};
-use crate::network::{Certificate, NetworkStack};
+use crate::network::{Certificate, NetworkStack, SimpleHttpResponse};
 use crate::reason::ReasonCode;
 use crate::security::{detect_driver_requirement_paths, driver_requirement_error};
+use crate::steam_protocol::{
+    self as steam_proto, ChunkInfo, ContentServerRecord as ProtoContentServerRecord,
+    DepotManifest as ProtoDepotManifest,
+};
 use crate::user32::{
     KeyboardDevice, KeyboardLayoutId, KeyModifiers, MessageKind, MouseDevice, User32Subsystem,
 };
@@ -15,7 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
 const OFFICIAL_STEAM_SETUP_NAME: &str = "steamsetup.exe";
@@ -134,6 +138,7 @@ pub struct SteamClient {
     ipc_channels: BTreeMap<(String, String), IpcChannel>,
     steamworks_ready: BTreeSet<u32>,
     overlay_active: BTreeSet<u32>,
+    content_manager: ContentManager,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -182,6 +187,7 @@ impl SteamClient {
             Vec::new(),
         );
 
+        let content_manager = ContentManager::new(network.clone());
         let mut client = Self {
             ge_root: ge_root.clone(),
             library_roots: vec![ge_root.clone()],
@@ -197,6 +203,7 @@ impl SteamClient {
             ipc_channels: BTreeMap::new(),
             steamworks_ready: BTreeSet::new(),
             overlay_active: BTreeSet::new(),
+            content_manager,
         };
         if installed {
             client.seed_steam_installation();
@@ -206,6 +213,14 @@ impl SteamClient {
 
     pub fn network_mut(&mut self) -> &mut NetworkStack {
         &mut self.network
+    }
+
+    pub fn content_manager_mut(&mut self) -> &mut ContentManager {
+        &mut self.content_manager
+    }
+
+    pub fn content_manager(&self) -> &ContentManager {
+        &self.content_manager
     }
 
     pub fn logs(&self) -> &[String] {
@@ -1526,6 +1541,1207 @@ fn parent_dir(path: &str) -> String {
     path.rsplit_once('/')
         .map(|(parent, _)| parent.to_string())
         .unwrap_or_else(|| path.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Content Server / CDN Integration (Phase 3.3)
+// ---------------------------------------------------------------------------
+
+/// Default Steam content server hostnames for round-robin discovery.
+const DEFAULT_CONTENT_SERVERS: &[&str] = &[
+    "content1.steampowered.com",
+    "content2.steampowered.com",
+    "content3.steampowered.com",
+    "content4.steampowered.com",
+    "content5.steampowered.com",
+    "content6.steampowered.com",
+    "content7.steampowered.com",
+    "content8.steampowered.com",
+];
+
+/// CDN routing endpoint for geo-located content server discovery.
+const CDN_ROUTING_URL: &str = "https://api.steampowered.com/ICMService/GetContentServerRouting/v1";
+
+/// How long (seconds) a content server list is cached before re-fetching.
+const CONTENT_SERVER_TTL_SECS: u64 = 900; // 15 min
+
+/// Default chunk size used for downloading depot content (1 MiB).
+const DEFAULT_CHUNK_SIZE: u32 = 1_048_576;
+
+/// Maximum concurrent chunk downloads per session.
+const MAX_CONCURRENT_CHUNKS: usize = 4;
+
+/// Maximum retries for downloading a single chunk.
+const MAX_CHUNK_RETRIES: u32 = 3;
+
+/// Base delay (ms) for exponential backoff when retrying chunks.
+const RETRY_BASE_DELAY_MS: u64 = 1000;
+
+// ---------------------------------------------------------------------------
+// Content server tracking
+// ---------------------------------------------------------------------------
+
+/// A content server record with health tracking for load-balancing and failover.
+#[derive(Debug, Clone)]
+pub struct ContentServerRecord {
+    /// Protocol-level content server record (host, port, https, cell, weight).
+    pub proto: ProtoContentServerRecord,
+    /// Whether the server is currently reachable.
+    pub healthy: bool,
+    /// Latency in milliseconds (None if not yet measured).
+    pub latency_ms: Option<u64>,
+    /// Timestamp (UNIX seconds) of the last successful health check.
+    pub last_checked: u64,
+    /// Consecutive failure count for failover.
+    pub consecutive_failures: u32,
+}
+
+impl ContentServerRecord {
+    pub fn from_proto(proto: ProtoContentServerRecord) -> Self {
+        Self {
+            proto,
+            healthy: true,
+            latency_ms: None,
+            last_checked: 0,
+            consecutive_failures: 0,
+        }
+    }
+
+    /// Returns the base URL for this content server (e.g. `https://content1.steampowered.com`).
+    pub fn base_url(&self) -> String {
+        let scheme = if self.proto.https { "https" } else { "http" };
+        format!("{}://{}:{}", scheme, self.proto.host, self.proto.port)
+    }
+}
+
+/// A list of content servers with TTL caching, round-robin, and latency-aware selection.
+#[derive(Debug, Clone)]
+pub struct ContentServerList {
+    /// All known content servers (healthy and unhealthy).
+    servers: Vec<ContentServerRecord>,
+    /// Current round-robin index.
+    rr_index: usize,
+    /// Timestamp (UNIX seconds) when this list was last fetched.
+    fetched_at: u64,
+}
+
+impl ContentServerList {
+    pub fn new() -> Self {
+        Self {
+            servers: Vec::new(),
+            rr_index: 0,
+            fetched_at: 0,
+        }
+    }
+
+    /// Returns true if the cached list is still within its TTL.
+    pub fn is_fresh(&self) -> bool {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        now.saturating_sub(self.fetched_at) < CONTENT_SERVER_TTL_SECS
+    }
+
+    /// Populate the server list from protocol-level records.
+    pub fn populate(&mut self, records: Vec<ProtoContentServerRecord>) {
+        self.servers = records.into_iter().map(ContentServerRecord::from_proto).collect();
+        self.fetched_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+    }
+
+    /// Seed with the default hardcoded content servers (fallback when CDN routing is unavailable).
+    pub fn seed_defaults(&mut self) {
+        let records: Vec<ProtoContentServerRecord> = DEFAULT_CONTENT_SERVERS
+            .iter()
+            .enumerate()
+            .map(|(i, host)| ProtoContentServerRecord {
+                host: host.to_string(),
+                port: 443,
+                https: true,
+                cell_id: 0,
+                weight: 1,
+            })
+            .collect();
+        self.populate(records);
+    }
+
+    /// Returns the next healthy server using round-robin, skipping unhealthy servers.
+    pub fn next_healthy(&mut self) -> Option<&ContentServerRecord> {
+        let len = self.servers.len();
+        if len == 0 {
+            return None;
+        }
+        for _ in 0..len {
+            let idx = self.rr_index % len;
+            self.rr_index = (self.rr_index + 1) % len;
+            if self.servers[idx].healthy {
+                return Some(&self.servers[idx]);
+            }
+        }
+        None
+    }
+
+    /// Mark a server as healthy or unhealthy, updating failure count.
+    pub fn report_health(&mut self, host: &str, healthy: bool, latency_ms: Option<u64>) {
+        if let Some(record) = self.servers.iter_mut().find(|r| r.proto.host == host) {
+            record.healthy = healthy;
+            record.latency_ms = latency_ms;
+            record.last_checked = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            if healthy {
+                record.consecutive_failures = 0;
+            } else {
+                record.consecutive_failures += 1;
+            }
+        }
+    }
+
+    /// Returns the number of healthy servers.
+    pub fn healthy_count(&self) -> usize {
+        self.servers.iter().filter(|s| s.healthy).count()
+    }
+
+    /// Returns all servers for inspection.
+    pub fn all_servers(&self) -> &[ContentServerRecord] {
+        &self.servers
+    }
+
+    /// Select the best server based on latency (lowest latency among healthy servers).
+    pub fn best_server(&self) -> Option<&ContentServerRecord> {
+        self.servers
+            .iter()
+            .filter(|s| s.healthy)
+            .min_by_key(|s| s.latency_ms.unwrap_or(u64::MAX))
+    }
+}
+
+impl Default for ContentServerList {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Download data types
+// ---------------------------------------------------------------------------
+
+/// State of a single file download.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DownloadState {
+    Pending,
+    Downloading,
+    Verifying,
+    Paused,
+    Completed,
+    Failed,
+}
+
+/// Progress metrics for a single file or an entire depot download.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DownloadProgress {
+    /// Total bytes to download.
+    pub total_bytes: u64,
+    /// Bytes downloaded so far.
+    pub downloaded_bytes: u64,
+    /// Current download speed in bytes/second.
+    pub speed_bps: u64,
+    /// Estimated time remaining in seconds.
+    pub eta_secs: u64,
+    /// Download progress as a percentage (0.0 – 100.0).
+    pub percent: f64,
+    /// Current state of the download.
+    pub state: DownloadState,
+}
+
+impl DownloadProgress {
+    pub fn new(total_bytes: u64) -> Self {
+        Self {
+            total_bytes,
+            downloaded_bytes: 0,
+            speed_bps: 0,
+            eta_secs: 0,
+            percent: 0.0,
+            state: DownloadState::Pending,
+        }
+    }
+
+    pub fn update(&mut self, downloaded: u64, elapsed: Duration) {
+        self.downloaded_bytes = downloaded;
+        self.percent = if self.total_bytes > 0 {
+            (downloaded as f64 / self.total_bytes as f64) * 100.0
+        } else {
+            0.0
+        };
+        let secs = elapsed.as_secs_f64();
+        if secs > 0.0 {
+            self.speed_bps = (downloaded as f64 / secs) as u64;
+            let remaining = self.total_bytes.saturating_sub(downloaded);
+            if self.speed_bps > 0 {
+                self.eta_secs = remaining / self.speed_bps;
+            }
+        }
+    }
+}
+
+/// Tracks the download state of a single file within a depot.
+#[derive(Debug, Clone)]
+pub struct FileDownload {
+    /// File path relative to the depot install root.
+    pub filename: String,
+    /// Total file size in bytes.
+    pub size: u64,
+    /// SHA-1 checksum of the entire file.
+    pub checksum: [u8; 20],
+    /// List of chunks composing this file (from depot manifest).
+    pub chunks: Vec<ChunkInfo>,
+    /// Bytes downloaded so far.
+    pub downloaded_bytes: u64,
+    /// Current state.
+    pub state: DownloadState,
+    /// Accumulated file data (in-memory staging).
+    pub data: Vec<u8>,
+}
+
+impl FileDownload {
+    pub fn new(filename: String, size: u64, checksum: [u8; 20], chunks: Vec<ChunkInfo>) -> Self {
+        let data = Vec::with_capacity(size as usize);
+        Self {
+            filename,
+            size,
+            checksum,
+            chunks,
+            downloaded_bytes: 0,
+            state: DownloadState::Pending,
+            data,
+        }
+    }
+}
+
+/// Tracks the download session for a single depot.
+#[derive(Debug, Clone)]
+pub struct DownloadSession {
+    /// Steam app ID being downloaded.
+    pub app_id: u32,
+    /// Depot ID (may differ from app_id for multi-depot titles).
+    pub depot_id: u32,
+    /// All files composing this depot.
+    pub files: Vec<FileDownload>,
+    /// Aggregate download progress.
+    pub progress: DownloadProgress,
+    /// Current state of the download session.
+    pub state: DownloadState,
+    /// Start time of the download (for ETA calculation).
+    pub start_time: Option<SystemTime>,
+    /// Content server host being used.
+    pub active_server: Option<String>,
+    /// Whether the session is paused.
+    pub paused: bool,
+    /// Number of chunks currently being downloaded concurrently.
+    pub active_chunks: usize,
+}
+
+impl DownloadSession {
+    pub fn new(app_id: u32, depot_id: u32, total_bytes: u64) -> Self {
+        Self {
+            app_id,
+            depot_id,
+            files: Vec::new(),
+            progress: DownloadProgress::new(total_bytes),
+            state: DownloadState::Pending,
+            start_time: None,
+            active_server: None,
+            paused: false,
+            active_chunks: 0,
+        }
+    }
+
+    /// Add a file to this download session.
+    pub fn add_file(&mut self, file: FileDownload) {
+        self.progress.total_bytes += file.size;
+        self.files.push(file);
+    }
+
+    /// Returns total downloaded bytes across all files.
+    pub fn total_downloaded(&self) -> u64 {
+        self.files.iter().map(|f| f.downloaded_bytes).sum()
+    }
+
+    /// Returns overall progress percentage.
+    pub fn overall_progress(&self) -> f64 {
+        if self.progress.total_bytes > 0 {
+            self.total_downloaded() as f64 / self.progress.total_bytes as f64 * 100.0
+        } else {
+            0.0
+        }
+    }
+
+    /// Check whether all files have been downloaded.
+    pub fn is_complete(&self) -> bool {
+        self.files.iter().all(|f| f.state == DownloadState::Completed)
+    }
+
+    /// Check whether any file has failed.
+    pub fn has_failed(&self) -> bool {
+        self.files.iter().any(|f| f.state == DownloadState::Failed)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SteamPipe format types
+// ---------------------------------------------------------------------------
+
+/// A single entry in a SteamPipe content manifest (.csm).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SteamPipeManifestEntry {
+    /// File path relative to the install root.
+    pub filename: String,
+    /// Uncompressed file size.
+    pub size: u64,
+    /// SHA-1 hash of the uncompressed content.
+    pub sha_hash: [u8; 20],
+    /// CRC32 checksum.
+    pub crc: u32,
+    /// Flags (compression, encryption, etc.).
+    pub flags: u32,
+}
+
+/// SteamPipe content data file (.csd) header and metadata.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SteamPipeContentData {
+    /// Version of the content data format.
+    pub version: u32,
+    /// Depot ID this data belongs to.
+    pub depot_id: u32,
+    /// Total size of content data in bytes.
+    pub data_size: u64,
+    /// Chunk size used when packing the data.
+    pub chunk_size: u32,
+    /// Raw content data bytes.
+    pub data: Vec<u8>,
+}
+
+/// SteamPipe content manifest file (.csm).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SteamPipeContentManifest {
+    /// Version of the manifest format.
+    pub version: u32,
+    /// Depot ID this manifest belongs to.
+    pub depot_id: u32,
+    /// Total number of files described.
+    pub file_count: u32,
+    /// List of file entries.
+    pub entries: Vec<SteamPipeManifestEntry>,
+}
+
+/// SteamPipe content bundle file (.csb) — a container for multiple depots.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SteamPipeContentBundle {
+    /// Version of the bundle format.
+    pub version: u32,
+    /// App ID this bundle belongs to.
+    pub app_id: u32,
+    /// Depot IDs contained in this bundle.
+    pub depot_ids: Vec<u32>,
+    /// Content data for each depot.
+    pub depots: BTreeMap<u32, SteamPipeContentData>,
+    /// Content manifest for each depot.
+    pub manifests: BTreeMap<u32, SteamPipeContentManifest>,
+}
+
+// ---------------------------------------------------------------------------
+// ContentManager
+// ---------------------------------------------------------------------------
+
+/// The main content manager for Steam CDN interactions.
+///
+/// Manages content server discovery, depot downloading with chunk-based
+/// verification, download sessions, SteamPipe format support, and content
+/// integrity verification.
+#[derive(Debug, Clone)]
+pub struct ContentManager {
+    /// Content server list with health tracking and failover.
+    pub server_list: ContentServerList,
+    /// Active download sessions, keyed by app_id.
+    pub downloads: BTreeMap<u32, DownloadSession>,
+    /// Completed download records (app_id → timestamp).
+    pub completed: BTreeMap<u32, u64>,
+    /// Content verification state (app_id → whether integrity check passed).
+    pub verified_content: BTreeMap<u32, bool>,
+    /// Reference to the network stack for HTTP operations.
+    network: NetworkStack,
+}
+
+impl ContentManager {
+    /// Create a new ContentManager with the given network stack.
+    pub fn new(network: NetworkStack) -> Self {
+        Self {
+            server_list: ContentServerList::new(),
+            downloads: BTreeMap::new(),
+            completed: BTreeMap::new(),
+            verified_content: BTreeMap::new(),
+            network,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Content server discovery
+    // -----------------------------------------------------------------------
+
+    /// Discover content servers from the Steam CDN routing endpoint.
+    /// Falls back to default hardcoded servers if the CDN routing request fails.
+    pub fn discover_content_servers(&mut self) -> AppResult<()> {
+        if self.server_list.is_fresh() {
+            return Ok(());
+        }
+
+        // Try fetching from the CDN routing endpoint
+        match self.http_get_with_retry(CDN_ROUTING_URL, 2) {
+            Ok(response) if response.status == 200 => {
+                let body_str = String::from_utf8_lossy(&response.body);
+                // Parse the CDN routing XML response using the protocol parser
+                let proto_stack = steam_proto::SteamProtocolStack::new();
+                match proto_stack.parse_cdn_routing(&body_str) {
+                    Ok(records) => {
+                        self.server_list.populate(records);
+                        return Ok(());
+                    }
+                    Err(_) => {
+                        // Fall through to default servers
+                    }
+                }
+            }
+            _ => {
+                // Fall through to default servers
+            }
+        }
+
+        // Fallback: seed with default hardcoded content servers
+        self.server_list.seed_defaults();
+        Ok(())
+    }
+
+    /// Ensure content servers are populated (discover if needed).
+    pub fn ensure_content_servers(&mut self) -> AppResult<()> {
+        if self.server_list.all_servers().is_empty() {
+            self.discover_content_servers()?;
+        }
+        Ok(())
+    }
+
+    /// Check latency to a specific content server by hostname.
+    pub fn check_server_latency(&mut self, host: &str) -> AppResult<u64> {
+        let url = format!("https://{}/", host);
+        let start = SystemTime::now();
+        let result = self.http_get_with_retry(&url, 1);
+        let elapsed = start.elapsed().unwrap_or(Duration::from_secs(30));
+        let latency_ms = elapsed.as_millis() as u64;
+
+        match result {
+            Ok(_) => {
+                self.server_list.report_health(host, true, Some(latency_ms));
+                Ok(latency_ms)
+            }
+            Err(_) => {
+                self.server_list.report_health(host, false, None);
+                Err(AppError::new(
+                    ReasonCode::RcIo,
+                    format!("content server {host} unreachable"),
+                ))
+            }
+        }
+    }
+
+    /// Select the best content server based on latency, falling back to round-robin.
+    pub fn select_best_server(&mut self) -> AppResult<String> {
+        self.ensure_content_servers()?;
+
+        // Try the best server by latency first
+        if let Some(best) = self.server_list.best_server() {
+            if best.latency_ms.unwrap_or(9999) < 500 {
+                return Ok(best.base_url());
+            }
+        }
+
+        // Fall back to round-robin
+        self.server_list.next_healthy().map(|s| s.base_url()).ok_or_else(|| {
+            AppError::new(ReasonCode::RcIo, "no healthy content servers available")
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // Manifest fetching and parsing
+    // -----------------------------------------------------------------------
+
+    /// Fetch a depot manifest from the content server.
+    pub fn fetch_depot_manifest(
+        &mut self,
+        app_id: u32,
+        depot_id: u32,
+        manifest_id: u64,
+        depot_key: Option<&[u8; 32]>,
+    ) -> AppResult<Vec<ProtoDepotManifest>> {
+        let base_url = self.select_best_server()?;
+        let url = format!(
+            "{}/depot/{depot_id}/manifest/{manifest_id}",
+            base_url.trim_end_matches('/')
+        );
+
+        let response = self.http_get_with_retry(&url, MAX_CHUNK_RETRIES)?;
+        if response.status != 200 {
+            return Err(AppError::new(
+                ReasonCode::RcIo,
+                format!("failed to fetch depot manifest: HTTP {}", response.status),
+            ));
+        }
+
+        // Use the protocol-level parser to decode the manifest
+        let proto_stack = steam_proto::SteamProtocolStack::new();
+        let manifests = proto_stack.parse_depot_manifest(&response.body, depot_key)?;
+        Ok(manifests)
+    }
+
+    // -----------------------------------------------------------------------
+    // Chunk downloading
+    // -----------------------------------------------------------------------
+
+    /// Download a single chunk of data from a content server.
+    pub fn download_chunk(
+        &mut self,
+        server_url: &str,
+        depot_id: u32,
+        chunk: &ChunkInfo,
+    ) -> AppResult<Vec<u8>> {
+        let chunk_hex = hex::encode(chunk.chunk_id);
+        let url = format!(
+            "{}/depot/{depot_id}/chunk/{chunk_hex}",
+            server_url.trim_end_matches('/')
+        );
+
+        let response = self.http_get_with_retry(&url, MAX_CHUNK_RETRIES)?;
+        if response.status != 200 {
+            return Err(AppError::new(
+                ReasonCode::RcIo,
+                format!("failed to download chunk: HTTP {}", response.status),
+            ));
+        }
+
+        let data = response.body;
+        let compressed_size = chunk.compressed_size;
+        let expected_size = if compressed_size > 0 { compressed_size as usize } else { chunk.size as usize };
+
+        // Verify chunk size
+        if data.len() != expected_size {
+            return Err(AppError::new(
+                ReasonCode::RcIo,
+                format!(
+                    "chunk size mismatch: expected {expected_size}, got {}",
+                    data.len()
+                ),
+            ));
+        }
+
+        // For compressed chunks, decompression would use the SteamPipe
+        // format (Oodle or zlib). For now, pass through raw data.
+        // In a full implementation, compressed_size != chunk.size would
+        // trigger Oodle/zlib decompression.
+        let chunk_data = data;
+
+        // Verify SHA-1 hash of the chunk data
+        let actual_hash = crate::network::sha1_hash(&chunk_data);
+        if actual_hash.as_slice() != chunk.chunk_id {
+            return Err(AppError::new(
+                ReasonCode::RcIo,
+                "chunk SHA-1 hash mismatch",
+            ));
+        }
+
+        Ok(chunk_data)
+    }
+
+    /// Download all chunks of a single file and assemble them.
+    pub fn download_file_chunks(
+        &mut self,
+        server_url: &str,
+        depot_id: u32,
+        file: &mut FileDownload,
+    ) -> AppResult<Vec<u8>> {
+        file.state = DownloadState::Downloading;
+        let mut assembled = Vec::with_capacity(file.size as usize);
+
+        for chunk in &file.chunks {
+            let chunk_data = self.download_chunk(server_url, depot_id, chunk)?;
+            let offset = assembled.len() as u64;
+            if offset != chunk.offset {
+                // Pad to correct offset if needed (e.g., sparse files)
+                let pad = (chunk.offset - offset) as usize;
+                assembled.extend(std::iter::repeat(0u8).take(pad));
+            }
+            assembled.extend_from_slice(&chunk_data);
+            file.downloaded_bytes += chunk_data.len() as u64;
+        }
+
+        // Verify the complete file checksum
+        file.state = DownloadState::Verifying;
+        let file_hash = crate::network::sha1_hash(&assembled);
+        if file_hash.as_slice() != file.checksum {
+            file.state = DownloadState::Failed;
+            return Err(AppError::new(
+                ReasonCode::RcIo,
+                format!("file SHA-1 mismatch for {}", file.filename),
+            ));
+        }
+
+        file.state = DownloadState::Completed;
+        file.data = assembled.clone();
+        Ok(assembled)
+    }
+
+    /// Helper for [`process_downloads`] that downloads chunks and verifies
+    /// checksum without holding a mutable borrow on `self.downloads`.
+    fn download_file_chunks_ext(
+        &mut self,
+        server_url: &str,
+        depot_id: u32,
+        chunks: &[ChunkInfo],
+        checksum: [u8; 20],
+        file_size: u64,
+    ) -> AppResult<Vec<u8>> {
+        let mut assembled = Vec::with_capacity(file_size as usize);
+
+        for chunk in chunks {
+            let chunk_data = self.download_chunk(server_url, depot_id, chunk)?;
+            let offset = assembled.len() as u64;
+            if offset != chunk.offset {
+                let pad = (chunk.offset - offset) as usize;
+                assembled.extend(std::iter::repeat(0u8).take(pad));
+            }
+            assembled.extend_from_slice(&chunk_data);
+        }
+
+        // Verify the complete file checksum
+        let file_hash = crate::network::sha1_hash(&assembled);
+        if file_hash.as_slice() != checksum {
+            return Err(AppError::new(
+                ReasonCode::RcIo,
+                "file SHA-1 mismatch",
+            ));
+        }
+
+        Ok(assembled)
+    }
+
+    // -----------------------------------------------------------------------
+    // Download session management
+    // -----------------------------------------------------------------------
+
+    /// Start a new download session for a depot.
+    pub fn start_download(
+        &mut self,
+        app_id: u32,
+        depot_id: u32,
+        manifests: Vec<ProtoDepotManifest>,
+    ) -> AppResult<()> {
+        let total_bytes: u64 = manifests.iter().map(|m| m.size).sum();
+        let mut session = DownloadSession::new(app_id, depot_id, total_bytes);
+
+        for manifest in manifests {
+            let file = FileDownload::new(
+                manifest.filename.clone(),
+                manifest.size,
+                manifest.checksum,
+                manifest.chunks.clone(),
+            );
+            session.add_file(file);
+        }
+
+        session.start_time = Some(SystemTime::now());
+        session.state = DownloadState::Downloading;
+        self.downloads.insert(app_id, session);
+        Ok(())
+    }
+
+    /// Process pending downloads — download queued files/chunks.
+    pub fn process_downloads(&mut self) -> AppResult<()> {
+        let app_ids: Vec<u32> = self.downloads.keys().copied().collect();
+
+        for app_id in app_ids {
+            let server_url = self.select_best_server()?;
+            let depot_id;
+            let file_indices: Vec<usize>;
+
+            // Scope the borrow of self.downloads
+            {
+                let session = self.downloads.get(&app_id).ok_or_else(|| {
+                    AppError::new(ReasonCode::RcIo, format!("no active session for app {app_id}"))
+                })?;
+
+                if session.paused || session.is_complete() {
+                    continue;
+                }
+
+                depot_id = session.depot_id;
+                file_indices = session
+                    .files
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, f)| matches!(f.state, DownloadState::Pending | DownloadState::Failed))
+                    .map(|(i, _)| i)
+                    .collect();
+            }
+
+            for idx in file_indices {
+                // Remove the file from the session to avoid borrow conflicts,
+                // then process it and put it back.
+                let mut file = self
+                    .downloads
+                    .get_mut(&app_id)
+                    .and_then(|s| s.files.get_mut(idx))
+                    .ok_or_else(|| {
+                        AppError::new(ReasonCode::RcIo, format!("file index {idx} out of range"))
+                    })?;
+
+                if file.state == DownloadState::Completed {
+                    continue;
+                }
+
+                // Extract the chunk info we need for downloading
+                let file_chunks = file.chunks.clone();
+                let file_checksum = file.checksum;
+                let file_size = file.size;
+                let filename = file.filename.clone();
+
+                // Call the download method - this borrows self mutably again
+                // To avoid the conflict, we use a temporary extraction pattern
+                match self.download_file_chunks_ext(
+                    &server_url,
+                    depot_id,
+                    &file_chunks,
+                    file_checksum,
+                    file_size,
+                ) {
+                    Ok(data) => {
+                        // Re-borrow to update the file
+                        if let Some(session) = self.downloads.get_mut(&app_id) {
+                            if let Some(f) = session.files.get_mut(idx) {
+                                f.data = data;
+                                f.downloaded_bytes = f.size;
+                                f.state = DownloadState::Completed;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        if let Some(session) = self.downloads.get_mut(&app_id) {
+                            if let Some(f) = session.files.get_mut(idx) {
+                                f.state = DownloadState::Failed;
+                            }
+                        }
+                        self.server_list.report_health(
+                            &server_url,
+                            false,
+                            None,
+                        );
+                        return Err(e);
+                    }
+                }
+            }
+
+            // Check if session is complete
+            let session = self.downloads.get(&app_id).ok_or_else(|| {
+                AppError::new(ReasonCode::RcIo, format!("session vanished for app {app_id}"))
+            })?;
+
+            if session.is_complete() {
+                if let Some(session_mut) = self.downloads.get_mut(&app_id) {
+                    session_mut.state = DownloadState::Completed;
+                }
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                self.completed.insert(app_id, now);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Pause an active download session.
+    pub fn pause_download(&mut self, app_id: u32) -> AppResult<()> {
+        let session = self.downloads.get_mut(&app_id).ok_or_else(|| {
+            AppError::new(ReasonCode::RcIo, format!("no active download for app {app_id}"))
+        })?;
+        session.paused = true;
+        session.state = DownloadState::Paused;
+        Ok(())
+    }
+
+    /// Resume a paused download session.
+    pub fn resume_download(&mut self, app_id: u32) -> AppResult<()> {
+        let session = self.downloads.get_mut(&app_id).ok_or_else(|| {
+            AppError::new(ReasonCode::RcIo, format!("no active download for app {app_id}"))
+        })?;
+        session.paused = false;
+        session.state = DownloadState::Downloading;
+        Ok(())
+    }
+
+    /// Cancel and remove a download session.
+    pub fn cancel_download(&mut self, app_id: u32) {
+        self.downloads.remove(&app_id);
+        self.completed.remove(&app_id);
+        self.verified_content.remove(&app_id);
+    }
+
+    // -----------------------------------------------------------------------
+    // Content verification
+    // -----------------------------------------------------------------------
+
+    /// Verify that installed content matches the depot manifest.
+    pub fn verify_installed_content(
+        &mut self,
+        app_id: u32,
+        files: &BTreeMap<String, Vec<u8>>,
+        manifests: &[ProtoDepotManifest],
+    ) -> AppResult<bool> {
+        for manifest in manifests {
+            let Some(content) = files.get(&manifest.filename) else {
+                self.verified_content.insert(app_id, false);
+                return Ok(false);
+            };
+
+            // Verify file size
+            if content.len() as u64 != manifest.size {
+                self.verified_content.insert(app_id, false);
+                return Ok(false);
+            }
+
+            // Verify SHA-1 checksum
+            let hash = crate::network::sha1_hash(content);
+            if hash.as_slice() != manifest.checksum {
+                self.verified_content.insert(app_id, false);
+                return Ok(false);
+            }
+        }
+
+        self.verified_content.insert(app_id, true);
+        Ok(true)
+    }
+
+    /// Check whether a previously verified app is still valid.
+    pub fn is_content_verified(&self, app_id: u32) -> Option<bool> {
+        self.verified_content.get(&app_id).copied()
+    }
+
+    // -----------------------------------------------------------------------
+    // SteamPipe format support
+    // -----------------------------------------------------------------------
+
+    /// Parse a SteamPipe content data file (.csd) from raw bytes.
+    pub fn parse_steampipe_csd(&self, data: &[u8]) -> AppResult<SteamPipeContentData> {
+        if data.len() < 20 {
+            return Err(AppError::new(
+                ReasonCode::RcIo,
+                "SteamPipe .csd file too short",
+            ));
+        }
+
+        let version = u32::from_le_bytes(data[0..4].try_into().unwrap());
+        let depot_id = u32::from_le_bytes(data[4..8].try_into().unwrap());
+        let data_size = u64::from_le_bytes(data[8..16].try_into().unwrap());
+        let chunk_size = u32::from_le_bytes(data[16..20].try_into().unwrap());
+
+        let content_data = if data.len() > 20 {
+            data[20..].to_vec()
+        } else {
+            Vec::new()
+        };
+
+        Ok(SteamPipeContentData {
+            version,
+            depot_id,
+            data_size,
+            chunk_size,
+            data: content_data,
+        })
+    }
+
+    /// Parse a SteamPipe content manifest file (.csm) from raw bytes.
+    pub fn parse_steampipe_csm(&self, data: &[u8]) -> AppResult<SteamPipeContentManifest> {
+        if data.len() < 12 {
+            return Err(AppError::new(
+                ReasonCode::RcIo,
+                "SteamPipe .csm file too short",
+            ));
+        }
+
+        let version = u32::from_le_bytes(data[0..4].try_into().unwrap());
+        let depot_id = u32::from_le_bytes(data[4..8].try_into().unwrap());
+        let file_count = u32::from_le_bytes(data[8..12].try_into().unwrap());
+
+        let mut entries = Vec::with_capacity(file_count as usize);
+        let mut offset = 12usize;
+
+        for _ in 0..file_count {
+            if offset + 44 > data.len() {
+                return Err(AppError::new(
+                    ReasonCode::RcIo,
+                    "SteamPipe .csm file truncated",
+                ));
+            }
+
+            // Read fixed-size fields (filename hash placeholder, size, sha, crc, flags)
+            let size = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+            offset += 8;
+            let mut sha_hash = [0u8; 20];
+            sha_hash.copy_from_slice(&data[offset..offset + 20]);
+            offset += 20;
+            let crc = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+            offset += 4;
+            let flags = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+            offset += 4;
+            let name_len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+            offset += 4;
+
+            if offset + name_len > data.len() {
+                return Err(AppError::new(
+                    ReasonCode::RcIo,
+                    "SteamPipe .csm filename truncated",
+                ));
+            }
+
+            let filename = String::from_utf8_lossy(&data[offset..offset + name_len]).to_string();
+            offset += name_len;
+
+            // Pad to 4-byte alignment
+            let padding = (4 - (name_len % 4)) % 4;
+            offset += padding;
+
+            entries.push(SteamPipeManifestEntry {
+                filename,
+                size,
+                sha_hash,
+                crc,
+                flags,
+            });
+        }
+
+        Ok(SteamPipeContentManifest {
+            version,
+            depot_id,
+            file_count,
+            entries,
+        })
+    }
+
+    /// Parse a SteamPipe content bundle file (.csb) from raw bytes.
+    pub fn parse_steampipe_csb(&self, data: &[u8]) -> AppResult<SteamPipeContentBundle> {
+        if data.len() < 12 {
+            return Err(AppError::new(
+                ReasonCode::RcIo,
+                "SteamPipe .csb file too short",
+            ));
+        }
+
+        let version = u32::from_le_bytes(data[0..4].try_into().unwrap());
+        let app_id = u32::from_le_bytes(data[4..8].try_into().unwrap());
+        let depot_count = u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize;
+
+        let mut offset = 12usize;
+        let mut depot_ids = Vec::with_capacity(depot_count);
+
+        for _ in 0..depot_count {
+            if offset + 8 > data.len() {
+                return Err(AppError::new(
+                    ReasonCode::RcIo,
+                    "SteamPipe .csb depot list truncated",
+                ));
+            }
+            let depot_id = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+            let data_size = u32::from_le_bytes(data[offset + 4..offset + 8].try_into().unwrap());
+            offset += 8;
+            depot_ids.push((depot_id, data_size as usize));
+        }
+
+        let mut depots = BTreeMap::new();
+        let mut manifests = BTreeMap::new();
+
+        for (depot_id, data_size) in &depot_ids {
+            if offset + data_size > data.len() {
+                return Err(AppError::new(
+                    ReasonCode::RcIo,
+                    format!("SteamPipe .csb data truncated for depot {depot_id}"),
+                ));
+            }
+
+            // Try parsing as .csd first
+            let depot_data = data[offset..offset + data_size].to_vec();
+            let mut chunk_offset = offset + data_size;
+
+            // Try to parse as content data
+            match self.parse_steampipe_csd(&depot_data) {
+                Ok(csd) => {
+                    depots.insert(*depot_id, csd);
+                }
+                Err(_) => {
+                    // Not a valid .csd, store raw
+                    depots.insert(
+                        *depot_id,
+                        SteamPipeContentData {
+                            version: 0,
+                            depot_id: *depot_id,
+                            data_size: *data_size as u64,
+                            chunk_size: 0,
+                            data: depot_data,
+                        },
+                    );
+                }
+            }
+
+            // Check for manifest data (.csm) after content data
+            if chunk_offset + 12 <= data.len() {
+                // Probe for manifest header
+                let remaining = data[chunk_offset..].to_vec();
+                match self.parse_steampipe_csm(&remaining) {
+                    Ok(csm) => {
+                        manifests.insert(*depot_id, csm);
+                        // Advance offset past the manifest
+                        chunk_offset = data.len();
+                    }
+                    Err(_) => {}
+                }
+            }
+
+            offset = chunk_offset;
+        }
+
+        Ok(SteamPipeContentBundle {
+            version,
+            app_id,
+            depot_ids: depot_ids.iter().map(|(id, _)| *id).collect(),
+            depots,
+            manifests,
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // Staging and commit
+    // -----------------------------------------------------------------------
+
+    /// Stage a downloaded file into the content manager's temporary storage.
+    pub fn stage_downloaded_file(&mut self, app_id: u32, filename: &str, data: Vec<u8>) {
+        if let Some(session) = self.downloads.get_mut(&app_id) {
+            if let Some(file) = session.files.iter_mut().find(|f| f.filename == filename) {
+                file.data = data;
+                file.state = DownloadState::Completed;
+            }
+        }
+    }
+
+    /// Commit a completed download — convert to a [`DepotManifest`] (app-level)
+    /// suitable for [`SteamClient::install_depot`].
+    pub fn commit_staged_file(
+        &mut self,
+        app_id: u32,
+        game_name: &str,
+        install_dir: &str,
+        launch_exe: &str,
+    ) -> AppResult<Option<DepotManifest>> {
+        let session = self.downloads.get(&app_id).ok_or_else(|| {
+            AppError::new(ReasonCode::RcIo, format!("no download session for app {app_id}"))
+        })?;
+
+        if !session.is_complete() {
+            return Ok(None);
+        }
+
+        let mut files = BTreeMap::new();
+        for file in &session.files {
+            if !file.data.is_empty() {
+                files.insert(file.filename.clone(), file.data.clone());
+            }
+        }
+
+        if files.is_empty() {
+            return Err(AppError::new(
+                ReasonCode::RcIo,
+                format!("no files committed for app {app_id}"),
+            ));
+        }
+
+        Ok(Some(DepotManifest {
+            app_id,
+            game_name: game_name.to_string(),
+            install_dir: install_dir.to_string(),
+            launch_exe: launch_exe.to_string(),
+            library_root: None,
+            prerequisites: Vec::new(),
+            files,
+        }))
+    }
+
+    // -----------------------------------------------------------------------
+    // Install manifest creation
+    // -----------------------------------------------------------------------
+
+    /// Create an install manifest from a depot manifest, suitable for
+    /// SteamClient. This maps protocol-level [`ProtoDepotManifest`] entries
+    /// into a high-level [`DepotManifest`] that the installer can consume.
+    pub fn create_install_manifest(
+        &self,
+        app_id: u32,
+        game_name: &str,
+        install_dir: &str,
+        launch_exe: &str,
+        depot_manifests: &[ProtoDepotManifest],
+        downloaded_files: &BTreeMap<String, Vec<u8>>,
+    ) -> DepotManifest {
+        DepotManifest {
+            app_id,
+            game_name: game_name.to_string(),
+            install_dir: install_dir.to_string(),
+            launch_exe: launch_exe.to_string(),
+            library_root: None,
+            prerequisites: Vec::new(),
+            files: downloaded_files.clone(),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // HTTP helpers
+    // -----------------------------------------------------------------------
+
+    /// Perform an HTTP GET request with retry and exponential backoff.
+    fn http_get_with_retry(&mut self, url: &str, max_retries: u32) -> AppResult<SimpleHttpResponse> {
+        let mut last_error = None;
+
+        for attempt in 0..=max_retries {
+            match self.network.http_get(url) {
+                Ok(response) => return Ok(response),
+                Err(e) => {
+                    last_error = Some(e);
+                    if attempt < max_retries {
+                        let delay = Duration::from_millis(RETRY_BASE_DELAY_MS * (1u64 << attempt));
+                        std::thread::sleep(delay);
+                    }
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| {
+            AppError::new(ReasonCode::RcIo, format!("HTTP GET failed after {max_retries} retries: {url}"))
+        }))
+    }
+}
+
+impl Default for ContentManager {
+    fn default() -> Self {
+        Self::new(NetworkStack::new())
+    }
 }
 
 #[cfg(test)]

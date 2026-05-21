@@ -1,13 +1,111 @@
 use crate::error::{AppError, AppResult};
 use crate::reason::ReasonCode;
+use crate::real_hid::{HostController, HidMonitor};
 use crate::util;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
+// ── Window style constants ──────────────────────────────────────────────
+pub const WS_OVERLAPPED: u32 = 0x0000_0000;
+pub const WS_POPUP: u32 = 0x8000_0000;
+pub const WS_CHILD: u32 = 0x4000_0000;
+pub const WS_MINIMIZE: u32 = 0x2000_0000;
+pub const WS_VISIBLE: u32 = 0x1000_0000;
+pub const WS_DISABLED: u32 = 0x0800_0000;
+pub const WS_CLIPSIBLINGS: u32 = 0x0400_0000;
+pub const WS_CLIPCHILDREN: u32 = 0x0200_0000;
+pub const WS_MAXIMIZE: u32 = 0x0100_0000;
+pub const WS_CAPTION: u32 = 0x00C0_0000;
+pub const WS_BORDER: u32 = 0x0080_0000;
+pub const WS_DLGFRAME: u32 = 0x0040_0000;
+pub const WS_VSCROLL: u32 = 0x0020_0000;
+pub const WS_HSCROLL: u32 = 0x0010_0000;
+pub const WS_SYSMENU: u32 = 0x0008_0000;
+pub const WS_THICKFRAME: u32 = 0x0004_0000;
+pub const WS_GROUP: u32 = 0x0002_0000;
+pub const WS_TABSTOP: u32 = 0x0001_0000;
+pub const WS_MINIMIZEBOX: u32 = 0x0002_0000;
+pub const WS_MAXIMIZEBOX: u32 = 0x0001_0000;
+
+// ── Extended window style constants ────────────────────────────────────
+pub const WS_EX_DLGMODALFRAME: u32 = 0x0000_0001;
+pub const WS_EX_NOPARENTNOTIFY: u32 = 0x0000_0004;
+pub const WS_EX_TOPMOST: u32 = 0x0000_0008;
+pub const WS_EX_ACCEPTFILES: u32 = 0x0000_0010;
+pub const WS_EX_TRANSPARENT: u32 = 0x0000_0020;
+pub const WS_EX_MDICHILD: u32 = 0x0000_0040;
+pub const WS_EX_TOOLWINDOW: u32 = 0x0000_0080;
+pub const WS_EX_WINDOWEDGE: u32 = 0x0000_0100;
+pub const WS_EX_CLIENTEDGE: u32 = 0x0000_0200;
+pub const WS_EX_OVERLAPPEDWINDOW: u32 = 0x0000_0300;
+pub const WS_EX_CONTEXTHELP: u32 = 0x0000_0400;
+pub const WS_EX_RIGHT: u32 = 0x0000_1000;
+pub const WS_EX_LEFT: u32 = 0x0000_0000;
+pub const WS_EX_RTLREADING: u32 = 0x0000_2000;
+pub const WS_EX_LEFTSCROLLBAR: u32 = 0x0000_4000;
+pub const WS_EX_CONTROLPARENT: u32 = 0x0001_0000;
+pub const WS_EX_STATICEDGE: u32 = 0x0002_0000;
+pub const WS_EX_APPWINDOW: u32 = 0x0004_0000;
+pub const WS_EX_LAYERED: u32 = 0x0008_0000;
+pub const WS_EX_NOINHERITLAYOUT: u32 = 0x0010_0000;
+pub const WS_EX_NOREDIRECTIONBITMAP: u32 = 0x0020_0000;
+pub const WS_EX_LAYOUTRTL: u32 = 0x0040_0000;
+pub const WS_EX_COMPOSITED: u32 = 0x0200_0000;
+pub const WS_EX_NOACTIVATE: u32 = 0x0800_0000;
+
+// ── GW_* constants for GetWindow ────────────────────────────────────────
+pub const GW_HWNDNEXT: u32 = 2;
+pub const GW_HWNDPREV: u32 = 3;
+pub const GW_OWNER: u32 = 4;
+pub const GW_CHILD: u32 = 5;
+pub const GW_ENABLEDPOPUP: u32 = 6;
+pub const GW_MAX: u32 = 6;
+
+// ── SWP flags for SetWindowPos ──────────────────────────────────────────
+pub const SWP_NOSIZE: u32 = 0x0001;
+pub const SWP_NOMOVE: u32 = 0x0002;
+pub const SWP_NOZORDER: u32 = 0x0004;
+pub const SWP_NOREDRAW: u32 = 0x0008;
+pub const SWP_NOACTIVATE: u32 = 0x0010;
+pub const SWP_FRAMECHANGED: u32 = 0x0020;
+pub const SWP_SHOWWINDOW: u32 = 0x0040;
+pub const SWP_HIDEWINDOW: u32 = 0x0080;
+pub const SWP_NOCOPYBITS: u32 = 0x0100;
+pub const SWP_NOOWNERZORDER: u32 = 0x0200;
+pub const SWP_NOSENDCHANGING: u32 = 0x0400;
+pub const SWP_DRAWFRAME: u32 = SWP_FRAMECHANGED;
+pub const SWP_NOREPOSITION: u32 = SWP_NOOWNERZORDER;
+pub const SWP_DEFERERASE: u32 = 0x2000;
+pub const SWP_ASYNCWINDOWPOS: u32 = 0x4000;
+
+// ── Special HWND values for SetWindowPos insert_after ───────────────────
+pub const HWND_TOP: u32 = 0;
+pub const HWND_BOTTOM: u32 = 1;
+pub const HWND_TOPMOST: u32 = !0u32;  // -1 as u32
+pub const HWND_NOTOPMOST: u32 = !1u32; // -2 as u32
+
+// ── Tray icon / Shell_NotifyIcon constants ──────────────────────────────
+pub const NIM_ADD: u32 = 0;
+pub const NIM_MODIFY: u32 = 1;
+pub const NIM_DELETE: u32 = 2;
+pub const NIF_MESSAGE: u32 = 0x0001;
+pub const NIF_ICON: u32 = 0x0002;
+pub const NIF_TIP: u32 = 0x0004;
+pub const NIF_STATE: u32 = 0x0008;
+pub const NIF_INFO: u32 = 0x0010;
+pub const NIF_GUID: u32 = 0x0020;
+pub const NIF_REALTIME: u32 = 0x0040;
+pub const NIF_SHOWTIP: u32 = 0x0080;
+
+// ── NOTIFYICONDATAW structure version constants ─────────────────────────
+pub const NOTIFYICON_VERSION: u32 = 3;
+pub const NOTIFYICON_VERSION_4: u32 = 4;
 
 pub type Atom = u16;
 pub type Hwnd = u32;
 
 pub const GWL_WNDPROC: i32 = -4;
+pub const GWL_HWNDPARENT: i32 = -8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WindowClassInfo {
@@ -46,12 +144,14 @@ impl Rect {
 pub enum MessageKind {
     NcCreate,
     Create,
+    Paint,
     ShowWindow,
     WindowPosChanging,
     Size,
     Activate,
     SetFocus,
     KillFocus,
+    Command,
     Input,
     KeyDown,
     KeyUp,
@@ -59,6 +159,8 @@ pub enum MessageKind {
     DeadChar,
     RawInput,
     MouseMove,
+    LButtonDown,
+    LButtonUp,
     MouseWheel,
     MouseHWheel,
     XButtonDown,
@@ -66,6 +168,7 @@ pub enum MessageKind {
     Destroy,
     NcDestroy,
     Quit,
+    Other(u32),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -211,6 +314,14 @@ pub struct MousePacket {
     pub wheel_delta: i32,
     pub hwheel_delta: i32,
     pub buttons: Vec<MouseButtonEvent>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WindowPlacement {
+    pub show_cmd: u32,
+    pub pt_min_position: (i32, i32),
+    pub pt_max_position: (i32, i32),
+    pub rc_normal_position: Rect,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -361,6 +472,15 @@ pub struct ForceFeedbackPlan {
     pub duration_ms: u32,
 }
 
+/// Registration entry for raw input devices.
+#[derive(Debug, Clone)]
+pub struct RawInputRegistration {
+    pub usage_page: u16,
+    pub usage: u16,
+    pub flags: u32,
+    pub target_hwnd: Option<Hwnd>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WindowState {
     pub hwnd: Hwnd,
@@ -372,6 +492,21 @@ pub struct WindowState {
     pub fullscreen: FullscreenState,
     pub monitor_id: u32,
     pub dpi: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WindowPreview {
+    pub hwnd: Hwnd,
+    pub parent: Option<Hwnd>,
+    pub class_name: String,
+    pub title: String,
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+    pub visible: bool,
+    pub enabled: bool,
+    pub control_id: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -386,16 +521,30 @@ struct WindowClass {
 struct WindowRecord {
     hwnd: Hwnd,
     parent: Option<Hwnd>,
+    owner: Option<Hwnd>,
     class_name: String,
     title: String,
+    x: i32,
+    y: i32,
     width: u32,
     height: u32,
     visible: bool,
     enabled: bool,
+    style: u32,
+    ex_style: u32,
+    control_id: u32,
     fullscreen: FullscreenState,
     monitor_id: u32,
     dpi: u32,
     destroyed: bool,
+    /// Layered window alpha (0–255), set by SetLayeredWindowAttributes
+    alpha: u8,
+    /// Layered window flags (LWA_ALPHA, LWA_COLORKEY), set by SetLayeredWindowAttributes
+    layered_flags: u32,
+    /// Window region handle set by SetWindowRgn
+    region_handle: u32,
+    /// Window placement cached for GetWindowPlacement/SetWindowPlacement
+    placement: WindowPlacement,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -432,6 +581,7 @@ pub struct User32Subsystem {
     dialog_results: BTreeMap<Hwnd, i64>,
     window_longs: BTreeMap<(Hwnd, i32), u64>,
     message_queue: VecDeque<Message>,
+    thread_message_queues: BTreeMap<u32, VecDeque<Message>>,
     message_log: Vec<Message>,
     capture: Option<Hwnd>,
     foreground: Option<Hwnd>,
@@ -448,6 +598,34 @@ pub struct User32Subsystem {
     next_sequence: u64,
     input_queue_capacity: usize,
     fullscreen_shims: BTreeSet<String>,
+    /// Active tray icon IDs managed by Shell_NotifyIconW
+    pub tray_icon_ids: BTreeSet<u32>,
+    /// Z-order tracking — windows in front-to-back order
+    z_order: Vec<Hwnd>,
+    /// CEF browser handle associated with each HWND (if any)
+    pub cef_browser_handles: BTreeMap<Hwnd, u64>,
+    /// Per-UID tray icon callback data: uid → (hwnd, callback_message)
+    pub tray_icon_callbacks: BTreeMap<u32, (u32, u32)>,
+    /// Registered raw input devices
+    raw_input_devices: Vec<RawInputRegistration>,
+    /// HID monitor for game controller hotplug detection (Phase 5.3.2).
+    hid_monitor: HidMonitor,
+}
+
+/// Per-icon data extracted from NOTIFYICONDATAW.
+#[derive(Debug, Clone, Copy)]
+pub struct TrayIconEntry {
+    pub hwnd: u32,
+    pub uid: u32,
+    pub callback_message: u32,
+}
+
+/// Manages macOS system tray (NSStatusItem) equivalents for Win32 tray icons.
+/// Each tray icon is mapped to a menu-bar status item on macOS.
+#[derive(Debug, Clone, Default)]
+pub struct TrayIconManager {
+    /// Maps Win32 tray UID → per-icon data
+    pub items: BTreeMap<u32, TrayIconEntry>,
 }
 
 impl Default for User32Subsystem {
@@ -506,6 +684,7 @@ impl User32Subsystem {
             dialog_results: BTreeMap::new(),
             window_longs: BTreeMap::new(),
             message_queue: VecDeque::new(),
+            thread_message_queues: BTreeMap::new(),
             message_log: Vec::new(),
             capture: None,
             foreground: None,
@@ -522,6 +701,12 @@ impl User32Subsystem {
             next_sequence: 1,
             input_queue_capacity: 8192,
             fullscreen_shims: BTreeSet::new(),
+            tray_icon_ids: BTreeSet::new(),
+            tray_icon_callbacks: BTreeMap::new(),
+            z_order: Vec::new(),
+            cef_browser_handles: BTreeMap::new(),
+            raw_input_devices: Vec::new(),
+            hid_monitor: HidMonitor::new(),
         }
     }
 
@@ -610,6 +795,23 @@ impl User32Subsystem {
         parent: Option<Hwnd>,
         monitor_id: u32,
     ) -> AppResult<Hwnd> {
+        self.create_window_ex_styled(class_name, title, width, height, visible, requested_exclusive_fullscreen, parent, monitor_id, 0, 0, None)
+    }
+
+    pub fn create_window_ex_styled(
+        &mut self,
+        class_name: &str,
+        title: &str,
+        width: u32,
+        height: u32,
+        visible: bool,
+        requested_exclusive_fullscreen: bool,
+        parent: Option<Hwnd>,
+        monitor_id: u32,
+        style: u32,
+        ex_style: u32,
+        owner: Option<Hwnd>,
+    ) -> AppResult<Hwnd> {
         let atom = self.ensure_class_available(class_name).ok_or_else(|| {
             AppError::new(ReasonCode::RcCliInvalid, format!("unregistered class {class_name}"))
         })?;
@@ -624,21 +826,55 @@ impl User32Subsystem {
             WindowRecord {
                 hwnd,
                 parent,
+                owner,
                 class_name: class_name.to_string(),
                 title: title.to_string(),
+                x: 0,
+                y: 0,
                 width,
                 height,
                 visible,
                 enabled: true,
+                style,
+                ex_style,
+                control_id: 0,
                 fullscreen,
                 monitor_id,
                 dpi,
                 destroyed: false,
+                alpha: 255,
+                layered_flags: 0,
+                region_handle: 0,
+                placement: WindowPlacement {
+                    show_cmd: if visible { 1 } else { 0 },
+                    pt_min_position: (-1, -1),
+                    pt_max_position: (-1, -1),
+                    rc_normal_position: Rect {
+                        left: 0,
+                        top: 0,
+                        right: width as i32,
+                        bottom: height as i32,
+                    },
+                },
             },
         );
+        // Add to z-order: topmost layered windows go at the front
+        if ex_style & WS_EX_TOPMOST != 0 {
+            self.z_order.insert(0, hwnd);
+        } else {
+            self.z_order.push(hwnd);
+        }
         if let Some(class_info) = class_info {
             if class_info.wnd_proc != 0 {
                 self.window_longs.insert((hwnd, GWL_WNDPROC), class_info.wnd_proc);
+            }
+        }
+        // Associate owner window
+        if let Some(owner_hwnd) = owner {
+            if !self.windows.contains_key(&owner_hwnd) {
+                if let Some(window) = self.windows.get_mut(&hwnd) {
+                    window.owner = None;
+                }
             }
         }
         self.enqueue(Message {
@@ -772,6 +1008,32 @@ impl User32Subsystem {
         self.window(hwnd).map(|window| window.enabled).unwrap_or(false)
     }
 
+    // ── Parent / Child relationship management ─────────────────────────────
+
+    /// Get the parent HWND of a window (if any). Returns 0 if no parent.
+    pub fn get_parent(&self, hwnd: Hwnd) -> Hwnd {
+        self.windows
+            .get(&hwnd)
+            .and_then(|w| w.parent)
+            .unwrap_or(0)
+    }
+
+    /// Set the parent HWND of a window. Updates the internal parent field.
+    /// Returns the previous parent HWND (0 if none).
+    pub fn set_parent(&mut self, hwnd: Hwnd, parent_hwnd: Hwnd) -> AppResult<Hwnd> {
+        // Validate parent window exists BEFORE the mutable borrow.
+        if parent_hwnd != 0 && !self.windows.contains_key(&parent_hwnd) {
+            return Err(AppError::new(
+                ReasonCode::RcCliInvalid,
+                format!("set_parent: unknown parent window {parent_hwnd:#x}"),
+            ));
+        }
+        let window = self.window_mut(hwnd)?;
+        let previous = window.parent;
+        window.parent = if parent_hwnd == 0 { None } else { Some(parent_hwnd) };
+        Ok(previous.unwrap_or(0))
+    }
+
     pub fn set_window_text_w(&mut self, hwnd: Hwnd, title: &str) -> bool {
         let Some(window) = self.windows.get_mut(&hwnd) else {
             return false;
@@ -814,9 +1076,12 @@ impl User32Subsystem {
         if self.capture == Some(hwnd) {
             self.capture = None;
         }
+        // Clean up CEF browser association
+        self.cef_browser_handles.remove(&hwnd);
         if let Some(window) = self.windows.get_mut(&hwnd) {
             window.destroyed = true;
         }
+        self.z_order.retain(|h| *h != hwnd);
         self.enqueue(Message {
             hwnd: Some(hwnd),
             kind: MessageKind::Destroy,
@@ -837,9 +1102,33 @@ impl User32Subsystem {
     }
 
     pub fn def_window_proc_w(&mut self, message: &Message) -> AppResult<i64> {
-        if let Some(hwnd) = message.hwnd {
-            if self.windows.contains_key(&hwnd) {
-                let _ = self.window(hwnd)?;
+        if let Some(hwnd) = message.hwnd.filter(|hwnd| self.windows.contains_key(hwnd)) {
+            let window = self.window(hwnd)?.clone();
+            match message.kind {
+                MessageKind::LButtonDown => {
+                    let _ = self.set_focus(hwnd)?;
+                    self.capture = Some(hwnd);
+                }
+                MessageKind::LButtonUp => {
+                    if self.capture == Some(hwnd) {
+                        self.capture = None;
+                    }
+                    if window.enabled && window.class_name.eq_ignore_ascii_case("button") {
+                        if let Some(parent) = window.parent {
+                            self.enqueue(Message {
+                                hwnd: Some(parent),
+                                kind: MessageKind::Command,
+                                wparam: i64::from(window.control_id),
+                                lparam: i64::from(window.hwnd),
+                                translated: false,
+                                device_id: message.device_id.clone(),
+                            })?;
+                        }
+                    }
+                }
+                _ => {
+                    let _ = self.window(hwnd)?;
+                }
             }
         }
         Ok(0)
@@ -847,6 +1136,44 @@ impl User32Subsystem {
 
     pub fn has_window(&self, hwnd: Hwnd) -> bool {
         self.windows.contains_key(&hwnd)
+    }
+
+    pub fn set_layered_window_attributes(&mut self, hwnd: Hwnd, alpha: u8, flags: u32) -> AppResult<()> {
+        let window = self.window_mut(hwnd)?;
+        window.alpha = alpha;
+        window.layered_flags = flags;
+        Ok(())
+    }
+
+    pub fn layered_window_attributes(&self, hwnd: Hwnd) -> AppResult<(u8, u32)> {
+        let window = self.window(hwnd)?;
+        Ok((window.alpha, window.layered_flags))
+    }
+
+    pub fn set_window_region(&mut self, hwnd: Hwnd, region_handle: u32) -> AppResult<()> {
+        let window = self.window_mut(hwnd)?;
+        window.region_handle = region_handle;
+        Ok(())
+    }
+
+    pub fn set_window_placement(&mut self, hwnd: Hwnd, placement: WindowPlacement) -> AppResult<()> {
+        let window = self.window_mut(hwnd)?;
+        window.placement = placement;
+        Ok(())
+    }
+
+    pub fn get_window_placement(&self, hwnd: Hwnd) -> AppResult<WindowPlacement> {
+        let window = self.window(hwnd)?;
+        Ok(window.placement)
+    }
+
+    pub fn dpi_for_window(&self, hwnd: Hwnd) -> AppResult<u32> {
+        let window = self.window(hwnd)?;
+        Ok(window.dpi)
+    }
+
+    pub fn trigger_repaint(&mut self, hwnd: Hwnd) -> AppResult<()> {
+        self.queue_paint(hwnd)
     }
 
     pub fn find_window_ex_w(
@@ -910,16 +1237,36 @@ impl User32Subsystem {
             WindowRecord {
                 hwnd,
                 parent: Some(parent),
+                owner: None,
                 class_name: "static".to_string(),
                 title: format!("dlg-item-{item_id}"),
+                x: 0,
+                y: 0,
                 width: 1,
                 height: 1,
                 visible: true,
                 enabled: true,
+                style: 0,
+                ex_style: 0,
+                control_id: item_id as u32,
                 fullscreen: parent_window.fullscreen,
                 monitor_id: parent_window.monitor_id,
                 dpi: parent_window.dpi,
                 destroyed: false,
+                alpha: 255,
+                layered_flags: 0,
+                region_handle: 0,
+                placement: WindowPlacement {
+                    show_cmd: 1,
+                    pt_min_position: (-1, -1),
+                    pt_max_position: (-1, -1),
+                    rc_normal_position: Rect {
+                        left: 0,
+                        top: 0,
+                        right: 1,
+                        bottom: 1,
+                    },
+                },
             },
         );
         self.dialog_items.insert((parent, item_id), hwnd);
@@ -942,12 +1289,23 @@ impl User32Subsystem {
         if !self.windows.contains_key(&hwnd) {
             return None;
         }
+        // GWL_HWNDPARENT (-8): delegate to set_parent so the window hierarchy stays
+        // consistent with the parent field in WindowRecord.
+        if index == GWL_HWNDPARENT {
+            let previous = self.get_parent(hwnd);
+            let _ = self.set_parent(hwnd, value as Hwnd);
+            return Some(previous as u64);
+        }
         Some(self.window_longs.insert((hwnd, index), value).unwrap_or(0))
     }
 
     pub fn get_window_long_w(&self, hwnd: Hwnd, index: i32) -> Option<u64> {
         if !self.windows.contains_key(&hwnd) {
             return None;
+        }
+        // GWL_HWNDPARENT (-8): return the current parent HWND from the window record.
+        if index == GWL_HWNDPARENT {
+            return Some(self.get_parent(hwnd) as u64);
         }
         Some(*self.window_longs.get(&(hwnd, index)).unwrap_or(&0))
     }
@@ -968,6 +1326,28 @@ impl User32Subsystem {
             translated: false,
             device_id: None,
         })
+    }
+
+    pub fn invalidate_window(&mut self, hwnd: Option<Hwnd>, _erase: bool) -> AppResult<bool> {
+        match hwnd {
+            Some(hwnd) => {
+                if !self.has_window(hwnd) {
+                    return Ok(false);
+                }
+                self.queue_paint(hwnd)?;
+            }
+            None => {
+                let hwnds = self
+                    .windows
+                    .iter()
+                    .filter_map(|(hwnd, window)| (!window.destroyed && window.visible).then_some(*hwnd))
+                    .collect::<Vec<_>>();
+                for hwnd in hwnds {
+                    self.queue_paint(hwnd)?;
+                }
+            }
+        }
+        Ok(true)
     }
 
     pub fn send_message_w(
@@ -1000,7 +1380,44 @@ impl User32Subsystem {
         })
     }
 
+    pub fn post_thread_message_w(
+        &mut self,
+        thread_id: u32,
+        kind: MessageKind,
+        wparam: i64,
+        lparam: i64,
+    ) -> AppResult<()> {
+        self.enqueue_thread_message(
+            thread_id,
+            Message {
+                hwnd: None,
+                kind,
+                wparam,
+                lparam,
+                translated: false,
+                device_id: None,
+            },
+        )
+    }
+
     pub fn peek_message_w(&mut self, remove: bool) -> Option<Message> {
+        self.peek_message_for_thread(1, remove)
+    }
+
+    pub fn peek_message_for_thread(&mut self, thread_id: u32, remove: bool) -> Option<Message> {
+        if let Some(message) = self
+            .thread_message_queues
+            .get(&thread_id)
+            .and_then(|queue| queue.front())
+            .cloned()
+        {
+            if remove {
+                if let Some(queue) = self.thread_message_queues.get_mut(&thread_id) {
+                    queue.pop_front();
+                }
+            }
+            return Some(message);
+        }
         let message = self.message_queue.front()?.clone();
         if remove {
             self.message_queue.pop_front();
@@ -1009,6 +1426,15 @@ impl User32Subsystem {
     }
 
     pub fn get_message_w(&mut self) -> Option<Message> {
+        self.get_message_for_thread(1)
+    }
+
+    pub fn get_message_for_thread(&mut self, thread_id: u32) -> Option<Message> {
+        if let Some(queue) = self.thread_message_queues.get_mut(&thread_id) {
+            if let Some(message) = queue.pop_front() {
+                return Some(message);
+            }
+        }
         self.message_queue.pop_front()
     }
 
@@ -1060,6 +1486,8 @@ impl User32Subsystem {
         if message.kind == MessageKind::NcDestroy {
             if let Some(hwnd) = message.hwnd {
                 self.windows.remove(&hwnd);
+                self.z_order.retain(|h| *h != hwnd);
+                self.cef_browser_handles.remove(&hwnd);
             }
         }
         Ok(result)
@@ -1100,6 +1528,258 @@ impl User32Subsystem {
 
     pub fn set_cursor_pos(&mut self, x: i32, y: i32) {
         self.cursor_pos = self.confine_cursor(x, y);
+    }
+
+    pub fn set_window_position(&mut self, hwnd: Hwnd, x: i32, y: i32) -> AppResult<()> {
+        let window = self.window_mut(hwnd)?;
+        window.x = x;
+        window.y = y;
+        Ok(())
+    }
+
+    pub fn set_window_control_id(&mut self, hwnd: Hwnd, control_id: u32) -> AppResult<()> {
+        self.window_mut(hwnd)?.control_id = control_id;
+        Ok(())
+    }
+
+    // ── Style / Extended Style accessors ──────────────────────────────────────
+
+    pub fn get_window_style(&self, hwnd: Hwnd) -> Option<u32> {
+        self.windows.get(&hwnd).map(|w| w.style)
+    }
+
+    pub fn set_window_style(&mut self, hwnd: Hwnd, style: u32) -> AppResult<()> {
+        self.window_mut(hwnd)?.style = style;
+        Ok(())
+    }
+
+    pub fn get_window_ex_style(&self, hwnd: Hwnd) -> Option<u32> {
+        self.windows.get(&hwnd).map(|w| w.ex_style)
+    }
+
+    pub fn set_window_ex_style(&mut self, hwnd: Hwnd, ex_style: u32) -> AppResult<()> {
+        self.window_mut(hwnd)?.ex_style = ex_style;
+        Ok(())
+    }
+
+    // ── CEF Browser Association ──────────────────────────────────────────────
+
+    /// Associate a CEF browser handle with an HWND so that WM_PAINT dispatch
+    /// can submit the correct WKWebView frame to the Metal compositor.
+    pub fn associate_cef_browser(&mut self, hwnd: Hwnd, cef_handle: u64) -> AppResult<()> {
+        self.window(hwnd)?;
+        self.cef_browser_handles.insert(hwnd, cef_handle);
+        Ok(())
+    }
+
+    /// Look up the CEF browser handle (if any) previously associated with `hwnd`.
+    pub fn cef_browser_for_window(&self, hwnd: Hwnd) -> Option<u64> {
+        self.cef_browser_handles.get(&hwnd).copied()
+    }
+
+    // ── Z-Order Management ────────────────────────────────────────────────────
+
+    /// Rebuild the z-order list from scratch based on window creation order
+    /// (front-to-back: last created is on top, except topmost windows first).
+    fn rebuild_z_order(&mut self) {
+        let mut topmost: Vec<Hwnd> = Vec::new();
+        let mut normal: Vec<Hwnd> = Vec::new();
+        let mut hwnds: Vec<Hwnd> = self.windows.keys().copied().filter(|h| !self.windows[h].destroyed).collect();
+        hwnds.sort();
+        for hwnd in hwnds {
+            if let Some(w) = self.windows.get(&hwnd) {
+                if w.ex_style & WS_EX_TOPMOST != 0 {
+                    topmost.push(hwnd);
+                } else {
+                    normal.push(hwnd);
+                }
+            }
+        }
+        topmost.extend(normal);
+        self.z_order = topmost;
+    }
+
+    /// Bring a window to the top of the z-order.
+    pub fn bring_window_to_top(&mut self, hwnd: Hwnd) -> AppResult<()> {
+        self.window(hwnd)?;
+        self.z_order.retain(|h| *h != hwnd);
+        self.z_order.insert(0, hwnd);
+        // If the window has an owner, bring the owner to top too
+        if let Some(owner) = self.windows.get(&hwnd).and_then(|w| w.owner) {
+            self.z_order.retain(|h| *h != owner);
+            self.z_order.insert(0, owner);
+        }
+        self.foreground = Some(hwnd);
+        Ok(())
+    }
+
+    /// Get the topmost (front-most) window in the z-order.
+    pub fn get_top_window(&self, hwnd: Option<Hwnd>) -> Option<Hwnd> {
+        if let Some(parent) = hwnd {
+            // Return topmost child of parent
+            self.z_order.iter().copied().find(|h| {
+                self.windows.get(h).map_or(false, |w| w.parent == Some(parent) && !w.destroyed)
+            })
+        } else {
+            self.z_order.first().copied().filter(|h| !self.windows[h].destroyed)
+        }
+    }
+
+    /// Get the next/previous window in the z-order (GW_HWNDNEXT / GW_HWNDPREV).
+    pub fn get_next_window(&self, hwnd: Hwnd, direction: u32) -> Option<Hwnd> {
+        let pos = self.z_order.iter().position(|h| *h == hwnd)?;
+        match direction {
+            GW_HWNDNEXT => {
+                // GW_HWNDNEXT (2): window below in z-order
+                self.z_order.get(pos + 1).copied().filter(|h| !self.windows[h].destroyed)
+            }
+            GW_HWNDPREV => {
+                // GW_HWNDPREV (3): window above in z-order
+                if pos > 0 {
+                    self.z_order.get(pos - 1).copied().filter(|h| !self.windows[h].destroyed)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Get a related window by relationship (GW_CHILD, GW_OWNER, GW_HWNDNEXT, GW_HWNDPREV).
+    pub fn get_window(&self, hwnd: Hwnd, cmd: u32) -> Option<Hwnd> {
+        match cmd {
+            GW_CHILD => {
+                // Return the topmost child window
+                self.z_order.iter().copied().find(|h| {
+                    self.windows.get(h).map_or(false, |w| w.parent == Some(hwnd) && !w.destroyed)
+                })
+            }
+            GW_OWNER => {
+                self.windows.get(&hwnd).and_then(|w| w.owner).filter(|h| !self.windows[h].destroyed)
+            }
+            GW_HWNDNEXT | GW_HWNDPREV => self.get_next_window(hwnd, cmd),
+            GW_ENABLEDPOPUP => {
+                // Return the topmost enabled popup owned by hwnd
+                self.z_order.iter().copied().find(|h| {
+                    self.windows.get(h).map_or(false, |w| {
+                        !w.destroyed && w.enabled && w.owner == Some(hwnd) && w.style & WS_POPUP != 0
+                    })
+                })
+            }
+            _ => None,
+        }
+    }
+
+    // ── SetWindowPos with full z-order support ────────────────────────────────
+
+    pub fn set_window_pos(
+        &mut self,
+        hwnd: Hwnd,
+        insert_after: u32,
+        x: i32,
+        y: i32,
+        cx: i32,
+        cy: i32,
+        flags: u32,
+    ) -> AppResult<bool> {
+        if !self.has_window(hwnd) {
+            return Ok(false);
+        }
+        if flags & SWP_NOMOVE == 0 {
+            if let Ok(window) = self.window_mut(hwnd) {
+                window.x = x;
+                window.y = y;
+            }
+        }
+        if flags & SWP_NOSIZE == 0 && cx > 0 && cy > 0 {
+            self.resize_window(hwnd, cx as u32, cy as u32)?;
+        }
+        if flags & SWP_SHOWWINDOW != 0 {
+            let _ = self.show_window(hwnd, 1)?;
+        }
+        if flags & SWP_HIDEWINDOW != 0 {
+            let _ = self.show_window(hwnd, 0)?;
+        }
+        // Z-order management
+        if flags & SWP_NOZORDER == 0 {
+            match insert_after {
+                HWND_TOP => {
+                    self.bring_window_to_top(hwnd)?;
+                }
+                HWND_BOTTOM => {
+                    self.z_order.retain(|h| *h != hwnd);
+                    self.z_order.push(hwnd);
+                }
+                HWND_TOPMOST => {
+                    // Make the window topmost and bring to front
+                    if let Ok(window) = self.window_mut(hwnd) {
+                        window.ex_style |= WS_EX_TOPMOST;
+                    }
+                    self.bring_window_to_top(hwnd)?;
+                }
+                HWND_NOTOPMOST => {
+                    // Remove topmost style
+                    if let Ok(window) = self.window_mut(hwnd) {
+                        window.ex_style &= !WS_EX_TOPMOST;
+                    }
+                    self.rebuild_z_order();
+                }
+                other_hwnd => {
+                    // Place after the given window in z-order
+                    if self.has_window(other_hwnd) {
+                        self.z_order.retain(|h| *h == hwnd || *h != other_hwnd);
+                        if let Some(pos) = self.z_order.iter().position(|h| *h == other_hwnd) {
+                            self.z_order.insert(pos + 1, hwnd);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    // ── Window text management ────────────────────────────────────────────────
+
+    pub fn get_window_text_w(&self, hwnd: Hwnd) -> Option<String> {
+        self.windows.get(&hwnd).map(|w| w.title.clone())
+    }
+
+    pub fn get_window_text_length_w(&self, hwnd: Hwnd) -> Option<i32> {
+        self.windows.get(&hwnd).map(|w| w.title.len() as i32)
+    }
+
+    // ── Update rectangle management ───────────────────────────────────────────
+
+    /// Simulate GetUpdateRect — reports whether the window has a pending paint.
+    /// Returns (has_update, rect) where rect is the client area.
+    pub fn get_update_rect(&self, hwnd: Hwnd) -> AppResult<(bool, Rect)> {
+        let window = self.window(hwnd)?;
+        let has_paint = self.message_queue.iter().any(|m| {
+            m.hwnd == Some(hwnd) && m.kind == MessageKind::Paint
+        });
+        let rect = Rect {
+            left: 0,
+            top: 0,
+            right: window.width as i32,
+            bottom: window.height as i32,
+        };
+        Ok((has_paint, rect))
+    }
+
+    /// ValidateRect — removes pending paint messages for the window.
+    pub fn validate_rect(&mut self, hwnd: Hwnd) -> AppResult<()> {
+        self.window(hwnd)?;
+        self.message_queue.retain(|m| !(m.hwnd == Some(hwnd) && m.kind == MessageKind::Paint));
+        Ok(())
+    }
+
+    /// InvalidateRgn — queues a paint for the window (simplified: ignores region).
+    pub fn invalidate_rgn(&mut self, hwnd: Hwnd) -> AppResult<bool> {
+        if !self.has_window(hwnd) {
+            return Ok(false);
+        }
+        self.queue_paint(hwnd)?;
+        Ok(true)
     }
 
     pub fn get_cursor_pos(&self) -> (i32, i32) {
@@ -1164,6 +1844,28 @@ impl User32Subsystem {
     pub fn get_dpi_for_monitor(&self, monitor_id: u32) -> AppResult<(u32, u32)> {
         let monitor = self.monitor(monitor_id)?;
         Ok((monitor.dpi_x, monitor.dpi_y))
+    }
+
+    pub fn primary_monitor_id(&self) -> u32 {
+        self.monitors.keys().next().copied().unwrap_or(0)
+    }
+
+    pub fn monitor_info(&self, monitor_id: u32) -> Option<MonitorInfo> {
+        self.monitors.get(&monitor_id).cloned()
+    }
+
+    pub fn monitor_from_window(&self, hwnd: Option<Hwnd>, flags: u32) -> u32 {
+        const MONITOR_DEFAULTTOPRIMARY: u32 = 0x0000_0001;
+        const MONITOR_DEFAULTTONEAREST: u32 = 0x0000_0002;
+
+        hwnd.and_then(|handle| self.windows.get(&handle))
+            .filter(|window| !window.destroyed)
+            .map(|window| window.monitor_id)
+            .or_else(|| {
+                ((flags & (MONITOR_DEFAULTTOPRIMARY | MONITOR_DEFAULTTONEAREST)) != 0)
+                    .then(|| self.primary_monitor_id())
+            })
+            .unwrap_or(0)
     }
 
     pub fn register_keyboard_device(&mut self, device: &KeyboardDevice) -> String {
@@ -1439,20 +2141,43 @@ impl User32Subsystem {
             })?;
         }
         for button in buttons {
-            if button.pressed && matches!(button.button, MouseButton::X1 | MouseButton::X2) {
-                let wparam = match button.button {
-                    MouseButton::X1 => 1,
-                    MouseButton::X2 => 2,
-                    _ => 0,
-                };
-                self.enqueue(Message {
-                    hwnd: Some(hwnd),
-                    kind: MessageKind::XButtonDown,
-                    wparam,
-                    lparam: 0,
-                    translated: false,
-                    device_id: Some(device_id.to_string()),
-                })?;
+            match (button.button, button.pressed) {
+                (MouseButton::Left, true) => {
+                    self.enqueue(Message {
+                        hwnd: Some(hwnd),
+                        kind: MessageKind::LButtonDown,
+                        wparam: cursor_x as i64,
+                        lparam: cursor_y as i64,
+                        translated: false,
+                        device_id: Some(device_id.to_string()),
+                    })?;
+                }
+                (MouseButton::Left, false) => {
+                    self.enqueue(Message {
+                        hwnd: Some(hwnd),
+                        kind: MessageKind::LButtonUp,
+                        wparam: cursor_x as i64,
+                        lparam: cursor_y as i64,
+                        translated: false,
+                        device_id: Some(device_id.to_string()),
+                    })?;
+                }
+                (MouseButton::X1 | MouseButton::X2, true) => {
+                    let wparam = match button.button {
+                        MouseButton::X1 => 1,
+                        MouseButton::X2 => 2,
+                        _ => 0,
+                    };
+                    self.enqueue(Message {
+                        hwnd: Some(hwnd),
+                        kind: MessageKind::XButtonDown,
+                        wparam,
+                        lparam: 0,
+                        translated: false,
+                        device_id: Some(device_id.to_string()),
+                    })?;
+                }
+                _ => {}
             }
         }
         Ok(MousePacket {
@@ -1595,6 +2320,11 @@ impl User32Subsystem {
         Ok(())
     }
 
+    pub fn unacquire_device(&mut self, guid: &str) -> AppResult<()> {
+        self.controller_mut(guid)?.acquired = false;
+        Ok(())
+    }
+
     pub fn get_device_state(&self, guid: &str) -> AppResult<DirectInputState> {
         let controller = self.controller(guid)?;
         if !controller.acquired {
@@ -1701,6 +2431,72 @@ impl User32Subsystem {
         self.input_owner.as_deref()
     }
 
+    /// Register raw input devices.
+    pub fn register_raw_input_devices(&mut self, devices: &[RawInputRegistration]) -> AppResult<()> {
+        for device in devices {
+            // Replace existing registration with same (usage_page, usage, target_hwnd)
+            self.raw_input_devices.retain(|d| {
+                !(d.usage_page == device.usage_page
+                    && d.usage == device.usage
+                    && d.target_hwnd == device.target_hwnd)
+            });
+            self.raw_input_devices.push(device.clone());
+        }
+        Ok(())
+    }
+
+    /// Return the number of bytes needed for a RAWINPUT structure matching
+    /// the given command (RID_HEADER, RID_INPUT, or RID_DEVICE_INFO).
+    pub fn raw_input_data_size(&self, command: u32) -> AppResult<u32> {
+        match command {
+            // RID_HEADER → sizeof(RAWINPUTHEADER) = 24 (x64) / 20 (x86)
+            0x10000001 => Ok(24),
+            // RID_INPUT → sizeof(RAWINPUT) = 40+ for mouse/keyboard/HID
+            0x10000002 => Ok(48),
+            // RID_DEVICE_INFO → sizeof(RID_DEVICE_INFO) = 24
+            0x10000003 => Ok(24),
+            _ => Err(AppError::new(
+                crate::reason::ReasonCode::RcInputUnsupported,
+                format!("unknown raw input command {command:#x}"),
+            )),
+        }
+    }
+
+    /// Get registered raw input devices count.
+    pub fn raw_input_device_count(&self) -> u32 {
+        self.raw_input_devices.len() as u32
+    }
+
+    /// Copy registered raw input devices into the output slice, returning the
+    /// number written (or the required count if output is too small).
+    pub fn get_registered_raw_input_devices(&self, output: &mut [RawInputRegistration]) -> usize {
+        let count = output.len().min(self.raw_input_devices.len());
+        for (i, dev) in self.raw_input_devices.iter().enumerate().take(count) {
+            output[i] = dev.clone();
+        }
+        count
+    }
+
+    /// Return the number of bytes needed for a RID_DEVICE_INFO structure for
+    /// the given device handle (or the default size if unknown).
+    pub fn raw_input_device_info_size(&self, _handle: u64, command: u32) -> AppResult<u32> {
+        match command {
+            // RIDI_DEVICENAME → wide-char string length in bytes
+            0x20000001 => {
+                // Return size of "\\??\\HID#default#col01" (approx 28 wide chars = 56 bytes)
+                Ok(56)
+            }
+            // RIDI_DEVICEINFO → sizeof(RID_DEVICE_INFO) = 24
+            0x20000002 => Ok(24),
+            // RIDI_PREPARSEDDATA → not supported
+            0x20000003 => Ok(0),
+            _ => Err(AppError::new(
+                crate::reason::ReasonCode::RcInputUnsupported,
+                format!("unknown raw input device info command {command:#x}"),
+            )),
+        }
+    }
+
     pub fn window_state(&self, hwnd: Hwnd) -> AppResult<WindowState> {
         let window = self.window(hwnd)?;
         Ok(WindowState {
@@ -1714,6 +2510,26 @@ impl User32Subsystem {
             monitor_id: window.monitor_id,
             dpi: window.dpi,
         })
+    }
+
+    pub fn window_previews(&self) -> Vec<WindowPreview> {
+        self.windows
+            .values()
+            .filter(|window| !window.destroyed)
+            .map(|window| WindowPreview {
+                hwnd: window.hwnd,
+                parent: window.parent,
+                class_name: window.class_name.clone(),
+                title: window.title.clone(),
+                x: window.x,
+                y: window.y,
+                width: window.width,
+                height: window.height,
+                visible: window.visible,
+                enabled: window.enabled,
+                control_id: window.control_id,
+            })
+            .collect()
     }
 
     fn queue_resize(&mut self, hwnd: Hwnd, width: u32, height: u32) -> AppResult<()> {
@@ -1732,11 +2548,36 @@ impl User32Subsystem {
             lparam: height as i64,
             translated: false,
             device_id: None,
+        })?;
+        self.queue_paint(hwnd)
+    }
+
+    fn queue_paint(&mut self, hwnd: Hwnd) -> AppResult<()> {
+        let Some(window) = self.windows.get(&hwnd) else {
+            return Ok(());
+        };
+        if window.destroyed || !window.visible {
+            return Ok(());
+        }
+        let already_queued = self
+            .message_queue
+            .iter()
+            .any(|message| message.hwnd == Some(hwnd) && message.kind == MessageKind::Paint);
+        if already_queued {
+            return Ok(());
+        }
+        self.enqueue(Message {
+            hwnd: Some(hwnd),
+            kind: MessageKind::Paint,
+            wparam: 0,
+            lparam: 0,
+            translated: false,
+            device_id: None,
         })
     }
 
     fn enqueue(&mut self, message: Message) -> AppResult<()> {
-        if self.message_queue.len() >= self.input_queue_capacity {
+        if self.total_queued_messages() >= self.input_queue_capacity {
             return Err(AppError::new(
                 ReasonCode::RcInputUnsupported,
                 "input queue overflow",
@@ -1744,6 +2585,29 @@ impl User32Subsystem {
         }
         self.message_queue.push_back(message);
         Ok(())
+    }
+
+    fn enqueue_thread_message(&mut self, thread_id: u32, message: Message) -> AppResult<()> {
+        if self.total_queued_messages() >= self.input_queue_capacity {
+            return Err(AppError::new(
+                ReasonCode::RcInputUnsupported,
+                "input queue overflow",
+            ));
+        }
+        self.thread_message_queues
+            .entry(thread_id)
+            .or_default()
+            .push_back(message);
+        Ok(())
+    }
+
+    fn total_queued_messages(&self) -> usize {
+        self.message_queue.len()
+            + self
+                .thread_message_queues
+                .values()
+                .map(VecDeque::len)
+                .sum::<usize>()
     }
 
     fn map_fullscreen_state(&mut self, title: &str, requested_exclusive: bool) -> FullscreenState {
@@ -1824,6 +2688,129 @@ impl User32Subsystem {
         Ok(self.controller_by_xinput_slot(slot)?.guid.clone())
     }
 
+    /// Polls for game controller hotplug events (connections/disconnections).
+    ///
+    /// Uses the macOS HID monitor to detect newly connected or disconnected
+    /// game controllers and updates the internal controller state accordingly.
+    ///
+    /// New controllers are added with a standard gamepad layout (six axes,
+    /// ten buttons) and appropriate XInput classification. Disconnected
+    /// controllers are removed from the controller map.
+    ///
+    /// This method is polling-based and should be called regularly from the
+    /// main input loop (e.g., [`poll_live_input`](crate::pe_runtime::PeHostRuntime::poll_live_input)).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying HID scan (`ioreg`) fails
+    /// critically. Temporary failures (e.g., `ioreg` not available) are
+    /// handled gracefully and return `Ok(())`.
+    pub fn poll_controller_hotplug(&mut self) -> AppResult<()> {
+        let (added, removed) = self.hid_monitor.poll_for_changes()?;
+
+        for controller in added {
+            // Build a standard ControllerSpec from the detected host controller.
+            let spec = ControllerSpec {
+                name: controller.name.clone(),
+                kind: if controller.xinput_capable {
+                    ControllerKind::Xbox
+                } else {
+                    ControllerKind::ThirdPartyXInput
+                },
+                transport: ControllerTransport::Hid,
+                vendor_id: controller.vendor_id,
+                product_id: controller.product_id,
+                serial: controller.identifier.clone(),
+                xinput_capable: controller.xinput_capable,
+                battery: BatteryInfo {
+                    level_percent: 100,
+                    wired: true,
+                },
+                axes: BTreeMap::from([
+                    (DeviceAxis::X, 0),
+                    (DeviceAxis::Y, 0),
+                    (DeviceAxis::Z, 0),
+                    (DeviceAxis::Rx, 0),
+                    (DeviceAxis::Ry, 0),
+                    (DeviceAxis::Rz, 0),
+                ]),
+                calibrations: BTreeMap::from([
+                    (
+                        DeviceAxis::X,
+                        AxisCalibration {
+                            min: -32768,
+                            center: 0,
+                            max: 32767,
+                        },
+                    ),
+                    (
+                        DeviceAxis::Y,
+                        AxisCalibration {
+                            min: -32768,
+                            center: 0,
+                            max: 32767,
+                        },
+                    ),
+                    (
+                        DeviceAxis::Z,
+                        AxisCalibration {
+                            min: -32768,
+                            center: 0,
+                            max: 32767,
+                        },
+                    ),
+                    (
+                        DeviceAxis::Rx,
+                        AxisCalibration {
+                            min: -32768,
+                            center: 0,
+                            max: 32767,
+                        },
+                    ),
+                    (
+                        DeviceAxis::Ry,
+                        AxisCalibration {
+                            min: -32768,
+                            center: 0,
+                            max: 32767,
+                        },
+                    ),
+                    (
+                        DeviceAxis::Rz,
+                        AxisCalibration {
+                            min: -32768,
+                            center: 0,
+                            max: 32767,
+                        },
+                    ),
+                ]),
+                buttons: BTreeSet::from([
+                    "A".to_string(),
+                    "B".to_string(),
+                    "X".to_string(),
+                    "Y".to_string(),
+                    "LB".to_string(),
+                    "RB".to_string(),
+                    "BACK".to_string(),
+                    "START".to_string(),
+                    "LTHUMB".to_string(),
+                    "RTHUMB".to_string(),
+                ]),
+                supported_effects: BTreeSet::new(),
+            };
+
+            // Use the existing add_controller infrastructure.
+            let target_window = self.foreground;
+            self.add_controller(target_window, spec)?;
+        }
+
+        for controller in removed {
+            self.remove_controller(self.foreground, &controller.identifier)?;
+        }
+
+        Ok(())
+    }
+
     fn reassign_xinput_slots(&mut self) {
         let mut guids = self
             .controllers
@@ -1846,7 +2833,14 @@ impl User32Subsystem {
 fn is_builtin_window_class(class_name: &str) -> bool {
     matches!(
         class_name.to_ascii_lowercase().as_str(),
-        "#32770" | "button" | "edit" | "static" | "richedit" | "riched20w" | "riched32"
+        "#32770"
+            | "button"
+            | "edit"
+            | "static"
+            | "richedit"
+            | "riched20w"
+            | "riched32"
+            | "msctls_progress32"
     )
 }
 
@@ -1864,6 +2858,110 @@ fn normalize_axis(raw: i32, calibration: AxisCalibration) -> i32 {
         -((calibration.center - raw) as i64 * 1000 / span) as i32
     };
     value.clamp(-1000, 1000)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn show_window_queues_paint_message() {
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        user32.register_class_ex_w("test-window");
+        let hwnd = user32
+            .create_window_ex_w("test-window", "title", 320, 200, false, false, None, 1)
+            .expect("create window");
+
+        assert_eq!(user32.get_message_w().expect("nc create").kind, MessageKind::NcCreate);
+        assert_eq!(user32.get_message_w().expect("create").kind, MessageKind::Create);
+
+        user32.show_window(hwnd, 1).expect("show window");
+        let kinds = std::iter::from_fn(|| user32.get_message_w().map(|message| message.kind))
+            .collect::<Vec<_>>();
+
+        assert!(kinds.contains(&MessageKind::ShowWindow));
+        assert!(kinds.contains(&MessageKind::Size));
+        assert!(kinds.contains(&MessageKind::Paint));
+    }
+
+    #[test]
+    fn invalidate_window_queues_paint_once() {
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        user32.register_class_ex_w("test-window");
+        let hwnd = user32
+            .create_window_ex_w("test-window", "title", 320, 200, true, false, None, 1)
+            .expect("create window");
+
+        let _ = std::iter::from_fn(|| user32.get_message_w()).collect::<Vec<_>>();
+
+        assert!(user32.invalidate_window(Some(hwnd), false).expect("invalidate window"));
+        assert!(user32.invalidate_window(Some(hwnd), false).expect("invalidate window"));
+
+        let kinds = std::iter::from_fn(|| user32.get_message_w().map(|message| message.kind))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            kinds.iter().filter(|kind| **kind == MessageKind::Paint).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn post_thread_message_queues_message_for_target_thread() {
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+
+        user32
+            .post_thread_message_w(7, MessageKind::Other(0x0400), 11, 22)
+            .expect("post thread message");
+
+        assert!(user32.get_message_for_thread(1).is_none());
+        let message = user32.get_message_for_thread(7).expect("target thread message");
+        assert_eq!(message.hwnd, None);
+        assert_eq!(message.kind, MessageKind::Other(0x0400));
+        assert_eq!(message.wparam, 11);
+        assert_eq!(message.lparam, 22);
+    }
+
+    #[test]
+    fn monitor_from_window_returns_window_monitor_or_primary_fallback() {
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        user32.register_class_ex_w("test-window");
+        let hwnd = user32
+            .create_window_ex_w("test-window", "title", 320, 200, false, false, None, 2)
+            .expect("create window");
+
+        assert_eq!(user32.monitor_from_window(Some(hwnd), 0), 2);
+        assert_eq!(user32.monitor_from_window(None, 0x1), 1);
+        assert_eq!(user32.monitor_from_window(Some(0xdead_beef), 0x2), 1);
+        assert_eq!(user32.monitor_from_window(None, 0), 0);
+    }
+
+    #[test]
+    fn us_layout_supports_live_session_control_keys() {
+        let user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        let modifiers = KeyModifiers {
+            shift: false,
+            altgr: false,
+        };
+
+        for (scancode, output_char) in [
+            (0x11, 'w'),
+            (0x13, 'r'),
+            (0x19, 'p'),
+            (0x1c, '\r'),
+            (0x1f, 's'),
+            (0x20, 'd'),
+            (0x2e, 'c'),
+            (0x31, 'n'),
+            (0x39, ' '),
+        ] {
+            let translation = user32
+                .translate_scancode(scancode, modifiers)
+                .unwrap_or_else(|_| panic!("missing live-session scancode {scancode:#x}"));
+            assert_eq!(translation.output_char, Some(output_char));
+            assert_eq!(translation.dead_char, None);
+        }
+    }
 }
 
 fn compose_dead_char(dead: char, base: char) -> Option<char> {
@@ -1884,8 +2982,16 @@ fn layout_tables() -> BTreeMap<KeyboardLayoutId, BTreeMap<u16, LayoutEntry>> {
             KeyboardLayoutId::Us,
             BTreeMap::from([
                 (0x10, LayoutEntry { vk: VirtualKey::Q, plain: Some('q'), shifted: Some('Q'), altgr: None, dead: None }),
+                (0x11, LayoutEntry { vk: VirtualKey::Unknown(0x57), plain: Some('w'), shifted: Some('W'), altgr: None, dead: None }),
                 (0x12, LayoutEntry { vk: VirtualKey::E, plain: Some('e'), shifted: Some('E'), altgr: None, dead: None }),
+                (0x13, LayoutEntry { vk: VirtualKey::Unknown(0x52), plain: Some('r'), shifted: Some('R'), altgr: None, dead: None }),
+                (0x19, LayoutEntry { vk: VirtualKey::Unknown(0x50), plain: Some('p'), shifted: Some('P'), altgr: None, dead: None }),
+                (0x1c, LayoutEntry { vk: VirtualKey::Unknown(0x0d), plain: Some('\r'), shifted: Some('\r'), altgr: Some('\r'), dead: None }),
                 (0x1e, LayoutEntry { vk: VirtualKey::A, plain: Some('a'), shifted: Some('A'), altgr: None, dead: None }),
+                (0x1f, LayoutEntry { vk: VirtualKey::Unknown(0x53), plain: Some('s'), shifted: Some('S'), altgr: None, dead: None }),
+                (0x20, LayoutEntry { vk: VirtualKey::Unknown(0x44), plain: Some('d'), shifted: Some('D'), altgr: None, dead: None }),
+                (0x2e, LayoutEntry { vk: VirtualKey::Unknown(0x43), plain: Some('c'), shifted: Some('C'), altgr: None, dead: None }),
+                (0x31, LayoutEntry { vk: VirtualKey::Unknown(0x4e), plain: Some('n'), shifted: Some('N'), altgr: None, dead: None }),
                 (0x39, LayoutEntry { vk: VirtualKey::Space, plain: Some(' '), shifted: Some(' '), altgr: None, dead: None }),
             ]),
         ),
