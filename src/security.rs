@@ -1654,8 +1654,8 @@ impl UpxUnpacker {
     /// Decompresses data using UPX's NRV2B algorithm.
     ///
     /// NRV2B is a lossless compression algorithm used by UPX. This
-    /// implementation performs a simplified bit-stream decompression
-    /// that handles the common case of literal bytes and match-copy pairs.
+    /// implementation performs bit-stream decompression using gamma2
+    /// coding for match offsets, following the UCL/NRV2B format.
     pub fn decompress_nrv2b(data: &[u8]) -> AppResult<Vec<u8>> {
         if data.is_empty() {
             return Ok(Vec::new());
@@ -1663,7 +1663,9 @@ impl UpxUnpacker {
         let mut output = Vec::new();
         let mut bit_pos: usize = 0;
         let data_len = data.len();
+        const MAX_OUTPUT: usize = 16 * 1024 * 1024;
 
+        /// Read one bit from the bit-stream. Returns `None` at end-of-stream.
         let read_bit = |data: &[u8], pos: &mut usize| -> Option<u8> {
             let byte_idx = *pos / 8;
             let bit_idx = 7 - (*pos % 8);
@@ -1674,6 +1676,7 @@ impl UpxUnpacker {
             Some((data[byte_idx] >> bit_idx) & 1)
         };
 
+        /// Read `n` bits from the bit-stream (MSB first).
         let read_bits = |data: &[u8], pos: &mut usize, n: usize| -> Option<u32> {
             let mut val = 0u32;
             for _ in 0..n {
@@ -1682,36 +1685,70 @@ impl UpxUnpacker {
             Some(val)
         };
 
-        while bit_pos / 8 < data_len && output.len() < 16 * 1024 * 1024 {
-            let indicator = read_bit(data, &mut bit_pos);
-            match indicator {
-                Some(0) => {
-                    let byte = read_bits(data, &mut bit_pos, 8);
-                    match byte {
-                        Some(b) => output.push(b as u8),
-                        None => break,
-                    }
+        /// Decode a gamma2-encoded integer from the bit stream.
+        /// Gamma2 encoding: read bits in pairs (flag, value).
+        /// While flag == 1, shift (value) into result; a flag of 0 terminates.
+        let read_gamma2 = |data: &[u8], pos: &mut usize| -> Option<u32> {
+            let mut result = 1u32;
+            loop {
+                let flag = read_bit(data, pos)?;
+                if flag == 0 {
+                    break;
                 }
-                Some(1) => {
-                    let offset_bits = read_bits(data, &mut bit_pos, 12);
-                    let length_bits = read_bits(data, &mut bit_pos, 4);
-                    match (offset_bits, length_bits) {
-                        (Some(off), Some(len)) => {
-                            let offset = off as usize;
-                            let length = (len as usize) + 3;
-                            if offset == 0 || offset > output.len() {
-                                continue;
-                            }
-                            let start = output.len() - offset;
-                            for i in 0..length {
-                                let byte = output[start + i];
-                                output.push(byte);
-                            }
-                        }
-                        _ => break,
-                    }
+                let val = read_bit(data, pos)? as u32;
+                result = (result << 1) | val;
+                if result > 0x1_0000 {
+                    return None;
                 }
-                _ => break,
+            }
+            Some(result)
+        };
+
+        while bit_pos / 8 < data_len && output.len() < MAX_OUTPUT {
+            let indicator = match read_bit(data, &mut bit_pos) {
+                Some(b) => b,
+                None => break,
+            };
+            if indicator == 0 {
+                // Literal byte: try reading 8 bits; break if insufficient
+                let byte = match read_bits(data, &mut bit_pos, 8) {
+                    Some(b) => b as u8,
+                    None => break,
+                };
+                output.push(byte);
+            } else {
+                // Match: decode gamma2-coded offset
+                let offset = match read_gamma2(data, &mut bit_pos) {
+                    Some(off) => off as usize,
+                    None => break,
+                };
+                // Decode length: read 2 bits for base
+                let len_base = match read_bits(data, &mut bit_pos, 2) {
+                    Some(lb) => lb,
+                    None => break,
+                };
+                let length = match len_base {
+                    0 => 2,
+                    1 => 3,
+                    2 => {
+                        // 4 + gamma2 extra
+                        4 + read_gamma2(data, &mut bit_pos).unwrap_or(0) as usize
+                    }
+                    3 => {
+                        // 6 + gamma2 extra (longer matches)
+                        6 + read_gamma2(data, &mut bit_pos).unwrap_or(0) as usize
+                    }
+                    _ => unreachable!(),
+                };
+
+                if offset == 0 || offset > output.len() {
+                    continue;
+                }
+                let start = output.len() - offset;
+                for i in 0..length {
+                    let byte = output[start + i % offset];
+                    output.push(byte);
+                }
             }
         }
 
@@ -1806,7 +1843,8 @@ impl UpxUnpacker {
     /// Decompresses data using LZMA compression.
     ///
     /// LZMA is used by newer versions of UPX. This implementation
-    /// performs a simplified LZMA decompression for the common case.
+    /// parses the LZMA properties header and performs full range-coded
+    /// LZMA decompression following the LZMA specification (LZMA SDK / 7z).
     pub fn decompress_lzma(data: &[u8]) -> AppResult<Vec<u8>> {
         if data.len() < 13 {
             return Err(AppError::new(
@@ -1814,59 +1852,519 @@ impl UpxUnpacker {
                 "LZMA data too small for header",
             ));
         }
-        let _properties = &data[0..5];
+
+        // Parse LZMA properties byte
+        let props_byte = data[0];
+        if props_byte >= 9 * 5 * 5 {
+            return Err(AppError::new(
+                ReasonCode::RcDrmDecryptFailed,
+                "LZMA properties byte out of range",
+            ));
+        }
+        let lc = (props_byte % 9) as usize;
+        let remainder = props_byte / 9;
+        let lp = (remainder % 5) as usize;
+        let pb = (remainder / 5) as usize;
+
+        // Dictionary size (little-endian u32)
+        let _dict_size = u32::from_le_bytes([data[1], data[2], data[3], data[4]]);
+
+        // Uncompressed size: 8 bytes (0xFFFFFFFF_FFFFFFFF means unknown)
         let uncompressed_size = u64::from_le_bytes(
             data[5..13]
                 .try_into()
                 .map_err(|_| AppError::new(ReasonCode::RcDrmDecryptFailed, "LZMA header parse error"))?,
         );
-        let max_size = if uncompressed_size == 0xFFFF_FFFF_FFFF_FFFF {
+
+        let max_size = if uncompressed_size == u64::MAX {
             16 * 1024 * 1024
         } else {
             uncompressed_size as usize
         };
+
         let compressed = &data[13..];
-        let mut output = Vec::with_capacity(max_size.min(16 * 1024 * 1024));
-        let mut pos = 0usize;
-        while pos < compressed.len() && output.len() < max_size {
-            let control = compressed[pos];
-            pos += 1;
-            if control == 0 {
-                if pos < compressed.len() {
-                    output.push(compressed[pos]);
-                    pos += 1;
-                }
-            } else if control < 128 {
-                let length = (control & 0x0F) as usize + 3;
-                let offset_high = ((control >> 4) & 0x07) as usize;
-                if pos < compressed.len() {
-                    let offset = (offset_high << 8) | compressed[pos] as usize;
-                    pos += 1;
-                    if offset > 0 && offset <= output.len() {
-                        let start = output.len() - offset;
-                        for i in 0..length {
-                            if start + i < output.len() {
-                                output.push(output[start + i]);
-                            }
-                        }
-                    }
-                }
-            } else {
-                let run_len = (control & 0x7F) as usize;
-                for _ in 0..run_len {
-                    if pos < compressed.len() {
-                        output.push(compressed[pos]);
-                        pos += 1;
-                    }
-                }
-            }
-        }
+
+        // Run the full LZMA range-coder decoder
+        let mut decoder = LzmaDecoder::new(lc, lp, pb, compressed, uncompressed_size, max_size);
+        let output = decoder.decode()?;
+
         if output.is_empty() {
             return Err(AppError::new(
                 ReasonCode::RcDrmDecryptFailed,
                 "LZMA decompression produced no output",
             ));
         }
+        Ok(output)
+    }
+}
+
+// ===========================================================================
+// LZMA Range-Coder Decoder
+// ===========================================================================
+
+/// Initial probability value (50% = 1024 out of 2048).
+const LZMA_PROB_INIT: u16 = 1024;
+/// Number of LZMA states (0..=11).
+const LZMA_NUM_STATES: usize = 12;
+/// Number of position states (1 << pb, max 16).
+const LZMA_NUM_POS_STATES_MAX: usize = 16;
+/// Number of length-to-position-states.
+const LZMA_NUM_LEN_TO_POS_STATES: usize = 4;
+/// Number of align bits.
+const LZMA_NUM_ALIGN_BITS: usize = 4;
+/// End-of-stream marker distance.
+const LZMA_END_POS: u32 = 0xFFFF_FFFF;
+/// Maximum match length (for high-length coding).
+const LZMA_MATCH_MIN_LEN: usize = 2;
+
+/// State transition tables for the 12-state LZMA machine.
+const K_LITERAL_NEXT_STATES: [usize; 12] = [0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 4, 5];
+const K_MATCH_NEXT_STATES: [usize; 12] = [7, 7, 7, 7, 7, 7, 7, 10, 10, 10, 10, 10];
+const K_REP_NEXT_STATES: [usize; 12] = [8, 8, 8, 8, 8, 8, 8, 11, 11, 11, 11, 11];
+const K_SHORT_REP_NEXT_STATES: [usize; 12] = [9, 9, 9, 9, 9, 9, 9, 11, 11, 11, 11, 11];
+
+/// Range coder — separated from the probability arrays to satisfy
+/// Rust's borrow checker.  The range coder owns only the stream state
+/// (`range`, `code`, `stream`, `stream_pos`) so that `decode_bit`
+/// borrows only the coder, not the surrounding probability tables.
+struct RangeCoder<'a> {
+    range: u32,
+    code: u32,
+    stream: &'a [u8],
+    stream_pos: usize,
+}
+
+impl<'a> RangeCoder<'a> {
+    fn new(stream: &'a [u8]) -> Self {
+        let mut rc = Self {
+            range: 0xFFFF_FFFF,
+            code: 0,
+            stream,
+            stream_pos: 0,
+        };
+        // First byte is ignored (must be 0x00)
+        rc.read_byte();
+        // Next 4 bytes initialise `code`
+        for _ in 0..4 {
+            rc.code = (rc.code << 8) | rc.read_byte() as u32;
+        }
+        rc
+    }
+
+    #[inline]
+    fn read_byte(&mut self) -> u8 {
+        if self.stream_pos < self.stream.len() {
+            let b = self.stream[self.stream_pos];
+            self.stream_pos += 1;
+            b
+        } else {
+            0
+        }
+    }
+
+    #[inline]
+    fn normalize(&mut self) {
+        if self.range < (1 << 24) {
+            self.range <<= 8;
+            self.code = (self.code << 8) | self.read_byte() as u32;
+        }
+    }
+
+    /// Decode one bit, updating the probability in-place.
+    #[inline]
+    fn decode_bit(&mut self, prob: &mut u16) -> u32 {
+        let bound = (self.range >> 11) * (*prob as u32);
+        if self.code < bound {
+            self.range = bound;
+            *prob += ((2048 - *prob) >> 5) as u16;
+            self.normalize();
+            0
+        } else {
+            self.range -= bound;
+            self.code -= bound;
+            *prob -= (*prob >> 5);
+            self.normalize();
+            1
+        }
+    }
+
+    /// Decode `count` direct (fixed 50%) bits.
+    fn decode_direct_bits(&mut self, count: usize) -> u32 {
+        let mut result: u32 = 0;
+        for _ in 0..count {
+            self.range >>= 1;
+            self.code = self.code.wrapping_sub(self.range);
+            let t = (self.code as i32 >> 31) as u32;
+            self.code = self.code.wrapping_add(t.wrapping_mul(self.range));
+            result = (result << 1) | t;
+            self.normalize();
+        }
+        result
+    }
+}
+
+/// Length decoder probability arrays.
+struct LenDecoder {
+    choice: [u16; 1],
+    choice2: [u16; 1],
+    low: [[u16; 8]; LZMA_NUM_POS_STATES_MAX],
+    mid: [[u16; 8]; LZMA_NUM_POS_STATES_MAX],
+    high: [u16; 256],
+}
+
+impl LenDecoder {
+    fn new() -> Self {
+        Self {
+            choice: [LZMA_PROB_INIT; 1],
+            choice2: [LZMA_PROB_INIT; 1],
+            low: [[LZMA_PROB_INIT; 8]; LZMA_NUM_POS_STATES_MAX],
+            mid: [[LZMA_PROB_INIT; 8]; LZMA_NUM_POS_STATES_MAX],
+            high: [LZMA_PROB_INIT; 256],
+        }
+    }
+}
+
+/// Full LZMA decoder.  The `rc` (range coder) is kept in a separate
+/// field so that `rc.decode_bit(prob)` borrows only `rc`, leaving the
+/// probability arrays free to be borrowed individually.
+struct LzmaDecoder<'a> {
+    lc: usize,
+    lp: usize,
+    pb: usize,
+    known_size: bool,
+    expected_size: u64,
+    max_size: usize,
+
+    rc: RangeCoder<'a>,
+
+    state: usize,
+    rep0: u32,
+    rep1: u32,
+    rep2: u32,
+    rep3: u32,
+
+    is_match: [[u16; LZMA_NUM_POS_STATES_MAX]; LZMA_NUM_STATES],
+    is_rep: [u16; LZMA_NUM_STATES],
+    is_rep_g0: [u16; LZMA_NUM_STATES],
+    is_rep_g1: [u16; LZMA_NUM_STATES],
+    is_rep_g2: [u16; LZMA_NUM_STATES],
+    is_rep0_long: [[u16; LZMA_NUM_POS_STATES_MAX]; LZMA_NUM_STATES],
+    literal: Vec<[u16; 0x400]>,
+    pos_slot: [[u16; 64]; LZMA_NUM_LEN_TO_POS_STATES],
+    pos_decoders: [u16; 115],
+    pos_align: [u16; 16],
+    len_codec: LenDecoder,
+    rep_len_codec: LenDecoder,
+}
+
+impl<'a> LzmaDecoder<'a> {
+    fn new(
+        lc: usize,
+        lp: usize,
+        pb: usize,
+        stream: &'a [u8],
+        uncompressed_size: u64,
+        max_size: usize,
+    ) -> Self {
+        let known_size = uncompressed_size != u64::MAX;
+        let num_literal_contexts = 1 << (lc + lp);
+        let mut literal = Vec::with_capacity(num_literal_contexts);
+        for _ in 0..num_literal_contexts {
+            literal.push([LZMA_PROB_INIT; 0x400]);
+        }
+
+        Self {
+            lc,
+            lp,
+            pb,
+            known_size,
+            expected_size: uncompressed_size,
+            max_size,
+
+            rc: RangeCoder::new(stream),
+
+            state: 0,
+            rep0: 0,
+            rep1: 0,
+            rep2: 0,
+            rep3: 0,
+
+            is_match: [[LZMA_PROB_INIT; LZMA_NUM_POS_STATES_MAX]; LZMA_NUM_STATES],
+            is_rep: [LZMA_PROB_INIT; LZMA_NUM_STATES],
+            is_rep_g0: [LZMA_PROB_INIT; LZMA_NUM_STATES],
+            is_rep_g1: [LZMA_PROB_INIT; LZMA_NUM_STATES],
+            is_rep_g2: [LZMA_PROB_INIT; LZMA_NUM_STATES],
+            is_rep0_long: [[LZMA_PROB_INIT; LZMA_NUM_POS_STATES_MAX]; LZMA_NUM_STATES],
+            literal,
+            pos_slot: [[LZMA_PROB_INIT; 64]; LZMA_NUM_LEN_TO_POS_STATES],
+            pos_decoders: [LZMA_PROB_INIT; 115],
+            pos_align: [LZMA_PROB_INIT; 16],
+            len_codec: LenDecoder::new(),
+            rep_len_codec: LenDecoder::new(),
+        }
+    }
+
+    /// Decode a literal byte at the given output position.
+    fn decode_literal(&mut self, output: &[u8], pos: usize) -> u8 {
+        let prev_byte = if pos > 0 { output[pos - 1] } else { 0 };
+        let lp_mask = ((1 << self.lp) - 1) as usize;
+        let lit_state = ((pos & (lp_mask << self.pb)) >> self.pb) << self.lc;
+        let lit_index = lit_state | ((prev_byte >> (8 - self.lc)) as usize);
+        let lit_index = lit_index.min(self.literal.len() - 1);
+
+        let mut symbol: u32 = 1;
+
+        if self.state >= 7 {
+            // Matched literal: use match byte as context
+            let match_byte = if pos > self.rep0 as usize && (self.rep0 as usize) < pos {
+                output[pos - 1 - self.rep0 as usize]
+            } else {
+                0
+            };
+            let mut match_byte = match_byte as u32;
+            let mut i = 0;
+            while i < 8 {
+                let match_bit = (match_byte >> 7) & 1;
+                match_byte <<= 1;
+                let bit = self.rc.decode_bit(&mut self.literal[lit_index][symbol as usize]);
+                symbol = (symbol << 1) | bit;
+                if match_bit != bit {
+                    // Rest of bits decoded normally
+                    while symbol < 0x100 {
+                        symbol = (symbol << 1) | self.rc.decode_bit(&mut self.literal[lit_index][symbol as usize]);
+                    }
+                    break;
+                }
+                i += 1;
+            }
+        } else {
+            // Normal literal
+            while symbol < 0x100 {
+                symbol = (symbol << 1) | self.rc.decode_bit(&mut self.literal[lit_index][symbol as usize]);
+            }
+        }
+
+        symbol as u8
+    }
+
+    /// Decode a length value using the given length codec.
+    /// Takes `rc` separately to avoid borrowing `self` and `len_codec` simultaneously.
+    fn decode_length(rc: &mut RangeCoder, len_codec: &mut LenDecoder, pos_state: usize) -> usize {
+        if rc.decode_bit(&mut len_codec.choice[0]) == 0 {
+            // Low length: 3-bit tree
+            let mut symbol = 1usize;
+            for _ in 0..3 {
+                symbol = (symbol << 1) | rc.decode_bit(&mut len_codec.low[pos_state][symbol]) as usize;
+            }
+            symbol - 1 + LZMA_MATCH_MIN_LEN
+        } else if rc.decode_bit(&mut len_codec.choice2[0]) == 0 {
+            // Mid length: 3 bits + 8
+            let mut symbol = 1usize;
+            for _ in 0..3 {
+                symbol = (symbol << 1) | rc.decode_bit(&mut len_codec.mid[pos_state][symbol]) as usize;
+            }
+            symbol - 1 + 8 + LZMA_MATCH_MIN_LEN
+        } else {
+            // High length: 8 bits + 16
+            let mut symbol = 1usize;
+            for _ in 0..8 {
+                symbol = (symbol << 1) | rc.decode_bit(&mut len_codec.high[symbol]) as usize;
+            }
+            symbol - 1 + 16 + LZMA_MATCH_MIN_LEN
+        }
+    }
+
+    /// Decode a position slot (6 bits) using the length state.
+    fn decode_pos_slot(rc: &mut RangeCoder, pos_slot: &mut [u16; 64], len_state: usize) -> u32 {
+        let mut symbol = 1usize;
+        for _ in 0..6 {
+            symbol = (symbol << 1) | rc.decode_bit(&mut pos_slot[symbol]) as usize;
+        }
+        symbol as u32
+    }
+
+    /// Decode a distance given the match length.
+    /// Takes `rc` and probability arrays separately to satisfy the borrow checker.
+    fn decode_distance(
+        rc: &mut RangeCoder,
+        pos_slot: &mut [[u16; 64]; LZMA_NUM_LEN_TO_POS_STATES],
+        pos_decoders: &mut [u16; 115],
+        pos_align: &mut [u16; 16],
+        len: usize,
+    ) -> Option<u32> {
+        let len_state = if len - LZMA_MATCH_MIN_LEN < LZMA_NUM_LEN_TO_POS_STATES - 1 {
+            len - LZMA_MATCH_MIN_LEN
+        } else {
+            LZMA_NUM_LEN_TO_POS_STATES - 1
+        };
+
+        let slot = Self::decode_pos_slot(rc, &mut pos_slot[len_state], len_state);
+
+        if slot < 4 {
+            return Some(slot);
+        }
+
+        let num_direct_bits = ((slot >> 1) - 1) as usize;
+        let mut dist = (2 | (slot & 1)) << num_direct_bits;
+
+        if slot < 14 {
+            // Probability-based extra bits
+            let base = ((slot as usize) - 4) * 4 + 4;
+            let mut m = 1usize;
+            for i in 0..num_direct_bits {
+                let idx = base + i;
+                if idx < pos_decoders.len() {
+                    m = (m << 1) | rc.decode_bit(&mut pos_decoders[idx]) as usize;
+                }
+            }
+            dist += m as u32 - (1 << num_direct_bits) as u32;
+        } else {
+            // Fixed-probability extra bits + align bits
+            dist += rc.decode_direct_bits(num_direct_bits - LZMA_NUM_ALIGN_BITS) << LZMA_NUM_ALIGN_BITS;
+            let mut m = 1usize;
+            for _ in 0..LZMA_NUM_ALIGN_BITS {
+                m = (m << 1) | rc.decode_bit(&mut pos_align[m]) as usize;
+            }
+            dist += m as u32 - (1 << LZMA_NUM_ALIGN_BITS) as u32;
+        }
+
+        if dist == LZMA_END_POS {
+            return None; // End marker
+        }
+
+        Some(dist)
+    }
+
+    /// Copy bytes from the dictionary for a match.
+    fn copy_match(output: &[u8], dist: u32, length: usize) -> Vec<u8> {
+        let mut copied = Vec::with_capacity(length);
+        let dist = dist as usize;
+        if dist == 0 || dist > output.len() {
+            return copied;
+        }
+        for i in 0..length {
+            let byte = output[output.len() - dist + (i % dist)];
+            copied.push(byte);
+        }
+        copied
+    }
+
+    /// Run the LZMA decode loop.
+    fn decode(&mut self) -> AppResult<Vec<u8>> {
+        let mut output = Vec::with_capacity(self.max_size.min(16 * 1024 * 1024));
+        let pos_states = 1 << self.pb;
+
+        loop {
+            // Check termination conditions
+            if self.known_size && output.len() as u64 >= self.expected_size {
+                break;
+            }
+            if output.len() >= self.max_size {
+                break;
+            }
+
+            let pos_state = output.len() & (pos_states - 1);
+
+            // Decode symbol type: literal vs match
+            if self.rc.decode_bit(&mut self.is_match[self.state][pos_state]) == 0 {
+                // Literal
+                let byte = self.decode_literal(&output, output.len());
+                output.push(byte);
+                self.state = K_LITERAL_NEXT_STATES[self.state];
+                continue;
+            }
+
+            // Match or rep
+            let is_rep = self.rc.decode_bit(&mut self.is_rep[self.state]) == 1;
+
+            let length;
+            let distance;
+
+            if !is_rep {
+                // Simple match
+                length = Self::decode_length(&mut self.rc, &mut self.len_codec, pos_state);
+                distance = Self::decode_distance(
+                    &mut self.rc,
+                    &mut self.pos_slot,
+                    &mut self.pos_decoders,
+                    &mut self.pos_align,
+                    length,
+                );
+
+                match distance {
+                    None => {
+                        // End marker reached
+                        break;
+                    }
+                    Some(d) => {
+                        // Shift rep distances
+                        self.rep3 = self.rep2;
+                        self.rep2 = self.rep1;
+                        self.rep1 = self.rep0;
+                        self.rep0 = d;
+                    }
+                }
+                self.state = K_MATCH_NEXT_STATES[self.state];
+            } else {
+                // Rep match
+                if self.rc.decode_bit(&mut self.is_rep_g0[self.state]) == 0 {
+                    // rep0
+                    if self.rc.decode_bit(&mut self.is_rep0_long[self.state][pos_state]) == 0 {
+                        // Short rep (length 1)
+                        self.state = K_SHORT_REP_NEXT_STATES[self.state];
+
+                        if self.rep0 as usize >= output.len() || self.rep0 == 0 {
+                            break;
+                        }
+                        let byte = output[output.len() - 1 - self.rep0 as usize];
+                        output.push(byte);
+
+                        if self.known_size && output.len() as u64 >= self.expected_size {
+                            break;
+                        }
+                        if output.len() >= self.max_size {
+                            break;
+                        }
+                        continue;
+                    }
+                    // Long rep0
+                    length = Self::decode_length(&mut self.rc, &mut self.rep_len_codec, pos_state);
+                } else if self.rc.decode_bit(&mut self.is_rep_g1[self.state]) == 0 {
+                    // rep1
+                    let temp = self.rep1;
+                    self.rep1 = self.rep0;
+                    self.rep0 = temp;
+                    length = Self::decode_length(&mut self.rc, &mut self.rep_len_codec, pos_state);
+                } else if self.rc.decode_bit(&mut self.is_rep_g2[self.state]) == 0 {
+                    // rep2
+                    let temp = self.rep2;
+                    self.rep2 = self.rep1;
+                    self.rep1 = self.rep0;
+                    self.rep0 = temp;
+                    length = Self::decode_length(&mut self.rc, &mut self.rep_len_codec, pos_state);
+                } else {
+                    // rep3
+                    let temp = self.rep3;
+                    self.rep3 = self.rep2;
+                    self.rep2 = self.rep1;
+                    self.rep1 = self.rep0;
+                    self.rep0 = temp;
+                    length = Self::decode_length(&mut self.rc, &mut self.rep_len_codec, pos_state);
+                }
+                self.state = K_REP_NEXT_STATES[self.state];
+                distance = Some(self.rep0);
+            }
+
+            // Copy match bytes
+            if let Some(dist) = distance {
+                let copied = Self::copy_match(&output, dist, length);
+                if copied.is_empty() {
+                    continue;
+                }
+                output.extend_from_slice(&copied);
+            }
+        }
+
         Ok(output)
     }
 }

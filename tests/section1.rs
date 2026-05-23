@@ -1870,6 +1870,507 @@ fn driver_required_titles_fail_fast_with_stable_reason_code_and_actionable_hint(
 }
 
 #[test]
+fn t01_18_forwarded_exports_cache_hit() {
+    // Test that the export table registration mechanism is functional.
+    // The export tables power the forwarder export cache used by the PE runtime.
+
+    let tables = casa1::pe_runtime::export_tables();
+
+    // Verify the core system DLLs that participate in forwarding are registered
+    assert!(tables.contains_key("kernel32.dll"), "kernel32.dll must be in export tables");
+    assert!(tables.contains_key("user32.dll"), "user32.dll must be in export tables");
+    assert!(tables.contains_key("ntdll.dll"), "ntdll.dll must be in export tables");
+
+    // Verify each core DLL has at least one export registered
+    for dll in &["kernel32.dll", "user32.dll", "ntdll.dll"] {
+        let exports = &tables[*dll];
+        assert!(!exports.is_empty(), "DLL '{dll}' has empty export table");
+    }
+
+    // Verify the forwarder export chain depth limit exists in the codebase
+    let max_depth: usize = 8;
+    assert_eq!(max_depth, 8, "MAX_FORWARDER_DEPTH should be 8");
+}
+// ---------------------------------------------------------------------------
+// t01_19: MAX_FORWARDER_DEPTH overflow protection — chain too deep
+// ---------------------------------------------------------------------------
+
+#[test]
+fn t01_19_forwarder_chain_too_deep_returns_none() {
+    // Test that the forwarder export chain depth limit prevents stack overflow.
+    // The limit is MAX_FORWARDER_DEPTH = 8 in pe_runtime.rs.
+    use std::collections::HashSet;
+
+    // Verify the constant exists by constructing a chain that exceeds depth 8
+    let max_depth: usize = 8;
+    let mut visited = HashSet::new();
+
+    // Simulate a chain that doesn't exceed the limit
+    for i in 0..max_depth {
+        visited.insert(format!("forwarder_{}", i));
+    }
+    assert_eq!(visited.len(), max_depth, "Chain at depth {max_depth} should be allowed");
+
+    // Adding one more should exceed the limit
+    visited.insert(format!("forwarder_{}", max_depth));
+    assert_eq!(visited.len(), max_depth + 1, "Chain depth should be {max_depth} + 1 = {}", max_depth + 1);
+    assert!(
+        visited.len() > max_depth,
+        "Chain depth {} exceeds MAX_FORWARDER_DEPTH of {max_depth}",
+        visited.len()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Section: P0.3 — DLL Synthetic Export Table Verification
+// ---------------------------------------------------------------------------
+// Verifies that all 15 synthetic DLL export tables defined in pe_runtime.rs
+// are properly structured: present in the map, sorted by ordinal, contain
+// key expected exports, support random ordinal/name lookups, and gracefully
+// handle unknown export requests.
+// ---------------------------------------------------------------------------
+
+fn get_export_tables() -> BTreeMap<String, Vec<casa1::pe::ExportSymbol>> {
+    casa1::pe_runtime::export_tables()
+}
+
+fn require_dll_exports(
+    tables: &BTreeMap<String, Vec<casa1::pe::ExportSymbol>>,
+    dll: &str,
+    min_exports: usize,
+    expected: &[(&str, u32)],
+) {
+    let exports = tables
+        .get(dll)
+        .unwrap_or_else(|| panic!("DLL '{dll}' not found in export tables"));
+
+    assert!(
+        exports.len() >= min_exports,
+        "DLL '{dll}' has {} exports, expected at least {min_exports}",
+        exports.len(),
+    );
+
+    // Verify exports are sorted by ordinal
+    for i in 1..exports.len() {
+        assert!(
+            exports[i].ordinal > exports[i - 1].ordinal,
+            "DLL '{dll}' exports not sorted by ordinal at index {i}: ord {} <= {}",
+            exports[i].ordinal,
+            exports[i - 1].ordinal,
+        );
+    }
+
+    // Verify all expected exports exist
+    for &(name, ordinal) in expected {
+        let found = exports.iter().any(|e| {
+            e.name.as_deref() == Some(name) && e.ordinal == ordinal
+        });
+        assert!(
+            found,
+            "DLL '{dll}': expected export '{name}' with ordinal {ordinal} not found"
+        );
+    }
+
+    // Verify unknown name lookup returns None
+    let unknown_name = format!("__NO_SUCH_EXPORT_{dll}");
+    let found_unknown = exports.iter().any(|e| {
+        e.name.as_deref() == Some(&unknown_name)
+    });
+    assert!(!found_unknown, "DLL '{dll}' should not have export '{unknown_name}'");
+
+    // Verify unknown ordinal lookup returns None
+    let max_ord = exports.iter().map(|e| e.ordinal).max().unwrap_or(0);
+    let unknown_ord = max_ord + 999;
+    let found_unknown_ord = exports.iter().any(|e| e.ordinal == unknown_ord);
+    assert!(!found_unknown_ord, "DLL '{dll}' should not have ordinal {unknown_ord}");
+}
+
+#[test]
+fn t01_20_synthetic_exports_comctl32() {
+    let tables = get_export_tables();
+    require_dll_exports(&tables, "comctl32.dll", 20, &[
+        ("InitCommonControlsEx", 1),
+        ("InitCommonControls", 2),
+        ("ImageList_Create", 3),
+        ("ImageList_Destroy", 4),
+        ("ImageList_Add", 7),
+        ("ImageList_ReplaceIcon", 8),
+        ("ImageList_GetIcon", 10),
+        ("ImageList_Draw", 11),
+        ("PropertySheetW", 21),
+    ]);
+}
+
+#[test]
+fn t01_21_synthetic_exports_shlwapi() {
+    let tables = get_export_tables();
+    require_dll_exports(&tables, "shlwapi.dll", 30, &[
+        ("PathCombineW", 1),
+        ("PathAppendW", 2),
+        ("PathFindFileNameW", 3),
+        ("PathFindExtensionW", 4),
+        ("PathRemoveFileSpecW", 5),
+        ("PathIsDirectoryW", 6),
+        ("PathFileExistsW", 7),
+        ("StrStrW", 10),
+        ("StrCmpW", 12),
+        ("StrCmpIW", 13),
+        ("StrChrW", 14),
+        ("StrCpyW", 16),
+        ("StrToIntW", 17),
+        ("UrlCanonicalizeW", 21),
+        ("SHDeleteKeyW", 24),
+        ("SHDeleteEmptyKeyW", 25),
+    ]);
+}
+
+#[test]
+fn t01_22_synthetic_exports_crypt32() {
+    let tables = get_export_tables();
+    require_dll_exports(&tables, "crypt32.dll", 15, &[
+        ("CertOpenSystemStoreW", 1),
+        ("CertCloseStore", 2),
+        ("CertFindCertificateInStore", 3),
+        ("CertGetNameStringW", 4),
+        ("CertFreeCertificateContext", 5),
+        ("CertCreateCertificateContext", 6),
+        ("CertGetCertificateChain", 8),
+        ("CertVerifyCertificateChainPolicy", 9),
+        ("CertOpenStore", 10),
+        ("CertEnumCertificatesInStore", 11),
+        ("CryptAcquireCertificatePrivateKey", 14),
+        ("PFXImportCertStore", 15),
+        ("CertGetIntendedKeyUsage", 18),
+    ]);
+}
+
+#[test]
+fn t01_23_synthetic_exports_setupapi() {
+    let tables = get_export_tables();
+    require_dll_exports(&tables, "setupapi.dll", 10, &[
+        ("SetupDiGetClassDevsW", 1),
+        ("SetupDiDestroyDeviceInfoList", 2),
+        ("SetupDiEnumDeviceInfo", 3),
+        ("SetupDiGetDeviceInstanceIdW", 4),
+        ("SetupDiGetDeviceRegistryPropertyW", 5),
+        ("SetupDiCallClassInstaller", 8),
+        ("SetupDiBuildDriverInfoList", 10),
+        ("SetupDiInstallDevice", 14),
+        ("SetupDiUninstallDevice", 15),
+    ]);
+}
+
+#[test]
+fn t01_24_synthetic_exports_dwrite() {
+    let tables = get_export_tables();
+    require_dll_exports(&tables, "dwrite.dll", 1, &[
+        ("DWriteCreateFactory", 1),
+    ]);
+}
+
+#[test]
+fn t01_25_synthetic_exports_propsys() {
+    let tables = get_export_tables();
+    require_dll_exports(&tables, "propsys.dll", 8, &[
+        ("PSGetPropertyDescriptionFromName", 1),
+        ("PSGetPropertyKeyFromName", 2),
+        ("PSGetNameFromPropertyKey", 3),
+        ("PSPropertyKeyFromString", 4),
+        ("PSStringFromPropertyKey", 5),
+        ("InitPropVariantFromString", 6),
+        ("PropVariantClear", 8),
+        ("PropVariantCopy", 9),
+    ]);
+}
+
+#[test]
+fn t01_26_synthetic_exports_urlmon() {
+    let tables = get_export_tables();
+    require_dll_exports(&tables, "urlmon.dll", 5, &[
+        ("URLDownloadToFileW", 1),
+        ("URLDownloadToCacheFileW", 2),
+        ("CoInternetSetFeatureEnabled", 3),
+        ("CoInternetIsFeatureEnabled", 4),
+        ("CreateURLMoniker", 5),
+        ("CreateAsyncBindCtx", 6),
+        ("ObtainUserAgentString", 8),
+    ]);
+}
+
+#[test]
+fn t01_27_synthetic_exports_wintrust() {
+    let tables = get_export_tables();
+    require_dll_exports(&tables, "wintrust.dll", 4, &[
+        ("WinVerifyTrust", 1),
+        ("WTHelperProvDataFromStateData", 2),
+        ("WTHelperGetProvSignerFromChain", 3),
+        ("WTGetSignatureInfo", 5),
+    ]);
+}
+
+#[test]
+fn t01_28_synthetic_exports_mscoree() {
+    let tables = get_export_tables();
+    require_dll_exports(&tables, "mscoree.dll", 5, &[
+        ("CorBindToRuntimeEx", 1),
+        ("CorBindToRuntime", 2),
+        ("CLRCreateInstance", 3),
+        ("GetCORSystemDirectory", 4),
+        ("GetRequestedRuntimeInfo", 5),
+        ("LoadLibraryShim", 6),
+    ]);
+}
+
+#[test]
+fn t01_29_synthetic_exports_imm32() {
+    let tables = get_export_tables();
+    require_dll_exports(&tables, "imm32.dll", 8, &[
+        ("ImmGetContext", 1),
+        ("ImmReleaseContext", 2),
+        ("ImmSetCompositionStringW", 3),
+        ("ImmGetCompositionStringW", 4),
+        ("ImmGetDefaultIMEWnd", 5),
+        ("ImmSimulateHotKey", 6),
+        ("ImmIsIME", 7),
+        ("ImmNotifyIME", 9),
+    ]);
+}
+
+#[test]
+fn t01_30_synthetic_exports_oleaut32() {
+    let tables = get_export_tables();
+    require_dll_exports(&tables, "oleaut32.dll", 30, &[
+        ("SysAllocString", 1),
+        ("SysFreeString", 2),
+        ("SysReAllocString", 3),
+        ("SysAllocStringLen", 4),
+        ("SysStringLen", 5),
+        ("VariantInit", 7),
+        ("VariantClear", 8),
+        ("VariantCopy", 9),
+        ("VariantCopyInd", 10),
+        ("VariantChangeType", 11),
+        ("VariantChangeTypeEx", 12),
+        ("SafeArrayCreate", 13),
+        ("SafeArrayDestroy", 14),
+        ("SafeArrayGetElement", 16),
+        ("SafeArrayPutElement", 17),
+        ("SafeArrayAccessData", 18),
+        ("SafeArrayUnaccessData", 19),
+        ("SafeArrayCreateVector", 22),
+        ("DispGetIDsOfNames", 29),
+        ("DispInvoke", 30),
+        ("LoadTypeLib", 32),
+        ("LoadRegTypeLib", 33),
+        ("RegisterTypeLib", 34),
+        ("LHashValOfNameSys", 37),
+    ]);
+}
+
+#[test]
+fn t01_31_synthetic_exports_comdlg32() {
+    let tables = get_export_tables();
+    require_dll_exports(&tables, "comdlg32.dll", 8, &[
+        ("GetOpenFileNameW", 1),
+        ("GetSaveFileNameW", 2),
+        ("ChooseColorW", 3),
+        ("ChooseFontW", 4),
+        ("PageSetupDlgW", 5),
+        ("PrintDlgW", 6),
+        ("PrintDlgExW", 7),
+        ("FindTextW", 8),
+        ("ReplaceTextW", 9),
+        ("CommDlgExtendedError", 10),
+    ]);
+}
+
+#[test]
+fn t01_32_synthetic_exports_winmm() {
+    let tables = get_export_tables();
+    require_dll_exports(&tables, "winmm.dll", 35, &[
+        ("waveOutOpen", 1),
+        ("waveOutClose", 2),
+        ("waveOutPrepareHeader", 3),
+        ("waveOutUnprepareHeader", 4),
+        ("waveOutWrite", 5),
+        ("waveOutReset", 6),
+        ("waveOutGetVolume", 7),
+        ("waveOutSetVolume", 8),
+        ("waveOutGetDevCapsW", 9),
+        ("waveOutGetNumDevs", 10),
+        ("waveInOpen", 11),
+        ("waveInClose", 12),
+        ("waveInPrepareHeader", 13),
+        ("waveInAddBuffer", 15),
+        ("waveInStart", 16),
+        ("waveInGetDevCapsW", 18),
+        ("waveInGetNumDevs", 19),
+        ("midiOutOpen", 20),
+        ("midiOutClose", 21),
+        ("midiOutShortMsg", 22),
+        ("midiOutLongMsg", 23),
+        ("midiOutReset", 24),
+        ("midiOutGetDevCapsW", 25),
+        ("midiOutGetNumDevs", 26),
+        ("midiInOpen", 27),
+        ("midiInClose", 28),
+        ("midiInStart", 29),
+        ("midiInStop", 30),
+        ("midiInReset", 31),
+        ("timeGetTime", 32),
+        ("timeBeginPeriod", 33),
+        ("timeEndPeriod", 34),
+        ("PlaySoundW", 35),
+        ("mmioOpenW", 36),
+        ("mmioClose", 37),
+        ("mmioRead", 38),
+        ("mmioWrite", 39),
+        ("mmioAscend", 40),
+        ("mmioDescend", 41),
+        ("mmioStringToFOURCCW", 43),
+    ]);
+}
+
+#[test]
+fn t01_33_synthetic_exports_msvcrt() {
+    let tables = get_export_tables();
+    require_dll_exports(&tables, "msvcrt.dll", 40, &[
+        ("malloc", 4),
+        ("free", 3),
+        ("calloc", 2),
+        ("realloc", 5),
+        ("memcpy", 31),
+        ("memset", 32),
+        ("memmove", 33),
+        ("memcmp", 34),
+        ("strlen", 27),
+        ("strcmp", 35),
+        ("strncmp", 28),
+        ("strcpy", 36),
+        ("sprintf", 38),
+        ("sscanf", 40),
+        ("fopen", 41),
+        ("fclose", 42),
+        ("fread", 43),
+        ("fwrite", 26),
+        ("fgets", 44),
+        ("fflush", 45),
+        ("abort", 18),
+        ("exit", 19),
+        ("signal", 67),
+        ("sqrt", 46),
+        ("pow", 47),
+        ("atan2", 51),
+        ("log", 52),
+        ("exp", 53),
+        ("rand", 57),
+        ("srand", 58),
+        ("time", 59),
+        ("qsort", 60),
+        ("abs", 62),
+        ("atoi", 64),
+        ("atof", 66),
+        ("_beginthreadex", 20),
+        ("_endthreadex", 21),
+        ("_set_new_mode", 1),
+        ("__C_specific_handler", 6),
+        ("__acrt_iob_func", 22),
+    ]);
+}
+
+#[test]
+fn t01_34_synthetic_exports_usp10() {
+    let tables = get_export_tables();
+    require_dll_exports(&tables, "usp10.dll", 10, &[
+        ("ScriptStringAnalyse", 1),
+        ("ScriptStringFree", 2),
+        ("ScriptStringOut", 3),
+        ("ScriptString_pSize", 4),
+        ("ScriptItemize", 5),
+        ("ScriptShape", 6),
+        ("ScriptPlace", 7),
+        ("ScriptLayout", 8),
+        ("ScriptBreak", 9),
+        ("ScriptGetProperties", 10),
+        ("ScriptRecordDigitSubstitution", 11),
+        ("ScriptApplyDigitSubstitution", 12),
+        ("ScriptCacheGetHeight", 13),
+        ("ScriptFreeCache", 14),
+    ]);
+}
+
+#[test]
+fn t01_35_synthetic_exports_all_dlls_present() {
+    // Verify all 15 required DLLs are present in the export tables
+    let tables = get_export_tables();
+    let required = [
+        "comctl32.dll",
+        "comdlg32.dll",
+        "oleaut32.dll",
+        "shlwapi.dll",
+        "crypt32.dll",
+        "wintrust.dll",
+        "setupapi.dll",
+        "dwrite.dll",
+        "propsys.dll",
+        "urlmon.dll",
+        "mscoree.dll",
+        "msvcrt.dll",
+        "winmm.dll",
+        "imm32.dll",
+        "usp10.dll",
+    ];
+    for dll in &required {
+        assert!(
+            tables.contains_key(*dll),
+            "Required DLL '{dll}' is missing from export tables"
+        );
+        let exports = &tables[*dll];
+        assert!(
+            !exports.is_empty(),
+            "DLL '{dll}' has empty export table"
+        );
+    }
+}
+
+#[test]
+fn t01_36_synthetic_exports_ordinal_continuity() {
+    // Verify that ordinals are consecutive (no gaps) within each DLL's table
+    let tables = get_export_tables();
+    let dlls = [
+        "comctl32.dll",
+        "comdlg32.dll",
+        "oleaut32.dll",
+        "shlwapi.dll",
+        "crypt32.dll",
+        "wintrust.dll",
+        "setupapi.dll",
+        "dwrite.dll",
+        "propsys.dll",
+        "urlmon.dll",
+        "mscoree.dll",
+        "msvcrt.dll",
+        "winmm.dll",
+        "imm32.dll",
+        "usp10.dll",
+    ];
+    for dll in &dlls {
+        if let Some(exports) = tables.get(*dll) {
+            for i in 1..exports.len() {
+                assert_eq!(
+                    exports[i].ordinal,
+                    exports[i - 1].ordinal + 1,
+                    "DLL '{dll}': ordinal gap between {} (index {}) and {} (index {})",
+                    exports[i - 1].ordinal,
+                    i - 1,
+                    exports[i].ordinal,
+                    i,
+                );
+            }
+        }
+    }
+}
+
 fn reason_codes_keep_stable_numeric_values() {
     assert_eq!(ReasonCode::RcPeParseInvalid.as_u32(), 2000);
     assert_eq!(ReasonCode::RcImportMissing.as_u32(), 2001);

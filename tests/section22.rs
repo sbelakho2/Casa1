@@ -743,6 +743,7 @@ fn t22_12_end_to_end_integration() {
     let root_sig = runtime.create_root_signature(RootSignatureDesc {
         descriptor_tables: vec![1],
         root_constants: 4,
+        ..Default::default()
     });
     let pso = runtime.create_pipeline_state(
         root_sig,

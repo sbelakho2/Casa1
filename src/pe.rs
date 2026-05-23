@@ -41,6 +41,7 @@ pub const STATUS_ENTRYPOINT_NOT_FOUND: u32 = 0xc000_0139;
 pub const IMAGE_DIRECTORY_ENTRY_EXPORT: usize = 0;
 pub const IMAGE_DIRECTORY_ENTRY_IMPORT: usize = 1;
 pub const IMAGE_DIRECTORY_ENTRY_RESOURCE: usize = 2;
+pub const IMAGE_DIRECTORY_ENTRY_EXCEPTION: usize = 3;
 pub const IMAGE_DIRECTORY_ENTRY_BASERELOC: usize = 5;
 pub const IMAGE_DIRECTORY_ENTRY_DEBUG: usize = 6;
 pub const IMAGE_DIRECTORY_ENTRY_TLS: usize = 9;
@@ -1947,6 +1948,553 @@ fn pe_error(message: impl Into<String>) -> AppError {
 
 fn invalid<T>(message: impl Into<String>) -> AppResult<T> {
     Err(pe_error(message))
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PE Icon Resource Extraction (Phase 1.1)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Icon directory header — matches `GRPICONDIR` / ICO file header.
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+pub struct IconDirHeader {
+    pub reserved: u16,
+    pub ty: u16, // 1 = ICO
+    pub count: u16,
+}
+
+/// Icon directory entry — matches `GRPICONDIRENTRY` / ICO directory entry.
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+pub struct IconDirEntry {
+    pub width: u8,
+    pub height: u8,
+    pub colors: u8,
+    pub reserved: u8,
+    pub planes: u16,
+    pub bpp: u16,
+    pub size: u32,
+    pub offset: u32,
+}
+
+// Re-export IconImage from the icon module to keep a single canonical type.
+pub use crate::icon::IconImage;
+
+/// A group icon resource: the header + array of directory entries from
+/// a single `RT_GROUP_ICON` resource.
+#[derive(Debug, Clone)]
+pub struct GroupIcon {
+    pub header: IconDirHeader,
+    pub entries: Vec<IconDirEntry>,
+}
+
+/// Find all `RT_GROUP_ICON` resources in the PE file and return their
+/// parsed `GroupIcon` structures (header + directory entries).
+///
+/// The returned `GroupIcon.entries` contain an `offset` field that
+/// holds the **resource ID** (icon name ID) to use when looking up
+/// the corresponding `RT_ICON` entry.
+pub fn find_resource_group_icons(pe_data: &[u8]) -> AppResult<Vec<GroupIcon>> {
+    let parsed = parse(pe_data)?;
+    let sections = &parsed.sections;
+    let directories = &parsed.data_directories;
+
+    let resource_dir = directories
+        .get(IMAGE_DIRECTORY_ENTRY_RESOURCE)
+        .copied()
+        .unwrap_or_default();
+    if resource_dir.virtual_address == 0 || resource_dir.size == 0 {
+        return Ok(Vec::new());
+    }
+
+    let res_section = section_for_rva(sections, resource_dir.virtual_address, 1, true)
+        .ok_or_else(|| pe_error("resource directory RVA is not covered by any section"))?;
+
+    let section_bytes = slice(
+        pe_data,
+        res_section.raw_data_ptr as usize,
+        res_section.raw_data_size as usize,
+        "resource section",
+    )?;
+
+    // Navigate: Root → Type (RT_GROUP_ICON) → Name → Language → Data Entry
+    let group_icon_data_entries =
+        collect_resource_data_entries_by_type(section_bytes, res_section.virtual_address, resource_dir.virtual_address, RT_GROUP_ICON)?;
+
+    let mut groups = Vec::new();
+    for data_entry in &group_icon_data_entries {
+        let data = get_resource_section_data(
+            section_bytes,
+            res_section.virtual_address,
+            data_entry.data_rva,
+            data_entry.data_size,
+        )?;
+        if data.len() < 6 {
+            continue;
+        }
+        let reserved = u16::from_le_bytes([data[0], data[1]]);
+        let ty = u16::from_le_bytes([data[2], data[3]]);
+        let count = u16::from_le_bytes([data[4], data[5]]);
+        if reserved != 0 || ty != 1 {
+            continue;
+        }
+
+        let header = IconDirHeader { reserved, ty, count };
+        let mut entries = Vec::with_capacity(count as usize);
+        for i in 0..count as usize {
+            let off = 6 + i * 14;
+            if off + 14 > data.len() {
+                break;
+            }
+            let width = data[off];
+            let height = data[off + 1];
+            let colors = data[off + 2];
+            let reserved_byte = data[off + 3];
+            let planes = u16::from_le_bytes([data[off + 4], data[off + 5]]);
+            let bpp = u16::from_le_bytes([data[off + 6], data[off + 7]]);
+            let size = u32::from_le_bytes([
+                data[off + 8], data[off + 9], data[off + 10], data[off + 11],
+            ]);
+            let icon_id = u16::from_le_bytes([data[off + 12], data[off + 13]]);
+
+            // Store the icon resource ID in the offset field (it's unused in
+            // the ICO file context but serves as our link to RT_ICON).
+            entries.push(IconDirEntry {
+                width,
+                height,
+                colors,
+                reserved: reserved_byte,
+                planes,
+                bpp,
+                size,
+                offset: icon_id as u32,
+            });
+        }
+        groups.push(GroupIcon { header, entries });
+    }
+
+    Ok(groups)
+}
+
+/// Extract the actual `RT_ICON` bitmap data bytes for a single icon entry
+/// (identified by its resource name ID from a group icon entry).
+pub fn find_resource_icon_by_id(pe_data: &[u8], icon_id: u32) -> AppResult<Option<Vec<u8>>> {
+    let parsed = parse(pe_data)?;
+    let sections = &parsed.sections;
+    let directories = &parsed.data_directories;
+
+    let resource_dir = directories
+        .get(IMAGE_DIRECTORY_ENTRY_RESOURCE)
+        .copied()
+        .unwrap_or_default();
+    if resource_dir.virtual_address == 0 || resource_dir.size == 0 {
+        return Ok(None);
+    }
+
+    let res_section = section_for_rva(sections, resource_dir.virtual_address, 1, true)
+        .ok_or_else(|| pe_error("resource directory RVA is not covered by any section"))?;
+    let section_bytes = slice(
+        pe_data,
+        res_section.raw_data_ptr as usize,
+        res_section.raw_data_size as usize,
+        "resource section",
+    )?;
+
+    let data_entries =
+        collect_resource_data_entries_by_type_and_name(section_bytes, res_section.virtual_address, resource_dir.virtual_address, RT_ICON, icon_id)?;
+
+    if let Some(entry) = data_entries.first() {
+        let data = get_resource_section_data(
+            section_bytes,
+            res_section.virtual_address,
+            entry.data_rva,
+            entry.data_size,
+        )?;
+        Ok(Some(data))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Extract the first (largest) icon from a PE file.
+///
+/// This is the primary extraction function. It finds all group icon
+/// resources, then for each entry resolves the corresponding `RT_ICON`
+/// data and returns a `Vec<IconImage>`.
+pub fn extract_icon_from_pe(pe_data: &[u8]) -> AppResult<Vec<IconImage>> {
+    let all = extract_all_icons_from_pe(pe_data)?;
+    // Return the icon with the highest score (pixel count × bpp)
+    Ok(all
+        .into_iter()
+        .max_by(|a, b| {
+            let sa = (a.width * a.height * a.bpp as u32) as u64;
+            let sb = (b.width * b.height * b.bpp as u32) as u64;
+            sa.cmp(&sb)
+        })
+        .into_iter()
+        .collect())
+}
+
+/// Extract all icon images from a PE file, across all group icon resources.
+pub fn extract_all_icons_from_pe(pe_data: &[u8]) -> AppResult<Vec<IconImage>> {
+    let groups = find_resource_group_icons(pe_data)?;
+    let mut icons = Vec::new();
+
+    for group in &groups {
+        for entry in &group.entries {
+            // The offset field holds the icon resource ID (name ID)
+            let icon_id = entry.offset;
+            let Some(icon_data) = find_resource_icon_by_id(pe_data, icon_id)? else {
+                continue;
+            };
+
+            let display_width = if entry.width == 0 {
+                256u32
+            } else {
+                entry.width as u32
+            };
+            let display_height = if entry.height == 0 {
+                256u32
+            } else {
+                entry.height as u32
+            };
+
+            // Check if the icon data is PNG-compressed (common in Vista+)
+            let is_png = icon_data.len() >= 8
+                && icon_data[0] == 0x89
+                && icon_data[1] == b'P'
+                && icon_data[2] == b'N'
+                && icon_data[3] == b'G';
+
+            icons.push(IconImage {
+                width: display_width,
+                height: display_height,
+                bpp: entry.bpp,
+                data: icon_data,
+                is_png_compressed: is_png,
+                xor_mask: None,
+            });
+        }
+    }
+
+    Ok(icons)
+}
+
+// ── Internal helpers for resource-tree traversal ────────────────────────────
+
+#[derive(Debug)]
+struct ResourceDataEntry {
+    data_rva: u32,
+    data_size: u32,
+}
+
+/// Collect all data entries under a given type ID at the first resource level.
+fn collect_resource_data_entries_by_type(
+    section_data: &[u8],
+    section_rva: u32,
+    root_rva: u32,
+    type_id: u32,
+) -> AppResult<Vec<ResourceDataEntry>> {
+    let root_relative = root_rva
+        .checked_sub(section_rva)
+        .ok_or_else(|| pe_error("resource root underflow"))? as usize;
+    if root_relative + 16 > section_data.len() {
+        return Ok(Vec::new());
+    }
+
+    let named_entries =
+        u16::from_le_bytes([section_data[root_relative + 12], section_data[root_relative + 13]]) as usize;
+    let id_entries =
+        u16::from_le_bytes([section_data[root_relative + 14], section_data[root_relative + 15]]) as usize;
+    let total = named_entries + id_entries;
+
+    for i in 0..total {
+        let off = root_relative + 16 + i * 8;
+        if off + 8 > section_data.len() {
+            break;
+        }
+        let name_or_id = u32::from_le_bytes([
+            section_data[off],
+            section_data[off + 1],
+            section_data[off + 2],
+            section_data[off + 3],
+        ]);
+        // Skip named entries (high bit set) — we only match by numeric ID
+        if name_or_id & 0x8000_0000 != 0 {
+            continue;
+        }
+        if (name_or_id & 0xffff) != type_id {
+            continue;
+        }
+
+        let payload = u32::from_le_bytes([
+            section_data[off + 4],
+            section_data[off + 5],
+            section_data[off + 6],
+            section_data[off + 7],
+        ]);
+
+        if payload & 0x8000_0000 != 0 {
+            // Points to a subdirectory — recurse to collect all data entries beneath it
+            let subdir_rva = root_rva
+                .checked_add(payload & 0x7fff_ffff)
+                .ok_or_else(|| pe_error("resource subdirectory overflow"))?;
+            return collect_data_entries_recursive(section_data, section_rva, root_rva, subdir_rva, 2);
+        } else {
+            // Points to a data entry directly (unusual at level 1 but handle gracefully)
+            let data_entry_rva = root_rva
+                .checked_add(payload & 0x7fff_ffff)
+                .ok_or_else(|| pe_error("resource data entry overflow"))?;
+            return Ok(vec![read_resource_data_entry(section_data, section_rva, data_entry_rva)?]);
+        }
+    }
+
+    Ok(Vec::new())
+}
+
+/// Collect data entries by matching both type ID (level 1) and name ID (level 2).
+fn collect_resource_data_entries_by_type_and_name(
+    section_data: &[u8],
+    section_rva: u32,
+    root_rva: u32,
+    type_id: u32,
+    name_id: u32,
+) -> AppResult<Vec<ResourceDataEntry>> {
+    let root_relative = root_rva
+        .checked_sub(section_rva)
+        .ok_or_else(|| pe_error("resource root underflow"))? as usize;
+    if root_relative + 16 > section_data.len() {
+        return Ok(Vec::new());
+    }
+
+    let named_entries =
+        u16::from_le_bytes([section_data[root_relative + 12], section_data[root_relative + 13]]) as usize;
+    let id_entries =
+        u16::from_le_bytes([section_data[root_relative + 14], section_data[root_relative + 15]]) as usize;
+    let total = named_entries + id_entries;
+
+    for i in 0..total {
+        let off = root_relative + 16 + i * 8;
+        if off + 8 > section_data.len() {
+            break;
+        }
+        let name_or_id = u32::from_le_bytes([
+            section_data[off],
+            section_data[off + 1],
+            section_data[off + 2],
+            section_data[off + 3],
+        ]);
+        if name_or_id & 0x8000_0000 != 0 {
+            continue;
+        }
+        if (name_or_id & 0xffff) != type_id {
+            continue;
+        }
+
+        let payload = u32::from_le_bytes([
+            section_data[off + 4],
+            section_data[off + 5],
+            section_data[off + 6],
+            section_data[off + 7],
+        ]);
+        if payload & 0x8000_0000 == 0 {
+            continue; // Need a subdirectory
+        }
+
+        let type_subdir_rva = root_rva
+            .checked_add(payload & 0x7fff_ffff)
+            .ok_or_else(|| pe_error("resource subdirectory overflow"))?;
+
+        // Search level 2 (name) for the specific name_id
+        return find_data_entries_by_name_id(
+            section_data,
+            section_rva,
+            root_rva,
+            type_subdir_rva,
+            name_id,
+        );
+    }
+
+    Ok(Vec::new())
+}
+
+/// At the second resource level (name entries), find entries matching `name_id`.
+fn find_data_entries_by_name_id(
+    section_data: &[u8],
+    section_rva: u32,
+    root_rva: u32,
+    dir_rva: u32,
+    name_id: u32,
+) -> AppResult<Vec<ResourceDataEntry>> {
+    let dir_relative = dir_rva
+        .checked_sub(section_rva)
+        .ok_or_else(|| pe_error("resource dir underflow"))? as usize;
+    if dir_relative + 16 > section_data.len() {
+        return Ok(Vec::new());
+    }
+
+    let named_entries =
+        u16::from_le_bytes([section_data[dir_relative + 12], section_data[dir_relative + 13]]) as usize;
+    let id_entries =
+        u16::from_le_bytes([section_data[dir_relative + 14], section_data[dir_relative + 15]]) as usize;
+    let total = named_entries + id_entries;
+
+    for i in 0..total {
+        let off = dir_relative + 16 + i * 8;
+        if off + 8 > section_data.len() {
+            break;
+        }
+        let name_or_id = u32::from_le_bytes([
+            section_data[off],
+            section_data[off + 1],
+            section_data[off + 2],
+            section_data[off + 3],
+        ]);
+        if name_or_id & 0x8000_0000 != 0 {
+            continue;
+        }
+        if (name_or_id & 0xffff) != name_id {
+            continue;
+        }
+
+        let payload = u32::from_le_bytes([
+            section_data[off + 4],
+            section_data[off + 5],
+            section_data[off + 6],
+            section_data[off + 7],
+        ]);
+
+        if payload & 0x8000_0000 != 0 {
+            // Navigate to level 3 (language) and collect all data entries
+            let lang_dir_rva = root_rva
+                .checked_add(payload & 0x7fff_ffff)
+                .ok_or_else(|| pe_error("resource language subdirectory overflow"))?;
+            return collect_data_entries_recursive(section_data, section_rva, root_rva, lang_dir_rva, 4);
+        } else {
+            // Points directly to a data entry
+            let data_entry_rva = root_rva
+                .checked_add(payload & 0x7fff_ffff)
+                .ok_or_else(|| pe_error("resource data entry overflow"))?;
+            return Ok(vec![read_resource_data_entry(section_data, section_rva, data_entry_rva)?]);
+        }
+    }
+
+    Ok(Vec::new())
+}
+
+/// Recursively collect all data entries at or below a given directory RVA.
+fn collect_data_entries_recursive(
+    section_data: &[u8],
+    section_rva: u32,
+    root_rva: u32,
+    dir_rva: u32,
+    depth: u8,
+) -> AppResult<Vec<ResourceDataEntry>> {
+    if depth > 4 {
+        return Ok(Vec::new());
+    }
+
+    let dir_relative = dir_rva
+        .checked_sub(section_rva)
+        .ok_or_else(|| pe_error("resource dir underflow"))? as usize;
+    if dir_relative + 16 > section_data.len() {
+        return Ok(Vec::new());
+    }
+
+    let named_entries =
+        u16::from_le_bytes([section_data[dir_relative + 12], section_data[dir_relative + 13]]) as usize;
+    let id_entries =
+        u16::from_le_bytes([section_data[dir_relative + 14], section_data[dir_relative + 15]]) as usize;
+    let total = named_entries + id_entries;
+
+    let mut results = Vec::new();
+    for i in 0..total {
+        let off = dir_relative + 16 + i * 8;
+        if off + 8 > section_data.len() {
+            break;
+        }
+        let _name_or_id = u32::from_le_bytes([
+            section_data[off],
+            section_data[off + 1],
+            section_data[off + 2],
+            section_data[off + 3],
+        ]);
+        let payload = u32::from_le_bytes([
+            section_data[off + 4],
+            section_data[off + 5],
+            section_data[off + 6],
+            section_data[off + 7],
+        ]);
+
+        if payload & 0x8000_0000 != 0 {
+            let child_rva = root_rva
+                .checked_add(payload & 0x7fff_ffff)
+                .ok_or_else(|| pe_error("resource subdirectory overflow"))?;
+            results.extend(collect_data_entries_recursive(
+                section_data,
+                section_rva,
+                root_rva,
+                child_rva,
+                depth + 1,
+            )?);
+        } else if depth >= 2 {
+            let data_entry_rva = root_rva
+                .checked_add(payload & 0x7fff_ffff)
+                .ok_or_else(|| pe_error("resource data entry overflow"))?;
+            results.push(read_resource_data_entry(section_data, section_rva, data_entry_rva)?);
+        }
+    }
+
+    Ok(results)
+}
+
+/// Read a `ResourceDataEntry` (offset-to-data + size) from a resource data entry structure.
+fn read_resource_data_entry(
+    section_data: &[u8],
+    section_rva: u32,
+    data_entry_rva: u32,
+) -> AppResult<ResourceDataEntry> {
+    let de_off = data_entry_rva
+        .checked_sub(section_rva)
+        .ok_or_else(|| pe_error("resource data entry underflow"))? as usize;
+    if de_off + 16 > section_data.len() {
+        return Err(pe_error("resource data entry truncated"));
+    }
+    let data_rva = u32::from_le_bytes([
+        section_data[de_off],
+        section_data[de_off + 1],
+        section_data[de_off + 2],
+        section_data[de_off + 3],
+    ]);
+    let data_size = u32::from_le_bytes([
+        section_data[de_off + 4],
+        section_data[de_off + 5],
+        section_data[de_off + 6],
+        section_data[de_off + 7],
+    ]);
+    Ok(ResourceDataEntry { data_rva, data_size })
+}
+
+/// Read raw bytes from the resource section data by RVA.
+fn get_resource_section_data(
+    section_bytes: &[u8],
+    section_rva: u32,
+    data_rva: u32,
+    data_size: u32,
+) -> AppResult<Vec<u8>> {
+    if data_size == 0 {
+        return Ok(Vec::new());
+    }
+    let offset = data_rva
+        .checked_sub(section_rva)
+        .ok_or_else(|| pe_error("resource data RVA underflow"))? as usize;
+    let end = offset
+        .checked_add(data_size as usize)
+        .ok_or_else(|| pe_error("resource data size overflow"))?;
+    if end > section_bytes.len() {
+        return Err(pe_error("resource data extends beyond section"));
+    }
+    Ok(section_bytes[offset..end].to_vec())
 }
 
 #[allow(dead_code)]

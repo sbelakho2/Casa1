@@ -64,6 +64,8 @@ pub enum ReasonCode {
     RcNetProtocolError = 2707,
     RcNetHttpRequestFailed = 2708,
     RcNetHttpHeaderNotFound = 2709,
+    RcNetSocketCreateFailed = 2710,
+    RcNetSendFailed = 2711,
     RcDrmInitFailed = 2800,
     RcDrmDecryptFailed = 2801,
     RcDrmIntegrityFailed = 2802,
@@ -71,6 +73,12 @@ pub enum ReasonCode {
     RcDrmPackUnsupported = 2804,
     RcDrmSectionNotFound = 2805,
     RcDrmRegionNotFound = 2806,
+    RcWmiParseError = 2900,
+    RcWmiClassNotFound = 2901,
+    RcWmiObjectNotFound = 2902,
+    RcTelemetryRanking = 2903,
+    SehException = 3000,
+    VeHandlerUnhandled = 3001,
 }
 
 impl ReasonCode {
@@ -141,6 +149,8 @@ impl ReasonCode {
             2707 => Some(Self::RcNetProtocolError),
             2708 => Some(Self::RcNetHttpRequestFailed),
             2709 => Some(Self::RcNetHttpHeaderNotFound),
+            2710 => Some(Self::RcNetSocketCreateFailed),
+            2711 => Some(Self::RcNetSendFailed),
             2800 => Some(Self::RcDrmInitFailed),
             2801 => Some(Self::RcDrmDecryptFailed),
             2802 => Some(Self::RcDrmIntegrityFailed),
@@ -148,6 +158,12 @@ impl ReasonCode {
             2804 => Some(Self::RcDrmPackUnsupported),
             2805 => Some(Self::RcDrmSectionNotFound),
             2806 => Some(Self::RcDrmRegionNotFound),
+            2900 => Some(Self::RcWmiParseError),
+            2901 => Some(Self::RcWmiClassNotFound),
+            2902 => Some(Self::RcWmiObjectNotFound),
+            2903 => Some(Self::RcTelemetryRanking),
+            3000 => Some(Self::SehException),
+            3001 => Some(Self::VeHandlerUnhandled),
             _ => None,
         }
     }
@@ -215,6 +231,8 @@ impl ReasonCode {
             Self::RcNetProtocolError => "RC_NET_PROTOCOL_ERROR",
             Self::RcNetHttpRequestFailed => "RC_NET_HTTP_REQUEST_FAILED",
             Self::RcNetHttpHeaderNotFound => "RC_NET_HTTP_HEADER_NOT_FOUND",
+            Self::RcNetSocketCreateFailed => "RC_NET_SOCKET_CREATE_FAILED",
+            Self::RcNetSendFailed => "RC_NET_SEND_FAILED",
             Self::RcDrmInitFailed => "RC_DRM_INIT_FAILED",
             Self::RcDrmDecryptFailed => "RC_DRM_DECRYPT_FAILED",
             Self::RcDrmIntegrityFailed => "RC_DRM_INTEGRITY_FAILED",
@@ -222,6 +240,12 @@ impl ReasonCode {
             Self::RcDrmPackUnsupported => "RC_DRM_PACK_UNSUPPORTED",
             Self::RcDrmSectionNotFound => "RC_DRM_SECTION_NOT_FOUND",
             Self::RcDrmRegionNotFound => "RC_DRM_REGION_NOT_FOUND",
+            Self::RcWmiParseError => "RC_WMI_PARSE_ERROR",
+            Self::RcWmiClassNotFound => "RC_WMI_CLASS_NOT_FOUND",
+            Self::RcWmiObjectNotFound => "RC_WMI_OBJECT_NOT_FOUND",
+            Self::RcTelemetryRanking => "RC_TELEMETRY_RANKING",
+            Self::SehException => "SEH_EXCEPTION",
+            Self::VeHandlerUnhandled => "VE_HANDLER_UNHANDLED",
         }
     }
 }

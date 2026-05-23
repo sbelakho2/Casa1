@@ -1,10 +1,12 @@
 use crate::error::{AppError, AppResult};
 use crate::reason::ReasonCode;
+use crate::winmm::WinMmSubsystem;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::Path;
 use std::process::{Command as HostCommand, Stdio};
+use std::sync::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub type DeviceId = u64;
@@ -258,7 +260,7 @@ impl Default for Ds3dListenerState {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct AudioSubsystem {
     next_id: u64,
     devices: BTreeMap<DeviceId, AudioDeviceRecord>,
@@ -273,6 +275,8 @@ pub struct AudioSubsystem {
     ds3d_listener_state: HashMap<DirectSoundId, Ds3dListenerState>,
     notifications: Vec<String>,
     latency_log: Vec<LatencyRecord>,
+    /// WinMM (Windows Multimedia) audio subsystem.
+    pub winmm: RwLock<WinMmSubsystem>,
 }
 
 impl Default for AudioSubsystem {
@@ -322,6 +326,7 @@ impl AudioSubsystem {
             ds3d_listener_state: HashMap::new(),
             notifications: Vec::new(),
             latency_log: Vec::new(),
+            winmm: RwLock::new(WinMmSubsystem::new()),
         }
     }
 

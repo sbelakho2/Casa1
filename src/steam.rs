@@ -122,7 +122,7 @@ struct IpcChannel {
     response: Vec<u8>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SteamClient {
     ge_root: String,
     library_roots: Vec<String>,

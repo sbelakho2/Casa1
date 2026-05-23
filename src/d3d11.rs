@@ -26,6 +26,497 @@ pub type SamplerStateId = u64;
 pub type InputLayoutId = u64;
 pub type ShaderId = u64;
 pub type D3d9DeviceId = u64;
+pub type D3d9VertexBufferId = u64;
+pub type D3d9IndexBufferId = u64;
+pub type D3d9TextureId = u64;
+pub type D3d9SurfaceId = u64;
+pub type D3d9QueryId = u64;
+
+// ── D3D9 Constants ───────────────────────────────────────────────────────────
+
+// D3DPRIMITIVETYPE
+pub const D3DPT_POINTLIST: u32 = 1;
+pub const D3DPT_LINELIST: u32 = 2;
+pub const D3DPT_LINESTRIP: u32 = 3;
+pub const D3DPT_TRIANGLELIST: u32 = 4;
+pub const D3DPT_TRIANGLESTRIP: u32 = 5;
+pub const D3DPT_TRIANGLEFAN: u32 = 6;
+
+// D3DFVF (Flexible Vertex Format) flags
+pub const D3DFVF_RESERVED0: u32 = 0x001;
+pub const D3DFVF_XYZ: u32 = 0x002;
+pub const D3DFVF_XYZRHW: u32 = 0x004;
+pub const D3DFVF_XYZB1: u32 = 0x006;
+pub const D3DFVF_XYZB2: u32 = 0x008;
+pub const D3DFVF_XYZB3: u32 = 0x00a;
+pub const D3DFVF_XYZB4: u32 = 0x00c;
+pub const D3DFVF_XYZB5: u32 = 0x00e;
+pub const D3DFVF_XYZW: u32 = 0x4002; // or 0x4000|0x0002
+pub const D3DFVF_NORMAL: u32 = 0x010;
+pub const D3DFVF_PSIZE: u32 = 0x020;
+pub const D3DFVF_DIFFUSE: u32 = 0x040;
+pub const D3DFVF_SPECULAR: u32 = 0x080;
+pub const D3DFVF_TEX0: u32 = 0x000;
+pub const D3DFVF_TEX1: u32 = 0x100;
+pub const D3DFVF_TEX2: u32 = 0x200;
+pub const D3DFVF_TEX3: u32 = 0x300;
+pub const D3DFVF_TEX4: u32 = 0x400;
+pub const D3DFVF_TEX5: u32 = 0x500;
+pub const D3DFVF_TEX6: u32 = 0x600;
+pub const D3DFVF_TEX7: u32 = 0x700;
+pub const D3DFVF_TEX8: u32 = 0x800;
+pub const D3DFVF_LASTBETA_UBYTE4: u32 = 0x1000;
+pub const D3DFVF_LASTBETA_D3DCOLOR: u32 = 0x8000;
+
+// D3DRENDERSTATETYPE
+pub const D3DRS_ZENABLE: u32 = 7;
+pub const D3DRS_FILLMODE: u32 = 8;
+pub const D3DRS_SHADEMODE: u32 = 9;
+pub const D3DRS_ZWRITEENABLE: u32 = 14;
+pub const D3DRS_ALPHATESTENABLE: u32 = 15;
+pub const D3DRS_LASTPIXEL: u32 = 16;
+pub const D3DRS_SRCBLEND: u32 = 19;
+pub const D3DRS_DESTBLEND: u32 = 20;
+pub const D3DRS_CULLMODE: u32 = 22;
+pub const D3DRS_ZFUNC: u32 = 23;
+pub const D3DRS_ALPHAREF: u32 = 24;
+pub const D3DRS_ALPHAFUNC: u32 = 25;
+pub const D3DRS_DITHERENABLE: u32 = 26;
+pub const D3DRS_ALPHABLENDENABLE: u32 = 27;
+pub const D3DRS_FOGENABLE: u32 = 28;
+pub const D3DRS_SPECULARENABLE: u32 = 29;
+pub const D3DRS_FOGCOLOR: u32 = 34;
+pub const D3DRS_FOGTABLEMODE: u32 = 35;
+pub const D3DRS_FOGSTART: u32 = 36;
+pub const D3DRS_FOGEND: u32 = 37;
+pub const D3DRS_FOGDENSITY: u32 = 38;
+pub const D3DRS_RANGEFOGENABLE: u32 = 48;
+pub const D3DRS_STENCILENABLE: u32 = 52;
+pub const D3DRS_STENCILFAIL: u32 = 53;
+pub const D3DRS_STENCILZFAIL: u32 = 54;
+pub const D3DRS_STENCILPASS: u32 = 55;
+pub const D3DRS_STENCILFUNC: u32 = 56;
+pub const D3DRS_STENCILREF: u32 = 57;
+pub const D3DRS_STENCILMASK: u32 = 58;
+pub const D3DRS_STENCILWRITEMASK: u32 = 59;
+pub const D3DRS_TEXTUREFACTOR: u32 = 60;
+pub const D3DRS_WRAP0: u32 = 128;
+pub const D3DRS_WRAP1: u32 = 129;
+pub const D3DRS_WRAP2: u32 = 130;
+pub const D3DRS_WRAP3: u32 = 131;
+pub const D3DRS_WRAP4: u32 = 132;
+pub const D3DRS_WRAP5: u32 = 133;
+pub const D3DRS_WRAP6: u32 = 134;
+pub const D3DRS_WRAP7: u32 = 135;
+pub const D3DRS_CLIPPING: u32 = 136;
+pub const D3DRS_LIGHTING: u32 = 137;
+pub const D3DRS_AMBIENT: u32 = 139;
+pub const D3DRS_FOGVERTEXMODE: u32 = 140;
+pub const D3DRS_COLORVERTEX: u32 = 141;
+pub const D3DRS_LOCALVIEWER: u32 = 142;
+pub const D3DRS_NORMALIZENORMALS: u32 = 143;
+pub const D3DRS_DIFFUSEMATERIALSOURCE: u32 = 145;
+pub const D3DRS_SPECULARMATERIALSOURCE: u32 = 146;
+pub const D3DRS_AMBIENTMATERIALSOURCE: u32 = 147;
+pub const D3DRS_EMISSIVEMATERIALSOURCE: u32 = 148;
+pub const D3DRS_VERTEXBLEND: u32 = 151;
+pub const D3DRS_CLIPPLANEENABLE: u32 = 152;
+pub const D3DRS_POINTSIZE: u32 = 154;
+pub const D3DRS_POINTSIZEMIN: u32 = 155;
+pub const D3DRS_POINTSIZE_MAX: u32 = 156; // renamed to avoid conflict
+pub const D3DRS_POINTSPRITEENABLE: u32 = 157;
+pub const D3DRS_POINTSCALEENABLE: u32 = 158;
+pub const D3DRS_POINTSCALE_A: u32 = 159;
+pub const D3DRS_POINTSCALE_B: u32 = 160;
+pub const D3DRS_POINTSCALE_C: u32 = 161;
+pub const D3DRS_MULTISAMPLEANTIALIAS: u32 = 161; // reuse with caution
+pub const D3DRS_MULTISAMPLEMASK: u32 = 162;
+pub const D3DRS_PATCHEDGESTYLE: u32 = 163;
+pub const D3DRS_DEBUGMONITORTOKEN: u32 = 165;
+pub const D3DRS_POINTSIZE_MAX_V9: u32 = 166;
+pub const D3DRS_INDEXEDVERTEXBLENDENABLE: u32 = 167;
+pub const D3DRS_COLORWRITEENABLE: u32 = 168;
+pub const D3DRS_TWEENFACTOR: u32 = 170;
+pub const D3DRS_BLENDOP: u32 = 171;
+pub const D3DRS_POSITIONDEGREE: u32 = 172;
+pub const D3DRS_NORMALDEGREE: u32 = 173;
+pub const D3DRS_SCISSORTESTENABLE: u32 = 174;
+pub const D3DRS_SLOPESCALEDEPTHBIAS: u32 = 175;
+pub const D3DRS_ANTIALIASEDLINEENABLE: u32 = 176;
+pub const D3DRS_MINTESSELLATIONLEVEL: u32 = 178;
+pub const D3DRS_MAXTESSELLATIONLEVEL: u32 = 179;
+pub const D3DRS_ADAPTIVETESS_X: u32 = 180;
+pub const D3DRS_ADAPTIVETESS_Y: u32 = 181;
+pub const D3DRS_ADAPTIVETESS_Z: u32 = 182;
+pub const D3DRS_ADAPTIVETESS_W: u32 = 183;
+pub const D3DRS_ENABLEADAPTIVETESSELLATION: u32 = 184;
+pub const D3DRS_DISPLACEMENTMAPSCALE: u32 = 186;
+pub const D3DRS_DISPLACEMENTMAPSAMPLING: u32 = 187;
+pub const D3DRS_DOMAIN: u32 = 188;
+pub const D3DRS_TESSELLATIONMODE: u32 = 189;
+
+// D3DTRANSFORMSTATETYPE
+pub const D3DTS_VIEW: u32 = 2;
+pub const D3DTS_PROJECTION: u32 = 3;
+pub const D3DTS_TEXTURE0: u32 = 16;
+pub const D3DTS_TEXTURE1: u32 = 17;
+pub const D3DTS_TEXTURE2: u32 = 18;
+pub const D3DTS_TEXTURE3: u32 = 19;
+pub const D3DTS_TEXTURE4: u32 = 20;
+pub const D3DTS_TEXTURE5: u32 = 21;
+pub const D3DTS_TEXTURE6: u32 = 22;
+pub const D3DTS_TEXTURE7: u32 = 23;
+pub const D3DTS_WORLD: u32 = 256;
+pub const D3DTS_WORLD1: u32 = 257;
+pub const D3DTS_WORLD2: u32 = 258;
+pub const D3DTS_WORLD3: u32 = 259;
+
+// D3DSAMPLERSTATETYPE / D3DTEXTURESTAGESTATETYPE
+pub const D3DTSS_COLOROP: u32 = 1;
+pub const D3DTSS_COLORARG1: u32 = 2;
+pub const D3DTSS_COLORARG2: u32 = 3;
+pub const D3DTSS_ALPHAOP: u32 = 4;
+pub const D3DTSS_ALPHAARG1: u32 = 5;
+pub const D3DTSS_ALPHAARG2: u32 = 6;
+pub const D3DTSS_BUMPENVMAT00: u32 = 7;
+pub const D3DTSS_BUMPENVMAT01: u32 = 8;
+pub const D3DTSS_BUMPENVMAT10: u32 = 9;
+pub const D3DTSS_BUMPENVMAT11: u32 = 10;
+pub const D3DTSS_TEXCOORDINDEX: u32 = 11;
+pub const D3DTSS_BUMPENVLSCALE: u32 = 22;
+pub const D3DTSS_BUMPENVLOFFSET: u32 = 23;
+pub const D3DTSS_TEXTURETRANSFORMFLAGS: u32 = 24;
+pub const D3DTSS_COLORARG0: u32 = 26;
+pub const D3DTSS_ALPHAARG0: u32 = 27;
+pub const D3DTSS_RESULTARG: u32 = 28;
+
+// D3DTEXTUREOP
+pub const D3DTOP_DISABLE: u32 = 1;
+pub const D3DTOP_SELECTARG1: u32 = 2;
+pub const D3DTOP_SELECTARG2: u32 = 3;
+pub const D3DTOP_MODULATE: u32 = 4;
+pub const D3DTOP_MODULATE2X: u32 = 5;
+pub const D3DTOP_MODULATE4X: u32 = 6;
+pub const D3DTOP_ADD: u32 = 7;
+pub const D3DTOP_ADDSIGNED: u32 = 8;
+pub const D3DTOP_ADDSIGNED2X: u32 = 9;
+pub const D3DTOP_SUBTRACT: u32 = 10;
+pub const D3DTOP_ADDSMOOTH: u32 = 11;
+pub const D3DTOP_BLENDDIFFUSEALPHA: u32 = 12;
+pub const D3DTOP_BLENDTEXTUREALPHA: u32 = 13;
+pub const D3DTOP_BLENDFACTORALPHA: u32 = 14;
+pub const D3DTOP_BLENDTEXTUREALPHAPM: u32 = 15;
+pub const D3DTOP_BLENDCURRENTALPHA: u32 = 16;
+pub const D3DTOP_PREMODULATE: u32 = 17;
+pub const D3DTOP_MODULATEALPHA_ADDCOLOR: u32 = 18;
+pub const D3DTOP_MODULATECOLOR_ADDALPHA: u32 = 19;
+pub const D3DTOP_MODULATEINVALPHA_ADDCOLOR: u32 = 20;
+pub const D3DTOP_MODULATEINVCOLOR_ADDALPHA: u32 = 21;
+pub const D3DTOP_BUMPENVMAP: u32 = 22;
+pub const D3DTOP_BUMPENVMAPLUMINANCE: u32 = 23;
+pub const D3DTOP_DOTPRODUCT3: u32 = 24;
+pub const D3DTOP_MULTIPLYADD: u32 = 25;
+pub const D3DTOP_LERP: u32 = 26;
+
+// D3DTA (texture argument)
+pub const D3DTA_TEXTURE: u32 = 0x00000004;
+pub const D3DTA_CURRENT: u32 = 0x00000008;
+pub const D3DTA_DIFFUSE: u32 = 0x00000000;
+pub const D3DTA_SPECULAR: u32 = 0x00000020;
+pub const D3DTA_TEMP: u32 = 0x00000040;
+pub const D3DTA_CONSTANT: u32 = 0x00000080;
+pub const D3DTA_ALPHAREPLICATE: u32 = 0x00000200;
+pub const D3DTA_COMPLEMENT: u32 = 0x00000100;
+
+// D3DCULL
+pub const D3DCULL_NONE: u32 = 1;
+pub const D3DCULL_CW: u32 = 2;
+pub const D3DCULL_CCW: u32 = 3;
+
+// D3DFILLMODE
+pub const D3DFILL_POINT: u32 = 1;
+pub const D3DFILL_WIREFRAME: u32 = 2;
+pub const D3DFILL_SOLID: u32 = 3;
+
+// D3DSHADEMODE
+pub const D3DSHADE_FLAT: u32 = 1;
+pub const D3DSHADE_GOURAUD: u32 = 2;
+pub const D3DSHADE_PHONG: u32 = 3;
+
+// D3DBLEND
+pub const D3DBLEND_ZERO: u32 = 1;
+pub const D3DBLEND_ONE: u32 = 2;
+pub const D3DBLEND_SRCCOLOR: u32 = 3;
+pub const D3DBLEND_INVSRCCOLOR: u32 = 4;
+pub const D3DBLEND_SRCALPHA: u32 = 5;
+pub const D3DBLEND_INVSRCALPHA: u32 = 6;
+pub const D3DBLEND_DESTALPHA: u32 = 7;
+pub const D3DBLEND_INVDESTALPHA: u32 = 8;
+pub const D3DBLEND_DESTCOLOR: u32 = 9;
+pub const D3DBLEND_INVDESTCOLOR: u32 = 10;
+pub const D3DBLEND_SRCALPHASAT: u32 = 11;
+pub const D3DBLEND_BOTHSRCALPHA: u32 = 12;
+pub const D3DBLEND_BOTHINVSRCALPHA: u32 = 13;
+pub const D3DBLEND_BLENDFACTOR: u32 = 14;
+
+// D3DCMPFUNC
+pub const D3DCMP_NEVER: u32 = 1;
+pub const D3DCMP_LESS: u32 = 2;
+pub const D3DCMP_EQUAL: u32 = 3;
+pub const D3DCMP_LESSEQUAL: u32 = 4;
+pub const D3DCMP_GREATER: u32 = 5;
+pub const D3DCMP_NOTEQUAL: u32 = 6;
+pub const D3DCMP_GREATEREQUAL: u32 = 7;
+pub const D3DCMP_ALWAYS: u32 = 8;
+
+// D3DSTENCILOP
+pub const D3DSTENCILOP_KEEP: u32 = 1;
+pub const D3DSTENCILOP_ZERO: u32 = 2;
+pub const D3DSTENCILOP_REPLACE: u32 = 3;
+pub const D3DSTENCILOP_INCRSAT: u32 = 4;
+pub const D3DSTENCILOP_DECRSAT: u32 = 5;
+pub const D3DSTENCILOP_INVERT: u32 = 6;
+pub const D3DSTENCILOP_INCR: u32 = 7;
+pub const D3DSTENCILOP_DECR: u32 = 8;
+
+// D3DMATERIALCOLORSOURCE
+pub const D3DMCS_MATERIAL: u32 = 0;
+pub const D3DMCS_COLOR1: u32 = 1;
+pub const D3DMCS_COLOR2: u32 = 2;
+
+// D3DLIGHTTYPE
+pub const D3DLIGHT_POINT: u32 = 1;
+pub const D3DLIGHT_SPOT: u32 = 2;
+pub const D3DLIGHT_DIRECTIONAL: u32 = 3;
+
+// D3DPRESENTFLAG
+pub const D3DPRESENTFLAG_LOCKABLE_BACKBUFFER: u32 = 0x00000001;
+pub const D3DPRESENTFLAG_DISCARD_DEPTHSTENCIL: u32 = 0x00000002;
+pub const D3DPRESENTFLAG_DEVICECLIP: u32 = 0x00000004;
+pub const D3DPRESENTFLAG_VIDEO: u32 = 0x00000010;
+
+// D3DSWAPEFFECT
+pub const D3DSWAPEFFECT_DISCARD: u32 = 1;
+pub const D3DSWAPEFFECT_FLIP: u32 = 2;
+pub const D3DSWAPEFFECT_COPY: u32 = 3;
+pub const D3DSWAPEFFECT_OVERLAY: u32 = 4;
+pub const D3DSWAPEFFECT_FLIPEX: u32 = 5;
+
+// D3DPRESENT_INTERVAL
+pub const D3DPRESENT_INTERVAL_DEFAULT: u32 = 0x00000000;
+pub const D3DPRESENT_INTERVAL_ONE: u32 = 0x00000001;
+pub const D3DPRESENT_INTERVAL_TWO: u32 = 0x00000002;
+pub const D3DPRESENT_INTERVAL_THREE: u32 = 0x00000003;
+pub const D3DPRESENT_INTERVAL_FOUR: u32 = 0x00000004;
+pub const D3DPRESENT_INTERVAL_IMMEDIATE: u32 = 0x80000000;
+
+// D3D9 HRESULT codes
+pub const D3DERR_INVALIDCALL: u64 = 0x8876086C;
+pub const D3DERR_WASSTILLDRAWING: u64 = 0x88760208;
+pub const D3DERR_DRIVERINTERNALERROR: u64 = 0x8876020A;
+pub const D3D_OK: u64 = 0;
+pub const D3DERR_OUTOFVIDEOMEMORY: u64 = 0x887601C2;
+
+// Maximum limits
+pub const D3D9_MAX_STREAMS: usize = 16;
+pub const D3D9_MAX_TEXTURE_STAGES: usize = 8;
+pub const D3D9_MAX_RENDER_STATES: usize = 256;
+pub const D3D9_MAX_LIGHTS: usize = 8;
+pub const D3D9_MAX_TEXTURES: usize = 8;
+
+// ── D3D9 Structures ──────────────────────────────────────────────────────────
+
+/// 4x4 matrix in row-major order (same as D3DMATRIX)
+#[derive(Debug, Clone, Copy)]
+pub struct D3dMatrix {
+    pub m: [[f32; 4]; 4],
+}
+
+impl D3dMatrix {
+    pub fn identity() -> Self {
+        D3dMatrix {
+            m: [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct D3dViewport9 {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+    pub min_z: f32,
+    pub max_z: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct D3dMaterial9 {
+    pub diffuse: [f32; 4],
+    pub ambient: [f32; 4],
+    pub specular: [f32; 4],
+    pub emissive: [f32; 4],
+    pub power: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct D3dLight9 {
+    pub light_type: u32,
+    pub diffuse: [f32; 4],
+    pub specular: [f32; 4],
+    pub ambient: [f32; 4],
+    pub position: [f32; 3],
+    pub direction: [f32; 3],
+    pub range: f32,
+    pub falloff: f32,
+    pub attenuation0: f32,
+    pub attenuation1: f32,
+    pub attenuation2: f32,
+    pub theta: f32,
+    pub phi: f32,
+}
+
+#[derive(Debug, Clone)]
+pub struct D3dPresentParameters {
+    pub back_buffer_width: u32,
+    pub back_buffer_height: u32,
+    pub back_buffer_format: u32,
+    pub back_buffer_count: u32,
+    pub multi_sample_type: u32,
+    pub multi_sample_quality: u32,
+    pub swap_effect: u32,
+    pub device_window: u64,
+    pub windowed: bool,
+    pub enable_auto_depth_stencil: bool,
+    pub auto_depth_stencil_format: u32,
+    pub flags: u32,
+    pub fullscreen_refresh_rate_in_hz: u32,
+    pub presentation_interval: u32,
+}
+
+impl Default for D3dPresentParameters {
+    fn default() -> Self {
+        D3dPresentParameters {
+            back_buffer_width: 0,
+            back_buffer_height: 0,
+            back_buffer_format: 0,
+            back_buffer_count: 1,
+            multi_sample_type: 0,
+            multi_sample_quality: 0,
+            swap_effect: D3DSWAPEFFECT_DISCARD,
+            device_window: 0,
+            windowed: true,
+            enable_auto_depth_stencil: true,
+            auto_depth_stencil_format: 0,
+            flags: 0,
+            fullscreen_refresh_rate_in_hz: 0,
+            presentation_interval: D3DPRESENT_INTERVAL_DEFAULT,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct VertexBuffer9 {
+    pub id: D3d9VertexBufferId,
+    pub size: usize,
+    pub data: Vec<u8>,
+    pub fvf: u32,
+    pub stride: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct IndexBuffer9 {
+    pub id: D3d9IndexBufferId,
+    pub size: usize,
+    pub data: Vec<u8>,
+    pub format: bool, // true = 32-bit, false = 16-bit
+}
+
+#[derive(Debug, Clone)]
+pub struct D3d9Texture {
+    pub id: D3d9TextureId,
+    pub width: u32,
+    pub height: u32,
+    pub levels: Vec<Vec<u8>>,
+    pub format: u32,
+}
+
+/// Represents the complete D3D9 fixed-function state for a draw call.
+#[derive(Debug, Clone)]
+pub struct D3d9StateBlock {
+    pub render_states: [u32; D3D9_MAX_RENDER_STATES],
+    pub textures: [Option<D3d9TextureId>; D3D9_MAX_TEXTURES],
+    pub texture_stage_states: [[u32; 32]; D3D9_MAX_TEXTURE_STAGES],
+    pub transforms: BTreeMap<u32, D3dMatrix>,
+    pub materials: [Option<D3dMaterial9>; D3D9_MAX_LIGHTS],
+    pub lights_enabled: [bool; D3D9_MAX_LIGHTS],
+    pub ambient: u32,
+    pub viewport: D3dViewport9,
+    pub material: D3dMaterial9,
+    pub fvf: u32,
+    pub vertex_declaration: u64,
+    pub stream_source: [Option<(D3d9VertexBufferId, u32, u32)>; D3D9_MAX_STREAMS],
+    pub stream_frequency: [u32; D3D9_MAX_STREAMS],
+    pub indices: Option<(D3d9IndexBufferId, u32)>,
+    pub pixel_shader: u64,
+    pub vertex_shader: u64,
+    pub clip_planes: [bool; 6],
+    pub scissor_rect: Option<(i32, i32, i32, i32)>,
+}
+
+impl D3d9StateBlock {
+    pub fn new() -> Self {
+        let mut render_states = [0u32; D3D9_MAX_RENDER_STATES];
+        render_states[D3DRS_ZENABLE as usize] = 1; // D3DZB_TRUE
+        render_states[D3DRS_FILLMODE as usize] = D3DFILL_SOLID;
+        render_states[D3DRS_SHADEMODE as usize] = D3DSHADE_GOURAUD;
+        render_states[D3DRS_CULLMODE as usize] = D3DCULL_CCW;
+        render_states[D3DRS_ALPHABLENDENABLE as usize] = 0;
+        render_states[D3DRS_LIGHTING as usize] = 1;
+        render_states[D3DRS_SPECULARENABLE as usize] = 0;
+        render_states[D3DRS_COLORVERTEX as usize] = 1;
+        render_states[D3DRS_CLIPPING as usize] = 1;
+        render_states[D3DRS_LOCALVIEWER as usize] = 1;
+        render_states[D3DRS_DIFFUSEMATERIALSOURCE as usize] = D3DMCS_COLOR1;
+        render_states[D3DRS_SPECULARMATERIALSOURCE as usize] = D3DMCS_COLOR2;
+        render_states[D3DRS_AMBIENTMATERIALSOURCE as usize] = D3DMCS_MATERIAL;
+        render_states[D3DRS_EMISSIVEMATERIALSOURCE as usize] = D3DMCS_MATERIAL;
+
+        D3d9StateBlock {
+            render_states,
+            textures: [None; D3D9_MAX_TEXTURES],
+            texture_stage_states: [[0u32; 32]; D3D9_MAX_TEXTURE_STAGES],
+            transforms: BTreeMap::new(),
+            materials: [None; D3D9_MAX_LIGHTS],
+            lights_enabled: [false; D3D9_MAX_LIGHTS],
+            ambient: 0,
+            viewport: D3dViewport9 {
+                x: 0, y: 0, width: 800, height: 600, min_z: 0.0, max_z: 1.0,
+            },
+            material: D3dMaterial9 {
+                diffuse: [1.0, 1.0, 1.0, 1.0],
+                ambient: [0.0, 0.0, 0.0, 0.0],
+                specular: [0.0, 0.0, 0.0, 0.0],
+                emissive: [0.0, 0.0, 0.0, 0.0],
+                power: 0.0,
+            },
+            fvf: 0,
+            vertex_declaration: 0,
+            stream_source: [None; D3D9_MAX_STREAMS],
+            stream_frequency: [1u32; D3D9_MAX_STREAMS],
+            indices: None,
+            pixel_shader: 0,
+            vertex_shader: 0,
+            clip_planes: [false; 6],
+            scissor_rect: None,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
@@ -186,6 +677,9 @@ pub struct FixedFunctionScene {
 pub struct D3d9Frame {
     pub signature: String,
     pub hash: String,
+    pub pixels: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -220,6 +714,49 @@ struct ShaderArtifact {
     cache_key: String,
     metal_entry: String,
     output: ShaderTranslationOutput,
+}
+
+/// D3D11 predicate type (maps to D3D11_QUERY with MiscFlags).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PredicateType {
+    /// D3D11_QUERY_OCCLUSION_PREDICATE / D3D11_QUERY_OCCLUSION_PREDICATE16
+    Occlusion,
+    /// D3D11_QUERY_SO_OVERFLOW_PREDICATE / D3D11_QUERY_SO_OVERFLOW_PREDICATE16
+    StreamOutputOverflow,
+}
+
+/// A D3D11 predicate for conditional rendering.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Predicate {
+    pub predicate_type: PredicateType,
+    pub value: bool,
+}
+
+/// D3D11 counter type (maps to D3D11_COUNTER).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CounterType {
+    /// D3D11_COUNTER_DEVICE_DEPENDENT (0x40000000)
+    DeviceDependent,
+}
+
+/// A D3D11 counter for performance measurement.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Counter {
+    pub counter_type: CounterType,
+    pub unit_count: u64,
+}
+
+/// A D3D11 class linkage instance for shader class interfaces.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClassInstance {
+    pub class_name: String,
+    pub instance_index: u32,
+}
+
+/// D3D11 class linkage for linking shader class instances.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClassLinkage {
+    pub instances: Vec<ClassInstance>,
 }
 
 #[derive(Debug, Clone)]
@@ -292,6 +829,14 @@ pub enum RecordedCommand {
         y: u32,
         z: u32,
     },
+    ResolveSubresource {
+        dst: D3d11ResourceId,
+        dst_subresource: u32,
+        src: D3d11ResourceId,
+        src_subresource: u32,
+        /// Raw DXGI_FORMAT u32 value.
+        format: u32,
+    },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -309,11 +854,20 @@ pub struct DeferredContext {
 pub struct Direct3D9Shim {
     enabled: bool,
     next_id: D3d9DeviceId,
+    pub vertex_buffers: BTreeMap<D3d9VertexBufferId, VertexBuffer9>,
+    pub index_buffers: BTreeMap<D3d9IndexBufferId, IndexBuffer9>,
+    pub textures: BTreeMap<D3d9TextureId, D3d9Texture>,
+    pub devices: BTreeMap<D3d9DeviceId, Direct3D9Device>,
+    pub render_target: Option<(u32, u32, Vec<u8>)>,
 }
 
 #[derive(Debug, Clone)]
 pub struct Direct3D9Device {
-    id: D3d9DeviceId,
+    pub id: D3d9DeviceId,
+    pub state: D3d9StateBlock,
+    pub present_params: D3dPresentParameters,
+    pub swapchain_width: u32,
+    pub swapchain_height: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -339,6 +893,12 @@ pub struct D3d11Device {
     shader_cache: ShaderCache,
     translated_shaders: BTreeMap<String, ShaderTranslationOutput>,
     immediate: ImmediateContext,
+    /// D3D11 predicates for conditional rendering.
+    predicates: BTreeMap<u64, Predicate>,
+    /// D3D11 counters for performance measurement.
+    counters: BTreeMap<u64, Counter>,
+    /// D3D11 class linkage objects for shader class interfaces.
+    class_linkage: BTreeMap<u64, ClassLinkage>,
 }
 
 impl D3d11Device {
@@ -832,6 +1392,26 @@ impl D3d11Device {
         Ok(())
     }
 
+    pub fn resolve_subresource(
+        &mut self,
+        dst: D3d11ResourceId,
+        dst_subresource: u32,
+        src: D3d11ResourceId,
+        src_subresource: u32,
+        format: u32,
+    ) -> AppResult<()> {
+        self.resource(src)?;
+        self.resource(dst)?;
+        self.immediate.commands.push(RecordedCommand::ResolveSubresource {
+            dst,
+            dst_subresource,
+            src,
+            src_subresource,
+            format,
+        });
+        Ok(())
+    }
+
     pub fn clear_render_target_view(&mut self, view: D3d11ViewId, color: [u8; 4]) -> AppResult<()> {
         self.expect_view_kind(view, ViewKind::Rtv)?;
         self.immediate.commands.push(RecordedCommand::ClearRenderTargetView { view, color });
@@ -1160,6 +1740,27 @@ impl D3d11Device {
                 RecordedCommand::DrawIndexed { indices, .. } => {
                     *indexed_draw_calls += 1;
                     self.backend.record_draw(list, *indices)?;
+                }
+                RecordedCommand::ResolveSubresource {
+                    dst,
+                    dst_subresource: _,
+                    src,
+                    src_subresource: _,
+                    format,
+                } => {
+                    let src_backend = self.resource(*src)?.backend_id;
+                    let dst_backend = self.resource(*dst)?.backend_id;
+                    // For MSAA resolve, use Average mode (D3D11 default).
+                    // The CPU-side bytes are copied; the GPU command is recorded for Metal backend.
+                    let source_bytes = self.resource(*src)?.bytes.clone();
+                    self.resource_mut(*dst)?.bytes = source_bytes;
+                    self.backend.record_resolve_subresource(
+                        list,
+                        dst_backend,
+                        src_backend,
+                        *format,
+                        0, // D3D11_RESOLVE_MODE_DECOMPRESS = 0, maps to Average
+                    )?;
                 }
                 RecordedCommand::Dispatch { x, y, z } => {
                     *dispatch_calls += 1;
@@ -1595,22 +2196,42 @@ impl D3d11Device {
         0
     }
 
+    /// Create a class linkage object for shader class interfaces.
+    /// Stores the class linkage with its initial class instances for
+    /// later use when binding shaders.
     pub fn create_class_linkage(&mut self) -> ShaderId {
-        // Class linkage is not used on Metal; return a dummy shader ID
-        self.create_shader(ShaderModuleDesc {
-            stage: ShaderStage::Vs,
-            entry: "__class_linkage_stub".to_string(),
-        })
+        let id = self.alloc_id();
+        let linkage = ClassLinkage {
+            instances: Vec::new(),
+        };
+        self.class_linkage.insert(id, linkage);
+        id
     }
 
-    pub fn create_predicate(&mut self) -> u64 {
-        // Predicates are not supported on Metal; return a dummy handle
-        self.alloc_id()
+    /// Create a predicate for conditional rendering.
+    /// The predicate tracks its type (occlusion or SO overflow) and initial value.
+    /// Games use predicates for conditional rendering (D3D11_SetPredication).
+    pub fn create_predicate(&mut self, predicate_type: PredicateType) -> u64 {
+        let id = self.alloc_id();
+        let predicate = Predicate {
+            predicate_type,
+            value: false, // initially not triggered
+        };
+        self.predicates.insert(id, predicate);
+        id
     }
 
-    pub fn create_counter(&mut self) -> u64 {
-        // Counters are not supported on Metal; return a dummy handle
-        self.alloc_id()
+    /// Create a counter for GPU performance measurement.
+    /// The counter tracks its type and accumulates a unit count.
+    /// Games use counters via D3D11_GetData for querying GPU progress.
+    pub fn create_counter(&mut self, counter_type: CounterType) -> u64 {
+        let id = self.alloc_id();
+        let counter = Counter {
+            counter_type,
+            unit_count: 0,
+        };
+        self.counters.insert(id, counter);
+        id
     }
 
     // ── Context methods ───────────────────────────────────────────────
@@ -1949,6 +2570,24 @@ impl DeferredContext {
         Ok(())
     }
 
+    pub fn resolve_subresource(
+        &self,
+        dst: D3d11ResourceId,
+        dst_subresource: u32,
+        src: D3d11ResourceId,
+        src_subresource: u32,
+        format: u32,
+    ) -> AppResult<()> {
+        self.lock()?.commands.push(RecordedCommand::ResolveSubresource {
+            dst,
+            dst_subresource,
+            src,
+            src_subresource,
+            format,
+        });
+        Ok(())
+    }
+
     pub fn copy_resource(&self, src: D3d11ResourceId, dst: D3d11ResourceId) -> AppResult<()> {
         self.lock()?.commands.push(RecordedCommand::CopyResource { src, dst });
         Ok(())
@@ -2011,6 +2650,18 @@ impl DeferredContext {
 }
 
 impl Direct3D9Shim {
+    pub fn new(enabled: bool) -> Self {
+        Direct3D9Shim {
+            enabled,
+            next_id: 1,
+            vertex_buffers: BTreeMap::new(),
+            index_buffers: BTreeMap::new(),
+            textures: BTreeMap::new(),
+            devices: BTreeMap::new(),
+            render_target: None,
+        }
+    }
+
     pub fn create_device(&mut self) -> AppResult<Direct3D9Device> {
         if !self.enabled {
             return Err(AppError::new(
@@ -2021,14 +2672,115 @@ impl Direct3D9Shim {
         }
         let id = self.next_id;
         self.next_id += 1;
-        Ok(Direct3D9Device { id })
+        let device = Direct3D9Device {
+            id,
+            state: D3d9StateBlock::new(),
+            present_params: D3dPresentParameters::default(),
+            swapchain_width: 640,
+            swapchain_height: 480,
+        };
+        let dev = device.clone();
+        self.devices.insert(id, device);
+        Ok(dev)
+    }
+
+    pub fn alloc_vertex_buffer(&mut self, size: usize, fvf: u32, stride: u32) -> D3d9VertexBufferId {
+        let id = self.vertex_buffers.len() as D3d9VertexBufferId + 1;
+        self.vertex_buffers.insert(id, VertexBuffer9 { id, size, fvf, stride, data: vec![0u8; size] });
+        id
+    }
+
+    pub fn alloc_index_buffer(&mut self, size: usize, format: bool) -> D3d9IndexBufferId {
+        let id = self.index_buffers.len() as D3d9IndexBufferId + 1;
+        self.index_buffers.insert(id, IndexBuffer9 { id, size, format, data: vec![0u8; size] });
+        id
+    }
+
+    pub fn alloc_texture(&mut self, width: u32, height: u32, level_count: u32, format: u32) -> D3d9TextureId {
+        let id = self.textures.len() as D3d9TextureId + 1;
+        let mut levels = Vec::new();
+        let mut mip_w = width;
+        let mut mip_h = height;
+        for _ in 0..level_count {
+            let pixel_count = (mip_w * mip_h * 4) as usize;
+            levels.push(vec![0u8; pixel_count]);
+            mip_w = (mip_w / 2).max(1);
+            mip_h = (mip_h / 2).max(1);
+        }
+        self.textures.insert(id, D3d9Texture { id, width, height, levels, format });
+        id
+    }
+
+    pub fn present(&mut self, device_id: D3d9DeviceId) -> AppResult<D3d9Frame> {
+        let device = self.devices.get(&device_id).ok_or_else(|| {
+            AppError::new(ReasonCode::RcD3d9NotSupported, "invalid d3d9 device id")
+        })?;
+        let (w, h) = (device.swapchain_width, device.swapchain_height);
+        let pixels = self.render_target.clone().unwrap_or_else(|| (w, h, vec![0u8; (w * h * 4) as usize]));
+        let sig = format!("d3d9:present:device={}", device_id);
+        Ok(D3d9Frame {
+            hash: util::sha256_bytes(sig.as_bytes()),
+            signature: sig,
+            pixels: pixels.2,
+            width: pixels.0,
+            height: pixels.1,
+        })
     }
 }
 
 impl Direct3D9Device {
     pub fn render_fixed_function_scene(&self, scene: &FixedFunctionScene) -> AppResult<D3d9Frame> {
+        let w = self.swapchain_width.max(1);
+        let h = self.swapchain_height.max(1);
+        let stride = (w * 4) as usize;
+        let mut pixels = vec![0u8; (h as usize) * stride];
+
+        // Fill background with diffuse color
+        let bg = scene.diffuse_color;
+        for row in 0..h as usize {
+            for col in 0..w as usize {
+                let off = row * stride + col * 4;
+                pixels[off] = bg[2];     // B
+                pixels[off + 1] = bg[1]; // G
+                pixels[off + 2] = bg[0]; // R
+                pixels[off + 3] = bg[3]; // A
+            }
+        }
+
+        // Draw simple placeholder primitives based on state
+        let prim_count = scene.primitive_count.max(1).min(100) as usize;
+        for i in 0..prim_count {
+            let cx = (w as f32) / 2.0;
+            let cy = (h as f32) / 2.0;
+            let angle = (i as f32) * 6.2832 / (prim_count as f32);
+            let r = (w.min(h) as f32) * 0.3;
+            let px = (cx + r * angle.cos()) as i32;
+            let py = (cy + r * angle.sin()) as i32;
+            let color = if i % 2 == 0 { [0xFF, 0xFF, 0xFF, 0xFF] } else { [0x00, 0x00, 0x00, 0x00] };
+            // Draw a small 4x4 square at each point
+            for dy in -2..=2 {
+                for dx in -2..=2 {
+                    let sx = px + dx;
+                    let sy = py + dy;
+                    if sx >= 0 && sx < w as i32 && sy >= 0 && sy < h as i32 {
+                        let off = (sy as usize) * stride + (sx as usize) * 4;
+                        if scene.alpha_blend_enable {
+                            let a = color[3] as u32;
+                            let inv_a = 255 - a;
+                            pixels[off] = ((pixels[off] as u32 * inv_a + color[0] as u32 * a) / 255) as u8;
+                            pixels[off + 1] = ((pixels[off + 1] as u32 * inv_a + color[1] as u32 * a) / 255) as u8;
+                            pixels[off + 2] = ((pixels[off + 2] as u32 * inv_a + color[2] as u32 * a) / 255) as u8;
+                            pixels[off + 3] = 255u8;
+                        } else {
+                            pixels[off..off + 4].copy_from_slice(&color);
+                        }
+                    }
+                }
+            }
+        }
+
         let signature = format!(
-            "d3d9:id={}|tf={:08x}|diff={:02x}{:02x}{:02x}{:02x}|fog={}|blend={}|prim={}",
+            "d3d9:id={}|tf={:08x}|diff={:02x}{:02x}{:02x}{:02x}|fog={}|blend={}|prim={}|{}x{}",
             self.id,
             scene.texture_factor,
             scene.diffuse_color[0],
@@ -2038,11 +2790,102 @@ impl Direct3D9Device {
             scene.fog_enable,
             scene.alpha_blend_enable,
             scene.primitive_count,
+            w, h,
         );
         Ok(D3d9Frame {
             hash: util::sha256_bytes(signature.as_bytes()),
             signature,
+            pixels,
+            width: w,
+            height: h,
         })
+    }
+
+    pub fn set_render_state(&mut self, state: u32, value: u32) {
+        if (state as usize) < self.state.render_states.len() {
+            self.state.render_states[state as usize] = value;
+        }
+    }
+
+    pub fn get_render_state(&self, state: u32) -> u32 {
+        if (state as usize) < self.state.render_states.len() {
+            self.state.render_states[state as usize]
+        } else {
+            0
+        }
+    }
+
+    pub fn set_texture_stage_state(&mut self, stage: u32, state: u32, value: u32) {
+        if (stage as usize) < self.state.texture_stage_states.len()
+            && (state as usize) < self.state.texture_stage_states[stage as usize].len()
+        {
+            self.state.texture_stage_states[stage as usize][state as usize] = value;
+        }
+    }
+
+    pub fn set_transform(&mut self, transform_type: u32, matrix: &D3dMatrix) {
+        self.state.transforms.insert(transform_type, *matrix);
+    }
+
+    pub fn set_material(&mut self, material: &D3dMaterial9) {
+        self.state.material = *material;
+    }
+
+    pub fn set_fvf(&mut self, fvf: u32) {
+        self.state.fvf = fvf;
+    }
+
+    pub fn set_stream_source(&mut self, stream: u32, buffer_id: D3d9VertexBufferId, offset: u32, stride: u32) {
+        if (stream as usize) < self.state.stream_source.len() {
+            self.state.stream_source[stream as usize] = Some((buffer_id, offset, stride));
+        }
+    }
+
+    pub fn set_indices(&mut self, buffer_id: D3d9IndexBufferId, base_vertex_index: u32) {
+        self.state.indices = Some((buffer_id, base_vertex_index));
+    }
+
+    pub fn set_texture(&mut self, stage: u32, texture_id: D3d9TextureId) {
+        if (stage as usize) < self.state.textures.len() {
+            self.state.textures[stage as usize] = Some(texture_id);
+        }
+    }
+
+    pub fn set_viewport(&mut self, viewport: &D3dViewport9) {
+        self.state.viewport = *viewport;
+    }
+
+    pub fn set_light(&mut self, index: u32, light: &D3dLight9) {
+        // D3D9 lights are stored separately from materials;
+        // we track them in the state block if needed.
+        // For now this is a no-op since the software renderer
+        // does not implement per-vertex lighting.
+        let _ = index;
+        let _ = light;
+    }
+
+    pub fn light_enable(&mut self, index: u32, enable: bool) {
+        if (index as usize) < self.state.lights_enabled.len() {
+            self.state.lights_enabled[index as usize] = enable;
+        }
+    }
+
+    pub fn set_pixel_shader(&mut self, shader: u64) {
+        self.state.pixel_shader = shader;
+    }
+
+    pub fn set_vertex_shader(&mut self, shader: u64) {
+        self.state.vertex_shader = shader;
+    }
+
+    pub fn set_clip_plane(&mut self, index: u32, enable: bool) {
+        if (index as usize) < self.state.clip_planes.len() {
+            self.state.clip_planes[index as usize] = enable;
+        }
+    }
+
+    pub fn set_scissor_rect(&mut self, left: i32, top: i32, right: i32, bottom: i32) {
+        self.state.scissor_rect = Some((left, top, right, bottom));
     }
 }
 
@@ -2058,7 +2901,7 @@ pub fn d3d11_create_device_and_swapchain(
 }
 
 pub fn direct3d_create9(enabled: bool) -> Direct3D9Shim {
-    Direct3D9Shim { enabled, next_id: 1 }
+    Direct3D9Shim::new(enabled)
 }
 
 fn create_device_internal(
@@ -2125,6 +2968,9 @@ fn create_device_internal_with_backend(
     let root_signature = backend.create_root_signature(RootSignatureDesc {
         descriptor_tables: vec![8, 4],
         root_constants: 16,
+        parameters: Vec::new(),
+        static_samplers: Vec::new(),
+        visibility_offsets: BTreeMap::new(),
     });
     let pipeline_label = format!(
         "d3d11-immediate-{}-mesh{}-argbuf{}",
@@ -2169,6 +3015,9 @@ fn create_device_internal_with_backend(
         shader_cache: ShaderCache::new(1 << 20),
         translated_shaders: BTreeMap::new(),
         immediate: ImmediateContext::default(),
+        predicates: BTreeMap::new(),
+        counters: BTreeMap::new(),
+        class_linkage: BTreeMap::new(),
     })
 }
 

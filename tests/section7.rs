@@ -299,6 +299,7 @@ fn t7_2_d3d12_microtests_cover_barriers_descriptors_aliasing_root_constants_quer
     let root_signature = backend.create_root_signature(RootSignatureDesc {
         descriptor_tables: vec![4],
         root_constants: 4,
+        ..Default::default()
     });
     let pipeline_state = backend.create_pipeline_state(
         root_signature,

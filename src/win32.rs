@@ -382,6 +382,35 @@ struct TimerObject {
     signaled: bool,
 }
 
+/// Named pipe open mode constants.
+pub const PIPE_ACCESS_DUPLEX: u32 = 0x0000_0003;
+pub const PIPE_ACCESS_INBOUND: u32 = 0x0000_0001;
+pub const PIPE_ACCESS_OUTBOUND: u32 = 0x0000_0002;
+
+/// Named pipe mode constants.
+pub const PIPE_WAIT: u32 = 0x0000_0000;
+pub const PIPE_NOWAIT: u32 = 0x0000_0001;
+pub const PIPE_READMODE_BYTE: u32 = 0x0000_0000;
+pub const PIPE_READMODE_MESSAGE: u32 = 0x0000_0002;
+
+/// Base directory for Unix domain socket backing of named pipes.
+pub const PIPE_SOCKET_BASE_DIR: &str = "/tmp/casa1_pipes";
+
+/// Map a Windows pipe name to a Unix domain socket path.
+///
+/// Converts `\\.\pipe\MyPipe` → `/tmp/casa1_pipes/MyPipe`.
+pub fn pipe_name_to_uds_path(pipe_name: &str) -> String {
+    let normalized = normalize_pipe_name(pipe_name);
+    // Strip the `\\.\pipe\` prefix
+    let name = normalized
+        .strip_prefix("\\\\.\\pipe\\")
+        .or_else(|| normalized.strip_prefix("\\\\?\\pipe\\"))
+        .unwrap_or(&normalized);
+    // Replace backslashes with underscores for safety
+    let safe_name = name.replace('\\', "_").replace('/', "_");
+    format!("{}/{}", PIPE_SOCKET_BASE_DIR, safe_name)
+}
+
 /// State tracking for a Windows named pipe.
 /// Named pipes are backed by in-memory ring buffers with condvar-based
 /// synchronisation so that readers block when the buffer is empty and
@@ -410,6 +439,14 @@ struct NamedPipeState {
     /// Unix-domain socket path for cross-process pipe communication.
     /// Only populated when the pipe is created with cross-process intent.
     uds_socket_path: Option<String>,
+    /// Pipe open mode (PIPE_ACCESS_DUPLEX, PIPE_ACCESS_INBOUND, PIPE_ACCESS_OUTBOUND).
+    open_mode: u32,
+    /// Pipe mode (PIPE_WAIT or PIPE_NOWAIT).
+    pipe_mode: u32,
+    /// Maximum number of pipe instances.
+    max_instances: u32,
+    /// Default timeout for WaitNamedPipe (in milliseconds).
+    default_timeout: u32,
 }
 
 /// A simple wrapper around `libc::mmap` / `munmap` for shared memory backing.
@@ -2363,6 +2400,13 @@ impl Win32Subsystem {
             ));
         }
         let buf_size = out_buffer_size.max(in_buffer_size).max(4096) as usize;
+
+        // Compute UDS path if not explicitly provided
+        let uds_path = uds_socket_path.unwrap_or_else(|| pipe_name_to_uds_path(&normalized));
+
+        // Ensure the socket base directory exists
+        let _ = std::fs::create_dir_all(PIPE_SOCKET_BASE_DIR);
+
         let state = NamedPipeState {
             name: normalized.clone(),
             server_created: true,
@@ -2372,11 +2416,14 @@ impl Win32Subsystem {
             max_buffer_size: buf_size,
             server_disconnected: false,
             security_descriptor,
-            uds_socket_path,
+            uds_socket_path: Some(uds_path),
+            open_mode,
+            pipe_mode: pipe_mode & 0x0000_0003, // PIPE_WAIT or PIPE_NOWAIT
+            max_instances,
+            default_timeout,
         };
         self.named_pipes.insert(normalized.clone(), state.clone());
 
-        let _ = (open_mode, pipe_mode, max_instances, default_timeout);
         Ok(self.insert_object(
             ObjectType::Pipe,
             0x1F0FFF,
@@ -2426,6 +2473,8 @@ impl Win32Subsystem {
     }
 
     /// `SetNamedPipeHandleState` — set pipe read mode, wait mode, etc.
+    ///
+    /// Supports `PIPE_WAIT`/`PIPE_NOWAIT` and `PIPE_READMODE_BYTE`/`PIPE_READMODE_MESSAGE`.
     pub fn set_named_pipe_handle_state(
         &mut self,
         handle: Handle,
@@ -2434,13 +2483,18 @@ impl Win32Subsystem {
         collect_data_timeout: Option<u32>,
     ) -> AppResult<()> {
         let entry = self.handle_entry(handle)?;
-        match &entry.object {
-            KernelObject::Pipe(_) => {
-                let _ = (mode, max_collect_count, collect_data_timeout);
-                Ok(())
+        let pipe_name = match &entry.object {
+            KernelObject::Pipe(pipe) => pipe.name.clone(),
+            _ => return invalid_handle("handle is not a pipe"),
+        };
+        let normalized = normalize_pipe_name(&pipe_name);
+        if let Some(state) = self.named_pipes.get_mut(&normalized) {
+            if let Some(mode) = mode {
+                state.pipe_mode = mode;
             }
-            _ => invalid_handle("handle is not a pipe"),
+            let _ = (max_collect_count, collect_data_timeout);
         }
+        Ok(())
     }
 
     /// `PeekNamedPipe` — read from a pipe without removing data.
@@ -3406,18 +3460,6 @@ fn invalid_handle<T>(message: &str) -> AppResult<T> {
 
 fn normalize_pipe_name(name: &str) -> String {
     name.replace('/', "\\").to_ascii_lowercase()
-}
-
-/// Generate a Unix-domain socket path from a named pipe name.
-/// Replaces `\\.\pipe\` prefix with the Casa1 UDS directory.
-/// E.g. `\\.\pipe\steam_service` → `/tmp/.casa1/pipe/steam_service.sock`
-fn pipe_name_to_uds_path(name: &str) -> String {
-    let normalized = normalize_pipe_name(name);
-    let stem = normalized
-        .strip_prefix(r"\\.\pipe\")
-        .unwrap_or(&normalized);
-    let safe_stem = stem.replace('\\', "_").replace('/', "_");
-    format!("/tmp/.casa1/pipe/{safe_stem}.sock")
 }
 
 fn current_ticks(dtm: bool, ticks_ms: u64) -> u64 {

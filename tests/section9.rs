@@ -4,7 +4,7 @@ use casa1::d3d11::{
     InputElementDesc, InputLayoutDesc, RasterizerStateDesc, SamplerStateDesc, ShaderModuleDesc,
     ShaderStage, ViewKind, Viewport,
 };
-use casa1::gfx::{DxgiFormat, FilterMode, SwapchainDesc};
+use casa1::gfx::{DxgiFormat, FilterMode, ResourceUsageHint, SwapchainDesc};
 use casa1::reason::ReasonCode;
 
 fn sha(bytes: &[u8]) -> String {
@@ -63,10 +63,10 @@ fn t9_1_d3d11_conformance_microtests_and_frame_diffs_match_reference() {
     let volume = device
         .create_texture_3d("volume", 2, 2, 2, DxgiFormat::R8G8B8A8Unorm)
         .expect("create texture3d");
-    let vertex = device.create_buffer("vertex", 16).expect("create vertex buffer");
-    let constants = device.create_buffer("constants", 16).expect("create constant buffer");
-    let staging = device.create_buffer("staging", 16).expect("create staging buffer");
-    let mirror = device.create_buffer("mirror", 16).expect("create mirror buffer");
+    let vertex = device.create_buffer("vertex", 16, ResourceUsageHint::Generic).expect("create vertex buffer");
+    let constants = device.create_buffer("constants", 16, ResourceUsageHint::Generic).expect("create constant buffer");
+    let staging = device.create_buffer("staging", 16, ResourceUsageHint::Generic).expect("create staging buffer");
+    let mirror = device.create_buffer("mirror", 16, ResourceUsageHint::Generic).expect("create mirror buffer");
 
     assert_eq!(device.resource_desc(volume).expect("volume desc").dimension, casa1::d3d11::ResourceDimension::Texture3D);
 
@@ -231,8 +231,8 @@ fn t9_2_deferred_context_stress_multi_thread_record_execute_no_races_and_determi
     let depth = device
         .create_texture_2d("depth", 4, 4, DxgiFormat::D24UnormS8Uint)
         .expect("create depth target");
-    let vertex = device.create_buffer("vertex", 16).expect("create vertex buffer");
-    let constants = device.create_buffer("constants", 16).expect("create constants buffer");
+    let vertex = device.create_buffer("vertex", 16, ResourceUsageHint::Generic).expect("create vertex buffer");
+    let constants = device.create_buffer("constants", 16, ResourceUsageHint::Generic).expect("create constants buffer");
     let color_rtv = device
         .create_render_target_view(color, DxgiFormat::B8G8R8A8Unorm)
         .expect("create RTV");
@@ -351,8 +351,8 @@ fn t9_3_state_leak_tests_random_state_churn_output_matches_oracle() {
         let depth = device
             .create_texture_2d("depth", 4, 4, DxgiFormat::D24UnormS8Uint)
             .expect("create depth target");
-        let buffer = device.create_buffer("vb", 16).expect("create vertex buffer");
-        let constants = device.create_buffer("cb", 16).expect("create constant buffer");
+        let buffer = device.create_buffer("vb", 16, ResourceUsageHint::Generic).expect("create vertex buffer");
+        let constants = device.create_buffer("cb", 16, ResourceUsageHint::Generic).expect("create constant buffer");
         let rtv = device
             .create_render_target_view(color, DxgiFormat::B8G8R8A8Unorm)
             .expect("create RTV");

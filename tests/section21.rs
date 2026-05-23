@@ -53,6 +53,7 @@ fn t21_2_command_allocator_and_list() {
     let root_sig = runtime.create_root_signature(RootSignatureDesc {
         descriptor_tables: vec![1],
         root_constants: 4,
+        ..Default::default()
     });
 
     let pso = runtime.create_pipeline_state(
@@ -127,6 +128,7 @@ fn t21_4_command_list_recording() {
     let root_sig = runtime.create_root_signature(RootSignatureDesc {
         descriptor_tables: vec![1],
         root_constants: 4,
+        ..Default::default()
     });
     let pso = runtime.create_pipeline_state(
         root_sig,
@@ -429,6 +431,7 @@ fn t21_8_root_signature() {
     let root_sig = runtime.create_root_signature(RootSignatureDesc {
         descriptor_tables: vec![2, 3, 1],
         root_constants: 8,
+        ..Default::default()
     });
 
     assert!(root_sig > 0, "root signature ID should be non-zero");
@@ -437,6 +440,7 @@ fn t21_8_root_signature() {
     let root_sig2 = runtime.create_root_signature(RootSignatureDesc {
         descriptor_tables: vec![1],
         root_constants: 16,
+        ..Default::default()
     });
 
     assert!(root_sig2 > 0, "second root signature ID should be non-zero");
@@ -455,6 +459,7 @@ fn t21_9_pipeline_state() {
     let root_sig = runtime.create_root_signature(RootSignatureDesc {
         descriptor_tables: vec![1],
         root_constants: 4,
+        ..Default::default()
     });
 
     // Create graphics pipeline state

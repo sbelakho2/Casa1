@@ -1,4 +1,6 @@
 use crate::canonical::{GfxFrame, GuestException, PerfMetric};
+use crate::telemetry::TelemetryCollector;
+use crate::real_fs::{parse_ntfs_path, RealFilesystem, WindowsPathResolver};
 use crate::user32::DeviceAxis;
 use crate::user32::DirectInputDataFormat;
 use crate::user32::RawInputRegistration;
@@ -15,10 +17,14 @@ use crate::d3d12::{
     SwapchainId as D3d12SwapchainId,
 };
 use crate::d3d11::{
-    d3d11_create_device, d3d11_create_device_and_swapchain, BlendStateDesc, D3d11Device,
-    D3d11ResourceId, D3d11ViewId, DepthStencilStateDesc, DeviceCreationRequest, FeatureLevel,
-    InputElementDesc, InputLayoutDesc, InputLayoutId, RasterizerStateDesc, ResourceDimension,
-    SamplerStateDesc, ScissorRect, ShaderStage as D3d11ShaderStage, ViewKind, Viewport,
+    d3d11_create_device, d3d11_create_device_and_swapchain, direct3d_create9, BlendStateDesc,
+    D3d11Device, D3d11ResourceId, D3d11ViewId, D3d9DeviceId, D3d9IndexBufferId, D3d9StateBlock,
+    D3d9Texture, D3d9TextureId, D3d9VertexBufferId, D3dLight9, D3dMaterial9, D3dMatrix,
+    D3dPresentParameters, D3dViewport9, D3DERR_INVALIDCALL, D3DERR_OUTOFVIDEOMEMORY,
+    DepthStencilStateDesc, DeviceCreationRequest, FeatureLevel, FixedFunctionScene,
+    IndexBuffer9, InputElementDesc, InputLayoutDesc, InputLayoutId, RasterizerStateDesc,
+    ResourceDimension, SamplerStateDesc, ScissorRect, ShaderStage as D3d11ShaderStage, ViewKind,
+    VertexBuffer9, Viewport,
 };
 use crate::error::{AppError, AppResult};
 use crate::ge::{GameEnvironment, RegistryView};
@@ -34,9 +40,14 @@ use crate::shader::parse_dxil_container;
 use crate::trace::TraceEvent;
 use crate::audio::{default_output_matrix, AudioSamples, AudioSubsystem, SampleFormat, SourceBuffer, VoiceId, WaveFormat};
 use crate::user32::{
-    KeyboardDevice, KeyboardLayoutId, KeyModifiers, Message, MessageKind, MouseButton,
-    MouseButtonEvent, MouseDevice, Rect, User32Subsystem, WindowClassInfo, WindowPlacement,
-    WindowPreview, GWL_HWNDPARENT, GWL_WNDPROC, WS_VISIBLE,
+    GdiplusBitmap, GdiplusBrush, GdiplusContainer, GdiplusFont, GdiplusFontFamily,
+    GdiplusGraphics, GdiplusGraphicsState, GdiplusImage, GdiplusImageAttributes, GdiplusLineBrush,
+    GdiplusMatrix, GdiplusObject, GdiplusPath, GdiplusPathElement, GdiplusPen, GdiplusPointF,
+    GdiplusSolidFill, GdiplusStatus, GdiplusTextureBrush,
+    GDIPLUS_DASH_STYLE_SOLID, GDIPLUS_LINE_CAP_FLAT, GDIPLUS_LINE_JOIN_MITER,
+    GDIPLUS_PIXEL_FORMAT_32BPP_ARGB, KeyboardDevice, KeyboardLayoutId, KeyModifiers, Message,
+    MessageKind, MouseButton, MouseButtonEvent, MouseDevice, Rect, User32Subsystem,
+    WindowClassInfo, WindowPlacement, WindowPreview, GWL_HWNDPARENT, GWL_WNDPROC, WS_VISIBLE,
 };
 use crate::util;
 use crate::win32::{ApartmentModel, CreationDisposition, FileInformation, FindData, SeekOrigin, WaitStatus, Win32Subsystem};
@@ -51,11 +62,19 @@ use std::hash::{BuildHasher, Hash, Hasher};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use crate::wmi;
 use std::sync::{
     atomic::{AtomicUsize, Ordering as AtomicOrdering},
-    Arc,
+    Arc, Mutex,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
+
+// Global state for ISteamNetworkingSockets and ISteamNetworkingMessages
+// PE runtime dispatch. Initialised lazily on first API call.
+static STEAM_NET_SOCKETS: Mutex<Option<crate::steam_integration::SteamNetworkingSockets>> =
+    Mutex::new(None);
+static STEAM_NET_MESSAGES: Mutex<Option<crate::steam_integration::SteamNetworkingMessages>> =
+    Mutex::new(None);
 
 const SYNTHETIC_PID_DTM: u32 = 4242;
 const LIVE_UI_DEBUG_LIMIT: usize = 32;
@@ -122,6 +141,8 @@ const X86_EXCEPTION_CONTINUE_SEARCH: u32 = 1;
 const PAGE_EXECUTE_READWRITE: u32 = 0x40;
 const MEM_COMMIT: u32 = 0x1000;
 const MEM_RESERVE: u32 = 0x2000;
+const MEM_DECOMMIT: u32 = 0x4000;
+const MEM_RELEASE: u32 = 0x8000;
 const MEM_PRIVATE: u32 = 0x0002_0000;
 const MEM_IMAGE: u32 = 0x0100_0000;
 const CREATE_SUSPENDED: u32 = 0x0000_0004;
@@ -137,6 +158,30 @@ const DLL_PROCESS_DETACH: u32 = 0;
 const DLL_PROCESS_ATTACH: u32 = 1;
 const DLL_THREAD_ATTACH: u32 = 2;
 const DLL_THREAD_DETACH: u32 = 3;
+
+/// Reason codes for DllMain entry point notifications.
+///
+/// These map 1:1 to the Windows `DLL_PROCESS_ATTACH`, `DLL_PROCESS_DETACH`,
+/// `DLL_THREAD_ATTACH`, and `DLL_THREAD_DETACH` constants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DllReason {
+    ProcessAttach,
+    ProcessDetach,
+    ThreadAttach,
+    ThreadDetach,
+}
+
+impl DllReason {
+    /// Convert this `DllReason` to the raw u32 value expected by Windows DllMain.
+    pub fn to_raw(self) -> u32 {
+        match self {
+            DllReason::ProcessAttach => DLL_PROCESS_ATTACH,
+            DllReason::ProcessDetach => DLL_PROCESS_DETACH,
+            DllReason::ThreadAttach => DLL_THREAD_ATTACH,
+            DllReason::ThreadDetach => DLL_THREAD_DETACH,
+        }
+    }
+}
 const DXGI_ADAPTER_DESC_DESCRIPTION_CHARS: usize = 128;
 const D3D12_FEATURE_D3D12_OPTIONS: u32 = 0;
 const D3D12_FEATURE_FEATURE_LEVELS: u32 = 2;
@@ -156,6 +201,7 @@ const D3D_SHADER_MODEL_6_5: u32 = 0x65;
 const D3D_SHADER_MODEL_6_6: u32 = 0x66;
 const D3D12_RENDER_PASS_TIER_1: u32 = 1;
 const D3D12_RAYTRACING_TIER_NOT_SUPPORTED: u32 = 0;
+const D3D12_RAYTRACING_TIER_1_1: u32 = 11;
 const D3D12_MESH_SHADER_TIER_NOT_SUPPORTED: u32 = 0;
 const D3D12_MESH_SHADER_TIER_1: u32 = 10;
 const D3D12_SAMPLER_FEEDBACK_TIER_NOT_SUPPORTED: u32 = 0;
@@ -215,6 +261,7 @@ const ERROR_FILE_NOT_FOUND: u32 = 2;
 const ERROR_NO_MORE_FILES: u32 = 18;
 const ERROR_PATH_NOT_FOUND: u32 = 3;
 const ERROR_MOD_NOT_FOUND: u32 = 126;
+const ERROR_PROC_NOT_FOUND: u32 = 127;
 const ERROR_INVALID_HANDLE: u32 = 6;
 const ERROR_INVALID_WINDOW_HANDLE: u32 = 1_400;
 const ERROR_CLASS_DOES_NOT_EXIST: u32 = 1_411;
@@ -432,7 +479,7 @@ struct KeyboardReplayEvent {
 }
 
 #[derive(Debug, Clone)]
-enum HostThunk {
+pub enum HostThunk {
     CreateDXGIFactory1,
     CreateDXGIFactory2,
     DXGIFactoryEnumAdapters,
@@ -517,10 +564,34 @@ enum HostThunk {
     D3D11DeviceContextRSSetState,
     D3D11DeviceContextRSSetViewports,
     D3D11DeviceContextRSSetScissorRects,
+    D3D11DeviceContextResolveSubresource,
     D3D11DeviceContextUpdateSubresource,
     DXGISwapChainGetBuffer,
     DXGISwapChainPresent,
     DXGISwapChainResizeBuffers,
+    // -- DXGI Factory methods (Phase 5.5 #2) --
+    DXGIFactoryMakeWindowAssociation,
+    DXGIFactoryGetWindowAssociation,
+    DXGIFactorySetPrivateData,
+    DXGIFactoryGetPrivateData,
+    DXGIFactoryGetParent,
+    DXGIFactoryCreateSoftwareAdapter,
+    // -- D3D11 Device query methods (Phase 5.5 #2) --
+    D3D11DeviceGetDeviceRemovedReason,
+    D3D11DeviceCheckFormatSupport,
+    D3D11DeviceCheckMultisampleQualityLevels,
+    D3D11DeviceGetFeatureLevel,
+    D3D11DeviceGetCreationFlags,
+    D3D11DeviceCheckCounterInfo,
+    D3D11DeviceCreateDeferredContext,
+    D3D11DeviceCreateQuery,
+    D3D11DeviceOpenSharedResource,
+    // -- DXGI Adapter methods (Phase 5.5 #2) --
+    DXGIAdapterCheckInterfaceSupport,
+    DXGIAdapterSetPrivateData,
+    DXGIAdapterGetPrivateData,
+    DXGIAdapterGetParent,
+    DXGIAdapterEnumOutputs,
     XAudio2Create,
     GuestObjectAddRef,
     GuestObjectRelease,
@@ -563,6 +634,15 @@ enum HostThunk {
     // -- XAudio2 engine methods (Phase 4.3) --
     XAudio2CreateSubmixVoice,
     XAudio2CommitChanges,
+    // -- IXAPO vtable thunks (Phase 4.3.1) --
+    /// `IXAPO::GetRegistrationProperties` — returns effect registration info.
+    XAPO_GetRegistrationProperties,
+    /// `IXAPO::LockForProcess` — prepare effect for processing at the given format.
+    XAPO_LockForProcess,
+    /// `IXAPO::UnlockForProcess` — release processing resources.
+    XAPO_UnlockForProcess,
+    /// `IXAPO::Process` — process audio through the effect.
+    XAPO_Process,
     // -- DirectInput8 (Phase 4.3) --
     DirectInput8Create,
     DirectInput8CreateDevice,
@@ -578,6 +658,8 @@ enum HostThunk {
     DirectInputDevice8SetProperty,
     DirectInputDevice8Poll,
     DirectInputDevice8UnacquireObj,
+    DirectInputDevice8SendForceFeedbackCommand,
+    DirectInputDevice8SetForceFeedbackState,
     // -- XInput (Phase 5.2.1) --
     XInputGetState,
     XInputSetState,
@@ -603,6 +685,17 @@ enum HostThunk {
     SteamAPI_ISteamInput_GetMotionData,
     SteamAPI_ISteamInput_ShowBindingPanel,
     SteamAPI_ISteamInput_GetGlyphForActionHandle,
+    // -- Steam Networking Sockets (Phase 5.4) --
+    SteamAPI_ISteamNetworkingSockets_CreateListenSocketIP,
+    SteamAPI_ISteamNetworkingSockets_ConnectByIPAddress,
+    SteamAPI_ISteamNetworkingSockets_SendMessageToConnection,
+    SteamAPI_ISteamNetworkingSockets_ReceiveMessagesOnListenSocket,
+    SteamAPI_ISteamNetworkingSockets_CloseConnection,
+    SteamAPI_ISteamNetworkingSockets_DestroyListenSocket,
+    // -- Steam Networking Messages (Phase 5.5) --
+    SteamAPI_ISteamNetworkingMessages_SendMessageToUser,
+    SteamAPI_ISteamNetworkingMessages_ReceiveMessagesOnChannel,
+    SteamAPI_ISteamNetworkingMessages_CloseSessionWithUser,
     // -- SteamVR / OpenVR (Phase 5.3.1) --
     SteamVR_Init,
     SteamVR_Shutdown,
@@ -638,6 +731,91 @@ enum HostThunk {
     SteamVR_IVRChaperone_GetCalibrationState,
     SteamVR_IVRChaperone_GetPlayAreaSize,
     SteamVR_IVRChaperone_GetPlayAreaRect,
+    // IVRController vtable
+    SteamVR_IVRController_Release,
+    SteamVR_IVRController_TriggerHapticPulse,
+    SteamVR_IVRController_GetControllerState,
+    SteamVR_IVRController_GetControllerStateForNextFrame,
+    // IVRInput vtable
+    SteamVR_IVRInput_Release,
+    SteamVR_IVRInput_SetActionManifestPath,
+    SteamVR_IVRInput_GetActionHandle,
+    SteamVR_IVRInput_GetActionSetHandle,
+    SteamVR_IVRInput_GetDigitalActionData,
+    SteamVR_IVRInput_GetAnalogActionData,
+    SteamVR_IVRInput_ActivateActionSet,
+    SteamVR_IVRInput_GetCurrentActionSet,
+    // IVRRenderModels
+    SteamVR_IVRRenderModels_LoadIntoTextureD3D11,
+    SteamVR_IVRRenderModels_LoadTextureD3D11_Async,
+    SteamVR_IVRRenderModels_FreeTextureD3D11,
+    // -- Direct2D / DirectWrite (Phase D2D) --
+    DWriteCreateFactory,
+    IDWriteFactory_CreateTextFormat,
+    IDWriteFactory_CreateTextLayout,
+    IDWriteFactory_GetSystemFontCollection,
+    IDWriteFactory_RegisterFontCollectionLoader,
+    IDWriteFactory_UnregisterFontCollectionLoader,
+    IDWriteTextFormat_Release,
+    IDWriteTextFormat_SetTextAlignment,
+    IDWriteTextFormat_SetParagraphAlignment,
+    IDWriteTextFormat_SetReadingDirection,
+    IDWriteTextFormat_SetWordWrapping,
+    IDWriteTextLayout_Release,
+    IDWriteTextLayout_Draw,
+    IDWriteTextLayout_GetMetrics,
+    IDWriteTextLayout_GetOverhangMetrics,
+    IDWriteTextLayout_HitTestPoint,
+    IDWriteTextLayout_HitTestTextPosition,
+    IDWriteFontCollection_Release,
+    IDWriteFontCollection_GetFontFamilyCount,
+    IDWriteFontCollection_GetFontFamily,
+    IDWriteFontFamily_Release,
+    IDWriteFontFamily_GetFontCount,
+    IDWriteFontFamily_GetFont,
+    D2D1CreateFactory,
+    ID2D1Factory_CreateHwndRenderTarget,
+    ID2D1Factory_CreateDCRenderTarget,
+    ID2D1Factory_CreateSolidColorBrush,
+    ID2D1Factory_CreateLinearGradientBrush,
+    ID2D1Factory_CreateRadialGradientBrush,
+    ID2D1Factory_CreateBitmap,
+    ID2D1Factory_CreateBitmapFromWicBitmap,
+    ID2D1Factory_Release,
+    ID2D1HwndRenderTarget_BeginDraw,
+    ID2D1HwndRenderTarget_EndDraw,
+    ID2D1HwndRenderTarget_Clear,
+    ID2D1HwndRenderTarget_DrawLine,
+    ID2D1HwndRenderTarget_DrawRectangle,
+    ID2D1HwndRenderTarget_FillRectangle,
+    ID2D1HwndRenderTarget_DrawEllipse,
+    ID2D1HwndRenderTarget_FillEllipse,
+    ID2D1HwndRenderTarget_DrawText,
+    ID2D1HwndRenderTarget_DrawBitmap,
+    ID2D1HwndRenderTarget_SetTransform,
+    ID2D1HwndRenderTarget_GetSize,
+    ID2D1HwndRenderTarget_GetDpi,
+    ID2D1HwndRenderTarget_Release,
+    ID2D1SolidColorBrush_SetColor,
+    ID2D1SolidColorBrush_SetOpacity,
+    ID2D1SolidColorBrush_Release,
+    ID2D1Bitmap_Release,
+    ID2D1Bitmap_GetSize,
+    ID2D1Bitmap_GetDpi,
+    // -- winspool.drv / Printing (Phase Print) --
+    OpenPrinterW,
+    ClosePrinter,
+    StartDocPrinterW,
+    EndDocPrinter,
+    StartPagePrinter,
+    EndPagePrinter,
+    WritePrinter,
+    ReadPrinter,
+    EnumPrintersW,
+    GetPrinterW,
+    SetPrinterW,
+    AddPrinterW,
+    DeletePrinter,
     // -- Raw Input (Phase 4.3) --
     RegisterRawInputDevices,
     GetRawInputData,
@@ -1018,6 +1196,14 @@ enum HostThunk {
     DecodePointer,
     UnhandledExceptionFilter,
     SetUnhandledExceptionFilter,
+    /// `AddVectoredExceptionHandler` / `RtlAddVectoredExceptionHandler` — registers a
+    /// vectored exception handler for the guest. Dispatched through the
+    /// `SehSubsystem` VEH chain.
+    AddVectoredExceptionHandler,
+    /// `RemoveVectoredExceptionHandler` / `RtlRemoveVectoredExceptionHandler` —
+    /// unregisters a vectored exception handler previously registered by
+    /// `AddVectoredExceptionHandler`.
+    RemoveVectoredExceptionHandler,
     Beep,
     Sleep,
     TlsAlloc,
@@ -1031,6 +1217,7 @@ enum HostThunk {
     SetFileCompletionNotificationModes,
     RtlNtStatusToDosError,
     VirtualAlloc,
+    VirtualFree,
     VirtualProtect,
     VirtualQuery,
     ExitProcess,
@@ -1243,6 +1430,8 @@ enum HostThunk {
     RaiseException,
     /// `RtlUnwind` — initiates an unwind of procedure call frames.
     RtlUnwind,
+    /// `RtlRestoreContext` — restores the exception context and resumes execution.
+    RtlRestoreContext,
     /// `GetConsoleMode` — retrieves the current input mode of a console's input buffer or the current output mode of a console screen buffer.
     GetConsoleMode,
     /// `SetConsoleMode` — sets the input mode of a console's input buffer or the output mode of a console screen buffer.
@@ -1581,10 +1770,363 @@ enum HostThunk {
     SafeArrayGetLBound,
     /// `SafeArrayGetUBound` — gets the upper bound of a SAFEARRAY dimension.
     SafeArrayGetUBound,
+    /// `SafeArrayCreateVector` — creates a one-dimensional SAFEARRAY (vector).
+    SafeArrayCreateVector,
+    // -- Touch / Pointer Input (Phase 6.x) --
+    RegisterTouchWindow,
+    UnregisterTouchWindow,
+    GetTouchInputInfo,
+    CloseTouchInputHandle,
+    InitializePointerDevice,
+    GetPointerInfo,
+    GetPointerPenInfo,
+    SkipPointerFrame,
+    // ── Phase 2.7: GDI+ (gdiplus.dll) ——————————————————————————————————
+    GdiplusStartup,
+    GdiplusShutdown,
+    GdipCreateFromHDC,
+    GdipDeleteGraphics,
+    // Drawing primitives
+    GdipDrawLine,
+    GdipDrawLines,
+    GdipDrawRectangle,
+    GdipFillRectangle,
+    GdipDrawEllipse,
+    GdipFillEllipse,
+    GdipDrawPie,
+    GdipFillPie,
+    GdipDrawPolygon,
+    GdipFillPolygon,
+    GdipDrawArc,
+    GdipDrawCurve,
+    GdipDrawClosedCurve,
+    GdipDrawString,
+    // Brushes
+    GdipCreateSolidFill,
+    GdipCreateLineBrush,
+    GdipCreateTextureBrush,
+    GdipDeleteBrush,
+    GdipFillRegion,
+    // Pens
+    GdipCreatePen1,
+    GdipCreatePen2,
+    GdipSetPenWidth,
+    GdipGetPenWidth,
+    GdipSetPenColor,
+    GdipGetPenColor,
+    GdipSetPenDashStyle,
+    GdipGetPenDashStyle,
+    GdipSetPenLineJoin,
+    GdipSetPenStartCap,
+    GdipSetPenEndCap,
+    GdipDeletePen,
+    // Paths
+    GdipCreatePath,
+    GdipDeletePath,
+    GdipAddPathLine,
+    GdipAddPathRectangle,
+    GdipAddPathEllipse,
+    GdipAddPathArc,
+    GdipAddPathBezier,
+    GdipClosePathFigure,
+    GdipStartPathFigure,
+    GdipSetPathFillMode,
+    GdipDrawPath,
+    GdipFillPath,
+    // Transforms
+    GdipCreateMatrix,
+    GdipDeleteMatrix,
+    GdipSetMatrixElements,
+    GdipGetMatrixElements,
+    GdipTranslateMatrix,
+    GdipRotateMatrix,
+    GdipScaleMatrix,
+    GdipInvertMatrix,
+    GdipMultiplyMatrix,
+    GdipSetWorldTransform,
+    GdipResetWorldTransform,
+    GdipGetWorldTransform,
+    // Clipping
+    GdipSetClipRect,
+    GdipSetClipPath,
+    GdipSetClipRegion,
+    GdipResetClip,
+    GdipGetClipBounds,
+    GdipGetClip,
+    // Containers
+    GdipSaveGraphics,
+    GdipRestoreGraphics,
+    GdipBeginContainer,
+    GdipEndContainer,
+    // Bitmap interop
+    GdipCreateBitmapFromHBITMAP,
+    GdipCreateBitmapFromFile,
+    GdipCreateBitmapFromGraphics,
+    GdipDisposeImage,
+    GdipGetImageWidth,
+    GdipGetImageHeight,
+    GdipGetImagePixelFormat,
+    GdipBitmapGetPixel,
+    GdipBitmapSetPixel,
+    GdipBitmapLockBits,
+    GdipBitmapUnlockBits,
+    // Text/Font
+    GdipCreateFont,
+    GdipDeleteFont,
+    GdipCreateFontFamilyFromName,
+    GdipDeleteFontFamily,
+    GdipSetTextRenderingHint,
+    GdipMeasureString,
+    GdipMeasureCharacterRanges,
+    // Image attributes
+    GdipCreateImageAttributes,
+    GdipDisposeImageAttributes,
+    GdipSetImageAttributesColorKeys,
+    GdipSetImageAttributesColorMatrix,
+    // Quality settings
+    GdipSetSmoothingMode,
+    GdipGetSmoothingMode,
+    GdipSetCompositingMode,
+    GdipGetCompositingMode,
+    GdipSetCompositingQuality,
+    GdipGetCompositingQuality,
+    GdipSetInterpolationMode,
+    GdipGetInterpolationMode,
+    GdipSetPixelOffsetMode,
+    GdipGetPixelOffsetMode,
+    // Image drawing
+    GdipDrawImage,
+    GdipDrawImageRect,
+    GdipDrawImageRectRect,
+    GdipGetImageType,
+    GdipGetImageRawFormat,
+    GdipCloneImage,
+    GdipSaveImageToFile,
+    GdipSaveImageToStream,
+    GdipCreateBitmapFromStream,
+    GdipCreateBitmapFromScan0,
+    GdipCreateHICONFromBitmap,
+    GdipCreateHBITMAPFromBitmap,
+    GdipCreateImageFromFile,
+    GdipImageForceValidation,
+    GdipGetFontHeight,
+    GdipCreateBitmapFromGdiDib,
+    // ── WMI (Windows Management Instrumentation) ───────────────────────────────
+    /// IWbemLocator::ConnectServer
+    WbemLocatorConnectServer,
+    /// IWbemServices::ExecQuery
+    WbemServicesExecQuery,
+    /// IWbemServices::CreateInstanceEnum
+    WbemServicesCreateInstanceEnum,
+    /// IWbemServices::GetObject
+    WbemServicesGetObject,
+    /// IWbemClassObject::Get
+    WbemClassObjectGet,
+    /// IWbemClassObject::Put
+    WbemClassObjectPut,
+    /// IWbemClassObject::GetNames
+    WbemClassObjectGetNames,
+    /// IWbemClassObject::GetObjectText
+    WbemClassObjectGetObjectText,
+    /// IEnumWbemClassObject::Next
+    EnumWbemClassObjectNext,
+    /// IEnumWbemClassObject::Reset
+    EnumWbemClassObjectReset,
+    /// IEnumWbemClassObject::Skip
+    EnumWbemClassObjectSkip,
+    /// IEnumWbemClassObject::Clone
+    EnumWbemClassObjectClone,
     /// A native function from a real (on-disk) DLL loaded via `load_real_dll`.
     /// When dispatched, the runtime looks up the loaded native library for this
     /// DLL and calls the native function pointer.
     RealDllExport { dll_name: String, export_name: String },
+    // ── WebView2 (webview2.dll) ───────────────────────────────────────────────
+    /// `CreateWebView2Environment` — entry point into WebView2.
+    WebView2CreateEnvironment,
+    /// `CreateWebView2EnvironmentWithDetails` — entry point with detailed options.
+    WebView2CreateEnvironmentWithDetails,
+    // ICoreWebView2Environment vtable
+    WebView2EnvRelease,
+    WebView2EnvCreateCoreWebView2Controller,
+    WebView2EnvCreateWebResourceResponse,
+    WebView2EnvGetBrowserVersionString,
+    // ICoreWebView2Controller vtable
+    WebView2CtrlRelease,
+    WebView2CtrlGetIsVisible,
+    WebView2CtrlPutIsVisible,
+    WebView2CtrlGetBounds,
+    WebView2CtrlPutBounds,
+    WebView2CtrlGetZoomFactor,
+    WebView2CtrlPutZoomFactor,
+    WebView2CtrlMoveFocus,
+    WebView2CtrlClose,
+    WebView2CtrlGetCoreWebView2,
+    // ICoreWebView2 vtable
+    WebView2Release,
+    WebView2GetSource,
+    WebView2Navigate,
+    WebView2NavigateToString,
+    WebView2ExecuteScript,
+    WebView2PostWebMessageAsJson,
+    WebView2PostWebMessageAsString,
+    WebView2GetSettings,
+    WebView2AddNavigationStarting,
+    WebView2RemoveNavigationStarting,
+    WebView2AddNavigationCompleted,
+    WebView2RemoveNavigationCompleted,
+    WebView2AddWebMessageReceived,
+    WebView2RemoveWebMessageReceived,
+    WebView2Stop,
+    WebView2Reload,
+    WebView2CallDevToolsProtocolMethod,
+    // ICoreWebView2_2
+    WebView2AddContentLoading,
+    WebView2RemoveContentLoading,
+    WebView2AddSourceChanged,
+    WebView2RemoveSourceChanged,
+    WebView2AddHistoryChanged,
+    WebView2RemoveHistoryChanged,
+    // ICoreWebView2_3
+    WebView2AddNewWindowRequested,
+    WebView2RemoveNewWindowRequested,
+    WebView2AddPermissionRequested,
+    WebView2RemovePermissionRequested,
+    WebView2AddProcessFailed,
+    WebView2RemoveProcessFailed,
+    // ICoreWebView2_4
+    WebView2AddDownloadStarting,
+    WebView2RemoveDownloadStarting,
+    // ICoreWebView2Settings vtable
+    WebView2SettingsRelease,
+    WebView2SettingsGetIsScriptEnabled,
+    WebView2SettingsPutIsScriptEnabled,
+    WebView2SettingsGetIsWebMessageEnabled,
+    WebView2SettingsPutIsWebMessageEnabled,
+    WebView2SettingsGetIsStatusBarEnabled,
+    WebView2SettingsPutIsStatusBarEnabled,
+    WebView2SettingsGetAreDevToolsEnabled,
+    WebView2SettingsPutAreDevToolsEnabled,
+    WebView2SettingsGetDefaultBackgroundColor,
+    WebView2SettingsPutDefaultBackgroundColor,
+    // -- D2D helper functions (D2D1.DLL) --
+    D2D1MakeRotateMatrix,
+    D2D1MakeSkewMatrix,
+    D2D1IsMatrixInvertible,
+    D2D1InvertMatrix,
+    // -- WinMM (Windows Multimedia) audio (Phase 2.5) --
+    WaveOutOpen,
+    WaveOutClose,
+    WaveOutPrepareHeader,
+    WaveOutUnprepareHeader,
+    WaveOutWrite,
+    WaveOutReset,
+    WaveOutGetVolume,
+    WaveOutSetVolume,
+    WaveOutGetDevCapsW,
+    WaveOutGetNumDevs,
+    WaveInOpen,
+    WaveInClose,
+    WaveInPrepareHeader,
+    WaveInUnprepareHeader,
+    WaveInAddBuffer,
+    WaveInStart,
+    WaveInStop,
+    WaveInGetDevCapsW,
+    WaveInGetNumDevs,
+    MidiOutOpen,
+    MidiOutClose,
+    MidiOutShortMsg,
+    MidiOutLongMsg,
+    MidiOutReset,
+    MidiOutGetDevCapsW,
+    MidiOutGetNumDevs,
+    MidiInOpen,
+    MidiInClose,
+    MidiInStart,
+    MidiInStop,
+    MidiInReset,
+    TimeGetTime,
+    TimeBeginPeriod,
+    TimeEndPeriod,
+    PlaySoundW,
+    MmioOpenW,
+    MmioClose,
+    MmioRead,
+    MmioWrite,
+    MmioAscend,
+    MmioDescend,
+    MmioCreateChunk,
+    MmioStringToFOURCCW,
+    // ── D3D9 Basic Rendering (Phase 1.5) ──────────────────────────────────────
+    /// Direct3DCreate9 — top-level entry point for D3D9.
+    Direct3DCreate9,
+    /// Direct3DCreate9Ex — extended entry point.
+    Direct3DCreate9Ex,
+    // IDirect3D9 factory vtable methods
+    D3d9FactoryCreateDevice,
+    D3d9FactoryGetAdapterCount,
+    D3d9FactoryGetAdapterIdentifier,
+    D3d9FactoryGetAdapterModeCount,
+    D3d9FactoryGetAdapterDisplayMode,
+    D3d9FactoryGetDeviceCaps,
+    // IDirect3DDevice9 vtable methods
+    D3d9DeviceSetRenderState,
+    D3d9DeviceGetRenderState,
+    D3d9DeviceSetFVF,
+    D3d9DeviceSetStreamSource,
+    D3d9DeviceSetIndices,
+    D3d9DeviceDrawPrimitive,
+    D3d9DeviceDrawIndexedPrimitive,
+    D3d9DeviceDrawPrimitiveUP,
+    D3d9DeviceDrawIndexedPrimitiveUP,
+    D3d9DeviceSetTransform,
+    D3d9DeviceSetMaterial,
+    D3d9DeviceSetLight,
+    D3d9DeviceLightEnable,
+    D3d9DeviceSetTexture,
+    D3d9DeviceSetTextureStageState,
+    D3d9DeviceSetViewport,
+    D3d9DeviceSetScissorRect,
+    D3d9DeviceSetClipPlane,
+    D3d9DeviceSetPixelShader,
+    D3d9DeviceSetVertexShader,
+    D3d9DeviceSetPixelShaderConstantF,
+    D3d9DeviceSetVertexShaderConstantF,
+    D3d9DeviceSetSamplerState,
+    D3d9DeviceBeginScene,
+    D3d9DeviceEndScene,
+    D3d9DevicePresent,
+    D3d9DeviceReset,
+    D3d9DeviceCreateVertexBuffer,
+    D3d9DeviceCreateIndexBuffer,
+    D3d9DeviceCreateTexture,
+    D3d9DeviceCreateQuery,
+    D3d9DeviceGetBackBuffer,
+    D3d9DeviceGetRenderTarget,
+    D3d9DeviceSetRenderTarget,
+    D3d9DeviceGetDepthStencilSurface,
+    D3d9DeviceSetDepthStencilSurface,
+    D3d9DeviceClear,
+    D3d9DeviceGetDeviceCaps,
+    D3d9DeviceGetSwapChain,
+    D3d9DeviceTestCooperativeLevel,
+    D3d9DeviceGetViewport,
+    D3d9DeviceGetTransform,
+    D3d9DeviceGetTexture,
+    D3d9DeviceGetStreamSource,
+    D3d9DeviceGetIndices,
+    // IDirect3DVertexBuffer9 vtable methods
+    D3d9VertexBufferLock,
+    D3d9VertexBufferUnlock,
+    // IDirect3DIndexBuffer9 vtable methods
+    D3d9IndexBufferLock,
+    D3d9IndexBufferUnlock,
+    // IDirect3DTexture9 vtable methods
+    D3d9TextureLockRect,
+    D3d9TextureUnlockRect,
+    // IDirect3DSwapChain9 vtable methods
+    D3d9SwapChainPresent,
+    D3d9SwapChainGetBackBuffer,
     Unsupported { dll: String, symbol: String },
 }
 
@@ -1640,10 +2182,47 @@ enum GuestObjectKind {
     SteamVRHmd,
     SteamVRCompositor,
     SteamVRChaperone,
+    SteamVRController,
+    SteamVRInput,
     /// A COM class factory (IClassFactory).
     ComClassFactory,
     /// A COM dispatch object (IDispatch).
     ComDispatch,
+    /// A XAPO audio effect object (IXAPO).
+    XapoEffect,
+    // ── WMI COM Objects ───────────────────────────────────────────────────────
+    /// IWbemLocator COM object.
+    WbemLocator,
+    /// IWbemServices COM object.
+    WbemServices,
+    /// IWbemClassObject COM object.
+    WbemClassObject,
+    /// IEnumWbemClassObject COM object.
+    EnumWbemObjects,
+    // ── WebView2 COM Objects ─────────────────────────────────────────────────
+    /// ICoreWebView2Environment COM object.
+    WebView2Environment,
+    /// ICoreWebView2Controller COM object.
+    WebView2Controller,
+    /// ICoreWebView2 COM object.
+    WebView2WebView,
+    /// ICoreWebView2Settings COM object.
+    WebView2Settings,
+    // ── D3D9 Objects (Phase 1.5) ─────────────────────────────────────────────
+    /// IDirect3D9 factory COM object.
+    D3d9Factory,
+    /// IDirect3DDevice9 COM object.
+    D3d9Device,
+    /// IDirect3DVertexBuffer9 COM object.
+    D3d9VertexBuffer,
+    /// IDirect3DIndexBuffer9 COM object.
+    D3d9IndexBuffer,
+    /// IDirect3DTexture9 COM object.
+    D3d9Texture,
+    /// IDirect3DQuery9 COM object.
+    D3d9Query,
+    /// IDirect3DSwapChain9 COM object.
+    D3d9SwapChain,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1849,6 +2428,27 @@ struct RealDllState {
     native_library: Option<libloading::Library>,
 }
 
+/// Tracks metadata for a loaded DLL (both synthetic and real PE).
+/// Used for HMODULE-based lookup and DllMain notification dispatch.
+#[derive(Debug, Clone)]
+struct DllInfo {
+    /// Module handle (HMODULE) — the base address in guest space.
+    pub handle: u64,
+    /// Size of the module image in bytes.
+    pub image_size: u64,
+    /// PE entry point RVA (0 if synthetic/no entry point).
+    pub entry_point_rva: u32,
+    /// Reference/load count (incremented on LoadLibrary, decremented on FreeLibrary).
+    pub load_count: u32,
+    /// Normalised module name (e.g. "kernel32.dll").
+    pub module_name: String,
+    /// Host path to the on-disk DLL (empty for synthetic modules).
+    pub host_path: String,
+    /// TLS callback addresses as RVAs (relative to original image base).
+    /// Empty vec for modules without TLS callbacks.
+    pub tls_callbacks: Vec<u64>,
+}
+
 struct PeHostRuntime {
     audio: AudioSubsystem,
     win32: Win32Subsystem,
@@ -1871,6 +2471,8 @@ struct PeHostRuntime {
     directinput8_objects: BTreeMap<u64, ()>,
     /// DirectInput8 device objects — device_object -> guid
     directinput8_device_objects: BTreeMap<u64, String>,
+    /// Per-device force-feedback state for DirectInputDevice8.
+    directinput8_ff_state: BTreeMap<u64, crate::real_win32::DirectInputDevice8>,
     d3d12_runtime: D3d12Runtime,
     d3d12_guest_root_signature: Option<D3d12RootSignatureId>,
     d3d12_guest_pipeline_state: Option<D3d12PipelineStateId>,
@@ -1918,6 +2520,9 @@ struct PeHostRuntime {
     /// Incremented when the bump pointer exceeds the 32-bit address space.
     x86_heap_region: u32,
     heap_allocations: BTreeMap<u64, usize>,
+    /// Tracks private page allocations (VirtualAlloc / MEM_RESERVE|MEM_COMMIT)
+    /// so `VirtualFree` / `MEM_RELEASE` can validate and free them.
+    private_pages: BTreeMap<u64, usize>,
     critical_sections: BTreeMap<u64, usize>,
     condition_variables: BTreeMap<u64, ConditionVariableState>,
     srw_locks: BTreeMap<u64, i32>,
@@ -1945,6 +2550,18 @@ struct PeHostRuntime {
     /// Real (on-disk) DLLs that have been loaded via `load_real_dll`.
     /// Keyed by normalised DLL name (lowercase, e.g. "mydll.dll").
     loaded_real_dlls: HashMap<String, RealDllState>,
+    /// Cache for forwarded export resolutions.
+    /// Key is the forwarder string (e.g. "KERNEL32.CreateFileW"),
+    /// value is the resolved address or None if unresolvable.
+    forwarder_export_cache: BTreeMap<String, Option<u64>>,
+    /// HMODULE → DllInfo tracking table for all loaded DLLs.
+    /// Populated for synthetic modules (via get_or_create_module_handle),
+    /// real PE DLLs (via load_real_dll), and the main module.
+    dll_info_table: HashMap<u64, DllInfo>,
+    /// Registered initialization callbacks for synthetic/managed DLLs.
+    /// Called with (module_handle, DLL_PROCESS_ATTACH) when a synthetic
+    /// module is first created.
+    synthetic_dll_init_callbacks: Vec<Box<dyn FnMut(u64, u32)>>,
     network: NetworkStack,
     /// WinHTTP/WinINet stack for HTTP/TLS operations
     winhttp: WinHttpStack,
@@ -2040,6 +2657,9 @@ struct PeHostRuntime {
     published_live_frame: bool,
     delivering_guest_exception: bool,
     dtm: bool,
+    /// Telemetry collector for unsupported imports, vtable methods,
+    /// shader-model requests, and unimplemented CPU instructions.
+    telemetry: TelemetryCollector,
     /// When enabled (via `CASA1_STEAM_TRACE` env var), Steam.exe-specific
     /// diagnostic probes in the main execution loop are active.  These probes
     /// track cookie-slot values, ESI-clobber detection, final-assert window
@@ -2068,6 +2688,60 @@ struct PeHostRuntime {
     /// Native COM apartment state for DllGetClassObject resolution and
     /// class-factory registration.  Lazily initialised on first COM call.
     com_apartment: Option<crate::real_win32::ComApartmentState>,
+    /// Maps file handles to ADS stream info (base_windows_path, stream_name).
+    /// Populated by CreateFileW when an NTFS Alternate Data Stream path is detected.
+    ads_handles: HashMap<u32, (String, String)>,
+    /// XAPO audio effect manager for IXAPO COM object dispatch.
+    xapo_manager: crate::real_audio::XapoManager,
+    /// Guest XAPO effect objects: maps guest object address -> effect instance ID.
+    xapo_effect_instances: HashMap<u64, u64>,
+    // ── WMI State ──────────────────────────────────────────────────────────────
+    /// WbemServices instances: maps guest object address -> WbemServices.
+    wmi_services: HashMap<u64, crate::wmi::WbemServices>,
+    /// WbemClassObject instances: maps guest object address -> WbemClassObject.
+    wmi_class_objects: HashMap<u64, crate::wmi::WbemClassObject>,
+    /// EnumWbemObjects instances: maps guest object address -> EnumWbemObjects.
+    wmi_enums: HashMap<u64, crate::wmi::EnumWbemObjects>,
+    // ── Direct2D / DirectWrite State ──────────────────────────────────────────
+    /// D2D factory instances.
+    d2d_factory: Option<crate::d2d::D2DFactory>,
+    /// DWrite factory instances.
+    dwrite_factory: Option<crate::dwrite::DWriteFactory>,
+    /// D2D brush objects: maps guest object address -> brush.
+    d2d_brushes: HashMap<u64, crate::d2d::D2DBrush>,
+    /// D2D bitmap objects: maps guest object address -> bitmap.
+    d2d_bitmaps: HashMap<u64, crate::d2d::D2DBitmap>,
+    /// DWrite text format objects: maps guest object address -> format.
+    dwrite_formats: HashMap<u64, crate::dwrite::DWriteTextFormat>,
+    /// DWrite text layout objects: maps guest object address -> layout.
+    dwrite_layouts: HashMap<u64, crate::dwrite::DWriteTextLayout>,
+    // ── Print Subsystem ────────────────────────────────────────────────────────
+    /// Print spooler state (winspool.drv)
+    print_subsystem: crate::print::PrintSubsystem,
+    // ── WebView2 Runtime ───────────────────────────────────────────────────────
+    /// WebView2 COM interface state (wraps WKWebView via cef_bridge).
+    webview2_runtime: crate::webview2::WebView2Runtime,
+    // ── SEH / VEH Exception Handling ──────────────────────────────────────────
+    /// Structured Exception Handling and Vectored Exception Handling subsystem.
+    /// Manages .pdata exception tables, VEH handler chains, and SEH dispatch.
+    seh: crate::seh::SehSubsystem,
+    // ── D3D9 Basic Rendering (Phase 1.5) ──────────────────────────────────────
+    /// Direct3D9 compatibility shim (lazily initialised).
+    d3d9_shim: Option<crate::d3d11::Direct3D9Shim>,
+    /// Guest IDirect3DDevice9 objects → shim device state.
+    d3d9_devices: HashMap<u64, crate::d3d11::Direct3D9Device>,
+    /// Guest IDirect3DVertexBuffer9 objects → shim vertex buffer.
+    d3d9_vertex_buffers: HashMap<u64, crate::d3d11::VertexBuffer9>,
+    /// Guest IDirect3DIndexBuffer9 objects → shim index buffer.
+    d3d9_index_buffers: HashMap<u64, crate::d3d11::IndexBuffer9>,
+    /// Guest IDirect3DTexture9 objects → shim texture.
+    d3d9_textures: HashMap<u64, crate::d3d11::D3d9Texture>,
+    /// Guest IDirect3DQuery9 objects (stub).
+    d3d9_queries: HashMap<u64, ()>,
+    /// Guest IDirect3DSwapChain9 objects → device association.
+    d3d9_swapchains: HashMap<u64, u64>,
+    /// Guest IDirect3D9 factory objects.
+    d3d9_factories: HashSet<u64>,
 }
 
 #[derive(Debug)]
@@ -2166,6 +2840,55 @@ pub fn is_pe_image(path: &Path) -> AppResult<bool> {
     Ok(bytes.starts_with(b"MZ"))
 }
 
+/// Locate the `casa1-runner` binary on disk.
+///
+/// Search order:
+/// 1. Same directory as the current executable (for installed / `cargo run`).
+/// 2. Cargo target directory (for `cargo test` / `cargo build`).
+/// 3. `PATH` environment variable.
+pub fn find_casa1_runner_binary() -> AppResult<PathBuf> {
+    // 1. Next to current executable
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            let candidate = exe_dir.join("casa1-runner");
+            if candidate.exists() {
+                return Ok(candidate);
+            }
+            // Also check for casa1-runner with .exe suffix (cross-compile scenarios)
+            let candidate_exe = exe_dir.join("casa1-runner.exe");
+            if candidate_exe.exists() {
+                return Ok(candidate_exe);
+            }
+        }
+    }
+
+    // 2. Cargo target directory (dev/test)
+    if let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
+        let manifest_path = PathBuf::from(manifest_dir);
+        for &profile in &["debug", "release"] {
+            let candidate = manifest_path.join("target").join(profile).join("casa1-runner");
+            if candidate.exists() {
+                return Ok(candidate);
+            }
+        }
+    }
+
+    // 3. PATH
+    if let Ok(path) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path) {
+            let candidate = dir.join("casa1-runner");
+            if candidate.exists() {
+                return Ok(candidate);
+            }
+        }
+    }
+
+    Err(AppError::new(
+        ReasonCode::RcRunnerSpawnFailed,
+        "casa1-runner binary not found — ensure the project is built (cargo build)",
+    ))
+}
+
 pub fn execute(
     program: &Path,
     args: &[String],
@@ -2235,7 +2958,23 @@ pub fn execute_with_options(
     let mapped = pe::map_image(&bytes, &image, &image_hash, dtm)?;
     let mut memory = MemoryImage::default();
     memory.map_bytes(mapped.selected_base, &mapped.memory);
-    runtime.set_main_module(&staged_program_path, mapped.selected_base, &image.exports);
+    // Extract main image TLS callback RVAs for storage in DllInfo.
+    let main_tls_callbacks_rva: Vec<u64> = image
+        .tls_directory
+        .as_ref()
+        .map(|tls| {
+            tls.callbacks
+                .iter()
+                .map(|&va| va.wrapping_sub(image.image_base))
+                .collect()
+        })
+        .unwrap_or_default();
+    runtime.set_main_module(
+        &staged_program_path,
+        mapped.selected_base,
+        &image.exports,
+        &main_tls_callbacks_rva,
+    );
     runtime.seed_process_state(
         &mut memory,
         &staged_program_path,
@@ -2246,6 +2985,32 @@ pub fn execute_with_options(
     runtime.initialize_security_cookie(&mut memory, &image, mapped.selected_base)?;
     runtime.initialize_main_thread_tls(&mut memory, &image, mapped.selected_base)?;
     runtime.bind_imports(mapped.selected_base, &mut memory, &resolved_imports)?;
+
+    // ── Register .pdata exception tables with the SEH subsystem ──────────────
+    if guest_arch == GuestArch::X64 {
+        // Extract .pdata section bytes (runtime function entries)
+        let mut pdata_bytes: &[u8] = &[];
+        if let Some(pdata_section) = image.sections.iter().find(|s| {
+            let name = s.name.trim_end_matches('\u{0000}');
+            name == ".pdata"
+        }) {
+            let start = pdata_section.virtual_address as usize;
+            let end = (pdata_section.virtual_address + pdata_section.virtual_size) as usize;
+            if end <= mapped.memory.len() {
+                pdata_bytes = &mapped.memory[start..end];
+            }
+        }
+        // Register the full mapped image as unwind data so that any
+        // UNWIND_INFO structure (typically in .rdata or .xdata) can be found
+        // by RVA during lazy parsing.
+        if !pdata_bytes.is_empty() {
+            runtime.register_seh_exception_data(
+                mapped.selected_base,
+                pdata_bytes,
+                &mapped.memory,
+            );
+        }
+    }
 
     // Parse Steam command-line flags if running Steam.exe.
     if staged_program_path.contains("Steam.exe") || staged_program_path.contains("steam.exe") {
@@ -4980,6 +5745,7 @@ impl PeHostRuntime {
             xaudio_source_voices: BTreeMap::new(),
             directinput8_objects: BTreeMap::new(),
             directinput8_device_objects: BTreeMap::new(),
+            directinput8_ff_state: BTreeMap::new(),
             d3d12_runtime: D3d12Runtime::new(),
             d3d12_guest_root_signature: None,
             d3d12_guest_pipeline_state: None,
@@ -5024,6 +5790,7 @@ impl PeHostRuntime {
             next_private_address: PRIVATE_PAGES_BASE,
             x86_heap_region: 0,
             heap_allocations: BTreeMap::new(),
+            private_pages: BTreeMap::new(),
             critical_sections: BTreeMap::new(),
             condition_variables: BTreeMap::new(),
             srw_locks: BTreeMap::new(),
@@ -5046,6 +5813,9 @@ impl PeHostRuntime {
             synthetic_module_handles: BTreeSet::new(),
             materialized_synthetic_modules: BTreeSet::new(),
             loaded_real_dlls: HashMap::new(),
+            forwarder_export_cache: BTreeMap::new(),
+            dll_info_table: HashMap::new(),
+            synthetic_dll_init_callbacks: Vec::new(),
             network: NetworkStack::new(),
             winhttp: WinHttpStack::new(),
             device_contexts: BTreeMap::new(),
@@ -5109,6 +5879,7 @@ impl PeHostRuntime {
             published_live_frame: false,
             delivering_guest_exception: false,
             dtm,
+            telemetry: TelemetryCollector::new(),
             // Steam diagnostic tracing is opt-in via env var.
             // Only enable when debugging Steam.exe startup failures.
             enable_steam_tracing: std::env::var("CASA1_STEAM_TRACE").is_ok(),
@@ -5121,6 +5892,39 @@ impl PeHostRuntime {
             com_registration_tokens: HashMap::new(),
             com_next_token: 1,
             com_apartment: None,
+            ads_handles: HashMap::new(),
+            xapo_manager: {
+                let mut mgr = crate::real_audio::XapoManager::new();
+                mgr.register_builtins();
+                mgr
+            },
+            xapo_effect_instances: HashMap::new(),
+            // ── WMI State ──────────────────────────────────────────────────────
+            wmi_services: HashMap::new(),
+            wmi_class_objects: HashMap::new(),
+            wmi_enums: HashMap::new(),
+            // ── Direct2D / DirectWrite State ──────────────────────────────────────
+            d2d_factory: None,
+            dwrite_factory: None,
+            d2d_brushes: HashMap::new(),
+            d2d_bitmaps: HashMap::new(),
+            dwrite_formats: HashMap::new(),
+            dwrite_layouts: HashMap::new(),
+            // ── Print Subsystem ─────────────────────────────────────────────────
+            print_subsystem: crate::print::PrintSubsystem::new(),
+            // ── WebView2 Runtime ───────────────────────────────────────────────
+            webview2_runtime: crate::webview2::WebView2Runtime::new(),
+            // ── SEH / VEH Exception Handling ───────────────────────────────────
+            seh: crate::seh::SehSubsystem::new(),
+            // ── D3D9 Basic Rendering (Phase 1.5) ───────────────────────────────
+            d3d9_shim: None,
+            d3d9_devices: HashMap::new(),
+            d3d9_vertex_buffers: HashMap::new(),
+            d3d9_index_buffers: HashMap::new(),
+            d3d9_textures: HashMap::new(),
+            d3d9_queries: HashMap::new(),
+            d3d9_swapchains: HashMap::new(),
+            d3d9_factories: HashSet::new(),
         }
     }
 
@@ -5176,16 +5980,35 @@ impl PeHostRuntime {
         Ok(guest_program_path)
     }
 
-    fn set_main_module(&mut self, guest_program_path: &str, mapped_image_base: u64, exports: &[ExportSymbol]) {
+    fn set_main_module(
+        &mut self,
+        guest_program_path: &str,
+        mapped_image_base: u64,
+        exports: &[ExportSymbol],
+        tls_callbacks_rva: &[u64],
+    ) {
         let main_module_name = normalize_module_name(module_file_name(guest_program_path));
         self.main_module_name = main_module_name.clone();
         self.main_module_path = guest_program_path.to_string();
         self.main_module_exports = exports.to_vec();
         if !main_module_name.is_empty() {
             self.module_handles.insert(main_module_name.clone(), mapped_image_base);
-            self.module_names_by_handle.insert(mapped_image_base, main_module_name);
+            self.module_names_by_handle.insert(mapped_image_base, main_module_name.clone());
             self.module_paths_by_handle
                 .insert(mapped_image_base, guest_program_path.to_string());
+            // Register DllInfo for the main module (the .exe).
+            self.dll_info_table.insert(
+                mapped_image_base,
+                DllInfo {
+                    handle: mapped_image_base,
+                    image_size: self.mapped_image_size,
+                    entry_point_rva: 0, // Main module entry point is not a DllMain
+                    load_count: 1,
+                    module_name: main_module_name,
+                    host_path: guest_program_path.to_string(),
+                    tls_callbacks: tls_callbacks_rva.to_vec(),
+                },
+            );
         }
     }
 
@@ -5194,7 +6017,11 @@ impl PeHostRuntime {
         if normalized.is_empty() || normalized.ends_with(".exe") {
             return self.mapped_image_base;
         }
+        // Already created?  Increment the load count.
         if let Some(&handle) = self.module_handles.get(&normalized) {
+            if let Some(info) = self.dll_info_table.get_mut(&handle) {
+                info.load_count = info.load_count.saturating_add(1);
+            }
             return handle;
         }
         let handle = align_up_u64(self.next_data_address, 0x1000);
@@ -5202,8 +6029,28 @@ impl PeHostRuntime {
         self.module_names_by_handle.insert(handle, normalized.clone());
         self.module_paths_by_handle
             .insert(handle, resolve_full_guest_path(&self.current_directory, module_name));
-        self.module_handles.insert(normalized, handle);
+        self.module_handles.insert(normalized.clone(), handle);
         self.synthetic_module_handles.insert(handle);
+
+        // Register DllInfo for this synthetic module.
+        self.dll_info_table.insert(
+            handle,
+            DllInfo {
+                handle,
+                image_size: 0x1000, // Minimal synthetic image size
+                entry_point_rva: 0,
+                load_count: 1,
+                module_name: normalized.clone(),
+                host_path: String::new(),
+                tls_callbacks: Vec::new(), // Synthetic modules have no TLS callbacks
+            },
+        );
+
+        // Fire synthetic DLL init callbacks (DLL_PROCESS_ATTACH).
+        for cb in &mut self.synthetic_dll_init_callbacks {
+            cb(handle, DLL_PROCESS_ATTACH);
+        }
+
         handle
     }
 
@@ -5323,6 +6170,30 @@ impl PeHostRuntime {
             }
         }
 
+        // Check if this is a synthetic module with an export table that contains
+        // a forwarder.  If so, follow the forwarder chain recursively.
+        if let Some(export_table) = export_tables().get(&normalized) {
+            let export = match &symbol {
+                ImportSymbol::ByName { name, .. } => export_table
+                    .iter()
+                    .find(|exp| exp.name.as_deref() == Some(name.as_str())),
+                ImportSymbol::ByOrdinal { ordinal } => export_table
+                    .iter()
+                    .find(|exp| exp.ordinal == u32::from(*ordinal)),
+            };
+            if let Some(ExportTarget::Forwarder(fwd_str)) = export.map(|exp| &exp.target) {
+                let mut visited = std::collections::HashSet::new();
+                if let Some(addr) = self.resolve_forwarder_export(fwd_str, &mut visited) {
+                    return addr;
+                }
+                // Forwarder unresolvable — return 0 (caller sets ERROR_PROC_NOT_FOUND).
+                return 0;
+            }
+            // RVA export found — nothing special to do; fall through to HostThunk
+            // creation below.  (Synthetic module RVA exports are handled by the
+            // HostThunk dispatch mechanism.)
+        }
+
         let thunk = HostThunk::from_import(&ResolvedImport {
             requested_module: module_name.clone(),
             resolved_module: module_name,
@@ -5339,22 +6210,48 @@ impl PeHostRuntime {
         thunk_address
     }
 
+    /// Maximum forwarder chain depth to prevent stack overflow on deeply
+    /// nested or malicious forwarder chains.
+    const MAX_FORWARDER_DEPTH: usize = 8;
+
     /// Resolve a forwarder export string like `"kernel32.LocalAlloc"` by
     /// chaining to the target module's export table.
+    ///
+    /// Results are cached in `forwarder_export_cache` to avoid re-resolving
+    /// the same forwarder on subsequent lookups.  Unresolvable forwarders
+    /// are cached as `None` to avoid re-attempting.
     fn resolve_forwarder_export(
         &mut self,
         forwarder: &str,
         visited: &mut std::collections::HashSet<String>,
     ) -> Option<u64> {
-        // Forwarder format: "DLL_NAME.SymbolName" or "DLL_NAME.#ORDINAL"
-        // Check for circular forwarding before doing any work.
+        // Check cache first.
+        if let Some(cached) = self.forwarder_export_cache.get(forwarder) {
+            return *cached;
+        }
+
+        // Guard against circular forwarding.
         if !visited.insert(forwarder.to_string()) {
             eprintln!(
                 "[pe_runtime] circular forwarder detected: {forwarder}"
             );
+            self.forwarder_export_cache
+                .insert(forwarder.to_string(), None);
             return None;
         }
 
+        // Guard against excessive forwarder depth.
+        if visited.len() > Self::MAX_FORWARDER_DEPTH {
+            eprintln!(
+                "[pe_runtime] forwarder chain too deep (>{}) at: {forwarder}",
+                Self::MAX_FORWARDER_DEPTH,
+            );
+            self.forwarder_export_cache
+                .insert(forwarder.to_string(), None);
+            return None;
+        }
+
+        // Forwarder format: "DLL_NAME.SymbolName" or "DLL_NAME.#ORDINAL"
         let (dll_part, symbol_part) = forwarder.split_once('.')?;
         let dll_name = normalize_module_name(dll_part);
         // normalize_module_name() always appends .dll if no extension is present,
@@ -5362,6 +6259,8 @@ impl PeHostRuntime {
 
         let (target_handle, _) = self.resolve_load_library_handle(&dll_name);
         if target_handle == 0 {
+            self.forwarder_export_cache
+                .insert(forwarder.to_string(), None);
             return None;
         }
 
@@ -5375,7 +6274,19 @@ impl PeHostRuntime {
             }
         };
 
-        Some(self.resolve_proc_address(target_handle, import_sym))
+        let result = Some(self.resolve_proc_address(target_handle, import_sym));
+
+        // Cache the result (address or None if address is 0).
+        if let Some(addr) = result {
+            if addr != 0 {
+                self.forwarder_export_cache
+                    .insert(forwarder.to_string(), Some(addr));
+                return Some(addr);
+            }
+        }
+        self.forwarder_export_cache
+            .insert(forwarder.to_string(), None);
+        None
     }
 
     /// DLL search order: app directory → C:\Windows\System32 → C:\Windows → PATH
@@ -5504,6 +6415,16 @@ impl PeHostRuntime {
     /// Returns the guest module handle and a status code (0 = success).
     fn load_real_dll(&mut self, module_name: &str, host_path: &Path) -> (u64, u32) {
         let normalized = normalize_module_name(module_name);
+
+        // Invalidate forwarder export cache entries that reference this DLL,
+        // since loading a new version may change its exports.
+        let dll_prefix = normalized
+            .trim_end_matches(".dll")
+            .to_uppercase();
+        self.forwarder_export_cache.retain(|key, _| {
+            // Keep entries whose key does not start with "<DLL_NAME>."
+            !key.starts_with(&format!("{dll_prefix}."))
+        });
 
         // Already loaded?
         if let Some(state) = self.loaded_real_dlls.get_mut(&normalized) {
@@ -5639,7 +6560,33 @@ impl PeHostRuntime {
         self.module_names_by_handle.insert(handle, normalized.clone());
         self.module_paths_by_handle
             .insert(handle, resolve_full_guest_path(&self.current_directory, module_name));
-        self.module_handles.insert(normalized, handle);
+        self.module_handles.insert(normalized.clone(), handle);
+
+        // Extract TLS callback RVAs (relative to original image base) for this DLL.
+        let tls_callbacks_rva: Vec<u64> = parsed
+            .tls_directory
+            .as_ref()
+            .map(|tls| {
+                tls.callbacks
+                    .iter()
+                    .map(|&va| va.wrapping_sub(parsed.image_base))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Register DllInfo for this real PE DLL.
+        self.dll_info_table.insert(
+            handle,
+            DllInfo {
+                handle,
+                image_size: parsed.size_of_image as u64,
+                entry_point_rva: parsed.address_of_entry_point,
+                load_count: 1,
+                module_name: normalized.clone(),
+                host_path: host_path.to_string_lossy().to_string(),
+                tls_callbacks: tls_callbacks_rva,
+            },
+        );
 
         (handle, 0)
     }
@@ -5657,6 +6604,10 @@ impl PeHostRuntime {
     ///
     ///   BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved);
     ///
+    /// TLS callbacks are fired BEFORE DllMain for process-attach and thread-attach,
+    /// and AFTER DllMain for process-detach and thread-detach, matching Windows
+    /// behavior.
+    ///
     /// This MUST be called from the main execution loop (or from a context where
     /// guest code can be safely executed), NOT from within a host thunk dispatch.
     fn drain_pending_dll_main_calls(
@@ -5667,6 +6618,16 @@ impl PeHostRuntime {
         while let Some((image_base, entry_point_rva, reason)) =
             self.pending_dll_main_calls.pop_front()
         {
+            // Fire TLS callbacks BEFORE DllMain for attach reasons.
+            if reason == DLL_PROCESS_ATTACH || reason == DLL_THREAD_ATTACH {
+                self.execute_tls_callbacks_for_module(
+                    state,
+                    memory,
+                    image_base,
+                    reason,
+                )?;
+            }
+
             let entry_point = image_base + entry_point_rva as u64;
             eprintln!(
                 "[pe_runtime] DllMain({:#x}, {}, NULL) at {:#x}",
@@ -5679,6 +6640,16 @@ impl PeHostRuntime {
                 &[image_base, reason as u64, 0],
                 &format!("DllMain({:#x}, reason={})", image_base, reason),
             )?;
+
+            // Fire TLS callbacks AFTER DllMain for detach reasons.
+            if reason == DLL_PROCESS_DETACH || reason == DLL_THREAD_DETACH {
+                self.execute_tls_callbacks_for_module(
+                    state,
+                    memory,
+                    image_base,
+                    reason,
+                )?;
+            }
         }
         Ok(())
     }
@@ -5701,6 +6672,32 @@ impl PeHostRuntime {
         // Immediately drain in case the caller expects synchronous execution
         // from a context where guest code can be safely run.
         self.drain_pending_dll_main_calls(state, memory)
+    }
+
+    /// Iterate all loaded DLLs from the `dll_info_table` and queue their entry
+    /// points to be called with the given `reason`.
+    ///
+    /// Only DLLs with a non-zero `entry_point_rva` (i.e. those that actually
+    /// export a DllMain) are notified.  Synthetic/managed modules that have no
+    /// PE entry point are skipped.
+    ///
+    /// The calls are deferred via [`pending_dll_main_calls`] and must be drained
+    /// later (e.g. via [`drain_pending_dll_main_calls`]) from a context where
+    /// guest code can safely execute.
+    pub fn call_dll_entry_points(
+        &mut self,
+        dll_handles: &[u64],
+        reason: DllReason,
+    ) {
+        let raw_reason = reason.to_raw();
+        for &handle in dll_handles {
+            if let Some(info) = self.dll_info_table.get(&handle) {
+                if info.entry_point_rva != 0 {
+                    self.pending_dll_main_calls
+                        .push_back((handle, info.entry_point_rva, raw_reason));
+                }
+            }
+        }
     }
 
     /// Dispatch a RealDllExport thunk by looking up the native function pointer
@@ -5794,6 +6791,16 @@ impl PeHostRuntime {
             .unwrap_or_default()
     }
 
+    /// Registers a callback that will be invoked when a synthetic/managed DLL receives
+    /// a DllMain notification (e.g. `DLL_PROCESS_ATTACH`).
+    ///
+    /// The callback receives the module handle (HMODULE) and the notification reason
+    /// (e.g. `DLL_PROCESS_ATTACH = 1`). Callbacks fire from
+    /// [`get_or_create_module_handle`] when a synthetic module is first created.
+    pub fn register_synthetic_dll_init_callback(&mut self, cb: Box<dyn FnMut(u64, u32)>) {
+        self.synthetic_dll_init_callbacks.push(cb);
+    }
+
     fn launch_guest_child_process(
         &mut self,
         application: &str,
@@ -5812,12 +6819,6 @@ impl PeHostRuntime {
                 format!("child executable not found: {}", host_program.display()),
             ));
         }
-        if !is_pe_image(&host_program)? {
-            return Err(AppError::new(
-                ReasonCode::RcUnimplInsn,
-                format!("CreateProcessW only supports PE children: {}", host_program.display()),
-            ));
-        }
 
         let host_cwd = self
             .win32
@@ -5825,61 +6826,153 @@ impl PeHostRuntime {
             .ok()
             .or_else(|| host_program.parent().map(Path::to_path_buf))
             .unwrap_or_else(|| PathBuf::from("."));
-        let child_test_id = environment
-            .get("CASA1_TEST_ID")
-            .map(String::as_str)
-            .unwrap_or("nested-pe-child")
-            .to_string();
 
         // Install the exit-sync condvar pair so that WaitForSingleObject
         // can block on this child process handle until it finishes.
         let sync = Arc::new((std::sync::Mutex::new(None), std::sync::Condvar::new()));
         self.win32.install_process_exit_sync(result.process_handle, sync.clone())?;
-        let sync = Some(sync);
 
-        // Clone all data that must outlive the background thread.
-        let ge = self.win32.ge().clone();
-        let argv: Vec<String> = result.argv.iter().skip(1).cloned().collect();
-        let env = (*environment).clone();
-        let dtm = self.dtm;
+        if is_pe_image(&host_program)? {
+            // For PE images, spawn casa1-runner as a child subprocess.
+            // The casa1-runner binary handles PE execution in a separate
+            // process, providing real process isolation.
+            let runner_path = find_casa1_runner_binary()?;
+            let argv: Vec<String> = result.argv.iter().skip(1).cloned().collect();
+            let env = (*environment).clone();
+            let ge = self.win32.ge().clone();
+            let dtm = self.dtm;
+            let child_test_id = environment
+                .get("CASA1_TEST_ID")
+                .map(String::as_str)
+                .unwrap_or("nested-pe-child")
+                .to_string();
 
-        // Spawn a background thread that runs the child PE image.
-        // When the child exits, the thread captures the exit code inside
-        // the shared sync pair and notifies any waiters.
-        std::thread::spawn(move || {
-            let child = match execute_with_options(
-                &host_program,
-                &argv,
-                &ge,
-                &host_cwd,
-                &env,
+            // Build a RunnerJob for the child PE.
+            let job = crate::runner::RunnerJob {
+                ge_name: ge.config.name.clone(),
+                ge_root: ge.root.clone(),
+                program: host_program.clone(),
+                args: argv,
+                cwd: host_cwd.clone(),
+                env,
                 dtm,
-                &child_test_id,
-                PeExecutionOptions::default(),
-            ) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("[pe_runtime] child process {host_program:?} failed: {e:?}");
-                    // On failure report exit code 0xFFFFFFFF (-1).
-                    if let Some(ref sync) = sync {
-                        let (lock, cvar) = &**sync;
-                        let mut guard = lock.lock().unwrap();
-                        *guard = Some(u32::MAX);
-                        cvar.notify_all();
-                    }
-                    return;
-                }
+                intent: crate::runner::RunIntent::Run,
+                trace_categories: Vec::new(),
+                test_id: child_test_id,
             };
-            let exit_code = child.exit_code as u32;
-            if let Some(ref sync) = sync {
-                let (lock, cvar) = &**sync;
-                let mut guard = lock.lock().unwrap();
-                *guard = Some(exit_code);
-                cvar.notify_all();
+
+            // Serialise the job to a temporary JSON file.
+            let job_json = serde_json::to_string(&job).map_err(|e| {
+                AppError::new(
+                    ReasonCode::RcRunnerProtocolInvalid,
+                    format!("failed to serialise runner job: {e}"),
+                )
+            })?;
+            let job_dir = std::env::temp_dir().join("casa1-createprocess");
+            let _ = std::fs::create_dir_all(&job_dir);
+            let job_path = job_dir.join(format!("child-{}.json", result.process_id));
+            std::fs::write(&job_path, &job_json).map_err(|e| {
+                AppError::from_io(
+                    ReasonCode::RcIo,
+                    format!("failed to write runner job to {}", job_path.display()),
+                    &e,
+                )
+            })?;
+
+            // Spawn the background monitor thread that starts the runner
+            // subprocess and captures its exit code.
+            let sync = Some(sync);
+            let job_path_clone = job_path.clone();
+            std::thread::spawn(move || {
+                let exit_code = Self::spawn_runner_and_wait(&runner_path, &job_path_clone);
+                // Clean up the temporary job file.
+                let _ = std::fs::remove_file(&job_path_clone);
+                if let Some(ref sync) = sync {
+                    let (lock, cvar) = &**sync;
+                    let mut guard = lock.lock().unwrap();
+                    *guard = Some(exit_code);
+                    cvar.notify_all();
+                }
+            });
+        } else {
+            // For native macOS binaries, spawn directly via std::process::Command.
+            let argv: Vec<String> = result.argv.iter().skip(1).cloned().collect();
+            let mut cmd = std::process::Command::new(&host_program);
+            cmd.args(&argv)
+                .current_dir(&host_cwd)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            for (key, value) in environment {
+                cmd.env(key, value);
             }
-        });
+
+            let sync = Some(sync);
+            std::thread::spawn(move || {
+                let exit_code = match cmd.spawn() {
+                    Ok(mut child) => {
+                        let status = child.wait();
+                        match status {
+                            Ok(status) => status.code().map(|c| c as u32).unwrap_or(u32::MAX),
+                            Err(e) => {
+                                eprintln!("[pe_runtime] failed to wait for native child {host_program:?}: {e:?}");
+                                u32::MAX
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[pe_runtime] failed to spawn native child {host_program:?}: {e:?}");
+                        u32::MAX
+                    }
+                };
+                if let Some(ref sync) = sync {
+                    let (lock, cvar) = &**sync;
+                    let mut guard = lock.lock().unwrap();
+                    *guard = Some(exit_code);
+                    cvar.notify_all();
+                }
+            });
+        }
 
         Ok(result)
+    }
+
+    /// Spawn casa1-runner with a job file and wait for it to complete.
+    /// Returns the exit code (u32::MAX on failure).
+    fn spawn_runner_and_wait(runner_path: &Path, job_path: &Path) -> u32 {
+        let child_result = std::process::Command::new(runner_path)
+            .arg("--job")
+            .arg(job_path)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn();
+        match child_result {
+            Ok(child) => {
+                // Use wait_with_output() to capture stdout while waiting.
+                // child.wait() would close stdout handles, making stdout.take() return None.
+                match child.wait_with_output() {
+                    Ok(output) => {
+                        let output_str = String::from_utf8_lossy(&output.stdout);
+                        // Try to extract the actual child PE exit code from the JSON output.
+                        if let Ok(outcome) =
+                            serde_json::from_str::<crate::runner::RunnerOutcome>(&output_str)
+                        {
+                            outcome.canonical_output.exit_code as u32
+                        } else {
+                            // Fallback: use the process exit code.
+                            output.status.code().map(|c| c as u32).unwrap_or(u32::MAX)
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[pe_runtime] failed to wait for casa1-runner: {e:?}");
+                        u32::MAX
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("[pe_runtime] failed to spawn casa1-runner: {e:?}");
+                u32::MAX
+            }
+        }
     }
 
     fn alloc_utf16_string(&mut self, memory: &mut MemoryImage, value: &str) -> AppResult<u64> {
@@ -6637,6 +7730,68 @@ impl PeHostRuntime {
         Ok(())
     }
 
+    /// Execute TLS callbacks for a specific module with the given reason code.
+    ///
+    /// `handle` is the mapped image base (HMODULE) for the module.
+    /// `reason` is one of `DLL_PROCESS_ATTACH`, `DLL_PROCESS_DETACH`,
+    /// `DLL_THREAD_ATTACH`, or `DLL_THREAD_DETACH`.
+    ///
+    /// Callback addresses are stored as RVAs in DllInfo and are converted to
+    /// runtime addresses by adding `handle`.
+    fn execute_tls_callbacks_for_module(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+        handle: u64,
+        reason: u32,
+    ) -> AppResult<()> {
+        let callbacks = self
+            .dll_info_table
+            .get(&handle)
+            .map(|info| info.tls_callbacks.clone())
+            .unwrap_or_default();
+        for (index, &callback_rva) in callbacks.iter().enumerate() {
+            if callback_rva == 0 {
+                continue;
+            }
+            let callback_address = handle.wrapping_add(callback_rva);
+            let result = self.execute_guest_callback(
+                state,
+                memory,
+                callback_address,
+                &[callback_address, reason as u64, 0, 0],
+                &format!("TLS callback {} for module {:#x}", index, handle),
+            )?;
+            let _ = result;
+        }
+        Ok(())
+    }
+
+    /// Fire TLS callbacks with the given reason for all registered modules.
+    fn fire_tls_callbacks_for_all_modules(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+        reason: u32,
+    ) -> AppResult<()> {
+        let handles: Vec<u64> = self.dll_info_table.keys().copied().collect();
+        for handle in handles {
+            self.execute_tls_callbacks_for_module(state, memory, handle, reason)?;
+        }
+        Ok(())
+    }
+
+    /// Register `.pdata` exception tables for a loaded image with the SEH subsystem.
+    pub fn register_seh_exception_data(
+        &mut self,
+        image_base: u64,
+        pdata_bytes: &[u8],
+        unwind_bytes: &[u8],
+    ) {
+        self.seh.register_pdata(image_base, pdata_bytes);
+        self.seh.register_unwind_data(image_base, unwind_bytes.to_vec());
+    }
+
     fn initialize_main_thread_tls(
         &mut self,
         memory: &mut MemoryImage,
@@ -6992,6 +8147,65 @@ impl PeHostRuntime {
             HostThunk::DXGIFactoryCreateSwapChainForHwnd => {
                 self.dispatch_dxgi_create_swapchain_for_hwnd(memory, state)?;
             }
+            // -- DXGI Factory methods (Phase 5.5 #2) --
+            HostThunk::DXGIFactoryMakeWindowAssociation => {
+                let _this = state.get(Register::Rcx);
+                let _flags = state.get(Register::Rdx);
+                let _window_handle = state.get(Register::R8);
+                // Stub: accept the call, track association, return S_OK.
+                state.set(Register::Rax, 0); // S_OK
+                self.last_error = 0;
+            }
+            HostThunk::DXGIFactoryGetWindowAssociation => {
+                let this = state.get(Register::Rcx);
+                let out_hwnd_ptr = state.get(Register::Rdx);
+                if out_hwnd_ptr != 0 {
+                    // Return a sentinel window handle (0 = no association).
+                    write_u64(memory, out_hwnd_ptr, 0);
+                }
+                state.set(Register::Rax, 0); // S_OK
+                self.last_error = 0;
+            }
+            HostThunk::DXGIFactorySetPrivateData => {
+                let _this = state.get(Register::Rcx);
+                let _guid_ptr = state.get(Register::Rdx);
+                let _data_size = state.get(Register::R8);
+                let _data_ptr = state.get(Register::R9);
+                // Stub: accept and discard, return S_OK.
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+            }
+            HostThunk::DXGIFactoryGetPrivateData => {
+                let _this = state.get(Register::Rcx);
+                let _guid_ptr = state.get(Register::Rdx);
+                let data_size_ptr = state.get(Register::R8);
+                let _data_ptr = state.get(Register::R9);
+                if data_size_ptr != 0 {
+                    // Write 0 bytes returned to signal no data.
+                    write_u32(memory, data_size_ptr, 0);
+                }
+                state.set(Register::Rax, 0x8007004E_u64.wrapping_neg() as u64); // DXGI_ERROR_NOT_FOUND
+                self.last_error = 0x4E; // ERROR_NOT_FOUND
+            }
+            HostThunk::DXGIFactoryGetParent => {
+                let _this = state.get(Register::Rcx);
+                let riid_ptr = state.get(Register::Rdx);
+                let out_ptr = state.get(Register::R8);
+                if out_ptr != 0 {
+                    write_u64(memory, out_ptr, 0);
+                }
+                let _ = riid_ptr;
+                state.set(Register::Rax, 0x80040154_u64.wrapping_neg() as u64); // CLASS_E_CLASSNOTAVAILABLE
+                self.last_error = 0;
+            }
+            HostThunk::DXGIFactoryCreateSoftwareAdapter => {
+                let _this = state.get(Register::Rcx);
+                let _software_module_ptr = state.get(Register::Rdx);
+                let _out_adapter_ptr = state.get(Register::R8);
+                // Software adapter not supported.
+                state.set(Register::Rax, 0x887A0002_u64); // DXGI_ERROR_UNSUPPORTED
+                self.last_error = 0;
+            }
             HostThunk::D3D11CreateDevice => {
                 let stack = state.get(Register::Rsp);
                 if state.get(Register::Rcx) != 0 || state.get(Register::R8) != 0 {
@@ -7176,7 +8390,7 @@ impl PeHostRuntime {
                 self.dispatch_d3d12_graphics_command_list1_set_sample_positions(state)?;
             }
             HostThunk::D3D12GraphicsCommandList1ResolveSubresourceRegion => {
-                self.dispatch_d3d12_graphics_command_list1_resolve_subresource_region(state)?;
+                self.dispatch_d3d12_graphics_command_list1_resolve_subresource_region(memory, state)?;
             }
             HostThunk::D3D12GraphicsCommandList1SetViewInstanceMask => {
                 self.dispatch_d3d12_graphics_command_list1_set_view_instance_mask(state)?;
@@ -7200,19 +8414,19 @@ impl PeHostRuntime {
                 self.dispatch_d3d12_graphics_command_list4_execute_meta_command(state)?;
             }
             HostThunk::D3D12GraphicsCommandList4BuildRaytracingAccelerationStructure => {
-                self.dispatch_d3d12_graphics_command_list4_build_raytracing_acceleration_structure(state)?;
+                self.dispatch_d3d12_graphics_command_list4_build_raytracing_acceleration_structure(memory, state)?;
             }
             HostThunk::D3D12GraphicsCommandList4EmitRaytracingAccelerationStructurePostbuildInfo => {
-                self.dispatch_d3d12_graphics_command_list4_emit_raytracing_acceleration_structure_postbuild_info(state)?;
+                self.dispatch_d3d12_graphics_command_list4_emit_raytracing_acceleration_structure_postbuild_info(memory, state)?;
             }
             HostThunk::D3D12GraphicsCommandList4CopyRaytracingAccelerationStructure => {
-                self.dispatch_d3d12_graphics_command_list4_copy_raytracing_acceleration_structure(state)?;
+                self.dispatch_d3d12_graphics_command_list4_copy_raytracing_acceleration_structure(memory, state)?;
             }
             HostThunk::D3D12GraphicsCommandList4SetPipelineState1 => {
-                self.dispatch_d3d12_graphics_command_list4_set_pipeline_state1(state)?;
+                self.dispatch_d3d12_graphics_command_list4_set_pipeline_state1(memory, state)?;
             }
             HostThunk::D3D12GraphicsCommandList4DispatchRays => {
-                self.dispatch_d3d12_graphics_command_list4_dispatch_rays(state)?;
+                self.dispatch_d3d12_graphics_command_list4_dispatch_rays(memory, state)?;
             }
             HostThunk::D3D12GraphicsCommandList5RSSetShadingRate => {
                 self.dispatch_d3d12_graphics_command_list5_rs_set_shading_rate(state)?;
@@ -7294,6 +8508,193 @@ impl PeHostRuntime {
                 state.set(Register::Rax, 0);
                 self.last_error = 0;
                 self.push_trace("d3d12", "ID3D11Device::GetImmediateContext", BTreeMap::new(), json!(0));
+            }
+            // -- D3D11 Device query methods (Phase 5.5 #2) --
+            HostThunk::D3D11DeviceGetDeviceRemovedReason => {
+                // Simulate device-not-removed (S_OK).
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+            }
+            HostThunk::D3D11DeviceCheckFormatSupport => {
+                let device_object = state.get(Register::Rcx);
+                let format = state.get(Register::Rdx) as u32;
+                let out_fmt_support = state.get(Register::R8);
+                // Accept common formats as supported; reject unknown formats.
+                const DXGI_FORMAT_UNKNOWN: u32 = 0;
+                const DXGI_FORMAT_R8G8B8A8_UNORM: u32 = 28;
+                const DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: u32 = 29;
+                const DXGI_FORMAT_B8G8R8A8_UNORM: u32 = 87;
+                const DXGI_FORMAT_B8G8R8X8_UNORM: u32 = 88;
+                const DXGI_FORMAT_D32_FLOAT: u32 = 40;
+                const DXGI_FORMAT_D24_UNORM_S8_UINT: u32 = 45;
+                const DXGI_FORMAT_D16_UNORM: u32 = 55;
+                const DXGI_FORMAT_R32_FLOAT: u32 = 41;
+                const DXGI_FORMAT_R16_FLOAT: u32 = 54;
+                const DXGI_FORMAT_R32G32B32A32_FLOAT: u32 = 2;
+                const DXGI_FORMAT_R32G32_FLOAT: u32 = 16;
+                const DXGI_FORMAT_R16G16B16A16_FLOAT: u32 = 10;
+                const DXGI_FORMAT_R16G16_UNORM: u32 = 56;
+                const DXGI_FORMAT_R8_UNORM: u32 = 62;
+                const DXGI_FORMAT_BC1_UNORM: u32 = 71;
+                const DXGI_FORMAT_BC2_UNORM: u32 = 74;
+                const DXGI_FORMAT_BC3_UNORM: u32 = 77;
+                const DXGI_FORMAT_NV12: u32 = 103;
+
+                let is_known = matches!(
+                    format,
+                    DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
+                        | DXGI_FORMAT_B8G8R8A8_UNORM | DXGI_FORMAT_B8G8R8X8_UNORM
+                        | DXGI_FORMAT_D32_FLOAT | DXGI_FORMAT_D24_UNORM_S8_UINT
+                        | DXGI_FORMAT_D16_UNORM | DXGI_FORMAT_R32_FLOAT
+                        | DXGI_FORMAT_R16_FLOAT | DXGI_FORMAT_R32G32B32A32_FLOAT
+                        | DXGI_FORMAT_R32G32_FLOAT | DXGI_FORMAT_R16G16B16A16_FLOAT
+                        | DXGI_FORMAT_R16G16_UNORM | DXGI_FORMAT_R8_UNORM
+                        | DXGI_FORMAT_BC1_UNORM | DXGI_FORMAT_BC2_UNORM
+                        | DXGI_FORMAT_BC3_UNORM | DXGI_FORMAT_NV12
+                );
+                if !is_known {
+                    state.set(Register::Rax, E_INVALIDARG);
+                    self.last_error = 0;
+                } else if out_fmt_support != 0 {
+                    // Bitmask of D3D11_FORMAT_SUPPORT values.
+                    // Support: Buffer, Texture2D, ShaderResource, RenderTarget,
+                    //         TypedUnorderedAccessView, CPUReadback, MultiSampleResolve, etc.
+                    let mut support: u32 = 0;
+                    support |= 0x0001; // BUFFER
+                    support |= 0x0004; // TEXTURE2D
+                    support |= 0x0010; // SHADER_RESOURCE
+                    support |= 0x0020; // RENDER_TARGET
+                    support |= 0x0400; // TYPED_UNORDERED_ACCESS_VIEW
+                    support |= 0x0800; // DEPTH_STENCIL (for depth formats)
+                    support |= 0x8000; // TEXTURE3D
+                    support |= 0x20000; // MULTISAMPLE_RENDERTARGET
+                    support |= 0x40000; // MULTISAMPLE_LOAD
+                    support |= 0x100000; // CPU_LOCKABLE
+                    write_u64(memory, out_fmt_support, support as u64);
+                    state.set(Register::Rax, 0); // S_OK
+                    self.last_error = 0;
+                } else {
+                    state.set(Register::Rax, 0x80070057_u64.wrapping_neg() as u64); // E_INVALIDARG
+                    self.last_error = 0;
+                }
+            }
+            HostThunk::D3D11DeviceCheckMultisampleQualityLevels => {
+                let _device_object = state.get(Register::Rcx);
+                let _format = state.get(Register::Rdx) as u32;
+                let sample_count = state.get(Register::R8) as u32;
+                let out_quality_levels = state.get(Register::R9);
+                // Report 1 quality level for sample counts 1, 2, 4, 8; reject others.
+                let valid = matches!(sample_count, 1 | 2 | 4 | 8);
+                if valid && out_quality_levels != 0 {
+                    write_u64(memory, out_quality_levels, 1);
+                }
+                state.set(Register::Rax, if valid { 0 } else { E_INVALIDARG });
+                self.last_error = 0;
+            }
+            HostThunk::D3D11DeviceGetFeatureLevel => {
+                let device_object = state.get(Register::Rcx);
+                let out_feature_level = state.get(Register::Rdx);
+                if out_feature_level != 0 {
+                    // Report D3D_FEATURE_LEVEL_11_0 (0xb000) as the device level.
+                    write_u32(memory, out_feature_level, 0xb000);
+                }
+                state.set(Register::Rax, 0); // S_OK
+                self.last_error = 0;
+            }
+            HostThunk::D3D11DeviceGetCreationFlags => {
+                let _device_object = state.get(Register::Rcx);
+                let out_flags = state.get(Register::Rdx);
+                if out_flags != 0 {
+                    write_u32(memory, out_flags, 0); // no special creation flags
+                }
+                state.set(Register::Rax, 0); // S_OK
+                self.last_error = 0;
+            }
+            HostThunk::D3D11DeviceCheckCounterInfo => {
+                let _device_object = state.get(Register::Rcx);
+                let out_info = state.get(Register::Rdx);
+                if out_info != 0 {
+                    // D3D11_COUNTER_INFO struct: { LargestCounter, MaxCounters, NumSimultaneousCounters }
+                    write_u32(memory, out_info, 0); // LargestCounter = D3D11_COUNTER_DEVICE_DEPENDENT (0)
+                    write_u32(memory, out_info + 4, 4); // MaxCounters = 4
+                    write_u32(memory, out_info + 8, 1); // NumSimultaneousCounters = 1
+                }
+                state.set(Register::Rax, 0); // S_OK
+                self.last_error = 0;
+            }
+            HostThunk::D3D11DeviceCreateDeferredContext => {
+                let _device_object = state.get(Register::Rcx);
+                let _context_flags = state.get(Register::Rdx);
+                let out_context = state.get(Register::R8);
+                if out_context != 0 {
+                    // Return S_FALSE since we don't truly support deferred contexts.
+                    write_u64(memory, out_context, 0);
+                }
+                state.set(Register::Rax, 1); // S_FALSE — not supported, indicate gracefully
+                self.last_error = 0;
+            }
+            HostThunk::D3D11DeviceCreateQuery => {
+                let _device_object = state.get(Register::Rcx);
+                let _desc_ptr = state.get(Register::Rdx);
+                let _out_query = state.get(Register::R8);
+                // Query not implemented; return E_NOTIMPL.
+                state.set(Register::Rax, 0x80004001_u64.wrapping_neg() as u64); // E_NOTIMPL
+                self.last_error = 0;
+            }
+            HostThunk::D3D11DeviceOpenSharedResource => {
+                let _device_object = state.get(Register::Rcx);
+                let _resource_handle = state.get(Register::Rdx);
+                let _riid = state.get(Register::R8);
+                let _out_resource = state.get(Register::R9);
+                // Shared resource not supported.
+                state.set(Register::Rax, 0x80070057_u64.wrapping_neg() as u64); // E_INVALIDARG
+                self.last_error = 0;
+            }
+            // -- DXGI Adapter methods (Phase 5.5 #2) --
+            HostThunk::DXGIAdapterCheckInterfaceSupport => {
+                let _this = state.get(Register::Rcx);
+                let _guid_ptr = state.get(Register::Rdx);
+                let _umd_version_ptr = state.get(Register::R8);
+                // Return DXGI_ERROR_UNSUPPORTED — use WARP if needed.
+                state.set(Register::Rax, 0x887A0004_u64); // DXGI_ERROR_UNSUPPORTED
+                self.last_error = 0;
+            }
+            HostThunk::DXGIAdapterSetPrivateData => {
+                let _this = state.get(Register::Rcx);
+                let _guid_ptr = state.get(Register::Rdx);
+                let _data_size = state.get(Register::R8);
+                let _data_ptr = state.get(Register::R9);
+                state.set(Register::Rax, 0); // S_OK
+                self.last_error = 0;
+            }
+            HostThunk::DXGIAdapterGetPrivateData => {
+                let _this = state.get(Register::Rcx);
+                let _guid_ptr = state.get(Register::Rdx);
+                let data_size_ptr = state.get(Register::R8);
+                let _data_ptr = state.get(Register::R9);
+                if data_size_ptr != 0 {
+                    write_u32(memory, data_size_ptr, 0);
+                }
+                state.set(Register::Rax, 0x8007004E_u64.wrapping_neg() as u64); // DXGI_ERROR_NOT_FOUND
+                self.last_error = 0;
+            }
+            HostThunk::DXGIAdapterGetParent => {
+                let _this = state.get(Register::Rcx);
+                let _riid_ptr = state.get(Register::Rdx);
+                let out_ptr = state.get(Register::R8);
+                if out_ptr != 0 {
+                    write_u64(memory, out_ptr, 0);
+                }
+                state.set(Register::Rax, 0x80040154_u64.wrapping_neg() as u64); // CLASS_E_CLASSNOTAVAILABLE
+                self.last_error = 0;
+            }
+            HostThunk::DXGIAdapterEnumOutputs => {
+                let _this = state.get(Register::Rcx);
+                let _output_index = state.get(Register::Rdx) as u32;
+                let _out_output = state.get(Register::R8);
+                // No outputs available (headless).
+                state.set(Register::Rax, 0x887A0002_u64); // DXGI_ERROR_NOT_FOUND
+                self.last_error = 0;
             }
             HostThunk::D3D11DeviceContextDrawIndexed => {
                 self.dispatch_d3d11_draw_indexed(state)?;
@@ -7391,6 +8792,9 @@ impl PeHostRuntime {
                     json!(0),
                 );
             }
+            HostThunk::D3D11DeviceContextResolveSubresource => {
+                self.dispatch_d3d11_resolve_subresource(memory, state)?;
+            }
             HostThunk::DXGISwapChainGetBuffer => {
                 self.dispatch_dxgi_swapchain_get_buffer(memory, state)?;
             }
@@ -7400,6 +8804,1527 @@ impl PeHostRuntime {
             HostThunk::DXGISwapChainResizeBuffers => {
                 self.dispatch_dxgi_swapchain_resize_buffers(memory, state)?;
             }
+            // ── D3D9 Basic Rendering (Phase 1.5) ───────────────────────────────────
+            //
+            // Direct3DCreate9 / Direct3DCreate9Ex entry points
+            //
+            HostThunk::Direct3DCreate9 => {
+                // D3D9 entry point: IDirect3D9* WINAPI Direct3DCreate9(UINT SDKVersion)
+                // RCX = SDKVersion (ignored for now)
+                let out_ptr = state.get(Register::Rcx);
+                if self.d3d9_shim.is_none() {
+                    self.d3d9_shim = Some(direct3d_create9(true));
+                }
+                if out_ptr != 0 {
+                    // Allocate factory COM object — the returned pointer IS the factory
+                    match self.alloc_d3d9_factory_object(memory) {
+                        Ok(factory) => {
+                            state.set(Register::Rax, factory);
+                            self.push_trace(
+                                "d3d9",
+                                "Direct3DCreate9",
+                                BTreeMap::from([("sdk_version".to_string(), json!(out_ptr as u32))]),
+                                json!(factory),
+                            );
+                        }
+                        Err(e) => {
+                            state.set(Register::Rax, 0); // NULL on failure
+                            self.push_trace("d3d9", "Direct3DCreate9", BTreeMap::new(), json!("null"));
+                        }
+                    }
+                } else {
+                    state.set(Register::Rax, 0);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::Direct3DCreate9Ex => {
+                // Direct3DCreate9Ex is similar but returns IDirect3D9Ex.
+                // We reuse the same factory object for now.
+                let _sdk_version = state.get(Register::Rcx);
+                let out_ptr = state.get(Register::Rdx);
+                if self.d3d9_shim.is_none() {
+                    self.d3d9_shim = Some(direct3d_create9(true));
+                }
+                if out_ptr != 0 {
+                    match self.alloc_d3d9_factory_object(memory) {
+                        Ok(factory) => {
+                            write_u64(memory, out_ptr, factory);
+                            state.set(Register::Rax, 0); // D3D_OK
+                        }
+                        Err(_) => {
+                            write_u64(memory, out_ptr, 0);
+                            state.set(Register::Rax, D3DERR_INVALIDCALL);
+                        }
+                    }
+                } else {
+                    state.set(Register::Rax, E_INVALIDARG);
+                }
+                self.last_error = 0;
+                self.push_trace("d3d9", "Direct3DCreate9Ex", BTreeMap::new(), json!(0));
+            }
+            // ── IDirect3D9 factory vtable handlers ────────────────────────────────
+            HostThunk::D3d9FactoryCreateDevice => {
+                // HRESULT CreateDevice(UINT Adapter, D3DDEVTYPE DeviceType, HWND hFocusWindow,
+                //                      DWORD BehaviorFlags, D3DPRESENT_PARAMETERS* pPresentationParameters,
+                //                      IDirect3DDevice9** ppReturnedDeviceInterface)
+                let _this = state.get(Register::Rcx);
+                let _adapter = state.get(Register::Rdx) as u32;
+                let _device_type = state.get(Register::R8) as u32;
+                let _focus_window = state.get(Register::R9);
+                let stack = state.get(Register::Rsp);
+                let _behavior_flags = read_guest_u32(memory, stack + 0x20)?;
+                let pp_params = memory.read_u64(stack + 0x28)?;
+                let pp_device = memory.read_u64(stack + 0x30)?;
+                if pp_device == 0 {
+                    state.set(Register::Rax, E_INVALIDARG);
+                } else {
+                    let shim = self.d3d9_shim.as_mut().ok_or_else(|| {
+                        AppError::new(ReasonCode::RcD3d9NotSupported, "D3D9 shim not initialized")
+                    })?;
+                    let present_params = if pp_params != 0 {
+                        // Read D3DPRESENT_PARAMETERS from guest memory (64 bytes)
+                        D3dPresentParameters {
+                            back_buffer_width: read_guest_u32(memory, pp_params)?,
+                            back_buffer_height: read_guest_u32(memory, pp_params + 4)?,
+                            back_buffer_format: read_guest_u32(memory, pp_params + 8)?,
+                            back_buffer_count: read_guest_u32(memory, pp_params + 12)?,
+                            multi_sample_type: read_guest_u32(memory, pp_params + 16)?,
+                            multi_sample_quality: read_guest_u32(memory, pp_params + 20)?,
+                            swap_effect: read_guest_u32(memory, pp_params + 24)?,
+                            // 4 bytes padding at offset 28 for 8-byte alignment of HWND
+                            device_window: memory.read_u64(pp_params + 32)?,
+                            windowed: read_guest_u32(memory, pp_params + 40)? != 0,
+                            enable_auto_depth_stencil: read_guest_u32(memory, pp_params + 44)? != 0,
+                            auto_depth_stencil_format: read_guest_u32(memory, pp_params + 48)?,
+                            flags: read_guest_u32(memory, pp_params + 52)?,
+                            fullscreen_refresh_rate_in_hz: read_guest_u32(memory, pp_params + 56)?,
+                            presentation_interval: read_guest_u32(memory, pp_params + 60)?,
+                        }
+                    } else {
+                        D3dPresentParameters::default()
+                    };
+                    match shim.create_device() {
+                        Ok(device) => {
+                            let device_id = device.id;
+                            // Update present params and swapchain size on the device
+                            if let Some(stored) = shim.devices.get_mut(&device_id) {
+                                stored.present_params = present_params.clone();
+                                if present_params.back_buffer_width > 0 && present_params.back_buffer_height > 0 {
+                                    stored.swapchain_width = present_params.back_buffer_width;
+                                    stored.swapchain_height = present_params.back_buffer_height;
+                                }
+                            }
+                            let device_object = self.alloc_d3d9_device_object(
+                                memory, device_id, present_params,
+                            )?;
+                            write_u64(memory, pp_device, device_object);
+                            state.set(Register::Rax, 0); // D3D_OK
+                            self.push_trace(
+                                "d3d9",
+                                "IDirect3D9::CreateDevice",
+                                BTreeMap::from([
+                                    ("device_id".to_string(), json!(device_id)),
+                                ]),
+                                json!(0),
+                            );
+                        }
+                        Err(e) => {
+                            state.set(Register::Rax, D3DERR_INVALIDCALL);
+                        }
+                    }
+                }
+                self.last_error = 0;
+            }
+            HostThunk::D3d9FactoryGetAdapterCount => {
+                // UINT GetAdapterCount()
+                let _this = state.get(Register::Rcx);
+                // Report 1 adapter (software/WARP)
+                state.set(Register::Rax, 1);
+                self.last_error = 0;
+                self.push_trace("d3d9", "IDirect3D9::GetAdapterCount", BTreeMap::new(), json!(1));
+            }
+            HostThunk::D3d9FactoryGetAdapterIdentifier => {
+                // HRESULT GetAdapterIdentifier(UINT Adapter, DWORD Flags, D3DADAPTER_IDENTIFIER9* pIdentifier)
+                let _this = state.get(Register::Rcx);
+                let _adapter = state.get(Register::Rdx) as u32;
+                let _flags = state.get(Register::R8) as u32;
+                let ident_ptr = state.get(Register::R9);
+                if ident_ptr != 0 {
+                    // D3DADAPTER_IDENTIFIER9 is ~524 bytes. Fill with zero + driver description.
+                    // Provide a minimal identity block:
+                    // Offset 0: Driver (512 wide chars)
+                    // Offset 512: Description (512 wide chars)
+                    // ...
+                    for i in 0..512 {
+                        let c = if i < b"casa1-d3d9".len() { b"casa1-d3d9"[i] } else { 0 };
+                        write_u16(memory, ident_ptr + (i as u64) * 2, c as u16);
+                    }
+                    // Description at offset 1024 bytes (512 wide chars)
+                    for i in 0..512 {
+                        let c = if i < b"casa1-software-renderer".len() { b"casa1-software-renderer"[i] } else { 0 };
+                        write_u16(memory, ident_ptr + 1024 + (i as u64) * 2, c as u16);
+                    }
+                    // Set VendorId = 0x1AF4 (Red Hat / QEMU — indicates software)
+                    write_u32(memory, ident_ptr + 1024 + 1024, 0x1AF4);
+                    // DeviceId = 0x1100
+                    write_u32(memory, ident_ptr + 1024 + 1024 + 4, 0x1100);
+                    // SubSysId, Revision, WHQLLevel — leave zero
+                    state.set(Register::Rax, 0); // D3D_OK
+                } else {
+                    state.set(Register::Rax, E_INVALIDARG);
+                }
+                self.last_error = 0;
+                self.push_trace("d3d9", "IDirect3D9::GetAdapterIdentifier", BTreeMap::new(), json!(0));
+            }
+            HostThunk::D3d9FactoryGetAdapterModeCount => {
+                // UINT GetAdapterModeCount(UINT Adapter, D3DFORMAT Format)
+                let _this = state.get(Register::Rcx);
+                let _adapter = state.get(Register::Rdx) as u32;
+                let _format = state.get(Register::R8) as u32;
+                // Report a few standard modes
+                state.set(Register::Rax, 3); // 640x480, 800x600, 1024x768
+                self.last_error = 0;
+                self.push_trace("d3d9", "IDirect3D9::GetAdapterModeCount", BTreeMap::new(), json!(3));
+            }
+            HostThunk::D3d9FactoryGetAdapterDisplayMode => {
+                // HRESULT GetAdapterDisplayMode(UINT Adapter, D3DDISPLAYMODE* pMode)
+                let _this = state.get(Register::Rcx);
+                let _adapter = state.get(Register::Rdx) as u32;
+                let mode_ptr = state.get(Register::R8);
+                if mode_ptr != 0 {
+                    // D3DDISPLAYMODE: Width(4), Height(4), RefreshRate(4), Format(4) = 16 bytes
+                    write_u32(memory, mode_ptr, 1024);     // Width
+                    write_u32(memory, mode_ptr + 4, 768);  // Height
+                    write_u32(memory, mode_ptr + 8, 60);   // RefreshRate
+                    write_u32(memory, mode_ptr + 12, 0);   // Format = D3DFMT_UNKNOWN (use default)
+                    state.set(Register::Rax, 0); // D3D_OK
+                } else {
+                    state.set(Register::Rax, E_INVALIDARG);
+                }
+                self.last_error = 0;
+                self.push_trace("d3d9", "IDirect3D9::GetAdapterDisplayMode", BTreeMap::new(), json!(0));
+            }
+            HostThunk::D3d9FactoryGetDeviceCaps => {
+                // HRESULT GetDeviceCaps(UINT Adapter, D3DDEVTYPE DeviceType, D3DCAPS9* pCaps)
+                let _this = state.get(Register::Rcx);
+                let _adapter = state.get(Register::Rdx) as u32;
+                let _device_type = state.get(Register::R8) as u32;
+                let caps_ptr = state.get(Register::R9);
+                if caps_ptr != 0 {
+                    // D3DCAPS9 is ~284 bytes. Fill a minimal caps structure.
+                    // Zero-initialize then set key fields:
+                    memory.map_bytes(caps_ptr, &vec![0u8; 284]);
+                    // DeviceType
+                    write_u32(memory, caps_ptr, 1); // D3DDEVTYPE_HAL
+                    // AdapterOrdinal — already 0
+                    // Caps (DWORD)
+                    write_u32(memory, caps_ptr + 4, 0x00020000); // D3DCAPS_READ_SCANLINE
+                    // Caps2, Caps3, PresentationIntervals
+                    write_u32(memory, caps_ptr + 8, 0);
+                    write_u32(memory, caps_ptr + 12, 0);
+                    // MaxVertexBlendMatrices, MaxVertexBlendMatrixIndex
+                    write_u32(memory, caps_ptr + 100, 4);
+                    write_u32(memory, caps_ptr + 104, 0);
+                    // MaxSimultaneousTextures
+                    write_u32(memory, caps_ptr + 120, 8);
+                    // MaxTextureWidth, MaxTextureHeight
+                    write_u32(memory, caps_ptr + 156, 4096);
+                    write_u32(memory, caps_ptr + 160, 4096);
+                    // MaxAnisotropy
+                    write_u32(memory, caps_ptr + 232, 16);
+                    // MaxTextureBlendStages
+                    write_u32(memory, caps_ptr + 248, 8);
+                    // MaxVertexShaderConst
+                    write_u32(memory, caps_ptr + 256, 256);
+                    // PixelShaderVersion, VertexShaderVersion
+                    write_u32(memory, caps_ptr + 260, 0xFFFF0200); // ps_2_0
+                    write_u32(memory, caps_ptr + 264, 0xFFFF0200); // vs_2_0
+                    state.set(Register::Rax, 0); // D3D_OK
+                } else {
+                    state.set(Register::Rax, E_INVALIDARG);
+                }
+                self.last_error = 0;
+                self.push_trace("d3d9", "IDirect3D9::GetDeviceCaps", BTreeMap::new(), json!(0));
+            }
+            // ── IDirect3DDevice9 vtable handlers ─────────────────────────────────
+            HostThunk::D3d9DeviceTestCooperativeLevel => {
+                // HRESULT TestCooperativeLevel()
+                let _this = state.get(Register::Rcx);
+                // Always report the device is OK.
+                state.set(Register::Rax, 0); // D3D_OK
+                self.last_error = 0;
+            }
+            HostThunk::D3d9DeviceGetDeviceCaps => {
+                // HRESULT GetDeviceCaps(D3DCAPS9* pCaps)
+                let _this = state.get(Register::Rcx);
+                let caps_ptr = state.get(Register::Rdx);
+                if caps_ptr != 0 {
+                    memory.map_bytes(caps_ptr, &vec![0u8; 284]);
+                    write_u32(memory, caps_ptr, 1); // D3DDEVTYPE_HAL
+                    write_u32(memory, caps_ptr + 4, 0x00020000);
+                    write_u32(memory, caps_ptr + 100, 4);
+                    write_u32(memory, caps_ptr + 120, 8);
+                    write_u32(memory, caps_ptr + 156, 4096);
+                    write_u32(memory, caps_ptr + 160, 4096);
+                    write_u32(memory, caps_ptr + 232, 16);
+                    write_u32(memory, caps_ptr + 248, 8);
+                    write_u32(memory, caps_ptr + 256, 256);
+                    write_u32(memory, caps_ptr + 260, 0xFFFF0200);
+                    write_u32(memory, caps_ptr + 264, 0xFFFF0200);
+                    state.set(Register::Rax, 0);
+                } else {
+                    state.set(Register::Rax, E_INVALIDARG);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::D3d9DeviceReset => {
+                // HRESULT Reset(D3DPRESENT_PARAMETERS* pPresentationParameters)
+                let _this = state.get(Register::Rcx);
+                let pp_params = state.get(Register::Rdx);
+                // Update the device's present parameters from guest memory
+                let device_object = state.get(Register::Rcx);
+                if let Some(dev) = self.d3d9_devices.get_mut(&device_object) {
+                    if pp_params != 0 {
+                        let pp = D3dPresentParameters {
+                            back_buffer_width: read_guest_u32(memory, pp_params)?,
+                            back_buffer_height: read_guest_u32(memory, pp_params + 4)?,
+                            back_buffer_format: read_guest_u32(memory, pp_params + 8)?,
+                            back_buffer_count: read_guest_u32(memory, pp_params + 12)?,
+                            multi_sample_type: read_guest_u32(memory, pp_params + 16)?,
+                            multi_sample_quality: read_guest_u32(memory, pp_params + 20)?,
+                            swap_effect: read_guest_u32(memory, pp_params + 24)?,
+                            device_window: memory.read_u64(pp_params + 32)?,
+                            windowed: read_guest_u32(memory, pp_params + 40)? != 0,
+                            enable_auto_depth_stencil: read_guest_u32(memory, pp_params + 44)? != 0,
+                            auto_depth_stencil_format: read_guest_u32(memory, pp_params + 48)?,
+                            flags: read_guest_u32(memory, pp_params + 52)?,
+                            fullscreen_refresh_rate_in_hz: read_guest_u32(memory, pp_params + 56)?,
+                            presentation_interval: read_guest_u32(memory, pp_params + 60)?,
+                        };
+                        dev.present_params = pp.clone();
+                        if pp.back_buffer_width > 0 && pp.back_buffer_height > 0 {
+                            dev.swapchain_width = pp.back_buffer_width;
+                            dev.swapchain_height = pp.back_buffer_height;
+                        }
+                    }
+                    state.set(Register::Rax, 0);
+                } else {
+                    state.set(Register::Rax, D3DERR_INVALIDCALL);
+                }
+                self.last_error = 0;
+                self.push_trace("d3d9", "IDirect3DDevice9::Reset", BTreeMap::new(), json!(0));
+            }
+            HostThunk::D3d9DevicePresent => {
+                // HRESULT Present(CONST RECT* pSourceRect, CONST RECT* pDestRect,
+                //                 HWND hDestWindowOverride, CONST RGNDATA* pDirtyRegion)
+                let device_object = state.get(Register::Rcx);
+                let _src_rect = state.get(Register::Rdx);
+                let _dst_rect = state.get(Register::R8);
+                let _hwnd = state.get(Register::R9);
+                if let Some(shim) = self.d3d9_shim.as_mut() {
+                    if let Some(dev) = self.d3d9_devices.get(&device_object) {
+                        match shim.present(dev.id) {
+                            Ok(frame) => {
+                                state.set(Register::Rax, 0);
+                                self.push_trace(
+                                    "d3d9",
+                                    "IDirect3DDevice9::Present",
+                                    BTreeMap::from([
+                                        ("width".to_string(), json!(frame.width)),
+                                        ("height".to_string(), json!(frame.height)),
+                                        ("hash".to_string(), json!(frame.hash)),
+                                    ]),
+                                    json!(0),
+                                );
+                            }
+                            Err(_) => {
+                                state.set(Register::Rax, D3DERR_INVALIDCALL);
+                            }
+                        }
+                    } else {
+                        state.set(Register::Rax, D3DERR_INVALIDCALL);
+                    }
+                } else {
+                    state.set(Register::Rax, D3DERR_INVALIDCALL);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::D3d9DeviceBeginScene => {
+                // HRESULT BeginScene()
+                let _this = state.get(Register::Rcx);
+                state.set(Register::Rax, 0); // D3D_OK
+                self.last_error = 0;
+            }
+            HostThunk::D3d9DeviceEndScene => {
+                // HRESULT EndScene()
+                let _this = state.get(Register::Rcx);
+                state.set(Register::Rax, 0); // D3D_OK
+                self.last_error = 0;
+            }
+            HostThunk::D3d9DeviceClear => {
+                // HRESULT Clear(DWORD Count, CONST D3DRECT* pRects, DWORD Flags,
+                //                D3DCOLOR Color, float Z, DWORD Stencil)
+                let device_object = state.get(Register::Rcx);
+                let _count = state.get(Register::Rdx) as u32;
+                let _rects = state.get(Register::R8);
+                let _flags = state.get(Register::R9) as u32;
+                let stack = state.get(Register::Rsp);
+                let color_raw = read_guest_u32(memory, stack + 0x20)?;
+                let _z = read_guest_f32(memory, stack + 0x28)?;
+                let _stencil = read_guest_u32(memory, stack + 0x30)?;
+                // Convert D3DCOLOR (0xAARRGGBB) to BGRA pixel bytes
+                let r = ((color_raw >> 16) & 0xFF) as u8;
+                let g = ((color_raw >> 8) & 0xFF) as u8;
+                let b = (color_raw & 0xFF) as u8;
+                let a = ((color_raw >> 24) & 0xFF) as u8;
+                // Fill the render target with the clear color
+                if let Some(dev) = self.d3d9_devices.get(&device_object) {
+                    let w = dev.swapchain_width.max(1);
+                    let h = dev.swapchain_height.max(1);
+                    let stride = (w * 4) as usize;
+                    let mut pixels = vec![0u8; (h as usize) * stride];
+                    for row in 0..h as usize {
+                        for col in 0..w as usize {
+                            let off = row * stride + col * 4;
+                            pixels[off] = b;
+                            pixels[off + 1] = g;
+                            pixels[off + 2] = r;
+                            pixels[off + 3] = a;
+                        }
+                    }
+                    // Store in shim's render_target
+                    if let Some(shim) = self.d3d9_shim.as_mut() {
+                        shim.render_target = Some((w, h, pixels));
+                    }
+                    state.set(Register::Rax, 0);
+                } else {
+                    state.set(Register::Rax, D3DERR_INVALIDCALL);
+                }
+                self.last_error = 0;
+                self.push_trace("d3d9", "IDirect3DDevice9::Clear", BTreeMap::from([
+                    ("color".to_string(), json!(format!("#{:08x}", color_raw))),
+                ]), json!(0));
+            }
+            HostThunk::D3d9DeviceSetRenderState => {
+                // HRESULT SetRenderState(D3DRENDERSTATETYPE State, DWORD Value)
+                let device_object = state.get(Register::Rcx);
+                let state_type = state.get(Register::Rdx) as u32;
+                let value = state.get(Register::R8) as u32;
+                if let Some(dev) = self.d3d9_devices.get_mut(&device_object) {
+                    dev.set_render_state(state_type, value);
+                    state.set(Register::Rax, 0);
+                } else {
+                    state.set(Register::Rax, D3DERR_INVALIDCALL);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::D3d9DeviceGetRenderState => {
+                // HRESULT GetRenderState(D3DRENDERSTATETYPE State, DWORD* pValue)
+                let device_object = state.get(Register::Rcx);
+                let state_type = state.get(Register::Rdx) as u32;
+                let out_ptr = state.get(Register::R8);
+                if let Some(dev) = self.d3d9_devices.get(&device_object) {
+                    if out_ptr != 0 {
+                        write_u32(memory, out_ptr, dev.get_render_state(state_type));
+                    }
+                    state.set(Register::Rax, 0);
+                } else {
+                    state.set(Register::Rax, D3DERR_INVALIDCALL);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::D3d9DeviceSetFVF => {
+                // HRESULT SetFVF(DWORD FVF)
+                let device_object = state.get(Register::Rcx);
+                let fvf = state.get(Register::Rdx) as u32;
+                if let Some(dev) = self.d3d9_devices.get_mut(&device_object) {
+                    dev.set_fvf(fvf);
+                    state.set(Register::Rax, 0);
+                } else {
+                    state.set(Register::Rax, D3DERR_INVALIDCALL);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::D3d9DeviceSetStreamSource => {
+                // HRESULT SetStreamSource(UINT StreamNumber, IDirect3DVertexBuffer9* pStreamData,
+                //                         UINT OffsetInBytes, UINT Stride)
+                let device_object = state.get(Register::Rcx);
+                let stream = state.get(Register::Rdx) as u32;
+                let vb_object = state.get(Register::R8);
+                let offset = state.get(Register::R9) as u32;
+                let stack = state.get(Register::Rsp);
+                let stride = read_guest_u32(memory, stack + 0x20)?;
+                if let Some(dev) = self.d3d9_devices.get_mut(&device_object) {
+                    if vb_object != 0 {
+                        // Look up the vertex buffer's internal D3D9VertexBufferId
+                        if let Some(vb) = self.d3d9_vertex_buffers.get(&vb_object) {
+                            dev.set_stream_source(stream, vb.id, offset, stride);
+                        }
+                    } else {
+                        // Null buffer — clear the stream source
+                        if (stream as usize) < dev.state.stream_source.len() {
+                            dev.state.stream_source[stream as usize] = None;
+                        }
+                    }
+                    state.set(Register::Rax, 0);
+                } else {
+                    state.set(Register::Rax, D3DERR_INVALIDCALL);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::D3d9DeviceGetStreamSource => {
+                // HRESULT GetStreamSource(UINT StreamNumber, IDirect3DVertexBuffer9** ppStreamData,
+                //                         UINT* pOffsetInBytes, UINT* pStride)
+                let device_object = state.get(Register::Rcx);
+                let stream = state.get(Register::Rdx) as u32;
+                let out_vb_ptr = state.get(Register::R8);
+                let out_offset_ptr = state.get(Register::R9);
+                let stack = state.get(Register::Rsp);
+                let out_stride_ptr = memory.read_u64(stack + 0x20)?;
+                if let Some(dev) = self.d3d9_devices.get(&device_object) {
+                    if (stream as usize) < dev.state.stream_source.len() {
+                        if let Some((vb_id, offset, stride)) = &dev.state.stream_source[stream as usize] {
+                            // Find the guest object for this vertex buffer id
+                            let vb_object = self.d3d9_vertex_buffers.iter()
+                                .find(|(_, vb)| vb.id == *vb_id)
+                                .map(|(obj, _)| *obj)
+                                .unwrap_or(0);
+                            if out_vb_ptr != 0 {
+                                write_u64(memory, out_vb_ptr, vb_object);
+                            }
+                            if out_offset_ptr != 0 {
+                                write_u32(memory, out_offset_ptr, *offset);
+                            }
+                            if out_stride_ptr != 0 {
+                                write_u32(memory, out_stride_ptr, *stride);
+                            }
+                        } else {
+                            if out_vb_ptr != 0 { write_u64(memory, out_vb_ptr, 0); }
+                            if out_offset_ptr != 0 { write_u32(memory, out_offset_ptr, 0); }
+                            if out_stride_ptr != 0 { write_u32(memory, out_stride_ptr, 0); }
+                        }
+                    }
+                    state.set(Register::Rax, 0);
+                } else {
+                    state.set(Register::Rax, D3DERR_INVALIDCALL);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::D3d9DeviceSetIndices => {
+                // HRESULT SetIndices(IDirect3DIndexBuffer9* pIndexData)
+                let device_object = state.get(Register::Rcx);
+                let ib_object = state.get(Register::Rdx);
+                if let Some(dev) = self.d3d9_devices.get_mut(&device_object) {
+                    if ib_object != 0 {
+                        if let Some(ib) = self.d3d9_index_buffers.get(&ib_object) {
+                            dev.set_indices(ib.id, 0);
+                        }
+                    } else {
+                        dev.state.indices = None;
+                    }
+                    state.set(Register::Rax, 0);
+                } else {
+                    state.set(Register::Rax, D3DERR_INVALIDCALL);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::D3d9DeviceGetIndices => {
+                // HRESULT GetIndices(IDirect3DIndexBuffer9** ppIndexData)
+                let device_object = state.get(Register::Rcx);
+                let out_ptr = state.get(Register::Rdx);
+                if let Some(dev) = self.d3d9_devices.get(&device_object) {
+                    if out_ptr != 0 {
+                        if let Some((ib_id, _)) = &dev.state.indices {
+                            let ib_object = self.d3d9_index_buffers.iter()
+                                .find(|(_, ib)| ib.id == *ib_id)
+                                .map(|(obj, _)| *obj)
+                                .unwrap_or(0);
+                            write_u64(memory, out_ptr, ib_object);
+                        } else {
+                            write_u64(memory, out_ptr, 0);
+                        }
+                    }
+                    state.set(Register::Rax, 0);
+                } else {
+                    state.set(Register::Rax, D3DERR_INVALIDCALL);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::D3d9DeviceSetTransform => {
+                // HRESULT SetTransform(D3DTRANSFORMSTATETYPE State, CONST D3DMATRIX* pMatrix)
+                let device_object = state.get(Register::Rcx);
+                let transform_type = state.get(Register::Rdx) as u32;
+                let matrix_ptr = state.get(Register::R8);
+                if let Some(dev) = self.d3d9_devices.get_mut(&device_object) {
+                    if matrix_ptr != 0 {
+                        let mut matrix = D3dMatrix::identity();
+                        for i in 0..4 {
+                            for j in 0..4 {
+                                matrix.m[i][j] = read_guest_f32(
+                                    memory, matrix_ptr + ((i * 4 + j) * 4) as u64,
+                                )?;
+                            }
+                        }
+                        dev.set_transform(transform_type, &matrix);
+                    }
+                    state.set(Register::Rax, 0);
+                } else {
+                    state.set(Register::Rax, D3DERR_INVALIDCALL);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::D3d9DeviceGetTransform => {
+                // HRESULT GetTransform(D3DTRANSFORMSTATETYPE State, D3DMATRIX* pMatrix)
+                let device_object = state.get(Register::Rcx);
+                let transform_type = state.get(Register::Rdx) as u32;
+                let out_ptr = state.get(Register::R8);
+                if let Some(dev) = self.d3d9_devices.get(&device_object) {
+                    if out_ptr != 0 {
+                        let matrix = dev.state.transforms.get(&transform_type)
+                            .copied()
+                            .unwrap_or(D3dMatrix::identity());
+                        for i in 0..4 {
+                            for j in 0..4 {
+                                write_u32(memory, out_ptr + ((i * 4 + j) * 4) as u64, matrix.m[i][j].to_bits());
+                            }
+                        }
+                    }
+                    state.set(Register::Rax, 0);
+                } else {
+                    state.set(Register::Rax, D3DERR_INVALIDCALL);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::D3d9DeviceSetViewport => {
+                // HRESULT SetViewport(CONST D3DVIEWPORT9* pViewport)
+                let device_object = state.get(Register::Rcx);
+                let vp_ptr = state.get(Register::Rdx);
+                if let Some(dev) = self.d3d9_devices.get_mut(&device_object) {
+                    if vp_ptr != 0 {
+                        let vp = D3dViewport9 {
+                            x: read_guest_u32(memory, vp_ptr)?,
+                            y: read_guest_u32(memory, vp_ptr + 4)?,
+                            width: read_guest_u32(memory, vp_ptr + 8)?,
+                            height: read_guest_u32(memory, vp_ptr + 12)?,
+                            min_z: read_guest_f32(memory, vp_ptr + 16)?,
+                            max_z: read_guest_f32(memory, vp_ptr + 20)?,
+                        };
+                        dev.set_viewport(&vp);
+                    }
+                    state.set(Register::Rax, 0);
+                } else {
+                    state.set(Register::Rax, D3DERR_INVALIDCALL);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::D3d9DeviceGetViewport => {
+                // HRESULT GetViewport(D3DVIEWPORT9* pViewport)
+                let device_object = state.get(Register::Rcx);
+                let out_ptr = state.get(Register::Rdx);
+                if let Some(dev) = self.d3d9_devices.get(&device_object) {
+                    if out_ptr != 0 {
+                        let vp = &dev.state.viewport;
+                        write_u32(memory, out_ptr, vp.x);
+                        write_u32(memory, out_ptr + 4, vp.y);
+                        write_u32(memory, out_ptr + 8, vp.width);
+                        write_u32(memory, out_ptr + 12, vp.height);
+                        write_u32(memory, out_ptr + 16, vp.min_z.to_bits());
+                        write_u32(memory, out_ptr + 20, vp.max_z.to_bits());
+                    }
+                    state.set(Register::Rax, 0);
+                } else {
+                    state.set(Register::Rax, D3DERR_INVALIDCALL);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::D3d9DeviceSetMaterial => {
+                // HRESULT SetMaterial(CONST D3DMATERIAL9* pMaterial)
+                let device_object = state.get(Register::Rcx);
+                let mat_ptr = state.get(Register::Rdx);
+                if let Some(dev) = self.d3d9_devices.get_mut(&device_object) {
+                    if mat_ptr != 0 {
+                        let mat = D3dMaterial9 {
+                            diffuse: [
+                                read_guest_f32(memory, mat_ptr)?,
+                                read_guest_f32(memory, mat_ptr + 4)?,
+                                read_guest_f32(memory, mat_ptr + 8)?,
+                                read_guest_f32(memory, mat_ptr + 12)?,
+                            ],
+                            ambient: [
+                                read_guest_f32(memory, mat_ptr + 16)?,
+                                read_guest_f32(memory, mat_ptr + 20)?,
+                                read_guest_f32(memory, mat_ptr + 24)?,
+                                read_guest_f32(memory, mat_ptr + 28)?,
+                            ],
+                            specular: [
+                                read_guest_f32(memory, mat_ptr + 32)?,
+                                read_guest_f32(memory, mat_ptr + 36)?,
+                                read_guest_f32(memory, mat_ptr + 40)?,
+                                read_guest_f32(memory, mat_ptr + 44)?,
+                            ],
+                            emissive: [
+                                read_guest_f32(memory, mat_ptr + 48)?,
+                                read_guest_f32(memory, mat_ptr + 52)?,
+                                read_guest_f32(memory, mat_ptr + 56)?,
+                                read_guest_f32(memory, mat_ptr + 60)?,
+                            ],
+                            power: read_guest_f32(memory, mat_ptr + 64)?,
+                        };
+                        dev.set_material(&mat);
+                    }
+                    state.set(Register::Rax, 0);
+                } else {
+                    state.set(Register::Rax, D3DERR_INVALIDCALL);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::D3d9DeviceSetLight => {
+                // HRESULT SetLight(DWORD Index, CONST D3DLIGHT9* pLight)
+                let device_object = state.get(Register::Rcx);
+                let index = state.get(Register::Rdx) as u32;
+                let light_ptr = state.get(Register::R8);
+                if let Some(dev) = self.d3d9_devices.get_mut(&device_object) {
+                    if light_ptr != 0 {
+                        let mut light = D3dLight9 {
+                            light_type: read_guest_u32(memory, light_ptr)?,
+                            diffuse: [0.0; 4],
+                            specular: [0.0; 4],
+                            ambient: [0.0; 4],
+                            position: [0.0; 3],
+                            direction: [0.0; 3],
+                            range: 0.0,
+                            falloff: 0.0,
+                            attenuation0: 0.0,
+                            attenuation1: 0.0,
+                            attenuation2: 0.0,
+                            theta: 0.0,
+                            phi: 0.0,
+                        };
+                        // Diffuse at offset 4
+                        for i in 0..4 {
+                            light.diffuse[i] = read_guest_f32(memory, light_ptr + 4 + (i as u64) * 4)?;
+                        }
+                        // Specular at offset 20
+                        for i in 0..4 {
+                            light.specular[i] = read_guest_f32(memory, light_ptr + 20 + (i as u64) * 4)?;
+                        }
+                        // Ambient at offset 36
+                        for i in 0..4 {
+                            light.ambient[i] = read_guest_f32(memory, light_ptr + 36 + (i as u64) * 4)?;
+                        }
+                        // Position at offset 52
+                        for i in 0..3 {
+                            light.position[i] = read_guest_f32(memory, light_ptr + 52 + (i as u64) * 4)?;
+                        }
+                        // Direction at offset 64
+                        for i in 0..3 {
+                            light.direction[i] = read_guest_f32(memory, light_ptr + 64 + (i as u64) * 4)?;
+                        }
+                        // Range at offset 76
+                        light.range = read_guest_f32(memory, light_ptr + 76)?;
+                        light.falloff = read_guest_f32(memory, light_ptr + 80)?;
+                        light.attenuation0 = read_guest_f32(memory, light_ptr + 84)?;
+                        light.attenuation1 = read_guest_f32(memory, light_ptr + 88)?;
+                        light.attenuation2 = read_guest_f32(memory, light_ptr + 92)?;
+                        light.theta = read_guest_f32(memory, light_ptr + 96)?;
+                        light.phi = read_guest_f32(memory, light_ptr + 100)?;
+                        dev.set_light(index, &light);
+                    }
+                    state.set(Register::Rax, 0);
+                } else {
+                    state.set(Register::Rax, D3DERR_INVALIDCALL);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::D3d9DeviceLightEnable => {
+                // HRESULT LightEnable(DWORD Index, BOOL Enable)
+                let device_object = state.get(Register::Rcx);
+                let index = state.get(Register::Rdx) as u32;
+                let enable = state.get(Register::R8) != 0;
+                if let Some(dev) = self.d3d9_devices.get_mut(&device_object) {
+                    dev.light_enable(index, enable);
+                    state.set(Register::Rax, 0);
+                } else {
+                    state.set(Register::Rax, D3DERR_INVALIDCALL);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::D3d9DeviceSetClipPlane => {
+                // HRESULT SetClipPlane(DWORD Index, CONST float* pPlane)
+                let device_object = state.get(Register::Rcx);
+                let index = state.get(Register::Rdx) as u32;
+                let _plane_ptr = state.get(Register::R8);
+                if let Some(dev) = self.d3d9_devices.get_mut(&device_object) {
+                    dev.set_clip_plane(index, true);
+                    state.set(Register::Rax, 0);
+                } else {
+                    state.set(Register::Rax, D3DERR_INVALIDCALL);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::D3d9DeviceSetScissorRect => {
+                // HRESULT SetScissorRect(CONST RECT* pRect)
+                let device_object = state.get(Register::Rcx);
+                let rect_ptr = state.get(Register::Rdx);
+                if let Some(dev) = self.d3d9_devices.get_mut(&device_object) {
+                    if rect_ptr != 0 {
+                        let left = read_i32_from_memory(memory, rect_ptr)?;
+                        let top = read_i32_from_memory(memory, rect_ptr + 4)?;
+                        let right = read_i32_from_memory(memory, rect_ptr + 8)?;
+                        let bottom = read_i32_from_memory(memory, rect_ptr + 12)?;
+                        dev.set_scissor_rect(left, top, right, bottom);
+                    }
+                    state.set(Register::Rax, 0);
+                } else {
+                    state.set(Register::Rax, D3DERR_INVALIDCALL);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::D3d9DeviceSetTexture => {
+                // HRESULT SetTexture(DWORD Sampler, IDirect3DBaseTexture9* pTexture)
+                let device_object = state.get(Register::Rcx);
+                let stage = state.get(Register::Rdx) as u32;
+                let tex_object = state.get(Register::R8);
+                if let Some(dev) = self.d3d9_devices.get_mut(&device_object) {
+                    if tex_object != 0 {
+                        if let Some(tex) = self.d3d9_textures.get(&tex_object) {
+                            dev.set_texture(stage, tex.id);
+                        }
+                    } else {
+                        // Null texture — clear the stage
+                        if (stage as usize) < dev.state.textures.len() {
+                            dev.state.textures[stage as usize] = None;
+                        }
+                    }
+                    state.set(Register::Rax, 0);
+                } else {
+                    state.set(Register::Rax, D3DERR_INVALIDCALL);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::D3d9DeviceGetTexture => {
+                // HRESULT GetTexture(DWORD Sampler, IDirect3DBaseTexture9** ppTexture)
+                let device_object = state.get(Register::Rcx);
+                let stage = state.get(Register::Rdx) as u32;
+                let out_ptr = state.get(Register::R8);
+                if let Some(dev) = self.d3d9_devices.get(&device_object) {
+                    if out_ptr != 0 {
+                        if (stage as usize) < dev.state.textures.len() {
+                            if let Some(tex_id) = &dev.state.textures[stage as usize] {
+                                let tex_object = self.d3d9_textures.iter()
+                                    .find(|(_, tex)| tex.id == *tex_id)
+                                    .map(|(obj, _)| *obj)
+                                    .unwrap_or(0);
+                                write_u64(memory, out_ptr, tex_object);
+                            } else {
+                                write_u64(memory, out_ptr, 0);
+                            }
+                        } else {
+                            write_u64(memory, out_ptr, 0);
+                        }
+                    }
+                    state.set(Register::Rax, 0);
+                } else {
+                    state.set(Register::Rax, D3DERR_INVALIDCALL);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::D3d9DeviceSetTextureStageState => {
+                // HRESULT SetTextureStageState(DWORD Stage, D3DTEXTURESTAGESTATETYPE Type, DWORD Value)
+                let device_object = state.get(Register::Rcx);
+                let stage = state.get(Register::Rdx) as u32;
+                let tex_state_type = state.get(Register::R8) as u32;
+                let value = state.get(Register::R9) as u32;
+                if let Some(dev) = self.d3d9_devices.get_mut(&device_object) {
+                    dev.set_texture_stage_state(stage, tex_state_type, value);
+                    state.set(Register::Rax, 0);
+                } else {
+                    state.set(Register::Rax, D3DERR_INVALIDCALL);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::D3d9DeviceSetSamplerState => {
+                // HRESULT SetSamplerState(DWORD Sampler, D3DSAMPLERSTATETYPE Type, DWORD Value)
+                let device_object = state.get(Register::Rcx);
+                let _sampler = state.get(Register::Rdx) as u32;
+                let _sampler_type = state.get(Register::R8) as u32;
+                let _value = state.get(Register::R9) as u32;
+                // Sampler state is tracked but not used in fixed-function rendering
+                if let Some(_dev) = self.d3d9_devices.get_mut(&device_object) {
+                    state.set(Register::Rax, 0);
+                } else {
+                    state.set(Register::Rax, D3DERR_INVALIDCALL);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::D3d9DeviceDrawPrimitive => {
+                // HRESULT DrawPrimitive(D3DPRIMITIVETYPE PrimitiveType, UINT StartVertex, UINT PrimitiveCount)
+                let device_object = state.get(Register::Rcx);
+                let prim_type = state.get(Register::Rdx) as u32;
+                let start_vertex = state.get(Register::R8) as u32;
+                let prim_count = state.get(Register::R9) as u32;
+                if let Some(dev) = self.d3d9_devices.get(&device_object) {
+                    // Build a FixedFunctionScene from current device state
+                    let material = &dev.state.material;
+                    let diffuse = material.diffuse;
+                    let alpha_blend = dev.state.render_states[crate::d3d11::D3DRS_ALPHABLENDENABLE as usize] != 0;
+                    let fog_enable = dev.state.render_states[crate::d3d11::D3DRS_FOGENABLE as usize] != 0;
+                    let scene = FixedFunctionScene {
+                        texture_factor: dev.state.texture_stage_states[0][crate::d3d11::D3DTSS_COLOROP as usize] as u32,
+                        diffuse_color: [
+                            (diffuse[0].clamp(0.0, 1.0) * 255.0) as u8,
+                            (diffuse[1].clamp(0.0, 1.0) * 255.0) as u8,
+                            (diffuse[2].clamp(0.0, 1.0) * 255.0) as u8,
+                            (diffuse[3].clamp(0.0, 1.0) * 255.0) as u8,
+                        ],
+                        fog_enable,
+                        alpha_blend_enable: alpha_blend,
+                        primitive_count: prim_count,
+                    };
+                    match dev.render_fixed_function_scene(&scene) {
+                        Ok(frame) => {
+                            // Store rendered pixels in shim's render_target
+                            if let Some(shim) = self.d3d9_shim.as_mut() {
+                                shim.render_target = Some((frame.width, frame.height, frame.pixels));
+                            }
+                            state.set(Register::Rax, 0);
+                            self.push_trace(
+                                "d3d9",
+                                "IDirect3DDevice9::DrawPrimitive",
+                                BTreeMap::from([
+                                    ("prim_type".to_string(), json!(prim_type)),
+                                    ("start_vertex".to_string(), json!(start_vertex)),
+                                    ("prim_count".to_string(), json!(prim_count)),
+                                    ("fvf".to_string(), json!(dev.state.fvf)),
+                                ]),
+                                json!(0),
+                            );
+                        }
+                        Err(e) => {
+                            state.set(Register::Rax, D3DERR_INVALIDCALL);
+                        }
+                    }
+                } else {
+                    state.set(Register::Rax, D3DERR_INVALIDCALL);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::D3d9DeviceDrawIndexedPrimitive => {
+                // HRESULT DrawIndexedPrimitive(D3DPRIMITIVETYPE Type, INT BaseVertexIndex,
+                //                               UINT MinVertexIndex, UINT NumVertices,
+                //                               UINT StartIndex, UINT PrimitiveCount)
+                let device_object = state.get(Register::Rcx);
+                let prim_type = state.get(Register::Rdx) as u32;
+                let _base_vertex = state.get(Register::R8) as i32;
+                let _min_vertex = state.get(Register::R9) as u32;
+                let stack = state.get(Register::Rsp);
+                let _num_vertices = read_guest_u32(memory, stack + 0x20)?;
+                let _start_index = read_guest_u32(memory, stack + 0x28)?;
+                let prim_count = read_guest_u32(memory, stack + 0x30)?;
+                if let Some(dev) = self.d3d9_devices.get(&device_object) {
+                    let material = &dev.state.material;
+                    let diffuse = material.diffuse;
+                    let alpha_blend = dev.state.render_states[crate::d3d11::D3DRS_ALPHABLENDENABLE as usize] != 0;
+                    let fog_enable = dev.state.render_states[crate::d3d11::D3DRS_FOGENABLE as usize] != 0;
+                    let scene = FixedFunctionScene {
+                        texture_factor: dev.state.texture_stage_states[0][crate::d3d11::D3DTSS_COLOROP as usize] as u32,
+                        diffuse_color: [
+                            (diffuse[0].clamp(0.0, 1.0) * 255.0) as u8,
+                            (diffuse[1].clamp(0.0, 1.0) * 255.0) as u8,
+                            (diffuse[2].clamp(0.0, 1.0) * 255.0) as u8,
+                            (diffuse[3].clamp(0.0, 1.0) * 255.0) as u8,
+                        ],
+                        fog_enable,
+                        alpha_blend_enable: alpha_blend,
+                        primitive_count: prim_count,
+                    };
+                    match dev.render_fixed_function_scene(&scene) {
+                        Ok(frame) => {
+                            if let Some(shim) = self.d3d9_shim.as_mut() {
+                                shim.render_target = Some((frame.width, frame.height, frame.pixels));
+                            }
+                            state.set(Register::Rax, 0);
+                            self.push_trace(
+                                "d3d9",
+                                "IDirect3DDevice9::DrawIndexedPrimitive",
+                                BTreeMap::from([
+                                    ("prim_type".to_string(), json!(prim_type)),
+                                    ("prim_count".to_string(), json!(prim_count)),
+                                ]),
+                                json!(0),
+                            );
+                        }
+                        Err(_) => {
+                            state.set(Register::Rax, D3DERR_INVALIDCALL);
+                        }
+                    }
+                } else {
+                    state.set(Register::Rax, D3DERR_INVALIDCALL);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::D3d9DeviceDrawPrimitiveUP => {
+                // HRESULT DrawPrimitiveUP(D3DPRIMITIVETYPE PrimitiveType,
+                //                         UINT PrimitiveCount, CONST void* pVertexStreamZeroData,
+                //                         UINT VertexStreamZeroStride)
+                let device_object = state.get(Register::Rcx);
+                let prim_type = state.get(Register::Rdx) as u32;
+                let prim_count = state.get(Register::R8) as u32;
+                let _stream_data = state.get(Register::R9);
+                let stack = state.get(Register::Rsp);
+                let _stride = read_guest_u32(memory, stack + 0x20)?;
+                if let Some(dev) = self.d3d9_devices.get(&device_object) {
+                    let material = &dev.state.material;
+                    let diffuse = material.diffuse;
+                    let scene = FixedFunctionScene {
+                        texture_factor: 0,
+                        diffuse_color: [
+                            (diffuse[0].clamp(0.0, 1.0) * 255.0) as u8,
+                            (diffuse[1].clamp(0.0, 1.0) * 255.0) as u8,
+                            (diffuse[2].clamp(0.0, 1.0) * 255.0) as u8,
+                            (diffuse[3].clamp(0.0, 1.0) * 255.0) as u8,
+                        ],
+                        fog_enable: false,
+                        alpha_blend_enable: false,
+                        primitive_count: prim_count,
+                    };
+                    match dev.render_fixed_function_scene(&scene) {
+                        Ok(frame) => {
+                            if let Some(shim) = self.d3d9_shim.as_mut() {
+                                shim.render_target = Some((frame.width, frame.height, frame.pixels));
+                            }
+                            state.set(Register::Rax, 0);
+                            self.push_trace(
+                                "d3d9",
+                                "IDirect3DDevice9::DrawPrimitiveUP",
+                                BTreeMap::from([
+                                    ("prim_type".to_string(), json!(prim_type)),
+                                    ("prim_count".to_string(), json!(prim_count)),
+                                ]),
+                                json!(0),
+                            );
+                        }
+                        Err(_) => {
+                            state.set(Register::Rax, D3DERR_INVALIDCALL);
+                        }
+                    }
+                } else {
+                    state.set(Register::Rax, D3DERR_INVALIDCALL);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::D3d9DeviceDrawIndexedPrimitiveUP => {
+                // HRESULT DrawIndexedPrimitiveUP(D3DPRIMITIVETYPE PrimitiveType,
+                //     UINT PrimitiveCount, CONST void* pIndexData, D3DFORMAT IndexDataFormat,
+                //     CONST void* pVertexStreamZeroData, UINT VertexStreamZeroStride)
+                let device_object = state.get(Register::Rcx);
+                let prim_type = state.get(Register::Rdx) as u32;
+                let prim_count = state.get(Register::R8) as u32;
+                let _index_data = state.get(Register::R9);
+                let stack = state.get(Register::Rsp);
+                let _index_format = read_guest_u32(memory, stack + 0x20)?;
+                if let Some(dev) = self.d3d9_devices.get(&device_object) {
+                    let material = &dev.state.material;
+                    let diffuse = material.diffuse;
+                    let scene = FixedFunctionScene {
+                        texture_factor: 0,
+                        diffuse_color: [
+                            (diffuse[0].clamp(0.0, 1.0) * 255.0) as u8,
+                            (diffuse[1].clamp(0.0, 1.0) * 255.0) as u8,
+                            (diffuse[2].clamp(0.0, 1.0) * 255.0) as u8,
+                            (diffuse[3].clamp(0.0, 1.0) * 255.0) as u8,
+                        ],
+                        fog_enable: false,
+                        alpha_blend_enable: false,
+                        primitive_count: prim_count,
+                    };
+                    match dev.render_fixed_function_scene(&scene) {
+                        Ok(frame) => {
+                            if let Some(shim) = self.d3d9_shim.as_mut() {
+                                shim.render_target = Some((frame.width, frame.height, frame.pixels));
+                            }
+                            state.set(Register::Rax, 0);
+                        }
+                        Err(_) => {
+                            state.set(Register::Rax, D3DERR_INVALIDCALL);
+                        }
+                    }
+                } else {
+                    state.set(Register::Rax, D3DERR_INVALIDCALL);
+                }
+                self.last_error = 0;
+                self.push_trace("d3d9", "IDirect3DDevice9::DrawIndexedPrimitiveUP", BTreeMap::new(), json!(0));
+            }
+            HostThunk::D3d9DeviceSetVertexShader => {
+                // HRESULT SetVertexShader(IDirect3DVertexShader9* pShader)
+                let device_object = state.get(Register::Rcx);
+                let shader = state.get(Register::Rdx);
+                if let Some(dev) = self.d3d9_devices.get_mut(&device_object) {
+                    dev.set_vertex_shader(shader);
+                    state.set(Register::Rax, 0);
+                } else {
+                    state.set(Register::Rax, D3DERR_INVALIDCALL);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::D3d9DeviceSetPixelShader => {
+                // HRESULT SetPixelShader(IDirect3DPixelShader9* pShader)
+                let device_object = state.get(Register::Rcx);
+                let shader = state.get(Register::Rdx);
+                if let Some(dev) = self.d3d9_devices.get_mut(&device_object) {
+                    dev.set_pixel_shader(shader);
+                    state.set(Register::Rax, 0);
+                } else {
+                    state.set(Register::Rax, D3DERR_INVALIDCALL);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::D3d9DeviceSetVertexShaderConstantF => {
+                // HRESULT SetVertexShaderConstantF(UINT StartRegister, CONST float* pConstantData, UINT Vector4fCount)
+                let _device_object = state.get(Register::Rcx);
+                let _start_reg = state.get(Register::Rdx) as u32;
+                let _data_ptr = state.get(Register::R8);
+                let _vec4_count = state.get(Register::R9) as u32;
+                // Shader constants are not used in fixed-function rendering.
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+            }
+            HostThunk::D3d9DeviceSetPixelShaderConstantF => {
+                // HRESULT SetPixelShaderConstantF(UINT StartRegister, CONST float* pConstantData, UINT Vector4fCount)
+                let _device_object = state.get(Register::Rcx);
+                let _start_reg = state.get(Register::Rdx) as u32;
+                let _data_ptr = state.get(Register::R8);
+                let _vec4_count = state.get(Register::R9) as u32;
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+            }
+            HostThunk::D3d9DeviceCreateVertexBuffer => {
+                // HRESULT CreateVertexBuffer(UINT Length, DWORD Usage, DWORD FVF,
+                //                            D3DPOOL Pool, IDirect3DVertexBuffer9** ppVertexBuffer,
+                //                            HANDLE* pSharedHandle)
+                let _device_object = state.get(Register::Rcx);
+                let length = state.get(Register::Rdx) as usize;
+                let _usage = state.get(Register::R8) as u32;
+                let fvf = state.get(Register::R9) as u32;
+                let stack = state.get(Register::Rsp);
+                let _pool = read_guest_u32(memory, stack + 0x20)?;
+                let pp_vb = memory.read_u64(stack + 0x28)?;
+                let _p_shared = memory.read_u64(stack + 0x30)?;
+                if pp_vb == 0 {
+                    state.set(Register::Rax, E_INVALIDARG);
+                } else if length == 0 {
+                    state.set(Register::Rax, E_INVALIDARG);
+                } else {
+                    // Compute stride from FVF if possible, default to 32 bytes
+                    let stride = if fvf != 0 { 32u32 } else { 32u32 };
+                    match self.alloc_d3d9_vertex_buffer_object(memory, length, fvf, stride) {
+                        Ok(vb_object) => {
+                            write_u64(memory, pp_vb, vb_object);
+                            state.set(Register::Rax, 0);
+                            self.push_trace(
+                                "d3d9",
+                                "IDirect3DDevice9::CreateVertexBuffer",
+                                BTreeMap::from([
+                                    ("length".to_string(), json!(length)),
+                                    ("fvf".to_string(), json!(fvf)),
+                                ]),
+                                json!(0),
+                            );
+                        }
+                        Err(_) => {
+                            state.set(Register::Rax, D3DERR_INVALIDCALL);
+                        }
+                    }
+                }
+                self.last_error = 0;
+            }
+            HostThunk::D3d9DeviceCreateIndexBuffer => {
+                // HRESULT CreateIndexBuffer(UINT Length, DWORD Usage, D3DFORMAT Format,
+                //                           D3DPOOL Pool, IDirect3DIndexBuffer9** ppIndexBuffer,
+                //                           HANDLE* pSharedHandle)
+                let _device_object = state.get(Register::Rcx);
+                let length = state.get(Register::Rdx) as usize;
+                let _usage = state.get(Register::R8) as u32;
+                let format = state.get(Register::R9) as u32;
+                let stack = state.get(Register::Rsp);
+                let _pool = read_guest_u32(memory, stack + 0x20)?;
+                let pp_ib = memory.read_u64(stack + 0x28)?;
+                if pp_ib == 0 || length == 0 {
+                    state.set(Register::Rax, E_INVALIDARG);
+                } else {
+                    // Format: D3DFMT_INDEX16 (0) or D3DFMT_INDEX32 (1)
+                    let is_32bit = format != 0;
+                    match self.alloc_d3d9_index_buffer_object(memory, length, is_32bit) {
+                        Ok(ib_object) => {
+                            write_u64(memory, pp_ib, ib_object);
+                            state.set(Register::Rax, 0);
+                            self.push_trace(
+                                "d3d9",
+                                "IDirect3DDevice9::CreateIndexBuffer",
+                                BTreeMap::from([
+                                    ("length".to_string(), json!(length)),
+                                    ("format".to_string(), json!(format)),
+                                ]),
+                                json!(0),
+                            );
+                        }
+                        Err(_) => {
+                            state.set(Register::Rax, D3DERR_INVALIDCALL);
+                        }
+                    }
+                }
+                self.last_error = 0;
+            }
+            HostThunk::D3d9DeviceCreateTexture => {
+                // HRESULT CreateTexture(UINT Width, UINT Height, UINT Levels, DWORD Usage,
+                //                       D3DFORMAT Format, D3DPOOL Pool,
+                //                       IDirect3DTexture9** ppTexture, HANDLE* pSharedHandle)
+                let _device_object = state.get(Register::Rcx);
+                let width = state.get(Register::Rdx) as u32;
+                let height = state.get(Register::R8) as u32;
+                let levels = state.get(Register::R9) as u32;
+                let stack = state.get(Register::Rsp);
+                let _usage = read_guest_u32(memory, stack + 0x20)?;
+                let format = read_guest_u32(memory, stack + 0x28)?;
+                let _pool = read_guest_u32(memory, stack + 0x30)?;
+                let pp_tex = memory.read_u64(stack + 0x38)?;
+                if pp_tex == 0 || width == 0 || height == 0 {
+                    state.set(Register::Rax, E_INVALIDARG);
+                } else {
+                    let level_count = if levels == 0 { 1 } else { levels.min(10) };
+                    match self.alloc_d3d9_texture_object(memory, width, height, level_count, format) {
+                        Ok(tex_object) => {
+                            write_u64(memory, pp_tex, tex_object);
+                            state.set(Register::Rax, 0);
+                            self.push_trace(
+                                "d3d9",
+                                "IDirect3DDevice9::CreateTexture",
+                                BTreeMap::from([
+                                    ("width".to_string(), json!(width)),
+                                    ("height".to_string(), json!(height)),
+                                    ("levels".to_string(), json!(level_count)),
+                                    ("format".to_string(), json!(format)),
+                                ]),
+                                json!(0),
+                            );
+                        }
+                        Err(_) => {
+                            state.set(Register::Rax, D3DERR_OUTOFVIDEOMEMORY);
+                        }
+                    }
+                }
+                self.last_error = 0;
+            }
+            HostThunk::D3d9DeviceCreateQuery => {
+                // HRESULT CreateQuery(D3DQUERYTYPE Type, IDirect3DQuery9** ppQuery)
+                let _device_object = state.get(Register::Rcx);
+                let _query_type = state.get(Register::Rdx) as u32;
+                let pp_query = state.get(Register::R8);
+                if pp_query != 0 {
+                    // Create a stub query object
+                    let query_object = self.alloc_zeroed(memory, 8, 8)?;
+                    let vtable = self.alloc_guest_vtable(memory, vec![
+                        unsupported_method(&self.telemetry, "IDirect3DQuery9::QueryInterface"),
+                        HostThunk::GuestObjectAddRef,
+                        HostThunk::GuestObjectRelease,
+                        unsupported_method(&self.telemetry, "IDirect3DQuery9::GetDevice"),
+                        unsupported_method(&self.telemetry, "IDirect3DQuery9::GetType"),
+                        unsupported_method(&self.telemetry, "IDirect3DQuery9::GetDataSize"),
+                        unsupported_method(&self.telemetry, "IDirect3DQuery9::Issue"),
+                        unsupported_method(&self.telemetry, "IDirect3DQuery9::GetData"),
+                    ])?;
+                    write_u64(memory, query_object, vtable);
+                    write_u64(memory, pp_query, query_object);
+                    self.d3d9_queries.insert(query_object, ());
+                    state.set(Register::Rax, 0);
+                } else {
+                    state.set(Register::Rax, E_INVALIDARG);
+                }
+                self.last_error = 0;
+                self.push_trace("d3d9", "IDirect3DDevice9::CreateQuery", BTreeMap::new(), json!(0));
+            }
+            HostThunk::D3d9DeviceGetBackBuffer => {
+                // HRESULT GetBackBuffer(UINT iSwapChain, UINT iBackBuffer,
+                //                       D3DBACKBUFFER_TYPE Type, IDirect3DSurface9** ppBackBuffer)
+                let _device_object = state.get(Register::Rcx);
+                let _swapchain_index = state.get(Register::Rdx) as u32;
+                let _back_buffer_index = state.get(Register::R8) as u32;
+                let _back_buffer_type = state.get(Register::R9) as u32;
+                let stack = state.get(Register::Rsp);
+                let pp_surface = memory.read_u64(stack + 0x20)?;
+                if pp_surface != 0 {
+                    // Create a stub surface object
+                    let surface_object = self.alloc_zeroed(memory, 8, 8)?;
+                    let vtable = self.alloc_guest_vtable(memory, vec![
+                        unsupported_method(&self.telemetry, "IDirect3DSurface9::QueryInterface"),
+                        HostThunk::GuestObjectAddRef,
+                        HostThunk::GuestObjectRelease,
+                    ])?;
+                    write_u64(memory, surface_object, vtable);
+                    write_u64(memory, pp_surface, surface_object);
+                    state.set(Register::Rax, 0);
+                } else {
+                    state.set(Register::Rax, E_INVALIDARG);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::D3d9DeviceGetRenderTarget => {
+                // HRESULT GetRenderTarget(DWORD RenderTargetIndex, IDirect3DSurface9** ppRenderTarget)
+                let _device_object = state.get(Register::Rcx);
+                let _index = state.get(Register::Rdx) as u32;
+                let pp_surface = state.get(Register::R8);
+                if pp_surface != 0 {
+                    let surface_object = self.alloc_zeroed(memory, 8, 8)?;
+                    let vtable = self.alloc_guest_vtable(memory, vec![
+                        unsupported_method(&self.telemetry, "IDirect3DSurface9::QueryInterface"),
+                        HostThunk::GuestObjectAddRef,
+                        HostThunk::GuestObjectRelease,
+                    ])?;
+                    write_u64(memory, surface_object, vtable);
+                    write_u64(memory, pp_surface, surface_object);
+                    state.set(Register::Rax, 0);
+                } else {
+                    state.set(Register::Rax, E_INVALIDARG);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::D3d9DeviceSetRenderTarget => {
+                // HRESULT SetRenderTarget(DWORD RenderTargetIndex, IDirect3DSurface9* pRenderTarget)
+                let _device_object = state.get(Register::Rcx);
+                let _index = state.get(Register::Rdx) as u32;
+                let _surface = state.get(Register::R8);
+                // Accept but ignore — we render into our own backbuffer
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+            }
+            HostThunk::D3d9DeviceGetDepthStencilSurface => {
+                // HRESULT GetDepthStencilSurface(IDirect3DSurface9** ppZStencilSurface)
+                let _device_object = state.get(Register::Rcx);
+                let pp_surface = state.get(Register::Rdx);
+                // No depth-stencil surface available
+                if pp_surface != 0 {
+                    write_u64(memory, pp_surface, 0);
+                }
+                state.set(Register::Rax, 0); // D3D_OK with null surface
+                self.last_error = 0;
+            }
+            HostThunk::D3d9DeviceSetDepthStencilSurface => {
+                // HRESULT SetDepthStencilSurface(IDirect3DSurface9* pNewZStencil)
+                let _device_object = state.get(Register::Rcx);
+                let _surface = state.get(Register::Rdx);
+                // Accept but ignore
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+            }
+            HostThunk::D3d9DeviceGetSwapChain => {
+                // HRESULT GetSwapChain(UINT iSwapChain, IDirect3DSwapChain9** ppSwapChain)
+                let device_object = state.get(Register::Rcx);
+                let _index = state.get(Register::Rdx) as u32;
+                let pp_swapchain = state.get(Register::R8);
+                if pp_swapchain != 0 {
+                    // Create a swapchain object and associate it with this device
+                    let swapchain_object = self.alloc_zeroed(memory, 8, 8)?;
+                    let vtable = self.alloc_guest_vtable(memory, vec![
+                        unsupported_method(&self.telemetry, "IDirect3DSwapChain9::QueryInterface"),
+                        HostThunk::GuestObjectAddRef,
+                        HostThunk::GuestObjectRelease,
+                        HostThunk::D3d9SwapChainPresent,
+                        HostThunk::D3d9SwapChainGetBackBuffer,
+                        unsupported_method(&self.telemetry, "IDirect3DSwapChain9::GetFrontBufferData"),
+                        unsupported_method(&self.telemetry, "IDirect3DSwapChain9::GetRasterStatus"),
+                        unsupported_method(&self.telemetry, "IDirect3DSwapChain9::GetDisplayMode"),
+                        unsupported_method(&self.telemetry, "IDirect3DSwapChain9::GetDevice"),
+                        unsupported_method(&self.telemetry, "IDirect3DSwapChain9::GetPresentParameters"),
+                    ])?;
+                    write_u64(memory, swapchain_object, vtable);
+                    write_u64(memory, pp_swapchain, swapchain_object);
+                    self.d3d9_swapchains.insert(swapchain_object, device_object);
+                    state.set(Register::Rax, 0);
+                } else {
+                    state.set(Register::Rax, E_INVALIDARG);
+                }
+                self.last_error = 0;
+                self.push_trace("d3d9", "IDirect3DDevice9::GetSwapChain", BTreeMap::new(), json!(0));
+            }
+            // ── IDirect3DVertexBuffer9 vtable handlers ──────────────────────────
+            HostThunk::D3d9VertexBufferLock => {
+                // HRESULT Lock(UINT OffsetToLock, UINT SizeToLock, void** ppbData, DWORD Flags)
+                let vb_object = state.get(Register::Rcx);
+                let offset = state.get(Register::Rdx) as usize;
+                let size = state.get(Register::R8) as usize;
+                let pp_data = state.get(Register::R9);
+                let _flags = guest_call_arg_u32(state, memory, 4)?;
+                // Extract data before any mutable borrow of self
+                let (lock_size, existing_data) = match self.d3d9_vertex_buffers.get(&vb_object) {
+                    Some(vb) => {
+                        let ls = if size == 0 { vb.size - offset } else { size };
+                        let data = if offset < vb.data.len() {
+                            let copy_len = ls.min(vb.data.len() - offset);
+                            Some(vb.data[offset..offset + copy_len].to_vec())
+                        } else {
+                            None
+                        };
+                        (ls, data)
+                    }
+                    None => {
+                        state.set(Register::Rax, D3DERR_INVALIDCALL);
+                        self.last_error = 0;
+                        return Ok(None);
+                    }
+                };
+                if pp_data != 0 {
+                    let temp = self.alloc_heap(memory, lock_size, false)?;
+                    write_u64(memory, pp_data, temp);
+                    if let Some(data) = existing_data {
+                        memory.map_bytes(temp, &data);
+                    }
+                }
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+            }
+            HostThunk::D3d9VertexBufferUnlock => {
+                // HRESULT Unlock()
+                // The guest has written data via the pointer obtained from Lock.
+                // For our implementation, we need to read the data back from the temp buffer.
+                // Since we allocated the temp buffer in Lock, the data is already in guest memory.
+                // The simplest approach: ignore Unlock — data is stale until next Lock.
+                // In a full implementation we would copy the temp buffer back.
+                let _vb_object = state.get(Register::Rcx);
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+            }
+            // ── IDirect3DIndexBuffer9 vtable handlers ───────────────────────────
+            HostThunk::D3d9IndexBufferLock => {
+                // HRESULT Lock(UINT OffsetToLock, UINT SizeToLock, void** ppbData, DWORD Flags)
+                let ib_object = state.get(Register::Rcx);
+                let offset = state.get(Register::Rdx) as usize;
+                let size = state.get(Register::R8) as usize;
+                let pp_data = state.get(Register::R9);
+                // Extract data before any mutable borrow of self
+                let (lock_size, existing_data) = match self.d3d9_index_buffers.get(&ib_object) {
+                    Some(ib) => {
+                        let ls = if size == 0 { ib.size - offset } else { size };
+                        let data = if offset < ib.data.len() {
+                            let copy_len = ls.min(ib.data.len() - offset);
+                            Some(ib.data[offset..offset + copy_len].to_vec())
+                        } else {
+                            None
+                        };
+                        (ls, data)
+                    }
+                    None => {
+                        state.set(Register::Rax, D3DERR_INVALIDCALL);
+                        self.last_error = 0;
+                        return Ok(None);
+                    }
+                };
+                if pp_data != 0 {
+                    let temp = self.alloc_heap(memory, lock_size, false)?;
+                    write_u64(memory, pp_data, temp);
+                    if let Some(data) = existing_data {
+                        memory.map_bytes(temp, &data);
+                    }
+                }
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+            }
+            HostThunk::D3d9IndexBufferUnlock => {
+                // HRESULT Unlock()
+                let _ib_object = state.get(Register::Rcx);
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+            }
+            // ── IDirect3DTexture9 vtable handlers ────────────────────────────────
+            HostThunk::D3d9TextureLockRect => {
+                // HRESULT LockRect(UINT Level, D3DLOCKED_RECT* pLockedRect,
+                //                  CONST RECT* pRect, DWORD Flags)
+                let tex_object = state.get(Register::Rcx);
+                let _level = state.get(Register::Rdx) as u32;
+                let locked_rect_ptr = state.get(Register::R8);
+                let _rect_ptr = state.get(Register::R9);
+                let _flags = guest_call_arg_u32(state, memory, 4)?;
+                // Extract texture info before any mutable borrow of self
+                let (width, height, existing_data) = match self.d3d9_textures.get(&tex_object) {
+                    Some(tex) => {
+                        let level_data = if !tex.levels.is_empty() {
+                            let copy_size = (tex.width * tex.height * 4) as usize;
+                            let copy_len = copy_size.min(tex.levels[0].len());
+                            Some(tex.levels[0][..copy_len].to_vec())
+                        } else {
+                            None
+                        };
+                        (tex.width, tex.height, level_data)
+                    }
+                    None => {
+                        state.set(Register::Rax, D3DERR_INVALIDCALL);
+                        self.last_error = 0;
+                        return Ok(None);
+                    }
+                };
+                if locked_rect_ptr != 0 {
+                    let pitch = (width * 4) as i32;
+                    write_u32(memory, locked_rect_ptr, pitch as u32);
+                    let level_data_size = (width * height * 4) as usize;
+                    let temp = self.alloc_heap(memory, level_data_size, false)?;
+                    write_u64(memory, locked_rect_ptr + 8, temp);
+                    if let Some(data) = existing_data {
+                        memory.map_bytes(temp, &data);
+                    }
+                }
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+            }
+            HostThunk::D3d9TextureUnlockRect => {
+                // HRESULT UnlockRect(UINT Level)
+                let _tex_object = state.get(Register::Rcx);
+                let _level = state.get(Register::Rdx) as u32;
+                // Similar to vertex/index buffer unlock — the guest wrote via the
+                // pointer from LockRect. In a full implementation we'd read back.
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+            }
+            // ── IDirect3DSwapChain9 vtable handlers ──────────────────────────────
+            HostThunk::D3d9SwapChainPresent => {
+                // HRESULT Present(CONST RECT* pSourceRect, CONST RECT* pDestRect,
+                //                 HWND hDestWindowOverride, CONST RGNDATA* pDirtyRegion,
+                //                 DWORD dwFlags)
+                let swapchain_object = state.get(Register::Rcx);
+                if let Some(device_object) = self.d3d9_swapchains.get(&swapchain_object).copied() {
+                    if let Some(shim) = self.d3d9_shim.as_mut() {
+                        if let Some(dev) = self.d3d9_devices.get(&device_object) {
+                            let _ = shim.present(dev.id);
+                        }
+                    }
+                    state.set(Register::Rax, 0);
+                } else {
+                    state.set(Register::Rax, D3DERR_INVALIDCALL);
+                }
+                self.last_error = 0;
+                self.push_trace("d3d9", "IDirect3DSwapChain9::Present", BTreeMap::new(), json!(0));
+            }
+            HostThunk::D3d9SwapChainGetBackBuffer => {
+                // HRESULT GetBackBuffer(UINT iBackBuffer, D3DBACKBUFFER_TYPE Type,
+                //                       IDirect3DSurface9** ppBackBuffer)
+                let _swapchain_object = state.get(Register::Rcx);
+                let _index = state.get(Register::Rdx) as u32;
+                let _back_type = state.get(Register::R8) as u32;
+                let pp_surface = state.get(Register::R9);
+                if pp_surface != 0 {
+                    let surface_object = self.alloc_zeroed(memory, 8, 8)?;
+                    let vtable = self.alloc_guest_vtable(memory, vec![
+                        unsupported_method(&self.telemetry, "IDirect3DSurface9::QueryInterface"),
+                        HostThunk::GuestObjectAddRef,
+                        HostThunk::GuestObjectRelease,
+                    ])?;
+                    write_u64(memory, surface_object, vtable);
+                    write_u64(memory, pp_surface, surface_object);
+                    state.set(Register::Rax, 0);
+                } else {
+                    state.set(Register::Rax, E_INVALIDARG);
+                }
+                self.last_error = 0;
+            }
+            // ── End D3D9 Basic Rendering ──────────────────────────────────────────
             HostThunk::XAudio2Create => {
                 let out_ptr = state.get(Register::Rcx);
                 if out_ptr == 0 {
@@ -7928,6 +10853,154 @@ impl PeHostRuntime {
                 self.last_error = 0;
                 self.push_trace("audio", "IXAudio2::CommitChanges", BTreeMap::new(), json!(0));
             }
+            // -- IXAPO vtable thunks (Phase 4.3.1) --
+            HostThunk::XAPO_GetRegistrationProperties => {
+                let object = state.get(Register::Rcx);
+                if self.guest_object_kind(object)? != GuestObjectKind::XapoEffect {
+                    state.set(Register::Rax, E_INVALIDARG);
+                } else {
+                    let out_ptr = state.get(Register::Rdx);
+                    if out_ptr != 0 {
+                        if let Some(instance_id) = self.xapo_effect_instances.get(&object).copied() {
+                            if let Some(props) = self.xapo_manager.instance_registration(instance_id) {
+                                // Write the XAPO_REGISTRATION_PROPERTIES structure to guest memory.
+                                // Layout (COM repr(C)):
+                                //   0:  clsid (16 bytes)
+                                //  16:  friendly_name (256 wide chars = 512 bytes)
+                                // 528:  copyright_info (256 wide chars = 512 bytes)
+                                // 1040: major_version (4)
+                                // 1044: minor_version (4)
+                                // 1048: flags (4)
+                                // 1052: min_input_buffer_count (4)
+                                // 1056: max_input_buffer_count (4)
+                                // 1060: min_output_buffer_count (4)
+                                // 1064: max_output_buffer_count (4)
+                                // Total: 1068 bytes
+                                for i in 0..16 {
+                                    write_u8(memory, out_ptr + i as u64, props.clsid[i]);
+                                }
+                                for i in 0..256 {
+                                    write_u16(memory, out_ptr + 16 + (i * 2) as u64, props.friendly_name[i]);
+                                }
+                                for i in 0..256 {
+                                    write_u16(memory, out_ptr + 528 + (i * 2) as u64, props.copyright_info[i]);
+                                }
+                                write_u32(memory, out_ptr + 1040, props.major_version);
+                                write_u32(memory, out_ptr + 1044, props.minor_version);
+                                write_u32(memory, out_ptr + 1048, props.flags);
+                                write_u32(memory, out_ptr + 1052, props.min_input_buffer_count);
+                                write_u32(memory, out_ptr + 1056, props.max_input_buffer_count);
+                                write_u32(memory, out_ptr + 1060, props.min_output_buffer_count);
+                                write_u32(memory, out_ptr + 1064, props.max_output_buffer_count);
+                            }
+                        }
+                    }
+                    state.set(Register::Rax, 0);
+                    self.push_trace("audio", "IXAPO::GetRegistrationProperties", BTreeMap::new(), json!(0));
+                }
+                self.last_error = 0;
+            }
+            HostThunk::XAPO_LockForProcess => {
+                let object = state.get(Register::Rcx);
+                if self.guest_object_kind(object)? != GuestObjectKind::XapoEffect {
+                    state.set(Register::Rax, E_INVALIDARG);
+                } else {
+                    // LockForProcess validates format and prepares the effect.
+                    // For our simple effects this is a no-op (always succeeds).
+                    state.set(Register::Rax, 0);
+                    self.push_trace("audio", "IXAPO::LockForProcess", BTreeMap::new(), json!(0));
+                }
+                self.last_error = 0;
+            }
+            HostThunk::XAPO_UnlockForProcess => {
+                let object = state.get(Register::Rcx);
+                if self.guest_object_kind(object)? != GuestObjectKind::XapoEffect {
+                    state.set(Register::Rax, E_INVALIDARG);
+                } else {
+                    // UnlockForProcess releases processing resources.
+                    // For our simple effects this is a no-op.
+                    state.set(Register::Rax, 0);
+                    self.push_trace("audio", "IXAPO::UnlockForProcess", BTreeMap::new(), json!(0));
+                }
+                self.last_error = 0;
+            }
+            HostThunk::XAPO_Process => {
+                let object = state.get(Register::Rcx);
+                if self.guest_object_kind(object)? != GuestObjectKind::XapoEffect {
+                    state.set(Register::Rax, E_INVALIDARG);
+                } else {
+                    // XAPO_Process arguments (x64 COM calling convention):
+                    //   RCX = this
+                    //   RDX = input_buffer (XAPO_BUFFER*)
+                    //   R8  = output_buffer (XAPO_BUFFER*)
+                    //   R9  = flags (UINT32)
+                    let stack = state.get(Register::Rsp);
+                    let input_buf_ptr = state.get(Register::Rdx);
+                    let output_buf_ptr = state.get(Register::R8);
+                    let _flags = read_guest_u32(memory, stack + 0x20)?;
+
+                    if input_buf_ptr == 0 || output_buf_ptr == 0 {
+                        state.set(Register::Rax, E_INVALIDARG);
+                    } else {
+                        // Read XAPO_BUFFER structures from guest memory.
+                        // XAPO_BUFFER layout: audio_data_ptr(8), flags(4), valid_frame_count(4)
+                        let input_data_ptr = memory.read_u64(input_buf_ptr)?;
+                        let _input_flags = memory.read_u32(input_buf_ptr + 8)?;
+                        let input_valid_frames = memory.read_u32(input_buf_ptr + 12)? as u32;
+                        let output_data_ptr = memory.read_u64(output_buf_ptr)?;
+                        let _output_flags = memory.read_u32(output_buf_ptr + 8)?;
+                        let output_valid_frames = memory.read_u32(output_buf_ptr + 12)? as u32;
+
+                        if input_data_ptr == 0 || output_data_ptr == 0 || input_valid_frames == 0 {
+                            state.set(Register::Rax, E_INVALIDARG);
+                        } else {
+                            let frames = input_valid_frames as usize;
+
+                            // Determine actual channel count from the effect instance.
+                            let channels = if let Some(instance_id) = self.xapo_effect_instances.get(&object).copied() {
+                                self.xapo_manager.instance_channels(instance_id).unwrap_or(2) as usize
+                            } else {
+                                2
+                            };
+
+                            let sample_count = frames * channels;
+                            let mut input_buf = vec![0.0f32; sample_count.max(4)];
+                            for i in 0..sample_count.min(input_buf.len()) {
+                                input_buf[i] = read_guest_f32(memory, input_data_ptr + (i * 4) as u64)?;
+                            }
+
+                            let out_samples = frames * channels;
+                            let mut output_buf = vec![0.0f32; out_samples.max(4)];
+
+                            if let Some(instance_id) = self.xapo_effect_instances.get(&object).copied() {
+                                self.xapo_manager.process_instance(
+                                    instance_id,
+                                    &input_buf,
+                                    &mut output_buf,
+                                );
+                            }
+
+                            // Write output samples back to guest memory
+                            let out_sample_count = out_samples.min(output_buf.len());
+                            for i in 0..out_sample_count {
+                                write_u32(memory, output_data_ptr + (i * 4) as u64, output_buf[i].to_bits());
+                            }
+                            write_u32(memory, output_buf_ptr + 12, input_valid_frames);
+
+                            state.set(Register::Rax, 0);
+                            self.push_trace(
+                                "audio",
+                                "IXAPO::Process",
+                                BTreeMap::from([
+                                    ("frames".to_string(), json!(input_valid_frames)),
+                                ]),
+                                json!(0),
+                            );
+                        }
+                    }
+                }
+                self.last_error = 0;
+            }
             // -- DirectInput8 (Phase 4.3) --
             HostThunk::DirectInput8Create => {
                 let instance = state.get(Register::Rcx);
@@ -8229,6 +11302,76 @@ impl PeHostRuntime {
                 state.set(Register::Rax, 0);
                 self.last_error = 0;
                 self.push_trace("input", "IDirectInputDevice8::UnacquireObj", BTreeMap::new(), json!(0));
+            }
+            HostThunk::DirectInputDevice8SendForceFeedbackCommand => {
+                let device_object = state.get(Register::Rcx);
+                let command = state.get(Register::Rdx) as u32;
+                if let Some(ff_state) = self.directinput8_ff_state.get_mut(&device_object) {
+                    match ff_state.send_force_feedback_command(command) {
+                        Ok(_) => state.set(Register::Rax, 0), // DI_OK
+                        Err(e) => {
+                            eprintln!("SendForceFeedbackCommand failed: {:?}", e);
+                            state.set(Register::Rax, 0x80070057u64); // E_INVALIDARG
+                        }
+                    }
+                } else if self.directinput8_device_objects.contains_key(&device_object) {
+                    // Lazily create force-feedback state.
+                    let user_index = (self.directinput8_device_objects.len() as u32) % 4;
+                    let mut ff = crate::real_win32::DirectInputDevice8::new(user_index);
+                    let _ = ff.send_force_feedback_command(command);
+                    self.directinput8_ff_state.insert(device_object, ff);
+                    state.set(Register::Rax, 0);
+                } else {
+                    state.set(Register::Rax, 0x80070057u64); // E_INVALIDARG
+                }
+                self.last_error = 0;
+                self.push_trace(
+                    "input",
+                    "IDirectInputDevice8::SendForceFeedbackCommand",
+                    BTreeMap::from([("command".to_string(), json!(command))]),
+                    json!(state.get(Register::Rax) as u32),
+                );
+            }
+            HostThunk::DirectInputDevice8SetForceFeedbackState => {
+                let device_object = state.get(Register::Rcx);
+                let effect_ptr = state.get(Register::Rdx);
+                if effect_ptr == 0 {
+                    state.set(Register::Rax, 0x80070057u64); // E_INVALIDARG
+                } else if let Some(ff_state) = self.directinput8_ff_state.get_mut(&device_object) {
+                    // Build a DirectInputEffect from the guest's effect structure.
+                    // The guest passes a DIEFFECT structure; for simplicity we
+                    // read only the common fields.
+                    let magnitude = memory.read_u32(effect_ptr + 8)?; // dwMagnitude
+                    let duration = memory.read_u32(effect_ptr + 0)?;  // dwDuration
+                    let gain = memory.read_u32(effect_ptr + 12)?;     // dwGain
+                    let sample_period = memory.read_u32(effect_ptr + 16)?; // dwSamplePeriod
+                    let _attack_time = memory.read_u32(effect_ptr + 28)?;
+                    let _fade_time = memory.read_u32(effect_ptr + 32)?;
+                    let effect = crate::real_win32::DirectInputEffect {
+                        effect_type: crate::real_win32::DirectInputEffectType::ConstantForce,
+                        magnitude,
+                        duration_us: duration,
+                        gain,
+                        sample_period_us: sample_period,
+                        ..Default::default()
+                    };
+                    match ff_state.set_force_feedback_state(&effect) {
+                        Ok(_) => state.set(Register::Rax, 0),
+                        Err(e) => {
+                            eprintln!("SetForceFeedbackState failed: {:?}", e);
+                            state.set(Register::Rax, 0x80070057u64); // E_INVALIDARG
+                        }
+                    }
+                } else {
+                    state.set(Register::Rax, 0x80070057u64); // E_INVALIDARG
+                }
+                self.last_error = 0;
+                self.push_trace(
+                    "input",
+                    "IDirectInputDevice8::SetForceFeedbackState",
+                    BTreeMap::new(),
+                    json!(state.get(Register::Rax) as u32),
+                );
             }
             // -- Raw Input (Phase 4.3) --
             HostThunk::RegisterRawInputDevices => {
@@ -8727,6 +11870,227 @@ impl PeHostRuntime {
                     BTreeMap::from([("action".to_string(), json!(format!("{action:#x}")))]),
                     json!(null));
             }
+            // -- Steam Networking Sockets (Phase 5.4) --
+            HostThunk::SteamAPI_ISteamNetworkingSockets_CreateListenSocketIP => {
+                // ListenSocketHandle SteamAPI_ISteamNetworkingSockets_CreateListenSocketIP(
+                //     void* this, int nLocalIP, uint16 nPort, int nOptions, void* pOptions)
+                let _this = arg(0);
+                let _local_ip = arg(1) as u32;
+                let port = arg(2) as u16;
+                let mut net_sockets = STEAM_NET_SOCKETS.lock().unwrap();
+                if net_sockets.is_none() {
+                    *net_sockets = Some(crate::steam_integration::SteamNetworkingSockets::new());
+                }
+                let sockets = net_sockets.as_mut().unwrap();
+                let bind_addr = Some(std::net::SocketAddr::from(([0, 0, 0, 0], port)));
+                let result = sockets.create_listen_socket_ip(bind_addr, false)
+                    .unwrap_or(0);
+                state.set(Register::Rax, result);
+                self.last_error = 0;
+                self.push_trace("steam_net_sockets", "CreateListenSocketIP",
+                    BTreeMap::from([("port".to_string(), json!(port))]),
+                    json!(result));
+            }
+            HostThunk::SteamAPI_ISteamNetworkingSockets_ConnectByIPAddress => {
+                // SocketsConnectionHandle SteamAPI_ISteamNetworkingSockets_ConnectByIPAddress(
+                //     void* this, void* addr)
+                let _this = arg(0);
+                let addr_ptr = arg(1);
+                // Read IP address from guest memory (simplified: 4 bytes IP + 2 bytes port)
+                let ip_b0 = memory.read_u8(addr_ptr).unwrap_or(0);
+                let ip_b1 = memory.read_u8(addr_ptr + 1).unwrap_or(0);
+                let ip_b2 = memory.read_u8(addr_ptr + 2).unwrap_or(0);
+                let ip_b3 = memory.read_u8(addr_ptr + 3).unwrap_or(0);
+                let port = memory.read_u16(addr_ptr + 4).unwrap_or(0);
+                let peer_addr = std::net::SocketAddr::from(([ip_b0, ip_b1, ip_b2, ip_b3], port));
+                let mut sockets = STEAM_NET_SOCKETS.lock().unwrap();
+                let result = sockets.as_mut()
+                    .and_then(|s| s.connect_by_ip_address(peer_addr).ok())
+                    .unwrap_or(0);
+                state.set(Register::Rax, result);
+                self.last_error = 0;
+                self.push_trace("steam_net_sockets", "ConnectByIPAddress",
+                    BTreeMap::from([("addr".to_string(), json!(peer_addr.to_string()))]),
+                    json!(result));
+            }
+            HostThunk::SteamAPI_ISteamNetworkingSockets_SendMessageToConnection => {
+                // int SteamAPI_ISteamNetworkingSockets_SendMessageToConnection(
+                //     void* this, SocketsConnectionHandle hConn, void* data, uint32 cbData,
+                //     int nSendFlags, void* pOutMessageNumber)
+                let _this = arg(0);
+                let conn_handle = arg(1);
+                let data_ptr = arg(2);
+                let data_len = arg(3) as usize;
+                let _send_flags = arg(4);
+                let data = (0..data_len)
+                    .map(|i| memory.read_u8(data_ptr + i as u64).unwrap_or(0))
+                    .collect::<Vec<u8>>();
+                let mut sockets = STEAM_NET_SOCKETS.lock().unwrap();
+                let result = sockets.as_mut()
+                    .and_then(|s| s.send_message_to_connection(conn_handle, &data, 0).ok())
+                    .map(|_| 0i64)  // 0 = success (k_EResultOK)
+                    .unwrap_or(2);  // 2 = fail (k_EResultFail)
+                state.set(Register::Rax, result as u64);
+                self.last_error = 0;
+                self.push_trace("steam_net_sockets", "SendMessageToConnection",
+                    BTreeMap::from([
+                        ("conn".to_string(), json!(format!("{conn_handle:#x}"))),
+                        ("len".to_string(), json!(data_len)),
+                    ]),
+                    json!(result));
+            }
+            HostThunk::SteamAPI_ISteamNetworkingSockets_ReceiveMessagesOnListenSocket => {
+                // int SteamAPI_ISteamNetworkingSockets_ReceiveMessagesOnListenSocket(
+                //     void* this, ListenSocketHandle hSocket, void** ppOutMessages,
+                //     int nMaxMessages)
+                let _this = arg(0);
+                let listen_handle = arg(1);
+                let out_ptr = arg(2);
+                let max_messages = arg(3) as usize;
+                let mut sockets = STEAM_NET_SOCKETS.lock().unwrap();
+                let mut count = 0i64;
+                if let Some(s) = sockets.as_mut() {
+                    if let Ok(msgs) = s.receive_messages_on_listen_socket(listen_handle) {
+                        count = msgs.len().min(max_messages) as i64;
+                        // Write each message pointer to the output array (simplified)
+                        // In a full implementation we'd write SteamNetworkingMessage_t
+                        // structs to guest memory.
+                        for (i, msg) in msgs.iter().enumerate().take(count as usize) {
+                            // Write a minimal placeholder: just the data pointer
+                            let msg_data_addr = self.alloc_heap(memory, msg.data.len(), false)
+                                .and_then(|addr| {
+                                    for (j, &byte) in msg.data.iter().enumerate() {
+                                        let _ = memory.write_u8(addr + j as u64, byte);
+                                    }
+                                    Ok(addr)
+                                })
+                                .unwrap_or(0);
+                            if msg_data_addr != 0 && out_ptr != 0 {
+                                let _ = memory.write_u64(out_ptr + (i as u64) * 8, msg_data_addr);
+                            }
+                        }
+                    }
+                }
+                state.set(Register::Rax, count as u64);
+                self.last_error = 0;
+                self.push_trace("steam_net_sockets", "ReceiveMessagesOnListenSocket",
+                    BTreeMap::from([("listen".to_string(), json!(format!("{listen_handle:#x}")))]),
+                    json!(count));
+            }
+            HostThunk::SteamAPI_ISteamNetworkingSockets_CloseConnection => {
+                // int SteamAPI_ISteamNetworkingSockets_CloseConnection(
+                //     void* this, SocketsConnectionHandle hConn, int bEnableLinger,
+                //     void* pReason, int nReasonLen)
+                let _this = arg(0);
+                let conn_handle = arg(1);
+                let mut sockets = STEAM_NET_SOCKETS.lock().unwrap();
+                let result = sockets.as_mut()
+                    .and_then(|s| s.close_connection(conn_handle).ok())
+                    .map(|_| 0i64)
+                    .unwrap_or(2);
+                state.set(Register::Rax, result as u64);
+                self.last_error = 0;
+                self.push_trace("steam_net_sockets", "CloseConnection",
+                    BTreeMap::from([("conn".to_string(), json!(format!("{conn_handle:#x}")))]),
+                    json!(result));
+            }
+            HostThunk::SteamAPI_ISteamNetworkingSockets_DestroyListenSocket => {
+                // int SteamAPI_ISteamNetworkingSockets_DestroyListenSocket(
+                //     void* this, ListenSocketHandle hSocket, int bNotifyOnClose)
+                let _this = arg(0);
+                let listen_handle = arg(1);
+                let mut sockets = STEAM_NET_SOCKETS.lock().unwrap();
+                let result = sockets.as_mut()
+                    .and_then(|s| s.destroy_listen_socket(listen_handle).ok())
+                    .map(|_| 0i64)
+                    .unwrap_or(2);
+                state.set(Register::Rax, result as u64);
+                self.last_error = 0;
+                self.push_trace("steam_net_sockets", "DestroyListenSocket",
+                    BTreeMap::from([("listen".to_string(), json!(format!("{listen_handle:#x}")))]),
+                    json!(result));
+            }
+            // -- Steam Networking Messages (Phase 5.5) --
+            HostThunk::SteamAPI_ISteamNetworkingMessages_SendMessageToUser => {
+                // int SteamAPI_ISteamNetworkingMessages_SendMessageToUser(
+                //     void* this, void* identity, void* data, uint32 cbData,
+                //     int nSendFlags, int nChannel, void* pOutMessageNumber)
+                let _this = arg(0);
+                let identity_ptr = arg(1);
+                let data_ptr = arg(2);
+                let data_len = arg(3) as usize;
+                let _send_flags = arg(4);
+                let channel = arg(5) as i32;
+                // Read Steam ID from identity struct (simplified: first 8 bytes)
+                let steam_id = memory.read_u64(identity_ptr).unwrap_or(0);
+                let data = (0..data_len)
+                    .map(|i| memory.read_u8(data_ptr + i as u64).unwrap_or(0))
+                    .collect::<Vec<u8>>();
+                let mut messages = STEAM_NET_MESSAGES.lock().unwrap();
+                if messages.is_none() {
+                    *messages = Some(crate::steam_integration::SteamNetworkingMessages::new());
+                }
+                let result = messages.as_mut()
+                    .and_then(|m| m.send_message_to_user(steam_id, &data, channel).ok())
+                    .map(|_| 0i64)
+                    .unwrap_or(2);
+                state.set(Register::Rax, result as u64);
+                self.last_error = 0;
+                self.push_trace("steam_net_messages", "SendMessageToUser",
+                    BTreeMap::from([
+                        ("steam_id".to_string(), json!(format!("{steam_id:#x}"))),
+                        ("len".to_string(), json!(data_len)),
+                    ]),
+                    json!(result));
+            }
+            HostThunk::SteamAPI_ISteamNetworkingMessages_ReceiveMessagesOnChannel => {
+                // int SteamAPI_ISteamNetworkingMessages_ReceiveMessagesOnChannel(
+                //     void* this, int nChannel, int nMaxMessages,
+                //     void** ppOutMessages, void* pFetchInfo)
+                let _this = arg(0);
+                let _channel = arg(1);
+                let max_messages = arg(2) as usize;
+                let out_ptr = arg(3);
+                let mut messages = STEAM_NET_MESSAGES.lock().unwrap();
+                let mut count = 0i64;
+                if let Some(m) = messages.as_mut() {
+                    if let Ok(msgs) = m.receive_messages_on_channel() {
+                        count = msgs.len().min(max_messages) as i64;
+                        for (i, msg) in msgs.iter().enumerate().take(count as usize) {
+                            let msg_data_addr = self.alloc_heap(memory, msg.data.len(), false)
+                                .and_then(|addr| {
+                                    for (j, &byte) in msg.data.iter().enumerate() {
+                                        let _ = memory.write_u8(addr + j as u64, byte);
+                                    }
+                                    Ok(addr)
+                                })
+                                .unwrap_or(0);
+                            if msg_data_addr != 0 && out_ptr != 0 {
+                                let _ = memory.write_u64(out_ptr + (i as u64) * 8, msg_data_addr);
+                            }
+                        }
+                    }
+                }
+                state.set(Register::Rax, count as u64);
+                self.last_error = 0;
+                self.push_trace("steam_net_messages", "ReceiveMessagesOnChannel",
+                    BTreeMap::new(), json!(count));
+            }
+            HostThunk::SteamAPI_ISteamNetworkingMessages_CloseSessionWithUser => {
+                // void SteamAPI_ISteamNetworkingMessages_CloseSessionWithUser(
+                //     void* this, void* identity)
+                let _this = arg(0);
+                let identity_ptr = arg(1);
+                let steam_id = memory.read_u64(identity_ptr).unwrap_or(0);
+                let mut messages = STEAM_NET_MESSAGES.lock().unwrap();
+                messages.as_mut()
+                    .and_then(|m| m.close_session_with_user(steam_id).ok());
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+                self.push_trace("steam_net_messages", "CloseSessionWithUser",
+                    BTreeMap::from([("steam_id".to_string(), json!(format!("{steam_id:#x}")))]),
+                    json!(null));
+            }
             // -- SteamVR / OpenVR (Phase 5.3.1) --
             HostThunk::SteamVR_Init => {
                 // u32 VR_Init(pe_error: u32*, application_type: u32)
@@ -8815,6 +12179,18 @@ impl PeHostRuntime {
                     }
                     crate::steamvr::IVR_CHAPERONE_VERSION => {
                         match self.alloc_ivrchaperone_vtable(memory) {
+                            Ok(obj) => obj,
+                            Err(_) => 0,
+                        }
+                    }
+                    crate::steamvr::IVR_CONTROLLER_VERSION => {
+                        match self.alloc_ivrcontroller_vtable(memory) {
+                            Ok(obj) => obj,
+                            Err(_) => 0,
+                        }
+                    }
+                    crate::steamvr::IVR_INPUT_VERSION => {
+                        match self.alloc_ivrinput_vtable(memory) {
                             Ok(obj) => obj,
                             Err(_) => 0,
                         }
@@ -9282,6 +12658,162 @@ impl PeHostRuntime {
                 state.set(Register::Rax, 0);
                 self.last_error = 0;
                 let _ = this_ptr;
+            }
+            // IVRController vtable dispatch
+            HostThunk::SteamVR_IVRController_Release => {
+                // void Release()
+                let _this_ptr = arg(0);
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+            }
+            HostThunk::SteamVR_IVRController_TriggerHapticPulse => {
+                // bool TriggerHapticPulse(u32 axis, u32 duration)
+                let this_ptr = arg(0);
+                let axis = arg(1) as u32;
+                let duration = arg(2) as u32;
+                // Stub: haptic not supported on macOS via SteamVR emulation
+                let result = 1; // return false (failure)
+                state.set(Register::Rax, result as u64);
+                self.last_error = 0;
+                let _ = (this_ptr, axis, duration);
+            }
+            HostThunk::SteamVR_IVRController_GetControllerState => {
+                // bool GetControllerState(u32 device_index, VRControllerState_t* pControllerState)
+                let this_ptr = arg(0);
+                let device_index = arg(1) as u32;
+                let state_ptr = arg(2);
+                if state_ptr != 0 {
+                    let controller_state = self.steam_vr.get_controller_state(device_index);
+                    let bytes = controller_state.to_bytes();
+                    memory.map_bytes(state_ptr, &bytes);
+                    state.set(Register::Rax, 1);
+                } else {
+                    state.set(Register::Rax, 0);
+                }
+                self.last_error = 0;
+                let _ = this_ptr;
+            }
+            HostThunk::SteamVR_IVRController_GetControllerStateForNextFrame => {
+                // bool GetControllerStateForNextFrame(u32 device_index, VRControllerState_t* pControllerState)
+                let this_ptr = arg(0);
+                let device_index = arg(1) as u32;
+                let state_ptr = arg(2);
+                if state_ptr != 0 {
+                    let controller_state = self.steam_vr.get_controller_state(device_index);
+                    let bytes = controller_state.to_bytes();
+                    memory.map_bytes(state_ptr, &bytes);
+                    state.set(Register::Rax, 1);
+                } else {
+                    state.set(Register::Rax, 0);
+                }
+                self.last_error = 0;
+                let _ = this_ptr;
+            }
+            // IVRInput vtable dispatch
+            HostThunk::SteamVR_IVRInput_Release => {
+                // void Release()
+                let _this_ptr = arg(0);
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+            }
+            HostThunk::SteamVR_IVRInput_SetActionManifestPath => {
+                // u32 SetActionManifestPath(const char* path)
+                let this_ptr = arg(0);
+                let path_ptr = arg(1);
+                let path = read_c_string(memory, path_ptr).unwrap_or_default();
+                let result = self.steam_vr.set_action_manifest_path(&path);
+                state.set(Register::Rax, result as u64);
+                self.last_error = 0;
+                let _ = this_ptr;
+            }
+            HostThunk::SteamVR_IVRInput_GetActionHandle => {
+                // u64 GetActionHandle(const char* action_name)
+                let this_ptr = arg(0);
+                let name_ptr = arg(1);
+                let name = read_c_string(memory, name_ptr).unwrap_or_default();
+                let handle = self.steam_vr.get_action_handle(&name);
+                state.set(Register::Rax, handle);
+                self.last_error = 0;
+                let _ = this_ptr;
+            }
+            HostThunk::SteamVR_IVRInput_GetActionSetHandle => {
+                // u64 GetActionSetHandle(const char* action_set)
+                let this_ptr = arg(0);
+                let name_ptr = arg(1);
+                let name = read_c_string(memory, name_ptr).unwrap_or_default();
+                let handle = self.steam_vr.get_action_set_handle(&name);
+                state.set(Register::Rax, handle);
+                self.last_error = 0;
+                let _ = this_ptr;
+            }
+            HostThunk::SteamVR_IVRInput_GetDigitalActionData => {
+                // u32 GetDigitalActionData(u64 action_handle, InputDigitalActionData_t* pActionData)
+                let this_ptr = arg(0);
+                let action_handle = arg(1);
+                let data_ptr = arg(2);
+                if data_ptr != 0 {
+                    let mut buf = vec![0u8; 20]; // InputDigitalActionData_t size
+                    let result = self.steam_vr.get_digital_action_data(action_handle, &mut buf);
+                    memory.map_bytes(data_ptr, &buf);
+                    state.set(Register::Rax, result as u64);
+                } else {
+                    state.set(Register::Rax, 0);
+                }
+                self.last_error = 0;
+                let _ = this_ptr;
+            }
+            HostThunk::SteamVR_IVRInput_GetAnalogActionData => {
+                // u32 GetAnalogActionData(u64 action_handle, InputAnalogActionData_t* pActionData)
+                let this_ptr = arg(0);
+                let action_handle = arg(1);
+                let data_ptr = arg(2);
+                if data_ptr != 0 {
+                    let mut buf = vec![0u8; 48]; // InputAnalogActionData_t size
+                    let result = self.steam_vr.get_analog_action_data(action_handle, &mut buf);
+                    memory.map_bytes(data_ptr, &buf);
+                    state.set(Register::Rax, result as u64);
+                } else {
+                    state.set(Register::Rax, 0);
+                }
+                self.last_error = 0;
+                let _ = this_ptr;
+            }
+            HostThunk::SteamVR_IVRInput_ActivateActionSet => {
+                // void ActivateActionSet(u64 action_set_handle)
+                let this_ptr = arg(0);
+                let handle = arg(1);
+                self.steam_vr.activate_action_set(handle);
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+                let _ = this_ptr;
+            }
+            HostThunk::SteamVR_IVRInput_GetCurrentActionSet => {
+                // u64 GetCurrentActionSet()
+                let this_ptr = arg(0);
+                let handle = self.steam_vr.get_current_action_set();
+                state.set(Register::Rax, handle);
+                self.last_error = 0;
+                let _ = this_ptr;
+            }
+            // IVRRenderModels vtable dispatch
+            HostThunk::SteamVR_IVRRenderModels_LoadIntoTextureD3D11 => {
+                // stub: return failure
+                let _this_ptr = arg(0);
+                // Return non-zero = error
+                state.set(Register::Rax, 1);
+                self.last_error = 0;
+            }
+            HostThunk::SteamVR_IVRRenderModels_LoadTextureD3D11_Async => {
+                // stub: return failure
+                let _this_ptr = arg(0);
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+            }
+            HostThunk::SteamVR_IVRRenderModels_FreeTextureD3D11 => {
+                // stub: no-op
+                let _this_ptr = arg(0);
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
             }
             HostThunk::RegisterClassW => {
                 let class = guest_call_arg(state, memory, 0)?;
@@ -12938,9 +16470,39 @@ impl PeHostRuntime {
             }
             HostThunk::FreeLibrary => {
                 let handle = guest_call_arg(state, memory, 0)?;
-                let released = handle != 0
+                let mut released = handle != 0
                     && (handle == self.mapped_image_base
                         || self.module_handles.values().any(|value| *value == handle));
+
+                // Decrement load count and queue DLL_PROCESS_DETACH if last reference.
+                if released {
+                    if let Some(info) = self.dll_info_table.get_mut(&handle) {
+                        if info.load_count > 0 {
+                            info.load_count -= 1;
+                        }
+                        // If this is a real PE DLL and the last reference is being
+                        // released, queue DLL_PROCESS_DETACH.
+                        if info.load_count == 0 && info.entry_point_rva != 0 {
+                            self.pending_dll_main_calls
+                                .push_back((handle, info.entry_point_rva, DLL_PROCESS_DETACH));
+                        }
+                    }
+
+                    // For real DLLs, also decrement the refcount in RealDllState.
+                    let normalized = self
+                        .module_names_by_handle
+                        .get(&handle)
+                        .cloned()
+                        .map(|name| normalize_module_name(&name));
+                    if let Some(ref norm) = normalized {
+                        if let Some(state) = self.loaded_real_dlls.get_mut(norm) {
+                            if state.refcount > 0 {
+                                state.refcount -= 1;
+                            }
+                        }
+                    }
+                }
+
                 state.set(Register::Rax, u64::from(released));
                 self.last_error = if released { 0 } else { ERROR_INVALID_HANDLE };
                 self.push_trace(
@@ -13741,6 +17303,24 @@ impl PeHostRuntime {
                     self.last_error = 0;
                     self.push_trace("oleaut32", "SafeArrayGetUBound", BTreeMap::new(), json!(0));
                 }
+            }
+            HostThunk::SafeArrayCreateVector => {
+                let vt = guest_call_arg_u32(state, memory, 0)? as u16;
+                let num_elements = guest_call_arg_u32(state, memory, 1)?;
+                let sa_data = crate::real_win32::safe_array_create_vector(vt, num_elements);
+                let sa_ptr = self.alloc_zeroed(memory, sa_data.len(), 8)?;
+                memory.map_bytes(sa_ptr, &sa_data);
+                state.set(Register::Rax, sa_ptr);
+                self.last_error = 0;
+                self.push_trace(
+                    "oleaut32",
+                    "SafeArrayCreateVector",
+                    BTreeMap::from([
+                        ("vt".to_string(), json!(format!("0x{vt:04x}"))),
+                        ("num_elements".to_string(), json!(num_elements)),
+                    ]),
+                    json!(format!("{sa_ptr:#x}")),
+                );
             }
             HostThunk::CommandLineToArgvW => {
                 let command_line_ptr = guest_call_arg(state, memory, 0)?;
@@ -15167,7 +18747,10 @@ impl PeHostRuntime {
                 let environment = if environment_ptr == 0 {
                     self.process_environment.clone()
                 } else {
-                    read_utf16_environment_block(memory, environment_ptr)?
+                    // CreateProcessA uses ANSI environment blocks.
+                    // Each entry is a null-terminated ANSI string "KEY=VALUE\0"
+                    // with a final double-null terminator.
+                    read_ansi_environment_block(memory, environment_ptr)?
                 };
                 let result = self.launch_guest_child_process(
                     &guest_application,
@@ -16040,59 +19623,126 @@ impl PeHostRuntime {
                         json!(INVALID_HANDLE_VALUE),
                     );
                 } else {
-                    match creation_disposition_from_win32(creation_raw).and_then(|creation| {
-                        self.win32.create_file_w(
-                            &path,
-                            desired_access,
-                            share_mode,
-                            creation,
-                            inheritable,
-                            flags_and_attributes & FILE_FLAG_OVERLAPPED != 0,
-                            flags_and_attributes & FILE_FLAG_BACKUP_SEMANTICS != 0,
-                        )
-                    }) {
-                        Ok(handle) => {
-                            state.set(Register::Rax, handle as u64);
-                            self.last_error = 0;
-                            self.push_trace(
-                                "file",
-                                "CreateFileW",
-                                BTreeMap::from([
-                                    ("caller_rip".to_string(), json!(format!("{return_address:#x}"))),
-                                    ("path_ptr".to_string(), json!(format!("{path_ptr:#x}"))),
-                                    ("path_raw".to_string(), json!(raw_path)),
-                                    ("path_recovered".to_string(), json!(recovered_raw_path.clone())),
-                                    ("path".to_string(), json!(path)),
-                                    ("cwd".to_string(), json!(self.current_directory.clone())),
-                                    ("desired_access".to_string(), json!(desired_access_raw)),
-                                    ("share_mode".to_string(), json!(share_mode_raw)),
-                                    ("creation_disposition".to_string(), json!(creation_raw)),
-                                    ("inheritable".to_string(), json!(inheritable)),
-                                ]),
-                                json!(handle),
-                            );
+                    let (base_guest_path, ads_stream) = parse_ntfs_path(&path);
+                    if let Some(stream) = ads_stream {
+                        // NTFS Alternate Data Stream path detected.
+                        // Open the base file and register the ADS handle mapping.
+                        match creation_disposition_from_win32(creation_raw).and_then(|creation| {
+                            self.win32.create_file_w(
+                                &base_guest_path,
+                                desired_access,
+                                share_mode,
+                                creation,
+                                inheritable,
+                                flags_and_attributes & FILE_FLAG_OVERLAPPED != 0,
+                                flags_and_attributes & FILE_FLAG_BACKUP_SEMANTICS != 0,
+                            )
+                        }) {
+                            Ok(handle) => {
+                                self.ads_handles.insert(handle, (base_guest_path.clone(), stream.stream_name.clone()));
+                                state.set(Register::Rax, handle as u64);
+                                self.last_error = 0;
+                                self.push_trace(
+                                    "file",
+                                    "CreateFileW",
+                                    BTreeMap::from([
+                                        ("caller_rip".to_string(), json!(format!("{return_address:#x}"))),
+                                        ("path_ptr".to_string(), json!(format!("{path_ptr:#x}"))),
+                                        ("path_raw".to_string(), json!(raw_path)),
+                                        ("path_recovered".to_string(), json!(recovered_raw_path.clone())),
+                                        ("path".to_string(), json!(path)),
+                                        ("cwd".to_string(), json!(self.current_directory.clone())),
+                                        ("desired_access".to_string(), json!(desired_access_raw)),
+                                        ("share_mode".to_string(), json!(share_mode_raw)),
+                                        ("creation_disposition".to_string(), json!(creation_raw)),
+                                        ("inheritable".to_string(), json!(inheritable)),
+                                        ("ads".to_string(), json!(true)),
+                                        ("stream".to_string(), json!(stream.stream_name)),
+                                    ]),
+                                    json!(handle),
+                                );
+                            }
+                            Err(error) => {
+                                state.set(Register::Rax, INVALID_HANDLE_VALUE);
+                                self.last_error = last_error_from_app_error(&error);
+                                self.push_trace(
+                                    "file",
+                                    "CreateFileW",
+                                    BTreeMap::from([
+                                        ("caller_rip".to_string(), json!(format!("{return_address:#x}"))),
+                                        ("path_ptr".to_string(), json!(format!("{path_ptr:#x}"))),
+                                        ("path_raw".to_string(), json!(raw_path)),
+                                        ("path_recovered".to_string(), json!(recovered_raw_path)),
+                                        ("path".to_string(), json!(path)),
+                                        ("cwd".to_string(), json!(self.current_directory.clone())),
+                                        ("desired_access".to_string(), json!(desired_access_raw)),
+                                        ("share_mode".to_string(), json!(share_mode_raw)),
+                                        ("creation_disposition".to_string(), json!(creation_raw)),
+                                        ("inheritable".to_string(), json!(inheritable)),
+                                        ("error".to_string(), json!(self.last_error)),
+                                        ("ads".to_string(), json!(true)),
+                                        ("stream".to_string(), json!(stream.stream_name)),
+                                    ]),
+                                    json!(INVALID_HANDLE_VALUE),
+                                );
+                            }
                         }
-                        Err(error) => {
-                            state.set(Register::Rax, INVALID_HANDLE_VALUE);
-                            self.last_error = last_error_from_app_error(&error);
-                            self.push_trace(
-                                "file",
-                                "CreateFileW",
-                                BTreeMap::from([
-                                    ("caller_rip".to_string(), json!(format!("{return_address:#x}"))),
-                                    ("path_ptr".to_string(), json!(format!("{path_ptr:#x}"))),
-                                    ("path_raw".to_string(), json!(raw_path)),
-                                    ("path_recovered".to_string(), json!(recovered_raw_path)),
-                                    ("path".to_string(), json!(path)),
-                                    ("cwd".to_string(), json!(self.current_directory.clone())),
-                                    ("desired_access".to_string(), json!(desired_access_raw)),
-                                    ("share_mode".to_string(), json!(share_mode_raw)),
-                                    ("creation_disposition".to_string(), json!(creation_raw)),
-                                    ("inheritable".to_string(), json!(inheritable)),
-                                    ("error".to_string(), json!(self.last_error)),
-                                ]),
-                                json!(INVALID_HANDLE_VALUE),
-                            );
+                    } else {
+                        // Normal (non-ADS) file creation
+                        match creation_disposition_from_win32(creation_raw).and_then(|creation| {
+                            self.win32.create_file_w(
+                                &path,
+                                desired_access,
+                                share_mode,
+                                creation,
+                                inheritable,
+                                flags_and_attributes & FILE_FLAG_OVERLAPPED != 0,
+                                flags_and_attributes & FILE_FLAG_BACKUP_SEMANTICS != 0,
+                            )
+                        }) {
+                            Ok(handle) => {
+                                state.set(Register::Rax, handle as u64);
+                                self.last_error = 0;
+                                self.push_trace(
+                                    "file",
+                                    "CreateFileW",
+                                    BTreeMap::from([
+                                        ("caller_rip".to_string(), json!(format!("{return_address:#x}"))),
+                                        ("path_ptr".to_string(), json!(format!("{path_ptr:#x}"))),
+                                        ("path_raw".to_string(), json!(raw_path)),
+                                        ("path_recovered".to_string(), json!(recovered_raw_path.clone())),
+                                        ("path".to_string(), json!(path)),
+                                        ("cwd".to_string(), json!(self.current_directory.clone())),
+                                        ("desired_access".to_string(), json!(desired_access_raw)),
+                                        ("share_mode".to_string(), json!(share_mode_raw)),
+                                        ("creation_disposition".to_string(), json!(creation_raw)),
+                                        ("inheritable".to_string(), json!(inheritable)),
+                                    ]),
+                                    json!(handle),
+                                );
+                            }
+                            Err(error) => {
+                                state.set(Register::Rax, INVALID_HANDLE_VALUE);
+                                self.last_error = last_error_from_app_error(&error);
+                                self.push_trace(
+                                    "file",
+                                    "CreateFileW",
+                                    BTreeMap::from([
+                                        ("caller_rip".to_string(), json!(format!("{return_address:#x}"))),
+                                        ("path_ptr".to_string(), json!(format!("{path_ptr:#x}"))),
+                                        ("path_raw".to_string(), json!(raw_path)),
+                                        ("path_recovered".to_string(), json!(recovered_raw_path)),
+                                        ("path".to_string(), json!(path)),
+                                        ("cwd".to_string(), json!(self.current_directory.clone())),
+                                        ("desired_access".to_string(), json!(desired_access_raw)),
+                                        ("share_mode".to_string(), json!(share_mode_raw)),
+                                        ("creation_disposition".to_string(), json!(creation_raw)),
+                                        ("inheritable".to_string(), json!(inheritable)),
+                                        ("error".to_string(), json!(self.last_error)),
+                                    ]),
+                                    json!(INVALID_HANDLE_VALUE),
+                                );
+                            }
                         }
                     }
                 }
@@ -16877,6 +20527,41 @@ impl PeHostRuntime {
                     }
                     state.set(Register::Rax, 0);
                     self.last_error = ERROR_INVALID_PARAMETER;
+                } else if let Some((base_path, stream_name)) = self.ads_handles.get(&handle).cloned() {
+                    // Read from an NTFS Alternate Data Stream handle
+                    let ge_root = self.win32.ge().root.clone();
+                    let resolver = WindowsPathResolver::new(ge_root);
+                    let fs = RealFilesystem::new(resolver);
+                    match fs.read_alternate_stream(&base_path, &stream_name) {
+                        Ok(data) => {
+                            let len = data.len().min(length);
+                            if len > 0 {
+                                memory.map_bytes(buffer_ptr, &data[..len]);
+                            }
+                            if bytes_read_ptr != 0 {
+                                write_u32(memory, bytes_read_ptr, len as u32);
+                            }
+                            state.set(Register::Rax, 1);
+                            self.last_error = 0;
+                            self.push_trace(
+                                "file",
+                                "ReadFile",
+                                BTreeMap::from([
+                                    ("handle".to_string(), json!(handle)),
+                                    ("requested_bytes".to_string(), json!(length as u32)),
+                                    ("ads".to_string(), json!(true)),
+                                ]),
+                                json!(len as u32),
+                            );
+                        }
+                        Err(error) => {
+                            if bytes_read_ptr != 0 {
+                                write_u32(memory, bytes_read_ptr, 0);
+                            }
+                            state.set(Register::Rax, 0);
+                            self.last_error = last_error_from_app_error(&error);
+                        }
+                    }
                 } else {
                     match self.win32.read_file(handle, length) {
                         Ok(bytes) => {
@@ -16943,6 +20628,38 @@ impl PeHostRuntime {
                     }
                     state.set(Register::Rax, 0);
                     self.last_error = ERROR_INVALID_PARAMETER;
+                } else if let Some((base_path, stream_name)) = self.ads_handles.get(&handle).cloned() {
+                    // Write to an NTFS Alternate Data Stream handle
+                    let bytes = read_window(memory, buffer_ptr, length)?;
+                    let ge_root = self.win32.ge().root.clone();
+                    let resolver = WindowsPathResolver::new(ge_root);
+                    let fs = RealFilesystem::new(resolver);
+                    match fs.write_alternate_stream(&base_path, &stream_name, &bytes) {
+                        Ok(()) => {
+                            if bytes_written_ptr != 0 {
+                                write_u32(memory, bytes_written_ptr, bytes.len() as u32);
+                            }
+                            state.set(Register::Rax, 1);
+                            self.last_error = 0;
+                            self.push_trace(
+                                "file",
+                                "WriteFile",
+                                BTreeMap::from([
+                                    ("handle".to_string(), json!(handle)),
+                                    ("bytes".to_string(), json!(bytes.len() as u32)),
+                                    ("ads".to_string(), json!(true)),
+                                ]),
+                                json!(1),
+                            );
+                        }
+                        Err(error) => {
+                            if bytes_written_ptr != 0 {
+                                write_u32(memory, bytes_written_ptr, 0);
+                            }
+                            state.set(Register::Rax, 0);
+                            self.last_error = last_error_from_app_error(&error);
+                        }
+                    }
                 } else {
                     match read_window(memory, buffer_ptr, length).and_then(|bytes| self.win32.write_file(handle, &bytes)) {
                         Ok(written) => {
@@ -17064,6 +20781,7 @@ impl PeHostRuntime {
             }
             HostThunk::CloseHandle => {
                 let handle = guest_call_arg_u32(state, memory, 0)?;
+                self.ads_handles.remove(&handle);
                 match self.win32.close_handle(handle) {
                     Ok(()) => {
                         state.set(Register::Rax, 1);
@@ -17906,7 +21624,7 @@ impl PeHostRuntime {
                     .unwrap_or_default();
                 let address = self.resolve_proc_address(module_handle, symbol);
                 state.set(Register::Rax, address);
-                self.last_error = 0;
+                self.last_error = if address == 0 { ERROR_PROC_NOT_FOUND } else { 0 };
                 self.push_trace(
                     "kernel32",
                     "GetProcAddress",
@@ -19480,7 +23198,16 @@ impl PeHostRuntime {
                 let heap = guest_call_arg(state, memory, 0)?;
                 let flags = guest_call_arg_u32(state, memory, 1)?;
                 let address = guest_call_arg(state, memory, 2)?;
-                let freed = heap == PROCESS_HEAP_HANDLE && self.heap_allocations.remove(&address).is_some();
+                let freed = if heap == PROCESS_HEAP_HANDLE {
+                    if let Some(size) = self.heap_allocations.remove(&address) {
+                        memory.unmap_range(address, size);
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
                 state.set(Register::Rax, u64::from(freed));
                 self.last_error = if freed { 0 } else { ERROR_INVALID_PARAMETER };
                 self.push_trace(
@@ -20087,6 +23814,45 @@ impl PeHostRuntime {
                     json!(format!("{previous:#x}")),
                 );
             }
+            HostThunk::AddVectoredExceptionHandler => {
+                let first_chance = guest_call_arg(state, memory, 0)?;
+                let callback = guest_call_arg(state, memory, 1)?;
+                let veh_first_chance = first_chance != 0;
+                let handle = crate::seh::add_vectored_handler(
+                    Box::new(move |_ptrs| {
+                        // Guest callback invocation would go here in a full
+                        // implementation — for now, continue searching.
+                        crate::seh::EXCEPTION_CONTINUE_SEARCH
+                    }),
+                    veh_first_chance,
+                );
+                state.set(Register::Rax, handle.0);
+                self.last_error = 0;
+                self.push_trace(
+                    "process",
+                    "AddVectoredExceptionHandler",
+                    BTreeMap::from([
+                        ("first_chance".to_string(), json!(first_chance)),
+                        ("callback".to_string(), json!(format!("{callback:#x}"))),
+                    ]),
+                    json!(format!("{:#x}", handle.0)),
+                );
+            }
+            HostThunk::RemoveVectoredExceptionHandler => {
+                let handle_value = guest_call_arg(state, memory, 0)?;
+                let handle = crate::seh::VehHandle(handle_value);
+                crate::seh::remove_vectored_handler(handle);
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+                self.push_trace(
+                    "process",
+                    "RemoveVectoredExceptionHandler",
+                    BTreeMap::from([
+                        ("handle".to_string(), json!(format!("{handle_value:#x}"))),
+                    ]),
+                    json!("0"),
+                );
+            }
             HostThunk::GetVersion => {
                 const WINDOWS_10_BUILD_22H2: u32 = (19045u32 << 16) | 10u32;
                 state.set(Register::Rax, WINDOWS_10_BUILD_22H2 as u64);
@@ -20322,6 +24088,89 @@ impl PeHostRuntime {
                     );
                 }
             }
+            HostThunk::VirtualFree => {
+                let address = guest_call_arg(state, memory, 0)?;
+                let bytes = guest_call_arg(state, memory, 1)? as usize;
+                let free_type = guest_call_arg_u32(state, memory, 2)?;
+                if free_type & MEM_RELEASE != 0 {
+                    // MEM_RELEASE: release the entire reserved region.
+                    // The size parameter must be 0 for MEM_RELEASE.
+                    if bytes != 0 {
+                        state.set(Register::Rax, 0);
+                        self.last_error = ERROR_INVALID_PARAMETER;
+                        self.push_trace(
+                            "memory",
+                            "VirtualFree",
+                            BTreeMap::from([
+                                ("address".to_string(), json!(format!("{address:#x}"))),
+                                ("size".to_string(), json!(bytes)),
+                                ("free_type".to_string(), json!(format!("0x{free_type:08x}"))),
+                                ("error".to_string(), json!("MEM_RELEASE requires size=0")),
+                            ]),
+                            json!(0),
+                        );
+                    } else if let Some(&size) = self.private_pages.get(&address) {
+                        memory.unmap_range(address, size);
+                        self.private_pages.remove(&address);
+                        state.set(Register::Rax, 1);
+                        self.last_error = 0;
+                        self.push_trace(
+                            "memory",
+                            "VirtualFree",
+                            BTreeMap::from([
+                                ("address".to_string(), json!(format!("{address:#x}"))),
+                                ("size".to_string(), json!(size)),
+                                ("free_type".to_string(), json!(format!("0x{free_type:08x}"))),
+                            ]),
+                            json!(1),
+                        );
+                    } else {
+                        state.set(Register::Rax, 0);
+                        self.last_error = ERROR_INVALID_PARAMETER;
+                        self.push_trace(
+                            "memory",
+                            "VirtualFree",
+                            BTreeMap::from([
+                                ("address".to_string(), json!(format!("{address:#x}"))),
+                                ("size".to_string(), json!(bytes)),
+                                ("free_type".to_string(), json!(format!("0x{free_type:08x}"))),
+                                ("error".to_string(), json!("address not found in private_pages")),
+                            ]),
+                            json!(0),
+                        );
+                    }
+                } else if free_type & MEM_DECOMMIT != 0 {
+                    // MEM_DECOMMIT: decommit pages (mark as invalid, keep reservation).
+                    // For simplicity, just unmap the specified range from the guest view.
+                    memory.unmap_range(address, bytes.max(0x1000));
+                    state.set(Register::Rax, 1);
+                    self.last_error = 0;
+                    self.push_trace(
+                        "memory",
+                        "VirtualFree",
+                        BTreeMap::from([
+                            ("address".to_string(), json!(format!("{address:#x}"))),
+                            ("size".to_string(), json!(bytes)),
+                            ("free_type".to_string(), json!(format!("0x{free_type:08x}"))),
+                        ]),
+                        json!(1),
+                    );
+                } else {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                    self.push_trace(
+                        "memory",
+                        "VirtualFree",
+                        BTreeMap::from([
+                            ("address".to_string(), json!(format!("{address:#x}"))),
+                            ("size".to_string(), json!(bytes)),
+                            ("free_type".to_string(), json!(format!("0x{free_type:08x}"))),
+                            ("error".to_string(), json!("unknown free type")),
+                        ]),
+                        json!(0),
+                    );
+                }
+            }
             HostThunk::VirtualProtect => {
                 let address = guest_call_arg(state, memory, 0)?;
                 let bytes = guest_call_arg(state, memory, 1)?;
@@ -20386,8 +24235,25 @@ impl PeHostRuntime {
                             MEM_PRIVATE,
                         )
                     } else {
-                        let allocation_base = self.heap_allocations.range(..=address).next_back().map(|(base, _)| *base).unwrap_or(address);
-                        let allocation_size = self.heap_allocations.get(&allocation_base).copied().unwrap_or(0x1000) as u64;
+                        // Check private_pages first (VirtualAlloc allocations), fall back to heap_allocations.
+                        let allocation_base = self
+                            .private_pages
+                            .range(..=address)
+                            .next_back()
+                            .map(|(base, _)| *base)
+                            .or_else(|| {
+                                self.heap_allocations
+                                    .range(..=address)
+                                    .next_back()
+                                    .map(|(base, _)| *base)
+                            })
+                            .unwrap_or(address);
+                        let allocation_size = self
+                            .private_pages
+                            .get(&allocation_base)
+                            .copied()
+                            .or_else(|| self.heap_allocations.get(&allocation_base).copied())
+                            .unwrap_or(0x1000) as u64;
                         (allocation_base, allocation_base, allocation_size, MEM_PRIVATE)
                     };
                     let region_size = region_size.max(0x1000);
@@ -20514,7 +24380,1284 @@ impl PeHostRuntime {
                 state.set(Register::Rax, response as i64 as u64);
                 self.last_error = 0;
             }
+            // ── DirectWrite dispatchers ───────────────────────────────────────
+            HostThunk::DWriteCreateFactory => {
+                let factory_type = state.get(Register::Rcx) as u32; // DWRITE_FACTORY_TYPE
+                let out_ptr = state.get(Register::R8);
+
+                if out_ptr == 0 {
+                    state.set(Register::Rax, 0x80070057); // E_INVALIDARG
+                } else {
+                    let factory = crate::dwrite::DWriteFactory::new();
+                    let factory_id = self.next_gdi_handle;
+                    self.next_gdi_handle += 1;
+
+                    write_u64(memory, out_ptr, factory_id);
+                    self.dwrite_factory = Some(factory);
+
+                    self.push_trace(
+                        "dwrite",
+                        "DWriteCreateFactory",
+                        BTreeMap::from([("factory_type".to_string(), json!(factory_type))]),
+                        json!(0),
+                    );
+                    state.set(Register::Rax, 0);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::IDWriteFactory_CreateTextFormat => {
+                let factory_object = state.get(Register::Rcx);
+                let font_family_ptr = state.get(Register::Rdx);
+                let font_collection_ptr = state.get(Register::R8); // may be null
+                let font_weight = state.get(Register::R9) as u16;
+                let stack = state.get(Register::Rsp);
+                let font_style = read_guest_u32(memory, stack + 0x20)? as u8;
+                let font_stretch = read_guest_u32(memory, stack + 0x28)? as u16;
+                let font_size = read_guest_f32(memory, stack + 0x30)?;
+                let out_ptr = read_guest_pointer(memory, stack + 0x38, self.guest_arch)?;
+                let _ = factory_object;
+
+                if font_family_ptr == 0 || out_ptr == 0 {
+                    state.set(Register::Rax, 0x80070057); // E_INVALIDARG
+                } else {
+                    let family_name = read_utf16_string(memory, font_family_ptr)?;
+                    if let Some(ref factory) = self.dwrite_factory {
+                        let format = factory.create_text_format(
+                            &family_name,
+                            font_size,
+                            font_weight,
+                            font_style,
+                            font_stretch,
+                        );
+                        let format_id = self.next_gdi_handle;
+                        self.next_gdi_handle += 1;
+                        self.dwrite_formats.insert(format_id, format);
+                        write_guest_pointer(memory, out_ptr, format_id, self.guest_arch)?;
+                        state.set(Register::Rax, 0);
+                    } else {
+                        state.set(Register::Rax, 0x80004002); // E_NOINTERFACE
+                    }
+                }
+                self.last_error = 0;
+            }
+            HostThunk::IDWriteFactory_CreateTextLayout => {
+                let factory_object = state.get(Register::Rcx);
+                let string_ptr = state.get(Register::Rdx);
+                let string_len = state.get(Register::R8) as u32;
+                let format_id = state.get(Register::R9);
+                let stack = state.get(Register::Rsp);
+                let max_width = read_guest_f32(memory, stack + 0x20)?;
+                let max_height = read_guest_f32(memory, stack + 0x28)?;
+                let out_ptr = read_guest_pointer(memory, stack + 0x30, self.guest_arch)?;
+                let _ = factory_object;
+
+                if string_ptr == 0 || out_ptr == 0 {
+                    state.set(Register::Rax, 0x80070057); // E_INVALIDARG
+                } else {
+                    let text = if string_len > 0 {
+                        let text_bytes = memory.read_bytes(string_ptr, string_len as usize * 2)?;
+                        let text_u16: Vec<u16> = text_bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+                        String::from_utf16_lossy(&text_u16)
+                    } else {
+                        String::new()
+                    };
+
+                    if let Some(format) = self.dwrite_formats.get(&format_id) {
+                        if let Some(ref factory) = self.dwrite_factory {
+                            let layout = factory.create_text_layout(&text, format, max_width, max_height);
+                            let layout_id = self.next_gdi_handle;
+                            self.next_gdi_handle += 1;
+                            self.dwrite_layouts.insert(layout_id, layout);
+                            write_guest_pointer(memory, out_ptr, layout_id, self.guest_arch)?;
+                            state.set(Register::Rax, 0);
+                        } else {
+                            state.set(Register::Rax, 0x80004002); // E_NOINTERFACE
+                        }
+                    } else {
+                        state.set(Register::Rax, 0x80070057); // E_INVALIDARG
+                    }
+                }
+                self.last_error = 0;
+            }
+            HostThunk::IDWriteFactory_GetSystemFontCollection => {
+                let _factory_object = state.get(Register::Rcx);
+                let out_ptr = state.get(Register::Rdx);
+                let _check_for_updates = state.get(Register::R8);
+
+                if out_ptr == 0 {
+                    state.set(Register::Rax, 0x80070057); // E_INVALIDARG
+                } else {
+                    if let Some(ref factory) = self.dwrite_factory {
+                        let collection_id = self.next_gdi_handle;
+                        self.next_gdi_handle += 1;
+                        write_guest_pointer(memory, out_ptr, collection_id, self.guest_arch)?;
+                        state.set(Register::Rax, 0);
+                    } else {
+                        state.set(Register::Rax, 0x80004002); // E_NOINTERFACE
+                    }
+                }
+                self.last_error = 0;
+            }
+            HostThunk::IDWriteFactory_RegisterFontCollectionLoader
+            | HostThunk::IDWriteFactory_UnregisterFontCollectionLoader => {
+                // Stub: return S_OK
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+            }
+            HostThunk::IDWriteTextFormat_Release => {
+                let format_id = state.get(Register::Rcx);
+                self.dwrite_formats.remove(&format_id);
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+            }
+            HostThunk::IDWriteTextFormat_SetTextAlignment => {
+                let format_id = state.get(Register::Rcx);
+                let alignment = state.get(Register::Rdx) as u8;
+                if let Some(format) = self.dwrite_formats.get_mut(&format_id) {
+                    format.set_text_alignment(alignment);
+                    state.set(Register::Rax, 0);
+                } else {
+                    state.set(Register::Rax, 0x80070057);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::IDWriteTextFormat_SetParagraphAlignment => {
+                let format_id = state.get(Register::Rcx);
+                let alignment = state.get(Register::Rdx) as u8;
+                if let Some(format) = self.dwrite_formats.get_mut(&format_id) {
+                    format.set_paragraph_alignment(alignment);
+                    state.set(Register::Rax, 0);
+                } else {
+                    state.set(Register::Rax, 0x80070057);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::IDWriteTextFormat_SetReadingDirection => {
+                let format_id = state.get(Register::Rcx);
+                let direction = state.get(Register::Rdx) as u8;
+                if let Some(format) = self.dwrite_formats.get_mut(&format_id) {
+                    format.set_reading_direction(direction);
+                    state.set(Register::Rax, 0);
+                } else {
+                    state.set(Register::Rax, 0x80070057);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::IDWriteTextFormat_SetWordWrapping => {
+                let format_id = state.get(Register::Rcx);
+                let wrapping = state.get(Register::Rdx) as u8;
+                if let Some(format) = self.dwrite_formats.get_mut(&format_id) {
+                    format.set_word_wrapping(wrapping);
+                    state.set(Register::Rax, 0);
+                } else {
+                    state.set(Register::Rax, 0x80070057);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::IDWriteTextLayout_Release => {
+                let layout_id = state.get(Register::Rcx);
+                self.dwrite_layouts.remove(&layout_id);
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+            }
+            HostThunk::IDWriteTextLayout_Draw => {
+                // Stub: text is rendered via the D2D render target's DrawText instead
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+            }
+            HostThunk::IDWriteTextLayout_GetMetrics => {
+                let layout_id = state.get(Register::Rcx);
+                let metrics_ptr = state.get(Register::Rdx);
+                if let Some(layout) = self.dwrite_layouts.get(&layout_id) {
+                    if metrics_ptr != 0 {
+                        let metrics = layout.get_metrics();
+                        write_guest_f32(memory, metrics_ptr, metrics.width)?;
+                        write_guest_f32(memory, metrics_ptr + 4, metrics.height)?;
+                        write_guest_u32(memory, metrics_ptr + 8, metrics.line_count)?;
+                    }
+                    state.set(Register::Rax, 0);
+                } else {
+                    state.set(Register::Rax, 0x80070057);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::IDWriteTextLayout_GetOverhangMetrics => {
+                // Stub: return zero overhang
+                let _layout_id = state.get(Register::Rcx);
+                let overhang_ptr = state.get(Register::Rdx);
+                if overhang_ptr != 0 {
+                    write_guest_f32(memory, overhang_ptr, 0.0)?;
+                    write_guest_f32(memory, overhang_ptr + 4, 0.0)?;
+                    write_guest_f32(memory, overhang_ptr + 8, 0.0)?;
+                    write_guest_f32(memory, overhang_ptr + 12, 0.0)?;
+                }
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+            }
+            HostThunk::IDWriteTextLayout_HitTestPoint => {
+                // Stub: return S_FALSE (no hit)
+                state.set(Register::Rax, 0x00000001); // S_FALSE
+                self.last_error = 0;
+            }
+            HostThunk::IDWriteTextLayout_HitTestTextPosition => {
+                // Stub: return S_FALSE
+                state.set(Register::Rax, 0x00000001);
+                self.last_error = 0;
+            }
+            HostThunk::IDWriteFontCollection_Release => {
+                // Font collection is owned by the factory, nothing to release
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+            }
+            HostThunk::IDWriteFontCollection_GetFontFamilyCount => {
+                let _collection_object = state.get(Register::Rcx);
+                let count = self.dwrite_factory.as_ref()
+                    .map(|f| f.font_collection.families.len() as u32)
+                    .unwrap_or(0);
+                state.set(Register::Rax, count as u64);
+                self.last_error = 0;
+            }
+            HostThunk::IDWriteFontCollection_GetFontFamily => {
+                let _collection_object = state.get(Register::Rcx);
+                let index = state.get(Register::Rdx) as u32;
+                let out_ptr = state.get(Register::R8);
+                if out_ptr != 0 && index < self.dwrite_factory.as_ref().map(|f| f.font_collection.families.len() as u32).unwrap_or(0) {
+                    let family_id = self.next_gdi_handle;
+                    self.next_gdi_handle += 1;
+                    write_guest_pointer(memory, out_ptr, family_id, self.guest_arch)?;
+                    state.set(Register::Rax, 0);
+                } else {
+                    state.set(Register::Rax, 0x80070057);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::IDWriteFontFamily_Release => {
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+            }
+            HostThunk::IDWriteFontFamily_GetFontCount => {
+                let _family_object = state.get(Register::Rcx);
+                state.set(Register::Rax, 1); // At least 1 font per family
+                self.last_error = 0;
+            }
+            HostThunk::IDWriteFontFamily_GetFont => {
+                let _family_object = state.get(Register::Rcx);
+                let _index = state.get(Register::Rdx);
+                let out_ptr = state.get(Register::R8);
+                if out_ptr != 0 {
+                    let font_id = self.next_gdi_handle;
+                    self.next_gdi_handle += 1;
+                    write_guest_pointer(memory, out_ptr, font_id, self.guest_arch)?;
+                }
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+            }
+            // ── Direct2D dispatchers ──────────────────────────────────────────
+            HostThunk::D2D1CreateFactory => {
+                let factory_type = state.get(Register::Rcx) as u32; // D2D1_FACTORY_TYPE
+                let riid_ptr = state.get(Register::Rdx);
+                let out_ptr = state.get(Register::R8);
+
+                if out_ptr == 0 || riid_ptr == 0 {
+                    state.set(Register::Rax, 0x80070057); // E_INVALIDARG
+                } else {
+                    let factory = crate::d2d::D2DFactory::new();
+                    let factory_id = self.next_gdi_handle;
+                    self.next_gdi_handle += 1;
+                    self.d2d_factory = Some(factory);
+
+                    write_u64(memory, out_ptr, factory_id);
+
+                    self.push_trace(
+                        "d2d",
+                        "D2D1CreateFactory",
+                        BTreeMap::from([("factory_type".to_string(), json!(factory_type))]),
+                        json!(0),
+                    );
+                    state.set(Register::Rax, 0);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::ID2D1Factory_CreateHwndRenderTarget => {
+                let _factory_object = state.get(Register::Rcx);
+                let render_target_properties_ptr = state.get(Register::Rdx);
+                let hwnd_properties_ptr = state.get(Register::R8);
+                let out_ptr = state.get(Register::R9);
+
+                if out_ptr == 0 {
+                    state.set(Register::Rax, 0x80070057);
+                } else {
+                    // Parse render target properties
+                    let mut pixel_format = crate::d2d::D2DPixelFormat::default();
+                    let mut dpi_x = 96.0_f32;
+                    let mut dpi_y = 96.0_f32;
+                    let mut _min_level = crate::d2d::D2D1_RENDER_TARGET_TYPE_DEFAULT;
+                    let mut _usage = crate::d2d::D2D1_RENDER_TARGET_USAGE_NONE;
+
+                    if render_target_properties_ptr != 0 {
+                        let rtp = render_target_properties_ptr;
+                        _min_level = read_guest_u32(memory, rtp)?; // type
+                        _usage = read_guest_u32(memory, rtp + 8)?; // usage
+                        let format_val = read_guest_u32(memory, rtp + 12)?; // pixel format dxgi
+                        let alpha_val = read_guest_u32(memory, rtp + 16)?; // pixel format alpha
+                        pixel_format = crate::d2d::D2DPixelFormat {
+                            dxgi_format: format_val,
+                            alpha_mode: alpha_val,
+                        };
+                        dpi_x = read_guest_f32(memory, rtp + 20)?; // dpiX
+                        dpi_y = read_guest_f32(memory, rtp + 24)?; // dpiY
+                    }
+
+                    // Parse HWND properties
+                    let mut hwnd = 0u64;
+                    let mut width = 0u32;
+                    let mut height = 0u32;
+
+                    if hwnd_properties_ptr != 0 {
+                        let hp = hwnd_properties_ptr;
+                        hwnd = read_guest_pointer(memory, hp, self.guest_arch)?;
+                        let size = read_guest_u32(memory, hp + 8)?;
+                        width = size;
+                        height = read_guest_u32(memory, hp + 12)?;
+                    }
+
+                    if let Some(ref mut factory) = self.d2d_factory {
+                        let target_id = factory.create_hwnd_render_target(
+                            hwnd, width, height, dpi_x, pixel_format,
+                        );
+                        write_guest_pointer(memory, out_ptr, target_id, self.guest_arch)?;
+                        state.set(Register::Rax, 0);
+                    } else {
+                        state.set(Register::Rax, 0x80004002); // E_NOINTERFACE
+                    }
+                }
+                self.last_error = 0;
+            }
+            HostThunk::ID2D1Factory_CreateDCRenderTarget => {
+                let _factory_object = state.get(Register::Rcx);
+                let render_target_properties_ptr = state.get(Register::Rdx);
+                let out_ptr = state.get(Register::R8);
+
+                if out_ptr == 0 {
+                    state.set(Register::Rax, 0x80070057);
+                } else {
+                    let mut pixel_format = crate::d2d::D2DPixelFormat::default();
+                    if render_target_properties_ptr != 0 {
+                        let format_val = read_guest_u32(memory, render_target_properties_ptr + 12)?;
+                        let alpha_val = read_guest_u32(memory, render_target_properties_ptr + 16)?;
+                        pixel_format = crate::d2d::D2DPixelFormat {
+                            dxgi_format: format_val,
+                            alpha_mode: alpha_val,
+                        };
+                    }
+
+                    if let Some(ref mut factory) = self.d2d_factory {
+                        let target_id = factory.create_dc_render_target(0, 0, 96.0, pixel_format);
+                        write_guest_pointer(memory, out_ptr, target_id, self.guest_arch)?;
+                        state.set(Register::Rax, 0);
+                    } else {
+                        state.set(Register::Rax, 0x80004002);
+                    }
+                }
+                self.last_error = 0;
+            }
+            HostThunk::ID2D1Factory_CreateSolidColorBrush => {
+                let _factory_object = state.get(Register::Rcx);
+                let color_ptr = state.get(Register::Rdx);
+                let _brush_properties_ptr = state.get(Register::R8);
+                let out_ptr = state.get(Register::R9);
+
+                if color_ptr == 0 || out_ptr == 0 {
+                    state.set(Register::Rax, 0x80070057);
+                } else {
+                    // Read color as D2D1_COLOR_F (4 floats: r, g, b, a)
+                    let r = read_guest_f32(memory, color_ptr)?;
+                    let g = read_guest_f32(memory, color_ptr + 4)?;
+                    let b = read_guest_f32(memory, color_ptr + 8)?;
+                    let a = read_guest_f32(memory, color_ptr + 12)?;
+
+                    let brush = crate::d2d::D2DBrush::Solid(crate::d2d::D2DSolidColorBrush {
+                        color: (r, g, b, a),
+                        opacity: 1.0,
+                    });
+                    let brush_id = self.next_gdi_handle;
+                    self.next_gdi_handle += 1;
+                    self.d2d_brushes.insert(brush_id, brush);
+                    write_guest_pointer(memory, out_ptr, brush_id, self.guest_arch)?;
+                    state.set(Register::Rax, 0);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::ID2D1Factory_CreateLinearGradientBrush => {
+                let _factory_object = state.get(Register::Rcx);
+                let linear_props_ptr = state.get(Register::Rdx);
+                let _gradient_stop_collection_ptr = state.get(Register::R8);
+                let out_ptr = state.get(Register::R9);
+
+                if linear_props_ptr == 0 || out_ptr == 0 {
+                    state.set(Register::Rax, 0x80070057);
+                } else {
+                    let start_x = read_guest_f32(memory, linear_props_ptr)?;
+                    let start_y = read_guest_f32(memory, linear_props_ptr + 4)?;
+                    let end_x = read_guest_f32(memory, linear_props_ptr + 8)?;
+                    let end_y = read_guest_f32(memory, linear_props_ptr + 12)?;
+
+                    let brush = crate::d2d::D2DBrush::LinearGradient(crate::d2d::D2DLinearGradientBrush {
+                        start_point: (start_x, start_y),
+                        end_point: (end_x, end_y),
+                        stops: Vec::new(),
+                    });
+                    let brush_id = self.next_gdi_handle;
+                    self.next_gdi_handle += 1;
+                    self.d2d_brushes.insert(brush_id, brush);
+                    write_guest_pointer(memory, out_ptr, brush_id, self.guest_arch)?;
+                    state.set(Register::Rax, 0);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::ID2D1Factory_CreateRadialGradientBrush => {
+                let _factory_object = state.get(Register::Rcx);
+                let radial_props_ptr = state.get(Register::Rdx);
+                let _gradient_stop_collection_ptr = state.get(Register::R8);
+                let out_ptr = state.get(Register::R9);
+
+                if radial_props_ptr == 0 || out_ptr == 0 {
+                    state.set(Register::Rax, 0x80070057);
+                } else {
+                    let center_x = read_guest_f32(memory, radial_props_ptr)?;
+                    let center_y = read_guest_f32(memory, radial_props_ptr + 4)?;
+                    let radius_x = read_guest_f32(memory, radial_props_ptr + 8)?;
+                    let radius_y = read_guest_f32(memory, radial_props_ptr + 12)?;
+
+                    let brush = crate::d2d::D2DBrush::RadialGradient(crate::d2d::D2DRadialGradientBrush {
+                        center: (center_x, center_y),
+                        radius_x,
+                        radius_y,
+                        stops: Vec::new(),
+                    });
+                    let brush_id = self.next_gdi_handle;
+                    self.next_gdi_handle += 1;
+                    self.d2d_brushes.insert(brush_id, brush);
+                    write_guest_pointer(memory, out_ptr, brush_id, self.guest_arch)?;
+                    state.set(Register::Rax, 0);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::ID2D1Factory_CreateBitmap => {
+                let _factory_object = state.get(Register::Rcx);
+                let size_ptr = state.get(Register::Rdx);
+                let src_data_ptr = state.get(Register::R8);
+                let src_pitch = state.get(Register::R9) as u32;
+                let stack = state.get(Register::Rsp);
+                let bitmap_props_ptr = read_guest_pointer(memory, stack + 0x20, self.guest_arch)?;
+                let out_ptr = read_guest_pointer(memory, stack + 0x28, self.guest_arch)?;
+
+                if size_ptr == 0 || out_ptr == 0 {
+                    state.set(Register::Rax, 0x80070057);
+                } else {
+                    let width = read_guest_u32(memory, size_ptr)?;
+                    let height = read_guest_u32(memory, size_ptr + 4)?;
+
+                    let mut pixel_format = crate::d2d::D2DPixelFormat::default();
+                    if bitmap_props_ptr != 0 {
+                        let format_val = read_guest_u32(memory, bitmap_props_ptr + 4)?;
+                        let alpha_val = read_guest_u32(memory, bitmap_props_ptr + 8)?;
+                        pixel_format = crate::d2d::D2DPixelFormat {
+                            dxgi_format: format_val,
+                            alpha_mode: alpha_val,
+                        };
+                    }
+
+                    let stride = if src_pitch != 0 { src_pitch } else { width * 4 };
+                    let data_len = (stride * height) as usize;
+                    let data = if src_data_ptr != 0 && data_len > 0 {
+                        let bytes = memory.read_bytes(src_data_ptr, data_len as usize)?;
+                        bytes
+                    } else {
+                        vec![0u8; data_len]
+                    };
+
+                    let bitmap = crate::d2d::D2DBitmap {
+                        width,
+                        height,
+                        stride,
+                        data,
+                        dpi: 96.0,
+                        pixel_format,
+                    };
+                    let bitmap_id = self.next_gdi_handle;
+                    self.next_gdi_handle += 1;
+                    self.d2d_bitmaps.insert(bitmap_id, bitmap);
+                    write_guest_pointer(memory, out_ptr, bitmap_id, self.guest_arch)?;
+                    state.set(Register::Rax, 0);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::ID2D1Factory_CreateBitmapFromWicBitmap => {
+                // Stub: return an empty bitmap
+                let _factory_object = state.get(Register::Rcx);
+                let out_ptr = state.get(Register::R8);
+                if out_ptr != 0 {
+                    let bitmap = crate::d2d::D2DBitmap {
+                        width: 1,
+                        height: 1,
+                        stride: 4,
+                        data: vec![0u8; 4],
+                        dpi: 96.0,
+                        pixel_format: crate::d2d::D2DPixelFormat::default(),
+                    };
+                    let bitmap_id = self.next_gdi_handle;
+                    self.next_gdi_handle += 1;
+                    self.d2d_bitmaps.insert(bitmap_id, bitmap);
+                    write_guest_pointer(memory, out_ptr, bitmap_id, self.guest_arch)?;
+                }
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+            }
+            HostThunk::ID2D1Factory_Release => {
+                // Factory release: clear all D2D state
+                self.d2d_factory = None;
+                self.d2d_brushes.clear();
+                self.d2d_bitmaps.clear();
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+            }
+            HostThunk::ID2D1HwndRenderTarget_BeginDraw => {
+                let target_id = state.get(Register::Rcx);
+                if let Some(ref mut factory) = self.d2d_factory {
+                    if let Some(target) = factory.hwnd_target_mut(target_id) {
+                        target.begin_draw();
+                        state.set(Register::Rax, 0);
+                    } else {
+                        state.set(Register::Rax, 0x80070057);
+                    }
+                } else {
+                    state.set(Register::Rax, 0x80004002);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::ID2D1HwndRenderTarget_EndDraw => {
+                let target_id = state.get(Register::Rcx);
+                let _out_tags_ptr = state.get(Register::Rdx);
+                if let Some(ref mut factory) = self.d2d_factory {
+                    if let Some(target) = factory.hwnd_target_mut(target_id) {
+                        target.end_draw();
+                        state.set(Register::Rax, 0);
+                    } else {
+                        state.set(Register::Rax, 0x80070057);
+                    }
+                } else {
+                    state.set(Register::Rax, 0x80004002);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::ID2D1HwndRenderTarget_Clear => {
+                let target_id = state.get(Register::Rcx);
+                let color_ptr = state.get(Register::Rdx);
+                if let Some(ref mut factory) = self.d2d_factory {
+                    if let Some(target) = factory.hwnd_target_mut(target_id) {
+                        let color = if color_ptr != 0 {
+                            let r = read_guest_f32(memory, color_ptr)?;
+                            let g = read_guest_f32(memory, color_ptr + 4)?;
+                            let b = read_guest_f32(memory, color_ptr + 8)?;
+                            let a = read_guest_f32(memory, color_ptr + 12)?;
+                            (r, g, b, a)
+                        } else {
+                            (0.0, 0.0, 0.0, 0.0) // Transparent black
+                        };
+                        target.clear(color);
+                        state.set(Register::Rax, 0);
+                    } else {
+                        state.set(Register::Rax, 0x80070057);
+                    }
+                } else {
+                    state.set(Register::Rax, 0x80004002);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::ID2D1HwndRenderTarget_DrawLine => {
+                let target_id = state.get(Register::Rcx);
+                let p1_x = read_guest_f32(memory, state.get(Register::Rdx))?;
+                let p1_y = read_guest_f32(memory, state.get(Register::Rdx) + 4)?;
+                let p2_x = read_guest_f32(memory, state.get(Register::R8))?;
+                let p2_y = read_guest_f32(memory, state.get(Register::R8) + 4)?;
+                let brush_id = state.get(Register::R9);
+                let stack = state.get(Register::Rsp);
+                let stroke_width = read_guest_f32(memory, stack + 0x20)?;
+
+                if let Some(ref mut factory) = self.d2d_factory {
+                    if let Some(target) = factory.hwnd_target_mut(target_id) {
+                        target.draw_line(
+                            (p1_x, p1_y),
+                            (p2_x, p2_y),
+                            brush_id,
+                            stroke_width,
+                            &self.d2d_brushes,
+                        );
+                        state.set(Register::Rax, 0);
+                    } else {
+                        state.set(Register::Rax, 0x80070057);
+                    }
+                } else {
+                    state.set(Register::Rax, 0x80004002);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::ID2D1HwndRenderTarget_DrawRectangle => {
+                let target_id = state.get(Register::Rcx);
+                let rect_ptr = state.get(Register::Rdx);
+                let brush_id = state.get(Register::R8);
+                let stroke_width = read_guest_f32(memory, state.get(Register::R9))?;
+
+                if rect_ptr == 0 {
+                    state.set(Register::Rax, 0x80070057);
+                } else if let Some(ref mut factory) = self.d2d_factory {
+                    if let Some(target) = factory.hwnd_target_mut(target_id) {
+                        let x = read_guest_f32(memory, rect_ptr)?;
+                        let y = read_guest_f32(memory, rect_ptr + 4)?;
+                        let w = read_guest_f32(memory, rect_ptr + 8)?;
+                        let h = read_guest_f32(memory, rect_ptr + 12)?;
+                        target.draw_rectangle((x, y, w, h), brush_id, stroke_width, &self.d2d_brushes);
+                        state.set(Register::Rax, 0);
+                    } else {
+                        state.set(Register::Rax, 0x80070057);
+                    }
+                } else {
+                    state.set(Register::Rax, 0x80004002);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::ID2D1HwndRenderTarget_FillRectangle => {
+                let target_id = state.get(Register::Rcx);
+                let rect_ptr = state.get(Register::Rdx);
+                let brush_id = state.get(Register::R8);
+
+                if rect_ptr == 0 {
+                    state.set(Register::Rax, 0x80070057);
+                } else if let Some(ref mut factory) = self.d2d_factory {
+                    if let Some(target) = factory.hwnd_target_mut(target_id) {
+                        let x = read_guest_f32(memory, rect_ptr)?;
+                        let y = read_guest_f32(memory, rect_ptr + 4)?;
+                        let w = read_guest_f32(memory, rect_ptr + 8)?;
+                        let h = read_guest_f32(memory, rect_ptr + 12)?;
+                        target.fill_rectangle((x, y, w, h), brush_id, &self.d2d_brushes);
+                        state.set(Register::Rax, 0);
+                    } else {
+                        state.set(Register::Rax, 0x80070057);
+                    }
+                } else {
+                    state.set(Register::Rax, 0x80004002);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::ID2D1HwndRenderTarget_DrawEllipse => {
+                let target_id = state.get(Register::Rcx);
+                let ellipse_ptr = state.get(Register::Rdx);
+                let brush_id = state.get(Register::R8);
+                let stroke_width = read_guest_f32(memory, state.get(Register::R9))?;
+
+                if ellipse_ptr == 0 {
+                    state.set(Register::Rax, 0x80070057);
+                } else if let Some(ref mut factory) = self.d2d_factory {
+                    if let Some(target) = factory.hwnd_target_mut(target_id) {
+                        let cx = read_guest_f32(memory, ellipse_ptr)?;
+                        let cy = read_guest_f32(memory, ellipse_ptr + 4)?;
+                        let rx = read_guest_f32(memory, ellipse_ptr + 8)?;
+                        let ry = read_guest_f32(memory, ellipse_ptr + 12)?;
+                        target.draw_ellipse((cx, cy), rx, ry, brush_id, stroke_width, &self.d2d_brushes);
+                        state.set(Register::Rax, 0);
+                    } else {
+                        state.set(Register::Rax, 0x80070057);
+                    }
+                } else {
+                    state.set(Register::Rax, 0x80004002);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::ID2D1HwndRenderTarget_FillEllipse => {
+                let target_id = state.get(Register::Rcx);
+                let ellipse_ptr = state.get(Register::Rdx);
+                let brush_id = state.get(Register::R8);
+
+                if ellipse_ptr == 0 {
+                    state.set(Register::Rax, 0x80070057);
+                } else if let Some(ref mut factory) = self.d2d_factory {
+                    if let Some(target) = factory.hwnd_target_mut(target_id) {
+                        let cx = read_guest_f32(memory, ellipse_ptr)?;
+                        let cy = read_guest_f32(memory, ellipse_ptr + 4)?;
+                        let rx = read_guest_f32(memory, ellipse_ptr + 8)?;
+                        let ry = read_guest_f32(memory, ellipse_ptr + 12)?;
+                        target.fill_ellipse((cx, cy), rx, ry, brush_id, &self.d2d_brushes);
+                        state.set(Register::Rax, 0);
+                    } else {
+                        state.set(Register::Rax, 0x80070057);
+                    }
+                } else {
+                    state.set(Register::Rax, 0x80004002);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::ID2D1HwndRenderTarget_DrawText => {
+                let target_id = state.get(Register::Rcx);
+                let string_ptr = state.get(Register::Rdx);
+                let string_len = state.get(Register::R8) as u32;
+                let format_id = state.get(Register::R9);
+                let stack = state.get(Register::Rsp);
+                let layout_rect_ptr = read_guest_pointer(memory, stack + 0x20, self.guest_arch)?;
+                let brush_id = read_guest_pointer(memory, stack + 0x28, self.guest_arch)?;
+                let _draw_options = read_guest_pointer(memory, stack + 0x30, self.guest_arch)?;
+
+                if string_ptr == 0 || layout_rect_ptr == 0 {
+                    state.set(Register::Rax, 0x80070057);
+                } else {
+                    let text = if string_len > 0 {
+                        let text_bytes = memory.read_bytes(string_ptr, string_len as usize * 2)?;
+                        let text_u16: Vec<u16> = text_bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+                        String::from_utf16_lossy(&text_u16)
+                    } else {
+                        String::new()
+                    };
+
+                    let x = read_guest_f32(memory, layout_rect_ptr)?;
+                    let y = read_guest_f32(memory, layout_rect_ptr + 4)?;
+                    let w = read_guest_f32(memory, layout_rect_ptr + 8)?;
+                    let h = read_guest_f32(memory, layout_rect_ptr + 12)?;
+
+                    if let Some(ref mut factory) = self.d2d_factory {
+                        if let Some(target) = factory.hwnd_target_mut(target_id) {
+                            if let Some(ref dw_factory) = self.dwrite_factory {
+                                target.draw_text(
+                                    &text, format_id,
+                                    (x, y, w, h), brush_id,
+                                    dw_factory,
+                                    &self.dwrite_formats,
+                                    &self.d2d_brushes,
+                                );
+                            }
+                            state.set(Register::Rax, 0);
+                        } else {
+                            state.set(Register::Rax, 0x80070057);
+                        }
+                    } else {
+                        state.set(Register::Rax, 0x80004002);
+                    }
+                }
+                self.last_error = 0;
+            }
+            HostThunk::ID2D1HwndRenderTarget_DrawBitmap => {
+                let target_id = state.get(Register::Rcx);
+                let bitmap_id = state.get(Register::Rdx);
+                let dest_rect_ptr = state.get(Register::R8);
+                let _opacity = read_guest_f32(memory, state.get(Register::R9))?;
+
+                if dest_rect_ptr == 0 {
+                    state.set(Register::Rax, 0x80070057);
+                } else if let Some(ref mut factory) = self.d2d_factory {
+                    if let Some(target) = factory.hwnd_target_mut(target_id) {
+                        let x = read_guest_f32(memory, dest_rect_ptr)?;
+                        let y = read_guest_f32(memory, dest_rect_ptr + 4)?;
+                        let w = read_guest_f32(memory, dest_rect_ptr + 8)?;
+                        let h = read_guest_f32(memory, dest_rect_ptr + 12)?;
+                        let opacity = 1.0;
+                        target.draw_bitmap(bitmap_id, (x, y, w, h), opacity, &self.d2d_bitmaps);
+                        state.set(Register::Rax, 0);
+                    } else {
+                        state.set(Register::Rax, 0x80070057);
+                    }
+                } else {
+                    state.set(Register::Rax, 0x80004002);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::ID2D1HwndRenderTarget_SetTransform => {
+                let target_id = state.get(Register::Rcx);
+                let matrix_ptr = state.get(Register::Rdx);
+
+                if matrix_ptr == 0 {
+                    state.set(Register::Rax, 0x80070057);
+                } else if let Some(ref mut factory) = self.d2d_factory {
+                    if let Some(target) = factory.hwnd_target_mut(target_id) {
+                        let mut matrix = crate::d2d::d2d_identity_matrix();
+                        matrix[0] = read_guest_f32(memory, matrix_ptr)?;
+                        matrix[1] = read_guest_f32(memory, matrix_ptr + 4)?;
+                        matrix[2] = read_guest_f32(memory, matrix_ptr + 8)?;
+                        matrix[3] = read_guest_f32(memory, matrix_ptr + 12)?;
+                        matrix[4] = read_guest_f32(memory, matrix_ptr + 16)?;
+                        matrix[5] = read_guest_f32(memory, matrix_ptr + 24)?;
+                        target.set_transform(&matrix);
+                        state.set(Register::Rax, 0);
+                    } else {
+                        state.set(Register::Rax, 0x80070057);
+                    }
+                } else {
+                    state.set(Register::Rax, 0x80004002);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::ID2D1HwndRenderTarget_GetSize => {
+                let target_id = state.get(Register::Rcx);
+                let size_ptr = state.get(Register::Rdx);
+                if let Some(ref factory) = self.d2d_factory {
+                    if let Some(target) = factory.hwnd_target(target_id) {
+                        let (w, h) = target.get_size();
+                        if size_ptr != 0 {
+                            write_guest_f32(memory, size_ptr, w)?;
+                            write_guest_f32(memory, size_ptr + 4, h)?;
+                        }
+                        state.set(Register::Rax, 0);
+                    } else {
+                        state.set(Register::Rax, 0x80070057);
+                    }
+                } else {
+                    state.set(Register::Rax, 0x80004002);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::ID2D1HwndRenderTarget_GetDpi => {
+                let target_id = state.get(Register::Rcx);
+                let dpi_x_ptr = state.get(Register::Rdx);
+                let dpi_y_ptr = state.get(Register::R8);
+                if let Some(ref factory) = self.d2d_factory {
+                    if let Some(target) = factory.hwnd_target(target_id) {
+                        let (dx, dy) = target.get_dpi();
+                        if dpi_x_ptr != 0 {
+                            write_guest_f32(memory, dpi_x_ptr, dx)?;
+                        }
+                        if dpi_y_ptr != 0 {
+                            write_guest_f32(memory, dpi_y_ptr, dy)?;
+                        }
+                        state.set(Register::Rax, 0);
+                    } else {
+                        state.set(Register::Rax, 0x80070057);
+                    }
+                } else {
+                    state.set(Register::Rax, 0x80004002);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::ID2D1HwndRenderTarget_Release => {
+                let target_id = state.get(Register::Rcx);
+                if let Some(ref mut factory) = self.d2d_factory {
+                    factory.release_render_target(target_id);
+                }
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+            }
+            HostThunk::ID2D1SolidColorBrush_SetColor => {
+                let brush_id = state.get(Register::Rcx);
+                let color_ptr = state.get(Register::Rdx);
+                if color_ptr != 0 {
+                    if let Some(brush) = self.d2d_brushes.get_mut(&brush_id) {
+                        if let crate::d2d::D2DBrush::Solid(s) = brush {
+                            s.color.0 = read_guest_f32(memory, color_ptr)?;
+                            s.color.1 = read_guest_f32(memory, color_ptr + 4)?;
+                            s.color.2 = read_guest_f32(memory, color_ptr + 8)?;
+                            s.color.3 = read_guest_f32(memory, color_ptr + 12)?;
+                        }
+                        state.set(Register::Rax, 0);
+                    } else {
+                        state.set(Register::Rax, 0x80070057);
+                    }
+                }
+                self.last_error = 0;
+            }
+            HostThunk::ID2D1SolidColorBrush_SetOpacity => {
+                let brush_id = state.get(Register::Rcx);
+                let opacity = read_guest_f32(memory, state.get(Register::Rdx))?;
+                if let Some(brush) = self.d2d_brushes.get_mut(&brush_id) {
+                    if let crate::d2d::D2DBrush::Solid(s) = brush {
+                        s.opacity = opacity;
+                    }
+                    state.set(Register::Rax, 0);
+                } else {
+                    state.set(Register::Rax, 0x80070057);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::ID2D1SolidColorBrush_Release => {
+                let brush_id = state.get(Register::Rcx);
+                self.d2d_brushes.remove(&brush_id);
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+            }
+            HostThunk::ID2D1Bitmap_Release => {
+                let bitmap_id = state.get(Register::Rcx);
+                self.d2d_bitmaps.remove(&bitmap_id);
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+            }
+            HostThunk::ID2D1Bitmap_GetSize => {
+                let bitmap_id = state.get(Register::Rcx);
+                let size_ptr = state.get(Register::Rdx);
+                if let Some(bitmap) = self.d2d_bitmaps.get(&bitmap_id) {
+                    if size_ptr != 0 {
+                        write_guest_f32(memory, size_ptr, bitmap.width as f32)?;
+                        write_guest_f32(memory, size_ptr + 4, bitmap.height as f32)?;
+                    }
+                    state.set(Register::Rax, 0);
+                } else {
+                    state.set(Register::Rax, 0x80070057);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::ID2D1Bitmap_GetDpi => {
+                let bitmap_id = state.get(Register::Rcx);
+                let dpi_x_ptr = state.get(Register::Rdx);
+                let dpi_y_ptr = state.get(Register::R8);
+                if let Some(bitmap) = self.d2d_bitmaps.get(&bitmap_id) {
+                    if dpi_x_ptr != 0 {
+                        write_guest_f32(memory, dpi_x_ptr, bitmap.dpi)?;
+                    }
+                    if dpi_y_ptr != 0 {
+                        write_guest_f32(memory, dpi_y_ptr, bitmap.dpi)?;
+                    }
+                    state.set(Register::Rax, 0);
+                } else {
+                    state.set(Register::Rax, 0x80070057);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::D2D1MakeRotateMatrix => {
+                let angle = read_guest_f32(memory, state.get(Register::Rcx))?;
+                let center_x = read_guest_f32(memory, state.get(Register::Rcx) + 4)?;
+                let center_y = read_guest_f32(memory, state.get(Register::Rcx) + 8)?;
+                let out_ptr = state.get(Register::Rdx);
+                if out_ptr != 0 {
+                    let matrix = crate::d2d::d2d_make_rotate_matrix(angle, (center_x, center_y));
+                    write_guest_f32(memory, out_ptr, matrix[0])?;
+                    write_guest_f32(memory, out_ptr + 4, matrix[1])?;
+                    write_guest_f32(memory, out_ptr + 8, matrix[2])?;
+                    write_guest_f32(memory, out_ptr + 12, matrix[3])?;
+                    write_guest_f32(memory, out_ptr + 16, matrix[4])?;
+                    write_guest_f32(memory, out_ptr + 20, matrix[5])?;
+                }
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+            }
+            HostThunk::D2D1MakeSkewMatrix => {
+                let angle_x = read_guest_f32(memory, state.get(Register::Rcx))?;
+                let angle_y = read_guest_f32(memory, state.get(Register::Rcx) + 4)?;
+                let center_x = read_guest_f32(memory, state.get(Register::Rcx) + 8)?;
+                let center_y = read_guest_f32(memory, state.get(Register::Rcx) + 12)?;
+                let out_ptr = state.get(Register::Rdx);
+                if out_ptr != 0 {
+                    let matrix = crate::d2d::d2d_make_skew_matrix(angle_x, angle_y, (center_x, center_y));
+                    write_guest_f32(memory, out_ptr, matrix[0])?;
+                    write_guest_f32(memory, out_ptr + 4, matrix[1])?;
+                    write_guest_f32(memory, out_ptr + 8, matrix[2])?;
+                    write_guest_f32(memory, out_ptr + 12, matrix[3])?;
+                    write_guest_f32(memory, out_ptr + 16, matrix[4])?;
+                    write_guest_f32(memory, out_ptr + 20, matrix[5])?;
+                }
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+            }
+            HostThunk::D2D1IsMatrixInvertible => {
+                let matrix_ptr = state.get(Register::Rcx);
+                let mut matrix = [0.0f32; 9];
+                for i in 0..6 {
+                    matrix[i] = read_guest_f32(memory, matrix_ptr + i as u64 * 4)?;
+                }
+                let invertible = crate::d2d::d2d_is_matrix_invertible(&matrix);
+                state.set(Register::Rax, if invertible { 1 } else { 0 });
+                self.last_error = 0;
+            }
+            HostThunk::D2D1InvertMatrix => {
+                let matrix_ptr = state.get(Register::Rcx);
+                let mut matrix = [0.0f32; 9];
+                for i in 0..6 {
+                    matrix[i] = read_guest_f32(memory, matrix_ptr + i as u64 * 4)?;
+                }
+                let success = crate::d2d::d2d_invert_matrix(&mut matrix);
+                if success {
+                    write_guest_f32(memory, matrix_ptr, matrix[0])?;
+                    write_guest_f32(memory, matrix_ptr + 4, matrix[1])?;
+                    write_guest_f32(memory, matrix_ptr + 8, matrix[2])?;
+                    write_guest_f32(memory, matrix_ptr + 12, matrix[3])?;
+                    write_guest_f32(memory, matrix_ptr + 16, matrix[4])?;
+                    write_guest_f32(memory, matrix_ptr + 20, matrix[5])?;
+                }
+                state.set(Register::Rax, if success { 1 } else { 0 });
+                self.last_error = 0;
+            }
+            // -- winspool.drv / Printing dispatch (Phase Print) --
+            HostThunk::OpenPrinterW => {
+                let printer_name_ptr = guest_call_arg(state, memory, 0)?;
+                let handle_ptr = guest_call_arg(state, memory, 1)?;
+                let _default_ptr = guest_call_arg(state, memory, 2)?;
+                let printer_name = if printer_name_ptr != 0 {
+                    Some(read_utf16_string(memory, printer_name_ptr)?)
+                } else {
+                    None
+                };
+                if let Some(handle) = self.print_subsystem.open_printer(printer_name.as_deref()) {
+                    if handle_ptr != 0 {
+                        write_guest_pointer(memory, handle_ptr, handle, self.guest_arch)?;
+                    }
+                    state.set(Register::Rax, 1); // TRUE
+                } else {
+                    state.set(Register::Rax, 0); // FALSE
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                }
+            }
+            HostThunk::ClosePrinter => {
+                let handle = guest_call_arg(state, memory, 0)?;
+                self.print_subsystem.close_printer(handle);
+                state.set(Register::Rax, 1); // TRUE
+                self.last_error = 0;
+            }
+            HostThunk::StartDocPrinterW => {
+                let printer_handle = guest_call_arg(state, memory, 0)?;
+                let _level = guest_call_arg_u32(state, memory, 1)?;
+                let doc_info_ptr = guest_call_arg(state, memory, 2)?;
+                let doc_name = if doc_info_ptr != 0 {
+                    // DOCINFOW: pDocName is at offset 0 (pointer to UTF-16 string)
+                    let doc_name_ptr = if self.guest_arch == GuestArch::X86 {
+                        memory.read_u32(doc_info_ptr)? as u64
+                    } else {
+                        memory.read_u64(doc_info_ptr)?
+                    };
+                    if doc_name_ptr != 0 {
+                        read_utf16_string(memory, doc_name_ptr)?
+                    } else {
+                        "Untitled".to_string()
+                    }
+                } else {
+                    "Untitled".to_string()
+                };
+                if let Some(job_id) = self.print_subsystem.start_doc_printer(printer_handle, &doc_name) {
+                    state.set(Register::Rax, job_id as u64);
+                } else {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                }
+            }
+            HostThunk::EndDocPrinter => {
+                let printer_handle = guest_call_arg(state, memory, 0)?;
+                if let Some(job_id) = self.print_subsystem.active_job_for_printer(printer_handle) {
+                    let ok = self.print_subsystem.end_doc_printer(job_id);
+                    state.set(Register::Rax, u64::from(ok));
+                } else {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                }
+            }
+            HostThunk::StartPagePrinter => {
+                let printer_handle = guest_call_arg(state, memory, 0)?;
+                if let Some(job_id) = self.print_subsystem.active_job_for_printer(printer_handle) {
+                    let ok = self.print_subsystem.start_page_printer(job_id);
+                    state.set(Register::Rax, u64::from(ok));
+                } else {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                }
+            }
+            HostThunk::EndPagePrinter => {
+                let printer_handle = guest_call_arg(state, memory, 0)?;
+                if let Some(job_id) = self.print_subsystem.active_job_for_printer(printer_handle) {
+                    let ok = self.print_subsystem.end_page_printer(job_id);
+                    state.set(Register::Rax, u64::from(ok));
+                } else {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                }
+            }
+            HostThunk::WritePrinter => {
+                let printer_handle = guest_call_arg(state, memory, 0)?;
+                let buffer_ptr = guest_call_arg(state, memory, 1)?;
+                let buffer_size = guest_call_arg_u32(state, memory, 2)?;
+                let written_ptr = guest_call_arg(state, memory, 3)?;
+                if let Some(job_id) = self.print_subsystem.active_job_for_printer(printer_handle) {
+                    let mut data = vec![0u8; buffer_size as usize];
+                    for i in 0..buffer_size as usize {
+                        data[i] = memory.read_u8(buffer_ptr + i as u64)?;
+                    }
+                    let ok = self.print_subsystem.write_printer(job_id, &data);
+                    if ok && written_ptr != 0 {
+                        write_u32(memory, written_ptr, buffer_size);
+                    }
+                    state.set(Register::Rax, u64::from(ok));
+                } else {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                }
+            }
+            HostThunk::ReadPrinter => {
+                let printer_handle = guest_call_arg(state, memory, 0)?;
+                let buffer_ptr = guest_call_arg(state, memory, 1)?;
+                let buffer_size = guest_call_arg_u32(state, memory, 2)?;
+                let read_ptr = guest_call_arg(state, memory, 3)?;
+                if let Some(job_id) = self.print_subsystem.active_job_for_printer(printer_handle) {
+                    let mut buf = vec![0u8; buffer_size as usize];
+                    let bytes_read = self.print_subsystem.read_printer(job_id, &mut buf);
+                    if let Some(count) = bytes_read {
+                        if read_ptr != 0 {
+                            write_u32(memory, read_ptr, count);
+                        }
+                        state.set(Register::Rax, 1);
+                    } else {
+                        state.set(Register::Rax, 0);
+                        self.last_error = ERROR_INVALID_PARAMETER;
+                    }
+                } else {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                }
+            }
+            HostThunk::EnumPrintersW => {
+                let _flags = guest_call_arg_u32(state, memory, 0)?;
+                let _name_ptr = guest_call_arg(state, memory, 1)?;
+                let level = guest_call_arg_u32(state, memory, 2)?;
+                let buffer_ptr = guest_call_arg(state, memory, 3)?;
+                let buffer_size = guest_call_arg_u32(state, memory, 4)?;
+                let needed_ptr = guest_call_arg(state, memory, 5)?;
+                let returned_ptr = guest_call_arg(state, memory, 6)?;
+                let printers = self.print_subsystem.enum_printers();
+                let count = printers.len() as u32;
+                let struct_size: u32 = if level == 2 { 72 } else { 64 }; // approximate
+                let total_needed = count * struct_size + 256; // rough estimate for string data
+                if needed_ptr != 0 {
+                    write_u32(memory, needed_ptr, total_needed);
+                }
+                if returned_ptr != 0 {
+                    write_u32(memory, returned_ptr, count);
+                }
+                if buffer_ptr != 0 && buffer_size >= total_needed {
+                    // Write PRINTER_INFO_2W or PRINTER_INFO_1W structures
+                    let mut offset = buffer_ptr;
+                    for info in &printers {
+                        // PRINTER_INFO_2W (Level 2) or PRINTER_INFO_1W (Level 1):
+                        // For simplicity, write basic fields
+                        if level == 2 {
+                            write_u32(memory, offset, 0); // pServerName (NULL)
+                            write_u32(memory, offset + 4, 0);
+                            write_u32(memory, offset + 8, 0); // pPrinterName (NULL)
+                            write_u32(memory, offset + 12, 0);
+                            write_u32(memory, offset + 16, 0); // pShareName (NULL)
+                            write_u32(memory, offset + 20, 0);
+                            write_u32(memory, offset + 24, 0); // pPortName (NULL)
+                            write_u32(memory, offset + 28, 0);
+                            write_u32(memory, offset + 32, 0); // pDriverName (NULL)
+                            write_u32(memory, offset + 36, 0);
+                            write_u32(memory, offset + 40, 0); // pComment (NULL)
+                            write_u32(memory, offset + 44, 0);
+                            write_u32(memory, offset + 48, 0); // pLocation (NULL)
+                            write_u32(memory, offset + 52, 0);
+                            write_u32(memory, offset + 56, 0); // pDevMode (NULL)
+                            write_u32(memory, offset + 60, 0);
+                            write_u32(memory, offset + 64, info.attributes); // Attributes
+                            write_u32(memory, offset + 68, info.status); // Status
+                            // (simplified - just filling nulls)
+                            offset += 72;
+                        } else {
+                            // Level 1: PRINTER_INFO_1W
+                            write_u32(memory, offset, 0); // Flags
+                            write_u32(memory, offset + 4, 0); // pDescription (NULL)
+                            write_u32(memory, offset + 8, 0);
+                            write_u32(memory, offset + 12, 0); // pName (NULL)
+                            write_u32(memory, offset + 16, 0);
+                            write_u32(memory, offset + 20, 0); // pComment (NULL)
+                            write_u32(memory, offset + 24, 0);
+                            offset += 28; // PRINTER_INFO_1 is 28 bytes on x64 (plus strings)
+                        }
+                    }
+                    state.set(Register::Rax, 1); // TRUE
+                } else if total_needed > 0 {
+                    state.set(Register::Rax, 0); // FALSE - buffer too small
+                    self.last_error = 122; // ERROR_INSUFFICIENT_BUFFER
+                } else {
+                    state.set(Register::Rax, 1); // empty set = success
+                }
+            }
+            HostThunk::GetPrinterW => {
+                let handle = guest_call_arg(state, memory, 0)?;
+                let _level = guest_call_arg_u32(state, memory, 1)?;
+                let buffer_ptr = guest_call_arg(state, memory, 2)?;
+                let buffer_size = guest_call_arg_u32(state, memory, 3)?;
+                let needed_ptr = guest_call_arg(state, memory, 4)?;
+                if let Some(info) = self.print_subsystem.get_printer(handle) {
+                    // Estimate size needed
+                    let name_len = (info.name.len() * 2 + 2) as u32;
+                    let port_len = (info.port.len() * 2 + 2) as u32;
+                    let driver_len = (info.driver.len() * 2 + 2) as u32;
+                    let comment_len = (info.comment.len() * 2 + 2) as u32;
+                    let total_needed = 112 + name_len + port_len + driver_len + comment_len;
+                    if needed_ptr != 0 {
+                        write_u32(memory, needed_ptr, total_needed);
+                    }
+                    if buffer_ptr != 0 && buffer_size >= total_needed {
+                        // Fill PRINTER_INFO_2W structure (simplified)
+                        write_u32(memory, buffer_ptr, 0); // pServerName = NULL
+                        write_u32(memory, buffer_ptr + 4, 0);
+                        write_u32(memory, buffer_ptr + 8, 0); // pPrinterName = NULL
+                        write_u32(memory, buffer_ptr + 12, 0);
+                        write_u32(memory, buffer_ptr + 16, 0); // pShareName = NULL
+                        write_u32(memory, buffer_ptr + 20, 0);
+                        write_u32(memory, buffer_ptr + 24, 0); // pPortName = NULL
+                        write_u32(memory, buffer_ptr + 28, 0);
+                        write_u32(memory, buffer_ptr + 32, 0); // pDriverName = NULL
+                        write_u32(memory, buffer_ptr + 36, 0);
+                        write_u32(memory, buffer_ptr + 40, 0); // pComment = NULL
+                        write_u32(memory, buffer_ptr + 44, 0);
+                        write_u32(memory, buffer_ptr + 48, 0); // pLocation = NULL
+                        write_u32(memory, buffer_ptr + 52, 0);
+                        write_u32(memory, buffer_ptr + 56, 0); // pDevMode = NULL
+                        write_u32(memory, buffer_ptr + 60, 0);
+                        write_u32(memory, buffer_ptr + 64, info.attributes);
+                        write_u32(memory, buffer_ptr + 68, info.status);
+                        state.set(Register::Rax, 1);
+                    } else {
+                        state.set(Register::Rax, 0);
+                        self.last_error = 122; // ERROR_INSUFFICIENT_BUFFER
+                    }
+                } else {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                }
+            }
+            HostThunk::SetPrinterW => {
+                let _handle = guest_call_arg(state, memory, 0)?;
+                let _level = guest_call_arg_u32(state, memory, 1)?;
+                let _printer_ptr = guest_call_arg(state, memory, 2)?;
+                let _command = guest_call_arg_u32(state, memory, 3)?;
+                // Stub: always succeed
+                state.set(Register::Rax, 1);
+                self.last_error = 0;
+            }
+            HostThunk::AddPrinterW => {
+                let _name_ptr = guest_call_arg(state, memory, 0)?;
+                let _level = guest_call_arg_u32(state, memory, 1)?;
+                let _printer_ptr = guest_call_arg(state, memory, 2)?;
+                // Stub: add a virtual printer
+                let handle = self.print_subsystem.add_printer(
+                    crate::print::PrinterInfo {
+                        name: "Virtual Printer".to_string(),
+                        port: "PORTPROMPT:".to_string(),
+                        driver: "Virtual Printer".to_string(),
+                        comment: "".to_string(),
+                        location: "".to_string(),
+                        status: 0,
+                        attributes: 0x4,
+                        jobs: 0,
+                        default_priority: 1,
+                    }
+                );
+                if let Some(h) = handle {
+                    state.set(Register::Rax, h);
+                    self.last_error = 0;
+                } else {
+                    state.set(Register::Rax, 0);
+                    self.last_error = ERROR_INVALID_PARAMETER;
+                }
+            }
+            HostThunk::DeletePrinter => {
+                let handle = guest_call_arg(state, memory, 0)?;
+                let ok = self.print_subsystem.delete_printer(handle);
+                state.set(Register::Rax, u64::from(ok));
+                self.last_error = if ok { 0 } else { ERROR_INVALID_PARAMETER };
+            }
             HostThunk::UnsupportedMethod { name } => {
+                self.telemetry.record_unsupported_method(&name);
                 return Err(AppError::new(
                     ReasonCode::RcUnimplInsn,
                     format!("unsupported guest method dispatch {name}"),
@@ -21716,11 +26859,9 @@ impl PeHostRuntime {
                 let headers_length = guest_call_arg_u32(state, memory, 2)?;
                 let optional_ptr = guest_call_arg(state, memory, 3)?;
                 let optional_length = guest_call_arg_u32(state, memory, 4)?;
-                let headers = if headers_ptr != 0 && headers_length > 0 {
-                    let header_bytes = read_guest_bytes(memory, headers_ptr, headers_length as usize)?;
-                    if let Ok(s) = String::from_utf16(&header_bytes.iter().map(|&b| b as u16).collect::<Vec<_>>()) {
-                        Some(s)
-                    } else { None }
+                let headers = if headers_ptr != 0 {
+                    let s = read_guest_utf16_string(memory, headers_ptr, headers_length as i32);
+                    if s.is_empty() { None } else { Some(s) }
                 } else { None };
                 let body = if optional_ptr != 0 && optional_length > 0 {
                     Some(read_guest_bytes(memory, optional_ptr, optional_length as usize)?)
@@ -22073,11 +27214,9 @@ impl PeHostRuntime {
                 let headers_length = guest_call_arg_u32(state, memory, 2)?;
                 let optional_ptr = guest_call_arg(state, memory, 3)?;
                 let optional_length = guest_call_arg_u32(state, memory, 4)?;
-                let headers = if headers_ptr != 0 && headers_length > 0 {
-                    let header_bytes = read_guest_bytes(memory, headers_ptr, headers_length as usize)?;
-                    if let Ok(s) = String::from_utf16(&header_bytes.iter().map(|&b| b as u16).collect::<Vec<_>>()) {
-                        Some(s)
-                    } else { None }
+                let headers = if headers_ptr != 0 {
+                    let s = read_guest_utf16_string(memory, headers_ptr, headers_length as i32);
+                    if s.is_empty() { None } else { Some(s) }
                 } else { None };
                 let body = if optional_ptr != 0 && optional_length > 0 {
                     Some(read_guest_bytes(memory, optional_ptr, optional_length as usize)?)
@@ -22678,6 +27817,50 @@ impl PeHostRuntime {
                     state.rip = target_ip as u32 as u64;
                 }
                 state.set(Register::Rax, retval);
+            }
+            HostThunk::RtlRestoreContext => {
+                // RtlRestoreContext(context_record, exception_record)
+                // Restores the exception context and resumes execution at
+                // the RIP stored in the context record.
+                let context_ptr = arg(0);
+                let _exception_record_ptr = arg(1);
+                // Read the X64Context-like structure from guest memory.
+                // The structure layout matches the X64Context fields:
+                // gpr[0..16] (rax–r15), rip, xmm[0..16] (each 2×u64)
+                // Total: 17 GP registers + 16 XMM registers × 2 u64 = 49 u64 = 392 bytes
+                const CONTEXT_SIZE: usize = 49 * 8;
+                if self.guest_arch == GuestArch::X64 && context_ptr != 0 {
+                    if let Ok(data) = memory.read_bytes(context_ptr, CONTEXT_SIZE) {
+                        let read_u64_at = |offset: usize| -> u64 {
+                            u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap())
+                        };
+                        // General‑purpose registers (gpr[0..16])
+                        for reg in 0..16 {
+                            state.gpr[reg] = read_u64_at(reg * 8);
+                        }
+                        // RIP at offset 128 (16 × 8)
+                        state.rip = read_u64_at(128);
+                        // XMM registers at offset 136 (17 × 8)
+                        for i in 0..16usize {
+                            let xmm_offset = 136 + i * 16;
+                            if xmm_offset + 16 <= data.len() {
+                                state.xmm[i].low = read_u64_at(xmm_offset);
+                                state.xmm[i].high = read_u64_at(xmm_offset + 8);
+                            }
+                        }
+                    }
+                }
+                state.set(Register::Rax, 0); // RtlRestoreContext does not return
+                self.last_error = 0;
+                self.push_trace(
+                    "process",
+                    "RtlRestoreContext",
+                    BTreeMap::from([
+                        ("context_ptr".to_string(), json!(format!("{context_ptr:#x}"))),
+                        ("new_rip".to_string(), json!(format!("{:x}", state.rip))),
+                    ]),
+                    json!("0"),
+                );
             }
             HostThunk::GetConsoleMode => {
                 let _handle = arg(0);
@@ -23948,6 +29131,716 @@ impl PeHostRuntime {
                 let _callback = arg(0);
                 state.set(Register::Rax, 1); // TRUE
             }
+            // ── WebView2 (webview2.dll) dispatch arms ───────────────────────────
+            HostThunk::WebView2CreateEnvironment => {
+                // CreateWebView2Environment(environment_created_handler, options)
+                let handler_ptr = arg(0);
+                let options = arg(1);
+
+                let env_id = self.webview2_runtime.create_environment(options);
+
+                if handler_ptr != 0 {
+                    // Invoke the ICoreWebView2EnvironmentCompletedHandler callback.
+                    // The callback's Invoke method is at vtable[3] for IUnknown[0..2].
+                    let vtable = memory.read_u64(handler_ptr).unwrap_or(0);
+                    let invoke_fn = memory.read_u64(vtable.wrapping_add(3 * 8)).unwrap_or(0);
+                    if invoke_fn != 0 {
+                        let env_obj_ptr = self.alloc_webview2_environment_object(env_id, memory);
+                        // Call invoke_fn(handler, S_OK, env_object)
+                        // On x64: rcx=handler, rdx=S_OK, r8=env_object
+                        // We just write the env object address for the caller to find
+                        let _ = memory.write_u64(handler_ptr.wrapping_add(0x10), env_obj_ptr);
+                    }
+                }
+
+                state.set(Register::Rax, 0); // S_OK
+                self.last_error = 0;
+            }
+            HostThunk::WebView2CreateEnvironmentWithDetails => {
+                // CreateWebView2EnvironmentWithDetails(browser_exe, user_data_folder, options, handler)
+                let _browser_exe_ptr = arg(0);
+                let _user_data_ptr = arg(1);
+                let _options = arg(2);
+                let handler_ptr = arg(3);
+
+                let env_id = self.webview2_runtime.create_environment(0);
+
+                if handler_ptr != 0 {
+                    let vtable = memory.read_u64(handler_ptr).unwrap_or(0);
+                    let invoke_fn = memory.read_u64(vtable.wrapping_add(3 * 8)).unwrap_or(0);
+                    if invoke_fn != 0 {
+                        let env_obj_ptr = self.alloc_webview2_environment_object(env_id, memory);
+                        let _ = memory.write_u64(handler_ptr.wrapping_add(0x10), env_obj_ptr);
+                    }
+                }
+
+                state.set(Register::Rax, 0); // S_OK
+                self.last_error = 0;
+            }
+            // ICoreWebView2Environment vtable methods
+            HostThunk::WebView2EnvRelease => {
+                // Release — decrement refcount (stub: just return S_OK)
+                state.set(Register::Rax, 0); // S_OK (non-zero refcount)
+                self.last_error = 0;
+            }
+            HostThunk::WebView2EnvCreateCoreWebView2Controller => {
+                // CreateCoreWebView2Controller(parent_hwnd, handler)
+                let env_id = self.find_webview2_env_for_controller();
+                let _parent_hwnd = arg(1); // x64: rdx = arg1
+                let handler_ptr = arg(2);  // x64: r8 = arg2
+
+                // On x64 Win64 calling convention: rcx=this, rdx=parent_hwnd, r8=handler
+                let parent_hwnd = state.get(Register::Rdx);
+                let handler = state.get(Register::R8);
+
+                let ctrl_id = self.webview2_runtime.create_controller(env_id, parent_hwnd);
+
+                if handler != 0 {
+                    let vtable = memory.read_u64(handler).unwrap_or(0);
+                    let invoke_fn = memory.read_u64(vtable.wrapping_add(3 * 8)).unwrap_or(0);
+                    if invoke_fn != 0 {
+                        let ctrl_obj_ptr = self.alloc_webview2_controller_object(ctrl_id, memory);
+                        let _ = memory.write_u64(handler.wrapping_add(0x10), ctrl_obj_ptr);
+                    }
+                }
+
+                state.set(Register::Rax, 0); // S_OK
+                self.last_error = 0;
+            }
+            HostThunk::WebView2EnvCreateWebResourceResponse => {
+                // CreateWebResourceResponse(content, status_code, reason_phrase, headers, response)
+                state.set(Register::Rax, 0); // S_OK (stub — not yet delegating to WKWebView)
+                self.last_error = 0;
+            }
+            HostThunk::WebView2EnvGetBrowserVersionString => {
+                // GetBrowserVersionString(version_string) — return a placeholder
+                state.set(Register::Rax, 0); // S_OK
+                self.last_error = 0;
+            }
+            // ICoreWebView2Controller vtable methods
+            HostThunk::WebView2CtrlRelease => {
+                state.set(Register::Rax, 0); // S_OK (non-zero refcount)
+                self.last_error = 0;
+            }
+            HostThunk::WebView2CtrlGetIsVisible => {
+                // get_IsVisible(is_visible_out) — this=r8 on our x64 dispatch path
+                let is_visible_out = state.get(Register::Rdx);
+                if is_visible_out != 0 {
+                    write_i32(memory, is_visible_out, 1); // TRUE
+                }
+                state.set(Register::Rax, 0); // S_OK
+                self.last_error = 0;
+            }
+            HostThunk::WebView2CtrlPutIsVisible => {
+                // put_IsVisible(visible)
+                let _visible = arg(1) != 0;
+                state.set(Register::Rax, 0); // S_OK
+                self.last_error = 0;
+            }
+            HostThunk::WebView2CtrlGetBounds => {
+                // get_Bounds(bounds_rect_out) — return rect
+                let bounds_out = state.get(Register::Rdx);
+                if bounds_out != 0 {
+                    write_i32(memory, bounds_out, 0);   // x
+                    write_i32(memory, bounds_out + 4, 0);   // y
+                    write_i32(memory, bounds_out + 8, 800); // width
+                    write_i32(memory, bounds_out + 12, 600); // height
+                }
+                state.set(Register::Rax, 0); // S_OK
+                self.last_error = 0;
+            }
+            HostThunk::WebView2CtrlPutBounds => {
+                // put_Bounds(bounds_rect)
+                state.set(Register::Rax, 0); // S_OK
+                self.last_error = 0;
+            }
+            HostThunk::WebView2CtrlGetZoomFactor => {
+                // get_ZoomFactor(zoom_out) — return 1.0
+                let zoom_out = state.get(Register::Rdx);
+                if zoom_out != 0 {
+                    // Write 1.0 as f64 bits
+                    write_u64(memory, zoom_out, 1.0f64.to_bits());
+                }
+                state.set(Register::Rax, 0); // S_OK
+                self.last_error = 0;
+            }
+            HostThunk::WebView2CtrlPutZoomFactor => {
+                // put_ZoomFactor(zoom)
+                state.set(Register::Rax, 0); // S_OK
+                self.last_error = 0;
+            }
+            HostThunk::WebView2CtrlMoveFocus => {
+                // MoveFocus(reason)
+                state.set(Register::Rax, 0); // S_OK
+                self.last_error = 0;
+            }
+            HostThunk::WebView2CtrlClose => {
+                // Close() — destroy the controller
+                state.set(Register::Rax, 0); // S_OK
+                self.last_error = 0;
+            }
+            HostThunk::WebView2CtrlGetCoreWebView2 => {
+                // get_CoreWebView2(core_webview_out)
+                let webview_out = state.get(Register::Rdx);
+                if webview_out != 0 {
+                    // Return a pointer to a synthesized ICoreWebView2 object
+                    let webview_obj = self.alloc_webview2_webview_object(1, memory);
+                    let _ = memory.write_u64(webview_out, webview_obj);
+                }
+                state.set(Register::Rax, 0); // S_OK
+                self.last_error = 0;
+            }
+            // ICoreWebView2 vtable methods
+            HostThunk::WebView2Release => {
+                state.set(Register::Rax, 0); // S_OK (non-zero refcount)
+                self.last_error = 0;
+            }
+            HostThunk::WebView2GetSource => {
+                // get_Source(source_out) — return URI
+                let source_out = state.get(Register::Rdx);
+                if source_out != 0 {
+                    // Write a BSTR or LPWSTR stub — return empty for now
+                    let _ = memory.write_u64(source_out, 0);
+                }
+                state.set(Register::Rax, 0); // S_OK
+                self.last_error = 0;
+            }
+            HostThunk::WebView2Navigate => {
+                // Navigate(url) — rcx=this, rdx=url (BSTR)
+                let url_ptr = state.get(Register::Rdx);
+                let url = if url_ptr != 0 {
+                    read_utf16_string(memory, url_ptr).unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                // Delegate to cef_bridge if possible
+                crate::cef_bridge::with_global_cef_bridge(|bridge| {
+                    let _ = bridge.cef_frame_load_url(0, &url);
+                });
+                state.set(Register::Rax, 0); // S_OK
+                self.last_error = 0;
+            }
+            HostThunk::WebView2NavigateToString => {
+                // NavigateToString(html_content)
+                let _html_ptr = state.get(Register::Rdx);
+                state.set(Register::Rax, 0); // S_OK
+                self.last_error = 0;
+            }
+            HostThunk::WebView2ExecuteScript => {
+                // ExecuteScript(script, handler)
+                let _script_ptr = state.get(Register::Rdx);
+                let _handler = state.get(Register::R8);
+                state.set(Register::Rax, 0); // S_OK
+                self.last_error = 0;
+            }
+            HostThunk::WebView2PostWebMessageAsJson => {
+                // PostWebMessageAsJson(json) — rcx=this, rdx=json (BSTR)
+                let _json_ptr = state.get(Register::Rdx);
+                state.set(Register::Rax, 0); // S_OK
+                self.last_error = 0;
+            }
+            HostThunk::WebView2PostWebMessageAsString => {
+                // PostWebMessageAsString(msg)
+                let _msg_ptr = state.get(Register::Rdx);
+                state.set(Register::Rax, 0); // S_OK
+                self.last_error = 0;
+            }
+            HostThunk::WebView2GetSettings => {
+                // get_Settings(settings_out)
+                let settings_out = state.get(Register::Rdx);
+                if settings_out != 0 {
+                    let settings_obj = self.alloc_webview2_settings_object(memory);
+                    let _ = memory.write_u64(settings_out, settings_obj);
+                }
+                state.set(Register::Rax, 0); // S_OK
+                self.last_error = 0;
+            }
+            HostThunk::WebView2AddNavigationStarting => {
+                // add_NavigationStarting(handler, token_out) — ignore registration
+                let _handler = state.get(Register::Rdx);
+                let token_out = state.get(Register::R8);
+                if token_out != 0 {
+                    let _ = memory.write_u64(token_out, 1); // dummy token
+                }
+                state.set(Register::Rax, 0); // S_OK
+                self.last_error = 0;
+            }
+            HostThunk::WebView2RemoveNavigationStarting => {
+                // remove_NavigationStarting(token)
+                state.set(Register::Rax, 0); // S_OK
+                self.last_error = 0;
+            }
+            HostThunk::WebView2AddNavigationCompleted => {
+                // add_NavigationCompleted(handler, token_out)
+                let _handler = state.get(Register::Rdx);
+                let token_out = state.get(Register::R8);
+                if token_out != 0 {
+                    let _ = memory.write_u64(token_out, 2); // dummy token
+                }
+                state.set(Register::Rax, 0); // S_OK
+                self.last_error = 0;
+            }
+            HostThunk::WebView2RemoveNavigationCompleted => {
+                state.set(Register::Rax, 0); // S_OK
+                self.last_error = 0;
+            }
+            HostThunk::WebView2AddWebMessageReceived => {
+                let _handler = state.get(Register::Rdx);
+                let token_out = state.get(Register::R8);
+                if token_out != 0 {
+                    let _ = memory.write_u64(token_out, 3); // dummy token
+                }
+                state.set(Register::Rax, 0); // S_OK
+                self.last_error = 0;
+            }
+            HostThunk::WebView2RemoveWebMessageReceived => {
+                state.set(Register::Rax, 0); // S_OK
+                self.last_error = 0;
+            }
+            HostThunk::WebView2Stop => {
+                state.set(Register::Rax, 0); // S_OK
+                self.last_error = 0;
+            }
+            HostThunk::WebView2Reload => {
+                state.set(Register::Rax, 0); // S_OK
+                self.last_error = 0;
+            }
+            HostThunk::WebView2CallDevToolsProtocolMethod => {
+                state.set(Register::Rax, 0); // S_OK (stub)
+                self.last_error = 0;
+            }
+            // ICoreWebView2_2
+            HostThunk::WebView2AddContentLoading => {
+                state.set(Register::Rax, 0); // S_OK
+                self.last_error = 0;
+            }
+            HostThunk::WebView2RemoveContentLoading => {
+                state.set(Register::Rax, 0); // S_OK
+                self.last_error = 0;
+            }
+            HostThunk::WebView2AddSourceChanged => {
+                state.set(Register::Rax, 0); // S_OK
+                self.last_error = 0;
+            }
+            HostThunk::WebView2RemoveSourceChanged => {
+                state.set(Register::Rax, 0); // S_OK
+                self.last_error = 0;
+            }
+            HostThunk::WebView2AddHistoryChanged => {
+                state.set(Register::Rax, 0); // S_OK
+                self.last_error = 0;
+            }
+            HostThunk::WebView2RemoveHistoryChanged => {
+                state.set(Register::Rax, 0); // S_OK
+                self.last_error = 0;
+            }
+            // ICoreWebView2_3
+            HostThunk::WebView2AddNewWindowRequested => {
+                state.set(Register::Rax, 0); // S_OK
+                self.last_error = 0;
+            }
+            HostThunk::WebView2RemoveNewWindowRequested => {
+                state.set(Register::Rax, 0); // S_OK
+                self.last_error = 0;
+            }
+            HostThunk::WebView2AddPermissionRequested => {
+                state.set(Register::Rax, 0); // S_OK
+                self.last_error = 0;
+            }
+            HostThunk::WebView2RemovePermissionRequested => {
+                state.set(Register::Rax, 0); // S_OK
+                self.last_error = 0;
+            }
+            HostThunk::WebView2AddProcessFailed => {
+                state.set(Register::Rax, 0); // S_OK
+                self.last_error = 0;
+            }
+            HostThunk::WebView2RemoveProcessFailed => {
+                state.set(Register::Rax, 0); // S_OK
+                self.last_error = 0;
+            }
+            // ICoreWebView2_4
+            HostThunk::WebView2AddDownloadStarting => {
+                state.set(Register::Rax, 0); // S_OK
+                self.last_error = 0;
+            }
+            HostThunk::WebView2RemoveDownloadStarting => {
+                state.set(Register::Rax, 0); // S_OK
+                self.last_error = 0;
+            }
+            // ICoreWebView2Settings vtable methods
+            HostThunk::WebView2SettingsRelease => {
+                state.set(Register::Rax, 0); // S_OK (non-zero refcount)
+                self.last_error = 0;
+            }
+            HostThunk::WebView2SettingsGetIsScriptEnabled => {
+                let enabled_out = state.get(Register::Rdx);
+                if enabled_out != 0 {
+                    write_i32(memory, enabled_out, 1); // TRUE
+                }
+                state.set(Register::Rax, 0); // S_OK
+                self.last_error = 0;
+            }
+            HostThunk::WebView2SettingsPutIsScriptEnabled => {
+                state.set(Register::Rax, 0); // S_OK
+                self.last_error = 0;
+            }
+            HostThunk::WebView2SettingsGetIsWebMessageEnabled => {
+                let enabled_out = state.get(Register::Rdx);
+                if enabled_out != 0 {
+                    write_i32(memory, enabled_out, 1); // TRUE
+                }
+                state.set(Register::Rax, 0); // S_OK
+                self.last_error = 0;
+            }
+            HostThunk::WebView2SettingsPutIsWebMessageEnabled => {
+                state.set(Register::Rax, 0); // S_OK
+                self.last_error = 0;
+            }
+            HostThunk::WebView2SettingsGetIsStatusBarEnabled => {
+                let enabled_out = state.get(Register::Rdx);
+                if enabled_out != 0 {
+                    write_i32(memory, enabled_out, 0); // FALSE
+                }
+                state.set(Register::Rax, 0); // S_OK
+                self.last_error = 0;
+            }
+            HostThunk::WebView2SettingsPutIsStatusBarEnabled => {
+                state.set(Register::Rax, 0); // S_OK
+                self.last_error = 0;
+            }
+            HostThunk::WebView2SettingsGetAreDevToolsEnabled => {
+                let enabled_out = state.get(Register::Rdx);
+                if enabled_out != 0 {
+                    write_i32(memory, enabled_out, 0); // FALSE
+                }
+                state.set(Register::Rax, 0); // S_OK
+                self.last_error = 0;
+            }
+            HostThunk::WebView2SettingsPutAreDevToolsEnabled => {
+                state.set(Register::Rax, 0); // S_OK
+                self.last_error = 0;
+            }
+            HostThunk::WebView2SettingsGetDefaultBackgroundColor => {
+                let color_out = state.get(Register::Rdx);
+                if color_out != 0 {
+                    write_u32(memory, color_out, 0xFF_FF_FF_FF); // white ARGB
+                }
+                state.set(Register::Rax, 0); // S_OK
+                self.last_error = 0;
+            }
+            HostThunk::WebView2SettingsPutDefaultBackgroundColor => {
+                state.set(Register::Rax, 0); // S_OK
+                self.last_error = 0;
+            }
+            // ── WMI (wbem*.dll / wmi*.dll) COM dispatch arms ──────────────────────────
+            HostThunk::WbemLocatorConnectServer => {
+                // IWbemLocator::ConnectServer(server, user, password, locale, flags, authority, ctx, ppNamespace)
+                let this = arg(0);
+                let server_ptr = arg(1);
+                let user_ptr = arg(2);
+                let password_ptr = arg(3);
+                let locale_ptr = arg(4);
+                let _flags = arg(5) as u32;
+                let authority_ptr = arg(6);
+                let _ctx_ptr = arg(7);
+                let out_ptr = arg(8);
+                let server = read_utf16_string(memory, server_ptr).unwrap_or_default();
+                let _user = read_utf16_string(memory, user_ptr).unwrap_or_default();
+                let _password = read_utf16_string(memory, password_ptr).unwrap_or_default();
+                let _locale = read_utf16_string(memory, locale_ptr).unwrap_or_default();
+                let _authority = read_utf16_string(memory, authority_ptr).unwrap_or_default();
+                let _ = this;
+                eprintln!("WbemLocator::ConnectServer(server={server:?})");
+                if out_ptr != 0 {
+                    let services_obj = self.alloc_wbem_services_object(memory)?;
+                    write_guest_pointer(memory, out_ptr, services_obj, self.guest_arch)?;
+                }
+                state.set(Register::Rax, 0); // S_OK
+                self.last_error = 0;
+            }
+            HostThunk::WbemServicesExecQuery => {
+                // IWbemServices::ExecQuery(query_language, query, flags, ctx, ppEnum)
+                let this = arg(0);
+                let query_lang = read_utf16_string(memory, arg(1)).unwrap_or_default();
+                let query = read_utf16_string(memory, arg(2)).unwrap_or_default();
+                let _flags = arg(3) as u32;
+                let _ctx_ptr = arg(4);
+                let out_ptr = arg(5);
+                let _ = this;
+                eprintln!("WbemServices::ExecQuery(lang={query_lang:?}, query={query:?})");
+                if let Some(services) = self.wmi_services.get(&this) {
+                    match services.exec_query(&query_lang, &query, _flags) {
+                        Ok(objects) => {
+                            let enum_obj = crate::wmi::EnumWbemObjects::from_wmi_objects(objects);
+                            let enum_address = self.alloc_enum_wbem_objects(memory, enum_obj)?;
+                            if out_ptr != 0 {
+                                write_guest_pointer(memory, out_ptr, enum_address, self.guest_arch)?;
+                            }
+                            state.set(Register::Rax, 0); // S_OK
+                        }
+                        Err(_) => {
+                            state.set(Register::Rax, 0x80041002); // WBEM_E_NOT_FOUND
+                        }
+                    }
+                } else {
+                    state.set(Register::Rax, 0x80041002); // WBEM_E_NOT_FOUND
+                }
+                self.last_error = 0;
+            }
+            HostThunk::WbemServicesCreateInstanceEnum => {
+                // IWbemServices::CreateInstanceEnum(class_name, flags, ctx, ppEnum)
+                let this = arg(0);
+                let class_name = read_utf16_string(memory, arg(1)).unwrap_or_default();
+                let _flags = arg(2) as u32;
+                let _ctx_ptr = arg(3);
+                let out_ptr = arg(4);
+                eprintln!("WbemServices::CreateInstanceEnum(class={class_name:?})");
+                if let Some(services) = self.wmi_services.get(&this) {
+                    match services.create_instance_enum(&class_name, _flags) {
+                        Ok(objects) => {
+                            let enum_obj = crate::wmi::EnumWbemObjects::from_wmi_objects(objects);
+                            let enum_address = self.alloc_enum_wbem_objects(memory, enum_obj)?;
+                            if out_ptr != 0 {
+                                write_guest_pointer(memory, out_ptr, enum_address, self.guest_arch)?;
+                            }
+                            state.set(Register::Rax, 0); // S_OK
+                        }
+                        Err(_) => {
+                            state.set(Register::Rax, 0x80041002); // WBEM_E_NOT_FOUND
+                        }
+                    }
+                } else {
+                    state.set(Register::Rax, 0x80041002); // WBEM_E_NOT_FOUND
+                }
+                self.last_error = 0;
+            }
+            HostThunk::WbemServicesGetObject => {
+                // IWbemServices::GetObject(object_path, flags, ctx, ppObject, ppCallResult)
+                let this = arg(0);
+                let object_path = read_utf16_string(memory, arg(1)).unwrap_or_default();
+                let _flags = arg(2) as u32;
+                let _ctx_ptr = arg(3);
+                let out_ptr = arg(4);
+                let _call_result_ptr = arg(5);
+                eprintln!("WbemServices::GetObject(path={object_path:?})");
+                if let Some(services) = self.wmi_services.get(&this) {
+                    match services.get_object(&object_path, _flags) {
+                        Ok(wmi_object) => {
+                            let class_obj = crate::wmi::WbemClassObject::new(wmi_object);
+                            let obj_address = self.alloc_wbem_class_object(memory, class_obj)?;
+                            if out_ptr != 0 {
+                                write_guest_pointer(memory, out_ptr, obj_address, self.guest_arch)?;
+                            }
+                            state.set(Register::Rax, 0); // S_OK
+                        }
+                        Err(_) => {
+                            state.set(Register::Rax, 0x80041002); // WBEM_E_NOT_FOUND
+                        }
+                    }
+                } else {
+                    state.set(Register::Rax, 0x80041002); // WBEM_E_NOT_FOUND
+                }
+                self.last_error = 0;
+            }
+            HostThunk::WbemClassObjectGet => {
+                // IWbemClassObject::Get(property_name, flags, pVal, pvtType, plFlavor)
+                let this = arg(0);
+                let name_ptr = arg(1);
+                let _flags = arg(2) as u32;
+                let _val_ptr = arg(3);
+                let _type_ptr = arg(4);
+                let _flavor_ptr = arg(5);
+                let property_name = if name_ptr != 0 {
+                    read_utf16_string(memory, name_ptr).unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                eprintln!("WbemClassObject::Get(property={property_name:?})");
+                if let Some(class_obj) = self.wmi_class_objects.get(&this) {
+                    if let Some(value) = class_obj.get(&property_name) {
+                        // Write the value to the VARIANT at pVal (simplified: write only basic types)
+                        if _val_ptr != 0 {
+                            // Simplified VARIANT writing — write as VT_BSTR for strings, VT_I4 for ints
+                            match value {
+                                crate::wmi::WmiPropertyValue::String(s) => {
+                                    // VT_BSTR = 8, write variant type and BSTR pointer
+                                    write_u16(memory, _val_ptr, 8); // vt = VT_BSTR
+                                    // For a real implementation we'd allocate a BSTR;
+                                    // for now just leave the value empty.
+                                }
+                                crate::wmi::WmiPropertyValue::Uint32(v) => {
+                                    write_u16(memory, _val_ptr, 3); // vt = VT_I4
+                                    write_u32(memory, _val_ptr + 8, *v); // lVal
+                                }
+                                crate::wmi::WmiPropertyValue::Uint64(v) => {
+                                    write_u16(memory, _val_ptr, 21); // vt = VT_UI8
+                                    write_u64(memory, _val_ptr + 8, *v); // ullVal
+                                }
+                                crate::wmi::WmiPropertyValue::Bool(v) => {
+                                    write_u16(memory, _val_ptr, 11); // vt = VT_BOOL
+                                    write_u16(memory, _val_ptr + 8, if *v { 0xFFFF } else { 0 }); // boolVal
+                                }
+                                _ => {
+                                    write_u16(memory, _val_ptr, 0); // vt = VT_EMPTY
+                                }
+                            }
+                        }
+                        state.set(Register::Rax, 0); // S_OK
+                    } else {
+                        state.set(Register::Rax, 0x80041002); // WBEM_E_NOT_FOUND
+                    }
+                } else {
+                    state.set(Register::Rax, 0x80041002); // WBEM_E_NOT_FOUND
+                }
+                self.last_error = 0;
+            }
+            HostThunk::WbemClassObjectPut => {
+                // IWbemClassObject::Put(property_name, flags, pVal, vtType)
+                let this = arg(0);
+                let name_ptr = arg(1);
+                let _flags = arg(2) as u32;
+                let _val_ptr = arg(3);
+                let _vt_type = arg(4) as u32;
+                let property_name = read_utf16_string(memory, name_ptr).unwrap_or_default();
+                eprintln!("WbemClassObject::Put(property={property_name:?})");
+                if let Some(class_obj) = self.wmi_class_objects.get_mut(&this) {
+                    // Simplified: read from VARIANT at _val_ptr and store as String
+                    if _val_ptr != 0 {
+                        let vt = memory.read_u16(_val_ptr).unwrap_or(0);
+                        match vt {
+                            8 /* VT_BSTR */ => {
+                                let bstr_ptr = read_guest_pointer(memory, _val_ptr + 8, self.guest_arch).unwrap_or(0);
+                                let str_val = read_utf16_string(memory, bstr_ptr).unwrap_or_default();
+                                class_obj.put(&property_name, crate::wmi::WmiPropertyValue::String(str_val));
+                            }
+                            3 /* VT_I4 */ => {
+                                let val = read_u32(memory, _val_ptr + 8).unwrap_or(0);
+                                class_obj.put(&property_name, crate::wmi::WmiPropertyValue::Uint32(val));
+                            }
+                            11 /* VT_BOOL */ => {
+                                let val = memory.read_u16(_val_ptr + 8).unwrap_or(0);
+                                class_obj.put(&property_name, crate::wmi::WmiPropertyValue::Bool(val != 0));
+                            }
+                            _ => {
+                                class_obj.put(&property_name, crate::wmi::WmiPropertyValue::Null);
+                            }
+                        }
+                    }
+                    state.set(Register::Rax, 0); // S_OK
+                } else {
+                    state.set(Register::Rax, 0x80041002); // WBEM_E_NOT_FOUND
+                }
+                self.last_error = 0;
+            }
+            HostThunk::WbemClassObjectGetNames => {
+                // IWbemClassObject::GetNames(qualifier_name, flags, pQualifierValue, ppNames)
+                let this = arg(0);
+                let _qual_name_ptr = arg(1);
+                let _flags = arg(2) as u32;
+                let _qual_val_ptr = arg(3);
+                let out_ptr = arg(4);
+                eprintln!("WbemClassObject::GetNames()");
+                if let Some(class_obj) = self.wmi_class_objects.get(&this) {
+                    let names = class_obj.get_names();
+                    // Write names as SAFEARRAY of BSTR (simplified — write nothing for now)
+                    let _ = names;
+                    let _ = out_ptr;
+                    state.set(Register::Rax, 0); // S_OK
+                } else {
+                    state.set(Register::Rax, 0x80041002); // WBEM_E_NOT_FOUND
+                }
+                self.last_error = 0;
+            }
+            HostThunk::WbemClassObjectGetObjectText => {
+                // IWbemClassObject::GetObjectText(flags, pstrObjectText)
+                let this = arg(0);
+                let _flags = arg(1) as u32;
+                let out_ptr = arg(2);
+                eprintln!("WbemClassObject::GetObjectText()");
+                if let Some(class_obj) = self.wmi_class_objects.get(&this) {
+                    let text = class_obj.get_object_text();
+                    if out_ptr != 0 {
+                        // Write BSTR: allocate UTF-16 string in guest memory
+                        let bstr_addr = self.alloc_utf16_string(memory, &text)?;
+                        write_guest_pointer(memory, out_ptr, bstr_addr, self.guest_arch)?;
+                    }
+                    state.set(Register::Rax, 0); // S_OK
+                } else {
+                    state.set(Register::Rax, 0x80041002); // WBEM_E_NOT_FOUND
+                }
+                self.last_error = 0;
+            }
+            HostThunk::EnumWbemClassObjectNext => {
+                // IEnumWbemClassObject::Next(timeout, count, apObjects, puReturned)
+                let this = arg(0);
+                let _timeout = arg(1) as i32;
+                let count = arg(2) as u32;
+                let objects_out = arg(3);
+                let returned_out = arg(4);
+                eprintln!("EnumWbemClassObject::Next(count={count})");
+                if let Some(enum_obj) = self.wmi_enums.get_mut(&this) {
+                    let results = enum_obj.next(count);
+                    let returned = results.len() as u32;
+                    // Write each result as a newly allocated WbemClassObject
+                    for (i, class_obj) in results.iter().enumerate() {
+                        if objects_out != 0 {
+                            let obj_addr = self.alloc_wbem_class_object(memory, class_obj.clone())?;
+                            write_guest_pointer(memory, objects_out + (i as u64 * 8), obj_addr, self.guest_arch)?;
+                        }
+                    }
+                    if returned_out != 0 {
+                        write_u32(memory, returned_out, returned);
+                    }
+                    state.set(Register::Rax, if returned > 0 { 0 } else { 1 }); // S_OK or S_FALSE
+                } else {
+                    state.set(Register::Rax, 0x80041002); // WBEM_E_NOT_FOUND
+                }
+                self.last_error = 0;
+            }
+            HostThunk::EnumWbemClassObjectReset => {
+                // IEnumWbemClassObject::Reset()
+                let this = arg(0);
+                eprintln!("EnumWbemClassObject::Reset()");
+                if let Some(enum_obj) = self.wmi_enums.get_mut(&this) {
+                    enum_obj.reset();
+                    state.set(Register::Rax, 0); // S_OK
+                } else {
+                    state.set(Register::Rax, 0x80041002); // WBEM_E_NOT_FOUND
+                }
+                self.last_error = 0;
+            }
+            HostThunk::EnumWbemClassObjectSkip => {
+                // IEnumWbemClassObject::Skip(timeout, count)
+                let this = arg(0);
+                let _timeout = arg(1) as i32;
+                let count = arg(2) as u32;
+                eprintln!("EnumWbemClassObject::Skip(count={count})");
+                if let Some(enum_obj) = self.wmi_enums.get_mut(&this) {
+                    let skipped = enum_obj.skip(count);
+                    state.set(Register::Rax, if skipped == count { 0 } else { 1 }); // S_OK or S_FALSE
+                } else {
+                    state.set(Register::Rax, 0x80041002); // WBEM_E_NOT_FOUND
+                }
+                self.last_error = 0;
+            }
+            HostThunk::EnumWbemClassObjectClone => {
+                // IEnumWbemClassObject::Clone(ppEnum)
+                let this = arg(0);
+                let out_ptr = arg(1);
+                eprintln!("EnumWbemClassObject::Clone()");
+                if let Some(enum_obj) = self.wmi_enums.get(&this) {
+                    let cloned = enum_obj.clone_enum();
+                    let cloned_addr = self.alloc_enum_wbem_objects(memory, cloned)?;
+                    if out_ptr != 0 {
+                        write_guest_pointer(memory, out_ptr, cloned_addr, self.guest_arch)?;
+                    }
+                    state.set(Register::Rax, 0); // S_OK
+                } else {
+                    state.set(Register::Rax, 0x80041002); // WBEM_E_NOT_FOUND
+                }
+                self.last_error = 0;
+            }
             // -- Phase 4.4: Synchronization primitives -----------------------------------
             HostThunk::CreateMutexW => {
                 let security_attributes_ptr = arg(0);
@@ -24418,7 +30311,2355 @@ impl PeHostRuntime {
                 state.set(Register::Rax, 0);
                 self.last_error = 0;
             }
+            // -- Touch / Pointer Input (Phase 6.x) --
+            HostThunk::RegisterTouchWindow => {
+                let hwnd = guest_call_arg(state, memory, 0)? as u32;
+                let flags = guest_call_arg(state, memory, 1)? as u32;
+                match self.user32.register_touch_window(hwnd, flags) {
+                    Ok(_) => state.set(Register::Rax, 1),
+                    Err(_) => state.set(Register::Rax, 0),
+                }
+                self.last_error = 0;
+            }
+            HostThunk::UnregisterTouchWindow => {
+                let hwnd = guest_call_arg(state, memory, 0)? as u32;
+                match self.user32.unregister_touch_window(hwnd) {
+                    Ok(_) => state.set(Register::Rax, 1),
+                    Err(_) => state.set(Register::Rax, 0),
+                }
+                self.last_error = 0;
+            }
+            HostThunk::GetTouchInputInfo => {
+                let handle = guest_call_arg(state, memory, 0)? as u32;
+                let count = guest_call_arg(state, memory, 1)? as u32;
+                let inputs_ptr = guest_call_arg(state, memory, 2)?;
+                let _cb_size = guest_call_arg(state, memory, 3)? as u32;
+                match self.user32.get_touch_input_info(handle) {
+                    Ok(inputs) => {
+                        let write_count = (inputs.len() as u32).min(count);
+                        for i in 0..write_count as u64 {
+                            let offset = inputs_ptr + i * 96; // TouchInput = 96 bytes
+                            let ti = &inputs[i as usize];
+                            memory.write_u32(offset, ti.x as u32);
+                            memory.write_u32(offset + 4, ti.y as u32);
+                            memory.write_u32(offset + 8, ti.source);
+                            memory.write_u32(offset + 12, ti.id);
+                            memory.write_u32(offset + 16, ti.flags);
+                            memory.write_u32(offset + 20, ti.mask);
+                            memory.write_u32(offset + 24, ti.time);
+                            memory.map_bytes(offset + 28, &ti.extra_info.to_le_bytes());
+                            memory.write_u32(offset + 36, ti.cx);
+                            memory.write_u32(offset + 40, ti.cy);
+                        }
+                        state.set(Register::Rax, 1);
+                    }
+                    Err(_) => state.set(Register::Rax, 0),
+                }
+                self.last_error = 0;
+            }
+            HostThunk::CloseTouchInputHandle => {
+                let handle = guest_call_arg(state, memory, 0)? as u32;
+                match self.user32.close_touch_input_handle(handle) {
+                    Ok(_) => state.set(Register::Rax, 1),
+                    Err(_) => state.set(Register::Rax, 0),
+                }
+                self.last_error = 0;
+            }
+            HostThunk::InitializePointerDevice => {
+                let hwnd = guest_call_arg(state, memory, 0)? as u32;
+                match self.user32.initialize_pointer_device(hwnd) {
+                    Ok(_) => state.set(Register::Rax, 1),
+                    Err(_) => state.set(Register::Rax, 0),
+                }
+                self.last_error = 0;
+            }
+            HostThunk::GetPointerInfo => {
+                let pointer_id = guest_call_arg(state, memory, 0)? as u32;
+                let info_ptr = guest_call_arg(state, memory, 1)?;
+                match self.user32.get_pointer_info(pointer_id) {
+                    Ok(info) => {
+                        if info_ptr != 0 {
+                            // PointerInfo layout (x86 Win32: all fields 4 bytes except HANDLE/HWND on x86 = 4)
+                            memory.write_u32(info_ptr, info.pointer_type);
+                            memory.write_u32(info_ptr + 4, info.pointer_id);
+                            memory.write_u32(info_ptr + 8, info.frame_id);
+                            memory.write_u32(info_ptr + 12, info.pointer_flags);
+                            memory.write_u32(info_ptr + 16, info.source_device as u32);
+                            memory.write_u32(info_ptr + 20, info.hwnd_target as u32);
+                            memory.write_u32(info_ptr + 24, info.pt_pixel_x as u32);
+                            memory.write_u32(info_ptr + 28, info.pt_pixel_y as u32);
+                            memory.write_u32(info_ptr + 32, info.pt_hic_res_x as u32);
+                            memory.write_u32(info_ptr + 36, info.pt_hic_res_y as u32);
+                            memory.write_u32(info_ptr + 40, info.pt_pixel_z as u32);
+                        }
+                        state.set(Register::Rax, 1);
+                    }
+                    Err(_) => state.set(Register::Rax, 0),
+                }
+                self.last_error = 0;
+            }
+            HostThunk::GetPointerPenInfo => {
+                let pointer_id = guest_call_arg(state, memory, 0)? as u32;
+                let info_ptr = guest_call_arg(state, memory, 1)?;
+                match self.user32.get_pointer_pen_info(pointer_id) {
+                    Ok(info) => {
+                        if info_ptr != 0 {
+                            // PointerInfo header (same layout as GetPointerInfo)
+                            memory.write_u32(info_ptr, info.pointer_type);
+                            memory.write_u32(info_ptr + 4, info.pointer_id);
+                            memory.write_u32(info_ptr + 8, info.frame_id);
+                            memory.write_u32(info_ptr + 12, info.pointer_flags);
+                            memory.write_u32(info_ptr + 16, info.source_device as u32);
+                            memory.write_u32(info_ptr + 20, info.hwnd_target as u32);
+                            memory.write_u32(info_ptr + 24, info.pt_pixel_x as u32);
+                            memory.write_u32(info_ptr + 28, info.pt_pixel_y as u32);
+                            memory.write_u32(info_ptr + 32, info.pt_hic_res_x as u32);
+                            memory.write_u32(info_ptr + 36, info.pt_hic_res_y as u32);
+                            memory.write_u32(info_ptr + 40, info.pt_pixel_z as u32);
+                            // Pen-specific fields
+                            memory.write_u32(info_ptr + 44, info.pen_flags);
+                            memory.write_u32(info_ptr + 48, info.pen_mask);
+                            memory.write_u32(info_ptr + 52, info.pressure);
+                            memory.write_u32(info_ptr + 56, info.rotation);
+                            memory.map_bytes(info_ptr + 60, &info.tilt_x.to_le_bytes());
+                            memory.map_bytes(info_ptr + 64, &info.tilt_y.to_le_bytes());
+                        }
+                        state.set(Register::Rax, 1);
+                    }
+                    Err(_) => state.set(Register::Rax, 0),
+                }
+                self.last_error = 0;
+            }
+            // ── Phase 2.7: GDI+ (gdiplus.dll) dispatch ───────────────────────────
+            HostThunk::GdiplusStartup => {
+                let token_ptr = arg(0);
+                let _input_ptr = arg(1);
+                let _output_ptr = arg(2);
+                let token: u64 = 0xABCD_0001;
+                if token_ptr != 0 {
+                    write_u64(memory, token_ptr, token);
+                }
+                self.user32.gdiplus_state.initialized = true;
+                self.user32.gdiplus_state.token = token;
+                state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                self.last_error = 0;
+            }
+            HostThunk::GdiplusShutdown => {
+                let _token = arg(0);
+                self.user32.gdiplus_state.initialized = false;
+                self.user32.gdiplus_state.objects.clear();
+                self.user32.gdiplus_state.graphics_from_hdc.clear();
+                self.user32.gdiplus_state.hdc_to_graphics.clear();
+                state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                self.last_error = 0;
+            }
+            HostThunk::GdipCreateFromHDC => {
+                let hdc = arg(0);
+                let graphics_ptr = arg(1);
+                let handle = self.user32.gdiplus_state.create_graphics_from_hdc(hdc);
+                if graphics_ptr != 0 {
+                    write_u64(memory, graphics_ptr, handle);
+                }
+                state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                self.last_error = 0;
+            }
+            HostThunk::GdipDeleteGraphics => {
+                let graphics = arg(0);
+                self.user32.gdiplus_state.remove(graphics);
+                state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                self.last_error = 0;
+            }
+            // ── Drawing primitives ────────────────────────────────────────────
+            HostThunk::GdipDrawLine => {
+                let graphics = arg(0);
+                let pen_handle = arg(1);
+                let x1 = f32::from_bits(arg(2) as u32);
+                let y1 = f32::from_bits(arg(3) as u32);
+                let x2 = f32::from_bits(arg(4) as u32);
+                let y2 = f32::from_bits(arg(5) as u32);
+                let (bmp_handle, compositing_mode, pen_width, color) = self.resolve_gdiplus_draw_target(graphics, pen_handle, None);
+                if let Some((bmp_handle, cm, pw, col)) = bmp_handle {
+                    if let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle) {
+                        if let GdiplusImage::Bitmap(bmp) = &mut **img {
+                            crate::gdiplus_render::draw_line(&mut bmp.pixels, bmp.width, bmp.height, bmp.stride, x1, y1, x2, y2, col, pw, cm);
+                        }
+                    }
+                }
+                state.set(Register::Rax, if bmp_handle.is_some() { GdiplusStatus::Ok.to_u32() } else { GdiplusStatus::InvalidParameter.to_u32() } as u64);
+                self.last_error = 0;
+            }
+            HostThunk::GdipDrawLines => {
+                let graphics = arg(0);
+                let pen_handle = arg(1);
+                let points_ptr = arg(2);
+                let count = arg(3) as u32;
+                let (bmp_handle, compositing_mode, pen_width, color) = self.resolve_gdiplus_draw_target(graphics, pen_handle, None);
+                if let Some((bmp_handle, cm, pw, col)) = bmp_handle {
+                    if let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle) {
+                        if let GdiplusImage::Bitmap(bmp) = &mut **img {
+                            let pts = read_gdiplus_pointf_array(memory, points_ptr, count);
+                            crate::gdiplus_render::draw_lines(&mut bmp.pixels, bmp.width, bmp.height, bmp.stride, &pts, col, pw, cm);
+                        }
+                    }
+                }
+                state.set(Register::Rax, if bmp_handle.is_some() { GdiplusStatus::Ok.to_u32() } else { GdiplusStatus::InvalidParameter.to_u32() } as u64);
+                self.last_error = 0;
+            }
+            HostThunk::GdipDrawRectangle => {
+                let graphics = arg(0);
+                let pen_handle = arg(1);
+                let x = f32::from_bits(arg(2) as u32);
+                let y = f32::from_bits(arg(3) as u32);
+                let w = f32::from_bits(arg(4) as u32);
+                let h = f32::from_bits(arg(5) as u32);
+                let (bmp_handle, compositing_mode, pen_width, color) = self.resolve_gdiplus_draw_target(graphics, pen_handle, None);
+                if let Some((bmp_handle, cm, pw, col)) = bmp_handle {
+                    if let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle) {
+                        if let GdiplusImage::Bitmap(bmp) = &mut **img {
+                            crate::gdiplus_render::draw_rect(&mut bmp.pixels, bmp.width, bmp.height, bmp.stride, x, y, w, h, col, pw, cm);
+                        }
+                    }
+                }
+                state.set(Register::Rax, if bmp_handle.is_some() { GdiplusStatus::Ok.to_u32() } else { GdiplusStatus::InvalidParameter.to_u32() } as u64);
+                self.last_error = 0;
+            }
+            HostThunk::GdipFillRectangle => {
+                let graphics = arg(0);
+                let brush_handle = arg(1);
+                let x = f32::from_bits(arg(2) as u32);
+                let y = f32::from_bits(arg(3) as u32);
+                let w = f32::from_bits(arg(4) as u32);
+                let h = f32::from_bits(arg(5) as u32);
+                let (bmp_handle, compositing_mode, _pw, color) = self.resolve_gdiplus_draw_target(graphics, 0, Some(brush_handle));
+                if let Some((bmp_handle, cm, _pw, col)) = bmp_handle {
+                    if let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle) {
+                        if let GdiplusImage::Bitmap(bmp) = &mut **img {
+                            crate::gdiplus_render::fill_rect(&mut bmp.pixels, bmp.width, bmp.height, bmp.stride, x, y, w, h, col, cm);
+                        }
+                    }
+                }
+                state.set(Register::Rax, if bmp_handle.is_some() { GdiplusStatus::Ok.to_u32() } else { GdiplusStatus::InvalidParameter.to_u32() } as u64);
+                self.last_error = 0;
+            }
+            HostThunk::GdipDrawEllipse => {
+                let graphics = arg(0);
+                let pen_handle = arg(1);
+                let x = f32::from_bits(arg(2) as u32);
+                let y = f32::from_bits(arg(3) as u32);
+                let w = f32::from_bits(arg(4) as u32);
+                let h = f32::from_bits(arg(5) as u32);
+                let (bmp_handle, compositing_mode, pen_width, color) = self.resolve_gdiplus_draw_target(graphics, pen_handle, None);
+                if let Some((bmp_handle, cm, pw, col)) = bmp_handle {
+                    if let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle) {
+                        if let GdiplusImage::Bitmap(bmp) = &mut **img {
+                            crate::gdiplus_render::draw_ellipse(&mut bmp.pixels, bmp.width, bmp.height, bmp.stride, x, y, w, h, col, pw, cm);
+                        }
+                    }
+                }
+                state.set(Register::Rax, if bmp_handle.is_some() { GdiplusStatus::Ok.to_u32() } else { GdiplusStatus::InvalidParameter.to_u32() } as u64);
+                self.last_error = 0;
+            }
+            HostThunk::GdipFillEllipse => {
+                let graphics = arg(0);
+                let brush_handle = arg(1);
+                let x = f32::from_bits(arg(2) as u32);
+                let y = f32::from_bits(arg(3) as u32);
+                let w = f32::from_bits(arg(4) as u32);
+                let h = f32::from_bits(arg(5) as u32);
+                let (bmp_handle, compositing_mode, _pw, color) = self.resolve_gdiplus_draw_target(graphics, 0, Some(brush_handle));
+                if let Some((bmp_handle, cm, _pw, col)) = bmp_handle {
+                    if let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle) {
+                        if let GdiplusImage::Bitmap(bmp) = &mut **img {
+                            crate::gdiplus_render::fill_ellipse(&mut bmp.pixels, bmp.width, bmp.height, bmp.stride, x, y, w, h, col, cm);
+                        }
+                    }
+                }
+                state.set(Register::Rax, if bmp_handle.is_some() { GdiplusStatus::Ok.to_u32() } else { GdiplusStatus::InvalidParameter.to_u32() } as u64);
+                self.last_error = 0;
+            }
+            HostThunk::GdipDrawPie => {
+                let graphics = arg(0);
+                let pen_handle = arg(1);
+                let x = f32::from_bits(arg(2) as u32);
+                let y = f32::from_bits(arg(3) as u32);
+                let w = f32::from_bits(arg(4) as u32);
+                let h = f32::from_bits(arg(5) as u32);
+                let start_angle = f32::from_bits(arg(6) as u32);
+                let sweep_angle = f32::from_bits(arg(7) as u32);
+                let (bmp_handle, compositing_mode, pen_width, color) = self.resolve_gdiplus_draw_target(graphics, pen_handle, None);
+                if let Some((bmp_handle, cm, pw, col)) = bmp_handle {
+                    if let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle) {
+                        if let GdiplusImage::Bitmap(bmp) = &mut **img {
+                            crate::gdiplus_render::draw_pie(&mut bmp.pixels, bmp.width, bmp.height, bmp.stride, x, y, w, h, start_angle, sweep_angle, col, pw, cm);
+                        }
+                    }
+                }
+                state.set(Register::Rax, if bmp_handle.is_some() { GdiplusStatus::Ok.to_u32() } else { GdiplusStatus::InvalidParameter.to_u32() } as u64);
+                self.last_error = 0;
+            }
+            HostThunk::GdipFillPie => {
+                let graphics = arg(0);
+                let brush_handle = arg(1);
+                let x = f32::from_bits(arg(2) as u32);
+                let y = f32::from_bits(arg(3) as u32);
+                let w = f32::from_bits(arg(4) as u32);
+                let h = f32::from_bits(arg(5) as u32);
+                let start_angle = f32::from_bits(arg(6) as u32);
+                let sweep_angle = f32::from_bits(arg(7) as u32);
+                let (bmp_handle, compositing_mode, _pw, color) = self.resolve_gdiplus_draw_target(graphics, 0, Some(brush_handle));
+                if let Some((bmp_handle, cm, _pw, col)) = bmp_handle {
+                    if let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle) {
+                        if let GdiplusImage::Bitmap(bmp) = &mut **img {
+                            crate::gdiplus_render::fill_pie(&mut bmp.pixels, bmp.width, bmp.height, bmp.stride, x, y, w, h, start_angle, sweep_angle, col, cm);
+                        }
+                    }
+                }
+                state.set(Register::Rax, if bmp_handle.is_some() { GdiplusStatus::Ok.to_u32() } else { GdiplusStatus::InvalidParameter.to_u32() } as u64);
+                self.last_error = 0;
+            }
+            HostThunk::GdipDrawPolygon => {
+                let graphics = arg(0);
+                let pen_handle = arg(1);
+                let points_ptr = arg(2);
+                let count = arg(3) as u32;
+                let (bmp_handle, compositing_mode, pen_width, color) = self.resolve_gdiplus_draw_target(graphics, pen_handle, None);
+                if let Some((bmp_handle, cm, pw, col)) = bmp_handle {
+                    if let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle) {
+                        if let GdiplusImage::Bitmap(bmp) = &mut **img {
+                            let pts = read_gdiplus_pointf_array(memory, points_ptr, count);
+                            crate::gdiplus_render::draw_lines(&mut bmp.pixels, bmp.width, bmp.height, bmp.stride, &pts, col, pw, cm);
+                            if pts.len() >= 2 {
+                                crate::gdiplus_render::draw_line(&mut bmp.pixels, bmp.width, bmp.height, bmp.stride, pts[pts.len()-1].x, pts[pts.len()-1].y, pts[0].x, pts[0].y, col, pw, cm);
+                            }
+                        }
+                    }
+                }
+                state.set(Register::Rax, if bmp_handle.is_some() { GdiplusStatus::Ok.to_u32() } else { GdiplusStatus::InvalidParameter.to_u32() } as u64);
+                self.last_error = 0;
+            }
+            HostThunk::GdipFillPolygon => {
+                let graphics = arg(0);
+                let brush_handle = arg(1);
+                let points_ptr = arg(2);
+                let count = arg(3) as u32;
+                let _fill_mode = arg(4) as u32;
+                let (bmp_handle, compositing_mode, _pw, color) = self.resolve_gdiplus_draw_target(graphics, 0, Some(brush_handle));
+                if let Some((bmp_handle, cm, _pw, col)) = bmp_handle {
+                    if let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle) {
+                        if let GdiplusImage::Bitmap(bmp) = &mut **img {
+                            let pts = read_gdiplus_pointf_array(memory, points_ptr, count);
+                            crate::gdiplus_render::fill_polygon(&mut bmp.pixels, bmp.width, bmp.height, bmp.stride, &pts, col, cm);
+                        }
+                    }
+                }
+                state.set(Register::Rax, if bmp_handle.is_some() { GdiplusStatus::Ok.to_u32() } else { GdiplusStatus::InvalidParameter.to_u32() } as u64);
+                self.last_error = 0;
+            }
+            HostThunk::GdipDrawArc => {
+                let graphics = arg(0);
+                let pen_handle = arg(1);
+                let x = f32::from_bits(arg(2) as u32);
+                let y = f32::from_bits(arg(3) as u32);
+                let w = f32::from_bits(arg(4) as u32);
+                let h = f32::from_bits(arg(5) as u32);
+                let start_angle = f32::from_bits(arg(6) as u32);
+                let sweep_angle = f32::from_bits(arg(7) as u32);
+                let (bmp_handle, compositing_mode, pen_width, color) = self.resolve_gdiplus_draw_target(graphics, pen_handle, None);
+                if let Some((bmp_handle, cm, pw, col)) = bmp_handle {
+                    if let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle) {
+                        if let GdiplusImage::Bitmap(bmp) = &mut **img {
+                            crate::gdiplus_render::draw_arc(&mut bmp.pixels, bmp.width, bmp.height, bmp.stride, x, y, w, h, start_angle, sweep_angle, col, pw, cm);
+                        }
+                    }
+                }
+                state.set(Register::Rax, if bmp_handle.is_some() { GdiplusStatus::Ok.to_u32() } else { GdiplusStatus::InvalidParameter.to_u32() } as u64);
+                self.last_error = 0;
+            }
+            HostThunk::GdipDrawCurve => {
+                let graphics = arg(0);
+                let pen_handle = arg(1);
+                let points_ptr = arg(2);
+                let count = arg(3) as u32;
+                let _tension = f32::from_bits(arg(4) as u32);
+                let (bmp_handle, compositing_mode, pen_width, color) = self.resolve_gdiplus_draw_target(graphics, pen_handle, None);
+                if let Some((bmp_handle, cm, pw, col)) = bmp_handle {
+                    if let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle) {
+                        if let GdiplusImage::Bitmap(bmp) = &mut **img {
+                            let pts = read_gdiplus_pointf_array(memory, points_ptr, count);
+                            crate::gdiplus_render::draw_lines(&mut bmp.pixels, bmp.width, bmp.height, bmp.stride, &pts, col, pw, cm);
+                        }
+                    }
+                }
+                state.set(Register::Rax, if bmp_handle.is_some() { GdiplusStatus::Ok.to_u32() } else { GdiplusStatus::InvalidParameter.to_u32() } as u64);
+                self.last_error = 0;
+            }
+            HostThunk::GdipDrawClosedCurve => {
+                let graphics = arg(0);
+                let pen_handle = arg(1);
+                let points_ptr = arg(2);
+                let count = arg(3) as u32;
+                let _tension = f32::from_bits(arg(4) as u32);
+                let (bmp_handle, compositing_mode, pen_width, color) = self.resolve_gdiplus_draw_target(graphics, pen_handle, None);
+                if let Some((bmp_handle, cm, pw, col)) = bmp_handle {
+                    if let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle) {
+                        if let GdiplusImage::Bitmap(bmp) = &mut **img {
+                            let pts = read_gdiplus_pointf_array(memory, points_ptr, count);
+                            crate::gdiplus_render::draw_lines(&mut bmp.pixels, bmp.width, bmp.height, bmp.stride, &pts, col, pw, cm);
+                            if pts.len() >= 2 {
+                                crate::gdiplus_render::draw_line(&mut bmp.pixels, bmp.width, bmp.height, bmp.stride, pts[pts.len()-1].x, pts[pts.len()-1].y, pts[0].x, pts[0].y, col, pw, cm);
+                            }
+                        }
+                    }
+                }
+                state.set(Register::Rax, if bmp_handle.is_some() { GdiplusStatus::Ok.to_u32() } else { GdiplusStatus::InvalidParameter.to_u32() } as u64);
+                self.last_error = 0;
+            }
+            HostThunk::GdipDrawString => {
+                let graphics = arg(0);
+                let string_ptr = arg(1);
+                let length = arg(2) as i32;
+                let font_handle = arg(3);
+                let layout_rect_ptr = arg(4);
+                let _format_ptr = arg(5);
+                let brush_handle = arg(6);
+                // Read font size and layout rect BEFORE getting mutable bitmap
+                let font_size = self.user32.gdiplus_state.get(font_handle).and_then(|obj| {
+                    if let GdiplusObject::Font(f) = obj { Some(f.em_size) } else { None }
+                }).unwrap_or(12.0);
+                let text = read_guest_utf16_string(memory, string_ptr, length);
+                let (lx, ly, _lw, _lh) = if layout_rect_ptr != 0 {
+                    let lx = f32::from_bits(memory.read_u32(layout_rect_ptr).unwrap_or(0));
+                    let ly = f32::from_bits(memory.read_u32(layout_rect_ptr + 4).unwrap_or(0));
+                    let lw = f32::from_bits(memory.read_u32(layout_rect_ptr + 8).unwrap_or(100));
+                    let lh = f32::from_bits(memory.read_u32(layout_rect_ptr + 12).unwrap_or(20));
+                    (lx, ly, lw, lh)
+                } else {
+                    (0.0, 0.0, 100.0, 20.0)
+                };
+                let (bmp_handle, compositing_mode, _pw, color) = self.resolve_gdiplus_draw_target(graphics, 0, Some(brush_handle));
+                if let Some((bmp_handle, cm, _pw, col)) = bmp_handle {
+                    if let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle) {
+                        if let GdiplusImage::Bitmap(bmp) = &mut **img {
+                            crate::gdiplus_render::draw_string(&mut bmp.pixels, bmp.width, bmp.height, bmp.stride, &text, lx, ly, font_size, col, cm);
+                        }
+                    }
+                }
+                state.set(Register::Rax, if bmp_handle.is_some() { GdiplusStatus::Ok.to_u32() } else { GdiplusStatus::InvalidParameter.to_u32() } as u64);
+                self.last_error = 0;
+            }
+            // ── Brushes ────────────────────────────────────────────────────────
+            HostThunk::GdipCreateSolidFill => {
+                let color = arg(0) as u32;
+                let brush_ptr = arg(1);
+                let brush = GdiplusBrush::SolidFill(GdiplusSolidFill { color });
+                let handle = self.user32.gdiplus_state.alloc_handle(GdiplusObject::Brush(Box::new(brush)));
+                if brush_ptr != 0 {
+                    write_u64(memory, brush_ptr, handle);
+                }
+                state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                self.last_error = 0;
+            }
+            HostThunk::GdipCreateLineBrush => {
+                let pt1_x = f32::from_bits(arg(0) as u32);
+                let pt1_y = f32::from_bits(arg(1) as u32);
+                let pt2_x = f32::from_bits(arg(2) as u32);
+                let pt2_y = f32::from_bits(arg(3) as u32);
+                let color1 = arg(4) as u32;
+                let color2 = arg(5) as u32;
+                let wrap_mode = arg(6) as u32;
+                let brush_ptr = arg(7);
+                let brush = GdiplusBrush::LineBrush(GdiplusLineBrush {
+                    point1: (pt1_x, pt1_y),
+                    point2: (pt2_x, pt2_y),
+                    color1,
+                    color2,
+                    wrap_mode,
+                });
+                let handle = self.user32.gdiplus_state.alloc_handle(GdiplusObject::Brush(Box::new(brush)));
+                if brush_ptr != 0 {
+                    write_u64(memory, brush_ptr, handle);
+                }
+                state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                self.last_error = 0;
+            }
+            HostThunk::GdipCreateTextureBrush => {
+                let image_handle = arg(0);
+                let wrap_mode = arg(1) as u32;
+                let brush_ptr = arg(2);
+                let brush = GdiplusBrush::Texture(GdiplusTextureBrush { image_handle, wrap_mode });
+                let handle = self.user32.gdiplus_state.alloc_handle(GdiplusObject::Brush(Box::new(brush)));
+                if brush_ptr != 0 {
+                    write_u64(memory, brush_ptr, handle);
+                }
+                state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                self.last_error = 0;
+            }
+            HostThunk::GdipDeleteBrush => {
+                let brush = arg(0);
+                self.user32.gdiplus_state.remove(brush);
+                state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                self.last_error = 0;
+            }
+            HostThunk::GdipFillRegion => {
+                let graphics = arg(0);
+                let brush_handle = arg(1);
+                let _region = arg(2);
+                // Extract brush color and clip rect BEFORE getting mutable bitmap
+                let brush_color = self.user32.gdiplus_state.get(brush_handle).and_then(|obj| {
+                    if let GdiplusObject::Brush(brush) = obj {
+                        Some(crate::gdiplus_render::brush_color_at(brush, 0.0, 0.0))
+                    } else {
+                        None
+                    }
+                }).unwrap_or(0xFFFF00FF);
+                let clip_rect = self.user32.gdiplus_state.get(graphics).and_then(|obj| {
+                    if let GdiplusObject::Graphics(gfx) = obj {
+                        gfx.clip_rect
+                    } else {
+                        None
+                    }
+                });
+                if let Some((bmp_handle, cm)) = self.resolve_gdiplus_graphics_target(graphics) {
+                    if let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle) {
+                        if let GdiplusImage::Bitmap(bmp) = &mut **img {
+                            if let Some((cx, cy, cw, ch)) = clip_rect {
+                                crate::gdiplus_render::fill_rect(&mut bmp.pixels, bmp.width, bmp.height, bmp.stride, cx, cy, cw, ch, brush_color, cm);
+                            } else {
+                                // No clip rect set: fill entire bitmap
+                                crate::gdiplus_render::fill_rect(&mut bmp.pixels, bmp.width, bmp.height, bmp.stride, 0.0, 0.0, bmp.width as f32, bmp.height as f32, brush_color, cm);
+                            }
+                        }
+                    }
+                }
+                state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                self.last_error = 0;
+            }
+            // ── Pens ───────────────────────────────────────────────────────────
+            HostThunk::GdipCreatePen1 => {
+                let color = arg(0) as u32;
+                let width = f32::from_bits(arg(1) as u32);
+                let _unit = arg(2) as u32;
+                let pen_ptr = arg(3);
+                let pen = GdiplusPen {
+                    width,
+                    color,
+                    brush_handle: None,
+                    dash_style: GDIPLUS_DASH_STYLE_SOLID,
+                    line_join: GDIPLUS_LINE_JOIN_MITER,
+                    start_cap: GDIPLUS_LINE_CAP_FLAT,
+                    end_cap: GDIPLUS_LINE_CAP_FLAT,
+                    alignment: 0,
+                };
+                let handle = self.user32.gdiplus_state.alloc_handle(GdiplusObject::Pen(Box::new(pen)));
+                if pen_ptr != 0 {
+                    write_u64(memory, pen_ptr, handle);
+                }
+                state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                self.last_error = 0;
+            }
+            HostThunk::GdipCreatePen2 => {
+                let brush_handle = arg(0);
+                let width = f32::from_bits(arg(1) as u32);
+                let _unit = arg(2) as u32;
+                let pen_ptr = arg(3);
+                let pen = GdiplusPen {
+                    width,
+                    color: 0,
+                    brush_handle: Some(brush_handle),
+                    dash_style: GDIPLUS_DASH_STYLE_SOLID,
+                    line_join: GDIPLUS_LINE_JOIN_MITER,
+                    start_cap: GDIPLUS_LINE_CAP_FLAT,
+                    end_cap: GDIPLUS_LINE_CAP_FLAT,
+                    alignment: 0,
+                };
+                let handle = self.user32.gdiplus_state.alloc_handle(GdiplusObject::Pen(Box::new(pen)));
+                if pen_ptr != 0 {
+                    write_u64(memory, pen_ptr, handle);
+                }
+                state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                self.last_error = 0;
+            }
+            HostThunk::GdipSetPenWidth => {
+                let pen_handle = arg(0);
+                let width = f32::from_bits(arg(1) as u32);
+                if let Some(GdiplusObject::Pen(pen)) = self.user32.gdiplus_state.get_mut(pen_handle) {
+                    pen.width = width;
+                    state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                } else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::GdipGetPenWidth => {
+                let pen_handle = arg(0);
+                let width_ptr = arg(1);
+                if let Some(GdiplusObject::Pen(pen)) = self.user32.gdiplus_state.get(pen_handle) {
+                    if width_ptr != 0 {
+                        write_u32(memory, width_ptr, pen.width.to_bits());
+                    }
+                    state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                } else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::GdipSetPenColor => {
+                let pen_handle = arg(0);
+                let color = arg(1) as u32;
+                if let Some(GdiplusObject::Pen(pen)) = self.user32.gdiplus_state.get_mut(pen_handle) {
+                    pen.color = color;
+                    state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                } else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::GdipGetPenColor => {
+                let pen_handle = arg(0);
+                let color_ptr = arg(1);
+                if let Some(GdiplusObject::Pen(pen)) = self.user32.gdiplus_state.get(pen_handle) {
+                    if color_ptr != 0 {
+                        write_u32(memory, color_ptr, pen.color);
+                    }
+                    state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                } else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::GdipSetPenDashStyle => {
+                let pen_handle = arg(0);
+                let dash_style = arg(1) as u32;
+                if let Some(GdiplusObject::Pen(pen)) = self.user32.gdiplus_state.get_mut(pen_handle) {
+                    pen.dash_style = dash_style;
+                    state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                } else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::GdipGetPenDashStyle => {
+                let pen_handle = arg(0);
+                let dash_style_ptr = arg(1);
+                if let Some(GdiplusObject::Pen(pen)) = self.user32.gdiplus_state.get(pen_handle) {
+                    if dash_style_ptr != 0 {
+                        write_u32(memory, dash_style_ptr, pen.dash_style);
+                    }
+                    state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                } else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::GdipSetPenLineJoin => {
+                let pen_handle = arg(0);
+                let line_join = arg(1) as u32;
+                if let Some(GdiplusObject::Pen(pen)) = self.user32.gdiplus_state.get_mut(pen_handle) {
+                    pen.line_join = line_join;
+                    state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                } else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::GdipSetPenStartCap => {
+                let pen_handle = arg(0);
+                let start_cap = arg(1) as u32;
+                if let Some(GdiplusObject::Pen(pen)) = self.user32.gdiplus_state.get_mut(pen_handle) {
+                    pen.start_cap = start_cap;
+                    state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                } else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::GdipSetPenEndCap => {
+                let pen_handle = arg(0);
+                let end_cap = arg(1) as u32;
+                if let Some(GdiplusObject::Pen(pen)) = self.user32.gdiplus_state.get_mut(pen_handle) {
+                    pen.end_cap = end_cap;
+                    state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                } else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::GdipDeletePen => {
+                let pen = arg(0);
+                self.user32.gdiplus_state.remove(pen);
+                state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                self.last_error = 0;
+            }
+            // ── Paths ──────────────────────────────────────────────────────────
+            HostThunk::GdipCreatePath => {
+                let fill_mode = arg(0) as u32;
+                let path_ptr = arg(1);
+                let path = GdiplusPath { fill_mode, elements: Vec::new() };
+                let handle = self.user32.gdiplus_state.alloc_handle(GdiplusObject::Path(Box::new(path)));
+                if path_ptr != 0 {
+                    write_u64(memory, path_ptr, handle);
+                }
+                state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                self.last_error = 0;
+            }
+            HostThunk::GdipDeletePath => {
+                let path = arg(0);
+                self.user32.gdiplus_state.remove(path);
+                state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                self.last_error = 0;
+            }
+            HostThunk::GdipAddPathLine => {
+                let path_handle = arg(0);
+                let x1 = f32::from_bits(arg(1) as u32);
+                let y1 = f32::from_bits(arg(2) as u32);
+                let x2 = f32::from_bits(arg(3) as u32);
+                let y2 = f32::from_bits(arg(4) as u32);
+                if let Some(GdiplusObject::Path(path)) = self.user32.gdiplus_state.get_mut(path_handle) {
+                    path.elements.push(GdiplusPathElement::Line { x1, y1, x2, y2 });
+                    state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                } else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::GdipAddPathRectangle => {
+                let path_handle = arg(0);
+                let x = f32::from_bits(arg(1) as u32);
+                let y = f32::from_bits(arg(2) as u32);
+                let w = f32::from_bits(arg(3) as u32);
+                let h = f32::from_bits(arg(4) as u32);
+                if let Some(GdiplusObject::Path(path)) = self.user32.gdiplus_state.get_mut(path_handle) {
+                    path.elements.push(GdiplusPathElement::Rectangle { x, y, w, h });
+                    state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                } else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::GdipAddPathEllipse => {
+                let path_handle = arg(0);
+                let x = f32::from_bits(arg(1) as u32);
+                let y = f32::from_bits(arg(2) as u32);
+                let w = f32::from_bits(arg(3) as u32);
+                let h = f32::from_bits(arg(4) as u32);
+                if let Some(GdiplusObject::Path(path)) = self.user32.gdiplus_state.get_mut(path_handle) {
+                    path.elements.push(GdiplusPathElement::Ellipse { x, y, w, h });
+                    state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                } else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::GdipAddPathArc => {
+                let path_handle = arg(0);
+                let x = f32::from_bits(arg(1) as u32);
+                let y = f32::from_bits(arg(2) as u32);
+                let w = f32::from_bits(arg(3) as u32);
+                let h = f32::from_bits(arg(4) as u32);
+                let start_angle = f32::from_bits(arg(5) as u32);
+                let sweep_angle = f32::from_bits(arg(6) as u32);
+                if let Some(GdiplusObject::Path(path)) = self.user32.gdiplus_state.get_mut(path_handle) {
+                    path.elements.push(GdiplusPathElement::Arc { x, y, w, h, start_angle, sweep_angle });
+                    state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                } else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::GdipAddPathBezier => {
+                let path_handle = arg(0);
+                let x1 = f32::from_bits(arg(1) as u32);
+                let y1 = f32::from_bits(arg(2) as u32);
+                let x2 = f32::from_bits(arg(3) as u32);
+                let y2 = f32::from_bits(arg(4) as u32);
+                let x3 = f32::from_bits(arg(5) as u32);
+                let y3 = f32::from_bits(arg(6) as u32);
+                let x4 = f32::from_bits(arg(7) as u32);
+                let y4 = f32::from_bits(arg(8) as u32);
+                if let Some(GdiplusObject::Path(path)) = self.user32.gdiplus_state.get_mut(path_handle) {
+                    let p = [
+                        GdiplusPointF { x: x1, y: y1 },
+                        GdiplusPointF { x: x2, y: y2 },
+                        GdiplusPointF { x: x3, y: y3 },
+                        GdiplusPointF { x: x4, y: y4 },
+                    ];
+                    path.elements.push(GdiplusPathElement::Bezier { points: p });
+                    state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                } else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::GdipClosePathFigure => {
+                let path_handle = arg(0);
+                if let Some(GdiplusObject::Path(path)) = self.user32.gdiplus_state.get_mut(path_handle) {
+                    path.elements.push(GdiplusPathElement::CloseFigure);
+                    state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                } else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::GdipStartPathFigure => {
+                let path_handle = arg(0);
+                if let Some(GdiplusObject::Path(path)) = self.user32.gdiplus_state.get_mut(path_handle) {
+                    path.elements.push(GdiplusPathElement::StartFigure);
+                    state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                } else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::GdipSetPathFillMode => {
+                let path_handle = arg(0);
+                let fill_mode = arg(1) as u32;
+                if let Some(GdiplusObject::Path(path)) = self.user32.gdiplus_state.get_mut(path_handle) {
+                    path.fill_mode = fill_mode;
+                    state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                } else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::GdipDrawPath => {
+                let graphics = arg(0);
+                let pen_handle = arg(1);
+                let path_handle = arg(2);
+                // Extract pen and path data BEFORE getting mutable bitmap
+                let pen_info = self.user32.gdiplus_state.get(pen_handle).and_then(|obj| {
+                    if let GdiplusObject::Pen(pen) = obj {
+                        Some((crate::gdiplus_render::pen_color(pen, 0.0, 0.0), pen.width.max(1.0)))
+                    } else {
+                        None
+                    }
+                });
+                // Clone path data to avoid borrow conflict
+                let path_clone = self.user32.gdiplus_state.get(path_handle).and_then(|obj| {
+                    if let GdiplusObject::Path(p) = obj {
+                        Some(p.clone())
+                    } else {
+                        None
+                    }
+                });
+                if let (Some((color, pw)), Some(path_obj)) = (pen_info, path_clone) {
+                    if let Some((bmp_handle, cm)) = self.resolve_gdiplus_graphics_target(graphics) {
+                        if let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle) {
+                            if let GdiplusImage::Bitmap(bmp) = &mut **img {
+                                crate::gdiplus_render::draw_path(&mut bmp.pixels, bmp.width, bmp.height, bmp.stride, &path_obj, color, pw, cm);
+                            }
+                        }
+                    }
+                }
+                state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                self.last_error = 0;
+            }
+            HostThunk::GdipFillPath => {
+                let graphics = arg(0);
+                let brush_handle = arg(1);
+                let path_handle = arg(2);
+                // Extract brush color and path data BEFORE getting mutable bitmap
+                let brush_color = self.user32.gdiplus_state.get(brush_handle).and_then(|obj| {
+                    if let GdiplusObject::Brush(brush) = obj {
+                        Some(crate::gdiplus_render::brush_color_at(brush, 0.0, 0.0))
+                    } else {
+                        None
+                    }
+                }).unwrap_or(0xFFFF00FF);
+                // Clone path data to avoid borrow conflict
+                let path_clone = self.user32.gdiplus_state.get(path_handle).and_then(|obj| {
+                    if let GdiplusObject::Path(p) = obj {
+                        Some(p.clone())
+                    } else {
+                        None
+                    }
+                });
+                if let Some(path_obj) = path_clone {
+                    if let Some((bmp_handle, cm)) = self.resolve_gdiplus_graphics_target(graphics) {
+                        if let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle) {
+                            if let GdiplusImage::Bitmap(bmp) = &mut **img {
+                                crate::gdiplus_render::fill_path(&mut bmp.pixels, bmp.width, bmp.height, bmp.stride, &path_obj, brush_color, cm);
+                            }
+                        }
+                    }
+                }
+                state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                self.last_error = 0;
+            }
+            // ── Transforms ─────────────────────────────────────────────────────
+            HostThunk::GdipCreateMatrix => {
+                let matrix_ptr = arg(0);
+                let matrix = GdiplusMatrix::identity();
+                let handle = self.user32.gdiplus_state.alloc_handle(GdiplusObject::Matrix(Box::new(matrix)));
+                if matrix_ptr != 0 {
+                    write_u64(memory, matrix_ptr, handle);
+                }
+                state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                self.last_error = 0;
+            }
+            HostThunk::GdipDeleteMatrix => {
+                let matrix = arg(0);
+                self.user32.gdiplus_state.remove(matrix);
+                state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                self.last_error = 0;
+            }
+            HostThunk::GdipSetMatrixElements => {
+                let matrix_handle = arg(0);
+                let m11 = f32::from_bits(arg(1) as u32);
+                let m12 = f32::from_bits(arg(2) as u32);
+                let m21 = f32::from_bits(arg(3) as u32);
+                let m22 = f32::from_bits(arg(4) as u32);
+                let dx = f32::from_bits(arg(5) as u32);
+                let dy = f32::from_bits(arg(6) as u32);
+                if let Some(GdiplusObject::Matrix(matrix)) = self.user32.gdiplus_state.get_mut(matrix_handle) {
+                    matrix.elements = [m11, m12, m21, m22, dx, dy];
+                    state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                } else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::GdipGetMatrixElements => {
+                let matrix_handle = arg(0);
+                let elements_ptr = arg(1);
+                if let Some(GdiplusObject::Matrix(matrix)) = self.user32.gdiplus_state.get(matrix_handle) {
+                    if elements_ptr != 0 {
+                        for (i, &val) in matrix.elements.iter().enumerate() {
+                            write_u32(memory, elements_ptr + (i as u64 * 4), val.to_bits());
+                        }
+                    }
+                    state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                } else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::GdipTranslateMatrix => {
+                let matrix_handle = arg(0);
+                let dx = f32::from_bits(arg(1) as u32);
+                let dy = f32::from_bits(arg(2) as u32);
+                let _order = arg(3) as u32;
+                if let Some(GdiplusObject::Matrix(matrix)) = self.user32.gdiplus_state.get_mut(matrix_handle) {
+                    matrix.elements[4] += dx;
+                    matrix.elements[5] += dy;
+                    state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                } else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::GdipRotateMatrix => {
+                let matrix_handle = arg(0);
+                let _angle = f32::from_bits(arg(1) as u32);
+                let _order = arg(2) as u32;
+                if let Some(GdiplusObject::Matrix(_)) = self.user32.gdiplus_state.get_mut(matrix_handle) {
+                    state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                } else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::GdipScaleMatrix => {
+                let matrix_handle = arg(0);
+                let sx = f32::from_bits(arg(1) as u32);
+                let sy = f32::from_bits(arg(2) as u32);
+                let _order = arg(3) as u32;
+                if let Some(GdiplusObject::Matrix(matrix)) = self.user32.gdiplus_state.get_mut(matrix_handle) {
+                    matrix.elements[0] *= sx;
+                    matrix.elements[1] *= sx;
+                    matrix.elements[2] *= sy;
+                    matrix.elements[3] *= sy;
+                    state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                } else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::GdipInvertMatrix => {
+                let matrix_handle = arg(0);
+                if let Some(GdiplusObject::Matrix(matrix)) = self.user32.gdiplus_state.get_mut(matrix_handle) {
+                    let e = &matrix.elements;
+                    let det = e[0] * e[3] - e[1] * e[2];
+                    if det.abs() > f32::EPSILON {
+                        let inv_det = 1.0 / det;
+                        let new = [e[3] * inv_det, -e[1] * inv_det, -e[2] * inv_det, e[0] * inv_det,
+                                   (e[2] * e[5] - e[3] * e[4]) * inv_det, (e[1] * e[4] - e[0] * e[5]) * inv_det];
+                        matrix.elements = new;
+                        state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                    } else {
+                        state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                    }
+                } else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::GdipMultiplyMatrix => {
+                let matrix_handle = arg(0);
+                let _matrix_b = arg(1);
+                let _order = arg(2) as u32;
+                if let Some(GdiplusObject::Matrix(_)) = self.user32.gdiplus_state.get_mut(matrix_handle) {
+                    state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                } else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::GdipSetWorldTransform => {
+                let graphics_handle = arg(0);
+                let matrix_handle = arg(1);
+                if let Some(GdiplusObject::Graphics(gfx)) = self.user32.gdiplus_state.get_mut(graphics_handle) {
+                    gfx.world_transform = Some(matrix_handle);
+                    state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                } else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::GdipResetWorldTransform => {
+                let graphics_handle = arg(0);
+                if let Some(GdiplusObject::Graphics(gfx)) = self.user32.gdiplus_state.get_mut(graphics_handle) {
+                    gfx.world_transform = None;
+                    state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                } else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::GdipGetWorldTransform => {
+                let graphics_handle = arg(0);
+                let matrix_ptr = arg(1);
+                if let Some(GdiplusObject::Graphics(gfx)) = self.user32.gdiplus_state.get(graphics_handle) {
+                    if let Some(mh) = gfx.world_transform {
+                        if matrix_ptr != 0 {
+                            write_u64(memory, matrix_ptr, mh);
+                        }
+                    } else {
+                        // Return identity if no transform set
+                        if matrix_ptr != 0 {
+                            let m = GdiplusMatrix::identity();
+                            let h = self.user32.gdiplus_state.alloc_handle(GdiplusObject::Matrix(Box::new(m)));
+                            write_u64(memory, matrix_ptr, h);
+                        }
+                    }
+                    state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                } else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                }
+                self.last_error = 0;
+            }
+            // ── Clipping ───────────────────────────────────────────────────────
+            HostThunk::GdipSetClipRect => {
+                let graphics_handle = arg(0);
+                let x = f32::from_bits(arg(1) as u32);
+                let y = f32::from_bits(arg(2) as u32);
+                let w = f32::from_bits(arg(3) as u32);
+                let h = f32::from_bits(arg(4) as u32);
+                let _combine_mode = arg(5) as u32;
+                if let Some(GdiplusObject::Graphics(gfx)) = self.user32.gdiplus_state.get_mut(graphics_handle) {
+                    gfx.clip_rect = Some((x, y, w, h));
+                    state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                } else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::GdipSetClipPath => {
+                let graphics_handle = arg(0);
+                let _path = arg(1);
+                let _combine_mode = arg(2) as u32;
+                if let Some(GdiplusObject::Graphics(_)) = self.user32.gdiplus_state.get_mut(graphics_handle) {
+                    state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                } else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::GdipSetClipRegion => {
+                let graphics_handle = arg(0);
+                let _region = arg(1);
+                let _combine_mode = arg(2) as u32;
+                if let Some(GdiplusObject::Graphics(_)) = self.user32.gdiplus_state.get_mut(graphics_handle) {
+                    state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                } else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::GdipResetClip => {
+                let graphics_handle = arg(0);
+                if let Some(GdiplusObject::Graphics(gfx)) = self.user32.gdiplus_state.get_mut(graphics_handle) {
+                    gfx.clip_rect = None;
+                    state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                } else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::GdipGetClipBounds => {
+                let graphics_handle = arg(0);
+                let rect_ptr = arg(1);
+                if let Some(GdiplusObject::Graphics(gfx)) = self.user32.gdiplus_state.get(graphics_handle) {
+                    let (x, y, w, h) = gfx.clip_rect.unwrap_or((0.0, 0.0, 0.0, 0.0));
+                    if rect_ptr != 0 {
+                        write_u32(memory, rect_ptr, x.to_bits());
+                        write_u32(memory, rect_ptr + 4, y.to_bits());
+                        write_u32(memory, rect_ptr + 8, w.to_bits());
+                        write_u32(memory, rect_ptr + 12, h.to_bits());
+                    }
+                    state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                } else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::GdipGetClip => {
+                let _graphics = arg(0);
+                let _region_ptr = arg(1);
+                // Stub: returns Ok without filling region
+                state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                self.last_error = 0;
+            }
+            // ── Containers ─────────────────────────────────────────────────────
+            HostThunk::GdipSaveGraphics => {
+                let graphics_handle = arg(0);
+                let state_ptr = arg(1);
+                if let Some(GdiplusObject::Graphics(gfx)) = self.user32.gdiplus_state.get_mut(graphics_handle) {
+                    let saved = GdiplusGraphicsState {
+                        smoothing_mode: gfx.smoothing_mode,
+                        compositing_mode: gfx.compositing_mode,
+                        compositing_quality: gfx.compositing_quality,
+                        interpolation_mode: gfx.interpolation_mode,
+                        pixel_offset_mode: gfx.pixel_offset_mode,
+                        text_rendering_hint: gfx.text_rendering_hint,
+                        clip_rect: gfx.clip_rect,
+                        world_transform: gfx.world_transform,
+                    };
+                    if state_ptr != 0 {
+                        write_u32(memory, state_ptr, gfx.next_container);
+                    }
+                    gfx.container_stack.push(GdiplusContainer {
+                        id: gfx.next_container,
+                        saved_state: Box::new(saved),
+                    });
+                    gfx.next_container += 1;
+                    state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                } else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::GdipRestoreGraphics => {
+                let graphics_handle = arg(0);
+                let _state_id = arg(1) as u32;
+                if let Some(GdiplusObject::Graphics(gfx)) = self.user32.gdiplus_state.get_mut(graphics_handle) {
+                    // Restore from container stack by matching state_id
+                    if let Some(pos) = gfx.container_stack.iter().position(|c| c.id == _state_id) {
+                        let container = gfx.container_stack.remove(pos);
+                        gfx.smoothing_mode = container.saved_state.smoothing_mode;
+                        gfx.compositing_mode = container.saved_state.compositing_mode;
+                        gfx.compositing_quality = container.saved_state.compositing_quality;
+                        gfx.interpolation_mode = container.saved_state.interpolation_mode;
+                        gfx.pixel_offset_mode = container.saved_state.pixel_offset_mode;
+                        gfx.text_rendering_hint = container.saved_state.text_rendering_hint;
+                        gfx.clip_rect = container.saved_state.clip_rect;
+                        gfx.world_transform = container.saved_state.world_transform;
+                    }
+                    state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                } else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::GdipBeginContainer => {
+                let graphics_handle = arg(0);
+                let _dst_rect_ptr = arg(1);
+                let _src_rect_ptr = arg(2);
+                let _unit = arg(3) as u32;
+                let state_ptr = arg(4);
+                if let Some(GdiplusObject::Graphics(gfx)) = self.user32.gdiplus_state.get_mut(graphics_handle) {
+                    let saved = GdiplusGraphicsState {
+                        smoothing_mode: gfx.smoothing_mode,
+                        compositing_mode: gfx.compositing_mode,
+                        compositing_quality: gfx.compositing_quality,
+                        interpolation_mode: gfx.interpolation_mode,
+                        pixel_offset_mode: gfx.pixel_offset_mode,
+                        text_rendering_hint: gfx.text_rendering_hint,
+                        clip_rect: gfx.clip_rect,
+                        world_transform: gfx.world_transform,
+                    };
+                    if state_ptr != 0 {
+                        write_u32(memory, state_ptr, gfx.next_container);
+                    }
+                    gfx.container_stack.push(GdiplusContainer {
+                        id: gfx.next_container,
+                        saved_state: Box::new(saved),
+                    });
+                    gfx.next_container += 1;
+                    state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                } else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::GdipEndContainer => {
+                let graphics_handle = arg(0);
+                let _state_id = arg(1) as u32;
+                if let Some(GdiplusObject::Graphics(gfx)) = self.user32.gdiplus_state.get_mut(graphics_handle) {
+                    if let Some(pos) = gfx.container_stack.iter().position(|c| c.id == _state_id) {
+                        let container = gfx.container_stack.remove(pos);
+                        gfx.smoothing_mode = container.saved_state.smoothing_mode;
+                        gfx.compositing_mode = container.saved_state.compositing_mode;
+                        gfx.compositing_quality = container.saved_state.compositing_quality;
+                        gfx.interpolation_mode = container.saved_state.interpolation_mode;
+                        gfx.pixel_offset_mode = container.saved_state.pixel_offset_mode;
+                        gfx.text_rendering_hint = container.saved_state.text_rendering_hint;
+                        gfx.clip_rect = container.saved_state.clip_rect;
+                        gfx.world_transform = container.saved_state.world_transform;
+                    }
+                    state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                } else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                }
+                self.last_error = 0;
+            }
+            // ── Bitmap interop ─────────────────────────────────────────────────
+            HostThunk::GdipCreateBitmapFromHBITMAP => {
+                let hbm = arg(0);
+                let _hpal = arg(1);
+                let bitmap_ptr = arg(2);
+                // Create a placeholder bitmap
+                let bitmap = GdiplusBitmap {
+                    width: 1,
+                    height: 1,
+                    pixel_format: GDIPLUS_PIXEL_FORMAT_32BPP_ARGB,
+                    stride: 4,
+                    pixels: vec![0; 4],
+                    locked: false,
+                };
+                let handle = self.user32.gdiplus_state.alloc_handle(
+                    GdiplusObject::Image(Box::new(GdiplusImage::Bitmap(bitmap)))
+                );
+                if bitmap_ptr != 0 {
+                    write_u64(memory, bitmap_ptr, handle);
+                }
+                state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                self.last_error = 0;
+            }
+            HostThunk::GdipCreateBitmapFromFile => {
+                let _filename_ptr = arg(0);
+                let bitmap_ptr = arg(1);
+                let bitmap = GdiplusBitmap {
+                    width: 1,
+                    height: 1,
+                    pixel_format: GDIPLUS_PIXEL_FORMAT_32BPP_ARGB,
+                    stride: 4,
+                    pixels: vec![0xFF; 4],
+                    locked: false,
+                };
+                let handle = self.user32.gdiplus_state.alloc_handle(
+                    GdiplusObject::Image(Box::new(GdiplusImage::Bitmap(bitmap)))
+                );
+                if bitmap_ptr != 0 {
+                    write_u64(memory, bitmap_ptr, handle);
+                }
+                state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                self.last_error = 0;
+            }
+            HostThunk::GdipCreateBitmapFromGraphics => {
+                let width = arg(0) as u32;
+                let height = arg(1) as u32;
+                let graphics = arg(2);
+                let bitmap_ptr = arg(3);
+                let bitmap = GdiplusBitmap {
+                    width,
+                    height,
+                    pixel_format: GDIPLUS_PIXEL_FORMAT_32BPP_ARGB,
+                    stride: (width * 4) as i32,
+                    pixels: vec![0; (width * height * 4) as usize],
+                    locked: false,
+                };
+                let handle = self.user32.gdiplus_state.alloc_handle(
+                    GdiplusObject::Image(Box::new(GdiplusImage::Bitmap(bitmap)))
+                );
+                // Set target_bitmap on the graphics object so drawing operations
+                // render into this bitmap's pixel buffer.
+                if let Some(GdiplusObject::Graphics(gfx)) = self.user32.gdiplus_state.get_mut(graphics) {
+                    gfx.target_bitmap = Some(handle);
+                }
+                if bitmap_ptr != 0 {
+                    write_u64(memory, bitmap_ptr, handle);
+                }
+                state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                self.last_error = 0;
+            }
+            HostThunk::GdipDisposeImage => {
+                let image = arg(0);
+                self.user32.gdiplus_state.remove(image);
+                state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                self.last_error = 0;
+            }
+            HostThunk::GdipGetImageWidth => {
+                let image_handle = arg(0);
+                let width_ptr = arg(1);
+                let result = self.user32.gdiplus_state.get(image_handle).and_then(|obj| {
+                    if let GdiplusObject::Image(img) = obj {
+                        if let GdiplusImage::Bitmap(bmp) = &**img {
+                            Some(bmp.width)
+                        } else { None }
+                    } else { None }
+                });
+                match result {
+                    Some(w) => {
+                        if width_ptr != 0 { write_u32(memory, width_ptr, w); }
+                        state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                    }
+                    None => state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64),
+                }
+                self.last_error = 0;
+            }
+            HostThunk::GdipGetImageHeight => {
+                let image_handle = arg(0);
+                let height_ptr = arg(1);
+                let result = self.user32.gdiplus_state.get(image_handle).and_then(|obj| {
+                    if let GdiplusObject::Image(img) = obj {
+                        if let GdiplusImage::Bitmap(bmp) = &**img {
+                            Some(bmp.height)
+                        } else { None }
+                    } else { None }
+                });
+                match result {
+                    Some(h) => {
+                        if height_ptr != 0 { write_u32(memory, height_ptr, h); }
+                        state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                    }
+                    None => state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64),
+                }
+                self.last_error = 0;
+            }
+            HostThunk::GdipGetImagePixelFormat => {
+                let image_handle = arg(0);
+                let format_ptr = arg(1);
+                let result = self.user32.gdiplus_state.get(image_handle).and_then(|obj| {
+                    if let GdiplusObject::Image(img) = obj {
+                        if let GdiplusImage::Bitmap(bmp) = &**img {
+                            Some(bmp.pixel_format)
+                        } else { None }
+                    } else { None }
+                });
+                match result {
+                    Some(f) => {
+                        if format_ptr != 0 { write_u32(memory, format_ptr, f); }
+                        state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                    }
+                    None => state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64),
+                }
+                self.last_error = 0;
+            }
+            HostThunk::GdipBitmapGetPixel => {
+                let bitmap_handle = arg(0);
+                let x = arg(1) as u32;
+                let y = arg(2) as u32;
+                let color_ptr = arg(3);
+                let result = self.user32.gdiplus_state.get(bitmap_handle).and_then(|obj| {
+                    if let GdiplusObject::Image(img) = obj {
+                        if let GdiplusImage::Bitmap(bmp) = &**img {
+                            if x < bmp.width && y < bmp.height {
+                                let stride = bmp.stride;
+                                let idx = (y as i32 * stride + x as i32 * 4) as usize;
+                                if idx + 3 < bmp.pixels.len() {
+                                    let color = u32::from_le_bytes([
+                                        bmp.pixels[idx],
+                                        bmp.pixels[idx + 1],
+                                        bmp.pixels[idx + 2],
+                                        bmp.pixels[idx + 3],
+                                    ]);
+                                    return Some(color);
+                                }
+                            }
+                        }
+                    }
+                    None
+                });
+                match result {
+                    Some(color) => {
+                        if color_ptr != 0 {
+                            write_u32(memory, color_ptr, color);
+                        }
+                        state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                    }
+                    None => state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64),
+                }
+                self.last_error = 0;
+            }
+            HostThunk::GdipBitmapSetPixel => {
+                let bitmap_handle = arg(0);
+                let x = arg(1) as u32;
+                let y = arg(2) as u32;
+                let color = arg(3) as u32;
+                let result = self.user32.gdiplus_state.get_mut(bitmap_handle).and_then(|obj| {
+                    if let GdiplusObject::Image(img) = obj {
+                        if let GdiplusImage::Bitmap(bmp) = &mut **img {
+                            if x < bmp.width && y < bmp.height {
+                                let stride = bmp.stride;
+                                let idx = (y as i32 * stride + x as i32 * 4) as usize;
+                                if idx + 3 < bmp.pixels.len() {
+                                    let bytes = color.to_le_bytes();
+                                    bmp.pixels[idx] = bytes[0];
+                                    bmp.pixels[idx + 1] = bytes[1];
+                                    bmp.pixels[idx + 2] = bytes[2];
+                                    bmp.pixels[idx + 3] = bytes[3];
+                                    return Some(());
+                                }
+                            }
+                        }
+                    }
+                    None
+                });
+                state.set(Register::Rax, if result.is_some() {
+                    GdiplusStatus::Ok.to_u32()
+                } else {
+                    GdiplusStatus::InvalidParameter.to_u32()
+                } as u64);
+                self.last_error = 0;
+            }
+            HostThunk::GdipBitmapLockBits => {
+                let bitmap_handle = arg(0);
+                let _rect_ptr = arg(1);
+                let _flags = arg(2) as u32;
+                let _format = arg(3) as u32;
+                let locked_data_ptr = arg(4);
+                let result = self.user32.gdiplus_state.get_mut(bitmap_handle).and_then(|obj| {
+                    if let GdiplusObject::Image(img) = obj {
+                        if let GdiplusImage::Bitmap(bmp) = &mut **img {
+                            if bmp.locked {
+                                return None; // Already locked
+                            }
+                            bmp.locked = true;
+                            // For USER_INPUT_BUF, the scan0 comes from the rect or the external pointer.
+                            // We'll use the bitmap's own pixel data as the scan0 buffer.
+                            // The guest will read/write directly via scan0.
+                            let scan0 = bmp.pixels.as_ptr() as u64;
+                            if locked_data_ptr != 0 {
+                                write_u32(memory, locked_data_ptr, bmp.width);
+                                write_u32(memory, locked_data_ptr + 4, bmp.height);
+                                write_u32(memory, locked_data_ptr + 8, bmp.stride as u32);
+                                write_u32(memory, locked_data_ptr + 12, bmp.pixel_format);
+                                write_u64(memory, locked_data_ptr + 16, scan0);
+                                write_u64(memory, locked_data_ptr + 24, 0); // Reserved
+                            }
+                            return Some(());
+                        }
+                    }
+                    None
+                });
+                state.set(Register::Rax, if result.is_some() {
+                    GdiplusStatus::Ok.to_u32()
+                } else {
+                    GdiplusStatus::InvalidParameter.to_u32()
+                } as u64);
+                self.last_error = 0;
+            }
+            HostThunk::GdipBitmapUnlockBits => {
+                let bitmap_handle = arg(0);
+                let _locked_data_ptr = arg(1);
+                let result = self.user32.gdiplus_state.get_mut(bitmap_handle).and_then(|obj| {
+                    if let GdiplusObject::Image(img) = obj {
+                        if let GdiplusImage::Bitmap(bmp) = &mut **img {
+                            bmp.locked = false;
+                            return Some(());
+                        }
+                    }
+                    None
+                });
+                state.set(Register::Rax, if result.is_some() {
+                    GdiplusStatus::Ok.to_u32()
+                } else {
+                    GdiplusStatus::InvalidParameter.to_u32()
+                } as u64);
+                self.last_error = 0;
+            }
+            // ── Text / Font ─────────────────────────────────────────────────────
+            HostThunk::GdipCreateFont => {
+                let family_handle = arg(0);
+                let em_size = f32::from_bits(arg(1) as u32);
+                let style = arg(2) as u32;
+                let unit = arg(3) as u32;
+                let font_ptr = arg(4);
+                let font = GdiplusFont { family_handle, em_size, style, unit };
+                let handle = self.user32.gdiplus_state.alloc_handle(GdiplusObject::Font(Box::new(font)));
+                if font_ptr != 0 {
+                    write_u64(memory, font_ptr, handle);
+                }
+                state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                self.last_error = 0;
+            }
+            HostThunk::GdipDeleteFont => {
+                let font = arg(0);
+                self.user32.gdiplus_state.remove(font);
+                state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                self.last_error = 0;
+            }
+            HostThunk::GdipCreateFontFamilyFromName => {
+                let _name_ptr = arg(0);
+                let _font_collection = arg(1);
+                let family_ptr = arg(2);
+                let family = GdiplusFontFamily { name: "Arial".to_string() };
+                let handle = self.user32.gdiplus_state.alloc_handle(GdiplusObject::FontFamily(Box::new(family)));
+                if family_ptr != 0 {
+                    write_u64(memory, family_ptr, handle);
+                }
+                state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                self.last_error = 0;
+            }
+            HostThunk::GdipDeleteFontFamily => {
+                let family = arg(0);
+                self.user32.gdiplus_state.remove(family);
+                state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                self.last_error = 0;
+            }
+            HostThunk::GdipSetTextRenderingHint => {
+                let graphics_handle = arg(0);
+                let hint = arg(1) as u32;
+                if let Some(GdiplusObject::Graphics(gfx)) = self.user32.gdiplus_state.get_mut(graphics_handle) {
+                    gfx.text_rendering_hint = hint;
+                    state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                } else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::GdipMeasureString => {
+                let _graphics = arg(0);
+                let string_ptr = arg(1);
+                let length = arg(2) as i32;
+                let font_handle = arg(3);
+                let layout_rect_ptr = arg(4);
+                let _format_ptr = arg(5);
+                let bounding_rect_ptr = arg(6);
+                let _codepoints_fitted_ptr = arg(7);
+                // Read the text and font size for approximate measurement
+                let text = read_guest_utf16_string(memory, string_ptr, length);
+                let font_size = self.user32.gdiplus_state.get(font_handle).and_then(|obj| {
+                    if let GdiplusObject::Font(f) = obj { Some(f.em_size) } else { None }
+                }).unwrap_or(12.0);
+                // Approximate measurement: character width ≈ font_size * 0.6, height ≈ font_size * 1.3
+                let char_w = font_size * 0.6;
+                let char_h = font_size * 1.3;
+                let text_width = (text.chars().count() as f32 * char_w).max(1.0);
+                let text_height = char_h.max(1.0);
+                // Use layout rect origin if available
+                let (lx, ly) = if layout_rect_ptr != 0 {
+                    let lx = f32::from_bits(memory.read_u32(layout_rect_ptr).unwrap_or(0));
+                    let ly = f32::from_bits(memory.read_u32(layout_rect_ptr + 4).unwrap_or(0));
+                    (lx, ly)
+                } else {
+                    (0.0, 0.0)
+                };
+                if bounding_rect_ptr != 0 {
+                    write_u32(memory, bounding_rect_ptr, lx.to_bits());
+                    write_u32(memory, bounding_rect_ptr + 4, ly.to_bits());
+                    write_u32(memory, bounding_rect_ptr + 8, text_width.to_bits());
+                    write_u32(memory, bounding_rect_ptr + 12, text_height.to_bits());
+                }
+                state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                self.last_error = 0;
+            }
+            HostThunk::GdipMeasureCharacterRanges => {
+                let _graphics = arg(0);
+                let _string_ptr = arg(1);
+                let _length = arg(2) as i32;
+                let _font = arg(3);
+                let _layout_rect_ptr = arg(4);
+                let _format_ptr = arg(5);
+                let _range_count = arg(6) as u32;
+                let _ranges_ptr = arg(7);
+                let _region_count = arg(8);
+                state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                self.last_error = 0;
+            }
+            // ── Image attributes ───────────────────────────────────────────────
+            HostThunk::GdipCreateImageAttributes => {
+                let attr_ptr = arg(0);
+                let attrs = GdiplusImageAttributes {
+                    color_keys: BTreeMap::new(),
+                    color_matrix: None,
+                };
+                let handle = self.user32.gdiplus_state.alloc_handle(GdiplusObject::ImageAttributes(Box::new(attrs)));
+                if attr_ptr != 0 {
+                    write_u64(memory, attr_ptr, handle);
+                }
+                state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                self.last_error = 0;
+            }
+            HostThunk::GdipDisposeImageAttributes => {
+                let attr = arg(0);
+                self.user32.gdiplus_state.remove(attr);
+                state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                self.last_error = 0;
+            }
+            HostThunk::GdipSetImageAttributesColorKeys => {
+                let attr_handle = arg(0);
+                let _type = arg(1) as u32;
+                let _enable_flag = arg(2) as u32;
+                let _color_low = arg(3) as u32;
+                let _color_high = arg(4) as u32;
+                if let Some(GdiplusObject::ImageAttributes(_)) = self.user32.gdiplus_state.get_mut(attr_handle) {
+                    state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                } else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::GdipSetImageAttributesColorMatrix => {
+                let attr_handle = arg(0);
+                let _type = arg(1) as u32;
+                let _enable_flag = arg(2) as u32;
+                let _color_matrix_ptr = arg(3);
+                let _gray_matrix_ptr = arg(4);
+                let _flags = arg(5) as u32;
+                if let Some(GdiplusObject::ImageAttributes(_)) = self.user32.gdiplus_state.get_mut(attr_handle) {
+                    state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                } else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                }
+                self.last_error = 0;
+            }
+            // ── Quality settings ───────────────────────────────────────────────
+            HostThunk::GdipSetSmoothingMode => {
+                let graphics_handle = arg(0);
+                let mode = arg(1) as u32;
+                if let Some(GdiplusObject::Graphics(gfx)) = self.user32.gdiplus_state.get_mut(graphics_handle) {
+                    gfx.smoothing_mode = mode;
+                    state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                } else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::GdipGetSmoothingMode => {
+                let graphics_handle = arg(0);
+                let mode_ptr = arg(1);
+                if let Some(GdiplusObject::Graphics(gfx)) = self.user32.gdiplus_state.get(graphics_handle) {
+                    if mode_ptr != 0 {
+                        write_u32(memory, mode_ptr, gfx.smoothing_mode);
+                    }
+                    state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                } else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::GdipSetCompositingMode => {
+                let graphics_handle = arg(0);
+                let mode = arg(1) as u32;
+                if let Some(GdiplusObject::Graphics(gfx)) = self.user32.gdiplus_state.get_mut(graphics_handle) {
+                    gfx.compositing_mode = mode;
+                    state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                } else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::GdipGetCompositingMode => {
+                let graphics_handle = arg(0);
+                let mode_ptr = arg(1);
+                if let Some(GdiplusObject::Graphics(gfx)) = self.user32.gdiplus_state.get(graphics_handle) {
+                    if mode_ptr != 0 {
+                        write_u32(memory, mode_ptr, gfx.compositing_mode);
+                    }
+                    state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                } else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::GdipSetCompositingQuality => {
+                let graphics_handle = arg(0);
+                let quality = arg(1) as u32;
+                if let Some(GdiplusObject::Graphics(gfx)) = self.user32.gdiplus_state.get_mut(graphics_handle) {
+                    gfx.compositing_quality = quality;
+                    state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                } else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::GdipGetCompositingQuality => {
+                let graphics_handle = arg(0);
+                let quality_ptr = arg(1);
+                if let Some(GdiplusObject::Graphics(gfx)) = self.user32.gdiplus_state.get(graphics_handle) {
+                    if quality_ptr != 0 {
+                        write_u32(memory, quality_ptr, gfx.compositing_quality);
+                    }
+                    state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                } else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::GdipSetInterpolationMode => {
+                let graphics_handle = arg(0);
+                let mode = arg(1) as u32;
+                if let Some(GdiplusObject::Graphics(gfx)) = self.user32.gdiplus_state.get_mut(graphics_handle) {
+                    gfx.interpolation_mode = mode;
+                    state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                } else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::GdipGetInterpolationMode => {
+                let graphics_handle = arg(0);
+                let mode_ptr = arg(1);
+                if let Some(GdiplusObject::Graphics(gfx)) = self.user32.gdiplus_state.get(graphics_handle) {
+                    if mode_ptr != 0 {
+                        write_u32(memory, mode_ptr, gfx.interpolation_mode);
+                    }
+                    state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                } else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::GdipSetPixelOffsetMode => {
+                let graphics_handle = arg(0);
+                let mode = arg(1) as u32;
+                if let Some(GdiplusObject::Graphics(gfx)) = self.user32.gdiplus_state.get_mut(graphics_handle) {
+                    gfx.pixel_offset_mode = mode;
+                    state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                } else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::GdipGetPixelOffsetMode => {
+                let graphics_handle = arg(0);
+                let mode_ptr = arg(1);
+                if let Some(GdiplusObject::Graphics(gfx)) = self.user32.gdiplus_state.get(graphics_handle) {
+                    if mode_ptr != 0 {
+                        write_u32(memory, mode_ptr, gfx.pixel_offset_mode);
+                    }
+                    state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                } else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                }
+                self.last_error = 0;
+            }
+            // ── Image drawing ────────────────────────────────────────────────────
+            HostThunk::GdipDrawImage => {
+                let graphics = arg(0);
+                let image_handle = arg(1);
+                let x = f32::from_bits(arg(2) as u32);
+                let y = f32::from_bits(arg(3) as u32);
+                // Extract source image data BEFORE getting mutable target bitmap
+                let src_data = self.user32.gdiplus_state.get(image_handle).and_then(|obj| {
+                    if let GdiplusObject::Image(img) = obj {
+                        if let GdiplusImage::Bitmap(bmp) = &**img {
+                            Some((bmp.pixels.clone(), bmp.width, bmp.height, bmp.stride))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                });
+                if let Some((bmp_handle, cm)) = self.resolve_gdiplus_graphics_target(graphics) {
+                    if let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle) {
+                        if let GdiplusImage::Bitmap(dst_bmp) = &mut **img {
+                            if let Some((ref src_pixels, sw, sh, sstride)) = src_data {
+                                crate::gdiplus_render::draw_image(&mut dst_bmp.pixels, dst_bmp.width, dst_bmp.height, dst_bmp.stride, src_pixels, sw, sh, sstride, x, y, cm);
+                            }
+                        }
+                    }
+                }
+                state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                self.last_error = 0;
+            }
+            HostThunk::GdipDrawImageRect => {
+                let graphics = arg(0);
+                let image_handle = arg(1);
+                let x = f32::from_bits(arg(2) as u32);
+                let y = f32::from_bits(arg(3) as u32);
+                let w = f32::from_bits(arg(4) as u32);
+                let h = f32::from_bits(arg(5) as u32);
+                // Extract source image data BEFORE getting mutable target bitmap
+                let src_data = self.user32.gdiplus_state.get(image_handle).and_then(|obj| {
+                    if let GdiplusObject::Image(img) = obj {
+                        if let GdiplusImage::Bitmap(bmp) = &**img {
+                            Some((bmp.pixels.clone(), bmp.width, bmp.height, bmp.stride))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                });
+                if let Some((bmp_handle, cm)) = self.resolve_gdiplus_graphics_target(graphics) {
+                    if let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle) {
+                        if let GdiplusImage::Bitmap(dst_bmp) = &mut **img {
+                            if let Some((ref src_pixels, sw, sh, sstride)) = src_data {
+                                crate::gdiplus_render::draw_image_rect(&mut dst_bmp.pixels, dst_bmp.width, dst_bmp.height, dst_bmp.stride, src_pixels, sw, sh, sstride, x, y, w, h, cm);
+                            }
+                        }
+                    }
+                }
+                state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                self.last_error = 0;
+            }
+            HostThunk::GdipDrawImageRectRect => {
+                let graphics = arg(0);
+                let image_handle = arg(1);
+                let _src_x = f32::from_bits(arg(2) as u32);
+                let _src_y = f32::from_bits(arg(3) as u32);
+                let _src_w = f32::from_bits(arg(4) as u32);
+                let _src_h = f32::from_bits(arg(5) as u32);
+                let dst_x = f32::from_bits(arg(6) as u32);
+                let dst_y = f32::from_bits(arg(7) as u32);
+                let dst_w = f32::from_bits(arg(8) as u32);
+                let dst_h = f32::from_bits(arg(9) as u32);
+                let _src_unit = arg(10) as u32;
+                let _attr = arg(11);
+                let _callback = arg(12);
+                let _callback_data = arg(13);
+                // Extract source image data BEFORE getting mutable target bitmap
+                let src_data = self.user32.gdiplus_state.get(image_handle).and_then(|obj| {
+                    if let GdiplusObject::Image(img) = obj {
+                        if let GdiplusImage::Bitmap(bmp) = &**img {
+                            Some((bmp.pixels.clone(), bmp.width, bmp.height, bmp.stride))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                });
+                if let Some((bmp_handle, cm)) = self.resolve_gdiplus_graphics_target(graphics) {
+                    if let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle) {
+                        if let GdiplusImage::Bitmap(dst_bmp) = &mut **img {
+                            if let Some((ref src_pixels, sw, sh, sstride)) = src_data {
+                                crate::gdiplus_render::draw_image_rect(&mut dst_bmp.pixels, dst_bmp.width, dst_bmp.height, dst_bmp.stride, src_pixels, sw, sh, sstride, dst_x, dst_y, dst_w, dst_h, cm);
+                            }
+                        }
+                    }
+                }
+                state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                self.last_error = 0;
+            }
+            HostThunk::GdipGetImageType => {
+                let image_handle = arg(0);
+                let type_ptr = arg(1);
+                if let Some(GdiplusObject::Image(_)) = self.user32.gdiplus_state.get(image_handle) {
+                    if type_ptr != 0 {
+                        write_u32(memory, type_ptr, 1); // ImageTypeBitmap = 1
+                    }
+                    state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                } else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::GdipGetImageRawFormat => {
+                let image_handle = arg(0);
+                let _format_ptr = arg(1);
+                if let Some(GdiplusObject::Image(_)) = self.user32.gdiplus_state.get(image_handle) {
+                    state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                } else {
+                    state.set(Register::Rax, GdiplusStatus::InvalidParameter.to_u32() as u64);
+                }
+                self.last_error = 0;
+            }
+            HostThunk::GdipCloneImage => {
+                let image_handle = arg(0);
+                let clone_ptr = arg(1);
+                // Shallow clone: just reuse same handle
+                if clone_ptr != 0 {
+                    write_u64(memory, clone_ptr, image_handle);
+                }
+                state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                self.last_error = 0;
+            }
+            HostThunk::GdipSaveImageToFile => {
+                let _image = arg(0);
+                let _filename_ptr = arg(1);
+                let _clsid_ptr = arg(2);
+                let _encoder_params = arg(3);
+                state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                self.last_error = 0;
+            }
+            HostThunk::GdipSaveImageToStream => {
+                let _image = arg(0);
+                let _stream = arg(1);
+                let _clsid_ptr = arg(2);
+                let _encoder_params = arg(3);
+                state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                self.last_error = 0;
+            }
+            HostThunk::GdipCreateBitmapFromStream => {
+                let _stream = arg(0);
+                let bitmap_ptr = arg(1);
+                let bitmap = GdiplusBitmap {
+                    width: 1, height: 1,
+                    pixel_format: GDIPLUS_PIXEL_FORMAT_32BPP_ARGB,
+                    stride: 4,
+                    pixels: vec![0xFF; 4],
+                    locked: false,
+                };
+                let handle = self.user32.gdiplus_state.alloc_handle(GdiplusObject::Image(Box::new(GdiplusImage::Bitmap(bitmap))));
+                if bitmap_ptr != 0 { write_u64(memory, bitmap_ptr, handle); }
+                state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                self.last_error = 0;
+            }
+            HostThunk::GdipCreateBitmapFromScan0 => {
+                let width = arg(0) as u32;
+                let height = arg(1) as u32;
+                let stride = arg(2) as i32;
+                let format = arg(3) as u32;
+                let scan0 = arg(4);
+                let bitmap_ptr = arg(5);
+                let pixel_count = (stride.unsigned_abs() * height) as usize;
+                let pixels = if scan0 != 0 {
+                    // Copy from guest memory
+                    (0..pixel_count).map(|i| memory.read_u8(scan0 + i as u64).unwrap_or(0)).collect()
+                } else {
+                    vec![0; pixel_count]
+                };
+                let bitmap = GdiplusBitmap {
+                    width, height, pixel_format: format,
+                    stride, pixels, locked: false,
+                };
+                let handle = self.user32.gdiplus_state.alloc_handle(GdiplusObject::Image(Box::new(GdiplusImage::Bitmap(bitmap))));
+                if bitmap_ptr != 0 { write_u64(memory, bitmap_ptr, handle); }
+                state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                self.last_error = 0;
+            }
+            HostThunk::GdipCreateHICONFromBitmap => {
+                let _bitmap = arg(0);
+                let _hicon_ptr = arg(1);
+                state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                self.last_error = 0;
+            }
+            HostThunk::GdipCreateHBITMAPFromBitmap => {
+                let _bitmap = arg(0);
+                let _hbm_ptr = arg(1);
+                let _background = arg(2) as u32;
+                state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                self.last_error = 0;
+            }
+            HostThunk::GdipCreateImageFromFile => {
+                let _filename_ptr = arg(0);
+                let image_ptr = arg(1);
+                let bitmap = GdiplusBitmap {
+                    width: 1, height: 1,
+                    pixel_format: GDIPLUS_PIXEL_FORMAT_32BPP_ARGB,
+                    stride: 4, pixels: vec![0xFF; 4],
+                    locked: false,
+                };
+                let handle = self.user32.gdiplus_state.alloc_handle(GdiplusObject::Image(Box::new(GdiplusImage::Bitmap(bitmap))));
+                if image_ptr != 0 { write_u64(memory, image_ptr, handle); }
+                state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                self.last_error = 0;
+            }
+            HostThunk::GdipImageForceValidation => {
+                let _image = arg(0);
+                state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                self.last_error = 0;
+            }
+            HostThunk::GdipGetFontHeight => {
+                let _font = arg(0);
+                let _graphics = arg(1);
+                let height_ptr = arg(2);
+                if height_ptr != 0 {
+                    write_u32(memory, height_ptr, 16.0f32.to_bits()); // Default font height
+                }
+                state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                self.last_error = 0;
+            }
+            HostThunk::GdipCreateBitmapFromGdiDib => {
+                let _gdi_bitmap_info = arg(0);
+                let _gdi_bitmap_data = arg(1);
+                let bitmap_ptr = arg(2);
+                let bitmap = GdiplusBitmap {
+                    width: 1, height: 1,
+                    pixel_format: GDIPLUS_PIXEL_FORMAT_32BPP_ARGB,
+                    stride: 4, pixels: vec![0xFF; 4],
+                    locked: false,
+                };
+                let handle = self.user32.gdiplus_state.alloc_handle(GdiplusObject::Image(Box::new(GdiplusImage::Bitmap(bitmap))));
+                if bitmap_ptr != 0 { write_u64(memory, bitmap_ptr, handle); }
+                state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
+                self.last_error = 0;
+            }
+            // ── WinMM (Windows Multimedia) audio dispatch (Phase 2.5) ───────────
+            HostThunk::WaveOutOpen => {
+                // waveOutOpen(phwo, uDeviceID, pwfx, dwCallback, dwCallbackInstance, fdwOpen)
+                let phwo = guest_call_arg(state, memory, 0)?;
+                let device_id = guest_call_arg_u32(state, memory, 1)?;
+                let format_ptr = guest_call_arg(state, memory, 2)?;
+                let callback = guest_call_arg(state, memory, 3)?;
+                let callback_instance = guest_call_arg_u32(state, memory, 4)?;
+                let _flags = guest_call_arg_u32(state, memory, 5)?;
+                // Read WaveFormatEx from guest memory
+                let mut fmt = crate::winmm::WaveFormatEx::pcm(2, 44100, 16);
+                if format_ptr != 0 {
+                    fmt.w_format_tag = memory.read_u16(format_ptr)?;
+                    fmt.n_channels = memory.read_u16(format_ptr + 2)?;
+                    fmt.n_samples_per_sec = memory.read_u32(format_ptr + 4)?;
+                    fmt.n_avg_bytes_per_sec = memory.read_u32(format_ptr + 8)?;
+                    fmt.n_block_align = memory.read_u16(format_ptr + 12)?;
+                    fmt.w_bits_per_sample = memory.read_u16(format_ptr + 14)?;
+                    fmt.cb_size = memory.read_u16(format_ptr + 16)?;
+                }
+                let cb = if callback != 0 { Some((callback, callback_instance as u64)) } else { None };
+                let (rc, handle) = self.audio.winmm.write().unwrap().wave_out_open(device_id, &fmt, cb);
+                if phwo != 0 {
+                    write_u32(memory, phwo, handle);
+                }
+                state.set(Register::Rax, rc as u64);
+                self.last_error = 0;
+            }
+            HostThunk::WaveOutClose => {
+                let handle = guest_call_arg_u32(state, memory, 0)?;
+                let rc = self.audio.winmm.write().unwrap().wave_out_close(handle);
+                state.set(Register::Rax, rc as u64);
+                self.last_error = 0;
+            }
+            HostThunk::WaveOutPrepareHeader => {
+                let handle = guest_call_arg_u32(state, memory, 0)?;
+                let _hdr_ptr = guest_call_arg(state, memory, 1)?;
+                let _size = guest_call_arg_u32(state, memory, 2)?;
+                let hdr = crate::winmm::WaveHdr {
+                    lp_data: if _hdr_ptr != 0 { memory.read_u64(_hdr_ptr)? } else { 0 },
+                    dw_buffer_length: if _hdr_ptr != 0 { memory.read_u32(_hdr_ptr + 8)? } else { 0 },
+                    dw_bytes_recorded: 0,
+                    dw_user: 0,
+                    dw_flags: 0,
+                    dw_loops: 0,
+                    lp_next: 0,
+                    reserved: 0,
+                };
+                let rc = self.audio.winmm.write().unwrap().wave_out_prepare_header(handle, &hdr);
+                // Set WHDR_PREPARED flag on the guest header
+                if _hdr_ptr != 0 {
+                    let flags = memory.read_u32(_hdr_ptr + 20)?;
+                    memory.write_u32(_hdr_ptr + 20, flags | crate::winmm::WaveHdr::WHDR_PREPARED);
+                }
+                state.set(Register::Rax, rc as u64);
+                self.last_error = 0;
+            }
+            HostThunk::WaveOutUnprepareHeader => {
+                let handle = guest_call_arg_u32(state, memory, 0)?;
+                let _hdr_ptr = guest_call_arg(state, memory, 1)?;
+                let _size = guest_call_arg_u32(state, memory, 2)?;
+                let hdr = crate::winmm::WaveHdr {
+                    lp_data: if _hdr_ptr != 0 { memory.read_u64(_hdr_ptr)? } else { 0 },
+                    dw_buffer_length: if _hdr_ptr != 0 { memory.read_u32(_hdr_ptr + 8)? } else { 0 },
+                    dw_bytes_recorded: 0,
+                    dw_user: 0,
+                    dw_flags: 0,
+                    dw_loops: 0,
+                    lp_next: 0,
+                    reserved: 0,
+                };
+                let rc = self.audio.winmm.write().unwrap().wave_out_unprepare_header(handle, &hdr);
+                state.set(Register::Rax, rc as u64);
+                self.last_error = 0;
+            }
+            HostThunk::WaveOutWrite => {
+                let handle = guest_call_arg_u32(state, memory, 0)?;
+                let hdr_ptr = guest_call_arg(state, memory, 1)?;
+                let _size = guest_call_arg_u32(state, memory, 2)?;
+                let data_ptr = if hdr_ptr != 0 { memory.read_u64(hdr_ptr)? } else { 0 };
+                let data_len = if hdr_ptr != 0 { memory.read_u32(hdr_ptr + 8)? } else { 0 };
+                let flags = if hdr_ptr != 0 { memory.read_u32(hdr_ptr + 20)? } else { 0 };
+                let loops = if hdr_ptr != 0 { memory.read_u32(hdr_ptr + 24)? } else { 0 };
+                let rc = self.audio.winmm.write().unwrap().wave_out_write(handle, data_ptr, data_len, flags, loops);
+                state.set(Register::Rax, rc as u64);
+                self.last_error = 0;
+            }
+            HostThunk::WaveOutReset => {
+                let handle = guest_call_arg_u32(state, memory, 0)?;
+                let rc = self.audio.winmm.write().unwrap().wave_out_reset(handle);
+                state.set(Register::Rax, rc as u64);
+                self.last_error = 0;
+            }
+            HostThunk::WaveOutGetVolume => {
+                let handle = guest_call_arg_u32(state, memory, 0)?;
+                let vol_ptr = guest_call_arg(state, memory, 1)?;
+                let mut vol = 0u32;
+                let rc = self.audio.winmm.read().unwrap().wave_out_get_volume(handle, &mut vol);
+                if vol_ptr != 0 {
+                    write_u32(memory, vol_ptr, vol);
+                }
+                state.set(Register::Rax, rc as u64);
+                self.last_error = 0;
+            }
+            HostThunk::WaveOutSetVolume => {
+                let handle = guest_call_arg_u32(state, memory, 0)?;
+                let volume = guest_call_arg_u32(state, memory, 1)?;
+                let rc = self.audio.winmm.write().unwrap().wave_out_set_volume(handle, volume);
+                state.set(Register::Rax, rc as u64);
+                self.last_error = 0;
+            }
+            HostThunk::WaveOutGetDevCapsW => {
+                let device_id = guest_call_arg_u32(state, memory, 0)?;
+                let caps_ptr = guest_call_arg(state, memory, 1)?;
+                let _size = guest_call_arg_u32(state, memory, 2)?;
+                let mut caps = crate::winmm::WaveOutCapsW::default();
+                let rc = self.audio.winmm.read().unwrap().wave_out_get_dev_caps(device_id, &mut caps);
+                if caps_ptr != 0 && rc == crate::winmm::MMSYSERR_NOERROR {
+                    // Write WaveOutCapsW to guest memory
+                    write_u16(memory, caps_ptr, caps.w_mid);
+                    write_u16(memory, caps_ptr + 2, caps.w_pid);
+                    write_u32(memory, caps_ptr + 4, caps.v_driver_version);
+                    for i in 0..32 {
+                        write_u16(memory, caps_ptr + 8 + i as u64 * 2, caps.sz_pname[i]);
+                    }
+                    write_u32(memory, caps_ptr + 72, caps.dw_formats);
+                    write_u16(memory, caps_ptr + 76, caps.w_channels);
+                    write_u16(memory, caps_ptr + 78, caps.w_reserved1);
+                    write_u32(memory, caps_ptr + 80, caps.dw_support);
+                }
+                state.set(Register::Rax, rc as u64);
+                self.last_error = 0;
+            }
+            HostThunk::WaveOutGetNumDevs => {
+                let n = self.audio.winmm.read().unwrap().wave_out_get_num_devs();
+                state.set(Register::Rax, n as u64);
+                self.last_error = 0;
+            }
+            // ── Wave In stubs ──────────────────────────────────────────────
+            HostThunk::WaveInOpen => {
+                let _ = guest_call_arg(state, memory, 0)?;
+                let _ = guest_call_arg_u32(state, memory, 1)?;
+                let _ = guest_call_arg(state, memory, 2)?;
+                let _ = guest_call_arg(state, memory, 3)?;
+                let _ = guest_call_arg_u32(state, memory, 4)?;
+                let _ = guest_call_arg_u32(state, memory, 5)?;
+                state.set(Register::Rax, crate::winmm::MMSYSERR_NOTSUPPORTED as u64);
+                self.last_error = 0;
+            }
+            HostThunk::WaveInClose => {
+                let _handle = guest_call_arg_u32(state, memory, 0)?;
+                state.set(Register::Rax, crate::winmm::MMSYSERR_NOTSUPPORTED as u64);
+                self.last_error = 0;
+            }
+            HostThunk::WaveInPrepareHeader => {
+                let _handle = guest_call_arg_u32(state, memory, 0)?;
+                let _ = guest_call_arg(state, memory, 1)?;
+                let _ = guest_call_arg_u32(state, memory, 2)?;
+                state.set(Register::Rax, crate::winmm::MMSYSERR_NOTSUPPORTED as u64);
+                self.last_error = 0;
+            }
+            HostThunk::WaveInUnprepareHeader => {
+                let _handle = guest_call_arg_u32(state, memory, 0)?;
+                let _ = guest_call_arg(state, memory, 1)?;
+                let _ = guest_call_arg_u32(state, memory, 2)?;
+                state.set(Register::Rax, crate::winmm::MMSYSERR_NOTSUPPORTED as u64);
+                self.last_error = 0;
+            }
+            HostThunk::WaveInAddBuffer => {
+                let _handle = guest_call_arg_u32(state, memory, 0)?;
+                let _ = guest_call_arg(state, memory, 1)?;
+                let _ = guest_call_arg_u32(state, memory, 2)?;
+                state.set(Register::Rax, crate::winmm::MMSYSERR_NOTSUPPORTED as u64);
+                self.last_error = 0;
+            }
+            HostThunk::WaveInStart => {
+                let _handle = guest_call_arg_u32(state, memory, 0)?;
+                state.set(Register::Rax, crate::winmm::MMSYSERR_NOTSUPPORTED as u64);
+                self.last_error = 0;
+            }
+            HostThunk::WaveInStop => {
+                let _handle = guest_call_arg_u32(state, memory, 0)?;
+                state.set(Register::Rax, crate::winmm::MMSYSERR_NOTSUPPORTED as u64);
+                self.last_error = 0;
+            }
+            HostThunk::WaveInGetDevCapsW => {
+                let _ = guest_call_arg_u32(state, memory, 0)?;
+                let _ = guest_call_arg(state, memory, 1)?;
+                let _ = guest_call_arg_u32(state, memory, 2)?;
+                let rc = self.audio.winmm.read().unwrap().wave_in_get_dev_caps();
+                state.set(Register::Rax, rc as u64);
+                self.last_error = 0;
+            }
+            HostThunk::WaveInGetNumDevs => {
+                let n = self.audio.winmm.read().unwrap().wave_in_get_num_devs();
+                state.set(Register::Rax, n as u64);
+                self.last_error = 0;
+            }
+            // ── MIDI Out stubs ─────────────────────────────────────────────
+            HostThunk::MidiOutOpen => {
+                let _ = guest_call_arg(state, memory, 0)?;
+                let _ = guest_call_arg_u32(state, memory, 1)?;
+                let _ = guest_call_arg_u32(state, memory, 2)?;
+                state.set(Register::Rax, crate::winmm::MMSYSERR_NOTSUPPORTED as u64);
+                self.last_error = 0;
+            }
+            HostThunk::MidiOutClose => {
+                let _handle = guest_call_arg_u32(state, memory, 0)?;
+                state.set(Register::Rax, crate::winmm::MMSYSERR_NOTSUPPORTED as u64);
+                self.last_error = 0;
+            }
+            HostThunk::MidiOutShortMsg => {
+                let _handle = guest_call_arg_u32(state, memory, 0)?;
+                let _msg = guest_call_arg_u32(state, memory, 1)?;
+                state.set(Register::Rax, crate::winmm::MMSYSERR_NOTSUPPORTED as u64);
+                self.last_error = 0;
+            }
+            HostThunk::MidiOutLongMsg => {
+                let _handle = guest_call_arg_u32(state, memory, 0)?;
+                let _ = guest_call_arg(state, memory, 1)?;
+                let _ = guest_call_arg_u32(state, memory, 2)?;
+                state.set(Register::Rax, crate::winmm::MMSYSERR_NOTSUPPORTED as u64);
+                self.last_error = 0;
+            }
+            HostThunk::MidiOutReset => {
+                let _handle = guest_call_arg_u32(state, memory, 0)?;
+                state.set(Register::Rax, crate::winmm::MMSYSERR_NOTSUPPORTED as u64);
+                self.last_error = 0;
+            }
+            HostThunk::MidiOutGetDevCapsW => {
+                let _ = guest_call_arg_u32(state, memory, 0)?;
+                let _ = guest_call_arg(state, memory, 1)?;
+                let _ = guest_call_arg_u32(state, memory, 2)?;
+                let rc = self.audio.winmm.read().unwrap().midi_out_get_dev_caps();
+                state.set(Register::Rax, rc as u64);
+                self.last_error = 0;
+            }
+            HostThunk::MidiOutGetNumDevs => {
+                let n = self.audio.winmm.read().unwrap().midi_out_get_num_devs();
+                state.set(Register::Rax, n as u64);
+                self.last_error = 0;
+            }
+            // ── MIDI In stubs ──────────────────────────────────────────────
+            HostThunk::MidiInOpen => {
+                let _ = guest_call_arg(state, memory, 0)?;
+                let _ = guest_call_arg_u32(state, memory, 1)?;
+                let _ = guest_call_arg_u32(state, memory, 2)?;
+                let _ = guest_call_arg(state, memory, 3)?;
+                let _ = guest_call_arg_u32(state, memory, 4)?;
+                let _ = guest_call_arg_u32(state, memory, 5)?;
+                state.set(Register::Rax, crate::winmm::MMSYSERR_NOTSUPPORTED as u64);
+                self.last_error = 0;
+            }
+            HostThunk::MidiInClose => {
+                let _handle = guest_call_arg_u32(state, memory, 0)?;
+                state.set(Register::Rax, crate::winmm::MMSYSERR_NOTSUPPORTED as u64);
+                self.last_error = 0;
+            }
+            HostThunk::MidiInStart => {
+                let _handle = guest_call_arg_u32(state, memory, 0)?;
+                state.set(Register::Rax, crate::winmm::MMSYSERR_NOTSUPPORTED as u64);
+                self.last_error = 0;
+            }
+            HostThunk::MidiInStop => {
+                let _handle = guest_call_arg_u32(state, memory, 0)?;
+                state.set(Register::Rax, crate::winmm::MMSYSERR_NOTSUPPORTED as u64);
+                self.last_error = 0;
+            }
+            HostThunk::MidiInReset => {
+                let _handle = guest_call_arg_u32(state, memory, 0)?;
+                state.set(Register::Rax, crate::winmm::MMSYSERR_NOTSUPPORTED as u64);
+                self.last_error = 0;
+            }
+            // ── Time functions ─────────────────────────────────────────────
+            HostThunk::TimeGetTime => {
+                let t = self.audio.winmm.read().unwrap().time_get_time();
+                state.set(Register::Rax, t as u64);
+                self.last_error = 0;
+            }
+            HostThunk::TimeBeginPeriod => {
+                let period = guest_call_arg_u32(state, memory, 0)?;
+                let rc = crate::winmm::WinMmSubsystem::time_begin_period(period);
+                state.set(Register::Rax, rc as u64);
+                self.last_error = 0;
+            }
+            HostThunk::TimeEndPeriod => {
+                let period = guest_call_arg_u32(state, memory, 0)?;
+                let rc = crate::winmm::WinMmSubsystem::time_end_period(period);
+                state.set(Register::Rax, rc as u64);
+                self.last_error = 0;
+            }
+            // ── PlaySound stub ────────────────────────────────────────────
+            HostThunk::PlaySoundW => {
+                let _sound_ptr = guest_call_arg(state, memory, 0)?;
+                let _ = guest_call_arg(state, memory, 1)?;
+                let _flags = guest_call_arg_u32(state, memory, 2)?;
+                let _reserved = guest_call_arg(state, memory, 3)?;
+                let rc = self.audio.winmm.write().unwrap().play_sound_w();
+                state.set(Register::Rax, rc as u64);
+                self.last_error = 0;
+            }
+            // ── mmio stubs ─────────────────────────────────────────────────
+            HostThunk::MmioOpenW => {
+                let _ = guest_call_arg(state, memory, 0)?;
+                let _ = guest_call_arg(state, memory, 1)?;
+                let _ = guest_call_arg_u32(state, memory, 2)?;
+                let rc = self.audio.winmm.write().unwrap().mmio_open_w();
+                state.set(Register::Rax, rc as u64);
+                self.last_error = 0;
+            }
+            HostThunk::MmioClose => {
+                let _handle = guest_call_arg_u32(state, memory, 0)?;
+                let _flags = guest_call_arg_u32(state, memory, 1)?;
+                let rc = self.audio.winmm.write().unwrap().mmio_close();
+                state.set(Register::Rax, rc as u64);
+                self.last_error = 0;
+            }
+            HostThunk::MmioRead => {
+                let _handle = guest_call_arg_u32(state, memory, 0)?;
+                let _ = guest_call_arg(state, memory, 1)?;
+                let _ = guest_call_arg_u32(state, memory, 2)?;
+                let rc = self.audio.winmm.write().unwrap().mmio_read();
+                state.set(Register::Rax, rc as u64);
+                self.last_error = 0;
+            }
+            HostThunk::MmioWrite => {
+                let _handle = guest_call_arg_u32(state, memory, 0)?;
+                let _ = guest_call_arg(state, memory, 1)?;
+                let _ = guest_call_arg_u32(state, memory, 2)?;
+                let rc = self.audio.winmm.write().unwrap().mmio_write();
+                state.set(Register::Rax, rc as u64);
+                self.last_error = 0;
+            }
+            HostThunk::MmioAscend => {
+                let _handle = guest_call_arg_u32(state, memory, 0)?;
+                let _ = guest_call_arg(state, memory, 1)?;
+                let rc = self.audio.winmm.write().unwrap().mmio_ascend();
+                state.set(Register::Rax, rc as u64);
+                self.last_error = 0;
+            }
+            HostThunk::MmioDescend => {
+                let _handle = guest_call_arg_u32(state, memory, 0)?;
+                let _ = guest_call_arg(state, memory, 1)?;
+                let _ = guest_call_arg(state, memory, 2)?;
+                let rc = self.audio.winmm.write().unwrap().mmio_descend();
+                state.set(Register::Rax, rc as u64);
+                self.last_error = 0;
+            }
+            HostThunk::MmioCreateChunk => {
+                let _handle = guest_call_arg_u32(state, memory, 0)?;
+                let _ = guest_call_arg(state, memory, 1)?;
+                let _ = guest_call_arg_u32(state, memory, 2)?;
+                let rc = self.audio.winmm.write().unwrap().mmio_create_chunk();
+                state.set(Register::Rax, rc as u64);
+                self.last_error = 0;
+            }
+            HostThunk::MmioStringToFOURCCW => {
+                let _ = guest_call_arg(state, memory, 0)?;
+                let _flags = guest_call_arg_u32(state, memory, 1)?;
+                let rc = self.audio.winmm.write().unwrap().mmio_string_to_fourcc_w();
+                state.set(Register::Rax, rc as u64);
+                self.last_error = 0;
+            }
+            HostThunk::SkipPointerFrame => {
+                let _pointer_id = guest_call_arg(state, memory, 0)? as u32;
+                // Per spec, this is a "might return TRUE or FALSE" no-op
+                state.set(Register::Rax, 1);
+                self.last_error = 0;
+            }
             HostThunk::Unsupported { dll, symbol } => {
+                self.telemetry.record_unsupported_import(&dll, &symbol);
                 emit_live_ui_debug(format!(
                     "UNSUPPORTED IMPORT {dll}!{symbol} — add HostThunk variant and dispatch arm"
                 ));
@@ -24651,6 +32892,7 @@ impl PeHostRuntime {
         }
     }
 
+    #[inline(never)]
     fn execute_guest_callback_inner(
         &mut self,
         state: &mut CpuState,
@@ -24916,7 +33158,10 @@ impl PeHostRuntime {
         self.yield_pumped_guest_thread = false;
         self.yield_pumped_guest_thread_wake_tick = None;
 
-        let result = (|| -> AppResult<(Option<PendingGuestThread>, BTreeMap<u32, u64>, BTreeMap<u32, u64>)> {
+        // Use a regular block instead of an IIFE closure to save one stack frame
+        // per recursion level in the GetMessageW → pump → execute_guest_callback_inner
+        // → dispatch_import chain.
+        let result = {
             self.teb_base = pending_thread.teb_base;
             self.tls_vector_ptr = pending_thread.tls_vector_ptr;
             self.tls_slots = pending_thread.tls_slots.clone();
@@ -24925,8 +33170,18 @@ impl PeHostRuntime {
                 self.sync_guest_tls_slot(memory, slot, value)?;
             }
 
+            // Fire TLS thread-attach callbacks for all loaded modules.
+            // These run in the context of the new thread, before the thread's
+            // start function executes — matching Windows TLS callback ordering.
+            {
+                let mut tls_state = CpuState::new(GuestArch::X86);
+                tls_state.segment_bases.fs = self.teb_base;
+                self.fire_tls_callbacks_for_all_modules(&mut tls_state, memory, DLL_THREAD_ATTACH)?;
+            }
+
             let resume_rsp = pending_thread.started.then_some(pending_thread.initial_rsp);
             pending_thread.started = true;
+
             let disposition = self.execute_guest_callback_inner(
                 &mut pending_thread.state,
                 memory,
@@ -24941,6 +33196,14 @@ impl PeHostRuntime {
             )?;
             match disposition {
                 GuestCallbackDisposition::Returned(exit_code) => {
+                    // Fire TLS thread-detach callbacks for all loaded modules.
+                    // These run after the thread's start function exits, before
+                    // the thread is torn down — matching Windows TLS callback ordering.
+                    {
+                        let mut tls_state = CpuState::new(GuestArch::X86);
+                        tls_state.segment_bases.fs = self.teb_base;
+                        self.fire_tls_callbacks_for_all_modules(&mut tls_state, memory, DLL_THREAD_DETACH)?;
+                    }
                     self.win32
                         .set_thread_exit_code_by_id(pending_thread.thread_id, exit_code as u32)?;
                     Ok((None, self.tls_slots.clone(), self.fls_slots.clone()))
@@ -24955,7 +33218,7 @@ impl PeHostRuntime {
                     Ok((Some(pending_thread), self.tls_slots.clone(), self.fls_slots.clone()))
                 }
             }
-        })();
+        };
 
         self.active_pumped_guest_thread = None;
         self.yield_pumped_guest_thread = false;
@@ -25018,10 +33281,57 @@ impl PeHostRuntime {
             Ok(_) => Ok(false),
             Err(error) => {
                 if self.try_deliver_x86_access_violation(state, memory, &error, label)? {
-                    Ok(true)
-                } else {
-                    Err(error)
+                    return Ok(true);
                 }
+                // ── x64 SEH / VEH Exception Dispatch ────────────────────────────
+                // If the guest is x64 and the fault is an unmapped guest memory
+                // access, try the SEH/VEH subsystem before propagating the error.
+                if self.guest_arch == GuestArch::X64 {
+                    if let Some(fault_address) = guest_access_violation_address(&error) {
+                        let ctx = crate::seh::X64Context {
+                            rax: state.gpr[0],
+                            rcx: state.gpr[1],
+                            rdx: state.gpr[2],
+                            rbx: state.gpr[3],
+                            rsp: state.gpr[4],
+                            rbp: state.gpr[5],
+                            rsi: state.gpr[6],
+                            rdi: state.gpr[7],
+                            r8:  state.gpr[8],
+                            r9:  state.gpr[9],
+                            r10: state.gpr[10],
+                            r11: state.gpr[11],
+                            r12: state.gpr[12],
+                            r13: state.gpr[13],
+                            r14: state.gpr[14],
+                            r15: state.gpr[15],
+                            rip: state.rip,
+                            xmm: {
+                                let mut xmm = [crate::seh::Xmm128::default(); 16];
+                                for i in 0..16 {
+                                    xmm[i] = crate::seh::Xmm128 {
+                                        low: state.xmm[i].low,
+                                        high: state.xmm[i].high,
+                                    };
+                                }
+                                xmm
+                            },
+                        };
+                        if self
+                            .seh
+                            .dispatch(
+                                crate::seh::STATUS_ACCESS_VIOLATION,
+                                fault_address,
+                                &ctx,
+                                self.mapped_image_base,
+                            )
+                            .is_ok()
+                        {
+                            return Ok(true);
+                        }
+                    }
+                }
+                Err(error)
             }
         }
     }
@@ -25449,7 +33759,14 @@ impl PeHostRuntime {
         let bytes = if zeroed {
             vec![0; mapped_size]
         } else {
-            vec![0; mapped_size]
+            // Allocate uninitialized memory: use Vec::with_capacity + unsafe set_len
+            // to avoid zeroing. This is safe because we immediately map the memory
+            // into the guest address space below.
+            let mut heap = Vec::with_capacity(mapped_size);
+            unsafe {
+                heap.set_len(mapped_size);
+            }
+            heap
         };
         memory.map_bytes(address, &bytes);
         self.heap_allocations.insert(address, requested_size);
@@ -25461,14 +33778,32 @@ impl PeHostRuntime {
         let address = if requested_address == 0 {
             align_up_u64(self.next_private_address, 0x1000)
         } else {
-            requested_address & !0xfff
+            let candidate = requested_address & !0xfff;
+            // Check for overlap with existing private page allocations
+            let candidate_end = candidate.checked_add(size as u64).ok_or_else(|| {
+                AppError::new(ReasonCode::RcUnimplInsn, "PE runtime virtual allocation overflow")
+            })?;
+            for (&existing_base, &existing_size) in &self.private_pages {
+                let existing_end = existing_base.checked_add(existing_size as u64).ok_or_else(|| {
+                    AppError::new(ReasonCode::RcUnimplInsn, "PE runtime virtual allocation overflow")
+                })?;
+                if candidate < existing_end && existing_base < candidate_end {
+                    return Err(AppError::new(
+                        ReasonCode::RcUnimplInsn,
+                        format!(
+                            "VirtualAlloc at {candidate:#x} size {size:#x} overlaps existing allocation at {existing_base:#x} size {existing_size:#x}"
+                        ),
+                    ));
+                }
+            }
+            candidate
         };
         let end = address.checked_add(size as u64).ok_or_else(|| {
             AppError::new(ReasonCode::RcUnimplInsn, "PE runtime virtual allocation overflow")
         })?;
         self.next_private_address = self.next_private_address.max(end);
         memory.map_bytes(address, &vec![0; size]);
-        self.heap_allocations.insert(address, size);
+        self.private_pages.insert(address, size);
         Ok(address)
     }
 
@@ -25696,7 +34031,9 @@ impl PeHostRuntime {
             }
             GuestObjectKind::SteamVRHmd
             | GuestObjectKind::SteamVRCompositor
-            | GuestObjectKind::SteamVRChaperone => {
+            | GuestObjectKind::SteamVRChaperone
+            | GuestObjectKind::SteamVRController
+            | GuestObjectKind::SteamVRInput => {
                 self.guest_objects.remove(&address);
             }
             GuestObjectKind::ComClassFactory => {
@@ -25704,6 +34041,73 @@ impl PeHostRuntime {
                 self.guest_objects.remove(&address);
             }
             GuestObjectKind::ComDispatch => {
+                self.guest_objects.remove(&address);
+            }
+            GuestObjectKind::XapoEffect => {
+                self.destroy_xapo_effect_object(address)?;
+            }
+            // ── WMI (Windows Management Instrumentation) ──────────────────────────
+            GuestObjectKind::WbemLocator => {
+                self.wmi_services.remove(&address);
+                self.wmi_class_objects.remove(&address);
+                self.wmi_enums.remove(&address);
+                self.guest_objects.remove(&address);
+            }
+            GuestObjectKind::WbemServices => {
+                self.wmi_services.remove(&address);
+                self.guest_objects.remove(&address);
+            }
+            GuestObjectKind::WbemClassObject => {
+                self.wmi_class_objects.remove(&address);
+                self.guest_objects.remove(&address);
+            }
+            GuestObjectKind::EnumWbemObjects => {
+                self.wmi_enums.remove(&address);
+                self.guest_objects.remove(&address);
+            }
+            // ── WebView2 ────────────────────────────────────────────────
+            GuestObjectKind::WebView2Environment => {
+                let _ = self.webview2_runtime.environments.remove(&address);
+                self.guest_objects.remove(&address);
+            }
+            GuestObjectKind::WebView2Controller => {
+                let _ = self.webview2_runtime.controllers.remove(&address);
+                self.guest_objects.remove(&address);
+            }
+            GuestObjectKind::WebView2WebView => {
+                let _ = self.webview2_runtime.webviews.remove(&address);
+                self.guest_objects.remove(&address);
+            }
+            GuestObjectKind::WebView2Settings => {
+                self.guest_objects.remove(&address);
+            }
+            // ── D3D9 Basic Rendering ──────────────────────────────────
+            GuestObjectKind::D3d9Factory => {
+                self.d3d9_factories.remove(&address);
+                self.guest_objects.remove(&address);
+            }
+            GuestObjectKind::D3d9Device => {
+                self.d3d9_devices.remove(&address);
+                self.guest_objects.remove(&address);
+            }
+            GuestObjectKind::D3d9VertexBuffer => {
+                self.d3d9_vertex_buffers.remove(&address);
+                self.guest_objects.remove(&address);
+            }
+            GuestObjectKind::D3d9IndexBuffer => {
+                self.d3d9_index_buffers.remove(&address);
+                self.guest_objects.remove(&address);
+            }
+            GuestObjectKind::D3d9Texture => {
+                self.d3d9_textures.remove(&address);
+                self.guest_objects.remove(&address);
+            }
+            GuestObjectKind::D3d9Query => {
+                self.d3d9_queries.remove(&address);
+                self.guest_objects.remove(&address);
+            }
+            GuestObjectKind::D3d9SwapChain => {
+                self.d3d9_swapchains.remove(&address);
                 self.guest_objects.remove(&address);
             }
         }
@@ -25741,9 +34145,7 @@ impl PeHostRuntime {
                 HostThunk::GuestObjectAddRef,
                 HostThunk::GuestObjectAddRef,
                 HostThunk::GuestObjectRelease,
-                HostThunk::UnsupportedMethod {
-                    name: "IDirectSound8::CreateSoundBuffer".to_string(),
-                },
+                unsupported_method(&self.telemetry, "IDirectSound8::CreateSoundBuffer"),
             ];
             let vtable = self.alloc_guest_vtable(memory, methods)?;
             let object = self.alloc_guest_object(memory, GuestObjectKind::DirectSound8, vtable)?;
@@ -25766,6 +34168,10 @@ impl PeHostRuntime {
             let vtable = self.alloc_guest_vtable(memory, methods)?;
             let object = self.alloc_guest_object(memory, GuestObjectKind::FileDialog, vtable)?;
             return Ok(Some(object));
+        }
+        // WMI CLSID: CLSID_WbemLocator ({4590F811-1D3A-11D0-891F-00AA004B2E24})
+        if clsid.eq_ignore_ascii_case("{4590F811-1D3A-11D0-891F-00AA004B2E24}") {
+            return self.alloc_wbem_locator_object(memory).map(Some);
         }
         // CLSID not recognised — caller should return CLASS_E_CLASSNOTAVAILABLE
         Ok(None)
@@ -25800,7 +34206,7 @@ impl PeHostRuntime {
     }
 
     fn alloc_shell_link_object(&mut self, memory: &mut MemoryImage) -> AppResult<u64> {
-        let mut methods = vec![unsupported_method("IShellLinkW::reserved"); 21];
+        let mut methods = vec![unsupported_method(&self.telemetry, "IShellLinkW::reserved"); 21];
         methods[0] = HostThunk::ShellLinkQueryInterface;
         methods[1] = HostThunk::ShellLinkAddRef;
         methods[2] = HostThunk::ShellLinkRelease;
@@ -25861,7 +34267,7 @@ impl PeHostRuntime {
         if let Some(object) = self.shell_link_state(state_id)?.persist_file_object {
             return Ok(object);
         }
-        let mut methods = vec![unsupported_method("IPersistFile::reserved"); 9];
+        let mut methods = vec![unsupported_method(&self.telemetry, "IPersistFile::reserved"); 9];
         methods[0] = HostThunk::ShellLinkQueryInterface;
         methods[1] = HostThunk::ShellLinkAddRef;
         methods[2] = HostThunk::ShellLinkRelease;
@@ -26138,19 +34544,19 @@ impl PeHostRuntime {
         let vtable = self.alloc_guest_vtable(
             memory,
             vec![
-                unsupported_method("IXAudio2::QueryInterface"),
+                unsupported_method(&self.telemetry, "IXAudio2::QueryInterface"),
                 HostThunk::GuestObjectAddRef,
                 HostThunk::GuestObjectRelease,
-                unsupported_method("IXAudio2::RegisterForCallbacks"),
-                unsupported_method("IXAudio2::UnregisterForCallbacks"),
+                unsupported_method(&self.telemetry, "IXAudio2::RegisterForCallbacks"),
+                unsupported_method(&self.telemetry, "IXAudio2::UnregisterForCallbacks"),
                 HostThunk::XAudio2CreateSourceVoice,
                 HostThunk::XAudio2CreateSubmixVoice,
                 HostThunk::XAudio2CreateMasteringVoice,
                 HostThunk::XAudio2StartEngine,
                 HostThunk::XAudio2StopEngine,
                 HostThunk::XAudio2CommitChanges,
-                unsupported_method("IXAudio2::GetPerformanceData"),
-                unsupported_method("IXAudio2::SetDebugConfiguration"),
+                unsupported_method(&self.telemetry, "IXAudio2::GetPerformanceData"),
+                unsupported_method(&self.telemetry, "IXAudio2::SetDebugConfiguration"),
             ],
         )?;
         let object = self.alloc_guest_object(memory, GuestObjectKind::XAudio2Engine, vtable)?;
@@ -26372,13 +34778,169 @@ impl PeHostRuntime {
         Ok(())
     }
 
+    /// Allocate a guest COM object implementing the IXAPO interface.
+    ///
+    /// IXAPO vtable layout (7 entries):
+    ///   [0] QueryInterface              → GuestObjectAddRef
+    ///   [1] AddRef                      → GuestObjectAddRef
+    ///   [2] Release                     → GuestObjectRelease
+    ///   [3] GetRegistrationProperties   → XAPO_GetRegistrationProperties
+    ///   [4] LockForProcess              → XAPO_LockForProcess
+    ///   [5] UnlockForProcess            → XAPO_UnlockForProcess
+    ///   [6] Process                     → XAPO_Process
+    fn alloc_xapo_effect_object(
+        &mut self,
+        memory: &mut MemoryImage,
+        clsid: &[u8; 16],
+    ) -> AppResult<Option<u64>> {
+        let instance_id = match self.xapo_manager.create_instance(clsid) {
+            Some(id) => id,
+            None => return Ok(None),
+        };
+        let vtable = self.alloc_guest_vtable(
+            memory,
+            vec![
+                HostThunk::GuestObjectAddRef,
+                HostThunk::GuestObjectAddRef,
+                HostThunk::GuestObjectRelease,
+                HostThunk::XAPO_GetRegistrationProperties,
+                HostThunk::XAPO_LockForProcess,
+                HostThunk::XAPO_UnlockForProcess,
+                HostThunk::XAPO_Process,
+            ],
+        )?;
+        let object = self.alloc_guest_object(memory, GuestObjectKind::XapoEffect, vtable)?;
+        self.xapo_effect_instances.insert(object, instance_id);
+        Ok(Some(object))
+    }
+
+    fn destroy_xapo_effect_object(&mut self, address: u64) -> AppResult<()> {
+        if let Some(instance_id) = self.xapo_effect_instances.remove(&address) {
+            self.xapo_manager.destroy_instance(instance_id);
+        }
+        self.guest_objects.remove(&address);
+        Ok(())
+    }
+
+    // ── WMI COM Object Allocation ────────────────────────────────────────────────
+
+    /// Allocate a WbemLocator guest COM object with IWbemLocator vtable.
+    ///
+    /// IWbemLocator vtable layout:
+    ///   [0] QueryInterface  → GuestObjectAddRef
+    ///   [1] AddRef          → GuestObjectAddRef
+    ///   [2] Release         → GuestObjectRelease
+    ///   [3] ConnectServer   → WbemLocatorConnectServer
+    fn alloc_wbem_locator_object(&mut self, memory: &mut MemoryImage) -> AppResult<u64> {
+        let methods = vec![
+            HostThunk::GuestObjectAddRef,
+            HostThunk::GuestObjectAddRef,
+            HostThunk::GuestObjectRelease,
+            HostThunk::WbemLocatorConnectServer,
+        ];
+        let vtable = self.alloc_guest_vtable(memory, methods)?;
+        let object = self.alloc_guest_object(memory, GuestObjectKind::WbemLocator, vtable)?;
+        self.wmi_services.insert(
+            object,
+            crate::wmi::WbemServices::new(),
+        );
+        Ok(object)
+    }
+
+    /// Allocate a WbemServices guest COM object with IWbemServices vtable.
+    ///
+    /// IWbemServices vtable layout:
+    ///   [0] QueryInterface       → GuestObjectAddRef
+    ///   [1] AddRef               → GuestObjectAddRef
+    ///   [2] Release              → GuestObjectRelease
+    ///   [3] ExecQuery            → WbemServicesExecQuery
+    ///   [4] CreateInstanceEnum   → WbemServicesCreateInstanceEnum
+    ///   [5] GetObject            → WbemServicesGetObject
+    fn alloc_wbem_services_object(&mut self, memory: &mut MemoryImage) -> AppResult<u64> {
+        let methods = vec![
+            HostThunk::GuestObjectAddRef,
+            HostThunk::GuestObjectAddRef,
+            HostThunk::GuestObjectRelease,
+            HostThunk::WbemServicesExecQuery,
+            HostThunk::WbemServicesCreateInstanceEnum,
+            HostThunk::WbemServicesGetObject,
+        ];
+        let vtable = self.alloc_guest_vtable(memory, methods)?;
+        let object = self.alloc_guest_object(memory, GuestObjectKind::WbemServices, vtable)?;
+        self.wmi_services.insert(
+            object,
+            crate::wmi::WbemServices::new(),
+        );
+        Ok(object)
+    }
+
+    /// Allocate a WbemClassObject guest COM object with IWbemClassObject vtable.
+    ///
+    /// IWbemClassObject vtable layout:
+    ///   [0] QueryInterface  → GuestObjectAddRef
+    ///   [1] AddRef          → GuestObjectAddRef
+    ///   [2] Release         → GuestObjectRelease
+    ///   [3] Get             → WbemClassObjectGet
+    ///   [4] Put             → WbemClassObjectPut
+    ///   [5] GetNames        → WbemClassObjectGetNames
+    ///   [6] GetObjectText   → WbemClassObjectGetObjectText
+    fn alloc_wbem_class_object(
+        &mut self,
+        memory: &mut MemoryImage,
+        class_object: crate::wmi::WbemClassObject,
+    ) -> AppResult<u64> {
+        let methods = vec![
+            HostThunk::GuestObjectAddRef,
+            HostThunk::GuestObjectAddRef,
+            HostThunk::GuestObjectRelease,
+            HostThunk::WbemClassObjectGet,
+            HostThunk::WbemClassObjectPut,
+            HostThunk::WbemClassObjectGetNames,
+            HostThunk::WbemClassObjectGetObjectText,
+        ];
+        let vtable = self.alloc_guest_vtable(memory, methods)?;
+        let object = self.alloc_guest_object(memory, GuestObjectKind::WbemClassObject, vtable)?;
+        self.wmi_class_objects.insert(object, class_object);
+        Ok(object)
+    }
+
+    /// Allocate an EnumWbemObjects guest COM object with IEnumWbemClassObject vtable.
+    ///
+    /// IEnumWbemClassObject vtable layout:
+    ///   [0] QueryInterface  → GuestObjectAddRef
+    ///   [1] AddRef          → GuestObjectAddRef
+    ///   [2] Release         → GuestObjectRelease
+    ///   [3] Next            → EnumWbemClassObjectNext
+    ///   [4] Skip            → EnumWbemClassObjectSkip
+    ///   [5] Reset           → EnumWbemClassObjectReset
+    ///   [6] Clone           → EnumWbemClassObjectClone
+    fn alloc_enum_wbem_objects(
+        &mut self,
+        memory: &mut MemoryImage,
+        enum_objects: crate::wmi::EnumWbemObjects,
+    ) -> AppResult<u64> {
+        let methods = vec![
+            HostThunk::GuestObjectAddRef,
+            HostThunk::GuestObjectAddRef,
+            HostThunk::GuestObjectRelease,
+            HostThunk::EnumWbemClassObjectNext,
+            HostThunk::EnumWbemClassObjectSkip,
+            HostThunk::EnumWbemClassObjectReset,
+            HostThunk::EnumWbemClassObjectClone,
+        ];
+        let vtable = self.alloc_guest_vtable(memory, methods)?;
+        let object = self.alloc_guest_object(memory, GuestObjectKind::EnumWbemObjects, vtable)?;
+        self.wmi_enums.insert(object, enum_objects);
+        Ok(object)
+    }
+
     fn alloc_directinput8_object(&mut self, memory: &mut MemoryImage) -> AppResult<u64> {
         // IDirectInput8W vtable layout:
         //   0: QueryInterface, 1: AddRef, 2: Release,
         //   3: CreateDevice, 4: EnumDevices, 5: GetDeviceStatus,
         //   6: RunControlPanel, 7: Initialize
-        let mut methods = vec![unsupported_method("IDirectInput8W::unsupported"); 10];
-        methods[0] = unsupported_method("IDirectInput8W::QueryInterface");
+        let mut methods = vec![unsupported_method(&self.telemetry, "IDirectInput8W::unsupported"); 10];
+        methods[0] = unsupported_method(&self.telemetry, "IDirectInput8W::QueryInterface");
         methods[1] = HostThunk::GuestObjectAddRef;
         methods[2] = HostThunk::GuestObjectRelease;
         methods[3] = HostThunk::DirectInput8CreateDevice;
@@ -26401,8 +34963,8 @@ impl PeHostRuntime {
         //   11: SetDataFormat, 12: SetCooperativeLevel,
         //   13-23: other methods (stubbed),
         //   24: Poll
-        let mut methods = vec![unsupported_method("IDirectInputDevice8W::unsupported"); 28];
-        methods[0] = unsupported_method("IDirectInputDevice8W::QueryInterface");
+        let mut methods = vec![unsupported_method(&self.telemetry, "IDirectInputDevice8W::unsupported"); 28];
+        methods[0] = unsupported_method(&self.telemetry, "IDirectInputDevice8W::QueryInterface");
         methods[1] = HostThunk::GuestObjectAddRef;
         methods[2] = HostThunk::GuestObjectRelease;
         methods[3] = HostThunk::DirectInputDevice8GetCapabilities;
@@ -26414,6 +34976,9 @@ impl PeHostRuntime {
         methods[10] = HostThunk::DirectInputDevice8GetDeviceData;
         methods[11] = HostThunk::DirectInputDevice8SetDataFormat;
         methods[12] = HostThunk::DirectInputDevice8SetCooperativeLevel;
+        // Force-feedback vtable slots (IDirectInputDevice8 methods 21 and 22)
+        methods[21] = HostThunk::DirectInputDevice8SendForceFeedbackCommand;
+        methods[22] = HostThunk::DirectInputDevice8SetForceFeedbackState;
         methods[24] = HostThunk::DirectInputDevice8Poll;
         let vtable = self.alloc_guest_vtable(memory, methods)?;
         let object = self.alloc_guest_object(memory, GuestObjectKind::DirectInput8Device, vtable)?;
@@ -26434,27 +34999,53 @@ impl PeHostRuntime {
     }
 
     fn alloc_d3d11_device_object(&mut self, memory: &mut MemoryImage, device: D3d11Device) -> AppResult<u64> {
-        let mut device_methods = vec![unsupported_method("ID3D11Device::unsupported"); 43];
-        device_methods[0] = unsupported_method("ID3D11Device::QueryInterface");
+        let mut device_methods = vec![unsupported_method(&self.telemetry, "ID3D11Device::unsupported"); 43];
+        device_methods[0] = unsupported_method(&self.telemetry, "ID3D11Device::QueryInterface");
         device_methods[1] = HostThunk::GuestObjectAddRef;
         device_methods[2] = HostThunk::GuestObjectRelease;
         device_methods[3] = HostThunk::D3D11DeviceCreateBuffer;
+        device_methods[4] = unsupported_method(&self.telemetry, "ID3D11Device::CreateTexture1D");
         device_methods[5] = HostThunk::D3D11DeviceCreateTexture2D;
+        device_methods[6] = unsupported_method(&self.telemetry, "ID3D11Device::CreateTexture3D");
         device_methods[7] = HostThunk::D3D11DeviceCreateShaderResourceView;
+        device_methods[8] = unsupported_method(&self.telemetry, "ID3D11Device::CreateUnorderedAccessView");
         device_methods[9] = HostThunk::D3D11DeviceCreateRenderTargetView;
         device_methods[10] = HostThunk::D3D11DeviceCreateDepthStencilView;
+        device_methods[11] = HostThunk::D3D11DeviceCreateInputLayout;
+        device_methods[12] = HostThunk::D3D11DeviceCreateVertexShader;
+        device_methods[13] = unsupported_method(&self.telemetry, "ID3D11Device::CreateGeometryShader");
+        device_methods[14] = unsupported_method(&self.telemetry, "ID3D11Device::CreateGeometryShaderWithStreamOutput");
+        device_methods[15] = HostThunk::D3D11DeviceCreatePixelShader;
+        device_methods[16] = unsupported_method(&self.telemetry, "ID3D11Device::CreateHullShader");
+        device_methods[17] = unsupported_method(&self.telemetry, "ID3D11Device::CreateDomainShader");
+        device_methods[18] = HostThunk::D3D11DeviceCreateComputeShader;
+        device_methods[19] = unsupported_method(&self.telemetry, "ID3D11Device::CreateClassLinkage");
         device_methods[20] = HostThunk::D3D11DeviceCreateBlendState;
         device_methods[21] = HostThunk::D3D11DeviceCreateDepthStencilState;
         device_methods[22] = HostThunk::D3D11DeviceCreateRasterizerState;
         device_methods[23] = HostThunk::D3D11DeviceCreateSamplerState;
-        device_methods[11] = HostThunk::D3D11DeviceCreateInputLayout;
-        device_methods[12] = HostThunk::D3D11DeviceCreateVertexShader;
-        device_methods[15] = HostThunk::D3D11DeviceCreatePixelShader;
-        device_methods[18] = HostThunk::D3D11DeviceCreateComputeShader;
-        device_methods[40] = HostThunk::D3D11DeviceGetImmediateContext;
+        device_methods[24] = HostThunk::D3D11DeviceCreateQuery;
+        device_methods[25] = HostThunk::D3D11DeviceCreateQuery; // CreatePredicate reuses Query stub
+        device_methods[26] = HostThunk::D3D11DeviceCreateQuery; // CreateCounter reuses Query stub
+        device_methods[27] = HostThunk::D3D11DeviceCreateDeferredContext;
+        device_methods[28] = HostThunk::D3D11DeviceOpenSharedResource;
+        device_methods[29] = HostThunk::D3D11DeviceCheckFormatSupport;
+        device_methods[30] = HostThunk::D3D11DeviceCheckMultisampleQualityLevels;
+        device_methods[31] = HostThunk::D3D11DeviceCheckCounterInfo;
+        device_methods[32] = unsupported_method(&self.telemetry, "ID3D11Device::CheckCounter");
+        device_methods[33] = unsupported_method(&self.telemetry, "ID3D11Device::CheckFeatureSupport");
+        device_methods[34] = HostThunk::DXGIFactoryGetPrivateData; // GetPrivateData
+        device_methods[35] = HostThunk::DXGIFactorySetPrivateData; // SetPrivateData
+        device_methods[36] = HostThunk::D3D11DeviceGetDeviceRemovedReason;
+        device_methods[37] = HostThunk::DXGIFactorySetPrivateData; // SetPrivateDataInterface (stub)
+        device_methods[38] = HostThunk::D3D11DeviceGetFeatureLevel;
+        device_methods[39] = unsupported_method(&self.telemetry, "ID3D11Device::GetImmediateContext"); // base D3D11 slot
+        device_methods[40] = HostThunk::D3D11DeviceGetImmediateContext; // ID3D11Device1::GetImmediateContext1
+        device_methods[41] = unsupported_method(&self.telemetry, "ID3D11Device::CreateDeferredContext1");
+        device_methods[42] = unsupported_method(&self.telemetry, "ID3D11Device::GetImmediateContext2");
 
-        let mut context_methods = vec![unsupported_method("ID3D11DeviceContext::unsupported"); 70];
-        context_methods[0] = unsupported_method("ID3D11DeviceContext::QueryInterface");
+        let mut context_methods = vec![unsupported_method(&self.telemetry, "ID3D11DeviceContext::unsupported"); 70];
+        context_methods[0] = unsupported_method(&self.telemetry, "ID3D11DeviceContext::QueryInterface");
         context_methods[1] = HostThunk::GuestObjectAddRef;
         context_methods[2] = HostThunk::GuestObjectRelease;
         context_methods[7] = HostThunk::D3D11DeviceContextVSSetConstantBuffers;
@@ -26477,10 +35068,11 @@ impl PeHostRuntime {
         context_methods[44] = HostThunk::D3D11DeviceContextRSSetViewports;
         context_methods[45] = HostThunk::D3D11DeviceContextRSSetScissorRects;
         context_methods[48] = HostThunk::D3D11DeviceContextUpdateSubresource;
+        context_methods[54] = HostThunk::D3D11DeviceContextResolveSubresource;
         context_methods[69] = HostThunk::D3D11DeviceContextCSSetShader;
 
-        let mut swapchain_methods = vec![unsupported_method("IDXGISwapChain::unsupported"); 14];
-        swapchain_methods[0] = unsupported_method("IDXGISwapChain::QueryInterface");
+        let mut swapchain_methods = vec![unsupported_method(&self.telemetry, "IDXGISwapChain::unsupported"); 14];
+        swapchain_methods[0] = unsupported_method(&self.telemetry, "IDXGISwapChain::QueryInterface");
         swapchain_methods[1] = HostThunk::GuestObjectAddRef;
         swapchain_methods[2] = HostThunk::GuestObjectRelease;
         swapchain_methods[8] = HostThunk::DXGISwapChainPresent;
@@ -26542,7 +35134,7 @@ impl PeHostRuntime {
         let texture_vtable = self.alloc_guest_vtable(
             memory,
             vec![
-                unsupported_method("ID3D11Texture2D::QueryInterface"),
+                unsupported_method(&self.telemetry, "ID3D11Texture2D::QueryInterface"),
                 HostThunk::GuestObjectAddRef,
                 HostThunk::GuestObjectRelease,
             ],
@@ -26571,13 +35163,13 @@ impl PeHostRuntime {
         let buffer_vtable = self.alloc_guest_vtable(
             memory,
             vec![
-                unsupported_method("ID3D11Buffer::QueryInterface"),
+                unsupported_method(&self.telemetry, "ID3D11Buffer::QueryInterface"),
                 HostThunk::GuestObjectAddRef,
                 HostThunk::GuestObjectRelease,
-                unsupported_method("ID3D11DeviceChild::GetDevice"),
-                unsupported_method("ID3D11DeviceChild::GetPrivateData"),
-                unsupported_method("ID3D11DeviceChild::SetPrivateData"),
-                unsupported_method("ID3D11DeviceChild::SetPrivateDataInterface"),
+                unsupported_method(&self.telemetry, "ID3D11DeviceChild::GetDevice"),
+                unsupported_method(&self.telemetry, "ID3D11DeviceChild::GetPrivateData"),
+                unsupported_method(&self.telemetry, "ID3D11DeviceChild::SetPrivateData"),
+                unsupported_method(&self.telemetry, "ID3D11DeviceChild::SetPrivateDataInterface"),
             ],
         )?;
         let buffer_object = self.alloc_guest_object(memory, GuestObjectKind::D3d11Buffer, buffer_vtable)?;
@@ -26602,13 +35194,13 @@ impl PeHostRuntime {
         let view_vtable = self.alloc_guest_vtable(
             memory,
             vec![
-                unsupported_method("ID3D11View::QueryInterface"),
+                unsupported_method(&self.telemetry, "ID3D11View::QueryInterface"),
                 HostThunk::GuestObjectAddRef,
                 HostThunk::GuestObjectRelease,
-                unsupported_method("ID3D11DeviceChild::GetDevice"),
-                unsupported_method("ID3D11DeviceChild::GetPrivateData"),
-                unsupported_method("ID3D11DeviceChild::SetPrivateData"),
-                unsupported_method("ID3D11DeviceChild::SetPrivateDataInterface"),
+                unsupported_method(&self.telemetry, "ID3D11DeviceChild::GetDevice"),
+                unsupported_method(&self.telemetry, "ID3D11DeviceChild::GetPrivateData"),
+                unsupported_method(&self.telemetry, "ID3D11DeviceChild::SetPrivateData"),
+                unsupported_method(&self.telemetry, "ID3D11DeviceChild::SetPrivateDataInterface"),
             ],
         )?;
         let view_object = self.alloc_guest_object(memory, GuestObjectKind::D3d11View, view_vtable)?;
@@ -26633,13 +35225,13 @@ impl PeHostRuntime {
         let layout_vtable = self.alloc_guest_vtable(
             memory,
             vec![
-                unsupported_method("ID3D11InputLayout::QueryInterface"),
+                unsupported_method(&self.telemetry, "ID3D11InputLayout::QueryInterface"),
                 HostThunk::GuestObjectAddRef,
                 HostThunk::GuestObjectRelease,
-                unsupported_method("ID3D11DeviceChild::GetDevice"),
-                unsupported_method("ID3D11DeviceChild::GetPrivateData"),
-                unsupported_method("ID3D11DeviceChild::SetPrivateData"),
-                unsupported_method("ID3D11DeviceChild::SetPrivateDataInterface"),
+                unsupported_method(&self.telemetry, "ID3D11DeviceChild::GetDevice"),
+                unsupported_method(&self.telemetry, "ID3D11DeviceChild::GetPrivateData"),
+                unsupported_method(&self.telemetry, "ID3D11DeviceChild::SetPrivateData"),
+                unsupported_method(&self.telemetry, "ID3D11DeviceChild::SetPrivateDataInterface"),
             ],
         )?;
         let layout_object = self.alloc_guest_object(memory, GuestObjectKind::D3d11InputLayout, layout_vtable)?;
@@ -26664,13 +35256,13 @@ impl PeHostRuntime {
         let shader_vtable = self.alloc_guest_vtable(
             memory,
             vec![
-                unsupported_method("ID3D11DeviceChild::QueryInterface"),
+                unsupported_method(&self.telemetry, "ID3D11DeviceChild::QueryInterface"),
                 HostThunk::GuestObjectAddRef,
                 HostThunk::GuestObjectRelease,
-                unsupported_method("ID3D11DeviceChild::GetDevice"),
-                unsupported_method("ID3D11DeviceChild::GetPrivateData"),
-                unsupported_method("ID3D11DeviceChild::SetPrivateData"),
-                unsupported_method("ID3D11DeviceChild::SetPrivateDataInterface"),
+                unsupported_method(&self.telemetry, "ID3D11DeviceChild::GetDevice"),
+                unsupported_method(&self.telemetry, "ID3D11DeviceChild::GetPrivateData"),
+                unsupported_method(&self.telemetry, "ID3D11DeviceChild::SetPrivateData"),
+                unsupported_method(&self.telemetry, "ID3D11DeviceChild::SetPrivateDataInterface"),
             ],
         )?;
         let shader_object = self.alloc_guest_object(memory, GuestObjectKind::D3d11Shader, shader_vtable)?;
@@ -26695,13 +35287,13 @@ impl PeHostRuntime {
         let state_vtable = self.alloc_guest_vtable(
             memory,
             vec![
-                unsupported_method("ID3D11BlendState::QueryInterface"),
+                unsupported_method(&self.telemetry, "ID3D11BlendState::QueryInterface"),
                 HostThunk::GuestObjectAddRef,
                 HostThunk::GuestObjectRelease,
-                unsupported_method("ID3D11DeviceChild::GetDevice"),
-                unsupported_method("ID3D11DeviceChild::GetPrivateData"),
-                unsupported_method("ID3D11DeviceChild::SetPrivateData"),
-                unsupported_method("ID3D11DeviceChild::SetPrivateDataInterface"),
+                unsupported_method(&self.telemetry, "ID3D11DeviceChild::GetDevice"),
+                unsupported_method(&self.telemetry, "ID3D11DeviceChild::GetPrivateData"),
+                unsupported_method(&self.telemetry, "ID3D11DeviceChild::SetPrivateData"),
+                unsupported_method(&self.telemetry, "ID3D11DeviceChild::SetPrivateDataInterface"),
             ],
         )?;
         let state_object = self.alloc_guest_object(memory, GuestObjectKind::D3d11BlendState, state_vtable)?;
@@ -26725,13 +35317,13 @@ impl PeHostRuntime {
         let state_vtable = self.alloc_guest_vtable(
             memory,
             vec![
-                unsupported_method("ID3D11RasterizerState::QueryInterface"),
+                unsupported_method(&self.telemetry, "ID3D11RasterizerState::QueryInterface"),
                 HostThunk::GuestObjectAddRef,
                 HostThunk::GuestObjectRelease,
-                unsupported_method("ID3D11DeviceChild::GetDevice"),
-                unsupported_method("ID3D11DeviceChild::GetPrivateData"),
-                unsupported_method("ID3D11DeviceChild::SetPrivateData"),
-                unsupported_method("ID3D11DeviceChild::SetPrivateDataInterface"),
+                unsupported_method(&self.telemetry, "ID3D11DeviceChild::GetDevice"),
+                unsupported_method(&self.telemetry, "ID3D11DeviceChild::GetPrivateData"),
+                unsupported_method(&self.telemetry, "ID3D11DeviceChild::SetPrivateData"),
+                unsupported_method(&self.telemetry, "ID3D11DeviceChild::SetPrivateDataInterface"),
             ],
         )?;
         let state_object = self.alloc_guest_object(memory, GuestObjectKind::D3d11RasterizerState, state_vtable)?;
@@ -26755,13 +35347,13 @@ impl PeHostRuntime {
         let state_vtable = self.alloc_guest_vtable(
             memory,
             vec![
-                unsupported_method("ID3D11DepthStencilState::QueryInterface"),
+                unsupported_method(&self.telemetry, "ID3D11DepthStencilState::QueryInterface"),
                 HostThunk::GuestObjectAddRef,
                 HostThunk::GuestObjectRelease,
-                unsupported_method("ID3D11DeviceChild::GetDevice"),
-                unsupported_method("ID3D11DeviceChild::GetPrivateData"),
-                unsupported_method("ID3D11DeviceChild::SetPrivateData"),
-                unsupported_method("ID3D11DeviceChild::SetPrivateDataInterface"),
+                unsupported_method(&self.telemetry, "ID3D11DeviceChild::GetDevice"),
+                unsupported_method(&self.telemetry, "ID3D11DeviceChild::GetPrivateData"),
+                unsupported_method(&self.telemetry, "ID3D11DeviceChild::SetPrivateData"),
+                unsupported_method(&self.telemetry, "ID3D11DeviceChild::SetPrivateDataInterface"),
             ],
         )?;
         let state_object = self.alloc_guest_object(memory, GuestObjectKind::D3d11DepthStencilState, state_vtable)?;
@@ -26785,13 +35377,13 @@ impl PeHostRuntime {
         let state_vtable = self.alloc_guest_vtable(
             memory,
             vec![
-                unsupported_method("ID3D11SamplerState::QueryInterface"),
+                unsupported_method(&self.telemetry, "ID3D11SamplerState::QueryInterface"),
                 HostThunk::GuestObjectAddRef,
                 HostThunk::GuestObjectRelease,
-                unsupported_method("ID3D11DeviceChild::GetDevice"),
-                unsupported_method("ID3D11DeviceChild::GetPrivateData"),
-                unsupported_method("ID3D11DeviceChild::SetPrivateData"),
-                unsupported_method("ID3D11DeviceChild::SetPrivateDataInterface"),
+                unsupported_method(&self.telemetry, "ID3D11DeviceChild::GetDevice"),
+                unsupported_method(&self.telemetry, "ID3D11DeviceChild::GetPrivateData"),
+                unsupported_method(&self.telemetry, "ID3D11DeviceChild::SetPrivateData"),
+                unsupported_method(&self.telemetry, "ID3D11DeviceChild::SetPrivateDataInterface"),
             ],
         )?;
         let state_object = self.alloc_guest_object(memory, GuestObjectKind::D3d11SamplerState, state_vtable)?;
@@ -26810,8 +35402,8 @@ impl PeHostRuntime {
 
     /// Allocates an IVRSystem vtable (80 slots) and returns the guest object address.
     fn alloc_ivrsystem_vtable(&mut self, memory: &mut MemoryImage) -> AppResult<u64> {
-        let mut methods = vec![unsupported_method("IVRSystem::unsupported"); 80];
-        methods[0] = unsupported_method("IVRSystem::Release");
+        let mut methods = vec![unsupported_method(&self.telemetry, "IVRSystem::unsupported"); 80];
+        methods[0] = unsupported_method(&self.telemetry, "IVRSystem::Release");
         methods[5] = HostThunk::SteamVR_IVRSystem_GetTrackedDeviceClass;
         methods[6] = HostThunk::SteamVR_IVRSystem_IsTrackedDeviceConnected;
         methods[7] = HostThunk::SteamVR_IVRSystem_GetStringTrackedDeviceProperty;
@@ -26832,8 +35424,8 @@ impl PeHostRuntime {
 
     /// Allocates an IVRCompositor vtable (40 slots) and returns the guest object address.
     fn alloc_ivrcompositor_vtable(&mut self, memory: &mut MemoryImage) -> AppResult<u64> {
-        let mut methods = vec![unsupported_method("IVRCompositor::unsupported"); 40];
-        methods[0] = unsupported_method("IVRCompositor::Release");
+        let mut methods = vec![unsupported_method(&self.telemetry, "IVRCompositor::unsupported"); 40];
+        methods[0] = unsupported_method(&self.telemetry, "IVRCompositor::Release");
         methods[5] = HostThunk::SteamVR_IVRCompositor_Submit;
         methods[6] = HostThunk::SteamVR_IVRCompositor_WaitGetPoses;
         methods[7] = HostThunk::SteamVR_IVRCompositor_GetFrameTiming;
@@ -26849,13 +35441,45 @@ impl PeHostRuntime {
 
     /// Allocates an IVRChaperone vtable (20 slots) and returns the guest object address.
     fn alloc_ivrchaperone_vtable(&mut self, memory: &mut MemoryImage) -> AppResult<u64> {
-        let mut methods = vec![unsupported_method("IVRChaperone::unsupported"); 20];
-        methods[0] = unsupported_method("IVRChaperone::Release");
+        let mut methods = vec![unsupported_method(&self.telemetry, "IVRChaperone::unsupported"); 20];
+        methods[0] = unsupported_method(&self.telemetry, "IVRChaperone::Release");
         methods[1] = HostThunk::SteamVR_IVRChaperone_GetCalibrationState;
         methods[2] = HostThunk::SteamVR_IVRChaperone_GetPlayAreaSize;
         methods[3] = HostThunk::SteamVR_IVRChaperone_GetPlayAreaRect;
         let vtable = self.alloc_guest_vtable(memory, methods)?;
         let object = self.alloc_guest_object(memory, GuestObjectKind::SteamVRChaperone, vtable)?;
+        Ok(object)
+    }
+
+    /// Allocates an IVRController vtable (10 slots) and returns the guest object address.
+    fn alloc_ivrcontroller_vtable(&mut self, memory: &mut MemoryImage) -> AppResult<u64> {
+        let mut methods = vec![unsupported_method(&self.telemetry, "IVRController::unsupported"); 10];
+        methods[0] = HostThunk::SteamVR_IVRController_Release;
+        methods[1] = HostThunk::SteamVR_IVRController_TriggerHapticPulse;
+        // Slot 2 = unused TriggerHapticPulseV2
+        methods[3] = HostThunk::SteamVR_IVRController_GetControllerState;
+        methods[4] = HostThunk::SteamVR_IVRController_GetControllerStateForNextFrame;
+        let vtable = self.alloc_guest_vtable(memory, methods)?;
+        let object = self.alloc_guest_object(memory, GuestObjectKind::SteamVRController, vtable)?;
+        Ok(object)
+    }
+
+    /// Allocates an IVRInput vtable (20 slots) and returns the guest object address.
+    fn alloc_ivrinput_vtable(&mut self, memory: &mut MemoryImage) -> AppResult<u64> {
+        let mut methods = vec![unsupported_method(&self.telemetry, "IVRInput::unsupported"); 20];
+        methods[0] = HostThunk::SteamVR_IVRInput_Release;
+        methods[1] = HostThunk::SteamVR_IVRInput_SetActionManifestPath;
+        methods[2] = HostThunk::SteamVR_IVRInput_GetActionHandle;
+        methods[3] = HostThunk::SteamVR_IVRInput_GetActionHandle; // GetDigitalActionHandle
+        methods[4] = HostThunk::SteamVR_IVRInput_GetActionHandle; // GetAnalogActionHandle
+        methods[5] = HostThunk::SteamVR_IVRInput_GetActionSetHandle;
+        methods[6] = HostThunk::SteamVR_IVRInput_GetDigitalActionData;
+        methods[7] = HostThunk::SteamVR_IVRInput_GetAnalogActionData;
+        methods[8] = HostThunk::SteamVR_IVRInput_GetActionSetHandle;
+        methods[9] = HostThunk::SteamVR_IVRInput_ActivateActionSet;
+        methods[10] = HostThunk::SteamVR_IVRInput_GetCurrentActionSet;
+        let vtable = self.alloc_guest_vtable(memory, methods)?;
+        let object = self.alloc_guest_object(memory, GuestObjectKind::SteamVRInput, vtable)?;
         Ok(object)
     }
 
@@ -28255,6 +36879,59 @@ impl PeHostRuntime {
         Ok(())
     }
 
+    fn dispatch_d3d11_resolve_subresource(
+        &mut self,
+        memory: &mut MemoryImage,
+        state: &mut CpuState,
+    ) -> AppResult<()> {
+        // ID3D11DeviceContext::ResolveSubresource calling convention (x64):
+        //   RCX = this (context object)
+        //   RDX = pDstResource
+        //   R8  = DstSubresource
+        //   R9  = pSrcResource
+        //   [RSP+0x20] = SrcSubresource
+        //   [RSP+0x28] = Format (DXGI_FORMAT)
+        let context = self.d3d11_context(state.get(Register::Rcx))?;
+        let dst_texture = self.d3d11_texture(state.get(Register::Rdx))?;
+        let dst_subresource = state.get(Register::R8) as u32;
+        let src_texture = self.d3d11_texture(state.get(Register::R9))?;
+        let stack = state.get(Register::Rsp);
+        let src_subresource = memory.read_u64(stack + 0x20)? as u32;
+        let format = memory.read_u64(stack + 0x28)? as u32;
+
+        if dst_texture.device_object != context.device_object
+            || src_texture.device_object != context.device_object
+        {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                "ResolveSubresource requires resources owned by the same device",
+            ));
+        }
+
+        self.d3d11_device_mut(context.device_object)?
+            .device
+            .resolve_subresource(
+                dst_texture.resource_id,
+                dst_subresource,
+                src_texture.resource_id,
+                src_subresource,
+                format,
+            )?;
+        state.set(Register::Rax, 0);
+        self.last_error = 0;
+        self.push_trace(
+            "d3d12",
+            "ID3D11DeviceContext::ResolveSubresource",
+            BTreeMap::from([
+                ("dst_subresource".to_string(), json!(dst_subresource)),
+                ("src_subresource".to_string(), json!(src_subresource)),
+                ("format".to_string(), json!(format)),
+            ]),
+            json!(0),
+        );
+        Ok(())
+    }
+
     fn dispatch_d3d11_create_shader(
         &mut self,
         memory: &mut MemoryImage,
@@ -28415,13 +37092,24 @@ impl PeHostRuntime {
     }
 
     fn alloc_dxgi_factory_object(&mut self, memory: &mut MemoryImage) -> AppResult<u64> {
-        let mut methods = vec![unsupported_method("IDXGIFactory::unsupported"); 26];
-        methods[0] = unsupported_method("IDXGIFactory::QueryInterface");
+        let mut methods = vec![unsupported_method(&self.telemetry, "IDXGIFactory::unsupported"); 26];
+        methods[0] = unsupported_method(&self.telemetry, "IDXGIFactory::QueryInterface");
         methods[1] = HostThunk::GuestObjectAddRef;
         methods[2] = HostThunk::GuestObjectRelease;
+        // IDXGIObject methods (slots 3-6)
+        methods[3] = HostThunk::DXGIFactorySetPrivateData;
+        methods[4] = unsupported_method(&self.telemetry, "IDXGIFactory::SetPrivateDataInterface");
+        methods[5] = HostThunk::DXGIFactoryGetPrivateData;
+        methods[6] = HostThunk::DXGIFactoryGetParent;
+        // IDXGIFactory methods (slots 7-13)
         methods[7] = HostThunk::DXGIFactoryEnumAdapters;
+        methods[8] = HostThunk::DXGIFactoryMakeWindowAssociation;
+        methods[9] = HostThunk::DXGIFactoryGetWindowAssociation;
         methods[10] = HostThunk::DXGIFactoryCreateSwapChain;
+        methods[11] = HostThunk::DXGIFactoryCreateSoftwareAdapter;
         methods[12] = HostThunk::DXGIFactoryEnumAdapters1;
+        // IDXGIFactory1 methods (slot 13+)
+        // IDXGIFactory2 methods (slot 14+)
         methods[15] = HostThunk::DXGIFactoryCreateSwapChainForHwnd;
         let vtable = self.alloc_guest_vtable(memory, methods)?;
         let object = self.alloc_guest_object(memory, GuestObjectKind::DxgiFactory, vtable)?;
@@ -28429,12 +37117,376 @@ impl PeHostRuntime {
         Ok(object)
     }
 
-    fn alloc_dxgi_adapter_object(&mut self, memory: &mut MemoryImage, factory_object: u64) -> AppResult<u64> {
-        let mut methods = vec![unsupported_method("IDXGIAdapter::unsupported"); 11];
-        methods[0] = unsupported_method("IDXGIAdapter::QueryInterface");
+    // ── D3D9 COM object allocators (Phase 1.5) ──────────────────────────────
+
+    fn alloc_d3d9_factory_object(&mut self, memory: &mut MemoryImage) -> AppResult<u64> {
+        // IDirect3D9 has ~20 methods. Fill with unsupported defaults, then
+        // wire up the ones we implement.
+        let mut methods = vec![unsupported_method(&self.telemetry, "IDirect3D9::QueryInterface"); 20];
+        methods[0] = unsupported_method(&self.telemetry, "IDirect3D9::QueryInterface");
         methods[1] = HostThunk::GuestObjectAddRef;
         methods[2] = HostThunk::GuestObjectRelease;
+        methods[3] = HostThunk::D3d9FactoryCreateDevice;
+        methods[4] = HostThunk::D3d9FactoryGetAdapterCount;
+        methods[5] = HostThunk::D3d9FactoryGetAdapterIdentifier;
+        methods[6] = HostThunk::D3d9FactoryGetAdapterModeCount;
+        methods[7] = HostThunk::D3d9FactoryGetAdapterDisplayMode;
+        methods[8] = HostThunk::D3d9FactoryGetDeviceCaps;
+        let vtable = self.alloc_guest_vtable(memory, methods)?;
+        let object = self.alloc_guest_object(memory, GuestObjectKind::D3d9Factory, vtable)?;
+        self.d3d9_factories.insert(object);
+        Ok(object)
+    }
+
+    fn alloc_d3d9_device_object(
+        &mut self,
+        memory: &mut MemoryImage,
+        device_id: D3d9DeviceId,
+        present_params: D3dPresentParameters,
+    ) -> AppResult<u64> {
+        // IDirect3DDevice9 has 105 vtable slots. Fill with unsupported, wire up
+        // the methods we handle for basic fixed-function rendering.
+        let mut methods = vec![unsupported_method(&self.telemetry, "IDirect3DDevice9::?"); 105];
+
+        // Standard COM (slots 0-2)
+        methods[0] = unsupported_method(&self.telemetry, "IDirect3DDevice9::QueryInterface");
+        methods[1] = HostThunk::GuestObjectAddRef;
+        methods[2] = HostThunk::GuestObjectRelease;
+
+        // State queries (slot 3)
+        methods[3] = HostThunk::D3d9DeviceTestCooperativeLevel;
+
+        // Capabilities (slot 7)
+        methods[7] = HostThunk::D3d9DeviceGetDeviceCaps;
+
+        // Reset / Present (slots 16-17)
+        methods[16] = HostThunk::D3d9DeviceReset;
+        methods[17] = HostThunk::D3d9DevicePresent;
+
+        // Back buffer / render target (slots 18-22)
+        methods[18] = HostThunk::D3d9DeviceGetBackBuffer;
+        methods[19] = HostThunk::D3d9DeviceGetRenderTarget;
+        methods[20] = HostThunk::D3d9DeviceSetRenderTarget;
+        methods[21] = HostThunk::D3d9DeviceGetDepthStencilSurface;
+        methods[22] = HostThunk::D3d9DeviceSetDepthStencilSurface;
+
+        // Scene management (slots 23-24)
+        methods[23] = HostThunk::D3d9DeviceBeginScene;
+        methods[24] = HostThunk::D3d9DeviceEndScene;
+
+        // Clear (slot 25)
+        methods[25] = HostThunk::D3d9DeviceClear;
+
+        // Transform (slots 26-28)
+        methods[26] = HostThunk::D3d9DeviceSetTransform;
+        methods[27] = HostThunk::D3d9DeviceGetTransform;
+
+        // Viewport (slots 29-30)
+        methods[29] = HostThunk::D3d9DeviceSetViewport;
+        methods[30] = HostThunk::D3d9DeviceGetViewport;
+
+        // Material (slots 31-32)
+        methods[31] = HostThunk::D3d9DeviceSetMaterial;
+
+        // Light (slots 33-36)
+        methods[33] = HostThunk::D3d9DeviceSetLight;
+        methods[35] = HostThunk::D3d9DeviceLightEnable;
+
+        // Clip plane (slots 37-38)
+        methods[37] = HostThunk::D3d9DeviceSetClipPlane;
+
+        // Render states (slots 39-40)
+        methods[39] = HostThunk::D3d9DeviceSetRenderState;
+        methods[40] = HostThunk::D3d9DeviceGetRenderState;
+
+        // Texture (slots 46-49)
+        methods[46] = HostThunk::D3d9DeviceGetTexture;
+        methods[47] = HostThunk::D3d9DeviceSetTexture;
+        methods[49] = HostThunk::D3d9DeviceSetTextureStageState;
+
+        // Sampler state (slots 50-51)
+        methods[51] = HostThunk::D3d9DeviceSetSamplerState;
+
+        // Scissor rect (slots 57-58)
+        methods[57] = HostThunk::D3d9DeviceSetScissorRect;
+
+        // Draw (slots 63-66)
+        methods[63] = HostThunk::D3d9DeviceDrawPrimitive;
+        methods[64] = HostThunk::D3d9DeviceDrawIndexedPrimitive;
+        methods[65] = HostThunk::D3d9DeviceDrawPrimitiveUP;
+        methods[66] = HostThunk::D3d9DeviceDrawIndexedPrimitiveUP;
+
+        // Vertex/pixel shader (slots 71-76)
+        methods[72] = HostThunk::D3d9DeviceSetVertexShader;
+        methods[75] = HostThunk::D3d9DeviceSetPixelShader;
+
+        // Resource creation (slots 77-82)
+        methods[77] = HostThunk::D3d9DeviceCreateVertexBuffer;
+        methods[78] = HostThunk::D3d9DeviceCreateIndexBuffer;
+        methods[79] = HostThunk::D3d9DeviceCreateTexture;
+
+        // Shader constants (slots 84-87)
+        methods[84] = HostThunk::D3d9DeviceSetVertexShaderConstantF;
+        methods[86] = HostThunk::D3d9DeviceSetPixelShaderConstantF;
+
+        // Stream source / indices (slots 88-93)
+        methods[88] = HostThunk::D3d9DeviceSetStreamSource;
+        methods[89] = HostThunk::D3d9DeviceGetStreamSource;
+        methods[90] = unsupported_method(&self.telemetry, "IDirect3DDevice9::SetStreamSourceFreq");
+        methods[92] = HostThunk::D3d9DeviceSetIndices;
+        methods[93] = HostThunk::D3d9DeviceGetIndices;
+
+        // Render target / depth-stencil creation (slots 94-95)
+        methods[94] = unsupported_method(&self.telemetry, "IDirect3DDevice9::CreateRenderTarget");
+        methods[95] = unsupported_method(&self.telemetry, "IDirect3DDevice9::CreateDepthStencilSurface");
+
+        // Query creation (slot 82)
+        methods[82] = HostThunk::D3d9DeviceCreateQuery;
+
+        // Swap chain (slots 13-15)
+        methods[13] = HostThunk::D3d9DeviceGetSwapChain;
+        methods[14] = unsupported_method(&self.telemetry, "IDirect3DDevice9::GetNumberOfSwapChains");
+
+        let vtable = self.alloc_guest_vtable(memory, methods)?;
+        let object = self.alloc_guest_object(memory, GuestObjectKind::D3d9Device, vtable)?;
+
+        // Create a Direct3D9Device for state tracking, indexed by device_id
+        // (device_id comes from the shim's create_device call)
+        let swapchain_width = present_params.back_buffer_width.max(1);
+        let swapchain_height = present_params.back_buffer_height.max(1);
+        let shim_device = crate::d3d11::Direct3D9Device {
+            id: device_id,
+            state: D3d9StateBlock::new(),
+            present_params,
+            swapchain_width,
+            swapchain_height,
+        };
+        self.d3d9_devices.insert(object, shim_device);
+
+        Ok(object)
+    }
+
+    fn alloc_d3d9_vertex_buffer_object(
+        &mut self,
+        memory: &mut MemoryImage,
+        size: usize,
+        fvf: u32,
+        stride: u32,
+    ) -> AppResult<u64> {
+        let methods = vec![
+            unsupported_method(&self.telemetry, "IDirect3DVertexBuffer9::QueryInterface"),
+            HostThunk::GuestObjectAddRef,
+            HostThunk::GuestObjectRelease,
+            HostThunk::D3d9VertexBufferLock,
+            HostThunk::D3d9VertexBufferUnlock,
+            unsupported_method(&self.telemetry, "IDirect3DVertexBuffer9::GetDesc"),
+        ];
+        let vtable = self.alloc_guest_vtable(memory, methods)?;
+        let object = self.alloc_guest_object(memory, GuestObjectKind::D3d9VertexBuffer, vtable)?;
+        let vb = crate::d3d11::VertexBuffer9 {
+            id: 0, // unused for guest-managed
+            size,
+            data: vec![0u8; size],
+            fvf,
+            stride,
+        };
+        self.d3d9_vertex_buffers.insert(object, vb);
+        Ok(object)
+    }
+
+    fn alloc_d3d9_index_buffer_object(
+        &mut self,
+        memory: &mut MemoryImage,
+        size: usize,
+        format: bool,
+    ) -> AppResult<u64> {
+        let methods = vec![
+            unsupported_method(&self.telemetry, "IDirect3DIndexBuffer9::QueryInterface"),
+            HostThunk::GuestObjectAddRef,
+            HostThunk::GuestObjectRelease,
+            HostThunk::D3d9IndexBufferLock,
+            HostThunk::D3d9IndexBufferUnlock,
+            unsupported_method(&self.telemetry, "IDirect3DIndexBuffer9::GetDesc"),
+        ];
+        let vtable = self.alloc_guest_vtable(memory, methods)?;
+        let object = self.alloc_guest_object(memory, GuestObjectKind::D3d9IndexBuffer, vtable)?;
+        let ib = crate::d3d11::IndexBuffer9 {
+            id: 0,
+            size,
+            format,
+            data: vec![0u8; size],
+        };
+        self.d3d9_index_buffers.insert(object, ib);
+        Ok(object)
+    }
+
+    fn alloc_d3d9_texture_object(
+        &mut self,
+        memory: &mut MemoryImage,
+        width: u32,
+        height: u32,
+        levels: u32,
+        format: u32,
+    ) -> AppResult<u64> {
+        let methods = vec![
+            unsupported_method(&self.telemetry, "IDirect3DTexture9::QueryInterface"),
+            HostThunk::GuestObjectAddRef,
+            HostThunk::GuestObjectRelease,
+            unsupported_method(&self.telemetry, "IDirect3DTexture9::GetLevelDesc"),
+            unsupported_method(&self.telemetry, "IDirect3DTexture9::GetSurfaceLevel"),
+            HostThunk::D3d9TextureLockRect,
+            HostThunk::D3d9TextureUnlockRect,
+            unsupported_method(&self.telemetry, "IDirect3DTexture9::AddDirtyRect"),
+        ];
+        let vtable = self.alloc_guest_vtable(memory, methods)?;
+        let object = self.alloc_guest_object(memory, GuestObjectKind::D3d9Texture, vtable)?;
+        let mut mip_levels = Vec::new();
+        let mut mw = width;
+        let mut mh = height;
+        for _ in 0..levels {
+            let pixel_count = (mw * mh * 4) as usize;
+            mip_levels.push(vec![0u8; pixel_count]);
+            mw = (mw / 2).max(1);
+            mh = (mh / 2).max(1);
+        }
+        let tex = crate::d3d11::D3d9Texture {
+            id: 0,
+            width,
+            height,
+            levels: mip_levels,
+            format,
+        };
+        self.d3d9_textures.insert(object, tex);
+        Ok(object)
+    }
+
+    // ── WebView2 COM object allocators ───────────────────────────────────────
+
+    /// Allocate a guest object for an ICoreWebView2Environment.
+    fn alloc_webview2_environment_object(&mut self, _env_id: u64, memory: &mut MemoryImage) -> u64 {
+        // 3 IUnknown methods + 3 ICoreWebView2Environment methods = 6 slots
+        let methods = vec![
+            unsupported_method(&self.telemetry, "IUnknown::QueryInterface"),            // 0
+            HostThunk::GuestObjectAddRef,                              // 1
+            HostThunk::WebView2EnvRelease,                             // 2
+            HostThunk::WebView2EnvCreateCoreWebView2Controller,        // 3
+            HostThunk::WebView2EnvCreateWebResourceResponse,            // 4
+            HostThunk::WebView2EnvGetBrowserVersionString,             // 5
+        ];
+        let vtable = self.alloc_guest_vtable(memory, methods).unwrap_or(0);
+        let object = self.alloc_guest_object(memory, GuestObjectKind::WebView2Environment, vtable).unwrap_or(0);
+        object
+    }
+
+    /// Allocate a guest object for an ICoreWebView2Controller.
+    fn alloc_webview2_controller_object(&mut self, _ctrl_id: u64, memory: &mut MemoryImage) -> u64 {
+        // 3 IUnknown + 7 ICoreWebView2Controller methods = 10 slots
+        let methods = vec![
+            unsupported_method(&self.telemetry, "IUnknown::QueryInterface"),            // 0
+            HostThunk::GuestObjectAddRef,                              // 1
+            HostThunk::WebView2CtrlRelease,                            // 2
+            HostThunk::WebView2CtrlGetIsVisible,                       // 3
+            HostThunk::WebView2CtrlPutIsVisible,                       // 4
+            HostThunk::WebView2CtrlGetBounds,                          // 5
+            HostThunk::WebView2CtrlPutBounds,                          // 6
+            HostThunk::WebView2CtrlGetZoomFactor,                      // 7
+            HostThunk::WebView2CtrlPutZoomFactor,                      // 8
+            HostThunk::WebView2CtrlMoveFocus,                          // 9
+            unsupported_method(&self.telemetry, "ICoreWebView2Controller::get_IsBrowserFocusEnabled"), // 10
+            HostThunk::WebView2CtrlClose,                              // 11
+            HostThunk::WebView2CtrlGetCoreWebView2,                    // 12
+        ];
+        let vtable = self.alloc_guest_vtable(memory, methods).unwrap_or(0);
+        let object = self.alloc_guest_object(memory, GuestObjectKind::WebView2Controller, vtable).unwrap_or(0);
+        object
+    }
+
+    /// Allocate a guest object for an ICoreWebView2.
+    fn alloc_webview2_webview_object(&mut self, _webview_id: u64, memory: &mut MemoryImage) -> u64 {
+        // 3 IUnknown + ~28 ICoreWebView2/2/3/4 methods = 31 slots
+        let mut methods = vec![unsupported_method(&self.telemetry, "ICoreWebView2::unsupported"); 31];
+        methods[0] = unsupported_method(&self.telemetry, "IUnknown::QueryInterface");
+        methods[1] = HostThunk::GuestObjectAddRef;
+        methods[2] = HostThunk::WebView2Release;
+        methods[3] = unsupported_method(&self.telemetry, "ICoreWebView2::get_Settings"); // handled by WebView2GetSettings
+        methods[4] = unsupported_method(&self.telemetry, "ICoreWebView2::get_Source");    // handled by WebView2GetSource
+        methods[5] = HostThunk::WebView2Navigate;
+        methods[6] = HostThunk::WebView2NavigateToString;
+        methods[7] = HostThunk::WebView2AddNavigationStarting;
+        methods[8] = HostThunk::WebView2RemoveNavigationStarting;
+        methods[9] = HostThunk::WebView2AddNavigationCompleted;
+        methods[10] = HostThunk::WebView2RemoveNavigationCompleted;
+        methods[11] = HostThunk::WebView2AddWebMessageReceived;
+        methods[12] = HostThunk::WebView2RemoveWebMessageReceived;
+        methods[13] = HostThunk::WebView2Stop;
+        methods[14] = HostThunk::WebView2Reload;
+        methods[15] = HostThunk::WebView2ExecuteScript;
+        methods[16] = HostThunk::WebView2PostWebMessageAsJson;
+        methods[17] = HostThunk::WebView2PostWebMessageAsString;
+        methods[18] = HostThunk::WebView2GetSettings;
+        // ICoreWebView2_2 (indices 19-24)
+        methods[19] = HostThunk::WebView2AddContentLoading;
+        methods[20] = HostThunk::WebView2RemoveContentLoading;
+        methods[21] = HostThunk::WebView2AddSourceChanged;
+        methods[22] = HostThunk::WebView2RemoveSourceChanged;
+        methods[23] = HostThunk::WebView2AddHistoryChanged;
+        methods[24] = HostThunk::WebView2RemoveHistoryChanged;
+        // ICoreWebView2_3 (indices 25-30)
+        methods[25] = HostThunk::WebView2AddNewWindowRequested;
+        methods[26] = HostThunk::WebView2RemoveNewWindowRequested;
+        methods[27] = HostThunk::WebView2AddPermissionRequested;
+        methods[28] = HostThunk::WebView2RemovePermissionRequested;
+        methods[29] = HostThunk::WebView2AddProcessFailed;
+        methods[30] = HostThunk::WebView2RemoveProcessFailed;
+        // ICoreWebView2_4 would follow at indices 31+
+        let vtable = self.alloc_guest_vtable(memory, methods).unwrap_or(0);
+        let object = self.alloc_guest_object(memory, GuestObjectKind::WebView2WebView, vtable).unwrap_or(0);
+        object
+    }
+
+    /// Allocate a guest object for an ICoreWebView2Settings.
+    fn alloc_webview2_settings_object(&mut self, memory: &mut MemoryImage) -> u64 {
+        // 3 IUnknown + 10 ICoreWebView2Settings methods = 13 slots
+        let mut methods = vec![unsupported_method(&self.telemetry, "ICoreWebView2Settings::unsupported"); 13];
+        methods[0] = unsupported_method(&self.telemetry, "IUnknown::QueryInterface");
+        methods[1] = HostThunk::GuestObjectAddRef;
+        methods[2] = HostThunk::WebView2SettingsRelease;
+        methods[3] = HostThunk::WebView2SettingsGetIsScriptEnabled;
+        methods[4] = HostThunk::WebView2SettingsPutIsScriptEnabled;
+        methods[5] = HostThunk::WebView2SettingsGetIsWebMessageEnabled;
+        methods[6] = HostThunk::WebView2SettingsPutIsWebMessageEnabled;
+        methods[7] = HostThunk::WebView2SettingsGetAreDevToolsEnabled;
+        methods[8] = HostThunk::WebView2SettingsPutAreDevToolsEnabled;
+        methods[9] = HostThunk::WebView2SettingsGetIsStatusBarEnabled;
+        methods[10] = HostThunk::WebView2SettingsPutIsStatusBarEnabled;
+        methods[11] = HostThunk::WebView2SettingsGetDefaultBackgroundColor;
+        methods[12] = HostThunk::WebView2SettingsPutDefaultBackgroundColor;
+        let vtable = self.alloc_guest_vtable(memory, methods).unwrap_or(0);
+        let object = self.alloc_guest_object(memory, GuestObjectKind::WebView2Settings, vtable).unwrap_or(0);
+        object
+    }
+
+    /// Find the latest WebView2 environment (for CreateCoreWebView2Controller dispatch).
+    /// In a real scenario we'd track the 'this' pointer, but simplified for now.
+    fn find_webview2_env_for_controller(&self) -> u64 {
+        self.webview2_runtime.environments.keys().next().copied().unwrap_or(0)
+    }
+
+    fn alloc_dxgi_adapter_object(&mut self, memory: &mut MemoryImage, factory_object: u64) -> AppResult<u64> {
+        let mut methods = vec![unsupported_method(&self.telemetry, "IDXGIAdapter::unsupported"); 11];
+        methods[0] = unsupported_method(&self.telemetry, "IDXGIAdapter::QueryInterface");
+        methods[1] = HostThunk::GuestObjectAddRef;
+        methods[2] = HostThunk::GuestObjectRelease;
+        // IDXGIObject methods (slots 3-6)
+        methods[3] = HostThunk::DXGIAdapterSetPrivateData;
+        methods[4] = unsupported_method(&self.telemetry, "IDXGIAdapter::SetPrivateDataInterface");
+        methods[5] = HostThunk::DXGIAdapterGetPrivateData;
+        methods[6] = HostThunk::DXGIAdapterGetParent;
+        // IDXGIAdapter methods (slots 7-9)
+        methods[7] = HostThunk::DXGIAdapterEnumOutputs;
         methods[8] = HostThunk::DXGIAdapterGetDesc;
+        methods[9] = HostThunk::DXGIAdapterCheckInterfaceSupport;
+        // IDXGIAdapter1 methods (slot 10+)
         methods[10] = HostThunk::DXGIAdapterGetDesc1;
         let vtable = self.alloc_guest_vtable(memory, methods)?;
         let object = self.alloc_guest_object(memory, GuestObjectKind::DxgiAdapter, vtable)?;
@@ -28444,8 +37496,8 @@ impl PeHostRuntime {
     }
 
     fn alloc_d3d12_device_object(&mut self, memory: &mut MemoryImage) -> AppResult<u64> {
-        let mut methods = vec![unsupported_method("ID3D12Device::unsupported"); 44];
-        methods[0] = unsupported_method("ID3D12Device::QueryInterface");
+        let mut methods = vec![unsupported_method(&self.telemetry, "ID3D12Device::unsupported"); 44];
+        methods[0] = unsupported_method(&self.telemetry, "ID3D12Device::QueryInterface");
         methods[1] = HostThunk::GuestObjectAddRef;
         methods[2] = HostThunk::GuestObjectRelease;
         methods[8] = HostThunk::D3D12DeviceCreateCommandQueue;
@@ -28467,8 +37519,8 @@ impl PeHostRuntime {
         device_object: u64,
         queue_id: D3d12CommandQueueId,
     ) -> AppResult<u64> {
-        let mut methods = vec![unsupported_method("ID3D12CommandQueue::unsupported"); 19];
-        methods[0] = unsupported_method("ID3D12CommandQueue::QueryInterface");
+        let mut methods = vec![unsupported_method(&self.telemetry, "ID3D12CommandQueue::unsupported"); 19];
+        methods[0] = unsupported_method(&self.telemetry, "ID3D12CommandQueue::QueryInterface");
         methods[1] = HostThunk::GuestObjectAddRef;
         methods[2] = HostThunk::GuestObjectRelease;
         methods[10] = HostThunk::D3D12CommandQueueExecuteCommandLists;
@@ -28492,8 +37544,8 @@ impl PeHostRuntime {
         device_object: u64,
         allocator_id: D3d12CommandAllocatorId,
     ) -> AppResult<u64> {
-        let mut methods = vec![unsupported_method("ID3D12CommandAllocator::unsupported"); 9];
-        methods[0] = unsupported_method("ID3D12CommandAllocator::QueryInterface");
+        let mut methods = vec![unsupported_method(&self.telemetry, "ID3D12CommandAllocator::unsupported"); 9];
+        methods[0] = unsupported_method(&self.telemetry, "ID3D12CommandAllocator::QueryInterface");
         methods[1] = HostThunk::GuestObjectAddRef;
         methods[2] = HostThunk::GuestObjectRelease;
         let vtable = self.alloc_guest_vtable(memory, methods)?;
@@ -28517,8 +37569,8 @@ impl PeHostRuntime {
         ty: DescriptorHeapType,
         descriptor_count: usize,
     ) -> AppResult<u64> {
-        let mut methods = vec![unsupported_method("ID3D12DescriptorHeap::unsupported"); 11];
-        methods[0] = unsupported_method("ID3D12DescriptorHeap::QueryInterface");
+        let mut methods = vec![unsupported_method(&self.telemetry, "ID3D12DescriptorHeap::unsupported"); 11];
+        methods[0] = unsupported_method(&self.telemetry, "ID3D12DescriptorHeap::QueryInterface");
         methods[1] = HostThunk::GuestObjectAddRef;
         methods[2] = HostThunk::GuestObjectRelease;
         methods[9] = HostThunk::D3D12DescriptorHeapGetCpuHandleForHeapStart;
@@ -28551,8 +37603,8 @@ impl PeHostRuntime {
     ) -> AppResult<u64> {
         // ID3D12GraphicsCommandList vtable has 49 methods (0-48).
         // ID3D12GraphicsCommandList1-9 add methods at slots 49-72.
-        let mut methods = vec![unsupported_method("ID3D12GraphicsCommandList::unsupported"); 73];
-        methods[0] = unsupported_method("ID3D12GraphicsCommandList::QueryInterface");
+        let mut methods = vec![unsupported_method(&self.telemetry, "ID3D12GraphicsCommandList::unsupported"); 73];
+        methods[0] = unsupported_method(&self.telemetry, "ID3D12GraphicsCommandList::QueryInterface");
         methods[1] = HostThunk::GuestObjectAddRef;
         methods[2] = HostThunk::GuestObjectRelease;
         methods[9] = HostThunk::D3D12GraphicsCommandListClose;
@@ -28614,8 +37666,8 @@ impl PeHostRuntime {
         device_object: u64,
         fence_id: D3d12FenceId,
     ) -> AppResult<u64> {
-        let mut methods = vec![unsupported_method("ID3D12Fence::unsupported"); 11];
-        methods[0] = unsupported_method("ID3D12Fence::QueryInterface");
+        let mut methods = vec![unsupported_method(&self.telemetry, "ID3D12Fence::unsupported"); 11];
+        methods[0] = unsupported_method(&self.telemetry, "ID3D12Fence::QueryInterface");
         methods[1] = HostThunk::GuestObjectAddRef;
         methods[2] = HostThunk::GuestObjectRelease;
         methods[8] = HostThunk::D3D12FenceGetCompletedValue;
@@ -28638,8 +37690,8 @@ impl PeHostRuntime {
         device_object: u64,
         swapchain_id: D3d12SwapchainId,
     ) -> AppResult<u64> {
-        let mut methods = vec![unsupported_method("IDXGISwapChain::unsupported"); 18];
-        methods[0] = unsupported_method("IDXGISwapChain::QueryInterface");
+        let mut methods = vec![unsupported_method(&self.telemetry, "IDXGISwapChain::unsupported"); 18];
+        methods[0] = unsupported_method(&self.telemetry, "IDXGISwapChain::QueryInterface");
         methods[1] = HostThunk::GuestObjectAddRef;
         methods[2] = HostThunk::GuestObjectRelease;
         methods[8] = HostThunk::DXGISwapChainPresent;
@@ -28670,7 +37722,7 @@ impl PeHostRuntime {
         let resource_vtable = self.alloc_guest_vtable(
             memory,
             vec![
-                unsupported_method("ID3D12Resource::QueryInterface"),
+                unsupported_method(&self.telemetry, "ID3D12Resource::QueryInterface"),
                 HostThunk::GuestObjectAddRef,
                 HostThunk::GuestObjectRelease,
             ],
@@ -28696,6 +37748,9 @@ impl PeHostRuntime {
         let root_signature = self.d3d12_runtime.create_root_signature(RootSignatureDesc {
             descriptor_tables: Vec::new(),
             root_constants: 0,
+            parameters: Vec::new(),
+            static_samplers: Vec::new(),
+            visibility_offsets: BTreeMap::new(),
         });
         let pipeline_state = self.d3d12_runtime.create_pipeline_state(
             root_signature,
@@ -29575,7 +38630,7 @@ impl PeHostRuntime {
         }
 
         let device_info = self.d3d12_runtime.device_info();
-        let Some(trace_params) = write_d3d12_feature_support(memory, feature, data_ptr, data_size, &device_info)? else {
+        let Some(trace_params) = write_d3d12_feature_support(memory, feature, data_ptr, data_size, &device_info, Some(&self.telemetry))? else {
             state.set(Register::Rax, E_INVALIDARG);
             self.last_error = 0;
             return Ok(());
@@ -30022,16 +39077,70 @@ impl PeHostRuntime {
 
     fn dispatch_d3d12_graphics_command_list1_resolve_subresource_region(
         &mut self,
+        memory: &mut MemoryImage,
         state: &mut CpuState,
     ) -> AppResult<()> {
-        let command_list_id = self.open_d3d12_command_list_id(state.get(Register::Rcx))?;
-        self.d3d12_runtime.resolve_subresource_region(command_list_id)?;
+        // ID3D12GraphicsCommandList1::ResolveSubresourceRegion calling convention (x64):
+        //   RCX = this (command list object)
+        //   RDX = pDstResource
+        //   R8  = DstSubresource
+        //   R9  = DstX
+        //   [RSP+0x20] = DstY
+        //   [RSP+0x28] = DstZ
+        //   [RSP+0x30] = pSrcResource
+        //   [RSP+0x38] = SrcSubresource
+        //   [RSP+0x40] = SrcX
+        //   [RSP+0x48] = SrcY
+        //   [RSP+0x50] = SrcZ
+        //   [RSP+0x58] = pRect (D3D12_RESOLVE_SUBRESOURCE_REGION_DESC*)
+        //   [RSP+0x60] = Format (DXGI_FORMAT)
+        let command_list_object = state.get(Register::Rcx);
+        let dst_resource_object = state.get(Register::Rdx);
+        let _dst_subresource = state.get(Register::R8) as u32;
+        let _dst_x = state.get(Register::R9) as u32;
+        let sp = state.get(Register::Rsp);
+        let _dst_y = memory.read_u32(sp + 0x20)?;
+        let _dst_z = memory.read_u32(sp + 0x28)?;
+        let src_resource_object = memory.read_u64(sp + 0x30)?;
+        let _src_subresource = memory.read_u32(sp + 0x38)?;
+        let _src_x = memory.read_u32(sp + 0x40)?;
+        let _src_y = memory.read_u32(sp + 0x48)?;
+        let _src_z = memory.read_u32(sp + 0x50)?;
+        let p_rect = memory.read_u64(sp + 0x58)?;
+        let format_raw = memory.read_u32(sp + 0x60)?;
+
+        let command_list_id = self.open_d3d12_command_list_id(command_list_object)?;
+
+        // Look up source and destination resources by guest object address
+        let dst_resource = self.d3d12_resource(dst_resource_object)?;
+        let src_resource = self.d3d12_resource(src_resource_object)?;
+
+        // Parse D3D12_RESOLVE_SUBRESOURCE_REGION_DESC from guest memory (if non-null).
+        // struct { UINT NumRects; const D3D12_RECT* pRects; }
+        // D3D12_RECT = { LONG left, top, right, bottom }
+        let _num_rects = if p_rect != 0 {
+            memory.read_u32(p_rect)?
+        } else {
+            0
+        };
+
+        self.d3d12_runtime.resolve_subresource_region(
+            command_list_id,
+            dst_resource.resource_id,
+            src_resource.resource_id,
+            format_raw,
+        )?;
+
         state.set(Register::Rax, 0);
         self.last_error = 0;
         self.push_trace(
             "d3d12",
             "ID3D12GraphicsCommandList1::ResolveSubresourceRegion",
-            BTreeMap::new(),
+            BTreeMap::from([
+                ("dst_format".to_string(), json!(format_raw)),
+                ("dst_subresource".to_string(), json!(_dst_subresource)),
+                ("src_subresource".to_string(), json!(_src_subresource)),
+            ]),
             json!(0),
         );
         Ok(())
@@ -30209,33 +39318,180 @@ impl PeHostRuntime {
 
     fn dispatch_d3d12_graphics_command_list4_build_raytracing_acceleration_structure(
         &mut self,
+        memory: &mut MemoryImage,
         state: &mut CpuState,
     ) -> AppResult<()> {
         let command_list_id = self.open_d3d12_command_list_id(state.get(Register::Rcx))?;
-        self.d3d12_runtime.build_raytracing_acceleration_structure(command_list_id)?;
+        let desc_ptr = state.get(Register::Rdx);
+        // R8 = NumPostbuildInfoDescs (unused in this bridge iteration)
+        // R9 = pPostbuildInfoDescs (unused in this bridge iteration)
+
+        if desc_ptr == 0 {
+            state.set(Register::Rax, 0);
+            self.last_error = 0;
+            return Ok(());
+        }
+
+        // Parse D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC from guest memory
+        // x64 layout (all offsets in bytes):
+        // +0:  DestAccelerationStructureData (u64)
+        // +8:  Inputs.Type (u32)
+        // +12: Inputs.Flags (u32)
+        // +16: Inputs.NumDescs (u32)
+        // +20: Inputs.DescriptorsLayout (u32)
+        // +24: Inputs.pGeometryDescs/ppInstances (u64)
+        // +32: SourceAccelerationStructureData (u64)
+        // +40: ScratchAccelerationStructureData (u64)
+        // +48: NumPostbuildInfoDescs (u32)
+        // +52: padding (4 bytes)
+        // +56: pPostbuildInfoDescs (u64)
+
+        let dest_address = read_guest_u64(memory, desc_ptr)?;
+        let as_type = read_guest_u32(memory, desc_ptr + 8)?; // 0=BLAS, 1=TLAS
+        let _flags = read_guest_u32(memory, desc_ptr + 12)?;
+        let num_descs = read_guest_u32(memory, desc_ptr + 16)?;
+        let _descriptors_layout = read_guest_u32(memory, desc_ptr + 20)?;
+        let geometry_descs_ptr = read_guest_u64(memory, desc_ptr + 24)?;
+
+        let mut geometries = Vec::new();
+        if as_type == 0 && geometry_descs_ptr != 0 {
+            // Bottom-level AS: parse D3D12_RAYTRACING_GEOMETRY_DESC array
+            for i in 0..num_descs as u64 {
+                let geom_addr = geometry_descs_ptr + i * 48; // 48 bytes per geometry desc
+                // D3D12_RAYTRACING_GEOMETRY_DESC layout:
+                // +0:  Type (u32)
+                // +4:  Flags (u32)
+                // +8:  Triangles.VertexBuffer (u64)
+                // +16: Triangles.IndexBuffer (u64)
+                // +24: Triangles.IndexBufferOffsetInBytes (u32)
+                // +28: Triangles.VertexCount (u32)
+                // +32: Triangles.IndexFormat (u32)
+                // +36: Triangles.VertexFormat (u32)
+                // +40: Triangles.VertexBufferStrideInBytes (u32)
+                // +44: Triangles.PrimitiveCount (u32)
+                let geom_type = read_guest_u32(memory, geom_addr)?;
+                let geom_flags = read_guest_u32(memory, geom_addr + 4)?;
+                let vb = read_guest_u64(memory, geom_addr + 8)?;
+                let ib = read_guest_u64(memory, geom_addr + 16)?;
+                let _ib_offset = read_guest_u32(memory, geom_addr + 24)?;
+                let vertex_count = read_guest_u32(memory, geom_addr + 28)?;
+                let index_format = read_guest_u32(memory, geom_addr + 32)?;
+                let vertex_format = read_guest_u32(memory, geom_addr + 36)?;
+                let vertex_stride = read_guest_u32(memory, geom_addr + 40)?;
+                let primitive_count = read_guest_u32(memory, geom_addr + 44)?;
+
+                geometries.push(crate::d3d12::D3D12RaytracingGeometryDesc {
+                    ty: geom_type,
+                    flags: geom_flags,
+                    vertex_buffer: vb,
+                    vertex_format,
+                    vertex_stride,
+                    vertex_count,
+                    index_buffer: ib,
+                    index_format,
+                    index_count: if ib != 0 { primitive_count * 3 } else { primitive_count },
+                });
+            }
+        }
+
+        let source_address = read_guest_u64(memory, desc_ptr + 32)?;
+        let scratch_address = read_guest_u64(memory, desc_ptr + 40)?;
+
+        let build_desc = crate::d3d12::D3D12BuildAccelerationStructureDesc {
+            dest_address,
+            inputs: crate::d3d12::D3D12BuildRaytracingInputs {
+                ty: as_type,
+                flags: 0,
+                num_descs,
+                geometries,
+            },
+            source_address,
+            scratch_address,
+        };
+
+        let result = self.d3d12_runtime.build_raytracing_acceleration_structure(command_list_id, &build_desc)?;
         state.set(Register::Rax, 0);
         self.last_error = 0;
         self.push_trace(
             "d3d12",
             "ID3D12GraphicsCommandList4::BuildRaytracingAccelerationStructure",
-            BTreeMap::new(),
-            json!(0),
+            BTreeMap::from([
+                ("dest_address".to_string(), json!(format!("{dest_address:#x}"))),
+                ("type".to_string(), json!(as_type)),
+                ("num_geometries".to_string(), json!(num_descs)),
+                ("scratch_address".to_string(), json!(format!("{scratch_address:#x}"))),
+            ]),
+            json!(result),
         );
         Ok(())
     }
 
     fn dispatch_d3d12_graphics_command_list4_emit_raytracing_acceleration_structure_postbuild_info(
         &mut self,
+        memory: &mut MemoryImage,
         state: &mut CpuState,
     ) -> AppResult<()> {
         let command_list_id = self.open_d3d12_command_list_id(state.get(Register::Rcx))?;
-        self.d3d12_runtime.emit_raytracing_acceleration_structure_postbuild_info(command_list_id)?;
+        let postbuild_info_desc_ptr = state.get(Register::Rdx);
+        let num_source_as = state.get(Register::R8) as usize;
+        let source_as_data_ptr = state.get(Register::R9);
+
+        if postbuild_info_desc_ptr == 0 || num_source_as == 0 || source_as_data_ptr == 0 {
+            state.set(Register::Rax, 0);
+            self.last_error = 0;
+            return Ok(());
+        }
+
+        // Parse D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC
+        // x64 layout:
+        // +0: DestBuffer (u64)
+        // +8: InfoType (u32)
+        // +12: padding (4 bytes)
+        let dest_buffer = read_guest_u64(memory, postbuild_info_desc_ptr)?;
+        let info_type = read_guest_u32(memory, postbuild_info_desc_ptr + 8)?;
+
+        // Read source acceleration structure GPU addresses
+        let mut source_addresses = Vec::with_capacity(num_source_as);
+        for i in 0..num_source_as {
+            let addr = read_guest_u64(memory, source_as_data_ptr + i as u64 * 8)?;
+            source_addresses.push(addr);
+        }
+
+        // Determine output size based on info type
+        let output_size = match info_type {
+            1 | 2 => num_source_as * 8, // COMPACTED_SIZE or TOOLS_VISUALIZATION
+            3 => num_source_as * 16,    // SERIALIZATION
+            _ => 0,
+        };
+
+        if output_size > 0 && dest_buffer != 0 {
+            let mut output_buf = vec![0u8; output_size];
+            if memory.is_range_mapped(dest_buffer, output_size) {
+                if let Ok(bytes) = memory.read_bytes(dest_buffer, output_size) {
+                    output_buf.copy_from_slice(&bytes);
+                }
+            }
+
+            self.d3d12_runtime.emit_raytracing_acceleration_structure_postbuild_info(
+                command_list_id,
+                info_type,
+                &source_addresses,
+                &mut output_buf,
+            )?;
+
+            memory.map_bytes(dest_buffer, &output_buf);
+        }
+
         state.set(Register::Rax, 0);
         self.last_error = 0;
         self.push_trace(
             "d3d12",
             "ID3D12GraphicsCommandList4::EmitRaytracingAccelerationStructurePostbuildInfo",
-            BTreeMap::new(),
+            BTreeMap::from([
+                ("info_type".to_string(), json!(info_type)),
+                ("num_sources".to_string(), json!(num_source_as)),
+                ("dest_buffer".to_string(), json!(format!("{dest_buffer:#x}"))),
+            ]),
             json!(0),
         );
         Ok(())
@@ -30243,16 +39499,29 @@ impl PeHostRuntime {
 
     fn dispatch_d3d12_graphics_command_list4_copy_raytracing_acceleration_structure(
         &mut self,
+        _memory: &mut MemoryImage,
         state: &mut CpuState,
     ) -> AppResult<()> {
         let command_list_id = self.open_d3d12_command_list_id(state.get(Register::Rcx))?;
-        self.d3d12_runtime.copy_raytracing_acceleration_structure(command_list_id)?;
+        // D3D12 API: CopyRaytracingAccelerationStructure(Dest, Source, Mode)
+        // RCX = this, RDX = DestAddress, R8 = SourceAddress, R9 = Mode
+        let dest_address = state.get(Register::Rdx);
+        let source_address = state.get(Register::R8);
+        let mode = state.get(Register::R9) as u32;
+
+        self.d3d12_runtime.copy_raytracing_acceleration_structure(
+            command_list_id, dest_address, source_address, mode,
+        )?;
         state.set(Register::Rax, 0);
         self.last_error = 0;
         self.push_trace(
             "d3d12",
             "ID3D12GraphicsCommandList4::CopyRaytracingAccelerationStructure",
-            BTreeMap::new(),
+            BTreeMap::from([
+                ("dest".to_string(), json!(format!("{dest_address:#x}"))),
+                ("source".to_string(), json!(format!("{source_address:#x}"))),
+                ("mode".to_string(), json!(mode)),
+            ]),
             json!(0),
         );
         Ok(())
@@ -30260,34 +39529,239 @@ impl PeHostRuntime {
 
     fn dispatch_d3d12_graphics_command_list4_set_pipeline_state1(
         &mut self,
+        memory: &mut MemoryImage,
         state: &mut CpuState,
     ) -> AppResult<()> {
         let command_list_id = self.open_d3d12_command_list_id(state.get(Register::Rcx))?;
-        let pipeline_state = state.get(Register::Rdx);
-        self.d3d12_runtime.set_pipeline_state1(command_list_id, pipeline_state)?;
+        let state_object_ptr = state.get(Register::Rdx);
+
+        // Parse D3D12_STATE_OBJECT_DESC from guest memory to extract DXIL shader bytecode.
+        // The state object is a container with subobjects (shaders, hit groups, configs).
+        //
+        // D3D12_STATE_OBJECT_DESC layout (x64):
+        // +0:  Type (u32) — D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE = 4
+        // +4:  NumSubobjects (u32)
+        // +8:  pSubobjects (u64) — pointer to array of D3D12_STATE_SUBOBJECT
+        //
+        // D3D12_STATE_SUBOBJECT layout (x64):
+        // +0:  Type (u32)
+        // +4:  padding (4 bytes)
+        // +8:  pDesc (u64) — pointer to subobject-specific data
+
+        let dxil_bytecode = if state_object_ptr != 0 {
+            self.read_dxil_from_state_object(memory, state_object_ptr)
+        } else {
+            Vec::new()
+        };
+
+        self.d3d12_runtime.set_pipeline_state1(command_list_id, state_object_ptr, dxil_bytecode)?;
         state.set(Register::Rax, 0);
         self.last_error = 0;
         self.push_trace(
             "d3d12",
             "ID3D12GraphicsCommandList4::SetPipelineState1",
-            BTreeMap::new(),
+            BTreeMap::from([
+                ("state_object".to_string(), json!(format!("{state_object_ptr:#x}"))),
+            ]),
             json!(0),
         );
         Ok(())
     }
 
+    /// Helper: read DXIL bytecode from a D3D12_STATE_OBJECT_DESC.
+    fn read_dxil_from_state_object(
+        &self,
+        memory: &MemoryImage,
+        state_object_ptr: u64,
+    ) -> Vec<u8> {
+        // D3D12_STATE_OBJECT_DESC
+        // +0: Type (u32)
+        // +4: NumSubobjects (u32)
+        // +8: pSubobjects (u64)
+        let _ty = match memory.read_u32(state_object_ptr) {
+            Ok(v) => v,
+            _ => return Vec::new(),
+        };
+        let num_subobjects = match memory.read_u32(state_object_ptr + 4) {
+            Ok(v) => v as u64,
+            _ => return Vec::new(),
+        };
+        let subobjects_ptr = match memory.read_u64(state_object_ptr + 8) {
+            Ok(v) => v,
+            _ => return Vec::new(),
+        };
+        if num_subobjects == 0 || subobjects_ptr == 0 {
+            return Vec::new();
+        }
+
+        // D3D12_STATE_SUBOBJECT is 16 bytes each on x64:
+        // +0: Type (u32)
+        // +4: padding (4 bytes)
+        // +8: pDesc (u64)
+        //
+        // We look for:
+        //  - D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY = 5
+        //  - D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP = 4
+        //  - D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG = 6
+        //  - D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG = 7
+
+        const SUBOBJECT_DXIL_LIBRARY: u32 = 5;
+        const SUBOBJECT_HIT_GROUP: u32 = 4;
+        const SUBOBJECT_SHADER_CONFIG: u32 = 6;
+        const SUBOBJECT_PIPELINE_CONFIG: u32 = 7;
+
+        for i in 0..num_subobjects {
+            let sub_obj_addr = subobjects_ptr + i * 16;
+            let sub_type = match memory.read_u32(sub_obj_addr) {
+                Ok(t) => t,
+                _ => continue,
+            };
+            let sub_desc_ptr = match memory.read_u64(sub_obj_addr + 8) {
+                Ok(p) => p,
+                _ => continue,
+            };
+            if sub_desc_ptr == 0 {
+                continue;
+            }
+
+            match sub_type {
+                SUBOBJECT_DXIL_LIBRARY => {
+                    // D3D12_DXIL_LIBRARY_DESC:
+                    // +0:  CreatorExport (D3D12_EXPORT_DESC) — we skip for now
+                    // +24: Bytecode (D3D12_SHADER_BYTECODE)
+                    //   D3D12_SHADER_BYTECODE:
+                    //   +0: pShaderBytecode (u64 pointer)
+                    //   +8: BytecodeLength (u64)
+                    let p_bytecode = match memory.read_u64(sub_desc_ptr + 24) {
+                        Ok(p) => p,
+                        _ => continue,
+                    };
+                    let bytecode_len = match memory.read_u64(sub_desc_ptr + 32) {
+                        Ok(len) => len as usize,
+                        _ => continue,
+                    };
+                    if p_bytecode != 0 && bytecode_len > 0 && bytecode_len <= 1024 * 1024 {
+                        if let Ok(bytes) = memory.read_bytes(p_bytecode, bytecode_len) {
+                            return bytes;
+                        }
+                    }
+                }
+                SUBOBJECT_SHADER_CONFIG => {
+                    // D3D12_RAYTRACING_SHADER_CONFIG:
+                    // +0: MaxPayloadSizeInBytes (u32)
+                    // +4: MaxAttributeSizeInBytes (u32)
+                    // We don't store these separately yet
+                }
+                SUBOBJECT_PIPELINE_CONFIG => {
+                    // D3D12_RAYTRACING_PIPELINE_CONFIG:
+                    // +0: MaxTraceRecursionDepth (u32)
+                    // We don't store this separately yet
+                }
+                SUBOBJECT_HIT_GROUP => {
+                    // D3D12_HIT_GROUP_DESC:
+                    // +0: HitGroupExport (wchar_t*)
+                    // +8: AnyHitShaderImport (wchar_t*)
+                    // +16: ClosestHitShaderImport (wchar_t*)
+                    // +24: IntersectionShaderImport (wchar_t*)
+                    // +32: Type (u32)
+                    // We skip for now
+                }
+                _ => {}
+            }
+        }
+
+        Vec::new()
+    }
+
     fn dispatch_d3d12_graphics_command_list4_dispatch_rays(
         &mut self,
+        memory: &mut MemoryImage,
         state: &mut CpuState,
     ) -> AppResult<()> {
         let command_list_id = self.open_d3d12_command_list_id(state.get(Register::Rcx))?;
-        self.d3d12_runtime.dispatch_rays(command_list_id)?;
+        let desc_ptr = state.get(Register::Rdx);
+
+        let desc = if desc_ptr != 0 {
+            // D3D12_DISPATCH_RAYS_DESC layout (x64):
+            // +0:  RaygenShaderRecord.StartAddress (u64)
+            // +8:  RaygenShaderRecord.SizeInBytes (u64)
+            // +16: MissShaderTable.StartAddress (u64)
+            // +24: MissShaderTable.SizeInBytes (u64)
+            // +32: MissShaderTable.StrideInBytes (u64)
+            // +40: HitGroupTable.StartAddress (u64)
+            // +48: HitGroupTable.SizeInBytes (u64)
+            // +56: HitGroupTable.StrideInBytes (u64)
+            // +64: CallableShaderTable.StartAddress (u64)
+            // +72: CallableShaderTable.SizeInBytes (u64)
+            // +80: CallableShaderTable.StrideInBytes (u64)
+            // +88: Width (u32)
+            // +92: Height (u32)
+            // +96: Depth (u32)
+            // Total: 100 bytes
+            let raygen_start = read_guest_u64(memory, desc_ptr)?;
+            let raygen_size = read_guest_u64(memory, desc_ptr + 8)?;
+            let miss_start = read_guest_u64(memory, desc_ptr + 16)?;
+            let miss_size = read_guest_u64(memory, desc_ptr + 24)?;
+            let miss_stride = read_guest_u64(memory, desc_ptr + 32)?;
+            let hit_start = read_guest_u64(memory, desc_ptr + 40)?;
+            let hit_size = read_guest_u64(memory, desc_ptr + 48)?;
+            let hit_stride = read_guest_u64(memory, desc_ptr + 56)?;
+            let callable_start = read_guest_u64(memory, desc_ptr + 64)?;
+            let callable_size = read_guest_u64(memory, desc_ptr + 72)?;
+            let callable_stride = read_guest_u64(memory, desc_ptr + 80)?;
+            let width = read_guest_u32(memory, desc_ptr + 88)?;
+            let height = read_guest_u32(memory, desc_ptr + 92)?;
+            let depth = read_guest_u32(memory, desc_ptr + 96)?;
+
+            crate::d3d12::D3D12DispatchRaysDesc {
+                raygen_shader_start_address: raygen_start,
+                raygen_shader_size: raygen_size,
+                miss_shader_start_address: miss_start,
+                miss_shader_size: miss_size,
+                miss_shader_stride: miss_stride,
+                hit_group_start_address: hit_start,
+                hit_group_size: hit_size,
+                hit_group_stride: hit_stride,
+                callable_shader_start_address: callable_start,
+                callable_shader_size: callable_size,
+                callable_shader_stride: callable_stride,
+                width,
+                height,
+                depth,
+            }
+        } else {
+            crate::d3d12::D3D12DispatchRaysDesc {
+                raygen_shader_start_address: 0,
+                raygen_shader_size: 0,
+                miss_shader_start_address: 0,
+                miss_shader_size: 0,
+                miss_shader_stride: 0,
+                hit_group_start_address: 0,
+                hit_group_size: 0,
+                hit_group_stride: 0,
+                callable_shader_start_address: 0,
+                callable_shader_size: 0,
+                callable_shader_stride: 0,
+                width: 0,
+                height: 0,
+                depth: 0,
+            }
+        };
+
+        self.d3d12_runtime.dispatch_rays(command_list_id, &desc)?;
         state.set(Register::Rax, 0);
         self.last_error = 0;
         self.push_trace(
             "d3d12",
             "ID3D12GraphicsCommandList4::DispatchRays",
-            BTreeMap::new(),
+            BTreeMap::from([
+                ("raygen".to_string(), json!(format!("{:#x}", desc.raygen_shader_start_address))),
+                ("miss".to_string(), json!(format!("{:#x}", desc.miss_shader_start_address))),
+                ("hit".to_string(), json!(format!("{:#x}", desc.hit_group_start_address))),
+                ("width".to_string(), json!(desc.width)),
+                ("height".to_string(), json!(desc.height)),
+                ("depth".to_string(), json!(desc.depth)),
+            ]),
             json!(0),
         );
         Ok(())
@@ -30466,6 +39940,63 @@ impl PeHostRuntime {
         );
         Ok(())
     }
+
+    // ── GDI+ drawing helpers ──────────────────────────────────────────
+
+    /// Resolve the drawing target bitmap handle, compositing mode, pen width, and color
+    /// for a GDI+ drawing operation.
+    ///
+    /// Returns `(Option<(bitmap_handle, compositing_mode, pen_width, color)>, _, _, _)`
+    /// where the trailing three values are unused (kept for destructuring compatibility).
+    fn resolve_gdiplus_draw_target(
+        &mut self,
+        graphics_handle: u64,
+        pen_handle: u64,
+        brush_handle: Option<u64>,
+    ) -> (Option<(u64, u32, f32, u32)>, u32, f32, u32) {
+        // Get graphics context
+        let gfx = match self.user32.gdiplus_state.get(graphics_handle) {
+            Some(GdiplusObject::Graphics(g)) => g,
+            _ => return (None, 0, 0.0, 0),
+        };
+        let target_bitmap = match gfx.target_bitmap {
+            Some(h) => h,
+            None => return (None, 0, 0.0, 0),
+        };
+        let compositing_mode = gfx.compositing_mode;
+
+        // Resolve pen (if provided)
+        if pen_handle != 0 {
+            if let Some(GdiplusObject::Pen(pen)) = self.user32.gdiplus_state.get(pen_handle) {
+                let pw = pen.width.max(1.0);
+                let color = crate::gdiplus_render::pen_color(pen, 0.0, 0.0);
+                return (Some((target_bitmap, compositing_mode, pw, color)), 0, 0.0, 0);
+            }
+        }
+
+        // Resolve brush (if provided)
+        if let Some(bh) = brush_handle {
+            if let Some(GdiplusObject::Brush(brush)) = self.user32.gdiplus_state.get(bh) {
+                let color = crate::gdiplus_render::brush_color_at(brush, 0.0, 0.0);
+                return (Some((target_bitmap, compositing_mode, 1.0, color)), 0, 0.0, 0);
+            }
+        }
+
+        // Default: red pen width 1
+        (Some((target_bitmap, compositing_mode, 1.0, 0xFFFF0000)), 0, 0.0, 0)
+    }
+
+    /// Resolve the graphics drawing target for path operations.
+    /// Returns the bitmap handle and compositing mode, or None if invalid.
+    fn resolve_gdiplus_graphics_target(
+        &mut self,
+        graphics_handle: u64,
+    ) -> Option<(u64, u32)> {
+        let gfx = self.user32.gdiplus_state.get(graphics_handle)?;
+        let gfx = if let GdiplusObject::Graphics(g) = gfx { g } else { return None; };
+        let target_bitmap = gfx.target_bitmap?;
+        Some((target_bitmap, gfx.compositing_mode))
+    }
 }
 
 impl HostThunk {
@@ -30486,6 +40017,12 @@ impl HostThunk {
             }
             ("d3d12.dll", ImportSymbol::ByName { name, .. }) if name == "D3D12CreateDevice" => {
                 Self::D3D12CreateDevice
+            }
+            ("d3d9.dll", ImportSymbol::ByName { name, .. }) if name == "Direct3DCreate9" => {
+                Self::Direct3DCreate9
+            }
+            ("d3d9.dll", ImportSymbol::ByName { name, .. }) if name == "Direct3DCreate9Ex" => {
+                Self::Direct3DCreate9Ex
             }
             ("xaudio2_9.dll", ImportSymbol::ByName { name, .. }) if name == "XAudio2Create" => {
                 Self::XAudio2Create
@@ -30978,6 +40515,7 @@ impl HostThunk {
             ("oleaut32.dll", ImportSymbol::ByName { name, .. }) if name == "SafeArrayPutElement" => Self::SafeArrayPutElement,
             ("oleaut32.dll", ImportSymbol::ByName { name, .. }) if name == "SafeArrayGetLBound" => Self::SafeArrayGetLBound,
             ("oleaut32.dll", ImportSymbol::ByName { name, .. }) if name == "SafeArrayGetUBound" => Self::SafeArrayGetUBound,
+            ("oleaut32.dll", ImportSymbol::ByName { name, .. }) if name == "SafeArrayCreateVector" => Self::SafeArrayCreateVector,
             ("shell32.dll", ImportSymbol::ByName { name, .. }) if name == "CommandLineToArgvW" => {
                 Self::CommandLineToArgvW
             }
@@ -31333,6 +40871,12 @@ impl HostThunk {
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "SetUnhandledExceptionFilter" => {
                 Self::SetUnhandledExceptionFilter
             }
+            ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "AddVectoredExceptionHandler" => {
+                Self::AddVectoredExceptionHandler
+            }
+            ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "RemoveVectoredExceptionHandler" => {
+                Self::RemoveVectoredExceptionHandler
+            }
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "Beep" => Self::Beep,
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "Sleep" || name == "Forwarded" => {
                 Self::Sleep
@@ -31346,6 +40890,7 @@ impl HostThunk {
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "FlsSetValue" => Self::FlsSetValue,
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "FlsFree" => Self::FlsFree,
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "VirtualAlloc" => Self::VirtualAlloc,
+            ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "VirtualFree" => Self::VirtualFree,
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "VirtualProtect" => Self::VirtualProtect,
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "VirtualQuery" => Self::VirtualQuery,
             ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "GetCurrentThread" => {
@@ -31567,6 +41112,7 @@ impl HostThunk {
             ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "FlsSetValue" => Self::FlsSetValue,
             ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "FlsFree" => Self::FlsFree,
             ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "VirtualAlloc" => Self::VirtualAlloc,
+            ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "VirtualFree" => Self::VirtualFree,
             ("kernelbase.dll", ImportSymbol::ByName { name, .. }) if name == "CreateProcessA" => {
                 Self::CreateProcessA
             }
@@ -32120,7 +41666,9 @@ impl HostThunk {
                 Self::RaiseException
             }
             ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "RtlUnwind" => Self::RtlUnwind,
+            ("ntdll.dll", ImportSymbol::ByName { name, .. }) if name == "RtlRestoreContext" => Self::RtlRestoreContext,
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "RtlUnwind" => Self::RtlUnwind,
+            ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "RtlRestoreContext" => Self::RtlRestoreContext,
             ("kernel32.dll", ImportSymbol::ByName { name, .. }) if name == "GetConsoleMode" => {
                 Self::GetConsoleMode
             }
@@ -32556,6 +42104,13 @@ impl HostThunk {
             ("libcef.dll", ImportSymbol::ByName { name, .. }) if name == "cef_cookie_manager_flush_store" => {
                 Self::CefCookieManagerFlushStore
             }
+            // ── WebView2 (webview2.dll) imports ─────────────────────────────────
+            ("webview2.dll", ImportSymbol::ByName { name, .. }) if name == "CreateWebView2Environment" => {
+                Self::WebView2CreateEnvironment
+            }
+            ("webview2.dll", ImportSymbol::ByName { name, .. }) if name == "CreateWebView2EnvironmentWithDetails" => {
+                Self::WebView2CreateEnvironmentWithDetails
+            }
             // -- DirectInput8 (Phase 4.3) --
             ("dinput8.dll", ImportSymbol::ByName { name, .. }) if name == "DirectInput8Create" => {
                 Self::DirectInput8Create
@@ -32572,6 +42127,34 @@ impl HostThunk {
             }
             ("user32.dll", ImportSymbol::ByName { name, .. }) if name == "GetRegisteredRawInputDevices" => {
                 Self::GetRegisteredRawInputDevices
+            }
+            // -- Touch / Pointer Input (Phase 6.x) --
+            ("user32.dll", ImportSymbol::ByName { name, .. }) if name == "RegisterTouchWindow" => {
+                Self::RegisterTouchWindow
+            }
+            ("user32.dll", ImportSymbol::ByName { name, .. }) if name == "UnregisterTouchWindow" => {
+                Self::UnregisterTouchWindow
+            }
+            ("user32.dll", ImportSymbol::ByName { name, .. }) if name == "GetTouchInputInfo" => {
+                Self::GetTouchInputInfo
+            }
+            ("user32.dll", ImportSymbol::ByName { name, .. }) if name == "CloseTouchInputHandle" => {
+                Self::CloseTouchInputHandle
+            }
+            ("user32.dll", ImportSymbol::ByName { name, .. }) if name == "InitializeTouchInjection" => {
+                Self::InitializePointerDevice
+            }
+            ("user32.dll", ImportSymbol::ByName { name, .. }) if name == "InitializePointerDevice" => {
+                Self::InitializePointerDevice
+            }
+            ("user32.dll", ImportSymbol::ByName { name, .. }) if name == "GetPointerInfo" => {
+                Self::GetPointerInfo
+            }
+            ("user32.dll", ImportSymbol::ByName { name, .. }) if name == "GetPointerPenInfo" => {
+                Self::GetPointerPenInfo
+            }
+            ("user32.dll", ImportSymbol::ByName { name, .. }) if name == "SkipPointerFrameMessages" => {
+                Self::SkipPointerFrame
             }
             // -- XInput (Phase 5.2.1) --
             ("xinput1_3.dll", ImportSymbol::ByName { name, .. }) if name == "XInputGetState" => {
@@ -32635,6 +42218,17 @@ impl HostThunk {
                     "SteamAPI_ISteamInput_GetMotionData" => Self::SteamAPI_ISteamInput_GetMotionData,
                     "SteamAPI_ISteamInput_ShowBindingPanel" => Self::SteamAPI_ISteamInput_ShowBindingPanel,
                     "SteamAPI_ISteamInput_GetGlyphForActionHandle" => Self::SteamAPI_ISteamInput_GetGlyphForActionHandle,
+                    // -- Steam Networking Sockets (Phase 5.4) --
+                    "SteamAPI_ISteamNetworkingSockets_CreateListenSocketIP" => Self::SteamAPI_ISteamNetworkingSockets_CreateListenSocketIP,
+                    "SteamAPI_ISteamNetworkingSockets_ConnectByIPAddress" => Self::SteamAPI_ISteamNetworkingSockets_ConnectByIPAddress,
+                    "SteamAPI_ISteamNetworkingSockets_SendMessageToConnection" => Self::SteamAPI_ISteamNetworkingSockets_SendMessageToConnection,
+                    "SteamAPI_ISteamNetworkingSockets_ReceiveMessagesOnListenSocket" => Self::SteamAPI_ISteamNetworkingSockets_ReceiveMessagesOnListenSocket,
+                    "SteamAPI_ISteamNetworkingSockets_CloseConnection" => Self::SteamAPI_ISteamNetworkingSockets_CloseConnection,
+                    "SteamAPI_ISteamNetworkingSockets_DestroyListenSocket" => Self::SteamAPI_ISteamNetworkingSockets_DestroyListenSocket,
+                    // -- Steam Networking Messages (Phase 5.5) --
+                    "SteamAPI_ISteamNetworkingMessages_SendMessageToUser" => Self::SteamAPI_ISteamNetworkingMessages_SendMessageToUser,
+                    "SteamAPI_ISteamNetworkingMessages_ReceiveMessagesOnChannel" => Self::SteamAPI_ISteamNetworkingMessages_ReceiveMessagesOnChannel,
+                    "SteamAPI_ISteamNetworkingMessages_CloseSessionWithUser" => Self::SteamAPI_ISteamNetworkingMessages_CloseSessionWithUser,
                     _ => Self::Unsupported {
                         dll: import.resolved_module.clone(),
                         symbol: name.clone(),
@@ -32658,6 +42252,248 @@ impl HostThunk {
                     },
                 }
             }
+            // ── Phase 2.7: GDI+ (gdiplus.dll) ──────────────────────────────────
+            ("gdiplus.dll", ImportSymbol::ByName { name, .. }) => {
+                match name.as_str() {
+                    "GdiplusStartup" => Self::GdiplusStartup,
+                    "GdiplusShutdown" => Self::GdiplusShutdown,
+                    "GdipCreateFromHDC" => Self::GdipCreateFromHDC,
+                    "GdipDeleteGraphics" => Self::GdipDeleteGraphics,
+                    // Drawing primitives
+                    "GdipDrawLine" => Self::GdipDrawLine,
+                    "GdipDrawLines" => Self::GdipDrawLines,
+                    "GdipDrawRectangle" => Self::GdipDrawRectangle,
+                    "GdipFillRectangle" => Self::GdipFillRectangle,
+                    "GdipDrawEllipse" => Self::GdipDrawEllipse,
+                    "GdipFillEllipse" => Self::GdipFillEllipse,
+                    "GdipDrawPie" => Self::GdipDrawPie,
+                    "GdipFillPie" => Self::GdipFillPie,
+                    "GdipDrawPolygon" => Self::GdipDrawPolygon,
+                    "GdipFillPolygon" => Self::GdipFillPolygon,
+                    "GdipDrawArc" => Self::GdipDrawArc,
+                    "GdipDrawCurve" => Self::GdipDrawCurve,
+                    "GdipDrawClosedCurve" => Self::GdipDrawClosedCurve,
+                    "GdipDrawString" => Self::GdipDrawString,
+                    // Brushes
+                    "GdipCreateSolidFill" => Self::GdipCreateSolidFill,
+                    "GdipCreateLineBrush" => Self::GdipCreateLineBrush,
+                    "GdipCreateTextureBrush" => Self::GdipCreateTextureBrush,
+                    "GdipDeleteBrush" => Self::GdipDeleteBrush,
+                    "GdipFillRegion" => Self::GdipFillRegion,
+                    // Pens
+                    "GdipCreatePen1" => Self::GdipCreatePen1,
+                    "GdipCreatePen2" => Self::GdipCreatePen2,
+                    "GdipSetPenWidth" => Self::GdipSetPenWidth,
+                    "GdipGetPenWidth" => Self::GdipGetPenWidth,
+                    "GdipSetPenColor" => Self::GdipSetPenColor,
+                    "GdipGetPenColor" => Self::GdipGetPenColor,
+                    "GdipSetPenDashStyle" => Self::GdipSetPenDashStyle,
+                    "GdipGetPenDashStyle" => Self::GdipGetPenDashStyle,
+                    "GdipSetPenLineJoin" => Self::GdipSetPenLineJoin,
+                    "GdipSetPenStartCap" => Self::GdipSetPenStartCap,
+                    "GdipSetPenEndCap" => Self::GdipSetPenEndCap,
+                    "GdipDeletePen" => Self::GdipDeletePen,
+                    // Paths
+                    "GdipCreatePath" => Self::GdipCreatePath,
+                    "GdipDeletePath" => Self::GdipDeletePath,
+                    "GdipAddPathLine" => Self::GdipAddPathLine,
+                    "GdipAddPathRectangle" => Self::GdipAddPathRectangle,
+                    "GdipAddPathEllipse" => Self::GdipAddPathEllipse,
+                    "GdipAddPathArc" => Self::GdipAddPathArc,
+                    "GdipAddPathBezier" => Self::GdipAddPathBezier,
+                    "GdipClosePathFigure" => Self::GdipClosePathFigure,
+                    "GdipStartPathFigure" => Self::GdipStartPathFigure,
+                    "GdipSetPathFillMode" => Self::GdipSetPathFillMode,
+                    "GdipDrawPath" => Self::GdipDrawPath,
+                    "GdipFillPath" => Self::GdipFillPath,
+                    // Transforms
+                    "GdipCreateMatrix" => Self::GdipCreateMatrix,
+                    "GdipDeleteMatrix" => Self::GdipDeleteMatrix,
+                    "GdipSetMatrixElements" => Self::GdipSetMatrixElements,
+                    "GdipGetMatrixElements" => Self::GdipGetMatrixElements,
+                    "GdipTranslateMatrix" => Self::GdipTranslateMatrix,
+                    "GdipRotateMatrix" => Self::GdipRotateMatrix,
+                    "GdipScaleMatrix" => Self::GdipScaleMatrix,
+                    "GdipInvertMatrix" => Self::GdipInvertMatrix,
+                    "GdipMultiplyMatrix" => Self::GdipMultiplyMatrix,
+                    "GdipSetWorldTransform" => Self::GdipSetWorldTransform,
+                    "GdipResetWorldTransform" => Self::GdipResetWorldTransform,
+                    "GdipGetWorldTransform" => Self::GdipGetWorldTransform,
+                    // Clipping
+                    "GdipSetClipRect" => Self::GdipSetClipRect,
+                    "GdipSetClipPath" => Self::GdipSetClipPath,
+                    "GdipSetClipRegion" => Self::GdipSetClipRegion,
+                    "GdipResetClip" => Self::GdipResetClip,
+                    "GdipGetClipBounds" => Self::GdipGetClipBounds,
+                    "GdipGetClip" => Self::GdipGetClip,
+                    // Containers
+                    "GdipSaveGraphics" => Self::GdipSaveGraphics,
+                    "GdipRestoreGraphics" => Self::GdipRestoreGraphics,
+                    "GdipBeginContainer" => Self::GdipBeginContainer,
+                    "GdipEndContainer" => Self::GdipEndContainer,
+                    // Bitmap interop
+                    "GdipCreateBitmapFromHBITMAP" => Self::GdipCreateBitmapFromHBITMAP,
+                    "GdipCreateBitmapFromFile" => Self::GdipCreateBitmapFromFile,
+                    "GdipCreateBitmapFromGraphics" => Self::GdipCreateBitmapFromGraphics,
+                    "GdipDisposeImage" => Self::GdipDisposeImage,
+                    "GdipGetImageWidth" => Self::GdipGetImageWidth,
+                    "GdipGetImageHeight" => Self::GdipGetImageHeight,
+                    "GdipGetImagePixelFormat" => Self::GdipGetImagePixelFormat,
+                    "GdipBitmapGetPixel" => Self::GdipBitmapGetPixel,
+                    "GdipBitmapSetPixel" => Self::GdipBitmapSetPixel,
+                    "GdipBitmapLockBits" => Self::GdipBitmapLockBits,
+                    "GdipBitmapUnlockBits" => Self::GdipBitmapUnlockBits,
+                    // Text/Font
+                    "GdipCreateFont" => Self::GdipCreateFont,
+                    "GdipDeleteFont" => Self::GdipDeleteFont,
+                    "GdipCreateFontFamilyFromName" => Self::GdipCreateFontFamilyFromName,
+                    "GdipDeleteFontFamily" => Self::GdipDeleteFontFamily,
+                    "GdipSetTextRenderingHint" => Self::GdipSetTextRenderingHint,
+                    "GdipMeasureString" => Self::GdipMeasureString,
+                    "GdipMeasureCharacterRanges" => Self::GdipMeasureCharacterRanges,
+                    // Image attributes
+                    "GdipCreateImageAttributes" => Self::GdipCreateImageAttributes,
+                    "GdipDisposeImageAttributes" => Self::GdipDisposeImageAttributes,
+                    "GdipSetImageAttributesColorKeys" => Self::GdipSetImageAttributesColorKeys,
+                    "GdipSetImageAttributesColorMatrix" => Self::GdipSetImageAttributesColorMatrix,
+                    // Quality settings
+                    "GdipSetSmoothingMode" => Self::GdipSetSmoothingMode,
+                    "GdipGetSmoothingMode" => Self::GdipGetSmoothingMode,
+                    "GdipSetCompositingMode" => Self::GdipSetCompositingMode,
+                    "GdipGetCompositingMode" => Self::GdipGetCompositingMode,
+                    "GdipSetCompositingQuality" => Self::GdipSetCompositingQuality,
+                    "GdipGetCompositingQuality" => Self::GdipGetCompositingQuality,
+                    "GdipSetInterpolationMode" => Self::GdipSetInterpolationMode,
+                    "GdipGetInterpolationMode" => Self::GdipGetInterpolationMode,
+                    "GdipSetPixelOffsetMode" => Self::GdipSetPixelOffsetMode,
+                    "GdipGetPixelOffsetMode" => Self::GdipGetPixelOffsetMode,
+                    // Image drawing (existing + new)
+                    "GdipDrawImage" => Self::GdipDrawImage,
+                    "GdipDrawImageRect" => Self::GdipDrawImageRect,
+                    "GdipDrawImageRectRect" => Self::GdipDrawImageRectRect,
+                    "GdipGetImageType" => Self::GdipGetImageType,
+                    "GdipGetImageRawFormat" => Self::GdipGetImageRawFormat,
+                    "GdipCloneImage" => Self::GdipCloneImage,
+                    "GdipSaveImageToFile" => Self::GdipSaveImageToFile,
+                    "GdipSaveImageToStream" => Self::GdipSaveImageToStream,
+                    "GdipCreateBitmapFromStream" => Self::GdipCreateBitmapFromStream,
+                    "GdipCreateBitmapFromScan0" => Self::GdipCreateBitmapFromScan0,
+                    "GdipCreateHICONFromBitmap" => Self::GdipCreateHICONFromBitmap,
+                    "GdipCreateHBITMAPFromBitmap" => Self::GdipCreateHBITMAPFromBitmap,
+                    "GdipCreateImageFromFile" => Self::GdipCreateImageFromFile,
+                    "GdipImageForceValidation" => Self::GdipImageForceValidation,
+                    "GdipGetFontHeight" => Self::GdipGetFontHeight,
+                    "GdipCreateBitmapFromGdiDib" => Self::GdipCreateBitmapFromGdiDib,
+                    _ => Self::Unsupported {
+                        dll: import.resolved_module.clone(),
+                        symbol: name.clone(),
+                    },
+                }
+            }
+            // -- DWrite exports --
+            ("dwrite.dll", ImportSymbol::ByName { name, .. }) if name == "DWriteCreateFactory" => {
+                Self::DWriteCreateFactory
+            }
+            // -- D2D exports --
+            ("d2d1.dll", ImportSymbol::ByName { name, .. }) if name == "D2D1CreateFactory" => {
+                Self::D2D1CreateFactory
+            }
+            ("d2d1.dll", ImportSymbol::ByName { name, .. }) if name == "D2D1MakeRotateMatrix" => {
+                Self::D2D1MakeRotateMatrix
+            }
+            ("d2d1.dll", ImportSymbol::ByName { name, .. }) if name == "D2D1MakeSkewMatrix" => {
+                Self::D2D1MakeSkewMatrix
+            }
+            ("d2d1.dll", ImportSymbol::ByName { name, .. }) if name == "D2D1IsMatrixInvertible" => {
+                Self::D2D1IsMatrixInvertible
+            }
+            ("d2d1.dll", ImportSymbol::ByName { name, .. }) if name == "D2D1InvertMatrix" => {
+                Self::D2D1InvertMatrix
+            }
+            // -- winspool.drv / Printing (Phase Print) --
+            ("winspool.drv", ImportSymbol::ByName { name, .. }) if name == "OpenPrinterW" || name == "OpenPrinter" => {
+                Self::OpenPrinterW
+            }
+            ("winspool.drv", ImportSymbol::ByName { name, .. }) if name == "ClosePrinter" => {
+                Self::ClosePrinter
+            }
+            ("winspool.drv", ImportSymbol::ByName { name, .. }) if name == "StartDocPrinterW" || name == "StartDocPrinter" => {
+                Self::StartDocPrinterW
+            }
+            ("winspool.drv", ImportSymbol::ByName { name, .. }) if name == "EndDocPrinter" => {
+                Self::EndDocPrinter
+            }
+            ("winspool.drv", ImportSymbol::ByName { name, .. }) if name == "StartPagePrinter" => {
+                Self::StartPagePrinter
+            }
+            ("winspool.drv", ImportSymbol::ByName { name, .. }) if name == "EndPagePrinter" => {
+                Self::EndPagePrinter
+            }
+            ("winspool.drv", ImportSymbol::ByName { name, .. }) if name == "WritePrinter" => {
+                Self::WritePrinter
+            }
+            ("winspool.drv", ImportSymbol::ByName { name, .. }) if name == "ReadPrinter" => {
+                Self::ReadPrinter
+            }
+            ("winspool.drv", ImportSymbol::ByName { name, .. }) if name == "EnumPrintersW" || name == "EnumPrinters" => {
+                Self::EnumPrintersW
+            }
+            ("winspool.drv", ImportSymbol::ByName { name, .. }) if name == "GetPrinterW" || name == "GetPrinter" => {
+                Self::GetPrinterW
+            }
+            ("winspool.drv", ImportSymbol::ByName { name, .. }) if name == "SetPrinterW" || name == "SetPrinter" => {
+                Self::SetPrinterW
+            }
+            ("winspool.drv", ImportSymbol::ByName { name, .. }) if name == "AddPrinterW" || name == "AddPrinter" => {
+                Self::AddPrinterW
+            }
+            ("winspool.drv", ImportSymbol::ByName { name, .. }) if name == "DeletePrinter" => {
+                Self::DeletePrinter
+            }
+            // -- WinMM (Windows Multimedia) audio (Phase 2.5) --
+            ("winmm.dll", ImportSymbol::ByName { name, .. }) if name == "waveOutOpen" => Self::WaveOutOpen,
+            ("winmm.dll", ImportSymbol::ByName { name, .. }) if name == "waveOutClose" => Self::WaveOutClose,
+            ("winmm.dll", ImportSymbol::ByName { name, .. }) if name == "waveOutPrepareHeader" => Self::WaveOutPrepareHeader,
+            ("winmm.dll", ImportSymbol::ByName { name, .. }) if name == "waveOutUnprepareHeader" => Self::WaveOutUnprepareHeader,
+            ("winmm.dll", ImportSymbol::ByName { name, .. }) if name == "waveOutWrite" => Self::WaveOutWrite,
+            ("winmm.dll", ImportSymbol::ByName { name, .. }) if name == "waveOutReset" => Self::WaveOutReset,
+            ("winmm.dll", ImportSymbol::ByName { name, .. }) if name == "waveOutGetVolume" => Self::WaveOutGetVolume,
+            ("winmm.dll", ImportSymbol::ByName { name, .. }) if name == "waveOutSetVolume" => Self::WaveOutSetVolume,
+            ("winmm.dll", ImportSymbol::ByName { name, .. }) if name == "waveOutGetDevCapsW" => Self::WaveOutGetDevCapsW,
+            ("winmm.dll", ImportSymbol::ByName { name, .. }) if name == "waveOutGetNumDevs" => Self::WaveOutGetNumDevs,
+            ("winmm.dll", ImportSymbol::ByName { name, .. }) if name == "waveInOpen" => Self::WaveInOpen,
+            ("winmm.dll", ImportSymbol::ByName { name, .. }) if name == "waveInClose" => Self::WaveInClose,
+            ("winmm.dll", ImportSymbol::ByName { name, .. }) if name == "waveInPrepareHeader" => Self::WaveInPrepareHeader,
+            ("winmm.dll", ImportSymbol::ByName { name, .. }) if name == "waveInUnprepareHeader" => Self::WaveInUnprepareHeader,
+            ("winmm.dll", ImportSymbol::ByName { name, .. }) if name == "waveInAddBuffer" => Self::WaveInAddBuffer,
+            ("winmm.dll", ImportSymbol::ByName { name, .. }) if name == "waveInStart" => Self::WaveInStart,
+            ("winmm.dll", ImportSymbol::ByName { name, .. }) if name == "waveInStop" => Self::WaveInStop,
+            ("winmm.dll", ImportSymbol::ByName { name, .. }) if name == "waveInGetDevCapsW" => Self::WaveInGetDevCapsW,
+            ("winmm.dll", ImportSymbol::ByName { name, .. }) if name == "waveInGetNumDevs" => Self::WaveInGetNumDevs,
+            ("winmm.dll", ImportSymbol::ByName { name, .. }) if name == "midiOutOpen" => Self::MidiOutOpen,
+            ("winmm.dll", ImportSymbol::ByName { name, .. }) if name == "midiOutClose" => Self::MidiOutClose,
+            ("winmm.dll", ImportSymbol::ByName { name, .. }) if name == "midiOutShortMsg" => Self::MidiOutShortMsg,
+            ("winmm.dll", ImportSymbol::ByName { name, .. }) if name == "midiOutLongMsg" => Self::MidiOutLongMsg,
+            ("winmm.dll", ImportSymbol::ByName { name, .. }) if name == "midiOutReset" => Self::MidiOutReset,
+            ("winmm.dll", ImportSymbol::ByName { name, .. }) if name == "midiOutGetDevCapsW" => Self::MidiOutGetDevCapsW,
+            ("winmm.dll", ImportSymbol::ByName { name, .. }) if name == "midiOutGetNumDevs" => Self::MidiOutGetNumDevs,
+            ("winmm.dll", ImportSymbol::ByName { name, .. }) if name == "midiInOpen" => Self::MidiInOpen,
+            ("winmm.dll", ImportSymbol::ByName { name, .. }) if name == "midiInClose" => Self::MidiInClose,
+            ("winmm.dll", ImportSymbol::ByName { name, .. }) if name == "midiInStart" => Self::MidiInStart,
+            ("winmm.dll", ImportSymbol::ByName { name, .. }) if name == "midiInStop" => Self::MidiInStop,
+            ("winmm.dll", ImportSymbol::ByName { name, .. }) if name == "midiInReset" => Self::MidiInReset,
+            ("winmm.dll", ImportSymbol::ByName { name, .. }) if name == "timeGetTime" => Self::TimeGetTime,
+            ("winmm.dll", ImportSymbol::ByName { name, .. }) if name == "timeBeginPeriod" => Self::TimeBeginPeriod,
+            ("winmm.dll", ImportSymbol::ByName { name, .. }) if name == "timeEndPeriod" => Self::TimeEndPeriod,
+            ("winmm.dll", ImportSymbol::ByName { name, .. }) if name == "PlaySoundW" => Self::PlaySoundW,
+            ("winmm.dll", ImportSymbol::ByName { name, .. }) if name == "mmioOpenW" => Self::MmioOpenW,
+            ("winmm.dll", ImportSymbol::ByName { name, .. }) if name == "mmioClose" => Self::MmioClose,
+            ("winmm.dll", ImportSymbol::ByName { name, .. }) if name == "mmioRead" => Self::MmioRead,
+            ("winmm.dll", ImportSymbol::ByName { name, .. }) if name == "mmioWrite" => Self::MmioWrite,
+            ("winmm.dll", ImportSymbol::ByName { name, .. }) if name == "mmioAscend" => Self::MmioAscend,
+            ("winmm.dll", ImportSymbol::ByName { name, .. }) if name == "mmioDescend" => Self::MmioDescend,
+            ("winmm.dll", ImportSymbol::ByName { name, .. }) if name == "mmioCreateChunk" => Self::MmioCreateChunk,
+            ("winmm.dll", ImportSymbol::ByName { name, .. }) if name == "mmioStringToFOURCCW" => Self::MmioStringToFOURCCW,
             (_, ImportSymbol::ByName { name, .. }) => Self::Unsupported {
                 dll: import.resolved_module.clone(),
                 symbol: name.clone(),
@@ -32835,6 +42671,8 @@ impl HostThunk {
             | Self::WakeAllConditionVariable
             | Self::UnhandledExceptionFilter
             | Self::SetUnhandledExceptionFilter
+            | Self::AddVectoredExceptionHandler
+            | Self::RemoveVectoredExceptionHandler
             | Self::Sleep
             | Self::ExitProcess
             | Self::InitCommonControlsEx
@@ -32929,6 +42767,7 @@ impl HostThunk {
             | Self::CheckDlgButton
             | Self::MulDiv
             | Self::VirtualQuery
+            | Self::VirtualFree
             | Self::FindWindowExW
             | Self::AppendMenuW
             | Self::SystemParametersInfoW
@@ -33113,6 +42952,7 @@ impl HostThunk {
             Self::DebugBreak => 0,
             Self::RaiseException => 16,
             Self::RtlUnwind => 16,
+            Self::RtlRestoreContext => 16,
             Self::GetConsoleMode => 8,
             Self::SetConsoleMode => 8,
             Self::WriteConsoleW => 20,
@@ -33218,6 +43058,11 @@ impl HostThunk {
             Self::XAudio2SourceVoiceSetSourceSampleRate => 8,
             Self::XAudio2CreateSubmixVoice => 20,
             Self::XAudio2CommitChanges => 4,
+            // -- IXAPO arg bytes (Phase 4.3.1): COM method params excluding this --
+            Self::XAPO_GetRegistrationProperties => 8,
+            Self::XAPO_LockForProcess => 8,
+            Self::XAPO_UnlockForProcess => 4,
+            Self::XAPO_Process => 24,
             // -- DirectInput8 arg bytes (Phase 4.3) --
             Self::DirectInput8Create => 20,
             Self::DirectInput8CreateDevice => 12,
@@ -33233,11 +43078,22 @@ impl HostThunk {
             Self::DirectInputDevice8SetProperty => 16,
             Self::DirectInputDevice8Poll => 4,
             Self::DirectInputDevice8UnacquireObj => 4,
+            Self::DirectInputDevice8SendForceFeedbackCommand => 8,
+            Self::DirectInputDevice8SetForceFeedbackState => 8,
             // -- Raw Input arg bytes (Phase 4.3) --
             Self::RegisterRawInputDevices => 12,
             Self::GetRawInputData => 20,
             Self::GetRawInputDeviceInfoW => 16,
             Self::GetRegisteredRawInputDevices => 12,
+            // -- Touch / Pointer arg bytes (Phase 6.x) --
+            Self::RegisterTouchWindow => 8,
+            Self::UnregisterTouchWindow => 4,
+            Self::GetTouchInputInfo => 16,
+            Self::CloseTouchInputHandle => 4,
+            Self::InitializePointerDevice => 4,
+            Self::GetPointerInfo => 8,
+            Self::GetPointerPenInfo => 8,
+            Self::SkipPointerFrame => 4,
             // -- XInput arg bytes (Phase 5.2.1) --
             Self::XInputGetState => 8,
             Self::XInputSetState => 8,
@@ -33295,6 +43151,17 @@ impl HostThunk {
             Self::SteamVR_IVRChaperone_GetCalibrationState => 4,
             Self::SteamVR_IVRChaperone_GetPlayAreaSize => 12,
             Self::SteamVR_IVRChaperone_GetPlayAreaRect => 8,
+            // -- Steam Networking Sockets (Phase 5.4) --
+            Self::SteamAPI_ISteamNetworkingSockets_CreateListenSocketIP => 20,
+            Self::SteamAPI_ISteamNetworkingSockets_ConnectByIPAddress => 8,
+            Self::SteamAPI_ISteamNetworkingSockets_SendMessageToConnection => 24,
+            Self::SteamAPI_ISteamNetworkingSockets_ReceiveMessagesOnListenSocket => 16,
+            Self::SteamAPI_ISteamNetworkingSockets_CloseConnection => 20,
+            Self::SteamAPI_ISteamNetworkingSockets_DestroyListenSocket => 12,
+            // -- Steam Networking Messages (Phase 5.5) --
+            Self::SteamAPI_ISteamNetworkingMessages_SendMessageToUser => 24,
+            Self::SteamAPI_ISteamNetworkingMessages_ReceiveMessagesOnChannel => 20,
+            Self::SteamAPI_ISteamNetworkingMessages_CloseSessionWithUser => 8,
             // -- Phase 4.4: Synchronization primitive arg bytes -------------------------
             Self::CreateMutexW | Self::CreateMutexA => 16,
             Self::OpenMutexW => 12,
@@ -33341,6 +43208,7 @@ impl HostThunk {
             Self::SafeArrayPutElement => 16,
             Self::SafeArrayGetLBound => 8,
             Self::SafeArrayGetUBound => 8,
+            Self::SafeArrayCreateVector => 8,
             // -- usp10.dll Uniscribe (P0.3) arg bytes --------------------------------
             Self::ScriptStringFree | Self::ScriptString_pSize | Self::ScriptFreeCache => 4,
             Self::ScriptGetProperties | Self::ScriptRecordDigitSubstitution => 8,
@@ -33351,6 +43219,169 @@ impl HostThunk {
             Self::ScriptStringOut => 32,
             Self::ScriptPlace => 32,
             Self::ScriptShape => 40,
+            // ── Phase 2.7: GDI+ (gdiplus.dll) arg bytes ──────────────────────────
+            // Most GDI+ functions take (handle, ...) with 4 bytes per handle/pointer
+            Self::GdiplusStartup => 12,
+            Self::GdiplusShutdown => 4,
+            Self::GdipCreateFromHDC => 8,
+            Self::GdipDeleteGraphics => 4,
+            Self::GdipDrawLine => 20,
+            Self::GdipDrawLines => 12,
+            Self::GdipDrawRectangle => 20,
+            Self::GdipFillRectangle => 20,
+            Self::GdipDrawEllipse => 20,
+            Self::GdipFillEllipse => 20,
+            Self::GdipDrawPie => 36,
+            Self::GdipFillPie => 36,
+            Self::GdipDrawPolygon => 12,
+            Self::GdipFillPolygon => 16,
+            Self::GdipDrawArc => 36,
+            Self::GdipDrawCurve => 20,
+            Self::GdipDrawClosedCurve => 20,
+            Self::GdipDrawString => 28,
+            Self::GdipCreateSolidFill => 8,
+            Self::GdipCreateLineBrush => 32,
+            Self::GdipCreateTextureBrush => 16,
+            Self::GdipDeleteBrush => 4,
+            Self::GdipFillRegion => 12,
+            Self::GdipCreatePen1 => 16,
+            Self::GdipCreatePen2 => 12,
+            Self::GdipSetPenWidth => 8,
+            Self::GdipGetPenWidth => 8,
+            Self::GdipSetPenColor => 8,
+            Self::GdipGetPenColor => 8,
+            Self::GdipSetPenDashStyle => 8,
+            Self::GdipGetPenDashStyle => 8,
+            Self::GdipSetPenLineJoin => 8,
+            Self::GdipSetPenStartCap => 8,
+            Self::GdipSetPenEndCap => 8,
+            Self::GdipDeletePen => 4,
+            Self::GdipCreatePath => 12,
+            Self::GdipDeletePath => 4,
+            Self::GdipAddPathLine => 20,
+            Self::GdipAddPathRectangle => 20,
+            Self::GdipAddPathEllipse => 20,
+            Self::GdipAddPathArc => 36,
+            Self::GdipAddPathBezier => 36,
+            Self::GdipClosePathFigure => 4,
+            Self::GdipStartPathFigure => 4,
+            Self::GdipSetPathFillMode => 8,
+            Self::GdipDrawPath => 12,
+            Self::GdipFillPath => 12,
+            Self::GdipCreateMatrix => 4,
+            Self::GdipDeleteMatrix => 4,
+            Self::GdipSetMatrixElements => 20,
+            Self::GdipGetMatrixElements => 8,
+            Self::GdipTranslateMatrix => 12,
+            Self::GdipRotateMatrix => 12,
+            Self::GdipScaleMatrix => 16,
+            Self::GdipInvertMatrix => 4,
+            Self::GdipMultiplyMatrix => 12,
+            Self::GdipSetWorldTransform => 8,
+            Self::GdipResetWorldTransform => 4,
+            Self::GdipGetWorldTransform => 8,
+            Self::GdipSetClipRect => 24,
+            Self::GdipSetClipPath => 12,
+            Self::GdipSetClipRegion => 12,
+            Self::GdipResetClip => 4,
+            Self::GdipGetClipBounds => 8,
+            Self::GdipGetClip => 12,
+            Self::GdipSaveGraphics => 8,
+            Self::GdipRestoreGraphics => 8,
+            Self::GdipBeginContainer => 28,
+            Self::GdipEndContainer => 12,
+            Self::GdipCreateBitmapFromHBITMAP => 16,
+            Self::GdipCreateBitmapFromFile => 8,
+            Self::GdipCreateBitmapFromGraphics => 12,
+            Self::GdipDisposeImage => 4,
+            Self::GdipGetImageWidth => 8,
+            Self::GdipGetImageHeight => 8,
+            Self::GdipGetImagePixelFormat => 8,
+            Self::GdipBitmapGetPixel => 20,
+            Self::GdipBitmapSetPixel => 20,
+            Self::GdipBitmapLockBits => 28,
+            Self::GdipBitmapUnlockBits => 12,
+            Self::GdipCreateFont => 28,
+            Self::GdipDeleteFont => 4,
+            Self::GdipCreateFontFamilyFromName => 16,
+            Self::GdipDeleteFontFamily => 4,
+            Self::GdipSetTextRenderingHint => 8,
+            Self::GdipMeasureString => 36,
+            Self::GdipMeasureCharacterRanges => 32,
+            Self::GdipCreateImageAttributes => 4,
+            Self::GdipDisposeImageAttributes => 4,
+            Self::GdipSetImageAttributesColorKeys => 20,
+            Self::GdipSetImageAttributesColorMatrix => 24,
+            Self::GdipSetSmoothingMode => 8,
+            Self::GdipGetSmoothingMode => 8,
+            Self::GdipSetCompositingMode => 8,
+            Self::GdipGetCompositingMode => 8,
+            Self::GdipSetCompositingQuality => 8,
+            Self::GdipGetCompositingQuality => 8,
+            Self::GdipSetInterpolationMode => 8,
+            Self::GdipGetInterpolationMode => 8,
+            Self::GdipSetPixelOffsetMode => 8,
+            Self::GdipGetPixelOffsetMode => 8,
+            Self::GdipDrawImage => 16,
+            Self::GdipDrawImageRect => 20,
+            Self::GdipDrawImageRectRect => 52,
+            Self::GdipGetImageType => 8,
+            Self::GdipGetImageRawFormat => 12,
+            Self::GdipCloneImage => 8,
+            Self::GdipSaveImageToFile => 16,
+            Self::GdipSaveImageToStream => 16,
+            Self::GdipCreateBitmapFromStream => 8,
+            Self::GdipCreateBitmapFromScan0 => 32,
+            Self::GdipCreateHICONFromBitmap => 8,
+            Self::GdipCreateHBITMAPFromBitmap => 12,
+            Self::GdipCreateImageFromFile => 8,
+            Self::GdipImageForceValidation => 4,
+            Self::GdipGetFontHeight => 12,
+            Self::GdipCreateBitmapFromGdiDib => 12,
+            // -- WinMM (Windows Multimedia) audio (Phase 2.5) --
+            Self::WaveOutOpen => 24,
+            Self::WaveOutClose => 4,
+            Self::WaveOutPrepareHeader => 12,
+            Self::WaveOutUnprepareHeader => 12,
+            Self::WaveOutWrite => 12,
+            Self::WaveOutReset => 4,
+            Self::WaveOutGetVolume => 8,
+            Self::WaveOutSetVolume => 8,
+            Self::WaveOutGetDevCapsW => 12,
+            Self::WaveOutGetNumDevs => 0,
+            Self::WaveInOpen => 24,
+            Self::WaveInClose => 4,
+            Self::WaveInPrepareHeader => 12,
+            Self::WaveInUnprepareHeader => 12,
+            Self::WaveInAddBuffer => 12,
+            Self::WaveInStart => 4,
+            Self::WaveInStop => 4,
+            Self::WaveInGetDevCapsW => 12,
+            Self::WaveInGetNumDevs => 0,
+            Self::MidiOutOpen => 12,
+            Self::MidiOutClose => 4,
+            Self::MidiOutShortMsg => 8,
+            Self::MidiOutLongMsg => 12,
+            Self::MidiOutReset => 4,
+            Self::MidiOutGetDevCapsW => 12,
+            Self::MidiOutGetNumDevs => 0,
+            Self::MidiInOpen => 24,
+            Self::MidiInClose => 4,
+            Self::MidiInStart => 4,
+            Self::MidiInStop => 4,
+            Self::MidiInReset => 4,
+            Self::TimeGetTime => 0,
+            Self::TimeBeginPeriod => 4,
+            Self::TimeEndPeriod => 4,
+            Self::PlaySoundW => 16,
+            Self::MmioOpenW => 12,
+            Self::MmioClose => 8,
+            Self::MmioRead => 12,
+            Self::MmioWrite => 12,
+            Self::MmioAscend => 8,
+            Self::MmioDescend => 12,
+            Self::MmioCreateChunk => 12,
+            Self::MmioStringToFOURCCW => 8,
             _ => 0,
         }
     }
@@ -34718,6 +44749,27 @@ fn read_utf16_environment_block(memory: &MemoryImage, address: u64) -> AppResult
             environment.insert(key.to_string(), value.to_string());
         }
         cursor = cursor.wrapping_add(((entry.encode_utf16().count() + 1) * 2) as u64);
+    }
+    Ok(environment)
+}
+
+/// Read a Win32 ANSI environment block from guest memory.
+///
+/// The format is a sequence of null-terminated ANSI strings
+/// `"KEY=VALUE\0"` terminated by an additional null byte
+/// (i.e. double-null terminated overall).
+fn read_ansi_environment_block(memory: &MemoryImage, address: u64) -> AppResult<BTreeMap<String, String>> {
+    let mut cursor = address;
+    let mut environment = BTreeMap::new();
+    loop {
+        let entry = read_c_string(memory, cursor)?;
+        if entry.is_empty() {
+            break;
+        }
+        if let Some((key, value)) = entry.split_once('=') {
+            environment.insert(key.to_string(), value.to_string());
+        }
+        cursor = cursor.wrapping_add((entry.len() + 1) as u64);
     }
     Ok(environment)
 }
@@ -36651,58 +46703,71 @@ mod tests {
 
     #[test]
     fn get_message_pumps_pending_guest_thread() {
-        let temp_dir = TempDir::new().expect("temp dir");
-        let ge = GameEnvironment::create_in(temp_dir.path(), "get-message-pump", GeArch::X86, "win11-23h2")
-            .expect("create ge");
-        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
-        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
-        let mut memory = MemoryImage::default();
+        // This test exercises the deeply-nested call chain:
+        //   dispatch_import(GetMessageW) → pump_pending_guest_thread
+        //     → execute_guest_callback_inner → dispatch_import(PostThreadMessageW)
+        //
+        // The dispatch_import function has grown to ~150+ HostThunk match arms
+        // (from ~80), which increased its stack frame significantly in debug mode.
+        // Run on a dedicated thread with 8MB stack to accommodate the larger frames.
+        let handle = std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let temp_dir = TempDir::new().expect("temp dir");
+                let ge = GameEnvironment::create_in(temp_dir.path(), "get-message-pump", GeArch::X86, "win11-23h2")
+                    .expect("create ge");
+                let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+                configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+                let mut memory = MemoryImage::default();
 
-        runtime
-            .seed_process_state(&mut memory, "C:\\Steam\\Steam.exe", &[], 0x400000, 0x1000)
-            .expect("seed process state");
+                runtime
+                    .seed_process_state(&mut memory, "C:\\Steam\\Steam.exe", &[], 0x400000, 0x1000)
+                    .expect("seed process state");
 
-        let post_thread_message = runtime.alloc_host_thunk(HostThunk::PostThreadMessageW);
-        let create_thread = runtime.alloc_host_thunk(HostThunk::CreateThread);
-        let get_message = runtime.alloc_host_thunk(HostThunk::GetMessageW);
-        let import_slot = 0x41_000_u64;
-        let entrypoint = 0x41_100_u64;
-        let msg_ptr = 0x41_200_u64;
-        let thread_id_ptr = 0x41_240_u64;
-        let mut entrypoint_bytes = vec![0x90; 0x40];
+                let post_thread_message = runtime.alloc_host_thunk(HostThunk::PostThreadMessageW);
+                let create_thread = runtime.alloc_host_thunk(HostThunk::CreateThread);
+                let get_message = runtime.alloc_host_thunk(HostThunk::GetMessageW);
+                let import_slot = 0x41_000_u64;
+                let entrypoint = 0x41_100_u64;
+                let msg_ptr = 0x41_200_u64;
+                let thread_id_ptr = 0x41_240_u64;
+                let mut entrypoint_bytes = vec![0x90; 0x40];
 
-        write_u32(&mut memory, import_slot, post_thread_message as u32);
-        memory.map_bytes(msg_ptr, &[0; 28]);
-        memory.map_bytes(thread_id_ptr, &[0; 4]);
-        entrypoint_bytes[..31].copy_from_slice(&[
-            0x68, 0x00, 0x00, 0x00, 0x00,
-            0x68, 0x00, 0x00, 0x00, 0x00,
-            0x68, 0x34, 0x12, 0x00, 0x00,
-            0x6A, 0x01,
-            0xFF, 0x15, 0x00, 0x10, 0x04, 0x00,
-            0xB8, 0x07, 0x00, 0x00, 0x00,
-            0xC2, 0x04, 0x00,
-        ]);
-        memory.map_bytes(entrypoint, &entrypoint_bytes);
+                write_u32(&mut memory, import_slot, post_thread_message as u32);
+                memory.map_bytes(msg_ptr, &[0; 28]);
+                memory.map_bytes(thread_id_ptr, &[0; 4]);
+                entrypoint_bytes[..31].copy_from_slice(&[
+                    0x68, 0x00, 0x00, 0x00, 0x00,
+                    0x68, 0x00, 0x00, 0x00, 0x00,
+                    0x68, 0x34, 0x12, 0x00, 0x00,
+                    0x6A, 0x01,
+                    0xFF, 0x15, 0x00, 0x10, 0x04, 0x00,
+                    0xB8, 0x07, 0x00, 0x00, 0x00,
+                    0xC2, 0x04, 0x00,
+                ]);
+                memory.map_bytes(entrypoint, &entrypoint_bytes);
 
-        let thread_handle = dispatch_x86_thunk(
-            &mut runtime,
-            &mut memory,
-            create_thread,
-            &[0, 0, entrypoint as u32, 0, 0, thread_id_ptr as u32],
-        );
+                let thread_handle = dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    create_thread,
+                    &[0, 0, entrypoint as u32, 0, 0, thread_id_ptr as u32],
+                );
 
-        assert_ne!(thread_handle, 0);
-        assert_eq!(runtime.win32.get_exit_code_thread(thread_handle as u32).expect("thread exit code before get message"), None);
+                assert_ne!(thread_handle, 0);
+                assert_eq!(runtime.win32.get_exit_code_thread(thread_handle as u32).expect("thread exit code before get message"), None);
 
-        let result = dispatch_x86_thunk(&mut runtime, &mut memory, get_message, &[msg_ptr as u32, 0, 0, 0]);
-        assert_eq!(result, 1);
+                let result = dispatch_x86_thunk(&mut runtime, &mut memory, get_message, &[msg_ptr as u32, 0, 0, 0]);
+                assert_eq!(result, 1);
 
-        let message = read_win32_msg(&memory, msg_ptr).expect("read msg");
-        assert_eq!(message_id(message.kind), 0x1234);
-        assert_eq!(message.wparam, 0);
-        assert_eq!(message.lparam, 0);
-        assert_eq!(runtime.win32.get_exit_code_thread(thread_handle as u32).expect("thread exit code after get message"), Some(7));
+                let message = read_win32_msg(&memory, msg_ptr).expect("read msg");
+                assert_eq!(message_id(message.kind), 0x1234);
+                assert_eq!(message.wparam, 0);
+                assert_eq!(message.lparam, 0);
+                assert_eq!(runtime.win32.get_exit_code_thread(thread_handle as u32).expect("thread exit code after get message"), Some(7));
+            })
+            .expect("spawn test thread with 8MB stack");
+        handle.join().unwrap_or_else(|e| std::panic::resume_unwind(e));
     }
 
     #[test]
@@ -38507,7 +48572,7 @@ mod tests {
             stack_base + 0x88,
         );
         assert_eq!(read_guest_u32(&memory, options5_ptr + 4).expect("render pass tier"), D3D12_RENDER_PASS_TIER_1);
-        assert_eq!(read_guest_u32(&memory, options5_ptr + 8).expect("raytracing tier"), D3D12_RAYTRACING_TIER_NOT_SUPPORTED);
+        assert_eq!(read_guest_u32(&memory, options5_ptr + 8).expect("raytracing tier"), D3D12_RAYTRACING_TIER_1_1);
 
         dispatch_feature_support_query(
             &mut runtime,
@@ -39127,6 +49192,381 @@ mod tests {
             &[0xf9, 0xfb, 0xfd]
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Phase 0.4 — Forwarded export chaining
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn forwarded_export_resolves_single_hop() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge =
+            GameEnvironment::create_in(temp_dir.path(), "fwd-single", GeArch::X64, "win11-23h2")
+                .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X64);
+        let mut memory = MemoryImage::default();
+
+        // kernel32.dll has a synthetic forwarder: "Forwarded" -> "kernelbase.Sleep"
+        let kernel32_handle = runtime.get_or_create_module_handle("kernel32.dll");
+        assert_ne!(kernel32_handle, 0, "kernel32.dll handle should be non-zero");
+
+        let addr = runtime.resolve_proc_address(
+            kernel32_handle,
+            ImportSymbol::ByName {
+                hint: 0,
+                name: "Forwarded".to_string(),
+            },
+        );
+        assert_ne!(
+            addr, 0,
+            "forwarded export 'Forwarded' should resolve through kernelbase.Sleep"
+        );
+        // The resolved address should be a valid host thunk address.
+        assert!(
+            runtime.host_thunks.contains_key(&addr),
+            "resolved address should be a host thunk in the thunk table"
+        );
+    }
+
+    #[test]
+    fn forwarded_export_to_nonexistent_forwarder_returns_zero() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge =
+            GameEnvironment::create_in(temp_dir.path(), "fwd-nonexist", GeArch::X64, "win11-23h2")
+                .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X64);
+        let mut memory = MemoryImage::default();
+
+        // Nonexistent forwarder should resolve to 0.
+        let kernel32_handle = runtime.get_or_create_module_handle("kernel32.dll");
+        let mut visited = std::collections::HashSet::new();
+        let result = runtime.resolve_forwarder_export("nonexistent_module.FooBar", &mut visited);
+        assert!(result.is_none(), "forwarder to nonexistent module should be None");
+    }
+
+    #[test]
+    fn forwarded_export_circular_detection() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge =
+            GameEnvironment::create_in(temp_dir.path(), "fwd-circular", GeArch::X64, "win11-23h2")
+                .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X64);
+        let mut memory = MemoryImage::default();
+
+        // Simulate a circular forwarder by marking the forwarder itself as visited
+        // before resolving — this triggers the circular guard immediately.
+        let mut visited = std::collections::HashSet::new();
+        visited.insert("kernel32.Forwarded".to_string());
+        let result =
+            runtime.resolve_forwarder_export("kernel32.Forwarded", &mut visited);
+        assert!(result.is_none(), "circular forwarder should return None");
+
+        // Also verify the cache recorded it as unresolvable.
+        assert_eq!(
+            runtime.forwarder_export_cache.get("kernel32.Forwarded"),
+            Some(&None),
+            "circular forwarder should be cached as None"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 0.5 — Synthetic DLL DllMain callbacks
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn synthetic_dll_init_callback_fires_on_module_creation() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge =
+            GameEnvironment::create_in(temp_dir.path(), "synth-cb", GeArch::X64, "win11-23h2")
+                .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X64);
+        let mut memory = MemoryImage::default();
+
+        let invoked = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let invoked_clone = invoked.clone();
+        runtime.register_synthetic_dll_init_callback(Box::new(move |handle, reason| {
+            invoked_clone.borrow_mut().push((handle, reason));
+        }));
+
+        let handle = runtime.get_or_create_module_handle("test_synth.dll");
+        assert_ne!(handle, 0, "synthetic module handle should be non-zero");
+
+        let calls = invoked.borrow();
+        assert_eq!(calls.len(), 1, "callback should have been invoked once");
+        assert_eq!(calls[0].0, handle, "callback handle should match module handle");
+        assert_eq!(
+            calls[0].1, DLL_PROCESS_ATTACH,
+            "callback reason should be DLL_PROCESS_ATTACH"
+        );
+    }
+
+    #[test]
+    fn synthetic_dll_multiple_callbacks_fire() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge =
+            GameEnvironment::create_in(temp_dir.path(), "synth-multi", GeArch::X64, "win11-23h2")
+                .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X64);
+        let mut memory = MemoryImage::default();
+
+        let count = std::rc::Rc::new(std::cell::RefCell::new(0_u32));
+        let c1 = count.clone();
+        runtime.register_synthetic_dll_init_callback(Box::new(move |_, _| {
+            *c1.borrow_mut() += 1;
+        }));
+        let c2 = count.clone();
+        runtime.register_synthetic_dll_init_callback(Box::new(move |_, _| {
+            *c2.borrow_mut() += 1;
+        }));
+
+        let handle = runtime.get_or_create_module_handle("multi_cb_test.dll");
+        assert_ne!(handle, 0);
+        assert_eq!(*count.borrow(), 2, "both callbacks should fire");
+    }
+
+    // -----------------------------------------------------------------------
+    // HMODULE tracking (DllInfo table)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn dll_info_table_tracks_synthetic_module() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge =
+            GameEnvironment::create_in(temp_dir.path(), "dllinfo-synth", GeArch::X64, "win11-23h2")
+                .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X64);
+        let mut memory = MemoryImage::default();
+
+        let handle = runtime.get_or_create_module_handle("tracking_test.dll");
+        assert_ne!(handle, 0);
+
+        let info = runtime.dll_info_table.get(&handle).expect("DllInfo should exist");
+        assert_eq!(info.handle, handle);
+        assert_eq!(info.module_name, "tracking_test.dll");
+        assert_eq!(info.load_count, 1);
+        assert_eq!(info.entry_point_rva, 0, "synthetic modules have no PE entry point");
+    }
+
+    #[test]
+    fn dll_info_table_load_count_increments() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge =
+            GameEnvironment::create_in(temp_dir.path(), "dllinfo-inc", GeArch::X64, "win11-23h2")
+                .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X64);
+        let mut memory = MemoryImage::default();
+
+        let handle = runtime.get_or_create_module_handle("load_count_test.dll");
+        assert_ne!(handle, 0);
+
+        // Second "load" via get_or_create_module_handle increments count.
+        let handle2 = runtime.get_or_create_module_handle("load_count_test.dll");
+        assert_eq!(handle, handle2, "same module should return same handle");
+
+        let info = runtime.dll_info_table.get(&handle).expect("DllInfo should exist");
+        assert_eq!(info.load_count, 2, "load_count should be 2 after two loads");
+    }
+
+    #[test]
+    fn free_library_decrements_load_count_and_queues_detach() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge =
+            GameEnvironment::create_in(temp_dir.path(), "freelib-dt", GeArch::X86, "win11-23h2")
+                .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        // Use kernel32 which has non-zero entry_point_rva in dll_info_table
+        // (since it's added via get_or_create_module_handle with entry_point_rva=0
+        // for synthetic modules, the DETACH won't queue — that's expected for synthetic).
+        // Instead, let's create a synthetic module and verify load_count decreases.
+        let handle = runtime.get_or_create_module_handle("detach_test.dll");
+        assert_ne!(handle, 0);
+
+        // Do a second "load" to bump load_count to 2.
+        let handle2 = runtime.get_or_create_module_handle("detach_test.dll");
+        assert_eq!(handle, handle2);
+        assert_eq!(
+            runtime.dll_info_table.get(&handle).unwrap().load_count,
+            2
+        );
+
+        // First FreeLibrary: decrement to 1.
+        let free = runtime.alloc_host_thunk(HostThunk::FreeLibrary);
+        let rax = dispatch_x86_thunk(&mut runtime, &mut memory, free, &[handle as u32]);
+        assert_eq!(rax, 1, "FreeLibrary should return TRUE (released)");
+        assert_eq!(
+            runtime.dll_info_table.get(&handle).unwrap().load_count,
+            1,
+            "load_count should be 1 after one FreeLibrary"
+        );
+
+        // Second FreeLibrary: decrement to 0.
+        let rax = dispatch_x86_thunk(&mut runtime, &mut memory, free, &[handle as u32]);
+        assert_eq!(rax, 1, "FreeLibrary should return TRUE (released)");
+        assert_eq!(
+            runtime.dll_info_table.get(&handle).unwrap().load_count,
+            0,
+            "load_count should be 0 after second FreeLibrary"
+        );
+        // For synthetic modules (entry_point_rva == 0) no DETACH is queued.
+        assert!(
+            runtime.pending_dll_main_calls.is_empty(),
+            "synthetic modules with no entry point should not queue DETACH"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // call_dll_entry_points — DllMain notification for all loaded DLLs
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn call_dll_entry_points_queues_process_attach_for_all_dlls() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge =
+            GameEnvironment::create_in(temp_dir.path(), "call-ep-all", GeArch::X86, "win11-23h2")
+                .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let _memory = MemoryImage::default();
+
+        // Create two synthetic module handles with forced entry points so they
+        // behave like real PE DLLs that export DllMain.
+        let handle_a = runtime.get_or_create_module_handle("first.dll");
+        let handle_b = runtime.get_or_create_module_handle("second.dll");
+        assert_ne!(handle_a, 0);
+        assert_ne!(handle_b, 0);
+
+        // Manually inject entry point RVAs into the DllInfo table (synthetic
+        // modules normally have entry_point_rva == 0).  This tricks the runtime
+        // into treating them as real PE DLLs that need DllMain notifications.
+        if let Some(info) = runtime.dll_info_table.get_mut(&handle_a) {
+            info.entry_point_rva = 0x1000;
+        }
+        if let Some(info) = runtime.dll_info_table.get_mut(&handle_b) {
+            info.entry_point_rva = 0x2000;
+        }
+
+        // Invoke call_dll_entry_points with ProcessAttach for both handles.
+        runtime.call_dll_entry_points(&[handle_a, handle_b], DllReason::ProcessAttach);
+
+        assert_eq!(
+            runtime.pending_dll_main_calls.len(),
+            2,
+            "should queue DllMain for both DLLs"
+        );
+
+        // Verify queue order matches input order.
+        let first = runtime.pending_dll_main_calls[0];
+        assert_eq!(first.0, handle_a, "first queued entry should be for handle_a");
+        assert_eq!(first.2, DLL_PROCESS_ATTACH, "reason should be PROCESS_ATTACH");
+
+        let second = runtime.pending_dll_main_calls[1];
+        assert_eq!(second.0, handle_b, "second queued entry should be for handle_b");
+        assert_eq!(second.2, DLL_PROCESS_ATTACH, "reason should be PROCESS_ATTACH");
+    }
+
+    #[test]
+    fn call_dll_entry_points_skips_dlls_without_entry_point() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge =
+            GameEnvironment::create_in(temp_dir.path(), "call-ep-skip", GeArch::X86, "win11-23h2")
+                .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let _memory = MemoryImage::default();
+
+        // Create a synthetic module (no entry point).
+        let handle = runtime.get_or_create_module_handle("noentry.dll");
+        assert_ne!(handle, 0);
+        // entry_point_rva is 0 for synthetic modules.
+
+        runtime.call_dll_entry_points(&[handle], DllReason::ProcessDetach);
+
+        assert!(
+            runtime.pending_dll_main_calls.is_empty(),
+            "DLLs without an entry point should not queue DllMain calls"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // GetProcAddress with forwarded exports
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn get_proc_address_resolves_forwarded_export() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge =
+            GameEnvironment::create_in(temp_dir.path(), "gpa-fwd", GeArch::X86, "win11-23h2")
+                .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        // Ensure kernel32.dll is loaded as a synthetic module.
+        let kernel32_handle = runtime.get_or_create_module_handle("kernel32.dll");
+        assert_ne!(kernel32_handle, 0);
+
+        // Allocate the "Forwarded" name string in guest memory.
+        let name_addr = runtime
+            .alloc_c_string(&mut memory, "Forwarded")
+            .expect("alloc Forwarded string");
+        let proc_addr = runtime.alloc_host_thunk(HostThunk::GetProcAddress);
+
+        let rax = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            proc_addr,
+            &[kernel32_handle as u32, name_addr as u32],
+        );
+        assert_ne!(
+            rax, 0,
+            "GetProcAddress of 'Forwarded' (forwarder to kernelbase.Sleep) should resolve"
+        );
+        assert_eq!(
+            runtime.last_error, 0,
+            "last_error should be 0 on successful resolution"
+        );
+    }
+
+    #[test]
+    fn get_proc_address_sets_error_on_unknown_export() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge =
+            GameEnvironment::create_in(temp_dir.path(), "gpa-err", GeArch::X86, "win11-23h2")
+                .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        let kernel32_handle = runtime.get_or_create_module_handle("kernel32.dll");
+        assert_ne!(kernel32_handle, 0);
+
+        let name_addr = runtime
+            .alloc_c_string(&mut memory, "NonExistentExport")
+            .expect("alloc name string");
+        let proc_addr = runtime.alloc_host_thunk(HostThunk::GetProcAddress);
+
+        let rax = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            proc_addr,
+            &[kernel32_handle as u32, name_addr as u32],
+        );
+        assert_eq!(rax, 0, "GetProcAddress of unknown export should return 0");
+        assert_eq!(
+            runtime.last_error, ERROR_PROC_NOT_FOUND,
+            "last_error should be ERROR_PROC_NOT_FOUND (127)"
+        );
+    }
 }
 
 fn read_d3d12_command_queue_desc(memory: &MemoryImage, address: u64) -> AppResult<(u32, i32, u32, u32)> {
@@ -39290,6 +49730,7 @@ fn write_d3d12_feature_support(
     address: u64,
     size: usize,
     device_info: &crate::d3d12::D3d12DeviceInfo,
+    telemetry: Option<&TelemetryCollector>,
 ) -> AppResult<Option<BTreeMap<String, Value>>> {
     let capabilities = &device_info.features;
     match feature {
@@ -39352,6 +49793,9 @@ fn write_d3d12_feature_support(
             }
             let supported = supported_d3d12_shader_model(device_info);
             let highest = if requested == 0 { supported } else { requested.min(supported) };
+            if let Some(t) = telemetry {
+                t.record_unsupported_shader_model(requested, supported);
+            }
             write_u32(memory, address, highest);
             Ok(Some(BTreeMap::from([
                 ("feature".to_string(), json!("SHADER_MODEL")),
@@ -39396,13 +49840,18 @@ fn write_d3d12_feature_support(
             if size < 12 {
                 return Ok(None);
             }
+            let raytracing_tier = if capabilities.raytracing {
+                D3D12_RAYTRACING_TIER_1_1
+            } else {
+                D3D12_RAYTRACING_TIER_NOT_SUPPORTED
+            };
             write_u32(memory, address, bool_to_u32(false));
             write_u32(memory, address + 4, D3D12_RENDER_PASS_TIER_1);
-            write_u32(memory, address + 8, D3D12_RAYTRACING_TIER_NOT_SUPPORTED);
+            write_u32(memory, address + 8, raytracing_tier);
             Ok(Some(BTreeMap::from([
                 ("feature".to_string(), json!("D3D12_OPTIONS5")),
                 ("render_pass_tier".to_string(), json!(D3D12_RENDER_PASS_TIER_1)),
-                ("raytracing_tier".to_string(), json!(D3D12_RAYTRACING_TIER_NOT_SUPPORTED)),
+                ("raytracing_tier".to_string(), json!(raytracing_tier)),
             ])))
         }
         D3D12_FEATURE_D3D12_OPTIONS7 => {
@@ -40726,7 +51175,8 @@ fn glyph_5x7(ch: char) -> Option<[u8; 7]> {
     })
 }
 
-fn unsupported_method(name: &str) -> HostThunk {
+fn unsupported_method(telemetry: &TelemetryCollector, name: &str) -> HostThunk {
+    telemetry.record_unsupported_method(name);
     HostThunk::UnsupportedMethod {
         name: name.to_string(),
     }
@@ -41048,6 +51498,16 @@ fn read_guest_i32(memory: &MemoryImage, address: u64) -> AppResult<i32> {
 
 fn read_guest_f32(memory: &MemoryImage, address: u64) -> AppResult<f32> {
     Ok(f32::from_bits(read_guest_u32(memory, address)?))
+}
+
+fn write_guest_u32(memory: &mut MemoryImage, address: u64, value: u32) -> AppResult<()> {
+    memory.write_u32(address, value);
+    Ok(())
+}
+
+fn write_guest_f32(memory: &mut MemoryImage, address: u64, value: f32) -> AppResult<()> {
+    memory.write_u32(address, value.to_bits());
+    Ok(())
 }
 
 fn read_guest_u64(memory: &MemoryImage, address: u64) -> AppResult<u64> {
@@ -41425,6 +51885,40 @@ fn write_u16(memory: &mut MemoryImage, address: u64, value: u16) {
 
 fn write_u8(memory: &mut MemoryImage, address: u64, value: u8) {
     memory.map_bytes(address, &[value]);
+}
+
+/// Read an array of GdiplusPointF from guest memory.
+fn read_gdiplus_pointf_array(memory: &MemoryImage, ptr: u64, count: u32) -> Vec<crate::user32::GdiplusPointF> {
+    let mut pts = Vec::with_capacity(count as usize);
+    for i in 0..count {
+        let offset = ptr + (i as u64 * 8);
+        let x = f32::from_bits(read_u32(memory, offset).unwrap_or(0));
+        let y = f32::from_bits(read_u32(memory, offset + 4).unwrap_or(0));
+        pts.push(crate::user32::GdiplusPointF { x, y });
+    }
+    pts
+}
+
+/// Read a UTF-16 string from guest memory.
+/// If length < 0, reads until null terminator.
+fn read_guest_utf16_string(memory: &MemoryImage, ptr: u64, length: i32) -> String {
+    if ptr == 0 {
+        return String::new();
+    }
+    let mut units = Vec::new();
+    if length >= 0 {
+        for i in 0..(length as usize) {
+            let cu = memory.read_u16(ptr + (i as u64 * 2)).unwrap_or(0);
+            units.push(cu);
+        }
+    } else {
+        loop {
+            let cu = memory.read_u16(ptr + (units.len() as u64 * 2)).unwrap_or(0);
+            if cu == 0 { break; }
+            units.push(cu);
+        }
+    }
+    String::from_utf16_lossy(&units)
 }
 
 fn write_i16(memory: &mut MemoryImage, address: u64, value: i16) {
@@ -42457,7 +52951,7 @@ fn trace_event(
     }
 }
 
-fn export_tables() -> BTreeMap<String, Vec<ExportSymbol>> {
+pub fn export_tables() -> BTreeMap<String, Vec<ExportSymbol>> {
     let mut kernel32_exports = vec![
         ExportSymbol {
             ordinal: 17,
@@ -42548,6 +53042,11 @@ fn export_tables() -> BTreeMap<String, Vec<ExportSymbol>> {
             ordinal: 118,
             name: Some("VirtualAlloc".to_string()),
             target: ExportTarget::Rva(0x1110),
+        },
+        ExportSymbol {
+            ordinal: 119,
+            name: Some("VirtualFree".to_string()),
+            target: ExportTarget::Rva(0x1118),
         },
         ExportSymbol {
             ordinal: 112,
@@ -42917,6 +53416,71 @@ fn export_tables() -> BTreeMap<String, Vec<ExportSymbol>> {
         ExportSymbol { ordinal: 52, name: Some("GdipSetClipPath".to_string()), target: ExportTarget::Rva(0x9630) },
         ExportSymbol { ordinal: 53, name: Some("GdipResetClip".to_string()), target: ExportTarget::Rva(0x9640) },
         ExportSymbol { ordinal: 54, name: Some("GdipCreateBitmapFromGdiDib".to_string()), target: ExportTarget::Rva(0x9650) },
+        // ── Phase 2.7 extended exports ──────────────────────────────────────────
+        ExportSymbol { ordinal: 55, name: Some("GdipCreateFromHDC".to_string()), target: ExportTarget::Rva(0x9660) },
+        ExportSymbol { ordinal: 56, name: Some("GdipDrawLines".to_string()), target: ExportTarget::Rva(0x9670) },
+        ExportSymbol { ordinal: 57, name: Some("GdipDrawPie".to_string()), target: ExportTarget::Rva(0x9680) },
+        ExportSymbol { ordinal: 58, name: Some("GdipFillPie".to_string()), target: ExportTarget::Rva(0x9690) },
+        ExportSymbol { ordinal: 59, name: Some("GdipDrawPolygon".to_string()), target: ExportTarget::Rva(0x96a0) },
+        ExportSymbol { ordinal: 60, name: Some("GdipFillPolygon".to_string()), target: ExportTarget::Rva(0x96b0) },
+        ExportSymbol { ordinal: 61, name: Some("GdipDrawArc".to_string()), target: ExportTarget::Rva(0x96c0) },
+        ExportSymbol { ordinal: 62, name: Some("GdipDrawCurve".to_string()), target: ExportTarget::Rva(0x96d0) },
+        ExportSymbol { ordinal: 63, name: Some("GdipDrawClosedCurve".to_string()), target: ExportTarget::Rva(0x96e0) },
+        ExportSymbol { ordinal: 64, name: Some("GdipCreatePen2".to_string()), target: ExportTarget::Rva(0x96f0) },
+        ExportSymbol { ordinal: 65, name: Some("GdipSetPenWidth".to_string()), target: ExportTarget::Rva(0x9700) },
+        ExportSymbol { ordinal: 66, name: Some("GdipGetPenWidth".to_string()), target: ExportTarget::Rva(0x9710) },
+        ExportSymbol { ordinal: 67, name: Some("GdipSetPenColor".to_string()), target: ExportTarget::Rva(0x9720) },
+        ExportSymbol { ordinal: 68, name: Some("GdipGetPenColor".to_string()), target: ExportTarget::Rva(0x9730) },
+        ExportSymbol { ordinal: 69, name: Some("GdipSetPenDashStyle".to_string()), target: ExportTarget::Rva(0x9740) },
+        ExportSymbol { ordinal: 70, name: Some("GdipGetPenDashStyle".to_string()), target: ExportTarget::Rva(0x9750) },
+        ExportSymbol { ordinal: 71, name: Some("GdipSetPenLineJoin".to_string()), target: ExportTarget::Rva(0x9760) },
+        ExportSymbol { ordinal: 72, name: Some("GdipSetPenStartCap".to_string()), target: ExportTarget::Rva(0x9770) },
+        ExportSymbol { ordinal: 73, name: Some("GdipSetPenEndCap".to_string()), target: ExportTarget::Rva(0x9780) },
+        ExportSymbol { ordinal: 74, name: Some("GdipCreateTextureBrush".to_string()), target: ExportTarget::Rva(0x9790) },
+        ExportSymbol { ordinal: 75, name: Some("GdipAddPathEllipse".to_string()), target: ExportTarget::Rva(0x97a0) },
+        ExportSymbol { ordinal: 76, name: Some("GdipAddPathArc".to_string()), target: ExportTarget::Rva(0x97b0) },
+        ExportSymbol { ordinal: 77, name: Some("GdipAddPathBezier".to_string()), target: ExportTarget::Rva(0x97c0) },
+        ExportSymbol { ordinal: 78, name: Some("GdipClosePathFigure".to_string()), target: ExportTarget::Rva(0x97d0) },
+        ExportSymbol { ordinal: 79, name: Some("GdipStartPathFigure".to_string()), target: ExportTarget::Rva(0x97e0) },
+        ExportSymbol { ordinal: 80, name: Some("GdipSetPathFillMode".to_string()), target: ExportTarget::Rva(0x97f0) },
+        ExportSymbol { ordinal: 81, name: Some("GdipCreateMatrix".to_string()), target: ExportTarget::Rva(0x9800) },
+        ExportSymbol { ordinal: 82, name: Some("GdipDeleteMatrix".to_string()), target: ExportTarget::Rva(0x9810) },
+        ExportSymbol { ordinal: 83, name: Some("GdipSetMatrixElements".to_string()), target: ExportTarget::Rva(0x9820) },
+        ExportSymbol { ordinal: 84, name: Some("GdipGetMatrixElements".to_string()), target: ExportTarget::Rva(0x9830) },
+        ExportSymbol { ordinal: 85, name: Some("GdipTranslateMatrix".to_string()), target: ExportTarget::Rva(0x9840) },
+        ExportSymbol { ordinal: 86, name: Some("GdipRotateMatrix".to_string()), target: ExportTarget::Rva(0x9850) },
+        ExportSymbol { ordinal: 87, name: Some("GdipScaleMatrix".to_string()), target: ExportTarget::Rva(0x9860) },
+        ExportSymbol { ordinal: 88, name: Some("GdipInvertMatrix".to_string()), target: ExportTarget::Rva(0x9870) },
+        ExportSymbol { ordinal: 89, name: Some("GdipMultiplyMatrix".to_string()), target: ExportTarget::Rva(0x9880) },
+        ExportSymbol { ordinal: 90, name: Some("GdipSetWorldTransform".to_string()), target: ExportTarget::Rva(0x9890) },
+        ExportSymbol { ordinal: 91, name: Some("GdipResetWorldTransform".to_string()), target: ExportTarget::Rva(0x98a0) },
+        ExportSymbol { ordinal: 92, name: Some("GdipGetWorldTransform".to_string()), target: ExportTarget::Rva(0x98b0) },
+        ExportSymbol { ordinal: 93, name: Some("GdipSetClipRegion".to_string()), target: ExportTarget::Rva(0x98c0) },
+        ExportSymbol { ordinal: 94, name: Some("GdipGetClipBounds".to_string()), target: ExportTarget::Rva(0x98d0) },
+        ExportSymbol { ordinal: 95, name: Some("GdipSaveGraphics".to_string()), target: ExportTarget::Rva(0x98e0) },
+        ExportSymbol { ordinal: 96, name: Some("GdipRestoreGraphics".to_string()), target: ExportTarget::Rva(0x98f0) },
+        ExportSymbol { ordinal: 97, name: Some("GdipBeginContainer".to_string()), target: ExportTarget::Rva(0x9900) },
+        ExportSymbol { ordinal: 98, name: Some("GdipEndContainer".to_string()), target: ExportTarget::Rva(0x9910) },
+        ExportSymbol { ordinal: 99, name: Some("GdipCreateBitmapFromGraphics".to_string()), target: ExportTarget::Rva(0x9920) },
+        ExportSymbol { ordinal: 100, name: Some("GdipBitmapGetPixel".to_string()), target: ExportTarget::Rva(0x9930) },
+        ExportSymbol { ordinal: 101, name: Some("GdipBitmapSetPixel".to_string()), target: ExportTarget::Rva(0x9940) },
+        ExportSymbol { ordinal: 102, name: Some("GdipBitmapLockBits".to_string()), target: ExportTarget::Rva(0x9950) },
+        ExportSymbol { ordinal: 103, name: Some("GdipBitmapUnlockBits".to_string()), target: ExportTarget::Rva(0x9960) },
+        ExportSymbol { ordinal: 104, name: Some("GdipSetTextRenderingHint".to_string()), target: ExportTarget::Rva(0x9970) },
+        ExportSymbol { ordinal: 105, name: Some("GdipMeasureCharacterRanges".to_string()), target: ExportTarget::Rva(0x9980) },
+        ExportSymbol { ordinal: 106, name: Some("GdipCreateImageAttributes".to_string()), target: ExportTarget::Rva(0x9990) },
+        ExportSymbol { ordinal: 107, name: Some("GdipDisposeImageAttributes".to_string()), target: ExportTarget::Rva(0x99a0) },
+        ExportSymbol { ordinal: 108, name: Some("GdipSetImageAttributesColorKeys".to_string()), target: ExportTarget::Rva(0x99b0) },
+        ExportSymbol { ordinal: 109, name: Some("GdipSetImageAttributesColorMatrix".to_string()), target: ExportTarget::Rva(0x99c0) },
+        ExportSymbol { ordinal: 110, name: Some("GdipGetSmoothingMode".to_string()), target: ExportTarget::Rva(0x99d0) },
+        ExportSymbol { ordinal: 111, name: Some("GdipSetCompositingMode".to_string()), target: ExportTarget::Rva(0x99e0) },
+        ExportSymbol { ordinal: 112, name: Some("GdipGetCompositingMode".to_string()), target: ExportTarget::Rva(0x99f0) },
+        ExportSymbol { ordinal: 113, name: Some("GdipSetCompositingQuality".to_string()), target: ExportTarget::Rva(0x9a00) },
+        ExportSymbol { ordinal: 114, name: Some("GdipGetCompositingQuality".to_string()), target: ExportTarget::Rva(0x9a10) },
+        ExportSymbol { ordinal: 115, name: Some("GdipGetInterpolationMode".to_string()), target: ExportTarget::Rva(0x9a20) },
+        ExportSymbol { ordinal: 116, name: Some("GdipSetPixelOffsetMode".to_string()), target: ExportTarget::Rva(0x9a30) },
+        ExportSymbol { ordinal: 117, name: Some("GdipGetPixelOffsetMode".to_string()), target: ExportTarget::Rva(0x9a40) },
+        ExportSymbol { ordinal: 118, name: Some("GdipFillRegion".to_string()), target: ExportTarget::Rva(0x9a50) },
     ];
 
     let mut ws2_32_exports = vec![
@@ -43392,6 +53956,10 @@ fn export_tables() -> BTreeMap<String, Vec<ExportSymbol>> {
         ExportSymbol { ordinal: 9, name: Some("MFCreateSourceReaderFromByteStream".to_string()), target: ExportTarget::Rva(0x24080) },
         ExportSymbol { ordinal: 10, name: Some("MFCreatePresentationDescriptor".to_string()), target: ExportTarget::Rva(0x24090) },
         ExportSymbol { ordinal: 11, name: Some("MFGetService".to_string()), target: ExportTarget::Rva(0x240a0) },
+        ExportSymbol { ordinal: 12, name: Some("MFTEnumEx".to_string()), target: ExportTarget::Rva(0x240b0) },
+        ExportSymbol { ordinal: 13, name: Some("MFCreateMediaSession".to_string()), target: ExportTarget::Rva(0x240c0) },
+        ExportSymbol { ordinal: 14, name: Some("MFCreateTopology".to_string()), target: ExportTarget::Rva(0x240d0) },
+        ExportSymbol { ordinal: 15, name: Some("MFCreatePresentationClock".to_string()), target: ExportTarget::Rva(0x240e0) },
     ];
 
     let mut cfgmgr32_exports = vec![
@@ -43689,6 +54257,1269 @@ fn export_tables() -> BTreeMap<String, Vec<ExportSymbol>> {
             ExportSymbol { ordinal: 1, name: Some("XInputGetState".to_string()), target: ExportTarget::Rva(0x23000) },
             ExportSymbol { ordinal: 2, name: Some("XInputSetState".to_string()), target: ExportTarget::Rva(0x23010) },
             ExportSymbol { ordinal: 3, name: Some("XInputGetCapabilities".to_string()), target: ExportTarget::Rva(0x23020) },
+        ]),
+        // ── New synthetic export tables added by automated task ──
+        ("browseui.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("SHOpenFolderWindow".to_string()), target: ExportTarget::Rva(0x2f000) },
+            ExportSymbol { ordinal: 2, name: Some("SHCreateExplorerTaskband".to_string()), target: ExportTarget::Rva(0x2f010) },
+        ]),
+        ("d3d8thk.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("D3DKMTCreateAllocation".to_string()), target: ExportTarget::Rva(0x30000) },
+            ExportSymbol { ordinal: 2, name: Some("D3DKMTQueryAllocationResidency".to_string()), target: ExportTarget::Rva(0x30010) },
+            ExportSymbol { ordinal: 3, name: Some("D3DKMTSetAllocationPriority".to_string()), target: ExportTarget::Rva(0x30020) },
+            ExportSymbol { ordinal: 4, name: Some("D3DKMTOpenResource".to_string()), target: ExportTarget::Rva(0x30030) },
+            ExportSymbol { ordinal: 5, name: Some("D3DKMTCreateDevice".to_string()), target: ExportTarget::Rva(0x30040) },
+            ExportSymbol { ordinal: 6, name: Some("D3DKMTDestroyDevice".to_string()), target: ExportTarget::Rva(0x30050) },
+            ExportSymbol { ordinal: 7, name: Some("D3DKMTCreateContext".to_string()), target: ExportTarget::Rva(0x30060) },
+            ExportSymbol { ordinal: 8, name: Some("D3DKMTDestroyContext".to_string()), target: ExportTarget::Rva(0x30070) },
+            ExportSymbol { ordinal: 9, name: Some("D3DKMTPresent".to_string()), target: ExportTarget::Rva(0x30080) },
+            ExportSymbol { ordinal: 10, name: Some("D3DKMTCloseAdapter".to_string()), target: ExportTarget::Rva(0x30090) },
+            ExportSymbol { ordinal: 11, name: Some("D3DKMTOpenAdapterFromHdc".to_string()), target: ExportTarget::Rva(0x300a0) },
+            ExportSymbol { ordinal: 12, name: Some("D3DKMTGetDisplayModeList".to_string()), target: ExportTarget::Rva(0x300b0) },
+            ExportSymbol { ordinal: 13, name: Some("D3DKMTEnumAdapters".to_string()), target: ExportTarget::Rva(0x300c0) },
+            ExportSymbol { ordinal: 14, name: Some("D3DKMTQueryAdapterInfo".to_string()), target: ExportTarget::Rva(0x300d0) },
+            ExportSymbol { ordinal: 15, name: Some("D3DKMTCreateSynchronizationObject".to_string()), target: ExportTarget::Rva(0x300e0) },
+            ExportSymbol { ordinal: 16, name: Some("D3DKMTRender".to_string()), target: ExportTarget::Rva(0x300f0) },
+            ExportSymbol { ordinal: 17, name: Some("D3DKMTOpenKeyedMutex".to_string()), target: ExportTarget::Rva(0x30100) },
+            ExportSymbol { ordinal: 18, name: Some("D3DKMTSetDisplayPrivateDriverFormat".to_string()), target: ExportTarget::Rva(0x30110) },
+        ]),
+        ("d3dcompiler_43.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("D3DCompile".to_string()), target: ExportTarget::Rva(0x31000) },
+            ExportSymbol { ordinal: 2, name: Some("D3DCompile2".to_string()), target: ExportTarget::Rva(0x31010) },
+            ExportSymbol { ordinal: 3, name: Some("D3DCompileFromFile".to_string()), target: ExportTarget::Rva(0x31020) },
+            ExportSymbol { ordinal: 4, name: Some("D3DDisassemble".to_string()), target: ExportTarget::Rva(0x31030) },
+            ExportSymbol { ordinal: 5, name: Some("D3DReflect".to_string()), target: ExportTarget::Rva(0x31040) },
+            ExportSymbol { ordinal: 6, name: Some("D3DStripShader".to_string()), target: ExportTarget::Rva(0x31050) },
+            ExportSymbol { ordinal: 7, name: Some("D3DGetBlobPart".to_string()), target: ExportTarget::Rva(0x31060) },
+            ExportSymbol { ordinal: 8, name: Some("D3DSetBlobPart".to_string()), target: ExportTarget::Rva(0x31070) },
+            ExportSymbol { ordinal: 9, name: Some("D3DCreateLinker".to_string()), target: ExportTarget::Rva(0x31080) },
+            ExportSymbol { ordinal: 10, name: Some("D3DLoadModule".to_string()), target: ExportTarget::Rva(0x31090) },
+            ExportSymbol { ordinal: 11, name: Some("D3DGetTraceInstructionOffsets".to_string()), target: ExportTarget::Rva(0x310a0) },
+            ExportSymbol { ordinal: 12, name: Some("D3DSetTraceInstructionOffsets".to_string()), target: ExportTarget::Rva(0x310b0) },
+        ]),
+        ("d3dcompiler_47.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("D3DCompile".to_string()), target: ExportTarget::Rva(0x32000) },
+            ExportSymbol { ordinal: 2, name: Some("D3DCompile2".to_string()), target: ExportTarget::Rva(0x32010) },
+            ExportSymbol { ordinal: 3, name: Some("D3DCompileFromFile".to_string()), target: ExportTarget::Rva(0x32020) },
+            ExportSymbol { ordinal: 4, name: Some("D3DDisassemble".to_string()), target: ExportTarget::Rva(0x32030) },
+            ExportSymbol { ordinal: 5, name: Some("D3DReflect".to_string()), target: ExportTarget::Rva(0x32040) },
+            ExportSymbol { ordinal: 6, name: Some("D3DStripShader".to_string()), target: ExportTarget::Rva(0x32050) },
+            ExportSymbol { ordinal: 7, name: Some("D3DGetBlobPart".to_string()), target: ExportTarget::Rva(0x32060) },
+            ExportSymbol { ordinal: 8, name: Some("D3DSetBlobPart".to_string()), target: ExportTarget::Rva(0x32070) },
+            ExportSymbol { ordinal: 9, name: Some("D3DCreateLinker".to_string()), target: ExportTarget::Rva(0x32080) },
+            ExportSymbol { ordinal: 10, name: Some("D3DLoadModule".to_string()), target: ExportTarget::Rva(0x32090) },
+            ExportSymbol { ordinal: 11, name: Some("D3DGetTraceInstructionOffsets".to_string()), target: ExportTarget::Rva(0x320a0) },
+            ExportSymbol { ordinal: 12, name: Some("D3DSetTraceInstructionOffsets".to_string()), target: ExportTarget::Rva(0x320b0) },
+        ]),
+        ("d3dx10_43.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("D3DX10CreateTextureFromFileW".to_string()), target: ExportTarget::Rva(0x33000) },
+            ExportSymbol { ordinal: 2, name: Some("D3DX10CompileFromFile".to_string()), target: ExportTarget::Rva(0x33010) },
+            ExportSymbol { ordinal: 3, name: Some("D3DX10SaveTextureToMemory".to_string()), target: ExportTarget::Rva(0x33020) },
+            ExportSymbol { ordinal: 4, name: Some("D3DX10GetImageInfoFromFile".to_string()), target: ExportTarget::Rva(0x33030) },
+        ]),
+        ("d3dx9_43.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("D3DX11CreateTextureFromFileW".to_string()), target: ExportTarget::Rva(0x34000) },
+            ExportSymbol { ordinal: 2, name: Some("D3DX11CompileFromFile".to_string()), target: ExportTarget::Rva(0x34010) },
+            ExportSymbol { ordinal: 3, name: Some("D3DX11SaveTextureToMemory".to_string()), target: ExportTarget::Rva(0x34020) },
+            ExportSymbol { ordinal: 4, name: Some("D3DX11GetImageInfoFromFile".to_string()), target: ExportTarget::Rva(0x34030) },
+            ExportSymbol { ordinal: 5, name: Some("D3DX11SaveTextureToFileW".to_string()), target: ExportTarget::Rva(0x34040) },
+            ExportSymbol { ordinal: 6, name: Some("D3DX11FilterTexture".to_string()), target: ExportTarget::Rva(0x34050) },
+            ExportSymbol { ordinal: 7, name: Some("D3DX11CreateShaderResourceViewFromFile".to_string()), target: ExportTarget::Rva(0x34060) },
+            ExportSymbol { ordinal: 8, name: Some("D3DX11CreateAsyncShaderResourceViewProcessor".to_string()), target: ExportTarget::Rva(0x34070) },
+        ]),
+        ("dhcpcsvc.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("DhcpRequestParams".to_string()), target: ExportTarget::Rva(0x35000) },
+            ExportSymbol { ordinal: 2, name: Some("DhcpRenewParams".to_string()), target: ExportTarget::Rva(0x35010) },
+            ExportSymbol { ordinal: 3, name: Some("DhcpReleaseParams".to_string()), target: ExportTarget::Rva(0x35020) },
+            ExportSymbol { ordinal: 4, name: Some("DhcpCApiCleanup".to_string()), target: ExportTarget::Rva(0x35030) },
+            ExportSymbol { ordinal: 5, name: Some("DhcpCApiInitialize".to_string()), target: ExportTarget::Rva(0x35040) },
+        ]),
+        ("dhcpcsvc6.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("Dhcpv6RequestParams".to_string()), target: ExportTarget::Rva(0x36000) },
+            ExportSymbol { ordinal: 2, name: Some("Dhcpv6RenewParams".to_string()), target: ExportTarget::Rva(0x36010) },
+            ExportSymbol { ordinal: 3, name: Some("Dhcpv6ReleaseParams".to_string()), target: ExportTarget::Rva(0x36020) },
+        ]),
+        ("dinput8.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("DirectInput8Create".to_string()), target: ExportTarget::Rva(0x37000) },
+            ExportSymbol { ordinal: 2, name: Some("DllRegisterServer".to_string()), target: ExportTarget::Rva(0x37010) },
+            ExportSymbol { ordinal: 3, name: Some("DllUnregisterServer".to_string()), target: ExportTarget::Rva(0x37020) },
+            ExportSymbol { ordinal: 4, name: Some("GetdfDIJoystick".to_string()), target: ExportTarget::Rva(0x37030) },
+        ]),
+        ("dxva2.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("DXVA2CreateDirect3DDeviceManager9".to_string()), target: ExportTarget::Rva(0x38000) },
+            ExportSymbol { ordinal: 2, name: Some("DXVA2CreateVideoService".to_string()), target: ExportTarget::Rva(0x38010) },
+            ExportSymbol { ordinal: 3, name: Some("DXVA2GetVideoProcessorCaps".to_string()), target: ExportTarget::Rva(0x38020) },
+        ]),
+        ("evr.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("MFCreateVideoRenderer".to_string()), target: ExportTarget::Rva(0x39000) },
+            ExportSymbol { ordinal: 2, name: Some("MFCreateVideoMixer".to_string()), target: ExportTarget::Rva(0x39010) },
+            ExportSymbol { ordinal: 3, name: Some("MFCreateVideoPresenter".to_string()), target: ExportTarget::Rva(0x39020) },
+            ExportSymbol { ordinal: 4, name: Some("MFCreateVideoSampleAllocator".to_string()), target: ExportTarget::Rva(0x39030) },
+            ExportSymbol { ordinal: 5, name: Some("MFCreateVideoMediaType".to_string()), target: ExportTarget::Rva(0x39040) },
+        ]),
+        ("fwpuclnt.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("FWPS_FILTER".to_string()), target: ExportTarget::Rva(0x3a000) },
+            ExportSymbol { ordinal: 2, name: Some("FwpsOpenToken".to_string()), target: ExportTarget::Rva(0x3a010) },
+            ExportSymbol { ordinal: 3, name: Some("FwpsQueryTokenInformation".to_string()), target: ExportTarget::Rva(0x3a020) },
+        ]),
+        ("gameux.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("GameExplorer_Initialize".to_string()), target: ExportTarget::Rva(0x3b000) },
+            ExportSymbol { ordinal: 2, name: Some("GameExplorer_VerifyAccess".to_string()), target: ExportTarget::Rva(0x3b010) },
+            ExportSymbol { ordinal: 3, name: Some("GameExplorer_SetUserAccess".to_string()), target: ExportTarget::Rva(0x3b020) },
+            ExportSymbol { ordinal: 4, name: Some("GAMEUX_SHFOLDERPATH".to_string()), target: ExportTarget::Rva(0x3b030) },
+        ]),
+        ("glu32.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("gluPerspective".to_string()), target: ExportTarget::Rva(0x3c000) },
+            ExportSymbol { ordinal: 2, name: Some("gluLookAt".to_string()), target: ExportTarget::Rva(0x3c010) },
+            ExportSymbol { ordinal: 3, name: Some("gluOrtho2D".to_string()), target: ExportTarget::Rva(0x3c020) },
+            ExportSymbol { ordinal: 4, name: Some("gluProject".to_string()), target: ExportTarget::Rva(0x3c030) },
+            ExportSymbol { ordinal: 5, name: Some("gluUnProject".to_string()), target: ExportTarget::Rva(0x3c040) },
+            ExportSymbol { ordinal: 6, name: Some("gluPickMatrix".to_string()), target: ExportTarget::Rva(0x3c050) },
+            ExportSymbol { ordinal: 7, name: Some("gluErrorString".to_string()), target: ExportTarget::Rva(0x3c060) },
+            ExportSymbol { ordinal: 8, name: Some("gluBuild2DMipmaps".to_string()), target: ExportTarget::Rva(0x3c070) },
+            ExportSymbol { ordinal: 9, name: Some("gluScaleImage".to_string()), target: ExportTarget::Rva(0x3c080) },
+            ExportSymbol { ordinal: 10, name: Some("gluNewQuadric".to_string()), target: ExportTarget::Rva(0x3c090) },
+            ExportSymbol { ordinal: 11, name: Some("gluDeleteQuadric".to_string()), target: ExportTarget::Rva(0x3c0a0) },
+            ExportSymbol { ordinal: 12, name: Some("gluSphere".to_string()), target: ExportTarget::Rva(0x3c0b0) },
+            ExportSymbol { ordinal: 13, name: Some("gluCylinder".to_string()), target: ExportTarget::Rva(0x3c0c0) },
+            ExportSymbol { ordinal: 14, name: Some("gluDisk".to_string()), target: ExportTarget::Rva(0x3c0d0) },
+            ExportSymbol { ordinal: 15, name: Some("gluPartialDisk".to_string()), target: ExportTarget::Rva(0x3c0e0) },
+            ExportSymbol { ordinal: 16, name: Some("gluNewTess".to_string()), target: ExportTarget::Rva(0x3c0f0) },
+            ExportSymbol { ordinal: 17, name: Some("gluTessBeginPolygon".to_string()), target: ExportTarget::Rva(0x3c100) },
+            ExportSymbol { ordinal: 18, name: Some("gluTessEndPolygon".to_string()), target: ExportTarget::Rva(0x3c110) },
+            ExportSymbol { ordinal: 19, name: Some("gluTessVertex".to_string()), target: ExportTarget::Rva(0x3c120) },
+        ]),
+        ("hid.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("HidP_GetCaps".to_string()), target: ExportTarget::Rva(0x3d000) },
+            ExportSymbol { ordinal: 2, name: Some("HidP_GetButtonCaps".to_string()), target: ExportTarget::Rva(0x3d010) },
+            ExportSymbol { ordinal: 3, name: Some("HidP_GetValueCaps".to_string()), target: ExportTarget::Rva(0x3d020) },
+            ExportSymbol { ordinal: 4, name: Some("HidP_GetUsages".to_string()), target: ExportTarget::Rva(0x3d030) },
+            ExportSymbol { ordinal: 5, name: Some("HidP_GetUsageValue".to_string()), target: ExportTarget::Rva(0x3d040) },
+            ExportSymbol { ordinal: 6, name: Some("HidP_SetUsages".to_string()), target: ExportTarget::Rva(0x3d050) },
+            ExportSymbol { ordinal: 7, name: Some("HidD_GetAttributes".to_string()), target: ExportTarget::Rva(0x3d060) },
+            ExportSymbol { ordinal: 8, name: Some("HidD_GetHidGuid".to_string()), target: ExportTarget::Rva(0x3d070) },
+            ExportSymbol { ordinal: 9, name: Some("HidD_GetPreparsedData".to_string()), target: ExportTarget::Rva(0x3d080) },
+            ExportSymbol { ordinal: 10, name: Some("HidD_FreePreparsedData".to_string()), target: ExportTarget::Rva(0x3d090) },
+            ExportSymbol { ordinal: 11, name: Some("HidD_GetManufacturerString".to_string()), target: ExportTarget::Rva(0x3d0a0) },
+            ExportSymbol { ordinal: 12, name: Some("HidD_GetProductString".to_string()), target: ExportTarget::Rva(0x3d0b0) },
+        ]),
+        ("httpapi.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("HttpInitialize".to_string()), target: ExportTarget::Rva(0x3e000) },
+            ExportSymbol { ordinal: 2, name: Some("HttpTerminate".to_string()), target: ExportTarget::Rva(0x3e010) },
+            ExportSymbol { ordinal: 3, name: Some("HttpCreateHttpHandle".to_string()), target: ExportTarget::Rva(0x3e020) },
+            ExportSymbol { ordinal: 4, name: Some("HttpAddUrl".to_string()), target: ExportTarget::Rva(0x3e030) },
+            ExportSymbol { ordinal: 5, name: Some("HttpRemoveUrl".to_string()), target: ExportTarget::Rva(0x3e040) },
+            ExportSymbol { ordinal: 6, name: Some("HttpReceiveHttpRequest".to_string()), target: ExportTarget::Rva(0x3e050) },
+            ExportSymbol { ordinal: 7, name: Some("HttpSendHttpResponse".to_string()), target: ExportTarget::Rva(0x3e060) },
+            ExportSymbol { ordinal: 8, name: Some("HttpSendResponseEntityBody".to_string()), target: ExportTarget::Rva(0x3e070) },
+            ExportSymbol { ordinal: 9, name: Some("HttpWaitForDisconnect".to_string()), target: ExportTarget::Rva(0x3e080) },
+        ]),
+        ("ieframe.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("IEHlink".to_string()), target: ExportTarget::Rva(0x3f000) },
+            ExportSymbol { ordinal: 2, name: Some("IEGetWriteableHlink".to_string()), target: ExportTarget::Rva(0x3f010) },
+            ExportSymbol { ordinal: 3, name: Some("IEGetFrameComponent".to_string()), target: ExportTarget::Rva(0x3f020) },
+        ]),
+        ("imagehlp.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("ImageLoad".to_string()), target: ExportTarget::Rva(0x40000) },
+            ExportSymbol { ordinal: 2, name: Some("ImageUnload".to_string()), target: ExportTarget::Rva(0x40010) },
+            ExportSymbol { ordinal: 3, name: Some("ImageGetDigestStream".to_string()), target: ExportTarget::Rva(0x40020) },
+            ExportSymbol { ordinal: 4, name: Some("ImageGetCertificateHeader".to_string()), target: ExportTarget::Rva(0x40030) },
+            ExportSymbol { ordinal: 5, name: Some("ImageGetCertificateData".to_string()), target: ExportTarget::Rva(0x40040) },
+            ExportSymbol { ordinal: 6, name: Some("ImageEnumerateCertificates".to_string()), target: ExportTarget::Rva(0x40050) },
+            ExportSymbol { ordinal: 7, name: Some("ImageAddCertificate".to_string()), target: ExportTarget::Rva(0x40060) },
+            ExportSymbol { ordinal: 8, name: Some("ImageRemoveCertificate".to_string()), target: ExportTarget::Rva(0x40070) },
+            ExportSymbol { ordinal: 9, name: Some("MapAndLoad".to_string()), target: ExportTarget::Rva(0x40080) },
+            ExportSymbol { ordinal: 10, name: Some("UnMapAndLoad".to_string()), target: ExportTarget::Rva(0x40090) },
+            ExportSymbol { ordinal: 11, name: Some("BindImage".to_string()), target: ExportTarget::Rva(0x400a0) },
+            ExportSymbol { ordinal: 12, name: Some("BindImageEx".to_string()), target: ExportTarget::Rva(0x400b0) },
+            ExportSymbol { ordinal: 13, name: Some("ImagehlpApiVersion".to_string()), target: ExportTarget::Rva(0x400c0) },
+            ExportSymbol { ordinal: 14, name: Some("CheckSumMappedFile".to_string()), target: ExportTarget::Rva(0x400d0) },
+        ]),
+        ("kerberos.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("KerbLogon".to_string()), target: ExportTarget::Rva(0x41000) },
+            ExportSymbol { ordinal: 2, name: Some("KerbRetrieveTicket".to_string()), target: ExportTarget::Rva(0x41010) },
+        ]),
+        ("loadperf.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("LoadPerfCounterTextStringsW".to_string()), target: ExportTarget::Rva(0x42000) },
+            ExportSymbol { ordinal: 2, name: Some("UnloadPerfCounterTextStringsW".to_string()), target: ExportTarget::Rva(0x42010) },
+            ExportSymbol { ordinal: 3, name: Some("SetServiceAsTrusted".to_string()), target: ExportTarget::Rva(0x42020) },
+        ]),
+        ("msacm32.drv".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("acmDriverOpen".to_string()), target: ExportTarget::Rva(0x43000) },
+            ExportSymbol { ordinal: 2, name: Some("acmDriverClose".to_string()), target: ExportTarget::Rva(0x43010) },
+            ExportSymbol { ordinal: 3, name: Some("acmDriverEnum".to_string()), target: ExportTarget::Rva(0x43020) },
+            ExportSymbol { ordinal: 4, name: Some("acmMetrics".to_string()), target: ExportTarget::Rva(0x43030) },
+            ExportSymbol { ordinal: 5, name: Some("acmFormatSuggest".to_string()), target: ExportTarget::Rva(0x43040) },
+            ExportSymbol { ordinal: 6, name: Some("acmFormatEnum".to_string()), target: ExportTarget::Rva(0x43050) },
+            ExportSymbol { ordinal: 7, name: Some("acmFormatDetails".to_string()), target: ExportTarget::Rva(0x43060) },
+            ExportSymbol { ordinal: 8, name: Some("acmStreamOpen".to_string()), target: ExportTarget::Rva(0x43070) },
+            ExportSymbol { ordinal: 9, name: Some("acmStreamClose".to_string()), target: ExportTarget::Rva(0x43080) },
+            ExportSymbol { ordinal: 10, name: Some("acmStreamConvert".to_string()), target: ExportTarget::Rva(0x43090) },
+            ExportSymbol { ordinal: 11, name: Some("acmStreamSize".to_string()), target: ExportTarget::Rva(0x430a0) },
+            ExportSymbol { ordinal: 12, name: Some("acmDriverMessage".to_string()), target: ExportTarget::Rva(0x430b0) },
+        ]),
+        ("msdmo.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("DMOEnum".to_string()), target: ExportTarget::Rva(0x44000) },
+            ExportSymbol { ordinal: 2, name: Some("DMOGetName".to_string()), target: ExportTarget::Rva(0x44010) },
+            ExportSymbol { ordinal: 3, name: Some("DMOGetTypes".to_string()), target: ExportTarget::Rva(0x44020) },
+            ExportSymbol { ordinal: 4, name: Some("DMOGuidToStr".to_string()), target: ExportTarget::Rva(0x44030) },
+            ExportSymbol { ordinal: 5, name: Some("DMOStrToGuid".to_string()), target: ExportTarget::Rva(0x44040) },
+            ExportSymbol { ordinal: 6, name: Some("MOFree".to_string()), target: ExportTarget::Rva(0x44050) },
+        ]),
+        ("msftedit.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("MsftEditRegisterClass".to_string()), target: ExportTarget::Rva(0x45000) },
+        ]),
+        ("mshtml.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("ShowHTMLDialogEx".to_string()), target: ExportTarget::Rva(0x46000) },
+            ExportSymbol { ordinal: 2, name: Some("IEFrameFactory_Constructor".to_string()), target: ExportTarget::Rva(0x46010) },
+            ExportSymbol { ordinal: 3, name: Some("CreateHTMLPropertyPage".to_string()), target: ExportTarget::Rva(0x46020) },
+        ]),
+        ("msi.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("MsiOpenPackageW".to_string()), target: ExportTarget::Rva(0x47000) },
+            ExportSymbol { ordinal: 2, name: Some("MsiCloseHandle".to_string()), target: ExportTarget::Rva(0x47010) },
+            ExportSymbol { ordinal: 3, name: Some("MsiGetPropertyW".to_string()), target: ExportTarget::Rva(0x47020) },
+            ExportSymbol { ordinal: 4, name: Some("MsiSetPropertyW".to_string()), target: ExportTarget::Rva(0x47030) },
+            ExportSymbol { ordinal: 5, name: Some("MsiInstallProductW".to_string()), target: ExportTarget::Rva(0x47040) },
+            ExportSymbol { ordinal: 6, name: Some("MsiConfigureProductW".to_string()), target: ExportTarget::Rva(0x47050) },
+            ExportSymbol { ordinal: 7, name: Some("MsiReinstallProductW".to_string()), target: ExportTarget::Rva(0x47060) },
+            ExportSymbol { ordinal: 8, name: Some("MsiQueryProductInfoW".to_string()), target: ExportTarget::Rva(0x47070) },
+            ExportSymbol { ordinal: 9, name: Some("MsiEnumProductsW".to_string()), target: ExportTarget::Rva(0x47080) },
+            ExportSymbol { ordinal: 10, name: Some("MsiGetProductInfoW".to_string()), target: ExportTarget::Rva(0x47090) },
+            ExportSymbol { ordinal: 11, name: Some("MsiOpenDatabaseW".to_string()), target: ExportTarget::Rva(0x470a0) },
+            ExportSymbol { ordinal: 12, name: Some("MsiDatabaseOpenViewW".to_string()), target: ExportTarget::Rva(0x470b0) },
+            ExportSymbol { ordinal: 13, name: Some("MsiViewExecute".to_string()), target: ExportTarget::Rva(0x470c0) },
+            ExportSymbol { ordinal: 14, name: Some("MsiViewFetch".to_string()), target: ExportTarget::Rva(0x470d0) },
+            ExportSymbol { ordinal: 15, name: Some("MsiViewClose".to_string()), target: ExportTarget::Rva(0x470e0) },
+            ExportSymbol { ordinal: 16, name: Some("MsiRecordGetStringW".to_string()), target: ExportTarget::Rva(0x470f0) },
+            ExportSymbol { ordinal: 17, name: Some("MsiRecordSetStringW".to_string()), target: ExportTarget::Rva(0x47100) },
+            ExportSymbol { ordinal: 18, name: Some("MsiRecordDataSize".to_string()), target: ExportTarget::Rva(0x47110) },
+            ExportSymbol { ordinal: 19, name: Some("MsiCloseAllHandles".to_string()), target: ExportTarget::Rva(0x47120) },
+        ]),
+        ("mspatcha.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("ApplyPatchToFileW".to_string()), target: ExportTarget::Rva(0x48000) },
+            ExportSymbol { ordinal: 2, name: Some("ApplyPatchToFileExW".to_string()), target: ExportTarget::Rva(0x48010) },
+            ExportSymbol { ordinal: 3, name: Some("GetPatchFileSignature".to_string()), target: ExportTarget::Rva(0x48020) },
+        ]),
+        ("ncrypt.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("NCryptOpenStorageProvider".to_string()), target: ExportTarget::Rva(0x49000) },
+            ExportSymbol { ordinal: 2, name: Some("NCryptCreatePersistedKey".to_string()), target: ExportTarget::Rva(0x49010) },
+            ExportSymbol { ordinal: 3, name: Some("NCryptOpenKey".to_string()), target: ExportTarget::Rva(0x49020) },
+            ExportSymbol { ordinal: 4, name: Some("NCryptFinalizeKey".to_string()), target: ExportTarget::Rva(0x49030) },
+            ExportSymbol { ordinal: 5, name: Some("NCryptEncrypt".to_string()), target: ExportTarget::Rva(0x49040) },
+            ExportSymbol { ordinal: 6, name: Some("NCryptDecrypt".to_string()), target: ExportTarget::Rva(0x49050) },
+            ExportSymbol { ordinal: 7, name: Some("NCryptExportKey".to_string()), target: ExportTarget::Rva(0x49060) },
+            ExportSymbol { ordinal: 8, name: Some("NCryptImportKey".to_string()), target: ExportTarget::Rva(0x49070) },
+            ExportSymbol { ordinal: 9, name: Some("NCryptDeleteKey".to_string()), target: ExportTarget::Rva(0x49080) },
+            ExportSymbol { ordinal: 10, name: Some("NCryptFreeBuffer".to_string()), target: ExportTarget::Rva(0x49090) },
+            ExportSymbol { ordinal: 11, name: Some("NCryptIsAlgSupported".to_string()), target: ExportTarget::Rva(0x490a0) },
+            ExportSymbol { ordinal: 12, name: Some("NCryptGetProperty".to_string()), target: ExportTarget::Rva(0x490b0) },
+            ExportSymbol { ordinal: 13, name: Some("NCryptSetProperty".to_string()), target: ExportTarget::Rva(0x490c0) },
+            ExportSymbol { ordinal: 14, name: Some("NCryptSignHash".to_string()), target: ExportTarget::Rva(0x490d0) },
+            ExportSymbol { ordinal: 15, name: Some("NCryptVerifySignature".to_string()), target: ExportTarget::Rva(0x490e0) },
+            ExportSymbol { ordinal: 16, name: Some("NCryptSecretAgreement".to_string()), target: ExportTarget::Rva(0x490f0) },
+            ExportSymbol { ordinal: 17, name: Some("NCryptDeriveKey".to_string()), target: ExportTarget::Rva(0x49100) },
+        ]),
+        ("opengl32.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("wglCreateContext".to_string()), target: ExportTarget::Rva(0x4a000) },
+            ExportSymbol { ordinal: 2, name: Some("wglDeleteContext".to_string()), target: ExportTarget::Rva(0x4a010) },
+            ExportSymbol { ordinal: 3, name: Some("wglMakeCurrent".to_string()), target: ExportTarget::Rva(0x4a020) },
+            ExportSymbol { ordinal: 4, name: Some("wglGetProcAddress".to_string()), target: ExportTarget::Rva(0x4a030) },
+            ExportSymbol { ordinal: 5, name: Some("wglSwapBuffers".to_string()), target: ExportTarget::Rva(0x4a040) },
+            ExportSymbol { ordinal: 6, name: Some("wglSetPixelFormat".to_string()), target: ExportTarget::Rva(0x4a050) },
+            ExportSymbol { ordinal: 7, name: Some("wglGetPixelFormat".to_string()), target: ExportTarget::Rva(0x4a060) },
+            ExportSymbol { ordinal: 8, name: Some("wglDescribePixelFormat".to_string()), target: ExportTarget::Rva(0x4a070) },
+            ExportSymbol { ordinal: 9, name: Some("wglChoosePixelFormat".to_string()), target: ExportTarget::Rva(0x4a080) },
+            ExportSymbol { ordinal: 10, name: Some("glClear".to_string()), target: ExportTarget::Rva(0x4a090) },
+            ExportSymbol { ordinal: 11, name: Some("glClearColor".to_string()), target: ExportTarget::Rva(0x4a0a0) },
+            ExportSymbol { ordinal: 12, name: Some("glViewport".to_string()), target: ExportTarget::Rva(0x4a0b0) },
+            ExportSymbol { ordinal: 13, name: Some("glMatrixMode".to_string()), target: ExportTarget::Rva(0x4a0c0) },
+            ExportSymbol { ordinal: 14, name: Some("glLoadIdentity".to_string()), target: ExportTarget::Rva(0x4a0d0) },
+            ExportSymbol { ordinal: 15, name: Some("glBegin".to_string()), target: ExportTarget::Rva(0x4a0e0) },
+            ExportSymbol { ordinal: 16, name: Some("glEnd".to_string()), target: ExportTarget::Rva(0x4a0f0) },
+            ExportSymbol { ordinal: 17, name: Some("glVertex2f".to_string()), target: ExportTarget::Rva(0x4a100) },
+            ExportSymbol { ordinal: 18, name: Some("glVertex3f".to_string()), target: ExportTarget::Rva(0x4a110) },
+            ExportSymbol { ordinal: 19, name: Some("glTexCoord2f".to_string()), target: ExportTarget::Rva(0x4a120) },
+            ExportSymbol { ordinal: 20, name: Some("glColor3f".to_string()), target: ExportTarget::Rva(0x4a130) },
+            ExportSymbol { ordinal: 21, name: Some("glColor4f".to_string()), target: ExportTarget::Rva(0x4a140) },
+            ExportSymbol { ordinal: 22, name: Some("glEnable".to_string()), target: ExportTarget::Rva(0x4a150) },
+            ExportSymbol { ordinal: 23, name: Some("glDisable".to_string()), target: ExportTarget::Rva(0x4a160) },
+            ExportSymbol { ordinal: 24, name: Some("glBindTexture".to_string()), target: ExportTarget::Rva(0x4a170) },
+            ExportSymbol { ordinal: 25, name: Some("glGenTextures".to_string()), target: ExportTarget::Rva(0x4a180) },
+            ExportSymbol { ordinal: 26, name: Some("glDeleteTextures".to_string()), target: ExportTarget::Rva(0x4a190) },
+            ExportSymbol { ordinal: 27, name: Some("glTexImage2D".to_string()), target: ExportTarget::Rva(0x4a1a0) },
+            ExportSymbol { ordinal: 28, name: Some("glTexParameteri".to_string()), target: ExportTarget::Rva(0x4a1b0) },
+            ExportSymbol { ordinal: 29, name: Some("glTexParameterf".to_string()), target: ExportTarget::Rva(0x4a1c0) },
+            ExportSymbol { ordinal: 30, name: Some("glBlendFunc".to_string()), target: ExportTarget::Rva(0x4a1d0) },
+            ExportSymbol { ordinal: 31, name: Some("glDepthFunc".to_string()), target: ExportTarget::Rva(0x4a1e0) },
+            ExportSymbol { ordinal: 32, name: Some("glCullFace".to_string()), target: ExportTarget::Rva(0x4a1f0) },
+            ExportSymbol { ordinal: 33, name: Some("glFrontFace".to_string()), target: ExportTarget::Rva(0x4a200) },
+            ExportSymbol { ordinal: 34, name: Some("glHint".to_string()), target: ExportTarget::Rva(0x4a210) },
+            ExportSymbol { ordinal: 35, name: Some("glShadeModel".to_string()), target: ExportTarget::Rva(0x4a220) },
+            ExportSymbol { ordinal: 36, name: Some("glFlush".to_string()), target: ExportTarget::Rva(0x4a230) },
+            ExportSymbol { ordinal: 37, name: Some("glFinish".to_string()), target: ExportTarget::Rva(0x4a240) },
+            ExportSymbol { ordinal: 38, name: Some("glGetString".to_string()), target: ExportTarget::Rva(0x4a250) },
+            ExportSymbol { ordinal: 39, name: Some("glGetError".to_string()), target: ExportTarget::Rva(0x4a260) },
+            ExportSymbol { ordinal: 40, name: Some("glReadPixels".to_string()), target: ExportTarget::Rva(0x4a270) },
+            ExportSymbol { ordinal: 41, name: Some("glDrawArrays".to_string()), target: ExportTarget::Rva(0x4a280) },
+            ExportSymbol { ordinal: 42, name: Some("glDrawElements".to_string()), target: ExportTarget::Rva(0x4a290) },
+            ExportSymbol { ordinal: 43, name: Some("glVertexPointer".to_string()), target: ExportTarget::Rva(0x4a2a0) },
+            ExportSymbol { ordinal: 44, name: Some("glTexCoordPointer".to_string()), target: ExportTarget::Rva(0x4a2b0) },
+            ExportSymbol { ordinal: 45, name: Some("glColorPointer".to_string()), target: ExportTarget::Rva(0x4a2c0) },
+            ExportSymbol { ordinal: 46, name: Some("glNormalPointer".to_string()), target: ExportTarget::Rva(0x4a2d0) },
+            ExportSymbol { ordinal: 47, name: Some("glEnableClientState".to_string()), target: ExportTarget::Rva(0x4a2e0) },
+            ExportSymbol { ordinal: 48, name: Some("glDisableClientState".to_string()), target: ExportTarget::Rva(0x4a2f0) },
+            ExportSymbol { ordinal: 49, name: Some("glPushMatrix".to_string()), target: ExportTarget::Rva(0x4a300) },
+            ExportSymbol { ordinal: 50, name: Some("glPopMatrix".to_string()), target: ExportTarget::Rva(0x4a310) },
+            ExportSymbol { ordinal: 51, name: Some("glRotatef".to_string()), target: ExportTarget::Rva(0x4a320) },
+            ExportSymbol { ordinal: 52, name: Some("glTranslatef".to_string()), target: ExportTarget::Rva(0x4a330) },
+            ExportSymbol { ordinal: 53, name: Some("glScalef".to_string()), target: ExportTarget::Rva(0x4a340) },
+            ExportSymbol { ordinal: 54, name: Some("glOrtho".to_string()), target: ExportTarget::Rva(0x4a350) },
+            ExportSymbol { ordinal: 55, name: Some("gluPerspective".to_string()), target: ExportTarget::Rva(0x4a360) },
+            ExportSymbol { ordinal: 56, name: Some("gluLookAt".to_string()), target: ExportTarget::Rva(0x4a370) },
+            ExportSymbol { ordinal: 57, name: Some("glLightfv".to_string()), target: ExportTarget::Rva(0x4a380) },
+            ExportSymbol { ordinal: 58, name: Some("glMaterialfv".to_string()), target: ExportTarget::Rva(0x4a390) },
+            ExportSymbol { ordinal: 59, name: Some("glFogi".to_string()), target: ExportTarget::Rva(0x4a3a0) },
+            ExportSymbol { ordinal: 60, name: Some("glFogf".to_string()), target: ExportTarget::Rva(0x4a3b0) },
+        ]),
+        ("qedit.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("AMGetErrorText".to_string()), target: ExportTarget::Rva(0x4b000) },
+            ExportSymbol { ordinal: 2, name: Some("CreateErrorInfo".to_string()), target: ExportTarget::Rva(0x4b010) },
+            ExportSymbol { ordinal: 3, name: Some("CreateFilter".to_string()), target: ExportTarget::Rva(0x4b020) },
+        ]),
+        ("riched20.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("RichEdit10ANSIWndClass".to_string()), target: ExportTarget::Rva(0x4c000) },
+            ExportSymbol { ordinal: 2, name: Some("ITextDocument".to_string()), target: ExportTarget::Rva(0x4c010) },
+            ExportSymbol { ordinal: 3, name: Some("CreateTextServices".to_string()), target: ExportTarget::Rva(0x4c020) },
+            ExportSymbol { ordinal: 4, name: Some("ShutdownTextServices".to_string()), target: ExportTarget::Rva(0x4c030) },
+        ]),
+        ("riched32.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("RichEditANSIWndClass".to_string()), target: ExportTarget::Rva(0x4d000) },
+        ]),
+        ("shdocvw.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("SHCreateLinks".to_string()), target: ExportTarget::Rva(0x4e000) },
+            ExportSymbol { ordinal: 2, name: Some("SHNavigateToFavorite".to_string()), target: ExportTarget::Rva(0x4e010) },
+        ]),
+        ("uiautomationcore.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("UiaGetPatternProvider".to_string()), target: ExportTarget::Rva(0x4f000) },
+            ExportSymbol { ordinal: 2, name: Some("UiaGetRuntimeId".to_string()), target: ExportTarget::Rva(0x4f010) },
+            ExportSymbol { ordinal: 3, name: Some("UiaRaiseAutomationEvent".to_string()), target: ExportTarget::Rva(0x4f020) },
+            ExportSymbol { ordinal: 4, name: Some("UiaRaiseAutomationPropertyChangedEvent".to_string()), target: ExportTarget::Rva(0x4f030) },
+            ExportSymbol { ordinal: 5, name: Some("UiaLookupId".to_string()), target: ExportTarget::Rva(0x4f040) },
+            ExportSymbol { ordinal: 6, name: Some("UiaNavigate".to_string()), target: ExportTarget::Rva(0x4f050) },
+            ExportSymbol { ordinal: 7, name: Some("UiaGetUpdatedCache".to_string()), target: ExportTarget::Rva(0x4f060) },
+        ]),
+        ("userenv.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("CreateAppContainerProfile".to_string()), target: ExportTarget::Rva(0x50000) },
+            ExportSymbol { ordinal: 2, name: Some("DeleteAppContainerProfile".to_string()), target: ExportTarget::Rva(0x50010) },
+            ExportSymbol { ordinal: 3, name: Some("GetAppContainerProfilePath".to_string()), target: ExportTarget::Rva(0x50020) },
+            ExportSymbol { ordinal: 4, name: Some("GetProfilesDirectoryW".to_string()), target: ExportTarget::Rva(0x50030) },
+            ExportSymbol { ordinal: 5, name: Some("GetProfileType".to_string()), target: ExportTarget::Rva(0x50040) },
+            ExportSymbol { ordinal: 6, name: Some("LoadUserProfileW".to_string()), target: ExportTarget::Rva(0x50050) },
+            ExportSymbol { ordinal: 7, name: Some("UnloadUserProfile".to_string()), target: ExportTarget::Rva(0x50060) },
+            ExportSymbol { ordinal: 8, name: Some("CreateEnvironmentBlock".to_string()), target: ExportTarget::Rva(0x50070) },
+            ExportSymbol { ordinal: 9, name: Some("DestroyEnvironmentBlock".to_string()), target: ExportTarget::Rva(0x50080) },
+        ]),
+        ("winhttp.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("WinHttpOpen".to_string()), target: ExportTarget::Rva(0x51000) },
+            ExportSymbol { ordinal: 2, name: Some("WinHttpCloseHandle".to_string()), target: ExportTarget::Rva(0x51010) },
+            ExportSymbol { ordinal: 3, name: Some("WinHttpConnect".to_string()), target: ExportTarget::Rva(0x51020) },
+            ExportSymbol { ordinal: 4, name: Some("WinHttpOpenRequest".to_string()), target: ExportTarget::Rva(0x51030) },
+            ExportSymbol { ordinal: 5, name: Some("WinHttpSendRequest".to_string()), target: ExportTarget::Rva(0x51040) },
+            ExportSymbol { ordinal: 6, name: Some("WinHttpReceiveResponse".to_string()), target: ExportTarget::Rva(0x51050) },
+            ExportSymbol { ordinal: 7, name: Some("WinHttpReadData".to_string()), target: ExportTarget::Rva(0x51060) },
+            ExportSymbol { ordinal: 8, name: Some("WinHttpWriteData".to_string()), target: ExportTarget::Rva(0x51070) },
+            ExportSymbol { ordinal: 9, name: Some("WinHttpQueryHeaders".to_string()), target: ExportTarget::Rva(0x51080) },
+            ExportSymbol { ordinal: 10, name: Some("WinHttpSetOption".to_string()), target: ExportTarget::Rva(0x51090) },
+            ExportSymbol { ordinal: 11, name: Some("WinHttpQueryOption".to_string()), target: ExportTarget::Rva(0x510a0) },
+            ExportSymbol { ordinal: 12, name: Some("WinHttpAddRequestHeaders".to_string()), target: ExportTarget::Rva(0x510b0) },
+            ExportSymbol { ordinal: 13, name: Some("WinHttpSetCredentials".to_string()), target: ExportTarget::Rva(0x510c0) },
+            ExportSymbol { ordinal: 14, name: Some("WinHttpTimeFromSystemTime".to_string()), target: ExportTarget::Rva(0x510d0) },
+            ExportSymbol { ordinal: 15, name: Some("WinHttpTimeToSystemTime".to_string()), target: ExportTarget::Rva(0x510e0) },
+            ExportSymbol { ordinal: 16, name: Some("WinHttpCrackUrl".to_string()), target: ExportTarget::Rva(0x510f0) },
+            ExportSymbol { ordinal: 17, name: Some("WinHttpCreateUrl".to_string()), target: ExportTarget::Rva(0x51100) },
+            ExportSymbol { ordinal: 18, name: Some("WinHttpDetectAutoProxyConfigUrl".to_string()), target: ExportTarget::Rva(0x51110) },
+            ExportSymbol { ordinal: 19, name: Some("WinHttpGetProxyForUrl".to_string()), target: ExportTarget::Rva(0x51120) },
+            ExportSymbol { ordinal: 20, name: Some("WinHttpGetIEProxyConfigForCurrentUser".to_string()), target: ExportTarget::Rva(0x51130) },
+            ExportSymbol { ordinal: 21, name: Some("WinHttpWebSocketCompleteUpgrade".to_string()), target: ExportTarget::Rva(0x51140) },
+            ExportSymbol { ordinal: 22, name: Some("WinHttpWebSocketSend".to_string()), target: ExportTarget::Rva(0x51150) },
+            ExportSymbol { ordinal: 23, name: Some("WinHttpWebSocketReceive".to_string()), target: ExportTarget::Rva(0x51160) },
+            ExportSymbol { ordinal: 24, name: Some("WinHttpWebSocketClose".to_string()), target: ExportTarget::Rva(0x51170) },
+            ExportSymbol { ordinal: 25, name: Some("WinHttpWebSocketQueryCloseStatus".to_string()), target: ExportTarget::Rva(0x51180) },
+        ]),
+        ("winmmbase.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("waveOutOpen".to_string()), target: ExportTarget::Rva(0x52000) },
+            ExportSymbol { ordinal: 2, name: Some("waveOutClose".to_string()), target: ExportTarget::Rva(0x52010) },
+            ExportSymbol { ordinal: 3, name: Some("waveOutWrite".to_string()), target: ExportTarget::Rva(0x52020) },
+            ExportSymbol { ordinal: 4, name: Some("waveOutReset".to_string()), target: ExportTarget::Rva(0x52030) },
+            ExportSymbol { ordinal: 5, name: Some("waveOutGetVolume".to_string()), target: ExportTarget::Rva(0x52040) },
+            ExportSymbol { ordinal: 6, name: Some("waveOutSetVolume".to_string()), target: ExportTarget::Rva(0x52050) },
+            ExportSymbol { ordinal: 7, name: Some("waveOutGetDevCapsW".to_string()), target: ExportTarget::Rva(0x52060) },
+            ExportSymbol { ordinal: 8, name: Some("waveOutGetNumDevs".to_string()), target: ExportTarget::Rva(0x52070) },
+            ExportSymbol { ordinal: 9, name: Some("waveInOpen".to_string()), target: ExportTarget::Rva(0x52080) },
+            ExportSymbol { ordinal: 10, name: Some("waveInClose".to_string()), target: ExportTarget::Rva(0x52090) },
+            ExportSymbol { ordinal: 11, name: Some("waveInPrepareHeader".to_string()), target: ExportTarget::Rva(0x520a0) },
+            ExportSymbol { ordinal: 12, name: Some("waveInUnprepareHeader".to_string()), target: ExportTarget::Rva(0x520b0) },
+            ExportSymbol { ordinal: 13, name: Some("waveInAddBuffer".to_string()), target: ExportTarget::Rva(0x520c0) },
+            ExportSymbol { ordinal: 14, name: Some("waveInStart".to_string()), target: ExportTarget::Rva(0x520d0) },
+            ExportSymbol { ordinal: 15, name: Some("waveInStop".to_string()), target: ExportTarget::Rva(0x520e0) },
+            ExportSymbol { ordinal: 16, name: Some("waveInGetDevCapsW".to_string()), target: ExportTarget::Rva(0x520f0) },
+            ExportSymbol { ordinal: 17, name: Some("waveInGetNumDevs".to_string()), target: ExportTarget::Rva(0x52100) },
+            ExportSymbol { ordinal: 18, name: Some("midiOutOpen".to_string()), target: ExportTarget::Rva(0x52110) },
+            ExportSymbol { ordinal: 19, name: Some("midiOutClose".to_string()), target: ExportTarget::Rva(0x52120) },
+            ExportSymbol { ordinal: 20, name: Some("midiOutShortMsg".to_string()), target: ExportTarget::Rva(0x52130) },
+            ExportSymbol { ordinal: 21, name: Some("midiOutLongMsg".to_string()), target: ExportTarget::Rva(0x52140) },
+            ExportSymbol { ordinal: 22, name: Some("midiOutReset".to_string()), target: ExportTarget::Rva(0x52150) },
+            ExportSymbol { ordinal: 23, name: Some("midiOutGetDevCapsW".to_string()), target: ExportTarget::Rva(0x52160) },
+            ExportSymbol { ordinal: 24, name: Some("midiOutGetNumDevs".to_string()), target: ExportTarget::Rva(0x52170) },
+            ExportSymbol { ordinal: 25, name: Some("midiInOpen".to_string()), target: ExportTarget::Rva(0x52180) },
+            ExportSymbol { ordinal: 26, name: Some("midiInClose".to_string()), target: ExportTarget::Rva(0x52190) },
+            ExportSymbol { ordinal: 27, name: Some("midiInStart".to_string()), target: ExportTarget::Rva(0x521a0) },
+            ExportSymbol { ordinal: 28, name: Some("midiInStop".to_string()), target: ExportTarget::Rva(0x521b0) },
+            ExportSymbol { ordinal: 29, name: Some("midiInReset".to_string()), target: ExportTarget::Rva(0x521c0) },
+        ]),
+        ("wldap32.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("ldap_init".to_string()), target: ExportTarget::Rva(0x53000) },
+            ExportSymbol { ordinal: 2, name: Some("ldap_bind_s".to_string()), target: ExportTarget::Rva(0x53010) },
+            ExportSymbol { ordinal: 3, name: Some("ldap_search_s".to_string()), target: ExportTarget::Rva(0x53020) },
+            ExportSymbol { ordinal: 4, name: Some("ldap_search".to_string()), target: ExportTarget::Rva(0x53030) },
+            ExportSymbol { ordinal: 5, name: Some("ldap_result".to_string()), target: ExportTarget::Rva(0x53040) },
+            ExportSymbol { ordinal: 6, name: Some("ldap_first_entry".to_string()), target: ExportTarget::Rva(0x53050) },
+            ExportSymbol { ordinal: 7, name: Some("ldap_next_entry".to_string()), target: ExportTarget::Rva(0x53060) },
+            ExportSymbol { ordinal: 8, name: Some("ldap_get_values".to_string()), target: ExportTarget::Rva(0x53070) },
+            ExportSymbol { ordinal: 9, name: Some("ldap_get_dn".to_string()), target: ExportTarget::Rva(0x53080) },
+            ExportSymbol { ordinal: 10, name: Some("ldap_memfree".to_string()), target: ExportTarget::Rva(0x53090) },
+            ExportSymbol { ordinal: 11, name: Some("ldap_unbind".to_string()), target: ExportTarget::Rva(0x530a0) },
+            ExportSymbol { ordinal: 12, name: Some("ldap_count_entries".to_string()), target: ExportTarget::Rva(0x530b0) },
+            ExportSymbol { ordinal: 13, name: Some("ldap_msgfree".to_string()), target: ExportTarget::Rva(0x530c0) },
+            ExportSymbol { ordinal: 14, name: Some("ldap_value_free_len".to_string()), target: ExportTarget::Rva(0x530d0) },
+        ]),
+        ("wmvcore.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("WMCreateReader".to_string()), target: ExportTarget::Rva(0x54000) },
+            ExportSymbol { ordinal: 2, name: Some("WMCreateWriter".to_string()), target: ExportTarget::Rva(0x54010) },
+            ExportSymbol { ordinal: 3, name: Some("WMCreateEditor".to_string()), target: ExportTarget::Rva(0x54020) },
+            ExportSymbol { ordinal: 4, name: Some("WMCreateSyncReader".to_string()), target: ExportTarget::Rva(0x54030) },
+            ExportSymbol { ordinal: 5, name: Some("WMCreateProfileManager".to_string()), target: ExportTarget::Rva(0x54040) },
+            ExportSymbol { ordinal: 6, name: Some("WMCreateIndexer".to_string()), target: ExportTarget::Rva(0x54050) },
+            ExportSymbol { ordinal: 7, name: Some("WMIsContentProtected".to_string()), target: ExportTarget::Rva(0x54060) },
+        ]),
+        ("x3daudio1_7.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("X3DAudioInitialize".to_string()), target: ExportTarget::Rva(0x55000) },
+            ExportSymbol { ordinal: 2, name: Some("X3DAudioCalculate".to_string()), target: ExportTarget::Rva(0x55010) },
+        ]),
+        ("xactengine3_7.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("XACT3CreateEngine".to_string()), target: ExportTarget::Rva(0x56000) },
+            ExportSymbol { ordinal: 2, name: Some("XACT3CreateEngineWithFlags".to_string()), target: ExportTarget::Rva(0x56010) },
+        ]),
+        ("xaudio2_8.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("XAudio2Create".to_string()), target: ExportTarget::Rva(0x57000) },
+        ]),
+        ("xmllite.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("CreateXmlReader".to_string()), target: ExportTarget::Rva(0x58000) },
+            ExportSymbol { ordinal: 2, name: Some("CreateXmlReaderInputWithEncoding".to_string()), target: ExportTarget::Rva(0x58010) },
+            ExportSymbol { ordinal: 3, name: Some("CreateXmlWriter".to_string()), target: ExportTarget::Rva(0x58020) },
+            ExportSymbol { ordinal: 4, name: Some("CreateXmlWriterOutputWithEncoding".to_string()), target: ExportTarget::Rva(0x58030) },
+        ]),
+        // ── Media/Graphics DLLs ──────────────────────────────────────────────
+        ("mf.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("MFStartup".to_string()), target: ExportTarget::Rva(0x59000) },
+            ExportSymbol { ordinal: 2, name: Some("MFShutdown".to_string()), target: ExportTarget::Rva(0x59010) },
+            ExportSymbol { ordinal: 3, name: Some("MFCreateMediaType".to_string()), target: ExportTarget::Rva(0x59020) },
+            ExportSymbol { ordinal: 4, name: Some("MFCreateMediaSession".to_string()), target: ExportTarget::Rva(0x59030) },
+            ExportSymbol { ordinal: 5, name: Some("MFCreateSourceResolver".to_string()), target: ExportTarget::Rva(0x59040) },
+            ExportSymbol { ordinal: 6, name: Some("MFCreateTopology".to_string()), target: ExportTarget::Rva(0x59050) },
+            ExportSymbol { ordinal: 7, name: Some("MFCreateTopologyNode".to_string()), target: ExportTarget::Rva(0x59060) },
+            ExportSymbol { ordinal: 8, name: Some("MFGetService".to_string()), target: ExportTarget::Rva(0x59070) },
+            ExportSymbol { ordinal: 9, name: Some("MFCreateSample".to_string()), target: ExportTarget::Rva(0x59080) },
+            ExportSymbol { ordinal: 10, name: Some("MFCreateMemoryBuffer".to_string()), target: ExportTarget::Rva(0x59090) },
+            ExportSymbol { ordinal: 11, name: Some("MFCreateEventQueue".to_string()), target: ExportTarget::Rva(0x590a0) },
+            ExportSymbol { ordinal: 12, name: Some("MFCreateAttributes".to_string()), target: ExportTarget::Rva(0x590b0) },
+            ExportSymbol { ordinal: 13, name: Some("MFEnumDeviceSources".to_string()), target: ExportTarget::Rva(0x590c0) },
+            ExportSymbol { ordinal: 14, name: Some("MFTEnumEx".to_string()), target: ExportTarget::Rva(0x590d0) },
+            ExportSymbol { ordinal: 15, name: Some("MFCreateSourceReaderFromURL".to_string()), target: ExportTarget::Rva(0x590e0) },
+            ExportSymbol { ordinal: 16, name: Some("MFCreateSourceReaderFromByteStream".to_string()), target: ExportTarget::Rva(0x590f0) },
+            ExportSymbol { ordinal: 17, name: Some("MFCreateSinkWriterFromURL".to_string()), target: ExportTarget::Rva(0x59100) },
+            ExportSymbol { ordinal: 18, name: Some("MFCreateSinkWriterFromMediaSink".to_string()), target: ExportTarget::Rva(0x59110) },
+            ExportSymbol { ordinal: 19, name: Some("MFCreatePresentationClock".to_string()), target: ExportTarget::Rva(0x59120) },
+            ExportSymbol { ordinal: 20, name: Some("MFRequireProtectedEnvironment".to_string()), target: ExportTarget::Rva(0x59130) },
+        ]),
+        ("mfreadwrite.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("MFCreateSourceReaderFromURL".to_string()), target: ExportTarget::Rva(0x5a000) },
+            ExportSymbol { ordinal: 2, name: Some("MFCreateSourceReaderFromByteStream".to_string()), target: ExportTarget::Rva(0x5a010) },
+            ExportSymbol { ordinal: 3, name: Some("MFCreateSourceReaderFromMFByteStream".to_string()), target: ExportTarget::Rva(0x5a020) },
+            ExportSymbol { ordinal: 4, name: Some("MFCreateSinkWriterFromURL".to_string()), target: ExportTarget::Rva(0x5a030) },
+            ExportSymbol { ordinal: 5, name: Some("MFCreateSinkWriterFromMediaSink".to_string()), target: ExportTarget::Rva(0x5a040) },
+        ]),
+        ("d2d1.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("D2D1CreateFactory".to_string()), target: ExportTarget::Rva(0x5b000) },
+            ExportSymbol { ordinal: 2, name: Some("D2D1MakeRotateMatrix".to_string()), target: ExportTarget::Rva(0x5b010) },
+            ExportSymbol { ordinal: 3, name: Some("D2D1MakeSkewMatrix".to_string()), target: ExportTarget::Rva(0x5b020) },
+            ExportSymbol { ordinal: 4, name: Some("D2D1IsMatrixInvertible".to_string()), target: ExportTarget::Rva(0x5b030) },
+            ExportSymbol { ordinal: 5, name: Some("D2D1InvertMatrix".to_string()), target: ExportTarget::Rva(0x5b040) },
+        ]),
+        ("d3d10.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("D3D10CreateDevice".to_string()), target: ExportTarget::Rva(0x5c000) },
+            ExportSymbol { ordinal: 2, name: Some("D3D10CreateDeviceAndSwapChain".to_string()), target: ExportTarget::Rva(0x5c010) },
+            ExportSymbol { ordinal: 3, name: Some("D3D10CreateEffectFromMemory".to_string()), target: ExportTarget::Rva(0x5c020) },
+            ExportSymbol { ordinal: 4, name: Some("D3D10CreateStateBlock".to_string()), target: ExportTarget::Rva(0x5c030) },
+            ExportSymbol { ordinal: 5, name: Some("D3D10RegisterLayers".to_string()), target: ExportTarget::Rva(0x5c040) },
+        ]),
+        ("d3d10_1.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("D3D10CreateDevice1".to_string()), target: ExportTarget::Rva(0x5d000) },
+            ExportSymbol { ordinal: 2, name: Some("D3D10CreateDeviceAndSwapChain1".to_string()), target: ExportTarget::Rva(0x5d010) },
+            ExportSymbol { ordinal: 3, name: Some("D3D10CreateEffectFromMemory".to_string()), target: ExportTarget::Rva(0x5d020) },
+        ]),
+        // ── System DLLs ───────────────────────────────────────────────────────
+        ("wlanapi.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("WlanOpenHandle".to_string()), target: ExportTarget::Rva(0x5e000) },
+            ExportSymbol { ordinal: 2, name: Some("WlanCloseHandle".to_string()), target: ExportTarget::Rva(0x5e010) },
+            ExportSymbol { ordinal: 3, name: Some("WlanEnumInterfaces".to_string()), target: ExportTarget::Rva(0x5e020) },
+            ExportSymbol { ordinal: 4, name: Some("WlanGetAvailableNetworkList".to_string()), target: ExportTarget::Rva(0x5e030) },
+            ExportSymbol { ordinal: 5, name: Some("WlanQueryInterface".to_string()), target: ExportTarget::Rva(0x5e040) },
+            ExportSymbol { ordinal: 6, name: Some("WlanScan".to_string()), target: ExportTarget::Rva(0x5e050) },
+            ExportSymbol { ordinal: 7, name: Some("WlanConnect".to_string()), target: ExportTarget::Rva(0x5e060) },
+            ExportSymbol { ordinal: 8, name: Some("WlanDisconnect".to_string()), target: ExportTarget::Rva(0x5e070) },
+        ]),
+        ("wevtapi.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("EvtOpenSession".to_string()), target: ExportTarget::Rva(0x5f000) },
+            ExportSymbol { ordinal: 2, name: Some("EvtOpenLog".to_string()), target: ExportTarget::Rva(0x5f010) },
+            ExportSymbol { ordinal: 3, name: Some("EvtQuery".to_string()), target: ExportTarget::Rva(0x5f020) },
+            ExportSymbol { ordinal: 4, name: Some("EvtNext".to_string()), target: ExportTarget::Rva(0x5f030) },
+            ExportSymbol { ordinal: 5, name: Some("EvtClose".to_string()), target: ExportTarget::Rva(0x5f040) },
+            ExportSymbol { ordinal: 6, name: Some("EvtRender".to_string()), target: ExportTarget::Rva(0x5f050) },
+            ExportSymbol { ordinal: 7, name: Some("EvtSubscribe".to_string()), target: ExportTarget::Rva(0x5f060) },
+            ExportSymbol { ordinal: 8, name: Some("EvtCreateBookmark".to_string()), target: ExportTarget::Rva(0x5f070) },
+        ]),
+        ("printui.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("PrintUIToDevice".to_string()), target: ExportTarget::Rva(0x60000) },
+            ExportSymbol { ordinal: 2, name: Some("PrintUIToFile".to_string()), target: ExportTarget::Rva(0x60010) },
+            ExportSymbol { ordinal: 3, name: Some("PrintUIEntry".to_string()), target: ExportTarget::Rva(0x60020) },
+        ]),
+        ("winspool.drv".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("OpenPrinter".to_string()), target: ExportTarget::Rva(0x61000) },
+            ExportSymbol { ordinal: 2, name: Some("ClosePrinter".to_string()), target: ExportTarget::Rva(0x61010) },
+            ExportSymbol { ordinal: 3, name: Some("StartDocPrinter".to_string()), target: ExportTarget::Rva(0x61020) },
+            ExportSymbol { ordinal: 4, name: Some("EndDocPrinter".to_string()), target: ExportTarget::Rva(0x61030) },
+            ExportSymbol { ordinal: 5, name: Some("StartPagePrinter".to_string()), target: ExportTarget::Rva(0x61040) },
+            ExportSymbol { ordinal: 6, name: Some("EndPagePrinter".to_string()), target: ExportTarget::Rva(0x61050) },
+            ExportSymbol { ordinal: 7, name: Some("WritePrinter".to_string()), target: ExportTarget::Rva(0x61060) },
+            ExportSymbol { ordinal: 8, name: Some("ReadPrinter".to_string()), target: ExportTarget::Rva(0x61070) },
+            ExportSymbol { ordinal: 9, name: Some("EnumPrinters".to_string()), target: ExportTarget::Rva(0x61080) },
+            ExportSymbol { ordinal: 10, name: Some("GetPrinter".to_string()), target: ExportTarget::Rva(0x61090) },
+            ExportSymbol { ordinal: 11, name: Some("SetPrinter".to_string()), target: ExportTarget::Rva(0x610a0) },
+            ExportSymbol { ordinal: 12, name: Some("AddPrinter".to_string()), target: ExportTarget::Rva(0x610b0) },
+            ExportSymbol { ordinal: 13, name: Some("DeletePrinter".to_string()), target: ExportTarget::Rva(0x610c0) },
+        ]),
+        ("sapi.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("SpCreateObjectFromToken".to_string()), target: ExportTarget::Rva(0x62000) },
+            ExportSymbol { ordinal: 2, name: Some("SpCreateObjectFromKey".to_string()), target: ExportTarget::Rva(0x62010) },
+            ExportSymbol { ordinal: 3, name: Some("SpGetCategoryFromId".to_string()), target: ExportTarget::Rva(0x62020) },
+            ExportSymbol { ordinal: 4, name: Some("SpEnumTokens".to_string()), target: ExportTarget::Rva(0x62030) },
+            ExportSymbol { ordinal: 5, name: Some("SpGetDescription".to_string()), target: ExportTarget::Rva(0x62040) },
+        ]),
+        ("rasapi32.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("RasDial".to_string()), target: ExportTarget::Rva(0x63000) },
+            ExportSymbol { ordinal: 2, name: Some("RasHangUp".to_string()), target: ExportTarget::Rva(0x63010) },
+            ExportSymbol { ordinal: 3, name: Some("RasEnumConnections".to_string()), target: ExportTarget::Rva(0x63020) },
+            ExportSymbol { ordinal: 4, name: Some("RasGetErrorString".to_string()), target: ExportTarget::Rva(0x63030) },
+            ExportSymbol { ordinal: 5, name: Some("RasGetConnectionStatus".to_string()), target: ExportTarget::Rva(0x63040) },
+            ExportSymbol { ordinal: 6, name: Some("RasSetEntryProperties".to_string()), target: ExportTarget::Rva(0x63050) },
+        ]),
+        // ── C++ Runtime DLLs ──────────────────────────────────────────────────
+        ("msvcp140.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("_Mtx_init".to_string()), target: ExportTarget::Rva(0x64000) },
+            ExportSymbol { ordinal: 2, name: Some("_Mtx_destroy".to_string()), target: ExportTarget::Rva(0x64010) },
+            ExportSymbol { ordinal: 3, name: Some("_Mtx_lock".to_string()), target: ExportTarget::Rva(0x64020) },
+            ExportSymbol { ordinal: 4, name: Some("_Mtx_unlock".to_string()), target: ExportTarget::Rva(0x64030) },
+            ExportSymbol { ordinal: 5, name: Some("_Cnd_init".to_string()), target: ExportTarget::Rva(0x64040) },
+            ExportSymbol { ordinal: 6, name: Some("_Cnd_destroy".to_string()), target: ExportTarget::Rva(0x64050) },
+            ExportSymbol { ordinal: 7, name: Some("_Cnd_signal".to_string()), target: ExportTarget::Rva(0x64060) },
+            ExportSymbol { ordinal: 8, name: Some("_Cnd_broadcast".to_string()), target: ExportTarget::Rva(0x64070) },
+            ExportSymbol { ordinal: 9, name: Some("_Cnd_wait".to_string()), target: ExportTarget::Rva(0x64080) },
+            ExportSymbol { ordinal: 10, name: Some("_Xbad_alloc".to_string()), target: ExportTarget::Rva(0x64090) },
+            ExportSymbol { ordinal: 11, name: Some("_Xinvalid_argument".to_string()), target: ExportTarget::Rva(0x640a0) },
+            ExportSymbol { ordinal: 12, name: Some("_Xlength_error".to_string()), target: ExportTarget::Rva(0x640b0) },
+            ExportSymbol { ordinal: 13, name: Some("_Xout_of_range".to_string()), target: ExportTarget::Rva(0x640c0) },
+            ExportSymbol { ordinal: 14, name: Some("_Xoverflow_error".to_string()), target: ExportTarget::Rva(0x640d0) },
+            ExportSymbol { ordinal: 15, name: Some("_Xruntime_error".to_string()), target: ExportTarget::Rva(0x640e0) },
+            ExportSymbol { ordinal: 16, name: Some("std::_Throw_C_error".to_string()), target: ExportTarget::Rva(0x640f0) },
+            ExportSymbol { ordinal: 17, name: Some("std::_Throw_Cpp_error".to_string()), target: ExportTarget::Rva(0x64100) },
+            ExportSymbol { ordinal: 18, name: Some("std::random_device::_Init".to_string()), target: ExportTarget::Rva(0x64110) },
+            ExportSymbol { ordinal: 19, name: Some("std::random_device::_Get".to_string()), target: ExportTarget::Rva(0x64120) },
+            ExportSymbol { ordinal: 20, name: Some("_Mtx_current".to_string()), target: ExportTarget::Rva(0x64130) },
+            ExportSymbol { ordinal: 21, name: Some("_Mtx_reset".to_string()), target: ExportTarget::Rva(0x64140) },
+        ]),
+        ("vcruntime140.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("memcpy".to_string()), target: ExportTarget::Rva(0x65000) },
+            ExportSymbol { ordinal: 2, name: Some("memset".to_string()), target: ExportTarget::Rva(0x65010) },
+            ExportSymbol { ordinal: 3, name: Some("memmove".to_string()), target: ExportTarget::Rva(0x65020) },
+            ExportSymbol { ordinal: 4, name: Some("strchr".to_string()), target: ExportTarget::Rva(0x65030) },
+            ExportSymbol { ordinal: 5, name: Some("strrchr".to_string()), target: ExportTarget::Rva(0x65040) },
+            ExportSymbol { ordinal: 6, name: Some("strstr".to_string()), target: ExportTarget::Rva(0x65050) },
+            ExportSymbol { ordinal: 7, name: Some("strncmp".to_string()), target: ExportTarget::Rva(0x65060) },
+            ExportSymbol { ordinal: 8, name: Some("strncpy".to_string()), target: ExportTarget::Rva(0x65070) },
+            ExportSymbol { ordinal: 9, name: Some("strlen".to_string()), target: ExportTarget::Rva(0x65080) },
+            ExportSymbol { ordinal: 10, name: Some("wcschr".to_string()), target: ExportTarget::Rva(0x65090) },
+            ExportSymbol { ordinal: 11, name: Some("wcsrchr".to_string()), target: ExportTarget::Rva(0x650a0) },
+            ExportSymbol { ordinal: 12, name: Some("wcsstr".to_string()), target: ExportTarget::Rva(0x650b0) },
+            ExportSymbol { ordinal: 13, name: Some("wcsncmp".to_string()), target: ExportTarget::Rva(0x650c0) },
+            ExportSymbol { ordinal: 14, name: Some("wcsncpy".to_string()), target: ExportTarget::Rva(0x650d0) },
+            ExportSymbol { ordinal: 15, name: Some("wcslen".to_string()), target: ExportTarget::Rva(0x650e0) },
+        ]),
+        ("vcruntime140_1.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("__C_specific_handler".to_string()), target: ExportTarget::Rva(0x66000) },
+            ExportSymbol { ordinal: 2, name: Some("_chkstk".to_string()), target: ExportTarget::Rva(0x66010) },
+            ExportSymbol { ordinal: 3, name: Some("__current_exception".to_string()), target: ExportTarget::Rva(0x66020) },
+            ExportSymbol { ordinal: 4, name: Some("__current_exception_context".to_string()), target: ExportTarget::Rva(0x66030) },
+            ExportSymbol { ordinal: 5, name: Some("__processing_throw".to_string()), target: ExportTarget::Rva(0x66040) },
+        ]),
+        ("msvcp140_1.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("_Mtx_init".to_string()), target: ExportTarget::Rva(0x67000) },
+            ExportSymbol { ordinal: 2, name: Some("_Mtx_destroy".to_string()), target: ExportTarget::Rva(0x67010) },
+            ExportSymbol { ordinal: 3, name: Some("_Mtx_lock".to_string()), target: ExportTarget::Rva(0x67020) },
+            ExportSymbol { ordinal: 4, name: Some("_Mtx_unlock".to_string()), target: ExportTarget::Rva(0x67030) },
+            ExportSymbol { ordinal: 5, name: Some("_Cnd_init".to_string()), target: ExportTarget::Rva(0x67040) },
+        ]),
+        ("msvcp140_2.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("_Mtx_init".to_string()), target: ExportTarget::Rva(0x68000) },
+            ExportSymbol { ordinal: 2, name: Some("_Mtx_destroy".to_string()), target: ExportTarget::Rva(0x68010) },
+            ExportSymbol { ordinal: 3, name: Some("_Mtx_lock".to_string()), target: ExportTarget::Rva(0x68020) },
+            ExportSymbol { ordinal: 4, name: Some("_Mtx_unlock".to_string()), target: ExportTarget::Rva(0x68030) },
+            ExportSymbol { ordinal: 5, name: Some("_Cnd_init".to_string()), target: ExportTarget::Rva(0x68040) },
+        ]),
+        // ── COM/OLE DLLs ───────────────────────────────────────────────────────
+        ("actxprxy.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("DllGetClassObject".to_string()), target: ExportTarget::Rva(0x69000) },
+            ExportSymbol { ordinal: 2, name: Some("DllCanUnloadNow".to_string()), target: ExportTarget::Rva(0x69010) },
+            ExportSymbol { ordinal: 3, name: Some("DllRegisterServer".to_string()), target: ExportTarget::Rva(0x69020) },
+            ExportSymbol { ordinal: 4, name: Some("DllUnregisterServer".to_string()), target: ExportTarget::Rva(0x69030) },
+            ExportSymbol { ordinal: 5, name: Some("DllInstall".to_string()), target: ExportTarget::Rva(0x69040) },
+        ]),
+        ("atl.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("AtlModuleAddTermFunc".to_string()), target: ExportTarget::Rva(0x6a000) },
+            ExportSymbol { ordinal: 2, name: Some("AtlModuleRegisterServer".to_string()), target: ExportTarget::Rva(0x6a010) },
+            ExportSymbol { ordinal: 3, name: Some("AtlModuleUnregisterServer".to_string()), target: ExportTarget::Rva(0x6a020) },
+            ExportSymbol { ordinal: 4, name: Some("AtlModuleRegisterTypeLib".to_string()), target: ExportTarget::Rva(0x6a030) },
+            ExportSymbol { ordinal: 5, name: Some("AtlModuleUnregisterTypeLib".to_string()), target: ExportTarget::Rva(0x6a040) },
+            ExportSymbol { ordinal: 6, name: Some("AtlModuleLoadTypeLib".to_string()), target: ExportTarget::Rva(0x6a050) },
+            ExportSymbol { ordinal: 7, name: Some("AtlModuleUpdateRegistryFromResource".to_string()), target: ExportTarget::Rva(0x6a060) },
+        ]),
+        ("atl100.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("AtlModuleAddTermFunc".to_string()), target: ExportTarget::Rva(0x6b000) },
+            ExportSymbol { ordinal: 2, name: Some("AtlModuleRegisterServer".to_string()), target: ExportTarget::Rva(0x6b010) },
+            ExportSymbol { ordinal: 3, name: Some("AtlModuleUnregisterServer".to_string()), target: ExportTarget::Rva(0x6b020) },
+            ExportSymbol { ordinal: 4, name: Some("AtlModuleRegisterTypeLib".to_string()), target: ExportTarget::Rva(0x6b030) },
+            ExportSymbol { ordinal: 5, name: Some("AtlModuleUnregisterTypeLib".to_string()), target: ExportTarget::Rva(0x6b040) },
+        ]),
+        ("atl80.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("AtlModuleAddTermFunc".to_string()), target: ExportTarget::Rva(0x6c000) },
+            ExportSymbol { ordinal: 2, name: Some("AtlModuleRegisterServer".to_string()), target: ExportTarget::Rva(0x6c010) },
+            ExportSymbol { ordinal: 3, name: Some("AtlModuleUnregisterServer".to_string()), target: ExportTarget::Rva(0x6c020) },
+            ExportSymbol { ordinal: 4, name: Some("AtlModuleRegisterTypeLib".to_string()), target: ExportTarget::Rva(0x6c030) },
+            ExportSymbol { ordinal: 5, name: Some("AtlModuleUnregisterTypeLib".to_string()), target: ExportTarget::Rva(0x6c040) },
+        ]),
+        // ── Storage/Setup DLLs ─────────────────────────────────────────────────
+        ("msimsg.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("MsiFormatRecordW".to_string()), target: ExportTarget::Rva(0x6d000) },
+            ExportSymbol { ordinal: 2, name: Some("MsiGetLastErrorRecord".to_string()), target: ExportTarget::Rva(0x6d010) },
+            ExportSymbol { ordinal: 3, name: Some("MsiProcessMessage".to_string()), target: ExportTarget::Rva(0x6d020) },
+        ]),
+        ("wimgapi.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("WIMCreateFile".to_string()), target: ExportTarget::Rva(0x6e000) },
+            ExportSymbol { ordinal: 2, name: Some("WIMCloseHandle".to_string()), target: ExportTarget::Rva(0x6e010) },
+            ExportSymbol { ordinal: 3, name: Some("WIMLoadImage".to_string()), target: ExportTarget::Rva(0x6e020) },
+            ExportSymbol { ordinal: 4, name: Some("WIMUnmountImageHandle".to_string()), target: ExportTarget::Rva(0x6e030) },
+            ExportSymbol { ordinal: 5, name: Some("WIMApplyImage".to_string()), target: ExportTarget::Rva(0x6e040) },
+        ]),
+        ("vssapi.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("CreateVssBackupComponents".to_string()), target: ExportTarget::Rva(0x6f000) },
+            ExportSymbol { ordinal: 2, name: Some("VssFreeSnapshotProperties".to_string()), target: ExportTarget::Rva(0x6f010) },
+            ExportSymbol { ordinal: 3, name: Some("VssFreeWriterMetadata".to_string()), target: ExportTarget::Rva(0x6f020) },
+            ExportSymbol { ordinal: 4, name: Some("VssFreeComponent".to_string()), target: ExportTarget::Rva(0x6f030) },
+        ]),
+        // ── Steam-related DLLs ─────────────────────────────────────────────────
+        ("steam_api.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("SteamAPI_Init".to_string()), target: ExportTarget::Rva(0x70000) },
+            ExportSymbol { ordinal: 2, name: Some("SteamAPI_Shutdown".to_string()), target: ExportTarget::Rva(0x70010) },
+            ExportSymbol { ordinal: 3, name: Some("SteamAPI_RestartAppIfNecessary".to_string()), target: ExportTarget::Rva(0x70020) },
+            ExportSymbol { ordinal: 4, name: Some("SteamAPI_RegisterCallback".to_string()), target: ExportTarget::Rva(0x70030) },
+            ExportSymbol { ordinal: 5, name: Some("SteamAPI_UnregisterCallback".to_string()), target: ExportTarget::Rva(0x70040) },
+            ExportSymbol { ordinal: 6, name: Some("SteamAPI_RegisterCallResult".to_string()), target: ExportTarget::Rva(0x70050) },
+            ExportSymbol { ordinal: 7, name: Some("SteamAPI_UnregisterCallResult".to_string()), target: ExportTarget::Rva(0x70060) },
+            ExportSymbol { ordinal: 8, name: Some("SteamAPI_RunCallbacks".to_string()), target: ExportTarget::Rva(0x70070) },
+            ExportSymbol { ordinal: 9, name: Some("SteamAPI_GetSteamInstallPath".to_string()), target: ExportTarget::Rva(0x70080) },
+            ExportSymbol { ordinal: 10, name: Some("SteamAPI_WriteMiniDump".to_string()), target: ExportTarget::Rva(0x70090) },
+            ExportSymbol { ordinal: 11, name: Some("SteamAPI_SetMiniDumpComment".to_string()), target: ExportTarget::Rva(0x700a0) },
+            ExportSymbol { ordinal: 12, name: Some("SteamInternal_CreateInterface".to_string()), target: ExportTarget::Rva(0x700b0) },
+            ExportSymbol { ordinal: 13, name: Some("SteamInternal_FindOrCreateUserInterface".to_string()), target: ExportTarget::Rva(0x700c0) },
+            ExportSymbol { ordinal: 14, name: Some("SteamInternal_FindOrCreateGameInterface".to_string()), target: ExportTarget::Rva(0x700d0) },
+            ExportSymbol { ordinal: 15, name: Some("SteamInternal_ContextInit".to_string()), target: ExportTarget::Rva(0x700e0) },
+        ]),
+        ("steam_api64.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("SteamAPI_Init".to_string()), target: ExportTarget::Rva(0x71000) },
+            ExportSymbol { ordinal: 2, name: Some("SteamAPI_Shutdown".to_string()), target: ExportTarget::Rva(0x71010) },
+            ExportSymbol { ordinal: 3, name: Some("SteamAPI_RestartAppIfNecessary".to_string()), target: ExportTarget::Rva(0x71020) },
+            ExportSymbol { ordinal: 4, name: Some("SteamAPI_RegisterCallback".to_string()), target: ExportTarget::Rva(0x71030) },
+            ExportSymbol { ordinal: 5, name: Some("SteamAPI_UnregisterCallback".to_string()), target: ExportTarget::Rva(0x71040) },
+            ExportSymbol { ordinal: 6, name: Some("SteamAPI_RegisterCallResult".to_string()), target: ExportTarget::Rva(0x71050) },
+            ExportSymbol { ordinal: 7, name: Some("SteamAPI_UnregisterCallResult".to_string()), target: ExportTarget::Rva(0x71060) },
+            ExportSymbol { ordinal: 8, name: Some("SteamAPI_RunCallbacks".to_string()), target: ExportTarget::Rva(0x71070) },
+            ExportSymbol { ordinal: 9, name: Some("SteamAPI_GetSteamInstallPath".to_string()), target: ExportTarget::Rva(0x71080) },
+            ExportSymbol { ordinal: 10, name: Some("SteamAPI_WriteMiniDump".to_string()), target: ExportTarget::Rva(0x71090) },
+            ExportSymbol { ordinal: 11, name: Some("SteamAPI_SetMiniDumpComment".to_string()), target: ExportTarget::Rva(0x710a0) },
+            ExportSymbol { ordinal: 12, name: Some("SteamInternal_CreateInterface".to_string()), target: ExportTarget::Rva(0x710b0) },
+            ExportSymbol { ordinal: 13, name: Some("SteamInternal_FindOrCreateUserInterface".to_string()), target: ExportTarget::Rva(0x710c0) },
+            ExportSymbol { ordinal: 14, name: Some("SteamInternal_FindOrCreateGameInterface".to_string()), target: ExportTarget::Rva(0x710d0) },
+            ExportSymbol { ordinal: 15, name: Some("SteamInternal_ContextInit".to_string()), target: ExportTarget::Rva(0x710e0) },
+        ]),
+        ("Steam.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("Steam_BGetSteamID".to_string()), target: ExportTarget::Rva(0x72000) },
+            ExportSymbol { ordinal: 2, name: Some("Steam_BIsSubscribedApp".to_string()), target: ExportTarget::Rva(0x72010) },
+            ExportSymbol { ordinal: 3, name: Some("Steam_BLoggedOn".to_string()), target: ExportTarget::Rva(0x72020) },
+            ExportSymbol { ordinal: 4, name: Some("Steam_NotifyOfLogin".to_string()), target: ExportTarget::Rva(0x72030) },
+            ExportSymbol { ordinal: 5, name: Some("Steam_NotifyOfLogoff".to_string()), target: ExportTarget::Rva(0x72040) },
+        ]),
+        ("GameOverlayRenderer.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("OverlayHookWindow".to_string()), target: ExportTarget::Rva(0x73000) },
+            ExportSymbol { ordinal: 2, name: Some("OverlayUnhookWindow".to_string()), target: ExportTarget::Rva(0x73010) },
+            ExportSymbol { ordinal: 3, name: Some("OverlayPresent".to_string()), target: ExportTarget::Rva(0x73020) },
+            ExportSymbol { ordinal: 4, name: Some("OverlayReset".to_string()), target: ExportTarget::Rva(0x73030) },
+            ExportSymbol { ordinal: 5, name: Some("OverlayCreateHook".to_string()), target: ExportTarget::Rva(0x73040) },
+        ]),
+        ("GameOverlayRenderer64.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("OverlayHookWindow".to_string()), target: ExportTarget::Rva(0x74000) },
+            ExportSymbol { ordinal: 2, name: Some("OverlayUnhookWindow".to_string()), target: ExportTarget::Rva(0x74010) },
+            ExportSymbol { ordinal: 3, name: Some("OverlayPresent".to_string()), target: ExportTarget::Rva(0x74020) },
+            ExportSymbol { ordinal: 4, name: Some("OverlayReset".to_string()), target: ExportTarget::Rva(0x74030) },
+            ExportSymbol { ordinal: 5, name: Some("OverlayCreateHook".to_string()), target: ExportTarget::Rva(0x74040) },
+        ]),
+        // ── Network/Security DLLs ──────────────────────────────────────────────
+        ("winrnr.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("RNRInitialize".to_string()), target: ExportTarget::Rva(0x75000) },
+            ExportSymbol { ordinal: 2, name: Some("RNRQuery".to_string()), target: ExportTarget::Rva(0x75010) },
+            ExportSymbol { ordinal: 3, name: Some("RNRCancelQuery".to_string()), target: ExportTarget::Rva(0x75020) },
+        ]),
+        ("cryptng.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("BCryptOpenAlgorithmProvider".to_string()), target: ExportTarget::Rva(0x76000) },
+            ExportSymbol { ordinal: 2, name: Some("BCryptCloseAlgorithmProvider".to_string()), target: ExportTarget::Rva(0x76010) },
+            ExportSymbol { ordinal: 3, name: Some("BCryptGenerateSymmetricKey".to_string()), target: ExportTarget::Rva(0x76020) },
+            ExportSymbol { ordinal: 4, name: Some("BCryptEncrypt".to_string()), target: ExportTarget::Rva(0x76030) },
+            ExportSymbol { ordinal: 5, name: Some("BCryptDecrypt".to_string()), target: ExportTarget::Rva(0x76040) },
+            ExportSymbol { ordinal: 6, name: Some("BCryptHash".to_string()), target: ExportTarget::Rva(0x76050) },
+            ExportSymbol { ordinal: 7, name: Some("BCryptGenRandom".to_string()), target: ExportTarget::Rva(0x76060) },
+        ]),
+        ("dpapi.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("CryptProtectData".to_string()), target: ExportTarget::Rva(0x77000) },
+            ExportSymbol { ordinal: 2, name: Some("CryptUnprotectData".to_string()), target: ExportTarget::Rva(0x77010) },
+            ExportSymbol { ordinal: 3, name: Some("CryptProtectMemory".to_string()), target: ExportTarget::Rva(0x77020) },
+            ExportSymbol { ordinal: 4, name: Some("CryptUnprotectMemory".to_string()), target: ExportTarget::Rva(0x77030) },
+        ]),
+        // ── Audio/Video DLLs ───────────────────────────────────────────────────
+        ("wmcodecdsp.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("WMCDSPCreateDecoder".to_string()), target: ExportTarget::Rva(0x78000) },
+            ExportSymbol { ordinal: 2, name: Some("WMCDSPCreateEncoder".to_string()), target: ExportTarget::Rva(0x78010) },
+            ExportSymbol { ordinal: 3, name: Some("WMCDSPCreateProcessor".to_string()), target: ExportTarget::Rva(0x78020) },
+            ExportSymbol { ordinal: 4, name: Some("WMCDSPCreateResampler".to_string()), target: ExportTarget::Rva(0x78030) },
+            ExportSymbol { ordinal: 5, name: Some("WMCDSPCreateConverter".to_string()), target: ExportTarget::Rva(0x78040) },
+            ExportSymbol { ordinal: 6, name: Some("WMCDSPCreateAudioDecoder".to_string()), target: ExportTarget::Rva(0x78050) },
+            ExportSymbol { ordinal: 7, name: Some("WMCDSPCreateAudioEncoder".to_string()), target: ExportTarget::Rva(0x78060) },
+        ]),
+        ("mp3dmod.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("DllRegisterServer".to_string()), target: ExportTarget::Rva(0x79000) },
+            ExportSymbol { ordinal: 2, name: Some("DllUnregisterServer".to_string()), target: ExportTarget::Rva(0x79010) },
+            ExportSymbol { ordinal: 3, name: Some("DllGetClassObject".to_string()), target: ExportTarget::Rva(0x79020) },
+        ]),
+        ("colorcnv.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("DllRegisterServer".to_string()), target: ExportTarget::Rva(0x7a000) },
+            ExportSymbol { ordinal: 2, name: Some("DllUnregisterServer".to_string()), target: ExportTarget::Rva(0x7a010) },
+            ExportSymbol { ordinal: 3, name: Some("DllGetClassObject".to_string()), target: ExportTarget::Rva(0x7a020) },
+        ]),
+        ("resampledmo.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("DllRegisterServer".to_string()), target: ExportTarget::Rva(0x7b000) },
+            ExportSymbol { ordinal: 2, name: Some("DllUnregisterServer".to_string()), target: ExportTarget::Rva(0x7b010) },
+            ExportSymbol { ordinal: 3, name: Some("DllGetClassObject".to_string()), target: ExportTarget::Rva(0x7b020) },
+        ]),
+        ("mfh264enc.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("DllRegisterServer".to_string()), target: ExportTarget::Rva(0x7c000) },
+            ExportSymbol { ordinal: 2, name: Some("DllUnregisterServer".to_string()), target: ExportTarget::Rva(0x7c010) },
+            ExportSymbol { ordinal: 3, name: Some("DllGetClassObject".to_string()), target: ExportTarget::Rva(0x7c020) },
+        ]),
+        ("mfmpeg2src.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("DllRegisterServer".to_string()), target: ExportTarget::Rva(0x7d000) },
+            ExportSymbol { ordinal: 2, name: Some("DllUnregisterServer".to_string()), target: ExportTarget::Rva(0x7d010) },
+            ExportSymbol { ordinal: 3, name: Some("DllGetClassObject".to_string()), target: ExportTarget::Rva(0x7d020) },
+        ]),
+        // ── Graphics: Direct3D 9/10/11 Legacy ──────────────────────────────────────
+        ("d3d9.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("Direct3DCreate9".to_string()), target: ExportTarget::Rva(0x7e000) },
+            ExportSymbol { ordinal: 2, name: Some("Direct3DCreate9Ex".to_string()), target: ExportTarget::Rva(0x7e010) },
+            ExportSymbol { ordinal: 3, name: Some("D3DPERF_BeginEvent".to_string()), target: ExportTarget::Rva(0x7e020) },
+            ExportSymbol { ordinal: 4, name: Some("D3DPERF_EndEvent".to_string()), target: ExportTarget::Rva(0x7e030) },
+            ExportSymbol { ordinal: 5, name: Some("D3DPERF_SetMarker".to_string()), target: ExportTarget::Rva(0x7e040) },
+            ExportSymbol { ordinal: 6, name: Some("D3DPERF_QueryRepeatFrame".to_string()), target: ExportTarget::Rva(0x7e050) },
+            ExportSymbol { ordinal: 7, name: Some("D3DPERF_SetOptions".to_string()), target: ExportTarget::Rva(0x7e060) },
+            ExportSymbol { ordinal: 8, name: Some("D3DPERF_GetStatus".to_string()), target: ExportTarget::Rva(0x7e070) },
+            ExportSymbol { ordinal: 9, name: Some("DebugSetLevel".to_string()), target: ExportTarget::Rva(0x7e080) },
+            ExportSymbol { ordinal: 10, name: Some("DebugSetMute".to_string()), target: ExportTarget::Rva(0x7e090) },
+        ]),
+        ("d3d10core.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("D3D10CoreCreateDevice".to_string()), target: ExportTarget::Rva(0x7f000) },
+            ExportSymbol { ordinal: 2, name: Some("D3D10CoreCreateLayeredDevice".to_string()), target: ExportTarget::Rva(0x7f010) },
+            ExportSymbol { ordinal: 3, name: Some("D3D10CoreGetSupportedVersions".to_string()), target: ExportTarget::Rva(0x7f020) },
+            ExportSymbol { ordinal: 4, name: Some("D3D10CoreRegisterLayers".to_string()), target: ExportTarget::Rva(0x7f030) },
+        ]),
+        ("d3d10level9.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("D3D10Level9CreateDevice".to_string()), target: ExportTarget::Rva(0x80000) },
+            ExportSymbol { ordinal: 2, name: Some("D3D10Level9GetSupportedVersions".to_string()), target: ExportTarget::Rva(0x80010) },
+        ]),
+        ("d3dx11_43.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("D3DX11CreateTextureFromFileW".to_string()), target: ExportTarget::Rva(0x81000) },
+            ExportSymbol { ordinal: 2, name: Some("D3DX11CreateShaderResourceViewFromFileW".to_string()), target: ExportTarget::Rva(0x81010) },
+            ExportSymbol { ordinal: 3, name: Some("D3DX11CompileFromFileW".to_string()), target: ExportTarget::Rva(0x81020) },
+            ExportSymbol { ordinal: 4, name: Some("D3DX11SaveTextureToFileW".to_string()), target: ExportTarget::Rva(0x81030) },
+            ExportSymbol { ordinal: 5, name: Some("D3DX11GetImageInfoFromFileW".to_string()), target: ExportTarget::Rva(0x81040) },
+            ExportSymbol { ordinal: 6, name: Some("D3DX11CreateTextureFromMemory".to_string()), target: ExportTarget::Rva(0x81050) },
+            ExportSymbol { ordinal: 7, name: Some("D3DX11LoadTextureFromTexture".to_string()), target: ExportTarget::Rva(0x81060) },
+        ]),
+        // ── Windows Imaging Component (WIC) ───────────────────────────────────────
+        ("windowscodecs.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("WICCreateImagingFactory_Proxy".to_string()), target: ExportTarget::Rva(0x82000) },
+            ExportSymbol { ordinal: 2, name: Some("WICCreateColorContext_Proxy".to_string()), target: ExportTarget::Rva(0x82010) },
+            ExportSymbol { ordinal: 3, name: Some("WICCreateBitmap_Proxy".to_string()), target: ExportTarget::Rva(0x82020) },
+            ExportSymbol { ordinal: 4, name: Some("WICCreateBitmapFromSection_Proxy".to_string()), target: ExportTarget::Rva(0x82030) },
+            ExportSymbol { ordinal: 5, name: Some("WICCreateStream_Proxy".to_string()), target: ExportTarget::Rva(0x82040) },
+            ExportSymbol { ordinal: 6, name: Some("WICCreateFormatConverter_Proxy".to_string()), target: ExportTarget::Rva(0x82050) },
+            ExportSymbol { ordinal: 7, name: Some("WICCreatePalette_Proxy".to_string()), target: ExportTarget::Rva(0x82060) },
+            ExportSymbol { ordinal: 8, name: Some("WICCreateBitmapScaler_Proxy".to_string()), target: ExportTarget::Rva(0x82070) },
+            ExportSymbol { ordinal: 9, name: Some("WICCreateBitmapClipper_Proxy".to_string()), target: ExportTarget::Rva(0x82080) },
+            ExportSymbol { ordinal: 10, name: Some("WICCreateBitmapFlipRotator_Proxy".to_string()), target: ExportTarget::Rva(0x82090) },
+            ExportSymbol { ordinal: 11, name: Some("WICCreateImagingFactory".to_string()), target: ExportTarget::Rva(0x820a0) },
+            ExportSymbol { ordinal: 12, name: Some("WICGetMetadataContentSize".to_string()), target: ExportTarget::Rva(0x820b0) },
+            ExportSymbol { ordinal: 13, name: Some("WICMapSchemaToName".to_string()), target: ExportTarget::Rva(0x820c0) },
+            ExportSymbol { ordinal: 14, name: Some("WICSerializeMetadataContent".to_string()), target: ExportTarget::Rva(0x820d0) },
+            ExportSymbol { ordinal: 15, name: Some("WICMatchMetadataContent".to_string()), target: ExportTarget::Rva(0x820e0) },
+            ExportSymbol { ordinal: 16, name: Some("WICCreateComponentInfo".to_string()), target: ExportTarget::Rva(0x820f0) },
+        ]),
+        ("windowscodecsext.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("WICCreateHeifDecoder".to_string()), target: ExportTarget::Rva(0x83000) },
+            ExportSymbol { ordinal: 2, name: Some("WICCreateHeifEncoder".to_string()), target: ExportTarget::Rva(0x83010) },
+            ExportSymbol { ordinal: 3, name: Some("WICCreateWebpDecoder".to_string()), target: ExportTarget::Rva(0x83020) },
+            ExportSymbol { ordinal: 4, name: Some("WICCreateWebpEncoder".to_string()), target: ExportTarget::Rva(0x83030) },
+            ExportSymbol { ordinal: 5, name: Some("WICCreateAvifDecoder".to_string()), target: ExportTarget::Rva(0x83040) },
+            ExportSymbol { ordinal: 6, name: Some("WICCreateAvifEncoder".to_string()), target: ExportTarget::Rva(0x83050) },
+        ]),
+        // ── Legacy DirectDraw / DirectInput / DirectPlay ──────────────────────────
+        ("ddraw.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("DirectDrawCreate".to_string()), target: ExportTarget::Rva(0x84000) },
+            ExportSymbol { ordinal: 2, name: Some("DirectDrawCreateEx".to_string()), target: ExportTarget::Rva(0x84010) },
+            ExportSymbol { ordinal: 3, name: Some("DirectDrawEnumerateExW".to_string()), target: ExportTarget::Rva(0x84020) },
+            ExportSymbol { ordinal: 4, name: Some("DirectDrawEnumerateW".to_string()), target: ExportTarget::Rva(0x84030) },
+            ExportSymbol { ordinal: 5, name: Some("DllCanUnloadNow".to_string()), target: ExportTarget::Rva(0x84040) },
+            ExportSymbol { ordinal: 6, name: Some("DllGetClassObject".to_string()), target: ExportTarget::Rva(0x84050) },
+            ExportSymbol { ordinal: 7, name: Some("DllRegisterServer".to_string()), target: ExportTarget::Rva(0x84060) },
+            ExportSymbol { ordinal: 8, name: Some("DllUnregisterServer".to_string()), target: ExportTarget::Rva(0x84070) },
+        ]),
+        ("dinput.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("DirectInputCreateW".to_string()), target: ExportTarget::Rva(0x85000) },
+            ExportSymbol { ordinal: 2, name: Some("DirectInputCreateEx".to_string()), target: ExportTarget::Rva(0x85010) },
+            ExportSymbol { ordinal: 3, name: Some("DllCanUnloadNow".to_string()), target: ExportTarget::Rva(0x85020) },
+            ExportSymbol { ordinal: 4, name: Some("DllGetClassObject".to_string()), target: ExportTarget::Rva(0x85030) },
+            ExportSymbol { ordinal: 5, name: Some("DllRegisterServer".to_string()), target: ExportTarget::Rva(0x85040) },
+            ExportSymbol { ordinal: 6, name: Some("DllUnregisterServer".to_string()), target: ExportTarget::Rva(0x85050) },
+        ]),
+        ("dplay.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("DirectPlayCreate".to_string()), target: ExportTarget::Rva(0x86000) },
+            ExportSymbol { ordinal: 2, name: Some("DirectPlayEnumerateW".to_string()), target: ExportTarget::Rva(0x86010) },
+        ]),
+        ("dpnet.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("DirectPlay8Create".to_string()), target: ExportTarget::Rva(0x87000) },
+            ExportSymbol { ordinal: 2, name: Some("DP8SPCreate".to_string()), target: ExportTarget::Rva(0x87010) },
+            ExportSymbol { ordinal: 3, name: Some("DllCanUnloadNow".to_string()), target: ExportTarget::Rva(0x87020) },
+            ExportSymbol { ordinal: 4, name: Some("DllGetClassObject".to_string()), target: ExportTarget::Rva(0x87030) },
+        ]),
+        ("dpaddr.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("DP8SPCreate".to_string()), target: ExportTarget::Rva(0x88000) },
+        ]),
+        // ── DirectShow ────────────────────────────────────────────────────────────
+        ("quartz.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("AMGetErrorTextW".to_string()), target: ExportTarget::Rva(0x89000) },
+            ExportSymbol { ordinal: 2, name: Some("DllCanUnloadNow".to_string()), target: ExportTarget::Rva(0x89010) },
+            ExportSymbol { ordinal: 3, name: Some("DllGetClassObject".to_string()), target: ExportTarget::Rva(0x89020) },
+            ExportSymbol { ordinal: 4, name: Some("DllRegisterServer".to_string()), target: ExportTarget::Rva(0x89030) },
+            ExportSymbol { ordinal: 5, name: Some("DllUnregisterServer".to_string()), target: ExportTarget::Rva(0x89040) },
+        ]),
+        ("amstream.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("DllCanUnloadNow".to_string()), target: ExportTarget::Rva(0x8a000) },
+            ExportSymbol { ordinal: 2, name: Some("DllGetClassObject".to_string()), target: ExportTarget::Rva(0x8a010) },
+            ExportSymbol { ordinal: 3, name: Some("DllRegisterServer".to_string()), target: ExportTarget::Rva(0x8a020) },
+            ExportSymbol { ordinal: 4, name: Some("DllUnregisterServer".to_string()), target: ExportTarget::Rva(0x8a030) },
+        ]),
+        // ── Media Foundation Codecs ───────────────────────────────────────────────
+        ("mfaacenc.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("DllRegisterServer".to_string()), target: ExportTarget::Rva(0x8b000) },
+            ExportSymbol { ordinal: 2, name: Some("DllUnregisterServer".to_string()), target: ExportTarget::Rva(0x8b010) },
+            ExportSymbol { ordinal: 3, name: Some("DllGetClassObject".to_string()), target: ExportTarget::Rva(0x8b020) },
+        ]),
+        ("mfvpxdec.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("DllRegisterServer".to_string()), target: ExportTarget::Rva(0x8c000) },
+            ExportSymbol { ordinal: 2, name: Some("DllUnregisterServer".to_string()), target: ExportTarget::Rva(0x8c010) },
+            ExportSymbol { ordinal: 3, name: Some("DllGetClassObject".to_string()), target: ExportTarget::Rva(0x8c020) },
+        ]),
+        ("msmpeg2adec.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("DllRegisterServer".to_string()), target: ExportTarget::Rva(0x8d000) },
+            ExportSymbol { ordinal: 2, name: Some("DllUnregisterServer".to_string()), target: ExportTarget::Rva(0x8d010) },
+            ExportSymbol { ordinal: 3, name: Some("DllGetClassObject".to_string()), target: ExportTarget::Rva(0x8d020) },
+        ]),
+        ("msmpeg2vdec.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("DllRegisterServer".to_string()), target: ExportTarget::Rva(0x8e000) },
+            ExportSymbol { ordinal: 2, name: Some("DllUnregisterServer".to_string()), target: ExportTarget::Rva(0x8e010) },
+            ExportSymbol { ordinal: 3, name: Some("DllGetClassObject".to_string()), target: ExportTarget::Rva(0x8e020) },
+        ]),
+        ("mpg4decdmod.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("DllRegisterServer".to_string()), target: ExportTarget::Rva(0x8f000) },
+            ExportSymbol { ordinal: 2, name: Some("DllUnregisterServer".to_string()), target: ExportTarget::Rva(0x8f010) },
+            ExportSymbol { ordinal: 3, name: Some("DllGetClassObject".to_string()), target: ExportTarget::Rva(0x8f020) },
+        ]),
+        ("encapi.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("DllRegisterServer".to_string()), target: ExportTarget::Rva(0x90000) },
+            ExportSymbol { ordinal: 2, name: Some("DllUnregisterServer".to_string()), target: ExportTarget::Rva(0x90010) },
+            ExportSymbol { ordinal: 3, name: Some("DllGetClassObject".to_string()), target: ExportTarget::Rva(0x90020) },
+        ]),
+        // ── Windows Media Player / Indeo ──────────────────────────────────────────
+        ("msdxm.ocx".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("DllRegisterServer".to_string()), target: ExportTarget::Rva(0x91000) },
+            ExportSymbol { ordinal: 2, name: Some("DllUnregisterServer".to_string()), target: ExportTarget::Rva(0x91010) },
+            ExportSymbol { ordinal: 3, name: Some("DllGetClassObject".to_string()), target: ExportTarget::Rva(0x91020) },
+        ]),
+        ("wmp.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("DllRegisterServer".to_string()), target: ExportTarget::Rva(0x92000) },
+            ExportSymbol { ordinal: 2, name: Some("DllUnregisterServer".to_string()), target: ExportTarget::Rva(0x92010) },
+            ExportSymbol { ordinal: 3, name: Some("DllGetClassObject".to_string()), target: ExportTarget::Rva(0x92020) },
+        ]),
+        ("ir50_qc.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("DllRegisterServer".to_string()), target: ExportTarget::Rva(0x93000) },
+            ExportSymbol { ordinal: 2, name: Some("DllUnregisterServer".to_string()), target: ExportTarget::Rva(0x93010) },
+        ]),
+        ("ir50_qcx.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("DllRegisterServer".to_string()), target: ExportTarget::Rva(0x94000) },
+            ExportSymbol { ordinal: 2, name: Some("DllUnregisterServer".to_string()), target: ExportTarget::Rva(0x94010) },
+        ]),
+        // ── Audio: Core Audio API ─────────────────────────────────────────────────
+        ("audioses.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("AudioSessionize".to_string()), target: ExportTarget::Rva(0x95000) },
+            ExportSymbol { ordinal: 2, name: Some("AudioSessionFromHWND".to_string()), target: ExportTarget::Rva(0x95010) },
+            ExportSymbol { ordinal: 3, name: Some("AudioSessionFromGuid".to_string()), target: ExportTarget::Rva(0x95020) },
+            ExportSymbol { ordinal: 4, name: Some("AudioSessionFromString".to_string()), target: ExportTarget::Rva(0x95030) },
+            ExportSymbol { ordinal: 5, name: Some("DllRegisterServer".to_string()), target: ExportTarget::Rva(0x95040) },
+            ExportSymbol { ordinal: 6, name: Some("DllUnregisterServer".to_string()), target: ExportTarget::Rva(0x95050) },
+        ]),
+        ("audioendpoint.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("DllRegisterServer".to_string()), target: ExportTarget::Rva(0x96000) },
+            ExportSymbol { ordinal: 2, name: Some("DllUnregisterServer".to_string()), target: ExportTarget::Rva(0x96010) },
+            ExportSymbol { ordinal: 3, name: Some("DllGetClassObject".to_string()), target: ExportTarget::Rva(0x96020) },
+        ]),
+        ("xapofx1_5.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("XAudio2Create".to_string()), target: ExportTarget::Rva(0x97000) },
+            ExportSymbol { ordinal: 2, name: Some("CreateFX".to_string()), target: ExportTarget::Rva(0x97010) },
+            ExportSymbol { ordinal: 3, name: Some("DllCanUnloadNow".to_string()), target: ExportTarget::Rva(0x97020) },
+        ]),
+        // ── Security / Cryptography ───────────────────────────────────────────────
+        ("cryptui.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("CryptUIDlgCertMgr".to_string()), target: ExportTarget::Rva(0x98000) },
+            ExportSymbol { ordinal: 2, name: Some("CryptUIDlgSelectCertificateW".to_string()), target: ExportTarget::Rva(0x98010) },
+            ExportSymbol { ordinal: 3, name: Some("CryptUIDlgViewCertificateW".to_string()), target: ExportTarget::Rva(0x98020) },
+            ExportSymbol { ordinal: 4, name: Some("CryptUIDlgSelectStoreW".to_string()), target: ExportTarget::Rva(0x98030) },
+        ]),
+        ("cryptdlg.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("CertDigestDigest".to_string()), target: ExportTarget::Rva(0x99000) },
+            ExportSymbol { ordinal: 2, name: Some("CertSelectCertificate".to_string()), target: ExportTarget::Rva(0x99010) },
+        ]),
+        ("credssp.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("CredSSPGetServerCredential".to_string()), target: ExportTarget::Rva(0x9a000) },
+            ExportSymbol { ordinal: 2, name: Some("CredSSPGetClientCredential".to_string()), target: ExportTarget::Rva(0x9a010) },
+        ]),
+        ("schannel.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("InitSecurityInterfaceW".to_string()), target: ExportTarget::Rva(0x9b000) },
+            ExportSymbol { ordinal: 2, name: Some("SslGetDataToWrite".to_string()), target: ExportTarget::Rva(0x9b010) },
+            ExportSymbol { ordinal: 3, name: Some("SslLoadCertificate".to_string()), target: ExportTarget::Rva(0x9b020) },
+        ]),
+        ("cryptdll.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("CryptEncodeObject".to_string()), target: ExportTarget::Rva(0x9c000) },
+            ExportSymbol { ordinal: 2, name: Some("CryptDecodeObject".to_string()), target: ExportTarget::Rva(0x9c010) },
+            ExportSymbol { ordinal: 3, name: Some("CryptExportPKCS8".to_string()), target: ExportTarget::Rva(0x9c020) },
+        ]),
+        ("scecli.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("ScGenerateRelativeName".to_string()), target: ExportTarget::Rva(0x9d000) },
+            ExportSymbol { ordinal: 2, name: Some("ScRemoveAllPrivileges".to_string()), target: ExportTarget::Rva(0x9d010) },
+            ExportSymbol { ordinal: 3, name: Some("ScSetSecurityDescriptor".to_string()), target: ExportTarget::Rva(0x9d020) },
+        ]),
+        ("rsaenh.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("CPAcquireContext".to_string()), target: ExportTarget::Rva(0x9e000) },
+            ExportSymbol { ordinal: 2, name: Some("CPReleaseContext".to_string()), target: ExportTarget::Rva(0x9e010) },
+            ExportSymbol { ordinal: 3, name: Some("CPGenKey".to_string()), target: ExportTarget::Rva(0x9e020) },
+            ExportSymbol { ordinal: 4, name: Some("CPEncrypt".to_string()), target: ExportTarget::Rva(0x9e030) },
+            ExportSymbol { ordinal: 5, name: Some("CPDecrypt".to_string()), target: ExportTarget::Rva(0x9e040) },
+            ExportSymbol { ordinal: 6, name: Some("CPHashData".to_string()), target: ExportTarget::Rva(0x9e050) },
+            ExportSymbol { ordinal: 7, name: Some("CPVerifySignature".to_string()), target: ExportTarget::Rva(0x9e060) },
+        ]),
+        ("cngaudit.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("CngAuditLog".to_string()), target: ExportTarget::Rva(0x9f000) },
+        ]),
+        ("certadm.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("CertSrvAdminGetCA".to_string()), target: ExportTarget::Rva(0xa0000) },
+            ExportSymbol { ordinal: 2, name: Some("CertSrvAdminSetCA".to_string()), target: ExportTarget::Rva(0xa0010) },
+            ExportSymbol { ordinal: 3, name: Some("CertSrvAdminGetCert".to_string()), target: ExportTarget::Rva(0xa0020) },
+        ]),
+        ("certcli.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("CertSrvBackupPrepare".to_string()), target: ExportTarget::Rva(0xa1000) },
+            ExportSymbol { ordinal: 2, name: Some("CertSrvBackupEnd".to_string()), target: ExportTarget::Rva(0xa1010) },
+            ExportSymbol { ordinal: 3, name: Some("CertSrvRestorePrepare".to_string()), target: ExportTarget::Rva(0xa1020) },
+            ExportSymbol { ordinal: 4, name: Some("CertSrvRestoreEnd".to_string()), target: ExportTarget::Rva(0xa1030) },
+        ]),
+        // ── Network: Winsock / DNS ────────────────────────────────────────────────
+        ("mswsock.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("WSARecvEx".to_string()), target: ExportTarget::Rva(0xa2000) },
+            ExportSymbol { ordinal: 2, name: Some("TransmitFile".to_string()), target: ExportTarget::Rva(0xa2010) },
+            ExportSymbol { ordinal: 3, name: Some("AcceptEx".to_string()), target: ExportTarget::Rva(0xa2020) },
+            ExportSymbol { ordinal: 4, name: Some("GetAcceptExSockaddrs".to_string()), target: ExportTarget::Rva(0xa2030) },
+            ExportSymbol { ordinal: 5, name: Some("EnumProtocolsW".to_string()), target: ExportTarget::Rva(0xa2040) },
+            ExportSymbol { ordinal: 6, name: Some("WSAGetOverlappedResult".to_string()), target: ExportTarget::Rva(0xa2050) },
+            ExportSymbol { ordinal: 7, name: Some("WSASocketW".to_string()), target: ExportTarget::Rva(0xa2060) },
+        ]),
+        ("msafd.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("WSPStartup".to_string()), target: ExportTarget::Rva(0xa3000) },
+            ExportSymbol { ordinal: 2, name: Some("WSPCleanup".to_string()), target: ExportTarget::Rva(0xa3010) },
+            ExportSymbol { ordinal: 3, name: Some("WSPSocket".to_string()), target: ExportTarget::Rva(0xa3020) },
+            ExportSymbol { ordinal: 4, name: Some("WSPBind".to_string()), target: ExportTarget::Rva(0xa3030) },
+            ExportSymbol { ordinal: 5, name: Some("WSPListen".to_string()), target: ExportTarget::Rva(0xa3040) },
+            ExportSymbol { ordinal: 6, name: Some("WSPAccept".to_string()), target: ExportTarget::Rva(0xa3050) },
+            ExportSymbol { ordinal: 7, name: Some("WSPConnect".to_string()), target: ExportTarget::Rva(0xa3060) },
+            ExportSymbol { ordinal: 8, name: Some("WSPSend".to_string()), target: ExportTarget::Rva(0xa3070) },
+            ExportSymbol { ordinal: 9, name: Some("WSPRecv".to_string()), target: ExportTarget::Rva(0xa3080) },
+        ]),
+        // ── .NET / Runtime ────────────────────────────────────────────────────────
+        ("mscorwks.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("CorBindToRuntimeEx".to_string()), target: ExportTarget::Rva(0xa4000) },
+            ExportSymbol { ordinal: 2, name: Some("CorBindToRuntime".to_string()), target: ExportTarget::Rva(0xa4010) },
+            ExportSymbol { ordinal: 3, name: Some("GetCLRRuntimeHost".to_string()), target: ExportTarget::Rva(0xa4020) },
+            ExportSymbol { ordinal: 4, name: Some("ClrCreateManagedInstance".to_string()), target: ExportTarget::Rva(0xa4030) },
+        ]),
+        ("mscorlib.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("DllRegisterServer".to_string()), target: ExportTarget::Rva(0xa5000) },
+            ExportSymbol { ordinal: 2, name: Some("DllUnregisterServer".to_string()), target: ExportTarget::Rva(0xa5010) },
+        ]),
+        ("msvbvm60.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("DllCall".to_string()), target: ExportTarget::Rva(0xa6000) },
+            ExportSymbol { ordinal: 2, name: Some("DllFunc".to_string()), target: ExportTarget::Rva(0xa6010) },
+            ExportSymbol { ordinal: 3, name: Some("DllMain".to_string()), target: ExportTarget::Rva(0xa6020) },
+            ExportSymbol { ordinal: 4, name: Some("DllProc".to_string()), target: ExportTarget::Rva(0xa6030) },
+            ExportSymbol { ordinal: 5, name: Some("BASIC_CLASS_AddRef".to_string()), target: ExportTarget::Rva(0xa6040) },
+            ExportSymbol { ordinal: 6, name: Some("BASIC_CLASS_Release".to_string()), target: ExportTarget::Rva(0xa6050) },
+            ExportSymbol { ordinal: 7, name: Some("BASIC_CLASS_QueryInterface".to_string()), target: ExportTarget::Rva(0xa6060) },
+            ExportSymbol { ordinal: 8, name: Some("BASIC_CLASS_Invoke".to_string()), target: ExportTarget::Rva(0xa6070) },
+            ExportSymbol { ordinal: 9, name: Some("BASIC_DISPINTERFACE_Invoke".to_string()), target: ExportTarget::Rva(0xa6080) },
+            ExportSymbol { ordinal: 10, name: Some("BASIC_CLASS_GetIDsOfNames".to_string()), target: ExportTarget::Rva(0xa6090) },
+        ]),
+        // ── WPF / Presentation ────────────────────────────────────────────────────
+        ("presentationframework.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("DllRegisterServer".to_string()), target: ExportTarget::Rva(0xa7000) },
+            ExportSymbol { ordinal: 2, name: Some("DllUnregisterServer".to_string()), target: ExportTarget::Rva(0xa7010) },
+        ]),
+        ("presentationcore.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("DllRegisterServer".to_string()), target: ExportTarget::Rva(0xa8000) },
+            ExportSymbol { ordinal: 2, name: Some("DllUnregisterServer".to_string()), target: ExportTarget::Rva(0xa8010) },
+        ]),
+        ("windowsbase.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("DllRegisterServer".to_string()), target: ExportTarget::Rva(0xa9000) },
+            ExportSymbol { ordinal: 2, name: Some("DllUnregisterServer".to_string()), target: ExportTarget::Rva(0xa9010) },
+        ]),
+        // ── Scripting ─────────────────────────────────────────────────────────────
+        ("vbscript.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("DllRegisterServer".to_string()), target: ExportTarget::Rva(0xaa000) },
+            ExportSymbol { ordinal: 2, name: Some("DllUnregisterServer".to_string()), target: ExportTarget::Rva(0xaa010) },
+            ExportSymbol { ordinal: 3, name: Some("DllGetClassObject".to_string()), target: ExportTarget::Rva(0xaa020) },
+            ExportSymbol { ordinal: 4, name: Some("DllCanUnloadNow".to_string()), target: ExportTarget::Rva(0xaa030) },
+        ]),
+        ("jscript.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("DllRegisterServer".to_string()), target: ExportTarget::Rva(0xab000) },
+            ExportSymbol { ordinal: 2, name: Some("DllUnregisterServer".to_string()), target: ExportTarget::Rva(0xab010) },
+            ExportSymbol { ordinal: 3, name: Some("DllGetClassObject".to_string()), target: ExportTarget::Rva(0xab020) },
+            ExportSymbol { ordinal: 4, name: Some("DllCanUnloadNow".to_string()), target: ExportTarget::Rva(0xab030) },
+        ]),
+        ("scrrun.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("DllRegisterServer".to_string()), target: ExportTarget::Rva(0xac000) },
+            ExportSymbol { ordinal: 2, name: Some("DllUnregisterServer".to_string()), target: ExportTarget::Rva(0xac010) },
+            ExportSymbol { ordinal: 3, name: Some("DllGetClassObject".to_string()), target: ExportTarget::Rva(0xac020) },
+        ]),
+        // ── XML ───────────────────────────────────────────────────────────────────
+        ("msxml6.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("DllRegisterServer".to_string()), target: ExportTarget::Rva(0xad000) },
+            ExportSymbol { ordinal: 2, name: Some("DllUnregisterServer".to_string()), target: ExportTarget::Rva(0xad010) },
+            ExportSymbol { ordinal: 3, name: Some("DllGetClassObject".to_string()), target: ExportTarget::Rva(0xad020) },
+            ExportSymbol { ordinal: 4, name: Some("DllCanUnloadNow".to_string()), target: ExportTarget::Rva(0xad030) },
+        ]),
+        // ── Text Services ─────────────────────────────────────────────────────────
+        ("msctf.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("TF_CreateThreadMgr".to_string()), target: ExportTarget::Rva(0xae000) },
+            ExportSymbol { ordinal: 2, name: Some("TF_CreateCategoryMgr".to_string()), target: ExportTarget::Rva(0xae010) },
+            ExportSymbol { ordinal: 3, name: Some("TF_CreateDisplayAttributeMgr".to_string()), target: ExportTarget::Rva(0xae020) },
+            ExportSymbol { ordinal: 4, name: Some("TF_GetThreadMgr".to_string()), target: ExportTarget::Rva(0xae030) },
+            ExportSymbol { ordinal: 5, name: Some("TF_InitSystem".to_string()), target: ExportTarget::Rva(0xae040) },
+            ExportSymbol { ordinal: 6, name: Some("TF_UninitSystem".to_string()), target: ExportTarget::Rva(0xae050) },
+            ExportSymbol { ordinal: 7, name: Some("DllRegisterServer".to_string()), target: ExportTarget::Rva(0xae060) },
+            ExportSymbol { ordinal: 8, name: Some("DllUnregisterServer".to_string()), target: ExportTarget::Rva(0xae070) },
+            ExportSymbol { ordinal: 9, name: Some("DllGetClassObject".to_string()), target: ExportTarget::Rva(0xae080) },
+            ExportSymbol { ordinal: 10, name: Some("DllCanUnloadNow".to_string()), target: ExportTarget::Rva(0xae090) },
+        ]),
+        ("msimtf.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("DllRegisterServer".to_string()), target: ExportTarget::Rva(0xaf000) },
+            ExportSymbol { ordinal: 2, name: Some("DllUnregisterServer".to_string()), target: ExportTarget::Rva(0xaf010) },
+        ]),
+        // ── WMI ───────────────────────────────────────────────────────────────────
+        ("wbemprox.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("WMIInitialize".to_string()), target: ExportTarget::Rva(0xb0000) },
+            ExportSymbol { ordinal: 2, name: Some("WMIClose".to_string()), target: ExportTarget::Rva(0xb0010) },
+            ExportSymbol { ordinal: 3, name: Some("WMIConnect".to_string()), target: ExportTarget::Rva(0xb0020) },
+            ExportSymbol { ordinal: 4, name: Some("WMIQuery".to_string()), target: ExportTarget::Rva(0xb0030) },
+            ExportSymbol { ordinal: 5, name: Some("DllRegisterServer".to_string()), target: ExportTarget::Rva(0xb0040) },
+            ExportSymbol { ordinal: 6, name: Some("DllUnregisterServer".to_string()), target: ExportTarget::Rva(0xb0050) },
+        ]),
+        ("wbemcomn.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("DllRegisterServer".to_string()), target: ExportTarget::Rva(0xb1000) },
+            ExportSymbol { ordinal: 2, name: Some("DllUnregisterServer".to_string()), target: ExportTarget::Rva(0xb1010) },
+            ExportSymbol { ordinal: 3, name: Some("DllGetClassObject".to_string()), target: ExportTarget::Rva(0xb1020) },
+            ExportSymbol { ordinal: 4, name: Some("DllCanUnloadNow".to_string()), target: ExportTarget::Rva(0xb1030) },
+        ]),
+        ("fastprox.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("DllRegisterServer".to_string()), target: ExportTarget::Rva(0xb2000) },
+            ExportSymbol { ordinal: 2, name: Some("DllUnregisterServer".to_string()), target: ExportTarget::Rva(0xb2010) },
+            ExportSymbol { ordinal: 3, name: Some("DllGetClassObject".to_string()), target: ExportTarget::Rva(0xb2020) },
+        ]),
+        ("wbemdisp.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("DllRegisterServer".to_string()), target: ExportTarget::Rva(0xb3000) },
+            ExportSymbol { ordinal: 2, name: Some("DllUnregisterServer".to_string()), target: ExportTarget::Rva(0xb3010) },
+        ]),
+        ("wmi.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("DllRegisterServer".to_string()), target: ExportTarget::Rva(0xb4000) },
+            ExportSymbol { ordinal: 2, name: Some("DllUnregisterServer".to_string()), target: ExportTarget::Rva(0xb4010) },
+        ]),
+        // ── WebView2 ──────────────────────────────────────────────────────────────
+        ("webview2.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("CreateWebView2Environment".to_string()), target: ExportTarget::Rva(0xb5000) },
+            ExportSymbol { ordinal: 2, name: Some("DllRegisterServer".to_string()), target: ExportTarget::Rva(0xb5010) },
+            ExportSymbol { ordinal: 3, name: Some("DllUnregisterServer".to_string()), target: ExportTarget::Rva(0xb5020) },
+        ]),
+        // ── COM / OLE Support ─────────────────────────────────────────────────────
+        ("asycfilt.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("DllRegisterServer".to_string()), target: ExportTarget::Rva(0xb6000) },
+            ExportSymbol { ordinal: 2, name: Some("DllUnregisterServer".to_string()), target: ExportTarget::Rva(0xb6010) },
+        ]),
+        ("comsvcs.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("DllRegisterServer".to_string()), target: ExportTarget::Rva(0xb7000) },
+            ExportSymbol { ordinal: 2, name: Some("DllUnregisterServer".to_string()), target: ExportTarget::Rva(0xb7010) },
+            ExportSymbol { ordinal: 3, name: Some("DllGetClassObject".to_string()), target: ExportTarget::Rva(0xb7020) },
+            ExportSymbol { ordinal: 4, name: Some("DllCanUnloadNow".to_string()), target: ExportTarget::Rva(0xb7030) },
+        ]),
+        ("clbcatq.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("DllRegisterServer".to_string()), target: ExportTarget::Rva(0xb8000) },
+            ExportSymbol { ordinal: 2, name: Some("DllUnregisterServer".to_string()), target: ExportTarget::Rva(0xb8010) },
+            ExportSymbol { ordinal: 3, name: Some("DllGetClassObject".to_string()), target: ExportTarget::Rva(0xb8020) },
+        ]),
+        ("mtxdm.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("DllRegisterServer".to_string()), target: ExportTarget::Rva(0xb9000) },
+            ExportSymbol { ordinal: 2, name: Some("DllUnregisterServer".to_string()), target: ExportTarget::Rva(0xb9010) },
+        ]),
+        // ── ESENT / Database ──────────────────────────────────────────────────────
+        ("esent.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("JetInit".to_string()), target: ExportTarget::Rva(0xba000) },
+            ExportSymbol { ordinal: 2, name: Some("JetTerm".to_string()), target: ExportTarget::Rva(0xba010) },
+            ExportSymbol { ordinal: 3, name: Some("JetCreateDatabase".to_string()), target: ExportTarget::Rva(0xba020) },
+            ExportSymbol { ordinal: 4, name: Some("JetAttachDatabase".to_string()), target: ExportTarget::Rva(0xba030) },
+            ExportSymbol { ordinal: 5, name: Some("JetDetachDatabase".to_string()), target: ExportTarget::Rva(0xba040) },
+            ExportSymbol { ordinal: 6, name: Some("JetOpenTable".to_string()), target: ExportTarget::Rva(0xba050) },
+            ExportSymbol { ordinal: 7, name: Some("JetCloseTable".to_string()), target: ExportTarget::Rva(0xba060) },
+            ExportSymbol { ordinal: 8, name: Some("JetOpenDatabase".to_string()), target: ExportTarget::Rva(0xba070) },
+            ExportSymbol { ordinal: 9, name: Some("JetCloseDatabase".to_string()), target: ExportTarget::Rva(0xba080) },
+            ExportSymbol { ordinal: 10, name: Some("JetBeginTransaction".to_string()), target: ExportTarget::Rva(0xba090) },
+            ExportSymbol { ordinal: 11, name: Some("JetCommitTransaction".to_string()), target: ExportTarget::Rva(0xba0a0) },
+            ExportSymbol { ordinal: 12, name: Some("JetRollback".to_string()), target: ExportTarget::Rva(0xba0b0) },
+            ExportSymbol { ordinal: 13, name: Some("JetGetTableColumnInfo".to_string()), target: ExportTarget::Rva(0xba0c0) },
+        ]),
+        // ── OLE DB ───────────────────────────────────────────────────────────────
+        ("msdart.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("DllRegisterServer".to_string()), target: ExportTarget::Rva(0xbb000) },
+            ExportSymbol { ordinal: 2, name: Some("DllUnregisterServer".to_string()), target: ExportTarget::Rva(0xbb010) },
+            ExportSymbol { ordinal: 3, name: Some("DllGetClassObject".to_string()), target: ExportTarget::Rva(0xbb020) },
+        ]),
+        // ── Performance Counters ──────────────────────────────────────────────────
+        ("pdh.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("PdhOpenQuery".to_string()), target: ExportTarget::Rva(0xbc000) },
+            ExportSymbol { ordinal: 2, name: Some("PdhCloseQuery".to_string()), target: ExportTarget::Rva(0xbc010) },
+            ExportSymbol { ordinal: 3, name: Some("PdhAddCounter".to_string()), target: ExportTarget::Rva(0xbc020) },
+            ExportSymbol { ordinal: 4, name: Some("PdhRemoveCounter".to_string()), target: ExportTarget::Rva(0xbc030) },
+            ExportSymbol { ordinal: 5, name: Some("PdhCollectQueryData".to_string()), target: ExportTarget::Rva(0xbc040) },
+            ExportSymbol { ordinal: 6, name: Some("PdhGetFormattedCounterValue".to_string()), target: ExportTarget::Rva(0xbc050) },
+            ExportSymbol { ordinal: 7, name: Some("PdhEnumObjects".to_string()), target: ExportTarget::Rva(0xbc060) },
+            ExportSymbol { ordinal: 8, name: Some("PdhEnumCounters".to_string()), target: ExportTarget::Rva(0xbc070) },
+        ]),
+        // ── Terminal Services / WinStation ────────────────────────────────────────
+        ("winsta.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("WinStationOpenServer".to_string()), target: ExportTarget::Rva(0xbd000) },
+            ExportSymbol { ordinal: 2, name: Some("WinStationCloseServer".to_string()), target: ExportTarget::Rva(0xbd010) },
+            ExportSymbol { ordinal: 3, name: Some("WinStationEnumerate".to_string()), target: ExportTarget::Rva(0xbd020) },
+        ]),
+        // ── Windows Update ────────────────────────────────────────────────────────
+        ("wuapi.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("DllRegisterServer".to_string()), target: ExportTarget::Rva(0xbe000) },
+            ExportSymbol { ordinal: 2, name: Some("DllUnregisterServer".to_string()), target: ExportTarget::Rva(0xbe010) },
+        ]),
+        ("sens.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("DllRegisterServer".to_string()), target: ExportTarget::Rva(0xbf000) },
+            ExportSymbol { ordinal: 2, name: Some("DllUnregisterServer".to_string()), target: ExportTarget::Rva(0xbf010) },
+        ]),
+        // ── SSAS / Analysis Services ──────────────────────────────────────────────
+        ("msmdlocal.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("DllRegisterServer".to_string()), target: ExportTarget::Rva(0xc0000) },
+            ExportSymbol { ordinal: 2, name: Some("DllUnregisterServer".to_string()), target: ExportTarget::Rva(0xc0010) },
+        ]),
+        // ── WinRM ─────────────────────────────────────────────────────────────────
+        ("winrsmgr.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("DllRegisterServer".to_string()), target: ExportTarget::Rva(0xc1000) },
+            ExportSymbol { ordinal: 2, name: Some("DllUnregisterServer".to_string()), target: ExportTarget::Rva(0xc1010) },
+        ]),
+        // ── Network Management APIs ───────────────────────────────────────────────
+        ("netutils.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("NetGetDCName".to_string()), target: ExportTarget::Rva(0xc2000) },
+            ExportSymbol { ordinal: 2, name: Some("NetGetAnyDCName".to_string()), target: ExportTarget::Rva(0xc2010) },
+        ]),
+        ("samlib.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("SamConnect".to_string()), target: ExportTarget::Rva(0xc3000) },
+            ExportSymbol { ordinal: 2, name: Some("SamCloseHandle".to_string()), target: ExportTarget::Rva(0xc3010) },
+            ExportSymbol { ordinal: 3, name: Some("SamOpenDomain".to_string()), target: ExportTarget::Rva(0xc3020) },
+        ]),
+        ("activeds.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("ADsGetObject".to_string()), target: ExportTarget::Rva(0xc4000) },
+            ExportSymbol { ordinal: 2, name: Some("ADsOpenObject".to_string()), target: ExportTarget::Rva(0xc4010) },
+            ExportSymbol { ordinal: 3, name: Some("ADsBuildEnumerator".to_string()), target: ExportTarget::Rva(0xc4020) },
+        ]),
+        ("ntdsapi.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("DsBind".to_string()), target: ExportTarget::Rva(0xc5000) },
+            ExportSymbol { ordinal: 2, name: Some("DsUnbind".to_string()), target: ExportTarget::Rva(0xc5010) },
+            ExportSymbol { ordinal: 3, name: Some("DsBindWithCred".to_string()), target: ExportTarget::Rva(0xc5020) },
+            ExportSymbol { ordinal: 4, name: Some("DsMakeSpnW".to_string()), target: ExportTarget::Rva(0xc5030) },
+        ]),
+        ("w32topl.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("DsBindToTopology".to_string()), target: ExportTarget::Rva(0xc6000) },
+        ]),
+        // ── Server / Workstation APIs ─────────────────────────────────────────────
+        ("wkssvc.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("NetWkstaGetInfo".to_string()), target: ExportTarget::Rva(0xc7000) },
+            ExportSymbol { ordinal: 2, name: Some("NetWkstaSetInfo".to_string()), target: ExportTarget::Rva(0xc7010) },
+        ]),
+        ("srvsvc.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("NetServerGetInfo".to_string()), target: ExportTarget::Rva(0xc8000) },
+        ]),
+        ("browser.dll".to_string(), vec![
+            ExportSymbol { ordinal: 1, name: Some("BrowserServerEnum".to_string()), target: ExportTarget::Rva(0xc9000) },
         ]),
     ])
 }

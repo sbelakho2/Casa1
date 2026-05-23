@@ -545,6 +545,46 @@ pub fn set_dock_icon(icon_data: &[u8]) -> AppResult<()> {
     Ok(())
 }
 
+/// Set the application's activation policy.
+///
+/// When `regular` is `true`, sets the policy to
+/// `NSApplicationActivationPolicyRegular` (value 0), which allows the app
+/// to appear in the Dock and receive focus.  When `regular` is `false`, sets
+/// the policy to `NSApplicationActivationPolicyProhibited` (value 2), which
+/// hides the app from the Dock and prevents it from becoming active.
+///
+/// This is useful when transitioning between the game environment (where the
+/// Casa1 window should behave as a regular app) and background/headless modes.
+pub fn set_activation_policy(regular: bool) -> AppResult<()> {
+    let policy = if regular { 0i64 } else { 2i64 };
+    unsafe {
+        // SAFETY: NSApplication's sharedApplication and setActivationPolicy:
+        // are well-defined Cocoa calls.  The NSApp singleton is guaranteed to
+        // exist once NSApplicationLoad() or [NSApplication sharedApplication]
+        // has been called.  Passing an integer enum value (0 or 2) for the
+        // policy parameter is valid per the AppKit specification.
+        let app_cls = objc::class!(NSApplication);
+        let app: *mut objc::runtime::Object = msg_send![app_cls, sharedApplication];
+        if app.is_null() {
+            return Err(AppError::new(
+                ReasonCode::RcIo,
+                "NSApp is null — Cocoa application not initialized",
+            ));
+        }
+        let result: i64 = msg_send![app, setActivationPolicy: policy];
+        if result != 0 {
+            return Err(AppError::new(
+                ReasonCode::RcIo,
+                format!(
+                    "setActivationPolicy returned {} for policy={}",
+                    result, policy
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Add a Spotlight metadata import for the app bundle.
 pub fn add_spotlight_metadata(app_path: &Path) -> AppResult<()> {
     use std::process::Command;

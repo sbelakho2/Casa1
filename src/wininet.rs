@@ -873,8 +873,12 @@ impl WinInetStack {
     }
 
     // -----------------------------------------------------------------------
-    // InternetCanonicalizeUrlW — canonicalize a URL
-    // This is a simplified implementation that encodes spaces and special chars
+    // InternetCanonicalizeUrlW — canonicalize a URL (RFC 3986)
+    //
+    // Performs:
+    // 1. Percent-encoding of reserved and unsafe characters
+    // 2. Path segment normalization (collapsing dot-segments)
+    // 3. Scheme lowercasing
     // -----------------------------------------------------------------------
     pub fn internet_canonicalize_url_w(
         &self,
@@ -887,21 +891,117 @@ impl WinInetStack {
             url
         };
 
-        // Simple canonicalization: percent-encode spaces and control characters
-        let mut result = String::with_capacity(url.len());
-        for ch in url.chars() {
+        // RFC 3986 unreserved characters: ALPHA / DIGIT / "-" / "." / "_" / "~"
+        // RFC 3986 reserved characters (gen-delims + sub-delims): ":" / "/" / "?" / "#"
+        //   / "[" / "]" / "@" / "!" / "$" / "&" / "'" / "(" / ")" / "*" / "+" / "," / ";" / "="
+        // We percent-encode anything outside unreserved and allowed-reserved sets.
+        fn needs_percent_encoding(ch: char) -> bool {
             match ch {
-                ' ' => result.push_str("%20"),
-                '\t' => result.push_str("%09"),
-                '\n' => result.push_str("%0A"),
-                '\r' => result.push_str("%0D"),
-                c if (c as u32) < 0x20 || c == '\x7F' => {
-                    result.push_str(&format!("%{:02X}", c as u32));
-                }
-                c => result.push(c),
+                // Unreserved
+                'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '.' | '_' | '~' => false,
+                // Reserved (gen-delims) — keep as-is
+                ':' | '/' | '?' | '#' | '[' | ']' | '@' => false,
+                // Reserved (sub-delims) — keep as-is
+                '!' | '$' | '&' | '\'' | '(' | ')' | '*' | '+' | ',' | ';' | '=' => false,
+                // Percent sign — only keep if followed by two hex digits (already encoded)
+                '%' => false,
+                // Everything else (spaces, control chars, non-ASCII with encoding needed) → encode
+                _ => true,
             }
         }
+
+        fn should_preserve_percent_encoded(url: &str, pos: usize) -> bool {
+            let bytes = url.as_bytes();
+            if pos + 2 < bytes.len() {
+                bytes[pos + 1].is_ascii_hexdigit() && bytes[pos + 2].is_ascii_hexdigit()
+            } else {
+                false
+            }
+        }
+
+        // First pass: percent-encode
+        let mut encoded = String::with_capacity(url.len() * 3 / 2);
+        let mut chars = url.char_indices();
+        while let Some((i, ch)) = chars.next() {
+            if ch == '%' && should_preserve_percent_encoded(url, i) {
+                // Preserve existing valid percent-encoding
+                encoded.push('%');
+                if let Some((_, c1)) = chars.next() { encoded.push(c1); }
+                if let Some((_, c2)) = chars.next() { encoded.push(c2); }
+            } else if needs_percent_encoding(ch) {
+                for byte in ch.to_string().as_bytes() {
+                    encoded.push_str(&format!("%{:02X}", byte));
+                }
+            } else {
+                encoded.push(ch);
+            }
+        }
+
+        // Second pass: collapse dot-segments in the path portion
+        // Split scheme + authority from path + query + fragment
+        let mut result = String::with_capacity(encoded.len());
+
+        // Find scheme separator
+        if let Some(scheme_end) = encoded.find("://") {
+            // Lowercase the scheme
+            let scheme = &encoded[..scheme_end];
+            for ch in scheme.chars() {
+                result.push(ch.to_ascii_lowercase());
+            }
+            result.push_str("://");
+
+            // Find the end of authority (first '/' after '://', or '?' or '#')
+            let rest = &encoded[scheme_end + 3..];
+            let auth_end = rest.find(|c: char| c == '/' || c == '?' || c == '#')
+                .unwrap_or(rest.len());
+            result.push_str(&rest[..auth_end]); // Authority (host + optional port)
+
+            if auth_end < rest.len() {
+                let path_and_more = &rest[auth_end..];
+                result.push_str(&collapse_dot_segments(path_and_more));
+            }
+        } else {
+            // No scheme — just collapse the path
+            result = collapse_dot_segments(&encoded);
+        }
+
         result
+    }
+}
+
+/// Collapse dot-segments in a URL path per RFC 3986 section 5.2.4.
+///
+/// Handles "." and ".." segments, removing them and their parent as appropriate.
+fn collapse_dot_segments(path: &str) -> String {
+    let mut segments: Vec<&str> = Vec::new();
+    let has_leading_slash = path.starts_with('/');
+
+    for segment in path.split('/') {
+        match segment {
+            "." | "" => {
+                // Ignore single-dot and empty segments (preserve trailing slash)
+                if segments.is_empty() && has_leading_slash {
+                    // Keep leading slash implicitly
+                }
+            }
+            ".." => {
+                // Remove the previous segment
+                if !segments.is_empty() {
+                    segments.pop();
+                }
+            }
+            other => {
+                segments.push(other);
+            }
+        }
+    }
+
+    if segments.is_empty() && has_leading_slash {
+        "/".to_string()
+    } else if has_leading_slash {
+        format!("/{}", segments.join("/"))
+    } else {
+        segments.join("/")
     }
 }
 

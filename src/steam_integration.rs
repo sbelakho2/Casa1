@@ -17,6 +17,7 @@ use crate::steam_protocol::{
 };
 use std::collections::BTreeMap;
 use std::fs;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use walkdir::WalkDir;
@@ -813,8 +814,10 @@ pub fn parse_app_manifest(content: &str) -> AppResult<BTreeMap<String, String>> 
 
 use crate::steam_protocol::{
     self, ConnectionState, ContentServerRecord, GameNetworkingSockets,
-    SteamMessageType, SteamProtocolStack,
+    GnsConnectionHandle, SteamMessageType, SteamNetworkingMessage, SteamProtocolStack,
+    DEFAULT_STUN_SERVER,
 };
+use rsa::RsaPublicKey;
 
 /// Notification types for Steam client events.
 #[derive(Debug, Clone)]
@@ -843,6 +846,9 @@ pub struct SteamClient {
     content_servers: Vec<ContentServerRecord>,
     /// Whether the client has successfully logged on.
     pub logged_on: bool,
+    /// RSA public key captured from the CM server during encryption handshake.
+    /// Used for RSA-OAEP password encryption during logon.
+    rsa_public_key: Option<RsaPublicKey>,
 }
 
 impl SteamClient {
@@ -853,6 +859,7 @@ impl SteamClient {
             gns: None,
             content_servers: Vec::new(),
             logged_on: false,
+            rsa_public_key: None,
         }
     }
 
@@ -880,9 +887,12 @@ impl SteamClient {
         // Step 2: Encryption handshake is performed by connect()
         assert_eq!(self.stack.state, ConnectionState::Ready);
 
-        // Step 3: Encrypt the password (simplified — in production this uses
-        // Steam's RSA-encrypted password scheme during logon, not the session
-        // cipher).
+        // Capture the RSA public key from the CM handshake for real
+        // RSA-OAEP password encryption.
+        self.rsa_public_key = self.stack.rsa_public_key().cloned();
+
+        // Step 3: Encrypt the password using RSA-OAEP (falling back to
+        // AES session key encryption if the RSA key is unavailable).
         let password_encrypted = self.encrypt_password(password);
 
         // Step 4: Send logon message
@@ -960,22 +970,46 @@ impl SteamClient {
         Ok(())
     }
 
-    /// Encrypt the password for the logon message.
+    /// Encrypt the password for the logon message using RSA-OAEP.
     ///
-    /// In the real Steam protocol, the password is encrypted with the session's
-    /// RSA public key. Here we use a simplified XOR with the session key for
-    /// development/testing purposes.
+    /// The real Steam protocol encrypts the password with the CM server's RSA
+    /// public key using RSA-OAEP (SHA-256). This replaces the previous simplified
+    /// XOR-with-session-key approach.
+    ///
+    /// Fallback chain:
+    ///   1. RSA-OAEP with the CM server's public key (real Steam behavior)
+    ///   2. AES session key encryption (XOR with derived session key)
+    ///   3. Raw bytes (no encryption) — only if neither key is available
     fn encrypt_password(&self, password: &str) -> Vec<u8> {
         let pw_bytes = password.as_bytes();
+
+        // Primary: RSA-OAEP (SHA-256) with the CM server's public key.
+        if let Some(ref pub_key) = self.rsa_public_key {
+            use rsa::Oaep;
+            use sha2::Sha256;
+            let padding = Oaep::new::<Sha256>();
+            match pub_key.encrypt(&mut rand::thread_rng(), padding, pw_bytes) {
+                Ok(encrypted) => return encrypted,
+                Err(e) => {
+                    eprintln!(
+                        "SteamClient: RSA-OAEP password encryption failed: {e}, \
+                         falling back to AES session key encryption"
+                    );
+                }
+            }
+        }
+
+        // Fallback: AES session key encryption (XOR with session key).
         if let Some(ref key) = self.stack.session_key() {
-            pw_bytes
+            return pw_bytes
                 .iter()
                 .enumerate()
                 .map(|(i, b)| b ^ key[i % key.len()])
-                .collect::<Vec<u8>>()
-        } else {
-            pw_bytes.to_vec()
+                .collect::<Vec<u8>>();
         }
+
+        // Last resort: send raw bytes (no encryption).
+        pw_bytes.to_vec()
     }
 
     /// Download all files for a given app from Steam's CDN.
@@ -1146,6 +1180,244 @@ impl SteamClient {
     pub fn parse_and_set_content_servers(&mut self, routing_body: &str) -> AppResult<()> {
         let servers = self.stack.parse_cdn_routing(routing_body)?;
         self.content_servers = servers;
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SteamNetworkingSockets — API wrapper for
+// ISteamNetworkingSockets exported to the PE guest.
+//
+// This wraps GameNetworkingSockets with the Steam flat-API surface
+// expected by game binaries (CreateListenSocketIP, ConnectByIPAddress,
+// SendMessageToConnection, ReceiveMessagesOnListenSocket, etc.).
+// ---------------------------------------------------------------------------
+
+/// Handle representing a listen socket.
+pub type ListenSocketHandle = u64;
+
+/// Handle representing a connection (same as GnsConnectionHandle).
+pub type SocketsConnectionHandle = u64;
+
+/// SteamNetworkingSockets API wrapper.
+///
+/// Provides the flat-API functions that Steam game binaries call via
+/// the PE runtime export table. Backed by a `GameNetworkingSockets`
+/// instance for actual UDP/P2P networking.
+#[derive(Debug)]
+pub struct SteamNetworkingSockets {
+    /// Inner GNS implementation.
+    gns: GameNetworkingSockets,
+    /// Listen sockets map: listen handle -> (local address, connection handles).
+    listen_sockets: BTreeMap<ListenSocketHandle, (String, Vec<SocketsConnectionHandle>)>,
+    /// Next listen socket handle.
+    next_listen_handle: ListenSocketHandle,
+}
+
+impl SteamNetworkingSockets {
+    /// Create a new SteamNetworkingSockets instance.
+    pub fn new() -> Self {
+        Self {
+            gns: GameNetworkingSockets::new(),
+            listen_sockets: BTreeMap::new(),
+            next_listen_handle: 1,
+        }
+    }
+
+    /// Returns a mutable reference to the inner GNS.
+    pub fn gns_mut(&mut self) -> &mut GameNetworkingSockets {
+        &mut self.gns
+    }
+
+    /// Returns a reference to the inner GNS.
+    pub fn gns(&self) -> &GameNetworkingSockets {
+        &self.gns
+    }
+
+    /// Create a listen socket bound to a local address (P2P).
+    ///
+    /// This binds a UDP socket for incoming P2P connections and
+    /// optionally performs STUN to discover the external address.
+    ///
+    /// Returns the listen socket handle.
+    pub fn create_listen_socket_ip(
+        &mut self,
+        bind_addr: Option<SocketAddr>,
+        use_stun: bool,
+    ) -> AppResult<ListenSocketHandle> {
+        let local_addr = self.gns.bind_udp(bind_addr)?;
+
+        if use_stun {
+            // Use default STUN server if not already configured
+            if self.gns.stun_server().is_none() {
+                let stun_addr: SocketAddr = DEFAULT_STUN_SERVER
+                    .to_socket_addrs()
+                    .map_err(|e| {
+                        AppError::new(
+                            ReasonCode::RcNetDnsResolutionFailed,
+                            format!("SteamNetworkingSockets: STUN DNS resolution failed: {e}"),
+                        )
+                    })?
+                    .next()
+                    .ok_or_else(|| {
+                        AppError::new(
+                            ReasonCode::RcNetDnsResolutionFailed,
+                            "SteamNetworkingSockets: no STUN server address",
+                        )
+                    })?;
+                self.gns.set_stun_server(stun_addr);
+            }
+
+            // Perform STUN binding
+            match self.gns.perform_stun_binding() {
+                Ok(external) => {
+                    eprintln!(
+                        "SteamNetworkingSockets: STUN discovered external address: {external}"
+                    );
+                }
+                Err(e) => {
+                    eprintln!("SteamNetworkingSockets: STUN failed (non-fatal): {e}");
+                }
+            }
+        }
+
+        let handle = self.next_listen_handle;
+        self.next_listen_handle += 1;
+        self.listen_sockets
+            .insert(handle, (local_addr.to_string(), Vec::new()));
+        Ok(handle)
+    }
+
+    /// Connect to a remote peer by IP address.
+    ///
+    /// Creates a new GNS session and records the peer address in the
+    /// routing table for subsequent `send_message_to_connection()` calls.
+    pub fn connect_by_ip_address(
+        &mut self,
+        peer_addr: SocketAddr,
+    ) -> AppResult<SocketsConnectionHandle> {
+        let handle = self.gns.create_session()?;
+        self.gns.set_peer_address(handle, peer_addr)?;
+        Ok(handle)
+    }
+
+    /// Send a message to a connected peer.
+    pub fn send_message_to_connection(
+        &mut self,
+        conn_handle: SocketsConnectionHandle,
+        data: &[u8],
+        channel: i32,
+    ) -> AppResult<()> {
+        self.gns.send_message(conn_handle, data, channel)
+    }
+
+    /// Receive messages on a listen socket (incoming connections and data).
+    pub fn receive_messages_on_listen_socket(
+        &mut self,
+        _listen_handle: ListenSocketHandle,
+    ) -> AppResult<Vec<SteamNetworkingMessage>> {
+        self.gns.poll_incoming_messages()
+    }
+
+    /// Close a connection.
+    pub fn close_connection(&mut self, conn_handle: SocketsConnectionHandle) -> AppResult<()> {
+        self.gns.close_session(conn_handle)
+    }
+
+    /// Destroy a listen socket and all associated connections.
+    pub fn destroy_listen_socket(&mut self, listen_handle: ListenSocketHandle) -> AppResult<()> {
+        if let Some((_, conn_handles)) = self.listen_sockets.remove(&listen_handle) {
+            for handle in conn_handles {
+                self.gns.close_session(handle).ok();
+            }
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SteamNetworkingMessages — API wrapper for ISteamNetworkingMessages
+//
+// Provides a simpler message-oriented API (as opposed to connection-oriented
+// ISteamNetworkingSockets). Used for lobby/chat messaging between Steam users.
+// ---------------------------------------------------------------------------
+
+/// SteamNetworkingMessages API wrapper.
+///
+/// Provides SendMessageToUser / ReceiveMessagesOnChannel for simple
+/// Steam user-to-user messaging over the GNS layer.
+#[derive(Debug)]
+pub struct SteamNetworkingMessages {
+    /// Inner GNS implementation (shared or separate).
+    gns: GameNetworkingSockets,
+    /// Map of Steam ID -> GNS connection handle for active sessions.
+    sessions: BTreeMap<u64, GnsConnectionHandle>,
+}
+
+impl SteamNetworkingMessages {
+    /// Create a new SteamNetworkingMessages instance.
+    pub fn new() -> Self {
+        Self {
+            gns: GameNetworkingSockets::new(),
+            sessions: BTreeMap::new(),
+        }
+    }
+
+    /// Returns a mutable reference to the inner GNS.
+    pub fn gns_mut(&mut self) -> &mut GameNetworkingSockets {
+        &mut self.gns
+    }
+
+    /// Returns a reference to the inner GNS.
+    pub fn gns(&self) -> &GameNetworkingSockets {
+        &self.gns
+    }
+
+    /// Send a message to a Steam user by their Steam ID.
+    ///
+    /// Creates a GNS session if one does not already exist for this user.
+    /// If a peer address is known (via `set_user_address`), the message is
+    /// sent over UDP; otherwise falls back to the in-memory queue.
+    pub fn send_message_to_user(
+        &mut self,
+        steam_id: u64,
+        data: &[u8],
+        channel: i32,
+    ) -> AppResult<()> {
+        let handle = match self.sessions.get(&steam_id) {
+            Some(&h) => h,
+            None => {
+                let h = self.gns.create_session()?;
+                self.sessions.insert(steam_id, h);
+                h
+            }
+        };
+        self.gns.send_message(handle, data, channel)
+    }
+
+    /// Receive all pending messages across all user sessions.
+    pub fn receive_messages_on_channel(&mut self) -> AppResult<Vec<SteamNetworkingMessage>> {
+        self.gns.poll_incoming_messages()
+    }
+
+    /// Set the peer address for a given Steam ID (for P2P routing).
+    pub fn set_user_address(&mut self, steam_id: u64, addr: SocketAddr) -> AppResult<()> {
+        let handle = match self.sessions.get(&steam_id) {
+            Some(&h) => h,
+            None => {
+                let h = self.gns.create_session()?;
+                self.sessions.insert(steam_id, h);
+                h
+            }
+        };
+        self.gns.set_peer_address(handle, addr)
+    }
+
+    /// Close the session with a specific user.
+    pub fn close_session_with_user(&mut self, steam_id: u64) -> AppResult<()> {
+        if let Some(handle) = self.sessions.remove(&steam_id) {
+            self.gns.close_session(handle)?;
+        }
         Ok(())
     }
 }

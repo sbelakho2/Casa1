@@ -2,6 +2,10 @@
 //!
 //! Phase 6.5.3 from the execution plan. Covers full Steam boot→login→browse→
 //! download→install→launch→play→exit workflow orchestration via the diagnostics,
+//! steam protocol, and performance modules, plus MSAA resolve integration tests.
+//!
+//! Phase 6.5.3 from the execution plan. Covers full Steam boot→login→browse→
+//! download→install→launch→play→exit workflow orchestration via the diagnostics,
 //! steam protocol, and performance modules.
 //!
 //! Tests that may depend on external services (Steam CM servers) handle the
@@ -1253,4 +1257,409 @@ fn t27_17_diagnostics_error_paths() {
     let (m, t) = compute_pixel_diff(&empty_a, &empty_b, 0.0);
     assert_eq!(m, 0, "empty buffers should have 0 matching pixels");
     assert_eq!(t, 0, "empty buffers should have 0 total pixels");
+}
+
+// ===========================================================================
+// MSAA Resolve Integration Tests
+// ===========================================================================
+//
+// These tests verify the MSAA resolve functionality across all backends:
+//   - D3D11 ResolveSubresource dispatch
+//   - D3D12 resolve_subresource_region dispatch
+//   - Metal backend resolve_msaa_texture integration
+
+// ---------------------------------------------------------------------------
+// t27_18: D3D11 ResolveSubresource — basic dispatch
+// ---------------------------------------------------------------------------
+
+#[test]
+fn t27_18_d3d11_resolve_subresource_dispatch() {
+    // Create a D3D11 device and resources for ResolveSubresource
+    use casa1::d3d11::{
+        D3d11Device, DeviceCreationRequest, FeatureLevel,
+    };
+    use casa1::gfx::{GraphicsBackend, ResourceDesc, ResourceUsageHint, DxgiFormat};
+
+    let mut backend = GraphicsBackend::new();
+
+    // Create a multisampled source resource and a single-sample destination
+    let msaa_desc = ResourceDesc {
+        name: "msaa_src".to_string(),
+        format: DxgiFormat::R8G8B8A8Unorm,
+        heap: casa1::gfx::HeapType::Default,
+        size: 64 * 64 * 4,
+        subresources: 1,
+        initial_state: casa1::gfx::ResourceState::Common,
+        usage_hint: ResourceUsageHint::Texture {
+            sampled: false,
+            render_target: true,
+            depth_stencil: false,
+            cpu_write_frequent: false,
+        },
+    };
+
+    let resolve_desc = ResourceDesc {
+        name: "resolve_dst".to_string(),
+        format: DxgiFormat::R8G8B8A8Unorm,
+        heap: casa1::gfx::HeapType::Default,
+        size: 64 * 64 * 4,
+        subresources: 1,
+        initial_state: casa1::gfx::ResourceState::Common,
+        usage_hint: ResourceUsageHint::Texture {
+            sampled: false,
+            render_target: true,
+            depth_stencil: false,
+            cpu_write_frequent: false,
+        },
+    };
+
+    // Create resources through the backend
+    let msaa_tex = backend.create_resource(msaa_desc);
+    assert!(msaa_tex.is_ok(), "Creating MSAA source texture should succeed");
+    let resolve_tex = backend.create_resource(resolve_desc);
+    assert!(resolve_tex.is_ok(), "Creating resolve destination texture should succeed");
+
+    let msaa_id = msaa_tex.unwrap();
+    let resolve_id = resolve_tex.unwrap();
+
+    // Create a command list and record a resolve subresource operation
+    let allocator = backend.create_command_allocator();
+    let root_sig = backend.create_root_signature(casa1::gfx::RootSignatureDesc {
+        descriptor_tables: vec![],
+        root_constants: 0,
+        ..Default::default()
+    });
+    let pso = backend.create_pipeline_state(
+        root_sig,
+        casa1::gfx::PipelineStateDesc {
+            label: "resolve_test".to_string(),
+            compute: false,
+            render_target_formats: vec![DxgiFormat::R8G8B8A8Unorm],
+            depth_format: None,
+        },
+    );
+    let list = backend.create_graphics_command_list(allocator, pso);
+
+    // Record the resolve subresource operation
+    let format_u32 = DxgiFormat::R8G8B8A8Unorm as u32;
+    let resolve_result = backend.record_resolve_subresource(
+        list,
+        resolve_id,
+        msaa_id,
+        format_u32,
+        0, // D3D12_RESOLVE_MODE_DECOMPRESS → Average
+    );
+    assert!(resolve_result.is_ok(), "Recording ResolveSubresource should succeed");
+
+    // Close and execute the command list
+    let stream = backend.close_command_list(list);
+    assert!(stream.is_ok(), "Closing command list should succeed");
+
+    let queue = backend.create_command_queue();
+    let exec_result = backend.execute_command_lists(
+        queue,
+        &[stream.unwrap()],
+        None,
+    );
+    assert!(exec_result.is_ok(), "Executing resolve command list should succeed");
+
+    // Clean up resources
+    backend.destroy_resource(msaa_id).ok();
+    backend.destroy_resource(resolve_id).ok();
+}
+
+// ---------------------------------------------------------------------------
+// t27_19: D3D12 resolve_subresource_region dispatch
+// ---------------------------------------------------------------------------
+
+#[test]
+fn t27_19_d3d12_resolve_subresource_region_dispatch() {
+    use casa1::d3d12::D3d12Runtime;
+    use casa1::gfx::{
+        DxgiFormat, ResourceDesc, ResourceUsageHint, RootSignatureDesc, PipelineStateDesc,
+    };
+
+    let mut runtime = D3d12Runtime::new();
+
+    // Create multisampled source and single-sample destination resources
+    let msaa_desc = ResourceDesc {
+        name: "d3d12_msaa_src".to_string(),
+        format: DxgiFormat::R8G8B8A8Unorm,
+        heap: casa1::gfx::HeapType::Default,
+        size: 128 * 128 * 4,
+        subresources: 1,
+        initial_state: casa1::gfx::ResourceState::Common,
+        usage_hint: ResourceUsageHint::Texture {
+            sampled: false,
+            render_target: true,
+            depth_stencil: false,
+            cpu_write_frequent: false,
+        },
+    };
+
+    let resolve_desc = ResourceDesc {
+        name: "d3d12_resolve_dst".to_string(),
+        format: DxgiFormat::R8G8B8A8Unorm,
+        heap: casa1::gfx::HeapType::Default,
+        size: 128 * 128 * 4,
+        subresources: 1,
+        initial_state: casa1::gfx::ResourceState::Common,
+        usage_hint: ResourceUsageHint::Texture {
+            sampled: false,
+            render_target: true,
+            depth_stencil: false,
+            cpu_write_frequent: false,
+        },
+    };
+
+    // Create resources
+    let msaa_tex = runtime.create_committed_resource(msaa_desc);
+    assert!(msaa_tex.is_ok(), "Creating D3D12 MSAA texture should succeed");
+    let resolve_tex = runtime.create_committed_resource(resolve_desc);
+    assert!(resolve_tex.is_ok(), "Creating D3D12 resolve target should succeed");
+
+    let msaa_id = msaa_tex.unwrap();
+    let resolve_id = resolve_tex.unwrap();
+
+    // Create a command list
+    let root_sig = runtime.create_root_signature(RootSignatureDesc {
+        descriptor_tables: vec![],
+        root_constants: 0,
+        ..Default::default()
+    });
+    let pso = runtime.create_pipeline_state(
+        root_sig,
+        PipelineStateDesc {
+            label: "d3d12_resolve_test".to_string(),
+            compute: false,
+            render_target_formats: vec![DxgiFormat::R8G8B8A8Unorm],
+            depth_format: None,
+        },
+    );
+    let allocator = runtime.create_command_allocator();
+    let list = runtime.create_graphics_command_list(allocator, pso);
+
+    // Call resolve_subresource_region (maps to record_resolve_subresource)
+    let format_u32 = DxgiFormat::R8G8B8A8Unorm as u32;
+    let resolve_result = runtime.resolve_subresource_region(
+        list,
+        resolve_id,
+        msaa_id,
+        format_u32,
+    );
+    assert!(resolve_result.is_ok(), "D3D12 resolve_subresource_region should succeed");
+
+    // Clean up
+    runtime.destroy_resource(msaa_id).ok();
+    runtime.destroy_resource(resolve_id).ok();
+}
+
+// ---------------------------------------------------------------------------
+// t27_20: D3D12 ResolveSubresource with different formats
+// ---------------------------------------------------------------------------
+
+#[test]
+fn t27_20_d3d12_resolve_subresource_various_formats() {
+    use casa1::d3d12::D3d12Runtime;
+    use casa1::gfx::{
+        DxgiFormat, ResourceDesc, ResourceUsageHint, RootSignatureDesc, PipelineStateDesc,
+    };
+
+    let mut runtime = D3d12Runtime::new();
+    let root_sig = runtime.create_root_signature(RootSignatureDesc {
+        descriptor_tables: vec![],
+        root_constants: 0,
+        ..Default::default()
+    });
+    let pso = runtime.create_pipeline_state(
+        root_sig,
+        PipelineStateDesc {
+            label: "resolve_formats".to_string(),
+            compute: false,
+            render_target_formats: vec![DxgiFormat::R8G8B8A8Unorm],
+            depth_format: None,
+        },
+    );
+    let allocator = runtime.create_command_allocator();
+    let list = runtime.create_graphics_command_list(allocator, pso);
+
+    // Test with different DXGI formats
+    let formats = [
+        DxgiFormat::R8G8B8A8Unorm,
+        DxgiFormat::R32G32B32A32Float,
+        DxgiFormat::R16G16B16A16Float,
+        DxgiFormat::R10G10B10A2Unorm,
+        DxgiFormat::B8G8R8A8Unorm,
+    ];
+
+    for &fmt in &formats {
+        let msaa_desc = ResourceDesc {
+            name: format!("msaa_{:?}", fmt),
+            format: fmt,
+            heap: casa1::gfx::HeapType::Default,
+            size: 32 * 32 * 4,
+            subresources: 1,
+            initial_state: casa1::gfx::ResourceState::Common,
+            usage_hint: ResourceUsageHint::Texture {
+                sampled: false,
+                render_target: true,
+                depth_stencil: false,
+                cpu_write_frequent: false,
+            },
+        };
+        let resolve_desc = ResourceDesc {
+            name: format!("resolve_{:?}", fmt),
+            format: fmt,
+            heap: casa1::gfx::HeapType::Default,
+            size: 32 * 32 * 4,
+            subresources: 1,
+            initial_state: casa1::gfx::ResourceState::Common,
+            usage_hint: ResourceUsageHint::Texture {
+                sampled: false,
+                render_target: true,
+                depth_stencil: false,
+                cpu_write_frequent: false,
+            },
+        };
+
+        if let (Ok(msaa), Ok(resolve)) = (
+            runtime.create_committed_resource(msaa_desc),
+            runtime.create_committed_resource(resolve_desc),
+        ) {
+            let result = runtime.resolve_subresource_region(list, resolve, msaa, fmt as u32);
+            assert!(result.is_ok(), "ResolveSubresource for format {:?} should succeed", fmt);
+            runtime.destroy_resource(msaa).ok();
+            runtime.destroy_resource(resolve).ok();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// t27_21: Metal backend resolve_msaa_texture — no panic on integration
+// ---------------------------------------------------------------------------
+
+#[test]
+fn t27_21_metal_backend_resolve_msaa_integration() {
+    use casa1::gfx::{
+        DxgiFormat, ResourceDesc, ResourceUsageHint, GraphicsBackend, RootSignatureDesc,
+        PipelineStateDesc,
+    };
+    use casa1::metal_backend::MetalGpuBackend;
+
+    // Try to create a Metal backend
+    let mut backend = match MetalGpuBackend::new() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("[skip] MetalGpuBackend not available: {e}");
+            return;
+        }
+    };
+
+    // Create MSAA source and resolve destination textures.
+    // create_texture takes (width, height, pixel_format, usage) and returns u64.
+    let msaa = backend.create_texture(
+        64,
+        64,
+        metal::MTLPixelFormat::BGRA8Unorm,
+        metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead,
+    );
+
+    let resolve = backend.create_texture(
+        64,
+        64,
+        metal::MTLPixelFormat::BGRA8Unorm,
+        metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead,
+    );
+
+    // The resolve_msaa function in metal_backend requires a MetalRenderEncoder.
+    // We verify the types exist and the resolve configuration is accessible.
+    // For a full integration test, this would be done within a render pass.
+    use casa1::metal_backend::{MsaaResolveConfig, MsaaResolveMode};
+    let config = MsaaResolveConfig {
+        sample_count: 4,
+        resolve_mode: MsaaResolveMode::Average,
+        custom_resolve_shader: None,
+    };
+
+    // Verify config is constructed correctly
+    assert_eq!(config.sample_count, 4, "MSAA sample count should be 4");
+    assert_eq!(config.resolve_mode as u32, 0, "Average resolve mode should be 0");
+
+    // Get texture info (existence check)
+    let msaa_info = backend.get_texture(msaa);
+    assert!(msaa_info.is_some(), "MSAA texture should exist in backend");
+    let resolve_info = backend.get_texture(resolve);
+    assert!(resolve_info.is_some(), "Resolve texture should exist in backend");
+
+    if let (Some(msaa_info), Some(resolve_info)) = (msaa_info, resolve_info) {
+        assert_eq!(msaa_info.width(), 64, "MSAA source should have width 64");
+        assert_eq!(resolve_info.width(), 64, "Resolve target should have width 64");
+    }
+
+    // Clean up - destroy_texture returns ()
+    backend.destroy_texture(msaa);
+    backend.destroy_texture(resolve);
+}
+
+// ---------------------------------------------------------------------------
+// t27_22: D3D11 ResolveSubresource via D3D11Device
+// ---------------------------------------------------------------------------
+
+#[test]
+fn t27_22_d3d11_device_resolve_subresource() {
+    use casa1::d3d11::{self, D3d11Device, d3d11_create_device};
+    use casa1::gfx::{GraphicsBackend, DxgiFormat, ResourceUsageHint};
+
+    // Create a D3D11 device using the free function (D3D11Device has no ::new())
+    let mut device = match d3d11_create_device(d3d11::DeviceCreationRequest {
+        requested_feature_levels: vec![d3d11::FeatureLevel::Level11_0],
+    }) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("[skip] D3D11Device creation failed: {e}");
+            return;
+        }
+    };
+
+    // Create MSAA source and resolve target resources using create_texture_2d_with_usage
+    let msaa = device.create_texture_2d_with_usage(
+        "msaa_src",
+        64,
+        64,
+        DxgiFormat::R8G8B8A8Unorm,
+        ResourceUsageHint::Texture {
+            sampled: false,
+            render_target: true,
+            depth_stencil: false,
+            cpu_write_frequent: false,
+        },
+    );
+    assert!(msaa.is_ok(), "Creating MSAA source should succeed");
+    let msaa_id = msaa.unwrap();
+
+    let dst = device.create_texture_2d_with_usage(
+        "resolve_dst",
+        64,
+        64,
+        DxgiFormat::R8G8B8A8Unorm,
+        ResourceUsageHint::Texture {
+            sampled: false,
+            render_target: true,
+            depth_stencil: false,
+            cpu_write_frequent: false,
+        },
+    );
+    assert!(dst.is_ok(), "Creating resolve target should succeed");
+    let dst_id = dst.unwrap();
+
+    // Call resolve_subresource on the D3D11 device
+    // resolve_subresource(&mut self, dst, dst_subresource, src, src_subresource, format)
+    let resolve_result = device.resolve_subresource(
+        dst_id,
+        0,
+        msaa_id,
+        0,
+        DxgiFormat::R8G8B8A8Unorm as u32,
+    );
+    assert!(resolve_result.is_ok(), "D3D11 ResolveSubresource via device should succeed");
 }

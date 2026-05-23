@@ -10,6 +10,14 @@ pub struct AppError {
     pub reproduction_hints: Vec<String>,
 }
 
+impl std::fmt::Display for AppError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code.name(), self.message)
+    }
+}
+
+impl std::error::Error for AppError {}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorResponse {
     pub reason_code: u32,

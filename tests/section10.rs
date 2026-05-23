@@ -62,6 +62,9 @@ fn t10_1_golden_pcm_deterministic_synth_output_crc_matches_reference_within_tole
             SourceBuffer {
                 tag: "pcm16".to_string(),
                 samples: AudioSamples::Pcm16(vec![i16::MAX, i16::MIN]),
+                loop_begin: None,
+                loop_count: None,
+                loop_length: None,
             },
         )
         .expect("submit source A buffer");
@@ -71,6 +74,9 @@ fn t10_1_golden_pcm_deterministic_synth_output_crc_matches_reference_within_tole
             SourceBuffer {
                 tag: "float32".to_string(),
                 samples: AudioSamples::Float32(stereo(&[[0.1, 0.2], [0.2, 0.3], [0.3, 0.4], [0.4, 0.5]])),
+                loop_begin: None,
+                loop_count: None,
+                loop_length: None,
             },
         )
         .expect("submit source B buffer");
@@ -142,6 +148,9 @@ fn t10_host_render_export_writes_playable_wav() {
             SourceBuffer {
                 tag: "preview".to_string(),
                 samples: AudioSamples::Float32(stereo(&[[0.1, -0.1], [0.25, -0.25], [0.5, -0.5]])),
+                loop_begin: None,
+                loop_count: None,
+                loop_length: None,
             },
         )
         .expect("submit preview source buffer");
@@ -188,6 +197,9 @@ fn t10_2_callback_timing_buffer_callbacks_occur_with_correct_ordering() {
             SourceBuffer {
                 tag: "first".to_string(),
                 samples: AudioSamples::Float32(vec![0.1, 0.2]),
+                loop_begin: None,
+                loop_count: None,
+                loop_length: None,
             },
         )
         .expect("submit first buffer");
@@ -197,6 +209,9 @@ fn t10_2_callback_timing_buffer_callbacks_occur_with_correct_ordering() {
             SourceBuffer {
                 tag: "second".to_string(),
                 samples: AudioSamples::Float32(vec![0.3, 0.4]),
+                loop_begin: None,
+                loop_count: None,
+                loop_length: None,
             },
         )
         .expect("submit second buffer");
@@ -250,6 +265,9 @@ fn t10_3_device_switch_during_playback_matches_expected_stop_and_recover_pattern
             SourceBuffer {
                 tag: "switch".to_string(),
                 samples: AudioSamples::Float32(stereo(&[[0.0, 0.1], [0.2, 0.3]])),
+                loop_begin: None,
+                loop_count: None,
+                loop_length: None,
             },
         )
         .expect("submit playback buffer");

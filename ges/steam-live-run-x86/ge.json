@@ -254,6 +254,14 @@
         "last_access_time_ticks": 17790514937043860,
         "last_write_time_ticks": 17790514937043860
       },
+      "C:\\package\\steam_client_win32.installed": {
+        "kind": "File",
+        "original_case": "steam_client_win32.installed",
+        "attributes": [],
+        "creation_time_ticks": 133607153160000000,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 133607153160000000
+      },
       "C:\\steam.exe": {
         "kind": "File",
         "original_case": "Steam.exe",

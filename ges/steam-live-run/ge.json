@@ -23,6 +23,15 @@
   ],
   "override_profiles": [],
   "fs_state": {
-    "entries": {}
+    "entries": {
+      "C:\\users\\casa1\\appdata\\local\\temp\\steamsetup.exe": {
+        "kind": "File",
+        "original_case": "SteamSetup.exe",
+        "attributes": [],
+        "creation_time_ticks": 0,
+        "last_access_time_ticks": 0,
+        "last_write_time_ticks": 0
+      }
+    }
   }
 }

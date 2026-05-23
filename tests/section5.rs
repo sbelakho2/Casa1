@@ -22,6 +22,7 @@ fn t5_1_file_api_differential_suite_vs_independent_reference() {
             CreationDisposition::CreateAlways,
             true,
             false,
+            false,
         )
         .expect("create demo file");
     let descriptor = win32.describe_handle(file).expect("file handle descriptor");
@@ -78,7 +79,7 @@ fn t5_1_file_api_differential_suite_vs_independent_reference() {
         .expect("move file");
     let temp_path = win32.get_temp_path_w().expect("temp path");
     assert!(temp_path.ends_with("Temp"));
-    let temp_file = win32.get_temp_file_name_w("CASA").expect("temp file name");
+    let temp_file = win32.get_temp_file_name_w("", "CASA").expect("temp file name");
     assert!(temp_file.contains("CASA"));
     win32.delete_file_w("C:\\Games\\moved.txt").expect("delete moved file");
     win32.close_handle(file).expect("close file handle");
@@ -98,26 +99,27 @@ fn t5_2_overlapped_io_randomized_tests_vs_independent_reference() {
             CreationDisposition::CreateAlways,
             false,
             true,
+            false,
         )
         .expect("create async file");
     assert!(win32.file_state(file).expect("async file state").overlapped);
-    let event = win32.create_event(false, false, false);
+    let event = win32.create_event(false, false, false, None);
     for (offset, payload) in [(0_u64, b"abcdef".as_slice()), (2_u64, b"XYZ".as_slice())] {
         let write = win32
-            .write_file_overlapped(file, payload, offset, Some(event))
+            .write_file_overlapped(file, payload, offset, Some(event.0))
             .expect("overlapped write");
         assert!(write.completed);
         assert_eq!(write.bytes_transferred, payload.len() as u32);
     }
     assert_eq!(
         win32
-            .wait_for_single_object(event, 0, false, None)
+            .wait_for_single_object(event.0, 0, false, None)
             .expect("wait on file event"),
         WaitStatus::Object0
     );
-    let read_event = win32.create_event(false, false, false);
+    let read_event = win32.create_event(false, false, false, None);
     let read = win32
-        .read_file_overlapped(file, 4, 2, Some(read_event))
+        .read_file_overlapped(file, 4, 2, Some(read_event.0))
         .expect("overlapped read");
     assert_eq!(
         win32.get_overlapped_result(read.id, false).expect("read overlapped result"),
@@ -125,9 +127,9 @@ fn t5_2_overlapped_io_randomized_tests_vs_independent_reference() {
     );
 
     let pipe = win32.create_named_pipe(r"\\.\pipe\steam-ipc", false);
-    let pipe_event = win32.create_event(false, false, false);
+    let pipe_event = win32.create_event(false, false, false, None);
     let pending = win32
-        .connect_named_pipe(pipe, Some(pipe_event), true)
+        .connect_named_pipe_internal(pipe, Some(pipe_event.0), true)
         .expect("pending connect")
         .expect("overlapped connect id");
     win32.cancel_io_ex(pipe, Some(pending)).expect("cancel pending connect");
@@ -148,7 +150,7 @@ fn t5_3_create_process_quoting_suite_vs_independent_reference_argv() {
     let temp_dir = TempDir::new().expect("temp dir");
     let ge = create_ge(&temp_dir, "section5-process");
     let mut win32 = Win32Subsystem::new(ge, true);
-    let inheritable = win32.create_event(true, false, true);
+    let inheritable = win32.create_event(true, false, true, None);
     let mut env = BTreeMap::new();
     env.insert("ALPHA".to_string(), "1".to_string());
     env.insert("BETA".to_string(), "hello world".to_string());
@@ -205,7 +207,7 @@ fn t5_3_create_process_quoting_suite_vs_independent_reference_argv() {
         .modules
         .iter()
         .any(|entry| entry.module_name == "kernel32.dll"));
-    let descriptor = win32.describe_handle(inheritable).expect("inheritable handle descriptor");
+    let descriptor = win32.describe_handle(inheritable.0).expect("inheritable handle descriptor");
     assert!(descriptor.inheritable);
 }
 

@@ -2043,6 +2043,1341 @@ pub fn mix_streams(destination: &mut [f32], source: &[f32]) {
 }
 
 // ---------------------------------------------------------------------------
+// XAPO Audio Effects Processing — COM-style interface
+// ---------------------------------------------------------------------------
+
+// ── XAPO GUIDs ─────────────────────────────────────────────────────────────
+
+/// CLSID_XAPO: {5EC3B1C3-5E4B-4f4e-B0E0-7B7D1E7B9E7C}
+pub const CLSID_XAPO: [u8; 16] = [
+    0xC3, 0xB1, 0xC3, 0x5E, 0x4B, 0x5E, 0x4E, 0x4F,
+    0xB0, 0xE0, 0x7B, 0x7D, 0x1E, 0x7B, 0x9E, 0x7C,
+];
+
+/// IID_IXAPO: {A1109C34-E46B-47c7-8E0F-7B7D1E7B9E7C}
+pub const IID_IXAPO: [u8; 16] = [
+    0x34, 0x9C, 0x10, 0xA1, 0x6B, 0xE4, 0xC7, 0x47,
+    0x8E, 0x0F, 0x7B, 0x7D, 0x1E, 0x7B, 0x9E, 0x7C,
+];
+
+/// IID_IXAPOParameters: {A1109C35-E46B-47c7-8E0F-7B7D1E7B9E7D}
+pub const IID_IXAPOParameters: [u8; 16] = [
+    0x35, 0x9C, 0x10, 0xA1, 0x6B, 0xE4, 0xC7, 0x47,
+    0x8E, 0x0F, 0x7B, 0x7D, 0x1E, 0x7B, 0x9E, 0x7D,
+];
+
+// ── XAPO flags ──────────────────────────────────────────────────────────────
+
+/// XAPO effect flag: effect can process in-place (input == output buffer).
+pub const XAPO_FLAG_INPLACE: u32 = 0x0001;
+/// XAPO effect flag: input and output buffer counts must be equal.
+pub const XAPO_FLAG_BUFFERCOUNT_MUST_EQUAL: u32 = 0x0004;
+
+/// XAPO buffer flag: buffer contains silence.
+pub const XAPO_BUFFER_SILENT: u32 = 0x0001;
+/// XAPO buffer flag: buffer contains valid audio data.
+pub const XAPO_BUFFER_VALID: u32 = 0x0002;
+
+// ── XAPO_REGISTRATION_PROPERTIES ────────────────────────────────────────────
+
+/// COM-style registration properties for an XAPO audio effect.
+///
+/// This struct matches the Windows `XAPO_REGISTRATION_PROPERTIES` layout
+/// and can be written directly into guest memory for COM introspection.
+#[repr(C)]
+#[derive(Debug, Clone)]
+pub struct XAPO_REGISTRATION_PROPERTIES {
+    /// CLSID identifying the effect type.
+    pub clsid: [u8; 16],
+    /// Human-readable friendly name (UTF-16, null-terminated).
+    pub friendly_name: [u16; 256],
+    /// Copyright/licensing info (UTF-16, null-terminated).
+    pub copyright_info: [u16; 256],
+    /// Major version number.
+    pub major_version: u32,
+    /// Minor version number.
+    pub minor_version: u32,
+    /// Capability flags (XAPO_FLAG_*).
+    pub flags: u32,
+    /// Minimum number of input buffers supported.
+    pub min_input_buffer_count: u32,
+    /// Maximum number of input buffers supported.
+    pub max_input_buffer_count: u32,
+    /// Minimum number of output buffers supported.
+    pub min_output_buffer_count: u32,
+    /// Maximum number of output buffers supported.
+    pub max_output_buffer_count: u32,
+}
+
+impl XAPO_REGISTRATION_PROPERTIES {
+    /// Create a new registration properties value with defaults.
+    pub fn new(clsid: [u8; 16], friendly_name: &str, flags: u32) -> Self {
+        let mut fn_buf = [0u16; 256];
+        let fn_chars: Vec<u16> = friendly_name.encode_utf16().take(255).collect();
+        fn_buf[..fn_chars.len()].copy_from_slice(&fn_chars);
+        let mut ci_buf = [0u16; 256];
+        let ci_str = "Casa1 XAPO Effect";
+        let ci_chars: Vec<u16> = ci_str.encode_utf16().take(255).collect();
+        ci_buf[..ci_chars.len()].copy_from_slice(&ci_chars);
+        Self {
+            clsid,
+            friendly_name: fn_buf,
+            copyright_info: ci_buf,
+            major_version: 1,
+            minor_version: 0,
+            flags,
+            min_input_buffer_count: 1,
+            max_input_buffer_count: 1,
+            min_output_buffer_count: 1,
+            max_output_buffer_count: 1,
+        }
+    }
+}
+
+// ── XAPO_BUFFER ──────────────────────────────────────────────────────────────
+
+/// COM-style audio buffer descriptor used by XAPO::Process.
+///
+/// Matches the Windows `XAPO_BUFFER` layout.
+#[repr(C)]
+#[derive(Debug, Clone)]
+pub struct XAPO_BUFFER {
+    /// Pointer to interleaved float audio samples in guest memory.
+    pub buffer: *const f32,
+    /// Buffer flags (XAPO_BUFFER_SILENT | XAPO_BUFFER_VALID).
+    pub flags: u32,
+    /// Number of valid audio frames in the buffer.
+    pub valid_frame_count: u32,
+}
+
+// Safety: XAPO_BUFFER is only used as a read-only descriptor, not sent across threads.
+unsafe impl Send for XAPO_BUFFER {}
+unsafe impl Sync for XAPO_BUFFER {}
+
+// ---------------------------------------------------------------------------
+// XapoEffect trait
+// ---------------------------------------------------------------------------
+
+/// Trait implemented by all XAPO audio effects.
+///
+/// Effects process interleaved float audio buffers, can be reset, and expose
+/// their registration properties for COM introspection. Each effect stores its
+/// own channel count, sample rate, and processing state internally.
+pub trait XapoEffect: Send {
+    /// Process audio data.
+    ///
+    /// `input` and `output` are interleaved float buffers. For in-place effects
+    /// (`XAPO_FLAG_INPLACE`), `input` and `output` may point to the same buffer.
+    ///
+    /// The effect determines the frame count from `input.len() / self.channels()`
+    /// and the channel count from its internal configuration. Returns `Ok(())`
+    /// on success, or an error if buffer sizes are incompatible.
+    fn process(&mut self, input: &[f32], output: &mut [f32]) -> AppResult<()>;
+
+    /// Reset the effect to its initial state (clear delay lines, envelopes, etc.).
+    fn reset(&mut self);
+
+    /// Return a reference to the effect's COM-style registration properties.
+    fn registration(&self) -> &XAPO_REGISTRATION_PROPERTIES;
+
+    /// Return the number of audio channels this effect is configured for.
+    fn channels(&self) -> u16;
+
+    /// Return the sample rate this effect is configured for.
+    fn sample_rate(&self) -> u32;
+}
+
+// ---------------------------------------------------------------------------
+// Built-in XAPO effects
+// ---------------------------------------------------------------------------
+
+/// Schroeder reverb effect.
+///
+/// Uses 4 parallel comb filters feeding 2 series all-pass filters. This
+/// classic DSP design produces a dense, natural-sounding reverb tail.
+pub struct XapoReverb {
+    /// Wet/dry mix (0.0 = dry only, 1.0 = wet only).
+    wet: f32,
+    /// Sample rate for delay calculation.
+    sample_rate: u32,
+    /// Comb filter delay lengths in samples.
+    comb_delays: [usize; 4],
+    /// Comb filter feedback coefficients.
+    comb_feedback: [f32; 4],
+    /// All-pass filter delay lengths in samples.
+    allpass_delays: [usize; 2],
+    /// All-pass filter feedback coefficient.
+    allpass_feedback: f32,
+    /// Comb filter delay line buffers.
+    comb_buffers: [Vec<f32>; 4],
+    /// Comb filter write positions.
+    comb_positions: [usize; 4],
+    /// All-pass filter delay line buffers.
+    allpass_buffers: [Vec<f32>; 2],
+    /// All-pass filter write positions.
+    allpass_positions: [usize; 2],
+    /// Output gain (wet level).
+    gain: f32,
+    /// Number of channels.
+    channels: u16,
+    /// COM registration properties.
+    registration: XAPO_REGISTRATION_PROPERTIES,
+}
+
+impl XapoReverb {
+    /// Create a new reverb effect with the given parameters.
+    ///
+    /// * `wet` — wet/dry mix (0.0–1.0).
+    /// * `sample_rate` — audio sample rate in Hz (used for delay calculations).
+    /// * `channels` — number of audio channels.
+    pub fn new(wet: f32, sample_rate: u32, channels: u16) -> Self {
+        // Comb delays (in samples): ~30ms, 37ms, 43ms, 50ms
+        let comb_ms = [30.0, 37.0, 43.0, 50.0];
+        let comb_delays: [usize; 4] = [
+            (comb_ms[0] * sample_rate as f32 / 1000.0).round() as usize,
+            (comb_ms[1] * sample_rate as f32 / 1000.0).round() as usize,
+            (comb_ms[2] * sample_rate as f32 / 1000.0).round() as usize,
+            (comb_ms[3] * sample_rate as f32 / 1000.0).round() as usize,
+        ];
+        let comb_feedback = [0.84, 0.82, 0.79, 0.77];
+
+        // All-pass delays: ~5ms, 3.5ms
+        let allpass_ms = [5.0, 3.5];
+        let allpass_delays: [usize; 2] = [
+            (allpass_ms[0] * sample_rate as f32 / 1000.0).round() as usize,
+            (allpass_ms[1] * sample_rate as f32 / 1000.0).round() as usize,
+        ];
+
+        let channels_usize = channels.max(1) as usize;
+        let comb_buffers = [
+            vec![0.0f32; comb_delays[0] * channels_usize],
+            vec![0.0f32; comb_delays[1] * channels_usize],
+            vec![0.0f32; comb_delays[2] * channels_usize],
+            vec![0.0f32; comb_delays[3] * channels_usize],
+        ];
+        let allpass_buffers = [
+            vec![0.0f32; allpass_delays[0] * channels_usize],
+            vec![0.0f32; allpass_delays[1] * channels_usize],
+        ];
+
+        let mut reg = XAPO_REGISTRATION_PROPERTIES::new(
+            [0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01],
+            "Schroeder Reverb",
+            XAPO_FLAG_INPLACE,
+        );
+
+        Self {
+            wet: wet.clamp(0.0, 1.0),
+            sample_rate,
+            comb_delays,
+            comb_feedback,
+            allpass_delays,
+            allpass_feedback: 0.5,
+            comb_buffers,
+            comb_positions: [0; 4],
+            allpass_buffers,
+            allpass_positions: [0; 2],
+            gain: 0.35,
+            channels: channels.max(1),
+            registration: reg,
+        }
+    }
+}
+
+impl XapoEffect for XapoReverb {
+    fn process(&mut self, input: &[f32], output: &mut [f32]) -> AppResult<()> {
+        let ch = self.channels.max(1) as usize;
+        let total = input.len();
+        if output.len() < total || total == 0 {
+            return Ok(());
+        }
+        let frames = total / ch;
+        if frames == 0 {
+            return Ok(());
+        }
+
+        for i in 0..total {
+            let sample = input[i];
+
+            // Sum through 4 parallel comb filters
+            let mut comb_sum = 0.0f32;
+            for c in 0..4 {
+                let delay = self.comb_delays[c];
+                let pos = self.comb_positions[c];
+                let buf = &mut self.comb_buffers[c];
+                if buf.is_empty() {
+                    continue;
+                }
+                let delayed = buf[pos];
+                buf[pos] = sample + delayed * self.comb_feedback[c];
+                comb_sum += delayed;
+                self.comb_positions[c] = (pos + 1) % buf.len();
+            }
+
+            // Feed through 2 series all-pass filters
+            let mut ap_out = comb_sum * 0.25;
+            for a in 0..2 {
+                let delay = self.allpass_delays[a];
+                let pos = self.allpass_positions[a];
+                let buf = &mut self.allpass_buffers[a];
+                if buf.is_empty() {
+                    continue;
+                }
+                let delayed = buf[pos];
+                buf[pos] = ap_out + delayed * self.allpass_feedback;
+                ap_out = delayed - ap_out * self.allpass_feedback;
+                self.allpass_positions[a] = (pos + 1) % buf.len();
+            }
+
+            // Mix: output = (1 - wet) * input + wet * processed * gain
+            output[i] = (1.0 - self.wet) * sample + self.wet * ap_out * self.gain;
+        }
+
+        Ok(())
+    }
+
+    fn reset(&mut self) {
+        for buf in self.comb_buffers.iter_mut() {
+            buf.fill(0.0);
+        }
+        for buf in self.allpass_buffers.iter_mut() {
+            buf.fill(0.0);
+        }
+        self.comb_positions = [0; 4];
+        self.allpass_positions = [0; 2];
+    }
+
+    fn registration(&self) -> &XAPO_REGISTRATION_PROPERTIES {
+        &self.registration
+    }
+
+    fn channels(&self) -> u16 {
+        self.channels
+    }
+
+    fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+}
+
+/// One-pole IIR low-pass filter effect.
+pub struct XapoLowPass {
+    /// Cutoff frequency coefficient (0.0–1.0).
+    cutoff: f32,
+    /// Per-channel previous output samples for the IIR filter.
+    previous: Vec<f32>,
+    /// Number of channels.
+    channels: u16,
+    /// Sample rate.
+    sample_rate: u32,
+    /// COM registration properties.
+    registration: XAPO_REGISTRATION_PROPERTIES,
+}
+
+impl XapoLowPass {
+    pub fn new(cutoff: f32, channels: u16, sample_rate: u32) -> Self {
+        let mut reg = XAPO_REGISTRATION_PROPERTIES::new(
+            [0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02],
+            "One-Pole Low-Pass Filter",
+            XAPO_FLAG_INPLACE,
+        );
+        Self {
+            cutoff: cutoff.clamp(0.01, 1.0),
+            previous: vec![0.0; channels.max(1) as usize],
+            channels: channels.max(1),
+            sample_rate,
+            registration: reg,
+        }
+    }
+}
+
+impl XapoEffect for XapoLowPass {
+    fn process(&mut self, input: &[f32], output: &mut [f32]) -> AppResult<()> {
+        let ch = self.channels as usize;
+        let total = input.len();
+        if output.len() < total || total == 0 {
+            return Ok(());
+        }
+        let frames = total / ch;
+        if frames == 0 {
+            return Ok(());
+        }
+        if self.cutoff >= 1.0 {
+            output[..total].copy_from_slice(&input[..total]);
+            return Ok(());
+        }
+        let alpha = self.cutoff;
+
+        for frame in 0..frames {
+            for c in 0..ch {
+                let idx = frame * ch + c;
+                let prev = &mut self.previous[c];
+                *prev = *prev + alpha * (input[idx] - *prev);
+                output[idx] = *prev;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn reset(&mut self) {
+        self.previous.fill(0.0);
+    }
+
+    fn registration(&self) -> &XAPO_REGISTRATION_PROPERTIES {
+        &self.registration
+    }
+
+    fn channels(&self) -> u16 {
+        self.channels
+    }
+
+    fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+}
+
+/// One-pole IIR high-pass filter effect.
+pub struct XapoHighPass {
+    /// Cutoff frequency coefficient (0.0–1.0).
+    cutoff: f32,
+    /// Per-channel previous input sample.
+    prev_input: Vec<f32>,
+    /// Per-channel previous output sample.
+    prev_output: Vec<f32>,
+    /// Number of channels.
+    channels: u16,
+    /// Sample rate.
+    sample_rate: u32,
+    /// COM registration properties.
+    registration: XAPO_REGISTRATION_PROPERTIES,
+}
+
+impl XapoHighPass {
+    pub fn new(cutoff: f32, channels: u16, sample_rate: u32) -> Self {
+        let mut reg = XAPO_REGISTRATION_PROPERTIES::new(
+            [0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03],
+            "One-Pole High-Pass Filter",
+            XAPO_FLAG_INPLACE,
+        );
+        Self {
+            cutoff: cutoff.clamp(0.01, 1.0),
+            prev_input: vec![0.0; channels.max(1) as usize],
+            prev_output: vec![0.0; channels.max(1) as usize],
+            channels: channels.max(1),
+            sample_rate,
+            registration: reg,
+        }
+    }
+}
+
+impl XapoEffect for XapoHighPass {
+    fn process(&mut self, input: &[f32], output: &mut [f32]) -> AppResult<()> {
+        let ch = self.channels as usize;
+        let total = input.len();
+        if output.len() < total || total == 0 {
+            return Ok(());
+        }
+        let frames = total / ch;
+        if frames == 0 {
+            return Ok(());
+        }
+        if self.cutoff >= 1.0 {
+            output[..total].copy_from_slice(&input[..total]);
+            return Ok(());
+        }
+        let alpha = self.cutoff;
+
+        for frame in 0..frames {
+            for c in 0..ch {
+                let idx = frame * ch + c;
+                let in_val = input[idx];
+                let out_val = alpha * (self.prev_output[c] + in_val - self.prev_input[c]);
+                self.prev_input[c] = in_val;
+                self.prev_output[c] = out_val;
+                output[idx] = out_val;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn reset(&mut self) {
+        self.prev_input.fill(0.0);
+        self.prev_output.fill(0.0);
+    }
+
+    fn registration(&self) -> &XAPO_REGISTRATION_PROPERTIES {
+        &self.registration
+    }
+
+    fn channels(&self) -> u16 {
+        self.channels
+    }
+
+    fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+}
+
+/// Echo / delay effect with configurable feedback.
+pub struct XapoEcho {
+    /// Delay line buffer.
+    delay_buffer: Vec<f32>,
+    /// Write position in the delay line.
+    write_pos: usize,
+    /// Delay time in frames.
+    delay_frames: usize,
+    /// Feedback gain (0.0–1.0).
+    feedback: f32,
+    /// Wet/dry mix (0.0–1.0).
+    wet: f32,
+    /// Number of channels.
+    channels: u16,
+    /// Sample rate.
+    sample_rate: u32,
+    /// COM registration properties.
+    registration: XAPO_REGISTRATION_PROPERTIES,
+}
+
+impl XapoEcho {
+    pub fn new(delay_ms: f32, feedback: f32, wet: f32, channels: u16, sample_rate: u32) -> Self {
+        let ch = channels.max(1) as usize;
+        let delay_frames = ((delay_ms.max(1.0) * sample_rate as f32) / 1000.0).round() as usize;
+        let mut reg = XAPO_REGISTRATION_PROPERTIES::new(
+            [0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04],
+            "Echo / Delay",
+            XAPO_FLAG_INPLACE,
+        );
+        Self {
+            delay_buffer: vec![0.0; delay_frames * ch],
+            write_pos: 0,
+            delay_frames,
+            feedback: feedback.clamp(0.0, 0.95),
+            wet: wet.clamp(0.0, 1.0),
+            channels: channels.max(1),
+            sample_rate,
+            registration: reg,
+        }
+    }
+}
+
+impl XapoEffect for XapoEcho {
+    fn process(&mut self, input: &[f32], output: &mut [f32]) -> AppResult<()> {
+        let ch = self.channels as usize;
+        let total = input.len();
+        if output.len() < total || total == 0 || self.delay_buffer.is_empty() {
+            return Ok(());
+        }
+        let buf_len = self.delay_buffer.len();
+
+        for i in 0..total {
+            let delayed = self.delay_buffer[self.write_pos];
+            self.delay_buffer[self.write_pos] = input[i] + delayed * self.feedback;
+            output[i] = (1.0 - self.wet) * input[i] + self.wet * delayed;
+            self.write_pos = (self.write_pos + 1) % buf_len;
+        }
+
+        Ok(())
+    }
+
+    fn reset(&mut self) {
+        self.delay_buffer.fill(0.0);
+        self.write_pos = 0;
+    }
+
+    fn registration(&self) -> &XAPO_REGISTRATION_PROPERTIES {
+        &self.registration
+    }
+
+    fn channels(&self) -> u16 {
+        self.channels
+    }
+
+    fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+}
+
+/// Dynamic range compressor effect.
+///
+/// Applies threshold-based gain reduction with configurable ratio,
+/// attack time, and release time.
+pub struct XapoCompressor {
+    /// Threshold in dB (e.g. -24.0).
+    threshold_db: f32,
+    /// Compression ratio (e.g. 4.0 = 4:1).
+    ratio: f32,
+    /// Attack time in seconds.
+    attack_s: f32,
+    /// Release time in seconds.
+    release_s: f32,
+    /// Envelope follower state per channel.
+    envelope: Vec<f32>,
+    /// Makeup gain in dB.
+    makeup_gain_db: f32,
+    /// Sample rate.
+    sample_rate: u32,
+    /// Number of channels.
+    channels: u16,
+    /// COM registration properties.
+    registration: XAPO_REGISTRATION_PROPERTIES,
+}
+
+impl XapoCompressor {
+    pub fn new(threshold_db: f32, ratio: f32, attack_ms: f32, release_ms: f32, channels: u16, sample_rate: u32) -> Self {
+        let mut reg = XAPO_REGISTRATION_PROPERTIES::new(
+            [0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05],
+            "Dynamic Range Compressor",
+            XAPO_FLAG_INPLACE,
+        );
+        Self {
+            threshold_db,
+            ratio: ratio.max(1.0),
+            attack_s: (attack_ms.max(0.1) / 1000.0),
+            release_s: (release_ms.max(1.0) / 1000.0),
+            envelope: vec![0.0; channels.max(1) as usize],
+            makeup_gain_db: 0.0,
+            sample_rate,
+            channels: channels.max(1),
+            registration: reg,
+        }
+    }
+}
+
+impl XapoEffect for XapoCompressor {
+    fn process(&mut self, input: &[f32], output: &mut [f32]) -> AppResult<()> {
+        let ch = self.channels as usize;
+        let total = input.len();
+        if output.len() < total || total == 0 {
+            return Ok(());
+        }
+        let frames = total / ch;
+        if frames == 0 {
+            return Ok(());
+        }
+
+        let attack_coeff = (-1.0 / (self.attack_s * self.sample_rate as f32)).exp();
+        let release_coeff = (-1.0 / (self.release_s * self.sample_rate as f32)).exp();
+        let threshold_linear = 10.0f32.powf(self.threshold_db / 20.0);
+        let slope = 1.0 / self.ratio;
+        let makeup = 10.0f32.powf(self.makeup_gain_db / 20.0);
+
+        for frame in 0..frames {
+            for c in 0..ch {
+                let idx = frame * ch + c;
+                let sample = input[idx];
+                let abs_sample = sample.abs();
+
+                // Envelope follower
+                let env = &mut self.envelope[c];
+                if abs_sample > *env {
+                    *env = *env + (1.0 - attack_coeff) * (abs_sample - *env);
+                } else {
+                    *env = *env + (1.0 - release_coeff) * (abs_sample - *env);
+                }
+
+                // Gain computation
+                let gain = if *env > threshold_linear {
+                    let db = 20.0 * env.log10();
+                    let compressed_db = self.threshold_db + (db - self.threshold_db) * slope;
+                    let compressed_linear = 10.0f32.powf(compressed_db / 20.0);
+                    if *env > 0.0 {
+                        compressed_linear / *env
+                    } else {
+                        1.0
+                    }
+                } else {
+                    1.0
+                };
+
+                output[idx] = sample * gain * makeup;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn reset(&mut self) {
+        self.envelope.fill(0.0);
+    }
+
+    fn registration(&self) -> &XAPO_REGISTRATION_PROPERTIES {
+        &self.registration
+    }
+
+    fn channels(&self) -> u16 {
+        self.channels
+    }
+
+    fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+}
+
+/// Normalize effect — scales audio to a target peak level.
+pub struct XapoNormalize {
+    /// Target peak amplitude (0.0–1.0).
+    target_peak: f32,
+    /// Maximum observed amplitude from the previous buffer.
+    max_observed: f32,
+    /// Number of channels.
+    channels: u16,
+    /// COM registration properties.
+    registration: XAPO_REGISTRATION_PROPERTIES,
+}
+
+impl XapoNormalize {
+    pub fn new(target_peak: f32, channels: u16) -> Self {
+        let mut reg = XAPO_REGISTRATION_PROPERTIES::new(
+            [0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x06],
+            "Normalize to Peak",
+            XAPO_FLAG_INPLACE,
+        );
+        Self {
+            target_peak: target_peak.clamp(0.01, 1.0),
+            max_observed: 0.0,
+            channels: channels.max(1),
+            registration: reg,
+        }
+    }
+}
+
+impl XapoEffect for XapoNormalize {
+    fn process(&mut self, input: &[f32], output: &mut [f32]) -> AppResult<()> {
+        let ch = self.channels as usize;
+        let total = input.len();
+        if output.len() < total || total == 0 {
+            return Ok(());
+        }
+
+        // Find peak in this buffer
+        let mut peak = 0.0f32;
+        for &s in input[..total].iter() {
+            let abs_s = s.abs();
+            if abs_s > peak {
+                peak = abs_s;
+            }
+        }
+
+        let effective_peak = peak.max(self.max_observed);
+        self.max_observed = peak * 0.5 + self.max_observed * 0.5; // Smooth the observation
+
+        if effective_peak > 0.0 {
+            let scale = (self.target_peak / effective_peak).min(2.0);
+            for i in 0..total {
+                output[i] = input[i] * scale;
+            }
+        } else {
+            output[..total].copy_from_slice(&input[..total]);
+        }
+
+        Ok(())
+    }
+
+    fn reset(&mut self) {
+        self.max_observed = 0.0;
+    }
+
+    fn registration(&self) -> &XAPO_REGISTRATION_PROPERTIES {
+        &self.registration
+    }
+
+    fn channels(&self) -> u16 {
+        self.channels
+    }
+
+    fn sample_rate(&self) -> u32 {
+        48000
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Effect parameter structures
+// ---------------------------------------------------------------------------
+
+/// Parameters for the Reverb effect.
+#[derive(Debug, Clone)]
+pub struct ReverbParameters {
+    /// Wet/dry mix (0.0 = dry only, 1.0 = wet only).
+    pub wet_dry_mix: f32,
+    /// Reverb delay in milliseconds.
+    pub delay_ms: f32,
+}
+
+impl Default for ReverbParameters {
+    fn default() -> Self {
+        Self { wet_dry_mix: 0.5, delay_ms: 50.0 }
+    }
+}
+
+/// Parameters for the Equalizer effect.
+#[derive(Debug, Clone)]
+pub struct EqualizerParameters {
+    /// Band gains in dB (typically -12.0 to +12.0).
+    pub band_gains_db: [f32; 4],
+    /// Band center frequencies in Hz.
+    pub band_frequencies: [f32; 4],
+    /// Band Q factors (bandwidth).
+    pub band_q: [f32; 4],
+}
+
+impl Default for EqualizerParameters {
+    fn default() -> Self {
+        Self {
+            band_gains_db: [0.0, 0.0, 0.0, 0.0],
+            band_frequencies: [100.0, 500.0, 2000.0, 8000.0],
+            band_q: [1.0, 1.0, 1.0, 1.0],
+        }
+    }
+}
+
+/// Parameters for the Compressor effect.
+#[derive(Debug, Clone)]
+pub struct CompressorParameters {
+    /// Threshold in dB.
+    pub threshold_db: f32,
+    /// Compression ratio.
+    pub ratio: f32,
+    /// Attack time in milliseconds.
+    pub attack_ms: f32,
+    /// Release time in milliseconds.
+    pub release_ms: f32,
+}
+
+impl Default for CompressorParameters {
+    fn default() -> Self {
+        Self { threshold_db: -24.0, ratio: 4.0, attack_ms: 5.0, release_ms: 50.0 }
+    }
+}
+
+/// Parameters for the Echo effect.
+#[derive(Debug, Clone)]
+pub struct EchoParameters {
+    /// Delay in milliseconds.
+    pub delay_ms: f32,
+    /// Feedback (0.0–1.0).
+    pub feedback: f32,
+    /// Wet/dry mix (0.0–1.0).
+    pub wet_dry_mix: f32,
+}
+
+impl Default for EchoParameters {
+    fn default() -> Self {
+        Self { delay_ms: 200.0, feedback: 0.5, wet_dry_mix: 0.5 }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Parametric 4-band Equalizer
+// ---------------------------------------------------------------------------
+
+/// Parametric 4-band equalizer XAPO effect.
+///
+/// Implements 4 peaking/notching biquad filters, each with configurable
+/// center frequency, gain, and Q factor. The bands are processed in series.
+pub struct XapoEqualizer {
+    /// Number of channels.
+    channels: u16,
+    /// Sample rate.
+    sample_rate: u32,
+    /// Current parameters.
+    params: EqualizerParameters,
+    /// Per-band biquad state: (x1, x2, y1, y2) for each channel.
+    /// Indexed as `band_state[band][channel] = (x1, x2, y1, y2)`.
+    band_state: [Vec<(f32, f32, f32, f32)>; 4],
+    /// COM registration properties.
+    registration: XAPO_REGISTRATION_PROPERTIES,
+}
+
+impl XapoEqualizer {
+    /// Create a new 4-band parametric equalizer.
+    pub fn new(params: EqualizerParameters, channels: u16, sample_rate: u32) -> Self {
+        let ch = channels.max(1) as usize;
+        let zero_state: Vec<(f32, f32, f32, f32)> = (0..ch).map(|_| (0.0, 0.0, 0.0, 0.0)).collect();
+
+        let mut reg = XAPO_REGISTRATION_PROPERTIES::new(
+            [0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07],
+            "Parametric 4-Band Equalizer",
+            XAPO_FLAG_INPLACE,
+        );
+        reg.min_input_buffer_count = 1;
+        reg.max_input_buffer_count = 1;
+        reg.min_output_buffer_count = 1;
+        reg.max_output_buffer_count = 1;
+
+        Self {
+            channels: channels.max(1),
+            sample_rate,
+            params,
+            band_state: [
+                zero_state.clone(),
+                zero_state.clone(),
+                zero_state.clone(),
+                zero_state,
+            ],
+            registration: reg,
+        }
+    }
+
+    /// Update the equalizer parameters.
+    pub fn set_parameters(&mut self, params: EqualizerParameters) {
+        self.params = params;
+    }
+
+    /// Get the current parameters.
+    pub fn parameters(&self) -> &EqualizerParameters {
+        &self.params
+    }
+
+    /// Compute biquad coefficients for a peaking EQ filter.
+    fn peaking_coefficients(freq: f32, gain_db: f32, q: f32, sample_rate: f32) -> (f32, f32, f32, f32, f32) {
+        let a = 10.0_f32.powf(gain_db / 40.0);
+        let w0 = 2.0 * std::f32::consts::PI * freq / sample_rate;
+        let cos_w0 = w0.cos();
+        let sin_w0 = w0.sin();
+        let alpha = sin_w0 / (2.0 * q);
+
+        let b0 = 1.0 + alpha * a;
+        let b1 = -2.0 * cos_w0;
+        let b2 = 1.0 - alpha * a;
+        let a0 = 1.0 + alpha / a;
+        let a1 = -2.0 * cos_w0;
+        let a2 = 1.0 - alpha / a;
+
+        // Normalize by a0
+        (b0 / a0, b1 / a0, b2 / a0, a1 / a0, a2 / a0)
+    }
+}
+
+impl XapoEffect for XapoEqualizer {
+    fn process(&mut self, input: &[f32], output: &mut [f32]) -> AppResult<()> {
+        let channels = self.channels as usize;
+
+        // Pre-compute biquad coefficients for each band
+        let coeffs: Vec<(f32, f32, f32, f32, f32)> = (0..4)
+            .map(|band| {
+                Self::peaking_coefficients(
+                    self.params.band_frequencies[band],
+                    self.params.band_gains_db[band],
+                    self.params.band_q[band],
+                    self.sample_rate as f32,
+                )
+            })
+            .collect();
+
+        // Process each sample through all 4 bands in series
+        for (i, &sample) in input.iter().enumerate() {
+            let ch = i % channels;
+            let mut y = sample;
+
+            for band in 0..4 {
+                let (b0, b1, b2, a1, a2) = coeffs[band];
+                let (x1, x2, y1, y2) = self.band_state[band][ch];
+
+                let new_y = b0 * y + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+                self.band_state[band][ch] = (y, x1, new_y, y1);
+                y = new_y;
+            }
+
+            if i < output.len() {
+                output[i] = y;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn reset(&mut self) {
+        let ch = self.channels as usize;
+        for band in 0..4 {
+            self.band_state[band] = (0..ch).map(|_| (0.0, 0.0, 0.0, 0.0)).collect();
+        }
+    }
+
+    fn registration(&self) -> &XAPO_REGISTRATION_PROPERTIES {
+        &self.registration
+    }
+
+    fn channels(&self) -> u16 {
+        self.channels
+    }
+
+    fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+}
+
+// ---------------------------------------------------------------------------
+// XAPO Effect Chain — processes audio through a sequence of effects
+// ---------------------------------------------------------------------------
+
+/// A chain of XAPO effects that processes audio in sequence.
+///
+/// Used to integrate with the XAudio2 voice graph: each source or submix
+/// voice can have an effect chain attached that transforms the audio
+/// before passing it to the next voice in the graph.
+pub struct XapoEffectChain {
+    /// Ordered list of effect instance handles in the chain.
+    chain: Vec<u64>,
+    /// Temporary buffer for inter-effect processing.
+    temp_buffer: Vec<f32>,
+}
+
+impl XapoEffectChain {
+    /// Create a new empty effect chain.
+    pub fn new() -> Self {
+        Self {
+            chain: Vec::new(),
+            temp_buffer: Vec::new(),
+        }
+    }
+
+    /// Create a chain from a list of effect instance handles.
+    pub fn from_handles(handles: Vec<u64>) -> Self {
+        Self {
+            chain: handles,
+            temp_buffer: Vec::new(),
+        }
+    }
+
+    /// Add an effect to the end of the chain.
+    pub fn push(&mut self, handle: u64) {
+        self.chain.push(handle);
+    }
+
+    /// Remove the last effect from the chain.
+    pub fn pop(&mut self) -> Option<u64> {
+        self.chain.pop()
+    }
+
+    /// Insert an effect at a specific position.
+    pub fn insert(&mut self, index: usize, handle: u64) {
+        if index <= self.chain.len() {
+            self.chain.insert(index, handle);
+        }
+    }
+
+    /// Remove an effect at a specific position.
+    pub fn remove(&mut self, index: usize) -> Option<u64> {
+        if index < self.chain.len() {
+            Some(self.chain.remove(index))
+        } else {
+            None
+        }
+    }
+
+    /// Get the number of effects in the chain.
+    pub fn len(&self) -> usize {
+        self.chain.len()
+    }
+
+    /// Check if the chain is empty.
+    pub fn is_empty(&self) -> bool {
+        self.chain.is_empty()
+    }
+
+    /// Get the effect handles in order.
+    pub fn handles(&self) -> &[u64] {
+        &self.chain
+    }
+
+    /// Process audio through the entire effect chain.
+    ///
+    /// Each effect processes the audio in sequence, with the output of one
+    /// becoming the input of the next.
+    pub fn process_chain(
+        &mut self,
+        manager: &mut XapoManager,
+        input: &[f32],
+        output: &mut [f32],
+    ) -> AppResult<()> {
+        if self.chain.is_empty() {
+            // No effects — pass through
+            let copy_len = input.len().min(output.len());
+            output[..copy_len].copy_from_slice(&input[..copy_len]);
+            return Ok(());
+        }
+
+        // Ensure temp buffer is large enough
+        if self.temp_buffer.len() < input.len() {
+            self.temp_buffer.resize(input.len(), 0.0);
+        }
+
+        // Copy input to temp buffer
+        self.temp_buffer[..input.len()].copy_from_slice(input);
+
+        // Process through each effect in the chain
+        for (i, &handle) in self.chain.iter().enumerate() {
+            if i == self.chain.len() - 1 {
+                // Last effect writes directly to output
+                manager.process_instance(handle, &self.temp_buffer[..input.len()], output);
+            } else {
+                // Intermediate effect: need a second temp buffer
+                let mut intermediate = vec![0.0f32; input.len()];
+                manager.process_instance(handle, &self.temp_buffer[..input.len()], &mut intermediate);
+                self.temp_buffer[..input.len()].copy_from_slice(&intermediate);
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl Default for XapoEffectChain {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// XAPO Voice Graph Integration
+// ---------------------------------------------------------------------------
+
+/// Associates an effect chain with a specific voice in the XAudio2 graph.
+pub struct VoiceEffectChain {
+    /// The voice this chain is attached to.
+    voice_id: VoiceId,
+    /// The effect chain.
+    chain: XapoEffectChain,
+    /// Whether the chain is enabled.
+    enabled: bool,
+}
+
+impl VoiceEffectChain {
+    /// Create a new voice effect chain.
+    pub fn new(voice_id: VoiceId) -> Self {
+        Self {
+            voice_id,
+            chain: XapoEffectChain::new(),
+            enabled: true,
+        }
+    }
+
+    /// Get the voice ID this chain is attached to.
+    pub fn voice_id(&self) -> VoiceId {
+        self.voice_id
+    }
+
+    /// Get the underlying effect chain.
+    pub fn chain(&self) -> &XapoEffectChain {
+        &self.chain
+    }
+
+    /// Get the mutable underlying effect chain.
+    pub fn chain_mut(&mut self) -> &mut XapoEffectChain {
+        &mut self.chain
+    }
+
+    /// Enable or disable the effect chain.
+    pub fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+    }
+
+    /// Check if the chain is enabled.
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+}
+
+// ---------------------------------------------------------------------------
+// XapoInstance — runtime effect instance
+// ---------------------------------------------------------------------------
+
+/// A running XAPO effect instance created from a registered effect type.
+pub struct XapoInstance {
+    /// The actual effect processing engine.
+    pub effect: Box<dyn XapoEffect + Send>,
+    /// CLSID of the effect type that was used to create this instance.
+    pub clsid: [u8; 16],
+}
+
+// ---------------------------------------------------------------------------
+// XapoManager — effect registration and instance factory
+// ---------------------------------------------------------------------------
+
+/// Type alias for a factory function that creates XAPO effect instances.
+type EffectFactory = Box<dyn Fn() -> Box<dyn XapoEffect + Send> + Send>;
+
+/// Manages registration, creation, and lifecycle of XAPO audio effects.
+///
+/// Effects are registered by CLSID (GUID) and instantiated on demand. Each
+/// instance holds its own processing state and can be independently processed,
+/// reset, or destroyed.
+pub struct XapoManager {
+    /// Registered effect factory functions and their registration props, keyed by CLSID.
+    registered: HashMap<[u8; 16], (XAPO_REGISTRATION_PROPERTIES, EffectFactory)>,
+    /// Active effect instances, keyed by a numeric handle.
+    instances: BTreeMap<u64, XapoInstance>,
+    /// Next handle to assign for create_instance().
+    next_handle: u64,
+}
+
+impl XapoManager {
+    /// Create a new empty XAPO manager.
+    pub fn new() -> Self {
+        Self {
+            registered: HashMap::new(),
+            instances: BTreeMap::new(),
+            next_handle: 1,
+        }
+    }
+
+    /// Register an effect type under the given CLSID.
+    ///
+    /// The `factory` closure must return a new default-initialised effect
+    /// instance each time it is called. The `registration` provides the
+    /// COM-style properties for this effect type.
+    pub fn register_effect(
+        &mut self,
+        clsid: [u8; 16],
+        registration: XAPO_REGISTRATION_PROPERTIES,
+        factory: Box<dyn Fn() -> Box<dyn XapoEffect + Send> + Send>,
+    ) {
+        self.registered.insert(clsid, (registration, factory));
+    }
+
+    /// Register the built-in effects with standard CLSIDs.
+    pub fn register_builtins(&mut self) {
+        let reverb = XapoReverb::new(0.5, 48000, 2);
+        let clsid = reverb.registration().clsid;
+        let reg = reverb.registration().clone();
+        self.register_effect(clsid, reg, Box::new(|| Box::new(XapoReverb::new(0.5, 48000, 2))));
+
+        let lp = XapoLowPass::new(0.5, 2, 48000);
+        let clsid_lp = lp.registration().clsid;
+        let reg_lp = lp.registration().clone();
+        self.register_effect(clsid_lp, reg_lp, Box::new(|| Box::new(XapoLowPass::new(0.5, 2, 48000))));
+
+        let hp = XapoHighPass::new(0.5, 2, 48000);
+        let clsid_hp = hp.registration().clsid;
+        let reg_hp = hp.registration().clone();
+        self.register_effect(clsid_hp, reg_hp, Box::new(|| Box::new(XapoHighPass::new(0.5, 2, 48000))));
+
+        let echo = XapoEcho::new(200.0, 0.5, 0.5, 2, 48000);
+        let clsid_echo = echo.registration().clsid;
+        let reg_echo = echo.registration().clone();
+        self.register_effect(clsid_echo, reg_echo, Box::new(|| Box::new(XapoEcho::new(200.0, 0.5, 0.5, 2, 48000))));
+
+        let comp = XapoCompressor::new(-24.0, 4.0, 5.0, 50.0, 2, 48000);
+        let clsid_comp = comp.registration().clsid;
+        let reg_comp = comp.registration().clone();
+        self.register_effect(clsid_comp, reg_comp, Box::new(|| Box::new(XapoCompressor::new(-24.0, 4.0, 5.0, 50.0, 2, 48000))));
+
+        let norm = XapoNormalize::new(0.95, 2);
+        let clsid_norm = norm.registration().clsid;
+        let reg_norm = norm.registration().clone();
+        self.register_effect(clsid_norm, reg_norm, Box::new(|| Box::new(XapoNormalize::new(0.95, 2))));
+
+        let eq = XapoEqualizer::new(EqualizerParameters::default(), 2, 48000);
+        let clsid_eq = eq.registration().clsid;
+        let reg_eq = eq.registration().clone();
+        self.register_effect(clsid_eq, reg_eq, Box::new(|| Box::new(XapoEqualizer::new(EqualizerParameters::default(), 2, 48000))));
+    }
+
+    /// Create a new instance of a registered effect by CLSID.
+    ///
+    /// Returns a handle that can be used with [`process_instance`],
+    /// [`destroy_instance`], and [`reset_instance`].
+    ///
+    /// Returns `None` if no effect is registered under the given CLSID.
+    pub fn create_instance(&mut self, clsid: &[u8; 16]) -> Option<u64> {
+        let (_, factory) = self.registered.get(clsid)?;
+        let effect = factory();
+        let handle = self.next_handle;
+        self.next_handle += 1;
+        self.instances.insert(handle, XapoInstance {
+            effect,
+            clsid: *clsid,
+        });
+        Some(handle)
+    }
+
+    /// Process audio through an effect instance.
+    ///
+    /// Returns `true` if the instance was found and processed, `false` otherwise.
+    pub fn process_instance(
+        &mut self,
+        handle: u64,
+        input: &[f32],
+        output: &mut [f32],
+    ) -> bool {
+        if let Some(instance) = self.instances.get_mut(&handle) {
+            instance.effect.process(input, output).is_ok()
+        } else {
+            false
+        }
+    }
+
+    /// Reset an effect instance to its initial state.
+    ///
+    /// Returns `true` if the instance was found and reset, `false` otherwise.
+    pub fn reset_instance(&mut self, handle: u64) -> bool {
+        if let Some(instance) = self.instances.get_mut(&handle) {
+            instance.effect.reset();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Destroy an effect instance and free its resources.
+    ///
+    /// Returns `true` if the instance was found and destroyed, `false` otherwise.
+    pub fn destroy_instance(&mut self, handle: u64) -> bool {
+        self.instances.remove(&handle).is_some()
+    }
+
+    /// Return the registration properties for a registered effect by CLSID.
+    pub fn registration_properties(&self, clsid: &[u8; 16]) -> Option<&XAPO_REGISTRATION_PROPERTIES> {
+        self.registered.get(clsid).map(|(reg, _)| reg)
+    }
+
+    /// Return the registration properties for an active instance.
+    pub fn instance_registration(&self, handle: u64) -> Option<&XAPO_REGISTRATION_PROPERTIES> {
+        self.instances.get(&handle).map(|inst| inst.effect.registration())
+    }
+
+    /// Return the effect channels for an active instance.
+    pub fn instance_channels(&self, handle: u64) -> Option<u16> {
+        self.instances.get(&handle).map(|inst| inst.effect.channels())
+    }
+
+    /// Check if a CLSID has been registered.
+    pub fn is_registered(&self, clsid: &[u8; 16]) -> bool {
+        self.registered.contains_key(clsid)
+    }
+
+    /// Get the number of registered effect types.
+    pub fn registered_count(&self) -> usize {
+        self.registered.len()
+    }
+
+    /// Get the number of active effect instances.
+    pub fn instance_count(&self) -> usize {
+        self.instances.len()
+    }
+
+    /// Return a list of all registered CLSIDs.
+    pub fn registered_clsids(&self) -> Vec<[u8; 16]> {
+        self.registered.keys().copied().collect()
+    }
+}
+
+impl Default for XapoManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Voice callback timing
 // ---------------------------------------------------------------------------
 
@@ -2415,7 +3750,6 @@ mod tests {
     // ── MS ADPCM decoder tests ──────────────────────────────────────────
 
     /// Build a synthetic mono MS ADPCM block with known values for testing.
-    /// Block: [predictor(2B)][delta(2B)][sample1(2B)][sample2(2B)][nibbles...]
     fn build_ms_adpcm_mono_block(
         predictor: u16,
         delta: u16,
@@ -2938,5 +4272,262 @@ mod tests {
         let a = AudioFormat::ImaAdpcm;
         let b = a; // Copy
         assert_eq!(a, b);
+    }
+
+    // ── XAPO effect tests ────────────────────────────────────────────────
+
+    fn make_reverb_clsid() -> [u8; 16] {
+        [0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01]
+    }
+
+    fn make_lowpass_clsid() -> [u8; 16] {
+        [0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02]
+    }
+
+    fn make_highpass_clsid() -> [u8; 16] {
+        [0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03]
+    }
+
+    fn make_echo_clsid() -> [u8; 16] {
+        [0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04]
+    }
+
+    fn make_compressor_clsid() -> [u8; 16] {
+        [0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05]
+    }
+
+    fn make_normalize_clsid() -> [u8; 16] {
+        [0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x06]
+    }
+
+    #[test]
+    fn xapo_reverb_processes_and_resets() {
+        let mut reverb = XapoReverb::new(0.5, 48000, 2);
+        let reg = reverb.registration();
+        // friendly_name should contain "Reverb" via the wide-char encoding
+        assert!(reg.friendly_name[0] != 0);
+        assert_eq!(reg.flags, XAPO_FLAG_INPLACE);
+        assert_eq!(reverb.channels(), 2);
+        assert_eq!(reverb.sample_rate(), 48000);
+
+        let input = vec![1.0f32, -1.0, 0.5, -0.5];
+        let mut output = vec![0.0f32; 4];
+        assert!(reverb.process(&input, &mut output).is_ok());
+        // After reverb processing, output should differ from input
+        let changed = input.iter().zip(output.iter()).any(|(a, b)| (a - b).abs() > 0.001);
+        assert!(changed);
+
+        reverb.reset();
+        // After reset, processing silence should produce silence
+        let silence = vec![0.0f32; 4];
+        let mut out2 = vec![1.0f32; 4];
+        assert!(reverb.process(&silence, &mut out2).is_ok());
+        for &s in &out2 {
+            assert!((s).abs() < 0.001);
+        }
+    }
+
+    #[test]
+    fn xapo_lowpass_attenuates_high_frequencies() {
+        let mut lp = XapoLowPass::new(0.2, 1, 48000);
+        let reg = lp.registration();
+        assert!(reg.friendly_name[0] != 0);
+
+        // Alternating signal (high frequency)
+        let input = vec![1.0f32, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0, -1.0];
+        let mut output = vec![0.0f32; 8];
+        assert!(lp.process(&input, &mut output).is_ok());
+        let max_out = output.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
+        assert!(max_out < 1.0);
+    }
+
+    #[test]
+    fn xapo_highpass_blocks_dc() {
+        let mut hp = XapoHighPass::new(0.3, 1, 48000);
+        let reg = hp.registration();
+        assert!(reg.friendly_name[0] != 0);
+
+        // DC signal (constant)
+        let input = vec![0.5f32; 16];
+        let mut output = vec![0.0f32; 16];
+        assert!(hp.process(&input, &mut output).is_ok());
+        // DC should be attenuated toward zero
+        let steady_state: f32 = output.iter().skip(8).sum();
+        assert!(steady_state.abs() < 1.0);
+    }
+
+    #[test]
+    fn xapo_echo_produces_delayed_output() {
+        let mut echo = XapoEcho::new(10.0, 0.5, 1.0, 1, 100);
+        let reg = echo.registration();
+        assert!(reg.friendly_name[0] != 0);
+
+        // 10ms delay at 100Hz = 1 frame delay
+        // Input: impulse at frame 0
+        let input = vec![1.0f32, 0.0, 0.0, 0.0, 0.0];
+        let mut output = vec![0.0f32; 5];
+        assert!(echo.process(&input, &mut output).is_ok());
+        // With the read-before-write delay line and 1 frame delay,
+        // the impulse appears at output[1] (delayed by 1 frame).
+        assert!((output[0] - 0.0).abs() < 0.001);
+        // Frame 1: delayed impulse (buffer contained 1.0 from frame 0)
+        assert!((output[1] - 1.0).abs() < 0.001);
+        // Frame 2: first feedback tap (1.0 * 0.5 = 0.5)
+        assert!((output[2] - 0.5).abs() < 0.001);
+        // Frame 3: second feedback tap (0.5 * 0.5 = 0.25)
+        assert!((output[3] - 0.25).abs() < 0.001);
+    }
+
+    #[test]
+    fn xapo_compressor_reduces_loud_signals() {
+        let mut comp = XapoCompressor::new(-6.0, 4.0, 1.0, 10.0, 1, 48000);
+        let reg = comp.registration();
+        assert!(reg.friendly_name[0] != 0);
+
+        // Loud signal above threshold
+        let input = vec![0.8f32; 480]; // 10ms at 48kHz
+        let mut output = vec![0.0f32; 480];
+        assert!(comp.process(&input, &mut output).is_ok());
+        // Output should be quieter than input
+        let avg_out: f32 = output.iter().sum::<f32>() / 480.0;
+        assert!(avg_out < 0.8);
+    }
+
+    #[test]
+    fn xapo_normalize_scales_to_target() {
+        let mut norm = XapoNormalize::new(0.5, 1);
+        let reg = norm.registration();
+        assert!(reg.friendly_name[0] != 0);
+
+        let input = vec![0.25f32, -0.25, 0.1, -0.1];
+        let mut output = vec![0.0f32; 4];
+        assert!(norm.process(&input, &mut output).is_ok());
+        // Peak should be scaled toward 0.5
+        let max_out = output.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
+        assert!((max_out - 0.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn xapo_manager_register_create_process_destroy() {
+        let mut mgr = XapoManager::new();
+        mgr.register_builtins();
+
+        assert!(mgr.is_registered(&make_reverb_clsid()));
+        assert!(mgr.is_registered(&make_lowpass_clsid()));
+        assert!(mgr.is_registered(&make_highpass_clsid()));
+        assert!(mgr.is_registered(&make_echo_clsid()));
+        assert!(mgr.is_registered(&make_compressor_clsid()));
+        assert!(mgr.is_registered(&make_normalize_clsid()));
+        assert_eq!(mgr.registered_count(), 6);
+
+        // Create a reverb instance
+        let handle = mgr.create_instance(&make_reverb_clsid()).expect("reverb should be registered");
+        assert!(handle > 0);
+
+        // Process through the instance
+        let input = vec![1.0f32, -1.0, 0.5, -0.5];
+        let mut output = vec![0.0f32; 4];
+        let processed = mgr.process_instance(handle, &input, &mut output);
+        assert!(processed);
+        let changed = input.iter().zip(output.iter()).any(|(a, b)| (a - b).abs() > 0.001);
+        assert!(changed);
+
+        // Reset
+        assert!(mgr.reset_instance(handle));
+
+        // Registration properties for instance
+        let props = mgr.instance_registration(handle);
+        assert!(props.is_some());
+
+        // Destroy
+        assert!(mgr.destroy_instance(handle));
+        assert_eq!(mgr.instance_count(), 0);
+
+        // Unknown CLSID should fail
+        let unknown_clsid = [0xFF; 16];
+        assert!(mgr.create_instance(&unknown_clsid).is_none());
+    }
+
+    #[test]
+    fn xapo_manager_process_unknown_id_returns_false() {
+        let mut mgr = XapoManager::new();
+        let mut output = vec![0.0f32; 4];
+        assert!(!mgr.process_instance(999, &[1.0; 4], &mut output));
+        assert!(!mgr.destroy_instance(999));
+        assert!(!mgr.reset_instance(999));
+    }
+
+    #[test]
+    fn xapo_guid_constants_defined() {
+        // Verify the GUID constants exist and have the expected byte counts.
+        assert_eq!(CLSID_XAPO.len(), 16);
+        assert_eq!(IID_IXAPO.len(), 16);
+        assert_eq!(IID_IXAPOParameters.len(), 16);
+
+        // Verify CLSID_XAPO matches the expected string {5EC3B1C3-5E4B-4f4e-B0E0-7B7D1E7B9E7C}
+        // Data1 = 0x5EC3B1C3 → LE bytes: [0xC3, 0xB1, 0xC3, 0x5E]
+        assert_eq!(CLSID_XAPO[0], 0xC3);
+        assert_eq!(CLSID_XAPO[1], 0xB1);
+        assert_eq!(CLSID_XAPO[2], 0xC3);
+        assert_eq!(CLSID_XAPO[3], 0x5E);
+        // Data2 = 0x5E4B → LE bytes: [0x4B, 0x5E]
+        assert_eq!(CLSID_XAPO[4], 0x4B);
+        assert_eq!(CLSID_XAPO[5], 0x5E);
+        // Data3 = 0x4f4e → LE bytes: [0x4E, 0x4F]
+        assert_eq!(CLSID_XAPO[6], 0x4E);
+        assert_eq!(CLSID_XAPO[7], 0x4F);
+    }
+
+    #[test]
+    fn xapo_flags_have_correct_values() {
+        assert_eq!(XAPO_FLAG_INPLACE, 1);
+        assert_eq!(XAPO_FLAG_BUFFERCOUNT_MUST_EQUAL, 4);
+        assert_eq!(XAPO_BUFFER_SILENT, 1);
+        assert_eq!(XAPO_BUFFER_VALID, 2);
+    }
+
+    #[test]
+    fn xapo_registration_properties_new_creates_valid_struct() {
+        let clsid = make_reverb_clsid();
+        let reg = XAPO_REGISTRATION_PROPERTIES::new(clsid, "Test Effect", XAPO_FLAG_INPLACE);
+        assert_eq!(reg.clsid, clsid);
+        assert_eq!(reg.major_version, 1);
+        assert_eq!(reg.minor_version, 0);
+        assert_eq!(reg.flags, XAPO_FLAG_INPLACE);
+        assert_eq!(reg.min_input_buffer_count, 1);
+        assert_eq!(reg.max_input_buffer_count, 1);
+        assert_eq!(reg.min_output_buffer_count, 1);
+        assert_eq!(reg.max_output_buffer_count, 1);
+        // friendly_name should contain 'T' at index 0
+        assert_eq!(reg.friendly_name[0], 'T' as u16);
+        assert_eq!(reg.friendly_name[1], 'e' as u16);
+        assert_eq!(reg.friendly_name[2], 's' as u16);
+        assert_eq!(reg.friendly_name[3], 't' as u16);
+        // Null terminator after "Test Effect"
+        assert_eq!(reg.friendly_name[11], 0);
+        // copyright_info should contain "Casa1 XAPO Effect"
+        assert_eq!(reg.copyright_info[0], 'C' as u16);
+    }
+
+    #[test]
+    fn xapo_xapo_buffer_layout() {
+        let data: [f32; 4] = [0.0, 0.5, -0.5, 1.0];
+        let xb = XAPO_BUFFER {
+            buffer: &data as *const f32,
+            flags: XAPO_BUFFER_VALID,
+            valid_frame_count: 2,
+        };
+        assert_eq!(xb.flags, XAPO_BUFFER_VALID);
+        assert_eq!(xb.valid_frame_count, 2);
+        // Verify we can read through the raw pointer
+        unsafe {
+            assert_eq!((*xb.buffer.add(1) - 0.5).abs() < 0.001, true);
+        }
     }
 }

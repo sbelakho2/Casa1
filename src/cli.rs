@@ -206,12 +206,15 @@ where
             let ge = GameEnvironment::open(&ge)?;
             let mut env = parse_env_pairs(&env_pairs)?;
             insert_input_replay(&mut env, input_replay.as_deref())?;
+            let exe = resolve_guest_path(&ge, &exe);
             let job = RunnerJob {
                 ge_name: ge.config.name.clone(),
                 ge_root: ge.root.clone(),
                 program: exe.clone(),
                 args: parse_args(args.as_deref())?,
-                cwd: cwd.unwrap_or_else(|| ge.root.clone()),
+                cwd: cwd
+                    .map(|c| resolve_guest_path(&ge, &c))
+                    .unwrap_or_else(|| ge.root.clone()),
                 env,
                 dtm,
                 intent: RunIntent::Run,
@@ -233,12 +236,15 @@ where
             let ge = GameEnvironment::open(&ge)?;
             let mut env = parse_env_pairs(&env_pairs)?;
             insert_input_replay(&mut env, input_replay.as_deref())?;
+            let exe = resolve_guest_path(&ge, &exe);
             let job = RunnerJob {
                 ge_name: ge.config.name.clone(),
                 ge_root: ge.root.clone(),
                 program: exe.clone(),
                 args: parse_args(args.as_deref())?,
-                cwd: cwd.unwrap_or_else(|| ge.root.clone()),
+                cwd: cwd
+                    .map(|c| resolve_guest_path(&ge, &c))
+                    .unwrap_or_else(|| ge.root.clone()),
                 env,
                 dtm: false,
                 intent: RunIntent::Play,
@@ -281,6 +287,7 @@ where
                 steam_library_host_root.as_deref(),
                 steam_library_host_map.as_deref(),
             )?;
+            let installer = resolve_guest_path(&ge, &installer);
             let args = install_args(&installer, silent)?;
             let job = RunnerJob {
                 ge_name: ge.config.name.clone(),
@@ -692,6 +699,15 @@ fn executable_stem(path: &Path) -> String {
     path.file_stem()
         .map(|value| value.to_string_lossy().to_string())
         .unwrap_or_else(|| "guest".to_string())
+}
+
+/// Resolve a Windows guest path (e.g. `C:\Steam.exe`) to a macOS host path
+/// via the GE's drive mappings. If the path is not a valid Windows guest path
+/// (e.g. already a host path), return it unchanged.
+fn resolve_guest_path(ge: &GameEnvironment, path: &Path) -> PathBuf {
+    let path_str = path.to_string_lossy();
+    ge.host_path_for_windows_path(&path_str)
+        .unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// Find the apps directory for Casa1 app bundles.

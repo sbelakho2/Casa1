@@ -164,6 +164,7 @@ fn instruction_vectors_vs_independent_reference_exact_flags_fp_and_cpuid() {
         IrInstruction::XorImm {
             dst: Register::Rdx,
             value: 0xFFFF,
+            width: 8,
         },
         IrInstruction::Popcnt {
             dst: Register::R9,
@@ -242,10 +243,15 @@ fn winmain_style_prologue_and_epilogue_decode_and_execute() {
     state.set(Register::Rcx, u64::MAX);
     let mut memory = MemoryImage::default();
 
+    // Pre-map stack pages for push/pop and lea operations
+    for addr in (0x0f80..=0x1000).step_by(8) {
+        memory.map_u64(addr, 0);
+    }
     engine
         .execute_ir(&mut state, &mut memory, &ir)
         .expect("execute prologue bytes");
-    assert_eq!(state.get(Register::Rsp), 0x1000);
+    // After push/sub/lea/xor/add/pop ret sequence, ret pops return address → RSP=0x1008
+    assert_eq!(state.get(Register::Rsp), 0x1008);
     assert_eq!(state.get(Register::Rbp), 0xABCD_EF01_2345_6789);
     assert_eq!(state.get(Register::Rcx), 0);
     assert_eq!(memory.read_u64(0x0ff8).expect("saved rbp"), 0xABCD_EF01_2345_6789);
@@ -350,15 +356,27 @@ fn atomic_torture_and_barrier_ordering_match_reference_hash() {
     let mut memory = MemoryImage::default();
     memory.map_u64(0xA000, 19);
 
+    let addr_a000 = casa1::cpu::MemoryOperand {
+        base: None,
+        index: None,
+        scale: 1,
+        displacement: 0xA000,
+        rip_relative: false,
+        rip_base: 0,
+        segment: None,
+        address_size_32: false,
+    };
     let program = vec![
         IrInstruction::LockXadd {
-            address: 0xA000,
+            address: addr_a000.clone(),
             src: Register::Rax,
+            width: 8,
         },
         IrInstruction::Mfence,
         IrInstruction::LockXadd {
-            address: 0xA000,
+            address: addr_a000.clone(),
             src: Register::Rcx,
+            width: 8,
         },
         IrInstruction::Mfence,
     ];
@@ -557,7 +575,7 @@ fn reference_execute(
                 gpr.insert(*dst, result);
                 flags = reference_sub_flags(lhs, *value, result, arch.pointer_bytes() * 8);
             }
-            IrInstruction::XorImm { dst, value } => {
+            IrInstruction::XorImm { dst, value, .. } => {
                 let result = *gpr.get(dst).unwrap() ^ *value;
                 gpr.insert(*dst, result);
                 flags = reference_logic_flags(result, arch.pointer_bytes() * 8);
@@ -666,18 +684,20 @@ fn reference_execute_random(
                 state.set(*dst, result);
                 state.flags = reference_sub_flags(lhs, *value, result, 64);
             }
-            IrInstruction::XorImm { dst, value } => {
+            IrInstruction::XorImm { dst, value, .. } => {
                 let result = state.get(*dst) ^ *value;
                 state.set(*dst, result);
                 state.flags = reference_logic_flags(result, 64);
             }
-            IrInstruction::LockXadd { address, src } => {
-                let original = memory.read_u64(*address).unwrap();
+            IrInstruction::LockXadd { address, src, .. } => {
+                let eff_addr = effective_address(address);
+                let original = memory.read_u64(eff_addr).unwrap();
                 let next = original.wrapping_add(state.get(*src));
-                memory.write_u64(*address, next);
+                let _ = memory.commit_zeroed_pages(eff_addr, 8);
+                memory.write_u64(eff_addr, next);
                 state.set(*src, original);
-                ordering_log.push(format!("ldaxr:{address:#x}"));
-                ordering_log.push(format!("stlxr:{address:#x}"));
+                ordering_log.push(format!("ldaxr:{eff_addr:#x}"));
+                ordering_log.push(format!("stlxr:{eff_addr:#x}"));
             }
             IrInstruction::Mfence => ordering_log.push("dmb ish".to_string()),
             _ => {}
@@ -703,6 +723,7 @@ fn reference_atomic(initial: u64, adds: &[u64]) -> ReferenceAtomicOutcome {
         ordering_log.push("dmb ish".to_string());
     }
     memory.map_u64(0xA000, value);
+    let _ = memory.commit_zeroed_pages(0xA000, 8);
     ReferenceAtomicOutcome {
         final_value: value,
         memory_hash: memory.stable_hash(),
@@ -727,10 +748,21 @@ fn build_random_program(seed: &mut u64, address: u64) -> Vec<IrInstruction> {
             2 => program.push(IrInstruction::XorImm {
                 dst: Register::Rdx,
                 value: lcg(seed) & 0xffff,
+                width: 8,
             }),
             3 => program.push(IrInstruction::LockXadd {
-                address,
+                address: casa1::cpu::MemoryOperand {
+                    base: None,
+                    index: None,
+                    scale: 1,
+                    displacement: address as i32,
+                    rip_relative: false,
+                    rip_base: 0,
+                    segment: None,
+                    address_size_32: false,
+                },
                 src: Register::Rax,
+                width: 8,
             }),
             _ => program.push(IrInstruction::Mfence),
         }
@@ -858,6 +890,12 @@ fn xmm_to_bytes(value: XmmValue) -> [u8; 16] {
     bytes[..8].copy_from_slice(&value.low.to_le_bytes());
     bytes[8..].copy_from_slice(&value.high.to_le_bytes());
     bytes
+}
+
+fn effective_address(mem: &casa1::cpu::MemoryOperand) -> u64 {
+    let base = mem.base.map_or(0, |r| 0 /* not used in these tests */);
+    let index = mem.index.map_or(0, |r| 0 /* not used in these tests */);
+    base + index * mem.scale as u64 + mem.displacement as i64 as u64
 }
 
 fn reference_crc32(seed: u32, value: u64) -> u32 {

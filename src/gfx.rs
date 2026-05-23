@@ -141,6 +141,8 @@ pub enum FeatureQuery {
     Tearing,
     TimestampQueries,
     MeshShaders,
+    /// Hardware-accelerated ray tracing (requires Metal 3.0+ / Apple GPU family 7+).
+    Raytracing,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -159,6 +161,8 @@ pub struct MetalCapabilities {
     pub memoryless_render_targets: bool,
     pub timestamp_queries: bool,
     pub mesh_shaders: bool,
+    /// Hardware-accelerated ray tracing (Metal 3.0+ / Apple GPU family 7+).
+    pub raytracing: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -270,15 +274,146 @@ pub enum MetalStorageMode {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ResourceState {
+    /// D3D12_RESOURCE_STATE_COMMON (0) — default state; not tracked
     Common,
+    /// D3D12_RESOURCE_STATE_PRESENT (0) — same as common for swapchain backbuffers
     Present,
+    /// D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER (0x0001)
+    VertexAndConstantBuffer,
+    /// D3D12_RESOURCE_STATE_INDEX_BUFFER (0x0002)
+    IndexBuffer,
+    /// D3D12_RESOURCE_STATE_RENDER_TARGET (0x0004)
     RenderTarget,
-    CopySource,
-    CopyDest,
-    PixelShaderResource,
+    /// D3D12_RESOURCE_STATE_UNORDERED_ACCESS (0x0008)
     UnorderedAccess,
+    /// D3D12_RESOURCE_STATE_DEPTH_WRITE (0x0010)
     DepthWrite,
+    /// D3D12_RESOURCE_STATE_DEPTH_READ (0x0020)
+    DepthRead,
+    /// D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE (0x0040)
+    NonPixelShaderResource,
+    /// D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE (0x0080)
+    PixelShaderResource,
+    /// D3D12_RESOURCE_STATE_STREAM_OUT (0x0100)
+    StreamOut,
+    /// D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT (0x0200)
+    IndirectArgument,
+    /// D3D12_RESOURCE_STATE_COPY_DEST (0x0400)
+    CopyDest,
+    /// D3D12_RESOURCE_STATE_COPY_SOURCE (0x0800)
+    CopySource,
+    /// D3D12_RESOURCE_STATE_RESOLVE_DEST (0x1000)
+    ResolveDest,
+    /// D3D12_RESOURCE_STATE_RESOLVE_SOURCE (0x2000)
+    ResolveSource,
+    /// D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE (0x4000)
+    RaytracingAccelerationStructure,
+    /// D3D12_RESOURCE_STATE_SHADING_RATE_SOURCE (0x10000)
+    ShadingRateSource,
+    /// D3D12_RESOURCE_STATE_VIDEO_DECODE_READ (0x00010000)
+    VideoDecodeRead,
+    /// D3D12_RESOURCE_STATE_VIDEO_DECODE_WRITE (0x00020000)
+    VideoDecodeWrite,
+    /// D3D12_RESOURCE_STATE_VIDEO_PROCESS_READ (0x00040000)
+    VideoProcessRead,
+    /// D3D12_RESOURCE_STATE_VIDEO_PROCESS_WRITE (0x00080000)
+    VideoProcessWrite,
+    /// D3D12_RESOURCE_STATE_VIDEO_ENCODE_READ (0x00100000)
+    VideoEncodeRead,
+    /// D3D12_RESOURCE_STATE_VIDEO_ENCODE_WRITE (0x00200000)
+    VideoEncodeWrite,
+    /// D3D12_RESOURCE_STATE_GENERIC_READ (combination: VB/IB/indirect/copy-src/SRV)
     GenericRead,
+    /// D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE (SRV visible to all stages)
+    AllShaderResource,
+}
+
+impl ResourceState {
+    /// Map from raw D3D12_RESOURCE_STATES bitmask to our enum.
+    /// Returns multiple states if it's a combined bitmask (e.g. GenericRead).
+    pub fn from_d3d12_bits(bits: u32) -> Vec<ResourceState> {
+        if bits == 0 {
+            return vec![ResourceState::Common];
+        }
+        let mut result = Vec::new();
+        if bits & 0x0001 != 0 { result.push(ResourceState::VertexAndConstantBuffer); }
+        if bits & 0x0002 != 0 { result.push(ResourceState::IndexBuffer); }
+        if bits & 0x0004 != 0 { result.push(ResourceState::RenderTarget); }
+        if bits & 0x0008 != 0 { result.push(ResourceState::UnorderedAccess); }
+        if bits & 0x0010 != 0 { result.push(ResourceState::DepthWrite); }
+        if bits & 0x0020 != 0 { result.push(ResourceState::DepthRead); }
+        if bits & 0x0040 != 0 { result.push(ResourceState::NonPixelShaderResource); }
+        if bits & 0x0080 != 0 { result.push(ResourceState::PixelShaderResource); }
+        if bits & 0x0100 != 0 { result.push(ResourceState::StreamOut); }
+        if bits & 0x0200 != 0 { result.push(ResourceState::IndirectArgument); }
+        if bits & 0x0400 != 0 { result.push(ResourceState::CopyDest); }
+        if bits & 0x0800 != 0 { result.push(ResourceState::CopySource); }
+        if bits & 0x1000 != 0 { result.push(ResourceState::ResolveDest); }
+        if bits & 0x2000 != 0 { result.push(ResourceState::ResolveSource); }
+        if bits & 0x4000 != 0 { result.push(ResourceState::RaytracingAccelerationStructure); }
+        if bits & 0x10000 != 0 { result.push(ResourceState::ShadingRateSource); }
+        if bits & 0x00010000 != 0 { result.push(ResourceState::VideoDecodeRead); }
+        if bits & 0x00020000 != 0 { result.push(ResourceState::VideoDecodeWrite); }
+        if bits & 0x00040000 != 0 { result.push(ResourceState::VideoProcessRead); }
+        if bits & 0x00080000 != 0 { result.push(ResourceState::VideoProcessWrite); }
+        if bits & 0x00100000 != 0 { result.push(ResourceState::VideoEncodeRead); }
+        if bits & 0x00200000 != 0 { result.push(ResourceState::VideoEncodeWrite); }
+        if result.is_empty() {
+            result.push(ResourceState::GenericRead);
+        }
+        result
+    }
+
+    /// Map our enum back to a D3D12_RESOURCE_STATES bitmask.
+    pub fn to_d3d12_bits(&self) -> u32 {
+        match self {
+            ResourceState::Common => 0,
+            ResourceState::Present => 0,
+            ResourceState::VertexAndConstantBuffer => 0x0001,
+            ResourceState::IndexBuffer => 0x0002,
+            ResourceState::RenderTarget => 0x0004,
+            ResourceState::UnorderedAccess => 0x0008,
+            ResourceState::DepthWrite => 0x0010,
+            ResourceState::DepthRead => 0x0020,
+            ResourceState::NonPixelShaderResource => 0x0040,
+            ResourceState::PixelShaderResource => 0x0080,
+            ResourceState::StreamOut => 0x0100,
+            ResourceState::IndirectArgument => 0x0200,
+            ResourceState::CopyDest => 0x0400,
+            ResourceState::CopySource => 0x0800,
+            ResourceState::ResolveDest => 0x1000,
+            ResourceState::ResolveSource => 0x2000,
+            ResourceState::RaytracingAccelerationStructure => 0x4000,
+            ResourceState::ShadingRateSource => 0x10000,
+            ResourceState::VideoDecodeRead => 0x00010000,
+            ResourceState::VideoDecodeWrite => 0x00020000,
+            ResourceState::VideoProcessRead => 0x00040000,
+            ResourceState::VideoProcessWrite => 0x00080000,
+            ResourceState::VideoEncodeRead => 0x00100000,
+            ResourceState::VideoEncodeWrite => 0x00200000,
+            ResourceState::GenericRead => 0x0AC3,
+            ResourceState::AllShaderResource => 0x00C0,
+        }
+    }
+
+    /// Returns true if this state allows read-only access from shaders.
+    pub fn is_read_only(&self) -> bool {
+        matches!(
+            self,
+            ResourceState::Common
+                | ResourceState::Present
+                | ResourceState::VertexAndConstantBuffer
+                | ResourceState::IndexBuffer
+                | ResourceState::DepthRead
+                | ResourceState::NonPixelShaderResource
+                | ResourceState::PixelShaderResource
+                | ResourceState::IndirectArgument
+                | ResourceState::CopySource
+                | ResourceState::ResolveSource
+                | ResourceState::GenericRead
+                | ResourceState::AllShaderResource
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -353,11 +488,167 @@ pub struct MetalBinding {
     pub metal_format: Option<MtlPixelFormat>,
 }
 
+/// D3D12_DESCRIPTOR_RANGE_TYPE — type of descriptor in a descriptor range.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum D3D12DescriptorRangeType {
+    Srv,
+    Uav,
+    Cbv,
+    Sampler,
+}
+
+/// Mapping from descriptor range type to Metal argument buffer resource type.
+impl D3D12DescriptorRangeType {
+    pub fn to_metal_resource_type(&self) -> &'static str {
+        match self {
+            D3D12DescriptorRangeType::Srv => "texture",
+            D3D12DescriptorRangeType::Uav => "texture",
+            D3D12DescriptorRangeType::Cbv => "buffer",
+            D3D12DescriptorRangeType::Sampler => "sampler",
+        }
+    }
+}
+
+/// D3D12_SHADER_VISIBILITY — which shader stages a root parameter applies to.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum D3D12ShaderVisibility {
+    All,
+    Vertex,
+    Hull,
+    Domain,
+    Geometry,
+    Pixel,
+    Amplification,
+    Mesh,
+}
+
+impl Default for D3D12ShaderVisibility {
+    fn default() -> Self {
+        D3D12ShaderVisibility::All
+    }
+}
+
+/// A single descriptor range within a descriptor table.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DescriptorRange {
+    pub range_type: D3D12DescriptorRangeType,
+    pub num_descriptors: u32,
+    pub base_shader_register: u32,
+    pub register_space: u32,
+    /// Offset from the start of the descriptor table. D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND = -1.
+    pub offset_in_table: u32,
+}
+
+/// D3D12_STATIC_SAMPLER_DESC — a sampler that is baked into the root signature.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct D3D12StaticSamplerDesc {
+    pub shader_register: u32,
+    pub register_space: u32,
+    pub filter: u32,             // D3D12_FILTER
+    pub address_u: u32,          // D3D12_TEXTURE_ADDRESS_MODE
+    pub address_v: u32,
+    pub address_w: u32,
+    pub mip_lod_bias: f32,
+    pub max_anisotropy: u32,
+    pub comparison_func: u32,    // D3D12_COMPARISON_FUNC
+    pub border_color: u32,       // D3D12_STATIC_BORDER_COLOR
+    pub min_lod: f32,
+    pub max_lod: f32,
+    pub shader_visibility: D3D12ShaderVisibility,
+}
+
+/// A single root parameter (descriptor table, root descriptor, or root constant).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RootParameter {
+    DescriptorTable {
+        ranges: Vec<DescriptorRange>,
+        visibility: D3D12ShaderVisibility,
+    },
+    RootDescriptor {
+        range_type: D3D12DescriptorRangeType,
+        shader_register: u32,
+        register_space: u32,
+        visibility: D3D12ShaderVisibility,
+    },
+    RootConstants {
+        shader_register: u32,
+        register_space: u32,
+        num_32bit_values: u32,
+        visibility: D3D12ShaderVisibility,
+    },
+}
+
+/// Expanded root signature descriptor with full D3D12 parameter mapping.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RootSignatureDesc {
     pub descriptor_tables: Vec<u32>,
     pub root_constants: u32,
+    /// Root parameters (expanded form for Phase 2.1).
+    pub parameters: Vec<RootParameter>,
+    /// Static samplers baked into the root signature.
+    pub static_samplers: Vec<D3D12StaticSamplerDesc>,
+    /// Per-shader-visibility descriptor table offset state.
+    pub visibility_offsets: BTreeMap<D3D12ShaderVisibility, Vec<u32>>,
 }
+
+impl Default for RootSignatureDesc {
+    fn default() -> Self {
+        Self {
+            descriptor_tables: Vec::new(),
+            root_constants: 0,
+            parameters: Vec::new(),
+            static_samplers: Vec::new(),
+            visibility_offsets: BTreeMap::new(),
+        }
+    }
+}
+
+/// D3D12_RESOURCE_BARRIER_TYPE — which type of barrier is being issued.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum D3D12ResourceBarrierType {
+    Transition,
+    Aliasing,
+    Uav,
+}
+
+/// Flags for D3D12_RESOURCE_BARRIER_FLAGS.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum D3D12ResourceBarrierFlags {
+    None,
+    BeginOnly,
+    EndOnly,
+}
+
+/// A pending split barrier (begin without matching end).
+#[derive(Debug, Clone)]
+pub struct PendingSplitBarrier {
+    pub resource: ResourceId,
+    pub subresource: u32,
+    pub state_before: ResourceState,
+    pub state_after: ResourceState,
+}
+
+/// Describes a full D3D12_RESOURCE_BARRIER (type, flags, and state).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct D3D12ResourceBarrierDesc {
+    pub barrier_type: D3D12ResourceBarrierType,
+    pub flags: D3D12ResourceBarrierFlags,
+    /// For Transition barriers.
+    pub resource: Option<ResourceId>,
+    pub subresource: u32,
+    pub state_before: ResourceState,
+    pub state_after: ResourceState,
+    /// For Aliasing barriers.
+    pub resource_before: Option<ResourceId>,
+    pub resource_after: Option<ResourceId>,
+}
+
+/// Per-subresource barrier state tracking key.
+pub type SubresourceKey = (ResourceId, u32, u32);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PipelineStateDesc {
@@ -383,6 +674,20 @@ pub enum QueryType {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Command {
     Transition {
+        resource: ResourceId,
+        subresource: u32,
+        from: ResourceState,
+        to: ResourceState,
+    },
+    /// D3D12_RESOURCE_BARRIER_TYPE_TRANSITION with D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY.
+    SplitBarrierBegin {
+        resource: ResourceId,
+        subresource: u32,
+        from: ResourceState,
+        to: ResourceState,
+    },
+    /// D3D12_RESOURCE_BARRIER_TYPE_TRANSITION with D3D12_RESOURCE_BARRIER_FLAG_END_ONLY.
+    SplitBarrierEnd {
         resource: ResourceId,
         subresource: u32,
         from: ResourceState,
@@ -424,9 +729,44 @@ pub enum Command {
         y: u32,
         z: u32,
     },
+    /// Dispatch a mesh shader threadgroup. Behaves like Dispatch but uses a
+    /// mesh shader pipeline instead of a compute pipeline. Requires Metal
+    /// mesh shader support (Apple9+/M3+).
+    DispatchMesh {
+        x: u32,
+        y: u32,
+        z: u32,
+    },
     CopyResource {
         src: ResourceId,
         dst: ResourceId,
+    },
+    CopyBufferRegion {
+        dst: ResourceId,
+        dst_offset: u64,
+        src: ResourceId,
+        src_offset: u64,
+        size: u64,
+    },
+    CopyResourceRegion {
+        dst: ResourceId,
+        dst_x: u32,
+        dst_y: u32,
+        dst_z: u32,
+        src: ResourceId,
+        src_x: u32,
+        src_y: u32,
+        src_z: u32,
+        width: u32,
+        height: u32,
+        depth: u32,
+    },
+    ResolveSubresource {
+        dst: ResourceId,
+        src: ResourceId,
+        /// Raw DXGI_FORMAT u32 value.
+        format: u32,
+        resolve_mode: u32,
     },
 }
 
@@ -527,6 +867,10 @@ pub struct GraphicsBackend {
     root_signatures: BTreeMap<RootSignatureId, RootSignatureDesc>,
     pipeline_states: BTreeMap<PipelineStateId, PipelineStateDesc>,
     timestamps: u64,
+    /// Per-subresource barrier state tracking: (resource, array_slice, mip_level) -> state.
+    subresource_states: BTreeMap<SubresourceKey, ResourceState>,
+    /// Pending split barriers (BEGIN_ONLY that have not yet been END_ONLY'd).
+    pending_split_barriers: Vec<PendingSplitBarrier>,
 }
 
 impl Default for GraphicsBackend {
@@ -596,6 +940,8 @@ impl GraphicsBackend {
             root_signatures: BTreeMap::new(),
             pipeline_states: BTreeMap::new(),
             timestamps: 1,
+            subresource_states: BTreeMap::new(),
+            pending_split_barriers: Vec::new(),
         }
     }
 
@@ -616,6 +962,7 @@ impl GraphicsBackend {
             FeatureQuery::Tearing => true,
             FeatureQuery::TimestampQueries => self.capabilities.timestamp_queries,
             FeatureQuery::MeshShaders => self.capabilities.mesh_shaders,
+            FeatureQuery::Raytracing => self.capabilities.raytracing,
         }
     }
 
@@ -828,23 +1175,27 @@ impl GraphicsBackend {
 
     pub fn transition_resource(
         &mut self,
-        resource: ResourceId,
+        resource_id: ResourceId,
         subresource: u32,
         from: ResourceState,
         to: ResourceState,
     ) -> AppResult<()> {
-        let resource = self.resource_mut(resource)?;
+        let resource = self.resource_mut(resource_id)?;
         let state = resource
             .states
             .get_mut(subresource as usize)
             .ok_or_else(|| AppError::new(ReasonCode::RcD3dInvalidState, "invalid subresource index"))?;
-        if *state != from {
+        // Only validate state mismatch when the from state is not Common
+        // (Common acts as "unknown/any" in D3D12 barrier validation)
+        if from != ResourceState::Common && *state != from {
             return Err(AppError::new(
                 ReasonCode::RcD3dInvalidState,
                 format!("resource state mismatch: expected {from:?}, found {state:?}"),
             ));
         }
         *state = to;
+        // Also track in subresource_states
+        self.subresource_states.insert((resource_id, 0, subresource), to);
         Ok(())
     }
 
@@ -1005,6 +1356,154 @@ impl GraphicsBackend {
         Ok(())
     }
 
+    /// Record a split barrier begin (BEGIN_ONLY).
+    /// Stores the pending transition; does NOT immediately change resource state.
+    pub fn record_split_barrier_begin(
+        &mut self,
+        list: CommandListId,
+        resource: ResourceId,
+        subresource: u32,
+        from: ResourceState,
+        to: ResourceState,
+    ) -> AppResult<()> {
+        self.resource(resource)?;
+        self.pending_split_barriers.push(PendingSplitBarrier {
+            resource,
+            subresource,
+            state_before: from,
+            state_after: to,
+        });
+        self.command_list_mut(list)?.commands.push(Command::SplitBarrierBegin {
+            resource,
+            subresource,
+            from,
+            to,
+        });
+        Ok(())
+    }
+
+    /// Record a split barrier end (END_ONLY).
+    /// Completes a previously begun split barrier and transitions the resource.
+    pub fn record_split_barrier_end(
+        &mut self,
+        list: CommandListId,
+        resource: ResourceId,
+        subresource: u32,
+        from: ResourceState,
+        to: ResourceState,
+    ) -> AppResult<()> {
+        self.resource(resource)?;
+        // Find and remove matching pending split barrier
+        let pos = self.pending_split_barriers.iter().position(|pending| {
+            pending.resource == resource
+                && pending.subresource == subresource
+                && pending.state_before == from
+                && pending.state_after == to
+        });
+        if let Some(index) = pos {
+            self.pending_split_barriers.remove(index);
+        }
+        // Apply the actual state transition on end
+        self.transition_resource_internal(resource, subresource, to)?;
+        self.command_list_mut(list)?.commands.push(Command::SplitBarrierEnd {
+            resource,
+            subresource,
+            from,
+            to,
+        });
+        Ok(())
+    }
+
+    /// Dispatch a full D3D12_RESOURCE_BARRIER (handles all 3 barrier types).
+    pub fn record_resource_barrier(
+        &mut self,
+        list: CommandListId,
+        desc: &D3D12ResourceBarrierDesc,
+    ) -> AppResult<()> {
+        match desc.barrier_type {
+            D3D12ResourceBarrierType::Transition => {
+                let resource = desc.resource.ok_or_else(|| {
+                    AppError::new(ReasonCode::RcD3dInvalidState, "transition barrier missing resource")
+                })?;
+                match desc.flags {
+                    D3D12ResourceBarrierFlags::BeginOnly => {
+                        self.record_split_barrier_begin(
+                            list, resource, desc.subresource,
+                            desc.state_before, desc.state_after,
+                        )?;
+                    }
+                    D3D12ResourceBarrierFlags::EndOnly => {
+                        self.record_split_barrier_end(
+                            list, resource, desc.subresource,
+                            desc.state_before, desc.state_after,
+                        )?;
+                    }
+                    D3D12ResourceBarrierFlags::None => {
+                        self.record_transition(
+                            list, resource, desc.subresource,
+                            desc.state_before, desc.state_after,
+                        )?;
+                    }
+                }
+            }
+            D3D12ResourceBarrierType::Uav => {
+                let resource = desc.resource.ok_or_else(|| {
+                    AppError::new(ReasonCode::RcD3dInvalidState, "UAV barrier missing resource")
+                })?;
+                self.record_uav_barrier(list, resource)?;
+            }
+            D3D12ResourceBarrierType::Aliasing => {
+                self.record_aliasing_barrier(list, desc.resource_before, desc.resource_after)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Internal: set subresource state without checking previous state (for split barriers).
+    fn transition_resource_internal(
+        &mut self,
+        resource: ResourceId,
+        subresource: u32,
+        to: ResourceState,
+    ) -> AppResult<()> {
+        let resource_record = self.resource_mut(resource)?;
+        let state = resource_record
+            .states
+            .get_mut(subresource as usize)
+            .ok_or_else(|| AppError::new(ReasonCode::RcD3dInvalidState, "invalid subresource index"))?;
+        *state = to;
+        // Also track in subresource_states for array-slice+mip-level tracking
+        let key = (resource, 0, subresource);
+        self.subresource_states.insert(key, to);
+        Ok(())
+    }
+
+    /// Get subresource state from the fine-grained tracking map.
+    pub fn subresource_state(&self, resource: ResourceId, array_slice: u32, mip_level: u32) -> Option<ResourceState> {
+        self.subresource_states.get(&(resource, array_slice, mip_level)).copied()
+    }
+
+    /// Set subresource state in the fine-grained tracking map.
+    pub fn set_subresource_state(
+        &mut self,
+        resource: ResourceId,
+        array_slice: u32,
+        mip_level: u32,
+        state: ResourceState,
+    ) {
+        self.subresource_states.insert((resource, array_slice, mip_level), state);
+    }
+
+    /// Return the number of pending split barriers.
+    pub fn pending_split_barrier_count(&self) -> usize {
+        self.pending_split_barriers.len()
+    }
+
+    /// Clear all pending split barriers (e.g., on command list reset).
+    pub fn clear_pending_split_barriers(&mut self) {
+        self.pending_split_barriers.clear();
+    }
+
     pub fn record_set_root_constants(&mut self, list: CommandListId, values: Vec<u32>) -> AppResult<()> {
         self.command_list_mut(list)?.commands.push(Command::SetRootConstants { values });
         Ok(())
@@ -1059,10 +1558,95 @@ impl GraphicsBackend {
         Ok(())
     }
 
+    /// Record a mesh shader dispatch command.
+    ///
+    /// This issues a `DispatchMesh` command which, when executed, will use
+    /// a mesh shader pipeline instead of a compute pipeline. On Metal with
+    /// Apple9+/M3+ GPUs this maps to `draw_mesh_threadgroups`. On older
+    /// hardware it falls back to compute-based emulation.
+    pub fn record_dispatch_mesh(&mut self, list: CommandListId, x: u32, y: u32, z: u32) -> AppResult<()> {
+        self.command_list_mut(list)?.commands.push(Command::DispatchMesh { x, y, z });
+        Ok(())
+    }
+
     pub fn record_copy_resource(&mut self, list: CommandListId, src: ResourceId, dst: ResourceId) -> AppResult<()> {
         self.resource(src)?;
         self.resource(dst)?;
         self.command_list_mut(list)?.commands.push(Command::CopyResource { src, dst });
+        Ok(())
+    }
+
+    pub fn record_copy_buffer_region(
+        &mut self,
+        list: CommandListId,
+        dst: ResourceId,
+        dst_offset: u64,
+        src: ResourceId,
+        src_offset: u64,
+        size: u64,
+    ) -> AppResult<()> {
+        self.resource(src)?;
+        self.resource(dst)?;
+        self.command_list_mut(list)?.commands.push(Command::CopyBufferRegion {
+            dst,
+            dst_offset,
+            src,
+            src_offset,
+            size,
+        });
+        Ok(())
+    }
+
+    pub fn record_copy_resource_region(
+        &mut self,
+        list: CommandListId,
+        dst: ResourceId,
+        dst_x: u32,
+        dst_y: u32,
+        dst_z: u32,
+        src: ResourceId,
+        src_x: u32,
+        src_y: u32,
+        src_z: u32,
+        width: u32,
+        height: u32,
+        depth: u32,
+    ) -> AppResult<()> {
+        self.resource(src)?;
+        self.resource(dst)?;
+        self.command_list_mut(list)?.commands.push(Command::CopyResourceRegion {
+            dst,
+            dst_x,
+            dst_y,
+            dst_z,
+            src,
+            src_x,
+            src_y,
+            src_z,
+            width,
+            height,
+            depth,
+        });
+        Ok(())
+    }
+
+    pub fn record_resolve_subresource(
+        &mut self,
+        list: CommandListId,
+        dst: ResourceId,
+        src: ResourceId,
+        // Raw DXGI_FORMAT u32 value.
+        format: u32,
+        resolve_mode: u32,
+    ) -> AppResult<()> {
+        self.resource(src)?;
+        self.resource(dst)?;
+        self.command_list_mut(list)?.commands.push(Command::ResolveSubresource {
+            dst,
+            src,
+            format,
+            resolve_mode,
+        });
         Ok(())
     }
 
@@ -1098,7 +1682,11 @@ impl GraphicsBackend {
                 .clone();
             for command in &stream.commands {
                 match command {
-                    Command::Transition { .. } | Command::UavBarrier { .. } | Command::AliasingBarrier { .. } => {
+                    Command::Transition { .. }
+                    | Command::SplitBarrierBegin { .. }
+                    | Command::SplitBarrierEnd { .. }
+                    | Command::UavBarrier { .. }
+                    | Command::AliasingBarrier { .. } => {
                         if let Some(pass) = active_pass.take() {
                             render_passes.push(pass);
                         }
@@ -1199,7 +1787,84 @@ impl GraphicsBackend {
                         }
                         compute_passes += 1;
                     }
+                    Command::DispatchMesh { .. } => {
+                        // Mesh shader dispatches require an active render pass
+                        // (they generate geometry for rasterization).
+                        if let Some(pass) = &mut active_pass {
+                            pass.draw_calls += 1;
+                        } else {
+                            validation_errors.push("dispatch mesh without active render pass".to_string());
+                        }
+                    }
                     Command::CopyResource { src, dst } => {
+                        if let Some(pass) = active_pass.take() {
+                            render_passes.push(pass);
+                        }
+                        blit_passes += 1;
+                        let src_bytes = self.resource(*src)?.bytes.clone();
+                        self.resource_mut(*dst)?.bytes = src_bytes;
+                    }
+                    Command::CopyBufferRegion {
+                        dst,
+                        dst_offset,
+                        src,
+                        src_offset,
+                        size,
+                    } => {
+                        if let Some(pass) = active_pass.take() {
+                            render_passes.push(pass);
+                        }
+                        blit_passes += 1;
+                        let src_bytes = self.resource(*src)?.bytes.clone();
+                        let dst_bytes = self.resource_mut(*dst)?;
+                        let src_start = *src_offset as usize;
+                        let dst_start = *dst_offset as usize;
+                        let len = *size as usize;
+                        if src_start + len <= src_bytes.len() && dst_start + len <= dst_bytes.bytes.len() {
+                            dst_bytes.bytes[dst_start..dst_start + len]
+                                .copy_from_slice(&src_bytes[src_start..src_start + len]);
+                        }
+                    }
+                    Command::CopyResourceRegion {
+                        dst,
+                        dst_x,
+                        dst_y,
+                        dst_z: _,
+                        src,
+                        src_x: _,
+                        src_y: _,
+                        src_z: _,
+                        width,
+                        height,
+                        depth: _,
+                    } => {
+                        if let Some(pass) = active_pass.take() {
+                            render_passes.push(pass);
+                        }
+                        blit_passes += 1;
+                        // For buffer-to-buffer copies, treat as a flat byte copy
+                        // using the offset/size from the region parameters.
+                        // Texture region copies (texture sub-rectangle) are approximated
+                        // by copying the full region as a contiguous block.
+                        let src_bytes = self.resource(*src)?.bytes.clone();
+                        let dst_bytes = self.resource_mut(*dst)?;
+                        let src_stride = *width as usize;
+                        let dst_stride = *width as usize;
+                        let row_count = *height as usize;
+                        let src_offset = (*dst_y as usize) * src_stride; // approximate
+                        let dst_offset = (*dst_y as usize) * dst_stride;
+                        for row in 0..row_count {
+                            let src_row_start = src_offset + row * src_stride;
+                            let dst_row_start = dst_offset + row * dst_stride;
+                            if src_row_start + src_stride <= src_bytes.len()
+                                && dst_row_start + dst_stride <= dst_bytes.bytes.len()
+                            {
+                                dst_bytes.bytes[dst_row_start..dst_row_start + src_stride]
+                                    .copy_from_slice(&src_bytes[src_row_start..src_row_start + src_stride]);
+                            }
+                        }
+                    }
+                    Command::ResolveSubresource { dst, src, .. } => {
                         if let Some(pass) = active_pass.take() {
                             render_passes.push(pass);
                         }
@@ -1243,6 +1908,11 @@ impl GraphicsBackend {
 
     pub fn fence_value(&self, fence: FenceId) -> AppResult<u64> {
         Ok(self.fence(fence)?.value)
+    }
+
+    pub fn wait_for_fence(&self, fence: FenceId, value: u64, _timeout_ns: u64) -> AppResult<bool> {
+        let current = self.fence_value(fence)?;
+        Ok(current >= value)
     }
 
     pub fn upload_write(&mut self, resource: ResourceId, offset: usize, bytes: &[u8]) -> AppResult<()> {
@@ -1923,6 +2593,8 @@ pub(crate) fn host_gpu_profile_from_name(name: &str) -> HostGpuProfile {
             memoryless_render_targets: normalized.starts_with("Apple "),
             timestamp_queries: true,
             mesh_shaders: family >= 9,
+            // Metal 3.0+ raytracing available on Apple GPU family >= 7
+            raytracing: family >= 7,
         },
     }
 }

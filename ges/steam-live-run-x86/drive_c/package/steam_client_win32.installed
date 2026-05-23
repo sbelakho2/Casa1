@@ -1,0 +1,11 @@
+"steam_client_win32"
+{
+	"InstallDir"		"C:\\Program Files\\Steam"
+	"RegistryPath"		"SOFTWARE\\Valve\\Steam"
+	"ProductName"		"Steam"
+	"Publisher"		"Valve"
+	"InstallSource"		"SteamSetup.exe"
+	"InstallDate"		"2026-05-22"
+	"Version"		"1729873782"
+	"ManifestSource"	"1"
+}

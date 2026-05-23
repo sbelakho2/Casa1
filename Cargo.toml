@@ -38,14 +38,26 @@ native-tls = "0.2"
 url = "2.5"
 metal = "0.31"
 objc = "0.2"
+core-graphics = "0.24"
 core-graphics-types = "0.1"
 raw-window-handle = "0.6"
 libloading = "0.8"
 lazy_static = "1.5"
+regex = "1.11"
+flate2 = "1.1"
+png = "0.17"
+tungstenite = { version = "0.26", optional = true }
+ffmpeg-next = { version = "7.0", optional = true, default-features = false }
 
 [features]
-default = ["metal"]
+default = ["metal", "vulkan", "opengl"]
 metal = []
+vulkan = []
+opengl = []
+moltenvk = ["vulkan"]
+angle = ["opengl"]
+websocket = ["tungstenite"]
+ffmpeg = ["ffmpeg-next"]
 
 [dev-dependencies]
 tempfile = "3.20"
