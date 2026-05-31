@@ -427,14 +427,23 @@ impl GameEnvironment {
         let current = std::env::current_dir().map_err(|error| {
             AppError::from_io(ReasonCode::RcIo, "failed to resolve current directory", &error)
         })?;
+        // When CASA1_GES_ROOT is set, that root is authoritative: the caller has
+        // explicitly chosen where game environments live, so we must NOT fall
+        // back to scanning the workspace for like-named environments (which
+        // exists only to disambiguate when no explicit root was provided).
+        let env_root_explicit = std::env::var_os("CASA1_GES_ROOT").is_some();
         let candidate_roots = base_root_candidates_from_env_or(&current)?;
         let root = candidate_roots[0].join(name);
-        if let Some(existing_root) = candidate_roots
+        let existing_root = candidate_roots
             .iter()
             .map(|candidate| candidate.join(name))
-            .find(|candidate| candidate.exists())
-            .or(find_named_ge_in_workspace(&current, name, &candidate_roots)?)
-        {
+            .find(|candidate| candidate.exists());
+        let existing_root = match existing_root {
+            Some(found) => Some(found),
+            None if env_root_explicit => None,
+            None => find_named_ge_in_workspace(&current, name, &candidate_roots)?,
+        };
+        if let Some(existing_root) = existing_root {
             return Err(AppError::new(
                 ReasonCode::RcGeExists,
                 format!("game environment {name} already exists at {}", existing_root.display()),

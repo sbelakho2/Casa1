@@ -152,16 +152,19 @@ fn extract_spki_der(data: &[u8]) -> Option<Vec<u8>> {
     skip_tlv(data, &mut off)?;
     skip_tlv(data, &mut off)?;
 
-    let (_, spki_len) = read_tag(data, &mut off)?;
-    let mut spki_start = off;
-    while spki_start > 0 && data[spki_start - 1] != 0x30 {
-        spki_start -= 1;
+    // SubjectPublicKeyInfo SEQUENCE: capture the TLV start offset *before*
+    // consuming the tag/length bytes so we can slice the exact DER encoding
+    // of the SPKI (tag + length + content) deterministically.
+    let spki_start = off;
+    let (spki_tag, spki_len) = read_tag(data, &mut off)?;
+    if spki_tag != 0x30 {
+        return None;
     }
-    if spki_start > 0 {
-        spki_start -= 1;
+    let spki_end = off + spki_len;
+    if spki_end > tbs_end {
+        return None;
     }
-    let full_spki = data[spki_start..(off + spki_len)].to_vec();
-    Some(full_spki)
+    Some(data[spki_start..spki_end].to_vec())
 }
 
 impl WinInetStack {
@@ -542,6 +545,7 @@ impl WinInetStack {
 
         let client = reqwest::blocking::Client::builder()
             .danger_accept_invalid_certs(true)
+            .tls_info(true) // expose the peer certificate so certificate pinning can be enforced
             .timeout(std::time::Duration::from_secs(30));
 
         let client = if let Some(ref cfg) = proxy_cfg {
@@ -588,7 +592,7 @@ impl WinInetStack {
             request_builder = request_builder.header("Proxy-Authorization", auth);
         }
 
-        let (_status_code, _status_text, _response_headers, _response_body, set_cookie_values) = {
+        let (_status_code, _status_text, _response_headers, _response_body, set_cookie_values, cert_chain) = {
             let req = self.requests.get_mut(&request_handle).ok_or_else(|| {
                 AppError::new(
                     ReasonCode::RcWin32InvalidHandle,
@@ -626,6 +630,15 @@ impl WinInetStack {
                 }
             };
 
+            // Capture the peer certificate (DER) from the live TLS handshake before the
+            // response body is consumed, so certificate pins can be enforced below.
+            let cert_chain: Vec<Vec<u8>> = response
+                .extensions()
+                .get::<reqwest::tls::TlsInfo>()
+                .and_then(|info| info.peer_certificate())
+                .map(|der| vec![der.to_vec()])
+                .unwrap_or_default();
+
             let sc = response.status().as_u16() as u32;
             let st = response.status().canonical_reason().unwrap_or("Unknown").to_string();
 
@@ -649,7 +662,7 @@ impl WinInetStack {
             req.response_body = body_bytes.clone();
             req.state = InternetState::ResponseReceived;
 
-            (sc, st, resp_headers, body_bytes, set_cookie_values)
+            (sc, st, resp_headers, body_bytes, set_cookie_values, cert_chain)
         };
 
         // Parse and store Set-Cookie headers
@@ -657,8 +670,8 @@ impl WinInetStack {
             self.parse_and_store_set_cookie(&conn_server_name, header_value);
         }
 
-        // Verify certificate pins
-        if !self.verify_certificate_pin(&conn_server_name, &[]) {
+        // Verify certificate pins against the certificate captured from the TLS handshake.
+        if !self.verify_certificate_pin(&conn_server_name, &cert_chain) {
             return Err(AppError::new(
                 ReasonCode::RcNetConnectionFailed,
                 format!("HttpSendRequestW: certificate pin validation failed for {}", conn_server_name),
@@ -1032,5 +1045,88 @@ mod tests {
         let mut buf = vec![0_u8; 4096];
         let read = stack.internet_read_file(req, &mut buf).expect("read");
         assert!(read > 0);
+    }
+
+    /// Encode a DER TLV: tag, length (short or long form), then content.
+    fn der(tag: u8, content: &[u8]) -> Vec<u8> {
+        let mut out = vec![tag];
+        let len = content.len();
+        if len < 0x80 {
+            out.push(len as u8);
+        } else {
+            let mut len_bytes = Vec::new();
+            let mut remaining = len;
+            while remaining > 0 {
+                len_bytes.push((remaining & 0xff) as u8);
+                remaining >>= 8;
+            }
+            len_bytes.reverse();
+            out.push(0x80 | len_bytes.len() as u8);
+            out.extend_from_slice(&len_bytes);
+        }
+        out.extend_from_slice(content);
+        out
+    }
+
+    fn build_spki(key_bits: &[u8]) -> Vec<u8> {
+        let algorithm = der(0x30, &der(0x06, &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01]));
+        let mut bit_string = vec![0x00];
+        bit_string.extend_from_slice(key_bits);
+        let public_key = der(0x03, &bit_string);
+        let mut spki = algorithm;
+        spki.extend_from_slice(&public_key);
+        der(0x30, &spki)
+    }
+
+    fn synthetic_certificate(spki: &[u8]) -> Vec<u8> {
+        let version = der(0xA0, &der(0x02, &[0x02]));
+        let serial = der(0x02, &[0x01]);
+        let signature = der(0x30, &der(0x06, &[0x2A, 0x86, 0x48]));
+        let issuer = der(0x30, &[]);
+        let validity = der(0x30, &[]);
+        let subject = der(0x30, &[]);
+        let mut tbs = Vec::new();
+        tbs.extend_from_slice(&version);
+        tbs.extend_from_slice(&serial);
+        tbs.extend_from_slice(&signature);
+        tbs.extend_from_slice(&issuer);
+        tbs.extend_from_slice(&validity);
+        tbs.extend_from_slice(&subject);
+        tbs.extend_from_slice(spki);
+        let tbs_certificate = der(0x30, &tbs);
+        let outer_signature = der(0x30, &der(0x06, &[0x2A, 0x86, 0x48]));
+        let signature_value = der(0x03, &[0x00]);
+        let mut cert = Vec::new();
+        cert.extend_from_slice(&tbs_certificate);
+        cert.extend_from_slice(&outer_signature);
+        cert.extend_from_slice(&signature_value);
+        der(0x30, &cert)
+    }
+
+    #[test]
+    fn wininet_extract_spki_der_returns_exact_subject_public_key_info() {
+        let spki = build_spki(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        let cert = synthetic_certificate(&spki);
+        let extracted = extract_spki_der(&cert).expect("SPKI must be extractable");
+        assert_eq!(extracted, spki);
+    }
+
+    #[test]
+    fn wininet_certificate_pin_enforces_only_matching_spki_hash() {
+        let spki = build_spki(&[0xAA, 0xBB, 0xCC, 0xDD]);
+        let cert = synthetic_certificate(&spki);
+        let pin = Sha256::digest(extract_spki_der(&cert).unwrap());
+
+        let mut stack = WinInetStack::new();
+        assert!(stack.verify_certificate_pin("steamcdn.example", &[cert.clone()]));
+
+        stack.pin_certificate("steamcdn.example", pin.as_slice());
+        assert!(stack.verify_certificate_pin("steamcdn.example", &[cert.clone()]));
+
+        let other = synthetic_certificate(&build_spki(&[0x11, 0x22, 0x33, 0x44]));
+        assert!(!stack.verify_certificate_pin("steamcdn.example", &[other]));
+
+        assert!(!stack.verify_certificate_pin("steamcdn.example", &[]));
+        assert!(stack.verify_certificate_pin("other.example", &[]));
     }
 }

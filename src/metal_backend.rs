@@ -28,6 +28,10 @@ use core_graphics_types::geometry::CGSize;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+// Re-export the top-level async_pipeline_compiler module so that
+// `crate::metal_backend::async_pipeline_compiler::*` imports work.
+pub use crate::async_pipeline_compiler;
+
 // ---------------------------------------------------------------------------
 // ID allocation
 // ---------------------------------------------------------------------------
@@ -397,32 +401,263 @@ pub fn configure_depth_attachment(
 // IOSurface-backed Metal texture utilities for zero-copy CEF compositing
 // ---------------------------------------------------------------------------
 
-/// Stub: create a Metal texture from an IOSurface.
-///
-/// The `metal` crate v0.31 does not expose the IOSurface-backed texture creation
-/// API (`newTextureWithDescriptor:iosurface:plane:error:`). This always returns
-/// `None` for now; the compositor falls back to CPU-side pixel uploads via
-/// [`submit_cef_overlay_frame`].
-///
-/// [`submit_cef_overlay_frame`]: crate::metal_renderer::submit_cef_overlay_frame
-pub fn create_texture_from_io_surface(
-    _device: &metal::Device,
-    _io_surface_ptr: *mut std::ffi::c_void,
-    _format: metal::MTLPixelFormat,
-    _width: u64,
-    _height: u64,
-) -> Option<metal::Texture> {
-    None
+#[link(name = "IOSurface", kind = "framework")]
+unsafe extern "C" {
+    /// `IOSurfaceRef IOSurfaceCreate(CFDictionaryRef properties);`
+    ///
+    /// Returns a `+1` retained `IOSurfaceRef` (release with `CFRelease`).
+    fn IOSurfaceCreate(
+        properties: core_foundation::dictionary::CFDictionaryRef,
+    ) -> *mut std::ffi::c_void;
+
+    /// `IOReturn IOSurfaceLock(IOSurfaceRef, IOSurfaceLockOptions, uint32_t *seed);`
+    ///
+    /// Locks the surface for CPU access. Returns `kIOReturnSuccess` (0) on
+    /// success. `seed` may be null.
+    fn IOSurfaceLock(
+        buffer: *mut std::ffi::c_void,
+        options: u32,
+        seed: *mut u32,
+    ) -> i32;
+
+    /// `IOReturn IOSurfaceUnlock(IOSurfaceRef, IOSurfaceLockOptions, uint32_t *seed);`
+    fn IOSurfaceUnlock(
+        buffer: *mut std::ffi::c_void,
+        options: u32,
+        seed: *mut u32,
+    ) -> i32;
+
+    /// `void *IOSurfaceGetBaseAddress(IOSurfaceRef);`
+    fn IOSurfaceGetBaseAddress(buffer: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+
+    /// `size_t IOSurfaceGetBytesPerRow(IOSurfaceRef);`
+    fn IOSurfaceGetBytesPerRow(buffer: *mut std::ffi::c_void) -> usize;
+
+    /// `size_t IOSurfaceGetWidth(IOSurfaceRef);`
+    fn IOSurfaceGetWidth(buffer: *mut std::ffi::c_void) -> usize;
+
+    /// `size_t IOSurfaceGetHeight(IOSurfaceRef);`
+    fn IOSurfaceGetHeight(buffer: *mut std::ffi::c_void) -> usize;
 }
 
-/// Stub: allocate a new IOSurface.
+/// Upload a tightly packed RGBA8 frame into the backing store of a BGRA8
+/// `IOSurface`, performing the R/B channel swap in place.
 ///
-/// The `metal` crate v0.31 does not expose the necessary APIs for IOSurface-backed
-/// Metal textures; this always returns `None`. When raw `objc` bindings are added
-/// (or the `metal` crate is updated), this will create an actual `IOSurfaceRef`
-/// for zero-copy buffer exchange between WKWebView and the Metal compositor.
-pub fn create_io_surface(_width: u32, _height: u32) -> Option<*mut std::ffi::c_void> {
-    None
+/// The surface created by [`create_io_surface`] uses the `'BGRA'` pixel format
+/// (the layout Core Animation and Metal expect for hardware compositing),
+/// while CEF/WKWebView snapshots are produced as `RGBA8`. This routine locks
+/// the surface, copies each row honoring the surface's real
+/// `BytesPerRow` (which IOSurface pads for alignment), swaps R and B per pixel,
+/// and unlocks it. Because the Metal texture returned by
+/// [`create_texture_from_io_surface`] aliases this same storage, the upload is
+/// the only copy in the pipeline — sampling on the GPU is zero-copy.
+///
+/// Returns an error if the surface is null, the dimensions disagree with the
+/// surface, the source buffer is too small, or the lock fails.
+pub fn upload_rgba_frame_to_io_surface(
+    io_surface_ptr: *mut std::ffi::c_void,
+    rgba_pixels: &[u8],
+    width: u32,
+    height: u32,
+) -> AppResult<()> {
+    if io_surface_ptr.is_null() {
+        return Err(AppError::new(
+            ReasonCode::RcInvalidState,
+            "upload_rgba_frame_to_io_surface: null IOSurface".to_string(),
+        ));
+    }
+    let width = width as usize;
+    let height = height as usize;
+    let expected = width
+        .checked_mul(height)
+        .and_then(|p| p.checked_mul(4))
+        .ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcInvalidState,
+                "upload_rgba_frame_to_io_surface: frame dimensions overflow".to_string(),
+            )
+        })?;
+    if rgba_pixels.len() < expected {
+        return Err(AppError::new(
+            ReasonCode::RcInvalidState,
+            format!(
+                "upload_rgba_frame_to_io_surface: source has {} bytes, need {expected}",
+                rgba_pixels.len()
+            ),
+        ));
+    }
+
+    unsafe {
+        let surf_w = IOSurfaceGetWidth(io_surface_ptr);
+        let surf_h = IOSurfaceGetHeight(io_surface_ptr);
+        if surf_w < width || surf_h < height {
+            return Err(AppError::new(
+                ReasonCode::RcInvalidState,
+                format!(
+                    "upload_rgba_frame_to_io_surface: surface {surf_w}x{surf_h} smaller than frame {width}x{height}"
+                ),
+            ));
+        }
+
+        // 0 = read/write access (no kIOSurfaceLockReadOnly bit).
+        let lock_rc = IOSurfaceLock(io_surface_ptr, 0, std::ptr::null_mut());
+        if lock_rc != 0 {
+            return Err(AppError::new(
+                ReasonCode::RcInvalidState,
+                format!("upload_rgba_frame_to_io_surface: IOSurfaceLock failed ({lock_rc:#x})"),
+            ));
+        }
+
+        let base = IOSurfaceGetBaseAddress(io_surface_ptr) as *mut u8;
+        if base.is_null() {
+            let _ = IOSurfaceUnlock(io_surface_ptr, 0, std::ptr::null_mut());
+            return Err(AppError::new(
+                ReasonCode::RcInvalidState,
+                "upload_rgba_frame_to_io_surface: null base address".to_string(),
+            ));
+        }
+        let dst_stride = IOSurfaceGetBytesPerRow(io_surface_ptr);
+        let src_stride = width * 4;
+
+        for y in 0..height {
+            let src_row = &rgba_pixels[y * src_stride..y * src_stride + src_stride];
+            let dst_row = base.add(y * dst_stride);
+            for x in 0..width {
+                let r = src_row[x * 4];
+                let g = src_row[x * 4 + 1];
+                let b = src_row[x * 4 + 2];
+                let a = src_row[x * 4 + 3];
+                let px = dst_row.add(x * 4);
+                // BGRA byte order.
+                *px = b;
+                *px.add(1) = g;
+                *px.add(2) = r;
+                *px.add(3) = a;
+            }
+        }
+
+        let unlock_rc = IOSurfaceUnlock(io_surface_ptr, 0, std::ptr::null_mut());
+        if unlock_rc != 0 {
+            return Err(AppError::new(
+                ReasonCode::RcInvalidState,
+                format!("upload_rgba_frame_to_io_surface: IOSurfaceUnlock failed ({unlock_rc:#x})"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Create a Metal texture that aliases the pixel storage of an `IOSurface`.
+///
+/// Builds an `MTLTextureDescriptor` and invokes the device's
+/// `newTextureWithDescriptor:iosurface:plane:` selector, which is not surfaced
+/// by the `metal` crate's safe API. The returned texture shares memory with the
+/// surface, giving a true zero-copy path between a WKWebView/CEF frame and the
+/// Metal compositor.
+///
+/// Returns `None` if the surface pointer is null, the dimensions are zero, or
+/// Metal declines to create the texture.
+///
+/// # Safety / Ownership
+/// `io_surface_ptr` must be a live `IOSurfaceRef` whose dimensions and pixel
+/// layout match `format`/`width`/`height`. The returned [`metal::Texture`] owns
+/// a `+1` reference to the underlying `MTLTexture` and releases it on drop; the
+/// caller retains ownership of the `IOSurface` itself.
+pub fn create_texture_from_io_surface(
+    device: &metal::DeviceRef,
+    io_surface_ptr: *mut std::ffi::c_void,
+    format: metal::MTLPixelFormat,
+    width: u64,
+    height: u64,
+) -> Option<metal::Texture> {
+    use metal::foreign_types::{ForeignType, ForeignTypeRef};
+
+    if io_surface_ptr.is_null() || width == 0 || height == 0 {
+        return None;
+    }
+
+    let descriptor = metal::TextureDescriptor::new();
+    descriptor.set_texture_type(metal::MTLTextureType::D2);
+    descriptor.set_pixel_format(format);
+    descriptor.set_width(width);
+    descriptor.set_height(height);
+    descriptor.set_usage(metal::MTLTextureUsage::ShaderRead | metal::MTLTextureUsage::RenderTarget);
+    descriptor.set_storage_mode(metal::MTLStorageMode::Shared);
+    descriptor.set_sample_count(1);
+
+    unsafe {
+        let device_obj = device.as_ptr() as *mut objc::runtime::Object;
+        let descriptor_obj = descriptor.as_ptr() as *mut objc::runtime::Object;
+        // NSUInteger plane index (0 for single-plane BGRA/RGBA surfaces).
+        let plane: u64 = 0;
+        let texture: *mut metal::MTLTexture = msg_send![
+            device_obj,
+            newTextureWithDescriptor: descriptor_obj
+            iosurface: io_surface_ptr
+            plane: plane
+        ];
+        if texture.is_null() {
+            None
+        } else {
+            Some(metal::Texture::from_ptr(texture))
+        }
+    }
+}
+
+/// Allocate a new BGRA8 `IOSurface` of the given dimensions.
+///
+/// The surface is created with `IOSurfaceBytesPerElement = 4` and pixel format
+/// `'BGRA'`, matching the layout the CEF/Metal compositor expects. `IOSurface`
+/// computes a correctly aligned `BytesPerRow`/`AllocSize` from these fields.
+///
+/// Returns the raw `IOSurfaceRef` (a `+1` retained CoreFoundation object that
+/// the caller must `CFRelease`), or `None` if the dimensions are zero or the
+/// allocation fails.
+pub fn create_io_surface(width: u32, height: u32) -> Option<*mut std::ffi::c_void> {
+    use core_foundation::base::TCFType;
+    use core_foundation::dictionary::CFDictionary;
+    use core_foundation::number::CFNumber;
+    use core_foundation::string::CFString;
+
+    if width == 0 || height == 0 {
+        return None;
+    }
+
+    // 'BGRA' four-character code (0x42475241) — 8 bits per channel.
+    const PIXEL_FORMAT_BGRA: i64 = 0x4247_5241;
+    const BYTES_PER_ELEMENT: i64 = 4;
+
+    let pairs = [
+        (
+            CFString::from_static_string("IOSurfaceWidth"),
+            CFNumber::from(width as i64),
+        ),
+        (
+            CFString::from_static_string("IOSurfaceHeight"),
+            CFNumber::from(height as i64),
+        ),
+        (
+            CFString::from_static_string("IOSurfaceBytesPerElement"),
+            CFNumber::from(BYTES_PER_ELEMENT),
+        ),
+        (
+            CFString::from_static_string("IOSurfacePixelFormat"),
+            CFNumber::from(PIXEL_FORMAT_BGRA),
+        ),
+    ];
+    let dict = CFDictionary::from_CFType_pairs(
+        &pairs
+            .iter()
+            .map(|(key, value)| (key.as_CFType(), value.as_CFType()))
+            .collect::<Vec<_>>(),
+    );
+
+    let surface = unsafe { IOSurfaceCreate(dict.as_concrete_TypeRef()) };
+    if surface.is_null() {
+        None
+    } else {
+        Some(surface)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1825,7 +2060,7 @@ pub fn create_mesh_pipeline(
         mesh_desc.set_mesh_function(Some(&mesh_fn));
 
         // Set object function if provided
-        if let Some(ref obj_source) = desc.object_function {
+        if let Some(ref _obj_source) = desc.object_function {
             // The object function is compiled as part of the full_source above.
             // Look it up by the expected entry point name.
             if let Ok(obj_fn) = library.get_function("object_main", None) {
@@ -1834,7 +2069,7 @@ pub fn create_mesh_pipeline(
         }
 
         // Set fragment function if provided
-        if let Some(ref frag_source) = desc.fragment_function {
+        if let Some(ref _frag_source) = desc.fragment_function {
             // The fragment function is also compiled as part of the full_source.
             if let Ok(frag_fn) = library.get_function("fragment_main", None) {
                 mesh_desc.set_fragment_function(Some(&frag_fn));
@@ -3826,6 +4061,56 @@ mod tests {
         assert!(device.is_ok());
         let device = device.unwrap();
         assert!(!device.name().is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // IOSurface-backed zero-copy texture path (G9)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn create_io_surface_rejects_zero_dimensions() {
+        assert!(create_io_surface(0, 64).is_none());
+        assert!(create_io_surface(64, 0).is_none());
+    }
+
+    #[test]
+    fn create_texture_from_io_surface_rejects_invalid_inputs() {
+        let device = MetalDevice::system_default().unwrap();
+        // Null surface pointer.
+        assert!(create_texture_from_io_surface(
+            device.device(),
+            std::ptr::null_mut(),
+            metal::MTLPixelFormat::BGRA8Unorm,
+            64,
+            64,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn io_surface_backed_texture_aliases_storage() {
+        let device = MetalDevice::system_default().unwrap();
+
+        let surface = create_io_surface(128, 96).expect("IOSurfaceCreate failed");
+        assert!(!surface.is_null());
+
+        let texture = create_texture_from_io_surface(
+            device.device(),
+            surface,
+            metal::MTLPixelFormat::BGRA8Unorm,
+            128,
+            96,
+        )
+        .expect("newTextureWithDescriptor:iosurface:plane: returned nil");
+
+        assert_eq!(texture.width(), 128);
+        assert_eq!(texture.height(), 96);
+        assert_eq!(texture.pixel_format(), metal::MTLPixelFormat::BGRA8Unorm);
+
+        // Release the +1 reference returned by IOSurfaceCreate.
+        unsafe {
+            core_foundation::base::CFRelease(surface as core_foundation::base::CFTypeRef);
+        }
     }
 
     #[test]

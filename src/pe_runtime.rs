@@ -2127,6 +2127,8 @@ pub enum HostThunk {
     // IDirect3DSwapChain9 vtable methods
     D3d9SwapChainPresent,
     D3d9SwapChainGetBackBuffer,
+    /// `wintrust.dll!WinVerifyTrust` — Authenticode trust verification.
+    WinVerifyTrust,
     Unsupported { dll: String, symbol: String },
 }
 
@@ -2461,6 +2463,8 @@ struct PeHostRuntime {
     keyboard_replay_device: Option<String>,
     keyboard_replay_injected: bool,
     host_thunks: U64Map<HostThunk>,
+    /// Maps guest thunk addresses → fast-thunk indices for JIT direct calls.
+    thunk_to_fast_index: U64Map<usize>,
     guest_objects: BTreeMap<u64, GuestObjectMeta>,
     shell_link_interfaces: BTreeMap<u64, GuestShellLinkInterface>,
     shell_link_states: BTreeMap<u64, GuestShellLinkState>,
@@ -5737,6 +5741,7 @@ impl PeHostRuntime {
             keyboard_replay_device,
             keyboard_replay_injected: false,
             host_thunks: U64Map::default(),
+            thunk_to_fast_index: U64Map::default(),
             guest_objects: BTreeMap::new(),
             shell_link_interfaces: BTreeMap::new(),
             shell_link_states: BTreeMap::new(),
@@ -5938,7 +5943,11 @@ impl PeHostRuntime {
         // JIT is enabled by default for performance.
         // Set CASA1_JIT=0 to disable JIT compilation.
         if std::env::var("CASA1_JIT").as_deref() != Ok("0") {
-            self.jit_runtime = Some(crate::jit::JitRuntime::new(guest_arch));
+            let mut jit_runtime = crate::jit::JitRuntime::new(guest_arch);
+            // Register JIT unwind info with the SEH subsystem so that
+            // RtlVirtualUnwind can walk through JIT-compiled frames.
+            jit_runtime.unwind_table.register_with_seh(&mut self.seh);
+            self.jit_runtime = Some(jit_runtime);
         }
     }
 
@@ -32658,6 +32667,98 @@ impl PeHostRuntime {
                 state.set(Register::Rax, 1);
                 self.last_error = 0;
             }
+            HostThunk::WinVerifyTrust => {
+                // WinVerifyTrust(HWND hWnd, GUID *pgActionID, LPVOID pWVTData)
+                // Returns 0 (ERROR_SUCCESS) when the Authenticode signature embedded in the
+                // target file proves the image's integrity and binds it to its signer;
+                // otherwise a trust HRESULT mirroring Windows' WinVerifyTrust contract.
+                const ERROR_SUCCESS: u32 = 0;
+                const TRUST_E_NOSIGNATURE: u32 = 0x800B_0100;
+                const TRUST_E_BAD_DIGEST: u32 = 0x8009_6010;
+                const TRUST_E_SUBJECT_FORM_UNKNOWN: u32 = 0x800B_0003;
+                const WTD_CHOICE_FILE: u32 = 1;
+
+                let pwvt_data = guest_call_arg(state, memory, 2)?;
+                let is_x64 = self.guest_arch == GuestArch::X64;
+                // WINTRUST_DATA / WINTRUST_FILE_INFO field offsets differ by pointer width.
+                let (union_choice_off, union_off, path_field_off): (u64, u64, u64) =
+                    if is_x64 { (32, 40, 8) } else { (20, 24, 4) };
+
+                let mut verdict_label = "no-data";
+                let mut raw_path = String::new();
+                let result: u32 = if pwvt_data == 0 {
+                    TRUST_E_NOSIGNATURE
+                } else {
+                    let union_choice = read_u32(memory, pwvt_data + union_choice_off)?;
+                    if union_choice != WTD_CHOICE_FILE {
+                        verdict_label = "non-file-choice";
+                        TRUST_E_SUBJECT_FORM_UNKNOWN
+                    } else {
+                        let file_info_ptr = if is_x64 {
+                            memory.read_u64(pwvt_data + union_off)?
+                        } else {
+                            u64::from(read_u32(memory, pwvt_data + union_off)?)
+                        };
+                        let path_ptr = if file_info_ptr == 0 {
+                            0
+                        } else if is_x64 {
+                            memory.read_u64(file_info_ptr + path_field_off)?
+                        } else {
+                            u64::from(read_u32(memory, file_info_ptr + path_field_off)?)
+                        };
+                        if path_ptr == 0 {
+                            verdict_label = "no-path";
+                            TRUST_E_NOSIGNATURE
+                        } else {
+                            raw_path = read_utf16_string(memory, path_ptr)?;
+                            let guest_path =
+                                resolve_guest_path(&self.current_directory, &raw_path);
+                            match self.win32.guest_path_to_host_path(&guest_path) {
+                                Ok(host_path) => match fs::read(&host_path) {
+                                    Ok(bytes) => {
+                                        match crate::security::verify_pe_authenticode(&bytes) {
+                                            crate::security::AuthenticodeVerdict::Valid => {
+                                                verdict_label = "valid";
+                                                ERROR_SUCCESS
+                                            }
+                                            crate::security::AuthenticodeVerdict::NoSignature => {
+                                                verdict_label = "unsigned";
+                                                TRUST_E_NOSIGNATURE
+                                            }
+                                            crate::security::AuthenticodeVerdict::Invalid(_) => {
+                                                verdict_label = "invalid";
+                                                TRUST_E_BAD_DIGEST
+                                            }
+                                        }
+                                    }
+                                    Err(_) => {
+                                        verdict_label = "read-failed";
+                                        TRUST_E_NOSIGNATURE
+                                    }
+                                },
+                                Err(_) => {
+                                    verdict_label = "path-unresolved";
+                                    TRUST_E_NOSIGNATURE
+                                }
+                            }
+                        }
+                    }
+                };
+
+                state.set(Register::Rax, u64::from(result));
+                self.last_error = 0;
+                self.push_trace(
+                    "security",
+                    "WinVerifyTrust",
+                    BTreeMap::from([
+                        ("pWVTData".to_string(), json!(format!("{pwvt_data:#x}"))),
+                        ("path".to_string(), json!(raw_path)),
+                        ("verdict".to_string(), json!(verdict_label)),
+                        ("result".to_string(), json!(format!("{result:#010x}"))),
+                    ]),
+                    json!(format!("{result:#010x}")),
+                );
+            }
             HostThunk::Unsupported { dll, symbol } => {
                 self.telemetry.record_unsupported_import(&dll, &symbol);
                 emit_live_ui_debug(format!(
@@ -32903,13 +33004,6 @@ impl PeHostRuntime {
         allow_yield: bool,
         resume_rsp: Option<u64>,
     ) -> AppResult<GuestCallbackDisposition> {
-        if self.guest_arch != GuestArch::X86 {
-            return Err(AppError::new(
-                ReasonCode::RcUnimplInsn,
-                format!("guest callback execution is only implemented for x86: {label}"),
-            ));
-        }
-
         let config = CpuEngineConfig::from_profile(
             self.guest_arch,
             &self.win32.ge().config.winver,
@@ -32921,18 +33015,52 @@ impl PeHostRuntime {
         let guest_pointer_bytes = self.guest_arch.pointer_bytes() as u64;
         let original_rsp = resume_rsp.unwrap_or_else(|| state.get(Register::Rsp));
         if resume_rsp.is_none() {
-            let callback_rsp = original_rsp.wrapping_sub((args.len() as u64 + 1) * guest_pointer_bytes);
-            write_guest_pointer(memory, callback_rsp, 0, self.guest_arch)?;
-            for (index, arg) in args.iter().enumerate() {
-                write_guest_pointer(
-                    memory,
-                    callback_rsp + guest_pointer_bytes * (index as u64 + 1),
-                    *arg,
-                    self.guest_arch,
-                )?;
+            match self.guest_arch {
+                GuestArch::X86 => {
+                    // 32-bit stdcall/cdecl: all arguments are pushed on the
+                    // stack above a synthetic return address of 0.
+                    let callback_rsp =
+                        original_rsp.wrapping_sub((args.len() as u64 + 1) * guest_pointer_bytes);
+                    write_guest_pointer(memory, callback_rsp, 0, self.guest_arch)?;
+                    for (index, arg) in args.iter().enumerate() {
+                        write_guest_pointer(
+                            memory,
+                            callback_rsp + guest_pointer_bytes * (index as u64 + 1),
+                            *arg,
+                            self.guest_arch,
+                        )?;
+                    }
+                    state.set(Register::Rsp, callback_rsp);
+                    state.rip = entrypoint;
+                }
+                GuestArch::X64 => {
+                    // Microsoft x64 calling convention: the first four integer
+                    // or pointer arguments are passed in RCX, RDX, R8, R9; any
+                    // further arguments are placed on the stack above a 32-byte
+                    // shadow (home) region. A synthetic return address of 0 sits
+                    // at [rsp] so the callback's terminating `ret` breaks the
+                    // loop. Entry RSP must satisfy `rsp % 16 == 8` per the ABI.
+                    let num_stack_args = args.len().saturating_sub(4) as u64;
+                    let region = 8 + 32 + num_stack_args * 8;
+                    let mut callback_rsp = original_rsp.wrapping_sub(region);
+                    callback_rsp = (callback_rsp & !0xF) | 0x8;
+                    write_guest_pointer(memory, callback_rsp, 0, self.guest_arch)?;
+                    for (index, arg) in args.iter().skip(4).enumerate() {
+                        write_guest_pointer(
+                            memory,
+                            callback_rsp + 8 + 32 + index as u64 * 8,
+                            *arg,
+                            self.guest_arch,
+                        )?;
+                    }
+                    let reg_args = [Register::Rcx, Register::Rdx, Register::R8, Register::R9];
+                    for (reg, arg) in reg_args.iter().zip(args.iter()) {
+                        state.set(*reg, *arg);
+                    }
+                    state.set(Register::Rsp, callback_rsp);
+                    state.rip = entrypoint;
+                }
             }
-            state.set(Register::Rsp, callback_rsp);
-            state.rip = entrypoint;
         }
 
         let mut steps = 0_u64;
@@ -32953,7 +33081,7 @@ impl PeHostRuntime {
                 .read_u8(state.rip)
                 .map_err(|error| annotate_guest_fault(error, memory, state))?;
             match opcode {
-                0xFF => match memory.read_u8(state.rip + 1)? {
+                0xFF if self.guest_arch == GuestArch::X86 => match memory.read_u8(state.rip + 1)? {
                     0x15 | 0x25 => {
                         advance_runtime_steps(self, &mut steps, instruction_budget, 1, memory, state, label)?;
                         let next_rip = state.rip + 6;
@@ -33317,6 +33445,14 @@ impl PeHostRuntime {
                                 xmm
                             },
                         };
+                        // Guest-stack memory reader: the SEH unwinder reads
+                        // return addresses and saved non-volatile registers
+                        // from the real guest stack (outside the image), so it
+                        // must read absolute guest addresses from `memory`.
+                        let mem_ref: &MemoryImage = memory;
+                        let stack_reader = |addr: u64, buf: &mut [u8]| -> bool {
+                            mem_ref.read_into(addr, buf).is_ok()
+                        };
                         if self
                             .seh
                             .dispatch(
@@ -33324,6 +33460,7 @@ impl PeHostRuntime {
                                 fault_address,
                                 &ctx,
                                 self.mapped_image_base,
+                                &stack_reader,
                             )
                             .is_ok()
                         {
@@ -33811,6 +33948,14 @@ impl PeHostRuntime {
         let address = self.next_thunk_address;
         self.next_thunk_address += 0x10;
         self.host_thunks.insert(address, thunk);
+        // Fast-thunk registration (G5) is deferred: it requires resolving
+        // the HostThunk variant to an actual function pointer, which is not
+        // available at allocation time. When that mechanism exists, call:
+        //   if let Some(jit) = self.jit_runtime.as_mut() {
+        //       if let Some(idx) = jit.register_host_thunk(host_fn_ptr) {
+        //           self.thunk_to_fast_index.insert(address, idx);
+        //       }
+        //   }
         address
     }
 
@@ -42494,6 +42639,7 @@ impl HostThunk {
             ("winmm.dll", ImportSymbol::ByName { name, .. }) if name == "mmioDescend" => Self::MmioDescend,
             ("winmm.dll", ImportSymbol::ByName { name, .. }) if name == "mmioCreateChunk" => Self::MmioCreateChunk,
             ("winmm.dll", ImportSymbol::ByName { name, .. }) if name == "mmioStringToFOURCCW" => Self::MmioStringToFOURCCW,
+            ("wintrust.dll", ImportSymbol::ByName { name, .. }) if name == "WinVerifyTrust" => Self::WinVerifyTrust,
             (_, ImportSymbol::ByName { name, .. }) => Self::Unsupported {
                 dll: import.resolved_module.clone(),
                 symbol: name.clone(),
@@ -45522,6 +45668,183 @@ mod tests {
             .dispatch_import(thunk, &mut state, memory)
             .expect("dispatch x86 thunk");
         state.get(Register::Rax)
+    }
+
+    /// Build a minimal, structurally valid PE32 image whose security data
+    /// directory entry is empty (i.e. the file carries no Authenticode
+    /// signature).  `verify_pe_authenticode` must report it as unsigned.
+    fn minimal_unsigned_pe() -> Vec<u8> {
+        let mut pe = vec![0u8; 0x200];
+        pe[0] = b'M';
+        pe[1] = b'Z';
+        let e_lfanew: u32 = 0x40;
+        pe[0x3C..0x40].copy_from_slice(&e_lfanew.to_le_bytes());
+        let e = e_lfanew as usize;
+        pe[e..e + 4].copy_from_slice(b"PE\0\0");
+        let coff = e + 4;
+        let size_of_optional: u16 = 0xE0;
+        pe[coff + 16..coff + 18].copy_from_slice(&size_of_optional.to_le_bytes());
+        let opt = coff + 20;
+        pe[opt..opt + 2].copy_from_slice(&0x10b_u16.to_le_bytes()); // PE32 magic
+        // SECURITY data directory entry (index 4) left zeroed → no signature.
+        pe
+    }
+
+    /// Build a PE32 image whose security directory points at a non-empty but
+    /// structurally invalid attribute certificate table.  The verifier must
+    /// reach the PKCS#7 decode and reject it as an invalid signature.
+    fn pe_with_garbage_certificate_table() -> Vec<u8> {
+        let mut pe = minimal_unsigned_pe();
+        let e = 0x40usize;
+        let coff = e + 4;
+        let opt = coff + 20;
+        let dd_offset = opt + 96; // PE32 data directories
+        let sec_entry = dd_offset + 4 * 8; // IMAGE_DIRECTORY_ENTRY_SECURITY
+        let cert_va: u32 = 0x180;
+        let cert_size: u32 = 0x20;
+        pe[sec_entry..sec_entry + 4].copy_from_slice(&cert_va.to_le_bytes());
+        pe[sec_entry + 4..sec_entry + 8].copy_from_slice(&cert_size.to_le_bytes());
+        let va = cert_va as usize;
+        // WIN_CERTIFICATE: dwLength, wRevision, wCertType=PKCS_SIGNED_DATA, then garbage.
+        pe[va..va + 4].copy_from_slice(&cert_size.to_le_bytes());
+        pe[va + 4..va + 6].copy_from_slice(&0x0200_u16.to_le_bytes());
+        pe[va + 6..va + 8].copy_from_slice(&0x0002_u16.to_le_bytes());
+        for byte in pe.iter_mut().skip(va + 8).take((cert_size as usize) - 8) {
+            *byte = 0xFF;
+        }
+        pe
+    }
+
+    /// Materialise a WINTRUST_DATA describing `guest_path` in x86 guest memory
+    /// and return the pointer to pass as the third WinVerifyTrust argument.
+    fn build_x86_wintrust_data(
+        runtime: &mut PeHostRuntime,
+        memory: &mut MemoryImage,
+        guest_path: &str,
+        union_choice: u32,
+    ) -> u64 {
+        let path_ptr = runtime
+            .alloc_utf16_string(memory, guest_path)
+            .expect("alloc path");
+        let file_info_ptr: u64 = 0x60_000;
+        memory.map_bytes(file_info_ptr, &vec![0u8; 16]);
+        write_u32(memory, file_info_ptr, 16); // cbStruct
+        write_u32(memory, file_info_ptr + 4, path_ptr as u32); // pcwszFilePath
+        let wvt_ptr: u64 = 0x61_000;
+        memory.map_bytes(wvt_ptr, &vec![0u8; 32]);
+        write_u32(memory, wvt_ptr, 32); // cbStruct
+        write_u32(memory, wvt_ptr + 20, union_choice); // dwUnionChoice
+        write_u32(memory, wvt_ptr + 24, file_info_ptr as u32); // union pointer
+        wvt_ptr
+    }
+
+    fn write_guest_pe_file(runtime: &PeHostRuntime, guest_path: &str, bytes: &[u8]) {
+        let host_path = runtime
+            .win32
+            .guest_path_to_host_path(guest_path)
+            .expect("host path");
+        if let Some(parent) = host_path.parent() {
+            fs::create_dir_all(parent).expect("create parent dir");
+        }
+        fs::write(&host_path, bytes).expect("write guest PE");
+    }
+
+    #[test]
+    fn win_verify_trust_reports_no_signature_for_null_data() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "wvt-null", GeArch::X86, "win11-23h2")
+            .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        let thunk = runtime.alloc_host_thunk(HostThunk::WinVerifyTrust);
+        let result = dispatch_x86_thunk(&mut runtime, &mut memory, thunk, &[0, 0, 0]);
+
+        // TRUST_E_NOSIGNATURE
+        assert_eq!(result, 0x800B_0100);
+    }
+
+    #[test]
+    fn win_verify_trust_rejects_non_file_union_choice() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "wvt-choice", GeArch::X86, "win11-23h2")
+            .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        // dwUnionChoice = 2 (WTD_CHOICE_CATALOG) — unsupported subject form.
+        let wvt_ptr = build_x86_wintrust_data(&mut runtime, &mut memory, "C:\\game\\app.exe", 2);
+        let thunk = runtime.alloc_host_thunk(HostThunk::WinVerifyTrust);
+        let result =
+            dispatch_x86_thunk(&mut runtime, &mut memory, thunk, &[0, 0, wvt_ptr as u32]);
+
+        // TRUST_E_SUBJECT_FORM_UNKNOWN
+        assert_eq!(result, 0x800B_0003);
+    }
+
+    #[test]
+    fn win_verify_trust_reports_unsigned_image_on_disk() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "wvt-unsigned", GeArch::X86, "win11-23h2")
+            .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        let guest_path = "C:\\game\\app.exe";
+        write_guest_pe_file(&runtime, guest_path, &minimal_unsigned_pe());
+        let wvt_ptr = build_x86_wintrust_data(&mut runtime, &mut memory, guest_path, 1);
+        let thunk = runtime.alloc_host_thunk(HostThunk::WinVerifyTrust);
+        let result =
+            dispatch_x86_thunk(&mut runtime, &mut memory, thunk, &[0, 0, wvt_ptr as u32]);
+
+        // TRUST_E_NOSIGNATURE
+        assert_eq!(result, 0x800B_0100);
+    }
+
+    #[test]
+    fn win_verify_trust_rejects_invalid_signature_on_disk() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "wvt-invalid", GeArch::X86, "win11-23h2")
+            .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        let guest_path = "C:\\game\\app.exe";
+        write_guest_pe_file(&runtime, guest_path, &pe_with_garbage_certificate_table());
+        let wvt_ptr = build_x86_wintrust_data(&mut runtime, &mut memory, guest_path, 1);
+        let thunk = runtime.alloc_host_thunk(HostThunk::WinVerifyTrust);
+        let result =
+            dispatch_x86_thunk(&mut runtime, &mut memory, thunk, &[0, 0, wvt_ptr as u32]);
+
+        // TRUST_E_BAD_DIGEST
+        assert_eq!(result, 0x8009_6010);
+    }
+
+    #[test]
+    fn host_thunk_from_import_maps_win_verify_trust() {
+        let import = ResolvedImport {
+            requested_module: "wintrust.dll".to_string(),
+            resolved_module: "wintrust.dll".to_string(),
+            symbol: ImportSymbol::ByName {
+                hint: 0,
+                name: "WinVerifyTrust".to_string(),
+            },
+            iat_rva: 0x1000,
+            export: ExportSymbol {
+                ordinal: 1,
+                name: Some("WinVerifyTrust".to_string()),
+                target: ExportTarget::Rva(0x22000),
+            },
+        };
+
+        assert!(matches!(
+            HostThunk::from_import(&import),
+            HostThunk::WinVerifyTrust
+        ));
     }
 
     #[test]

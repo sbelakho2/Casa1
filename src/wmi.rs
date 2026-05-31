@@ -382,12 +382,18 @@ pub trait WmiClassProvider: Send + Sync {
         self.enum_objects()
     }
     fn enum_objects(&self) -> AppResult<Vec<WmiObject>>;
+    /// Clone this provider into a new boxed trait object so that
+    /// `WbemServices` can be duplicated (e.g. by `IWbemLocator::ConnectServer`)
+    /// without losing any registered class providers.
+    fn clone_box(&self) -> Box<dyn WmiClassProvider>;
 }
+
 
 // ============================================================================
 // Win32_ComputerSystem Provider
 // ============================================================================
 
+#[derive(Clone)]
 pub struct Win32ComputerSystemProvider;
 
 impl Win32ComputerSystemProvider {
@@ -412,6 +418,10 @@ impl Win32ComputerSystemProvider {
 }
 
 impl WmiClassProvider for Win32ComputerSystemProvider {
+    fn clone_box(&self) -> Box<dyn WmiClassProvider> {
+        Box::new(self.clone())
+    }
+
     fn class_name(&self) -> &'static str {
         "Win32_ComputerSystem"
     }
@@ -434,6 +444,7 @@ impl WmiClassProvider for Win32ComputerSystemProvider {
 // Win32_Processor Provider
 // ============================================================================
 
+#[derive(Clone)]
 pub struct Win32ProcessorProvider;
 
 impl Win32ProcessorProvider {
@@ -456,6 +467,9 @@ impl Win32ProcessorProvider {
 }
 
 impl WmiClassProvider for Win32ProcessorProvider {
+    fn clone_box(&self) -> Box<dyn WmiClassProvider> {
+        Box::new(self.clone())
+    }
     fn class_name(&self) -> &'static str {
         "Win32_Processor"
     }
@@ -473,6 +487,7 @@ impl WmiClassProvider for Win32ProcessorProvider {
 // Win32_OperatingSystem Provider
 // ============================================================================
 
+#[derive(Clone)]
 pub struct Win32OperatingSystemProvider;
 
 impl Win32OperatingSystemProvider {
@@ -512,6 +527,9 @@ impl Win32OperatingSystemProvider {
 }
 
 impl WmiClassProvider for Win32OperatingSystemProvider {
+    fn clone_box(&self) -> Box<dyn WmiClassProvider> {
+        Box::new(self.clone())
+    }
     fn class_name(&self) -> &'static str {
         "Win32_OperatingSystem"
     }
@@ -534,6 +552,7 @@ impl WmiClassProvider for Win32OperatingSystemProvider {
 // Win32_VideoController Provider
 // ============================================================================
 
+#[derive(Clone)]
 pub struct Win32VideoControllerProvider;
 
 impl Win32VideoControllerProvider {
@@ -609,6 +628,9 @@ impl Win32VideoControllerProvider {
 }
 
 impl WmiClassProvider for Win32VideoControllerProvider {
+    fn clone_box(&self) -> Box<dyn WmiClassProvider> {
+        Box::new(self.clone())
+    }
     fn class_name(&self) -> &'static str {
         "Win32_VideoController"
     }
@@ -626,6 +648,7 @@ impl WmiClassProvider for Win32VideoControllerProvider {
 // Win32_DiskDrive Provider
 // ============================================================================
 
+#[derive(Clone)]
 pub struct Win32DiskDriveProvider;
 
 impl Win32DiskDriveProvider {
@@ -692,6 +715,9 @@ impl Win32DiskDriveProvider {
 }
 
 impl WmiClassProvider for Win32DiskDriveProvider {
+    fn clone_box(&self) -> Box<dyn WmiClassProvider> {
+        Box::new(self.clone())
+    }
     fn class_name(&self) -> &'static str {
         "Win32_DiskDrive"
     }
@@ -709,6 +735,7 @@ impl WmiClassProvider for Win32DiskDriveProvider {
 // Win32_NetworkAdapter Provider
 // ============================================================================
 
+#[derive(Clone)]
 pub struct Win32NetworkAdapterProvider;
 
 impl Win32NetworkAdapterProvider {
@@ -797,6 +824,9 @@ impl Win32NetworkAdapterProvider {
 }
 
 impl WmiClassProvider for Win32NetworkAdapterProvider {
+    fn clone_box(&self) -> Box<dyn WmiClassProvider> {
+        Box::new(self.clone())
+    }
     fn class_name(&self) -> &'static str {
         "Win32_NetworkAdapter"
     }
@@ -829,6 +859,7 @@ impl WmiClassProvider for Win32NetworkAdapterProvider {
 // Win32_BIOS Provider
 // ============================================================================
 
+#[derive(Clone)]
 pub struct Win32BiosProvider;
 
 impl Win32BiosProvider {
@@ -855,6 +886,9 @@ impl Win32BiosProvider {
 }
 
 impl WmiClassProvider for Win32BiosProvider {
+    fn clone_box(&self) -> Box<dyn WmiClassProvider> {
+        Box::new(self.clone())
+    }
     fn class_name(&self) -> &'static str {
         "Win32_BIOS"
     }
@@ -872,6 +906,7 @@ impl WmiClassProvider for Win32BiosProvider {
 // Win32_LogicalDisk Provider
 // ============================================================================
 
+#[derive(Clone)]
 pub struct Win32LogicalDiskProvider;
 
 impl Win32LogicalDiskProvider {
@@ -941,6 +976,9 @@ impl Win32LogicalDiskProvider {
 }
 
 impl WmiClassProvider for Win32LogicalDiskProvider {
+    fn clone_box(&self) -> Box<dyn WmiClassProvider> {
+        Box::new(self.clone())
+    }
     fn class_name(&self) -> &'static str {
         "Win32_LogicalDisk"
     }
@@ -968,6 +1006,7 @@ impl WmiClassProvider for Win32LogicalDiskProvider {
 // Win32_TimeZone Provider
 // ============================================================================
 
+#[derive(Clone)]
 pub struct Win32TimeZoneProvider;
 
 impl Win32TimeZoneProvider {
@@ -988,6 +1027,9 @@ impl Win32TimeZoneProvider {
 }
 
 impl WmiClassProvider for Win32TimeZoneProvider {
+    fn clone_box(&self) -> Box<dyn WmiClassProvider> {
+        Box::new(self.clone())
+    }
     fn class_name(&self) -> &'static str {
         "Win32_TimeZone"
     }
@@ -1005,6 +1047,7 @@ impl WmiClassProvider for Win32TimeZoneProvider {
 // Win32_ComputerSystemProduct Provider
 // ============================================================================
 
+#[derive(Clone)]
 pub struct Win32ComputerSystemProductProvider;
 
 impl Win32ComputerSystemProductProvider {
@@ -1021,6 +1064,9 @@ impl Win32ComputerSystemProductProvider {
 }
 
 impl WmiClassProvider for Win32ComputerSystemProductProvider {
+    fn clone_box(&self) -> Box<dyn WmiClassProvider> {
+        Box::new(self.clone())
+    }
     fn class_name(&self) -> &'static str {
         "Win32_ComputerSystemProduct"
     }
@@ -1422,10 +1468,14 @@ impl std::fmt::Debug for WbemServices {
 
 impl Clone for WbemServices {
     fn clone(&self) -> Self {
-        // WmiClassProvider is not cloneable; create a new empty services
-        WbemServices {
-            providers: HashMap::new(),
-        }
+        // Deep-clone every registered provider so the duplicated services
+        // expose the same class set (IWbemLocator::ConnectServer semantics).
+        let providers = self
+            .providers
+            .iter()
+            .map(|(name, provider)| (name.clone(), provider.clone_box()))
+            .collect();
+        WbemServices { providers }
     }
 }
 

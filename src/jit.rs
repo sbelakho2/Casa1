@@ -697,7 +697,7 @@ impl JitMemoryManager {
     }
 
     /// Re-enable write access for code patching.
-    pub unsafe fn make_writable(&self, ptr: *mut u8, size: usize) {
+    pub unsafe fn make_writable(&self, _ptr: *mut u8, _size: usize) {
         // On Apple Silicon with MAP_JIT, use pthread_jit_write_protect_np
         // instead of mprotect to toggle to writable mode.
         #[cfg(target_arch = "aarch64")]
@@ -1243,6 +1243,15 @@ impl JitCompiler {
                 self.emitter.str_q_imm(0, 0, dst_off as u16);
             }
 
+            IrInstruction::Fxsave { .. } | IrInstruction::Fxrstor { .. } => {
+                // These instructions operate on a 512-byte FXSAVE area in memory.
+                // The interpreter handles the complex x87/SSE state serialization.
+                // Exit JIT to interpreter to execute natively.
+                self.emit_store_guest_registers(arch);
+                self.emitter.movz(regmap::X0, EXIT_UNIMPL as u16, 0);
+                self.emit_epilogue();
+            }
+
             // For unimplemented instructions, emit a fallback exit
             _ => {
                 self.emit_store_guest_registers(arch);
@@ -1287,6 +1296,12 @@ pub struct JitRuntime {
     pub interpreter_fallbacks: u64,
     /// Block chain entries keyed by (from_address, to_address).
     pub block_chains: BTreeMap<(u64, u64), BlockChainEntry>,
+    /// Fast thunk table: ARM64 trampolines for direct host-function calls
+    /// from JIT-compiled guest code, bypassing the full dispatch loop.
+    pub fast_thunk_table: FastThunkTable,
+    /// Unwind table for JIT-compiled blocks, enabling SEH stack walks
+    /// through JIT frames via `RtlVirtualUnwind`.
+    pub unwind_table: JitUnwindTable,
 }
 
 impl JitRuntime {
@@ -1299,6 +1314,8 @@ impl JitRuntime {
             blocks_executed: 0,
             interpreter_fallbacks: 0,
             block_chains: BTreeMap::new(),
+            fast_thunk_table: FastThunkTable::new(),
+            unwind_table: JitUnwindTable::new(),
         }
     }
 
@@ -1316,7 +1333,14 @@ impl JitRuntime {
         let is_new = !self.block_cache.contains_key(&guest_address);
         if is_new {
             let block = self.compiler.compile_block(ir, guest_address, arch)?;
+            let code_size = block.code_size;
             self.blocks_compiled += 1;
+
+            // Register this block's address range with the unwind table
+            // so that SEH stack walks can unwind through JIT frames.
+            self.unwind_table
+                .register_block(guest_address, guest_address + code_size as u64);
+
             self.block_cache.insert(guest_address, block);
 
             // Auto-chain: if the last instruction is an unconditional jump
@@ -1586,6 +1610,19 @@ impl JitRuntime {
         }
 
         Ok(())
+    }
+
+    /// Register a host function pointer as a fast thunk, returning the thunk
+    /// index that can be used by JIT-compiled code to call the host function
+    /// directly (bypassing the full guest→host dispatch loop).
+    pub fn register_host_thunk(&mut self, host_fn: usize) -> Option<usize> {
+        self.fast_thunk_table.register(host_fn).ok()
+    }
+
+    /// Look up the executable thunk address for a previously registered
+    /// fast-thunk index. Returns `None` if the index is out of range.
+    pub fn lookup_thunk_address(&self, idx: usize) -> Option<usize> {
+        self.fast_thunk_table.thunk_address(idx)
     }
 }
 
@@ -2380,7 +2417,7 @@ impl JitCompiler {
 
         // Look for the loop pattern at the end of the block in the ORIGINAL IR:
         // SubImm(counter, 1, width) followed by JumpIf(counter, target, NotEqual)
-        let (counter_reg, width, jump_target) = match (&ir[len - 2], &ir[len - 1]) {
+        let (counter_reg, width, _jump_target) = match (&ir[len - 2], &ir[len - 1]) {
             (
                 IrInstruction::SubImm { dst, value, width },
                 IrInstruction::JumpIf { condition, target, fallthrough: _ },
@@ -3007,6 +3044,286 @@ impl OptimizerConfig {
 }
 
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// G5: FastThunk — ARM64 thunk codegen for direct host-call dispatch
+// ---------------------------------------------------------------------------
+
+/// A registered fast-thunk entry: maps a host function pointer to a small
+/// ARM64 trampoline that calls it directly from JIT-compiled guest code.
+struct FastThunkEntry {
+    /// The host function to call.
+    host_fn: usize,
+    /// ARM64 trampoline machine code ("thunk") that jumps to `host_fn`.
+    thunk_code: Vec<u8>,
+    /// Virtual address where the thunk is mapped for execution.
+    thunk_addr: usize,
+}
+
+/// Manages all registered fast-thunks, providing executable ARM64 trampolines
+/// that allow JIT-compiled guest code to call host functions without going
+/// through the full guest→host dispatch loop.
+pub struct FastThunkTable {
+    entries: Vec<FastThunkEntry>,
+    /// mmap'd executable code zone for thunks.
+    code_zone: Option<*mut u8>,
+    code_zone_size: usize,
+    code_zone_used: usize,
+}
+
+unsafe impl Send for FastThunkTable {}
+unsafe impl Sync for FastThunkTable {}
+
+impl FastThunkTable {
+    /// Create a new, empty fast-thunk table.
+    pub fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            code_zone: None,
+            code_zone_size: 0,
+            code_zone_used: 0,
+        }
+    }
+
+    /// Ensure we have an executable code zone, allocating one if needed.
+    fn ensure_code_zone(&mut self) -> AppResult<()> {
+        if self.code_zone.is_some() {
+            return Ok(());
+        }
+        // Allocate 64 KB (one JIT page) of executable memory for thunks
+        let size = 64 * 1024;
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+                libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_JIT,
+                -1,
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err(AppError::new(
+                ReasonCode::RcJitCodeAllocFailed,
+                "failed to mmap fast-thunk code zone",
+            ));
+        }
+        // Apple Silicon requires syscall to enable JIT on MAP_JIT regions
+        unsafe {
+            libc::pthread_jit_write_protect_np(0);
+        }
+        self.code_zone = Some(ptr as *mut u8);
+        self.code_zone_size = size;
+        self.code_zone_used = 0;
+        Ok(())
+    }
+
+    /// Register a fast-thunk for a host function.
+    ///
+    /// Returns the entry index, which can be used by the JIT to emit a call
+    /// to this thunk instead of going through the full dispatch loop.
+    pub fn register(&mut self, host_fn: usize) -> AppResult<usize> {
+        self.ensure_code_zone()?;
+
+        let zone = self.code_zone.unwrap();
+        let offset = self.code_zone_used;
+        let addr = unsafe { zone.add(offset) } as usize;
+
+        // Emit ARM64 trampoline:
+        //   ldr    x17, [pc, #8]    // Load host_fn address from literal pool
+        //   br     x17               // Jump to host function
+        //   .quad  host_fn           // Literal pool entry
+        //
+        // Encoding:
+        //   ldr x17, [pc, #8] = 0x58000051
+        //   br x17            = 0xD61F0220
+        let thunk: Vec<u8> = vec![
+            0x51, 0x00, 0x00, 0x58,  // ldr x17, [pc, #8]
+            0x20, 0x02, 0x1F, 0xD6,  // br x17
+            // literal pool: host_fn (8 bytes, little-endian)
+            (host_fn & 0xFF) as u8,
+            ((host_fn >> 8) & 0xFF) as u8,
+            ((host_fn >> 16) & 0xFF) as u8,
+            ((host_fn >> 24) & 0xFF) as u8,
+            ((host_fn >> 32) & 0xFF) as u8,
+            ((host_fn >> 40) & 0xFF) as u8,
+            ((host_fn >> 48) & 0xFF) as u8,
+            ((host_fn >> 56) & 0xFF) as u8,
+        ];
+
+        // Write thunk into the code zone
+        unsafe {
+            std::ptr::copy_nonoverlapping(thunk.as_ptr(), addr as *mut u8, thunk.len());
+        }
+        self.code_zone_used += thunk.len();
+
+        let entry = FastThunkEntry {
+            host_fn,
+            thunk_code: thunk,
+            thunk_addr: addr,
+        };
+        let idx = self.entries.len();
+        self.entries.push(entry);
+        Ok(idx)
+    }
+
+    /// Get the thunk address for a registered entry.
+    pub fn thunk_address(&self, idx: usize) -> Option<usize> {
+        self.entries.get(idx).map(|e| e.thunk_addr)
+    }
+
+    /// Get the host function pointer for a registered entry.
+    pub fn host_fn(&self, idx: usize) -> Option<usize> {
+        self.entries.get(idx).map(|e| e.host_fn)
+    }
+
+    /// Number of registered thunks.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+impl Drop for FastThunkTable {
+    fn drop(&mut self) {
+        if let Some(zone) = self.code_zone.take() {
+            unsafe {
+                libc::munmap(zone as *mut libc::c_void, self.code_zone_size);
+            }
+        }
+    }
+}
+
+// pthread_jit_write_protect_np FFI (Apple Silicon)
+unsafe extern "C" {
+    fn pthread_jit_write_protect_np(enabled: i32);
+}
+
+// ---------------------------------------------------------------------------
+// G6: JIT Unwind Info — ARM64 RuntimeFunction + UnwindInfo for SEH
+// ---------------------------------------------------------------------------
+
+/// A single unwind info entry for JIT-compiled blocks.
+/// Follows the Windows ARM64 unwind info format for `UNW_FLAG_NO_HANDLER`.
+struct JitUnwindInfo {
+    /// Start RVA (relative to the code base).
+    start_rva: u32,
+    /// End RVA (exclusive).
+    end_rva: u32,
+    /// The raw unwind info bytes (UNW_FLAG_NO_HANDLER format).
+    unwind_data: Vec<u8>,
+}
+
+/// Manages unwind info for all JIT-compiled blocks, registering them with
+/// the SEH subsystem so that `RtlVirtualUnwind` works through JIT frames.
+pub struct JitUnwindTable {
+    entries: Vec<JitUnwindInfo>,
+}
+
+impl JitUnwindTable {
+    pub fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+
+    /// Register a JIT block with the unwind table.
+    ///
+    /// `start_addr` and `end_addr` are the virtual addresses of the compiled
+    /// block in the guest address space. The unwind info uses the Windows
+    /// ARM64 "packed unwind data" format with UNW_FLAG_NO_HANDLER.
+    pub fn register_block(&mut self, start_addr: u64, end_addr: u64) {
+        // Generate minimal unwind info for ARM64:
+        //   - No prologue (flag=00)
+        //   - Function length computed from start_rva..end_rva
+        //   - No chained unwind info
+        //
+        // Windows ARM64 packed unwind data (2 bytes):
+        //   Bit 0-1: flag (0=no handler, no chained)
+        //   Bit 2-3: function length in 4-byte units, minus 1
+        //   Bit 4-5: (unused for no prologue)
+        let func_len = ((end_addr - start_addr) / 4) as u32;
+        let packed = if func_len > 0x3F { 0x3F } else { func_len as u8 };
+
+        // 2-byte packed unwind data
+        let unwind_data = vec![packed | 0x00, 0x00]; // flag=00 (no handler)
+
+        self.entries.push(JitUnwindInfo {
+            start_rva: start_addr as u32,
+            end_rva: end_addr as u32,
+            unwind_data,
+        });
+    }
+
+    /// Register all entries with the SEH subsystem.
+    ///
+    /// Builds a `.pdata`-format function table and x64-compatible UNWIND_INFO
+    /// blocks from the JIT entries and registers them with the SEH subsystem
+    /// so that `RtlVirtualUnwind` can unwind through JIT-compiled frames.
+    ///
+    /// Uses `JIT_IMAGE_BASE` (0) as the image base — the JIT entries store
+    /// RVA-sized address ranges that are looked up directly without subtraction.
+    ///
+    /// Each JIT entry generates:
+    /// - A 12-byte `RUNTIME_FUNCTION` entry (3 × u32 LE: `begin_rva`, `end_rva`,
+    ///   `unwind_info_rva`)
+    /// - A 4-byte x64 `UNWIND_INFO` with `UNW_FLAG_NO_HANDLER` (version=1,
+    ///   flags=0, no prolog, no unwind codes) — this tells `virtual_unwind` to
+    ///   simply pop the return address from the stack.
+    ///
+    /// If called multiple times (e.g. after adding more blocks), the previous
+    /// registration is overwritten. Callers should batch all `register_block()`
+    /// calls before a single `register_with_seh()` call.
+    pub fn register_with_seh(&mut self, seh: &mut crate::seh::SehSubsystem) {
+        if self.entries.is_empty() {
+            return;
+        }
+
+        // Image base for JIT code. Since entries store RVA-sized values,
+        // using 0 means the SEH lookup (rip - image_base) preserves the
+        // stored RVAs directly.
+        const JIT_IMAGE_BASE: u64 = 0;
+
+        // Each RUNTIME_FUNCTION entry is 12 bytes (3 × u32 LE).
+        let mut pdata_bytes = Vec::with_capacity(self.entries.len() * 12);
+
+        // Build a concatenated x64 UNWIND_INFO blob. Each entry gets a 4-byte
+        // UNW_FLAG_NO_HANDLER descriptor so that parse_unwind_info() can
+        // successfully parse it and virtual_unwind() can pop the return address.
+        //
+        // x64 UNWIND_INFO layout (4 bytes):
+        //   [0]: version(3 bits) | flags(5 bits)  — 0x01 = v1, UNW_FLAG_NO_HANDLER
+        //   [1]: prolog_size                      — 0x00 (no prologue)
+        //   [2]: code_count                       — 0x00 (no unwind codes)
+        //   [3]: frame_register(4) | frame_offset(4) — 0x00
+        let mut unwind_data = Vec::new();
+
+        for entry in &self.entries {
+            // RVA to this entry's unwind info within the concatenated blob.
+            let unwind_info_rva = unwind_data.len() as u32;
+
+            // Append the RUNTIME_FUNCTION entry (begin_rva, end_rva, unwind_info_rva).
+            pdata_bytes.extend_from_slice(&entry.start_rva.to_le_bytes());
+            pdata_bytes.extend_from_slice(&entry.end_rva.to_le_bytes());
+            pdata_bytes.extend_from_slice(&unwind_info_rva.to_le_bytes());
+
+            // Append a 4-byte x64 UNWIND_INFO (UNW_FLAG_NO_HANDLER, no codes).
+            unwind_data.push(0x01); // version=1, flags=0
+            unwind_data.push(0x00); // prolog_size=0
+            unwind_data.push(0x00); // code_count=0
+            unwind_data.push(0x00); // frame_register=0, frame_offset=0
+        }
+
+        // Register the function table and unwind data with the SEH subsystem
+        // under the JIT image base. This enables find_runtime_function() to
+        // locate JIT entries and get_unwind_info() to parse the unwind data.
+        seh.register_pdata(JIT_IMAGE_BASE, &pdata_bytes);
+        seh.register_unwind_data(JIT_IMAGE_BASE, unwind_data);
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
 
 #[cfg(test)]
 mod tests {

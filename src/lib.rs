@@ -18,6 +18,7 @@ pub mod icon;
 pub mod installer;
 pub mod jit;
 pub mod live;
+pub mod async_pipeline_compiler;
 pub mod metal_backend;
 pub mod metal_renderer;
 pub mod logging;

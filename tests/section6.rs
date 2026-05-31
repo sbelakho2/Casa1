@@ -809,7 +809,7 @@ fn t6_9_static_sampler_filter_modes() {
     assert!(!cmp);
 
     let (min_f, mag_f, mip_f, aniso, cmp) =
-        D3d12Runtime::map_d3d12_filter_to_metal(0x55); // MIN_MAG_LINEAR_MIP_POINT
+        D3d12Runtime::map_d3d12_filter_to_metal(0x14); // MIN_MAG_LINEAR_MIP_POINT
     assert_eq!(min_f, "linear");
     assert_eq!(mag_f, "linear");
     assert_eq!(mip_f, "nearest");
@@ -817,12 +817,12 @@ fn t6_9_static_sampler_filter_modes() {
     assert!(!cmp);
 
     let (min_f, mag_f, mip_f, aniso, cmp) =
-        D3d12Runtime::map_d3d12_filter_to_metal(0x40); // ANISOTROPIC
+        D3d12Runtime::map_d3d12_filter_to_metal(0x55); // ANISOTROPIC
     assert!(aniso);
     assert!(!cmp);
 
     let (min_f, mag_f, mip_f, aniso, cmp) =
-        D3d12Runtime::map_d3d12_filter_to_metal(0x80); // COMPARISON
+        D3d12Runtime::map_d3d12_filter_to_metal(0x80); // COMPARISON_MIN_MAG_MIP_POINT
     assert!(!aniso);
     assert!(cmp);
 

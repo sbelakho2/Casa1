@@ -1320,11 +1320,19 @@ impl StressTestRunner {
                         }
                     };
 
-                    // Spawn a helper thread that accepts one connection, sends 4 bytes, and closes
+                    // Spawn a helper thread that serves both the initial
+                    // connection and the subsequent reconnect. It must keep the
+                    // listener alive for both accepts: dropping the listener
+                    // after a single accept would make the reconnect race
+                    // against a closed port and fail with connection-refused.
                     let helper = std::thread::spawn(move || {
+                        // Initial connection: send a 4-byte payload, then close.
                         if let Ok((mut stream, _)) = listener.accept() {
                             let _ = std::io::Write::write_all(&mut stream, &[0xCA, 0xFE, 0x01, 0x00]);
                         }
+                        // Reconnect: accept the second connection so the client's
+                        // reconnect succeeds deterministically.
+                        let _ = listener.accept();
                     });
 
                     // Main thread: connect a TcpStream to the listener

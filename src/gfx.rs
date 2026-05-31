@@ -358,6 +358,12 @@ impl ResourceState {
         if bits & 0x00080000 != 0 { result.push(ResourceState::VideoProcessWrite); }
         if bits & 0x00100000 != 0 { result.push(ResourceState::VideoEncodeRead); }
         if bits & 0x00200000 != 0 { result.push(ResourceState::VideoEncodeWrite); }
+        // D3D12_RESOURCE_STATE_GENERIC_READ is the composite of all the
+        // read-only buffer/shader/copy states. When every component bit is
+        // present, the resource is in the canonical GENERIC_READ state.
+        if bits & 0x0AC3 == 0x0AC3 {
+            result.push(ResourceState::GenericRead);
+        }
         if result.is_empty() {
             result.push(ResourceState::GenericRead);
         }
@@ -783,6 +789,39 @@ pub struct RenderPassPlan {
     pub draw_calls: u32,
     pub load_action: String,
     pub store_action: String,
+}
+
+impl RenderPassPlan {
+    /// Two adjacent render passes can be coalesced into one when they target an
+    /// identical attachment configuration (same color attachment formats in the
+    /// same order and the same optional depth format) *and* the follow-on pass
+    /// merely loads the existing attachments. This is the standard Metal
+    /// load/store-action coalescing optimisation: a `store` followed by a
+    /// matching `load` of the same attachments is redundant, so the passes are
+    /// merged and the surviving pass adopts the later pass's store action. A
+    /// follow-on pass that *clears* (or otherwise discards) its attachments
+    /// establishes a fresh, observable starting state and must never be folded
+    /// into the previous pass.
+    pub fn can_merge_with(
+        &self,
+        color_formats: &[MtlPixelFormat],
+        depth_format: Option<MtlPixelFormat>,
+        load_action: &str,
+    ) -> bool {
+        self.color_formats == color_formats
+            && self.depth_format == depth_format
+            && load_action == "load"
+    }
+
+    /// Merge a compatible follow-on render pass into `self`. The caller is
+    /// responsible for having checked [`can_merge_with`]; only the store action
+    /// is updated, since the attachment formats and load action of the first
+    /// pass are retained for the coalesced pass.
+    ///
+    /// [`can_merge_with`]: RenderPassPlan::can_merge_with
+    pub fn merge_store_action(&mut self, store_action: &str) {
+        self.store_action = store_action.to_string();
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1712,11 +1751,14 @@ impl GraphicsBackend {
                             .transpose()?;
                         match &mut active_pass {
                             Some(pass)
-                                if pass.color_formats == mapped_color_formats
-                                    && pass.depth_format == mapped_depth_format
-                                    && self.capabilities.mesh_shaders =>
+                                if self.capabilities.mesh_shaders
+                                    && pass.can_merge_with(
+                                        &mapped_color_formats,
+                                        mapped_depth_format,
+                                        load_action,
+                                    ) =>
                             {
-                                pass.store_action = store_action.clone();
+                                pass.merge_store_action(store_action);
                             }
                             Some(_) => {
                                 render_passes.push(active_pass.take().expect("active pass"));
@@ -2709,6 +2751,49 @@ fn read_command_output(program: &str, args: &[&str]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn render_pass_plan_merges_only_compatible_attachments() {
+        let mut pass = RenderPassPlan {
+            color_formats: vec![MtlPixelFormat::Bgra8Unorm],
+            depth_format: Some(MtlPixelFormat::Depth32Float),
+            draw_calls: 2,
+            load_action: "clear".to_string(),
+            store_action: "store".to_string(),
+        };
+
+        // Identical attachments with a follow-on `load` => mergeable.
+        assert!(pass.can_merge_with(
+            &[MtlPixelFormat::Bgra8Unorm],
+            Some(MtlPixelFormat::Depth32Float),
+            "load",
+        ));
+
+        // Identical attachments but the follow-on pass clears => not mergeable,
+        // because the clear establishes a fresh observable starting state.
+        assert!(!pass.can_merge_with(
+            &[MtlPixelFormat::Bgra8Unorm],
+            Some(MtlPixelFormat::Depth32Float),
+            "clear",
+        ));
+
+        // Different color format => not mergeable.
+        assert!(!pass.can_merge_with(
+            &[MtlPixelFormat::Rgba8Unorm],
+            Some(MtlPixelFormat::Depth32Float),
+            "load",
+        ));
+
+        // Different depth presence => not mergeable.
+        assert!(!pass.can_merge_with(&[MtlPixelFormat::Bgra8Unorm], None, "load"));
+
+        // Merging adopts the later pass's store action while preserving the
+        // first pass's load action and draw tally.
+        pass.merge_store_action("dont_care");
+        assert_eq!(pass.store_action, "dont_care");
+        assert_eq!(pass.load_action, "clear");
+        assert_eq!(pass.draw_calls, 2);
+    }
 
     #[test]
     fn apple_m_series_profiles_map_to_expected_metal_families() {

@@ -12,6 +12,8 @@ fn sha(bytes: &[u8]) -> String {
 }
 
 fn submission_signature(
+    gpu_profile: &str,
+    depth_store_action: &str,
     binding_signature: &str,
     color_digest: &str,
     constants_digest: &str,
@@ -23,7 +25,7 @@ fn submission_signature(
     vertex_digest: &str,
 ) -> String {
     format!(
-        "fl=Level10_1|lists=1|draw=1|draw_indexed=1|dispatch=1|render_passes=1|compute_passes=1|blit_passes=1|validation=0|bind[0]={binding_signature}|rp=[Bgra8Unorm]:Some(Depth24UnormStencil8):2:clear:store|res[color]={color_digest}|res[constants]={constants_digest}|res[depth]={depth_digest}|res[mirror]={mirror_digest}|res[staging]={staging_digest}|res[tex1d]={texture_1d_digest}|res[vertex]={vertex_digest}|res[volume]={texture_3d_digest}"
+        "gpu={gpu_profile}|fl=Level10_1|lists=1|draw=1|draw_indexed=1|dispatch=1|render_passes=1|compute_passes=1|blit_passes=1|validation=0|bind[0]=gpu={gpu_profile}|{binding_signature}|rp=[Bgra8Unorm]:Some(Depth24UnormStencil8):2:clear:{depth_store_action}|res[color]={color_digest}|res[constants]={constants_digest}|res[depth]={depth_digest}|res[mirror]={mirror_digest}|res[staging]={staging_digest}|res[tex1d]={texture_1d_digest}|res[vertex]={vertex_digest}|res[volume]={texture_3d_digest}"
     )
 }
 
@@ -176,7 +178,7 @@ fn t9_1_d3d11_conformance_microtests_and_frame_diffs_match_reference() {
     device.dispatch(2, 3, 1);
     let submission = device.submit_immediate().expect("submit immediate context");
 
-    let binding_signature = "rtv=[Rtv:color]|dsv=depth|vp=0.0,0.0,1280.0,720.0|vb=[vertex]|ib=staging|il=POSITION:R32Float:0,TEXCOORD:R32Float:0|blend=true:false|rast=solid:back|depth=true:true|shaders=[Vs:vs_main,Ps:ps_main,Cs:cs_main]|cb=[Vs=[constants];Ps=[constants];Cs=[]]|srv=[Vs=[];Ps=[color];Cs=[volume]]|samp=[Vs=[];Ps=[Linear:wrap:clamp];Cs=[]]";
+    let binding_signature = "rtv=[Rtv:color]|dsv=depth|vp=0.0,0.0,1280.0,720.0|scissor=none|vb=[vertex]|ib=staging|topo=none|il=POSITION:R32Float:0,TEXCOORD:R32Float:0|blend=true:false|rast=solid:back|depth=true:true|shaders=[Vs:vs_main,Ps:ps_main,Cs:cs_main,Gs:none,Hs:none,Ds:none]|cb=[Vs=[constants];Ps=[constants];Cs=[];Gs=[];Hs=[];Ds=[]]|srv=[Vs=[];Ps=[color];Cs=[volume];Gs=[];Hs=[];Ds=[]]|samp=[Vs=[];Ps=[Linear:wrap:clamp];Cs=[];Gs=[];Hs=[];Ds=[]]";
     assert_eq!(submission.draw_calls, 1);
     assert_eq!(submission.indexed_draw_calls, 1);
     assert_eq!(submission.dispatch_calls, 1);
@@ -203,7 +205,15 @@ fn t9_1_d3d11_conformance_microtests_and_frame_diffs_match_reference() {
     let texture_3d_digest = sha(&[0; 32]);
     let vertex_digest = sha(&[1, 2, 3, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
     assert_eq!(device.resource_digest(tex1d).expect("tex1d digest"), texture_1d_digest);
+    let gpu_profile = device.gpu_profile_signature();
+    let depth_store_action = if device.memoryless_depth_targets() {
+        "store+depth-discard"
+    } else {
+        "store"
+    };
     let expected_signature = submission_signature(
+        &gpu_profile,
+        depth_store_action,
         binding_signature,
         &color_digest,
         &constants_digest,
@@ -463,7 +473,7 @@ fn t9_4_d3d9_legacy_suite_covers_golden_frames_and_exact_not_supported_errors() 
     let frame = device
         .render_fixed_function_scene(&scene)
         .expect("render fixed-function scene");
-    let expected_signature = "d3d9:id=1|tf=11223344|diff=aabbccdd|fog=true|blend=false|prim=12";
+    let expected_signature = "d3d9:id=1|tf=11223344|diff=aabbccdd|fog=true|blend=false|prim=12|640x480";
     assert_eq!(frame.signature, expected_signature);
     assert_eq!(frame.hash, sha(expected_signature.as_bytes()));
 

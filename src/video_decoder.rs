@@ -85,13 +85,17 @@ pub enum VideoCodec {
 }
 
 /// A decoded video frame.
+///
+/// When the zero-copy Metal path is active, `metal_texture` holds a +1
+/// retained `id<MTLTexture>` pointer and `data` is empty.  Otherwise
+/// `data` contains CPU-side RGBA bytes and `metal_texture` is `None`.
 #[derive(Debug, Clone)]
 pub struct VideoFrame {
     /// Width in pixels.
     pub width: u32,
     /// Height in pixels.
     pub height: u32,
-    /// RGBA pixel data (8 bits per channel).
+    /// RGBA pixel data (8 bits per channel) — empty when using zero-copy.
     pub data: Vec<u8>,
     /// Presentation timestamp in microseconds.
     pub pts: u64,
@@ -99,6 +103,11 @@ pub struct VideoFrame {
     pub duration: u64,
     /// Optional Metal texture ID (set after uploading to GPU).
     pub texture_id: Option<u64>,
+    /// Zero-copy Metal texture pointer (+1 retained `id<MTLTexture>`).
+    /// When `Some`, the pixel data lives on the GPU and `data` is empty.
+    /// The consumer should wrap this with `metal::Texture::from_ptr()`
+    /// and the texture will be released on drop.
+    pub metal_texture: Option<*mut std::ffi::c_void>,
     /// Color space of the frame.
     pub color_space: ColorSpace,
 }
@@ -185,6 +194,15 @@ mod vt_ffi {
     pub type CFNumberRef = *const c_void;
     /// CoreFoundation type reference.
     pub type CFTypeRef = *const c_void;
+
+    // ---- CVMetalTextureCache types ----
+
+    /// Metal texture cache reference (from CoreVideo).
+    pub type CVMetalTextureCacheRef = *mut c_void;
+    /// Metal texture reference wrapping a CVPixelBuffer.
+    pub type CVMetalTextureRef = *mut c_void;
+    /// CoreVideo return type (like OSStatus / CVReturn).
+    pub type CVReturn = i32;
 
     // ---- Constants ----
 
@@ -411,12 +429,212 @@ mod vt_ffi {
             theType: u32,
             valuePtr: *const c_void,
         ) -> CFNumberRef;
+
+        // ========== CVMetalTextureCache ==========
+
+        /// Create a CVMetalTextureCache.
+        ///
+        /// `mtlDevice` must be a retained `id<MTLDevice>` pointer obtained from
+        /// the `metal` crate (e.g., `device.as_ptr()`).
+        pub fn CVMetalTextureCacheCreate(
+            allocator: CFAllocatorRef,
+            cacheAttributes: CFDictionaryRef,
+            mtlDevice: *mut c_void,
+            textureAttributes: CFDictionaryRef,
+            cacheOut: *mut CVMetalTextureCacheRef,
+        ) -> CVReturn;
+
+        /// Create a Metal texture from a CVPixelBuffer via the cache.
+        ///
+        /// `pixelFormat` is a Metal `MTLPixelFormat` enum value (e.g.,
+        /// `MTLPixelFormatBGRA8Unorm = 80`). `width`/`height` should match
+        /// the pixel buffer dimensions; `planeIndex` is 0 for single-plane
+        /// (BGRA) or 0/1 for bi-planar (NV12 Y/UV) formats.
+        pub fn CVMetalTextureCacheCreateTextureFromImage(
+            allocator: CFAllocatorRef,
+            cache: CVMetalTextureCacheRef,
+            sourceImage: CVPixelBufferRef,
+            textureAttributes: CFDictionaryRef,
+            pixelFormat: u32,
+            width: usize,
+            height: usize,
+            planeIndex: usize,
+            textureOut: *mut CVMetalTextureRef,
+        ) -> CVReturn;
+
+        /// Extract the `id<MTLTexture>` from a CVMetalTextureRef.
+        ///
+        /// Returns a raw pointer to the MTLTexture (borrowed; caller must
+        /// retain if they need it to outlive the CVMetalTextureRef).
+        pub fn CVMetalTextureGetTexture(texture: CVMetalTextureRef) -> *mut c_void;
+
+        /// Flush the texture cache, releasing any internally cached textures
+        /// whose CVPixelBuffers have been discarded.
+        ///
+        /// Pass `options = 0` for a standard flush.
+        pub fn CVMetalTextureCacheFlush(cache: CVMetalTextureCacheRef, options: u64);
     }
 
     // CFNumber types
     pub const kCFNumberSInt32Type: u32 = 3;
     // kCFStringEncodingUTF8
     pub const kCFStringEncodingUTF8: u32 = 0x08000100;
+}
+
+// ===========================================================================
+// Metal pixel format constants (for CVMetalTextureCache)
+// ===========================================================================
+
+/// MTLPixelFormatBGRA8Unorm — 8-bit BGRA with normalized unsigned components.
+#[cfg(target_os = "macos")]
+pub const MTLPixelFormatBGRA8Unorm: u32 = 80;
+/// MTLPixelFormatRGBA8Unorm — 8-bit RGBA with normalized unsigned components.
+#[cfg(target_os = "macos")]
+pub const MTLPixelFormatRGBA8Unorm: u32 = 70;
+/// MTLPixelFormatNV12 — bi-planar Y/CbCr (420v).
+#[cfg(target_os = "macos")]
+pub const MTLPixelFormatNV12: u32 = 150;
+
+// ===========================================================================
+// CVMetalTextureCache — zero-copy CVPixelBuffer → MTLTexture bridge
+// ===========================================================================
+
+/// A zero-copy bridge that wraps `CVPixelBuffer` objects produced by
+/// VideoToolbox as `MTLTexture` objects, avoiding any CPU-side pixel copy.
+///
+/// Internally holds a `CVMetalTextureCacheRef` that maps pixel buffers to
+/// Metal textures.  Textures are lazily created and cached by the
+/// CoreVideo framework; the cache must be flushed periodically to release
+/// stale entries.
+///
+/// ## Thread Safety
+/// CVMetalTextureCache is *not* fully thread-safe.  All methods must be
+/// called from the same thread / dispatch queue.  In practice this is
+/// satisfied because the `decompression_output_callback` runs on a
+/// VideoToolbox internal thread, and we create/destroy the cache only on
+/// the decoder's owning thread.
+#[cfg(target_os = "macos")]
+pub struct MetalVideoTextureCache {
+    /// The underlying `CVMetalTextureCacheRef`.
+    cache: vt_ffi::CVMetalTextureCacheRef,
+    /// Retained Metal device pointer (`id<MTLDevice>`).
+    device_ptr: *mut std::ffi::c_void,
+}
+
+#[cfg(target_os = "macos")]
+impl MetalVideoTextureCache {
+    /// Create a new texture cache from a Metal device.
+    ///
+    /// Returns `None` if the system has no Metal device or if the
+    /// CoreVideo cache creation fails.
+    pub fn new(device: &metal::Device) -> Option<Self> {
+        use self::vt_ffi::*;
+        use metal::foreign_types::ForeignType;
+        use std::ptr;
+
+        let device_ptr = device.as_ptr() as *mut std::ffi::c_void;
+
+        unsafe {
+            let mut cache: CVMetalTextureCacheRef = ptr::null_mut();
+            let status = CVMetalTextureCacheCreate(
+                ptr::null_mut(), // kCFAllocatorDefault
+                ptr::null(),     // cacheAttributes (NULL = default)
+                device_ptr,
+                ptr::null(),     // textureAttributes (NULL = default)
+                &mut cache,
+            );
+            if status != 0 || cache.is_null() {
+                return None;
+            }
+            Some(Self { cache, device_ptr })
+        }
+    }
+
+    /// Wrap a `CVPixelBuffer` as a Metal texture.
+    ///
+    /// The returned raw pointer is a +1 retained `id<MTLTexture>` that the
+    /// caller must eventually release (e.g. by wrapping it with
+    /// `metal::Texture::from_ptr()` which hands ownership to the
+    /// reference-counted wrapper).
+    ///
+    /// Returns `None` on failure (e.g. invalid format, out of memory).
+    pub fn create_texture_from_pixel_buffer(
+        &self,
+        pixel_buffer: vt_ffi::CVPixelBufferRef,
+        width: u32,
+        height: u32,
+        pixel_format: u32,
+        plane_index: usize,
+    ) -> Option<*mut std::ffi::c_void> {
+        use self::vt_ffi::*;
+        use std::ptr;
+
+        unsafe {
+            let mut cv_texture: CVMetalTextureRef = ptr::null_mut();
+            let status = CVMetalTextureCacheCreateTextureFromImage(
+                ptr::null_mut(), // kCFAllocatorDefault
+                self.cache,
+                pixel_buffer,
+                ptr::null(),     // textureAttributes
+                pixel_format,
+                width as usize,
+                height as usize,
+                plane_index,
+                &mut cv_texture,
+            );
+            if status != 0 || cv_texture.is_null() {
+                return None;
+            }
+
+            // Extract the id<MTLTexture> — borrowed per CoreVideo "Get" rule.
+            let mtl_texture = CVMetalTextureGetTexture(cv_texture);
+            if mtl_texture.is_null() {
+                // Release the CVMetalTextureRef (which we own).
+                CFRelease(cv_texture as CFTypeRef);
+                return None;
+            }
+
+            // Retain the MTLTexture so it outlives the CVMetalTextureRef.
+            // We send the Objective-C `retain` message directly.
+            // The metal::Texture::from_ptr() will pair this with a release on drop.
+            let retained: *mut std::ffi::c_void = {
+                let obj = mtl_texture as *mut objc::runtime::Object;
+                let _: *mut objc::runtime::Object = msg_send![obj, retain];
+                mtl_texture
+            };
+
+            // Release the CVMetalTextureRef (cache may still hold an internal reference).
+            CFRelease(cv_texture as CFTypeRef);
+
+            Some(retained)
+        }
+    }
+
+    /// Flush the cache, releasing stale texture entries.
+    pub fn flush(&self) {
+        use self::vt_ffi::*;
+        unsafe {
+            CVMetalTextureCacheFlush(self.cache, 0);
+        }
+    }
+
+    /// Access the raw cache reference (for advanced use).
+    pub fn as_raw(&self) -> vt_ffi::CVMetalTextureCacheRef {
+        self.cache
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for MetalVideoTextureCache {
+    fn drop(&mut self) {
+        use self::vt_ffi::*;
+        if !self.cache.is_null() {
+            unsafe {
+                CVMetalTextureCacheFlush(self.cache, 0);
+                CFRelease(self.cache as CFTypeRef);
+            }
+        }
+    }
 }
 
 // ===========================================================================
@@ -568,6 +786,10 @@ struct DecoderContext {
     fps: f64,
     /// Running frame counter.
     frame_number: Mutex<u64>,
+    /// Optional Metal texture cache for zero-copy path.
+    /// When `Some`, the callback attempts to create a Metal texture
+    /// from the CVPixelBuffer before falling back to the CPU path.
+    metal_cache: Option<MetalVideoTextureCache>,
 }
 
 // ===========================================================================
@@ -589,6 +811,10 @@ pub struct VideoDecoder {
     format_desc: Option<vt_ffi::CMVideoFormatDescriptionRef>,
     #[cfg(target_os = "macos")]
     context: Option<Box<DecoderContext>>,
+    /// Zero-copy Metal texture cache. Created on macOS if a Metal device
+    /// is available; `None` otherwise.
+    #[cfg(target_os = "macos")]
+    metal_cache: Option<MetalVideoTextureCache>,
 
     #[cfg(feature = "ffmpeg")]
     ffmpeg_ctx: Option<ffmpeg_decoder::FfmpegCodecContext>,
@@ -606,6 +832,10 @@ impl VideoDecoder {
         #[cfg(feature = "ffmpeg")]
         let ffmpeg_ctx = ffmpeg_decoder::FfmpegCodecContext::new(&config).ok();
 
+        #[cfg(target_os = "macos")]
+        let metal_cache = metal::Device::system_default()
+            .and_then(|dev| MetalVideoTextureCache::new(&dev));
+
         Self {
             #[cfg(target_os = "macos")]
             session: None,
@@ -613,6 +843,8 @@ impl VideoDecoder {
             format_desc: None,
             #[cfg(target_os = "macos")]
             context: None,
+            #[cfg(target_os = "macos")]
+            metal_cache,
             #[cfg(feature = "ffmpeg")]
             ffmpeg_ctx,
             config,
@@ -785,12 +1017,23 @@ impl VideoDecoder {
         }
 
         // 2. Create the context for the output callback
+        //    Move the Metal cache into the context (the callback needs it).
+        //    On session re-creation, create a fresh cache from the system device.
+        let metal_cache = self
+            .metal_cache
+            .take()
+            .or_else(|| {
+                metal::Device::system_default()
+                    .and_then(|dev| MetalVideoTextureCache::new(&dev))
+            });
+
         let ctx = Box::new(DecoderContext {
             frames: Mutex::new(VecDeque::new()),
             output_width: self.config.width,
             output_height: self.config.height,
             fps: self.config.fps,
             frame_number: Mutex::new(0),
+            metal_cache,
         });
 
         let context_ptr = Box::into_raw(ctx);
@@ -1008,7 +1251,6 @@ impl VideoDecoder {
     #[cfg(target_os = "macos")]
     fn destroy_session(&mut self) {
         use self::vt_ffi::*;
-        use std::ptr;
 
         if let Some(session) = self.session.take() {
             unsafe {
@@ -1367,7 +1609,6 @@ unsafe extern "C" fn decompression_output_callback(
     _presentationDuration: vt_ffi::CMTime,
 ) {
     use self::vt_ffi::*;
-    use std::ptr;
 
     if status != 0 || imageBuffer.is_null() {
         return;
@@ -1383,6 +1624,68 @@ unsafe extern "C" fn decompression_output_callback(
         return;
     }
 
+    // ---- ZERO-COPY PATH (CVMetalTextureCache) ----
+    // Before locking the pixel buffer for CPU reads, try to wrap it as a
+    // Metal texture via the cache.  If this succeeds we can skip the
+    // entire CPU-side pixel copy + format conversion.
+    //
+    // The pixel buffer does NOT need to be locked for CVMetalTextureCache.
+    if let Some(ref metal_cache) = ctx.metal_cache {
+        let pixel_format = CVPixelBufferGetPixelFormatType(imageBuffer);
+        let mtl_pixel_format = if pixel_format == kCVPixelFormatType_32BGRA {
+            MTLPixelFormatBGRA8Unorm
+        } else if pixel_format == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange {
+            // For NV12 we try BGRA texture creation which CoreVideo can
+            // convert on-the-fly; if that fails we fall through to software.
+            MTLPixelFormatBGRA8Unorm
+        } else {
+            // Unknown format — skip zero-copy
+            0
+        };
+
+        if mtl_pixel_format != 0 {
+            let mtl_texture = metal_cache.create_texture_from_pixel_buffer(
+                imageBuffer,
+                width,
+                height,
+                mtl_pixel_format,
+                0, // planeIndex: 0 for BGRA / single-plane
+            );
+
+            if let Some(texture_ptr) = mtl_texture {
+                // Zero-copy succeeded — no need to lock / copy pixels.
+                let frame_num = { *ctx.frame_number.lock().unwrap() };
+                let pts = if frame_num == 0 {
+                    0
+                } else {
+                    frame_num * 1_000_000 / ctx.fps as u64
+                };
+                let duration = if ctx.fps > 0.0 {
+                    1_000_000 / ctx.fps as u64
+                } else {
+                    33_333
+                };
+
+                let frame = VideoFrame {
+                    width: ctx.output_width.max(width),
+                    height: ctx.output_height.max(height),
+                    data: Vec::new(), // zero-copy — no CPU data
+                    pts,
+                    duration,
+                    texture_id: None,
+                    metal_texture: Some(texture_ptr),
+                    color_space: ColorSpace::Rec709,
+                };
+
+                let mut frames = ctx.frames.lock().unwrap();
+                frames.push_back(frame);
+                return; // Skip the software path entirely
+            }
+            // Zero-copy failed — fall through to software path below.
+        }
+    }
+
+    // ---- SOFTWARE PATH (CPU-side pixel copy) ----
     // Lock the pixel buffer for reading
     let lock_status = CVPixelBufferLockBaseAddress(imageBuffer, 0);
     if lock_status != 0 {
@@ -1505,6 +1808,7 @@ unsafe extern "C" fn decompression_output_callback(
             pts,
             duration,
             texture_id: None,
+            metal_texture: None,
             color_space: ColorSpace::Rec709,
         };
 

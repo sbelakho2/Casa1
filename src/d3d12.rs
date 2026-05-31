@@ -265,21 +265,22 @@ impl D3d12Runtime {
     pub fn map_d3d12_filter_to_metal(
         d3d12_filter: u32,
     ) -> (&'static str, &'static str, &'static str, bool, bool) {
-        // D3D12_FILTER encoding:
-        // Bits 0-1: min filter (0=point, 1=linear)
-        // Bits 2-3: mag filter (0=point, 1=linear)
-        // Bits 4-5: mip filter (0=point, 1=linear)
-        // Bit 6: anisotropic
-        // Bit 7: comparison filter
-        let min_part = (d3d12_filter & 0x03) as u8;
-        let mag_part = ((d3d12_filter >> 2) & 0x03) as u8;
-        let mip_part = ((d3d12_filter >> 4) & 0x03) as u8;
+        // D3D12_FILTER bit encoding (see d3d12.h):
+        //   bits 0-1: mip filter (0=point, 1=linear)
+        //   bits 2-3: mag filter (0=point, 1=linear)
+        //   bits 4-5: min filter (0=point, 1=linear)
+        //   bit 6   : anisotropic filtering (forces linear on all stages)
+        //   bits 7-8: reduction type (0=standard, 1=comparison, 2=min, 3=max)
         let anisotropic = (d3d12_filter & 0x40) != 0;
-        let comparison = (d3d12_filter & 0x80) != 0;
+        let comparison = ((d3d12_filter >> 7) & 0x03) == 1;
 
-        let min_filter = if min_part == 0 { "nearest" } else { "linear" };
-        let mag_filter = if mag_part == 0 { "nearest" } else { "linear" };
-        let mip_filter = if mip_part == 0 { "nearest" } else { "linear" };
+        let mip_linear = anisotropic || (d3d12_filter & 0x03) != 0;
+        let mag_linear = anisotropic || ((d3d12_filter >> 2) & 0x03) != 0;
+        let min_linear = anisotropic || ((d3d12_filter >> 4) & 0x03) != 0;
+
+        let min_filter = if min_linear { "linear" } else { "nearest" };
+        let mag_filter = if mag_linear { "linear" } else { "nearest" };
+        let mip_filter = if mip_linear { "linear" } else { "nearest" };
 
         (min_filter, mag_filter, mip_filter, anisotropic, comparison)
     }
@@ -563,6 +564,7 @@ impl D3d12Runtime {
         before: Option<ResourceId>,
         after: Option<ResourceId>,
     ) -> AppResult<()> {
+        self.aliasing_overlaps.push((before, after));
         self.backend.record_aliasing_barrier(list, before, after)
     }
 

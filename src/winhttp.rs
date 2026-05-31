@@ -357,33 +357,19 @@ fn extract_spki_der(data: &[u8]) -> Option<Vec<u8>> {
     // Skip subject (SEQUENCE)
     skip_tlv(data, &mut off)?;
 
-    // Now we should be at SubjectPublicKeyInfo: SEQUENCE
-    let (_, spki_len) = read_tag(data, &mut off)?;
-    let _spki_start = off - 2 - if spki_len > 127 { spki_len.leading_zeros() as usize } else { 0 }; // not exact but close enough
-    // Actually compute the exact spki_start
-    // We already consumed the tag and length at 'off', and spki_len is the content length
-    // So the full TLV starts at off - (number of bytes consumed by read_tag for this sequence)
-    // Let's just record the start position before calling read_tag
-    // Since we already called read_tag, we need to back up. Let me recalculate.
-    // The TLV for SPKI starts at off - 2 (tag + 1-byte length) or more for multi-byte length
-    // We don't know exactly, but we know the content starts at off and has length spki_len
-    // The full SPKI DER includes the tag and length bytes too
-    // Let's just return from off-2 to off+spki_len for the simplified case
-    // Actually, let's re-read the tag to find the start
-    // Since read_tag advanced off past tag and length, and we know the content is at off..off+spki_len
-    // The TLV start is at off - (bytes for tag+len). Let's find it by scanning backward.
-    let mut spki_start = off;
-    // Find the start by scanning back: we know the tag was 0x30 and length spki_len
-    // Go back to find the tag
-    while spki_start > 0 && data[spki_start - 1] != 0x30 {
-        spki_start -= 1;
+    // SubjectPublicKeyInfo SEQUENCE: capture the TLV start offset *before*
+    // consuming the tag/length bytes so we can slice the exact DER encoding
+    // of the SPKI (tag + length + content) deterministically.
+    let spki_start = off;
+    let (spki_tag, spki_len) = read_tag(data, &mut off)?;
+    if spki_tag != 0x30 {
+        return None;
     }
-    if spki_start > 0 {
-        spki_start -= 1; // Include the tag byte
+    let spki_end = off + spki_len;
+    if spki_end > tbs_end {
+        return None;
     }
-    let full_spki = data[spki_start..(off + spki_len)].to_vec();
-
-    Some(full_spki)
+    Some(data[spki_start..spki_end].to_vec())
 }
 
 impl WinHttpStack {
@@ -437,25 +423,24 @@ impl WinHttpStack {
     }
 
     /// Verify that at least one certificate in the chain matches a pin for the given host.
-    /// `cert_chain` contains DER-encoded certificates (from leaf to root).
+    /// `cert_chain` contains DER-encoded certificates (from leaf to root), captured from
+    /// the live TLS handshake via reqwest's `tls_info`.
     ///
-    /// NOTE: reqwest 0.12 does not expose raw certificate chains through its public API,
-    /// so callers pass an empty chain. When the chain is empty we skip verification
-    /// rather than failing closed, since we cannot verify what we cannot see.
-    /// A full implementation would use native-tls certificate extraction.
+    /// Behavior:
+    /// - No pins configured for the host: accept (pinning is opt-in per host).
+    /// - Pins configured: accept iff some certificate's SubjectPublicKeyInfo SHA-256 matches
+    ///   a pin. If the chain is empty (e.g. a plain-HTTP request to a pinned host, or the TLS
+    ///   layer exposed no certificate) we FAIL CLOSED, since a configured pin must be honored.
     pub fn verify_certificate_pin(&self, host: &str, cert_chain: &[Vec<u8>]) -> bool {
         let Some(acceptable) = self.pinned_certs.get(host) else {
-            // No pins configured for this host — skip verification
+            // No pins configured for this host — pinning is opt-in.
             return true;
         };
         if acceptable.is_empty() {
             return true;
         }
-        // If no certificate chain was provided (reqwest limitation), skip verification
-        if cert_chain.is_empty() {
-            return true;
-        }
-        // Compute SPKI SHA-256 hash for each certificate in the chain and check against pins
+        // Compute SPKI SHA-256 hash for each certificate in the chain and check against pins.
+        // An empty chain falls through the loop and returns `false` (fail closed).
         for cert_der in cert_chain {
             // Simple DER parsing to extract the SubjectPublicKeyInfo
             if let Some(spki_der) = extract_spki_der(cert_der) {
@@ -875,6 +860,7 @@ impl WinHttpStack {
         let client = self.client.get_or_insert_with(|| {
             let mut builder = reqwest::blocking::Client::builder()
                 .danger_accept_invalid_certs(true) // for development; production should validate
+                .tls_info(true) // expose the peer certificate so certificate pinning can be enforced
                 .timeout(std::time::Duration::from_secs(30));
             if let Some(ref cfg) = proxy_cfg {
                 if !should_bypass {
@@ -919,7 +905,7 @@ impl WinHttpStack {
         }
 
         // Phase 2: Re-borrow request to add headers/body and send
-        let (_status_code, _status_text, _response_headers, _response_body, set_cookie_values) = {
+        let (_status_code, _status_text, _response_headers, _response_body, set_cookie_values, cert_chain) = {
             let req = self.requests.get_mut(&request_handle).ok_or_else(|| {
                 AppError::new(
                     ReasonCode::RcWin32InvalidHandle,
@@ -950,6 +936,15 @@ impl WinHttpStack {
                     ));
                 }
             };
+
+            // Capture the peer certificate (DER) from the live TLS handshake before the
+            // response body is consumed, so certificate pins can be enforced below.
+            let cert_chain: Vec<Vec<u8>> = response
+                .extensions()
+                .get::<reqwest::tls::TlsInfo>()
+                .and_then(|info| info.peer_certificate())
+                .map(|der| vec![der.to_vec()])
+                .unwrap_or_default();
 
             let sc = response.status().as_u16() as u32;
             let st = response
@@ -984,7 +979,7 @@ impl WinHttpStack {
             req.response_body = body_bytes.clone();
             req.state = WinHttpSessionState::Complete;
 
-            (sc, st, resp_headers, body_bytes, set_cookie_values)
+            (sc, st, resp_headers, body_bytes, set_cookie_values, cert_chain)
         };
 
         // --- 3.1.4: Parse and store Set-Cookie headers from response ---
@@ -993,12 +988,10 @@ impl WinHttpStack {
         }
 
         // --- 3.1.3: Verify certificate pins ---
-        // reqwest 0.12 does not expose raw certificate chains through its
-        // public API, so we pass the chain from the response if available.
-        // If no chain was received, pin validation is skipped (reqwest
-        // limitation). Once native-tls certificate extraction is implemented,
-        // this will validate pins properly.
-        if !self.verify_certificate_pin(&conn_server_name, &[]) {
+        // The peer certificate captured from the TLS handshake (via `tls_info`) is passed
+        // to the pin validator. If pins are configured for this host and none match, the
+        // request is rejected (fail closed).
+        if !self.verify_certificate_pin(&conn_server_name, &cert_chain) {
             return Err(AppError::new(
                 ReasonCode::RcNetConnectionFailed,
                 format!(
@@ -1649,5 +1642,111 @@ mod tests {
         assert!(stack
             .win_http_connect(0xDEAD, "example.com", 443, true)
             .is_err());
+    }
+
+    // --- Certificate pinning (SPKI extraction + pin enforcement) ---
+
+    /// Encode a DER TLV: tag, length (short or long form), then content.
+    fn der(tag: u8, content: &[u8]) -> Vec<u8> {
+        let mut out = vec![tag];
+        let len = content.len();
+        if len < 0x80 {
+            out.push(len as u8);
+        } else {
+            let mut len_bytes = Vec::new();
+            let mut remaining = len;
+            while remaining > 0 {
+                len_bytes.push((remaining & 0xff) as u8);
+                remaining >>= 8;
+            }
+            len_bytes.reverse();
+            out.push(0x80 | len_bytes.len() as u8);
+            out.extend_from_slice(&len_bytes);
+        }
+        out.extend_from_slice(content);
+        out
+    }
+
+    /// A self-contained DER-encoded SubjectPublicKeyInfo TLV.
+    fn build_spki(key_bits: &[u8]) -> Vec<u8> {
+        let algorithm = der(0x30, &der(0x06, &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01]));
+        let mut bit_string = vec![0x00];
+        bit_string.extend_from_slice(key_bits);
+        let public_key = der(0x03, &bit_string);
+        let mut spki = algorithm;
+        spki.extend_from_slice(&public_key);
+        der(0x30, &spki)
+    }
+
+    /// Wrap a SubjectPublicKeyInfo into a minimal but structurally valid
+    /// X.509 certificate DER that `extract_spki_der` can walk.
+    fn synthetic_certificate(spki: &[u8]) -> Vec<u8> {
+        let version = der(0xA0, &der(0x02, &[0x02]));
+        let serial = der(0x02, &[0x01]);
+        let signature = der(0x30, &der(0x06, &[0x2A, 0x86, 0x48]));
+        let issuer = der(0x30, &[]);
+        let validity = der(0x30, &[]);
+        let subject = der(0x30, &[]);
+        let mut tbs = Vec::new();
+        tbs.extend_from_slice(&version);
+        tbs.extend_from_slice(&serial);
+        tbs.extend_from_slice(&signature);
+        tbs.extend_from_slice(&issuer);
+        tbs.extend_from_slice(&validity);
+        tbs.extend_from_slice(&subject);
+        tbs.extend_from_slice(spki);
+        let tbs_certificate = der(0x30, &tbs);
+        let outer_signature = der(0x30, &der(0x06, &[0x2A, 0x86, 0x48]));
+        let signature_value = der(0x03, &[0x00]);
+        let mut cert = Vec::new();
+        cert.extend_from_slice(&tbs_certificate);
+        cert.extend_from_slice(&outer_signature);
+        cert.extend_from_slice(&signature_value);
+        der(0x30, &cert)
+    }
+
+    #[test]
+    fn extract_spki_der_returns_exact_subject_public_key_info() {
+        let spki = build_spki(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        let cert = synthetic_certificate(&spki);
+        let extracted = extract_spki_der(&cert).expect("SPKI must be extractable");
+        // The extracted bytes must be the exact SPKI TLV — no off-by-one,
+        // no trailing or missing bytes from a heuristic backward scan.
+        assert_eq!(extracted, spki);
+    }
+
+    #[test]
+    fn extract_spki_der_rejects_truncated_certificate() {
+        let spki = build_spki(&[0x01, 0x02, 0x03, 0x04]);
+        let cert = synthetic_certificate(&spki);
+        // Chop the certificate so the declared outer length exceeds the data.
+        let truncated = &cert[..cert.len() - 1];
+        assert!(extract_spki_der(truncated).is_none());
+    }
+
+    #[test]
+    fn certificate_pin_enforces_only_matching_spki_hash() {
+        let spki = build_spki(&[0xAA, 0xBB, 0xCC, 0xDD]);
+        let cert = synthetic_certificate(&spki);
+        let pin = Sha256::digest(extract_spki_der(&cert).unwrap());
+
+        let mut stack = WinHttpStack::new();
+
+        // No pins configured for the host: any chain is accepted.
+        assert!(stack.verify_certificate_pin("steamcdn.example", &[cert.clone()]));
+
+        // Pin the correct SPKI hash: the matching chain is accepted.
+        stack.pin_certificate("steamcdn.example", pin.as_slice());
+        assert!(stack.verify_certificate_pin("steamcdn.example", &[cert.clone()]));
+
+        // A different certificate (different SPKI) must be rejected.
+        let other = synthetic_certificate(&build_spki(&[0x11, 0x22, 0x33, 0x44]));
+        assert!(!stack.verify_certificate_pin("steamcdn.example", &[other]));
+
+        // With an active pin but no certificate presented, reject.
+        assert!(!stack.verify_certificate_pin("steamcdn.example", &[]));
+
+        // Hosts without a pin remain unaffected.
+        assert!(stack.verify_certificate_pin("other.example", &[]));
     }
 }

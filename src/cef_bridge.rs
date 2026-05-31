@@ -26,7 +26,59 @@ use std::sync::LazyLock;
 use std::sync::Mutex;
 
 // ---------------------------------------------------------------------------
+// G9: IOSurface-backed Metal texture cache for zero-copy CEF compositing
+// ---------------------------------------------------------------------------
+
+/// A cached pair of IOSurface and its wrapping Metal texture.
+struct IoSurfaceTexturePair {
+    /// Raw IOSurfaceRef (owned, released on drop/resize).
+    io_surface: *mut std::ffi::c_void,
+    /// Metal texture wrapping the IOSurface.
+    metal_texture: Option<metal::Texture>,
+    /// Width in pixels.
+    width: u32,
+    /// Height in pixels.
+    height: u32,
+}
+
+unsafe impl Send for IoSurfaceTexturePair {}
+unsafe impl Sync for IoSurfaceTexturePair {}
+
+impl IoSurfaceTexturePair {
+    fn new(metal_device: &metal::DeviceRef, width: u32, height: u32) -> Option<Self> {
+        let io_surface = crate::metal_backend::create_io_surface(width, height)?;
+        let metal_texture = crate::metal_backend::create_texture_from_io_surface(
+            metal_device,
+            io_surface,
+            metal::MTLPixelFormat::BGRA8Unorm,
+            width as u64,
+            height as u64,
+        );
+        Some(Self {
+            io_surface,
+            metal_texture,
+            width,
+            height,
+        })
+    }
+}
+
+impl Drop for IoSurfaceTexturePair {
+    fn drop(&mut self) {
+        if !self.io_surface.is_null() {
+            unsafe {
+                // CFRelease the IOSurfaceRef
+                let sel = objc::sel!(release);
+                let obj: *mut objc::runtime::Object = self.io_surface as *mut _;
+                let _: () = objc::msg_send![obj, performSelector: sel];
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Objective-C runtime helper types (no `foundation` feature in objc 0.2.7)
+// --------------------------------------------------------------------------- (no `foundation` feature in objc 0.2.7)
 // ---------------------------------------------------------------------------
 
 /// Objective-C NSPoint (CGPoint) struct
@@ -311,6 +363,8 @@ pub struct CefBridge {
     webview_manager: Option<WKWebViewManager>,
     /// Whether the NSApplication has been set up for headless rendering
     nsapp_initialized: bool,
+    /// G9: IOSurface-backed Metal texture cache keyed by browser_id.
+    io_surface_cache: BTreeMap<u32, IoSurfaceTexturePair>,
 }
 
 impl std::fmt::Debug for CefBridge {
@@ -346,6 +400,7 @@ impl Default for CefBridge {
             paint_callback: None,
             webview_manager: None,
             nsapp_initialized: false,
+            io_surface_cache: BTreeMap::new(),
         }
     }
 }
@@ -824,8 +879,75 @@ impl WKWebViewManager {
         Ok(())
     }
 
-    /// Execute JavaScript in a WKWebView. Returns the result as a string
-    /// if a completion handler result is available.
+    /// G9: Return the `IOSurfaceRef` backing a WKWebView's compositing layer,
+    /// if one exists.
+    ///
+    /// WKWebView renders through a `CALayer` tree. When its content is
+    /// hardware-composited, `layer.contents` is an `IOSurface` that can be
+    /// handed straight to Metal for zero-copy sampling. This method walks
+    /// `WKWebView -> layer -> contents` and verifies the object is an
+    /// `IOSurface` (it responds to `surfaceID`) before returning it.
+    ///
+    /// Returns a null pointer (not an error) when the view exists but has no
+    /// IOSurface-backed layer — the common case for snapshot-based offscreen
+    /// rendering — so callers fall back to a managed surface plus CPU upload.
+    /// The returned pointer is borrowed (not retained); callers must not
+    /// release it.
+    pub fn get_io_surface_for_browser(
+        &self,
+        handle: WKWebViewHandle,
+    ) -> AppResult<*mut std::ffi::c_void> {
+        let instance = self.views.get(&handle).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcNotFound,
+                format!("get_io_surface_for_browser: WKWebView {handle:?} not found"),
+            )
+        })?;
+
+        if instance.native_ptr.is_null() {
+            return Ok(std::ptr::null_mut());
+        }
+
+        #[cfg(feature = "metal")]
+        unsafe {
+            let view: *mut objc::runtime::Object = instance.native_ptr as *mut _;
+            let layer: *mut objc::runtime::Object = msg_send![view, layer];
+            if layer.is_null() {
+                eprintln!(
+                    "[CefBridge] get_io_surface_for_browser: WKWebView {handle:?} has no backing CALayer"
+                );
+                return Ok(std::ptr::null_mut());
+            }
+            let contents: *mut objc::runtime::Object = msg_send![layer, contents];
+            if contents.is_null() {
+                eprintln!(
+                    "[CefBridge] get_io_surface_for_browser: layer contents is null for WKWebView {handle:?}"
+                );
+                return Ok(std::ptr::null_mut());
+            }
+            // Only an IOSurface responds to `surfaceID`; any other layer
+            // contents (e.g. a CGImage) must not be passed to Metal's
+            // iosurface texture constructor.
+            let responds: bool =
+                msg_send![contents, respondsToSelector: objc::sel!(surfaceID)];
+            if responds {
+                Ok(contents as *mut std::ffi::c_void)
+            } else {
+                eprintln!(
+                    "[CefBridge] get_io_surface_for_browser: layer contents is not an IOSurface \
+                     (e.g. CGImage or other) for WKWebView {handle:?} — falling back to CPU upload"
+                );
+                Ok(std::ptr::null_mut())
+            }
+        }
+
+        #[cfg(not(feature = "metal"))]
+        {
+            Ok(std::ptr::null_mut())
+        }
+    }
+
+
     pub fn evaluate_java_script(
         &mut self,
         handle: WKWebViewHandle,
@@ -2209,6 +2331,146 @@ impl CefBridge {
         Ok(texture)
     }
 
+    // -----------------------------------------------------------------------
+    /// G9: Render a browser frame into an IOSurface-backed Metal texture.
+    ///
+    /// Unlike `render_to_metal_texture`, which copies pixels from a CPU-side
+    /// `RenderedFrame` into a Metal texture, this method directly serves the
+    /// WKWebView's IOSurface backing store to Metal, achieving zero-copy frame
+    /// delivery. The IOSurface is cached per browser to avoid reallocation on
+    /// every frame. Only works for WKWebView-backed browsers.
+    ///
+    /// Returns the Metal texture wrapping the IOSurface, or falls back to
+    /// `render_to_metal_texture` if no IOSurface is available.
+    // -----------------------------------------------------------------------
+    #[cfg(feature = "metal")]
+    pub fn render_to_io_surface_texture(
+        &mut self,
+        browser_handle: CefHandle,
+        metal_device: &crate::metal_backend::MetalDevice,
+    ) -> AppResult<metal::Texture> {
+        let browser = self.browsers.get(&browser_handle).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcNotFound,
+                format!("render_to_io_surface_texture: browser {browser_handle:#x} not found"),
+            )
+        })?;
+        let browser_id = browser.id;
+        let wk_handle = browser.wk_handle;
+
+        // Fast path: if the WKWebView's compositing layer is already
+        // IOSurface-backed, wrap that surface directly — true zero-copy with
+        // no pixel upload at all.
+        if let (Some(mgr), Some(handle)) = (&self.webview_manager, wk_handle) {
+            if let Ok(native_surface) = mgr.get_io_surface_for_browser(handle) {
+                if !native_surface.is_null() {
+                    let (fw, fh, fnum) = {
+                        let frame = self.get_rendered_frame(browser_id).ok_or_else(|| {
+                            AppError::new(
+                                ReasonCode::RcNotFound,
+                                format!(
+                                    "render_to_io_surface_texture: no frame for browser {browser_id}"
+                                ),
+                            )
+                        })?;
+                        (frame.width, frame.height, frame.frame_number)
+                    };
+                    if let Some(texture) = crate::metal_backend::create_texture_from_io_surface(
+                        metal_device.device(),
+                        native_surface,
+                        metal::MTLPixelFormat::BGRA8Unorm,
+                        fw as u64,
+                        fh as u64,
+                    ) {
+                        if let Some(b) = self.browsers.get_mut(&browser_handle) {
+                            b.metal_texture_id = Some(fnum);
+                        }
+                        eprintln!(
+                            "[CefBridge] render_to_io_surface_texture: zero-copy native \
+                             IOSurface path for browser {browser_handle:#x} ({fw}x{fh})"
+                        );
+                        return Ok(texture);
+                    }
+                }
+            }
+        }
+
+        eprintln!(
+            "[CefBridge] render_to_io_surface_texture: managed IOSurface with CPU upload \
+             for browser {browser_handle:#x}"
+        );
+        // Managed path: maintain a per-browser IOSurface + Metal texture pair
+        // and upload the latest rendered frame into the surface's backing
+        // store. The Metal texture aliases that storage, so GPU sampling is
+        // zero-copy even though WKWebView snapshots are produced on the CPU.
+        let (width, height, frame_number) = {
+            let frame = self.get_rendered_frame(browser_id).ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcNotFound,
+                    format!("render_to_io_surface_texture: no frame for browser {browser_id}"),
+                )
+            })?;
+            (frame.width, frame.height, frame.frame_number)
+        };
+
+        let needs_alloc = self
+            .io_surface_cache
+            .get(&browser_id)
+            .map(|p| (p.width, p.height) != (width, height))
+            .unwrap_or(true);
+        if needs_alloc {
+            let pair = IoSurfaceTexturePair::new(metal_device.device(), width, height)
+                .ok_or_else(|| {
+                    AppError::new(
+                        ReasonCode::RcInvalidState,
+                        format!(
+                            "render_to_io_surface_texture: IOSurface allocation failed for {width}x{height}"
+                        ),
+                    )
+                })?;
+            self.io_surface_cache.insert(browser_id, pair);
+        }
+
+        // Upload the RGBA snapshot into the BGRA IOSurface backing store. The
+        // surface pointer and a copy of the texture are taken under separate
+        // scopes so the frame borrow does not overlap the upload.
+        let io_surface_ptr = self
+            .io_surface_cache
+            .get(&browser_id)
+            .map(|p| p.io_surface)
+            .expect("IOSurface pair present after allocation");
+        {
+            let frame = self.get_rendered_frame(browser_id).ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcNotFound,
+                    format!("render_to_io_surface_texture: no frame for browser {browser_id}"),
+                )
+            })?;
+            crate::metal_backend::upload_rgba_frame_to_io_surface(
+                io_surface_ptr,
+                &frame.pixels,
+                width,
+                height,
+            )?;
+        }
+
+        let texture = self
+            .io_surface_cache
+            .get(&browser_id)
+            .and_then(|p| p.metal_texture.clone())
+            .ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcInvalidState,
+                    "render_to_io_surface_texture: no Metal texture for IOSurface".to_string(),
+                )
+            })?;
+
+        if let Some(b) = self.browsers.get_mut(&browser_handle) {
+            b.metal_texture_id = Some(frame_number);
+        }
+        Ok(texture)
+    }
+
     /// Non-metal fallback: returns an error if the `metal` feature is not enabled.
     #[cfg(not(feature = "metal"))]
     pub fn render_to_metal_texture(
@@ -2238,11 +2500,22 @@ impl CefBridge {
     pub fn submit_latest_frame_to_compositor(&mut self, browser_handle: CefHandle) {
         let browser_id = match self.browsers.get(&browser_handle) {
             Some(b) => b.id,
-            None => return,
+            None => {
+                eprintln!(
+                    "[CefBridge] submit_latest_frame_to_compositor: browser {browser_handle:#x} not found"
+                );
+                return;
+            }
         };
         let frame = match self.get_rendered_frame(browser_id) {
             Some(f) => f.clone(),
-            None => return,
+            None => {
+                eprintln!(
+                    "[CefBridge] submit_latest_frame_to_compositor: no rendered frame for browser \
+                     {browser_handle:#x} (browser_id={browser_id})"
+                );
+                return;
+            }
         };
         crate::metal_renderer::submit_cef_overlay_frame(
             frame.width,

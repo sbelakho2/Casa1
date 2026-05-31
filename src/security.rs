@@ -2937,6 +2937,456 @@ pub fn register_drm_dll() -> Vec<(&'static str, u64)> {
 }
 
 // ===========================================================================
+// 7. Authenticode signature verification (WinVerifyTrust backing)
+// ===========================================================================
+
+/// Outcome of verifying a PE image's embedded Authenticode signature.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthenticodeVerdict {
+    /// The PE carries an embedded PKCS#7 signature whose signer certificate
+    /// cryptographically signs the file's Authenticode hash.
+    ///
+    /// Scope note: this proves *integrity* (the file matches what the embedded
+    /// signer signed) and *signer binding* (the signature verifies against the
+    /// public key in the embedded signer certificate). It deliberately does
+    /// **not** validate the signer certificate chain up to a trusted Windows
+    /// root authority, because the emulator does not ship the Windows root
+    /// certificate store. Callers that need full trust-chain validation must
+    /// supply their own root store.
+    Valid,
+    /// The PE has no attribute certificate table (it is unsigned). This maps to
+    /// the Win32 `TRUST_E_NOSIGNATURE` status.
+    NoSignature,
+    /// A signature is present but failed verification: tampered file, malformed
+    /// structure, unsupported algorithm, or signature mismatch. This maps to the
+    /// Win32 `TRUST_E_BAD_DIGEST` / `TRUST_E_NOSIGNATURE` failure family.
+    Invalid(String),
+}
+
+const WIN_CERT_TYPE_PKCS_SIGNED_DATA: u16 = 0x0002;
+const IMAGE_DIRECTORY_ENTRY_SECURITY: usize = 4;
+/// OID 1.2.840.113549.1.7.2 — PKCS#7 signedData.
+const OID_SIGNED_DATA: &str = "1.2.840.113549.1.7.2";
+/// OID 1.3.6.1.4.1.311.2.1.4 — SPC_INDIRECT_DATA_OBJID (Authenticode content).
+const OID_SPC_INDIRECT_DATA: &str = "1.3.6.1.4.1.311.2.1.4";
+/// OID 1.2.840.113549.1.9.4 — PKCS#9 messageDigest signed attribute.
+const OID_MESSAGE_DIGEST: &str = "1.2.840.113549.1.9.4";
+/// OID 2.16.840.1.101.3.4.2.1 — SHA-256.
+const OID_SHA256: &str = "2.16.840.1.101.3.4.2.1";
+/// OID 1.3.14.3.2.26 — SHA-1.
+const OID_SHA1: &str = "1.3.14.3.2.26";
+
+fn read_u16_le(d: &[u8], off: usize) -> Option<u16> {
+    d.get(off..off + 2).map(|b| u16::from_le_bytes([b[0], b[1]]))
+}
+
+fn read_u32_le(d: &[u8], off: usize) -> Option<u32> {
+    d.get(off..off + 4)
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+/// Locate the attribute certificate table (PE security data directory entry).
+///
+/// Returns:
+/// - `Ok(Some((file_offset, size)))` when a non-empty certificate table exists;
+/// - `Ok(None)` when the file is a well-formed PE with no signature;
+/// - `Err(_)` when the PE headers are malformed.
+fn locate_certificate_table(pe: &[u8]) -> Result<Option<(usize, usize)>, String> {
+    let e_lfanew = read_u32_le(pe, 0x3C).ok_or("missing e_lfanew")? as usize;
+    if pe.get(e_lfanew..e_lfanew + 4) != Some(b"PE\0\0") {
+        return Err("missing PE signature".into());
+    }
+    let coff = e_lfanew + 4;
+    let size_of_optional = read_u16_le(pe, coff + 16).ok_or("truncated COFF header")? as usize;
+    let opt = coff + 20;
+    let magic = read_u16_le(pe, opt).ok_or("truncated optional header")?;
+    let dd_offset = match magic {
+        0x10b => opt + 96,  // PE32
+        0x20b => opt + 112, // PE32+
+        _ => return Err(format!("unknown optional header magic {magic:#06x}")),
+    };
+    let sec_entry = dd_offset + IMAGE_DIRECTORY_ENTRY_SECURITY * 8;
+    if sec_entry + 8 > opt + size_of_optional {
+        // No security directory entry present in the optional header.
+        return Ok(None);
+    }
+    let va = read_u32_le(pe, sec_entry).ok_or("truncated security dir entry")? as usize;
+    let size = read_u32_le(pe, sec_entry + 4).ok_or("truncated security dir entry")? as usize;
+    if va == 0 || size == 0 {
+        return Ok(None);
+    }
+    if va + size > pe.len() {
+        return Err("certificate table extends past end of file".into());
+    }
+    Ok(Some((va, size)))
+}
+
+/// Compute the Authenticode digest of `pe` using the named hash OID.
+///
+/// Per the Authenticode specification the hash covers the whole image except
+/// the optional-header checksum field, the security data directory entry, and
+/// the attribute certificate table itself.
+fn compute_authenticode_hash(pe: &[u8], hash_oid: &str) -> Option<Vec<u8>> {
+    let e_lfanew = read_u32_le(pe, 0x3C)? as usize;
+    let coff = e_lfanew + 4;
+    let opt = coff + 20;
+    let magic = read_u16_le(pe, opt)?;
+    let dd_offset = match magic {
+        0x10b => opt + 96,
+        0x20b => opt + 112,
+        _ => return None,
+    };
+    let checksum_off = opt + 64;
+    let sec_entry = dd_offset + IMAGE_DIRECTORY_ENTRY_SECURITY * 8;
+    let cert_va = read_u32_le(pe, sec_entry)? as usize;
+    let cert_size = read_u32_le(pe, sec_entry + 4)? as usize;
+    let cert_end = cert_va.checked_add(cert_size)?;
+
+    // Hashable byte ranges, in order, skipping the excluded fields.
+    let segments = [
+        (0usize, checksum_off),
+        (checksum_off + 4, sec_entry),
+        (sec_entry + 8, cert_va),
+        (cert_end, pe.len()),
+    ];
+
+    fn hash_segments<H: Digest>(pe: &[u8], segments: &[(usize, usize)]) -> Vec<u8> {
+        let mut hasher = H::new();
+        for &(start, end) in segments {
+            if end > start && end <= pe.len() {
+                hasher.update(&pe[start..end]);
+            }
+        }
+        hasher.finalize().to_vec()
+    }
+
+    match hash_oid {
+        OID_SHA256 => Some(hash_segments::<Sha256>(pe, &segments)),
+        OID_SHA1 => Some(hash_segments::<sha1::Sha1>(pe, &segments)),
+        _ => None,
+    }
+}
+
+/// Decode a DER object-identifier value (content octets) to dotted-decimal form.
+fn decode_oid(bytes: &[u8]) -> Option<String> {
+    let first = *bytes.first()? as u32;
+    let mut out = format!("{}.{}", first / 40, first % 40);
+    let mut value: u64 = 0;
+    let mut pending = false;
+    for &b in &bytes[1..] {
+        value = (value << 7) | (b & 0x7f) as u64;
+        pending = true;
+        if b & 0x80 == 0 {
+            out.push_str(&format!(".{value}"));
+            value = 0;
+            pending = false;
+        }
+    }
+    if pending {
+        return None; // truncated multi-byte arc
+    }
+    Some(out)
+}
+
+/// Minimal DER TLV reader. On success advances `off` past the element and
+/// returns `(tag, content_start, content_len)`.
+fn der_read_tlv(d: &[u8], off: &mut usize) -> Option<(u8, usize, usize)> {
+    let tag = *d.get(*off)?;
+    let mut p = *off + 1;
+    let b0 = *d.get(p)?;
+    p += 1;
+    let len = if b0 & 0x80 == 0 {
+        b0 as usize
+    } else {
+        let n = (b0 & 0x7f) as usize;
+        if n == 0 || n > 4 {
+            return None;
+        }
+        let mut l = 0usize;
+        for _ in 0..n {
+            l = (l << 8) | (*d.get(p)? as usize);
+            p += 1;
+        }
+        l
+    };
+    let content_start = p;
+    let content_end = content_start.checked_add(len)?;
+    if content_end > d.len() {
+        return None;
+    }
+    *off = content_end;
+    Some((tag, content_start, len))
+}
+
+/// Parse an Authenticode `SpcIndirectDataContent` (the eContent of the signed
+/// data) and return `(pe_hash_oid, pe_hash_digest)`.
+///
+/// ```text
+/// SpcIndirectDataContent ::= SEQUENCE {
+///     data          SpcAttributeTypeAndOptionalValue,
+///     messageDigest DigestInfo }
+/// DigestInfo ::= SEQUENCE {
+///     digestAlgorithm AlgorithmIdentifier,
+///     digest          OCTET STRING }
+/// ```
+fn parse_spc_indirect_data(econtent_full: &[u8]) -> Option<(String, Vec<u8>)> {
+    let mut off = 0;
+    let (tag, seq_start, seq_len) = der_read_tlv(econtent_full, &mut off)?;
+    if tag != 0x30 {
+        return None;
+    }
+    let mut inner = seq_start;
+    let seq_end = seq_start + seq_len;
+    // Skip `data` (SpcAttributeTypeAndOptionalValue).
+    der_read_tlv(econtent_full, &mut inner)?;
+    if inner >= seq_end {
+        return None;
+    }
+    // messageDigest = DigestInfo SEQUENCE.
+    let (di_tag, di_start, _di_len) = der_read_tlv(econtent_full, &mut inner)?;
+    if di_tag != 0x30 {
+        return None;
+    }
+    let mut di = di_start;
+    // AlgorithmIdentifier SEQUENCE.
+    let (alg_tag, alg_start, _alg_len) = der_read_tlv(econtent_full, &mut di)?;
+    if alg_tag != 0x30 {
+        return None;
+    }
+    let mut alg = alg_start;
+    let (oid_tag, oid_start, oid_len) = der_read_tlv(econtent_full, &mut alg)?;
+    if oid_tag != 0x06 {
+        return None;
+    }
+    let oid = decode_oid(&econtent_full[oid_start..oid_start + oid_len])?;
+    // digest OCTET STRING.
+    let (dg_tag, dg_start, dg_len) = der_read_tlv(econtent_full, &mut di)?;
+    if dg_tag != 0x04 {
+        return None;
+    }
+    Some((oid, econtent_full[dg_start..dg_start + dg_len].to_vec()))
+}
+
+/// Compute a digest of `data` using a hash named by OID.
+fn digest_with_oid(hash_oid: &str, data: &[u8]) -> Option<Vec<u8>> {
+    match hash_oid {
+        OID_SHA256 => Some(Sha256::digest(data).to_vec()),
+        OID_SHA1 => Some(<sha1::Sha1 as Digest>::digest(data).to_vec()),
+        _ => None,
+    }
+}
+
+/// Verify the embedded Authenticode signature on a PE image.
+///
+/// See [`AuthenticodeVerdict`] for the precise meaning and scope of each result.
+pub fn verify_pe_authenticode(pe_data: &[u8]) -> AuthenticodeVerdict {
+    use cms::cert::CertificateChoices;
+    use cms::content_info::ContentInfo;
+    use cms::signed_data::{SignedData, SignerIdentifier};
+    use der::asn1::OctetString;
+    use der::{Decode, Encode};
+    use rsa::pkcs1v15::{Signature as RsaSignature, VerifyingKey};
+    use rsa::pkcs8::DecodePublicKey;
+    use rsa::signature::Verifier;
+    use rsa::RsaPublicKey;
+
+    let (cert_va, cert_size) = match locate_certificate_table(pe_data) {
+        Ok(Some(table)) => table,
+        Ok(None) => return AuthenticodeVerdict::NoSignature,
+        Err(e) => return AuthenticodeVerdict::Invalid(e),
+    };
+
+    // Parse the WIN_CERTIFICATE wrapper.
+    let win_cert = &pe_data[cert_va..cert_va + cert_size];
+    let dw_length = match read_u32_le(win_cert, 0) {
+        Some(v) => v as usize,
+        None => return AuthenticodeVerdict::Invalid("truncated WIN_CERTIFICATE".into()),
+    };
+    let cert_type = match read_u16_le(win_cert, 6) {
+        Some(v) => v,
+        None => return AuthenticodeVerdict::Invalid("truncated WIN_CERTIFICATE".into()),
+    };
+    if cert_type != WIN_CERT_TYPE_PKCS_SIGNED_DATA {
+        return AuthenticodeVerdict::Invalid(format!(
+            "unsupported certificate type {cert_type:#06x}"
+        ));
+    }
+    if dw_length < 8 || dw_length > win_cert.len() {
+        return AuthenticodeVerdict::Invalid("invalid WIN_CERTIFICATE length".into());
+    }
+    let pkcs7 = &win_cert[8..dw_length];
+
+    // Decode the PKCS#7 SignedData.
+    let content_info = match ContentInfo::from_der(pkcs7) {
+        Ok(ci) => ci,
+        Err(e) => return AuthenticodeVerdict::Invalid(format!("malformed PKCS#7: {e}")),
+    };
+    if content_info.content_type.to_string() != OID_SIGNED_DATA {
+        return AuthenticodeVerdict::Invalid("PKCS#7 is not signedData".into());
+    }
+    let signed_data: SignedData = match content_info.content.decode_as() {
+        Ok(sd) => sd,
+        Err(e) => return AuthenticodeVerdict::Invalid(format!("malformed SignedData: {e}")),
+    };
+
+    // The encapsulated content must be Authenticode SpcIndirectData.
+    if signed_data.encap_content_info.econtent_type.to_string() != OID_SPC_INDIRECT_DATA {
+        return AuthenticodeVerdict::Invalid("eContent is not SpcIndirectData".into());
+    }
+    let econtent = match signed_data.encap_content_info.econtent.as_ref() {
+        Some(c) => c,
+        None => return AuthenticodeVerdict::Invalid("missing eContent".into()),
+    };
+    let econtent_full = match econtent.to_der() {
+        Ok(d) => d,
+        Err(e) => return AuthenticodeVerdict::Invalid(format!("eContent re-encode failed: {e}")),
+    };
+    // The value octets of SpcIndirectDataContent (tag/length stripped) are what
+    // the messageDigest signed attribute is computed over.
+    let econtent_value = {
+        let mut off = 0;
+        match der_read_tlv(&econtent_full, &mut off) {
+            Some((0x30, start, len)) => econtent_full[start..start + len].to_vec(),
+            _ => return AuthenticodeVerdict::Invalid("eContent is not a SEQUENCE".into()),
+        }
+    };
+
+    // Extract the PE hash claimed by the signature and verify it against the file.
+    let (pe_hash_oid, claimed_pe_hash) = match parse_spc_indirect_data(&econtent_full) {
+        Some(v) => v,
+        None => return AuthenticodeVerdict::Invalid("malformed SpcIndirectData".into()),
+    };
+    let computed_pe_hash = match compute_authenticode_hash(pe_data, &pe_hash_oid) {
+        Some(h) => h,
+        None => {
+            return AuthenticodeVerdict::Invalid(format!(
+                "unsupported PE hash algorithm {pe_hash_oid}"
+            ))
+        }
+    };
+    if computed_pe_hash != claimed_pe_hash {
+        return AuthenticodeVerdict::Invalid("PE hash does not match signature".into());
+    }
+
+    // Verify the signer's signature over the signed attributes (or eContent).
+    let signer = match signed_data.signer_infos.0.iter().next() {
+        Some(s) => s,
+        None => return AuthenticodeVerdict::Invalid("no SignerInfo".into()),
+    };
+    let digest_oid = signer.digest_alg.oid.to_string();
+
+    // Locate the signer's certificate by issuer + serial number.
+    let signer_cert = {
+        let ias = match &signer.sid {
+            SignerIdentifier::IssuerAndSerialNumber(ias) => ias,
+            SignerIdentifier::SubjectKeyIdentifier(_) => {
+                return AuthenticodeVerdict::Invalid(
+                    "subjectKeyIdentifier signer id is unsupported".into(),
+                )
+            }
+        };
+        let certs = match signed_data.certificates.as_ref() {
+            Some(c) => c,
+            None => return AuthenticodeVerdict::Invalid("no certificates in signature".into()),
+        };
+        let mut found = None;
+        for choice in certs.0.iter() {
+            if let CertificateChoices::Certificate(cert) = choice {
+                if cert.tbs_certificate.issuer == ias.issuer
+                    && cert.tbs_certificate.serial_number == ias.serial_number
+                {
+                    found = Some(cert.clone());
+                    break;
+                }
+            }
+        }
+        match found {
+            Some(c) => c,
+            None => return AuthenticodeVerdict::Invalid("signer certificate not found".into()),
+        }
+    };
+
+    // Extract the signer's RSA public key.
+    let spki_der = match signer_cert.tbs_certificate.subject_public_key_info.to_der() {
+        Ok(d) => d,
+        Err(e) => return AuthenticodeVerdict::Invalid(format!("bad SubjectPublicKeyInfo: {e}")),
+    };
+    let public_key = match RsaPublicKey::from_public_key_der(&spki_der) {
+        Ok(k) => k,
+        Err(_) => {
+            return AuthenticodeVerdict::Invalid(
+                "signer key is not RSA or could not be parsed".into(),
+            )
+        }
+    };
+
+    // Determine the message that was actually signed.
+    let message = match signer.signed_attrs.as_ref() {
+        Some(attrs) => {
+            // The messageDigest signed attribute must equal the hash of eContent.
+            let mut message_digest: Option<Vec<u8>> = None;
+            for attr in attrs.iter() {
+                if attr.oid.to_string() == OID_MESSAGE_DIGEST {
+                    if let Some(value) = attr.values.iter().next() {
+                        if let Ok(octets) = value.decode_as::<OctetString>() {
+                            message_digest = Some(octets.as_bytes().to_vec());
+                        }
+                    }
+                }
+            }
+            let message_digest = match message_digest {
+                Some(d) => d,
+                None => {
+                    return AuthenticodeVerdict::Invalid(
+                        "missing messageDigest signed attribute".into(),
+                    )
+                }
+            };
+            let expected = match digest_with_oid(&digest_oid, &econtent_value) {
+                Some(d) => d,
+                None => {
+                    return AuthenticodeVerdict::Invalid(format!(
+                        "unsupported signed-attribute digest {digest_oid}"
+                    ))
+                }
+            };
+            if message_digest != expected {
+                return AuthenticodeVerdict::Invalid(
+                    "messageDigest attribute does not match eContent".into(),
+                );
+            }
+            // The signature is over the DER SET encoding of the signed attributes.
+            match attrs.to_der() {
+                Ok(d) => d,
+                Err(e) => {
+                    return AuthenticodeVerdict::Invalid(format!(
+                        "signed attributes re-encode failed: {e}"
+                    ))
+                }
+            }
+        }
+        None => econtent_value,
+    };
+
+    // Verify the RSA PKCS#1 v1.5 signature over `message`.
+    let signature = match RsaSignature::try_from(signer.signature.as_bytes()) {
+        Ok(s) => s,
+        Err(_) => return AuthenticodeVerdict::Invalid("malformed signature value".into()),
+    };
+    let verify_result = match digest_oid.as_str() {
+        OID_SHA256 => VerifyingKey::<Sha256>::new(public_key).verify(&message, &signature),
+        OID_SHA1 => VerifyingKey::<sha1::Sha1>::new(public_key).verify(&message, &signature),
+        other => {
+            return AuthenticodeVerdict::Invalid(format!("unsupported signature digest {other}"))
+        }
+    };
+    match verify_result {
+        Ok(()) => AuthenticodeVerdict::Valid,
+        Err(_) => AuthenticodeVerdict::Invalid("signature verification failed".into()),
+    }
+}
+
+// ===========================================================================
 // Tests
 // ===========================================================================
 

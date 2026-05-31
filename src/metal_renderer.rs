@@ -10,7 +10,10 @@
 use crate::error::{AppError, AppResult};
 use crate::reason::ReasonCode;
 use crate::gfx::DxgiFormat;
-use crate::metal_backend::{MetalDevice, MetalSwapchain, dxgi_to_metal_format};
+use crate::metal_backend::{
+    async_pipeline_compiler::{AsyncPipelineCompiler, PipelineState},
+    MetalDevice, MetalSwapchain, dxgi_to_metal_format,
+};
 use std::collections::BTreeMap;
 
 // ---------------------------------------------------------------------------
@@ -263,6 +266,10 @@ pub struct MetalRenderContext {
     cef_overlay_pipeline: Option<metal::RenderPipelineState>,
     cef_texture_width: u32,
     cef_texture_height: u32,
+    // Async pipeline compiler for non-blocking PSO creation
+    pipeline_compiler: Option<AsyncPipelineCompiler>,
+    /// Request ID for the CEF overlay pipeline submission (0 = none / not yet submitted).
+    cef_pipeline_request_id: u64,
 }
 
 impl MetalRenderContext {
@@ -270,6 +277,9 @@ impl MetalRenderContext {
     pub fn new() -> AppResult<Self> {
         let device = MetalDevice::system_default()?;
         let command_queue = device.create_command_queue().to_owned();
+
+        // Create the async pipeline compiler (optional — falls back to sync).
+        let pipeline_compiler = Some(AsyncPipelineCompiler::new(device.device()));
 
         Ok(Self {
             device,
@@ -281,6 +291,8 @@ impl MetalRenderContext {
             cef_overlay_pipeline: None,
             cef_texture_width: 0,
             cef_texture_height: 0,
+            pipeline_compiler,
+            cef_pipeline_request_id: 0,
         })
     }
 
@@ -398,6 +410,28 @@ impl MetalRenderContext {
 
         let (width, height) = (frame.width, frame.height);
 
+        // Zero-copy path: if the frame carries an IOSurface, alias its storage
+        // directly into a Metal texture instead of doing a CPU pixel upload.
+        if let Some(io_surface) = frame.io_surface {
+            if let Some(texture) = crate::metal_backend::create_texture_from_io_surface(
+                self.device.device(),
+                io_surface,
+                metal::MTLPixelFormat::BGRA8Unorm,
+                width as u64,
+                height as u64,
+            ) {
+                self.cef_overlay_texture = Some(texture);
+                self.cef_texture_width = width;
+                self.cef_texture_height = height;
+                return Ok(());
+            }
+            // If IOSurface aliasing failed and no CPU pixels are available,
+            // there is nothing further to upload this frame.
+            if frame.pixels.is_empty() {
+                return Ok(());
+            }
+        }
+
         // Re-allocate texture if dimensions changed
         if self.cef_texture_width != width || self.cef_texture_height != height || self.cef_overlay_texture.is_none() {
             let descriptor = metal::TextureDescriptor::new();
@@ -440,32 +474,83 @@ impl MetalRenderContext {
     }
 
     /// Ensure the CEF overlay compositing pipeline is created (lazily).
+    ///
+    /// Uses the async pipeline compiler when available so that compilation
+    /// happens off the render thread.  If the compiler is not ready yet or
+    /// if async compilation fails, falls back to synchronous creation.
     fn ensure_cef_overlay_pipeline(&mut self) -> AppResult<()> {
+        // Always poll the async compiler first to drain any completed results,
+        // even if we already have a pipeline (avoids leaking PipelineReady entries).
+        if let Some(ref mut compiler) = self.pipeline_compiler {
+            if self.cef_pipeline_request_id != 0 {
+                for ready in compiler.poll() {
+                    if ready.id == self.cef_pipeline_request_id {
+                        if let PipelineState::Render(ps) = ready.state {
+                            self.cef_overlay_pipeline = Some(ps);
+                            self.cef_pipeline_request_id = 0;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Already have the pipeline?
         if self.cef_overlay_pipeline.is_some() {
             return Ok(());
         }
 
-        let library = self.device.compile_shader_library(CEF_OVERLAY_SHADER_SOURCE)?;
+        if let Some(ref mut compiler) = self.pipeline_compiler {
+            // A request is still in-flight — try again next frame.
+            if self.cef_pipeline_request_id != 0 {
+                return Ok(());
+            }
 
+            // Compile the shader library and extract functions.
+            let library = self.device.compile_shader_library(CEF_OVERLAY_SHADER_SOURCE)?;
+            let vertex_fn = library.get_function("cef_overlay_vertex", None)
+                .map_err(|_| AppError::new(ReasonCode::RcIo, "failed to find cef_overlay_vertex in MSL library"))?;
+            let fragment_fn = library.get_function("cef_overlay_fragment", None)
+                .map_err(|_| AppError::new(ReasonCode::RcIo, "failed to find cef_overlay_fragment in MSL library"))?;
+
+            let pipeline_desc = build_cef_pipeline_descriptor(&vertex_fn, &fragment_fn);
+
+            // Cache hit?
+            if let Some(cached) = compiler.get_cached_render_pipeline(&pipeline_desc) {
+                self.cef_overlay_pipeline = Some(cached);
+                return Ok(());
+            }
+
+            // Submit async compilation.
+            let id = compiler.submit_render(&pipeline_desc);
+            self.cef_pipeline_request_id = id;
+
+            // Also pre-warm with a synchronous fallback so the very first
+            // frame has something to draw (this only happens once).
+            match self
+                .device
+                .device()
+                .new_render_pipeline_state(&pipeline_desc)
+            {
+                Ok(ps) => {
+                    compiler.cache_render_pipeline(&pipeline_desc, &ps);
+                    self.cef_overlay_pipeline = Some(ps);
+                }
+                Err(e) => {
+                    eprintln!("sync fallback for CEF overlay pipeline failed: {e:?}");
+                }
+            }
+            return Ok(());
+        }
+
+        // No async compiler — original synchronous path.
+        let library = self.device.compile_shader_library(CEF_OVERLAY_SHADER_SOURCE)?;
         let vertex_fn = library.get_function("cef_overlay_vertex", None)
             .map_err(|_| AppError::new(ReasonCode::RcIo, "failed to find cef_overlay_vertex in MSL library"))?;
         let fragment_fn = library.get_function("cef_overlay_fragment", None)
             .map_err(|_| AppError::new(ReasonCode::RcIo, "failed to find cef_overlay_fragment in MSL library"))?;
 
-        let pipeline_desc = metal::RenderPipelineDescriptor::new();
-        pipeline_desc.set_vertex_function(Some(&vertex_fn));
-        pipeline_desc.set_fragment_function(Some(&fragment_fn));
-
-        let color_attachment = pipeline_desc.color_attachments().object_at(0).unwrap();
-        color_attachment.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
-        // Enable alpha blending: src_alpha * src + (1 - src_alpha) * dst
-        color_attachment.set_blending_enabled(true);
-        color_attachment.set_rgb_blend_operation(metal::MTLBlendOperation::Add);
-        color_attachment.set_alpha_blend_operation(metal::MTLBlendOperation::Add);
-        color_attachment.set_source_rgb_blend_factor(metal::MTLBlendFactor::SourceAlpha);
-        color_attachment.set_source_alpha_blend_factor(metal::MTLBlendFactor::SourceAlpha);
-        color_attachment.set_destination_rgb_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
-        color_attachment.set_destination_alpha_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
+        let pipeline_desc = build_cef_pipeline_descriptor(&vertex_fn, &fragment_fn);
 
         let pipeline = self
             .device
@@ -539,6 +624,31 @@ impl MetalRenderContext {
         self.cef_texture_width = 0;
         self.cef_texture_height = 0;
     }
+}
+
+/// Build a `RenderPipelineDescriptor` for the CEF overlay compositing pass.
+///
+/// Shared between the async and sync compilation paths.
+fn build_cef_pipeline_descriptor(
+    vertex_fn: &metal::FunctionRef,
+    fragment_fn: &metal::FunctionRef,
+) -> metal::RenderPipelineDescriptor {
+    let pipeline_desc = metal::RenderPipelineDescriptor::new();
+    pipeline_desc.set_vertex_function(Some(vertex_fn));
+    pipeline_desc.set_fragment_function(Some(fragment_fn));
+
+    let color_attachment = pipeline_desc.color_attachments().object_at(0).unwrap();
+    color_attachment.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
+    // Enable alpha blending: src_alpha * src + (1 - src_alpha) * dst
+    color_attachment.set_blending_enabled(true);
+    color_attachment.set_rgb_blend_operation(metal::MTLBlendOperation::Add);
+    color_attachment.set_alpha_blend_operation(metal::MTLBlendOperation::Add);
+    color_attachment.set_source_rgb_blend_factor(metal::MTLBlendFactor::SourceAlpha);
+    color_attachment.set_source_alpha_blend_factor(metal::MTLBlendFactor::SourceAlpha);
+    color_attachment.set_destination_rgb_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
+    color_attachment.set_destination_alpha_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
+
+    pipeline_desc
 }
 
 /// Inline Metal Shading Language source for the CEF overlay compositing pass.
@@ -662,10 +772,14 @@ impl CefMetalCompositor {
     /// Returns `None` if no new frame has arrived since the last take.
     pub fn take_pending_frame(&mut self) -> Option<PendingCefFrame> {
         let io_surface = self.pending_io_surface.take().map(|p| p.0);
-        self.pending_pixels.take().map(|pixels| PendingCefFrame {
+        let pixels = self.pending_pixels.take();
+        if io_surface.is_none() && pixels.is_none() {
+            return None;
+        }
+        Some(PendingCefFrame {
             width: self.pending_width,
             height: self.pending_height,
-            pixels,
+            pixels: pixels.unwrap_or_default(),
             io_surface,
             frame_number: self.last_frame_number,
         })

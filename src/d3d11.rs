@@ -910,6 +910,22 @@ impl D3d11Device {
         &self.caps
     }
 
+    /// Canonical GPU profile signature for the live host adapter. This is the
+    /// exact prefix embedded in every submission signature, exposed so callers
+    /// (and conformance harnesses) can reconstruct the expected signature on any
+    /// host without hardcoding a specific GPU family.
+    pub fn gpu_profile_signature(&self) -> String {
+        self.pipeline_profile_signature()
+    }
+
+    /// Returns true when the host backend places transient depth attachments in
+    /// memoryless storage (an Apple-GPU bandwidth optimization). When true, a
+    /// depth target that is never sampled afterwards is stored with a
+    /// `store+depth-discard` action rather than a plain `store`.
+    pub fn memoryless_depth_targets(&self) -> bool {
+        self.backend.capabilities().memoryless_render_targets
+    }
+
     pub fn swapchain_state(&self) -> Option<SwapchainState> {
         self.swapchain
             .and_then(|swapchain| self.backend.swapchain_state(swapchain).ok())
@@ -1652,18 +1668,40 @@ impl D3d11Device {
         indexed_draw_calls: &mut u32,
         dispatch_calls: &mut u32,
     ) -> AppResult<()> {
-        if commands
+        // A render pass is required only when the sequence actually issues draws
+        // against bound attachments. We open it *lazily*, immediately before the
+        // first clear or draw, rather than eagerly at the top of the command
+        // list: a leading blit (e.g. CopyResource) would otherwise flush an
+        // empty load-only pass and leave a spurious render pass in the plan.
+        let needs_render_pass = commands
             .iter()
             .any(|command| matches!(command, RecordedCommand::Draw { .. } | RecordedCommand::DrawIndexed { .. }))
-            && (!bindings.render_targets.is_empty() || bindings.depth_target.is_some())
-        {
-            let (color_formats, depth_format) = self.render_pass_formats(bindings)?;
-            let (load_action, store_action) = self.render_pass_actions(bindings)?;
-            self.backend
-                .record_begin_render_pass(list, color_formats, depth_format, load_action, store_action)?;
-        }
+            && (!bindings.render_targets.is_empty() || bindings.depth_target.is_some());
+        let mut pass_opened = false;
 
         for command in commands {
+            // Open the render pass just-in-time before the first attachment
+            // operation (clear or draw). Clears that begin a brand-new pass are
+            // handled by the backend itself, but pre-opening here keeps the
+            // load/store actions (including depth-discard for memoryless depth)
+            // consistent with the bound pipeline state.
+            if needs_render_pass
+                && !pass_opened
+                && matches!(
+                    command,
+                    RecordedCommand::ClearRenderTargetView { .. }
+                        | RecordedCommand::ClearDepthStencilView { .. }
+                        | RecordedCommand::Draw { .. }
+                        | RecordedCommand::DrawIndexed { .. }
+                )
+            {
+                let (color_formats, depth_format) = self.render_pass_formats(bindings)?;
+                let (load_action, store_action) = self.render_pass_actions(bindings)?;
+                self.backend
+                    .record_begin_render_pass(list, color_formats, depth_format, load_action, store_action)?;
+                pass_opened = true;
+            }
+
             match command {
                 RecordedCommand::UpdateSubresource { resource, bytes } => {
                     let backend_id = {
@@ -1680,6 +1718,8 @@ impl D3d11Device {
                     let destination = self.resource_mut(*dst)?;
                     destination.bytes = source_bytes;
                     self.backend.record_copy_resource(list, src_backend, dst_backend)?;
+                    // A blit closes the active render pass in the backend plan.
+                    pass_opened = false;
                 }
                 RecordedCommand::CopySubresourceRegion {
                     src,
@@ -1761,10 +1801,14 @@ impl D3d11Device {
                         *format,
                         0, // D3D11_RESOLVE_MODE_DECOMPRESS = 0, maps to Average
                     )?;
+                    // A resolve is a blit and closes the active render pass.
+                    pass_opened = false;
                 }
                 RecordedCommand::Dispatch { x, y, z } => {
                     *dispatch_calls += 1;
                     self.backend.record_dispatch(list, *x, *y, *z)?;
+                    // A compute dispatch closes the active render pass.
+                    pass_opened = false;
                 }
             }
         }
@@ -1799,11 +1843,29 @@ impl D3d11Device {
         let mut dispatch_calls = 0;
         let all_sequences_empty = sequences.iter().all(|(_, commands)| commands.is_empty());
 
+        // Coalescing fuses a *small draw submission burst* into a single backend
+        // command list / render pass. This is only valid when every sequence
+        // targets the identical attachments and contains nothing but draw
+        // commands: clears, dispatches, copies and resource updates each
+        // establish distinct render-pass or execution boundaries that must be
+        // preserved verbatim (e.g. four deferred lists each clearing the same
+        // RTV to a different colour must remain four separate passes).
+        let first_bindings = sequences.first().map(|(bindings, _)| bindings);
         let coalesce_sequences = self.backend.capabilities().unified_memory
             && self.backend.capabilities().argument_buffers
             && self.backend.capabilities().mesh_shaders
             && sequences.len() > 1
-            && sequences.iter().all(|(_, commands)| commands.len() <= 8);
+            && sequences.iter().all(|(bindings, commands)| {
+                !commands.is_empty()
+                    && commands.len() <= 8
+                    && Some(bindings) == first_bindings
+                    && commands.iter().all(|command| {
+                        matches!(
+                            command,
+                            RecordedCommand::Draw { .. } | RecordedCommand::DrawIndexed { .. }
+                        )
+                    })
+            });
 
         if all_sequences_empty {
             // Bare presents should not synthesize empty command lists.
@@ -2989,7 +3051,9 @@ fn create_device_internal_with_backend(
     );
     let fence = backend.create_fence(0);
     let caps = FeatureCaps {
-        geometry_shader: backend.capabilities().mesh_shaders,
+        // Metal has no native geometry shader stage; D3D11 geometry shaders are
+        // unsupported on this backend regardless of the host GPU family.
+        geometry_shader: false,
         hull_shader: backend.capabilities().mesh_shaders,
         domain_shader: backend.capabilities().mesh_shaders,
     };

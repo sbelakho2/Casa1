@@ -36,6 +36,7 @@ pub enum ReasonCode {
     RcAnticheatDriverDetected = 2004,
     RcTlsCertRejected = 2005,
     RcMsiCustomActionServiceBlocked = 2006,
+    RcJitCodeAllocFailed = 2010,
     RcInputUnsupported = 2100,
     RcDxilInvalid = 2101,
     RcDxilBindingAmbiguous = 2102,
@@ -79,6 +80,7 @@ pub enum ReasonCode {
     RcTelemetryRanking = 2903,
     SehException = 3000,
     VeHandlerUnhandled = 3001,
+    Halted = 3100,
 }
 
 impl ReasonCode {
@@ -164,6 +166,8 @@ impl ReasonCode {
             2903 => Some(Self::RcTelemetryRanking),
             3000 => Some(Self::SehException),
             3001 => Some(Self::VeHandlerUnhandled),
+            3100 => Some(Self::Halted),
+            2010 => Some(Self::RcJitCodeAllocFailed),
             _ => None,
         }
     }
@@ -246,6 +250,8 @@ impl ReasonCode {
             Self::RcTelemetryRanking => "RC_TELEMETRY_RANKING",
             Self::SehException => "SEH_EXCEPTION",
             Self::VeHandlerUnhandled => "VE_HANDLER_UNHANDLED",
+            Self::Halted => "HALTED",
+            Self::RcJitCodeAllocFailed => "RC_JIT_CODE_ALLOC_FAILED",
         }
     }
 }

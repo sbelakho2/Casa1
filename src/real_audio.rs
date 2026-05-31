@@ -4306,6 +4306,11 @@ mod tests {
          0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x06]
     }
 
+    fn make_equalizer_clsid() -> [u8; 16] {
+        [0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07]
+    }
+
     #[test]
     fn xapo_reverb_processes_and_resets() {
         let mut reverb = XapoReverb::new(0.5, 48000, 2);
@@ -4424,7 +4429,8 @@ mod tests {
         assert!(mgr.is_registered(&make_echo_clsid()));
         assert!(mgr.is_registered(&make_compressor_clsid()));
         assert!(mgr.is_registered(&make_normalize_clsid()));
-        assert_eq!(mgr.registered_count(), 6);
+        assert!(mgr.is_registered(&make_equalizer_clsid()));
+        assert_eq!(mgr.registered_count(), 7);
 
         // Create a reverb instance
         let handle = mgr.create_instance(&make_reverb_clsid()).expect("reverb should be registered");

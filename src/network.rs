@@ -1,4 +1,7 @@
 use crate::error::{AppError, AppResult};
+use base64::{Engine as _, engine::general_purpose};
+use der::{Decode, Encode};
+use x509_cert::Certificate as X509Certificate;
 use std::time::Duration;
 use crate::reason::ReasonCode;
 use aes::Aes128;
@@ -37,6 +40,146 @@ const WSAETIMEDOUT: i32 = 10060;
 const WSAECONNREFUSED: i32 = 10061;
 const WSANOTINITIALISED: i32 = 10093;
 const WSAHOST_NOT_FOUND: i32 = 11001;
+
+// ---------------------------------------------------------------------------
+// G8: Certificate pinning — HPKP-style public key pinning
+// ---------------------------------------------------------------------------
+
+/// A single certificate pin entry: maps a hostname to a set of accepted SPKI
+/// fingerprints (base64-encoded SHA-256 of the SubjectPublicKeyInfo).
+#[derive(Debug, Clone)]
+pub struct CertificatePin {
+    /// The hostname this pin applies to (e.g. "example.com").
+    pub hostname: String,
+    /// Base64-encoded SHA-256 SPKI fingerprints that are accepted.
+    pub fingerprints: Vec<String>,
+}
+
+/// Manages certificate pin expectations for known hosts.
+///
+/// Pinning enforces that the server's certificate chain contains at least one
+/// public key whose SPKI fingerprint matches an expected value. This prevents
+/// MITM attacks even if a CA is compromised.
+///
+/// # Implementation Notes
+/// `native_tls` does not expose the peer certificate chain after the TLS
+/// handshake in its public API. Therefore pinning is implemented via:
+/// 1. Pre-connection configuration (store pin expectations)
+/// 2. Custom TLS builder that would inspect certificates if available
+/// 3. Post-connection verification using raw TLS stream inspection
+#[derive(Debug, Default)]
+pub struct PinnedCertificates {
+    /// Pins indexed by hostname (lowercase).
+    pins: BTreeMap<String, Vec<String>>,
+}
+
+impl PinnedCertificates {
+    /// Create a new empty pin set.
+    pub fn new() -> Self {
+        Self {
+            pins: BTreeMap::new(),
+        }
+    }
+
+    /// Add a pin for a specific hostname.
+    ///
+    /// `fingerprint` is a base64-encoded SHA-256 hash of the DER-encoded SPKI.
+    pub fn add_pin(&mut self, hostname: &str, fingerprint: &str) {
+        let host = hostname.to_lowercase();
+        self.pins.entry(host).or_default().push(fingerprint.to_string());
+    }
+
+    /// Add multiple pins for a hostname.
+    pub fn add_pins(&mut self, hostname: &str, fingerprints: &[String]) {
+        let host = hostname.to_lowercase();
+        self.pins.entry(host).or_default().extend_from_slice(fingerprints);
+    }
+
+    /// Check if a hostname has any pins configured.
+    pub fn has_pins_for(&self, hostname: &str) -> bool {
+        self.pins.contains_key(&hostname.to_lowercase())
+    }
+
+    /// Get the pins for a hostname, if any.
+    pub fn pins_for(&self, hostname: &str) -> Option<&Vec<String>> {
+        self.pins.get(&hostname.to_lowercase())
+    }
+
+    /// Verify a certificate chain against the pins for the given hostname.
+    ///
+    /// Returns `Ok(())` if:
+    /// - No pins are configured for the hostname (no pinning required)
+    /// - At least one certificate in the chain has a matching SPKI fingerprint
+    ///
+    /// Returns `Err(AppError)` if pins are configured but none match.
+    ///
+    /// # Implementation
+    /// Each DER-encoded certificate in `der_certs` is parsed using the
+    /// `x509-cert` crate. The SubjectPublicKeyInfo (SPKI) is extracted and
+    /// re-encoded to DER bytes, then SHA-256 hashed and base64-encoded.
+    /// The resulting fingerprint is compared against the configured pins.
+    /// If no certificate matches, the connection is rejected (fail-closed).
+    pub fn verify(&self, hostname: &str, der_certs: &[Vec<u8>]) -> AppResult<()> {
+        let host = hostname.to_lowercase();
+        if let Some(expected_pins) = self.pins.get(&host) {
+            for der in der_certs {
+                // Parse the DER-encoded X.509 certificate
+                let cert = X509Certificate::from_der(der).map_err(|e| {
+                    AppError::new(
+                        ReasonCode::RcNetConnectionFailed,
+                        format!(
+                            "certificate pinning: failed to parse DER certificate for {host}: {e}"
+                        ),
+                    )
+                })?;
+
+                // Re-encode the SubjectPublicKeyInfo to DER bytes
+                let spki_der = cert
+                    .tbs_certificate
+                    .subject_public_key_info
+                    .to_der()
+                    .map_err(|e| {
+                        AppError::new(
+                            ReasonCode::RcNetConnectionFailed,
+                            format!(
+                                "certificate pinning: failed to encode SPKI for {host}: {e}"
+                            ),
+                        )
+                    })?;
+
+                // Compute SHA-256 hash of the DER-encoded SPKI
+                let hash = Sha256::digest(&spki_der);
+
+                // Base64-encode the hash and compare against expected pins
+                let fingerprint = general_purpose::STANDARD.encode(hash);
+                if expected_pins.iter().any(|pin| pin == &fingerprint) {
+                    return Ok(());
+                }
+            }
+
+            // No certificate matched any pin — fail closed
+            return Err(AppError::new(
+                ReasonCode::RcNetConnectionFailed,
+                format!(
+                    "certificate pinning: no matching SPKI fingerprint for {host} \
+                     (checked {} certificate(s))",
+                    der_certs.len(),
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Clear all pins.
+    pub fn clear(&mut self) {
+        self.pins.clear();
+    }
+
+    /// Number of hostnames with pins configured.
+    pub fn len(&self) -> usize {
+        self.pins.len()
+    }
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]

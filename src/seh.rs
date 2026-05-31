@@ -56,6 +56,10 @@ pub struct UnwindInfo {
     /// If UNW_FLAG_EHANDLER or UNW_FLAG_UHANDLER is set, the RVA of the
     /// language-specific exception/unwind handler that follows the codes.
     pub handler_rva: Option<u32>,
+    /// If UNW_FLAG_CHAININFO is set, the unwind_info_addr of the chained
+    /// (primary) RUNTIME_FUNCTION whose unwind codes must also be replayed
+    /// for this frame.
+    pub chained_info_rva: Option<u32>,
 }
 
 /// x64 context (subset of Windows CONTEXT64).
@@ -177,7 +181,12 @@ pub fn parse_unwind_info(data: &[u8], rva: u32) -> Option<UnwindInfo> {
     }
 
     let mut codes = Vec::with_capacity(code_count as usize);
-    for i in 0..code_count as usize {
+    // Each unwind code occupies one or more 2-byte "nodes". Operations that
+    // carry an operand (ALLOC_LARGE, SAVE_NONVOL[_FAR], SAVE_XMM128[_FAR])
+    // consume additional nodes for the inline 16-/32-bit value. We must skip
+    // those operand nodes rather than mis-parsing them as further unwind codes.
+    let mut i = 0usize;
+    while i < code_count as usize {
         let code_offset = codes_start + i * 2;
         let code_byte = data[code_offset];
         let info = data[code_offset + 1];
@@ -294,6 +303,20 @@ pub fn parse_unwind_info(data: &[u8], rva: u32) -> Option<UnwindInfo> {
                 // Unknown unwind code — skip
             }
         }
+        // Advance past this code and any inline operand nodes it consumed.
+        let nodes = match op {
+            1 => {
+                if op_info == 0 {
+                    2 // ALLOC_LARGE with 16-bit scaled size
+                } else {
+                    3 // ALLOC_LARGE with 32-bit unscaled size
+                }
+            }
+            4 | 6 => 2,  // SAVE_NONVOL / SAVE_XMM128 (16-bit operand)
+            5 | 7 => 3,  // SAVE_NONVOL_FAR / SAVE_XMM128_FAR (32-bit operand)
+            _ => 1,
+        };
+        i += nodes;
     }
 
     // After the unwind codes (padded to even count, then DWORD-aligned),
@@ -315,6 +338,21 @@ pub fn parse_unwind_info(data: &[u8], rva: u32) -> Option<UnwindInfo> {
         None
     };
 
+    // If UNW_FLAG_CHAININFO (0x04) is set, a 12-byte RUNTIME_FUNCTION follows
+    // the unwind codes (at the same DWORD-aligned offset). Its third DWORD is
+    // the unwind_info_addr of the chained (primary) unwind info whose codes
+    // must also be replayed for this frame.
+    let chained_info_rva = if flags & 0x04 != 0 && handler_offset + 12 <= data.len() {
+        Some(u32::from_le_bytes([
+            data[handler_offset + 8],
+            data[handler_offset + 9],
+            data[handler_offset + 10],
+            data[handler_offset + 11],
+        ]))
+    } else {
+        None
+    };
+
     Some(UnwindInfo {
         version,
         flags,
@@ -324,6 +362,7 @@ pub fn parse_unwind_info(data: &[u8], rva: u32) -> Option<UnwindInfo> {
         frame_offset,
         codes,
         handler_rva,
+        chained_info_rva,
     })
 }
 
@@ -389,16 +428,17 @@ pub fn virtual_unwind(
     context: &mut X64Context,
     memory_reader: &MemoryReader<'_>,
 ) -> UnwindResult {
-    // UNW_FLAG_CHAININFO — the unwind info chains to another RUNTIME_FUNCTION.
-    // The caller should look up the chained entry and continue unwinding.
-    if unwind_info.flags & 0x04 != 0 {
-        return UnwindResult::Collided;
-    }
-
     // Replay the unwind codes in reverse order to restore the caller's frame.
     // At entry, RSP points to the top of the current frame (= caller's return
     // address slot after the prolog). We process codes in reverse so that the
     // last prolog operation (which saved the deepest register) is undone first.
+    //
+    // UNW_FLAG_CHAININFO (0x04): this UNWIND_INFO describes a secondary code
+    // region whose prolog operations are a continuation of the chained
+    // (primary) entry. Its codes are replayed here, but the return-address pop
+    // is deferred — the caller follows `chained_info_rva` and replays the
+    // chained entry's codes as part of the same logical frame.
+    let mut machine_frame = false;
     for code in unwind_info.codes.iter().rev() {
         match *code {
             UnwindCode::PushNonVolatile { register } => {
@@ -477,16 +517,32 @@ pub fn virtual_unwind(
                     // If we can't read the old RSP, at least advance past the frame
                     context.rsp += error_code_offset + 40; // frame total = error + 5*8
                 }
+                // A machine frame is the complete return mechanism: it already
+                // supplies both RIP and the caller's RSP. There is no separate
+                // return-address slot to pop afterwards.
+                machine_frame = true;
             }
         }
     }
 
     // After processing all unwind codes, pop the return address from the stack.
-    // At this point RSP should point to the return address of the call.
-    if let Some(return_rip) = read_u64_from_guest(memory_reader, context.rsp) {
-        context.rip = return_rip;
+    // At this point RSP should point to the return address of the call. A
+    // machine frame already restored RIP and the caller's RSP, so it has no
+    // separate return-address slot to pop.
+    //
+    // For a CHAININFO entry the prolog description is not yet complete: the
+    // caller must follow the chained (primary) entry and replay its codes
+    // before the return address is reached. Defer the pop and signal Collided.
+    if unwind_info.flags & 0x04 != 0 {
+        return UnwindResult::Collided;
     }
-    context.rsp += 8;
+
+    if !machine_frame {
+        if let Some(return_rip) = read_u64_from_guest(memory_reader, context.rsp) {
+            context.rip = return_rip;
+        }
+        context.rsp += 8;
+    }
 
     // If the function has an exception handler (EHANDLER or UHANDLER),
     // return the handler RVA so the caller can dispatch to it.
@@ -580,7 +636,22 @@ pub fn unwind_frames(
             None => return UnwindResult::NotFound,
         };
 
-        let result = virtual_unwind(&unwind_info, context, memory_reader);
+        // Follow CHAININFO entries in-place so the whole logical frame's
+        // prolog is replayed before the return address is popped.
+        let mut active_info = unwind_info;
+        let result = loop {
+            let res = virtual_unwind(&active_info, context, memory_reader);
+            if res == UnwindResult::Collided {
+                match active_info.chained_info_rva.and_then(&get_unwind_info) {
+                    Some(next) => {
+                        active_info = next;
+                        continue;
+                    }
+                    None => break res,
+                }
+            }
+            break res;
+        };
 
         match result {
             UnwindResult::HandlerFound(handler_rva) => {
@@ -598,12 +669,8 @@ pub fn unwind_frames(
                 return UnwindResult::Completed;
             }
             UnwindResult::Collided => {
-                // Chained unwind info — the unwind_info_addr in the current
-                // RuntimeFunction points to the chained entry indirectly.
-                // We need to follow the chain by re-resolving unwind info
-                // from the chained entry's unwind_info_addr.
-                // For now, treat as completed (the chain has been followed).
-                continue;
+                // Chain terminated without a primary entry — stop unwinding.
+                return UnwindResult::NotFound;
             }
             UnwindResult::NotFound => {
                 return UnwindResult::NotFound;
@@ -646,13 +713,20 @@ pub fn rtl_unwind(
     seh: &mut SehSubsystem,
     memory_reader: &MemoryReader<'_>,
 ) -> Result<(), crate::error::AppError> {
+    let mut frames_unwound: u32 = 0;
     loop {
         let rva = context.rip.wrapping_sub(image_base) as u32;
 
         // Check if we've reached the target frame.
         if target_frame != 0 {
-            if let Some(rf) = seh.find_runtime_function(image_base, rva) {
-                if rva >= rf.begin_addr && rva < rf.end_addr {
+            // The target frame identifies a specific function (the one that
+            // contains the target address). Stop once the current RIP enters
+            // that function's range — that is the frame the unwind was asked
+            // to stop at.
+            let target_rva = target_frame.wrapping_sub(image_base) as u32;
+            if let Some(target_rf) = seh.find_runtime_function(image_base, target_rva) {
+                let (begin, end) = (target_rf.begin_addr, target_rf.end_addr);
+                if rva >= begin && rva < end {
                     // We're inside the target frame. If target_rip is set,
                     // use it as the final RIP.
                     if target_rip != 0 {
@@ -667,6 +741,16 @@ pub fn rtl_unwind(
         let rf = match seh.find_runtime_function(image_base, rva) {
             Some(rf) => rf.clone(),
             None => {
+                // No function table entry for this RIP. During an exit unwind
+                // (target_frame == 0) this is the natural termination of the
+                // walk: we have reached a leaf/bottom frame past the last
+                // managed function, so the unwind is complete. Only treat it
+                // as an error if we never made progress (the initial context
+                // was already invalid) or a specific target frame was sought
+                // but never reached.
+                if frames_unwound > 0 && target_frame == 0 {
+                    return Ok(());
+                }
                 return Err(crate::error::AppError::new(
                     ReasonCode::SehException,
                     format!("rtl_unwind: no runtime function for RVA {:#x}", rva),
@@ -685,20 +769,45 @@ pub fn rtl_unwind(
             }
         };
 
-        // Perform the virtual unwind for this frame.
-        let result = virtual_unwind(&unwind_info, context, memory_reader);
+        // Perform the virtual unwind for this frame. CHAININFO entries are
+        // followed in-place: replay the chained (primary) entry's codes as a
+        // continuation of the same logical frame, until a non-chained entry
+        // pops the return address.
+        let mut active_info = unwind_info;
+        let result = loop {
+            let res = virtual_unwind(&active_info, context, memory_reader);
+            if res == UnwindResult::Collided {
+                let Some(chained_rva) = active_info.chained_info_rva else {
+                    break res;
+                };
+                match seh.get_unwind_info(chained_rva) {
+                    Some(next) => {
+                        active_info = next.clone();
+                        continue;
+                    }
+                    None => break res,
+                }
+            }
+            break res;
+        };
 
         match result {
             UnwindResult::Completed => {
                 // Successfully unwound one frame. Continue to the next one
                 // in the loop (which will check target_frame again).
+                frames_unwound += 1;
                 continue;
             }
             UnwindResult::Collided => {
-                // Chained unwind info — follow the chain by continuing.
-                // The chained entry will be resolved on the next iteration
-                // since RIP has been updated by virtual_unwind.
-                continue;
+                // The chain terminated without a primary entry to pop the
+                // return address — nothing more can be unwound here.
+                if frames_unwound > 0 && target_frame == 0 {
+                    return Ok(());
+                }
+                return Err(crate::error::AppError::new(
+                    ReasonCode::SehException,
+                    format!("rtl_unwind: unresolved chained unwind at RVA {:#x}", rva),
+                ));
             }
             UnwindResult::HandlerFound(handler_rva) => {
                 // A handler was found. The caller should invoke it.
@@ -1007,6 +1116,7 @@ impl SehSubsystem {
         address: u64,
         context: &X64Context,
         image_base: u64,
+        memory_reader: &MemoryReader<'_>,
     ) -> Result<(), crate::error::AppError> {
         let record = ExceptionRecord::new(code, address);
 
@@ -1027,11 +1137,24 @@ impl SehSubsystem {
         // to restore each frame's registers and checking for handlers.
         let mut current_context = context.clone();
 
-        // Pre-borrow unwind_data to avoid capturing `self` in the closure.
-        // We only need immutable access to unwind_data for the memory reader.
-        let unwind_data_ref: *const HashMap<u64, Vec<u8>> = &self.unwind_data;
+        // Unwinding moves up the call stack, so RSP must strictly increase on
+        // every completed frame. We track the previous RSP to detect a frame
+        // that fails to make progress (e.g. a return address that cannot be
+        // read from guest memory), which Windows treats as a corrupt/exhausted
+        // stack and stops the search — preventing an infinite unwind loop.
+        let mut prev_rsp = current_context.rsp;
+        let mut frames_unwound: u32 = 0;
+        // RtlVirtualUnwind / RtlDispatchException bound the unwind depth; a real
+        // user-mode stack is never this deep. Exceeding it means the unwind
+        // chain is cyclic or corrupt, so we stop the search.
+        const MAX_UNWIND_FRAMES: u32 = 4096;
 
         loop {
+            if frames_unwound >= MAX_UNWIND_FRAMES {
+                break;
+            }
+            frames_unwound += 1;
+
             let rva = current_context.rip.wrapping_sub(image_base) as u32;
 
             // Scoped lookup to avoid overlapping borrows on self.
@@ -1084,29 +1207,75 @@ impl SehSubsystem {
                 return Ok(());
             }
 
-            // Create the memory reader closure. It captures `unwind_data_ref`
-            // (a raw pointer) and `image_base` (a Copy value). This avoids
-            // capturing `self` which would conflict with other borrows.
-            let memory_reader = |addr: u64, buf: &mut [u8]| -> bool {
-                // Safety: unwind_data_ref points to self.unwind_data which is
-                // alive for the duration of this method. We only read from it.
-                let unwind_data: &HashMap<u64, Vec<u8>> =
-                    unsafe { &*unwind_data_ref };
-                if let Some(data) = unwind_data.get(&image_base) {
-                    let offset = addr.wrapping_sub(image_base) as usize;
-                    if offset + buf.len() <= data.len() {
-                        buf.copy_from_slice(&data[offset..offset + buf.len()]);
-                        return true;
-                    }
-                }
-                false
-            };
-
-            let result = virtual_unwind(&unwind_info, &mut current_context, &memory_reader);
+            // Use the caller-supplied guest memory reader so virtual_unwind
+            // can read return addresses and saved registers from the actual
+            // guest stack (which lives outside the image's unwind data).
+            let result = virtual_unwind(&unwind_info, &mut current_context, memory_reader);
             match result {
-                UnwindResult::Completed | UnwindResult::Collided => {
-                    // Unwound to the caller (or followed a chain) — continue.
+                UnwindResult::Completed => {
+                    // Unwound to the caller — verify forward progress before
+                    // continuing. If RSP did not advance, the return address
+                    // could not be read (corrupt/exhausted stack); stop here so
+                    // the exception falls through to the unhandled path rather
+                    // than looping on the same frame forever.
+                    if current_context.rsp <= prev_rsp {
+                        break;
+                    }
+                    prev_rsp = current_context.rsp;
                     continue;
+                }
+                UnwindResult::Collided => {
+                    // CHAININFO: follow the chained (primary) entry in-place,
+                    // replaying its codes until a non-chained entry pops the
+                    // return address. Resolving by chained_info_rva (not by
+                    // RIP) guarantees forward progress.
+                    let mut chain_rva = unwind_info.chained_info_rva;
+                    let mut resolved = false;
+                    while let Some(rva) = chain_rva {
+                        let next = {
+                            let cached = self.unwind_cache.get(&rva).cloned();
+                            match cached {
+                                Some(ui) => Some(ui),
+                                None => {
+                                    let mut parsed: Option<UnwindInfo> = None;
+                                    for (_, data) in &self.unwind_data {
+                                        if let Some(info) = parse_unwind_info(data, rva) {
+                                            parsed = Some(info);
+                                            break;
+                                        }
+                                    }
+                                    if let Some(info) = parsed.clone() {
+                                        self.unwind_cache.insert(rva, info);
+                                    }
+                                    parsed
+                                }
+                            }
+                        };
+                        let Some(next) = next else { break };
+                        match virtual_unwind(&next, &mut current_context, memory_reader) {
+                            UnwindResult::Collided => {
+                                chain_rva = next.chained_info_rva;
+                            }
+                            UnwindResult::HandlerFound(_) => {
+                                return Ok(());
+                            }
+                            _ => {
+                                resolved = true;
+                                break;
+                            }
+                        }
+                    }
+                    if resolved {
+                        // The chained entry popped the return address; ensure the
+                        // progress tracker reflects the new (higher) RSP so the
+                        // next Completed frame is not falsely treated as stuck.
+                        if current_context.rsp <= prev_rsp {
+                            break;
+                        }
+                        prev_rsp = current_context.rsp;
+                        continue;
+                    }
+                    break;
                 }
                 UnwindResult::HandlerFound(handler_rva) => {
                     let _ = handler_rva;
@@ -1135,8 +1304,9 @@ impl SehSubsystem {
         code: u32,
         context: &X64Context,
         image_base: u64,
+        memory_reader: &MemoryReader<'_>,
     ) -> Result<(), crate::error::AppError> {
-        self.dispatch(code, context.rip, context, image_base)
+        self.dispatch(code, context.rip, context, image_base, memory_reader)
     }
 }
 
@@ -1151,6 +1321,12 @@ impl Default for SehSubsystem {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serializes tests that touch the process-global VEH chain. The vectored
+    /// exception handler registry is shared process-wide (matching Windows
+    /// semantics), so tests that add/remove handlers or dispatch through them
+    /// must not interleave with one another under the parallel test runner.
+    static VEH_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     /// Helper: build a minimal valid UNWIND_INFO blob.
     fn make_unwind_info(version: u8, flags: u8, codes: &[(u8, u8)]) -> Vec<u8> {
@@ -1222,6 +1398,7 @@ mod tests {
 
     #[test]
     fn test_veh_add_remove() {
+        let _guard = VEH_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let handler: VectoredExceptionHandler = Box::new(|_ptrs| EXCEPTION_CONTINUE_SEARCH);
 
         let handle = add_vectored_handler(handler, true);
@@ -1241,6 +1418,7 @@ mod tests {
 
     #[test]
     fn test_veh_dispatch() {
+        let _guard = VEH_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         // Register a handler that claims STATUS_ACCESS_VIOLATION
         let handler: VectoredExceptionHandler = Box::new(|ptrs| {
             if ptrs.record.code == STATUS_ACCESS_VIOLATION {
@@ -1298,9 +1476,11 @@ mod tests {
 
     #[test]
     fn test_seh_subsystem_dispatch_no_veh() {
+        let _guard = VEH_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let mut seh = SehSubsystem::new();
         let context = X64Context::default();
-        let result = seh.dispatch(STATUS_ACCESS_VIOLATION, 0x1000, &context, 0x14000_0000);
+        let no_memory = |_addr: u64, _buf: &mut [u8]| -> bool { false };
+        let result = seh.dispatch(STATUS_ACCESS_VIOLATION, 0x1000, &context, 0x14000_0000, &no_memory);
         assert!(result.is_err());
         if let Err(err) = result {
             assert_eq!(err.code, ReasonCode::SehException);
@@ -1315,6 +1495,7 @@ mod tests {
 
     #[test]
     fn test_veh_continue_execution() {
+        let _guard = VEH_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let handler: VectoredExceptionHandler = Box::new(|_ptrs| EXCEPTION_CONTINUE_EXECUTION);
         let handle = add_vectored_handler(handler, true);
 
@@ -1395,7 +1576,7 @@ mod tests {
         // Simulate: function that pushes RBP (register 5), allocates 0x20 bytes.
         // Prolog: push rbp; sub rsp, 0x20
         // Unwind codes: UWOP_PUSH_NONVOL(reg=5), UWOP_ALLOC_SMALL(size=0x28)
-        let codes = vec![(0, 5), (2, 3)]; // push rbp, alloc 0x28 (= 3*8+8)
+        let codes = vec![(0, 5), (2, 4)]; // push rbp, alloc 0x28 (= 4*8+8)
         let unwind_data = make_unwind_info(1, 0, &codes);
 
         // Build a fake stack: at [RSP] = saved RBP value = 0xdeadbeef
@@ -1822,8 +2003,12 @@ mod tests {
         // PushNonVolatile reads from [RSP] = [RBP]. But RBP was set to
         // original_RSP - 8 (after push rbp). So [RBP] = saved_RBP value. That works!
 
-        let codes = vec![(0, 5), (3, 5), (2, 6)]; // push rbp, set_fp(reg=5,off=0), alloc(0x38=6*8+8)
-        let unwind_data = make_unwind_info(1, 0, &codes);
+        let codes = vec![(0, 5), (3, 5), (2, 6)]; // push rbp, set_fp, alloc(0x38=6*8+8)
+        let mut unwind_data = make_unwind_info(1, 0, &codes);
+        // Per the x64 ABI, UWOP_SET_FPREG takes its frame register and offset
+        // from the UNWIND_INFO header (byte 3 = (frame_offset << 4) | frame_register),
+        // NOT from the code's op_info. Encode RBP (reg 5), offset 0.
+        unwind_data[3] = 0x05;
 
         // Stack layout after prolog:
         // [RBP-0x38..RBP]: allocated locals
@@ -1999,7 +2184,7 @@ mod tests {
     fn test_virtual_unwind_with_ehandler_flag_restores_registers() {
         // Test that when EHANDLER is set, virtual_unwind still restores
         // registers correctly AND returns the handler_rva.
-        let codes = vec![(0, 5), (2, 3)]; // push rbp, alloc 0x28
+        let codes = vec![(0, 5), (2, 4)]; // push rbp, alloc 0x28 (= 4*8+8)
         let handler_rva = 0x5000u32;
         let data = make_unwind_info_full(1, 0x01, &codes, &handler_rva.to_le_bytes());
 
@@ -2112,27 +2297,34 @@ mod tests {
     fn test_virtual_unwind_save_nonvol_far() {
         // Test SaveNonVolatileFar (UWOP_SAVE_NONVOL_FAR, op=5) with 32-bit offset
         // Prolog: push rbp; sub rsp, 0x200; mov [rsp+0x180], r12
-        // Codes: PushNonVolatile(reg=5), AllocSmall(info=0x3F -> size=0x200),
+        // Codes: PushNonVolatile(reg=5), AllocLarge(0x200),
         //        SaveNonVolatileFar(reg=12, offset=0x180)
+        // NOTE: 0x200 (512 bytes) cannot be encoded by UWOP_ALLOC_SMALL because
+        // op_info is only 4 bits (max 15 => 15*8+8 = 0x80). A 0x200 allocation
+        // must use UWOP_ALLOC_LARGE (op_info=0, 16-bit scaled size = 0x200/8 = 0x40).
         let mut buf = Vec::new();
         buf.push(0x01); // version=1, flags=0
         buf.push(0x10); // prolog_size
-        buf.push(5); // code_count = 5 slots (push=1, alloc=1, save_far=3)
+        buf.push(6); // code_count = 6 slots (push=1, alloc_large=2, save_far=3)
         buf.push(0x00);
 
         // Slot 0: UWOP_PUSH_NONVOL reg=5
         buf.push((5 << 4) | 0);
         buf.push(0x00);
 
-        // Slot 1: UWOP_ALLOC_SMALL info=0x3F (size = 0x3F*8+8 = 0x200)
-        buf.push((0x3F << 4) | 2);
+        // Slot 1: UWOP_ALLOC_LARGE op_info=0 (16-bit scaled size follows)
+        buf.push((0 << 4) | 1); // op=1, info=0 => 0x01
         buf.push(0x00);
 
-        // Slot 2: UWOP_SAVE_NONVOL_FAR reg=12 (op=5, info=12)
+        // Slot 2: 16-bit scaled size = 0x200 / 8 = 0x40
+        buf.push(0x40);
+        buf.push(0x00);
+
+        // Slot 3: UWOP_SAVE_NONVOL_FAR reg=12 (op=5, info=12)
         buf.push((12 << 4) | 5);
         buf.push(0x00);
 
-        // Slot 3-4: 32-bit offset = 0x180
+        // Slot 4-5: 32-bit offset = 0x180
         buf.push(0x80);
         buf.push(0x01);
         buf.push(0x00);
@@ -2203,6 +2395,7 @@ mod tests {
 
     #[test]
     fn test_rtl_restore_context_with_veh_handler() {
+        let _guard = VEH_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         // Register a VEH handler that handles STATUS_ILLEGAL_INSTRUCTION
         // and verify rtl_restore_context dispatches through VEH.
         let handler: VectoredExceptionHandler = Box::new(|ptrs| {
@@ -2237,7 +2430,7 @@ mod tests {
         let image_base = 0x14000_0000u64;
 
         // Build unwind info: push rbp; sub rsp, 0x28
-        let codes = vec![(0, 5), (2, 3)]; // push rbp, alloc 0x28
+        let codes = vec![(0, 5), (2, 4)]; // push rbp, alloc 0x28 (= 4*8+8)
         let unwind_data = make_unwind_info(1, 0, &codes);
 
         // Register unwind data at RVA 0x2000
@@ -2358,7 +2551,7 @@ mod tests {
         let codes = vec![(0, 5)];
         let unwind_data = make_unwind_info(1, 0, &codes);
 
-        let mut data = vec![0u8; 0x2000];
+        let mut data = vec![0u8; 0x2000 + unwind_data.len()];
         data[0x2000..0x2000 + unwind_data.len()].copy_from_slice(&unwind_data);
         seh.register_unwind_data(image_base, data);
 
@@ -2447,8 +2640,8 @@ mod tests {
         let mut seh = SehSubsystem::new();
         let image_base = 0x14000_0000u64;
 
-        // All three functions have the same prolog: push rbp; sub rsp, 0x20
-        let codes = vec![(0, 5), (2, 3)]; // push rbp, alloc 0x28
+        // All three functions have the same prolog: push rbp; sub rsp, 0x28
+        let codes = vec![(0, 5), (2, 4)]; // push rbp, alloc 0x28 (= 4*8+8)
         let unwind_data = make_unwind_info(1, 0, &codes);
 
         // Register unwind data with entries at different RVAs
@@ -2541,16 +2734,21 @@ mod tests {
         let func_b_rbp = 0xBBBB_BBBBu64;
         let func_c_rbp = 0xCCCC_CCCCu64;
 
-        let mut stack = vec![0u8; 0x98];
+        // Each frame is 0x38 bytes: 0x28 alloc + 8 saved RBP + 8 return address.
+        // At unwind time RSP=0x00 (bottom of func_C's locals):
+        // [0x00..0x28] func_C locals; [0x28] func_C saved RBP; [0x30] ret->func_B
+        // [0x38..0x60] func_B locals; [0x60] func_B saved RBP; [0x68] ret->func_A
+        // [0x70..0x98] func_A locals; [0x98] func_A saved RBP; [0xA0] ret->caller
+        let mut stack = vec![0u8; 0xA8];
         // func_C frame
         stack[0x28..0x30].copy_from_slice(&func_c_rbp.to_le_bytes());
         stack[0x30..0x38].copy_from_slice(&(image_base + 0x1105u64).to_le_bytes());
         // func_B frame
-        stack[0x58..0x60].copy_from_slice(&func_b_rbp.to_le_bytes());
-        stack[0x60..0x68].copy_from_slice(&(image_base + 0x1005u64).to_le_bytes());
+        stack[0x60..0x68].copy_from_slice(&func_b_rbp.to_le_bytes());
+        stack[0x68..0x70].copy_from_slice(&(image_base + 0x1005u64).to_le_bytes());
         // func_A frame
-        stack[0x88..0x90].copy_from_slice(&func_a_rbp.to_le_bytes());
-        stack[0x90..0x98].copy_from_slice(&func_a_ret.to_le_bytes());
+        stack[0x98..0xA0].copy_from_slice(&func_a_rbp.to_le_bytes());
+        stack[0xA0..0xA8].copy_from_slice(&func_a_ret.to_le_bytes());
 
         let stack_base = 0x7fff_0000u64;
         let mem_reader = slice_memory_reader(&stack, stack_base);
@@ -2603,81 +2801,60 @@ mod tests {
 
     #[test]
     fn test_collided_unwind_follow_chain() {
-        // Test that when virtual_unwind returns Collided, rtl_unwind
-        // continues to follow the chain by looking up the next frame.
+        // Verify that a UNW_FLAG_CHAININFO entry is followed correctly: the
+        // secondary code region's unwind codes are replayed, then the chained
+        // (primary) entry's codes complete the frame before the return address
+        // is popped.
         let mut seh = SehSubsystem::new();
         let image_base = 0x14000_0000u64;
 
-        // First function: has UNW_FLAG_CHAININFO, chains to second function
-        let codes1 = vec![(0, 5)]; // push rbp
-        let unwind1 = make_unwind_info(1, 0x04, &codes1); // flags=CHAININFO
-        // The chained entry: the unwind_info_addr in the RuntimeFunction for
-        // this function should point to the chained unwind info.
+        // Secondary region (unwind1 @ 0x2000): allocated 0x28 of stack and
+        // chains to the primary entry. CHAININFO requires an appended
+        // RUNTIME_FUNCTION whose unwind_info_addr points at the primary.
+        let mut unwind1 = make_unwind_info(1, 0x04, &[(2, 4)]); // alloc 0x28, CHAININFO
+        // Append the chained RUNTIME_FUNCTION (begin, end, unwind_info_addr).
+        unwind1.extend_from_slice(&0x1100u32.to_le_bytes());
+        unwind1.extend_from_slice(&0x1150u32.to_le_bytes());
+        unwind1.extend_from_slice(&0x2100u32.to_le_bytes());
 
-        // Second function (the one we chain to): push rbp, alloc 0x28
-        let codes2 = vec![(0, 5), (2, 3)];
-        let unwind2 = make_unwind_info(1, 0, &codes2);
+        // Primary region (unwind2 @ 0x2100): push rbp, no chaining.
+        let unwind2 = make_unwind_info(1, 0, &[(0, 5)]); // push rbp
 
-        // Register unwind data
         let mut data = vec![0u8; 0x3000];
         data[0x2000..0x2000 + unwind1.len()].copy_from_slice(&unwind1);
         data[0x2100..0x2100 + unwind2.len()].copy_from_slice(&unwind2);
         seh.register_unwind_data(image_base, data);
 
-        // Register .pdata: the first function chains to the second
-        // For CHAININFO, the unwind_info_addr in the RuntimeFunction points
-        // to the chained entry. virtual_unwind sees CHAININFO flag and
-        // returns Collided. The caller (rtl_unwind) continues the loop,
-        // and since RIP hasn't changed (chained unwind returns early),
-        // it re-resolves... wait, but the same function match will be found.
-        //
-        // Actually, for chained unwind, the expected behavior is:
-        // 1. virtual_unwind sees CHAININFO flag -> returns Collided
-        // 2. rtl_unwind continues loop, re-looks up RuntimeFunction for same RIP
-        // 3. Same function found -> same chained unwind info -> infinite loop!
-        //
-        // This is a known limitation. The proper way to handle CHAININFO is
-        // to look at the chained entry's begin_addr/end_addr from the
-        // RUNTIME_FUNCTION that this unwind info points to.
-        //
-        // For this test, let's just verify that Collided doesn't cause an error.
+        // .pdata: the executing function (the secondary region) chains to the
+        // primary. Only the secondary region is reachable by RIP.
         let mut pdata = Vec::new();
         pdata.extend_from_slice(&0x1000u32.to_le_bytes());
         pdata.extend_from_slice(&0x1050u32.to_le_bytes());
         pdata.extend_from_slice(&0x2000u32.to_le_bytes());
         seh.register_pdata(image_base, &pdata);
 
-        // Stack for function 1: push rbp saved + return address (no alloc)
-        let mut stack = vec![0u8; 0x10];
-        stack[0x00..0x08].copy_from_slice(&0xf00du64.to_le_bytes()); // saved RBP
-        stack[0x08..0x10].copy_from_slice(&0x14000bbbbu64.to_le_bytes()); // return addr
+        // Stack layout relative to the entry RSP:
+        //   [+0x28] saved RBP (restored by the primary's push rbp)
+        //   [+0x30] return address (popped after the chain completes)
         let stack_base = 0x7fff_0000u64;
+        let mut stack = vec![0u8; 0x40];
+        stack[0x28..0x30].copy_from_slice(&0x0000_cafeu64.to_le_bytes());
+        stack[0x30..0x38].copy_from_slice(&0x1_4000_bbbbu64.to_le_bytes());
         let mem_reader = slice_memory_reader(&stack, stack_base);
 
         let mut ctx = X64Context::default();
-        ctx.rip = 0x140001000;
+        ctx.rip = 0x1_4000_1000;
         ctx.rsp = stack_base;
         ctx.rbp = 0xf00d;
 
         let result = rtl_unwind(0, 0, image_base, &mut ctx, &mut seh, &mem_reader);
-        // With the current implementation, chained unwind returns Collided,
-        // rtl_unwind continues the loop, finds the same function again,
-        // and gets Collided again -> infinite loop.
-        // To avoid this, we'd need to follow the chain by looking at the
-        // unwind_info_addr + 4 bytes (chained RUNTIME_FUNCTION).
-        //
-        // For now, let's accept that chained unwind leads to the same frame
-        // being re-processed. The test just verifies no crash.
-        // The function should either succeed (if somehow the chain resolves)
-        // or eventually hit Completed/NotFound.
-        //
-        // Since the chain info points to the same unwind info, we just loop.
-        // This test simply confirms the function doesn't panic.
-        // In practice, chained unwind info has a different structure that
-        // we'd need to follow properly.
-        //
-        // Let's just accept either outcome (Ok or Err) as valid for now
-        // since chained unwind handling may depend on the specific format.
-        let _ = result;
+
+        // The chain must resolve: alloc 0x28 (secondary) → push rbp (primary)
+        // → pop return address. The walk then reaches an unmanaged frame and
+        // terminates normally.
+        assert!(result.is_ok(), "chained unwind must complete: {result:?}");
+        assert_eq!(ctx.rbp, 0x0000_cafe, "primary entry must restore saved RBP");
+        assert_eq!(ctx.rip, 0x1_4000_bbbb, "return address must be popped after the chain");
+        assert_eq!(ctx.rsp, stack_base + 0x38, "RSP must reflect alloc + push + return pop");
     }
 }

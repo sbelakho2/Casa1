@@ -1460,6 +1460,7 @@ impl User32Subsystem {
                     device_id: None,
                 })?;
             }
+            self.queue_paint(hwnd)?;
         } else {
             if self.focus == Some(hwnd) {
                 self.focus = None;
@@ -3337,8 +3338,7 @@ impl User32Subsystem {
             lparam: height as i64,
             translated: false,
             device_id: None,
-        })?;
-        self.queue_paint(hwnd)
+        })
     }
 
     fn queue_paint(&mut self, hwnd: Hwnd) -> AppResult<()> {
@@ -3417,6 +3417,13 @@ impl User32Subsystem {
     }
 
     fn effective_dpi(&self, monitor_id: u32) -> AppResult<u32> {
+        // A monitor id of 0 means "unspecified": Win32 resolves an
+        // unqualified window to the primary monitor for DPI purposes.
+        let monitor_id = if monitor_id == 0 {
+            self.primary_monitor_id()
+        } else {
+            monitor_id
+        };
         let monitor = self.monitor(monitor_id)?;
         Ok(match self.dpi_context {
             DpiAwarenessContext::Unaware => 96,
