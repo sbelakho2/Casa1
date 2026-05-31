@@ -1,7 +1,6 @@
 # Casa1 Execution Plan — v3.1 (Code-Verified Gap Correction — Fully Implemented)
 
 **Generated:** 31-May-2026  
-**Previous version:** v2.0 (claimed 12 gaps requiring 4-5 developer-weeks; 8 of those gaps were FALSE or OVERSTATED)  
 **This version:** Each gap claim was verified against actual source code at commit 511d572b7157c41c9d9341fd3334add7f3334cb7 by examining specific line numbers in each module.
 
 **Methodology:** Every "missing feature" claim from v2.0 was subjected to source-code line verification. Claims were classified as:
@@ -34,12 +33,11 @@
 
 ```mermaid
 flowchart LR
-    v20[v2.0: 12 Gaps<br/>4-5 dev-weeks]
+    
     v20 --> Verify{Source Verification<br/>@ commit 511d572}
     Verify -->|FALSE| Removed[8 False Claims<br/>G2,G3,G4,G7,G8,G10,G11,G12]
     Verify -->|OVERSTATED| Narrow[3 Narrow Items<br/>G1,G5,G6]
     Verify -->|CHECK| Optional[1 Optional Item<br/>G9 - CEF]
-    Narrow --> v30[v3.0: ~1-2 dev-weeks<br/>4 items total]
     Optional --> v30
 ```
 
@@ -330,6 +328,209 @@ Phase 2:
   G6 — Added unwind_table + register_block() after compilation + register_with_seh()
   G9 — Added error diagnostics + path instrumentation for IOSurface paths
 ```
+
+---
+
+## Steam Readiness Assessment — Gaps, Blockers & Problems
+
+> **Assessment Date**: 2026-05-31
+> **Methodology**: Deep analysis of all Steam-related code paths across 60+ source modules
+> **Overall Readiness**: ~65% — Architecture sound, 4 critical blockers prevent Steam from running
+
+### Critical Blockers (P0 — Steam Cannot Run Without These)
+
+#### B1: No Real macOS Window Creation
+
+| Aspect | Details |
+|--------|---------|
+| **Impact** | Nothing appears on screen — not Steam UI, not game output |
+| **Root Cause** | [`src/user32.rs`](../src/user32.rs) tracks windows as data structures but never creates `NSWindow`/`NSView` |
+| **Evidence** | `CreateWindowExW` in pe_runtime dispatches to `Win32Subsystem` which stores window metadata (title, rect, style) but has zero Objective-C FFI calls to `NSWindow.alloc().init()` |
+| **Scope** | Every visual element: Steam main window, game windows, dialog boxes, message boxes, popup menus |
+| **Dependencies** | Requires Objective-C runtime bridge (`objc` crate already in deps), `CAMetalLayer` for game rendering, `WKWebView` embedding for CEF |
+
+**Required Changes**:
+- `src/user32.rs`: Add `NSWindow` creation in `CreateWindowExW` dispatch
+- `src/metal_backend.rs`: Connect `CAMetalLayer` to created `NSWindow` for swap chain presentation
+- `src/cef_bridge.rs`: Embed `WKWebView` in the `NSWindow`'s content view
+- `src/user32.rs`: Implement real message pump (`GetMessage`/`DispatchMessage`) backed by macOS `NSEvent` loop
+- `src/runner.rs`: Create main `NSApplication` shared instance at startup
+
+#### B2: DXIL→MSL Shader Translation Incomplete
+
+| Aspect | Details |
+|--------|---------|
+| **Impact** | Games with complex HLSL shaders crash or render incorrectly |
+| **Root Cause** | [`src/shader.rs`](../src/shader.rs) (3,793 lines) handles common DXIL opcodes but real game shaders use thousands of patterns |
+| **Evidence** | DXIL opcode coverage is broad but shallow — edge cases in HLSL intrinsics (`InterlockedCompareExchange`, `WaveMultiPrefixOp`, `Dot4AddI8Packed`), resource binding arrays, geometry/tessellation control points, and raytracing hit shaders are unimplemented |
+| **Scope** | All D3D11/D3D12 games with non-trivial shaders (i.e., virtually all modern games) |
+| **Dependencies** | DXIL specification, MSL reference, real game shader corpora for testing |
+
+**Required Changes**:
+- `src/shader.rs`: Implement missing DXIL opcode → MSL translation patterns
+- `src/shader_compiler.rs`: Add HLSL intrinsic → MSL function mapping for all SM 5.0–6.7 intrinsics
+- Add shader regression test suite using real game shader bytecode
+- Handle edge cases: resource array indexing, dynamic descriptor indexing, UAV atomics, barriers
+
+#### B3: No `steam_api64.dll` Synthetic Export
+
+| Aspect | Details |
+|--------|---------|
+| **Impact** | Games cannot call Steamworks SDK functions (achievements, leaderboards, multiplayer, DLC) |
+| **Root Cause** | Steam API is implemented at Casa1 level ([`src/steam.rs`](../src/steam.rs)) but not exposed as importable DLL exports |
+| **Evidence** | [`src/pe_runtime.rs`](../src/pe_runtime.rs) `can_synthesize_module()` (line ~6088) recognizes 40+ DLLs but `steam_api64.dll` is not in the list; games that `LoadLibrary("steam_api64.dll")` + `GetProcAddress("SteamAPI_Init")` get nothing |
+| **Scope** | All Steam games that use Steamworks SDK (virtually all games on Steam) |
+| **Dependencies** | Steamworks SDK API documentation, `src/steam.rs` integration |
+
+**Required Changes**:
+- `src/pe_runtime.rs`: Add `steam_api64.dll` and `steam_api.dll` to `can_synthesize_module()` list
+- Create export table mapping: `SteamAPI_Init`, `SteamAPI_Shutdown`, `SteamAPI_RunCallbacks`, `SteamUser()->GetSteamID()`, `SteamUserStats()->RequestCurrentStats()`, etc.
+- Wire each export to existing [`src/steam.rs`](../src/steam.rs) `SteamClient` methods
+- Handle `SteamAPI_RegisterCallback`/`SteamAPI_UnregisterCallback` dispatch
+
+#### B4: Performance at Scale Unproven
+
+| Aspect | Details |
+|--------|---------|
+| **Impact** | Steam.exe is 5–10 MB with hundreds of DLLs; may be too slow for usable interaction |
+| **Root Cause** | CPU emulator/JIT ([`src/jit.rs`](../src/jit.rs)) works for small test binaries but hasn't been stress-tested with Steam's complexity |
+| **Evidence** | Test evidence limited to Windows Tetris ([`games/windows_tetris/`](../games/windows_tetris/)) — a simple game. No benchmarks against complex applications. |
+| **Scope** | Entire runtime performance: PE loading, instruction decoding, JIT compilation throughput, memory access patterns |
+| **Dependencies** | Profiling tools, real Steam workload traces |
+
+**Required Changes**:
+- Profile instruction decode/execute hot paths with `criterion` or `instruments`
+- Optimize JIT compilation cache hit rate (block chaining, hot block recompilation)
+- Add `--release` mode benchmarks for CPU engine throughput (instructions/second)
+- Test with progressively larger binaries: simple EXE → complex EXE → Steam.exe
+
+---
+
+### High-Priority Gaps (P1 — Major Functionality Missing)
+
+#### G-NW1: COM Object Instantiation is Stub-Level
+
+| Aspect | Details |
+|--------|---------|
+| **Status** | ⚠️ Partial |
+| **File** | [`src/real_win32.rs`](../src/real_win32.rs) |
+| **Problem** | COM class factories ([`ComApartmentState`](../src/real_win32.rs:20)) exist but `CoCreateInstance` for real CLSIDs returns synthetic objects, not functional ones |
+| **Impact** | Steam/games that instantiate COM objects (DirectSound8, XAudio2, Shell dialogs) get non-functional stubs |
+| **Affected CLSIDs** | `DirectSound8`, `XAudio2` (already handled via audio.rs), `ShellLink`, `FileOpenDialog`, `TaskbarList` |
+
+#### G-CPU1: AVX-512 Explicitly Disabled
+
+| Aspect | Details |
+|--------|---------|
+| **Status** | ⚠️ Partial |
+| **File** | [`src/cpu.rs`](../src/cpu.rs:91-95) |
+| **Problem** | AVX-512 support is explicitly disabled: "512-bit vector execution on 128-bit NEON is incomplete" |
+| **Impact** | Games that probe CPUID for AVX-512 and branch on it will take the wrong path; games that require AVX-512 will crash |
+| **Note** | Most current games don't require AVX-512, but future titles increasingly will |
+
+#### G-GFX1: No D3D10 Support
+
+| Aspect | Details |
+|--------|---------|
+| **Status** | ❌ Missing |
+| **Files** | [`src/d3d11.rs`](../src/d3d11.rs), [`src/d3d12.rs`](../src/d3d12.rs) |
+| **Problem** | Only D3D9, D3D11, D3D12 are covered; D3D10 games have no translation path |
+| **Impact** | Games targeting D3D10 feature level (e.g., some late-2000s/early-2010s titles) won't render |
+| **Mitigation** | Many D3D10 games have D3D11 patches or can be forced to D3D9 |
+
+
+#### G-CEF1: CEF Callback Dispatch Incomplete
+
+| Aspect | Details |
+|--------|---------|
+| **Status** | ⚠️ Partial |
+| **File** | [`src/cef_bridge.rs`](../src/cef_bridge.rs) |
+| **Problem** | Steam's CEF usage involves complex callback chains (render handler, life span handler, load handler, display handler, request handler) that are partially stubbed |
+| **Impact** | Steam's Chromium-based UI (store, library, settings, login) may not render or respond to user interaction |
+
+
+#### G-STM1: SteamVR is Virtual Only
+
+| Aspect | Details |
+|--------|---------|
+| **Status** | ⚠️ Partial |
+| **File** | [`src/steamvr.rs`](../src/steamvr.rs) |
+| **Problem** | OpenVR API emulation uses a virtual HMD (Valve Index specs) with no real VR headset connection |
+| **Impact** | VR games compile but have no display output; head tracking is simulated |
+
+
+#### G-STM2: Steam Overlay Not Rendered
+
+| Aspect | Details |
+|--------|---------|
+| **Status** | ❌ Missing |
+| **Files** | [`src/steam.rs`](../src/steam.rs), [`src/gfx.rs`](../src/gfx.rs) |
+| **Problem** | `overlay_active` field exists but no rendering hook injects overlay UI into game frames |
+| **Impact** | Steam Overlay (Shift+Tab) doesn't work — no in-game browser, friends list, achievements viewer |
+
+---
+
+### Medium-Priority Gaps (P2 — Degraded Experience)
+
+#### G-WIN1: Missing Esoteric Win32 APIs for Steam.exe
+
+| Aspect | Details |
+|--------|---------|
+| **Status** | ⚠️ Partial |
+| **File** | [`src/pe_runtime.rs`](../src/pe_runtime.rs:42017) |
+| **Problem** | Phase 1.3.3 explicitly labeled "Missing user32.dll imports for Steam.exe": `GetWindowThreadProcessId`, `KillTimer`, `MoveWindow`, `GetDesktopWindow`, `MsgWaitForMultipleObjects`, `UpdateWindow`, `UnregisterClassW`, clipboard APIs |
+| **Impact** | Steam.exe may crash when calling these unimplemented functions |
+
+
+#### G-CPU2: Self-Modifying Code Not Stress-Tested
+
+| Aspect | Details |
+|--------|---------|
+| **Status** | ⚠️ Partial |
+| **File** | [`src/cpu.rs`](../src/cpu.rs:2804) |
+| **Problem** | Code cache invalidation exists (`invalidate_code_write()`) but hasn't been stress-tested with JIT-heavy workloads that modify their own code |
+| **Impact** | Some anti-cheat systems and JIT compilers in games may break |
+
+
+#### G-NET1: No QUIC/HTTP3 Support
+
+| Aspect | Details |
+|--------|---------|
+| **Status** | ⚠️ Partial |
+| **Files** | [`src/network.rs`](../src/network.rs), [`src/winhttp.rs`](../src/winhttp.rs) |
+| **Problem** | Steam may use QUIC/HTTP3 for some connections; only HTTP/1.1 and HTTP/2 are supported |
+| **Impact** | Some Steam features may fail silently or fall back to slower protocols |
+
+#### G-GFX2: DXGI Swap Chain Not Connected to Display
+
+| Aspect | Details |
+|--------|---------|
+| **Status** | ⚠️ Partial |
+| **File** | [`src/gfx.rs`](../src/gfx.rs) |
+| **Problem** | Swap chain emulation creates Metal textures but doesn't present them to a `CAMetalLayer` on screen |
+| **Impact** | Games render internally but user sees nothing (same root cause as B1) |
+| **Effort** | Resolved by B1 (window creation) |
+
+---
+
+### Subsystem Readiness Summary
+
+| Subsystem | Status | % | Key File(s) | Critical Gap |
+|-----------|--------|---|-------------|--------------|
+| PE Loader / CPU | ⚠️ Partial | 70% | [`src/cpu.rs`](../src/cpu.rs), [`src/jit.rs`](../src/jit.rs) | Scale, AVX-512 |
+| Win32 API | ⚠️ Partial | 65% | [`src/win32.rs`](../src/win32.rs), [`src/real_win32.rs`](../src/real_win32.rs) | COM, missing APIs |
+| Network | ✅ Ready | 90% | [`src/network.rs`](../src/network.rs), [`src/steam_protocol.rs`](../src/steam_protocol.rs) | QUIC/HTTP3 |
+| CEF/WebView | ⚠️ Partial | 50% | [`src/cef_bridge.rs`](../src/cef_bridge.rs) | No visible rendering |
+| Graphics | ⚠️ Partial | 45% | [`src/d3d11.rs`](../src/d3d11.rs), [`src/metal_backend.rs`](../src/metal_backend.rs) | Shader completeness |
+| Installer | ✅ Ready | 85% | [`src/installer.rs`](../src/installer.rs) | Complex NSIS plugins |
+| File System + Registry | ✅ Ready | 90% | [`src/real_fs.rs`](../src/real_fs.rs), [`src/ge.rs`](../src/ge.rs) | NTFS junctions |
+| Steam API | ⚠️ Partial | 75% | [`src/steam.rs`](../src/steam.rs), [`src/steam_protocol.rs`](../src/steam_protocol.rs) | No DLL exports |
+| Audio | ✅ Ready | 85% | [`src/real_audio.rs`](../src/real_audio.rs) | Advanced XAudio2 |
+| **Overall** | **⚠️ Partial** | **~65%** | — | **Window creation + shaders** |
+
+---
+
+### Path to Steam Readiness
 
 ---
 

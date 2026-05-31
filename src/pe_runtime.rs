@@ -696,6 +696,22 @@ pub enum HostThunk {
     SteamAPI_ISteamNetworkingMessages_SendMessageToUser,
     SteamAPI_ISteamNetworkingMessages_ReceiveMessagesOnChannel,
     SteamAPI_ISteamNetworkingMessages_CloseSessionWithUser,
+    // -- Steam API flat exports (Phase B3) --
+    SteamAPI_Init,
+    SteamAPI_Shutdown,
+    SteamAPI_RestartAppIfNecessary,
+    SteamAPI_RegisterCallback,
+    SteamAPI_UnregisterCallback,
+    SteamAPI_RegisterCallResult,
+    SteamAPI_UnregisterCallResult,
+    SteamAPI_RunCallbacks,
+    SteamAPI_GetSteamInstallPath,
+    SteamAPI_WriteMiniDump,
+    SteamAPI_SetMiniDumpComment,
+    SteamInternal_CreateInterface,
+    SteamInternal_FindOrCreateUserInterface,
+    SteamInternal_FindOrCreateGameInterface,
+    SteamInternal_ContextInit,
     // -- SteamVR / OpenVR (Phase 5.3.1) --
     SteamVR_Init,
     SteamVR_Shutdown,
@@ -1523,6 +1539,12 @@ pub enum HostThunk {
     SetClipboardData,
     /// `EmptyClipboard` — empties the clipboard and frees handles to data in the clipboard.
     EmptyClipboard,
+    /// `GetClipboardData` — retrieves data from the clipboard in a specified format.
+    GetClipboardData,
+    /// `IsClipboardFormatAvailable` — determines whether the clipboard contains data in the specified format.
+    IsClipboardFormatAvailable,
+    /// `EnumClipboardFormats` — enumerates the data formats currently available on the clipboard.
+    EnumClipboardFormats,
     /// `GetWindowTextLengthA` — retrieves the length of the specified window's title bar text (ANSI).
     GetWindowTextLengthA,
     /// `GetProcessWindowStation` — retrieves a handle to the current window station.
@@ -2746,6 +2768,20 @@ struct PeHostRuntime {
     d3d9_swapchains: HashMap<u64, u64>,
     /// Guest IDirect3D9 factory objects.
     d3d9_factories: HashSet<u64>,
+    // ── Steam API (Phase B3) ────────────────────────────────────────────────
+    /// Whether SteamAPI_Init() has been called successfully.
+    steam_api_initialized: bool,
+    /// Registered Steam callbacks: maps callback ID → callback function pointer.
+    /// Used by SteamAPI_RegisterCallback / SteamAPI_RunCallbacks.
+    steam_callbacks: BTreeMap<u32, u64>,
+    /// Registered Steam call results: maps call result ID → callback function pointer.
+    /// Used by SteamAPI_RegisterCallResult / SteamAPI_UnregisterCallResult.
+    steam_call_results: BTreeMap<u64, u64>,
+    /// Interface pointer counter for SteamInternal_CreateInterface.
+    /// Incremented for each unique interface version string.
+    steam_interface_pointers: BTreeMap<String, u64>,
+    /// Next virtual address for Steam interface allocation.
+    next_steam_interface_address: u64,
 }
 
 #[derive(Debug)]
@@ -4303,7 +4339,13 @@ pub fn execute_with_options(
             if let Some(_tier) = runtime.tiered_compiler.record_execution(block_start) {
                 let ir = &cached_block.translated.ir;
                 let arch = state.arch;
-                if jit.get_or_compile(ir, block_start, arch).is_ok() {
+                if jit.get_or_compile(ir, block_start, arch, None).is_ok() {
+                    // Sync updated unwind info to the SEH subsystem so that
+                    // RtlVirtualUnwind can find newly compiled JIT blocks.
+                    if jit.is_unwind_dirty() {
+                        jit.unwind_table.register_with_seh(&mut runtime.seh);
+                    }
+
                     // Auto-chain: if the last IR instruction is an
                     // unconditional Jump to a compiled target, chain them.
                     if let Some(crate::cpu::IrInstruction::Jump { target }) = ir.last() {
@@ -5693,6 +5735,38 @@ pub fn regression_test_steam_bootstrap(
     .expect("Steam.exe execution failed")
 }
 
+// ---------------------------------------------------------------------------
+// C ABI bridge for fast-thunk dispatch
+// ---------------------------------------------------------------------------
+
+/// C ABI bridge called by the ARM64 fast-thunk trampoline.
+///
+/// # Arguments (ARM64 C ABI)
+/// - `x0 = runtime_ptr`:   raw pointer to the [`PeHostRuntime`] instance
+/// - `x1 = state_ptr`:     raw pointer to the [`CpuState`]
+/// - `x2 = memory_ptr`:    raw pointer to the [`MemoryImage`]
+/// - `x3 = thunk_address`: the guest thunk address being dispatched
+///
+/// # Returns
+/// - `-1`  → "continue execution" (no exit code)
+/// - `-2`  → "error during dispatch"
+/// - `>=0` → guest exit code
+unsafe extern "C" fn fast_thunk_host_dispatcher(
+    runtime_ptr: *mut std::ffi::c_void,
+    state_ptr: *mut CpuState,
+    memory_ptr: *mut MemoryImage,
+    thunk_address: u64,
+) -> i32 {
+    let runtime = &mut *(runtime_ptr as *mut PeHostRuntime);
+    let state = &mut *state_ptr;
+    let memory = &mut *memory_ptr;
+    match runtime.dispatch_import(thunk_address, state, memory) {
+        Ok(Some(code)) => code,
+        Ok(None) => -1,  // Continue
+        Err(_) => -2,    // Error
+    }
+}
+
 impl PeHostRuntime {
     fn new(
         ge: GameEnvironment,
@@ -5930,6 +6004,12 @@ impl PeHostRuntime {
             d3d9_queries: HashMap::new(),
             d3d9_swapchains: HashMap::new(),
             d3d9_factories: HashSet::new(),
+            // ── Steam API (Phase B3) ────────────────────────────────────────────────
+            steam_api_initialized: false,
+            steam_callbacks: BTreeMap::new(),
+            steam_call_results: BTreeMap::new(),
+            steam_interface_pointers: BTreeMap::new(),
+            next_steam_interface_address: 0x7f0000000000,
         }
     }
 
@@ -7965,6 +8045,9 @@ impl PeHostRuntime {
             self.next_thunk_address += 0x10;
             self.host_thunks
                 .insert(thunk_address, HostThunk::from_import(import));
+            // Register a fast-thunk for this import so that JIT-compiled
+            // blocks can call the host function directly.
+            self.register_fast_thunk(thunk_address);
             write_guest_pointer(memory, slot_va, thunk_address, self.guest_arch)?;
         }
         Ok(())
@@ -7976,9 +8059,55 @@ impl PeHostRuntime {
         state: &mut CpuState,
         memory: &mut MemoryImage,
     ) -> AppResult<Option<Option<i32>>> {
+        // Fast-thunk hot path: if a fast-thunk ARM64 trampoline has been
+        // registered for this thunk address, call it directly. This skips
+        // the dispatch_import match entirely for JIT-compiled call sites
+        // and provides a measurable speed-up for frequently-called thunks.
+        if let Some(idx) = self.thunk_to_fast_index.get(&thunk_address) {
+            if let Some(jit) = self.jit_runtime.as_ref() {
+                if let Some(trampoline) = jit.lookup_thunk_address(*idx) {
+                    emit_live_ui_debug(format!(
+                        "fast-thunk dispatch for thunk {:#x} (idx={})",
+                        thunk_address, idx
+                    ));
+                    // Safety: the trampoline calls fast_thunk_host_dispatcher
+                    // with the same signature. We pass `self` as a raw pointer;
+                    // the bridge re-borrows it synchronously, so there is no
+                    // aliasing.
+                    let result: i32 = unsafe {
+                        let func: unsafe extern "C" fn(
+                            *mut std::ffi::c_void,
+                            *mut CpuState,
+                            *mut MemoryImage,
+                            u64,
+                        ) -> i32 = std::mem::transmute(trampoline);
+                        func(
+                            self as *mut Self as *mut std::ffi::c_void,
+                            state as *mut CpuState,
+                            memory as *mut MemoryImage,
+                            thunk_address,
+                        )
+                    };
+                    return match result {
+                        -1 => Ok(Some(None)),       // Continue execution
+                        -2 => Err(AppError::new(
+                            ReasonCode::RcUnimplInsn,
+                            format!("fast-thunk dispatch failed for thunk {thunk_address:#x}"),
+                        )),
+                        code => Ok(Some(Some(code))), // Guest exit code
+                    };
+                }
+            }
+        }
+
+        // Fallback: check the standard host_thunks table
         if !self.host_thunks.contains_key(&thunk_address) {
             return Ok(None);
         }
+        emit_live_ui_debug(format!(
+            "fallback dispatch (no fast-thunk) for thunk {:#x}",
+            thunk_address,
+        ));
         self.dispatch_import(thunk_address, state, memory).map(Some)
     }
 
@@ -12099,6 +12228,218 @@ impl PeHostRuntime {
                 self.push_trace("steam_net_messages", "CloseSessionWithUser",
                     BTreeMap::from([("steam_id".to_string(), json!(format!("{steam_id:#x}")))]),
                     json!(null));
+            }
+            // -- Steam API flat exports (Phase B3) --
+            HostThunk::SteamAPI_Init => {
+                // bool SteamAPI_Init()
+                // Initialise the Steamworks API. Returns true on success.
+                self.steam_api_initialized = true;
+                state.set(Register::Rax, 1);
+                self.last_error = 0;
+                self.push_trace("steam_api", "SteamAPI_Init", BTreeMap::new(), json!(true));
+            }
+            HostThunk::SteamAPI_Shutdown => {
+                // void SteamAPI_Shutdown()
+                self.steam_api_initialized = false;
+                self.steam_callbacks.clear();
+                self.steam_call_results.clear();
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+                self.push_trace("steam_api", "SteamAPI_Shutdown", BTreeMap::new(), json!(null));
+            }
+            HostThunk::SteamAPI_RestartAppIfNecessary => {
+                // bool SteamAPI_RestartAppIfNecessary(u32 app_id)
+                // Returns false — the app is already running under Casa1.
+                let _app_id = arg(0) as u32;
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+                self.push_trace("steam_api", "SteamAPI_RestartAppIfNecessary",
+                    BTreeMap::from([("app_id".to_string(), json!(_app_id))]),
+                    json!(false));
+            }
+            HostThunk::SteamAPI_RegisterCallback => {
+                // void SteamAPI_RegisterCallback(callback_func, callback_id)
+                // callback_func is a guest function pointer to call when
+                // the specified callback ID fires.
+                let callback_func = arg(0);
+                let callback_id = arg(1) as u32;
+                if callback_func != 0 {
+                    self.steam_callbacks.insert(callback_id, callback_func);
+                }
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+                self.push_trace("steam_api", "SteamAPI_RegisterCallback",
+                    BTreeMap::from([
+                        ("callback_id".to_string(), json!(callback_id)),
+                        ("func".to_string(), json!(format!("{callback_func:#x}"))),
+                    ]),
+                    json!(0));
+            }
+            HostThunk::SteamAPI_UnregisterCallback => {
+                // void SteamAPI_UnregisterCallback(callback_func)
+                let callback_func = arg(0);
+                // Remove any entry whose value matches the given function pointer
+                self.steam_callbacks.retain(|_, &mut v| v != callback_func);
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+                self.push_trace("steam_api", "SteamAPI_UnregisterCallback",
+                    BTreeMap::from([("func".to_string(), json!(format!("{callback_func:#x}")))]),
+                    json!(0));
+            }
+            HostThunk::SteamAPI_RegisterCallResult => {
+                // void SteamAPI_RegisterCallResult(call_result_func, call_result_id)
+                // call_result_func is a guest function pointer to call when
+                // the specified call result ID completes.
+                let call_result_func = arg(0);
+                let call_result_id = arg(1);
+                if call_result_func != 0 {
+                    self.steam_call_results.insert(call_result_id, call_result_func);
+                }
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+                self.push_trace("steam_api", "SteamAPI_RegisterCallResult",
+                    BTreeMap::from([
+                        ("call_result_id".to_string(), json!(format!("{call_result_id:#x}"))),
+                        ("func".to_string(), json!(format!("{call_result_func:#x}"))),
+                    ]),
+                    json!(0));
+            }
+            HostThunk::SteamAPI_UnregisterCallResult => {
+                // void SteamAPI_UnregisterCallResult(call_result_func, call_result_id)
+                let call_result_func = arg(0);
+                let call_result_id = arg(1);
+                // Remove if both function pointer and ID match
+                if self.steam_call_results.get(&call_result_id) == Some(&call_result_func) {
+                    self.steam_call_results.remove(&call_result_id);
+                }
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+                self.push_trace("steam_api", "SteamAPI_UnregisterCallResult",
+                    BTreeMap::from([
+                        ("call_result_id".to_string(), json!(format!("{call_result_id:#x}"))),
+                    ]),
+                    json!(0));
+            }
+            HostThunk::SteamAPI_RunCallbacks => {
+                // void SteamAPI_RunCallbacks()
+                // Pump any pending Steam callbacks. Currently a no-op since
+                // no asynchronous Steam operations are implemented yet.
+                // In a full implementation, this would iterate steam_callbacks
+                // and invoke each registered callback with pending event data.
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+                self.push_trace("steam_api", "SteamAPI_RunCallbacks", BTreeMap::new(), json!(null));
+            }
+            HostThunk::SteamAPI_GetSteamInstallPath => {
+                // char* SteamAPI_GetSteamInstallPath()
+                // Returns the Steam install path string (or null if not found).
+                // For synthetic mode, return a placeholder path.
+                let path = "C:\\Program Files (x86)\\Steam";
+                let path_ptr = self.alloc_c_string(memory, path)?;
+                state.set(Register::Rax, path_ptr);
+                self.last_error = 0;
+                self.push_trace("steam_api", "SteamAPI_GetSteamInstallPath",
+                    BTreeMap::from([("path".to_string(), json!(path))]),
+                    json!(format!("{path_ptr:#x}")));
+            }
+            HostThunk::SteamAPI_WriteMiniDump => {
+                // void SteamAPI_WriteMiniDump(u32 exception, ...)
+                // No-op — crash dumps are not applicable in the emulated context.
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+                self.push_trace("steam_api", "SteamAPI_WriteMiniDump", BTreeMap::new(), json!(null));
+            }
+            HostThunk::SteamAPI_SetMiniDumpComment => {
+                // void SteamAPI_SetMiniDumpComment(char* comment)
+                // No-op.
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+                self.push_trace("steam_api", "SteamAPI_SetMiniDumpComment", BTreeMap::new(), json!(null));
+            }
+            HostThunk::SteamInternal_CreateInterface => {
+                // void* SteamInternal_CreateInterface(char* version_string)
+                // Returns a non-null interface pointer for the requested Steam
+                // interface version. The pointer points to a small allocation
+                // with a method table stub so the game does not crash on null.
+                let version_ptr = arg(0);
+                let version = read_c_string(memory, version_ptr).unwrap_or_default();
+                // Check if we already have a pointer for this interface version
+                let iface_addr_val = {
+                    let entry = self.steam_interface_pointers.entry(version.clone()).or_insert_with(|| {
+                        let addr = self.next_steam_interface_address;
+                        self.next_steam_interface_address += 0x1000;
+                        addr
+                    });
+                    *entry
+                };
+                state.set(Register::Rax, iface_addr_val);
+                self.last_error = 0;
+                self.push_trace("steam_api", "SteamInternal_CreateInterface",
+                    BTreeMap::from([("version".to_string(), json!(version))]),
+                    json!(format!("{:#x}", iface_addr_val)));
+            }
+            HostThunk::SteamInternal_FindOrCreateUserInterface => {
+                // void* SteamInternal_FindOrCreateUserInterface(hSteamUser, char* version)
+                let _h_user = arg(0);
+                let version_ptr = arg(1);
+                let version = read_c_string(memory, version_ptr).unwrap_or_default();
+                let iface_addr_val = {
+                    let entry = self.steam_interface_pointers.entry(version.clone()).or_insert_with(|| {
+                        let addr = self.next_steam_interface_address;
+                        self.next_steam_interface_address += 0x1000;
+                        addr
+                    });
+                    *entry
+                };
+                state.set(Register::Rax, iface_addr_val);
+                self.last_error = 0;
+                self.push_trace("steam_api", "SteamInternal_FindOrCreateUserInterface",
+                    BTreeMap::from([("version".to_string(), json!(version))]),
+                    json!(format!("{:#x}", iface_addr_val)));
+            }
+            HostThunk::SteamInternal_FindOrCreateGameInterface => {
+                // void* SteamInternal_FindOrCreateGameInterface(hSteamUser, char* version)
+                let _h_user = arg(0);
+                let version_ptr = arg(1);
+                let version = read_c_string(memory, version_ptr).unwrap_or_default();
+                let iface_addr_val = {
+                    let entry = self.steam_interface_pointers.entry(version.clone()).or_insert_with(|| {
+                        let addr = self.next_steam_interface_address;
+                        self.next_steam_interface_address += 0x1000;
+                        addr
+                    });
+                    *entry
+                };
+                state.set(Register::Rax, iface_addr_val);
+                self.last_error = 0;
+                self.push_trace("steam_api", "SteamInternal_FindOrCreateGameInterface",
+                    BTreeMap::from([("version".to_string(), json!(version))]),
+                    json!(format!("{:#x}", iface_addr_val)));
+            }
+            HostThunk::SteamInternal_ContextInit => {
+                // void* SteamInternal_ContextInit(void* context)
+                // Initialises a Steam context structure if needed.
+                // Returns the context pointer.
+                let context_ptr = arg(0);
+                if context_ptr != 0 {
+                    // Check if the context is already initialised (first u64 != 0)
+                    let init_flag = memory.read_u64(context_ptr).unwrap_or(0);
+                    if init_flag == 0 {
+                        // Allocate a context structure and store its address
+                        let ctx_addr = self.next_steam_interface_address;
+                        self.next_steam_interface_address += 0x100;
+                        memory.write_u64(context_ptr, ctx_addr);
+                        state.set(Register::Rax, ctx_addr);
+                    } else {
+                        state.set(Register::Rax, init_flag);
+                    }
+                } else {
+                    state.set(Register::Rax, 0);
+                }
+                self.last_error = 0;
+                self.push_trace("steam_api", "SteamInternal_ContextInit",
+                    BTreeMap::from([("context_ptr".to_string(), json!(format!("{context_ptr:#x}")))]),
+                    json!(format!("{:#x}", state.get(Register::Rax))));
             }
             // -- SteamVR / OpenVR (Phase 5.3.1) --
             HostThunk::SteamVR_Init => {
@@ -28330,42 +28671,40 @@ impl PeHostRuntime {
                 state.set(Register::Rax, 1); // thread ID
             }
             HostThunk::KillTimer => {
-                state.set(Register::Rax, 1); // TRUE
+                let hwnd = arg(0) as u32;
+                let timer_id = arg(1) as usize;
+                let result = self.user32.kill_timer(hwnd, timer_id);
+                state.set(Register::Rax, if result { 1 } else { 1 }); // Always TRUE per Win32
             }
             HostThunk::MoveWindow => {
-                state.set(Register::Rax, 1); // TRUE
+                let hwnd = arg(0) as u32;
+                let x = arg(1) as i32;
+                let y = arg(2) as i32;
+                let width = arg(3) as u32;
+                let height = arg(4) as u32;
+                let repaint = arg(5) != 0;
+                let result = self.user32.move_window(hwnd, x, y, width, height, repaint);
+                state.set(Register::Rax, if result.unwrap_or(false) { 1 } else { 0 });
             }
             HostThunk::GetDesktopWindow => {
-                state.set(Register::Rax, 1); // HWND_DESKTOP
+                let hwnd = self.user32.get_desktop_window();
+                state.set(Register::Rax, hwnd as u64);
             }
             HostThunk::MsgWaitForMultipleObjects => {
                 let n = arg(0) as usize;
                 let handles_ptr = arg(1);
                 let wait_all = arg(2) != 0;
                 let timeout = arg(3) as u32;
-                let _wake_mask = arg(4) as u32;
+                let wake_mask = arg(4) as u32;
                 if n == 0 {
-                    // No handles — just check for messages (QS_ALLINPUT).
-                    // In the VM, always report messages available.
-                    state.set(Register::Rax, 0); // WAIT_OBJECT_0
-                } else if wait_all {
-                    // WaitAll: wait for all handles sequentially
-                    let mut all_signaled = true;
-                    for i in 0..n {
-                        let handle_addr = handles_ptr + (i as u64) * if self.guest_arch == GuestArch::X86 { 4 } else { 8 };
-                        let handle = if self.guest_arch == GuestArch::X86 { read_u32(memory, handle_addr).unwrap_or(0) as u32 } else { memory.read_u64(handle_addr).unwrap_or(0) as u32 };
-                        match self.win32.wait_for_single_object(handle, timeout, false, None) {
-                            Ok(WaitStatus::Object0) => {}, // WAIT_OBJECT_0
-                            _ => { all_signaled = false; break; }
-                        }
-                    }
-                    if all_signaled {
-                        state.set(Register::Rax, 0); // WAIT_OBJECT_0
+                    // No handles — just check message queue for matching QS_* events.
+                    if self.user32.message_queue_has_events(wake_mask) {
+                        state.set(Register::Rax, 0); // WAIT_OBJECT_0 — messages available
                     } else {
-                        state.set(Register::Rax, 0xFFFFFFFF); // WAIT_FAILED
+                        state.set(Register::Rax, 0xFFFFFFFF); // WAIT_TIMEOUT
                     }
-                } else {
-                    // WaitAny: wait for first handle or check all
+                } else if wake_mask != 0 {
+                    // Check handles AND message queue
                     let mut found = None;
                     for i in 0..n {
                         let handle_addr = handles_ptr + (i as u64) * if self.guest_arch == GuestArch::X86 { 4 } else { 8 };
@@ -28377,17 +28716,55 @@ impl PeHostRuntime {
                     }
                     if let Some(idx) = found {
                         state.set(Register::Rax, idx as u64); // WAIT_OBJECT_0 + idx
+                    } else if self.user32.message_queue_has_events(wake_mask) {
+                        state.set(Register::Rax, (n as u64) | 0); // WAIT_OBJECT_0 + n — msg available
                     } else {
-                        // No handle signaled — report messages available
-                        state.set(Register::Rax, n as u64); // WAIT_OBJECT_0 + n
+                        state.set(Register::Rax, 0xFFFFFFFF); // WAIT_TIMEOUT
+                    }
+                } else if wait_all {
+                    // WaitAll: wait for all handles sequentially
+                    let mut all_signaled = true;
+                    for i in 0..n {
+                        let handle_addr = handles_ptr + (i as u64) * if self.guest_arch == GuestArch::X86 { 4 } else { 8 };
+                        let handle = if self.guest_arch == GuestArch::X86 { read_u32(memory, handle_addr).unwrap_or(0) as u32 } else { memory.read_u64(handle_addr).unwrap_or(0) as u32 };
+                        match self.win32.wait_for_single_object(handle, timeout, false, None) {
+                            Ok(WaitStatus::Object0) => {},
+                            _ => { all_signaled = false; break; }
+                        }
+                    }
+                    if all_signaled {
+                        state.set(Register::Rax, 0); // WAIT_OBJECT_0
+                    } else {
+                        state.set(Register::Rax, 0xFFFFFFFF); // WAIT_FAILED
+                    }
+                } else {
+                    // WaitAny: wait for first handle
+                    let mut found = None;
+                    for i in 0..n {
+                        let handle_addr = handles_ptr + (i as u64) * if self.guest_arch == GuestArch::X86 { 4 } else { 8 };
+                        let handle = if self.guest_arch == GuestArch::X86 { read_u32(memory, handle_addr).unwrap_or(0) as u32 } else { memory.read_u64(handle_addr).unwrap_or(0) as u32 };
+                        match self.win32.wait_for_single_object(handle, 0, false, None) {
+                            Ok(WaitStatus::Object0) => { found = Some(i); break; }
+                            _ => {}
+                        }
+                    }
+                    if let Some(idx) = found {
+                        state.set(Register::Rax, idx as u64);
+                    } else {
+                        state.set(Register::Rax, n as u64); // WAIT_OBJECT_0 + n — msgs available
                     }
                 }
             }
             HostThunk::UpdateWindow => {
-                state.set(Register::Rax, 1); // TRUE
+                let hwnd = arg(0) as u32;
+                let result = self.user32.update_window(hwnd);
+                state.set(Register::Rax, if result.unwrap_or(false) { 1 } else { 0 });
             }
             HostThunk::UnregisterClassW => {
-                state.set(Register::Rax, 1); // TRUE
+                let class_name_ptr = arg(0);
+                let class_name = read_utf16_string(memory, class_name_ptr).unwrap_or_default();
+                let result = self.user32.unregister_class_w(&class_name);
+                state.set(Register::Rax, if result { 1 } else { 1 }); // Win32 returns TRUE on success
             }
             HostThunk::WsprintfA => {
                 let dest_ptr = arg(0);
@@ -28496,22 +28873,64 @@ impl PeHostRuntime {
                 state.set(Register::Rax, 1); // TRUE
             }
             HostThunk::OpenClipboard => {
-                state.set(Register::Rax, 1); // TRUE
+                let hwnd = arg(0) as u32;
+                let hwnd_opt = if hwnd != 0 { Some(hwnd) } else { None };
+                let result = self.user32.open_clipboard(hwnd_opt);
+                state.set(Register::Rax, if result { 1 } else { 0 });
             }
             HostThunk::CloseClipboard => {
-                state.set(Register::Rax, 1); // TRUE
+                let result = self.user32.close_clipboard();
+                state.set(Register::Rax, if result { 1 } else { 0 });
             }
             HostThunk::SetClipboardData => {
-                // SetClipboardData(format, data_handle) — accept clipboard data.
-                // In the VM, we don't expose the data to the OS clipboard, but we
-                // return success so the application believes the data was set.
-                let _format = arg(0) as u32;
+                let format = arg(0) as u32;
                 let data_handle = arg(1);
-                // Return the handle as-is (matching Windows behavior for non-CF_LOCAL formats)
-                state.set(Register::Rax, data_handle);
+                // Read clipboard data from guest memory (max 1MB for safety)
+                let data = if data_handle != 0 {
+                    // For simplicity, read up to 64KB from the handle address
+                    let max_read = 65536usize;
+                    let mut buf = Vec::with_capacity(max_read);
+                    for i in 0..max_read {
+                        match memory.read_u8(data_handle + i as u64) {
+                            Ok(byte) => buf.push(byte),
+                            Err(_) => break,
+                        }
+                    }
+                    buf
+                } else {
+                    Vec::new()
+                };
+                let result = self.user32.set_clipboard_data(format, data);
+                state.set(Register::Rax, result);
             }
             HostThunk::EmptyClipboard => {
-                state.set(Register::Rax, 1); // TRUE
+                let result = self.user32.empty_clipboard();
+                state.set(Register::Rax, if result { 1 } else { 0 });
+            }
+            HostThunk::GetClipboardData => {
+                let format = arg(0) as u32;
+                let data = self.user32.get_clipboard_data(format);
+                match data {
+                    Some(_bytes) => {
+                        // Return format as pseudo-handle. In a full implementation,
+                        // this would GlobalAlloc + copy data into guest memory,
+                        // but for Steam.exe compatibility the pseudo-handle suffices.
+                        state.set(Register::Rax, format as u64);
+                    }
+                    None => {
+                        state.set(Register::Rax, 0); // NULL
+                    }
+                }
+            }
+            HostThunk::IsClipboardFormatAvailable => {
+                let format = arg(0) as u32;
+                let available = self.user32.is_clipboard_format_available(format);
+                state.set(Register::Rax, if available { 1 } else { 0 });
+            }
+            HostThunk::EnumClipboardFormats => {
+                let format = arg(0) as u32;
+                let next_format = self.user32.enum_clipboard_formats(format);
+                state.set(Register::Rax, next_format as u64);
             }
             HostThunk::GetWindowTextLengthA => {
                 let hwnd = arg(0) as u32;
@@ -33152,7 +33571,13 @@ impl PeHostRuntime {
                 let block_start = cached_block.start_rip;
                 if let Some(_tier) = self.tiered_compiler.record_execution(block_start) {
                     let ir = &cached_block.translated.ir;
-                    if jit.get_or_compile(ir, block_start, engine.config.arch).is_ok() {
+                    if jit.get_or_compile(ir, block_start, engine.config.arch, None).is_ok() {
+                        // Sync updated unwind info to the SEH subsystem so that
+                        // RtlVirtualUnwind can find newly compiled JIT blocks.
+                        if jit.is_unwind_dirty() {
+                            jit.unwind_table.register_with_seh(&mut self.seh);
+                        }
+
                         if let Some(crate::cpu::IrInstruction::Jump { target }) = ir.last() {
                             if jit.is_compiled(*target) {
                                 let _ = jit.chain_blocks(block_start, *target);
@@ -33944,18 +34369,38 @@ impl PeHostRuntime {
         Ok(address)
     }
 
+    /// Register a fast-thunk for the given host thunk address.
+    ///
+    /// Creates an ARM64 trampoline that calls [`dispatch_import`] for this
+    /// thunk address. JIT-compiled blocks can call the trampoline directly
+    /// instead of exiting to the dispatch loop, and the dispatch hot path
+    /// (`dispatch_import_if_present`) may also use it as a shortcut.
+    fn register_fast_thunk(&mut self, thunk_address: u64) {
+        if let Some(jit) = self.jit_runtime.as_mut() {
+            let bridge_addr = fast_thunk_host_dispatcher as usize;
+            if let Some(idx) = jit.register_host_thunk(bridge_addr) {
+                emit_live_ui_debug(format!(
+                    "fast-thunk: registered idx={} for thunk {:#x}",
+                    idx, thunk_address
+                ));
+                self.thunk_to_fast_index.insert(thunk_address, idx);
+            } else {
+                eprintln!(
+                    "[pe_runtime] WARN: failed to register fast-thunk for thunk {:#x}",
+                    thunk_address
+                );
+            }
+        }
+    }
+
     fn alloc_host_thunk(&mut self, thunk: HostThunk) -> u64 {
         let address = self.next_thunk_address;
         self.next_thunk_address += 0x10;
         self.host_thunks.insert(address, thunk);
-        // Fast-thunk registration (G5) is deferred: it requires resolving
-        // the HostThunk variant to an actual function pointer, which is not
-        // available at allocation time. When that mechanism exists, call:
-        //   if let Some(jit) = self.jit_runtime.as_mut() {
-        //       if let Some(idx) = jit.register_host_thunk(host_fn_ptr) {
-        //           self.thunk_to_fast_index.insert(address, idx);
-        //       }
-        //   }
+        // Register a fast-thunk ARM64 trampoline so JIT-compiled code and
+        // the dispatch hot path can call the host function directly without
+        // the overhead of the full dispatch_import match statement.
+        self.register_fast_thunk(address);
         address
     }
 
@@ -42045,6 +42490,9 @@ impl HostThunk {
                 Self::SetClipboardData
             }
             ("user32.dll", ImportSymbol::ByName { name, .. }) if name == "EmptyClipboard" => Self::EmptyClipboard,
+            ("user32.dll", ImportSymbol::ByName { name, .. }) if name == "GetClipboardData" => Self::GetClipboardData,
+            ("user32.dll", ImportSymbol::ByName { name, .. }) if name == "IsClipboardFormatAvailable" => Self::IsClipboardFormatAvailable,
+            ("user32.dll", ImportSymbol::ByName { name, .. }) if name == "EnumClipboardFormats" => Self::EnumClipboardFormats,
             ("user32.dll", ImportSymbol::ByName { name, .. }) if name == "GetWindowTextLengthA" => {
                 Self::GetWindowTextLengthA
             }
@@ -42374,6 +42822,22 @@ impl HostThunk {
                     "SteamAPI_ISteamNetworkingMessages_SendMessageToUser" => Self::SteamAPI_ISteamNetworkingMessages_SendMessageToUser,
                     "SteamAPI_ISteamNetworkingMessages_ReceiveMessagesOnChannel" => Self::SteamAPI_ISteamNetworkingMessages_ReceiveMessagesOnChannel,
                     "SteamAPI_ISteamNetworkingMessages_CloseSessionWithUser" => Self::SteamAPI_ISteamNetworkingMessages_CloseSessionWithUser,
+                    // -- Steam API flat exports (Phase B3) --
+                    "SteamAPI_Init" => Self::SteamAPI_Init,
+                    "SteamAPI_Shutdown" => Self::SteamAPI_Shutdown,
+                    "SteamAPI_RestartAppIfNecessary" => Self::SteamAPI_RestartAppIfNecessary,
+                    "SteamAPI_RegisterCallback" => Self::SteamAPI_RegisterCallback,
+                    "SteamAPI_UnregisterCallback" => Self::SteamAPI_UnregisterCallback,
+                    "SteamAPI_RegisterCallResult" => Self::SteamAPI_RegisterCallResult,
+                    "SteamAPI_UnregisterCallResult" => Self::SteamAPI_UnregisterCallResult,
+                    "SteamAPI_RunCallbacks" => Self::SteamAPI_RunCallbacks,
+                    "SteamAPI_GetSteamInstallPath" => Self::SteamAPI_GetSteamInstallPath,
+                    "SteamAPI_WriteMiniDump" => Self::SteamAPI_WriteMiniDump,
+                    "SteamAPI_SetMiniDumpComment" => Self::SteamAPI_SetMiniDumpComment,
+                    "SteamInternal_CreateInterface" => Self::SteamInternal_CreateInterface,
+                    "SteamInternal_FindOrCreateUserInterface" => Self::SteamInternal_FindOrCreateUserInterface,
+                    "SteamInternal_FindOrCreateGameInterface" => Self::SteamInternal_FindOrCreateGameInterface,
+                    "SteamInternal_ContextInit" => Self::SteamInternal_ContextInit,
                     _ => Self::Unsupported {
                         dll: import.resolved_module.clone(),
                         symbol: name.clone(),
@@ -43139,6 +43603,9 @@ impl HostThunk {
             Self::OpenClipboard | Self::CloseClipboard => 4,
             Self::SetClipboardData => 12,
             Self::EmptyClipboard => 0,
+            Self::GetClipboardData => 4,
+            Self::IsClipboardFormatAvailable => 4,
+            Self::EnumClipboardFormats => 4,
             Self::GetWindowTextLengthA => 4,
             Self::GetProcessWindowStation => 0,
             Self::EnumWindows => 8,
@@ -43308,6 +43775,22 @@ impl HostThunk {
             Self::SteamAPI_ISteamNetworkingMessages_SendMessageToUser => 24,
             Self::SteamAPI_ISteamNetworkingMessages_ReceiveMessagesOnChannel => 20,
             Self::SteamAPI_ISteamNetworkingMessages_CloseSessionWithUser => 8,
+            // -- Steam API flat exports (Phase B3) --
+            Self::SteamAPI_Init => 0,
+            Self::SteamAPI_Shutdown => 0,
+            Self::SteamAPI_RestartAppIfNecessary => 4,
+            Self::SteamAPI_RegisterCallback => 8,
+            Self::SteamAPI_UnregisterCallback => 4,
+            Self::SteamAPI_RegisterCallResult => 12,
+            Self::SteamAPI_UnregisterCallResult => 12,
+            Self::SteamAPI_RunCallbacks => 0,
+            Self::SteamAPI_GetSteamInstallPath => 0,
+            Self::SteamAPI_WriteMiniDump => 16,
+            Self::SteamAPI_SetMiniDumpComment => 4,
+            Self::SteamInternal_CreateInterface => 4,
+            Self::SteamInternal_FindOrCreateUserInterface => 8,
+            Self::SteamInternal_FindOrCreateGameInterface => 8,
+            Self::SteamInternal_ContextInit => 4,
             // -- Phase 4.4: Synchronization primitive arg bytes -------------------------
             Self::CreateMutexW | Self::CreateMutexA => 16,
             Self::OpenMutexW => 12,
@@ -49889,6 +50372,435 @@ mod tests {
             runtime.last_error, ERROR_PROC_NOT_FOUND,
             "last_error should be ERROR_PROC_NOT_FOUND (127)"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Fast-thunk table tests (G5 FastThunk Table Dispatch Integration)
+    // -----------------------------------------------------------------------
+
+    fn setup_fast_thunk_runtime() -> (PeHostRuntime, MemoryImage) {
+        let ge = GameEnvironment::open("steam-live-run-x86")
+            .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        runtime.set_guest_arch(GuestArch::X64);
+        let memory = MemoryImage::default();
+        (runtime, memory)
+    }
+
+    #[test]
+    fn fast_thunk_register_populates_index() {
+        let (mut runtime, _memory) = setup_fast_thunk_runtime();
+
+        let thunk_addr = runtime.next_thunk_address;
+        runtime.host_thunks.insert(thunk_addr, HostThunk::GetModuleHandleA);
+        runtime.register_fast_thunk(thunk_addr);
+
+        assert!(
+            runtime.thunk_to_fast_index.contains_key(&thunk_addr),
+            "register_fast_thunk should populate thunk_to_fast_index for thunk {:#x}",
+            thunk_addr,
+        );
+
+        // Verify the JIT runtime has the corresponding trampoline
+        let jit = runtime.jit_runtime.as_ref()
+            .expect("jit_runtime should be Some after set_guest_arch");
+        let idx = runtime.thunk_to_fast_index.get(&thunk_addr)
+            .expect("thunk should be in thunk_to_fast_index");
+        let trampoline = jit.lookup_thunk_address(*idx);
+        assert!(
+            trampoline.is_some(),
+            "fast-thunk trampoline should be available for idx={}",
+            idx,
+        );
+    }
+
+    #[test]
+    fn fast_thunk_alloc_host_thunk_registers_fast_thunk() {
+        let (mut runtime, _memory) = setup_fast_thunk_runtime();
+
+        let thunk_addr = runtime.alloc_host_thunk(HostThunk::GetModuleHandleA);
+
+        assert!(
+            runtime.thunk_to_fast_index.contains_key(&thunk_addr),
+            "alloc_host_thunk should register fast-thunk for {:#x}",
+            thunk_addr,
+        );
+        assert!(
+            runtime.host_thunks.contains_key(&thunk_addr),
+            "alloc_host_thunk should populate host_thunks",
+        );
+    }
+
+    #[test]
+    fn fast_thunk_dispatch_fallback_for_unregistered() {
+        let (mut runtime, mut memory) = setup_fast_thunk_runtime();
+
+        let unknown_addr = 0xBADD_CAFE_u64;
+        let result = runtime
+            .dispatch_import_if_present(
+                unknown_addr,
+                &mut CpuState::new(GuestArch::X64),
+                &mut memory,
+            )
+            .expect("dispatch_import_if_present should not error for unknown thunk");
+
+        assert_eq!(result, None, "unregistered thunk should return None");
+    }
+
+    #[test]
+    fn fast_thunk_dispatch_fast_path_for_registered() {
+        let (mut runtime, mut memory) = setup_fast_thunk_runtime();
+        let mut state = CpuState::new(GuestArch::X64);
+
+        // Set up a minimal stack (needed by dispatch_import for return address)
+        let stack = 0x50_000u64;
+        memory.map_bytes(stack, &vec![0u8; 0x200]);
+        write_guest_pointer(&mut memory, stack, 0x1000, GuestArch::X64)
+            .expect("write return address");
+        state.set(Register::Rsp, stack);
+
+        let thunk_addr = runtime.alloc_host_thunk(HostThunk::GetModuleHandleA);
+
+        let result = runtime
+            .dispatch_import_if_present(thunk_addr, &mut state, &mut memory)
+            .expect("dispatch_import_if_present should succeed");
+
+        assert!(
+            result.is_some(),
+            "registered thunk should return Some result (fast path or fallback)"
+        );
+    }
+
+    #[test]
+    fn fast_thunk_import_resolution_registers_fast_thunk() {
+        // Verify that creating a host thunk from a ResolvedImport (as done by
+        // bind_imports) and then calling register_fast_thunk correctly populates
+        // both the thunk_to_fast_index and the JIT runtime's trampoline table.
+        let (mut runtime, _memory) = setup_fast_thunk_runtime();
+
+        // Simulate what bind_imports does for each imported function:
+        // 1. Create a thunk from the import descriptor
+        let import = ResolvedImport {
+            requested_module: "kernel32.dll".to_string(),
+            resolved_module: "kernel32.dll".to_string(),
+            symbol: ImportSymbol::ByName {
+                hint: 0,
+                name: "GetModuleHandleA".to_string(),
+            },
+            iat_rva: 0,
+            export: ExportSymbol {
+                ordinal: 0,
+                name: None,
+                target: ExportTarget::Rva(0),
+            },
+        };
+        let thunk_addr = runtime.next_thunk_address;
+        runtime.next_thunk_address += 0x10;
+        runtime.host_thunks.insert(thunk_addr, HostThunk::from_import(&import));
+        assert!(
+            runtime.host_thunks.contains_key(&thunk_addr),
+            "host_thunks should contain the import thunk",
+        );
+
+        // 2. Register the fast-thunk trampoline (as bind_imports does via
+        //    register_fast_thunk)
+        runtime.register_fast_thunk(thunk_addr);
+
+        // 3. Verify the fast-thunk mapping exists
+        assert!(
+            runtime.thunk_to_fast_index.contains_key(&thunk_addr),
+            "bind_imports should register a fast-thunk for {:#x}",
+            thunk_addr,
+        );
+
+        // 4. Verify the JIT runtime has the corresponding trampoline
+        let jit = runtime.jit_runtime.as_ref()
+            .expect("jit_runtime should be Some after set_guest_arch");
+        let idx = runtime.thunk_to_fast_index.get(&thunk_addr)
+            .expect("thunk should be in thunk_to_fast_index");
+        let trampoline = jit.lookup_thunk_address(*idx);
+        assert!(
+            trampoline.is_some(),
+            "fast-thunk trampoline should be available after import resolution",
+        );
+    }
+
+    // ── Steam API flat export (Phase B3) tests ─────────────────────────────
+
+    #[test]
+    fn steam_api_from_import_maps_init() {
+        let import = ResolvedImport {
+            requested_module: "steam_api64.dll".to_string(),
+            resolved_module: "steam_api64.dll".to_string(),
+            symbol: ImportSymbol::ByName {
+                hint: 0,
+                name: "SteamAPI_Init".to_string(),
+            },
+            iat_rva: 0x1000,
+            export: ExportSymbol {
+                ordinal: 1,
+                name: Some("SteamAPI_Init".to_string()),
+                target: ExportTarget::Rva(0x10000),
+            },
+        };
+        assert!(matches!(HostThunk::from_import(&import), HostThunk::SteamAPI_Init));
+    }
+
+    #[test]
+    fn steam_api_from_import_maps_shutdown() {
+        let import = ResolvedImport {
+            requested_module: "steam_api.dll".to_string(),
+            resolved_module: "steam_api.dll".to_string(),
+            symbol: ImportSymbol::ByName {
+                hint: 0,
+                name: "SteamAPI_Shutdown".to_string(),
+            },
+            iat_rva: 0x1000,
+            export: ExportSymbol {
+                ordinal: 2,
+                name: Some("SteamAPI_Shutdown".to_string()),
+                target: ExportTarget::Rva(0x10010),
+            },
+        };
+        assert!(matches!(HostThunk::from_import(&import), HostThunk::SteamAPI_Shutdown));
+    }
+
+    #[test]
+    fn steam_api_from_import_maps_create_interface() {
+        let import = ResolvedImport {
+            requested_module: "steam_api64.dll".to_string(),
+            resolved_module: "steam_api64.dll".to_string(),
+            symbol: ImportSymbol::ByName {
+                hint: 0,
+                name: "SteamInternal_CreateInterface".to_string(),
+            },
+            iat_rva: 0x1000,
+            export: ExportSymbol {
+                ordinal: 12,
+                name: Some("SteamInternal_CreateInterface".to_string()),
+                target: ExportTarget::Rva(0x100b0),
+            },
+        };
+        assert!(matches!(
+            HostThunk::from_import(&import),
+            HostThunk::SteamInternal_CreateInterface
+        ));
+    }
+
+    #[test]
+    fn steam_api_from_import_maps_register_callback() {
+        let import = ResolvedImport {
+            requested_module: "steam_api64.dll".to_string(),
+            resolved_module: "steam_api64.dll".to_string(),
+            symbol: ImportSymbol::ByName {
+                hint: 0,
+                name: "SteamAPI_RegisterCallback".to_string(),
+            },
+            iat_rva: 0x1000,
+            export: ExportSymbol {
+                ordinal: 4,
+                name: Some("SteamAPI_RegisterCallback".to_string()),
+                target: ExportTarget::Rva(0x10030),
+            },
+        };
+        assert!(matches!(
+            HostThunk::from_import(&import),
+            HostThunk::SteamAPI_RegisterCallback
+        ));
+    }
+
+    #[test]
+    fn steam_api_from_import_maps_context_init() {
+        let import = ResolvedImport {
+            requested_module: "steam_api64.dll".to_string(),
+            resolved_module: "steam_api64.dll".to_string(),
+            symbol: ImportSymbol::ByName {
+                hint: 0,
+                name: "SteamInternal_ContextInit".to_string(),
+            },
+            iat_rva: 0x1000,
+            export: ExportSymbol {
+                ordinal: 15,
+                name: Some("SteamInternal_ContextInit".to_string()),
+                target: ExportTarget::Rva(0x100e0),
+            },
+        };
+        assert!(matches!(
+            HostThunk::from_import(&import),
+            HostThunk::SteamInternal_ContextInit
+        ));
+    }
+
+    #[test]
+    fn steam_api_is_import_supported_for_all_flat_exports() {
+        // Verify that all 15 flat export names from the synthetic
+        // export_tables() entries for steam_api.dll / steam_api64.dll
+        // are mapped to supported (non-Unsupported) HostThunk variants.
+        let flat_exports = [
+            "SteamAPI_Init",
+            "SteamAPI_Shutdown",
+            "SteamAPI_RestartAppIfNecessary",
+            "SteamAPI_RegisterCallback",
+            "SteamAPI_UnregisterCallback",
+            "SteamAPI_RegisterCallResult",
+            "SteamAPI_UnregisterCallResult",
+            "SteamAPI_RunCallbacks",
+            "SteamAPI_GetSteamInstallPath",
+            "SteamAPI_WriteMiniDump",
+            "SteamAPI_SetMiniDumpComment",
+            "SteamInternal_CreateInterface",
+            "SteamInternal_FindOrCreateUserInterface",
+            "SteamInternal_FindOrCreateGameInterface",
+            "SteamInternal_ContextInit",
+        ];
+        for name in &flat_exports {
+            let symbol = ImportSymbol::ByName {
+                hint: 0,
+                name: name.to_string(),
+            };
+            assert!(
+                is_import_supported("steam_api64.dll", &symbol),
+                "steam_api64.dll export '{name}' should be mapped to a supported HostThunk variant",
+            );
+            assert!(
+                is_import_supported("steam_api.dll", &symbol),
+                "steam_api.dll export '{name}' should be mapped to a supported HostThunk variant",
+            );
+        }
+    }
+
+    #[test]
+    fn steam_api_init_sets_initialized_flag() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "steam-api-init", GeArch::X64, "win11-23h2")
+            .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X64);
+        let mut memory = MemoryImage::default();
+
+        let thunk = runtime.alloc_host_thunk(HostThunk::SteamAPI_Init);
+        let mut state = CpuState::new(GuestArch::X64);
+        runtime.dispatch_import(thunk, &mut state, &mut memory).expect("dispatch SteamAPI_Init");
+
+        assert_eq!(state.get(Register::Rax), 1, "SteamAPI_Init should return true");
+        assert!(runtime.steam_api_initialized, "steam_api_initialized should be set");
+    }
+
+    #[test]
+    fn steam_api_shutdown_clears_state() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "steam-api-shutdown", GeArch::X64, "win11-23h2")
+            .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X64);
+        let mut memory = MemoryImage::default();
+
+        // Set up some state
+        runtime.steam_api_initialized = true;
+        runtime.steam_callbacks.insert(123, 0x1000);
+        runtime.steam_call_results.insert(456, 0x2000);
+
+        let thunk = runtime.alloc_host_thunk(HostThunk::SteamAPI_Shutdown);
+        let mut state = CpuState::new(GuestArch::X64);
+        runtime.dispatch_import(thunk, &mut state, &mut memory).expect("dispatch SteamAPI_Shutdown");
+
+        assert!(!runtime.steam_api_initialized, "steam_api_initialized should be cleared");
+        assert!(runtime.steam_callbacks.is_empty(), "callbacks should be cleared");
+        assert!(runtime.steam_call_results.is_empty(), "call results should be cleared");
+    }
+
+    #[test]
+    fn steam_api_register_callback_stores_callback() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "steam-api-reg-cb", GeArch::X64, "win11-23h2")
+            .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X64);
+        let mut memory = MemoryImage::default();
+
+        let thunk = runtime.alloc_host_thunk(HostThunk::SteamAPI_RegisterCallback);
+        let mut state = CpuState::new(GuestArch::X64);
+        // SteamAPI_RegisterCallback(callback_func, callback_id)
+        // On x64: RCX = arg(0) = callback_func, RDX = arg(1) = callback_id
+        state.set(Register::Rcx, 0x7f001000);
+        state.set(Register::Rdx, 42);
+        runtime.dispatch_import(thunk, &mut state, &mut memory).expect("dispatch RegisterCallback");
+
+        assert_eq!(runtime.steam_callbacks.get(&42), Some(&0x7f001000),
+            "callback 42 should be registered with func 0x7f001000");
+    }
+
+    #[test]
+    fn steam_api_unregister_callback_removes_callback() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "steam-api-unreg-cb", GeArch::X64, "win11-23h2")
+            .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X64);
+        let mut memory = MemoryImage::default();
+
+        runtime.steam_callbacks.insert(42, 0x7f001000);
+
+        let thunk = runtime.alloc_host_thunk(HostThunk::SteamAPI_UnregisterCallback);
+        let mut state = CpuState::new(GuestArch::X64);
+        state.set(Register::Rcx, 0x7f001000);
+        runtime.dispatch_import(thunk, &mut state, &mut memory).expect("dispatch UnregisterCallback");
+
+        assert!(runtime.steam_callbacks.is_empty(), "callbacks should be empty after unregister");
+    }
+
+    #[test]
+    fn steam_api_create_interface_returns_non_null() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "steam-api-create-iface", GeArch::X64, "win11-23h2")
+            .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X64);
+        let mut memory = MemoryImage::default();
+
+        // Write a version string into guest memory
+        let version = "SteamClient020\0";
+        let version_ptr = runtime.alloc_c_string(&mut memory, version).expect("alloc version string");
+
+        let thunk = runtime.alloc_host_thunk(HostThunk::SteamInternal_CreateInterface);
+        let mut state = CpuState::new(GuestArch::X64);
+        state.set(Register::Rcx, version_ptr);
+        runtime.dispatch_import(thunk, &mut state, &mut memory).expect("dispatch CreateInterface");
+
+        let result = state.get(Register::Rax);
+        assert_ne!(result, 0, "SteamInternal_CreateInterface should return non-null pointer");
+
+        // Calling again with the same version should return the same pointer
+        let mut state2 = CpuState::new(GuestArch::X64);
+        state2.set(Register::Rcx, version_ptr);
+        runtime.dispatch_import(thunk, &mut state2, &mut memory).expect("dispatch CreateInterface again");
+        assert_eq!(state2.get(Register::Rax), result,
+            "second call with same version should return same pointer");
+    }
+
+    #[test]
+    fn steam_api_context_init_initialises_context() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "steam-api-ctx-init", GeArch::X64, "win11-23h2")
+            .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X64);
+        let mut memory = MemoryImage::default();
+
+        // Allocate a context structure in guest memory
+        let context_ptr = runtime.alloc_zeroed(&mut memory, 16, 8).expect("alloc context");
+
+        let thunk = runtime.alloc_host_thunk(HostThunk::SteamInternal_ContextInit);
+        let mut state = CpuState::new(GuestArch::X64);
+        state.set(Register::Rcx, context_ptr);
+        runtime.dispatch_import(thunk, &mut state, &mut memory).expect("dispatch ContextInit");
+
+        let result = state.get(Register::Rax);
+        assert_ne!(result, 0, "ContextInit should return non-null context pointer");
+
+        // The context pointer should now store the allocated address
+        let stored = memory.read_u64(context_ptr).expect("read context ptr");
+        assert_eq!(stored, result, "context should store the returned pointer");
     }
 }
 

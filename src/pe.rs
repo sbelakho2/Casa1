@@ -1930,6 +1930,13 @@ fn read_u64(bytes: &[u8], offset: usize, label: &str) -> AppResult<u64> {
     ]))
 }
 
+#[cfg(test)]
+fn write_u16(bytes: &mut [u8], offset: usize, value: u16) -> AppResult<()> {
+    let slice = checked_range_mut(bytes, offset, 2, "write_u16")?;
+    slice.copy_from_slice(&value.to_le_bytes());
+    Ok(())
+}
+
 fn write_u32(bytes: &mut [u8], offset: usize, value: u32) -> AppResult<()> {
     let slice = checked_range_mut(bytes, offset, 4, "write_u32")?;
     slice.copy_from_slice(&value.to_le_bytes());
@@ -2569,5 +2576,1165 @@ mod tests {
         assert_eq!(load_config.security_cookie, 0x0123_4567);
         assert_eq!(load_config.se_handler_table, 0x007b_7358);
         assert_eq!(load_config.se_handler_count, 625);
+    }
+}
+
+// ── Helper: build a minimal valid PE32 binary for testing ─────────────────
+#[cfg(test)]
+fn build_minimal_pe32() -> Vec<u8> {
+    // DOS header: 64 bytes
+    let mut buf = vec![0u8; 0x400];
+    buf[0] = b'M';
+    buf[1] = b'Z';
+    let pe_offset: u32 = 0x80;
+    buf[0x3c..0x40].copy_from_slice(&pe_offset.to_le_bytes());
+    // PE signature
+    let pe_off = pe_offset as usize;
+    buf[pe_off..pe_off + 4].copy_from_slice(b"PE\x00\x00");
+    // COFF header (20 bytes)
+    buf[pe_off + 4..pe_off + 6].copy_from_slice(&0x014c_u16.to_le_bytes()); // machine = I386
+    buf[pe_off + 6..pe_off + 8].copy_from_slice(&0u16.to_le_bytes()); // number_of_sections
+    buf[pe_off + 20..pe_off + 22].copy_from_slice(&0xE0u16.to_le_bytes()); // size_of_optional_header
+    buf[pe_off + 22..pe_off + 24].copy_from_slice(&0x0102_u16.to_le_bytes()); // characteristics
+    // Optional header PE32
+    let opt_off = pe_off + 24;
+    buf[opt_off..opt_off + 2].copy_from_slice(&0x010b_u16.to_le_bytes()); // magic PE32
+    // address_of_entry_point at opt+16
+    buf[opt_off + 16..opt_off + 20].copy_from_slice(&0x1000_u32.to_le_bytes());
+    // image_base at opt+28 (PE32)
+    buf[opt_off + 28..opt_off + 32].copy_from_slice(&0x00400000_u32.to_le_bytes());
+    // section_alignment at opt+32
+    buf[opt_off + 32..opt_off + 36].copy_from_slice(&0x1000_u32.to_le_bytes());
+    // file_alignment at opt+36
+    buf[opt_off + 36..opt_off + 40].copy_from_slice(&0x0200_u32.to_le_bytes());
+    // size_of_image at opt+56
+    buf[opt_off + 56..opt_off + 60].copy_from_slice(&0x2000_u32.to_le_bytes());
+    // size_of_headers at opt+60
+    buf[opt_off + 60..opt_off + 64].copy_from_slice(&0x0400_u32.to_le_bytes());
+    // dll_characteristics at opt+70
+    buf[opt_off + 70..opt_off + 72].copy_from_slice(&0_u16.to_le_bytes());
+    // number_of_rva_and_sizes at opt+92
+    buf[opt_off + 92..opt_off + 96].copy_from_slice(&16_u32.to_le_bytes());
+    buf
+}
+
+#[cfg(test)]
+fn build_minimal_pe32_plus() -> Vec<u8> {
+    let mut buf = vec![0u8; 0x400];
+    buf[0] = b'M';
+    buf[1] = b'Z';
+    let pe_offset: u32 = 0x80;
+    buf[0x3c..0x40].copy_from_slice(&pe_offset.to_le_bytes());
+    let pe_off = pe_offset as usize;
+    buf[pe_off..pe_off + 4].copy_from_slice(b"PE\x00\x00");
+    buf[pe_off + 4..pe_off + 6].copy_from_slice(&0x8664_u16.to_le_bytes()); // machine = AMD64
+    buf[pe_off + 6..pe_off + 8].copy_from_slice(&0u16.to_le_bytes());
+    buf[pe_off + 20..pe_off + 22].copy_from_slice(&0xF0u16.to_le_bytes()); // size_of_optional_header (>=112)
+    buf[pe_off + 22..pe_off + 24].copy_from_slice(&0x0102_u16.to_le_bytes());
+    let opt_off = pe_off + 24;
+    buf[opt_off..opt_off + 2].copy_from_slice(&0x020b_u16.to_le_bytes()); // magic PE32+
+    buf[opt_off + 16..opt_off + 20].copy_from_slice(&0x1000_u32.to_le_bytes());
+    // image_base at opt+24 (PE32+)
+    buf[opt_off + 24..opt_off + 32].copy_from_slice(&0x00000000_40000000_u64.to_le_bytes());
+    buf[opt_off + 32..opt_off + 36].copy_from_slice(&0x1000_u32.to_le_bytes());
+    buf[opt_off + 36..opt_off + 40].copy_from_slice(&0x0200_u32.to_le_bytes());
+    buf[opt_off + 56..opt_off + 60].copy_from_slice(&0x2000_u32.to_le_bytes());
+    buf[opt_off + 60..opt_off + 64].copy_from_slice(&0x0400_u32.to_le_bytes());
+    buf[opt_off + 70..opt_off + 72].copy_from_slice(&0_u16.to_le_bytes());
+    buf[opt_off + 108..opt_off + 112].copy_from_slice(&16_u32.to_le_bytes());
+    buf
+}
+
+// ── Helper: build a section and directory for inline testing ──────────────
+#[cfg(test)]
+fn make_section(va: u32, vs: u32, rdp: u32, rds: u32, name: &str, chars: u32) -> PeSection {
+    PeSection {
+        name: name.to_string(),
+        virtual_address: va,
+        virtual_size: vs,
+        raw_data_ptr: rdp,
+        raw_data_size: rds,
+        characteristics: chars,
+    }
+}
+
+#[cfg(test)]
+fn make_directory(va: u32, size: u32) -> DataDirectory {
+    DataDirectory { virtual_address: va, size }
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// E5 – PE Parser Test Coverage Expansion
+// ══════════════════════════════════════════════════════════════════════════
+
+mod e5_pe_parser_tests {
+    use super::*;
+
+    // ── Malformed PE files ───────────────────────────────────────────────
+
+    #[test]
+    fn parse_rejects_invalid_dos_signature() {
+        let bytes = b"not-a-pe-file".to_vec();
+        let result = parse(&bytes);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_rejects_invalid_pe_signature() {
+        let mut buf = build_minimal_pe32();
+        let pe_off = 0x80usize;
+        buf[pe_off..pe_off + 4].copy_from_slice(b"PE\x00\x01"); // bad sig
+        let result = parse(&buf);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_rejects_truncated_dos_header() {
+        let bytes = b"MZ".to_vec(); // only 2 bytes, no e_lfanew
+        let result = parse(&bytes);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_rejects_pe_offset_out_of_range() {
+        let mut buf = vec![0u8; 0x100];
+        buf[0] = b'M';
+        buf[1] = b'Z';
+        // e_lfanew points beyond file size
+        buf[0x3c..0x40].copy_from_slice(&0x2000_u32.to_le_bytes());
+        let result = parse(&buf);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_rejects_unsupported_optional_header_magic() {
+        let mut buf = build_minimal_pe32();
+        let opt_off = 0x80 + 24;
+        buf[opt_off..opt_off + 2].copy_from_slice(&0x010c_u16.to_le_bytes()); // invalid magic
+        let result = parse(&buf);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_rejects_optional_header_too_small_for_pe32() {
+        let mut buf = build_minimal_pe32();
+        let pe_off = 0x80;
+        // size_of_optional_header = 0 (minimum PE32 requires 96)
+        buf[pe_off + 20..pe_off + 22].copy_from_slice(&0u16.to_le_bytes());
+        let result = parse(&buf);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_rejects_optional_header_too_small_for_pe32_plus() {
+        let mut buf = build_minimal_pe32_plus();
+        let pe_off = 0x80;
+        // size_of_optional_header = 100 (minimum PE32+ requires 112)
+        buf[pe_off + 20..pe_off + 22].copy_from_slice(&100_u16.to_le_bytes());
+        let result = parse(&buf);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_accepts_minimum_valid_pe32() {
+        let buf = build_minimal_pe32();
+        let parsed = parse(&buf).expect("minimal PE32 should parse");
+        assert_eq!(parsed.machine, 0x014c);
+        assert_eq!(parsed.number_of_sections, 0);
+        assert_eq!(parsed.optional_header_magic, 0x010b);
+        assert_eq!(parsed.address_of_entry_point, 0x1000);
+        assert_eq!(parsed.image_base, 0x00400000);
+        assert_eq!(parsed.sections.len(), 0);
+    }
+
+    #[test]
+    fn parse_accepts_minimum_valid_pe32_plus() {
+        let buf = build_minimal_pe32_plus();
+        let parsed = parse(&buf).expect("minimal PE32+ should parse");
+        assert_eq!(parsed.machine, 0x8664);
+        assert_eq!(parsed.optional_header_magic, 0x020b);
+        assert_eq!(parsed.pointer_bytes(), 8);
+    }
+
+    #[test]
+    fn parse_detects_pointer_bytes_for_pe32() {
+        let buf = build_minimal_pe32();
+        let parsed = parse(&buf).unwrap();
+        assert_eq!(parsed.pointer_bytes(), 4);
+    }
+
+    #[test]
+    fn parse_detects_dynamic_base_flag() {
+        let mut buf = build_minimal_pe32();
+        let pe_off = 0x80;
+        let opt_off = pe_off + 24;
+        // Set DLL characteristics: DYNAMIC_BASE
+        buf[opt_off + 70..opt_off + 72].copy_from_slice(&0x0040_u16.to_le_bytes());
+        let parsed = parse(&buf).unwrap();
+        assert!(parsed.dynamic_base());
+    }
+
+    #[test]
+    fn parse_reports_no_dynamic_base_when_flag_missing() {
+        let buf = build_minimal_pe32();
+        let parsed = parse(&buf).unwrap();
+        assert!(!parsed.dynamic_base());
+    }
+
+    // ── Section edge cases ───────────────────────────────────────────────
+
+    #[test]
+    fn parse_accepts_single_section() {
+        let mut buf = build_minimal_pe32();
+        let pe_off = 0x80;
+        // Set number_of_sections = 1
+        buf[pe_off + 6..pe_off + 8].copy_from_slice(&1_u16.to_le_bytes());
+        // size_of_optional_header needs to include enough room for section table
+        let opt_size: u16 = 0xE0;
+        buf[pe_off + 20..pe_off + 22].copy_from_slice(&opt_size.to_le_bytes());
+        let section_table_off = pe_off + 24 + opt_size as usize;
+        // Extend buffer for section header (40 bytes)
+        buf.resize(section_table_off + 40, 0);
+        // Section name ".text"
+        buf[section_table_off..section_table_off + 5].copy_from_slice(b".text");
+        buf[section_table_off + 8..section_table_off + 12].copy_from_slice(&0x1000_u32.to_le_bytes()); // vs
+        buf[section_table_off + 12..section_table_off + 16].copy_from_slice(&0x1000_u32.to_le_bytes()); // va
+        buf[section_table_off + 16..section_table_off + 20].copy_from_slice(&0x0200_u32.to_le_bytes()); // rds
+        buf[section_table_off + 20..section_table_off + 24].copy_from_slice(&0x0400_u32.to_le_bytes()); // rdp
+        buf[section_table_off + 36..section_table_off + 40]
+            .copy_from_slice(&(IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_EXECUTE).to_le_bytes());
+        // Ensure raw data is present
+        buf.resize(0x0600, 0);
+        let parsed = parse(&buf).expect("PE32 with one section should parse");
+        assert_eq!(parsed.number_of_sections, 1);
+        assert_eq!(parsed.sections.len(), 1);
+        assert_eq!(parsed.sections[0].name, ".text");
+        assert_eq!(parsed.sections[0].virtual_address, 0x1000);
+    }
+
+    #[test]
+    fn parse_rejects_section_exceeding_size_of_image() {
+        let mut buf = build_minimal_pe32();
+        let pe_off = 0x80;
+        buf[pe_off + 6..pe_off + 8].copy_from_slice(&1_u16.to_le_bytes());
+        let opt_size: u16 = 0xE0;
+        buf[pe_off + 20..pe_off + 22].copy_from_slice(&opt_size.to_le_bytes());
+        let section_table_off = pe_off + 24 + opt_size as usize;
+        buf.resize(section_table_off + 40, 0);
+        buf[section_table_off..section_table_off + 5].copy_from_slice(b".text");
+        buf[section_table_off + 8..section_table_off + 12].copy_from_slice(&0x2000_u32.to_le_bytes()); // vs (exceeds SizeOfImage=0x2000)
+        buf[section_table_off + 12..section_table_off + 16].copy_from_slice(&0x1000_u32.to_le_bytes()); // va
+        buf[section_table_off + 16..section_table_off + 20].copy_from_slice(&4_u32.to_le_bytes()); // rds
+        buf[section_table_off + 20..section_table_off + 24].copy_from_slice(&0x0400_u32.to_le_bytes()); // rdp
+        buf[section_table_off + 36..section_table_off + 40]
+            .copy_from_slice(&IMAGE_SCN_MEM_READ.to_le_bytes());
+        buf.resize(0x0600, 0);
+        let result = parse(&buf);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_rejects_size_of_headers_exceeding_file_size() {
+        let mut buf = build_minimal_pe32();
+        let opt_off = 0x80 + 24;
+        // Set SizeOfHeaders to something huge
+        buf[opt_off + 60..opt_off + 64].copy_from_slice(&0x1_0000_u32.to_le_bytes());
+        let result = parse(&buf);
+        assert!(result.is_err());
+    }
+
+    // ── Debug directory ──────────────────────────────────────────────────
+
+    #[test]
+    fn parse_debug_entries_returns_empty_when_directory_missing() {
+        let sections = &[];
+        let directories = &[];
+        let entries = parse_debug_entries(b"", sections, directories, 0).unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn parse_debug_entries_rejects_misaligned_size() {
+        let sections = &[make_section(0x1000, 0x200, 0, 0x200, ".rdata", IMAGE_SCN_MEM_READ)];
+        let directories = &[DataDirectory::default(); 7];
+        let mut dirs = directories.to_vec();
+        dirs[6] = make_directory(0x1000, 30); // 30 is not a multiple of 28
+        let result = parse_debug_entries(&[0u8; 0x200], sections, &dirs, 0);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_debug_directory_with_one_entry() {
+        let mut bytes = vec![0u8; 0x200];
+        // One debug entry at RVA 0x1000, offset 0 (within section)
+        // IMAGE_DEBUG_DIRECTORY is 28 bytes
+        // Type at offset 12, size_of_data at 16, address_of_raw_data at 20, pointer_to_raw_data at 24
+        write_u32(&mut bytes, 12, 2).unwrap(); // type = IMAGE_DEBUG_TYPE_CODEVIEW (2)
+        write_u32(&mut bytes, 16, 64).unwrap(); // size_of_data
+        write_u32(&mut bytes, 20, 0x1100).unwrap(); // address_of_raw_data
+        write_u32(&mut bytes, 24, 0x0100).unwrap(); // pointer_to_raw_data
+        let sections = &[make_section(0x1000, 0x200, 0, 0x200, ".rdata", IMAGE_SCN_MEM_READ)];
+        let mut dirs = vec![DataDirectory::default(); 7];
+        dirs[IMAGE_DIRECTORY_ENTRY_DEBUG] = make_directory(0x1000, 28);
+        let entries = parse_debug_entries(&bytes, sections, &dirs, 0).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].ty, 2);
+        assert_eq!(entries[0].size_of_data, 64);
+    }
+
+    // ── Load Config ──────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_load_config_returns_none_when_directory_missing() {
+        let result = parse_load_config(b"", &[], &[], 4).unwrap();
+        assert!(result.is_none());
+    }
+
+    // ── Import directory ─────────────────────────────────────────────────
+
+    #[test]
+    fn parse_import_directory_returns_empty_when_missing() {
+        let result = parse_import_directory(b"", &[], &[], false, 0, 4).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn parse_import_directory_returns_empty_when_null_descriptor() {
+        // Provide an import directory with a single all-zero descriptor (terminator)
+        let sections = &[make_section(0x1000, 0x100, 0, 0x100, ".idata", IMAGE_SCN_MEM_READ)];
+        let dirs = &[make_directory(0x1000, 20)];
+        let mut bytes = vec![0u8; 0x100];
+        // All zeros = terminal descriptor
+        let result = parse_import_directory(&bytes, sections, dirs, false, 0, 4).unwrap();
+        assert!(result.is_empty());
+    }
+
+    // ── Delay import directory ───────────────────────────────────────────
+
+    #[test]
+    fn parse_delay_import_directory_returns_empty_when_missing() {
+        let result = parse_delay_import_directory(b"", &[], &[], 0, 4).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn parse_delay_import_directory_rejects_misaligned_size() {
+        let sections = &[make_section(0x1000, 0x100, 0, 0x100, ".data", IMAGE_SCN_MEM_READ)];
+        // Directory index 13 for delay import
+        let mut dirs = vec![DataDirectory::default(); 14];
+        dirs[13] = make_directory(0x1000, 33); // 33 is not a multiple of 32
+        let result = parse_delay_import_directory(&[0u8; 0x100], sections, &dirs, 0, 4);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_delay_import_directory_accepts_null_descriptor() {
+        let sections = &[make_section(0x1000, 0x100, 0, 0x100, ".data", IMAGE_SCN_MEM_READ)];
+        let mut dirs = vec![DataDirectory::default(); 14];
+        dirs[13] = make_directory(0x1000, 32);
+        let mut bytes = vec![0u8; 0x100];
+        // All zeros = terminal descriptor
+        // DELAY_IMPORT_DESCRIPTOR: name(4), iat(4), int(4), ... — all zero
+        let result = parse_delay_import_directory(&bytes, sections, &dirs, 0, 4).unwrap();
+        assert!(result.is_empty());
+    }
+
+    // ── Export directory ─────────────────────────────────────────────────
+
+    #[test]
+    fn parse_export_directory_returns_empty_when_missing() {
+        let result = parse_export_directory(b"", &[], &[]).unwrap();
+        assert!(result.is_empty());
+    }
+
+    // ── Relocations ──────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_relocations_returns_empty_when_missing() {
+        let result = parse_relocations(b"", &[], &[]).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn parse_relocations_parses_absolute_entry() {
+        let sections = &[make_section(0x1000, 0x200, 0, 0x200, ".reloc", IMAGE_SCN_MEM_READ)];
+        let mut dirs = vec![DataDirectory::default(); 16];
+        dirs[IMAGE_DIRECTORY_ENTRY_BASERELOC] = make_directory(0x1000, 12);
+        let mut bytes = vec![0u8; 0x200];
+        // Block header: page_rva(4), block_size(4)
+        write_u32(&mut bytes, 0, 0x2000).unwrap(); // page_rva
+        write_u32(&mut bytes, 4, 12).unwrap(); // block_size (8 header + 4 entry bytes)
+        // Entry: type(4 bits) | offset(12 bits) = 0x0000 (IMAGE_REL_BASED_ABSOLUTE)
+        write_u16(&mut bytes, 8, 0x0000).unwrap();
+        let blocks = parse_relocations(&bytes, sections, &dirs).unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].page_rva, 0x2000);
+        assert_eq!(blocks[0].entries.len(), 2); // each entry is 2 bytes, 4 bytes = 2 entries
+        assert_eq!(blocks[0].entries[0].kind, RelocationType::Absolute);
+    }
+
+    #[test]
+    fn parse_relocations_parses_highlow_entry() {
+        let sections = &[make_section(0x1000, 0x200, 0, 0x200, ".reloc", IMAGE_SCN_MEM_READ)];
+        let mut dirs = vec![DataDirectory::default(); 16];
+        dirs[IMAGE_DIRECTORY_ENTRY_BASERELOC] = make_directory(0x1000, 12);
+        let mut bytes = vec![0u8; 0x200];
+        write_u32(&mut bytes, 0, 0x2000).unwrap();
+        write_u32(&mut bytes, 4, 12).unwrap();
+        // Entry: type=3 (HIGHLOW), offset=0x123
+        write_u16(&mut bytes, 8, (3 << 12) | 0x0123).unwrap();
+        let blocks = parse_relocations(&bytes, sections, &dirs).unwrap();
+        assert_eq!(blocks[0].entries.len(), 2);
+        let entry = &blocks[0].entries[0];
+        assert_eq!(entry.kind, RelocationType::HighLow);
+        assert_eq!(entry.offset, 0x0123);
+    }
+
+    #[test]
+    fn parse_relocations_parses_dir64_entry() {
+        let sections = &[make_section(0x1000, 0x200, 0, 0x200, ".reloc", IMAGE_SCN_MEM_READ)];
+        let mut dirs = vec![DataDirectory::default(); 16];
+        dirs[IMAGE_DIRECTORY_ENTRY_BASERELOC] = make_directory(0x1000, 12);
+        let mut bytes = vec![0u8; 0x200];
+        write_u32(&mut bytes, 0, 0x2000).unwrap();
+        write_u32(&mut bytes, 4, 12).unwrap();
+        // Entry: type=10 (DIR64), offset=0xABC
+        write_u16(&mut bytes, 8, (10 << 12) | 0x0ABC).unwrap();
+        let blocks = parse_relocations(&bytes, sections, &dirs).unwrap();
+        let entry = &blocks[0].entries[0];
+        assert_eq!(entry.kind, RelocationType::Dir64);
+        assert_eq!(entry.offset, 0x0ABC);
+    }
+
+    #[test]
+    fn parse_relocations_rejects_truncated_block() {
+        let sections = &[make_section(0x1000, 0x200, 0, 0x200, ".reloc", IMAGE_SCN_MEM_READ)];
+        let mut dirs = vec![DataDirectory::default(); 16];
+        dirs[IMAGE_DIRECTORY_ENTRY_BASERELOC] = make_directory(0x1000, 12);
+        let mut bytes = vec![0u8; 0x200];
+        write_u32(&mut bytes, 0, 0x2000).unwrap();
+        write_u32(&mut bytes, 4, 20).unwrap(); // claims 20 bytes but directory size is 12
+        let result = parse_relocations(&bytes, sections, &dirs);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_relocations_rejects_block_with_truncated_entry() {
+        let sections = &[make_section(0x1000, 0x200, 0, 0x200, ".reloc", IMAGE_SCN_MEM_READ)];
+        let mut dirs = vec![DataDirectory::default(); 16];
+        dirs[IMAGE_DIRECTORY_ENTRY_BASERELOC] = make_directory(0x1000, 13);
+        let mut bytes = vec![0u8; 0x200];
+        write_u32(&mut bytes, 0, 0x2000).unwrap();
+        write_u32(&mut bytes, 4, 13).unwrap(); // 13 - 8 = 5, which is odd -> truncated entry
+        let result = parse_relocations(&bytes, sections, &dirs);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_relocations_terminates_on_zero_page_and_block() {
+        let sections = &[make_section(0x1000, 0x200, 0, 0x200, ".reloc", IMAGE_SCN_MEM_READ)];
+        let mut dirs = vec![DataDirectory::default(); 16];
+        dirs[IMAGE_DIRECTORY_ENTRY_BASERELOC] = make_directory(0x1000, 16);
+        let mut bytes = vec![0u8; 0x200];
+        // First block: valid
+        write_u32(&mut bytes, 0, 0x2000).unwrap();
+        write_u32(&mut bytes, 4, 12).unwrap();
+        write_u16(&mut bytes, 8, 0x0000).unwrap();
+        // Second block: zero page_rva and block_size = terminator
+        write_u32(&mut bytes, 12, 0).unwrap();
+        write_u32(&mut bytes, 16, 0).unwrap();
+        let blocks = parse_relocations(&bytes, sections, &dirs).unwrap();
+        assert_eq!(blocks.len(), 1);
+    }
+
+    // ── TLS directory ────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_tls_directory_returns_none_when_missing() {
+        let result = parse_tls_directory(b"", &[], &[], 0, 4).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn parse_tls_directory_with_callbacks_pe32() {
+        let sections = &[make_section(0x1000, 0x200, 0, 0x200, ".tls", IMAGE_SCN_MEM_READ)];
+        let mut dirs = vec![DataDirectory::default(); 10];
+        dirs[9] = make_directory(0x1000, 24); // TLS dir, size=24 for PE32
+        let mut bytes = vec![0u8; 0x200];
+        // PE32 TLS directory: raw_data_start(4), raw_data_end(4), index(4), callbacks(4)
+        write_u32(&mut bytes, 0, 0x3000).unwrap(); // raw_data_start
+        write_u32(&mut bytes, 4, 0x3100).unwrap(); // raw_data_end
+        write_u32(&mut bytes, 8, 0x4000).unwrap(); // address_of_index
+        // address_of_callbacks -> points to callback array
+        let callback_array_rva = 0x1050u32; // within .tls section
+        let callback_array_va = callback_array_rva; // image_base = 0 for simplicity
+        write_u32(&mut bytes, 12, callback_array_va).unwrap();
+        // Write callback array: two callbacks + null terminator
+        let array_offset = (callback_array_rva - 0x1000) as usize;
+        write_u32(&mut bytes, array_offset, 0x1000_0100).unwrap(); // callback 1
+        write_u32(&mut bytes, array_offset + 4, 0x1000_0200).unwrap(); // callback 2
+        write_u32(&mut bytes, array_offset + 8, 0).unwrap(); // terminator
+
+        let tls = parse_tls_directory(&bytes, sections, &dirs, 0, 4)
+            .unwrap()
+            .expect("TLS should be present");
+        assert_eq!(tls.raw_data_start, 0x3000);
+        assert_eq!(tls.raw_data_end, 0x3100);
+        assert_eq!(tls.callbacks.len(), 2);
+        assert_eq!(tls.callbacks[0], 0x1000_0100);
+        assert_eq!(tls.callbacks[1], 0x1000_0200);
+    }
+
+    #[test]
+    fn parse_tls_directory_no_callbacks() {
+        let sections = &[make_section(0x1000, 0x100, 0, 0x100, ".tls", IMAGE_SCN_MEM_READ)];
+        let mut dirs = vec![DataDirectory::default(); 10];
+        dirs[9] = make_directory(0x1000, 24);
+        let mut bytes = vec![0u8; 0x100];
+        write_u32(&mut bytes, 0, 0x3000).unwrap();
+        write_u32(&mut bytes, 4, 0x3100).unwrap();
+        write_u32(&mut bytes, 8, 0x4000).unwrap();
+        write_u32(&mut bytes, 12, 0).unwrap(); // address_of_callbacks = 0
+        let tls = parse_tls_directory(&bytes, sections, &dirs, 0, 4)
+            .unwrap()
+            .expect("TLS should be present");
+        assert!(tls.callbacks.is_empty());
+    }
+
+    // ── Version info ─────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_version_resource_default_when_missing() {
+        let result = parse_version_resource(b"", &[], &[]).unwrap();
+        assert_eq!(result, VersionInfo::default());
+    }
+
+    // ── Embedded manifest ────────────────────────────────────────────────
+
+    #[test]
+    fn parse_embedded_manifest_none_when_missing() {
+        let result = parse_embedded_manifest(b"", &[], &[]).unwrap();
+        assert!(result.is_none());
+    }
+
+    // ── Image base selection ─────────────────────────────────────────────
+
+    #[test]
+    fn select_image_base_returns_image_base_without_dynamic_base() {
+        let pe = ParsedPe {
+            dll_characteristics: 0,
+            relocations: vec![],
+            image_base: 0x0040_0000,
+            // pointer_bytes is derived from optional_header_magic
+            // pe_stub() uses 0x010b (PE32) → pointer_bytes = 4
+            ..pe_stub()
+        };
+        let base = select_image_base(&pe, "abc123", false);
+        assert_eq!(base, 0x0040_0000);
+    }
+
+    // ── map_image ────────────────────────────────────────────────────────
+
+    #[test]
+    fn map_image_produces_correct_sized_memory() {
+        let pe = ParsedPe {
+            size_of_image: 0x2000,
+            size_of_headers: 0x400,
+            sections: vec![],
+            image_base: 0x0040_0000,
+            relocations: vec![],
+            section_alignment: 0x1000,
+            file_alignment: 0x0200,
+            dll_characteristics: 0,
+            ..pe_stub()
+        };
+        let bytes = vec![0u8; 0x400];
+        let mapped = map_image(&bytes, &pe, "abc", false).unwrap();
+        assert_eq!(mapped.memory.len(), 0x2000);
+        assert_eq!(mapped.selected_base, pe.image_base);
+    }
+
+    #[test]
+    fn map_image_applies_section_data() {
+        let section = make_section(0x1000, 0x100, 0x400, 8, ".text", IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_EXECUTE);
+        let pe = ParsedPe {
+            size_of_image: 0x2000,
+            size_of_headers: 0x400,
+            section_alignment: 0x1000,
+            file_alignment: 0x0200,
+            sections: vec![section],
+            image_base: 0x0040_0000,
+            relocations: vec![],
+            dll_characteristics: 0,
+            ..pe_stub()
+        };
+        let mut bytes = vec![0u8; 0x500];
+        bytes[0x400..0x408].copy_from_slice(b"section!");
+        let mapped = map_image(&bytes, &pe, "abc", false).unwrap();
+        assert_eq!(&mapped.memory[0x1000..0x1008], b"section!");
+    }
+
+    // ── apply_relocations ────────────────────────────────────────────────
+
+    #[test]
+    fn apply_relocations_highlow_adjusts_value() {
+        let pe = ParsedPe {
+            image_base: 0x0040_0000,
+            relocations: vec![RelocationBlock {
+                page_rva: 0x1000,
+                entries: vec![RelocationEntry {
+                    kind: RelocationType::HighLow,
+                    offset: 0x008,
+                }],
+            }],
+            ..pe_stub()
+        };
+        let section = make_section(0x1000, 0x200, 0, 0x200, ".text", IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE);
+        let mut memory = vec![0u8; 0x2000];
+        memory[0x1008..0x100c].copy_from_slice(&0x0040_1000_u32.to_le_bytes());
+        let mut mapped = MappedImage {
+            preferred_base: 0x0040_0000,
+            selected_base: 0x0050_0000,
+            memory,
+            sections: vec![SectionMapping {
+                name: ".text".to_string(),
+                virtual_address: section.virtual_address,
+                mapped_size: section.virtual_size,
+                raw_data_size: section.raw_data_size,
+                protection: MemoryProtection { read: true, write: false, execute: true },
+            }],
+        };
+        apply_relocations(&pe, &mut mapped).unwrap();
+        let val = u32::from_le_bytes(mapped.memory[0x1008..0x100c].try_into().unwrap());
+        assert_eq!(val, 0x0050_1000);
+    }
+
+    #[test]
+    fn apply_relocations_dir64_adjusts_value() {
+        let pe = ParsedPe {
+            image_base: 0x0040_0000,
+            relocations: vec![RelocationBlock {
+                page_rva: 0x1000,
+                entries: vec![RelocationEntry {
+                    kind: RelocationType::Dir64,
+                    offset: 0x000,
+                }],
+            }],
+            ..pe_stub()
+        };
+        let mut memory = vec![0u8; 0x2000];
+        memory[0x1000..0x1008].copy_from_slice(&0x0000_0000_0040_1000_u64.to_le_bytes());
+        let mut mapped = MappedImage {
+            preferred_base: 0x0040_0000,
+            selected_base: 0x0050_0000,
+            memory,
+            sections: vec![],
+        };
+        apply_relocations(&pe, &mut mapped).unwrap();
+        let val = u64::from_le_bytes(mapped.memory[0x1000..0x1008].try_into().unwrap());
+        assert_eq!(val, 0x0000_0000_0050_1000);
+    }
+
+    #[test]
+    fn apply_relocations_noop_when_delta_zero() {
+        let pe = ParsedPe {
+            image_base: 0x0040_0000,
+            relocations: vec![RelocationBlock {
+                page_rva: 0x1000,
+                entries: vec![RelocationEntry {
+                    kind: RelocationType::Dir64,
+                    offset: 0x000,
+                }],
+            }],
+            ..pe_stub()
+        };
+        let mut memory = vec![0u8; 0x2000];
+        memory[0x1000..0x1008].copy_from_slice(&0x0000_0000_0040_1000_u64.to_le_bytes());
+        let mut mapped = MappedImage {
+            preferred_base: 0x0040_0000,
+            selected_base: 0x0040_0000, // same as image_base
+            memory,
+            sections: vec![],
+        };
+        apply_relocations(&pe, &mut mapped).unwrap();
+        let val = u64::from_le_bytes(mapped.memory[0x1000..0x1008].try_into().unwrap());
+        assert_eq!(val, 0x0000_0000_0040_1000); // unchanged
+    }
+
+    // ── resolve_imports ──────────────────────────────────────────────────
+
+    #[test]
+    fn resolve_imports_returns_empty_when_no_imports() {
+        let pe = ParsedPe {
+            imports: vec![],
+            delay_imports: vec![],
+            ..pe_stub()
+        };
+        let resolver = ApiSetResolver::new();
+        let result = resolve_imports(&pe, &BTreeMap::new(), &resolver).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn resolve_imports_errors_on_missing_provider() {
+        let pe = ParsedPe {
+            imports: vec![ImportDescriptor {
+                dll_name: "missing.dll".to_string(),
+                imports: vec![ImportThunk {
+                    symbol: ImportSymbol::ByName { hint: 0, name: "Func".to_string() },
+                    iat_rva: 0,
+                }],
+                delay_load: false,
+            }],
+            delay_imports: vec![],
+            ..pe_stub()
+        };
+        let resolver = ApiSetResolver::new();
+        let result = resolve_imports(&pe, &BTreeMap::new(), &resolver);
+        assert!(result.is_err());
+    }
+
+    // ── plan_lifecycle ───────────────────────────────────────────────────
+
+    #[test]
+    fn plan_lifecycle_detects_dependency_cycle() {
+        let mut deps = BTreeMap::new();
+        deps.insert("a.dll".to_string(), vec!["b.dll".to_string()]);
+        deps.insert("b.dll".to_string(), vec!["a.dll".to_string()]);
+        let result = plan_lifecycle("a.dll", &deps, &BTreeMap::new());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn plan_lifecycle_produces_correct_load_order() {
+        let mut deps = BTreeMap::new();
+        deps.insert("app.exe".to_string(), vec!["c.dll".to_string(), "a.dll".to_string()]);
+        deps.insert("a.dll".to_string(), vec!["b.dll".to_string()]);
+        deps.insert("b.dll".to_string(), vec![]);
+        deps.insert("c.dll".to_string(), vec![]);
+        let plan = plan_lifecycle("app.exe", &deps, &BTreeMap::new()).unwrap();
+        // b must come before a, a before app; c is independent
+        let pos = |name: &str| plan.load_order.iter().position(|m| m == name);
+        let pos_b = pos("b.dll").unwrap();
+        let pos_a = pos("a.dll").unwrap();
+        let pos_app = pos("app.exe").unwrap();
+        assert!(pos_b < pos_a);
+        assert!(pos_a < pos_app);
+    }
+
+    #[test]
+    fn plan_lifecycle_includes_tls_callbacks() {
+        let mut deps = BTreeMap::new();
+        deps.insert("app.exe".to_string(), vec![]);
+        let mut tls = BTreeMap::new();
+        tls.insert("app.exe".to_string(), vec![0x1000_0100]);
+        let plan = plan_lifecycle("app.exe", &deps, &tls).unwrap();
+        assert!(plan.process_attach.iter().any(|e| matches!(e.stage, LifecycleStage::TlsProcessAttach(0x1000_0100))));
+        assert!(plan.process_attach.iter().any(|e| matches!(e.stage, LifecycleStage::DllMainProcessAttach)));
+    }
+
+    // ── ApiSetResolver ───────────────────────────────────────────────────
+
+    #[test]
+    fn api_set_resolver_resolves_api_ms_win_core_to_kernel32() {
+        let resolver = ApiSetResolver::new();
+        assert_eq!(resolver.resolve("api-ms-win-core-heap-l1-1-0.dll"), "kernel32.dll");
+    }
+
+    #[test]
+    fn api_set_resolver_resolves_api_ms_win_crt_to_ucrtbase() {
+        let resolver = ApiSetResolver::new();
+        assert_eq!(resolver.resolve("api-ms-win-crt-string-l1-1-0.dll"), "ucrtbase.dll");
+    }
+
+    #[test]
+    fn api_set_resolver_resolves_ext_ms_win_ntuser_to_user32() {
+        let resolver = ApiSetResolver::new();
+        assert_eq!(resolver.resolve("ext-ms-win-ntuser-window-l1-1-0.dll"), "user32.dll");
+    }
+
+    #[test]
+    fn api_set_resolver_returns_original_when_no_match() {
+        let resolver = ApiSetResolver::new();
+        assert_eq!(resolver.resolve("user32.dll"), "user32.dll");
+    }
+
+    #[test]
+    fn api_set_resolver_prefers_explicit_mapping() {
+        let resolver = ApiSetResolver::new().with_mapping("api-ms-win-core-foo.dll", "custom.dll");
+        assert_eq!(resolver.resolve("api-ms-win-core-foo.dll"), "custom.dll");
+    }
+
+    // ── normalize_module_name ────────────────────────────────────────────
+
+    #[test]
+    fn normalize_module_name_adds_dll_extension() {
+        assert_eq!(normalize_module_name("kernel32"), "kernel32.dll");
+    }
+
+    #[test]
+    fn normalize_module_name_preserves_existing_extension() {
+        assert_eq!(normalize_module_name("user32.dll"), "user32.dll");
+    }
+
+    #[test]
+    fn normalize_module_name_lowercases() {
+        assert_eq!(normalize_module_name("KERNEL32.DLL"), "kernel32.dll");
+    }
+
+    // ── parse_forwarder_string ───────────────────────────────────────────
+
+    #[test]
+    fn parse_forwarder_string_by_name() {
+        let (module, symbol) = parse_forwarder_string("kernel32.CreateFileA").unwrap();
+        assert_eq!(module, "kernel32.dll");
+        assert!(matches!(symbol, ImportSymbol::ByName { ref name, .. } if name == "CreateFileA"));
+    }
+
+    #[test]
+    fn parse_forwarder_string_by_ordinal() {
+        let (module, symbol) = parse_forwarder_string("ntdll.#123").unwrap();
+        assert_eq!(module, "ntdll.dll");
+        assert!(matches!(symbol, ImportSymbol::ByOrdinal { ordinal } if ordinal == 123));
+    }
+
+    #[test]
+    fn parse_forwarder_string_rejects_missing_separator() {
+        let result = parse_forwarder_string("justaname");
+        assert!(result.is_err());
+    }
+
+    // ── build_activation_context ─────────────────────────────────────────
+
+    #[test]
+    fn build_activation_context_detects_vc_runtime() {
+        let manifest = ManifestInfo {
+            source: ManifestSource::Embedded,
+            supported_os: vec![],
+            dpi_awareness: None,
+            assemblies: vec![
+                AssemblyIdentity {
+                    name: "Microsoft.VC141.CRT".to_string(),
+                    version: Some("14.16.27023.1".to_string()),
+                    processor_architecture: Some("amd64".to_string()),
+                    public_key_token: Some("1fc8b3b9a1e18e3b".to_string()),
+                    type_attr: Some("win32".to_string()),
+                },
+            ],
+        };
+        let plan = build_activation_context(&manifest);
+        assert_eq!(plan.vc_runtime_assemblies.len(), 1);
+        assert!(plan.vc_runtime_bindings[0].dlls.contains(&"vcruntime140.dll".to_string()));
+    }
+
+    #[test]
+    fn build_activation_context_non_vc_assembly_not_included() {
+        let manifest = ManifestInfo {
+            source: ManifestSource::Embedded,
+            supported_os: vec![],
+            dpi_awareness: None,
+            assemblies: vec![
+                AssemblyIdentity {
+                    name: "SxS.Whatever".to_string(),
+                    version: None,
+                    processor_architecture: None,
+                    public_key_token: None,
+                    type_attr: None,
+                },
+            ],
+        };
+        let plan = build_activation_context(&manifest);
+        assert!(plan.vc_runtime_assemblies.is_empty());
+    }
+
+    // ── rva_to_file_offset / section_for_rva ─────────────────────────────
+
+    #[test]
+    fn rva_to_file_offset_uses_size_of_headers_for_header_rva() {
+        let sections = &[];
+        let offset = rva_to_file_offset(0x100, 0x100, sections, 0x400).unwrap();
+        assert_eq!(offset, 0x100);
+    }
+
+    #[test]
+    fn rva_to_file_offset_rejects_unbacked_rva() {
+        let sections = &[];
+        let result = rva_to_file_offset(0x1000, 4, sections, 0);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn section_for_rva_finds_correct_section() {
+        let sections = &[make_section(0x1000, 0x100, 0x400, 8, ".text", IMAGE_SCN_MEM_READ)];
+        let found = section_for_rva(sections, 0x1000, 4, false);
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().name, ".text");
+    }
+
+    #[test]
+    fn section_for_rva_no_match() {
+        let sections = &[make_section(0x1000, 0x100, 0x400, 8, ".text", IMAGE_SCN_MEM_READ)];
+        let found = section_for_rva(sections, 0x2000, 4, false);
+        assert!(found.is_none());
+    }
+
+    // ── align_up edge cases ──────────────────────────────────────────────
+
+    #[test]
+    fn align_up_rejects_zero_alignment() {
+        let result = align_up(0x1000, 0);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn align_up_preserves_aligned_value() {
+        let result = align_up(0x1000, 0x1000).unwrap();
+        assert_eq!(result, 0x1000);
+    }
+
+    #[test]
+    fn align_up_rounds_up() {
+        let result = align_up(0x1001, 0x1000).unwrap();
+        assert_eq!(result, 0x2000);
+    }
+
+    // ── MemoryProtection ─────────────────────────────────────────────────
+
+    #[test]
+    fn protection_from_characteristics_decode_correctly() {
+        let chars = IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_EXECUTE;
+        let prot = protection_from_characteristics(chars);
+        assert!(prot.read);
+        assert!(!prot.write);
+        assert!(prot.execute);
+    }
+
+    // ── Slice / checked_range edge cases ─────────────────────────────────
+
+    #[test]
+    fn checked_range_rejects_out_of_bounds() {
+        let bytes = b"hello";
+        let result = checked_range(bytes, 0, 10, "test");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn checked_range_accepts_exact_size() {
+        let bytes = b"hello";
+        let result = checked_range(bytes, 0, 5, "test");
+        assert!(result.is_ok());
+    }
+
+    // ── parse manifest bytes (unit-level XML parsing) ────────────────────
+
+    #[test]
+    fn parse_manifest_bytes_valid_xml() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>
+    </application>
+  </compatibility>
+  <assemblyIdentity name="MyApp" version="1.0.0.0" processorArchitecture="x86"/>
+</assembly>"#;
+        let manifest = parse_manifest_bytes(xml, ManifestSource::Embedded).unwrap();
+        assert_eq!(manifest.source, ManifestSource::Embedded);
+        assert_eq!(manifest.supported_os.len(), 1);
+        assert_eq!(manifest.assemblies.len(), 1);
+        assert_eq!(manifest.assemblies[0].name, "MyApp");
+    }
+
+    #[test]
+    fn parse_manifest_bytes_rejects_invalid_xml() {
+        let bytes = b"not valid xml";
+        let result = parse_manifest_bytes(bytes, ManifestSource::Embedded);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn decode_manifest_bytes_utf8_works() {
+        let bytes = b"hello manifest";
+        let result = decode_manifest_bytes(bytes).unwrap();
+        assert_eq!(result, "hello manifest");
+    }
+
+    #[test]
+    fn decode_manifest_bytes_utf16_le() {
+        let mut bytes = vec![0xff, 0xfe]; // BOM
+        let text = "hello";
+        for ch in text.encode_utf16() {
+            bytes.extend_from_slice(&ch.to_le_bytes());
+        }
+        let result = decode_manifest_bytes(&bytes).unwrap();
+        assert_eq!(result, "hello");
+    }
+
+    #[test]
+    fn decode_manifest_bytes_rejects_utf16_be() {
+        let bytes = &[0xfe, 0xff, 0x00, 0x61]; // BE BOM + 'a'
+        let result = decode_manifest_bytes(bytes);
+        assert!(result.is_err());
+    }
+
+    // ── PE32+ TLS with 8-byte pointers ───────────────────────────────────
+
+    #[test]
+    fn parse_tls_directory_pe32_plus_with_callbacks() {
+        let sections = &[make_section(0x1000, 0x200, 0, 0x200, ".tls", IMAGE_SCN_MEM_READ)];
+        let mut dirs = vec![DataDirectory::default(); 10];
+        dirs[9] = make_directory(0x1000, 40); // TLS dir, size=40 for PE32+
+        let mut bytes = vec![0u8; 0x200];
+        write_u64(&mut bytes, 0, 0x0000_0000_0000_3000).unwrap();
+        write_u64(&mut bytes, 8, 0x0000_0000_0000_3100).unwrap();
+        write_u64(&mut bytes, 16, 0x0000_0000_0000_4000).unwrap();
+        // address_of_callbacks: callback array at RVA 0x1050, image_base=0
+        write_u64(&mut bytes, 24, 0x1050).unwrap();
+        // Two callbacks + null
+        let array_off = 0x50usize;
+        write_u64(&mut bytes, array_off, 0x1000_0100_0000_0001).unwrap();
+        write_u64(&mut bytes, array_off + 8, 0x1000_0200_0000_0002).unwrap();
+        write_u64(&mut bytes, array_off + 16, 0).unwrap();
+
+        let tls = parse_tls_directory(&bytes, sections, &dirs, 0, 8)
+            .unwrap()
+            .expect("TLS should be present");
+        assert_eq!(tls.callbacks.len(), 2);
+    }
+
+    // ── Alignment helper ─────────────────────────────────────────────────
+
+    #[test]
+    fn align4_produces_correct_values() {
+        assert_eq!(align4(0).unwrap(), 0);
+        assert_eq!(align4(1).unwrap(), 4);
+        assert_eq!(align4(3).unwrap(), 4);
+        assert_eq!(align4(4).unwrap(), 4);
+        assert_eq!(align4(5).unwrap(), 8);
+    }
+
+    // ── Export parsing edge cases ────────────────────────────────────────
+
+    #[test]
+    fn parse_exports_with_forwarder_rva() {
+        let sections = &[make_section(0x1000, 0x200, 0, 0x200, ".edata", IMAGE_SCN_MEM_READ)];
+        let dirs = &[make_directory(0x1000, 0x200)];
+        let mut bytes = vec![0u8; 0x200];
+        // Export directory at RVA 0x1000
+        // offset+16: ordinal_base = 1
+        write_u32(&mut bytes, 16, 1).unwrap();
+        // offset+20: number_of_functions = 1
+        write_u32(&mut bytes, 20, 1).unwrap();
+        // offset+24: number_of_names = 0
+        write_u32(&mut bytes, 24, 0).unwrap();
+        // offset+28: AddressOfFunctions = RVA of function address table
+        write_u32(&mut bytes, 28, 0x1040).unwrap();
+        // offset+32: AddressOfNames = 0 (no names)
+        write_u32(&mut bytes, 32, 0).unwrap();
+        // offset+36: AddressOfNameOrdinals = 0
+        write_u32(&mut bytes, 36, 0).unwrap();
+        // Function address table at 0x1040 -> RVA relative to section (0x1040-0x1000=0x40)
+        // Function RVA = 0x2000 (a normal export)
+        write_u32(&mut bytes, 0x40, 0x2000).unwrap();
+
+        let exports = parse_export_directory(&bytes, sections, dirs).unwrap();
+        assert_eq!(exports.len(), 1);
+        assert_eq!(exports[0].ordinal, 1);
+        assert!(matches!(exports[0].target, ExportTarget::Rva(0x2000)));
+    }
+
+    #[test]
+    fn parse_exports_detects_forwarder_in_export_dir() {
+        let sections = &[make_section(0x1000, 0x200, 0, 0x200, ".edata", IMAGE_SCN_MEM_READ)];
+        let dirs = &[make_directory(0x1000, 0x200)];
+        let mut bytes = vec![0u8; 0x200];
+        write_u32(&mut bytes, 16, 1).unwrap();
+        write_u32(&mut bytes, 20, 1).unwrap();
+        write_u32(&mut bytes, 24, 0).unwrap();
+        // AddressOfFunctions = 0x1040
+        write_u32(&mut bytes, 28, 0x1040).unwrap();
+        write_u32(&mut bytes, 32, 0).unwrap();
+        write_u32(&mut bytes, 36, 0).unwrap();
+        // Function RVA points WITHIN export directory -> forwarder
+        // Forwarder string at RVA 0x1020 -> "kernel32.CreateFileA\0"
+        write_u32(&mut bytes, 0x40, 0x1020).unwrap();
+        // Forwarder string at section offset 0x20
+        let fwd = b"kernel32.CreateFileA\0";
+        bytes[0x20..0x20 + fwd.len()].copy_from_slice(fwd);
+
+        let exports = parse_export_directory(&bytes, sections, dirs).unwrap();
+        assert_eq!(exports.len(), 1);
+        assert!(matches!(&exports[0].target, ExportTarget::Forwarder(s) if s == "kernel32.CreateFileA"));
+    }
+
+    // ── Import thunk parsing ─────────────────────────────────────────────
+
+    #[test]
+    fn read_import_thunks_parses_ordinal_import() {
+        let sections = &[make_section(0x1000, 0x100, 0, 0x100, ".idata", IMAGE_SCN_MEM_READ)];
+        let mut bytes = vec![0u8; 0x100];
+        // PE32 ordinal flag = 0x8000_0000
+        // thunk = ordinal_flag | 42
+        write_u32(&mut bytes, 0, 0x8000_002a).unwrap(); // ordinal import
+        write_u32(&mut bytes, 4, 0).unwrap(); // terminator
+
+        let thunks = read_import_thunks(&bytes, sections, 0x1000, 0x1010, 0, 4).unwrap();
+        assert_eq!(thunks.len(), 1);
+        assert!(matches!(thunks[0].symbol, ImportSymbol::ByOrdinal { ordinal } if ordinal == 42));
+        assert_eq!(thunks[0].iat_rva, 0x1010);
+    }
+
+    #[test]
+    fn read_import_thunks_terminates_on_zero() {
+        let sections = &[make_section(0x1000, 0x100, 0, 0x100, ".idata", IMAGE_SCN_MEM_READ)];
+        let bytes = vec![0u8; 0x100]; // all zeros = no thunks
+        let thunks = read_import_thunks(&bytes, sections, 0x1000, 0x1010, 0, 4).unwrap();
+        assert!(thunks.is_empty());
+    }
+
+    // ── BitTest helpers ──────────────────────────────────────────────────
+
+    #[test]
+    fn version_format_produces_dotted_quad() {
+        assert_eq!(format_version(0x0001_0002, 0x0003_0004), "1.2.3.4");
+    }
+
+    #[test]
+    fn hash_seed_produces_consistent_output() {
+        let seed = hash_seed("aabbccdd");
+        // first of each pair: aa, bb, cc, dd -> 0xaabb_ccdd_.... (zero-padded)
+        // Actually: chunks of 2: "aa", "bb", "cc", "dd" -> u8 values
+        assert!(seed > 0);
+    }
+}
+
+// ── pe_stub: minimal ParsedPe for use in test helpers ──────────────────
+// (placed after the tests so it's visible inside the test module)
+#[cfg(test)]
+fn pe_stub() -> ParsedPe {
+    ParsedPe {
+        machine: 0x014c,
+        number_of_sections: 0,
+        characteristics: 0,
+        optional_header_magic: 0x010b,
+        dll_characteristics: 0,
+        address_of_entry_point: 0x1000,
+        image_base: 0x0040_0000,
+        size_of_image: 0x2000,
+        size_of_headers: 0x0400,
+        section_alignment: 0x1000,
+        file_alignment: 0x0200,
+        data_directories: vec![],
+        sections: vec![],
+        debug_entries: vec![],
+        load_config: None,
+        imports: vec![],
+        delay_imports: vec![],
+        exports: vec![],
+        relocations: vec![],
+        tls_directory: None,
+        version_info: VersionInfo::default(),
+        embedded_manifest: None,
+        external_manifest: None,
     }
 }

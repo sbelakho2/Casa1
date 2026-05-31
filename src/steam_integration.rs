@@ -1423,6 +1423,347 @@ impl SteamNetworkingMessages {
 }
 
 // ---------------------------------------------------------------------------
+// Steam Overlay State Manager
+// ---------------------------------------------------------------------------
+
+/// CoreGraphics FFI for real-time keyboard state querying on macOS.
+///
+/// Used by the overlay manager to detect Shift+Tab keybinding without
+/// requiring modification of the input pipeline.  This is the same
+/// approach used by `src/user32.rs` for `GetAsyncKeyState`.
+#[cfg(target_os = "macos")]
+#[allow(non_snake_case)]
+unsafe extern "C" {
+    /// Returns the flags state (modifier keys) for a given event source.
+    fn CGEventSourceFlagsState(sourceStateID: i32) -> u64;
+    /// Returns whether a given key code is currently pressed.
+    fn CGEventSourceKeyState(sourceStateID: i32, keyCode: u16) -> bool;
+}
+
+#[cfg(target_os = "macos")]
+const kCGEventSourceStatePrivate: i32 = -1;
+#[cfg(target_os = "macos")]
+const kCGEventFlagMaskShift: u64 = 0x0002_0000;
+#[cfg(target_os = "macos")]
+const kCGEventFlagMaskControl: u64 = 0x0004_0000;
+
+/// macOS HID key code for the Tab key (0x30 = kVK_Tab).
+#[cfg(target_os = "macos")]
+const kVK_TAB: u16 = 0x30;
+
+/// Steam overlay state manager.
+///
+/// Tracks whether the Steam overlay is active and provides Shift+Tab
+/// detection via macOS CoreGraphics event APIs so that the overlay
+/// toggle works even when the guest game window does not have focus.
+///
+/// This is a thread-safe global singleton, callable from any module.
+pub struct SteamOverlayManager {
+    /// Whether the overlay is currently visible / compositing.
+    overlay_active: bool,
+    /// Edge-detection flag: true for one poll cycle after a toggle.
+    /// Consumers (e.g. the CEF bridge) check this to load/unload the
+    /// overlay WKWebView.
+    toggle_occurred: bool,
+    /// Whether Shift was held during the *last* poll.  Used to detect
+    /// a fresh combined press of Shift+Tab rather than continuous hold.
+    shift_was_down: bool,
+    /// Whether Tab was held during the *last* poll.
+    tab_was_down: bool,
+    /// Steam overlay URL that will be loaded when the overlay activates.
+    overlay_url: String,
+}
+
+impl SteamOverlayManager {
+    /// Create a new overlay manager with the default Steam overlay URL.
+    pub fn new() -> Self {
+        Self {
+            overlay_active: false,
+            toggle_occurred: false,
+            shift_was_down: false,
+            tab_was_down: false,
+            overlay_url: "steam://openurl/https://steamcommunity.com/my/overlay".to_string(),
+        }
+    }
+
+    /// Poll keyboard state via the macOS CoreGraphics API and detect
+    /// Shift+Tab.  If the chord is newly pressed, toggle the overlay.
+    ///
+    /// Should be called once per frame from the rendering loop or from
+    /// the host window's event pump.
+    pub fn poll_keyboard_state(&mut self) {
+        let (shift_down, tab_down) = self.query_key_state();
+        // Edge detection: rising edge of both keys simultaneously.
+        let newly_pressed = shift_down && tab_down && !(self.shift_was_down && self.tab_was_down);
+        self.shift_was_down = shift_down;
+        self.tab_was_down = tab_down;
+        if newly_pressed {
+            self.overlay_active = !self.overlay_active;
+            self.toggle_occurred = true;
+        }
+    }
+
+    /// Query the physical key state via CoreGraphics.
+    #[cfg(target_os = "macos")]
+    fn query_key_state(&self) -> (bool, bool) {
+        unsafe {
+            let flags = CGEventSourceFlagsState(kCGEventSourceStatePrivate);
+            let shift = (flags & kCGEventFlagMaskShift) != 0;
+            let tab = CGEventSourceKeyState(kCGEventSourceStatePrivate, kVK_TAB);
+            (shift, tab)
+        }
+    }
+
+    /// Fallback when not on macOS — always returns (false, false).
+    #[cfg(not(target_os = "macos"))]
+    fn query_key_state(&self) -> (bool, bool) {
+        (false, false)
+    }
+
+    /// Force-toggle the overlay state programmatically (e.g. from a
+    /// Steam API call or remote debug command).
+    pub fn toggle(&mut self) {
+        self.overlay_active = !self.overlay_active;
+        self.toggle_occurred = true;
+    }
+
+    /// Set the overlay active state directly.
+    pub fn set_active(&mut self, active: bool) {
+        if self.overlay_active != active {
+            self.overlay_active = active;
+            self.toggle_occurred = true;
+        }
+    }
+
+    /// Returns `true` if the overlay is currently active / visible.
+    pub fn is_active(&self) -> bool {
+        self.overlay_active
+    }
+
+    /// Consume the toggle-occurred flag (edge detection).  Returns
+    /// `true` if a toggle happened since the last call to this method.
+    pub fn consume_toggle(&mut self) -> bool {
+        let occurred = self.toggle_occurred;
+        self.toggle_occurred = false;
+        occurred
+    }
+
+    /// Get the overlay URL that should be loaded when the overlay activates.
+    pub fn overlay_url(&self) -> &str {
+        &self.overlay_url
+    }
+
+    /// Set a custom overlay URL.
+    pub fn set_overlay_url(&mut self, url: String) {
+        self.overlay_url = url;
+    }
+}
+
+impl Default for SteamOverlayManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ── Global singleton ──────────────────────────────────────────────────
+
+static GLOBAL_STEAM_OVERLAY: std::sync::LazyLock<std::sync::Mutex<SteamOverlayManager>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(SteamOverlayManager::new()));
+
+/// Access the global overlay manager with a closure.
+pub fn with_steam_overlay<F, R>(f: F) -> R
+where
+    F: FnOnce(&mut SteamOverlayManager) -> R,
+{
+    let mut guard = GLOBAL_STEAM_OVERLAY.lock().unwrap();
+    f(&mut *guard)
+}
+
+/// Poll keyboard state for Shift+Tab detection (call once per frame).
+pub fn steam_overlay_poll_keyboard() {
+    with_steam_overlay(|mgr| mgr.poll_keyboard_state());
+}
+
+/// Returns `true` if the overlay is currently active.
+pub fn steam_overlay_is_active() -> bool {
+    with_steam_overlay(|mgr| mgr.is_active())
+}
+
+/// Force-toggle the overlay.
+pub fn steam_overlay_toggle() {
+    with_steam_overlay(|mgr| mgr.toggle());
+}
+
+/// Set overlay active state directly.
+pub fn steam_overlay_set_active(active: bool) {
+    with_steam_overlay(|mgr| mgr.set_active(active));
+}
+
+/// Consume the toggle flag (edge detection).  Returns `true` if the
+/// overlay was toggled since the last call.
+pub fn steam_overlay_consume_toggle() -> bool {
+    with_steam_overlay(|mgr| mgr.consume_toggle())
+}
+
+// ---------------------------------------------------------------------------
+// Overlay Input Forwarding
+// ---------------------------------------------------------------------------
+
+/// Determines whether keyboard/mouse input events should be forwarded to
+/// the overlay WKWebView instead of the game.
+///
+/// When the overlay is active, input events (keyboard, mouse clicks,
+/// scroll) should be routed to the overlay webview so the user can
+/// interact with the Steam UI (browse, chat, etc.).  When the overlay
+/// is inactive, all events pass through to the game normally.
+pub fn steam_overlay_should_capture_input() -> bool {
+    steam_overlay_is_active()
+}
+
+/// Forward a keyboard event to the overlay WKWebView (if active).
+///
+/// When the overlay is capturing input, this dispatches a synthetic
+/// `KeyboardEvent` via JavaScript in the overlay browser.  This lets
+/// the Steam UI respond to typing, navigation, and shortcut keys.
+///
+/// Parameters:
+/// - `key_code`:  Windows virtual-key code (e.g. `VK_RETURN = 0x0D`).
+/// - `key_char`:  Optional Unicode character for `keypress` events.
+/// - `down`:      `true` for `keydown`, `false` for `keyup`.
+pub fn steam_overlay_forward_key_event(key_code: u16, key_char: Option<char>, down: bool) {
+    if !steam_overlay_should_capture_input() {
+        return;
+    }
+
+    let event_type = if down { "keydown" } else { "keyup" };
+    let key_str = key_char
+        .map(|c| format!("'{}'", c))
+        .unwrap_or_else(|| "''".to_string());
+
+    let js = format!(
+        r#"(function() {{
+            var event = new KeyboardEvent('{event_type}', {{
+                key: {key_str},
+                keyCode: {key_code},
+                which: {key_code},
+                code: '',
+                bubbles: true,
+                cancelable: true
+            }});
+            document.activeElement?.dispatchEvent(event);
+        }})()"#,
+        event_type = event_type,
+        key_str = key_str,
+        key_code = key_code,
+    );
+
+    crate::cef_bridge::with_global_cef_bridge(|bridge| {
+        if let Some(handle) = bridge.overlay_browser_handle() {
+            let _ = bridge.cef_frame_execute_java_script(handle, 1, &js);
+        }
+    });
+}
+
+/// Forward a mouse-move event to the overlay WKWebView (if active).
+///
+/// The coordinates are in window-relative pixels.
+pub fn steam_overlay_forward_mouse_move(x: f64, y: f64) {
+    if !steam_overlay_should_capture_input() {
+        return;
+    }
+
+    let js = format!(
+        r#"(function() {{
+            var event = new MouseEvent('mousemove', {{
+                clientX: {x},
+                clientY: {y},
+                bubbles: true,
+                cancelable: true
+            }});
+            document.elementFromPoint({x}, {y})?.dispatchEvent(event);
+        }})()"#,
+        x = x,
+        y = y,
+    );
+
+    crate::cef_bridge::with_global_cef_bridge(|bridge| {
+        if let Some(handle) = bridge.overlay_browser_handle() {
+            let _ = bridge.cef_frame_execute_java_script(handle, 1, &js);
+        }
+    });
+}
+
+/// Forward a mouse-button event to the overlay WKWebView (if active).
+///
+/// `button` follows the MouseEvent.button convention:
+///   0 = left, 1 = middle, 2 = right
+/// `down` is `true` for mousedown, `false` for mouseup.
+pub fn steam_overlay_forward_mouse_button(x: f64, y: f64, button: i32, down: bool) {
+    if !steam_overlay_should_capture_input() {
+        return;
+    }
+
+    let event_type = if down { "mousedown" } else { "mouseup" };
+
+    let js = format!(
+        r#"(function() {{
+            var event = new MouseEvent('{event_type}', {{
+                clientX: {x},
+                clientY: {y},
+                button: {button},
+                bubbles: true,
+                cancelable: true
+            }});
+            document.elementFromPoint({x}, {y})?.dispatchEvent(event);
+        }})()"#,
+        event_type = event_type,
+        x = x,
+        y = y,
+        button = button,
+    );
+
+    crate::cef_bridge::with_global_cef_bridge(|bridge| {
+        if let Some(handle) = bridge.overlay_browser_handle() {
+            let _ = bridge.cef_frame_execute_java_script(handle, 1, &js);
+        }
+    });
+}
+
+/// Forward a mouse-wheel event to the overlay WKWebView (if active).
+///
+/// `delta_x` and `delta_y` represent scroll deltas in pixels.
+pub fn steam_overlay_forward_mouse_wheel(x: f64, y: f64, delta_x: f64, delta_y: f64) {
+    if !steam_overlay_should_capture_input() {
+        return;
+    }
+
+    let js = format!(
+        r#"(function() {{
+            var event = new WheelEvent('wheel', {{
+                clientX: {x},
+                clientY: {y},
+                deltaX: {delta_x},
+                deltaY: {delta_y},
+                deltaMode: 0,
+                bubbles: true,
+                cancelable: true
+            }});
+            document.elementFromPoint({x}, {y})?.dispatchEvent(event);
+        }})()"#,
+        x = x,
+        y = y,
+        delta_x = delta_x,
+        delta_y = delta_y,
+    );
+
+    crate::cef_bridge::with_global_cef_bridge(|bridge| {
+        if let Some(handle) = bridge.overlay_browser_handle() {
+            let _ = bridge.cef_frame_execute_java_script(handle, 1, &js);
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1430,6 +1771,85 @@ impl SteamNetworkingMessages {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    // ── Overlay state tests ────────────────────────────────────────────
+
+    #[test]
+    fn overlay_manager_default_state() {
+        let mut mgr = SteamOverlayManager::new();
+        assert!(!mgr.is_active(), "overlay should start inactive");
+        assert!(!mgr.consume_toggle(), "no toggle should have occurred");
+    }
+
+    #[test]
+    fn overlay_manager_toggle() {
+        let mut mgr = SteamOverlayManager::new();
+        mgr.toggle();
+        assert!(mgr.is_active(), "overlay should be active after toggle");
+        assert!(mgr.consume_toggle(), "toggle flag should be set");
+        assert!(!mgr.consume_toggle(), "toggle flag should be consumed");
+    }
+
+    #[test]
+    fn overlay_manager_set_active() {
+        let mut mgr = SteamOverlayManager::new();
+        mgr.set_active(true);
+        assert!(mgr.is_active());
+        assert!(mgr.consume_toggle());
+        mgr.set_active(false);
+        assert!(!mgr.is_active());
+        assert!(mgr.consume_toggle());
+    }
+
+    #[test]
+    fn overlay_manager_set_active_noop() {
+        let mut mgr = SteamOverlayManager::new();
+        mgr.set_active(false); // already inactive
+        assert!(!mgr.consume_toggle(), "no toggle should fire for no-op");
+    }
+
+    #[test]
+    fn overlay_manager_double_toggle() {
+        let mut mgr = SteamOverlayManager::new();
+        mgr.toggle();
+        mgr.toggle();
+        assert!(!mgr.is_active(), "double toggle returns to inactive");
+        assert!(mgr.consume_toggle(), "last toggle should be reported");
+    }
+
+    #[test]
+    fn overlay_manager_default_url() {
+        let mgr = SteamOverlayManager::new();
+        assert!(
+            mgr.overlay_url().contains("steam://"),
+            "default URL should be a steam:// URL"
+        );
+    }
+
+    #[test]
+    fn overlay_manager_custom_url() {
+        let mut mgr = SteamOverlayManager::new();
+        mgr.set_overlay_url("steam://openurl/https://example.com".to_string());
+        assert_eq!(mgr.overlay_url(), "steam://openurl/https://example.com");
+    }
+
+    #[test]
+    fn overlay_input_capture_when_active() {
+        // When overlay is inactive, input should NOT be captured.
+        assert!(
+            !steam_overlay_should_capture_input(),
+            "input should not be captured when overlay is inactive"
+        );
+        // After toggle, input should be captured.
+        steam_overlay_toggle();
+        assert!(
+            steam_overlay_should_capture_input(),
+            "input should be captured when overlay is active"
+        );
+        // Clean up: toggle back off.
+        steam_overlay_toggle();
+        assert!(!steam_overlay_is_active());
+    }
 
     fn setup_steam_dir() -> (TempDir, PathBuf) {
         let tmp = TempDir::new().unwrap();

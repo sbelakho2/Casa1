@@ -13,8 +13,13 @@
 //!   - SafeArrayCreate / SafeArrayAccessData round-trip
 
 use casa1::real_win32::{
-    ComApartmentModel, ComApartmentState, ComClsid, ComIid,
+    ComApartmentModel, ComApartmentState, ComClsid, ComIid, ComObject,
     DispatchInterface, SimpleComObject,
+    DirectSound8Object, DirectSoundBuffer8Object,
+    XAudio2Object, XAudio2MasteringVoiceObject,
+    XAudio2SourceVoiceObject, XAudio2SubmixVoiceObject,
+    ShellLinkObject, FileOpenDialogObject, FileSaveDialogObject,
+    TaskbarListObject,
     sys_alloc_string, sys_alloc_string_len, sys_free_string, sys_string_len,
     variant_init, variant_clear, variant_copy,
     safe_array_create_vector, safe_array_access_data, safe_array_get_lbound,
@@ -818,4 +823,485 @@ fn t28c_13_co_create_guid() {
     let s = guid_to_string(&guid1);
     assert_eq!(s.len(), 36);
     assert_eq!(s.chars().filter(|&c| c == '-').count(), 4);
+}
+
+// ===========================================================================
+// t28c_14 — Functional COM Objects: DirectSound8
+// ===========================================================================
+
+#[test]
+fn t28c_14_directsound8_com_object() {
+    // Test DirectSound8Object construction and ComObject trait
+    let obj = DirectSound8Object::new(ComClsid::DIRECTSOUND8);
+    assert_eq!(obj.debug_name(), "DirectSound8");
+
+    let iids = obj.supported_iids();
+    assert!(iids.contains(&ComIid::IUNKNOWN), "Must support IUnknown");
+    assert!(iids.contains(&ComIid::IDIRECTSOUND8), "Must support IDirectSound8");
+
+    // Test through ComApartmentState
+    let mut state = ComApartmentState::new();
+    state.co_initialize_ex(1, ComApartmentModel::MultiThreaded).expect("CoInitializeEx");
+
+    state.register_class_object(
+        &ComClsid::DIRECTSOUND8,
+        Box::new(|| Box::new(DirectSound8Object::new(ComClsid::DIRECTSOUND8))),
+    );
+
+    let handle = state.co_create_instance(
+        ComClsid::DIRECTSOUND8,
+        ComIid::IDIRECTSOUND8,
+        0x10000,
+        "DirectSound8",
+    ).expect("CoCreateInstance DirectSound8");
+    assert!(handle > 0);
+
+    // QueryInterface for IDirectSound8 should succeed
+    assert!(state.com_query_interface(handle, ComIid::IDIRECTSOUND8).expect("QI IDirectSound8"));
+
+    // Reference counting
+    let rc = state.com_addref(handle).expect("AddRef");
+    assert_eq!(rc, 2);
+    let rc = state.com_release(handle).expect("Release");
+    assert_eq!(rc, 1);
+
+    // Clean up
+    let rc = state.com_release(handle).expect("Release final");
+    assert_eq!(rc, 0);
+    assert!(state.com_object_info(handle).is_err(), "Object should be released");
+}
+
+#[test]
+fn t28c_14b_directsound_buffer8_com_object() {
+    // Test DirectSoundBuffer8Object construction
+    let obj = DirectSoundBuffer8Object::new(ComClsid::DIRECTSOUND8);
+    assert_eq!(obj.debug_name(), "DirectSoundBuffer8");
+
+    let iids = obj.supported_iids();
+    assert!(iids.contains(&ComIid::IUNKNOWN));
+    assert!(iids.contains(&ComIid::IDIRECTSOUNDBUFFER8));
+}
+
+// ===========================================================================
+// t28c_15 — Functional COM Objects: XAudio2
+// ===========================================================================
+
+#[test]
+fn t28c_15_xaudio2_com_object() {
+    let obj = XAudio2Object::new(ComClsid::XAUDIO2);
+    assert_eq!(obj.debug_name(), "XAudio2");
+
+    let iids = obj.supported_iids();
+    assert!(iids.contains(&ComIid::IUNKNOWN));
+    assert!(iids.contains(&ComIid::IXAUDIO2));
+
+    // Test through ComApartmentState
+    let mut state = ComApartmentState::new();
+    state.co_initialize_ex(1, ComApartmentModel::MultiThreaded).expect("CoInitializeEx");
+
+    state.register_class_object(
+        &ComClsid::XAUDIO2,
+        Box::new(|| Box::new(XAudio2Object::new(ComClsid::XAUDIO2))),
+    );
+
+    let handle = state.co_create_instance(
+        ComClsid::XAUDIO2,
+        ComIid::IXAUDIO2,
+        0x20000,
+        "XAudio2",
+    ).expect("CoCreateInstance XAudio2");
+
+    // QueryInterface for IXAudio2 should succeed
+    assert!(state.com_query_interface(handle, ComIid::IXAUDIO2).expect("QI IXAudio2"));
+    // Unrelated IID should fail
+    assert!(!state.com_query_interface(handle, ComIid::IDISPATCH).expect("QI IDispatch (unsupported)"));
+
+    // Reference counting
+    let rc = state.com_addref(handle).expect("AddRef");
+    assert_eq!(rc, 2);
+    let rc = state.com_release(handle).expect("Release");
+    assert_eq!(rc, 1);
+    let rc = state.com_release(handle).expect("Release final");
+    assert_eq!(rc, 0);
+}
+
+#[test]
+fn t28c_15b_xaudio2_voice_objects() {
+    let mastering = XAudio2MasteringVoiceObject::new(ComClsid::XAUDIO2);
+    assert_eq!(mastering.debug_name(), "XAudio2MasteringVoice");
+    assert!(mastering.supported_iids().contains(&ComIid::IXAUDIO2_MASTERING_VOICE));
+
+    let source = XAudio2SourceVoiceObject::new(ComClsid::XAUDIO2);
+    assert_eq!(source.debug_name(), "XAudio2SourceVoice");
+    assert!(source.supported_iids().contains(&ComIid::IXAUDIO2_SOURCE_VOICE));
+
+    let submix = XAudio2SubmixVoiceObject::new(ComClsid::XAUDIO2);
+    assert_eq!(submix.debug_name(), "XAudio2SubmixVoice");
+    assert!(submix.supported_iids().contains(&ComIid::IXAUDIO2_SUBMIX_VOICE));
+}
+
+// ===========================================================================
+// t28c_16 — Functional COM Objects: Shell Link
+// ===========================================================================
+
+#[test]
+fn t28c_16_shell_link_com_object() {
+    let obj = ShellLinkObject::new(ComClsid::SHELL_LINK);
+    assert_eq!(obj.debug_name(), "ShellLink");
+
+    let iids = obj.supported_iids();
+    assert!(iids.contains(&ComIid::IUNKNOWN));
+    assert!(iids.contains(&ComIid::ISHELLLINKW));
+    assert!(iids.contains(&ComIid::IPERSISTFILE));
+
+    // Test data storage and retrieval
+    let mut link = ShellLinkObject::new(ComClsid::SHELL_LINK);
+    assert_eq!(link.get_path(), "");
+    assert_eq!(link.get_arguments(), "");
+    assert_eq!(link.get_description(), "");
+    assert_eq!(link.get_working_directory(), "");
+    assert_eq!(link.get_icon_location(), ("", 0));
+    assert_eq!(link.get_show_cmd(), 1); // SW_SHOWNORMAL
+
+    link.set_path("/usr/local/game.exe".to_string());
+    link.set_arguments("--fullscreen --windowed".to_string());
+    link.set_description("My Game Shortcut".to_string());
+    link.set_working_directory("/usr/local".to_string());
+    link.set_icon_location("/usr/local/game.exe".to_string(), 0);
+    link.set_show_cmd(3); // SW_MAXIMIZE
+
+    assert_eq!(link.get_path(), "/usr/local/game.exe");
+    assert_eq!(link.get_arguments(), "--fullscreen --windowed");
+    assert_eq!(link.get_description(), "My Game Shortcut");
+    assert_eq!(link.get_working_directory(), "/usr/local");
+    assert_eq!(link.get_icon_location(), ("/usr/local/game.exe", 0));
+    assert_eq!(link.get_show_cmd(), 3);
+
+    // Test through ComApartmentState
+    let mut state = ComApartmentState::new();
+    state.co_initialize_ex(1, ComApartmentModel::MultiThreaded).expect("CoInitializeEx");
+
+    state.register_class_object(
+        &ComClsid::SHELL_LINK,
+        Box::new(|| Box::new(ShellLinkObject::new(ComClsid::SHELL_LINK))),
+    );
+
+    let handle = state.co_create_instance(
+        ComClsid::SHELL_LINK,
+        ComIid::ISHELLLINKW,
+        0x30000,
+        "ShellLink",
+    ).expect("CoCreateInstance ShellLink");
+
+    // QueryInterface for IShellLinkW and IPersistFile should succeed
+    assert!(state.com_query_interface(handle, ComIid::ISHELLLINKW).expect("QI IShellLinkW"));
+    assert!(state.com_query_interface(handle, ComIid::IPERSISTFILE).expect("QI IPersistFile"));
+    assert!(!state.com_query_interface(handle, ComIid::IDISPATCH).expect("QI IDispatch (unsupported)"));
+
+    let rc = state.com_release(handle).expect("Release");
+    assert_eq!(rc, 0);
+}
+
+// ===========================================================================
+// t28c_17 — Functional COM Objects: File Open Dialog
+// ===========================================================================
+
+#[test]
+fn t28c_17_file_open_dialog_com_object() {
+    let obj = FileOpenDialogObject::new(ComClsid::FILE_OPEN_DIALOG);
+    assert_eq!(obj.debug_name(), "FileOpenDialog");
+
+    let iids = obj.supported_iids();
+    assert!(iids.contains(&ComIid::IUNKNOWN));
+    assert!(iids.contains(&ComIid::IMODAL_WINDOW));
+    assert!(iids.contains(&ComIid::IFILE_DIALOG));
+    assert!(iids.contains(&ComIid::IFILE_OPEN_DIALOG));
+    // Should NOT support IFileSaveDialog
+    assert!(!iids.contains(&ComIid::IFILE_SAVE_DIALOG));
+
+    // Test data operations
+    let mut dialog = FileOpenDialogObject::new(ComClsid::FILE_OPEN_DIALOG);
+
+    // Default state
+    assert_eq!(dialog.file_name(), "");
+    assert_eq!(dialog.title(), "");
+    assert_eq!(dialog.options(), 0);
+    assert!(!dialog.is_shown());
+
+    // Set dialog properties
+    dialog.set_title("Open Game File".to_string());
+    dialog.set_file_name("/home/user/game.exe".to_string());
+    dialog.set_default_folder("/home/user".to_string());
+    dialog.set_options(0x00000008); // FOS_FORCEFILESYSTEM
+
+    assert_eq!(dialog.title(), "Open Game File");
+    assert_eq!(dialog.file_name(), "/home/user/game.exe");
+    assert_eq!(dialog.default_folder(), "/home/user");
+    assert_eq!(dialog.options(), 0x00000008);
+
+    // Show dialog (simulated)
+    dialog.show();
+    assert!(dialog.is_shown());
+    // Result path should match the file name since one was set
+    assert_eq!(dialog.result_path(), "/home/user/game.exe");
+
+    // Test through ComApartmentState
+    let mut state = ComApartmentState::new();
+    state.co_initialize_ex(1, ComApartmentModel::MultiThreaded).expect("CoInitializeEx");
+
+    state.register_class_object(
+        &ComClsid::FILE_OPEN_DIALOG,
+        Box::new(|| Box::new(FileOpenDialogObject::new(ComClsid::FILE_OPEN_DIALOG))),
+    );
+
+    let handle = state.co_create_instance(
+        ComClsid::FILE_OPEN_DIALOG,
+        ComIid::IFILE_OPEN_DIALOG,
+        0x40000,
+        "FileOpenDialog",
+    ).expect("CoCreateInstance FileOpenDialog");
+
+    // QueryInterface for all supported IIDs
+    assert!(state.com_query_interface(handle, ComIid::IMODAL_WINDOW).expect("QI IModalWindow"));
+    assert!(state.com_query_interface(handle, ComIid::IFILE_DIALOG).expect("QI IFileDialog"));
+    assert!(state.com_query_interface(handle, ComIid::IFILE_OPEN_DIALOG).expect("QI IFileOpenDialog"));
+    assert!(!state.com_query_interface(handle, ComIid::IFILE_SAVE_DIALOG).expect("QI IFileSaveDialog (unsupported)"));
+
+    let rc = state.com_release(handle).expect("Release");
+    assert_eq!(rc, 0);
+}
+
+#[test]
+fn t28c_17b_file_save_dialog_com_object() {
+    let obj = FileSaveDialogObject::new(ComClsid::FILE_SAVE_DIALOG);
+    assert_eq!(obj.debug_name(), "FileSaveDialog");
+
+    let iids = obj.supported_iids();
+    assert!(iids.contains(&ComIid::IUNKNOWN));
+    assert!(iids.contains(&ComIid::IMODAL_WINDOW));
+    assert!(iids.contains(&ComIid::IFILE_DIALOG));
+    assert!(iids.contains(&ComIid::IFILE_SAVE_DIALOG));
+    // Should NOT support IFileOpenDialog
+    assert!(!iids.contains(&ComIid::IFILE_OPEN_DIALOG));
+}
+
+// ===========================================================================
+// t28c_18 — Functional COM Objects: Taskbar List
+// ===========================================================================
+
+#[test]
+fn t28c_18_taskbar_list_com_object() {
+    let obj = TaskbarListObject::new(ComClsid::TASKBAR_LIST);
+    assert_eq!(obj.debug_name(), "TaskbarList");
+
+    let iids = obj.supported_iids();
+    assert!(iids.contains(&ComIid::IUNKNOWN));
+    assert!(iids.contains(&ComIid::ITASKBAR_LIST));
+    assert!(iids.contains(&ComIid::ITASKBAR_LIST2));
+    assert!(iids.contains(&ComIid::ITASKBAR_LIST3));
+
+    // Test operations
+    let mut tb = TaskbarListObject::new(ComClsid::TASKBAR_LIST);
+    assert!(!tb.is_initialized());
+    assert_eq!(tb.tab_count(), 0);
+
+    // HrInit
+    tb.hr_init();
+    assert!(tb.is_initialized());
+
+    // Add tabs
+    tb.add_tab(0x100);
+    tb.add_tab(0x200);
+    tb.add_tab(0x300);
+    assert_eq!(tb.tab_count(), 3);
+
+    // Duplicate add should not increase count
+    tb.add_tab(0x200);
+    assert_eq!(tb.tab_count(), 3);
+
+    // Delete tab
+    tb.delete_tab(0x200);
+    assert_eq!(tb.tab_count(), 2);
+
+    // Activate tab
+    tb.activate_tab(0x300);
+    tb.set_active_alt(0x100);
+
+    // Progress operations
+    tb.set_progress_value(0x100, 500);
+    tb.set_progress_state(0x100, 1); // TBPF_NORMAL
+    tb.set_overlay_icon(0x100, 0xABCD);
+    tb.set_thumbnail_tooltip(0x100, "Game Window".to_string());
+
+    // Test through ComApartmentState
+    let mut state = ComApartmentState::new();
+    state.co_initialize_ex(1, ComApartmentModel::MultiThreaded).expect("CoInitializeEx");
+
+    state.register_class_object(
+        &ComClsid::TASKBAR_LIST,
+        Box::new(|| Box::new(TaskbarListObject::new(ComClsid::TASKBAR_LIST))),
+    );
+
+    let handle = state.co_create_instance(
+        ComClsid::TASKBAR_LIST,
+        ComIid::ITASKBAR_LIST3,
+        0x50000,
+        "TaskbarList",
+    ).expect("CoCreateInstance TaskbarList");
+
+    // QueryInterface for all supported IIDs
+    assert!(state.com_query_interface(handle, ComIid::ITASKBAR_LIST).expect("QI ITaskbarList"));
+    assert!(state.com_query_interface(handle, ComIid::ITASKBAR_LIST2).expect("QI ITaskbarList2"));
+    assert!(state.com_query_interface(handle, ComIid::ITASKBAR_LIST3).expect("QI ITaskbarList3"));
+    assert!(!state.com_query_interface(handle, ComIid::IDISPATCH).expect("QI IDispatch (unsupported)"));
+
+    let rc = state.com_release(handle).expect("Release");
+    assert_eq!(rc, 0);
+}
+
+// ===========================================================================
+// t28c_19 — Functional COM Objects: DllGetClassObject returns new types
+// ===========================================================================
+
+#[test]
+fn t28c_19_dll_get_class_object_returns_functional_types() {
+    let state = ComApartmentState::new();
+
+    // All functional CLSIDs should return objects with proper IID support
+    let ds = state.dll_get_class_object(&ComClsid::DIRECTSOUND8)
+        .expect("DllGetClassObject DirectSound8");
+    let ds_iids = ds.supported_iids();
+    assert!(ds_iids.contains(&ComIid::IDIRECTSOUND8), "DirectSound8 should report IDIRECTSOUND8 support");
+
+    let xa = state.dll_get_class_object(&ComClsid::XAUDIO2)
+        .expect("DllGetClassObject XAudio2");
+    let xa_iids = xa.supported_iids();
+    assert!(xa_iids.contains(&ComIid::IXAUDIO2), "XAudio2 should report IXAUDIO2 support");
+
+    let sl = state.dll_get_class_object(&ComClsid::SHELL_LINK)
+        .expect("DllGetClassObject ShellLink");
+    let sl_iids = sl.supported_iids();
+    assert!(sl_iids.contains(&ComIid::ISHELLLINKW), "ShellLink should report ISHELLLINKW support");
+    assert!(sl_iids.contains(&ComIid::IPERSISTFILE), "ShellLink should report IPERSISTFILE support");
+
+    let fod = state.dll_get_class_object(&ComClsid::FILE_OPEN_DIALOG)
+        .expect("DllGetClassObject FileOpenDialog");
+    let fod_iids = fod.supported_iids();
+    assert!(fod_iids.contains(&ComIid::IFILE_OPEN_DIALOG), "FileOpenDialog should report IFILE_OPEN_DIALOG support");
+    assert!(fod_iids.contains(&ComIid::IFILE_DIALOG), "FileOpenDialog should report IFILE_DIALOG support");
+
+    let tb = state.dll_get_class_object(&ComClsid::TASKBAR_LIST)
+        .expect("DllGetClassObject TaskbarList");
+    let tb_iids = tb.supported_iids();
+    assert!(tb_iids.contains(&ComIid::ITASKBAR_LIST3), "TaskbarList should report ITASKBAR_LIST3 support");
+    assert!(tb_iids.contains(&ComIid::ITASKBAR_LIST), "TaskbarList should report ITASKBAR_LIST support");
+}
+
+// ===========================================================================
+// t28c_20 — Functional COM Objects: CoCreateInstance integration
+// ===========================================================================
+
+#[test]
+fn t28c_20_co_create_instance_all_functional_clsids() {
+    let mut state = ComApartmentState::new();
+    state.co_initialize_ex(1, ComApartmentModel::MultiThreaded).expect("CoInitializeEx");
+
+    // Register all functional CLSIDs
+    state.register_class_object(
+        &ComClsid::DIRECTSOUND8,
+        Box::new(|| Box::new(DirectSound8Object::new(ComClsid::DIRECTSOUND8))),
+    );
+    state.register_class_object(
+        &ComClsid::XAUDIO2,
+        Box::new(|| Box::new(XAudio2Object::new(ComClsid::XAUDIO2))),
+    );
+    state.register_class_object(
+        &ComClsid::SHELL_LINK,
+        Box::new(|| Box::new(ShellLinkObject::new(ComClsid::SHELL_LINK))),
+    );
+    state.register_class_object(
+        &ComClsid::FILE_OPEN_DIALOG,
+        Box::new(|| Box::new(FileOpenDialogObject::new(ComClsid::FILE_OPEN_DIALOG))),
+    );
+    state.register_class_object(
+        &ComClsid::TASKBAR_LIST,
+        Box::new(|| Box::new(TaskbarListObject::new(ComClsid::TASKBAR_LIST))),
+    );
+
+    // Create all 5 objects
+    let test_cases: Vec<([u8; 16], [u8; 16], &str)> = vec![
+        (ComClsid::DIRECTSOUND8, ComIid::IDIRECTSOUND8, "DirectSound8"),
+        (ComClsid::XAUDIO2, ComIid::IXAUDIO2, "XAudio2"),
+        (ComClsid::SHELL_LINK, ComIid::ISHELLLINKW, "ShellLink"),
+        (ComClsid::FILE_OPEN_DIALOG, ComIid::IFILE_OPEN_DIALOG, "FileOpenDialog"),
+        (ComClsid::TASKBAR_LIST, ComIid::ITASKBAR_LIST3, "TaskbarList"),
+    ];
+
+    let mut handles = Vec::new();
+    for (clsid, iid, name) in &test_cases {
+        let handle = state.co_create_instance(*clsid, *iid, 0x60000, name)
+            .unwrap_or_else(|_| panic!("CoCreateInstance {name} should succeed"));
+        assert!(handle > 0, "{name} handle should be non-zero");
+        handles.push(handle);
+    }
+
+    // Verify all objects exist
+    assert_eq!(state.active_object_count(), 5);
+
+    // QueryInterface for expected IIDs on each object
+    assert!(state.com_query_interface(handles[0], ComIid::IDIRECTSOUND8).expect("DS QI"));
+    assert!(state.com_query_interface(handles[1], ComIid::IXAUDIO2).expect("XA QI"));
+    assert!(state.com_query_interface(handles[2], ComIid::ISHELLLINKW).expect("SL QI"));
+    assert!(state.com_query_interface(handles[3], ComIid::IFILE_OPEN_DIALOG).expect("FOD QI"));
+    assert!(state.com_query_interface(handles[4], ComIid::ITASKBAR_LIST3).expect("TB QI"));
+
+    // Verify unsupported IIDs fail
+    assert!(!state.com_query_interface(handles[0], ComIid::IDISPATCH).expect("DS QI unrelated"));
+    assert!(!state.com_query_interface(handles[4], ComIid::IFILE_DIALOG).expect("TB QI unrelated"));
+
+    // Release all objects
+    for handle in handles {
+        let rc = state.com_release(handle).expect("Release");
+        assert_eq!(rc, 0, "Object should be fully released");
+    }
+
+    assert_eq!(state.active_object_count(), 0);
+}
+
+// ===========================================================================
+// t28c_21 — Functional COM Objects: Reference counting stress
+// ===========================================================================
+
+#[test]
+fn t28c_21_refcounting_stress() {
+    let mut state = ComApartmentState::new();
+    state.co_initialize_ex(1, ComApartmentModel::MultiThreaded).expect("CoInitializeEx");
+
+    state.register_class_object(
+        &ComClsid::DIRECTSOUND8,
+        Box::new(|| Box::new(DirectSound8Object::new(ComClsid::DIRECTSOUND8))),
+    );
+
+    let handle = state.co_create_instance(
+        ComClsid::DIRECTSOUND8,
+        ComIid::IDIRECTSOUND8,
+        0x70000,
+        "DirectSound8",
+    ).expect("CoCreateInstance");
+
+    // Multiple AddRef/Release cycles
+    for i in 0..10 {
+        let rc = state.com_addref(handle).expect("AddRef");
+        assert_eq!(rc, i + 2, "Refcount should be {} after {i} AddRefs", i + 2);
+    }
+
+    for i in (1..11).rev() {
+        let rc = state.com_release(handle).expect("Release");
+        assert_eq!(rc, i, "Refcount should be {i} after release");
+    }
+
+    // Release the original ref
+    let rc = state.com_release(handle).expect("Release final");
+    assert_eq!(rc, 0);
+    assert!(state.com_object_info(handle).is_err());
 }

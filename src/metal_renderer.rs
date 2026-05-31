@@ -376,7 +376,25 @@ impl MetalRenderContext {
     }
 
     /// Present the swapchain.
-    pub fn present(&self) -> AppResult<()> {
+    /// Present the current frame.
+    ///
+    /// If the Steam overlay is active, this automatically uploads the latest
+    /// CEF overlay frame and composites it on top of the game content via
+    /// [`composite_and_present`](Self::composite_and_present).
+    ///
+    /// Otherwise, it performs a simple Metal present of the game content.
+    pub fn present(&mut self) -> AppResult<()> {
+        // Check if the Steam overlay is active
+        let overlay_active = crate::steam_integration::steam_overlay_is_active();
+
+        if overlay_active {
+            // Upload the latest CEF overlay frame (if any pending)
+            self.upload_cef_overlay_if_needed()?;
+            // Composite overlay on top of game content and present
+            return self.composite_and_present();
+        }
+
+        // Standard present without overlay compositing
         let swapchain = self.swapchain.as_ref().ok_or_else(|| {
             AppError::new(ReasonCode::RcIo, "no swapchain created")
         })?;

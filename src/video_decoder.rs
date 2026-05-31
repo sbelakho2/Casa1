@@ -2383,6 +2383,7 @@ mod tests {
             pts: 0,
             duration: 33_333,
             texture_id: None,
+            metal_texture: None,
             color_space: ColorSpace::Rec709,
         };
 
@@ -2402,6 +2403,7 @@ mod tests {
             pts: 0,
             duration: 33_333,
             texture_id: None,
+            metal_texture: None,
             color_space: ColorSpace::Rec709,
         };
 
@@ -2424,6 +2426,7 @@ mod tests {
             pts: 0,
             duration: 33_333,
             texture_id: None,
+            metal_texture: None,
             color_space: ColorSpace::Rec709,
         };
 
@@ -2443,6 +2446,7 @@ mod tests {
             pts: 0,
             duration: 33_333,
             texture_id: None,
+            metal_texture: None,
             color_space: ColorSpace::Rec709,
         };
 

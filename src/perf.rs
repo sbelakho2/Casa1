@@ -632,6 +632,17 @@ pub struct DrawBatch {
     pub total_indices: u32,
 }
 
+impl DrawBatch {
+    fn with_capacity(pipeline_state_id: u64, capacity: usize) -> Self {
+        Self {
+            pipeline_state_id,
+            draw_calls: Vec::with_capacity(capacity),
+            total_vertices: 0,
+            total_indices: 0,
+        }
+    }
+}
+
 /// A single draw call within a batch.
 #[derive(Debug, Clone)]
 pub struct BatchedDrawCall {
@@ -695,12 +706,9 @@ impl MetalCommandBatcher {
             self.current_pipeline = Some(pipeline_state_id);
         }
 
-        // Add to current batch
-        let batch = self.current_batch.get_or_insert_with(|| DrawBatch {
-            pipeline_state_id,
-            draw_calls: Vec::new(),
-            total_vertices: 0,
-            total_indices: 0,
+        // Add to current batch (pre-allocate to avoid repeated resizing)
+        let batch = self.current_batch.get_or_insert_with(|| {
+            DrawBatch::with_capacity(pipeline_state_id, self.max_batch_size)
         });
 
         batch.draw_calls.push(BatchedDrawCall {
@@ -775,7 +783,7 @@ pub struct StreamingBuffer {
 /// Instead of creating new buffers for each frame's dynamic data, pre-allocate
 /// a ring buffer and sub-allocate from it each frame.
 pub struct GpuUploadStreamer {
-    buffers: BTreeMap<u64, StreamingBuffer>,
+    buffers: HashMap<u64, StreamingBuffer>,
     next_buffer_id: AtomicU64,
     current_frame: AtomicU64,
     ring_buffer_size: usize,
@@ -785,7 +793,7 @@ pub struct GpuUploadStreamer {
 impl GpuUploadStreamer {
     pub fn new(ring_buffer_size: usize) -> Self {
         Self {
-            buffers: BTreeMap::new(),
+            buffers: HashMap::new(),
             next_buffer_id: AtomicU64::new(1),
             current_frame: AtomicU64::new(0),
             ring_buffer_size,

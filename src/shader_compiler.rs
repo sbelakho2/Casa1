@@ -103,6 +103,8 @@ pub struct MslShaderGenerator {
     constant_buffers: Vec<ConstantBuffer>,
     textures: Vec<TextureBinding>,
     samplers: Vec<SamplerBinding>,
+    /// Number of tessellation control points (hull/domain shaders).
+    patch_control_points: u32,
 }
 
 /// Describes a shader input.
@@ -163,6 +165,7 @@ impl MslShaderGenerator {
             constant_buffers: Vec::new(),
             textures: Vec::new(),
             samplers: Vec::new(),
+            patch_control_points: 0,
         }
     }
 
@@ -215,6 +218,11 @@ impl MslShaderGenerator {
             register,
             space,
         });
+    }
+
+    /// Set the number of tessellation control points (for hull/domain shaders).
+    pub fn set_patch_control_points(&mut self, n: u32) {
+        self.patch_control_points = n;
     }
 
     /// Generate the complete MSL source code.
@@ -448,32 +456,95 @@ impl MslShaderGenerator {
     }
 
     fn generate_geometry_entry(&self, source: &mut String) {
-        // Geometry shaders are translated to compute in Metal
+        // Geometry shaders are translated to compute in Metal.
+        // Each thread in the grid processes one input primitive and emits
+        // vertices to a stream output buffer.
         source.push_str(&format!(
             "kernel void {}_gs(uint3 gid [[thread_position_in_grid]]) {{\n",
             self.entry_point
         ));
-        source.push_str("    // Geometry shader emulated via compute\n");
+
+        // Geometry shader stream output buffer (position + attributes)
+        if !self.outputs.is_empty() {
+            source.push_str("    // Stream output buffer (geometry shader vertex data)\n");
+            // Use a device pointer for stream output
+            source.push_str("    device float4* _gs_stream [[buffer(254)]];\n");
+            source.push_str("    device uint* _gs_prim_count [[buffer(255)]];\n\n");
+            source.push_str("    uint _gs_write_pos = atomic_fetch_add_explicit((volatile device atomic_uint*)_gs_prim_count, 1, memory_order_relaxed);\n");
+            source.push_str("    uint _gs_vertex_base = _gs_write_pos * ");
+            source.push_str(&self.outputs.len().to_string());
+            source.push_str(";\n\n");
+        }
+
+        source.push_str("    // Geometry shader body (emulated via compute)\n");
         source.push_str("}\n");
     }
 
     fn generate_hull_entry(&self, source: &mut String) {
-        // Hull shaders use Metal tessellation
+        // Hull shaders use Metal tessellation via compute kernel.
+        // Each thread processes one output control point.
+        let cp = self.patch_control_points.max(1);
         source.push_str(&format!(
             "kernel void {}_hs(uint3 gid [[thread_position_in_grid]]) {{\n",
             self.entry_point
         ));
-        source.push_str("    // Hull shader emulated via compute\n");
+
+        // Tessellation control point output buffer
+        source.push_str("    // Hull shader (tessellation control) emulated via compute\n");
+        source.push_str(&format!(
+            "    device float4* _hs_output [[buffer(252)]];\n"
+        ));
+        source.push_str("    device float* _hs_tess_factors [[buffer(253)]];\n");
+        source.push_str(&format!(
+            "    constant uint& _hs_num_control_points [[buffer(254)]];\n\n"
+        ));
+        source.push_str("    uint _hs_cp_id = gid.x; // control point index\n");
+        source.push_str(&format!(
+            "    if (_hs_cp_id >= {}) return;\n\n", cp
+        ));
+        source.push_str("    // Compute tessellation factors (edge and inside)\n");
+        source.push_str("    if (_hs_cp_id == 0) {\n");
+        source.push_str("        _hs_tess_factors[0] = 1.0; // edge factor\n");
+        source.push_str("        _hs_tess_factors[1] = 1.0; // inside factor\n");
+        source.push_str("    }\n\n");
+
+        source.push_str("    // Hull shader body\n");
         source.push_str("}\n");
     }
 
     fn generate_domain_entry(&self, source: &mut String) {
-        // Domain shaders use Metal tessellation
+        // Domain shaders use Metal tessellation via compute kernel.
+        // Each thread processes one tessellated vertex.
+        let cp = self.patch_control_points.max(1);
         source.push_str(&format!(
             "kernel void {}_ds(uint3 gid [[thread_position_in_grid]]) {{\n",
             self.entry_point
         ));
-        source.push_str("    // Domain shader emulated via compute\n");
+
+        // Tessellation input buffers
+        source.push_str("    // Domain shader (tessellation evaluation) emulated via compute\n");
+        source.push_str("    device float4* _ds_tessellated_vertices [[buffer(250)]];\n");
+        source.push_str("    device float4* _ds_control_points [[buffer(251)]];\n");
+        source.push_str("    device float* _ds_tess_factors [[buffer(252)]];\n");
+        source.push_str("    constant uint& _ds_num_control_points [[buffer(253)]];\n\n");
+        source.push_str("    uint _ds_vert_id = gid.x; // tessellated vertex index\n\n");
+
+        source.push_str("    // Barycentric/tessellation coordinates\n");
+        source.push_str("    float2 _ds_uv = float2(0.0, 0.0); // placeholder tessellation coordinates\n\n");
+
+        source.push_str("    // Sample control points\n");
+        source.push_str("    float4 _ds_cp[");
+        source.push_str(&cp.to_string());
+        source.push_str("];\n");
+        source.push_str("    for (uint _ds_i = 0; _ds_i < ");
+        source.push_str(&cp.to_string());
+        source.push_str("; _ds_i++) {\n");
+        source.push_str("        _ds_cp[_ds_i] = _ds_control_points[_ds_vert_id * ");
+        source.push_str(&cp.to_string());
+        source.push_str(" + _ds_i];\n");
+        source.push_str("    }\n\n");
+
+        source.push_str("    // Domain shader body\n");
         source.push_str("}\n");
     }
 }
@@ -556,6 +627,7 @@ impl ShaderCache {
 /// Translate common HLSL intrinsic functions to MSL equivalents.
 pub fn translate_hlsl_intrinsic(name: &str) -> String {
     match name {
+        // --- Math intrinsics ---
         "mul" => "/* mul -> matrix multiply */".to_string(),
         "dot" => "dot".to_string(),
         "cross" => "cross".to_string(),
@@ -566,7 +638,7 @@ pub fn translate_hlsl_intrinsic(name: &str) -> String {
         "refract" => "refract".to_string(),
         "lerp" => "mix".to_string(),
         "clamp" => "clamp".to_string(),
-        "saturate" => "clamp(0, 1)".to_string(),
+        "saturate" => "saturate".to_string(),
         "min" => "min".to_string(),
         "max" => "max".to_string(),
         "abs" => "abs".to_string(),
@@ -578,11 +650,14 @@ pub fn translate_hlsl_intrinsic(name: &str) -> String {
         "frac" => "fract".to_string(),
         "sqrt" => "sqrt".to_string(),
         "rsqrt" => "rsqrt".to_string(),
+        "rcp" => "recip".to_string(),
+        "mad" => "fma".to_string(),
         "pow" => "pow".to_string(),
         "exp" => "exp".to_string(),
         "exp2" => "exp2".to_string(),
         "log" => "log".to_string(),
         "log2" => "log2".to_string(),
+        "log10" => "log10".to_string(),
         "sin" => "sin".to_string(),
         "cos" => "cos".to_string(),
         "tan" => "tan".to_string(),
@@ -593,29 +668,109 @@ pub fn translate_hlsl_intrinsic(name: &str) -> String {
         "tanh" => "tanh".to_string(),
         "sinh" => "sinh".to_string(),
         "cosh" => "cosh".to_string(),
+
+        // --- Bit manipulation intrinsics ---
+        "asfloat" => "as_type<float>".to_string(),
+        "asint" => "as_type<int>".to_string(),
+        "asuint" => "as_type<uint>".to_string(),
+        "reversebits" => "reverse_bits".to_string(),
+        "countbits" => "popcount".to_string(),
+        "firstbithigh" => "// firstbithigh = (clz(x)==32) ? -1 : (31-(int)clz(x))".to_string(),
+        "firstbitlow" => "// firstbitlow = (ctz(x)==32) ? -1 : (int)ctz(x)".to_string(),
+
+        // --- Texture/sample intrinsics ---
         "tex2D" | "tex2Dlod" | "tex2Dgrad" | "tex2Dbias" | "Sample" | "SampleLevel" | "SampleGrad" | "SampleBias" => "sample".to_string(),
         "Load" => "read".to_string(),
         "Store" => "write".to_string(),
-        "ddx" | "ddx_coarse" | "ddx_fine" => "dfdx".to_string(),
-        "ddy" | "ddy_coarse" | "ddy_fine" => "dfdy".to_string(),
+        "CalculateLevelOfDetail" => "calculate_lod".to_string(),
+        "CalculateLevelOfDetailUnclamped" => "calculate_lod".to_string(),
+
+        // --- Derivative intrinsics ---
+        "ddx" => "dfdx".to_string(),
+        "ddx_coarse" => "dfdx_coarse".to_string(),
+        "ddx_fine" => "dfdx_fine".to_string(),
+        "ddy" => "dfdy".to_string(),
+        "ddy_coarse" => "dfdy_coarse".to_string(),
+        "ddy_fine" => "dfdy_fine".to_string(),
         "fwidth" => "fwidth".to_string(),
+
+        // --- Comparison/selection intrinsics ---
         "any" => "any".to_string(),
         "all" => "all".to_string(),
         "select" => "select".to_string(),
         "step" => "step".to_string(),
         "smoothstep" => "smoothstep".to_string(),
+
+        // --- Matrix intrinsics ---
         "transpose" => "transpose".to_string(),
         "determinant" => "matrix_determinant".to_string(),
         "inverse" => "matrix_invert".to_string(),
+
+        // --- Atomic (Interlocked) intrinsics ---
         "InterlockedAdd" => "atomic_fetch_add_explicit".to_string(),
+        "InterlockedAnd" => "atomic_fetch_and_explicit".to_string(),
+        "InterlockedOr" => "atomic_fetch_or_explicit".to_string(),
+        "InterlockedXor" => "atomic_fetch_xor_explicit".to_string(),
+        "InterlockedMin" => "atomic_fetch_min_explicit".to_string(),
+        "InterlockedMax" => "atomic_fetch_max_explicit".to_string(),
         "InterlockedExchange" => "atomic_exchange".to_string(),
         "InterlockedCompareExchange" => "atomic_compare_exchange_weak_explicit".to_string(),
+        "InterlockedCompareStore" => "// InterlockedCompareStore -> atomic_compare_exchange_weak_explicit (void)".to_string(),
+
+        // --- Wave/SIMD intrinsics ---
         "WaveReadLaneFirst" => "simd_broadcast_first".to_string(),
+        "WaveReadLaneAt" => "simd_broadcast".to_string(),
         "WaveActiveAllTrue" => "simd_all".to_string(),
         "WaveActiveAnyTrue" => "simd_any".to_string(),
+        "WaveActiveAllEqual" => "simd_all".to_string(), // compare then simd_all
         "WaveActiveBallot" => "simd_ballot".to_string(),
         "WaveGetLaneIndex" => "simd_lane_id".to_string(),
         "WaveGetLaneCount" => "simd_lane_count".to_string(),
+        "WaveActiveSum" => "simd_sum".to_string(),
+        "WaveActiveProduct" => "simd_product".to_string(),
+        "WaveActiveMin" => "simd_min".to_string(),
+        "WaveActiveMax" => "simd_max".to_string(),
+        "WaveActiveBitAnd" => "simd_and".to_string(),
+        "WaveActiveBitOr" => "simd_or".to_string(),
+        "WaveActiveBitXor" => "simd_xor".to_string(),
+        "WaveActiveCountBits" => "// popcount(simd_ballot)".to_string(),
+        "WaveMultiPrefixSum" => "simd_prefix_exclusive_sum".to_string(),
+        "WaveMultiPrefixProduct" => "simd_prefix_exclusive_product".to_string(),
+        "WaveMultiPrefixBitAnd" => "simd_prefix_exclusive_and".to_string(),
+        "WaveMultiPrefixBitOr" => "simd_prefix_exclusive_or".to_string(),
+        "WaveMultiPrefixBitXor" => "simd_prefix_exclusive_xor".to_string(),
+        "WaveMultiPrefixCountBits" => "// popcount(simd_prefix_exclusive_or)".to_string(),
+        "WaveMatch" => "// WaveMatch emulated via simd_vote".to_string(),
+        "QuadReadLaneAt" => "quad_broadcast".to_string(),
+
+        // --- Tessellation intrinsics ---
+        "Process2DQuadTessFactorsAvg" => "// Process2DQuadTessFactorsAvg".to_string(),
+        "Process2DQuadTessFactorsMax" => "// Process2DQuadTessFactorsMax".to_string(),
+        "Process2DQuadTessFactorsMin" => "// Process2DQuadTessFactorsMin".to_string(),
+        "ProcessTriTessFactorsAvg" => "// ProcessTriTessFactorsAvg".to_string(),
+        "ProcessTriTessFactorsMax" => "// ProcessTriTessFactorsMax".to_string(),
+        "ProcessTriTessFactorsMin" => "// ProcessTriTessFactorsMin".to_string(),
+
+        // --- Attribute evaluation intrinsics ---
+        "EvaluateAttributeAtCentroid" => "// EvaluateAttributeAtCentroid".to_string(),
+        "EvaluateAttributeAtSample" => "// EvaluateAttributeAtSample".to_string(),
+        "EvaluateAttributeAtConstant" => "// EvaluateAttributeAtConstant".to_string(),
+
+        // --- Resource query intrinsics ---
+        "CheckAccessFullyMapped" => "1".to_string(),
+
+        // --- Barrier / sync intrinsics ---
+        "AllMemoryBarrier" => "threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device)".to_string(),
+        "AllMemoryBarrierWithGroupSync" => "threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device)".to_string(),
+        "DeviceMemoryBarrier" => "threadgroup_barrier(mem_flags::mem_device)".to_string(),
+        "DeviceMemoryBarrierWithGroupSync" => "threadgroup_barrier(mem_flags::mem_device)".to_string(),
+        "GroupMemoryBarrier" => "threadgroup_barrier(mem_flags::mem_threadgroup)".to_string(),
+        "GroupMemoryBarrierWithGroupSync" => "threadgroup_barrier(mem_flags::mem_threadgroup)".to_string(),
+
+        // --- Utility ---
+        "abort" => "abort".to_string(),
+        "printf" => "// printf".to_string(),
+
         _ => name.to_string(),
     }
 }
@@ -734,10 +889,26 @@ mod tests {
     fn intrinsic_translation() {
         assert_eq!(translate_hlsl_intrinsic("lerp"), "mix");
         assert_eq!(translate_hlsl_intrinsic("frac"), "fract");
-        assert_eq!(translate_hlsl_intrinsic("saturate"), "clamp(0, 1)");
+        assert_eq!(translate_hlsl_intrinsic("saturate"), "saturate");
         assert_eq!(translate_hlsl_intrinsic("ddx"), "dfdx");
+        assert_eq!(translate_hlsl_intrinsic("ddy"), "dfdy");
         assert_eq!(translate_hlsl_intrinsic("Sample"), "sample");
+        assert_eq!(translate_hlsl_intrinsic("Load"), "read");
         assert_eq!(translate_hlsl_intrinsic("WaveGetLaneIndex"), "simd_lane_id");
+        assert_eq!(translate_hlsl_intrinsic("WaveGetLaneCount"), "simd_lane_count");
+        assert_eq!(translate_hlsl_intrinsic("WaveActiveBallot"), "simd_ballot");
+        assert_eq!(translate_hlsl_intrinsic("WaveActiveSum"), "simd_sum");
+        assert_eq!(translate_hlsl_intrinsic("asfloat"), "as_type<float>");
+        assert_eq!(translate_hlsl_intrinsic("reversebits"), "reverse_bits");
+        assert_eq!(translate_hlsl_intrinsic("countbits"), "popcount");
+        assert_eq!(translate_hlsl_intrinsic("firstbithigh"), "// firstbithigh = (clz(x)==32) ? -1 : (31-(int)clz(x))");
+        assert_eq!(translate_hlsl_intrinsic("firstbitlow"), "// firstbitlow = (ctz(x)==32) ? -1 : (int)ctz(x)");
+        assert_eq!(translate_hlsl_intrinsic("InterlockedAdd"), "atomic_fetch_add_explicit");
+        assert_eq!(translate_hlsl_intrinsic("InterlockedCompareExchange"), "atomic_compare_exchange_weak_explicit");
+        assert!(translate_hlsl_intrinsic("InterlockedCompareStore").contains("atomic_compare_exchange_weak_explicit"));
+        assert!(translate_hlsl_intrinsic("InterlockedCompareStore").contains("void"));
+        assert_eq!(translate_hlsl_intrinsic("AllMemoryBarrier"), "threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device)");
+        assert_eq!(translate_hlsl_intrinsic("AllMemoryBarrierWithGroupSync"), "threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device)");
     }
 
     #[test]

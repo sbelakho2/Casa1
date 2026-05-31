@@ -1,4 +1,5 @@
 use crate::error::{AppError, AppResult};
+use crate::mac_window;
 use crate::reason::ReasonCode;
 use crate::real_hid::{HostController, HidMonitor};
 use crate::util;
@@ -335,6 +336,57 @@ pub const PEN_FLAG_NONE: u32 = 0;
 pub const PEN_FLAG_BARREL: u32 = 0x00000001;
 pub const PEN_FLAG_INVERTED: u32 = 0x00000002;
 pub const PEN_FLAG_ERASER: u32 = 0x00000004;
+
+// ── Clipboard format constants (Win32) ────────────────────────────────────
+pub const CF_TEXT: u32 = 1;
+pub const CF_BITMAP: u32 = 2;
+pub const CF_METAFILEPICT: u32 = 3;
+pub const CF_SYLK: u32 = 4;
+pub const CF_DIF: u32 = 5;
+pub const CF_TIFF: u32 = 6;
+pub const CF_OEMTEXT: u32 = 7;
+pub const CF_DIB: u32 = 8;
+pub const CF_PALETTE: u32 = 9;
+pub const CF_PENDATA: u32 = 10;
+pub const CF_RIFF: u32 = 11;
+pub const CF_WAVE: u32 = 12;
+pub const CF_UNICODETEXT: u32 = 13;
+pub const CF_ENHMETAFILE: u32 = 14;
+pub const CF_HDROP: u32 = 15;
+pub const CF_LOCALE: u32 = 16;
+pub const CF_DIBV5: u32 = 17;
+pub const CF_MAX: u32 = 18;
+pub const CF_OWNERDISPLAY: u32 = 0x0080;
+pub const CF_DSPTEXT: u32 = 0x0081;
+pub const CF_DSPBITMAP: u32 = 0x0082;
+pub const CF_DSPMETAFILEPICT: u32 = 0x0083;
+pub const CF_DSPENHMETAFILE: u32 = 0x008E;
+/// First private clipboard format identifier.
+pub const CF_PRIVATEFIRST: u32 = 0x0200;
+/// Last private clipboard format identifier.
+pub const CF_PRIVATELAST: u32 = 0x02FF;
+/// First registered clipboard format identifier.
+pub const CF_GDIOBJFIRST: u32 = 0x0300;
+/// Last registered clipboard format identifier.
+pub const CF_GDIOBJLAST: u32 = 0x03FF;
+
+// ── QS_* message queue status flags (for MsgWaitForMultipleObjects) ──────
+pub const QS_KEY: u32 = 0x0001;
+pub const QS_MOUSEMOVE: u32 = 0x0002;
+pub const QS_MOUSEBUTTON: u32 = 0x0004;
+pub const QS_POSTMESSAGE: u32 = 0x0008;
+pub const QS_TIMER: u32 = 0x0010;
+pub const QS_PAINT: u32 = 0x0020;
+pub const QS_SENDMESSAGE: u32 = 0x0040;
+pub const QS_HOTKEY: u32 = 0x0080;
+pub const QS_ALLPOSTMESSAGE: u32 = 0x0100;
+pub const QS_RAWINPUT: u32 = 0x0400;
+pub const QS_TOUCH: u32 = 0x0800;
+pub const QS_POINTER: u32 = 0x1000;
+pub const QS_MOUSE: u32 = QS_MOUSEMOVE | QS_MOUSEBUTTON;
+pub const QS_INPUT: u32 = QS_MOUSE | QS_KEY | QS_RAWINPUT | QS_TOUCH | QS_POINTER;
+pub const QS_ALLEVENTS: u32 = QS_INPUT | QS_POSTMESSAGE | QS_TIMER | QS_PAINT | QS_SENDMESSAGE | QS_HOTKEY;
+pub const QS_ALLINPUT: u32 = QS_ALLEVENTS | QS_ALLPOSTMESSAGE;
 
 // ── Touch Input structure (96 bytes on x64) ──────────────────────────────
 #[derive(Debug, Clone, Copy)]
@@ -880,6 +932,8 @@ struct WindowRecord {
     region_handle: u32,
     /// Window placement cached for GetWindowPlacement/SetWindowPlacement
     placement: WindowPlacement,
+    /// Raw pointer to the real NSWindow on macOS (null if not yet created / headless).
+    ns_window: *mut std::ffi::c_void,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1086,6 +1140,16 @@ pub struct User32Subsystem {
     hooks: HashMap<i32, HookInfo>,
     /// Next hook ID to assign.
     next_hook_id: i32,
+    /// Active timers: (hwnd, timer_id) → expiry time.
+    timers: BTreeMap<(Hwnd, usize), std::time::SystemTime>,
+    /// Clipboard open state (OpenClipboard/CloseClipboard tracking).
+    clipboard_open: bool,
+    /// Window that currently owns the clipboard.
+    clipboard_owner: Option<Hwnd>,
+    /// Clipboard data store: format → raw bytes.
+    clipboard_data: BTreeMap<u32, Vec<u8>>,
+    /// Next clipboard format to enumerate (for EnumClipboardFormats).
+    clipboard_format_enum_cursor: Option<u32>,
 }
 
 /// Per-icon data extracted from NOTIFYICONDATAW.
@@ -1190,6 +1254,11 @@ impl User32Subsystem {
             async_toggle: [0u8; 256],
             hooks: HashMap::new(),
             next_hook_id: 1,
+            timers: BTreeMap::new(),
+            clipboard_open: false,
+            clipboard_owner: None,
+            clipboard_data: BTreeMap::new(),
+            clipboard_format_enum_cursor: None,
         }
     }
 
@@ -1304,6 +1373,36 @@ impl User32Subsystem {
         self.next_hwnd += 1;
         let fullscreen = self.map_fullscreen_state(title, requested_exclusive_fullscreen);
         let dpi = self.effective_dpi(monitor_id)?;
+
+        // Create a real NSWindow for any non-child window.
+        // Overlapped (WS_OVERLAPPED=0), popup (WS_POPUP), or any combination
+        // that is not a child needs a real macOS NSWindow.
+        const WS_OVERLAPPED: u32 = 0x0000_0000;
+        let is_child = style & WS_CHILD != 0;
+        let is_overlapped_or_popup = !is_child;
+        let ns_window = if is_overlapped_or_popup {
+            // Lazy initialization of NSApplication if not already done
+            if !mac_window::init_nsapplication() {
+                std::ptr::null_mut()
+            } else {
+                let nswin = mac_window::create_nswindow(
+                    title,
+                    0, // x (will be set later via SetWindowPos/MoveWindow)
+                    0, // y
+                    width,
+                    height,
+                    style,
+                    ex_style,
+                );
+                if !nswin.is_null() {
+                    mac_window::associate_hwnd_nswindow(hwnd, nswin);
+                }
+                nswin
+            }
+        } else {
+            std::ptr::null_mut()
+        };
+
         self.windows.insert(
             hwnd,
             WindowRecord {
@@ -1339,6 +1438,7 @@ impl User32Subsystem {
                         bottom: height as i32,
                     },
                 },
+                ns_window,
             },
         );
         // Add to z-order: topmost layered windows go at the front
@@ -1478,6 +1578,13 @@ impl User32Subsystem {
             }
         }
 
+        // Real macOS window: show or hide the NSWindow
+        if let Ok(window) = self.window(hwnd) {
+            if !window.ns_window.is_null() {
+                mac_window::show_nswindow(window.ns_window, should_show);
+            }
+        }
+
         Ok(was_visible)
     }
 
@@ -1523,6 +1630,10 @@ impl User32Subsystem {
             return false;
         };
         window.title = title.to_string();
+        // Update the real NSWindow title if it exists
+        if !window.ns_window.is_null() {
+            mac_window::set_nswindow_title(window.ns_window, title);
+        }
         true
     }
 
@@ -1582,7 +1693,309 @@ impl User32Subsystem {
             translated: false,
             device_id: None,
         })?;
+
+        // Close the real NSWindow if it exists
+        if let Some(window) = self.windows.get(&hwnd) {
+            if !window.ns_window.is_null() {
+                mac_window::close_nswindow(window.ns_window);
+                mac_window::remove_hwnd_nswindow(hwnd);
+            }
+        }
+
         Ok(true)
+    }
+
+    // ── Real NSWindow API methods ────────────────────────────────────────
+
+    /// Move the real NSWindow (MoveWindow Win32 API equivalent).
+    pub fn move_window(&mut self, hwnd: Hwnd, x: i32, y: i32, width: u32, height: u32, _repaint: bool) -> AppResult<bool> {
+        let Some(window) = self.windows.get_mut(&hwnd) else {
+            return Ok(false);
+        };
+        window.x = x;
+        window.y = y;
+        window.width = width;
+        window.height = height;
+        if !window.ns_window.is_null() {
+            mac_window::set_nswindow_frame(window.ns_window, x, y, width, height);
+        }
+        self.queue_resize(hwnd, width, height)?;
+        Ok(true)
+    }
+
+    /// Set window position (SetWindowPos Win32 API equivalent).
+    pub fn set_window_pos(
+        &mut self,
+        hwnd: Hwnd,
+        insert_after: u32,
+        x: i32,
+        y: i32,
+        cx: i32,
+        cy: i32,
+        flags: u32,
+    ) -> AppResult<bool> {
+        const SWP_NOSIZE: u32 = 0x0001;
+        const SWP_NOMOVE: u32 = 0x0002;
+        const SWP_NOZORDER: u32 = 0x0004;
+        const SWP_SHOWWINDOW: u32 = 0x0040;
+        const SWP_HIDEWINDOW: u32 = 0x0080;
+        const HWND_TOP: u32 = 0;
+        const HWND_BOTTOM: u32 = 1;
+        const HWND_TOPMOST: u32 = -1i32 as u32;
+        const HWND_NOTOPMOST: u32 = -2i32 as u32;
+        const WS_EX_TOPMOST: u32 = 0x0008;
+
+        let Some(window) = self.windows.get_mut(&hwnd) else {
+            return Ok(false);
+        };
+
+        if flags & SWP_NOMOVE == 0 {
+            window.x = x;
+            window.y = y;
+        }
+        if flags & SWP_NOSIZE == 0 && cx > 0 && cy > 0 {
+            window.width = cx as u32;
+            window.height = cy as u32;
+        }
+        if flags & SWP_SHOWWINDOW != 0 {
+            window.visible = true;
+        }
+        if flags & SWP_HIDEWINDOW != 0 {
+            window.visible = false;
+        }
+
+        // Update real NSWindow frame
+        if !window.ns_window.is_null() {
+            let new_x = if flags & SWP_NOMOVE == 0 { x } else { window.x };
+            let new_y = if flags & SWP_NOMOVE == 0 { y } else { window.y };
+            let new_w = if flags & SWP_NOSIZE == 0 { cx as u32 } else { window.width };
+            let new_h = if flags & SWP_NOSIZE == 0 { cy as u32 } else { window.height };
+            mac_window::set_nswindow_frame(window.ns_window, new_x, new_y, new_w, new_h);
+
+            if flags & SWP_SHOWWINDOW != 0 {
+                mac_window::show_nswindow(window.ns_window, true);
+            }
+            if flags & SWP_HIDEWINDOW != 0 {
+                mac_window::show_nswindow(window.ns_window, false);
+            }
+        }
+
+        if flags & SWP_NOSIZE == 0 && cx > 0 && cy > 0 {
+            self.queue_resize(hwnd, cx as u32, cy as u32)?;
+        }
+
+        // Z-order management
+        if flags & SWP_NOZORDER == 0 {
+            match insert_after {
+                HWND_TOP => {
+                    self.bring_window_to_top(hwnd)?;
+                }
+                HWND_BOTTOM => {
+                    self.z_order.retain(|h| *h != hwnd);
+                    self.z_order.push(hwnd);
+                }
+                HWND_TOPMOST => {
+                    if let Ok(window) = self.window_mut(hwnd) {
+                        window.ex_style |= WS_EX_TOPMOST;
+                    }
+                    self.bring_window_to_top(hwnd)?;
+                }
+                HWND_NOTOPMOST => {
+                    if let Ok(window) = self.window_mut(hwnd) {
+                        window.ex_style &= !WS_EX_TOPMOST;
+                    }
+                    self.rebuild_z_order();
+                }
+                other_hwnd => {
+                    if self.has_window(other_hwnd) {
+                        self.z_order.retain(|h| *h == hwnd || *h != other_hwnd);
+                        if let Some(pos) = self.z_order.iter().position(|h| *h == other_hwnd) {
+                            self.z_order.insert(pos + 1, hwnd);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    /// Force update/redraw of the real NSWindow (UpdateWindow Win32 API equivalent).
+    pub fn update_window(&mut self, hwnd: Hwnd) -> AppResult<bool> {
+        let Some(window) = self.windows.get(&hwnd) else {
+            return Ok(false);
+        };
+        if !window.ns_window.is_null() {
+            mac_window::update_nswindow(window.ns_window);
+        }
+        // Also queue a paint message for Win32 message processing
+        self.queue_paint(hwnd)?;
+        Ok(true)
+    }
+
+    /// Return a pseudo-handle for the desktop window (GetDesktopWindow Win32 API).
+    /// In Casa1, we return 0 since we don't map the desktop to a real HWND.
+    pub fn get_desktop_window(&self) -> Hwnd {
+        0
+    }
+
+    /// GetWindowThreadProcessId — returns the thread that created the window.
+    /// In Casa1, all windows are created by thread 1.
+    pub fn get_window_thread_process_id(&self, _hwnd: Hwnd) -> (u32, u32) {
+        // Return thread_id=1, process_id=current_pid
+        (1, std::process::id())
+    }
+
+    /// KillTimer — destroy a timer.
+    pub fn kill_timer(&mut self, hwnd: Hwnd, timer_id: usize) -> bool {
+        let removed = self.timers.remove(&(hwnd, timer_id)).is_some();
+        removed
+    }
+
+    /// UnregisterClassW — unregister a window class.
+    pub fn unregister_class_w(&mut self, class_name: &str) -> bool {
+        self.classes.remove(class_name).is_some()
+    }
+
+    /// Set a timer (called from the dispatch side for SetTimer).
+    pub fn set_timer(&mut self, hwnd: Hwnd, timer_id: usize, timeout_ms: u32) -> bool {
+        let expiry = std::time::SystemTime::now()
+            + std::time::Duration::from_millis(timeout_ms as u64);
+        self.timers.insert((hwnd, timer_id), expiry);
+        true
+    }
+
+    /// Check if any timers have expired (for WM_TIMER generation).
+    pub fn poll_timers(&mut self) -> Vec<(Hwnd, usize)> {
+        let now = std::time::SystemTime::now();
+        let mut expired = Vec::new();
+        self.timers.retain(|&(hwnd, id), expiry| {
+            if *expiry <= now {
+                expired.push((hwnd, id));
+                false
+            } else {
+                true
+            }
+        });
+        expired
+    }
+
+    /// Return count of active timers.
+    pub fn timer_count(&self) -> usize {
+        self.timers.len()
+    }
+
+    /// Check whether the message queue has certain types of events (QS_* flags).
+    pub fn message_queue_has_events(&self, wake_mask: u32) -> bool {
+        if wake_mask == 0 || wake_mask & QS_ALLINPUT == QS_ALLINPUT {
+            return !self.message_queue.is_empty() || self.pending_paint();
+        }
+        for msg in &self.message_queue {
+            let msg_flag = match msg.kind {
+                MessageKind::KeyDown | MessageKind::KeyUp | MessageKind::Char => QS_KEY,
+                MessageKind::MouseMove => QS_MOUSEMOVE,
+                MessageKind::LButtonDown | MessageKind::LButtonUp
+                | MessageKind::XButtonDown => QS_MOUSEBUTTON,
+                MessageKind::Paint => QS_PAINT,
+                // WM_TIMER (0x0113) is represented as Other(0x0113) when no dedicated variant exists
+                MessageKind::Other(id) if id == 0x0113 => QS_TIMER,
+                MessageKind::Other(_) => QS_POSTMESSAGE,
+                _ => continue,
+            };
+            if msg_flag & wake_mask != 0 {
+                return true;
+            }
+        }
+        // Also check for paint messages that may be pending (not yet enqueued)
+        if wake_mask & QS_PAINT != 0 && self.pending_paint() {
+            return true;
+        }
+        false
+    }
+
+    /// Returns true if any window has a pending paint (invalidation not yet turned into WM_PAINT).
+    fn pending_paint(&self) -> bool {
+        self.message_queue.iter().any(|m| m.kind == MessageKind::Paint)
+    }
+
+    // ── Clipboard API ────────────────────────────────────────────────────
+
+    /// OpenClipboard — open the clipboard.
+    pub fn open_clipboard(&mut self, hwnd: Option<Hwnd>) -> bool {
+        if self.clipboard_open {
+            return false; // already open by another window
+        }
+        self.clipboard_open = true;
+        self.clipboard_owner = hwnd;
+        true
+    }
+
+    /// CloseClipboard — close the clipboard.
+    pub fn close_clipboard(&mut self) -> bool {
+        self.clipboard_open = false;
+        self.clipboard_owner = None;
+        self.clipboard_format_enum_cursor = None;
+        true
+    }
+
+    /// GetClipboardData — retrieve clipboard data.
+    /// Returns a handle (address) to the data in the guest's memory.
+    /// In this implementation, we store clipboard data as byte vectors.
+    /// The returned handle is a pseudo-handle (the format keyed index).
+    pub fn get_clipboard_data(&mut self, format: u32) -> Option<Vec<u8>> {
+        if !self.clipboard_open {
+            return None;
+        }
+        self.clipboard_data.get(&format).cloned()
+    }
+
+    /// SetClipboardData — set clipboard data.
+    /// Stores a copy of the data. The handle is returned as-is (Windows returns
+    /// the handle for non-CF_LOCAL formats; for CF_LOCAL we'd need real allocation).
+    pub fn set_clipboard_data(&mut self, format: u32, data: Vec<u8>) -> u64 {
+        if !self.clipboard_open {
+            return 0;
+        }
+        self.clipboard_data.insert(format, data);
+        // Return a synthetic handle (just use a small integer as pseudo-handle)
+        format as u64
+    }
+
+    /// EmptyClipboard — empty the clipboard and free handles to data.
+    pub fn empty_clipboard(&mut self) -> bool {
+        if !self.clipboard_open {
+            return false;
+        }
+        self.clipboard_data.clear();
+        self.clipboard_format_enum_cursor = None;
+        true
+    }
+
+    /// IsClipboardFormatAvailable — check if the clipboard contains data in the specified format.
+    pub fn is_clipboard_format_available(&self, format: u32) -> bool {
+        self.clipboard_data.contains_key(&format)
+    }
+
+    /// EnumClipboardFormats — enumerate the formats currently available on the clipboard.
+    /// Pass format=0 to get the first format. Returns 0 when no more formats.
+    pub fn enum_clipboard_formats(&mut self, format: u32) -> u32 {
+        if !self.clipboard_open {
+            return 0;
+        }
+        let formats: Vec<u32> = self.clipboard_data.keys().copied().collect();
+        if formats.is_empty() {
+            return 0;
+        }
+        if format == 0 {
+            // Return the first format
+            *formats.first().unwrap()
+        } else {
+            // Return the next format after the given one
+            let pos = formats.iter().position(|f| *f == format);
+            match pos {
+                Some(idx) if idx + 1 < formats.len() => formats[idx + 1],
+                _ => 0,
+            }
+        }
     }
 
     pub fn def_window_proc_w(&mut self, message: &Message) -> AppResult<i64> {
@@ -1740,6 +2153,7 @@ impl User32Subsystem {
                 alpha: 255,
                 layered_flags: 0,
                 region_handle: 0,
+                ns_window: std::ptr::null_mut(),
                 placement: WindowPlacement {
                     show_cmd: 1,
                     pt_min_position: (-1, -1),
@@ -1969,6 +2383,13 @@ impl User32Subsystem {
         self.message_log.push(message.clone());
         if message.kind == MessageKind::NcDestroy {
             if let Some(hwnd) = message.hwnd {
+                // Clean up the real NSWindow
+                if let Some(window) = self.windows.get(&hwnd) {
+                    if !window.ns_window.is_null() {
+                        mac_window::close_nswindow(window.ns_window);
+                        mac_window::remove_hwnd_nswindow(hwnd);
+                    }
+                }
                 self.windows.remove(&hwnd);
                 self.z_order.retain(|h| *h != hwnd);
                 self.cef_browser_handles.remove(&hwnd);
@@ -2152,74 +2573,6 @@ impl User32Subsystem {
             }
             _ => None,
         }
-    }
-
-    // ── SetWindowPos with full z-order support ────────────────────────────────
-
-    pub fn set_window_pos(
-        &mut self,
-        hwnd: Hwnd,
-        insert_after: u32,
-        x: i32,
-        y: i32,
-        cx: i32,
-        cy: i32,
-        flags: u32,
-    ) -> AppResult<bool> {
-        if !self.has_window(hwnd) {
-            return Ok(false);
-        }
-        if flags & SWP_NOMOVE == 0 {
-            if let Ok(window) = self.window_mut(hwnd) {
-                window.x = x;
-                window.y = y;
-            }
-        }
-        if flags & SWP_NOSIZE == 0 && cx > 0 && cy > 0 {
-            self.resize_window(hwnd, cx as u32, cy as u32)?;
-        }
-        if flags & SWP_SHOWWINDOW != 0 {
-            let _ = self.show_window(hwnd, 1)?;
-        }
-        if flags & SWP_HIDEWINDOW != 0 {
-            let _ = self.show_window(hwnd, 0)?;
-        }
-        // Z-order management
-        if flags & SWP_NOZORDER == 0 {
-            match insert_after {
-                HWND_TOP => {
-                    self.bring_window_to_top(hwnd)?;
-                }
-                HWND_BOTTOM => {
-                    self.z_order.retain(|h| *h != hwnd);
-                    self.z_order.push(hwnd);
-                }
-                HWND_TOPMOST => {
-                    // Make the window topmost and bring to front
-                    if let Ok(window) = self.window_mut(hwnd) {
-                        window.ex_style |= WS_EX_TOPMOST;
-                    }
-                    self.bring_window_to_top(hwnd)?;
-                }
-                HWND_NOTOPMOST => {
-                    // Remove topmost style
-                    if let Ok(window) = self.window_mut(hwnd) {
-                        window.ex_style &= !WS_EX_TOPMOST;
-                    }
-                    self.rebuild_z_order();
-                }
-                other_hwnd => {
-                    // Place after the given window in z-order
-                    if self.has_window(other_hwnd) {
-                        self.z_order.retain(|h| *h == hwnd || *h != other_hwnd);
-                        if let Some(pos) = self.z_order.iter().position(|h| *h == other_hwnd) {
-                            self.z_order.insert(pos + 1, hwnd);
-                        }
-                    }
-                }
-            }
-        }
-        Ok(true)
     }
 
     // ── Window text management ────────────────────────────────────────────────
@@ -4365,6 +4718,371 @@ mod tests {
         // Unhook
         assert!(user32.unhook_windows_hook_ex(hook_id), "unhook should succeed");
         assert!(!user32.unhook_windows_hook_ex(hook_id), "unhook again should fail");
+    }
+
+    // ── Timer tests ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_kill_timer_no_timer() {
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        assert!(!user32.kill_timer(1, 42), "killing non-existent timer should return false");
+    }
+
+    #[test]
+    fn test_set_and_kill_timer() {
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        assert!(user32.set_timer(1, 42, 1000), "set_timer should succeed");
+        assert_eq!(user32.timer_count(), 1, "should have 1 active timer");
+        assert!(user32.kill_timer(1, 42), "kill_timer should return true");
+        assert_eq!(user32.timer_count(), 0, "timer count should be 0 after kill");
+    }
+
+    #[test]
+    fn test_timer_count() {
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        assert_eq!(user32.timer_count(), 0, "initially no timers");
+        user32.set_timer(1, 1, 1000);
+        user32.set_timer(1, 2, 2000);
+        user32.set_timer(2, 1, 500);
+        assert_eq!(user32.timer_count(), 3, "three timers should be active");
+    }
+
+    #[test]
+    fn test_poll_timers_expired() {
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        // Set a timer with 0ms timeout so it should already be expired
+        user32.set_timer(1, 99, 0);
+        // Give it a brief moment to pass
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        let expired = user32.poll_timers();
+        assert!(!expired.is_empty(), "timer with 0ms timeout should expire");
+        assert!(expired.contains(&(1, 99)), "should contain our timer (hwnd=1, id=99)");
+        assert_eq!(user32.timer_count(), 0, "expired timers should be removed");
+    }
+
+    #[test]
+    fn test_poll_timers_none_expired() {
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        user32.set_timer(1, 1, 10_000); // 10 seconds — won't expire in test
+        let expired = user32.poll_timers();
+        assert!(expired.is_empty(), "long timer should not expire immediately");
+        assert_eq!(user32.timer_count(), 1, "timer should still be active");
+    }
+
+    // ── MessageQueue QS_* flag tests ────────────────────────────────────────
+
+    #[test]
+    fn test_message_queue_has_no_events_initially() {
+        let user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        assert!(!user32.message_queue_has_events(QS_KEY), "no key events initially");
+        assert!(!user32.message_queue_has_events(QS_MOUSE), "no mouse events initially");
+        assert!(!user32.message_queue_has_events(QS_PAINT), "no paint events initially");
+    }
+
+    #[test]
+    fn test_message_queue_has_key_events() {
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        user32.register_class_ex_w("test-window");
+        let hwnd = user32
+            .create_window_ex_w("test-window", "title", 320, 200, false, false, None, 1)
+            .expect("create window");
+        let _ = std::iter::from_fn(|| user32.get_message_w()).collect::<Vec<_>>();
+
+        // Inject a key-down message
+        user32.enqueue(Message {
+            hwnd: Some(hwnd),
+            kind: MessageKind::KeyDown,
+            wparam: 0x41,
+            lparam: 0,
+            translated: false,
+            device_id: None,
+        }).expect("enqueue keydown");
+
+        assert!(user32.message_queue_has_events(QS_KEY), "should detect key event");
+        assert!(user32.message_queue_has_events(QS_INPUT), "QS_INPUT should include key");
+        assert!(!user32.message_queue_has_events(QS_MOUSE), "should not detect mouse event");
+    }
+
+    #[test]
+    fn test_message_queue_has_mouse_events() {
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        user32.enqueue(Message {
+            hwnd: None,
+            kind: MessageKind::MouseMove,
+            wparam: 0,
+            lparam: 0,
+            translated: false,
+            device_id: None,
+        }).expect("enqueue mousemove");
+
+        assert!(user32.message_queue_has_events(QS_MOUSEMOVE), "should detect mousemove");
+        assert!(user32.message_queue_has_events(QS_MOUSE), "QS_MOUSE should include mousemove");
+        assert!(!user32.message_queue_has_events(QS_KEY), "should not detect key event");
+    }
+
+    #[test]
+    fn test_message_queue_has_paint_events() {
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        user32.enqueue(Message {
+            hwnd: None,
+            kind: MessageKind::Paint,
+            wparam: 0,
+            lparam: 0,
+            translated: false,
+            device_id: None,
+        }).expect("enqueue paint");
+
+        assert!(user32.message_queue_has_events(QS_PAINT), "should detect paint event");
+        assert!(user32.message_queue_has_events(QS_ALLEVENTS), "QS_ALLEVENTS should include paint");
+    }
+
+    #[test]
+    fn test_message_queue_has_postmessage_events() {
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        user32.enqueue(Message {
+            hwnd: None,
+            kind: MessageKind::Other(0x0400), // WM_USER
+            wparam: 0,
+            lparam: 0,
+            translated: false,
+            device_id: None,
+        }).expect("enqueue postmessage");
+
+        assert!(user32.message_queue_has_events(QS_POSTMESSAGE), "should detect postmessage");
+    }
+
+    #[test]
+    fn test_message_queue_has_timer_events() {
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        user32.enqueue(Message {
+            hwnd: None,
+            kind: MessageKind::Other(0x0113), // WM_TIMER
+            wparam: 0,
+            lparam: 0,
+            translated: false,
+            device_id: None,
+        }).expect("enqueue timer");
+
+        assert!(user32.message_queue_has_events(QS_TIMER), "should detect timer event");
+    }
+
+    #[test]
+    fn test_message_queue_wake_mask_allinput() {
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        // Empty queue with QS_ALLINPUT should still check pending_paint
+        assert!(!user32.message_queue_has_events(QS_ALLINPUT), "empty queue, no events");
+    }
+
+    #[test]
+    fn test_message_queue_wake_mask_zero() {
+        let user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        // wake_mask=0 means check everything
+        assert!(!user32.message_queue_has_events(0), "empty queue should return false even with mask=0");
+    }
+
+    // ── Clipboard tests ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_open_clipboard() {
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        assert!(user32.open_clipboard(Some(1)), "open clipboard should succeed");
+        // Opening again should fail (already open)
+        assert!(!user32.open_clipboard(Some(2)), "second open should fail");
+    }
+
+    #[test]
+    fn test_close_clipboard() {
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        user32.open_clipboard(Some(1));
+        assert!(user32.close_clipboard(), "close clipboard should succeed");
+        // Opening again after close should work
+        assert!(user32.open_clipboard(Some(2)), "open after close should succeed");
+    }
+
+    #[test]
+    fn test_empty_clipboard_no_open() {
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        assert!(!user32.empty_clipboard(), "empty without open should fail");
+    }
+
+    #[test]
+    fn test_empty_clipboard_clears_data() {
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        user32.open_clipboard(Some(1));
+        user32.set_clipboard_data(CF_TEXT, b"hello".to_vec());
+        assert!(user32.is_clipboard_format_available(CF_TEXT), "data should be available");
+        assert!(user32.empty_clipboard(), "empty should succeed");
+        assert!(!user32.is_clipboard_format_available(CF_TEXT), "data should be gone after empty");
+    }
+
+    #[test]
+    fn test_set_clipboard_data() {
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        user32.open_clipboard(Some(1));
+
+        let handle = user32.set_clipboard_data(CF_TEXT, b"Hello, World!".to_vec());
+        // The handle returned is the format as a pseudo-handle
+        assert!(handle != 0, "set_clipboard_data should return non-zero handle");
+
+        // Retrieve and verify
+        let data = user32.get_clipboard_data(CF_TEXT);
+        assert!(data.is_some(), "get_clipboard_data should return data");
+        assert_eq!(data.unwrap(), b"Hello, World!".to_vec());
+    }
+
+    #[test]
+    fn test_get_clipboard_data_not_open() {
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        assert!(user32.get_clipboard_data(CF_TEXT).is_none(), "get without open should return None");
+    }
+
+    #[test]
+    fn test_set_clipboard_data_not_open() {
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        let handle = user32.set_clipboard_data(CF_TEXT, b"data".to_vec());
+        assert_eq!(handle, 0, "set without open should return 0");
+    }
+
+    #[test]
+    fn test_set_multiple_clipboard_formats() {
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        user32.open_clipboard(Some(1));
+
+        user32.set_clipboard_data(CF_TEXT, b"text data".to_vec());
+        user32.set_clipboard_data(CF_UNICODETEXT, "unicode data\0".encode_utf16().flat_map(|c| c.to_le_bytes()).collect::<Vec<_>>());
+        user32.set_clipboard_data(CF_HDROP, vec![0u8; 100]);
+
+        assert!(user32.is_clipboard_format_available(CF_TEXT), "CF_TEXT should be available");
+        assert!(user32.is_clipboard_format_available(CF_UNICODETEXT), "CF_UNICODETEXT should be available");
+        assert!(user32.is_clipboard_format_available(CF_HDROP), "CF_HDROP should be available");
+        assert!(!user32.is_clipboard_format_available(CF_BITMAP), "CF_BITMAP should NOT be available");
+
+        assert_eq!(user32.get_clipboard_data(CF_TEXT).unwrap(), b"text data".to_vec());
+    }
+
+    #[test]
+    fn test_is_clipboard_format_available_not_open() {
+        let user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        assert!(!user32.is_clipboard_format_available(CF_TEXT), "not open, should return false");
+    }
+
+    #[test]
+    fn test_enum_clipboard_formats_not_open() {
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        assert_eq!(user32.enum_clipboard_formats(0), 0, "not open, should return 0");
+    }
+
+    #[test]
+    fn test_enum_clipboard_formats_empty() {
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        user32.open_clipboard(Some(1));
+        assert_eq!(user32.enum_clipboard_formats(0), 0, "empty clipboard, should return 0");
+    }
+
+    #[test]
+    fn test_enum_clipboard_formats_single() {
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        user32.open_clipboard(Some(1));
+        user32.set_clipboard_data(CF_TEXT, b"data".to_vec());
+
+        let first = user32.enum_clipboard_formats(0);
+        assert_eq!(first, CF_TEXT, "first format should be CF_TEXT");
+
+        // No more formats
+        assert_eq!(user32.enum_clipboard_formats(first), 0, "no more formats after CF_TEXT");
+    }
+
+    #[test]
+    fn test_enum_clipboard_formats_multiple() {
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        user32.open_clipboard(Some(1));
+        user32.set_clipboard_data(CF_TEXT, b"text".to_vec());
+        user32.set_clipboard_data(CF_UNICODETEXT, b"unicode\0".to_vec());
+        user32.set_clipboard_data(CF_HDROP, vec![0u8; 64]);
+
+        // Enumerate all formats
+        let mut formats = Vec::new();
+        let mut fmt = 0u32;
+        loop {
+            fmt = user32.enum_clipboard_formats(fmt);
+            if fmt == 0 {
+                break;
+            }
+            formats.push(fmt);
+        }
+
+        assert_eq!(formats.len(), 3, "should find 3 clipboard formats");
+        assert!(formats.contains(&CF_TEXT), "should contain CF_TEXT");
+        assert!(formats.contains(&CF_UNICODETEXT), "should contain CF_UNICODETEXT");
+        assert!(formats.contains(&CF_HDROP), "should contain CF_HDROP");
+    }
+
+    #[test]
+    fn test_clipboard_preserves_data_across_formats() {
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        user32.open_clipboard(Some(1));
+        user32.set_clipboard_data(CF_TEXT, b"hello".to_vec());
+        user32.set_clipboard_data(CF_UNICODETEXT, b"hello wide\0".to_vec());
+
+        // Reading one format shouldn't affect others
+        assert_eq!(user32.get_clipboard_data(CF_TEXT).unwrap(), b"hello".to_vec());
+        assert_eq!(user32.get_clipboard_data(CF_UNICODETEXT).unwrap(), b"hello wide\0".to_vec());
+    }
+
+    // ── Misc API tests ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_get_window_thread_process_id() {
+        let user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        let (tid, pid) = user32.get_window_thread_process_id(42);
+        assert_eq!(tid, 1, "thread id should be 1");
+        assert_eq!(pid, std::process::id(), "process id should match current pid");
+    }
+
+    #[test]
+    fn test_get_desktop_window() {
+        let user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        assert_eq!(user32.get_desktop_window(), 0, "desktop window should return 0");
+    }
+
+    #[test]
+    fn test_update_window_nonexistent() {
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        let result = user32.update_window(999);
+        assert!(result.is_ok(), "update_window should not fail");
+        assert_eq!(result.unwrap(), false, "update_window for non-existent hwnd should return false");
+    }
+
+    #[test]
+    fn test_update_window_existing() {
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        user32.register_class_ex_w("test-window");
+        let hwnd = user32
+            .create_window_ex_w("test-window", "title", 320, 200, false, false, None, 1)
+            .expect("create window");
+        let _ = std::iter::from_fn(|| user32.get_message_w()).collect::<Vec<_>>();
+
+        let result = user32.update_window(hwnd);
+        assert!(result.is_ok(), "update_window should succeed");
+        assert_eq!(result.unwrap(), true, "update_window for existing hwnd should return true");
+
+        // Should have queued a paint message
+        assert!(user32.get_message_w().map(|m| m.kind == MessageKind::Paint).unwrap_or(false),
+                "update_window should queue a paint message");
+    }
+
+    #[test]
+    fn test_unregister_class_w() {
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        user32.register_class_ex_w("TestClass");
+        assert!(user32.unregister_class_w("TestClass"), "unregister existing class should succeed");
+        assert!(!user32.unregister_class_w("TestClass"), "unregister again should fail");
+    }
+
+    #[test]
+    fn test_unregister_class_w_nonexistent() {
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        assert!(!user32.unregister_class_w("NonExistentClass"), "unregister non-existent should fail");
     }
 }
 

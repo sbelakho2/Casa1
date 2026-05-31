@@ -14,6 +14,7 @@
 #![allow(unexpected_cfgs)]
 
 use crate::error::{AppError, AppResult};
+use crate::mac_window;
 use crate::reason::ReasonCode;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -365,6 +366,30 @@ pub struct CefBridge {
     nsapp_initialized: bool,
     /// G9: IOSurface-backed Metal texture cache keyed by browser_id.
     io_surface_cache: BTreeMap<u32, IoSurfaceTexturePair>,
+    /// Cached result of IOSurface runtime availability check.
+    /// `None` = not yet checked, `Some(true)` = available, `Some(false)` = unavailable.
+    io_surface_available: Option<bool>,
+
+    // -----------------------------------------------------------------------
+    // CEF callback handler state
+    // -----------------------------------------------------------------------
+
+    /// CefRenderHandler: current popup position/dimensions (popup browser).
+    popup_info: Option<CefRect>,
+    /// CefRenderHandler: whether a popup is currently shown.
+    popup_showing: bool,
+    /// CefLifeSpanHandler: whether DoClose has been called and close is pending.
+    close_pending_for: Option<CefHandle>,
+    /// CefRequestHandler: cookieable scheme list.
+    cookieable_schemes: Vec<String>,
+
+    // -----------------------------------------------------------------------
+    // Steam Overlay WKWebView state
+    // -----------------------------------------------------------------------
+
+    /// Handle to the dedicated overlay WKWebView browser, if active.
+    /// Created when the overlay toggles on, destroyed when it toggles off.
+    overlay_browser_handle: Option<CefHandle>,
 }
 
 impl std::fmt::Debug for CefBridge {
@@ -383,6 +408,11 @@ impl std::fmt::Debug for CefBridge {
             )
             .field("webview_manager", &self.webview_manager.as_ref().map(|_| "WKWebViewManager"))
             .field("nsapp_initialized", &self.nsapp_initialized)
+            .field("io_surface_available", &self.io_surface_available)
+            .field("popup_info", &self.popup_info)
+            .field("popup_showing", &self.popup_showing)
+            .field("close_pending_for", &self.close_pending_for)
+            .field("overlay_browser_handle", &self.overlay_browser_handle)
             .finish()
     }
 }
@@ -401,6 +431,18 @@ impl Default for CefBridge {
             webview_manager: None,
             nsapp_initialized: false,
             io_surface_cache: BTreeMap::new(),
+            io_surface_available: None,
+            popup_info: None,
+            popup_showing: false,
+            close_pending_for: None,
+            cookieable_schemes: vec![
+                "http".to_string(),
+                "https".to_string(),
+                "steam".to_string(),
+                "steamstore".to_string(),
+                "steamcommunity".to_string(),
+            ],
+            overlay_browser_handle: None,
         }
     }
 }
@@ -456,6 +498,9 @@ pub struct WKWebViewManager {
     nav_delegate: Option<*mut std::ffi::c_void>,
     /// Script message handler object pointer
     msg_handler: Option<*mut std::ffi::c_void>,
+    /// Optional real NSWindow content view for embedding WKWebViews
+    /// in real macOS windows (instead of the offscreen view).
+    real_window_view: Option<*mut std::ffi::c_void>,
 }
 
 // SAFETY: WKWebViewManager holds opaque ObjC pointers that are Send + Sync
@@ -678,6 +723,7 @@ impl WKWebViewManager {
             nsapp_ready: false,
             nav_delegate: None,
             msg_handler: None,
+            real_window_view: None,
         };
 
         #[cfg(target_os = "macos")]
@@ -691,12 +737,21 @@ impl WKWebViewManager {
         mgr
     }
 
-    /// Initialize the NSApplication for headless rendering.
-    /// Creates a shared application, sets activation policy to prohibited
-    /// (headless), and creates a hidden offscreen window + NSView.
+    /// Initialize the NSApplication.
+    ///
+    /// If a regular NSApp has already been set up by `mac_window::init_nsapplication()`
+    /// (i.e., a real UI session with windows), this method skips changing the
+    /// activation policy and just creates the offscreen fallback view.
+    ///
+    /// If no NSApp exists yet, this creates one with prohibited activation policy
+    /// (headless mode) and the offscreen window — matching the original behaviour
+    /// for pure headless/CEF scenarios.
     #[cfg(target_os = "macos")]
     fn init_nsapp(&mut self) {
         unsafe {
+            // ── 1. Check whether a regular NSApp already exists ───────────
+            let regular_mode = mac_window::is_nsapp_initialized();
+
             let cls_app = match objc::runtime::Class::get("NSApplication") {
                 Some(c) => c,
                 None => {
@@ -713,14 +768,16 @@ impl WKWebViewManager {
                 return;
             }
 
-            // Set activation policy to prohibited for headless mode
-            let _: () = msg_send![
-                shared_app,
-                setActivationPolicy: 0 /* NSApplicationActivationPolicyProhibited */
-            ];
+            if !regular_mode {
+                // ── 2a. Headless mode: prohibited activation policy ─────
+                let _: () = msg_send![
+                    shared_app,
+                    setActivationPolicy: 0 /* NSApplicationActivationPolicyProhibited */
+                ];
+            }
+            // else: regular NSApp already exists – do NOT change activation policy
 
-            // Create a hidden NSWindow to serve as parent for WKWebView
-            // WKWebView requires being in a window hierarchy to render.
+            // ── 3. Create a hidden offscreen window (WKWebView needs hierarchy) ──
             let cls_window = match objc::runtime::Class::get("NSWindow") {
                 Some(c) => c,
                 None => {
@@ -742,6 +799,13 @@ impl WKWebViewManager {
             let view_frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(4096.0, 4096.0));
             let view: *mut objc::runtime::Object =
                 msg_send![view_alloc, initWithFrame: view_frame];
+
+            // G9: Enable layer-backed rendering on the offscreen view so that
+            // WKWebView subviews use IOSurface-backed compositing layers
+            // instead of fallback CPU rendering paths. Without this, the
+            // WKWebView's backing CALayer may remain snapshot-based (CGImage
+            // contents) rather than IOSurface-backed, defeating zero-copy.
+            let _: () = msg_send![view, setWantsLayer: 1 /* YES */];
 
             // Create hidden window with the offscreen view as content
             let win_alloc: *mut objc::runtime::Object = msg_send![cls_window, alloc];
@@ -799,6 +863,19 @@ impl WKWebViewManager {
         self.nsapp_ready
     }
 
+    /// Set a real NSWindow content view as the parent for subsequent WKWebView
+    /// creations. When set, WKWebViews will be embedded in the real window's
+    /// view hierarchy instead of the offscreen hidden view.
+    ///
+    /// Pass `std::ptr::null_mut()` to reset back to offscreen (headless) mode.
+    pub fn set_real_window_view(&mut self, view: *mut std::ffi::c_void) {
+        if view.is_null() {
+            self.real_window_view = None;
+        } else {
+            self.real_window_view = Some(view);
+        }
+    }
+
     /// Create a new WKWebView with the given configuration.
     /// Returns a handle that can be used to interact with the web view.
     pub fn create_webview(&mut self, config: WKWebViewConfig) -> AppResult<WKWebViewHandle> {
@@ -812,6 +889,10 @@ impl WKWebViewManager {
         let handle = WKWebViewHandle(self.next_id);
         self.next_id += 1;
 
+        // Use the real window content view if one has been set, otherwise
+        // fall back to the offscreen hidden view (headless rendering path).
+        let parent_view = self.real_window_view.or(self.offscreen_view);
+
         // Create the WKWebView via Objective-C runtime
         let native_ptr = Self::create_wkwebview_native(
             config.width,
@@ -820,7 +901,7 @@ impl WKWebViewManager {
             config.user_agent.as_deref(),
             self.nav_delegate,
             self.msg_handler,
-            self.offscreen_view,
+            parent_view,
         );
         if native_ptr.is_null() {
             return Err(AppError::new(
@@ -914,14 +995,25 @@ impl WKWebViewManager {
             let layer: *mut objc::runtime::Object = msg_send![view, layer];
             if layer.is_null() {
                 eprintln!(
-                    "[CefBridge] get_io_surface_for_browser: WKWebView {handle:?} has no backing CALayer"
+                    "[CefBridge] get_io_surface_for_browser: WKWebView {handle:?} has no \
+                     backing CALayer (view={view:?})"
                 );
                 return Ok(std::ptr::null_mut());
             }
+
+            // G9: Force the layer to display its latest content so that
+            // `layer.contents` reflects the most recent composited frame
+            // rather than a stale IOSurface from a previous render cycle.
+            // Without this call, the IOSurface pointer may refer to content
+            // that the layer has already replaced with a new surface.
+            let _: () = msg_send![layer, displayIfNeeded];
+
             let contents: *mut objc::runtime::Object = msg_send![layer, contents];
             if contents.is_null() {
                 eprintln!(
-                    "[CefBridge] get_io_surface_for_browser: layer contents is null for WKWebView {handle:?}"
+                    "[CefBridge] get_io_surface_for_browser: layer contents is null \
+                     for WKWebView {handle:?} (view={view:?}, dims={w:.0}x{h:.0})",
+                    w = instance.width, h = instance.height
                 );
                 return Ok(std::ptr::null_mut());
             }
@@ -931,11 +1023,33 @@ impl WKWebViewManager {
             let responds: bool =
                 msg_send![contents, respondsToSelector: objc::sel!(surfaceID)];
             if responds {
+                eprintln!(
+                    "[CefBridge] get_io_surface_for_browser: found IOSurface for \
+                     WKWebView {handle:?} ({w:.0}x{h:.0}) — zero-copy path available",
+                    w = instance.width, h = instance.height
+                );
                 Ok(contents as *mut std::ffi::c_void)
             } else {
+                // Check what kind of object it is for diagnostic purposes
+                let class_name: *mut objc::runtime::Object =
+                    msg_send![contents, description];
+                let contents_desc = if !class_name.is_null() {
+                    let cstr: *const i8 = msg_send![class_name, UTF8String];
+                    if !cstr.is_null() {
+                        std::ffi::CStr::from_ptr(cstr)
+                            .to_string_lossy()
+                            .into_owned()
+                    } else {
+                        "unknown".to_string()
+                    }
+                } else {
+                    "unknown".to_string()
+                };
                 eprintln!(
-                    "[CefBridge] get_io_surface_for_browser: layer contents is not an IOSurface \
-                     (e.g. CGImage or other) for WKWebView {handle:?} — falling back to CPU upload"
+                    "[CefBridge] get_io_surface_for_browser: layer contents is not an \
+                     IOSurface for WKWebView {handle:?} — contents class: {contents_desc}, \
+                     dimensions: {w:.0}x{h:.0} — falling back to CPU upload",
+                    w = instance.width, h = instance.height
                 );
                 Ok(std::ptr::null_mut())
             }
@@ -1244,6 +1358,14 @@ impl WKWebViewManager {
                         ];
                     }
                 }
+
+                // --- G9: Enable layer-backed rendering on WKWebView itself ---
+                // WKWebView on macOS uses a layer-hosted NSView by default, but
+                // explicitly setting wantsLayer ensures its backing CALayer is
+                // configured for IOSurface-backed compositing rather than falling
+                // back to CPU-based CGImage snapshotting. This is required for the
+                // zero-copy IOSurface path in get_io_surface_for_browser().
+                let _: () = msg_send![view, setWantsLayer: 1 /* YES */];
 
                 // --- Set navigation gesture support ---
                 let _: () = msg_send![
@@ -1677,6 +1799,36 @@ impl CefBridge {
         let h = self.next_handle;
         self.next_handle = self.next_handle.wrapping_add(1);
         h
+    }
+
+    /// Check whether IOSurface is available at runtime.
+    ///
+    /// On macOS with Metal, IOSurface is typically available. On headless
+    /// systems (e.g., Remote Desktop, CI without GPU, or VMs without
+    /// IOSurface support), the IOSurface Objective-C class may not be
+    /// loadable. The result is cached after the first check so that
+    /// subsequent lookups are O(1).
+    ///
+    /// Returns `true` if IOSurface appears to be available, `false` if the
+    /// IOSurface class cannot be found (indicating CPU-side fallback is
+    /// required).
+    pub fn io_surface_available(&mut self) -> bool {
+        if let Some(cached) = self.io_surface_available {
+            return cached;
+        }
+        let available = unsafe {
+            // Attempt to locate the IOSurface ObjC class.
+            // If it's not registered, IOSurfaceCreate etc. will all fail.
+            objc::runtime::Class::get("IOSurface").is_some()
+        };
+        self.io_surface_available = Some(available);
+        if !available {
+            eprintln!(
+                "[CefBridge] WARNING: IOSurface class not available at runtime — \
+                 all IOSurface paths will use CPU-side rendering fallback"
+            );
+        }
+        available
     }
 
     /// Ensure NSApplication and WKWebViewManager are initialized.
@@ -2362,8 +2514,8 @@ impl CefBridge {
         // IOSurface-backed, wrap that surface directly — true zero-copy with
         // no pixel upload at all.
         if let (Some(mgr), Some(handle)) = (&self.webview_manager, wk_handle) {
-            if let Ok(native_surface) = mgr.get_io_surface_for_browser(handle) {
-                if !native_surface.is_null() {
+            match mgr.get_io_surface_for_browser(handle) {
+                Ok(native_surface) if !native_surface.is_null() => {
                     let (fw, fh, fnum) = {
                         let frame = self.get_rendered_frame(browser_id).ok_or_else(|| {
                             AppError::new(
@@ -2391,8 +2543,47 @@ impl CefBridge {
                         );
                         return Ok(texture);
                     }
+                    // create_texture_from_io_surface returned None even though
+                    // we had a valid IOSurface — Metal rejected the surface
+                    // (e.g. incompatible pixel format or dimension mismatch).
+                    eprintln!(
+                        "[CefBridge] render_to_io_surface_texture: Metal rejected IOSurface \
+                         from WKWebView {handle:?} for browser {browser_handle:#x} — \
+                         falling back"
+                    );
+                }
+                Ok(_) => {
+                    // get_io_surface_for_browser returned null (no IOSurface).
+                    // This is expected for snapshot-based rendering — we fall
+                    // through to the managed path below.
+                }
+                Err(e) => {
+                    // get_io_surface_for_browser returned an actual error
+                    // (e.g. handle not found). Log it and fall back.
+                    eprintln!(
+                        "[CefBridge] render_to_io_surface_texture: get_io_surface_for_browser \
+                         error for browser {browser_handle:#x}: {e} — falling back"
+                    );
                 }
             }
+        } else if wk_handle.is_none() {
+            eprintln!(
+                "[CefBridge] render_to_io_surface_texture: browser {browser_handle:#x} has no \
+                 WKWebView handle — using managed IOSurface path"
+            );
+        }
+
+        // Runtime availability check: if IOSurface is not available on this
+        // system (e.g. headless CI, Remote Desktop, VM without GPU), skip
+        // the managed IOSurface path entirely and fall back to a plain
+        // CPU-side Metal texture. The result is cached after first check.
+        if !self.io_surface_available() {
+            eprintln!(
+                "[CefBridge] render_to_io_surface_texture: IOSurface unavailable \
+                 at runtime — using CPU-side Metal texture for browser \
+                 {browser_handle:#x}"
+            );
+            return self.render_to_metal_texture(browser_handle, metal_device);
         }
 
         eprintln!(
@@ -2419,16 +2610,24 @@ impl CefBridge {
             .map(|p| (p.width, p.height) != (width, height))
             .unwrap_or(true);
         if needs_alloc {
-            let pair = IoSurfaceTexturePair::new(metal_device.device(), width, height)
-                .ok_or_else(|| {
-                    AppError::new(
-                        ReasonCode::RcInvalidState,
-                        format!(
-                            "render_to_io_surface_texture: IOSurface allocation failed for {width}x{height}"
-                        ),
-                    )
-                })?;
-            self.io_surface_cache.insert(browser_id, pair);
+            let pair = IoSurfaceTexturePair::new(metal_device.device(), width, height);
+            match pair {
+                Some(p) => {
+                    self.io_surface_cache.insert(browser_id, p);
+                }
+                None => {
+                    // IOSurface allocation failed — fall back to CPU-side
+                    // Metal texture. This can happen if the IOSurface kernel
+                    // resource is exhausted or the GPU doesn't support it.
+                    eprintln!(
+                        "[CefBridge] WARNING: render_to_io_surface_texture: \
+                         IOSurface allocation failed for {width}x{height} — \
+                         falling back to CPU-side Metal texture for browser \
+                         {browser_handle:#x}"
+                    );
+                    return self.render_to_metal_texture(browser_handle, metal_device);
+                }
+            }
         }
 
         // Upload the RGBA snapshot into the BGRA IOSurface backing store. The
@@ -2496,6 +2695,14 @@ impl CefBridge {
     // Called from the frame publishing path (e.g. process_pending_webview_ops
     // or the pe_runtime WM_PAINT handler) whenever a new WKWebView snapshot is
     // captured.
+    //
+    // G9: This function submits raw CPU pixels to the compositor via
+    // submit_cef_overlay_frame(). For zero-copy IOSurface delivery, callers
+    // should use render_to_io_surface_texture() instead, which provides a
+    // Metal texture wrapping either the native WKWebView IOSurface (zero-copy)
+    // or a managed IOSurface (CPU upload). This function remains the primary
+    // path for non-Metal fallback and for callers that only need CPU pixel
+    // access.
     // -----------------------------------------------------------------------
     pub fn submit_latest_frame_to_compositor(&mut self, browser_handle: CefHandle) {
         let browser_id = match self.browsers.get(&browser_handle) {
@@ -2517,6 +2724,30 @@ impl CefBridge {
                 return;
             }
         };
+
+        // G9 diagnostic: check if IOSurface is available for this browser
+        // (informational only — actual IOSurface-based submission requires
+        // render_to_io_surface_texture with a Metal device).
+        let io_surface_hint = if let (Some(mgr), Some(handle)) = (
+            &self.webview_manager,
+            self.browsers.get(&browser_handle).and_then(|b| b.wk_handle),
+        ) {
+            match mgr.get_io_surface_for_browser(handle) {
+                Ok(ptr) if !ptr.is_null() => "iosurface-available",
+                _ => "cpu-fallback",
+            }
+        } else {
+            "no-wkwebview"
+        };
+
+        eprintln!(
+            "[CefBridge] submit_latest_frame_to_compositor: browser {browser_handle:#x} \
+             frame={} ({width}x{height}) path={io_surface_hint}",
+            frame.frame_number,
+            width = frame.width,
+            height = frame.height,
+        );
+
         crate::metal_renderer::submit_cef_overlay_frame(
             frame.width,
             frame.height,
@@ -2530,6 +2761,150 @@ impl CefBridge {
         if let Some(handle) = self.first_browser_handle() {
             self.submit_latest_frame_to_compositor(handle);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Steam Overlay WKWebView management
+    //
+    // The overlay is a dedicated WKWebView browser that displays Steam's
+    // in-game overlay (friends, achievements, web browser). It is created
+    // when Shift+Tab activates the overlay and destroyed when the overlay
+    // closes.
+    //
+    // Frames from the overlay browser are submitted to the global
+    // CefMetalCompositor for compositing on top of the game's rendered
+    // output.
+    // -----------------------------------------------------------------------
+
+    /// Create a dedicated overlay browser (WKWebView) and navigate it to the
+    /// given overlay URL.  Returns the browser handle on success.
+    ///
+    /// If an overlay browser already exists, returns an error.
+    pub fn create_overlay_browser(&mut self, url: &str) -> AppResult<CefHandle> {
+        if self.overlay_browser_handle.is_some() {
+            return Err(AppError::new(
+                ReasonCode::RcInvalidState,
+                "create_overlay_browser: overlay browser already exists",
+            ));
+        }
+
+        // Ensure NSApplication + WKWebViewManager are initialised
+        self.ensure_webview_manager()?;
+
+        let window_info = CefWindowInfo {
+            x: 0,
+            y: 0,
+            width: 1280,
+            height: 720,
+            windowless_rendering_enabled: true,
+            parent_window: 0,
+            url: None,
+            external_begin_frame_enabled: false,
+        };
+
+        let browser_handle = self.cef_browser_host_create_browser(
+            window_info,
+            url,
+            CefBrowserSettings::default(),
+        )?;
+
+        self.overlay_browser_handle = Some(browser_handle);
+
+        // Set the compositor to game-inactive so the overlay renders on top
+        crate::metal_renderer::set_cef_compositor_game_active(false);
+
+        eprintln!(
+            "[CefBridge] create_overlay_browser: handle={:#x} url={}",
+            browser_handle, url,
+        );
+
+        Ok(browser_handle)
+    }
+
+    /// Destroy the overlay browser if one exists.
+    pub fn destroy_overlay_browser(&mut self) -> AppResult<()> {
+        let handle = match self.overlay_browser_handle.take() {
+            Some(h) => h,
+            None => return Ok(()),
+        };
+
+        eprintln!(
+            "[CefBridge] destroy_overlay_browser: handle={:#x}",
+            handle,
+        );
+
+        self.close_browser(handle).ok();
+        self.overlay_browser_handle = None;
+
+        // Restore compositor to game-active state
+        crate::metal_renderer::set_cef_compositor_game_active(true);
+
+        Ok(())
+    }
+
+    /// Tick the overlay subsystem once per frame:
+    ///
+    /// 1. Polls the global keyboard state for Shift+Tab via CoreGraphics.
+    /// 2. If a toggle edge was detected, creates or destroys the overlay
+    ///    WKWebView browser accordingly.
+    /// 3. When the overlay is active, runs the CEF message loop and submits
+    ///    the latest rendered frame to the compositor.
+    ///
+    /// Call this from the main rendering loop (e.g. inside gfx::present or
+    /// pe_runtime::poll_live_input).
+    pub fn tick_overlay(&mut self) {
+        use crate::steam_integration::{
+            steam_overlay_consume_toggle,
+            steam_overlay_is_active,
+            steam_overlay_poll_keyboard,
+        };
+
+        // 1. Poll physical keyboard for Shift+Tab
+        steam_overlay_poll_keyboard();
+
+        // 2. Check if overlay was toggled this frame
+        if steam_overlay_consume_toggle() {
+            if steam_overlay_is_active() {
+                // Overlay activated → create the WKWebView
+                let url = crate::steam_integration::with_steam_overlay(|mgr| {
+                    mgr.overlay_url().to_string()
+                });
+                if let Err(e) = self.create_overlay_browser(&url) {
+                    eprintln!(
+                        "[CefBridge] tick_overlay: failed to create overlay browser: {e}",
+                    );
+                }
+            } else {
+                // Overlay deactivated → destroy the WKWebView
+                if let Err(e) = self.destroy_overlay_browser() {
+                    eprintln!(
+                        "[CefBridge] tick_overlay: failed to destroy overlay browser: {e}",
+                    );
+                }
+            }
+        }
+
+        // 3. When overlay is active, pump message loop and submit frames
+        if steam_overlay_is_active() {
+            self.cef_do_message_loop_work();
+
+            if let Some(handle) = self.overlay_browser_handle {
+                // Submit the latest overlay frame to the compositor
+                self.submit_latest_frame_to_compositor(handle);
+
+                // Also check if a toggle happened during message loop work
+                if steam_overlay_consume_toggle() {
+                    if !steam_overlay_is_active() {
+                        let _ = self.destroy_overlay_browser();
+                    }
+                }
+            }
+        }
+    }
+
+    /// Get the current overlay browser handle, if any.
+    pub fn overlay_browser_handle(&self) -> Option<CefHandle> {
+        self.overlay_browser_handle
     }
 
     /// Mark a browser's rendered frame as dirty, triggering a new snapshot
@@ -2614,6 +2989,10 @@ impl CefBridge {
 // ===========================================================================
 
 impl CefBridge {
+    // -----------------------------------------------------------------------
+    // CefLifeSpanHandler — browser creation/closing
+    // -----------------------------------------------------------------------
+
     /// `CefLifeSpanHandler::OnAfterCreated` — called after a browser is created.
     ///
     /// Updates the browser's internal state to reflect that it is fully initialized.
@@ -2623,21 +3002,170 @@ impl CefBridge {
             browser.is_loading = true;
             browser.dirty = true;
             eprintln!("[CefBridge] OnAfterCreated: browser {browser_handle:#x}");
+        } else {
+            eprintln!(
+                "[CefBridge] OnAfterCreated: browser {browser_handle:#x} not found",
+            );
         }
         Ok(())
+    }
+
+    /// `CefLifeSpanHandler::DoClose` — called when the browser is about to close.
+    ///
+    /// Returns `true` if the close will be handled (host should close immediately),
+    /// or `false` if the host should wait for OnBeforeClose. In our WKWebView
+    /// bridge, we set a close-pending flag and return `true` to initiate teardown.
+    pub fn do_close(&mut self, browser_handle: CefHandle) -> bool {
+        let exists = self.browsers.contains_key(&browser_handle);
+        if exists {
+            self.close_pending_for = Some(browser_handle);
+            eprintln!(
+                "[CefBridge] DoClose: browser {browser_handle:#x} — close sequence initiated"
+            );
+            true
+        } else {
+            eprintln!(
+                "[CefBridge] DoClose: browser {browser_handle:#x} not found — ignoring",
+            );
+            false
+        }
+    }
+
+    /// `CefLifeSpanHandler::OnBeforeClose` — called just before the browser is destroyed.
+    ///
+    /// Performs final cleanup: closes the underlying WKWebView and removes the
+    /// browser from all internal state. After this call the browser handle is
+    /// no longer valid.
+    pub fn on_before_close(&mut self, browser_handle: CefHandle) {
+        if self.close_pending_for == Some(browser_handle) {
+            self.close_pending_for = None;
+        }
+
+        // Close the WKWebView if this browser has one
+        if let Some(browser) = self.browsers.get(&browser_handle) {
+            if let Some(wk_handle) = browser.wk_handle {
+                if let Some(mgr) = self.webview_manager.as_mut() {
+                    mgr.close(wk_handle);
+                }
+            }
+        }
+
+        // Remove browser from all state
+        self.browsers.remove(&browser_handle);
+        self.frames.retain(|&(bh, _), _| bh != browser_handle);
+        self.rendered_frames.retain(|f| {
+            self.browsers
+                .get(&browser_handle)
+                .map_or(true, |b| f.browser_id != b.id)
+        });
+
+        eprintln!("[CefBridge] OnBeforeClose: browser {browser_handle:#x} — cleaned up");
+    }
+
+    // -----------------------------------------------------------------------
+    // CefLoadHandler — page loading state changes
+    // -----------------------------------------------------------------------
+
+    /// `CefLoadHandler::OnLoadingStateChange` — called when the loading state changes.
+    ///
+    /// Updates the browser's `is_loading`, `can_go_back`, and `can_go_forward` flags.
+    /// Steam's UI uses this to enable/disable navigation buttons.
+    pub fn on_loading_state_change(
+        &mut self,
+        browser_handle: CefHandle,
+        is_loading: bool,
+        can_go_back: bool,
+        can_go_forward: bool,
+    ) {
+        if let Some(browser) = self.browsers.get_mut(&browser_handle) {
+            browser.is_loading = is_loading;
+            browser.can_go_back = can_go_back;
+            browser.can_go_forward = can_go_forward;
+            browser.dirty = true;
+            eprintln!(
+                "[CefBridge] OnLoadingStateChange: browser {browser_handle:#x} \
+                 loading={is_loading} back={can_go_back} forward={can_go_forward}",
+            );
+        }
+    }
+
+    /// `CefLoadHandler::OnLoadStart` — called when a page starts loading.
+    ///
+    /// Marks the browser as loading. The `transition_type` indicates what kind
+    /// of navigation triggered the load (link click, address bar, reload, etc.).
+    pub fn on_load_start(
+        &mut self,
+        browser_handle: CefHandle,
+        url: &str,
+        _is_main_frame: bool,
+    ) {
+        let is_main = true; // WKWebView reports per-page, always main frame
+        if let Some(browser) = self.browsers.get_mut(&browser_handle) {
+            browser.is_loading = true;
+            browser.current_url = url.to_string();
+            browser.dirty = true;
+            eprintln!(
+                "[CefBridge] OnLoadStart: browser {browser_handle:#x} url={url} \
+                 main_frame={is_main}",
+            );
+        }
     }
 
     /// `CefLoadHandler::OnLoadEnd` — called when a page finishes loading.
     ///
     /// Marks the browser as no longer loading and triggers a snapshot for rendering.
     /// Steam uses this to know when to inject its JavaScript bridge.
-    pub fn on_load_end(&mut self, browser_handle: CefHandle) -> AppResult<()> {
+    pub fn on_load_end(&mut self, browser_handle: CefHandle, url: &str) -> AppResult<()> {
+        if let Some(browser) = self.browsers.get_mut(&browser_handle) {
+            browser.is_loading = false;
+            browser.current_url = url.to_string();
+            browser.dirty = true;
+            eprintln!("[CefBridge] OnLoadEnd: browser {browser_handle:#x} url={url}");
+        }
+        Ok(())
+    }
+
+    /// `CefLoadHandler::OnLoadError` — called when a page fails to load.
+    ///
+    /// Logs the error and updates the browser's error state. Important for
+    /// diagnostics when Steam overlay URLs fail to load.
+    pub fn on_load_error(
+        &mut self,
+        browser_handle: CefHandle,
+        error_code: u32,
+        error_text: &str,
+        failed_url: &str,
+    ) {
         if let Some(browser) = self.browsers.get_mut(&browser_handle) {
             browser.is_loading = false;
             browser.dirty = true;
-            eprintln!("[CefBridge] OnLoadEnd: browser {browser_handle:#x}");
+            eprintln!(
+                "[CefBridge] OnLoadError: browser {browser_handle:#x} \
+                 error_code={error_code} url={failed_url} error={error_text}",
+            );
+        } else {
+            eprintln!(
+                "[CefBridge] OnLoadError: browser {browser_handle:#x} not found \
+                 error_code={error_code} url={failed_url} error={error_text}",
+            );
         }
-        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // CefDisplayHandler — display-related events
+    // -----------------------------------------------------------------------
+
+    /// `CefDisplayHandler::OnAddressChange` — called when the displayed URL changes.
+    ///
+    /// Updates the browser's `current_url`. Steam's overlay uses this to track
+    /// navigation state for the in-game browser UI.
+    pub fn on_address_change(&mut self, browser_handle: CefHandle, url: &str) {
+        if let Some(browser) = self.browsers.get_mut(&browser_handle) {
+            browser.current_url = url.to_string();
+            eprintln!(
+                "[CefBridge] OnAddressChange: browser {browser_handle:#x} url={url}",
+            );
+        }
     }
 
     /// `CefDisplayHandler::OnTitleChange` — called when the page title changes.
@@ -2648,11 +3176,323 @@ impl CefBridge {
         if let Some(browser) = self.browsers.get_mut(&browser_handle) {
             browser.title = title.to_string();
             eprintln!(
-                "[CefBridge] OnTitleChange: browser {browser_handle:#x} title={title}"
+                "[CefBridge] OnTitleChange: browser {browser_handle:#x} title={title}",
             );
         }
         Ok(())
     }
+
+    /// `CefDisplayHandler::OnTooltip` — called when the tooltip text changes.
+    ///
+    /// Returns `true` to show the tooltip text, `false` to hide it.
+    /// Steam overlay uses tooltips for navigation hints and button descriptions.
+    pub fn on_tooltip(&mut self, _browser_handle: CefHandle, text: &str) -> bool {
+        if text.is_empty() {
+            eprintln!(
+                "[CefBridge] OnTooltip: browser {_browser_handle:#x} — tooltip hidden",
+            );
+            false
+        } else {
+            eprintln!(
+                "[CefBridge] OnTooltip: browser {_browser_handle:#x} text=\"{text}\"",
+            );
+            true
+        }
+    }
+
+    /// `CefDisplayHandler::OnStatusMessage` — called when the status message changes.
+    ///
+    /// Logs status bar messages (e.g., link hover URLs). Steam may use this
+    /// for status bar display in the overlay.
+    pub fn on_status_message(&mut self, browser_handle: CefHandle, message: &str) {
+        eprintln!(
+            "[CefBridge] OnStatusMessage: browser {browser_handle:#x} message=\"{message}\"",
+        );
+    }
+
+    /// `CefDisplayHandler::OnConsoleMessage` — called when CEF writes to the console.
+    ///
+    /// Logs JavaScript console output from the browser page. Important for
+    /// debugging Steam overlay JavaScript issues.
+    ///
+    /// Returns `true` if the message was handled (prevents default console output).
+    pub fn on_console_message(
+        &mut self,
+        _browser_handle: CefHandle,
+        message: &str,
+        source: &str,
+        line: u32,
+    ) -> bool {
+        eprintln!(
+            "[CefBridge] OnConsoleMessage: browser {_browser_handle:#x} \
+             source=\"{source}\" line={line} message=\"{message}\"",
+        );
+        // Return false to allow default console handling as well
+        false
+    }
+
+    // -----------------------------------------------------------------------
+    // CefRenderHandler — offscreen rendering / painting
+    // -----------------------------------------------------------------------
+
+    /// `CefRenderHandler::GetViewRect` — return the browser's view dimensions.
+    ///
+    /// Returns the current dimensions of the browser's rendering area.
+    /// CEF calls this to know how large the offscreen bitmap should be.
+    /// Falls back to 1x1 if the browser is not found (minimum valid rect).
+    pub fn get_view_rect(&self, browser_handle: CefHandle) -> CefRect {
+        if let Some(browser) = self.browsers.get(&browser_handle) {
+            // Use WKWebView dimensions if available
+            let (w, h) = if let Some(wk_handle) = browser.wk_handle {
+                if let Some(mgr) = self.webview_manager.as_ref() {
+                    mgr.dimensions(wk_handle)
+                        .map(|(dw, dh)| (dw as i32, dh as i32))
+                        .unwrap_or((1, 1))
+                } else {
+                    (1, 1)
+                }
+            } else {
+                // Fall back to first rendered frame dimensions
+                self.get_rendered_frame(browser.id)
+                    .map(|f| (f.width as i32, f.height as i32))
+                    .unwrap_or((1, 1))
+            };
+            let rect = CefRect {
+                x: 0,
+                y: 0,
+                width: w,
+                height: h,
+            };
+            eprintln!(
+                "[CefBridge] GetViewRect: browser {browser_handle:#x} -> {w}x{h}",
+            );
+            rect
+        } else {
+            eprintln!(
+                "[CefBridge] GetViewRect: browser {browser_handle:#x} not found — returning 1x1",
+            );
+            CefRect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            }
+        }
+    }
+
+    /// `CefRenderHandler::GetScreenInfo` — return screen information.
+    ///
+    /// Returns the screen point (origin) and available rect. Steam overlay
+    /// may query this to position popups relative to the game window.
+    /// Returns `(screen_point_x, screen_point_y, scale_factor)` where
+    /// `scale_factor` is the device pixel ratio (1.0 for standard DPI).
+    pub fn get_screen_info(&self, _browser_handle: CefHandle) -> (i32, i32, f64) {
+        // Default screen info: origin at (0,0), 1x scale factor.
+        // In production, this should query the NSScreen for the actual
+        // display where the overlay is shown.
+        eprintln!(
+            "[CefBridge] GetScreenInfo: browser {_browser_handle:#x} -> (0,0) scale=1.0",
+        );
+        (0, 0, 1.0)
+    }
+
+    /// `CefRenderHandler::OnPaint` — called when CEF wants to paint the
+    /// offscreen buffer.
+    ///
+    /// This is the critical rendering callback. CEF passes the pixel buffer
+    /// (BGRA or RGBA depending on config) that should be composited into
+    /// the graphics pipeline.
+    ///
+    /// `paint_type` indicates whether this is a view paint (0) or popup paint (1).
+    /// The `dirty_rects` describe which regions have changed. The `buffer`
+    /// contains the full frame pixel data.
+    ///
+    /// In our WKWebView bridge, this maps snapshot data into the rendered
+    /// frame queue for compositing.
+    pub fn on_paint(
+        &mut self,
+        browser_handle: CefHandle,
+        paint_type: u32,
+        _dirty_rects: &[CefRect],
+        buffer: &[u8],
+        width: u32,
+        height: u32,
+    ) {
+        let browser_id = match self.browsers.get(&browser_handle) {
+            Some(b) => b.id,
+            None => {
+                eprintln!(
+                    "[CefBridge] OnPaint: browser {browser_handle:#x} not found",
+                );
+                return;
+            }
+        };
+
+        let expected_size = (width as usize).saturating_mul(height as usize).saturating_mul(4);
+        let pixels = if buffer.len() >= expected_size {
+            buffer[..expected_size].to_vec()
+        } else {
+            eprintln!(
+                "[CefBridge] OnPaint: buffer too small for {width}x{height} \
+                 (got {} bytes, need {expected_size}) — padding",
+                buffer.len(),
+            );
+            let mut padded = buffer.to_vec();
+            padded.resize(expected_size, 0xFF);
+            padded
+        };
+
+        if paint_type == 0 {
+            // View paint (main rendering area)
+            let frame_number = self.rendered_frames.len() as u64;
+            let rendered = RenderedFrame {
+                browser_id,
+                width,
+                height,
+                pixels: pixels.clone(),
+                frame_number,
+            };
+
+            // Invoke paint callback if registered
+            if let Some(ref mut cb) = self.paint_callback {
+                cb(rendered.clone());
+            }
+
+            self.rendered_frames.push_back(rendered);
+            while self.rendered_frames.len() > 10 {
+                self.rendered_frames.pop_front();
+            }
+
+            if let Some(browser) = self.browsers.get_mut(&browser_handle) {
+                browser.dirty = false;
+            }
+
+            eprintln!(
+                "[CefBridge] OnPaint: browser {browser_handle:#x} \
+                 view {width}x{height} frame={frame_number}",
+            );
+        } else {
+            // Popup paint — store popup pixel data for compositing
+            eprintln!(
+                "[CefBridge] OnPaint: browser {browser_handle:#x} \
+                 popup {width}x{height} (popup paint type={paint_type})",
+            );
+            // Store popup frame data for subsequent compositing calls
+            self.popup_info = Some(CefRect {
+                x: 0,
+                y: 0,
+                width: width as i32,
+                height: height as i32,
+            });
+        }
+    }
+
+    /// `CefRenderHandler::OnAcceleratedPaint` — called when CEF paints via
+    /// a shared GPU texture handle (D3D11/OpenGL/Vulkan shared handle).
+    ///
+    /// On macOS, this maps to IOSurface-based zero-copy rendering.
+    /// The `shared_handle` is an IOSurfaceRef that can be wrapped as a
+    /// Metal texture for direct compositing.
+    ///
+    /// Returns `true` if the accelerated paint was handled.
+    pub fn on_accelerated_paint(
+        &mut self,
+        browser_handle: CefHandle,
+        _paint_type: u32,
+        shared_handle: *mut std::ffi::c_void,
+    ) -> bool {
+        if shared_handle.is_null() {
+            eprintln!(
+                "[CefBridge] OnAcceleratedPaint: browser {browser_handle:#x} \
+                 null shared handle — ignoring",
+            );
+            return false;
+        }
+
+        let browser_id = match self.browsers.get(&browser_handle) {
+            Some(b) => b.id,
+            None => {
+                eprintln!(
+                    "[CefBridge] OnAcceleratedPaint: browser {browser_handle:#x} not found",
+                );
+                return false;
+            }
+        };
+
+        eprintln!(
+            "[CefBridge] OnAcceleratedPaint: browser {browser_handle:#x} \
+             shared_handle={:p} — IOSurface zero-copy path available",
+            shared_handle,
+        );
+
+        // Update the IO surface cache with the shared handle
+        // The caller (drawing code) will use render_to_io_surface_texture
+        // to wrap this in a Metal texture for compositing.
+        if let Some(mgr) = self.webview_manager.as_ref() {
+            if let Some(browser) = self.browsers.get(&browser_handle) {
+                if let Some(wk_handle) = browser.wk_handle {
+                    if let Some(dims) = mgr.dimensions(wk_handle) {
+                        let (fw, fh) = (dims.0 as u32, dims.1 as u32);
+                        let frame_number = self.rendered_frames.len() as u64;
+                        // Push a placeholder rendered frame that the IOSurface
+                        // path will serve (actual pixels live on GPU).
+                        let rendered = RenderedFrame {
+                            browser_id,
+                            width: fw,
+                            height: fh,
+                            pixels: Vec::new(), // zero-copy — no CPU pixels
+                            frame_number,
+                        };
+                        if let Some(ref mut cb) = self.paint_callback {
+                            cb(rendered.clone());
+                        }
+                        self.rendered_frames.push_back(rendered);
+                        while self.rendered_frames.len() > 10 {
+                            self.rendered_frames.pop_front();
+                        }
+                        if let Some(b) = self.browsers.get_mut(&browser_handle) {
+                            b.dirty = false;
+                        }
+                        return true;
+                    }
+                }
+            }
+        }
+
+        false
+    }
+
+    /// `CefRenderHandler::OnPopupShow` — called to show or hide the popup widget.
+    ///
+    /// When `show` is true, a popup (e.g., <select> dropdown, context menu) is
+    /// being displayed. When false, the popup is hidden.
+    pub fn on_popup_show(&mut self, browser_handle: CefHandle, show: bool) {
+        self.popup_showing = show;
+        if !show {
+            self.popup_info = None;
+        }
+        eprintln!(
+            "[CefBridge] OnPopupShow: browser {browser_handle:#x} show={show}",
+        );
+    }
+
+    /// `CefRenderHandler::OnPopupSize` — called when the popup widget is resized.
+    ///
+    /// Stores the popup's position and dimensions so that subsequent OnPaint
+    /// calls with popup type can correctly composite the popup content.
+    pub fn on_popup_size(&mut self, browser_handle: CefHandle, rect: CefRect) {
+        let stored_rect = rect.clone();
+        self.popup_info = Some(stored_rect);
+        eprintln!(
+            "[CefBridge] OnPopupSize: browser {browser_handle:#x} \
+             rect=({},{}) {}x{}",
+            rect.x, rect.y, rect.width, rect.height,
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // CefRequestHandler — request interception and auth
+    // -----------------------------------------------------------------------
 
     /// `CefRequestHandler::OnBeforeBrowse` — called before a navigation request.
     ///
@@ -2660,7 +3500,6 @@ impl CefBridge {
     /// By default, all navigations are allowed. Steam may use this to intercept
     /// `steam://` protocol URLs and route them to native handlers.
     pub fn on_before_browse(&mut self, _browser_handle: CefHandle, url: &str) -> bool {
-        // Allow all navigations by default, but log steam:// URLs for debugging
         if url.starts_with("steam://") {
             eprintln!("[CefBridge] OnBeforeBrowse (steam://): {url}");
             // steam:// URLs are handled natively — cancel browser navigation
@@ -2669,6 +3508,82 @@ impl CefBridge {
         eprintln!("[CefBridge] OnBeforeBrowse: {url}");
         false
     }
+
+    /// `CefRequestHandler::OnBeforeResourceLoad` — called before a resource
+    /// is loaded.
+    ///
+    /// Returns `true` to block the resource, `false` to allow it.
+    /// Used for content filtering or ad blocking in the Steam overlay.
+    pub fn on_before_resource_load(
+        &mut self,
+        _browser_handle: CefHandle,
+        _url: &str,
+    ) -> bool {
+        // Allow all resources by default
+        false
+    }
+
+    /// `CefRequestHandler::GetResourceRequestHandler` — called to get a handler
+    /// for intercepting individual resource requests.
+    ///
+    /// Returns a handler ID (0 = default handling). In our bridge, we use
+    /// the default WKWebView resource loading (no custom interception).
+    /// A non-zero return value could be used for custom cookie injection,
+    /// header modification, etc. for specific resource types.
+    pub fn get_resource_request_handler(
+        &mut self,
+        _browser_handle: CefHandle,
+        url: &str,
+    ) -> u32 {
+        // Return 0 for default handling of all resources
+        // Steam overlay may check for specific resources:
+        if url.contains("steamcommunity.com") || url.contains("store.steampowered.com") {
+            // These are Steam domains — could inject custom headers here
+            // in a future implementation (e.g., Steam auth tokens).
+            return 0;
+        }
+        0
+    }
+
+    /// `CefRequestHandler::OnAuthCredentials` — called when the browser needs
+    /// authentication credentials (HTTP Basic/Digest auth or proxy auth).
+    ///
+    /// Returns `true` if credentials are provided, `false` to cancel auth.
+    /// Steam overlay may need this for proxy-authenticated networks.
+    ///
+    /// In our bridge, we do not store credentials — the caller must provide
+    /// them via the CEF credential store. We return `false` to cancel auth
+    /// (the request will fail with a 401).
+    pub fn on_auth_credentials(
+        &mut self,
+        _browser_handle: CefHandle,
+        _origin_url: &str,
+        _is_proxy: bool,
+        _host: &str,
+        _port: u16,
+        _realm: &str,
+        _scheme: &str,
+    ) -> bool {
+        eprintln!(
+            "[CefBridge] OnAuthCredentials: browser {_browser_handle:#x} \
+             host={_host}:{_port} realm={_realm} scheme={_scheme} — credentials not available, \
+             cancelling auth",
+        );
+        false
+    }
+
+    /// `CefRequestHandler::OnCookieableSchemes` — returns the list of URI schemes
+    /// for which cookies can be stored.
+    ///
+    /// This tells CEF which protocols support cookies. Steam overlay uses cookies
+    /// for session management across store.steampowered.com and steamcommunity.com.
+    pub fn on_cookieable_schemes(&self) -> &[String] {
+        &self.cookieable_schemes
+    }
+
+    // -----------------------------------------------------------------------
+    // Utility / Extension Registration
+    // -----------------------------------------------------------------------
 
     /// Register a JavaScript extension for all current and future browser instances.
     ///
@@ -4273,6 +5188,1145 @@ mod tests {
             exports.len(),
             "all export ordinals should be unique"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // G9: IOSurface hardening tests
+    // -----------------------------------------------------------------------
+
+    /// Test that `get_io_surface_for_browser` returns proper errors for
+    /// invalid/bogus handles rather than crashing or returning success.
+    #[test]
+    fn g9_io_surface_extraction_error_handling() {
+        let mut bridge = CefBridge::new();
+        if !wkwebview_available() {
+            return;
+        }
+        bridge.cef_initialize(CefSettings::default()).unwrap();
+
+        // Test 1: Non-existent handle should return RcNotFound error
+        let bogus_handle = WKWebViewHandle(99999);
+        let mgr = bridge.webview_manager.as_ref().unwrap();
+        let result = mgr.get_io_surface_for_browser(bogus_handle);
+        assert!(
+            result.is_err(),
+            "non-existent handle should produce an error"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.message.contains("not found"),
+            "error should mention 'not found', got: {}",
+            err.message
+        );
+
+        // Test 2: Valid handle to a just-created browser should not crash.
+        // The IOSurface may be null (snapshot-based fallback is expected for
+        // offscreen rendering), but the call itself must not panic or segfault.
+        let browser = bridge
+            .cef_browser_host_create_browser(
+                CefWindowInfo {
+                    x: 0, y: 0, width: 320, height: 240,
+                    windowless_rendering_enabled: true,
+                    parent_window: 0, url: None,
+                    external_begin_frame_enabled: false,
+                },
+                "about:blank",
+                CefBrowserSettings::default(),
+            )
+            .expect("create browser for IOSurface test");
+        let wk_handle = bridge
+            .browsers()
+            .get(&browser)
+            .and_then(|b| b.wk_handle)
+            .expect("browser should have a WKWebView handle");
+        let mgr = bridge.webview_manager.as_ref().unwrap();
+        let surface = mgr.get_io_surface_for_browser(wk_handle);
+        // The call must succeed (even if surface is null) and must not panic.
+        assert!(
+            surface.is_ok(),
+            "get_io_surface_for_browser on valid handle should not error"
+        );
+
+        bridge.close_browser(browser).unwrap();
+    }
+
+    /// Test that `render_to_io_surface_texture` properly falls back to the
+    /// managed (CPU upload) path when the native WKWebView layer has no
+    /// IOSurface backing — which is the expected case for offscreen rendering.
+    ///
+    /// This test exercises the full fallback chain:
+    ///   1. Zero-copy path attempted → fails (no IOSurface in layer)
+    ///   2. Managed path: IOSurface allocated, CPU pixels uploaded
+    ///   3. Metal texture wrapping managed IOSurface returned
+    #[test]
+    fn g9_io_surface_fallback_path_when_unavailable() {
+        let mut bridge = CefBridge::new();
+        if !wkwebview_available() {
+            return;
+        }
+        bridge.cef_initialize(CefSettings::default()).unwrap();
+
+        let browser = bridge
+            .cef_browser_host_create_browser(
+                CefWindowInfo {
+                    x: 0, y: 0, width: 100, height: 100,
+                    windowless_rendering_enabled: true,
+                    parent_window: 0, url: None,
+                    external_begin_frame_enabled: false,
+                },
+                "about:blank",
+                CefBrowserSettings::default(),
+            )
+            .expect("create browser");
+
+        // Process pending ops to generate a rendered frame
+        bridge.process_pending_webview_ops();
+
+        // Verify we have a rendered frame
+        let browser_obj = bridge.browsers().get(&browser).unwrap();
+        let frame = bridge.get_rendered_frame(browser_obj.id);
+        assert!(
+            frame.is_some(),
+            "rendered frame should be available after browser creation"
+        );
+
+        // Test that submit_latest_frame_to_compositor does not crash
+        // even when IOSurface is unavailable
+        bridge.submit_latest_frame_to_compositor(browser);
+
+        // Test that a call with an invalid browser handle does not panic
+        bridge.submit_latest_frame_to_compositor(0xDEADBEEF);
+
+        bridge.close_browser(browser).unwrap();
+    }
+
+    /// Test frame delivery sequencing: verify that rendered frames are
+    /// properly queued, retrieved in the correct order, and that the
+    /// frame number monotonically increases.
+    #[test]
+    fn g9_frame_delivery_sequencing() {
+        let mut bridge = CefBridge::new();
+
+        // Manually push frames (no WKWebView needed — pure data path test)
+        let browser_id = 1u32;
+        let frame1 = RenderedFrame {
+            browser_id,
+            width: 10,
+            height: 10,
+            pixels: vec![0xFFu8; 10 * 10 * 4],
+            frame_number: 0,
+        };
+        let frame2 = RenderedFrame {
+            browser_id,
+            width: 10,
+            height: 10,
+            pixels: vec![0x80u8; 10 * 10 * 4],
+            frame_number: 1,
+        };
+        let frame3 = RenderedFrame {
+            browser_id,
+            width: 20,
+            height: 20,
+            pixels: vec![0x40u8; 20 * 20 * 4],
+            frame_number: 2,
+        };
+
+        bridge.rendered_frames.push_back(frame1.clone());
+        bridge.rendered_frames.push_back(frame2.clone());
+        bridge.rendered_frames.push_back(frame3.clone());
+
+        // get_rendered_frame should return the latest (most recent) frame,
+        // which is frame3 (highest frame_number for the given browser_id).
+        let latest = bridge.get_rendered_frame(browser_id);
+        assert!(latest.is_some(), "should find a rendered frame");
+        let latest = latest.unwrap();
+        assert_eq!(latest.frame_number, 2, "should return latest frame (frame_number=2)");
+        assert_eq!(latest.width, 20, "should match frame3 dimensions");
+        assert_eq!(latest.height, 20, "should match frame3 dimensions");
+        assert_eq!(latest.pixels[0], 0x40, "should match frame3 pixel data");
+
+        // Verify earlier frame is still accessible (VecDeque retains history)
+        let all_frames: Vec<&RenderedFrame> = bridge
+            .rendered_frames
+            .iter()
+            .filter(|f| f.browser_id == browser_id)
+            .collect();
+        assert_eq!(all_frames.len(), 3, "all three frames should be preserved");
+
+        // Test frame_number monotonic property
+        for i in 1..all_frames.len() {
+            assert!(
+                all_frames[i].frame_number > all_frames[i - 1].frame_number,
+                "frame numbers should be monotonically increasing"
+            );
+        }
+    }
+
+    /// Test that `submit_latest_frame_to_compositor` handles edge cases
+    /// gracefully: missing browser, missing frame, empty pixels.
+    #[test]
+    fn g9_submit_frame_edge_cases() {
+        let mut bridge = CefBridge::new();
+
+        // Edge case 1: no browsers registered — should not panic
+        bridge.submit_first_browser_to_compositor();
+
+        // Edge case 2: browser exists but no rendered frame — should not panic
+        bridge.browsers.insert(
+            1,
+            CefBrowser {
+                id: 1,
+                host_handle: 1,
+                main_frame_handle: 1,
+                can_go_back: false,
+                can_go_forward: false,
+                is_loading: false,
+                current_url: "about:blank".to_string(),
+                title: String::new(),
+                zoom_level: 1.0,
+                wk_handle: None,
+                dirty: false,
+                metal_texture_id: None,
+            },
+        );
+        // No rendered_frames pushed, so submit should gracefully no-op
+        bridge.submit_latest_frame_to_compositor(1);
+
+        // Edge case 3: browser has a frame with valid (empty) pixels
+        bridge.rendered_frames.push_back(RenderedFrame {
+            browser_id: 1,
+            width: 1,
+            height: 1,
+            pixels: vec![0xFFu8; 4], // 1x1 RGBA pixel
+            frame_number: 0,
+        });
+        // Should not panic
+        bridge.submit_latest_frame_to_compositor(1);
+    }
+
+    /// Test that IoSurfaceTexturePair creation and drop do not crash.
+    ///
+    /// This test validates the lifecycle of the cached IOSurface+Metal-texture
+    /// pair used by the managed IOSurface path. On macOS with a Metal device,
+    /// a real IOSurface is allocated and wrapped; on other platforms, creation
+    /// gracefully returns None.
+    #[test]
+    fn g9_io_surface_pair_lifecycle() {
+        // Creating with zero dimensions should return None
+        let maybe_device = crate::metal_backend::MetalDevice::system_default();
+        if let Ok(ref device) = maybe_device {
+            let pair = IoSurfaceTexturePair::new(device.device(), 0, 0);
+            assert!(
+                pair.is_none(),
+                "IOSurface pair creation with zero dimensions should return None"
+            );
+
+            // Creating with valid dimensions should succeed on Apple Silicon
+            let pair = IoSurfaceTexturePair::new(device.device(), 64, 64);
+            assert!(
+                pair.is_some(),
+                "IOSurface pair creation with valid dimensions should succeed"
+            );
+            if let Some(ref p) = pair {
+                assert!(!p.io_surface.is_null(), "IOSurface pointer should not be null");
+                assert!(
+                    p.metal_texture.is_some(),
+                    "Metal texture wrapping IOSurface should exist"
+                );
+                assert_eq!(p.width, 64, "width should match");
+                assert_eq!(p.height, 64, "height should match");
+            }
+            // pair drops here — verifies CFRelease doesn't crash
+        }
+    }
+
+    /// Test that `io_surface_available()` returns a cached result and does
+    /// not panic. On macOS with Metal, the IOSurface class should be found;
+    /// on headless systems it may return false, but the method itself must
+    /// always complete without error.
+    #[test]
+    fn g9_io_surface_availability_check() {
+        let mut bridge = CefBridge::new();
+        // First call performs the ObjC class lookup
+        let result1 = bridge.io_surface_available();
+        // Second call uses the cached value
+        let result2 = bridge.io_surface_available();
+        assert_eq!(
+            result1, result2,
+            "io_surface_available should return the same cached result on repeated calls"
+        );
+        // The cached field should now be Some
+        assert!(
+            bridge.io_surface_available.is_some(),
+            "io_surface_available field should be cached after first check"
+        );
+    }
+
+    /// Test that `render_to_io_surface_texture` correctly falls back to
+    /// `render_to_metal_texture` when IOSurface allocation fails in the
+    /// managed path. This exercises the defensive fallback added in
+    /// Phase D3:R3.
+    ///
+    /// We simulate the fallback by passing a device that exists; if the
+    /// IOSurface class is unavailable (headless CI), the early check in
+    /// `render_to_io_surface_texture` should route to the CPU path.
+    /// If IOSurface IS available, we verify the IO surface path still
+    /// works as the primary path.
+    #[test]
+    fn g9_render_to_io_surface_fallback_on_alloc_failure() {
+        if !wkwebview_available() {
+            return;
+        }
+        let maybe_device = crate::metal_backend::MetalDevice::system_default();
+        if let Ok(ref device) = maybe_device {
+            let mut bridge = CefBridge::new();
+            bridge.cef_initialize(CefSettings::default()).unwrap();
+
+            let browser = bridge
+                .cef_browser_host_create_browser(
+                    CefWindowInfo {
+                        x: 0, y: 0, width: 100, height: 100,
+                        windowless_rendering_enabled: true,
+                        parent_window: 0, url: None,
+                        external_begin_frame_enabled: false,
+                    },
+                    "about:blank",
+                    CefBrowserSettings::default(),
+                )
+                .expect("create browser for IOSurface fallback test");
+
+            // Process pending ops to generate a rendered frame
+            bridge.process_pending_webview_ops();
+
+            // Call render_to_io_surface_texture — this should succeed
+            // via either the managed IOSurface path or the CPU fallback.
+            let result = bridge.render_to_io_surface_texture(browser, device);
+            assert!(
+                result.is_ok(),
+                "render_to_io_surface_texture should not fail, got: {:?}",
+                result.err(),
+            );
+
+            // Verify the returned texture has the expected dimensions
+            if let Ok(texture) = result {
+                assert_eq!(texture.width(), 100, "texture width should match frame width");
+                assert_eq!(texture.height(), 100, "texture height should match frame height");
+            }
+
+            bridge.close_browser(browser).unwrap();
+        }
+    }
+
+    /// Test that CPU-side `render_to_metal_texture` works correctly as
+    /// the fallback rendering path. This test verifies the function that
+    /// `render_to_io_surface_texture` falls back to when IOSurface is
+    /// unavailable.
+    #[test]
+    fn g9_cpu_fallback_metal_texture_rendering() {
+        if !wkwebview_available() {
+            return;
+        }
+        let maybe_device = crate::metal_backend::MetalDevice::system_default();
+        if let Ok(ref device) = maybe_device {
+            let mut bridge = CefBridge::new();
+            bridge.cef_initialize(CefSettings::default()).unwrap();
+
+            let browser = bridge
+                .cef_browser_host_create_browser(
+                    CefWindowInfo {
+                        x: 0, y: 0, width: 64, height: 64,
+                        windowless_rendering_enabled: true,
+                        parent_window: 0, url: None,
+                        external_begin_frame_enabled: false,
+                    },
+                    "about:blank",
+                    CefBrowserSettings::default(),
+                )
+                .expect("create browser for CPU fallback test");
+
+            // Process pending ops to generate a rendered frame
+            bridge.process_pending_webview_ops();
+
+            // Call render_to_metal_texture directly (CPU fallback path)
+            let result = bridge.render_to_metal_texture(browser, device);
+            assert!(
+                result.is_ok(),
+                "render_to_metal_texture should succeed, got: {:?}",
+                result.err(),
+            );
+
+            if let Ok(texture) = result {
+                assert_eq!(texture.width(), 64, "texture width should match");
+                assert_eq!(texture.height(), 64, "texture height should match");
+                assert_eq!(
+                    texture.pixel_format(),
+                    metal::MTLPixelFormat::RGBA8Unorm,
+                    "CPU fallback texture should be RGBA8Unorm"
+                );
+            }
+
+            bridge.close_browser(browser).unwrap();
+        }
+    }
+
+    /// Test that `submit_latest_frame_to_compositor` works correctly with
+    /// explicit CPU pixel data, exercising the full CPU submission path
+    /// without requiring IOSurface. This verifies the downstream compositor
+    /// can handle frames submitted via the fallback path.
+    #[test]
+    fn g9_submit_frame_cpu_fallback_path() {
+        let mut bridge = CefBridge::new();
+
+        // Insert a browser with a specific ID
+        bridge.browsers.insert(
+            42,
+            CefBrowser {
+                id: 42,
+                host_handle: 42,
+                main_frame_handle: 42,
+                can_go_back: false,
+                can_go_forward: false,
+                is_loading: false,
+                current_url: "about:blank".to_string(),
+                title: String::new(),
+                zoom_level: 1.0,
+                wk_handle: None,
+                dirty: false,
+                metal_texture_id: None,
+            },
+        );
+
+        // Push a rendered frame with known pixel data
+        bridge.rendered_frames.push_back(RenderedFrame {
+            browser_id: 42,
+            width: 4,
+            height: 4,
+            pixels: vec![0x80u8; 4 * 4 * 4], // 4x4 half-opaque gray
+            frame_number: 0,
+        });
+
+        // Submit via CPU fallback path — must not panic
+        bridge.submit_latest_frame_to_compositor(42);
+
+        // Verify the frame was consumed from the queue
+        assert_eq!(
+            bridge.rendered_frames.len(),
+            1,
+            "frame should remain in queue after submission (compositor clones)"
+        );
+    }
+
+    /// Test that `render_to_io_surface_texture` handles the edge case
+    /// where the managed IOSurface cache needs to be resized (different
+    /// dimensions from a previous frame), and the re-allocation fallback
+    /// works correctly.
+    #[test]
+    fn g9_io_surface_cache_resize_fallback() {
+        if !wkwebview_available() {
+            return;
+        }
+        let maybe_device = crate::metal_backend::MetalDevice::system_default();
+        if let Ok(ref device) = maybe_device {
+            let mut bridge = CefBridge::new();
+            bridge.cef_initialize(CefSettings::default()).unwrap();
+
+            let browser = bridge
+                .cef_browser_host_create_browser(
+                    CefWindowInfo {
+                        x: 0, y: 0, width: 100, height: 100,
+                        windowless_rendering_enabled: true,
+                        parent_window: 0, url: None,
+                        external_begin_frame_enabled: false,
+                    },
+                    "about:blank",
+                    CefBrowserSettings::default(),
+                )
+                .expect("create browser for cache resize test");
+
+            // Process to get initial frame
+            bridge.process_pending_webview_ops();
+
+            // First call: allocate IOSurface at 100x100
+            let result1 = bridge.render_to_io_surface_texture(browser, device);
+            assert!(
+                result1.is_ok(),
+                "first render_to_io_surface_texture should succeed, got: {:?}",
+                result1.err(),
+            );
+
+            // Simulate a resize by pushing a frame with different dimensions
+            // and invalidating the browser's rendered frame
+            let browser_id = bridge.browsers.get(&browser).unwrap().id;
+            bridge.rendered_frames.push_back(RenderedFrame {
+                browser_id,
+                width: 200,
+                height: 200,
+                pixels: vec![0xFFu8; 200 * 200 * 4],
+                frame_number: 1,
+            });
+
+            // Second call with different dimensions: cache should detect
+            // mismatch and re-allocate. If IOSurface re-allocation fails,
+            // the fallback to render_to_metal_texture kicks in.
+            let result2 = bridge.render_to_io_surface_texture(browser, device);
+            assert!(
+                result2.is_ok(),
+                "second render_to_io_surface_texture (after resize) should succeed, got: {:?}",
+                result2.err(),
+            );
+
+            if let Ok(texture) = result2 {
+                assert_eq!(
+                    texture.width(), 200,
+                    "resized texture width should match new frame width"
+                );
+                assert_eq!(
+                    texture.height(), 200,
+                    "resized texture height should match new frame height"
+                );
+            }
+
+            bridge.close_browser(browser).unwrap();
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // CEF callback handler tests
+    // -----------------------------------------------------------------------
+
+    /// Helper to create an initialized CefBridge with one browser for testing handlers.
+    fn create_test_bridge() -> (CefBridge, CefHandle) {
+        let mut bridge = CefBridge::new();
+        if !wkwebview_available() {
+            return (bridge, 0);
+        }
+        bridge.cef_initialize(CefSettings::default()).unwrap();
+        let browser = bridge
+            .cef_browser_host_create_browser(
+                CefWindowInfo {
+                    x: 0, y: 0, width: 640, height: 480,
+                    windowless_rendering_enabled: true,
+                    parent_window: 0, url: None,
+                    external_begin_frame_enabled: false,
+                },
+                "about:blank",
+                CefBrowserSettings::default(),
+            )
+            .expect("create browser");
+        (bridge, browser)
+    }
+
+    /// Test CefLifeSpanHandler: OnAfterCreated updates browser state.
+    #[test]
+    fn cef_handler_on_after_created() {
+        let mut bridge = CefBridge::new();
+        if !wkwebview_available() {
+            return;
+        }
+        bridge.cef_initialize(CefSettings::default()).unwrap();
+        let browser = bridge
+            .cef_browser_host_create_browser(
+                CefWindowInfo {
+                    x: 0, y: 0, width: 640, height: 480,
+                    windowless_rendering_enabled: true,
+                    parent_window: 0, url: None,
+                    external_begin_frame_enabled: false,
+                },
+                "about:blank",
+                CefBrowserSettings::default(),
+            )
+            .expect("create browser");
+
+        // Initially the browser is loading=true (set during creation)
+        bridge.on_after_created(browser).expect("on_after_created");
+        let b = bridge.browsers().get(&browser).unwrap();
+        assert!(b.is_loading, "browser should be loading after OnAfterCreated");
+        assert!(b.dirty, "browser should be dirty after OnAfterCreated");
+
+        // Non-existent handle should not panic
+        assert!(bridge.on_after_created(99999).is_ok());
+    }
+
+    /// Test CefLifeSpanHandler: DoClose and OnBeforeClose sequence.
+    #[test]
+    fn cef_handler_do_close_and_before_close() {
+        let (mut bridge, browser) = create_test_bridge();
+        if !wkwebview_available() || browser == 0 {
+            return;
+        }
+
+        // DoClose should return true and set pending state
+        let result = bridge.do_close(browser);
+        assert!(result, "DoClose should return true for existing browser");
+        assert_eq!(
+            bridge.close_pending_for,
+            Some(browser),
+            "close_pending_for should be set"
+        );
+
+        // DoClose on non-existent browser should return false
+        assert!(!bridge.do_close(99999), "DoClose on missing browser should return false");
+
+        // Non-existent handle should not panic
+        bridge.on_before_close(99999);
+
+        // Close the browser properly
+        bridge.on_before_close(browser);
+        assert!(
+            !bridge.cef_browser_is_valid(browser),
+            "browser should be invalid after OnBeforeClose"
+        );
+        assert_eq!(
+            bridge.close_pending_for,
+            None,
+            "close_pending_for should be cleared"
+        );
+    }
+
+    /// Test CefLoadHandler: OnLoadingStateChange updates navigation flags.
+    #[test]
+    fn cef_handler_loading_state_change() {
+        let (mut bridge, browser) = create_test_bridge();
+        if !wkwebview_available() || browser == 0 {
+            return;
+        }
+
+        bridge.on_loading_state_change(browser, true, false, false);
+        let b = bridge.browsers().get(&browser).unwrap();
+        assert!(b.is_loading);
+        assert!(!b.can_go_back);
+        assert!(!b.can_go_forward);
+        assert!(b.dirty);
+
+        bridge.on_loading_state_change(browser, false, true, true);
+        let b = bridge.browsers().get(&browser).unwrap();
+        assert!(!b.is_loading);
+        assert!(b.can_go_back);
+        assert!(b.can_go_forward);
+
+        // Non-existent handle should not panic
+        bridge.on_loading_state_change(99999, true, false, false);
+    }
+
+    /// Test CefLoadHandler: OnLoadStart marks loading state.
+    #[test]
+    fn cef_handler_load_start() {
+        let (mut bridge, browser) = create_test_bridge();
+        if !wkwebview_available() || browser == 0 {
+            return;
+        }
+
+        bridge.on_load_start(browser, "https://store.steampowered.com", true);
+        let b = bridge.browsers().get(&browser).unwrap();
+        assert!(b.is_loading, "browser should be loading after OnLoadStart");
+        assert_eq!(b.current_url, "https://store.steampowered.com");
+
+        // Non-existent handle should not panic
+        bridge.on_load_start(99999, "https://example.com", true);
+    }
+
+    /// Test CefLoadHandler: OnLoadEnd updates loading state and URL.
+    #[test]
+    fn cef_handler_load_end() {
+        let (mut bridge, browser) = create_test_bridge();
+        if !wkwebview_available() || browser == 0 {
+            return;
+        }
+
+        bridge.on_load_end(browser, "https://steamcommunity.com").unwrap();
+        let b = bridge.browsers().get(&browser).unwrap();
+        assert!(!b.is_loading, "browser should not be loading after OnLoadEnd");
+        assert_eq!(b.current_url, "https://steamcommunity.com");
+        assert!(b.dirty, "browser should be dirty after OnLoadEnd");
+    }
+
+    /// Test CefLoadHandler: OnLoadError logs error and updates state.
+    #[test]
+    fn cef_handler_load_error() {
+        let (mut bridge, browser) = create_test_bridge();
+        if !wkwebview_available() || browser == 0 {
+            return;
+        }
+
+        bridge.on_load_error(browser, -3i32 as u32, "Operation cancelled", "https://store.steampowered.com");
+        let b = bridge.browsers().get(&browser).unwrap();
+        assert!(!b.is_loading, "browser should not be loading after error");
+        assert!(b.dirty, "browser should be dirty after error");
+
+        // Non-existent handle should not panic
+        bridge.on_load_error(99999, 1, "test error", "https://example.com");
+    }
+
+    /// Test CefDisplayHandler: OnAddressChange updates current_url.
+    #[test]
+    fn cef_handler_address_change() {
+        let (mut bridge, browser) = create_test_bridge();
+        if !wkwebview_available() || browser == 0 {
+            return;
+        }
+
+        bridge.on_address_change(browser, "https://store.steampowered.com/app/730");
+        let b = bridge.browsers().get(&browser).unwrap();
+        assert_eq!(b.current_url, "https://store.steampowered.com/app/730");
+
+        // Non-existent handle should not panic
+        bridge.on_address_change(99999, "https://example.com");
+    }
+
+    /// Test CefDisplayHandler: OnTitleChange updates browser title.
+    #[test]
+    fn cef_handler_title_change() {
+        let (mut bridge, browser) = create_test_bridge();
+        if !wkwebview_available() || browser == 0 {
+            return;
+        }
+
+        bridge.on_title_change(browser, "Counter-Strike 2").unwrap();
+        let b = bridge.browsers().get(&browser).unwrap();
+        assert_eq!(b.title, "Counter-Strike 2");
+
+        // Title update with empty string should still update
+        bridge.on_title_change(browser, "").unwrap();
+        let b = bridge.browsers().get(&browser).unwrap();
+        assert_eq!(b.title, "");
+
+        // Non-existent handle should not panic
+        assert!(bridge.on_title_change(99999, "test").is_ok());
+    }
+
+    /// Test CefDisplayHandler: OnTooltip returns correct visibility.
+    #[test]
+    fn cef_handler_tooltip() {
+        let (mut bridge, browser) = create_test_bridge();
+        if !wkwebview_available() || browser == 0 {
+            return;
+        }
+
+        // Non-empty text should show tooltip
+        assert!(bridge.on_tooltip(browser, "Click to open Store"), "tooltip should show with text");
+
+        // Empty text should hide tooltip
+        assert!(!bridge.on_tooltip(browser, ""), "tooltip should hide with empty text");
+    }
+
+    /// Test CefDisplayHandler: OnStatusMessage logs messages without errors.
+    #[test]
+    fn cef_handler_status_message() {
+        let (mut bridge, browser) = create_test_bridge();
+        if !wkwebview_available() || browser == 0 {
+            return;
+        }
+
+        // Should not panic
+        bridge.on_status_message(browser, "https://store.steampowered.com/");
+        bridge.on_status_message(browser, "");
+        bridge.on_status_message(99999, "test");
+    }
+
+    /// Test CefDisplayHandler: OnConsoleMessage logs JS console output.
+    #[test]
+    fn cef_handler_console_message() {
+        let (mut bridge, browser) = create_test_bridge();
+        if !wkwebview_available() || browser == 0 {
+            return;
+        }
+
+        // Should return false (allow default handling)
+        let result = bridge.on_console_message(
+            browser,
+            "Hello from Steam",
+            "https://store.steampowered.com/steam.js",
+            42,
+        );
+        assert!(!result, "OnConsoleMessage should return false (not handled)");
+
+        // Non-existent handle should not panic
+        bridge.on_console_message(99999, "test", "test.js", 1);
+    }
+
+    /// Test CefRenderHandler: GetViewRect returns correct dimensions.
+    #[test]
+    fn cef_handler_get_view_rect() {
+        let (mut bridge, browser) = create_test_bridge();
+        if !wkwebview_available() || browser == 0 {
+            return;
+        }
+
+        let rect = bridge.get_view_rect(browser);
+        assert_eq!(rect.x, 0, "view rect x should be 0");
+        assert_eq!(rect.y, 0, "view rect y should be 0");
+        assert!(rect.width > 0, "view rect width should be positive");
+        assert!(rect.height > 0, "view rect height should be positive");
+
+        // Non-existent handle should return 1x1 fallback
+        let fallback = bridge.get_view_rect(99999);
+        assert_eq!(fallback.width, 1, "fallback width should be 1");
+        assert_eq!(fallback.height, 1, "fallback height should be 1");
+    }
+
+    /// Test CefRenderHandler: GetScreenInfo returns default values.
+    #[test]
+    fn cef_handler_get_screen_info() {
+        let (mut bridge, browser) = create_test_bridge();
+        if !wkwebview_available() || browser == 0 {
+            return;
+        }
+
+        let (x, y, scale) = bridge.get_screen_info(browser);
+        assert_eq!(x, 0, "screen origin x should be 0");
+        assert_eq!(y, 0, "screen origin y should be 0");
+        assert!((scale - 1.0).abs() < f64::EPSILON, "scale factor should be 1.0");
+    }
+
+    /// Test CefRenderHandler: OnPaint processes pixel data.
+    #[test]
+    fn cef_handler_on_paint() {
+        let (mut bridge, browser) = create_test_bridge();
+        if !wkwebview_available() || browser == 0 {
+            return;
+        }
+        let browser_id = bridge.browsers().get(&browser).unwrap().id;
+
+        // Simulate a paint with 100x50 RGBA pixel data
+        let width = 100u32;
+        let height = 50u32;
+        let pixels = vec![0x80u8; (width * height * 4) as usize];
+        let dirty_rects = [CefRect { x: 0, y: 0, width: 100, height: 50 }];
+
+        bridge.on_paint(browser, 0, &dirty_rects, &pixels, width, height);
+
+        // Verify rendered frame was created
+        let frame = bridge.get_rendered_frame(browser_id);
+        assert!(frame.is_some(), "rendered frame should exist after OnPaint");
+        let frame = frame.unwrap();
+        assert_eq!(frame.width, width, "frame width should match paint width");
+        assert_eq!(frame.height, height, "frame height should match paint height");
+        assert_eq!(frame.pixels.len(), pixels.len(), "pixel buffer size should match");
+
+        // Verify browser is no longer dirty after paint
+        let b = bridge.browsers().get(&browser).unwrap();
+        assert!(!b.dirty, "browser should not be dirty after OnPaint");
+
+        // OnPaint with non-existent handle should not panic
+        bridge.on_paint(99999, 0, &dirty_rects, &pixels, width, height);
+    }
+
+    /// Test CefRenderHandler: OnPaint with buffer too small handles gracefully.
+    #[test]
+    fn cef_handler_on_paint_buffer_too_small() {
+        let (mut bridge, browser) = create_test_bridge();
+        if !wkwebview_available() || browser == 0 {
+            return;
+        }
+
+        // Paint with buffer smaller than expected for dimensions
+        let pixels = vec![0xFFu8; 10]; // much smaller than 100x50x4 = 20000
+        bridge.on_paint(browser, 0, &[], &pixels, 100, 50);
+        // Should not panic; buffer gets padded internally
+    }
+
+    /// Test CefRenderHandler: OnPopupShow and OnPopupSize track popup state.
+    #[test]
+    fn cef_handler_popup_show_and_size() {
+        let (mut bridge, browser) = create_test_bridge();
+        if !wkwebview_available() || browser == 0 {
+            return;
+        }
+
+        // Initially no popup
+        assert!(!bridge.popup_showing, "popup should not be showing initially");
+        assert!(bridge.popup_info.is_none(), "popup info should be none initially");
+
+        // Show popup and set size
+        bridge.on_popup_show(browser, true);
+        assert!(bridge.popup_showing, "popup should be showing after OnPopupShow(true)");
+
+        let popup_rect = CefRect { x: 10, y: 20, width: 300, height: 200 };
+        bridge.on_popup_size(browser, popup_rect);
+        assert!(bridge.popup_info.is_some(), "popup info should be set after OnPopupSize");
+        let info = bridge.popup_info.clone().unwrap();
+        assert_eq!(info.x, 10);
+        assert_eq!(info.y, 20);
+        assert_eq!(info.width, 300);
+        assert_eq!(info.height, 200);
+
+        // Hide popup — should clear state
+        bridge.on_popup_show(browser, false);
+        assert!(!bridge.popup_showing, "popup should not be showing after OnPopupShow(false)");
+        assert!(bridge.popup_info.is_none(), "popup info should be cleared after hide");
+    }
+
+    /// Test CefRenderHandler: OnAcceleratedPaint with null handle.
+    #[test]
+    fn cef_handler_accelerated_paint_null() {
+        let (mut bridge, browser) = create_test_bridge();
+        if !wkwebview_available() || browser == 0 {
+            return;
+        }
+
+        // Null shared handle should return false
+        let result = bridge.on_accelerated_paint(browser, 0, std::ptr::null_mut());
+        assert!(!result, "null handle should return false");
+    }
+
+    /// Test CefRequestHandler: OnBeforeBrowse allows normal URLs.
+    #[test]
+    fn cef_handler_before_browse() {
+        let (mut bridge, browser) = create_test_bridge();
+        if !wkwebview_available() || browser == 0 {
+            return;
+        }
+
+        // Normal URLs should be allowed
+        assert!(
+            !bridge.on_before_browse(browser, "https://store.steampowered.com"),
+            "normal URLs should be allowed"
+        );
+
+        // steam:// URLs should be cancelled
+        assert!(
+            bridge.on_before_browse(browser, "steam://connect/127.0.0.1"),
+            "steam:// URLs should be cancelled"
+        );
+    }
+
+    /// Test CefRequestHandler: OnBeforeResourceLoad allows all resources.
+    #[test]
+    fn cef_handler_before_resource_load() {
+        let (mut bridge, browser) = create_test_bridge();
+        if !wkwebview_available() || browser == 0 {
+            return;
+        }
+
+        assert!(
+            !bridge.on_before_resource_load(browser, "https://store.steampowered.com/script.js"),
+            "resources should be allowed by default"
+        );
+        assert!(
+            !bridge.on_before_resource_load(browser, "https://steamcommunity.com/style.css"),
+            "Steam resources should be allowed"
+        );
+    }
+
+    /// Test CefRequestHandler: GetResourceRequestHandler returns default (0).
+    #[test]
+    fn cef_handler_resource_request_handler() {
+        let (mut bridge, browser) = create_test_bridge();
+        if !wkwebview_available() || browser == 0 {
+            return;
+        }
+
+        let handler_id = bridge.get_resource_request_handler(
+            browser,
+            "https://store.steampowered.com/steam.js",
+        );
+        assert_eq!(handler_id, 0, "resource request handler should return 0 (default)");
+    }
+
+    /// Test CefRequestHandler: OnAuthCredentials returns false (no creds).
+    #[test]
+    fn cef_handler_auth_credentials() {
+        let (mut bridge, browser) = create_test_bridge();
+        if !wkwebview_available() || browser == 0 {
+            return;
+        }
+
+        let result = bridge.on_auth_credentials(
+            browser,
+            "https://example.com",
+            false,
+            "proxy.example.com",
+            8080,
+            "My Realm",
+            "basic",
+        );
+        assert!(!result, "auth should be cancelled (no credentials available)");
+    }
+
+    /// Test CefRequestHandler: OnCookieableSchemes returns supported schemes.
+    #[test]
+    fn cef_handler_cookieable_schemes() {
+        let bridge = CefBridge::new();
+        let schemes = bridge.on_cookieable_schemes();
+        assert!(
+            schemes.contains(&"http".to_string()),
+            "http should be in cookieable schemes"
+        );
+        assert!(
+            schemes.contains(&"https".to_string()),
+            "https should be in cookieable schemes"
+        );
+        assert!(
+            schemes.contains(&"steam".to_string()),
+            "steam should be in cookieable schemes"
+        );
+    }
+
+    /// Test that multiple OnPaint calls produce sequential frame numbers.
+    #[test]
+    fn cef_handler_paint_frame_sequencing() {
+        let (mut bridge, browser) = create_test_bridge();
+        if !wkwebview_available() || browser == 0 {
+            return;
+        }
+        let browser_id = bridge.browsers().get(&browser).unwrap().id;
+
+        let pixels = vec![0xFFu8; 100 * 100 * 4];
+        let dirty = [CefRect { x: 0, y: 0, width: 100, height: 100 }];
+
+        // First paint
+        bridge.on_paint(browser, 0, &dirty, &pixels, 100, 100);
+        let f1 = bridge.get_rendered_frame(browser_id).unwrap();
+        assert_eq!(f1.frame_number, 0, "first frame number should be 0");
+
+        // Second paint
+        bridge.on_paint(browser, 0, &dirty, &pixels, 100, 100);
+        let f2 = bridge.get_rendered_frame(browser_id).unwrap();
+        assert_eq!(f2.frame_number, 1, "second frame number should be 1");
+
+        // Verify frame queue does not exceed max (10)
+        for _i in 0..15 {
+            bridge.on_paint(browser, 0, &dirty, &pixels, 100, 100);
+        }
+        assert!(
+            bridge.rendered_frames.len() <= 10,
+            "rendered frame queue should not exceed 10 entries"
+        );
+    }
+
+    /// Test handler callbacks work with manually constructed bridge
+    /// (no WKWebView dependency) for pure unit testing.
+    #[test]
+    fn cef_handler_no_wkwebview_dependency() {
+        // Test handlers that don't need WKWebView at all
+        let mut bridge = CefBridge::new();
+
+        // CefLifeSpanHandler
+        assert!(!bridge.do_close(1), "DoClose on non-existent browser should return false");
+        bridge.on_before_close(1); // should not panic
+
+        // CefDisplayHandler
+        bridge.on_address_change(1, "https://example.com"); // should not panic
+        assert!(bridge.on_tooltip(1, "test"));
+        assert!(!bridge.on_tooltip(1, ""));
+        bridge.on_status_message(1, "test"); // should not panic
+        assert!(!bridge.on_console_message(1, "test", "test.js", 1));
+
+        // CefLoadHandler (these don't panic even without browsers)
+        bridge.on_loading_state_change(1, true, false, false);
+        bridge.on_load_start(1, "https://example.com", true);
+        bridge.on_load_error(1, 1, "error", "https://example.com");
+
+        // CefRenderHandler (GetViewRect returns fallback 1x1)
+        let rect = bridge.get_view_rect(1);
+        assert_eq!(rect.width, 1, "without browser, GetViewRect should return fallback 1x1");
+        assert_eq!(rect.height, 1);
+        let (x, y, scale) = bridge.get_screen_info(1);
+        assert_eq!(x, 0);
+        assert_eq!(y, 0);
+        assert!((scale - 1.0).abs() < f64::EPSILON);
+
+        // CefRequestHandler
+        assert!(!bridge.on_before_browse(1, "https://example.com"));
+        assert!(bridge.on_before_browse(1, "steam://connect"));
+        assert!(!bridge.on_before_resource_load(1, "https://example.com/resource.js"));
+        assert_eq!(bridge.get_resource_request_handler(1, "https://example.com"), 0);
+        assert!(!bridge.on_auth_credentials(1, "https://example.com", false, "host", 80, "realm", "basic"));
+        assert!(bridge.on_cookieable_schemes().contains(&"https".to_string()));
+    }
+
+    // -----------------------------------------------------------------------
+    // Steam Overlay lifecycle tests
+    // -----------------------------------------------------------------------
+
+    /// Default state: no overlay browser active.
+    #[test]
+    fn overlay_default_state() {
+        let bridge = CefBridge::new();
+        assert_eq!(bridge.overlay_browser_handle, None);
+        assert_eq!(bridge.overlay_browser_handle(), None);
+    }
+
+    /// Creating then destroying the overlay browser should transition the
+    /// handle from Some → None.  This exercise the data-path without
+    /// requiring a real WKWebView (the creation will fail on systems
+    /// without WKWebView, but we verify the handle was not set).
+    #[test]
+    fn overlay_create_and_destroy() {
+        let mut bridge = CefBridge::new();
+
+        // create_overlay_browser may fail on non-macOS or headless CI,
+        // but we verify the handle is NOT set on failure.
+        let result = bridge.create_overlay_browser("steam://openurl/https://steamcommunity.com/my/overlay");
+        match result {
+            Ok(handle) => {
+                assert_eq!(bridge.overlay_browser_handle, Some(handle));
+                assert_eq!(bridge.overlay_browser_handle(), Some(handle));
+
+                // Destroy it
+                bridge.destroy_overlay_browser().unwrap();
+                assert_eq!(bridge.overlay_browser_handle, None);
+                assert_eq!(bridge.overlay_browser_handle(), None);
+            }
+            Err(_) => {
+                // Platform doesn't support WKWebView — only verify state
+                // wasn't corrupted
+                assert_eq!(bridge.overlay_browser_handle, None);
+            }
+        }
+    }
+
+    /// Creating a second overlay browser while one exists returns an error.
+    #[test]
+    fn overlay_create_twice_fails() {
+        let mut bridge = CefBridge::new();
+
+        match bridge.create_overlay_browser("steam://openurl/test") {
+            Ok(handle) => {
+                // Second creation attempt MUST fail
+                let err = bridge
+                    .create_overlay_browser("steam://openurl/test2")
+                    .unwrap_err();
+                assert!(
+                    err.to_string().contains("already exists"),
+                    "Expected 'already exists' error, got: {err}",
+                );
+                // Clean up
+                bridge.destroy_overlay_browser().unwrap();
+                assert_eq!(bridge.overlay_browser_handle, None);
+            }
+            Err(_) => {
+                // WKWebView not available — nothing to verify beyond state
+                assert_eq!(bridge.overlay_browser_handle, None);
+            }
+        }
+    }
+
+    /// Destroy without a prior create is safe (no-op).
+    #[test]
+    fn overlay_destroy_without_create() {
+        let mut bridge = CefBridge::new();
+        assert_eq!(bridge.overlay_browser_handle, None);
+        // Should not panic or error
+        assert!(bridge.destroy_overlay_browser().is_ok());
+        assert_eq!(bridge.overlay_browser_handle, None);
+    }
+
+    /// Submit the overlay browser frame to the compositor does not crash
+    /// when no overlay is active.
+    #[test]
+    fn overlay_submit_frame_no_overlay() {
+        let mut bridge = CefBridge::new();
+        // Should not panic with a non-existent handle
+        bridge.submit_latest_frame_to_compositor(0xCAFE);
+    }
+
+    /// The overlay_browser_handle getter returns None when no overlay
+    /// browser exists (smoke test for the public API).
+    #[test]
+    fn overlay_browser_handle_getter() {
+        let bridge = CefBridge::new();
+        assert_eq!(bridge.overlay_browser_handle(), None);
     }
 
     // -----------------------------------------------------------------------

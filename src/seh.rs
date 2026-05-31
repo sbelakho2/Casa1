@@ -1056,8 +1056,25 @@ impl SehSubsystem {
     }
 
     /// Register raw unwind data (the full section containing UNWIND_INFO).
+    ///
+    /// When replacing existing unwind data, the unwind cache is cleared to
+    /// prevent stale entries. All subsequent `get_unwind_info()` calls will
+    /// re-parse from the fresh data.
     pub fn register_unwind_data(&mut self, image_base: u64, data: Vec<u8>) {
         self.unwind_data.insert(image_base, data);
+        // Invalidate the entire unwind cache because the raw data has changed
+        // and any previously-parsed entries may now point to stale/invalid
+        // locations within the old data blob. A full clear is safe since
+        // entries are parsed on demand; the alternative (selective invalidation
+        // by RVA range) is fragile without tracking which image an RVA belongs to.
+        self.unwind_cache.clear();
+    }
+
+    /// Get a reference to the raw unwind data blob for a given image base.
+    /// Returns `None` if no unwind data has been registered for this base.
+    /// Used for low-level verification of the raw byte layout in tests.
+    pub fn get_unwind_data_raw(&self, image_base: u64) -> Option<&Vec<u8>> {
+        self.unwind_data.get(&image_base)
     }
 
     /// Find the `RuntimeFunction` for a given RVA in a specific image.

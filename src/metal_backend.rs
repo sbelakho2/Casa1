@@ -349,6 +349,19 @@ impl MetalSwapchain {
     pub fn size(&self) -> (u64, u64) {
         (self.width, self.height)
     }
+
+    /// Attach the CAMetalLayer as a sublayer of the given NSWindow's content view.
+    /// `ns_window` is a raw pointer to an NSWindow obtained from `mac_window::create_nswindow`.
+    pub fn attach_to_window(&self, ns_window: *mut std::ffi::c_void) {
+        use metal::foreign_types::ForeignType;
+        let layer_ptr = self.layer.as_ptr() as *mut std::ffi::c_void;
+        crate::mac_window::attach_cametal_layer_to_window(
+            ns_window,
+            layer_ptr,
+            self.width as u32,
+            self.height as u32,
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

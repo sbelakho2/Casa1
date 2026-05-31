@@ -1,10 +1,28 @@
 use crate::error::{AppError, AppResult};
+use crate::network::{
+    AltSvcEntry, HttpProtocol, HttpProtocolFlags, QuicConfig,
+    is_quic_alpn, negotiate_http_protocol, parse_alt_svc_header,
+};
 use crate::reason::ReasonCode;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::Path;
+
+// ---------------------------------------------------------------------------
+// WinHTTP protocol constants
+// ---------------------------------------------------------------------------
+
+/// WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL — enables HTTP/2 and/or HTTP/3 protocol
+pub const WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL: u32 = 159;
+
+/// WINHTTP_OPTION_QUERY_PROTOCOL — query the negotiated HTTP protocol
+pub const WINHTTP_OPTION_QUERY_PROTOCOL: u32 = 160;
+
+/// Protocol flags for WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL
+pub const WINHTTP_PROTOCOL_FLAG_HTTP2: u32 = 0x0001;
+pub const WINHTTP_PROTOCOL_FLAG_HTTP3: u32 = 0x0002;
 
 #[cfg(feature = "websocket")]
 use std::net::TcpStream;
@@ -57,6 +75,9 @@ pub struct WinHttpSession {
     pub proxy: Option<String>,
     pub proxy_bypass: Option<String>,
     pub state: WinHttpSessionState,
+    /// Enabled HTTP protocol flags (HTTP/2, HTTP/3).
+    /// Set via WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL.
+    pub enabled_protocols: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -277,6 +298,12 @@ pub struct WinHttpStack {
     /// Keyed by the same handle as in `websockets`.
     #[cfg(feature = "websocket")]
     live_websockets: BTreeMap<HINTERNET, TungsteniteWebSocket>,
+    /// QUIC/HTTP3 configuration
+    quic_config: QuicConfig,
+    /// Alt-Svc entries discovered from response headers (host -> entries)
+    alt_svc_entries: HashMap<String, Vec<AltSvcEntry>>,
+    /// Whether HTTP/3 fallback logging has been emitted for each host
+    quic_fallback_logged: HashMap<String, bool>,
 }
 
 // -----------------------------------------------------------------------
@@ -387,6 +414,9 @@ impl WinHttpStack {
             websockets: BTreeMap::new(),
             #[cfg(feature = "websocket")]
             live_websockets: BTreeMap::new(),
+            quic_config: QuicConfig::default(),
+            alt_svc_entries: HashMap::new(),
+            quic_fallback_logged: HashMap::new(),
         };
         // Pre-load known Steam CDN certificate pins (SPKI SHA-256 hashes)
         // Note: These placeholder hashes need to be replaced with real SPKI SHA-256
@@ -681,6 +711,7 @@ impl WinHttpStack {
             proxy: proxy.map(|s| s.to_string()),
             proxy_bypass: proxy_bypass.map(|s| s.to_string()),
             state: WinHttpSessionState::Open,
+            enabled_protocols: 0,
         };
         self.sessions.insert(handle, session);
         handle
@@ -905,7 +936,7 @@ impl WinHttpStack {
         }
 
         // Phase 2: Re-borrow request to add headers/body and send
-        let (_status_code, _status_text, _response_headers, _response_body, set_cookie_values, cert_chain) = {
+        let (_status_code, _status_text, response_headers, _response_body, set_cookie_values, cert_chain) = {
             let req = self.requests.get_mut(&request_handle).ok_or_else(|| {
                 AppError::new(
                     ReasonCode::RcWin32InvalidHandle,
@@ -999,6 +1030,33 @@ impl WinHttpStack {
                     conn_server_name
                 ),
             ));
+        }
+
+        // --- Parse Alt-Svc header for HTTP/3 discovery ---
+        if let Some(alt_svc_value) = response_headers.get("alt-svc") {
+            let entries = parse_alt_svc_header(alt_svc_value);
+            if !entries.is_empty() {
+                self.alt_svc_entries.insert(conn_server_name.clone(), entries);
+            }
+        }
+
+        // --- QUIC/HTTP3 detection and fallback logging ---
+        // If the session requested HTTP/3 but we're running on a platform without QUIC,
+        // log the fallback once per host so downstream diagnostics can see it.
+        let session_handle = self.connections.get(&_conn_handle).map(|c| c.session_handle);
+        let enabled_protocols = session_handle
+            .and_then(|sh| self.sessions.get(&sh))
+            .map(|s| s.enabled_protocols)
+            .unwrap_or(0);
+        if enabled_protocols & WINHTTP_PROTOCOL_FLAG_HTTP3 != 0 {
+            if !self.quic_fallback_logged.get(&conn_server_name).copied().unwrap_or(false) {
+                eprintln!(
+                    "WinHttp: HTTP/3 requested for {} but QUIC is not available on this platform; \
+                     using HTTP/2 as fallback",
+                    conn_server_name
+                );
+                self.quic_fallback_logged.insert(conn_server_name.clone(), true);
+            }
         }
 
         Ok(())
@@ -1105,16 +1163,29 @@ impl WinHttpStack {
         if let Some(session) = self.sessions.get_mut(&handle) {
             match option {
                 0 => {} // WINHTTP_OPTION_PROXY — ignore for now
+                WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL => {
+                    if value.len() >= 4 {
+                        let flags = u32::from_ne_bytes([value[0], value[1], value[2], value[3]]);
+                        session.enabled_protocols = flags;
+
+                        // Log if HTTP/3 was requested
+                        if flags & WINHTTP_PROTOCOL_FLAG_HTTP3 != 0 {
+                            eprintln!(
+                                "WinHttpSetOption: HTTP/3 protocol enabled for session {:#x} \
+                                 (HTTP/3 will be transparently downgraded to HTTP/2 on this platform)",
+                                handle
+                            );
+                        }
+                    }
+                }
                 _ => {}
             }
-            let _ = session;
             return Ok(());
         }
         if let Some(conn) = self.connections.get_mut(&handle) {
             match option {
                 _ => {}
             }
-            let _ = conn;
             return Ok(());
         }
         if let Some(req) = self.requests.get_mut(&handle) {
@@ -1133,6 +1204,77 @@ impl WinHttpStack {
             ReasonCode::RcWin32InvalidHandle,
             format!("WinHttpSetOption: invalid handle {handle:#x}"),
         ))
+    }
+
+    // -----------------------------------------------------------------------
+    // WinHttpQueryOption — query an option on a handle
+    // -----------------------------------------------------------------------
+    pub fn win_http_query_option(
+        &mut self,
+        handle: HINTERNET,
+        option: u32,
+        buffer: &mut [u8],
+    ) -> AppResult<u32> {
+        match option {
+            WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL => {
+                if let Some(session) = self.sessions.get(&handle) {
+                    if buffer.len() >= 4 {
+                        let flags = session.enabled_protocols;
+                        buffer[..4].copy_from_slice(&flags.to_ne_bytes());
+                        return Ok(4);
+                    }
+                    return Err(AppError::new(
+                        ReasonCode::RcNetProtocolError,
+                        "WinHttpQueryOption: buffer too small for protocol flags",
+                    ));
+                }
+                Err(AppError::new(
+                    ReasonCode::RcWin32InvalidHandle,
+                    format!("WinHttpQueryOption: invalid handle {handle:#x} for protocol query"),
+                ))
+            }
+            WINHTTP_OPTION_QUERY_PROTOCOL => {
+                // For the request handle, return the negotiated protocol
+                // We determine this from the enabled protocols and Alt-Svc state
+                if let Some(req) = self.requests.get(&handle) {
+                    if let Some(conn) = self.connections.get(&req.connection_handle) {
+                        let host = &conn.server_name;
+                        let session_flags = self.sessions.get(&conn.session_handle)
+                            .map(|s| s.enabled_protocols)
+                            .unwrap_or(0);
+
+                        let flags = HttpProtocolFlags(session_flags);
+                        let alt_svc_entries = self.alt_svc_entries.get(host)
+                            .cloned()
+                            .unwrap_or_default();
+
+                        let (protocol, _fell_back) = negotiate_http_protocol(
+                            &flags,
+                            &self.quic_config,
+                            &alt_svc_entries,
+                        );
+
+                        if buffer.len() >= 4 {
+                            let proto_val = match protocol {
+                                HttpProtocol::Http3 => 3u32,
+                                HttpProtocol::Http2 => 2u32,
+                                HttpProtocol::Http11 => 1u32,
+                            };
+                            buffer[..4].copy_from_slice(&proto_val.to_ne_bytes());
+                            return Ok(4);
+                        }
+                    }
+                }
+                Err(AppError::new(
+                    ReasonCode::RcWin32InvalidHandle,
+                    format!("WinHttpQueryOption: invalid handle {handle:#x} for protocol query"),
+                ))
+            }
+            _ => Err(AppError::new(
+                ReasonCode::RcWin32InvalidHandle,
+                format!("WinHttpQueryOption: unsupported option {option}"),
+            )),
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1748,5 +1890,192 @@ mod tests {
 
         // Hosts without a pin remain unaffected.
         assert!(stack.verify_certificate_pin("other.example", &[]));
+    }
+
+    // --- QUIC / HTTP3 detection and fallback tests ---
+
+    #[test]
+    fn winhttp_quic_set_option_stores_enabled_protocols() {
+        let mut stack = WinHttpStack::new();
+        let session = stack.win_http_open(Some("Casa1"), 0, None, None);
+
+        // Enable HTTP/2 + HTTP/3 via WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL
+        let flags = WINHTTP_PROTOCOL_FLAG_HTTP2 | WINHTTP_PROTOCOL_FLAG_HTTP3;
+        let flag_bytes = flags.to_le_bytes();
+        let result = stack.win_http_set_option(
+            session,
+            WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL,
+            &flag_bytes,
+        );
+        assert!(result.is_ok());
+
+        // Verify the session has the flags stored
+        let sess = stack.sessions.get(&session).expect("session exists");
+        assert_eq!(sess.enabled_protocols, flags);
+    }
+
+    #[test]
+    fn winhttp_quic_query_option_returns_enabled_protocols() {
+        let mut stack = WinHttpStack::new();
+        let session = stack.win_http_open(Some("Casa1"), 0, None, None);
+
+        // Enable HTTP/3 only
+        let flags = WINHTTP_PROTOCOL_FLAG_HTTP3;
+        let flag_bytes = flags.to_le_bytes();
+        stack
+            .win_http_set_option(session, WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL, &flag_bytes)
+            .expect("set_option");
+
+        // Query back via WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL
+        let mut buf = vec![0u8; 4];
+        let result = stack.win_http_query_option(
+            session,
+            WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL,
+            &mut buf,
+        );
+        assert!(result.is_ok());
+        let retrieved = u32::from_le_bytes(buf.try_into().unwrap());
+        assert_eq!(retrieved, WINHTTP_PROTOCOL_FLAG_HTTP3);
+    }
+
+    #[test]
+    fn winhttp_quic_query_protocol_returns_http2_when_quic_unavailable() {
+        let mut stack = WinHttpStack::new();
+        let session = stack.win_http_open(Some("Casa1"), 0, None, None);
+
+        // Enable HTTP/2 + HTTP/3
+        let flags = WINHTTP_PROTOCOL_FLAG_HTTP2 | WINHTTP_PROTOCOL_FLAG_HTTP3;
+        let flag_bytes = flags.to_le_bytes();
+        stack
+            .win_http_set_option(session, WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL, &flag_bytes)
+            .expect("set_option");
+
+        // Query negotiated protocol — should report HTTP/2 since QUIC is unavailable
+        let mut buf = vec![0u8; 4];
+        let result = stack.win_http_query_option(
+            session,
+            WINHTTP_OPTION_QUERY_PROTOCOL,
+            &mut buf,
+        );
+        assert!(result.is_ok());
+        let protocol = u32::from_le_bytes(buf.try_into().unwrap());
+        // HTTP/2 is the best available fallback when QUIC is requested but unavailable
+        assert_eq!(protocol, WINHTTP_PROTOCOL_FLAG_HTTP2);
+    }
+
+    #[test]
+    fn winhttp_quic_query_protocol_returns_http2_when_only_http2_enabled() {
+        let mut stack = WinHttpStack::new();
+        let session = stack.win_http_open(Some("Casa1"), 0, None, None);
+
+        // Enable HTTP/2 only (no QUIC)
+        let flags = WINHTTP_PROTOCOL_FLAG_HTTP2;
+        let flag_bytes = flags.to_le_bytes();
+        stack
+            .win_http_set_option(session, WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL, &flag_bytes)
+            .expect("set_option");
+
+        let mut buf = vec![0u8; 4];
+        let result = stack.win_http_query_option(
+            session,
+            WINHTTP_OPTION_QUERY_PROTOCOL,
+            &mut buf,
+        );
+        assert!(result.is_ok());
+        let protocol = u32::from_le_bytes(buf.try_into().unwrap());
+        assert_eq!(protocol, WINHTTP_PROTOCOL_FLAG_HTTP2);
+    }
+
+    #[test]
+    fn winhttp_quic_query_protocol_returns_http11_when_no_flags_set() {
+        let mut stack = WinHttpStack::new();
+        let session = stack.win_http_open(Some("Casa1"), 0, None, None);
+
+        // No protocol flags enabled — expect HTTP/1.1
+        let mut buf = vec![0u8; 4];
+        let result = stack.win_http_query_option(
+            session,
+            WINHTTP_OPTION_QUERY_PROTOCOL,
+            &mut buf,
+        );
+        assert!(result.is_ok());
+        let protocol = u32::from_le_bytes(buf.try_into().unwrap());
+        assert_eq!(protocol, 0); // HTTP/1.1 is represented as 0
+    }
+
+    #[test]
+    fn winhttp_quic_parse_alt_svc_stores_entries() {
+        let mut stack = WinHttpStack::new();
+        let entries = parse_alt_svc_header(r#"h3=":443"; ma=2592000"#);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].protocol_id, "h3");
+        assert_eq!(entries[0].alt_port, 443);
+        assert_eq!(entries[0].alt_host, "");
+        assert_eq!(entries[0].alpn, Some("h3".to_string()));
+
+        // Store entries via the stack's alt_svc_entries map
+        stack.alt_svc_entries.insert("example.com".to_string(), entries);
+        let stored = stack.alt_svc_entries.get("example.com").expect("entries exist");
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].alt_port, 443);
+    }
+
+    #[test]
+    fn winhttp_quic_parse_alt_svc_multiple_entries() {
+        let header = r#"h3=":443"; ma=2592000, h3-29=":443"; ma=2592000"#;
+        let entries = parse_alt_svc_header(header);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].protocol_id, "h3");
+        assert_eq!(entries[1].protocol_id, "h3-29");
+    }
+
+    #[test]
+    fn winhttp_quic_parse_alt_svc_with_host() {
+        let header = r#"h3="alt.example.com:8443"; ma=2592000"#;
+        let entries = parse_alt_svc_header(header);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].alt_host, "alt.example.com");
+        assert_eq!(entries[0].alt_port, 8443);
+    }
+
+    #[test]
+    fn winhttp_quic_alt_svc_empty_input() {
+        let entries = parse_alt_svc_header("");
+        assert!(entries.is_empty());
+
+        let entries = parse_alt_svc_header("   ");
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn winhttp_quic_negotiate_falls_back_when_quic_unavailable() {
+        // Simulate: HTTP/3 requested, QUIC not available → falls back to HTTP/2
+        let flags = HttpProtocolFlags(HttpProtocolFlags::HTTP2 | HttpProtocolFlags::HTTP3);
+        let quic_config = QuicConfig::default(); // Not forced, not enabled (default)
+        let alt_svc = vec![];
+
+        let (protocol, used_quic) = negotiate_http_protocol(&flags, &quic_config, &alt_svc);
+        assert!(!used_quic);
+        assert_eq!(protocol, HttpProtocol::Http2);
+    }
+
+    #[test]
+    fn winhttp_quic_negotiate_force_disabled_prevents_quic() {
+        let flags = HttpProtocolFlags(HttpProtocolFlags::HTTP2 | HttpProtocolFlags::HTTP3);
+        let quic_config = QuicConfig {
+            force_enabled: false,
+            force_disabled: true,
+            ..Default::default()
+        };
+        let alt_svc = vec![AltSvcEntry {
+            protocol_id: "h3".to_string(),
+            alt_port: 443,
+            alt_host: String::new(),
+            alpn: Some("h3".to_string()),
+        }];
+
+        let (protocol, used_quic) = negotiate_http_protocol(&flags, &quic_config, &alt_svc);
+        assert!(!used_quic);
+        assert_eq!(protocol, HttpProtocol::Http2);
     }
 }

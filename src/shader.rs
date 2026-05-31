@@ -689,6 +689,71 @@ const DXIL_INTRIN_WAVEACTIVEBIT: u32 = 571;
 const DXIL_INTRIN_WAVEPREFIX: u32 = 572;
 const DXIL_INTRIN_QUADREAD: u32 = 573;
 const DXIL_INTRIN_QUADWRITE: u32 = 574;
+const DXIL_INTRIN_WAVEGETLANEINDEX: u32 = 575;
+const DXIL_INTRIN_WAVEGETLANECOUNT: u32 = 576;
+const DXIL_INTRIN_WAVEANYTRUE: u32 = 577;
+const DXIL_INTRIN_WAVEALLTRUE: u32 = 578;
+const DXIL_INTRIN_WAVEALLEQUAL: u32 = 579;
+const DXIL_INTRIN_WAVEBALLOT: u32 = 580;
+const DXIL_INTRIN_WAVEREADLANEAT: u32 = 581;
+const DXIL_INTRIN_WAVEREADLANEFIRST: u32 = 582;
+const DXIL_INTRIN_WAVEACTIVEBITAND: u32 = 583;
+const DXIL_INTRIN_WAVEACTIVEBITOR: u32 = 584;
+const DXIL_INTRIN_WAVEACTIVEBITXOR: u32 = 585;
+const DXIL_INTRIN_WAVEACTIVECOUNTBITS: u32 = 586;
+const DXIL_INTRIN_WAVEACTIVESUM: u32 = 587;
+const DXIL_INTRIN_WAVEACTIVEPRODUCT: u32 = 588;
+const DXIL_INTRIN_WAVEACTIVEMIN: u32 = 589;
+const DXIL_INTRIN_WAVEACTIVEMAX: u32 = 590;
+const DXIL_INTRIN_WAVEMULTIPREFIXSUM: u32 = 591;
+const DXIL_INTRIN_WAVEMULTIPREFIXPRODUCT: u32 = 592;
+const DXIL_INTRIN_WAVEMULTIPREFIXBITAND: u32 = 593;
+const DXIL_INTRIN_WAVEMULTIPREFIXBITOR: u32 = 594;
+const DXIL_INTRIN_WAVEMULTIPREFIXBITXOR: u32 = 595;
+const DXIL_INTRIN_WAVEMULTIPREFIXBITCOUNT: u32 = 596;
+const DXIL_INTRIN_WAVEMATCH: u32 = 597;
+
+// Conversion and bit-manipulation intrinsics
+const DXIL_INTRIN_ASFLOAT: u32 = 600;
+const DXIL_INTRIN_ASINT: u32 = 601;
+const DXIL_INTRIN_ASUINT: u32 = 602;
+const DXIL_INTRIN_FIRSTBITHIGH: u32 = 603;
+const DXIL_INTRIN_FIRSTBITLOW: u32 = 604;
+const DXIL_INTRIN_LOG10: u32 = 605;
+
+// Packed dot-product intrinsics
+const DXIL_INTRIN_DOT4ADDI8PACKED: u32 = 610;
+const DXIL_INTRIN_DOT4ADDU8PACKED: u32 = 611;
+
+// Tessellation intrinsics
+const DXIL_INTRIN_PROCESS2DQUADTESSSFACTORSAVG: u32 = 620;
+const DXIL_INTRIN_PROCESS2DQUADTESSFACTORSMAX: u32 = 621;
+const DXIL_INTRIN_PROCESS2DQUADTESSFACTORSMIN: u32 = 622;
+const DXIL_INTRIN_PROCESS2DTRIANGLEFACTORSAVG: u32 = 623;
+const DXIL_INTRIN_PROCESS2DTRIANGLEFACTORSMAX: u32 = 624;
+const DXIL_INTRIN_PROCESS2DTRIANGLEFACTORSMIN: u32 = 625;
+
+// Texture query intrinsics
+const DXIL_INTRIN_CALCULATELOD: u32 = 630;
+const DXIL_INTRIN_CALCULATELODUNCLAMPED: u32 = 631;
+
+// Attribute evaluation and other misc intrinsics
+const DXIL_INTRIN_CHECKACCESSFULLYMAPPED: u32 = 640;
+const DXIL_INTRIN_EVALUATEATTRIBUTEATCENTROID: u32 = 641;
+const DXIL_INTRIN_EVALUATEATTRIBUTEATSAMPLE: u32 = 642;
+const DXIL_INTRIN_EVALUATEATTRIBUTEATCONSTANT: u32 = 643;
+const DXIL_INTRIN_INSTANCEID: u32 = 645;
+const DXIL_INTRIN_VERTEXID: u32 = 646;
+const DXIL_INTRIN_PRIMITIVEID: u32 = 647;
+
+// Geometry shader intrinsics
+const DXIL_INTRIN_EMITSTREAM: u32 = 650;
+const DXIL_INTRIN_CUTSTREAM: u32 = 651;
+const DXIL_INTRIN_EMITTHENCUTSTREAM: u32 = 652;
+
+// Resource array support
+const DXIL_INTRIN_CREATEHANDLE: u32 = 660;
+const DXIL_INTRIN_CREATEHANDLEFORBINDING: u32 = 661;
 
 // ---------------------------------------------------------------------------
 // LLVM Bitcode Reader
@@ -1634,6 +1699,38 @@ pub fn dxil_opcode_to_msl(
             }
         }
 
+        // --- Vector element operations (LLVM opcodes 49-52) ---
+        49 => { // extractelement
+            if args.len() >= 2 {
+                format!("{} = {}[{}];", dst, args[0], args[1])
+            } else {
+                format!("{} = 0; // extractelement (no args)", dst)
+            }
+        }
+        50 => { // insertelement
+            if args.len() >= 3 {
+                format!(
+                    "{} = {}; {}[{}] = {}; // insertelement",
+                    dst, args[0], args[0], args[1], args[2]
+                )
+            } else {
+                format!("{} = 0; // insertelement (no args)", dst)
+            }
+        }
+        51 => { // shufflevector
+            if args.len() >= 3 {
+                format!(
+                    "{} = {}.{}; // shufflevector({}, {})",
+                    dst, args[0], args[2], args[0], args[1]
+                )
+            } else {
+                format!("{} = 0; // shufflevector", dst)
+            }
+        }
+        52 => { // unreachable
+            String::from("// unreachable")
+        }
+
         // --- HLSL Intrinsics (opcodes 400+) ---
         DXIL_INTRIN_ABS => unop("abs"),
         DXIL_INTRIN_SATURATE => unop("saturate"),
@@ -1841,7 +1938,33 @@ pub fn dxil_opcode_to_msl(
             }
         }
         DXIL_INTRIN_BARRIER => {
-            "threadgroup_barrier(mem_flags::mem_threadgroup);".to_string()
+            // DXIL barrier flags:
+            //   0x01 = GroupSync (thread synchronization)
+            //   0x04 = GroupShared memory (threadgroup memory)
+            //   0x08 = UAV memory (device memory)
+            // Without GroupSync, use memory_barrier (no thread sync).
+            // With GroupSync, use threadgroup_barrier (includes thread sync).
+            let flag = if args.is_empty() || args[0] == "0" {
+                0u32
+            } else {
+                args[0].parse::<u32>().unwrap_or(0)
+            };
+            let has_sync = flag == 0 || (flag & 0x01) != 0;
+            let has_gs = (flag & 0x04) != 0;
+            let has_uav = (flag & 0x08) != 0;
+
+            let memory_flags = match (has_gs, has_uav) {
+                (true, true) => "mem_flags::mem_threadgroup | mem_flags::mem_device",
+                (true, false) => "mem_flags::mem_threadgroup",
+                (false, true) => "mem_flags::mem_device",
+                (false, false) => "mem_flags::mem_threadgroup | mem_flags::mem_device",
+            };
+
+            if has_sync {
+                format!("threadgroup_barrier({});", memory_flags)
+            } else {
+                format!("memory_barrier({});", memory_flags)
+            }
         }
         DXIL_INTRIN_GROUPMEMORYBARRIER => {
             "threadgroup_barrier(mem_flags::mem_threadgroup);".to_string()
@@ -1851,82 +1974,157 @@ pub fn dxil_opcode_to_msl(
         }
 
         // --- Atomic intrinsics ---
+        // Helper: generate atomic operation with correct address space based on operands
         DXIL_INTRIN_ATOMICADD => {
             if args.len() >= 3 {
-                format!(
-                    "{} = atomic_fetch_add_explicit((volatile device atomic_int*){}, {}, memory_order_relaxed);",
-                    dst, args[1], args[2]
-                )
+                let ptr = &args[1];
+                let val = &args[2];
+                // Try to detect if this is threadgroup memory
+                if is_groupshared_ptr(ptr) {
+                    format!(
+                        "{} = atomic_fetch_add_explicit((volatile threadgroup atomic_int*){}, {}, memory_order_relaxed);",
+                        dst, ptr, val
+                    )
+                } else {
+                    format!(
+                        "{} = atomic_fetch_add_explicit((volatile device atomic_int*){}, {}, memory_order_relaxed);",
+                        dst, ptr, val
+                    )
+                }
             } else {
                 format!("{} = 0; // atomicAdd", dst)
             }
         }
         DXIL_INTRIN_ATOMICAND => {
             if args.len() >= 3 {
-                format!(
-                    "{} = atomic_fetch_and_explicit((volatile device atomic_int*){}, {}, memory_order_relaxed);",
-                    dst, args[1], args[2]
-                )
+                let ptr = &args[1];
+                let val = &args[2];
+                if is_groupshared_ptr(ptr) {
+                    format!(
+                        "{} = atomic_fetch_and_explicit((volatile threadgroup atomic_int*){}, {}, memory_order_relaxed);",
+                        dst, ptr, val
+                    )
+                } else {
+                    format!(
+                        "{} = atomic_fetch_and_explicit((volatile device atomic_int*){}, {}, memory_order_relaxed);",
+                        dst, ptr, val
+                    )
+                }
             } else {
                 format!("{} = 0; // atomicAnd", dst)
             }
         }
         DXIL_INTRIN_ATOMICOR => {
             if args.len() >= 3 {
-                format!(
-                    "{} = atomic_fetch_or_explicit((volatile device atomic_int*){}, {}, memory_order_relaxed);",
-                    dst, args[1], args[2]
-                )
+                let ptr = &args[1];
+                let val = &args[2];
+                if is_groupshared_ptr(ptr) {
+                    format!(
+                        "{} = atomic_fetch_or_explicit((volatile threadgroup atomic_int*){}, {}, memory_order_relaxed);",
+                        dst, ptr, val
+                    )
+                } else {
+                    format!(
+                        "{} = atomic_fetch_or_explicit((volatile device atomic_int*){}, {}, memory_order_relaxed);",
+                        dst, ptr, val
+                    )
+                }
             } else {
                 format!("{} = 0; // atomicOr", dst)
             }
         }
         DXIL_INTRIN_ATOMICXOR => {
             if args.len() >= 3 {
-                format!(
-                    "{} = atomic_fetch_xor_explicit((volatile device atomic_int*){}, {}, memory_order_relaxed);",
-                    dst, args[1], args[2]
-                )
+                let ptr = &args[1];
+                let val = &args[2];
+                if is_groupshared_ptr(ptr) {
+                    format!(
+                        "{} = atomic_fetch_xor_explicit((volatile threadgroup atomic_int*){}, {}, memory_order_relaxed);",
+                        dst, ptr, val
+                    )
+                } else {
+                    format!(
+                        "{} = atomic_fetch_xor_explicit((volatile device atomic_int*){}, {}, memory_order_relaxed);",
+                        dst, ptr, val
+                    )
+                }
             } else {
                 format!("{} = 0; // atomicXor", dst)
             }
         }
         DXIL_INTRIN_ATOMICMIN => {
             if args.len() >= 3 {
-                format!(
-                    "{} = atomic_fetch_min_explicit((volatile device atomic_int*){}, {}, memory_order_relaxed);",
-                    dst, args[1], args[2]
-                )
+                let ptr = &args[1];
+                let val = &args[2];
+                if is_groupshared_ptr(ptr) {
+                    format!(
+                        "{} = atomic_fetch_min_explicit((volatile threadgroup atomic_int*){}, {}, memory_order_relaxed);",
+                        dst, ptr, val
+                    )
+                } else {
+                    format!(
+                        "{} = atomic_fetch_min_explicit((volatile device atomic_int*){}, {}, memory_order_relaxed);",
+                        dst, ptr, val
+                    )
+                }
             } else {
                 format!("{} = 0; // atomicMin", dst)
             }
         }
         DXIL_INTRIN_ATOMICMAX => {
             if args.len() >= 3 {
-                format!(
-                    "{} = atomic_fetch_max_explicit((volatile device atomic_int*){}, {}, memory_order_relaxed);",
-                    dst, args[1], args[2]
-                )
+                let ptr = &args[1];
+                let val = &args[2];
+                if is_groupshared_ptr(ptr) {
+                    format!(
+                        "{} = atomic_fetch_max_explicit((volatile threadgroup atomic_int*){}, {}, memory_order_relaxed);",
+                        dst, ptr, val
+                    )
+                } else {
+                    format!(
+                        "{} = atomic_fetch_max_explicit((volatile device atomic_int*){}, {}, memory_order_relaxed);",
+                        dst, ptr, val
+                    )
+                }
             } else {
                 format!("{} = 0; // atomicMax", dst)
             }
         }
         DXIL_INTRIN_ATOMICEXCHANGE => {
             if args.len() >= 3 {
-                format!(
-                    "{} = atomic_exchange_explicit((volatile device atomic_int*){}, {}, memory_order_relaxed);",
-                    dst, args[1], args[2]
-                )
+                let ptr = &args[1];
+                let val = &args[2];
+                if is_groupshared_ptr(ptr) {
+                    format!(
+                        "{} = atomic_exchange_explicit((volatile threadgroup atomic_int*){}, {}, memory_order_relaxed);",
+                        dst, ptr, val
+                    )
+                } else {
+                    format!(
+                        "{} = atomic_exchange_explicit((volatile device atomic_int*){}, {}, memory_order_relaxed);",
+                        dst, ptr, val
+                    )
+                }
             } else {
                 format!("{} = 0; // atomicExchange", dst)
             }
         }
         DXIL_INTRIN_ATOMICCOMPAREEXCHANGE => {
             if args.len() >= 4 {
-                format!(
-                    "{} = atomic_compare_exchange_weak_explicit((volatile device atomic_int*){}, {}, {}, memory_order_relaxed, memory_order_relaxed);",
-                    dst, args[1], args[2], args[3]
-                )
+                let ptr = &args[1];
+                let cmp = &args[2];
+                let val = &args[3];
+                if is_groupshared_ptr(ptr) {
+                    format!(
+                        "{} = atomic_compare_exchange_weak_explicit((volatile threadgroup atomic_int*){}, {}, {}, memory_order_relaxed, memory_order_relaxed);",
+                        dst, ptr, cmp, val
+                    )
+                } else {
+                    format!(
+                        "{} = atomic_compare_exchange_weak_explicit((volatile device atomic_int*){}, {}, {}, memory_order_relaxed, memory_order_relaxed);",
+                        dst, ptr, cmp, val
+                    )
+                }
             } else {
                 format!("{} = 0; // atomicCompareExchange", dst)
             }
@@ -1959,6 +2157,435 @@ pub fn dxil_opcode_to_msl(
         DXIL_INTRIN_WAVEACTIVE => {
             format!("{} = simd_active(true); // WaveActive", dst)
         }
+        DXIL_INTRIN_WAVEACTIVEBIT => {
+            if args.len() >= 2 {
+                format!("{} = simd_ballot({} != 0); // WaveActiveBit", dst, args[1])
+            } else {
+                format!("{} = 0;", dst)
+            }
+        }
+        DXIL_INTRIN_WAVEPREFIX => {
+            if args.len() >= 2 {
+                format!("{} = simd_prefix_exclusive_sum({}); // WavePrefix", dst, args[1])
+            } else {
+                format!("{} = 0;", dst)
+            }
+        }
+        DXIL_INTRIN_QUADREAD => {
+            if args.len() >= 2 {
+                format!("{} = quad_broadcast({}, {});", dst, args[0], args[1])
+            } else {
+                format!("{} = 0;", dst)
+            }
+        }
+        DXIL_INTRIN_QUADWRITE => {
+            if args.len() >= 3 {
+                format!(
+                    "{} = quad_vote({} == {}); // QuadWrite emulation",
+                    dst, args[0], args[1]
+                )
+            } else {
+                format!("{} = 0;", dst)
+            }
+        }
+        DXIL_INTRIN_WAVEGETLANEINDEX => {
+            format!("{} = simd_lane_id();", dst)
+        }
+        DXIL_INTRIN_WAVEGETLANECOUNT => {
+            format!("{} = simd_lane_count();", dst)
+        }
+        DXIL_INTRIN_WAVEANYTRUE => {
+            if args.len() >= 1 {
+                format!("{} = simd_any({});", dst, args[0])
+            } else {
+                format!("{} = 0;", dst)
+            }
+        }
+        DXIL_INTRIN_WAVEALLTRUE => {
+            if args.len() >= 1 {
+                format!("{} = simd_all({});", dst, args[0])
+            } else {
+                format!("{} = 0;", dst)
+            }
+        }
+        DXIL_INTRIN_WAVEALLEQUAL => {
+            if args.len() >= 1 {
+                format!("{} = simd_all({} == simd_broadcast_first({}));", dst, args[0], args[0])
+            } else {
+                format!("{} = 0;", dst)
+            }
+        }
+        DXIL_INTRIN_WAVEBALLOT => {
+            if args.len() >= 1 {
+                format!("{} = simd_ballot({});", dst, args[0])
+            } else {
+                format!("{} = 0;", dst)
+            }
+        }
+        DXIL_INTRIN_WAVEREADLANEAT => {
+            if args.len() >= 2 {
+                format!("{} = simd_broadcast({}, {});", dst, args[0], args[1])
+            } else {
+                format!("{} = 0;", dst)
+            }
+        }
+        DXIL_INTRIN_WAVEREADLANEFIRST => {
+            if args.len() >= 1 {
+                format!("{} = simd_broadcast_first({});", dst, args[0])
+            } else {
+                format!("{} = 0;", dst)
+            }
+        }
+        DXIL_INTRIN_WAVEACTIVEBITAND => {
+            if args.len() >= 1 {
+                format!("{} = simd_and({});", dst, args[0])
+            } else {
+                format!("{} = 0;", dst)
+            }
+        }
+        DXIL_INTRIN_WAVEACTIVEBITOR => {
+            if args.len() >= 1 {
+                format!("{} = simd_or({});", dst, args[0])
+            } else {
+                format!("{} = 0;", dst)
+            }
+        }
+        DXIL_INTRIN_WAVEACTIVEBITXOR => {
+            if args.len() >= 1 {
+                format!("{} = simd_xor({});", dst, args[0])
+            } else {
+                format!("{} = 0;", dst)
+            }
+        }
+        DXIL_INTRIN_WAVEACTIVECOUNTBITS => {
+            if args.len() >= 1 {
+                format!("{} = popcount(simd_ballot({}));", dst, args[0])
+            } else {
+                format!("{} = 0;", dst)
+            }
+        }
+        DXIL_INTRIN_WAVEACTIVESUM => {
+            if args.len() >= 1 {
+                format!("{} = simd_sum({});", dst, args[0])
+            } else {
+                format!("{} = 0;", dst)
+            }
+        }
+        DXIL_INTRIN_WAVEACTIVEPRODUCT => {
+            if args.len() >= 1 {
+                format!("{} = simd_product({});", dst, args[0])
+            } else {
+                format!("{} = 0;", dst)
+            }
+        }
+        DXIL_INTRIN_WAVEACTIVEMIN => {
+            if args.len() >= 1 {
+                format!("{} = simd_min({});", dst, args[0])
+            } else {
+                format!("{} = 0;", dst)
+            }
+        }
+        DXIL_INTRIN_WAVEACTIVEMAX => {
+            if args.len() >= 1 {
+                format!("{} = simd_max({});", dst, args[0])
+            } else {
+                format!("{} = 0;", dst)
+            }
+        }
+        DXIL_INTRIN_WAVEMULTIPREFIXSUM => {
+            if args.len() >= 2 {
+                format!("{} = simd_prefix_exclusive_sum({}); // MultiPrefix", dst, args[1])
+            } else {
+                format!("{} = 0;", dst)
+            }
+        }
+        DXIL_INTRIN_WAVEMULTIPREFIXPRODUCT => {
+            if args.len() >= 2 {
+                format!("{} = simd_prefix_exclusive_product({}); // MultiPrefix", dst, args[1])
+            } else {
+                format!("{} = 0;", dst)
+            }
+        }
+        DXIL_INTRIN_WAVEMULTIPREFIXBITAND => {
+            if args.len() >= 2 {
+                format!("{} = simd_prefix_exclusive_and({}); // MultiPrefix", dst, args[1])
+            } else {
+                format!("{} = 0;", dst)
+            }
+        }
+        DXIL_INTRIN_WAVEMULTIPREFIXBITOR => {
+            if args.len() >= 2 {
+                format!("{} = simd_prefix_exclusive_or({}); // MultiPrefix", dst, args[1])
+            } else {
+                format!("{} = 0;", dst)
+            }
+        }
+        DXIL_INTRIN_WAVEMULTIPREFIXBITXOR => {
+            if args.len() >= 2 {
+                format!("{} = simd_prefix_exclusive_xor({}); // MultiPrefix", dst, args[1])
+            } else {
+                format!("{} = 0;", dst)
+            }
+        }
+        DXIL_INTRIN_WAVEMULTIPREFIXBITCOUNT => {
+            if args.len() >= 2 {
+                format!("{} = popcount(simd_prefix_exclusive_or({})); // MultiPrefix", dst, args[1])
+            } else {
+                format!("{} = 0;", dst)
+            }
+        }
+        DXIL_INTRIN_WAVEMATCH => {
+            if args.len() >= 1 {
+                format!("{} = simd_vote({} == {}); // WaveMatch emulation", dst, args[0], args.get(1).unwrap_or(&args[0]))
+            } else {
+                format!("{} = 0;", dst)
+            }
+        }
+
+        // --- Conversion/bit intrinsics ---
+        DXIL_INTRIN_ASFLOAT => {
+            if args.len() >= 1 {
+                format!("{} = as_type<float>({});", dst, args[0])
+            } else {
+                format!("{} = 0;", dst)
+            }
+        }
+        DXIL_INTRIN_ASINT => {
+            if args.len() >= 1 {
+                format!("{} = as_type<int>({});", dst, args[0])
+            } else {
+                format!("{} = 0;", dst)
+            }
+        }
+        DXIL_INTRIN_ASUINT => {
+            if args.len() >= 1 {
+                format!("{} = as_type<uint>({});", dst, args[0])
+            } else {
+                format!("{} = 0;", dst)
+            }
+        }
+        DXIL_INTRIN_FIRSTBITHIGH => {
+            if args.len() >= 1 {
+                format!("{} = (clz({}) == 32) ? -1 : (31 - (int)clz({}));", dst, args[0], args[0])
+            } else {
+                format!("{} = 0;", dst)
+            }
+        }
+        DXIL_INTRIN_FIRSTBITLOW => {
+            if args.len() >= 1 {
+                format!("{} = (ctz({}) == 32) ? -1 : (int)ctz({});", dst, args[0], args[0])
+            } else {
+                format!("{} = 0;", dst)
+            }
+        }
+        DXIL_INTRIN_LOG10 => {
+            if args.len() >= 1 {
+                format!("{} = log10({});", dst, args[0])
+            } else {
+                format!("{} = 0;", dst)
+            }
+        }
+
+        // --- Packed dot-product intrinsics ---
+        DXIL_INTRIN_DOT4ADDI8PACKED => {
+            if args.len() >= 2 {
+                format!(
+                    "{} = (int)(({} >> 0) & 0xFF) * (int)(({} >> 0) & 0xFF) + (int)(({} >> 8) & 0xFF) * (int)(({} >> 8) & 0xFF) + (int)(({} >> 16) & 0xFF) * (int)(({} >> 16) & 0xFF) + (int)(({} >> 24) & 0xFF) * (int)(({} >> 24) & 0xFF); // Dot4AddI8Packed",
+                    dst, args[0], args[1], args[0], args[1], args[0], args[1], args[0], args[1]
+                )
+            } else {
+                format!("{} = 0;", dst)
+            }
+        }
+        DXIL_INTRIN_DOT4ADDU8PACKED => {
+            if args.len() >= 2 {
+                format!(
+                    "{} = uint(({} >> 0) & 0xFF) * uint(({} >> 0) & 0xFF) + uint(({} >> 8) & 0xFF) * uint(({} >> 8) & 0xFF) + uint(({} >> 16) & 0xFF) * uint(({} >> 16) & 0xFF) + uint(({} >> 24) & 0xFF) * uint(({} >> 24) & 0xFF); // Dot4AddU8Packed",
+                    dst, args[0], args[1], args[0], args[1], args[0], args[1], args[0], args[1]
+                )
+            } else {
+                format!("{} = 0;", dst)
+            }
+        }
+
+        // --- Tessellation intrinsics ---
+        DXIL_INTRIN_PROCESS2DQUADTESSSFACTORSAVG => {
+            if args.len() >= 4 {
+                format!(
+                    "{} = float2(({} + {} + {} + {}) / 4.0, (fabs({}) + fabs({}) + fabs({}) + fabs({})) / 4.0);",
+                    dst, args[0], args[1], args[2], args[3], args[0], args[1], args[2], args[3]
+                )
+            } else {
+                format!("{} = float2(1.0, 1.0);", dst)
+            }
+        }
+        DXIL_INTRIN_PROCESS2DQUADTESSFACTORSMAX => {
+            if args.len() >= 4 {
+                format!(
+                    "{} = float2(fmax(fmax({}, {}), fmax({}, {})), fmax(fmax(fabs({}), fabs({})), fmax(fabs({}), fabs({}))));",
+                    dst, args[0], args[1], args[2], args[3], args[0], args[1], args[2], args[3]
+                )
+            } else {
+                format!("{} = float2(1.0, 1.0);", dst)
+            }
+        }
+        DXIL_INTRIN_PROCESS2DQUADTESSFACTORSMIN => {
+            if args.len() >= 4 {
+                format!(
+                    "{} = float2(fmin(fmin({}, {}), fmin({}, {})), fmin(fmin(fabs({}), fabs({})), fmin(fabs({}), fabs({}))));",
+                    dst, args[0], args[1], args[2], args[3], args[0], args[1], args[2], args[3]
+                )
+            } else {
+                format!("{} = float2(1.0, 1.0);", dst)
+            }
+        }
+        DXIL_INTRIN_PROCESS2DTRIANGLEFACTORSAVG => {
+            if args.len() >= 3 {
+                format!(
+                    "{} = float2(({} + {} + {}) / 3.0, (fabs({}) + fabs({}) + fabs({})) / 3.0);",
+                    dst, args[0], args[1], args[2], args[0], args[1], args[2]
+                )
+            } else {
+                format!("{} = float2(1.0, 1.0);", dst)
+            }
+        }
+        DXIL_INTRIN_PROCESS2DTRIANGLEFACTORSMAX => {
+            if args.len() >= 3 {
+                format!(
+                    "{} = float2(fmax(fmax({}, {}), {}), fmax(fmax(fabs({}), fabs({})), fabs({})));",
+                    dst, args[0], args[1], args[2], args[0], args[1], args[2]
+                )
+            } else {
+                format!("{} = float2(1.0, 1.0);", dst)
+            }
+        }
+        DXIL_INTRIN_PROCESS2DTRIANGLEFACTORSMIN => {
+            if args.len() >= 3 {
+                format!(
+                    "{} = float2(fmin(fmin({}, {}), {}), fmin(fmin(fabs({}), fabs({})), fabs({})));",
+                    dst, args[0], args[1], args[2], args[0], args[1], args[2]
+                )
+            } else {
+                format!("{} = float2(1.0, 1.0);", dst)
+            }
+        }
+
+        // --- Texture query intrinsics ---
+        DXIL_INTRIN_CALCULATELOD => {
+            if args.len() >= 2 {
+                format!("{} = {}.calculate_lod({});", dst, args[0], args[1])
+            } else {
+                format!("{} = 0.0;", dst)
+            }
+        }
+        DXIL_INTRIN_CALCULATELODUNCLAMPED => {
+            if args.len() >= 2 {
+                format!("{} = {}.calculate_lod({}); // Note: MSL does not support unclamped LOD", dst, args[0], args[1])
+            } else {
+                format!("{} = 0.0;", dst)
+            }
+        }
+
+        // --- Attribute evaluation and misc ---
+        DXIL_INTRIN_CHECKACCESSFULLYMAPPED => {
+            format!("{} = 1; // CheckAccessFullyMapped", dst)
+        }
+        DXIL_INTRIN_EVALUATEATTRIBUTEATCENTROID => {
+            if args.len() >= 1 {
+                format!("{} = {}; // EvaluateAttributeAtCentroid", dst, args[0])
+            } else {
+                format!("{} = 0.0;", dst)
+            }
+        }
+        DXIL_INTRIN_EVALUATEATTRIBUTEATSAMPLE => {
+            if args.len() >= 2 {
+                format!("{} = {}; // EvaluateAttributeAtSample({})", dst, args[0], args[1])
+            } else {
+                format!("{} = 0.0;", dst)
+            }
+        }
+        DXIL_INTRIN_EVALUATEATTRIBUTEATCONSTANT => {
+            if args.len() >= 2 {
+                format!("{} = {}; // EvaluateAttributeAtConstant({})", dst, args[0], args[1])
+            } else {
+                format!("{} = 0.0;", dst)
+            }
+        }
+        DXIL_INTRIN_INSTANCEID => {
+            format!("{} = instance_id;", dst)
+        }
+        DXIL_INTRIN_VERTEXID => {
+            format!("{} = vid;", dst)
+        }
+        DXIL_INTRIN_PRIMITIVEID => {
+            format!("{} = primitive_id;", dst)
+        }
+
+        // --- Geometry shader intrinsics ---
+        DXIL_INTRIN_EMITSTREAM => {
+            format!("// EmitStream({})", args.first().map_or("0", |v| v))
+        }
+        DXIL_INTRIN_CUTSTREAM => {
+            format!("// CutStream({})", args.first().map_or("0", |v| v))
+        }
+        DXIL_INTRIN_EMITTHENCUTSTREAM => {
+            format!("// EmitThenCutStream({})", args.first().map_or("0", |v| v))
+        }
+
+        // --- Resource handle creation (resource array indexing) ---
+        // DXIL resource classes: 0=SRV, 1=UAV, 2=CBV, 3=Sampler
+        // CreateHandle(resClass, rangeId, index) — resolves a resource by
+        // range + index.  In MSL, resources are bound individually via
+        // [[texture(N)]], [[buffer(N)]], [[sampler(N)]], so we emit a
+        // reference expression that picks the correct binding.
+        DXIL_INTRIN_CREATEHANDLE => {
+            if args.len() >= 3 {
+                let res_class = &args[0];
+                let _range_id = &args[1];
+                let index = &args[2];
+                // Determine if index looks like a literal constant
+                let is_const_idx = index.parse::<u32>().is_ok();
+                let binding = if is_const_idx {
+                    // Static index: reference the specific binding slot
+                    // e.g., _handle_srv_0, _handle_uav_1, _handle_cbv_2
+                    format!("_res_{}_{}", res_class, index)
+                } else {
+                    // Dynamic index: array-of-resources pattern
+                    // e.g., _res_array_srv[_idx_3] where _idx_3 is the runtime index
+                    format!("_res_array_{}[{}]", res_class, index)
+                };
+                // Store the resolved handle name so later instructions can use it
+                format!("{} = {}; // CreateHandle(resClass={}, rangeId={}, index={})",
+                    dst, binding, args[0], args[1], args[2])
+            } else {
+                format!("{} = 0; // CreateHandle (no args)", dst)
+            }
+        }
+        // CreateHandleForBinding(resClass, rangeId, index, nonUniformIndex)
+        // Similar to CreateHandle but the index may come from a non-uniform
+        // input (e.g., a per-vertex/fragment attribute).  In MSL, non-uniform
+        // indexing of resource arrays requires either:
+        //   a) A switch() over individual [[texture(N)]] bindings, or
+        //   b) An array<> of textures (MSL 2.3+, device only).
+        // We emit the dynamic-indexing pattern.
+        DXIL_INTRIN_CREATEHANDLEFORBINDING => {
+            if args.len() >= 4 {
+                let res_class = &args[0];
+                let _range_id = &args[1];
+                let index = &args[2];
+                let _non_uniform = &args[3];
+                let is_const_idx = index.parse::<u32>().is_ok();
+                let binding = if is_const_idx {
+                    format!("_res_{}_{}", res_class, index)
+                } else {
+                    format!("_res_array_{}[{}]", res_class, index)
+                };
+                format!("{} = {}; // CreateHandleForBinding(resClass={}, rangeId={}, index={}, nonUniform={})",
+                    dst, binding, args[0], args[1], args[2], args[3])
+            } else {
+                format!("{} = 0; // CreateHandleForBinding (no args)", dst)
+            }
+        }
 
         _ => {
             format!(
@@ -1966,6 +2593,199 @@ pub fn dxil_opcode_to_msl(
                 dst, opcode, is_signed, is_float
             )
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DXIL intrinsic mapping helpers
+// ---------------------------------------------------------------------------
+
+/// Heuristic: check if a pointer argument refers to groupshared memory by
+/// looking for common patterns in temporary variable names used for groupshared
+/// accesses.
+fn is_groupshared_ptr(ptr: &str) -> bool {
+    // Groupshared variables typically have "gs_" prefix or "_gs" suffix in
+    // the temporary variable naming scheme.
+    ptr.contains("_gs") || ptr.contains("gs_") || ptr.contains("groupshared")
+}
+
+/// Map a DXIL intrinsic function ID (from the DXIL spec's intrinsic numbering)
+/// to this implementation's internal opcode constants.
+///
+/// DXIL intrinsic IDs are the first operand of a call to a DXIL intrinsic
+/// function (e.g., `@dx.op.call`). This function maps them to the internal
+/// opcode space used by `dxil_opcode_to_msl`.
+///
+/// Returns `None` for unknown intrinsic IDs, which fall back to a generic call.
+pub fn map_dxil_intrinsic_id(dxil_intrinsic_id: u32) -> Option<u32> {
+    match dxil_intrinsic_id {
+        // Arithmetic intrinsics (HLSL intrinsic mapping)
+        6 => Some(DXIL_INTRIN_ABS),       // abs/absi/f
+        7 => Some(DXIL_INTRIN_SATURATE),  // saturate
+        8 => Some(DXIL_INTRIN_MAD),       // mad/fma
+        9 => Some(DXIL_INTRIN_MIN),       // min
+        10 => Some(DXIL_INTRIN_MAX),      // max
+        11 => Some(DXIL_INTRIN_CLAMP),    // clamp
+        12 => Some(DXIL_INTRIN_SIN),      // sin
+        13 => Some(DXIL_INTRIN_COS),      // cos
+        14 => Some(DXIL_INTRIN_TAN),      // tan
+        15 => Some(DXIL_INTRIN_SQRT),     // sqrt
+        16 => Some(DXIL_INTRIN_RSQRT),    // rsqrt
+        17 => Some(DXIL_INTRIN_FRAC),     // frac
+        18 => Some(DXIL_INTRIN_FLOOR),    // floor
+        19 => Some(DXIL_INTRIN_CEIL),     // ceil
+        20 => Some(DXIL_INTRIN_ROUND),    // round
+        21 => Some(DXIL_INTRIN_EXP),      // exp
+        22 => Some(DXIL_INTRIN_EXP2),     // exp2
+        23 => Some(DXIL_INTRIN_LOG),      // log
+        24 => Some(DXIL_INTRIN_LOG2),     // log2
+        25 => Some(DXIL_INTRIN_LOG10),    // log10
+        26 => Some(DXIL_INTRIN_POW),      // pow
+        27 => Some(DXIL_INTRIN_DOT),      // dot
+        28 => Some(DXIL_INTRIN_MUL),      // mul
+        29 => Some(DXIL_INTRIN_LERP),     // lerp
+        30 => Some(DXIL_INTRIN_NORMALIZE), // normalize
+        31 => Some(DXIL_INTRIN_CROSS),    // cross
+        32 => Some(DXIL_INTRIN_TRANSPOSE), // transpose
+        33 => Some(DXIL_INTRIN_DETERMINANT), // determinant
+        34 => Some(DXIL_INTRIN_REFLECT),  // reflect
+        35 => Some(DXIL_INTRIN_REFRACT),  // refract
+        36 => Some(DXIL_INTRIN_ISFINITE), // isfinite
+        37 => Some(DXIL_INTRIN_ISINF),    // isinf
+        38 => Some(DXIL_INTRIN_ISNAN),    // isnan
+        39 => Some(DXIL_INTRIN_SIGN),     // sign
+        40 => Some(DXIL_INTRIN_COUNTBITS), // countbits
+        41 => Some(DXIL_INTRIN_REVERSEBITS), // reversebits
+        42 => Some(DXIL_INTRIN_RCP),      // rcp
+        43 => Some(DXIL_INTRIN_DISTANCE), // distance
+        44 => Some(DXIL_INTRIN_LENGTH),   // length
+        45 => Some(DXIL_INTRIN_SMOOTHSTEP), // smoothstep
+        46 => Some(DXIL_INTRIN_STEP),     // step
+        47 => Some(DXIL_INTRIN_SINCOS),   // sincos
+        48 => Some(DXIL_INTRIN_ATAN2),    // atan2
+        49 => Some(DXIL_INTRIN_ATAN),     // atan
+        50 => Some(DXIL_INTRIN_ASIN),     // asin
+        51 => Some(DXIL_INTRIN_ACOS),     // acos
+        52 => Some(DXIL_INTRIN_TANH),     // tanh
+        53 => Some(DXIL_INTRIN_SINH),     // sinh
+        54 => Some(DXIL_INTRIN_COSH),     // cosh
+        55 => Some(DXIL_INTRIN_FWIDTH),   // fwidth
+        56 => Some(DXIL_INTRIN_ASFLOAT),  // asfloat
+        57 => Some(DXIL_INTRIN_ASINT),    // asint
+        58 => Some(DXIL_INTRIN_ASUINT),   // asuint
+        59 => Some(DXIL_INTRIN_FIRSTBITHIGH), // firstbithigh
+        60 => Some(DXIL_INTRIN_FIRSTBITLOW),  // firstbitlow
+
+        // Texture/sample intrinsics
+        120 => Some(DXIL_INTRIN_SAMPLE),
+        121 => Some(DXIL_INTRIN_SAMPLELEVEL),
+        122 => Some(DXIL_INTRIN_SAMPLEGRAD),
+        123 => Some(DXIL_INTRIN_SAMPLEBIAS),
+        124 => Some(DXIL_INTRIN_SAMPLECMP),
+        125 => Some(DXIL_INTRIN_GATHER),
+        126 => Some(DXIL_INTRIN_CALCULATELOD),
+        127 => Some(DXIL_INTRIN_CALCULATELODUNCLAMPED),
+
+        // Buffer/load/store intrinsics
+        130 => Some(DXIL_INTRIN_LOAD),
+        131 => Some(DXIL_INTRIN_STORE),
+        132 => Some(DXIL_INTRIN_BUFFERLOAD),
+        133 => Some(DXIL_INTRIN_BUFFERSTORE),
+        134 => Some(DXIL_INTRIN_TEXTURELOAD),
+        135 => Some(DXIL_INTRIN_TEXTURESTORE),
+
+        // Atomic intrinsics
+        136 => Some(DXIL_INTRIN_ATOMICADD),
+        137 => Some(DXIL_INTRIN_ATOMICAND),
+        138 => Some(DXIL_INTRIN_ATOMICOR),
+        139 => Some(DXIL_INTRIN_ATOMICXOR),
+        140 => Some(DXIL_INTRIN_ATOMICMIN),
+        141 => Some(DXIL_INTRIN_ATOMICMAX),
+        142 => Some(DXIL_INTRIN_ATOMICEXCHANGE),
+        143 => Some(DXIL_INTRIN_ATOMICCOMPAREEXCHANGE),
+
+        // Thread/buffer identity intrinsics
+        150 => Some(DXIL_INTRIN_INSTANCEID),
+        151 => Some(DXIL_INTRIN_VERTEXID),
+        152 => Some(DXIL_INTRIN_PRIMITIVEID),
+        153 => Some(DXIL_INTRIN_THREADID),
+        154 => Some(DXIL_INTRIN_GROUPID),
+        155 => Some(DXIL_INTRIN_THREADGROUPID),
+        156 => Some(DXIL_INTRIN_GROUPINDEX),
+        157 => Some(DXIL_INTRIN_DISPATCHTHREADID),
+
+        // Barrier/sync intrinsics
+        158 => Some(DXIL_INTRIN_BARRIER),
+        159 => Some(DXIL_INTRIN_GROUPMEMORYBARRIER),
+        160 => Some(DXIL_INTRIN_DEVICEMEMORYBARRIER),
+
+        // Derivative intrinsics
+        161 => Some(DXIL_INTRIN_DERIVATIVE),
+        162 => Some(DXIL_INTRIN_DERIVATIVE_COARSE),
+        163 => Some(DXIL_INTRIN_DERIVATIVE_FINE),
+
+        // Arithmetic intrinsics (continued)
+        164 => Some(DXIL_INTRIN_DOT4ADDI8PACKED),
+        165 => Some(DXIL_INTRIN_DOT4ADDU8PACKED),
+
+        // Wave intrinsics
+        190 => Some(DXIL_INTRIN_WAVEACTIVE),
+        191 => Some(DXIL_INTRIN_WAVEACTIVEBIT),
+        192 => Some(DXIL_INTRIN_WAVEPREFIX),
+        193 => Some(DXIL_INTRIN_WAVEGETLANEINDEX),
+        194 => Some(DXIL_INTRIN_WAVEGETLANECOUNT),
+        195 => Some(DXIL_INTRIN_WAVEANYTRUE),
+        196 => Some(DXIL_INTRIN_WAVEALLTRUE),
+        197 => Some(DXIL_INTRIN_WAVEALLEQUAL),
+        198 => Some(DXIL_INTRIN_WAVEBALLOT),
+        199 => Some(DXIL_INTRIN_WAVEREADLANEAT),
+        200 => Some(DXIL_INTRIN_WAVEREADLANEFIRST),
+        201 => Some(DXIL_INTRIN_WAVEACTIVESUM),
+        202 => Some(DXIL_INTRIN_WAVEACTIVEPRODUCT),
+        203 => Some(DXIL_INTRIN_WAVEACTIVEMIN),
+        204 => Some(DXIL_INTRIN_WAVEACTIVEMAX),
+        205 => Some(DXIL_INTRIN_WAVEACTIVEBITAND),
+        206 => Some(DXIL_INTRIN_WAVEACTIVEBITOR),
+        207 => Some(DXIL_INTRIN_WAVEACTIVEBITXOR),
+        208 => Some(DXIL_INTRIN_WAVEACTIVECOUNTBITS),
+        209 => Some(DXIL_INTRIN_WAVEMATCH),
+        210 => Some(DXIL_INTRIN_WAVEMULTIPREFIXSUM),
+        211 => Some(DXIL_INTRIN_WAVEMULTIPREFIXPRODUCT),
+        212 => Some(DXIL_INTRIN_WAVEMULTIPREFIXBITAND),
+        213 => Some(DXIL_INTRIN_WAVEMULTIPREFIXBITOR),
+        214 => Some(DXIL_INTRIN_WAVEMULTIPREFIXBITXOR),
+        215 => Some(DXIL_INTRIN_WAVEMULTIPREFIXBITCOUNT),
+
+        // Quad read/write intrinsics
+        216 => Some(DXIL_INTRIN_QUADREAD),
+        217 => Some(DXIL_INTRIN_QUADWRITE),
+
+        // Tessellation intrinsics
+        230 => Some(DXIL_INTRIN_PROCESS2DQUADTESSSFACTORSAVG),
+        231 => Some(DXIL_INTRIN_PROCESS2DQUADTESSFACTORSMAX),
+        232 => Some(DXIL_INTRIN_PROCESS2DQUADTESSFACTORSMIN),
+        233 => Some(DXIL_INTRIN_PROCESS2DTRIANGLEFACTORSAVG),
+        234 => Some(DXIL_INTRIN_PROCESS2DTRIANGLEFACTORSMAX),
+        235 => Some(DXIL_INTRIN_PROCESS2DTRIANGLEFACTORSMIN),
+
+        // Geometry shader intrinsics
+        240 => Some(DXIL_INTRIN_EMITSTREAM),
+        241 => Some(DXIL_INTRIN_CUTSTREAM),
+        242 => Some(DXIL_INTRIN_EMITTHENCUTSTREAM),
+
+        // Attribute evaluation intrinsics
+        250 => Some(DXIL_INTRIN_EVALUATEATTRIBUTEATCENTROID),
+        251 => Some(DXIL_INTRIN_EVALUATEATTRIBUTEATSAMPLE),
+        252 => Some(DXIL_INTRIN_EVALUATEATTRIBUTEATCONSTANT),
+
+        // Resource handle creation
+        253 => Some(DXIL_INTRIN_CREATEHANDLE),
+        254 => Some(DXIL_INTRIN_CREATEHANDLEFORBINDING),
+
+        // CheckAccessFullyMapped
+        255 => Some(DXIL_INTRIN_CHECKACCESSFULLYMAPPED),
+
+        _ => None,
     }
 }
 
@@ -2239,8 +3059,19 @@ fn parse_function_block(
                     }
                     FUNC_CODE_INST_CALL => {
                         instruction_count += 1;
+                        // Try to detect DXIL intrinsic calls.
+                        // In DXIL, intrinsic calls have a function index as the first
+                        // operand and the DXIL intrinsic ID as the second operand.
+                        // If we can map the intrinsic ID, use our opcode constant;
+                        // otherwise fall back to generic call (opcode 41).
+                        let opcode = if record.operands.len() >= 2 {
+                            let dxil_intrinsic_id = record.operands[1];
+                            map_dxil_intrinsic_id(dxil_intrinsic_id).unwrap_or(41)
+                        } else {
+                            41
+                        };
                         let instr = DxilInstruction {
-                            opcode: 41, // call
+                            opcode,
                             operands: record.operands.clone(),
                         };
                         if let Some(ref mut bb) = current_bb {
@@ -3788,5 +4619,669 @@ mod tests {
         let key3 = ShaderCache::compute_key(b"different_data");
         assert_eq!(key1, key2);
         assert_ne!(key1, key3);
+    }
+
+    // -----------------------------------------------------------------------
+    // Wave intrinsic opcode translation tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn t_dxil_opcode_wave_get_lane_index() {
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_WAVEGETLANEINDEX, "_r", &[], false, false);
+        assert!(stmt.contains("simd_lane_id"));
+    }
+
+    #[test]
+    fn t_dxil_opcode_wave_get_lane_count() {
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_WAVEGETLANECOUNT, "_r", &[], false, false);
+        assert!(stmt.contains("simd_lane_count"));
+    }
+
+    #[test]
+    fn t_dxil_opcode_wave_any_true() {
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_WAVEANYTRUE, "_r", &["cond".to_string()], false, false);
+        assert!(stmt.contains("simd_any(cond)"));
+    }
+
+    #[test]
+    fn t_dxil_opcode_wave_all_true() {
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_WAVEALLTRUE, "_r", &["cond".to_string()], false, false);
+        assert!(stmt.contains("simd_all(cond)"));
+    }
+
+    #[test]
+    fn t_dxil_opcode_wave_all_equal() {
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_WAVEALLEQUAL, "_r", &["val".to_string()], false, false);
+        assert!(stmt.contains("simd_all(val == simd_broadcast_first(val)"));
+    }
+
+    #[test]
+    fn t_dxil_opcode_wave_ballot() {
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_WAVEBALLOT, "_r", &["cond".to_string()], false, false);
+        assert!(stmt.contains("simd_ballot(cond)"));
+    }
+
+    #[test]
+    fn t_dxil_opcode_wave_read_lane_at() {
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_WAVEREADLANEAT, "_r", &["val".to_string(), "lane".to_string()], false, false);
+        assert!(stmt.contains("simd_broadcast(val, lane)"));
+    }
+
+    #[test]
+    fn t_dxil_opcode_wave_read_lane_first() {
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_WAVEREADLANEFIRST, "_r", &["val".to_string()], false, false);
+        assert!(stmt.contains("simd_broadcast_first(val)"));
+    }
+
+    #[test]
+    fn t_dxil_opcode_wave_active_bitand() {
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_WAVEACTIVEBITAND, "_r", &["val".to_string()], false, false);
+        assert!(stmt.contains("simd_and(val)"));
+    }
+
+    #[test]
+    fn t_dxil_opcode_wave_active_bitor() {
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_WAVEACTIVEBITOR, "_r", &["val".to_string()], false, false);
+        assert!(stmt.contains("simd_or(val)"));
+    }
+
+    #[test]
+    fn t_dxil_opcode_wave_active_bitxor() {
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_WAVEACTIVEBITXOR, "_r", &["val".to_string()], false, false);
+        assert!(stmt.contains("simd_xor(val)"));
+    }
+
+    #[test]
+    fn t_dxil_opcode_wave_active_countbits() {
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_WAVEACTIVECOUNTBITS, "_r", &["val".to_string()], false, false);
+        assert!(stmt.contains("popcount(simd_ballot(val)"));
+    }
+
+    #[test]
+    fn t_dxil_opcode_wave_active_sum() {
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_WAVEACTIVESUM, "_r", &["val".to_string()], false, false);
+        assert!(stmt.contains("simd_sum(val)"));
+    }
+
+    #[test]
+    fn t_dxil_opcode_wave_active_product() {
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_WAVEACTIVEPRODUCT, "_r", &["val".to_string()], false, false);
+        assert!(stmt.contains("simd_product(val)"));
+    }
+
+    #[test]
+    fn t_dxil_opcode_wave_active_min() {
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_WAVEACTIVEMIN, "_r", &["val".to_string()], false, false);
+        assert!(stmt.contains("simd_min(val)"));
+    }
+
+    #[test]
+    fn t_dxil_opcode_wave_active_max() {
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_WAVEACTIVEMAX, "_r", &["val".to_string()], false, false);
+        assert!(stmt.contains("simd_max(val)"));
+    }
+
+    #[test]
+    fn t_dxil_opcode_wave_multiprefix_sum() {
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_WAVEMULTIPREFIXSUM, "_r", &["mask".to_string(), "val".to_string()], false, false);
+        assert!(stmt.contains("simd_prefix_exclusive_sum(val)"));
+    }
+
+    #[test]
+    fn t_dxil_opcode_wave_multiprefix_product() {
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_WAVEMULTIPREFIXPRODUCT, "_r", &["mask".to_string(), "val".to_string()], false, false);
+        assert!(stmt.contains("simd_prefix_exclusive_product(val)"));
+    }
+
+    #[test]
+    fn t_dxil_opcode_wave_multiprefix_bitand() {
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_WAVEMULTIPREFIXBITAND, "_r", &["mask".to_string(), "val".to_string()], false, false);
+        assert!(stmt.contains("simd_prefix_exclusive_and(val)"));
+    }
+
+    #[test]
+    fn t_dxil_opcode_wave_multiprefix_bitor() {
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_WAVEMULTIPREFIXBITOR, "_r", &["mask".to_string(), "val".to_string()], false, false);
+        assert!(stmt.contains("simd_prefix_exclusive_or(val)"));
+    }
+
+    #[test]
+    fn t_dxil_opcode_wave_multiprefix_bitxor() {
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_WAVEMULTIPREFIXBITXOR, "_r", &["mask".to_string(), "val".to_string()], false, false);
+        assert!(stmt.contains("simd_prefix_exclusive_xor(val)"));
+    }
+
+    #[test]
+    fn t_dxil_opcode_wave_multiprefix_bitcount() {
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_WAVEMULTIPREFIXBITCOUNT, "_r", &["mask".to_string(), "val".to_string()], false, false);
+        assert!(stmt.contains("popcount(simd_prefix_exclusive_or(val)"));
+    }
+
+    #[test]
+    fn t_dxil_opcode_wave_match() {
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_WAVEMATCH, "_r", &["a".to_string()], false, false);
+        assert!(stmt.contains("simd_vote(a == a)"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Conversion/bit intrinsic opcode translation tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn t_dxil_opcode_asfloat() {
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_ASFLOAT, "_r", &["val".to_string()], false, false);
+        assert!(stmt.contains("as_type<float>(val)"));
+    }
+
+    #[test]
+    fn t_dxil_opcode_asint() {
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_ASINT, "_r", &["val".to_string()], false, false);
+        assert!(stmt.contains("as_type<int>(val)"));
+    }
+
+    #[test]
+    fn t_dxil_opcode_asuint() {
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_ASUINT, "_r", &["val".to_string()], false, false);
+        assert!(stmt.contains("as_type<uint>(val)"));
+    }
+
+    #[test]
+    fn t_dxil_opcode_firstbithigh() {
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_FIRSTBITHIGH, "_r", &["val".to_string()], false, false);
+        assert!(stmt.contains("clz(val)"));
+        assert!(stmt.contains("31 - (int)clz(val)"));
+    }
+
+    #[test]
+    fn t_dxil_opcode_firstbitlow() {
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_FIRSTBITLOW, "_r", &["val".to_string()], false, false);
+        assert!(stmt.contains("ctz(val)"));
+    }
+
+    #[test]
+    fn t_dxil_opcode_log10() {
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_LOG10, "_r", &["val".to_string()], false, true);
+        assert!(stmt.contains("log10(val)"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Packed dot-product opcode translation tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn t_dxil_opcode_dot4addi8packed() {
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_DOT4ADDI8PACKED, "_r", &["a".to_string(), "b".to_string()], false, false);
+        assert!(stmt.contains("Dot4AddI8Packed"));
+        assert!(stmt.contains("(int)((a >> 0) & 0xFF)"));
+    }
+
+    #[test]
+    fn t_dxil_opcode_dot4addu8packed() {
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_DOT4ADDU8PACKED, "_r", &["a".to_string(), "b".to_string()], false, false);
+        assert!(stmt.contains("Dot4AddU8Packed"));
+        assert!(stmt.contains("uint((a >> 0) & 0xFF)"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Tessellation intrinsic opcode translation tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn t_dxil_opcode_tess_quad_avg() {
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_PROCESS2DQUADTESSSFACTORSAVG, "_r",
+            &["a".to_string(), "b".to_string(), "c".to_string(), "d".to_string()], false, true);
+        assert!(stmt.contains("(a + b + c + d) / 4.0"));
+    }
+
+    #[test]
+    fn t_dxil_opcode_tess_quad_max() {
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_PROCESS2DQUADTESSFACTORSMAX, "_r",
+            &["a".to_string(), "b".to_string(), "c".to_string(), "d".to_string()], false, true);
+        assert!(stmt.contains("fmax(fmax(a, b), fmax(c, d))"));
+    }
+
+    #[test]
+    fn t_dxil_opcode_tess_quad_min() {
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_PROCESS2DQUADTESSFACTORSMIN, "_r",
+            &["a".to_string(), "b".to_string(), "c".to_string(), "d".to_string()], false, true);
+        assert!(stmt.contains("fmin(fmin(a, b), fmin(c, d))"));
+    }
+
+    #[test]
+    fn t_dxil_opcode_tess_tri_avg() {
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_PROCESS2DTRIANGLEFACTORSAVG, "_r",
+            &["a".to_string(), "b".to_string(), "c".to_string()], false, true);
+        assert!(stmt.contains("(a + b + c) / 3.0"));
+    }
+
+    #[test]
+    fn t_dxil_opcode_tess_tri_max() {
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_PROCESS2DTRIANGLEFACTORSMAX, "_r",
+            &["a".to_string(), "b".to_string(), "c".to_string()], false, true);
+        assert!(stmt.contains("fmax(fmax(a, b), c)"));
+    }
+
+    #[test]
+    fn t_dxil_opcode_tess_tri_min() {
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_PROCESS2DTRIANGLEFACTORSMIN, "_r",
+            &["a".to_string(), "b".to_string(), "c".to_string()], false, true);
+        assert!(stmt.contains("fmin(fmin(a, b), c)"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Texture query intrinsic tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn t_dxil_opcode_calculate_lod() {
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_CALCULATELOD, "_r",
+            &["tex".to_string(), "coord".to_string()], false, true);
+        assert!(stmt.contains("tex.calculate_lod(coord)"));
+    }
+
+    #[test]
+    fn t_dxil_opcode_calculate_lod_unclamped() {
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_CALCULATELODUNCLAMPED, "_r",
+            &["tex".to_string(), "coord".to_string()], false, true);
+        assert!(stmt.contains("tex.calculate_lod(coord)"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Attribute evaluation tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn t_dxil_opcode_check_access_fully_mapped() {
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_CHECKACCESSFULLYMAPPED, "_r", &[], false, false);
+        assert!(stmt.contains("CheckAccessFullyMapped"));
+        assert!(stmt.contains("= 1"));
+    }
+
+    #[test]
+    fn t_dxil_opcode_eval_attr_centroid() {
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_EVALUATEATTRIBUTEATCENTROID, "_r", &["attr".to_string()], false, true);
+        assert!(stmt.contains("EvaluateAttributeAtCentroid"));
+    }
+
+    #[test]
+    fn t_dxil_opcode_eval_attr_sample() {
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_EVALUATEATTRIBUTEATSAMPLE, "_r",
+            &["attr".to_string(), "idx".to_string()], false, true);
+        assert!(stmt.contains("EvaluateAttributeAtSample(idx)"));
+    }
+
+    #[test]
+    fn t_dxil_opcode_eval_attr_constant() {
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_EVALUATEATTRIBUTEATCONSTANT, "_r",
+            &["attr".to_string(), "idx".to_string()], false, true);
+        assert!(stmt.contains("EvaluateAttributeAtConstant(idx)"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Vertex/instance/primitive ID tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn t_dxil_opcode_instance_id() {
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_INSTANCEID, "_r", &[], false, false);
+        assert!(stmt.contains("instance_id"));
+    }
+
+    #[test]
+    fn t_dxil_opcode_vertex_id() {
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_VERTEXID, "_r", &[], false, false);
+        assert!(stmt.contains("vid"));
+    }
+
+    #[test]
+    fn t_dxil_opcode_primitive_id() {
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_PRIMITIVEID, "_r", &[], false, false);
+        assert!(stmt.contains("primitive_id"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Geometry shader intrinsic tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn t_dxil_opcode_emit_stream() {
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_EMITSTREAM, "", &["0".to_string()], false, false);
+        assert!(stmt.contains("EmitStream(0)"));
+    }
+
+    #[test]
+    fn t_dxil_opcode_cut_stream() {
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_CUTSTREAM, "", &["0".to_string()], false, false);
+        assert!(stmt.contains("CutStream(0)"));
+    }
+
+    #[test]
+    fn t_dxil_opcode_emit_then_cut_stream() {
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_EMITTHENCUTSTREAM, "", &["0".to_string()], false, false);
+        assert!(stmt.contains("EmitThenCutStream(0)"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Resource handle creation tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn t_dxil_opcode_create_handle() {
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_CREATEHANDLE, "_r",
+            &["0".to_string(), "1".to_string(), "2".to_string()], false, false);
+        assert!(stmt.contains("CreateHandle(resClass=0, rangeId=1, index=2)"));
+    }
+
+    #[test]
+    fn t_dxil_opcode_create_handle_for_binding() {
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_CREATEHANDLEFORBINDING, "_r",
+            &["0".to_string(), "1".to_string(), "2".to_string(), "0".to_string()], false, false);
+        assert!(stmt.contains("CreateHandleForBinding(resClass=0, rangeId=1, index=2, nonUniform=0)"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Barrier memory flag tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn t_dxil_opcode_barrier_default() {
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_BARRIER, "", &[], false, false);
+        assert!(stmt.contains("threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device)"));
+    }
+
+    #[test]
+    fn t_dxil_opcode_barrier_uav() {
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_BARRIER, "", &["8".to_string()], false, false);
+        assert!(stmt.contains("mem_flags::mem_device"));
+        assert!(!stmt.contains("mem_threadgroup"));
+    }
+
+    #[test]
+    fn t_dxil_opcode_barrier_groupshared() {
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_BARRIER, "", &["4".to_string()], false, false);
+        assert!(stmt.contains("mem_flags::mem_threadgroup"));
+        assert!(!stmt.contains("mem_device"));
+    }
+
+    #[test]
+    fn t_dxil_opcode_barrier_all() {
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_BARRIER, "", &["12".to_string()], false, false);
+        assert!(stmt.contains("mem_threadgroup | mem_flags::mem_device"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Atomic operation address space tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn t_dxil_opcode_atomic_add_device() {
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_ATOMICADD, "_r",
+            &["buf".to_string(), "ptr".to_string(), "1".to_string()], false, false);
+        assert!(stmt.contains("device atomic_int*"));
+        assert!(!stmt.contains("threadgroup atomic_int*"));
+    }
+
+    #[test]
+    fn t_dxil_opcode_atomic_add_groupshared() {
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_ATOMICADD, "_r",
+            &["buf".to_string(), "_gs_ptr".to_string(), "1".to_string()], false, false);
+        assert!(stmt.contains("threadgroup atomic_int*"));
+    }
+
+    #[test]
+    fn t_dxil_opcode_atomic_exchange_groupshared() {
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_ATOMICEXCHANGE, "_r",
+            &["buf".to_string(), "gs_val".to_string(), "1".to_string()], false, false);
+        assert!(stmt.contains("threadgroup atomic_int*"));
+    }
+
+    #[test]
+    fn t_dxil_opcode_atomic_compare_exchange_groupshared() {
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_ATOMICCOMPAREEXCHANGE, "_r",
+            &["buf".to_string(), "groupshared_ptr".to_string(), "0".to_string(), "1".to_string()], false, false);
+        assert!(stmt.contains("threadgroup atomic_int*"));
+        assert!(stmt.contains("atomic_compare_exchange_weak_explicit"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Helper function tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn t_is_groupshared_ptr_positive() {
+        assert!(is_groupshared_ptr("_gs_val"));
+        assert!(is_groupshared_ptr("gs_ptr"));
+        assert!(is_groupshared_ptr("my_groupshared_var"));
+        assert!(is_groupshared_ptr("val_gs"));
+    }
+
+    #[test]
+    fn t_is_groupshared_ptr_negative() {
+        assert!(!is_groupshared_ptr("buf_ptr"));
+        assert!(!is_groupshared_ptr("device_val"));
+        assert!(!is_groupshared_ptr(""));
+    }
+
+    #[test]
+    fn t_map_dxil_intrinsic_id_arithmetic() {
+        assert_eq!(map_dxil_intrinsic_id(6), Some(DXIL_INTRIN_ABS));
+        assert_eq!(map_dxil_intrinsic_id(7), Some(DXIL_INTRIN_SATURATE));
+        assert_eq!(map_dxil_intrinsic_id(8), Some(DXIL_INTRIN_MAD));
+        assert_eq!(map_dxil_intrinsic_id(56), Some(DXIL_INTRIN_ASFLOAT));
+        assert_eq!(map_dxil_intrinsic_id(57), Some(DXIL_INTRIN_ASINT));
+        assert_eq!(map_dxil_intrinsic_id(58), Some(DXIL_INTRIN_ASUINT));
+    }
+
+    #[test]
+    fn t_map_dxil_intrinsic_id_texture() {
+        assert_eq!(map_dxil_intrinsic_id(120), Some(DXIL_INTRIN_SAMPLE));
+        assert_eq!(map_dxil_intrinsic_id(121), Some(DXIL_INTRIN_SAMPLELEVEL));
+        assert_eq!(map_dxil_intrinsic_id(126), Some(DXIL_INTRIN_CALCULATELOD));
+        assert_eq!(map_dxil_intrinsic_id(127), Some(DXIL_INTRIN_CALCULATELODUNCLAMPED));
+    }
+
+    #[test]
+    fn t_map_dxil_intrinsic_id_atomics() {
+        assert_eq!(map_dxil_intrinsic_id(136), Some(DXIL_INTRIN_ATOMICADD));
+        assert_eq!(map_dxil_intrinsic_id(143), Some(DXIL_INTRIN_ATOMICCOMPAREEXCHANGE));
+    }
+
+    #[test]
+    fn t_map_dxil_intrinsic_id_wave() {
+        assert_eq!(map_dxil_intrinsic_id(190), Some(DXIL_INTRIN_WAVEACTIVE));
+        assert_eq!(map_dxil_intrinsic_id(193), Some(DXIL_INTRIN_WAVEGETLANEINDEX));
+        assert_eq!(map_dxil_intrinsic_id(198), Some(DXIL_INTRIN_WAVEBALLOT));
+        assert_eq!(map_dxil_intrinsic_id(210), Some(DXIL_INTRIN_WAVEMULTIPREFIXSUM));
+    }
+
+    #[test]
+    fn t_map_dxil_intrinsic_id_tessellation() {
+        assert_eq!(map_dxil_intrinsic_id(230), Some(DXIL_INTRIN_PROCESS2DQUADTESSSFACTORSAVG));
+        assert_eq!(map_dxil_intrinsic_id(235), Some(DXIL_INTRIN_PROCESS2DTRIANGLEFACTORSMIN));
+    }
+
+    #[test]
+    fn t_map_dxil_intrinsic_id_geometry() {
+        assert_eq!(map_dxil_intrinsic_id(240), Some(DXIL_INTRIN_EMITSTREAM));
+        assert_eq!(map_dxil_intrinsic_id(242), Some(DXIL_INTRIN_EMITTHENCUTSTREAM));
+    }
+
+    #[test]
+    fn t_map_dxil_intrinsic_id_create_handle() {
+        assert_eq!(map_dxil_intrinsic_id(253), Some(DXIL_INTRIN_CREATEHANDLE));
+        assert_eq!(map_dxil_intrinsic_id(254), Some(DXIL_INTRIN_CREATEHANDLEFORBINDING));
+    }
+
+    #[test]
+    fn t_map_dxil_intrinsic_id_unknown() {
+        assert_eq!(map_dxil_intrinsic_id(0), None);
+        assert_eq!(map_dxil_intrinsic_id(999), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Quad read/write tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn t_dxil_opcode_quad_read() {
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_QUADREAD, "_r",
+            &["val".to_string(), "lane".to_string()], false, false);
+        assert!(stmt.contains("quad_broadcast(val, lane)"));
+    }
+
+    #[test]
+    fn t_dxil_opcode_quad_write() {
+        // QuadWrite requires 3+ args to reach the quad_vote emulation
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_QUADWRITE, "_r",
+            &["val".to_string(), "lane".to_string(), "mask".to_string()], false, false);
+        assert!(stmt.contains("quad_vote"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Group/device memory barrier tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn t_dxil_opcode_group_memory_barrier() {
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_GROUPMEMORYBARRIER, "", &[], false, false);
+        assert!(stmt.contains("threadgroup_barrier(mem_flags::mem_threadgroup)"));
+    }
+
+    #[test]
+    fn t_dxil_opcode_device_memory_barrier() {
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_DEVICEMEMORYBARRIER, "", &[], false, false);
+        assert!(stmt.contains("threadgroup_barrier(mem_flags::mem_device)"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Derivative coarse/fine tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn t_dxil_opcode_derivative_coarse() {
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_DERIVATIVE_COARSE, "_r", &["v".to_string()], false, true);
+        assert!(stmt.contains("dfdx_coarse(v)"));
+    }
+
+    #[test]
+    fn t_dxil_opcode_derivative_fine() {
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_DERIVATIVE_FINE, "_r", &["v".to_string()], false, true);
+        assert!(stmt.contains("dfdx_fine(v)"));
+    }
+
+    // -----------------------------------------------------------------------
+    // LLVM opcodes 49-52 tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn t_dxil_opcode_extractelement() {
+        let stmt = dxil_opcode_to_msl(49, "_r", &["vec".to_string(), "3".to_string()], false, false);
+        assert!(stmt.contains("_r = vec[3]"));
+        // Test fallback when args are missing
+        let fallback = dxil_opcode_to_msl(49, "_r", &[], false, false);
+        assert!(fallback.contains("extractelement (no args)"));
+    }
+
+    #[test]
+    fn t_dxil_opcode_insertelement() {
+        let stmt = dxil_opcode_to_msl(50, "_r", &["vec".to_string(), "2".to_string(), "val".to_string()], false, false);
+        assert!(stmt.contains("_r = vec;"));
+        assert!(stmt.contains("vec[2] = val;"));
+        assert!(stmt.contains("insertelement"));
+        // Test fallback when args are missing
+        let fallback = dxil_opcode_to_msl(50, "_r", &[], false, false);
+        assert!(fallback.contains("insertelement (no args)"));
+    }
+
+    #[test]
+    fn t_dxil_opcode_shufflevector() {
+        let stmt = dxil_opcode_to_msl(51, "_r", &["a".to_string(), "b".to_string(), "2".to_string()], false, false);
+        assert!(stmt.contains("shufflevector(a, b)"));
+        // Test fallback when args are missing
+        let fallback = dxil_opcode_to_msl(51, "_r", &[], false, false);
+        assert!(fallback.contains("shufflevector"));
+    }
+
+    #[test]
+    fn t_dxil_opcode_unreachable() {
+        let stmt = dxil_opcode_to_msl(52, "", &[], false, false);
+        assert_eq!(stmt, "// unreachable");
+    }
+
+    // -----------------------------------------------------------------------
+    // CreateHandle / CreateHandleForBinding with dynamic indexing
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn t_dxil_opcode_create_handle_dynamic() {
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_CREATEHANDLE, "_r",
+            &["0".to_string(), "1".to_string(), "idx".to_string()], false, false);
+        assert!(stmt.contains("_res_array_0[idx]"));
+        assert!(stmt.contains("CreateHandle(resClass=0, rangeId=1, index=idx)"));
+    }
+
+    #[test]
+    fn t_dxil_opcode_create_handle_for_binding_dynamic() {
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_CREATEHANDLEFORBINDING, "_r",
+            &["1".to_string(), "2".to_string(), "nonconst".to_string(), "1".to_string()], false, false);
+        assert!(stmt.contains("_res_array_1[nonconst]"));
+        assert!(stmt.contains("CreateHandleForBinding(resClass=1, rangeId=2"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Barrier GroupSync flag differentiation tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn t_dxil_opcode_barrier_sync_no_memory() {
+        // GroupSync only (flag=0x01): should produce threadgroup_barrier (has sync)
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_BARRIER, "", &["1".to_string()], false, false);
+        assert!(stmt.starts_with("threadgroup_barrier("));
+        assert!(stmt.contains("mem_flags::mem_threadgroup | mem_flags::mem_device"));
+    }
+
+    #[test]
+    fn t_dxil_opcode_barrier_no_sync_both_memory() {
+        // Both GroupShared + UAV but NO GroupSync (flag=0x0C = 12):
+        // should produce memory_barrier (no thread sync)
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_BARRIER, "", &["12".to_string()], false, false);
+        assert!(stmt.starts_with("memory_barrier("));
+        assert!(stmt.contains("mem_flags::mem_threadgroup | mem_flags::mem_device"));
+    }
+
+    #[test]
+    fn t_dxil_opcode_barrier_sync_groupshared() {
+        // GroupSync + GroupShared (flag=0x05): threadgroup_barrier with GS-only
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_BARRIER, "", &["5".to_string()], false, false);
+        assert!(stmt.starts_with("threadgroup_barrier("));
+        assert!(stmt.contains("mem_flags::mem_threadgroup"));
+        assert!(!stmt.contains("mem_device"));
+    }
+
+    #[test]
+    fn t_dxil_opcode_barrier_sync_uav() {
+        // GroupSync + UAV (flag=0x09): threadgroup_barrier with UAV-only
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_BARRIER, "", &["9".to_string()], false, false);
+        assert!(stmt.starts_with("threadgroup_barrier("));
+        assert!(stmt.contains("mem_flags::mem_device"));
+        assert!(!stmt.contains("mem_threadgroup"));
+    }
+
+    #[test]
+    fn t_dxil_opcode_barrier_no_sync_groupshared() {
+        // GroupShared only, no sync (flag=0x04): memory_barrier with GS-only
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_BARRIER, "", &["4".to_string()], false, false);
+        assert!(stmt.starts_with("memory_barrier("));
+        assert!(stmt.contains("mem_flags::mem_threadgroup"));
+        assert!(!stmt.contains("mem_device"));
+    }
+
+    #[test]
+    fn t_dxil_opcode_barrier_no_sync_uav() {
+        // UAV only, no sync (flag=0x08): memory_barrier with UAV-only
+        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_BARRIER, "", &["8".to_string()], false, false);
+        assert!(stmt.starts_with("memory_barrier("));
+        assert!(stmt.contains("mem_flags::mem_device"));
+        assert!(!stmt.contains("mem_threadgroup"));
     }
 }

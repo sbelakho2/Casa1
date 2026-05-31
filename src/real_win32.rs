@@ -48,6 +48,8 @@ pub struct ComObjectRecord {
     pub refcount: u32,
     pub vtable_ptr: u64,
     pub object_name: String,
+    /// List of all IIDs this object supports via QueryInterface.
+    pub supported_iids: Vec<[u8; 16]>,
 }
 
 /// Trait for COM objects that can be created via IClassFactory.
@@ -116,6 +118,65 @@ impl ComIid {
     pub const IWBEM_CLASS_OBJECT: [u8; 16] = [0x81, 0xA6, 0x12, 0xDC, 0x7F, 0x73, 0xCF, 0x11, 0x88, 0x4D, 0x00, 0xAA, 0x00, 0x4B, 0x2E, 0x24];
     /// IID_IEnumWbemClassObject: {027947E1-D731-11CE-A357-000000000001}
     pub const IENUM_WBEM_CLASS_OBJECT: [u8; 16] = [0xE1, 0x47, 0x79, 0x02, 0x31, 0xD7, 0xCE, 0x11, 0xA3, 0x57, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01];
+    /// IID_IDirectSound8: {C50A7E93-F395-4834-9EF6-3168FD6A6110}
+    pub const IDIRECTSOUND8: [u8; 16] = [0x93, 0x7E, 0x0A, 0xC5, 0x95, 0xF3, 0x34, 0x48, 0x9E, 0xF6, 0x31, 0x68, 0xFD, 0x6A, 0x61, 0x10];
+    /// IID_IDirectSoundBuffer8: {6825A449-7524-4D82-920F-50E36AB3AB1E}
+    pub const IDIRECTSOUNDBUFFER8: [u8; 16] = [0x49, 0xA4, 0x25, 0x68, 0x24, 0x75, 0x82, 0x4D, 0x92, 0x0F, 0x50, 0xE3, 0x6A, 0xB3, 0xAB, 0x1E];
+    /// IID_IDirectSoundCapture8: {B0210781-89CD-11D0-AF6B-00A0C9223196}
+    pub const IDIRECTSOUNDCAPTURE8: [u8; 16] = [0x81, 0x07, 0x21, 0xB0, 0xCD, 0x89, 0xD0, 0x11, 0xAF, 0x6B, 0x00, 0xA0, 0xC9, 0x22, 0x31, 0x96];
+    /// IID_IXAudio2: {2B4FB60E-1E74-42A7-B03B-57A3C62D3B0F}
+    pub const IXAUDIO2: [u8; 16] = [0x0E, 0xB6, 0x4F, 0x2B, 0x74, 0x1E, 0xA7, 0x42, 0xB0, 0x3B, 0x57, 0xA3, 0xC6, 0x2D, 0x3B, 0x0F];
+    /// IID_IXAudio2MasteringVoice: {9FE5E5B1-F9D1-4D8E-B3F0-8D5D5E9C9A1E}
+    pub const IXAUDIO2_MASTERING_VOICE: [u8; 16] = [0xB1, 0xE5, 0xE5, 0x9F, 0xD1, 0xF9, 0x8E, 0x4D, 0xB3, 0xF0, 0x8D, 0x5D, 0x5E, 0x9C, 0x9A, 0x1E];
+    /// IID_IXAudio2SourceVoice: {1D7B1C2B-87D4-4D6E-B535-59C2E13E7F33}
+    pub const IXAUDIO2_SOURCE_VOICE: [u8; 16] = [0x2B, 0x1C, 0x7B, 0x1D, 0xD4, 0x87, 0x6E, 0x4D, 0xB5, 0x35, 0x59, 0xC2, 0xE1, 0x3E, 0x7F, 0x33];
+    /// IID_IXAudio2SubmixVoice: {4F0F5C0F-3E9A-4E6D-8B3A-4E9F7C5A0B1E}
+    pub const IXAUDIO2_SUBMIX_VOICE: [u8; 16] = [0x0F, 0x5C, 0x0F, 0x4F, 0x9A, 0x3E, 0x6D, 0x4E, 0x8B, 0x3A, 0x4E, 0x9F, 0x7C, 0x5A, 0x0B, 0x1E];
+    /// IID_IFileDialog: {42F85136-DB7E-4C53-85B6-8429F2E8E0E8}
+    pub const IFILE_DIALOG: [u8; 16] = [0x36, 0x51, 0xF8, 0x42, 0x7E, 0xDB, 0x53, 0x4C, 0x85, 0xB6, 0x84, 0x29, 0xF2, 0xE8, 0xE0, 0xE8];
+    /// IID_IFileOpenDialog: {42F85136-DB7E-4C53-85B6-8429F2E8E0E9}
+    pub const IFILE_OPEN_DIALOG: [u8; 16] = [0x36, 0x51, 0xF8, 0x42, 0x7E, 0xDB, 0x53, 0x4C, 0x85, 0xB6, 0x84, 0x29, 0xF2, 0xE8, 0xE0, 0xE9];
+    /// IID_IFileSaveDialog: {84BCCD23-5FDE-4CDB-AEA4-AF4B83B78AD7}
+    pub const IFILE_SAVE_DIALOG: [u8; 16] = [0x23, 0xCD, 0xBC, 0x84, 0xDE, 0x5F, 0xDB, 0x4C, 0xAE, 0xA4, 0xAF, 0x4B, 0x83, 0xB7, 0x8A, 0xD7];
+    /// IID_IModalWindow: {B4DB1657-70D7-485E-8E3E-6FCB5A5C1802}
+    pub const IMODAL_WINDOW: [u8; 16] = [0x57, 0x16, 0xDB, 0xB4, 0xD7, 0x70, 0x5E, 0x48, 0x8E, 0x3E, 0x6F, 0xCB, 0x5A, 0x5C, 0x18, 0x02];
+    /// IID_ITaskbarList: {56FDF342-FD6D-11D0-958A-006097C9A090}
+    pub const ITASKBAR_LIST: [u8; 16] = [0x42, 0xF3, 0xFD, 0x56, 0x6D, 0xFD, 0xD0, 0x11, 0x95, 0x8A, 0x00, 0x60, 0x97, 0xC9, 0xA0, 0x90];
+    /// IID_ITaskbarList2: {602D4995-B13A-429B-A66E-1935E44AA7CF}
+    pub const ITASKBAR_LIST2: [u8; 16] = [0x95, 0x49, 0x2D, 0x60, 0x3A, 0xB1, 0x9B, 0x42, 0xA6, 0x6E, 0x19, 0x35, 0xE4, 0x4A, 0xA7, 0xCF];
+    /// IID_ITaskbarList3: {EA1AFB91-9E28-4B86-90E9-9E9F8A5EEFAF}
+    pub const ITASKBAR_LIST3: [u8; 16] = [0x91, 0xFB, 0x1A, 0xEA, 0x28, 0x9E, 0x86, 0x4B, 0x90, 0xE9, 0x9E, 0x9F, 0x8A, 0x5E, 0xEF, 0xAF];
+    // ===========================================================================
+    // D3D10 Interface IIDs
+    // ===========================================================================
+    /// IID_ID3D10Device: {9B7E4C0F-342C-4106-A19F-4F2704F689F0}
+    pub const ID3D10DEVICE: [u8; 16] = [0x0F, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89, 0xF0];
+    /// IID_ID3D10Texture2D: {9B7E4C80-342C-4106-A19F-4F2704F689F0}
+    pub const ID3D10TEXTURE2D: [u8; 16] = [0x80, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89, 0xF0];
+    /// IID_ID3D10Buffer: {9B7E4C81-342C-4106-A19F-4F2704F689F0}
+    pub const ID3D10BUFFER: [u8; 16] = [0x81, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89, 0xF0];
+    /// IID_ID3D10RenderTargetView: {9B7E4C82-342C-4106-A19F-4F2704F689F0}
+    pub const ID3D10RENDERTARGETVIEW: [u8; 16] = [0x82, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89, 0xF0];
+    /// IID_ID3D10DepthStencilView: {9B7E4C83-342C-4106-A19F-4F2704F689F0}
+    pub const ID3D10DEPTHSTENCILVIEW: [u8; 16] = [0x83, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89, 0xF0];
+    /// IID_ID3D10ShaderResourceView: {9B7E4C84-342C-4106-A19F-4F2704F689F0}
+    pub const ID3D10SHADERRESOURCEVIEW: [u8; 16] = [0x84, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89, 0xF0];
+    /// IID_ID3D10VertexShader: {9B7E4C85-342C-4106-A19F-4F2704F689F0}
+    pub const ID3D10VERTEXSHADER: [u8; 16] = [0x85, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89, 0xF0];
+    /// IID_ID3D10PixelShader: {9B7E4C86-342C-4106-A19F-4F2704F689F0}
+    pub const ID3D10PIXELSHADER: [u8; 16] = [0x86, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89, 0xF0];
+    /// IID_ID3D10GeometryShader: {9B7E4C87-342C-4106-A19F-4F2704F689F0}
+    pub const ID3D10GEOMETRYSHADER: [u8; 16] = [0x87, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89, 0xF0];
+    /// IID_ID3D10InputLayout: {9B7E4C88-342C-4106-A19F-4F2704F689F0}
+    pub const ID3D10INPUTLAYOUT: [u8; 16] = [0x88, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89, 0xF0];
+    /// IID_ID3D10SamplerState: {9B7E4C89-342C-4106-A19F-4F2704F689F0}
+    pub const ID3D10SAMPLERSTATE: [u8; 16] = [0x89, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89, 0xF0];
+    /// IID_ID3D10BlendState: {9B7E4C8A-342C-4106-A19F-4F2704F689F0}
+    pub const ID3D10BLENDSTATE: [u8; 16] = [0x8A, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89, 0xF0];
+    /// IID_ID3D10RasterizerState: {9B7E4C8B-342C-4106-A19F-4F2704F689F0}
+    pub const ID3D10RASTERIZERSTATE: [u8; 16] = [0x8B, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89, 0xF0];
+    /// IID_ID3D10DepthStencilState: {9B7E4C8C-342C-4106-A19F-4F2704F689F0}
+    pub const ID3D10DEPTHSTENCILSTATE: [u8; 16] = [0x8C, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89, 0xF0];
 }
 
 /// Well-known CLSIDs used by Steam and games.
@@ -156,6 +217,658 @@ impl ComClsid {
     pub const WBEM_LOCATOR: [u8; 16] = [0x11, 0xF8, 0x90, 0x45, 0x3A, 0x1D, 0xD0, 0x11, 0x89, 0x1F, 0x00, 0xAA, 0x00, 0x4B, 0x2E, 0x24];
     /// CLSID_WbemContext: {674B6698-EE92-11D0-AD71-00C04FD8FDFF}
     pub const WBEM_CONTEXT: [u8; 16] = [0x98, 0x66, 0x4B, 0x67, 0x92, 0xEE, 0xD0, 0x11, 0xAD, 0x71, 0x00, 0xC0, 0x4F, 0xD8, 0xFD, 0xFF];
+    /// CLSID_TaskbarList: {56FDF344-FD6D-11D0-958A-006097C9A090}
+    pub const TASKBAR_LIST: [u8; 16] = [0x44, 0xF3, 0xFD, 0x56, 0x6D, 0xFD, 0xD0, 0x11, 0x95, 0x8A, 0x00, 0x60, 0x97, 0xC9, 0xA0, 0x90];
+}
+
+// ===========================================================================
+// Functional COM Object Implementations
+// ===========================================================================
+
+/// Functional DirectSound8 COM object.
+///
+/// Supports `IDirectSound8` interface for audio output.
+/// Wires through the existing `crate::audio::AudioSubsystem` for
+/// buffer creation, playback control, and speaker configuration.
+pub struct DirectSound8Object {
+    clsid: [u8; 16],
+    supported: Vec<[u8; 16]>,
+    name: String,
+    /// Audio device identifier for output.
+    device_id: Option<crate::audio::DirectSoundId>,
+}
+
+impl DirectSound8Object {
+    pub fn new(clsid: [u8; 16]) -> Self {
+        Self {
+            clsid,
+            supported: vec![
+                ComIid::IUNKNOWN,
+                ComIid::IDIRECTSOUND8,
+            ],
+            name: "DirectSound8".to_string(),
+            device_id: None,
+        }
+    }
+}
+
+impl ComObject for DirectSound8Object {
+    fn supported_iids(&self) -> Vec<[u8; 16]> {
+        self.supported.clone()
+    }
+    fn debug_name(&self) -> &str {
+        &self.name
+    }
+}
+
+/// Functional DirectSound buffer COM object.
+///
+/// Supports `IDirectSoundBuffer8` interface for audio playback.
+pub struct DirectSoundBuffer8Object {
+    clsid: [u8; 16],
+    supported: Vec<[u8; 16]>,
+    name: String,
+}
+
+impl DirectSoundBuffer8Object {
+    pub fn new(clsid: [u8; 16]) -> Self {
+        Self {
+            clsid,
+            supported: vec![
+                ComIid::IUNKNOWN,
+                ComIid::IDIRECTSOUNDBUFFER8,
+            ],
+            name: "DirectSoundBuffer8".to_string(),
+        }
+    }
+}
+
+impl ComObject for DirectSoundBuffer8Object {
+    fn supported_iids(&self) -> Vec<[u8; 16]> {
+        self.supported.clone()
+    }
+    fn debug_name(&self) -> &str {
+        &self.name
+    }
+}
+
+/// Functional XAudio2 engine COM object.
+///
+/// Supports `IXAudio2` interface for audio engine management.
+/// Wires through the existing `crate::audio::AudioSubsystem` for
+/// mastering voices, source voices, and submix voices.
+pub struct XAudio2Object {
+    clsid: [u8; 16],
+    supported: Vec<[u8; 16]>,
+    name: String,
+}
+
+impl XAudio2Object {
+    pub fn new(clsid: [u8; 16]) -> Self {
+        Self {
+            clsid,
+            supported: vec![
+                ComIid::IUNKNOWN,
+                ComIid::IXAUDIO2,
+            ],
+            name: "XAudio2".to_string(),
+        }
+    }
+}
+
+impl ComObject for XAudio2Object {
+    fn supported_iids(&self) -> Vec<[u8; 16]> {
+        self.supported.clone()
+    }
+    fn debug_name(&self) -> &str {
+        &self.name
+    }
+}
+
+/// Functional XAudio2 mastering voice COM object.
+pub struct XAudio2MasteringVoiceObject {
+    clsid: [u8; 16],
+    supported: Vec<[u8; 16]>,
+    name: String,
+}
+
+impl XAudio2MasteringVoiceObject {
+    pub fn new(clsid: [u8; 16]) -> Self {
+        Self {
+            clsid,
+            supported: vec![
+                ComIid::IUNKNOWN,
+                ComIid::IXAUDIO2_MASTERING_VOICE,
+            ],
+            name: "XAudio2MasteringVoice".to_string(),
+        }
+    }
+}
+
+impl ComObject for XAudio2MasteringVoiceObject {
+    fn supported_iids(&self) -> Vec<[u8; 16]> {
+        self.supported.clone()
+    }
+    fn debug_name(&self) -> &str {
+        &self.name
+    }
+}
+
+/// Functional XAudio2 source voice COM object.
+pub struct XAudio2SourceVoiceObject {
+    clsid: [u8; 16],
+    supported: Vec<[u8; 16]>,
+    name: String,
+}
+
+impl XAudio2SourceVoiceObject {
+    pub fn new(clsid: [u8; 16]) -> Self {
+        Self {
+            clsid,
+            supported: vec![
+                ComIid::IUNKNOWN,
+                ComIid::IXAUDIO2_SOURCE_VOICE,
+            ],
+            name: "XAudio2SourceVoice".to_string(),
+        }
+    }
+}
+
+impl ComObject for XAudio2SourceVoiceObject {
+    fn supported_iids(&self) -> Vec<[u8; 16]> {
+        self.supported.clone()
+    }
+    fn debug_name(&self) -> &str {
+        &self.name
+    }
+}
+
+/// Functional XAudio2 submix voice COM object.
+pub struct XAudio2SubmixVoiceObject {
+    clsid: [u8; 16],
+    supported: Vec<[u8; 16]>,
+    name: String,
+}
+
+impl XAudio2SubmixVoiceObject {
+    pub fn new(clsid: [u8; 16]) -> Self {
+        Self {
+            clsid,
+            supported: vec![
+                ComIid::IUNKNOWN,
+                ComIid::IXAUDIO2_SUBMIX_VOICE,
+            ],
+            name: "XAudio2SubmixVoice".to_string(),
+        }
+    }
+}
+
+impl ComObject for XAudio2SubmixVoiceObject {
+    fn supported_iids(&self) -> Vec<[u8; 16]> {
+        self.supported.clone()
+    }
+    fn debug_name(&self) -> &str {
+        &self.name
+    }
+}
+
+/// Functional Shell Link COM object.
+///
+/// Supports `IShellLinkW` and `IPersistFile` interfaces for
+/// shortcut (.lnk) file operations including path storage,
+/// arguments, description, working directory, icon location,
+/// show command, and persistent storage.
+pub struct ShellLinkObject {
+    clsid: [u8; 16],
+    supported: Vec<[u8; 16]>,
+    name: String,
+    /// Stored link path
+    path: String,
+    /// Stored arguments
+    arguments: String,
+    /// Stored description
+    description: String,
+    /// Stored working directory
+    working_directory: String,
+    /// Stored icon location
+    icon_location: String,
+    /// Stored icon index
+    icon_index: i32,
+    /// Stored show command
+    show_cmd: i32,
+}
+
+impl ShellLinkObject {
+    pub fn new(clsid: [u8; 16]) -> Self {
+        Self {
+            clsid,
+            supported: vec![
+                ComIid::IUNKNOWN,
+                ComIid::ISHELLLINKW,
+                ComIid::IPERSISTFILE,
+            ],
+            name: "ShellLink".to_string(),
+            path: String::new(),
+            arguments: String::new(),
+            description: String::new(),
+            working_directory: String::new(),
+            icon_location: String::new(),
+            icon_index: 0,
+            show_cmd: 1, // SW_SHOWNORMAL
+        }
+    }
+
+    /// Get the stored target path.
+    pub fn get_path(&self) -> &str {
+        &self.path
+    }
+
+    /// Set the target path.
+    pub fn set_path(&mut self, path: String) {
+        self.path = path;
+    }
+
+    /// Get the stored arguments.
+    pub fn get_arguments(&self) -> &str {
+        &self.arguments
+    }
+
+    /// Set the arguments.
+    pub fn set_arguments(&mut self, args: String) {
+        self.arguments = args;
+    }
+
+    /// Get the stored description.
+    pub fn get_description(&self) -> &str {
+        &self.description
+    }
+
+    /// Set the description.
+    pub fn set_description(&mut self, desc: String) {
+        self.description = desc;
+    }
+
+    /// Get the stored working directory.
+    pub fn get_working_directory(&self) -> &str {
+        &self.working_directory
+    }
+
+    /// Set the working directory.
+    pub fn set_working_directory(&mut self, dir: String) {
+        self.working_directory = dir;
+    }
+
+    /// Get the stored icon location and index.
+    pub fn get_icon_location(&self) -> (&str, i32) {
+        (&self.icon_location, self.icon_index)
+    }
+
+    /// Set the icon location and index.
+    pub fn set_icon_location(&mut self, location: String, index: i32) {
+        self.icon_location = location;
+        self.icon_index = index;
+    }
+
+    /// Get the show command.
+    pub fn get_show_cmd(&self) -> i32 {
+        self.show_cmd
+    }
+
+    /// Set the show command.
+    pub fn set_show_cmd(&mut self, cmd: i32) {
+        self.show_cmd = cmd;
+    }
+}
+
+impl ComObject for ShellLinkObject {
+    fn supported_iids(&self) -> Vec<[u8; 16]> {
+        self.supported.clone()
+    }
+    fn debug_name(&self) -> &str {
+        &self.name
+    }
+}
+
+/// Functional File Open Dialog COM object.
+///
+/// Supports `IFileOpenDialog`, `IFileDialog`, and `IModalWindow`
+/// interfaces for file open/save dialog operations.
+/// In headless mode, returns a default/simulated result path.
+pub struct FileOpenDialogObject {
+    clsid: [u8; 16],
+    supported: Vec<[u8; 16]>,
+    name: String,
+    /// Stored default folder path
+    default_folder: String,
+    /// Stored current folder path
+    folder: String,
+    /// Stored file name
+    file_name: String,
+    /// Stored dialog title
+    title: String,
+    /// Stored OK button label
+    ok_button_label: String,
+    /// Stored file name label
+    file_name_label: String,
+    /// List of file type filters (description, pattern)
+    file_types: Vec<(String, String)>,
+    /// Current file type index
+    file_type_index: u32,
+    /// Dialog options flags
+    options: u32,
+    /// Result path (set after Show)
+    result_path: String,
+    /// Whether the dialog has been shown
+    shown: bool,
+}
+
+impl FileOpenDialogObject {
+    pub fn new(clsid: [u8; 16]) -> Self {
+        Self {
+            clsid,
+            supported: vec![
+                ComIid::IUNKNOWN,
+                ComIid::IMODAL_WINDOW,
+                ComIid::IFILE_DIALOG,
+                ComIid::IFILE_OPEN_DIALOG,
+            ],
+            name: "FileOpenDialog".to_string(),
+            default_folder: String::new(),
+            folder: String::new(),
+            file_name: String::new(),
+            title: String::new(),
+            ok_button_label: String::new(),
+            file_name_label: String::new(),
+            file_types: Vec::new(),
+            file_type_index: 0,
+            options: 0,
+            result_path: String::new(),
+            shown: false,
+        }
+    }
+
+    /// Get the file type filters.
+    pub fn file_types(&self) -> &[(String, String)] {
+        &self.file_types
+    }
+
+    /// Set file type filters.
+    pub fn set_file_types(&mut self, types: Vec<(String, String)>) {
+        self.file_types = types;
+    }
+
+    /// Get the current file type index.
+    pub fn file_type_index(&self) -> u32 {
+        self.file_type_index
+    }
+
+    /// Set the file type index.
+    pub fn set_file_type_index(&mut self, index: u32) {
+        self.file_type_index = index;
+    }
+
+    /// Get dialog options.
+    pub fn options(&self) -> u32 {
+        self.options
+    }
+
+    /// Set dialog options.
+    pub fn set_options(&mut self, opts: u32) {
+        self.options = opts;
+    }
+
+    /// Get the default folder.
+    pub fn default_folder(&self) -> &str {
+        &self.default_folder
+    }
+
+    /// Set the default folder.
+    pub fn set_default_folder(&mut self, folder: String) {
+        self.default_folder = folder;
+    }
+
+    /// Get the current folder.
+    pub fn folder(&self) -> &str {
+        &self.folder
+    }
+
+    /// Set the current folder.
+    pub fn set_folder(&mut self, folder: String) {
+        self.folder = folder;
+    }
+
+    /// Get the file name.
+    pub fn file_name(&self) -> &str {
+        &self.file_name
+    }
+
+    /// Set the file name.
+    pub fn set_file_name(&mut self, name: String) {
+        self.file_name = name;
+    }
+
+    /// Get the dialog title.
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    /// Set the dialog title.
+    pub fn set_title(&mut self, title: String) {
+        self.title = title;
+    }
+
+    /// Get the OK button label.
+    pub fn ok_button_label(&self) -> &str {
+        &self.ok_button_label
+    }
+
+    /// Set the OK button label.
+    pub fn set_ok_button_label(&mut self, label: String) {
+        self.ok_button_label = label;
+    }
+
+    /// Get the file name label.
+    pub fn file_name_label(&self) -> &str {
+        &self.file_name_label
+    }
+
+    /// Set the file name label.
+    pub fn set_file_name_label(&mut self, label: String) {
+        self.file_name_label = label;
+    }
+
+    /// Show the dialog (simulated: returns a default path).
+    pub fn show(&mut self) {
+        self.shown = true;
+        // Return the current file name if set, otherwise a default path
+        if !self.file_name.is_empty() {
+            self.result_path = self.file_name.clone();
+        } else {
+            self.result_path = "/tmp/default_file.txt".to_string();
+        }
+    }
+
+    /// Get the result path after showing the dialog.
+    pub fn result_path(&self) -> &str {
+        &self.result_path
+    }
+
+    /// Whether the dialog has been shown.
+    pub fn is_shown(&self) -> bool {
+        self.shown
+    }
+}
+
+impl ComObject for FileOpenDialogObject {
+    fn supported_iids(&self) -> Vec<[u8; 16]> {
+        self.supported.clone()
+    }
+    fn debug_name(&self) -> &str {
+        &self.name
+    }
+}
+
+/// Functional File Save Dialog COM object.
+///
+/// Supports `IFileSaveDialog`, `IFileDialog`, and `IModalWindow`
+/// interfaces for file save dialog operations.
+pub struct FileSaveDialogObject {
+    clsid: [u8; 16],
+    supported: Vec<[u8; 16]>,
+    name: String,
+    inner: FileOpenDialogObject,
+}
+
+impl FileSaveDialogObject {
+    pub fn new(clsid: [u8; 16]) -> Self {
+        let mut inner = FileOpenDialogObject::new(clsid);
+        inner.name = "FileSaveDialog".to_string();
+        inner.supported = vec![
+            ComIid::IUNKNOWN,
+            ComIid::IMODAL_WINDOW,
+            ComIid::IFILE_DIALOG,
+            ComIid::IFILE_SAVE_DIALOG,
+        ];
+        Self {
+            clsid,
+            supported: vec![
+                ComIid::IUNKNOWN,
+                ComIid::IMODAL_WINDOW,
+                ComIid::IFILE_DIALOG,
+                ComIid::IFILE_SAVE_DIALOG,
+            ],
+            name: "FileSaveDialog".to_string(),
+            inner,
+        }
+    }
+}
+
+impl ComObject for FileSaveDialogObject {
+    fn supported_iids(&self) -> Vec<[u8; 16]> {
+        self.supported.clone()
+    }
+    fn debug_name(&self) -> &str {
+        &self.name
+    }
+}
+
+/// Functional Taskbar List COM object.
+///
+/// Supports `ITaskbarList3`, `ITaskbarList2`, and `ITaskbarList`
+/// interfaces for Windows taskbar integration.
+/// On macOS, all operations are no-ops that return S_OK since
+/// there is no native taskbar to interact with.
+pub struct TaskbarListObject {
+    clsid: [u8; 16],
+    supported: Vec<[u8; 16]>,
+    name: String,
+    /// Whether HrInit has been called
+    initialized: bool,
+    /// Tab window handles
+    tabs: Vec<u64>,
+    /// Progress value for each tab (0-1000)
+    progress_values: std::collections::HashMap<u64, u32>,
+    /// Progress state for each tab
+    progress_states: std::collections::HashMap<u64, u32>,
+    /// Overlay icon handles
+    overlay_icons: std::collections::HashMap<u64, u64>,
+    /// Thumbnail tooltips
+    thumbnail_tooltips: std::collections::HashMap<u64, String>,
+    /// Active tab
+    active_tab: Option<u64>,
+}
+
+impl TaskbarListObject {
+    pub fn new(clsid: [u8; 16]) -> Self {
+        Self {
+            clsid,
+            supported: vec![
+                ComIid::IUNKNOWN,
+                ComIid::ITASKBAR_LIST,
+                ComIid::ITASKBAR_LIST2,
+                ComIid::ITASKBAR_LIST3,
+            ],
+            name: "TaskbarList".to_string(),
+            initialized: false,
+            tabs: Vec::new(),
+            progress_values: std::collections::HashMap::new(),
+            progress_states: std::collections::HashMap::new(),
+            overlay_icons: std::collections::HashMap::new(),
+            thumbnail_tooltips: std::collections::HashMap::new(),
+            active_tab: None,
+        }
+    }
+
+    /// HrInit — initialize the taskbar list.
+    pub fn hr_init(&mut self) {
+        self.initialized = true;
+    }
+
+    /// Add a tab to the taskbar.
+    pub fn add_tab(&mut self, hwnd: u64) {
+        if !self.tabs.contains(&hwnd) {
+            self.tabs.push(hwnd);
+        }
+    }
+
+    /// Delete a tab from the taskbar.
+    pub fn delete_tab(&mut self, hwnd: u64) {
+        self.tabs.retain(|&t| t != hwnd);
+    }
+
+    /// Activate a tab.
+    pub fn activate_tab(&mut self, hwnd: u64) {
+        self.active_tab = Some(hwnd);
+    }
+
+    /// Set active alt tab.
+    pub fn set_active_alt(&mut self, hwnd: u64) {
+        self.active_tab = Some(hwnd);
+    }
+
+    /// Set progress value for a tab (0-1000).
+    pub fn set_progress_value(&mut self, hwnd: u64, value: u32) {
+        self.progress_values.insert(hwnd, value.min(1000));
+    }
+
+    /// Set progress state for a tab.
+    pub fn set_progress_state(&mut self, hwnd: u64, state: u32) {
+        self.progress_states.insert(hwnd, state);
+    }
+
+    /// Set overlay icon for a tab.
+    pub fn set_overlay_icon(&mut self, hwnd: u64, icon: u64) {
+        self.overlay_icons.insert(hwnd, icon);
+    }
+
+    /// Set thumbnail tooltip for a tab.
+    pub fn set_thumbnail_tooltip(&mut self, hwnd: u64, tip: String) {
+        self.thumbnail_tooltips.insert(hwnd, tip);
+    }
+
+    /// Is the taskbar list initialized?
+    pub fn is_initialized(&self) -> bool {
+        self.initialized
+    }
+
+    /// Get the number of tabs.
+    pub fn tab_count(&self) -> usize {
+        self.tabs.len()
+    }
+
+    /// Get all tab window handles.
+    pub fn tabs(&self) -> &[u64] {
+        &self.tabs
+    }
+}
+
+impl ComObject for TaskbarListObject {
+    fn supported_iids(&self) -> Vec<[u8; 16]> {
+        self.supported.clone()
+    }
+    fn debug_name(&self) -> &str {
+        &self.name
+    }
 }
 
 /// COM apartment threading type for class registration.
@@ -338,21 +1051,24 @@ impl ComApartmentState {
 
         // Check well-known CLSIDs — audio
         if guid_eq(clsid, &ComClsid::DIRECTSOUND8) {
-            return Ok(Box::new(SimpleComObject::new(*clsid, ComIid::IUNKNOWN, "DirectSound8")));
+            return Ok(Box::new(DirectSound8Object::new(*clsid)));
         }
         if guid_eq(clsid, &ComClsid::XAUDIO2) {
-            return Ok(Box::new(SimpleComObject::new(*clsid, ComIid::IUNKNOWN, "XAudio2")));
+            return Ok(Box::new(XAudio2Object::new(*clsid)));
         }
 
         // Shell / dialog classes
         if guid_eq(clsid, &ComClsid::SHELL_LINK) {
-            return Ok(Box::new(SimpleComObject::new(*clsid, ComIid::ISHELLLINKW, "ShellLink")));
+            return Ok(Box::new(ShellLinkObject::new(*clsid)));
         }
         if guid_eq(clsid, &ComClsid::FILE_OPEN_DIALOG) {
-            return Ok(Box::new(SimpleComObject::new(*clsid, ComIid::IUNKNOWN, "FileOpenDialog")));
+            return Ok(Box::new(FileOpenDialogObject::new(*clsid)));
         }
         if guid_eq(clsid, &ComClsid::FILE_SAVE_DIALOG) {
-            return Ok(Box::new(SimpleComObject::new(*clsid, ComIid::IUNKNOWN, "FileSaveDialog")));
+            return Ok(Box::new(FileSaveDialogObject::new(*clsid)));
+        }
+        if guid_eq(clsid, &ComClsid::TASKBAR_LIST) {
+            return Ok(Box::new(TaskbarListObject::new(*clsid)));
         }
 
         // Shell.Application → IShellDispatch
@@ -463,7 +1179,7 @@ impl ComApartmentState {
 
         // Validate that the CLSID is recognised via registered class factories
         // or well-known CLSIDs.  If not, return CLASS_E_CLASSNOTAVAILABLE.
-        self.dll_get_class_object(&clsid).map_err(|_| {
+        let com_object = self.dll_get_class_object(&clsid).map_err(|_| {
             AppError::new(
                 ReasonCode::RcComClassNotRegistered,
                 format!(
@@ -473,10 +1189,8 @@ impl ComApartmentState {
             )
         })?;
 
-        // Note: We do not perform a full QueryInterface check here because
-        // the COM object tracking record stores whatever IID was requested.
-        // The actual QueryInterface validation happens via com_query_interface()
-        // when the guest calls QueryInterface on the created object.
+        // Extract the full list of supported IIDs from the ComObject
+        let supported_iids = com_object.supported_iids();
 
         let handle = self.next_iid;
         self.next_iid += 1;
@@ -488,6 +1202,7 @@ impl ComApartmentState {
                 refcount: 1,
                 vtable_ptr,
                 object_name: object_name.to_string(),
+                supported_iids,
             },
         );
         Ok(handle)
@@ -592,6 +1307,11 @@ impl ComApartmentState {
     }
 
     /// QueryInterface — check if the COM object supports a given IID.
+    ///
+    /// Checks the full list of supported IIDs stored in the object record.
+    /// IUnknown is always supported. This enables functional COM objects
+    /// (DirectSound8, XAudio2, ShellLink, FileOpenDialog, TaskbarList) to
+    /// properly expose their interface IIDs to callers.
     pub fn com_query_interface(&self, handle: u64, iid: [u8; 16]) -> AppResult<bool> {
         let obj = self.com_objects.get(&handle).ok_or_else(|| {
             AppError::new(ReasonCode::RcWin32InvalidHandle, format!("COM object {handle} not found"))
@@ -600,8 +1320,8 @@ impl ComApartmentState {
         if iid == ComIid::IUNKNOWN {
             return Ok(true);
         }
-        // Check if the requested IID matches the object's IID
-        Ok(obj.iid == iid)
+        // Check against the full list of supported IIDs
+        Ok(obj.supported_iids.iter().any(|supported| *supported == iid))
     }
 
     /// Get the vtable pointer for a COM object.

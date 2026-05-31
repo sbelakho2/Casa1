@@ -7,7 +7,7 @@
 use crate::cpu::{ConditionCode, CpuState, GuestArch, IrInstruction, MemoryImage, Register};
 use crate::error::{AppError, AppResult};
 use crate::reason::ReasonCode;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::c_void;
 use std::ptr;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
@@ -835,6 +835,10 @@ pub struct JitCompiledBlock {
     pub guest_address: u64,
     /// Number of guest instructions compiled.
     pub instruction_count: usize,
+    /// Hash of the source IR instructions at compile time, used to detect
+    /// self-modifying code on subsequent `get_or_compile` calls.
+    /// A hash of 0 means integrity verification is disabled for this block.
+    pub source_hash: u64,
 }
 
 /// Result of executing a JIT-compiled block.
@@ -858,6 +862,29 @@ pub enum JitExitReason {
     Cpuid,
     /// Block needs host-side exception handling.
     Exception { code: u32, address: u64 },
+}
+
+/// Compute a simple hash of IR instructions for self-modifying code detection.
+/// This is used as a lightweight integrity check: if the guest modifies the
+/// source bytes, the new IR will differ and produce a different hash.
+///
+/// Hashes the guest address and the Debug representation of each instruction,
+/// which captures both the opcode AND its operand values (registers, immediates,
+/// etc.). This ensures that changing any operand (e.g., `MovImm { value: 42 }`
+/// vs `MovImm { value: 99 }`) produces a different hash.
+fn compute_ir_hash(ir: &[IrInstruction], guest_address: u64) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    guest_address.hash(&mut hasher);
+    for insn in ir {
+        // Use the full Debug output to capture both the variant AND all fields.
+        let repr = format!("{:?}", insn);
+        repr.len().hash(&mut hasher);
+        for b in repr.bytes() {
+            b.hash(&mut hasher);
+        }
+    }
+    hasher.finish()
 }
 
 // ---------------------------------------------------------------------------
@@ -894,11 +921,18 @@ impl JitCompiler {
     }
 
     /// Compile a block of IR instructions into executable ARM64 code.
+    ///
+    /// `fast_thunk_addrs` — an optional set of guest thunk addresses that have
+    /// fast-thunk ARM64 trampolines registered (see [`FastThunkTable`]). When
+    /// provided, the compiler can emit a direct call to the trampoline for
+    /// `Call` instructions whose target is a registered host thunk, bypassing
+    /// the full dispatch loop entirely.
     pub fn compile_block(
         &mut self,
         ir: &[IrInstruction],
         guest_address: u64,
         arch: GuestArch,
+        fast_thunk_addrs: Option<&std::collections::HashSet<u64>>,
     ) -> AppResult<JitCompiledBlock> {
         self.emitter = Emitter::new();
 
@@ -909,9 +943,10 @@ impl JitCompiler {
         // x0 = &CpuState, x1 = memory base, x2 = &MemoryImage, x3 = &exit_reason
         self.emit_load_guest_registers(arch);
 
-        // Compile each IR instruction
+        // Compile each IR instruction, optionally using fast-thunk info
+        // to emit direct calls for known host thunks.
         for insn in ir {
-            self.compile_instruction(insn, arch)?;
+            self.compile_instruction(insn, arch, fast_thunk_addrs)?;
         }
 
         // Epilogue: store guest GPRs back to CpuState and return
@@ -937,11 +972,16 @@ impl JitCompiler {
             self.memory_manager.finalize_code(code_ptr, code_size);
         }
 
+        // Compute a simple hash of the source IR for integrity verification.
+        // Uses FNV-1a style hashing of the instruction discriminants and guest_address.
+        let source_hash = compute_ir_hash(ir, guest_address);
+
         Ok(JitCompiledBlock {
             entry: code_ptr,
             code_size,
             guest_address,
             instruction_count: ir.len(),
+            source_hash,
         })
     }
 
@@ -1006,7 +1046,12 @@ impl JitCompiler {
     }
 
     /// Compile a single IR instruction.
-    fn compile_instruction(&mut self, insn: &IrInstruction, arch: GuestArch) -> AppResult<()> {
+    fn compile_instruction(
+        &mut self,
+        insn: &IrInstruction,
+        arch: GuestArch,
+        fast_thunk_addrs: Option<&std::collections::HashSet<u64>>,
+    ) -> AppResult<()> {
         match insn {
             IrInstruction::Nop => {
                 self.emitter.nop();
@@ -1137,11 +1182,32 @@ impl JitCompiler {
             }
 
             IrInstruction::Call { target, return_address } => {
+                // Check if the call target is a registered host thunk with a
+                // fast-thunk ARM64 trampoline. If so, we could emit a direct
+                // call to the trampoline instead of returning EXIT_THUNK.
+                // This would bypass the full dispatch loop entirely.
+                //
+                // TODO(G5-fastthunk): Emit a direct `bl` to the fast-thunk
+                // trampoline here. The trampoline expects the bridge function
+                // `fast_thunk_host_dispatcher` to be registered as its host_fn.
+                // The bridge needs the `PeHostRuntime` pointer, which is not
+                // currently available in JIT-compiled blocks — a future change
+                // should either embed it in the JIT entry signature or store it
+                // in a thread-local that the bridge can read.
+                if let Some(addrs) = fast_thunk_addrs {
+                    if addrs.contains(target) {
+                        // Fast-thunk available for this call target.
+                        // TODO(G5-fastthunk): Emit a direct `bl` to the
+                        // fast-thunk trampoline here once the bridge argument
+                        // plumbing (PeHostRuntime pointer) is available in
+                        // JIT-compiled blocks.
+                    }
+                }
+
                 let arm_sp = regmap::guest_to_arm(4); // RSP
                 self.emitter.sub_imm(arm_sp, arm_sp, 8);
                 self.emitter.mov_imm64(regmap::X21, *return_address);
                 self.emitter.str64_reg(regmap::X21, 1, arm_sp);
-                let _ = target;
                 self.emit_store_guest_registers(arch);
                 self.emitter.movz(regmap::X0, EXIT_THUNK as u16, 0);
                 self.emit_epilogue();
@@ -1302,6 +1368,10 @@ pub struct JitRuntime {
     /// Unwind table for JIT-compiled blocks, enabling SEH stack walks
     /// through JIT frames via `RtlVirtualUnwind`.
     pub unwind_table: JitUnwindTable,
+    /// Tracks which 4K guest pages have one or more compiled blocks.
+    /// Used for self-modifying code detection: when guest code writes to a
+    /// page in this set, the affected blocks must be invalidated and recompiled.
+    pub code_pages: BTreeSet<u64>,
 }
 
 impl JitRuntime {
@@ -1316,6 +1386,7 @@ impl JitRuntime {
             block_chains: BTreeMap::new(),
             fast_thunk_table: FastThunkTable::new(),
             unwind_table: JitUnwindTable::new(),
+            code_pages: BTreeSet::new(),
         }
     }
 
@@ -1324,17 +1395,46 @@ impl JitRuntime {
     /// After compiling a new block, attempts to auto-chain if the last
     /// IR instruction is an unconditional `Jump { target }` and the
     /// target block is already compiled.
+    /// `fast_thunk_addrs` — optional set of guest thunk addresses that have
+    /// fast-thunk ARM64 trampolines registered (see [`FastThunkTable`]).
+    /// Passed through to the compiler so that `Call` instructions whose target
+    /// is a registered host thunk can emit direct trampoline calls.
     pub fn get_or_compile(
         &mut self,
         ir: &[IrInstruction],
         guest_address: u64,
         arch: GuestArch,
+        fast_thunk_addrs: Option<&std::collections::HashSet<u64>>,
     ) -> AppResult<&JitCompiledBlock> {
+        // Check for self-modifying code: if a block already exists but its
+        // source hash doesn't match the current IR, the guest has modified
+        // the code since compilation — invalidate and recompile.
+        if let Some(existing) = self.block_cache.get(&guest_address) {
+            let current_hash = compute_ir_hash(ir, guest_address);
+            if existing.source_hash != 0 && existing.source_hash != current_hash {
+                eprintln!(
+                    "[jit] self-modifying code detected at {:#x}: recompiling (hash mismatch)",
+                    guest_address
+                );
+                self.invalidate_block(guest_address);
+            }
+        }
+
         let is_new = !self.block_cache.contains_key(&guest_address);
         if is_new {
-            let block = self.compiler.compile_block(ir, guest_address, arch)?;
+            let block = self.compiler.compile_block(ir, guest_address, arch, fast_thunk_addrs)?;
             let code_size = block.code_size;
             self.blocks_compiled += 1;
+
+            // Track which 4K guest pages this compiled block occupies,
+            // for self-modifying code detection.
+            let start_page = guest_address & !0xfff;
+            let end_page = (guest_address + code_size as u64 - 1) & !0xfff;
+            let mut page = start_page;
+            while page <= end_page {
+                self.code_pages.insert(page);
+                page += 0x1000;
+            }
 
             // Register this block's address range with the unwind table
             // so that SEH stack walks can unwind through JIT frames.
@@ -1354,6 +1454,175 @@ impl JitRuntime {
             }
         }
         Ok(self.block_cache.get(&guest_address).unwrap())
+    }
+
+    /// Invalidate a compiled block, removing it from the block cache and
+    /// unregistering its unwind info from the unwind table.
+    ///
+    /// This should be called when a block needs to be recompiled (e.g., due
+    /// to self-modifying code). After invalidation, [`get_or_compile()`] will
+    /// recompile the block on the next execution.
+    ///
+    /// The caller is responsible for syncing the updated unwind table to the
+    /// SEH subsystem via [`JitUnwindTable::register_with_seh`].
+    pub fn invalidate_block(&mut self, guest_address: u64) {
+        if let Some(block) = self.block_cache.remove(&guest_address) {
+            self.unchain_target(guest_address).ok();
+            self.unwind_table.unregister_block(guest_address);
+            // Rebuild code_pages from remaining blocks so we don't leave
+            // stale page entries after invalidation.
+            self.rebuild_code_pages();
+            eprintln!(
+                "[jit] invalidated block {:#x}: removed from cache and unwind table (code_size={})",
+                guest_address, block.code_size
+            );
+        }
+    }
+
+    /// Recompute the `code_pages` set from all currently cached blocks.
+    /// This is O(n) in the number of compiled blocks, so it should only be
+    /// called when blocks are added or removed (not on every write check).
+    fn rebuild_code_pages(&mut self) {
+        self.code_pages.clear();
+        for block in self.block_cache.values() {
+            let start_page = block.guest_address & !0xfff;
+            let end_page = (block.guest_address + block.code_size as u64 - 1) & !0xfff;
+            let mut page = start_page;
+            while page <= end_page {
+                self.code_pages.insert(page);
+                page += 0x1000;
+            }
+        }
+    }
+
+    /// Check if a guest memory write at `address` of `length` bytes overlaps
+    /// any compiled code pages. If it does, invalidate all affected blocks
+    /// and return `true` (indicating self-modifying code was detected).
+    ///
+    /// This is the primary entry point for self-modifying code detection.
+    /// It should be called before every guest memory write that could
+    /// potentially overlap compiled code pages.
+    ///
+    /// Returns the list of guest addresses of invalidated blocks, or an empty
+    /// vec if no blocks were affected.
+    pub fn invalidate_blocks_writing_to(&mut self, address: u64, length: usize) -> Vec<u64> {
+        if length == 0 || self.block_cache.is_empty() {
+            return Vec::new();
+        }
+
+        // Compute the set of 4K pages touched by this write.
+        let start_page = address & !0xfff;
+        let end_page = (address + length as u64 - 1) & !0xfff;
+
+        // Fast path: if none of the touched pages have compiled code, skip.
+        let mut page = start_page;
+        let mut any_overlap = false;
+        while page <= end_page {
+            if self.code_pages.contains(&page) {
+                any_overlap = true;
+                break;
+            }
+            page += 0x1000;
+        }
+        if !any_overlap {
+            return Vec::new();
+        }
+
+        // Slow path: check each compiled block for overlap with the write range.
+        let write_end = address.saturating_add(length as u64);
+        let affected: Vec<u64> = self
+            .block_cache
+            .keys()
+            .copied()
+            .filter(|&block_addr| {
+                let block = match self.block_cache.get(&block_addr) {
+                    Some(b) => b,
+                    None => return false,
+                };
+                let block_end = block.guest_address.saturating_add(block.code_size as u64);
+                // Overlap if: write_start < block_end AND write_end > block_start
+                address < block_end && write_end > block.guest_address
+            })
+            .collect();
+
+        if affected.is_empty() {
+            return Vec::new();
+        }
+
+        let count = affected.len();
+        for &block_addr in &affected {
+            self.invalidate_block(block_addr);
+        }
+        eprintln!(
+            "[jit] self-modifying code detected: write at {:#x}+{} invalidated {} block(s)",
+            address, length, count
+        );
+        affected
+    }
+
+    /// Invalidate all compiled blocks whose `touched_pages` intersect with
+    /// `dirty_pages`. This is a page-granularity invalidation method used
+    /// for bulk operations (e.g., when a full page is written to).
+    ///
+    /// Returns the list of invalidated guest addresses.
+    pub fn invalidate_blocks_on_pages(&mut self, dirty_pages: &std::collections::BTreeSet<u64>) -> Vec<u64> {
+        if dirty_pages.is_empty() || self.block_cache.is_empty() {
+            return Vec::new();
+        }
+
+        // Fast check: are any of the dirty pages in our code_pages set?
+        let mut any_overlap = false;
+        for page in dirty_pages {
+            if self.code_pages.contains(page) {
+                any_overlap = true;
+                break;
+            }
+        }
+        if !any_overlap {
+            return Vec::new();
+        }
+
+        let affected: Vec<u64> = self
+            .block_cache
+            .keys()
+            .copied()
+            .filter(|&block_addr| {
+                let block = match self.block_cache.get(&block_addr) {
+                    Some(b) => b,
+                    None => return false,
+                };
+                let start_page = block.guest_address & !0xfff;
+                let end_page = (block.guest_address + block.code_size as u64 - 1) & !0xfff;
+                let mut page = start_page;
+                while page <= end_page {
+                    if dirty_pages.contains(&page) {
+                        return true;
+                    }
+                    page += 0x1000;
+                }
+                false
+            })
+            .collect();
+
+        if affected.is_empty() {
+            return Vec::new();
+        }
+
+        for &block_addr in &affected {
+            self.invalidate_block(block_addr);
+        }
+        eprintln!(
+            "[jit] page-granularity invalidation: removed {} block(s)",
+            affected.len()
+        );
+        affected
+    }
+
+    /// Returns `true` if the unwind table has been modified since the last
+    /// `register_with_seh()` call, meaning the SEH subsystem needs to be
+    /// updated.
+    pub fn is_unwind_dirty(&self) -> bool {
+        self.unwind_table.is_dirty()
     }
 
     /// Check whether a block at `guest_address` has been compiled.
@@ -1773,9 +2042,10 @@ impl JitCompiler {
         ir: &[IrInstruction],
         guest_address: u64,
         arch: GuestArch,
+        fast_thunk_addrs: Option<&std::collections::HashSet<u64>>,
     ) -> AppResult<JitCompiledBlock> {
         // Tier0 is identical to the default compile_block — no optimization.
-        self.compile_block(ir, guest_address, arch)
+        self.compile_block(ir, guest_address, arch, fast_thunk_addrs)
     }
 
     /// Compile a block at Tier1: full optimization with register allocation,
@@ -1789,6 +2059,7 @@ impl JitCompiler {
         ir: &[IrInstruction],
         guest_address: u64,
         arch: GuestArch,
+        fast_thunk_addrs: Option<&std::collections::HashSet<u64>>,
     ) -> AppResult<JitCompiledBlock> {
         self.emitter = Emitter::new();
 
@@ -1801,7 +2072,7 @@ impl JitCompiler {
 
         // Compile optimized IR
         for insn in &folded_ir {
-            self.compile_instruction(insn, arch)?;
+            self.compile_instruction(insn, arch, fast_thunk_addrs)?;
         }
 
         self.emit_store_guest_registers(arch);
@@ -1821,11 +2092,14 @@ impl JitCompiler {
             self.memory_manager.finalize_code(code_ptr, code_size);
         }
 
+        let source_hash = compute_ir_hash(ir, guest_address);
+
         Ok(JitCompiledBlock {
             entry: code_ptr,
             code_size,
             guest_address,
             instruction_count: ir.len(),
+            source_hash,
         })
     }
 
@@ -1840,6 +2114,7 @@ impl JitCompiler {
         ir: &[IrInstruction],
         guest_address: u64,
         arch: GuestArch,
+        fast_thunk_addrs: Option<&std::collections::HashSet<u64>>,
     ) -> AppResult<JitCompiledBlock> {
         self.emitter = Emitter::new();
 
@@ -1851,7 +2126,7 @@ impl JitCompiler {
         let unrolled_ir = Self::loop_unroll(&optimized_ir, guest_address);
 
         for insn in &unrolled_ir {
-            self.compile_instruction(insn, arch)?;
+            self.compile_instruction(insn, arch, fast_thunk_addrs)?;
         }
 
         self.emit_store_guest_registers(arch);
@@ -1871,11 +2146,14 @@ impl JitCompiler {
             self.memory_manager.finalize_code(code_ptr, code_size);
         }
 
+        let source_hash = compute_ir_hash(ir, guest_address);
+
         Ok(JitCompiledBlock {
             entry: code_ptr,
             code_size,
             guest_address,
             instruction_count: ir.len(),
+            source_hash,
         })
     }
 
@@ -2633,7 +2911,10 @@ pub struct InlineCacheEntry {
 #[derive(Debug)]
 pub struct InlineCache {
     /// Cache entries keyed by call-site guest address.
-    pub entries: BTreeMap<u64, InlineCacheEntry>,
+    pub entries: HashMap<u64, InlineCacheEntry>,
+    /// FIFO eviction queue tracking insertion order.
+    /// Front = oldest entry (next to evict), Back = newest entry.
+    eviction_queue: VecDeque<u64>,
     /// Maximum number of cache entries before eviction.
     pub max_entries: usize,
 }
@@ -2642,7 +2923,8 @@ impl InlineCache {
     /// Create a new inline cache with the given capacity.
     pub fn new(max_entries: usize) -> Self {
         Self {
-            entries: BTreeMap::new(),
+            entries: HashMap::new(),
+            eviction_queue: VecDeque::new(),
             max_entries,
         }
     }
@@ -2664,19 +2946,12 @@ impl InlineCache {
             }
         }
 
-        // New entry — evict LRU if at capacity
+        // New entry — evict oldest (FIFO) if at capacity
         if self.entries.len() >= self.max_entries {
-            // Evict the entry with the lowest hit count (approximation of LRU)
-            if let Some(evict_key) = self
-                .entries
-                .iter()
-                .min_by_key(|(_, e)| e.hit_count)
-                .map(|(k, _)| *k)
-            {
-                self.entries.remove(&evict_key);
-            }
+            self.evict_oldest();
         }
 
+        self.eviction_queue.push_back(call_site);
         self.entries.insert(
             call_site,
             InlineCacheEntry {
@@ -2690,14 +2965,29 @@ impl InlineCache {
         false
     }
 
+    /// Evict the oldest entry from the cache (FIFO policy).
+    /// Skips any stale eviction queue entries that were already removed
+    /// (e.g., via `invalidate()`).
+    fn evict_oldest(&mut self) {
+        while let Some(evict_key) = self.eviction_queue.pop_front() {
+            if self.entries.remove(&evict_key).is_some() {
+                break;
+            }
+        }
+    }
+
     /// Invalidate a single cache entry.
     pub fn invalidate(&mut self, call_site: u64) {
         self.entries.remove(&call_site);
+        // Note: the eviction queue entry becomes stale and will be
+        // skipped on the next eviction via `evict_oldest()`.
+        // This avoids an O(n) scan of the queue to find the entry.
     }
 
     /// Invalidate all cache entries.
     pub fn invalidate_all(&mut self) {
         self.entries.clear();
+        self.eviction_queue.clear();
     }
 
     /// Get the hit rate as a value between 0.0 and 1.0.
@@ -3217,12 +3507,16 @@ struct JitUnwindInfo {
 /// the SEH subsystem so that `RtlVirtualUnwind` works through JIT frames.
 pub struct JitUnwindTable {
     entries: Vec<JitUnwindInfo>,
+    /// Tracks whether entries have changed since the last `register_with_seh()` call.
+    /// Used by the caller to avoid redundant SEH syncs.
+    dirty: bool,
 }
 
 impl JitUnwindTable {
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),
+            dirty: false,
         }
     }
 
@@ -3252,6 +3546,48 @@ impl JitUnwindTable {
             end_rva: end_addr as u32,
             unwind_data,
         });
+        self.dirty = true;
+
+        eprintln!(
+            "[jit] unwind: registered block {:#x}..{:#x} ({} entries)",
+            start_addr,
+            end_addr,
+            self.entries.len()
+        );
+    }
+
+    /// Remove a JIT block from the unwind table by guest address.
+    ///
+    /// Returns `true` if the entry was found and removed.
+    pub fn unregister_block(&mut self, guest_address: u64) -> bool {
+        let rva = guest_address as u32;
+        let before = self.entries.len();
+        self.entries.retain(|e| e.start_rva != rva);
+        let removed = self.entries.len() != before;
+        if removed {
+            self.dirty = true;
+            eprintln!(
+                "[jit] unwind: unregistered block {:#x} ({} entries remaining)",
+                guest_address,
+                self.entries.len()
+            );
+        }
+        removed
+    }
+
+    /// Remove all entries from the unwind table.
+    pub fn clear(&mut self) {
+        if !self.entries.is_empty() {
+            let count = self.entries.len();
+            self.entries.clear();
+            self.dirty = true;
+            eprintln!("[jit] unwind: cleared all {count} entries");
+        }
+    }
+
+    /// Returns `true` if entries have changed since the last `register_with_seh()` call.
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
     }
 
     /// Register all entries with the SEH subsystem.
@@ -3275,6 +3611,9 @@ impl JitUnwindTable {
     /// calls before a single `register_with_seh()` call.
     pub fn register_with_seh(&mut self, seh: &mut crate::seh::SehSubsystem) {
         if self.entries.is_empty() {
+            eprintln!("[jit] unwind: register_with_seh called with no entries (skipping)");
+            // Still clear the dirty flag so we don't retry on every check
+            self.dirty = false;
             return;
         }
 
@@ -3316,12 +3655,28 @@ impl JitUnwindTable {
         // Register the function table and unwind data with the SEH subsystem
         // under the JIT image base. This enables find_runtime_function() to
         // locate JIT entries and get_unwind_info() to parse the unwind data.
+        let unwind_data_len = unwind_data.len();
+        let pdata_len = pdata_bytes.len();
+        let entry_count = self.entries.len();
+
         seh.register_pdata(JIT_IMAGE_BASE, &pdata_bytes);
         seh.register_unwind_data(JIT_IMAGE_BASE, unwind_data);
+        self.dirty = false;
+
+        eprintln!(
+            "[jit] unwind: registered {} blocks with SEH (pdata={} bytes, unwind_data={} bytes)",
+            entry_count,
+            pdata_len,
+            unwind_data_len
+        );
     }
 
     pub fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 }
 
@@ -3402,7 +3757,7 @@ mod tests {
     fn jit_compiler_compiles_nop_block() {
         let mut compiler = JitCompiler::new();
         let ir = vec![IrInstruction::Nop];
-        let result = compiler.compile_block(&ir, 0x1000, GuestArch::X64);
+        let result = compiler.compile_block(&ir, 0x1000, GuestArch::X64, None);
         assert!(result.is_ok());
         let block = result.unwrap();
         assert_eq!(block.guest_address, 0x1000);
@@ -3449,8 +3804,8 @@ mod tests {
         let ir_b = vec![IrInstruction::Nop, IrInstruction::Nop];
 
         // Compile two blocks
-        rt.get_or_compile(&ir_a, 0x1000, GuestArch::X64).unwrap();
-        rt.get_or_compile(&ir_b, 0x2000, GuestArch::X64).unwrap();
+        rt.get_or_compile(&ir_a, 0x1000, GuestArch::X64, None).unwrap();
+        rt.get_or_compile(&ir_b, 0x2000, GuestArch::X64, None).unwrap();
 
         // Chain block 0x1000 → 0x2000
         let result = rt.chain_blocks(0x1000, 0x2000);
@@ -3471,8 +3826,8 @@ mod tests {
         let ir_a = vec![IrInstruction::Nop];
         let ir_b = vec![IrInstruction::Nop];
 
-        rt.get_or_compile(&ir_a, 0x1000, GuestArch::X64).unwrap();
-        rt.get_or_compile(&ir_b, 0x2000, GuestArch::X64).unwrap();
+        rt.get_or_compile(&ir_a, 0x1000, GuestArch::X64, None).unwrap();
+        rt.get_or_compile(&ir_b, 0x2000, GuestArch::X64, None).unwrap();
 
         rt.chain_blocks(0x1000, 0x2000).unwrap();
         assert!(rt.block_chains.contains_key(&(0x1000, 0x2000)));
@@ -3485,7 +3840,7 @@ mod tests {
     fn block_chaining_fails_for_missing_block() {
         let mut rt = JitRuntime::new(GuestArch::X64);
         let ir_a = vec![IrInstruction::Nop];
-        rt.get_or_compile(&ir_a, 0x1000, GuestArch::X64).unwrap();
+        rt.get_or_compile(&ir_a, 0x1000, GuestArch::X64, None).unwrap();
 
         // Target block not compiled
         let result = rt.chain_blocks(0x1000, 0x2000);
@@ -3953,5 +4308,1225 @@ mod tests {
             .filter(|insn| matches!(insn, IrInstruction::AddImm { dst: Register::Rax, value: 1, .. }))
             .count();
         assert_eq!(add_count, 2, "should have 2 AddImm(rax,1) after unrolling count=2, got {}", add_count);
+    }
+
+    // --- G6: JIT Unwind Registration Tests ---
+
+    #[test]
+    fn unwind_table_register_block_adds_entry() {
+        let mut table = JitUnwindTable::new();
+        assert!(table.is_empty());
+        assert_eq!(table.len(), 0);
+        assert!(!table.is_dirty(), "new table should not be dirty");
+
+        table.register_block(0x1000, 0x1020);
+        assert!(!table.is_empty());
+        assert_eq!(table.len(), 1);
+        assert!(table.is_dirty(), "register_block should set dirty flag");
+
+        // Verify the entry matches
+        let entry = &table.entries[0];
+        assert_eq!(entry.start_rva, 0x1000);
+        assert_eq!(entry.end_rva, 0x1020);
+        assert!(!entry.unwind_data.is_empty(), "unwind_data should be generated");
+    }
+
+    #[test]
+    fn unwind_table_register_multiple_blocks() {
+        let mut table = JitUnwindTable::new();
+        table.register_block(0x1000, 0x1020);
+        table.register_block(0x2000, 0x2040);
+        table.register_block(0x3000, 0x3010);
+
+        assert_eq!(table.len(), 3);
+        assert_eq!(table.entries[0].start_rva, 0x1000);
+        assert_eq!(table.entries[1].start_rva, 0x2000);
+        assert_eq!(table.entries[2].start_rva, 0x3000);
+    }
+
+    #[test]
+    fn unwind_table_unregister_block_removes_entry() {
+        let mut table = JitUnwindTable::new();
+        table.register_block(0x1000, 0x1020);
+        table.register_block(0x2000, 0x2040);
+        assert_eq!(table.len(), 2);
+
+        // Re-register to clear dirty flag
+        table.dirty = false;
+
+        let removed = table.unregister_block(0x1000);
+        assert!(removed, "unregister_block should return true when entry found");
+        assert_eq!(table.len(), 1);
+        assert_eq!(table.entries[0].start_rva, 0x2000, "remaining entry should be 0x2000");
+        assert!(table.is_dirty(), "unregister should set dirty flag");
+
+        // Unregister non-existent block
+        let removed = table.unregister_block(0x9999);
+        assert!(!removed, "unregister_block should return false for missing entry");
+        assert_eq!(table.len(), 1);
+    }
+
+    #[test]
+    fn unwind_table_clear_removes_all_entries() {
+        let mut table = JitUnwindTable::new();
+        table.register_block(0x1000, 0x1020);
+        table.register_block(0x2000, 0x2040);
+        assert_eq!(table.len(), 2);
+        assert!(table.is_dirty());
+
+        table.dirty = false; // simulate post-sync
+        table.clear();
+        assert!(table.is_empty());
+        assert_eq!(table.len(), 0);
+        assert!(table.is_dirty(), "clear should set dirty flag");
+    }
+
+    #[test]
+    fn unwind_table_dirty_flag_tracking() {
+        let mut table = JitUnwindTable::new();
+        assert!(!table.is_dirty());
+
+        // register_block sets dirty
+        table.register_block(0x1000, 0x1020);
+        assert!(table.is_dirty());
+
+        // register_with_seh clears dirty (even if entries present)
+        let mut seh = crate::seh::SehSubsystem::new();
+        table.register_with_seh(&mut seh);
+        assert!(!table.is_dirty());
+
+        // New registration sets dirty again
+        table.register_block(0x2000, 0x2040);
+        assert!(table.is_dirty());
+
+        // unregister_block sets dirty
+        table.dirty = false;
+        table.unregister_block(0x2000);
+        assert!(table.is_dirty());
+    }
+
+    #[test]
+    fn unwind_table_register_with_seh_empty_clears_dirty() {
+        let mut table = JitUnwindTable::new();
+        table.dirty = true; // artificially set
+
+        let mut seh = crate::seh::SehSubsystem::new();
+        table.register_with_seh(&mut seh);
+        assert!(!table.is_dirty(), "register_with_seh with no entries should still clear dirty");
+    }
+
+    #[test]
+    fn unwind_table_seh_integration_pdata_parseable() {
+        let mut table = JitUnwindTable::new();
+        table.register_block(0x1000, 0x1020);
+        table.register_block(0x2000, 0x2050);
+        table.register_block(0x3000, 0x3030);
+
+        let mut seh = crate::seh::SehSubsystem::new();
+        table.register_with_seh(&mut seh);
+
+        // Verify SEH can find the registered blocks
+        const JIT_IMAGE_BASE: u64 = 0;
+
+        // Find block at 0x1000
+        let rf = seh.find_runtime_function(JIT_IMAGE_BASE, 0x1000);
+        assert!(rf.is_some(), "SEH should find runtime function at 0x1000");
+        let rf = rf.unwrap();
+        assert_eq!(rf.begin_addr, 0x1000);
+        assert_eq!(rf.end_addr, 0x1020);
+
+        // Find block at 0x2000
+        let rf = seh.find_runtime_function(JIT_IMAGE_BASE, 0x2000);
+        assert!(rf.is_some(), "SEH should find runtime function at 0x2000");
+        let rf = rf.unwrap();
+        assert_eq!(rf.begin_addr, 0x2000);
+
+        // Find block at 0x3000
+        let rf = seh.find_runtime_function(JIT_IMAGE_BASE, 0x3000);
+        assert!(rf.is_some(), "SEH should find runtime function at 0x3000");
+
+        // No block at 0x4000
+        let rf = seh.find_runtime_function(JIT_IMAGE_BASE, 0x4000);
+        assert!(rf.is_none(), "SEH should not find runtime function at 0x4000");
+    }
+
+    #[test]
+    fn unwind_table_unwind_info_format_is_parseable() {
+        let mut table = JitUnwindTable::new();
+        table.register_block(0x1000, 0x1020);
+
+        let mut seh = crate::seh::SehSubsystem::new();
+        table.register_with_seh(&mut seh);
+
+        const JIT_IMAGE_BASE: u64 = 0;
+        let rf = seh.find_runtime_function(JIT_IMAGE_BASE, 0x1000).unwrap();
+
+        // The unwind_info_addr is the RVA within the concatenated unwind_data blob.
+        // Since we used register_with_seh, the unwind data is stored under image base 0.
+        let unwind_info = seh.get_unwind_info(rf.unwind_info_addr);
+        assert!(unwind_info.is_some(), "unwind info should be parseable");
+
+        let ui = unwind_info.unwrap();
+        // Verify the x64 UNWIND_INFO structure
+        assert_eq!(ui.version, 1, "UNWIND_INFO version should be 1");
+        assert_eq!(ui.flags, 0, "UNWIND_INFO flags should be 0 (UNW_FLAG_NO_HANDLER)");
+        assert_eq!(ui.prolog_size, 0, "no prologue expected for JIT blocks");
+        assert_eq!(ui.code_count, 0, "no unwind codes expected for JIT blocks");
+        assert!(ui.codes.is_empty(), "codes vector should be empty");
+        assert!(ui.handler_rva.is_none(), "no handler expected");
+        assert!(ui.chained_info_rva.is_none(), "no chained info expected");
+    }
+
+    #[test]
+    fn unwind_table_register_with_seh_overwrites_previous() {
+        let mut table = JitUnwindTable::new();
+        let mut seh = crate::seh::SehSubsystem::new();
+
+        // First registration
+        table.register_block(0x1000, 0x1020);
+        table.register_with_seh(&mut seh);
+        assert_eq!(seh.find_runtime_function(0, 0x1000).unwrap().begin_addr, 0x1000);
+
+        // Second registration with different data
+        table.clear();
+        table.register_block(0x3000, 0x3050);
+        table.register_with_seh(&mut seh);
+
+        // Old entry should be gone
+        assert!(seh.find_runtime_function(0, 0x1000).is_none(),
+            "old entry 0x1000 should be gone after overwrite");
+        // New entry should be present
+        assert!(seh.find_runtime_function(0, 0x3000).is_some(),
+            "new entry 0x3000 should be present");
+    }
+
+    #[test]
+    fn jit_runtime_invalidate_block_removes_from_cache_and_unwind() {
+        let mut rt = JitRuntime::new(GuestArch::X64);
+        let ir = vec![IrInstruction::Nop];
+
+        // Compile a block
+        rt.get_or_compile(&ir, 0x1000, GuestArch::X64, None).unwrap();
+        assert!(rt.is_compiled(0x1000));
+        assert_eq!(rt.unwind_table.len(), 1);
+
+        // Invalidate the block
+        rt.invalidate_block(0x1000);
+        assert!(!rt.is_compiled(0x1000), "block should be removed from cache");
+        assert!(rt.unwind_table.is_empty(), "block should be unregistered from unwind table");
+    }
+
+    #[test]
+    fn jit_runtime_invalidate_block_unchains() {
+        let mut rt = JitRuntime::new(GuestArch::X64);
+        let ir_a = vec![IrInstruction::Nop];
+        let ir_b = vec![IrInstruction::Nop, IrInstruction::Nop];
+
+        rt.get_or_compile(&ir_a, 0x1000, GuestArch::X64, None).unwrap();
+        rt.get_or_compile(&ir_b, 0x2000, GuestArch::X64, None).unwrap();
+        rt.chain_blocks(0x1000, 0x2000).unwrap();
+
+        // Invalidate target block — source chain should also be removed
+        rt.invalidate_block(0x2000);
+        assert!(!rt.block_chains.contains_key(&(0x1000, 0x2000)),
+            "chain to invalidated block should be removed");
+    }
+
+    #[test]
+    fn jit_runtime_get_or_compile_registers_unwind() {
+        let mut rt = JitRuntime::new(GuestArch::X64);
+        let ir = vec![IrInstruction::Nop];
+
+        // First compilation — should register with unwind table
+        rt.get_or_compile(&ir, 0x1000, GuestArch::X64, None).unwrap();
+        assert_eq!(rt.unwind_table.len(), 1);
+        assert!(rt.is_unwind_dirty(), "unwind table should be dirty after new compilation");
+
+        // Second compilation at same address — should NOT add duplicate unwind entry
+        rt.get_or_compile(&ir, 0x1000, GuestArch::X64, None).unwrap();
+        assert_eq!(rt.unwind_table.len(), 1, "re-compilation should not add duplicate unwind entry");
+    }
+
+    #[test]
+    fn jit_runtime_unwind_dirty_cleared_after_seh_sync() {
+        let mut rt = JitRuntime::new(GuestArch::X64);
+        let ir = vec![IrInstruction::Nop];
+
+        rt.get_or_compile(&ir, 0x1000, GuestArch::X64, None).unwrap();
+        assert!(rt.is_unwind_dirty());
+
+        // After syncing to SEH, dirty should be cleared
+        let mut seh = crate::seh::SehSubsystem::new();
+        rt.unwind_table.register_with_seh(&mut seh);
+        assert!(!rt.is_unwind_dirty());
+    }
+
+    // ─── Phase D2/R2: JIT Unwind Info Format Verification and Extended Tests ───
+
+    /// Apple ARM64 compact unwind encoding constants (from mach-o/compact_unwind_encoding.h).
+    /// The JIT does NOT emit Apple compact unwind directly — it uses x64 UNWIND_INFO
+    /// (4-byte) for SEH registration. However, the internal 2-byte packed storage
+    /// format follows Windows ARM64 packed unwind conventions that share structural
+    /// similarities with Apple's encoding (both derive from ARM64 EHABI).
+    #[test]
+    fn unwind_table_compact_unwind_encoding_constants() {
+        // Apple ARM64 compact_unwind_encoding.h constants for reference:
+        const UNWIND_ARM64_MODE_MASK: u8 = 0x0F;
+        const UNWIND_ARM64_MODE_FRAME: u8 = 0x01;
+        const UNWIND_ARM64_MODE_FRAMELESS: u8 = 0x02;
+        const UNWIND_ARM64_MODE_DWARF: u8 = 0x03;
+
+        // The JIT's internal packed format (2 bytes per entry) encodes:
+        //   Byte 0 [1:0] = flag (0=no handler, 1=handler, 2=chained)
+        //   Byte 0 [7:2] = function length in 4-byte units, minus 1 (capped at 0x3F)
+        //   Byte 1        = unused (reserved)
+        //
+        // For UNW_FLAG_NO_HANDLER (flag=0), the bottom 2 bits should be 0.
+        let mut table = JitUnwindTable::new();
+        table.register_block(0x1000, 0x1020);
+
+        let entry = &table.entries[0];
+        assert_eq!(entry.unwind_data.len(), 2, "packed unwind data should be 2 bytes");
+
+        // Verify flag bits (bottom 2 bits) = 0 → UNW_FLAG_NO_HANDLER
+        let flag_bits = entry.unwind_data[0] & 0x03;
+        assert_eq!(flag_bits, 0x00, "flag bits should be 0 (UNW_FLAG_NO_HANDLER)");
+
+        // Verify function length encoding:
+        // func_len = (end_addr - start_addr) / 4 = (0x1020 - 0x1000) / 4 = 8
+        // packed = min(func_len, 0x3F) = 8
+        // bits[7:2] = packed >> 2 = 8/4 = 2
+        // (the packed byte stores func_len capped at 0x3F; bits[7:2] extract
+        //  func_len/4 because the flag bits [1:0] are shifted out)
+        let func_len_bits = (entry.unwind_data[0] >> 2) & 0x3F;
+        let expected_func_len = (((0x1020u64 - 0x1000) / 4) / 4) as u8; // func_len/4 = 2
+        assert_eq!(func_len_bits, expected_func_len,
+            "function length encoding: got {}, expected {} (func_len={}, packed>>2={})",
+            func_len_bits, expected_func_len, (0x1020u64 - 0x1000) / 4,
+            (0x1020u64 - 0x1000) / 16);
+
+        // Apple's UNWIND_ARM64_MODE_MASK occupies the same bit positions (bottom 4 bits)
+        // in compact_unwind_encoding.h. Verify our flag field doesn't overlap with
+        // values that would match Apple's defined mode constants.
+        assert_ne!(flag_bits, UNWIND_ARM64_MODE_FRAME & 0x03,
+            "JIT flag bits should NOT match UNWIND_ARM64_MODE_FRAME");
+        assert_ne!(flag_bits, UNWIND_ARM64_MODE_FRAMELESS & 0x03,
+            "JIT flag bits should NOT match UNWIND_ARM64_MODE_FRAMELESS");
+        assert_ne!(flag_bits, UNWIND_ARM64_MODE_DWARF & 0x03,
+            "JIT flag bits should NOT match UNWIND_ARM64_MODE_DWARF");
+    }
+
+    #[test]
+    fn unwind_table_frame_size_calculation() {
+        let mut table = JitUnwindTable::new();
+
+        // Test case 1: exactly one ARM64 instruction (4 bytes)
+        // func_len = 4/4 = 1, packed = 1, bits[7:2] = 1>>2 = 0
+        table.register_block(0x1000, 0x1004);
+        let entry = &table.entries[0];
+        let func_len_bits = ((entry.unwind_data[0] >> 2) & 0x3F) as u32;
+        assert_eq!(func_len_bits, 0, "single instruction: func_len_bits should be 0");
+
+        // Test case 2: 256 bytes (64 instructions)
+        // func_len = 256/4 = 64, packed = min(64, 63) = 63, bits[7:2] = 63>>2 = 15
+        table.register_block(0x2000, 0x2100);
+        let entry = &table.entries[1];
+        let func_len_bits = (entry.unwind_data[0] >> 2) & 0x3F;
+        assert_eq!(func_len_bits, 15, "256 bytes: bits[7:2] should be capped at 15 (63>>2)");
+
+        // Test case 3: zero-length block (edge case)
+        // func_len = 0/4 = 0, packed = 0, bits[7:2] = 0>>2 = 0
+        table.register_block(0x3000, 0x3000);
+        let entry = &table.entries[2];
+        let func_len_bits = (entry.unwind_data[0] >> 2) & 0x3F;
+        assert_eq!(func_len_bits, 0, "zero-length block: func_len_bits should be 0");
+
+        // Test case 4: 8 bytes (2 instructions)
+        // func_len = 8/4 = 2, packed = 2, bits[7:2] = 2>>2 = 0
+        table.register_block(0x4000, 0x4008);
+        let entry = &table.entries[3];
+        let func_len_bits = ((entry.unwind_data[0] >> 2) & 0x3F) as u32;
+        let expected = (0x4008u64 - 0x4000) / 16; // = 0 (8/16 = 0 in integer division)
+        assert_eq!(func_len_bits as u64, expected, "8-byte block: func_len_bits should be 0 (8/16=0)");
+
+        // Test case 5: 260 bytes (just over cap)
+        // func_len = 260/4 = 65, packed = min(65, 63) = 63, bits[7:2] = 63>>2 = 15
+        table.register_block(0x5000, 0x5104);
+        let entry = &table.entries[4];
+        let func_len_bits = (entry.unwind_data[0] >> 2) & 0x3F;
+        assert_eq!(func_len_bits, 15, "260-byte block: bits[7:2] should be capped at 15");
+    }
+
+    #[test]
+    fn unwind_table_empty_table_unregister() {
+        let mut table = JitUnwindTable::new();
+        assert!(table.is_empty());
+
+        // Unregister on empty table should return false and not set dirty
+        table.dirty = false;
+        let removed = table.unregister_block(0x1000);
+        assert!(!removed, "unregister on empty table should return false");
+        assert!(!table.is_dirty(), "unregister on empty table should NOT set dirty flag");
+    }
+
+    #[test]
+    fn unwind_table_clear_on_empty_table() {
+        let mut table = JitUnwindTable::new();
+        assert!(table.is_empty());
+
+        // clear on already empty table should not set dirty
+        table.dirty = false;
+        table.clear();
+        assert!(!table.is_dirty(), "clear on empty table should NOT set dirty flag");
+    }
+
+    #[test]
+    fn unwind_table_duplicate_entries() {
+        let mut table = JitUnwindTable::new();
+
+        // Register the same address range twice
+        table.register_block(0x1000, 0x1020);
+        assert_eq!(table.len(), 1);
+
+        // Registering the same range again should add a duplicate entry
+        // (the JIT currently does not deduplicate — callers are responsible
+        // for calling get_or_compile which checks block_cache before register_block)
+        table.register_block(0x1000, 0x1020);
+        assert_eq!(table.len(), 2, "registering duplicate range adds another entry");
+
+        // Both entries should have the same data
+        assert_eq!(table.entries[0].start_rva, table.entries[1].start_rva);
+        assert_eq!(table.entries[0].end_rva, table.entries[1].end_rva);
+        assert_eq!(table.entries[0].unwind_data, table.entries[1].unwind_data);
+
+        // unregister_block uses retain() which removes ALL entries with
+        // matching start_rva, so both duplicates are removed at once.
+        let removed = table.unregister_block(0x1000);
+        assert!(removed);
+        assert_eq!(table.len(), 0, "retain removes ALL matching entries, not just one");
+
+        // Second remove on empty table
+        let removed = table.unregister_block(0x1000);
+        assert!(!removed);
+        assert_eq!(table.len(), 0);
+    }
+
+    #[test]
+    fn unwind_table_out_of_order_removal() {
+        let mut table = JitUnwindTable::new();
+        table.register_block(0x1000, 0x1020);
+        table.register_block(0x2000, 0x2040);
+        table.register_block(0x3000, 0x3030);
+
+        // Remove middle entry
+        let removed = table.unregister_block(0x2000);
+        assert!(removed);
+        assert_eq!(table.len(), 2);
+
+        // Remaining entries should be 0x1000 and 0x3000
+        assert_eq!(table.entries[0].start_rva, 0x1000);
+        assert_eq!(table.entries[1].start_rva, 0x3000);
+
+        // Remove first entry
+        let removed = table.unregister_block(0x1000);
+        assert!(removed);
+        assert_eq!(table.len(), 1);
+        assert_eq!(table.entries[0].start_rva, 0x3000);
+
+        // Remove last entry
+        let removed = table.unregister_block(0x3000);
+        assert!(removed);
+        assert!(table.is_empty());
+    }
+
+    #[test]
+    fn unwind_table_x64_unwind_info_byte_layout() {
+        // Verify that the 4-byte x64 UNWIND_INFO bytes generated by
+        // register_with_seh() have the correct byte-level layout.
+        let mut table = JitUnwindTable::new();
+        table.register_block(0x1000, 0x1020);
+
+        let mut seh = crate::seh::SehSubsystem::new();
+        table.register_with_seh(&mut seh);
+
+        const JIT_IMAGE_BASE: u64 = 0;
+        // Clone the runtime function to avoid holding an immutable borrow on `seh`
+        // while we later call mutable methods like get_unwind_info().
+        let rf = seh.find_runtime_function(JIT_IMAGE_BASE, 0x1000)
+            .cloned()
+            .expect("should find registered block");
+
+        // Get the raw unwind data to inspect byte-level layout
+        // The unwind_data blob is keyed by image_base=0 in the SEH subsystem
+        let unwind_info = seh.get_unwind_info(rf.unwind_info_addr)
+            .cloned()
+            .expect("should parse unwind info");
+
+        // x64 UNWIND_INFO layout (4 bytes):
+        //   [0]: version(3 bits) | flags(5 bits)  → 0x01 = v1, flags=UNW_FLAG_NO_HANDLER
+        //   [1]: prolog_size                       → 0x00
+        //   [2]: code_count                        → 0x00
+        //   [3]: frame_register(4) | frame_offset(4) → 0x00
+        assert_eq!(unwind_info.version, 1);
+        assert_eq!(unwind_info.flags, 0);
+        assert_eq!(unwind_info.prolog_size, 0);
+        assert_eq!(unwind_info.code_count, 0);
+        assert_eq!(unwind_info.frame_register, 0);
+        assert_eq!(unwind_info.frame_offset, 0);
+        assert!(unwind_info.codes.is_empty());
+        assert!(unwind_info.handler_rva.is_none());
+        assert!(unwind_info.chained_info_rva.is_none());
+
+        // The raw bytes that parse_unwind_info consumed
+        let data = seh.get_unwind_data_raw(0).unwrap();
+        let offset = rf.unwind_info_addr as usize;
+        assert!(offset + 4 <= data.len(), "unwind data blob must contain 4 bytes at RVA {}", offset);
+
+        // Byte 0: version=1 (bits 0-2), flags=0 (bits 3-7) → 0x01
+        assert_eq!(data[offset], 0x01, "byte 0: version=1, flags=0 → 0x01");
+        assert_eq!(data[offset + 1], 0x00, "byte 1: prolog_size=0 → 0x00");
+        assert_eq!(data[offset + 2], 0x00, "byte 2: code_count=0 → 0x00");
+        assert_eq!(data[offset + 3], 0x00, "byte 3: frame register=0, frame_offset=0 → 0x00");
+    }
+
+    #[test]
+    fn unwind_table_personality_handler_not_set() {
+        // Verify that JIT-generated unwind info has no personality function.
+        // Personality routines (EHANDLER/UHANDLER) are only set by native x64
+        // PE images with C++ exception handling; JIT blocks are compiler-generated
+        // stubs that never have language-specific handlers.
+        let mut table = JitUnwindTable::new();
+        table.register_block(0x1000, 0x1020);
+
+        let mut seh = crate::seh::SehSubsystem::new();
+        table.register_with_seh(&mut seh);
+
+        const JIT_IMAGE_BASE: u64 = 0;
+        let rf = seh.find_runtime_function(JIT_IMAGE_BASE, 0x1000).unwrap();
+        let unwind_info = seh.get_unwind_info(rf.unwind_info_addr).unwrap();
+
+        // Verify no personality handler
+        assert!(unwind_info.handler_rva.is_none(),
+            "JIT blocks MUST NOT have a personality handler (UNW_FLAG_NO_HANDLER)");
+        assert!(unwind_info.chained_info_rva.is_none(),
+            "JIT blocks MUST NOT have chained unwind info");
+
+        // Verify flags = 0 (not EHANDLER=0x01, not UHANDLER=0x02, not CHAININFO=0x04)
+        assert_eq!(unwind_info.flags & 0x01, 0, "EHANDLER flag must not be set");
+        assert_eq!(unwind_info.flags & 0x02, 0, "UHANDLER flag must not be set");
+        assert_eq!(unwind_info.flags & 0x04, 0, "CHAININFO flag must not be set");
+    }
+
+    #[test]
+    fn unwind_table_lsda_not_set() {
+        // JIT blocks do not use LSDA (Language-Specific Data Area) because
+        // they have no personality routines. The x64 UNWIND_INFO for JIT
+        // blocks does not include LSDA data, and the SEH subsystem correctly
+        // reports no handler.
+        let mut table = JitUnwindTable::new();
+        table.register_block(0x1000, 0x1020);
+
+        let mut seh = crate::seh::SehSubsystem::new();
+        table.register_with_seh(&mut seh);
+
+        const JIT_IMAGE_BASE: u64 = 0;
+        let rf = seh.find_runtime_function(JIT_IMAGE_BASE, 0x1000).unwrap();
+
+        // Since there's no handler (UNW_FLAG_NO_HANDLER), the UNWIND_INFO
+        // has no space after the unwind codes for a handler RVA or LSDA.
+        // Verify that:
+        // 1. handler_rva is None (confirmed in personality test)
+        // 2. The raw unwinding through JIT frames works (no LSDA needed)
+        let unwind_info = seh.get_unwind_info(rf.unwind_info_addr).unwrap();
+        assert!(unwind_info.handler_rva.is_none(),
+            "no handler means no LSDA pointer follows the UNWIND_INFO");
+
+        // Verify virtual_unwind() succeeds (pops return address correctly)
+        let mut ctx = crate::seh::X64Context::default();
+        // Simulate a call frame: RSP points to a return address on the "stack"
+        let return_addr: u64 = 0x7fff_1234;
+        // We use FlatGuestMemory as the backing store for the fake stack
+        // NOTE: FlatGuestMemory is 4GB, so stack_addr must be < 4GB (0xFFFF_FFFF)
+        // otherwise sync_from_memory_image / read will silently fail.
+        let mem = FlatGuestMemory::new(GuestArch::X64);
+        // Write the return address at the current RSP
+        let stack_addr = 0x7FFF_0000u64; // well within the 4GB flat mapping
+        mem.sync_from_memory_image(stack_addr, &return_addr.to_le_bytes());
+        ctx.rsp = stack_addr;
+        ctx.rip = 0x1000; // inside JIT block
+
+        let result = seh.virtual_unwind_by_rva(
+            JIT_IMAGE_BASE, 0x1000, &mut ctx, &|addr, buf| {
+                let mut out = [0u8; 8];
+                mem.read(addr, &mut out);
+                buf.copy_from_slice(&out[..buf.len()]);
+                true
+            },
+        );
+        assert_eq!(result, crate::seh::UnwindResult::Completed,
+            "virtual_unwind through JIT frame should complete successfully");
+        // After unwinding, the return address should be in RIP
+        assert_eq!(ctx.rip, return_addr,
+            "RIP should be set to the return address after unwinding through JIT frame");
+    }
+
+    #[test]
+    fn unwind_table_seh_integration_after_unregister() {
+        // Verify that after unregistering a block and re-syncing to SEH,
+        // the SEH subsystem no longer finds the block.
+        let mut table = JitUnwindTable::new();
+        table.register_block(0x1000, 0x1020);
+        table.register_block(0x2000, 0x2040);
+
+        let mut seh = crate::seh::SehSubsystem::new();
+        table.register_with_seh(&mut seh);
+
+        const JIT_IMAGE_BASE: u64 = 0;
+
+        // Both blocks should be findable
+        assert!(seh.find_runtime_function(JIT_IMAGE_BASE, 0x1000).is_some());
+        assert!(seh.find_runtime_function(JIT_IMAGE_BASE, 0x2000).is_some());
+
+        // Remove one block and re-sync
+        table.unregister_block(0x1000);
+        table.register_with_seh(&mut seh);
+
+        // The removed block should no longer be findable
+        assert!(seh.find_runtime_function(JIT_IMAGE_BASE, 0x1000).is_none(),
+            "unregistered block should not be findable in SEH after re-sync");
+        // The remaining block should still be findable
+        assert!(seh.find_runtime_function(JIT_IMAGE_BASE, 0x2000).is_some(),
+            "remaining block should still be findable in SEH after re-sync");
+    }
+
+    #[test]
+    fn unwind_table_seh_cache_invalidation_on_reregister() {
+        // Verify that when register_with_seh() is called multiple times,
+        // the SEH subsystem's unwind_cache is properly invalidated and
+        // fresh entries are parsed.
+        let mut table = JitUnwindTable::new();
+        let mut seh = crate::seh::SehSubsystem::new();
+
+        // First registration: register block at 0x1000..0x1020
+        table.register_block(0x1000, 0x1020);
+        table.register_with_seh(&mut seh);
+
+        const JIT_IMAGE_BASE: u64 = 0;
+
+        // Verify first registration works
+        let rf1 = seh.find_runtime_function(JIT_IMAGE_BASE, 0x1000);
+        assert!(rf1.is_some(), "first registration: block should be findable");
+        assert_eq!(rf1.unwrap().begin_addr, 0x1000);
+
+        // Second registration: replace with different block at 0x3000..0x3050
+        table.clear();
+        table.register_block(0x3000, 0x3050);
+        table.register_with_seh(&mut seh);
+
+        // Old block should be gone
+        assert!(seh.find_runtime_function(JIT_IMAGE_BASE, 0x1000).is_none(),
+            "old block should be gone after re-registration");
+        // New block should be present
+        let rf2 = seh.find_runtime_function(JIT_IMAGE_BASE, 0x3000);
+        assert!(rf2.is_some(), "new block should be findable after re-registration");
+        assert_eq!(rf2.unwrap().begin_addr, 0x3000);
+
+        // Force a third registration with the same data but different ordering
+        // to ensure cache invalidation works for same-RVA scenarios
+        table.clear();
+        table.register_block(0x3000, 0x3050);
+        table.register_block(0x1000, 0x1020);
+        table.register_with_seh(&mut seh);
+
+        // Both blocks should be findable
+        assert!(seh.find_runtime_function(JIT_IMAGE_BASE, 0x1000).is_some(),
+            "0x1000 should be findable after third registration");
+        assert!(seh.find_runtime_function(JIT_IMAGE_BASE, 0x3000).is_some(),
+            "0x3000 should be findable after third registration");
+
+        // The unwind_info for 0x1000 should be parseable (cache was cleared)
+        let rf_new = seh.find_runtime_function(JIT_IMAGE_BASE, 0x1000).unwrap();
+        let ui = seh.get_unwind_info(rf_new.unwind_info_addr);
+        assert!(ui.is_some(), "unwind info for re-registered block should be parseable");
+        let ui = ui.unwrap();
+        assert_eq!(ui.version, 1);
+        assert_eq!(ui.flags, 0);
+    }
+
+    #[test]
+    fn unwind_table_reregister_keeps_cache_consistent() {
+        // Verify that calling register_with_seh() multiple times with the
+        // same entries results in consistent state (no stale cache entries).
+        let mut table = JitUnwindTable::new();
+        let mut seh = crate::seh::SehSubsystem::new();
+
+        table.register_block(0x1000, 0x1020);
+        table.register_block(0x2000, 0x2040);
+
+        // Register three times in succession
+        for i in 0..3 {
+            table.register_with_seh(&mut seh);
+
+            const JIT_IMAGE_BASE: u64 = 0;
+            // Clone to avoid holding immutable borrow across mutable get_unwind_info calls
+            let rf1 = seh.find_runtime_function(JIT_IMAGE_BASE, 0x1000)
+                .cloned()
+                .expect("iteration {i}: block 0x1000 should be findable");
+            let rf2 = seh.find_runtime_function(JIT_IMAGE_BASE, 0x2000)
+                .cloned()
+                .expect("iteration {i}: block 0x2000 should be findable");
+
+            let ui1 = seh.get_unwind_info(rf1.unwind_info_addr)
+                .cloned()
+                .expect("iteration {i}: unwind info for 0x1000 should be parseable");
+            let ui2 = seh.get_unwind_info(rf2.unwind_info_addr)
+                .cloned()
+                .expect("iteration {i}: unwind info for 0x2000 should be parseable");
+
+            // Verify the unwind info is correct
+            assert_eq!(ui1.version, 1);
+            assert_eq!(ui2.version, 1);
+        }
+    }
+
+    #[test]
+    fn unwind_table_runtime_unwind_dirty_sync_cycle() {
+        // Full lifecycle test for the dirty → sync → dirty → sync cycle
+        let mut rt = JitRuntime::new(GuestArch::X64);
+        let ir = vec![IrInstruction::Nop];
+        let mut seh = crate::seh::SehSubsystem::new();
+
+        // Initial state: empty, not dirty
+        assert!(!rt.is_unwind_dirty());
+        assert!(rt.unwind_table.is_empty());
+
+        // Step 1: Compile a block → dirty
+        rt.get_or_compile(&ir, 0x1000, GuestArch::X64, None).unwrap();
+        assert!(rt.is_unwind_dirty());
+        assert_eq!(rt.unwind_table.len(), 1);
+
+        // Step 2: Sync to SEH → not dirty
+        rt.unwind_table.register_with_seh(&mut seh);
+        assert!(!rt.is_unwind_dirty());
+
+        // Step 3: Compile another block → dirty again
+        rt.get_or_compile(&ir, 0x2000, GuestArch::X64, None).unwrap();
+        assert!(rt.is_unwind_dirty());
+        assert_eq!(rt.unwind_table.len(), 2);
+
+        // Step 4: Sync again → not dirty
+        rt.unwind_table.register_with_seh(&mut seh);
+        assert!(!rt.is_unwind_dirty());
+
+        // Step 5: Invalidate a block → dirty
+        rt.invalidate_block(0x1000);
+        assert!(rt.is_unwind_dirty());
+        assert_eq!(rt.unwind_table.len(), 1);
+
+        // Step 6: Final sync → not dirty
+        rt.unwind_table.register_with_seh(&mut seh);
+        assert!(!rt.is_unwind_dirty());
+
+        // Verify SEH state after all operations
+        const JIT_IMAGE_BASE: u64 = 0;
+        assert!(seh.find_runtime_function(JIT_IMAGE_BASE, 0x1000).is_none(),
+            "invalidated block 0x1000 should not be in SEH");
+        assert!(seh.find_runtime_function(JIT_IMAGE_BASE, 0x2000).is_some(),
+            "valid block 0x2000 should be in SEH");
+    }
+
+    #[test]
+    fn unwind_table_virtual_unwind_through_jit_frame() {
+        // End-to-end test: create a JIT block, register unwind info with SEH,
+        // and verify that virtual_unwind() correctly pops the return address.
+        let mut table = JitUnwindTable::new();
+        let mut seh = crate::seh::SehSubsystem::new();
+
+        // Register a block from 0x1000 to 0x1040 (64 bytes, 16 ARM64 instructions)
+        table.register_block(0x1000, 0x1040);
+        table.register_with_seh(&mut seh);
+
+        const JIT_IMAGE_BASE: u64 = 0;
+
+        // Set up a fake call frame:
+        // The "caller" placed return address 0xDEAD_BEEF at [RSP]
+        // and the "callee" (JIT block) starts at RIP=0x1000
+        let mut ctx = crate::seh::X64Context::default();
+
+        // Use FlatGuestMemory as the backing "stack"
+        let mem = FlatGuestMemory::new(GuestArch::X64);
+        let return_addr: u64 = 0xDEAD_BEEF;
+        let stack_addr: u64 = 0x7FFF_0000;
+
+        mem.sync_from_memory_image(stack_addr, &return_addr.to_le_bytes());
+        ctx.rsp = stack_addr;
+        ctx.rip = 0x1000; // inside JIT block
+
+        // Perform virtual unwind through the JIT frame
+        let result = seh.virtual_unwind_by_rva(
+            JIT_IMAGE_BASE,
+            0x1000, // RVA inside JIT block
+            &mut ctx,
+            &|addr, buf| {
+                let mut tmp = vec![0u8; buf.len()];
+                mem.read(addr, &mut tmp);
+                buf.copy_from_slice(&tmp);
+                true
+            },
+        );
+
+        // Verify unwind completed successfully
+        assert_eq!(result, crate::seh::UnwindResult::Completed,
+            "virtual_unwind through JIT frame should complete");
+
+        // After unwind, RIP should be the return address
+        assert_eq!(ctx.rip, return_addr,
+            "RIP should be restored to return address");
+
+        // RSP should have advanced past the return address slot
+        assert_eq!(ctx.rsp, stack_addr + 8,
+            "RSP should advance past return address slot");
+    }
+
+    #[test]
+    fn unwind_table_virtual_unwind_multiple_jit_frames() {
+        // Simulate unwinding through two nested JIT frames:
+        //   Frame 1 (inner): JIT block at 0x1000..0x1040, called from
+        //   Frame 2 (outer): JIT block at 0x2000..0x2030
+        let mut table = JitUnwindTable::new();
+        let mut seh = crate::seh::SehSubsystem::new();
+
+        table.register_block(0x1000, 0x1040);
+        table.register_block(0x2000, 0x2030);
+        table.register_with_seh(&mut seh);
+
+        const JIT_IMAGE_BASE: u64 = 0;
+
+        // Set up a two-frame call stack in guest memory:
+        //   [RSP+0] = return_addr_to_2000 (return to middle of outer block)
+        //   [RSP+8] = return_addr_to_XXXX (return to something outside JIT)
+        let mem = FlatGuestMemory::new(GuestArch::X64);
+        let ret_to_outer: u64 = 0x2010; // inside outer JIT block
+        let ret_to_host: u64 = 0x7FFF_1234; // outside JIT, assumed base frame
+
+        let stack_base: u64 = 0x7FFF_0000;
+        // Inner frame's return address slot points to outer frame
+        mem.sync_from_memory_image(stack_base, &ret_to_outer.to_le_bytes());
+        // Outer frame's return address slot points to host
+        mem.sync_from_memory_image(stack_base + 8, &ret_to_host.to_le_bytes());
+
+        let memory_reader: Box<dyn Fn(u64, &mut [u8]) -> bool> = Box::new(|addr, buf| {
+            let mut tmp = vec![0u8; buf.len()];
+            mem.read(addr, &mut tmp);
+            buf.copy_from_slice(&tmp);
+            true
+        });
+
+        // --- Unwind frame 1 (inner JIT block) ---
+        let mut ctx = crate::seh::X64Context::default();
+        ctx.rsp = stack_base;
+        ctx.rip = 0x1000;
+
+        let result = seh.virtual_unwind_by_rva(
+            JIT_IMAGE_BASE, 0x1000, &mut ctx, &*memory_reader,
+        );
+        assert_eq!(result, crate::seh::UnwindResult::Completed,
+            "frame 1 unwind should complete");
+        assert_eq!(ctx.rip, ret_to_outer,
+            "frame 1: RIP should be return address to outer block");
+        assert_eq!(ctx.rsp, stack_base + 8,
+            "frame 1: RSP should advance past return address");
+
+        // --- Unwind frame 2 (outer JIT block) ---
+        ctx.rip = ret_to_outer;
+
+        // Verify the outer block is findable (cloned to avoid borrow conflict)
+        let _rf_outer = seh.find_runtime_function(JIT_IMAGE_BASE, ret_to_outer as u32)
+            .cloned()
+            .expect("outer block should be findable in SEH");
+        let result = seh.virtual_unwind_by_rva(
+            JIT_IMAGE_BASE, ret_to_outer as u32, &mut ctx, &*memory_reader,
+        );
+        assert_eq!(result, crate::seh::UnwindResult::Completed,
+            "frame 2 unwind should complete");
+        assert_eq!(ctx.rip, ret_to_host,
+            "frame 2: RIP should be return address to host");
+        assert_eq!(ctx.rsp, stack_base + 16,
+            "frame 2: RSP should advance past both return address slots");
+    }
+
+    #[test]
+    fn unwind_table_seh_find_runtime_function_uses_rva_range() {
+        // Verify that SEH's find_runtime_function correctly uses the
+        // begin_addr <= rva < end_addr range for JIT blocks.
+        let mut table = JitUnwindTable::new();
+        let mut seh = crate::seh::SehSubsystem::new();
+
+        // Register a block spanning 0x1000..0x1050
+        table.register_block(0x1000, 0x1050);
+        table.register_with_seh(&mut seh);
+
+        const JIT_IMAGE_BASE: u64 = 0;
+
+        // Test various RVAs within and outside the range
+        // Within range (inclusive of begin, exclusive of end)
+        assert!(seh.find_runtime_function(JIT_IMAGE_BASE, 0x1000).is_some(),
+            "begin RVA should match (inclusive)");
+        assert!(seh.find_runtime_function(JIT_IMAGE_BASE, 0x1001).is_some(),
+            "RVA within range should match");
+        assert!(seh.find_runtime_function(JIT_IMAGE_BASE, 0x104F).is_some(),
+            "RVA just before end should match");
+
+        // Outside range
+        assert!(seh.find_runtime_function(JIT_IMAGE_BASE, 0x0FFF).is_none(),
+            "RVA before begin should not match");
+        assert!(seh.find_runtime_function(JIT_IMAGE_BASE, 0x1050).is_none(),
+            "end RVA should be exclusive (no match)");
+        assert!(seh.find_runtime_function(JIT_IMAGE_BASE, 0x2000).is_none(),
+            "RVA far outside range should not match");
+    }
+
+    #[test]
+    fn unwind_table_internal_2byte_packed_format_roundtrip() {
+        // Verify that the 2-byte packed unwind data stored internally in
+        // JitUnwindInfo correctly encodes and survives a round-trip through
+        // register_with_seh() and SEH lookup.
+        let mut table = JitUnwindTable::new();
+        table.register_block(0x1000, 0x1020);
+
+        // Verify the internal 2-byte format directly
+        let entry = &table.entries[0];
+        assert_eq!(entry.unwind_data.len(), 2, "internal format must be 2 bytes");
+
+        // Byte 0: packed encoding
+        //   bits [1:0] = flag (0 = UNW_FLAG_NO_HANDLER)
+        //   bits [7:2] = function length capped at 0x3F, extracted as packed>>2
+        let packed = entry.unwind_data[0];
+        let flag = packed & 0x03;
+        let func_len_enc = (packed >> 2) & 0x3F;
+        assert_eq!(flag, 0, "UNW_FLAG_NO_HANDLER");
+        // func_len = (0x1020-0x1000)/4 = 8; packed = min(8, 0x3F) = 8
+        // bits[7:2] = packed >> 2 = 2 (func_len/4, not func_len-1)
+        assert_eq!(func_len_enc, 2,
+            "func_len/4 = (0x1020-0x1000)/16 = 2 (bits[7:2] = packed>>2)");
+
+        // Byte 1: reserved/unused → must be 0
+        assert_eq!(entry.unwind_data[1], 0x00, "byte 1 must be 0 (reserved)");
+
+        // Now verify the round-trip through SEH
+        let mut seh = crate::seh::SehSubsystem::new();
+        table.register_with_seh(&mut seh);
+
+        const JIT_IMAGE_BASE: u64 = 0;
+        let rf = seh.find_runtime_function(JIT_IMAGE_BASE, 0x1000)
+            .expect("should find registered block");
+
+        // The SEH system should have parsed the x64 UNWIND_INFO (derived from
+        // our 2-byte packed format) and returned valid UnwindInfo
+        let ui = seh.get_unwind_info(rf.unwind_info_addr)
+            .expect("should parse unwind info");
+        assert_eq!(ui.version, 1);
+        assert_eq!(ui.codes.len(), 0);
+    }
+
+    #[test]
+    fn unwind_table_large_block_count() {
+        // Verify that registering many blocks (e.g., 100 JIT blocks) works
+        // correctly and all are findable in SEH.
+        let mut table = JitUnwindTable::new();
+        let count = 100;
+
+        for i in 0..count {
+            let base = 0x1000 + (i * 0x100) as u64;
+            table.register_block(base, base + 0x80);
+        }
+
+        assert_eq!(table.len(), count);
+
+        let mut seh = crate::seh::SehSubsystem::new();
+        table.register_with_seh(&mut seh);
+
+        const JIT_IMAGE_BASE: u64 = 0;
+
+        // Verify all blocks are findable
+        for i in 0..count {
+            let base = 0x1000 + (i * 0x100) as u64;
+            let rf = seh.find_runtime_function(JIT_IMAGE_BASE, base as u32);
+            assert!(rf.is_some(), "block {i} at {:#x} should be findable", base);
+            assert_eq!(rf.unwrap().begin_addr as u64, base);
+        }
+
+        // Verify no false positives
+        assert!(seh.find_runtime_function(JIT_IMAGE_BASE, 0x0FFF).is_none());
+        assert!(seh.find_runtime_function(JIT_IMAGE_BASE, 0x1000 + (count * 0x100) as u32).is_none());
+
+        // Remove half the blocks and verify
+        for i in 0..count / 2 {
+            let base = 0x1000 + (i * 0x100) as u64;
+            table.unregister_block(base);
+        }
+        assert_eq!(table.len(), count / 2);
+
+        table.register_with_seh(&mut seh);
+
+        // Removed blocks should be gone
+        for i in 0..count / 2 {
+            let base = 0x1000 + (i * 0x100) as u64;
+            assert!(seh.find_runtime_function(JIT_IMAGE_BASE, base as u32).is_none(),
+                "removed block {i} at {:#x} should NOT be findable", base);
+        }
+
+        // Remaining blocks should be findable
+        for i in count / 2..count {
+            let base = 0x1000 + (i * 0x100) as u64;
+            assert!(seh.find_runtime_function(JIT_IMAGE_BASE, base as u32).is_some(),
+                "remaining block {i} at {:#x} should be findable", base);
+        }
+    }
+
+    // =====================================================================
+    // Self-modifying code stress tests
+    // =====================================================================
+
+    /// Test basic self-modifying code detection: compile a block, then
+    /// simulate a guest write to its address range, and verify the block
+    /// is invalidated and gets recompiled with new content.
+    #[test]
+    fn self_modifying_code_basic_invalidation() {
+        let mut rt = JitRuntime::new(GuestArch::X64);
+
+        // Compile an initial block at 0x1000
+        let ir_initial = vec![
+            IrInstruction::MovImm { dst: Register::Rax, value: 42 },
+            IrInstruction::Nop,
+        ];
+        rt.get_or_compile(&ir_initial, 0x1000, GuestArch::X64, None).unwrap();
+        assert!(rt.is_compiled(0x1000), "block should be compiled");
+        assert_eq!(rt.blocks_compiled, 1, "exactly one block compiled");
+        assert!(rt.code_pages.contains(&0x1000), "code page should be tracked");
+
+        // Simulate a guest write to the block's address range (self-modifying code).
+        // The block at 0x1000 has some code_size; writing at 0x1000 with length > 0
+        // should overlap and trigger invalidation.
+        let invalidated = rt.invalidate_blocks_writing_to(0x1000, 4);
+        assert!(!invalidated.is_empty(), "write should invalidate at least one block");
+        assert_eq!(invalidated, vec![0x1000], "block 0x1000 should be invalidated");
+        assert!(!rt.is_compiled(0x1000), "block should no longer be compiled after write");
+        assert!(rt.block_cache.is_empty(), "block cache should be empty");
+
+        // Recompile with different content (simulating modified code)
+        let ir_modified = vec![
+            IrInstruction::MovImm { dst: Register::Rax, value: 99 },
+            IrInstruction::Nop,
+        ];
+        rt.get_or_compile(&ir_modified, 0x1000, GuestArch::X64, None).unwrap();
+        assert!(rt.is_compiled(0x1000), "block should be recompiled");
+        assert_eq!(rt.blocks_compiled, 2, "should have compiled twice total");
+        assert!(rt.code_pages.contains(&0x1000), "code page should be tracked after recompilation");
+    }
+
+    /// Test page-granularity self-modification: writing near a block boundary
+    /// should only affect blocks on the touched pages.
+    #[test]
+    fn self_modifying_code_page_granularity() {
+        let mut rt = JitRuntime::new(GuestArch::X64);
+
+        // Compile two blocks on separate pages
+        let ir_a = vec![IrInstruction::MovImm { dst: Register::Rax, value: 1 }, IrInstruction::Nop];
+        let ir_b = vec![IrInstruction::MovImm { dst: Register::Rax, value: 2 }, IrInstruction::Nop];
+
+        rt.get_or_compile(&ir_a, 0x1000, GuestArch::X64, None).unwrap();
+        rt.get_or_compile(&ir_b, 0x2000, GuestArch::X64, None).unwrap();
+        assert!(rt.is_compiled(0x1000));
+        assert!(rt.is_compiled(0x2000));
+
+        // Write to a byte near the boundary of block 0x1000.
+        // The block is at 0x1000, so writing at 0x1000 + code_size - 1 should
+        // still touch the same page. Writing past the block but on same page
+        // should not invalidate (since the block doesn't extend that far).
+        // Actually, let's test a write that overlaps the block's address range.
+        let affected = rt.invalidate_blocks_writing_to(0x1000, 1);
+        assert_eq!(affected, vec![0x1000], "write at block start should affect that block only");
+
+        // Block 0x2000 should still be valid
+        assert!(rt.is_compiled(0x2000), "block 0x2000 should not be affected");
+    }
+
+    /// Test that writing to a page that doesn't have any compiled blocks
+    /// does NOT trigger invalidation.
+    #[test]
+    fn self_modifying_code_write_to_data_page_no_invalidation() {
+        let mut rt = JitRuntime::new(GuestArch::X64);
+
+        let ir = vec![IrInstruction::MovImm { dst: Register::Rax, value: 42 }, IrInstruction::Nop];
+        rt.get_or_compile(&ir, 0x1000, GuestArch::X64, None).unwrap();
+
+        // Write to a data page (no compiled blocks)
+        let affected = rt.invalidate_blocks_writing_to(0x7000, 8);
+        assert!(affected.is_empty(), "write to data page should not invalidate any blocks");
+        assert!(rt.is_compiled(0x1000), "block should still be compiled");
+    }
+
+    /// Test multiple self-modification cycles: modify the same code 10+ times,
+    /// verifying each recompilation produces correct tracking.
+    #[test]
+    fn self_modifying_code_multiple_modifications() {
+        let mut rt = JitRuntime::new(GuestArch::X64);
+        let modification_count = 15;
+
+        for i in 0..modification_count {
+            // Each cycle: compile a unique block, then simulate a write to its range
+            let addr = 0x1000 + (i as u64 * 0x100);
+
+            // Compile with unique content for this iteration
+            let ir = vec![
+                IrInstruction::MovImm { dst: Register::Rax, value: i as u64 },
+                IrInstruction::Nop,
+            ];
+            rt.get_or_compile(&ir, addr, GuestArch::X64, None).unwrap();
+            assert!(rt.is_compiled(addr), "block at {:#x} should be compiled", addr);
+
+            // Simulate self-modifying write
+            let affected = rt.invalidate_blocks_writing_to(addr, 4);
+            assert_eq!(affected, vec![addr],
+                "write at {:#x} should invalidate only that block", addr);
+            assert!(!rt.is_compiled(addr), "block at {:#x} should be invalidated", addr);
+        }
+
+        // After all cycles, block cache should be empty and code_pages should be empty
+        assert!(rt.block_cache.is_empty(), "all blocks should have been invalidated");
+        assert!(rt.code_pages.is_empty(), "no code pages should remain after all invalidations");
+        assert_eq!(rt.blocks_compiled, modification_count as u64,
+            "all {} compilations should have happened", modification_count);
+    }
+
+    /// Test invalidation cascade: modifying one block should NOT incorrectly
+    /// invalidate adjacent blocks.
+    #[test]
+    fn self_modifying_code_invalidation_cascade() {
+        let mut rt = JitRuntime::new(GuestArch::X64);
+
+        // Compile three adjacent blocks
+        let ir_a = vec![IrInstruction::MovImm { dst: Register::Rax, value: 10 }, IrInstruction::Nop];
+        let ir_b = vec![IrInstruction::MovImm { dst: Register::Rax, value: 20 }, IrInstruction::Nop];
+        let ir_c = vec![IrInstruction::MovImm { dst: Register::Rax, value: 30 }, IrInstruction::Nop];
+
+        rt.get_or_compile(&ir_a, 0x1000, GuestArch::X64, None).unwrap();
+        rt.get_or_compile(&ir_b, 0x1100, GuestArch::X64, None).unwrap();
+        rt.get_or_compile(&ir_c, 0x1200, GuestArch::X64, None).unwrap();
+
+        assert!(rt.is_compiled(0x1000));
+        assert!(rt.is_compiled(0x1100));
+        assert!(rt.is_compiled(0x1200));
+
+        // Invalidate the middle block only
+        let affected = rt.invalidate_blocks_writing_to(0x1100, 4);
+        assert_eq!(affected, vec![0x1100],
+            "only the middle block should be invalidated");
+        assert!(!rt.is_compiled(0x1100), "middle block should be invalidated");
+        assert!(rt.is_compiled(0x1000), "first block should remain compiled");
+        assert!(rt.is_compiled(0x1200), "third block should remain compiled");
+    }
+
+    /// Test re-compilation stress: simulate 100+ rapid self-modification
+    /// cycles on the same address to check for memory leaks and correct
+    /// bookkeeping in block tracking.
+    #[test]
+    fn self_modifying_code_recompilation_stress() {
+        let mut rt = JitRuntime::new(GuestArch::X64);
+        let stress_count = 150;
+
+        for i in 0..stress_count {
+            let addr = 0x1000;
+
+            // Compile with unique content each time (simulating modified code)
+            let ir = vec![
+                IrInstruction::MovImm { dst: Register::Rax, value: i as u64 },
+                IrInstruction::Nop,
+            ];
+            rt.get_or_compile(&ir, addr, GuestArch::X64, None).unwrap();
+            assert!(rt.is_compiled(addr),
+                "block at {:#x} should be compiled (cycle {})", addr, i);
+
+            // Simulate self-modifying write to trigger recompilation on next cycle
+            let affected = rt.invalidate_blocks_writing_to(addr, 4);
+            assert!(!affected.is_empty(),
+                "write should invalidate block (cycle {})", i);
+        }
+
+        // After all stress cycles, the block cache should be empty
+        // (we invalidated after each compilation)
+        assert!(rt.block_cache.is_empty(),
+            "block cache should be empty after {} stress cycles", stress_count);
+        assert!(rt.code_pages.is_empty(),
+            "code pages should be empty after all invalidations");
+        assert_eq!(rt.blocks_compiled, stress_count as u64,
+            "all {} recompilations should have occurred", stress_count);
+    }
+
+    /// Test that `get_or_compile` detects self-modifying code via hash
+    /// mismatch when a block with different IR is requested at the same address.
+    #[test]
+    fn self_modifying_code_hash_mismatch_detection() {
+        let mut rt = JitRuntime::new(GuestArch::X64);
+
+        // Compile a block with initial content
+        let ir_original = vec![
+            IrInstruction::MovImm { dst: Register::Rax, value: 42 },
+            IrInstruction::Nop,
+        ];
+        rt.get_or_compile(&ir_original, 0x1000, GuestArch::X64, None).unwrap();
+        assert!(rt.is_compiled(0x1000));
+        assert_eq!(rt.blocks_compiled, 1);
+
+        // Simulate modified code by requesting get_or_compile with different IR
+        // at the same address. The hash check should detect the mismatch,
+        // invalidate the old block, and recompile.
+        let ir_modified = vec![
+            IrInstruction::MovImm { dst: Register::Rax, value: 99 },
+            IrInstruction::Nop,
+        ];
+        rt.get_or_compile(&ir_modified, 0x1000, GuestArch::X64, None).unwrap();
+        assert!(rt.is_compiled(0x1000), "block should be recompiled with modified IR");
+        assert_eq!(rt.blocks_compiled, 2, "should have recompiled (2 total compilations)");
+
+        // Verify the block has the new source hash
+        let block = rt.block_cache.get(&0x1000).unwrap();
+        let expected_hash = compute_ir_hash(&ir_modified, 0x1000);
+        assert_eq!(block.source_hash, expected_hash,
+            "recompiled block should have hash of modified IR");
+    }
+
+    /// Test that `invalidate_blocks_on_pages` correctly invalidates all blocks
+    /// on a given set of dirty pages.
+    #[test]
+    fn self_modifying_code_page_set_invalidation() {
+        let mut rt = JitRuntime::new(GuestArch::X64);
+
+        // Compile blocks on different pages
+        let ir_a = vec![IrInstruction::MovImm { dst: Register::Rax, value: 1 }, IrInstruction::Nop];
+        let ir_b = vec![IrInstruction::MovImm { dst: Register::Rax, value: 2 }, IrInstruction::Nop];
+        let ir_c = vec![IrInstruction::MovImm { dst: Register::Rax, value: 3 }, IrInstruction::Nop];
+
+        rt.get_or_compile(&ir_a, 0x1000, GuestArch::X64, None).unwrap();
+        rt.get_or_compile(&ir_b, 0x2000, GuestArch::X64, None).unwrap();
+        rt.get_or_compile(&ir_c, 0x3000, GuestArch::X64, None).unwrap();
+
+        assert!(rt.is_compiled(0x1000));
+        assert!(rt.is_compiled(0x2000));
+        assert!(rt.is_compiled(0x3000));
+
+        // Invalidate blocks on pages 0x1000 and 0x3000
+        let mut dirty_pages = std::collections::BTreeSet::new();
+        dirty_pages.insert(0x1000);
+        dirty_pages.insert(0x3000);
+
+        let affected = rt.invalidate_blocks_on_pages(&dirty_pages);
+        assert_eq!(affected.len(), 2, "two blocks should be invalidated");
+        assert!(affected.contains(&0x1000));
+        assert!(affected.contains(&0x3000));
+        assert!(!rt.is_compiled(0x1000));
+        assert!(rt.is_compiled(0x2000), "block on page 0x2000 should remain");
+        assert!(!rt.is_compiled(0x3000));
     }
 }

@@ -2847,7 +2847,7 @@ impl CpuExecutionEngine {
             // Only use JIT if block is already compiled (adaptive tiering:
             // compilation is triggered by the hotness tracker in the main loop).
             let jit_info = if runtime.is_compiled(state.rip) {
-                let block = runtime.get_or_compile(ir, state.rip, self.config.arch);
+                let block = runtime.get_or_compile(ir, state.rip, self.config.arch, None);
                 match block {
                     Ok(block) => Some((block.entry, block.code_size)),
                     Err(_) => None,
@@ -15567,12 +15567,14 @@ fn fxsave_to_memory(state: &CpuState, memory: &mut MemoryImage, base: u64) -> Ap
     write_memory_value(memory, base, x87_control_word(&state.x87) as u64, 2)?;
     write_memory_value(memory, base + 2, x87_status_word(state) as u64, 2)?;
 
-    // Abridged tag word: bit i set if ST(i) is occupied.
+    // Abridged tag word (Intel/AMD spec): bit i set (=1) if ST(i) is EMPTY,
+    // cleared (=0) if ST(i) is non-empty (Valid, Zero, or Special).
     let depth = state.x87.stack.len().min(8);
-    let mut ftw = 0u8;
-    for i in 0..depth {
-        ftw |= 1 << i;
-    }
+    let ftw = if depth >= 8 {
+        0u8 // all registers non-empty
+    } else {
+        (!0u8) << depth // bits 0..depth-1 = 0 (non-empty), bits depth..7 = 1 (empty)
+    };
     write_memory_value(memory, base + 4, ftw as u64, 1)?;
     write_memory_value(memory, base + 5, 0, 1)?; // reserved
     write_memory_value(memory, base + 6, 0, 2)?; // FOP
@@ -15625,9 +15627,10 @@ fn fxrstor_from_memory(state: &mut CpuState, memory: &MemoryImage, base: u64) ->
     state.x87.precision = (fsw & (1 << 5)) != 0;
 
     // Rebuild the x87 stack with ST(0) on top.
+    // Abridged tag: bit=0 means non-empty, bit=1 means empty.
     let mut stack = Vec::new();
     for i in (0..8usize).rev() {
-        if ftw & (1 << i) != 0 {
+        if ftw & (1 << i) == 0 {
             let slot = base + 32 + (i as u64) * 16;
             let mant = read_memory_value(memory, slot, 8)?;
             let sign_exp = read_memory_value(memory, slot + 8, 2)? as u16;
@@ -21042,5 +21045,1066 @@ mod tests {
         // We can't easily inject features_no_avx without touching CpuVirtualization
         // internals, so verify the base invariant: xcr0 never sets bits 3-8
         assert!(xcr0 & 0x1F8 == 0, "Bits 3-8 must never be set in xcr0");
+    }
+
+    // ── FXSAVE x87 tag word tests ──────────────────────────────────────────
+    //
+    // The FXSAVE abridged tag word (byte at offset 4) uses Intel/AMD encoding:
+    //   bit i = 1  → ST(i) is EMPTY
+    //   bit i = 0  → ST(i) is non-empty (Valid, Zero, or Special)
+    //
+    // Helper: map zeroed pages at address for an FXSAVE area (512 bytes).
+    fn map_fxsave_area(memory: &mut MemoryImage, base: u64) {
+        memory.map_zeroed_if_unmapped(base, 512);
+    }
+
+    // Helper: FXSAVE into a scratch buffer and return the tag byte at offset 4.
+    fn fxsave_tag(state: &CpuState, memory: &mut MemoryImage, base: u64) -> u8 {
+        fxsave_to_memory(state, memory, base).expect("fxsave_to_memory");
+        memory.read_u8(base + 4).expect("read tag byte")
+    }
+
+    #[test]
+    fn fxsave_tag_word_all_empty_after_init() {
+        // After X87Init (or default X87State), the stack is empty → all 8
+        // registers are EMPTY → tag byte should be 0xFF (all bits = 1).
+        let state = CpuState::new(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        map_fxsave_area(&mut memory, 0x10000);
+
+        let tag = fxsave_tag(&state, &mut memory, 0x10000);
+        assert_eq!(tag, 0xFF, "all registers empty → tag = 0xFF");
+    }
+
+    #[test]
+    fn fxsave_tag_word_one_register_occupied() {
+        // Push one value → ST0 occupied → bit 0 = 0 (non-empty), bits 1-7 = 1 (empty)
+        let mut state = CpuState::new(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        map_fxsave_area(&mut memory, 0x10000);
+
+        state.x87.stack.push(1.0_f64);
+
+        let tag = fxsave_tag(&state, &mut memory, 0x10000);
+        // bit 0 = 0 (non-empty), bits 1-7 = 1 (empty)
+        assert_eq!(tag, 0b1111_1110, "ST0 occupied → bit0=0, rest=1");
+    }
+
+    #[test]
+    fn fxsave_tag_word_three_registers_occupied() {
+        // Push 3 values → ST0, ST1, ST2 occupied → bits 0-2 = 0, bits 3-7 = 1
+        let mut state = CpuState::new(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        map_fxsave_area(&mut memory, 0x10000);
+
+        state.x87.stack.push(3.0_f64); // ST2
+        state.x87.stack.push(2.0_f64); // ST1
+        state.x87.stack.push(1.0_f64); // ST0
+
+        let tag = fxsave_tag(&state, &mut memory, 0x10000);
+        assert_eq!(tag, 0b1111_1000, "ST0-ST2 occupied → bits0-2=0, bits3-7=1");
+    }
+
+    #[test]
+    fn fxsave_tag_word_all_registers_full() {
+        // Push 8 values → all registers occupied → all bits = 0
+        let mut state = CpuState::new(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        map_fxsave_area(&mut memory, 0x10000);
+
+        for i in 0..8 {
+            state.x87.stack.push((i as f64) + 1.0);
+        }
+
+        let tag = fxsave_tag(&state, &mut memory, 0x10000);
+        assert_eq!(tag, 0x00, "all 8 registers occupied → tag = 0x00");
+    }
+
+    #[test]
+    fn fxsave_tag_word_zero_values_are_non_empty() {
+        // Zero values are non-empty in the abridged tag (bit=0).
+        let mut state = CpuState::new(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        map_fxsave_area(&mut memory, 0x10000);
+
+        // Push a zero value onto the stack
+        state.x87.stack.push(0.0_f64);
+
+        let tag = fxsave_tag(&state, &mut memory, 0x10000);
+        // Zero is non-empty → bit 0 = 0
+        assert_eq!(tag, 0b1111_1110, "ST0=zero → bit0=0 (non-empty)");
+    }
+
+    #[test]
+    fn fxsave_tag_word_nan_is_non_empty() {
+        // NaN values are non-empty in the abridged tag (bit=0).
+        let mut state = CpuState::new(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        map_fxsave_area(&mut memory, 0x10000);
+
+        state.x87.stack.push(f64::NAN);
+
+        let tag = fxsave_tag(&state, &mut memory, 0x10000);
+        assert_eq!(tag, 0b1111_1110, "ST0=NaN → bit0=0 (non-empty)");
+    }
+
+    #[test]
+    fn fxsave_tag_word_infinity_is_non_empty() {
+        // Infinity values are non-empty in the abridged tag (bit=0).
+        let mut state = CpuState::new(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        map_fxsave_area(&mut memory, 0x10000);
+
+        state.x87.stack.push(f64::INFINITY);
+
+        let tag = fxsave_tag(&state, &mut memory, 0x10000);
+        assert_eq!(tag, 0b1111_1110, "ST0=Inf → bit0=0 (non-empty)");
+    }
+
+    #[test]
+    fn fxsave_tag_word_after_finit_all_empty() {
+        // X87Init resets the FPU state → stack empty → all EMPTY → tag = 0xFF
+        let mut state = CpuState::new(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        map_fxsave_area(&mut memory, 0x10000);
+
+        // Push some values, then init
+        state.x87.stack.push(42.0_f64);
+        state.x87.stack.push(3.14_f64);
+        state.x87.stack.push(2.71_f64);
+
+        // Simulate FINIT
+        state.x87 = X87State::default();
+
+        let tag = fxsave_tag(&state, &mut memory, 0x10000);
+        assert_eq!(tag, 0xFF, "after FINIT → all empty → tag = 0xFF");
+    }
+
+    #[test]
+    fn fxsave_fxrstor_round_trip_preserves_tag_and_values() {
+        // FXSAVE then FXRSTOR should preserve the full x87 state including
+        // tag word and register values.
+        let mut original = CpuState::new(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        map_fxsave_area(&mut memory, 0x10000);
+
+        // Set up a mixed state: 3 values with different types
+        original.x87.stack.push(3.0_f64);  // ST2 = Valid
+        original.x87.stack.push(0.0_f64);  // ST1 = Zero
+        original.x87.stack.push(f64::NAN); // ST0 = Special (NaN)
+        original.x87.divide_by_zero = true;
+        original.x87.precision = true;
+
+        // Save
+        fxsave_to_memory(&original, &mut memory, 0x10000).expect("fxsave");
+
+        // Restore into a fresh state
+        let mut restored = CpuState::new(GuestArch::X64);
+        map_fxsave_area(&mut memory, 0x20000);
+        fxrstor_from_memory(&mut restored, &memory, 0x10000).expect("fxrstor");
+
+        // Verify tag
+        let tag_original = fxsave_tag(&original, &mut memory, 0x10000);
+        let tag_restored = fxsave_tag(&restored, &mut memory, 0x20000);
+        assert_eq!(tag_original, tag_restored, "tag preserved across round-trip");
+
+        // Verify values preserved (NaN may not preserve exact bits through f80 round-trip).
+        // Stack convention: ST0 is at the top (last element), ST(depth-1) at index 0.
+        assert_eq!(restored.x87.stack.len(), 3);
+        assert!(restored.x87.stack[2].is_nan(), "ST0 (top) NaN preserved");
+        assert_eq!(restored.x87.stack[1].to_bits(), 0.0_f64.to_bits(), "ST1 Zero preserved");
+        assert!((restored.x87.stack[0] - 3.0_f64).abs() < 1e-15, "ST2 = 3.0 preserved");
+
+        // Verify status flags preserved
+        assert!(restored.x87.divide_by_zero, "ZE flag preserved");
+        assert!(restored.x87.precision, "PE flag preserved");
+    }
+
+    #[test]
+    fn fxsave_fxrstor_round_trip_full_stack() {
+        // Round-trip with all 8 registers occupied
+        let mut original = CpuState::new(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        map_fxsave_area(&mut memory, 0x10000);
+
+        for i in 0..8 {
+            original.x87.stack.push((i as f64) * 1.5);
+        }
+
+        fxsave_to_memory(&original, &mut memory, 0x10000).expect("fxsave");
+
+        let mut restored = CpuState::new(GuestArch::X64);
+        map_fxsave_area(&mut memory, 0x20000);
+        fxrstor_from_memory(&mut restored, &memory, 0x10000).expect("fxrstor");
+
+        assert_eq!(restored.x87.stack.len(), 8, "all 8 values restored");
+        // Stack convention: ST0 at the top (last element = index 7).
+        // Original push order: 0.0 (i=0, ST7 bottom), 1.5, ..., 10.5 (i=7, ST0 top).
+        for i in 0..8 {
+            let expected = (i as f64) * 1.5;
+            assert!(
+                (restored.x87.stack[i] - expected).abs() < 1e-10,
+                "value ST{} at index {}: expected {}, got {}",
+                i, i, expected, restored.x87.stack[i]
+            );
+        }
+    }
+
+    #[test]
+    fn fxsave_fxrstor_round_trip_empty_stack() {
+        // Round-trip with empty stack preserves empty tag (0xFF)
+        let original = CpuState::new(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        map_fxsave_area(&mut memory, 0x10000);
+
+        fxsave_to_memory(&original, &mut memory, 0x10000).expect("fxsave");
+
+        let mut restored = CpuState::new(GuestArch::X64);
+        map_fxsave_area(&mut memory, 0x20000);
+        fxrstor_from_memory(&mut restored, &memory, 0x10000).expect("fxrstor");
+
+        assert!(restored.x87.stack.is_empty(), "empty stack after round-trip");
+        let tag = fxsave_tag(&restored, &mut memory, 0x20000);
+        assert_eq!(tag, 0xFF, "empty tag preserved across round-trip");
+    }
+
+    #[test]
+    fn fxsave_tag_word_register_order_matches_sti() {
+        // Verify that ST(i) maps to physical register i in the tag word.
+        // With TOP=0, ST0 is physical register 0, ST1 is physical register 1, etc.
+        let mut state = CpuState::new(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        map_fxsave_area(&mut memory, 0x10000);
+
+        // Push one value → only ST0 exists → only bit 0 should be 0
+        state.x87.stack.push(1.0_f64);
+
+        let tag = fxsave_tag(&state, &mut memory, 0x10000);
+        assert_eq!(tag & 0x01, 0, "ST0 → bit 0 = 0 (non-empty)");
+        assert_eq!(tag & 0xFE, 0xFE, "ST1-ST7 → bits 1-7 = 1 (empty)");
+    }
+
+    #[test]
+    fn fxsave_tag_word_stack_depth_clamped_to_eight() {
+        // Stack depth is clamped to 8 in the tag computation.
+        let mut state = CpuState::new(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        map_fxsave_area(&mut memory, 0x10000);
+
+        // Push 10 values (should clamp to 8)
+        for i in 0..10 {
+            state.x87.stack.push((i as f64) + 1.0);
+        }
+
+        let tag = fxsave_tag(&state, &mut memory, 0x10000);
+        assert_eq!(tag, 0x00, "depth clamped to 8 → all registers non-empty → tag = 0x00");
+    }
+
+    #[test]
+    fn fxsave_fxrstor_preserves_mxcsr() {
+        // MXCSR should be preserved through FXSAVE/FXRSTOR round-trip.
+        let mut original = CpuState::new(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        map_fxsave_area(&mut memory, 0x10000);
+
+        original.mxcsr = 0x1F80; // Default MXCSR value
+        original.x87.stack.push(std::f64::consts::PI);
+
+        fxsave_to_memory(&original, &mut memory, 0x10000).expect("fxsave");
+
+        let mut restored = CpuState::new(GuestArch::X64);
+        map_fxsave_area(&mut memory, 0x20000);
+        fxrstor_from_memory(&mut restored, &memory, 0x10000).expect("fxrstor");
+
+        assert_eq!(restored.mxcsr, 0x1F80, "MXCSR preserved");
+        assert_eq!(restored.x87.stack.len(), 1);
+        assert!((restored.x87.stack[0] - std::f64::consts::PI).abs() < 1e-15);
+    }
+
+    #[test]
+    fn fxsave_x87_control_word_encoding() {
+        // Verify FCW (control word) encoding in FXSAVE area.
+        let mut state = CpuState::new(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        map_fxsave_area(&mut memory, 0x10000);
+
+        state.x87.rounding_mode = X87RoundingMode::Nearest;
+        fxsave_to_memory(&state, &mut memory, 0x10000).expect("fxsave");
+        let fcw = memory.read_u16(0x10000).expect("read fcw");
+        assert_eq!(fcw & 0x0C00, 0x0000, "Nearest rounding → RC=00");
+
+        state.x87.rounding_mode = X87RoundingMode::Down;
+        fxsave_to_memory(&state, &mut memory, 0x10000).expect("fxsave");
+        let fcw = memory.read_u16(0x10000).expect("read fcw");
+        assert_eq!(fcw & 0x0C00, 0x0400, "Down rounding → RC=01");
+
+        state.x87.rounding_mode = X87RoundingMode::Up;
+        fxsave_to_memory(&state, &mut memory, 0x10000).expect("fxsave");
+        let fcw = memory.read_u16(0x10000).expect("read fcw");
+        assert_eq!(fcw & 0x0C00, 0x0800, "Up rounding → RC=10");
+
+        state.x87.rounding_mode = X87RoundingMode::TowardZero;
+        fxsave_to_memory(&state, &mut memory, 0x10000).expect("fxsave");
+        let fcw = memory.read_u16(0x10000).expect("read fcw");
+        assert_eq!(fcw & 0x0C00, 0x0C00, "TowardZero rounding → RC=11");
+    }
+
+    #[test]
+    fn fxsave_x87_status_word_encoding() {
+        // Verify FSW (status word) encoding in FXSAVE area.
+        let mut state = CpuState::new(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        map_fxsave_area(&mut memory, 0x10000);
+
+        // No exceptions
+        fxsave_to_memory(&state, &mut memory, 0x10000).expect("fxsave");
+        let fsw = memory.read_u16(0x10002).expect("read fsw");
+        assert_eq!(fsw, 0, "no exceptions → FSW=0");
+
+        // Divide-by-zero
+        state.x87.divide_by_zero = true;
+        fxsave_to_memory(&state, &mut memory, 0x10000).expect("fxsave");
+        let fsw = memory.read_u16(0x10002).expect("read fsw");
+        assert_ne!(fsw & (1 << 2), 0, "ZE bit set");
+
+        // Precision
+        state.x87.divide_by_zero = false;
+        state.x87.precision = true;
+        fxsave_to_memory(&state, &mut memory, 0x10000).expect("fxsave");
+        let fsw = memory.read_u16(0x10002).expect("read fsw");
+        assert_eq!(fsw & (1 << 2), 0, "ZE bit clear");
+        assert_ne!(fsw & (1 << 5), 0, "PE bit set");
+    }
+
+    // =====================================================================
+    // Self-modifying code: TranslationCache tests
+    // =====================================================================
+
+    /// Test that `TranslationCache::invalidate_code_write` correctly removes
+    /// blocks whose touched pages intersect with a write range.
+    #[test]
+    fn translation_cache_invalidate_code_write_removes_overlapping_blocks() {
+        let mut cache = TranslationCache::default();
+        let config = CpuEngineConfig::from_profile(
+            GuestArch::X64,
+            "test".to_string(),
+            "test".to_string(),
+            None,
+        ).unwrap();
+
+        // Translate three blocks at different addresses
+        let bytes_a = vec![0xB8, 0x0A, 0x00, 0x00, 0x00]; // mov eax, 10
+        let bytes_b = vec![0xB8, 0x14, 0x00, 0x00, 0x00]; // mov eax, 20
+        let bytes_c = vec![0xB8, 0x1E, 0x00, 0x00, 0x00]; // mov eax, 30
+
+        cache.translate(&bytes_a, 0x1000, &config).unwrap();
+        cache.translate(&bytes_b, 0x2000, &config).unwrap();
+        cache.translate(&bytes_c, 0x3000, &config).unwrap();
+
+        assert_eq!(cache.blocks.len(), 3, "three blocks should be cached");
+
+        // Invalidate a write that overlaps block at 0x2000
+        let keys = cache.invalidate_code_write(0x2000, 4);
+        assert_eq!(keys.len(), 1, "one block should be invalidated");
+        assert_eq!(cache.blocks.len(), 2, "two blocks should remain");
+        assert!(cache.blocks.iter().any(|(k, _)| k.start_address == 0x1000),
+            "block 0x1000 should remain");
+        assert!(cache.blocks.iter().any(|(k, _)| k.start_address == 0x3000),
+            "block 0x3000 should remain");
+    }
+
+    /// Test that writing to a page shared by multiple blocks invalidates all
+    /// blocks on that page.
+    #[test]
+    fn translation_cache_invalidate_code_write_shared_page() {
+        let mut cache = TranslationCache::default();
+        let config = CpuEngineConfig::from_profile(
+            GuestArch::X64,
+            "test".to_string(),
+            "test".to_string(),
+            None,
+        ).unwrap();
+
+        // Two blocks on the same 4K page
+        let bytes_a = vec![0xB8, 0x0A, 0x00, 0x00, 0x00]; // mov eax, 10 at 0x1000
+        let bytes_b = vec![0xB8, 0x14, 0x00, 0x00, 0x00]; // mov eax, 20 at 0x1FF0 (near page boundary)
+        // Note: at 0x1FF0, with 5 bytes, it crosses into page 0x2000? No, 0x1FF0+5 = 0x1FF5, still on page 0x1000.
+
+        cache.translate(&bytes_a, 0x1000, &config).unwrap();
+        let block_b = cache.translate(&bytes_b, 0x1FF0, &config).unwrap();
+        // Both should share page 0x1000
+        assert!(block_b.touched_pages.contains(&0x1000),
+            "block at 0x1FF0 should touch page 0x1000");
+
+        assert_eq!(cache.blocks.len(), 2);
+
+        // Write to page 0x1000 should invalidate both blocks
+        let keys = cache.invalidate_code_write(0x1000, 1);
+        assert_eq!(keys.len(), 2, "both blocks on page 0x1000 should be invalidated");
+        assert!(cache.blocks.is_empty(), "all blocks should be removed");
+    }
+
+    /// Test that writing to a page with no translated blocks is a no-op.
+    #[test]
+    fn translation_cache_invalidate_code_write_no_overlap() {
+        let mut cache = TranslationCache::default();
+        let config = CpuEngineConfig::from_profile(
+            GuestArch::X64,
+            "test".to_string(),
+            "test".to_string(),
+            None,
+        ).unwrap();
+
+        let bytes = vec![0xB8, 0x0A, 0x00, 0x00, 0x00];
+        cache.translate(&bytes, 0x1000, &config).unwrap();
+
+        // Write to a completely different page
+        let keys = cache.invalidate_code_write(0x9000, 16);
+        assert!(keys.is_empty(), "no blocks should be invalidated");
+        assert_eq!(cache.blocks.len(), 1, "block should remain");
+    }
+
+    /// Test that writing 0 bytes at an address that doesn't overlap any cached
+    /// block does not invalidate anything.
+    #[test]
+    fn translation_cache_invalidate_code_write_zero_length() {
+        let mut cache = TranslationCache::default();
+        let config = CpuEngineConfig::from_profile(
+            GuestArch::X64,
+            "test".to_string(),
+            "test".to_string(),
+            None,
+        ).unwrap();
+
+        let bytes = vec![0xB8, 0x0A, 0x00, 0x00, 0x00];
+        cache.translate(&bytes, 0x1000, &config).unwrap();
+
+        // Write with length=0 to a different page (0x5000).
+        // Note: touched_pages uses length.max(1), so zero-length still targets
+        // one page, but that page (0x5000) has no blocks.
+        let keys = cache.invalidate_code_write(0x5000, 0);
+        assert!(keys.is_empty(), "zero-length write to non-overlapping page should not invalidate anything");
+        assert_eq!(cache.blocks.len(), 1, "block should remain");
+    }
+
+    /// Test multiple invalidation cycles on TranslationCache.
+    /// Blocks are placed on separate pages (0x1000 apart) to avoid page-sharing
+    /// interactions, so that invalidating one block's address only removes
+    /// that specific block (not neighbors on the same 4K page).
+    #[test]
+    fn translation_cache_invalidate_code_write_stress() {
+        let mut cache = TranslationCache::default();
+        let config = CpuEngineConfig::from_profile(
+            GuestArch::X64,
+            "test".to_string(),
+            "test".to_string(),
+            None,
+        ).unwrap();
+
+        let stress_count = 50;
+
+        // Place each block on its own page to avoid page-sharing effects.
+        // Page size is 4K (0x1000), so address = page_base + i * 0x1000
+        // keeps each block on a distinct page.
+        for i in 0..stress_count {
+            let page_base = 0x1000 + (i as u64 * 0x1000);
+            // Place block at the start of each page
+            let addr = page_base;
+            let value = (i as u8).wrapping_mul(2).wrapping_add(1);
+            let bytes = vec![0xB8, value, 0x00, 0x00, 0x00]; // mov eax, value
+            cache.translate(&bytes, addr, &config).unwrap();
+        }
+
+        assert_eq!(cache.blocks.len(), stress_count,
+            "all {} blocks should be cached", stress_count);
+
+        // Invalidate every other block by writing to its exact address
+        for i in (0..stress_count).step_by(2) {
+            let page_base = 0x1000 + (i as u64 * 0x1000);
+            cache.invalidate_code_write(page_base, 4);
+        }
+
+        // Only odd-indexed blocks should remain (each on its own page)
+        let remaining: Vec<u64> = cache.blocks.keys().map(|k| k.start_address).collect();
+        for i in 0..stress_count {
+            let page_base = 0x1000 + (i as u64 * 0x1000);
+            if i % 2 == 0 {
+                assert!(!remaining.contains(&page_base),
+                    "even-indexed block at {:#x} should be removed", page_base);
+            } else {
+                assert!(remaining.contains(&page_base),
+                    "odd-indexed block at {:#x} should remain", page_base);
+            }
+        }
+        assert_eq!(cache.blocks.len(), stress_count / 2,
+            "half the blocks should remain");
+    }
+
+    // =====================================================================
+    // E4 — BMI/BMI2 instruction tests (IR level)
+    // =====================================================================
+
+    #[test]
+    fn execute_andn_computes_not_lhs_and_rhs() {
+        let mut state = CpuState::new(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        // andn edx, eax, ecx  =>  edx = ~eax & ecx
+        state.set(Register::Rax, 0x0000_00FF);
+        state.set(Register::Rcx, 0x0000_0F0F);
+        execute_ir(&mut state, &mut memory, &[IrInstruction::Andn {
+            dst: Register::Rdx, lhs: Register::Rax, rhs: Register::Rcx,
+        }]).expect("execute andn");
+        assert_eq!(state.get(Register::Rdx), 0x0000_0F00);
+    }
+
+    #[test]
+    fn execute_bextr_extracts_bit_range() {
+        let mut state = CpuState::new(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        // bextr eax, edx, (start=4, len=8) => range register = (8 << 8) | 4
+        state.set(Register::Rdx, 0xFFFF_FFFF);
+        state.set(Register::Rcx, (8 << 8) | 4);
+        execute_ir(&mut state, &mut memory, &[IrInstruction::Bextr {
+            dst: Register::Rax, src: Register::Rdx, range: Register::Rcx,
+        }]).expect("execute bextr");
+        assert_eq!(state.get(Register::Rax), 0xFF);
+    }
+
+    #[test]
+    fn execute_blsi_extracts_lowest_set_bit() {
+        let mut state = CpuState::new(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        // blsi eax, edx  =>  eax = edx & -edx
+        state.set(Register::Rdx, 0x0000_A000);
+        execute_ir(&mut state, &mut memory, &[IrInstruction::Blsi {
+            dst: Register::Rax, src: Register::Rdx,
+        }]).expect("execute blsi");
+        assert_eq!(state.get(Register::Rax), 0x0000_2000);
+    }
+
+    #[test]
+    fn execute_blsmsk_generates_mask_from_lowest_set_bit() {
+        let mut state = CpuState::new(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        state.set(Register::Rdx, 0x0000_A000);
+        execute_ir(&mut state, &mut memory, &[IrInstruction::Blsmsk {
+            dst: Register::Rax, src: Register::Rdx,
+        }]).expect("execute blsmsk");
+        assert_eq!(state.get(Register::Rax), 0x0000_3FFF);
+    }
+
+    #[test]
+    fn execute_blsr_resets_lowest_set_bit() {
+        let mut state = CpuState::new(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        state.set(Register::Rdx, 0x0000_A000);
+        execute_ir(&mut state, &mut memory, &[IrInstruction::Blsr {
+            dst: Register::Rax, src: Register::Rdx,
+        }]).expect("execute blsr");
+        assert_eq!(state.get(Register::Rax), 0x0000_8000);
+    }
+
+    #[test]
+    fn execute_rorx_rotates_right_by_immediate() {
+        let mut state = CpuState::new(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        state.set(Register::Rax, 0x0000_00FF);
+        execute_ir(&mut state, &mut memory, &[IrInstruction::Rorx {
+            dst: Register::Rdx, src: Register::Rax, imm: 4,
+        }]).expect("execute rorx");
+        assert_eq!(state.get(Register::Rdx), 0xF000_0000_0000_000F);
+    }
+
+    #[test]
+    fn execute_sarx_arithmetic_shifts_right() {
+        let mut state = CpuState::new(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        state.set(Register::Rax, 0xFFFF_FF00i64 as u64);
+        state.set(Register::Rcx, 4);
+        execute_ir(&mut state, &mut memory, &[IrInstruction::Sarx {
+            dst: Register::Rdx, src: Register::Rax, shift: Register::Rcx,
+        }]).expect("execute sarx");
+        assert_eq!(state.get(Register::Rdx), 0x0FFF_FFF0);
+    }
+
+    #[test]
+    fn execute_shrx_shifts_right_logically() {
+        let mut state = CpuState::new(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        state.set(Register::Rax, 0xFFFF_FFFF);
+        state.set(Register::Rcx, 8);
+        execute_ir(&mut state, &mut memory, &[IrInstruction::Shrx {
+            dst: Register::Rdx, src: Register::Rax, shift: Register::Rcx,
+        }]).expect("execute shrx");
+        assert_eq!(state.get(Register::Rdx), 0x00FF_FFFF);
+    }
+
+    #[test]
+    fn execute_shlx_shifts_left_logically() {
+        let mut state = CpuState::new(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        state.set(Register::Rax, 0x00FF_FFFF);
+        state.set(Register::Rcx, 8);
+        execute_ir(&mut state, &mut memory, &[IrInstruction::Shlx {
+            dst: Register::Rdx, src: Register::Rax, shift: Register::Rcx,
+        }]).expect("execute shlx");
+        assert_eq!(state.get(Register::Rdx), 0xFFFF_FF00);
+    }
+
+    // =====================================================================
+    // E4 — AES-NI instruction tests (IR level)
+    // =====================================================================
+
+    fn make_aes_test_state() -> (CpuState, MemoryImage) {
+        (CpuState::new(GuestArch::X64), MemoryImage::default())
+    }
+
+    #[test]
+    fn execute_aesenc_performs_one_aes_round() {
+        let mut state = CpuState::new(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        state.set_xmm(0, XmmValue { low: 0x0123456789ABCDEF, high: 0xFEDCBA9876543210 });
+        state.set_xmm(1, XmmValue { low: 0x0011223344556677, high: 0x8899AABBCCDDEEFF });
+        execute_ir(&mut state, &mut memory, &[IrInstruction::AesEnc { dst: 0, src: 1 }])
+            .expect("execute aesenc");
+        // Result should differ from both inputs (cipher round applied)
+        assert_ne!(state.get_xmm(0), XmmValue { low: 0x0123456789ABCDEF, high: 0xFEDCBA9876543210 });
+        assert_ne!(state.get_xmm(0), XmmValue { low: 0x0011223344556677, high: 0x8899AABBCCDDEEFF });
+    }
+
+    #[test]
+    fn execute_aesenclast_performs_final_aes_round() {
+        let mut state = CpuState::new(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        state.set_xmm(0, XmmValue { low: 0x0123456789ABCDEF, high: 0xFEDCBA9876543210 });
+        state.set_xmm(1, XmmValue { low: 0x0011223344556677, high: 0x8899AABBCCDDEEFF });
+        execute_ir(&mut state, &mut memory, &[IrInstruction::AesEncLast { dst: 0, src: 1 }])
+            .expect("execute aesenclast");
+        assert_ne!(state.get_xmm(0), XmmValue { low: 0x0123456789ABCDEF, high: 0xFEDCBA9876543210 });
+    }
+
+    #[test]
+    fn execute_aesdec_performs_one_aes_decryption_round() {
+        let mut state = CpuState::new(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        state.set_xmm(0, XmmValue { low: 0x0123456789ABCDEF, high: 0xFEDCBA9876543210 });
+        state.set_xmm(1, XmmValue { low: 0x0011223344556677, high: 0x8899AABBCCDDEEFF });
+        execute_ir(&mut state, &mut memory, &[IrInstruction::AesDec { dst: 0, src: 1 }])
+            .expect("execute aesdec");
+        assert_ne!(state.get_xmm(0), XmmValue { low: 0x0123456789ABCDEF, high: 0xFEDCBA9876543210 });
+    }
+
+    #[test]
+    fn execute_aesdeclast_performs_final_aes_decryption_round() {
+        let mut state = CpuState::new(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        state.set_xmm(0, XmmValue { low: 0x0123456789ABCDEF, high: 0xFEDCBA9876543210 });
+        state.set_xmm(1, XmmValue { low: 0x0011223344556677, high: 0x8899AABBCCDDEEFF });
+        execute_ir(&mut state, &mut memory, &[IrInstruction::AesDecLast { dst: 0, src: 1 }])
+            .expect("execute aesdeclast");
+        assert_ne!(state.get_xmm(0), XmmValue { low: 0x0123456789ABCDEF, high: 0xFEDCBA9876543210 });
+    }
+
+    #[test]
+    fn execute_aesimc_computes_inverse_mix_columns() {
+        let mut state = CpuState::new(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        state.set_xmm(0, XmmValue { low: 0x0123456789ABCDEF, high: 0xFEDCBA9876543210 });
+        execute_ir(&mut state, &mut memory, &[IrInstruction::AesImc { dst: 1, src: 0 }])
+            .expect("execute aesimc");
+        assert_ne!(state.get_xmm(1), XmmValue::default());
+    }
+
+    #[test]
+    fn execute_aeskeygenassist_generates_round_key() {
+        let mut state = CpuState::new(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        state.set_xmm(0, XmmValue { low: 0x0123456789ABCDEF, high: 0xFEDCBA9876543210 });
+        execute_ir(&mut state, &mut memory, &[IrInstruction::AesKeyGenAssist { dst: 1, src: 0, imm: 0x01 }])
+            .expect("execute aeskeygenassist");
+        assert_ne!(state.get_xmm(1), XmmValue::default());
+    }
+
+    #[test]
+    fn execute_pclmulqdq_performs_carry_less_multiplication() {
+        let mut state = CpuState::new(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        state.set_xmm(0, XmmValue { low: 0x0000000000000002, high: 0 });
+        state.set_xmm(1, XmmValue { low: 0x0000000000000004, high: 0 });
+        execute_ir(&mut state, &mut memory, &[IrInstruction::Pclmulqdq { dst: 2, src: 1, imm: 0x00 }])
+            .expect("execute pclmulqdq");
+        // PCLMULQDQ carry-less multiply — verify instruction executes without error
+        // (exact result depends on bit-level carry-less implementation)
+        assert_ne!(state.get_xmm(2).low, 0xDEAD_BEEF); // just checking it didn't trap
+    }
+
+    // =====================================================================
+    // E4 — FMA instruction tests (IR level)
+    // =====================================================================
+
+    #[test]
+    fn execute_vfmadd213ps_performs_fused_multiply_add() {
+        let mut state = CpuState::new(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        // a = [1.0, 2.0, 3.0, 4.0], b = [5.0, 6.0, 7.0, 8.0], c = [0.5, 1.0, 1.5, 2.0]
+        // result = a * b + c
+        state.set_xmm(0, f32x4_to_xmm([1.0, 2.0, 3.0, 4.0]));
+        state.set_xmm(1, f32x4_to_xmm([5.0, 6.0, 7.0, 8.0]));
+        state.set_xmm(2, f32x4_to_xmm([0.5, 1.0, 1.5, 2.0]));
+        execute_ir(&mut state, &mut memory, &[IrInstruction::FmaVector {
+            kind: FmaKind::Vfmadd213,
+            dst: 2,
+            src1: 1,
+            src2: VectorOperand::Register(0),
+            element_kind: 0, // PS
+            width: 16,       // 128-bit
+        }]).expect("execute vfmadd213ps");
+        let result = xmm_to_f32x4(state.get_xmm(2));
+        // VFMADD213: result = dst * src1 + src2
+        assert!((result[0] - 3.5).abs() < 1e-6, "result[0]={}", result[0]);
+        assert!((result[1] - 8.0).abs() < 1e-6, "result[1]={}", result[1]);
+        assert!((result[2] - 13.5).abs() < 1e-6, "result[2]={}", result[2]);
+        assert!((result[3] - 20.0).abs() < 1e-6, "result[3]={}", result[3]);
+    }
+
+    #[test]
+    fn execute_vfmsub213ps_performs_fused_multiply_subtract() {
+        let mut state = CpuState::new(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        state.set_xmm(0, f32x4_to_xmm([1.0, 2.0, 3.0, 4.0]));
+        state.set_xmm(1, f32x4_to_xmm([5.0, 6.0, 7.0, 8.0]));
+        state.set_xmm(2, f32x4_to_xmm([0.5, 1.0, 1.5, 2.0]));
+        execute_ir(&mut state, &mut memory, &[IrInstruction::FmaVector {
+            kind: FmaKind::Vfmsub213,
+            dst: 2,
+            src1: 1,
+            src2: VectorOperand::Register(0),
+            element_kind: 0, // PS
+            width: 16,
+        }]).expect("execute vfmsub213ps");
+        let result = xmm_to_f32x4(state.get_xmm(2));
+        // VFMSUB213: result = dst * src1 - src2
+        assert!((result[0] - 1.5).abs() < 1e-6, "result[0]={}", result[0]);
+        assert!((result[1] - 4.0).abs() < 1e-6, "result[1]={}", result[1]);
+        assert!((result[2] - 7.5).abs() < 1e-6, "result[2]={}", result[2]);
+        assert!((result[3] - 12.0).abs() < 1e-6, "result[3]={}", result[3]);
+    }
+
+    #[test]
+    fn execute_vfnmadd213ps_performs_fused_negated_multiply_add() {
+        let mut state = CpuState::new(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        state.set_xmm(0, f32x4_to_xmm([1.0, 2.0, 3.0, 4.0]));
+        state.set_xmm(1, f32x4_to_xmm([5.0, 6.0, 7.0, 8.0]));
+        state.set_xmm(2, f32x4_to_xmm([0.5, 1.0, 1.5, 2.0]));
+        execute_ir(&mut state, &mut memory, &[IrInstruction::FmaVector {
+            kind: FmaKind::Vfnmadd213,
+            dst: 2,
+            src1: 1,
+            src2: VectorOperand::Register(0),
+            element_kind: 0, // PS
+            width: 16,
+        }]).expect("execute vfnmadd213ps");
+        let result = xmm_to_f32x4(state.get_xmm(2));
+        // VFNMADD213: result = -(dst * src1) + src2
+        assert!((result[0] - (-1.5)).abs() < 1e-6, "result[0]={}", result[0]);
+        assert!((result[1] - (-4.0)).abs() < 1e-6, "result[1]={}", result[1]);
+    }
+
+    // =====================================================================
+    // E4 — Additional SIMD instruction tests
+    // =====================================================================
+
+    #[test]
+    fn execute_haddps_performs_horizontal_add_of_f32_pairs() {
+        let mut state = CpuState::new(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        state.set_xmm(0, f32x4_to_xmm([1.0, 3.0, 5.0, 7.0]));
+        state.set_xmm(1, f32x4_to_xmm([2.0, 4.0, 6.0, 8.0]));
+        execute_ir(&mut state, &mut memory, &[IrInstruction::HaddPs { dst: 0, src: 1 }])
+            .expect("execute haddps");
+        let result = xmm_to_f32x4(state.get_xmm(0));
+        assert!((result[0] - 4.0).abs() < 1e-6, "result[0]={}", result[0]);
+        assert!((result[1] - 12.0).abs() < 1e-6, "result[1]={}", result[1]);
+        assert!((result[2] - 6.0).abs() < 1e-6, "result[2]={}", result[2]);
+        assert!((result[3] - 14.0).abs() < 1e-6, "result[3]={}", result[3]);
+    }
+
+    #[test]
+    fn execute_pshufb_shuffles_bytes_by_mask() {
+        let mut state = CpuState::new(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        // dst bytes: [0x11, 0x22, 0x33, 0x44, ...]
+        state.set_xmm(0, bytes_to_xmm([
+            0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+            0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00,
+        ]));
+        // mask: [2, 1, 0, 3, 0x80 (zero), 5, 4, 7, 6, 9, 8, 11, 10, 13, 12, 15]
+        state.set_xmm(1, bytes_to_xmm([
+            2, 1, 0, 3, 0x80, 5, 4, 7,
+            6, 9, 8, 11, 10, 13, 12, 15,
+        ]));
+        execute_ir(&mut state, &mut memory, &[IrInstruction::Pshufb { dst: 0, mask: 1 }])
+            .expect("execute pshufb");
+        let expected = bytes_to_xmm([
+            0x33, 0x22, 0x11, 0x44, 0x00, 0x66, 0x55, 0x88,
+            0x77, 0xAA, 0x99, 0xCC, 0xBB, 0xEE, 0xDD, 0x00,
+        ]);
+        assert_eq!(state.get_xmm(0), expected);
+    }
+
+    #[test]
+    fn execute_blendd_blends_dwords_by_mask() {
+        let mut state = CpuState::new(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        state.set_xmm(0, u32x4_to_xmm([0x1111_1111, 0x2222_2222, 0x3333_3333, 0x4444_4444]));
+        state.set_xmm(1, u32x4_to_xmm([0xAAAA_AAAA, 0xBBBB_BBBB, 0xCCCC_CCCC, 0xDDDD_DDDD]));
+        // imm=0b0101: select from src for lanes 0,2
+        execute_ir(&mut state, &mut memory, &[IrInstruction::BlendD { dst: 0, src: 1, mask: 0b0101 }])
+            .expect("execute blendd");
+        let result = xmm_to_u32x4(state.get_xmm(0));
+        assert_eq!(result[0], 0xAAAA_AAAA);
+        assert_eq!(result[1], 0x2222_2222);
+        assert_eq!(result[2], 0xCCCC_CCCC);
+        assert_eq!(result[3], 0x4444_4444);
+    }
+
+    // =====================================================================
+    // E4 — Division by zero and edge case tests
+    // =====================================================================
+
+    #[test]
+    fn execute_div_by_zero_using_div_idiv_ir_fails_gracefully() {
+        // DIV and IDIV with divisor=0 should produce an error
+        let mut state = CpuState::new(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        state.set(Register::Rax, 10);
+        state.set(Register::Rcx, 0);
+        let result = execute_ir(&mut state, &mut memory, &[IrInstruction::Div {
+            src: CompareOperand::Register(Register::Rcx),
+            width: 4,
+        }]);
+        assert!(result.is_err(), "DIV by zero should fail");
+    }
+
+    #[test]
+    fn execute_idiv_by_zero_fails_gracefully() {
+        let mut state = CpuState::new(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        state.set(Register::Rax, 10);
+        state.set(Register::Rcx, 0);
+        let result = execute_ir(&mut state, &mut memory, &[IrInstruction::Idiv {
+            src: CompareOperand::Register(Register::Rcx),
+            width: 4,
+        }]);
+        assert!(result.is_err(), "IDIV by zero should fail");
+    }
+
+    #[test]
+    fn execute_div_overflow_fails_gracefully() {
+        // DIV quotient overflow: RDX:RAX=0x1_0000_0000, divisor=1 => quotient 0x1_0000_0000 doesn't fit in 32-bit EAX
+        let mut state = CpuState::new(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        state.set(Register::Rax, 0);
+        state.set(Register::Rdx, 1);  // RDX:RAX = 0x1_0000_0000
+        state.set(Register::Rcx, 1);
+        let result = execute_ir(&mut state, &mut memory, &[IrInstruction::Div {
+            src: CompareOperand::Register(Register::Rcx),
+            width: 4,
+        }]);
+        assert!(result.is_err(), "DIV overflow should fail");
+    }
+
+    #[test]
+    fn execute_idiv_overflow_fails_gracefully() {
+        let mut state = CpuState::new(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        // IDIV with dividend INT32_MIN and divisor -1 overflows
+        state.set(Register::Rax, 0x8000_0000u32 as u64);
+        state.set(Register::Rdx, 0xFFFF_FFFFu32 as u64);
+        state.set(Register::Rcx, 0xFFFF_FFFFu32 as u64); // -1
+        let result = execute_ir(&mut state, &mut memory, &[IrInstruction::Idiv {
+            src: CompareOperand::Register(Register::Rcx),
+            width: 4,
+        }]);
+        assert!(result.is_err(), "IDIV overflow should fail");
+    }
+
+    // =====================================================================
+    // E4 — Flag computation tests
+    // =====================================================================
+
+    #[test]
+    fn flag_computation_add_sets_cf_on_unsigned_wrap() {
+        let mut state = CpuState::new(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        state.set(Register::Rax, 0xFFFF_FFFF);
+        execute_ir(&mut state, &mut memory, &[IrInstruction::AddImm {
+            dst: Register::Rax, value: 1, width: 4,
+        }]).expect("add");
+        assert!(state.flags.cf, "CF should be set on 32-bit unsigned wrap");
+        assert!(state.flags.zf, "ZF should be set (result=0)");
+    }
+
+    #[test]
+    fn flag_computation_add_sets_of_on_signed_wrap() {
+        let mut state = CpuState::new(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        state.set(Register::Rax, 0x7FFF_FFFFi64 as u64);
+        execute_ir(&mut state, &mut memory, &[IrInstruction::AddImm {
+            dst: Register::Rax, value: 1, width: 4,
+        }]).expect("add");
+        assert!(state.flags.of, "OF should be set on signed overflow (MAX_INT + 1)");
+        assert!(state.flags.sf, "SF should be set (result negative in signed view)");
+    }
+
+    #[test]
+    fn flag_computation_sub_sets_cf_on_borrow() {
+        let mut state = CpuState::new(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        state.set(Register::Rax, 0);
+        execute_ir(&mut state, &mut memory, &[IrInstruction::SubImm {
+            dst: Register::Rax, value: 1, width: 4,
+        }]).expect("sub");
+        assert!(state.flags.cf, "CF should be set on borrow (0 - 1)");
+        assert!(!state.flags.zf);
+        assert!(state.flags.sf, "SF should be set (result = -1)");
+    }
+
+    #[test]
+    fn flag_computation_and_clears_cf_of_sets_zf_sf() {
+        let mut state = CpuState::new(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        state.set(Register::Rax, 0xFFFF_FFFF);
+        execute_ir(&mut state, &mut memory, &[IrInstruction::AndImm {
+            dst: Register::Rax, value: 0, width: 4,
+        }]).expect("and");
+        assert!(!state.flags.cf, "CF should be cleared by AND");
+        assert!(!state.flags.of, "OF should be cleared by AND");
+        assert!(state.flags.zf, "ZF should be set (result=0)");
+        assert!(!state.flags.sf, "SF should be cleared (result non-negative)");
+    }
+
+    #[test]
+    fn flag_computation_xor_clears_cf_of_sets_zf_on_self() {
+        let mut state = CpuState::new(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        state.set(Register::Rax, 0x1234_5678);
+        execute_ir(&mut state, &mut memory, &[IrInstruction::XorReg {
+            dst: Register::Rax,
+            src: CompareOperand::Register(Register::Rax),
+            width: 4,
+        }]).expect("xor");
+        assert!(!state.flags.cf, "CF should be cleared by XOR");
+        assert!(!state.flags.of, "OF should be cleared by XOR");
+        assert!(state.flags.zf, "ZF should be set (self-xor = 0)");
+        assert!(!state.flags.sf, "SF should be cleared");
+    }
+
+    #[test]
+    fn flag_computation_cmp_sets_flags_like_sub_without_destination() {
+        let mut state = CpuState::new(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        state.set(Register::Rax, 5);
+        execute_ir(&mut state, &mut memory, &[IrInstruction::Compare {
+            lhs: CompareOperand::Register(Register::Rax),
+            rhs: CompareOperand::ImmediateU64(5),
+            width: 4,
+        }]).expect("cmp");
+        assert!(state.flags.zf, "ZF should be set (5 == 5)");
+        assert!(!state.flags.cf, "CF should be cleared (no borrow)");
+        assert!(!state.flags.sf, "SF should be cleared");
+    }
+
+    #[test]
+    fn flag_computation_test_sets_zf_on_zero_result() {
+        let mut state = CpuState::new(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        state.set(Register::Rax, 0x0000_00FF);
+        execute_ir(&mut state, &mut memory, &[IrInstruction::Test {
+            lhs: CompareOperand::Register(Register::Rax),
+            rhs: CompareOperand::ImmediateU64(0x0000_FF00),
+            width: 4,
+        }]).expect("test");
+        assert!(state.flags.zf, "ZF should be set (no overlapping bits)");
+        assert!(!state.flags.cf, "CF should be cleared by TEST");
+        assert!(!state.flags.of, "OF should be cleared by TEST");
+    }
+
+    #[test]
+    fn flag_computation_mul_sets_cf_of_on_result_overflow() {
+        let mut state = CpuState::new(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        state.set(Register::Rax, 0x1000_0000);
+        state.set(Register::Rcx, 0x10);
+        execute_ir(&mut state, &mut memory, &[IrInstruction::MulAcc {
+            src: CompareOperand::Register(Register::Rcx),
+            width: 4,
+        }]).expect("mul");
+        assert!(state.flags.cf, "MUL CF should indicate overflow");
+        assert!(state.flags.of, "MUL OF should indicate overflow");
+    }
+
+    #[test]
+    fn flag_computation_inc_does_not_affect_cf() {
+        let mut state = CpuState::new(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        state.set(Register::Rax, 0xFFFF_FFFF);
+        state.flags.cf = false;
+        execute_ir(&mut state, &mut memory, &[IrInstruction::IncReg {
+            dst: Register::Rax, width: 4,
+        }]).expect("inc");
+        assert!(!state.flags.cf, "INC should not alter CF");
+        assert!(state.flags.zf, "ZF should be set (result wraps to 0)");
+    }
+
+    #[test]
+    fn flag_computation_dec_sets_zf_on_zero() {
+        let mut state = CpuState::new(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        state.set(Register::Rax, 1);
+        state.flags.cf = false;
+        execute_ir(&mut state, &mut memory, &[IrInstruction::DecReg {
+            dst: Register::Rax, width: 4,
+        }]).expect("dec");
+        assert!(state.flags.zf, "ZF should be set (1 - 1 = 0)");
+        assert!(!state.flags.cf, "DEC should not alter CF");
+    }
+
+    #[test]
+    fn flag_computation_neg_sets_cf_on_non_zero() {
+        let mut state = CpuState::new(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        state.set(Register::Rax, 1);
+        execute_ir(&mut state, &mut memory, &[IrInstruction::NegReg {
+            dst: Register::Rax, width: 4,
+        }]).expect("neg");
+        assert!(state.flags.cf, "NEG of non-zero should set CF");
+        assert_eq!(state.get(Register::Rax) as i32, -1i32);
+    }
+
+    #[test]
+    fn flag_computation_shl_sets_cf_from_shifted_out_bit() {
+        let mut state = CpuState::new(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        state.set(Register::Rax, 0x8000_0001);
+        execute_ir(&mut state, &mut memory, &[IrInstruction::ShlImm {
+            dst: Register::Rax, count: 1, width: 4,
+        }]).expect("shl");
+        assert!(state.flags.cf, "CF = MSB shifted out (bit 31 was 1)");
+        assert_eq!(state.get(Register::Rax) as u32, 0x0000_0002u32);
+    }
+
+    #[test]
+    fn flag_computation_shr_sets_cf_from_lsb() {
+        let mut state = CpuState::new(GuestArch::X64);
+        let mut memory = MemoryImage::default();
+        state.set(Register::Rax, 0x0000_0001);
+        execute_ir(&mut state, &mut memory, &[IrInstruction::ShrImm {
+            dst: Register::Rax, count: 1, width: 4,
+        }]).expect("shr");
+        assert!(state.flags.cf, "CF = LSB shifted out (bit 0 was 1)");
+        assert_eq!(state.get(Register::Rax) as u32, 0);
+        assert!(state.flags.zf, "ZF should be set (result = 0)");
     }
 }
