@@ -37,13 +37,14 @@ fuzz_target!(|data: &[u8]| {
 
     // === Test 3: SteamMessage deserialisation from raw frames ===
     // A valid frame has: 4-byte magic + 4-byte len + body.
-    // SteamMessage does not implement PartialEq, so we compare Debug
-    // representations for determinism checking.
+    // SteamMessage lacks PartialEq, so determinism and round-trip checks
+    // compare the serialized wire bytes instead of Debug strings (which
+    // allocate and are brittle against Debug format drift).
     let msg_result = steam_protocol::deserialize_message(data);
     let msg_result2 = steam_protocol::deserialize_message(data);
     assert_eq!(
-        format!("{:?}", msg_result),
-        format!("{:?}", msg_result2),
+        message_digest(msg_result.as_ref()),
+        message_digest(msg_result2.as_ref()),
         "deserialize_message produced nondeterministic results"
     );
 
@@ -52,8 +53,8 @@ fuzz_target!(|data: &[u8]| {
         let frame = steam_protocol::serialize_message(msg);
         let re_deserialized = steam_protocol::deserialize_message(&frame);
         assert_eq!(
-            format!("{:?}", Some(msg.clone())),
-            format!("{:?}", re_deserialized),
+            message_digest(Some(msg)),
+            message_digest(re_deserialized.as_ref()),
             "SteamMessage round-trip failed"
         );
     }
@@ -72,12 +73,28 @@ fuzz_target!(|data: &[u8]| {
 
 fn url_parse_summary(input: &str) -> String {
     match steam_protocol::parse_steam_protocol_url(input) {
-        Some(url) => format!(
-            "ok:{}:{}:{}",
-            format!("{:?}", url.command),
-            url.query_params.len(),
-            url.raw_url.len(),
-        ),
+        Some(url) => {
+            // A parsed steam:// URL must begin with an alphabetic scheme
+            // (the `url` crate requires schemes to start with a letter)
+            assert!(
+                url.raw_url
+                    .chars()
+                    .next()
+                    .map_or(false, |c| c.is_ascii_alphabetic()),
+                "parsed URL {url:?} has no alphabetic scheme start"
+            );
+            format!(
+                "ok:{}:{}:{}",
+                format!("{:?}", url.command),
+                url.query_params.len(),
+                url.raw_url.len(),
+            )
+        }
         None => "err:parse_failed".to_string(),
     }
+}
+
+/// Value-level digest of a message: its serialized wire bytes.
+fn message_digest(msg: Option<&steam_protocol::SteamMessage>) -> Option<Vec<u8>> {
+    msg.map(steam_protocol::serialize_message)
 }

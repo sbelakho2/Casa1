@@ -100,13 +100,6 @@ doc = false
 bench = false
 
 [[bin]]
-name = "websocket"
-path = "fuzz_targets/websocket.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
 name = "url_handling"
 path = "fuzz_targets/url_handling.rs"
 test = false

@@ -8,6 +8,7 @@
 //! 5. Startup-to-First-Frame — composite pipeline benchmark
 
 use criterion::{Criterion, criterion_group, criterion_main};
+use std::collections::BTreeMap;
 use std::hint::black_box as bb;
 
 // ---------------------------------------------------------------------------
@@ -83,12 +84,13 @@ fn cmp_jcc_block(count: usize) -> Vec<u8> {
 }
 
 /// Build a block of simple SSE SIMD instructions:
-/// MOVUPS XMM0, XMM1 (3 bytes: 0F 10 C1) + ADDPS XMM0, XMM1 (3 bytes: 0F 58 C1)
+/// MOVUPS XMM0, XMM1 (3 bytes: 0F 10 C1) + MOVUPS XMM1, XMM0 (3 bytes: 0F 10 C8)
+/// (register-form MOVUPS is the SSE path supported by the decoder)
 fn simd_block(count: usize) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(count * 6);
     for _ in 0..count {
         bytes.extend_from_slice(&[0x0F, 0x10, 0xC1]); // MOVUPS XMM0, XMM1
-        bytes.extend_from_slice(&[0x0F, 0x58, 0xC1]); // ADDPS XMM0, XMM1
+        bytes.extend_from_slice(&[0x0F, 0x10, 0xC8]); // MOVUPS XMM1, XMM0
     }
     bytes
 }
@@ -235,7 +237,76 @@ fn minimal_pe() -> Vec<u8> {
     pe
 }
 
+/// Write a complete PE32+ optional header: 112 bytes of standard/windows
+/// fields plus 16 data directories (128 bytes) = 240 bytes = 0xF0, exactly
+/// matching the declared `size_of_optional_header`.
+fn write_pe32p_optional_header(
+    pe: &mut Vec<u8>,
+    entry_point: u32,
+    size_of_image: u32,
+    size_of_headers: u32,
+    directories: &[(u32, u32)],
+) {
+    pe.extend_from_slice(&0x020Bu16.to_le_bytes()); // PE32+ magic
+    pe.push(14); // major linker version
+    pe.push(0); // minor linker version
+    pe.extend_from_slice(&0x200u32.to_le_bytes()); // SizeOfCode
+    pe.extend_from_slice(&0u32.to_le_bytes()); // SizeOfInitializedData
+    pe.extend_from_slice(&0u32.to_le_bytes()); // SizeOfUninitializedData
+    pe.extend_from_slice(&entry_point.to_le_bytes());
+    pe.extend_from_slice(&0x1000u32.to_le_bytes()); // BaseOfCode
+    pe.extend_from_slice(&0x1400_0000_0u64.to_le_bytes()); // ImageBase
+    pe.extend_from_slice(&0x1000u32.to_le_bytes()); // SectionAlignment
+    pe.extend_from_slice(&0x200u32.to_le_bytes()); // FileAlignment
+    pe.extend_from_slice(&6u16.to_le_bytes()); // MajorOSVersion
+    pe.extend_from_slice(&0u16.to_le_bytes()); // MinorOSVersion
+    pe.extend_from_slice(&0u16.to_le_bytes()); // MajorImageVersion
+    pe.extend_from_slice(&0u16.to_le_bytes()); // MinorImageVersion
+    pe.extend_from_slice(&6u16.to_le_bytes()); // MajorSubsystemVersion
+    pe.extend_from_slice(&0u16.to_le_bytes()); // MinorSubsystemVersion
+    pe.extend_from_slice(&0u32.to_le_bytes()); // Win32VersionValue
+    pe.extend_from_slice(&size_of_image.to_le_bytes());
+    pe.extend_from_slice(&size_of_headers.to_le_bytes());
+    pe.extend_from_slice(&0u32.to_le_bytes()); // Checksum
+    pe.extend_from_slice(&2u16.to_le_bytes()); // Subsystem: WINDOWS_GUI
+    pe.extend_from_slice(&0u16.to_le_bytes()); // DllCharacteristics
+    pe.extend_from_slice(&0x100_000u64.to_le_bytes()); // SizeOfStackReserve
+    pe.extend_from_slice(&0x1000u64.to_le_bytes()); // SizeOfStackCommit
+    pe.extend_from_slice(&0x100_000u64.to_le_bytes()); // SizeOfHeapReserve
+    pe.extend_from_slice(&0x1000u64.to_le_bytes()); // SizeOfHeapCommit
+    pe.extend_from_slice(&0u32.to_le_bytes()); // LoaderFlags
+    pe.extend_from_slice(&16u32.to_le_bytes()); // NumberOfRvaAndSizes
+    for index in 0..16 {
+        let (rva, size) = directories.get(index).copied().unwrap_or((0, 0));
+        pe.extend_from_slice(&rva.to_le_bytes());
+        pe.extend_from_slice(&size.to_le_bytes());
+    }
+}
+
+/// Append a 40-byte IMAGE_SECTION_HEADER.
+fn write_pe_section(
+    pe: &mut Vec<u8>,
+    name: &[u8; 8],
+    virtual_size: u32,
+    virtual_address: u32,
+    raw_data_size: u32,
+    raw_data_ptr: u32,
+) {
+    pe.extend_from_slice(name);
+    pe.extend_from_slice(&virtual_size.to_le_bytes());
+    pe.extend_from_slice(&virtual_address.to_le_bytes());
+    pe.extend_from_slice(&raw_data_size.to_le_bytes());
+    pe.extend_from_slice(&raw_data_ptr.to_le_bytes());
+    pe.extend_from_slice(&0u32.to_le_bytes()); // relocs ptr
+    pe.extend_from_slice(&0u32.to_le_bytes()); // linenumbers ptr
+    pe.extend_from_slice(&0u16.to_le_bytes()); // num relocs
+    pe.extend_from_slice(&0u16.to_le_bytes()); // num linenumbers
+    pe.extend_from_slice(&0x6000_0020u32.to_le_bytes()); // CODE | EXECUTE | READ
+}
+
 /// Build a PE with many (empty) sections to stress section-table parsing.
+/// Writes the full PE32+ optional header (0xF0) so the section table sits
+/// exactly where the parser expects it (optional header + declared size).
 fn many_sections_pe(count: usize) -> Vec<u8> {
     let count = count.min(100); // reasonable upper bound
     // DOS header (64 bytes) + e_lfanew
@@ -259,14 +330,16 @@ fn many_sections_pe(count: usize) -> Vec<u8> {
     pe.extend_from_slice(&size_of_optional_header.to_le_bytes());
     pe.extend_from_slice(&0x0022u16.to_le_bytes()); // characteristics
 
-    // Optional header (minimal)
-    pe.extend_from_slice(&0x020Bu16.to_le_bytes()); // PE32+ magic
-    pe.extend_from_slice(&[0; 86]); // minimal optional header padding
-    // Data directory entries (16 × 8 = 128 bytes)
-    for _ in 0..16 {
-        pe.extend_from_slice(&0u32.to_le_bytes());
-        pe.extend_from_slice(&0u32.to_le_bytes());
-    }
+    // Section table starts at 0x80 + 4 + 20 + 0xF0 = 0x188
+    let section_table_start = 0x80 + 4 + 20 + 0xF0;
+    let headers_size = (section_table_start + count * 40 + 0x1FF) & !0x1FF;
+    let size_of_image = 0x1000 * (count as u32 + 2);
+    write_pe32p_optional_header(&mut pe, 0x1000, size_of_image, headers_size as u32, &[]);
+    debug_assert_eq!(
+        pe.len(),
+        section_table_start,
+        "optional header must be exactly 0xF0 bytes"
+    );
 
     // Section table entries
     for i in 0..count {
@@ -275,18 +348,18 @@ fn many_sections_pe(count: usize) -> Vec<u8> {
         let mut section_name = [0u8; 8];
         section_name[..name_bytes.len().min(8)]
             .copy_from_slice(&name_bytes[..name_bytes.len().min(8)]);
-        pe.extend_from_slice(&section_name);
-        pe.extend_from_slice(&0x1000u32.to_le_bytes()); // virtual size
-        pe.extend_from_slice(&(0x1000 + (i as u32 * 0x1000)).to_le_bytes()); // VA
-        pe.extend_from_slice(&0x200u32.to_le_bytes()); // raw data size
-        pe.extend_from_slice(&0x200u32.to_le_bytes()); // raw data ptr
-        pe.extend_from_slice(&0u32.to_le_bytes()); // relocs ptr
-        pe.extend_from_slice(&0u32.to_le_bytes()); // linenumbers ptr
-        pe.extend_from_slice(&0u16.to_le_bytes()); // num relocs
-        pe.extend_from_slice(&0u16.to_le_bytes()); // num linenumbers
-        pe.extend_from_slice(&0x60000020u32.to_le_bytes()); // characteristics
+        write_pe_section(
+            &mut pe,
+            &section_name,
+            0x1000,                       // virtual size
+            0x1000 + (i as u32 * 0x1000), // VA
+            0x200,                        // raw data size
+            0x200,                        // raw data ptr
+        );
     }
-
+    pe.resize(headers_size, 0);
+    // Raw data for the sections (all point at 0x200)
+    pe.extend_from_slice(&[0x90u8; 0x200]);
     pe
 }
 
@@ -299,9 +372,12 @@ fn bench_cpu_decode_nop(c: &mut Criterion) {
     let mut group = c.benchmark_group("cpu/decode/nop");
     for size in [64usize, 256, 1024] {
         let code = nop_sled(size);
+        let decoded = casa1::cpu::decode_block(&code, 0x1000, arch).expect("decode nop sled");
+        assert_eq!(decoded.len(), size, "NOP decode must yield one instruction per byte");
         group.bench_function(format!("{size}_bytes"), |b| {
             b.iter(|| {
-                let decoded = casa1::cpu::decode_block(bb(&code), bb(0x1000), bb(arch));
+                let decoded = casa1::cpu::decode_block(bb(&code), bb(0x1000), bb(arch))
+                    .expect("decode nop sled");
                 bb(decoded)
             })
         });
@@ -314,9 +390,12 @@ fn bench_cpu_decode_alu(c: &mut Criterion) {
     let mut group = c.benchmark_group("cpu/decode/alu");
     for count in [10usize, 50, 200] {
         let code = alu_mix_block(count);
+        let decoded = casa1::cpu::decode_block(&code, 0x1000, arch).expect("decode alu block");
+        assert_eq!(decoded.len(), count * 3, "ALU block is 3 instructions per triplet");
         group.bench_function(format!("{count}_insns"), |b| {
             b.iter(|| {
-                let decoded = casa1::cpu::decode_block(bb(&code), bb(0x1000), bb(arch));
+                let decoded = casa1::cpu::decode_block(bb(&code), bb(0x1000), bb(arch))
+                    .expect("decode alu block");
                 bb(decoded)
             })
         });
@@ -329,9 +408,12 @@ fn bench_cpu_decode_simd(c: &mut Criterion) {
     let mut group = c.benchmark_group("cpu/decode/simd");
     for count in [10usize, 50, 200] {
         let code = simd_block(count);
+        let decoded = casa1::cpu::decode_block(&code, 0x1000, arch).expect("decode simd block");
+        assert_eq!(decoded.len(), count * 2, "SIMD block is 2 instructions per pair");
         group.bench_function(format!("{count}_insns"), |b| {
             b.iter(|| {
-                let decoded = casa1::cpu::decode_block(bb(&code), bb(0x1000), bb(arch));
+                let decoded = casa1::cpu::decode_block(bb(&code), bb(0x1000), bb(arch))
+                    .expect("decode simd block");
                 bb(decoded)
             })
         });
@@ -344,9 +426,12 @@ fn bench_cpu_decode_control_flow(c: &mut Criterion) {
     let mut group = c.benchmark_group("cpu/decode/control_flow");
     for count in [10usize, 50, 200] {
         let code = cmp_jcc_block(count);
+        let decoded = casa1::cpu::decode_block(&code, 0x1000, arch).expect("decode cmp/jcc block");
+        assert_eq!(decoded.len(), count * 2, "cmp/jcc block is 2 instructions per pair");
         group.bench_function(format!("{count}_insns"), |b| {
             b.iter(|| {
-                let decoded = casa1::cpu::decode_block(bb(&code), bb(0x1000), bb(arch));
+                let decoded = casa1::cpu::decode_block(bb(&code), bb(0x1000), bb(arch))
+                    .expect("decode cmp/jcc block");
                 bb(decoded)
             })
         });
@@ -360,9 +445,11 @@ fn bench_cpu_lower_to_ir(c: &mut Criterion) {
     for count in [10usize, 50, 200] {
         let code = alu_mix_block(count);
         let decoded = casa1::cpu::decode_block(&code, 0x1000, arch).expect("decode");
+        let ir = casa1::cpu::lower_to_ir(&decoded).expect("lower");
+        assert_eq!(ir.len(), decoded.len(), "lowering must preserve instruction count");
         group.bench_function(format!("{count}_insns"), |b| {
             b.iter(|| {
-                let ir = casa1::cpu::lower_to_ir(bb(&decoded));
+                let ir = casa1::cpu::lower_to_ir(bb(&decoded)).expect("lower");
                 bb(ir)
             })
         });
@@ -393,7 +480,9 @@ fn bench_cpu_full_pipeline(c: &mut Criterion) {
                     (state, memory, ir)
                 },
                 |(mut state, mut memory, ir)| {
-                    let result = engine.execute_ir(bb(&mut state), bb(&mut memory), bb(&ir));
+                    let result = engine
+                        .execute_ir(bb(&mut state), bb(&mut memory), bb(&ir))
+                        .expect("execute");
                     bb(result)
                 },
             )
@@ -413,9 +502,15 @@ fn bench_jit_compile_tier0(c: &mut Criterion) {
         let code = alu_mix_block(count);
         let decoded = casa1::cpu::decode_block(&code, 0x1000, arch).expect("decode");
         let ir = casa1::cpu::lower_to_ir(&decoded).expect("lower");
+        let mut probe = casa1::jit::JitCompiler::new();
+        let compiled = probe.compile_tier0(&ir, 0x1000, arch, None).expect("compile tier0");
+        assert!(compiled.code_size > 0, "tier0 must emit code");
+        assert_eq!(compiled.instruction_count, ir.len());
         group.bench_function(format!("{count}_insns"), |b| {
             b.iter_with_setup(casa1::jit::JitCompiler::new, |mut compiler| {
-                let result = compiler.compile_tier0(bb(&ir), bb(0x1000), bb(arch), bb(None));
+                let result = compiler
+                    .compile_tier0(bb(&ir), bb(0x1000), bb(arch), bb(None))
+                    .expect("compile tier0");
                 bb(result)
             })
         });
@@ -430,9 +525,15 @@ fn bench_jit_compile_tier1(c: &mut Criterion) {
         let code = alu_mix_block(count);
         let decoded = casa1::cpu::decode_block(&code, 0x1000, arch).expect("decode");
         let ir = casa1::cpu::lower_to_ir(&decoded).expect("lower");
+        let mut probe = casa1::jit::JitCompiler::new();
+        let compiled = probe.compile_tier1(&ir, 0x1000, arch, None).expect("compile tier1");
+        assert!(compiled.code_size > 0, "tier1 must emit code");
+        assert_eq!(compiled.instruction_count, ir.len());
         group.bench_function(format!("{count}_insns"), |b| {
             b.iter_with_setup(casa1::jit::JitCompiler::new, |mut compiler| {
-                let result = compiler.compile_tier1(bb(&ir), bb(0x1000), bb(arch), bb(None));
+                let result = compiler
+                    .compile_tier1(bb(&ir), bb(0x1000), bb(arch), bb(None))
+                    .expect("compile tier1");
                 bb(result)
             })
         });
@@ -447,9 +548,15 @@ fn bench_jit_compile_tier2(c: &mut Criterion) {
         let code = alu_mix_block(count);
         let decoded = casa1::cpu::decode_block(&code, 0x1000, arch).expect("decode");
         let ir = casa1::cpu::lower_to_ir(&decoded).expect("lower");
+        let mut probe = casa1::jit::JitCompiler::new();
+        let compiled = probe.compile_tier2(&ir, 0x1000, arch, None).expect("compile tier2");
+        assert!(compiled.code_size > 0, "tier2 must emit code");
+        assert_eq!(compiled.instruction_count, ir.len());
         group.bench_function(format!("{count}_insns"), |b| {
             b.iter_with_setup(casa1::jit::JitCompiler::new, |mut compiler| {
-                let result = compiler.compile_tier2(bb(&ir), bb(0x1000), bb(arch), bb(None));
+                let result = compiler
+                    .compile_tier2(bb(&ir), bb(0x1000), bb(arch), bb(None))
+                    .expect("compile tier2");
                 bb(result)
             })
         });
@@ -461,15 +568,33 @@ fn bench_jit_constant_folding(c: &mut Criterion) {
     let arch = casa1::cpu::GuestArch::X64;
     let mut group = c.benchmark_group("jit/optimiser/constant_fold");
     for count in [10usize, 100, 500] {
-        // Build MOV EAX, imm32 chains — each successive MOV EAX overwrites the
-        // previous, producing dead assignments that constant folding resolves.
+        // MOV EAX, imm32 chains — each successive MOV EAX overwrites the
+        // previous one; constant folding collapses the chain to the final
+        // write (dead-assignment elimination would not shrink it further).
         let code = mov_eax_block(count);
         let decoded = casa1::cpu::decode_block(&code, 0x1000, arch).expect("decode");
         let ir = casa1::cpu::lower_to_ir(&decoded).expect("lower");
-        // Compile with tier1 (includes constant folding pass internally)
+        // Prove the tier1 optimizer actually ran: compiled output must be
+        // strictly smaller than the unoptimised tier0 output for the same IR.
+        let mut tier0_probe = casa1::jit::JitCompiler::new();
+        let mut tier1_probe = casa1::jit::JitCompiler::new();
+        let t0 = tier0_probe
+            .compile_tier0(&ir, 0x1000, arch, None)
+            .expect("compile tier0");
+        let t1 = tier1_probe
+            .compile_tier1(&ir, 0x1000, arch, None)
+            .expect("compile tier1");
+        assert!(
+            t1.code_size < t0.code_size,
+            "constant folding did not reduce code size (tier0={}, tier1={})",
+            t0.code_size,
+            t1.code_size
+        );
         group.bench_function(format!("tier1_{count}_insns"), |b| {
             b.iter_with_setup(casa1::jit::JitCompiler::new, |mut compiler| {
-                let result = compiler.compile_tier1(bb(&ir), bb(0x1000), bb(arch), bb(None));
+                let result = compiler
+                    .compile_tier1(bb(&ir), bb(0x1000), bb(arch), bb(None))
+                    .expect("compile tier1");
                 bb(result)
             })
         });
@@ -481,15 +606,32 @@ fn bench_jit_dead_code_elimination(c: &mut Criterion) {
     let arch = casa1::cpu::GuestArch::X64;
     let mut group = c.benchmark_group("jit/optimiser/dce");
     for count in [10usize, 100, 500] {
-        // Build dead_eax_block: each triplet has a dead MOV EAX that is
-        // immediately overwritten — DCE eliminates the first assignment.
+        // Each triplet has a dead MOV EAX that is immediately overwritten —
+        // DCE eliminates the first assignment (dead-assignment elimination).
         let code = dead_eax_block(count);
         let decoded = casa1::cpu::decode_block(&code, 0x1000, arch).expect("decode");
         let ir = casa1::cpu::lower_to_ir(&decoded).expect("lower");
-        // Compile with tier1 (includes constant folding + DCE passes internally)
+        // Prove the DCE pass actually ran: tier1 output must be strictly
+        // smaller than tier0 output for the same IR.
+        let mut tier0_probe = casa1::jit::JitCompiler::new();
+        let mut tier1_probe = casa1::jit::JitCompiler::new();
+        let t0 = tier0_probe
+            .compile_tier0(&ir, 0x1000, arch, None)
+            .expect("compile tier0");
+        let t1 = tier1_probe
+            .compile_tier1(&ir, 0x1000, arch, None)
+            .expect("compile tier1");
+        assert!(
+            t1.code_size < t0.code_size,
+            "DCE did not reduce code size (tier0={}, tier1={})",
+            t0.code_size,
+            t1.code_size
+        );
         group.bench_function(format!("tier1_{count}_insns"), |b| {
             b.iter_with_setup(casa1::jit::JitCompiler::new, |mut compiler| {
-                let result = compiler.compile_tier1(bb(&ir), bb(0x1000), bb(arch), bb(None));
+                let result = compiler
+                    .compile_tier1(bb(&ir), bb(0x1000), bb(arch), bb(None))
+                    .expect("compile tier1");
                 bb(result)
             })
         });
@@ -501,6 +643,23 @@ fn bench_jit_tier_promotion(c: &mut Criterion) {
     let mut group = c.benchmark_group("jit/tier_promotion");
     let mut compiler = casa1::jit::TieredCompiler::with_thresholds(10, 50);
 
+    // Prove the promotion policy: the 10th execution promotes to Tier1 and
+    // the 50th to Tier2.
+    let mut probe = casa1::jit::TieredCompiler::with_thresholds(10, 50);
+    let mut tier1_at = None;
+    let mut tier2_at = None;
+    for exec in 1..=60 {
+        let tier = probe.record_execution(0x1000);
+        if tier == Some(casa1::jit::CompilationTier::Tier1) && tier1_at.is_none() {
+            tier1_at = Some(exec);
+        }
+        if tier == Some(casa1::jit::CompilationTier::Tier2) && tier2_at.is_none() {
+            tier2_at = Some(exec);
+        }
+    }
+    assert_eq!(tier1_at, Some(10), "Tier1 promotion must occur at 10 executions");
+    assert_eq!(tier2_at, Some(50), "Tier2 promotion must occur at 50 executions");
+
     group.bench_function("100_blocks_x_100_execs", |b| {
         b.iter(|| {
             for i in 0..100 {
@@ -508,6 +667,11 @@ fn bench_jit_tier_promotion(c: &mut Criterion) {
                 for _ in 0..100 {
                     let _tier = compiler.record_execution(bb(addr));
                 }
+                assert_eq!(
+                    compiler.get_tier(addr),
+                    casa1::jit::CompilationTier::Tier2,
+                    "block {addr:#x} must reach Tier2 after 100 executions"
+                );
             }
             bb(())
         })
@@ -520,15 +684,31 @@ fn bench_jit_inline_cache(c: &mut Criterion) {
     for max_entries in [16usize, 64, 256] {
         group.bench_function(format!("{max_entries}_entries"), |b| {
             let mut ic = casa1::jit::InlineCache::new(max_entries);
+            let mut iter_count: u64 = 0;
             b.iter(|| {
-                // Mix of hits (repeated call sites) and misses
-                for i in 0..max_entries * 4 {
-                    let call_site = 0x1000 + (i as u64 * 0x40);
-                    let target = 0x8000_0000 + ((i as u64 % max_entries as u64) * 0x100);
+                // Phase 1: a distinct stream of call sites (misses that insert).
+                // Phase 2: re-lookup the same sites — every lookup must hit.
+                // With one insert and one hit per site per iteration the hit
+                // rate is exactly 0.5, well above the asserted floor.
+                let base = (iter_count % 4) * max_entries as u64;
+                iter_count += 1;
+                for i in 0..max_entries {
+                    let call_site = 0x10_0000 + (base + i as u64) * 0x40;
+                    let target = 0x9000_0000 + i as u64;
                     let hit = ic.lookup(bb(call_site), bb(target));
                     bb(hit);
                 }
-                bb(ic.hit_rate())
+                for i in 0..max_entries {
+                    let call_site = 0x10_0000 + (base + i as u64) * 0x40;
+                    let target = 0x9000_0000 + i as u64;
+                    assert!(
+                        ic.lookup(bb(call_site), bb(target)),
+                        "repeated call site lookup must hit"
+                    );
+                }
+                let rate = ic.hit_rate();
+                assert!(rate >= 0.5, "hit rate {rate} below 0.5");
+                bb(rate)
             })
         });
     }
@@ -542,10 +722,12 @@ fn bench_jit_inline_cache(c: &mut Criterion) {
 fn bench_pe_parse_minimal(c: &mut Criterion) {
     let mut group = c.benchmark_group("pe/parse/minimal");
     let pe_data = minimal_pe();
+    let parsed = casa1::pe::parse(&pe_data).expect("minimal PE must parse");
+    assert_eq!(parsed.sections.len(), 1);
 
     group.bench_function("parse", |b| {
         b.iter(|| {
-            let parsed = casa1::pe::parse(bb(&pe_data));
+            let parsed = casa1::pe::parse(bb(&pe_data)).expect("parse");
             bb(parsed)
         })
     });
@@ -556,9 +738,11 @@ fn bench_pe_parse_many_sections(c: &mut Criterion) {
     let mut group = c.benchmark_group("pe/parse/many_sections");
     for count in [5usize, 20, 100] {
         let pe_data = many_sections_pe(count);
+        let parsed = casa1::pe::parse(&pe_data).expect("many-sections PE must parse");
+        assert_eq!(parsed.sections.len(), count, "parsed section count mismatch");
         group.bench_function(format!("{count}_sections"), |b| {
             b.iter(|| {
-                let parsed = casa1::pe::parse(bb(&pe_data));
+                let parsed = casa1::pe::parse(bb(&pe_data)).expect("parse");
                 bb(parsed)
             })
         });
@@ -569,12 +753,17 @@ fn bench_pe_parse_many_sections(c: &mut Criterion) {
 fn bench_pe_parse_and_map(c: &mut Criterion) {
     let mut group = c.benchmark_group("pe/parse_and_map");
     let pe_data = minimal_pe();
+    let parsed = casa1::pe::parse(&pe_data).expect("parse");
+    let mapped = casa1::pe::map_image(&pe_data, &parsed, "bench", false).expect("map");
+    assert!(!mapped.sections.is_empty());
 
     group.bench_function("parse_then_map", |b| {
         b.iter_with_setup(
             || casa1::pe::parse(&pe_data).expect("parse"),
             |parsed| {
-                let mapped = casa1::pe::map_image(bb(&pe_data), bb(&parsed), "bench", bb(false));
+                let mapped =
+                    casa1::pe::map_image(bb(&pe_data), bb(&parsed), "bench", bb(false))
+                        .expect("map");
                 bb(mapped)
             },
         )
@@ -618,21 +807,28 @@ fn bench_gfx_command_batching(c: &mut Criterion) {
 fn bench_gfx_shader_compiler_submit(c: &mut Criterion) {
     use casa1::perf::ParallelShaderCompiler;
 
-    let mut group = c.benchmark_group("gfx/shader_compiler/submit");
+    // Measures job-queue bookkeeping only (no shader is compiled).
+    let mut group = c.benchmark_group("gfx/shader_compiler/submit_bookkeeping");
     for concurrent in [4usize, 16, 64] {
+        // Pre-build the owned job arguments outside the measured closure so
+        // no string formatting/allocation happens inside the timed region.
+        let jobs: Vec<(String, String, String)> = (0..concurrent * 2)
+            .map(|i| (format!("sha256:{i}"), "vs".to_string(), "main".to_string()))
+            .collect();
         group.bench_function(format!("{concurrent}_concurrent"), |b| {
             b.iter_with_setup(
                 || ParallelShaderCompiler::new(concurrent),
                 |mut compiler| {
-                    for i in 0..concurrent * 2 {
+                    for (hash, stage, entry) in &jobs {
                         let id = compiler.submit_job(
-                            bb(format!("sha256:{i}")),
-                            bb("vs".into()),
-                            bb("main".into()),
+                            bb(hash.clone()),
+                            bb(stage.clone()),
+                            bb(entry.clone()),
                         );
-                        let _ = compiler.mark_compiling(bb(id));
+                        compiler.mark_compiling(bb(id)).expect("mark compiling");
                     }
-                    bb(compiler.pending_jobs().len())
+                    let pending = compiler.pending_jobs().len();
+                    bb(pending)
                 },
             )
         });
@@ -643,7 +839,8 @@ fn bench_gfx_shader_compiler_submit(c: &mut Criterion) {
 fn bench_gfx_upload_streaming(c: &mut Criterion) {
     use casa1::perf::GpuUploadStreamer;
 
-    let mut group = c.benchmark_group("gfx/upload_streaming");
+    // Measures the O(1) allocate() bookkeeping only (no bytes are uploaded).
+    let mut group = c.benchmark_group("gfx/upload_streaming/allocate_bookkeeping");
     for alloc_size in [4096usize, 65536, 524288] {
         group.bench_function(format!("{}_bytes", alloc_size), |b| {
             b.iter_with_setup(
@@ -654,12 +851,42 @@ fn bench_gfx_upload_streaming(c: &mut Criterion) {
                     (streamer, buf_id)
                 },
                 |(mut streamer, buf_id)| {
-                    let offset = streamer.allocate(bb(buf_id), bb(alloc_size));
+                    let offset = streamer.allocate(bb(buf_id), bb(alloc_size)).expect("allocate");
                     bb(offset)
                 },
             )
         });
     }
+    group.finish();
+}
+
+fn bench_gfx_upload_streaming_wrap(c: &mut Criterion) {
+    use casa1::perf::GpuUploadStreamer;
+
+    // Exercises the ring-wrap path: allocating past the ring capacity resets
+    // the write offset, which is the actual "streaming" semantics.
+    let mut group = c.benchmark_group("gfx/upload_streaming/wrap");
+    group.bench_function("wrap_ring", |b| {
+        b.iter_with_setup(
+            || {
+                let ring = 65536;
+                let mut streamer = GpuUploadStreamer::new(ring);
+                let buf_id = streamer.create_streaming_buffer(ring);
+                (streamer, buf_id)
+            },
+            |(mut streamer, buf_id)| {
+                let mut saw_wrap = false;
+                let mut last_offset = 0usize;
+                for _ in 0..64 {
+                    let offset = streamer.allocate(bb(buf_id), bb(4096)).expect("allocate");
+                    saw_wrap |= offset < last_offset;
+                    last_offset = offset;
+                }
+                assert!(saw_wrap, "streaming ring never wrapped");
+                bb(last_offset)
+            },
+        )
+    });
     group.finish();
 }
 
@@ -691,6 +918,11 @@ fn bench_startup_full_pipeline(c: &mut Criterion) {
         c.extend_from_slice(&cmp_jcc_block(10));
         c
     };
+    // Prove the boot block decodes and lowers before benchmarking it
+    let probe_decoded = casa1::cpu::decode_block(&code, 0x1000, arch).expect("decode boot block");
+    assert!(!probe_decoded.is_empty());
+    let probe_ir = casa1::cpu::lower_to_ir(&probe_decoded).expect("lower boot block");
+    assert!(!probe_ir.is_empty());
 
     group.bench_function("decode_lower_execute", |b| {
         b.iter_with_setup(
@@ -706,7 +938,9 @@ fn bench_startup_full_pipeline(c: &mut Criterion) {
                 // Phase 2: Lower to IR
                 let ir = casa1::cpu::lower_to_ir(bb(&decoded)).expect("lower");
                 // Phase 3: Execute (interpretation)
-                let result = engine.execute_ir(bb(&mut state), bb(&mut memory), bb(&ir));
+                let result = engine
+                    .execute_ir(bb(&mut state), bb(&mut memory), bb(&ir))
+                    .expect("execute");
                 bb(result)
             },
         )
@@ -728,10 +962,17 @@ fn bench_startup_adaptive_jit(c: &mut Criterion) {
     group.bench_function("tier0_then_tier1_then_tier2", |b| {
         b.iter_with_setup(casa1::jit::JitCompiler::new, |mut compiler| {
             // Simulate adaptive tier progression
-            let _t0 = compiler.compile_tier0(bb(&ir), bb(0x1000), bb(arch), bb(None));
-            let _t1 = compiler.compile_tier1(bb(&ir), bb(0x1000), bb(arch), bb(None));
-            let _t2 = compiler.compile_tier2(bb(&ir), bb(0x1000), bb(arch), bb(None));
-            bb(())
+            let t0 = compiler
+                .compile_tier0(bb(&ir), bb(0x1000), bb(arch), bb(None))
+                .expect("compile tier0");
+            let t1 = compiler
+                .compile_tier1(bb(&ir), bb(0x1000), bb(arch), bb(None))
+                .expect("compile tier1");
+            let t2 = compiler
+                .compile_tier2(bb(&ir), bb(0x1000), bb(arch), bb(None))
+                .expect("compile tier2");
+            assert!(t0.code_size > 0 && t1.code_size > 0 && t2.code_size > 0);
+            bb((t0, t1, t2))
         })
     });
 
@@ -751,7 +992,9 @@ fn bench_startup_pe_load_and_prepare(c: &mut Criterion) {
             |parsed| {
                 // Parse again (cold path)
                 let parsed2 = casa1::pe::parse(bb(&pe_data)).expect("parse");
-                let mapped = casa1::pe::map_image(bb(&pe_data), bb(&parsed2), "bench", bb(false));
+                let mapped = casa1::pe::map_image(bb(&pe_data), bb(&parsed2), "bench", bb(false))
+                    .expect("map");
+                assert!(!mapped.sections.is_empty());
                 bb((parsed, mapped))
             },
         )
@@ -789,74 +1032,110 @@ fn bench_startup_perf_subsystems(c: &mut Criterion) {
     group.finish();
 }
 
-/// Build a synthetic PE with a large import table.
-/// Generates `count` import entries pointing to kernel32.dll.
+/// Build a synthetic PE with a real import table.
+/// Generates `count` import thunks (hint/name entries) into kernel32.dll.
+/// The import directory is populated so `pe::parse` resolves all thunks.
 fn many_imports_pe(count: usize) -> Vec<u8> {
     let count = count.min(4096);
-    let base_pe = minimal_pe();
-    let mut pe = base_pe;
-    // Pad to accommodate import data
-    pe.resize(0x400, 0);
-    // Build an import directory table at offset 0x400
-    let import_offset: u32 = 0x400;
-    let iat_offset: u32 = 0x800;
-    let hint_name_offset: u32 = 0xC00;
-    // Number of import descriptors: 1 (kernel32.dll) + 1 (terminator)
-    let num_desc = 2;
-    let desc_size = num_desc * 20; // each IMAGE_IMPORT_DESCRIPTOR is 20 bytes
-    let lookup_table_offset = import_offset + desc_size as u32;
-    pe.resize(import_offset as usize, 0);
+    let mut pe = vec![0u8; 64]; // DOS header
+    pe[0..2].copy_from_slice(b"MZ");
+    let e_lfanew: u32 = 0x80;
+    pe[0x3C..0x40].copy_from_slice(&e_lfanew.to_le_bytes());
+    pe.resize(0x80, 0);
+    pe.extend_from_slice(b"PE\0\0");
+
+    pe.extend_from_slice(&0x8664u16.to_le_bytes()); // machine
+    pe.extend_from_slice(&2u16.to_le_bytes()); // number of sections (.text + .idata)
+    pe.extend_from_slice(&0u32.to_le_bytes()); // timedatestamp
+    pe.extend_from_slice(&0u32.to_le_bytes()); // ptr to symbols
+    pe.extend_from_slice(&0u32.to_le_bytes()); // num symbols
+    pe.extend_from_slice(&0xF0u16.to_le_bytes()); // size of optional header
+    pe.extend_from_slice(&0x0022u16.to_le_bytes()); // characteristics
+
+    // .idata layout (RVA 0x2000, file offset 0x400):
+    //   1. Import descriptor table: kernel32 entry + terminator (2 × 20 = 40)
+    //   2. ILT: `count` name-RVA thunks + zero terminator
+    //   3. IAT: `count` name-RVA thunks + zero terminator
+    //   4. Hint/name table: `count` (hint u16 + "FuncN\0" + even padding)
+    //   5. DLL name: "kernel32.dll\0"
+    let desc_rva: u32 = 0x2000;
+    let desc_bytes: u32 = 40;
+    let ilt_rva = desc_rva + desc_bytes;
+    let ilt_bytes = (count as u32 + 1) * 8;
+    let iat_rva = ilt_rva + ilt_bytes;
+    let iat_bytes = (count as u32 + 1) * 8;
+    let hnt_rva = iat_rva + iat_bytes;
+    let mut hnt_bytes: u32 = 0;
+    for i in 0..count {
+        let entry = 2 + format!("Func{i}\0").len() as u32;
+        hnt_bytes += entry + (entry & 1);
+    }
+    let dll_name_rva = hnt_rva + hnt_bytes;
+    let idata_size = (dll_name_rva + "kernel32.dll\0".len() as u32) - desc_rva;
+
+    let mut directories = [(0u32, 0u32); 16];
+    directories[casa1::pe::IMAGE_DIRECTORY_ENTRY_IMPORT] = (desc_rva, desc_bytes);
+    let size_of_image = (0x2000 + idata_size + 0xFFF) & !0xFFF;
+    write_pe32p_optional_header(&mut pe, 0x1000, size_of_image, 0x200, &directories);
+
+    write_pe_section(&mut pe, b".text\0\0\0", 0x1000, 0x1000, 0x200, 0x200);
+    write_pe_section(&mut pe, b".idata\0\0", idata_size, 0x2000, idata_size, 0x400);
+    pe.resize(0x400, 0); // headers + .text raw data
+
+    // Helper: file offset of an .idata RVA
+    let idata_file = |rva: u32| 0x400 + (rva - desc_rva) as usize;
+    let hint_name_offset = |index: usize| -> u32 {
+        let mut bytes = 0u32;
+        for j in 0..index {
+            let entry = 2 + format!("Func{j}\0").len() as u32;
+            bytes += entry + (entry & 1);
+        }
+        bytes
+    };
+
     // Import descriptor for kernel32.dll
-    pe.extend_from_slice(&lookup_table_offset.to_le_bytes()); // OriginalFirstThunk
+    pe.resize(idata_file(desc_rva), 0);
+    pe.extend_from_slice(&ilt_rva.to_le_bytes()); // OriginalFirstThunk
     pe.extend_from_slice(&0u32.to_le_bytes()); // TimeDateStamp
     pe.extend_from_slice(&0u32.to_le_bytes()); // ForwarderChain
-    pe.extend_from_slice(&(hint_name_offset - 12).to_le_bytes()); // Name ("kernel32.dll\0")
-    pe.extend_from_slice(&iat_offset.to_le_bytes()); // FirstThunk
-    // Terminator entry
+    pe.extend_from_slice(&dll_name_rva.to_le_bytes()); // Name
+    pe.extend_from_slice(&iat_rva.to_le_bytes()); // FirstThunk
+    // Terminator descriptor
     pe.extend_from_slice(&0u32.to_le_bytes());
     pe.extend_from_slice(&0u32.to_le_bytes());
     pe.extend_from_slice(&0u32.to_le_bytes());
     pe.extend_from_slice(&0u32.to_le_bytes());
     pe.extend_from_slice(&0u32.to_le_bytes());
-    // ILT entries (IMAGE_THUNK_DATA32) — count entries
-    while pe.len() < lookup_table_offset as usize {
-        pe.push(0);
-    }
+
+    // ILT: hint/name entries with the zero terminator at the END
+    pe.resize(idata_file(ilt_rva), 0);
     for i in 0..count {
-        let entry = if i == 0 {
-            0u64 // terminator
-        } else {
-            // Hint-name ordinal: IMAGE_SNAP_BY_ORDINAL flag
-            let name_rva = hint_name_offset + ((i - 1) * 12) as u32;
-            name_rva as u64 | 0x8000_0000_0000_0000
-        };
-        pe.extend_from_slice(&entry.to_le_bytes());
+        let name_rva = hnt_rva + hint_name_offset(i);
+        pe.extend_from_slice(&(name_rva as u64).to_le_bytes());
     }
-    // IAT entries (same data as ILT)
-    while pe.len() < iat_offset as usize {
-        pe.push(0);
-    }
+    pe.extend_from_slice(&0u64.to_le_bytes());
+
+    // IAT: same entries
+    pe.resize(idata_file(iat_rva), 0);
     for i in 0..count {
-        let entry = if i == 0 {
-            0u64
-        } else {
-            let name_rva = hint_name_offset + ((i - 1) * 12) as u32;
-            name_rva as u64 | 0x8000_0000_0000_0000
-        };
-        pe.extend_from_slice(&entry.to_le_bytes());
+        let name_rva = hnt_rva + hint_name_offset(i);
+        pe.extend_from_slice(&(name_rva as u64).to_le_bytes());
     }
+    pe.extend_from_slice(&0u64.to_le_bytes());
+
     // Hint/name table
-    while pe.len() < hint_name_offset as usize {
-        pe.push(0);
-    }
-    for i in 0..count.saturating_sub(1) {
+    pe.resize(idata_file(hnt_rva), 0);
+    for i in 0..count {
         pe.extend_from_slice(&0u16.to_le_bytes()); // Hint
-        pe.extend_from_slice(format!("Func{}\0", i).as_bytes());
-        // Pad to align
-        while pe.len() % 2 != 0 {
+        pe.extend_from_slice(format!("Func{i}\0").as_bytes());
+        if pe.len() % 2 != 0 {
             pe.push(0);
         }
     }
+
+    // DLL name
+    pe.resize(idata_file(dll_name_rva), 0);
+    pe.extend_from_slice(b"kernel32.dll\0");
     pe
 }
 
@@ -940,9 +1219,11 @@ fn bench_shader_input(
 // 6.  AUDIO MIXING BENCHMARKS  (Item 287/290)
 // ===========================================================================
 
-fn bench_audio_mix_direct_sound_44k(c: &mut Criterion) {
+fn bench_audio_mix_direct_sound(c: &mut Criterion) {
     use casa1::audio::{AudioSubsystem, SampleFormat, WaveFormat};
-    let mut group = c.benchmark_group("audio/mix/44k");
+    // The configured sample rate does not change the per-iteration work
+    // (fixed frame counts), so a single representative rate is used.
+    let mut group = c.benchmark_group("audio/mix");
     let mut audio = AudioSubsystem::new();
     let ds_id = audio.create_direct_sound8(1).expect("create DS8");
     let fmt = WaveFormat {
@@ -963,73 +1244,16 @@ fn bench_audio_mix_direct_sound_44k(c: &mut Criterion) {
     audio.play_direct_sound_buffer(buf_id).expect("play buffer");
 
     for frames in [256usize, 512, 1024] {
+        // The mixer must always produce exactly frames × channels samples
+        let probe = audio
+            .mix_direct_sound_buffer(buf_id, frames)
+            .expect("mix probe");
+        assert_eq!(probe.samples.len(), frames * 2, "mix output sample count");
         group.bench_function(format!("{frames}_frames"), |b| {
             b.iter(|| {
-                let out = audio.mix_direct_sound_buffer(bb(buf_id), bb(frames));
-                bb(out)
-            })
-        });
-    }
-    group.finish();
-}
-
-fn bench_audio_mix_direct_sound_48k(c: &mut Criterion) {
-    use casa1::audio::{AudioSubsystem, SampleFormat, WaveFormat};
-    let mut group = c.benchmark_group("audio/mix/48k");
-    let mut audio = AudioSubsystem::new();
-    let ds_id = audio.create_direct_sound8(1).expect("create DS8");
-    let fmt = WaveFormat {
-        channels: 2,
-        sample_rate: 48000,
-        sample_format: SampleFormat::Pcm16,
-    };
-    let buf_id = audio
-        .create_direct_sound_buffer_simple(ds_id, fmt.clone())
-        .expect("create buffer");
-    let test_samples: Vec<f32> = (0..(48000 * 2))
-        .map(|i| ((i as f32) * 0.001).sin())
-        .collect();
-    audio
-        .write_direct_sound_buffer(buf_id, &test_samples)
-        .expect("write buffer");
-    audio.play_direct_sound_buffer(buf_id).expect("play buffer");
-
-    for frames in [256usize, 512, 1024] {
-        group.bench_function(format!("{frames}_frames"), |b| {
-            b.iter(|| {
-                let out = audio.mix_direct_sound_buffer(bb(buf_id), bb(frames));
-                bb(out)
-            })
-        });
-    }
-    group.finish();
-}
-
-fn bench_audio_mix_direct_sound_96k(c: &mut Criterion) {
-    use casa1::audio::{AudioSubsystem, SampleFormat, WaveFormat};
-    let mut group = c.benchmark_group("audio/mix/96k");
-    let mut audio = AudioSubsystem::new();
-    let ds_id = audio.create_direct_sound8(1).expect("create DS8");
-    let fmt = WaveFormat {
-        channels: 2,
-        sample_rate: 96000,
-        sample_format: SampleFormat::Pcm16,
-    };
-    let buf_id = audio
-        .create_direct_sound_buffer_simple(ds_id, fmt.clone())
-        .expect("create buffer");
-    let test_samples: Vec<f32> = (0..(96000 * 2))
-        .map(|i| ((i as f32) * 0.001).sin())
-        .collect();
-    audio
-        .write_direct_sound_buffer(buf_id, &test_samples)
-        .expect("write buffer");
-    audio.play_direct_sound_buffer(buf_id).expect("play buffer");
-
-    for frames in [256usize, 512, 1024] {
-        group.bench_function(format!("{frames}_frames"), |b| {
-            b.iter(|| {
-                let out = audio.mix_direct_sound_buffer(bb(buf_id), bb(frames));
+                let out = audio
+                    .mix_direct_sound_buffer(bb(buf_id), bb(frames))
+                    .expect("mix");
                 bb(out)
             })
         });
@@ -1078,40 +1302,52 @@ fn bench_network_socket_send_recv(c: &mut Criterion) {
 }
 
 fn bench_network_websocket_buffer(c: &mut Criterion) {
-    use casa1::network::{AddressFamily, NetworkStack, SockAddr};
+    use casa1::network::NetworkStack;
     let mut group = c.benchmark_group("network/websocket/buffer");
     let mut net = NetworkStack::new();
     net.wsa_startup();
-    // Create a simple HTTP-like request handle for WebSocket upgrade
-    let sock_a = net.socket(AddressFamily::Ipv4).expect("create socket");
-    let addr = SockAddr {
-        family: AddressFamily::Ipv4,
-        host: "127.0.0.1".into(),
-        port: 9091,
-    };
-    net.bind(sock_a, addr.clone()).expect("bind");
-    net.listen(sock_a, 1).expect("listen");
+    // Set up a routed HTTP request so the WebSocket upgrade machinery
+    // (URL building, request-state validation, buffer records) is reached.
+    // This is pure bookkeeping — no real network I/O.
+    let session = net.win_http_open("bench");
+    let conn = net
+        .win_http_connect(session, "bench.test", 80, false)
+        .expect("connect");
+    let req = net
+        .win_http_open_request(conn, "GET", "/ws")
+        .expect("open request");
+    net.add_route("http", "bench.test", "/ws", 101, BTreeMap::new(), b"", vec![], vec![]);
+    net.win_http_send_request(req, BTreeMap::new(), b"")
+        .expect("send request");
+    net.win_http_receive_response(req).expect("receive response");
 
     for size in [256usize, 4096, 65536] {
         let payload = vec![0xABu8; size];
+        let mut rx_buf = vec![0u8; size];
         group.bench_function(format!("send_{size}_bytes"), |b| {
             b.iter(|| {
-                // Create a pair of connected sockets for each iteration
-                let sock_c = net.socket(AddressFamily::Ipv4).expect("create socket C");
-                net.bind(
-                    sock_c,
-                    SockAddr {
-                        family: AddressFamily::Ipv4,
-                        host: "127.0.0.1".into(),
-                        port: 9092,
-                    },
-                )
-                .expect("bind C");
-                net.connect(sock_c, addr.clone()).expect("connect C->A");
-                let _accepted = net.accept(sock_a).expect("accept");
-                // Send via socket (WebSocket-like data path)
-                let written = net.send(bb(sock_c), bb(&payload)).expect("send");
-                bb(written)
+                // Full buffer-based WebSocket data path: upgrade (creates the
+                // WebSocket record), send (open-state check + buffer append),
+                // receive (drain), close, then release the handle so no state
+                // accumulates across iterations.
+                let ws = net
+                    .websocket_complete_upgrade(bb(req))
+                    .expect("websocket upgrade");
+                net.websocket_send(bb(ws), bb(&payload)).expect("websocket send");
+                let received = net
+                    .websocket_receive(bb(ws), &mut rx_buf)
+                    .expect("websocket receive");
+                // Nothing feeds the receive buffer in this bench, so a drain
+                // must return zero bytes.
+                assert_eq!(received, 0, "unexpected buffered WebSocket data");
+                net.websocket_close(bb(ws), 1000, Some("bench"))
+                    .expect("websocket close");
+                let (status, _) = net
+                    .websocket_query_close_status(bb(ws))
+                    .expect("query close status");
+                assert_eq!(status, 1000, "close status round-trip failed");
+                net.close_handle(ws);
+                bb(received)
             })
         });
     }
@@ -1174,9 +1410,16 @@ fn bench_pe_parse_large_image(c: &mut Criterion) {
     let mut group = c.benchmark_group("pe/parse/large_image");
     for count in [64usize, 200, 500] {
         let pe_data = many_imports_pe(count);
+        let parsed = casa1::pe::parse(&pe_data).expect("import-rich PE must parse");
+        assert_eq!(parsed.imports.len(), 1, "expected exactly one import descriptor");
+        assert_eq!(
+            parsed.imports[0].imports.len(),
+            count,
+            "parsed import thunk count mismatch"
+        );
         group.bench_function(format!("{count}_imports"), |b| {
             b.iter(|| {
-                let parsed = casa1::pe::parse(bb(&pe_data));
+                let parsed = casa1::pe::parse(bb(&pe_data)).expect("parse");
                 bb(parsed)
             })
         });
@@ -1188,6 +1431,10 @@ fn bench_pe_map_large_image(c: &mut Criterion) {
     let mut group = c.benchmark_group("pe/map/large_image");
     for count in [64usize, 200, 500] {
         let pe_data = many_imports_pe(count);
+        let parsed = casa1::pe::parse(&pe_data).expect("import-rich PE must parse");
+        assert_eq!(parsed.imports[0].imports.len(), count);
+        let mapped = casa1::pe::map_image(&pe_data, &parsed, "bench", false).expect("map");
+        assert!(!mapped.sections.is_empty());
         group.bench_with_input(
             criterion::BenchmarkId::new("parse_and_map", count),
             &pe_data,
@@ -1196,7 +1443,8 @@ fn bench_pe_map_large_image(c: &mut Criterion) {
                     || casa1::pe::parse(data).expect("parse"),
                     |parsed| {
                         let mapped =
-                            casa1::pe::map_image(bb(data), bb(&parsed), "bench", bb(false));
+                            casa1::pe::map_image(bb(data), bb(&parsed), "bench", bb(false))
+                                .expect("map");
                         bb(mapped)
                     },
                 )
@@ -1210,9 +1458,11 @@ fn bench_pe_parse_many_sections_large(c: &mut Criterion) {
     let mut group = c.benchmark_group("pe/parse/many_sections_large");
     for count in [50usize, 100] {
         let pe_data = many_sections_pe(count);
+        let parsed = casa1::pe::parse(&pe_data).expect("many-sections PE must parse");
+        assert_eq!(parsed.sections.len(), count, "parsed section count mismatch");
         group.bench_function(format!("{count}_sections"), |b| {
             b.iter(|| {
-                let parsed = casa1::pe::parse(bb(&pe_data));
+                let parsed = casa1::pe::parse(bb(&pe_data)).expect("parse");
                 bb(parsed)
             })
         });
@@ -1224,38 +1474,24 @@ fn bench_pe_parse_many_sections_large(c: &mut Criterion) {
 // 10. FAST-THUNK DISPATCH BENCHMARKS  (Item 292)
 // ===========================================================================
 
-fn bench_fast_thunk_inline_cache(c: &mut Criterion) {
-    let mut group = c.benchmark_group("fast_thunk/inline_cache");
-    for max_entries in [16usize, 64, 256, 1024] {
-        group.bench_function(format!("{max_entries}_entries"), |b| {
-            let mut ic = casa1::jit::InlineCache::new(max_entries);
-            b.iter(|| {
-                for i in 0..max_entries * 4 {
-                    let call_site = 0x1000 + (i as u64 * 0x40);
-                    let target = 0x8000_0000 + ((i as u64 % max_entries as u64) * 0x100);
-                    let hit = ic.lookup(bb(call_site), bb(target));
-                    bb(hit);
-                }
-                bb(ic.hit_rate())
-            })
-        });
+fn bench_fast_thunk_dispatch_lookup(c: &mut Criterion) {
+    // Exercises the real fast-thunk machinery: executable trampolines are
+    // emitted per registration and looked up by index afterwards.
+    let mut table = casa1::jit::FastThunkTable::new();
+    let mut thunk_indices = Vec::new();
+    for i in 0..256 {
+        thunk_indices.push(table.register(0x1000 + i).expect("register thunk"));
     }
-    group.finish();
-}
+    assert_eq!(table.len(), 256);
 
-fn bench_fast_thunk_tier_promotion(c: &mut Criterion) {
-    let mut group = c.benchmark_group("fast_thunk/tier_promotion");
-    let mut compiler = casa1::jit::TieredCompiler::with_thresholds(5, 20);
-
-    group.bench_function("200_blocks_x_50_execs", |b| {
+    let mut group = c.benchmark_group("fast_thunk/dispatch_lookup");
+    group.bench_function("256_thunks", |b| {
         b.iter(|| {
-            for i in 0..200 {
-                let addr = 0x2000 + (i as u64 * 0x80);
-                for _ in 0..50 {
-                    let _tier = compiler.record_execution(bb(addr));
-                }
+            let mut acc = 0usize;
+            for index in &thunk_indices {
+                acc = acc.wrapping_add(table.thunk_address(bb(*index)).unwrap_or(0));
             }
-            bb(())
+            bb(acc)
         })
     });
     group.finish();
@@ -1296,38 +1532,17 @@ fn bench_fast_thunk_guest_pointer_checks(c: &mut Criterion) {
 // 11. INTERPRETER THROUGHPUT BENCHMARKS  (Item 287)
 // ===========================================================================
 
-fn bench_cpu_interpreter_throughput(c: &mut Criterion) {
-    let arch = casa1::cpu::GuestArch::X64;
-    let mut group = c.benchmark_group("cpu/interpreter/throughput");
-    for count in [50usize, 200, 1000] {
-        let code = alu_mix_block(count);
-        group.bench_function(format!("{count}_insns"), |b| {
-            b.iter_with_setup(
-                || {
-                    let state = casa1::cpu::CpuState::new(arch);
-                    let memory = casa1::cpu::MemoryImage::default();
-                    let decoded = casa1::cpu::decode_block(&code, 0x1000, arch).expect("decode");
-                    let ir = casa1::cpu::lower_to_ir(&decoded).expect("lower");
-                    (state, memory, ir)
-                },
-                |(mut state, mut memory, ir)| {
-                    let result = casa1::cpu::execute_ir(bb(&mut state), bb(&mut memory), bb(&ir));
-                    bb(result)
-                },
-            )
-        });
-    }
-    group.finish();
-}
-
 fn bench_cpu_decode_throughput(c: &mut Criterion) {
     let arch = casa1::cpu::GuestArch::X64;
     let mut group = c.benchmark_group("cpu/decode/throughput");
     for size in [1024usize, 4096, 16384] {
         let code = nop_sled(size);
+        let decoded = casa1::cpu::decode_block(&code, 0x1000, arch).expect("decode nop sled");
+        assert_eq!(decoded.len(), size);
         group.bench_function(format!("{size}_bytes"), |b| {
             b.iter(|| {
-                let decoded = casa1::cpu::decode_block(bb(&code), bb(0x1000), bb(arch));
+                let decoded = casa1::cpu::decode_block(bb(&code), bb(0x1000), bb(arch))
+                    .expect("decode nop sled");
                 bb(decoded)
             })
         });
@@ -1531,10 +1746,11 @@ fn bench_stress_network_create_destroy(c: &mut Criterion) {
 fn bench_stress_pe_parse_loop(c: &mut Criterion) {
     let mut group = c.benchmark_group("stress/pe/parse_loop");
     let pe_data = minimal_pe();
+    casa1::pe::parse(&pe_data).expect("minimal PE must parse");
     group.bench_function("1000_parses", |b| {
         b.iter(|| {
             for _ in 0..1000 {
-                let parsed = casa1::pe::parse(bb(&pe_data));
+                let parsed = casa1::pe::parse(bb(&pe_data)).expect("parse");
                 let _ = bb(parsed);
             }
             bb(())
@@ -1591,15 +1807,14 @@ criterion_group!(
     bench_gfx_command_batching,
     bench_gfx_shader_compiler_submit,
     bench_gfx_upload_streaming,
+    bench_gfx_upload_streaming_wrap,
     // 5. Startup-to-First-Frame
     bench_startup_full_pipeline,
     bench_startup_adaptive_jit,
     bench_startup_pe_load_and_prepare,
     bench_startup_perf_subsystems,
     // 6. Audio Mixing
-    bench_audio_mix_direct_sound_44k,
-    bench_audio_mix_direct_sound_48k,
-    bench_audio_mix_direct_sound_96k,
+    bench_audio_mix_direct_sound,
     // 7. Network Socket/WebSocket
     bench_network_socket_send_recv,
     bench_network_websocket_buffer,
@@ -1612,11 +1827,9 @@ criterion_group!(
     bench_pe_map_large_image,
     bench_pe_parse_many_sections_large,
     // 10. Fast-Thunk Dispatch
-    bench_fast_thunk_inline_cache,
-    bench_fast_thunk_tier_promotion,
+    bench_fast_thunk_dispatch_lookup,
     bench_fast_thunk_guest_pointer_checks,
-    // 11. Interpreter Throughput
-    bench_cpu_interpreter_throughput,
+    // 11. Decode Throughput
     bench_cpu_decode_throughput,
     // 12. Memory Usage Tracking
     bench_memory_usage_tracking,

@@ -1,0 +1,3 @@
+# Corpus seeds are raw binary fuzz inputs; preserve their bytes exactly
+# (several HTTP seeds require literal CRLF line endings).
+* binary

@@ -14,12 +14,27 @@ fuzz_target!(|data: &[u8]| {
 
 fn parse_summary(data: &[u8]) -> String {
     match network::parse_http_response(data) {
-        Ok(response) => format!(
-            "ok:{}:{}:{}",
-            response.status,
-            response.headers.len(),
-            response.body.len(),
-        ),
+        Ok(response) => {
+            // Invariants on a successfully parsed HTTP response
+            assert!(
+                response.headers.len() <= data.len().saturating_add(1),
+                "header count {} exceeds input length {}",
+                response.headers.len(),
+                data.len()
+            );
+            assert!(
+                response.body.len() <= data.len(),
+                "body length {} exceeds input length {}",
+                response.body.len(),
+                data.len()
+            );
+            format!(
+                "ok:{}:{}:{}",
+                response.status,
+                response.headers.len(),
+                response.body.len(),
+            )
+        }
         Err(error) => format!("err:{}:{}", error.code.as_u32(), error.message),
     }
 }
