@@ -14,17 +14,12 @@
 # Non-determinism can arise from timestamps, file paths, or compiler version.
 #
 # Usage:
-#   ./ci/check_reproducible.sh [--skip-clean]
+#   ./ci/check_reproducible.sh
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
-
-SKIP_CLEAN=false
-if [[ "${1:-}" == "--skip-clean" ]]; then
-  SKIP_CLEAN=true
-fi
 
 PASS=0
 FAIL=0
@@ -36,6 +31,11 @@ fail() { echo "!! $*" >&2; }
 TARGET_DIR="${CARGO_TARGET_DIR:-$REPO_ROOT/target}"
 BUILD1_DIR="$TARGET_DIR/reproducible-build-1"
 BUILD2_DIR="$TARGET_DIR/reproducible-build-2"
+
+# Both build directories must start empty: a stale or incremental build would
+# let the hashes compare previously produced artifacts instead of a clean
+# rebuild, so the check could pass trivially against different/older sources.
+rm -rf "$BUILD1_DIR" "$BUILD2_DIR"
 
 BINARIES=(
   casa1
@@ -73,20 +73,17 @@ PASS=$((PASS + 1))
 
 # ── Compute first hashes ─────────────────────────────────────────────────────
 info "Computing SHA-256 hashes of first build ..."
-declare -A HASHES1
+HASHES1=()
+i=0
 for binary in "${BINARIES[@]}"; do
-  HASHES1["$binary"]="$(shasum -a 256 "$BIN_DIR/$binary" | cut -d' ' -f1)"
-  info "  $binary: ${HASHES1[$binary]}"
+  HASHES1[$i]="$(shasum -a 256 "$BIN_DIR/$binary" | cut -d' ' -f1)"
+  info "  $binary: ${HASHES1[$i]}"
+  i=$((i + 1))
 done
 
 # ── Second build ──────────────────────────────────────────────────────────────
 info ""
 info "Second build (into $BUILD2_DIR) ..."
-
-if [[ "$SKIP_CLEAN" == "false" ]]; then
-  # Only remove the previous build artifacts, not the entire target
-  rm -rf "$BUILD2_DIR"
-fi
 
 CARGO_TARGET_DIR="$BUILD2_DIR" \
   cargo build --release --bins 2>&1
@@ -111,16 +108,18 @@ PASS=$((PASS + 1))
 info ""
 info "Comparing SHA-256 hashes ..."
 ALL_MATCH=true
+i=0
 for binary in "${BINARIES[@]}"; do
   HASH2="$(shasum -a 256 "$BIN_DIR2/$binary" | cut -d' ' -f1)"
-  if [[ "${HASHES1[$binary]}" == "$HASH2" ]]; then
+  if [[ "${HASHES1[$i]}" == "$HASH2" ]]; then
     info "  ✅ $binary: MATCH"
   else
     fail "  ❌ $binary: MISMATCH"
-    fail "     Build 1: ${HASHES1[$binary]}"
+    fail "     Build 1: ${HASHES1[$i]}"
     fail "     Build 2: $HASH2"
     ALL_MATCH=false
   fi
+  i=$((i + 1))
 done
 
 if [[ "$ALL_MATCH" == "true" ]]; then

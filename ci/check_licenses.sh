@@ -24,7 +24,7 @@ fail() { echo "!! $*" >&2; }
 
 # ── 1. Verify Cargo.toml has a license field ─────────────────────────────────
 info "Checking Cargo.toml for license field ..."
-LICENSE="$(grep -P '^license\s*=' Cargo.toml | head -1 | sed 's/^license\s*=\s*"\(.*\)"/\1/' || true)"
+LICENSE="$(grep '^license[[:space:]]*=' Cargo.toml | head -1 | sed -E 's/^license[[:space:]]*=[[:space:]]*"([^"]*)"/\1/' || true)"
 if [[ -z "$LICENSE" ]]; then
   fail "Cargo.toml is missing the 'license' field"
   FAIL=$((FAIL + 1))
@@ -50,29 +50,32 @@ info "Checking dependency licenses ..."
 # Use cargo-license if available, otherwise use cargo metadata + python3
 if command -v cargo-license &>/dev/null; then
   info "Using cargo-license for dependency license scan ..."
-  LICENSE_OUTPUT="$(cargo license --do-not-bundle --transitive 2>/dev/null || true)"
-  
-  # Known problematic license patterns
-  PROBLEMATIC=0
-  while IFS= read -r line; do
-    case "$line" in
-      *"GPL"*|*"AGPL"*|*"LGPL"*|*"CC-BY-NC"*|*"CC-BY-ND"*|*"BUSL"*|*"SSPL"*)
-        fail "Potentially incompatible license found: $line"
-        PROBLEMATIC=$((PROBLEMATIC + 1))
-        ;;
-    esac
-  done <<< "$LICENSE_OUTPUT"
-
-  if [[ $PROBLEMATIC -eq 0 ]]; then
-    info "All dependency licenses appear compatible — OK"
-    PASS=$((PASS + 1))
-  else
-    fail "Found $PROBLEMATIC dependencies with potentially incompatible licenses"
+  if ! LICENSE_OUTPUT="$(cargo license --do-not-bundle --transitive 2>&1)"; then
+    fail "cargo license failed — dependency licenses could not be verified"
     FAIL=$((FAIL + 1))
+  else
+    # Known problematic license patterns
+    PROBLEMATIC=0
+    while IFS= read -r line; do
+      case "$line" in
+        *"GPL"*|*"AGPL"*|*"LGPL"*|*"CC-BY-NC"*|*"CC-BY-ND"*|*"BUSL"*|*"SSPL"*)
+          fail "Potentially incompatible license found: $line"
+          PROBLEMATIC=$((PROBLEMATIC + 1))
+          ;;
+      esac
+    done <<< "$LICENSE_OUTPUT"
+
+    if [[ $PROBLEMATIC -eq 0 ]]; then
+      info "All dependency licenses appear compatible — OK"
+      PASS=$((PASS + 1))
+    else
+      fail "Found $PROBLEMATIC dependencies with potentially incompatible licenses"
+      FAIL=$((FAIL + 1))
+    fi
   fi
 elif command -v python3 &>/dev/null; then
   info "Using cargo metadata + python3 for license scan ..."
-  python3 -c "
+  if python3 -c "
 import json, subprocess, sys
 
 result = subprocess.run(
@@ -98,10 +101,7 @@ if incompatible:
     sys.exit(1)
 else:
     print(f'    All {len(licenses)} unique license expressions appear compatible')
-" 2>&1 || true
-
-  # Check exit code
-  if [[ $? -eq 0 ]]; then
+" 2>&1; then
     info "Dependency license scan via metadata — OK"
     PASS=$((PASS + 1))
   else

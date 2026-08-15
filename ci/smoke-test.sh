@@ -96,9 +96,15 @@ fi
 #   installer (installer, scm): 50%
 if command -v cargo-llvm-cov &>/dev/null; then
     info "cargo-llvm-cov available — generating coverage report ..."
-    # Generate a JSON summary for threshold checking
-    cargo llvm-cov --no-clean --lib --bins --json 2>/dev/null > target/coverage.json || true
-    if [[ -f target/coverage.json ]]; then
+    # Generate a JSON summary for threshold checking. A failing generator
+    # (or empty output) is a FAIL, not a silent skip.
+    if ! cargo llvm-cov --no-clean --lib --bins --json > target/coverage.json 2>/dev/null; then
+        echo "!! cargo llvm-cov failed — coverage threshold check could not run" >&2
+        FAIL=$((FAIL + 1))
+    elif [[ ! -s target/coverage.json ]]; then
+        echo "!! coverage JSON empty — coverage threshold check could not run" >&2
+        FAIL=$((FAIL + 1))
+    else
         # Check critical module coverage thresholds
         MODULES=(
             "src/pe.rs:70"
@@ -122,11 +128,16 @@ if command -v cargo-llvm-cov &>/dev/null; then
 import json
 with open('target/coverage.json') as f:
     data = json.load(f)
+target = '$MODULE_FILE'
 for d in data.get('data', []):
-    for t in d.get('totals', {}).get('classes', {}).get('items', []):
-        if '$MODULE_FILE' in t.get('filename', ''):
-            print(t.get('covered', 0), t.get('count', 1))
-" 2>/dev/null) || COVERED=""
+    for f in d.get('files', []):
+        if f.get('filename', '').endswith(target):
+            summary = f.get('summary', {}).get('lines', {})
+            covered = summary.get('covered', 0)
+            count = summary.get('count', 0)
+            print(covered, count)
+            break
+" 2>/dev/null)
                 if [[ -n "$COVERED" ]]; then
                     read -r cov_lines total_lines <<< "$COVERED"
                     if [[ "$total_lines" -gt 0 ]]; then
@@ -137,8 +148,17 @@ for d in data.get('data', []):
                         else
                             info "Coverage for $MODULE_FILE: ${PCT}% (threshold: ${THRESHOLD}%)"
                         fi
+                    else
+                        echo "!! No covered lines recorded for $MODULE_FILE — cannot verify threshold" >&2
+                        COVERAGE_FAILED=true
                     fi
+                else
+                    echo "!! No coverage data found for $MODULE_FILE — cannot verify threshold" >&2
+                    COVERAGE_FAILED=true
                 fi
+            else
+                echo "!! python3 not available — cannot verify coverage thresholds" >&2
+                COVERAGE_FAILED=true
             fi
         done
         if [[ "$COVERAGE_FAILED" == "true" ]]; then
@@ -148,9 +168,6 @@ for d in data.get('data', []):
             PASS=$((PASS + 1))
             info "coverage thresholds — OK"
         fi
-    else
-        info "coverage JSON not generated — skipping threshold check"
-        PASS=$((PASS + 1))
     fi
 elif command -v cargo-tarpaulin &>/dev/null; then
     info "cargo-tarpaulin available — running coverage on critical modules..."
@@ -170,19 +187,16 @@ fi
 
 # Step 8: Dependency audit (if cargo-audit is available)
 if command -v cargo-audit &>/dev/null; then
-    run_step "cargo audit" cargo audit --ignore RUSTSEC-2024-0370
-elif command -v cargo-audit &>/dev/null; then
-    info "cargo-audit not installed — skipping dependency audit"
-    info "(install with: cargo install cargo-audit)"
-    PASS=$((PASS + 1))
+    run_step "cargo audit" cargo audit
 else
     info "cargo-audit not installed — skipping dependency audit"
+    info "(install with: cargo install cargo-audit)"
     PASS=$((PASS + 1))
 fi
 
 # Step 9: License check (quick project-level check)
 info "Checking Cargo.toml for license field ..."
-LICENSE=$(grep -P '^license\s*=' Cargo.toml | head -1 | sed 's/^license\s*=\s*"\(.*\)"/\1/' || true)
+LICENSE=$(grep '^license[[:space:]]*=' Cargo.toml | head -1 | sed -E 's/^license[[:space:]]*=[[:space:]]*"([^"]*)"/\1/' || true)
 if [[ -n "$LICENSE" ]]; then
     info "License field present: $LICENSE"
     PASS=$((PASS + 1))

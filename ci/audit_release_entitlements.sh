@@ -6,7 +6,7 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # Detect the default target if configured in .cargo/config.toml
 default_target=""
 if [[ -f "$repo_root/.cargo/config.toml" ]]; then
-  default_target="$(grep -oP '(?<=^target\s*=\s*")[^"]+' "$repo_root/.cargo/config.toml" 2>/dev/null || true)"
+  default_target="$(sed -nE 's/^target[[:space:]]*=[[:space:]]*"([^"]*)".*/\1/p' "$repo_root/.cargo/config.toml" | head -1)"
 fi
 if [[ -n "$default_target" ]]; then
   release_dir="${RELEASE_DIR:-$repo_root/target/$default_target/release}"
@@ -69,9 +69,20 @@ done
 # ---------------------------------------------------------------------------
 echo "Checking Cargo.toml for insecure default features..."
 
-# Extract the default = [...] line from [features] and ensure dev-insecure-tls
+# Extract the default = [...] array from [features] and ensure dev-insecure-tls
 # is not present. This prevents accidental inclusion of TLS bypass in release.
-if grep -Pzo '(?s)\[features\].*?default\s*=\s*\[([^\]]*)\]' Cargo.toml | grep -q 'dev-insecure-tls'; then
+# (POSIX tools only — grep -P/-Pzo are GNU extensions unavailable on macOS.)
+if awk '
+    /^\[features\]/ { in_features = 1; next }
+    in_features && /^\[/ { exit }
+    in_features && /^default[[:space:]]*=/ { found = 1; depth = 0 }
+    found {
+        depth += gsub(/\[/, "[")
+        depth -= gsub(/\]/, "]")
+        print
+        if (depth <= 0) { found = 0 }
+    }
+' Cargo.toml | grep -q 'dev-insecure-tls'; then
   echo "ERROR: 'dev-insecure-tls' found in default features in Cargo.toml." >&2
   echo "Remove it before cutting a release." >&2
   exit 1

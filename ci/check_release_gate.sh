@@ -40,12 +40,12 @@ CURRENT_SECTION=""
 
 while IFS= read -r line; do
   # Detect section headers (## ...)
-  if [[ "$line" =~ ^##\s+(.+) ]]; then
+  if [[ "$line" =~ ^##[[:space:]]+(.+) ]]; then
     CURRENT_SECTION="${BASH_REMATCH[1]}"
   fi
 
   # Check for unchecked checklist items
-  if [[ "$line" =~ ^-\ \[ \] ]]; then
+  if printf '%s\n' "$line" | grep -qE '^-\ \[ \]'; then
     ITEM="${line#- \[ \] }"
     UNCHECKED+=("[$CURRENT_SECTION] $ITEM")
   fi
@@ -74,19 +74,19 @@ SECTION_UNCHECKED=0
 SECTION_TOTAL=0
 
 while IFS= read -r line; do
-  if [[ "$line" =~ ^##\s+CI\ And\ Release\ Readiness ]]; then
+  if [[ "$line" =~ ^##[[:space:]]+CI[[:space:]]+And[[:space:]]+Release[[:space:]]+Readiness ]]; then
     IN_SECTION=true
     continue
   fi
   if [[ "$IN_SECTION" == true ]]; then
     # Stop at next section
-    if [[ "$line" =~ ^##\s+ ]]; then
+    if [[ "$line" =~ ^##[[:space:]]+ ]]; then
       break
     fi
-    if [[ "$line" =~ ^-\ \[ \] ]]; then
+    if printf '%s\n' "$line" | grep -qE '^-\ \[ \]'; then
       SECTION_UNCHECKED=$((SECTION_UNCHECKED + 1))
       SECTION_TOTAL=$((SECTION_TOTAL + 1))
-    elif [[ "$line" =~ ^-\ \[x\] ]]; then
+    elif printf '%s\n' "$line" | grep -qE '^-\ \[[xX]\]'; then
       SECTION_TOTAL=$((SECTION_TOTAL + 1))
     fi
   fi

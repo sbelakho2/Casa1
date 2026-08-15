@@ -23,7 +23,7 @@ fail() { echo "!! $*" >&2; }
 # Detect release directory
 default_target=""
 if [[ -f "$REPO_ROOT/.cargo/config.toml" ]]; then
-  default_target="$(grep -oP '(?<=^target\s*=\s*")[^"]+' "$REPO_ROOT/.cargo/config.toml" 2>/dev/null || true)"
+  default_target="$(sed -nE 's/^target[[:space:]]*=[[:space:]]*"([^"]*)".*/\1/p' "$REPO_ROOT/.cargo/config.toml" | head -1)"
 fi
 if [[ -n "$default_target" ]]; then
   RELEASE_DIR="${RELEASE_DIR:-$REPO_ROOT/target/$default_target/release}"
@@ -122,8 +122,8 @@ if echo "$ORACLE_OUTPUT" | grep -q "Usage\|Commands\|Arguments"; then
   info "    ✅ casa1-oracle --help produces usage output"
   PASS=$((PASS + 1))
 else
-  info "    ⚠ casa1-oracle --help output (non-fatal): $(echo "$ORACLE_OUTPUT" | head -3)"
-  PASS=$((PASS + 1))
+  fail "casa1-oracle --help did not produce expected output: $(echo "$ORACLE_OUTPUT" | head -3)"
+  FAIL=$((FAIL + 1))
 fi
 
 # casa1-test-guest --help
@@ -133,118 +133,154 @@ if echo "$TESTGUEST_OUTPUT" | grep -q "Usage\|Commands\|Arguments"; then
   info "    ✅ casa1-test-guest --help produces usage output"
   PASS=$((PASS + 1))
 else
-  info "    ⚠ casa1-test-guest --help output (non-fatal): $(echo "$TESTGUEST_OUTPUT" | head -3)"
-  PASS=$((PASS + 1))
+  fail "casa1-test-guest --help did not produce expected output: $(echo "$TESTGUEST_OUTPUT" | head -3)"
+  FAIL=$((FAIL + 1))
 fi
 
-# ── 3. App bundle structure test ──────────────────────────────────────────────
+# ── 3. App bundle structure test (via the real bundler) ───────────────────────
 info ""
-info "3. Testing app bundle structure ..."
+info "3. Testing app bundle creation ..."
 
 # Create a temporary directory for app bundle testing
 TEMP_DIR="$(mktemp -d 2>/dev/null || mktemp -d -t casa1-smoke)"
 trap 'rm -rf "$TEMP_DIR"' EXIT
 
-APPS_DIR="$TEMP_DIR/apps"
-mkdir -p "$APPS_DIR"
+# Use the project's real bundling entry point (macwin apps:install, which
+# calls create_app_bundle()) so regressions in the bundler itself are caught.
+# A throwaway Game Environment is created under CASA1_GES_ROOT so the test
+# never touches real environments or Launch Services.
+export CASA1_GES_ROOT="$TEMP_DIR/ges"
+GE_NAME="smoke-test-ge"
 
-# Create a minimal app bundle manually to verify the structure
-TEST_APP="$APPS_DIR/TestApp.app"
-mkdir -p "$TEST_APP/Contents/MacOS"
-mkdir -p "$TEST_APP/Contents/Resources"
-mkdir -p "$TEST_APP/Contents/Frameworks"
+BUNDLE_TEST_OK=true
+if ! "$RELEASE_DIR/macwin" ge:create --name "$GE_NAME" --arch x64 --winver win11-23h2 \
+    > "$TEMP_DIR/ge-create.json" 2>&1; then
+  fail "macwin ge:create failed — cannot test app bundling"
+  fail "$(head -5 "$TEMP_DIR/ge-create.json")"
+  FAIL=$((FAIL + 1))
+  BUNDLE_TEST_OK=false
+elif ! "$RELEASE_DIR/macwin" apps:install \
+    --ge "$GE_NAME" \
+    --exe /bin/echo \
+    --app-name TestApp \
+    --bundle-id com.casa1.testapp \
+    --skip-launch-services \
+    > "$TEMP_DIR/apps-install.json" 2>&1; then
+  fail "macwin apps:install failed — cannot test app bundling"
+  fail "$(head -5 "$TEMP_DIR/apps-install.json")"
+  FAIL=$((FAIL + 1))
+  BUNDLE_TEST_OK=false
+fi
 
-# Create Info.plist
-cat > "$TEST_APP/Contents/Info.plist" << 'PLIST'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>CFBundleExecutable</key>
-    <string>casa1-wrapper</string>
-    <key>CFBundleIdentifier</key>
-    <string>com.casa1.testapp</string>
-    <key>CFBundleName</key>
-    <string>TestApp</string>
-    <key>CFBundlePackageType</key>
-    <string>APPL</string>
-</dict>
-</plist>
-PLIST
+if [[ "$BUNDLE_TEST_OK" == "true" ]]; then
+  # Extract the created .app path from the JSON response
+  TEST_APP="$(python3 -c "
+import json, sys
+try:
+    data = json.load(open('$TEMP_DIR/apps-install.json'))
+    print(data.get('app_path', ''))
+except Exception:
+    print('')
+")"
 
-# Create PkgInfo
-printf 'APPLcasa' > "$TEST_APP/Contents/PkgInfo"
-
-# Create wrapper script
-cat > "$TEST_APP/Contents/MacOS/casa1-wrapper" << 'WRAPPER'
-#!/bin/bash
-echo "TestApp wrapper executed"
-WRAPPER
-chmod +x "$TEST_APP/Contents/MacOS/casa1-wrapper"
-
-# Verify bundle structure
-info "  Verifying .app bundle structure ..."
-STRUCTURE_OK=true
-for required in \
-  "$TEST_APP/Contents/Info.plist" \
-  "$TEST_APP/Contents/PkgInfo" \
-  "$TEST_APP/Contents/MacOS/casa1-wrapper" \
-  "$TEST_APP/Contents/Resources" \
-  "$TEST_APP/Contents/Frameworks"; do
-  if [[ -e "$required" ]]; then
-    info "    ✅ $required exists"
+  if [[ -z "$TEST_APP" ]]; then
+    fail "apps:install response did not include an app_path"
+    fail "$(cat "$TEMP_DIR/apps-install.json")"
+    FAIL=$((FAIL + 1))
+  elif [[ ! -d "$TEST_APP" ]]; then
+    fail "bundler reported app_path that does not exist: $TEST_APP"
+    FAIL=$((FAIL + 1))
   else
-    fail "    ❌ $required missing"
-    STRUCTURE_OK=false
+    info "  Bundler created: $TEST_APP"
+
+    # Verify bundle structure
+    info "  Verifying .app bundle structure ..."
+    STRUCTURE_OK=true
+    for required in \
+      "$TEST_APP/Contents/Info.plist" \
+      "$TEST_APP/Contents/PkgInfo" \
+      "$TEST_APP/Contents/MacOS/casa1-wrapper" \
+      "$TEST_APP/Contents/Resources" \
+      "$TEST_APP/Contents/Frameworks"; do
+      if [[ -e "$required" ]]; then
+        info "    ✅ $required exists"
+      else
+        fail "    ❌ $required missing"
+        STRUCTURE_OK=false
+      fi
+    done
+
+    if [[ "$STRUCTURE_OK" == "true" ]]; then
+      info "  App bundle structure validation — OK"
+      PASS=$((PASS + 1))
+    else
+      fail "  App bundle structure validation — FAILED"
+      FAIL=$((FAIL + 1))
+    fi
+
+    # Verify Info.plist contains required keys
+    info "  Verifying Info.plist contents ..."
+    if grep -q "CFBundleExecutable" "$TEST_APP/Contents/Info.plist" \
+      && grep -q "CFBundleIdentifier" "$TEST_APP/Contents/Info.plist" \
+      && grep -q "CFBundleName" "$TEST_APP/Contents/Info.plist" \
+      && grep -q "APPL" "$TEST_APP/Contents/Info.plist"; then
+      info "    ✅ Info.plist contains all required keys"
+      PASS=$((PASS + 1))
+    else
+      fail "    ❌ Info.plist missing required keys"
+      FAIL=$((FAIL + 1))
+    fi
+
+    # Verify wrapper is executable
+    info "  Verifying wrapper script is executable ..."
+    if [[ -x "$TEST_APP/Contents/MacOS/casa1-wrapper" ]]; then
+      info "    ✅ Wrapper script is executable"
+      PASS=$((PASS + 1))
+    else
+      fail "    ❌ Wrapper script is not executable"
+      FAIL=$((FAIL + 1))
+    fi
+
+    # Verify the wrapper launches through the real ge:run path (it must NOT
+    # be executed here — that would start the guest environment)
+    info "  Verifying wrapper script content ..."
+    if grep -q "ge:run" "$TEST_APP/Contents/MacOS/casa1-wrapper" \
+      && grep -q "$GE_NAME" "$TEST_APP/Contents/MacOS/casa1-wrapper"; then
+      info "    ✅ Wrapper invokes ge:run for the configured environment"
+      PASS=$((PASS + 1))
+    else
+      fail "    ❌ Wrapper script does not invoke the real ge:run launcher"
+      FAIL=$((FAIL + 1))
+    fi
   fi
-done
-
-if [[ "$STRUCTURE_OK" == "true" ]]; then
-  info "  App bundle structure validation — OK"
-  PASS=$((PASS + 1))
-else
-  fail "  App bundle structure validation — FAILED"
-  FAIL=$((FAIL + 1))
-fi
-
-# Verify Info.plist contains required keys (XML parse)
-info "  Verifying Info.plist contents ..."
-if grep -q "CFBundleExecutable" "$TEST_APP/Contents/Info.plist" \
-  && grep -q "CFBundleIdentifier" "$TEST_APP/Contents/Info.plist" \
-  && grep -q "CFBundleName" "$TEST_APP/Contents/Info.plist" \
-  && grep -q "APPL" "$TEST_APP/Contents/Info.plist"; then
-  info "    ✅ Info.plist contains all required keys"
-  PASS=$((PASS + 1))
-else
-  fail "    ❌ Info.plist missing required keys"
-  FAIL=$((FAIL + 1))
-fi
-
-# Verify wrapper is executable
-info "  Verifying wrapper script is executable ..."
-if [[ -x "$TEST_APP/Contents/MacOS/casa1-wrapper" ]]; then
-  info "    ✅ Wrapper script is executable"
-  PASS=$((PASS + 1))
-else
-  fail "    ❌ Wrapper script is not executable"
-  FAIL=$((FAIL + 1))
-fi
-
-# Verify wrapper actually runs
-info "  Verifying wrapper script execution ..."
-WRAPPER_OUTPUT="$("$TEST_APP/Contents/MacOS/casa1-wrapper" 2>&1)"
-if [[ "$WRAPPER_OUTPUT" == "TestApp wrapper executed" ]]; then
-  info "    ✅ Wrapper script executes correctly"
-  PASS=$((PASS + 1))
-else
-  fail "    ❌ Wrapper script produced unexpected output: $WRAPPER_OUTPUT"
-  FAIL=$((FAIL + 1))
 fi
 
 # ── 4. Code signing verification (macOS only) ────────────────────────────────
 info ""
-info "4. Checking code signing status (macOS only) ..."
+info "4. Checking code signing (macOS only) ..."
 if command -v codesign &>/dev/null; then
+  # Ad-hoc sign every release binary the way a release build would (casa1-runner
+  # carries its JIT entitlements plist), then verify each one is signed.
+  SIGN_FAILED=false
+  for binary in "${BINARIES[@]}"; do
+    BINARY_PATH="$RELEASE_DIR/$binary"
+    if [[ "$binary" == "casa1-runner" && -f "$REPO_ROOT/ci/entitlements/casa1-runner.plist" ]]; then
+      /usr/bin/codesign --force --sign - \
+        --entitlements "$REPO_ROOT/ci/entitlements/casa1-runner.plist" \
+        "$BINARY_PATH" &>/dev/null || SIGN_FAILED=true
+    else
+      /usr/bin/codesign --force --sign - "$BINARY_PATH" &>/dev/null || SIGN_FAILED=true
+    fi
+  done
+
+  if [[ "$SIGN_FAILED" == "true" ]]; then
+    fail "  ❌ codesign failed for one or more release binaries"
+    FAIL=$((FAIL + 1))
+  else
+    info "  All binaries ad-hoc signed"
+  fi
+
+  # Verify the signature is actually present and valid
   for binary in "${BINARIES[@]}"; do
     BINARY_PATH="$RELEASE_DIR/$binary"
     if [[ -x "$BINARY_PATH" ]]; then
@@ -252,11 +288,11 @@ if command -v codesign &>/dev/null; then
       if echo "$SIGN_INFO" | grep -q "adhoc\|designated"; then
         info "  ✅ $binary: signed"
       else
-        info "  ⚠  $binary: not signed (expected for debug/dev builds)"
+        fail "  ❌ $binary: not signed"
+        FAIL=$((FAIL + 1))
       fi
     fi
   done
-  PASS=$((PASS + 1))
 else
   info "  codesign not available — skipping signing check"
   PASS=$((PASS + 1))
