@@ -1,0 +1,80 @@
+warning: unreachable expression
+     --> src/pe_runtime.rs:65207:9
+      |
+65202 |               return Ok(Arc::clone(&cached.cached));
+      |               ------------------------------------- any code following this expression is unreachable
+...
+65207 | /         if let Some(jit) = jit_runtime {
+65208 | |             if jit.is_compiled(rip) {
+65209 | |                 let _ = jit.unchain_target(rip);
+65210 | |             }
+65211 | |         }
+      | |_________^ unreachable expression
+      |
+      = note: `#[warn(unreachable_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `lhs`
+     --> src/cpu.rs:16265:38
+      |
+16265 |             IrInstruction::Compare { lhs, rhs, width } => {
+      |                                      ^^^ help: try ignoring the field: `lhs: _`
+      |
+      = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `rhs`
+     --> src/cpu.rs:16265:43
+      |
+16265 |             IrInstruction::Compare { lhs, rhs, width } => {
+      |                                           ^^^ help: try ignoring the field: `rhs: _`
+
+warning: unused variable: `width`
+     --> src/cpu.rs:16265:48
+      |
+16265 |             IrInstruction::Compare { lhs, rhs, width } => {
+      |                                                ^^^^^ help: try ignoring the field: `width: _`
+
+warning: unused variable: `lhs`
+     --> src/cpu.rs:16268:35
+      |
+16268 |             IrInstruction::Test { lhs, rhs, width } => {
+      |                                   ^^^ help: try ignoring the field: `lhs: _`
+
+warning: unused variable: `rhs`
+     --> src/cpu.rs:16268:40
+      |
+16268 |             IrInstruction::Test { lhs, rhs, width } => {
+      |                                        ^^^ help: try ignoring the field: `rhs: _`
+
+warning: unused variable: `width`
+     --> src/cpu.rs:16268:45
+      |
+16268 |             IrInstruction::Test { lhs, rhs, width } => {
+      |                                             ^^^^^ help: try ignoring the field: `width: _`
+
+warning: unused variable: `jit_runtime`
+     --> src/pe_runtime.rs:65191:5
+      |
+65191 |     jit_runtime: Option<&mut crate::jit::JitRuntime>,
+      |     ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_jit_runtime`
+
+warning: `casa1` (lib) generated 8 warnings (run `cargo fix --lib -p casa1` to apply 7 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.35s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running tests/section_fuzz.rs (target/debug/deps/section_fuzz-efcdb3cb41db05d3)
+
+running 11 tests
+test regression_steam_truncated_header ... ok
+test regression_winhttp_ntlm_empty ... ok
+test regression_steam_bad_magic ... ok
+test regression_steam_empty_frame ... ok
+test regression_http_empty ... ok
+test regression_pe_minimal_mz ... ok
+test regression_pe_truncated_nt_headers ... ok
+test regression_http_malformed ... ok
+test regression_winhttp_empty_url ... ok
+test fuzz_fixtures_no_panic ... ok
+test regression_wininet_empty_url ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

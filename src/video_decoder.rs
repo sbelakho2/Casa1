@@ -19,18 +19,59 @@ use crate::error::{AppError, AppResult};
 use crate::reason::ReasonCode;
 use std::collections::VecDeque;
 use std::ffi::c_void;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+
+/// Maximum size (in bytes) of media data buffered from HTTP sources.
+///
+/// HTTP sources are downloaded into memory for probing/decoding; cap the
+/// download so a malicious or oversized remote file cannot exhaust memory.
+pub(crate) const HTTP_FETCH_LIMIT_BYTES: usize = 64 * 1024 * 1024;
+
+/// Lock a `Mutex`, recovering from poisoning instead of panicking.
+///
+/// Used inside C callbacks where a panic would unwind across the FFI
+/// boundary (undefined behavior in release builds).
+fn lock_poisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Fetch an HTTP(S) URL into memory, rejecting responses larger than `limit`.
+pub(crate) fn fetch_http_bounded(url: &str, limit: usize) -> AppResult<Vec<u8>> {
+    use std::io::Read;
+    let response = reqwest::blocking::get(url).map_err(|e| {
+        AppError::new(
+            ReasonCode::RcMediaInvalid,
+            format!("Failed to fetch {url}: {e}"),
+        )
+    })?;
+    let mut bytes = Vec::new();
+    let mut limited = response.take(limit as u64 + 1);
+    limited.read_to_end(&mut bytes).map_err(|e| {
+        AppError::new(
+            ReasonCode::RcMediaInvalid,
+            format!("Failed to read response from {url}: {e}"),
+        )
+    })?;
+    if bytes.len() > limit {
+        return Err(AppError::new(
+            ReasonCode::RcMediaInvalid,
+            format!("Media at {url} exceeds the {limit}-byte buffering limit"),
+        ));
+    }
+    Ok(bytes)
+}
 
 // ===========================================================================
 // Color space / color primaries
 // ===========================================================================
 
 /// Color space / color primaries for video frames.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ColorSpace {
     /// ITU-R BT.601 (SDTV).
     Rec601,
     /// ITU-R BT.709 (HDTV).
+    #[default]
     Rec709,
     /// ITU-R BT.2020 (UHDTV / HDR).
     Rec2020,
@@ -39,11 +80,6 @@ pub enum ColorSpace {
 }
 
 impl ColorSpace {
-    /// Return the default color space.
-    pub fn default() -> Self {
-        ColorSpace::Rec709
-    }
-
     /// Return the BT.601 coefficients.
     pub fn coeffs_601() -> (f32, f32, f32, f32, f32) {
         // Kr = 0.299, Kg = 0.587, Kb = 0.114
@@ -71,6 +107,18 @@ impl ColorSpace {
     }
 }
 
+/// Full-range YUV -> RGB conversion coefficients for the given color space,
+/// returned as `(cr, cg_u, cg_v, cb)` multipliers.
+#[cfg(target_os = "macos")]
+fn yuv_to_rgb_coeffs(color_space: ColorSpace) -> (f32, f32, f32, f32) {
+    match color_space {
+        ColorSpace::Rec601 => (1.402, 0.344, 0.714, 1.772),
+        ColorSpace::Rec709 => (1.5748, 0.1873, 0.4681, 1.8556),
+        ColorSpace::Rec2020 => (1.4746, 0.1646, 0.5714, 1.8814),
+        ColorSpace::Unknown => (1.5748, 0.1873, 0.4681, 1.8556),
+    }
+}
+
 // ===========================================================================
 // Shared types (platform-independent)
 // ===========================================================================
@@ -89,7 +137,11 @@ pub enum VideoCodec {
 /// When the zero-copy Metal path is active, `metal_texture` holds a +1
 /// retained `id<MTLTexture>` pointer and `data` is empty.  Otherwise
 /// `data` contains CPU-side RGBA bytes and `metal_texture` is `None`.
-#[derive(Debug, Clone)]
+///
+/// `VideoFrame` is intentionally not `Clone`: the `metal_texture` pointer
+/// has single-ownership semantics (released when the frame is dropped), so
+/// copying a frame would double-release the texture.
+#[derive(Debug)]
 pub struct VideoFrame {
     /// Width in pixels.
     pub width: u32,
@@ -110,6 +162,20 @@ pub struct VideoFrame {
     pub metal_texture: Option<*mut std::ffi::c_void>,
     /// Color space of the frame.
     pub color_space: ColorSpace,
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for VideoFrame {
+    fn drop(&mut self) {
+        // SAFETY: `metal_texture` is a +1 retained id<MTLTexture> owned by
+        // this frame (see `MetalVideoTextureCache::create_texture_from_pixel_buffer`).
+        if let Some(ptr) = self.metal_texture {
+            unsafe {
+                let obj = ptr as *mut objc::runtime::Object;
+                let _: () = msg_send![obj, release];
+            }
+        }
+    }
 }
 
 /// Video decoder configuration.
@@ -206,8 +272,8 @@ pub(crate) mod vt_ffi {
 
     // ---- Constants ----
 
-    /// H.264 codec type FourCharCode 'avc1' (as a little-endian u32).
-    pub const kCMVideoCodecType_H264: u32 = 0x31637661;
+    /// H.264 codec type FourCharCode 'avc1' (a=0x61 is the high byte).
+    pub const kCMVideoCodecType_H264: u32 = 0x61766331;
 
     /// BGRA pixel format type FourCharCode 'BGRA'.
     pub const kCVPixelFormatType_32BGRA: u32 = 0x42475241;
@@ -281,11 +347,14 @@ pub(crate) mod vt_ffi {
     }
 
     // ---- FFI function declarations ----
-
+    //
+    // Multiple framework link attributes on one extern block trip
+    // `clippy::duplicated_attributes`; they are intentional (each names a
+    // distinct framework), so the lint is scoped out here.
+    #[allow(clippy::duplicated_attributes)]
     #[link(name = "VideoToolbox", kind = "framework")]
     #[link(name = "CoreMedia", kind = "framework")]
     #[link(name = "CoreVideo", kind = "framework")]
-    #[allow(clashing_extern_declarations)]
     unsafe extern "C" {
         // ========== CMBlockBuffer ==========
 
@@ -322,14 +391,27 @@ pub(crate) mod vt_ffi {
 
         // ========== CMVideoFormatDescription ==========
 
+        /// Create a CMVideoFormatDescription from raw extradata (avcC / Annex B).
+        pub fn CMVideoFormatDescriptionCreate(
+            allocator: CFAllocatorRef,
+            codecType: u32,
+            width: i32,
+            height: i32,
+            descOut: *mut CMVideoFormatDescriptionRef,
+        ) -> i32;
+
         /// Create a CMVideoFormatDescription from H.264 parameter sets (SPS, PPS).
-        /// Uses `CMVideoFormatDescriptionCreateFromH264ParameterSets`.
-        #[link_name = "CMVideoFormatDescriptionCreateFromH264ParameterSets"]
-        pub fn CMVideoFormatDescriptionCreateFromH264ParameterSet(
+        ///
+        /// Matches the real API:
+        /// `CMVideoFormatDescriptionCreateFromH264ParameterSets(allocator,
+        /// parameterSetCount, parameterSetSizes, parameterSetPointers,
+        /// nalUnitHeaderLength, out)`.
+        pub fn CMVideoFormatDescriptionCreateFromH264ParameterSets(
             allocator: CFAllocatorRef,
             parameterSetCount: usize,
-            parameterSetPointers: *const *const u8,
             parameterSetSizes: *const usize,
+            parameterSetPointers: *const *const u8,
+            nalUnitHeaderLength: i32,
             formatDescriptionOut: *mut CMVideoFormatDescriptionRef,
         ) -> i32;
 
@@ -372,6 +454,8 @@ pub(crate) mod vt_ffi {
         pub fn CVPixelBufferGetPixelFormatType(pixelBuffer: CVPixelBufferRef) -> u32;
         /// Get the base address of a pixel buffer (for packed formats).
         pub fn CVPixelBufferGetBaseAddress(pixelBuffer: CVPixelBufferRef) -> *mut c_void;
+        /// Get the total data size of a pixel buffer (in bytes).
+        pub fn CVPixelBufferGetDataSize(pixelBuffer: CVPixelBufferRef) -> usize;
         /// Get the base address of a specific plane.
         pub fn CVPixelBufferGetBaseAddressOfPlane(
             pixelBuffer: CVPixelBufferRef,
@@ -553,8 +637,14 @@ impl MetalVideoTextureCache {
     /// `metal::Texture::from_ptr()` which hands ownership to the
     /// reference-counted wrapper).
     ///
+    /// # Safety
+    ///
+    /// `pixel_buffer` must be a valid, retained-or-live `CVPixelBufferRef`
+    /// for the duration of the call (e.g. one delivered by a VideoToolbox
+    /// output callback while the callback is still running).
+    ///
     /// Returns `None` on failure (e.g. invalid format, out of memory).
-    pub fn create_texture_from_pixel_buffer(
+    pub unsafe fn create_texture_from_pixel_buffer(
         &self,
         pixel_buffer: vt_ffi::CVPixelBufferRef,
         width: u32,
@@ -773,8 +863,8 @@ fn no_decoder_error() -> AppError {
 
 /// Shared state that the VideoToolbox callback writes decoded frames into.
 ///
-/// This is allocated on the heap and passed to VTDecompressionSessionCreate
-/// as the `outputRefCon`. The callback converts the CVPixelBuffer to RGBA
+/// This is reference-counted and passed to VTDecompressionSessionCreate as
+/// the `outputRefCon`. The callback converts the CVPixelBuffer to RGBA
 /// and pushes the result into `frames`.
 #[cfg(target_os = "macos")]
 struct DecoderContext {
@@ -784,15 +874,22 @@ struct DecoderContext {
     output_width: u32,
     /// Output height in pixels.
     output_height: u32,
-    /// FPS for computing PTS/duration.
-    fps: f64,
-    /// Running frame counter.
-    frame_number: Mutex<u64>,
     /// Optional Metal texture cache for zero-copy path.
     /// When `Some`, the callback attempts to create a Metal texture
     /// from the CVPixelBuffer before falling back to the CPU path.
     metal_cache: Option<MetalVideoTextureCache>,
+    /// Color space applied to decoded frames and YUV conversion.
+    color_space: ColorSpace,
+    /// Scratch buffer reused across frames to avoid per-frame allocations.
+    scratch: Mutex<Vec<u8>>,
 }
+
+// Safety: `DecoderContext` is shared with the VideoToolbox output callback
+// (which runs on a VideoToolbox internal thread) via an `Arc`. All shared
+// state (`frames`, `scratch`) is mutex-protected, and the Metal texture
+// cache is only touched from the callback thread after being handed over.
+unsafe impl Send for DecoderContext {}
+unsafe impl Sync for DecoderContext {}
 
 // ===========================================================================
 // VideoDecoder
@@ -812,7 +909,11 @@ pub struct VideoDecoder {
     #[cfg(target_os = "macos")]
     format_desc: Option<vt_ffi::CMVideoFormatDescriptionRef>,
     #[cfg(target_os = "macos")]
-    context: Option<Box<DecoderContext>>,
+    context: Option<Arc<DecoderContext>>,
+    /// Raw `Arc<DecoderContext>` handed to VideoToolbox as the output
+    /// callback refcon (one strong reference; reclaimed on teardown).
+    #[cfg(target_os = "macos")]
+    callback_refcon: Option<*mut c_void>,
     /// Zero-copy Metal texture cache. Created on macOS if a Metal device
     /// is available; `None` otherwise.
     #[cfg(target_os = "macos")]
@@ -824,6 +925,10 @@ pub struct VideoDecoder {
     config: VideoDecoderConfig,
     sps: Vec<u8>,
     pps: Vec<u8>,
+    /// FNV-1a hash of the current SPS+PPS pair, used to avoid tearing down
+    /// and re-creating the VT session when parameter sets are repeated.
+    #[cfg(target_os = "macos")]
+    sps_pps_hash: u64,
     frame_queue: VecDeque<VideoFrame>,
     frame_number: u64,
 }
@@ -852,12 +957,16 @@ impl VideoDecoder {
             #[cfg(target_os = "macos")]
             context: None,
             #[cfg(target_os = "macos")]
+            callback_refcon: None,
+            #[cfg(target_os = "macos")]
             metal_cache,
             #[cfg(feature = "ffmpeg")]
             ffmpeg_ctx,
             config,
             sps: Vec::new(),
             pps: Vec::new(),
+            #[cfg(target_os = "macos")]
+            sps_pps_hash: 0,
             frame_queue: VecDeque::new(),
             frame_number: 0,
         }
@@ -870,32 +979,29 @@ impl VideoDecoder {
     /// or a VP9 frame) in Annex B format.
     ///
     /// Returns the number of frames that were decoded and added to the output queue.
-    pub fn decode_packet(&mut self, data: &[u8], _pts: u64) -> AppResult<usize> {
+    pub fn decode_packet(&mut self, data: &[u8], pts: u64) -> AppResult<usize> {
         let before = self.frame_queue.len();
 
         #[cfg(feature = "ffmpeg")]
-        {
-            if let Some(ref mut ctx) = self.ffmpeg_ctx {
-                if let Some(frame) = ctx.decode_packet(data, pts)? {
-                    self.frame_queue.push_back(frame);
-                }
-                return Ok(self.frame_queue.len() - before);
+        if let Some(ref mut ctx) = self.ffmpeg_ctx {
+            if let Some(frame) = ctx.decode_packet(data, pts)? {
+                self.frame_queue.push_back(frame);
             }
+            return Ok(self.frame_queue.len() - before);
         }
 
         // Fall back to VideoToolbox on macOS
         #[cfg(target_os = "macos")]
         {
-            // feed_data will parse Annex B and decode via VT
-            self.feed_data_internal(data)?;
-            return Ok(self.frame_queue.len() - before);
+            self.feed_data_internal(data, Some(pts))?;
+            Ok(self.frame_queue.len() - before)
         }
 
         #[cfg(not(any(target_os = "macos", feature = "ffmpeg")))]
         {
             let _data = data;
             let _pts = pts;
-            return Err(no_decoder_error());
+            Err(no_decoder_error())
         }
     }
 
@@ -903,20 +1009,18 @@ impl VideoDecoder {
     /// Legacy method — prefer `decode_packet()` for new code.
     pub fn feed_data(&mut self, data: &[u8]) -> AppResult<()> {
         #[cfg(feature = "ffmpeg")]
-        {
-            if let Some(ref mut ctx) = self.ffmpeg_ctx {
-                let pts = self.frame_number * 1_000_000 / self.config.fps.max(1.0) as u64;
-                if let Some(frame) = ctx.decode_packet(data, pts)? {
-                    self.frame_queue.push_back(frame);
-                }
-                self.frame_number += 1;
-                return Ok(());
+        if let Some(ref mut ctx) = self.ffmpeg_ctx {
+            let pts = self.frame_number * 1_000_000 / self.config.fps.max(1.0) as u64;
+            if let Some(frame) = ctx.decode_packet(data, pts)? {
+                self.frame_queue.push_back(frame);
             }
+            self.frame_number += 1;
+            return Ok(());
         }
 
         #[cfg(target_os = "macos")]
         {
-            return self.feed_data_internal(data);
+            self.feed_data_internal(data, None)
         }
 
         #[cfg(not(any(target_os = "macos", feature = "ffmpeg")))]
@@ -927,8 +1031,12 @@ impl VideoDecoder {
     }
 
     /// Internal H.264 Annex B feed path for VideoToolbox.
+    ///
+    /// `pts` is the presentation timestamp (microseconds) of the access
+    /// unit when known; when `None`, a PTS is synthesized from the frame
+    /// counter and configured frame rate.
     #[cfg(target_os = "macos")]
-    fn feed_data_internal(&mut self, data: &[u8]) -> AppResult<()> {
+    fn feed_data_internal(&mut self, data: &[u8], pts: Option<u64>) -> AppResult<()> {
         let nalus = parse_h264_annex_b(data);
 
         for nalu in &nalus {
@@ -945,32 +1053,23 @@ impl VideoDecoder {
                         self.config.width = w;
                         self.config.height = h;
                     }
-                    // Re-initialize the session with new SPS/PPS if we have both
-                    if !self.pps.is_empty() {
-                        if let Err(e) = self.init_session() {
-                            eprintln!("[VideoDecoder] failed to re-init VT session after SPS: {e}");
-                        }
-                    }
+                    self.reinit_session_if_changed();
                 }
                 8 => {
                     // PPS (Picture Parameter Set)
                     self.pps = nalu.to_vec();
-                    if !self.sps.is_empty() {
-                        if let Err(e) = self.init_session() {
-                            eprintln!("[VideoDecoder] failed to re-init VT session after PPS: {e}");
-                        }
-                    }
+                    self.reinit_session_if_changed();
                 }
-                5 | 1 => {
+                5 | 1 if self.session.is_some() => {
                     // IDR slice (5) or Non-IDR slice (1)
-                    if self.session.is_some() {
-                        let pts = if self.frame_number == 0 {
+                    let frame_pts = pts.unwrap_or_else(|| {
+                        if self.frame_number == 0 {
                             0
                         } else {
-                            self.frame_number * 1_000_000 / self.config.fps as u64
-                        };
-                        self.decode_frame_vt(nalu, pts)?;
-                    }
+                            self.frame_number * 1_000_000 / self.config.fps.max(1.0) as u64
+                        }
+                    });
+                    self.decode_frame_vt(nalu, frame_pts)?;
                 }
                 _ => {
                     // Other NAL types (SEI, AUD, etc.) — ignore
@@ -979,6 +1078,30 @@ impl VideoDecoder {
         }
 
         Ok(())
+    }
+
+    /// (Re)initialize the VideoToolbox session, but only when the SPS/PPS
+    /// parameter sets actually changed. Many streams repeat SPS/PPS in every
+    /// access unit; tearing down and re-creating the session per frame would
+    /// be needlessly expensive and drop buffered output.
+    #[cfg(target_os = "macos")]
+    fn reinit_session_if_changed(&mut self) {
+        if self.sps.is_empty() || self.pps.is_empty() {
+            return;
+        }
+        // FNV-1a hash over SPS+PPS
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in self.sps.iter().chain(self.pps.iter()) {
+            hash ^= *byte as u64;
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        if hash == self.sps_pps_hash && self.session.is_some() {
+            return; // parameter sets unchanged — keep the current session
+        }
+        self.sps_pps_hash = hash;
+        if let Err(e) = self.init_session() {
+            eprintln!("[VideoDecoder] failed to (re)init VT session: {e}");
+        }
     }
 
     /// Initialize (or re-initialize) the VideoToolbox decompression session.
@@ -1009,11 +1132,12 @@ impl VideoDecoder {
         // 1. Create CMVideoFormatDescription from SPS + PPS
         let mut format_desc: CMVideoFormatDescriptionRef = ptr::null_mut();
         let status = unsafe {
-            CMVideoFormatDescriptionCreateFromH264ParameterSet(
+            CMVideoFormatDescriptionCreateFromH264ParameterSets(
                 ptr::null_mut(), // kCFAllocatorDefault
                 2,               // SPS + PPS
-                param_set_pointers.as_ptr(),
                 param_set_sizes.as_ptr(),
+                param_set_pointers.as_ptr(),
+                4, // nalUnitHeaderLength: AVCC 4-byte length prefixes
                 &mut format_desc,
             )
         };
@@ -1022,7 +1146,7 @@ impl VideoDecoder {
             return Err(AppError::new(
                 ReasonCode::RcMediaInvalid,
                 format!(
-                    "CMVideoFormatDescriptionCreateFromH264ParameterSet failed with status {}",
+                    "CMVideoFormatDescriptionCreateFromH264ParameterSets failed with status {}",
                     status
                 ),
             ));
@@ -1035,28 +1159,57 @@ impl VideoDecoder {
             metal::Device::system_default().and_then(|dev| MetalVideoTextureCache::new(&dev))
         });
 
-        let ctx = Box::new(DecoderContext {
+        let ctx = Arc::new(DecoderContext {
             frames: Mutex::new(VecDeque::new()),
             output_width: self.config.width,
             output_height: self.config.height,
-            fps: self.config.fps,
-            frame_number: Mutex::new(0),
             metal_cache,
+            color_space: ColorSpace::default(),
+            scratch: Mutex::new(Vec::new()),
         });
 
-        let context_ptr = Box::into_raw(ctx);
+        self.context = Some(ctx.clone());
+        let context_ptr = Arc::into_raw(ctx) as *mut c_void;
+        self.callback_refcon = Some(context_ptr);
 
         // 3. Set up the output callback record
         let callback_record = VTDecompressionOutputCallbackRecord {
             decompressionOutputCallback: Some(decompression_output_callback),
-            decompressionOutputRefCon: context_ptr as *mut c_void,
+            decompressionOutputRefCon: context_ptr,
+        };
+
+        // On any failure below, drop the context and reclaim the refcon
+        // strong reference before returning an error.
+        let cleanup_on_error = |self_ref: &mut Self, format_desc: CMVideoFormatDescriptionRef| {
+            self_ref.context = None;
+            if let Some(refcon) = self_ref.callback_refcon.take() {
+                unsafe { let _ = Arc::from_raw(refcon as *const DecoderContext); }
+            }
+            if !format_desc.is_null() {
+                unsafe { CFRelease(format_desc as CFTypeRef) };
+            }
         };
 
         // 4. Create destination pixel buffer attributes (request BGRA output)
-        let dest_attrs = create_bgra_pixel_buffer_attributes()?;
+        let dest_attrs = match create_bgra_pixel_buffer_attributes() {
+            Ok(attrs) => attrs,
+            Err(e) => {
+                cleanup_on_error(self, format_desc);
+                return Err(e);
+            }
+        };
 
         // 5. Create decoder specification (prefer hardware acceleration)
-        let decoder_spec = create_hardware_decoder_specification()?;
+        let decoder_spec = match create_hardware_decoder_specification() {
+            Ok(spec) => spec,
+            Err(e) => {
+                if !dest_attrs.is_null() {
+                    unsafe { CFRelease(dest_attrs as CFTypeRef) };
+                }
+                cleanup_on_error(self, format_desc);
+                return Err(e);
+            }
+        };
 
         // 6. Create the decompression session
         let mut session: VTDecompressionSessionRef = ptr::null_mut();
@@ -1080,17 +1233,11 @@ impl VideoDecoder {
         }
 
         if status != 0 || session.is_null() {
-            // Clean up the context we allocated on failure
-            unsafe {
-                let context_box = Box::from_raw(context_ptr);
-                eprintln!(
-                    "[VideoDecoder] VTDecompressionSessionCreate failed (status={status}), cleaned up context"
-                );
-                drop(context_box);
-            }
-            if !format_desc.is_null() {
-                unsafe { CFRelease(format_desc as CFTypeRef) };
-            }
+            // No callbacks can be in flight because the session was never created.
+            cleanup_on_error(self, format_desc);
+            eprintln!(
+                "[VideoDecoder] VTDecompressionSessionCreate failed (status={status}), cleaned up context"
+            );
             return Err(AppError::new(
                 ReasonCode::RcMediaInvalid,
                 format!("VTDecompressionSessionCreate failed with status {}", status),
@@ -1099,7 +1246,6 @@ impl VideoDecoder {
 
         self.session = Some(session);
         self.format_desc = Some(format_desc);
-        self.context = Some(unsafe { Box::from_raw(context_ptr) });
 
         Ok(())
     }
@@ -1197,20 +1343,18 @@ impl VideoDecoder {
             ));
         }
 
-        // If we have a context, update the frame number before decoding
-        if let Some(ref ctx) = self.context {
-            let mut frame_num = ctx.frame_number.lock().unwrap();
-            *frame_num = self.frame_number;
-        }
-
-        // Decode the frame (synchronous: wait for completion)
+        // Decode the frame synchronously: without
+        // kVTDecodeFrame_EnableAsynchronousDecompression the callback runs
+        // before VTDecompressionSessionDecodeFrame returns, so no callback
+        // can be in flight after this call — which also makes session
+        // teardown race-free.
         let mut info_flags: VTDecodeInfoFlags = 0;
         let status = unsafe {
             VTDecompressionSessionDecodeFrame(
                 session,
                 sample_buffer,
-                kVTDecodeFrame_EnableAsynchronousDecompression, // async
-                ptr::null_mut(),                                // sourceFrameRefCon
+                0,               // synchronous
+                ptr::null_mut(), // sourceFrameRefCon
                 &mut info_flags,
             )
         };
@@ -1228,18 +1372,6 @@ impl VideoDecoder {
             ));
         }
 
-        // Wait for asynchronous decoding to finish
-        let wait_status = unsafe { VTDecompressionSessionWaitForAsynchronousFrames(session) };
-        if wait_status != 0 {
-            return Err(AppError::new(
-                ReasonCode::RcMediaInvalid,
-                format!(
-                    "VTDecompressionSessionWaitForAsynchronousFrames failed with status {}",
-                    wait_status
-                ),
-            ));
-        }
-
         // Transfer any decoded frames from the callback context to our queue
         self.sync_decoded_frames();
 
@@ -1252,7 +1384,7 @@ impl VideoDecoder {
     #[cfg(target_os = "macos")]
     fn sync_decoded_frames(&mut self) {
         if let Some(ref ctx) = self.context {
-            let mut frames = ctx.frames.lock().unwrap();
+            let mut frames = lock_poisoned(&ctx.frames);
             while let Some(frame) = frames.pop_front() {
                 self.frame_queue.push_back(frame);
             }
@@ -1267,6 +1399,11 @@ impl VideoDecoder {
         if let Some(session) = self.session.take() {
             unsafe {
                 VTDecompressionSessionInvalidate(session);
+                // Drain any frames that were already queued for the callback.
+                // With synchronous decoding no callback is in flight here, but
+                // the wait is harmless and covers the async flag used by other
+                // modules sharing this session pattern.
+                let _ = VTDecompressionSessionWaitForAsynchronousFrames(session);
                 CFRelease(session as CFTypeRef);
             }
         }
@@ -1275,7 +1412,13 @@ impl VideoDecoder {
                 CFRelease(fd as CFTypeRef);
             }
         }
-        self.context.take();
+        // Reclaim the callback refcon's strong reference. After invalidation
+        // no new callbacks can start, and any in-flight callback holds its
+        // own strong reference via `Arc::increment_strong_count`.
+        if let Some(refcon) = self.callback_refcon.take() {
+            unsafe { let _ = Arc::from_raw(refcon as *const DecoderContext); }
+        }
+        self.context = None;
     }
 
     /// Destroy the session (non-macOS no-op).
@@ -1285,6 +1428,12 @@ impl VideoDecoder {
     /// Get the next decoded frame (if available).
     pub fn get_frame(&mut self) -> Option<VideoFrame> {
         self.frame_queue.pop_front()
+    }
+
+    /// Re-queue frames at the back of the output queue (used by the MFT
+    /// Drain message so flushed frames remain deliverable via ProcessOutput).
+    pub(crate) fn push_frame(&mut self, frame: VideoFrame) {
+        self.frame_queue.push_back(frame);
     }
 
     /// Check if there are frames available in the queue.
@@ -1315,6 +1464,10 @@ impl VideoDecoder {
         self.frame_queue.clear();
         self.sps.clear();
         self.pps.clear();
+        #[cfg(target_os = "macos")]
+        {
+            self.sps_pps_hash = 0;
+        }
         self.frame_number = 0;
     }
 
@@ -1356,10 +1509,43 @@ pub fn prepare_metal_texture_upload(
     let width = frame.width;
     let height = frame.height;
 
+    // Reject dimensions that overflow or that the given format cannot
+    // represent (checked arithmetic; width/height come from callers).
+    if width == 0 || height == 0 {
+        return Err(AppError::new(
+            ReasonCode::RcMediaInvalid,
+            "Invalid zero dimension for Metal texture upload",
+        ));
+    }
+    let Some(pixel_count) = (width as u64).checked_mul(height as u64) else {
+        return Err(AppError::new(
+            ReasonCode::RcMediaInvalid,
+            "Texture dimensions overflow",
+        ));
+    };
+    let Some(needed) = pixel_count.checked_mul(4) else {
+        return Err(AppError::new(
+            ReasonCode::RcMediaInvalid,
+            "Texture byte size overflows",
+        ));
+    };
+    if frame.data.len() != needed as usize {
+        return Err(AppError::new(
+            ReasonCode::RcMediaInvalid,
+            format!(
+                "Frame data length {} does not match {}x{} RGBA ({} bytes)",
+                frame.data.len(),
+                width,
+                height,
+                needed
+            ),
+        ));
+    }
+
     match format {
         MetalTextureFormat::BGRA8Unorm => {
             // RGBA -> BGRA: swap R and B
-            let pixel_count = (width * height) as usize;
+            let pixel_count = pixel_count as usize;
             let mut bgra = vec![0u8; pixel_count * 4];
             for i in 0..pixel_count {
                 let si = i * 4;
@@ -1388,11 +1574,23 @@ pub fn prepare_metal_texture_upload(
             })
         }
         MetalTextureFormat::NV12 => {
+            // NV12 requires even dimensions: the UV plane is subsampled
+            // 2:1 in both axes and odd sizes would produce a UV plane
+            // inconsistent with the Y plane.
+            if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
+                return Err(AppError::new(
+                    ReasonCode::RcMediaInvalid,
+                    format!(
+                        "NV12 upload requires even dimensions, got {width}x{height}"
+                    ),
+                ));
+            }
+
             // Convert RGBA -> YUV420p -> NV12
             let (kr, kb) = color_space.kr_kb();
             let kg = 1.0 - kr - kb;
 
-            let y_size = (width * height) as usize;
+            let y_size = pixel_count as usize;
             let uv_size = ((width / 2) * (height / 2)) as usize;
             let mut y_plane = vec![0u8; y_size];
             let mut u_plane = vec![0u8; uv_size];
@@ -1629,11 +1827,13 @@ impl MfTransform {
                 Ok(())
             }
             MftMessageType::Drain => {
-                // Produce all remaining output
+                // Produce all remaining output. `flush` returns the pending
+                // frames; re-queue them so ProcessOutput can deliver them.
                 let remaining = self.decoder.flush();
                 self.input_queued = 0;
-                // Frames remain in the decoder's queue for ProcessOutput
-                let _remaining = remaining;
+                for frame in remaining {
+                    self.decoder.push_frame(frame);
+                }
                 Ok(())
             }
             MftMessageType::Reset => {
@@ -1711,100 +1911,139 @@ impl MfTransform {
 ///
 /// Converts the `CVPixelBufferRef` to RGBA bytes and pushes the result
 /// into the `DecoderContext`'s frame queue.
+///
+/// # Safety
+///
+/// Must be invoked with the `outputRefCon` handed to
+/// `VTDecompressionSessionCreate`, which is a strong reference to a
+/// `DecoderContext`. The callback takes its own reference for the duration
+/// of the call, so the context can never be freed while the callback runs.
 #[cfg(target_os = "macos")]
 unsafe extern "C" fn decompression_output_callback(
     outputRefCon: *mut c_void,
     _sourceFrameRefCon: *mut c_void,
     status: i32,
-    _infoFlags: vt_ffi::VTDecodeInfoFlags,
+    infoFlags: vt_ffi::VTDecodeInfoFlags,
     imageBuffer: vt_ffi::CVPixelBufferRef,
-    _presentationTimeStamp: vt_ffi::CMTime,
-    _presentationDuration: vt_ffi::CMTime,
+    presentationTimeStamp: vt_ffi::CMTime,
+    presentationDuration: vt_ffi::CMTime,
 ) {
     unsafe {
         use self::vt_ffi::*;
 
-        if status != 0 || imageBuffer.is_null() {
+        // A frame dropped by the decoder must not be enqueued.
+        if status != 0 || imageBuffer.is_null() || outputRefCon.is_null() {
+            return;
+        }
+        if infoFlags & kVTDecodeInfo_FrameDropped != 0 {
             return;
         }
 
-        // Reconstruct the context pointer
-        let ctx = &mut *(outputRefCon as *mut DecoderContext);
+        // Reconstruct the context: take a strong reference for the duration
+        // of this callback so the context cannot be freed concurrently.
+        let ctx_ptr = outputRefCon as *const DecoderContext;
+        Arc::increment_strong_count(ctx_ptr);
+        let ctx = Arc::from_raw(ctx_ptr);
 
         let width = CVPixelBufferGetWidth(imageBuffer) as u32;
         let height = CVPixelBufferGetHeight(imageBuffer) as u32;
+        let pts = cmtime_to_us(presentationTimeStamp);
+        let duration = cmtime_to_us(presentationDuration);
 
-        if width == 0 || height == 0 {
-            return;
-        }
-
-        // ---- ZERO-COPY PATH (CVMetalTextureCache) ----
-        // Before locking the pixel buffer for CPU reads, try to wrap it as a
-        // Metal texture via the cache.  If this succeeds we can skip the
-        // entire CPU-side pixel copy + format conversion.
-        //
-        // The pixel buffer does NOT need to be locked for CVMetalTextureCache.
-        if let Some(ref metal_cache) = ctx.metal_cache {
-            let pixel_format = CVPixelBufferGetPixelFormatType(imageBuffer);
-            let mtl_pixel_format = if pixel_format == kCVPixelFormatType_32BGRA {
-                MTLPixelFormatBGRA8Unorm
-            } else if pixel_format == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange {
-                // For NV12 we try BGRA texture creation which CoreVideo can
-                // convert on-the-fly; if that fails we fall through to software.
-                MTLPixelFormatBGRA8Unorm
-            } else {
-                // Unknown format — skip zero-copy
-                0
-            };
-
-            if mtl_pixel_format != 0 {
-                let mtl_texture = metal_cache.create_texture_from_pixel_buffer(
-                    imageBuffer,
-                    width,
-                    height,
-                    mtl_pixel_format,
-                    0, // planeIndex: 0 for BGRA / single-plane
-                );
-
-                if let Some(texture_ptr) = mtl_texture {
-                    // Zero-copy succeeded — no need to lock / copy pixels.
-                    let frame_num = { *ctx.frame_number.lock().unwrap() };
-                    let pts = if frame_num == 0 {
-                        0
+        let result = if width == 0 || height == 0 {
+            None
+        } else {
+            // ---- ZERO-COPY PATH (CVMetalTextureCache) ----
+            // Only 32BGRA pixel buffers are eligible: CoreVideo supports
+            // direct BGRA texture wrapping, and requesting anything else
+            // (e.g. "converting" NV12 to BGRA) yields undefined contents.
+            // NV12 buffers fall through to the software path below.
+            if let Some(ref metal_cache) = ctx.metal_cache {
+                let pixel_format = CVPixelBufferGetPixelFormatType(imageBuffer);
+                if pixel_format == kCVPixelFormatType_32BGRA {
+                    let mtl_texture = metal_cache.create_texture_from_pixel_buffer(
+                        imageBuffer,
+                        width,
+                        height,
+                        MTLPixelFormatBGRA8Unorm,
+                        0, // planeIndex: 0 for single-plane BGRA
+                    );
+                    if let Some(texture_ptr) = mtl_texture {
+                        // Zero-copy succeeded — no need to lock / copy pixels.
+                        let frame = VideoFrame {
+                            width: ctx.output_width.max(width),
+                            height: ctx.output_height.max(height),
+                            data: Vec::new(), // zero-copy — no CPU data
+                            pts,
+                            duration,
+                            texture_id: None,
+                            metal_texture: Some(texture_ptr),
+                            color_space: ctx.color_space,
+                        };
+                        Some(frame)
                     } else {
-                        frame_num * 1_000_000 / ctx.fps as u64
-                    };
-                    let duration = if ctx.fps > 0.0 {
-                        1_000_000 / ctx.fps as u64
-                    } else {
-                        33_333
-                    };
-
-                    let frame = VideoFrame {
-                        width: ctx.output_width.max(width),
-                        height: ctx.output_height.max(height),
-                        data: Vec::new(), // zero-copy — no CPU data
-                        pts,
-                        duration,
-                        texture_id: None,
-                        metal_texture: Some(texture_ptr),
-                        color_space: ColorSpace::Rec709,
-                    };
-
-                    let mut frames = ctx.frames.lock().unwrap();
-                    frames.push_back(frame);
-                    return; // Skip the software path entirely
+                        // Zero-copy failed — fall through to software path below.
+                        software_copy(&ctx, imageBuffer, width, height, pts, duration)
+                    }
+                } else {
+                    software_copy(&ctx, imageBuffer, width, height, pts, duration)
                 }
-                // Zero-copy failed — fall through to software path below.
+            } else {
+                software_copy(&ctx, imageBuffer, width, height, pts, duration)
             }
+        };
+
+        if let Some(frame) = result {
+            let mut frames = lock_poisoned(&ctx.frames);
+            frames.push_back(frame);
         }
 
-        // ---- SOFTWARE PATH (CPU-side pixel copy) ----
+        drop(ctx);
+    }
+}
+
+/// Convert a `CMTime` to microseconds; a zero/invalid timescale yields 0.
+#[cfg(target_os = "macos")]
+fn cmtime_to_us(time: vt_ffi::CMTime) -> u64 {
+    if time.timescale <= 0 {
+        return 0;
+    }
+    (time.value * 1_000_000 / time.timescale as i64) as u64
+}
+
+/// Copy the pixel data of `imageBuffer` into CPU memory as RGBA, using the
+/// context's scratch buffer to avoid per-frame allocations.
+///
+/// Returns `None` when the buffer layout cannot be validated.
+#[cfg(target_os = "macos")]
+fn software_copy(
+    ctx: &Arc<DecoderContext>,
+    imageBuffer: vt_ffi::CVPixelBufferRef,
+    width: u32,
+    height: u32,
+    pts: u64,
+    duration: u64,
+) -> Option<VideoFrame> {
+    use self::vt_ffi::*;
+
+    let w = width as usize;
+    let h = height as usize;
+    // Validate the RGBA size up front (checked arithmetic; the buffer
+    // dimensions come from CoreVideo but can be huge on crafted input).
+    let pixel_bytes = w.checked_mul(h).and_then(|n| n.checked_mul(4))?;
+    if pixel_bytes == 0 {
+        return None;
+    }
+
+    unsafe {
         // Lock the pixel buffer for reading
         let lock_status = CVPixelBufferLockBaseAddress(imageBuffer, 0);
         if lock_status != 0 {
-            return;
+            return None;
         }
+
+        let mut scratch = lock_poisoned(&ctx.scratch);
+        scratch.resize(pixel_bytes, 0);
 
         let pixel_format = CVPixelBufferGetPixelFormatType(imageBuffer);
         let frame_data = match pixel_format {
@@ -1815,44 +2054,53 @@ unsafe extern "C" fn decompression_output_callback(
                 if base.is_null() {
                     None
                 } else {
-                    let src = std::slice::from_raw_parts(base as *const u8, bpr * height as usize);
-                    let mut rgba = vec![0u8; (width * height * 4) as usize];
-                    for y in 0..height as usize {
-                        for x in 0..width as usize {
-                            let si = y * bpr + x * 4;
-                            let di = (y * width as usize + x) * 4;
-                            if si + 3 < src.len() && di + 3 < rgba.len() {
+                    // Bound the slice by the actual buffer size; stride*height is
+                    // the most we may ever touch.
+                    let data_size = CVPixelBufferGetDataSize(imageBuffer);
+                    let slice_len = bpr.checked_mul(h).unwrap_or(0).min(data_size);
+                    if slice_len == 0 {
+                    None
+                } else {
+                    let src = std::slice::from_raw_parts(base as *const u8, slice_len);
+                    for y in 0..h {
+                        let row = y * bpr;
+                        for x in 0..w {
+                            let si = row + x * 4;
+                            let di = (y * w + x) * 4;
+                            if si + 3 < src.len() {
                                 // BGRA -> RGBA: swap B and R
-                                rgba[di] = src[si + 2]; // R
-                                rgba[di + 1] = src[si + 1]; // G
-                                rgba[di + 2] = src[si]; // B
-                                rgba[di + 3] = src[si + 3]; // A
+                                scratch[di] = src[si + 2]; // R
+                                scratch[di + 1] = src[si + 1]; // G
+                                scratch[di + 2] = src[si]; // B
+                                scratch[di + 3] = src[si + 3]; // A
                             }
                         }
                     }
-                    Some(rgba)
+                    Some(std::mem::take(&mut *scratch))
                 }
             }
-            kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange => {
-                // NV12 bi-planar: Y plane + interleaved UV plane
-                let y_bpr = CVPixelBufferGetBytesPerRowOfPlane(imageBuffer, 0);
-                let uv_bpr = CVPixelBufferGetBytesPerRowOfPlane(imageBuffer, 1);
-                let y_base = CVPixelBufferGetBaseAddressOfPlane(imageBuffer, 0);
-                let uv_base = CVPixelBufferGetBaseAddressOfPlane(imageBuffer, 1);
+        }
+        kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange => {
+            // NV12 bi-planar: Y plane + interleaved UV plane
+            let y_bpr = CVPixelBufferGetBytesPerRowOfPlane(imageBuffer, 0);
+            let uv_bpr = CVPixelBufferGetBytesPerRowOfPlane(imageBuffer, 1);
+            let y_base = CVPixelBufferGetBaseAddressOfPlane(imageBuffer, 0);
+            let uv_base = CVPixelBufferGetBaseAddressOfPlane(imageBuffer, 1);
 
-                if y_base.is_null() || uv_base.is_null() {
+            if y_base.is_null() || uv_base.is_null() {
+                None
+            } else {
+                let y_slice_len = y_bpr.checked_mul(h).unwrap_or(0);
+                let uv_slice_len = uv_bpr.checked_mul(h.div_ceil(2)).unwrap_or(0);
+                if y_slice_len == 0 || uv_slice_len == 0 {
                     None
                 } else {
-                    let y_src =
-                        std::slice::from_raw_parts(y_base as *const u8, y_bpr * height as usize);
-                    let uv_src = std::slice::from_raw_parts(
-                        uv_base as *const u8,
-                        uv_bpr * (height as usize / 2),
-                    );
-                    let mut rgba = vec![0u8; (width * height * 4) as usize];
+                    let y_src = std::slice::from_raw_parts(y_base as *const u8, y_slice_len);
+                    let uv_src = std::slice::from_raw_parts(uv_base as *const u8, uv_slice_len);
+                    let (cr, cg_u, cg_v, cb) = yuv_to_rgb_coeffs(ctx.color_space);
 
-                    for y in 0..height as usize {
-                        for x in 0..width as usize {
+                    for y in 0..h {
+                        for x in 0..w {
                             let y_idx = y * y_bpr + x;
                             let uv_idx = (y / 2) * uv_bpr + (x / 2) * 2;
 
@@ -1860,76 +2108,66 @@ unsafe extern "C" fn decompression_output_callback(
                             let u_val = *uv_src.get(uv_idx).unwrap_or(&128) as f32 - 128.0;
                             let v_val = *uv_src.get(uv_idx + 1).unwrap_or(&128) as f32 - 128.0;
 
-                            let r = (y_val + 1.402 * v_val).clamp(0.0, 255.0) as u8;
-                            let g = (y_val - 0.344 * u_val - 0.714 * v_val).clamp(0.0, 255.0) as u8;
-                            let b = (y_val + 1.772 * u_val).clamp(0.0, 255.0) as u8;
+                            let r = (y_val + cr * v_val).clamp(0.0, 255.0) as u8;
+                            let g = (y_val - cg_u * u_val - cg_v * v_val).clamp(0.0, 255.0) as u8;
+                            let b = (y_val + cb * u_val).clamp(0.0, 255.0) as u8;
 
-                            let di = (y * width as usize + x) * 4;
-                            rgba[di] = r;
-                            rgba[di + 1] = g;
-                            rgba[di + 2] = b;
-                            rgba[di + 3] = 255;
+                            let di = (y * w + x) * 4;
+                            scratch[di] = r;
+                            scratch[di + 1] = g;
+                            scratch[di + 2] = b;
+                            scratch[di + 3] = 255;
                         }
                     }
-                    Some(rgba)
+                    Some(std::mem::take(&mut *scratch))
                 }
             }
-            _ => {
-                // Unknown format — try reading as packed BGRA anyway
-                let bpr = CVPixelBufferGetBytesPerRow(imageBuffer);
-                let base = CVPixelBufferGetBaseAddress(imageBuffer);
-                if base.is_null() {
+        }
+        _ => {
+            // Unknown format — try reading as packed BGRA anyway
+            let bpr = CVPixelBufferGetBytesPerRow(imageBuffer);
+            let base = CVPixelBufferGetBaseAddress(imageBuffer);
+            if base.is_null() {
+                None
+            } else {
+                let data_size = CVPixelBufferGetDataSize(imageBuffer);
+                let slice_len = bpr.checked_mul(h).unwrap_or(0).min(data_size);
+                if slice_len == 0 {
                     None
                 } else {
-                    let src = std::slice::from_raw_parts(base as *const u8, bpr * height as usize);
-                    let mut rgba = vec![0u8; (width * height * 4) as usize];
-                    for y in 0..height as usize {
-                        for x in 0..width as usize {
-                            let si = y * bpr + x * 4;
-                            let di = (y * width as usize + x) * 4;
-                            if si + 3 < src.len() && di + 3 < rgba.len() {
-                                rgba[di] = src[si + 2];
-                                rgba[di + 1] = src[si + 1];
-                                rgba[di + 2] = src[si];
-                                rgba[di + 3] = 255;
+                    let src = std::slice::from_raw_parts(base as *const u8, slice_len);
+                    for y in 0..h {
+                        let row = y * bpr;
+                        for x in 0..w {
+                            let si = row + x * 4;
+                            let di = (y * w + x) * 4;
+                            if si + 3 < src.len() {
+                                scratch[di] = src[si + 2];
+                                scratch[di + 1] = src[si + 1];
+                                scratch[di + 2] = src[si];
+                                scratch[di + 3] = 255;
                             }
                         }
                     }
-                    Some(rgba)
+                    Some(std::mem::take(&mut *scratch))
                 }
             }
-        };
+        }
+    };
 
         // Unlock the pixel buffer
         CVPixelBufferUnlockBaseAddress(imageBuffer, 0);
 
-        if let Some(data) = frame_data {
-            let frame_num = { *ctx.frame_number.lock().unwrap() };
-            let pts = if frame_num == 0 {
-                0
-            } else {
-                frame_num * 1_000_000 / ctx.fps as u64
-            };
-            let duration = if ctx.fps > 0.0 {
-                1_000_000 / ctx.fps as u64
-            } else {
-                33_333
-            };
-
-            let frame = VideoFrame {
-                width: ctx.output_width.max(width),
-                height: ctx.output_height.max(height),
-                data,
-                pts,
-                duration,
-                texture_id: None,
-                metal_texture: None,
-                color_space: ColorSpace::Rec709,
-            };
-
-            let mut frames = ctx.frames.lock().unwrap();
-            frames.push_back(frame);
-        }
+        frame_data.map(|data| VideoFrame {
+            width: ctx.output_width.max(width),
+            height: ctx.output_height.max(height),
+            data,
+            pts,
+            duration,
+            texture_id: None,
+            metal_texture: None,
+            color_space: ctx.color_space,
+        })
     }
 }
 
@@ -1939,7 +2177,7 @@ unsafe extern "C" fn decompression_output_callback(
 
 /// Create a CFDictionary to request BGRA pixel buffers from VideoToolbox.
 #[cfg(target_os = "macos")]
-fn create_bgra_pixel_buffer_attributes() -> AppResult<vt_ffi::CFDictionaryRef> {
+pub(crate) fn create_bgra_pixel_buffer_attributes() -> AppResult<vt_ffi::CFDictionaryRef> {
     use self::vt_ffi::*;
     use std::ffi::CString;
     use std::ptr;
@@ -1970,8 +2208,8 @@ fn create_bgra_pixel_buffer_attributes() -> AppResult<vt_ffi::CFDictionaryRef> {
             return Ok(ptr::null());
         }
 
-        let keys: [*const c_void; 1] = [key_str as *const c_void];
-        let values: [*const c_void; 1] = [val_num as *const c_void];
+        let keys: [*const c_void; 1] = [key_str];
+        let values: [*const c_void; 1] = [val_num];
 
         let dict = CFDictionaryCreate(
             ptr::null_mut(),
@@ -1992,7 +2230,7 @@ fn create_bgra_pixel_buffer_attributes() -> AppResult<vt_ffi::CFDictionaryRef> {
 
 /// Create a CFDictionary to request hardware-accelerated decoding.
 #[cfg(target_os = "macos")]
-fn create_hardware_decoder_specification() -> AppResult<vt_ffi::CFDictionaryRef> {
+pub(crate) fn create_hardware_decoder_specification() -> AppResult<vt_ffi::CFDictionaryRef> {
     use self::vt_ffi::*;
     use std::ffi::CString;
     use std::ptr;
@@ -2013,20 +2251,22 @@ fn create_hardware_decoder_specification() -> AppResult<vt_ffi::CFDictionaryRef>
             return Ok(ptr::null());
         }
 
-        // Value: kCFBooleanTrue — we use a CFNumber(1) as a simple boolean
-        let val: u8 = 1;
+        // Value: kCFBooleanTrue — we use a CFNumber(1) as a simple boolean.
+        // CFNumberCreate with kCFNumberSInt32Type reads a 4-byte value, so
+        // the backing variable must be an i32.
+        let val: i32 = 1;
         let val_num = CFNumberCreate(
             ptr::null_mut(),
             kCFNumberSInt32Type,
-            &val as *const u8 as *const c_void,
+            &val as *const i32 as *const c_void,
         );
         if val_num.is_null() {
             CFRelease(key_str as CFTypeRef);
             return Ok(ptr::null());
         }
 
-        let keys: [*const c_void; 1] = [key_str as *const c_void];
-        let values: [*const c_void; 1] = [val_num as *const c_void];
+        let keys: [*const c_void; 1] = [key_str];
+        let values: [*const c_void; 1] = [val_num];
 
         let dict = CFDictionaryCreate(
             ptr::null_mut(),
@@ -2089,9 +2329,16 @@ pub fn parse_h264_annex_b(data: &[u8]) -> Vec<Vec<u8>> {
     nalus
 }
 
+/// Maximum sane video dimension (in pixels per side) parsed from an SPS.
+/// Real-world SPS values are far below this; the clamp keeps crafted SPS
+/// data from producing absurd dimensions that later get multiplied for
+/// allocations.
+const MAX_SPS_DIMENSION: u64 = 16_384;
+
 /// Parse H.264 SPS (Sequence Parameter Set) to extract width and height.
 ///
-/// Returns `(width, height)` in pixels, or `(0, 0)` if parsing fails.
+/// Returns `(width, height)` in pixels, or `(0, 0)` if parsing fails or the
+/// values are invalid (overflow, crop larger than the frame, out of range).
 pub fn parse_h264_sps(sps: &[u8]) -> (u32, u32) {
     if sps.len() < 5 {
         return (0, 0);
@@ -2158,18 +2405,24 @@ pub fn parse_h264_sps(sps: &[u8]) -> (u32, u32) {
     let frame_mbs_only_flag = read_bits(sps, bit_offset, 1);
     bit_offset += 1;
 
-    let mut height_in_mbs = pic_height_in_map_units_minus1 + 1;
+    let mut height_in_mbs = pic_height_in_map_units_minus1 as u64 + 1;
     if frame_mbs_only_flag == 0 {
         let _mb_adaptive_frame_field_flag = read_bits(sps, bit_offset, 1);
         bit_offset += 1;
-        height_in_mbs *= 2;
+        height_in_mbs = height_in_mbs.saturating_mul(2);
     }
 
     let _direct_8x8_inference_flag = read_bits(sps, bit_offset, 1);
     bit_offset += 1;
 
-    let width = (pic_width_in_mbs_minus1 + 1) * 16;
-    let height = height_in_mbs * 16;
+    // Compute in u64 with saturating/checked arithmetic; a crafted SPS can
+    // carry arbitrarily large Exp-Golomb values.
+    let width = (pic_width_in_mbs_minus1 as u64 + 1).saturating_mul(16);
+    let height = height_in_mbs.saturating_mul(16);
+
+    if width == 0 || height == 0 || width > MAX_SPS_DIMENSION || height > MAX_SPS_DIMENSION {
+        return (0, 0);
+    }
 
     // Frame cropping
     if bit_offset as usize / 8 < sps.len() {
@@ -2177,25 +2430,29 @@ pub fn parse_h264_sps(sps: &[u8]) -> (u32, u32) {
         bit_offset += 1;
 
         if frame_cropping_flag == 1 {
-            let crop_left = read_ue(sps, &mut bit_offset);
-            let crop_right = read_ue(sps, &mut bit_offset);
-            let crop_top = read_ue(sps, &mut bit_offset);
-            let crop_bottom = read_ue(sps, &mut bit_offset);
+            let crop_left = read_ue(sps, &mut bit_offset) as u64;
+            let crop_right = read_ue(sps, &mut bit_offset) as u64;
+            let crop_top = read_ue(sps, &mut bit_offset) as u64;
+            let crop_bottom = read_ue(sps, &mut bit_offset) as u64;
 
             // Chroma subsampling for crop units
-            let crop_unit_x: u32 = 2; // 4:2:0 chroma
-            let crop_unit_y: u32 = 2;
+            let crop_unit_x: u64 = 2; // 4:2:0 chroma
+            let crop_unit_y: u64 = 2;
 
-            let width_cropped = width - (crop_left + crop_right) * crop_unit_x;
-            let height_cropped = height - (crop_top + crop_bottom) * crop_unit_y;
-
-            if width_cropped > 0 && height_cropped > 0 {
-                return (width_cropped, height_cropped);
+            let crop_w = crop_left.saturating_add(crop_right).saturating_mul(crop_unit_x);
+            let crop_h = crop_top.saturating_add(crop_bottom).saturating_mul(crop_unit_y);
+            // Reject crops that exceed the frame size (would underflow).
+            if crop_w < width && crop_h < height {
+                let width_cropped = width - crop_w;
+                let height_cropped = height - crop_h;
+                if width_cropped > 0 && height_cropped > 0 {
+                    return (width_cropped as u32, height_cropped as u32);
+                }
             }
         }
     }
 
-    (width, height)
+    (width as u32, height as u32)
 }
 
 /// Read one unsigned Exp-Golomb coded value from the bitstream.
@@ -2238,10 +2495,10 @@ fn read_se(data: &[u8], bit_offset: &mut u64) -> i32 {
     if ue == 0 {
         return 0;
     }
-    if ue % 2 == 0 {
+    if ue.is_multiple_of(2) {
         -((ue / 2) as i32)
     } else {
-        ((ue + 1) / 2) as i32
+        ((ue + 1).div_ceil(2)) as i32
     }
 }
 
@@ -2275,20 +2532,38 @@ fn read_bits(data: &[u8], bit_offset: u64, count: u32) -> u32 {
 }
 
 /// Convert YUV420p to RGBA (software fallback for non-VideoToolbox paths).
+///
+/// The input must contain `width * height` luma bytes followed by
+/// `width * height / 4` bytes each of U and V (planar 4:2:0). If the buffer
+/// is too short, or the dimensions overflow, an empty vector is returned
+/// instead of panicking.
 pub fn yuv420p_to_rgba(yuv: &[u8], width: u32, height: u32) -> Vec<u8> {
-    let total_pixels = (width * height) as usize;
-    let mut rgba = vec![0u8; total_pixels * 4];
+    let w = width as usize;
+    let h = height as usize;
+    let Some(total_pixels) = w.checked_mul(h) else {
+        return Vec::new();
+    };
+    let Some(rgba_len) = total_pixels.checked_mul(4) else {
+        return Vec::new();
+    };
+    let Some(u_start) = total_pixels.checked_add(total_pixels / 4) else {
+        return Vec::new();
+    };
+    if u_start > yuv.len() {
+        // Not enough luma + chroma data for this size.
+        return Vec::new();
+    }
+    let u_plane = &yuv[total_pixels..u_start];
+    let v_plane = &yuv[u_start..];
 
-    let y_plane = yuv;
-    let u_plane = &yuv[total_pixels..total_pixels + total_pixels / 4];
-    let v_plane = &u_plane[total_pixels / 4..];
+    let mut rgba = vec![0u8; rgba_len];
 
-    for y in 0..height as usize {
-        for x in 0..width as usize {
-            let y_idx = y * width as usize + x;
-            let uv_idx = (y / 2) * (width as usize / 2) + (x / 2);
+    for y in 0..h {
+        for x in 0..w {
+            let y_idx = y * w + x;
+            let uv_idx = (y / 2) * (w / 2) + (x / 2);
 
-            let y_val = y_plane.get(y_idx).copied().unwrap_or(128) as f32;
+            let y_val = yuv.get(y_idx).copied().unwrap_or(128) as f32;
             let u_val = u_plane.get(uv_idx).copied().unwrap_or(128) as f32 - 128.0;
             let v_val = v_plane.get(uv_idx).copied().unwrap_or(128) as f32 - 128.0;
 
@@ -2342,10 +2617,9 @@ fn detect_codec_from_extension(path: &str) -> VideoCodec {
         VideoCodec::H265
     } else if lower.ends_with(".vp9") || lower.ends_with(".webm") {
         VideoCodec::VP9
-    } else if lower.ends_with(".wmv") {
-        VideoCodec::H264 // default to H264 for WMV containers
     } else {
-        VideoCodec::H264 // default
+        // Default to H264 for WMV containers and unknown extensions.
+        VideoCodec::H264
     }
 }
 
@@ -2417,7 +2691,8 @@ impl MfSourceReader {
     ///
     /// Parses the URL to determine the media type, detects the codec
     /// from the file extension, and prepares the decoder.
-    /// For HTTP URLs, the data will be fetched on first `feed_data` call.
+    /// For HTTP URLs, the data is fetched (bounded to
+    /// `HTTP_FETCH_LIMIT_BYTES`) during initialization.
     pub fn initialize(&mut self, url: &str) -> AppResult<()> {
         self.url_type = detect_url_type(url);
         let codec = detect_codec_from_extension(url);
@@ -2430,20 +2705,6 @@ impl MfSourceReader {
                     Ok(data) => {
                         self.stream_buffer = data;
                         self.source_loaded = true;
-                        // Try to parse H.264 SPS for dimensions
-                        if codec == VideoCodec::H264 {
-                            let nalus = parse_h264_annex_b(&self.stream_buffer);
-                            for nalu in &nalus {
-                                if !nalu.is_empty() && (nalu[0] & 0x1F) == 7 {
-                                    let (w, h) = parse_h264_sps(nalu);
-                                    if w > 0 && h > 0 {
-                                        self.width = self.width.max(w);
-                                        self.height = self.height.max(h);
-                                    }
-                                    break;
-                                }
-                            }
-                        }
                     }
                     Err(e) => {
                         eprintln!(
@@ -2453,33 +2714,13 @@ impl MfSourceReader {
                 }
             }
             SourceUrlType::Http(url_str) => {
-                // For HTTP URLs, we fetch the data using reqwest blocking
+                // For HTTP URLs, fetch with a bounded buffer so a malicious
+                // or oversized remote file cannot exhaust memory.
                 eprintln!("[MfSourceReader] Fetching streaming data from {url_str}");
-                match reqwest::blocking::get(url_str) {
-                    Ok(response) => {
-                        match response.bytes() {
-                            Ok(bytes) => {
-                                self.stream_buffer = bytes.to_vec();
-                                self.source_loaded = true;
-                                // Try to parse H.264 SPS for dimensions
-                                if codec == VideoCodec::H264 {
-                                    let nalus = parse_h264_annex_b(&self.stream_buffer);
-                                    for nalu in &nalus {
-                                        if !nalu.is_empty() && (nalu[0] & 0x1F) == 7 {
-                                            let (w, h) = parse_h264_sps(nalu);
-                                            if w > 0 && h > 0 {
-                                                self.width = self.width.max(w);
-                                                self.height = self.height.max(h);
-                                            }
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                eprintln!("[MfSourceReader] Failed to read HTTP response: {e}");
-                            }
-                        }
+                match fetch_http_bounded(url_str, HTTP_FETCH_LIMIT_BYTES) {
+                    Ok(data) => {
+                        self.stream_buffer = data;
+                        self.source_loaded = true;
                     }
                     Err(e) => {
                         eprintln!("[MfSourceReader] Failed to fetch {url_str}: {e}");
@@ -2487,6 +2728,21 @@ impl MfSourceReader {
                 }
             }
             SourceUrlType::Unknown => {}
+        }
+
+        // Try to parse H.264 SPS for dimensions
+        if codec == VideoCodec::H264 && !self.stream_buffer.is_empty() {
+            let nalus = parse_h264_annex_b(&self.stream_buffer);
+            for nalu in &nalus {
+                if !nalu.is_empty() && (nalu[0] & 0x1F) == 7 {
+                    let (w, h) = parse_h264_sps(nalu);
+                    if w > 0 && h > 0 {
+                        self.width = self.width.max(w);
+                        self.height = self.height.max(h);
+                    }
+                    break;
+                }
+            }
         }
 
         let config = VideoDecoderConfig {
@@ -2498,6 +2754,18 @@ impl MfSourceReader {
         };
 
         self.decoder = Some(VideoDecoder::new(config.clone()));
+
+        // Feed the preloaded stream once here, so `feed_data` never re-feeds
+        // the whole buffered source on top of the caller's chunk (which
+        // would decode every NAL twice and duplicate frames/PTS).
+        if self.source_loaded
+            && !self.stream_buffer.is_empty()
+            && let Some(ref mut decoder) = self.decoder
+            && let Err(e) = decoder.feed_data(&self.stream_buffer)
+        {
+            eprintln!("[MfSourceReader] Warning: failed to pre-feed buffered source: {e}");
+        }
+
         self.initialized = true;
 
         // Set up default stream selection
@@ -2526,17 +2794,13 @@ impl MfSourceReader {
     }
 
     /// Feed encoded H.264/H.265 data to the decoder.
+    ///
+    /// Only the caller's chunk is fed. The buffered source was already fed
+    /// once during `initialize`; re-feeding it here would decode every NAL
+    /// twice and duplicate frames.
     pub fn feed_data(&mut self, data: &[u8]) -> AppResult<()> {
         match &mut self.decoder {
-            Some(decoder) => {
-                decoder.feed_data(data)?;
-                // If we have stream data buffered, feed it too
-                if !self.stream_buffer.is_empty() {
-                    let buf = std::mem::take(&mut self.stream_buffer);
-                    decoder.feed_data(&buf)?;
-                }
-                Ok(())
-            }
+            Some(decoder) => decoder.feed_data(data),
             None => Err(AppError::new(
                 ReasonCode::RcMediaInvalid,
                 "MfSourceReader not initialized",
@@ -2547,7 +2811,9 @@ impl MfSourceReader {
     /// Seek to a specific position in the stream.
     ///
     /// `position_us` is the target position in microseconds.
-    /// Resets the decoder and re-feeds data from the seek point.
+    /// Resets the decoder and re-feeds the buffered source. The buffered
+    /// data is kept intact so repeated seeks remain consistent; a full
+    /// implementation would find the nearest keyframe to the seek point.
     pub fn seek(&mut self, position_us: u64) -> AppResult<()> {
         self.position_us = position_us;
 
@@ -2557,15 +2823,11 @@ impl MfSourceReader {
             decoder.reset();
         }
 
-        // If we have source data loaded, we could re-feed from the seek point
-        // For now, we just reset and mark the position
-        if self.source_loaded && !self.stream_buffer.is_empty() {
-            // Re-feed data from the approximate seek point
-            // In a full implementation, this would find the nearest keyframe
-            let data = std::mem::take(&mut self.stream_buffer);
-            if let Some(ref mut decoder) = self.decoder {
-                decoder.feed_data(&data)?;
-            }
+        if self.source_loaded
+            && !self.stream_buffer.is_empty()
+            && let Some(ref mut decoder) = self.decoder
+        {
+            decoder.feed_data(&self.stream_buffer)?;
         }
 
         Ok(())
@@ -2592,11 +2854,7 @@ impl MfSourceReader {
             return Ok(());
         }
 
-        let codec = if idx == 0 {
-            VideoCodec::H264
-        } else {
-            VideoCodec::H264
-        };
+        let codec = VideoCodec::H264;
 
         self.selected_streams.push(SelectedStream {
             index: idx,
@@ -2777,9 +3035,9 @@ mod tests {
             fps: 30.0,
             bitrate: 1_000_000,
         };
-        let _decoder = VideoDecoder::new(config);
+        let mut decoder = VideoDecoder::new(config);
 
-        let _packet = vec![0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84, 0x00, 0xAD, 0xB7];
+        let packet = vec![0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84, 0x00, 0xAD, 0xB7];
 
         #[cfg(feature = "ffmpeg")]
         {
@@ -2792,6 +3050,13 @@ mod tests {
         {
             let result = decoder.decode_packet(&packet, 0);
             assert!(result.is_err(), "expected Err, got {result:?}");
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            // On macOS, decoding arbitrary data must not panic; it may
+            // succeed (no SPS/PPS yet) or return an error.
+            let _ = decoder.decode_packet(&packet, 0);
         }
     }
 
@@ -2889,10 +3154,7 @@ mod tests {
         let frame = VideoFrame {
             width: 4,
             height: 4,
-            data: std::iter::repeat([255u8, 0, 0, 255])
-                .take(16)
-                .flatten()
-                .collect(), // Red RGBA pixels
+            data: std::iter::repeat_n([255u8, 0, 0, 255], 16).flatten().collect(), // Red RGBA pixels
             pts: 0,
             duration: 33_333,
             texture_id: None,
@@ -2986,7 +3248,7 @@ mod tests {
 
         // Feed multiple packets with different PTS
         for pts_step in 0..3 {
-            let _pts = pts_step * 33_333;
+            let pts = pts_step * 33_333;
             let idr = vec![0x00, 0x00, 0x00, 0x01, 0x65, 0x88, pts_step as u8];
             #[cfg(feature = "ffmpeg")]
             {
@@ -2994,6 +3256,7 @@ mod tests {
             }
             #[cfg(not(feature = "ffmpeg"))]
             {
+                let _ = pts;
                 let _ = decoder.feed_data(&idr);
             }
         }
@@ -3091,10 +3354,12 @@ mod tests {
             let _ = decoder.feed_data(&idr);
         }
 
-        let _frames = decoder.flush();
+        let frames = decoder.flush();
         // Without ffmpeg feature and not on macOS, flush returns 0 frames
         #[cfg(not(any(target_os = "macos", feature = "ffmpeg")))]
         assert_eq!(frames.len(), 0);
+        #[cfg(any(target_os = "macos", feature = "ffmpeg"))]
+        let _ = frames;
     }
 
     #[test]
@@ -3127,9 +3392,8 @@ mod tests {
 
         let result = decoder.decode_packet(&[], 0);
         // Empty input should either return Ok(0) or an error, but never panic
-        match result {
-            Ok(count) => assert_eq!(count, 0, "empty input should decode 0 frames"),
-            Err(_) => {} // Error is also acceptable for empty input
+        if let Ok(count) = result {
+            assert_eq!(count, 0, "empty input should decode 0 frames");
         }
     }
 
@@ -3238,11 +3502,8 @@ mod tests {
     fn test_parse_h264_sps_truncated() {
         // SPS with only 2 bytes (too short for real parsing)
         let (w, h) = parse_h264_sps(&[0x67, 0x64]);
-        // Should return (0, 0) or some default without panicking
-        assert!(
-            w == 0 || w > 0,
-            "truncated SPS should not panic, got {w}x{h}"
-        );
+        // Should return (0, 0) without panicking
+        assert_eq!((w, h), (0, 0), "truncated SPS should yield no dimensions");
     }
 
     #[test]

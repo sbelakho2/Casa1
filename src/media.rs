@@ -578,9 +578,14 @@ impl MediaEvent {
 
     /// Create a new media event with an error message.
     pub fn with_error(message: impl Into<String>) -> Self {
+        Self::with_error_status(-1, message)
+    }
+
+    /// Create a new media event with an explicit error status (HRESULT).
+    pub fn with_error_status(status: i32, message: impl Into<String>) -> Self {
         Self {
             event_type: MediaEventType::Error,
-            status: -1,
+            status,
             data: Some(message.into()),
             pts: None,
         }
@@ -606,8 +611,16 @@ pub struct ImfMediaBuffer {
 }
 
 impl ImfMediaBuffer {
+    /// Maximum allocation size for `new`; larger capacities are clamped so
+    /// a caller-controlled size cannot trigger a multi-GiB allocation.
+    pub const MAX_CAPACITY: u32 = 512 * 1024 * 1024;
+
     /// Create a new media buffer with the given capacity.
+    ///
+    /// The capacity is clamped to [`Self::MAX_CAPACITY`] to bound memory
+    /// use from untrusted sizes.
     pub fn new(capacity: u32) -> Self {
+        let capacity = capacity.min(Self::MAX_CAPACITY);
         Self {
             data: vec![0u8; capacity as usize],
             max_length: capacity,
@@ -770,6 +783,9 @@ impl MfEventQueue {
 
     /// Queue a new event.
     pub fn queue_event(&mut self, event: MediaEvent) {
+        if self.max_events == 0 {
+            return; // zero-capacity queue holds nothing
+        }
         if self.events.len() >= self.max_events {
             self.events.pop_front();
         }
@@ -804,6 +820,12 @@ impl MfEventQueue {
     /// Clear all pending events.
     pub fn clear(&mut self) {
         self.events.clear();
+    }
+}
+
+impl Default for MfEventQueue {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -870,53 +892,98 @@ pub trait MftTransform: Send {
 #[cfg(target_os = "macos")]
 mod vt_decoder_mft {
     use super::*;
+    use crate::video_decoder::vt_ffi;
     use std::ffi::c_void;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
-    // ---- FFI types (opaque pointers) ----
-    type CMVideoFormatDescriptionRef = *mut c_void;
-    type CMBlockBufferRef = *mut c_void;
-    type CMSampleBufferRef = *mut c_void;
-    type CVPixelBufferRef = *mut c_void;
-    type VTDecompressionSessionRef = *mut c_void;
-    type CFAllocatorRef = *const c_void;
-    type CFDictionaryRef = *const c_void;
-    type CFStringRef = *const c_void;
+    // ---- FFI type aliases (canonical declarations live in vt_ffi) ----
+    type CMVideoFormatDescriptionRef = vt_ffi::CMVideoFormatDescriptionRef;
+    type CMBlockBufferRef = vt_ffi::CMBlockBufferRef;
+    type CMSampleBufferRef = vt_ffi::CMSampleBufferRef;
+    type CVPixelBufferRef = vt_ffi::CVPixelBufferRef;
+    type VTDecompressionSessionRef = vt_ffi::VTDecompressionSessionRef;
+    type CFDictionaryRef = vt_ffi::CFDictionaryRef;
 
-    // ---- Constants ----
-    const kCMVideoCodecType_H264: u32 = 0x31637661; // 'avc1'
-    const kCVPixelFormatType_32BGRA: u32 = 0x42475241; // 'BGRA'
-    const kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange: u32 = 0x34323076; // '420v'
-    const kVTDecodeInfo_Asynchronous: u32 = 1 << 0;
-    const kVTDecodeInfo_FrameDropped: u32 = 1 << 1;
-
-    // ---- CMTime ----
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct CMTime {
-        value: i64,
-        timescale: i32,
-        flags: u32,
-        epoch: i64,
+    /// Lock a `Mutex`, recovering from poisoning instead of panicking.
+    fn lock_guard<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+        mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    impl CMTime {
-        fn make(value: i64, timescale: i32) -> Self {
-            Self {
-                value,
-                timescale,
-                flags: 0,
-                epoch: 0,
-            }
+    /// Split H.264 AVCC (avcC) extradata into its parameter sets.
+    ///
+    /// Returns `(parameter_sets, nal_length_size)`. Every length/offset in
+    /// the blob is untrusted and validated before use.
+    fn parse_avcc_parameter_sets(data: &[u8]) -> AppResult<(Vec<Vec<u8>>, u32)> {
+        if data.len() < 7 || data[0] != 1 {
+            return Err(AppError::new(
+                ReasonCode::RcMediaInvalid,
+                "H.264 avcC extradata is invalid",
+            ));
         }
+        let nal_length_size = (data[4] & 0x03) as u32 + 1;
+        let mut pos = 5usize;
+        let num_sps = (data[pos] & 0x1F) as usize;
+        pos += 1;
+        let mut sets = Vec::new();
+        for _ in 0..num_sps {
+            if pos + 2 > data.len() {
+                return Err(AppError::new(
+                    ReasonCode::RcMediaInvalid,
+                    "Truncated SPS length in avcC extradata",
+                ));
+            }
+            let len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+            pos += 2;
+            if pos + len > data.len() {
+                return Err(AppError::new(
+                    ReasonCode::RcMediaInvalid,
+                    "SPS overruns avcC extradata",
+                ));
+            }
+            sets.push(data[pos..pos + len].to_vec());
+            pos += len;
+        }
+        if pos >= data.len() {
+            return Err(AppError::new(
+                ReasonCode::RcMediaInvalid,
+                "avcC extradata missing PPS count",
+            ));
+        }
+        let num_pps = data[pos] as usize;
+        pos += 1;
+        for _ in 0..num_pps {
+            if pos + 2 > data.len() {
+                return Err(AppError::new(
+                    ReasonCode::RcMediaInvalid,
+                    "Truncated PPS length in avcC extradata",
+                ));
+            }
+            let len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+            pos += 2;
+            if pos + len > data.len() {
+                return Err(AppError::new(
+                    ReasonCode::RcMediaInvalid,
+                    "PPS overruns avcC extradata",
+                ));
+            }
+            sets.push(data[pos..pos + len].to_vec());
+            pos += len;
+        }
+        Ok((sets, nal_length_size))
     }
 
     // ---- Decoded frame queue ----
+    /// A decoded frame. The pixel buffer is +1 retained when the frame is
+    /// enqueued and must be released exactly once by whoever pops it.
     struct DecodedFrame {
         pixel_buffer: CVPixelBufferRef,
         pts: i64,
         duration: i64,
     }
+
+    // Safety: the pixel buffer is retained for the lifetime of the struct
+    // and released on pop/drop; all access is serialized by the mutex.
+    unsafe impl Send for DecodedFrame {}
 
     /// H.264 decoder using macOS VideoToolbox, implementing MftTransform.
     ///
@@ -926,42 +993,45 @@ mod vt_decoder_mft {
     pub struct H264DecoderMft {
         session: Option<VTDecompressionSessionRef>,
         format_desc: Option<CMVideoFormatDescriptionRef>,
-        input_type_set: bool,
-        output_type_set: bool,
-        decoded_frames: VecDeque<DecodedFrame>,
+        /// Per-instance decoded frame queue, shared with the C callback via
+        /// the decompression output refcon.
+        frame_queue: Arc<Mutex<VecDeque<DecodedFrame>>>,
         width: u32,
         height: u32,
-        last_pts: i64,
         callback_refcon: *mut c_void,
     }
 
-    // Safety: DecodedFrame only holds raw pixel buffers passed between C callbacks.
-    // The mutex ensures single-threaded access, and the buffers are always valid
-    // while referenced.
-    unsafe impl Send for DecodedFrame {}
-
-    // Global decoded frame queue (used by C callback)
-    static DECODED_FRAMES: std::sync::LazyLock<Mutex<VecDeque<DecodedFrame>>> =
-        std::sync::LazyLock::new(|| Mutex::new(VecDeque::new()));
-
     unsafe extern "C" fn decompression_output_callback(
-        _output_refcon: *mut c_void,
+        output_refcon: *mut c_void,
         _source_frame_refcon: *mut c_void,
         status: i32,
         _info_flags: u32,
         image_buffer: CVPixelBufferRef,
-        pts: crate::video_decoder::vt_ffi::CMTime,
-        duration: crate::video_decoder::vt_ffi::CMTime,
+        pts: vt_ffi::CMTime,
+        duration: vt_ffi::CMTime,
     ) {
-        if status != 0 || image_buffer.is_null() {
+        if status != 0 || image_buffer.is_null() || output_refcon.is_null() {
             return;
         }
-        if let Ok(mut frames) = DECODED_FRAMES.lock() {
+        let queue_ptr = output_refcon as *const Mutex<VecDeque<DecodedFrame>>;
+        unsafe {
+            // Take a strong reference for the duration of this callback so
+            // the queue allocation cannot be freed while we use it.
+            Arc::increment_strong_count(queue_ptr);
+            let queue = Arc::from_raw(queue_ptr);
+
+            // The pixel buffer is only valid during this callback; retain it
+            // so it survives until the frame is consumed (and is released by
+            // process_output / flush / Drop).
+            vt_ffi::CVPixelBufferRetain(image_buffer);
+            let mut frames = lock_guard(&queue);
             frames.push_back(DecodedFrame {
                 pixel_buffer: image_buffer,
                 pts: pts.value,
                 duration: duration.value,
             });
+            drop(frames);
+            drop(queue);
         }
     }
 
@@ -971,13 +1041,42 @@ mod vt_decoder_mft {
             Self {
                 session: None,
                 format_desc: None,
-                input_type_set: false,
-                output_type_set: false,
-                decoded_frames: VecDeque::new(),
+                frame_queue: Arc::new(Mutex::new(VecDeque::new())),
                 width: 0,
                 height: 0,
-                last_pts: 0,
                 callback_refcon: std::ptr::null_mut(),
+            }
+        }
+
+        /// Hand the frame queue to the C callback as the output refcon.
+        ///
+        /// This transfers one strong reference into the refcon; it is
+        /// reclaimed in `reclaim_refcon` during teardown.
+        fn ensure_refcon(&mut self) {
+            if self.callback_refcon.is_null() {
+                self.callback_refcon = Arc::into_raw(self.frame_queue.clone()) as *mut c_void;
+            }
+        }
+
+        /// Reclaim the refcon's strong reference. Safe once the session has
+        /// been invalidated (no new callbacks can start); any in-flight
+        /// callback holds its own strong reference.
+        fn reclaim_refcon(&mut self) {
+            if !self.callback_refcon.is_null() {
+                unsafe {
+                    let _ = Arc::from_raw(
+                        self.callback_refcon as *const Mutex<VecDeque<DecodedFrame>>,
+                    );
+                }
+                self.callback_refcon = std::ptr::null_mut();
+            }
+        }
+
+        /// Release all queued pixel buffers (dropping the frames).
+        fn clear_frame_queue(&mut self) {
+            let mut frames = lock_guard(&self.frame_queue);
+            while let Some(frame) = frames.pop_front() {
+                unsafe { vt_ffi::CVPixelBufferRelease(frame.pixel_buffer) };
             }
         }
 
@@ -994,25 +1093,22 @@ mod vt_decoder_mft {
             })?;
 
             unsafe {
-                // Pixel format types we want to receive
-                let _pixel_format_keys: [CFStringRef; 1] =
-                    [b"PixelFormatType\0".as_ptr() as CFStringRef];
-                let _bg_value: u32 = kCVPixelFormatType_32BGRA.to_be();
-                let _bg_values: [*mut c_void; 1] = [&_bg_value as *const u32 as *mut c_void];
-
-                let dest_dict: CFDictionaryRef = std::ptr::null(); // Use default pixel buffer attributes
+                // Request BGRA output buffers so the CPU-side copy in
+                // `process_output` matches the actual buffer layout.
+                let dest_dict = crate::video_decoder::create_bgra_pixel_buffer_attributes()?;
 
                 // Callback record
-                let callback = crate::video_decoder::vt_ffi::VTDecompressionOutputCallbackRecord {
+                self.ensure_refcon();
+                let callback = vt_ffi::VTDecompressionOutputCallbackRecord {
                     decompressionOutputCallback: Some(decompression_output_callback),
                     decompressionOutputRefCon: self.callback_refcon,
                 };
 
-                // Decoder specification: require hardware acceleration
+                // Decoder specification: default (hardware when available)
                 let decoder_spec: CFDictionaryRef = std::ptr::null();
 
                 let mut session_out: VTDecompressionSessionRef = std::ptr::null_mut();
-                let status = VTDecompressionSessionCreate(
+                let status = vt_ffi::VTDecompressionSessionCreate(
                     std::ptr::null_mut(),
                     fmt_desc,
                     decoder_spec,
@@ -1021,7 +1117,12 @@ mod vt_decoder_mft {
                     &mut session_out,
                 );
 
+                if !dest_dict.is_null() {
+                    vt_ffi::CFRelease(dest_dict as vt_ffi::CFTypeRef);
+                }
+
                 if status != 0 || session_out.is_null() {
+                    self.reclaim_refcon();
                     return Err(AppError::new(
                         ReasonCode::RcMediaInvalid,
                         format!("VTDecompressionSessionCreate failed with status {status}"),
@@ -1030,15 +1131,6 @@ mod vt_decoder_mft {
                 self.session = Some(session_out);
             }
             Ok(())
-        }
-
-        /// Transfer frames from global callback queue to local queue.
-        fn drain_global_queue(&mut self) {
-            if let Ok(mut frames) = DECODED_FRAMES.lock() {
-                while let Some(frame) = frames.pop_front() {
-                    self.decoded_frames.push_back(frame);
-                }
-            }
         }
     }
 
@@ -1062,6 +1154,12 @@ mod vt_decoder_mft {
             self.width = width;
             self.height = height;
 
+            // set_input_type may be called more than once: release any
+            // previous format description before replacing it.
+            if let Some(desc) = self.format_desc.take() {
+                unsafe { vt_ffi::CFRelease(desc as vt_ffi::CFTypeRef) };
+            }
+
             // Try to get codec private data (AVCC extradata / SPS/PPS)
             let codec_data = media_type
                 .get_blob(&MF_MT_MPEG_SEQUENCE_HEADER)
@@ -1071,18 +1169,39 @@ mod vt_decoder_mft {
                 // Create CMVideoFormatDescription from H.264 parameter sets
                 let mut desc_out: CMVideoFormatDescriptionRef = std::ptr::null_mut();
                 let status = if let Some(data) = codec_data {
-                    // Try with avcC/annexb data
-                    CMVideoFormatDescriptionCreateFromH264ParameterSets(
-                        std::ptr::null_mut(),
-                        data.as_ptr() as *mut c_void,
-                        data.len() as usize,
-                        &mut desc_out,
-                    )
+                    match parse_avcc_parameter_sets(data) {
+                        Ok((sets, nal_length_size)) if sets.len() >= 2 => {
+                            // AVCC extradata: pass the individual SPS/PPS
+                            // with the real 6-argument signature.
+                            let pointers: Vec<*const u8> =
+                                sets.iter().map(|s| s.as_ptr()).collect();
+                            let sizes: Vec<usize> = sets.iter().map(|s| s.len()).collect();
+                            vt_ffi::CMVideoFormatDescriptionCreateFromH264ParameterSets(
+                                std::ptr::null_mut(),
+                                sets.len(),
+                                sizes.as_ptr(),
+                                pointers.as_ptr(),
+                                nal_length_size as i32,
+                                &mut desc_out,
+                            )
+                        }
+                        _ => {
+                            // Not parseable as avcC — fall back to a
+                            // dimensions-only description.
+                            vt_ffi::CMVideoFormatDescriptionCreate(
+                                std::ptr::null_mut(),
+                                vt_ffi::kCMVideoCodecType_H264,
+                                width as i32,
+                                height as i32,
+                                &mut desc_out,
+                            )
+                        }
+                    }
                 } else {
                     // Create with just dimensions (some files work)
-                    CMVideoFormatDescriptionCreate(
+                    vt_ffi::CMVideoFormatDescriptionCreate(
                         std::ptr::null_mut(),
-                        kCMVideoCodecType_H264,
+                        vt_ffi::kCMVideoCodecType_H264,
                         width as i32,
                         height as i32,
                         &mut desc_out,
@@ -1098,7 +1217,6 @@ mod vt_decoder_mft {
                 self.format_desc = Some(desc_out);
             }
 
-            self.input_type_set = true;
             Ok(())
         }
 
@@ -1107,7 +1225,6 @@ mod vt_decoder_mft {
             _stream_id: u32,
             _media_type: &ImfMediaType,
         ) -> AppResult<()> {
-            self.output_type_set = true;
             Ok(())
         }
 
@@ -1146,17 +1263,29 @@ mod vt_decoder_mft {
             _flags: u32,
         ) -> AppResult<()> {
             self.create_session()?;
-            self.last_pts = sample.sample_time;
 
             let data = &sample.buffer;
             if data.is_empty() {
                 return Ok(()); // Flush
             }
 
+            let session = self.session.ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcMediaInvalid,
+                    "H.264 decoder session not initialized",
+                )
+            })?;
+            let format_desc = self.format_desc.ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcMediaInvalid,
+                    "H.264 decoder format description not initialized",
+                )
+            })?;
+
             unsafe {
                 // Create CMBlockBuffer from our data
                 let mut block_buffer: CMBlockBufferRef = std::ptr::null_mut();
-                let status = CMBlockBufferCreateWithMemoryBlock(
+                let status = vt_ffi::CMBlockBufferCreateWithMemoryBlock(
                     std::ptr::null_mut(),
                     data.as_ptr() as *mut c_void,
                     data.len(),
@@ -1175,22 +1304,21 @@ mod vt_decoder_mft {
                     ));
                 }
 
-                let pts_time = CMTime::make(sample.sample_time, 10_000_000); // 100ns units -> 10MHz
-                let _duration_time = CMTime::make(sample.sample_duration, 10_000_000);
+                let pts_time = vt_ffi::CMTime::make(sample.sample_time, 10_000_000); // 100ns units -> 10MHz
 
                 let mut sample_buffer: CMSampleBufferRef = std::ptr::null_mut();
-                let status2 = CMSampleBufferCreate(
+                let status2 = vt_ffi::CMSampleBufferCreate(
                     std::ptr::null_mut(),
                     block_buffer,
                     1, // dataReady
                     std::ptr::null(),
                     std::ptr::null_mut(),
-                    self.format_desc.unwrap_or(std::ptr::null_mut()),
+                    format_desc,
                     1, // numSamples
                     1, // numSampleTimingEntries
                     &pts_time,
                     1, // numSampleSizeEntries
-                    &(data.len() as usize),
+                    &data.len(),
                     &mut sample_buffer,
                 );
 
@@ -1201,12 +1329,14 @@ mod vt_decoder_mft {
                     ));
                 }
 
-                // Decode frame
-                let decode_flags: u32 = 1; // kVTDecodeFrame_EnableAsynchronousDecompression
-                let decode_status = VTDecompressionSessionDecodeFrame(
-                    self.session.unwrap(),
+                // Decode the frame synchronously (no async flag): the output
+                // callback runs before this call returns, so the decoded
+                // frames are already in our queue afterwards and there is
+                // nothing to wait for.
+                let decode_status = vt_ffi::VTDecompressionSessionDecodeFrame(
+                    session,
                     sample_buffer,
-                    decode_flags,
+                    0,                // synchronous
                     std::ptr::null_mut(), // sourceFrameRefCon
                     std::ptr::null_mut(), // infoFlagsOut (null = don't care)
                 );
@@ -1217,13 +1347,8 @@ mod vt_decoder_mft {
                         format!("VTDecompressionSessionDecodeFrame failed {decode_status}"),
                     ));
                 }
-
-                // Wait for async completion
-                let _wait_status =
-                    VTDecompressionSessionWaitForAsynchronousFrames(self.session.unwrap());
             }
 
-            self.drain_global_queue();
             Ok(())
         }
 
@@ -1233,149 +1358,195 @@ mod vt_decoder_mft {
             sample: &mut ImfSample,
             flags: &mut u32,
         ) -> AppResult<()> {
-            self.drain_global_queue();
+            let frame = lock_guard(&self.frame_queue).pop_front();
 
-            if let Some(frame) = self.decoded_frames.pop_front() {
-                unsafe {
-                    // Lock pixel buffer to get data
-                    let lock_status = CVPixelBufferLockBaseAddress(frame.pixel_buffer, 0);
-                    if lock_status != 0 {
-                        return Err(AppError::new(
-                            ReasonCode::RcMediaInvalid,
-                            format!("CVPixelBufferLockBaseAddress failed {lock_status}"),
-                        ));
-                    }
+            let Some(frame) = frame else {
+                *flags = MFT_OUTPUT_DATA_BUFFER_NO_SAMPLE;
+                return Ok(());
+            };
 
-                    let base_addr = CVPixelBufferGetBaseAddress(frame.pixel_buffer);
-                    let data_size = CVPixelBufferGetDataSize(frame.pixel_buffer);
-                    let width = CVPixelBufferGetWidth(frame.pixel_buffer);
-                    let height = CVPixelBufferGetHeight(frame.pixel_buffer);
-                    let bytes_per_row = CVPixelBufferGetBytesPerRow(frame.pixel_buffer);
+            unsafe {
+                // Lock pixel buffer to get data
+                let lock_status = vt_ffi::CVPixelBufferLockBaseAddress(frame.pixel_buffer, 0);
+                if lock_status != 0 {
+                    vt_ffi::CVPixelBufferRelease(frame.pixel_buffer);
+                    *flags = MFT_OUTPUT_DATA_BUFFER_NO_SAMPLE;
+                    return Ok(());
+                }
 
-                    if base_addr.is_null() || data_size == 0 {
-                        CVPixelBufferUnlockBaseAddress(frame.pixel_buffer, 0);
-                        *flags = MFT_OUTPUT_DATA_BUFFER_NO_SAMPLE;
-                        return Ok(());
-                    }
+                let base_addr = vt_ffi::CVPixelBufferGetBaseAddress(frame.pixel_buffer);
+                let data_size = vt_ffi::CVPixelBufferGetDataSize(frame.pixel_buffer);
+                let width = vt_ffi::CVPixelBufferGetWidth(frame.pixel_buffer);
+                let height = vt_ffi::CVPixelBufferGetHeight(frame.pixel_buffer);
+                let bytes_per_row = vt_ffi::CVPixelBufferGetBytesPerRow(frame.pixel_buffer);
 
-                    // Copy pixel data
-                    let src = std::slice::from_raw_parts(base_addr as *const u8, data_size);
-                    let mut dst = Vec::with_capacity(data_size);
-
-                    // Handle row-by-row (padding may differ)
-                    if bytes_per_row == width * 4 {
-                        dst.extend_from_slice(src);
-                    } else {
-                        for row in 0..height as usize {
-                            let row_start = row * bytes_per_row as usize;
-                            dst.extend_from_slice(&src[row_start..row_start + width as usize * 4]);
+                let mut dst: Vec<u8> = Vec::new();
+                if !base_addr.is_null() && data_size > 0 && width > 0 && height > 0 {
+                    let w = width;
+                    let h = height;
+                    let pixel_format =
+                        vt_ffi::CVPixelBufferGetPixelFormatType(frame.pixel_buffer);
+                    match pixel_format {
+                        vt_ffi::kCVPixelFormatType_32BGRA => {
+                            // Validate the layout before copying so no read
+                            // can go out of bounds, regardless of stride.
+                            let Some(needed) = w.checked_mul(h).and_then(|n| n.checked_mul(4))
+                            else {
+                                unlock_release_and_finish(frame.pixel_buffer, flags);
+                                return Ok(());
+                            };
+                            if needed > 0
+                                && w.checked_mul(4) == Some(bytes_per_row)
+                                && data_size >= needed
+                            {
+                                // Tightly packed: single copy.
+                                let src =
+                                    std::slice::from_raw_parts(base_addr as *const u8, needed);
+                                dst.extend_from_slice(src);
+                            } else if needed > 0 && bytes_per_row >= w * 4 {
+                                // Padded rows: copy row by row, bounded by
+                                // the actual buffer size.
+                                let total = bytes_per_row
+                                    .checked_mul(h)
+                                    .unwrap_or(0)
+                                    .min(data_size);
+                                if total >= needed {
+                                    let src =
+                                        std::slice::from_raw_parts(base_addr as *const u8, total);
+                                    dst.reserve(needed);
+                                    for row in 0..h {
+                                        let row_start = row * bytes_per_row;
+                                        dst.extend_from_slice(&src[row_start..row_start + w * 4]);
+                                    }
+                                }
+                            }
+                        }
+                        vt_ffi::kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange => {
+                            // NV12: convert bi-planar Y/UV to BGRA (bounded
+                            // reads; matches the software path used by the
+                            // VideoDecoder).
+                            let y_bpr =
+                                vt_ffi::CVPixelBufferGetBytesPerRowOfPlane(frame.pixel_buffer, 0);
+                            let uv_bpr =
+                                vt_ffi::CVPixelBufferGetBytesPerRowOfPlane(frame.pixel_buffer, 1);
+                            let y_base =
+                                vt_ffi::CVPixelBufferGetBaseAddressOfPlane(frame.pixel_buffer, 0);
+                            let uv_base =
+                                vt_ffi::CVPixelBufferGetBaseAddressOfPlane(frame.pixel_buffer, 1);
+                            if !y_base.is_null() && !uv_base.is_null() {
+                                let Some(needed) =
+                                    w.checked_mul(h).and_then(|n| n.checked_mul(4))
+                                else {
+                                    unlock_release_and_finish(frame.pixel_buffer, flags);
+                                    return Ok(());
+                                };
+                                let y_slice_len = y_bpr.checked_mul(h).unwrap_or(0);
+                                let uv_slice_len = uv_bpr.checked_mul(h.div_ceil(2)).unwrap_or(0);
+                                if y_slice_len > 0 && uv_slice_len > 0 {
+                                    let y_src = std::slice::from_raw_parts(
+                                        y_base as *const u8,
+                                        y_slice_len,
+                                    );
+                                    let uv_src = std::slice::from_raw_parts(
+                                        uv_base as *const u8,
+                                        uv_slice_len,
+                                    );
+                                    dst.reserve(needed);
+                                    for row in 0..h {
+                                        for col in 0..w {
+                                            let y_idx = row * y_bpr + col;
+                                            let uv_idx = (row / 2) * uv_bpr + (col / 2) * 2;
+                                            let y_val = *y_src.get(y_idx).unwrap_or(&128) as f32;
+                                            let u_val =
+                                                *uv_src.get(uv_idx).unwrap_or(&128) as f32 - 128.0;
+                                            let v_val = *uv_src.get(uv_idx + 1).unwrap_or(&128)
+                                                as f32
+                                                - 128.0;
+                                            // Rec.709 full-range coefficients
+                                            // (matches the default used by
+                                            // VideoDecoder frames).
+                                            let r =
+                                                (y_val + 1.5748 * v_val).clamp(0.0, 255.0) as u8;
+                                            let g = (y_val - 0.1873 * u_val - 0.4681 * v_val)
+                                                .clamp(0.0, 255.0)
+                                                as u8;
+                                            let b =
+                                                (y_val + 1.8556 * u_val).clamp(0.0, 255.0) as u8;
+                                            dst.push(b); // BGRA
+                                            dst.push(g);
+                                            dst.push(r);
+                                            dst.push(255);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        _ => {
+                            // Unknown format — no output for this frame.
                         }
                     }
+                }
 
-                    CVPixelBufferUnlockBaseAddress(frame.pixel_buffer, 0);
+                vt_ffi::CVPixelBufferUnlockBaseAddress(frame.pixel_buffer, 0);
+                vt_ffi::CVPixelBufferRelease(frame.pixel_buffer);
 
+                if dst.is_empty() {
+                    *flags = MFT_OUTPUT_DATA_BUFFER_NO_SAMPLE;
+                } else {
                     sample.buffer = dst;
                     sample.sample_time = frame.pts;
                     sample.sample_duration = frame.duration;
                     *flags = 0;
                 }
-            } else {
-                *flags = MFT_OUTPUT_DATA_BUFFER_NO_SAMPLE;
             }
 
             Ok(())
         }
 
         fn has_output(&self) -> bool {
-            !self.decoded_frames.is_empty()
+            !lock_guard(&self.frame_queue).is_empty()
         }
 
         fn flush(&mut self) -> AppResult<()> {
-            self.decoded_frames.clear();
-            if let Ok(mut frames) = DECODED_FRAMES.lock() {
-                frames.clear();
-            }
+            self.clear_frame_queue();
             Ok(())
         }
     }
 
-    // ---- FFI declarations ----
-    #[link(name = "VideoToolbox", kind = "framework")]
-    #[link(name = "CoreMedia", kind = "framework")]
-    #[link(name = "CoreVideo", kind = "framework")]
-    unsafe extern "C" {
-        fn CMVideoFormatDescriptionCreate(
-            allocator: CFAllocatorRef,
-            codec_type: u32,
-            width: i32,
-            height: i32,
-            desc_out: *mut CMVideoFormatDescriptionRef,
-        ) -> i32;
-
-        fn CMVideoFormatDescriptionCreateFromH264ParameterSets(
-            allocator: CFAllocatorRef,
-            parameter_set_data: *mut c_void,
-            parameter_set_data_len: usize,
-            desc_out: *mut CMVideoFormatDescriptionRef,
-        ) -> i32;
-
-        fn CMBlockBufferCreateWithMemoryBlock(
-            allocator: CFAllocatorRef,
-            memory_block: *mut c_void,
-            block_length: usize,
-            block_allocator: CFAllocatorRef,
-            custom_block_source: *const c_void,
-            offset_to_data: usize,
-            data_length: usize,
-            flags: u32,
-            block_buffer_out: *mut CMBlockBufferRef,
-        ) -> i32;
-
-        fn CMSampleBufferCreate(
-            allocator: CFAllocatorRef,
-            data_buffer: CMBlockBufferRef,
-            data_ready: u8,
-            make_data_ready_callback: *const c_void,
-            make_data_ready_refcon: *mut c_void,
-            format_description: CMVideoFormatDescriptionRef,
-            num_samples: i32,
-            num_sample_timing_entries: i32,
-            sample_timing_array: *const CMTime,
-            num_sample_size_entries: i32,
-            sample_size_array: *const usize,
-            sample_buffer_out: *mut CMSampleBufferRef,
-        ) -> i32;
-
-        fn VTDecompressionSessionCreate(
-            allocator: CFAllocatorRef,
-            video_format_description: CMVideoFormatDescriptionRef,
-            video_decoder_specification: CFDictionaryRef,
-            destination_image_buffer_attributes: CFDictionaryRef,
-            output_callback: *const crate::video_decoder::vt_ffi::VTDecompressionOutputCallbackRecord,
-            decompression_session_out: *mut VTDecompressionSessionRef,
-        ) -> i32;
-
-        fn VTDecompressionSessionDecodeFrame(
-            session: VTDecompressionSessionRef,
-            sample_buffer: CMSampleBufferRef,
-            decode_flags: u32,
-            source_frame_refcon: *mut c_void,
-            info_flags_out: *mut u32,
-        ) -> i32;
-
-        fn VTDecompressionSessionWaitForAsynchronousFrames(
-            session: VTDecompressionSessionRef,
-        ) -> i32;
-
-        fn CVPixelBufferLockBaseAddress(pixel_buffer: CVPixelBufferRef, lock_flags: u32) -> i32;
-        fn CVPixelBufferUnlockBaseAddress(pixel_buffer: CVPixelBufferRef, unlock_flags: u32)
-        -> i32;
-        fn CVPixelBufferGetBaseAddress(pixel_buffer: CVPixelBufferRef) -> *mut c_void;
-        fn CVPixelBufferGetDataSize(pixel_buffer: CVPixelBufferRef) -> usize;
-        fn CVPixelBufferGetWidth(pixel_buffer: CVPixelBufferRef) -> usize;
-        fn CVPixelBufferGetHeight(pixel_buffer: CVPixelBufferRef) -> usize;
-        fn CVPixelBufferGetBytesPerRow(pixel_buffer: CVPixelBufferRef) -> usize;
+    // Helper for the (rare) validation-failure paths in process_output:
+    // unlock + release the pixel buffer and signal no sample.
+    unsafe fn unlock_release_and_finish(pixel_buffer: CVPixelBufferRef, flags: &mut u32) {
+        unsafe {
+            vt_ffi::CVPixelBufferUnlockBaseAddress(pixel_buffer, 0);
+            vt_ffi::CVPixelBufferRelease(pixel_buffer);
+        }
+        *flags = MFT_OUTPUT_DATA_BUFFER_NO_SAMPLE;
     }
+
+    impl Drop for H264DecoderMft {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(session) = self.session.take() {
+                    // Invalidate first so no new callbacks can start, then
+                    // drain and release the session.
+                    vt_ffi::VTDecompressionSessionInvalidate(session);
+                    let _ = vt_ffi::VTDecompressionSessionWaitForAsynchronousFrames(session);
+                    vt_ffi::CFRelease(session as vt_ffi::CFTypeRef);
+                }
+                if let Some(desc) = self.format_desc.take() {
+                    vt_ffi::CFRelease(desc as vt_ffi::CFTypeRef);
+                }
+            }
+        self.reclaim_refcon();
+        self.clear_frame_queue();
+    }
+}
+
+impl Default for H264DecoderMft {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 }
 
 // Non-macOS stub for H264DecoderMft
@@ -1387,6 +1558,12 @@ mod vt_decoder_mft {
     impl H264DecoderMft {
         pub fn new() -> Self {
             Self
+        }
+    }
+
+    impl Default for H264DecoderMft {
+        fn default() -> Self {
+            Self::new()
         }
     }
 
@@ -1449,12 +1626,11 @@ mod aac_decoder_mft {
         m_reserved: u32,
     }
 
-    const kAudioFormatMPEG4AAC: u32 = 0x00001610u32.to_le(); // 'aac '
-    const kAudioFormatLinearPCM: u32 = 0x00000001u32.to_le();
+    // AudioToolbox FourCC format IDs (not Media Foundation / WAVE values).
+    const kAudioFormatMPEG4AAC: u32 = 0x6161_6320; // 'aac '
+    const kAudioFormatLinearPCM: u32 = 0x6C70_636D; // 'lpcm'
     const kAudioFormatFlagIsSignedInteger: u32 = 1 << 0;
     const kAudioFormatFlagIsPacked: u32 = 1 << 1;
-    const kAudioConverterPropertySetInputFormat: u32 = 0x69736674; // 'isf '
-    const kAudioConverterPropertySetOutputFormat: u32 = 0x6f736674; // 'osf '
     const noErr: i32 = 0;
 
     #[link(name = "AudioToolbox", kind = "framework")]
@@ -1466,47 +1642,18 @@ mod aac_decoder_mft {
         ) -> i32;
 
         fn AudioConverterDispose(converter: AudioConverterRef) -> i32;
-
-        fn AudioConverterFillComplexBuffer(
-            converter: AudioConverterRef,
-            input_proc: Option<
-                unsafe extern "C" fn(
-                    *mut std::ffi::c_void,
-                    *mut AudioStreamBasicDescriptionPtr,
-                    *mut u32,
-                    *mut *mut std::ffi::c_void,
-                    *mut u32,
-                ) -> i32,
-            >,
-            input_proc_ref_con: *mut std::ffi::c_void,
-            io_output_data_packet_descriptions: *mut *mut std::ffi::c_void,
-            io_output_packet_descriptions: *mut u32,
-            out_output_data: *mut *mut std::ffi::c_void,
-            io_output_packet_description: *mut std::ffi::c_void,
-        ) -> i32;
-
-        fn AudioConverterGetProperty(
-            converter: AudioConverterRef,
-            property_id: u32,
-            property_data_size: *mut u32,
-            out_property_data: *mut std::ffi::c_void,
-        ) -> i32;
-
-        fn AudioConverterSetProperty(
-            converter: AudioConverterRef,
-            property_id: u32,
-            property_data_size: u32,
-            property_data: *const std::ffi::c_void,
-        ) -> i32;
     }
 
     /// AAC decoder using macOS AudioToolbox, implementing MftTransform.
+    ///
+    /// Note: real AAC decoding (via `AudioConverterFillComplexBuffer`) is
+    /// not implemented yet; the transform validates formats, creates the
+    /// converter, and deliberately produces no output instead of fabricating
+    /// silence.
     pub struct AacDecoderMft {
         converter: Option<AudioConverterRef>,
         input_desc: AudioStreamBasicDescription,
         output_desc: AudioStreamBasicDescription,
-        input_type_set: bool,
-        output_type_set: bool,
         channels: u32,
         sample_rate: f64,
     }
@@ -1518,8 +1665,6 @@ mod aac_decoder_mft {
                 converter: None,
                 input_desc: unsafe { std::mem::zeroed() },
                 output_desc: unsafe { std::mem::zeroed() },
-                input_type_set: false,
-                output_type_set: false,
                 channels: 2,
                 sample_rate: 44100.0,
             }
@@ -1529,6 +1674,22 @@ mod aac_decoder_mft {
     // Safety: AacDecoderMft holds AudioConverterRef raw pointer. All access
     // is through MftTransform's &mut self methods, single-threaded.
     unsafe impl Send for AacDecoderMft {}
+
+    impl Drop for AacDecoderMft {
+        fn drop(&mut self) {
+            if let Some(converter) = self.converter.take() {
+                unsafe {
+                    AudioConverterDispose(converter);
+                }
+            }
+        }
+    }
+
+    impl Default for AacDecoderMft {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
 
     impl MftTransform for AacDecoderMft {
         fn get_stream_count(&self) -> (u32, u32) {
@@ -1566,7 +1727,6 @@ mod aac_decoder_mft {
                 m_reserved: 0,
             };
 
-            self.input_type_set = true;
             Ok(())
         }
 
@@ -1575,7 +1735,6 @@ mod aac_decoder_mft {
             _stream_id: u32,
             _media_type: &ImfMediaType,
         ) -> AppResult<()> {
-            self.output_type_set = true;
             Ok(())
         }
 
@@ -1628,33 +1787,26 @@ mod aac_decoder_mft {
                     self.converter = Some(converter);
                 }
             }
-            // AAC decode will happen on process_output
+            // Real AAC decode is not implemented; input is accepted so the
+            // format negotiation succeeds, and process_output reports no
+            // output rather than fabricating silence.
             Ok(())
         }
 
         fn process_output(
             &mut self,
             _stream_id: u32,
-            sample: &mut ImfSample,
+            _sample: &mut ImfSample,
             flags: &mut u32,
         ) -> AppResult<()> {
-            if let Some(_converter) = self.converter {
-                // Simple approach: produce silence for now if no decoded data
-                // Real implementation would use AudioConverterFillComplexBuffer
-                let frame_count = 1024u32;
-                let byte_count = (frame_count * self.channels * 2) as usize;
-                sample.buffer = vec![0u8; byte_count];
-                sample.sample_duration =
-                    (frame_count as i64 * 10_000_000) / (self.sample_rate as i64);
-                *flags = 0;
-            } else {
-                *flags = MFT_OUTPUT_DATA_BUFFER_NO_SAMPLE;
-            }
+            // No decoded output is available until the AAC decode loop
+            // (AudioConverterFillComplexBuffer) is implemented.
+            *flags = MFT_OUTPUT_DATA_BUFFER_NO_SAMPLE;
             Ok(())
         }
 
         fn has_output(&self) -> bool {
-            self.converter.is_some()
+            false
         }
     }
 }
@@ -1667,6 +1819,12 @@ mod aac_decoder_mft {
     impl AacDecoderMft {
         pub fn new() -> Self {
             Self
+        }
+    }
+
+    impl Default for AacDecoderMft {
+        fn default() -> Self {
+            Self::new()
         }
     }
 
@@ -1899,6 +2057,12 @@ impl Topology {
     }
 }
 
+impl Default for Topology {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ===========================================================================
 // Topology loader
 // ===========================================================================
@@ -1926,6 +2090,12 @@ impl TopologyLoader {
     /// Clear the topology loader state.
     pub fn clear(&self) {
         // No-op stub
+    }
+}
+
+impl Default for TopologyLoader {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -2004,16 +2174,21 @@ impl MfMediaSession {
     /// Corresponds to `IMFMediaSession::Start`.
     /// Transitions: Idle -> Playing, Stopped -> Playing, Paused -> Playing
     pub fn start(&mut self) -> AppResult<()> {
+        // Already playing: no-op without a duplicate SessionStarted event.
+        if self.state == MfSessionState::Playing {
+            return Ok(());
+        }
         if !self.state.can_start() {
-            // If already playing, this is a no-op (or restart)
-            if self.state == MfSessionState::Playing {
-                self.event_queue
-                    .queue_event_type(MediaEventType::SessionStarted);
-                return Ok(());
-            }
             return Err(AppError::new(
                 ReasonCode::RcInvalidState,
                 format!("Cannot start from state {}", self.state.name()),
+            ));
+        }
+        // Real Media Foundation rejects Start from Idle without a topology.
+        if self.state == MfSessionState::Idle && !self.has_topology {
+            return Err(AppError::new(
+                ReasonCode::RcInvalidState,
+                "Cannot start from Idle without a topology",
             ));
         }
 
@@ -2103,15 +2278,15 @@ impl MfMediaSession {
             ));
         }
 
+        // Resolve the topology before committing it, so a failed load never
+        // leaves the session with a topology and a missing TopologyLoaded
+        // event.
+        self.topology_loader.load(&topology)?;
+
         self.topology = Some(topology);
         self.has_topology = true;
         self.event_queue
             .queue_event_type(MediaEventType::TopologySet);
-
-        // Resolve the topology immediately
-        if let Some(ref topology) = self.topology {
-            self.topology_loader.load(topology)?;
-        }
         self.event_queue
             .queue_event_type(MediaEventType::TopologyLoaded);
 
@@ -2209,6 +2384,12 @@ impl MfMediaSession {
     }
 }
 
+impl Default for MfMediaSession {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ===========================================================================
 // MP4 Demuxer (ISO Base Media File Format Parser)
 // ===========================================================================
@@ -2242,8 +2423,34 @@ pub struct Mp4Demuxer {
     file: Vec<u8>,
     position: usize,
     tracks: Vec<Mp4Track>,
-    current_sample: HashMap<u32, Mp4Sample>, // track_id -> current sample
 }
+
+/// Raw sample-table data collected while walking `stbl`.
+///
+/// Box order inside `stbl` is not guaranteed by the spec, so the tables are
+/// collected first and the per-sample tables are built afterwards.
+#[derive(Default)]
+struct SampleTableRaw {
+    /// stts entries: (sample_count, sample_delta)
+    stts: Vec<(u32, u32)>,
+    /// stss entries: 1-based sync sample numbers (sorted)
+    stss: Vec<u32>,
+    /// stsc entries: (first_chunk, samples_per_chunk)
+    stsc: Vec<(u32, u32)>,
+    /// stsz default sample size (0 = per-sample sizes)
+    stsz_default: u32,
+    /// stsz per-sample sizes (used when the default size is 0)
+    stsz_sizes: Vec<u32>,
+    /// stsz sample count (authoritative sample count)
+    stsz_sample_count: u32,
+    /// stco chunk offsets
+    stco: Vec<u64>,
+}
+
+/// Cap on the number of samples built per track. A crafted header can claim
+/// up to 2^32 samples; the cap keeps the derived allocations proportional to
+/// a sane stream (~8M samples is >3 days of video at 24 fps).
+const MAX_MP4_SAMPLES: usize = 8_000_000;
 
 impl Mp4Demuxer {
     /// Create a new MP4 demuxer from file data.
@@ -2252,15 +2459,17 @@ impl Mp4Demuxer {
             file: data,
             position: 0,
             tracks: Vec::new(),
-            current_sample: HashMap::new(),
         }
+    }
+
+    fn invalid(&self, message: &str) -> AppError {
+        AppError::new(ReasonCode::RcMediaInvalid, message.to_string())
     }
 
     /// Parse the entire MP4 file structure.
     pub fn parse(&mut self) -> AppResult<()> {
         while self.position < self.file.len() {
             self.read_box()?;
-            // After moov, stop scanning for more boxes (data is after moov typically)
         }
         if self.tracks.is_empty() {
             return Err(AppError::new(
@@ -2274,10 +2483,7 @@ impl Mp4Demuxer {
     /// Read a single box at the current position.
     fn read_box(&mut self) -> AppResult<()> {
         if self.position + 8 > self.file.len() {
-            return Err(AppError::new(
-                ReasonCode::RcMediaInvalid,
-                "Truncated MP4 box header",
-            ));
+            return Err(self.invalid("Truncated MP4 box header"));
         }
 
         let size = u32::from_be_bytes([
@@ -2289,16 +2495,13 @@ impl Mp4Demuxer {
 
         let box_type = &self.file[self.position + 4..self.position + 8];
 
-        let actual_size = if size == 0 {
+        let (header_size, actual_size) = if size == 0 {
             // Box extends to end of file
-            self.file.len() as u64 - self.position as u64
+            (8usize, (self.file.len() - self.position) as u64)
         } else if size == 1 {
             // 64-bit size
             if self.position + 16 > self.file.len() {
-                return Err(AppError::new(
-                    ReasonCode::RcMediaInvalid,
-                    "Truncated 64-bit MP4 box size",
-                ));
+                return Err(self.invalid("Truncated 64-bit MP4 box size"));
             }
             let size64 = u64::from_be_bytes([
                 self.file[self.position + 8],
@@ -2310,48 +2513,42 @@ impl Mp4Demuxer {
                 self.file[self.position + 14],
                 self.file[self.position + 15],
             ]);
-            self.position += 8; // skip extended size field
-            size64
+            (16usize, size64)
         } else {
-            size as u64
+            (8usize, size)
         };
 
-        let _header_size: usize = if size == 1 { 16 } else { 8 };
-        let end = self.position + actual_size as usize;
+        let box_start = self.position;
+        // All sizes come from the untrusted container: validate against the
+        // file length (checked arithmetic, no wrapping).
+        let box_end = match box_start.checked_add(actual_size as usize) {
+            Some(end) if end <= self.file.len() => end,
+            _ => return Err(self.invalid("MP4 box extends beyond file")),
+        };
 
+        // Point the reader at the payload and recurse into container boxes.
+        self.position = box_start + header_size;
         match box_type {
-            b"ftyp" => {
-                self.read_ftyp();
-            }
+            b"ftyp" => { /* file type - skip */ }
             b"moov" => {
-                self.read_moov();
+                self.read_moov(box_end)?;
             }
             b"moof" => {
-                // Basic fragmented MP4: track fragment runs and sequence numbers
-                // so the reader can locate moof-base data references
-                self.read_moof();
+                // Basic fragmented MP4: track fragment runs and sequence
+                // numbers so the reader can locate moof-based data references.
+                self.read_moof(box_end)?;
             }
-            b"mdat" => { /* data - skip, we reference offsets */ }
-            b"free" | b"skip" => { /* skip */ }
+            b"mdat" | b"free" | b"skip" => { /* skip */ }
             _ => { /* unknown - skip */ }
         }
 
-        self.position = end as usize;
+        self.position = box_end;
         Ok(())
     }
 
-    /// Parse ftyp box (file type).
-    fn read_ftyp(&mut self) {
-        // ftyp: major brand (4) + minor version (4) + compatible brands
-        // We just skip it; we already know it's MP4
-    }
-
-    /// Parse moov box (movie metadata).
-    fn read_moov(&mut self) {
-        while self.position < self.file.len() {
-            if self.position + 8 > self.file.len() {
-                break;
-            }
+    /// Parse moov box (movie metadata), bounded by its own `parent_end`.
+    fn read_moov(&mut self, parent_end: usize) -> AppResult<()> {
+        while self.position + 8 <= parent_end && self.position + 8 <= self.file.len() {
             let child_size = u32::from_be_bytes([
                 self.file[self.position],
                 self.file[self.position + 1],
@@ -2359,35 +2556,31 @@ impl Mp4Demuxer {
                 self.file[self.position + 3],
             ]) as usize;
             if child_size < 8 {
-                break;
+                return Err(self.invalid("Invalid MP4 moov child box size"));
             }
             let child_type = &self.file[self.position + 4..self.position + 8];
-            let child_end = self.position + child_size;
+            let child_end = match self.position.checked_add(child_size) {
+                Some(end) if end <= parent_end && end <= self.file.len() => end,
+                _ => return Err(self.invalid("MP4 moov child box overruns its parent")),
+            };
 
             match child_type {
                 b"trak" => {
-                    if let Ok(track) = self.read_trak() {
-                        self.tracks.push(track);
-                    }
+                    let track = self.read_trak(child_end)?;
+                    self.tracks.push(track);
                 }
                 b"mvhd" => { /* movie header - skip */ }
                 _ => {}
             }
 
             self.position = child_end;
-            // Safety check
-            if self.position >= self.file.len() {
-                break;
-            }
         }
+        Ok(())
     }
 
-    /// Parse moof box (movie fragment).
-    ///
-    /// Tracks fragment sequence numbers and sample metadata so
-    /// fragmented MP4 streams can be navigated.
-    fn read_moof(&mut self) {
-        while self.position + 8 < self.file.len() {
+    /// Parse moof box (movie fragment), bounded by its own `parent_end`.
+    fn read_moof(&mut self, parent_end: usize) -> AppResult<()> {
+        while self.position + 8 <= parent_end && self.position + 8 <= self.file.len() {
             let child_size = u32::from_be_bytes([
                 self.file[self.position],
                 self.file[self.position + 1],
@@ -2395,35 +2588,33 @@ impl Mp4Demuxer {
                 self.file[self.position + 3],
             ]) as usize;
             if child_size < 8 {
-                break;
+                return Err(self.invalid("Invalid MP4 moof child box size"));
             }
             let child_type = &self.file[self.position + 4..self.position + 8];
-            let child_end = self.position + child_size;
-            if child_end > self.file.len() {
-                break;
-            }
+            let child_end = match self.position.checked_add(child_size) {
+                Some(end) if end <= parent_end && end <= self.file.len() => end,
+                _ => return Err(self.invalid("MP4 moof child box overruns its parent")),
+            };
 
             match child_type {
                 b"traf" => {
-                    // Track fragment: contains tfhd + trun boxes
-                    // We skip the details for now but mark that we've seen a fragment
+                    // Track fragment: contains tfhd + trun boxes.
+                    // Skipped for now (fragmented streams are not decoded).
                 }
                 b"mfhd" => {
-                    // Movie fragment header: contains sequence number
-                    // Skip past the header (4 bytes version/flags + 4 bytes seq num)
+                    // Movie fragment header: sequence number follows the
+                    // version/flags field. Skipped.
                 }
                 _ => {}
             }
 
             self.position = child_end;
-            if self.position >= self.file.len() {
-                break;
-            }
         }
+        Ok(())
     }
 
-    /// Parse a trak box.
-    fn read_trak(&mut self) -> AppResult<Mp4Track> {
+    /// Parse a trak box, bounded by its own `parent_end`.
+    fn read_trak(&mut self, parent_end: usize) -> AppResult<Mp4Track> {
         let mut track = Mp4Track {
             id: 0,
             media_type: ImfMediaType::new(),
@@ -2433,13 +2624,7 @@ impl Mp4Demuxer {
             duration: 0,
         };
 
-        let _start = self.position;
-        // We need to find tkhd and mdia within trak
-        // Simple approach: scan children
-        while self.position < self.file.len() {
-            if self.position + 8 > self.file.len() {
-                break;
-            }
+        while self.position + 8 <= parent_end && self.position + 8 <= self.file.len() {
             let child_size = u32::from_be_bytes([
                 self.file[self.position],
                 self.file[self.position + 1],
@@ -2447,28 +2632,34 @@ impl Mp4Demuxer {
                 self.file[self.position + 3],
             ]) as usize;
             if child_size < 8 {
-                break;
+                return Err(self.invalid("Invalid MP4 trak child box size"));
             }
             let child_type = &self.file[self.position + 4..self.position + 8];
-            let child_end = self.position + child_size;
+            let child_end = match self.position.checked_add(child_size) {
+                Some(end) if end <= parent_end && end <= self.file.len() => end,
+                _ => return Err(self.invalid("MP4 trak child box overruns its parent")),
+            };
 
             match child_type {
                 b"tkhd" => {
-                    // Track header: version(1) + flags(3) + ... + track_id(4) + ...
-                    let ver = self.file[self.position + 8];
-                    let track_id_offset = if ver == 1 { 20 } else { 12 };
-                    if self.position + 8 + track_id_offset + 4 <= self.file.len() {
-                        let id_bytes: [u8; 4] = [
-                            self.file[self.position + 8 + track_id_offset],
-                            self.file[self.position + 9 + track_id_offset],
-                            self.file[self.position + 10 + track_id_offset],
-                            self.file[self.position + 11 + track_id_offset],
-                        ];
-                        track.id = u32::from_be_bytes(id_bytes);
+                    // Track header: version(1) + flags(3) + ... + track_id(4)
+                    // track_id is at +20 (v0) or +28 (v1) relative to the box.
+                    if child_size >= 12 {
+                        let ver = self.file[self.position + 8];
+                        let track_id_offset = if ver == 1 { 20 } else { 12 };
+                        if child_size >= 8 + track_id_offset + 4 {
+                            let id_bytes: [u8; 4] = [
+                                self.file[self.position + 8 + track_id_offset],
+                                self.file[self.position + 9 + track_id_offset],
+                                self.file[self.position + 10 + track_id_offset],
+                                self.file[self.position + 11 + track_id_offset],
+                            ];
+                            track.id = u32::from_be_bytes(id_bytes);
+                        }
                     }
                 }
                 b"mdia" => {
-                    self.read_mdia(&mut track)?;
+                    self.read_mdia(&mut track, child_end)?;
                 }
                 _ => {}
             }
@@ -2479,12 +2670,9 @@ impl Mp4Demuxer {
         Ok(track)
     }
 
-    /// Parse mdia box inside trak.
-    fn read_mdia(&mut self, track: &mut Mp4Track) -> AppResult<()> {
-        while self.position < self.file.len() {
-            if self.position + 8 > self.file.len() {
-                break;
-            }
+    /// Parse mdia box inside trak, bounded by its own `parent_end`.
+    fn read_mdia(&mut self, track: &mut Mp4Track, parent_end: usize) -> AppResult<()> {
+        while self.position + 8 <= parent_end && self.position + 8 <= self.file.len() {
             let child_size = u32::from_be_bytes([
                 self.file[self.position],
                 self.file[self.position + 1],
@@ -2492,39 +2680,42 @@ impl Mp4Demuxer {
                 self.file[self.position + 3],
             ]) as usize;
             if child_size < 8 {
-                break;
+                return Err(self.invalid("Invalid MP4 mdia child box size"));
             }
             let child_type = &self.file[self.position + 4..self.position + 8];
-            let child_end = self.position + child_size;
+            let child_end = match self.position.checked_add(child_size) {
+                Some(end) if end <= parent_end && end <= self.file.len() => end,
+                _ => return Err(self.invalid("MP4 mdia child box overruns its parent")),
+            };
 
             match child_type {
                 b"mdhd" => {
                     // Media header: version(1) + flags(3) + timescale(4)
-                    let ver = self.file[self.position + 8];
-                    let ts_offset = if ver == 1 { 20 } else { 12 };
-                    if self.position + 8 + ts_offset + 4 <= self.file.len() {
-                        let ts_bytes: [u8; 4] = [
-                            self.file[self.position + 8 + ts_offset],
-                            self.file[self.position + 9 + ts_offset],
-                            self.file[self.position + 10 + ts_offset],
-                            self.file[self.position + 11 + ts_offset],
-                        ];
-                        track.timescale = u32::from_be_bytes(ts_bytes);
-                    }
-                    // duration follows timescale
-                    if self.position + 8 + ts_offset + 8 <= self.file.len() {
-                        let dur_bytes: [u8; 4] = [
-                            self.file[self.position + 8 + ts_offset + 4],
-                            self.file[self.position + 9 + ts_offset + 4],
-                            self.file[self.position + 10 + ts_offset + 4],
-                            self.file[self.position + 11 + ts_offset + 4],
-                        ];
-                        track.duration = u32::from_be_bytes(dur_bytes) as u64;
+                    // timescale is at +20 (v0) or +28 (v1), duration after it.
+                    if child_size >= 12 {
+                        let ver = self.file[self.position + 8];
+                        let ts_offset = if ver == 1 { 20 } else { 12 };
+                        if child_size >= 8 + ts_offset + 8 {
+                            let ts_bytes: [u8; 4] = [
+                                self.file[self.position + 8 + ts_offset],
+                                self.file[self.position + 9 + ts_offset],
+                                self.file[self.position + 10 + ts_offset],
+                                self.file[self.position + 11 + ts_offset],
+                            ];
+                            track.timescale = u32::from_be_bytes(ts_bytes);
+                            let dur_bytes: [u8; 4] = [
+                                self.file[self.position + 8 + ts_offset + 4],
+                                self.file[self.position + 9 + ts_offset + 4],
+                                self.file[self.position + 10 + ts_offset + 4],
+                                self.file[self.position + 11 + ts_offset + 4],
+                            ];
+                            track.duration = u32::from_be_bytes(dur_bytes) as u64;
+                        }
                     }
                 }
                 b"hdlr" => {
-                    // Handler reference: type(4) + ... + handler_type(4)
-                    if self.position + 24 <= self.file.len() {
+                    // Handler reference: handler_type at box+16..+20.
+                    if child_size >= 20 {
                         let handler = &self.file[self.position + 16..self.position + 20];
                         match handler {
                             b"vide" => {
@@ -2544,7 +2735,7 @@ impl Mp4Demuxer {
                     }
                 }
                 b"minf" => {
-                    self.read_minf(track)?;
+                    self.read_minf(track, child_end)?;
                 }
                 _ => {}
             }
@@ -2554,12 +2745,9 @@ impl Mp4Demuxer {
         Ok(())
     }
 
-    /// Parse minf box.
-    fn read_minf(&mut self, track: &mut Mp4Track) -> AppResult<()> {
-        while self.position < self.file.len() {
-            if self.position + 8 > self.file.len() {
-                break;
-            }
+    /// Parse minf box, bounded by its own `parent_end`.
+    fn read_minf(&mut self, track: &mut Mp4Track, parent_end: usize) -> AppResult<()> {
+        while self.position + 8 <= parent_end && self.position + 8 <= self.file.len() {
             let child_size = u32::from_be_bytes([
                 self.file[self.position],
                 self.file[self.position + 1],
@@ -2567,16 +2755,16 @@ impl Mp4Demuxer {
                 self.file[self.position + 3],
             ]) as usize;
             if child_size < 8 {
-                break;
+                return Err(self.invalid("Invalid MP4 minf child box size"));
             }
             let child_type = &self.file[self.position + 4..self.position + 8];
-            let child_end = self.position + child_size;
+            let child_end = match self.position.checked_add(child_size) {
+                Some(end) if end <= parent_end && end <= self.file.len() => end,
+                _ => return Err(self.invalid("MP4 minf child box overruns its parent")),
+            };
 
-            match child_type {
-                b"stbl" => {
-                    self.read_stbl(track)?;
-                }
-                _ => {}
+            if child_type == b"stbl" {
+                self.read_stbl(track, child_end)?;
             }
 
             self.position = child_end;
@@ -2584,12 +2772,14 @@ impl Mp4Demuxer {
         Ok(())
     }
 
-    /// Parse stbl (sample table) box.
-    fn read_stbl(&mut self, track: &mut Mp4Track) -> AppResult<()> {
-        while self.position < self.file.len() {
-            if self.position + 8 > self.file.len() {
-                break;
-            }
+    /// Parse stbl (sample table) box, bounded by its own `parent_end`.
+    ///
+    /// Collects the raw stts/stss/stsc/stsz/stco tables, then builds the
+    /// per-sample tables (offsets, durations, PTS, sync flags).
+    fn read_stbl(&mut self, track: &mut Mp4Track, parent_end: usize) -> AppResult<()> {
+        let mut raw = SampleTableRaw::default();
+
+        while self.position + 8 <= parent_end && self.position + 8 <= self.file.len() {
             let child_size = u32::from_be_bytes([
                 self.file[self.position],
                 self.file[self.position + 1],
@@ -2597,123 +2787,272 @@ impl Mp4Demuxer {
                 self.file[self.position + 3],
             ]) as usize;
             if child_size < 8 {
-                break;
+                return Err(self.invalid("Invalid MP4 stbl child box size"));
             }
             let child_type = &self.file[self.position + 4..self.position + 8];
-            let child_end = self.position + child_size;
+            let child_end = match self.position.checked_add(child_size) {
+                Some(end) if end <= parent_end && end <= self.file.len() => end,
+                _ => return Err(self.invalid("MP4 stbl child box overruns its parent")),
+            };
 
             match child_type {
-                b"stsd" => {
-                    // Sample description - parse for codec info
-                    // stsd: version(1) + flags(3) + entry_count(4)
-                    // Then entries with codec-specific data
-                }
                 b"stts" => {
-                    // Time-to-sample table
-                    if child_size > 16 {
-                        let _entry_count = u32::from_be_bytes([
-                            self.file[self.position + 12],
-                            self.file[self.position + 13],
-                            self.file[self.position + 14],
-                            self.file[self.position + 15],
-                        ]);
-                        // We'll use this later when building samples
-                    }
-                }
-                b"stss" => {
-                    // Sync sample table (key frames)
-                    if child_size > 16 {
-                        let _entry_count = u32::from_be_bytes([
-                            self.file[self.position + 12],
-                            self.file[self.position + 13],
-                            self.file[self.position + 14],
-                            self.file[self.position + 15],
-                        ]);
-                        // Mark sync samples
-                    }
-                }
-                b"stsc" => {
-                    // Sample-to-chunk table
-                }
-                b"stsz" => {
-                    // Sample sizes
-                    if child_size > 16 {
-                        let sample_count = u32::from_be_bytes([
-                            self.file[self.position + 12],
-                            self.file[self.position + 13],
-                            self.file[self.position + 14],
-                            self.file[self.position + 15],
-                        ]) as usize;
-                        let default_size = u32::from_be_bytes([
-                            self.file[self.position + 8],
-                            self.file[self.position + 9],
-                            self.file[self.position + 10],
-                            self.file[self.position + 11],
-                        ]);
-                        track.samples.clear();
-                        if default_size > 0 {
-                            // All samples same size
-                            for i in 0..sample_count {
-                                track.samples.push(Mp4Sample {
-                                    offset: 0,
-                                    size: default_size,
-                                    duration: 0,
-                                    pts: i as u64,
-                                    is_sync: true,
-                                });
-                            }
-                        } else if child_size >= 16 + sample_count * 4 {
-                            // Each sample has its own size
-                            for i in 0..sample_count {
-                                let off = self.position + 16 + i * 4;
-                                if off + 4 <= self.file.len() {
-                                    let sz = u32::from_be_bytes([
-                                        self.file[off],
-                                        self.file[off + 1],
-                                        self.file[off + 2],
-                                        self.file[off + 3],
-                                    ]);
-                                    track.samples.push(Mp4Sample {
-                                        offset: 0,
-                                        size: sz,
-                                        duration: 0,
-                                        pts: i as u64,
-                                        is_sync: true,
-                                    });
-                                }
-                            }
-                        }
-                    }
-                }
-                b"stco" => {
-                    // Chunk offsets
-                    if child_size > 16 && !track.samples.is_empty() {
+                    // version/flags(4) + entry_count(4) at +8..16; entries are
+                    // (sample_count, sample_delta), 8 bytes each, at +16.
+                    if child_size >= 16 {
                         let entry_count = u32::from_be_bytes([
                             self.file[self.position + 12],
                             self.file[self.position + 13],
                             self.file[self.position + 14],
                             self.file[self.position + 15],
                         ]) as usize;
-                        // Map sample offsets from chunk offsets
-                        if entry_count > 0 && self.position + 16 + 4 <= self.file.len() {
-                            let first_chunk_offset = u32::from_be_bytes([
-                                self.file[self.position + 16],
-                                self.file[self.position + 17],
-                                self.file[self.position + 18],
-                                self.file[self.position + 19],
-                            ]) as u64;
-                            for sample in track.samples.iter_mut() {
-                                sample.offset = first_chunk_offset;
+                        let Some(needed) = 16usize.checked_add(entry_count.saturating_mul(8)) else {
+                            return Err(self.invalid("stts entry count overflows"));
+                        };
+                        if child_size >= needed {
+                            let mut entries = Vec::with_capacity(entry_count);
+                            for i in 0..entry_count {
+                                let off = self.position + 16 + i * 8;
+                                let count = u32::from_be_bytes([
+                                    self.file[off],
+                                    self.file[off + 1],
+                                    self.file[off + 2],
+                                    self.file[off + 3],
+                                ]);
+                                let delta = u32::from_be_bytes([
+                                    self.file[off + 4],
+                                    self.file[off + 5],
+                                    self.file[off + 6],
+                                    self.file[off + 7],
+                                ]);
+                                entries.push((count, delta));
+                            }
+                            raw.stts = entries;
+                        } else {
+                            return Err(self.invalid("stts table overruns its box"));
+                        }
+                    }
+                }
+                b"stss" => {
+                    // version/flags(4) + entry_count(4) at +8..16; entries are
+                    // 1-based sync sample numbers, 4 bytes each, at +16.
+                    if child_size >= 16 {
+                        let entry_count = u32::from_be_bytes([
+                            self.file[self.position + 12],
+                            self.file[self.position + 13],
+                            self.file[self.position + 14],
+                            self.file[self.position + 15],
+                        ]) as usize;
+                        let Some(needed) = 16usize.checked_add(entry_count.saturating_mul(4)) else {
+                            return Err(self.invalid("stss entry count overflows"));
+                        };
+                        if child_size >= needed {
+                            let mut entries = Vec::with_capacity(entry_count);
+                            for i in 0..entry_count {
+                                let off = self.position + 16 + i * 4;
+                                entries.push(u32::from_be_bytes([
+                                    self.file[off],
+                                    self.file[off + 1],
+                                    self.file[off + 2],
+                                    self.file[off + 3],
+                                ]));
+                            }
+                            raw.stss = entries;
+                        } else {
+                            return Err(self.invalid("stss table overruns its box"));
+                        }
+                    }
+                }
+                b"stsc" => {
+                    // version/flags(4) + entry_count(4) at +8..16; entries are
+                    // (first_chunk, samples_per_chunk, sample_description_index),
+                    // 12 bytes each, at +16.
+                    if child_size >= 16 {
+                        let entry_count = u32::from_be_bytes([
+                            self.file[self.position + 12],
+                            self.file[self.position + 13],
+                            self.file[self.position + 14],
+                            self.file[self.position + 15],
+                        ]) as usize;
+                        let Some(needed) = 16usize.checked_add(entry_count.saturating_mul(12)) else {
+                            return Err(self.invalid("stsc entry count overflows"));
+                        };
+                        if child_size >= needed {
+                            let mut entries = Vec::with_capacity(entry_count);
+                            for i in 0..entry_count {
+                                let off = self.position + 16 + i * 12;
+                                let first_chunk = u32::from_be_bytes([
+                                    self.file[off],
+                                    self.file[off + 1],
+                                    self.file[off + 2],
+                                    self.file[off + 3],
+                                ]);
+                                let samples_per_chunk = u32::from_be_bytes([
+                                    self.file[off + 4],
+                                    self.file[off + 5],
+                                    self.file[off + 6],
+                                    self.file[off + 7],
+                                ]);
+                                entries.push((first_chunk, samples_per_chunk));
+                            }
+                            raw.stsc = entries;
+                        } else {
+                            return Err(self.invalid("stsc table overruns its box"));
+                        }
+                    }
+                }
+                b"stsz" => {
+                    // version/flags(4) at +8; sample_size at +12;
+                    // sample_count at +16; per-sample sizes at +20 (4 each).
+                    if child_size >= 20 {
+                        let default_size = u32::from_be_bytes([
+                            self.file[self.position + 12],
+                            self.file[self.position + 13],
+                            self.file[self.position + 14],
+                            self.file[self.position + 15],
+                        ]);
+                        let sample_count = u32::from_be_bytes([
+                            self.file[self.position + 16],
+                            self.file[self.position + 17],
+                            self.file[self.position + 18],
+                            self.file[self.position + 19],
+                        ]);
+                        raw.stsz_default = default_size;
+                        raw.stsz_sample_count = sample_count;
+                        if default_size == 0 {
+                            let count = sample_count as usize;
+                            let Some(needed) = 20usize.checked_add(count.saturating_mul(4)) else {
+                                return Err(self.invalid("stsz sample count overflows"));
+                            };
+                            if child_size >= needed {
+                                let mut sizes = Vec::with_capacity(count);
+                                for i in 0..count {
+                                    let off = self.position + 20 + i * 4;
+                                    sizes.push(u32::from_be_bytes([
+                                        self.file[off],
+                                        self.file[off + 1],
+                                        self.file[off + 2],
+                                        self.file[off + 3],
+                                    ]));
+                                }
+                                raw.stsz_sizes = sizes;
+                            } else {
+                                return Err(self.invalid("stsz table overruns its box"));
                             }
                         }
                     }
                 }
-                _ => {}
+                b"stco" if child_size >= 16 => {
+                    // version/flags(4) at +8; entry_count at +12; chunk
+                    // offsets (4 bytes each) at +16.
+                    let entry_count = u32::from_be_bytes([
+                        self.file[self.position + 12],
+                        self.file[self.position + 13],
+                        self.file[self.position + 14],
+                        self.file[self.position + 15],
+                    ]) as usize;
+                    let Some(needed) = 16usize.checked_add(entry_count.saturating_mul(4)) else {
+                        return Err(self.invalid("stco entry count overflows"));
+                    };
+                    if child_size >= needed {
+                            let mut offsets = Vec::with_capacity(entry_count);
+                            for i in 0..entry_count {
+                                let off = self.position + 16 + i * 4;
+                                offsets.push(u32::from_be_bytes([
+                                    self.file[off],
+                                    self.file[off + 1],
+                                    self.file[off + 2],
+                                    self.file[off + 3],
+                                ]) as u64);
+                            }
+                            raw.stco = offsets;
+                        } else {
+                            return Err(self.invalid("stco table overruns its box"));
+                        }
+                }
+                _ => { /* stsd etc. - skip */ }
             }
 
             self.position = child_end;
         }
+
+        self.build_samples(&raw, track);
         Ok(())
+    }
+
+    /// Build the per-sample tables from the raw stbl data.
+    ///
+    /// Walks chunk offsets (stco), groups samples into chunks (stsc), sizes
+    /// them (stsz), and derives durations/PTS (stts) and sync flags (stss).
+    fn build_samples(&self, raw: &SampleTableRaw, track: &mut Mp4Track) {
+        track.samples.clear();
+        let total = raw.stsz_sample_count as usize;
+        if total == 0 || raw.stco.is_empty() {
+            // Without chunk offsets there is no way to locate sample data.
+            return;
+        }
+        let count = total.min(MAX_MP4_SAMPLES);
+
+        let mut samples = Vec::with_capacity(count.min(raw.stco.len() * 16));
+        let mut stsc_run = 0usize;
+        let mut stts_run = 0usize;
+        let mut stts_left = 0u32;
+        let mut stts_delta = 0u32;
+        let mut pts: u64 = 0;
+        let mut global = 0usize;
+
+        for (chunk_idx, &chunk_offset) in raw.stco.iter().enumerate() {
+            // Advance to the stsc run covering this 1-based chunk number.
+            while stsc_run + 1 < raw.stsc.len()
+                && chunk_idx as u32 + 1 >= raw.stsc[stsc_run + 1].0
+            {
+                stsc_run += 1;
+            }
+            let per_chunk = match raw.stsc.get(stsc_run) {
+                Some(&(first_chunk, samples_per_chunk)) if chunk_idx as u32 + 1 >= first_chunk => {
+                    samples_per_chunk as usize
+                }
+                _ => 1,
+            };
+
+            let mut offset = chunk_offset;
+            for _ in 0..per_chunk {
+                if global >= count {
+                    break;
+                }
+                let size = if raw.stsz_default > 0 {
+                    raw.stsz_default
+                } else {
+                    raw.stsz_sizes.get(global).copied().unwrap_or(0)
+                };
+                if stts_left == 0 {
+                    if let Some(&(run_count, run_delta)) = raw.stts.get(stts_run) {
+                        stts_run += 1;
+                        stts_left = run_count;
+                        stts_delta = run_delta;
+                    } else {
+                        stts_delta = 0;
+                    }
+                }
+                stts_left = stts_left.saturating_sub(1);
+
+                samples.push(Mp4Sample {
+                    offset,
+                    size,
+                    duration: stts_delta,
+                    pts,
+                    is_sync: raw.stss.binary_search(&((global + 1) as u32)).is_ok(),
+                });
+                pts = pts.wrapping_add(stts_delta as u64);
+                offset = offset.wrapping_add(size as u64);
+                global += 1;
+            }
+            if global >= count {
+                break;
+            }
+        }
+
+        track.samples = samples;
     }
 
     /// Get the number of tracks.
@@ -2790,7 +3129,6 @@ pub struct SourceReader {
     demuxer: Mp4Demuxer,
     selected_streams: Vec<u32>,
     decoder: Option<Box<dyn MftTransform>>,
-    position: u64,
 }
 
 impl SourceReader {
@@ -2813,7 +3151,6 @@ impl SourceReader {
             demuxer,
             selected_streams: Vec::new(),
             decoder: None,
-            position: 0,
         })
     }
 
@@ -2864,21 +3201,34 @@ impl SourceReader {
         Ok(())
     }
 
+    /// Convert a timestamp in track time units to 100-ns units, saturating
+    /// instead of overflowing the i64 sample time.
+    fn to_hns(value: u64, scale: u64) -> i64 {
+        let scale = scale.max(1) as u128;
+        i64::try_from((value as u128 * 10_000_000) / scale).unwrap_or(i64::MAX)
+    }
+
     /// Read the next sample from the given stream.
     pub fn read_sample(&mut self, stream_index: u32) -> AppResult<Option<ImfSample>> {
-        if let Some(sample_info) = self.demuxer.next_sample(stream_index as usize) {
+        let idx = stream_index as usize;
+        // MF_SOURCE_READER_FLAG_NEW_STREAM is only set for the first sample
+        // of a stream, not for every sync sample.
+        let is_first = self
+            .demuxer
+            .get_track(idx)
+            .is_some_and(|track| track.current_index == 0);
+        if let Some(sample_info) = self.demuxer.next_sample(idx) {
             let data = self.demuxer.read_sample_data(&sample_info)?;
             let mut sample = ImfSample::new(data);
             // Convert from track timescale to 100ns units
-            if let Some(track) = self.demuxer.get_track(stream_index as usize) {
-                let scale = track.timescale.max(1);
-                sample.sample_time = (sample_info.pts as i64 * 10_000_000) / scale as i64;
-                sample.sample_duration = (sample_info.duration as i64 * 10_000_000) / scale as i64;
-                if sample_info.is_sync {
+            if let Some(track) = self.demuxer.get_track(idx) {
+                let scale = track.timescale.max(1) as u64;
+                sample.sample_time = Self::to_hns(sample_info.pts, scale);
+                sample.sample_duration = Self::to_hns(sample_info.duration as u64, scale);
+                if is_first {
                     sample.flags |= 1; // MF_SOURCE_READER_FLAG_NEW_STREAM
                 }
             }
-            self.position = sample_info.pts;
             Ok(Some(sample))
         } else {
             Ok(None) // End of stream
@@ -2887,7 +3237,6 @@ impl SourceReader {
 
     /// Set the current position for seeking.
     pub fn set_current_position(&mut self, position: u64) {
-        self.position = position;
         for i in 0..self.demuxer.track_count() {
             self.demuxer.seek(i, position);
         }
@@ -2905,9 +3254,9 @@ impl SourceReader {
 pub struct SinkWriter {
     output_file: Option<String>,
     input_type: Option<ImfMediaType>,
-    encoder: Option<Box<dyn MftTransform>>,
     frame_count: u64,
     output_data: Vec<u8>,
+    output_handle: Option<std::fs::File>,
 }
 
 impl SinkWriter {
@@ -2916,9 +3265,9 @@ impl SinkWriter {
         Self {
             output_file: None,
             input_type: None,
-            encoder: None,
             frame_count: 0,
             output_data: Vec::new(),
+            output_handle: None,
         }
     }
 
@@ -2927,9 +3276,9 @@ impl SinkWriter {
         Ok(Self {
             output_file: Some(url.to_string()),
             input_type: None,
-            encoder: None,
             frame_count: 0,
             output_data: Vec::new(),
+            output_handle: None,
         })
     }
 
@@ -2946,19 +3295,49 @@ impl SinkWriter {
     /// Begin writing (initialize output).
     pub fn begin_writing(&mut self) -> AppResult<()> {
         self.frame_count = 0;
+        self.output_data.clear();
+        // Open the target file up front so samples stream to disk instead of
+        // accumulating in memory until `end_writing`.
+        if let Some(path) = &self.output_file {
+            let file = std::fs::File::create(path).map_err(|e| {
+                AppError::new(
+                    ReasonCode::RcMediaInvalid,
+                    format!("Failed to create {path}: {e}"),
+                )
+            })?;
+            self.output_handle = Some(file);
+        }
         Ok(())
     }
 
     /// Write a sample to the output.
     pub fn write_sample(&mut self, _stream_index: u32, sample: &ImfSample) -> AppResult<()> {
-        self.output_data.extend_from_slice(&sample.buffer);
+        if let Some(file) = &mut self.output_handle {
+            use std::io::Write;
+            file.write_all(&sample.buffer).map_err(|e| {
+                AppError::new(
+                    ReasonCode::RcMediaInvalid,
+                    format!("Failed to write sample: {e}"),
+                )
+            })?;
+        } else {
+            self.output_data.extend_from_slice(&sample.buffer);
+        }
         self.frame_count += 1;
         Ok(())
     }
 
     /// Finalize writing and close the output file.
     pub fn end_writing(&mut self) -> AppResult<()> {
-        if let Some(path) = &self.output_file {
+        if let Some(mut file) = self.output_handle.take() {
+            use std::io::Write;
+            file.flush().map_err(|e| {
+                AppError::new(
+                    ReasonCode::RcMediaInvalid,
+                    format!("Failed to flush output file: {e}"),
+                )
+            })?;
+        } else if let Some(path) = &self.output_file {
             std::fs::write(path, &self.output_data).map_err(|e| {
                 AppError::new(
                     ReasonCode::RcMediaInvalid,
@@ -2967,6 +3346,12 @@ impl SinkWriter {
             })?;
         }
         Ok(())
+    }
+}
+
+impl Default for SinkWriter {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -3012,8 +3397,10 @@ impl PresentationClock {
 
     /// Pause the clock, recording the elapsed time so far.
     pub fn pause(&mut self) {
-        if self.start_time.is_some() && self.paused_time.is_none() {
-            self.time_offset += self.start_time.unwrap().elapsed();
+        if self.paused_time.is_none()
+            && let Some(start) = self.start_time
+        {
+            self.time_offset += start.elapsed();
             self.paused_time = Some(self.time_offset);
             self.start_time = None;
         }
@@ -3027,14 +3414,20 @@ impl PresentationClock {
         }
     }
 
-    /// Get the current time elapsed since start, minus pauses.
+    /// Get the current time elapsed since start, minus pauses, scaled by the
+    /// configured playback rate.
     pub fn get_time(&self) -> Duration {
-        self.time_offset
-            + if let Some(start) = self.start_time {
-                start.elapsed()
-            } else {
-                Duration::ZERO
-            }
+        let elapsed = if let Some(start) = self.start_time {
+            start.elapsed()
+        } else {
+            Duration::ZERO
+        };
+        let scaled = if self.rate == 1.0 {
+            elapsed
+        } else {
+            Duration::from_secs_f64(elapsed.as_secs_f64() * self.rate as f64)
+        };
+        self.time_offset + scaled
     }
 
     /// Get the current time in 100-ns units (MF format).
@@ -3109,15 +3502,18 @@ pub enum ResolvedSource {
 }
 
 /// Container format detection from magic bytes.
-pub fn detect_container_from_bytes(data: &[u8]) -> ContainerKind {
+///
+/// Returns `None` for input too short to carry a magic (or with an unknown
+/// magic) instead of misclassifying it.
+pub fn detect_container_from_bytes(data: &[u8]) -> Option<ContainerKind> {
     if data.len() < 4 {
-        return ContainerKind::Ogg; // fallback
+        return None;
     }
     match &data[..4] {
-        b"ftyp" | b"MP4!" => ContainerKind::Mp4,
-        b"Ogg " | b"OGG!" => ContainerKind::Ogg,
-        b"0\x26\xB2\x75" => ContainerKind::Wmv, // ASF header
-        _ => ContainerKind::Ogg,                // fallback
+        b"ftyp" | b"MP4!" => Some(ContainerKind::Mp4),
+        b"OggS" | b"Ogg " | b"OGG!" => Some(ContainerKind::Ogg),
+        b"0\x26\xB2\x75" => Some(ContainerKind::Wmv), // ASF header
+        _ => None,
     }
 }
 
@@ -3174,23 +3570,14 @@ impl SourceResolver {
     }
 
     /// Resolve a media source from an HTTP(S) URL.
+    ///
+    /// Downloads are bounded (see `crate::video_decoder::HTTP_FETCH_LIMIT_BYTES`)
+    /// so a malicious or oversized remote file cannot exhaust memory.
     fn create_object_from_http_url(&self, url: &str) -> AppResult<ResolvedSource> {
-        // Attempt to download the first few KB to detect container,
-        // then create the source
-        let response = reqwest::blocking::get(url).map_err(|e| {
-            AppError::new(
-                ReasonCode::RcMediaInvalid,
-                format!("Failed to fetch {url}: {e}"),
-            )
-        })?;
-
-        let bytes = response.bytes().map_err(|e| {
-            AppError::new(
-                ReasonCode::RcMediaInvalid,
-                format!("Failed to read response from {url}: {e}"),
-            )
-        })?;
-
+        let bytes = crate::video_decoder::fetch_http_bounded(
+            url,
+            crate::video_decoder::HTTP_FETCH_LIMIT_BYTES,
+        )?;
         self.create_object_from_byte_stream(&bytes)
     }
 
@@ -3202,18 +3589,22 @@ impl SourceResolver {
         let container = detect_container_from_bytes(data);
 
         match container {
-            ContainerKind::Mp4 => {
+            Some(ContainerKind::Mp4) => {
                 let reader = SourceReader::from_data(data.to_vec())?;
                 Ok(ResolvedSource::Mp4(reader))
             }
-            ContainerKind::Wmv => {
+            Some(ContainerKind::Wmv) => {
                 // WMV support is detected but decoding may be limited
                 Ok(ResolvedSource::Wmv)
             }
-            ContainerKind::Ogg => {
+            Some(ContainerKind::Ogg) => {
                 // OGG is handled by the existing MediaShim path
                 Ok(ResolvedSource::Unknown)
             }
+            None => Err(AppError::new(
+                ReasonCode::RcMediaInvalid,
+                "Unrecognized media container format",
+            )),
         }
     }
 
@@ -3346,10 +3737,20 @@ impl MediaShim {
                 ));
             }
         };
-        let duration_ms = u32::from_le_bytes(bytes[6..10].try_into().expect("duration bytes"));
-        let frame_count = u32::from_le_bytes(bytes[10..14].try_into().expect("frame count bytes"));
-        let audio_block_count =
-            u32::from_le_bytes(bytes[14..18].try_into().expect("audio count bytes"));
+        let duration_ms = Self::read_le_u32(bytes, 6)?;
+        let frame_count = Self::read_le_u32(bytes, 10)?;
+        let audio_block_count = Self::read_le_u32(bytes, 14)?;
+
+        // Bound counts derived from the untrusted header: without a cap,
+        // `decode_golden_clip` would allocate up to 4G SHA-256 strings and
+        // `synthesize_audio_samples` up to 34 GB of audio samples.
+        const MAX_SHIM_COUNT: u32 = 1_000_000;
+        if frame_count > MAX_SHIM_COUNT || audio_block_count > MAX_SHIM_COUNT {
+            return Err(AppError::new(
+                ReasonCode::RcMediaInvalid,
+                "media container counts exceed the supported limit",
+            ));
+        }
 
         // Validate codec combinations per container
         match container {
@@ -3394,6 +3795,25 @@ impl MediaShim {
             frame_count,
             audio_block_count,
         })
+    }
+
+    /// Read a little-endian u32 at `offset` (bounds-checked).
+    fn read_le_u32(bytes: &[u8], offset: usize) -> AppResult<u32> {
+        let end = offset.checked_add(4).ok_or_else(|| {
+            AppError::new(ReasonCode::RcMediaInvalid, "media container offset overflows")
+        })?;
+        if end > bytes.len() {
+            return Err(AppError::new(
+                ReasonCode::RcMediaInvalid,
+                "media container is truncated",
+            ));
+        }
+        Ok(u32::from_le_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ]))
     }
 
     pub fn decode_golden_clip(&self, clip: &GoldenClip) -> AppResult<DecodedClip> {
@@ -3441,14 +3861,25 @@ impl MediaShim {
 
     pub fn ensure_decoder_path_trusted(&self, path: &str) -> AppResult<()> {
         let normalized = normalize_path(path);
-        if normalized.starts_with(&self.ge_root) || normalized.starts_with("builtin://codecs") {
-            Ok(())
-        } else {
-            Err(AppError::new(
-                ReasonCode::RcFsSandboxEscape,
-                format!("untrusted decoder path {path}"),
-            ))
+        // builtin://codecs is a dedicated namespace; match it exactly (or
+        // with a path separator), never as a bare string prefix.
+        if normalized == "builtin://codecs" || normalized.starts_with("builtin://codecs/") {
+            return Ok(());
         }
+        // Lexically resolve "." / ".." and compare component-wise, so
+        // "/root/codecs_evil/..." or "/root/codecs/../evil" cannot bypass
+        // the sandbox.
+        let candidate = resolve_path(&normalized);
+        let root = resolve_path(&self.ge_root);
+        if let Some(rest) = candidate.strip_prefix(&root)
+            && (rest.is_empty() || rest.starts_with('/'))
+        {
+            return Ok(());
+        }
+        Err(AppError::new(
+            ReasonCode::RcFsSandboxEscape,
+            format!("untrusted decoder path {path}"),
+        ))
     }
 }
 
@@ -3503,6 +3934,29 @@ fn synthesize_audio_samples(clip_id: &str, block_count: u32) -> Vec<f32> {
 
 fn normalize_path(path: &str) -> String {
     path.replace('\\', "/").to_ascii_lowercase()
+}
+
+/// Lexically resolve `.` and `..` components in a normalized path.
+///
+/// Purely lexical (no filesystem access); preserves a leading `/`.
+fn resolve_path(path: &str) -> String {
+    let is_absolute = path.starts_with('/');
+    let mut components: Vec<&str> = Vec::new();
+    for component in path.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                components.pop();
+            }
+            c => components.push(c),
+        }
+    }
+    let joined = components.join("/");
+    if is_absolute {
+        format!("/{joined}")
+    } else {
+        joined
+    }
 }
 
 // ===========================================================================
