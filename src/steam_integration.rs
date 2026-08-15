@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
 use std::net::{SocketAddr, ToSocketAddrs};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
@@ -131,7 +131,23 @@ impl SteamBootConfig {
         }
         args.extend(self.launch_args.iter().cloned());
 
-        args.join(" ")
+        args.iter()
+            .map(|a| quote_command_line_arg(a))
+            .collect::<Vec<String>>()
+            .join(" ")
+    }
+}
+
+/// Quote a command-line argument for a joined command line.
+///
+/// Arguments containing whitespace or quotes are wrapped in double quotes
+/// with inner double quotes escaped so that downstream re-parsing does not
+/// split the executable path or argument list.
+fn quote_command_line_arg(arg: &str) -> String {
+    if arg.contains([' ', '\t', '"']) {
+        format!("\"{}\"", arg.replace('"', "\\\""))
+    } else {
+        arg.to_string()
     }
 }
 
@@ -234,9 +250,15 @@ impl SteamEnvironment {
 
         let service_exists = service_exe.exists();
 
-        // Count files in Steam directory
+        // Count files in Steam directory (skipping cache-heavy subtrees that
+        // can contain 100k+ files and turn this into a multi-second walk).
         let file_count = WalkDir::new(steam_dir)
             .into_iter()
+            .filter_entry(|e| {
+                let name = e.file_name().to_string_lossy();
+                !(e.file_type().is_dir()
+                    && (name == "shadercache" || name == "htmlcache" || name == "dumps"))
+            })
             .filter_map(|e: Result<walkdir::DirEntry, _>| e.ok())
             .filter(|e: &walkdir::DirEntry| e.file_type().is_file())
             .count();
@@ -302,6 +324,12 @@ impl SteamNamedPipeManager {
     }
 }
 
+impl Default for SteamNamedPipeManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // SteamService execution
 // ---------------------------------------------------------------------------
@@ -343,9 +371,13 @@ pub struct SteamServiceProcess {
     protocol_handler: Option<SteamProtocolHandler>,
     /// Queue of incoming named-pipe-style requests (CreatePipe / CallNamedPipe).
     pipe_requests: std::collections::VecDeque<(Vec<u8>, Instant)>,
-    /// Tracks whether we've attempted native macOS SteamService.
-    attempted_native: bool,
 }
+
+/// Maximum number of pipe requests retained for debugging before the oldest
+/// entries are dropped. Bounds the `pipe_requests` queue so that every
+/// `CreatePipe` / `CallNamedPipe` request from Steam.exe cannot accumulate
+/// memory indefinitely.
+const MAX_PIPE_REQUESTS: usize = 256;
 
 impl SteamServiceProcess {
     /// Create a new service process tracker for the given GE root.
@@ -361,7 +393,6 @@ impl SteamServiceProcess {
             started_at: Instant::now(),
             protocol_handler: None,
             pipe_requests: std::collections::VecDeque::new(),
-            attempted_native: false,
         }
     }
 
@@ -469,35 +500,49 @@ impl SteamServiceProcess {
             }
         } else {
             // Attempt to execute SteamService.exe via the PE runtime.
+            //
+            // `pe_runtime::execute` runs the guest PE synchronously to
+            // completion, but SteamService.exe is a long-running service.
+            // Run it on a dedicated thread so that `start()` returns
+            // immediately, the service is reported as `Running`, and
+            // `stop()` / pipe responses stay reachable. The thread only
+            // updates logging once the guest exits; it cannot touch `self`
+            // after launch.
             let args: Vec<String> = Vec::new();
             let env = BTreeMap::new();
-            let cwd = self.service_path.parent().unwrap_or(Path::new("."));
-
-            match pe_runtime::execute(
-                &self.service_path,
-                &args,
-                ge,
-                cwd,
-                &env,
-                false, // dtm
-                "steam-service",
-            ) {
-                Ok(result) => {
-                    self.state = if result.exit_code == 0 {
-                        ServiceState::Running
-                    } else {
-                        ServiceState::Error
-                    };
-                    self.started_at = Instant::now();
-                    Ok(())
-                }
-                Err(e) => {
-                    eprintln!("SteamService: PE execution failed: {e}, falling back to stub mode");
-                    self.state = ServiceState::Running;
-                    self.started_at = Instant::now();
-                    Ok(())
-                }
-            }
+            let cwd = self.service_path.parent().unwrap_or(Path::new(".")).to_path_buf();
+            let service_exe = self.service_path.clone();
+            let ge_clone = ge.clone();
+            std::thread::Builder::new()
+                .name("steam-service".to_string())
+                .spawn(move || match pe_runtime::execute(
+                    &service_exe,
+                    &args,
+                    &ge_clone,
+                    &cwd,
+                    &env,
+                    false, // dtm
+                    "steam-service",
+                ) {
+                    Ok(result) => {
+                        eprintln!(
+                            "SteamService: PE service exited with code {}",
+                            result.exit_code
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("SteamService: PE execution failed: {e}");
+                    }
+                })
+                .map_err(|e| {
+                    AppError::new(
+                        ReasonCode::RcRunnerSpawnFailed,
+                        format!("SteamService: failed to spawn service thread: {e}"),
+                    )
+                })?;
+            self.state = ServiceState::Running;
+            self.started_at = Instant::now();
+            Ok(())
         }
     }
 
@@ -512,8 +557,11 @@ impl SteamServiceProcess {
             {
                 // Send SIGTERM
                 let pid = child.id() as i32;
-                unsafe {
-                    libc::kill(pid, libc::SIGTERM);
+                let kill_result = unsafe { libc::kill(pid, libc::SIGTERM) };
+                if kill_result != 0 {
+                    eprintln!(
+                        "SteamService: SIGTERM to PID {pid} failed (errno {kill_result})"
+                    );
                 }
                 // Wait briefly for graceful shutdown
                 for _ in 0..50 {
@@ -534,6 +582,9 @@ impl SteamServiceProcess {
                 }
             }
         }
+        // Reset the recorded PID so `pid()` cannot return a stale value for a
+        // process that is no longer running (e.g. a PE-thread service).
+        self.service_pid = 0;
         self.state = ServiceState::Stopped;
         self.pipe_requests.clear();
         Ok(())
@@ -573,7 +624,11 @@ impl SteamServiceProcess {
             request_type, data_len
         );
 
-        // Queue it as pending
+        // Queue it as pending (bounded: drop the oldest request if the queue
+        // is full so untrusted guest traffic cannot grow memory unboundedly).
+        if self.pipe_requests.len() >= MAX_PIPE_REQUESTS {
+            self.pipe_requests.pop_front();
+        }
         self.pipe_requests
             .push_back((request.to_vec(), Instant::now()));
 
@@ -724,18 +779,20 @@ impl SteamProtocolIntegration {
             }
             SteamProtocolDispatchResult::LaunchGame(app_id, action) => {
                 eprintln!(
-                    "[SteamProtocol] Launching game {app_id} (action={:?})",
+                    "[SteamProtocol] Launching game {app_id} (action={:?}) — NOT IMPLEMENTED",
                     action.unwrap_or_default()
                 );
                 // In a full implementation, this would trigger the Phase 4
-                // AAA Game Execution Pipeline to launch the game.
-                true
+                // AAA Game Execution Pipeline to launch the game. Until the
+                // backing subsystem is wired, report failure so callers can
+                // fall back.
+                false
             }
             SteamProtocolDispatchResult::NavigateBrowser(url) => {
-                eprintln!("[SteamProtocol] Navigating browser to: {url}");
+                eprintln!("[SteamProtocol] Navigating browser to: {url} — NOT IMPLEMENTED");
                 // This would use CEF bridge (cef_bridge.rs) to navigate the
                 // Steam overlay or main browser to the given URL.
-                true
+                false
             }
             SteamProtocolDispatchResult::ShowFriends => {
                 eprintln!("[SteamProtocol] Opening friends list");
@@ -746,9 +803,9 @@ impl SteamProtocolIntegration {
                 true
             }
             SteamProtocolDispatchResult::InstallGame(app_id) => {
-                eprintln!("[SteamProtocol] Installing game {app_id}");
+                eprintln!("[SteamProtocol] Installing game {app_id} — NOT IMPLEMENTED");
                 // This would trigger the CDN download pipeline.
-                true
+                false
             }
             SteamProtocolDispatchResult::Unrecognized(cmd) => {
                 eprintln!("[SteamProtocol] Unrecognized command: {cmd}");
@@ -795,9 +852,16 @@ pub struct SteamIpcManager {
     service: Option<SteamServiceProcess>,
     /// Optional TCP listener (acceptor side).
     listener: Option<std::net::TcpListener>,
-    /// Optional active stream.
-    stream: Option<std::net::TcpStream>,
 }
+
+/// Maximum accepted size of a single length-prefixed IPC message. Guards
+/// against unbounded allocations driven by an attacker-controlled length
+/// prefix on the loopback socket (the listener is reachable by any local
+/// process).
+const MAX_IPC_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
+
+/// How long `send_message` waits for a response header before giving up.
+const IPC_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl SteamIpcManager {
     /// Create a new TCP-based IPC manager.
@@ -807,7 +871,6 @@ impl SteamIpcManager {
             enabled: true,
             service: Some(SteamServiceProcess::new(ge_root)),
             listener: None,
-            stream: None,
         }
     }
 
@@ -843,7 +906,6 @@ impl SteamIpcManager {
 
     /// Stop the IPC system: stops the service and drops the listener.
     pub fn stop(&mut self) -> AppResult<()> {
-        self.stream = None;
         self.listener = None;
         if let Some(ref mut svc) = self.service {
             svc.stop()?;
@@ -856,9 +918,22 @@ impl SteamIpcManager {
     /// If no connection is active, this attempts to connect to the local
     /// loopback port. The message is prefixed with a 4-byte length header
     /// (little-endian u32) for framing.
+    ///
+    /// The response read is bounded by `IPC_RESPONSE_TIMEOUT` and the
+    /// response length is capped at `MAX_IPC_MESSAGE_SIZE`, so a missing
+    /// responder or a hostile peer can never block or exhaust this process.
     pub fn send_message(&self, msg: &[u8]) -> AppResult<Vec<u8>> {
         if !self.enabled {
             return Ok(Vec::new());
+        }
+        if msg.len() > MAX_IPC_MESSAGE_SIZE {
+            return Err(AppError::new(
+                ReasonCode::RcRequestBodyTooLarge,
+                format!(
+                    "SteamIpcManager: outgoing message too large ({} bytes, max {MAX_IPC_MESSAGE_SIZE})",
+                    msg.len()
+                ),
+            ));
         }
 
         let addr = format!("127.0.0.1:{}", self.port);
@@ -866,6 +941,12 @@ impl SteamIpcManager {
             AppError::new(
                 ReasonCode::RcNetConnectionFailed,
                 format!("SteamIpcManager: connect to {addr} failed: {e}"),
+            )
+        })?;
+        stream.set_read_timeout(Some(IPC_RESPONSE_TIMEOUT)).map_err(|e| {
+            AppError::new(
+                ReasonCode::RcNetSocketCreateFailed,
+                format!("SteamIpcManager: failed to set read timeout: {e}"),
             )
         })?;
 
@@ -890,17 +971,28 @@ impl SteamIpcManager {
         stream.read_exact(&mut len_buf).map_err(|e| {
             AppError::new(
                 ReasonCode::RcNetReadFailed,
-                format!("SteamIpcManager: read header failed: {e}"),
+                format!(
+                    "SteamIpcManager: read response header failed (no responder on port {}?): {e}",
+                    self.port
+                ),
             )
         })?;
 
         let response_len = u32::from_le_bytes(len_buf) as usize;
+        if response_len > MAX_IPC_MESSAGE_SIZE {
+            return Err(AppError::new(
+                ReasonCode::RcRequestBodyTooLarge,
+                format!(
+                    "SteamIpcManager: response length {response_len} exceeds limit {MAX_IPC_MESSAGE_SIZE}"
+                ),
+            ));
+        }
         let mut response = vec![0u8; response_len];
         if response_len > 0 {
             stream.read_exact(&mut response).map_err(|e| {
                 AppError::new(
                     ReasonCode::RcNetReadFailed,
-                    format!("SteamIpcManager: read body failed: {e}"),
+                    format!("SteamIpcManager: read response body failed: {e}"),
                 )
             })?;
         }
@@ -908,11 +1000,15 @@ impl SteamIpcManager {
         Ok(response)
     }
 
-    /// Receive an IPC message.
+    /// Receive an IPC message (responder side).
     ///
     /// If a listener is active, this accepts an incoming connection and reads
-    /// a length-prefixed message from it.
-    pub fn receive_message(&self) -> AppResult<Vec<u8>> {
+    /// a length-prefixed message from it. Unlike the previous behaviour, the
+    /// request is answered: the peer's length-prefixed request is handed to
+    /// the SteamService stub protocol (`handle_pipe_request`) and the reply
+    /// is written back over the same connection, so a paired
+    /// `send_message` call completes instead of hanging forever.
+    pub fn receive_message(&mut self) -> AppResult<Vec<u8>> {
         if !self.enabled {
             return Ok(Vec::new());
         }
@@ -920,7 +1016,13 @@ impl SteamIpcManager {
         if let Some(ref listener) = self.listener {
             match listener.accept() {
                 Ok((mut stream, _)) => {
-                    use std::io::Read;
+                    use std::io::{Read, Write};
+                    // Bound how long a single request may stall this
+                    // responder; a peer that connects but never sends must
+                    // not block the caller indefinitely.
+                    if let Err(e) = stream.set_read_timeout(Some(IPC_RESPONSE_TIMEOUT)) {
+                        eprintln!("SteamIpcManager: failed to set read timeout: {e}");
+                    }
                     let mut len_buf = [0u8; 4];
                     stream.read_exact(&mut len_buf).map_err(|e| {
                         AppError::new(
@@ -930,6 +1032,14 @@ impl SteamIpcManager {
                     })?;
 
                     let msg_len = u32::from_le_bytes(len_buf) as usize;
+                    if msg_len > MAX_IPC_MESSAGE_SIZE {
+                        return Err(AppError::new(
+                            ReasonCode::RcRequestBodyTooLarge,
+                            format!(
+                                "SteamIpcManager: received length {msg_len} exceeds limit {MAX_IPC_MESSAGE_SIZE}"
+                            ),
+                        ));
+                    }
                     let mut msg = vec![0u8; msg_len];
                     if msg_len > 0 {
                         stream.read_exact(&mut msg).map_err(|e| {
@@ -939,6 +1049,26 @@ impl SteamIpcManager {
                             )
                         })?;
                     }
+
+                    // Reply to the peer so request/response round-trips work.
+                    let response = self
+                        .service
+                        .as_mut()
+                        .map(|svc| svc.handle_pipe_request(&msg))
+                        .unwrap_or_default();
+                    if response.len() > MAX_IPC_MESSAGE_SIZE {
+                        return Err(AppError::new(
+                            ReasonCode::RcRequestBodyTooLarge,
+                            "SteamIpcManager: response too large",
+                        ));
+                    }
+                    let mut reply = Vec::with_capacity(4 + response.len());
+                    reply.extend_from_slice(&(response.len() as u32).to_le_bytes());
+                    reply.extend_from_slice(&response);
+                    if let Err(e) = stream.write_all(&reply) {
+                        eprintln!("SteamIpcManager: failed to write response: {e}");
+                    }
+
                     Ok(msg)
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -989,9 +1119,17 @@ impl SteamLibraryScanner {
                 let name = entry.file_name().to_string_lossy().to_string();
                 let install_dir = entry.path();
 
-                // Calculate total size
+                // Calculate total size (skipping cache-heavy subtrees such as
+                // shadercache/htmlcache that can contain 100k+ files).
                 let size_bytes = WalkDir::new(&install_dir)
                     .into_iter()
+                    .filter_entry(|e| {
+                        let name = e.file_name().to_string_lossy();
+                        !(e.file_type().is_dir()
+                            && (name == "shadercache"
+                                || name == "htmlcache"
+                                || name == "dumps"))
+                    })
                     .filter_map(|e: Result<walkdir::DirEntry, _>| e.ok())
                     .filter(|e: &walkdir::DirEntry| e.file_type().is_file())
                     .filter_map(|e: walkdir::DirEntry| e.metadata().ok())
@@ -1017,26 +1155,49 @@ impl SteamLibraryScanner {
 // ---------------------------------------------------------------------------
 
 /// Parse a Steam app manifest (appmanifest_*.acf) file.
+///
+/// The parser is block-aware: key/value pairs are only recorded at brace
+/// depth 0/1, so nested-block keys (e.g. `"InstalledDepots" { "480000" ... }`)
+/// no longer pollute the flat result map.
 pub fn parse_app_manifest(content: &str) -> AppResult<BTreeMap<String, String>> {
     let mut result = BTreeMap::new();
+    let mut depth: i64 = 0;
     let mut current_key = String::new();
     let mut in_value = false;
 
     for line in content.lines() {
         let line = line.trim();
 
-        if line.starts_with('"') {
+        // Count braces outside of quoted strings on this line, and the depth
+        // at the start of the line (i.e. the block the line belongs to).
+        let mut line_depth_delta: i64 = 0;
+        let mut in_quote = false;
+        for ch in line.chars() {
+            match ch {
+                '"' => in_quote = !in_quote,
+                '{' if !in_quote => line_depth_delta += 1,
+                '}' if !in_quote => line_depth_delta -= 1,
+                _ => {}
+            }
+        }
+        let line_depth = depth;
+        depth += line_depth_delta;
+        let is_brace_line = line_depth_delta != 0;
+
+        if line.starts_with('"') && !is_brace_line {
             let parts: Vec<&str> = line.splitn(5, '"').collect();
             if parts.len() >= 5 {
-                let key = parts[1];
-                let value = parts[3];
-                result.insert(key.to_string(), value.to_string());
-                in_value = false;
-            } else if parts.len() >= 2 {
+                if line_depth <= 1 {
+                    let key = parts[1];
+                    let value = parts[3];
+                    result.insert(key.to_string(), value.to_string());
+                    in_value = false;
+                }
+            } else if parts.len() >= 2 && line_depth <= 1 {
                 current_key = parts[1].to_string();
                 in_value = true;
             }
-        } else if in_value && !line.is_empty() {
+        } else if in_value && !line.is_empty() && !is_brace_line {
             // Continuation of a multi-line value — append to current key
             if let Some(val) = result.get_mut(&current_key) {
                 val.push(' ');
@@ -1046,6 +1207,50 @@ pub fn parse_app_manifest(content: &str) -> AppResult<BTreeMap<String, String>> 
     }
 
     Ok(result)
+}
+
+/// Validate a relative path coming from an untrusted source (sync-server
+/// listing, depot manifest, or guest FFI).
+///
+/// Rejects empty paths, absolute paths, and any `..` component so that
+/// joining the path with a base directory can never escape that directory.
+fn is_safe_rel_path(rel_path: &str) -> bool {
+    if rel_path.is_empty() {
+        return false;
+    }
+    let mut seen_normal = false;
+    for component in Path::new(rel_path).components() {
+        match component {
+            Component::ParentDir => return false,
+            Component::RootDir | Component::Prefix(_) => return false,
+            Component::Normal(c) if c.is_empty() => return false,
+            Component::Normal(_) => seen_normal = true,
+            Component::CurDir => {}
+        }
+    }
+    seen_normal
+}
+
+/// Percent-encode a string for use as a single URL path segment.
+///
+/// Leaves RFC 3986 unreserved characters (`A-Z a-z 0-9 - . _ ~`) untouched
+/// and encodes everything else, so file names containing spaces, `#`, `?`,
+/// `%`, etc. cannot produce malformed or misrouted cloud-sync requests.
+fn percent_encode(segment: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(segment.len());
+    for &byte in segment.as_bytes() {
+        let unreserved = byte.is_ascii_alphanumeric()
+            || matches!(byte, b'-' | b'.' | b'_' | b'~');
+        if unreserved {
+            out.push(byte as char);
+        } else {
+            out.push('%');
+            out.push(HEX[(byte >> 4) as usize] as char);
+            out.push(HEX[(byte & 0x0F) as usize] as char);
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1129,15 +1334,22 @@ impl SteamClient {
         self.stack.connect(server)?;
 
         // Step 2: Encryption handshake is performed by connect()
-        assert_eq!(self.stack.state, ConnectionState::Ready);
+        if self.stack.state != ConnectionState::Ready {
+            return Err(AppError::new(
+                ReasonCode::RcNetProtocolError,
+                format!(
+                    "SteamClient: connect returned without reaching Ready state (state={:?})",
+                    self.stack.state
+                ),
+            ));
+        }
 
         // Capture the RSA public key from the CM handshake for real
         // RSA-OAEP password encryption.
         self.rsa_public_key = self.stack.rsa_public_key().cloned();
 
-        // Step 3: Encrypt the password using RSA-OAEP (falling back to
-        // AES session key encryption if the RSA key is unavailable).
-        let password_encrypted = self.encrypt_password(password);
+        // Step 3: Encrypt the password using RSA-OAEP.
+        let password_encrypted = self.encrypt_password(password)?;
 
         // Step 4: Send logon message
         self.stack.send_logon(username, &password_encrypted)?;
@@ -1212,43 +1424,33 @@ impl SteamClient {
     /// Encrypt the password for the logon message using RSA-OAEP.
     ///
     /// The real Steam protocol encrypts the password with the CM server's RSA
-    /// public key using RSA-OAEP (SHA-256). This replaces the previous simplified
-    /// XOR-with-session-key approach.
-    ///
-    /// Fallback chain:
-    ///   1. RSA-OAEP with the CM server's public key (real Steam behavior)
-    ///   2. AES session key encryption (XOR with derived session key)
-    ///   3. Raw bytes (no encryption) — only if neither key is available
-    fn encrypt_password(&self, password: &str) -> Vec<u8> {
+    /// public key using RSA-OAEP (SHA-256). If no server RSA key is
+    /// available, the login is refused: the password is never transmitted
+    /// unencrypted (raw bytes or trivially reversible XOR are not
+    /// encryption).
+    fn encrypt_password(&self, password: &str) -> AppResult<Vec<u8>> {
         let pw_bytes = password.as_bytes();
 
-        // Primary: RSA-OAEP (SHA-256) with the CM server's public key.
+        // RSA-OAEP (SHA-256) with the CM server's public key.
         if let Some(ref pub_key) = self.rsa_public_key {
             use rsa::Oaep;
             use sha2::Sha256;
             let padding = Oaep::new::<Sha256>();
             match pub_key.encrypt(&mut rand::thread_rng(), padding, pw_bytes) {
-                Ok(encrypted) => return encrypted,
+                Ok(encrypted) => return Ok(encrypted),
                 Err(e) => {
-                    eprintln!(
-                        "SteamClient: RSA-OAEP password encryption failed: {e}, \
-                         falling back to AES session key encryption"
-                    );
+                    return Err(AppError::new(
+                        ReasonCode::RcCryptoInvalid,
+                        format!("SteamClient: RSA-OAEP password encryption failed: {e}"),
+                    ));
                 }
             }
         }
 
-        // Fallback: AES session key encryption (XOR with session key).
-        if let Some(ref key) = self.stack.session_key() {
-            return pw_bytes
-                .iter()
-                .enumerate()
-                .map(|(i, b)| b ^ key[i % key.len()])
-                .collect::<Vec<u8>>();
-        }
-
-        // Last resort: send raw bytes (no encryption).
-        pw_bytes.to_vec()
+        Err(AppError::new(
+            ReasonCode::RcCryptoInvalid,
+            "SteamClient: no encryption key available — refusing to send plaintext password",
+        ))
     }
 
     /// Download all files for a given app from Steam's CDN.
@@ -1283,6 +1485,16 @@ impl SteamClient {
                     let manifests = self.stack.parse_depot_manifest(&msg.payload, None)?;
 
                     for manifest in &manifests {
+                        // The manifest comes from the CM server (untrusted
+                        // network data); refuse entries whose filename could
+                        // escape `output_dir` (absolute paths or `..`).
+                        if !is_safe_rel_path(&manifest.filename) {
+                            eprintln!(
+                                "SteamClient: skipping depot manifest entry with unsafe filename {:?}",
+                                manifest.filename
+                            );
+                            continue;
+                        }
                         let file_output = output_dir.join(&manifest.filename);
 
                         // Try to find a content server to download from
@@ -1319,12 +1531,27 @@ impl SteamClient {
         // Ensure GNS is initialized
         let gns = self.gns.get_or_insert_with(GameNetworkingSockets::new);
 
-        // Reuse an existing session for this peer, or create a new one
-        if !self.lobby_sessions.contains_key(&target_steam_id) {
-            let handle = gns.create_session()?;
-            self.lobby_sessions.insert(target_steam_id, handle);
+        // The session map is capped so long-running sessions cannot grow
+        // without bound; the oldest peer session is evicted first (only for
+        // new peers — an existing session is never evicted).
+        const MAX_LOBBY_SESSIONS: usize = 256;
+        if !self.lobby_sessions.contains_key(&target_steam_id)
+            && self.lobby_sessions.len() >= MAX_LOBBY_SESSIONS
+        {
+            let oldest = self.lobby_sessions.keys().next().copied();
+            if let Some(oldest) = oldest {
+                if let Err(err) = gns.close_session(oldest) {
+                    eprintln!("SteamClient: failed to close evicted GNS session: {err}");
+                }
+                self.lobby_sessions.remove(&oldest);
+            }
         }
-        let handle = self.lobby_sessions[&target_steam_id];
+
+        // Reuse an existing session for this peer, or create a new one.
+        let handle = match self.lobby_sessions.entry(target_steam_id) {
+            std::collections::hash_map::Entry::Occupied(e) => *e.get(),
+            std::collections::hash_map::Entry::Vacant(e) => *e.insert(gns.create_session()?),
+        };
 
         // Send the message through the established session
         gns.send_message(handle, data, 0)?;
@@ -1390,15 +1617,15 @@ impl SteamClient {
         }
 
         // Also poll GNS messages if initialized
-        if let Some(ref mut gns) = self.gns {
-            if let Ok(gns_messages) = gns.poll_incoming_messages() {
-                for gns_msg in &gns_messages {
-                    // GNS messages could be chat, game data, etc.
-                    notifications.push(SteamNotification::ChatMessage {
-                        steam_id: gns_msg.sender_id,
-                        message: format!("GNS message ({} bytes)", gns_msg.data.len()),
-                    });
-                }
+        if let Some(gns) = self.gns.as_mut()
+            && let Ok(gns_messages) = gns.poll_incoming_messages()
+        {
+            for gns_msg in &gns_messages {
+                // GNS messages could be chat, game data, etc.
+                notifications.push(SteamNotification::ChatMessage {
+                    steam_id: gns_msg.sender_id,
+                    message: format!("GNS message ({} bytes)", gns_msg.data.len()),
+                });
             }
         }
 
@@ -1415,6 +1642,12 @@ impl SteamClient {
         let servers = self.stack.parse_cdn_routing(routing_body)?;
         self.content_servers = servers;
         Ok(())
+    }
+}
+
+impl Default for SteamClient {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -1599,11 +1832,42 @@ impl SteamNetworkingSockets {
     }
 
     /// Receive messages on a listen socket (incoming connections and data).
+    ///
+    /// Messages are filtered to the connections that belong to this listen
+    /// socket so that one game polling its own listen socket cannot consume
+    /// messages intended for another listen socket / connection. Connections
+    /// are claimed by the first listen socket that observes a message from
+    /// them.
     pub fn receive_messages_on_listen_socket(
         &mut self,
-        _listen_handle: ListenSocketHandle,
+        listen_handle: ListenSocketHandle,
     ) -> AppResult<Vec<SteamNetworkingMessage>> {
-        self.gns.poll_incoming_messages()
+        if !self.listen_sockets.contains_key(&listen_handle) {
+            return Err(AppError::new(
+                ReasonCode::RcCliInvalid,
+                format!("SteamNetworkingSockets: unknown listen socket {listen_handle}"),
+            ));
+        }
+
+        let messages = self.gns.poll_incoming_messages()?;
+        let mut result = Vec::with_capacity(messages.len());
+        for msg in messages {
+            // Claim unowned connections for this listen socket so messages
+            // are not cross-delivered between sockets.
+            let is_owned_elsewhere = self.listen_sockets.iter().any(|(handle, (_, conns))| {
+                *handle != listen_handle && conns.contains(&msg.conn)
+            });
+            if !is_owned_elsewhere
+                && let Some((_, conns)) = self.listen_sockets.get_mut(&listen_handle)
+                && !conns.contains(&msg.conn)
+            {
+                conns.push(msg.conn);
+            }
+            if !is_owned_elsewhere {
+                result.push(msg);
+            }
+        }
+        Ok(result)
     }
 
     /// Close a connection.
@@ -1650,13 +1914,32 @@ impl SteamNetworkingSockets {
     }
 
     /// Get detailed status information for a connection.
+    ///
+    /// Merges the tracked per-connection details (ping, quality, rates,
+    /// pending counts) with the live GNS connection state.
     pub fn get_connection_status(
         &self,
         handle: SocketsConnectionHandle,
     ) -> AppResult<SteamNetworkingConnectionStatus> {
         let state = self.gns.connection_state(handle as GnsConnectionHandle);
+        let detail = self.connection_details.get(&handle);
         Ok(SteamNetworkingConnectionStatus {
             state: state.map(|s| s as i32).unwrap_or(0),
+            ping: detail.map(|d| d.ping_ms).unwrap_or(0),
+            connection_quality_local: detail
+                .map(|d| d.connection_quality_local)
+                .unwrap_or(1.0),
+            connection_quality_remote: detail
+                .map(|d| d.connection_quality_remote)
+                .unwrap_or(1.0),
+            out_packets_per_sec: detail.map(|d| d.out_packets_per_sec).unwrap_or(0.0),
+            in_packets_per_sec: detail.map(|d| d.in_packets_per_sec).unwrap_or(0.0),
+            send_rate_bytes_per_sec: detail
+                .map(|d| d.send_rate_bytes_per_sec as i32)
+                .unwrap_or(0),
+            pending_unreliable: detail.map(|d| d.pending_unreliable as i32).unwrap_or(0),
+            pending_reliable: detail.map(|d| d.pending_reliable as i32).unwrap_or(0),
+            sent_unacked_reliable: detail.map(|d| d.sent_unacked_reliable as i32).unwrap_or(0),
             ..Default::default()
         })
     }
@@ -1681,14 +1964,21 @@ impl SteamNetworkingSockets {
     /// This is the connection-less variant used for P2P networking.
     pub fn create_listen_socket(&mut self) -> AppResult<ListenSocketHandle> {
         // Bind to 0.0.0.0:0 (OS-assigned ephemeral port) without STUN
-        let addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
+        let addr: SocketAddr = "0.0.0.0:0".parse().map_err(|e| {
+            AppError::new(
+                ReasonCode::RcPortParseError,
+                format!("SteamNetworkingSockets: failed to parse ephemeral bind address: {e}"),
+            )
+        })?;
         self.create_listen_socket_ip(Some(addr), false)
     }
 
     /// Flush any pending outgoing messages on a connection.
     ///
     /// Immediately sends all queued pending messages through the GNS layer.
-    /// Returns the number of bytes flushed on success.
+    /// Returns the number of bytes flushed on success. If a send fails
+    /// partway, the unsent remainder is re-queued for a later retry instead
+    /// of being dropped.
     pub fn flush_message_on_connection(
         &mut self,
         conn_handle: SocketsConnectionHandle,
@@ -1696,14 +1986,29 @@ impl SteamNetworkingSockets {
     ) -> AppResult<u64> {
         let mut total_bytes: u64 = 0;
         if let Some(pending) = self.pending_outgoing.remove(&conn_handle) {
-            for data in &pending {
-                self.gns.send_message(conn_handle, data, channel)?;
+            for (i, data) in pending.iter().enumerate() {
+                if let Err(e) = self.gns.send_message(conn_handle, data, channel) {
+                    // Re-queue everything from the first failed message on;
+                    // already-sent messages are gone but nothing is lost
+                    // silently.
+                    if i < pending.len() {
+                        self.pending_outgoing
+                            .entry(conn_handle)
+                            .or_default()
+                            .extend_from_slice(&pending[i..]);
+                    }
+                    return Err(e);
+                }
                 total_bytes += data.len() as u64;
             }
         }
         // Update connection state metrics after flushing.
         if let Some(detail) = self.connection_details.get_mut(&conn_handle) {
-            detail.pending_reliable = 0;
+            detail.pending_reliable = self
+                .pending_outgoing
+                .get(&conn_handle)
+                .map(|v| v.len() as u32)
+                .unwrap_or(0);
         }
         Ok(total_bytes)
     }
@@ -1717,10 +2022,19 @@ impl SteamNetworkingSockets {
         use_flush: bool,
     ) -> AppResult<()> {
         if use_flush {
-            self.pending_outgoing
-                .entry(conn_handle)
-                .or_default()
-                .push(data.to_vec());
+            // Bound the per-connection queue so an unflushed producer cannot
+            // grow memory without limit.
+            const MAX_PENDING_PER_CONNECTION: usize = 1024;
+            let queue = self.pending_outgoing.entry(conn_handle).or_default();
+            if queue.len() >= MAX_PENDING_PER_CONNECTION {
+                return Err(AppError::new(
+                    ReasonCode::RcSocketReceiveQueueFull,
+                    format!(
+                        "SteamNetworkingSockets: pending queue full for connection {conn_handle} (max {MAX_PENDING_PER_CONNECTION})"
+                    ),
+                ));
+            }
+            queue.push(data.to_vec());
             if let Some(detail) = self.connection_details.get_mut(&conn_handle) {
                 detail.pending_reliable = self
                     .pending_outgoing
@@ -1735,7 +2049,17 @@ impl SteamNetworkingSockets {
     }
 }
 
+impl Default for SteamNetworkingSockets {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Detailed status of a Steam networking connection.
+///
+/// Field types match `SteamNetworkingConnectionStatus_t` from the Steam SDK
+/// (`int` for the rate/count fields) so the layout exported to guest binaries
+/// via FFI is exact.
 #[derive(Debug, Clone, Default)]
 #[repr(C)]
 pub struct SteamNetworkingConnectionStatus {
@@ -1745,10 +2069,10 @@ pub struct SteamNetworkingConnectionStatus {
     pub connection_quality_remote: f32,
     pub out_packets_per_sec: f32,
     pub in_packets_per_sec: f32,
-    pub send_rate_bytes_per_sec: u32,
-    pub pending_unreliable: u32,
-    pub pending_reliable: u32,
-    pub sent_unacked_reliable: u32,
+    pub send_rate_bytes_per_sec: i32,
+    pub pending_unreliable: i32,
+    pub pending_reliable: i32,
+    pub sent_unacked_reliable: i32,
     pub usec_queue_time: u64,
 }
 
@@ -1804,6 +2128,21 @@ impl SteamNetworkingMessages {
         let handle = match self.sessions.get(&steam_id) {
             Some(&h) => h,
             None => {
+                // Bound the session table so long-running peers cannot grow
+                // memory without limit; the oldest session is evicted first.
+                const MAX_USER_SESSIONS: usize = 256;
+                while self.sessions.len() >= MAX_USER_SESSIONS {
+                    if let Some((oldest, _)) =
+                        self.sessions.iter().next().map(|(k, v)| (*k, *v))
+                    {
+                        if let Err(err) = self.gns.close_session(oldest) {
+                            eprintln!(
+                                "SteamNetworkingMessages: failed to close evicted session: {err}"
+                            );
+                        }
+                        self.sessions.remove(&oldest);
+                    }
+                }
                 let h = self.gns.create_session()?;
                 self.sessions.insert(steam_id, h);
                 h
@@ -1836,6 +2175,12 @@ impl SteamNetworkingMessages {
             self.gns.close_session(handle)?;
         }
         Ok(())
+    }
+}
+
+impl Default for SteamNetworkingMessages {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -1992,8 +2337,10 @@ pub fn with_steam_overlay<F, R>(f: F) -> R
 where
     F: FnOnce(&mut SteamOverlayManager) -> R,
 {
-    let mut guard = GLOBAL_STEAM_OVERLAY.lock().unwrap();
-    f(&mut *guard)
+    // Recover from a poisoned lock (a previous panic while holding it) so
+    // overlay callbacks never become fatal.
+    let mut guard = GLOBAL_STEAM_OVERLAY.lock().unwrap_or_else(|e| e.into_inner());
+    f(&mut guard)
 }
 
 /// Poll keyboard state for Shift+Tab detection (call once per frame).
@@ -2053,9 +2400,11 @@ pub fn steam_overlay_forward_key_event(key_code: u16, key_char: Option<char>, do
     }
 
     let event_type = if down { "keydown" } else { "keyup" };
+    // JSON-encode the key so quotes/backslashes can never break out of the
+    // generated JavaScript string literal.
     let key_str = key_char
-        .map(|c| format!("'{}'", c))
-        .unwrap_or_else(|| "''".to_string());
+        .map(|c| serde_json::to_string(&c.to_string()).unwrap_or_else(|_| "\"\"".to_string()))
+        .unwrap_or_else(|| "\"\"".to_string());
 
     let js = format!(
         r#"(function() {{
@@ -2075,10 +2424,10 @@ pub fn steam_overlay_forward_key_event(key_code: u16, key_char: Option<char>, do
     );
 
     crate::cef_bridge::with_global_cef_bridge(|bridge| {
-        if let Some(handle) = bridge.overlay_browser_handle() {
-            if let Err(e) = bridge.cef_frame_execute_java_script(handle, 1, &js) {
-                eprintln!("steam_overlay_forward_key_event: JS exec failed: {e}");
-            }
+        if let Some(handle) = bridge.overlay_browser_handle()
+            && let Err(e) = bridge.cef_frame_execute_java_script(handle, 1, &js)
+        {
+            eprintln!("steam_overlay_forward_key_event: JS exec failed: {e}");
         }
     });
 }
@@ -2106,10 +2455,10 @@ pub fn steam_overlay_forward_mouse_move(x: f64, y: f64) {
     );
 
     crate::cef_bridge::with_global_cef_bridge(|bridge| {
-        if let Some(handle) = bridge.overlay_browser_handle() {
-            if let Err(e) = bridge.cef_frame_execute_java_script(handle, 1, &js) {
-                eprintln!("steam_overlay_forward_mouse_move: JS exec failed: {e}");
-            }
+        if let Some(handle) = bridge.overlay_browser_handle()
+            && let Err(e) = bridge.cef_frame_execute_java_script(handle, 1, &js)
+        {
+            eprintln!("steam_overlay_forward_mouse_move: JS exec failed: {e}");
         }
     });
 }
@@ -2144,10 +2493,10 @@ pub fn steam_overlay_forward_mouse_button(x: f64, y: f64, button: i32, down: boo
     );
 
     crate::cef_bridge::with_global_cef_bridge(|bridge| {
-        if let Some(handle) = bridge.overlay_browser_handle() {
-            if let Err(e) = bridge.cef_frame_execute_java_script(handle, 1, &js) {
-                eprintln!("steam_overlay_forward_mouse_button: JS exec failed: {e}");
-            }
+        if let Some(handle) = bridge.overlay_browser_handle()
+            && let Err(e) = bridge.cef_frame_execute_java_script(handle, 1, &js)
+        {
+            eprintln!("steam_overlay_forward_mouse_button: JS exec failed: {e}");
         }
     });
 }
@@ -2180,10 +2529,10 @@ pub fn steam_overlay_forward_mouse_wheel(x: f64, y: f64, delta_x: f64, delta_y: 
     );
 
     crate::cef_bridge::with_global_cef_bridge(|bridge| {
-        if let Some(handle) = bridge.overlay_browser_handle() {
-            if let Err(e) = bridge.cef_frame_execute_java_script(handle, 1, &js) {
-                eprintln!("steam_overlay_forward_mouse_wheel: JS exec failed: {e}");
-            }
+        if let Some(handle) = bridge.overlay_browser_handle()
+            && let Err(e) = bridge.cef_frame_execute_java_script(handle, 1, &js)
+        {
+            eprintln!("steam_overlay_forward_mouse_wheel: JS exec failed: {e}");
         }
     });
 }
@@ -2191,6 +2540,29 @@ pub fn steam_overlay_forward_mouse_wheel(x: f64, y: f64, delta_x: f64, delta_y: 
 // ---------------------------------------------------------------------------
 // K1 — ISteamUserStats (Achievements, Stats, Leaderboards)
 // ---------------------------------------------------------------------------
+
+/// Current app id for per-app config file scoping.
+///
+/// Set via `SteamUserStats::set_app_id` / `SteamFriends::set_app_id` (or the
+/// shared `set_steam_config_app_id`) so stats/friends data from different
+/// games does not overwrite one another in the shared config directory.
+static CONFIG_APP_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Set the app id used to scope persisted Steam config files (stats, friends).
+pub fn set_steam_config_app_id(app_id: u32) {
+    CONFIG_APP_ID.store(app_id, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Build a per-app config file name, e.g. `user_stats_480.json` when an app
+/// id is set, or `user_stats.json` for the default (unset) app.
+fn app_scoped_config_name(base: &str) -> String {
+    let app_id = CONFIG_APP_ID.load(std::sync::atomic::Ordering::Relaxed);
+    if app_id == 0 {
+        base.to_string()
+    } else {
+        format!("{base}_{app_id}")
+    }
+}
 
 /// A single leaderboard entry returned by `DownloadLeaderboardEntries`.
 #[derive(Debug, Clone)]
@@ -2240,7 +2612,13 @@ impl SteamUserStats {
             .join("Application Support")
             .join("Casa1")
             .join("config")
-            .join("user_stats.json")
+            .join(format!("{}.json", app_scoped_config_name("user_stats")))
+    }
+
+    /// Set the app id used to scope this user's persisted stats file, so
+    /// different games do not overwrite each other's achievements/leaderboards.
+    pub fn set_app_id(app_id: u32) {
+        set_steam_config_app_id(app_id);
     }
 
     fn load_from_config(&mut self) {
@@ -2278,11 +2656,12 @@ impl SteamUserStats {
             achievement_progress: self.achievement_progress.clone(),
         };
         let path = Self::config_path();
-        if let Some(parent) = path.parent() {
-            if let Err(e) = fs::create_dir_all(parent) {
-                eprintln!("SteamUserStats: failed to create config dir: {e}");
-                return;
-            }
+        let Some(parent) = path.parent() else {
+            return;
+        };
+        if let Err(e) = fs::create_dir_all(parent) {
+            eprintln!("SteamUserStats: failed to create config dir: {e}");
+            return;
         }
         match serde_json::to_string_pretty(&snapshot) {
             Ok(json) => {
@@ -2344,9 +2723,9 @@ impl SteamUserStats {
     }
 
     pub fn get_achievement_name(&self, idx: usize) -> Option<&str> {
-        let mut keys: Vec<&str> = self.achievements.keys().map(|s| s.as_str()).collect();
-        keys.sort();
-        keys.get(idx).copied()
+        // BTreeMap keys are already sorted; step the iterator directly to
+        // avoid per-call allocation and sorting in this hot getter.
+        self.achievements.keys().nth(idx).map(|s| s.as_str())
     }
 
     pub fn indicate_achievement_icon(&mut self, _name: &str) -> bool {
@@ -2405,9 +2784,9 @@ impl SteamUserStats {
         let board = self
             .leaderboards
             .entry(name.to_string())
-            .or_insert_with(Vec::new);
+            .or_default();
         board.push((score, 0, details));
-        board.sort_by(|a, b| b.0.cmp(&a.0));
+        board.sort_by_key(|e| std::cmp::Reverse(e.0));
         self.save_to_config();
         Ok(())
     }
@@ -2438,9 +2817,8 @@ impl SteamUserStats {
     }
 
     pub fn get_leaderboard_name(&self, idx: usize) -> Option<&str> {
-        let mut keys: Vec<&str> = self.leaderboards.keys().map(|s| s.as_str()).collect();
-        keys.sort();
-        keys.get(idx).copied()
+        // BTreeMap keys are already sorted; avoid per-call allocation/sort.
+        self.leaderboards.keys().nth(idx).map(|s| s.as_str())
     }
 
     pub fn attach_leaderboard_ugc(&mut self, _name: &str, _ugc_handle: u64) -> AppResult<()> {
@@ -2508,9 +2886,16 @@ impl SteamUserStats {
         if self.achievements.contains_key(name) {
             return true;
         }
-        // Auto-unlock when progress reaches max.
+        // Auto-unlock when progress reaches max: use the same epoch-seconds
+        // timestamp as `set_achievement` and persist so the unlock survives
+        // restarts.
         if max_progress > 0.0 && current_progress >= max_progress {
-            self.achievements.insert(name.to_string(), 1);
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            self.achievements.insert(name.to_string(), now);
+            self.save_to_config();
             return true;
         }
         false
@@ -2603,7 +2988,13 @@ impl SteamFriends {
             .join("Application Support")
             .join("Casa1")
             .join("config")
-            .join("friends_config.json")
+            .join(format!("{}.json", app_scoped_config_name("friends_config")))
+    }
+
+    /// Set the app id used to scope this user's persisted friends file, so
+    /// different games do not overwrite each other's friends state.
+    pub fn set_app_id(app_id: u32) {
+        set_steam_config_app_id(app_id);
     }
 
     fn load_from_config(&mut self) {
@@ -2654,11 +3045,12 @@ impl SteamFriends {
             clans: self.clans.clone(),
         };
         let path = Self::config_path();
-        if let Some(parent) = path.parent() {
-            if let Err(e) = fs::create_dir_all(parent) {
-                eprintln!("SteamFriends: failed to create config dir: {e}");
-                return;
-            }
+        let Some(parent) = path.parent() else {
+            return;
+        };
+        if let Err(e) = fs::create_dir_all(parent) {
+            eprintln!("SteamFriends: failed to create config dir: {e}");
+            return;
         }
         match serde_json::to_string_pretty(&snapshot) {
             Ok(json) => {
@@ -2718,8 +3110,10 @@ impl SteamFriends {
     }
 
     pub fn get_friend_by_index(&self, index: i32) -> Option<u64> {
-        let keys: Vec<u64> = self.friends.keys().copied().collect();
-        keys.get(index as usize).copied()
+        if index < 0 {
+            return None;
+        }
+        self.friends.keys().nth(index as usize).copied()
     }
 
     pub fn add_friend(&mut self, steam_id: u64, name: &str) {
@@ -2757,8 +3151,10 @@ impl SteamFriends {
     }
 
     pub fn get_invite_by_index(&self, index: i32) -> Option<u64> {
-        let keys: Vec<u64> = self.friend_invites.keys().copied().collect();
-        keys.get(index as usize).copied()
+        if index < 0 {
+            return None;
+        }
+        self.friend_invites.keys().nth(index as usize).copied()
     }
 
     pub fn accept_invite(&mut self, steam_id: u64) {
@@ -2775,10 +3171,14 @@ impl SteamFriends {
     }
 
     pub fn send_friend_message(&mut self, steam_id: u64, message: &str) {
-        self.chat_messages
-            .entry(steam_id)
-            .or_default()
-            .push(message.to_string());
+        // Bound per-friend history so long chat sessions cannot grow memory
+        // without limit (drop the oldest message beyond the cap).
+        const MAX_FRIEND_CHAT_MESSAGES: usize = 200;
+        let history = self.chat_messages.entry(steam_id).or_default();
+        if history.len() >= MAX_FRIEND_CHAT_MESSAGES {
+            history.remove(0);
+        }
+        history.push(message.to_string());
     }
 
     pub fn get_friend_message_count(&self, steam_id: u64) -> i32 {
@@ -2814,8 +3214,10 @@ impl SteamFriends {
     }
 
     pub fn get_clan_by_index(&self, index: i32) -> Option<u64> {
-        let keys: Vec<u64> = self.clans.keys().copied().collect();
-        keys.get(index as usize).copied()
+        if index < 0 {
+            return None;
+        }
+        self.clans.keys().nth(index as usize).copied()
     }
 
     pub fn get_clan_name(&self, clan_id: u64) -> Option<&str> {
@@ -3003,8 +3405,7 @@ impl SteamMatchmaking {
     }
 
     pub fn get_lobby_by_index(&self, index: usize) -> Option<u64> {
-        let keys: Vec<u64> = self.lobbies.keys().copied().collect();
-        keys.get(index).copied()
+        self.lobbies.keys().nth(index).copied()
     }
 
     pub fn get_lobby_data(&self, lobby_id: u64, key: &str) -> Option<&str> {
@@ -3030,10 +3431,12 @@ impl SteamMatchmaking {
     }
 
     pub fn get_lobby_member_by_index(&self, lobby_id: u64, index: i32) -> Option<u64> {
-        self.lobbies.get(&lobby_id).and_then(|l| {
-            let keys: Vec<u64> = l.members.keys().copied().collect();
-            keys.get(index as usize).copied()
-        })
+        if index < 0 {
+            return None;
+        }
+        self.lobbies
+            .get(&lobby_id)
+            .and_then(|l| l.members.keys().nth(index as usize).copied())
     }
 
     pub fn get_lobby_member_data(&self, lobby_id: u64, member_id: u64, key: &str) -> Option<&str> {
@@ -3086,6 +3489,12 @@ impl SteamMatchmaking {
         let lobby = self.lobbies.get_mut(&lobby_id).ok_or_else(|| {
             AppError::new(crate::reason::ReasonCode::RcCliInvalid, "lobby not found")
         })?;
+        // Bound the lobby chat history so long sessions cannot grow memory
+        // without limit.
+        const MAX_LOBBY_CHAT_MESSAGES: usize = 200;
+        if lobby.chat_messages.len() >= MAX_LOBBY_CHAT_MESSAGES {
+            lobby.chat_messages.remove(0);
+        }
         lobby.chat_messages.push(message.to_string());
         Ok(())
     }
@@ -3113,8 +3522,10 @@ impl SteamMatchmaking {
     }
 
     pub fn get_lobby_search_result(&self, index: usize) -> Option<&Lobby> {
-        let keys: Vec<u64> = self.search_results.keys().copied().collect();
-        keys.get(index).and_then(|k| self.search_results.get(k))
+        self.search_results
+            .keys()
+            .nth(index)
+            .and_then(|k| self.search_results.get(k))
     }
 
     pub fn clear_lobby_search_results(&mut self) {
@@ -3236,6 +3647,10 @@ pub struct SteamRemoteStorage {
     http_client: Option<reqwest::blocking::Client>,
 }
 
+/// Upper bound on a single cloud download (4 GiB). Guards against an
+/// untrusted sync server streaming unbounded data to disk.
+const MAX_CLOUD_DOWNLOAD_SIZE: u64 = 4 * 1024 * 1024 * 1024;
+
 impl SteamRemoteStorage {
     pub fn new() -> Self {
         let base_path = Self::default_base_path();
@@ -3310,12 +3725,11 @@ impl SteamRemoteStorage {
     }
 
     fn ensure_parent_dir(&self, rel_path: &str) -> AppResult<()> {
-        let parent = self
-            .base_path
-            .join(rel_path)
-            .parent()
-            .unwrap()
-            .to_path_buf();
+        let full_path = self.base_path.join(rel_path);
+        let parent = match full_path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+            _ => self.base_path.clone(),
+        };
         fs::create_dir_all(&parent).map_err(|e| {
             AppError::new(
                 crate::reason::ReasonCode::RcIo,
@@ -3339,12 +3753,15 @@ impl SteamRemoteStorage {
     pub fn configure_sync_server(&mut self, url: Option<&str>) {
         self.sync_server_url = url.map(|s| s.trim_end_matches('/').to_string());
         if self.sync_server_url.is_some() && self.http_client.is_none() {
-            if let Ok(client) = reqwest::blocking::Client::builder()
+            match reqwest::blocking::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .cookie_store(true)
                 .build()
             {
-                self.http_client = Some(client);
+                Ok(client) => self.http_client = Some(client),
+                Err(e) => {
+                    eprintln!("RemoteStorage: failed to build HTTP client: {e}");
+                }
             }
         }
     }
@@ -3373,16 +3790,22 @@ impl SteamRemoteStorage {
         let rel_paths: Vec<String> = self.files.keys().cloned().collect();
 
         for rel_path in rel_paths {
+            if !is_safe_rel_path(&rel_path) {
+                eprintln!("RemoteStorage: skipping upload of unsafe path '{rel_path}'");
+                continue;
+            }
             let state = self.sync_state.get(&rel_path).cloned().unwrap_or_default();
 
             if state.sync_status == SyncStatus::Synced {
                 continue;
             }
 
-            // Read the local file content
+            // Stream the local file to the server instead of loading the
+            // whole file into memory (multi-GB saves cause large transient
+            // allocations otherwise).
             let full_path = self.base_path.join(&rel_path);
-            let data = match fs::read(&full_path) {
-                Ok(d) => d,
+            let file = match std::fs::File::open(&full_path) {
+                Ok(f) => f,
                 Err(e) => {
                     eprintln!("RemoteStorage: cannot read '{rel_path}' for upload: {e}");
                     continue;
@@ -3390,8 +3813,11 @@ impl SteamRemoteStorage {
             };
 
             // Upload via HTTP PUT
-            let upload_url = format!("{server_url}/api/v1/cloud/upload/{rel_path}");
-            match client.put(&upload_url).body(data).send() {
+            let upload_url = format!(
+                "{server_url}/api/v1/cloud/upload/{}",
+                percent_encode(&rel_path)
+            );
+            match client.put(&upload_url).body(file).send() {
                 Ok(resp) if resp.status().is_success() => {
                     let remote_mtime = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
@@ -3414,15 +3840,23 @@ impl SteamRemoteStorage {
                         },
                     );
                     // Update quota from server response if provided
-                    if let Ok(body) = resp.text() {
-                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&body) {
-                            if let Some(quota) = parsed.get("quota_used").and_then(|v| v.as_u64()) {
-                                self.quota_used = quota;
+                    match resp.text() {
+                        Ok(body) => {
+                            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&body) {
+                                if let Some(quota) =
+                                    parsed.get("quota_used").and_then(|v| v.as_u64())
+                                {
+                                    self.quota_used = quota;
+                                }
+                                if let Some(total) =
+                                    parsed.get("quota_total").and_then(|v| v.as_u64())
+                                {
+                                    self.quota_total = total;
+                                }
                             }
-                            if let Some(total) = parsed.get("quota_total").and_then(|v| v.as_u64())
-                            {
-                                self.quota_total = total;
-                            }
+                        }
+                        Err(e) => {
+                            eprintln!("RemoteStorage: failed to read upload response body: {e}");
                         }
                     }
                     changed_count += 1;
@@ -3507,6 +3941,15 @@ impl SteamRemoteStorage {
         };
 
         for (rel_path, remote_info) in &remote_files {
+            // The listing comes from an untrusted server; never let a
+            // `..`/absolute path escape the storage directory.
+            if !is_safe_rel_path(rel_path) {
+                eprintln!(
+                    "RemoteStorage: skipping unsafe remote path '{rel_path}' from server listing"
+                );
+                continue;
+            }
+
             let local_mtime = self.file_timestamps.get(rel_path).copied().unwrap_or(0);
             let state = self.sync_state.get(rel_path).cloned().unwrap_or_default();
 
@@ -3529,14 +3972,54 @@ impl SteamRemoteStorage {
                 continue;
             }
 
-            // Download the file
-            let download_url = format!("{server_url}/api/v1/cloud/download/{rel_path}");
+            // Download the file, streaming the body to a temp file so a
+            // failed/partial transfer never truncates the existing local
+            // file. Only after the transfer completes is the temp file
+            // renamed into place and the sync state marked Synced; on any
+            // error the previous file and sync status are left untouched so
+            // the download is retried on the next sync.
+            let download_url = format!(
+                "{server_url}/api/v1/cloud/download/{}",
+                percent_encode(rel_path)
+            );
             match client.get(&download_url).send() {
                 Ok(dl_resp) if dl_resp.status().is_success() => {
-                    let data = dl_resp.bytes().unwrap_or_default();
-                    // Write locally
-                    if let Err(e) = self.file_write(rel_path, &data) {
-                        eprintln!("RemoteStorage: failed to write downloaded '{rel_path}': {e}");
+                    let full_path = self.base_path.join(rel_path);
+                    let tmp_path = full_path.with_extension("part");
+                    let write_result = (|| -> AppResult<()> {
+                        let mut out = fs::File::create(&tmp_path).map_err(|e| {
+                            AppError::new(
+                                ReasonCode::RcIo,
+                                format!("RemoteStorage: cannot create temp file: {e}"),
+                            )
+                        })?;
+                        let mut limited =
+                            std::io::Read::take(dl_resp, MAX_CLOUD_DOWNLOAD_SIZE);
+                        std::io::copy(&mut limited, &mut out).map_err(|e| {
+                            AppError::new(
+                                ReasonCode::RcNetReadFailed,
+                                format!("RemoteStorage: download '{rel_path}' failed: {e}"),
+                            )
+                        })?;
+                        let size = out.metadata().map(|m| m.len()).unwrap_or(0);
+                        if size == 0 && remote_info.size > 0 {
+                            return Err(AppError::new(
+                                ReasonCode::RcNetReadFailed,
+                                format!("RemoteStorage: download of '{rel_path}' returned an empty body"),
+                            ));
+                        }
+                        fs::rename(&tmp_path, &full_path).map_err(|e| {
+                            AppError::new(
+                                ReasonCode::RcIo,
+                                format!("RemoteStorage: failed to finalize '{rel_path}': {e}"),
+                            )
+                        })?;
+                        self.record_written_file(rel_path, size);
+                        Ok(())
+                    })();
+                    if let Err(e) = write_result {
+                        let _ = fs::remove_file(&tmp_path);
+                        eprintln!("RemoteStorage: download '{rel_path}' failed: {e}");
                         continue;
                     }
                     // Update sync state
@@ -3592,35 +4075,35 @@ impl SteamRemoteStorage {
     }
 
     /// Detect local file changes by comparing current mtime with stored state.
+    ///
+    /// Both sides are tracked independently: a file whose local mtime moved
+    /// past the last-synced `local_mtime` is `LocalChanged`; if the
+    /// last-known remote copy was itself newer than the last-synced local
+    /// copy (`remote_mtime > local_mtime`) and the local file has changed
+    /// again, both sides hold changes and the file is marked `Conflict`
+    /// (resolved last-write-wins by the sync loops).
     fn detect_changes(&mut self) {
-        let _now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
         // Check for new or modified local files
         for (rel_path, current_mtime) in &self.file_timestamps.clone() {
             let state = self.sync_state.get(rel_path).cloned().unwrap_or_default();
             let was_synced = state.sync_status == SyncStatus::Synced;
 
             if *current_mtime > state.local_mtime {
-                // File was modified locally
+                // File was modified locally.
+                let remote_changed = state.remote_mtime > state.local_mtime;
                 let new_status = if was_synced {
-                    if state.remote_mtime > 0 && *current_mtime <= state.remote_mtime {
+                    // Cleanly synced before: a local modification is either a
+                    // plain local change or, if the local copy is still older
+                    // than the last-known remote copy, a remote change.
+                    if remote_changed && state.remote_mtime >= *current_mtime {
                         SyncStatus::RemoteChanged
                     } else {
                         SyncStatus::LocalChanged
                     }
-                } else if state.remote_mtime > 0
-                    && *current_mtime > state.local_mtime
-                    && *current_mtime > state.remote_mtime
-                {
-                    // Both sides changed since last sync
-                    if *current_mtime > state.remote_mtime {
-                        SyncStatus::LocalChanged
-                    } else {
-                        SyncStatus::RemoteChanged
-                    }
+                } else if remote_changed {
+                    // Never synced and both sides changed since the last
+                    // contact: a genuine conflict.
+                    SyncStatus::Conflict
                 } else {
                     SyncStatus::LocalChanged
                 };
@@ -3709,6 +4192,28 @@ impl SteamRemoteStorage {
     // ── File operations ────────────────────────────────────────────────
 
     pub fn file_write(&mut self, rel_path: &str, data: &[u8]) -> AppResult<()> {
+        if !is_safe_rel_path(rel_path) {
+            return Err(AppError::new(
+                ReasonCode::RcFsPathInvalid,
+                format!("remote storage: unsafe path '{rel_path}'"),
+            ));
+        }
+
+        // Enforce the configured cloud quota before writing: refuse writes
+        // that would push the storage usage over `quota_total`.
+        let old_size = self.files.get(rel_path).copied().unwrap_or(0);
+        let new_size = data.len() as u64;
+        let projected = self.quota_used.saturating_sub(old_size).saturating_add(new_size);
+        if self.quota_total > 0 && projected > self.quota_total {
+            return Err(AppError::new(
+                ReasonCode::RcInvalidState,
+                format!(
+                    "remote storage: quota exceeded ({projected} > {} bytes)",
+                    self.quota_total
+                ),
+            ));
+        }
+
         self.ensure_parent_dir(rel_path)?;
         let full_path = self.base_path.join(rel_path);
         fs::write(&full_path, data).map_err(|e| {
@@ -3718,12 +4223,19 @@ impl SteamRemoteStorage {
             )
         })?;
 
-        let size = data.len() as u64;
+        self.record_written_file(rel_path, new_size);
+
+        Ok(())
+    }
+
+    /// Update in-memory bookkeeping (quota, file index, timestamps) after a
+    /// file was written or updated on disk.
+    fn record_written_file(&mut self, rel_path: &str, size: u64) {
         let old_size = self.files.get(rel_path).copied().unwrap_or(0);
         if size > old_size {
             self.quota_used += size - old_size;
         } else {
-            self.quota_used -= old_size - size;
+            self.quota_used = self.quota_used.saturating_sub(old_size - size);
         }
         self.files.insert(rel_path.to_string(), size);
 
@@ -3733,11 +4245,15 @@ impl SteamRemoteStorage {
             .unwrap_or_default()
             .as_secs();
         self.file_timestamps.insert(rel_path.to_string(), now);
-
-        Ok(())
     }
 
     pub fn file_read(&self, rel_path: &str) -> AppResult<Vec<u8>> {
+        if !is_safe_rel_path(rel_path) {
+            return Err(AppError::new(
+                ReasonCode::RcFsPathInvalid,
+                format!("remote storage: unsafe path '{rel_path}'"),
+            ));
+        }
         let full_path = self.base_path.join(rel_path);
         fs::read(&full_path).map_err(|e| {
             AppError::new(
@@ -3748,6 +4264,12 @@ impl SteamRemoteStorage {
     }
 
     pub fn file_delete(&mut self, rel_path: &str) -> AppResult<()> {
+        if !is_safe_rel_path(rel_path) {
+            return Err(AppError::new(
+                ReasonCode::RcFsPathInvalid,
+                format!("remote storage: unsafe path '{rel_path}'"),
+            ));
+        }
         let full_path = self.base_path.join(rel_path);
         if full_path.exists() {
             fs::remove_file(&full_path).map_err(|e| {
@@ -3779,6 +4301,9 @@ impl SteamRemoteStorage {
     }
 
     pub fn file_time(&self, rel_path: &str) -> i64 {
+        if !is_safe_rel_path(rel_path) {
+            return 0;
+        }
         let full_path = self.base_path.join(rel_path);
         fs::metadata(&full_path)
             .ok()
@@ -3793,14 +4318,20 @@ impl SteamRemoteStorage {
     }
 
     pub fn get_file_name(&self, index: i32) -> Option<&str> {
-        let keys: Vec<&str> = self.files.keys().map(|s| s.as_str()).collect();
-        keys.get(index as usize).copied()
+        if index < 0 {
+            return None;
+        }
+        self.files.keys().nth(index as usize).map(|s| s.as_str())
     }
 
     pub fn get_file_size(&self, index: i32) -> u64 {
-        let keys: Vec<&str> = self.files.keys().map(|s| s.as_str()).collect();
-        keys.get(index as usize)
-            .and_then(|k| self.files.get(*k))
+        if index < 0 {
+            return 0;
+        }
+        self.files
+            .keys()
+            .nth(index as usize)
+            .and_then(|k| self.files.get(k))
             .copied()
             .unwrap_or(0)
     }
@@ -3876,6 +4407,9 @@ impl SteamRemoteStorage {
     }
 
     pub fn file_persisted(&self, rel_path: &str) -> bool {
+        if !is_safe_rel_path(rel_path) {
+            return false;
+        }
         let full_path = self.base_path.join(rel_path);
         full_path.exists()
     }
@@ -3956,8 +4490,16 @@ pub struct SteamScreenshots {
     screenshots: Vec<ScreenshotEntry>,
     next_handle: u64,
     hook_registered: bool,
-    locations: BTreeMap<u64, String>,
 }
+
+/// Maximum number of screenshot entries retained in memory; the oldest
+/// entries are dropped beyond this cap so long sessions cannot grow memory
+/// without bound.
+const MAX_SCREENSHOT_ENTRIES: usize = 512;
+
+/// Maximum supported screenshot dimension in pixels (per side). Screenshots
+/// larger than 8K are rejected before any arithmetic or allocation.
+const MAX_SCREENSHOT_DIMENSION: u32 = 8192;
 
 /// Metadata for a tagged user in a screenshot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4006,21 +4548,46 @@ impl SteamScreenshots {
             screenshots: Vec::new(),
             next_handle: 1,
             hook_registered: false,
-            locations: BTreeMap::new(),
         }
     }
 
     /// Write raw RGBA pixel data as a PNG screenshot.
     ///
-    /// The RGBA data must be exactly `width * height * 4` bytes.
-    /// Encodes the data as a PNG file in memory and stores the entry.
+    /// The RGBA data must be exactly `width * height * 4` bytes (checked,
+    /// with overflow-safe arithmetic). Encodes the data as a PNG file in
+    /// memory and stores the entry.
     pub fn write_screenshot(&mut self, rgba: &[u8], width: u32, height: u32) -> AppResult<u64> {
-        let _expected = (width as usize) * (height as usize) * 4;
+        // Validate dimensions before any arithmetic: reject overflow and
+        // absurd sizes so a guest cannot drive a giant allocation.
+        if width == 0 || height == 0 || width > MAX_SCREENSHOT_DIMENSION || height > MAX_SCREENSHOT_DIMENSION {
+            return Err(AppError::new(
+                ReasonCode::RcCliInvalid,
+                format!("SteamScreenshots: invalid dimensions {width}x{height}"),
+            ));
+        }
+        let expected = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|v| v.checked_mul(4))
+            .ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcCliInvalid,
+                    "SteamScreenshots: dimension arithmetic overflow",
+                )
+            })?;
+        if rgba.len() != expected {
+            return Err(AppError::new(
+                ReasonCode::RcCliInvalid,
+                format!(
+                    "SteamScreenshots: RGBA buffer size {} does not match {width}x{height} (expected {expected} bytes)",
+                    rgba.len()
+                ),
+            ));
+        }
         let handle = self.next_handle;
         self.next_handle += 1;
 
         // Encode RGBA → PNG in memory (real PNG encoding)
-        let png_data = encode_rgba_to_png(rgba, width as usize, height as usize);
+        let png_data = encode_rgba_to_png(rgba, width as usize, height as usize)?;
 
         // Generate deterministic file paths
         let file_path = format!("screenshots/screenshot_{handle}.png");
@@ -4046,6 +4613,7 @@ impl SteamScreenshots {
         // Store the PNG data alongside the entry for later retrieval
         // In a real scenario this would write to the GE filesystem.
         // We store it in the entry metadata so callers can access it.
+        self.trim_screenshot_entries();
         self.screenshots.push(entry);
 
         eprintln!(
@@ -4077,6 +4645,7 @@ impl SteamScreenshots {
             .unwrap_or_default()
             .as_secs();
 
+        self.trim_screenshot_entries();
         self.screenshots.push(ScreenshotEntry {
             handle,
             file_path: file_path.to_string(),
@@ -4089,6 +4658,14 @@ impl SteamScreenshots {
             created_at: now_ts,
         });
         Ok(handle)
+    }
+
+    /// Drop the oldest screenshot entries beyond `MAX_SCREENSHOT_ENTRIES`.
+    fn trim_screenshot_entries(&mut self) {
+        if self.screenshots.len() >= MAX_SCREENSHOT_ENTRIES {
+            let excess = self.screenshots.len() + 1 - MAX_SCREENSHOT_ENTRIES;
+            self.screenshots.drain(0..excess);
+        }
     }
 
     /// Trigger a screenshot capture.
@@ -4107,6 +4684,7 @@ impl SteamScreenshots {
             .unwrap_or_default()
             .as_secs();
 
+        self.trim_screenshot_entries();
         self.screenshots.push(ScreenshotEntry {
             handle,
             file_path: format!("screenshots/screenshot_{handle}.png"),
@@ -4184,7 +4762,6 @@ impl SteamScreenshots {
         if let Some(entry) = self.screenshots.iter_mut().find(|e| e.handle == handle) {
             entry.location = location.to_string();
         }
-        self.locations.insert(handle, location.to_string());
     }
 
     /// Get the full screenshot entry by handle.
@@ -4202,8 +4779,16 @@ impl SteamScreenshots {
 ///
 /// This is a real PNG encoder that constructs the IHDR, IDAT (with deflate
 /// compression via stored-only blocks for correctness), and IEND chunks.
-/// Each row gets a filter byte of 0 (None filter) prepended.
-fn encode_rgba_to_png(rgba: &[u8], width: usize, height: usize) -> Vec<u8> {
+/// Each row gets a filter byte of 0 (None filter) prepended. All dimension
+/// arithmetic is overflow-checked and reported as an `AppError`.
+fn encode_rgba_to_png(rgba: &[u8], width: usize, height: usize) -> AppResult<Vec<u8>> {
+    let stride = width.checked_mul(4).ok_or_else(|| {
+        AppError::new(ReasonCode::RcCliInvalid, "PNG encode: stride overflow")
+    })?;
+    let raw_len = height.checked_mul(1 + stride).ok_or_else(|| {
+        AppError::new(ReasonCode::RcCliInvalid, "PNG encode: raw length overflow")
+    })?;
+
     let mut out = Vec::with_capacity(rgba.len() + 128);
 
     // PNG signature
@@ -4221,8 +4806,6 @@ fn encode_rgba_to_png(rgba: &[u8], width: usize, height: usize) -> Vec<u8> {
     write_png_chunk(&mut out, b"IHDR", &ihdr_data);
 
     // IDAT chunk — raw (stored) deflate with filter byte 0 per row
-    let stride = width * 4;
-    let raw_len = height * (1 + stride); // 1 filter byte per row
     // zlib header (CMF=0x78, FLG=0x01) + stored blocks + adler32
     let mut idat = Vec::with_capacity(raw_len + 16);
     // zlib header
@@ -4265,7 +4848,7 @@ fn encode_rgba_to_png(rgba: &[u8], width: usize, height: usize) -> Vec<u8> {
     // IEND chunk
     write_png_chunk(&mut out, b"IEND", &[]);
 
-    out
+    Ok(out)
 }
 
 /// Write a PNG chunk: length (4 BE) + type + data + CRC32.
@@ -4286,7 +4869,7 @@ fn crc32(data: &[u8]) -> u32 {
     static TABLE: std::sync::OnceLock<[u32; 256]> = std::sync::OnceLock::new();
     let table = TABLE.get_or_init(|| {
         let mut t = [0u32; 256];
-        for i in 0..256 {
+        for (i, entry) in t.iter_mut().enumerate() {
             let mut c = i as u32;
             for _ in 0..8 {
                 if c & 1 != 0 {
@@ -4295,7 +4878,7 @@ fn crc32(data: &[u8]) -> u32 {
                     c >>= 1;
                 }
             }
-            t[i] = c;
+            *entry = c;
         }
         t
     });
@@ -4568,10 +5151,10 @@ impl SteamMusic {
             return;
         }
         self.position_secs += delta_secs;
-        if let Some(track) = self.current_track() {
-            if track.duration_secs > 0.0 && self.position_secs >= track.duration_secs {
-                self.play_next();
-            }
+        if self.current_track().is_some_and(|track| {
+            track.duration_secs > 0.0 && self.position_secs >= track.duration_secs
+        }) {
+            self.play_next();
         }
     }
 }
@@ -4819,9 +5402,10 @@ mod tests {
             0x014c => "I386 / x86 (32-bit)",
             0x8664 => "AMD64 / x64 (64-bit)",
             0x0200 => "IA64 (Itanium)",
-            0x01c4 => "ARM64",
+            0xAA64 => "ARM64",
             0x01c0 => "ARM (Thumb)",
-            0x01c2 => "ARMNT (Thumb-2 / 32-bit)",
+            0x01c2 => "THUMB (Thumb-1 / 16-bit)",
+            0x01c4 => "ARMNT (Thumb-2 / 32-bit)",
             _ => "unknown",
         }
     }
@@ -4835,6 +5419,7 @@ mod tests {
             3 => "WINDOWS_CUI (Console)",
             5 => "OS2_CUI",
             7 => "POSIX_CUI",
+            8 => "NATIVE_WINDOWS",
             9 => "WINDOWS_CE_GUI",
             10 => "EFI_APPLICATION",
             11 => "EFI_BOOT_SERVICE_DRIVER",
@@ -4920,16 +5505,31 @@ mod tests {
         );
 
         // Subsystem — read directly from the raw bytes since ParsedPe doesn't
-        // expose a subsystem field.
+        // expose a subsystem field. Guard every slice against truncated or
+        // malformed input with a clear failure message.
         let bytes = std::fs::read(&steam_exe).unwrap();
-        let pe_offset = u32::from_le_bytes(bytes[0x3c..0x40].try_into().unwrap()) as usize;
+        assert!(
+            bytes.len() >= 0x40,
+            "Steam.exe too small to contain a PE header ({} bytes)",
+            bytes.len()
+        );
+        let pe_offset = u32::from_le_bytes(
+            bytes[0x3c..0x40]
+                .try_into()
+                .expect("PE header e_lfanew field should fit in 4 bytes"),
+        ) as usize;
         // Optional header starts at pe_offset + 24, subsystem is at byte 68
         // within the optional header.
         let subsystem_offset = pe_offset + 24 + 68;
+        assert!(
+            subsystem_offset + 2 <= bytes.len(),
+            "PE optional header subsystem field out of bounds (offset {subsystem_offset} in {} bytes)",
+            bytes.len()
+        );
         let subsystem = u16::from_le_bytes(
             bytes[subsystem_offset..subsystem_offset + 2]
                 .try_into()
-                .unwrap(),
+                .expect("subsystem field should fit in 2 bytes"),
         );
         println!(
             "Subsystem:      0x{subsystem:04x} ({})",
@@ -4951,8 +5551,8 @@ mod tests {
         // Section list
         println!("\n--- Sections ({} total) ---", parsed.sections.len());
         println!(
-            "{:8} {:>10} {:>10} {:>10} {:>10}  {}",
-            "Name", "VAddr", "VSize", "RawPtr", "RawSize", "Flags"
+            "{:8} {:>10} {:>10} {:>10} {:>10}  Flags",
+            "Name", "VAddr", "VSize", "RawPtr", "RawSize"
         );
         for section in &parsed.sections {
             println!(
