@@ -602,9 +602,24 @@ fn sanitize_entitlement_xml(xml: &str) -> String {
     // Phase 1: Quick reject of malicious constructs.
     //
     // DOCTYPE declarations enable entity expansion (billion laughs) and XXE.
-    // Use case-insensitive matching via uppercase conversion.
-    if xml.contains("<!DOCTYPE") || xml.to_ascii_uppercase().contains("<!DOCTYPE") {
-        return String::new();
+    // Use case-insensitive matching via uppercase conversion. The one
+    // exception is the standard Apple plist DOCTYPE emitted by
+    // `codesign -d --entitlements`; it declares no entities (and no internal
+    // subset), and the output is parsed by `roxmltree::Document`, a
+    // non-DTD, non-entity parser that never resolves external DTDs — so the
+    // XXE/billion-laughs defenses remain intact. Any other DOCTYPE is
+    // rejected.
+    let upper = xml.to_ascii_uppercase();
+    if upper.contains("<!DOCTYPE") {
+        // Allow only the standard Apple plist DOCTYPE (as emitted by
+        // `codesign -d --entitlements`, with either http/https DTD URL and
+        // any plausible system identifier quoting). It declares no entities
+        // and no internal subset.
+        let apple_prefix = "<!DOCTYPE PLIST PUBLIC \"-//APPLE//DTD PLIST 1.0//EN\"";
+        let apple_prefix_single = "<!DOCTYPE PLIST PUBLIC '-//APPLE//DTD PLIST 1.0//EN'";
+        if !upper.contains(apple_prefix) && !upper.contains(apple_prefix_single) {
+            return String::new();
+        }
     }
 
     // XML comments are not needed in entitlement plists and can be used to
@@ -681,6 +696,13 @@ fn sanitize_entitlement_xml(xml: &str) -> String {
     // Strip any remaining processing instructions (e.g., <?mso-info?>, <?mso-application?>)
     let mut sanitized = String::new();
     let mut remainder = trimmed;
+    // Also drop the (allowed) Apple plist DOCTYPE declaration so the
+    // roxmltree parse sees clean XML with no DOCTYPE node.
+    if let Some(start) = remainder.find("<!DOCTYPE")
+        && let Some(end) = remainder[start..].find('>')
+    {
+        remainder = &remainder[start + end + 1..];
+    }
     while let Some(start) = remainder.find("<?") {
         sanitized.push_str(&remainder[..start]);
         if let Some(end) = remainder[start..].find("?>") {
@@ -6423,11 +6445,26 @@ mod tests {
 
     #[test]
     fn entitlement_xml_rejects_doctype() {
+        // The standard Apple plist DOCTYPE (emitted by `codesign -d
+        // --entitlements`) is accepted and stripped; it declares no
+        // entities, so the sanitizer can safely remove it.
         let xml = r#"<?xml version="1.0"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist><dict><key>test</key><true/></dict></plist>"#;
         let result = sanitize_entitlement_xml(xml);
-        assert!(result.is_empty(), "DOCTYPE should be rejected");
+        assert!(!result.is_empty(), "Apple plist DOCTYPE should be accepted");
+        assert!(
+            !result.contains("<!DOCTYPE"),
+            "DOCTYPE must be stripped from the sanitized output"
+        );
+        assert!(result.contains("<plist"));
+
+        // Any other DOCTYPE is rejected outright (XXE/billion-laughs defense).
+        let evil = r#"<?xml version="1.0"?>
+<!DOCTYPE foo PUBLIC "-//Other//DTD X 1.0//EN" "http://evil.example.com/x.dtd">
+<plist><dict><key>test</key><true/></dict></plist>"#;
+        let rejected = sanitize_entitlement_xml(evil);
+        assert!(rejected.is_empty(), "non-Apple DOCTYPE should be rejected");
     }
 
     #[test]

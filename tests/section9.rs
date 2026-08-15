@@ -138,8 +138,8 @@ fn t9_1_d3d11_conformance_microtests_and_frame_diffs_match_reference() {
         max_anisotropy: 16,
         comparison_func: 2,
         border_color: [0.0, 0.0, 0.0, 0.0],
-        min_lod: -3.40282347e+38,
-        max_lod: 3.40282347e+38,
+        min_lod: -3.402_823_5e38,
+        max_lod: 3.402_823_5e38,
     });
     let input_layout = device.create_input_layout(InputLayoutDesc {
         elements: vec![
@@ -407,8 +407,8 @@ fn t9_2_deferred_context_stress_multi_thread_record_execute_no_races_and_determi
         max_anisotropy: 1,
         comparison_func: 2,
         border_color: [0.0, 0.0, 0.0, 0.0],
-        min_lod: -3.40282347e+38,
-        max_lod: 3.40282347e+38,
+        min_lod: -3.402_823_5e38,
+        max_lod: 3.402_823_5e38,
     });
     let input_layout = device.create_input_layout(InputLayoutDesc {
         elements: vec![InputElementDesc {
@@ -595,8 +595,8 @@ fn t9_3_state_leak_tests_random_state_churn_output_matches_oracle() {
             max_anisotropy: 16,
             comparison_func: 2,
             border_color: [0.0, 0.0, 0.0, 0.0],
-            min_lod: -3.40282347e+38,
-            max_lod: 3.40282347e+38,
+            min_lod: -3.402_823_5e38,
+            max_lod: 3.402_823_5e38,
         });
         let input_layout = device.create_input_layout(InputLayoutDesc {
             elements: vec![InputElementDesc {

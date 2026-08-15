@@ -710,8 +710,8 @@ pub enum GnsConnectionState {
 /// - STUN binding requests are used for NAT traversal
 /// - SDR relay is available for peers behind restrictive NATs
 /// - Falls back to in-memory queue when no UDP socket is available
-/// Shared in-memory fallback queue for GNS messages when no UDP socket is
-/// bound: `(connection handle, channel, payload)`.
+///   Shared in-memory fallback queue for GNS messages when no UDP socket is
+///   bound: `(connection handle, channel, payload)`.
 type SignalQueue = std::sync::Arc<std::sync::Mutex<Vec<(GnsConnectionHandle, i32, Vec<u8>)>>>;
 
 #[derive(Debug)]
@@ -3830,7 +3830,10 @@ impl SteamProtocolHandler {
     /// `HKCR\steam\shell\open\command`.
     ///
     /// This is a best-effort registration; it may fail silently if the
-    /// process lacks the necessary entitlements.
+    /// process lacks the necessary entitlements. The LaunchServices call is
+    /// performed in a forked child process so that a framework crash (seen
+    /// on some macOS releases inside `LSSetDefaultHandlerForURLScheme`)
+    /// cannot take down the caller.
     pub fn register(&mut self) {
         if self.registered {
             return;
@@ -3856,12 +3859,47 @@ impl SteamProtocolHandler {
                 }
             };
 
-            let ret = unsafe { LSSetDefaultHandlerForURLScheme(scheme.as_ptr(), bundle_id.as_ptr()) };
-            if self.verbose {
-                eprintln!(
-                    "[SteamProtocol] LSSetDefaultHandlerForURLScheme returned {}",
-                    ret
-                );
+            // Fork so a LaunchServices crash cannot kill this process. The
+            // child performs the registration; the parent waits briefly and
+            // treats any child crash as a failed registration.
+            unsafe {
+                let pid = libc::fork();
+                if pid == 0 {
+                    // Child: perform the registration, then exit.
+                    let _ = LSSetDefaultHandlerForURLScheme(
+                        scheme.as_ptr(),
+                        bundle_id.as_ptr(),
+                    );
+                    libc::_exit(0);
+                } else if pid > 0 {
+                    // Parent: wait up to 5 s for the child to finish.
+                    let mut status: libc::c_int = 0;
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    loop {
+                        let waited = libc::waitpid(pid, &mut status, libc::WNOHANG);
+                        if waited == pid {
+                            break;
+                        }
+                        if waited < 0 {
+                            break;
+                        }
+                        if std::time::Instant::now() >= deadline {
+                            let _ = libc::kill(pid, libc::SIGKILL);
+                            let _ = libc::waitpid(pid, &mut status, 0);
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    if self.verbose {
+                        eprintln!(
+                            "[SteamProtocol] LSSetDefaultHandlerForURLScheme child exited (status {status})"
+                        );
+                    }
+                } else {
+                    if self.verbose {
+                        eprintln!("[SteamProtocol] fork failed; skipping steam:// registration");
+                    }
+                }
             }
 
             if self.verbose {

@@ -318,7 +318,7 @@ pub struct DcRenderTarget {
 /// Enum of all render target types.
 #[derive(Debug)]
 pub enum D2DRenderTarget {
-    Hwnd(HwndRenderTarget),
+    Hwnd(Box<HwndRenderTarget>),
     Dc(DcRenderTarget),
 }
 
@@ -389,7 +389,7 @@ impl D2DFactory {
         };
 
         self.render_targets
-            .insert(id, D2DRenderTarget::Hwnd(target));
+            .insert(id, D2DRenderTarget::Hwnd(Box::new(target)));
         id
     }
 
@@ -418,7 +418,7 @@ impl D2DFactory {
     /// Get a mutable reference to an HWND render target.
     pub fn hwnd_target_mut(&mut self, id: u64) -> Option<&mut HwndRenderTarget> {
         match self.render_targets.get_mut(&id) {
-            Some(D2DRenderTarget::Hwnd(t)) => Some(t),
+            Some(D2DRenderTarget::Hwnd(t)) => Some(t.as_mut()),
             _ => None,
         }
     }
@@ -426,7 +426,7 @@ impl D2DFactory {
     /// Get an immutable reference to an HWND render target.
     pub fn hwnd_target(&self, id: u64) -> Option<&HwndRenderTarget> {
         match self.render_targets.get(&id) {
-            Some(D2DRenderTarget::Hwnd(t)) => Some(t),
+            Some(D2DRenderTarget::Hwnd(t)) => Some(t.as_ref()),
             _ => None,
         }
     }

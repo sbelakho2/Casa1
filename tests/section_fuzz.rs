@@ -32,7 +32,7 @@ fn collect_bin_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
         let path = entry.path();
         if path.is_dir() {
             collect_bin_files(&path, out);
-        } else if path.extension().map_or(false, |e| e == "bin") {
+        } else if path.extension().is_some_and(|e| e == "bin") {
             out.push(path);
         }
     }
@@ -144,7 +144,7 @@ fn run_parser(kind: &str, data: &[u8]) {
         }
         "spirv" => {
             let mut padded = data.to_vec();
-            while padded.len() % 4 != 0 {
+            while !padded.len().is_multiple_of(4) {
                 padded.push(0);
             }
             let words: Vec<u32> = padded

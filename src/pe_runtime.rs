@@ -3961,8 +3961,8 @@ pub fn is_pe_image(path: &Path) -> AppResult<bool> {
 /// 3. `PATH` environment variable.
 pub fn find_casa1_runner_binary() -> AppResult<PathBuf> {
     // 1. Next to current executable
-    if let Ok(exe_path) = std::env::current_exe() {
-        if let Some(exe_dir) = exe_path.parent() {
+    if let Ok(exe_path) = std::env::current_exe()
+        && let Some(exe_dir) = exe_path.parent() {
             let candidate = exe_dir.join("casa1-runner");
             if candidate.exists() {
                 return Ok(candidate);
@@ -3973,7 +3973,6 @@ pub fn find_casa1_runner_binary() -> AppResult<PathBuf> {
                 return Ok(candidate_exe);
             }
         }
-    }
 
     // 2. Cargo target directory (dev/test)
     if let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
@@ -4026,6 +4025,7 @@ pub fn execute(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn execute_with_options(
     program: &Path,
     args: &[String],
@@ -4217,8 +4217,8 @@ pub fn execute_with_options(
         }
     }
     // Also check the external manifest for comctl32 v6
-    if !runtime.comctl32_v6_active {
-        if let Some(ref external_manifest) = image.external_manifest {
+    if !runtime.comctl32_v6_active
+        && let Some(ref external_manifest) = image.external_manifest {
             for asm in &external_manifest.assemblies {
                 if asm.name == "Microsoft.Windows.Common-Controls"
                     && asm.version.as_deref() == Some("6.0.0.0")
@@ -4242,7 +4242,6 @@ pub fn execute_with_options(
                 }
             }
         }
-    }
 
     // Parse Steam command-line flags if running Steam.exe.
     if staged_program_path.contains("Steam.exe") || staged_program_path.contains("steam.exe") {
@@ -4548,7 +4547,7 @@ pub fn execute_with_options(
                 ));
             }
         }
-        if same_rip_consecutive_count >= 10 && same_rip_consecutive_count % 5 == 0 {
+        if same_rip_consecutive_count >= 10 && same_rip_consecutive_count.is_multiple_of(5) {
             diag(&format!(
                 "SAME_RIP_WARN rip={:#x} consecutive={} eax={:#x} ecx={:#x} edx={:#x} esi={:#x} edi={:#x}",
                 state.rip,
@@ -4641,64 +4640,59 @@ pub fn execute_with_options(
         let opcode = memory
             .read_u8(state.rip)
             .map_err(|error| annotate_guest_fault(error, &memory, &state))?;
-        match opcode {
-            0xFF => match memory.read_u8(state.rip + 1)? {
-                0x15 | 0x25 => {
-                    advance_runtime_steps(
-                        &mut runtime,
-                        &mut steps,
-                        instruction_budget,
-                        1,
-                        &memory,
-                        &state,
-                        test_id,
-                    )?;
-                    let next_rip = state.rip + 6;
-                    let slot_address = if guest_arch == GuestArch::X64 {
-                        let displacement = read_i32_from_memory(&memory, state.rip + 2)?;
-                        (next_rip as i128 + displacement as i128) as u64
-                    } else {
-                        read_u32(&memory, state.rip + 2)? as u64
-                    };
-                    let target = read_guest_pointer(&memory, slot_address, guest_arch)?;
-                    let is_call = memory.read_u8(state.rip + 1)? == 0x15;
+        if opcode == 0xFF { match memory.read_u8(state.rip + 1)? {
+            0x15 | 0x25 => {
+                advance_runtime_steps(
+                    &mut runtime,
+                    &mut steps,
+                    instruction_budget,
+                    1,
+                    &memory,
+                    &state,
+                    test_id,
+                )?;
+                let next_rip = state.rip + 6;
+                let slot_address = if guest_arch == GuestArch::X64 {
+                    let displacement = read_i32_from_memory(&memory, state.rip + 2)?;
+                    (next_rip as i128 + displacement as i128) as u64
+                } else {
+                    read_u32(&memory, state.rip + 2)? as u64
+                };
+                let target = read_guest_pointer(&memory, slot_address, guest_arch)?;
+                let is_call = memory.read_u8(state.rip + 1)? == 0x15;
 
-                    if is_call {
-                        let call_rsp = state.get(Register::Rsp).wrapping_sub(guest_pointer_bytes);
-                        write_guest_pointer(&mut memory, call_rsp, next_rip, guest_arch)?;
-                        state.set(Register::Rsp, call_rsp);
-                    }
-
-                    if let Some(result) =
-                        runtime.dispatch_import_if_present(target, &mut state, &mut memory)?
-                    {
-                        thunk_count += 1;
-                        if let Some(code) = result {
-                            exit_code = code;
-                            break;
-                        }
-                        // Host thunk was dispatched successfully. For a CALL, advance
-                        // RIP past the call instruction so the subsequent block decode
-                        // (line 4807) starts from the instruction AFTER the call.
-                        // Without this, the decoded block will contain the same call
-                        // instruction, causing a second dispatch through the IR
-                        // interpreter — a double-dispatch bug.
-                        if is_call {
-                            state.rip = next_rip;
-                        }
-                        // For a JMP (ModRM 0x25), the thunk handles control flow
-                        // internally.  Just continue the loop — dispatch_import
-                        // will have updated state.rip as needed.
-                    } else if is_call {
-                        state.rip = target;
-                    } else {
-                        state.rip = target;
-                    }
+                if is_call {
+                    let call_rsp = state.get(Register::Rsp).wrapping_sub(guest_pointer_bytes);
+                    write_guest_pointer(&mut memory, call_rsp, next_rip, guest_arch)?;
+                    state.set(Register::Rsp, call_rsp);
                 }
-                _ => {}
-            },
+
+                if let Some(result) =
+                    runtime.dispatch_import_if_present(target, &mut state, &mut memory)?
+                {
+                    thunk_count += 1;
+                    if let Some(code) = result {
+                        exit_code = code;
+                        break;
+                    }
+                    // Host thunk was dispatched successfully. For a CALL, advance
+                    // RIP past the call instruction so the subsequent block decode
+                    // (line 4807) starts from the instruction AFTER the call.
+                    // Without this, the decoded block will contain the same call
+                    // instruction, causing a second dispatch through the IR
+                    // interpreter — a double-dispatch bug.
+                    if is_call {
+                        state.rip = next_rip;
+                    }
+                    // For a JMP (ModRM 0x25), the thunk handles control flow
+                    // internally.  Just continue the loop — dispatch_import
+                    // will have updated state.rip as needed.
+                } else {
+                    state.rip = target;
+                }
+            }
             _ => {}
-        }
+        } }
 
         // --- Steam.exe crash point: zero-filled record at 0x401389/0x401390 ---
         // Steam's main loop iterates over a table of 0x1c-byte records whose base
@@ -4778,8 +4772,7 @@ pub fn execute_with_options(
         if guest_arch == GuestArch::X86
             && state.rip == runtime.mapped_image_base + 0x13a8
             && std::env::var("CASA1_STEAM_CRASH_WORKAROUND").is_ok()
-        {
-            if let Some(expected_esi) = runtime.steam_401389_expected_esi_after_401434.take() {
+            && let Some(expected_esi) = runtime.steam_401389_expected_esi_after_401434.take() {
                 runtime.steam_401389_saved_esi_slot_addr = None;
                 let actual_esi = state.get(Register::Rsi) as u32;
                 if actual_esi != expected_esi {
@@ -4797,7 +4790,6 @@ pub fn execute_with_options(
                     );
                 }
             }
-        }
         // Per-block diagnostic writes removed.
         let cached_block = decode_basic_block_cached(
             &mut engine,
@@ -4837,12 +4829,11 @@ pub fn execute_with_options(
             let block_rva = block_start_rip.saturating_sub(runtime.mapped_image_base) as u32;
             // Steam diagnostic tracking of block RVAs (only when tracing is active).
             if runtime.enable_steam_tracing {
-                if runtime.recent_main_block_rvas.len() == 32 {
-                    if runtime.recent_main_block_rvas.pop_front() == Some(0x000c_c400) {
+                if runtime.recent_main_block_rvas.len() == 32
+                    && runtime.recent_main_block_rvas.pop_front() == Some(0x000c_c400) {
                         runtime.recent_main_cc400_count =
                             runtime.recent_main_cc400_count.saturating_sub(1);
                     }
-                }
                 runtime.recent_main_block_rvas.push_back(block_rva);
                 if block_rva == 0x000c_c400 {
                     runtime.recent_main_cc400_count += 1;
@@ -4882,8 +4873,8 @@ pub fn execute_with_options(
             }
             None
         };
-        if runtime.enable_steam_tracing {
-            if let Some(block_rva) = block_rva {
+        if runtime.enable_steam_tracing
+            && let Some(block_rva) = block_rva {
                 if guest_arch == GuestArch::X86 {
                     let cookie_watch_site = match block_rva {
                         0x0017_5f4e => Some("after_get_module_file_name_w"),
@@ -5097,7 +5088,6 @@ pub fn execute_with_options(
                     }
                 }
             }
-        }
         // --- Steam tracing pre-execution state captures ---
         // These variable declarations capture guest state before block execution so
         // that tracing emission blocks (C, D, E below) can compare before/after values.
@@ -5365,7 +5355,7 @@ pub fn execute_with_options(
             )
         });
         let steam_saved_edi_slot_watch = steam_trace
-            && matches!(block_rva, Some(rva) if (0x0016_ca8..=0x0017_304).contains(&rva));
+            && matches!(block_rva, Some(rva) if (0x0001_6ca8..=0x0001_7304).contains(&rva));
         let steam_saved_edi_slot_before = steam_saved_edi_slot_watch
             .then(|| probe_read_guest_u32(&memory, 0x7000_ff1c).map(u64::from))
             .flatten();
@@ -5660,8 +5650,8 @@ pub fn execute_with_options(
             } else if guest_arch == GuestArch::X86 && !watch_steam_4dea00_edi_preservation {
                 runtime.steam_4dea00_expected_edi = None;
             }
-            if watch_steam_4dea00_edi_preservation {
-                if let Some(expected_edi) = runtime.steam_4dea00_expected_edi {
+            if watch_steam_4dea00_edi_preservation
+                && let Some(expected_edi) = runtime.steam_4dea00_expected_edi {
                     let actual_edi = state.get(Register::Rdi);
                     if actual_edi != expected_edi {
                         return Err(AppError::new(
@@ -5684,9 +5674,8 @@ pub fn execute_with_options(
                         )));
                     }
                 }
-            }
-            if watch_steam_install_dir_edi_preservation {
-                if let Some(expected_edi) = runtime.steam_install_dir_expected_edi {
+            if watch_steam_install_dir_edi_preservation
+                && let Some(expected_edi) = runtime.steam_install_dir_expected_edi {
                     let actual_edi = state.get(Register::Rdi);
                     if actual_edi != expected_edi {
                         let decoded_addresses = cached_block
@@ -5715,7 +5704,6 @@ pub fn execute_with_options(
                         )));
                     }
                 }
-            }
             if watch_steam_adf60_edi_preservation {
                 let expected_edi =
                     read_guest_u32(&memory, state.get(Register::Rbp).wrapping_add(12))
@@ -5856,8 +5844,8 @@ pub fn execute_with_options(
                     );
                 }
             }
-            if guest_arch == GuestArch::X86 && contains_steam_402a57 {
-                if let Some(expected_esi) = runtime.steam_401389_expected_esi_after_401434 {
+            if guest_arch == GuestArch::X86 && contains_steam_402a57
+                && let Some(expected_esi) = runtime.steam_401389_expected_esi_after_401434 {
                     let saved_esi =
                         read_guest_u32(&memory, state.get(Register::Rbp).wrapping_sub(0x2b8))
                             .unwrap_or(0);
@@ -5870,7 +5858,6 @@ pub fn execute_with_options(
                         ));
                     }
                 }
-            }
         }
         if state.rip <= 0x19026bf1 && cached_block.end_rip > 0x19026bf1 {
             let this_ptr = state.get(Register::Rcx) & state.arch.register_mask();
@@ -7642,17 +7629,15 @@ pub fn execute_with_options(
             if guest_arch == GuestArch::X86
                 && runtime.steam_401389_expected_esi_after_401434.is_some()
                 && runtime.steam_401389_saved_esi_slot_addr.is_none()
-            {
-                if let Some(expected_esi) = runtime.steam_401389_expected_esi_after_401434 {
+                && let Some(expected_esi) = runtime.steam_401389_expected_esi_after_401434 {
                     let candidate = state.get(Register::Rbp).wrapping_sub(0x2b8);
                     if read_guest_u32(&memory, candidate).ok() == Some(expected_esi) {
                         runtime.steam_401389_saved_esi_slot_addr = Some(candidate);
                     }
                 }
-            }
-            if let Some((watched_address, before_value)) = watched_esi_slot_before {
-                if let Ok(after_value) = read_guest_u32(&memory, watched_address) {
-                    if after_value != before_value {
+            if let Some((watched_address, before_value)) = watched_esi_slot_before
+                && let Ok(after_value) = read_guest_u32(&memory, watched_address)
+                    && after_value != before_value {
                         let decoded_addresses = cached_block
                             .translated
                             .decoded
@@ -7667,8 +7652,6 @@ pub fn execute_with_options(
                             ),
                         ));
                     }
-                }
-            }
             if steam_install_dir_set_edi {
                 let expected_edi = runtime.mapped_image_base + 0x003d_6168;
                 let actual_edi = state.get(Register::Rdi);
@@ -8429,8 +8412,8 @@ impl PeHostRuntime {
                 .join(source_program)
         };
         let normalized_source = runtime_guest_path(self.win32.ge(), &source_program);
-        if is_windows_absolute_path(&normalized_source) {
-            if let Some(drive_prefix) = windows_drive_prefix(&normalized_source) {
+        if is_windows_absolute_path(&normalized_source)
+            && let Some(drive_prefix) = windows_drive_prefix(&normalized_source) {
                 let drive = &drive_prefix[..1];
                 if self
                     .win32
@@ -8442,7 +8425,6 @@ impl PeHostRuntime {
                     return Ok(normalized_source);
                 }
             }
-        }
         let file_name = source_program
             .file_name()
             .and_then(|name| name.to_str())
@@ -8598,11 +8580,10 @@ impl PeHostRuntime {
 
         // 5. Fallback: try the original guest-to-host path resolution
         let guest_path = resolve_full_guest_path(&self.current_directory, module_name);
-        if let Ok(host_path) = self.win32.guest_path_to_host_path(&guest_path) {
-            if host_path.exists() {
+        if let Ok(host_path) = self.win32.guest_path_to_host_path(&guest_path)
+            && host_path.exists() {
                 return self.load_real_dll(module_name, &host_path);
             }
-        }
 
         (0, ERROR_MOD_NOT_FOUND)
     }
@@ -8642,11 +8623,10 @@ impl PeHostRuntime {
                     None
                 }
             };
-            if let Some(addr) = export_addr {
-                if addr != 0 {
+            if let Some(addr) = export_addr
+                && addr != 0 {
                     return addr;
                 }
-            }
         }
 
         // Check if this is a synthetic module with an export table that contains
@@ -8754,13 +8734,12 @@ impl PeHostRuntime {
         let result = Some(self.resolve_proc_address(target_handle, import_sym));
 
         // Cache the result (address or None if address is 0).
-        if let Some(addr) = result {
-            if addr != 0 {
+        if let Some(addr) = result
+            && addr != 0 {
                 self.forwarder_export_cache
                     .insert(forwarder.to_string(), Some(addr));
                 return Some(addr);
             }
-        }
         self.forwarder_export_cache
             .insert(forwarder.to_string(), None);
         None
@@ -9272,15 +9251,14 @@ impl PeHostRuntime {
     pub fn call_dll_entry_points(&mut self, dll_handles: &[u64], reason: DllReason) {
         let raw_reason = reason.to_raw();
         for &handle in dll_handles {
-            if let Some(info) = self.dll_info_table.get(&handle) {
-                if info.entry_point_rva != 0 {
+            if let Some(info) = self.dll_info_table.get(&handle)
+                && info.entry_point_rva != 0 {
                     self.pending_dll_main_calls.push_back((
                         handle,
                         info.entry_point_rva,
                         raw_reason,
                     ));
                 }
-            }
         }
     }
 
@@ -9855,6 +9833,7 @@ impl PeHostRuntime {
         Ok(())
     }
 
+#[allow(clippy::too_many_arguments)]
     fn dispatch_live_mouse_input(
         &mut self,
         x: i32,
@@ -10003,11 +9982,11 @@ impl PeHostRuntime {
 
     /// Re‑publish the most recent GDI window preview frame if:
     ///
-    ///   1. D3D has **not** started producing frames yet
-    ///      („published_live_frame“ is still false — we are still in the
-    ///       pure‑GDI bootstrapper phase).
-    ///   2. At least 50 ms have elapsed since the last publish, so the
-    ///      live window does not go blank between sporadic GDI operations.
+    /// 1. D3D has **not** started producing frames yet
+    ///    („published_live_frame“ is still false — we are still in the
+    ///    pure‑GDI bootstrapper phase).
+    /// 2. At least 50 ms have elapsed since the last publish, so the
+    ///    live window does not go blank between sporadic GDI operations.
     ///
     /// Once `published_live_frame` becomes true (the 64‑bit Steam client
     /// has started and its D3D swapchain presents are flowing), this
@@ -10076,13 +10055,11 @@ impl PeHostRuntime {
         let object = self.dc_selected_objects.get(&hdc).copied()?;
         let bitmap = self.gdi_bitmaps.get_mut(&object)?;
         // Refresh the host-side mirror from guest memory.
-        if bitmap.guest_pixel_ptr != 0 && !bitmap.bytes.is_empty() {
-            if let Ok(slice) = memory.read_bytes(bitmap.guest_pixel_ptr, bitmap.bytes.len()) {
-                if slice.len() == bitmap.bytes.len() {
+        if bitmap.guest_pixel_ptr != 0 && !bitmap.bytes.is_empty()
+            && let Ok(slice) = memory.read_bytes(bitmap.guest_pixel_ptr, bitmap.bytes.len())
+                && slice.len() == bitmap.bytes.len() {
                     bitmap.bytes.copy_from_slice(&slice);
                 }
-            }
-        }
         Some((object, bitmap.clone()))
     }
 
@@ -10097,6 +10074,7 @@ impl PeHostRuntime {
     /// Only `SRCCOPY` (0x00CC0020) is implemented pixel-faithfully; the other
     /// ternary raster ops fall back to a plain copy (good enough for the vast
     /// majority of app-side BitBlt usage, which is SRCCOPY).
+#[allow(clippy::too_many_arguments)]
     fn blit_dc_to_dc(
         &mut self,
         memory: &mut MemoryImage,
@@ -10154,8 +10132,8 @@ impl PeHostRuntime {
                     if sy >= src_h || sx >= src_w {
                         continue;
                     }
-                    let tx = x_dest as i64 + dx as i64;
-                    let ty = y_dest as i64 + dy as i64;
+                    let tx = x_dest + dx as i64;
+                    let ty = y_dest + dy as i64;
                     if tx < 0 || ty < 0 {
                         continue;
                     }
@@ -10198,8 +10176,8 @@ impl PeHostRuntime {
                     if sy >= src_h || sx >= src_w {
                         continue;
                     }
-                    let tx = x_dest as i64 + dx as i64;
-                    let ty = y_dest as i64 + dy as i64;
+                    let tx = x_dest + dx as i64;
+                    let ty = y_dest + dy as i64;
                     if tx < 0 || ty < 0 {
                         continue;
                     }
@@ -11520,16 +11498,13 @@ impl PeHostRuntime {
         // Find the module info for this handle
         let dll_info = self.dll_info_table.get(&handle);
         match dll_info {
-            Some(info) => {
+            Some(info)
                 // We have the DLL info with a host path — check its timestamp.
                 // host_path is a String; empty means synthetic module.
-                if !info.host_path.is_empty() {
+                if !info.host_path.is_empty() => {
                     check_dll_timestamp(Path::new(&info.host_path), expected_timestamp)
-                } else {
-                    // Synthetic module — can't validate, conservatively fail
-                    false
                 }
-            }
+            Some(_) => false,
             None => false,
         }
     }
@@ -11544,9 +11519,9 @@ impl PeHostRuntime {
         // registered for this thunk address, call it directly. This skips
         // the dispatch_import match entirely for JIT-compiled call sites
         // and provides a measurable speed-up for frequently-called thunks.
-        if let Some(idx) = self.thunk_to_fast_index.get(&thunk_address) {
-            if let Some(jit) = self.jit_runtime.as_ref() {
-                if let Some(trampoline) = jit.lookup_thunk_address(*idx) {
+        if let Some(idx) = self.thunk_to_fast_index.get(&thunk_address)
+            && let Some(jit) = self.jit_runtime.as_ref()
+                && let Some(trampoline) = jit.lookup_thunk_address(*idx) {
                     emit_live_ui_debug(format!(
                         "fast-thunk dispatch for thunk {:#x} (idx={})",
                         thunk_address, idx
@@ -11591,8 +11566,6 @@ impl PeHostRuntime {
                         code => Ok(Some(Some(code))), // Guest exit code
                     };
                 }
-            }
-        }
 
         // Fallback: check the standard host_thunks table
         let Some(thunk) = self.host_thunks.get(&thunk_address).cloned() else {
@@ -11882,7 +11855,7 @@ impl PeHostRuntime {
                     // Write 0 bytes returned to signal no data.
                     write_u32(memory, data_size_ptr, 0);
                 }
-                state.set(Register::Rax, 0x8007004E_u64.wrapping_neg() as u64); // DXGI_ERROR_NOT_FOUND
+                state.set(Register::Rax, 0x8007004E_u64.wrapping_neg()); // DXGI_ERROR_NOT_FOUND
                 self.last_error = 0x4E; // ERROR_NOT_FOUND
             }
             HostThunk::DXGIFactoryGetParent => {
@@ -11892,7 +11865,7 @@ impl PeHostRuntime {
                 if out_ptr != 0 {
                     write_u64(memory, out_ptr, 0);
                 }
-                state.set(Register::Rax, 0x80040154_u64.wrapping_neg() as u64); // CLASS_E_CLASSNOTAVAILABLE
+                state.set(Register::Rax, 0x80040154_u64.wrapping_neg()); // CLASS_E_CLASSNOTAVAILABLE
                 self.last_error = 0;
             }
             HostThunk::DXGIFactoryCreateSoftwareAdapter => {
@@ -12516,20 +12489,20 @@ impl PeHostRuntime {
                             data.len() as u32
                         };
                         if data_size_ptr != 0 {
-                            let _ = memory.write_u32(data_size_ptr, copy_len);
+                            memory.write_u32(data_size_ptr, copy_len);
                         }
                         state.set(Register::Rax, 0); // S_OK
                     } else {
                         if data_size_ptr != 0 {
-                            let _ = memory.write_u32(data_size_ptr, 0);
+                            memory.write_u32(data_size_ptr, 0);
                         }
-                        state.set(Register::Rax, 0x8007004E_u64.wrapping_neg() as u64); // NOT_FOUND
+                        state.set(Register::Rax, 0x8007004E_u64.wrapping_neg()); // NOT_FOUND
                     }
                 } else {
                     if data_size_ptr != 0 {
-                        let _ = memory.write_u32(data_size_ptr, 0);
+                        memory.write_u32(data_size_ptr, 0);
                     }
-                    state.set(Register::Rax, 0x8007004E_u64.wrapping_neg() as u64); // NOT_FOUND
+                    state.set(Register::Rax, 0x8007004E_u64.wrapping_neg()); // NOT_FOUND
                 }
                 self.last_error = 0;
             }
@@ -12875,7 +12848,7 @@ impl PeHostRuntime {
                     state.set(Register::Rax, 0); // S_OK
                     self.last_error = 0;
                 } else {
-                    state.set(Register::Rax, 0x80070057_u64.wrapping_neg() as u64); // E_INVALIDARG
+                    state.set(Register::Rax, 0x80070057_u64.wrapping_neg()); // E_INVALIDARG
                     self.last_error = 0;
                 }
             }
@@ -13049,7 +13022,7 @@ impl PeHostRuntime {
                 let _riid = state.get(Register::R8);
                 let _out_resource = state.get(Register::R9);
                 // Shared resource not supported.
-                state.set(Register::Rax, 0x80070057_u64.wrapping_neg() as u64); // E_INVALIDARG
+                state.set(Register::Rax, 0x80070057_u64.wrapping_neg()); // E_INVALIDARG
                 self.last_error = 0;
             }
             // -- DXGI Adapter methods (Phase 5.5 #2) --
@@ -13077,7 +13050,7 @@ impl PeHostRuntime {
                 if data_size_ptr != 0 {
                     write_u32(memory, data_size_ptr, 0);
                 }
-                state.set(Register::Rax, 0x8007004E_u64.wrapping_neg() as u64); // DXGI_ERROR_NOT_FOUND
+                state.set(Register::Rax, 0x8007004E_u64.wrapping_neg()); // DXGI_ERROR_NOT_FOUND
                 self.last_error = 0;
             }
             HostThunk::DXGIAdapterGetParent => {
@@ -13087,7 +13060,7 @@ impl PeHostRuntime {
                 if out_ptr != 0 {
                     write_u64(memory, out_ptr, 0);
                 }
-                state.set(Register::Rax, 0x80040154_u64.wrapping_neg() as u64); // CLASS_E_CLASSNOTAVAILABLE
+                state.set(Register::Rax, 0x80040154_u64.wrapping_neg()); // CLASS_E_CLASSNOTAVAILABLE
                 self.last_error = 0;
             }
             HostThunk::DXGIAdapterEnumOutputs => {
@@ -13282,28 +13255,24 @@ impl PeHostRuntime {
                 let a = f32::from_bits(memory.read_u32(stack + 0x38)?);
                 let color = [(r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8, (a * 255.0) as u8];
                 if let Ok(deferred) = self.d3d11_deferred_context(context_object) {
-                    if let Ok(view_id) = self.d3d11_view(view) {
-                        if let Ok(device) = self.d3d11_device_mut(deferred.device_object) {
-                            if let Err(error) = device.device.clear_render_target_view(view_id.view_id, color) {
+                    if let Ok(view_id) = self.d3d11_view(view)
+                        && let Ok(device) = self.d3d11_device_mut(deferred.device_object)
+                            && let Err(error) = device.device.clear_render_target_view(view_id.view_id, color) {
                                 eprintln!(
                                     "[pe_runtime] D3D11 ClearRenderTargetView failed (deferred): {}",
                                     error
                                 );
                             }
-                        }
-                    }
                 } else {
                     let context = self.d3d11_context(context_object)?;
-                    if let Ok(view_id) = self.d3d11_view(view) {
-                        if let Ok(dev) = self.d3d11_device_mut(context.device_object) {
-                            if let Err(error) = dev.device.clear_render_target_view(view_id.view_id, color) {
+                    if let Ok(view_id) = self.d3d11_view(view)
+                        && let Ok(dev) = self.d3d11_device_mut(context.device_object)
+                            && let Err(error) = dev.device.clear_render_target_view(view_id.view_id, color) {
                                 eprintln!(
                                     "[pe_runtime] D3D11 ClearRenderTargetView failed: {}",
                                     error
                                 );
                             }
-                        }
-                    }
                 }
                 state.set(Register::Rax, 0);
                 self.last_error = 0;
@@ -13316,30 +13285,26 @@ impl PeHostRuntime {
                 let depth = f32::from_bits(state.get(Register::R9) as u32);
                 let stack = state.get(Register::Rsp);
                 let stencil = memory.read_u8(stack + 0x20)?;
-                let depth_bits = ((depth * 65535.0) as u32).min(0xFFFFFFFF);
+                let depth_bits = (depth * 65535.0) as u32 ;
                 if let Ok(deferred) = self.d3d11_deferred_context(context_object) {
-                    if let Ok(view_id) = self.d3d11_view(view) {
-                        if let Ok(device) = self.d3d11_device_mut(deferred.device_object) {
-                            if let Err(error) = device.device.clear_depth_stencil_view(view_id.view_id, depth_bits, stencil) {
+                    if let Ok(view_id) = self.d3d11_view(view)
+                        && let Ok(device) = self.d3d11_device_mut(deferred.device_object)
+                            && let Err(error) = device.device.clear_depth_stencil_view(view_id.view_id, depth_bits, stencil) {
                                 eprintln!(
                                     "[pe_runtime] D3D11 ClearDepthStencilView failed (deferred): {}",
                                     error
                                 );
                             }
-                        }
-                    }
                 } else {
                     let context = self.d3d11_context(context_object)?;
-                    if let Ok(view_id) = self.d3d11_view(view) {
-                        if let Ok(dev) = self.d3d11_device_mut(context.device_object) {
-                            if let Err(error) = dev.device.clear_depth_stencil_view(view_id.view_id, depth_bits, stencil) {
+                    if let Ok(view_id) = self.d3d11_view(view)
+                        && let Ok(dev) = self.d3d11_device_mut(context.device_object)
+                            && let Err(error) = dev.device.clear_depth_stencil_view(view_id.view_id, depth_bits, stencil) {
                                 eprintln!(
                                     "[pe_runtime] D3D11 ClearDepthStencilView failed: {}",
                                     error
                                 );
                             }
-                        }
-                    }
                 }
                 state.set(Register::Rax, 0);
                 self.last_error = 0;
@@ -14200,8 +14165,8 @@ impl PeHostRuntime {
                 let src_subresource = memory.read_u32(sp + 0x30)?;
                 let _src_box_ptr = read_guest_pointer(memory, sp + 0x38, self.guest_arch)?;
                 // Forward to device.copy_subresource_region().
-                if let Ok(dst_buffer) = self.d3d11_buffer(dst_resource) {
-                    if let Ok(src_buffer) = self.d3d11_buffer(src_resource) {
+                if let Ok(dst_buffer) = self.d3d11_buffer(dst_resource)
+                    && let Ok(src_buffer) = self.d3d11_buffer(src_resource) {
                         if let Ok(deferred) = self.d3d11_deferred_context(context_object) {
                             self.d3d11_device_mut(deferred.device_object)?.device.copy_subresource_region(
                                 src_buffer.resource_id, dst_buffer.resource_id,
@@ -14213,7 +14178,6 @@ impl PeHostRuntime {
                                 src_subresource as usize, dst_subresource as usize, 0)?;
                         }
                     }
-                }
                 state.set(Register::Rax, 0);
                 self.last_error = 0;
                 self.push_trace("d3d11", "ID3D11DeviceContext::CopySubresourceRegion",
@@ -14224,8 +14188,8 @@ impl PeHostRuntime {
                 let dst_resource = state.get(Register::Rdx);
                 let src_resource = state.get(Register::R8);
                 // Forward to device.copy_resource().
-                if let Ok(dst_buffer) = self.d3d11_buffer(dst_resource) {
-                    if let Ok(src_buffer) = self.d3d11_buffer(src_resource) {
+                if let Ok(dst_buffer) = self.d3d11_buffer(dst_resource)
+                    && let Ok(src_buffer) = self.d3d11_buffer(src_resource) {
                         if let Ok(deferred) = self.d3d11_deferred_context(context_object) {
                             self.d3d11_device_mut(deferred.device_object)?.device.copy_resource(
                                 src_buffer.resource_id, dst_buffer.resource_id)?;
@@ -14235,7 +14199,6 @@ impl PeHostRuntime {
                                 src_buffer.resource_id, dst_buffer.resource_id)?;
                         }
                     }
-                }
                 state.set(Register::Rax, 0);
                 self.last_error = 0;
                 self.push_trace("d3d11", "ID3D11DeviceContext::CopyResource",
@@ -14247,8 +14210,8 @@ impl PeHostRuntime {
                 let src_view = state.get(Register::R8);
                 let aligned_byte_offset = state.get(Register::R9) as u32;
                 // Forward to device.copy_structure_count().
-                if let Ok(dst) = self.d3d11_buffer(dst_buffer) {
-                    if let Ok(src) = self.d3d11_view(src_view) {
+                if let Ok(dst) = self.d3d11_buffer(dst_buffer)
+                    && let Ok(src) = self.d3d11_view(src_view) {
                         if let Ok(deferred) = self.d3d11_deferred_context(context_object) {
                             deferred.deferred_context.copy_structure_count(dst.resource_id, src.view_id, aligned_byte_offset)?;
                         } else {
@@ -14257,7 +14220,6 @@ impl PeHostRuntime {
                                 dst.resource_id, src.view_id, aligned_byte_offset);
                         }
                     }
-                }
                 state.set(Register::Rax, 0);
                 self.last_error = 0;
                 self.push_trace("d3d11", "ID3D11DeviceContext::CopyStructureCount",
@@ -15547,7 +15509,7 @@ impl PeHostRuntime {
                     let alpha_blend = dev.state.render_states[crate::d3d11::D3DRS_ALPHABLENDENABLE as usize] != 0;
                     let fog_enable = dev.state.render_states[crate::d3d11::D3DRS_FOGENABLE as usize] != 0;
                     let scene = FixedFunctionScene {
-                        texture_factor: dev.state.texture_stage_states[0][crate::d3d11::D3DTSS_COLOROP as usize] as u32,
+                        texture_factor: dev.state.texture_stage_states[0][crate::d3d11::D3DTSS_COLOROP as usize],
                         diffuse_color: [
                             (diffuse[0].clamp(0.0, 1.0) * 255.0) as u8,
                             (diffuse[1].clamp(0.0, 1.0) * 255.0) as u8,
@@ -15604,7 +15566,7 @@ impl PeHostRuntime {
                     let alpha_blend = dev.state.render_states[crate::d3d11::D3DRS_ALPHABLENDENABLE as usize] != 0;
                     let fog_enable = dev.state.render_states[crate::d3d11::D3DRS_FOGENABLE as usize] != 0;
                     let scene = FixedFunctionScene {
-                        texture_factor: dev.state.texture_stage_states[0][crate::d3d11::D3DTSS_COLOROP as usize] as u32,
+                        texture_factor: dev.state.texture_stage_states[0][crate::d3d11::D3DTSS_COLOROP as usize],
                         diffuse_color: [
                             (diffuse[0].clamp(0.0, 1.0) * 255.0) as u8,
                             (diffuse[1].clamp(0.0, 1.0) * 255.0) as u8,
@@ -15787,13 +15749,11 @@ impl PeHostRuntime {
                 let _pool = read_guest_u32(memory, stack + 0x20)?;
                 let pp_vb = memory.read_u64(stack + 0x28)?;
                 let _p_shared = memory.read_u64(stack + 0x30)?;
-                if pp_vb == 0 {
-                    state.set(Register::Rax, E_INVALIDARG);
-                } else if length == 0 {
+                if pp_vb == 0 || length == 0 {
                     state.set(Register::Rax, E_INVALIDARG);
                 } else {
                     // Compute stride from FVF if possible, default to 32 bytes
-                    let stride = if fvf != 0 { 32u32 } else { 32u32 };
+                    let stride = 32u32;
                     match self.alloc_d3d9_vertex_buffer_object(memory, length, fvf, stride) {
                         Ok(vb_object) => {
                             write_u64(memory, pp_vb, vb_object);
@@ -16167,10 +16127,10 @@ impl PeHostRuntime {
                 //                 DWORD dwFlags)
                 let swapchain_object = state.get(Register::Rcx);
                 if let Some(device_object) = self.d3d9_swapchains.get(&swapchain_object).copied() {
-                    if let Some(shim) = self.d3d9_shim.as_mut() {
-                        if let Some(dev) = self.d3d9_devices.get(&device_object) {
-                            if let Ok(frame) = shim.present(dev.id) {
-                                if self.live_session.is_some() && !self.published_live_frame {
+                    if let Some(shim) = self.d3d9_shim.as_mut()
+                        && let Some(dev) = self.d3d9_devices.get(&device_object)
+                            && let Ok(frame) = shim.present(dev.id)
+                                && self.live_session.is_some() && !self.published_live_frame {
                                     let live_frame = LiveFrame {
                                         width: frame.width,
                                         height: frame.height,
@@ -16181,9 +16141,6 @@ impl PeHostRuntime {
                                     self.publish_live_frame(live_frame);
                                     self.published_live_frame = true;
                                 }
-                            }
-                        }
-                    }
                     state.set(Register::Rax, 0);
                 } else {
                     state.set(Register::Rax, D3DERR_INVALIDCALL);
@@ -16564,14 +16521,13 @@ impl PeHostRuntime {
                 let volumes_ptr = state.get(Register::R8);
                 let voice = self.xaudio_mastering_voice(voice_object)
                     .or_else(|_| self.xaudio_source_voice(voice_object));
-                if let Ok(voice) = voice {
-                    if volumes_ptr != 0 && channels > 0 {
+                if let Ok(voice) = voice
+                    && volumes_ptr != 0 && channels > 0 {
                         for ch in 0..channels as usize {
                             let vol = f32::from_bits(memory.read_u32(volumes_ptr + ch as u64 * 4)?);
                             self.audio.set_channel_volume(voice.voice_id, ch, vol)?;
                         }
                     }
-                }
                 state.set(Register::Rax, 0);
                 self.last_error = 0;
                 self.push_trace("audio", "IXAudio2Voice::SetChannelVolumes", BTreeMap::from([
@@ -16584,14 +16540,13 @@ impl PeHostRuntime {
                 let volumes_ptr = state.get(Register::R8);
                 let voice = self.xaudio_mastering_voice(voice_object)
                     .or_else(|_| self.xaudio_source_voice(voice_object));
-                if let Ok(voice) = voice {
-                    if volumes_ptr != 0 && channels > 0 {
+                if let Ok(voice) = voice
+                    && volumes_ptr != 0 && channels > 0 {
                         for ch in 0..channels as usize {
                             let vol = self.audio.channel_volume(voice.voice_id, ch)?;
                             write_u32(memory, volumes_ptr + ch as u64 * 4, vol.to_bits());
                         }
                     }
-                }
                 state.set(Register::Rax, 0);
                 self.last_error = 0;
                 self.push_trace("audio", "IXAudio2Voice::GetChannelVolumes", BTreeMap::new(), json!(0));
@@ -16610,8 +16565,8 @@ impl PeHostRuntime {
                 let matrix_ptr = guest_call_arg(state, memory, 3)?;
                 let voice = self.xaudio_mastering_voice(voice_object)
                     .or_else(|_| self.xaudio_source_voice(voice_object));
-                if let Ok(voice) = voice {
-                    if matrix_ptr != 0 && src_channels > 0 && dst_channels > 0 {
+                if let Ok(voice) = voice
+                    && matrix_ptr != 0 && src_channels > 0 && dst_channels > 0 {
                         let format = self.audio.voice_format(voice.voice_id)?;
                         let actual_src = format.channels as u32;
                         let matrix = default_output_matrix(actual_src as usize, dst_channels as usize);
@@ -16623,7 +16578,6 @@ impl PeHostRuntime {
                             }
                         }
                     }
-                }
                 state.set(Register::Rax, 0);
                 self.last_error = 0;
                 self.push_trace("audio", "IXAudio2Voice::GetOutputMatrix", BTreeMap::new(), json!(0));
@@ -16647,8 +16601,8 @@ impl PeHostRuntime {
             HostThunk::XAudio2SourceVoiceGetState => {
                 let source_object = state.get(Register::Rcx);
                 let state_ptr = state.get(Register::Rdx);
-                if state_ptr != 0 {
-                    if let Ok(source_voice) = self.xaudio_source_voice(source_object) {
+                if state_ptr != 0
+                    && let Ok(source_voice) = self.xaudio_source_voice(source_object) {
                         let played = self.audio.played_frames(source_voice.voice_id)?;
                         let queued = self.audio.queued_source_frames(source_voice.voice_id)? as u64;
                         // XAUDIO2_VOICE_STATE: pCurrentBufferContext(8), BuffersQueued(4), SamplesPlayed(8)
@@ -16656,7 +16610,6 @@ impl PeHostRuntime {
                         write_u32(memory, state_ptr + 8, queued as u32);
                         write_u64(memory, state_ptr + 12, played);
                     }
-                }
                 state.set(Register::Rax, 0);
                 self.last_error = 0;
                 self.push_trace("audio", "IXAudio2SourceVoice::GetState", BTreeMap::new(), json!(0));
@@ -16773,9 +16726,9 @@ impl PeHostRuntime {
                     state.set(Register::Rax, E_INVALIDARG);
                 } else {
                     let out_ptr = state.get(Register::Rdx);
-                    if out_ptr != 0 {
-                        if let Some(instance_id) = self.xapo_effect_instances.get(&object).copied() {
-                            if let Some(props) = self.xapo_manager.instance_registration(instance_id) {
+                    if out_ptr != 0
+                        && let Some(instance_id) = self.xapo_effect_instances.get(&object).copied()
+                            && let Some(props) = self.xapo_manager.instance_registration(instance_id) {
                                 // Write the XAPO_REGISTRATION_PROPERTIES structure to guest memory.
                                 // Layout (COM repr(C)):
                                 //   0:  clsid (16 bytes)
@@ -16806,8 +16759,6 @@ impl PeHostRuntime {
                                 write_u32(memory, out_ptr + 1060, props.min_output_buffer_count);
                                 write_u32(memory, out_ptr + 1064, props.max_output_buffer_count);
                             }
-                        }
-                    }
                     state.set(Register::Rax, 0);
                     self.push_trace("audio", "IXAPO::GetRegistrationProperties", BTreeMap::new(), json!(0));
                 }
@@ -16859,10 +16810,10 @@ impl PeHostRuntime {
                         // XAPO_BUFFER layout: audio_data_ptr(8), flags(4), valid_frame_count(4)
                         let input_data_ptr = memory.read_u64(input_buf_ptr)?;
                         let _input_flags = memory.read_u32(input_buf_ptr + 8)?;
-                        let input_valid_frames = memory.read_u32(input_buf_ptr + 12)? as u32;
+                        let input_valid_frames = memory.read_u32(input_buf_ptr + 12)?;
                         let output_data_ptr = memory.read_u64(output_buf_ptr)?;
                         let _output_flags = memory.read_u32(output_buf_ptr + 8)?;
-                        let _output_valid_frames = memory.read_u32(output_buf_ptr + 12)? as u32;
+                        let _output_valid_frames = memory.read_u32(output_buf_ptr + 12)?;
 
                         if input_data_ptr == 0 || output_data_ptr == 0 || input_valid_frames == 0 {
                             state.set(Register::Rax, E_INVALIDARG);
@@ -16895,8 +16846,8 @@ impl PeHostRuntime {
 
                             // Write output samples back to guest memory
                             let out_sample_count = out_samples.min(output_buf.len());
-                            for i in 0..out_sample_count {
-                                write_u32(memory, output_data_ptr + (i * 4) as u64, output_buf[i].to_bits());
+                            for (i, sample) in output_buf.iter().enumerate().take(out_sample_count) {
+                                write_u32(memory, output_data_ptr + (i as u64 * 4), sample.to_bits());
                             }
                             write_u32(memory, output_buf_ptr + 12, input_valid_frames);
 
@@ -16997,7 +16948,7 @@ impl PeHostRuntime {
                             state.set(Register::Rax, 0);
                         }
                         Err(_e) => {
-                            state.set(Register::Rax, 0x80070057u64 as u64); // E_INVALIDARG
+                            state.set(Register::Rax, 80070057_u64); // E_INVALIDARG
                         }
                     }
                     self.push_trace(
@@ -17095,18 +17046,17 @@ impl PeHostRuntime {
                                         if idx < bytes_to_write {
                                             buf[idx] = 0x80;
                                         }
-                                    } else if let Some(idx) = button_name.strip_prefix("key_").and_then(|s| s.parse::<usize>().ok()) {
-                                        if idx < bytes_to_write {
+                                    } else if let Some(idx) = button_name.strip_prefix("key_").and_then(|s| s.parse::<usize>().ok())
+                                        && idx < bytes_to_write {
                                             buf[idx] = 0x80;
                                         }
-                                    }
                                 }
                                 memory.map_bytes(data_ptr, &buf);
                             }
                             state.set(Register::Rax, 0);
                         }
                         Err(_) => {
-                            state.set(Register::Rax, 0x80070005u64 as u64); // DIERR_NOTACQUIRED
+                            state.set(Register::Rax, 80070005_u64); // DIERR_NOTACQUIRED
                         }
                     }
                 } else {
@@ -17348,7 +17298,7 @@ impl PeHostRuntime {
                     // The guest passes a DIEFFECT structure; for simplicity we
                     // read only the common fields.
                     let magnitude = memory.read_u32(effect_ptr + 8)?; // dwMagnitude
-                    let duration = memory.read_u32(effect_ptr + 0)?;  // dwDuration
+                    let duration = memory.read_u32(effect_ptr)?;  // dwDuration
                     let gain = memory.read_u32(effect_ptr + 12)?;     // dwGain
                     let sample_period = memory.read_u32(effect_ptr + 16)?; // dwSamplePeriod
                     let _attack_time = memory.read_u32(effect_ptr + 28)?;
@@ -18005,28 +17955,28 @@ impl PeHostRuntime {
                 let max_messages = arg(3) as usize;
                 let mut sockets = STEAM_NET_SOCKETS.lock().unwrap();
                 let mut count = 0i64;
-                if let Some(s) = sockets.as_mut() {
-                    if let Ok(msgs) = s.receive_messages_on_listen_socket(listen_handle) {
+                if let Some(s) = sockets.as_mut()
+                    && let Ok(msgs) = s.receive_messages_on_listen_socket(listen_handle) {
                         count = msgs.len().min(max_messages) as i64;
                         // Write each message pointer to the output array (simplified)
                         // In a full implementation we'd write SteamNetworkingMessage_t
                         // structs to guest memory.
                         for (i, msg) in msgs.iter().enumerate().take(count as usize) {
                             // Write a minimal placeholder: just the data pointer
-                            let msg_data_addr = self.alloc_heap(memory, msg.data.len(), false)
-                                .and_then(|addr| {
+                            let msg_data_addr = match self.alloc_heap(memory, msg.data.len(), false) {
+                                Ok(addr) => {
                                     for (j, &byte) in msg.data.iter().enumerate() {
                                         memory.write_u8(addr + j as u64, byte);
                                     }
-                                    Ok(addr)
-                                })
-                                .unwrap_or(0);
+                                    addr
+                                }
+                                Err(_) => 0,
+                            };
                             if msg_data_addr != 0 && out_ptr != 0 {
                                 memory.write_u64(out_ptr + (i as u64) * 8, msg_data_addr);
                             }
                         }
                     }
-                }
                 state.set(Register::Rax, count as u64);
                 self.last_error = 0;
                 self.push_trace("steam_net_sockets", "ReceiveMessagesOnListenSocket",
@@ -18253,24 +18203,24 @@ impl PeHostRuntime {
                 let out_ptr = arg(3);
                 let mut messages = STEAM_NET_MESSAGES.lock().unwrap();
                 let mut count = 0i64;
-                if let Some(m) = messages.as_mut() {
-                    if let Ok(msgs) = m.receive_messages_on_channel() {
+                if let Some(m) = messages.as_mut()
+                    && let Ok(msgs) = m.receive_messages_on_channel() {
                         count = msgs.len().min(max_messages) as i64;
                         for (i, msg) in msgs.iter().enumerate().take(count as usize) {
-                            let msg_data_addr = self.alloc_heap(memory, msg.data.len(), false)
-                                .and_then(|addr| {
+                            let msg_data_addr = match self.alloc_heap(memory, msg.data.len(), false) {
+                                Ok(addr) => {
                                     for (j, &byte) in msg.data.iter().enumerate() {
                                         memory.write_u8(addr + j as u64, byte);
                                     }
-                                    Ok(addr)
-                                })
-                                .unwrap_or(0);
+                                    addr
+                                }
+                                Err(_) => 0,
+                            };
                             if msg_data_addr != 0 && out_ptr != 0 {
                                 memory.write_u64(out_ptr + (i as u64) * 8, msg_data_addr);
                             }
                         }
                     }
-                }
                 state.set(Register::Rax, count as u64);
                 self.last_error = 0;
                 self.push_trace("steam_net_messages", "ReceiveMessagesOnChannel",
@@ -19415,7 +19365,7 @@ impl PeHostRuntime {
                 let height = arg(4) as u32;
                 let mut rgba = Vec::new();
                 if rgba_ptr != 0 {
-                    rgba = read_memory_slice(memory, rgba_ptr, (_rgba_size as usize).min(4 * 1024 * 1024)).unwrap_or_default();
+                    rgba = read_memory_slice(memory, rgba_ptr, _rgba_size.min(4 * 1024 * 1024)).unwrap_or_default();
                 }
                 let mut ss = STEAM_SCREENSHOTS.lock().unwrap();
                 if ss.is_none() { *ss = Some(crate::steam_integration::SteamScreenshots::new()); }
@@ -20241,8 +20191,8 @@ impl PeHostRuntime {
                 };
                 let bounds = if bounds_ptr != 0 {
                     let mut b = [0.0f32; 4];
-                    for i in 0..4 {
-                        b[i] = f32::from_bits(memory.read_u32(bounds_ptr + (i as u64 * 4))?);
+                    for (i, slot) in b.iter_mut().enumerate() {
+                        *slot = f32::from_bits(memory.read_u32(bounds_ptr + (i as u64 * 4))?);
                     }
                     Some(b)
                 } else {
@@ -20373,22 +20323,22 @@ impl PeHostRuntime {
                     let pose = crate::steamvr::TrackedDevicePose {
                         device_to_absolute_tracking: {
                             let mut m = [0.0f32; 12];
-                            for i in 0..12 {
-                                m[i] = f32::from_bits(memory.read_u32(pose_ptr + (i as u64 * 4))?);
+                            for (i, slot) in m.iter_mut().enumerate() {
+                                *slot = f32::from_bits(memory.read_u32(pose_ptr + (i as u64 * 4))?);
                             }
                             m
                         },
                         velocity: {
                             let mut v = [0.0f32; 3];
-                            for i in 0..3 {
-                                v[i] = f32::from_bits(memory.read_u32(pose_ptr + 48 + (i as u64 * 4))?);
+                            for (i, slot) in v.iter_mut().enumerate() {
+                                *slot = f32::from_bits(memory.read_u32(pose_ptr + 48 + (i as u64 * 4))?);
                             }
                             v
                         },
                         angular_velocity: {
                             let mut v = [0.0f32; 3];
-                            for i in 0..3 {
-                                v[i] = f32::from_bits(memory.read_u32(pose_ptr + 60 + (i as u64 * 4))?);
+                            for (i, slot) in v.iter_mut().enumerate() {
+                                *slot = f32::from_bits(memory.read_u32(pose_ptr + 60 + (i as u64 * 4))?);
                             }
                             v
                         },
@@ -20397,8 +20347,8 @@ impl PeHostRuntime {
                         pose_index: memory.read_u32(pose_ptr + 80)?,
                         raw_device_to_absolute_tracking: {
                             let mut m = [0.0f32; 12];
-                            for i in 0..12 {
-                                m[i] = f32::from_bits(memory.read_u32(pose_ptr + 84 + (i as u64 * 4))?);
+                            for (i, slot) in m.iter_mut().enumerate() {
+                                *slot = f32::from_bits(memory.read_u32(pose_ptr + 84 + (i as u64 * 4))?);
                             }
                             m
                         },
@@ -21207,12 +21157,11 @@ impl PeHostRuntime {
                     } else {
                         menu.items.iter().position(|i| i.id == id)
                     };
-                    if let Some(idx) = search_idx {
-                        if let Some(item) = menu.items.get_mut(idx) {
+                    if let Some(idx) = search_idx
+                        && let Some(item) = menu.items.get_mut(idx) {
                             prev_state = item.state;
                             item.state = if (flags & 0x00000008) != 0 { 0 } else { 1 };
                         }
-                    }
                 }
                 state.set(Register::Rax, prev_state as u64);
                 self.last_error = 0;
@@ -22083,8 +22032,8 @@ impl PeHostRuntime {
                     } else {
                         menu.items.iter().position(|i| i.id == pos)
                     };
-                    if let Some(idx) = search_idx {
-                        if idx < menu.items.len() {
+                    if let Some(idx) = search_idx
+                        && idx < menu.items.len() {
                             let text = if text_ptr == 0 {
                                 String::new()
                             } else if text_ptr >> 16 == 0 {
@@ -22097,7 +22046,6 @@ impl PeHostRuntime {
                             menu.items[idx].text = text;
                             menu.items[idx].sub_menu = if (flags & 0x00000001) != 0 { Some(id) } else { None };
                         }
-                    }
                     true
                 } else {
                     false
@@ -22121,11 +22069,10 @@ impl PeHostRuntime {
                     } else {
                         menu.items.iter().position(|i| i.id == pos)
                     };
-                    if let Some(idx) = search_idx {
-                        if idx < menu.items.len() {
+                    if let Some(idx) = search_idx
+                        && idx < menu.items.len() {
                             menu.items.remove(idx);
                         }
-                    }
                     true
                 } else {
                     false
@@ -22239,8 +22186,8 @@ impl PeHostRuntime {
                     search_idx.and_then(|idx| menu.items.get(idx)).map(|item| {
                         let text_utf16: Vec<u16> = item.text.encode_utf16().collect();
                         let copy_len = (text_utf16.len()).min(if buf_size > 0 { buf_size as usize - 1 } else { 0 });
-                        for i in 0..copy_len {
-                            memory.write_u16(buf_ptr.wrapping_add((i * 2) as u64), text_utf16[i]);
+                        for (i, &c) in text_utf16.iter().enumerate().take(copy_len) {
+                            memory.write_u16(buf_ptr.wrapping_add((i * 2) as u64), c);
                         }
                         if buf_size > 0 && copy_len < buf_size as usize {
                             memory.write_u16(buf_ptr.wrapping_add((copy_len * 2) as u64), 0u16);
@@ -22275,8 +22222,8 @@ impl PeHostRuntime {
                     } else {
                         menu.items.iter().position(|i| i.id == id)
                     };
-                    if let Some(idx) = search_idx {
-                        if let Some(item) = menu.items.get_mut(idx) {
+                    if let Some(idx) = search_idx
+                        && let Some(item) = menu.items.get_mut(idx) {
                             prev_state = item.flags & 0x00000008;
                             if (flags & 0x00000008) != 0 {
                                 item.flags |= 0x00000008;
@@ -22284,7 +22231,6 @@ impl PeHostRuntime {
                                 item.flags &= !0x00000008;
                             }
                         }
-                    }
                 }
                 state.set(Register::Rax, prev_state as u64);
                 self.last_error = 0;
@@ -23507,7 +23453,7 @@ impl PeHostRuntime {
                 };
                 // Ensure the stock object is registered in our GDI stores
                 // so that brush_to_bgra / fill_hdc_rect can resolve it.
-                if !self.gdi_objects.contains_key(&handle) {
+                if let std::collections::btree_map::Entry::Vacant(e) = self.gdi_objects.entry(handle) {
                     let label = match fn_object {
                         0..=5 => "stock-brush",
                         6..=8 => "stock-pen",
@@ -23517,7 +23463,7 @@ impl PeHostRuntime {
                         19 => "stock-dc-pen",
                         _ => "stock",
                     };
-                    self.gdi_objects.insert(handle, label.to_string());
+                    e.insert(label.to_string());
                     // Pre-register known stock brush colors (COLORREF: 0x00BBGGRR)
                     match fn_object {
                         0 => { self.gdi_brushes.insert(handle, 0x00ff_ffff); } // WHITE_BRUSH
@@ -25135,13 +25081,11 @@ impl PeHostRuntime {
                         .get(&handle)
                         .cloned()
                         .map(|name| normalize_module_name(&name));
-                    if let Some(ref norm) = normalized {
-                        if let Some(state) = self.loaded_real_dlls.get_mut(norm) {
-                            if state.refcount > 0 {
+                    if let Some(ref norm) = normalized
+                        && let Some(state) = self.loaded_real_dlls.get_mut(norm)
+                            && state.refcount > 0 {
                                 state.refcount -= 1;
                             }
-                        }
-                    }
                 }
 
                 state.set(Register::Rax, u64::from(released));
@@ -25352,12 +25296,11 @@ impl PeHostRuntime {
             HostThunk::ImageList_Remove => {
                 let himl = guest_call_arg(state, memory, 0)? as u32;
                 let i = guest_call_arg(state, memory, 1)? as i32;
-                if let Some(info) = self.image_lists.get_mut(&himl) {
-                    if i == -1 {
+                if let Some(info) = self.image_lists.get_mut(&himl)
+                    && i == -1 {
                         info.image_count = 0;
                         info.images.clear();
                     }
-                }
                 state.set(Register::Rax, 1);
                 self.last_error = 0;
                 self.push_trace("comctl32", "ImageList_Remove", BTreeMap::from([
@@ -25719,13 +25662,11 @@ impl PeHostRuntime {
                 let reg = guest_call_arg_u32(state, memory, 0)?;
                 let clsid_str = self.com_registration_tokens.remove(&reg);
                 // Also unregister from native COM apartment
-                if let Some(ref clsid) = clsid_str {
-                    if let Some(guid_bytes) = crate::real_win32::guid_from_string(clsid) {
-                        if let Some(apt) = self.com_apartment.as_mut() {
+                if let Some(ref clsid) = clsid_str
+                    && let Some(guid_bytes) = crate::real_win32::guid_from_string(clsid)
+                        && let Some(apt) = self.com_apartment.as_mut() {
                             apt.revoke_class_object(&guid_bytes);
                         }
-                    }
-                }
                 state.set(Register::Rax, 0);
                 self.last_error = 0;
                 self.push_trace(
@@ -27139,10 +27080,7 @@ impl PeHostRuntime {
                 let char_count = guest_call_arg(state, memory, 2)? as i32;
                 let output_ptr = guest_call_arg(state, memory, 3)?;
 
-                if string_ptr == 0 || output_ptr == 0 || char_count == 0 {
-                    state.set(Register::Rax, 0);
-                    self.last_error = ERROR_INVALID_PARAMETER;
-                } else if !matches!(info_type, CT_CTYPE1 | CT_CTYPE2 | CT_CTYPE3) {
+                if string_ptr == 0 || output_ptr == 0 || char_count == 0 || !matches!(info_type, CT_CTYPE1 | CT_CTYPE2 | CT_CTYPE3) {
                     state.set(Register::Rax, 0);
                     self.last_error = ERROR_INVALID_PARAMETER;
                 } else {
@@ -28342,8 +28280,7 @@ impl PeHostRuntime {
                         // Sleep 1 ms when the caller actually wanted to block
                         // (non-zero timeout), so the object has a chance to
                         // become signaled before the next poll.
-                        if timeout != 0 {
-                        }
+                        
                         if result_code == crate::win32::WAIT_TIMEOUT && timeout != 0 && !handles.is_empty() {
                             match self.win32.wait_for_single_object(handles[0], timeout, false, None) {
                                 Ok(crate::win32::WaitStatus::Object0) => {
@@ -29965,11 +29902,10 @@ impl PeHostRuntime {
                     // Existing heap allocation — allocate new block, copy old contents, free old
                     let copy_size = old_size.min(new_size as usize);
                     let new_addr = self.alloc_heap(memory, new_size as usize, true)?;
-                    if new_addr != 0 && copy_size > 0 {
-                        if let Ok(old_bytes) = memory.read_bytes(ptr, copy_size) {
+                    if new_addr != 0 && copy_size > 0
+                        && let Ok(old_bytes) = memory.read_bytes(ptr, copy_size) {
                             memory.map_bytes(new_addr, &old_bytes);
                         }
-                    }
                     self.heap_allocations.remove(&ptr);
                     state.set(Register::Rax, new_addr);
                 } else {
@@ -32389,7 +32325,7 @@ impl PeHostRuntime {
                 } else {
                     None
                 };
-                let result = size.unwrap_or_else(|| match self.guest_arch {
+                let result = size.unwrap_or(match self.guest_arch {
                     GuestArch::X64 => u64::MAX,
                     GuestArch::X86 => u32::MAX as u64,
                 });
@@ -32753,11 +32689,10 @@ impl PeHostRuntime {
                         .unwrap_or(false);
                     while !woke {
                         // Check timeout
-                        if let Some(deadline) = max_wait {
-                            if wait_start.elapsed() >= deadline {
+                        if let Some(deadline) = max_wait
+                            && wait_start.elapsed() >= deadline {
                                 break;
                             }
-                        }
                         // Pump pending guest threads for cooperative multitasking
                         if !self.pending_guest_threads.is_empty() {
                             self.pump_pending_guest_thread(memory)?;
@@ -33020,7 +32955,7 @@ impl PeHostRuntime {
                     state.set(Register::Rax, 0);
                     self.last_error = ERROR_INVALID_PARAMETER;
                 } else {
-                    let reported_size = read_u32(&memory, info_ptr)?;
+                    let reported_size = read_u32(memory, info_ptr)?;
                     let major: u32 = 10;
                     let minor: u32 = 0;
                     let build: u32 = 19045;
@@ -33347,9 +33282,7 @@ impl PeHostRuntime {
                 // Accept the pseudo-handle (0xFFFFFFFFFFFFFFFF or -1) or any non-zero handle
                 // as "this process".  In our single-process emulator we only support writing
                 // to the current guest process.
-                let is_current_process = h_process == 0
-                    || h_process == u64::MAX
-                    || h_process == 0xFFFFFFFFFFFFFFFF;
+                let is_current_process = h_process == 0 || h_process == u64::MAX;
 
                 if !is_current_process {
                     // Cannot write to other processes in our emulator.
@@ -34205,8 +34138,8 @@ impl PeHostRuntime {
                     let stride = if src_pitch != 0 { src_pitch } else { width * 4 };
                     let data_len = (stride * height) as usize;
                     let data = if src_data_ptr != 0 && data_len > 0 {
-                        let bytes = memory.read_bytes(src_data_ptr, data_len as usize)?;
-                        bytes
+                        
+                        memory.read_bytes(src_data_ptr, data_len as usize)?
                     } else {
                         vec![0u8; data_len]
                     };
@@ -34694,8 +34627,8 @@ impl PeHostRuntime {
             HostThunk::D2D1IsMatrixInvertible => {
                 let matrix_ptr = state.get(Register::Rcx);
                 let mut matrix = [0.0f32; 9];
-                for i in 0..6 {
-                    matrix[i] = read_guest_f32(memory, matrix_ptr + i as u64 * 4)?;
+                for (i, slot) in matrix.iter_mut().enumerate().take(6) {
+                    *slot = read_guest_f32(memory, matrix_ptr + i as u64 * 4)?;
                 }
                 let invertible = crate::d2d::d2d_is_matrix_invertible(&matrix);
                 state.set(Register::Rax, if invertible { 1 } else { 0 });
@@ -34704,8 +34637,8 @@ impl PeHostRuntime {
             HostThunk::D2D1InvertMatrix => {
                 let matrix_ptr = state.get(Register::Rcx);
                 let mut matrix = [0.0f32; 9];
-                for i in 0..6 {
-                    matrix[i] = read_guest_f32(memory, matrix_ptr + i as u64 * 4)?;
+                for (i, slot) in matrix.iter_mut().enumerate().take(6) {
+                    *slot = read_guest_f32(memory, matrix_ptr + i as u64 * 4)?;
                 }
                 let success = crate::d2d::d2d_invert_matrix(&mut matrix);
                 if success {
@@ -34808,8 +34741,8 @@ impl PeHostRuntime {
                 let written_ptr = guest_call_arg(state, memory, 3)?;
                 if let Some(job_id) = self.print_subsystem.active_job_for_printer(printer_handle) {
                     let mut data = vec![0u8; buffer_size as usize];
-                    for i in 0..buffer_size as usize {
-                        data[i] = memory.read_u8(buffer_ptr + i as u64)?;
+                    for (i, slot) in data.iter_mut().enumerate() {
+                        *slot = memory.read_u8(buffer_ptr + i as u64)?;
                     }
                     let ok = self.print_subsystem.write_printer(job_id, &data);
                     if ok && written_ptr != 0 {
@@ -34960,7 +34893,7 @@ impl PeHostRuntime {
                 let printer_ptr = guest_call_arg(state, memory, 2)?;
                 let _command = guest_call_arg_u32(state, memory, 3)?;
                 // Parse the PRINTER_INFO_* struct at printer_ptr and update printer properties.
-                if printer_ptr != 0 && level >= 1 && level <= 9 {
+                if printer_ptr != 0 && (1..=9).contains(&level) {
                     // Read the pPrinterName field (first pointer field in PRINTER_INFO_* structs)
                     let name_ptr = read_guest_pointer(memory, printer_ptr, self.guest_arch)?;
                     let _name = if name_ptr != 0 {
@@ -35465,7 +35398,7 @@ impl PeHostRuntime {
 
                     // Read the version info blob from guest memory
                     let w_length = read_guest_u16(memory, block_ptr)? as usize;
-                    if w_length < 6 || w_length > 0x10000 {
+                    if !(6..=0x10000).contains(&w_length) {
                         return Ok(false);
                     }
                     let blob = read_window(memory, block_ptr, w_length)?;
@@ -35481,8 +35414,7 @@ impl PeHostRuntime {
                         return Ok(false);
                     }
 
-                    if sub_block.starts_with("\\StringFileInfo\\") {
-                        let rest = &sub_block["\\StringFileInfo\\".len()..];
+                    if let Some(rest) = sub_block.strip_prefix("\\StringFileInfo\\") {
                         if let Some(dot_pos) = rest.find('\\') {
                             let lang_cp = &rest[..dot_pos];
                             let key_name = &rest[dot_pos + 1..];
@@ -36428,9 +36360,7 @@ impl PeHostRuntime {
                 let headers_length = guest_call_arg_u32(state, memory, 2)?;
                 let headers = if headers_ptr != 0 && headers_length > 0 {
                     let header_bytes = read_guest_bytes(memory, headers_ptr, headers_length as usize)?;
-                    if let Ok(s) = String::from_utf16(&header_bytes.iter().map(|&b| b as u16).collect::<Vec<_>>()) {
-                        s
-                    } else { String::new() }
+                    String::from_utf16(&header_bytes.iter().map(|&b| b as u16).collect::<Vec<_>>()).unwrap_or_default()
                 } else { String::new() };
                 match self.winhttp.win_http_add_request_headers(request_handle, &headers) {
                     Ok(()) => {
@@ -36946,15 +36876,14 @@ impl PeHostRuntime {
                         if status_ptr != 0 {
                             memory.write_u16(status_ptr, close_status as u16);
                         }
-                        if let Some(reason) = close_reason {
-                            if reason_ptr != 0 && !reason.is_empty() {
+                        if let Some(reason) = close_reason
+                            && reason_ptr != 0 && !reason.is_empty() {
                                 let reason_utf16: Vec<u16> = reason.encode_utf16().collect();
                                 let max_chars = (reason_length as usize).min(reason_utf16.len());
                                 for (i, &ch) in reason_utf16[..max_chars].iter().enumerate() {
                                     memory.write_u16(reason_ptr + (i as u64) * 2, ch);
                                 }
                             }
-                        }
                         state.set(Register::Rax, 0);
                         self.last_error = 0;
                     }
@@ -37520,7 +37449,7 @@ impl PeHostRuntime {
                     let total_page: u64 = 32 * 1024 * 1024 * 1024;
                     let avail_page: u64 = 16 * 1024 * 1024 * 1024;
                     let total_virt: u64 = 2 * 1024 * 1024 * 1024;  // 2 GB for x86
-                    let avail_virt: u64 = 1 * 1024 * 1024 * 1024;
+                    let avail_virt: u64 = 1024 * 1024 * 1024;
                     let memory_load = ((total_phys - avail_phys) * 100 / total_phys) as u32;
                     let offset = if self.guest_arch == GuestArch::X86 { 4u64 } else { 8u64 };
                     write_u32(memory, buffer_ptr, 64); // dwLength
@@ -37643,8 +37572,8 @@ impl PeHostRuntime {
                         rip: state.rip,
                         xmm: {
                             let mut xmm = [crate::seh::Xmm128::default(); 16];
-                            for i in 0..16 {
-                                xmm[i] = crate::seh::Xmm128 {
+                            for (i, slot) in xmm.iter_mut().enumerate() {
+                                *slot = crate::seh::Xmm128 {
                                     low: state.xmm[i].low,
                                     high: state.xmm[i].high,
                                 };
@@ -37722,8 +37651,8 @@ impl PeHostRuntime {
                 // gpr[0..16] (rax–r15), rip, xmm[0..16] (each 2×u64)
                 // Total: 17 GP registers + 16 XMM registers × 2 u64 = 49 u64 = 392 bytes
                 const CONTEXT_SIZE: usize = 49 * 8;
-                if self.guest_arch == GuestArch::X64 && context_ptr != 0 {
-                    if let Ok(data) = memory.read_bytes(context_ptr, CONTEXT_SIZE) {
+                if self.guest_arch == GuestArch::X64 && context_ptr != 0
+                    && let Ok(data) = memory.read_bytes(context_ptr, CONTEXT_SIZE) {
                         let read_u64_at = |offset: usize| -> u64 {
                             u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap())
                         };
@@ -37742,7 +37671,6 @@ impl PeHostRuntime {
                             }
                         }
                     }
-                }
                 state.set(Register::Rax, 0); // RtlRestoreContext does not return
                 self.last_error = 0;
                 self.push_trace(
@@ -38077,12 +38005,12 @@ impl PeHostRuntime {
                         let mut y = 1970u16;
                         let mut remaining = days;
                         loop {
-                            let diy = if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 { 366 } else { 365 };
+                            let diy = if (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400) { 366 } else { 365 };
                             if remaining < diy { break; }
                             remaining -= diy;
                             y += 1;
                         }
-                        let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+                        let leap = (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400);
                         let md: [u64; 12] = if leap { [31,29,31,30,31,30,31,31,30,31,30,31] } else { [31,28,31,30,31,30,31,31,30,31,30,31] };
                         let mut m = 1u16;
                         for &days_in_m in &md {
@@ -38095,8 +38023,6 @@ impl PeHostRuntime {
                     // Format: DATE_SHORTDATE (0x01) or default "yyyy-MM-dd"
                     let date_str = if flags & 0x01 != 0 {
                         format!("{}/{}/{}", month, day, year)
-                    } else if flags & 0x02 != 0 {
-                        format!("{:04}-{:02}-{:02}", year, month, day)
                     } else {
                         format!("{:04}-{:02}-{:02}", year, month, day)
                     };
@@ -38363,16 +38289,16 @@ impl PeHostRuntime {
             }
             HostThunk::DeactivateActCtx => {
                 let _dw_flags = arg(0);
-                let cookie = arg(1) as u64;
+                let cookie = arg(1);
                 // Find and remove the matching cookie from the stack.
                 // Windows pops the most recent matching activation context.
                 if let Some(pos) = self.activation_context_stack.iter().rposition(|&h| {
-                    self.activation_contexts.get(&h).map_or(false, |ctx| ctx.cookie == cookie)
+                    self.activation_contexts.get(&h).is_some_and(|ctx| ctx.cookie == cookie)
                 }) {
                     let handle = self.activation_context_stack.remove(pos);
                     // Reset comctl32 v6 if deactivating
-                    if let Some(ctx) = self.activation_contexts.get(&handle) {
-                        if let Some(ref manifest_info) = ctx.manifest_info {
+                    if let Some(ctx) = self.activation_contexts.get(&handle)
+                        && let Some(ref manifest_info) = ctx.manifest_info {
                             for asm in &manifest_info.assemblies {
                                 if asm.name == "Microsoft.Windows.Common-Controls"
                                     && asm.version.as_deref() == Some("6.0.0.0")
@@ -38381,7 +38307,6 @@ impl PeHostRuntime {
                                 }
                             }
                         }
-                    }
                     state.set(Register::Rax, 1); // TRUE
                     self.push_trace(
                         "sxs",
@@ -38488,8 +38413,8 @@ impl PeHostRuntime {
             HostThunk::KillTimer => {
                 let hwnd = arg(0) as u32;
                 let timer_id = arg(1) as usize;
-                let result = self.user32.kill_timer(hwnd, timer_id);
-                state.set(Register::Rax, if result { 1 } else { 1 }); // Always TRUE per Win32
+                let _result = self.user32.kill_timer(hwnd, timer_id);
+                state.set(Register::Rax, 1); // Always TRUE per Win32
             }
             HostThunk::MoveWindow => {
                 let hwnd = arg(0) as u32;
@@ -38526,15 +38451,12 @@ impl PeHostRuntime {
                     for i in 0..n {
                         let handle_addr = handles_ptr + (i as u64) * if self.guest_arch == GuestArch::X86 { 4 } else { 8 };
                         let handle = if self.guest_arch == GuestArch::X86 { read_u32(memory, handle_addr).unwrap_or(0) as u32 } else { memory.read_u64(handle_addr).unwrap_or(0) as u32 };
-                        match self.win32.wait_for_single_object(handle, 0, false, None) {
-                            Ok(WaitStatus::Object0) => { found = Some(i); break; }
-                            _ => {}
-                        }
+                        if let Ok(WaitStatus::Object0) = self.win32.wait_for_single_object(handle, 0, false, None) { found = Some(i); break; }
                     }
                     if let Some(idx) = found {
                         state.set(Register::Rax, idx as u64); // WAIT_OBJECT_0 + idx
                     } else if self.user32.message_queue_has_events(wake_mask) {
-                        state.set(Register::Rax, (n as u64) | 0); // WAIT_OBJECT_0 + n — msg available
+                        state.set(Register::Rax, n as u64 ); // WAIT_OBJECT_0 + n — msg available
                     } else {
                         state.set(Register::Rax, 0xFFFFFFFF); // WAIT_TIMEOUT
                         timed_out = true;
@@ -38561,10 +38483,7 @@ impl PeHostRuntime {
                     for i in 0..n {
                         let handle_addr = handles_ptr + (i as u64) * if self.guest_arch == GuestArch::X86 { 4 } else { 8 };
                         let handle = if self.guest_arch == GuestArch::X86 { read_u32(memory, handle_addr).unwrap_or(0) as u32 } else { memory.read_u64(handle_addr).unwrap_or(0) as u32 };
-                        match self.win32.wait_for_single_object(handle, 0, false, None) {
-                            Ok(WaitStatus::Object0) => { found = Some(i); break; }
-                            _ => {}
-                        }
+                        if let Ok(WaitStatus::Object0) = self.win32.wait_for_single_object(handle, 0, false, None) { found = Some(i); break; }
                     }
                     if let Some(idx) = found {
                         state.set(Register::Rax, idx as u64);
@@ -38600,7 +38519,7 @@ impl PeHostRuntime {
                 let class_name_ptr = arg(0);
                 let class_name = read_utf16_string(memory, class_name_ptr).unwrap_or_default();
                 let result = self.user32.unregister_class_w(&class_name);
-                state.set(Register::Rax, if result { 1 } else { 1 }); // Win32 returns TRUE on success
+                state.set(Register::Rax, if result { 1 } else { 0 }); // Win32 returns TRUE on success
             }
             HostThunk::WsprintfA => {
                 let dest_ptr = arg(0);
@@ -39101,10 +39020,7 @@ impl PeHostRuntime {
                 let bar = arg(1) as i32;
                 let lpsi = arg(2);
                 let _redraw = arg(3) != 0;
-                if hwnd == 0 || !self.user32.has_window(hwnd) {
-                    state.set(Register::Rax, 0);
-                    self.last_error = ERROR_INVALID_PARAMETER;
-                } else if lpsi == 0 {
+                if hwnd == 0 || !self.user32.has_window(hwnd) || lpsi == 0 {
                     state.set(Register::Rax, 0);
                     self.last_error = ERROR_INVALID_PARAMETER;
                 } else {
@@ -39144,11 +39060,10 @@ impl PeHostRuntime {
                     state.set(Register::Rax, info.pos as u64);
                     self.last_error = 0;
                     // Schedule redraw
-                    if _redraw && self.live_session.is_some() {
-                        if let Err(error) = self.user32.send_message_w(hwnd, MessageKind::Paint, 0, 0) {
+                    if _redraw && self.live_session.is_some()
+                        && let Err(error) = self.user32.send_message_w(hwnd, MessageKind::Paint, 0, 0) {
                             eprintln!("SetScrollInfo repaint failed for hwnd {hwnd:#x}: {error}");
                         }
-                    }
                 }
             }
             HostThunk::GetScrollInfo => {
@@ -39217,11 +39132,10 @@ impl PeHostRuntime {
                     info.pos = pos.clamp(info.min, info.max);
                     state.set(Register::Rax, prev_pos as u64);
                     self.last_error = 0;
-                    if _redraw && self.live_session.is_some() {
-                        if let Err(error) = self.user32.send_message_w(hwnd, MessageKind::Paint, 0, 0) {
+                    if _redraw && self.live_session.is_some()
+                        && let Err(error) = self.user32.send_message_w(hwnd, MessageKind::Paint, 0, 0) {
                             eprintln!("SetScrollPos repaint failed for hwnd {hwnd:#x}: {error}");
                         }
-                    }
                 }
             }
             HostThunk::GetScrollPos => {
@@ -39258,11 +39172,10 @@ impl PeHostRuntime {
                     if info.pos > info.max { info.pos = info.max; }
                     state.set(Register::Rax, 1); // TRUE
                     self.last_error = 0;
-                    if _redraw && self.live_session.is_some() {
-                        if let Err(error) = self.user32.send_message_w(hwnd, MessageKind::Paint, 0, 0) {
+                    if _redraw && self.live_session.is_some()
+                        && let Err(error) = self.user32.send_message_w(hwnd, MessageKind::Paint, 0, 0) {
                             eprintln!("SetScrollRange repaint failed for hwnd {hwnd:#x}: {error}");
                         }
-                    }
                 }
             }
             HostThunk::GetScrollRange => {
@@ -39360,17 +39273,16 @@ impl PeHostRuntime {
                         let _bottom = memory.read_u32(lprc_scroll + 12).unwrap_or(0) as i32;
                     }
                     // Schedule window redraw
-                    if self.live_session.is_some() {
-                        if let Err(error) = self.user32.send_message_w(hwnd, MessageKind::Paint, 0, 0) {
+                    if self.live_session.is_some()
+                        && let Err(error) = self.user32.send_message_w(hwnd, MessageKind::Paint, 0, 0) {
                             eprintln!("ScrollWindow repaint failed for hwnd {hwnd:#x}: {error}");
                         }
-                    }
                     state.set(Register::Rax, 1); // TRUE
                     self.last_error = 0;
                 }
             }
             HostThunk::ScrollDC => {
-                let hdc = arg(0) as u64;
+                let hdc = arg(0);
                 let _dx = arg(1) as i32;
                 let _dy = arg(2) as i32;
                 let lprc_scroll = arg(3);
@@ -39423,11 +39335,10 @@ impl PeHostRuntime {
                     // Handle flags: SW_SCROLLCHILDREN=0x0001, SW_INVALIDATE=0x0002,
                     // SW_ERASE=0x0004, SW_SMOOTHSCROLL=0x0010
                     // Schedule window redraw
-                    if self.live_session.is_some() {
-                        if let Err(error) = self.user32.send_message_w(hwnd, MessageKind::Paint, 0, 0) {
+                    if self.live_session.is_some()
+                        && let Err(error) = self.user32.send_message_w(hwnd, MessageKind::Paint, 0, 0) {
                             eprintln!("ScrollWindowEx repaint failed for hwnd {hwnd:#x}: {error}");
                         }
-                    }
                     // Return SIMPLEREGION = 2 (SIMULATED)
                     state.set(Register::Rax, 2); // SIMPLEREGION
                     self.last_error = 0;
@@ -39441,7 +39352,7 @@ impl PeHostRuntime {
                 state.set(Register::Rax, 1); // TRUE
             }
             HostThunk::TextOutW => {
-                let hdc = arg(0) as u64;
+                let hdc = arg(0);
                 let x = arg(1) as i32;
                 let y = arg(2) as i32;
                 let text_ptr = arg(3);
@@ -39480,10 +39391,10 @@ impl PeHostRuntime {
                 let _section = arg(4);
                 let _offset = arg(5) as u32;
                 // Read BITMAPINFOHEADER to determine bitmap size
-                let width = if pbmi != 0 { memory.read_u32(pbmi + 4).map(|v| v as i32).unwrap_or(32).unsigned_abs() as u32 } else { 32 };
-                let height = if pbmi != 0 { memory.read_u32(pbmi + 8).map(|v| v as i32).unwrap_or(32).unsigned_abs() as u32 } else { 32 };
+                let width = if pbmi != 0 { memory.read_u32(pbmi + 4).map(|v| v as i32).unwrap_or(32).unsigned_abs() } else { 32 };
+                let height = if pbmi != 0 { memory.read_u32(pbmi + 8).map(|v| v as i32).unwrap_or(32).unsigned_abs() } else { 32 };
                 let bpp = if pbmi != 0 { memory.read_u16(pbmi + 14).unwrap_or(32) } else { 32 };
-                let row_size = ((width * bpp as u32 + 31) / 32) * 4;
+                let row_size = (width * bpp as u32).div_ceil(32) * 4;
                 let bitmap_size = row_size * height;
                 // Allocate pixel data in guest memory
                 let pixel_ptr = self.alloc_heap(memory, bitmap_size as usize + 64, true)?;
@@ -39525,7 +39436,7 @@ impl PeHostRuntime {
                 state.set(Register::Rax, dc_handle);
             }
             HostThunk::CreateCompatibleDC => {
-                let _hdc = arg(0) as u64;
+                let _hdc = arg(0);
                 // Allocate a proper memory DC handle (not an Unsupported thunk).
                 // Register it in `device_contexts` with `None` target window so
                 // that SelectObject / BitBlt recognise it as a valid memory DC.
@@ -39589,11 +39500,10 @@ impl PeHostRuntime {
                         } else {
                             memory.read_u64(strings_ptr + i as u64 * 8).unwrap_or(0)
                         };
-                        if str_ptr != 0 {
-                            if let Ok(msg) = read_utf16_string(memory, str_ptr) {
+                        if str_ptr != 0
+                            && let Ok(msg) = read_utf16_string(memory, str_ptr) {
                                 messages.push(msg);
                             }
-                        }
                     }
                 }
                 let type_str = match event_type {
@@ -39710,7 +39620,7 @@ impl PeHostRuntime {
                 // Open a certificate store. Uses CertificateStoreManager for real tracking.
                 let store_provider = arg(0) as u32;
                 let _encoding_type = arg(1) as u32;
-                let _crypt_prov = arg(2) as u64;
+                let _crypt_prov = arg(2);
                 let _flags = arg(3) as u32;
                 let pv_para = arg(4);
                 // Determine store name from pv_para based on store_provider type
@@ -39730,7 +39640,7 @@ impl PeHostRuntime {
             }
             HostThunk::CertCloseStore => {
                 // CertCloseStore(store_handle, flags) — close certificate store.
-                let store_handle = arg(0) as u64;
+                let store_handle = arg(0);
                 let _flags = arg(1) as u32;
                 self.cert_store_names.remove(&store_handle);
                 self.cert_store_manager.close_store(store_handle);
@@ -39739,10 +39649,10 @@ impl PeHostRuntime {
             HostThunk::CertGetCertificateChain => {
                 // CertGetCertificateChain(engine, context, time, store, chain_params, flags, reserved, chain)
                 // Return a minimal certificate chain indicating success.
-                let _engine = arg(0) as u64;
+                let _engine = arg(0);
                 let _context = arg(1);
-                let _time = arg(2) as u64;
-                let _store = arg(3) as u64;
+                let _time = arg(2);
+                let _store = arg(3);
                 let _chain_params = arg(4);
                 let _flags = arg(5) as u32;
                 let _reserved = arg(6);
@@ -39794,7 +39704,7 @@ impl PeHostRuntime {
             HostThunk::CertAddCertificateContextToStore => {
                 // CertAddCertificateContextToStore(store, context, add_flags, store_context)
                 // Add a certificate to the store. Return success.
-                let store_handle = arg(0) as u64;
+                let store_handle = arg(0);
                 let context_handle = arg(1);
                 let _add_flags = arg(2) as u32;
                 let store_context_ptr = arg(3);
@@ -39827,7 +39737,7 @@ impl PeHostRuntime {
             HostThunk::CertOpenSystemStoreW => {
                 // CertOpenSystemStoreW(handle_prov, sub_system_store)
                 // Open a system certificate store. Return a synthetic handle.
-                let _handle_prov = arg(0) as u64;
+                let _handle_prov = arg(0);
                 let store_name_ptr = arg(1);
                 let store_name = if store_name_ptr != 0 {
                     read_utf16_string(memory, store_name_ptr).unwrap_or_default()
@@ -39847,7 +39757,7 @@ impl PeHostRuntime {
             HostThunk::CertFindCertificateInStore => {
                 // CertFindCertificateInStore(store, encoding, flags, find_type, find_param, prev)
                 // Find a certificate in the store using the CertificateStoreManager.
-                let store_handle = arg(0) as u64;
+                let store_handle = arg(0);
                 let _encoding = arg(1) as u32;
                 let _flags = arg(2) as u32;
                 let find_type = arg(3) as u32;
@@ -39946,7 +39856,7 @@ impl PeHostRuntime {
             HostThunk::CertEnumCertificatesInStore => {
                 // CertEnumCertificatesInStore(store, prev)
                 // Enumerate certificates in the store sequentially.
-                let store_handle = arg(0) as u64;
+                let store_handle = arg(0);
                 let prev_ctx = arg(1);
                 let mut found_handle = 0u64;
                 // Phase 1: Update cursor (mutable borrow on self.cert_enum_cursors only)
@@ -40228,8 +40138,8 @@ impl PeHostRuntime {
                     match BCryptContext::encrypt(key, &input_data, iv.as_ref()) {
                         Ok(encrypted) => {
                             let to_copy = std::cmp::min(encrypted.len(), output_len);
-                            for i in 0..to_copy {
-                                memory.write_u8(output_ptr + i as u64, encrypted[i]);
+                            for (i, &byte) in encrypted.iter().enumerate().take(to_copy) {
+                                memory.write_u8(output_ptr + i as u64, byte);
                             }
                             if result_len_ptr != 0 {
                                 write_u32(memory, result_len_ptr, encrypted.len() as u32);
@@ -40274,8 +40184,8 @@ impl PeHostRuntime {
                     match BCryptContext::decrypt(key, &input_data, iv.as_ref()) {
                         Ok(decrypted) => {
                             let to_copy = std::cmp::min(decrypted.len(), output_len);
-                            for i in 0..to_copy {
-                                memory.write_u8(output_ptr + i as u64, decrypted[i]);
+                            for (i, &byte) in decrypted.iter().enumerate().take(to_copy) {
+                                memory.write_u8(output_ptr + i as u64, byte);
                             }
                             if result_len_ptr != 0 {
                                 write_u32(memory, result_len_ptr, decrypted.len() as u32);
@@ -40314,8 +40224,8 @@ impl PeHostRuntime {
                             match BCryptContext::finish_hash(&hash) {
                                 Ok(result) => {
                                     let to_copy = std::cmp::min(result.len(), output_len);
-                                    for i in 0..to_copy {
-                                        memory.write_u8(output_ptr + i as u64, result[i]);
+                                    for (i, &byte) in result.iter().enumerate().take(to_copy) {
+                                        memory.write_u8(output_ptr + i as u64, byte);
                                     }
                                     state.set(Register::Rax, 0); // STATUS_SUCCESS
                                 }
@@ -40420,8 +40330,8 @@ impl PeHostRuntime {
                 };
                 if let Some(data) = response {
                     let to_copy = std::cmp::min(data.len(), output_len);
-                    for i in 0..to_copy {
-                        memory.write_u8(output_ptr + i as u64, data[i]);
+                    for (i, &byte) in data.iter().enumerate().take(to_copy) {
+                        memory.write_u8(output_ptr + i as u64, byte);
                     }
                     if result_len_ptr != 0 {
                         write_u32(memory, result_len_ptr, data.len() as u32);
@@ -40475,8 +40385,8 @@ impl PeHostRuntime {
                     match BCryptContext::derive_key(secret, &kdf_str, &kdf_feedback, output_len) {
                         Ok(derived) => {
                             let to_copy = std::cmp::min(derived.len(), output_len as usize);
-                            for i in 0..to_copy {
-                                memory.write_u8(output_ptr + i as u64, derived[i]);
+                            for (i, &byte) in derived.iter().enumerate().take(to_copy) {
+                                memory.write_u8(output_ptr + i as u64, byte);
                             }
                             if result_len_ptr != 0 {
                                 write_u32(memory, result_len_ptr, to_copy as u32);
@@ -40576,8 +40486,8 @@ impl PeHostRuntime {
                     match BCryptContext::sign_hash(key, &hash_data, flags) {
                         Ok(sig) => {
                             let to_copy = std::cmp::min(sig.len(), output_len);
-                            for i in 0..to_copy {
-                                memory.write_u8(output_ptr + i as u64, sig[i]);
+                            for (i, &byte) in sig.iter().enumerate().take(to_copy) {
+                                memory.write_u8(output_ptr + i as u64, byte);
                             }
                             if result_len_ptr != 0 {
                                 write_u32(memory, result_len_ptr, sig.len() as u32);
@@ -40712,7 +40622,7 @@ impl PeHostRuntime {
                 let _process_handle = arg(0);
                 let info_class = arg(1) as u32;
                 let info_ptr = arg(2);
-                let info_length = arg(3) as u64;
+                let info_length = arg(3);
                 let return_length_ptr = arg(4);
 
                 match info_class {
@@ -40977,9 +40887,9 @@ impl PeHostRuntime {
                 let src_ptr = arg(0);
                 let src_len = arg(1) as usize;
                 let output_ptr = arg(2);
-                if output_ptr != 0 {
-                    if src_ptr != 0 && src_len > 0 {
-                        if let Ok(bytes) = memory.read_bytes(src_ptr, src_len) {
+                if output_ptr != 0
+                    && src_ptr != 0 && src_len > 0
+                        && let Ok(bytes) = memory.read_bytes(src_ptr, src_len) {
                             let rust_str = String::from_utf8_lossy(&bytes);
                             let utf16_count = rust_str.encode_utf16().count();
                             if let Ok(data_addr) = self.alloc_utf16_string(memory, &rust_str) {
@@ -40988,8 +40898,6 @@ impl PeHostRuntime {
                                 write_u64(memory, output_ptr + 16, 0); // dtor = NULL
                             }
                         }
-                    }
-                }
                 state.set(Register::Rax, 1); // TRUE
             }
             HostThunk::CefStringUtf16ToUtf8 => {
@@ -40999,8 +40907,8 @@ impl PeHostRuntime {
                 let output_ptr = arg(2);
                 if output_ptr != 0 && src_ptr != 0 && src_len > 0 {
                     let byte_len = src_len.checked_mul(2).unwrap_or(0);
-                    if byte_len > 0 {
-                        if let Ok(raw) = memory.read_bytes(src_ptr, byte_len) {
+                    if byte_len > 0
+                        && let Ok(raw) = memory.read_bytes(src_ptr, byte_len) {
                             let utf16_units: Vec<u16> = raw.chunks_exact(2)
                                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
                                 .collect();
@@ -41011,7 +40919,6 @@ impl PeHostRuntime {
                                 write_u64(memory, output_ptr + 16, 0); // dtor = NULL
                             }
                         }
-                    }
                 }
                 state.set(Register::Rax, 1); // TRUE
             }
@@ -41020,9 +40927,9 @@ impl PeHostRuntime {
                 let src_ptr = arg(0);
                 let src_len = arg(1) as usize;
                 let output_ptr = arg(2);
-                if output_ptr != 0 {
-                    if src_ptr != 0 && src_len > 0 {
-                        if let Ok(bytes) = memory.read_bytes(src_ptr, src_len) {
+                if output_ptr != 0
+                    && src_ptr != 0 && src_len > 0
+                        && let Ok(bytes) = memory.read_bytes(src_ptr, src_len) {
                             let rust_str = String::from_utf8_lossy(&bytes);
                             let utf16_count = rust_str.encode_utf16().count();
                             if let Ok(data_addr) = self.alloc_utf16_string(memory, &rust_str) {
@@ -41031,8 +40938,6 @@ impl PeHostRuntime {
                                 write_u64(memory, output_ptr + 16, 0); // dtor = NULL
                             }
                         }
-                    }
-                }
                 state.set(Register::Rax, 1); // TRUE
             }
             HostThunk::CefStringWideToUtf8 => {
@@ -41042,8 +40947,8 @@ impl PeHostRuntime {
                 let output_ptr = arg(2);
                 if output_ptr != 0 && src_ptr != 0 && src_len > 0 {
                     let byte_len = src_len.checked_mul(2).unwrap_or(0);
-                    if byte_len > 0 {
-                        if let Ok(raw) = memory.read_bytes(src_ptr, byte_len) {
+                    if byte_len > 0
+                        && let Ok(raw) = memory.read_bytes(src_ptr, byte_len) {
                             let utf16_units: Vec<u16> = raw.chunks_exact(2)
                                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
                                 .collect();
@@ -41054,7 +40959,6 @@ impl PeHostRuntime {
                                 write_u64(memory, output_ptr + 16, 0); // dtor = NULL
                             }
                         }
-                    }
                 }
                 state.set(Register::Rax, 1); // TRUE
             }
@@ -41126,8 +41030,8 @@ impl PeHostRuntime {
                 if parts_ptr != 0 && url_out_ptr != 0 {
                     let spec_str_ptr = memory.read_u64(parts_ptr).unwrap_or(0);
                     let spec_len = memory.read_u64(parts_ptr + 8).unwrap_or(0) as usize;
-                    if spec_str_ptr != 0 && spec_len > 0 {
-                        if let Ok(raw) = memory.read_bytes(spec_str_ptr, spec_len.checked_mul(2).unwrap_or(0)) {
+                    if spec_str_ptr != 0 && spec_len > 0
+                        && let Ok(raw) = memory.read_bytes(spec_str_ptr, spec_len.checked_mul(2).unwrap_or(0)) {
                             let utf16_units: Vec<u16> = raw.chunks_exact(2)
                                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
                                 .collect();
@@ -41138,7 +41042,6 @@ impl PeHostRuntime {
                                 write_u64(memory, url_out_ptr + 16, 0);         // url_out.dtor
                             }
                         }
-                    }
                 }
                 state.set(Register::Rax, 1); // TRUE
             }
@@ -42354,13 +42257,12 @@ impl PeHostRuntime {
                 if thread_id_ptr != 0 {
                     write_u32(memory, thread_id_ptr, thread_id);
                 }
-                if can_queue_guest_thread {
-                    if let Ok(pending_thread) =
+                if can_queue_guest_thread
+                    && let Ok(pending_thread) =
                         self.prepare_guest_thread_entry(memory, thread_handle, stack_size, start_address, parameter)
                     {
                         self.pending_guest_threads.push_back(pending_thread);
                     }
-                }
                 state.set(Register::Rax, thread_handle as u64);
                 self.last_error = 0;
                 self.push_trace(
@@ -42910,13 +42812,11 @@ impl PeHostRuntime {
                 let x2 = f32::from_bits(arg(4) as u32);
                 let y2 = f32::from_bits(arg(5) as u32);
                 let (bmp_handle, _compositing_mode, _pen_width, _color) = self.resolve_gdiplus_draw_target(graphics, pen_handle, None);
-                if let Some((bmp_handle, cm, sm, pw, col)) = bmp_handle {
-                    if let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle) {
-                        if let GdiplusImage::Bitmap(bmp) = &mut **img {
+                if let Some((bmp_handle, cm, sm, pw, col)) = bmp_handle
+                    && let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle)
+                        && let GdiplusImage::Bitmap(bmp) = &mut **img {
                             crate::gdiplus_render::draw_line(&mut bmp.pixels, bmp.width, bmp.height, bmp.stride, x1, y1, x2, y2, col, pw, cm, sm);
                         }
-                    }
-                }
                 state.set(Register::Rax, if bmp_handle.is_some() { GdiplusStatus::Ok.to_u32() } else { GdiplusStatus::InvalidParameter.to_u32() } as u64);
                 self.last_error = 0;
             }
@@ -42926,14 +42826,12 @@ impl PeHostRuntime {
                 let points_ptr = arg(2);
                 let count = arg(3) as u32;
                 let (bmp_handle, _compositing_mode, _pen_width, _color) = self.resolve_gdiplus_draw_target(graphics, pen_handle, None);
-                if let Some((bmp_handle, cm, sm, pw, col)) = bmp_handle {
-                    if let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle) {
-                        if let GdiplusImage::Bitmap(bmp) = &mut **img {
+                if let Some((bmp_handle, cm, sm, pw, col)) = bmp_handle
+                    && let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle)
+                        && let GdiplusImage::Bitmap(bmp) = &mut **img {
                             let pts = read_gdiplus_pointf_array(memory, points_ptr, count);
                             crate::gdiplus_render::draw_lines(&mut bmp.pixels, bmp.width, bmp.height, bmp.stride, &pts, col, pw, cm, sm);
                         }
-                    }
-                }
                 state.set(Register::Rax, if bmp_handle.is_some() { GdiplusStatus::Ok.to_u32() } else { GdiplusStatus::InvalidParameter.to_u32() } as u64);
                 self.last_error = 0;
             }
@@ -42945,13 +42843,11 @@ impl PeHostRuntime {
                 let w = f32::from_bits(arg(4) as u32);
                 let h = f32::from_bits(arg(5) as u32);
                 let (bmp_handle, _compositing_mode, _pen_width, _color) = self.resolve_gdiplus_draw_target(graphics, pen_handle, None);
-                if let Some((bmp_handle, cm, sm, pw, col)) = bmp_handle {
-                    if let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle) {
-                        if let GdiplusImage::Bitmap(bmp) = &mut **img {
+                if let Some((bmp_handle, cm, sm, pw, col)) = bmp_handle
+                    && let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle)
+                        && let GdiplusImage::Bitmap(bmp) = &mut **img {
                             crate::gdiplus_render::draw_rect(&mut bmp.pixels, bmp.width, bmp.height, bmp.stride, x, y, w, h, col, pw, cm, sm);
                         }
-                    }
-                }
                 state.set(Register::Rax, if bmp_handle.is_some() { GdiplusStatus::Ok.to_u32() } else { GdiplusStatus::InvalidParameter.to_u32() } as u64);
                 self.last_error = 0;
             }
@@ -42963,13 +42859,11 @@ impl PeHostRuntime {
                 let w = f32::from_bits(arg(4) as u32);
                 let h = f32::from_bits(arg(5) as u32);
                 let (bmp_handle, _compositing_mode, _pw, _color) = self.resolve_gdiplus_draw_target(graphics, 0, Some(brush_handle));
-                if let Some((bmp_handle, cm, _sm, _pw, col)) = bmp_handle {
-                    if let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle) {
-                        if let GdiplusImage::Bitmap(bmp) = &mut **img {
+                if let Some((bmp_handle, cm, _sm, _pw, col)) = bmp_handle
+                    && let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle)
+                        && let GdiplusImage::Bitmap(bmp) = &mut **img {
                             crate::gdiplus_render::fill_rect(&mut bmp.pixels, bmp.width, bmp.height, bmp.stride, x, y, w, h, col, cm);
                         }
-                    }
-                }
                 state.set(Register::Rax, if bmp_handle.is_some() { GdiplusStatus::Ok.to_u32() } else { GdiplusStatus::InvalidParameter.to_u32() } as u64);
                 self.last_error = 0;
             }
@@ -42981,13 +42875,11 @@ impl PeHostRuntime {
                 let w = f32::from_bits(arg(4) as u32);
                 let h = f32::from_bits(arg(5) as u32);
                 let (bmp_handle, _compositing_mode, _pen_width, _color) = self.resolve_gdiplus_draw_target(graphics, pen_handle, None);
-                if let Some((bmp_handle, cm, sm, pw, col)) = bmp_handle {
-                    if let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle) {
-                        if let GdiplusImage::Bitmap(bmp) = &mut **img {
+                if let Some((bmp_handle, cm, sm, pw, col)) = bmp_handle
+                    && let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle)
+                        && let GdiplusImage::Bitmap(bmp) = &mut **img {
                             crate::gdiplus_render::draw_ellipse(&mut bmp.pixels, bmp.width, bmp.height, bmp.stride, x, y, w, h, col, pw, cm, sm);
                         }
-                    }
-                }
                 state.set(Register::Rax, if bmp_handle.is_some() { GdiplusStatus::Ok.to_u32() } else { GdiplusStatus::InvalidParameter.to_u32() } as u64);
                 self.last_error = 0;
             }
@@ -42999,13 +42891,11 @@ impl PeHostRuntime {
                 let w = f32::from_bits(arg(4) as u32);
                 let h = f32::from_bits(arg(5) as u32);
                 let (bmp_handle, _compositing_mode, _pw, _color) = self.resolve_gdiplus_draw_target(graphics, 0, Some(brush_handle));
-                if let Some((bmp_handle, cm, _sm, _pw, col)) = bmp_handle {
-                    if let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle) {
-                        if let GdiplusImage::Bitmap(bmp) = &mut **img {
+                if let Some((bmp_handle, cm, _sm, _pw, col)) = bmp_handle
+                    && let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle)
+                        && let GdiplusImage::Bitmap(bmp) = &mut **img {
                             crate::gdiplus_render::fill_ellipse(&mut bmp.pixels, bmp.width, bmp.height, bmp.stride, x, y, w, h, col, cm);
                         }
-                    }
-                }
                 state.set(Register::Rax, if bmp_handle.is_some() { GdiplusStatus::Ok.to_u32() } else { GdiplusStatus::InvalidParameter.to_u32() } as u64);
                 self.last_error = 0;
             }
@@ -43019,13 +42909,11 @@ impl PeHostRuntime {
                 let start_angle = f32::from_bits(arg(6) as u32);
                 let sweep_angle = f32::from_bits(arg(7) as u32);
                 let (bmp_handle, _compositing_mode, _pen_width, _color) = self.resolve_gdiplus_draw_target(graphics, pen_handle, None);
-                if let Some((bmp_handle, cm, sm, pw, col)) = bmp_handle {
-                    if let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle) {
-                        if let GdiplusImage::Bitmap(bmp) = &mut **img {
+                if let Some((bmp_handle, cm, sm, pw, col)) = bmp_handle
+                    && let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle)
+                        && let GdiplusImage::Bitmap(bmp) = &mut **img {
                             crate::gdiplus_render::draw_pie(&mut bmp.pixels, bmp.width, bmp.height, bmp.stride, x, y, w, h, start_angle, sweep_angle, col, pw, cm, sm);
                         }
-                    }
-                }
                 state.set(Register::Rax, if bmp_handle.is_some() { GdiplusStatus::Ok.to_u32() } else { GdiplusStatus::InvalidParameter.to_u32() } as u64);
                 self.last_error = 0;
             }
@@ -43039,13 +42927,11 @@ impl PeHostRuntime {
                 let start_angle = f32::from_bits(arg(6) as u32);
                 let sweep_angle = f32::from_bits(arg(7) as u32);
                 let (bmp_handle, _compositing_mode, _pw, _color) = self.resolve_gdiplus_draw_target(graphics, 0, Some(brush_handle));
-                if let Some((bmp_handle, cm, _sm, _pw, col)) = bmp_handle {
-                    if let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle) {
-                        if let GdiplusImage::Bitmap(bmp) = &mut **img {
+                if let Some((bmp_handle, cm, _sm, _pw, col)) = bmp_handle
+                    && let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle)
+                        && let GdiplusImage::Bitmap(bmp) = &mut **img {
                             crate::gdiplus_render::fill_pie(&mut bmp.pixels, bmp.width, bmp.height, bmp.stride, x, y, w, h, start_angle, sweep_angle, col, cm);
                         }
-                    }
-                }
                 state.set(Register::Rax, if bmp_handle.is_some() { GdiplusStatus::Ok.to_u32() } else { GdiplusStatus::InvalidParameter.to_u32() } as u64);
                 self.last_error = 0;
             }
@@ -43055,17 +42941,15 @@ impl PeHostRuntime {
                 let points_ptr = arg(2);
                 let count = arg(3) as u32;
                 let (bmp_handle, _compositing_mode, _pen_width, _color) = self.resolve_gdiplus_draw_target(graphics, pen_handle, None);
-                if let Some((bmp_handle, cm, sm, pw, col)) = bmp_handle {
-                    if let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle) {
-                        if let GdiplusImage::Bitmap(bmp) = &mut **img {
+                if let Some((bmp_handle, cm, sm, pw, col)) = bmp_handle
+                    && let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle)
+                        && let GdiplusImage::Bitmap(bmp) = &mut **img {
                             let pts = read_gdiplus_pointf_array(memory, points_ptr, count);
                             crate::gdiplus_render::draw_lines(&mut bmp.pixels, bmp.width, bmp.height, bmp.stride, &pts, col, pw, cm, sm);
                             if pts.len() >= 2 {
                                 crate::gdiplus_render::draw_line(&mut bmp.pixels, bmp.width, bmp.height, bmp.stride, pts[pts.len()-1].x, pts[pts.len()-1].y, pts[0].x, pts[0].y, col, pw, cm, sm);
                             }
                         }
-                    }
-                }
                 state.set(Register::Rax, if bmp_handle.is_some() { GdiplusStatus::Ok.to_u32() } else { GdiplusStatus::InvalidParameter.to_u32() } as u64);
                 self.last_error = 0;
             }
@@ -43076,14 +42960,12 @@ impl PeHostRuntime {
                 let count = arg(3) as u32;
                 let _fill_mode = arg(4) as u32;
                 let (bmp_handle, _compositing_mode, _pw, _color) = self.resolve_gdiplus_draw_target(graphics, 0, Some(brush_handle));
-                if let Some((bmp_handle, cm, _sm, _pw, col)) = bmp_handle {
-                    if let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle) {
-                        if let GdiplusImage::Bitmap(bmp) = &mut **img {
+                if let Some((bmp_handle, cm, _sm, _pw, col)) = bmp_handle
+                    && let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle)
+                        && let GdiplusImage::Bitmap(bmp) = &mut **img {
                             let pts = read_gdiplus_pointf_array(memory, points_ptr, count);
                             crate::gdiplus_render::fill_polygon(&mut bmp.pixels, bmp.width, bmp.height, bmp.stride, &pts, col, cm);
                         }
-                    }
-                }
                 state.set(Register::Rax, if bmp_handle.is_some() { GdiplusStatus::Ok.to_u32() } else { GdiplusStatus::InvalidParameter.to_u32() } as u64);
                 self.last_error = 0;
             }
@@ -43097,13 +42979,11 @@ impl PeHostRuntime {
                 let start_angle = f32::from_bits(arg(6) as u32);
                 let sweep_angle = f32::from_bits(arg(7) as u32);
                 let (bmp_handle, _compositing_mode, _pen_width, _color) = self.resolve_gdiplus_draw_target(graphics, pen_handle, None);
-                if let Some((bmp_handle, cm, sm, pw, col)) = bmp_handle {
-                    if let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle) {
-                        if let GdiplusImage::Bitmap(bmp) = &mut **img {
+                if let Some((bmp_handle, cm, sm, pw, col)) = bmp_handle
+                    && let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle)
+                        && let GdiplusImage::Bitmap(bmp) = &mut **img {
                             crate::gdiplus_render::draw_arc(&mut bmp.pixels, bmp.width, bmp.height, bmp.stride, x, y, w, h, start_angle, sweep_angle, col, pw, cm, sm);
                         }
-                    }
-                }
                 state.set(Register::Rax, if bmp_handle.is_some() { GdiplusStatus::Ok.to_u32() } else { GdiplusStatus::InvalidParameter.to_u32() } as u64);
                 self.last_error = 0;
             }
@@ -43114,14 +42994,12 @@ impl PeHostRuntime {
                 let count = arg(3) as u32;
                 let _tension = f32::from_bits(arg(4) as u32);
                 let (bmp_handle, _compositing_mode, _pen_width, _color) = self.resolve_gdiplus_draw_target(graphics, pen_handle, None);
-                if let Some((bmp_handle, cm, sm, pw, col)) = bmp_handle {
-                    if let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle) {
-                        if let GdiplusImage::Bitmap(bmp) = &mut **img {
+                if let Some((bmp_handle, cm, sm, pw, col)) = bmp_handle
+                    && let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle)
+                        && let GdiplusImage::Bitmap(bmp) = &mut **img {
                             let pts = read_gdiplus_pointf_array(memory, points_ptr, count);
                             crate::gdiplus_render::draw_lines(&mut bmp.pixels, bmp.width, bmp.height, bmp.stride, &pts, col, pw, cm, sm);
                         }
-                    }
-                }
                 state.set(Register::Rax, if bmp_handle.is_some() { GdiplusStatus::Ok.to_u32() } else { GdiplusStatus::InvalidParameter.to_u32() } as u64);
                 self.last_error = 0;
             }
@@ -43132,17 +43010,15 @@ impl PeHostRuntime {
                 let count = arg(3) as u32;
                 let _tension = f32::from_bits(arg(4) as u32);
                 let (bmp_handle, _compositing_mode, _pen_width, _color) = self.resolve_gdiplus_draw_target(graphics, pen_handle, None);
-                if let Some((bmp_handle, cm, sm, pw, col)) = bmp_handle {
-                    if let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle) {
-                        if let GdiplusImage::Bitmap(bmp) = &mut **img {
+                if let Some((bmp_handle, cm, sm, pw, col)) = bmp_handle
+                    && let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle)
+                        && let GdiplusImage::Bitmap(bmp) = &mut **img {
                             let pts = read_gdiplus_pointf_array(memory, points_ptr, count);
                             crate::gdiplus_render::draw_lines(&mut bmp.pixels, bmp.width, bmp.height, bmp.stride, &pts, col, pw, cm, sm);
                             if pts.len() >= 2 {
                                 crate::gdiplus_render::draw_line(&mut bmp.pixels, bmp.width, bmp.height, bmp.stride, pts[pts.len()-1].x, pts[pts.len()-1].y, pts[0].x, pts[0].y, col, pw, cm, sm);
                             }
                         }
-                    }
-                }
                 state.set(Register::Rax, if bmp_handle.is_some() { GdiplusStatus::Ok.to_u32() } else { GdiplusStatus::InvalidParameter.to_u32() } as u64);
                 self.last_error = 0;
             }
@@ -43169,13 +43045,11 @@ impl PeHostRuntime {
                     (0.0, 0.0, 100.0, 20.0)
                 };
                 let (bmp_handle, _compositing_mode, _pw, _color) = self.resolve_gdiplus_draw_target(graphics, 0, Some(brush_handle));
-                if let Some((bmp_handle, cm, _sm, _pw, col)) = bmp_handle {
-                    if let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle) {
-                        if let GdiplusImage::Bitmap(bmp) = &mut **img {
+                if let Some((bmp_handle, cm, _sm, _pw, col)) = bmp_handle
+                    && let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle)
+                        && let GdiplusImage::Bitmap(bmp) = &mut **img {
                             crate::gdiplus_render::draw_string(&mut bmp.pixels, bmp.width, bmp.height, bmp.stride, &text, lx, ly, font_size, col, cm);
                         }
-                    }
-                }
                 state.set(Register::Rax, if bmp_handle.is_some() { GdiplusStatus::Ok.to_u32() } else { GdiplusStatus::InvalidParameter.to_u32() } as u64);
                 self.last_error = 0;
             }
@@ -43283,9 +43157,9 @@ impl PeHostRuntime {
                         None
                     }
                 });
-                if let Some((bmp_handle, cm, _sm)) = self.resolve_gdiplus_graphics_target(graphics) {
-                    if let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle) {
-                        if let GdiplusImage::Bitmap(bmp) = &mut **img {
+                if let Some((bmp_handle, cm, _sm)) = self.resolve_gdiplus_graphics_target(graphics)
+                    && let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle)
+                        && let GdiplusImage::Bitmap(bmp) = &mut **img {
                             if let Some((cx, cy, cw, ch)) = clip_rect {
                                 crate::gdiplus_render::fill_rect(&mut bmp.pixels, bmp.width, bmp.height, bmp.stride, cx, cy, cw, ch, brush_color, cm);
                             } else {
@@ -43293,8 +43167,6 @@ impl PeHostRuntime {
                                 crate::gdiplus_render::fill_rect(&mut bmp.pixels, bmp.width, bmp.height, bmp.stride, 0.0, 0.0, bmp.width as f32, bmp.height as f32, brush_color, cm);
                             }
                         }
-                    }
-                }
                 state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
                 self.last_error = 0;
             }
@@ -43605,15 +43477,12 @@ impl PeHostRuntime {
                         None
                     }
                 });
-                if let (Some((color, pw)), Some(path_obj)) = (pen_info, path_clone) {
-                    if let Some((bmp_handle, cm, sm)) = self.resolve_gdiplus_graphics_target(graphics) {
-                        if let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle) {
-                            if let GdiplusImage::Bitmap(bmp) = &mut **img {
+                if let (Some((color, pw)), Some(path_obj)) = (pen_info, path_clone)
+                    && let Some((bmp_handle, cm, sm)) = self.resolve_gdiplus_graphics_target(graphics)
+                        && let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle)
+                            && let GdiplusImage::Bitmap(bmp) = &mut **img {
                                 crate::gdiplus_render::draw_path(&mut bmp.pixels, bmp.width, bmp.height, bmp.stride, &path_obj, color, pw, cm, sm);
                             }
-                        }
-                    }
-                }
                 state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
                 self.last_error = 0;
             }
@@ -43669,15 +43538,12 @@ impl PeHostRuntime {
                         None
                     }
                 });
-                if let Some(path_obj) = path_clone {
-                    if let Some((bmp_handle, cm, _sm)) = self.resolve_gdiplus_graphics_target(graphics) {
-                        if let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle) {
-                            if let GdiplusImage::Bitmap(bmp) = &mut **img {
+                if let Some(path_obj) = path_clone
+                    && let Some((bmp_handle, cm, _sm)) = self.resolve_gdiplus_graphics_target(graphics)
+                        && let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle)
+                            && let GdiplusImage::Bitmap(bmp) = &mut **img {
                                 crate::gdiplus_render::fill_path(&mut bmp.pixels, bmp.width, bmp.height, bmp.stride, &path_obj, brush_color, cm);
                             }
-                        }
-                    }
-                }
                 state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
                 self.last_error = 0;
             }
@@ -44175,9 +44041,9 @@ impl PeHostRuntime {
                 let y = arg(2) as u32;
                 let color_ptr = arg(3);
                 let result = self.user32.gdiplus_state.get(bitmap_handle).and_then(|obj| {
-                    if let GdiplusObject::Image(img) = obj {
-                        if let GdiplusImage::Bitmap(bmp) = &**img {
-                            if x < bmp.width && y < bmp.height {
+                    if let GdiplusObject::Image(img) = obj
+                        && let GdiplusImage::Bitmap(bmp) = &**img
+                            && x < bmp.width && y < bmp.height {
                                 let stride = bmp.stride;
                                 let idx = (y as i32 * stride + x as i32 * 4) as usize;
                                 if idx + 3 < bmp.pixels.len() {
@@ -44190,8 +44056,6 @@ impl PeHostRuntime {
                                     return Some(color);
                                 }
                             }
-                        }
-                    }
                     None
                 });
                 match result {
@@ -44211,9 +44075,9 @@ impl PeHostRuntime {
                 let y = arg(2) as u32;
                 let color = arg(3) as u32;
                 let result = self.user32.gdiplus_state.get_mut(bitmap_handle).and_then(|obj| {
-                    if let GdiplusObject::Image(img) = obj {
-                        if let GdiplusImage::Bitmap(bmp) = &mut **img {
-                            if x < bmp.width && y < bmp.height {
+                    if let GdiplusObject::Image(img) = obj
+                        && let GdiplusImage::Bitmap(bmp) = &mut **img
+                            && x < bmp.width && y < bmp.height {
                                 let stride = bmp.stride;
                                 let idx = (y as i32 * stride + x as i32 * 4) as usize;
                                 if idx + 3 < bmp.pixels.len() {
@@ -44225,8 +44089,6 @@ impl PeHostRuntime {
                                     return Some(());
                                 }
                             }
-                        }
-                    }
                     None
                 });
                 state.set(Register::Rax, if result.is_some() {
@@ -44243,8 +44105,8 @@ impl PeHostRuntime {
                 let _format = arg(3) as u32;
                 let locked_data_ptr = arg(4);
                 let result = self.user32.gdiplus_state.get_mut(bitmap_handle).and_then(|obj| {
-                    if let GdiplusObject::Image(img) = obj {
-                        if let GdiplusImage::Bitmap(bmp) = &mut **img {
+                    if let GdiplusObject::Image(img) = obj
+                        && let GdiplusImage::Bitmap(bmp) = &mut **img {
                             if bmp.locked {
                                 return None; // Already locked
                             }
@@ -44263,7 +44125,6 @@ impl PeHostRuntime {
                             }
                             return Some(());
                         }
-                    }
                     None
                 });
                 state.set(Register::Rax, if result.is_some() {
@@ -44277,12 +44138,11 @@ impl PeHostRuntime {
                 let bitmap_handle = arg(0);
                 let _locked_data_ptr = arg(1);
                 let result = self.user32.gdiplus_state.get_mut(bitmap_handle).and_then(|obj| {
-                    if let GdiplusObject::Image(img) = obj {
-                        if let GdiplusImage::Bitmap(bmp) = &mut **img {
+                    if let GdiplusObject::Image(img) = obj
+                        && let GdiplusImage::Bitmap(bmp) = &mut **img {
                             bmp.locked = false;
                             return Some(());
                         }
-                    }
                     None
                 });
                 state.set(Register::Rax, if result.is_some() {
@@ -44577,15 +44437,12 @@ impl PeHostRuntime {
                         None
                     }
                 });
-                if let Some((bmp_handle, cm, _sm)) = self.resolve_gdiplus_graphics_target(graphics) {
-                    if let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle) {
-                        if let GdiplusImage::Bitmap(dst_bmp) = &mut **img {
-                            if let Some((ref src_pixels, sw, sh, sstride)) = src_data {
+                if let Some((bmp_handle, cm, _sm)) = self.resolve_gdiplus_graphics_target(graphics)
+                    && let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle)
+                        && let GdiplusImage::Bitmap(dst_bmp) = &mut **img
+                            && let Some((ref src_pixels, sw, sh, sstride)) = src_data {
                                 crate::gdiplus_render::draw_image(&mut dst_bmp.pixels, dst_bmp.width, dst_bmp.height, dst_bmp.stride, src_pixels, sw, sh, sstride, x, y, cm);
                             }
-                        }
-                    }
-                }
                 state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
                 self.last_error = 0;
             }
@@ -44608,15 +44465,12 @@ impl PeHostRuntime {
                         None
                     }
                 });
-                if let Some((bmp_handle, cm, _sm)) = self.resolve_gdiplus_graphics_target(graphics) {
-                    if let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle) {
-                        if let GdiplusImage::Bitmap(dst_bmp) = &mut **img {
-                            if let Some((ref src_pixels, sw, sh, sstride)) = src_data {
+                if let Some((bmp_handle, cm, _sm)) = self.resolve_gdiplus_graphics_target(graphics)
+                    && let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle)
+                        && let GdiplusImage::Bitmap(dst_bmp) = &mut **img
+                            && let Some((ref src_pixels, sw, sh, sstride)) = src_data {
                                 crate::gdiplus_render::draw_image_rect(&mut dst_bmp.pixels, dst_bmp.width, dst_bmp.height, dst_bmp.stride, src_pixels, sw, sh, sstride, x, y, w, h, cm);
                             }
-                        }
-                    }
-                }
                 state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
                 self.last_error = 0;
             }
@@ -44647,15 +44501,12 @@ impl PeHostRuntime {
                         None
                     }
                 });
-                if let Some((bmp_handle, cm, _sm)) = self.resolve_gdiplus_graphics_target(graphics) {
-                    if let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle) {
-                        if let GdiplusImage::Bitmap(dst_bmp) = &mut **img {
-                            if let Some((ref src_pixels, sw, sh, sstride)) = src_data {
+                if let Some((bmp_handle, cm, _sm)) = self.resolve_gdiplus_graphics_target(graphics)
+                    && let Some(GdiplusObject::Image(img)) = self.user32.gdiplus_state.get_mut(bmp_handle)
+                        && let GdiplusImage::Bitmap(dst_bmp) = &mut **img
+                            && let Some((ref src_pixels, sw, sh, sstride)) = src_data {
                                 crate::gdiplus_render::draw_image_rect(&mut dst_bmp.pixels, dst_bmp.width, dst_bmp.height, dst_bmp.stride, src_pixels, sw, sh, sstride, dst_x, dst_y, dst_w, dst_h, cm);
                             }
-                        }
-                    }
-                }
                 state.set(Register::Rax, GdiplusStatus::Ok.to_u32() as u64);
                 self.last_error = 0;
             }
@@ -45038,14 +44889,12 @@ impl PeHostRuntime {
                 if hdr_ptr != 0 {
                     let data_ptr = memory.read_u64(hdr_ptr)?;
                     let buf_len = memory.read_u32(hdr_ptr + 8)?;
-                    if let Ok(mut winmm) = self.audio.winmm.write() {
-                        if let Some(device) = winmm.wave_in_devices.iter_mut().find(|d| d.handle == handle) {
-                            if let Some(buf) = device.buffers.iter_mut().find(|b| b.header_ptr == (hdr_ptr as u32)) {
+                    if let Ok(mut winmm) = self.audio.winmm.write()
+                        && let Some(device) = winmm.wave_in_devices.iter_mut().find(|d| d.handle == handle)
+                            && let Some(buf) = device.buffers.iter_mut().find(|b| b.header_ptr == (hdr_ptr as u32)) {
                                 buf.data_ptr = data_ptr as u32;
                                 buf.buffer_size = buf_len;
                             }
-                        }
-                    }
                     // Clear WHDR_DONE, set WHDR_INQUEUE on guest header
                     let flags = memory.read_u32(hdr_ptr + 20)?;
                     memory.write_u32(hdr_ptr + 20, (flags & !crate::winmm::WaveHdr::WHDR_DONE) | crate::winmm::WaveHdr::WHDR_INQUEUE);
@@ -45066,9 +44915,9 @@ impl PeHostRuntime {
                 let handle = guest_call_arg_u32(state, memory, 0)?;
                 let rc = self.audio.winmm.write().unwrap().wave_in_stop(handle);
                 // Mark all queued buffers as DONE in guest headers
-                if rc == crate::winmm::MMSYSERR_NOERROR {
-                    if let Ok(winmm) = self.audio.winmm.read() {
-                        if let Some(device) = winmm.wave_in_devices.iter().find(|d| d.handle == handle) {
+                if rc == crate::winmm::MMSYSERR_NOERROR
+                    && let Ok(winmm) = self.audio.winmm.read()
+                        && let Some(device) = winmm.wave_in_devices.iter().find(|d| d.handle == handle) {
                             for buf in &device.buffers {
                                 if buf.is_queued && buf.header_ptr != 0 {
                                     let hdr_ptr = buf.header_ptr as u64;
@@ -45077,8 +44926,6 @@ impl PeHostRuntime {
                                 }
                             }
                         }
-                    }
-                }
                 state.set(Register::Rax, rc as u64);
                 self.last_error = 0;
             }
@@ -46159,8 +46006,8 @@ impl PeHostRuntime {
                             memory.read_u32(vtable_ptr + drag_enter_offset).map(|v| v as u64)
                         } else {
                             memory.read_u64(vtable_ptr + drag_enter_offset)
-                        } {
-                            if drag_enter != 0 {
+                        }
+                            && drag_enter != 0 {
                                 // Allocate a POINTL struct {x=0, y=0} on guest stack
                                 let pt_addr = self.alloc_heap(memory, 8, true)?;
                                 write_u32(memory, pt_addr, 0); // x
@@ -46175,14 +46022,13 @@ impl PeHostRuntime {
                                     "IDropTarget::DragEnter",
                                 );
                             }
-                        }
                         // Attempt DragOver: IDropTarget::DragOver(this, grfKeyState, pt, pdwEffect)
                         if let Ok(drag_over) = if self.guest_arch == GuestArch::X86 {
                             memory.read_u32(vtable_ptr + drag_over_offset).map(|v| v as u64)
                         } else {
                             memory.read_u64(vtable_ptr + drag_over_offset)
-                        } {
-                            if drag_over != 0 {
+                        }
+                            && drag_over != 0 {
                                 let pt_addr = self.alloc_heap(memory, 8, true)?;
                                 write_u32(memory, pt_addr, 0);
                                 write_u32(memory, pt_addr + 4, 0);
@@ -46192,14 +46038,13 @@ impl PeHostRuntime {
                                     "IDropTarget::DragOver",
                                 );
                             }
-                        }
                         // Attempt Drop: IDropTarget::Drop(this, data_obj, grfKeyState, pt, pdwEffect)
                         if let Ok(drop_fn) = if self.guest_arch == GuestArch::X86 {
                             memory.read_u32(vtable_ptr + drop_offset).map(|v| v as u64)
                         } else {
                             memory.read_u64(vtable_ptr + drop_offset)
-                        } {
-                            if drop_fn != 0 {
+                        }
+                            && drop_fn != 0 {
                                 let pt_addr = self.alloc_heap(memory, 8, true)?;
                                 write_u32(memory, pt_addr, 0);
                                 write_u32(memory, pt_addr + 4, 0);
@@ -46209,7 +46054,6 @@ impl PeHostRuntime {
                                     "IDropTarget::Drop",
                                 );
                             }
-                        }
                     }
                 }
                 if effect_out != 0 {
@@ -46531,13 +46375,11 @@ impl PeHostRuntime {
                     };
                     let mut paths: Vec<String> = Vec::new();
                     for i in 0..cidl {
-                        if let Ok(pidl_ptr) = read_guest_pointer(memory, apidl + i as u64 * ptr_size, self.guest_arch) {
-                            if pidl_ptr != 0 {
-                                if let Ok(path) = read_utf16_string(memory, pidl_ptr) {
+                        if let Ok(pidl_ptr) = read_guest_pointer(memory, apidl + i as u64 * ptr_size, self.guest_arch)
+                            && pidl_ptr != 0
+                                && let Ok(path) = read_utf16_string(memory, pidl_ptr) {
                                     paths.push(path);
                                 }
-                            }
-                        }
                     }
                     // Create IContextMenu COM object.
                     let methods = vec![
@@ -47288,6 +47130,7 @@ impl PeHostRuntime {
         self.user32.dispatch_message_w(message)
     }
 
+#[allow(clippy::too_many_arguments)]
     fn dispatch_window_message(
         &mut self,
         state: &mut CpuState,
@@ -47528,6 +47371,7 @@ impl PeHostRuntime {
     }
 
     #[inline(never)]
+#[allow(clippy::too_many_arguments)]
     fn execute_guest_callback_inner(
         &mut self,
         state: &mut CpuState,
@@ -47666,8 +47510,6 @@ impl PeHostRuntime {
                             if allow_yield && self.take_pumped_guest_thread_yield_request() {
                                 return Ok(GuestCallbackDisposition::Yielded);
                             }
-                        } else if is_call {
-                            state.rip = target;
                         } else {
                             state.rip = target;
                         }
@@ -47731,11 +47573,10 @@ impl PeHostRuntime {
                             jit.unwind_table.register_with_seh(&mut self.seh);
                         }
 
-                        if let Some(crate::cpu::IrInstruction::Jump { target }) = ir.last() {
-                            if *target > block_start && jit.is_compiled(*target) {
+                        if let Some(crate::cpu::IrInstruction::Jump { target }) = ir.last()
+                            && *target > block_start && jit.is_compiled(*target) {
                                 let _ = jit.chain_blocks(block_start, *target);
                             }
-                        }
                     }
                 }
             }
@@ -48062,8 +47903,8 @@ impl PeHostRuntime {
                             rip: state.rip,
                             xmm: {
                                 let mut xmm = [crate::seh::Xmm128::default(); 16];
-                                for i in 0..16 {
-                                    xmm[i] = crate::seh::Xmm128 {
+                                for (i, slot) in xmm.iter_mut().enumerate() {
+                                    *slot = crate::seh::Xmm128 {
                                         low: state.xmm[i].low,
                                         high: state.xmm[i].high,
                                     };
@@ -48138,8 +47979,8 @@ impl PeHostRuntime {
                             rip: state.rip,
                             xmm: {
                                 let mut xmm = [crate::seh::Xmm128::default(); 16];
-                                for i in 0..16 {
-                                    xmm[i] = crate::seh::Xmm128 {
+                                for (i, slot) in xmm.iter_mut().enumerate() {
+                                    *slot = crate::seh::Xmm128 {
                                         low: state.xmm[i].low,
                                         high: state.xmm[i].high,
                                     };
@@ -48203,8 +48044,8 @@ impl PeHostRuntime {
                             rip: state.rip,
                             xmm: {
                                 let mut xmm = [crate::seh::Xmm128::default(); 16];
-                                for i in 0..16 {
-                                    xmm[i] = crate::seh::Xmm128 {
+                                for (i, slot) in xmm.iter_mut().enumerate() {
+                                    *slot = crate::seh::Xmm128 {
                                         low: state.xmm[i].low,
                                         high: state.xmm[i].high,
                                     };
@@ -48430,7 +48271,7 @@ impl PeHostRuntime {
             match disposition {
                 X86_EXCEPTION_CONTINUE_EXECUTION => {
                     read_x86_context(memory, context_record, state)?;
-                    state.segment_bases = saved_state.segment_bases.clone();
+                    state.segment_bases = saved_state.segment_bases;
                     if state.rip == 0 {
                         *state = saved_state;
                         return Ok(false);
@@ -48457,11 +48298,10 @@ impl PeHostRuntime {
         parameters: BTreeMap<String, Value>,
         return_value: Value,
     ) {
-        if let Some(allowed_trace_categories) = &self.allowed_trace_categories {
-            if !allowed_trace_categories.contains(category) {
+        if let Some(allowed_trace_categories) = &self.allowed_trace_categories
+            && !allowed_trace_categories.contains(category) {
                 return;
             }
-        }
         self.trace_events.push(trace_event(
             self.next_trace_index,
             category,
@@ -48793,15 +48633,10 @@ impl PeHostRuntime {
         let bytes = if zeroed {
             vec![0; mapped_size]
         } else {
-            // Allocate uninitialized memory: use Vec::with_capacity + unsafe set_len
-            // to avoid zeroing. This is safe because we immediately map the memory
-            // into the guest address space below.
-            let mut heap = Vec::with_capacity(mapped_size);
-            // SAFETY: guest memory access and FFI for PE runtime emulation
-            unsafe {
-                heap.set_len(mapped_size);
-            }
-            heap
+            // Zero-initialize: the buffer is mapped into guest memory and may be
+            // read before every byte is written, so uninitialized contents would
+            // be observable.
+            vec![0u8; mapped_size]
         };
         memory.map_bytes(address, &bytes);
         self.heap_allocations.insert(address, requested_size);
@@ -50111,11 +49946,10 @@ impl PeHostRuntime {
         let mastering_voice = self.xaudio_mastering_voice(mastering_object)?;
         let mut frames = 0_usize;
         for source_object in &source_objects {
-            if let Some(source) = self.xaudio_source_voices.get(source_object) {
-                if self.audio.voice_started(source.voice_id)? {
+            if let Some(source) = self.xaudio_source_voices.get(source_object)
+                && self.audio.voice_started(source.voice_id)? {
                     frames = frames.max(self.audio.queued_source_frames(source.voice_id)?);
                 }
-            }
         }
         if frames == 0 {
             return Ok(());
@@ -50519,11 +50353,10 @@ impl PeHostRuntime {
         if let Some(context_meta) = self.guest_objects.get_mut(&context_object) {
             context_meta.refcount = 0;
         }
-        if let Some(swapchain_object) = swapchain_object {
-            if let Some(swapchain_meta) = self.guest_objects.get_mut(&swapchain_object) {
+        if let Some(swapchain_object) = swapchain_object
+            && let Some(swapchain_meta) = self.guest_objects.get_mut(&swapchain_object) {
                 swapchain_meta.refcount = 0;
             }
-        }
 
         self.add_ref_guest_object(device_object)?;
         if swapchain_object.is_some() {
@@ -53392,10 +53225,10 @@ impl PeHostRuntime {
             HostThunk::WebView2EnvGetBrowserVersionString,                   // 5
         ];
         let vtable = self.alloc_guest_vtable(memory, methods).unwrap_or(0);
-        let object = self
+        
+        self
             .alloc_guest_object(memory, GuestObjectKind::WebView2Environment, vtable)
-            .unwrap_or(0);
-        object
+            .unwrap_or(0)
     }
 
     /// Allocate a guest object for an ICoreWebView2Controller.
@@ -53420,10 +53253,10 @@ impl PeHostRuntime {
             HostThunk::WebView2CtrlGetCoreWebView2,                          // 12
         ];
         let vtable = self.alloc_guest_vtable(memory, methods).unwrap_or(0);
-        let object = self
+        
+        self
             .alloc_guest_object(memory, GuestObjectKind::WebView2Controller, vtable)
-            .unwrap_or(0);
-        object
+            .unwrap_or(0)
     }
 
     /// Allocate a guest object for an ICoreWebView2.
@@ -53466,10 +53299,10 @@ impl PeHostRuntime {
         methods[30] = HostThunk::WebView2RemoveProcessFailed;
         // ICoreWebView2_4 would follow at indices 31+
         let vtable = self.alloc_guest_vtable(memory, methods).unwrap_or(0);
-        let object = self
+        
+        self
             .alloc_guest_object(memory, GuestObjectKind::WebView2WebView, vtable)
-            .unwrap_or(0);
-        object
+            .unwrap_or(0)
     }
 
     /// Allocate a guest object for an ICoreWebView2Settings.
@@ -53493,10 +53326,10 @@ impl PeHostRuntime {
         methods[13] = HostThunk::WebView2SettingsGetIsBuiltInErrorPageEnabled;
         methods[14] = HostThunk::WebView2SettingsPutIsBuiltInErrorPageEnabled;
         let vtable = self.alloc_guest_vtable(memory, methods).unwrap_or(0);
-        let object = self
+        
+        self
             .alloc_guest_object(memory, GuestObjectKind::WebView2Settings, vtable)
-            .unwrap_or(0);
-        object
+            .unwrap_or(0)
     }
 
     /// Allocate a guest object for an ICoreWebView2WebResourceResponse.
@@ -53517,10 +53350,10 @@ impl PeHostRuntime {
             ), // 4
         ];
         let vtable = self.alloc_guest_vtable(memory, methods).unwrap_or(0);
-        let object = self
+        
+        self
             .alloc_guest_object(memory, GuestObjectKind::WebView2WebResourceResponse, vtable)
-            .unwrap_or(0);
-        object
+            .unwrap_or(0)
     }
 
     /// Find the latest WebView2 environment (for CreateCoreWebView2Controller dispatch).
@@ -54176,7 +54009,7 @@ impl PeHostRuntime {
                     return None;
                 }
                 let offset = handle - heap.cpu_handle_start;
-                if offset % DESCRIPTOR_HANDLE_STRIDE != 0 {
+                if !offset.is_multiple_of(DESCRIPTOR_HANDLE_STRIDE) {
                     return None;
                 }
                 Some((*heap, (offset / DESCRIPTOR_HANDLE_STRIDE) as usize))
@@ -56331,11 +56164,10 @@ impl PeHostRuntime {
 
         if output_size > 0 && dest_buffer != 0 {
             let mut output_buf = vec![0u8; output_size];
-            if memory.is_range_mapped(dest_buffer, output_size) {
-                if let Ok(bytes) = memory.read_bytes(dest_buffer, output_size) {
+            if memory.is_range_mapped(dest_buffer, output_size)
+                && let Ok(bytes) = memory.read_bytes(dest_buffer, output_size) {
                     output_buf.copy_from_slice(&bytes);
                 }
-            }
 
             self.d3d12_runtime
                 .emit_raytracing_acceleration_structure_postbuild_info(
@@ -56510,11 +56342,10 @@ impl PeHostRuntime {
                         Ok(len) => len as usize,
                         _ => continue,
                     };
-                    if p_bytecode != 0 && bytecode_len > 0 && bytecode_len <= 1024 * 1024 {
-                        if let Ok(bytes) = memory.read_bytes(p_bytecode, bytecode_len) {
+                    if p_bytecode != 0 && bytecode_len > 0 && bytecode_len <= 1024 * 1024
+                        && let Ok(bytes) = memory.read_bytes(p_bytecode, bytecode_len) {
                             return bytes;
                         }
-                    }
                 }
                 SUBOBJECT_SHADER_CONFIG => {
                     // D3D12_RAYTRACING_SHADER_CONFIG:
@@ -58033,7 +57864,7 @@ impl PeHostRuntime {
                 let view_addr = views_ptr + i * 24;
                 let _buffer_object = memory.read_u64(view_addr)?;
                 let _byte_offset = memory.read_u64(view_addr + 8)?;
-                let _byte_stride = memory.read_u32(view_addr + 16)? as u32;
+                let _byte_stride = memory.read_u32(view_addr + 16)?;
                 let _size = memory.read_u32(view_addr + 20)?;
             }
         }
@@ -58145,7 +57976,7 @@ impl PeHostRuntime {
     ) -> AppResult<()> {
         let command_list_id = self.open_d3d12_command_list_id(state.get(Register::Rcx))?;
         let _buffer_object = state.get(Register::Rdx);
-        let _buffer_offset = state.get(Register::R8) as u64;
+        let _buffer_offset = state.get(Register::R8);
         let _predicate_value = state.get(Register::R9) as u32;
         self.d3d12_runtime
             .record_set_root_constants(command_list_id, vec![])?;
@@ -58383,9 +58214,9 @@ impl PeHostRuntime {
         let _height = state.get(Register::R8) as u32;
         let _format = state.get(Register::R9) as u32;
         let sp = state.get(Register::Rsp);
-        let _multi_sample = memory.read_u32(sp + 0x20)? as u32;
-        let _multi_quality = memory.read_u32(sp + 0x24)? as u32;
-        let _lockable = memory.read_u32(sp + 0x28)? as u32;
+        let _multi_sample = memory.read_u32(sp + 0x20)?;
+        let _multi_quality = memory.read_u32(sp + 0x24)?;
+        let _lockable = memory.read_u32(sp + 0x28)?;
         let surface_ptr = memory.read_u64(sp + 0x30)?;
         let _shared_handle = memory.read_u64(sp + 0x38)?;
         if surface_ptr != 0 {
@@ -58435,9 +58266,9 @@ impl PeHostRuntime {
         let _height = state.get(Register::R8) as u32;
         let _format = state.get(Register::R9) as u32;
         let sp = state.get(Register::Rsp);
-        let _multi_sample = memory.read_u32(sp + 0x20)? as u32;
-        let _multi_quality = memory.read_u32(sp + 0x24)? as u32;
-        let _discard = memory.read_u32(sp + 0x28)? as u32;
+        let _multi_sample = memory.read_u32(sp + 0x20)?;
+        let _multi_quality = memory.read_u32(sp + 0x24)?;
+        let _discard = memory.read_u32(sp + 0x28)?;
         let surface_ptr = memory.read_u64(sp + 0x30)?;
         let _shared_handle = memory.read_u64(sp + 0x38)?;
         if surface_ptr != 0 {
@@ -58487,7 +58318,7 @@ impl PeHostRuntime {
         let _height = state.get(Register::R8) as u32;
         let _format = state.get(Register::R9) as u32;
         let sp = state.get(Register::Rsp);
-        let _pool = memory.read_u32(sp + 0x20)? as u32;
+        let _pool = memory.read_u32(sp + 0x20)?;
         let surface_ptr = memory.read_u64(sp + 0x28)?;
         let _shared_handle = memory.read_u64(sp + 0x30)?;
         if surface_ptr != 0 {
@@ -59043,7 +58874,7 @@ impl PeHostRuntime {
         let _desired_pixel_size = state.get(Register::R8);
         let _desired_format = state.get(Register::R9) as u32;
         let sp = state.get(Register::Rsp);
-        let _compat_options = memory.read_u32(sp + 0x20)? as u32;
+        let _compat_options = memory.read_u32(sp + 0x20)?;
         let target_ptr = memory.read_u64(sp + 0x28)?;
         if target_ptr != 0 {
             let methods = vec![
@@ -59074,6 +58905,7 @@ impl PeHostRuntime {
     ///
     /// Returns `(Option<(bitmap_handle, compositing_mode, smoothing_mode, pen_width, color)>, _, _, _)`
     /// where the trailing three values are unused (kept for destructuring compatibility).
+#[allow(clippy::type_complexity)]
     fn resolve_gdiplus_draw_target(
         &mut self,
         graphics_handle: u64,
@@ -59093,8 +58925,8 @@ impl PeHostRuntime {
         let smoothing_mode = gfx.smoothing_mode;
 
         // Resolve pen (if provided)
-        if pen_handle != 0 {
-            if let Some(GdiplusObject::Pen(pen)) = self.user32.gdiplus_state.get(pen_handle) {
+        if pen_handle != 0
+            && let Some(GdiplusObject::Pen(pen)) = self.user32.gdiplus_state.get(pen_handle) {
                 let pw = pen.width.max(1.0);
                 let color = crate::gdiplus_render::pen_color(pen, 0.0, 0.0);
                 return (
@@ -59104,11 +58936,10 @@ impl PeHostRuntime {
                     0,
                 );
             }
-        }
 
         // Resolve brush (if provided)
-        if let Some(bh) = brush_handle {
-            if let Some(GdiplusObject::Brush(brush)) = self.user32.gdiplus_state.get(bh) {
+        if let Some(bh) = brush_handle
+            && let Some(GdiplusObject::Brush(brush)) = self.user32.gdiplus_state.get(bh) {
                 // For texture brushes, try to look up the bitmap pixels
                 let tex_data: Option<(&[u8], u32, u32, i32)> = match brush.as_ref() {
                     GdiplusBrush::Texture(tb) => self
@@ -59140,7 +58971,6 @@ impl PeHostRuntime {
                     0,
                 );
             }
-        }
 
         // Default: red pen width 1
         (
@@ -65118,11 +64948,10 @@ fn decode_current_instruction(
     // so trying the longest window first means we typically succeed on the
     // FIRST call to decode_block (1 call instead of 15).
     for len in (1..=bytes.len()).rev() {
-        if let Ok(decoded) = engine.decode_block(&bytes[..len], rip) {
-            if decoded.len() == 1 && decoded[0].size == len {
+        if let Ok(decoded) = engine.decode_block(&bytes[..len], rip)
+            && decoded.len() == 1 && decoded[0].size == len {
                 return Ok(decoded.into_iter().next().expect("decoded instruction"));
             }
-        }
     }
     let window = bytes
         .iter()
@@ -65145,12 +64974,17 @@ fn decode_current_instruction_cached(
     rip: u64,
 ) -> AppResult<Arc<CachedInstruction>> {
     if let Some(cached) = instruction_cache.get_mut(&rip) {
-        // Skip read_window_matches for performance — trust the cache.
-        // Invalidated explicitly by invalidate_code_write.
-        *instruction_cache_generation = instruction_cache_generation.saturating_add(1);
-        cached.generation = *instruction_cache_generation;
-        instruction_cache_lru.push_back((rip, cached.generation));
-        return Ok(Arc::clone(&cached.cached));
+        // Verify the cached instruction still matches guest memory so
+        // self-modifying code refreshes the cache. The check is a single
+        // short read (≤15 bytes) per hit.
+        let mut live = vec![0u8; cached.cached.decoded.size];
+        if memory.read_into_slice(rip, &mut live).is_ok() && live == cached.cached.bytes {
+            *instruction_cache_generation = instruction_cache_generation.saturating_add(1);
+            cached.generation = *instruction_cache_generation;
+            instruction_cache_lru.push_back((rip, cached.generation));
+            return Ok(Arc::clone(&cached.cached));
+        }
+        // Memory changed — fall through and re-decode below.
     }
 
     let decoded = decode_current_instruction(engine, memory, rip)?;
@@ -65176,6 +65010,7 @@ fn decode_current_instruction_cached(
     Ok(cached)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn decode_basic_block_cached(
     engine: &mut CpuExecutionEngine,
     memory: &MemoryImage,
@@ -65188,7 +65023,7 @@ fn decode_basic_block_cached(
     basic_block_cache_generation: &mut u64,
     basic_block_cache_limit: usize,
     rip: u64,
-    jit_runtime: Option<&mut crate::jit::JitRuntime>,
+    _jit_runtime: Option<&mut crate::jit::JitRuntime>,
 ) -> AppResult<Arc<CachedBlock>> {
     if let Some(cached) = basic_block_cache.get_mut(&rip) {
         // Skip read_window_matches verification for performance —
@@ -65201,14 +65036,8 @@ fn decode_basic_block_cached(
             basic_block_cache_lru.push_back((rip, cached.generation));
             return Ok(Arc::clone(&cached.cached));
         }
-        // Cache miss — memory content changed. Invalidate any stale JIT
-        // compiled block and unchain incoming jumps so we don't execute
-        // the old code.
-        if let Some(jit) = jit_runtime {
-            if jit.is_compiled(rip) {
-                let _ = jit.unchain_target(rip);
-            }
-        }
+        // Cache hit path returns above; JIT blocks are invalidated
+        // explicitly by invalidate_code_write when guest code pages change.
     }
 
     let mut current_rip = rip;
@@ -65367,8 +65196,8 @@ fn annotate_guest_fault(error: AppError, memory: &MemoryImage, state: &CpuState)
             }
         }
     }
-    if let Ok(bytes) = read_window(memory, rip, 16) {
-        if bytes.starts_with(&[0xc5, 0xf5, 0x74, 0x01, 0xc5, 0xfd, 0xd7, 0xc0]) {
+    if let Ok(bytes) = read_window(memory, rip, 16)
+        && bytes.starts_with(&[0xc5, 0xf5, 0x74, 0x01, 0xc5, 0xfd, 0xd7, 0xc0]) {
             let caller = read_guest_u32(memory, state.get(Register::Rbp) + 4)
                 .ok()
                 .map(u64::from);
@@ -65419,7 +65248,6 @@ fn annotate_guest_fault(error: AppError, memory: &MemoryImage, state: &CpuState)
                     .unwrap_or_else(|| "<none>".to_string()),
             ));
         }
-    }
     if rip == 0x401390 {
         let state_table = read_guest_u32(memory, 0x42a250).ok().map(u64::from);
         let record_base = read_guest_u32(memory, 0x42a270).ok().map(u64::from);
@@ -65497,8 +65325,8 @@ fn annotate_guest_fault(error: AppError, memory: &MemoryImage, state: &CpuState)
             current_record,
         ));
     }
-    if let Some(fault_address) = guest_access_violation_address(&error) {
-        if fault_address < 0x1000 {
+    if let Some(fault_address) = guest_access_violation_address(&error)
+        && fault_address < 0x1000 {
             let frame_probe = [
                 state.get(Register::Rbp) + 4,
                 state.get(Register::Rbp) + 8,
@@ -65618,7 +65446,6 @@ fn annotate_guest_fault(error: AppError, memory: &MemoryImage, state: &CpuState)
                 parent_frame_probe,
             ));
         }
-    }
     for hint in error.reproduction_hints {
         wrapped = wrapped.with_hint(hint);
     }
@@ -66021,9 +65848,7 @@ fn pe_runtime_instruction_budget(
 fn registry_view_from_sam_desired(sam_desired: u32, guest_arch: GuestArch) -> RegistryView {
     if sam_desired & KEY_WOW64_64KEY != 0 {
         RegistryView::Native64
-    } else if sam_desired & KEY_WOW64_32KEY != 0 {
-        RegistryView::Wow6432
-    } else if guest_arch == GuestArch::X86 {
+    } else if sam_desired & KEY_WOW64_32KEY != 0 || guest_arch == GuestArch::X86 {
         RegistryView::Wow6432
     } else {
         RegistryView::Native
@@ -67446,7 +67271,7 @@ mod tests {
         args: &[u32],
     ) -> u64 {
         let stack = 0x50_000;
-        memory.map_bytes(stack, &vec![0_u8; 0x200]);
+        memory.map_bytes(stack, &[0_u8; 0x200]);
         write_u32(memory, stack, 0xDEAD_BEEF);
         for (index, arg) in args.iter().enumerate() {
             write_u32(memory, stack + 4 + (index as u64 * 4), *arg);
@@ -67516,11 +67341,11 @@ mod tests {
             .alloc_utf16_string(memory, guest_path)
             .expect("alloc path");
         let file_info_ptr: u64 = 0x60_000;
-        memory.map_bytes(file_info_ptr, &vec![0u8; 16]);
+        memory.map_bytes(file_info_ptr, &[0u8; 16]);
         write_u32(memory, file_info_ptr, 16); // cbStruct
         write_u32(memory, file_info_ptr + 4, path_ptr as u32); // pcwszFilePath
         let wvt_ptr: u64 = 0x61_000;
-        memory.map_bytes(wvt_ptr, &vec![0u8; 32]);
+        memory.map_bytes(wvt_ptr, &[0u8; 32]);
         write_u32(memory, wvt_ptr, 32); // cbStruct
         write_u32(memory, wvt_ptr + 20, union_choice); // dwUnionChoice
         write_u32(memory, wvt_ptr + 24, file_info_ptr as u32); // union pointer
@@ -68435,7 +68260,7 @@ mod tests {
         let mut memory = MemoryImage::default();
         let thunk = runtime.alloc_host_thunk(HostThunk::VerSetConditionMask);
         let stack = 0x50_000;
-        memory.map_bytes(stack, &vec![0_u8; 0x200]);
+        memory.map_bytes(stack, &[0_u8; 0x200]);
         write_u32(&mut memory, stack, 0xDEAD_BEEF);
         for (index, arg) in [0x7654_3210_u32, 0xfedc_ba98, 0x0000_0003, 0x0000_0005]
             .into_iter()
@@ -68627,7 +68452,7 @@ mod tests {
         let current_process_handle = runtime.win32.current_process_handle();
         let thunk = runtime.alloc_host_thunk(HostThunk::TerminateProcess);
         let stack = 0x50_000;
-        memory.map_bytes(stack, &vec![0_u8; 0x200]);
+        memory.map_bytes(stack, &[0_u8; 0x200]);
         write_u32(&mut memory, stack, 0xDEAD_BEEF);
         write_u32(&mut memory, stack + 4, current_process_handle);
         write_u32(&mut memory, stack + 8, 0x1234);
@@ -68728,14 +68553,14 @@ mod tests {
         let registration = 0x41_000;
         let resume_rip = entrypoint + 5;
 
-        memory.map_bytes(entrypoint, &vec![0x90_u8; 0x40]);
+        memory.map_bytes(entrypoint, &[0x90_u8; 0x40]);
         memory.map_bytes(
             entrypoint,
             &[
                 0x33, 0xC0, 0x8B, 0x40, 0x3C, 0xB8, 0x34, 0x12, 0x00, 0x00, 0xC3,
             ],
         );
-        memory.map_bytes(handler, &vec![0x90_u8; 0x40]);
+        memory.map_bytes(handler, &[0x90_u8; 0x40]);
         let mut handler_bytes = vec![0x8B, 0x4C, 0x24, 0x0C, 0xC7, 0x81, 0xB8, 0x00, 0x00, 0x00];
         handler_bytes.extend_from_slice(&(resume_rip as u32).to_le_bytes());
         handler_bytes.extend_from_slice(&[0x31, 0xC0, 0xC2, 0x10, 0x00]);
@@ -69644,6 +69469,7 @@ mod tests {
         assert_eq!(runtime.last_error, 0);
     }
 
+#[allow(clippy::too_many_arguments)]
     fn dispatch_feature_support_query(
         runtime: &mut PeHostRuntime,
         memory: &mut MemoryImage,
@@ -71602,7 +71428,7 @@ mod tests {
         state.set(Register::Rdx, 2);
         state.set(Register::R8, 4);
         state.set(Register::R9, 4);
-        memory.write_u64(stack_base + 0x78, 0x1000_0004_5);
+        memory.write_u64(stack_base + 0x78, 0x1000_0045);
         write_u32(&mut memory, stack_base + 0x78 + 0x28, 28);
         write_u32(&mut memory, stack_base + 0x78 + 0x30, 0);
         runtime
@@ -73136,8 +72962,8 @@ mod tests {
         // Pass null pointer as pActCtx
         let mut state = CpuState::new(GuestArch::X64);
         let stack = 0x50_000;
-        memory.map_bytes(stack, &vec![0_u8; 0x200]);
-        write_u64(&mut memory, stack + 0, 0xDEAD_BEEF); // return address
+        memory.map_bytes(stack, &[0_u8; 0x200]);
+        write_u64(&mut memory, stack, 0xDEAD_BEEF); // return address
         write_u64(&mut memory, stack + 8, 0); // arg(0) = null
         state.set(Register::Rsp, stack + 8);
         runtime
@@ -73188,7 +73014,7 @@ mod tests {
 
         let mut state = CpuState::new(GuestArch::X64);
         let stack = 0x50_000;
-        memory.map_bytes(stack, &vec![0_u8; 0x200]);
+        memory.map_bytes(stack, &[0_u8; 0x200]);
         write_u64(&mut memory, stack, 0xDEAD_BEEF); // return address
         state.set(Register::Rsp, stack);
         state.set(Register::Rcx, ctx_addr); // arg(0) = pActCtx
@@ -73244,7 +73070,7 @@ mod tests {
         // Create activation context
         let create_thunk = runtime.alloc_host_thunk(HostThunk::CreateActCtxW);
         let ctx_addr = 0x100_000;
-        memory.map_bytes(ctx_addr, &vec![0_u8; 56]);
+        memory.map_bytes(ctx_addr, &[0_u8; 56]);
         write_u32(&mut memory, ctx_addr, 48); // cbSize
         write_u32(&mut memory, ctx_addr + 4, 0); // dwFlags
         write_u64(&mut memory, ctx_addr + 8, 0); // lpSource = null
@@ -73257,7 +73083,7 @@ mod tests {
 
         let mut state = CpuState::new(GuestArch::X64);
         let stack = 0x50_000;
-        memory.map_bytes(stack, &vec![0_u8; 0x200]);
+        memory.map_bytes(stack, &[0_u8; 0x200]);
         write_u64(&mut memory, stack, 0xDEAD_BEEF);
         state.set(Register::Rsp, stack);
         state.set(Register::Rcx, ctx_addr);
@@ -73392,7 +73218,7 @@ mod tests {
     fn test_validate_guest_pointer_accepts_mapped_range() {
         let mut memory = MemoryImage::default();
         let base: u64 = 0x10000;
-        memory.map_bytes(base, &vec![0u8; 64]);
+        memory.map_bytes(base, &[0u8; 64]);
         let result = validate_guest_pointer(&memory, base, 16);
         assert!(result.is_ok(), "expected Ok, got {result:?}");
     }
@@ -73445,7 +73271,7 @@ mod tests {
     fn test_write_guest_bytes_checked_writes_mapped() {
         let mut memory = MemoryImage::default();
         let base: u64 = 0x30000;
-        memory.map_bytes(base, &vec![0u8; 8]);
+        memory.map_bytes(base, &[0u8; 8]);
         let result = write_guest_bytes_checked(&mut memory, base, &[0xAA, 0xBB]);
         assert!(result.is_ok(), "expected Ok, got {result:?}");
         let read_back = memory.read_bytes(base, 2).unwrap();
@@ -73752,7 +73578,7 @@ mod tests {
     fn test_read_guest_utf16_truncated_surrogate_pair() {
         let mut mem = MemoryImage::default();
         // U+D800 high surrogate followed by null terminator (truncated pair)
-        let data: Vec<u8> = [0x00, 0xD8, 0x00, 0x00].iter().copied().collect();
+        let data: Vec<u8> = [0x00, 0xD8, 0x00, 0x00].to_vec();
         mem.map_bytes(0x1000, &data);
         let s = super::read_guest_utf16_string(&mem, 0x1000, -1);
         // from_utf16_lossy replaces unpaired surrogates with U+FFFD
@@ -73767,10 +73593,7 @@ mod tests {
     fn test_read_guest_utf16_invalid_double_high_surrogate() {
         let mut mem = MemoryImage::default();
         // Two consecutive high surrogates (invalid)
-        let data: Vec<u8> = [0x00, 0xD8, 0x01, 0xD8, 0x00, 0x00]
-            .iter()
-            .copied()
-            .collect();
+        let data: Vec<u8> = [0x00, 0xD8, 0x01, 0xD8, 0x00, 0x00].to_vec();
         mem.map_bytes(0x1000, &data);
         let s = super::read_guest_utf16_string(&mem, 0x1000, -1);
         // Should handle gracefully (replacement chars)
@@ -73784,10 +73607,7 @@ mod tests {
     fn test_read_guest_utf16_non_terminated_with_length() {
         let mut mem = MemoryImage::default();
         // "ABC" followed by 0xFFFE (non-character), no null
-        let data: Vec<u8> = [0x41, 0x00, 0x42, 0x00, 0x43, 0x00, 0xFE, 0xFF]
-            .iter()
-            .copied()
-            .collect();
+        let data: Vec<u8> = [0x41, 0x00, 0x42, 0x00, 0x43, 0x00, 0xFE, 0xFF].to_vec();
         mem.map_bytes(0x1000, &data);
         // Read only first 3 code units
         let s = super::read_guest_utf16_string(&mem, 0x1000, 3);
@@ -76121,7 +75941,7 @@ fn render_live_window_preview(
     })
 }
 
-fn select_preview_root<'a>(previews: &'a [WindowPreview]) -> Option<&'a WindowPreview> {
+fn select_preview_root(previews: &[WindowPreview]) -> Option<&WindowPreview> {
     let score = |window: &WindowPreview| {
         let child_count = previews
             .iter()
@@ -77084,7 +76904,7 @@ fn format_time_zone_name(local_tm: &libc::tm) -> String {
         libc::strftime(
             buffer.as_mut_ptr(),
             buffer.len(),
-            b"%Z\0".as_ptr().cast(),
+            c"%Z".as_ptr().cast(),
             local_tm as *const _,
         )
     };
@@ -77103,7 +76923,7 @@ fn write_time_zone_information(
     address: u64,
     info: &HostTimeZoneInformation,
 ) {
-    memory.map_bytes(address, &vec![0; TIME_ZONE_INFORMATION_SIZE]);
+    memory.map_bytes(address, &[0; TIME_ZONE_INFORMATION_SIZE]);
     write_i32(memory, address, info.bias_minutes);
     write_utf16_fixed(
         memory,
@@ -77222,31 +77042,31 @@ fn systemtime_to_filetime_ticks(
     let d = day as u64;
     // Days from epoch using the civil calendar algorithm
     let days_from_epoch = if m > 2 {
-        y * 365 + (y + 3) / 4 - (y + 99) / 100 + (y + 399) / 400 + (m * 153 + 2) / 5 + d - 719468
+        y * 365 + y.div_ceil(4) - y.div_ceil(100) + y.div_ceil(400) + (m * 153 + 2) / 5 + d - 719468
     } else {
         let yn = y - 1;
-        yn * 365 + (yn + 3) / 4 - (yn + 99) / 100 + (yn + 399) / 400 + ((m + 9) * 153 + 2) / 5 + d
+        yn * 365 + yn.div_ceil(4) - yn.div_ceil(100) + yn.div_ceil(400) + ((m + 9) * 153 + 2) / 5 + d
             - 719468
     };
-    let total_days = DAYS_1601_TO_1970 + days_from_epoch as u64;
-    let ticks = total_days * 86400_000_000_0  // days to 100ns
-        + hour as u64 * 3600_000_000_0
-        + minute as u64 * 60_000_000_0
-        + second as u64 * 1_000_000_0
-        + millis as u64 * 10_000;
-    ticks
+    let total_days = DAYS_1601_TO_1970 + days_from_epoch;
+    
+    total_days * 864_000_000_000  // days to 100ns
+        + hour as u64 * 3_600_000_000
+        + minute as u64 * 60_000_000
+        + second as u64 * 10_000_000
+        + millis as u64 * 10_000
 }
 
 /// Convert FILETIME ticks (100-ns intervals since 1601-01-01) to SYSTEMTIME components.
 /// Returns (year, month, day_of_week, day, hour, minute, second, millis).
 fn filetime_ticks_to_systemtime(ticks: u64) -> (u16, u16, u16, u16, u16, u16, u16, u16) {
     // Convert to days since 1601-01-01 and time-of-day in 100ns units
-    let days_since_1601 = ticks / 86400_000_000_0;
-    let time_of_day = ticks % 86400_000_000_0;
-    let hour = (time_of_day / 3600_000_000_0) as u16;
-    let minute = ((time_of_day % 3600_000_000_0) / 60_000_000_0) as u16;
-    let second = ((time_of_day % 60_000_000_0) / 1_000_000_0) as u16;
-    let millis = ((time_of_day % 1_000_000_0) / 10_000) as u16;
+    let days_since_1601 = ticks / 864_000_000_000;
+    let time_of_day = ticks % 864_000_000_000;
+    let hour = (time_of_day / 3_600_000_000) as u16;
+    let minute = ((time_of_day % 3_600_000_000) / 60_000_000) as u16;
+    let second = ((time_of_day % 60_000_000) / 10_000_000) as u16;
+    let millis = ((time_of_day % 10_000_000) / 10_000) as u16;
     // Convert days since 1601-01-01 to year/month/day
     // First convert to days since 1970-01-01
     let days_since_epoch = days_since_1601 as i64 - 134774;
@@ -77295,11 +77115,11 @@ fn local_timezone_bias_minutes() -> i32 {
             .as_secs() as i64;
 
         let mut tm: MaybeUninit<libc::tm> = MaybeUninit::uninit();
-        let mut time_val: libc::time_t = now_secs;
+        let time_val: libc::time_t = now_secs;
         // SAFETY: localtime_r is thread-safe and writes to a caller-owned buffer.
         // The time_t is a valid Unix timestamp. The function returns a pointer
         // to the same buffer we provided on success, or null on failure.
-        let result = unsafe { libc::localtime_r(&mut time_val, tm.as_mut_ptr()) };
+        let result = unsafe { libc::localtime_r(&time_val, tm.as_mut_ptr()) };
         if result.is_null() {
             // Fallback: return 0 (UTC) if localtime_r fails
             return 0;
@@ -77979,8 +77799,8 @@ fn initial_guest_current_directory(
     guest_program_path: &str,
 ) -> String {
     let candidate = runtime_guest_path(ge, host_cwd);
-    if is_windows_absolute_path(&candidate) {
-        if let Some(drive_prefix) = windows_drive_prefix(&candidate) {
+    if is_windows_absolute_path(&candidate)
+        && let Some(drive_prefix) = windows_drive_prefix(&candidate) {
             let drive = &drive_prefix[..1];
             if ge
                 .active_drive_mappings()
@@ -77990,13 +77810,12 @@ fn initial_guest_current_directory(
                 return candidate;
             }
         }
-    }
     windows_parent_path(guest_program_path).unwrap_or_else(|| "C:\\".to_string())
 }
 
 fn drive_relative_base(current_directory: &str, drive_prefix: &str) -> String {
-    if let Some(current_drive) = windows_drive_prefix(current_directory) {
-        if current_drive.eq_ignore_ascii_case(drive_prefix) {
+    if let Some(current_drive) = windows_drive_prefix(current_directory)
+        && current_drive.eq_ignore_ascii_case(drive_prefix) {
             let trimmed = current_directory.trim_end_matches(['\\', '/']);
             return if trimmed.len() <= 2 {
                 format!("{drive_prefix}\\")
@@ -78004,7 +77823,6 @@ fn drive_relative_base(current_directory: &str, drive_prefix: &str) -> String {
                 trimmed.to_string()
             };
         }
-    }
     format!("{drive_prefix}\\")
 }
 
@@ -78335,11 +78153,7 @@ fn build_shell_link_link_info(path: &str) -> Vec<u8> {
     let normalized = normalize_windows_path(path);
     let (local_base_path, common_path_suffix) =
         if let Some((parent, leaf)) = normalized.rsplit_once('\\') {
-            let base = if parent.ends_with(':') {
-                format!("{parent}\\")
-            } else {
-                format!("{parent}\\")
-            };
+            let base = format!("{parent}\\");
             (base, leaf.to_string())
         } else {
             (normalized.clone(), String::new())
@@ -88856,8 +88670,8 @@ impl SteamCliFlags {
 
             match arg.as_str() {
                 "-applaunch" | "-launch" => {
-                    if i + 1 < args.len() {
-                        if let Ok(id) = args[i + 1].parse::<u32>() {
+                    if i + 1 < args.len()
+                        && let Ok(id) = args[i + 1].parse::<u32>() {
                             flags.applaunch = Some(id);
                             i += 2;
                             // Collect game-specific arguments (everything up
@@ -88868,7 +88682,6 @@ impl SteamCliFlags {
                             }
                             continue;
                         }
-                    }
                 }
                 "-silent" | "-silentlaunch" => {
                     flags.silent = true;

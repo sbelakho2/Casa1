@@ -1636,7 +1636,7 @@ fn t27_21_metal_backend_resolve_msaa_integration() {
     // Previously this test only created textures and never called the resolve.
     let cmd_buffer = backend.command_queue().new_command_buffer();
     let descriptor = create_render_pass_descriptor(src_info, None);
-    let mut encoder = MetalRenderEncoder::new(cmd_buffer, descriptor)
+    let mut encoder = MetalRenderEncoder::new(cmd_buffer, &descriptor)
         .expect("render encoder must be creatable");
 
     let config = MsaaResolveConfig {

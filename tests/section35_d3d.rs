@@ -798,11 +798,11 @@ fn t35_35_descriptor_range_type_to_metal() {
 fn t35_36_subresource_state_tracking() {
     let mut rt = D3d12Runtime::new();
 
-    assert_eq!(rt.subresource_state(1, 0, 0), None);
+    assert_eq!(rt.subresource_state(1, 0), None);
 
-    rt.set_subresource_state(1, 0, 0, ResourceState::RenderTarget);
+    rt.set_subresource_state(1, 0, ResourceState::RenderTarget);
     assert_eq!(
-        rt.subresource_state(1, 0, 0),
+        rt.subresource_state(1, 0),
         Some(ResourceState::RenderTarget)
     );
 }

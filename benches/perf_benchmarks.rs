@@ -255,7 +255,7 @@ fn write_pe32p_optional_header(
     pe.extend_from_slice(&0u32.to_le_bytes()); // SizeOfUninitializedData
     pe.extend_from_slice(&entry_point.to_le_bytes());
     pe.extend_from_slice(&0x1000u32.to_le_bytes()); // BaseOfCode
-    pe.extend_from_slice(&0x1400_0000_0u64.to_le_bytes()); // ImageBase
+    pe.extend_from_slice(&0x0001_4000_0000u64.to_le_bytes()); // ImageBase
     pe.extend_from_slice(&0x1000u32.to_le_bytes()); // SectionAlignment
     pe.extend_from_slice(&0x200u32.to_le_bytes()); // FileAlignment
     pe.extend_from_slice(&6u16.to_le_bytes()); // MajorOSVersion
@@ -1128,7 +1128,7 @@ fn many_imports_pe(count: usize) -> Vec<u8> {
     for i in 0..count {
         pe.extend_from_slice(&0u16.to_le_bytes()); // Hint
         pe.extend_from_slice(format!("Func{i}\0").as_bytes());
-        if pe.len() % 2 != 0 {
+        if !pe.len().is_multiple_of(2) {
             pe.push(0);
         }
     }
@@ -1674,11 +1674,11 @@ fn bench_memory_usage_tracking(c: &mut Criterion) {
     // Allocate some pages to measure
     for i in 0..10 {
         let addr = 0x1000 + (i as u64 * 0x1000);
-        let _ = memory.write_u32(addr, i as u32);
+        memory.write_u32(addr, i as u32);
     }
     for i in 0..5 {
         let addr = 0x100_0000 + (i as u64 * 0x1000);
-        let _ = memory.write_u32(addr, i as u32);
+        memory.write_u32(addr, i as u32);
     }
 
     let mut group = c.benchmark_group("memory/usage_tracker");

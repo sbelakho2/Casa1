@@ -575,16 +575,16 @@ impl GameEnvironment {
     /// guest file writes do not rewrite the whole config (and reparse DB)
     /// on every operation.
     fn flush_config_if_due(&self) -> AppResult<()> {
+        // State changes must be durable synchronously: callers (and tests)
+        // read the persisted ge.json / reparse DB immediately after
+        // mutating operations, and a debounced write would drop those
+        // changes on reopen or crash.
         {
-            let mut flush_states = config_flush_states();
-            let state = flush_states.entry(self.root.clone()).or_default();
-            if !state.dirty {
+            let flush_states = config_flush_states();
+            let Some(state) = flush_states.get(&self.root) else {
                 return Ok(());
-            }
-            if state
-                .last_flush
-                .is_some_and(|last| last.elapsed() < CONFIG_FLUSH_INTERVAL)
-            {
+            };
+            if !state.dirty {
                 return Ok(());
             }
         }
@@ -2436,11 +2436,8 @@ fn find_named_ge_in_workspace(
 /// added whenever host time is exposed to the guest.
 const FILE_TIME_EPOCH_OFFSET_TICKS: u64 = 116444736000000000;
 
-/// Minimum interval between full `ge.json` + reparse-DB rewrites triggered by
-/// guest file operations. Per-frame guest writes (logs, caches, save games)
-/// are coalesced to at most one serialization per interval instead of one
-/// full rewrite per syscall.
-const CONFIG_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
+// Config writes are synchronous (no debounce interval): state changes are
+// made durable immediately so reopens and tests observe them.
 
 /// Per-GE persistence bookkeeping. Kept in a process-global registry keyed by
 /// GE root so `GameEnvironment`'s public shape stays unchanged.

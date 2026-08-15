@@ -3107,7 +3107,14 @@ fn normalize_path(path: &str) -> String {
 /// written by different code paths (MSI components, GUI installers, the
 /// uninstall registry) can be matched by the substring detectors.
 fn normalize_registry_key(key: &str) -> String {
-    key.replace('\\', "/").to_ascii_lowercase()
+    // Case-preserving, backslash-joined: registry keys are case-insensitive
+    // on Windows but their stored case and separator form must be preserved
+    // (registry deltas, manifest hashes and tests compare the written form).
+    key.replace('/', "\\")
+        .split('\\')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>()
+        .join("\\")
 }
 
 fn stable_pairs(env: &BTreeMap<String, String>) -> String {
@@ -3950,7 +3957,7 @@ mod tests {
             ]
             .into_iter()
             .collect(),
-            registry: vec![("hklm/software/myapp/version".to_string(), "2.0".to_string())]
+            registry: vec![("HKLM\\Software\\MyApp\\Version".to_string(), "2.0".to_string())]
                 .into_iter()
                 .collect(),
             logs: vec!["install.log".to_string()],
@@ -3978,7 +3985,7 @@ mod tests {
 
         // Verify registry was added
         assert_eq!(
-            engine.registry.get("hklm/software/myapp/version"),
+            engine.registry.get("HKLM\\Software\\MyApp\\Version"),
             Some(&"2.0".to_string())
         );
 

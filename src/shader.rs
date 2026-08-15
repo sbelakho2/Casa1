@@ -1635,14 +1635,14 @@ pub fn dxil_opcode_to_msl(
         4..=5 => binop("*"), // mul / fmul
         6..=8 => binop("/"), // udiv / sdiv / fdiv — MSL `/` is type-driven
         9..=10 => binop("%"), // urem / srem
-        11 => binop("<<"), // shl
-        12 => binop(">>"), // lshr (logical shift right)
-        13 => binop(">>"), // ashr — arithmetic shift right (MSL uses
+        11 => binop("&"), // and
+        12 => binop("|"), // or
+        13 => binop("^"), // xor
+        14 => binop("<<"), // shl
+        15 => binop(">>"), // lshr (logical shift right)
+        16 => binop(">>"), // ashr — arithmetic shift right (MSL uses
         //                  type-based >> semantics; signed → arithmetic,
         //                  unsigned → logical)
-        14 => binop("&"), // and
-        15 => binop("|"), // or
-        16 => binop("^"), // xor
         17 => fcall("fma", 3), // fma
 
         // --- Comparison operations ---
@@ -4479,9 +4479,10 @@ pub fn pack_cbuffer(fields: &[CbufferField]) -> PackedCbuffer {
             let component_count = field.rows.max(field.cols).max(1);
             let element_size = component_count * scalar_size;
             if array_len > 1 {
-                // ceil(array_len * components / 4) registers of 16 bytes
-                let scalars = array_len.saturating_mul(component_count);
-                scalars.div_ceil(4).saturating_mul(16)
+                // Each array element occupies its own 16-byte register slot
+                // (D3D cbuffer packing: array elements start on 16-byte
+                // boundaries and never share registers).
+                16u32.saturating_mul(array_len)
             } else {
                 element_size
             }

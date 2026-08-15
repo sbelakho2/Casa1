@@ -736,8 +736,8 @@ fn t10_7_xaudio2_channel_mixing_resampling_and_latency() {
         );
     }
     // Every frame must follow the same projection: [0.8s, 0.4s, 0, 0, 0, 0].
-    for frame in 0..12 {
-        let s = mono_samples[frame] * 0.8;
+    for (frame, &s_ref) in mono_samples.iter().enumerate().take(12) {
+        let s = s_ref * 0.8;
         let base = frame * 6;
         assert!((rendered.samples[base] - s).abs() <= 1e-6);
         assert!((rendered.samples[base + 1] - s * 0.5).abs() <= 1e-6);

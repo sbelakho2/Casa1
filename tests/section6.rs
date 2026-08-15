@@ -1555,14 +1555,14 @@ fn t6_16_visibility_flags() {
     let id = runtime.create_root_signature(desc);
     let stored = runtime.root_signature_desc(id).expect("stored root signature");
 
-    let pixel_offsets = D3d12Runtime::visibility_offsets(&stored, D3D12ShaderVisibility::Pixel);
+    let pixel_offsets = D3d12Runtime::visibility_offsets(stored, D3D12ShaderVisibility::Pixel);
     assert_eq!(pixel_offsets, &[0]);
 
-    let vertex_offsets = D3d12Runtime::visibility_offsets(&stored, D3D12ShaderVisibility::Vertex);
+    let vertex_offsets = D3d12Runtime::visibility_offsets(stored, D3D12ShaderVisibility::Vertex);
     assert_eq!(vertex_offsets, &[1]);
 
     // Shader visibility with no entries returns empty slice
-    let hull_offsets = D3d12Runtime::visibility_offsets(&stored, D3D12ShaderVisibility::Hull);
+    let hull_offsets = D3d12Runtime::visibility_offsets(stored, D3D12ShaderVisibility::Hull);
     assert!(hull_offsets.is_empty());
 
     // Offsets must distinguish the two descriptor tables (index 0 is the

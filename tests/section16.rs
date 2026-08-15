@@ -152,10 +152,7 @@ fn t16_1b_entitlement_audit_treats_metadata_only_codesign_output_as_empty_entitl
 // so `audit_embedded_entitlements` (src/security.rs:165-199) sees empty entitlements for
 // every signed binary and reports `casa1-runner:missing_allow_jit`. Expected: the
 // allow-jit-signed copy is approved. Actual: `report.approved == false` with
-// `casa1-runner:missing_allow_jit` (verified on macOS 2026-08-15). Once the sanitizer
-// accepts the standard plist DOCTYPE (or the excerpt strips it), remove the #[ignore].
 #[test]
-#[ignore] // blocked by src bug: sanitize_entitlement_xml rejects the plist DOCTYPE emitted by codesign
 #[cfg(target_os = "macos")]
 fn t16_1c_embedded_entitlement_audit_reads_actual_signed_binaries() {
 
@@ -188,16 +185,7 @@ fn t16_1c_embedded_entitlement_audit_reads_actual_signed_binaries() {
     );
 }
 
-// KNOWN-ISSUE: same src bug as t16_1c — `codesign -d --entitlements :-` output begins
-// with a `<!DOCTYPE plist ...>` declaration, which `sanitize_entitlement_xml`
-// (src/security.rs:591-593) rejects, so the embedded audit reports
-// `casa1-runner:missing_allow_jit` for a correctly allow-jit-signed binary. Expected:
-// `macwin security:audit-entitlements --require-approved` exits 0 for the approved set.
-// Actual: exit code 1010 (RC_ENTITLEMENT_AUDIT_FAILED) with hint
-// `unexpected entitlement target: casa1-runner:missing_allow_jit` (verified on macOS
-// 2026-08-15). Once the sanitizer accepts the plist DOCTYPE, remove the #[ignore].
 #[test]
-#[ignore] // blocked by src bug: sanitize_entitlement_xml rejects the plist DOCTYPE emitted by codesign
 #[cfg(target_os = "macos")]
 fn t16_1d_entitlement_audit_cli_enforces_signed_binary_set_end_to_end() {
 
@@ -605,7 +593,7 @@ fn t16_7_glsl_translation_errors() {
     assert!(msl.contains("vertex float4 casa1_entry("), "MSL:\n{msl}");
     assert!(msl.contains("uint vid [[vertex_id]]"));
     assert!(
-        msl.contains("// gl_Position"),
+        msl.contains("out_pos"),
         "gl_Position must be mapped to the position output, MSL:\n{msl}"
     );
 
@@ -615,7 +603,7 @@ fn t16_7_glsl_translation_errors() {
         .expect("fragment shader must translate");
     assert!(msl.contains("fragment float4 casa1_entry("), "MSL:\n{msl}");
     assert!(
-        msl.contains("// gl_FragColor"),
+        msl.contains("out_color"),
         "gl_FragColor must be mapped to the return value, MSL:\n{msl}"
     );
 

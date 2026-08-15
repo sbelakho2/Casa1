@@ -1177,7 +1177,7 @@ impl MemoryImage {
         let start_page = address & MEMORY_PAGE_MASK;
         let end = address.wrapping_add(len as u64);
         let end_page = if end == 0 {
-            u64::MAX & MEMORY_PAGE_MASK
+            MEMORY_PAGE_MASK
         } else {
             (end - 1) & MEMORY_PAGE_MASK
         };
@@ -1320,8 +1320,7 @@ impl MemoryImage {
         if len == 0 {
             return Ok(Vec::new());
         }
-        let mut bytes = Vec::with_capacity(len);
-        bytes.resize(len, 0);
+        let mut bytes = vec![0; len];
         self.read_into(address, &mut bytes)?;
         Ok(bytes)
     }
@@ -3977,6 +3976,7 @@ impl CpuExecutionEngine {
     ///    SIGBUS, amortising the signal-delivery cost.
     /// 4. **Targeted write-back** — only pages in the `synced_pages` set
     ///    are written back from flat memory → MemoryImage after each block.
+    ///
     /// Execute a block of IR instructions.  This is the AOT-compiled
     /// execution engine: the match dispatch is native code compiled by
     /// rustc at build time.  There is no JIT (macOS 26 blocks dynamic
@@ -4081,25 +4081,23 @@ impl ExceptionDispatcher {
         let mut visited = Vec::new();
         for handler in &self.veh {
             visited.push(format!("veh:{}", handler.name));
-            if handler.handles_code.is_none() || handler.handles_code == Some(exception.code) {
-                if handler.disposition != ExceptionDisposition::ContinueSearch {
+            if (handler.handles_code.is_none() || handler.handles_code == Some(exception.code))
+                && handler.disposition != ExceptionDisposition::ContinueSearch {
                     return DispatchTrace {
                         visited,
                         result: handler.disposition.clone(),
                     };
                 }
-            }
         }
         for handler in self.seh.iter().rev() {
             visited.push(format!("seh:{}", handler.name));
-            if handler.handles_code.is_none() || handler.handles_code == Some(exception.code) {
-                if handler.disposition != ExceptionDisposition::ContinueSearch {
+            if (handler.handles_code.is_none() || handler.handles_code == Some(exception.code))
+                && handler.disposition != ExceptionDisposition::ContinueSearch {
                     return DispatchTrace {
                         visited,
                         result: handler.disposition.clone(),
                     };
                 }
-            }
         }
         DispatchTrace {
             visited,
@@ -4153,12 +4151,11 @@ pub fn decode_block(
         // In 32-bit mode (X86), 0x62 is the BOUND instruction and must not
         // be consumed as an EVEX prefix.
         let mut evex = None;
-        if arch == GuestArch::X64 {
-            if let Some((parsed, consumed)) = decode_evex_prefix(bytes, local)? {
+        if arch == GuestArch::X64
+            && let Some((parsed, consumed)) = decode_evex_prefix(bytes, local)? {
                 evex = Some(parsed);
                 local += consumed;
             }
-        }
         if let Some((parsed, consumed)) = parse_vex_prefix(bytes, local, arch)? {
             vex = Some(parsed);
             local += consumed;
@@ -5559,7 +5556,7 @@ pub fn decode_block(
                         evex_info: EvexInfo::no_mask(),
                     }
                 }
-                0x38 | 0x39 | 0x3A | 0x3B => {
+                0x38..=0x3B => {
                     let (modrm, consumed) = parse_modrm(bytes, local, arch, rex, address_size_32)?;
                     local += consumed;
                     let width = if matches!(opcode, 0x38 | 0x3A) {
@@ -6538,7 +6535,7 @@ pub fn decode_block(
                         }
                     }
                 }
-                0x88 | 0x8A | 0x8B | 0x89 => {
+                0x88..=0x8B => {
                     let (modrm, consumed) = parse_modrm(bytes, local, arch, rex, address_size_32)?;
                     local += consumed;
                     let rm_operand =
@@ -7176,7 +7173,7 @@ pub fn decode_block(
                 0xDD => {
                     let (modrm, consumed) = parse_modrm(bytes, local, arch, rex, address_size_32)?;
                     local += consumed;
-                    if !matches!(modrm.reg, 0 | 1 | 2 | 3) {
+                    if !matches!(modrm.reg, 0..=3) {
                         return Err(AppError::new(
                             ReasonCode::RcUnimplInsn,
                             format!("unsupported opcode 0xdd /{}", modrm.reg),
@@ -7466,7 +7463,7 @@ pub fn decode_block(
                                 // ENCLS: 0x0F 0x01 CF-FF (privileged, reg field encodes leaf)
                                 // ENCLU: 0x0F 0x01 E0-FF or D8-FF (unprivileged, reg field encodes leaf)
                                 // NOTE: SGX requires NO prefix (F2/F3 conflict with CET/XEND/XTEST)
-                                0xC8..=0xCF | 0xD0..=0xD7 | 0xD8..=0xDF
+                                0xC8..=0xDF
                                     if !prefixes.contains(&InstructionPrefix::Rep)
                                         && !prefixes.contains(&InstructionPrefix::Repne) =>
                                 {
@@ -7482,7 +7479,7 @@ pub fn decode_block(
                                         evex_info: EvexInfo::no_mask(),
                                     }
                                 }
-                                0xE0..=0xE7 | 0xE8..=0xEF | 0xF0..=0xF7 | 0xF8..=0xFF
+                                0xE0..=0xFF
                                     if !prefixes.contains(&InstructionPrefix::Rep)
                                         && !prefixes.contains(&InstructionPrefix::Repne) =>
                                 {
@@ -7749,7 +7746,7 @@ pub fn decode_block(
                                         operands: vec![
                                             Operand::Xmm(modrm.reg),
                                             Operand::Xmm(modrm.rm),
-                                            Operand::ImmediateU64(u64::from(imm)),
+                                            Operand::ImmediateU64(imm),
                                         ],
                                         precise_faulting_memory: false,
                                         evex_info: EvexInfo::no_mask(),
@@ -7777,7 +7774,7 @@ pub fn decode_block(
                                         operands: vec![
                                             Operand::Xmm(modrm.reg),
                                             Operand::Xmm(modrm.rm),
-                                            Operand::ImmediateU64(u64::from(imm)),
+                                            Operand::ImmediateU64(imm),
                                         ],
                                         precise_faulting_memory: false,
                                         evex_info: EvexInfo::no_mask(),
@@ -7805,7 +7802,7 @@ pub fn decode_block(
                                         operands: vec![
                                             Operand::Xmm(modrm.reg),
                                             Operand::Xmm(modrm.rm),
-                                            Operand::ImmediateU64(u64::from(imm)),
+                                            Operand::ImmediateU64(imm),
                                         ],
                                         precise_faulting_memory: false,
                                         evex_info: EvexInfo::no_mask(),
@@ -7851,7 +7848,7 @@ pub fn decode_block(
                                 parse_modrm(bytes, local, arch, rex, address_size_32)?;
                             local += consumed;
                             if modrm.mod_bits == 0b11 {
-                                if matches!((modrm.reg, modrm.rm_register()), (5 | 6 | 7, 0)) {
+                                if matches!((modrm.reg, modrm.rm_register()), (5..=7, 0)) {
                                     DecodedInstruction {
                                         address,
                                         size: local - cursor,
@@ -8409,7 +8406,7 @@ pub fn decode_block(
                             } else {
                                 return Err(AppError::new(
                                     ReasonCode::RcUnimplInsn,
-                                    format!("unsupported 0x0f 0x1a prefix combination"),
+                                    "unsupported 0x0f 0x1a prefix combination".to_string(),
                                 ));
                             }
                         }
@@ -8493,7 +8490,7 @@ pub fn decode_block(
                             } else {
                                 return Err(AppError::new(
                                     ReasonCode::RcUnimplInsn,
-                                    format!("unsupported 0x0f 0x1b prefix combination"),
+                                    "unsupported 0x0f 0x1b prefix combination".to_string(),
                                 ));
                             }
                         }
@@ -10299,6 +10296,7 @@ fn vex_vvvv_to_register(vvvv: u8) -> Register {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn decode_vex_instruction(
     bytes: &[u8],
     mut local: usize,
@@ -10583,7 +10581,7 @@ fn decode_vex_instruction(
                 }
                 // VPADDB (0xFC), VPADDW (0xFD), VPADDD (0xFE) with pp=1
                 // VPSUBB (0xF8), VPSUBW (0xF9), VPSUBD (0xFA), VPSUBQ (0xFB) with pp=1
-                0xFC | 0xFD | 0xFE | 0xF8 | 0xF9 | 0xFA | 0xFB => {
+                0xF8..=0xFE => {
                     if vex.pp != 1 {
                         return Err(AppError::new(
                             ReasonCode::RcUnimplInsn,
@@ -11043,6 +11041,7 @@ fn decode_vex_instruction(
 /// Currently supports FMA instructions (map_select 1 = 0x0F38).
 /// Additional EVEX-coded instructions (AVX-512) can be added here.
 #[allow(unreachable_patterns)]
+#[allow(clippy::too_many_arguments)]
 fn decode_evex_instruction(
     bytes: &[u8],
     mut local: usize,
@@ -14729,25 +14728,19 @@ pub fn lower_to_ir(decoded: &[DecodedInstruction]) -> AppResult<Vec<IrInstructio
                 }
             }
             // ADX instructions (ADCX, ADOX)
-            DecodedOpcode::Adcx => match instruction.operands.as_slice() {
-                [Operand::Register(dst), src, Operand::ImmediateU64(width)] => {
-                    ir.push(IrInstruction::Adcx {
-                        dst: *dst,
-                        src: compare_operand(src.clone()),
-                        width: *width as usize,
-                    });
-                }
-                _ => {}
+            DecodedOpcode::Adcx => if let [Operand::Register(dst), src, Operand::ImmediateU64(width)] = instruction.operands.as_slice() {
+                ir.push(IrInstruction::Adcx {
+                    dst: *dst,
+                    src: compare_operand(src.clone()),
+                    width: *width as usize,
+                });
             },
-            DecodedOpcode::Adox => match instruction.operands.as_slice() {
-                [Operand::Register(dst), src, Operand::ImmediateU64(width)] => {
-                    ir.push(IrInstruction::Adox {
-                        dst: *dst,
-                        src: compare_operand(src.clone()),
-                        width: *width as usize,
-                    });
-                }
-                _ => {}
+            DecodedOpcode::Adox => if let [Operand::Register(dst), src, Operand::ImmediateU64(width)] = instruction.operands.as_slice() {
+                ir.push(IrInstruction::Adox {
+                    dst: *dst,
+                    src: compare_operand(src.clone()),
+                    width: *width as usize,
+                });
             },
             // FMA instructions
             DecodedOpcode::Vfmadd132ps
@@ -16239,55 +16232,86 @@ pub fn execute_ir_with_hashing(
                 state.flags = logic_flags(result, *width * 8);
             }
             IrInstruction::XorReg { dst, src, width } => {
-                if let crate::cpu::CompareOperand::Register(src_reg) = src {
-                    let mask = width_mask(*width);
-                    let result = (state.get(*dst) ^ state.get(*src_reg)) & mask;
-                    state.set(*dst, result);
-                    state.flags = logic_flags(result, *width * 8);
-                }
+                let mask = width_mask(*width);
+                let lhs = state.get(*dst) & mask;
+                let rhs = read_compare_operand(state, memory, src, *width)? & mask;
+                let result = (lhs ^ rhs) & mask;
+                let next = match *width {
+                    8 => result,
+                    4 => zero_extend(result, *width),
+                    2 => (state.get(*dst) & !mask) | result,
+                    other => {
+                        return Err(AppError::new(
+                            ReasonCode::RcUnimplInsn,
+                            format!("unsupported xor reg width {other}"),
+                        ));
+                    }
+                };
+                state.set(*dst, next);
+                state.flags = logic_flags(result, *width * 8);
             }
             IrInstruction::AndReg { dst, src, width } => {
-                if let crate::cpu::CompareOperand::Register(src_reg) = src {
-                    let mask = width_mask(*width);
-                    let result = (state.get(*dst) & state.get(*src_reg)) & mask;
-                    state.set(*dst, result);
-                    state.flags = logic_flags(result, *width * 8);
-                }
+                let lhs = state.get(*dst) & width_mask(*width);
+                let rhs = read_compare_operand(state, memory, src, *width)? & width_mask(*width);
+                let result = (lhs & rhs) & width_mask(*width);
+                state.set(*dst, merge_register_result(state.get(*dst), result, *width));
+                state.flags = logic_flags(result, *width * 8);
             }
             IrInstruction::OrReg { dst, src, width } => {
-                if let crate::cpu::CompareOperand::Register(src_reg) = src {
-                    let mask = width_mask(*width);
-                    let result = (state.get(*dst) | state.get(*src_reg)) & mask;
-                    state.set(*dst, result);
-                    state.flags = logic_flags(result, *width * 8);
-                }
+                let lhs = state.get(*dst) & width_mask(*width);
+                let rhs = read_compare_operand(state, memory, src, *width)? & width_mask(*width);
+                let result = (lhs | rhs) & width_mask(*width);
+                state.set(*dst, merge_register_result(state.get(*dst), result, *width));
+                state.flags = logic_flags(result, *width * 8);
             }
-            IrInstruction::Compare { lhs, rhs, width } => {
+            IrInstruction::Compare { lhs: _, rhs: _, width: _ } => {
                 execute_cold_path(state, memory, instruction, virtualization)?;
             }
-            IrInstruction::Test { lhs, rhs, width } => {
+            IrInstruction::Test { lhs: _, rhs: _, width: _ } => {
                 execute_cold_path(state, memory, instruction, virtualization)?;
             }
             IrInstruction::ShlImm { dst, count, width } => {
                 let bits = (*width * 8) as u32;
-                let shift = (*count as u32) & if bits == 64 { 63 } else { 31 };
+                let shift = (u32::from(*count)) & if bits == 64 { 63 } else { 31 };
                 if shift != 0 {
                     let mask = width_mask(*width);
                     let lhs = state.get(*dst) & mask;
                     let result = (lhs << shift) & mask;
+                    let sign_bit = 1_u64 << (bits - 1);
                     state.set(*dst, merge_register_result(state.get(*dst), result, *width));
+                    state.flags = Flags {
+                        cf: ((lhs >> (bits - shift)) & 1) != 0,
+                        pf: parity(result as u8),
+                        af: false,
+                        zf: result == 0,
+                        sf: (result & sign_bit) != 0,
+                        of: shift == 1 && ((lhs ^ result) & sign_bit) != 0,
+                    };
                 }
             }
             IrInstruction::ShrImm { dst, count, width } => {
-                let mask = width_mask(*width);
-                let lhs = state.get(*dst) & mask;
-                let result = lhs >> (*count as u32);
-                state.set(*dst, result);
+                let bits = (*width * 8) as u32;
+                let shift = (u32::from(*count)) & if bits == 64 { 63 } else { 31 };
+                if shift != 0 {
+                    let mask = width_mask(*width);
+                    let lhs = state.get(*dst) & mask;
+                    let result = lhs >> shift;
+                    let sign_bit = 1_u64 << (bits - 1);
+                    state.set(*dst, merge_register_result(state.get(*dst), result, *width));
+                    state.flags = Flags {
+                        cf: ((lhs >> (shift - 1)) & 1) != 0,
+                        pf: parity(result as u8),
+                        af: false,
+                        zf: result == 0,
+                        sf: (result & sign_bit) != 0,
+                        of: shift == 1 && (lhs & sign_bit) != 0,
+                    };
+                }
             }
             IrInstruction::LoadMemory { dst, address, width } => {
                 let target = resolve_memory_operand(state, address, *width)?;
                 let value = read_memory_value(memory, target, *width)?;
-                state.set(*dst, zero_extend(value, *width));
+                state.set(*dst, merge_register_result(state.get(*dst), value, *width));
             }
             IrInstruction::LoadMemory8 { dst, address } => {
                 let target = resolve_memory_operand(state, address, 1)?;
@@ -16326,11 +16350,13 @@ pub fn execute_ir_with_hashing(
             IrInstruction::PushFlags { width } => {
                 let sp = state.get(Register::Rsp).wrapping_sub(*width as u64);
                 state.set(Register::Rsp, sp);
-                write_memory_value(memory, sp, 0, *width)?;
+                write_memory_value(memory, sp, pack_eflags(state), *width)?;
             }
-            IrInstruction::PopFlags { width: _ } => {
+            IrInstruction::PopFlags { width } => {
                 let sp = state.get(Register::Rsp);
-                state.set(Register::Rsp, sp.wrapping_add(8));
+                let value = read_memory_value(memory, sp, *width)?;
+                unpack_eflags(state, value);
+                state.set(Register::Rsp, sp.wrapping_add(*width as u64));
             }
             IrInstruction::Leave => {
                 let bp = state.get(Register::Rbp);
@@ -16340,9 +16366,9 @@ pub fn execute_ir_with_hashing(
                 state.set(Register::Rbp, value);
                 state.set(Register::Rsp, new_sp.wrapping_add(state.arch.pointer_bytes() as u64));
             }
-            IrInstruction::LoadEffectiveAddress { dst, address, width: _ } => {
+            IrInstruction::LoadEffectiveAddress { dst, address, width } => {
                 let target = resolve_memory_operand(state, address, 8)?;
-                state.set(*dst, target);
+                state.set(*dst, merge_register_result(state.get(*dst), target, *width));
             }
             IrInstruction::Jump { target } => state.rip = *target,
             IrInstruction::JumpIf { condition, target, fallthrough } => {
@@ -16353,12 +16379,12 @@ pub fn execute_ir_with_hashing(
                 let sp = state.get(Register::Rsp);
                 let ret = read_memory_value(memory, sp, state.arch.pointer_bytes())?;
                 state.rip = ret;
-                state.set(Register::Rsp, sp.wrapping_add(state.arch.pointer_bytes() as u64 + *stack_adjust as u64));
+                state.set(Register::Rsp, sp.wrapping_add(state.arch.pointer_bytes() as u64 + *stack_adjust));
             }
-            IrInstruction::Call { target, return_address: _ } => {
+            IrInstruction::Call { target, return_address } => {
                 let sp = state.get(Register::Rsp).wrapping_sub(state.arch.pointer_bytes() as u64);
                 state.set(Register::Rsp, sp);
-                write_memory_value(memory, sp, state.rip, state.arch.pointer_bytes())?;
+                write_memory_value(memory, sp, *return_address, state.arch.pointer_bytes())?;
                 state.rip = *target;
             }
             // Everything else goes to the cold path
@@ -17076,14 +17102,13 @@ fn execute_cold_path(
                         (combined as i32) as i128
                     }
                     4 => {
-                        let combined = (((state.get(Register::Rdx) & 0xffff_ffff) << 32)
-                            | (state.get(Register::Rax) & 0xffff_ffff))
-                            as u64;
+                        let combined = ((state.get(Register::Rdx) & 0xffff_ffff) << 32)
+                            | (state.get(Register::Rax) & 0xffff_ffff) ;
                         (combined as i64) as i128
                     }
                     8 => {
                         ((state.get(Register::Rdx) as i64 as i128) << 64)
-                            | (state.get(Register::Rax) as u64 as i128)
+                            | (state.get(Register::Rax) as i128)
                     }
                     _ => unreachable!(),
                 };
@@ -18404,8 +18429,8 @@ fn execute_cold_path(
                 let bytes = ymm_to_bytes(vector);
                 let byte_count = if *width == 16 { 16 } else { 32 };
                 let mut mask = 0_u64;
-                for index in 0..byte_count {
-                    mask |= u64::from((bytes[index] >> 7) & 1) << index;
+                for (index, &byte) in bytes.iter().enumerate().take(byte_count) {
+                    mask |= u64::from((byte >> 7) & 1) << index;
                 }
                 state.set(*dst, merge_register_result(state.get(*dst), mask, 4));
             }
@@ -18497,7 +18522,7 @@ fn execute_cold_path(
                 let len = if len == 0 {
                     64
                 } else {
-                    len.min(64 - start) as u8
+                    len.min(64 - start)
                 };
                 let mask = if len >= 64 { !0u64 } else { (1u64 << len) - 1 };
                 let result = (src_val >> start) & mask;
@@ -18547,7 +18572,7 @@ fn execute_cold_path(
                 let result = if shift == 0 {
                     val
                 } else {
-                    (val >> shift) | (val << (64 - shift))
+                    val.rotate_right(shift.try_into().unwrap())
                 };
                 state.set(*dst, result);
             }
@@ -19168,7 +19193,7 @@ fn execute_cold_path(
                     src,
                     *width,
                     if *element_size == 0 { 4 } else { 8 },
-                    &evex,
+                    evex,
                 )?;
                 let idx_bytes = read_vector_bytes(state, *indices, *width)?;
                 let lane_size = if *element_size == 0 { 4usize } else { 8usize };
@@ -19191,7 +19216,7 @@ fn execute_cold_path(
                     &mut result_bytes,
                     *width,
                     if *element_size == 0 { 4 } else { 8 },
-                    &evex,
+                    evex,
                 )?;
                 write_vector_bytes(state, *dst, &result_bytes, *width)?;
             }
@@ -19225,7 +19250,7 @@ fn execute_cold_path(
                     &mut result_bytes,
                     *width,
                     if *element_size == 0 { 4 } else { 8 },
-                    &evex,
+                    evex,
                 )?;
                 write_vector_bytes(state, *dst, &result_bytes, *width)?;
             }
@@ -19266,7 +19291,7 @@ fn execute_cold_path(
                     &mut result_bytes,
                     *width,
                     if *element_size == 0 { 4 } else { 8 },
-                    &evex,
+                    evex,
                 )?;
                 write_vector_bytes(state, *dst, &result_bytes, *width)?;
             }
@@ -19307,7 +19332,7 @@ fn execute_cold_path(
                     &mut result_bytes,
                     *width,
                     if *element_size == 0 { 4 } else { 8 },
-                    &evex,
+                    evex,
                 )?;
                 write_vector_bytes(state, *dst, &result_bytes, *width)?;
             }
@@ -19336,7 +19361,7 @@ fn execute_cold_path(
                     result_bytes[dst_off + 4..dst_off + 8]
                         .copy_from_slice(&sel1_src[off1..off1 + 4]);
                 }
-                apply_opmask(state, *dst, &mut result_bytes, *width, 4, &evex)?;
+                apply_opmask(state, *dst, &mut result_bytes, *width, 4, evex)?;
                 write_vector_bytes(state, *dst, &result_bytes, *width)?;
             }
             IrInstruction::ShuffleF64 {
@@ -19363,7 +19388,7 @@ fn execute_cold_path(
                     result_bytes[dst_off + 8..dst_off + 16]
                         .copy_from_slice(&sel1_src[off1..off1 + 8]);
                 }
-                apply_opmask(state, *dst, &mut result_bytes, *width, 8, &evex)?;
+                apply_opmask(state, *dst, &mut result_bytes, *width, 8, evex)?;
                 write_vector_bytes(state, *dst, &result_bytes, *width)?;
             }
             IrInstruction::AlignD {
@@ -19384,7 +19409,7 @@ fn execute_cold_path(
                 let start = combined.len() - bytes_to_shift - *width;
                 let mut result_bytes = vec![0u8; *width];
                 result_bytes.copy_from_slice(&combined[start..start + *width]);
-                apply_opmask(state, *dst, &mut result_bytes, *width, 4, &evex)?;
+                apply_opmask(state, *dst, &mut result_bytes, *width, 4, evex)?;
                 write_vector_bytes(state, *dst, &result_bytes, *width)?;
             }
             IrInstruction::AlignQ {
@@ -19405,7 +19430,7 @@ fn execute_cold_path(
                 let start = combined.len() - bytes_to_shift - *width;
                 let mut result_bytes = vec![0u8; *width];
                 result_bytes.copy_from_slice(&combined[start..start + *width]);
-                apply_opmask(state, *dst, &mut result_bytes, *width, 8, &evex)?;
+                apply_opmask(state, *dst, &mut result_bytes, *width, 8, evex)?;
                 write_vector_bytes(state, *dst, &result_bytes, *width)?;
             }
             IrInstruction::InsertSubVector {
@@ -19462,7 +19487,7 @@ fn execute_cold_path(
                     &mut result_bytes,
                     *width,
                     *element_size as usize,
-                    &evex,
+                    evex,
                 )?;
                 write_vector_bytes(state, *dst, &result_bytes, *width)?;
             }
@@ -19492,18 +19517,16 @@ fn execute_cold_path(
                     src,
                     *width,
                     if *element_size == 0 { 4 } else { 8 },
-                    &evex,
+                    evex,
                 )?;
                 let lane_size = if *element_size == 0 { 4usize } else { 8usize };
                 let lane_count = *width / lane_size;
                 let imm_val = *imm as usize;
                 let mut result_bytes = vec![0u8; *width];
+                let bits_per_lane = if lane_count == 2 { 1 } else { 2 };
+                let sel_mask = (1u32 << bits_per_lane) - 1;
                 for i in 0..lane_count {
-                    let src_sel = if lane_size == 4 {
-                        (imm_val >> (i * 2)) & 0x3
-                    } else {
-                        (imm_val >> (i * 2)) & 0x3
-                    };
+                    let src_sel = (imm_val >> (i * bits_per_lane)) & sel_mask as usize;
                     let src_off = (src_sel % lane_count) * lane_size;
                     let dst_off = i * lane_size;
                     result_bytes[dst_off..dst_off + lane_size]
@@ -19515,7 +19538,7 @@ fn execute_cold_path(
                     &mut result_bytes,
                     *width,
                     if *element_size == 0 { 4 } else { 8 },
-                    &evex,
+                    evex,
                 )?;
                 write_vector_bytes(state, *dst, &result_bytes, *width)?;
             }
@@ -19537,7 +19560,7 @@ fn execute_cold_path(
                 for i in 0..lane_count {
                     let sel = (imm_val >> (i * 2)) & 0x3;
                     let src_bytes = if sel < 2 { &src1_bytes } else { &src2_bytes };
-                    let src_off = ((sel % 2) as usize) * lane_size; // simplified
+                    let src_off = (sel % 2) * lane_size; // simplified
                     let dst_off = i * lane_size;
                     result_bytes[dst_off..dst_off + lane_size]
                         .copy_from_slice(&src_bytes[src_off..src_off + lane_size]);
@@ -19548,7 +19571,7 @@ fn execute_cold_path(
                     &mut result_bytes,
                     *width,
                     if *element_size == 0 { 4 } else { 8 },
-                    &evex,
+                    evex,
                 )?;
                 write_vector_bytes(state, *dst, &result_bytes, *width)?;
             }
@@ -19568,7 +19591,7 @@ fn execute_cold_path(
                     src2,
                     *width,
                     if *element_size == 0 { 4 } else { 8 },
-                    &evex,
+                    evex,
                 )?;
                 let lane_size = if *element_size == 0 { 4usize } else { 8usize };
                 let lane_count = *width / lane_size;
@@ -19589,7 +19612,7 @@ fn execute_cold_path(
                     &mut result_bytes,
                     *width,
                     if *element_size == 0 { 4 } else { 8 },
-                    &evex,
+                    evex,
                 )?;
                 apply_opmask(
                     state,
@@ -19597,7 +19620,7 @@ fn execute_cold_path(
                     &mut result_bytes,
                     *width,
                     if *element_size == 0 { 4 } else { 8 },
-                    &evex,
+                    evex,
                 )?;
                 write_vector_bytes(state, *dst, &result_bytes, *width)?;
             }
@@ -19616,7 +19639,7 @@ fn execute_cold_path(
                     src2,
                     *width,
                     if *element_size == 0 { 4 } else { 8 },
-                    &evex,
+                    evex,
                 )?;
                 let lane_size = if *element_size == 0 { 4usize } else { 8usize };
                 let lane_count = *width / lane_size;
@@ -19637,7 +19660,7 @@ fn execute_cold_path(
                     &mut result_bytes,
                     *width,
                     if *element_size == 0 { 4 } else { 8 },
-                    &evex,
+                    evex,
                 )?;
                 apply_opmask(
                     state,
@@ -19645,7 +19668,7 @@ fn execute_cold_path(
                     &mut result_bytes,
                     *width,
                     if *element_size == 0 { 4 } else { 8 },
-                    &evex,
+                    evex,
                 )?;
                 write_vector_bytes(state, *dst, &result_bytes, *width)?;
             }
@@ -19664,7 +19687,7 @@ fn execute_cold_path(
                     src2,
                     *width,
                     if *element_size == 0 { 4 } else { 8 },
-                    &evex,
+                    evex,
                 )?;
                 let lane_size = if *element_size == 0 { 4usize } else { 8usize };
                 let lane_count = *width / lane_size;
@@ -19685,7 +19708,7 @@ fn execute_cold_path(
                     &mut result_bytes,
                     *width,
                     if *element_size == 0 { 4 } else { 8 },
-                    &evex,
+                    evex,
                 )?;
                 apply_opmask(
                     state,
@@ -19693,7 +19716,7 @@ fn execute_cold_path(
                     &mut result_bytes,
                     *width,
                     if *element_size == 0 { 4 } else { 8 },
-                    &evex,
+                    evex,
                 )?;
                 write_vector_bytes(state, *dst, &result_bytes, *width)?;
             }
@@ -19712,7 +19735,7 @@ fn execute_cold_path(
                     src2,
                     *width,
                     if *element_size == 0 { 4 } else { 8 },
-                    &evex,
+                    evex,
                 )?;
                 let lane_size = if *element_size == 0 { 4usize } else { 8usize };
                 let lane_count = *width / lane_size;
@@ -19733,7 +19756,7 @@ fn execute_cold_path(
                     &mut result_bytes,
                     *width,
                     if *element_size == 0 { 4 } else { 8 },
-                    &evex,
+                    evex,
                 )?;
                 apply_opmask(
                     state,
@@ -19741,7 +19764,7 @@ fn execute_cold_path(
                     &mut result_bytes,
                     *width,
                     if *element_size == 0 { 4 } else { 8 },
-                    &evex,
+                    evex,
                 )?;
                 write_vector_bytes(state, *dst, &result_bytes, *width)?;
             }
@@ -19760,7 +19783,7 @@ fn execute_cold_path(
                     src2,
                     *width,
                     if *element_size == 0 { 4 } else { 8 },
-                    &evex,
+                    evex,
                 )?;
                 let lane_size = if *element_size == 0 { 4usize } else { 8usize };
                 let lane_count = *width / lane_size;
@@ -19781,7 +19804,7 @@ fn execute_cold_path(
                     &mut result_bytes,
                     *width,
                     if *element_size == 0 { 4 } else { 8 },
-                    &evex,
+                    evex,
                 )?;
                 apply_opmask(
                     state,
@@ -19789,7 +19812,7 @@ fn execute_cold_path(
                     &mut result_bytes,
                     *width,
                     if *element_size == 0 { 4 } else { 8 },
-                    &evex,
+                    evex,
                 )?;
                 write_vector_bytes(state, *dst, &result_bytes, *width)?;
             }
@@ -19808,7 +19831,7 @@ fn execute_cold_path(
                     src2,
                     *width,
                     if *element_size == 0 { 4 } else { 8 },
-                    &evex,
+                    evex,
                 )?;
                 let lane_size = if *element_size == 0 { 4usize } else { 8usize };
                 let lane_count = *width / lane_size;
@@ -19829,7 +19852,7 @@ fn execute_cold_path(
                     &mut result_bytes,
                     *width,
                     if *element_size == 0 { 4 } else { 8 },
-                    &evex,
+                    evex,
                 )?;
                 apply_opmask(
                     state,
@@ -19837,7 +19860,7 @@ fn execute_cold_path(
                     &mut result_bytes,
                     *width,
                     if *element_size == 0 { 4 } else { 8 },
-                    &evex,
+                    evex,
                 )?;
                 write_vector_bytes(state, *dst, &result_bytes, *width)?;
             }
@@ -19854,7 +19877,7 @@ fn execute_cold_path(
                     src,
                     *width,
                     if *element_size == 0 { 4 } else { 8 },
-                    &evex,
+                    evex,
                 )?;
                 let lane_size = if *element_size == 0 { 4usize } else { 8usize };
                 let lane_count = *width / lane_size;
@@ -19873,7 +19896,7 @@ fn execute_cold_path(
                     &mut result_bytes,
                     *width,
                     if *element_size == 0 { 4 } else { 8 },
-                    &evex,
+                    evex,
                 )?;
                 apply_opmask(
                     state,
@@ -19881,7 +19904,7 @@ fn execute_cold_path(
                     &mut result_bytes,
                     *width,
                     if *element_size == 0 { 4 } else { 8 },
-                    &evex,
+                    evex,
                 )?;
                 write_vector_bytes(state, *dst, &result_bytes, *width)?;
             }
@@ -19932,12 +19955,12 @@ fn execute_cold_path(
                     src,
                     *width,
                     *from_size as usize,
-                    &evex,
+                    evex,
                 )?;
-                let from_lanes = *width as usize / *from_size as usize;
-                let to_lanes = *width as usize / *to_size as usize;
+                let from_lanes = *width / *from_size as usize;
+                let to_lanes = *width / *to_size as usize;
                 let lane_count = from_lanes.min(to_lanes);
-                let mut result_bytes = vec![0u8; *width as usize];
+                let mut result_bytes = vec![0u8; *width ];
                 for i in 0..lane_count {
                     let src_off = i * *from_size as usize;
                     let dst_off = i * *to_size as usize;
@@ -19960,9 +19983,9 @@ fn execute_cold_path(
                     state,
                     *dst,
                     &mut result_bytes,
-                    *width as usize,
+                    *width ,
                     *to_size as usize,
-                    &evex,
+                    evex,
                 )?;
                 write_vector_bytes(state, *dst, &result_bytes, *width)?;
             }
@@ -20018,7 +20041,7 @@ fn execute_cold_path(
                     src,
                     *width,
                     if *element_size == 0 { 4 } else { 8 },
-                    &evex,
+                    evex,
                 )?;
                 let lane_size = if *element_size == 0 { 4usize } else { 8usize };
                 let lane_count = *width / lane_size;
@@ -20041,7 +20064,7 @@ fn execute_cold_path(
                     &mut result_bytes,
                     *width,
                     if *element_size == 0 { 4 } else { 8 },
-                    &evex,
+                    evex,
                 )?;
                 write_vector_bytes(state, *dst, &result_bytes, *width)?;
             }
@@ -20060,7 +20083,7 @@ fn execute_cold_path(
                     src,
                     *width,
                     if *element_size == 0 { 4 } else { 8 },
-                    &evex,
+                    evex,
                 )?;
                 let lane_size = if *element_size == 0 { 4usize } else { 8usize };
                 let lane_count = *width / lane_size;
@@ -20083,7 +20106,7 @@ fn execute_cold_path(
                     &mut result_bytes,
                     *width,
                     if *element_size == 0 { 4 } else { 8 },
-                    &evex,
+                    evex,
                 )?;
                 write_vector_bytes(state, *dst, &result_bytes, *width)?;
             }
@@ -20101,7 +20124,7 @@ fn execute_cold_path(
                     src,
                     *width,
                     if *element_size == 0 { 4 } else { 8 },
-                    &evex,
+                    evex,
                 )?;
                 let lane_size = if *element_size == 0 { 4usize } else { 8usize };
                 let lane_count = *width / lane_size;
@@ -20124,7 +20147,7 @@ fn execute_cold_path(
                     &mut result_bytes,
                     *width,
                     if *element_size == 0 { 4 } else { 8 },
-                    &evex,
+                    evex,
                 )?;
                 write_vector_bytes(state, *dst, &result_bytes, *width)?;
             }
@@ -20144,7 +20167,7 @@ fn execute_cold_path(
                     src2,
                     *width,
                     if *element_size == 0 { 4 } else { 8 },
-                    &evex,
+                    evex,
                 )?;
                 let lane_size = if *element_size == 0 { 4usize } else { 8usize };
                 let lane_count = *width / lane_size;
@@ -20169,7 +20192,7 @@ fn execute_cold_path(
                     &mut result_bytes,
                     *width,
                     if *element_size == 0 { 4 } else { 8 },
-                    &evex,
+                    evex,
                 )?;
                 write_vector_bytes(state, *dst, &result_bytes, *width)?;
             }
@@ -20188,7 +20211,7 @@ fn execute_cold_path(
                     src2,
                     *width,
                     if *element_size == 0 { 4 } else { 8 },
-                    &evex,
+                    evex,
                 )?;
                 let lane_size = if *element_size == 0 { 4usize } else { 8usize };
                 let lane_count = *width / lane_size;
@@ -20213,7 +20236,7 @@ fn execute_cold_path(
                     &mut result_bytes,
                     *width,
                     if *element_size == 0 { 4 } else { 8 },
-                    &evex,
+                    evex,
                 )?;
                 write_vector_bytes(state, *dst, &result_bytes, *width)?;
             }
@@ -20260,7 +20283,7 @@ fn execute_cold_path(
                     src2,
                     *width,
                     if *element_size == 0 { 4 } else { 8 },
-                    &evex,
+                    evex,
                 )?;
                 let lane_size = if *element_size == 0 { 4usize } else { 8usize };
                 let lane_count = *width / lane_size;
@@ -20297,7 +20320,7 @@ fn execute_cold_path(
                     &mut result_bytes,
                     *width,
                     if *element_size == 0 { 4 } else { 8 },
-                    &evex,
+                    evex,
                 )?;
                 write_vector_bytes(state, *dst, &result_bytes, *width)?;
             }
@@ -20314,7 +20337,7 @@ fn execute_cold_path(
                 let dst_bytes = read_vector_bytes(state, *dst, *width)?;
                 let src1_bytes = read_vector_bytes(state, *src1, *width)?;
                 let src2_bytes = read_vector_operand_bytes(state, memory, src2, *width)?;
-                let tt = *truth_table as u8;
+                let tt = *truth_table;
                 let mut result_bytes = vec![0u8; *width];
                 for byte_idx in 0..*width {
                     let a = dst_bytes[byte_idx];
@@ -20334,7 +20357,7 @@ fn execute_cold_path(
                     &mut result_bytes,
                     *width,
                     if *element_size == 0 { 4 } else { 8 },
-                    &evex,
+                    evex,
                 )?;
                 write_vector_bytes(state, *dst, &result_bytes, *width)?;
             }
@@ -20352,7 +20375,7 @@ fn execute_cold_path(
                     src,
                     *width,
                     if *element_size == 0 { 4 } else { 8 },
-                    &evex,
+                    evex,
                 )?;
                 let lane_size = if *element_size == 0 { 4usize } else { 8usize };
                 let lane_count = *width / lane_size;
@@ -20388,7 +20411,7 @@ fn execute_cold_path(
                     &mut result_bytes,
                     *width,
                     if *element_size == 0 { 4 } else { 8 },
-                    &evex,
+                    evex,
                 )?;
                 write_vector_bytes(state, *dst, &result_bytes, *width)?;
             }
@@ -20423,7 +20446,7 @@ fn execute_cold_path(
                     src,
                     *width,
                     if *element_size == 0 { 4 } else { 8 },
-                    &evex,
+                    evex,
                 )?;
                 let lane_size = if *element_size == 0 { 4usize } else { 8usize };
                 let lane_count = *width / lane_size;
@@ -20439,7 +20462,7 @@ fn execute_cold_path(
                     &mut result_bytes,
                     *width,
                     if *element_size == 0 { 4 } else { 8 },
-                    &evex,
+                    evex,
                 )?;
                 write_vector_bytes(state, *dst, &result_bytes, *width)?;
             }
@@ -20482,7 +20505,7 @@ fn execute_cold_path(
                     &mut result_bytes,
                     *width,
                     *element_size as usize,
-                    &evex,
+                    evex,
                 )?;
                 write_vector_bytes(state, *dst, &result_bytes, *width)?;
             }
@@ -20574,7 +20597,7 @@ fn execute_cold_path(
                 count,
                 size,
             } => {
-                let val = (state.opmask[*src as usize] as u64).wrapping_shl(*count as u32);
+                let val = state.opmask[*src as usize].wrapping_shl(*count as u32);
                 let mask = if *size >= 64 {
                     !0u64
                 } else {
@@ -20588,7 +20611,7 @@ fn execute_cold_path(
                 count,
                 size,
             } => {
-                let val = (state.opmask[*src as usize] as u64) >> count;
+                let val = state.opmask[*src as usize] >> count;
                 let mask = if *size >= 64 {
                     !0u64
                 } else {
@@ -20602,8 +20625,8 @@ fn execute_cold_path(
                 src2,
                 size,
             } => {
-                let val = (state.opmask[*src1 as usize] as u64)
-                    .wrapping_add(state.opmask[*src2 as usize] as u64);
+                let val = state.opmask[*src1 as usize]
+                    .wrapping_add(state.opmask[*src2 as usize]);
                 let mask = if *size >= 64 {
                     !0u64
                 } else {
@@ -20612,8 +20635,8 @@ fn execute_cold_path(
                 state.opmask[*dst as usize] = val & mask;
             }
             IrInstruction::Ktest { src1, src2, size } => {
-                let a = state.opmask[*src1 as usize] as u64;
-                let b = state.opmask[*src2 as usize] as u64;
+                let a = state.opmask[*src1 as usize];
+                let b = state.opmask[*src2 as usize];
                 let and_res = a & b;
                 let mask = if *size >= 64 {
                     !0u64
@@ -21061,7 +21084,7 @@ fn execute_cold_path(
                         // Shift dst left by 32 bits, inserting new_b at the bottom
                         let result = XmmValue {
                             low: ((dst_val.low & 0xFFFF_FFFF) << 32)
-                                | ((dst_val.high & 0xFFFF_FFFF) as u64),
+                                | (dst_val.high & 0xFFFF_FFFF),
                             high: ((dst_val.high >> 32) << 32) | (new_b as u64),
                         };
                         state.set_xmm(*dst, result);
@@ -21109,7 +21132,7 @@ fn execute_cold_path(
                         let zero = vdupq_n_u32(0);
                         let result = vsha1su0q_u32(dst_v, src_v, zero);
                         let mut out = [0u8; 16];
-                        vst1q_u8(out.as_mut_ptr() as *mut u8, vreinterpretq_u8_u32(result));
+                        vst1q_u8(out.as_mut_ptr(), vreinterpretq_u8_u32(result));
                         let result_low =
                             u64::from_le_bytes(out[0..8].try_into().unwrap_unchecked());
                         let result_high =
@@ -21167,7 +21190,7 @@ fn execute_cold_path(
                         // vsha1su1q_u32: XOR dst with src, then ROL32 each lane by 1
                         let result = vsha1su1q_u32(dst_v, src_v);
                         let mut out = [0u8; 16];
-                        vst1q_u8(out.as_mut_ptr() as *mut u8, vreinterpretq_u8_u32(result));
+                        vst1q_u8(out.as_mut_ptr(), vreinterpretq_u8_u32(result));
                         let result_low =
                             u64::from_le_bytes(out[0..8].try_into().unwrap_unchecked());
                         let result_high =
@@ -21261,7 +21284,7 @@ fn execute_cold_path(
 
                         // Extract result back to x86 layout
                         let mut out = [0u8; 16];
-                        vst1q_u8(out.as_mut_ptr() as *mut u8, vreinterpretq_u8_u32(new_abcd));
+                        vst1q_u8(out.as_mut_ptr(), vreinterpretq_u8_u32(new_abcd));
                         // NEON out = {d',c',b',a'} in memory
                         let nd = u32::from_le_bytes(out[0..4].try_into().unwrap_unchecked());
                         let nc = u32::from_le_bytes(out[4..8].try_into().unwrap_unchecked());
@@ -22373,11 +22396,11 @@ fn lower_to_arm64(ir: &[IrInstruction]) -> Vec<String> {
             }
             IrInstruction::Bzhi { dst, src, index } => {
                 instructions.push(format!("lsl x9, x{}, #56", index.index()));
-                instructions.push(format!("lsr x9, x9, #56"));
-                instructions.push(format!("cmp x9, #64"));
-                instructions.push(format!("csel x9, x9, xzr, lo"));
-                instructions.push(format!("lsl x10, xzr, x9"));
-                instructions.push(format!("sub x10, x10, #1"));
+                instructions.push("lsr x9, x9, #56".to_string());
+                instructions.push("cmp x9, #64".to_string());
+                instructions.push("csel x9, x9, xzr, lo".to_string());
+                instructions.push("lsl x10, xzr, x9".to_string());
+                instructions.push("sub x10, x10, #1".to_string());
                 instructions.push(format!("and x{}, x{}, x10", dst.index(), src.index()));
             }
             IrInstruction::Mulx { dst_lo, dst_hi, src } => {
@@ -23383,7 +23406,7 @@ fn logic_flags(result: u64, width: usize) -> Flags {
 }
 
 fn parity(value: u8) -> bool {
-    value.count_ones() % 2 == 0
+    value.count_ones().is_multiple_of(2)
 }
 
 fn bit_deposit(mut source: u64, mut mask: u64) -> u64 {
@@ -23624,7 +23647,7 @@ fn execute_pcmpistri_implicit_u8(lhs: [u8; 16], rhs: [u8; 16], imm: u8) -> AppRe
             // Equal Any: for each position in rhs, set bit if any lhs byte matches
             for (index, &byte) in rhs[..rhs_len].iter().enumerate() {
                 let matches = match comparison {
-                    0 => lhs[..lhs_len].iter().any(|&needle| needle == byte),
+                    0 => lhs[..lhs_len].contains(&byte),
                     1 => {
                         // Greater-than: rhs byte > any lhs byte (signed or unsigned)
                         lhs[..lhs_len]
@@ -24213,8 +24236,8 @@ fn compare_f32(a: f32, b: f32, predicate: u8) -> bool {
         2 => a <= b,
         3 => a.is_nan() || b.is_nan(),
         4 => a != b,
-        5 => !(a < b),
-        6 => !(a <= b),
+        5 => a.partial_cmp(&b) != Some(std::cmp::Ordering::Less),
+        6 => matches!(a.partial_cmp(&b), Some(std::cmp::Ordering::Greater) | None),
         7 => a.is_nan() && b.is_nan(),
         _ => false,
     }
@@ -24227,8 +24250,8 @@ fn compare_f64(a: f64, b: f64, predicate: u8) -> bool {
         2 => a <= b,
         3 => a.is_nan() || b.is_nan(),
         4 => a != b,
-        5 => !(a < b),
-        6 => !(a <= b),
+        5 => a.partial_cmp(&b) != Some(std::cmp::Ordering::Less),
+        6 => matches!(a.partial_cmp(&b), Some(std::cmp::Ordering::Greater) | None),
         7 => a.is_nan() && b.is_nan(),
         _ => false,
     }
@@ -24574,9 +24597,9 @@ fn pclmulqdq(a: u64, b: u64) -> u128 {
     ];
 
     let mut result: [u16; 8] = [0; 8];
-    for i in 0..4 {
-        for j in 0..4 {
-            let product = (a_limbs[i] as u32) * (b_limbs[j] as u32);
+    for (i, &a_limb) in a_limbs.iter().enumerate() {
+        for (j, &b_limb) in b_limbs.iter().enumerate() {
+            let product = (a_limb as u32) * (b_limb as u32);
             // In carry-less multiplication, the product of two 16-bit values
             // is XOR'd (not added with carry) into the appropriate position.
             let shift = i + j;
@@ -24619,14 +24642,14 @@ fn sha1_rounds(
     let mut d = d;
     let mut e = e;
 
-    for round in 0..4 {
+    for &w_round in w.iter() {
         let f = (b & c) | (!b & d);
         let temp = a
             .rotate_left(5)
             .wrapping_add(f)
             .wrapping_add(e)
             .wrapping_add(k)
-            .wrapping_add(w[round]);
+            .wrapping_add(w_round);
         e = d;
         d = c;
         c = b.rotate_left(30);
@@ -24643,6 +24666,7 @@ fn sha1_rounds(
 
 /// Execute 2 rounds of SHA-256 using the given message schedule words.
 /// Returns the updated (a, b, c, d, e, f, g, h) state.
+#[allow(clippy::too_many_arguments)]
 fn sha256_rounds(
     a: u32,
     b: u32,
@@ -28203,7 +28227,7 @@ mod tests {
 
     #[test]
     fn decode_and_execute_mov_moffs8_store_and_load() {
-        let start_address = 0x401d_c2;
+        let start_address = 0x0040_1dc2;
         let bytes = [0xA2, 0x00, 0x20, 0x00, 0x00, 0xA0, 0x01, 0x20, 0x00, 0x00];
         let decoded =
             decode_block(&bytes, start_address, GuestArch::X86).expect("decode moffs8 block");
@@ -28664,7 +28688,7 @@ mod tests {
         let bytes = [0x62, 0xF1];
         let result = decode_evex_prefix(&bytes, 0);
         assert!(
-            result.is_err() || result.as_ref().map_or(false, |o| o.is_none()),
+            result.is_err() || result.as_ref().is_ok_and(|o| o.is_none()),
             "truncated EVEX should error or return None"
         );
     }
@@ -29562,7 +29586,6 @@ mod tests {
         {
             let result = state.get_xmm(0);
             // Just ensure the operation completed
-            assert!(true, "SHA1MSG2 completed without error");
             let _ = result;
         }
     }
@@ -29875,7 +29898,7 @@ mod tests {
 
         // Push some values, then init
         state.x87.stack.push(42.0_f64);
-        state.x87.stack.push(3.14_f64);
+        state.x87.stack.push(std::f64::consts::PI);
         state.x87.stack.push(2.71_f64);
 
         // Simulate FINIT
@@ -31237,10 +31260,10 @@ mod tests {
         )
         .expect("execute AddPacked zmm");
         let result = zmm_to_f32x16(state.get_zmm(0));
-        for i in 0..16 {
+        for (i, &lane) in result.iter().enumerate() {
             let expected = (i as f32 + 1.0) + (i as f32 * 2.0);
             assert!(
-                (result[i] - expected).abs() < 1e-6,
+                (lane - expected).abs() < 1e-6,
                 "lane {i}: expected {expected}, got {}",
                 result[i]
             );
@@ -31624,7 +31647,7 @@ mod tests {
             }],
         )
         .expect("execute Kunpckdq");
-        let expected = (0x00FFu64 << 16) | 0x0000;
+        let expected = 0x00FFu64 << 16;
         assert_eq!(state.get_opmask(0), expected, "KUNPCKDQ interleave");
     }
 
@@ -32757,7 +32780,7 @@ mod tests {
 
     #[test]
     fn checked_f32_le_roundtrip() {
-        let value: f32 = 3.14159;
+        let value: f32 = std::f32::consts::PI;
         let bytes = value.to_le_bytes().to_vec();
         let result = checked_f32_le(&bytes, 0).unwrap();
         assert_eq!(result.to_bits(), value.to_bits());
@@ -32765,7 +32788,7 @@ mod tests {
 
     #[test]
     fn checked_f64_le_roundtrip() {
-        let value: f64 = 2.718281828;
+        let value: f64 = std::f64::consts::E;
         let bytes = value.to_le_bytes().to_vec();
         let result = checked_f64_le(&bytes, 0).unwrap();
         assert_eq!(result.to_bits(), value.to_bits());

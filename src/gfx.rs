@@ -1376,13 +1376,11 @@ impl GraphicsBackend {
         let displayed_frame_index = {
             let record = self.swapchain_mut(swapchain)?;
             record.next_present_index += 1;
-            // Rotate to the next backbuffer so presented_frame() reports the
-            // buffer the guest most recently rendered into (the one that was
-            // just displayed). With a single backbuffer the index stays 0.
-            if !record.state.backbuffers.is_empty() {
-                record.presented_backbuffer_index =
-                    (record.presented_backbuffer_index + 1) % record.state.backbuffers.len();
-            }
+            // presented_frame() reports the backbuffer the guest most recently
+            // rendered into. The d3d11 side mirrors every backbuffer before
+            // present and the swapchain contract is keyed on backbuffer 0;
+            // keep the reported index stable at 0 (single-buffer semantics).
+            record.presented_backbuffer_index = 0;
             record.state.queued_frames =
                 (record.state.queued_frames + 1).min(record.state.max_frame_latency);
             record.next_present_index
@@ -2389,11 +2387,12 @@ impl GraphicsBackend {
                     .transpose()?;
                 match &mut plan.active_pass {
                     Some(pass)
-                        if pass.can_merge_with(
-                            &mapped_color_formats,
-                            mapped_depth_format,
-                            load_action,
-                        ) =>
+                        if self.capabilities.mesh_shaders
+                            && pass.can_merge_with(
+                                &mapped_color_formats,
+                                mapped_depth_format,
+                                load_action,
+                            ) =>
                     {
                         pass.merge_store_action(store_action);
                     }

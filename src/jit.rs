@@ -26,8 +26,14 @@ use std::sync::{LazyLock, Mutex};
 
 /// Read 1/2/4/8 bytes from guest memory.  Returns the zero-extended value,
 /// or 0 if the address is unmapped.
+///
+/// # Safety
+///
+/// The raw pointers passed in must be valid for the duration of the call;
+/// JIT-generated code guarantees this by only passing pointers to live
+/// guest state, memory images, and IR owned by the executing block.
 #[unsafe(no_mangle)]
-pub extern "C" fn jit_helper_load(memory: *mut MemoryImage, address: u64, width: u64) -> u64 {
+pub unsafe extern "C" fn jit_helper_load(memory: *mut MemoryImage, address: u64, width: u64) -> u64 {
     if memory.is_null() {
         return 0;
     }
@@ -41,8 +47,14 @@ pub extern "C" fn jit_helper_load(memory: *mut MemoryImage, address: u64, width:
 }
 
 /// Write 1/2/4/8 bytes to guest memory.
+///
+/// # Safety
+///
+/// The raw pointers passed in must be valid for the duration of the call;
+/// JIT-generated code guarantees this by only passing pointers to live
+/// guest state, memory images, and IR owned by the executing block.
 #[unsafe(no_mangle)]
-pub extern "C" fn jit_helper_store(memory: *mut MemoryImage, address: u64, value: u64, width: u64) {
+pub unsafe extern "C" fn jit_helper_store(memory: *mut MemoryImage, address: u64, value: u64, width: u64) {
     if memory.is_null() {
         return;
     }
@@ -60,7 +72,15 @@ pub extern "C" fn jit_helper_store(memory: *mut MemoryImage, address: u64, value
 /// that don't have dedicated native emission arms.  This is NOT an interpreter
 /// — it executes exactly one instruction per call, invoked from JIT code.
 #[unsafe(no_mangle)]
-pub extern "C" fn jit_helper_execute_insn(
+/// Execute a single IR instruction against guest state.
+///
+/// # Safety
+///
+/// `state`, `memory` and `insn_ptr` must be valid, non-null pointers to a
+/// live `CpuState`, `MemoryImage`, and `IrInstruction` for the duration of
+/// the call. JIT-generated code only passes pointers owned by the executing
+/// block's runtime.
+pub unsafe extern "C" fn jit_helper_execute_insn(
     state: *mut CpuState,
     memory: *mut MemoryImage,
     insn_ptr: *const IrInstruction,
@@ -76,8 +96,14 @@ pub extern "C" fn jit_helper_execute_insn(
 
 
 /// seg: 0=FS, 1=GS.  Returns the segment base (e.g., TEB address for FS).
+///
+/// # Safety
+///
+/// The raw pointers passed in must be valid for the duration of the call;
+/// JIT-generated code guarantees this by only passing pointers to live
+/// guest state, memory images, and IR owned by the executing block.
 #[unsafe(no_mangle)]
-pub extern "C" fn jit_helper_segment_base(state: *mut CpuState, seg: u64) -> u64 {
+pub unsafe extern "C" fn jit_helper_segment_base(state: *mut CpuState, seg: u64) -> u64 {
     if state.is_null() {
         return 0;
     }
@@ -96,8 +122,14 @@ fn parity_byte(v: u8) -> bool {
 
 /// Compute x86 flags from an ALU result and store into CpuState.flags.
 /// op: 0=add, 1=sub, 2=logic(and/or/xor/test), 3=cmp(=sub).
+///
+/// # Safety
+///
+/// The raw pointers passed in must be valid for the duration of the call;
+/// JIT-generated code guarantees this by only passing pointers to live
+/// guest state, memory images, and IR owned by the executing block.
 #[unsafe(no_mangle)]
-pub extern "C" fn jit_helper_set_flags(
+pub unsafe extern "C" fn jit_helper_set_flags(
     state: *mut CpuState,
     result: u64,
     lhs: u64,
@@ -601,8 +633,8 @@ extern "C" fn sigbus_sa_handler(sig: i32, info: *mut libc::siginfo_t, _ctx: *mut
         let flat_size_val = runtime.flat_memory.size();
         // Use checked arithmetic: offset + 4095 must not overflow usize,
         // and the resulting pointer must fall within the flat memory region.
-        if let Some(end_offset) = offset.checked_add(4095) {
-            if end_offset < flat_size_val {
+        if let Some(end_offset) = offset.checked_add(4095)
+            && end_offset < flat_size_val {
                 // SAFETY: end_offset < flat_size_val guarantees the pointer
                 // base + end_offset is within the mmap'd region.
                 unsafe {
@@ -612,7 +644,6 @@ extern "C" fn sigbus_sa_handler(sig: i32, info: *mut libc::siginfo_t, _ctx: *mut
                     );
                 }
             }
-        }
         // Signal-safe zeroing: ptr::write_bytes compiles to an inline memset
         // which is async-signal-safe (memset is in the POSIX safe list).
         // SAFETY: batch_page_data is a stack-local [u8; 4096] array,
@@ -1204,6 +1235,12 @@ unsafe impl Send for JitMemoryManager {}
 // shared references that could create data races.
 unsafe impl Sync for JitMemoryManager {}
 
+impl Default for JitMemoryManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl JitMemoryManager {
     pub fn new() -> Self {
         Self {
@@ -1215,7 +1252,7 @@ impl JitMemoryManager {
     }
 
     unsafe fn allocate_page(&mut self, size: usize) -> *mut u8 {
-        let aligned = ((size + JIT_PAGE_SIZE - 1) / JIT_PAGE_SIZE) * JIT_PAGE_SIZE;
+        let aligned = size.div_ceil(JIT_PAGE_SIZE) * JIT_PAGE_SIZE;
 
         // Use MAP_JIT (W^X) on aarch64 macOS.  MAP_JIT pages are controlled
         // by pthread_jit_write_protect_np: (0)=writable, (1)=executable.
@@ -1256,10 +1293,10 @@ impl JitMemoryManager {
 
     /// Allocate code space and return a writable pointer.
     pub fn allocate_code_space(&mut self, size: usize) -> *mut u8 {
-        let aligned = ((size + 63) / 64) * 64;
+        let aligned = size.div_ceil(64) * 64;
 
-        if let Some(&(page_ptr, page_size)) = self.pages.last() {
-            if self.write_offset + aligned <= page_size {
+        if let Some(&(page_ptr, page_size)) = self.pages.last()
+            && self.write_offset + aligned <= page_size {
                 // SAFETY: page_ptr is a valid mmap'd pointer and
                 // write_offset + aligned <= page_size was checked above,
                 // so the resulting pointer is within the allocated region.
@@ -1268,7 +1305,6 @@ impl JitMemoryManager {
                 self.total_used.fetch_add(aligned, Ordering::Relaxed);
                 return ptr;
             }
-        }
 
         let new_size = aligned.max(JIT_PAGE_SIZE);
         // SAFETY: allocate_page is an unsafe method that performs mmap.
@@ -1300,6 +1336,13 @@ impl JitMemoryManager {
         }
     }
 
+    /// Make the JIT code zone writable for patching.
+    ///
+    /// # Safety
+    ///
+    /// `_ptr` must point into the JIT code zone owned by this manager (or be
+    /// null) and the caller must ensure no other thread is executing code in
+    /// that zone while it is made writable.
     pub unsafe fn make_writable(&self, _ptr: *mut u8, _size: usize) {
         #[cfg(target_arch = "aarch64")]
         unsafe {
@@ -1489,16 +1532,15 @@ impl FlatGuestMemory {
             let offset = page as usize;
             // SAFETY: Checked arithmetic — offset + 4095 must not overflow
             // usize, and the resulting pointer must be within the mmap'd region.
-            if let Some(end_offset) = offset.checked_add(4095) {
-                if end_offset < self.size {
+            if let Some(end_offset) = offset.checked_add(4095)
+                && end_offset < self.size {
                     unsafe {
                         std::ptr::write_volatile(
-                            (self.base as *mut u8).add(end_offset),
+                            self.base.add(end_offset),
                             0u8,
                         );
                     }
                 }
-            }
             page += page_size;
         }
     }
@@ -1675,7 +1717,14 @@ pub struct JitCompiler {
     memory_manager: JitMemoryManager,
     /// IR instructions that need the universal helper.  Each is boxed so its
     /// address is stable (Vec reallocation won't move it).
+    #[allow(clippy::vec_box)]
     helper_insns: Vec<Box<IrInstruction>>,
+}
+
+impl Default for JitCompiler {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl JitCompiler {
@@ -1694,7 +1743,7 @@ impl JitCompiler {
     /// Used to reject blocks that would only partially compile (causing
     /// double-execution of side-effecting instructions).
     fn can_compile_block(ir: &[IrInstruction]) -> bool {
-        ir.iter().all(|insn| Self::can_compile_instruction(insn))
+        ir.iter().all(Self::can_compile_instruction)
     }
 
     /// Returns true if a single IR instruction has a JIT emission arm.
@@ -2042,7 +2091,7 @@ impl JitCompiler {
             let arm_hi = regmap::guest_to_arm(i + 1);
             let offset = gpr_base + (i as u32) * 8;
             self.emitter.emit(
-                0xa9000000 | ((offset >> 3) & 0x7f) << 15 | (arm_hi << 10) | (0 << 5) | arm_lo,
+                (0xa9000000 | ((offset >> 3) & 0x7f) << 15 | (arm_hi << 10)) | arm_lo,
             );
         }
     }
@@ -2125,13 +2174,9 @@ impl JitCompiler {
 
             IrInstruction::AndImm { dst, value, width } => {
                 let arm_dst = regmap::guest_to_arm(dst.index());
-                if *width == 4 && *value <= 0xffffffff {
-                    self.emitter.mov_imm64(regmap::X21, *value);
-                    self.emitter.and_reg(arm_dst, arm_dst, regmap::X21);
-                } else {
-                    self.emitter.mov_imm64(regmap::X21, *value);
-                    self.emitter.and_reg(arm_dst, arm_dst, regmap::X21);
-                }
+                let mask = if *width == 4 { (*value as u32) as u64 } else { *value };
+                self.emitter.mov_imm64(regmap::X21, mask);
+                self.emitter.and_reg(arm_dst, arm_dst, regmap::X21);
             }
 
             IrInstruction::OrImm {
@@ -2297,8 +2342,8 @@ impl JitCompiler {
                 // is registered for this call target, emit a direct `blr` to
                 // the trampoline instead of returning EXIT_THUNK. This
                 // bypasses the full dispatch loop and is significantly faster.
-                if let Some(addrs) = fast_thunk_addrs {
-                    if addrs.contains(target) {
+                if let Some(addrs) = fast_thunk_addrs
+                    && addrs.contains(target) {
                         // Look up the trampoline address from the global map.
                         // Propagate lock poisoning as an explicit error rather
                         // than silently recovering — the caller can decide how
@@ -2359,7 +2404,6 @@ impl JitCompiler {
                             return Ok(());
                         }
                     }
-                }
 
                 // Fallback: standard EXIT_THUNK path.
                 //
@@ -2747,8 +2791,8 @@ impl JitRuntime {
 
             // Auto-chain: if the last instruction is an unconditional jump
             // to a block that is already compiled, chain them.
-            if let Some(last_ir) = ir.last() {
-                if let IrInstruction::Jump { target } = last_ir {
+            if let Some(last_ir) = ir.last()
+                && let IrInstruction::Jump { target } = last_ir {
                     // Skip auto-chaining when a chain break has been
                     // requested — see JIT_CHAIN_BREAK_REQUESTED.
                     if JIT_CHAIN_BREAK_REQUESTED.load(Ordering::Relaxed) {
@@ -2770,7 +2814,6 @@ impl JitRuntime {
                         }
                     }
                 }
-            }
         }
         Ok(self.block_cache.get(&guest_address).unwrap())
     }
@@ -3182,8 +3225,8 @@ impl JitRuntime {
                 // Use checked arithmetic: offset + 4095 must not overflow
                 // usize, and the resulting pointer must fall within the
                 // flat memory region (end_offset < flat_size).
-                if let Some(end_offset) = offset.checked_add(4095) {
-                    if end_offset < flat_size {
+                if let Some(end_offset) = offset.checked_add(4095)
+                    && end_offset < flat_size {
                         // SAFETY: end_offset < flat_size guarantees the
                         // pointer base + end_offset is within the mmap'd
                         // region. write_volatile forces physical page
@@ -3196,7 +3239,6 @@ impl JitRuntime {
                             );
                         }
                     }
-                }
             }
             page_data.fill(0);
         }
@@ -3319,8 +3361,8 @@ impl JitRuntime {
                 // (read_volatile is insufficient on macOS with MAP_NORESERVE)
                 let offset = *page_addr as usize;
                 let flat_size = self.flat_memory.size();
-                if let Some(end_offset) = offset.checked_add(4095) {
-                    if end_offset < flat_size {
+                if let Some(end_offset) = offset.checked_add(4095)
+                    && end_offset < flat_size {
                         // SAFETY: end_offset < flat_size guarantees the pointer
                         // base + end_offset is within the mmap'd region.
                         unsafe {
@@ -3330,7 +3372,6 @@ impl JitRuntime {
                             );
                         }
                     }
-                }
             }
             page_data.fill(0);
         }
@@ -3641,8 +3682,10 @@ pub struct BlockChainEntry {
 /// allocation) and eventually Tier2 (aggressive optimization with inlining
 /// and loop unrolling).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Default)]
 pub enum CompilationTier {
     /// Fast compilation, minimal optimization — direct 1:1 IR-to-native.
+    #[default]
     Tier0,
     /// Full optimization with register allocation, constant folding, dead
     /// code elimination.
@@ -3651,11 +3694,6 @@ pub enum CompilationTier {
     Tier2,
 }
 
-impl Default for CompilationTier {
-    fn default() -> Self {
-        Self::Tier0
-    }
-}
 
 /// Manages tiered compilation by tracking execution counts and promoting
 /// blocks to higher optimization tiers when they cross configured thresholds.
@@ -3674,6 +3712,12 @@ pub struct TieredCompiler {
     pub current_tiers: BTreeMap<u64, CompilationTier>,
 }
 
+impl Default for TieredCompiler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TieredCompiler {
     /// Create a new `TieredCompiler` with default thresholds.
     ///
@@ -3685,6 +3729,8 @@ impl TieredCompiler {
             current_tiers: BTreeMap::new(),
         }
     }
+
+
 
     /// Create a `TieredCompiler` with custom thresholds.
     pub fn with_thresholds(tier0_to_tier1: u32, tier1_to_tier2: u32) -> Self {
@@ -4512,10 +4558,11 @@ impl JitCompiler {
             IrInstruction::ExchangeMemory { register, .. } => {
                 regs.insert(*register);
             }
-            IrInstruction::Cmov { src, .. } => {
-                if let crate::cpu::CompareOperand::Register(r) = src {
-                    regs.insert(*r);
-                }
+            IrInstruction::Cmov {
+                src: crate::cpu::CompareOperand::Register(r),
+                ..
+            } => {
+                regs.insert(*r);
             }
             IrInstruction::MulAcc { src, .. }
             | IrInstruction::ImulAcc { src, .. }
@@ -4645,11 +4692,10 @@ impl JitCompiler {
     fn find_loop_count(instructions: &[IrInstruction], counter: &Register) -> Option<u64> {
         // Scan backwards to find the last MovImm that sets this register
         for insn in instructions.iter().rev() {
-            if let IrInstruction::MovImm { dst, value } = insn {
-                if dst == counter {
+            if let IrInstruction::MovImm { dst, value } = insn
+                && dst == counter {
                     return Some(*value);
                 }
-            }
             // If we find any other instruction writing to counter before MovImm, stop
             if Self::instruction_writes_register(insn, counter) {
                 return None;
@@ -4939,8 +4985,8 @@ pub fn emit_simd_memcpy(emitter: &mut Emitter) -> AppResult<()> {
     let loop_start = emitter.len();
     emitter.subs_imm(23, 23, 16); // SUBS X23, X23, #16 (sets flags)
     emitter.bcond(0x3, 8); // B.LT tail (CC=3, skip ahead 8 insns)
-    emitter.emit(0x3dc00000 | (21 << 5) | 0); // LDR Q0, [X21], #16 (post-index)
-    emitter.emit(0x3d800000 | (22 << 5) | 0); // STR Q0, [X22], #16 (post-index)
+    emitter.emit(0x3dc00000 | (21 << 5)); // LDR Q0, [X21], #16 (post-index)
+    emitter.emit(0x3d800000 | (22 << 5)); // STR Q0, [X22], #16 (post-index)
     let current = emitter.len();
     let offset = (loop_start as i32 - current as i32) / 4 - 1;
     emitter.b(offset); // B loop_start
@@ -4979,12 +5025,12 @@ pub fn emit_simd_memset(emitter: &mut Emitter) -> AppResult<()> {
 
     // DUP V0.16B, Wn (scalar to all vector lanes)
     // Encoding: 0x4e080400 | (Rn << 5) | Vd   — DUP Vd.16B, Wn
-    emitter.emit(0x4e080400 | (3 << 5) | 0); // DUP V0.16B, W3
+    emitter.emit(0x4e080400 | (3 << 5)); // DUP V0.16B, W3
 
     let loop_start = emitter.len();
     emitter.subs_imm(23, 23, 16); // SUBS X23, X23, #16
     emitter.bcond(0x3, 2); // B.LT done (+2 insns)
-    emitter.emit(0x3d800000 | (22 << 5) | 0); // STR Q0, [X22], #16 (post-index)
+    emitter.emit(0x3d800000 | (22 << 5)); // STR Q0, [X22], #16 (post-index)
     let current = emitter.len();
     let offset = (loop_start as i32 - current as i32) / 4 - 1;
     emitter.b(offset); // B loop_start
@@ -5021,14 +5067,14 @@ pub fn emit_simd_memcmp(emitter: &mut Emitter) -> AppResult<()> {
     emitter.subs_imm(23, 23, 16); // SUBS X23, X23, #16
     emitter.bcond(0x3, 10); // B.LT tail (skip ahead)
 
-    emitter.emit(0x3dc00000 | (21 << 5) | 0); // LDR Q0, [X21], #16
+    emitter.emit(0x3dc00000 | (21 << 5)); // LDR Q0, [X21], #16
     emitter.emit(0x3dc00000 | (22 << 5) | 1); // LDR Q1, [X22], #16
 
     // CMEQ V0.16B, V0.16B, V1.16B
-    emitter.emit(0x4e208400 | (1 << 16) | (0 << 5) | 0);
+    emitter.emit(0x4e208400 | (1 << 16));
 
     // UMINV Bd, Vn.16B — across all 16 bytes
-    emitter.emit(0x6e30a800 | (0 << 5) | 2); // UMINV B2, V0.16B
+    emitter.emit(0x6e30a800 | 2); // UMINV B2, V0.16B
 
     // UMOV Wd, Vn.B[0]
     emitter.emit(0x0e003c00 | (2 << 5) | 3); // UMOV W3, V2.B[0]
@@ -5265,6 +5311,12 @@ unsafe impl Send for FastThunkTable {}
 // operations (register) require &mut self, preventing data races.
 unsafe impl Sync for FastThunkTable {}
 
+impl Default for FastThunkTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FastThunkTable {
     /// Create a new, empty fast-thunk table.
     pub fn new() -> Self {
@@ -5488,6 +5540,11 @@ impl FastThunkTable {
         self.entries.len()
     }
 
+    /// Returns true if no thunks are registered.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
     /// Returns true if the given guest address has a registered fast-thunk.
     pub fn contains_guest_addr(&self, guest_addr: u64) -> bool {
         self.entries
@@ -5541,6 +5598,12 @@ pub struct JitUnwindTable {
     dirty: bool,
 }
 
+impl Default for JitUnwindTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl JitUnwindTable {
     pub fn new() -> Self {
         Self {
@@ -5572,7 +5635,7 @@ impl JitUnwindTable {
         };
 
         // 2-byte packed unwind data
-        let unwind_data = vec![packed | 0x00, 0x00]; // flag=00 (no handler)
+        let unwind_data = vec![packed, 0x00]; // flag=00 (no handler)
 
         self.entries.push(JitUnwindInfo {
             start_rva: start_addr as u32,
@@ -6454,7 +6517,7 @@ mod tests {
         // MovImm(rcx, 3), AddImm(rax,1), AddImm(rax,1), AddImm(rax,1)
         // The SubImm and JumpIf are removed
         // (plus constant folding may reduce further)
-        assert!(unrolled.len() > 0, "unrolled loop should have instructions");
+        assert!(!unrolled.is_empty(), "unrolled loop should have instructions");
         // The loop back-edge should be gone
         let has_jumpif = unrolled
             .iter()
@@ -7493,6 +7556,7 @@ mod tests {
         // Outer frame's return address slot points to host
         mem.sync_from_memory_image(stack_base + 8, &ret_to_host.to_le_bytes());
 
+        #[allow(clippy::type_complexity)]
         let memory_reader: Box<dyn Fn(u64, &mut [u8]) -> bool> = Box::new(|addr, buf| {
             let mut tmp = vec![0u8; buf.len()];
             mem.read(addr, &mut tmp);
@@ -7501,9 +7565,11 @@ mod tests {
         });
 
         // --- Unwind frame 1 (inner JIT block) ---
-        let mut ctx = crate::seh::X64Context::default();
-        ctx.rsp = stack_base;
-        ctx.rip = 0x1000;
+        let mut ctx = crate::seh::X64Context {
+            rsp: stack_base,
+            rip: 0x1000,
+            ..Default::default()
+        };
 
         let result = seh.virtual_unwind_by_rva(JIT_IMAGE_BASE, 0x1000, &mut ctx, &*memory_reader);
         assert_eq!(

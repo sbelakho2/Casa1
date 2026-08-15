@@ -3387,7 +3387,6 @@ mod tests {
         let quic_config = QuicConfig {
             force_enabled: false,
             force_disabled: true,
-            ..Default::default()
         };
         let alt_svc = vec![AltSvcEntry {
             protocol_id: "h3".to_string(),
