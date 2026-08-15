@@ -13,7 +13,6 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::os::raw::c_char;
 use std::path::Path;
 use std::time::Duration;
 
@@ -23,6 +22,8 @@ use std::time::Duration;
 
 /// Maximum WinHTTP request body size (256 MB).
 pub const MAX_WINHTTP_REQUEST_BODY: usize = 256 * 1024 * 1024;
+/// Maximum WinHTTP response body size (256 MB).
+pub const MAX_WINHTTP_RESPONSE_BODY: usize = 256 * 1024 * 1024;
 
 /// WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL — enables HTTP/2 and/or HTTP/3 protocol
 pub const WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL: u32 = 159;
@@ -66,6 +67,9 @@ pub struct ProxyConfig {
 
 pub type HINTERNET = u64;
 
+/// Result of cracking a URL into its component parts.
+pub type CrackedUrl = (String, String, u16, String, Option<String>, Option<String>);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WinHttpSessionState {
     NotOpen,
@@ -86,6 +90,11 @@ pub struct WinHttpSession {
     /// Enabled HTTP protocol flags (HTTP/2, HTTP/3).
     /// Set via WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL.
     pub enabled_protocols: u32,
+    /// WINHTTP_OPTION_SECURITY_FLAGS value (revocation checking, etc.).
+    /// Kept separate from `enabled_protocols` so the two options cannot
+    /// clobber each other.
+    #[serde(default)]
+    pub security_flags: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,6 +115,9 @@ pub struct WinHttpRequest {
     pub raw_headers: Vec<String>,
     pub body: Vec<u8>,
     pub response_body: Vec<u8>,
+    /// Read cursor into `response_body` (avoids O(n²) `drain` on every read).
+    #[serde(default)]
+    pub response_read_offset: usize,
     pub response_headers: BTreeMap<String, String>,
     pub status_code: u32,
     pub status_text: String,
@@ -223,6 +235,9 @@ pub struct WinHttpWebSocketState {
     pub is_open: bool,
     pub buffer_type: WinHttpWebSocketBufferType,
     pub receive_buffer: Vec<u8>,
+    /// Read cursor into `receive_buffer` (avoids O(n²) `drain` per receive).
+    #[serde(default)]
+    pub receive_read_offset: usize,
     pub send_buffer: Vec<u8>,
     pub close_status: WinHttpWebSocketCloseStatus,
     pub close_reason: Option<String>,
@@ -368,7 +383,10 @@ pub struct WinHttpStack {
     connections: BTreeMap<HINTERNET, WinHttpConnection>,
     requests: BTreeMap<HINTERNET, WinHttpRequest>,
     next_handle: HINTERNET,
-    client: Option<reqwest::blocking::Client>,
+    /// Cached reqwest client, keyed by the (proxy, timeout) config it was
+    /// built with. Rebuilt whenever the config generation changes so that
+    /// `WINHTTP_OPTION_PROXY` / timeout options take effect.
+    client_cache: Option<(String, reqwest::blocking::Client)>,
     /// Certificate pinning: host -> list of acceptable SPKI SHA-256 hashes
     pinned_certs: HashMap<String, Vec<Vec<u8>>>,
     /// Cookie jar: host -> list of cookies
@@ -377,6 +395,8 @@ pub struct WinHttpStack {
     proxy: Option<ProxyConfig>,
     /// Last response error text (for InternetGetLastResponseInfoW)
     last_response_error: String,
+    /// Last response error code (for InternetGetLastResponseInfoW)
+    last_response_error_code: u32,
     /// WebSocket connections (buffer-based state)
     websockets: BTreeMap<HINTERNET, WinHttpWebSocketState>,
     /// Real tungstenite-backed WebSocket connections (feature-gated).
@@ -398,10 +418,10 @@ pub struct WinHttpStack {
     ftp_binary_mode: BTreeMap<HINTERNET, bool>,
     /// FTP data connection addresses (pasv response) per connection
     ftp_data_addr: BTreeMap<HINTERNET, String>,
-    /// FTP file data cache: FtpOpenFileW handle -> file contents.
+    /// FTP file data cache: FtpOpenFileW handle -> (file contents, read offset).
     /// Allows InternetReadFile to retrieve data after ftp_open_file_w
     /// reads and caches it, rather than discarding it.
-    ftp_file_data: BTreeMap<HINTERNET, Vec<u8>>,
+    ftp_file_data: BTreeMap<HINTERNET, (Vec<u8>, usize)>,
     /// FTP last listing results for find operations
     ftp_listing_cache: BTreeMap<HINTERNET, Vec<crate::wininet::FtpFileInfo>>,
     /// FTP listing iterator index per find handle
@@ -437,7 +457,13 @@ fn extract_spki_der(data: &[u8]) -> Option<Vec<u8>> {
         let len = if let Some(&b) = data.get(*offset) {
             *offset += 1;
             if b & 0x80 != 0 {
+                // Reject absurd long-form lengths (up to 4 length bytes, like
+                // `der_read_length` below) so crafted DER cannot drive
+                // unchecked arithmetic.
                 let num_bytes = (b & 0x7F) as usize;
+                if num_bytes > 4 || *offset + num_bytes > data.len() {
+                    return None;
+                }
                 let mut len_val = 0usize;
                 for _ in 0..num_bytes {
                     len_val = (len_val << 8) | (*data.get(*offset)? as usize);
@@ -450,26 +476,31 @@ fn extract_spki_der(data: &[u8]) -> Option<Vec<u8>> {
         } else {
             return None;
         };
+        // Reject lengths that exceed the remaining buffer before any
+        // arithmetic is performed on them.
+        if len > data.len() - *offset {
+            return None;
+        }
         Some((tag, len))
     }
 
     fn skip_tlv(data: &[u8], offset: &mut usize) -> Option<()> {
         let (_, len) = read_tag(data, offset)?;
-        *offset += len;
+        *offset = (*offset).checked_add(len)?;
         Some(())
     }
 
     // Outer SEQUENCE (Certificate)
     let mut off = 0;
     let (_, outer_len) = read_tag(data, &mut off)?;
-    let end = off + outer_len;
+    let end = off.checked_add(outer_len)?;
     if end > data.len() {
         return None;
     }
 
     // TBSCertificate SEQUENCE
     let (_, tbs_len) = read_tag(data, &mut off)?;
-    let tbs_end = off + tbs_len;
+    let tbs_end = off.checked_add(tbs_len)?;
     if tbs_end > end {
         return None;
     }
@@ -502,11 +533,17 @@ fn extract_spki_der(data: &[u8]) -> Option<Vec<u8>> {
     if spki_tag != 0x30 {
         return None;
     }
-    let spki_end = off + spki_len;
+    let spki_end = off.checked_add(spki_len)?;
     if spki_end > tbs_end {
         return None;
     }
     Some(data[spki_start..spki_end].to_vec())
+}
+
+impl Default for WinHttpStack {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl WinHttpStack {
@@ -515,12 +552,13 @@ impl WinHttpStack {
             sessions: BTreeMap::new(),
             connections: BTreeMap::new(),
             requests: BTreeMap::new(),
-            next_handle: 0,
-            client: None,
+            next_handle: 1,
+            client_cache: None,
             pinned_certs: HashMap::new(),
             cookie_jar: HashMap::new(),
             proxy: None,
             last_response_error: String::new(),
+            last_response_error_code: 0,
             websockets: BTreeMap::new(),
             #[cfg(feature = "websocket")]
             live_websockets: BTreeMap::new(),
@@ -554,14 +592,6 @@ impl WinHttpStack {
         // stack.pin_certificate("steampowered.com", &real_spki_hash);
         // stack.pin_certificate("steamstore.akamaihd.net", &real_spki_hash);
         stack
-    }
-
-    /// Decode a hex string to bytes; returns empty vec on failure (pins are best-effort).
-    fn hex_decode(hex: &str) -> Vec<u8> {
-        (0..hex.len())
-            .step_by(2)
-            .filter_map(|i| u8::from_str_radix(&hex[i..(i + 2).min(hex.len())], 16).ok())
-            .collect()
     }
 
     // -----------------------------------------------------------------------
@@ -620,17 +650,37 @@ impl WinHttpStack {
     // Cookie jar
     // -----------------------------------------------------------------------
 
+    /// Maximum cookies stored per host, and per jar, to bound memory growth
+    /// from malicious servers issuing unbounded `Set-Cookie` headers.
+    const MAX_COOKIES_PER_HOST: usize = 512;
+    const MAX_COOKIE_JAR_SIZE: usize = 8192;
+
     /// Store a cookie for a given host.
     pub fn set_cookie(&mut self, host: &str, cookie: Cookie) {
-        self.cookie_jar
-            .entry(host.to_string())
-            .or_default()
-            .push(cookie);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let host_cookies = self.cookie_jar.entry(host.to_string()).or_default();
+        // Drop expired entries for this host and cap the per-host count.
+        host_cookies.retain(|c| c.expiry.map(|e| e > now).unwrap_or(true));
+        if host_cookies.len() >= Self::MAX_COOKIES_PER_HOST {
+            return; // Jar full — refuse to grow unbounded.
+        }
+        host_cookies.push(cookie);
+        // Cap the total jar size; evict a bucket when exceeded.
+        if self.cookie_jar.len() > Self::MAX_COOKIE_JAR_SIZE
+            && let Some(evicted_host) = self.cookie_jar.keys().next().cloned()
+        {
+            self.cookie_jar.remove(&evicted_host);
+        }
     }
 
     /// Retrieve cookies matching the given host and path.
+    /// `secure` indicates whether the request is over HTTPS; secure-only
+    /// cookies are never sent over plaintext HTTP.
     /// Returns a list of (name, value) pairs suitable for a `Cookie` header.
-    pub fn get_cookies(&self, host: &str, path: &str) -> Vec<(String, String)> {
+    pub fn get_cookies(&self, host: &str, path: &str, secure: bool) -> Vec<(String, String)> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -639,10 +689,14 @@ impl WinHttpStack {
         if let Some(cookies) = self.cookie_jar.get(host) {
             for cookie in cookies {
                 // Skip expired cookies
-                if let Some(expiry) = cookie.expiry {
-                    if now >= expiry {
-                        continue;
-                    }
+                if let Some(expiry) = cookie.expiry
+                    && now >= expiry
+                {
+                    continue;
+                }
+                // Secure cookies must not leak over plaintext HTTP
+                if cookie.secure && !secure {
+                    continue;
                 }
                 // Path match: cookie path must be a prefix of the request path
                 if !path.starts_with(&cookie.path) {
@@ -692,6 +746,19 @@ impl WinHttpStack {
         Ok(())
     }
 
+    /// Returns true if `domain_attr` is acceptable for a cookie received from
+    /// `host`: the attribute must be equal to the host or a parent domain
+    /// (per RFC 6265), and must not be a public suffix. Hosts are compared
+    /// case-insensitively and an optional leading `.` is ignored.
+    fn cookie_domain_matches(host: &str, domain_attr: &str) -> bool {
+        let host = host.trim_end_matches('.').to_lowercase();
+        let domain = domain_attr.trim().trim_start_matches('.').trim_end_matches('.').to_lowercase();
+        if domain.is_empty() {
+            return false;
+        }
+        host == domain || host.ends_with(&format!(".{domain}"))
+    }
+
     /// Parse a `Set-Cookie` header value and store the cookie.
     fn parse_and_store_set_cookie(&mut self, host: &str, header_value: &str) {
         // Parse the simplest form: "name=value; attr1; attr2=val2"
@@ -723,18 +790,21 @@ impl WinHttpStack {
                 let key = attr[..eq_pos].trim().to_lowercase();
                 let val = attr[eq_pos + 1..].trim().to_string();
                 match key.as_str() {
-                    "domain" => cookie.domain = val,
+                    "domain" if Self::cookie_domain_matches(host, &val) => {
+                        cookie.domain = val;
+                    }
+                    "domain" => {}
                     "path" => cookie.path = val,
                     "expires" | "max-age" => {
                         // For simplicity, parse as a timestamp if max-age
-                        if key == "max-age" {
-                            if let Ok(seconds) = val.parse::<u64>() {
-                                let now = std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .map(|d| d.as_secs())
-                                    .unwrap_or(0);
-                                cookie.expiry = Some(now + seconds);
-                            }
+                        if key == "max-age"
+                            && let Ok(seconds) = val.parse::<u64>()
+                        {
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0);
+                            cookie.expiry = Some(now + seconds);
                         }
                         // Expires date parsing is complex; skip for now
                     }
@@ -762,35 +832,47 @@ impl WinHttpStack {
 
     /// Returns true if the given URL should bypass the proxy.
     pub fn should_bypass_proxy(&self, url: &str) -> bool {
-        let Some(ref proxy) = self.proxy else {
+        let Some(proxy) = self.proxy.as_ref() else {
             return true; // No proxy configured, nothing to bypass
         };
         if proxy.bypass_list.is_empty() {
             return false;
         }
-        // Check if the URL matches any bypass entry (simple substring/prefix match)
+        // Match bypass entries against the URL *host* with proper suffix
+        // rules, so "example.com" does not match "notexample.com" or
+        // "example.com.evil.net".
+        let host = url::Url::parse(url)
+            .ok()
+            .and_then(|u| u.host_str().map(|h| h.to_lowercase()))
+            .unwrap_or_else(|| url.to_lowercase());
         for bypass in &proxy.bypass_list {
-            if url.contains(bypass) {
+            if Self::host_matches_bypass(&host, bypass) {
                 return true;
-            }
-            // Also check for wildcard-like patterns (e.g., "*.local")
-            if let Some(domain) = bypass.strip_prefix("*.") {
-                if url.contains(domain) {
-                    return true;
-                }
             }
         }
         false
     }
 
+    /// Match a host against a single bypass entry. Supports plain domains
+    /// (`example.com`), leading-dot forms (`.example.com`) and wildcard
+    /// prefixes (`*.example.com`).
+    fn host_matches_bypass(host: &str, bypass: &str) -> bool {
+        let entry = bypass
+            .trim()
+            .trim_start_matches('*')
+            .trim_start_matches('.')
+            .trim_end_matches('.')
+            .to_lowercase();
+        if entry.is_empty() {
+            return false;
+        }
+        host == entry || host.ends_with(&format!(".{entry}"))
+    }
+
     /// Returns the Proxy-Authorization header value if proxy auth is configured.
     pub fn proxy_auth_header(&self) -> Option<String> {
-        let Some(ref proxy) = self.proxy else {
-            return None;
-        };
-        let Some((ref username, ref password)) = proxy.auth else {
-            return None;
-        };
+        let proxy = self.proxy.as_ref()?;
+        let (username, password) = proxy.auth.as_ref()?;
         let credentials = format!("{username}:{password}");
         let encoded = Self::base64_encode(credentials.as_bytes());
         Some(format!("Basic {encoded}"))
@@ -801,7 +883,7 @@ impl WinHttpStack {
         const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         let mut result = String::new();
         for chunk in input.chunks(3) {
-            let b0 = chunk.get(0).copied().unwrap_or(0) as u32;
+            let b0 = chunk.first().copied().unwrap_or(0) as u32;
             let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
             let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
             let triple = (b0 << 16) | (b1 << 8) | b2;
@@ -827,6 +909,103 @@ impl WinHttpStack {
         h
     }
 
+    /// Build (or reuse from the cache) a reqwest blocking client for the
+    /// given proxy configuration and timeout. The cache key covers the proxy
+    /// server, bypass state and timeout, so changing any of them rebuilds the
+    /// client. Returns an error instead of panicking if the client cannot be
+    /// constructed (e.g. invalid TLS configuration).
+    fn client_for(
+        &mut self,
+        proxy_cfg: Option<&ProxyConfig>,
+        should_bypass: bool,
+        timeout_ms: u32,
+    ) -> AppResult<reqwest::blocking::Client> {
+        let proxy_key = match proxy_cfg {
+            Some(cfg) if !should_bypass => cfg.server.clone(),
+            _ => String::new(),
+        };
+        let key = format!("{proxy_key}|{timeout_ms}");
+        if let Some((cached_key, client)) = &self.client_cache
+            && *cached_key == key
+        {
+            return Ok(client.clone());
+        }
+
+        let mut builder = reqwest::blocking::Client::builder()
+            .danger_accept_invalid_certs(false) // certificate pinning is enforced for pinned hosts
+            .tls_info(true) // expose the peer certificate so certificate pinning can be enforced
+            .timeout(std::time::Duration::from_millis(timeout_ms as u64));
+        if let Some(cfg) = proxy_cfg
+            && !should_bypass
+        {
+            let proxy_url = if cfg.server.starts_with("http://")
+                || cfg.server.starts_with("https://")
+            {
+                cfg.server.clone()
+            } else {
+                format!("http://{}", cfg.server)
+            };
+            // https:// proxy URLs must be registered as https proxies;
+            // Proxy::http silently rejects them.
+            let proxy = if proxy_url.starts_with("https://") {
+                reqwest::Proxy::https(&proxy_url)
+            } else {
+                reqwest::Proxy::all(&proxy_url)
+            };
+            match proxy {
+                Ok(p) => {
+                    builder = builder.proxy(p);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "WinHttpSendRequest: ignoring invalid proxy configuration '{}': {e}",
+                        Self::redact_proxy_url(&proxy_url)
+                    );
+                }
+            }
+        }
+        let client = builder.build().map_err(|e| {
+            AppError::new(
+                ReasonCode::RcNetHttpRequestFailed,
+                format!("WinHttpSendRequest: failed to create HTTP client: {e:?}"),
+            )
+        })?;
+        self.client_cache = Some((key, client.clone()));
+        Ok(client)
+    }
+
+    /// Redact the userinfo portion of a proxy URL for logging.
+    pub fn redact_proxy_url(proxy_url: &str) -> String {
+        match url::Url::parse(proxy_url) {
+            Ok(parsed) => {
+                let mut out = format!("{}://", parsed.scheme());
+                if let Some(host) = parsed.host_str() {
+                    out.push_str(host);
+                    if let Some(port) = parsed.port() {
+                        out.push_str(&format!(":{port}"));
+                    }
+                } else {
+                    out.push_str("[invalid]");
+                }
+                out
+            }
+            Err(_) => {
+                // Fall back to a manual strip of `user:pass@`.
+                match proxy_url.find('@') {
+                    Some(at) => {
+                        let scheme_end = proxy_url.find("://").map(|p| p + 3).unwrap_or(0);
+                        if at > scheme_end {
+                            format!("{}[redacted]@{}", &proxy_url[..scheme_end], &proxy_url[at + 1..])
+                        } else {
+                            proxy_url.to_string()
+                        }
+                    }
+                    None => proxy_url.to_string(),
+                }
+            }
+        }
+    }
+
     // -----------------------------------------------------------------------
     // WinHttpOpen — initialise a WinHTTP session
     // -----------------------------------------------------------------------
@@ -845,6 +1024,7 @@ impl WinHttpStack {
             proxy_bypass: proxy_bypass.map(|s| s.to_string()),
             state: WinHttpSessionState::Open,
             enabled_protocols: 0,
+            security_flags: 0,
         };
         self.sessions.insert(handle, session);
         handle
@@ -854,6 +1034,17 @@ impl WinHttpStack {
     // WinHttpCloseHandle — close any WinHTTP handle
     // -----------------------------------------------------------------------
     pub fn win_http_close_handle(&mut self, handle: HINTERNET) -> AppResult<()> {
+        // Drop every per-handle resource for this handle (FTP sockets, listing
+        // caches, cert contexts, ...) regardless of which handle type it is.
+        let removed_ftp = self.ftp_control.remove(&handle).is_some()
+            || self.ftp_current_dir.remove(&handle).is_some()
+            || self.ftp_binary_mode.remove(&handle).is_some()
+            || self.ftp_data_addr.remove(&handle).is_some()
+            || self.ftp_file_data.remove(&handle).is_some()
+            || self.ftp_listing_cache.remove(&handle).is_some()
+            || self.ftp_listing_index.remove(&handle).is_some()
+            || self.revocation_handlers.remove(&handle).is_some()
+            || self.client_cert_contexts.remove(&handle).is_some();
         if self.sessions.remove(&handle).is_some() {
             return Ok(());
         }
@@ -868,8 +1059,7 @@ impl WinHttpStack {
             self.live_websockets.remove(&handle);
             return Ok(());
         }
-        // Clean up FTP file data cache entry
-        if self.ftp_file_data.remove(&handle).is_some() {
+        if removed_ftp {
             return Ok(());
         }
         Err(AppError::new(
@@ -945,6 +1135,7 @@ impl WinHttpStack {
             raw_headers,
             body: Vec::new(),
             response_body: Vec::new(),
+            response_read_offset: 0,
             response_headers: BTreeMap::new(),
             status_code: 0,
             status_text: String::new(),
@@ -1033,42 +1224,25 @@ impl WinHttpStack {
             None
         };
         let proxy_cfg = self.proxy.clone();
+        let req_timeout_ms = self.requests.get(&request_handle).map(|r| r.timeout_ms).unwrap_or(30000);
 
         // --- 3.1.4: Collect cookies from jar ---
-        let cookies = self.get_cookies(&conn_server_name, &req_object_name);
+        let cookies = self.get_cookies(&conn_server_name, &req_object_name, conn_is_secure);
 
-        // Build the HTTP client lazily (with proxy support if configured)
-        let client = self.client.get_or_insert_with(|| {
-            let mut builder = reqwest::blocking::Client::builder()
-                .danger_accept_invalid_certs(false) // certificate pinning is enforced for pinned hosts
-                .tls_info(true) // expose the peer certificate so certificate pinning can be enforced
-                .timeout(std::time::Duration::from_secs(30));
-            if let Some(ref cfg) = proxy_cfg {
-                if !should_bypass {
-                    let proxy_url = if cfg.server.starts_with("http://")
-                        || cfg.server.starts_with("https://")
-                    {
-                        cfg.server.clone()
-                    } else {
-                        format!("http://{}", cfg.server)
-                    };
-                    if let Ok(proxy) = reqwest::Proxy::http(&proxy_url) {
-                        builder = builder.proxy(proxy);
-                    }
-                }
-            }
-            builder.build().expect("Failed to create reqwest client")
-        });
+        // Build (or reuse) the HTTP client. The cache key covers the proxy
+        // configuration, bypass state and effective timeout, so later
+        // WinHttpSetOption(WINHTTP_OPTION_PROXY / *_TIMEOUT) changes rebuild
+        // the client instead of silently keeping the first request's settings.
+        let client = self.client_for(proxy_cfg.as_ref(), should_bypass, req_timeout_ms)?;
 
-        let method = match req_verb.to_uppercase().as_str() {
-            "GET" => reqwest::Method::GET,
-            "POST" => reqwest::Method::POST,
-            "PUT" => reqwest::Method::PUT,
-            "DELETE" => reqwest::Method::DELETE,
-            "HEAD" => reqwest::Method::HEAD,
-            "PATCH" => reqwest::Method::PATCH,
-            _ => reqwest::Method::GET,
-        };
+        let method = reqwest::Method::from_bytes(req_verb.to_uppercase().as_bytes()).map_err(
+            |_| {
+                AppError::new(
+                    ReasonCode::RcCliInvalid,
+                    format!("WinHttpSendRequest: invalid HTTP verb '{req_verb}'"),
+                )
+            },
+        )?;
 
         let mut request_builder = client.request(method.clone(), &url);
 
@@ -1108,21 +1282,26 @@ impl WinHttpStack {
                 request_builder = request_builder.header(key.as_str(), value.as_str());
             }
 
-            // Add body for methods that support it
-            if method == reqwest::Method::POST
+            // Add body for methods that support it (take ownership instead of
+            // cloning up to 256 MB; a subsequent send on the same handle will
+            // have an empty body, matching one-shot WinHTTP semantics).
+            let supports_body = method == reqwest::Method::POST
                 || method == reqwest::Method::PUT
-                || method == reqwest::Method::PATCH
-            {
-                request_builder = request_builder.body(req.body.clone());
+                || method == reqwest::Method::PATCH;
+            if supports_body {
+                let request_body = std::mem::take(&mut req.body);
+                request_builder = request_builder.body(request_body);
             }
 
             req.state = WinHttpSessionState::Sending;
 
             // Execute the request
-            let response = match request_builder.send() {
+            let mut response = match request_builder.send() {
                 Ok(resp) => resp,
                 Err(e) => {
                     req.state = WinHttpSessionState::Complete;
+                    self.last_response_error = format!("{e:?}");
+                    self.last_response_error_code = 12029; // ERROR_INTERNET_CANNOT_CONNECT
                     return Err(AppError::new(
                         ReasonCode::RcNetHttpRequestFailed,
                         format!("WinHttpSendRequest: {e:?}"),
@@ -1162,21 +1341,57 @@ impl WinHttpStack {
                 .map(|hv| hv.to_str().unwrap_or("").to_string())
                 .collect();
 
-            // Read response body
-            let body_bytes = response.bytes().unwrap_or_default().to_vec();
+            // Read the response body with a hard size cap and error
+            // propagation: a mid-body network error must fail the request
+            // instead of silently producing a truncated body.
+            if let Some(cl) = response.content_length()
+                && cl > MAX_WINHTTP_RESPONSE_BODY as u64
+            {
+                req.state = WinHttpSessionState::Complete;
+                return Err(AppError::new(
+                    ReasonCode::RcBufferLimitExceeded,
+                    format!(
+                        "WinHttpSendRequest: response content length {cl} exceeds limit ({MAX_WINHTTP_RESPONSE_BODY})"
+                    ),
+                ));
+            }
+            let mut body_bytes = Vec::new();
+            {
+                let mut limited = (&mut response).take((MAX_WINHTTP_RESPONSE_BODY + 1) as u64);
+                if let Err(e) = limited.read_to_end(&mut body_bytes) {
+                    req.state = WinHttpSessionState::Complete;
+                    self.last_response_error = format!("{e}");
+                    self.last_response_error_code = 12002; // ERROR_INTERNET_TIMEOUT
+                    return Err(AppError::new(
+                        ReasonCode::RcNetHttpRequestFailed,
+                        format!("WinHttpSendRequest: failed reading response body: {e}"),
+                    ));
+                }
+            }
+            if body_bytes.len() > MAX_WINHTTP_RESPONSE_BODY {
+                req.state = WinHttpSessionState::Complete;
+                return Err(AppError::new(
+                    ReasonCode::RcBufferLimitExceeded,
+                    format!(
+                        "WinHttpSendRequest: response body size {} exceeds limit ({MAX_WINHTTP_RESPONSE_BODY})",
+                        body_bytes.len()
+                    ),
+                ));
+            }
 
-            // Write results into request
+            // Write results into request (move, no clone)
             req.status_code = sc;
             req.status_text = st.clone();
             req.response_headers = resp_headers.clone();
-            req.response_body = body_bytes.clone();
+            req.response_body = body_bytes;
+            req.response_read_offset = 0;
             req.state = WinHttpSessionState::Complete;
 
             (
                 sc,
                 st,
                 resp_headers,
-                body_bytes,
+                Vec::<u8>::new(),
                 set_cookie_values,
                 cert_chain,
             )
@@ -1221,21 +1436,20 @@ impl WinHttpStack {
             .and_then(|sh| self.sessions.get(&sh))
             .map(|s| s.enabled_protocols)
             .unwrap_or(0);
-        if enabled_protocols & WINHTTP_PROTOCOL_FLAG_HTTP3 != 0 {
-            if !self
+        if enabled_protocols & WINHTTP_PROTOCOL_FLAG_HTTP3 != 0
+            && !self
                 .quic_fallback_logged
                 .get(&conn_server_name)
                 .copied()
                 .unwrap_or(false)
-            {
-                eprintln!(
-                    "WinHttp: HTTP/3 requested for {} but QUIC is not available on this platform; \
-                     using HTTP/2 as fallback",
-                    conn_server_name
-                );
-                self.quic_fallback_logged
-                    .insert(conn_server_name.clone(), true);
-            }
+        {
+            eprintln!(
+                "WinHttp: HTTP/3 requested for {} but QUIC is not available on this platform; \
+                 using HTTP/2 as fallback",
+                conn_server_name
+            );
+            self.quic_fallback_logged
+                .insert(conn_server_name.clone(), true);
         }
 
         Ok(())
@@ -1271,17 +1485,28 @@ impl WinHttpStack {
     ) -> AppResult<u32> {
         // First try the HTTP requests map
         if let Some(req) = self.requests.get_mut(&request_handle) {
-            let to_read = buffer.len().min(req.response_body.len());
-            buffer[..to_read].copy_from_slice(&req.response_body[..to_read]);
-            req.response_body.drain(..to_read);
+            let off = req.response_read_offset;
+            let to_read = buffer.len().min(req.response_body.len().saturating_sub(off));
+            buffer[..to_read].copy_from_slice(&req.response_body[off..off + to_read]);
+            req.response_read_offset = off + to_read;
+            // Release the backing buffer once fully consumed.
+            if req.response_read_offset == req.response_body.len() {
+                req.response_body.clear();
+                req.response_read_offset = 0;
+            }
             return Ok(to_read as u32);
         }
 
         // Fall back to FTP file data cache (for handles from ftp_open_file_w)
-        if let Some(file_data) = self.ftp_file_data.get_mut(&request_handle) {
-            let to_read = buffer.len().min(file_data.len());
-            buffer[..to_read].copy_from_slice(&file_data[..to_read]);
-            file_data.drain(..to_read);
+        if let Some((file_data, read_offset)) = self.ftp_file_data.get_mut(&request_handle) {
+            let to_read = buffer.len().min(file_data.len().saturating_sub(*read_offset));
+            buffer[..to_read].copy_from_slice(&file_data[*read_offset..*read_offset + to_read]);
+            *read_offset += to_read;
+            // Release the backing buffer once fully consumed.
+            if *read_offset == file_data.len() {
+                file_data.clear();
+                *read_offset = 0;
+            }
             return Ok(to_read as u32);
         }
 
@@ -1301,7 +1526,11 @@ impl WinHttpStack {
                 format!("WinHttpQueryDataAvailable: invalid handle {request_handle:#x}"),
             )
         })?;
-        Ok(req.response_body.len() as u32)
+        Ok(req
+            .response_body
+            .len()
+            .saturating_sub(req.response_read_offset)
+            .min(u32::MAX as usize) as u32)
     }
 
     // -----------------------------------------------------------------------
@@ -1327,8 +1556,11 @@ impl WinHttpStack {
                 .collect();
             return Ok(raw.join("\r\n"));
         }
+        // WinHTTP header names are case-insensitive; stored keys are
+        // lowercased by reqwest, so lowercase the query before looking up.
+        let lower = header_name.to_lowercase();
         req.response_headers
-            .get(header_name)
+            .get(&lower)
             .cloned()
             .ok_or_else(|| {
                 AppError::new(
@@ -1414,44 +1646,42 @@ impl WinHttpStack {
                             });
                             eprintln!(
                                 "WinHttpSetOption: proxy set to {} for session {:#x}",
-                                proxy_url, handle
+                                Self::redact_proxy_url(proxy_url), handle
                             );
                         }
                     }
                 }
-                WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL => {
-                    if value.len() >= 4 {
-                        let flags = u32::from_ne_bytes([value[0], value[1], value[2], value[3]]);
-                        session.enabled_protocols = flags;
+                WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL if value.len() >= 4 => {
+                    let flags = u32::from_ne_bytes([value[0], value[1], value[2], value[3]]);
+                    session.enabled_protocols = flags;
 
-                        // Log if HTTP/3 was requested
-                        if flags & WINHTTP_PROTOCOL_FLAG_HTTP3 != 0 {
-                            eprintln!(
-                                "WinHttpSetOption: HTTP/3 protocol enabled for session {:#x} \
-                                 (HTTP/3 will be transparently downgraded to HTTP/2 on this platform)",
-                                handle
-                            );
-                        }
+                    // Log if HTTP/3 was requested
+                    if flags & WINHTTP_PROTOCOL_FLAG_HTTP3 != 0 {
+                        eprintln!(
+                            "WinHttpSetOption: HTTP/3 protocol enabled for session {:#x} \
+                             (HTTP/3 will be transparently downgraded to HTTP/2 on this platform)",
+                            handle
+                        );
                     }
                 }
                 _ => {}
             }
             return Ok(());
         }
-        if let Some(_conn) = self.connections.get_mut(&handle) {
-            match option {
-                _ => {}
-            }
+        if self.connections.contains_key(&handle) {
             return Ok(());
         }
         if let Some(req) = self.requests.get_mut(&handle) {
             match option {
-                4 => {
-                    // WINHTTP_OPTION_CONNECT_TIMEOUT
-                    if value.len() >= 4 {
-                        req.timeout_ms =
-                            u32::from_ne_bytes([value[0], value[1], value[2], value[3]]);
-                    }
+                4 | 5 if value.len() >= 4 => {
+                    // WINHTTP_OPTION_CONNECT_TIMEOUT (4) / WINHTTP_OPTION_SEND_TIMEOUT (5)
+                    req.timeout_ms =
+                        u32::from_ne_bytes([value[0], value[1], value[2], value[3]]);
+                }
+                6 if value.len() >= 4 => {
+                    // WINHTTP_OPTION_RECEIVE_TIMEOUT
+                    req.timeout_ms =
+                        u32::from_ne_bytes([value[0], value[1], value[2], value[3]]);
                 }
                 _ => {}
             }
@@ -1631,12 +1861,12 @@ impl WinHttpStack {
         user_name: Option<&str>,
         password: Option<&str>,
     ) -> AppResult<()> {
-        // Log unsupported auth schemes (only Basic=1 is implemented)
+        // Log unsupported auth schemes (only Basic=1 is implemented).
+        // Do not print the user name — credentials must never reach stderr.
         if auth_scheme != 1 {
             eprintln!(
-                "WinHttpSetCredentials: auth scheme {} requested (only Basic=1 supported); \
-                 target={}, user={:?}",
-                auth_scheme, auth_target, user_name
+                "WinHttpSetCredentials: auth scheme {} requested (only Basic=1 supported); target={}",
+                auth_scheme, auth_target
             );
         }
         let req = self.requests.get_mut(&request_handle).ok_or_else(|| {
@@ -1684,30 +1914,30 @@ impl WinHttpStack {
         // WINHTTP_AUTH_SCHEME_DIGEST = 8
         // WINHTTP_AUTH_SCHEME_NEGOTIATE = 16
 
-        for (_key, value) in &req.response_headers {
-            let lower = value.to_lowercase();
-            if lower.contains("basic") {
-                supported_schemes |= 1;
-                if first_scheme == 0 {
-                    first_scheme = 1;
-                }
+        // Only challenge headers can advertise schemes; scanning every
+        // response header (or substring-matching, e.g. "notbasic") would
+        // report false positives.
+        let mut note_scheme = |scheme: u32| {
+            supported_schemes |= scheme;
+            if first_scheme == 0 {
+                first_scheme = scheme;
             }
-            if lower.contains("ntlm") {
-                supported_schemes |= 2;
-                if first_scheme == 0 {
-                    first_scheme = 2;
-                }
+        };
+        for (key, value) in &req.response_headers {
+            if key != "www-authenticate" && key != "proxy-authenticate" {
+                continue;
             }
-            if lower.contains("digest") {
-                supported_schemes |= 8;
-                if first_scheme == 0 {
-                    first_scheme = 8;
+            for token in value.split(|c: char| c == ',' || c.is_ascii_whitespace()) {
+                let token = token.trim();
+                if token.is_empty() {
+                    continue;
                 }
-            }
-            if lower.contains("negotiate") {
-                supported_schemes |= 16;
-                if first_scheme == 0 {
-                    first_scheme = 16;
+                match token.to_ascii_lowercase().as_str() {
+                    "basic" => note_scheme(1),
+                    "ntlm" => note_scheme(2),
+                    "digest" => note_scheme(8),
+                    "negotiate" => note_scheme(16),
+                    _ => {}
                 }
             }
         }
@@ -1720,24 +1950,42 @@ impl WinHttpStack {
     // (shared between WinHTTP and WinINet dispatch)
     // -----------------------------------------------------------------------
     pub fn internet_get_last_response_info(&self) -> (u32, String) {
-        (12002u32, self.last_response_error.clone())
+        let code = if self.last_response_error_code == 0 {
+            12002 // ERROR_INTERNET_TIMEOUT — default when no failure recorded
+        } else {
+            self.last_response_error_code
+        };
+        (code, self.last_response_error.clone())
     }
 
     // -----------------------------------------------------------------------
     // InternetCrackUrlW — crack a URL into its component parts
     // (shared between WinHTTP and WinINet dispatch)
     // -----------------------------------------------------------------------
+
+    /// Truncate `url` to at most `url_length` UTF-8 bytes, never splitting a
+    /// multi-byte character. `url_length` is guest-controlled (a UTF-16-unit
+    /// count per WinINet semantics), so slicing at the raw byte offset can
+    /// panic; clamp to the nearest char boundary instead.
+    fn truncate_url(url: &str, url_length: u32) -> &str {
+        let want = url_length as usize;
+        if want >= url.len() {
+            return url;
+        }
+        let mut end = want;
+        while end > 0 && !url.is_char_boundary(end) {
+            end -= 1;
+        }
+        &url[..end]
+    }
+
     #[allow(unused_assignments)]
     pub fn internet_crack_url_w(
         &self,
         url: &str,
         url_length: u32,
-    ) -> AppResult<(String, String, u16, String, Option<String>, Option<String>)> {
-        let url = if (url_length as usize) < url.len() {
-            &url[..url_length as usize]
-        } else {
-            url
-        };
+    ) -> AppResult<CrackedUrl> {
+        let url = Self::truncate_url(url, url_length);
 
         let url = url.trim();
         let mut scheme = String::new();
@@ -1770,7 +2018,8 @@ impl WinHttpStack {
         };
 
         let path_start = hostpart
-            .find(|c: char| c == '/' || c == '?' || c == '#')
+            .bytes()
+            .position(|b| b == b'/' || b == b'?' || b == b'#')
             .unwrap_or(hostpart.len());
         let host_port = &hostpart[..path_start];
         let path_and_query = &hostpart[path_start..];
@@ -1806,11 +2055,7 @@ impl WinHttpStack {
     // (shared between WinHTTP and WinINet dispatch)
     // -----------------------------------------------------------------------
     pub fn internet_canonicalize_url_w(&self, url: &str, url_length: u32) -> String {
-        let url = if (url_length as usize) < url.len() {
-            &url[..url_length as usize]
-        } else {
-            url
-        };
+        let url = Self::truncate_url(url, url_length);
 
         let mut result = String::with_capacity(url.len());
         for ch in url.chars() {
@@ -1868,15 +2113,11 @@ impl WinHttpStack {
         });
 
         let ws_handle = self.next_handle;
-        self.next_handle += 1;
 
-        let is_text_mode = matches!(
-            request
-                .headers
-                .get("Sec-WebSocket-Protocol")
-                .map(|s| s.as_str()),
-            Some("text") | Some("text-only")
-        );
+        // Frame encoding is governed by the per-call buffer types passed to
+        // WinHttpWebSocketSend/Receive, not by the negotiated subprotocol
+        // (Sec-WebSocket-Protocol is unrelated to text vs binary framing).
+        let is_text_mode = false;
 
         self.websockets.insert(
             ws_handle,
@@ -1889,6 +2130,7 @@ impl WinHttpStack {
                     WinHttpWebSocketBufferType::BinaryMessageBuffer
                 },
                 receive_buffer: Vec::new(),
+                receive_read_offset: 0,
                 send_buffer: Vec::new(),
                 close_status: WinHttpWebSocketCloseStatus::Success,
                 close_reason: None,
@@ -1968,7 +2210,12 @@ impl WinHttpStack {
         }
 
         // Buffer-based fallback
-        let ws = self.websockets.get_mut(&ws_handle).unwrap();
+        let ws = self.websockets.get_mut(&ws_handle).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcWin32InvalidHandle,
+                "WinHttpWebSocketSend: WebSocket handle vanished",
+            )
+        })?;
         let new_send_len = ws.send_buffer.len().saturating_add(data.len());
         if new_send_len > MAX_WEBSOCKET_SEND_BUFFER {
             return Err(AppError::new(
@@ -2018,7 +2265,12 @@ impl WinHttpStack {
                     data[..to_copy].copy_from_slice(&bytes[..to_copy]);
                     // Store any remaining data in the receive buffer
                     if bytes.len() > to_copy {
-                        let ws = self.websockets.get_mut(&ws_handle).unwrap();
+                        let ws = self.websockets.get_mut(&ws_handle).ok_or_else(|| {
+                            AppError::new(
+                                ReasonCode::RcWin32InvalidHandle,
+                                "WinHttpWebSocketReceive: WebSocket handle vanished",
+                            )
+                        })?;
                         let new_recv_len = ws
                             .receive_buffer
                             .len()
@@ -2039,7 +2291,12 @@ impl WinHttpStack {
                     let to_copy = data.len().min(bin.len());
                     data[..to_copy].copy_from_slice(&bin[..to_copy]);
                     if bin.len() > to_copy {
-                        let ws = self.websockets.get_mut(&ws_handle).unwrap();
+                        let ws = self.websockets.get_mut(&ws_handle).ok_or_else(|| {
+                            AppError::new(
+                                ReasonCode::RcWin32InvalidHandle,
+                                "WinHttpWebSocketReceive: WebSocket handle vanished",
+                            )
+                        })?;
                         let new_recv_len =
                             ws.receive_buffer.len().saturating_add(bin.len() - to_copy);
                         if new_recv_len > MAX_WEBSOCKET_RECEIVE_SPILL {
@@ -2055,7 +2312,12 @@ impl WinHttpStack {
                     return Ok(to_copy as u32);
                 }
                 WebSocketMessage::Close(code, reason) => {
-                    let ws = self.websockets.get_mut(&ws_handle).unwrap();
+                    let ws = self.websockets.get_mut(&ws_handle).ok_or_else(|| {
+                        AppError::new(
+                            ReasonCode::RcWin32InvalidHandle,
+                            "WinHttpWebSocketReceive: WebSocket handle vanished",
+                        )
+                    })?;
                     ws.is_open = false;
                     ws.close_status = WinHttpWebSocketCloseStatus::from_code(code);
                     ws.close_reason = Some(reason);
@@ -2069,9 +2331,14 @@ impl WinHttpStack {
 
         // Buffer-based fallback
         let ws = self.websockets.get_mut(&ws_handle).unwrap();
-        let bytes_to_read = data.len().min(ws.receive_buffer.len());
-        data[..bytes_to_read].copy_from_slice(&ws.receive_buffer[..bytes_to_read]);
-        ws.receive_buffer.drain(..bytes_to_read);
+        let bytes_to_read = data.len().min(ws.receive_buffer.len().saturating_sub(ws.receive_read_offset));
+        data[..bytes_to_read]
+            .copy_from_slice(&ws.receive_buffer[ws.receive_read_offset..ws.receive_read_offset + bytes_to_read]);
+        ws.receive_read_offset += bytes_to_read;
+        if ws.receive_read_offset == ws.receive_buffer.len() {
+            ws.receive_buffer.clear();
+            ws.receive_read_offset = 0;
+        }
 
         Ok(bytes_to_read as u32)
     }
@@ -2133,8 +2400,160 @@ impl WinHttpStack {
 
     // ── FTP helpers ────────────────────────────────────────────────────────
 
+    /// Reject FTP operands (file names, patterns, directories, credentials)
+    /// that contain CR/LF, which would inject arbitrary FTP commands into the
+    /// control stream.
+    fn ftp_check_operand(operand: &str, what: &str) -> AppResult<()> {
+        if operand.contains('\r') || operand.contains('\n') {
+            return Err(AppError::new(
+                ReasonCode::RcCliInvalid,
+                format!("FTP: {what} contains illegal CR/LF characters"),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Read the FTP server greeting and log in (anonymous fallback) so that a
+    /// control connection exists before any command is issued. The WinINet
+    /// host thunks route `InternetConnectW` into the WinHTTP stack without a
+    /// service/credentials argument, so the control connection is established
+    /// lazily on first use instead of at connect time.
+    fn ensure_ftp_control(&mut self, conn_handle: HINTERNET) -> AppResult<()> {
+        if self.ftp_control.contains_key(&conn_handle) {
+            return Ok(());
+        }
+        let (server_name, server_port) = {
+            let conn = self.connections.get(&conn_handle).ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcWin32InvalidHandle,
+                    format!("FTP: invalid connection handle {conn_handle:#x}"),
+                )
+            })?;
+            (conn.server_name.clone(), conn.server_port)
+        };
+        let port = if server_port == 0 { 21 } else { server_port };
+        let addr = format!("{server_name}:{port}");
+        let mut stream = TcpStream::connect_timeout(
+            &addr
+                .to_socket_addrs()
+                .map_err(|e| {
+                    AppError::new(
+                        ReasonCode::RcNetDnsResolutionFailed,
+                        format!("FTP DNS resolution failed for {server_name}: {e}"),
+                    )
+                })?
+                .next()
+                .ok_or_else(|| {
+                    AppError::new(
+                        ReasonCode::RcNetDnsResolutionFailed,
+                        format!("FTP: no address for {server_name}"),
+                    )
+                })?,
+            Duration::from_secs(15),
+        )
+        .map_err(|e| {
+            AppError::new(
+                ReasonCode::RcNetConnectionFailed,
+                format!("FTP connection to {addr} failed: {e}"),
+            )
+        })?;
+        stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
+        stream.set_write_timeout(Some(Duration::from_secs(30))).ok();
+
+        // Read the 220 greeting
+        let greeting = Self::ftp_read_reply(&mut stream, 8192)?;
+        let greeting_status = greeting
+            .get(..3)
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        if !greeting_status.starts_with("220") && !greeting_status.starts_with("120") {
+            return Err(AppError::new(
+                ReasonCode::RcIo,
+                format!("FTP: unexpected greeting from {addr}: {greeting_status}"),
+            ));
+        }
+
+        // USER anonymous
+        stream
+            .write_all(b"USER anonymous\r\n")
+            .map_err(|e| AppError::new(ReasonCode::RcIo, format!("FTP USER failed: {e}")))?;
+        let user_reply = Self::ftp_read_reply(&mut stream, 8192)?;
+        if user_reply.starts_with("331") {
+            stream
+                .write_all(b"PASS casa1@localhost\r\n")
+                .map_err(|e| AppError::new(ReasonCode::RcIo, format!("FTP PASS failed: {e}")))?;
+            let pass_reply = Self::ftp_read_reply(&mut stream, 8192)?;
+            if pass_reply.starts_with("530") {
+                return Err(AppError::new(
+                    ReasonCode::RcIo,
+                    format!("FTP: login rejected by {addr}: {}", pass_reply.trim()),
+                ));
+            }
+        } else if user_reply.starts_with("530") {
+            return Err(AppError::new(
+                ReasonCode::RcIo,
+                format!("FTP: login rejected by {addr}: {}", user_reply.trim()),
+            ));
+        }
+
+        self.ftp_control.insert(conn_handle, stream);
+        Ok(())
+    }
+
+    /// Read a complete FTP reply (one or more `NNN-` continuation lines
+    /// terminated by a `NNN ` final line) from a stream, up to `max_len` bytes.
+    fn ftp_read_reply(stream: &mut TcpStream, max_len: usize) -> AppResult<String> {
+        let mut response = String::new();
+        let mut buf = [0u8; 4096];
+        let mut pending = String::new();
+        loop {
+            let n = stream.read(&mut buf).map_err(|e| {
+                AppError::new(ReasonCode::RcIo, format!("FTP control read failed: {e}"))
+            })?;
+            if n == 0 {
+                break;
+            }
+            pending.push_str(&String::from_utf8_lossy(&buf[..n]));
+            // Process complete lines from `pending`.
+            while let Some(newline) = pending.find('\n') {
+                let line = pending[..newline].trim_end_matches('\r').to_string();
+                pending = pending[newline + 1..].to_string();
+                if line.len() >= 4
+                    && line.as_bytes()[0].is_ascii_digit()
+                    && line.as_bytes()[1].is_ascii_digit()
+                    && line.as_bytes()[2].is_ascii_digit()
+                    && line.as_bytes()[3] == b' '
+                {
+                    // `NNN ` final line — reply complete.
+                    response.push_str(&line);
+                    response.push_str("\r\n");
+                    return Ok(response);
+                }
+                response.push_str(&line);
+                response.push_str("\r\n");
+                if response.len() > max_len {
+                    return Ok(response);
+                }
+            }
+            if response.len() > max_len {
+                break;
+            }
+        }
+        if response.is_empty() {
+            let mut single_buf = [0u8; 1024];
+            let n = stream.read(&mut single_buf).map_err(|e| {
+                AppError::new(ReasonCode::RcIo, format!("FTP control read failed: {e}"))
+            })?;
+            if n > 0 {
+                response = String::from_utf8_lossy(&single_buf[..n]).to_string();
+            }
+        }
+        Ok(response)
+    }
+
     /// Send a raw command to an FTP control connection and read the response.
     fn ftp_command(&mut self, conn_handle: HINTERNET, cmd: &str) -> AppResult<String> {
+        self.ensure_ftp_control(conn_handle)?;
         let stream = self.ftp_control.get_mut(&conn_handle).ok_or_else(|| {
             AppError::new(
                 ReasonCode::RcIo,
@@ -2147,76 +2566,48 @@ impl WinHttpStack {
             AppError::new(ReasonCode::RcIo, format!("FTP command '{cmd}' failed: {e}"))
         })?;
 
-        // Read the multi-line response
-        let mut response = String::new();
-        let mut buf = [0u8; 1];
-        let mut line = String::new();
-        let mut last_char_was_cr = false;
-        loop {
-            match stream.read(&mut buf) {
-                Ok(0) => break,
-                Ok(_) => {
-                    let c = buf[0] as char;
-                    if c == '\r' {
-                        last_char_was_cr = true;
-                    } else if c == '\n' && last_char_was_cr {
-                        if line.len() >= 4
-                            && line.as_bytes()[0].is_ascii_digit()
-                            && line.as_bytes()[1].is_ascii_digit()
-                            && line.as_bytes()[2].is_ascii_digit()
-                            && line.as_bytes()[3] == b' '
-                        {
-                            response.push_str(&line);
-                            response.push_str("\r\n");
-                            break;
-                        }
-                        response.push_str(&line);
-                        response.push_str("\r\n");
-                        line.clear();
-                        last_char_was_cr = false;
-                    } else {
-                        if last_char_was_cr {
-                            line.push('\r');
-                            last_char_was_cr = false;
-                        }
-                        line.push(c);
-                    }
-                }
-                Err(_) => break,
-            }
-            if response.len() > 16384 {
-                break;
-            }
-        }
+        Self::ftp_read_reply(stream, 16384)
+    }
 
-        if response.is_empty() {
-            let mut single_buf = [0u8; 1024];
-            if let Ok(n) = stream.read(&mut single_buf) {
-                if n > 0 {
-                    response = String::from_utf8_lossy(&single_buf[..n]).to_string();
-                }
-            }
+    /// Check an FTP command reply for an expected 1xx/2xx/3xx preliminary or
+    /// final success code.
+    fn ftp_expect_success(reply: &str, cmd: &str) -> AppResult<()> {
+        let status = reply
+            .lines()
+            .next()
+            .map(|l| l.trim())
+            .unwrap_or_default()
+            .chars()
+            .take(3)
+            .collect::<String>();
+        let ok = status.starts_with('1')
+            || status.starts_with('2')
+            || status.starts_with('3');
+        if !ok {
+            return Err(AppError::new(
+                ReasonCode::RcIo,
+                format!("FTP {cmd} failed: {}", reply.trim()),
+            ));
         }
-
-        Ok(response)
+        Ok(())
     }
 
     /// Parse a PASV response (227 Entering Passive Mode (h1,h2,h3,h4,p1,p2))
     fn ftp_parse_pasv(response: &str) -> Option<(String, u16)> {
-        if let Some(start) = response.find('(') {
-            if let Some(end) = response.find(')') {
-                let nums: Vec<&str> = response[start + 1..end].split(',').collect();
-                if nums.len() == 6 {
-                    let h1: u8 = nums[0].trim().parse().ok()?;
-                    let h2: u8 = nums[1].trim().parse().ok()?;
-                    let h3: u8 = nums[2].trim().parse().ok()?;
-                    let h4: u8 = nums[3].trim().parse().ok()?;
-                    let p1: u16 = nums[4].trim().parse().ok()?;
-                    let p2: u16 = nums[5].trim().parse().ok()?;
-                    let addr = format!("{h1}.{h2}.{h3}.{h4}");
-                    let port = p1 * 256 + p2;
-                    return Some((addr, port));
-                }
+        if let Some(start) = response.find('(')
+            && let Some(end) = response.find(')')
+        {
+            let nums: Vec<&str> = response[start + 1..end].split(',').collect();
+            if nums.len() == 6 {
+                let h1: u8 = nums[0].trim().parse().ok()?;
+                let h2: u8 = nums[1].trim().parse().ok()?;
+                let h3: u8 = nums[2].trim().parse().ok()?;
+                let h4: u8 = nums[3].trim().parse().ok()?;
+                let p1: u16 = nums[4].trim().parse().ok()?;
+                let p2: u16 = nums[5].trim().parse().ok()?;
+                let addr = format!("{h1}.{h2}.{h3}.{h4}");
+                let port = p1 * 256 + p2;
+                return Some((addr, port));
             }
         }
         None
@@ -2225,6 +2616,7 @@ impl WinHttpStack {
     /// Establish a PASV data connection to the FTP server.
     fn ftp_data_connect(&mut self, conn_handle: HINTERNET) -> AppResult<TcpStream> {
         let pasv_response = self.ftp_command(conn_handle, "PASV")?;
+        Self::ftp_expect_success(&pasv_response, "PASV")?;
         let (data_addr, data_port) = Self::ftp_parse_pasv(&pasv_response).ok_or_else(|| {
             AppError::new(
                 ReasonCode::RcIo,
@@ -2253,18 +2645,36 @@ impl WinHttpStack {
                 format!("FTP data connect to {data_addr}:{data_port} failed: {e}"),
             )
         })?;
+        // A stalled server must not hang the transfer indefinitely.
+        data_stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .ok();
+        data_stream
+            .set_write_timeout(Some(Duration::from_secs(30)))
+            .ok();
 
         Ok(data_stream)
     }
 
-    /// Read all data from a data connection until closed.
+    /// Read all data from a data connection until closed, with a size cap.
     fn ftp_read_data(stream: &mut TcpStream) -> AppResult<Vec<u8>> {
         let mut data = Vec::new();
         let mut buf = [0u8; 16384];
         loop {
             match stream.read(&mut buf) {
                 Ok(0) => break,
-                Ok(n) => data.extend_from_slice(&buf[..n]),
+                Ok(n) => {
+                    let new_len = data.len().saturating_add(n);
+                    if new_len > MAX_WINHTTP_RESPONSE_BODY {
+                        return Err(AppError::new(
+                            ReasonCode::RcBufferLimitExceeded,
+                            format!(
+                                "FTP data transfer exceeds limit ({MAX_WINHTTP_RESPONSE_BODY})"
+                            ),
+                        ));
+                    }
+                    data.extend_from_slice(&buf[..n]);
+                }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(e) => {
                     return Err(AppError::new(
@@ -2280,7 +2690,8 @@ impl WinHttpStack {
     /// Helper: set binary or ASCII transfer mode.
     fn ftp_set_transfer_mode(&mut self, conn_handle: HINTERNET, binary: bool) -> AppResult<()> {
         let cmd = if binary { "TYPE I" } else { "TYPE A" };
-        let _resp = self.ftp_command(conn_handle, cmd)?;
+        let resp = self.ftp_command(conn_handle, cmd)?;
+        Self::ftp_expect_success(&resp, cmd)?;
         self.ftp_binary_mode.insert(conn_handle, binary);
         Ok(())
     }
@@ -2296,6 +2707,7 @@ impl WinHttpStack {
         _access: u32,
         transfer_type: crate::wininet::FtpTransferType,
     ) -> AppResult<HINTERNET> {
+        Self::ftp_check_operand(file_name, "file name")?;
         // Set transfer mode
         let binary = matches!(transfer_type, crate::wininet::FtpTransferType::Binary);
         self.ftp_set_transfer_mode(connect_handle, binary)?;
@@ -2303,9 +2715,11 @@ impl WinHttpStack {
         // Establish PASV data connection
         let mut data_stream = self.ftp_data_connect(connect_handle)?;
 
-        // Send RETR command
+        // Send RETR command and validate the server accepted it (a 550
+        // closes the data connection immediately, so never proceed silently).
         let retr_cmd = format!("RETR {file_name}");
-        let _retr_response = self.ftp_command(connect_handle, &retr_cmd)?;
+        let retr_response = self.ftp_command(connect_handle, &retr_cmd)?;
+        Self::ftp_expect_success(&retr_response, &retr_cmd)?;
 
         // Read file data from the data connection and cache it
         let file_data = Self::ftp_read_data(&mut data_stream)?;
@@ -2315,7 +2729,7 @@ impl WinHttpStack {
 
         // Store the file data so subsequent InternetReadFile calls can
         // retrieve it from the ftp_file_data map using this handle.
-        self.ftp_file_data.insert(handle, file_data);
+        self.ftp_file_data.insert(handle, (file_data, 0));
 
         Ok(handle)
     }
@@ -2327,9 +2741,16 @@ impl WinHttpStack {
         connect_handle: HINTERNET,
         remote_file: &str,
         local_file: &str,
-        _fail_if_exists: bool,
+        fail_if_exists: bool,
         transfer_type: crate::wininet::FtpTransferType,
     ) -> AppResult<bool> {
+        Self::ftp_check_operand(remote_file, "remote file name")?;
+        if fail_if_exists && Path::new(local_file).exists() {
+            return Err(AppError::new(
+                ReasonCode::RcIo,
+                format!("FTP: local file {local_file} already exists"),
+            ));
+        }
         // Set transfer mode
         let binary = matches!(transfer_type, crate::wininet::FtpTransferType::Binary);
         self.ftp_set_transfer_mode(connect_handle, binary)?;
@@ -2342,9 +2763,10 @@ impl WinHttpStack {
             )
         })?;
 
-        // Send RETR command
+        // Send RETR command and validate the server accepted it.
         let retr_cmd = format!("RETR {remote_file}");
-        let _retr_response = self.ftp_command(connect_handle, &retr_cmd)?;
+        let retr_response = self.ftp_command(connect_handle, &retr_cmd)?;
+        Self::ftp_expect_success(&retr_response, &retr_cmd)?;
 
         // Read file data from the data connection
         let file_data = Self::ftp_read_data(&mut data_stream)?;
@@ -2368,6 +2790,7 @@ impl WinHttpStack {
         local_file: &str,
         transfer_type: crate::wininet::FtpTransferType,
     ) -> AppResult<bool> {
+        Self::ftp_check_operand(remote_file, "remote file name")?;
         // Read the local file
         let local_data = std::fs::read(local_file).map_err(|e| {
             AppError::new(
@@ -2388,9 +2811,10 @@ impl WinHttpStack {
             )
         })?;
 
-        // Send STOR command
+        // Send STOR command and validate the server accepted it.
         let stor_cmd = format!("STOR {remote_file}");
-        let _stor_response = self.ftp_command(connect_handle, &stor_cmd)?;
+        let stor_response = self.ftp_command(connect_handle, &stor_cmd)?;
+        Self::ftp_expect_success(&stor_response, &stor_cmd)?;
 
         // Write data to the data connection
         data_stream.write_all(&local_data).map_err(|e| {
@@ -2415,6 +2839,7 @@ impl WinHttpStack {
         connect_handle: HINTERNET,
         file_name: &str,
     ) -> AppResult<bool> {
+        Self::ftp_check_operand(file_name, "file name")?;
         let cmd = format!("DELE {file_name}");
         let response = self.ftp_command(connect_handle, &cmd)?;
         if !response.contains("250") && !response.contains("200") {
@@ -2433,6 +2858,8 @@ impl WinHttpStack {
         existing: &str,
         new_name: &str,
     ) -> AppResult<bool> {
+        Self::ftp_check_operand(existing, "existing file name")?;
+        Self::ftp_check_operand(new_name, "new file name")?;
         let rnfr_cmd = format!("RNFR {existing}");
         let rnfr_response = self.ftp_command(connect_handle, &rnfr_cmd)?;
         if !rnfr_response.contains("350") {
@@ -2458,6 +2885,7 @@ impl WinHttpStack {
         connect_handle: HINTERNET,
         directory: &str,
     ) -> AppResult<bool> {
+        Self::ftp_check_operand(directory, "directory")?;
         let cmd = format!("CWD {directory}");
         let response = self.ftp_command(connect_handle, &cmd)?;
         if response.contains("250") || response.contains("200") {
@@ -2482,12 +2910,12 @@ impl WinHttpStack {
         // Query via PWD
         let response = self.ftp_command(connect_handle, "PWD")?;
         // PWD response format: 257 "/remote/dir" is current directory
-        if let Some(start) = response.find('"') {
-            if let Some(end) = response[start + 1..].find('"') {
-                let dir = &response[start + 1..start + 1 + end];
-                self.ftp_current_dir.insert(connect_handle, dir.to_string());
-                return Ok(dir.to_string());
-            }
+        if let Some(start) = response.find('"')
+            && let Some(end) = response[start + 1..].find('"')
+        {
+            let dir = &response[start + 1..start + 1 + end];
+            self.ftp_current_dir.insert(connect_handle, dir.to_string());
+            return Ok(dir.to_string());
         }
         Ok("/".to_string())
     }
@@ -2498,6 +2926,7 @@ impl WinHttpStack {
         connect_handle: HINTERNET,
         directory: &str,
     ) -> AppResult<bool> {
+        Self::ftp_check_operand(directory, "directory")?;
         let cmd = format!("MKD {directory}");
         let response = self.ftp_command(connect_handle, &cmd)?;
         if !response.contains("257") {
@@ -2515,6 +2944,7 @@ impl WinHttpStack {
         connect_handle: HINTERNET,
         directory: &str,
     ) -> AppResult<bool> {
+        Self::ftp_check_operand(directory, "directory")?;
         let cmd = format!("RMD {directory}");
         let response = self.ftp_command(connect_handle, &cmd)?;
         if !response.contains("250") {
@@ -2532,6 +2962,7 @@ impl WinHttpStack {
         connect_handle: HINTERNET,
         pattern: &str,
     ) -> AppResult<HINTERNET> {
+        Self::ftp_check_operand(pattern, "pattern")?;
         // Establish PASV data connection
         let mut data_stream = self.ftp_data_connect(connect_handle)?;
 
@@ -2541,7 +2972,8 @@ impl WinHttpStack {
         } else {
             format!("NLST {pattern}")
         };
-        let _nlst_response = self.ftp_command(connect_handle, &nlst_cmd)?;
+        let nlst_response = self.ftp_command(connect_handle, &nlst_cmd)?;
+        Self::ftp_expect_success(&nlst_response, &nlst_cmd)?;
 
         // Read the listing from the data connection
         let listing_data = Self::ftp_read_data(&mut data_stream)?;
@@ -2776,15 +3208,15 @@ mod tests {
         let mut stack = WinHttpStack::new();
 
         // No pins configured for the host: any chain is accepted.
-        assert!(stack.verify_certificate_pin("steamcdn.example", &[cert.clone()]));
+        assert!(stack.verify_certificate_pin("steamcdn.example", std::slice::from_ref(&cert)));
 
         // Pin the correct SPKI hash: the matching chain is accepted.
         stack.pin_certificate("steamcdn.example", pin.as_slice());
-        assert!(stack.verify_certificate_pin("steamcdn.example", &[cert.clone()]));
+        assert!(stack.verify_certificate_pin("steamcdn.example", std::slice::from_ref(&cert)));
 
         // A different certificate (different SPKI) must be rejected.
         let other = synthetic_certificate(&build_spki(&[0x11, 0x22, 0x33, 0x44]));
-        assert!(!stack.verify_certificate_pin("steamcdn.example", &[other]));
+        assert!(!stack.verify_certificate_pin("steamcdn.example", std::slice::from_ref(&other)));
 
         // With an active pin but no certificate presented, reject.
         assert!(!stack.verify_certificate_pin("steamcdn.example", &[]));
@@ -3007,11 +3439,11 @@ mod tests {
 
         // Pin the correct SPKI hash.
         stack.pin_certificate("pinned.example.com", pin.as_slice());
-        assert!(stack.verify_certificate_pin("pinned.example.com", &[cert.clone()]));
+        assert!(stack.verify_certificate_pin("pinned.example.com", std::slice::from_ref(&cert)));
 
         // A different certificate must be rejected.
         let other = synthetic_certificate(&build_spki(&[0x11, 0x22, 0x33, 0x44]));
-        assert!(!stack.verify_certificate_pin("pinned.example.com", &[other]));
+        assert!(!stack.verify_certificate_pin("pinned.example.com", std::slice::from_ref(&other)));
     }
 
     #[test]
@@ -3043,6 +3475,7 @@ mod tests {
 // -----------------------------------------------------------------------
 
 /// NTLM constants
+pub const NTLM_NEGOTIATE_FLAG_UNICODE: u32 = 0x00000001;
 pub const NTLM_NEGOTIATE_FLAG_56: u32 = 0x80000000;
 pub const NTLM_NEGOTIATE_FLAG_KEY_EXCH: u32 = 0x40000000;
 pub const NTLM_NEGOTIATE_FLAG_128: u32 = 0x20000000;
@@ -3062,24 +3495,22 @@ pub fn ntlm_create_negotiate_msg(domain: &str, workstation: &str) -> Vec<u8> {
     let mut msg = b"NTLMSSP\x00".to_vec();
     // Message type 1 (negotiate)
     msg.extend_from_slice(&1u32.to_le_bytes());
-    // Flags: NTLM, negotiate 128, negotiate 56, request target
-    let flags = NTLM_NEGOTIATE_FLAG_NTLM
+    // Flags: UNICODE (strings below are UTF-16LE), NTLM, negotiate 128,
+    // negotiate 56, request target.
+    let flags = NTLM_NEGOTIATE_FLAG_UNICODE
+        | NTLM_NEGOTIATE_FLAG_NTLM
         | NTLM_NEGOTIATE_FLAG_NEG_128
         | NTLM_NEGOTIATE_FLAG_NEG_56
         | NTLM_NEGOTIATE_FLAG_REQUEST_NON_NT_SESSION_KEY
         | NTLM_NEGOTIATE_FLAG_TARGET_INFO;
     msg.extend_from_slice(&flags.to_le_bytes());
 
-    // Domain name fields (offset after header)
+    // Payload is appended in the order [domain][workstation], so the domain
+    // starts at offset 32 and the workstation directly after it.
     let domain_enc: Vec<u16> = domain.encode_utf16().collect();
     let domain_bytes: Vec<u8> = domain_enc.iter().flat_map(|&c| c.to_le_bytes()).collect();
     let domain_len = domain_bytes.len() as u16;
-    let domain_offset = 32u16
-        + if workstation.is_empty() {
-            0
-        } else {
-            (workstation.encode_utf16().count() * 2) as u16
-        };
+    let domain_offset = 32u16;
     msg.extend_from_slice(&domain_len.to_le_bytes());
     msg.extend_from_slice(&domain_len.to_le_bytes());
     msg.extend_from_slice(&domain_offset.to_le_bytes());
@@ -3088,7 +3519,7 @@ pub fn ntlm_create_negotiate_msg(domain: &str, workstation: &str) -> Vec<u8> {
     let ws_enc: Vec<u16> = workstation.encode_utf16().collect();
     let ws_bytes: Vec<u8> = ws_enc.iter().flat_map(|&c| c.to_le_bytes()).collect();
     let ws_len = ws_bytes.len() as u16;
-    let ws_offset = 32u16;
+    let ws_offset = 32u16 + domain_len;
     msg.extend_from_slice(&ws_len.to_le_bytes());
     msg.extend_from_slice(&ws_len.to_le_bytes());
     msg.extend_from_slice(&ws_offset.to_le_bytes());
@@ -3160,7 +3591,7 @@ fn md4(data: &[u8]) -> [u8; 16] {
         padded.push(0);
     }
     padded.extend_from_slice(&orig_len_bits.to_le_bytes());
-    debug_assert!(padded.len() % 64 == 0);
+    debug_assert!(padded.len().is_multiple_of(64));
     let mut state: [u32; 4] = [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476];
     let mut w = [0u32; 16];
     for chunk in padded.chunks(64) {
@@ -3282,15 +3713,17 @@ pub fn ntlm_create_authenticate_msg(
     let lm_response_len = lm_response.len() as u16;
     let ntlm_response_len = ntlmv2_response.len() as u16;
 
-    // Offsets (payload starts after fixed header)
-    let fixed_header_size = 64u16;
+    // Offsets: the fixed header is 64 bytes (signature + type + 5 security
+    // buffers + session key + flags) and the 8-byte OS Version block is
+    // appended before the payloads, so the payload area starts at 72.
+    let fixed_header_size = 72u16;
     let lm_offset = fixed_header_size;
     let ntlm_offset = lm_offset + lm_response_len;
     let domain_offset = ntlm_offset + ntlm_response_len;
-    let user_offset = domain_offset + (domain.encode_utf16().count() * 2) as u16;
     let user_enc: Vec<u16> = username.encode_utf16().collect();
     let user_bytes: Vec<u8> = user_enc.iter().flat_map(|&c| c.to_le_bytes()).collect();
     let user_len = user_bytes.len() as u16;
+    let user_offset = domain_offset + (domain.encode_utf16().count() * 2) as u16;
     let ws_offset = user_offset + user_len;
 
     let workstation = "";
@@ -3331,9 +3764,15 @@ pub fn ntlm_create_authenticate_msg(
     msg.extend_from_slice(&0u16.to_le_bytes());
     msg.extend_from_slice(&0u32.to_le_bytes());
 
-    // Flags
+    // Flags: UNICODE (all strings are UTF-16LE), NTLM, 128/56-bit, and
+    // VERSION — the OS version block below is present, so the flag must
+    // match the actual message layout.
     msg.extend_from_slice(
-        &(NTLM_NEGOTIATE_FLAG_NTLM | NTLM_NEGOTIATE_FLAG_NEG_128 | NTLM_NEGOTIATE_FLAG_NEG_56)
+        &(NTLM_NEGOTIATE_FLAG_UNICODE
+            | NTLM_NEGOTIATE_FLAG_NTLM
+            | NTLM_NEGOTIATE_FLAG_NEG_128
+            | NTLM_NEGOTIATE_FLAG_NEG_56
+            | NTLM_NEGOTIATE_FLAG_VERSION)
             .to_le_bytes(),
     );
 
@@ -3376,12 +3815,16 @@ fn compute_ntlmv2_response(ntlmv2_hash: &[u8], challenge: &[u8]) -> Vec<u8> {
     // Create the NTLMv2 blob
     let mut blob = Vec::new();
 
+    // Per MS-NLMP the blob starts with the RespType/hiRespType signature
+    // (0x01 0x01) plus reserved fields (2 + 4 bytes) before the timestamp.
+    blob.extend_from_slice(&[0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+
     // Timestamp (current time in tenths of microseconds since Jan 1, 1601)
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
     let filetime =
-        (now.as_secs() as u64 + 11644473600u64) * 10000000u64 + (now.subsec_nanos() as u64 / 100);
+        (now.as_secs() + 11644473600u64) * 10000000u64 + (now.subsec_nanos() as u64 / 100);
     blob.extend_from_slice(&filetime.to_le_bytes());
 
     // 8 bytes random nonce
@@ -3432,50 +3875,50 @@ pub enum ProxyDetectionMode {
 /// and DNS-based WPAD discovery.
 pub fn winhttp_detect_proxy_config() -> ProxyDetectionMode {
     // Check environment variables (standard Unix convention)
-    if let Ok(proxy) = std::env::var("https_proxy") {
-        if !proxy.is_empty() {
-            return ProxyDetectionMode::Explicit(proxy);
-        }
+    if let Ok(proxy) = std::env::var("https_proxy")
+        && !proxy.is_empty()
+    {
+        return ProxyDetectionMode::Explicit(proxy);
     }
-    if let Ok(proxy) = std::env::var("HTTPS_PROXY") {
-        if !proxy.is_empty() {
-            return ProxyDetectionMode::Explicit(proxy);
-        }
+    if let Ok(proxy) = std::env::var("HTTPS_PROXY")
+        && !proxy.is_empty()
+    {
+        return ProxyDetectionMode::Explicit(proxy);
     }
-    if let Ok(proxy) = std::env::var("http_proxy") {
-        if !proxy.is_empty() {
-            return ProxyDetectionMode::Explicit(proxy);
-        }
+    if let Ok(proxy) = std::env::var("http_proxy")
+        && !proxy.is_empty()
+    {
+        return ProxyDetectionMode::Explicit(proxy);
     }
-    if let Ok(proxy) = std::env::var("HTTP_PROXY") {
-        if !proxy.is_empty() {
-            return ProxyDetectionMode::Explicit(proxy);
-        }
+    if let Ok(proxy) = std::env::var("HTTP_PROXY")
+        && !proxy.is_empty()
+    {
+        return ProxyDetectionMode::Explicit(proxy);
     }
-    if let Ok(proxy) = std::env::var("all_proxy") {
-        if !proxy.is_empty() {
-            return ProxyDetectionMode::Explicit(proxy);
-        }
+    if let Ok(proxy) = std::env::var("all_proxy")
+        && !proxy.is_empty()
+    {
+        return ProxyDetectionMode::Explicit(proxy);
     }
-    if let Ok(proxy) = std::env::var("ALL_PROXY") {
-        if !proxy.is_empty() {
-            return ProxyDetectionMode::Explicit(proxy);
-        }
+    if let Ok(proxy) = std::env::var("ALL_PROXY")
+        && !proxy.is_empty()
+    {
+        return ProxyDetectionMode::Explicit(proxy);
     }
     // Check for WPAD via DNS on macOS (wpad.<domain> lookup)
-    if let Ok(hostname) = std::env::var("HOSTNAME").or_else(|_| std::env::var("HOST")) {
-        if !hostname.is_empty() {
-            let domain: Vec<&str> = hostname.split('.').collect();
-            if domain.len() >= 2 {
-                let wpad_host = format!("wpad.{}", domain[1..].join("."));
-                let wpad_addr = format!("{wpad_host}:80");
-                if let Ok(addrs) = wpad_addr.to_socket_addrs() {
-                    if addrs.len() > 0 {
-                        // WPAD host resolved — we have a PAC URL
-                        let pac_url = format!("http://{wpad_host}/wpad.dat");
-                        return ProxyDetectionMode::Explicit(pac_url);
-                    }
-                }
+    if let Ok(hostname) = std::env::var("HOSTNAME").or_else(|_| std::env::var("HOST"))
+        && !hostname.is_empty()
+    {
+        let domain: Vec<&str> = hostname.split('.').collect();
+        if domain.len() >= 2 {
+            let wpad_host = format!("wpad.{}", domain[1..].join("."));
+            let wpad_addr = format!("{wpad_host}:80");
+            if let Ok(addrs) = wpad_addr.to_socket_addrs()
+                && addrs.len() > 0
+            {
+                // WPAD host resolved — we have a PAC URL
+                let pac_url = format!("http://{wpad_host}/wpad.dat");
+                return ProxyDetectionMode::Explicit(pac_url);
             }
         }
     }
@@ -3494,8 +3937,8 @@ fn evaluate_pac_script(pac_script: &str, url: &str, host: &str) -> String {
 
     // Common PAC patterns to evaluate
     let lines: Vec<&str> = pac_script.lines().collect();
-    for line in &lines {
-        let line = line.trim();
+    for (idx, raw_line) in lines.iter().enumerate() {
+        let line = raw_line.trim();
 
         // Skip comments and empty lines
         if line.starts_with("//") || line.starts_with('#') || line.is_empty() {
@@ -3523,13 +3966,11 @@ fn evaluate_pac_script(pac_script: &str, url: &str, host: &str) -> String {
                         .replace(".", "\\.")
                         .replace("*", ".*")
                         .replace("?", ".");
-                    if let Ok(re) = regex::Regex::new(&format!("^{}$", regex_str)) {
-                        if re.is_match(test_val) {
-                            // The shExpMatch matched, now find the return value
-                            if let Some(ret) = find_return_in_block(&lines, line) {
-                                return ret;
-                            }
-                        }
+                    if let Ok(re) = regex::Regex::new(&format!("^{}$", regex_str))
+                        && re.is_match(test_val)
+                        && let Some(ret) = find_return_in_block(&lines, idx)
+                    {
+                        return ret;
                     }
                 }
             }
@@ -3543,11 +3984,10 @@ fn evaluate_pac_script(pac_script: &str, url: &str, host: &str) -> String {
                 let parts: Vec<&str> = args.split(',').collect();
                 if parts.len() == 2 {
                     let domain = parts[1].trim().trim_matches('"');
-                    if host_lower.ends_with(domain) || host_lower == domain.trim_start_matches('.')
+                    if (host_lower.ends_with(domain) || host_lower == domain.trim_start_matches('.'))
+                        && let Some(ret) = find_return_in_block(&lines, idx)
                     {
-                        if let Some(ret) = find_return_in_block(&lines, line) {
-                            return ret;
-                        }
+                        return ret;
                     }
                 }
             }
@@ -3560,23 +4000,20 @@ fn evaluate_pac_script(pac_script: &str, url: &str, host: &str) -> String {
             } else {
                 !url_lower.contains('.')
             };
-            if has_no_dot {
-                if let Some(ret) = find_return_in_block(&lines, line) {
-                    return ret;
-                }
+            if has_no_dot
+                && let Some(ret) = find_return_in_block(&lines, idx)
+            {
+                return ret;
             }
         }
 
         // Check for simple return statement
-        if line.starts_with("return ") {
-            let ret_val = line[7..]
-                .trim()
-                .trim_end_matches(';')
-                .trim()
-                .trim_matches('"');
-            if !ret_val.is_empty() {
-                return ret_val.to_string();
-            }
+        if let Some(ret_val) = line
+            .strip_prefix("return ")
+            .map(|v| v.trim().trim_end_matches(';').trim().trim_matches('"'))
+            && !ret_val.is_empty()
+        {
+            return ret_val.to_string();
         }
 
         // dnsResolve helper — check if host resolves to a specific IP
@@ -3584,19 +4021,15 @@ fn evaluate_pac_script(pac_script: &str, url: &str, host: &str) -> String {
             let remainder = &line[cap + 11..];
             if let Some(rparen) = remainder.find(')') {
                 let arg = remainder[..rparen].trim().trim_matches('"');
-                if arg == "host" {
-                    if let Ok(mut addrs) = host.to_socket_addrs() {
-                        if let Some(_addr) = addrs.next() {
-                            // dnsResolve succeeded, check the condition
-                            if line.contains("!=")
-                                || line.contains("==")
-                                || line.contains("isInNet")
-                            {
-                                if let Some(ret) = find_return_in_block(&lines, line) {
-                                    return ret;
-                                }
-                            }
-                        }
+                if arg == "host"
+                    && let Ok(mut addrs) = host.to_socket_addrs()
+                    && let Some(_addr) = addrs.next()
+                {
+                    // dnsResolve succeeded, check the condition
+                    if (line.contains("!=") || line.contains("==") || line.contains("isInNet"))
+                        && let Some(ret) = find_return_in_block(&lines, idx)
+                    {
+                        return ret;
                     }
                 }
             }
@@ -3607,23 +4040,24 @@ fn evaluate_pac_script(pac_script: &str, url: &str, host: &str) -> String {
     "DIRECT".to_string()
 }
 
-/// Helper: find the nearest enclosing return statement for a matched condition.
-fn find_return_in_block(lines: &[&str], current_line: &str) -> Option<String> {
-    let current_idx = lines.iter().position(|l| *l == current_line)?;
+/// Helper: find the nearest enclosing return statement for a matched
+/// condition at line index `current_idx`. Stops at the first closing brace,
+/// so a value from a later `if` block can never be attributed to this one.
+fn find_return_in_block(lines: &[&str], current_idx: usize) -> Option<String> {
     // Look forward for a return statement (within a few lines)
     let search_end = (current_idx + 20).min(lines.len());
-    for i in current_idx..search_end {
-        let l = lines[i].trim();
-        if l.starts_with("return ") {
-            let ret_val = l[7..].trim().trim_end_matches(';').trim().trim_matches('"');
-            if !ret_val.is_empty() {
-                return Some(ret_val.to_string());
-            }
+    for line in &lines[current_idx..search_end] {
+        let l = line.trim();
+        if let Some(ret_val) = l
+            .strip_prefix("return ")
+            .map(|v| v.trim().trim_end_matches(';').trim().trim_matches('"'))
+            && !ret_val.is_empty()
+        {
+            return Some(ret_val.to_string());
         }
-        // Also check for closing brace at top level (end of if block)
-        if l == "}" || l == "}" {
-            // Check if there's another return after this
-            continue;
+        if l == "}" {
+            // End of the enclosing block — do not keep scanning.
+            return None;
         }
     }
     None
@@ -3633,47 +4067,89 @@ fn find_return_in_block(lines: &[&str], current_line: &str) -> Option<String> {
 /// Tries DNS lookup for wpad.<domain> and checks for WPAD via DHCP.
 fn wpad_discovery(url: &str) -> Option<String> {
     // Parse the URL to get the hostname
-    if let Ok(parsed) = url::Url::parse(url) {
-        if let Some(host) = parsed.host_str() {
-            // Extract domain from hostname
-            let parts: Vec<&str> = host.split('.').collect();
-            if parts.len() >= 2 {
-                // Try wpad.<parent-domain>
-                for i in 1..parts.len() {
-                    let domain = parts[i..].join(".");
-                    let wpad_host = format!("wpad.{}", domain);
-                    let wpad_url = format!("http://{}/wpad.dat", wpad_host);
-                    // Try DNS resolution
-                    if let Ok(addrs) = (wpad_host + ":80").to_socket_addrs() {
-                        if addrs.len() > 0 {
-                            // Found a WPAD host via DNS
-                            return Some(wpad_url);
-                        }
-                    }
+    if let Ok(parsed) = url::Url::parse(url)
+        && let Some(host) = parsed.host_str()
+    {
+        // Extract domain from hostname
+        let parts: Vec<&str> = host.split('.').collect();
+        if parts.len() >= 2 {
+            // Try wpad.<parent-domain>
+            for i in 1..parts.len() {
+                let domain = parts[i..].join(".");
+                let wpad_host = format!("wpad.{}", domain);
+                let wpad_url = format!("http://{}/wpad.dat", wpad_host);
+                // Try DNS resolution
+                if let Ok(addrs) = (wpad_host + ":80").to_socket_addrs()
+                    && addrs.len() > 0
+                {
+                    // Found a WPAD host via DNS
+                    return Some(wpad_url);
                 }
             }
         }
     }
 
     // Fallback: check environment variable for WPAD URL
-    if let Ok(wpad_url) = std::env::var("WPAD_URL").or_else(|_| std::env::var("AUTO_PROXY_URL")) {
-        if !wpad_url.is_empty() {
-            return Some(wpad_url);
-        }
+    if let Ok(wpad_url) = std::env::var("WPAD_URL").or_else(|_| std::env::var("AUTO_PROXY_URL"))
+        && !wpad_url.is_empty()
+    {
+        return Some(wpad_url);
     }
 
     None
 }
 
-/// Fetch a PAC script from the given URL.
+/// Fetch a PAC script from the given URL with an explicit timeout and a size
+/// cap so a misbehaving PAC server cannot block or exhaust the emulator.
 fn fetch_pac_script(pac_url: &str) -> Option<String> {
-    // Try to fetch the PAC file via HTTP GET
-    if let Ok(response) = reqwest::blocking::get(pac_url) {
-        if let Ok(text) = response.text() {
-            if !text.is_empty() {
-                return Some(text);
-            }
-        }
+    const MAX_PAC_SIZE: usize = 1024 * 1024;
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .ok()?;
+    let response = client.get(pac_url).send().ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let mut text = String::new();
+    let mut limited = response.take(MAX_PAC_SIZE as u64 + 1);
+    let n = std::io::Read::read_to_string(&mut limited, &mut text).ok()?;
+    if n > MAX_PAC_SIZE || text.is_empty() {
+        return None;
+    }
+    Some(text)
+}
+
+/// Convert a PAC `FindProxyForURL` result into a usable proxy URL.
+/// Handles "DIRECT", "PROXY host:port", "HTTPS host:port", "SOCKS host:port"
+/// and already-schemed results (e.g. `socks5://...` from env vars) without
+/// mangling them into `http://socks5://...`.
+fn pac_result_to_proxy(result: &str) -> Option<String> {
+    let result = result.trim();
+    if result.is_empty() || result.eq_ignore_ascii_case("DIRECT") {
+        return None;
+    }
+    if let Some(proxy_str) = result.strip_prefix("PROXY ") {
+        return Some(format!("http://{}", proxy_str.trim()));
+    }
+    if let Some(proxy_str) = result.strip_prefix("HTTPS ") {
+        return Some(format!("https://{}", proxy_str.trim()));
+    }
+    if let Some(proxy_str) = result.strip_prefix("SOCKS ") {
+        return Some(format!("socks5://{}", proxy_str.trim()));
+    }
+    let lower = result.to_lowercase();
+    if lower.starts_with("http://")
+        || lower.starts_with("https://")
+        || lower.starts_with("socks://")
+        || lower.starts_with("socks4://")
+        || lower.starts_with("socks5://")
+    {
+        return Some(result.to_string());
+    }
+    // Bare "host:port" — prefix with http://.
+    if result.contains(':') && !result.contains(' ') {
+        return Some(format!("http://{}", result));
     }
     None
 }
@@ -3692,39 +4168,29 @@ pub fn winhttp_get_proxy_for_url(url: &str, config: &ProxyDetectionMode) -> Opti
                         .and_then(|u| u.host_str().map(|h| h.to_string()))
                         .unwrap_or_default();
                     let result = evaluate_pac_script(&pac_script, url, &host);
-                    // Parse the result: "PROXY host:port" or "DIRECT"
-                    if result == "DIRECT" {
-                        return None;
-                    }
-                    if let Some(proxy_str) = result.strip_prefix("PROXY ") {
-                        return Some(format!("http://{}", proxy_str));
-                    }
-                    if let Some(proxy_str) = result.strip_prefix("HTTPS ") {
-                        return Some(format!("https://{}", proxy_str));
-                    }
-                    if let Some(proxy_str) = result.strip_prefix("SOCKS ") {
-                        return Some(format!("socks5://{}", proxy_str));
-                    }
-                    // If result contains a proxy, return it
-                    if result.contains(':') && !result.contains(' ') {
-                        return Some(format!("http://{}", result));
-                    }
+                    return pac_result_to_proxy(&result);
                 }
                 // PAC evaluation failed, fall back to direct
                 return None;
             }
 
-            // Check no_proxy exclusion list
-            if let Ok(no_proxy) = std::env::var("no_proxy").or_else(|_| std::env::var("NO_PROXY")) {
+            // Check no_proxy exclusion list (host-suffix matching)
+            if let Ok(no_proxy) = std::env::var("no_proxy").or_else(|_| std::env::var("NO_PROXY"))
+                && let Some(host) = url::Url::parse(url)
+                    .ok()
+                    .and_then(|u| u.host_str().map(|h| h.to_lowercase()))
+            {
                 for exclusion in no_proxy.split(',') {
-                    let exclusion = exclusion.trim();
-                    if url.contains(exclusion) {
+                    let entry = exclusion
+                        .trim()
+                        .trim_start_matches('*')
+                        .trim_start_matches('.')
+                        .trim_end_matches('.')
+                        .to_lowercase();
+                    if !entry.is_empty()
+                        && (host == entry || host.ends_with(&format!(".{entry}")))
+                    {
                         return None;
-                    }
-                    if let Some(domain) = exclusion.strip_prefix('.') {
-                        if url.contains(domain) {
-                            return None;
-                        }
                     }
                 }
             }
@@ -3732,22 +4198,16 @@ pub fn winhttp_get_proxy_for_url(url: &str, config: &ProxyDetectionMode) -> Opti
         }
         ProxyDetectionMode::AutoDetect => {
             // WPAD: auto-detect the PAC URL via DNS, then evaluate
-            if let Some(pac_url) = wpad_discovery(url) {
-                if let Some(pac_script) = fetch_pac_script(&pac_url) {
-                    let host = url::Url::parse(url)
-                        .ok()
-                        .and_then(|u| u.host_str().map(|h| h.to_string()))
-                        .unwrap_or_default();
-                    let result = evaluate_pac_script(&pac_script, url, &host);
-                    if result == "DIRECT" {
-                        return None;
-                    }
-                    if let Some(proxy_str) = result.strip_prefix("PROXY ") {
-                        return Some(format!("http://{}", proxy_str));
-                    }
-                    if let Some(proxy_str) = result.strip_prefix("HTTPS ") {
-                        return Some(format!("https://{}", proxy_str));
-                    }
+            if let Some(pac_url) = wpad_discovery(url)
+                && let Some(pac_script) = fetch_pac_script(&pac_url)
+            {
+                let host = url::Url::parse(url)
+                    .ok()
+                    .and_then(|u| u.host_str().map(|h| h.to_string()))
+                    .unwrap_or_default();
+                let result = evaluate_pac_script(&pac_script, url, &host);
+                if let Some(proxy) = pac_result_to_proxy(&result) {
+                    return Some(proxy);
                 }
             }
             // Fallback: check environment variables
@@ -3761,10 +4221,17 @@ pub fn winhttp_get_proxy_for_url(url: &str, config: &ProxyDetectionMode) -> Opti
 }
 
 /// Set the proxy configuration on a WinHttpStack session.
+/// Logs are redacted: proxy URLs frequently embed `user:password@`, which
+/// must never reach stderr.
 pub fn winhttp_set_proxy_config(hSession: u64, config: &ProxyDetectionMode) -> bool {
+    let redacted = match config {
+        ProxyDetectionMode::Direct => "direct".to_string(),
+        ProxyDetectionMode::Explicit(p) => WinHttpStack::redact_proxy_url(p),
+        ProxyDetectionMode::AutoDetect => "auto-detect".to_string(),
+    };
     eprintln!(
-        "winhttp_set_proxy_config: session={:#x}, config={:?}",
-        hSession, config
+        "winhttp_set_proxy_config: session={:#x}, config={redacted}",
+        hSession
     );
     let (proxy_str, bypass_str) = match config {
         ProxyDetectionMode::Direct => (None, None),
@@ -3787,10 +4254,11 @@ pub fn winhttp_set_proxy_config(hSession: u64, config: &ProxyDetectionMode) -> b
         }
     };
 
-    if let Some(ref p) = proxy_str {
+    if let Some(p) = proxy_str.as_deref() {
         eprintln!(
             "winhttp_set_proxy_config: proxy={} for session {:#x}",
-            p, hSession
+            WinHttpStack::redact_proxy_url(p),
+            hSession
         );
     } else {
         eprintln!(
@@ -3798,10 +4266,10 @@ pub fn winhttp_set_proxy_config(hSession: u64, config: &ProxyDetectionMode) -> b
             hSession
         );
     }
-    if let Some(ref bypass) = bypass_str {
+    if let Some(bypass) = bypass_str.as_deref() {
         eprintln!(
-            "winhttp_set_proxy_config: bypass={} for session {:#x}",
-            bypass, hSession
+            "winhttp_set_proxy_config: bypass={bypass} for session {:#x}",
+            hSession
         );
     }
     true
@@ -4040,9 +4508,287 @@ fn find_extension_by_oid(cert_der: &[u8], target_oid: &[u8]) -> Option<Vec<u8>> 
     None
 }
 
+/// Minimal DER builder: encode a TLV with tag `tag` and content.
+fn der_tlv(tag: u8, content: &[u8]) -> Vec<u8> {
+    let mut out = vec![tag];
+    let len = content.len();
+    if len < 0x80 {
+        out.push(len as u8);
+    } else {
+        let mut len_bytes = Vec::new();
+        let mut remaining = len;
+        while remaining > 0 {
+            len_bytes.push((remaining & 0xff) as u8);
+            remaining >>= 8;
+        }
+        len_bytes.reverse();
+        out.push(0x80 | len_bytes.len() as u8);
+        out.extend_from_slice(&len_bytes);
+    }
+    out.extend_from_slice(content);
+    out
+}
+
+/// Extract the raw DER-encoded Name TLV (issuer if `want_issuer`, else
+/// subject) from a certificate.
+fn extract_name_tlv(cert_der: &[u8], want_issuer: bool) -> Option<Vec<u8>> {
+    let mut off = 0;
+    if cert_der.get(off) != Some(&0x30) {
+        return None;
+    }
+    off += 1;
+    let cert_len = der_read_length(cert_der, &mut off)?;
+    let cert_end = off + cert_len;
+    if cert_end > cert_der.len() {
+        return None;
+    }
+    // TBSCertificate SEQUENCE
+    if cert_der.get(off) != Some(&0x30) {
+        return None;
+    }
+    let mut tbs_off = off + 1;
+    let tbs_len = der_read_length(cert_der, &mut tbs_off)?;
+    let tbs_end = tbs_off + tbs_len;
+    if tbs_end > cert_end {
+        return None;
+    }
+    // Skip version [0] EXPLICIT if present
+    if cert_der.get(tbs_off) == Some(&0xa0) {
+        let mut ver_off = tbs_off + 1;
+        let ver_len = der_read_length(cert_der, &mut ver_off)?;
+        tbs_off = ver_off + ver_len;
+    }
+    // serialNumber INTEGER
+    let mut sn_off = tbs_off + 1;
+    let sn_len = der_read_length(cert_der, &mut sn_off)?;
+    tbs_off = sn_off + sn_len;
+    // signature AlgorithmIdentifier SEQUENCE
+    let mut sig_off = tbs_off + 1;
+    let sig_len = der_read_length(cert_der, &mut sig_off)?;
+    tbs_off = sig_off + sig_len;
+    // issuer or subject Name SEQUENCE — capture the full TLV
+    if cert_der.get(tbs_off) != Some(&0x30) {
+        return None;
+    }
+    let name_start = tbs_off;
+    let mut name_off = tbs_off + 1;
+    let name_len = der_read_length(cert_der, &mut name_off)?;
+    let name_end = name_off + name_len;
+    if name_end > tbs_end {
+        return None;
+    }
+    if !want_issuer {
+        // Skip subject Name as well and return it
+        let subj_start = name_end;
+        if cert_der.get(subj_start) != Some(&0x30) {
+            return None;
+        }
+        let mut subj_off = subj_start + 1;
+        let subj_len = der_read_length(cert_der, &mut subj_off)?;
+        let subj_end = subj_off + subj_len;
+        if subj_end > tbs_end {
+            return None;
+        }
+        return Some(cert_der[subj_start..subj_end].to_vec());
+    }
+    Some(cert_der[name_start..name_end].to_vec())
+}
+
+/// Extract the subjectPublicKey BIT STRING content (without the leading
+/// unused-bits byte) from a certificate.
+fn extract_spki_bitstring(cert_der: &[u8]) -> Option<Vec<u8>> {
+    // Reuse the SPKI walker, then read the inner BIT STRING.
+    let spki = extract_spki_der(cert_der)?;
+    // SPKI ::= SEQUENCE { algorithm AlgorithmIdentifier, subjectPublicKey BIT STRING }
+    let mut off = 0;
+    if spki.get(off) != Some(&0x30) {
+        return None;
+    }
+    off += 1;
+    let spki_len = der_read_length(&spki, &mut off)?;
+    let spki_end = off + spki_len;
+    if spki_end > spki.len() {
+        return None;
+    }
+    // AlgorithmIdentifier SEQUENCE
+    let mut alg_off = off + 1;
+    let alg_len = der_read_length(&spki, &mut alg_off)?;
+    let key_off = alg_off + alg_len;
+    if spki.get(key_off) != Some(&0x03) {
+        return None;
+    }
+    let mut bs_off = key_off + 1;
+    let bs_len = der_read_length(&spki, &mut bs_off)?;
+    let bs_end = bs_off + bs_len;
+    if bs_end > spki_end || bs_len == 0 {
+        return None;
+    }
+    // Skip the unused-bits count byte
+    Some(spki[bs_off + 1..bs_end].to_vec())
+}
+
+/// Build the OCSP CertID (SHA-1 hash algorithm) for `cert_der` using the
+/// issuer certificate, per RFC 6960 section 4.1.1.
+fn build_ocsp_cert_id(cert_der: &[u8], issuer_der: &[u8]) -> Option<Vec<u8>> {
+    let issuer_name = extract_name_tlv(issuer_der, true)?;
+    let issuer_key = extract_spki_bitstring(issuer_der)?;
+    let serial = extract_serial_number(cert_der);
+    if serial.is_empty() {
+        return None;
+    }
+    let name_hash = sha1::Sha1::digest(&issuer_name);
+    let key_hash = sha1::Sha1::digest(&issuer_key);
+    let mut cert_id = Vec::new();
+    // hashAlgorithm: SHA-1 OID 1.3.14.3.2.26
+    cert_id.extend_from_slice(&[0x30, 0x05, 0x06, 0x03, 0x2b, 0x0e, 0x03, 0x02, 0x1a]);
+    cert_id.extend_from_slice(&der_tlv(0x04, &name_hash));
+    cert_id.extend_from_slice(&der_tlv(0x04, &key_hash));
+    cert_id.extend_from_slice(&der_tlv(0x02, &serial));
+    Some(der_tlv(0x30, &cert_id))
+}
+
+/// Build a minimal but valid OCSPRequest DER for the given certificate.
+fn build_ocsp_request(cert_der: &[u8], issuer_der: &[u8]) -> Option<Vec<u8>> {
+    let cert_id = build_ocsp_cert_id(cert_der, issuer_der)?;
+    let request = der_tlv(0x30, &cert_id);
+    let request_list = der_tlv(0x30, &request);
+    let tbs_request = der_tlv(0x30, &request_list);
+    Some(der_tlv(0x30, &tbs_request))
+}
+
+/// Parse an OCSP response. Only a `successful(0)` responseStatus is treated
+/// as conclusive; the certStatus inside responseBytes is then examined
+/// (revoked = tag 0xa1, good = tag 0x80, unknown = tag 0x82). Any parse
+/// failure is inconclusive, never a revocation.
+fn parse_ocsp_response(resp_bytes: &[u8]) -> Result<bool, String> {
+    let off = 0;
+    // OCSPResponse ::= SEQUENCE { responseStatus, responseBytes [0] OPTIONAL }
+    if resp_bytes.first() != Some(&0x30) {
+        return Ok(false);
+    }
+    let mut tlv_off = off + 1;
+    let resp_len = der_read_length(resp_bytes, &mut tlv_off).unwrap_or(0);
+    let resp_end = tlv_off.saturating_add(resp_len);
+    if resp_end > resp_bytes.len() || resp_bytes.get(tlv_off) != Some(&0x0a) {
+        return Ok(false);
+    }
+    let mut enum_off = tlv_off + 1;
+    let enum_len = der_read_length(resp_bytes, &mut enum_off).unwrap_or(0);
+    if enum_len != 1 || enum_off >= resp_end {
+        return Ok(false);
+    }
+    if resp_bytes[enum_off] != 0 {
+        // Not successful — malformedRequest(1) etc. is not conclusive.
+        return Ok(false);
+    }
+    // responseBytes [0] EXPLICIT
+    let rb_tag_off = enum_off + 1;
+    if resp_bytes.get(rb_tag_off) != Some(&0xa0) {
+        return Ok(false);
+    }
+    let mut rb_inner = rb_tag_off + 1;
+    let rb_len = der_read_length(resp_bytes, &mut rb_inner).unwrap_or(0);
+    let rb_end = rb_inner.saturating_add(rb_len);
+    if rb_end > resp_end || resp_bytes.get(rb_inner) != Some(&0x30) {
+        return Ok(false);
+    }
+    let mut seq_off = rb_inner + 1;
+    let seq_len = der_read_length(resp_bytes, &mut seq_off).unwrap_or(0);
+    let seq_end = seq_off.saturating_add(seq_len);
+    if seq_end > rb_end || resp_bytes.get(seq_off) != Some(&0x06) {
+        return Ok(false);
+    }
+    // OID then OCTET STRING (BasicOCSPResponse)
+    let mut oid_off = seq_off + 1;
+    let oid_len = der_read_length(resp_bytes, &mut oid_off).unwrap_or(0);
+    let oid_end = oid_off.saturating_add(oid_len);
+    if oid_end > seq_end || resp_bytes.get(oid_end) != Some(&0x04) {
+        return Ok(false);
+    }
+    let mut oct_off = oid_end + 1;
+    let oct_len = der_read_length(resp_bytes, &mut oct_off).unwrap_or(0);
+    let oct_end = oct_off.saturating_add(oct_len);
+    if oct_end > seq_end {
+        return Ok(false);
+    }
+    let basic = &resp_bytes[oct_off..oct_end];
+
+    // BasicOCSPResponse ::= SEQUENCE { tbsResponseData SEQUENCE, ... }
+    if basic.first() != Some(&0x30) {
+        return Ok(false);
+    }
+    let mut b_off = 1;
+    let b_len = der_read_length(basic, &mut b_off).unwrap_or(0);
+    let b_end = b_off.saturating_add(b_len);
+    if b_end > basic.len() || basic.get(b_off) != Some(&0x30) {
+        return Ok(false);
+    }
+    let mut td_off = b_off + 1;
+    let td_len = der_read_length(basic, &mut td_off).unwrap_or(0);
+    let td_end = td_off.saturating_add(td_len);
+    if td_end > b_end {
+        return Ok(false);
+    }
+    // ResponseData: skip version [0] EXPLICIT if present
+    if basic.get(td_off) == Some(&0xa0) {
+        let mut v_off = td_off + 1;
+        let v_len = der_read_length(basic, &mut v_off).unwrap_or(0);
+        td_off = v_off.saturating_add(v_len);
+    }
+    // Skip responderID and producedAt
+    for _ in 0..2 {
+        let mut s_off = td_off + 1;
+        let s_len = der_read_length(basic, &mut s_off).unwrap_or(0);
+        td_off = s_off.saturating_add(s_len);
+        if td_off > td_end {
+            return Ok(false);
+        }
+    }
+    // responses SEQUENCE OF SingleResponse
+    if basic.get(td_off) != Some(&0x30) {
+        return Ok(false);
+    }
+    let mut r_off = td_off + 1;
+    let r_len = der_read_length(basic, &mut r_off).unwrap_or(0);
+    let r_end = r_off.saturating_add(r_len);
+    if r_end > td_end || basic.get(r_off) != Some(&0x30) {
+        return Ok(false);
+    }
+    // First SingleResponse ::= SEQUENCE { certID CertID, certStatus CertStatus, ... }
+    let mut sr_off = r_off + 1;
+    let sr_len = der_read_length(basic, &mut sr_off).unwrap_or(0);
+    let sr_end = sr_off.saturating_add(sr_len);
+    if sr_end > r_end {
+        return Ok(false);
+    }
+    // Skip certID (SEQUENCE)
+    if basic.get(sr_off) != Some(&0x30) {
+        return Ok(false);
+    }
+    let mut cid_off = sr_off + 1;
+    let cid_len = der_read_length(basic, &mut cid_off).unwrap_or(0);
+    sr_off = cid_off.saturating_add(cid_len);
+    if sr_off >= sr_end {
+        return Ok(false);
+    }
+    // certStatus CHOICE: good [0] 0x80, revoked [1] 0xa1, unknown [2] 0x82
+    match basic[sr_off] {
+        0x80 | 0x82 => Ok(false),
+        0xa1 => Err("OCSP: certificate has been revoked".to_string()),
+        _ => Ok(false),
+    }
+}
+
 /// Check certificate revocation using OCSP (Online Certificate Status Protocol).
 /// Returns Ok(()) if the certificate is valid, Err if revoked or check failed.
-fn check_ocsp_revocation(cert_der: &[u8], _issuer_der: Option<&[u8]>) -> Result<(), String> {
+fn check_ocsp_revocation(cert_der: &[u8], issuer_der: Option<&[u8]>) -> Result<(), String> {
+    // A proper OCSP request needs the issuer certificate to build the CertID.
+    // Without it the check cannot be performed meaningfully, so skip it.
+    let issuer_der = match issuer_der {
+        Some(i) => i,
+        None => return Ok(()),
+    };
+
     // AIA extension OID: 1.3.6.1.5.5.7.1.1
     let aia_oid: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x01, 0x01];
 
@@ -4067,100 +4813,89 @@ fn check_ocsp_revocation(cert_der: &[u8], _issuer_der: Option<&[u8]>) -> Result<
                     break;
                 }
                 let mut ad_off = aia_off + 1;
-                if let Some(ad_len) = der_read_length(&aia_value, &mut ad_off) {
-                    let ad_end = ad_off + ad_len;
-                    // Read accessMethod OID
-                    if ad_off < ad_end && aia_value[ad_off] == 0x06 {
-                        let mut method_off = ad_off + 1;
-                        if let Some(method_len) = der_read_length(&aia_value, &mut method_off) {
-                            let method_end = method_off + method_len;
-                            if method_end <= ad_end
-                                && &aia_value[method_off..method_end] == ocsp_oid
+                let Some(ad_len) = der_read_length(&aia_value, &mut ad_off) else {
+                    break;
+                };
+                let ad_end = ad_off + ad_len;
+                // Read accessMethod OID
+                if ad_off < ad_end && aia_value[ad_off] == 0x06 {
+                    let mut method_off = ad_off + 1;
+                    let Some(method_len) = der_read_length(&aia_value, &mut method_off) else {
+                        break;
+                    };
+                    let method_end = method_off + method_len;
+                    if method_end <= ad_end && &aia_value[method_off..method_end] == ocsp_oid {
+                        // Access location is a GeneralName — tag 0x86 for dNSName
+                        let loc_off = method_end;
+                        if loc_off < ad_end && aia_value[loc_off] == 0x86 {
+                            let mut url_off = loc_off + 1;
+                            let Some(url_len) = der_read_length(&aia_value, &mut url_off) else {
+                                break;
+                            };
+                            let url_end = url_off + url_len;
+                            if url_end <= ad_end
+                                && let Ok(url) =
+                                    String::from_utf8(aia_value[url_off..url_end].to_vec())
                             {
-                                // Access location is a GeneralName — tag 0x86 for dNSName, 0x87 for iPAddress
-                                // URI is tag 0x86 (context-specific primitive, tag 6)
-                                let loc_off = method_end;
-                                if loc_off < ad_end && aia_value[loc_off] == 0x86 {
-                                    let mut url_off = loc_off + 1;
-                                    if let Some(url_len) = der_read_length(&aia_value, &mut url_off)
-                                    {
-                                        let url_end = url_off + url_len;
-                                        if url_end <= ad_end {
-                                            if let Ok(url) = String::from_utf8(
-                                                aia_value[url_off..url_end].to_vec(),
-                                            ) {
-                                                ocsp_url = Some(url);
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
+                                ocsp_url = Some(url);
+                                break;
                             }
                         }
                     }
                 }
                 // Move to next AccessDescription
-                if let Some(ad_len) = der_read_length(&aia_value, &mut (aia_off + 1)) {
-                    aia_off += 1 + der_length_size(ad_len) + ad_len;
-                } else {
+                let mut next_off = aia_off + 1;
+                let Some(ad_len) = der_read_length(&aia_value, &mut next_off) else {
                     break;
-                }
+                };
+                aia_off = next_off + ad_len;
             }
         }
     }
 
     if let Some(url) = ocsp_url {
-        // Build a minimal OCSP request and send it
-        // For a production implementation, we'd build a proper OCSPRequest DER
-        // For practical purposes, we check reachability and parse the response
         if url.starts_with("http://") || url.starts_with("https://") {
-            // Send HTTP POST to the OCSP responder
-            if let Ok(client) = reqwest::blocking::Client::builder()
+            // Build a valid OCSPRequest (empty sequences are rejected by
+            // real responders).
+            let request_body = match build_ocsp_request(cert_der, issuer_der) {
+                Some(b) => b,
+                None => return Ok(()), // Could not construct CertID — skip
+            };
+            let client = match reqwest::blocking::Client::builder()
                 .timeout(Duration::from_secs(10))
                 .build()
             {
-                // Build a simple OCSP request (minimal DER)
-                // OCSPRequest ::= SEQUENCE { tbsRequest TBSRequest, optionalSignature [0] Signature OPTIONAL }
-                // For a basic check, we just ping the OCSP responder
-                if let Ok(response) = client
-                    .post(&url)
-                    .header("Content-Type", "application/ocsp-request")
-                    .body(vec![0x30, 0x00]) // Minimal empty OCSP request
-                    .send()
-                {
-                    if response.status().is_success() {
-                        let resp_bytes = response.bytes().unwrap_or_default();
-                        // Check if the response indicates revoked (very basic check)
-                        if resp_bytes.len() > 2 && resp_bytes[0] == 0x30 {
-                            // Parse OCSPResponse
-                            // OCSPResponseStatus ::= ENUMERATED { successful(0), ... }
-                            if resp_bytes.len() > 10 {
-                                // Look for "good" (0x80) or "revoked" (0x81) status bytes
-                                if resp_bytes.windows(2).any(|w| w == &[0x0a, 0x01]) {
-                                    // Enumeration present — check value
-                                    let enum_idx = resp_bytes
-                                        .windows(2)
-                                        .position(|w| w == &[0x0a, 0x01])
-                                        .unwrap();
-                                    if enum_idx + 2 < resp_bytes.len() {
-                                        let status = resp_bytes[enum_idx + 2];
-                                        if status == 1 {
-                                            // revoked
-                                            return Err(format!(
-                                                "OCSP: certificate for host has been revoked"
-                                            ));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+                Ok(c) => c,
+                Err(_) => return Ok(()),
+            };
+            let response = match client
+                .post(&url)
+                .header("Content-Type", "application/ocsp-request")
+                .body(request_body)
+                .send()
+            {
+                Ok(r) => r,
+                Err(_) => return Ok(()), // Transient network failure — inconclusive
+            };
+            if !response.status().is_success() {
+                return Ok(());
             }
+            // Cap the response size (OCSP responses are small).
+            let mut resp_bytes = Vec::new();
+            let mut limited = response.take(1024 * 1024 + 1);
+            if std::io::Read::read_to_end(&mut limited, &mut resp_bytes).is_err() {
+                return Ok(());
+            }
+            if resp_bytes.len() > 1024 * 1024 {
+                return Ok(());
+            }
+            parse_ocsp_response(&resp_bytes).map(|_| ())
+        } else {
+            Ok(())
         }
+    } else {
+        Ok(())
     }
-
-    Ok(())
 }
 
 /// Helper: determine the number of bytes in a DER length encoding.
@@ -4168,7 +4903,7 @@ fn der_length_size(len: usize) -> usize {
     if len < 0x80 {
         1
     } else {
-        1 + (usize::BITS as usize - len.leading_zeros() as usize + 7) / 8
+        1 + (usize::BITS - len.leading_zeros()).div_ceil(8) as usize
     }
 }
 
@@ -4220,33 +4955,38 @@ fn check_crl_revocation(cert_der: &[u8]) -> Result<(), String> {
                                         let mut url_off = seq_off + 1;
                                         if let Some(url_len) =
                                             der_read_length(&cdp_value, &mut url_off)
+                                            && url_off + url_len <= cdp_value.len()
+                                            && let Ok(url) = String::from_utf8(
+                                                cdp_value[url_off..url_off + url_len].to_vec(),
+                                            )
+                                            && (url.starts_with("http://")
+                                                || url.starts_with("https://"))
                                         {
-                                            if url_off + url_len <= cdp_value.len() {
-                                                if let Ok(url) = String::from_utf8(
-                                                    cdp_value[url_off..url_off + url_len].to_vec(),
-                                                ) {
-                                                    // Try to fetch the CRL
-                                                    if url.starts_with("http://")
-                                                        || url.starts_with("https://")
-                                                    {
-                                                        if let Ok(response) =
-                                                            reqwest::blocking::get(&url)
-                                                        {
-                                                            if let Ok(crl_bytes) = response.bytes()
-                                                            {
-                                                                // Parse CRL to check if cert serial is listed
-                                                                // CRL ::= SEQUENCE { tbsCertList TBSCertList, ... }
-                                                                // Look for revokedCertificates SEQUENCE
-                                                                if let Err(msg) =
-                                                                    check_serial_in_crl(
-                                                                        cert_der, &crl_bytes,
-                                                                    )
-                                                                {
-                                                                    return Err(msg);
-                                                                }
-                                                            }
-                                                        }
-                                                    }
+                                            // Try to fetch the CRL
+                                            let client =
+                                                match reqwest::blocking::Client::builder()
+                                                    .timeout(Duration::from_secs(10))
+                                                    .build()
+                                                {
+                                                    Ok(c) => c,
+                                                    Err(_) => break,
+                                                };
+                                            if let Ok(response) = client.get(&url).send()
+                                                && response.status().is_success()
+                                            {
+                                                let mut crl_bytes = Vec::new();
+                                                let mut limited =
+                                                    response.take(16 * 1024 * 1024 + 1);
+                                                if std::io::Read::read_to_end(
+                                                    &mut limited,
+                                                    &mut crl_bytes,
+                                                )
+                                                .is_ok()
+                                                    && crl_bytes.len() <= 16 * 1024 * 1024
+                                                {
+                                                    // Parse CRL to check if cert serial is listed
+                                                    // CRL ::= SEQUENCE { tbsCertList TBSCertList, ... }
+                                                    check_serial_in_crl(cert_der, &crl_bytes)?;
                                                 }
                                             }
                                         }
@@ -4384,16 +5124,28 @@ fn check_serial_in_crl(cert_der: &[u8], crl_der: &[u8]) -> Result<(), String> {
                                 }
                             }
                         }
-                        pos = pos
-                            + 1
-                            + der_length_size(crl_der[pos + 1] as usize)
-                            + crl_der[pos + 1] as usize;
+                        // Advance using a bounds-checked DER length read.
+                        // The old raw-byte advance indexed `crl_der[pos + 1]`
+                        // without bounds checks (panic on crafted CRLs) and
+                        // only understood short-form lengths.
+                        let mut len_off = pos + 1;
+                        match der_read_length(crl_der, &mut len_off) {
+                            Some(entry_len) => {
+                                pos = len_off + entry_len;
+                            }
+                            None => break,
+                        }
                         field_count += 1;
                         continue;
                     }
                     // Skip this SEQUENCE field
-                    let skip_len = der_read_length(crl_der, &mut (pos + 1)).unwrap_or(0);
-                    pos += 1 + der_length_size(skip_len) + skip_len;
+                    let mut skip_off = pos + 1;
+                    match der_read_length(crl_der, &mut skip_off) {
+                        Some(skip_len) => {
+                            pos = skip_off + skip_len;
+                        }
+                        None => break,
+                    }
                     field_count += 1;
                     continue;
                 }
@@ -4454,10 +5206,10 @@ fn extract_serial_number(cert_der: &[u8]) -> Vec<u8> {
         return vec![];
     }
     let mut sn_off = tbs_off + 1;
-    if let Some(sn_len) = der_read_length(cert_der, &mut sn_off) {
-        if sn_off + sn_len <= cert_der.len() {
-            return cert_der[sn_off..sn_off + sn_len].to_vec();
-        }
+    if let Some(sn_len) = der_read_length(cert_der, &mut sn_off)
+        && sn_off + sn_len <= cert_der.len()
+    {
+        return cert_der[sn_off..sn_off + sn_len].to_vec();
     }
 
     vec![]
@@ -4490,162 +5242,8 @@ pub fn verify_certificate(hostname: &str, cert_der: &[u8]) -> Result<(), String>
         return Err(e); // CRL confirmation of revocation is definitive
     }
 
-    // macOS Security.framework trust evaluation (if available)
-    // SecTrustEvaluate automatically checks CRL and OCSP when configured
-    #[cfg(target_os = "macos")]
-    {
-        if let Err(e) = verify_with_security_framework(hostname, cert_der) {
-            eprintln!(
-                "Security.framework validation failed for {}: {}",
-                hostname, e
-            );
-            // Only fail if it's a definitive revocation, not a transient error
-            if e.contains("revoked") || e.contains("Revoked") {
-                return Err(e);
-            }
-        }
-    }
-
     Ok(())
 }
-
-/// On macOS, use Security.framework for comprehensive certificate validation
-/// including CRL and OCSP checks via SecTrustEvaluate.
-#[cfg(target_os = "macos")]
-fn verify_with_security_framework(hostname: &str, cert_der: &[u8]) -> Result<(), String> {
-    use std::ffi::CString;
-    use std::os::raw::c_void;
-
-    // Use Security.framework via FFI to validate the certificate chain
-    // SecCertificateCreateWithData, SecTrustCreateWithCertificates, SecTrustEvaluate
-    use crate::security::{SecCertificateRef, SecTrustRef};
-
-    type SecPolicyRef = *const c_void;
-    type CFArrayRef = core_foundation::base::CFTypeRef;
-    type CFDataRef = core_foundation::base::CFTypeRef;
-    type CFStringRef = core_foundation::base::CFTypeRef;
-    type CFTypeRef = core_foundation::base::CFTypeRef;
-
-    unsafe extern "C" {
-        fn CFDataCreate(allocator: *const c_void, bytes: *const u8, length: usize) -> CFDataRef;
-        fn CFRelease(cf: CFTypeRef);
-        fn SecCertificateCreateWithData(
-            allocator: *const c_void,
-            data: CFDataRef,
-        ) -> SecCertificateRef;
-        fn SecPolicyCreateSSL(server: u8, hostname: CFStringRef) -> SecPolicyRef;
-        fn CFStringCreateWithCString(
-            allocator: *const c_void,
-            cStr: *const c_char,
-            encoding: u32,
-        ) -> CFStringRef;
-        fn SecTrustCreateWithCertificates(
-            certificates: CFTypeRef,
-            policies: CFTypeRef,
-            trust: *mut SecTrustRef,
-        ) -> i32;
-        fn SecTrustEvaluate(trust: SecTrustRef, result: *mut u32) -> i32;
-        fn CFArrayCreate(
-            allocator: *const c_void,
-            values: *const *const c_void,
-            count: usize,
-            callbacks: *const c_void,
-        ) -> CFArrayRef;
-    }
-
-    const kCFStringEncodingUTF8: u32 = 0x08000100;
-    const errSecSuccess: i32 = 0;
-    // SecTrustResultType values
-    const kSecTrustResultUnspecified: u32 = 4;
-    const kSecTrustResultProceed: u32 = 1;
-    const kSecTrustResultRecoverableTrustFailure: u32 = 5;
-    const kSecTrustResultFatalTrustFailure: u32 = 6;
-    const kSecTrustResultOtherError: u32 = 7;
-
-    unsafe {
-        // Create CFData from cert DER
-        let cf_data = CFDataCreate(std::ptr::null(), cert_der.as_ptr(), cert_der.len());
-        if cf_data.is_null() {
-            return Err("Security.framework: failed to create CFData".to_string());
-        }
-
-        // Create SecCertificate
-        let cert_ref = SecCertificateCreateWithData(std::ptr::null(), cf_data);
-        CFRelease(cf_data as CFTypeRef);
-        if cert_ref.is_null() {
-            return Err("Security.framework: failed to create SecCertificate".to_string());
-        }
-
-        // Create SSL policy with hostname
-        let hostname_c = CString::new(hostname).map_err(|_| "Invalid hostname".to_string())?;
-        let cf_hostname =
-            CFStringCreateWithCString(std::ptr::null(), hostname_c.as_ptr(), kCFStringEncodingUTF8);
-        if cf_hostname.is_null() {
-            CFRelease(cert_ref as CFTypeRef);
-            return Err("Security.framework: failed to create CFString".to_string());
-        }
-
-        let ssl_policy = SecPolicyCreateSSL(1, cf_hostname);
-        CFRelease(cf_hostname as CFTypeRef);
-        if ssl_policy.is_null() {
-            CFRelease(cert_ref as CFTypeRef);
-            return Err("Security.framework: failed to create SSL policy".to_string());
-        }
-
-        // Create array with the certificate
-        let certs: [*const c_void; 1] = [cert_ref as *const c_void];
-        let cert_array = CFArrayCreate(std::ptr::null(), certs.as_ptr(), 1, std::ptr::null());
-        if cert_array.is_null() {
-            CFRelease(cert_ref as CFTypeRef);
-            CFRelease(ssl_policy as CFTypeRef);
-            return Err("Security.framework: failed to create CFArray".to_string());
-        }
-
-        // Create SecTrust
-        let mut trust: SecTrustRef = std::ptr::null();
-        let status = SecTrustCreateWithCertificates(
-            cert_array as CFTypeRef,
-            ssl_policy as CFTypeRef,
-            &mut trust,
-        );
-
-        CFRelease(cert_array as CFTypeRef);
-        CFRelease(cert_ref as CFTypeRef);
-        CFRelease(ssl_policy as CFTypeRef);
-
-        if status != errSecSuccess || trust.is_null() {
-            return Err(format!(
-                "Security.framework: SecTrustCreateWithCertificates failed: {status}"
-            ));
-        }
-
-        // Evaluate trust (auto-checks CRL/OCSP on macOS)
-        let mut result: u32 = 0;
-        let eval_status = SecTrustEvaluate(trust, &mut result);
-
-        CFRelease(trust as CFTypeRef);
-
-        if eval_status != errSecSuccess {
-            return Err(format!(
-                "Security.framework: SecTrustEvaluate failed: {eval_status}"
-            ));
-        }
-
-        match result {
-            kSecTrustResultUnspecified | kSecTrustResultProceed => Ok(()),
-            kSecTrustResultRecoverableTrustFailure => Err(format!(
-                "Security.framework: certificate trust failure for {hostname} (recoverable)"
-            )),
-            kSecTrustResultFatalTrustFailure => Err(format!(
-                "Security.framework: certificate trust failure for {hostname} (fatal — likely revoked)"
-            )),
-            other => Err(format!(
-                "Security.framework: certificate trust evaluation returned {other}"
-            )),
-        }
-    }
-}
-
 /// Get the pinned certificate hash for a known hostname.
 /// Returns the expected SHA-256 hash (hex-encoded) if pinned.
 // TODO: Replace with real SPKI SHA-256 pin when available.
@@ -4682,15 +5280,15 @@ pub fn win_http_set_option_extended(
 
     // Route to existing handler for known options
     match option {
-        WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL => {
-            return stack.win_http_set_option(handle, option, value);
-        }
+        WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL => stack.win_http_set_option(handle, option, value),
         WINHTTP_OPTION_SECURITY_FLAGS => {
-            // Store security preferences (flags like 0x08000000 for revocation checking)
+            // Store security preferences (flags like 0x08000000 for revocation
+            // checking) in a dedicated field — reusing `enabled_protocols`
+            // would clobber WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL settings.
             if let Some(session) = stack.sessions.get_mut(&handle) {
                 if value.len() >= 4 {
                     let flags = u32::from_ne_bytes([value[0], value[1], value[2], value[3]]);
-                    session.enabled_protocols = flags;
+                    session.security_flags = flags;
                     if flags & 0x08000000 != 0 {
                         eprintln!(
                             "WinHttpSetOption: certificate revocation checking enabled for session {:#x}",
@@ -4703,10 +5301,11 @@ pub fn win_http_set_option_extended(
             if stack.connections.contains_key(&handle) || stack.requests.contains_key(&handle) {
                 return Ok(());
             }
+            Ok(())
         }
         WINHTTP_OPTION_SECURITY_KEY_BITNESS => {
             // Return 128-bit key strength (common default)
-            return Ok(());
+            Ok(())
         }
         WINHTTP_OPTION_REVOKE_HANDLER => {
             // Store a revocation handler callback for the given handle.
@@ -4721,7 +5320,7 @@ pub fn win_http_set_option_extended(
                     handle, callback_ptr
                 );
             }
-            return Ok(());
+            Ok(())
         }
         WINHTTP_OPTION_CLIENT_CERT_CONTEXT => {
             // Store client certificate context for the given handle.
@@ -4734,12 +5333,11 @@ pub fn win_http_set_option_extended(
                     value.len()
                 );
             }
-            return Ok(());
+            Ok(())
         }
         _ => {
             // Fall through to existing handler
-            return stack.win_http_set_option(handle, option, value);
+            stack.win_http_set_option(handle, option, value)
         }
     }
-    Ok(())
 }

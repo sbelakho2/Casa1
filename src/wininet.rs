@@ -1,5 +1,6 @@
 use crate::error::{AppError, AppResult};
 use crate::reason::ReasonCode;
+use crate::winhttp::CrackedUrl;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
@@ -40,7 +41,10 @@ pub struct FtpFileInfo {
 /// Tracks an open FTP file transfer
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FtpTransfer {
-    pub session_handle: HINTERNET,
+    /// The InternetConnectW handle this transfer belongs to (the field was
+    /// historically named `session_handle` but always stored the connection
+    /// handle).
+    pub connection_handle: HINTERNET,
     pub remote_file: String,
     pub is_passive: bool,
     pub transfer_type: FtpTransferType,
@@ -82,6 +86,9 @@ pub struct InternetConnection {
     pub user_name: Option<String>,
     pub password: Option<String>,
     pub service: u32,
+    /// INTERNET_FLAG_SECURE was requested at connect time.
+    #[serde(default)]
+    pub is_secure: bool,
     pub state: InternetState,
 }
 
@@ -95,6 +102,9 @@ pub struct HttpRequest {
     pub raw_headers: Vec<String>,
     pub body: Vec<u8>,
     pub response_body: Vec<u8>,
+    /// Read cursor into `response_body` (avoids O(n²) `drain` per read).
+    #[serde(default)]
+    pub read_offset: usize,
     pub response_headers: BTreeMap<String, String>,
     pub status_code: u32,
     pub status_text: String,
@@ -133,6 +143,10 @@ pub struct WinInetStack {
     connections: BTreeMap<HINTERNET, InternetConnection>,
     requests: BTreeMap<HINTERNET, HttpRequest>,
     next_handle: HINTERNET,
+    /// Cached reqwest client keyed by (proxy, timeout) config, so
+    /// connection pooling survives across requests and proxy/timeout option
+    /// changes take effect.
+    client_cache: Option<(String, reqwest::blocking::Client)>,
     /// Certificate pinning: host -> list of acceptable SPKI SHA-256 hashes
     pinned_certs: HashMap<String, Vec<Vec<u8>>>,
     /// Cookie jar: host -> list of cookies
@@ -141,6 +155,8 @@ pub struct WinInetStack {
     proxy: Option<InternetProxyConfig>,
     /// Last response info (for InternetGetLastResponseInfoW)
     last_response_error: String,
+    /// Last response error code (for InternetGetLastResponseInfoW)
+    last_response_error_code: u32,
     /// Active FTP transfers
     ftp_transfers: BTreeMap<HINTERNET, FtpTransfer>,
     /// FTP control connections (connection_handle -> TcpStream).
@@ -148,6 +164,12 @@ pub struct WinInetStack {
     pub(crate) ftp_control_streams: BTreeMap<HINTERNET, TcpStream>,
     /// FTP current working directory per connection (connection_handle -> path)
     ftp_current_dir: BTreeMap<HINTERNET, String>,
+    /// FTP file data cache: FtpOpenFileW handle -> (file contents, read offset)
+    ftp_file_data: BTreeMap<HINTERNET, (Vec<u8>, usize)>,
+    /// FTP last listing results for find operations
+    ftp_listing_cache: BTreeMap<HINTERNET, Vec<FtpFileInfo>>,
+    /// FTP listing iterator index per find handle
+    ftp_listing_index: BTreeMap<HINTERNET, usize>,
 }
 
 impl Default for WinInetStack {
@@ -157,13 +179,18 @@ impl Default for WinInetStack {
             connections: BTreeMap::new(),
             requests: BTreeMap::new(),
             next_handle: 1,
+            client_cache: None,
             pinned_certs: HashMap::new(),
             cookie_jar: HashMap::new(),
             proxy: None,
             last_response_error: String::new(),
+            last_response_error_code: 0,
             ftp_transfers: BTreeMap::new(),
             ftp_control_streams: BTreeMap::new(),
             ftp_current_dir: BTreeMap::new(),
+            ftp_file_data: BTreeMap::new(),
+            ftp_listing_cache: BTreeMap::new(),
+            ftp_listing_index: BTreeMap::new(),
         }
     }
 }
@@ -180,7 +207,12 @@ fn extract_spki_der(data: &[u8]) -> Option<Vec<u8>> {
         let len = if let Some(&b) = data.get(*offset) {
             *offset += 1;
             if b & 0x80 != 0 {
+                // Reject absurd long-form lengths so crafted DER cannot drive
+                // unchecked arithmetic.
                 let num_bytes = (b & 0x7F) as usize;
+                if num_bytes > 4 || *offset + num_bytes > data.len() {
+                    return None;
+                }
                 let mut len_val = 0usize;
                 for _ in 0..num_bytes {
                     len_val = (len_val << 8) | (*data.get(*offset)? as usize);
@@ -193,24 +225,29 @@ fn extract_spki_der(data: &[u8]) -> Option<Vec<u8>> {
         } else {
             return None;
         };
+        // Reject lengths that exceed the remaining buffer before any
+        // arithmetic is performed on them.
+        if len > data.len() - *offset {
+            return None;
+        }
         Some((tag, len))
     }
 
     fn skip_tlv(data: &[u8], offset: &mut usize) -> Option<()> {
         let (_, len) = read_tag(data, offset)?;
-        *offset += len;
+        *offset = (*offset).checked_add(len)?;
         Some(())
     }
 
     let mut off = 0;
     let (_, outer_len) = read_tag(data, &mut off)?;
-    let end = off + outer_len;
+    let end = off.checked_add(outer_len)?;
     if end > data.len() {
         return None;
     }
 
     let (_, tbs_len) = read_tag(data, &mut off)?;
-    let tbs_end = off + tbs_len;
+    let tbs_end = off.checked_add(tbs_len)?;
     if tbs_end > end {
         return None;
     }
@@ -232,7 +269,7 @@ fn extract_spki_der(data: &[u8]) -> Option<Vec<u8>> {
     if spki_tag != 0x30 {
         return None;
     }
-    let spki_end = off + spki_len;
+    let spki_end = off.checked_add(spki_len)?;
     if spki_end > tbs_end {
         return None;
     }
@@ -253,14 +290,6 @@ impl WinInetStack {
         // stack.pin_certificate("steampowered.com", &real_spki_hash);
         // stack.pin_certificate("steamstore.akamaihd.net", &real_spki_hash);
         stack
-    }
-
-    /// Decode a hex string to bytes; returns empty vec on failure (pins are best-effort).
-    fn hex_decode(hex: &str) -> Vec<u8> {
-        (0..hex.len())
-            .step_by(2)
-            .filter_map(|i| u8::from_str_radix(&hex[i..(i + 2).min(hex.len())], 16).ok())
-            .collect()
     }
 
     // -----------------------------------------------------------------------
@@ -297,14 +326,35 @@ impl WinInetStack {
     // -----------------------------------------------------------------------
     // Cookie jar
     // -----------------------------------------------------------------------
+
+    /// Maximum cookies stored per host, and per jar, to bound memory growth
+    /// from malicious servers issuing unbounded `Set-Cookie` headers.
+    const MAX_COOKIES_PER_HOST: usize = 512;
+    const MAX_COOKIE_JAR_SIZE: usize = 8192;
+
     pub fn set_cookie(&mut self, host: &str, cookie: Cookie) {
-        self.cookie_jar
-            .entry(host.to_string())
-            .or_default()
-            .push(cookie);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let host_cookies = self.cookie_jar.entry(host.to_string()).or_default();
+        // Drop expired entries for this host and cap the per-host count.
+        host_cookies.retain(|c| c.expiry.map(|e| e > now).unwrap_or(true));
+        if host_cookies.len() >= Self::MAX_COOKIES_PER_HOST {
+            return; // Jar full — refuse to grow unbounded.
+        }
+        host_cookies.push(cookie);
+        // Cap the total jar size; evict a bucket when exceeded.
+        if self.cookie_jar.len() > Self::MAX_COOKIE_JAR_SIZE
+            && let Some(evicted_host) = self.cookie_jar.keys().next().cloned()
+        {
+            self.cookie_jar.remove(&evicted_host);
+        }
     }
 
-    pub fn get_cookies(&self, host: &str, path: &str) -> Vec<(String, String)> {
+    /// `secure` indicates whether the request is over HTTPS; secure-only
+    /// cookies are never sent over plaintext HTTP.
+    pub fn get_cookies(&self, host: &str, path: &str, secure: bool) -> Vec<(String, String)> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -312,10 +362,13 @@ impl WinInetStack {
         let mut result = Vec::new();
         if let Some(cookies) = self.cookie_jar.get(host) {
             for cookie in cookies {
-                if let Some(expiry) = cookie.expiry {
-                    if now >= expiry {
-                        continue;
-                    }
+                if let Some(expiry) = cookie.expiry
+                    && now >= expiry
+                {
+                    continue;
+                }
+                if cookie.secure && !secure {
+                    continue;
                 }
                 if !path.starts_with(&cookie.path) {
                     continue;
@@ -362,6 +415,21 @@ impl WinInetStack {
         Ok(())
     }
 
+    /// Returns true if `domain_attr` is acceptable for a cookie received from
+    /// `host` (equal to the host or a parent domain, per RFC 6265).
+    fn cookie_domain_matches(host: &str, domain_attr: &str) -> bool {
+        let host = host.trim_end_matches('.').to_lowercase();
+        let domain = domain_attr
+            .trim()
+            .trim_start_matches('.')
+            .trim_end_matches('.')
+            .to_lowercase();
+        if domain.is_empty() {
+            return false;
+        }
+        host == domain || host.ends_with(&format!(".{domain}"))
+    }
+
     fn parse_and_store_set_cookie(&mut self, host: &str, header_value: &str) {
         let parts: Vec<&str> = header_value.split(';').collect();
         if parts.is_empty() {
@@ -391,7 +459,14 @@ impl WinInetStack {
                 let key = attr[..eq_pos].trim().to_lowercase();
                 let val = attr[eq_pos + 1..].trim().to_string();
                 match key.as_str() {
-                    "domain" => cookie.domain = val,
+                    "domain" => {
+                        // Never trust a server-supplied domain blindly: only
+                        // accept it if it is the responding host or a parent
+                        // domain of it.
+                        if Self::cookie_domain_matches(host, &val) {
+                            cookie.domain = val;
+                        }
+                    }
                     "path" => cookie.path = val,
                     "max-age" => {
                         if let Ok(seconds) = val.parse::<u64>() {
@@ -423,32 +498,40 @@ impl WinInetStack {
     }
 
     pub fn should_bypass_proxy(&self, url: &str) -> bool {
-        let Some(ref proxy) = self.proxy else {
+        let Some(proxy) = self.proxy.as_ref() else {
             return true;
         };
         if proxy.bypass_list.is_empty() {
             return false;
         }
-        for bypass in &proxy.bypass_list {
-            if url.contains(bypass) {
-                return true;
-            }
-            if let Some(domain) = bypass.strip_prefix("*.") {
-                if url.contains(domain) {
-                    return true;
-                }
-            }
+        // Match bypass entries against the URL *host* with proper suffix
+        // rules, so "example.com" does not match "notexample.com" or
+        // "example.com.evil.net".
+        let host = url::Url::parse(url)
+            .ok()
+            .and_then(|u| u.host_str().map(|h| h.to_lowercase()))
+            .unwrap_or_else(|| url.to_lowercase());
+        proxy.bypass_list.iter().any(|b| Self::host_matches_bypass(&host, b))
+    }
+
+    /// Match a host against a single bypass entry. Supports plain domains,
+    /// leading-dot forms and wildcard prefixes.
+    fn host_matches_bypass(host: &str, bypass: &str) -> bool {
+        let entry = bypass
+            .trim()
+            .trim_start_matches('*')
+            .trim_start_matches('.')
+            .trim_end_matches('.')
+            .to_lowercase();
+        if entry.is_empty() {
+            return false;
         }
-        false
+        host == entry || host.ends_with(&format!(".{entry}"))
     }
 
     pub fn proxy_auth_header(&self) -> Option<String> {
-        let Some(ref proxy) = self.proxy else {
-            return None;
-        };
-        let Some((ref username, ref password)) = proxy.auth else {
-            return None;
-        };
+        let proxy = self.proxy.as_ref()?;
+        let (username, password) = proxy.auth.as_ref()?;
         let credentials = format!("{username}:{password}");
         let encoded = Self::base64_encode(credentials.as_bytes());
         Some(format!("Basic {encoded}"))
@@ -458,7 +541,7 @@ impl WinInetStack {
         const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         let mut result = String::new();
         for chunk in input.chunks(3) {
-            let b0 = chunk.get(0).copied().unwrap_or(0) as u32;
+            let b0 = chunk.first().copied().unwrap_or(0) as u32;
             let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
             let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
             let triple = (b0 << 16) | (b1 << 8) | b2;
@@ -482,6 +565,42 @@ impl WinInetStack {
         let h = self.next_handle;
         self.next_handle = self.next_handle.wrapping_add(1);
         h
+    }
+
+    /// Redact the userinfo portion of a proxy URL for logging.
+    pub fn redact_proxy_url(proxy_url: &str) -> String {
+        match url::Url::parse(proxy_url) {
+            Ok(parsed) => {
+                let mut out = format!("{}://", parsed.scheme());
+                if let Some(host) = parsed.host_str() {
+                    out.push_str(host);
+                    if let Some(port) = parsed.port() {
+                        out.push_str(&format!(":{port}"));
+                    }
+                } else {
+                    out.push_str("[invalid]");
+                }
+                out
+            }
+            Err(_) => {
+                // Fall back to a manual strip of `user:pass@`.
+                match proxy_url.find('@') {
+                    Some(at) => {
+                        let scheme_end = proxy_url.find("://").map(|p| p + 3).unwrap_or(0);
+                        if at > scheme_end {
+                            format!(
+                                "{}[redacted]@{}",
+                                &proxy_url[..scheme_end],
+                                &proxy_url[at + 1..]
+                            )
+                        } else {
+                            proxy_url.to_string()
+                        }
+                    }
+                    None => proxy_url.to_string(),
+                }
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -511,6 +630,8 @@ impl WinInetStack {
     // -----------------------------------------------------------------------
     // InternetConnectW — connect to an HTTP/FTP server
     // -----------------------------------------------------------------------
+    // The argument list mirrors the Win32 InternetConnectW prototype.
+    #[allow(clippy::too_many_arguments)]
     pub fn internet_connect_w(
         &mut self,
         session_handle: HINTERNET,
@@ -521,8 +642,9 @@ impl WinInetStack {
         service: u32,
         flags: u32,
     ) -> AppResult<HINTERNET> {
-        // INTERNET_FLAGS: secure connections & other flags
-        if flags & 0x00800000 != 0 {
+        // INTERNET_FLAG_SECURE: secure connections & other flags
+        let is_secure = flags & 0x00800000 != 0;
+        if is_secure {
             eprintln!(
                 "InternetConnectW: INTERNET_FLAG_SECURE requested for {}",
                 server_name
@@ -545,133 +667,177 @@ impl WinInetStack {
             user_name: user_name.map(|s| s.to_string()),
             password: password.map(|s| s.to_string()),
             service,
+            is_secure,
             state: InternetState::Connected,
         };
         let handle = self.next_handle();
         self.connections.insert(handle, conn);
 
         // If this is an FTP connection, establish the control connection
-        // and log in with the provided credentials.
-        if service == INTERNET_SERVICE_FTP {
-            let ftp_port = if server_port == 0 { 21 } else { server_port };
-            let addr = format!("{server_name}:{ftp_port}");
-            match TcpStream::connect_timeout(
-                &addr
-                    .to_socket_addrs()
-                    .map_err(|e| {
-                        AppError::new(
-                            ReasonCode::RcNetDnsResolutionFailed,
-                            format!("FTP DNS resolution failed for {server_name}: {e}"),
-                        )
-                    })?
-                    .next()
-                    .ok_or_else(|| {
-                        AppError::new(
-                            ReasonCode::RcNetDnsResolutionFailed,
-                            format!("FTP no address for {server_name}"),
-                        )
-                    })?,
-                Duration::from_secs(15),
-            ) {
-                Ok(stream) => {
-                    if let Err(e) = stream.set_read_timeout(Some(Duration::from_secs(30))) {
-                        eprintln!("FTP: failed to set read timeout: {e}");
-                    }
-                    if let Err(e) = stream.set_write_timeout(Some(Duration::from_secs(30))) {
-                        eprintln!("FTP: failed to set write timeout: {e}");
-                    }
-
-                    // Read the 220 greeting
-                    let mut buf = [0u8; 4096];
-                    let mut greeting = Vec::new();
-                    let mut stream_clone = stream.try_clone().map_err(|e| {
-                        AppError::new(ReasonCode::RcIo, format!("FTP clone stream failed: {e}"))
-                    })?;
-                    // Read greeting in a loop until we have the full banner
-                    loop {
-                        match stream_clone.read(&mut buf) {
-                            Ok(0) => break,
-                            Ok(n) => {
-                                greeting.extend_from_slice(&buf[..n]);
-                                if greeting.len() >= 4 && &greeting[greeting.len() - 4..] == b"\r\n"
-                                {
-                                    break;
-                                }
-                            }
-                            Err(_) => break,
-                        }
-                    }
-
-                    // Send USER
-                    let user = user_name.unwrap_or("anonymous");
-                    let cmd = format!("USER {user}\r\n");
-                    if let Err(e) = stream_clone.write_all(cmd.as_bytes()) {
-                        eprintln!("FTP: failed to send USER command: {e}");
-                    }
-
-                    // Read response
-                    greeting.clear();
-                    loop {
-                        match stream_clone.read(&mut buf) {
-                            Ok(0) => break,
-                            Ok(n) => {
-                                greeting.extend_from_slice(&buf[..n]);
-                                if greeting.windows(3).any(|w| w == b"230")
-                                    || greeting.windows(3).any(|w| w == b"331")
-                                {
-                                    break;
-                                }
-                                if greeting.len() > 1024 {
-                                    break;
-                                }
-                            }
-                            Err(_) => break,
-                        }
-                    }
-
-                    // Send PASS if we got a password request (331)
-                    if greeting.windows(3).any(|w| w == b"331") {
-                        let pass = password.unwrap_or("casa1@localhost");
-                        let cmd = format!("PASS {pass}\r\n");
-                        if let Err(e) = stream_clone.write_all(cmd.as_bytes()) {
-                            eprintln!("FTP: failed to send PASS command: {e}");
-                        }
-                        greeting.clear();
-                        loop {
-                            match stream_clone.read(&mut buf) {
-                                Ok(0) => break,
-                                Ok(n) => {
-                                    greeting.extend_from_slice(&buf[..n]);
-                                    if greeting.windows(3).any(|w| w == b"230")
-                                        || greeting.windows(3).any(|w| w == b"530")
-                                    {
-                                        break;
-                                    }
-                                    if greeting.len() > 1024 {
-                                        break;
-                                    }
-                                }
-                                Err(_) => break,
-                            }
-                        }
-                    }
-
-                    self.ftp_control_streams.insert(handle, stream);
-                    self.ftp_current_dir.insert(handle, "/".to_string());
-                }
-                Err(e) => {
-                    // FTP connection failed; log but don't fail — allow fallback
-                    eprintln!("FTP connection to {addr} failed: {e}");
-                }
-            }
+        // and log in with the provided credentials. Failures propagate as
+        // errors instead of silently handing out a broken handle.
+        if service == INTERNET_SERVICE_FTP
+            && let Err(e) = self.ftp_establish_control(handle, server_name, server_port, user_name, password)
+        {
+            self.connections.remove(&handle);
+            return Err(e);
         }
 
         Ok(handle)
     }
 
+    /// Reject FTP operands (user names, passwords, file names, patterns,
+    /// directories) that contain CR/LF, which would inject arbitrary FTP
+    /// commands into the control stream.
+    fn ftp_check_operand(operand: &str, what: &str) -> AppResult<()> {
+        if operand.contains('\r') || operand.contains('\n') {
+            return Err(AppError::new(
+                ReasonCode::RcCliInvalid,
+                format!("FTP: {what} contains illegal CR/LF characters"),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Read a complete FTP reply from a stream (multi-line aware).
+    fn ftp_read_reply(stream: &mut TcpStream, max_len: usize) -> AppResult<String> {
+        let mut response = String::new();
+        let mut buf = [0u8; 4096];
+        let mut pending = String::new();
+        loop {
+            let n = stream.read(&mut buf).map_err(|e| {
+                AppError::new(ReasonCode::RcIo, format!("FTP control read failed: {e}"))
+            })?;
+            if n == 0 {
+                break;
+            }
+            pending.push_str(&String::from_utf8_lossy(&buf[..n]));
+            // Process complete lines from `pending`.
+            while let Some(newline) = pending.find('\n') {
+                let line = pending[..newline].trim_end_matches('\r').to_string();
+                pending = pending[newline + 1..].to_string();
+                if line.len() >= 4
+                    && line.as_bytes()[0].is_ascii_digit()
+                    && line.as_bytes()[1].is_ascii_digit()
+                    && line.as_bytes()[2].is_ascii_digit()
+                    && line.as_bytes()[3] == b' '
+                {
+                    // `NNN ` final line — reply complete.
+                    response.push_str(&line);
+                    response.push_str("\r\n");
+                    return Ok(response);
+                }
+                response.push_str(&line);
+                response.push_str("\r\n");
+                if response.len() > max_len {
+                    return Ok(response);
+                }
+            }
+            if response.len() > max_len {
+                break;
+            }
+        }
+        Ok(response)
+    }
+
+    /// Establish and authenticate an FTP control connection.
+    fn ftp_establish_control(
+        &mut self,
+        handle: HINTERNET,
+        server_name: &str,
+        server_port: u16,
+        user_name: Option<&str>,
+        password: Option<&str>,
+    ) -> AppResult<()> {
+        let user = user_name.unwrap_or("anonymous");
+        let pass = password.unwrap_or("casa1@localhost");
+        Self::ftp_check_operand(user, "user name")?;
+        Self::ftp_check_operand(pass, "password")?;
+
+        let ftp_port = if server_port == 0 { 21 } else { server_port };
+        let addr = format!("{server_name}:{ftp_port}");
+        let mut stream = TcpStream::connect_timeout(
+            &addr
+                .to_socket_addrs()
+                .map_err(|e| {
+                    AppError::new(
+                        ReasonCode::RcNetDnsResolutionFailed,
+                        format!("FTP DNS resolution failed for {server_name}: {e}"),
+                    )
+                })?
+                .next()
+                .ok_or_else(|| {
+                    AppError::new(
+                        ReasonCode::RcNetDnsResolutionFailed,
+                        format!("FTP no address for {server_name}"),
+                    )
+                })?,
+            Duration::from_secs(15),
+        )
+        .map_err(|e| {
+            AppError::new(
+                ReasonCode::RcNetConnectionFailed,
+                format!("FTP connection to {addr} failed: {e}"),
+            )
+        })?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .map_err(|e| {
+                AppError::new(ReasonCode::RcIo, format!("FTP set read timeout failed: {e}"))
+            })?;
+        stream
+            .set_write_timeout(Some(Duration::from_secs(30)))
+            .map_err(|e| {
+                AppError::new(ReasonCode::RcIo, format!("FTP set write timeout failed: {e}"))
+            })?;
+
+        // Read the 220 greeting and validate the banner status code.
+        let greeting = Self::ftp_read_reply(&mut stream, 8192)?;
+        if !greeting.starts_with("220") && !greeting.starts_with("120") {
+            return Err(AppError::new(
+                ReasonCode::RcIo,
+                format!("FTP: unexpected greeting from {addr}: {}", greeting.trim()),
+            ));
+        }
+
+        // Send USER
+        let cmd = format!("USER {user}\r\n");
+        stream
+            .write_all(cmd.as_bytes())
+            .map_err(|e| AppError::new(ReasonCode::RcIo, format!("FTP: failed to send USER: {e}")))?;
+        let user_reply = Self::ftp_read_reply(&mut stream, 8192)?;
+        if user_reply.starts_with("530") {
+            return Err(AppError::new(
+                ReasonCode::RcIo,
+                format!("FTP: login rejected by {addr}: {}", user_reply.trim()),
+            ));
+        }
+
+        // Send PASS if we got a password request (331)
+        if user_reply.starts_with("331") {
+            let cmd = format!("PASS {pass}\r\n");
+            stream
+                .write_all(cmd.as_bytes())
+                .map_err(|e| AppError::new(ReasonCode::RcIo, format!("FTP: failed to send PASS: {e}")))?;
+            let pass_reply = Self::ftp_read_reply(&mut stream, 8192)?;
+            if pass_reply.starts_with("530") {
+                return Err(AppError::new(
+                    ReasonCode::RcIo,
+                    format!("FTP: login rejected by {addr}: {}", pass_reply.trim()),
+                ));
+            }
+        }
+
+        self.ftp_control_streams.insert(handle, stream);
+        self.ftp_current_dir.insert(handle, "/".to_string());
+        Ok(())
+    }
+
     // -----------------------------------------------------------------------
     // HttpOpenRequestW — create an HTTP request handle
     // -----------------------------------------------------------------------
+    // The argument list mirrors the Win32 HttpOpenRequestW prototype.
+    #[allow(clippy::too_many_arguments)]
     pub fn http_open_request_w(
         &mut self,
         connect_handle: HINTERNET,
@@ -683,10 +849,10 @@ impl WinInetStack {
         flags: u32,
     ) -> AppResult<HINTERNET> {
         // Log HTTP version preference if set
-        if let Some(v) = version {
-            if !v.is_empty() {
-                eprintln!("HttpOpenRequestW: HTTP version requested: {}", v);
-            }
+        if let Some(v) = version
+            && !v.is_empty()
+        {
+            eprintln!("HttpOpenRequestW: HTTP version requested: {}", v);
         }
         // Log security flags
         if flags & 0x00800000 != 0 {
@@ -715,6 +881,7 @@ impl WinInetStack {
             raw_headers: Vec::new(),
             body: Vec::new(),
             response_body: Vec::new(),
+            read_offset: 0,
             response_headers: BTreeMap::new(),
             status_code: 0,
             status_text: String::new(),
@@ -738,7 +905,7 @@ impl WinInetStack {
         headers: Option<&str>,
         body: Option<&[u8]>,
     ) -> AppResult<()> {
-        let (_conn_handle, conn_server_name, conn_port, req_object_path, req_verb) = {
+        let (_conn_handle, conn_server_name, conn_port, conn_is_secure, req_object_path, req_verb) = {
             let req = self.requests.get_mut(&request_handle).ok_or_else(|| {
                 AppError::new(
                     ReasonCode::RcWin32InvalidHandle,
@@ -777,16 +944,19 @@ impl WinInetStack {
                 ch,
                 cn.server_name.clone(),
                 cn.server_port,
+                cn.is_secure,
                 req.object_path.clone(),
                 req.verb.clone(),
             )
         };
 
-        let port = conn_port;
-        let scheme = if port == 443 || port == 0 {
-            "https"
+        // Scheme comes from the connection's INTERNET_FLAG_SECURE state, not
+        // a raw port comparison. Port 0 means "default port": 80/443
+        // depending on the secure flag.
+        let (scheme, port) = if conn_is_secure {
+            ("https", if conn_port == 0 { 443 } else { conn_port })
         } else {
-            "http"
+            ("http", if conn_port == 0 { 80 } else { conn_port })
         };
         let url = format!(
             "{}://{}:{}{}",
@@ -801,51 +971,74 @@ impl WinInetStack {
             None
         };
         let proxy_cfg = self.proxy.clone();
+        let req_timeout_ms = self.requests.get(&request_handle).map(|r| r.timeout_ms).unwrap_or(30000);
 
         // Collect cookies from jar
-        let cookies = self.get_cookies(&conn_server_name, &req_object_path);
+        let cookies = self.get_cookies(&conn_server_name, &req_object_path, conn_is_secure);
 
-        let client = reqwest::blocking::Client::builder()
-            .danger_accept_invalid_certs(false) // certificate pinning is enforced for pinned hosts
-            .tls_info(true) // expose the peer certificate so certificate pinning can be enforced
-            .timeout(std::time::Duration::from_secs(30));
-
-        let client = if let Some(ref cfg) = proxy_cfg {
-            if !should_bypass {
-                let proxy_url =
-                    if cfg.server.starts_with("http://") || cfg.server.starts_with("https://") {
+        // Build (or reuse) the HTTP client. The cache key covers the proxy
+        // configuration, bypass state and effective timeout, so proxy/timeout
+        // option changes take effect and connection pooling is retained.
+        let proxy_key = match proxy_cfg.as_ref() {
+            Some(cfg) if !should_bypass => cfg.server.clone(),
+            _ => String::new(),
+        };
+        let client_key = format!("{proxy_key}|{req_timeout_ms}");
+        let client = match self.client_cache.as_ref() {
+            Some((key, client)) if *key == client_key => client.clone(),
+            _ => {
+                let mut builder = reqwest::blocking::Client::builder()
+                    .danger_accept_invalid_certs(false) // certificate pinning is enforced for pinned hosts
+                    .tls_info(true) // expose the peer certificate so certificate pinning can be enforced
+                    .timeout(std::time::Duration::from_millis(req_timeout_ms as u64));
+                if let Some(cfg) = proxy_cfg.as_ref()
+                    && !should_bypass
+                {
+                    let proxy_url = if cfg.server.starts_with("http://")
+                        || cfg.server.starts_with("https://")
+                    {
                         cfg.server.clone()
                     } else {
                         format!("http://{}", cfg.server)
                     };
-                if let Ok(proxy) = reqwest::Proxy::http(&proxy_url) {
-                    client.proxy(proxy)
-                } else {
-                    client
+                    let proxy = if proxy_url.starts_with("https://") {
+                        reqwest::Proxy::https(&proxy_url)
+                    } else {
+                        reqwest::Proxy::all(&proxy_url)
+                    };
+                    match proxy {
+                        Ok(p) => {
+                            builder = builder.proxy(p);
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "HttpSendRequestW: ignoring invalid proxy configuration '{}': {e}",
+                                Self::redact_proxy_url(&proxy_url)
+                            );
+                        }
+                    }
                 }
-            } else {
+                let client = builder.build().map_err(|e| {
+                    AppError::new(
+                        ReasonCode::RcNetHttpRequestFailed,
+                        format!("HttpSendRequestW: failed to create client: {e:?}"),
+                    )
+                })?;
+                self.client_cache = Some((client_key, client.clone()));
                 client
             }
-        } else {
-            client
         };
 
-        let client = client.build().map_err(|e| {
-            AppError::new(
-                ReasonCode::RcNetHttpRequestFailed,
-                format!("HttpSendRequestW: failed to create client: {e:?}"),
-            )
-        })?;
-
-        let method = match req_verb.to_uppercase().as_str() {
-            "GET" => reqwest::Method::GET,
-            "POST" => reqwest::Method::POST,
-            "PUT" => reqwest::Method::PUT,
-            "DELETE" => reqwest::Method::DELETE,
-            "HEAD" => reqwest::Method::HEAD,
-            "PATCH" => reqwest::Method::PATCH,
-            _ => reqwest::Method::GET,
-        };
+        // Unknown verbs are errors, not silent GETs: a PROPFIND sent as GET
+        // would change semantics and drop the payload.
+        let method = reqwest::Method::from_bytes(req_verb.to_uppercase().as_bytes()).map_err(
+            |_| {
+                AppError::new(
+                    ReasonCode::RcCliInvalid,
+                    format!("HttpSendRequestW: invalid HTTP verb '{req_verb}'"),
+                )
+            },
+        )?;
 
         let mut request_builder = client.request(method.clone(), &url);
 
@@ -887,23 +1080,24 @@ impl WinInetStack {
                 }
             }
 
-            // Add body for methods that support it
-            if method == reqwest::Method::POST
+            // Add body for methods that support it (take ownership instead of
+            // cloning up to 256 MB).
+            let supports_body = method == reqwest::Method::POST
                 || method == reqwest::Method::PUT
-                || method == reqwest::Method::PATCH
-            {
-                if !req.body.is_empty() {
-                    request_builder = request_builder.body(req.body.clone());
-                }
+                || method == reqwest::Method::PATCH;
+            if supports_body {
+                let request_body = std::mem::take(&mut req.body);
+                request_builder = request_builder.body(request_body);
             }
 
             req.state = InternetState::RequestSent;
 
-            let response = match request_builder.send() {
+            let mut response = match request_builder.send() {
                 Ok(resp) => resp,
                 Err(e) => {
                     req.state = InternetState::ResponseReceived;
                     self.last_response_error = format!("{e:?}");
+                    self.last_response_error_code = 12029; // ERROR_INTERNET_CANNOT_CONNECT
                     return Err(AppError::new(
                         ReasonCode::RcNetHttpRequestFailed,
                         format!("HttpSendRequestW: {e:?}"),
@@ -939,12 +1133,35 @@ impl WinInetStack {
                 .map(|hv| hv.to_str().unwrap_or("").to_string())
                 .collect();
 
-            let body_bytes = response.bytes().unwrap_or_default().to_vec();
-
-            req.status_code = sc;
-            req.status_text = st.clone();
-            req.response_headers = resp_headers.clone();
+            // Enforce the response size cap *before* downloading (via the
+            // Content-Length pre-check) and abort mid-stream once the cap is
+            // exceeded, instead of buffering the whole body first.
+            if let Some(cl) = response.content_length()
+                && cl > MAX_WININET_RESPONSE_BODY as u64
+            {
+                req.state = InternetState::ResponseReceived;
+                return Err(AppError::new(
+                    ReasonCode::RcBufferLimitExceeded,
+                    format!(
+                        "HttpSendRequestW: response content length {cl} exceeds limit ({MAX_WININET_RESPONSE_BODY})"
+                    ),
+                ));
+            }
+            let mut body_bytes = Vec::new();
+            {
+                let mut limited = (&mut response).take((MAX_WININET_RESPONSE_BODY + 1) as u64);
+                if let Err(e) = limited.read_to_end(&mut body_bytes) {
+                    req.state = InternetState::ResponseReceived;
+                    self.last_response_error = format!("{e}");
+                    self.last_response_error_code = 12002; // ERROR_INTERNET_TIMEOUT
+                    return Err(AppError::new(
+                        ReasonCode::RcNetHttpRequestFailed,
+                        format!("HttpSendRequestW: failed reading response body: {e}"),
+                    ));
+                }
+            }
             if body_bytes.len() > MAX_WININET_RESPONSE_BODY {
+                req.state = InternetState::ResponseReceived;
                 return Err(AppError::new(
                     ReasonCode::RcBufferLimitExceeded,
                     format!(
@@ -953,14 +1170,19 @@ impl WinInetStack {
                     ),
                 ));
             }
-            req.response_body = body_bytes.clone();
+
+            req.status_code = sc;
+            req.status_text = st.clone();
+            req.response_headers = resp_headers.clone();
+            req.response_body = body_bytes;
+            req.read_offset = 0;
             req.state = InternetState::ResponseReceived;
 
             (
                 sc,
                 st,
                 resp_headers,
-                body_bytes,
+                Vec::<u8>::new(),
                 set_cookie_values,
                 cert_chain,
             )
@@ -993,19 +1215,40 @@ impl WinInetStack {
         request_handle: HINTERNET,
         buffer: &mut [u8],
     ) -> AppResult<u32> {
-        let req = self.requests.get_mut(&request_handle).ok_or_else(|| {
-            AppError::new(
-                ReasonCode::RcWin32InvalidHandle,
-                format!("InternetReadFile: invalid handle {request_handle:#x}"),
-            )
-        })?;
-
-        let to_read = buffer.len().min(req.response_body.len());
-        if to_read > 0 {
-            buffer[..to_read].copy_from_slice(&req.response_body[..to_read]);
-            req.response_body.drain(..to_read);
+        // First try the HTTP requests map
+        if let Some(req) = self.requests.get_mut(&request_handle) {
+            let off = req.read_offset;
+            let to_read = buffer.len().min(req.response_body.len().saturating_sub(off));
+            if to_read > 0 {
+                buffer[..to_read].copy_from_slice(&req.response_body[off..off + to_read]);
+            }
+            req.read_offset = off + to_read;
+            // Release the backing buffer once fully consumed.
+            if req.read_offset == req.response_body.len() {
+                req.response_body.clear();
+                req.read_offset = 0;
+            }
+            return Ok(to_read as u32);
         }
-        Ok(to_read as u32)
+
+        // Fall back to FTP file data cache (for handles from ftp_open_file_w)
+        if let Some((file_data, read_offset)) = self.ftp_file_data.get_mut(&request_handle) {
+            let to_read = buffer.len().min(file_data.len().saturating_sub(*read_offset));
+            if to_read > 0 {
+                buffer[..to_read].copy_from_slice(&file_data[*read_offset..*read_offset + to_read]);
+            }
+            *read_offset += to_read;
+            if *read_offset == file_data.len() {
+                file_data.clear();
+                *read_offset = 0;
+            }
+            return Ok(to_read as u32);
+        }
+
+        Err(AppError::new(
+            ReasonCode::RcWin32InvalidHandle,
+            format!("InternetReadFile: invalid handle {request_handle:#x}"),
+        ))
     }
 
     // -----------------------------------------------------------------------
@@ -1016,6 +1259,9 @@ impl WinInetStack {
         self.ftp_control_streams.remove(&handle);
         self.ftp_current_dir.remove(&handle);
         self.ftp_transfers.remove(&handle);
+        self.ftp_file_data.remove(&handle);
+        self.ftp_listing_cache.remove(&handle);
+        self.ftp_listing_index.remove(&handle);
 
         if self.sessions.remove(&handle).is_some() {
             return Ok(());
@@ -1042,7 +1288,11 @@ impl WinInetStack {
                 format!("InternetQueryDataAvailable: invalid handle {request_handle:#x}"),
             )
         })?;
-        Ok(req.response_body.len() as u32)
+        Ok(req
+            .response_body
+            .len()
+            .saturating_sub(req.read_offset)
+            .min(u32::MAX as usize) as u32)
     }
 
     // -----------------------------------------------------------------------
@@ -1081,42 +1331,65 @@ impl WinInetStack {
                         } else {
                             None
                         };
-                        if let Some(ref p) = proxy_str {
+                        if let Some(p) = proxy_str {
+                            let bypass_list = if value.len() > 4 + p.len() + 1 {
+                                let bypass_start = 4 + p.len() + 1;
+                                if bypass_start < value.len() {
+                                    let remainder = &value[bypass_start..];
+                                    let end = remainder
+                                        .iter()
+                                        .position(|&b| b == 0)
+                                        .unwrap_or(remainder.len());
+                                    if end > 0 {
+                                        remainder[..end]
+                                            .split(|&b| b == b';')
+                                            .filter(|s| !s.is_empty())
+                                            .map(|s| String::from_utf8_lossy(s).to_string())
+                                            .collect::<Vec<_>>()
+                                    } else {
+                                        Vec::new()
+                                    }
+                                } else {
+                                    Vec::new()
+                                }
+                            } else {
+                                Vec::new()
+                            };
                             session.proxy = Some(p.clone());
+                            session.proxy_bypass = Some(bypass_list.join(";"));
+                            // Apply to the request path (http_send_request_w
+                            // consults `self.proxy`).
+                            self.proxy = Some(InternetProxyConfig {
+                                server: p.clone(),
+                                bypass_list,
+                                auth: None,
+                            });
                             eprintln!(
                                 "InternetSetOptionW: proxy set to {} for session {:#x}",
-                                p, handle
+                                Self::redact_proxy_url(&p),
+                                handle
                             );
                         }
                     }
-                    // Store proxy bypass list if present in value
-                    let _ = value; // value bytes already consumed above
                 }
                 _ => {}
             }
             return Ok(());
         }
-        if let Some(_conn) = self.connections.get_mut(&handle) {
-            match option {
-                _ => {}
-            }
+        if self.connections.contains_key(&handle) {
             return Ok(());
         }
         if let Some(req) = self.requests.get_mut(&handle) {
             match option {
-                4 => {
+                4 if value.len() >= 4 => {
                     // INTERNET_OPTION_CONNECT_TIMEOUT
-                    if value.len() >= 4 {
-                        req.timeout_ms =
-                            u32::from_ne_bytes([value[0], value[1], value[2], value[3]]);
-                    }
+                    req.timeout_ms =
+                        u32::from_ne_bytes([value[0], value[1], value[2], value[3]]);
                 }
-                30 => {
+                30 if value.len() >= 4 => {
                     // INTERNET_OPTION_RECEIVE_TIMEOUT
-                    if value.len() >= 4 {
-                        req.timeout_ms =
-                            u32::from_ne_bytes([value[0], value[1], value[2], value[3]]);
-                    }
+                    req.timeout_ms =
+                        u32::from_ne_bytes([value[0], value[1], value[2], value[3]]);
                 }
                 _ => {}
             }
@@ -1132,8 +1405,12 @@ impl WinInetStack {
     // InternetGetLastResponseInfoW — retrieve the last response error text
     // -----------------------------------------------------------------------
     pub fn internet_get_last_response_info(&self) -> (u32, String) {
-        // Return a generic error code and the stored error text
-        (12002u32, self.last_response_error.clone()) // ERROR_INTERNET_TIMEOUT is a common fallback
+        let code = if self.last_response_error_code == 0 {
+            12002 // ERROR_INTERNET_TIMEOUT — default when no failure recorded
+        } else {
+            self.last_response_error_code
+        };
+        (code, self.last_response_error.clone())
     }
 
     // -----------------------------------------------------------------------
@@ -1166,17 +1443,30 @@ impl WinInetStack {
     // InternetCrackUrlW — crack a URL into its component parts
     // Returns (scheme, hostname, port, path, username, password)
     // -----------------------------------------------------------------------
+
+    /// Truncate `url` to at most `url_length` UTF-8 bytes, never splitting a
+    /// multi-byte character. `url_length` is guest-controlled (a UTF-16-unit
+    /// count per WinINet semantics), so slicing at the raw byte offset can
+    /// panic; clamp to the nearest char boundary instead.
+    fn truncate_url(url: &str, url_length: u32) -> &str {
+        let want = url_length as usize;
+        if want >= url.len() {
+            return url;
+        }
+        let mut end = want;
+        while end > 0 && !url.is_char_boundary(end) {
+            end -= 1;
+        }
+        &url[..end]
+    }
+
     #[allow(unused_assignments)]
     pub fn internet_crack_url_w(
         &self,
         url: &str,
         url_length: u32,
-    ) -> AppResult<(String, String, u16, String, Option<String>, Option<String>)> {
-        let url = if (url_length as usize) < url.len() {
-            &url[..url_length as usize]
-        } else {
-            url
-        };
+    ) -> AppResult<CrackedUrl> {
+        let url = Self::truncate_url(url, url_length);
 
         // Parse the URL manually (simple approach)
         let url = url.trim();
@@ -1215,9 +1505,9 @@ impl WinInetStack {
         let _ = userinfo;
 
         // Extract host and port
-        let hostpart = hostpart;
         let path_start = hostpart
-            .find(|c: char| c == '/' || c == '?' || c == '#')
+            .bytes()
+            .position(|b| b == b'/' || b == b'?' || b == b'#')
             .unwrap_or(hostpart.len());
         let host_port = &hostpart[..path_start];
         let path_and_query = &hostpart[path_start..];
@@ -1257,11 +1547,7 @@ impl WinInetStack {
     // 3. Scheme lowercasing
     // -----------------------------------------------------------------------
     pub fn internet_canonicalize_url_w(&self, url: &str, url_length: u32) -> String {
-        let url = if (url_length as usize) < url.len() {
-            &url[..url_length as usize]
-        } else {
-            url
-        };
+        let url = Self::truncate_url(url, url_length);
 
         // RFC 3986 unreserved characters: ALPHA / DIGIT / "-" / "." / "_" / "~"
         // RFC 3986 reserved characters (gen-delims + sub-delims): ":" / "/" / "?" / "#"
@@ -1275,8 +1561,9 @@ impl WinInetStack {
                 ':' | '/' | '?' | '#' | '[' | ']' | '@' => false,
                 // Reserved (sub-delims) — keep as-is
                 '!' | '$' | '&' | '\'' | '(' | ')' | '*' | '+' | ',' | ';' | '=' => false,
-                // Percent sign — only keep if followed by two hex digits (already encoded)
-                '%' => false,
+                // Percent sign — encoded below unless followed by two hex
+                // digits (i.e. already valid percent-encoding).
+                '%' => true,
                 // Everything else (spaces, control chars, non-ASCII with encoding needed) → encode
                 _ => true,
             }
@@ -1306,7 +1593,7 @@ impl WinInetStack {
                 }
             } else if needs_percent_encoding(ch) {
                 for byte in ch.to_string().as_bytes() {
-                    encoded.push_str(&format!("%{:02X}", byte));
+                    encoded.push_str(&format!("%{byte:02X}"));
                 }
             } else {
                 encoded.push(ch);
@@ -1329,7 +1616,8 @@ impl WinInetStack {
             // Find the end of authority (first '/' after '://', or '?' or '#')
             let rest = &encoded[scheme_end + 3..];
             let auth_end = rest
-                .find(|c: char| c == '/' || c == '?' || c == '#')
+                .bytes()
+                .position(|b| b == b'/' || b == b'?' || b == b'#')
                 .unwrap_or(rest.len());
             result.push_str(&rest[..auth_end]); // Authority (host + optional port)
 
@@ -1368,83 +1656,47 @@ impl WinInetStack {
             AppError::new(ReasonCode::RcIo, format!("FTP command '{cmd}' failed: {e}"))
         })?;
 
-        // Read the multi-line response
-        let mut response = String::new();
-        let mut buf = [0u8; 1];
-        let mut line = String::new();
-        let mut last_char_was_cr = false;
-        loop {
-            match stream.read(&mut buf) {
-                Ok(0) => break,
-                Ok(_) => {
-                    let c = buf[0] as char;
-                    if c == '\r' {
-                        last_char_was_cr = true;
-                    } else if c == '\n' && last_char_was_cr {
-                        // End of line
-                        // Check if this is the last line of a multi-line response
-                        // Last line starts with "XXX " (3 digits + space)
-                        if line.len() >= 4
-                            && line.as_bytes()[0].is_ascii_digit()
-                            && line.as_bytes()[1].is_ascii_digit()
-                            && line.as_bytes()[2].is_ascii_digit()
-                            && line.as_bytes()[3] == b' '
-                        {
-                            response.push_str(&line);
-                            response.push_str("\r\n");
-                            break;
-                        }
-                        response.push_str(&line);
-                        response.push_str("\r\n");
-                        line.clear();
-                        last_char_was_cr = false;
-                    } else {
-                        if last_char_was_cr {
-                            line.push('\r');
-                            last_char_was_cr = false;
-                        }
-                        line.push(c);
-                    }
-                }
-                Err(_) => break,
-            }
-            if response.len() > 16384 {
-                break; // Safety limit
-            }
-        }
+        Self::ftp_read_reply(stream, 16384)
+    }
 
-        if response.is_empty() {
-            // Try single line read as fallback
-            let mut single_buf = [0u8; 1024];
-            match stream.read(&mut single_buf) {
-                Ok(n) if n > 0 => {
-                    response = String::from_utf8_lossy(&single_buf[..n]).to_string();
-                }
-                _ => {}
-            }
+    /// Check an FTP command reply for an expected 1xx/2xx/3xx success code.
+    fn ftp_expect_success(reply: &str, cmd: &str) -> AppResult<()> {
+        let status = reply
+            .lines()
+            .next()
+            .map(|l| l.trim())
+            .unwrap_or_default()
+            .chars()
+            .take(3)
+            .collect::<String>();
+        let ok = status.starts_with('1') || status.starts_with('2') || status.starts_with('3');
+        if !ok {
+            return Err(AppError::new(
+                ReasonCode::RcIo,
+                format!("FTP {cmd} failed: {}", reply.trim()),
+            ));
         }
-
-        Ok(response)
+        Ok(())
     }
 
     /// Parse a PASV response (227 Entering Passive Mode (h1,h2,h3,h4,p1,p2))
     /// to extract the data connection address and port.
     fn ftp_parse_pasv(response: &str) -> Option<(String, u16)> {
         // Look for the parentheses: "(h1,h2,h3,h4,p1,p2)"
-        if let Some(start) = response.find('(') {
-            if let Some(end) = response.find(')') {
-                let nums: Vec<&str> = response[start + 1..end].split(',').collect();
-                if nums.len() == 6 {
-                    let h1: u8 = nums[0].trim().parse().ok()?;
-                    let h2: u8 = nums[1].trim().parse().ok()?;
-                    let h3: u8 = nums[2].trim().parse().ok()?;
-                    let h4: u8 = nums[3].trim().parse().ok()?;
-                    let p1: u16 = nums[4].trim().parse().ok()?;
-                    let p2: u16 = nums[5].trim().parse().ok()?;
-                    let addr = format!("{h1}.{h2}.{h3}.{h4}");
-                    let port = p1 * 256 + p2;
-                    return Some((addr, port));
-                }
+        if let Some(start) = response.find('(')
+            && let Some(end) = response.find(')')
+        {
+            let nums: Vec<&str> = response[start + 1..end].split(',').collect();
+            if nums.len() == 6 {
+                let h1: u8 = nums[0].trim().parse().ok()?;
+                let h2: u8 = nums[1].trim().parse().ok()?;
+                let h3: u8 = nums[2].trim().parse().ok()?;
+                let h4: u8 = nums[3].trim().parse().ok()?;
+                let p1: u16 = nums[4].trim().parse().ok()?;
+                let p2: u16 = nums[5].trim().parse().ok()?;
+                let addr = format!("{h1}.{h2}.{h3}.{h4}");
+                let port = p1 * 256 + p2;
+                return Some((addr, port));
             }
         }
         None
@@ -1454,6 +1706,7 @@ impl WinInetStack {
     fn ftp_data_connect(&mut self, conn_handle: HINTERNET) -> AppResult<TcpStream> {
         // Send PASV command
         let pasv_response = self.ftp_command(conn_handle, "PASV")?;
+        Self::ftp_expect_success(&pasv_response, "PASV")?;
 
         // Parse the response for the data address
         let (data_addr, data_port) = Self::ftp_parse_pasv(&pasv_response).ok_or_else(|| {
@@ -1485,18 +1738,36 @@ impl WinInetStack {
                 format!("FTP data connect to {data_addr}:{data_port} failed: {e}"),
             )
         })?;
+        // A stalled server must not hang the transfer indefinitely.
+        data_stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .ok();
+        data_stream
+            .set_write_timeout(Some(Duration::from_secs(30)))
+            .ok();
 
         Ok(data_stream)
     }
 
-    /// Read all data from a data connection.
+    /// Read all data from a data connection, with a size cap.
     fn ftp_read_data(stream: &mut TcpStream) -> AppResult<Vec<u8>> {
         let mut data = Vec::new();
         let mut buf = [0u8; 16384];
         loop {
             match stream.read(&mut buf) {
                 Ok(0) => break,
-                Ok(n) => data.extend_from_slice(&buf[..n]),
+                Ok(n) => {
+                    let new_len = data.len().saturating_add(n);
+                    if new_len > MAX_WININET_RESPONSE_BODY {
+                        return Err(AppError::new(
+                            ReasonCode::RcBufferLimitExceeded,
+                            format!(
+                                "FTP data transfer exceeds limit ({MAX_WININET_RESPONSE_BODY})"
+                            ),
+                        ));
+                    }
+                    data.extend_from_slice(&buf[..n]);
+                }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(e) => {
                     return Err(AppError::new(
@@ -1522,19 +1793,22 @@ impl WinInetStack {
         _access: u32,
         transfer_type: FtpTransferType,
     ) -> AppResult<HINTERNET> {
+        Self::ftp_check_operand(file_name, "file name")?;
         // Try to initiate the transfer by sending PASV + RETR
         let mut data_stream = self.ftp_data_connect(connect_handle)?;
         let retr_cmd = format!("RETR {file_name}");
-        let _retr_response = self.ftp_command(connect_handle, &retr_cmd)?;
+        let retr_response = self.ftp_command(connect_handle, &retr_cmd)?;
+        Self::ftp_expect_success(&retr_response, &retr_cmd)?;
 
-        // Read the file data from the data connection
-        let _file_data = Self::ftp_read_data(&mut data_stream)?;
+        // Read the file data from the data connection and cache it so
+        // InternetReadFile can serve it from the transfer handle.
+        let file_data = Self::ftp_read_data(&mut data_stream)?;
 
         let handle = self.next_handle();
         self.ftp_transfers.insert(
             handle,
             FtpTransfer {
-                session_handle: connect_handle,
+                connection_handle: connect_handle,
                 remote_file: file_name.to_string(),
                 is_passive: true,
                 transfer_type,
@@ -1542,17 +1816,11 @@ impl WinInetStack {
                 context: 0,
             },
         );
+        self.ftp_file_data.insert(handle, (file_data, 0));
 
-        // Store the data in the transfer's context (we use local_path as temp storage)
-        // For simplicity, we store it as base64 in the receive buffer concept
-        // Actually, let's use the FtpTransfer.local_path to signal "data available"
-        // and store the data in a separate map
-        // For now, the caller will use ftp_get_file_w to retrieve
-
-        // Send the completion command
-        if let Err(e) = self.ftp_command(connect_handle, "QUIT") {
-            eprintln!("FTP quit command failed: {e}");
-        }
+        // No QUIT here: that would close the server-side control session and
+        // poison every subsequent command on this connection. The guest
+        // closes the handle when done.
 
         Ok(handle)
     }
@@ -1564,9 +1832,16 @@ impl WinInetStack {
         connect_handle: HINTERNET,
         remote_file: &str,
         local_file: &str,
-        _fail_if_exists: bool,
+        fail_if_exists: bool,
         _transfer_type: FtpTransferType,
     ) -> AppResult<bool> {
+        Self::ftp_check_operand(remote_file, "remote file name")?;
+        if fail_if_exists && Path::new(local_file).exists() {
+            return Err(AppError::new(
+                ReasonCode::RcIo,
+                format!("FTP: local file {local_file} already exists"),
+            ));
+        }
         // Establish PASV data connection
         let mut data_stream = self.ftp_data_connect(connect_handle).map_err(|e| {
             AppError::new(
@@ -1575,19 +1850,21 @@ impl WinInetStack {
             )
         })?;
 
-        // Send RETR command
+        // Send RETR command and validate the server accepted it.
         let retr_cmd = format!("RETR {remote_file}");
-        if let Err(e) = self.ftp_command(connect_handle, &retr_cmd) {
-            eprintln!("FTP RETR command failed: {e}");
-        }
+        let retr_response = self.ftp_command(connect_handle, &retr_cmd)?;
+        Self::ftp_expect_success(&retr_response, &retr_cmd)?;
 
         // Read file data from the data connection
         let file_data = Self::ftp_read_data(&mut data_stream)?;
 
-        // Write to local file
-        if let Err(e) = std::fs::write(local_file, &file_data) {
-            eprintln!("FTP: failed to write local file {local_file}: {e}");
-        }
+        // Write to local file — failures must surface, not be logged away.
+        std::fs::write(local_file, &file_data).map_err(|e| {
+            AppError::new(
+                ReasonCode::RcIo,
+                format!("FTP: failed to write local file {local_file}: {e}"),
+            )
+        })?;
 
         Ok(true)
     }
@@ -1600,6 +1877,7 @@ impl WinInetStack {
         local_file: &str,
         _transfer_type: FtpTransferType,
     ) -> AppResult<bool> {
+        Self::ftp_check_operand(remote_file, "remote file name")?;
         // Read the local file
         let local_data = std::fs::read(local_file).map_err(|e| {
             AppError::new(
@@ -1616,19 +1894,24 @@ impl WinInetStack {
             )
         })?;
 
-        // Send STOR command
+        // Send STOR command and validate the server accepted it.
         let stor_cmd = format!("STOR {remote_file}");
-        if let Err(e) = self.ftp_command(connect_handle, &stor_cmd) {
-            eprintln!("FTP STOR command failed: {e}");
-        }
+        let stor_response = self.ftp_command(connect_handle, &stor_cmd)?;
+        Self::ftp_expect_success(&stor_response, &stor_cmd)?;
 
         // Write data to the data connection
-        if let Err(e) = data_stream.write_all(&local_data) {
-            eprintln!("FTP: failed to write data to STOR: {e}");
-        }
-        if let Err(e) = data_stream.flush() {
-            eprintln!("FTP: failed to flush data stream: {e}");
-        }
+        data_stream.write_all(&local_data).map_err(|e| {
+            AppError::new(
+                ReasonCode::RcIo,
+                format!("FTP: failed to write data to STOR: {e}"),
+            )
+        })?;
+        data_stream.flush().map_err(|e| {
+            AppError::new(
+                ReasonCode::RcIo,
+                format!("FTP: failed to flush data stream: {e}"),
+            )
+        })?;
 
         Ok(true)
     }
@@ -1639,9 +1922,15 @@ impl WinInetStack {
         connect_handle: HINTERNET,
         file_name: &str,
     ) -> AppResult<bool> {
+        Self::ftp_check_operand(file_name, "file name")?;
         let cmd = format!("DELE {file_name}");
         let response = self.ftp_command(connect_handle, &cmd)?;
-        eprintln!("FTP DELE {file_name}: {response}");
+        if !response.contains("250") && !response.contains("200") {
+            return Err(AppError::new(
+                ReasonCode::RcIo,
+                format!("FTP DELE failed: {}", response.trim()),
+            ));
+        }
         Ok(true)
     }
 
@@ -1652,10 +1941,11 @@ impl WinInetStack {
         existing: &str,
         new_name: &str,
     ) -> AppResult<bool> {
+        Self::ftp_check_operand(existing, "existing file name")?;
+        Self::ftp_check_operand(new_name, "new file name")?;
         let rnfr_cmd = format!("RNFR {existing}");
         let rnfr_response = self.ftp_command(connect_handle, &rnfr_cmd)?;
         if !rnfr_response.contains("350") {
-            eprintln!("FTP RNFR {existing} failed: {}", rnfr_response.trim());
             return Err(AppError::new(
                 ReasonCode::RcIo,
                 format!("FTP RNFR failed: {}", rnfr_response.trim()),
@@ -1664,7 +1954,6 @@ impl WinInetStack {
         let rnto_cmd = format!("RNTO {new_name}");
         let rnto_response = self.ftp_command(connect_handle, &rnto_cmd)?;
         if !rnto_response.contains("250") {
-            eprintln!("FTP RNTO {new_name} failed: {}", rnto_response.trim());
             return Err(AppError::new(
                 ReasonCode::RcIo,
                 format!("FTP RNTO failed: {}", rnto_response.trim()),
@@ -1679,6 +1968,7 @@ impl WinInetStack {
         connect_handle: HINTERNET,
         directory: &str,
     ) -> AppResult<bool> {
+        Self::ftp_check_operand(directory, "directory")?;
         let cmd = format!("CWD {directory}");
         let response = self.ftp_command(connect_handle, &cmd)?;
         if response.contains("250") || response.contains("200") {
@@ -1703,12 +1993,12 @@ impl WinInetStack {
         // Query via PWD
         let response = self.ftp_command(connect_handle, "PWD")?;
         // PWD response format: 257 "/remote/dir" is current directory
-        if let Some(start) = response.find('"') {
-            if let Some(end) = response[start + 1..].find('"') {
-                let dir = &response[start + 1..start + 1 + end];
-                self.ftp_current_dir.insert(connect_handle, dir.to_string());
-                return Ok(dir.to_string());
-            }
+        if let Some(start) = response.find('"')
+            && let Some(end) = response[start + 1..].find('"')
+        {
+            let dir = &response[start + 1..start + 1 + end];
+            self.ftp_current_dir.insert(connect_handle, dir.to_string());
+            return Ok(dir.to_string());
         }
         Ok("/".to_string())
     }
@@ -1719,10 +2009,10 @@ impl WinInetStack {
         connect_handle: HINTERNET,
         directory: &str,
     ) -> AppResult<bool> {
+        Self::ftp_check_operand(directory, "directory")?;
         let cmd = format!("MKD {directory}");
         let response = self.ftp_command(connect_handle, &cmd)?;
         if !response.contains("257") {
-            eprintln!("FTP MKD {directory} failed: {}", response.trim());
             return Err(AppError::new(
                 ReasonCode::RcIo,
                 format!("FTP MKD failed: {}", response.trim()),
@@ -1737,10 +2027,10 @@ impl WinInetStack {
         connect_handle: HINTERNET,
         directory: &str,
     ) -> AppResult<bool> {
+        Self::ftp_check_operand(directory, "directory")?;
         let cmd = format!("RMD {directory}");
         let response = self.ftp_command(connect_handle, &cmd)?;
         if !response.contains("250") {
-            eprintln!("FTP RMD {directory} failed: {}", response.trim());
             return Err(AppError::new(
                 ReasonCode::RcIo,
                 format!("FTP RMD failed: {}", response.trim()),
@@ -1755,6 +2045,7 @@ impl WinInetStack {
         connect_handle: HINTERNET,
         pattern: &str,
     ) -> AppResult<HINTERNET> {
+        Self::ftp_check_operand(pattern, "pattern")?;
         // Use NLST (name list) with pattern to list files
         let mut data_stream = self.ftp_data_connect(connect_handle)?;
         let nlst_cmd = if pattern.is_empty() || pattern == "*" || pattern == "*.*" {
@@ -1763,9 +2054,7 @@ impl WinInetStack {
             format!("NLST {pattern}")
         };
         let response = self.ftp_command(connect_handle, &nlst_cmd)?;
-        if !response.contains("150") && !response.contains("226") && !response.contains("125") {
-            eprintln!("FTP NLST returned unexpected response: {}", response.trim());
-        }
+        Self::ftp_expect_success(&response, &nlst_cmd)?;
 
         // Read the listing from the data connection
         let listing_data = Self::ftp_read_data(&mut data_stream)?;
@@ -1777,16 +2066,17 @@ impl WinInetStack {
             .filter(|l| !l.is_empty())
             .collect();
 
-        // Store the listing in a new transfer handle
+        // Store the listing (pre-split) in the listing cache so
+        // ftp_find_next_file_w does not re-split it on every call.
         let handle = self.next_handle();
         self.ftp_transfers.insert(
             handle,
             FtpTransfer {
-                session_handle: connect_handle,
+                connection_handle: connect_handle,
                 remote_file: pattern.to_string(),
                 is_passive: true,
                 transfer_type: FtpTransferType::Ascii,
-                local_path: Some(files.join("\n")),
+                local_path: None,
                 context: 0,
             },
         );
@@ -1795,31 +2085,32 @@ impl WinInetStack {
             return Err(AppError::new(ReasonCode::RcIo, "FTP: no files found"));
         }
 
+        let file_infos: Vec<FtpFileInfo> = files
+            .iter()
+            .map(|name| FtpFileInfo {
+                file_name: name.clone(),
+                file_size: 0,
+                last_modified: None,
+                attributes: None,
+                is_directory: false,
+            })
+            .collect();
+        self.ftp_listing_cache.insert(handle, file_infos);
+        self.ftp_listing_index.insert(handle, 0);
+
         Ok(handle)
     }
 
     /// Find the next file on the FTP server in a search started by ftp_find_first_file_w.
     /// Returns the next FtpFileInfo or None when exhausted.
     pub fn ftp_find_next_file_w(&mut self, find_handle: HINTERNET) -> Option<FtpFileInfo> {
-        let transfer = self.ftp_transfers.get(&find_handle)?;
-        let file_list = transfer.local_path.as_ref()?;
-        let files: Vec<&str> = file_list.split('\n').collect();
+        let cache = self.ftp_listing_cache.get(&find_handle)?;
+        let idx = *self.ftp_listing_index.get(&find_handle)?;
 
-        // Use the context field to track the current index
-        let idx = transfer.context as usize;
-        if idx < files.len() {
-            let name = files[idx].to_string();
-            // Update context to next index
-            if let Some(t) = self.ftp_transfers.get_mut(&find_handle) {
-                t.context = (idx + 1) as u64;
-            }
-            Some(FtpFileInfo {
-                file_name: name,
-                file_size: 0,
-                last_modified: None,
-                attributes: None,
-                is_directory: false,
-            })
+        if idx < cache.len() {
+            let info = cache[idx].clone();
+            self.ftp_listing_index.insert(find_handle, idx + 1);
+            Some(info)
         } else {
             None
         }
@@ -1918,10 +2209,10 @@ impl BindStatusCallback {
 
     /// Invoke the callback with a status update.
     pub fn on_progress(&self, status_code: u32, progress: u32, max_progress: u32) {
-        if let Some(cb) = self.callback {
-            if self.notify_flags == 0 || (self.notify_flags & (1 << status_code)) != 0 {
-                cb(self.context, status_code, progress, max_progress);
-            }
+        if let Some(cb) = self.callback
+            && (self.notify_flags == 0 || (self.notify_flags & (1 << status_code)) != 0)
+        {
+            cb(self.context, status_code, progress, max_progress);
         }
     }
 }
@@ -1985,9 +2276,16 @@ impl Default for BindCtx {
 }
 
 // Global registry for bind status callbacks, keyed by context handle.
+// Bounded: entries are evicted (oldest key) once the cap is reached so a
+// guest registering callbacks with fresh context handles cannot grow the map
+// without limit.
 lazy_static::lazy_static! {
-    static ref BIND_STATUS_CALLBACKS: std::sync::Mutex<HashMap<u64, BindStatusCallback>> = std::sync::Mutex::new(HashMap::new());
+    static ref BIND_STATUS_CALLBACKS: std::sync::Mutex<BTreeMap<u64, BindStatusCallback>> =
+        std::sync::Mutex::new(BTreeMap::new());
 }
+
+/// Maximum number of concurrently registered bind status callbacks.
+const MAX_BIND_STATUS_CALLBACKS: usize = 4096;
 
 /// Register a bind status callback for a given context handle.
 ///
@@ -2003,6 +2301,14 @@ pub fn register_bind_status_callback(
         )
     })?;
     callbacks.insert(ctx_handle, callback);
+    while callbacks.len() > MAX_BIND_STATUS_CALLBACKS {
+        // Evict the oldest registered handle.
+        if let Some(oldest) = callbacks.keys().next().copied() {
+            callbacks.remove(&oldest);
+        } else {
+            break;
+        }
+    }
     Ok(())
 }
 
@@ -2032,11 +2338,11 @@ pub fn get_bind_status_callback(ctx_handle: u64) -> Option<BindStatusCallback> {
 /// registered bind status callback (if any).
 pub fn create_url_moniker(url: &str, ctx: Option<&BindCtx>) -> AppResult<Vec<u8>> {
     // Notify: finding resource
-    if let Some(ctx) = ctx {
-        if let Some(cb) = ctx.get_bind_status_callback() {
-            cb.on_progress(BINDSTATUS_FINDINGRESOURCE, 0, 0);
-            cb.on_progress(BINDSTATUS_CONNECTING, 0, 0);
-        }
+    if let Some(ctx) = ctx
+        && let Some(cb) = ctx.get_bind_status_callback()
+    {
+        cb.on_progress(BINDSTATUS_FINDINGRESOURCE, 0, 0);
+        cb.on_progress(BINDSTATUS_CONNECTING, 0, 0);
     }
 
     // Build the reqwest client
@@ -2051,10 +2357,10 @@ pub fn create_url_moniker(url: &str, ctx: Option<&BindCtx>) -> AppResult<Vec<u8>
         })?;
 
     // Notify: sending request
-    if let Some(ctx) = ctx {
-        if let Some(cb) = ctx.get_bind_status_callback() {
-            cb.on_progress(BINDSTATUS_SENDINGREQUEST, 0, 0);
-        }
+    if let Some(ctx) = ctx
+        && let Some(cb) = ctx.get_bind_status_callback()
+    {
+        cb.on_progress(BINDSTATUS_SENDINGREQUEST, 0, 0);
     }
 
     let response = client.get(url).send().map_err(|e| {
@@ -2064,42 +2370,81 @@ pub fn create_url_moniker(url: &str, ctx: Option<&BindCtx>) -> AppResult<Vec<u8>
         )
     })?;
 
-    // Check content length for progress tracking
-    let total_size = response.content_length().unwrap_or(0) as u32;
-
-    // Notify: begin download data
-    if let Some(ctx) = ctx {
-        if let Some(cb) = ctx.get_bind_status_callback() {
-            cb.on_progress(BINDSTATUS_BEGINDOWNLOADDATA, 0, total_size);
-        }
+    // Check content length for progress tracking (and cap the download).
+    let total_size = response.content_length().unwrap_or(0);
+    if total_size > MAX_WININET_RESPONSE_BODY as u64 {
+        return Err(AppError::new(
+            ReasonCode::RcBufferLimitExceeded,
+            format!(
+                "CreateURLMoniker: response content length {total_size} exceeds limit ({MAX_WININET_RESPONSE_BODY})"
+            ),
+        ));
     }
 
-    // Read the response bytes in chunks for progress reporting
+    // Notify: begin download data
+    if let Some(ctx) = ctx
+        && let Some(cb) = ctx.get_bind_status_callback()
+    {
+        cb.on_progress(BINDSTATUS_BEGINDOWNLOADDATA, 0, total_size.min(u32::MAX as u64) as u32);
+    }
+
+    // Stream the response body into `data` with a size cap, reporting
+    // progress per chunk. `usize` counters avoid truncation above 4 GiB.
     let mut data = Vec::new();
-    let mut downloaded: u32 = 0;
+    let mut downloaded: u64 = 0;
     let chunk_size: usize = 8192;
-
-    // Use a cursor-based approach to read in chunks
-    let bytes = response.bytes().unwrap_or_default();
-    let total = bytes.len() as u32;
-
-    for chunk in bytes.chunks(chunk_size) {
-        data.extend_from_slice(chunk);
-        downloaded += chunk.len() as u32;
+    let mut buf = vec![0u8; chunk_size];
+    let mut limited = response.take(MAX_WININET_RESPONSE_BODY as u64 + 1);
+    let mut n = limited
+        .read(&mut buf)
+        .map_err(|e| {
+            AppError::new(
+                ReasonCode::RcNetHttpRequestFailed,
+                format!("CreateURLMoniker: read failed for {url}: {e}"),
+            )
+        })?;
+    while n > 0 {
+        if data.len().saturating_add(n) > MAX_WININET_RESPONSE_BODY {
+            return Err(AppError::new(
+                ReasonCode::RcBufferLimitExceeded,
+                format!(
+                    "CreateURLMoniker: response body exceeds limit ({MAX_WININET_RESPONSE_BODY})"
+                ),
+            ));
+        }
+        data.extend_from_slice(&buf[..n]);
+        downloaded += n as u64;
 
         // Notify: downloading data
-        if let Some(ctx) = ctx {
-            if let Some(cb) = ctx.get_bind_status_callback() {
-                cb.on_progress(BINDSTATUS_DOWNLOADINGDATA, downloaded, total);
-            }
+        if let Some(ctx) = ctx
+            && let Some(cb) = ctx.get_bind_status_callback()
+        {
+            cb.on_progress(
+                BINDSTATUS_DOWNLOADINGDATA,
+                downloaded.min(u32::MAX as u64) as u32,
+                total_size.min(u32::MAX as u64) as u32,
+            );
         }
+
+        n = limited
+            .read(&mut buf)
+            .map_err(|e| {
+                AppError::new(
+                    ReasonCode::RcNetHttpRequestFailed,
+                    format!("CreateURLMoniker: read failed for {url}: {e}"),
+                )
+            })?;
     }
 
     // Notify: end download data
-    if let Some(ctx) = ctx {
-        if let Some(cb) = ctx.get_bind_status_callback() {
-            cb.on_progress(BINDSTATUS_ENDDOWNLOADDATA, total, total);
-        }
+    if let Some(ctx) = ctx
+        && let Some(cb) = ctx.get_bind_status_callback()
+    {
+        cb.on_progress(
+            BINDSTATUS_ENDDOWNLOADDATA,
+            downloaded.min(u32::MAX as u64) as u32,
+            total_size.min(u32::MAX as u64) as u32,
+        );
     }
 
     Ok(data)
@@ -2125,18 +2470,19 @@ pub fn create_url_moniker_ex(url: &str, ctx: Option<&BindCtx>, flags: u32) -> Ap
 
 /// Collapse dot-segments in a URL path per RFC 3986 section 5.2.4.
 ///
-/// Handles "." and ".." segments, removing them and their parent as appropriate.
+/// Handles "." and ".." segments, removing them and their parent as
+/// appropriate. A trailing slash is preserved when the original path had one
+/// (`/a/` stays `/a/`, it is not reduced to `/a`).
 fn collapse_dot_segments(path: &str) -> String {
     let mut segments: Vec<&str> = Vec::new();
     let has_leading_slash = path.starts_with('/');
+    let has_trailing_slash = path.ends_with('/') && path.len() > 1;
 
     for segment in path.split('/') {
         match segment {
             "." | "" => {
-                // Ignore single-dot and empty segments (preserve trailing slash)
-                if segments.is_empty() && has_leading_slash {
-                    // Keep leading slash implicitly
-                }
+                // Ignore single-dot and empty segments (leading slash kept
+                // implicitly; trailing slash restored below).
             }
             ".." => {
                 // Remove the previous segment
@@ -2150,13 +2496,17 @@ fn collapse_dot_segments(path: &str) -> String {
         }
     }
 
-    if segments.is_empty() && has_leading_slash {
+    let mut result = if segments.is_empty() && has_leading_slash {
         "/".to_string()
     } else if has_leading_slash {
         format!("/{}", segments.join("/"))
     } else {
         segments.join("/")
+    };
+    if has_trailing_slash && !result.ends_with('/') {
+        result.push('/');
     }
+    result
 }
 
 #[cfg(test)]
@@ -2218,7 +2568,6 @@ mod tests {
             eprintln!("skipping wininet_simple_http_get: read returned 0");
             let _ = stack.internet_close_handle(req);
             let _ = stack.internet_close_handle(conn);
-            return;
         }
     }
 
@@ -2299,10 +2648,10 @@ mod tests {
         let pin = Sha256::digest(extract_spki_der(&cert).unwrap());
 
         let mut stack = WinInetStack::new();
-        assert!(stack.verify_certificate_pin("steamcdn.example", &[cert.clone()]));
+        assert!(stack.verify_certificate_pin("steamcdn.example", std::slice::from_ref(&cert)));
 
         stack.pin_certificate("steamcdn.example", pin.as_slice());
-        assert!(stack.verify_certificate_pin("steamcdn.example", &[cert.clone()]));
+        assert!(stack.verify_certificate_pin("steamcdn.example", std::slice::from_ref(&cert)));
 
         let other = synthetic_certificate(&build_spki(&[0x11, 0x22, 0x33, 0x44]));
         assert!(!stack.verify_certificate_pin("steamcdn.example", &[other]));
