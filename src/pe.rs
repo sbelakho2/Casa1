@@ -2,9 +2,9 @@ use crate::error::{AppError, AppResult};
 use crate::reason::ReasonCode;
 use roxmltree::Document;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 const IMAGE_DOS_SIGNATURE: u16 = 0x5a4d;
 const IMAGE_NT_SIGNATURE: u32 = 0x0000_4550;
@@ -400,7 +400,7 @@ impl ParsedPe {
     /// IJW assemblies contain native code and a CLR entry point token with the
     /// COMIMAGE_FLAGS_NATIVE_ENTRYPOINT flag set. They require CLR bootstrapping.
     pub fn is_ijw(&self) -> bool {
-        self.clr_header.as_ref().map_or(false, |clr| {
+        self.clr_header.as_ref().is_some_and(|clr| {
             (clr.flags & COMIMAGE_FLAGS_NATIVE_ENTRYPOINT) != 0
         })
     }
@@ -409,7 +409,7 @@ impl ParsedPe {
     pub fn is_il_only(&self) -> bool {
         self.clr_header
             .as_ref()
-            .map_or(false, |clr| (clr.flags & COMIMAGE_FLAGS_ILONLY) != 0)
+            .is_some_and(|clr| (clr.flags & COMIMAGE_FLAGS_ILONLY) != 0)
     }
 }
 
@@ -438,6 +438,19 @@ impl ApiSetResolver {
         let normalized = normalize_module_name(dll_name);
         if let Some(host) = self.explicit.get(&normalized) {
             return host.clone();
+        }
+
+        // ── api-ms-win-core-registry-l1 / registry → advapi32.dll
+        // Registry access via api-ms-win-core-registry goes through advapi32.
+        // Must be checked before the generic api-ms-win-core-* catch-all below.
+        if normalized.starts_with("api-ms-win-core-registry") {
+            return "advapi32.dll".to_string();
+        }
+
+        // ── api-ms-win-core-winrt-string → combase.dll
+        // Must be checked before the generic api-ms-win-core-* catch-all below.
+        if normalized.starts_with("api-ms-win-core-winrt-string") {
+            return "combase.dll".to_string();
         }
 
         // ── api-ms-win-core-* → kernel32.dll ──────────────────────────────
@@ -528,17 +541,6 @@ impl ApiSetResolver {
         // ── api-ms-win-rtcore-* → ntdll.dll
         if normalized.starts_with("api-ms-win-rtcore-") {
             return "ntdll.dll".to_string();
-        }
-
-        // ── api-ms-win-core-registry-l1 / registry → advapi32.dll
-        // Registry access via api-ms-win-core-registry goes through advapi32.
-        if normalized.starts_with("api-ms-win-core-registry") {
-            return "advapi32.dll".to_string();
-        }
-
-        // ── api-ms-win-core-winrt-string → combase.dll
-        if normalized.starts_with("api-ms-win-core-winrt-string") {
-            return "combase.dll".to_string();
         }
 
         // ══════════════════════════════════════════════════════════════════
@@ -756,6 +758,9 @@ pub fn parse(bytes: &[u8]) -> AppResult<ParsedPe> {
     let file_alignment = read_u32(bytes, optional_offset + 36, "file alignment")?;
     let size_of_image = read_u32(bytes, optional_offset + 56, "size of image")?;
     let size_of_headers = read_u32(bytes, optional_offset + 60, "size of headers")?;
+    if size_of_image < size_of_headers {
+        return invalid("SizeOfImage is smaller than SizeOfHeaders");
+    }
     // Subsystem is at offset 68 from optional header (same for PE32 and PE32+)
     let subsystem = read_u16(bytes, optional_offset + 68, "subsystem")?;
     let dll_characteristics = read_u16(bytes, optional_offset + 70, "DLL characteristics")?;
@@ -767,9 +772,13 @@ pub fn parse(bytes: &[u8]) -> AppResult<ParsedPe> {
     let available_directories =
         ((size_of_optional_header - data_directory_offset) / 8).min(number_of_rva_and_sizes);
     let mut data_directories = vec![DataDirectory::default(); 16.max(available_directories)];
-    for index in 0..available_directories {
+    for (index, slot) in data_directories
+        .iter_mut()
+        .take(available_directories)
+        .enumerate()
+    {
         let directory_offset = optional_offset + data_directory_offset + index * 8;
-        data_directories[index] = DataDirectory {
+        *slot = DataDirectory {
             virtual_address: read_u32(bytes, directory_offset, "data directory RVA")?,
             size: read_u32(bytes, directory_offset + 4, "data directory size")?,
         };
@@ -920,8 +929,16 @@ pub fn map_image(
     dtm: bool,
 ) -> AppResult<MappedImage> {
     let selected_base = select_image_base(image, image_hash, dtm);
-    let mut memory = vec![0u8; image.size_of_image as usize];
+    let image_size = image.size_of_image as usize;
     let headers_size = image.size_of_headers as usize;
+    if headers_size > image_size {
+        return invalid("SizeOfHeaders exceeds SizeOfImage");
+    }
+    let mut memory = Vec::new();
+    memory
+        .try_reserve_exact(image_size)
+        .map_err(|_| pe_error("SizeOfImage is too large to map"))?;
+    memory.resize(image_size, 0);
     memory[..headers_size].copy_from_slice(slice(bytes, 0, headers_size, "headers")?);
 
     let mut mappings = Vec::with_capacity(image.sections.len());
@@ -1016,22 +1033,23 @@ pub fn resolve_imports(
     resolver: &ApiSetResolver,
 ) -> AppResult<Vec<ResolvedImport>> {
     let mut resolved = Vec::new();
+    let mut index_cache = HashMap::new();
     for descriptor in image.imports.iter().chain(image.delay_imports.iter()) {
         let resolved_module = resolver.resolve(&descriptor.dll_name);
-        let exports = export_tables.get(&resolved_module).ok_or_else(|| {
-            AppError::new(
+        if !export_tables.contains_key(&resolved_module) {
+            return Err(AppError::new(
                 ReasonCode::RcImportMissing,
                 format!("missing import provider {resolved_module}"),
-            )
-        })?;
+            ));
+        }
         for thunk in &descriptor.imports {
             let export = resolve_export_symbol(
                 &thunk.symbol,
                 &resolved_module,
                 export_tables,
-                exports,
                 resolver,
                 &mut BTreeSet::new(),
+                &mut index_cache,
             )?;
             resolved.push(ResolvedImport {
                 requested_module: descriptor.dll_name.clone(),
@@ -1051,9 +1069,10 @@ pub fn resolve_delay_imports(
     resolver: &ApiSetResolver,
 ) -> AppResult<Vec<DelayLoadResult>> {
     let mut results = Vec::new();
+    let mut index_cache = HashMap::new();
     for descriptor in &image.delay_imports {
         let resolved_module = resolver.resolve(&descriptor.dll_name);
-        let Some(exports) = export_tables.get(&resolved_module) else {
+        if !export_tables.contains_key(&resolved_module) {
             for thunk in &descriptor.imports {
                 results.push(DelayLoadResult {
                     requested_module: descriptor.dll_name.clone(),
@@ -1066,15 +1085,15 @@ pub fn resolve_delay_imports(
                 });
             }
             continue;
-        };
+        }
         for thunk in &descriptor.imports {
             let outcome = match lookup_export_symbol(
                 &thunk.symbol,
                 &resolved_module,
                 export_tables,
-                exports,
                 resolver,
                 &mut BTreeSet::new(),
+                &mut index_cache,
             ) {
                 Ok(export) => DelayLoadOutcome::Resolved(export),
                 Err(ExportLookupFailure::MissingProvider(_)) => {
@@ -1342,6 +1361,9 @@ pub fn find_activation_context_section(
     search_string: &str,
 ) -> Option<ActCtxSectionResult> {
     let search_lower = search_string.to_lowercase();
+    if search_lower.is_empty() {
+        return None;
+    }
 
     // Walk the stack from most recently activated to least recently
     for &handle in stack.iter().rev() {
@@ -1352,8 +1374,8 @@ pub fn find_activation_context_section(
                 // Search for an assembly whose name matches the search string
                 if let Some(ref manifest) = ctx.manifest_info {
                     for assembly in &manifest.assemblies {
-                        if assembly.name.to_lowercase() == search_lower
-                            || assembly.name.to_lowercase().contains(&search_lower)
+                        let assembly_lower = assembly.name.to_lowercase();
+                        if assembly_lower == search_lower || assembly_lower.contains(&search_lower)
                         {
                             return Some(ActCtxSectionResult {
                                 section_id,
@@ -1382,7 +1404,7 @@ pub fn find_activation_context_section(
                         for &(name, dlls) in known_sxs_assembly_dlls() {
                             if assembly.name == name {
                                 for dll in dlls {
-                                    if dll.to_lowercase() == *dll_name {
+                                    if *dll == dll_name.as_str() {
                                         let dll_path = ctx
                                             .assembly_directory
                                             .as_ref()
@@ -1402,18 +1424,21 @@ pub fn find_activation_context_section(
                         // Also check if the assembly name itself matches the DLL base name
                         // (e.g., searching for "comctl32.dll" in "Microsoft.Windows.Common-Controls")
                         let base_dll = dll_name.trim_end_matches(".dll");
-                        if assembly.name.to_lowercase().contains(base_dll) {
-                            let dll_path = ctx
-                                .assembly_directory
-                                .as_ref()
-                                .map(|dir| format!("{}/{}", dir, dll_name));
-                            return Some(ActCtxSectionResult {
-                                section_id,
-                                assembly_identity: Some(assembly.clone()),
-                                dll_path,
-                                context_handle: handle,
-                                assembly_directory: ctx.assembly_directory.clone(),
-                            });
+                        if !base_dll.is_empty() {
+                            let assembly_lower = assembly.name.to_lowercase();
+                            if assembly_lower.contains(base_dll) {
+                                let dll_path = ctx
+                                    .assembly_directory
+                                    .as_ref()
+                                    .map(|dir| format!("{}/{}", dir, dll_name));
+                                return Some(ActCtxSectionResult {
+                                    section_id,
+                                    assembly_identity: Some(assembly.clone()),
+                                    dll_path,
+                                    context_handle: handle,
+                                    assembly_directory: ctx.assembly_directory.clone(),
+                                });
+                            }
                         }
                     }
                 }
@@ -1442,6 +1467,60 @@ enum ExportLookupFailure {
     Parser(AppError),
 }
 
+/// Indexed view of a module's export table for O(1) name/ordinal lookups.
+struct ExportIndex<'a> {
+    exports: &'a [ExportSymbol],
+    by_name: HashMap<&'a str, usize>,
+    by_ordinal: HashMap<u32, usize>,
+}
+
+impl<'a> ExportIndex<'a> {
+    fn build(exports: &'a [ExportSymbol]) -> Self {
+        let mut by_name = HashMap::new();
+        let mut by_ordinal = HashMap::new();
+        for (index, export) in exports.iter().enumerate() {
+            if let Some(name) = export.name.as_deref() {
+                by_name.entry(name).or_insert(index);
+            }
+            by_ordinal.entry(export.ordinal).or_insert(index);
+        }
+        Self {
+            exports,
+            by_name,
+            by_ordinal,
+        }
+    }
+
+    fn lookup(&self, symbol: &ImportSymbol) -> Option<&'a ExportSymbol> {
+        match symbol {
+            ImportSymbol::ByName { name, .. } => self
+                .by_name
+                .get(name.as_str())
+                .map(|&index| &self.exports[index]),
+            ImportSymbol::ByOrdinal { ordinal } => self
+                .by_ordinal
+                .get(&(*ordinal as u32))
+                .map(|&index| &self.exports[index]),
+        }
+    }
+}
+
+fn export_index_for<'a, 'b>(
+    module: &str,
+    export_tables: &'a BTreeMap<String, Vec<ExportSymbol>>,
+    index_cache: &'b mut HashMap<String, ExportIndex<'a>>,
+) -> Result<&'b ExportIndex<'a>, ExportLookupFailure> {
+    if !index_cache.contains_key(module) {
+        let exports = export_tables
+            .get(module)
+            .ok_or_else(|| ExportLookupFailure::MissingProvider(module.to_string()))?;
+        index_cache.insert(module.to_string(), ExportIndex::build(exports));
+    }
+    index_cache
+        .get(module)
+        .ok_or_else(|| ExportLookupFailure::Parser(pe_error("export index cache is inconsistent")))
+}
+
 fn parse_debug_entries(
     bytes: &[u8],
     sections: &[PeSection],
@@ -1454,9 +1533,6 @@ fn parse_debug_entries(
         .unwrap_or_default();
     if directory.virtual_address == 0 || directory.size == 0 {
         return Ok(Vec::new());
-    }
-    if directory.size % 28 != 0 {
-        return invalid("debug directory size is not aligned to IMAGE_DEBUG_DIRECTORY entries");
     }
     let offset = rva_to_file_offset(
         directory.virtual_address,
@@ -1710,15 +1786,15 @@ fn parse_delay_import_directory(
     if directory.virtual_address == 0 || directory.size == 0 {
         return Ok(Vec::new());
     }
-    if directory.size % 32 != 0 {
-        return invalid(
-            "delay import descriptor size is not aligned to IMAGE_DELAYLOAD_DESCRIPTOR",
-        );
-    }
     let mut descriptors = Vec::new();
     let mut offset = rva_to_file_offset(directory.virtual_address, 32, sections, 0)?;
     let end = offset + directory.size as usize;
+    let mut iterations = 0usize;
     while offset + 32 <= end {
+        iterations += 1;
+        if iterations > 4096 {
+            return invalid("delay import descriptor table exceeded the safety limit");
+        }
         let name_rva = read_u32(bytes, offset + 4, "delay import DLL name RVA")?;
         let iat_rva = read_u32(bytes, offset + 12, "delay import IAT RVA")?;
         let int_rva = read_u32(bytes, offset + 16, "delay import INT RVA")?;
@@ -1760,7 +1836,12 @@ fn parse_bound_import_directory(
     let mut descriptors = Vec::new();
     let mut offset = rva_to_file_offset(directory.virtual_address, 8, sections, size_of_headers)?;
     let end = offset + directory.size as usize;
+    let mut iterations = 0usize;
     while offset + 8 <= end {
+        iterations += 1;
+        if iterations > 4096 {
+            return invalid("bound import descriptor table exceeded the safety limit");
+        }
         let time_date_stamp = read_u32(bytes, offset, "bound import TimeDateStamp")?;
         if time_date_stamp == 0 {
             break; // Terminator descriptor
@@ -1955,8 +2036,14 @@ fn parse_export_directory(
     let address_of_names = read_u32(bytes, offset + 32, "AddressOfNames")?;
     let address_of_name_ordinals = read_u32(bytes, offset + 36, "AddressOfNameOrdinals")?;
 
+    // Every entry in these tables occupies at least 2 bytes in the file, so a
+    // count larger than bytes.len() / 4 cannot be backed by real data. Clamp to
+    // keep untrusted counts from driving unbounded loops and allocations.
+    let name_count = number_of_names.min(bytes.len() / 4);
+    let function_count = number_of_functions.min(bytes.len() / 4);
+
     let mut names_by_index = BTreeMap::new();
-    for index in 0..number_of_names {
+    for index in 0..name_count {
         let name_rva =
             read_u32_at_rva(bytes, sections, address_of_names, index, "export name RVA")?;
         let ordinal_index = read_u16_at_rva(
@@ -1970,8 +2057,11 @@ fn parse_export_directory(
         names_by_index.insert(ordinal_index, name);
     }
 
-    let mut exports = Vec::with_capacity(number_of_functions);
-    for function_index in 0..number_of_functions {
+    let mut exports = Vec::new();
+    exports
+        .try_reserve_exact(function_count)
+        .map_err(|_| pe_error("export table is too large to parse"))?;
+    for function_index in 0..function_count {
         let function_rva = read_u32_at_rva(
             bytes,
             sections,
@@ -2027,7 +2117,7 @@ fn parse_relocations(
         if block_size < 8 || cursor + block_size > end {
             return invalid("relocation block exceeds directory bounds");
         }
-        if (block_size - 8) % 2 != 0 {
+        if !(block_size - 8).is_multiple_of(2) {
             return invalid("relocation block has a truncated entry");
         }
         let mut entries = Vec::new();
@@ -2091,10 +2181,12 @@ fn parse_tls_directory(
     let callbacks = if address_of_callbacks == 0 {
         Vec::new()
     } else {
-        let callbacks_rva = address_of_callbacks
-            .checked_sub(image_base)
-            .ok_or_else(|| pe_error("TLS callback VA is below image base"))?
-            as u32;
+        let callbacks_rva = u32::try_from(
+            address_of_callbacks
+                .checked_sub(image_base)
+                .ok_or_else(|| pe_error("TLS callback VA is below image base"))?,
+        )
+        .map_err(|_| pe_error("TLS callback VA does not fit in RVA space"))?;
         read_callback_array(bytes, sections, callbacks_rva, pointer_bytes)?
     };
     Ok(Some(TlsDirectory {
@@ -2223,7 +2315,7 @@ fn decode_manifest_bytes(bytes: &[u8]) -> AppResult<String> {
 }
 
 fn decode_utf16(bytes: &[u8]) -> AppResult<String> {
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         return invalid("UTF-16 payload has an odd byte length");
     }
     let words = bytes
@@ -2280,13 +2372,12 @@ fn parse_version_info_blob(bytes: &[u8]) -> AppResult<VersionInfo> {
 
 fn parse_string_file_info(
     bytes: &[u8],
-    block_offset: usize,
+    _block_offset: usize,
     after_key: usize,
     block_end: usize,
     version: &mut VersionInfo,
 ) -> AppResult<()> {
     let mut cursor = align4(after_key)?;
-    let _block_offset = block_offset;
     while cursor + 6 <= block_end {
         let table_length = read_u16(bytes, cursor, "string table length")? as usize;
         if table_length == 0 || cursor + table_length > block_end {
@@ -2376,6 +2467,12 @@ fn find_resource_data_entry(
     target_id: Option<u32>,
     depth: u8,
 ) -> AppResult<Option<(u32, u32)>> {
+    // Bound recursion depth: a crafted resource tree with cyclic subdirectory
+    // pointers must not overflow the stack. The Windows resource tree is at
+    // most 3 levels deep (type → name → language), so 4 is generous.
+    if depth > 4 {
+        return Ok(None);
+    }
     let relative = directory_rva
         .checked_sub(section_rva)
         .ok_or_else(|| pe_error("resource directory underflow"))? as usize;
@@ -2395,10 +2492,10 @@ fn find_resource_data_entry(
         let entry_offset = relative + 16 + index * 8;
         checked_range(resource_section_bytes, entry_offset, 8, "resource entry")?;
         let name = read_u32(resource_section_bytes, entry_offset, "resource entry name")?;
-        if let Some(expected_id) = target_id {
-            if name & 0x8000_0000 != 0 || (name & 0xffff) != expected_id {
-                continue;
-            }
+        if let Some(expected_id) = target_id
+            && (name & 0x8000_0000 != 0 || (name & 0xffff) != expected_id)
+        {
+            continue;
         }
         let payload = read_u32(
             resource_section_bytes,
@@ -2499,7 +2596,9 @@ fn read_import_thunks(
         };
         imports.push(ImportThunk {
             symbol,
-            iat_rva: iat_rva + (index as u32 * pointer_bytes as u32),
+            iat_rva: iat_rva
+                .checked_add((index as u32).saturating_mul(pointer_bytes as u32))
+                .ok_or_else(|| pe_error("IAT RVA overflow"))?,
         });
         index += 1;
     }
@@ -2535,21 +2634,21 @@ fn read_callback_array(
     Ok(callbacks)
 }
 
-fn resolve_export_symbol(
+fn resolve_export_symbol<'a>(
     symbol: &ImportSymbol,
     current_module: &str,
-    export_tables: &BTreeMap<String, Vec<ExportSymbol>>,
-    exports: &[ExportSymbol],
+    export_tables: &'a BTreeMap<String, Vec<ExportSymbol>>,
     resolver: &ApiSetResolver,
     visited: &mut BTreeSet<String>,
+    index_cache: &mut HashMap<String, ExportIndex<'a>>,
 ) -> AppResult<ExportSymbol> {
     match lookup_export_symbol(
         symbol,
         current_module,
         export_tables,
-        exports,
         resolver,
         visited,
+        index_cache,
     ) {
         Ok(export) => Ok(export),
         Err(ExportLookupFailure::MissingProvider(module)) => Err(AppError::new(
@@ -2564,13 +2663,13 @@ fn resolve_export_symbol(
     }
 }
 
-fn lookup_export_symbol(
+fn lookup_export_symbol<'a>(
     symbol: &ImportSymbol,
     current_module: &str,
-    export_tables: &BTreeMap<String, Vec<ExportSymbol>>,
-    exports: &[ExportSymbol],
+    export_tables: &'a BTreeMap<String, Vec<ExportSymbol>>,
     resolver: &ApiSetResolver,
     visited: &mut BTreeSet<String>,
+    index_cache: &mut HashMap<String, ExportIndex<'a>>,
 ) -> Result<ExportSymbol, ExportLookupFailure> {
     let lookup_key = format!("{}::{symbol:?}", current_module);
     if !visited.insert(lookup_key) {
@@ -2578,36 +2677,26 @@ fn lookup_export_symbol(
             "export forwarder cycle detected",
         )));
     }
-    let export = match symbol {
-        ImportSymbol::ByName { name, .. } => exports
-            .iter()
-            .find(|export| export.name.as_deref() == Some(name.as_str()))
-            .cloned(),
-        ImportSymbol::ByOrdinal { ordinal } => exports
-            .iter()
-            .find(|export| export.ordinal == *ordinal as u32)
-            .cloned(),
-    }
-    .ok_or_else(|| {
-        ExportLookupFailure::MissingSymbol(format!("{symbol:?} from {current_module}"))
-    })?;
+    let export = export_index_for(current_module, export_tables, index_cache)?
+        .lookup(symbol)
+        .cloned()
+        .ok_or_else(|| {
+            ExportLookupFailure::MissingSymbol(format!("{symbol:?} from {current_module}"))
+        })?;
 
     match &export.target {
         ExportTarget::Rva(_) => Ok(export),
         ExportTarget::Forwarder(forwarder) => {
             let (module_name, forwarded_symbol) =
-                parse_forwarder_string(forwarder).map_err(ExportLookupFailure::Parser)?;
+                parse_forwarder_string(forwarder.as_str()).map_err(ExportLookupFailure::Parser)?;
             let resolved_module = resolver.resolve(&module_name);
-            let next_exports = export_tables
-                .get(&resolved_module)
-                .ok_or_else(|| ExportLookupFailure::MissingProvider(resolved_module.clone()))?;
             lookup_export_symbol(
                 &forwarded_symbol,
                 &resolved_module,
                 export_tables,
-                next_exports,
                 resolver,
                 visited,
+                index_cache,
             )
         }
     }
@@ -2669,25 +2758,44 @@ fn parse_forwarder_string(value: &str) -> AppResult<(String, ImportSymbol)> {
 }
 
 fn visit_module(
-    module: &str,
+    root: &str,
     dependencies: &BTreeMap<String, Vec<String>>,
     visiting: &mut BTreeSet<String>,
     visited: &mut BTreeSet<String>,
     load_order: &mut Vec<String>,
 ) -> AppResult<()> {
-    if visited.contains(module) {
-        return Ok(());
+    // Iterative post-order DFS with an explicit worklist so that very deep
+    // dependency chains (which are attacker-influenceable through import
+    // tables) cannot overflow the call stack.
+    enum Frame {
+        Enter(String),
+        Exit(String),
     }
-    if !visiting.insert(module.to_string()) {
-        return invalid(format!("dependency cycle detected at {module}"));
+    let mut stack = vec![Frame::Enter(root.to_string())];
+    while let Some(frame) = stack.pop() {
+        match frame {
+            Frame::Enter(module) => {
+                if visited.contains(&module) {
+                    continue;
+                }
+                if !visiting.insert(module.clone()) {
+                    return invalid(format!("dependency cycle detected at {module}"));
+                }
+                stack.push(Frame::Exit(module.clone()));
+                for dependency in dependencies.get(&module).into_iter().flatten().rev() {
+                    let dependency = normalize_module_name(dependency);
+                    if !visited.contains(&dependency) {
+                        stack.push(Frame::Enter(dependency));
+                    }
+                }
+            }
+            Frame::Exit(module) => {
+                visiting.remove(&module);
+                visited.insert(module.clone());
+                load_order.push(module);
+            }
+        }
     }
-    for dependency in dependencies.get(module).into_iter().flatten() {
-        let dependency = normalize_module_name(dependency);
-        visit_module(&dependency, dependencies, visiting, visited, load_order)?;
-    }
-    visiting.remove(module);
-    visited.insert(module.to_string());
-    load_order.push(module.to_string());
     Ok(())
 }
 
@@ -2739,9 +2847,6 @@ fn rva_to_file_offset(
     sections: &[PeSection],
     size_of_headers: u32,
 ) -> AppResult<usize> {
-    if size == 0 {
-        return Ok(rva as usize);
-    }
     if size_of_headers > 0 {
         let end = rva
             .checked_add(size)
@@ -2756,12 +2861,12 @@ fn rva_to_file_offset(
     Ok(section.raw_data_ptr as usize + relative as usize)
 }
 
-fn section_for_rva<'a>(
-    sections: &'a [PeSection],
+fn section_for_rva(
+    sections: &[PeSection],
     rva: u32,
     size: u32,
     allow_virtual_padding: bool,
-) -> Option<&'a PeSection> {
+) -> Option<&PeSection> {
     sections.iter().find(|section| {
         let start = section.virtual_address;
         let max_size = if allow_virtual_padding {
@@ -2769,8 +2874,8 @@ fn section_for_rva<'a>(
         } else {
             section.raw_data_size
         };
-        let end = start.checked_add(max_size).unwrap_or(u32::MAX);
-        let requested_end = rva.checked_add(size).unwrap_or(u32::MAX);
+        let end = start.saturating_add(max_size);
+        let requested_end = rva.saturating_add(size);
         rva >= start && requested_end <= end
     })
 }
@@ -2842,6 +2947,9 @@ fn read_c_string_from_rva(
 }
 
 fn read_c_string(bytes: &[u8], offset: usize, label: &str) -> AppResult<String> {
+    if offset > bytes.len() {
+        return invalid(format!("{label} starts past end of file"));
+    }
     let end = bytes[offset..]
         .iter()
         .position(|value| *value == 0)
@@ -3580,15 +3688,6 @@ fn get_resource_section_data(
     Ok(section_bytes[offset..end].to_vec())
 }
 
-#[allow(dead_code)]
-fn _external_manifest_path(path: &Path) -> PathBuf {
-    let file_name = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default();
-    path.with_file_name(format!("{file_name}.manifest"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3933,6 +4032,16 @@ mod e5_pe_parser_tests {
         assert!(result.is_err(), "expected Err, got {result:?}");
     }
 
+    #[test]
+    fn parse_rejects_size_of_image_smaller_than_headers() {
+        let mut buf = build_minimal_pe32();
+        let opt_off = 0x80 + 24;
+        // SizeOfImage=0x200 < SizeOfHeaders=0x400 — would crash map_image
+        buf[opt_off + 56..opt_off + 60].copy_from_slice(&0x200_u32.to_le_bytes());
+        let result = parse(&buf);
+        assert!(result.is_err(), "expected Err, got {result:?}");
+    }
+
     // ── Debug directory ──────────────────────────────────────────────────
 
     #[test]
@@ -3944,7 +4053,7 @@ mod e5_pe_parser_tests {
     }
 
     #[test]
-    fn parse_debug_entries_rejects_misaligned_size() {
+    fn parse_debug_entries_tolerates_trailing_padding() {
         let sections = &[make_section(
             0x1000,
             0x200,
@@ -3955,9 +4064,9 @@ mod e5_pe_parser_tests {
         )];
         let directories = &[DataDirectory::default(); 7];
         let mut dirs = directories.to_vec();
-        dirs[6] = make_directory(0x1000, 30); // 30 is not a multiple of 28
-        let result = parse_debug_entries(&[0u8; 0x200], sections, &dirs, 0);
-        assert!(result.is_err(), "expected Err, got {result:?}");
+        dirs[6] = make_directory(0x1000, 30); // 30 = one 28-byte entry + 2 bytes of padding
+        let entries = parse_debug_entries(&[0u8; 0x200], sections, &dirs, 0).unwrap();
+        assert_eq!(entries.len(), 1);
     }
 
     #[test]
@@ -4029,7 +4138,7 @@ mod e5_pe_parser_tests {
     }
 
     #[test]
-    fn parse_delay_import_directory_rejects_misaligned_size() {
+    fn parse_delay_import_directory_tolerates_trailing_padding() {
         let sections = &[make_section(
             0x1000,
             0x100,
@@ -4040,9 +4149,11 @@ mod e5_pe_parser_tests {
         )];
         // Directory index 13 for delay import
         let mut dirs = vec![DataDirectory::default(); 14];
-        dirs[13] = make_directory(0x1000, 33); // 33 is not a multiple of 32
-        let result = parse_delay_import_directory(&[0u8; 0x100], sections, &dirs, 0, 4);
-        assert!(result.is_err(), "expected Err, got {result:?}");
+        dirs[13] = make_directory(0x1000, 33); // 33 = one 32-byte descriptor + 1 byte of padding
+        let bytes = vec![0u8; 0x100];
+        // All-zero descriptor is a terminator, so parsing succeeds with no entries.
+        let result = parse_delay_import_directory(&bytes, sections, &dirs, 0, 4).unwrap();
+        assert!(result.is_empty());
     }
 
     #[test]
@@ -4282,12 +4393,50 @@ mod e5_pe_parser_tests {
         assert!(tls.callbacks.is_empty());
     }
 
+    #[test]
+    fn parse_tls_directory_rejects_callback_va_outside_rva_space() {
+        let sections = &[make_section(
+            0x1000,
+            0x100,
+            0,
+            0x100,
+            ".tls",
+            IMAGE_SCN_MEM_READ,
+        )];
+        let mut dirs = vec![DataDirectory::default(); 10];
+        dirs[9] = make_directory(0x1000, 40);
+        let mut bytes = vec![0u8; 0x100];
+        // PE32+ TLS directory
+        write_u64(&mut bytes, 0, 0x3000).unwrap();
+        write_u64(&mut bytes, 8, 0x3100).unwrap();
+        write_u64(&mut bytes, 16, 0x4000).unwrap();
+        // address_of_callbacks = image_base + 4 GiB: the RVA delta does not
+        // fit in u32 and must error instead of truncating.
+        write_u64(&mut bytes, 24, 0x0040_0000_0000_0000 + 0x1_0000_0000).unwrap();
+        let result = parse_tls_directory(&bytes, sections, &dirs, 0x0040_0000_0000_0000, 8);
+        assert!(result.is_err(), "expected Err, got {result:?}");
+    }
+
     // ── Version info ─────────────────────────────────────────────────────
 
     #[test]
     fn parse_version_resource_default_when_missing() {
         let result = parse_version_resource(b"", &[], &[]).unwrap();
         assert_eq!(result, VersionInfo::default());
+    }
+
+    #[test]
+    fn find_resource_data_entry_terminates_on_cyclic_tree() {
+        // A resource directory whose single entry points back to itself
+        // (payload = 0x8000_0000 | 0). Without the depth guard this recurses
+        // forever and overflows the stack.
+        let mut bytes = vec![0u8; 0x28];
+        write_u16(&mut bytes, 12, 0).unwrap(); // named entry count
+        write_u16(&mut bytes, 14, 1).unwrap(); // id entry count
+        write_u32(&mut bytes, 16, RT_VERSION).unwrap(); // entry name
+        write_u32(&mut bytes, 20, 0x8000_0000).unwrap(); // subdirectory → self
+        let result = find_resource_data_entry(&bytes, 0x1000, 0x1000, 0x1000, Some(RT_VERSION), 0);
+        assert_eq!(result.unwrap(), None);
     }
 
     // ── Embedded manifest ────────────────────────────────────────────────
@@ -4360,6 +4509,24 @@ mod e5_pe_parser_tests {
         bytes[0x400..0x408].copy_from_slice(b"section!");
         let mapped = map_image(&bytes, &pe, "abc", false).unwrap();
         assert_eq!(&mapped.memory[0x1000..0x1008], b"section!");
+    }
+
+    #[test]
+    fn map_image_rejects_headers_larger_than_image() {
+        let pe = ParsedPe {
+            size_of_image: 0x200,
+            size_of_headers: 0x400,
+            sections: vec![],
+            image_base: 0x0040_0000,
+            relocations: vec![],
+            section_alignment: 0x1000,
+            file_alignment: 0x0200,
+            dll_characteristics: 0,
+            ..pe_stub()
+        };
+        let bytes = vec![0u8; 0x400];
+        let result = map_image(&bytes, &pe, "abc", false);
+        assert!(result.is_err(), "expected Err, got {result:?}");
     }
 
     // ── apply_relocations ────────────────────────────────────────────────
@@ -4546,6 +4713,23 @@ mod e5_pe_parser_tests {
         );
     }
 
+    #[test]
+    fn plan_lifecycle_handles_deep_dependency_chain() {
+        // A 10k-deep chain would overflow the old recursive implementation.
+        let depth = 10_000usize;
+        let mut deps = BTreeMap::new();
+        for index in 0..depth {
+            deps.insert(
+                format!("m{index:05}.dll"),
+                vec![format!("m{:05}.dll", index + 1)],
+            );
+        }
+        let plan = plan_lifecycle("m00000.dll", &deps, &BTreeMap::new()).unwrap();
+        assert_eq!(plan.load_order.len(), depth + 1);
+        assert_eq!(plan.load_order[0], "m10000.dll");
+        assert_eq!(plan.load_order[depth], "m00000.dll");
+    }
+
     // ── ApiSetResolver ───────────────────────────────────────────────────
 
     #[test]
@@ -4585,6 +4769,24 @@ mod e5_pe_parser_tests {
     fn api_set_resolver_prefers_explicit_mapping() {
         let resolver = ApiSetResolver::new().with_mapping("api-ms-win-core-foo.dll", "custom.dll");
         assert_eq!(resolver.resolve("api-ms-win-core-foo.dll"), "custom.dll");
+    }
+
+    #[test]
+    fn api_set_resolver_maps_core_registry_to_advapi32() {
+        let resolver = ApiSetResolver::new();
+        assert_eq!(
+            resolver.resolve("api-ms-win-core-registry-l1-1-0.dll"),
+            "advapi32.dll"
+        );
+    }
+
+    #[test]
+    fn api_set_resolver_maps_core_winrt_string_to_combase() {
+        let resolver = ApiSetResolver::new();
+        assert_eq!(
+            resolver.resolve("api-ms-win-core-winrt-string-l1-1-0.dll"),
+            "combase.dll"
+        );
     }
 
     // ── normalize_module_name ────────────────────────────────────────────
@@ -4683,6 +4885,28 @@ mod e5_pe_parser_tests {
         let sections = &[];
         let result = rva_to_file_offset(0x1000, 4, sections, 0);
         assert!(result.is_err(), "expected Err, got {result:?}");
+    }
+
+    #[test]
+    fn rva_to_file_offset_rejects_unbacked_zero_size_rva() {
+        // size == 0 must not fall back to treating the raw RVA as a file offset.
+        let sections = &[];
+        let result = rva_to_file_offset(0x1000, 0, sections, 0);
+        assert!(result.is_err(), "expected Err, got {result:?}");
+    }
+
+    #[test]
+    fn rva_to_file_offset_zero_size_within_section() {
+        let sections = &[make_section(
+            0x1000,
+            0x100,
+            0x400,
+            8,
+            ".text",
+            IMAGE_SCN_MEM_READ,
+        )];
+        let offset = rva_to_file_offset(0x1004, 0, sections, 0).unwrap();
+        assert_eq!(offset, 0x404);
     }
 
     #[test]
@@ -4965,6 +5189,25 @@ mod e5_pe_parser_tests {
         assert!(thunks.is_empty());
     }
 
+    #[test]
+    fn read_import_thunks_rejects_iat_rva_overflow() {
+        let sections = &[make_section(
+            0x1000,
+            0x100,
+            0,
+            0x100,
+            ".idata",
+            IMAGE_SCN_MEM_READ,
+        )];
+        let mut bytes = vec![0u8; 0x100];
+        // Two thunks: IAT slots would be 0xFFFF_FFFF and 0xFFFF_FFFF + 4.
+        write_u32(&mut bytes, 0, 0x8000_0001).unwrap();
+        write_u32(&mut bytes, 4, 0x8000_0002).unwrap();
+        write_u32(&mut bytes, 8, 0).unwrap(); // terminator
+        let result = read_import_thunks(&bytes, sections, 0x1000, 0xFFFF_FFFF, 0, 4);
+        assert!(result.is_err(), "expected Err, got {result:?}");
+    }
+
     // ── Bound import parsing ─────────────────────────────────────────────
 
     #[test]
@@ -5160,6 +5403,70 @@ mod e5_pe_parser_tests {
         assert_eq!(ctx.source, "test");
         assert!(ctx.assembly_directory.is_none());
         assert!(ctx.manifest_info.is_none());
+    }
+
+    #[test]
+    fn test_activation_context_dll_redirection_ignores_literal_dll() {
+        // Searching for the literal ".dll" must not spuriously match the
+        // first assembly via the empty base-name fallback.
+        let ctx = super::ActivationContext {
+            handle: 1,
+            cookie: 0,
+            source: "test".to_string(),
+            assembly_directory: Some("C:\\test".to_string()),
+            manifest_info: Some(super::ManifestInfo {
+                source: super::ManifestSource::Embedded,
+                supported_os: vec![],
+                dpi_awareness: None,
+                assemblies: vec![super::AssemblyIdentity {
+                    name: "Microsoft.Windows.Common-Controls".to_string(),
+                    version: None,
+                    processor_architecture: None,
+                    public_key_token: None,
+                    type_attr: None,
+                }],
+            }),
+        };
+        let mut contexts = BTreeMap::new();
+        contexts.insert(1, ctx);
+        let result = super::find_activation_context_section(
+            &contexts,
+            &[1],
+            sxs_section::DLL_REDIRECTION,
+            ".dll",
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_activation_context_empty_search_matches_nothing() {
+        let ctx = super::ActivationContext {
+            handle: 1,
+            cookie: 0,
+            source: "test".to_string(),
+            assembly_directory: None,
+            manifest_info: Some(super::ManifestInfo {
+                source: super::ManifestSource::Embedded,
+                supported_os: vec![],
+                dpi_awareness: None,
+                assemblies: vec![super::AssemblyIdentity {
+                    name: "Microsoft.Windows.Common-Controls".to_string(),
+                    version: None,
+                    processor_architecture: None,
+                    public_key_token: None,
+                    type_attr: None,
+                }],
+            }),
+        };
+        let mut contexts = BTreeMap::new();
+        contexts.insert(1, ctx);
+        let result = super::find_activation_context_section(
+            &contexts,
+            &[1],
+            sxs_section::ASSEMBLY_INFORMATION,
+            "",
+        );
+        assert!(result.is_none());
     }
 
     // ── PE import resolution tests ──────────────────────────────────────────
