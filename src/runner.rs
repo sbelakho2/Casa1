@@ -120,10 +120,14 @@ pub fn execute_job(job: &RunnerJob) -> AppResult<RunnerOutcome> {
             return Err(e);
         }
     };
-    if job.program.exists() {
-        if let Some(report) = detect_driver_requirement_on_disk(&job.program)? {
-            return Err(driver_requirement_error(&report));
-        }
+    let driver_report = job
+        .program
+        .exists()
+        .then(|| detect_driver_requirement_on_disk(&job.program))
+        .transpose()?
+        .flatten();
+    if let Some(report) = driver_report {
+        return Err(driver_requirement_error(&report));
     }
     let started = SystemTime::now();
     let before_files = ge.snapshot_files(job.dtm, started)?;
@@ -210,12 +214,16 @@ pub fn execute_job(job: &RunnerJob) -> AppResult<RunnerOutcome> {
                 .map(String::as_str),
         )?;
         steam_client.materialize_into_ge(&mut ge, job.dtm)?;
+        let launched =
+            steam_result.launch.input_ok && steam_result.launch.audio_ok && steam_result.launch.network_ok;
         runner_events.push(log_steam_zero_touch_install(
             &mut logger,
             job,
             &steam_result,
+            launched,
         )?);
-        runner_events.push(log_process_end_code(&mut logger, 0)?);
+        let exit_code = if launched { 0 } else { 1 };
+        runner_events.push(log_process_end_code(&mut logger, exit_code)?);
 
         let after_files = ge.snapshot_files(job.dtm, started)?;
         let after_registry = ge.snapshot_registry()?;
@@ -225,7 +233,7 @@ pub fn execute_job(job: &RunnerJob) -> AppResult<RunnerOutcome> {
             os_build: util::current_platform_build(),
             stdout: String::new(),
             stderr: String::new(),
-            exit_code: 0,
+            exit_code,
             guest_exceptions: Vec::new(),
             file_manifest_delta: diff_file_snapshots(&before_files, &after_files),
             registry_delta: diff_registry_snapshots(&before_registry, &after_registry),
@@ -413,11 +421,28 @@ pub fn execute_job(job: &RunnerJob) -> AppResult<RunnerOutcome> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    for (key, value) in std::env::vars() {
-        command.env(&key, &value);
-    }
-
-    for (key, value) in &effective_child_environment {
+    // In DTM (deterministic) mode the guest must not observe host-dependent
+    // variables (PATH, DYLD_*, TMPDIR, host CASA1_* values): recorded traces
+    // fingerprint only `effective_child_environment`, so a replay must see
+    // exactly the same environment.  Otherwise keep host passthrough and
+    // mirror the full spawn environment into the trace fingerprint.
+    let spawn_env = if job.dtm {
+        effective_child_environment.clone()
+    } else {
+        let mut host_env = std::env::vars_os()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.to_string_lossy().into_owned(),
+                )
+            })
+            .collect::<BTreeMap<String, String>>();
+        host_env.extend(effective_child_environment.iter().map(|(key, value)| {
+            (key.clone(), value.clone())
+        }));
+        host_env
+    };
+    for (key, value) in &spawn_env {
         command.env(key, value);
     }
 
@@ -448,7 +473,6 @@ pub fn execute_job(job: &RunnerJob) -> AppResult<RunnerOutcome> {
             &error,
         )
     })?;
-    let mut runner_events = runner_events;
     runner_events.push(log_process_end(&mut logger, &output.status)?);
 
     let after_files = ge.snapshot_files(job.dtm, started)?;
@@ -478,7 +502,7 @@ pub fn execute_job(job: &RunnerJob) -> AppResult<RunnerOutcome> {
         program: job.program.clone(),
         args: job.args.clone(),
         cwd: job.cwd.clone(),
-        env: effective_child_environment.clone(),
+        env: spawn_env.clone(),
         dtm: job.dtm,
         intent: job.intent.as_str().to_string(),
     };
@@ -679,7 +703,13 @@ fn execute_live_pe_job(
                 },
             )
         })
-        .unwrap();
+        .map_err(|error| {
+            AppError::new(
+                ReasonCode::RcRunnerSpawnFailed,
+                "failed to spawn PE runtime worker thread",
+            )
+            .with_hint(error.to_string())
+        })?;
     live::run_live_host_session(
         &live_window_title(&job.ge_name, &job.program, &job.intent),
         host_session,
@@ -820,6 +850,7 @@ fn log_steam_zero_touch_install(
     logger: &mut JsonlLogger,
     job: &RunnerJob,
     result: &steam::SteamZeroTouchLaunchResult,
+    launched: bool,
 ) -> AppResult<TraceEvent> {
     let steam_app_id = result
         .launch
@@ -827,7 +858,6 @@ fn log_steam_zero_touch_install(
         .get("SteamAppId")
         .and_then(|value| value.parse::<u32>().ok())
         .unwrap_or_default();
-    let launched = result.launch.input_ok && result.launch.audio_ok && result.launch.network_ok;
     let mut kv = BTreeMap::new();
     kv.insert(
         "installer".to_string(),
@@ -845,9 +875,17 @@ fn log_steam_zero_touch_install(
     );
     let event = logger.log(
         "steam",
-        "info",
-        ReasonCode::Success,
-        format!("zero-touch Steam install launched app {steam_app_id}"),
+        if launched { "info" } else { "error" },
+        if launched {
+            ReasonCode::Success
+        } else {
+            ReasonCode::RcSteamUpdateFailed
+        },
+        if launched {
+            format!("zero-touch Steam install launched app {steam_app_id}")
+        } else {
+            format!("zero-touch Steam install FAILED to launch app {steam_app_id}")
+        },
         kv,
     )?;
     Ok(trace_from_log_event(
@@ -928,11 +966,20 @@ fn log_native_steam_install_recovery(
     ))
 }
 
+/// Detect PE instruction-budget exhaustion.
+///
+/// The PE runtime reports budget exhaustion as `RcUnimplInsn` with a
+/// message prefix; a dedicated reason code does not exist yet (reason.rs is
+/// outside this module's boundary), so the check tolerates both the exact
+/// historical prefix and the "instruction budget" phrasing to avoid
+/// silently disabling the Steam-install recovery path if the wording is
+/// ever tweaked.
 fn budget_exhausted(error: &AppError) -> bool {
     error.code == ReasonCode::RcUnimplInsn
-        && error
+        && (error
             .message
             .starts_with("PE runtime exceeded the instruction budget")
+            || error.message.contains("instruction budget"))
 }
 
 fn steam_zero_touch_request(job: &RunnerJob) -> AppResult<Option<SteamZeroTouchRequest>> {

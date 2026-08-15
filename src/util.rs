@@ -5,7 +5,6 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::ffi::OsStr;
 use std::fs;
-use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
@@ -45,15 +44,15 @@ pub fn sha256_file(path: &Path) -> AppResult<String> {
             &error,
         )
     })?;
-    let mut buffer = Vec::new();
-    file.read_to_end(&mut buffer).map_err(|error| {
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut file, &mut hasher).map_err(|error| {
         AppError::from_io(
             ReasonCode::RcIo,
             format!("failed to read {}", path.display()),
             &error,
         )
     })?;
-    Ok(sha256_bytes(&buffer))
+    Ok(hex_lower(&hasher.finalize()))
 }
 
 pub fn parse_env_pair(input: &str) -> AppResult<(String, String)> {
@@ -184,10 +183,10 @@ pub fn sibling_binary(name: &str) -> AppResult<PathBuf> {
     let mut candidates = Vec::new();
     if let Some(parent) = current_exe.parent() {
         candidates.push(parent.join(&filename));
-        if parent.file_name() == Some(OsStr::new("deps")) {
-            if let Some(grand_parent) = parent.parent() {
-                candidates.push(grand_parent.join(&filename));
-            }
+        if parent.file_name() == Some(OsStr::new("deps"))
+            && let Some(grand_parent) = parent.parent()
+        {
+            candidates.push(grand_parent.join(&filename));
         }
     }
 
@@ -212,9 +211,11 @@ fn executable_extension() -> &'static str {
 }
 
 fn hex_lower(bytes: &[u8]) -> String {
+    const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut value = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
-        value.push_str(&format!("{byte:02x}"));
+        value.push(HEX_DIGITS[(byte >> 4) as usize] as char);
+        value.push(HEX_DIGITS[(byte & 0x0f) as usize] as char);
     }
     value
 }
@@ -231,5 +232,36 @@ fn to_windows_path(prefix: &str, relative: &Path) -> String {
         format!("{prefix}:\\")
     } else {
         format!("{prefix}:\\{}", pieces.join("\\"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sha256_file_matches_sha256_bytes() {
+        let path = std::env::temp_dir().join(format!(
+            "casa1_sha256_test_{}.bin",
+            std::process::id()
+        ));
+        let data: &[u8] = b"hello casa1 streaming hash\x00\xff\x10";
+        fs::write(&path, data).expect("write temp file");
+        let from_file = sha256_file(&path).expect("hash file");
+        let from_bytes = sha256_bytes(data);
+        assert_eq!(from_file, from_bytes);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn sha256_known_vectors() {
+        assert_eq!(
+            sha256_bytes(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            sha256_bytes(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
     }
 }

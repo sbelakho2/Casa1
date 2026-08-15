@@ -206,23 +206,37 @@ fn compare_value(
                 .get(test_id)
                 .and_then(|fields| fields.get(path));
             if let Some(rule) = tolerance {
-                let Some(expected_float) = expected_number.as_f64() else {
-                    return Err(failure(
-                        path,
-                        expected,
-                        actual,
-                        "expected number is not representable as f64",
-                    ));
+                let within_tolerance = if let (Some(expected_int), Some(actual_int)) =
+                    (expected_number.as_u64(), actual_number.as_u64())
+                {
+                    // Exact u64 comparison: avoids f64 rounding for values > 2^53.
+                    expected_int.abs_diff(actual_int) as f64 <= rule.epsilon
+                } else if let (Some(expected_int), Some(actual_int)) =
+                    (expected_number.as_i64(), actual_number.as_i64())
+                {
+                    // i128 difference covers mixed-sign spans without overflow.
+                    let diff = (expected_int as i128 - actual_int as i128).unsigned_abs();
+                    diff as f64 <= rule.epsilon
+                } else {
+                    let Some(expected_float) = expected_number.as_f64() else {
+                        return Err(failure(
+                            path,
+                            expected,
+                            actual,
+                            "expected number is not representable as f64",
+                        ));
+                    };
+                    let Some(actual_float) = actual_number.as_f64() else {
+                        return Err(failure(
+                            path,
+                            expected,
+                            actual,
+                            "actual number is not representable as f64",
+                        ));
+                    };
+                    (expected_float - actual_float).abs() <= rule.epsilon
                 };
-                let Some(actual_float) = actual_number.as_f64() else {
-                    return Err(failure(
-                        path,
-                        expected,
-                        actual,
-                        "actual number is not representable as f64",
-                    ));
-                };
-                if (expected_float - actual_float).abs() <= rule.epsilon {
+                if within_tolerance {
                     Ok(())
                 } else {
                     Err(failure(
@@ -264,5 +278,89 @@ fn join_path(current: &str, segment: &str) -> String {
         segment.to_string()
     } else {
         format!("{current}.{segment}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn delta(size: u64) -> FileManifestDelta {
+        FileManifestDelta {
+            op: "add".to_string(),
+            path_norm: "C:\\x".to_string(),
+            sha256: "abc".to_string(),
+            size,
+            times_norm: NormalizedTimes {
+                created_ms: 0,
+                accessed_ms: 0,
+                modified_ms: 0,
+            },
+            attrs: Vec::new(),
+        }
+    }
+
+    fn tolerance_for(path: &str, epsilon: f64) -> ToleranceRegistry {
+        let mut registry = ToleranceRegistry::default();
+        let mut fields = BTreeMap::new();
+        fields.insert(path.to_string(), ToleranceRule { epsilon });
+        registry.rules.insert("test".to_string(), fields);
+        registry
+    }
+
+    #[test]
+    fn tolerance_compares_large_u64_exactly() {
+        // u64::MAX and u64::MAX - 1 must differ under epsilon 0 even though
+        // both round to the same value when converted to f64 (2^53 precision).
+        let registry = tolerance_for("file_manifest_delta[0].size", 0.0);
+        let mut expected = CanonicalTestOutput {
+            test_id: "test".to_string(),
+            ..CanonicalTestOutput::default()
+        };
+        expected.file_manifest_delta.push(delta(u64::MAX));
+        let mut actual = expected.clone();
+        actual.file_manifest_delta[0].size = u64::MAX - 1;
+        assert!(compare_outputs(&expected, &actual, &registry).is_err());
+
+        // Identical large values still pass.
+        let same = expected.clone();
+        assert!(compare_outputs(&expected, &same, &registry).is_ok());
+    }
+
+    #[test]
+    fn tolerance_allows_small_integer_difference() {
+        let registry = tolerance_for("file_manifest_delta[0].size", 4.0);
+        let mut expected = CanonicalTestOutput {
+            test_id: "test".to_string(),
+            ..CanonicalTestOutput::default()
+        };
+        expected.file_manifest_delta.push(delta(1000));
+        let mut actual = expected.clone();
+        actual.file_manifest_delta[0].size = 1003;
+        assert!(compare_outputs(&expected, &actual, &registry).is_ok());
+        actual.file_manifest_delta[0].size = 1005;
+        assert!(compare_outputs(&expected, &actual, &registry).is_err());
+    }
+
+    #[test]
+    fn non_tolerance_numbers_compare_exactly() {
+        let mut expected = CanonicalTestOutput {
+            test_id: "t".to_string(),
+            ..CanonicalTestOutput::default()
+        };
+        let mut actual = expected.clone();
+        expected.perf.push(PerfMetric {
+            metric_id: "v".to_string(),
+            value: 1.5,
+            unit: "x".to_string(),
+        });
+        actual.perf.push(PerfMetric {
+            metric_id: "v".to_string(),
+            value: 1.5000000001,
+            unit: "x".to_string(),
+        });
+        assert!(
+            compare_outputs(&expected, &actual, &ToleranceRegistry::default()).is_err()
+        );
     }
 }

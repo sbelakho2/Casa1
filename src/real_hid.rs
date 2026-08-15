@@ -8,8 +8,7 @@
 //! Hotplug Detection. It follows the same polling pattern used by audio device
 //! hotplug in [`RealAudioBackend::detect_device_changes`](super::real_audio::RealAudioBackend::detect_device_changes).
 
-use crate::error::{AppError, AppResult};
-use crate::reason::ReasonCode;
+use crate::error::AppResult;
 use std::collections::HashMap;
 use std::process::Command;
 
@@ -52,6 +51,10 @@ const KNOWN_VIDS: &[u16] = &[
     VID_HORI,
     VID_THRUSTMASTER,
 ];
+
+/// Vendors whose VID is exclusively used for game controllers; a device from
+/// one of these vendors is a controller regardless of its product ID.
+const VID_ONLY_CONTROLLER_VENDORS: &[u16] = &[VID_VALVE, VID_8BITDO, VID_POWERA, VID_MADCATZ];
 
 /// Microsoft Xbox controller product IDs that are XInput-capable.
 const XINPUT_PIDS: &[(u16, u16)] = &[
@@ -108,6 +111,9 @@ pub struct HidMonitor {
     previous: HashMap<String, HostController>,
     /// Whether the first scan has completed.
     initialized: bool,
+    /// Cached scan results so `poll_for_changes` does not spawn a fresh
+    /// `ioreg` process per call (the consumer polls every frame).
+    cached_scan: Option<(std::time::Instant, Vec<HostController>)>,
 }
 
 impl HidMonitor {
@@ -118,6 +124,7 @@ impl HidMonitor {
         Self {
             previous: HashMap::new(),
             initialized: false,
+            cached_scan: None,
         }
     }
 
@@ -135,7 +142,15 @@ impl HidMonitor {
     /// executed. Returns an empty list (no controllers) if `ioreg` is not
     /// available on the system.
     pub fn poll_for_changes(&mut self) -> AppResult<(Vec<HostController>, Vec<HostController>)> {
-        let current = scan_controllers()?;
+        const SCAN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+        let current = match &self.cached_scan {
+            Some((scanned_at, cached)) if scanned_at.elapsed() < SCAN_INTERVAL => cached.clone(),
+            _ => {
+                let fresh = scan_controllers()?;
+                self.cached_scan = Some((std::time::Instant::now(), fresh.clone()));
+                fresh
+            }
+        };
 
         if !self.initialized {
             // First scan: return everything as "added" for bootstrapping.
@@ -188,17 +203,16 @@ impl Default for HidMonitor {
 /// for entries with known game controller vendor IDs or product names
 /// containing keywords like "gamepad", "controller", or "joystick".
 ///
-/// Returns an empty vector if `ioreg` is unavailable or fails gracefully.
+/// Returns an empty vector if `ioreg` is unavailable or fails gracefully
+/// (matching the documented contract of [`HidMonitor::poll_for_changes`]).
 fn scan_controllers() -> AppResult<Vec<HostController>> {
-    let output = Command::new("ioreg")
-        .args(["-r", "-c", "IOHIDDevice"])
-        .output()
-        .map_err(|e| {
-            AppError::new(
-                ReasonCode::RcCliInvalid,
-                format!("failed to execute ioreg for HID scan: {e}"),
-            )
-        })?;
+    let output = match Command::new("ioreg").args(["-r", "-c", "IOHIDDevice"]).output() {
+        Ok(output) => output,
+        Err(e) => {
+            eprintln!("[real_hid] ioreg unavailable, reporting no controllers: {e}");
+            return Ok(Vec::new());
+        }
+    };
 
     if !output.status.success() {
         // ioreg may not be available; return empty list gracefully.
@@ -234,6 +248,7 @@ fn parse_ioreg_devices(text: &str) -> Vec<HostController> {
     let mut vendor_id = 0u16;
     let mut product_id = 0u16;
     let mut serial = String::new();
+    let mut entry_id = String::new();
 
     for line in text.lines() {
         let trimmed = line.trim();
@@ -247,6 +262,7 @@ fn parse_ioreg_devices(text: &str) -> Vec<HostController> {
                 vendor_id = 0;
                 product_id = 0;
                 serial.clear();
+                entry_id = parse_ioreg_entry_id(trimmed);
             }
             continue;
         }
@@ -274,6 +290,7 @@ fn parse_ioreg_devices(text: &str) -> Vec<HostController> {
                     vendor_id,
                     product_id,
                     &serial,
+                    &entry_id,
                     controllers.len(),
                 ));
             }
@@ -297,10 +314,8 @@ fn parse_ioreg_devices(text: &str) -> Vec<HostController> {
                 "ProductID" | "idProduct" => {
                     product_id = val.parse().unwrap_or(0);
                 }
-                "SerialNumber" | "USB Serial Number" | "Serial Number" => {
-                    if !val.is_empty() {
-                        serial = val.to_string();
-                    }
+                "SerialNumber" | "USB Serial Number" | "Serial Number" if !val.is_empty() => {
+                    serial = val.to_string();
                 }
                 _ => {}
             }
@@ -310,20 +325,43 @@ fn parse_ioreg_devices(text: &str) -> Vec<HostController> {
     controllers
 }
 
+/// Extract the IORegistry entry id (the `id 0x…` token on the `+-o` line),
+/// which is a stable per-device identifier across rescans.
+fn parse_ioreg_entry_id(line: &str) -> String {
+    let mut words = line.split_whitespace();
+    while let Some(word) = words.next() {
+        if word == "id"
+            && let Some(value) = words.next()
+        {
+            return value.trim_matches(',').to_string();
+        }
+    }
+    String::new()
+}
+
 /// Returns `true` if the device with the given VID/PID/name appears to be a
 /// game controller.
-fn is_game_controller(vendor_id: u16, _product_id: u16, product: &str) -> bool {
-    // Check by known vendor ID.
-    if KNOWN_VIDS.contains(&vendor_id) {
-        return true; // correct: vendor is a known game controller VID
+fn is_game_controller(vendor_id: u16, product_id: u16, product: &str) -> bool {
+    let lower = product.to_ascii_lowercase();
+    let name_is_controller = lower.contains("gamepad")
+        || lower.contains("controller")
+        || lower.contains("joystick");
+
+    // Strictly-gaming vendors match on VID alone.
+    if VID_ONLY_CONTROLLER_VENDORS.contains(&vendor_id) {
+        return true;
     }
 
-    // Check product name for controller-related keywords.
-    let lower = product.to_ascii_lowercase();
-    lower.contains("gamepad")
-        || lower.contains("controller")
-        || lower.contains("joystick")
-        || lower.contains("game controller")
+    // Known vendors (Microsoft, Sony, Nintendo, Logitech, Razer, HORI,
+    // Thrustmaster) also cover keyboards, mice, and webcams, so a VID match
+    // alone would report phantom gamepads.  Require an XInput-capable
+    // product ID (Xbox controllers) or a controller-like product name.
+    if KNOWN_VIDS.contains(&vendor_id) {
+        return is_xinput_capable(vendor_id, product_id) || name_is_controller;
+    }
+
+    // Unknown vendor: fall back to the product name keywords.
+    name_is_controller
 }
 
 /// Returns `true` if the device with the given VID/PID is XInput-capable.
@@ -337,12 +375,19 @@ fn build_controller(
     vendor_id: u16,
     product_id: u16,
     serial: &str,
+    entry_id: &str,
     index: usize,
 ) -> HostController {
-    let identifier = if serial.is_empty() {
-        format!("{:04x}:{:04x}:hid{}", vendor_id, product_id, index)
-    } else {
+    // Prefer the serial number, then the stable IORegistry entry id; the
+    // enumeration index is only a last resort and is not stable across
+    // scans (unplugging one of two identical controllers would otherwise
+    // rename the survivor and churn remove+add events).
+    let identifier = if !serial.is_empty() {
         format!("{:04x}:{:04x}:{}", vendor_id, product_id, serial)
+    } else if !entry_id.is_empty() {
+        format!("{:04x}:{:04x}:{}", vendor_id, product_id, entry_id)
+    } else {
+        format!("{:04x}:{:04x}:hid{}", vendor_id, product_id, index)
     };
 
     HostController {
@@ -445,16 +490,50 @@ mod tests {
 
     #[test]
     fn test_is_game_controller_known_vid() {
+        // XInput-capable product ID matches even without a name keyword.
         assert!(is_game_controller(
             VID_MICROSOFT,
             0x028E,
             "Xbox 360 Controller"
         ));
-        assert!(is_game_controller(VID_SONY, 0x0CE6, "DualSense"));
+        // Known vendor + controller-like name.
+        assert!(is_game_controller(
+            VID_SONY,
+            0x0CE6,
+            "DualSense Wireless Controller"
+        ));
         assert!(is_game_controller(
             VID_NINTENDO,
             0x2006,
             "Switch Pro Controller"
+        ));
+        // Strictly-gaming vendors match on VID alone.
+        assert!(is_game_controller(VID_VALVE, 0x0001, "Steam Controller"));
+        assert!(is_game_controller(VID_8BITDO, 0x1234, "8BitDo Device"));
+        assert!(is_game_controller(VID_POWERA, 0x0000, "PowerA Device"));
+        assert!(is_game_controller(VID_MADCATZ, 0x0000, "Mad Catz Device"));
+    }
+
+    #[test]
+    fn test_known_vendor_non_controller_is_filtered() {
+        // Microsoft and Logitech VIDs also cover keyboards/mice/webcams:
+        // a VID match alone must not report a phantom gamepad.
+        assert!(!is_game_controller(
+            VID_MICROSOFT,
+            0x0001,
+            "Microsoft Ergonomic Keyboard"
+        ));
+        assert!(!is_game_controller(
+            VID_LOGITECH,
+            0xC077,
+            "Logitech USB Optical Mouse"
+        ));
+        assert!(!is_game_controller(VID_SONY, 0x0300, "Sony Device"));
+        // XInput-capable product IDs still classify regardless of name.
+        assert!(is_game_controller(
+            VID_MICROSOFT,
+            0x028E,
+            "Wireless Receiver"
         ));
     }
 
@@ -465,5 +544,31 @@ mod tests {
         assert!(is_game_controller(0x1234, 0x5678, "USB Joystick"));
         // Non-controller name
         assert!(!is_game_controller(0x1234, 0x5678, "USB Keyboard"));
+    }
+
+    #[test]
+    fn test_serial_less_controller_uses_stable_entry_id() {
+        let sample = r#"
++-o IOHIDDevice  <class IOHIDDevice, id 0x12345678, registered, matched, active, busy 0, retain count 7>
+{
+  "Product" = "Xbox Wireless Controller"
+  "VendorID" = 1118
+  "ProductID" = 736
+  "Transport" = "USB"
+}
++-o IOHIDDevice  <class IOHIDDevice, id 0x87654321, registered, matched, active, busy 0, retain count 5>
+{
+  "Product" = "Xbox Wireless Controller"
+  "VendorID" = 1118
+  "ProductID" = 736
+  "Transport" = "USB"
+}
+"#;
+        let devices = parse_ioreg_devices(sample);
+        assert_eq!(devices.len(), 2);
+        // Identifiers embed the registry entry id, not the enumeration index.
+        assert_eq!(devices[0].identifier, "045e:02e0:0x12345678");
+        assert_eq!(devices[1].identifier, "045e:02e0:0x87654321");
+        assert_ne!(devices[0].identifier, devices[1].identifier);
     }
 }

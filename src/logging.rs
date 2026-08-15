@@ -74,8 +74,8 @@ impl JsonlLogger {
             reason_code: reason_code.as_u32(),
             win32_err: None,
             ntstatus: None,
-            msg: message.into(),
-            kv,
+            msg: redact_sensitive(&message.into()),
+            kv: redact_sensitive_values(kv),
         };
         self.next_event_id += 1;
         let line = serde_json::to_string(&event).map_err(|error| {
@@ -85,10 +85,49 @@ impl JsonlLogger {
         writeln!(self.writer, "{line}").map_err(|error| {
             AppError::from_io(ReasonCode::RcIo, "failed to write JSONL log event", &error)
         })?;
+        Ok(event)
+    }
+
+    /// Flush buffered log events to disk.
+    pub fn flush(&mut self) -> AppResult<()> {
         self.writer.flush().map_err(|error| {
             AppError::from_io(ReasonCode::RcIo, "failed to flush JSONL logger", &error)
-        })?;
-        Ok(event)
+        })
+    }
+}
+
+impl Drop for JsonlLogger {
+    fn drop(&mut self) {
+        // Best-effort flush so buffered events are not lost; `BufWriter`
+        // would flush anyway on drop, but this surfaces errors before teardown.
+        let _ = self.writer.flush();
+    }
+}
+
+/// Recursively redact sensitive values from a log event's KV map so
+/// guest-controlled strings cannot leak credentials into log files.
+fn redact_sensitive_values(kv: BTreeMap<String, Value>) -> BTreeMap<String, Value> {
+    kv.into_iter()
+        .map(|(key, value)| (key, redact_sensitive_value(value)))
+        .collect()
+}
+
+fn redact_sensitive_value(value: Value) -> Value {
+    match value {
+        Value::String(text) => Value::String(redact_sensitive(&text)),
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .map(redact_sensitive_value)
+                .collect(),
+        ),
+        Value::Object(fields) => Value::Object(
+            fields
+                .into_iter()
+                .map(|(key, value)| (key, redact_sensitive_value(value)))
+                .collect(),
+        ),
+        other => other,
     }
 }
 
@@ -98,10 +137,13 @@ impl JsonlLogger {
 
 static REDACTION_PATTERNS: LazyLock<Vec<(&'static str, Regex)>> = LazyLock::new(|| {
     vec![
-        // Bearer / token headers
+        // Bearer / token headers.
+        // Bare "token" matches are restricted to the `token=` / `token:`
+        // forms so ordinary prose ("no token found") is not mangled; the
+        // `bearer\s+` prefix only matches an explicit Bearer scheme.
         (
             "bearer_token",
-            Regex::new(r"(?i)(bearer\s+|token[=:\s]*)[^\s,;]+").unwrap(),
+            Regex::new(r"(?i)(bearer\s+|token[=:])[^\s,;]+").unwrap(),
         ),
         // Authorization header (Basic, Digest, Negotiate, etc.)
         (
@@ -162,10 +204,14 @@ static REDACTION_PATTERNS: LazyLock<Vec<(&'static str, Regex)>> = LazyLock::new(
         // JWT tokens: header.payload.signature (standalone, without "Bearer " prefix).
         // Bearer+JWT cases are handled by the bearer_token pattern above which
         // redacts the entire token.  First segment >= 15 chars avoids matching
-        // domain names like "ftp.example.com".
+        // short hostname labels; the signature segment must also be >= 15
+        // chars (real JWT signatures are base64url and far longer), which
+        // excludes hostnames like "www.verylongdomainname.example.com".  The
+        // signature is the non-captured part so the shared `${1}[REDACTED]${2}`
+        // replacement redacts it (group 2 is the empty trailing capture).
         (
             "jwt_token",
-            Regex::new(r"(?i)([a-z0-9_-]{15,}\.[a-z0-9_-]+\.)[a-z0-9_-]+()").unwrap(),
+            Regex::new(r"(?i)([a-z0-9_-]{15,}\.[a-z0-9_-]{3,}\.)[a-z0-9_-]{15,}()").unwrap(),
         ),
         // Session tokens / session IDs
         (
@@ -176,9 +222,11 @@ static REDACTION_PATTERNS: LazyLock<Vec<(&'static str, Regex)>> = LazyLock::new(
         // matching e.g. the trailing 'e' in "certificate:").
         // Uses a consuming (?:^|[^a-zA-Z]) group instead of (?<![a-zA-Z])
         // lookbehind because the `regex` crate does not support lookarounds.
+        // The value class excludes ',' so adjacent DN fields ("CN=MyCA,O=MyOrg")
+        // are redacted field-by-field without eating the separator.
         (
             "x509_dn",
-            Regex::new(r"(?i)((?:^|[^a-zA-Z])(?:CN|O|OU|L|ST|C|E)[=:]\s*)[a-zA-Z0-9\s.,'()-]{3,80}()").unwrap(),
+            Regex::new(r"(?i)((?:^|[^a-zA-Z])(?:CN|O|OU|L|ST|C|E)[=:]\s*)[a-zA-Z0-9\s.'()-]{3,80}()").unwrap(),
         ),
     ]
 });
@@ -231,7 +279,13 @@ mod tests {
     use std::path::PathBuf;
 
     fn temp_log_path() -> PathBuf {
-        std::env::temp_dir().join(format!("casa1_log_test_{}.jsonl", std::process::id()))
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "casa1_log_test_{}_{unique}.jsonl",
+            std::process::id()
+        ))
     }
 
     #[test]
@@ -335,12 +389,29 @@ mod tests {
     fn test_redact_jwt_token() {
         // Standalone JWT (no "Bearer " or "token=" prefix — those are handled
         // by the bearer_token pattern which redacts the entire token).
-        let input = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signature123";
+        let input = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signature1234567890";
         let redacted = redact_sensitive(input);
         assert!(redacted.contains("[REDACTED]"));
-        assert!(!redacted.contains("signature123"));
+        assert!(!redacted.contains("signature1234567890"));
         // The pattern should keep the prefix up to the second dot
         assert!(redacted.contains("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0."));
+    }
+
+    #[test]
+    fn test_redact_does_not_mangle_plain_language() {
+        // Bare "token" followed by a space must not be treated as a secret.
+        assert_eq!(
+            redact_sensitive("no token found for this session"),
+            "no token found for this session"
+        );
+        // Long hostnames must not be mistaken for JWTs.
+        let hostname = "connecting to www.verylongdomainname.example.com";
+        assert_eq!(redact_sensitive(hostname), hostname);
+        // "token=" forms are still redacted.
+        let with_value = "auth failed: token=abcdef123456";
+        let redacted = redact_sensitive(with_value);
+        assert!(!redacted.contains("abcdef123456"));
+        assert!(redacted.contains("token=[REDACTED]"));
     }
 
     #[test]
@@ -372,7 +443,7 @@ mod tests {
         let kv = boundary_kv("network", "exit", None);
         assert_eq!(kv.get("boundary").unwrap(), "network");
         assert_eq!(kv.get("direction").unwrap(), "exit");
-        assert!(kv.get("detail").is_none());
+        assert!(!kv.contains_key("detail"));
     }
 
     #[test]
@@ -403,12 +474,47 @@ mod tests {
         assert_eq!(event.module, "test");
 
         // Read back and verify
+        logger.flush().expect("flush logger");
         let mut contents = String::new();
         File::open(&path)
             .expect("open log")
             .read_to_string(&mut contents)
             .expect("read log");
         assert!(contents.contains("hello"));
+
+        // Cleanup
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_jsonl_logger_redacts_guest_strings() {
+        let path = temp_log_path();
+        let mut logger = JsonlLogger::new(&path, 1234, false).expect("create logger");
+        let mut kv = BTreeMap::new();
+        kv.insert(
+            "header".to_string(),
+            Value::String("Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.secret".to_string()),
+        );
+        kv.insert(
+            "args".to_string(),
+            Value::Array(vec![
+                Value::String("--token".to_string()),
+                Value::String("token=supersecret123".to_string()),
+            ]),
+        );
+        logger
+            .log("test", "info", ReasonCode::Success, "token=also-secret", kv)
+            .expect("log event");
+
+        logger.flush().expect("flush logger");
+        let mut contents = String::new();
+        File::open(&path)
+            .expect("open log")
+            .read_to_string(&mut contents)
+            .expect("read log");
+        assert!(!contents.contains("supersecret123"), "kv value leaked: {contents}");
+        assert!(!contents.contains("also-secret"), "msg leaked: {contents}");
+        assert!(!contents.contains("eyJhbGciOiJIUzI1NiJ9.secret"));
 
         // Cleanup
         let _ = std::fs::remove_file(&path);

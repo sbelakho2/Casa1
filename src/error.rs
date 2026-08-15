@@ -225,8 +225,10 @@ impl AppError {
     pub fn hresult(&self) -> u32 {
         match self.code {
             ReasonCode::Success => 0x0000_0000, // S_OK
-            // FACILITY_ITF = 4; SEVERITY_ERROR = 1 (bit 31)
-            _ => 0x8004_0000 | self.code.as_u32(),
+            // FACILITY_ITF = 4; SEVERITY_ERROR = 1 (bit 31).
+            // Mask to 16 bits so a future reason code >= 0x10000 cannot
+            // bleed into the facility/severity bits.
+            _ => 0x8004_0000 | (self.code.as_u32() & 0xFFFF),
         }
     }
 }
@@ -336,7 +338,7 @@ pub fn ntstatus_to_dos_error(status: u32) -> u32 {
         0xC000_009B => ERROR_INVALID_PARAMETER, // STATUS_FLOAT_UNDERFLOW
 
         // Image / PE loading
-        0xC000_00BB => ERROR_MOD_NOT_FOUND, // STATUS_DLL_NOT_FOUND
+        0xC000_00BB => ERROR_NOT_SUPPORTED, // STATUS_NOT_SUPPORTED
         0xC000_0120 => ERROR_INVALID_PARAMETER, // STATUS_CANCELLED
         0xC000_0128 => ERROR_MOD_NOT_FOUND, // STATUS_ENTRYPOINT_NOT_FOUND
         0xC000_0135 => ERROR_MOD_NOT_FOUND, // STATUS_DLL_NOT_FOUND (alternate)
@@ -447,7 +449,7 @@ pub fn dos_error_to_errno(error: u32) -> i32 {
         0 => 0,                  // ERROR_SUCCESS
         2 => libc::ENOENT,       // ERROR_FILE_NOT_FOUND
         3 => libc::ENOENT,       // ERROR_PATH_NOT_FOUND
-        4 => libc::EINTR,        // ERROR_TOO_MANY_OPEN_FILES
+        4 => libc::EMFILE,       // ERROR_TOO_MANY_OPEN_FILES
         5 => libc::EACCES,       // ERROR_ACCESS_DENIED
         6 => libc::EBADF,        // ERROR_INVALID_HANDLE
         7 => libc::ENOMEM,       // ERROR_ARENA_TRASHED
@@ -528,8 +530,10 @@ pub fn dos_error_to_errno(error: u32) -> i32 {
 /// POSIX errno → macOS / XNU kern_return_t.
 /// The kernel uses mach/i386/kern_return.h values.
 /// Only uses POSIX/BSD errno constants available on macOS.
-/// Linux-specific errno values > 43 use raw integer literals.
-#[allow(unreachable_patterns)]
+/// Linux-specific errno values (> 43, not defined in macOS libc) are handled
+/// by a cfg-gated guarded arm; on macOS those numeric values belong to real
+/// constants (e.g. 44 is ESOCKTNOSUPPORT, 62 is ELOOP) and are matched by
+/// the constant arms above.
 pub fn errno_to_kern_return(errno: i32) -> u32 {
     match errno {
         0 => 0,                   // KERN_SUCCESS
@@ -543,7 +547,7 @@ pub fn errno_to_kern_return(errno: i32) -> u32 {
         libc::ENOEXEC => 8,       // KERN_INVALID_ARGUMENT
         libc::EBADF => 9,         // KERN_INVALID_TASK
         libc::ECHILD => 10,       // KERN_INVALID_TASK
-        libc::EAGAIN => 11,       // KERN_RESOURCE_SHORTAGE
+        libc::EAGAIN => 6,        // KERN_RESOURCE_SHORTAGE (EAGAIN == EWOULDBLOCK on macOS/Linux)
         libc::ENOMEM => 12,       // KERN_RESOURCE_SHORTAGE
         libc::EACCES => 13,       // KERN_INVALID_ARGUMENT
         libc::EFAULT => 14,       // KERN_INVALID_ARGUMENT
@@ -573,55 +577,15 @@ pub fn errno_to_kern_return(errno: i32) -> u32 {
         libc::ENOSYS => 38,       // KERN_FAILURE
         libc::ENOTEMPTY => 39,    // KERN_FAILURE
         libc::ELOOP => 40,        // KERN_FAILURE
-        libc::EWOULDBLOCK => 41,  // KERN_RESOURCE_SHORTAGE
         libc::ENOMSG => 42,       // KERN_FAILURE
         libc::EIDRM => 43,        // KERN_FAILURE
-        // Linux-specific errno constants not available in macOS libc,
-        // using raw integer values from Linux <asm-generic/errno.h>
-        44 => 5,                     // ECHRNG
-        45 => 5,                     // EL2NSYNC
-        46 => 5,                     // EL3HLT
-        47 => 5,                     // EL3RST
-        48 => 5,                     // ELNRNG
-        49 => 5,                     // EUNATCH
-        50 => 5,                     // ENOCSI
-        51 => 5,                     // EL2HLT
-        52 => 5,                     // EBADE
-        53 => 5,                     // EBADR
-        54 => 5,                     // EXFULL
-        55 => 5,                     // ENOANO
-        56 => 5,                     // EBADRQC
-        57 => 5,                     // EBADSLT
-        58 => 5,                     // EDEADLOCK
-        59 => 5,                     // EBFONT
-        60 => 5,                     // ENOSTR
-        61 => 5,                     // ENODATA
-        62 => 5,                     // ETIME
-        63 => 5,                     // ENOSR
-        64 => 5,                     // ENONET
-        65 => 5,                     // ENOPKG
         libc::EREMOTE => 66,         // KERN_FAILURE
         libc::ENOLINK => 67,         // KERN_FAILURE
-        68 => 5,                     // EADV
-        69 => 5,                     // ESRMNT
-        70 => 5,                     // ECOMM
         libc::EPROTO => 71,          // KERN_FAILURE
         libc::EMULTIHOP => 72,       // KERN_FAILURE
-        73 => 5,                     // EDOTDOT
         libc::EBADMSG => 74,         // KERN_FAILURE
         libc::EOVERFLOW => 75,       // KERN_FAILURE
-        76 => 5,                     // ENOTUNIQ
-        77 => 5,                     // EBADFD
-        78 => 5,                     // EREMCHG
-        79 => 5,                     // ELIBACC
-        80 => 5,                     // ELIBBAD
-        81 => 5,                     // ELIBSCN
-        82 => 5,                     // ELIBMAX
-        83 => 5,                     // ELIBEXEC
         libc::EILSEQ => 84,          // KERN_FAILURE
-        85 => 5,                     // ERESTART
-        86 => 5,                     // ESTRPIPE
-        87 => 5,                     // EUSERS
         libc::ENOTSOCK => 88,        // KERN_FAILURE
         libc::EDESTADDRREQ => 89,    // KERN_FAILURE
         libc::EMSGSIZE => 90,        // KERN_FAILURE
@@ -651,19 +615,32 @@ pub fn errno_to_kern_return(errno: i32) -> u32 {
         libc::EALREADY => 114,       // KERN_FAILURE
         libc::EINPROGRESS => 115,    // KERN_FAILURE
         libc::ESTALE => 116,         // KERN_FAILURE
-        117 => 5,                    // EUCLEAN
-        118 => 5,                    // ENOTNAM
-        119 => 5,                    // ENAVAIL
-        120 => 5,                    // EISNAM
-        121 => 5,                    // EREMOTEIO
         libc::EDQUOT => 122,         // KERN_RESOURCE_SHORTAGE
-        123 => 5,                    // ENOMEDIUM
-        124 => 5,                    // EMEDIUMTYPE
+        // Linux-specific errno constants not available in macOS libc,
+        // using raw integer values from Linux <asm-generic/errno.h>:
+        //   ECHRNG=44, EL2NSYNC=45, EL3HLT=46, EL3RST=47, ELNRNG=48,
+        //   EUNATCH=49, ENOCSI=50, EL2HLT=51, EBADE=52, EBADR=53, EXFULL=54,
+        //   ENOANO=55, EBADRQC=56, EBADSLT=57, EDEADLOCK=58, EBFONT=59,
+        //   ENOSTR=60, ENODATA=61, ETIME=62, ENOSR=63, ENONET=64, ENOPKG=65,
+        //   EADV=68, ESRMNT=69, ECOMM=70, EDOTDOT=73, ENOTUNIQ=76, EBADFD=77,
+        //   EREMCHG=78, ELIBACC=79, ELIBBAD=80, ELIBSCN=81, ELIBMAX=82,
+        //   ELIBEXEC=83, ERESTART=85, ESTRPIPE=86, EUSERS=87, EUCLEAN=117,
+        //   ENOTNAM=118, ENAVAIL=119, EISNAM=120, EREMOTEIO=121, ENOMEDIUM=123,
+        //   EMEDIUMTYPE=124.
+        // The guard keeps the values out of the constant arms on macOS, where
+        // the same numbers are real errno constants matched above.
+        #[cfg(target_os = "linux")]
+        errno if linux_only_errno(errno) => 5, // KERN_FAILURE
         // Unknown errno values beyond the POSIX/Linux range map to KERN_FAILURE.
-        // All errno values 0–124 are covered above; this branch handles any
-        // future or platform-specific extensions.
         _ => 5, // KERN_FAILURE
     }
+}
+
+/// Returns `true` for Linux-only errno values (44–124) that are not covered
+/// by the constant arms above.  Compiles to nothing on non-Linux targets.
+#[cfg(target_os = "linux")]
+fn linux_only_errno(errno: i32) -> bool {
+    matches!(errno, 44..=65 | 68..=70 | 73 | 76..=83 | 85..=87 | 117..=121 | 123..=124)
 }
 
 /// WSA error → DOS error mapping.
@@ -778,12 +755,51 @@ impl OomError {
 /// Try to allocate a Vec<T> with OOM error handling.
 /// Returns an `OomError` instead of panicking on allocation failure.
 pub fn try_vec<T>(capacity: usize) -> Result<Vec<T>, OomError> {
-    Ok(Vec::with_capacity(capacity))
+    let size = std::mem::size_of::<T>();
+    let Some(total) = size.checked_mul(capacity) else {
+        return Err(OomError::new(
+            capacity,
+            std::mem::align_of::<T>(),
+            "Vec<T>: capacity overflows isize address space",
+        ));
+    };
+    if total > isize::MAX as usize {
+        return Err(OomError::new(
+            capacity,
+            std::mem::align_of::<T>(),
+            "Vec<T>: capacity exceeds isize::MAX bytes",
+        ));
+    }
+    let mut vec = Vec::new();
+    vec.try_reserve_exact(capacity).map_err(|_| {
+        OomError::new(
+            capacity,
+            std::mem::align_of::<T>(),
+            "Vec<T>: allocation failed",
+        )
+    })?;
+    Ok(vec)
 }
 
 /// Try to allocate a Box<T> with OOM error handling.
+/// Returns an `OomError` instead of aborting the process on allocation failure.
 pub fn try_box<T>(value: T) -> Result<Box<T>, OomError> {
-    Ok(Box::new(value))
+    let layout = std::alloc::Layout::new::<T>();
+    // SAFETY: `Layout::new::<T>()` is a valid layout for a single `T`.
+    let ptr = unsafe { std::alloc::alloc(layout) };
+    if ptr.is_null() {
+        return Err(OomError::new(
+            layout.size(),
+            layout.align(),
+            "Box<T>: allocation failed",
+        ));
+    }
+    // SAFETY: `ptr` is non-null, aligned for `T` (per `Layout::new`), and we
+    // write a fully initialized `T` before constructing the box.
+    unsafe {
+        std::ptr::write(ptr as *mut T, value);
+        Ok(Box::from_raw(ptr as *mut T))
+    }
 }
 
 /// Global OOM handler that logs the error instead of panicking.
@@ -1224,7 +1240,9 @@ mod error_mapping_tests {
 
     #[test]
     fn ntstatus_dll_not_found() {
-        assert_eq!(ntstatus_to_dos_error(0xC000_00BB), ERROR_MOD_NOT_FOUND);
+        // 0xC000_00BB is STATUS_NOT_SUPPORTED, not STATUS_DLL_NOT_FOUND.
+        assert_eq!(ntstatus_to_dos_error(0xC000_00BB), ERROR_NOT_SUPPORTED);
+        assert_eq!(ntstatus_to_dos_error(0xC000_0135), ERROR_MOD_NOT_FOUND);
     }
 
     #[test]
@@ -1265,6 +1283,7 @@ mod error_mapping_tests {
     fn dos_error_to_errno_mappings() {
         assert_eq!(dos_error_to_errno(0), 0);
         assert_eq!(dos_error_to_errno(2), libc::ENOENT);
+        assert_eq!(dos_error_to_errno(4), libc::EMFILE); // ERROR_TOO_MANY_OPEN_FILES
         assert_eq!(dos_error_to_errno(5), libc::EACCES);
         assert_eq!(dos_error_to_errno(6), libc::EBADF);
         assert_eq!(dos_error_to_errno(87), libc::EINVAL);
@@ -1304,6 +1323,21 @@ mod error_mapping_tests {
         assert_eq!(errno_to_kern_return(libc::EPERM), 1);
         assert_eq!(errno_to_kern_return(libc::ENOMEM), 12);
         assert_eq!(errno_to_kern_return(libc::EINVAL), 22);
+        // EAGAIN == EWOULDBLOCK on macOS/Linux; both map to
+        // KERN_RESOURCE_SHORTAGE (6).
+        assert_eq!(errno_to_kern_return(libc::EAGAIN), 6);
+        assert_eq!(errno_to_kern_return(libc::EWOULDBLOCK), 6);
+    }
+
+    #[test]
+    fn try_vec_and_box_are_fallible() {
+        assert!(try_vec::<u8>(0).is_ok());
+        assert!(try_vec::<u8>(64).is_ok());
+        // Capacity overflow must error, not panic.
+        assert!(try_vec::<u8>(usize::MAX).is_err());
+        assert!(try_vec::<u64>(usize::MAX / 2).is_err());
+        assert!(try_box(42u32).is_ok());
+        assert_eq!(*try_box(String::from("hello")).unwrap(), "hello");
     }
 
     #[test]
