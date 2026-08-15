@@ -19,6 +19,7 @@
 // in `#[cfg(target_os = "macos")]` blocks for cross-platform compilation.
 // ---------------------------------------------------------------------------
 
+use block::{ConcreteBlock, RcBlock};
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::sync::Mutex;
@@ -39,8 +40,8 @@ pub const E_NOTIMPL: u64 = 0x8000_4001;
 pub const E_UNEXPECTED: u64 = 0x8000_FFFF;
 /// HRESULT pointer not found.
 pub const E_POINTER: u64 = 0x8000_4003;
-/// HRESULT class not available.
-pub const E_CLASSNOTAVAILABLE: u64 = 0x8004_0117;
+/// HRESULT class not available (CLASS_E_CLASSNOTAVAILABLE).
+pub const E_CLASSNOTAVAILABLE: u64 = 0x8004_0111;
 
 // ---------------------------------------------------------------------------
 // Navigation callback types
@@ -125,6 +126,15 @@ use std::sync::LazyLock;
 static DELEGATE_STATE: LazyLock<Mutex<DelegateState>> =
     LazyLock::new(|| Mutex::new(DelegateState::new()));
 
+/// Lock the global delegate state, recovering from poisoning.
+///
+/// A panicked callback must not permanently disable delegate dispatch, so a
+/// poisoned mutex is repaired by reinitializing it with its (possibly
+/// partial) contents intact.
+fn delegate_state() -> std::sync::MutexGuard<'static, DelegateState> {
+    DELEGATE_STATE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 // ---------------------------------------------------------------------------
 // ObjC runtime helper types (mirrored from cef_bridge)
 // ---------------------------------------------------------------------------
@@ -196,22 +206,39 @@ unsafe impl objc::Encode for NSRect {
 }
 
 /// Create an Objective-C NSString from a Rust &str.
-/// Returns a raw pointer to the NSString object (caller must release).
+/// Returns a raw pointer to the NSString object (caller must release), or
+/// null on failure (e.g. embedded NUL bytes). The returned object is owned
+/// (+1).
 fn ns_string_from_str(s: &str) -> *mut objc::runtime::Object {
     // SAFETY: NSString is always available in the ObjC runtime on macOS.
+    let cls = match objc::runtime::Class::get("NSString") {
+        Some(c) => c,
+        None => return std::ptr::null_mut(),
+    };
+    let c_str = match CString::new(s) {
+        Ok(c) => c,
+        Err(_) => return std::ptr::null_mut(), // embedded NUL byte — refuse
+    };
     unsafe {
-        let cls = objc::runtime::Class::get("NSString")
-            .expect("NSString class always available at runtime");
-        let c_str = CString::new(s).expect("string from Rust should not contain NUL bytes");
-        msg_send![cls, stringWithUTF8String: c_str.as_ptr()]
+        let obj: *mut objc::runtime::Object = msg_send![cls, alloc];
+        if obj.is_null() {
+            return std::ptr::null_mut();
+        }
+        let str_obj: *mut objc::runtime::Object =
+            msg_send![obj, initWithUTF8String: c_str.as_ptr()];
+        if str_obj.is_null() {
+            let _: () = msg_send![obj, release];
+        }
+        str_obj
     }
 }
 
 /// Helper: create an ObjC NSURL from a Rust &str.
 /// SAFETY: returns a +0 (unowned) reference; caller must retain if needed.
 unsafe fn ns_url_from_str(url: &str) -> *mut objc::runtime::Object {
-    let cls_nsurl =
-        objc::runtime::Class::get("NSURL").expect("NSURL class always available at runtime");
+    let Some(cls_nsurl) = objc::runtime::Class::get("NSURL") else {
+        return std::ptr::null_mut();
+    };
     let url_str = ns_string_from_str(url);
     if url_str.is_null() {
         return std::ptr::null_mut();
@@ -242,176 +269,192 @@ fn register_webview2_nav_delegate_class() -> Option<*const objc::runtime::Class>
 
     // Add webView:didFinishNavigation: method
     extern "C" fn did_finish_nav(
-        self_: &objc::runtime::Object,
-        _cmd: objc::runtime::Sel,
-        _webview: *mut objc::runtime::Object,
-        _navigation: *mut objc::runtime::Object,
-    ) {
-        let ptr_val = self_ as *const _ as u64;
-        if let Ok(mut state) = DELEGATE_STATE.lock() {
-            // Find the webview_id for the delegate
-            if let Some(&webview_id) = state.view_to_webview_id.get(&ptr_val) {
-                // Update navigation state
-                state
-                    .nav_states
-                    .entry(webview_id)
-                    .and_modify(|ns| {
-                        ns.navigation_completed = true;
-                    });
-
-                // Fire NavigationCompleted callbacks
-                let uri = state
-                    .nav_states
-                    .get(&webview_id)
-                    .map(|ns| ns.current_uri.clone())
-                    .unwrap_or_default();
-                let callbacks: Vec<_> = state
-                    .on_navigation_completed
-                    .iter_mut()
-                    .map(|(id, cb)| (*id, cb(webview_id, &uri, true, 200)))
-                    .collect();
-                drop(callbacks);
-
-                eprintln!(
-                    "[WebView2] didFinishNavigation: webview_id={:#x}",
-                    webview_id,
-                );
-            }
-        }
-    }
-
-    extern "C" fn did_fail_nav(
-        self_: &objc::runtime::Object,
-        _cmd: objc::runtime::Sel,
-        _webview: *mut objc::runtime::Object,
-        _navigation: *mut objc::runtime::Object,
-        error: *mut objc::runtime::Object,
-    ) {
-        let ptr_val = self_ as *const _ as u64;
-        let error_desc = unsafe {
-            let desc: *mut objc::runtime::Object = msg_send![error, localizedDescription];
-            if desc.is_null() {
-                "unknown error".to_string()
-            } else {
-                let cstr: *const i8 = msg_send![desc, UTF8String];
-                if cstr.is_null() {
-                    "unknown error".to_string()
-                } else {
-                    std::ffi::CStr::from_ptr(cstr)
-                        .to_string_lossy()
-                        .into_owned()
-                }
-            }
-        };
-
-        if let Ok(mut state) = DELEGATE_STATE.lock() {
-            if let Some(&webview_id) = state.view_to_webview_id.get(&ptr_val) {
-                state
-                    .nav_states
-                    .entry(webview_id)
-                    .and_modify(|ns| {
-                        ns.navigation_completed = true;
-                        ns.navigation_error = Some(error_desc.clone());
-                    });
-
-                // Fire NavigationCompleted callbacks with failure
-                let uri = state
-                    .nav_states
-                    .get(&webview_id)
-                    .map(|ns| ns.current_uri.clone())
-                    .unwrap_or_default();
-                let callbacks: Vec<_> = state
-                    .on_navigation_completed
-                    .iter_mut()
-                    .map(|(id, cb)| (*id, cb(webview_id, &uri, false, 0)))
-                    .collect();
-                drop(callbacks);
-
-                eprintln!(
-                    "[WebView2] didFailNavigation: webview_id={:#x} error={}",
-                    webview_id, error_desc,
-                );
-            }
-        }
-    }
-
-    extern "C" fn did_commit_nav(
-        self_: &objc::runtime::Object,
-        _cmd: objc::runtime::Sel,
-        _webview: *mut objc::runtime::Object,
-        _navigation: *mut objc::runtime::Object,
-    ) {
-        let ptr_val = self_ as *const _ as u64;
-        if let Ok(mut state) = DELEGATE_STATE.lock() {
-            if let Some(&webview_id) = state.view_to_webview_id.get(&ptr_val) {
-                state
-                    .nav_states
-                    .entry(webview_id)
-                    .and_modify(|ns| {
-                        ns.navigation_started = true;
-                    });
-            }
-        }
-    }
-
-    extern "C" fn did_start_prov_nav(
-        self_: &objc::runtime::Object,
+        _self_: &objc::runtime::Object,
         _cmd: objc::runtime::Sel,
         webview: *mut objc::runtime::Object,
         _navigation: *mut objc::runtime::Object,
     ) {
-        let ptr_val = self_ as *const _ as u64;
-        if let Ok(mut state) = DELEGATE_STATE.lock() {
-            if let Some(&webview_id) = state.view_to_webview_id.get(&ptr_val) {
-                // Get the URL from the webview
-                let uri = unsafe {
-                    let url: *mut objc::runtime::Object = msg_send![webview, URL];
-                    if url.is_null() {
+        // The delegate object is shared across all webviews of an
+        // environment, so the webview ID must be looked up by the WKWebView
+        // pointer that produced this callback, not by the delegate pointer.
+        let ptr_val = webview as *const _ as u64;
+        let (webview_id, uri, callbacks) = {
+            let mut state = delegate_state();
+            let Some(&webview_id) = state.view_to_webview_id.get(&ptr_val) else {
+                return;
+            };
+            // Update navigation state
+            state
+                .nav_states
+                .entry(webview_id)
+                .and_modify(|ns| {
+                    ns.navigation_completed = true;
+                });
+
+            // Collect NavigationCompleted callbacks
+            let uri = state
+                .nav_states
+                .get(&webview_id)
+                .map(|ns| ns.current_uri.clone())
+                .unwrap_or_default();
+            let callbacks = std::mem::take(&mut state.on_navigation_completed);
+            (webview_id, uri, callbacks)
+        };
+
+        // Invoke callbacks without holding the state lock: user callbacks
+        // may re-enter WebView2 APIs that lock DELEGATE_STATE.
+        for (id, mut cb) in callbacks {
+            cb(webview_id, &uri, true, 200);
+            delegate_state().on_navigation_completed.push((id, cb));
+        }
+
+        eprintln!(
+            "[WebView2] didFinishNavigation: webview_id={:#x}",
+            webview_id,
+        );
+    }
+
+    extern "C" fn did_fail_nav(
+        _self_: &objc::runtime::Object,
+        _cmd: objc::runtime::Sel,
+        webview: *mut objc::runtime::Object,
+        _navigation: *mut objc::runtime::Object,
+        error: *mut objc::runtime::Object,
+    ) {
+        let ptr_val = webview as *const _ as u64;
+        let error_desc = if error.is_null() {
+            "unknown error".to_string()
+        } else {
+            unsafe {
+                let desc: *mut objc::runtime::Object = msg_send![error, localizedDescription];
+                if desc.is_null() {
+                    "unknown error".to_string()
+                } else {
+                    let cstr: *const i8 = msg_send![desc, UTF8String];
+                    if cstr.is_null() {
+                        "unknown error".to_string()
+                    } else {
+                        std::ffi::CStr::from_ptr(cstr)
+                            .to_string_lossy()
+                            .into_owned()
+                    }
+                }
+            }
+        };
+
+        let (webview_id, uri, callbacks) = {
+            let mut state = delegate_state();
+            let Some(&webview_id) = state.view_to_webview_id.get(&ptr_val) else {
+                return;
+            };
+            state
+                .nav_states
+                .entry(webview_id)
+                .and_modify(|ns| {
+                    ns.navigation_completed = true;
+                    ns.navigation_error = Some(error_desc.clone());
+                });
+
+            // Collect NavigationCompleted callbacks
+            let uri = state
+                .nav_states
+                .get(&webview_id)
+                .map(|ns| ns.current_uri.clone())
+                .unwrap_or_default();
+            let callbacks = std::mem::take(&mut state.on_navigation_completed);
+            (webview_id, uri, callbacks)
+        };
+
+        // Invoke callbacks without holding the state lock.
+        for (id, mut cb) in callbacks {
+            cb(webview_id, &uri, false, 0);
+            delegate_state().on_navigation_completed.push((id, cb));
+        }
+
+        eprintln!(
+            "[WebView2] didFailNavigation: webview_id={:#x} error={}",
+            webview_id, error_desc,
+        );
+    }
+
+    extern "C" fn did_commit_nav(
+        _self_: &objc::runtime::Object,
+        _cmd: objc::runtime::Sel,
+        webview: *mut objc::runtime::Object,
+        _navigation: *mut objc::runtime::Object,
+    ) {
+        let ptr_val = webview as *const _ as u64;
+        let mut state = delegate_state();
+        if let Some(&webview_id) = state.view_to_webview_id.get(&ptr_val) {
+            state
+                .nav_states
+                .entry(webview_id)
+                .and_modify(|ns| {
+                    ns.navigation_started = true;
+                });
+        }
+    }
+
+    extern "C" fn did_start_prov_nav(
+        _self_: &objc::runtime::Object,
+        _cmd: objc::runtime::Sel,
+        webview: *mut objc::runtime::Object,
+        _navigation: *mut objc::runtime::Object,
+    ) {
+        let ptr_val = webview as *const _ as u64;
+        // Get the URL from the webview
+        let uri = unsafe {
+            let url: *mut objc::runtime::Object = msg_send![webview, URL];
+            if url.is_null() {
+                String::new()
+            } else {
+                let url_str: *mut objc::runtime::Object =
+                    msg_send![url, absoluteString];
+                if url_str.is_null() {
+                    String::new()
+                } else {
+                    let cstr: *const i8 = msg_send![url_str, UTF8String];
+                    if cstr.is_null() {
                         String::new()
                     } else {
-                        let url_str: *mut objc::runtime::Object =
-                            msg_send![url, absoluteString];
-                        if url_str.is_null() {
-                            String::new()
-                        } else {
-                            let cstr: *const i8 = msg_send![url_str, UTF8String];
-                            if cstr.is_null() {
-                                String::new()
-                            } else {
-                                std::ffi::CStr::from_ptr(cstr)
-                                    .to_string_lossy()
-                                    .into_owned()
-                            }
-                        }
+                        std::ffi::CStr::from_ptr(cstr)
+                            .to_string_lossy()
+                            .into_owned()
                     }
-                };
-
-                state
-                    .nav_states
-                    .entry(webview_id)
-                    .and_modify(|ns| {
-                        ns.current_uri = uri.clone();
-                        ns.navigation_started = true;
-                        ns.navigation_completed = false;
-                        ns.navigation_error = None;
-                    });
-
-                // Fire ContentLoading callbacks
-                let callbacks: Vec<_> = state
-                    .on_content_loading
-                    .iter_mut()
-                    .map(|(id, cb)| (*id, cb(webview_id, &uri)))
-                    .collect();
-                drop(callbacks);
-
-                // Fire NavigationStarting callbacks
-                let callbacks: Vec<_> = state
-                    .on_navigation_starting
-                    .iter_mut()
-                    .map(|(id, cb)| (*id, cb(webview_id, &uri, false)))
-                    .collect();
-                drop(callbacks);
+                }
             }
+        };
+
+        let (webview_id, content_loading_cbs, nav_starting_cbs) = {
+            let mut state = delegate_state();
+            let Some(&webview_id) = state.view_to_webview_id.get(&ptr_val) else {
+                return;
+            };
+            state
+                .nav_states
+                .entry(webview_id)
+                .and_modify(|ns| {
+                    ns.current_uri = uri.clone();
+                    ns.navigation_started = true;
+                    ns.navigation_completed = false;
+                    ns.navigation_error = None;
+                });
+
+            let content_loading_cbs = std::mem::take(&mut state.on_content_loading);
+            let nav_starting_cbs = std::mem::take(&mut state.on_navigation_starting);
+            (webview_id, content_loading_cbs, nav_starting_cbs)
+        };
+
+        // Invoke callbacks without holding the state lock. The navigation is
+        // already in progress here, so the cancel result is informational
+        // only.
+        for (id, mut cb) in content_loading_cbs {
+            cb(webview_id, &uri);
+            delegate_state().on_content_loading.push((id, cb));
+        }
+        for (id, mut cb) in nav_starting_cbs {
+            let _ = cb(webview_id, &uri, false);
+            delegate_state().on_navigation_starting.push((id, cb));
         }
     }
 
@@ -486,7 +529,24 @@ fn register_webview2_msg_handler_class() -> Option<*const objc::runtime::Class> 
         _controller: *mut objc::runtime::Object,
         message: *mut objc::runtime::Object,
     ) {
-        let ptr_val = self_ as *const _ as u64;
+        // The message handler object is shared across all webviews of an
+        // environment, so resolve the originating WKWebView from the
+        // WKScriptMessage (falls back to the handler itself only if the
+        // runtime does not expose the webView property).
+        let webview_ptr: *mut objc::runtime::Object = unsafe {
+            let responds: bool = msg_send![message, respondsToSelector: objc::sel!(webView)];
+            if responds {
+                msg_send![message, webView]
+            } else {
+                std::ptr::null_mut()
+            }
+        };
+        let ptr_val = if webview_ptr.is_null() {
+            self_ as *const _ as u64
+        } else {
+            webview_ptr as *const _ as u64
+        };
+
         // Extract the message body as JSON string
         let body_json = unsafe {
             let body: *mut objc::runtime::Object = msg_send![message, body];
@@ -510,15 +570,19 @@ fn register_webview2_msg_handler_class() -> Option<*const objc::runtime::Class> 
             }
         };
 
-        if let Ok(mut state) = DELEGATE_STATE.lock() {
-            if let Some(&webview_id) = state.view_to_webview_id.get(&ptr_val) {
-                let callbacks: Vec<_> = state
-                    .on_web_message_received
-                    .iter_mut()
-                    .map(|(id, cb)| (*id, cb(webview_id, &body_json)))
-                    .collect();
-                drop(callbacks);
-            }
+        let (webview_id, callbacks) = {
+            let mut state = delegate_state();
+            let Some(&webview_id) = state.view_to_webview_id.get(&ptr_val) else {
+                return;
+            };
+            let callbacks = std::mem::take(&mut state.on_web_message_received);
+            (webview_id, callbacks)
+        };
+
+        // Invoke callbacks without holding the state lock.
+        for (id, mut cb) in callbacks {
+            cb(webview_id, &body_json);
+            delegate_state().on_web_message_received.push((id, cb));
         }
     }
 
@@ -718,6 +782,12 @@ impl WebView2Settings {
     }
 }
 
+impl Default for WebView2Settings {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Native WKWebView FFI helpers
 // ---------------------------------------------------------------------------
@@ -777,6 +847,12 @@ fn create_wkwebview_native(
             let _: () = msg_send![config, setProcessPool: pool];
             let _: () = msg_send![config, setUserContentController: uc];
 
+            // The configuration retains the pool, preferences and user
+            // content controller; drop the local +1 references.
+            let _: () = msg_send![pool, release];
+            let _: () = msg_send![prefs, release];
+            let _: () = msg_send![uc, release];
+
             config
         } else {
             configuration
@@ -800,6 +876,8 @@ fn create_wkwebview_native(
                 // Use KVC to set customUserAgent
                 let key = ns_string_from_str("customUserAgent");
                 let _: () = msg_send![view, setValue: ua_str forKey: key];
+                let _: () = msg_send![key, release];
+                let _: () = msg_send![ua_str, release];
             }
         }
 
@@ -889,12 +967,18 @@ fn navigate_html_wkwebview_native(native_ptr: *mut std::ffi::c_void, html: &str)
             }
 
             // Use nil for baseURL (or could provide about:blank)
-            let cls_url = objc::runtime::Class::get("NSURL")
-                .expect("NSURL class always available at runtime");
-            let base_url_str = ns_string_from_str("about:blank");
-            let base_url: *mut objc::runtime::Object = msg_send![cls_url, URLWithString: base_url_str];
+            let base_url = if let Some(cls_url) = objc::runtime::Class::get("NSURL") {
+                let base_url_str = ns_string_from_str("about:blank");
+                let url: *mut objc::runtime::Object =
+                    msg_send![cls_url, URLWithString: base_url_str];
+                let _: () = msg_send![base_url_str, release];
+                url
+            } else {
+                std::ptr::null_mut()
+            };
 
             let _: () = msg_send![view, loadHTMLString: html_str baseURL: base_url];
+            let _: () = msg_send![html_str, release];
         }) {
             let msg = if let Some(s) = panic_err.downcast_ref::<&str>() {
                 s.to_string()
@@ -959,6 +1043,58 @@ fn get_uri_wkwebview_native(native_ptr: *mut std::ffi::c_void) -> String {
     }
 }
 
+/// Process-wide completion handler for `evaluateJavaScript:completionHandler:`.
+///
+/// Built with the `block` crate so the block has a valid isa
+/// (`_NSConcreteStackBlock`) and a proper descriptor with copy/dispose
+/// helpers. WKWebView copies the block before invoking it asynchronously,
+/// and the copy is kept alive for the process lifetime.
+struct JsCompletionBlock(
+    RcBlock<(*mut objc::runtime::Object, *mut objc::runtime::Object), ()>,
+);
+
+// SAFETY: the block has no captures, is created once at first use, is never
+// mutated or freed (owned by the static), and is only ever passed by
+// pointer to WebKit.
+unsafe impl Send for JsCompletionBlock {}
+unsafe impl Sync for JsCompletionBlock {}
+
+static JS_COMPLETION_BLOCK: LazyLock<JsCompletionBlock> = LazyLock::new(|| {
+    let block = ConcreteBlock::new(
+        |result: *mut objc::runtime::Object, error: *mut objc::runtime::Object| {
+            // SAFETY: Objective-C runtime message sending on objects owned
+            // by the WebKit framework.
+            unsafe {
+                if !error.is_null() {
+                    let desc: *mut objc::runtime::Object = msg_send![error, localizedDescription];
+                    if !desc.is_null() {
+                        let cstr: *const i8 = msg_send![desc, UTF8String];
+                        if !cstr.is_null() {
+                            let err_str = std::ffi::CStr::from_ptr(cstr)
+                                .to_string_lossy()
+                                .into_owned();
+                            eprintln!("[WebView2] JS execution error: {err_str}");
+                        }
+                    }
+                } else if !result.is_null() {
+                    let desc: *mut objc::runtime::Object = msg_send![result, description];
+                    if !desc.is_null() {
+                        let cstr: *const i8 = msg_send![desc, UTF8String];
+                        if !cstr.is_null() {
+                            let result_str = std::ffi::CStr::from_ptr(cstr)
+                                .to_string_lossy()
+                                .into_owned();
+                            let preview: String = result_str.chars().take(200).collect();
+                            eprintln!("[WebView2] JS execution result: {preview}");
+                        }
+                    }
+                }
+            }
+        },
+    );
+    JsCompletionBlock(block.copy())
+});
+
 /// Execute JavaScript in a WKWebView using `evaluateJavaScript:completionHandler:`.
 fn execute_js_wkwebview_native(native_ptr: *mut std::ffi::c_void, script: &str) {
     if native_ptr.is_null() {
@@ -974,76 +1110,15 @@ fn execute_js_wkwebview_native(native_ptr: *mut std::ffi::c_void, script: &str) 
                 return;
             }
 
-            // Create a minimal block for the completion handler.
-            // Block signature: void (^)(id _Nullable, NSError * _Nullable)
-            extern "C" fn js_completion_block(
-                _block: *const std::ffi::c_void,
-                result: *mut objc::runtime::Object,
-                error: *mut objc::runtime::Object,
-            ) {
-                // SAFETY: Objective-C runtime message sending
-                unsafe {
-                    if !error.is_null() {
-                        let desc: *mut objc::runtime::Object =
-                            msg_send![error, localizedDescription];
-                        if !desc.is_null() {
-                            let cstr: *const i8 = msg_send![desc, UTF8String];
-                            if !cstr.is_null() {
-                                let err_str = std::ffi::CStr::from_ptr(cstr)
-                                    .to_string_lossy()
-                                    .into_owned();
-                                eprintln!("[WebView2] JS execution error: {err_str}");
-                            }
-                        }
-                    } else if !result.is_null() {
-                        let desc: *mut objc::runtime::Object = msg_send![result, description];
-                        if !desc.is_null() {
-                            let cstr: *const i8 = msg_send![desc, UTF8String];
-                            if !cstr.is_null() {
-                                let result_str = std::ffi::CStr::from_ptr(cstr)
-                                    .to_string_lossy()
-                                    .into_owned();
-                                eprintln!(
-                                    "[WebView2] JS execution result: {}",
-                                    &result_str[..result_str.len().min(200)]
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Build a stack-block for the completion handler.
-            // Block descriptor struct.
-            #[repr(C)]
-            struct BlockDescriptor {
-                reserved: usize,
-                size: usize,
-            }
-
-            #[repr(C)]
-            struct StackBlock {
-                isa: *const std::ffi::c_void,
-                flags: i32,
-                reserved: i32,
-                invoke: *const std::ffi::c_void,
-                descriptor: *const BlockDescriptor,
-            }
-
-            static DESCRIPTOR: BlockDescriptor = BlockDescriptor {
-                reserved: 0,
-                size: std::mem::size_of::<StackBlock>(),
-            };
-
-            let block = StackBlock {
-                isa: std::ptr::null(), // will be set by _NSConcreteStackBlock
-                flags: 1 << 25,        // BLOCK_HAS_COPY_DISPOSE
-                reserved: 0,
-                invoke: js_completion_block as *const std::ffi::c_void,
-                descriptor: &DESCRIPTOR as *const BlockDescriptor,
-            };
-
-            let _: () = msg_send![view, evaluateJavaScript: js_str completionHandler: &block];
+            // Pass a well-formed completion-handler block. WKWebView copies
+            // it (via _Block_copy) before invoking it asynchronously, and
+            // the static copy above stays alive for the process lifetime.
+            let _: () = msg_send![
+                view,
+                evaluateJavaScript: js_str
+                completionHandler: &JS_COMPLETION_BLOCK.0
+            ];
+            let _: () = msg_send![js_str, release];
         }) {
             let msg = if let Some(s) = panic_err.downcast_ref::<&str>() {
                 s.to_string()
@@ -1093,6 +1168,8 @@ fn add_user_script_wkwebview_native(
                 injectionTime: injection_time
                 forMainFrameOnly: for_main_frame_only as u8
             ];
+            // The initializer copies the script string; drop our +1 refs.
+            let _: () = msg_send![script_str, release];
 
             if !user_script.is_null() {
                 // Get the configuration's user content controller
@@ -1104,6 +1181,9 @@ fn add_user_script_wkwebview_native(
                         let _: () = msg_send![uc, addUserScript: user_script];
                     }
                 }
+                // The user content controller retains the script; drop the
+                // +1 from alloc/init.
+                let _: () = msg_send![user_script, release];
             }
         }) {
             let msg = if let Some(s) = panic_err.downcast_ref::<&str>() {
@@ -1167,7 +1247,8 @@ fn set_hidden_wkwebview_native(native_ptr: *mut std::ffi::c_void, hidden: bool) 
     }
 }
 
-/// Close/destroy a WKWebView: stop loading, remove from superview.
+/// Close/destroy a WKWebView: stop loading, detach the navigation delegate,
+/// remove from superview and release the +1 from alloc/init.
 fn close_wkwebview_native(native_ptr: *mut std::ffi::c_void) {
     if native_ptr.is_null() {
         return;
@@ -1178,7 +1259,16 @@ fn close_wkwebview_native(native_ptr: *mut std::ffi::c_void) {
             // SAFETY: Standard NSView/WKWebView teardown sequence.
             let view = native_ptr as *mut objc::runtime::Object;
             let _: () = msg_send![view, stopLoading];
+            // The navigation delegate is a weak (assign) reference shared
+            // across the environment's webviews; clear it so no callback can
+            // reach the delegate after teardown.
+            let _: () = msg_send![
+                view,
+                setNavigationDelegate: std::ptr::null_mut::<objc::runtime::Object>()
+            ];
             let _: () = msg_send![view, removeFromSuperview];
+            // Balance the +1 from alloc/initWithFrame:configuration:.
+            let _: () = msg_send![view, release];
         }) {
             let msg = if let Some(s) = panic_err.downcast_ref::<&str>() {
                 s.to_string()
@@ -1235,11 +1325,15 @@ fn create_wkwebview_configuration(
 
         if let Some(handler_ptr) = msg_handler {
             let handler_name = ns_string_from_str("webview2");
-            let _: () = msg_send![
-                uc,
-                addScriptMessageHandler: handler_ptr as *mut objc::runtime::Object
-                name: handler_name
-            ];
+            if !handler_name.is_null() {
+                let _: () = msg_send![
+                    uc,
+                    addScriptMessageHandler: handler_ptr
+                    name: handler_name
+                ];
+                // The user content controller copies the name; drop our +1.
+                let _: () = msg_send![handler_name, release];
+            }
         }
 
         // Create configuration
@@ -1247,6 +1341,12 @@ fn create_wkwebview_configuration(
         let _: () = msg_send![config, setPreferences: prefs];
         let _: () = msg_send![config, setProcessPool: pool];
         let _: () = msg_send![config, setUserContentController: uc];
+
+        // The configuration retains the pool, preferences and user content
+        // controller; drop the local +1 references.
+        let _: () = msg_send![pool, release];
+        let _: () = msg_send![prefs, release];
+        let _: () = msg_send![uc, release];
 
         // Set navigation delegate on the configuration for future webviews
         // (Note: navigation delegate is set per-webview, not on configuration)
@@ -1358,13 +1458,6 @@ impl WebView2Environment {
 
             let native_config = if config.is_null() { None } else { Some(config as *mut std::ffi::c_void) };
 
-            // Register delegate pointer in global state
-            if let (Some(_nd), Ok(_state)) = (nav_delegate, DELEGATE_STATE.lock()) {
-                // The delegate itself doesn't map to a webview, we use
-                // view_to_webview_id for the webview-to-delegate mapping
-                // which is set when controllers are created.
-            }
-
             Self {
                 browser_exe_path: None,
                 user_data_folder: None,
@@ -1451,6 +1544,10 @@ pub struct WebView2Controller {
     pub zoom_factor: f64,
     /// Native WKWebView object pointer.
     pub native_webview: Option<*mut std::ffi::c_void>,
+    /// Retained reference to the environment's shared navigation delegate.
+    /// Kept so the delegate outlives this controller's webview even when the
+    /// environment is dropped first (the webview holds the delegate weakly).
+    pub nav_delegate_ref: Option<*mut std::ffi::c_void>,
 }
 
 // SAFETY: WebView2Controller holds an opaque ObjC pointer that is Send + Sync
@@ -1466,6 +1563,7 @@ impl Clone for WebView2Controller {
             is_visible: self.is_visible,
             zoom_factor: self.zoom_factor,
             native_webview: None,
+            nav_delegate_ref: None,
         }
     }
 }
@@ -1477,6 +1575,7 @@ impl WebView2Controller {
         webview_id: u64,
         width: i32,
         height: i32,
+        parent_hwnd: u64,
     ) -> Self {
         #[cfg(target_os = "macos")]
         {
@@ -1496,6 +1595,7 @@ impl WebView2Controller {
             );
 
             // Set navigation delegate on the webview
+            let mut nav_delegate_ref = None;
             if !native_ptr.is_null() {
                 let nav_delegate = env.nav_delegate_ptr();
                 if !nav_delegate.is_null() {
@@ -1503,27 +1603,36 @@ impl WebView2Controller {
                         native_ptr,
                         nav_delegate as *mut objc::runtime::Object,
                     );
+                    // Retain the shared delegate so it stays alive until this
+                    // controller is closed, even if the environment is
+                    // dropped first.
+                    unsafe {
+                        let _: () = msg_send![
+                            nav_delegate as *mut objc::runtime::Object,
+                            retain
+                        ];
+                    }
+                    nav_delegate_ref = Some(nav_delegate);
                 }
 
                 // Register the view in the delegate state
-                if let Ok(mut state) = DELEGATE_STATE.lock() {
-                    let ptr_val = native_ptr as u64;
-                    state.view_to_webview_id.insert(ptr_val, webview_id);
-                    state.nav_states.insert(
-                        webview_id,
-                        NavigationState {
-                            navigation_started: false,
-                            navigation_completed: false,
-                            navigation_error: None,
-                            current_uri: String::new(),
-                        },
-                    );
-                }
+                let mut state = delegate_state();
+                let ptr_val = native_ptr as u64;
+                state.view_to_webview_id.insert(ptr_val, webview_id);
+                state.nav_states.insert(
+                    webview_id,
+                    NavigationState {
+                        navigation_started: false,
+                        navigation_completed: false,
+                        navigation_error: None,
+                        current_uri: String::new(),
+                    },
+                );
             }
 
             Self {
                 webview_id,
-                parent_hwnd: 0,
+                parent_hwnd,
                 bounds: (0, 0, width, height),
                 is_visible: true,
                 zoom_factor: 1.0,
@@ -1532,6 +1641,7 @@ impl WebView2Controller {
                 } else {
                     Some(native_ptr)
                 },
+                nav_delegate_ref,
             }
         }
 
@@ -1539,11 +1649,12 @@ impl WebView2Controller {
         {
             Self {
                 webview_id,
-                parent_hwnd: 0,
+                parent_hwnd,
                 bounds: (0, 0, width, height),
                 is_visible: true,
                 zoom_factor: 1.0,
                 native_webview: None,
+                nav_delegate_ref: None,
             }
         }
     }
@@ -1577,8 +1688,9 @@ impl WebView2Controller {
 
     /// Navigate to a URL.
     pub fn navigate(&self, url: &str) {
-        // Fire NavigationStarting callback
-        if let Ok(mut state) = DELEGATE_STATE.lock() {
+        // Collect NavigationStarting callbacks under the lock...
+        let callbacks: Vec<(u64, NavigationStartingCallback)> = {
+            let mut state = delegate_state();
             state
                 .nav_states
                 .entry(self.webview_id)
@@ -1587,14 +1699,22 @@ impl WebView2Controller {
                     ns.navigation_started = true;
                     ns.navigation_completed = false;
                 });
-            let callbacks: Vec<_> = state
-                .on_navigation_starting
-                .iter_mut()
-                .map(|(id, cb)| (*id, cb(self.webview_id, url, false)))
-                .collect();
-            drop(callbacks);
+            std::mem::take(&mut state.on_navigation_starting)
+        };
+
+        // ...and invoke them without the lock, so callbacks may re-enter
+        // WebView2 APIs. Any callback returning true cancels the navigation.
+        let mut should_cancel = false;
+        for (id, mut cb) in callbacks {
+            if cb(self.webview_id, url, false) {
+                should_cancel = true;
+            }
+            delegate_state().on_navigation_starting.push((id, cb));
         }
 
+        if should_cancel {
+            return;
+        }
         navigate_wkwebview_native(self.native_ptr(), url);
     }
 
@@ -1626,7 +1746,8 @@ impl WebView2Controller {
     /// Close and destroy the webview.
     pub fn close(&mut self) {
         // Clean up delegate state
-        if let Ok(mut state) = DELEGATE_STATE.lock() {
+        {
+            let mut state = delegate_state();
             if let Some(ptr) = self.native_webview {
                 state.view_to_webview_id.remove(&(ptr as u64));
             }
@@ -1635,6 +1756,14 @@ impl WebView2Controller {
 
         close_wkwebview_native(self.native_ptr());
         self.native_webview = None;
+        // The webview no longer references the shared navigation delegate
+        // (it was cleared and the view released in close_wkwebview_native);
+        // drop our retained reference last.
+        if let Some(ptr) = self.nav_delegate_ref.take() {
+            unsafe {
+                let _: () = msg_send![ptr as *mut objc::runtime::Object, release];
+            }
+        }
     }
 }
 
@@ -1642,15 +1771,7 @@ impl Drop for WebView2Controller {
     fn drop(&mut self) {
         // Close the webview if still alive
         if self.native_webview.is_some() {
-            // Clean up delegate state
-            if let Ok(mut state) = DELEGATE_STATE.lock() {
-                if let Some(ptr) = self.native_webview {
-                    state.view_to_webview_id.remove(&(ptr as u64));
-                }
-                state.nav_states.remove(&self.webview_id);
-            }
-            close_wkwebview_native(self.native_ptr());
-            self.native_webview = None;
+            self.close();
         }
     }
 }
@@ -1682,6 +1803,15 @@ impl WebView2Runtime {
             next_id: 1,
         }
     }
+}
+
+impl Default for WebView2Runtime {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl WebView2Runtime {
 
     /// Create a new WebView2 environment backed by WKWebView.
     pub fn create_environment(&mut self, _options: u64) -> u64 {
@@ -1699,25 +1829,20 @@ impl WebView2Runtime {
         let webview_id = self.create_webview();
 
         // Look up environment for configuration
-        let (has_native, width, height) = if let Some(env) = self.environments.get(&env_id) {
-            (env.is_valid(), 800, 600)
-        } else {
-            (false, 800, 600)
-        };
-
-        let controller = if has_native {
-            let env = self.environments.get(&env_id).unwrap();
-            WebView2Controller::create(env, webview_id, width, height)
-        } else {
-            WebView2Controller {
-                webview_id,
-                parent_hwnd,
-                bounds: (0, 0, width, height),
-                is_visible: true,
-                zoom_factor: 1.0,
-                native_webview: None,
-            }
-        };
+        let controller =
+            if let Some(env) = self.environments.get(&env_id).filter(|e| e.is_valid()) {
+                WebView2Controller::create(env, webview_id, 800, 600, parent_hwnd)
+            } else {
+                WebView2Controller {
+                    webview_id,
+                    parent_hwnd,
+                    bounds: (0, 0, 800, 600),
+                    is_visible: true,
+                    zoom_factor: 1.0,
+                    native_webview: None,
+                    nav_delegate_ref: None,
+                }
+            };
 
         self.controllers.insert(id, controller);
         // Link the environment to this controller if it exists
@@ -1793,6 +1918,11 @@ impl WebView2Runtime {
             self.webviews.remove(&ctrl.webview_id);
             self.settings.remove(&ctrl.webview_id);
         }
+        // Drop the stale controller ID from its owning environment so
+        // env.controllers stays in sync with reality.
+        for env in self.environments.values_mut() {
+            env.controllers.retain(|cid| *cid != id);
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1821,16 +1951,13 @@ impl WebView2Runtime {
     where
         F: FnMut(u64, &str, bool) -> bool + Send + 'static,
     {
-        if let Ok(mut state) = DELEGATE_STATE.lock() {
-            let id = state.next_callback_id;
-            state.next_callback_id += 1;
-            state
-                .on_navigation_starting
-                .push((id, Box::new(callback)));
-            id
-        } else {
-            0
-        }
+        let mut state = delegate_state();
+        let id = state.next_callback_id;
+        state.next_callback_id += 1;
+        state
+            .on_navigation_starting
+            .push((id, Box::new(callback)));
+        id
     }
 
     /// Register a NavigationCompleted callback.
@@ -1838,16 +1965,13 @@ impl WebView2Runtime {
     where
         F: FnMut(u64, &str, bool, u32) + Send + 'static,
     {
-        if let Ok(mut state) = DELEGATE_STATE.lock() {
-            let id = state.next_callback_id;
-            state.next_callback_id += 1;
-            state
-                .on_navigation_completed
-                .push((id, Box::new(callback)));
-            id
-        } else {
-            0
-        }
+        let mut state = delegate_state();
+        let id = state.next_callback_id;
+        state.next_callback_id += 1;
+        state
+            .on_navigation_completed
+            .push((id, Box::new(callback)));
+        id
     }
 
     /// Register a SourceChanged callback.
@@ -1855,14 +1979,11 @@ impl WebView2Runtime {
     where
         F: FnMut(u64, &str) + Send + 'static,
     {
-        if let Ok(mut state) = DELEGATE_STATE.lock() {
-            let id = state.next_callback_id;
-            state.next_callback_id += 1;
-            state.on_source_changed.push((id, Box::new(callback)));
-            id
-        } else {
-            0
-        }
+        let mut state = delegate_state();
+        let id = state.next_callback_id;
+        state.next_callback_id += 1;
+        state.on_source_changed.push((id, Box::new(callback)));
+        id
     }
 
     /// Register a ContentLoading callback.
@@ -1870,14 +1991,11 @@ impl WebView2Runtime {
     where
         F: FnMut(u64, &str) + Send + 'static,
     {
-        if let Ok(mut state) = DELEGATE_STATE.lock() {
-            let id = state.next_callback_id;
-            state.next_callback_id += 1;
-            state.on_content_loading.push((id, Box::new(callback)));
-            id
-        } else {
-            0
-        }
+        let mut state = delegate_state();
+        let id = state.next_callback_id;
+        state.next_callback_id += 1;
+        state.on_content_loading.push((id, Box::new(callback)));
+        id
     }
 
     /// Register a WebMessageReceived callback.
@@ -1885,28 +2003,24 @@ impl WebView2Runtime {
     where
         F: FnMut(u64, &str) + Send + 'static,
     {
-        if let Ok(mut state) = DELEGATE_STATE.lock() {
-            let id = state.next_callback_id;
-            state.next_callback_id += 1;
-            state
-                .on_web_message_received
-                .push((id, Box::new(callback)));
-            id
-        } else {
-            0
-        }
+        let mut state = delegate_state();
+        let id = state.next_callback_id;
+        state.next_callback_id += 1;
+        state
+            .on_web_message_received
+            .push((id, Box::new(callback)));
+        id
     }
 
     /// Unregister a callback by its ID.
     pub fn unregister_callback(&mut self, callback_id: u64) {
-        if let Ok(mut state) = DELEGATE_STATE.lock() {
-            state.on_navigation_starting.retain(|(id, _)| *id != callback_id);
-            state.on_navigation_completed.retain(|(id, _)| *id != callback_id);
-            state.on_source_changed.retain(|(id, _)| *id != callback_id);
-            state.on_content_loading.retain(|(id, _)| *id != callback_id);
-            state.on_web_message_received.retain(|(id, _)| *id != callback_id);
-            state.on_new_window_requested.retain(|(id, _)| *id != callback_id);
-        }
+        let mut state = delegate_state();
+        state.on_navigation_starting.retain(|(id, _)| *id != callback_id);
+        state.on_navigation_completed.retain(|(id, _)| *id != callback_id);
+        state.on_source_changed.retain(|(id, _)| *id != callback_id);
+        state.on_content_loading.retain(|(id, _)| *id != callback_id);
+        state.on_web_message_received.retain(|(id, _)| *id != callback_id);
+        state.on_new_window_requested.retain(|(id, _)| *id != callback_id);
     }
 
     // -----------------------------------------------------------------------
@@ -2034,24 +2148,31 @@ impl WebView2Runtime {
     }
 
     /// Trigger all registered NavigationStarting callbacks with the given args.
-    pub fn fire_navigation_starting(&self, _webview_id: u64, _uri: &str) {
-        for (token, _callback_ptr) in &self.events.navigation_starting {
-            let _ = token;
-            eprintln!(
-                "[WebView2] NavigationStarting event fired (token={})",
-                token
-            );
+    /// Returns true if any callback requested cancellation.
+    pub fn fire_navigation_starting(&self, webview_id: u64, uri: &str) -> bool {
+        let callbacks: Vec<(u64, NavigationStartingCallback)> = {
+            let mut state = delegate_state();
+            std::mem::take(&mut state.on_navigation_starting)
+        };
+        let mut should_cancel = false;
+        for (id, mut cb) in callbacks {
+            if cb(webview_id, uri, false) {
+                should_cancel = true;
+            }
+            delegate_state().on_navigation_starting.push((id, cb));
         }
+        should_cancel
     }
 
     /// Trigger all registered NavigationCompleted callbacks.
-    pub fn fire_navigation_completed(&self, _webview_id: u64, _is_success: bool) {
-        for (token, _callback_ptr) in &self.events.navigation_completed {
-            let _ = token;
-            eprintln!(
-                "[WebView2] NavigationCompleted event fired (token={})",
-                token
-            );
+    pub fn fire_navigation_completed(&self, webview_id: u64, is_success: bool) {
+        let callbacks: Vec<(u64, NavigationCompletedCallback)> = {
+            let mut state = delegate_state();
+            std::mem::take(&mut state.on_navigation_completed)
+        };
+        for (id, mut cb) in callbacks {
+            cb(webview_id, "", is_success, 200);
+            delegate_state().on_navigation_completed.push((id, cb));
         }
     }
 }
@@ -2094,7 +2215,7 @@ impl WebView2Instance {
     /// Navigate to an HTML string via a data: URL.
     pub fn navigate_to_string(&mut self, html: &str) {
         let encoded = percent_encode_data_url(html);
-        let data_url = format!("data:text/html,{}", encoded);
+        let data_url = format!("data:text/html;charset=utf-8,{}", encoded);
         if let Some(ceh_id) = self.ceh_handle {
             crate::cef_bridge::with_global_cef_bridge(|bridge| {
                 if let Err(e) = bridge.cef_frame_load_url(ceh_id, &data_url) {
@@ -2121,13 +2242,9 @@ impl WebView2Instance {
     /// Post a web message as JSON.
     pub fn post_web_message_as_json(&mut self, json: &str) {
         if self.is_web_message_enabled {
-            self.web_messages.push(json.to_string());
+            push_web_message(&mut self.web_messages, json.to_string());
             if let Some(ceh_id) = self.ceh_handle {
-                let escaped = json
-                    .replace('\\', "\\\\")
-                    .replace('\'', "\\'")
-                    .replace('\n', "\\n")
-                    .replace('\r', "\\r");
+                let escaped = escape_js_string_literal(json);
                 let js = format!(
                     "window.dispatchEvent(new MessageEvent('message', {{ data: JSON.parse('{}') }}));",
                     escaped
@@ -2144,13 +2261,9 @@ impl WebView2Instance {
     /// Post a web message as a plain string.
     pub fn post_web_message_as_string(&mut self, msg: &str) {
         if self.is_web_message_enabled {
-            self.web_messages.push(msg.to_string());
+            push_web_message(&mut self.web_messages, msg.to_string());
             if let Some(ceh_id) = self.ceh_handle {
-                let escaped = msg
-                    .replace('\\', "\\\\")
-                    .replace('\'', "\\'")
-                    .replace('\n', "\\n")
-                    .replace('\r', "\\r");
+                let escaped = escape_js_string_literal(msg);
                 let js = format!(
                     "window.dispatchEvent(new MessageEvent('message', {{ data: '{}' }}));",
                     escaped
@@ -2206,12 +2319,12 @@ impl WebView2Instance {
             crate::cef_bridge::with_global_cef_bridge(|bridge| {
                 if let Ok(mgr) = bridge.ensure_webview_manager() {
                     let handle = crate::cef_bridge::WKWebViewHandle(ceh_id);
-                    if let Ok(()) = mgr.take_snapshot(handle) {
-                        if let Some(snapshot_data) = mgr.snapshot(handle) {
-                            output_buffer.clear();
-                            output_buffer.extend_from_slice(snapshot_data);
-                            result = snapshot_data.len() as u64;
-                        }
+                    if let (Ok(()), Some(snapshot_data)) =
+                        (mgr.take_snapshot(handle), mgr.snapshot(handle))
+                    {
+                        output_buffer.clear();
+                        output_buffer.extend_from_slice(snapshot_data);
+                        result = snapshot_data.len() as u64;
                     }
                 }
             });
@@ -2263,6 +2376,12 @@ impl WebView2Events {
             download_starting: HashMap::new(),
             next_token: 1,
         }
+    }
+}
+
+impl Default for WebView2Events {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -2378,6 +2497,70 @@ pub enum SettingsMethod {
     put_Language,
     get_TargetCompatibleBrowserVersion,
     put_TargetCompatibleBrowserVersion,
+}
+
+// ---------------------------------------------------------------------------
+// Utility
+// ---------------------------------------------------------------------------
+
+/// Maximum number of queued web messages retained per webview.
+const MAX_WEB_MESSAGES: usize = 256;
+
+/// Append a web message to the queue, bounding its size so long-running
+/// sessions cannot grow it without limit.
+fn push_web_message(messages: &mut Vec<String>, msg: String) {
+    messages.push(msg);
+    if messages.len() > MAX_WEB_MESSAGES {
+        let overflow = messages.len() - MAX_WEB_MESSAGES;
+        messages.drain(..overflow);
+    }
+}
+
+/// Escape a string for embedding in a single-quoted JavaScript string
+/// literal.
+///
+/// Escapes backslash, quote, newlines, line/paragraph separators
+/// (U+2028/U+2029) and all C0 control characters, which would otherwise
+/// terminate or corrupt the literal.
+fn escape_js_string_literal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\'' => out.push_str("\\'"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            '\u{2028}' => out.push_str("\\u2028"),
+            '\u{2029}' => out.push_str("\\u2029"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Percent-encode every byte outside the RFC 3986 unreserved set for use in
+/// a `data:` URL. The caller supplies the `data:text/html;charset=utf-8,`
+/// prefix.
+fn percent_encode_data_url(input: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(input.len() * 3);
+    for byte in input.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char);
+            }
+            _ => {
+                out.push('%');
+                out.push(HEX[(byte >> 4) as usize] as char);
+                out.push(HEX[(byte & 0x0F) as usize] as char);
+            }
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -2532,7 +2715,7 @@ mod tests {
 
         let webview = runtime.get_webview_mut(webview_id).unwrap();
         webview.navigate_to_string("<html><body><h1>Hello</h1></body></html>");
-        assert!(webview.source.starts_with("data:text/html,"));
+        assert!(webview.source.starts_with("data:text/html;charset=utf-8,"));
     }
 
     /// Destroy environment and verify all state is cleaned up.
@@ -2603,6 +2786,10 @@ mod tests {
     }
 
     /// Test that callbacks can be registered and unregistered.
+    ///
+    /// DELEGATE_STATE is process-global, so assertions are scoped to the
+    /// callback IDs this test owns instead of global vector lengths, which
+    /// would race with other tests running in parallel.
     #[test]
     fn test_webview2_callback_system() {
         let mut runtime = WebView2Runtime::new();
@@ -2621,18 +2808,17 @@ mod tests {
         // Unregister the first callback
         runtime.unregister_callback(cb_id);
 
-        // Only cb_id2 should remain
-        if let Ok(state) = DELEGATE_STATE.lock() {
-            assert_eq!(state.on_navigation_starting.len(), 0);
-            assert_eq!(state.on_navigation_completed.len(), 1);
-        }
+        // cb_id must be gone; cb_id2 must remain registered.
+        let state = DELEGATE_STATE.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(!state.on_navigation_starting.iter().any(|(id, _)| *id == cb_id));
+        assert!(state.on_navigation_completed.iter().any(|(id, _)| *id == cb_id2));
     }
 
     /// Test WebView2Controller create/destroy lifecycle.
     #[test]
     fn test_webview2_controller_create_destroy() {
         let env = WebView2Environment::new(true, None);
-        let mut ctrl = WebView2Controller::create(&env, 42, 1024, 768);
+        let mut ctrl = WebView2Controller::create(&env, 42, 1024, 768, 0);
         assert_eq!(ctrl.webview_id, 42);
         assert_eq!(ctrl.bounds.2, 1024);
         assert_eq!(ctrl.bounds.3, 768);
@@ -2641,26 +2827,6 @@ mod tests {
         // Close should clean up
         ctrl.close();
         assert!(ctrl.native_webview.is_none());
+        assert!(ctrl.nav_delegate_ref.is_none());
     }
-}
-
-// ---------------------------------------------------------------------------
-// Utility
-// ---------------------------------------------------------------------------
-
-/// Minimal percent-encoding for data: URLs.
-fn percent_encode_data_url(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    for byte in input.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(byte as char);
-            }
-            b' ' => out.push_str("%20"),
-            b'#' => out.push_str("%23"),
-            b'%' => out.push_str("%25"),
-            _ => out.push_str(&format!("%{:02X}", byte)),
-        }
-    }
-    out
 }
