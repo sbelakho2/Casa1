@@ -159,6 +159,29 @@ type CFDictionaryCreateFn = unsafe extern "C" fn(
     keyCallBacks: *const c_void,
     valueCallBacks: *const c_void,
 ) -> CFDictionaryRef;
+type CFDictionaryGetValueFn =
+    unsafe extern "C" fn(theDict: CFDictionaryRef, key: *const c_void) -> *const c_void;
+type CGColorSpaceCreateDeviceRGBFn = unsafe extern "C" fn() -> CGColorSpaceRef;
+type CGBitmapContextCreateFn = unsafe extern "C" fn(
+    data: *mut u8,
+    width: usize,
+    height: usize,
+    bits_per_component: usize,
+    bytes_per_row: usize,
+    space: CGColorSpaceRef,
+    bitmap_info: u32,
+) -> CGContextRef;
+type CGContextReleaseFn = unsafe extern "C" fn(ctx: CGContextRef);
+type CGContextTranslateCTMFn = unsafe extern "C" fn(ctx: CGContextRef, tx: CGFloat, ty: CGFloat);
+type CGContextSetRGBFillColorFn = unsafe extern "C" fn(
+    ctx: CGContextRef,
+    r: CGFloat,
+    g: CGFloat,
+    b: CGFloat,
+    a: CGFloat,
+);
+type CGColorSpaceReleaseFn = unsafe extern "C" fn(space: CGColorSpaceRef);
+type CTLineDrawFn = unsafe extern "C" fn(line: CTLineRef, ctx: CGContextRef);
 
 // ── Constants ───────────────────────────────────────────────────────────
 
@@ -285,6 +308,14 @@ pub struct DWriteFactory {
     cf_data_get_length: Option<CFDataGetLengthFn>,
     cf_attributed_string_create: Option<CFAttributedStringCreateFn>,
     cf_dictionary_create: Option<CFDictionaryCreateFn>,
+    cf_dictionary_get_value: Option<CFDictionaryGetValueFn>,
+    cg_color_space_create_device_rgb: Option<CGColorSpaceCreateDeviceRGBFn>,
+    cg_bitmap_context_create: Option<CGBitmapContextCreateFn>,
+    cg_context_release: Option<CGContextReleaseFn>,
+    cg_context_translate_ctm: Option<CGContextTranslateCTMFn>,
+    cg_context_set_rgb_fill_color: Option<CGContextSetRGBFillColorFn>,
+    cg_color_space_release: Option<CGColorSpaceReleaseFn>,
+    ct_line_draw: Option<CTLineDrawFn>,
 }
 
 /// A text format object, like `IDWriteTextFormat`.
@@ -360,6 +391,27 @@ pub struct RenderedGlyphs {
 
 // ── dlopen helpers ──────────────────────────────────────────────────────
 
+/// Maximum dimension (in pixels) of a rendered text bitmap. Font sizes and
+/// layout widths come from guest code and are untrusted; anything beyond
+/// this cap is treated as a rendering failure instead of an allocation.
+const MAX_RENDER_DIM: usize = 8192;
+
+/// Maximum byte size of a rendered text bitmap buffer.
+const MAX_RENDER_BYTES: usize = 256 * 1024 * 1024;
+
+/// Compute the RGBA buffer size for the given dimensions, returning `None`
+/// when the dimensions are unreasonable or the size would overflow.
+fn render_buffer_size(width: usize, height: usize) -> Option<usize> {
+    if width == 0 || height == 0 || width > MAX_RENDER_DIM || height > MAX_RENDER_DIM {
+        return None;
+    }
+    let bytes = width.checked_mul(height)?.checked_mul(4)?;
+    if bytes > MAX_RENDER_BYTES {
+        return None;
+    }
+    Some(bytes)
+}
+
 /// Load a symbol from a dynamic library by path.
 unsafe fn load_symbol<T: Clone>(lib: &libloading::Library, symbol: &str) -> Option<T> {
     unsafe {
@@ -430,6 +482,14 @@ impl DWriteFactory {
             cf_data_get_length: None,
             cf_attributed_string_create: None,
             cf_dictionary_create: None,
+            cf_dictionary_get_value: None,
+            cg_color_space_create_device_rgb: None,
+            cg_bitmap_context_create: None,
+            cg_context_release: None,
+            cg_context_translate_ctm: None,
+            cg_context_set_rgb_fill_color: None,
+            cg_color_space_release: None,
+            ct_line_draw: None,
         };
 
         // Load Core Text function pointers
@@ -530,6 +590,22 @@ impl DWriteFactory {
                     "CFAttributedStringCreate"
                 );
                 load_sym!(cf_dictionary_create, cg_lib, "CFDictionaryCreate");
+                load_sym!(cf_dictionary_get_value, cg_lib, "CFDictionaryGetValue");
+                // Core Graphics bitmap-rendering symbols, cached here so
+                // `draw()` does not dlopen/dlsym on every call.
+                load_sym!(
+                    cg_color_space_create_device_rgb,
+                    cg_lib,
+                    "CGColorSpaceCreateDeviceRGB"
+                );
+                load_sym!(cg_bitmap_context_create, cg_lib, "CGBitmapContextCreate");
+                load_sym!(cg_context_release, cg_lib, "CGContextRelease");
+                load_sym!(cg_context_translate_ctm, cg_lib, "CGContextTranslateCTM");
+                load_sym!(cg_context_set_rgb_fill_color, cg_lib, "CGContextSetRGBFillColor");
+                load_sym!(cg_color_space_release, cg_lib, "CGColorSpaceRelease");
+                // CTLineDraw is a CoreText API; it must be resolved against
+                // the CoreText library, not CoreGraphics.
+                load_sym!(ct_line_draw, ct_lib, "CTLineDraw");
             }
 
             // Load system font collection
@@ -593,13 +669,39 @@ impl DWriteFactory {
         }
     }
 
+    /// Release every object in `objs` (used on early-return paths in
+    /// `draw()` so partially constructed CF objects are not leaked).
+    unsafe fn cf_release_all(&self, objs: &[CFTypeRef]) {
+        unsafe {
+            for &obj in objs {
+                self.cf_release(obj);
+            }
+        }
+    }
+
     /// Convert DWrite weight to a CGFloat suitable for Core Text's weight
     /// axis. Core Text uses negative values for light weights and positive
     /// for bold, typically on a scale where 0.0 is regular.
     fn dwrite_weight_to_ct_weight(weight: u16) -> CGFloat {
         // Map DWrite weight (100-900) to Core Text weight (-1.0 to 1.0)
         let normalized = (weight as f64 - 400.0) / 400.0;
-        normalized.max(-1.0).min(1.0)
+        normalized.clamp(-1.0, 1.0)
+    }
+
+    /// Map a Core Text font width trait (1.0 = normal, extremes 0.5/2.0)
+    /// to a `DWRITE_FONT_STRETCH` value.
+    fn ct_width_to_dwrite_stretch(width: CGFloat) -> u16 {
+        match width {
+            w if w <= 0.5 => DWRITE_FONT_STRETCH_ULTRA_CONDENSED,
+            w if w <= 0.625 => DWRITE_FONT_STRETCH_EXTRA_CONDENSED,
+            w if w <= 0.75 => DWRITE_FONT_STRETCH_CONDENSED,
+            w if w <= 0.875 => DWRITE_FONT_STRETCH_SEMI_CONDENSED,
+            w if w <= 1.125 => DWRITE_FONT_STRETCH_NORMAL,
+            w if w <= 1.25 => DWRITE_FONT_STRETCH_SEMI_EXPANDED,
+            w if w <= 1.5 => DWRITE_FONT_STRETCH_EXPANDED,
+            w if w <= 2.0 => DWRITE_FONT_STRETCH_EXTRA_EXPANDED,
+            _ => DWRITE_FONT_STRETCH_ULTRA_EXPANDED,
+        }
     }
 
     // ── Main API ────────────────────────────────────────────────────────
@@ -698,14 +800,20 @@ impl DWriteFactory {
                             let mut cursor_x = 0.0_f32;
                             let mut cursor_y = 0.0_f32;
                             for adv in &advances {
-                                positions.push(cursor_x);
-                                positions.push(cursor_y);
-                                cursor_x += adv.width as f32;
-                                // Check word wrap
-                                if max_width > 0.0 && cursor_x > max_width {
+                                let advance = adv.width as f32;
+                                // Break before the glyph that would cross
+                                // max_width, so the overflowing glyph starts
+                                // the new line (DWrite behavior).
+                                if max_width > 0.0
+                                    && cursor_x > 0.0
+                                    && cursor_x + advance > max_width
+                                {
                                     cursor_x = 0.0;
                                     cursor_y += format.font_size * 1.2;
                                 }
+                                positions.push(cursor_x);
+                                positions.push(cursor_y);
+                                cursor_x += advance;
                             }
                         }
                         self.cf_release(font);
@@ -722,13 +830,14 @@ impl DWriteFactory {
             let char_width = format.font_size * 0.6;
             let line_height = format.font_size * 1.2;
             for _ in text.chars() {
-                positions.push(cursor_x);
-                positions.push(cursor_y);
-                cursor_x += char_width;
-                if max_width > 0.0 && cursor_x > max_width {
+                // Break before the glyph that would cross max_width.
+                if max_width > 0.0 && cursor_x > 0.0 && cursor_x + char_width > max_width {
                     cursor_x = 0.0;
                     cursor_y += line_height;
                 }
+                positions.push(cursor_x);
+                positions.push(cursor_y);
+                cursor_x += char_width;
             }
         }
 
@@ -754,15 +863,17 @@ impl DWriteFactory {
                 Some(get_typographic_bounds),
                 Some(create_attr_str),
                 Some(create_dict),
+                Some(create_font),
             ) = (
                 self.ct_line_create_with_attributed_string,
                 self.ct_line_get_typographic_bounds,
                 self.cf_attributed_string_create,
                 self.cf_dictionary_create,
+                self.ct_font_create_with_name,
             ) {
                 let cf_name = self.cf_string_create(&format.font_family);
                 if let Some(name) = cf_name {
-                    let font = (self.ct_font_create_with_name.unwrap())(
+                    let font = create_font(
                         name,
                         format.font_size as CGFloat,
                         std::ptr::null(),
@@ -834,16 +945,12 @@ impl DWriteFactory {
         let line_height = format.font_size * 1.2;
         let char_width = format.font_size * 0.6;
         let chars_per_line = if max_width > 0.0 {
-            (max_width / char_width).max(1.0) as usize
+            ((max_width / char_width) as usize).max(1)
         } else {
             text.len()
         };
         let char_count = text.chars().count();
-        let line_count = if chars_per_line > 0 {
-            (char_count + chars_per_line - 1) / chars_per_line
-        } else {
-            1
-        };
+        let line_count = char_count.div_ceil(chars_per_line.max(1));
 
         let width = if line_count == 1 {
             char_count as f32 * char_width
@@ -853,7 +960,9 @@ impl DWriteFactory {
         let height = line_count as f32 * line_height;
 
         TextMetrics {
-            width: width.min(max_width),
+            // Only clamp to max_width when it is a real limit; a non-positive
+            // max_width means "no wrap / no width limit".
+            width: if max_width > 0.0 { width.min(max_width) } else { width },
             height: height.min(if max_height > 0.0 { max_height } else { height }),
             line_count: line_count as u32,
         }
@@ -893,14 +1002,14 @@ impl DWriteFactory {
                             b"NSFontFamilyNameAttribute\0" as *const u8,
                             KCFStringEncodingUTF8,
                         );
-                        let style_name_key = create_string(
-                            std::ptr::null(),
-                            b"NSFontStyleNameAttribute\0" as *const u8,
-                            KCFStringEncodingUTF8,
-                        );
                         let traits_key = create_string(
                             std::ptr::null(),
                             b"CTFontTraitsAttribute\0" as *const u8,
+                            KCFStringEncodingUTF8,
+                        );
+                        let width_key = create_string(
+                            std::ptr::null(),
+                            b"NSWidth\0" as *const u8,
                             KCFStringEncodingUTF8,
                         );
 
@@ -930,22 +1039,28 @@ impl DWriteFactory {
                             // Get font traits (weight, etc.)
                             let mut weight = DWRITE_FONT_WEIGHT_NORMAL;
                             let mut style = DWRITE_FONT_STYLE_NORMAL;
-                            let stretch = DWRITE_FONT_STRETCH_NORMAL;
+                            let mut stretch = DWRITE_FONT_STRETCH_NORMAL;
 
                             let traits_cf = copy_attr(desc, traits_key);
                             if !traits_cf.is_null() {
-                                // Try to extract weight from traits dictionary
-                                if let Some(_get_value_fn) = self.cf_number_get_value {
-                                    let weight_key = create_string(
-                                        std::ptr::null(),
-                                        b"CTFontWeightTrait\0" as *const u8,
-                                        KCFStringEncodingUTF8,
-                                    );
-                                    if !weight_key.is_null() {
-                                        let _dict = traits_cf as CFDictionaryRef;
-                                        // We'd need CFDictionaryGetValue, but for simplicity
-                                        // we'll estimate from the font descriptor
-                                        self.cf_release(weight_key);
+                                // Extract the width trait from the traits
+                                // dictionary and map it to DWRITE_FONT_STRETCH.
+                                if let (Some(get_value_fn), Some(get_number_fn)) = (
+                                    self.cf_dictionary_get_value,
+                                    self.cf_number_get_value,
+                                ) {
+                                    let width_trait =
+                                        get_value_fn(traits_cf as CFDictionaryRef, width_key as *const c_void);
+                                    if !width_trait.is_null() {
+                                        let mut ct_width: CGFloat = 0.0;
+                                        let got = get_number_fn(
+                                            width_trait as CFNumberRef,
+                                            KCFNumberCGFloatType,
+                                            (&mut ct_width as *mut CGFloat).cast(),
+                                        );
+                                        if got != 0 {
+                                            stretch = Self::ct_width_to_dwrite_stretch(ct_width);
+                                        }
                                     }
                                 }
                                 self.cf_release(traits_cf);
@@ -959,7 +1074,7 @@ impl DWriteFactory {
                                         let ct_weight = get_weight_fn(font);
                                         // Map CT weight (-1..1) to DWrite weight (100..900)
                                         weight = ((ct_weight + 1.0) * 400.0 + 100.0) as u16;
-                                        weight = weight.max(100).min(900);
+                                        weight = weight.clamp(100, 900);
                                     }
 
                                     if let Some(get_traits) = self.ct_font_get_symbolic_traits {
@@ -995,8 +1110,8 @@ impl DWriteFactory {
                             collection.families.push(DWriteFontFamily { name, fonts });
                         }
 
+                        self.cf_release(width_key);
                         self.cf_release(traits_key);
-                        self.cf_release(style_name_key);
                         self.cf_release(family_name_key);
                         self.cf_release(descriptors);
                     }
@@ -1020,6 +1135,12 @@ impl DWriteFactory {
         }
 
         collection
+    }
+}
+
+impl Default for DWriteFactory {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -1057,18 +1178,25 @@ impl DWriteTextLayout {
     /// `factory` must contain valid Core Text function pointers loaded via
     /// `dlopen`. Passing a null or dangling factory is undefined behavior.
     pub fn draw(&self, factory: &DWriteFactory) -> Option<RenderedGlyphs> {
-        // Determine the bitmap dimensions from metrics or fallback.
-        let width = (self.metrics.width.max(1.0)) as u32;
-        let height = (self.metrics.height.max(1.0)) as u32;
-        if width == 0 || height == 0 || self.text.is_empty() {
+        // Determine the bitmap dimensions from metrics or fallback. The
+        // metrics derive from guest-controlled font sizes, so sizes are
+        // computed with checked arithmetic and a sane cap: an absurd or
+        // overflowing size yields `None` instead of a tiny buffer that
+        // Core Graphics would then overrun.
+        let width = self.metrics.width.max(1.0) as usize;
+        let height = self.metrics.height.max(1.0) as usize;
+        let buf_bytes = render_buffer_size(width, height)?;
+        if self.text.is_empty() {
             return Some(RenderedGlyphs {
-                pixels: vec![0u8; (width * height * 4) as usize],
-                width,
-                height,
+                pixels: vec![0u8; buf_bytes],
+                width: width as u32,
+                height: height as u32,
             });
         }
 
-        // Attempt to render via Core Text.
+        // Attempt to render via Core Text. All symbols were resolved once
+        // when the factory was created; if any is missing, degrade to the
+        // empty-bitmap fallback instead of failing the whole draw.
         unsafe {
             let (
                 Some(create_font),
@@ -1076,86 +1204,64 @@ impl DWriteTextLayout {
                 Some(get_image_bounds),
                 Some(create_attr_str),
                 Some(create_dict),
-                Some(ref release),
+                Some(color_space_create),
+                Some(bmp_ctx_create),
+                Some(ctx_release),
+                Some(translate),
+                Some(set_color),
+                Some(line_draw),
+                Some(release_space),
             ) = (
                 factory.ct_font_create_with_name,
                 factory.ct_line_create_with_attributed_string,
                 factory.ct_line_get_image_bounds,
                 factory.cf_attributed_string_create,
                 factory.cf_dictionary_create,
-                factory.cf_release,
+                factory.cg_color_space_create_device_rgb,
+                factory.cg_bitmap_context_create,
+                factory.cg_context_release,
+                factory.cg_context_translate_ctm,
+                factory.cg_context_set_rgb_fill_color,
+                factory.ct_line_draw,
+                factory.cg_color_space_release,
             ) else {
                 // Fallback: return empty bitmap
                 return Some(RenderedGlyphs {
-                    pixels: vec![0u8; (width * height * 4) as usize],
-                    width,
-                    height,
+                    pixels: vec![0u8; buf_bytes],
+                    width: width as u32,
+                    height: height as u32,
                 });
             };
 
-            // Load Core Graphics functions needed for bitmap rendering.
-            let cg_lib = libloading::Library::new(
-                "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics",
-            )
-            .ok()?;
-
-            type CGColorSpaceCreateDeviceRGBFn =
-                unsafe extern "C" fn() -> CGColorSpaceRef;
-            let color_space_sym: libloading::Symbol<CGColorSpaceCreateDeviceRGBFn> =
-                cg_lib.get(b"CGColorSpaceCreateDeviceRGB").ok()?;
-            let color_space = color_space_sym();
-            if color_space.is_null() {
-                return None;
-            }
-
-            type CGBitmapContextCreateFn = unsafe extern "C" fn(
-                data: *mut u8,
-                width: usize,
-                height: usize,
-                bits_per_component: usize,
-                bytes_per_row: usize,
-                space: CGColorSpaceRef,
-                bitmap_info: u32,
-            ) -> CGContextRef;
-            let bmp_ctx_sym: libloading::Symbol<CGBitmapContextCreateFn> =
-                cg_lib.get(b"CGBitmapContextCreate").ok()?;
-
-            type CGContextReleaseFn = unsafe extern "C" fn(ctx: CGContextRef);
-            let ctx_release_sym: libloading::Symbol<CGContextReleaseFn> =
-                cg_lib.get(b"CGContextRelease").ok()?;
-
-            type CGContextTranslateCTMFn =
-                unsafe extern "C" fn(ctx: CGContextRef, tx: CGFloat, ty: CGFloat);
-            let translate_sym: libloading::Symbol<CGContextTranslateCTMFn> =
-                cg_lib.get(b"CGContextTranslateCTM").ok()?;
-
-            type CGContextSetRGBFillColorFn = unsafe extern "C" fn(
-                ctx: CGContextRef,
-                r: CGFloat,
-                g: CGFloat,
-                b: CGFloat,
-                a: CGFloat,
-            );
-            let set_color_sym: libloading::Symbol<CGContextSetRGBFillColorFn> =
-                cg_lib.get(b"CGContextSetRGBFillColor").ok()?;
-
-            type CTLineDrawFn = unsafe extern "C" fn(line: CTLineRef, ctx: CGContextRef);
-            let line_draw_sym: libloading::Symbol<CTLineDrawFn> =
-                cg_lib.get(b"CTLineDraw").ok()?;
-
-            // SAFETY: All function pointers have been loaded from the system
-            // CoreGraphics framework which is always present on macOS.
-
-            // Build the attributed string using Core Text.
+            // Build the attributed string using Core Text, tracking every
+            // created object so early returns never leak CF objects.
             let cf_name = factory.cf_string_create(&self.format.font_family)?;
+            let mut owned: Vec<CFTypeRef> = vec![cf_name];
+
             let font = create_font(cf_name, self.format.font_size as CGFloat, std::ptr::null());
             if font.is_null() {
-                release(cf_name);
+                factory.cf_release_all(&owned);
                 return None;
             }
+            owned.push(font);
 
-            let cf_text = factory.cf_string_create(&self.text)?;
-            let attr_name = factory.cf_string_create(KCT_FONT_ATTRIBUTE_NAME)?;
+            let cf_text = match factory.cf_string_create(&self.text) {
+                Some(text) => text,
+                None => {
+                    factory.cf_release_all(&owned);
+                    return None;
+                }
+            };
+            owned.push(cf_text);
+
+            let attr_name = match factory.cf_string_create(KCT_FONT_ATTRIBUTE_NAME) {
+                Some(name) => name,
+                None => {
+                    factory.cf_release_all(&owned);
+                    return None;
+                }
+            };
+            owned.push(attr_name);
 
             let keys: [*const c_void; 1] = [attr_name as *const c_void];
             let values: [*const c_void; 1] = [font as *const c_void];
@@ -1167,92 +1273,80 @@ impl DWriteTextLayout {
                 std::ptr::null(),
                 std::ptr::null(),
             );
-
             if dict.is_null() {
-                release(cf_text);
-                release(attr_name);
-                release(font);
-                release(cf_name);
+                factory.cf_release_all(&owned);
                 return None;
             }
+            owned.push(dict);
 
             let attr_str = create_attr_str(std::ptr::null(), cf_text, dict);
             if attr_str.is_null() {
-                release(dict);
-                release(cf_text);
-                release(attr_name);
-                release(font);
-                release(cf_name);
+                factory.cf_release_all(&owned);
                 return None;
             }
+            owned.push(attr_str);
 
             let line = create_line(attr_str);
             if line.is_null() {
-                release(attr_str);
-                release(dict);
-                release(cf_text);
-                release(attr_name);
-                release(font);
-                release(cf_name);
+                factory.cf_release_all(&owned);
                 return None;
             }
+            owned.push(line);
 
             // Get the typographic bounds to determine the image size.
             let bounds = get_image_bounds(line, std::ptr::null());
 
-            // Compute pixel dimensions from bounds, with a minimum of 1x1.
-            let bmp_w = (bounds.size.width.ceil().max(1.0)) as u32;
-            let bmp_h = (bounds.size.height.ceil().max(1.0)) as u32;
-
-            // Allocate the pixel buffer.
+            // Compute pixel dimensions from bounds (checked, capped), with
+            // a minimum of 1x1.
+            let bmp_w = (bounds.size.width.ceil().max(1.0)) as usize;
+            let bmp_h = (bounds.size.height.ceil().max(1.0)) as usize;
+            let Some(buf_size) = render_buffer_size(bmp_w, bmp_h) else {
+                factory.cf_release_all(&owned);
+                return None;
+            };
             let row_bytes = bmp_w * 4;
-            let buf_size = (row_bytes * bmp_h) as usize;
             let mut pixel_buf: Vec<u8> = vec![0u8; buf_size];
 
-            // Create the bitmap context.
-            let ctx = bmp_ctx_sym(
-                pixel_buf.as_mut_ptr(),
-                bmp_w as usize,
-                bmp_h as usize,
-                8, // bits per component
-                row_bytes as usize,
-                color_space,
-                1u32, // kCGImageAlphaPremultipliedFirst
-            );
-
-            if ctx.is_null() {
-                release(line);
-                release(attr_str);
-                release(dict);
-                release(cf_text);
-                release(attr_name);
-                release(font);
-                release(cf_name);
+            let color_space = color_space_create();
+            if color_space.is_null() {
+                factory.cf_release_all(&owned);
                 return None;
             }
 
+            // Create the bitmap context.
+            let ctx = bmp_ctx_create(
+                pixel_buf.as_mut_ptr(),
+                bmp_w,
+                bmp_h,
+                8, // bits per component
+                row_bytes,
+                color_space,
+                1u32, // kCGImageAlphaPremultipliedFirst
+            );
+            if ctx.is_null() {
+                release_space(color_space);
+                factory.cf_release_all(&owned);
+                return None;
+            }
+            // The bitmap context retains the color space; ours is done.
+            release_space(color_space);
+
             // Set white fill color and translate so the text renders at origin.
-            set_color_sym(ctx, 1.0, 1.0, 1.0, 1.0);
-            translate_sym(ctx, -bounds.origin.x, -bounds.origin.y);
-            line_draw_sym(line, ctx);
+            set_color(ctx, 1.0, 1.0, 1.0, 1.0);
+            translate(ctx, -bounds.origin.x, -bounds.origin.y);
+            line_draw(line, ctx);
 
             // Release the CGContext.
-            ctx_release_sym(ctx);
+            ctx_release(ctx);
 
             // Release Core Foundation objects.
-            release(line);
-            release(attr_str);
-            release(dict);
-            release(cf_text);
-            release(attr_name);
-            release(font);
-            release(cf_name);
+            factory.cf_release_all(&owned);
 
-            return Some(RenderedGlyphs {
+            Some(RenderedGlyphs {
                 pixels: pixel_buf,
-                width: bmp_w,
-                height: bmp_h,
-            });
+                width: bmp_w as u32,
+                height: bmp_h as u32,
+            })
         }
     }
 
@@ -1393,9 +1487,8 @@ mod tests {
     #[test]
     fn test_dwrite_create_factory() {
         let factory = DWriteFactory::new();
-        // Factory should have been created; font collection may be empty
-        // if Core Text is unavailable, but the factory itself should exist
-        assert!(!factory.font_collection.families.is_empty() || true);
+        // The factory always carries at least the fallback "Arial" family.
+        assert!(!factory.font_collection.families.is_empty());
     }
 
     #[test]

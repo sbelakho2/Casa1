@@ -136,37 +136,172 @@ pub fn extract_all_icons_from_pe(path: &Path) -> AppResult<Vec<IconImage>> {
     crate::pe::extract_all_icons_from_pe(&bytes)
 }
 
-/// Convert raw BMP/DIB icon pixel data to PNG bytes.
-/// The icon data is in Windows DIB format (BGRA bottom-up).
-pub fn dib_to_png(data: &[u8], width: u32, height: u32, bpp: u16) -> AppResult<Vec<u8>> {
-    let actual_height = height / 2; // DIB includes XOR mask (height/2) and AND mask (height/2)
-    let row_size = ((width * bpp as u32 + 31) / 32) * 4;
-    let pixel_height = actual_height;
+/// Maximum dimension (in pixels) accepted for an icon image.
+const MAX_ICON_DIM: usize = 4096;
 
-    let mut rgba = vec![0u8; (width * pixel_height * 4) as usize];
+/// Parsed BITMAPINFOHEADER for a DIB icon payload.
+struct DibHeader {
+    /// Logical image width in pixels.
+    width: u32,
+    /// Doubled height (XOR mask + AND mask rows).
+    doubled_height: u32,
+    /// Bits per pixel from the header.
+    bpp: u16,
+    /// Number of palette entries (biClrUsed).
+    clr_used: u32,
+    /// Size of the header in bytes (the palette follows it).
+    header_size: usize,
+}
+
+/// Parse the BITMAPINFOHEADER that prefixes raw (non-PNG) ICO entries and
+/// PE `RT_ICON` payloads. Returns `None` when the payload is headerless
+/// or malformed.
+fn parse_dib_header(data: &[u8]) -> Option<DibHeader> {
+    if data.len() < 40 {
+        return None;
+    }
+    let bi_size = i32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+    if bi_size < 40 || bi_size as usize > data.len() {
+        return None;
+    }
+    let width = i32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+    let doubled_height = i32::from_le_bytes([data[8], data[9], data[10], data[11]]);
+    if width <= 0 || doubled_height <= 0 {
+        return None;
+    }
+    let bpp = u16::from_le_bytes([data[14], data[15]]);
+    let clr_used = u32::from_le_bytes([data[32], data[33], data[34], data[35]]);
+    Some(DibHeader {
+        width: width as u32,
+        doubled_height: doubled_height as u32,
+        bpp,
+        clr_used,
+        header_size: bi_size as usize,
+    })
+}
+
+/// Convert raw BMP/DIB icon pixel data to PNG bytes.
+///
+/// The icon data is a Windows DIB (BGRA bottom-up) payload, normally
+/// prefixed by a 40-byte BITMAPINFOHEADER whose `biHeight` doubles the
+/// logical icon height (XOR mask + AND mask). When the header is present
+/// its values are authoritative and the height is halved exactly once;
+/// `width`/`height`/`bpp` are fallbacks for headerless payloads, where
+/// `height` is the doubled DIB height.
+pub fn dib_to_png(data: &[u8], width: u32, height: u32, bpp: u16) -> AppResult<Vec<u8>> {
+    let header = parse_dib_header(data);
+    let (pixel_width, pixel_height, bpp) = match header.as_ref() {
+        Some(h) => (
+            h.width,
+            h.doubled_height / 2,
+            if h.bpp != 0 { h.bpp } else { bpp },
+        ),
+        None => (width, height / 2, bpp),
+    };
+    let pixel_width = pixel_width as usize;
+    let pixel_height = pixel_height as usize;
+    if pixel_width == 0
+        || pixel_height == 0
+        || pixel_width > MAX_ICON_DIM
+        || pixel_height > MAX_ICON_DIM
+    {
+        return Err(AppError::new(
+            ReasonCode::RcPeParseInvalid,
+            format!("unreasonable DIB icon dimensions {pixel_width}x{pixel_height}"),
+        ));
+    }
+
+    let bytes_per_pixel = match bpp {
+        32 => 4,
+        24 => 3,
+        8 | 4 | 1 => 1,
+        _ => {
+            return Err(AppError::new(
+                ReasonCode::RcPeParseInvalid,
+                format!("unsupported DIB icon bit depth {bpp}"),
+            ));
+        }
+    };
+    let row_size = (pixel_width * bpp as usize).div_ceil(32) * 4;
+    let rgba_bytes = pixel_width
+        .checked_mul(pixel_height)
+        .and_then(|n| n.checked_mul(4))
+        .ok_or_else(|| {
+            AppError::new(ReasonCode::RcPeParseInvalid, "DIB icon dimensions overflow")
+        })?;
+    let mut rgba = vec![0u8; rgba_bytes];
+
+    let header_size = header.as_ref().map_or(0, |h| h.header_size);
+    let palette_count = if bpp <= 8 {
+        let clr_used = header.as_ref().map_or(0, |h| h.clr_used);
+        if clr_used != 0 {
+            clr_used as usize
+        } else {
+            1usize << bpp
+        }
+    } else {
+        0
+    };
+    let palette_offset = header_size;
+    // The XOR bitmap follows the header and the color table.
+    let pixels_offset = palette_offset + palette_count * 4;
 
     for y in 0..pixel_height {
-        let src_row = (pixel_height - 1 - y) as usize * row_size as usize;
-        for x in 0..width as usize {
-            let src_pixel = src_row + x * (bpp as usize / 8);
-            let dst_pixel = (y as usize * width as usize + x) * 4;
-            if src_pixel + 4 <= data.len() {
-                // DIB is BGRA
-                rgba[dst_pixel as usize] = data[src_pixel + 2]; // R
-                rgba[dst_pixel as usize + 1] = data[src_pixel + 1]; // G
-                rgba[dst_pixel as usize + 2] = data[src_pixel]; // B
-                if bpp == 32 {
-                    rgba[dst_pixel as usize + 3] = data[src_pixel + 3]; // A
-                } else {
-                    rgba[dst_pixel as usize + 3] = 255;
+        let src_row = (pixel_height - 1 - y) * row_size + pixels_offset;
+        for x in 0..pixel_width {
+            let dst_pixel = (y * pixel_width + x) * 4;
+            let pixel = if bytes_per_pixel == 4 {
+                let src_pixel = src_row + x * 4;
+                if src_pixel + 4 > data.len() {
+                    continue;
                 }
-            }
+                // DIB is BGRA
+                (
+                    data[src_pixel + 2],
+                    data[src_pixel + 1],
+                    data[src_pixel],
+                    data[src_pixel + 3],
+                )
+            } else if bytes_per_pixel == 3 {
+                let src_pixel = src_row + x * 3;
+                if src_pixel + 3 > data.len() {
+                    continue;
+                }
+                (data[src_pixel + 2], data[src_pixel + 1], data[src_pixel], 255)
+            } else {
+                // Palette-indexed: extract the index (MSB-first bit order)
+                let bits = x * bpp as usize;
+                let Some(&byte) = data.get(src_row + bits / 8) else {
+                    continue;
+                };
+                let index = match bpp {
+                    1 => ((byte >> (7 - bits % 8)) & 1) as usize,
+                    4 => ((byte >> (4 * (1 - (bits % 8) / 4))) & 0x0F) as usize,
+                    _ => byte as usize,
+                };
+                if index >= palette_count {
+                    continue;
+                }
+                // Palette entries are BGRX (4 bytes each)
+                let entry = palette_offset + index * 4;
+                let (Some(&b), Some(&g), Some(&r)) = (
+                    data.get(entry),
+                    data.get(entry + 1),
+                    data.get(entry + 2),
+                ) else {
+                    continue;
+                };
+                (r, g, b, 255)
+            };
+            rgba[dst_pixel] = pixel.0;
+            rgba[dst_pixel + 1] = pixel.1;
+            rgba[dst_pixel + 2] = pixel.2;
+            rgba[dst_pixel + 3] = pixel.3;
         }
     }
 
-    // Encode as PNG using a simple DEFLATE-based approach
-    // Since we can't add a PNG dependency easily, we'll use a minimal PNG encoder
-    encode_png(&rgba, width, pixel_height)
+    // Encode as PNG
+    encode_png(&rgba, pixel_width as u32, pixel_height as u32)
 }
 
 /// Convert an IconImage to PNG bytes. If already PNG compressed, returns as-is.
@@ -240,7 +375,14 @@ pub fn ico_to_icns(ico_data: &[u8]) -> AppResult<Vec<u8>> {
             ]),
         };
         let data_start = entry.offset as usize;
-        let data_end = (data_start + entry.size as usize).min(ico_data.len());
+        if data_start >= ico_data.len() {
+            // Entry points beyond the end of the file — malformed ICO;
+            // skip it rather than constructing an inverted slice.
+            continue;
+        }
+        let data_end = data_start
+            .saturating_add(entry.size as usize)
+            .min(ico_data.len());
         let image_data = ico_data[data_start..data_end].to_vec();
         entries.push((entry, image_data));
     }
@@ -444,32 +586,134 @@ mod tests {
 
     #[test]
     fn test_dib_to_png() {
-        // Create a 4x4 32bpp DIB (BGRA, bottom-up)
+        // Build a 4x4 32bpp DIB (BGRA, bottom-up) with a BITMAPINFOHEADER
+        // whose biHeight doubles the logical height (XOR + AND masks).
         let width = 4u32;
-        let height = 8u32; // DIB includes XOR + AND mask = 2x height
         let bpp = 32u16;
-        let row_size = ((width * bpp as u32 + 31) / 32) * 4;
-        let mut dib = vec![0u8; (row_size * height) as usize];
-        // Fill top half with red pixels (B=0, G=0, R=255, A=255)
-        // In DIB bottom-up, bottom rows come first, so write some test data
-        for y in 0..4 {
-            for x in 0..4 {
-                let off = ((height - 1 - y) * row_size + x * 4) as usize;
-                if off + 4 <= dib.len() {
-                    dib[off] = 0; // B
-                    dib[off + 1] = 0; // G
-                    dib[off + 2] = 255; // R
-                    dib[off + 3] = 255; // A
-                }
+        let row_size = (width * bpp as u32).div_ceil(32) * 4;
+        let mut dib = Vec::new();
+        let mut header = [0u8; 40];
+        header[0..4].copy_from_slice(&40u32.to_le_bytes()); // biSize
+        header[4..8].copy_from_slice(&(width as i32).to_le_bytes()); // biWidth
+        header[8..12].copy_from_slice(&8i32.to_le_bytes()); // biHeight (XOR + AND)
+        header[12..14].copy_from_slice(&1u16.to_le_bytes()); // biPlanes
+        header[14..16].copy_from_slice(&bpp.to_le_bytes()); // biBitCount
+        dib.extend_from_slice(&header);
+        // XOR rows (bottom-up), all red: 4 rows x 16 bytes
+        for _ in 0..4 {
+            for _ in 0..width {
+                dib.extend_from_slice(&[0, 0, 255, 255]); // B G R A
             }
         }
-        let result = dib_to_png(&dib, width, height, bpp);
-        assert!(
-            result.is_ok(),
-            "dib_to_png should succeed for valid DIB data"
+        // AND mask rows (opaque)
+        dib.extend_from_slice(&vec![0u8; (4 * row_size) as usize]);
+
+        let png = dib_to_png(&dib, 4, 4, 32).unwrap();
+        assert_eq!(
+            png[0..8],
+            [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]
         );
-        let png = result.unwrap();
-        assert!(&png[0..8] == &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+
+        // The PNG must be 4x4 (logical height), not 4x2 (double-halved).
+        let decoder = png::Decoder::new(std::io::Cursor::new(&png));
+        let mut reader = decoder.read_info().unwrap();
+        let mut out = vec![0u8; reader.output_buffer_size()];
+        let info = reader.next_frame(&mut out).unwrap();
+        assert_eq!(info.width, 4);
+        assert_eq!(info.height, 4);
+        let rgba = &out[..info.buffer_size()];
+        for px in rgba.chunks_exact(4) {
+            assert_eq!(px, [255, 0, 0, 255]);
+        }
+    }
+
+    #[test]
+    fn test_dib_to_png_headerless_fallback() {
+        // Headerless DIB: the height argument is the doubled DIB height
+        // (XOR + AND masks) and is halved exactly once.
+        let width = 4u32;
+        let height = 8u32;
+        let bpp = 32u16;
+        let row_size = (width * bpp as u32).div_ceil(32) * 4;
+        let mut dib = vec![0u8; (row_size * height) as usize];
+        for y in 0..4 {
+            let src_y = height - 1 - y; // bottom-up: last row in DIB = top of image
+            for x in 0..4 {
+                let off = (src_y * row_size + x * 4) as usize;
+                dib[off..off + 4].copy_from_slice(&[0, 0, 255, 255]);
+            }
+        }
+        let png = dib_to_png(&dib, width, height, bpp).unwrap();
+        assert_eq!(
+            png[0..8],
+            [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]
+        );
+    }
+
+    #[test]
+    fn test_dib_to_png_palette_8bpp() {
+        // 2x2 8bpp palette icon: XOR rows are bottom-up; row 0 in memory is
+        // the bottom image row.
+        let width = 2u32;
+        let bpp = 8u16;
+        let mut dib = Vec::new();
+        let mut header = [0u8; 40];
+        header[0..4].copy_from_slice(&40u32.to_le_bytes()); // biSize
+        header[4..8].copy_from_slice(&(width as i32).to_le_bytes()); // biWidth
+        header[8..12].copy_from_slice(&4i32.to_le_bytes()); // biHeight (2 XOR + 2 AND)
+        header[12..14].copy_from_slice(&1u16.to_le_bytes()); // biPlanes
+        header[14..16].copy_from_slice(&bpp.to_le_bytes()); // biBitCount
+        header[32..36].copy_from_slice(&4u32.to_le_bytes()); // biClrUsed: 4 palette entries
+        dib.extend_from_slice(&header);
+        // Palette: 4 BGRX entries
+        dib.extend_from_slice(&[0, 0, 0, 0]); // 0: black
+        dib.extend_from_slice(&[0, 0, 255, 0]); // 1: red
+        dib.extend_from_slice(&[0, 255, 0, 0]); // 2: green
+        dib.extend_from_slice(&[255, 0, 0, 0]); // 3: blue
+        // XOR rows (bottom-up), 4 bytes each (2 pixel bytes + padding):
+        // bottom image row = [green, red], top image row = [black, blue]
+        dib.extend_from_slice(&[2, 1, 0, 0]);
+        dib.extend_from_slice(&[0, 3, 0, 0]);
+        // AND mask rows
+        dib.extend_from_slice(&[0u8; 8]);
+
+        let png = dib_to_png(&dib, 2, 2, 8).unwrap();
+        let decoder = png::Decoder::new(std::io::Cursor::new(&png));
+        let mut reader = decoder.read_info().unwrap();
+        let mut out = vec![0u8; reader.output_buffer_size()];
+        let info = reader.next_frame(&mut out).unwrap();
+        assert_eq!(info.width, 2);
+        assert_eq!(info.height, 2);
+        let rgba = &out[..info.buffer_size()];
+        // Image row order: top row first.
+        assert_eq!(&rgba[0..4], [0, 0, 0, 255]); // black
+        assert_eq!(&rgba[4..8], [0, 0, 255, 255]); // blue
+        assert_eq!(&rgba[8..12], [0, 255, 0, 255]); // green
+        assert_eq!(&rgba[12..16], [255, 0, 0, 255]); // red
+    }
+
+    #[test]
+    fn test_dib_to_png_rejects_unsupported_bpp() {
+        let mut dib = vec![0u8; 40];
+        dib[0..4].copy_from_slice(&40u32.to_le_bytes());
+        dib[4..8].copy_from_slice(&1i32.to_le_bytes());
+        dib[8..12].copy_from_slice(&2i32.to_le_bytes());
+        dib[14..16].copy_from_slice(&16u16.to_le_bytes()); // 16bpp is unsupported
+        assert!(dib_to_png(&dib, 1, 1, 16).is_err());
+    }
+
+    #[test]
+    fn test_ico_to_icns_skips_entry_beyond_eof() {
+        // An entry whose offset lies beyond EOF must be skipped, not panic.
+        let mut ico = vec![0, 0, 1, 0, 1, 0]; // header with 1 icon
+        ico.extend_from_slice(&[32, 32, 0, 0]); // width, height, colors, reserved
+        ico.extend_from_slice(&[1, 0]); // planes
+        ico.extend_from_slice(&[32, 0]); // bpp
+        ico.extend_from_slice(&0x1000u32.to_le_bytes()); // size
+        ico.extend_from_slice(&0xFFFF_FF00u32.to_le_bytes()); // offset beyond EOF
+        let icns = ico_to_icns(&ico).unwrap();
+        assert_eq!(icns.len(), 8); // no entries were added
+        assert!(validate_icns(&icns).unwrap_or(false));
     }
 
     #[test]

@@ -27,6 +27,32 @@ const PLACEHOLDER_FRAME_WIDTH: usize = 160;
 const PLACEHOLDER_FRAME_HEIGHT: usize = 90;
 const LIVE_WINDOW_OFFSET: isize = 32;
 
+/// Maximum window dimension for live presentation. Guest-provided frame
+/// dimensions are untrusted; anything beyond this is rejected before it
+/// reaches minifb.
+const MAX_WINDOW_DIM: usize = 16384;
+
+/// Maximum total pixel count for live presentation (~100 MP).
+const MAX_WINDOW_PIXELS: usize = 100 * 1024 * 1024;
+
+/// Validate that guest-provided frame dimensions can be presented.
+fn validate_presentable_dims(width: usize, height: usize) -> AppResult<()> {
+    if width == 0
+        || height == 0
+        || width > MAX_WINDOW_DIM
+        || height > MAX_WINDOW_DIM
+        || width
+            .checked_mul(height)
+            .is_none_or(|pixels| pixels > MAX_WINDOW_PIXELS)
+    {
+        return Err(AppError::new(
+            ReasonCode::RcD3dInvalidState,
+            format!("live frame dimensions {width}x{height} are not presentable"),
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct LiveFrame {
     pub width: u32,
@@ -112,6 +138,27 @@ pub fn run_live_host_session<T>(
     session: LiveHostSession,
     worker: JoinHandle<AppResult<T>>,
 ) -> AppResult<T> {
+    let loop_result = run_live_host_loop(title, session, &worker);
+    live_trace("[live] run_live_host_session exiting — joining worker thread");
+    // The worker is always joined, even when the host loop returns early
+    // (window creation, export, or decode failure), so it never keeps
+    // running detached.
+    let worker_result = worker.join().map_err(|_| {
+        live_trace("[live] worker thread panicked!");
+        AppError::new(
+            ReasonCode::RcRunnerProtocolInvalid,
+            "live PE worker panicked",
+        )
+    })?;
+    loop_result?;
+    worker_result
+}
+
+fn run_live_host_loop<T>(
+    title: &str,
+    session: LiveHostSession,
+    worker: &JoinHandle<AppResult<T>>,
+) -> AppResult<()> {
     let audio = LiveAudioOutput::new()?;
     let export_live_frame_path = std::env::var(EXPORT_LIVE_FRAME_ENV)
         .ok()
@@ -127,7 +174,6 @@ pub fn run_live_host_session<T>(
     let mut left_mouse_down = false;
     let mut right_mouse_down = false;
     let mut middle_mouse_down = false;
-    let mut previous_scroll = (0i32, 0i32);
 
     window
         .update_with_buffer(&frame_buffer, frame_width, frame_height)
@@ -161,7 +207,7 @@ pub fn run_live_host_session<T>(
             trace_no_frame_counter = 0;
         } else {
             trace_no_frame_counter += 1;
-            if trace_no_frame_counter % 1000 == 0 {
+            if trace_no_frame_counter.is_multiple_of(1000) {
                 live_trace(&format!(
                     "[live] no frames yet after {} loop iterations (worker_finished={})",
                     trace_no_frame_counter,
@@ -179,9 +225,16 @@ pub fn run_live_host_session<T>(
 
         if let Some(frame) = latest_frame.take() {
             if frame.width as usize != frame_width || frame.height as usize != frame_height {
-                window = create_window(title, frame.width as usize, frame.height as usize)?;
-                frame_width = frame.width as usize;
-                frame_height = frame.height as usize;
+                let width = frame.width as usize;
+                let height = frame.height as usize;
+                // The frame dimensions come from the guest frame pipeline
+                // and are untrusted; validate before handing them to
+                // minifb, which would otherwise try to allocate unbounded
+                // window buffers.
+                validate_presentable_dims(width, height)?;
+                window = create_window(title, width, height)?;
+                frame_width = width;
+                frame_height = height;
             }
             if let Some(path) = export_live_frame_path.as_deref() {
                 export_live_frame(&frame, Path::new(path))?;
@@ -198,7 +251,6 @@ pub fn run_live_host_session<T>(
             &mut left_mouse_down,
             &mut right_mouse_down,
             &mut middle_mouse_down,
-            &mut previous_scroll,
         );
         if window.is_key_down(Key::Escape) && !close_requested {
             release_held_keys(&session.input_tx, &mut held_scancodes);
@@ -240,7 +292,6 @@ pub fn run_live_host_session<T>(
                     .store(true, std::sync::atomic::Ordering::Relaxed);
                 crate::jit::force_break_all_chains();
                 last_jit_watchdog = std::time::Instant::now();
-                // permission toggle occurs. The race window is microseconds.
                 let sigbus_total = crate::jit::SIGBUS_TOTAL_EVENTS
                     .load(std::sync::atomic::Ordering::Relaxed);
                 let storm = crate::jit::JIT_FAULT_STORM_DISABLED
@@ -273,15 +324,7 @@ pub fn run_live_host_session<T>(
         }
     }
 
-    live_trace("[live] run_live_host_session exiting — joining worker thread");
-
-    worker.join().map_err(|_| {
-        live_trace("[live] worker thread panicked!");
-        AppError::new(
-            ReasonCode::RcRunnerProtocolInvalid,
-            "live PE worker panicked",
-        )
-    })?
+    Ok(())
 }
 
 fn create_window(title: &str, width: usize, height: usize) -> AppResult<Window> {
@@ -320,10 +363,8 @@ where
 {
     let mut scancodes = BTreeSet::new();
     for key in ALL_MAPPED_KEYS {
-        if is_key_down(*key) {
-            if let Some(scancode) = map_key_to_scancode(*key) {
-                scancodes.insert(scancode);
-            }
+        if is_key_down(*key) && let Some(scancode) = map_key_to_scancode(*key) {
+            scancodes.insert(scancode);
         }
     }
     scancodes
@@ -403,7 +444,6 @@ fn pump_mouse(
     left_mouse_down: &mut bool,
     right_mouse_down: &mut bool,
     middle_mouse_down: &mut bool,
-    previous_scroll: &mut (i32, i32),
 ) {
     let current_mouse_pos = window
         .get_mouse_pos(MouseMode::Clamp)
@@ -418,23 +458,23 @@ fn pump_mouse(
     let middle_pressed = current_middle_down && !*middle_mouse_down;
     let middle_released = !current_middle_down && *middle_mouse_down;
 
-    // Scroll wheel
+    // Scroll wheel: minifb reports the delta accumulated since the last
+    // update, so forward it directly rather than treating it as a
+    // cumulative position.
     if let Some(scroll) = window.get_scroll_wheel() {
-        let scroll_delta_y = scroll.1 - previous_scroll.1 as f32;
-        let scroll_delta_x = scroll.0 - previous_scroll.0 as f32;
-        if scroll_delta_y.abs() >= 1.0 || scroll_delta_x.abs() >= 1.0 {
-            if let Some((x, y)) = current_mouse_pos {
-                if let Err(e) = input_tx.send(LiveInputEvent::MouseScroll {
-                    x,
-                    y,
-                    delta_x: scroll_delta_x as i32,
-                    delta_y: scroll_delta_y as i32,
-                }) {
-                    eprintln!("[live] failed to send mouse scroll event: {e}");
-                }
-            }
+        let scroll_delta_x = scroll.0 as i32;
+        let scroll_delta_y = scroll.1 as i32;
+        if (scroll_delta_x.abs() >= 1 || scroll_delta_y.abs() >= 1)
+            && let Some((x, y)) = current_mouse_pos
+            && let Err(e) = input_tx.send(LiveInputEvent::MouseScroll {
+                x,
+                y,
+                delta_x: scroll_delta_x,
+                delta_y: scroll_delta_y,
+            })
+        {
+            eprintln!("[live] failed to send mouse scroll event: {e}");
         }
-        *previous_scroll = (scroll.0 as i32, scroll.1 as i32);
     }
 
     let mouse_changed = current_mouse_pos != *previous_mouse_pos
@@ -445,21 +485,20 @@ fn pump_mouse(
         || middle_pressed
         || middle_released;
 
-    if let Some((x, y)) = current_mouse_pos {
-        if mouse_changed {
-            if let Err(e) = input_tx.send(LiveInputEvent::MouseInput {
-                x,
-                y,
-                left_pressed,
-                left_released,
-                right_pressed,
-                right_released,
-                middle_pressed,
-                middle_released,
-            }) {
-                eprintln!("[live] failed to send mouse input event: {e}");
-            }
-        }
+    if let Some((x, y)) = current_mouse_pos
+        && mouse_changed
+        && let Err(e) = input_tx.send(LiveInputEvent::MouseInput {
+            x,
+            y,
+            left_pressed,
+            left_released,
+            right_pressed,
+            right_released,
+            middle_pressed,
+            middle_released,
+        })
+    {
+        eprintln!("[live] failed to send mouse input event: {e}");
     }
 
     *previous_mouse_pos = current_mouse_pos;
@@ -961,6 +1000,11 @@ fn fill_output_u16(output: &mut [u16], queue: &Arc<Mutex<VecDeque<f32>>>) {
     }
 }
 
+/// Upper bound on the number of resampled frames produced per chunk.
+/// Guest-controlled sample rates must not be able to force multi-GB
+/// allocations (the audio queue trims to a few seconds anyway).
+const MAX_ADAPTED_FRAMES: usize = 4 * 1024 * 1024;
+
 fn adapt_audio_chunk(
     samples: &[f32],
     input_channels: u16,
@@ -970,6 +1014,11 @@ fn adapt_audio_chunk(
 ) -> Vec<f32> {
     let input_channels = input_channels.max(1) as usize;
     let output_channels = output_channels.max(1) as usize;
+    // The sample rates come from the guest's WaveFormat and are untrusted:
+    // a zero rate would divide by zero, and a tiny rate would explode the
+    // resampled chunk size.
+    let input_sample_rate = input_sample_rate.max(1) as u64;
+    let output_sample_rate = output_sample_rate.max(1) as u64;
     if samples.is_empty() {
         return Vec::new();
     }
@@ -980,15 +1029,22 @@ fn adapt_audio_chunk(
     let output_frames = if input_sample_rate == output_sample_rate {
         input_frames
     } else {
-        ((input_frames as u64 * output_sample_rate as u64) / input_sample_rate as u64).max(1)
-            as usize
+        let frames = (input_frames as u64)
+            .saturating_mul(output_sample_rate)
+            .checked_div(input_sample_rate)
+            .unwrap_or(0)
+            .max(1);
+        frames.min(MAX_ADAPTED_FRAMES as u64) as usize
     };
     let mut output = vec![0.0; output_frames * output_channels];
     for output_frame in 0..output_frames {
         let input_frame = if input_sample_rate == output_sample_rate {
             output_frame.min(input_frames - 1)
         } else {
-            ((output_frame as u64 * input_sample_rate as u64) / output_sample_rate as u64) as usize
+            (output_frame as u64)
+                .saturating_mul(input_sample_rate)
+                .checked_div(output_sample_rate)
+                .unwrap_or(0) as usize
         }
         .min(input_frames - 1);
         let source = &samples[input_frame * input_channels..(input_frame + 1) * input_channels];
@@ -1070,5 +1126,32 @@ mod tests {
 
         assert_eq!(pressed, vec![0x1e]);
         assert!(released.is_empty());
+    }
+
+    #[test]
+    fn validate_presentable_dims_rejects_oversize() {
+        assert!(validate_presentable_dims(0, 10).is_err());
+        assert!(validate_presentable_dims(10, 0).is_err());
+        assert!(validate_presentable_dims(MAX_WINDOW_DIM + 1, 10).is_err());
+        assert!(validate_presentable_dims(100_000, 100_000).is_err());
+        assert!(validate_presentable_dims(1920, 1080).is_ok());
+        assert!(validate_presentable_dims(MAX_WINDOW_DIM, MAX_WINDOW_DIM).is_err());
+    }
+
+    #[test]
+    fn adapt_audio_chunk_zero_input_rate_does_not_panic() {
+        let samples = vec![0.0f32; 64];
+        let out = adapt_audio_chunk(&samples, 2, 0, 2, 44100);
+        assert!(!out.is_empty());
+        assert_eq!(out.len() % 2, 0);
+    }
+
+    #[test]
+    fn adapt_audio_chunk_tiny_input_rate_is_capped() {
+        // A guest claiming a 1 Hz input rate would otherwise amplify a
+        // one-second chunk into ~1.9 billion frames.
+        let samples = vec![0.0f32; 44100 * 2];
+        let out = adapt_audio_chunk(&samples, 2, 1, 2, 44100);
+        assert!(out.len() <= MAX_ADAPTED_FRAMES * 2);
     }
 }

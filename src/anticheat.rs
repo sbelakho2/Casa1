@@ -178,6 +178,12 @@ pub struct ModuleInfo {
     pub base_name: String,
     /// SHA-256 hash of the module's code sections (for integrity checks).
     pub code_hash: [u8; 32],
+    /// True when `code_hash` was derived from the module path rather than
+    /// from guest memory (default module list). Integrity checks against
+    /// such modules are auto-passed because their fake bases are not
+    /// mapped in guest memory.
+    #[serde(default)]
+    pub hash_from_path: bool,
 }
 
 /// Information about the guest process.
@@ -220,7 +226,7 @@ pub struct HardwareInfo {
     pub mac_address: [u8; 6],
     /// BIOS UUID (16 bytes).
     pub bios_uuid: [u8; 16],
-    /// Motherboard serial (deterministic, 32 ASCII chars).
+    /// Motherboard serial (deterministic, 64 hex chars).
     pub motherboard_serial: String,
     /// Total physical memory in MB.
     pub total_memory_mb: u32,
@@ -254,6 +260,19 @@ pub struct IntegrityCheckResponse {
     pub region_size: u32,
     /// Timestamp of the check.
     pub timestamp: u64,
+}
+
+/// Cap on auto-registered integrity-check regions so a long session cannot
+/// grow `modules` without bound.
+const MAX_AUTO_REGIONS: usize = 256;
+
+/// Whether `address` falls within `module`'s mapped range (overflow-safe).
+fn module_contains(module: &ModuleInfo, address: u64) -> bool {
+    address >= module.base_address
+        && module
+            .base_address
+            .checked_add(module.image_size as u64)
+            .is_some_and(|end| address < end)
 }
 
 // ---------------------------------------------------------------------------
@@ -429,7 +448,7 @@ impl AntiCheatDriverShim {
         code_hash: [u8; 32],
     ) {
         let base_name = image_path
-            .rsplit(|c| c == '\\' || c == '/')
+            .rsplit(['\\', '/'])
             .next()
             .unwrap_or(image_path)
             .to_string();
@@ -439,6 +458,7 @@ impl AntiCheatDriverShim {
             image_path: image_path.to_string(),
             base_name,
             code_hash,
+            hash_from_path: false,
         });
     }
 
@@ -480,30 +500,47 @@ impl AntiCheatDriverShim {
         size: u32,
     ) -> AppResult<IntegrityCheckResponse> {
         self.integrity_check_count += 1;
+        let timestamp = SHIM_TICK.fetch_add(1, Ordering::Relaxed);
+
+        // Default modules have path-derived hashes and their bases are not
+        // mapped in guest memory, so integrity checks against them are
+        // auto-passed (only modules registered with real memory content
+        // participate in hash comparison).
+        let containing_module = self
+            .modules
+            .iter()
+            .find(|m| module_contains(m, base_address));
+        if let Some(module) = containing_module
+            && module.hash_from_path
+        {
+            return Ok(IntegrityCheckResponse {
+                passed: true,
+                computed_hash: module.code_hash,
+                region_size: size,
+                timestamp,
+            });
+        }
+
         let data = memory.read_bytes(base_address, size as usize)?;
         let computed_hash = sha256_hash(&data);
 
-        // Look up the module that contains this region
-        let expected_hash = self
-            .modules
-            .iter()
-            .find(|m| {
-                base_address >= m.base_address
-                    && base_address < m.base_address + m.image_size as u64
-            })
-            .map(|m| m.code_hash);
-
-        let passed = match expected_hash {
-            Some(expected) => computed_hash == expected,
+        let passed = match containing_module {
+            Some(module) => computed_hash == module.code_hash,
             None => {
-                // No expected hash — first check for this region; record it
-                let base_name = format!("region_{base_address:X}");
-                self.add_module(base_address, size, &base_name, computed_hash);
+                // No expected hash — first check for this region; record it.
+                // Deduplicate by base address and bound the list so a long
+                // session cannot grow the module set without limit.
+                let already_registered = self
+                    .modules
+                    .iter()
+                    .any(|m| m.base_address == base_address);
+                if !already_registered && self.modules.len() < MAX_AUTO_REGIONS {
+                    let base_name = format!("region_{base_address:X}");
+                    self.add_module(base_address, size, &base_name, computed_hash);
+                }
                 true
             }
         };
-
-        let timestamp = SHIM_TICK.fetch_add(1, Ordering::Relaxed);
 
         Ok(IntegrityCheckResponse {
             passed,
@@ -561,19 +598,19 @@ impl AntiCheatDriverShim {
         let seed_bytes = seed.to_le_bytes();
         let mut hasher = Sha256::new();
         hasher.update(b"casa1-hw-seed");
-        hasher.update(&seed_bytes);
+        hasher.update(seed_bytes);
         hasher.update(b"casa1-hw-salt-1");
         let hash1: [u8; 32] = hasher.finalize().into();
 
         let mut hasher = Sha256::new();
         hasher.update(b"casa1-hw-seed");
-        hasher.update(&seed_bytes);
+        hasher.update(seed_bytes);
         hasher.update(b"casa1-hw-salt-2");
         let hash2: [u8; 32] = hasher.finalize().into();
 
         let mut hasher = Sha256::new();
         hasher.update(b"casa1-hw-seed");
-        hasher.update(&seed_bytes);
+        hasher.update(seed_bytes);
         hasher.update(b"casa1-hw-salt-3");
         let hash3: [u8; 32] = hasher.finalize().into();
 
@@ -583,7 +620,7 @@ impl AntiCheatDriverShim {
 
         // CPUID leaf 1: realistic-looking values for Intel Core i7
         let cpuid_eax = 0x0009_06EA; // Comet Lake
-        let cpuid_ebx = 0x0002_0800 | ((seed & 0xFF) as u32); // brand index + APIC ID
+        let cpuid_ebx = 0x0002_0800 | (seed & 0xFF); // brand index + APIC ID
         let cpuid_ecx = 0x7FFA_FBBF; // feature flags
         let cpuid_edx = 0xBFEB_FBFF; // feature flags
 
@@ -605,7 +642,7 @@ impl AntiCheatDriverShim {
         bios_uuid[6] = (bios_uuid[6] & 0x0F) | 0x40;
         bios_uuid[8] = (bios_uuid[8] & 0x3F) | 0x80;
 
-        // Motherboard serial: 32 ASCII chars from hash
+        // Motherboard serial: 64 hex chars from both hashes
         let motherboard_serial = derive_ascii_hex(&hash1, &hash2);
 
         // Total memory: 16 GB (realistic for gaming)
@@ -731,9 +768,14 @@ impl AntiCheatDriverShim {
         ];
 
         for (base, size, path) in &default_modules {
-            // Generate a deterministic hash for each module based on its path
+            // These modules are not mapped in guest memory, so their hashes
+            // are derived from the path and marked as such; integrity checks
+            // auto-pass for them (see `check_integrity`).
             let hash = sha256_hash(path.as_bytes());
             self.add_module(*base, *size, path, hash);
+            if let Some(last) = self.modules.last_mut() {
+                last.hash_from_path = true;
+            }
         }
     }
 }
@@ -779,7 +821,12 @@ impl AntiCheatShimRegistry {
             return Ok(false);
         }
         let key = driver_name.to_ascii_lowercase();
-        if self.shims.contains_key(&key) {
+        if let Some(shim) = self.shims.get_mut(&key) {
+            // A shim that was previously unloaded must be re-activated;
+            // an already-active shim stays as-is.
+            if shim.state != ShimState::Active {
+                shim.load()?;
+            }
             return Ok(true); // Already loaded
         }
         let mut shim = AntiCheatDriverShim::new(
@@ -860,14 +907,14 @@ fn derive_ascii_digits(hash: &[u8], len: usize) -> String {
     result
 }
 
-/// Derives a 32-character hex string from two hashes.
+/// Derives a 64-character hex string from two hashes.
 fn derive_ascii_hex(hash1: &[u8; 32], hash2: &[u8; 32]) -> String {
-    let mut result = String::with_capacity(32);
-    for i in 0..16 {
-        result.push_str(&format!("{:02x}", hash1[i]));
+    let mut result = String::with_capacity(64);
+    for byte in &hash1[..16] {
+        result.push_str(&format!("{byte:02x}"));
     }
-    for i in 0..16 {
-        result.push_str(&format!("{:02x}", hash2[i]));
+    for byte in &hash2[..16] {
+        result.push_str(&format!("{byte:02x}"));
     }
     result
 }
@@ -1144,5 +1191,19 @@ mod tests {
         // Unload
         assert!(registry.unload_driver("easyanticheat.sys"));
         assert!(registry.get_shim("easyanticheat.sys").is_some()); // still exists but unloaded
+        assert_eq!(
+            registry.get_shim("easyanticheat.sys").unwrap().state,
+            ShimState::Unloaded
+        );
+
+        // Reloading an unloaded shim must re-activate it
+        let loaded = registry.try_load_driver("easyanticheat.sys").unwrap();
+        assert!(loaded);
+        assert_eq!(registry.count(), 2);
+        assert_eq!(
+            registry.get_shim("easyanticheat.sys").unwrap().state,
+            ShimState::Active
+        );
+        assert!(registry.has_active_shim());
     }
 }
