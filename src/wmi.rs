@@ -153,13 +153,15 @@ fn os_version() -> String {
     }
     // Fallback: kern.osrelease gives Darwin version (e.g., "23.6.0")
     // macOS 14.x = Darwin 23.x, macOS 13.x = Darwin 22.x, etc.
-    if let Some(darwin) = sysctl_value("kern.osrelease") {
-        if let Some(major_str) = darwin.split('.').next() {
-            if let Ok(major) = major_str.parse::<u32>() {
-                let macos_ver = major.saturating_sub(9);
-                return format!("{}.0", macos_ver);
-            }
+    if let Some(darwin) = sysctl_value("kern.osrelease")
+        && let Some(major_str) = darwin.split('.').next()
+        && let Ok(major) = major_str.parse::<u32>()
+    {
+        if major < 20 {
+            // Darwin 17/18/19 correspond to macOS 10.13/10.14/10.15.
+            return format!("10.{}", major.saturating_sub(4));
         }
+        return format!("{}.0", major.saturating_sub(9));
     }
     "14.0".to_string()
 }
@@ -203,7 +205,7 @@ fn boot_time_dmtf() -> String {
     let raw = sysctl_raw("kern.boottime").unwrap_or_default();
     // kern.boottime returns struct timeval { tv_sec: i64, tv_usec: i32 }
     let sec = if raw.len() >= 8 {
-        i64::from_ne_bytes(raw[..8].try_into().unwrap_or([0i64.to_ne_bytes()[0]; 8])) as u64
+        i64::from_ne_bytes(raw[..8].try_into().unwrap_or([0; 8])) as u64
     } else {
         // Fallback: current time minus 1 hour
         let now = SystemTime::now()
@@ -329,7 +331,7 @@ fn screen_resolution() -> (u32, u32) {
 // WMI Property Types
 // ============================================================================
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub enum WmiPropertyValue {
     Uint16(u16),
     Uint32(u32),
@@ -343,13 +345,8 @@ pub enum WmiPropertyValue {
     DateTime(String), // DMTF format
     Array(Vec<WmiPropertyValue>),
     Object(Box<WmiObject>),
+    #[default]
     Null,
-}
-
-impl Default for WmiPropertyValue {
-    fn default() -> Self {
-        WmiPropertyValue::Null
-    }
 }
 
 /// A WMI object instance with property bag.
@@ -557,9 +554,10 @@ impl WmiClassProvider for Win32ProcessorProvider {
     }
 
     fn enum_objects(&self) -> AppResult<Vec<WmiObject>> {
-        Ok((0..physical_cpu_count())
-            .map(|_| self.build_object())
-            .collect())
+        // Build the object once and clone it per entry — one instance per
+        // physical processor, without re-running the sysctls per core.
+        let obj = self.build_object();
+        Ok((0..physical_cpu_count()).map(|_| obj.clone()).collect())
     }
 }
 
@@ -585,10 +583,10 @@ impl Win32OperatingSystemProvider {
             .set("BuildNumber", build.clone())
             .set("BuildType", "Release")
             .set("OSArchitecture", "ARM64")
-            .set("TotalVisibleMemorySize", total_ram_kb as u64)
-            .set("FreePhysicalMemory", avail_ram_kb as u64)
-            .set("FreeVirtualMemory", avail_ram_kb as u64)
-            .set("TotalVirtualMemorySize", (total_ram_kb + 2_097_152) as u64) // ~2 GB page file
+            .set("TotalVisibleMemorySize", total_ram_kb)
+            .set("FreePhysicalMemory", avail_ram_kb)
+            .set("FreeVirtualMemory", avail_ram_kb)
+            .set("TotalVirtualMemorySize", total_ram_kb + 2_097_152) // ~2 GB page file
             .set(
                 "LastBootUpTime",
                 WmiPropertyValue::DateTime(boot_time_dmtf()),
@@ -674,10 +672,10 @@ impl Win32VideoControllerProvider {
             }
         }
         // Fallback: use hw.model to infer GPU family
-        if let Some(model) = sysctl_value("hw.model") {
-            if model.contains("Pro") || model.contains("Max") || model.contains("Ultra") {
-                return format!("Apple {} GPU", model);
-            }
+        if let Some(model) = sysctl_value("hw.model")
+            .filter(|m| m.contains("Pro") || m.contains("Max") || m.contains("Ultra"))
+        {
+            return format!("Apple {} GPU", model);
         }
         "Apple GPU".to_string()
     }
@@ -714,7 +712,7 @@ impl Win32VideoControllerProvider {
         const CF_STRING_ENCODING_UTF8: u32 = 0x08000100;
 
         // SAFETY: IOKit functions are safe to call on macOS; they query the IORegistry.
-        let matching = unsafe { IOServiceMatching("IOAccelerator\0".as_ptr() as *const i8) };
+        let matching = unsafe { IOServiceMatching(c"IOAccelerator".as_ptr()) };
         if matching.is_null() {
             return String::new();
         }
@@ -729,7 +727,7 @@ impl Win32VideoControllerProvider {
         let model_cfstr = unsafe {
             CFStringCreateWithCString(
                 std::ptr::null(),
-                "Model\0".as_ptr() as *const libc::c_char,
+                c"Model".as_ptr(),
                 CF_STRING_ENCODING_UTF8,
             )
         };
@@ -820,10 +818,10 @@ impl Win32VideoControllerProvider {
             fn IOObjectRelease(object: libc::c_uint) -> i32;
         }
         const CF_STRING_ENCODING_UTF8: u32 = 0x08000100;
-        const KCF_NUMBER_S64_TYPE: u32 = 14; // kCFNumberSInt64Type
+        const KCF_NUMBER_S64_TYPE: u32 = 4; // kCFNumberSInt64Type
 
         // SAFETY: IOKit functions are safe to call on macOS.
-        let matching = unsafe { IOServiceMatching("IOAccelerator\0".as_ptr() as *const i8) };
+        let matching = unsafe { IOServiceMatching(c"IOAccelerator".as_ptr()) };
         if matching.is_null() {
             return 0;
         }
@@ -838,7 +836,7 @@ impl Win32VideoControllerProvider {
         let vram_cfstr = unsafe {
             CFStringCreateWithCString(
                 std::ptr::null(),
-                "VRAM (total)\0".as_ptr() as *const libc::c_char,
+                c"VRAM (total)".as_ptr(),
                 CF_STRING_ENCODING_UTF8,
             )
         };
@@ -1018,46 +1016,45 @@ impl Win32NetworkAdapterProvider {
 
             for line in text.lines() {
                 if line.is_empty() {
-                    if let Some(name) = current_iface.take() {
-                        if name != "lo0"
-                            && !name.starts_with("gif")
-                            && !name.starts_with("stf")
-                            && !name.starts_with("awdl")
-                            && !name.starts_with("llw")
-                        {
-                            let ip_enabled = !current_ips.is_empty();
-                            objects.push(
-                                WmiObject::new("Win32_NetworkAdapter")
-                                    .set("Name", name.clone())
-                                    .set(
-                                        "MACAddress",
-                                        current_mac
-                                            .clone()
-                                            .unwrap_or_else(|| "00:00:00:00:00:00".to_string()),
-                                    )
-                                    .set("IPEnabled", ip_enabled)
-                                    .set(
-                                        "IPAddress",
-                                        WmiPropertyValue::Array(
-                                            current_ips
-                                                .iter()
-                                                .map(|ip| WmiPropertyValue::String(ip.clone()))
-                                                .collect(),
-                                        ),
-                                    )
-                                    .set(
-                                        "NetConnectionStatus",
-                                        if ip_enabled { 2u32 } else { 0u32 },
-                                    ) // 2=connected
-                                    .set("AdapterType", "Ethernet 802.3")
-                                    .set("Description", name)
-                                    .set("Speed", 1000000000u64)
-                                    .set("Manufacturer", "Apple")
-                                    .set("NetEnabled", is_up)
-                                    .set("Index", objects.len() as u32)
-                                    .clone(),
-                            );
-                        }
+                    if let Some(name) = current_iface.take()
+                        && name != "lo0"
+                        && !name.starts_with("gif")
+                        && !name.starts_with("stf")
+                        && !name.starts_with("awdl")
+                        && !name.starts_with("llw")
+                    {
+                        let ip_enabled = !current_ips.is_empty();
+                        objects.push(
+                            WmiObject::new("Win32_NetworkAdapter")
+                                .set("Name", name.clone())
+                                .set(
+                                    "MACAddress",
+                                    current_mac
+                                        .clone()
+                                        .unwrap_or_else(|| "00:00:00:00:00:00".to_string()),
+                                )
+                                .set("IPEnabled", ip_enabled)
+                                .set(
+                                    "IPAddress",
+                                    WmiPropertyValue::Array(
+                                        current_ips
+                                            .iter()
+                                            .map(|ip| WmiPropertyValue::String(ip.clone()))
+                                            .collect(),
+                                    ),
+                                )
+                                .set(
+                                    "NetConnectionStatus",
+                                    if ip_enabled { 2u32 } else { 0u32 },
+                                ) // 2=connected
+                                .set("AdapterType", "Ethernet 802.3")
+                                .set("Description", name)
+                                .set("Speed", 1000000000u64)
+                                .set("Manufacturer", "Apple")
+                                .set("NetEnabled", is_up)
+                                .set("Index", objects.len() as u32)
+                                .clone(),
+                        );
                     }
                     current_ips.clear();
                     current_mac = None;
@@ -1102,18 +1099,9 @@ impl WmiClassProvider for Win32NetworkAdapterProvider {
 
     fn get_object(&self, key: &str, value: &str) -> Option<WmiObject> {
         for obj in self.build_objects() {
-            match key {
-                "Name" => {
-                    if obj.get_string("Name").as_deref() == Some(value) {
-                        return Some(obj);
-                    }
-                }
-                "MACAddress" => {
-                    if obj.get_string("MACAddress").as_deref() == Some(value) {
-                        return Some(obj);
-                    }
-                }
-                _ => {}
+            if matches!(key, "Name" | "MACAddress") && obj.get_string(key).as_deref() == Some(value)
+            {
+                return Some(obj);
             }
         }
         None
@@ -1400,8 +1388,7 @@ pub fn parse_wql(query: &str) -> AppResult<WqlQuery> {
     let trimmed = query.trim();
 
     // Must start with SELECT (case-insensitive)
-    let upper = trimmed.to_uppercase();
-    if !upper.starts_with("SELECT") {
+    if !trimmed.get(..6).is_some_and(|p| p.eq_ignore_ascii_case("SELECT")) {
         return Err(AppError::new(
             ReasonCode::RcWmiParseError,
             format!("WQL query must start with SELECT: {}", query),
@@ -1410,8 +1397,8 @@ pub fn parse_wql(query: &str) -> AppResult<WqlQuery> {
 
     let after_select = trimmed[6..].trim();
 
-    // Find FROM position
-    let from_idx = after_select.to_uppercase().find("FROM").ok_or_else(|| {
+    // Find FROM position (byte-accurate; safe to slice `after_select`)
+    let from_idx = find_ci(after_select, "FROM").ok_or_else(|| {
         AppError::new(
             ReasonCode::RcWmiParseError,
             format!("WQL query missing FROM clause: {}", query),
@@ -1434,7 +1421,7 @@ pub fn parse_wql(query: &str) -> AppResult<WqlQuery> {
     };
 
     // Find WHERE position
-    let where_idx = after_from.to_uppercase().find("WHERE");
+    let where_idx = find_ci(after_from, "WHERE");
     let class_name = if let Some(idx) = where_idx {
         after_from[..idx].trim().to_string()
     } else {
@@ -1477,29 +1464,52 @@ fn parse_where_clause(s: &str) -> AppResult<WqlWhereClause> {
     parse_simple_condition(trimmed)
 }
 
+/// Find the byte index of a case-insensitive ASCII keyword in `s`.
+///
+/// Scans the raw bytes so the returned index is a char boundary of `s`
+/// whenever the keyword is ASCII (multi-byte UTF-8 bytes are never ASCII,
+/// so they can neither match nor be matched across).
+fn find_ci(s: &str, keyword: &str) -> Option<usize> {
+    let k = keyword.as_bytes();
+    if k.is_empty() {
+        return None;
+    }
+    s.as_bytes()
+        .windows(k.len())
+        .position(|w| w.eq_ignore_ascii_case(k))
+}
+
 fn split_by_and(s: &str) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut depth: usize = 0;
     let mut start = 0;
-    let upper = s.to_uppercase();
-    let chars: Vec<char> = s.chars().collect();
+    let bytes = s.as_bytes();
 
-    for (i, _) in chars.iter().enumerate() {
-        if chars[i] == '(' {
+    let mut i = 0;
+    while i + 3 <= bytes.len() {
+        // `i` is always a char boundary: it starts at 0 and advances by
+        // whole characters below.
+        let ch = match s[i..].chars().next() {
+            Some(c) => c,
+            None => break,
+        };
+        if ch == '(' {
             depth += 1;
         }
-        if chars[i] == ')' {
+        if ch == ')' {
             depth = depth.saturating_sub(1);
         }
-        if depth == 0 && i + 3 < s.len() && &upper[i..i + 3] == "AND" {
-            // Make sure it's a word boundary
-            let prev_is_boundary = i == 0 || chars[i - 1] == ' ';
-            let next_is_boundary = i + 3 >= s.len() || chars[i + 3] == ' ';
+        if depth == 0 && bytes[i..i + 3].eq_ignore_ascii_case(b"AND") {
+            // Make sure it's a word boundary. The matched bytes are ASCII
+            // "AND", so i and i + 3 are both char boundaries.
+            let prev_is_boundary = i == 0 || bytes[i - 1].is_ascii_whitespace();
+            let next_is_boundary = i + 3 >= bytes.len() || bytes[i + 3].is_ascii_whitespace();
             if prev_is_boundary && next_is_boundary {
                 parts.push(s[start..i].trim());
                 start = i + 3;
             }
         }
+        i += ch.len_utf8();
     }
     if start < s.len() {
         parts.push(s[start..].trim());
@@ -1507,60 +1517,64 @@ fn split_by_and(s: &str) -> Vec<&str> {
     parts
 }
 
+/// Try to parse `s` as `<property> <op> <value>` for a specific operator.
+///
+/// Only matches when the operator is a standalone token bounded by
+/// whitespace and the property is a simple identifier, so quoted values
+/// containing operator words (e.g. `Name = 'LIKE'`) fall through.
+fn parse_operator_condition(s: &str, op_str: &str) -> Option<(String, WqlOp, String)> {
+    let idx = s.find(op_str)?;
+    let before = s[..idx].trim();
+    let after = s[idx + op_str.len()..].trim();
+    if before.is_empty() || after.is_empty() || !is_simple_property(before) {
+        return None;
+    }
+    let op = WqlOp::from_str(op_str)?;
+    Some((before.to_string(), op, unquote(after)))
+}
+
 fn parse_simple_condition(s: &str) -> AppResult<WqlWhereClause> {
     let trimmed = s.trim();
 
-    // Try LIKE first (longest operator)
-    let like_idx = trimmed.to_uppercase().find("LIKE");
-    if let Some(idx) = like_idx {
-        let before = trimmed[..idx].trim();
-        let after = trimmed[idx + 4..].trim();
-        if !before.is_empty() && !after.is_empty() {
-            return Ok(WqlWhereClause::Simple {
-                property: before.to_string(),
-                op: WqlOp::Like,
-                value: unquote(after),
-            });
+    // Try LIKE first (longest operator). Only treat it as an operator when
+    // it is a standalone word and the property is a simple identifier, so a
+    // value containing the literal word "LIKE" is not misparsed.
+    if let Some(idx) = find_ci(trimmed, "LIKE") {
+        let prev_is_boundary = idx == 0 || trimmed[..idx].ends_with(char::is_whitespace);
+        let next_is_boundary =
+            idx + 4 >= trimmed.len() || trimmed[idx + 4..].starts_with(char::is_whitespace);
+        if prev_is_boundary && next_is_boundary {
+            let before = trimmed[..idx].trim();
+            let after = trimmed[idx + 4..].trim();
+            if !before.is_empty() && !after.is_empty() && is_simple_property(before) {
+                return Ok(WqlWhereClause::Simple {
+                    property: before.to_string(),
+                    op: WqlOp::Like,
+                    value: unquote(after),
+                });
+            }
         }
     }
 
     // Try multi-char operators: !=, <>, <=, >=
-    let operators = ["!=", "<>", "<=", ">="];
-    for op_str in &operators {
-        if let Some(idx) = trimmed.find(op_str) {
-            let before = trimmed[..idx].trim();
-            let after = trimmed[idx + op_str.len()..].trim();
-            if !before.is_empty() && !after.is_empty() {
-                if let Some(op) = WqlOp::from_str(op_str) {
-                    if is_simple_property(before) {
-                        return Ok(WqlWhereClause::Simple {
-                            property: before.to_string(),
-                            op,
-                            value: unquote(after),
-                        });
-                    }
-                }
-            }
+    for op_str in ["!=", "<>", "<=", ">="] {
+        if let Some((property, op, value)) = parse_operator_condition(trimmed, op_str) {
+            return Ok(WqlWhereClause::Simple {
+                property,
+                op,
+                value,
+            });
         }
     }
 
     // Try single-char operators: =, <, >
-    let operators = ["=", "<", ">"];
-    for op_str in &operators {
-        if let Some(idx) = trimmed.find(op_str) {
-            let before = trimmed[..idx].trim();
-            let after = trimmed[idx + op_str.len()..].trim();
-            if !before.is_empty() && !after.is_empty() {
-                if let Some(op) = WqlOp::from_str(op_str) {
-                    if is_simple_property(before) {
-                        return Ok(WqlWhereClause::Simple {
-                            property: before.to_string(),
-                            op,
-                            value: unquote(after),
-                        });
-                    }
-                }
-            }
+    for op_str in ["=", "<", ">"] {
+        if let Some((property, op, value)) = parse_operator_condition(trimmed, op_str) {
+            return Ok(WqlWhereClause::Simple {
+                property,
+                op,
+                value,
+            });
         }
     }
 
@@ -1576,8 +1590,9 @@ fn is_simple_property(s: &str) -> bool {
 
 fn unquote(s: &str) -> String {
     let trimmed = s.trim();
-    if (trimmed.starts_with('\'') && trimmed.ends_with('\''))
-        || (trimmed.starts_with('"') && trimmed.ends_with('"'))
+    if trimmed.len() >= 2
+        && ((trimmed.starts_with('\'') && trimmed.ends_with('\''))
+            || (trimmed.starts_with('"') && trimmed.ends_with('"')))
     {
         trimmed[1..trimmed.len() - 1].to_string()
     } else {
@@ -1637,8 +1652,10 @@ fn values_like(prop: &WmiPropertyValue, pattern: &str) -> bool {
         _ => return false,
     };
 
-    // Simple wildcard matching: % matches any sequence, _ matches single char
-    let regex_pattern = pattern.replace('%', ".*").replace('_', ".");
+    // Simple wildcard matching: % matches any sequence, _ matches single char.
+    // Escape regex metacharacters first so guest-supplied patterns cannot
+    // change the match semantics.
+    let regex_pattern = regex::escape(pattern).replace('%', ".*").replace('_', ".");
 
     if let Ok(re) = regex::Regex::new(&format!("^(?i){}$", regex_pattern)) {
         re.is_match(prop_str)
@@ -1709,6 +1726,9 @@ impl WbemLocator {
     /// ConnectServer — creates a WMI connection to the specified namespace.
     ///
     /// Standard namespace: `root\cimv2`
+    // The argument list mirrors the IWbemLocator::ConnectServer COM vtable
+    // signature; the extra parameters are accepted for compatibility.
+    #[allow(clippy::too_many_arguments)]
     pub fn connect_server(
         &self,
         server: Option<&str>,
@@ -2173,6 +2193,61 @@ mod tests {
         } else {
             panic!("Expected And where clause");
         }
+    }
+
+    #[test]
+    fn test_wql_parse_non_ascii_where() {
+        // Regression: a multi-byte UTF-8 character before the AND used to
+        // panic with "byte index is not a char boundary".
+        let query =
+            parse_wql("SELECT * FROM Win32_Processor WHERE Name = 'Café' AND Architecture = 9")
+                .unwrap();
+        if let Some(WqlWhereClause::And(ref clauses)) = query.where_clause {
+            assert_eq!(clauses.len(), 2);
+        } else {
+            panic!("Expected And where clause");
+        }
+    }
+
+    #[test]
+    fn test_wql_parse_like_literal_in_value() {
+        // Regression: a value containing the literal word "LIKE" must not be
+        // parsed as a LIKE operator.
+        let query = parse_wql("SELECT * FROM Win32_Processor WHERE Name = 'LIKE'").unwrap();
+        if let Some(WqlWhereClause::Simple {
+            ref property,
+            ref op,
+            ref value,
+        }) = query.where_clause
+        {
+            assert_eq!(property, "Name");
+            assert_eq!(*op, WqlOp::Eq);
+            assert_eq!(value, "LIKE");
+        } else {
+            panic!("Expected Simple where clause");
+        }
+    }
+
+    #[test]
+    fn test_wql_like_regex_metachars() {
+        // Regression: LIKE patterns with regex metacharacters must match
+        // literally, not as regular expressions.
+        let mut obj = WmiObject::new("Win32_Test");
+        obj.set("Name", "a+b");
+        let clause = WqlWhereClause::Simple {
+            property: "Name".to_string(),
+            op: WqlOp::Like,
+            value: "a+b".to_string(),
+        };
+        assert!(evaluate_condition(&obj, &clause));
+        let mut obj2 = WmiObject::new("Win32_Test");
+        obj2.set("Name", "aXb");
+        let clause2 = WqlWhereClause::Simple {
+            property: "Name".to_string(),
+            op: WqlOp::Like,
+            value: "a+b".to_string(),
+        };
+        assert!(!evaluate_condition(&obj2, &clause2));
     }
 
     #[test]
