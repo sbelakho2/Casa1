@@ -12,7 +12,14 @@
 //! use casa1::crash_recovery::CrashRecovery;
 //!
 //! let mut recovery = CrashRecovery::new("/tmp/casa1_crashes", 3);
-//! recovery.record_crash(12345, Some(-6), "SIGABRT", &telemetry_snapshot, &installer_state);
+//! let dump = recovery.record_crash(
+//!     12345,
+//!     0,
+//!     Some(-6),
+//!     Some("SIGABRT"),
+//!     TelemetryData::default(),
+//!     None,
+//! );
 //! if recovery.should_restart() {
 //!     recovery.restart(|| {
 //!         // re-launch the emulated process
@@ -226,7 +233,7 @@ impl CrashRecovery {
         telemetry: TelemetryData,
         installer: Option<&InstallerEngine>,
     ) -> CrashDump {
-        self.attempt_count += 1;
+        self.attempt_count = self.attempt_count.saturating_add(1);
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -328,7 +335,17 @@ impl CrashRecovery {
         fs::create_dir_all(&self.dump_dir)
             .map_err(|e| format!("failed to create dump dir {:?}: {e}", self.dump_dir))?;
 
-        let filename = format!("crash_{}_{}.json", dump.timestamp, dump.pid);
+        // Use a unique suffix (sub-second timestamp + monotonic counter) so
+        // crashes of the same pid within the same second cannot overwrite
+        // each other's dump, and concurrent saves cannot clobber the same
+        // temporary file.
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        static DUMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let counter = DUMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let filename = format!("crash_{}_{}_{}_{}.json", dump.timestamp, dump.pid, nanos, counter);
         let path = self.dump_dir.join(&filename);
 
         let json = serde_json::to_string_pretty(dump)
@@ -366,13 +383,13 @@ impl CrashRecovery {
 
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().map_or(true, |e| e != "json") {
+            if path.extension().is_none_or(|e| e != "json") {
                 continue;
             }
-            if let Ok(json) = fs::read_to_string(&path) {
-                if let Ok(dump) = serde_json::from_str::<CrashDump>(&json) {
-                    dumps.push(dump);
-                }
+            if let Ok(json) = fs::read_to_string(&path)
+                && let Ok(dump) = serde_json::from_str::<CrashDump>(&json)
+            {
+                dumps.push(dump);
             }
         }
 
@@ -399,24 +416,33 @@ impl CrashRecovery {
             .as_secs();
 
         let mut dump_files: Vec<(PathBuf, u64)> = Vec::new();
+        let mut tmp_files: Vec<PathBuf> = Vec::new();
 
         let entries =
             fs::read_dir(&self.dump_dir).map_err(|e| format!("failed to read dump dir: {e}"))?;
 
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().map_or(true, |e| e != "json") {
+            if path.extension().is_none_or(|e| e != "json") {
+                // Prune stale temporary files left behind by an interrupted
+                // atomic write (`crash_*.json.tmp`).
+                if path.extension().is_some_and(|e| e == "tmp")
+                    && path.file_stem().is_some_and(|s| {
+                        s.to_str().is_some_and(|s| s.starts_with("crash_"))
+                    })
+                {
+                    tmp_files.push(path);
+                }
                 continue;
             }
-            // Try to extract timestamp from filename: crash_{timestamp}_{pid}.json
+            // Try to extract timestamp from filename: crash_{timestamp}_{pid}_{nanos}_{counter}.json
             let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
             if let Some(ts_str) = stem
                 .strip_prefix("crash_")
                 .and_then(|s| s.split('_').next())
+                && let Ok(ts) = ts_str.parse::<u64>()
             {
-                if let Ok(ts) = ts_str.parse::<u64>() {
-                    dump_files.push((path, ts));
-                }
+                dump_files.push((path, ts));
             }
         }
 
@@ -430,22 +456,39 @@ impl CrashRecovery {
 
         let mut removed = 0_usize;
 
-        // Remove files older than MAX_DUMP_AGE_SECS
-        while let Some((path, ts)) = dump_files.first() {
-            if now.saturating_sub(*ts) > MAX_DUMP_AGE_SECS {
-                if fs::remove_file(path).is_ok() {
-                    removed += 1;
-                }
-                dump_files.remove(0);
-            } else {
-                break;
+        // Remove files older than MAX_DUMP_AGE_SECS.
+        let mut older_than_age = 0;
+        while older_than_age < dump_files.len()
+            && now.saturating_sub(dump_files[older_than_age].1) > MAX_DUMP_AGE_SECS
+        {
+            older_than_age += 1;
+        }
+        for (path, _) in dump_files.drain(..older_than_age) {
+            if fs::remove_file(path).is_ok() {
+                removed += 1;
             }
         }
 
-        // If still over the limit, remove oldest
-        while dump_files.len() > MAX_DUMP_FILES {
-            let (path, _) = dump_files.remove(0);
+        // If still over the limit, remove the oldest.
+        let excess = dump_files.len().saturating_sub(MAX_DUMP_FILES);
+        for (path, _) in dump_files.drain(..excess) {
             if fs::remove_file(path).is_ok() {
+                removed += 1;
+            }
+        }
+
+        // Remove stale temporary files older than MAX_DUMP_AGE_SECS (by file
+        // modification time; incomplete dumps have no reliable name timestamp).
+        for path in tmp_files {
+            let stale = fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .map(|t| {
+                    t.duration_since(UNIX_EPOCH)
+                        .map(|d| now.saturating_sub(d.as_secs()) > MAX_DUMP_AGE_SECS)
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false);
+            if stale && fs::remove_file(&path).is_ok() {
                 removed += 1;
             }
         }
@@ -532,8 +575,7 @@ fn format_timestamp_iso(ts: u64) -> String {
     // Algorithm to convert days to year/month/day (from Howard Hinnant's
     // public-domain date algorithms)
     let z = days + 719468;
-    #[allow(unused_comparisons)]
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let era = z / 146097;
     let doe = z - era * 146097;
     let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
     let y = yoe + era * 400;
@@ -890,7 +932,7 @@ mod tests {
         assert_eq!(dumps[0].pid, 100);
 
         // No .tmp files should remain
-        let tmp_files: Vec<_> = std::fs::read_dir(&dir.path())
+        let tmp_files: Vec<_> = std::fs::read_dir(dir.path())
             .expect("should read temp dir")
             .flatten()
             .filter(|e| {
