@@ -85,7 +85,6 @@ pub fn steam_exe_imports() -> BTreeMap<String, Vec<String>> {
             "GetSystemTime".into(),
             "GetSystemTimeAsFileTime".into(),
             "GetLocalTime".into(),
-            "GetTickCount64".into(),
             "CreateMutexA".into(),
             "CreateMutexW".into(),
             "OpenMutexA".into(),
@@ -96,7 +95,6 @@ pub fn steam_exe_imports() -> BTreeMap<String, Vec<String>> {
             "CreateEventW".into(),
             "SetEvent".into(),
             "ResetEvent".into(),
-            "WaitForSingleObject".into(),
             "InitializeCriticalSection".into(),
             "EnterCriticalSection".into(),
             "LeaveCriticalSection".into(),
@@ -138,8 +136,6 @@ pub fn steam_exe_imports() -> BTreeMap<String, Vec<String>> {
             "GetVersionExW".into(),
             "GetComputerNameA".into(),
             "GetComputerNameW".into(),
-            "GetUserNameA".into(),
-            "GetUserNameW".into(),
             "GetEnvironmentVariableA".into(),
             "GetEnvironmentVariableW".into(),
             "SetEnvironmentVariableA".into(),
@@ -568,7 +564,6 @@ pub fn steam_exe_imports() -> BTreeMap<String, Vec<String>> {
             "SHParseDisplayName".into(),
             "SHCreateItemFromParsingName".into(),
             "ExtractIconW".into(),
-            "DoDragDrop".into(),
         ],
     );
 
@@ -979,980 +974,30 @@ pub struct ImportCoverageReport {
     pub entries: Vec<ImportCoverageEntry>,
 }
 
-// ---------------------------------------------------------------------------
-// Functions that determine whether a function is "covered"
-// ---------------------------------------------------------------------------
-
-/// Known covered functions per DLL. These are functions that have real
-/// (non-stub) implementations in the Casa1 PE runtime.
-fn known_covered_functions() -> BTreeMap<String, Vec<String>> {
-    let mut m = BTreeMap::new();
-
-    // kernel32.dll — most functions are implemented
-    m.insert(
-        "kernel32.dll".to_string(),
-        vec![
-            "GetModuleHandleA",
-            "GetModuleHandleW",
-            "GetProcAddress",
-            "LoadLibraryA",
-            "LoadLibraryW",
-            "LoadLibraryExA",
-            "LoadLibraryExW",
-            "FreeLibrary",
-            "GetModuleFileNameA",
-            "GetModuleFileNameW",
-            "CreateFileA",
-            "CreateFileW",
-            "ReadFile",
-            "WriteFile",
-            "CloseHandle",
-            "GetFileSize",
-            "GetFileSizeEx",
-            "SetFilePointer",
-            "SetFilePointerEx",
-            "FlushFileBuffers",
-            "DeleteFileA",
-            "DeleteFileW",
-            "MoveFileA",
-            "MoveFileW",
-            "MoveFileExA",
-            "MoveFileExW",
-            "FindFirstFileA",
-            "FindFirstFileW",
-            "FindNextFileA",
-            "FindNextFileW",
-            "FindClose",
-            "CreateDirectoryA",
-            "CreateDirectoryW",
-            "RemoveDirectoryA",
-            "RemoveDirectoryW",
-            "GetFileAttributesA",
-            "GetFileAttributesW",
-            "SetFileAttributesA",
-            "SetFileAttributesW",
-            "GetCurrentDirectoryA",
-            "GetCurrentDirectoryW",
-            "SetCurrentDirectoryA",
-            "SetCurrentDirectoryW",
-            "GetTempPathA",
-            "GetTempPathW",
-            "GetTempFileNameA",
-            "GetTempFileNameW",
-            "CreateProcessA",
-            "CreateProcessW",
-            "TerminateProcess",
-            "GetExitCodeProcess",
-            "WaitForSingleObject",
-            "WaitForMultipleObjects",
-            "Sleep",
-            "SleepEx",
-            "GetTickCount",
-            "GetTickCount64",
-            "QueryPerformanceCounter",
-            "QueryPerformanceFrequency",
-            "GetSystemTime",
-            "GetSystemTimeAsFileTime",
-            "GetLocalTime",
-            "CreateMutexA",
-            "CreateMutexW",
-            "OpenMutexA",
-            "OpenMutexW",
-            "CreateSemaphoreA",
-            "CreateSemaphoreW",
-            "CreateEventA",
-            "CreateEventW",
-            "SetEvent",
-            "ResetEvent",
-            "InitializeCriticalSection",
-            "EnterCriticalSection",
-            "LeaveCriticalSection",
-            "DeleteCriticalSection",
-            "CreateThread",
-            "ExitThread",
-            "GetCurrentThreadId",
-            "GetCurrentProcessId",
-            "TlsAlloc",
-            "TlsFree",
-            "TlsGetValue",
-            "TlsSetValue",
-            "HeapAlloc",
-            "HeapFree",
-            "HeapCreate",
-            "HeapDestroy",
-            "GetProcessHeap",
-            "VirtualAlloc",
-            "VirtualFree",
-            "VirtualProtect",
-            "VirtualQuery",
-            "GetLastError",
-            "SetLastError",
-            "FormatMessageA",
-            "FormatMessageW",
-            "MultiByteToWideChar",
-            "WideCharToMultiByte",
-            "lstrlenA",
-            "lstrlenW",
-            "lstrcpyA",
-            "lstrcpyW",
-            "lstrcatA",
-            "lstrcatW",
-            "lstrcmpA",
-            "lstrcmpW",
-            "lstrcmpiA",
-            "lstrcmpiW",
-            "GetVersionExA",
-            "GetVersionExW",
-            "GetComputerNameA",
-            "GetComputerNameW",
-            "GetUserNameA",
-            "GetUserNameW",
-            "GetEnvironmentVariableA",
-            "GetEnvironmentVariableW",
-            "SetEnvironmentVariableA",
-            "SetEnvironmentVariableW",
-            "ExpandEnvironmentStringsA",
-            "ExpandEnvironmentStringsW",
-            "GetCommandLineA",
-            "GetCommandLineW",
-            "GetStartupInfoA",
-            "GetStartupInfoW",
-            "GlobalAlloc",
-            "GlobalFree",
-            "GlobalLock",
-            "GlobalUnlock",
-            "GlobalHandle",
-            "LocalAlloc",
-            "LocalFree",
-            "CreateActCtxW",
-            "ActivateActCtx",
-            "DeactivateActCtx",
-            "ReleaseActCtx",
-            "FindActCtxSectionStringW",
-            "GetSystemInfo",
-            "IsWow64Process",
-            "GetNativeSystemInfo",
-            "OutputDebugStringA",
-            "OutputDebugStringW",
-            "IsDebuggerPresent",
-            "SetUnhandledExceptionFilter",
-            "UnhandledExceptionFilter",
-            "GetStdHandle",
-            "WriteConsoleA",
-            "WriteConsoleW",
-        ]
-        .into_iter()
-        .map(String::from)
-        .collect(),
-    );
-
-    // user32.dll
-    m.insert(
-        "user32.dll".to_string(),
-        vec![
-            "CreateWindowExA",
-            "CreateWindowExW",
-            "DestroyWindow",
-            "ShowWindow",
-            "UpdateWindow",
-            "GetMessageA",
-            "GetMessageW",
-            "TranslateMessage",
-            "DispatchMessageA",
-            "DispatchMessageW",
-            "SendMessageA",
-            "SendMessageW",
-            "PostMessageA",
-            "PostMessageW",
-            "PostQuitMessage",
-            "PeekMessageA",
-            "PeekMessageW",
-            "DefWindowProcA",
-            "DefWindowProcW",
-            "RegisterClassA",
-            "RegisterClassW",
-            "RegisterClassExA",
-            "RegisterClassExW",
-            "GetClientRect",
-            "GetWindowRect",
-            "SetWindowPos",
-            "MoveWindow",
-            "GetDC",
-            "ReleaseDC",
-            "BeginPaint",
-            "EndPaint",
-            "InvalidateRect",
-            "ValidateRect",
-            "SetWindowTextA",
-            "SetWindowTextW",
-            "GetWindowTextA",
-            "GetWindowTextW",
-            "GetWindowTextLengthA",
-            "GetWindowTextLengthW",
-            "SetTimer",
-            "KillTimer",
-            "GetSystemMetrics",
-            "LoadCursorA",
-            "LoadCursorW",
-            "LoadIconA",
-            "LoadIconW",
-            "LoadImageA",
-            "LoadImageW",
-            "MessageBoxA",
-            "MessageBoxW",
-            "GetDlgItem",
-            "SetDlgItemTextA",
-            "SetDlgItemTextW",
-            "GetDlgItemTextA",
-            "GetDlgItemTextW",
-            "DialogBoxParamA",
-            "DialogBoxParamW",
-            "EndDialog",
-            "CreateDialogParamA",
-            "CreateDialogParamW",
-            "IsDialogMessageA",
-            "IsDialogMessageW",
-            "EnableWindow",
-            "IsWindowEnabled",
-            "IsWindowVisible",
-            "IsWindow",
-            "GetParent",
-            "SetParent",
-            "GetForegroundWindow",
-            "SetForegroundWindow",
-            "GetFocus",
-            "SetFocus",
-            "GetActiveWindow",
-            "SetActiveWindow",
-            "GetKeyState",
-            "GetAsyncKeyState",
-            "GetKeyboardState",
-            "MapVirtualKeyA",
-            "MapVirtualKeyW",
-            "VkKeyScanA",
-            "VkKeyScanW",
-            "TrackPopupMenu",
-            "CreateMenu",
-            "CreatePopupMenu",
-            "AppendMenuA",
-            "AppendMenuW",
-            "InsertMenuA",
-            "InsertMenuW",
-            "DrawMenuBar",
-            "LoadMenuA",
-            "LoadMenuW",
-            "GetMenu",
-            "SetMenu",
-            "DestroyMenu",
-            "GetSubMenu",
-            "GetMenuItemCount",
-            "GetMenuItemID",
-            "CheckMenuItem",
-            "EnableMenuItem",
-            "GetCursorPos",
-            "SetCursorPos",
-            "ShowCursor",
-            "ScreenToClient",
-            "ClientToScreen",
-            "GetWindowLongA",
-            "GetWindowLongW",
-            "GetWindowLongPtrA",
-            "GetWindowLongPtrW",
-            "SetWindowLongA",
-            "SetWindowLongW",
-            "SetWindowLongPtrA",
-            "SetWindowLongPtrW",
-            "GetClassLongA",
-            "GetClassLongW",
-            "SetClassLongA",
-            "SetClassLongW",
-            "AdjustWindowRect",
-            "AdjustWindowRectEx",
-            "GetDesktopWindow",
-            "GetWindowThreadProcessId",
-            "EnumWindows",
-            "EnumChildWindows",
-            "GetClassNameA",
-            "GetClassNameW",
-            "RegisterWindowMessageA",
-            "RegisterWindowMessageW",
-            "SendMessageTimeoutA",
-            "SendMessageTimeoutW",
-            "SendNotifyMessageA",
-            "SendNotifyMessageW",
-            "PostThreadMessageA",
-            "PostThreadMessageW",
-            "WaitMessage",
-            "MsgWaitForMultipleObjects",
-            "MsgWaitForMultipleObjectsEx",
-            "GetMessagePos",
-            "GetMessageTime",
-            "TranslateAcceleratorA",
-            "TranslateAcceleratorW",
-            "LoadAcceleratorsA",
-            "LoadAcceleratorsW",
-            "SetCapture",
-            "ReleaseCapture",
-            "GetCapture",
-            "GetDoubleClickTime",
-            "RegisterHotKey",
-            "UnregisterHotKey",
-            "FlashWindow",
-            "FlashWindowEx",
-            "GetWindow",
-            "IsChild",
-            "BringWindowToTop",
-            "ShowOwnedPopups",
-            "OpenClipboard",
-            "CloseClipboard",
-            "EmptyClipboard",
-            "SetClipboardData",
-            "GetClipboardData",
-            "IsClipboardFormatAvailable",
-            "CountClipboardFormats",
-            "EnumClipboardFormats",
-            "RegisterClipboardFormatA",
-            "RegisterClipboardFormatW",
-        ]
-        .into_iter()
-        .map(String::from)
-        .collect(),
-    );
-
-    // gdi32.dll
-    m.insert(
-        "gdi32.dll".to_string(),
-        vec![
-            "CreateCompatibleDC",
-            "CreateCompatibleBitmap",
-            "CreateBitmap",
-            "CreateDIBSection",
-            "CreateDIBitmap",
-            "SelectObject",
-            "DeleteObject",
-            "DeleteDC",
-            "BitBlt",
-            "StretchBlt",
-            "StretchDIBits",
-            "SetDIBitsToDevice",
-            "GetDIBits",
-            "SetBitmapBits",
-            "GetBitmapBits",
-            "CreateSolidBrush",
-            "CreatePen",
-            "CreateFontA",
-            "CreateFontW",
-            "CreateFontIndirectA",
-            "CreateFontIndirectW",
-            "SetTextColor",
-            "SetBkColor",
-            "SetBkMode",
-            "TextOutA",
-            "TextOutW",
-            "DrawTextA",
-            "DrawTextW",
-            "GetTextExtentPoint32A",
-            "GetTextExtentPoint32W",
-            "GetTextMetricsA",
-            "GetTextMetricsW",
-            "Rectangle",
-            "FillRect",
-            "FrameRect",
-            "RoundRect",
-            "Ellipse",
-            "LineTo",
-            "MoveToEx",
-            "Polygon",
-            "Polyline",
-            "SetPixel",
-            "GetPixel",
-            "PatBlt",
-            "MaskBlt",
-            "PlgBlt",
-            "CreatePalette",
-            "SelectPalette",
-            "RealizePalette",
-            "GetDeviceCaps",
-            "GetSystemPaletteEntries",
-            "CreateHalftonePalette",
-            "GetObjectA",
-            "GetObjectW",
-            "GetStockObject",
-            "SetROP2",
-            "SetStretchBltMode",
-            "GetBrushOrgEx",
-            "SetBrushOrgEx",
-            "GetClipBox",
-            "SelectClipRgn",
-            "ExtSelectClipRgn",
-            "OffsetClipRgn",
-            "SaveDC",
-            "RestoreDC",
-            "CreateRectRgn",
-            "CreateRectRgnIndirect",
-            "CombineRgn",
-            "OffsetRgn",
-            "GetRegionData",
-            "ExtCreatePen",
-            "CreatePatternBrush",
-            "CreateHatchBrush",
-            "SetWorldTransform",
-            "ModifyWorldTransform",
-            "SetGraphicsMode",
-            "SetMapMode",
-            "SetViewportOrgEx",
-            "SetWindowOrgEx",
-            "SetViewportExtEx",
-            "SetWindowExtEx",
-            "DPtoLP",
-            "LPtoDP",
-            "GetWorldTransform",
-            "GetMapMode",
-            "GetCurrentObject",
-            "GetObjectType",
-            "EnumFontFamiliesExA",
-            "EnumFontFamiliesExW",
-            "AddFontResourceA",
-            "AddFontResourceW",
-            "RemoveFontResourceA",
-            "RemoveFontResourceW",
-            "GetCharABCWidthsA",
-            "GetCharABCWidthsW",
-            "GetCharacterPlacementA",
-            "GetCharacterPlacementW",
-        ]
-        .into_iter()
-        .map(String::from)
-        .collect(),
-    );
-
-    // advapi32.dll
-    m.insert(
-        "advapi32.dll".to_string(),
-        vec![
-            "RegOpenKeyExA",
-            "RegOpenKeyExW",
-            "RegCreateKeyExA",
-            "RegCreateKeyExW",
-            "RegCloseKey",
-            "RegSetValueExA",
-            "RegSetValueExW",
-            "RegQueryValueExA",
-            "RegQueryValueExW",
-            "RegDeleteKeyA",
-            "RegDeleteKeyW",
-            "RegDeleteValueA",
-            "RegDeleteValueW",
-            "RegEnumKeyExA",
-            "RegEnumKeyExW",
-            "RegEnumValueA",
-            "RegEnumValueW",
-            "RegNotifyChangeKeyValue",
-            "OpenProcessToken",
-            "GetTokenInformation",
-            "AdjustTokenPrivileges",
-            "LookupPrivilegeValueA",
-            "LookupPrivilegeValueW",
-            "CheckTokenMembership",
-            "DuplicateTokenEx",
-            "GetUserNameA",
-            "GetUserNameW",
-            "ConvertSidToStringSidA",
-            "ConvertSidToStringSidW",
-            "ConvertStringSidToSidA",
-            "ConvertStringSidToSidW",
-            "EqualSid",
-            "GetLengthSid",
-            "CopySid",
-            "InitializeSecurityDescriptor",
-            "SetSecurityDescriptorDacl",
-            "GetSecurityDescriptorDacl",
-            "InitializeAcl",
-            "AddAccessAllowedAce",
-            "CryptAcquireContextA",
-            "CryptAcquireContextW",
-            "CryptGenRandom",
-            "CryptReleaseContext",
-            "CryptCreateHash",
-            "CryptHashData",
-            "CryptGetHashParam",
-            "CryptDestroyHash",
-            "CryptDeriveKey",
-            "CryptEncrypt",
-            "CryptDecrypt",
-            "CryptDestroyKey",
-            "CryptImportKey",
-            "CryptExportKey",
-            "CryptSetKeyParam",
-            "CryptGenKey",
-            "StartServiceCtrlDispatcherA",
-            "StartServiceCtrlDispatcherW",
-            "RegisterServiceCtrlHandlerA",
-            "RegisterServiceCtrlHandlerW",
-            "SetServiceStatus",
-            "OpenSCManagerA",
-            "OpenSCManagerW",
-            "OpenServiceA",
-            "OpenServiceW",
-            "CreateServiceA",
-            "CreateServiceW",
-            "StartServiceA",
-            "StartServiceW",
-            "ControlService",
-            "CloseServiceHandle",
-            "DeleteService",
-            "QueryServiceStatus",
-            "QueryServiceStatusEx",
-            "GetFileSecurityA",
-            "GetFileSecurityW",
-            "SetFileSecurityA",
-            "SetFileSecurityW",
-            "AccessCheck",
-            "MapGenericMask",
-        ]
-        .into_iter()
-        .map(String::from)
-        .collect(),
-    );
-
-    // shell32.dll
-    m.insert(
-        "shell32.dll".to_string(),
-        vec![
-            "SHGetFolderPathA",
-            "SHGetFolderPathW",
-            "SHGetSpecialFolderPathA",
-            "SHGetSpecialFolderPathW",
-            "SHGetDesktopFolder",
-            "SHBrowseForFolderW",
-            "SHGetPathFromIDListW",
-            "ILCreateFromPathW",
-            "ILFree",
-            "SHGetFileInfoA",
-            "SHGetFileInfoW",
-            "SHGetMalloc",
-            "DragAcceptFiles",
-            "DragQueryFileW",
-            "DragFinish",
-            "DragQueryPoint",
-            "ShellExecuteA",
-            "ShellExecuteW",
-            "ShellExecuteExA",
-            "ShellExecuteExW",
-            "SHGetSpecialFolderLocation",
-            "SHGetFolderLocation",
-            "SHParseDisplayName",
-            "SHCreateItemFromParsingName",
-            "ExtractIconW",
-            "DoDragDrop",
-        ]
-        .into_iter()
-        .map(String::from)
-        .collect(),
-    );
-
-    // ole32.dll
-    m.insert(
-        "ole32.dll".to_string(),
-        vec![
-            "CoInitialize",
-            "CoInitializeEx",
-            "CoUninitialize",
-            "CoCreateInstance",
-            "CoGetClassObject",
-            "CoTaskMemAlloc",
-            "CoTaskMemFree",
-            "CoTaskMemRealloc",
-            "CoInitializeSecurity",
-            "CoGetCallContext",
-            "CoSetProxyBlanket",
-            "CoGetApartmentType",
-            "CoGetCurrentProcess",
-            "CoRegisterClassObject",
-            "CoRevokeClassObject",
-            "CoResumeClassObjects",
-            "CoSuspendClassObjects",
-            "CreateStreamOnHGlobal",
-            "GetHGlobalFromStream",
-            "CoCreateGuid",
-            "StringFromGUID2",
-            "IIDFromString",
-            "CLSIDFromString",
-            "StringFromCLSID",
-            "ProgIDFromCLSID",
-            "CLSIDFromProgID",
-            "OleInitialize",
-            "OleUninitialize",
-            "RegisterDragDrop",
-            "RevokeDragDrop",
-            "DoDragDrop",
-            "CreateBindCtx",
-            "CreateFileMoniker",
-            "MkParseDisplayName",
-            "CoGetMalloc",
-            "CoGetObjectContext",
-            "CoGetInterfaceAndReleaseStream",
-            "CoMarshalInterThreadInterfaceInStream",
-            "CoReleaseMarshalData",
-        ]
-        .into_iter()
-        .map(String::from)
-        .collect(),
-    );
-
-    // crypt32.dll
-    m.insert(
-        "crypt32.dll".to_string(),
-        vec![
-            "CertOpenStore",
-            "CertCloseStore",
-            "CertOpenSystemStoreA",
-            "CertOpenSystemStoreW",
-            "CertEnumCertificatesInStore",
-            "CertFindCertificateInStore",
-            "CertGetCertificateChain",
-            "CertFreeCertificateChain",
-            "CertVerifyCertificateChainPolicy",
-            "CertDeleteCertificateFromStore",
-            "CertAddCertificateContextToStore",
-            "CertDuplicateCertificateContext",
-            "CertFreeCertificateContext",
-            "CryptAcquireCertificatePrivateKey",
-            "PFXImportCertStore",
-            "PFXIsPFXBlob",
-            "CertFindExtension",
-            "CertGetNameStringA",
-            "CertGetNameStringW",
-            "CertGetIssuerCertificateFromStore",
-            "CertEnumCRLsInStore",
-            "CertFindCRLInStore",
-        ]
-        .into_iter()
-        .map(String::from)
-        .collect(),
-    );
-
-    // winhttp.dll
-    m.insert(
-        "winhttp.dll".to_string(),
-        vec![
-            "WinHttpOpen",
-            "WinHttpConnect",
-            "WinHttpOpenRequest",
-            "WinHttpSendRequest",
-            "WinHttpReceiveResponse",
-            "WinHttpReadData",
-            "WinHttpWriteData",
-            "WinHttpCloseHandle",
-            "WinHttpSetOption",
-            "WinHttpQueryOption",
-            "WinHttpQueryHeaders",
-            "WinHttpAddRequestHeaders",
-            "WinHttpSetCredentials",
-            "WinHttpSetTimeouts",
-            "WinHttpGetProxyForUrl",
-            "WinHttpCrackUrl",
-            "WinHttpCreateUrl",
-            "WinHttpDetectAutoProxyConfigUrl",
-            "WinHttpGetIEProxyConfigForCurrentUser",
-            "WinHttpWebSocketCompleteUpgrade",
-            "WinHttpWebSocketSend",
-            "WinHttpWebSocketReceive",
-            "WinHttpWebSocketClose",
-            "WinHttpWebSocketQueryCloseStatus",
-            "WinHttpGetProxySettingsVersion",
-            "WinHttpSetProxySettingsPerUser",
-        ]
-        .into_iter()
-        .map(String::from)
-        .collect(),
-    );
-
-    // wininet.dll
-    m.insert(
-        "wininet.dll".to_string(),
-        vec![
-            "InternetOpenA",
-            "InternetOpenW",
-            "InternetConnectA",
-            "InternetConnectW",
-            "HttpOpenRequestA",
-            "HttpOpenRequestW",
-            "HttpSendRequestA",
-            "HttpSendRequestW",
-            "InternetReadFile",
-            "InternetWriteFile",
-            "InternetCloseHandle",
-            "InternetSetOptionA",
-            "InternetSetOptionW",
-            "InternetQueryOptionA",
-            "InternetQueryOptionW",
-            "HttpQueryInfoA",
-            "HttpQueryInfoW",
-            "HttpAddRequestHeadersA",
-            "HttpAddRequestHeadersW",
-            "InternetSetCookieA",
-            "InternetSetCookieW",
-            "InternetGetCookieA",
-            "InternetGetCookieW",
-            "InternetSetStatusCallback",
-            "InternetErrorDlg",
-            "InternetCanonicalizeUrlA",
-            "InternetCanonicalizeUrlW",
-            "InternetCrackUrlA",
-            "InternetCrackUrlW",
-            "InternetCreateUrlA",
-            "InternetCreateUrlW",
-            "FindFirstUrlCacheEntryA",
-            "FindFirstUrlCacheEntryW",
-            "FindNextUrlCacheEntryA",
-            "FindNextUrlCacheEntryW",
-            "FindCloseUrlCache",
-            "DeleteUrlCacheEntryA",
-            "DeleteUrlCacheEntryW",
-            "FtpOpenFileA",
-            "FtpOpenFileW",
-            "FtpGetFileA",
-            "FtpGetFileW",
-            "FtpPutFileA",
-            "FtpPutFileW",
-            "FtpDeleteFileA",
-            "FtpDeleteFileW",
-            "FtpRenameFileA",
-            "FtpRenameFileW",
-            "FtpCreateDirectoryA",
-            "FtpCreateDirectoryW",
-            "FtpRemoveDirectoryA",
-            "FtpRemoveDirectoryW",
-            "FtpFindFirstFileA",
-            "FtpFindFirstFileW",
-            "InternetGetConnectedState",
-            "InternetAutodial",
-            "InternetAttemptConnect",
-        ]
-        .into_iter()
-        .map(String::from)
-        .collect(),
-    );
-
-    // ws2_32.dll
-    m.insert(
-        "ws2_32.dll".to_string(),
-        vec![
-            "WSAStartup",
-            "WSACleanup",
-            "socket",
-            "closesocket",
-            "connect",
-            "bind",
-            "listen",
-            "accept",
-            "send",
-            "recv",
-            "sendto",
-            "recvfrom",
-            "select",
-            "ioctlsocket",
-            "getsockopt",
-            "setsockopt",
-            "getsockname",
-            "getpeername",
-            "gethostbyname",
-            "getaddrinfo",
-            "freeaddrinfo",
-            "getnameinfo",
-            "WSAGetLastError",
-            "WSASetLastError",
-            "WSARecv",
-            "WSASend",
-            "WSARecvFrom",
-            "WSASendTo",
-            "WSASocketA",
-            "WSASocketW",
-            "WSAIoctl",
-            "WSAEventSelect",
-            "WSAEnumNetworkEvents",
-            "WSACreateEvent",
-            "WSACloseEvent",
-            "WSAWaitForMultipleEvents",
-            "WSAResetEvent",
-            "WSAConnect",
-            "htons",
-            "ntohs",
-            "htonl",
-            "ntohl",
-            "inet_addr",
-            "inet_ntoa",
-            "inet_pton",
-            "inet_ntop",
-            "shutdown",
-            "WSAAddressToStringA",
-            "WSAAddressToStringW",
-            "WSAStringToAddressA",
-            "WSAStringToAddressW",
-        ]
-        .into_iter()
-        .map(String::from)
-        .collect(),
-    );
-
-    // dinput8.dll
-    m.insert(
-        "dinput8.dll".to_string(),
-        vec!["DirectInput8Create"]
-            .into_iter()
-            .map(String::from)
-            .collect(),
-    );
-
-    // xinput1_4.dll
-    m.insert(
-        "xinput1_4.dll".to_string(),
-        vec![
-            "XInputGetState",
-            "XInputSetState",
-            "XInputGetCapabilities",
-            "XInputGetDSoundAudioDeviceGuids",
-            "XInputEnable",
-            "XInputGetBatteryInformation",
-            "XInputGetKeystroke",
-            "XInputGetAudioDeviceIds",
-        ]
-        .into_iter()
-        .map(String::from)
-        .collect(),
-    );
-
-    // version.dll
-    m.insert(
-        "version.dll".to_string(),
-        vec![
-            "GetFileVersionInfoA",
-            "GetFileVersionInfoW",
-            "GetFileVersionInfoSizeA",
-            "GetFileVersionInfoSizeW",
-            "VerQueryValueA",
-            "VerQueryValueW",
-        ]
-        .into_iter()
-        .map(String::from)
-        .collect(),
-    );
-
-    // imm32.dll
-    m.insert(
-        "imm32.dll".to_string(),
-        vec![
-            "ImmGetContext",
-            "ImmReleaseContext",
-            "ImmGetCompositionStringA",
-            "ImmGetCompositionStringW",
-            "ImmSetCompositionStringA",
-            "ImmSetCompositionStringW",
-            "ImmGetCandidateListA",
-            "ImmGetCandidateListW",
-            "ImmGetCandidateListCountA",
-            "ImmGetCandidateListCountW",
-            "ImmNotifyIME",
-            "ImmAssociateContext",
-            "ImmAssociateContextEx",
-        ]
-        .into_iter()
-        .map(String::from)
-        .collect(),
-    );
-
-    // msacm32.dll
-    m.insert(
-        "msacm32.dll".to_string(),
-        vec![
-            "acmDriverEnum",
-            "acmDriverDetailsA",
-            "acmDriverDetailsW",
-            "acmFormatTagDetailsA",
-            "acmFormatTagDetailsW",
-            "acmFormatEnumA",
-            "acmFormatEnumW",
-            "acmStreamOpen",
-            "acmStreamClose",
-            "acmStreamConvert",
-            "acmStreamSize",
-            "acmStreamPrepareHeader",
-            "acmStreamUnprepareHeader",
-        ]
-        .into_iter()
-        .map(String::from)
-        .collect(),
-    );
-
-    // winmm.dll
-    m.insert(
-        "winmm.dll".to_string(),
-        vec![
-            "timeBeginPeriod",
-            "timeEndPeriod",
-            "timeGetTime",
-            "timeGetDevCaps",
-            "waveOutOpen",
-            "waveOutClose",
-            "waveOutWrite",
-            "waveOutPrepareHeader",
-            "waveOutUnprepareHeader",
-            "waveOutGetDevCapsA",
-            "waveOutGetDevCapsW",
-            "waveOutGetNumDevs",
-            "waveOutGetVolume",
-            "waveOutSetVolume",
-            "waveOutPause",
-            "waveOutRestart",
-            "waveOutReset",
-            "waveOutGetPosition",
-            "midiOutOpen",
-            "midiOutClose",
-            "midiOutShortMsg",
-            "midiOutLongMsg",
-            "midiOutGetDevCapsA",
-            "midiOutGetDevCapsW",
-            "midiOutGetNumDevs",
-            "midiOutReset",
-            "PlaySoundA",
-            "PlaySoundW",
-            "auxGetNumDevs",
-            "mixerOpen",
-            "mixerClose",
-            "mixerGetControlDetailsA",
-            "mixerGetControlDetailsW",
-            "mixerGetDevCapsA",
-            "mixerGetDevCapsW",
-            "mixerGetID",
-            "mixerGetLineControlsA",
-            "mixerGetLineControlsW",
-            "mixerGetLineInfoA",
-            "mixerGetLineInfoW",
-            "mixerGetNumDevs",
-            "mixerMessage",
-            "mixerSetControlDetails",
-        ]
-        .into_iter()
-        .map(String::from)
-        .collect(),
-    );
-
-    m
-}
-
-// ---------------------------------------------------------------------------
-// Report generation
-// ---------------------------------------------------------------------------
 
 /// Generate an import coverage report by cross-referencing known Steam.exe
-/// imports with the functions that have real implementations in Casa1.
+/// imports with the PE runtime's registered export tables.
 ///
-/// This function scans the known Steam.exe import list and checks each
-/// function against the list of covered implementations.
+/// "Covered" is derived from the authoritative runtime export registry
+/// ([`crate::pe_runtime::export_tables`]), so the report reflects the actual
+/// state of the implemented API surface instead of a hand-maintained copy.
 pub fn generate_import_coverage_report() -> ImportCoverageReport {
     let steam_imports = steam_exe_imports();
-    let covered = known_covered_functions();
+
+    // Pre-index the runtime's registered export names (lowercased) per DLL
+    // so each import lookup is O(1) instead of a linear scan.
+    let covered_by_dll: std::collections::HashMap<String, std::collections::HashSet<String>> =
+        crate::pe_runtime::export_tables()
+            .into_iter()
+            .map(|(dll, exports)| {
+                let names = exports
+                    .into_iter()
+                    .filter_map(|e| e.name)
+                    .map(|n| n.to_lowercase())
+                    .collect();
+                (dll.to_lowercase(), names)
+            })
+            .collect();
 
     let mut entries = Vec::new();
     let mut dll_reports = Vec::new();
@@ -1961,9 +1006,7 @@ pub fn generate_import_coverage_report() -> ImportCoverageReport {
     let mut total_missing = 0usize;
 
     for (dll, functions) in &steam_imports {
-        let dll_covered = covered.get(dll).cloned().unwrap_or_default();
-        let _dll_lower = dll.to_lowercase();
-        let dll_covered_lower: Vec<String> = dll_covered.iter().map(|s| s.to_lowercase()).collect();
+        let dll_covered = covered_by_dll.get(&dll.to_lowercase());
 
         let mut dll_total = 0usize;
         let mut dll_covered_count = 0usize;
@@ -1974,7 +1017,7 @@ pub fn generate_import_coverage_report() -> ImportCoverageReport {
         for func in functions {
             dll_total += 1;
             let func_lower = func.to_lowercase();
-            let is_covered = dll_covered_lower.contains(&func_lower);
+            let is_covered = dll_covered.is_some_and(|names| names.contains(&func_lower));
 
             let status = if is_covered {
                 "real".to_string()
@@ -2183,6 +1226,34 @@ pub fn generate_import_coverage_text() -> String {
     lines.join("\n")
 }
 
+/// Per-DLL lookup index over an export table, built once per DLL so that
+/// per-thunk coverage checks are O(log n)/O(1) instead of linear scans.
+struct ExportIndex {
+    names: std::collections::HashSet<String>,
+    ordinals: std::collections::HashSet<u32>,
+}
+
+impl ExportIndex {
+    fn new(exports: &[ExportSymbol]) -> Self {
+        let mut names = std::collections::HashSet::new();
+        let mut ordinals = std::collections::HashSet::new();
+        for export in exports {
+            ordinals.insert(export.ordinal);
+            if let Some(name) = &export.name {
+                names.insert(name.clone());
+            }
+        }
+        Self { names, ordinals }
+    }
+
+    fn contains(&self, symbol: &ImportSymbol) -> bool {
+        match symbol {
+            ImportSymbol::ByName { name, .. } => self.names.contains(name),
+            ImportSymbol::ByOrdinal { ordinal } => self.ordinals.contains(&(*ordinal as u32)),
+        }
+    }
+}
+
 /// Generate a coverage report from a parsed PE file's imports.
 ///
 /// This cross-references the actual imports from a PE file with the
@@ -2197,7 +1268,9 @@ pub fn generate_pe_coverage_report(
     // Collect all imports from the PE
     for import_desc in &pe.imports {
         let dll_lower = import_desc.dll_name.to_lowercase();
-        let exports = export_tables.get(&dll_lower);
+        let export_index = export_tables
+            .get(&dll_lower)
+            .map(|exports| ExportIndex::new(exports));
         let builder = dll_reports_map
             .entry(dll_lower.clone())
             .or_insert_with(|| DllCoverageReportBuilder::new(dll_lower.clone()));
@@ -2208,18 +1281,9 @@ pub fn generate_pe_coverage_report(
                 ImportSymbol::ByOrdinal { ordinal } => format!("#{}", ordinal),
             };
 
-            let is_covered = if let Some(exports) = exports {
-                match &thunk.symbol {
-                    ImportSymbol::ByName { name, .. } => exports
-                        .iter()
-                        .any(|e| e.name.as_deref() == Some(name.as_str())),
-                    ImportSymbol::ByOrdinal { ordinal } => {
-                        exports.iter().any(|e| e.ordinal == *ordinal as u32)
-                    }
-                }
-            } else {
-                false
-            };
+            let is_covered = export_index
+                .as_ref()
+                .is_some_and(|index| index.contains(&thunk.symbol));
 
             let status = if is_covered {
                 "real".to_string()
@@ -2241,7 +1305,9 @@ pub fn generate_pe_coverage_report(
     // Also check delay imports
     for import_desc in &pe.delay_imports {
         let dll_lower = import_desc.dll_name.to_lowercase();
-        let exports = export_tables.get(&dll_lower);
+        let export_index = export_tables
+            .get(&dll_lower)
+            .map(|exports| ExportIndex::new(exports));
         let builder = dll_reports_map
             .entry(dll_lower.clone())
             .or_insert_with(|| DllCoverageReportBuilder::new(dll_lower.clone()));
@@ -2252,31 +1318,9 @@ pub fn generate_pe_coverage_report(
                 ImportSymbol::ByOrdinal { ordinal } => format!("#{}", ordinal),
             };
 
-            let is_covered = if let Some(exports) = exports {
-                match &thunk.symbol {
-                    ImportSymbol::ByName { name, .. } => exports
-                        .iter()
-                        .any(|e| e.name.as_deref() == Some(name.as_str())),
-                    ImportSymbol::ByOrdinal { ordinal } => {
-                        exports.iter().any(|e| e.ordinal == *ordinal as u32)
-                    }
-                }
-            } else {
-                false
-            };
-
-            let status = if is_covered {
-                "real".to_string()
-            } else {
-                "missing".to_string()
-            };
-
-            entries.push(ImportCoverageEntry {
-                dll: dll_lower.clone(),
-                function: func_name.clone(),
-                covered: is_covered,
-                status,
-            });
+            let is_covered = export_index
+                .as_ref()
+                .is_some_and(|index| index.contains(&thunk.symbol));
 
             builder.add(func_name, is_covered);
         }
@@ -2393,13 +1437,92 @@ mod tests {
     #[test]
     fn test_steam_exe_imports_contains_known_dlls() {
         let imports = steam_exe_imports();
-        assert!(imports.contains_key(&"kernel32.dll".to_string()));
-        assert!(imports.contains_key(&"user32.dll".to_string()));
-        assert!(imports.contains_key(&"gdi32.dll".to_string()));
-        assert!(imports.contains_key(&"advapi32.dll".to_string()));
-        assert!(imports.contains_key(&"shell32.dll".to_string()));
-        assert!(imports.contains_key(&"ole32.dll".to_string()));
-        assert!(imports.contains_key(&"crypt32.dll".to_string()));
+        assert!(imports.contains_key("kernel32.dll"));
+        assert!(imports.contains_key("user32.dll"));
+        assert!(imports.contains_key("gdi32.dll"));
+        assert!(imports.contains_key("advapi32.dll"));
+        assert!(imports.contains_key("shell32.dll"));
+        assert!(imports.contains_key("ole32.dll"));
+        assert!(imports.contains_key("crypt32.dll"));
+    }
+
+    #[test]
+    fn test_steam_exe_imports_are_unique_and_attributed() {
+        let imports = steam_exe_imports();
+        for (dll, functions) in &imports {
+            let mut seen = std::collections::HashSet::new();
+            for func in functions {
+                assert!(
+                    seen.insert(func),
+                    "duplicate import {func} in {dll}"
+                );
+            }
+        }
+
+        let kernel32 = imports.get("kernel32.dll").unwrap();
+        assert_eq!(
+            kernel32.iter().filter(|f| *f == "WaitForSingleObject").count(),
+            1,
+            "WaitForSingleObject must not be duplicated"
+        );
+        assert_eq!(
+            kernel32.iter().filter(|f| *f == "GetTickCount64").count(),
+            1,
+            "GetTickCount64 must not be duplicated"
+        );
+        assert!(
+            !kernel32.contains(&"GetUserNameA".to_string())
+                && !kernel32.contains(&"GetUserNameW".to_string()),
+            "GetUserNameA/W are advapi32 exports, not kernel32"
+        );
+
+        let shell32 = imports.get("shell32.dll").unwrap();
+        assert!(
+            !shell32.contains(&"DoDragDrop".to_string()),
+            "DoDragDrop is an ole32 export, not shell32"
+        );
+
+        let advapi32 = imports.get("advapi32.dll").unwrap();
+        assert!(
+            advapi32.contains(&"GetUserNameA".to_string())
+                && advapi32.contains(&"GetUserNameW".to_string()),
+            "GetUserNameA/W must be listed under advapi32"
+        );
+
+        let ole32 = imports.get("ole32.dll").unwrap();
+        assert!(
+            ole32.contains(&"DoDragDrop".to_string()),
+            "DoDragDrop must be listed under ole32"
+        );
+    }
+
+    #[test]
+    fn test_coverage_is_derived_from_authoritative_export_registry() {
+        // The report must track the real PE runtime export registry, not a
+        // hand-maintained copy: any drift between the two fails CI.
+        let report = generate_import_coverage_report();
+        let registry = crate::pe_runtime::export_tables();
+
+        let mut expected_total = 0usize;
+        let mut expected_covered = 0usize;
+        for (dll, functions) in steam_exe_imports() {
+            expected_total += functions.len();
+            let exports = registry.get(&dll);
+            for func in &functions {
+                let covered = exports.is_some_and(|table| {
+                    table
+                        .iter()
+                        .any(|e| e.name.as_deref() == Some(func.as_str()))
+                });
+                if covered {
+                    expected_covered += 1;
+                }
+            }
+        }
+
+        assert_eq!(report.total_imports, expected_total);
+        assert_eq!(report.covered_imports, expected_covered);
+        assert_eq!(report.missing_imports, expected_total - expected_covered);
     }
 
     #[test]

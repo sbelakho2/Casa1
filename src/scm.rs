@@ -22,10 +22,32 @@ use crate::reason::ReasonCode;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+#[cfg(all(target_os = "macos", not(test)))]
 use std::ffi::CString;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
+
+// ---------------------------------------------------------------------------
+// Bounds for guest-controlled buffers/queues
+// ---------------------------------------------------------------------------
+
+/// Maximum bytes queued in the virtio-net TX buffer before `send_packet` fails.
+const MAX_NET_TX_BUFFER: usize = 4 * 1024 * 1024;
+/// Maximum bytes queued in the virtio-net RX buffer; overflow is dropped.
+const MAX_NET_RX_BUFFER: usize = 4 * 1024 * 1024;
+/// Maximum number of outstanding IRPs in the kernel shim queue.
+const MAX_IRP_QUEUE: usize = 4096;
+/// Maximum number of queued DPCs in the kernel shim.
+const MAX_DPC_QUEUE: usize = 4096;
+/// Maximum number of entries in the measured-launch log.
+const MAX_MEASUREMENT_LOG: usize = 65536;
+/// Maximum number of concurrently open virtio-fs file handles.
+const MAX_OPEN_FILE_HANDLES: usize = 4096;
+/// Maximum number of dirty rectangles before coalescing to a full-frame flush.
+const MAX_DIRTY_RECTS: usize = 1024;
+/// Bounds for the simulated guest memory allocation (in MB).
+const MIN_GUEST_MEMORY_MB: u32 = 256;
+const MAX_GUEST_MEMORY_MB: u32 = 16384;
 
 // ---------------------------------------------------------------------------
 // SCM configuration
@@ -167,17 +189,187 @@ pub struct VZVirtualMachineConfiguration {
 // VZ Virtual Machine Handle (wrapping Apple VZ ObjC objects)
 // ===========================================================================
 
-/// Flag for BlockLiteral (stack block, no copy/dispose helpers).
-const BLOCK_FLAGS_STACK: i32 = 1 << 30;
+/// Flags for a plain stack block: no copy/dispose helpers, no signature.
+const BLOCK_FLAGS_NONE: i32 = 0;
+
+// Global isa pointer for stack blocks, exported by libsystem_blocks.
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    static _NSConcreteStackBlock: std::ffi::c_void;
+}
+
+/// Trailing descriptor of an Objective-C block literal (mandatory field of
+/// every block layout; contains the block size used by `_Block_copy`).
+#[repr(C)]
+struct BlockDescriptor {
+    reserved: usize,
+    size: usize,
+}
+
+/// Descriptor shared by all stack blocks in this module.
+static BLOCK_DESCRIPTOR: BlockDescriptor = BlockDescriptor {
+    reserved: 0,
+    size: std::mem::size_of::<*const std::ffi::c_void>() * 3
+        + std::mem::size_of::<i32>() * 2,
+};
 
 /// An Objective-C block literal for completion handlers.
-/// Matches the ABI used by cef_bridge.rs for stack-based blocks.
+///
+/// Follows the canonical libclosure layout
+/// `{ isa, flags, reserved, invoke, descriptor }`.
 #[repr(C)]
 struct BlockLiteral<F> {
     isa: *const std::ffi::c_void,
     flags: i32,
     reserved: i32,
     invoke: *const F,
+    descriptor: *const BlockDescriptor,
+}
+
+// ---------------------------------------------------------------------------
+// Shared machinery for the synchronous VZ wrappers
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "macos")]
+type VzCompletionFn = extern "C" fn(*const std::ffi::c_void, *mut objc::runtime::Object);
+
+/// Serializes all VZ operations process-wide. The completion handlers carry
+/// no instance context, so concurrent operations on different handles must
+/// not interleave — otherwise one op's result could satisfy another's wait.
+#[cfg(target_os = "macos")]
+static VZ_OP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Sender for the completion result of the in-flight VZ operation.
+///
+/// Each message carries the address of the issuing block literal, so a stale
+/// completion from a timed-out operation is discarded rather than delivered
+/// to the next operation.
+#[cfg(target_os = "macos")]
+static VZ_COMPLETION_SLOT: std::sync::Mutex<Option<std::sync::mpsc::Sender<(usize, bool)>>> =
+    std::sync::Mutex::new(None);
+
+/// Shared completion handler for all VZ async operations.
+///
+/// `block` is the address of the stack block literal the operation was issued
+/// with; `error` is nil on success.
+#[cfg(target_os = "macos")]
+extern "C" fn vz_completion_handler(
+    block: *const std::ffi::c_void,
+    error: *mut objc::runtime::Object,
+) {
+    let ok = error.is_null();
+    if let Ok(slot) = VZ_COMPLETION_SLOT.lock()
+        && let Some(tx) = slot.as_ref()
+    {
+        let _ = tx.send((block as usize, ok));
+    }
+}
+
+/// Build a stack block literal for a VZ completion handler.
+#[cfg(target_os = "macos")]
+fn vz_completion_block() -> (BlockLiteral<VzCompletionFn>, usize) {
+    // SAFETY: `_NSConcreteStackBlock` is a constant, read-only libclosure
+    // symbol; taking its address is safe on all supported macOS versions.
+    let isa = unsafe { &_NSConcreteStackBlock as *const std::ffi::c_void };
+    let block = BlockLiteral::<VzCompletionFn> {
+        isa,
+        flags: BLOCK_FLAGS_NONE,
+        reserved: 0,
+        invoke: vz_completion_handler as *const VzCompletionFn,
+        descriptor: &BLOCK_DESCRIPTOR,
+    };
+    let block_addr = &block as *const BlockLiteral<VzCompletionFn> as usize;
+    (block, block_addr)
+}
+
+/// Wait for the completion of a VZ operation, pumping the NSRunLoop while
+/// blocking on the per-call result channel.
+///
+/// Run-loop objects are created once per call (released when the enclosing
+/// autorelease pool pops) and every loop pass drains its own pool, so no
+/// autoreleased objects accumulate during the wait.
+#[cfg(target_os = "macos")]
+fn vz_sync_wait(rx: &std::sync::mpsc::Receiver<(usize, bool)>, block_addr: usize) -> bool {
+    objc::rc::autoreleasepool(|| unsafe {
+        let cls_runloop = match objc::runtime::Class::get("NSRunLoop") {
+            Some(c) => c,
+            None => return false,
+        };
+        let cls_date = match objc::runtime::Class::get("NSDate") {
+            Some(c) => c,
+            None => return false,
+        };
+        let cls_str = match objc::runtime::Class::get("NSString") {
+            Some(c) => c,
+            None => return false,
+        };
+        let current_runloop: *mut objc::runtime::Object = msg_send![cls_runloop, currentRunLoop];
+        if current_runloop.is_null() {
+            return false;
+        }
+        let interval: *mut objc::runtime::Object =
+            msg_send![cls_date, dateWithTimeIntervalSinceNow: 0.01];
+        if interval.is_null() {
+            return false;
+        }
+        let default_mode: *mut objc::runtime::Object =
+            msg_send![cls_str, stringWithUTF8String: c"NSDefaultRunLoopMode".as_ptr()];
+        if default_mode.is_null() {
+            return false;
+        }
+
+        let start = std::time::Instant::now();
+        loop {
+            match rx.recv_timeout(std::time::Duration::from_millis(10)) {
+                Ok((addr, ok)) if addr == block_addr => return ok,
+                // Stale result from an operation that already timed out.
+                Ok(_) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if start.elapsed() > std::time::Duration::from_secs(30) {
+                        return false;
+                    }
+                    objc::rc::autoreleasepool(|| {
+                        let _: () = msg_send![
+                            current_runloop,
+                            runMode: default_mode
+                            beforeDate: interval
+                        ];
+                    });
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return false,
+            }
+        }
+    })
+}
+
+/// Acquire the process-wide VZ operation lock, tolerating poisoning.
+#[cfg(target_os = "macos")]
+fn vz_op_lock() -> std::sync::MutexGuard<'static, ()> {
+    match VZ_OP_LOCK.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// Install a per-call completion receiver as the current pending result.
+#[cfg(target_os = "macos")]
+fn vz_completion_install() -> std::sync::mpsc::Receiver<(usize, bool)> {
+    let (tx, rx) = std::sync::mpsc::channel::<(usize, bool)>();
+    let mut slot = match VZ_COMPLETION_SLOT.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *slot = Some(tx);
+    rx
+}
+
+/// Remove the pending completion sender once the caller is done waiting, so a
+/// late completion from a timed-out operation cannot reach the next operation.
+#[cfg(target_os = "macos")]
+fn vz_completion_clear() {
+    if let Ok(mut slot) = VZ_COMPLETION_SLOT.lock() {
+        slot.take();
+    }
 }
 
 /// Handle to an Apple VZVirtualMachine instance.
@@ -389,7 +581,9 @@ impl VZVirtualMachineHandle {
     /// Query the current VM state.
     ///
     /// On macOS, reads the `state` property from VZVirtualMachine.
-    /// Maps: 0→Stopped, 1→Running, 2→Paused, 3→Error.
+    /// Maps: 0→Stopped, 1→Running, 2→Paused, 3→Error. The transient
+    /// VZ states 4 (starting) / 5 (stopping) keep the last known state
+    /// instead of reporting a hard error.
     pub fn state(&self) -> VmState {
         #[cfg(target_os = "macos")]
         {
@@ -403,6 +597,7 @@ impl VZVirtualMachineHandle {
                     1 => VmState::Running,
                     2 => VmState::Paused,
                     3 => VmState::Error,
+                    4 | 5 => self.cached_state,
                     _ => VmState::Error,
                 }
             }
@@ -433,29 +628,9 @@ impl VZVirtualMachineHandle {
     /// `vm` must be a valid VZVirtualMachine pointer.
     #[cfg(target_os = "macos")]
     unsafe fn vz_start_sync(vm: *mut objc::runtime::Object) -> bool {
-        static VZ_COMPLETION_RESULT: std::sync::atomic::AtomicBool =
-            std::sync::atomic::AtomicBool::new(false);
-        VZ_COMPLETION_RESULT.store(false, Ordering::SeqCst);
-
-        extern "C" fn completion_handler(
-            _block: *const std::ffi::c_void,
-            error: *mut objc::runtime::Object,
-        ) {
-            if error.is_null() {
-                VZ_COMPLETION_RESULT.store(true, Ordering::SeqCst);
-            } else {
-                VZ_COMPLETION_RESULT.store(true, Ordering::SeqCst);
-            }
-        }
-
-        let block =
-            BlockLiteral::<extern "C" fn(*const std::ffi::c_void, *mut objc::runtime::Object)> {
-                isa: std::ptr::null_mut(),
-                flags: BLOCK_FLAGS_STACK,
-                reserved: 0,
-                invoke: completion_handler
-                    as *const extern "C" fn(*const std::ffi::c_void, *mut objc::runtime::Object),
-            };
+        let _op_guard = vz_op_lock();
+        let rx = vz_completion_install();
+        let (block, block_addr) = vz_completion_block();
 
         let _: () = msg_send![
             vm,
@@ -463,15 +638,9 @@ impl VZVirtualMachineHandle {
                 as *mut std::ffi::c_void
         ];
 
-        let start = std::time::Instant::now();
-        while !VZ_COMPLETION_RESULT.load(Ordering::SeqCst) {
-            if start.elapsed() > std::time::Duration::from_secs(30) {
-                return false;
-            }
-            Self::pump_run_loop();
-            std::thread::yield_now();
-        }
-        true
+        let ok = vz_sync_wait(&rx, block_addr);
+        vz_completion_clear();
+        ok
     }
 
     /// Synchronously stop the VM.
@@ -480,25 +649,9 @@ impl VZVirtualMachineHandle {
     /// `vm` must be a valid VZVirtualMachine pointer.
     #[cfg(target_os = "macos")]
     unsafe fn vz_stop_sync(vm: *mut objc::runtime::Object) -> bool {
-        static VZ_STOP_RESULT: std::sync::atomic::AtomicBool =
-            std::sync::atomic::AtomicBool::new(false);
-        VZ_STOP_RESULT.store(false, Ordering::SeqCst);
-
-        extern "C" fn stop_completion(
-            _block: *const std::ffi::c_void,
-            _error: *mut objc::runtime::Object,
-        ) {
-            VZ_STOP_RESULT.store(true, Ordering::SeqCst);
-        }
-
-        let block =
-            BlockLiteral::<extern "C" fn(*const std::ffi::c_void, *mut objc::runtime::Object)> {
-                isa: std::ptr::null_mut(),
-                flags: BLOCK_FLAGS_STACK,
-                reserved: 0,
-                invoke: stop_completion
-                    as *const extern "C" fn(*const std::ffi::c_void, *mut objc::runtime::Object),
-            };
+        let _op_guard = vz_op_lock();
+        let rx = vz_completion_install();
+        let (block, block_addr) = vz_completion_block();
 
         let _: () = msg_send![
             vm,
@@ -506,15 +659,9 @@ impl VZVirtualMachineHandle {
                 as *mut std::ffi::c_void
         ];
 
-        let start = std::time::Instant::now();
-        while !VZ_STOP_RESULT.load(Ordering::SeqCst) {
-            if start.elapsed() > std::time::Duration::from_secs(30) {
-                return false;
-            }
-            Self::pump_run_loop();
-            std::thread::yield_now();
-        }
-        true
+        let ok = vz_sync_wait(&rx, block_addr);
+        vz_completion_clear();
+        ok
     }
 
     /// Synchronously pause the VM.
@@ -523,25 +670,9 @@ impl VZVirtualMachineHandle {
     /// `vm` must be a valid VZVirtualMachine pointer.
     #[cfg(target_os = "macos")]
     unsafe fn vz_pause_sync(vm: *mut objc::runtime::Object) -> bool {
-        static VZ_PAUSE_RESULT: std::sync::atomic::AtomicBool =
-            std::sync::atomic::AtomicBool::new(false);
-        VZ_PAUSE_RESULT.store(false, Ordering::SeqCst);
-
-        extern "C" fn pause_completion(
-            _block: *const std::ffi::c_void,
-            _error: *mut objc::runtime::Object,
-        ) {
-            VZ_PAUSE_RESULT.store(true, Ordering::SeqCst);
-        }
-
-        let block =
-            BlockLiteral::<extern "C" fn(*const std::ffi::c_void, *mut objc::runtime::Object)> {
-                isa: std::ptr::null_mut(),
-                flags: BLOCK_FLAGS_STACK,
-                reserved: 0,
-                invoke: pause_completion
-                    as *const extern "C" fn(*const std::ffi::c_void, *mut objc::runtime::Object),
-            };
+        let _op_guard = vz_op_lock();
+        let rx = vz_completion_install();
+        let (block, block_addr) = vz_completion_block();
 
         let _: () = msg_send![
             vm,
@@ -549,15 +680,9 @@ impl VZVirtualMachineHandle {
                 as *mut std::ffi::c_void
         ];
 
-        let start = std::time::Instant::now();
-        while !VZ_PAUSE_RESULT.load(Ordering::SeqCst) {
-            if start.elapsed() > std::time::Duration::from_secs(30) {
-                return false;
-            }
-            Self::pump_run_loop();
-            std::thread::yield_now();
-        }
-        true
+        let ok = vz_sync_wait(&rx, block_addr);
+        vz_completion_clear();
+        ok
     }
 
     /// Synchronously resume the VM.
@@ -566,25 +691,9 @@ impl VZVirtualMachineHandle {
     /// `vm` must be a valid VZVirtualMachine pointer.
     #[cfg(target_os = "macos")]
     unsafe fn vz_resume_sync(vm: *mut objc::runtime::Object) -> bool {
-        static VZ_RESUME_RESULT: std::sync::atomic::AtomicBool =
-            std::sync::atomic::AtomicBool::new(false);
-        VZ_RESUME_RESULT.store(false, Ordering::SeqCst);
-
-        extern "C" fn resume_completion(
-            _block: *const std::ffi::c_void,
-            _error: *mut objc::runtime::Object,
-        ) {
-            VZ_RESUME_RESULT.store(true, Ordering::SeqCst);
-        }
-
-        let block =
-            BlockLiteral::<extern "C" fn(*const std::ffi::c_void, *mut objc::runtime::Object)> {
-                isa: std::ptr::null_mut(),
-                flags: BLOCK_FLAGS_STACK,
-                reserved: 0,
-                invoke: resume_completion
-                    as *const extern "C" fn(*const std::ffi::c_void, *mut objc::runtime::Object),
-            };
+        let _op_guard = vz_op_lock();
+        let rx = vz_completion_install();
+        let (block, block_addr) = vz_completion_block();
 
         let _: () = msg_send![
             vm,
@@ -592,15 +701,9 @@ impl VZVirtualMachineHandle {
                 as *mut std::ffi::c_void
         ];
 
-        let start = std::time::Instant::now();
-        while !VZ_RESUME_RESULT.load(Ordering::SeqCst) {
-            if start.elapsed() > std::time::Duration::from_secs(30) {
-                return false;
-            }
-            Self::pump_run_loop();
-            std::thread::yield_now();
-        }
-        true
+        let ok = vz_sync_wait(&rx, block_addr);
+        vz_completion_clear();
+        ok
     }
 
     /// Synchronously request stop of the VM.
@@ -609,25 +712,9 @@ impl VZVirtualMachineHandle {
     /// `vm` must be a valid VZVirtualMachine pointer.
     #[cfg(target_os = "macos")]
     unsafe fn vz_request_stop_sync(vm: *mut objc::runtime::Object) -> bool {
-        static VZ_REQSTOP_RESULT: std::sync::atomic::AtomicBool =
-            std::sync::atomic::AtomicBool::new(false);
-        VZ_REQSTOP_RESULT.store(false, Ordering::SeqCst);
-
-        extern "C" fn reqstop_completion(
-            _block: *const std::ffi::c_void,
-            _error: *mut objc::runtime::Object,
-        ) {
-            VZ_REQSTOP_RESULT.store(true, Ordering::SeqCst);
-        }
-
-        let block =
-            BlockLiteral::<extern "C" fn(*const std::ffi::c_void, *mut objc::runtime::Object)> {
-                isa: std::ptr::null_mut(),
-                flags: BLOCK_FLAGS_STACK,
-                reserved: 0,
-                invoke: reqstop_completion
-                    as *const extern "C" fn(*const std::ffi::c_void, *mut objc::runtime::Object),
-            };
+        let _op_guard = vz_op_lock();
+        let rx = vz_completion_install();
+        let (block, block_addr) = vz_completion_block();
 
         let _: () = msg_send![
             vm,
@@ -635,61 +722,9 @@ impl VZVirtualMachineHandle {
                 as *mut std::ffi::c_void
         ];
 
-        let start = std::time::Instant::now();
-        while !VZ_REQSTOP_RESULT.load(Ordering::SeqCst) {
-            if start.elapsed() > std::time::Duration::from_secs(30) {
-                return false;
-            }
-            Self::pump_run_loop();
-            std::thread::yield_now();
-        }
-        true
-    }
-
-    /// Pump the NSRunLoop for ~10ms to allow completion handlers to fire.
-    #[cfg(target_os = "macos")]
-    fn pump_run_loop() {
-        unsafe {
-            let cls_runloop = match objc::runtime::Class::get("NSRunLoop") {
-                Some(c) => c,
-                None => return,
-            };
-            let cls_date = match objc::runtime::Class::get("NSDate") {
-                Some(c) => c,
-                None => return,
-            };
-            let current_runloop: *mut objc::runtime::Object =
-                msg_send![cls_runloop, currentRunLoop];
-            let interval: *mut objc::runtime::Object =
-                msg_send![cls_date, dateWithTimeIntervalSinceNow: 0.01];
-            if !current_runloop.is_null() && !interval.is_null() {
-                let modes: *mut objc::runtime::Object = {
-                    let cls_array = match objc::runtime::Class::get("NSArray") {
-                        Some(c) => c,
-                        None => return,
-                    };
-                    let default_mode: *mut objc::runtime::Object = {
-                        let cls_str = objc::runtime::Class::get("NSString").unwrap();
-                        let c_str = CString::new("NSDefaultRunLoopMode").unwrap();
-                        msg_send![cls_str, stringWithUTF8String: c_str.as_ptr()]
-                    };
-                    let args = [default_mode];
-                    msg_send![cls_array, arrayWithObjects: args.as_ptr() count: 1]
-                };
-                if !modes.is_null() {
-                    let default_mode_str = CString::new("NSDefaultRunLoopMode").unwrap();
-                    let ns_default_mode: *mut objc::runtime::Object = {
-                        let cls_str = objc::runtime::Class::get("NSString").unwrap();
-                        msg_send![cls_str, stringWithUTF8String: default_mode_str.as_ptr()]
-                    };
-                    let _: () = msg_send![
-                        current_runloop,
-                        runMode: ns_default_mode
-                        beforeDate: interval
-                    ];
-                }
-            }
-        }
+        let ok = vz_sync_wait(&rx, block_addr);
+        vz_completion_clear();
+        ok
     }
 }
 
@@ -702,11 +737,9 @@ impl Drop for VZVirtualMachineHandle {
                     let _: () = msg_send![self.vm, release];
                 }
             }
-            if let Some(delegate) = self.delegate.take() {
-                if !delegate.is_null() {
-                    unsafe {
-                        let _: () = msg_send![delegate, release];
-                    }
+            if let Some(delegate) = self.delegate.take().filter(|d| !d.is_null()) {
+                unsafe {
+                    let _: () = msg_send![delegate, release];
                 }
             }
         }
@@ -747,7 +780,7 @@ fn load_virtualization_framework() -> bool {
             Some(c) => c,
             None => return false,
         };
-        let path_str = CString::new("/System/Library/Frameworks/Virtualization.framework").unwrap();
+        let path_str = c"/System/Library/Frameworks/Virtualization.framework";
         let ns_string_cls = match objc::runtime::Class::get("NSString") {
             Some(c) => c,
             None => return false,
@@ -835,33 +868,73 @@ pub fn create_vz_virtual_machine(
                     let bl_alloc: *mut objc::runtime::Object = msg_send![cls_linux_bl, alloc];
                     let bl: *mut objc::runtime::Object = msg_send![bl_alloc, init];
 
-                    let kernel_str = CString::new(kernel_path.as_str()).unwrap();
+                    let kernel_str = CString::new(kernel_path.as_str()).map_err(|_| {
+                        AppError::new(
+                            ReasonCode::RcFsPathInvalid,
+                            "SCM: kernel path contains a NUL byte",
+                        )
+                    })?;
                     let ns_kernel: *mut objc::runtime::Object = {
-                        let cls_str = objc::runtime::Class::get("NSString").unwrap();
+                        let cls_str = objc::runtime::Class::get("NSString").ok_or_else(|| {
+                            AppError::new(
+                                ReasonCode::RcVulkanNotSupported,
+                                "SCM: NSString class not found",
+                            )
+                        })?;
                         msg_send![cls_str, stringWithUTF8String: kernel_str.as_ptr()]
                     };
                     let kernel_url: *mut objc::runtime::Object = {
-                        let cls_url = objc::runtime::Class::get("NSURL").unwrap();
+                        let cls_url = objc::runtime::Class::get("NSURL").ok_or_else(|| {
+                            AppError::new(
+                                ReasonCode::RcVulkanNotSupported,
+                                "SCM: NSURL class not found",
+                            )
+                        })?;
                         msg_send![cls_url, fileURLWithPath: ns_kernel]
                     };
                     let _: () = msg_send![bl, setLinuxKernelURL: kernel_url];
 
                     if let Some(initrd) = initrd_path {
-                        let initrd_str = CString::new(initrd.as_str()).unwrap();
+                        let initrd_str = CString::new(initrd.as_str()).map_err(|_| {
+                            AppError::new(
+                                ReasonCode::RcFsPathInvalid,
+                                "SCM: initrd path contains a NUL byte",
+                            )
+                        })?;
                         let ns_initrd: *mut objc::runtime::Object = {
-                            let cls_str = objc::runtime::Class::get("NSString").unwrap();
+                            let cls_str = objc::runtime::Class::get("NSString").ok_or_else(|| {
+                                AppError::new(
+                                    ReasonCode::RcVulkanNotSupported,
+                                    "SCM: NSString class not found",
+                                )
+                            })?;
                             msg_send![cls_str, stringWithUTF8String: initrd_str.as_ptr()]
                         };
                         let initrd_url: *mut objc::runtime::Object = {
-                            let cls_url = objc::runtime::Class::get("NSURL").unwrap();
+                            let cls_url = objc::runtime::Class::get("NSURL").ok_or_else(|| {
+                                AppError::new(
+                                    ReasonCode::RcVulkanNotSupported,
+                                    "SCM: NSURL class not found",
+                                )
+                            })?;
                             msg_send![cls_url, fileURLWithPath: ns_initrd]
                         };
                         let _: () = msg_send![bl, setInitialRamdiskURL: initrd_url];
                     }
 
-                    let cmd_str = CString::new(command_line.as_str()).unwrap();
+                    let cmd_str = CString::new(command_line.as_str()).map_err(|_| {
+                        AppError::new(
+                            ReasonCode::RcFsPathInvalid,
+                            "SCM: command line contains a NUL byte",
+                        )
+                    })?;
                     let ns_cmd: *mut objc::runtime::Object = {
-                        let cls_str = objc::runtime::Class::get("NSString").unwrap();
+                        let cls_str = objc::runtime::Class::get("NSString").ok_or_else(|| {
+                            AppError::new(
+                                ReasonCode::RcVulkanNotSupported,
+                                "SCM: NSString class not found",
+                            )
+                        })?;
                         msg_send![cls_str, stringWithUTF8String: cmd_str.as_ptr()]
                     };
                     let _: () = msg_send![bl, setCommandLine: ns_cmd];
@@ -879,13 +952,28 @@ pub fn create_vz_virtual_machine(
                     let bl_alloc: *mut objc::runtime::Object = msg_send![cls_efi_bl, alloc];
                     let bl: *mut objc::runtime::Object = msg_send![bl_alloc, init];
 
-                    let efi_str = CString::new(efi_path.as_str()).unwrap();
+                    let efi_str = CString::new(efi_path.as_str()).map_err(|_| {
+                        AppError::new(
+                            ReasonCode::RcFsPathInvalid,
+                            "SCM: EFI path contains a NUL byte",
+                        )
+                    })?;
                     let ns_efi: *mut objc::runtime::Object = {
-                        let cls_str = objc::runtime::Class::get("NSString").unwrap();
+                        let cls_str = objc::runtime::Class::get("NSString").ok_or_else(|| {
+                            AppError::new(
+                                ReasonCode::RcVulkanNotSupported,
+                                "SCM: NSString class not found",
+                            )
+                        })?;
                         msg_send![cls_str, stringWithUTF8String: efi_str.as_ptr()]
                     };
                     let efi_url: *mut objc::runtime::Object = {
-                        let cls_url = objc::runtime::Class::get("NSURL").unwrap();
+                        let cls_url = objc::runtime::Class::get("NSURL").ok_or_else(|| {
+                            AppError::new(
+                                ReasonCode::RcVulkanNotSupported,
+                                "SCM: NSURL class not found",
+                            )
+                        })?;
                         msg_send![cls_url, fileURLWithPath: ns_efi]
                     };
 
@@ -913,7 +1001,12 @@ pub fn create_vz_virtual_machine(
             let _: () = msg_send![vz_config, setBootLoader: boot_loader];
 
             // --- Create device configurations ---
-            let cls_array = objc::runtime::Class::get("NSMutableArray").unwrap();
+            let cls_array = objc::runtime::Class::get("NSMutableArray").ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcVulkanNotSupported,
+                    "SCM: NSMutableArray class not found",
+                )
+            })?;
             let devices_array: *mut objc::runtime::Object = msg_send![cls_array, array];
 
             for device in &config.devices {
@@ -931,7 +1024,14 @@ pub fn create_vz_virtual_machine(
                                     msg_send![cls_scanout, alloc];
                                 let scanout: *mut objc::runtime::Object = msg_send![so_alloc, init];
                                 let scanouts_array: *mut objc::runtime::Object = {
-                                    let cls_arr = objc::runtime::Class::get("NSArray").unwrap();
+                                    let cls_arr = objc::runtime::Class::get("NSArray").ok_or_else(
+                                        || {
+                                            AppError::new(
+                                                ReasonCode::RcVulkanNotSupported,
+                                                "SCM: NSArray class not found",
+                                            )
+                                        },
+                                    )?;
                                     let args = [scanout];
                                     msg_send![cls_arr, arrayWithObjects: args.as_ptr() count: 1]
                                 };
@@ -953,20 +1053,49 @@ pub fn create_vz_virtual_machine(
                             let fs_alloc: *mut objc::runtime::Object = msg_send![cls_fs, alloc];
                             let fs_dev: *mut objc::runtime::Object = msg_send![fs_alloc, init];
 
-                            let tag_str = CString::new(mount_tag.as_str()).unwrap();
+                            let tag_str = CString::new(mount_tag.as_str()).map_err(|_| {
+                                AppError::new(
+                                    ReasonCode::RcFsPathInvalid,
+                                    "SCM: mount tag contains a NUL byte",
+                                )
+                            })?;
                             let ns_tag: *mut objc::runtime::Object = {
-                                let cls_str = objc::runtime::Class::get("NSString").unwrap();
+                                let cls_str = objc::runtime::Class::get("NSString").ok_or_else(
+                                    || {
+                                        AppError::new(
+                                            ReasonCode::RcVulkanNotSupported,
+                                            "SCM: NSString class not found",
+                                        )
+                                    },
+                                )?;
                                 msg_send![cls_str, stringWithUTF8String: tag_str.as_ptr()]
                             };
                             let _: () = msg_send![fs_dev, setTag: ns_tag];
 
-                            let dir_str = CString::new(shared_dir.as_str()).unwrap();
+                            let dir_str = CString::new(shared_dir.as_str()).map_err(|_| {
+                                AppError::new(
+                                    ReasonCode::RcFsPathInvalid,
+                                    "SCM: shared directory path contains a NUL byte",
+                                )
+                            })?;
                             let ns_dir: *mut objc::runtime::Object = {
-                                let cls_str = objc::runtime::Class::get("NSString").unwrap();
+                                let cls_str = objc::runtime::Class::get("NSString").ok_or_else(
+                                    || {
+                                        AppError::new(
+                                            ReasonCode::RcVulkanNotSupported,
+                                            "SCM: NSString class not found",
+                                        )
+                                    },
+                                )?;
                                 msg_send![cls_str, stringWithUTF8String: dir_str.as_ptr()]
                             };
                             let dir_url: *mut objc::runtime::Object = {
-                                let cls_url = objc::runtime::Class::get("NSURL").unwrap();
+                                let cls_url = objc::runtime::Class::get("NSURL").ok_or_else(|| {
+                                    AppError::new(
+                                        ReasonCode::RcVulkanNotSupported,
+                                        "SCM: NSURL class not found",
+                                    )
+                                })?;
                                 msg_send![cls_url, fileURLWithPath: ns_dir]
                             };
                             if let Some(cls_share) = objc::runtime::Class::get("VZSharedDirectory")
@@ -991,9 +1120,20 @@ pub fn create_vz_virtual_machine(
                             let net_dev: *mut objc::runtime::Object = msg_send![net_alloc, init];
 
                             if let Some(mac) = mac_address {
-                                let mac_str = CString::new(mac.as_str()).unwrap();
+                                let mac_str = CString::new(mac.as_str()).map_err(|_| {
+                                    AppError::new(
+                                        ReasonCode::RcFsPathInvalid,
+                                        "SCM: MAC address contains a NUL byte",
+                                    )
+                                })?;
                                 let ns_mac: *mut objc::runtime::Object = {
-                                    let cls_str = objc::runtime::Class::get("NSString").unwrap();
+                                    let cls_str = objc::runtime::Class::get("NSString")
+                                        .ok_or_else(|| {
+                                            AppError::new(
+                                                ReasonCode::RcVulkanNotSupported,
+                                                "SCM: NSString class not found",
+                                            )
+                                        })?;
                                     msg_send![cls_str, stringWithUTF8String: mac_str.as_ptr()]
                                 };
                                 if let Some(cls_mac) = objc::runtime::Class::get("VZMACAddress") {
@@ -1018,27 +1158,89 @@ pub fn create_vz_virtual_machine(
                             None
                         }
                     }
-                    VZDeviceConfiguration::SerialPort { .. } => {
-                        if let Some(cls_serial) =
-                            objc::runtime::Class::get("VZSerialPortConfiguration")
-                        {
-                            let serial_alloc: *mut objc::runtime::Object =
-                                msg_send![cls_serial, alloc];
-                            let serial_dev: *mut objc::runtime::Object =
-                                msg_send![serial_alloc, init];
-                            Some(serial_dev)
-                        } else {
-                            None
+                    VZDeviceConfiguration::SerialPort { handler } => match handler {
+                        // A Null handler means serial output is discarded, so no
+                        // serial device is added at all (a bare serial config
+                        // without an attachment fails `validateWithError:`).
+                        SerialHandler::Null => None,
+                        SerialHandler::File(path) => {
+                            if let Some(cls_serial) =
+                                objc::runtime::Class::get("VZSerialPortConfiguration")
+                            {
+                                let serial_alloc: *mut objc::runtime::Object =
+                                    msg_send![cls_serial, alloc];
+                                let serial_dev: *mut objc::runtime::Object =
+                                    msg_send![serial_alloc, init];
+
+                                let file = match std::fs::OpenOptions::new()
+                                    .create(true)
+                                    .append(true)
+                                    .open(path)
+                                {
+                                    Ok(f) => f,
+                                    Err(_) => {
+                                        let _: () = msg_send![serial_dev, release];
+                                        return Err(AppError::new(
+                                            ReasonCode::RcIo,
+                                            format!("SCM: cannot open serial log file: {path}"),
+                                        ));
+                                    }
+                                };
+                                use std::os::unix::io::AsRawFd;
+                                // VZ takes ownership of the descriptor, so the
+                                // Rust File must not close it afterwards.
+                                let fd = file.as_raw_fd();
+                                std::mem::forget(file);
+
+                                if let Some(cls_attach) = objc::runtime::Class::get(
+                                    "VZFileHandleSerialPortAttachment",
+                                ) {
+                                    let attach_alloc: *mut objc::runtime::Object =
+                                        msg_send![cls_attach, alloc];
+                                    let attach: *mut objc::runtime::Object = msg_send![
+                                        attach_alloc,
+                                        initWithFileDescriptor: fd as i32
+                                    ];
+                                    if !attach.is_null() {
+                                        let _: () = msg_send![serial_dev, setAttachment: attach];
+                                        let _: () = msg_send![attach, release];
+                                        Some(serial_dev)
+                                    } else {
+                                        let _: () = msg_send![serial_dev, release];
+                                        None
+                                    }
+                                } else {
+                                    let _: () = msg_send![serial_dev, release];
+                                    None
+                                }
+                            } else {
+                                None
+                            }
                         }
-                    }
+                    },
                     VZDeviceConfiguration::Storage { path, readonly } => {
-                        let storage_str = CString::new(path.as_str()).unwrap();
+                        let storage_str = CString::new(path.as_str()).map_err(|_| {
+                            AppError::new(
+                                ReasonCode::RcFsPathInvalid,
+                                "SCM: storage path contains a NUL byte",
+                            )
+                        })?;
                         let ns_storage: *mut objc::runtime::Object = {
-                            let cls_str = objc::runtime::Class::get("NSString").unwrap();
+                            let cls_str = objc::runtime::Class::get("NSString").ok_or_else(|| {
+                                AppError::new(
+                                    ReasonCode::RcVulkanNotSupported,
+                                    "SCM: NSString class not found",
+                                )
+                            })?;
                             msg_send![cls_str, stringWithUTF8String: storage_str.as_ptr()]
                         };
                         let storage_url: *mut objc::runtime::Object = {
-                            let cls_url = objc::runtime::Class::get("NSURL").unwrap();
+                            let cls_url = objc::runtime::Class::get("NSURL").ok_or_else(|| {
+                                AppError::new(
+                                    ReasonCode::RcVulkanNotSupported,
+                                    "SCM: NSURL class not found",
+                                )
+                            })?;
                             msg_send![cls_url, fileURLWithPath: ns_storage]
                         };
 
@@ -1093,7 +1295,7 @@ pub fn create_vz_virtual_machine(
                 }
             }
 
-            let _: () = msg_send![vz_config, setDeviceDevices: devices_array];
+            let _: () = msg_send![vz_config, setDevices: devices_array];
 
             // --- Validate configuration ---
             let mut error: *mut objc::runtime::Object = std::ptr::null_mut();
@@ -1219,8 +1421,9 @@ impl Default for Arm64VmConfig {
 /// Build a [`VZVirtualMachineConfiguration`] from an [`Arm64VmConfig`].
 ///
 /// Translates the high-level ARM64 configuration into the full VZ device
-/// configuration, including boot loader, GPU, filesystem, networking, serial,
-/// storage, and entropy devices.
+/// configuration, including boot loader, GPU, filesystem, networking, and
+/// entropy devices. No serial device is added: serial output is discarded
+/// unless a `SerialHandler::File` config is constructed explicitly.
 pub fn configure_arm64_vm(config: &Arm64VmConfig) -> AppResult<VZVirtualMachineConfiguration> {
     let boot_loader = match &config.boot_loader {
         BootLoaderType::LinuxKernel {
@@ -1256,9 +1459,9 @@ pub fn configure_arm64_vm(config: &Arm64VmConfig) -> AppResult<VZVirtualMachineC
         mac_address: config.mac_address.clone(),
     });
 
-    devices.push(VZDeviceConfiguration::SerialPort {
-        handler: SerialHandler::Null,
-    });
+    // No serial device: a bare serial config without an attachment fails VZ
+    // validation, and serial output is discarded unless a File handler is
+    // explicitly configured by the caller.
 
     if config.entropy_enabled {
         devices.push(VZDeviceConfiguration::Entropy);
@@ -1406,6 +1609,10 @@ impl VirtioGpuMetal {
     ///
     /// The `data` slice must contain `width * height * 4` bytes of RGBA pixel
     /// data. The updated region is marked dirty for the next Metal flush.
+    ///
+    /// All offsets are computed with checked `usize` arithmetic; guest-supplied
+    /// coordinates that overflow or fall outside the framebuffer are clamped
+    /// or rejected with an error instead of panicking.
     pub fn update_scanout(
         &mut self,
         data: &[u8],
@@ -1424,28 +1631,81 @@ impl VirtioGpuMetal {
             return Ok(());
         }
 
+        let fb_width = fb_width as usize;
+        let x = x as usize;
+        let y = y as usize;
+        let width = width as usize;
+        let clamped_width = clamped_width as usize;
+        let clamped_height = clamped_height as usize;
+        let row_bytes = clamped_width * 4;
+
         for row in 0..clamped_height {
-            let src_start = (row * width * 4) as usize;
-            let src_end = src_start + (clamped_width as usize * 4);
+            let src_start = row
+                .checked_mul(width)
+                .and_then(|v| v.checked_mul(4))
+                .ok_or_else(|| {
+                    AppError::new(
+                        ReasonCode::RcBufferLimitExceeded,
+                        "SCM: framebuffer source offset overflow",
+                    )
+                })?;
+            let src_end = src_start.checked_add(row_bytes).ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcBufferLimitExceeded,
+                    "SCM: framebuffer source range overflow",
+                )
+            })?;
             if src_end > data.len() {
-                break;
+                return Err(AppError::new(
+                    ReasonCode::RcBufferLimitExceeded,
+                    "SCM: framebuffer source data too small",
+                ));
             }
-            let dst_start = ((y + row) * fb_width + x) as usize * 4;
-            let dst_end = dst_start + (clamped_width as usize * 4);
+            let dst_start = y
+                .checked_add(row)
+                .and_then(|v| v.checked_mul(fb_width))
+                .and_then(|v| v.checked_add(x))
+                .and_then(|v| v.checked_mul(4))
+                .ok_or_else(|| {
+                    AppError::new(
+                        ReasonCode::RcBufferLimitExceeded,
+                        "SCM: framebuffer destination offset overflow",
+                    )
+                })?;
+            let dst_end = dst_start.checked_add(row_bytes).ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcBufferLimitExceeded,
+                    "SCM: framebuffer destination range overflow",
+                )
+            })?;
             if dst_end > self.framebuffer.len() {
-                break;
+                return Err(AppError::new(
+                    ReasonCode::RcBufferLimitExceeded,
+                    "SCM: framebuffer destination out of bounds",
+                ));
             }
-            let copy_len = (src_end - src_start).min(dst_end - dst_start);
-            self.framebuffer[dst_start..dst_start + copy_len]
-                .copy_from_slice(&data[src_start..src_start + copy_len]);
+            self.framebuffer[dst_start..dst_end].copy_from_slice(&data[src_start..src_end]);
         }
 
-        self.dirty_rects.push(DirtyRect {
-            x,
-            y,
-            width: clamped_width,
-            height: clamped_height,
-        });
+        // Bound the dirty-rect list: when the guest floods updates without
+        // flushing, coalesce into a single full-frame dirty region instead of
+        // growing the list without limit.
+        if self.dirty_rects.len() >= MAX_DIRTY_RECTS {
+            self.dirty_rects.clear();
+            self.dirty_rects.push(DirtyRect {
+                x: 0,
+                y: 0,
+                width: self.scanout_width,
+                height: self.scanout_height,
+            });
+        } else {
+            self.dirty_rects.push(DirtyRect {
+                x: x as u32,
+                y: y as u32,
+                width: clamped_width as u32,
+                height: clamped_height as u32,
+            });
+        }
 
         Ok(())
     }
@@ -1454,6 +1714,9 @@ impl VirtioGpuMetal {
     ///
     /// On macOS, this uses `MTLBlitCommandEncoder` to copy pixel data from the
     /// CPU buffer into the Metal texture. On other platforms this is a no-op.
+    ///
+    /// The Metal calls run inside an autorelease pool so the command buffer and
+    /// blit encoder are released on both success and error paths.
     pub fn flush_to_metal(&mut self) -> AppResult<()> {
         if self.dirty_rects.is_empty() {
             return Ok(());
@@ -1462,7 +1725,7 @@ impl VirtioGpuMetal {
         #[cfg(target_os = "macos")]
         {
             if let (Some(texture_ptr), Some(queue_ptr)) = (self.metal_texture, self.command_queue) {
-                unsafe {
+                objc::rc::autoreleasepool(|| unsafe {
                     let texture = texture_ptr as *mut objc::runtime::Object;
                     let queue = queue_ptr as *mut objc::runtime::Object;
 
@@ -1528,7 +1791,8 @@ impl VirtioGpuMetal {
 
                     let _: () = msg_send![blit_encoder, endEncoding];
                     let _: () = msg_send![cmd_buffer, commit];
-                }
+                    Ok(())
+                })?;
             }
         }
 
@@ -1580,6 +1844,26 @@ impl VirtioGpuMetal {
     }
 }
 
+impl Drop for VirtioGpuMetal {
+    fn drop(&mut self) {
+        // Release the retained Metal texture and command queue so dropped
+        // GPUs do not leak GPU resources.
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(texture_ptr) = self.metal_texture.take() {
+                unsafe {
+                    let _: () = msg_send![texture_ptr as *mut objc::runtime::Object, release];
+                }
+            }
+            if let Some(queue_ptr) = self.command_queue.take() {
+                unsafe {
+                    let _: () = msg_send![queue_ptr as *mut objc::runtime::Object, release];
+                }
+            }
+        }
+    }
+}
+
 impl std::fmt::Debug for VirtioGpuMetal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("VirtioGpuMetal")
@@ -1613,7 +1897,7 @@ pub struct VirtioFsStat {
 }
 
 /// An open file handle within the virtio-fs bridge.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct VirtioFsFileHandle {
     /// Absolute path on the host filesystem.
     pub host_path: PathBuf,
@@ -1625,6 +1909,10 @@ pub struct VirtioFsFileHandle {
     pub readable: bool,
     /// Whether the file was opened for writing.
     pub writable: bool,
+    /// Host file descriptor pinned at `open` time, so subsequent reads,
+    /// writes, and seeks hit the same file (Windows handle semantics) instead
+    /// of re-opening by path.
+    pub file: Option<std::fs::File>,
 }
 
 /// Virtio-FS bridge that maps guest filesystem operations to host operations.
@@ -1660,23 +1948,95 @@ impl VirtioFsBridge {
         }
     }
 
-    /// Translate a guest path to an absolute host path.
+    /// Resolve a guest path to a host path confined to the shared directory.
     ///
-    /// Guest paths are relative to the shared directory root. Leading slashes
-    /// are stripped. Path traversal (`..`) is resolved but confined to the
-    /// shared directory.
-    fn guest_to_host_path(&self, guest_path: &str) -> PathBuf {
+    /// NUL bytes, absolute paths (other than a leading `/`, which is treated
+    /// as the shared-directory root), and `..` components are rejected up
+    /// front. The result is additionally verified against the canonicalized
+    /// shared root, so symlinks inside the share cannot redirect an operation
+    /// outside it. For paths that do not exist yet (e.g. `mkdir`), the deepest
+    /// existing ancestor is canonicalized and the remainder re-appended.
+    fn guest_to_host_path(&self, guest_path: &str) -> AppResult<PathBuf> {
+        if guest_path.contains('\0') {
+            return Err(AppError::new(
+                ReasonCode::RcFsPathInvalid,
+                "SCM: virtio-fs path contains a NUL byte",
+            ));
+        }
+
         let cleaned = guest_path.trim_start_matches('/');
-        let host_root = Path::new(&self.host_shared_dir);
-        host_root.join(cleaned)
+        let guest = Path::new(cleaned);
+        if guest.components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        }) {
+            return Err(AppError::new(
+                ReasonCode::RcFsSandboxEscape,
+                format!("SCM: virtio-fs path escapes shared directory: {guest_path}"),
+            ));
+        }
+
+        let canonical_root = std::fs::canonicalize(&self.host_shared_dir).map_err(|e| {
+            AppError::from_io(
+                ReasonCode::RcFsNotFound,
+                format!("SCM: shared directory unavailable: {}", self.host_shared_dir),
+                &e,
+            )
+        })?;
+
+        let candidate = canonical_root.join(guest);
+
+        let mut tail: Vec<std::ffi::OsString> = Vec::new();
+        let mut ancestor = candidate.as_path();
+        loop {
+            match std::fs::canonicalize(ancestor) {
+                Ok(canon) => {
+                    if !canon.starts_with(&canonical_root) {
+                        return Err(AppError::new(
+                            ReasonCode::RcFsSandboxEscape,
+                            format!("SCM: virtio-fs path escapes shared directory: {guest_path}"),
+                        ));
+                    }
+                    let mut resolved = canon;
+                    for part in tail.iter().rev() {
+                        resolved.push(part);
+                    }
+                    return Ok(resolved);
+                }
+                Err(_) => match ancestor.file_name() {
+                    Some(name) => {
+                        tail.push(name.to_os_string());
+                        ancestor = ancestor.parent().unwrap_or(ancestor);
+                    }
+                    None => {
+                        return Err(AppError::new(
+                            ReasonCode::RcFsNotFound,
+                            format!("SCM: virtio-fs path not found: {guest_path}"),
+                        ));
+                    }
+                },
+            }
+        }
     }
 
     /// Open a file in the shared directory and return a handle ID.
     ///
     /// `flags` is a bitmask of `O_RDONLY`/`O_WRONLY`/`O_RDWR` etc.
-    /// The file is opened on the host and a handle is allocated.
+    /// The file is opened on the host and a handle is allocated. The host
+    /// descriptor is pinned in the handle for the lifetime of the handle.
     pub fn open(&mut self, guest_path: &str, flags: u32) -> AppResult<u64> {
-        let host_path = self.guest_to_host_path(guest_path);
+        if self.file_handles.len() >= MAX_OPEN_FILE_HANDLES {
+            return Err(AppError::new(
+                ReasonCode::RcBufferLimitExceeded,
+                "SCM: virtio-fs open file handle limit reached",
+            ));
+        }
+
+        let host_path = self.guest_to_host_path(guest_path)?;
         let path = Path::new(&host_path);
 
         if !path.exists() {
@@ -1690,8 +2050,27 @@ impl VirtioFsBridge {
         let readable = (flags & 0o3) != 0o1;
         let writable = (flags & 0o3) != 0o0;
 
+        // Directories cannot be opened for writing on macOS; pin a read-only
+        // descriptor for directory handles (the writable flag still gates
+        // write() calls, which fail with EISDIR on directories).
+        let open_result = if is_directory {
+            std::fs::OpenOptions::new().read(true).open(&host_path)
+        } else {
+            std::fs::OpenOptions::new()
+                .read(readable)
+                .write(writable)
+                .open(&host_path)
+        };
+        let file = open_result.map_err(|e| {
+            AppError::from_io(
+                ReasonCode::RcIo,
+                format!("SCM: virtio-fs open failed for: {guest_path}"),
+                &e,
+            )
+        })?;
+
         let handle_id = self.next_handle;
-        self.next_handle += 1;
+        self.next_handle = self.next_handle.saturating_add(1);
 
         self.file_handles.insert(
             handle_id,
@@ -1701,6 +2080,7 @@ impl VirtioFsBridge {
                 position: 0,
                 readable,
                 writable,
+                file: Some(file),
             },
         );
 
@@ -1710,8 +2090,8 @@ impl VirtioFsBridge {
     /// Read from a file handle into the provided buffer.
     ///
     /// Returns the number of bytes actually read. Advances the file position.
-    pub fn read(&mut self, handle: u64, buffer: &mut [u8]) -> AppResult<u32> {
-        let fh = self.file_handles.get(&handle).ok_or_else(|| {
+    pub fn read(&mut self, handle: u64, buffer: &mut [u8]) -> AppResult<u64> {
+        let fh = self.file_handles.get_mut(&handle).ok_or_else(|| {
             AppError::new(
                 ReasonCode::RcWin32InvalidHandle,
                 format!("SCM: virtio-fs invalid handle: {handle}"),
@@ -1725,14 +2105,14 @@ impl VirtioFsBridge {
             ));
         }
 
-        let host_path = fh.host_path.clone();
-        let position = fh.position;
-
-        let mut file = std::fs::File::open(&host_path).map_err(|e| {
-            AppError::from_io(ReasonCode::RcIo, "SCM: failed to open file for reading", &e)
+        let file = fh.file.as_mut().ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcFsSharingViolation,
+                "SCM: file handle has no pinned descriptor",
+            )
         })?;
 
-        file.seek(SeekFrom::Start(position))
+        file.seek(SeekFrom::Start(fh.position))
             .map_err(|e| AppError::from_io(ReasonCode::RcIo, "SCM: failed to seek", &e))?;
 
         let bytes_read = file.read(buffer).map_err(|e| {
@@ -1743,18 +2123,15 @@ impl VirtioFsBridge {
             )
         })?;
 
-        if let Some(fh) = self.file_handles.get_mut(&handle) {
-            fh.position += bytes_read as u64;
-        }
-
-        Ok(bytes_read as u32)
+        fh.position = fh.position.saturating_add(bytes_read as u64);
+        Ok(bytes_read as u64)
     }
 
     /// Write data to a file handle.
     ///
     /// Returns the number of bytes actually written. Advances the file position.
-    pub fn write(&mut self, handle: u64, data: &[u8]) -> AppResult<u32> {
-        let fh = self.file_handles.get(&handle).ok_or_else(|| {
+    pub fn write(&mut self, handle: u64, data: &[u8]) -> AppResult<u64> {
+        let fh = self.file_handles.get_mut(&handle).ok_or_else(|| {
             AppError::new(
                 ReasonCode::RcWin32InvalidHandle,
                 format!("SCM: virtio-fs invalid handle: {handle}"),
@@ -1768,17 +2145,14 @@ impl VirtioFsBridge {
             ));
         }
 
-        let host_path = fh.host_path.clone();
-        let position = fh.position;
+        let file = fh.file.as_mut().ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcFsSharingViolation,
+                "SCM: file handle has no pinned descriptor",
+            )
+        })?;
 
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&host_path)
-            .map_err(|e| {
-                AppError::from_io(ReasonCode::RcIo, "SCM: failed to open file for writing", &e)
-            })?;
-
-        file.seek(SeekFrom::Start(position))
+        file.seek(SeekFrom::Start(fh.position))
             .map_err(|e| AppError::from_io(ReasonCode::RcIo, "SCM: failed to seek", &e))?;
 
         let bytes_written = file.write(data).map_err(|e| {
@@ -1789,19 +2163,18 @@ impl VirtioFsBridge {
             )
         })?;
 
-        if let Some(fh) = self.file_handles.get_mut(&handle) {
-            fh.position += bytes_written as u64;
-        }
-
-        Ok(bytes_written as u32)
+        fh.position = fh.position.saturating_add(bytes_written as u64);
+        Ok(bytes_written as u64)
     }
 
     /// Seek to a position within a file handle.
     ///
     /// `whence`: 0 = SeekStart, 1 = SeekCurrent, 2 = SeekEnd.
-    /// Returns the new absolute position.
+    /// Returns the new absolute position. Negative offsets with `whence = 0`
+    /// are rejected (matching Windows `SetFilePointer` semantics) instead of
+    /// wrapping into huge `u64` positions.
     pub fn seek(&mut self, handle: u64, offset: i64, whence: i32) -> AppResult<u64> {
-        let fh = self.file_handles.get(&handle).ok_or_else(|| {
+        let fh = self.file_handles.get_mut(&handle).ok_or_else(|| {
             AppError::new(
                 ReasonCode::RcWin32InvalidHandle,
                 format!("SCM: virtio-fs invalid handle: {handle}"),
@@ -1809,6 +2182,12 @@ impl VirtioFsBridge {
         })?;
 
         let seek_from = match whence {
+            0 if offset < 0 => {
+                return Err(AppError::new(
+                    ReasonCode::RcFsPathInvalid,
+                    format!("SCM: negative seek offset for SEEK_SET: {offset}"),
+                ));
+            }
             0 => SeekFrom::Start(offset as u64),
             1 => SeekFrom::Current(offset),
             2 => SeekFrom::End(offset),
@@ -1820,18 +2199,18 @@ impl VirtioFsBridge {
             }
         };
 
-        let mut file = std::fs::File::open(&fh.host_path).map_err(|e| {
-            AppError::from_io(ReasonCode::RcIo, "SCM: failed to open file for seek", &e)
+        let file = fh.file.as_mut().ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcFsSharingViolation,
+                "SCM: file handle has no pinned descriptor",
+            )
         })?;
 
         let new_pos = file
             .seek(seek_from)
             .map_err(|e| AppError::from_io(ReasonCode::RcIo, "SCM: seek failed", &e))?;
 
-        if let Some(fh) = self.file_handles.get_mut(&handle) {
-            fh.position = new_pos;
-        }
-
+        fh.position = new_pos;
         Ok(new_pos)
     }
 
@@ -1852,7 +2231,7 @@ impl VirtioFsBridge {
     ///
     /// Returns size, modification time, creation time, and permissions.
     pub fn stat(&self, guest_path: &str) -> AppResult<VirtioFsStat> {
-        let host_path = self.guest_to_host_path(guest_path);
+        let host_path = self.guest_to_host_path(guest_path)?;
         let metadata = std::fs::metadata(&host_path).map_err(|e| {
             AppError::from_io(
                 ReasonCode::RcFsNotFound,
@@ -1894,7 +2273,7 @@ impl VirtioFsBridge {
 
     /// Create a directory at the given guest path.
     pub fn mkdir(&self, guest_path: &str) -> AppResult<()> {
-        let host_path = self.guest_to_host_path(guest_path);
+        let host_path = self.guest_to_host_path(guest_path)?;
         std::fs::create_dir(&host_path).map_err(|e| {
             AppError::from_io(
                 ReasonCode::RcIo,
@@ -1906,7 +2285,7 @@ impl VirtioFsBridge {
 
     /// Delete a file at the given guest path.
     pub fn unlink(&self, guest_path: &str) -> AppResult<()> {
-        let host_path = self.guest_to_host_path(guest_path);
+        let host_path = self.guest_to_host_path(guest_path)?;
         let path = Path::new(&host_path);
         if path.is_dir() {
             std::fs::remove_dir(path)
@@ -1926,7 +2305,7 @@ impl VirtioFsBridge {
     ///
     /// Returns a vector of entry names (not full paths).
     pub fn readdir(&self, guest_path: &str) -> AppResult<Vec<String>> {
-        let host_path = self.guest_to_host_path(guest_path);
+        let host_path = self.guest_to_host_path(guest_path)?;
         let entries = std::fs::read_dir(&host_path).map_err(|e| {
             AppError::from_io(
                 ReasonCode::RcFsNotFound,
@@ -1975,19 +2354,26 @@ pub struct VirtioNetStats {
     pub packets_sent: u64,
     /// Total packets received.
     pub packets_received: u64,
+    /// Total bytes dropped because a bounded buffer was full.
+    #[serde(default)]
+    pub bytes_dropped: u64,
+    /// Total packets dropped because a bounded buffer was full.
+    #[serde(default)]
+    pub packets_dropped: u64,
 }
 
 /// Virtio-net bridge for guest network I/O.
 ///
 /// Provides packet-level send/receive with statistics tracking.
-/// The bridge maintains TX and RX buffers for queuing packets.
+/// The bridge maintains bounded TX and RX buffers for queuing packets so a
+/// stalled counterparty cannot grow memory without limit.
 pub struct VirtioNetBridge {
     /// MAC address of the virtual network interface.
     pub mac_address: String,
     /// Whether the network is connected.
     pub connected: bool,
     /// Receive buffer (packets waiting to be read by the guest).
-    pub rx_buffer: Vec<u8>,
+    pub rx_buffer: std::collections::VecDeque<u8>,
     /// Transmit buffer (packets waiting to be sent to the network).
     pub tx_buffer: Vec<u8>,
     /// Traffic statistics.
@@ -2000,7 +2386,7 @@ impl VirtioNetBridge {
         Self {
             mac_address: mac_address.to_string(),
             connected: false,
-            rx_buffer: Vec::new(),
+            rx_buffer: std::collections::VecDeque::new(),
             tx_buffer: Vec::new(),
             stats: VirtioNetStats::default(),
         }
@@ -2009,6 +2395,7 @@ impl VirtioNetBridge {
     /// Send a packet through the virtual network interface.
     ///
     /// The packet data is queued in the TX buffer and statistics are updated.
+    /// Fails when the bounded TX buffer is full.
     pub fn send_packet(&mut self, data: &[u8]) -> AppResult<()> {
         if !self.connected {
             return Err(AppError::new(
@@ -2016,10 +2403,39 @@ impl VirtioNetBridge {
                 "SCM: virtio-net not connected",
             ));
         }
+        let new_len = self.tx_buffer.len().checked_add(data.len()).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcBufferLimitExceeded,
+                "SCM: virtio-net TX buffer overflow",
+            )
+        })?;
+        if new_len > MAX_NET_TX_BUFFER {
+            return Err(AppError::new(
+                ReasonCode::RcBufferLimitExceeded,
+                "SCM: virtio-net TX buffer full",
+            ));
+        }
         self.tx_buffer.extend_from_slice(data);
         self.stats.bytes_sent += data.len() as u64;
         self.stats.packets_sent += 1;
         Ok(())
+    }
+
+    /// Queue bytes into the bounded RX buffer, dropping (and counting) the
+    /// overflow when the guest is not draining fast enough.
+    pub fn enqueue_rx(&mut self, data: &[u8]) {
+        let room = MAX_NET_RX_BUFFER.saturating_sub(self.rx_buffer.len());
+        if room == 0 {
+            self.stats.bytes_dropped += data.len() as u64;
+            self.stats.packets_dropped += 1;
+            return;
+        }
+        let copy_len = data.len().min(room);
+        if copy_len < data.len() {
+            self.stats.bytes_dropped += (data.len() - copy_len) as u64;
+            self.stats.packets_dropped += 1;
+        }
+        self.rx_buffer.extend(&data[..copy_len]);
     }
 
     /// Receive a packet from the virtual network interface.
@@ -2038,7 +2454,16 @@ impl VirtioNetBridge {
         }
 
         let copy_len = buffer.len().min(self.rx_buffer.len());
-        buffer[..copy_len].copy_from_slice(&self.rx_buffer[..copy_len]);
+        let (head, tail) = self.rx_buffer.as_slices();
+        let mut written = 0usize;
+        for part in [head, tail] {
+            if written >= copy_len {
+                break;
+            }
+            let n = part.len().min(copy_len - written);
+            buffer[written..written + n].copy_from_slice(&part[..n]);
+            written += n;
+        }
         self.rx_buffer.drain(..copy_len);
         self.stats.bytes_received += copy_len as u64;
         self.stats.packets_received += 1;
@@ -2069,7 +2494,7 @@ impl std::fmt::Debug for VirtioNetBridge {
 // ===========================================================================
 
 /// Configuration for EFI secure boot.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SecureBootConfig {
     /// Whether secure boot is enabled.
     pub enabled: bool,
@@ -2079,17 +2504,6 @@ pub struct SecureBootConfig {
     pub machine_identifier: Option<String>,
     /// Path to the secure boot certificate.
     pub certificate_path: Option<String>,
-}
-
-impl Default for SecureBootConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            efi_variable_store_path: None,
-            machine_identifier: None,
-            certificate_path: None,
-        }
-    }
 }
 
 /// A single measurement entry in the TPM-like measurement log.
@@ -2110,7 +2524,7 @@ pub struct MeasurementEntry {
 /// Maintains 8 PCR registers (SHA-256) and a measurement log.
 /// PCR values are extended by hashing the existing value concatenated
 /// with the new measurement data.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MeasuredLaunchState {
     /// Whether measured launch is enabled.
     pub enabled: bool,
@@ -2120,33 +2534,26 @@ pub struct MeasuredLaunchState {
     pub measurement_log: Vec<MeasurementEntry>,
 }
 
-impl Default for MeasuredLaunchState {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            pcr_values: [[0u8; 32]; 8],
-            measurement_log: Vec::new(),
-        }
-    }
-}
-
-/// Configure secure boot on the given VZ configuration.
+/// Validate the secure-boot configuration.
 ///
-/// Sets up the VZEFIBootLoader with secure boot enabled, optionally
-/// specifying a variable store path and machine identifier.
-/// On non-macOS this is a no-op that validates the configuration.
+/// Note: this function is validation-only. The actual EFI secure-boot wiring
+/// (VZEFIBootLoader + VZEFIVariableStore) is performed by
+/// [`create_vz_virtual_machine`] when the boot loader is [`VZBootLoader::Windows`];
+/// Windows-EFI guest boot is otherwise not implemented by product code.
 pub fn configure_secure_boot(config: &SecureBootConfig) -> AppResult<()> {
     if !config.enabled {
         return Ok(());
     }
 
-    if let Some(ref path) = config.efi_variable_store_path {
-        if path.is_empty() {
-            return Err(AppError::new(
-                ReasonCode::RcFsPathInvalid,
-                "SCM: EFI variable store path cannot be empty",
-            ));
-        }
+    if config
+        .efi_variable_store_path
+        .as_deref()
+        .is_some_and(str::is_empty)
+    {
+        return Err(AppError::new(
+            ReasonCode::RcFsPathInvalid,
+            "SCM: EFI variable store path cannot be empty",
+        ));
     }
 
     Ok(())
@@ -2168,7 +2575,8 @@ pub fn measure_component(component: &str, data: &[u8]) -> AppResult<[u8; 32]> {
 /// Extend a PCR register with a new measurement.
 ///
 /// The PCR value is updated to `SHA-256( old_pcr || new_data )`.
-/// The measurement is appended to the measurement log.
+/// The measurement is appended to the measurement log, which is bounded so a
+/// flooding guest cannot grow it without limit.
 pub fn extend_pcr(state: &mut MeasuredLaunchState, pcr_index: usize, data: &[u8]) -> AppResult<()> {
     if pcr_index >= 8 {
         return Err(AppError::new(
@@ -2177,8 +2585,15 @@ pub fn extend_pcr(state: &mut MeasuredLaunchState, pcr_index: usize, data: &[u8]
         ));
     }
 
+    if state.measurement_log.len() >= MAX_MEASUREMENT_LOG {
+        return Err(AppError::new(
+            ReasonCode::RcBufferLimitExceeded,
+            "SCM: measurement log is full",
+        ));
+    }
+
     let mut hasher = Sha256::new();
-    hasher.update(&state.pcr_values[pcr_index]);
+    hasher.update(state.pcr_values[pcr_index]);
     hasher.update(data);
     let result = hasher.finalize();
     let mut new_digest = [0u8; 32];
@@ -2335,6 +2750,9 @@ pub struct WindowsKernelShim {
     /// Next IRP ID to allocate.
     #[serde(default)]
     pub next_irp_id: u64,
+    /// Monotonic fake-PID counter for started services.
+    #[serde(default)]
+    pub next_pid: u32,
 }
 
 impl WindowsKernelShim {
@@ -2353,6 +2771,7 @@ impl WindowsKernelShim {
             device_map: BTreeMap::new(),
             dpc_queue: Vec::new(),
             next_irp_id: 1,
+            next_pid: 1000,
         }
     }
 
@@ -2387,8 +2806,10 @@ impl WindowsKernelShim {
     }
 
     /// Start a registered service.
+    ///
+    /// Fake PIDs are drawn from a monotonic counter so they are stable within
+    /// the shim's lifetime and never collide, regardless of service order.
     pub fn start_service(&mut self, name: &str) -> AppResult<()> {
-        let pid_value = 1000 + (self.service_database.len() as u32) % 60000;
         let entry = self.service_database.get_mut(name).ok_or_else(|| {
             AppError::new(
                 ReasonCode::RcNotFound,
@@ -2398,6 +2819,8 @@ impl WindowsKernelShim {
 
         match entry.state {
             ServiceState::Stopped | ServiceState::Paused => {
+                let pid_value = self.next_pid;
+                self.next_pid = self.next_pid.saturating_add(1);
                 entry.state = ServiceState::Running;
                 entry.pid = Some(pid_value);
                 Ok(())
@@ -2480,9 +2903,18 @@ impl WindowsKernelShim {
     }
 
     /// Queue an IRP for processing.
+    ///
+    /// The queue is bounded so a guest that never completes IRPs cannot grow
+    /// memory without limit.
     pub fn queue_irp(&mut self, mut irp: IrpRequest) -> AppResult<()> {
+        if self.irp_queue.len() >= MAX_IRP_QUEUE {
+            return Err(AppError::new(
+                ReasonCode::RcBufferLimitExceeded,
+                "SCM: IRP queue is full",
+            ));
+        }
         irp.irp_id = self.next_irp_id;
-        self.next_irp_id += 1;
+        self.next_irp_id = self.next_irp_id.saturating_add(1);
         irp.completed = false;
         self.irp_queue.push(irp);
         Ok(())
@@ -2518,12 +2950,22 @@ impl WindowsKernelShim {
     }
 
     /// Queue a Deferred Procedure Call.
-    pub fn queue_dpc(&mut self, routine: u64, context: u64, parameter: u64) {
+    ///
+    /// The queue is bounded so a guest that never drains DPCs cannot grow
+    /// memory without limit.
+    pub fn queue_dpc(&mut self, routine: u64, context: u64, parameter: u64) -> AppResult<()> {
+        if self.dpc_queue.len() >= MAX_DPC_QUEUE {
+            return Err(AppError::new(
+                ReasonCode::RcBufferLimitExceeded,
+                "SCM: DPC queue is full",
+            ));
+        }
         self.dpc_queue.push(DpcEntry {
             routine,
             context,
             parameter,
         });
+        Ok(())
     }
 
     /// Drain all pending DPCs from the queue.
@@ -2543,17 +2985,28 @@ pub struct ScmController {
     pub virtio_fs: VirtioFs,
     pub virtio_net: VirtioNet,
     pub kernel_shim: WindowsKernelShim,
-    /// Guest memory mapping (simulated)
+    /// Guest memory mapping (simulated).
+    ///
+    /// Allocated lazily when the VM actually starts; `memory_mb` from the
+    /// (untrusted) config is clamped to `[256, 16384]` MiB so a hostile config
+    /// cannot force a multi-gigabyte allocation at construction time.
     pub guest_memory: Vec<u8>,
     /// Performance metrics
     pub uptime_seconds: u64,
     pub total_instructions: u64,
+    /// Size of the guest memory mapping, in bytes.
+    guest_memory_size: usize,
+    /// Wall-clock timestamp of the last tick, used to track uptime.
+    last_tick: Option<std::time::Instant>,
 }
 
 impl ScmController {
     /// Create a new SCM controller with the given configuration.
     pub fn new(config: ScmConfig) -> Self {
-        let memory_size = (config.memory_mb as usize).max(256) * 1024 * 1024;
+        let guest_memory_size = (config.memory_mb.clamp(MIN_GUEST_MEMORY_MB, MAX_GUEST_MEMORY_MB)
+            as usize)
+            * 1024
+            * 1024;
         Self {
             vm_state: VmState::Stopped,
             virtio_gpu: VirtioGpu {
@@ -2573,9 +3026,11 @@ impl ScmController {
                 connected: false,
             },
             kernel_shim: WindowsKernelShim::new(config.secure_boot),
-            guest_memory: vec![0u8; memory_size],
+            guest_memory: Vec::new(),
             uptime_seconds: 0,
             total_instructions: 0,
+            guest_memory_size,
+            last_tick: None,
             config,
         }
     }
@@ -2587,6 +3042,15 @@ impl ScmController {
                 ReasonCode::RcInvalidState,
                 "SCM: VM is already running",
             ));
+        }
+
+        if self.guest_memory.is_empty() {
+            let mut memory = Vec::new();
+            memory.try_reserve_exact(self.guest_memory_size).map_err(|_| {
+                AppError::oom("SCM: failed to allocate guest memory")
+            })?;
+            memory.resize(self.guest_memory_size, 0);
+            self.guest_memory = memory;
         }
 
         self.load_kernel_shim()?;
@@ -2605,6 +3069,7 @@ impl ScmController {
 
         self.vm_state = VmState::Running;
         self.uptime_seconds = 0;
+        self.last_tick = Some(std::time::Instant::now());
 
         Ok(())
     }
@@ -2712,22 +3177,54 @@ impl ScmController {
         Ok(())
     }
 
-    /// Write to virtio-gpu framebuffer (called by guest display driver)
-    pub fn write_framebuffer(&mut self, x: u32, y: u32, width: u32, height: u32, pixels: &[u8]) {
-        let fb_width = self.virtio_gpu.framebuffer_width;
-        for row in 0..height.min(self.virtio_gpu.framebuffer_height - y) {
-            let src_start = (row * width * 4) as usize;
-            let src_end = src_start + (width as usize * 4).min(pixels.len() - src_start);
-            let dst_start = ((y + row) * fb_width + x) as usize * 4;
-            let dst_end =
-                dst_start + (width as usize * 4).min(self.virtio_gpu.framebuffer.len() - dst_start);
+    /// Write to virtio-gpu framebuffer (called by guest display driver).
+    ///
+    /// Guest-supplied coordinates are clamped to the framebuffer and all
+    /// offsets are computed with checked arithmetic; an undersized pixel
+    /// buffer is rejected with an error instead of slicing out of bounds.
+    pub fn write_framebuffer(
+        &mut self,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        pixels: &[u8],
+    ) -> AppResult<()> {
+        let fb_width = self.virtio_gpu.framebuffer_width as usize;
+        let fb_height = self.virtio_gpu.framebuffer_height as usize;
+        let x = x as usize;
+        let y = y as usize;
+        let width = width as usize;
+        let height = height as usize;
 
-            if src_end > src_start && dst_end > dst_start {
-                let copy_len = dst_end - dst_start;
-                self.virtio_gpu.framebuffer[dst_start..dst_end]
-                    .copy_from_slice(&pixels[src_start..src_start + copy_len]);
-            }
+        if x >= fb_width || y >= fb_height || width == 0 || height == 0 {
+            return Ok(());
         }
+
+        let width = width.min(fb_width - x);
+        let height = height.min(fb_height - y);
+        let row_bytes = width * 4;
+        let total_bytes = row_bytes.checked_mul(height).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcBufferLimitExceeded,
+                "SCM: framebuffer write range overflow",
+            )
+        })?;
+        if total_bytes > pixels.len() {
+            return Err(AppError::new(
+                ReasonCode::RcBufferLimitExceeded,
+                "SCM: framebuffer pixel data too small",
+            ));
+        }
+
+        for row in 0..height {
+            let src_start = row * row_bytes;
+            let dst_start = ((y + row) * fb_width + x) * 4;
+            self.virtio_gpu.framebuffer[dst_start..dst_start + row_bytes]
+                .copy_from_slice(&pixels[src_start..src_start + row_bytes]);
+        }
+
+        Ok(())
     }
 
     /// Read virtio-gpu framebuffer (for display output)
@@ -2735,19 +3232,45 @@ impl ScmController {
         &self.virtio_gpu.framebuffer
     }
 
-    /// Tick the VM — advance simulation by one time quantum
+    /// Tick the VM — advance simulation by one time quantum.
+    ///
+    /// Also advances `uptime_seconds` from the wall clock.
     pub fn tick(&mut self) {
         if self.vm_state == VmState::Running {
             self.total_instructions += 1000;
+            let now = std::time::Instant::now();
+            if let Some(prev) = self.last_tick {
+                self.uptime_seconds = self
+                    .uptime_seconds
+                    .saturating_add(now.duration_since(prev).as_secs());
+            }
+            self.last_tick = Some(now);
         }
     }
 
-    /// Satisfy an integrity check request from guest driver
-    pub fn satisfy_integrity_check(&self, address: u64, _expected_hash: &[u8]) -> bool {
-        if address < self.kernel_shim.ntoskrnl_base {
+    /// Satisfy an integrity check request from guest driver.
+    ///
+    /// Computes the SHA-256 digest of the simulated guest memory region
+    /// starting at `address` (relative to the ntoskrnl base) and returns
+    /// `true` only when it matches `expected_hash`. Out-of-range addresses and
+    /// malformed hashes fail the check instead of silently passing.
+    pub fn satisfy_integrity_check(&self, address: u64, expected_hash: &[u8]) -> bool {
+        let base = self.kernel_shim.ntoskrnl_base;
+        if address < base {
             return false;
         }
-        true
+        let offset = (address - base) as usize;
+        if offset >= self.guest_memory.len() {
+            return false;
+        }
+        if expected_hash.len() != 32 {
+            return false;
+        }
+
+        let mut hasher = Sha256::new();
+        hasher.update(&self.guest_memory[offset..]);
+        let digest = hasher.finalize();
+        digest.as_slice() == expected_hash
     }
 
     /// Report whether secure boot is active (for anti-cheat queries)
@@ -2837,7 +3360,19 @@ impl ScmRunnerIntegration {
     }
 
     /// Full VM launch sequence.
+    ///
+    /// Rejects re-entry while a VM is already running so a second call cannot
+    /// silently drop (and orphan) the running VM handle. If a later step of
+    /// the sequence fails, the already-started VM is stopped before the error
+    /// propagates.
     pub fn launch_vm(&mut self) -> AppResult<()> {
+        if self.vm_handle.is_some() || self.controller.vm_state == VmState::Running {
+            return Err(AppError::new(
+                ReasonCode::RcInvalidState,
+                "SCM: VM is already running",
+            ));
+        }
+
         let arm_config = Arm64VmConfig {
             cpu_count: self.controller.config.cpu_count,
             memory_mb: self.controller.config.memory_mb,
@@ -2864,18 +3399,34 @@ impl ScmRunnerIntegration {
         let mut vm_handle = create_vz_virtual_machine(&vz_config)?;
         vm_handle.start()?;
 
-        if let Some(ref mut net) = self.net_bridge {
-            net.connected = true;
-        }
-        if let Some(ref mut fs) = self.fs_bridge {
-            fs.mounted = true;
+        // Validate the secure-boot configuration as part of the launch
+        // sequence (the VZ-level EFI wiring is done in create_vz_virtual_machine).
+        if let Some(ref sb) = self.secure_boot {
+            configure_secure_boot(sb)?;
         }
 
-        self.controller.start_vm()?;
+        let launch_result = (|| -> AppResult<()> {
+            if let Some(ref mut net) = self.net_bridge {
+                net.connected = true;
+            }
+            if let Some(ref mut fs) = self.fs_bridge {
+                fs.mounted = true;
+            }
 
-        if let Some(ref mut ml) = self.measured_launch {
-            let kernel_measurement = measure_component("ntoskrnl", &[0u8; 32])?;
-            extend_pcr(ml, 0, &kernel_measurement)?;
+            self.controller.start_vm()?;
+
+            if let Some(ref mut ml) = self.measured_launch {
+                let kernel_measurement = measure_component("ntoskrnl", &[0u8; 32])?;
+                extend_pcr(ml, 0, &kernel_measurement)?;
+            }
+            Ok(())
+        })();
+
+        if let Err(e) = launch_result {
+            // The guest is already running; shut it down before failing so
+            // the VM handle is not leaked in a running state.
+            let _ = vm_handle.stop();
+            return Err(e);
         }
 
         self.vm_handle = Some(vm_handle);
@@ -2915,11 +3466,15 @@ impl ScmRunnerIntegration {
             gpu.flush_to_metal()?;
         }
 
-        if let Some(ref mut net) = self.net_bridge {
-            if !net.tx_buffer.is_empty() {
-                let tx_data = std::mem::take(&mut net.tx_buffer);
-                net.rx_buffer.extend(tx_data);
-            }
+        // Loop TX back into the guest's RX queue, bounded so a guest that
+        // never reads cannot grow the RX buffer without limit.
+        if let Some(ref mut net) = self
+            .net_bridge
+            .as_mut()
+            .filter(|net| !net.tx_buffer.is_empty())
+        {
+            let tx_data = std::mem::take(&mut net.tx_buffer);
+            net.enqueue_rx(&tx_data);
         }
 
         self.controller.tick();
@@ -3038,7 +3593,9 @@ mod tests {
         controller.start_vm().unwrap();
 
         let pixels = vec![0xFF; 640 * 480 * 4];
-        controller.write_framebuffer(0, 0, 640, 480, &pixels);
+        controller
+            .write_framebuffer(0, 0, 640, 480, &pixels)
+            .expect("write framebuffer");
 
         let fb = controller.read_framebuffer();
         assert_eq!(fb[0], 0xFF);
@@ -3105,6 +3662,8 @@ mod tests {
             .devices
             .iter()
             .any(|d| matches!(d, VZDeviceConfiguration::VirtioNet { .. }));
+        // A Null serial handler adds no serial device (a bare serial config
+        // without an attachment fails VZ validation).
         let has_serial = vz_config
             .devices
             .iter()
@@ -3117,9 +3676,9 @@ mod tests {
         assert!(has_gpu, "VirtioGpu device should be present");
         assert!(has_fs, "VirtioFs device should be present");
         assert!(has_net, "VirtioNet device should be present");
-        assert!(has_serial, "SerialPort device should be present");
+        assert!(!has_serial, "Null serial handler should add no device");
         assert!(has_entropy, "Entropy device should be present");
-        assert_eq!(vz_config.devices.len(), 5);
+        assert_eq!(vz_config.devices.len(), 4);
     }
 
     #[test]
@@ -3175,6 +3734,17 @@ mod tests {
         assert_eq!(bytes_read, 11);
         assert_eq!(&buffer[..11], b"hello world");
 
+        let new_pos = bridge.seek(handle, -5, 0);
+        assert!(new_pos.is_err(), "negative SEEK_SET must fail");
+
+        let new_pos = bridge.seek(handle, 6, 0).expect("seek to 6");
+        assert_eq!(new_pos, 6);
+
+        let mut buffer2 = vec![0u8; 64];
+        let bytes_read = bridge.read(handle, &mut buffer2).expect("read after seek");
+        assert_eq!(bytes_read, 5);
+        assert_eq!(&buffer2[..5], b"world");
+
         bridge.close(handle).expect("close file");
         let _result = bridge.read(handle, &mut buffer);
         assert!(_result.is_err(), "expected Err, got {_result:?}");
@@ -3199,6 +3769,106 @@ mod tests {
 
         let entries = bridge.readdir(".").expect("readdir after unlink");
         assert!(!entries.contains(&"subdir".to_string()));
+    }
+
+    #[test]
+    fn virtio_fs_bridge_rejects_path_traversal() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let dir_path = dir.path().to_str().unwrap();
+
+        let mut bridge = VirtioFsBridge::new(dir_path, "casa1-shared");
+
+        for evil in [
+            "../escape",
+            "../../etc/passwd",
+            "/../../etc/passwd",
+            "a/../../b",
+            "..",
+            "sub/..",
+        ] {
+            assert!(
+                bridge.stat(evil).is_err(),
+                "traversal path must be rejected: {evil}"
+            );
+            assert!(
+                bridge.open(evil, 0).is_err(),
+                "traversal open must be rejected: {evil}"
+            );
+        }
+
+        // NUL bytes must be rejected too.
+        assert!(bridge.stat("bad\0path").is_err());
+        assert!(bridge.mkdir("bad\0path").is_err());
+        assert!(bridge.unlink("bad\0path").is_err());
+    }
+
+    #[test]
+    fn virtio_fs_bridge_write_pins_handle() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let dir_path = dir.path().to_str().unwrap();
+
+        let file_path = dir.path().join("out.txt");
+        std::fs::File::create(&file_path).unwrap();
+
+        let mut bridge = VirtioFsBridge::new(dir_path, "casa1-shared");
+        let handle = bridge.open("out.txt", 0o2).expect("open for writing");
+
+        bridge.write(handle, b"abc").expect("write");
+        bridge.write(handle, b"def").expect("write");
+        bridge.seek(handle, 0, 0).expect("seek to start");
+
+        let mut buffer = vec![0u8; 64];
+        let bytes_read = bridge.read(handle, &mut buffer).expect("read");
+        assert_eq!(bytes_read, 6);
+        assert_eq!(&buffer[..6], b"abcdef");
+    }
+
+    #[test]
+    fn scm_write_framebuffer_rejects_oob_input() {
+        let mut controller = ScmController::new(ScmConfig {
+            enabled: true,
+            ..Default::default()
+        });
+
+        // A single malicious call must not panic (coordinates are clamped).
+        let big_pixels = vec![0u8; 1280 * 720 * 4];
+        assert!(
+            controller
+                .write_framebuffer(0, 1000, 100, 100, &big_pixels)
+                .is_ok(),
+            "y beyond framebuffer is clamped away"
+        );
+        assert!(
+            controller
+                .write_framebuffer(1280, 719, 1, 1, &big_pixels)
+                .is_ok(),
+            "x at the right edge is clamped away"
+        );
+        assert!(
+            controller
+                .write_framebuffer(u32::MAX, u32::MAX, u32::MAX, u32::MAX, &big_pixels)
+                .is_ok(),
+            "huge coordinates are clamped away"
+        );
+        assert!(
+            controller
+                .write_framebuffer(0, 0, 100, 100, &[0u8; 10])
+                .is_err(),
+            "undersized pixel buffer must error"
+        );
+    }
+
+    #[test]
+    fn scm_launch_vm_rejects_reentry() {
+        let mut integration = ScmRunnerIntegration::new(ScmConfig {
+            enabled: true,
+            ..Default::default()
+        });
+
+        integration.launch_vm().expect("first launch");
+        let second = integration.launch_vm();
+        assert!(second.is_err(), "second launch must be rejected");
+        integration.shutdown_vm().expect("shutdown");
     }
 
     #[test]
@@ -3382,9 +4052,9 @@ mod tests {
     fn windows_kernel_shim_dpc_queue() {
         let mut shim = WindowsKernelShim::new(false);
 
-        shim.queue_dpc(0xDEADBEEF, 0x1000, 0x2000);
-        shim.queue_dpc(0xCAFEBABE, 0x3000, 0x4000);
-        shim.queue_dpc(0x12345678, 0x5000, 0x6000);
+        shim.queue_dpc(0xDEADBEEF, 0x1000, 0x2000).expect("queue DPC 1");
+        shim.queue_dpc(0xCAFEBABE, 0x3000, 0x4000).expect("queue DPC 2");
+        shim.queue_dpc(0x12345678, 0x5000, 0x6000).expect("queue DPC 3");
 
         assert_eq!(shim.dpc_queue.len(), 3);
 
