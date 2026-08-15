@@ -9,6 +9,10 @@
 //!
 //! No external dependencies are required – this is a pure‑Rust software renderer.
 
+// The software-rasterizer entry points mirror the GDI+ API surface, which has
+// many parameters by design; keep the public signatures intact.
+#![allow(clippy::too_many_arguments)]
+
 use crate::user32::{
     GDIPLUS_COMPOSITING_MODE_SOURCE_COPY, GDIPLUS_COMPOSITING_MODE_SOURCE_OVER,
     GDIPLUS_SMOOTHING_MODE_ANTI_ALIAS, GDIPLUS_SMOOTHING_MODE_HIGH_QUALITY,
@@ -97,8 +101,15 @@ pub fn put_pixel(
     if x < 0 || y < 0 || x >= width as i32 || y >= height as i32 {
         return;
     }
-    let idx = (y as i32 * stride) + (x as i32 * 4);
-    if idx < 0 || idx + 3 >= pixels.len() as i32 {
+    // Negative strides (bottom-up DIBs) store row 0 at the bottom, so flip the
+    // row index. i64 arithmetic keeps the offset from overflowing.
+    let row = if stride < 0 {
+        (height as i64 - 1 - y as i64) * stride as i64
+    } else {
+        y as i64 * stride as i64
+    };
+    let idx = row.saturating_add(x as i64 * 4);
+    if idx < 0 || idx.saturating_add(3) >= pixels.len() as i64 {
         return;
     }
     let idx = idx as usize;
@@ -124,20 +135,6 @@ fn clamp_f32(v: f32) -> i32 {
     } else {
         v.round() as i32
     }
-}
-
-/// Return an (x, y, w, h) rectangle from the given ellipse bounds,
-/// clamping to integer pixels and the actual bitmap extents.
-fn clip_rect_for_bounds(x: f32, y: f32, w: f32, h: f32, bw: u32, bh: u32) -> (i32, i32, i32, i32) {
-    let x0 = x.min(x + w) as i32;
-    let y0 = y.min(y + h) as i32;
-    let x1 = x.max(x + w) as i32;
-    let y1 = y.max(y + h) as i32;
-    let cx0 = x0.max(0).min(bw as i32 - 1);
-    let cy0 = y0.max(0).min(bh as i32 - 1);
-    let cx1 = x1.max(0).min(bw as i32 - 1);
-    let cy1 = y1.max(0).min(bh as i32 - 1);
-    (cx0, cy0, cx1 - cx0 + 1, cy1 - cy0 + 1)
 }
 
 // ── Brush helpers ───────────────────────────────────────────────────────────
@@ -180,13 +177,18 @@ pub fn brush_color_at(
                 let u = wrap_coord(px, width, tb.wrap_mode);
                 let v = wrap_coord(py, height, tb.wrap_mode);
                 // GDI+ bitmaps are top-down ARGB in memory (byte order B,G,R,A).
-                // stride may be larger than width*4 for alignment.
-                let row_start = (v as i32) * stride;
+                // stride may be larger than width*4 for alignment; a negative
+                // stride means bottom-up storage, so flip the row index.
+                let row = if stride < 0 {
+                    (height as i64 - 1 - v as i64) * stride as i64
+                } else {
+                    v as i64 * stride as i64
+                };
                 let col = (u as usize) * 4;
-                if row_start < 0 || (row_start as usize + col + 3) >= pixels.len() {
+                if row < 0 || row.saturating_add(col as i64 + 3) >= pixels.len() as i64 {
                     return 0x00000000;
                 }
-                let idx = row_start as usize + col;
+                let idx = row as usize + col;
                 let b = pixels[idx] as u32;
                 let g = pixels[idx + 1] as u32;
                 let r = pixels[idx + 2] as u32;
@@ -560,7 +562,19 @@ pub fn fill_rect(
 
 // ── Ellipse drawing (midpoint algorithm) ────────────────────────────────────
 
+/// Maximum ellipse radius (pixels) used by the midpoint algorithm. Larger
+/// radii are clamped so the i64 accumulation can never overflow and the loop
+/// is guaranteed to terminate.
+const MAX_ELLIPSE_RADIUS: i64 = 32_768;
+
+/// Maximum pen width (pixels) for the outline loops.
+const MAX_PEN_WIDTH: f32 = 1024.0;
+
 /// Draw the outline of an ellipse using the midpoint algorithm.
+///
+/// All step arithmetic is done in `i64` (with `rx`/`ry` clamped) so that
+/// guest-supplied extents cannot overflow `i32` — which previously caused a
+/// debug panic and, in release builds, an infinite loop when `d1` wrapped.
 pub fn draw_ellipse(
     pixels: &mut [u8],
     width: u32,
@@ -577,17 +591,19 @@ pub fn draw_ellipse(
 ) {
     let cx = (x + w / 2.0).round() as i32;
     let cy = (y + h / 2.0).round() as i32;
-    let rx = (w / 2.0).max(1.0).round() as i32;
-    let ry = (h / 2.0).max(1.0).round() as i32;
-    let pw = pen_width.max(1.0).round() as i32;
+    let rx = ((w / 2.0).max(1.0).round() as i64).min(MAX_ELLIPSE_RADIUS);
+    let ry = ((h / 2.0).max(1.0).round() as i64).min(MAX_ELLIPSE_RADIUS);
+    let pw = pen_width.max(1.0).round().min(MAX_PEN_WIDTH) as i32;
 
-    let mut dx = 0;
-    let mut dy = ry;
-    let mut d1 = (ry * ry) - (rx * rx * ry) + (rx * rx) / 4;
-    let mut d2;
+    let rxrx = rx * rx;
+    let ryry = ry * ry;
+
+    let mut dx: i64 = 0;
+    let mut dy: i64 = ry;
+    let mut d1 = ryry - rxrx * ry + rxrx / 4;
 
     // Region 1
-    while dx * ry * ry < dy * rx * rx {
+    while dx * ryry < dy * rxrx {
         for wy in -(pw / 2)..=(pw / 2) {
             for wx in -(pw / 2)..=(pw / 2) {
                 put_pixel(
@@ -595,8 +611,8 @@ pub fn draw_ellipse(
                     width,
                     height,
                     stride,
-                    cx + dx + wx,
-                    cy + dy + wy,
+                    (cx as i64 + dx + wx as i64) as i32,
+                    (cy as i64 + dy + wy as i64) as i32,
                     color,
                     compositing_mode,
                 );
@@ -605,8 +621,8 @@ pub fn draw_ellipse(
                     width,
                     height,
                     stride,
-                    cx - dx + wx,
-                    cy + dy + wy,
+                    (cx as i64 - dx + wx as i64) as i32,
+                    (cy as i64 + dy + wy as i64) as i32,
                     color,
                     compositing_mode,
                 );
@@ -615,8 +631,8 @@ pub fn draw_ellipse(
                     width,
                     height,
                     stride,
-                    cx + dx + wx,
-                    cy - dy + wy,
+                    (cx as i64 + dx + wx as i64) as i32,
+                    (cy as i64 - dy + wy as i64) as i32,
                     color,
                     compositing_mode,
                 );
@@ -625,8 +641,8 @@ pub fn draw_ellipse(
                     width,
                     height,
                     stride,
-                    cx - dx + wx,
-                    cy - dy + wy,
+                    (cx as i64 - dx + wx as i64) as i32,
+                    (cy as i64 - dy + wy as i64) as i32,
                     color,
                     compositing_mode,
                 );
@@ -634,17 +650,18 @@ pub fn draw_ellipse(
         }
         if d1 < 0 {
             dx += 1;
-            d1 += 2 * ry * ry * dx + ry * ry;
+            d1 += 2 * ryry * dx + ryry;
         } else {
             dx += 1;
             dy -= 1;
-            d1 += 2 * ry * ry * dx - 2 * rx * rx * dy + ry * ry;
+            d1 += 2 * ryry * dx - 2 * rxrx * dy + ryry;
         }
     }
 
-    d2 = ((ry * ry) as f32 * (dx as f32 + 0.5) * (dx as f32 + 0.5)
-        + (rx * rx) as f32 * (dy as f32 - 1.0) * (dy as f32 - 1.0)
-        - (rx * rx * ry * ry) as f32) as i32;
+    let mut d2 = (ryry as f64 * (dx as f64 + 0.5) * (dx as f64 + 0.5)
+        + rxrx as f64 * (dy as f64 - 1.0) * (dy as f64 - 1.0)
+        - (rxrx * ryry) as f64)
+        .round() as i64;
     while dy >= 0 {
         for wy in -(pw / 2)..=(pw / 2) {
             for wx in -(pw / 2)..=(pw / 2) {
@@ -653,8 +670,8 @@ pub fn draw_ellipse(
                     width,
                     height,
                     stride,
-                    cx + dx + wx,
-                    cy + dy + wy,
+                    (cx as i64 + dx + wx as i64) as i32,
+                    (cy as i64 + dy + wy as i64) as i32,
                     color,
                     compositing_mode,
                 );
@@ -663,8 +680,8 @@ pub fn draw_ellipse(
                     width,
                     height,
                     stride,
-                    cx - dx + wx,
-                    cy + dy + wy,
+                    (cx as i64 - dx + wx as i64) as i32,
+                    (cy as i64 + dy + wy as i64) as i32,
                     color,
                     compositing_mode,
                 );
@@ -673,8 +690,8 @@ pub fn draw_ellipse(
                     width,
                     height,
                     stride,
-                    cx + dx + wx,
-                    cy - dy + wy,
+                    (cx as i64 + dx + wx as i64) as i32,
+                    (cy as i64 - dy + wy as i64) as i32,
                     color,
                     compositing_mode,
                 );
@@ -683,8 +700,8 @@ pub fn draw_ellipse(
                     width,
                     height,
                     stride,
-                    cx - dx + wx,
-                    cy - dy + wy,
+                    (cx as i64 - dx + wx as i64) as i32,
+                    (cy as i64 - dy + wy as i64) as i32,
                     color,
                     compositing_mode,
                 );
@@ -692,11 +709,11 @@ pub fn draw_ellipse(
         }
         if d2 > 0 {
             dy -= 1;
-            d2 -= 2 * rx * rx * dy + rx * rx;
+            d2 -= 2 * rxrx * dy + rxrx;
         } else {
             dy -= 1;
             dx += 1;
-            d2 += 2 * ry * ry * dx - 2 * rx * rx * dy + rx * rx;
+            d2 += 2 * ryry * dx - 2 * rxrx * dy + rxrx;
         }
     }
 }
@@ -746,6 +763,10 @@ pub fn fill_ellipse(
 
 /// Fill a convex or simple polygon using a scanline algorithm.
 /// `points` must be in order (either clockwise or counter‑clockwise).
+///
+/// Edge traversal uses `i64` arithmetic so that extreme-but-plausible guest
+/// coordinates cannot overflow `i32` (which previously filled wrong regions
+/// or panicked in debug builds).
 pub fn fill_polygon(
     pixels: &mut [u8],
     width: u32,
@@ -759,8 +780,8 @@ pub fn fill_polygon(
         return;
     }
 
-    // Build edge table
-    let mut edges: Vec<(i32, i32, i32, i32)> = Vec::new(); // (min_y, max_y, x_at_min_y, dx/dy)
+    // Build edge table: (min_y, max_y, x_at_min_y, dx/dy per scanline).
+    let mut edges: Vec<(i32, i32, i64, i64)> = Vec::new();
     for i in 0..points.len() {
         let j = (i + 1) % points.len();
         let p1 = &points[i];
@@ -776,7 +797,7 @@ pub fn fill_polygon(
             (y2, y1, p2.x, p1.x)
         };
         let dx = (x_at_y_max - x_at_y_min) / (y_max - y_min) as f32;
-        edges.push((y_min, y_max, x_at_y_min.round() as i32, dx as i32));
+        edges.push((y_min, y_max, x_at_y_min.round() as i64, dx as i64));
     }
 
     if edges.is_empty() {
@@ -795,8 +816,10 @@ pub fn fill_polygon(
         let mut intersections: Vec<i32> = Vec::new();
         for &(y_min, y_max, x_at_min, step) in &edges {
             if scan_y >= y_min && scan_y < y_max {
-                let x = x_at_min + step * (scan_y - y_min);
-                intersections.push(x);
+                // Saturating i64 arithmetic: extreme coordinates cannot panic
+                // here; out-of-range results are clamped to the bitmap.
+                let x = x_at_min.saturating_add(step.saturating_mul(scan_y as i64 - y_min as i64));
+                intersections.push(x.clamp(0, width as i64 - 1) as i32);
             }
         }
         intersections.sort_unstable();
@@ -834,7 +857,9 @@ fn arc_to_line_segments(
     sweep_angle: f32,
     is_pie: bool,
 ) -> Vec<GdiplusPointF> {
-    let segments = 64.max((sweep_angle.abs() * 0.5) as i32);
+    // Cap the segment count: `sweep_angle` is guest-controlled and a huge
+    // value would otherwise allocate an unbounded point vector (OOM/hang).
+    let segments = 64.max((sweep_angle.abs() * 0.5).min(4096.0) as i32);
     let step = sweep_angle.to_radians() / segments as f32;
     let start_rad = start_angle.to_radians();
 
@@ -848,9 +873,6 @@ fn arc_to_line_segments(
             x: cx + rx * angle.cos(),
             y: cy + ry * angle.sin(),
         });
-    }
-    if !is_pie {
-        // Include the ending point back if just an arc
     }
     pts
 }
@@ -1172,6 +1194,11 @@ pub fn draw_path(
 }
 
 /// Fill a path using the given colour (from a brush).
+///
+/// Each connected figure (separated by `StartFigure`/`CloseFigure`, or a
+/// self-contained closed element such as a rectangle, ellipse or pie) is
+/// filled on its own, so disjoint figures are never merged into one polygon
+/// (which produced spurious fills between unrelated shapes).
 pub fn fill_path(
     pixels: &mut [u8],
     width: u32,
@@ -1181,36 +1208,38 @@ pub fn fill_path(
     color: u32,
     compositing_mode: u32,
 ) {
-    // Collect all polygon points from the path for a simple fill.
-    let mut poly_points: Vec<GdiplusPointF> = Vec::new();
+    let mut figures: Vec<Vec<GdiplusPointF>> = Vec::new();
+    let mut current: Vec<GdiplusPointF> = Vec::new();
+
     for elem in &path.elements {
         match elem {
-            GdiplusPathElement::Line { x1, y1, x2, y2 } => {
-                poly_points.push(GdiplusPointF { x: *x1, y: *y1 });
-                poly_points.push(GdiplusPointF { x: *x2, y: *y2 });
+            GdiplusPathElement::StartFigure | GdiplusPathElement::CloseFigure => {
+                // Figure boundary: close off the accumulated points.
+                if !current.is_empty() {
+                    figures.push(std::mem::take(&mut current));
+                }
             }
+            GdiplusPathElement::Line { x1, y1, x2, y2 } => {
+                current.push(GdiplusPointF { x: *x1, y: *y1 });
+                current.push(GdiplusPointF { x: *x2, y: *y2 });
+            }
+            // Self-contained closed shapes form their own figure.
             GdiplusPathElement::Rectangle { x, y, w, h } => {
-                poly_points.push(GdiplusPointF { x: *x, y: *y });
-                poly_points.push(GdiplusPointF { x: *x + *w, y: *y });
-                poly_points.push(GdiplusPointF {
-                    x: *x + *w,
-                    y: *y + *h,
-                });
-                poly_points.push(GdiplusPointF { x: *x, y: *y + *h });
+                if !current.is_empty() {
+                    figures.push(std::mem::take(&mut current));
+                }
+                figures.push(vec![
+                    GdiplusPointF { x: *x, y: *y },
+                    GdiplusPointF { x: *x + *w, y: *y },
+                    GdiplusPointF { x: *x + *w, y: *y + *h },
+                    GdiplusPointF { x: *x, y: *y + *h },
+                ]);
             }
             GdiplusPathElement::Ellipse { x, y, w, h } => {
-                let cx = x + w / 2.0;
-                let cy = y + h / 2.0;
-                let rx = w / 2.0;
-                let ry = h / 2.0;
-                let segs = 32;
-                for s in 0..=segs {
-                    let a = 2.0 * std::f32::consts::PI * s as f32 / segs as f32;
-                    poly_points.push(GdiplusPointF {
-                        x: cx + rx * a.cos(),
-                        y: cy + ry * a.sin(),
-                    });
+                if !current.is_empty() {
+                    figures.push(std::mem::take(&mut current));
                 }
+                figures.push(ellipse_points(*x, *y, *w, *h));
             }
             GdiplusPathElement::Pie {
                 x,
@@ -1220,47 +1249,66 @@ pub fn fill_path(
                 start_angle,
                 sweep_angle,
             } => {
+                if !current.is_empty() {
+                    figures.push(std::mem::take(&mut current));
+                }
                 let cx = x + w / 2.0;
                 let cy = y + h / 2.0;
                 let rx = w / 2.0;
                 let ry = h / 2.0;
-                let pts = arc_to_line_segments(cx, cy, rx, ry, *start_angle, *sweep_angle, true);
-                poly_points.extend(pts);
+                figures.push(arc_to_line_segments(
+                    cx, cy, rx, ry, *start_angle, *sweep_angle, true,
+                ));
             }
-            GdiplusPathElement::Polygon { points } => {
-                poly_points.extend(points.iter().cloned());
-            }
-            GdiplusPathElement::Lines { points } => {
-                poly_points.extend(points.iter().cloned());
+            GdiplusPathElement::Polygon { points } | GdiplusPathElement::Lines { points } => {
+                current.extend(points.iter().cloned());
             }
             GdiplusPathElement::Bezier { points } => {
                 let segs = 32;
                 for s in 0..=segs {
                     let t = s as f32 / segs as f32;
-                    let p = eval_cubic_bezier(points, t);
-                    poly_points.push(p);
+                    current.push(eval_cubic_bezier(points, t));
                 }
             }
             GdiplusPathElement::Curve { points, tension: _ } => {
-                poly_points.extend(points.iter().cloned());
+                current.extend(points.iter().cloned());
             }
             GdiplusPathElement::ClosedCurve { points, tension: _ } => {
-                poly_points.extend(points.iter().cloned());
+                current.extend(points.iter().cloned());
             }
-            _ => {}
+            GdiplusPathElement::Arc { .. } | GdiplusPathElement::String { .. } => {
+                // Open arcs have no interior to fill; strings are not handled.
+            }
         }
     }
-    if poly_points.len() >= 3 {
-        fill_polygon(
-            pixels,
-            width,
-            height,
-            stride,
-            &poly_points,
-            color,
-            compositing_mode,
-        );
+    if !current.is_empty() {
+        figures.push(current);
     }
+
+    for figure in figures {
+        if figure.len() >= 3 {
+            fill_polygon(pixels, width, height, stride, &figure, color, compositing_mode);
+        }
+    }
+}
+
+/// Approximate an ellipse with 32 line segments (the scanline filler closes
+/// the loop back to the first point).
+fn ellipse_points(x: f32, y: f32, w: f32, h: f32) -> Vec<GdiplusPointF> {
+    let cx = x + w / 2.0;
+    let cy = y + h / 2.0;
+    let rx = w / 2.0;
+    let ry = h / 2.0;
+    let segs = 32;
+    let mut pts = Vec::with_capacity(segs as usize + 1);
+    for s in 0..=segs {
+        let a = 2.0 * std::f32::consts::PI * s as f32 / segs as f32;
+        pts.push(GdiplusPointF {
+            x: cx + rx * a.cos(),
+            y: cy + ry * a.sin(),
+        });
+    }
+    pts
 }
 
 /// Evaluate a cubic Bezier at parameter `t` (0..=1).
@@ -1297,10 +1345,17 @@ pub fn draw_image(
     let oy = clamp_f32(dy);
     for sy in 0..src_height as i32 {
         for sx in 0..src_width as i32 {
-            let src_idx = (sy * src_stride + sx * 4) as usize;
-            if src_idx + 3 >= src_pixels.len() {
+            // Negative source strides (bottom-up DIBs) flip the row index.
+            let src_row = if src_stride < 0 {
+                src_height as i64 - 1 - sy as i64
+            } else {
+                sy as i64
+            };
+            let src_off = src_row.saturating_mul(src_stride as i64) + sx as i64 * 4;
+            if src_off < 0 || src_off.saturating_add(3) >= src_pixels.len() as i64 {
                 continue;
             }
+            let src_idx = src_off as usize;
             let color = u32::from_le_bytes([
                 src_pixels[src_idx],
                 src_pixels[src_idx + 1],
@@ -1337,6 +1392,10 @@ pub fn draw_image_rect(
     dh: f32,
     compositing_mode: u32,
 ) {
+    // Zero-size sources would underflow the `src_width - 1` clamp below.
+    if src_width == 0 || src_height == 0 {
+        return;
+    }
     let ox = clamp_f32(dx);
     let oy = clamp_f32(dy);
     let ow = dw.max(1.0).round() as i32;
@@ -1348,10 +1407,17 @@ pub fn draw_image_rect(
                 (px as f32 / ow as f32 * src_width as f32).min((src_width - 1) as f32) as i32;
             let src_y =
                 (py as f32 / oh as f32 * src_height as f32).min((src_height - 1) as f32) as i32;
-            let src_idx = (src_y * src_stride + src_x * 4) as usize;
-            if src_idx + 3 >= src_pixels.len() {
+            // Negative source strides (bottom-up DIBs) flip the row index.
+            let src_row = if src_stride < 0 {
+                src_height as i64 - 1 - src_y as i64
+            } else {
+                src_y as i64
+            };
+            let src_off = src_row.saturating_mul(src_stride as i64) + src_x as i64 * 4;
+            if src_off < 0 || src_off.saturating_add(3) >= src_pixels.len() as i64 {
                 continue;
             }
+            let src_idx = src_off as usize;
             let color = u32::from_le_bytes([
                 src_pixels[src_idx],
                 src_pixels[src_idx + 1],
@@ -1394,7 +1460,9 @@ pub fn draw_string(
     let ox = clamp_f32(x);
     let oy = clamp_f32(y);
 
-    for (i, _) in text.char_indices() {
+    // Enumerate characters (not byte offsets): multi-byte UTF-8 must not
+    // produce over-wide spacing.
+    for (i, _) in text.chars().enumerate() {
         let cx = ox + (i as i32 * char_w);
         for py in oy..(oy + char_h) {
             for px in cx..(cx + char_w) {
@@ -1552,7 +1620,7 @@ mod tests {
             let stride = sstride;
             let mut v = vec![0u8; (stride * 3) as usize];
             // Set a pixel
-            let idx = (1 * stride + 1 * 4) as usize;
+            let idx = (stride + 4) as usize;
             v[idx..idx + 4].copy_from_slice(&0xFFFF0000u32.to_le_bytes());
             v
         };
@@ -1830,5 +1898,154 @@ mod tests {
             pixels.iter().all(|&b| b == 0),
             "out-of-bounds writes should be no-ops"
         );
+    }
+
+    #[test]
+    fn put_pixel_supports_negative_stride() {
+        // 2 rows, bottom-up storage: row 0 (y=0) lives at the *bottom*.
+        let stride = -8i32;
+        let mut pixels = vec![0u8; 16];
+        put_pixel(
+            &mut pixels,
+            2,
+            2,
+            stride,
+            1,
+            1,
+            0xFFFF0000,
+            GDIPLUS_COMPOSITING_MODE_SOURCE_COPY,
+        );
+        // y=1 (top row) with negative stride maps to row offset 0, x=1 → byte 4.
+        assert_eq!(
+            u32::from_le_bytes([pixels[4], pixels[5], pixels[6], pixels[7]]),
+            0xFFFF0000
+        );
+    }
+
+    #[test]
+    fn draw_ellipse_large_extents_do_not_overflow_or_hang() {
+        let (mut buf, stride) = make_buffer(64, 64);
+        // rx = ry = 1500 previously overflowed i32 (debug panic / release hang).
+        draw_ellipse(
+            &mut buf,
+            64,
+            64,
+            stride,
+            -5000.0,
+            -5000.0,
+            3000.0,
+            3000.0,
+            0xFFFF0000,
+            1.0,
+            GDIPLUS_COMPOSITING_MODE_SOURCE_COPY,
+            0,
+        );
+        // And with an absurd pen width the loop must still terminate.
+        draw_ellipse(
+            &mut buf,
+            64,
+            64,
+            stride,
+            5.0,
+            5.0,
+            20.0,
+            20.0,
+            0xFF00FF00,
+            1.0e9,
+            GDIPLUS_COMPOSITING_MODE_SOURCE_COPY,
+            0,
+        );
+    }
+
+    #[test]
+    fn fill_polygon_extreme_coordinates_do_not_panic() {
+        let (mut buf, stride) = make_buffer(32, 32);
+        let pts = vec![
+            GdiplusPointF { x: -1.0e9, y: -1.0e9 },
+            GdiplusPointF { x: 1.0e9, y: -1.0e9 },
+            GdiplusPointF { x: 0.0, y: 1.0e9 },
+        ];
+        fill_polygon(
+            &mut buf,
+            32,
+            32,
+            stride,
+            &pts,
+            0xFF0000FF,
+            GDIPLUS_COMPOSITING_MODE_SOURCE_COPY,
+        );
+    }
+
+    #[test]
+    fn draw_image_rect_zero_size_source_is_noop() {
+        let (mut dst, dstride) = make_buffer(8, 8);
+        let empty: Vec<u8> = Vec::new();
+        // src_width == 0 previously underflowed `src_width - 1` (debug panic).
+        draw_image_rect(
+            &mut dst,
+            8,
+            8,
+            dstride,
+            &empty,
+            0,
+            0,
+            0,
+            0.0,
+            0.0,
+            8.0,
+            8.0,
+            GDIPLUS_COMPOSITING_MODE_SOURCE_COPY,
+        );
+    }
+
+    #[test]
+    fn arc_segment_count_is_bounded() {
+        // A huge sweep angle previously produced ~2.1e9 segments (OOM).
+        let pts = arc_to_line_segments(0.0, 0.0, 10.0, 10.0, 0.0, 1.0e9, false);
+        assert!(
+            pts.len() <= 4097,
+            "arc segment count must be bounded, got {}",
+            pts.len()
+        );
+    }
+
+    #[test]
+    fn fill_path_fills_disjoint_figures_separately() {
+        let (mut buf, stride) = make_buffer(40, 40);
+        // Two disjoint triangles: filling them as one polygon would fill the
+        // area between them; filling them separately leaves the gap clear.
+        let path = GdiplusPath {
+            fill_mode: 0,
+            elements: vec![
+                crate::user32::GdiplusPathElement::Polygon {
+                    points: vec![
+                        GdiplusPointF { x: 2.0, y: 2.0 },
+                        GdiplusPointF { x: 10.0, y: 2.0 },
+                        GdiplusPointF { x: 6.0, y: 10.0 },
+                    ],
+                },
+                crate::user32::GdiplusPathElement::Polygon {
+                    points: vec![
+                        GdiplusPointF { x: 22.0, y: 22.0 },
+                        GdiplusPointF { x: 30.0, y: 22.0 },
+                        GdiplusPointF { x: 26.0, y: 30.0 },
+                    ],
+                },
+            ],
+        };
+        fill_path(
+            &mut buf,
+            40,
+            40,
+            stride,
+            &path,
+            0xFF0000FF,
+            GDIPLUS_COMPOSITING_MODE_SOURCE_COPY,
+        );
+        // Centres of both triangles are filled…
+        assert_eq!(get_pixel(&buf, stride, 6, 6), 0xFF0000FF);
+        assert_eq!(get_pixel(&buf, stride, 26, 26), 0xFF0000FF);
+        // …but the gap between them is not (a merged polygon would fill it).
+        assert_eq!(get_pixel(&buf, stride, 15, 15), 0x00000000);
     }
 }

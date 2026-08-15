@@ -50,8 +50,10 @@ fn semantic_to_msl_attribute(semantic: &str, index: u32) -> String {
         "SV_GROUPTHREADID" => "[[thread_position_in_threadgroup]]".to_string(),
         "SV_GROUPID" => "[[threadgroup_position_in_grid]]".to_string(),
         "SV_GROUPINDEX" => "[[thread_index_in_threadgroup]]".to_string(),
-        "SV_TESSFACTOR" => "[[patch(tess_level_inner)]]".to_string(),
-        "SV_INSIDETESSFACTOR" => "[[patch(tess_level_outer)]]".to_string(),
+        // HLSL SV_TessFactor = outer (edge) factors, SV_InsideTessFactor = inner;
+        // Metal tess_level_outer / tess_level_inner match respectively.
+        "SV_TESSFACTOR" => "[[patch(tess_level_outer)]]".to_string(),
+        "SV_INSIDETESSFACTOR" => "[[patch(tess_level_inner)]]".to_string(),
         "NORMAL" => {
             if index == 0 {
                 "[[user(normal0)]]".to_string()
@@ -67,30 +69,48 @@ fn semantic_to_msl_attribute(semantic: &str, index: u32) -> String {
     }
 }
 
+/// Map HLSL semantic names to MSL attributes for **vertex** `stage_in` members.
+///
+/// `[[position]]` (and the other output-only attributes) are not valid on a
+/// vertex function's stage-in struct; such inputs fall back to a user
+/// attribute so the generated shader still compiles.
+fn semantic_to_msl_vertex_input_attribute(semantic: &str, index: u32) -> String {
+    match semantic.to_uppercase().as_str() {
+        "SV_POSITION" | "SV_TARGET" | "SV_DEPTH" => {
+            format!("[[user({}_{index})]]", semantic.to_lowercase())
+        }
+        _ => semantic_to_msl_attribute(semantic, index),
+    }
+}
+
 /// Map HLSL types to MSL types.
-fn hlsl_type_to_msl(hlsl_type: &str) -> &'static str {
+///
+/// Unsupported types map to an MSL error comment rather than a silently wrong
+/// `float4` so that a bad type mapping fails loudly at MSL compile time instead
+/// of corrupting the shader's data layout.
+fn hlsl_type_to_msl(hlsl_type: &str) -> String {
     match hlsl_type {
-        "float" => "float",
-        "float2" => "float2",
-        "float3" => "float3",
-        "float4" => "float4",
-        "float3x3" => "float3x3",
-        "float4x4" => "float4x4",
-        "int" => "int",
-        "int2" => "int2",
-        "int3" => "int3",
-        "int4" => "int4",
-        "uint" => "uint",
-        "uint2" => "uint2",
-        "uint3" => "uint3",
-        "uint4" => "uint4",
-        "double" => "double",
-        "bool" => "bool",
-        "half" => "half",
-        "half2" => "half2",
-        "half3" => "half3",
-        "half4" => "half4",
-        _ => "float4",
+        "float" => "float".to_string(),
+        "float2" => "float2".to_string(),
+        "float3" => "float3".to_string(),
+        "float4" => "float4".to_string(),
+        "float3x3" => "float3x3".to_string(),
+        "float4x4" => "float4x4".to_string(),
+        "int" => "int".to_string(),
+        "int2" => "int2".to_string(),
+        "int3" => "int3".to_string(),
+        "int4" => "int4".to_string(),
+        "uint" => "uint".to_string(),
+        "uint2" => "uint2".to_string(),
+        "uint3" => "uint3".to_string(),
+        "uint4" => "uint4".to_string(),
+        "double" => "double".to_string(),
+        "bool" => "bool".to_string(),
+        "half" => "half".to_string(),
+        "half2" => "half2".to_string(),
+        "half3" => "half3".to_string(),
+        "half4" => "half4".to_string(),
+        _ => format!("// ERROR: unknown HLSL type '{hlsl_type}'"),
     }
 }
 
@@ -400,7 +420,11 @@ impl MslShaderGenerator {
             source.push_str(&format!("struct {} {{\n", struct_name));
             for input in &self.inputs {
                 let msl_type = hlsl_type_to_msl(&input.hlsl_type);
-                let attr = semantic_to_msl_attribute(&input.semantic, input.semantic_index);
+                let attr = if self.stage == ShaderStage::Vs {
+                    semantic_to_msl_vertex_input_attribute(&input.semantic, input.semantic_index)
+                } else {
+                    semantic_to_msl_attribute(&input.semantic, input.semantic_index)
+                };
                 source.push_str(&format!(
                     "    {} {} {};\n",
                     msl_type,
@@ -454,6 +478,11 @@ impl MslShaderGenerator {
         // Add instance ID if needed
         source.push_str(", uint instance_id [[instance_id]]");
 
+        // Add the input assembly stage-in (only when inputs are declared)
+        if !self.inputs.is_empty() {
+            source.push_str(", VertexInput in [[stage_in]]");
+        }
+
         // Add constant buffer arguments
         for cb in &self.constant_buffers {
             source.push_str(&format!(
@@ -491,15 +520,11 @@ impl MslShaderGenerator {
         source.push_str(") {\n");
         source.push_str("    VertexOutput out;\n");
 
-        // Generate pass-through for each output
-        for output in &self.outputs {
-            let msl_type = hlsl_type_to_msl(&output.hlsl_type);
-            source.push_str(&format!(
-                "    out.{} = {}(0);\n",
-                sanitize_name(&output.name),
-                msl_type
-            ));
-        }
+        // Pass through inputs to outputs (per semantic) or zero-fill
+        self.emit_output_init(source);
+
+        // Emit translated DXIL instruction body
+        self.emit_instruction_body(source);
 
         source.push_str("    return out;\n");
         source.push_str("}\n");
@@ -559,8 +584,34 @@ impl MslShaderGenerator {
         if has_outputs {
             source.push_str("    FragmentOutput out;\n");
 
-            // Generate pass-through for each output
-            for output in &self.outputs {
+            // Pass through inputs to outputs (per semantic) or zero-fill
+            self.emit_output_init(source);
+        }
+
+        // Emit translated DXIL instruction body
+        self.emit_instruction_body(source);
+
+        if has_outputs {
+            source.push_str("    return out;\n");
+        }
+        source.push_str("}\n");
+    }
+
+    /// Initialize each declared output member: pass through the matching
+    /// stage input (same semantic + index) where one exists, otherwise
+    /// zero-fill so every output is written at least once.
+    fn emit_output_init(&self, source: &mut String) {
+        for output in &self.outputs {
+            if let Some(input) = self.inputs.iter().find(|i| {
+                i.semantic.eq_ignore_ascii_case(&output.semantic)
+                    && i.semantic_index == output.semantic_index
+            }) {
+                source.push_str(&format!(
+                    "    out.{} = in.{};\n",
+                    sanitize_name(&output.name),
+                    sanitize_name(&input.name)
+                ));
+            } else {
                 let msl_type = hlsl_type_to_msl(&output.hlsl_type);
                 source.push_str(&format!(
                     "    out.{} = {}(0);\n",
@@ -568,10 +619,7 @@ impl MslShaderGenerator {
                     msl_type
                 ));
             }
-
-            source.push_str("    return out;\n");
         }
-        source.push_str("}\n");
     }
 
     /// Emit the body of translated DXIL instructions into the entry point.
@@ -714,7 +762,7 @@ impl MslShaderGenerator {
         // Primitive count (atomic counter for stream output)
         source.push_str("    device atomic_uint* _gs_prim_count [[buffer(3)]],\n");
         source.push_str("    uint3 gid [[thread_position_in_grid]]\n");
-        source.push_str(&format!(") {{\n"));
+        source.push_str(") {\n");
 
         // Declare per-invocation vertex attribute storage
         source.push_str("    // Per-invocation geometry shader vertex attributes\n");
@@ -724,13 +772,32 @@ impl MslShaderGenerator {
 
         // Load input primitive vertices
         source.push_str("    // Load input primitive vertices\n");
-        source.push_str(&format!("    uint _gs_prim_id = gid.x;\n"));
+        source.push_str("    uint _gs_prim_id = gid.x;\n");
+        let has_barriers = self.instructions.iter().any(|i| i.is_barrier);
+        if has_barriers {
+            // If the translated body contains barriers, every thread must reach
+            // them: out-of-range invocations are clamped to the last valid
+            // primitive instead of returning early (a barrier reached by only
+            // some threads is undefined behaviour in Metal and can hang the GPU).
+            source.push_str(&format!(
+                "    uint _gs_base = (_gs_vertex_count >= {}) ? min(_gs_prim_id * {}, _gs_vertex_count - {}) : 0;\n",
+                input_verts, input_verts, input_verts
+            ));
+            source.push_str(
+                "    // NOTE: body contains barriers, so out-of-range threads are clamped, not returned.\n",
+            );
+        } else {
+            source.push_str(&format!(
+                "    uint _gs_base = _gs_prim_id * {};\n",
+                input_verts
+            ));
+            source.push_str(&format!(
+                "    if (_gs_base + {} > _gs_vertex_count) return;\n\n",
+                input_verts
+            ));
+        }
         source.push_str(&format!(
-            "    uint _gs_base = _gs_prim_id * {};\n",
-            input_verts
-        ));
-        source.push_str(&format!(
-            "    if (_gs_base + {} > _gs_vertex_count) return;\n\n",
+            "    bool _gs_ok = (_gs_base + {} <= _gs_vertex_count);\n\n",
             input_verts
         ));
 
@@ -739,15 +806,17 @@ impl MslShaderGenerator {
 
         // Default: if no EmitVertex was called, emit a default vertex
         source.push_str("\n    // Default emit if no EmitVertex was called\n");
-        source.push_str("    uint _gs_out_idx = atomic_fetch_add_explicit(\n");
-        source.push_str("        _gs_prim_count, 1u, memory_order_relaxed);\n");
-        source.push_str("    if (_gs_out_idx < ");
+        source.push_str("    if (_gs_ok) {\n");
+        source.push_str("        uint _gs_out_idx = atomic_fetch_add_explicit(\n");
+        source.push_str("            _gs_prim_count, 1u, memory_order_relaxed);\n");
+        source.push_str("        if (_gs_out_idx < ");
         source.push_str(&max_vtx.to_string());
         source.push_str(") {\n");
-        source.push_str("        device float4* _gs_out = _gs_stream + _gs_out_idx * 3;\n");
-        source.push_str("        _gs_out[0] = _gs_position;\n");
-        source.push_str("        _gs_out[1] = _gs_normal;\n");
-        source.push_str("        _gs_out[2] = _gs_texcoord;\n");
+        source.push_str("            device float4* _gs_out = _gs_stream + _gs_out_idx * 3;\n");
+        source.push_str("            _gs_out[0] = _gs_position;\n");
+        source.push_str("            _gs_out[1] = float4(_gs_normal, 0.0);\n");
+        source.push_str("            _gs_out[2] = float4(_gs_texcoord, 0.0, 0.0);\n");
+        source.push_str("        }\n");
         source.push_str("    }\n");
 
         source.push_str("}\n");
@@ -802,8 +871,22 @@ impl MslShaderGenerator {
         source.push_str("    uint3 gid [[thread_position_in_grid]]\n");
         source.push_str(") {\n");
 
-        source.push_str("    uint _hs_cp_id = gid.x; // control point index\n");
-        source.push_str(&format!("    if (_hs_cp_id >= {}) return;\n\n", cp));
+        // Control point index. If the translated body contains barriers, all
+        // threads must reach them, so out-of-range invocations are clamped
+        // instead of returning early (divergent barriers are UB in Metal).
+        let has_barriers = self.instructions.iter().any(|i| i.is_barrier);
+        if has_barriers {
+            source.push_str(&format!(
+                "    uint _hs_cp_id = min(gid.x, {} - 1); // control point index (clamped)\n",
+                cp
+            ));
+            source.push_str(
+                "    // NOTE: body contains barriers, so out-of-range threads are clamped, not returned.\n\n",
+            );
+        } else {
+            source.push_str("    uint _hs_cp_id = gid.x; // control point index\n");
+            source.push_str(&format!("    if (_hs_cp_id >= {}) return;\n\n", cp));
+        }
 
         // ---- Tessellation factor computation (only thread 0) ----
         source.push_str("    // Compute tessellation factors (thread 0 only)\n");
@@ -826,18 +909,20 @@ impl MslShaderGenerator {
             partition_fn
         ));
         for i in 0..tess_factor_count.min(4) {
+            // Metal stores the triangle inside factor at index 3.
+            let label = if patch == PatchType::Triangle && i == 3 {
+                "inside factor (placeholder)".to_string()
+            } else {
+                format!("edge factor {} (placeholder)", i)
+            };
             source.push_str(&format!(
-                "        _hs_tess_factors[{}] = 1.0; // edge factor {}\n",
-                i, i
+                "        _hs_tess_factors[{}] = 1.0; // {}\n",
+                i, label
             ));
         }
         if tess_factor_count > 4 {
-            source.push_str(&format!(
-                "        _hs_tess_factors[4] = 1.0; // inside factor 0\n"
-            ));
-            source.push_str(&format!(
-                "        _hs_tess_factors[5] = 1.0; // inside factor 1\n"
-            ));
+            source.push_str("        _hs_tess_factors[4] = 1.0; // inside factor 0 (placeholder)\n");
+            source.push_str("        _hs_tess_factors[5] = 1.0; // inside factor 1 (placeholder)\n");
         }
         source.push_str("    }\n\n");
 
@@ -862,8 +947,11 @@ impl MslShaderGenerator {
 
         source.push_str(&format!("kernel void {}_ds(\n", self.entry_point));
 
-        // Tessellated vertex buffer (from fixed-function tessellator)
-        source.push_str("    device const float4* _ds_tessellated_vertices [[buffer(0)]],\n");
+        // Tessellated vertex buffer (from fixed-function tessellator).
+        // NOTE: not `const` — the generated body writes the tessellated
+        // position back into this buffer, and MSL rejects writes through a
+        // const-qualified pointer.
+        source.push_str("    device float4* _ds_tessellated_vertices [[buffer(0)]],\n");
 
         // Control point buffer (written by hull shader)
         source.push_str("    device const float4* _ds_control_points [[buffer(1)]],\n");
@@ -997,6 +1085,9 @@ impl ShaderCache {
 
     /// Look up a compiled shader by hash.
     pub fn get(&self, hash: &str) -> AppResult<Option<Vec<u8>>> {
+        if !is_valid_cache_hash(hash) {
+            return Ok(None);
+        }
         let path = self.cache_dir.join(format!("{hash}.metallib"));
         if path.exists() {
             let data = fs::read(&path).map_err(|e| {
@@ -1010,6 +1101,9 @@ impl ShaderCache {
 
     /// Store a compiled shader in the cache.
     pub fn put(&self, hash: &str, data: &[u8]) -> AppResult<()> {
+        if !is_valid_cache_hash(hash) {
+            return Err(invalid_cache_hash_error(hash));
+        }
         let path = self.cache_path(hash);
         fs::write(&path, data)
             .map_err(|e| AppError::new(ReasonCode::RcIo, format!("cannot write shader cache: {e}")))
@@ -1017,6 +1111,9 @@ impl ShaderCache {
 
     /// Look up generated MSL source by hash.
     pub fn get_source(&self, hash: &str) -> AppResult<Option<String>> {
+        if !is_valid_cache_hash(hash) {
+            return Ok(None);
+        }
         let path = self.cache_dir.join(format!("{hash}.msl"));
         if path.exists() {
             let source = fs::read_to_string(&path).map_err(|e| {
@@ -1033,6 +1130,9 @@ impl ShaderCache {
 
     /// Store generated MSL source in the cache.
     pub fn put_source(&self, hash: &str, source: &str) -> AppResult<()> {
+        if !is_valid_cache_hash(hash) {
+            return Err(invalid_cache_hash_error(hash));
+        }
         let path = self.cache_dir.join(format!("{hash}.msl"));
         fs::write(&path, source).map_err(|e| {
             AppError::new(
@@ -1052,6 +1152,20 @@ impl ShaderCache {
     }
 }
 
+/// Cache hashes are caller-supplied strings, so reject anything that is not a
+/// plain (lowercase) hex digest before joining it onto the cache directory:
+/// a hash containing `/` or `..` must not escape the cache directory.
+fn is_valid_cache_hash(hash: &str) -> bool {
+    !hash.is_empty() && hash.len() <= 64 && hash.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn invalid_cache_hash_error(hash: &str) -> AppError {
+    AppError::new(
+        ReasonCode::RcIo,
+        format!("invalid shader cache hash: {hash:?} (must be hex)"),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // HLSL intrinsic translation
 // ---------------------------------------------------------------------------
@@ -1060,7 +1174,9 @@ impl ShaderCache {
 pub fn translate_hlsl_intrinsic(name: &str) -> String {
     match name {
         // --- Math intrinsics ---
-        "mul" => "/* mul -> matrix multiply */".to_string(),
+        // HLSL `mul(a, b)` is matrix/vector multiplication, which MSL performs
+        // with the plain `*` operator (MSL has no mul() function).
+        "mul" => "*".to_string(),
         "dot" => "dot".to_string(),
         "cross" => "cross".to_string(),
         "normalize" => "normalize".to_string(),
@@ -1299,6 +1415,70 @@ mod tests {
         assert!(source.contains("sampler"));
     }
 
+    #[test]
+    fn vertex_shader_wires_stage_in_and_instructions() {
+        let mut generator = MslShaderGenerator::new(ShaderStage::Vs, "vs_main");
+        generator.add_input("position", "SV_POSITION", 0, "float4");
+        generator.add_input("uv", "TEXCOORD", 0, "float2");
+        generator.add_output("sv_position", "SV_POSITION", 0, "float4");
+        generator.add_output("uv", "TEXCOORD", 0, "float2");
+        generator.add_output("unused", "TEXCOORD", 1, "float3");
+        generator.set_instructions(vec![TranslatedInstruction {
+            msl_body: "_t0 = in.position;".to_string(),
+            dst: "_t0".to_string(),
+            operands: vec!["in.position".to_string()],
+            is_barrier: false,
+            barrier_flags: Vec::new(),
+            is_uav_access: false,
+            address_space: String::new(),
+            is_threadgroup_mem: false,
+        }]);
+
+        let source = generator.generate();
+        assert!(source.contains("VertexInput in [[stage_in]]"));
+        assert!(source.contains("out.sv_position = in.position;"));
+        assert!(source.contains("out.uv = in.uv;"));
+        assert!(source.contains("out.unused = float3(0);"));
+        assert!(source.contains("_t0 = in.position;"));
+        // SV_POSITION as a vertex *input* must not use [[position]] (output-only).
+        assert!(!source.contains("float4 position [[position]]"));
+        assert!(source.contains("float4 position [[user(sv_position_0)]]"));
+    }
+
+    #[test]
+    fn fragment_shader_wires_stage_in_and_instructions() {
+        let mut generator = MslShaderGenerator::new(ShaderStage::Ps, "ps_main");
+        generator.add_input("uv", "TEXCOORD", 0, "float2");
+        generator.add_output("uv_out", "TEXCOORD", 0, "float2");
+        generator.set_instructions(vec![TranslatedInstruction {
+            msl_body: "_c = in.uv;".to_string(),
+            dst: "_c".to_string(),
+            operands: vec!["in.uv".to_string()],
+            is_barrier: false,
+            barrier_flags: Vec::new(),
+            is_uav_access: false,
+            address_space: String::new(),
+            is_threadgroup_mem: false,
+        }]);
+
+        let source = generator.generate();
+        assert!(source.contains("FragmentInput in [[stage_in]]"));
+        assert!(source.contains("out.uv_out = in.uv;"));
+        assert!(source.contains("_c = in.uv;"));
+    }
+
+    #[test]
+    fn tessellation_semantics_map_to_matching_metal_patch_attributes() {
+        assert_eq!(
+            semantic_to_msl_attribute("SV_TESSFACTOR", 0),
+            "[[patch(tess_level_outer)]]"
+        );
+        assert_eq!(
+            semantic_to_msl_attribute("SV_INSIDETESSFACTOR", 0),
+            "[[patch(tess_level_inner)]]"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Compute shader tests (G4)
     // -----------------------------------------------------------------------
@@ -1473,6 +1653,49 @@ mod tests {
         assert!(source.contains("_t0 = _gs_position;"));
     }
 
+    #[test]
+    fn geometry_shader_with_barriers_clamps_instead_of_early_return() {
+        let mut g = MslShaderGenerator::new(ShaderStage::Gs, "gs_main");
+        g.set_max_vertex_count(32);
+        g.set_instructions(vec![TranslatedInstruction {
+            msl_body: String::new(),
+            dst: String::new(),
+            operands: Vec::new(),
+            is_barrier: true,
+            barrier_flags: vec!["mem_flags::mem_threadgroup".to_string()],
+            is_uav_access: false,
+            address_space: String::new(),
+            is_threadgroup_mem: false,
+        }]);
+        let source = g.generate();
+        // No early `return` may appear before the barrier, and the default emit
+        // must be guarded by the bounds flag.
+        assert!(!source.contains("if (_gs_base + 3 > _gs_vertex_count) return;"));
+        assert!(source.contains("min(_gs_prim_id * 3, _gs_vertex_count - 3)"));
+        assert!(source.contains("bool _gs_ok"));
+        assert!(source.contains("if (_gs_ok) {"));
+        // Default emit must write float4-typed values into the float4 stream.
+        assert!(source.contains("float4(_gs_normal, 0.0)"));
+        assert!(source.contains("float4(_gs_texcoord, 0.0, 0.0)"));
+    }
+
+    #[test]
+    fn geometry_shader_without_barriers_keeps_early_return() {
+        let mut g = MslShaderGenerator::new(ShaderStage::Gs, "gs_main");
+        g.set_max_vertex_count(32);
+        let source = g.generate();
+        assert!(source.contains("if (_gs_base + 3 > _gs_vertex_count) return;"));
+    }
+
+    #[test]
+    fn hull_shader_triangle_labels_inside_factor() {
+        let mut g = MslShaderGenerator::new(ShaderStage::Hs, "hs_main");
+        g.set_patch_control_points(3);
+        g.set_patch_type(PatchType::Triangle);
+        let source = g.generate();
+        assert!(source.contains("_hs_tess_factors[3] = 1.0; // inside factor (placeholder)"));
+    }
+
     // -----------------------------------------------------------------------
     // Hull shader tests (G5)
     // -----------------------------------------------------------------------
@@ -1568,6 +1791,12 @@ mod tests {
         assert!(source.contains("_ds_tessellated_vertices"));
         assert!(source.contains("_ds_control_points"));
         assert!(source.contains("_ds_tess_factors"));
+        // The tessellated-vertex buffer is written by the domain shader, so it
+        // must not be declared `const` (MSL rejects writes through const).
+        assert!(
+            !source.contains("device const float4* _ds_tessellated_vertices"),
+            "domain shader must write the tessellated vertex buffer"
+        );
     }
 
     #[test]
@@ -1708,7 +1937,10 @@ mod tests {
         assert_eq!(hlsl_type_to_msl("float4"), "float4");
         assert_eq!(hlsl_type_to_msl("float3x3"), "float3x3");
         assert_eq!(hlsl_type_to_msl("uint2"), "uint2");
-        assert_eq!(hlsl_type_to_msl("unknown"), "float4");
+        assert!(
+            hlsl_type_to_msl("unknown").contains("ERROR: unknown HLSL type"),
+            "unknown types must fail loudly, not silently map to float4"
+        );
     }
 
     #[test]
@@ -1720,6 +1952,7 @@ mod tests {
         assert_eq!(translate_hlsl_intrinsic("ddy"), "dfdy");
         assert_eq!(translate_hlsl_intrinsic("Sample"), "sample");
         assert_eq!(translate_hlsl_intrinsic("Load"), "read");
+        assert_eq!(translate_hlsl_intrinsic("mul"), "*");
         assert_eq!(translate_hlsl_intrinsic("WaveGetLaneIndex"), "simd_lane_id");
         assert_eq!(
             translate_hlsl_intrinsic("WaveGetLaneCount"),
@@ -1798,12 +2031,31 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let cache = ShaderCache::new(tmp.path().join("shaders")).unwrap();
 
-        let hash = "test_hash_1234";
+        let hash = "deadbeef1234abcd";
         let source = "#include <metal_stdlib>\nusing namespace metal;\n";
 
         cache.put_source(hash, source).unwrap();
         let cached = cache.get_source(hash).unwrap();
         assert_eq!(cached, Some(source.to_string()));
+    }
+
+    #[test]
+    fn shader_cache_rejects_path_traversal_hashes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache = ShaderCache::new(tmp.path().join("shaders")).unwrap();
+
+        // A hash containing separators or `..` must never touch the filesystem.
+        assert!(cache.get("../../etc/passwd").unwrap().is_none());
+        assert!(cache.get("a/b").unwrap().is_none());
+        assert!(cache.put("../escape", b"data").is_err());
+        assert!(cache.put_source("..%2F..%2Fescape", "source").is_err());
+
+        // The cache directory must not contain any files from the rejected hashes.
+        let entries: Vec<_> = fs::read_dir(cache.cache_dir())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert!(entries.is_empty(), "no files may be written for invalid hashes");
     }
 
     #[test]

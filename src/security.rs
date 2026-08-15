@@ -81,6 +81,10 @@ pub struct NetworkPolicyEnforcer {
     last_winsock_error: Option<i32>,
 }
 
+/// Maximum number of connection log entries retained per enforcer; the log is
+/// guest-driven and otherwise grows without bound over long sessions.
+const NETWORK_LOG_CAP: usize = 1024;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ParsedHttpRequest {
     pub method: String,
@@ -289,9 +293,14 @@ impl FilesystemSandbox {
                 format!("TOCTOU path swap denied: {requested_path}"),
             ));
         }
+        // Require a path boundary after the prefix so sibling directories
+        // sharing the root's name cannot pass as inside the sandbox.
+        let within_root = |path_lower: &str, root_lower: &str| {
+            path_lower == root_lower || path_lower.starts_with(&format!("{root_lower}/"))
+        };
         if is_sensitive_path(&before) {
-            if before.starts_with(&self.ge_root)
-                || self.allow_list.iter().any(|root| before.starts_with(root))
+            if within_root(&before, &self.ge_root)
+                || self.allow_list.iter().any(|root| within_root(&before, root))
             {
                 return Ok(AuthorizedPath {
                     canonical_path: after,
@@ -302,8 +311,8 @@ impl FilesystemSandbox {
                 format!("sensitive path denied: {requested_path}"),
             ));
         }
-        if before.starts_with(&self.ge_root)
-            || self.allow_list.iter().any(|root| before.starts_with(root))
+        if within_root(&before, &self.ge_root)
+            || self.allow_list.iter().any(|root| within_root(&before, root))
         {
             Ok(AuthorizedPath {
                 canonical_path: after,
@@ -339,6 +348,9 @@ impl NetworkPolicyEnforcer {
         };
         if !allowed {
             self.last_winsock_error = Some(WSAENETUNREACH);
+            if self.log.len() >= NETWORK_LOG_CAP {
+                self.log.remove(0);
+            }
             self.log.push(NetworkConnectLog {
                 host: host.to_string(),
                 ip: ip.to_string(),
@@ -352,6 +364,9 @@ impl NetworkPolicyEnforcer {
             .with_hint(format!("winsock_error={WSAENETUNREACH}")));
         }
         self.last_winsock_error = None;
+        if self.log.len() >= NETWORK_LOG_CAP {
+            self.log.remove(0);
+        }
         self.log.push(NetworkConnectLog {
             host: host.to_string(),
             ip: ip.to_string(),
@@ -671,7 +686,10 @@ fn sanitize_entitlement_xml(xml: &str) -> String {
         if let Some(end) = remainder[start..].find("?>") {
             remainder = &remainder[start + end + 2..];
         } else {
-            remainder = &remainder[..start];
+            // Unterminated processing instruction: drop the rest of the input.
+            // `remainder[..start]` was already appended above, so it must not
+            // be appended a second time.
+            remainder = "";
             break;
         }
     }
@@ -732,7 +750,11 @@ fn sandbox_canonicalize(path: &Path) -> AppResult<PathBuf> {
 /// 1. Rejects paths containing `..` or null bytes
 /// 2. Canonicalizes the path (resolving symlinks, `..`, case, Unicode)
 /// 3. Checks that the canonicalized path is within `ge_root` or the allow-list
-/// 4. Performs a TOCTOU check by comparing pre- and post-resolution paths
+///
+/// Callers that open files should additionally compare a pre-open and
+/// post-open `realpath` (see [`FilesystemSandbox::authorize`]) to close the
+/// symlink-swap TOCTOU window, which this function does not perform on its
+/// own.
 ///
 /// Returns the canonicalized, authorized path or an error.
 pub fn resolve_sandbox_path(
@@ -750,7 +772,7 @@ pub fn resolve_sandbox_path(
 
     // Reject path traversal with ..
     if requested_path
-        .split(|c: char| c == '/' || c == '\\')
+        .split(['/', '\\'])
         .any(|seg| seg == "..")
     {
         return Err(AppError::new(
@@ -771,13 +793,19 @@ pub fn resolve_sandbox_path(
     let canonical_lower = canonical_str.to_ascii_lowercase();
     let ge_root_lower = ge_root.to_string_lossy().to_ascii_lowercase();
 
-    if canonical_lower.starts_with(&ge_root_lower) {
+    // Require a path boundary after the prefix so sibling directories sharing
+    // the root's name (e.g. `/ge/root-evil`) cannot pass as inside the sandbox.
+    let within = |path_lower: &str, root_lower: &str| {
+        path_lower == root_lower || path_lower.starts_with(&format!("{root_lower}/"))
+    };
+
+    if within(&canonical_lower, &ge_root_lower) {
         allowed = true;
     }
     if !allowed {
         for allowed_root in allow_list {
             let allowed_lower = allowed_root.to_ascii_lowercase();
-            if canonical_lower.starts_with(&allowed_lower) {
+            if within(&canonical_lower, &allowed_lower) {
                 allowed = true;
                 break;
             }
@@ -826,14 +854,17 @@ fn tail_log_bytes(lines: &[String]) -> String {
 }
 
 fn redact_pii(line: &str) -> String {
-    let mut redacted = line.to_string();
-    if let Some(start) = redacted.find("/Users/") {
-        if let Some(end) = redacted[start + 7..].find('/') {
-            let prefix = &redacted[..start + 7];
-            let suffix = &redacted[start + 7 + end..];
-            redacted = format!("{prefix}<redacted>{suffix}");
-        }
-    }
+    let redacted = match line.find("/Users/") {
+        Some(start) => match line[start + 7..].find('/') {
+            Some(end) => {
+                let prefix = &line[..start + 7];
+                let suffix = &line[start + 7 + end..];
+                format!("{prefix}<redacted>{suffix}")
+            }
+            None => line.to_string(),
+        },
+        None => line.to_string(),
+    };
     redacted
         .split_whitespace()
         .map(|token| {
@@ -954,6 +985,9 @@ pub struct DenuvoEmulator {
     pub integrity_checks_failed: u64,
     /// Whether the license has been verified.
     pub license_verified: bool,
+    /// Guest base address of the loaded PE image (set by `initialize`).
+    #[serde(default)]
+    pub base: u64,
 }
 
 impl DenuvoEmulator {
@@ -975,6 +1009,7 @@ impl DenuvoEmulator {
             integrity_checks_passed: 0,
             integrity_checks_failed: 0,
             license_verified: false,
+            base: 0,
         }
     }
 
@@ -988,6 +1023,7 @@ impl DenuvoEmulator {
     /// # Errors
     /// Returns an error if any code section cannot be read from memory.
     pub fn initialize(&mut self, memory: &mut MemoryImage, base: u64) -> AppResult<()> {
+        self.base = base;
         for section in &mut self.config.code_sections {
             let abs_addr = base + section.rva;
             let data = memory.read_bytes(abs_addr, section.size as usize)?;
@@ -1051,7 +1087,9 @@ impl DenuvoEmulator {
             i
         };
 
-        let abs_addr = section.rva;
+        // The section lives at `base + rva` in guest memory; `initialize`
+        // captured the on-disk (encrypted) bytes into `section.decrypted`.
+        let abs_addr = self.base + section.rva;
         let mut data = section.decrypted.clone();
 
         // AES-128-CBC decrypt with PKCS7 padding
@@ -1101,7 +1139,9 @@ impl DenuvoEmulator {
                     format!("denuvo code section index {section_index} out of bounds"),
                 )
             })?;
-        let abs_addr = section.rva;
+        // Read the section from `base + rva` so integrity checks cover the
+        // same guest memory the decryption writes to.
+        let abs_addr = self.base + section.rva;
         let data = memory.read_bytes(abs_addr, section.size as usize)?;
         let current_hash = sha256_hash(&data);
         let matches = current_hash == section.original_hash;
@@ -1287,6 +1327,12 @@ pub struct SteamstubLoader {
 /// Steamstub magic number: "STUB" in ASCII.
 const STEAMSTUB_MAGIC: u32 = 0x53545542;
 
+impl Default for SteamstubLoader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SteamstubLoader {
     /// Creates a new `SteamstubLoader` in an unloaded state.
     pub fn new() -> Self {
@@ -1379,10 +1425,11 @@ impl SteamstubLoader {
             }
         }
         // Try to read magic at the end of the image
-        if let Ok(magic) = memory.read_u32(last_section_end) {
-            if magic == STEAMSTUB_MAGIC {
+        match memory.read_u32(last_section_end) {
+            Ok(magic) if magic == STEAMSTUB_MAGIC => {
                 return Self::parse_header_at(memory, last_section_end, 64);
             }
+            _ => {}
         }
 
         Ok(None)
@@ -1697,7 +1744,7 @@ impl SteamstubLoader {
             let iv = [0u8; 16];
             // Extract the payload, decrypt, then copy back
             let mut payload = data[payload_start..].to_vec();
-            if payload.len() % 16 == 0 {
+            if payload.len().is_multiple_of(16) {
                 Self::decrypt_aes(&mut payload, &aes_key, &iv)?;
             } else {
                 // Fallback: XOR decrypt if not AES-aligned
@@ -1879,28 +1926,38 @@ impl SteamstubLoader {
                 break;
             }
 
+            // Never extend past the output cap: clamp every copy to the
+            // remaining budget so a single large block cannot overshoot
+            // `max_size` (and later computations cannot underflow).
+            let remaining = max_size.saturating_sub(output.len());
+            if remaining == 0 {
+                break;
+            }
+
             match block_type {
                 0 => {
-                    // Raw block — copy directly
-                    output.extend_from_slice(&data[pos..pos + block_size]);
+                    // Raw block — copy directly, clamped to the budget.
+                    let copy_len = block_size.min(remaining);
+                    output.extend_from_slice(&data[pos..pos + copy_len]);
                 }
                 1 => {
-                    // RLE block — repeat single byte
+                    // RLE block — repeat single byte, clamped to the budget.
                     if block_size > 0 && pos < data.len() {
                         let byte = data[pos];
-                        output.extend(std::iter::repeat(byte).take(block_size));
+                        let copy_len = block_size.min(remaining);
+                        output.extend(std::iter::repeat_n(byte, copy_len));
                     }
                 }
                 2 => {
                     // Compressed block — use zstd block decompression
                     let block_data = &data[pos..pos + block_size];
-                    let decompressed =
-                        Self::decompress_zstd_block(block_data, max_size - output.len());
+                    let decompressed = Self::decompress_zstd_block(block_data, remaining);
                     match decompressed {
                         Ok(d) => output.extend_from_slice(&d),
                         Err(_) => {
-                            // Fallback: copy raw data
-                            output.extend_from_slice(block_data);
+                            // Fallback: copy raw data, clamped to the budget.
+                            let copy_len = block_data.len().min(remaining);
+                            output.extend_from_slice(&block_data[..copy_len]);
                         }
                     }
                 }
@@ -1996,10 +2053,12 @@ impl SteamstubLoader {
 
     /// Decompresses raw (unframed) zstd data using simple pattern matching.
     fn decompress_zstd_raw(data: &[u8], uncompressed_size: usize) -> AppResult<Vec<u8>> {
+        // The claimed size is attacker-controlled; clamp it so a crafted
+        // header cannot force an unbounded allocation.
         let max_size = if uncompressed_size > 0 {
-            uncompressed_size
+            uncompressed_size.min(16 * 1024 * 1024)
         } else {
-            data.len() * 4
+            16 * 1024 * 1024
         };
 
         let mut output = Vec::with_capacity(max_size.min(16 * 1024 * 1024));
@@ -2222,7 +2281,7 @@ impl SteamstubLoader {
     /// Returns an error if the data length is not a multiple of the AES block
     /// size (16 bytes) or the key length is invalid.
     pub fn decrypt_aes(data: &mut [u8], key: &[u8], iv: &[u8]) -> AppResult<()> {
-        if data.len() % 16 != 0 {
+        if !data.len().is_multiple_of(16) {
             return Err(AppError::new(
                 ReasonCode::RcDrmDecryptFailed,
                 "AES-CBC data length must be a multiple of 16 bytes",
@@ -2411,7 +2470,7 @@ impl PackedExeDetector {
         let e_lfanew =
             u32::from_le_bytes([pe_data[0x3C], pe_data[0x3D], pe_data[0x3E], pe_data[0x3F]])
                 as usize;
-        if pe_data.len() < e_lfanew + 6 {
+        if pe_data.len() < e_lfanew + 8 {
             return names;
         }
         let num_sections =
@@ -2854,10 +2913,13 @@ impl UpxUnpacker {
             AppError::new(ReasonCode::RcDrmDecryptFailed, "LZMA header parse error")
         })?);
 
+        // Bound the output independently of the attacker-claimed size field:
+        // a crafted header can claim a huge size and drive memory exhaustion
+        // if the cap is taken from it verbatim.
         let max_size = if uncompressed_size == u64::MAX {
             16 * 1024 * 1024
         } else {
-            uncompressed_size as usize
+            (uncompressed_size as usize).min(16 * 1024 * 1024)
         };
 
         let compressed = &data[13..];
@@ -2954,7 +3016,7 @@ impl<'a> RangeCoder<'a> {
         let bound = (self.range >> 11) * (*prob as u32);
         if self.code < bound {
             self.range = bound;
-            *prob += ((2048 - *prob) >> 5) as u16;
+            *prob += (2048 - *prob) >> 5;
             self.normalize();
             0
         } else {
@@ -3093,8 +3155,9 @@ impl<'a> LzmaDecoder<'a> {
         let mut symbol: u32 = 1;
 
         if self.state >= 7 {
-            // Matched literal: use match byte as context
-            let match_byte = if pos > self.rep0 as usize && (self.rep0 as usize) < pos {
+            // Matched literal: use match byte as context. A zero-distance
+            // reference is invalid per LZMA, so fall back to 0.
+            let match_byte = if self.rep0 != 0 && (self.rep0 as usize) < pos {
                 output[pos - 1 - self.rep0 as usize]
             } else {
                 0
@@ -3328,9 +3391,7 @@ impl<'a> LzmaDecoder<'a> {
                     length = Self::decode_length(&mut self.rc, &mut self.rep_len_codec, pos_state);
                 } else if self.rc.decode_bit(&mut self.is_rep_g1[self.state]) == 0 {
                     // rep1
-                    let temp = self.rep1;
-                    self.rep1 = self.rep0;
-                    self.rep0 = temp;
+                    std::mem::swap(&mut self.rep1, &mut self.rep0);
                     length = Self::decode_length(&mut self.rc, &mut self.rep_len_codec, pos_state);
                 } else if self.rc.decode_bit(&mut self.is_rep_g2[self.state]) == 0 {
                     // rep2
@@ -3403,6 +3464,12 @@ impl AsPackUnpacker {
         let e_lfanew =
             u32::from_le_bytes([pe_data[0x3C], pe_data[0x3D], pe_data[0x3E], pe_data[0x3F]])
                 as usize;
+        if pe_data.len() < e_lfanew + 24 {
+            return Err(AppError::new(
+                ReasonCode::RcPeParseInvalid,
+                "PE header truncated",
+            ));
+        }
         let num_sections =
             u16::from_le_bytes([pe_data[e_lfanew + 6], pe_data[e_lfanew + 7]]) as usize;
         let size_optional =
@@ -3561,8 +3628,16 @@ impl AsPackUnpacker {
                     pos += 1;
                     if full_offset > 0 && full_offset <= output.len() {
                         let start = output.len() - full_offset;
-                        output.push(output[start]);
-                        output.push(output[start + 1]);
+                        let first = output[start];
+                        output.push(first);
+                        // aPLib allows overlapping copies; with full_offset == 1
+                        // the second byte repeats the first.
+                        let second = if start + 1 < output.len() {
+                            output[start + 1]
+                        } else {
+                            first
+                        };
+                        output.push(second);
                     }
                 }
             } else if tag < 128 {
@@ -3691,6 +3766,10 @@ pub struct IntegrityCheckEmulator {
     next_region_id: u32,
 }
 
+/// Maximum number of integrity check results retained; checks are guest-driven
+/// and the history would otherwise grow without bound over long sessions.
+const CHECK_HISTORY_CAP: usize = 1024;
+
 impl IntegrityCheckEmulator {
     /// Creates a new `IntegrityCheckEmulator` with no registered regions.
     pub fn new() -> Self {
@@ -3702,7 +3781,15 @@ impl IntegrityCheckEmulator {
             next_region_id: 1,
         }
     }
+}
 
+impl Default for IntegrityCheckEmulator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl IntegrityCheckEmulator {
     /// Registers a memory region for integrity checking.
     pub fn register_region(&mut self, base: u64, size: u64, expected_hash: [u8; 32]) -> u32 {
         let id = self.next_region_id;
@@ -3759,6 +3846,9 @@ impl IntegrityCheckEmulator {
             computed_hash,
             timestamp,
         };
+        if self.check_history.len() >= CHECK_HISTORY_CAP {
+            self.check_history.remove(0);
+        }
         self.check_history.push(result.clone());
         Ok(result)
     }
@@ -3800,6 +3890,8 @@ impl IntegrityCheckEmulator {
     }
 }
 
+// ===========================================================================
+// 5. Anti-Debugging API Stubs
 // ===========================================================================
 // 5. Anti-Debugging API Stubs
 // ===========================================================================
@@ -3852,7 +3944,15 @@ impl AntiDebugState {
             ntdll_base: 0x7FFE_0000,
         }
     }
+}
 
+impl Default for AntiDebugState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AntiDebugState {
     /// Returns `false` to indicate no debugger is present.
     pub fn is_debugger_present(&self) -> bool {
         false
@@ -3925,15 +4025,27 @@ impl AntiDebugState {
     }
 
     /// Returns a monotonically increasing tick count.
+    ///
+    /// The counter increments by 30 ms per call and saturates instead of
+    /// wrapping to 0, so guest anti-debug code never observes time moving
+    /// backward mid-session.
     pub fn get_tick_count(&self) -> u32 {
         let prev = TICK_COUNTER.fetch_add(1, Ordering::Relaxed);
-        (prev + 30_000) as u32
+        prev
+            .saturating_add(1)
+            .saturating_mul(30_000)
+            .min(u32::MAX as u64) as u32
     }
 
     /// Returns a monotonically increasing performance counter value.
+    ///
+    /// The counter saturates instead of wrapping, so guest anti-debug code
+    /// never observes time moving backward mid-session.
     pub fn query_performance_counter(&self) -> u64 {
         let prev = PERF_COUNTER.fetch_add(1, Ordering::Relaxed);
-        prev * 100 + 1_000_000
+        prev.saturating_add(1)
+            .saturating_mul(100)
+            .saturating_add(1_000_000)
     }
 }
 
@@ -4142,15 +4254,20 @@ fn create_basic_x509_policy() -> core_foundation::base::CFTypeRef {
 /// Validate a DER-encoded X.509 certificate chain up to a system-trusted root
 /// using the macOS Security framework.
 ///
+/// `leaf_der` is the signer certificate; `chain_ders` are the additional
+/// certificates (intermediate CAs) embedded in the signature's certificate
+/// bag, which SecTrust needs to build the chain when the intermediates are
+/// not present in the local keychain.
+///
 /// Returns `Ok(())` if the certificate is trusted (chain leads to a trusted
 /// root, not expired, and optionally passes OCSP/CRL revocation checks).
-fn validate_certificate_chain(cert_der: &[u8]) -> Result<(), String> {
+fn validate_certificate_chain(leaf_der: &[u8], chain_ders: &[Vec<u8>]) -> Result<(), String> {
     use core_foundation::base::CFRelease;
 
     // SAFETY: CFRelease decrements the reference count of a valid CoreFoundation object
     unsafe {
         // 1. Create CFData from the DER bytes.
-        let cf_data = CFDataCreate(kCFAllocatorDefault, cert_der.as_ptr(), cert_der.len());
+        let cf_data = CFDataCreate(kCFAllocatorDefault, leaf_der.as_ptr(), leaf_der.len());
         if cf_data.is_null() {
             return Err("CFDataCreate failed".into());
         }
@@ -4169,17 +4286,37 @@ fn validate_certificate_chain(cert_der: &[u8]) -> Result<(), String> {
             return Err("SecPolicyCreateBasicX509 failed".into());
         }
 
-        // 4. Put the certificate in a CFArray.
-        let cert_ptr = cert_ref as *const c_void;
+        // 4. Put the leaf plus the embedded intermediates in a CFArray.
+        //    Track the created references so they can be released after the
+        //    trust object has retained them.
+        let mut cert_ptrs: Vec<*const c_void> = Vec::with_capacity(chain_ders.len() + 1);
+        let mut created: Vec<*const c_void> = Vec::with_capacity(chain_ders.len());
+        cert_ptrs.push(cert_ref as *const c_void);
+        for der in chain_ders {
+            let cf = CFDataCreate(kCFAllocatorDefault, der.as_ptr(), der.len());
+            if cf.is_null() {
+                continue;
+            }
+            let intermediate = SecCertificateCreateWithData(kCFAllocatorDefault, cf);
+            CFRelease(cf);
+            if intermediate.is_null() {
+                continue;
+            }
+            created.push(intermediate as *const c_void);
+            cert_ptrs.push(intermediate as *const c_void);
+        }
         let certs_array = CFArrayCreate(
             kCFAllocatorDefault,
-            &cert_ptr as *const *const c_void,
-            1,
+            cert_ptrs.as_ptr(),
+            cert_ptrs.len(),
             std::ptr::null(),
         );
         if certs_array.is_null() {
             CFRelease(policy);
             CFRelease(cert_ref as *const c_void);
+            for ptr in &created {
+                CFRelease(*ptr);
+            }
             return Err("CFArrayCreate failed".into());
         }
 
@@ -4190,6 +4327,9 @@ fn validate_certificate_chain(cert_der: &[u8]) -> Result<(), String> {
         CFRelease(certs_array);
         CFRelease(policy);
         CFRelease(cert_ref as *const c_void);
+        for ptr in &created {
+            CFRelease(*ptr);
+        }
 
         if os_status != 0 {
             return Err(format!(
@@ -4283,6 +4423,11 @@ fn validate_certificate_chain(cert_der: &[u8]) -> Result<(), String> {
                 CFRelease(trust as *const c_void);
                 return Err(reason);
             }
+            // Offline retry succeeded: release its error object (if any) so
+            // the success path below does not leak it.
+            if !error2.is_null() {
+                CFRelease(error2 as *const c_void);
+            }
         }
 
         if !error.is_null() {
@@ -4294,10 +4439,10 @@ fn validate_certificate_chain(cert_der: &[u8]) -> Result<(), String> {
         let mut result_type: SecTrustResultType = SecTrustResultType::Invalid;
         SecTrustGetTrustResult(trust, &mut result_type);
 
-        let ok = match result_type {
-            SecTrustResultType::Proceed | SecTrustResultType::Unspecified => true,
-            _ => false,
-        };
+        let ok = matches!(
+            result_type,
+            SecTrustResultType::Proceed | SecTrustResultType::Unspecified
+        );
 
         CFRelease(trust as *const c_void);
 
@@ -4386,13 +4531,11 @@ fn find_cert_by_subject_key_id<'a>(
             };
             // Manually search for the SubjectKeyIdentifier extension by OID.
             for ext in exts.iter() {
-                if ext.extn_id.to_string() == OID_SUBJECT_KEY_IDENTIFIER {
-                    // Decode the extension value as SubjectKeyIdentifier.
-                    if let Ok(skid) = SubjectKeyIdentifier::from_der(ext.extn_value.as_bytes()) {
-                        if skid.0.as_bytes() == ski_bytes {
-                            return Some(cert);
-                        }
-                    }
+                if ext.extn_id.to_string() == OID_SUBJECT_KEY_IDENTIFIER
+                    && let Ok(skid) = SubjectKeyIdentifier::from_der(ext.extn_value.as_bytes())
+                    && skid.0.as_bytes() == ski_bytes
+                {
+                    return Some(cert);
                 }
             }
         }
@@ -4739,18 +4882,23 @@ pub fn verify_pe_authenticode(pe_data: &[u8]) -> AuthenticodeVerdict {
         Ok(d) => d,
         Err(e) => return AuthenticodeVerdict::Invalid(format!("eContent re-encode failed: {e}")),
     };
-    // The value octets of SpcIndirectDataContent (tag/length stripped) are what
-    // the messageDigest signed attribute is computed over.
+    // Per RFC 5652 the eContent is a `[0] EXPLICIT OCTET STRING`; the `Any`
+    // value re-encodes the full OCTET STRING TLV. Real Authenticode signatures
+    // wrap `SpcIndirectDataContent` in that OCTET STRING, so unwrap it before
+    // parsing. The messageDigest signed attribute is computed over the full
+    // DER of `SpcIndirectDataContent` (SEQUENCE tag included), so the
+    // unwrapped bytes are used verbatim for hashing.
     let econtent_value = {
         let mut off = 0;
         match der_read_tlv(&econtent_full, &mut off) {
-            Some((0x30, start, len)) => econtent_full[start..start + len].to_vec(),
-            _ => return AuthenticodeVerdict::Invalid("eContent is not a SEQUENCE".into()),
+            Some((0x04, start, len)) => econtent_full[start..start + len].to_vec(),
+            Some((0x30, _, _)) => econtent_full,
+            _ => return AuthenticodeVerdict::Invalid("eContent is not an OCTET STRING".into()),
         }
     };
 
     // Extract the PE hash claimed by the signature and verify it against the file.
-    let (pe_hash_oid, claimed_pe_hash) = match parse_spc_indirect_data(&econtent_full) {
+    let (pe_hash_oid, claimed_pe_hash) = match parse_spc_indirect_data(&econtent_value) {
         Some(v) => v,
         None => return AuthenticodeVerdict::Invalid("malformed SpcIndirectData".into()),
     };
@@ -4872,7 +5020,18 @@ pub fn verify_pe_authenticode(pe_data: &[u8]) -> AuthenticodeVerdict {
     if let Some(signer_cert) = chain_validated_signer_cert {
         match signer_cert.to_der() {
             Ok(cert_der) => {
-                if let Err(e) = validate_certificate_chain(&cert_der) {
+                // Include the intermediate CAs embedded in the signature's
+                // certificate bag so SecTrust can build the chain even when
+                // they are not present in the local keychain.
+                let intermediates: Vec<Vec<u8>> = certs_vec
+                    .iter()
+                    .filter_map(|choice| match choice {
+                        cms::cert::CertificateChoices::Certificate(cert) => cert.to_der().ok(),
+                        _ => None,
+                    })
+                    .filter(|der| der != &cert_der)
+                    .collect();
+                if let Err(e) = validate_certificate_chain(&cert_der, &intermediates) {
                     return AuthenticodeVerdict::Invalid(format!("chain validation failed: {e}"));
                 }
             }
@@ -4899,12 +5058,11 @@ fn locate_signer_certificate(
     match &signer.sid {
         SignerIdentifier::IssuerAndSerialNumber(ias) => {
             for choice in certs.iter() {
-                if let CertificateChoices::Certificate(cert) = choice {
-                    if cert.tbs_certificate.issuer == ias.issuer
-                        && cert.tbs_certificate.serial_number == ias.serial_number
-                    {
-                        return Ok(Some(cert.clone()));
-                    }
+                if let CertificateChoices::Certificate(cert) = choice
+                    && cert.tbs_certificate.issuer == ias.issuer
+                    && cert.tbs_certificate.serial_number == ias.serial_number
+                {
+                    return Ok(Some(cert.clone()));
                 }
             }
             Ok(None)
@@ -4916,10 +5074,10 @@ fn locate_signer_certificate(
             if let Some(cert) = find_cert_by_subject_key_id(certs, ski_bytes) {
                 return Ok(Some(cert.clone()));
             }
-            // Fallback: return the first certificate (some signers are self-issued).
-            if let Some(CertificateChoices::Certificate(cert)) = certs.first() {
-                return Ok(Some(cert.clone()));
-            }
+            // No fallback: a SubjectKeyIdentifier that matches no certificate
+            // must not bind the signature to an arbitrary bag certificate,
+            // which would let the signer identity claimed by the PKCS#7 be
+            // replaced with an unrelated certificate.
             Ok(None)
         }
     }
@@ -4940,12 +5098,14 @@ fn extract_signing_message(
             // The messageDigest signed attribute must equal the hash of eContent.
             let mut message_digest: Option<Vec<u8>> = None;
             for attr in attrs.iter() {
-                if attr.oid.to_string() == OID_MESSAGE_DIGEST {
-                    if let Some(value) = attr.values.iter().next() {
-                        if let Ok(octets) = value.decode_as::<OctetString>() {
-                            message_digest = Some(octets.as_bytes().to_vec());
-                        }
-                    }
+                if attr.oid.to_string() != OID_MESSAGE_DIGEST {
+                    continue;
+                }
+                let Some(value) = attr.values.iter().next() else {
+                    continue;
+                };
+                if let Ok(octets) = value.decode_as::<OctetString>() {
+                    message_digest = Some(octets.as_bytes().to_vec());
                 }
             }
             let message_digest = match message_digest {
@@ -5182,10 +5342,13 @@ pub fn win_verify_trust(policy_guid: WinTrustPolicyGuid, pe_data: &[u8]) -> WinV
             }
         }
         WinTrustPolicyGuid::HttpsProvAction => {
-            // HTTPS verification — not applicable for PE files
+            // HTTPS certificate verification operates on a certificate chain
+            // context, not PE data; the provider cannot evaluate the input it
+            // was given. Reporting success here would make every guest
+            // certificate check observe "trusted", so fail closed instead.
             WinVerifyTrustResult {
-                error: win_trust_error::ERROR_SUCCESS,
-                description: "HTTPS provider: not applicable for PE files.".to_string(),
+                error: win_trust_error::TRUST_E_PROVIDER_UNKNOWN,
+                description: "HTTPS provider: subject type not supported by this provider.".to_string(),
                 verdict: None,
             }
         }
@@ -5290,7 +5453,7 @@ mod tests {
         let block_size = 16usize;
         let pad_len = block_size - (code.len() % block_size);
         let mut padded = code.clone();
-        padded.extend(std::iter::repeat(pad_len as u8).take(pad_len));
+        padded.extend(std::iter::repeat_n(pad_len as u8, pad_len));
         let ciphertext =
             crate::network::aes_128_cbc_encrypt(&aes_key, &iv, &padded).unwrap();
 
@@ -5302,6 +5465,68 @@ mod tests {
         assert!(emulator.state.code_sections_decrypted);
         let decrypted_data = memory.read_bytes(0x1000, code.len()).unwrap();
         assert_eq!(decrypted_data, code);
+    }
+
+    #[test]
+    fn denuvo_code_section_decrypt_nonzero_base() {
+        // Regression test: decryption and integrity verification must operate
+        // at `base + section.rva`, not at the bare RVA.
+        let base: u64 = 0x400_000;
+        let rva: u64 = 0x1000;
+        let code = vec![0x90, 0x90, 0x90, 0x90, 0xC3];
+        let config = DenuvoConfig {
+            version: DenuvoVersion::V5,
+            enabled: true,
+            integrity_check_interval_ms: 1000,
+            code_sections: vec![CodeSection {
+                rva,
+                size: code.len() as u32,
+                original_hash: [0u8; 32],
+                decrypted: Vec::new(),
+                encrypted: true,
+            }],
+            trigger_points: Vec::new(),
+        };
+        let mut emulator = DenuvoEmulator::new(config);
+        let mut memory = MemoryImage::default();
+        memory.map_bytes(base + rva, &code);
+        emulator.initialize(&mut memory, base).unwrap();
+        assert_eq!(emulator.base, base);
+
+        // Encrypt the plaintext with the same key derivation used internally.
+        let section = &emulator.config.code_sections[0];
+        let mut key_material = Vec::with_capacity(48);
+        key_material.extend_from_slice(&emulator.state.hardware_id);
+        key_material.extend_from_slice(&section.original_hash);
+        let derived = sha256_hash(&key_material);
+        let aes_key: [u8; 16] = {
+            let mut k = [0u8; 16];
+            k.copy_from_slice(&derived[..16]);
+            k
+        };
+        let iv: [u8; 16] = {
+            let mut i = [0u8; 16];
+            i.copy_from_slice(&derived[16..]);
+            i
+        };
+        let block_size = 16usize;
+        let pad_len = block_size - (code.len() % block_size);
+        let mut padded = code.clone();
+        padded.extend(std::iter::repeat_n(pad_len as u8, pad_len));
+        let ciphertext =
+            crate::network::aes_128_cbc_encrypt(&aes_key, &iv, &padded).unwrap();
+        emulator.config.code_sections[0].decrypted = ciphertext;
+
+        emulator.decrypt_code_section(&mut memory, 0).unwrap();
+        // Plaintext must land at base + rva, leaving the bare RVA untouched.
+        let decrypted_data = memory.read_bytes(base + rva, code.len()).unwrap();
+        assert_eq!(decrypted_data, code);
+        let bare_rva = memory.read_bytes(rva, code.len()).unwrap_or_default();
+        assert_ne!(bare_rva, code);
+
+        // Integrity check must pass against the same base + rva location.
+        let result = emulator.verify_integrity(&memory, 0).unwrap();
+        assert!(result);
     }
 
     #[test]
@@ -5468,10 +5693,7 @@ mod tests {
 
     #[test]
     fn upx_decompression() {
-        let mut compressed = Vec::new();
-        compressed.push(0x24);
-        compressed.push(0x1A);
-        compressed.push(0x40);
+        let compressed = vec![0x24, 0x1A, 0x40];
         let result = UpxUnpacker::decompress_nrv2b(&compressed);
         assert!(result.is_ok(), "expected Ok, got {result:?}");
         let decompressed = result.unwrap();
@@ -5692,7 +5914,7 @@ mod tests {
         ];
 
         // Chain validation should fail for a self-signed cert not in the system trust store.
-        let result = validate_certificate_chain(cert_der);
+        let result = validate_certificate_chain(cert_der, &[]);
         assert!(
             result.is_err(),
             "self-signed certificate should fail chain validation, got Ok(())"
@@ -6190,7 +6412,7 @@ mod tests {
     }
 
     /// Write a security data directory entry into a minimal PE.
-    fn write_cert_table(pe: &mut Vec<u8>, va: usize, size: usize) {
+    fn write_cert_table(pe: &mut [u8], va: usize, size: usize) {
         let pe_offset = read_u32_le(pe, 0x3C).unwrap_or(0x80) as usize;
         let opt = pe_offset + 4 + 20;
         let dd_start = opt + 96;
@@ -6662,7 +6884,10 @@ impl CertificateStore {
             2 => self.find_by_issuer(search_param),  // CERT_FIND_ISSUER_STR
             3 => self.find_by_serial(search_param),  // CERT_FIND_SERIAL_NUMBER
             4 => self.find_by_thumbprint(search_param), // CERT_FIND_SHA1_HASH
-            5 => self.find_by_serial(search_param),  // CERT_FIND_CERT_ID
+            // CERT_FIND_CERT_ID (5) matches a hash of issuer+serial, which
+            // `find_by_serial` does not implement. Return no results instead
+            // of silently producing wrong matches for an unsupported type.
+            5 => vec![],
             _ => vec![],                             // unsupported search type
         }
     }
@@ -6862,7 +7087,15 @@ impl CertificateStoreManager {
             next_handle: 1,
         }
     }
+}
 
+impl Default for CertificateStoreManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CertificateStoreManager {
     /// Open a certificate store by name. Creates it if it doesn't exist.
     pub fn open_store(&mut self, name: &str) -> u64 {
         // Check if store already exists
@@ -6909,11 +7142,12 @@ impl CertificateStoreManager {
     /// Add a certificate to a store. Returns the certificate handle.
     pub fn add_certificate(&mut self, store_handle: u64, der: &[u8]) -> Option<u64> {
         let cert = Certificate::from_der(der.to_vec())?;
+        // Fail (and do not consume a handle) when the store does not exist,
+        // instead of reporting success for a certificate that was never stored.
+        let store = self.stores.get_mut(&store_handle)?;
         let cert_handle = self.next_handle;
         self.next_handle += 1;
-        if let Some(store) = self.stores.get_mut(&store_handle) {
-            store.certificates.push(cert);
-        }
+        store.certificates.push(cert);
         Some(cert_handle)
     }
 
@@ -7293,6 +7527,11 @@ impl BCryptRuntime {
         // Generate key material using the appropriate algorithm
         let key_data = match alg_id {
             BCryptAlgorithmId::Rsa | BCryptAlgorithmId::RsaPss => {
+                // Sanity-cap the key size so a guest-requested value cannot
+                // drive a huge allocation (raw u32 bit size up to ~512 MiB).
+                if !(512..=16384).contains(&key_size_bits) || !key_size_bits.is_multiple_of(8) {
+                    return None;
+                }
                 // Generate a random RSA key placeholder
                 let mut key = vec![0u8; (key_size_bits / 8) as usize];
                 getrandom::getrandom(&mut key).ok()?;
@@ -7309,6 +7548,11 @@ impl BCryptRuntime {
                 key
             }
             BCryptAlgorithmId::Dh => {
+                // Sanity-cap the key size so a guest-requested value cannot
+                // drive a huge allocation.
+                if !(512..=16384).contains(&key_size_bits) || !key_size_bits.is_multiple_of(8) {
+                    return None;
+                }
                 let mut key = vec![0u8; (key_size_bits / 8) as usize];
                 getrandom::getrandom(&mut key).ok()?;
                 key
@@ -7368,18 +7612,35 @@ impl BCryptRuntime {
         let key = self.key_handles.get(&key_handle)?;
         match key.algorithm {
             BCryptAlgorithmId::AesCbc => {
-                use aes::Aes256;
-                use cbc::Encryptor;
                 use cipher::{BlockEncryptMut, KeyIvInit};
-                type Aes256CbcEnc = Encryptor<Aes256>;
-                let mut encryptor = Aes256CbcEnc::new_from_slices(&key.key_data, iv).ok()?;
+                if iv.len() != 16 {
+                    return None;
+                }
+                // Select the cipher from the actual key size so AES-128 keys
+                // (16 bytes) work instead of failing on the hardcoded AES-256.
                 let mut buf = plaintext.to_vec();
-                // PKCS7 padding
                 let pad_len = 16 - (buf.len() % 16);
-                buf.extend(std::iter::repeat(pad_len as u8).take(pad_len));
-                // Process in-place block by block
-                for chunk in buf.chunks_exact_mut(16) {
-                    encryptor.encrypt_block_mut(aes::Block::from_mut_slice(chunk));
+                buf.extend(std::iter::repeat_n(pad_len as u8, pad_len));
+                match key.key_data.len() {
+                    16 => {
+                        use aes::Aes128;
+                        use cbc::Encryptor;
+                        type Aes128CbcEnc = Encryptor<Aes128>;
+                        let mut encryptor = Aes128CbcEnc::new_from_slices(&key.key_data, iv).ok()?;
+                        for chunk in buf.chunks_exact_mut(16) {
+                            encryptor.encrypt_block_mut(aes::Block::from_mut_slice(chunk));
+                        }
+                    }
+                    32 => {
+                        use aes::Aes256;
+                        use cbc::Encryptor;
+                        type Aes256CbcEnc = Encryptor<Aes256>;
+                        let mut encryptor = Aes256CbcEnc::new_from_slices(&key.key_data, iv).ok()?;
+                        for chunk in buf.chunks_exact_mut(16) {
+                            encryptor.encrypt_block_mut(aes::Block::from_mut_slice(chunk));
+                        }
+                    }
+                    _ => return None,
                 }
                 Some(buf)
             }
@@ -7404,24 +7665,48 @@ impl BCryptRuntime {
         let key = self.key_handles.get(&key_handle)?;
         match key.algorithm {
             BCryptAlgorithmId::AesCbc => {
-                use aes::Aes256;
-                use cbc::Decryptor;
                 use cipher::{BlockDecryptMut, KeyIvInit};
-                type Aes256CbcDec = Decryptor<Aes256>;
-                let mut decryptor = Aes256CbcDec::new_from_slices(&key.key_data, iv).ok()?;
-                let mut buf = ciphertext.to_vec();
-                if buf.len() % 16 != 0 {
+                if iv.len() != 16 {
                     return None;
                 }
-                for chunk in buf.chunks_exact_mut(16) {
-                    decryptor.decrypt_block_mut(aes::Block::from_mut_slice(chunk));
+                if !ciphertext.len().is_multiple_of(16) {
+                    return None;
                 }
-                // Remove PKCS7 padding
-                if let Some(&pad_len) = buf.last() {
-                    if pad_len as usize <= 16 {
-                        buf.truncate(buf.len() - pad_len as usize);
+                let mut buf = ciphertext.to_vec();
+                match key.key_data.len() {
+                    16 => {
+                        use aes::Aes128;
+                        use cbc::Decryptor;
+                        type Aes128CbcDec = Decryptor<Aes128>;
+                        let mut decryptor = Aes128CbcDec::new_from_slices(&key.key_data, iv).ok()?;
+                        for chunk in buf.chunks_exact_mut(16) {
+                            decryptor.decrypt_block_mut(aes::Block::from_mut_slice(chunk));
+                        }
                     }
+                    32 => {
+                        use aes::Aes256;
+                        use cbc::Decryptor;
+                        type Aes256CbcDec = Decryptor<Aes256>;
+                        let mut decryptor = Aes256CbcDec::new_from_slices(&key.key_data, iv).ok()?;
+                        for chunk in buf.chunks_exact_mut(16) {
+                            decryptor.decrypt_block_mut(aes::Block::from_mut_slice(chunk));
+                        }
+                    }
+                    _ => return None,
                 }
+                // Validate the PKCS#7 padding before truncating: pad length in
+                // 1..=16 and every pad byte equal to it.
+                let pad_len = *buf.last()? as usize;
+                if pad_len == 0 || pad_len > 16 {
+                    return None;
+                }
+                if buf[buf.len() - pad_len..]
+                    .iter()
+                    .any(|&b| b as usize != pad_len)
+                {
+                    return None;
+                }
+                buf.truncate(buf.len() - pad_len);
                 Some(buf)
             }
             BCryptAlgorithmId::AesGcm => {
@@ -7473,21 +7758,33 @@ impl BCryptRuntime {
     ///
     /// ## Security Note — Compatibility Stub
     ///
-    /// This is a **compatibility stub** that returns `true` for any non-empty
-    /// hash and signature. Real signature verification would require the
-    /// actual public key and cryptographic verification implementation.
+    /// This is a **compatibility stub**: it does NOT perform real
+    /// cryptographic verification and must NEVER be used for security
+    /// decisions. It only requires that the inputs are non-empty and that the
+    /// signature size is consistent with the key's algorithm, so guest code
+    /// that passes mismatched key/signature pairs fails instead of observing
+    /// an unconditional pass.
     ///
     /// Casa1's authenticode/signature verification uses the macOS Security
     /// framework (see [`validate_certificate_chain`]) rather than this BCrypt
     /// emulation layer, so this stub only affects guest-observed behavior.
     pub fn verify_signature(&self, key_handle: u64, hash: &[u8], signature: &[u8]) -> bool {
-        let key = self.key_handles.get(&key_handle);
-        if key.is_none() {
+        let Some(key) = self.key_handles.get(&key_handle) else {
+            return false;
+        };
+        if hash.is_empty() || signature.is_empty() {
             return false;
         }
-        // In a full implementation, this would verify the signature
-        // against the public key. For now, return true for well-formed inputs.
-        !hash.is_empty() && !signature.is_empty()
+        match key.algorithm {
+            // RSA signature length equals the modulus size in bytes.
+            BCryptAlgorithmId::Rsa | BCryptAlgorithmId::RsaPss => {
+                signature.len() == key.key_data.len() && !key.key_data.is_empty()
+            }
+            // P-256: r || s (32 + 32 bytes); P-384: 48 + 48 bytes.
+            BCryptAlgorithmId::EcdsaP256 => signature.len() == 64,
+            BCryptAlgorithmId::EcdsaP384 => signature.len() == 96,
+            _ => false,
+        }
     }
 
     /// Derive a shared secret (DH/ECDH).
@@ -7545,15 +7842,33 @@ impl BCryptRuntime {
     }
 
     /// Derive a key from a shared secret.
+    ///
+    /// Implements HKDF-Expand (RFC 5869) with the shared secret as the PRK,
+    /// producing exactly `key_length` bytes. Unsupported lengths (above the
+    /// HMAC-SHA256 counter-block limit of 255 * 32 bytes) return `None` rather
+    /// than silently returning a short key.
     pub fn derive_key(&self, secret_handle: u64, key_length: usize) -> Option<Vec<u8>> {
         let secret = self.secret_handles.get(&secret_handle)?;
-        // Use HKDF-like derivation from the shared secret
         use hmac::{Hmac, Mac};
         type HmacSha256 = Hmac<sha2::Sha256>;
-        let mut mac = HmacSha256::new_from_slice(b"bcrypt-derive-key").ok()?;
-        mac.update(&secret.shared_secret);
-        let result = mac.finalize().into_bytes();
-        Some(result[..key_length.min(result.len())].to_vec())
+
+        const H_LEN: usize = 32;
+        if key_length > 255 * H_LEN {
+            return None;
+        }
+        let block_count = key_length.div_ceil(H_LEN);
+        let mut okm = Vec::with_capacity(block_count * H_LEN);
+        let mut t: Vec<u8> = Vec::new();
+        for i in 1..=block_count {
+            let mut mac = HmacSha256::new_from_slice(&secret.shared_secret).ok()?;
+            mac.update(&t);
+            mac.update(b"bcrypt-derive-key");
+            mac.update(&[i as u8]);
+            t = mac.finalize().into_bytes().to_vec();
+            okm.extend_from_slice(&t);
+        }
+        okm.truncate(key_length);
+        Some(okm)
     }
 
     /// Destroy a handle.
@@ -8106,19 +8421,30 @@ pub fn set_protected_process_light_cancellation(process_name: &str, cancel: bool
     }
 }
 
+// Global current-process name used by the PPL lookups.
+//
+// A process-global `Mutex<String>` replaces the previous `std::env` channel:
+// environment access is documented as not thread-safe, and guest code can
+// call the name-set API concurrently from multiple threads.
+lazy_static::lazy_static! {
+    static ref CURRENT_PROCESS_NAME: Mutex<String> = Mutex::new("game.exe".to_string());
+}
+
 /// Returns the current process name (extracted from the executable path).
 ///
 /// This is a simple helper that returns a default process name. In the
 /// actual PE runtime, this would be set based on the loaded executable.
 fn current_process_name() -> String {
-    std::env::var("CASA1_PROCESS_NAME").unwrap_or_else(|_| "game.exe".to_string())
+    CURRENT_PROCESS_NAME
+        .lock()
+        .map(|name| name.clone())
+        .unwrap_or_else(|_| "game.exe".to_string())
 }
 
 /// Sets the current process name for PPL lookups.
 pub fn set_current_process_name(name: &str) {
-    // SAFETY: Security framework FFI for cryptographic operations
-    unsafe {
-        std::env::set_var("CASA1_PROCESS_NAME", name);
+    if let Ok(mut current) = CURRENT_PROCESS_NAME.lock() {
+        *current = name.to_string();
     }
 }
 
@@ -8196,6 +8522,9 @@ fn split_hmac_key_message(data: &[u8]) -> (&[u8], &[u8]) {
 /// The `data` buffer format:
 ///   4-byte BE key_len + key + 4-byte BE salt_len + salt + 4-byte BE iterations + 4-byte BE dk_len
 ///
+/// Both `iterations` and `dk_len` are attacker-controlled; they are clamped at
+/// parse time (1M iterations, 1 MiB output) to prevent CPU/memory exhaustion.
+///
 /// Returns the derived key bytes, or None if the data is malformed.
 fn derive_pbkdf2_from_data(data: &[u8]) -> Option<Vec<u8>> {
     if data.len() < 16 {
@@ -8215,13 +8544,20 @@ fn derive_pbkdf2_from_data(data: &[u8]) -> Option<Vec<u8>> {
     let salt = &data[off + 4..off + 4 + salt_len];
     let off2 = off + 4 + salt_len;
     let iterations =
-        u32::from_be_bytes([data[off2], data[off2 + 1], data[off2 + 2], data[off2 + 3]]) as u32;
+        u32::from_be_bytes([data[off2], data[off2 + 1], data[off2 + 2], data[off2 + 3]]);
     let dk_len = u32::from_be_bytes([
         data[off2 + 4],
         data[off2 + 5],
         data[off2 + 6],
         data[off2 + 7],
     ]) as usize;
+
+    // Caps against guest-controlled CPU/memory exhaustion.
+    const MAX_ITERATIONS: u32 = 1_000_000;
+    const MAX_DK_LEN: usize = 1024 * 1024;
+    if iterations == 0 || iterations > MAX_ITERATIONS || dk_len == 0 || dk_len > MAX_DK_LEN {
+        return None;
+    }
 
     pbkdf2_hmac_sha256(key, salt, iterations, dk_len)
 }
@@ -8241,7 +8577,7 @@ fn pbkdf2_hmac_sha256(
     type HmacSha256 = Hmac<sha2::Sha256>;
 
     let h_len = 32; // SHA-256 output size
-    let block_count = (dk_len + h_len - 1) / h_len;
+    let block_count = dk_len.div_ceil(h_len);
 
     let mut derived_key = Vec::with_capacity(block_count * h_len);
 
@@ -8324,9 +8660,10 @@ pub fn pfx_is_pfx_blob(data: &[u8]) -> bool {
         }
     }
 
-    // Even without the OID, if it starts with 0x30 and is long enough,
-    // it could be a PFX blob. Return true for any SEQUENCE that's large enough.
-    found || data.len() > 100
+    // The OID scan above is the classification; the old `data.len() > 100`
+    // fallback routed arbitrary SEQUENCE blobs into SecPKCS12Import, so it is
+    // deliberately not applied here.
+    found
 }
 
 /// Import certificates from a PFX/PKCS#12 blob into a new certificate store.
@@ -8419,11 +8756,25 @@ pub fn pfx_import_cert_store(
         let mut opt_values: [*const c_void; 2] = [std::ptr::null(); 2];
         let mut opt_count: isize = 0;
 
+        // The created CFString must be released after the import; the options
+        // dictionary retains its own reference to it.
+        let mut cf_password: core_foundation::base::CFTypeRef = std::ptr::null();
         if let Some(pwd) = password {
             let pwd_bytes = pwd.as_bytes();
-            let cf_password = CFStringCreateWithCString(
+            // CFStringCreateWithCString reads until a NUL terminator; Rust
+            // string bytes are not NUL-terminated, so append one (an interior
+            // NUL would also truncate the passphrase — reject those outright).
+            if pwd_bytes.contains(&0) {
+                return Err(AppError::new(
+                    ReasonCode::RcCryptoInvalid,
+                    "PFX import: password contains a NUL byte",
+                ));
+            }
+            let mut nul_terminated = pwd_bytes.to_vec();
+            nul_terminated.push(0);
+            cf_password = CFStringCreateWithCString(
                 kCFAllocatorDefault,
-                pwd_bytes.as_ptr() as *const i8,
+                nul_terminated.as_ptr() as *const i8,
                 0x08000100, // kCFStringEncodingUTF8
             );
             if !cf_password.is_null() {
@@ -8457,7 +8808,11 @@ pub fn pfx_import_cert_store(
         let mut items: *const c_void = std::ptr::null();
         let status = SecPKCS12Import(cf_data, options, &mut items);
 
-        // Release allocated CF objects
+        // Release allocated CF objects (the options dictionary holds its own
+        // retain on the passphrase, so cf_password can be released here).
+        if !cf_password.is_null() {
+            CFRelease(cf_password);
+        }
         CFRelease(cf_data);
         if !options.is_null() {
             CFRelease(options);
@@ -8527,11 +8882,12 @@ pub fn pfx_import_cert_store(
                     let len = CFDataGetLength(cf_cert_data);
                     if len > 0 && !ptr.is_null() {
                         let der = std::slice::from_raw_parts(ptr, len as usize).to_vec();
-                        if let Some(cert) = Certificate::from_der(der) {
-                            if let Some(store) = store_manager.stores.get_mut(&store_handle) {
-                                store.certificates.push(cert);
-                                cert_count += 1;
-                            }
+                        let Some(cert) = Certificate::from_der(der) else {
+                            continue;
+                        };
+                        if let Some(store) = store_manager.stores.get_mut(&store_handle) {
+                            store.certificates.push(cert);
+                            cert_count += 1;
                         }
                     }
                     CFRelease(cf_cert_data);
@@ -8597,11 +8953,13 @@ pub fn pfx_import_cert_store(
         // Check if this looks like a certificate (must be large enough)
         if total_len > 100 {
             let der = pfx_data[offset..offset + total_len].to_vec();
-            if let Some(cert) = Certificate::from_der(der) {
-                if let Some(store) = store_manager.stores.get_mut(&store_handle) {
-                    store.certificates.push(cert);
-                    cert_count += 1;
-                }
+            let Some(cert) = Certificate::from_der(der) else {
+                offset += total_len.max(1);
+                continue;
+            };
+            if let Some(store) = store_manager.stores.get_mut(&store_handle) {
+                store.certificates.push(cert);
+                cert_count += 1;
             }
         }
         offset += total_len.max(1);
