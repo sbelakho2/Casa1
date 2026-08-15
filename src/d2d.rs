@@ -11,8 +11,7 @@ use std::collections::HashMap;
 use crate::gdiplus_render;
 use crate::metal_backend::MetalD2DRenderer;
 use crate::user32::{
-    GDIPLUS_COMPOSITING_MODE_SOURCE_COPY, GDIPLUS_COMPOSITING_MODE_SOURCE_OVER,
-    GDIPLUS_SMOOTHING_MODE_ANTI_ALIAS,
+    GDIPLUS_COMPOSITING_MODE_SOURCE_OVER, GDIPLUS_SMOOTHING_MODE_ANTI_ALIAS,
 };
 
 // ── Forward declarations from dwrite ────────────────────────────────────
@@ -55,13 +54,17 @@ pub const D2D1_RENDER_TARGET_USAGE_GDI_COMPATIBLE: u32 = 2;
 pub const D2D1_FACTORY_TYPE_SINGLE_THREADED: u32 = 0;
 pub const D2D1_FACTORY_TYPE_MULTI_THREADED: u32 = 1;
 
-/// IID for ID2D1Factory
+/// IID for ID2D1Factory: {06152247-6F50-465A-9245-118BFD3B6007}
 pub const IID_ID2D1Factory: [u8; 16] = [
-    0x06, 0x15, 0x22, 0x06, 0x84, 0xC0, 0xD4, 0x47, 0x84, 0xA3, 0xB4, 0x4B, 0x4F, 0x6C, 0x14, 0xAF,
+    0x47, 0x22, 0x15, 0x06, 0x50, 0x6F, 0x5A, 0x46, 0x92, 0x45, 0x11, 0x8B, 0xFD, 0x3B, 0x60, 0x07,
 ];
-/// IID for ID2D1HwndRenderTarget
+/// IID for ID2D1HwndRenderTarget.
+///
+/// ID2D1HwndRenderTarget is a pure C++ extension of ID2D1RenderTarget and
+/// has no distinct IID in d2d1.h; guests QI it with the ID2D1RenderTarget
+/// IID: {2CD90694-12E2-11DC-9FED-001143A055F9}
 pub const IID_ID2D1HwndRenderTarget: [u8; 16] = [
-    0x38, 0x8A, 0x73, 0xA4, 0xC0, 0x83, 0x4C, 0x44, 0x84, 0xF5, 0x4A, 0x17, 0xFD, 0x07, 0x66, 0x32,
+    0x94, 0x06, 0xD9, 0x2C, 0xE2, 0x12, 0xDC, 0x11, 0x9F, 0xED, 0x00, 0x11, 0x43, 0xA0, 0x55, 0xF9,
 ];
 
 // ── Core types ──────────────────────────────────────────────────────────
@@ -158,106 +161,94 @@ pub enum D2DBrush {
     RadialGradient(D2DRadialGradientBrush),
 }
 
+/// Interpolate the gradient color at parameter `t`.
+///
+/// `t` is clamped to the first and last stop positions so values outside
+/// the stop range do not extrapolate (which would produce out-of-range,
+/// possibly negative, channel values).
+fn interpolate_gradient(t: f32, stops: &[D2DGradientStop]) -> (f32, f32, f32, f32) {
+    match stops {
+        [] => (1.0, 1.0, 1.0, 1.0),
+        [only] => only.color,
+        _ => {
+            let first = stops.first().expect("non-empty stops");
+            let last = stops.last().expect("non-empty stops");
+            let t = if t.is_finite()
+                && first.position.is_finite()
+                && last.position.is_finite()
+                && first.position <= last.position
+            {
+                t.clamp(first.position, last.position)
+            } else {
+                // Degenerate or non-finite stop positions: clamp to [0, 1].
+                t.clamp(0.0, 1.0)
+            };
+            // Find the last stop at or before t
+            let i = stops
+                .iter()
+                .rposition(|stop| stop.position <= t)
+                .unwrap_or(0);
+            let next = (i + 1).min(stops.len() - 1);
+            if i == next {
+                stops[i].color
+            } else {
+                let span = stops[next].position - stops[i].position;
+                let local_t = if span > 0.0 {
+                    (t - stops[i].position) / span
+                } else {
+                    0.0
+                };
+                let it = 1.0 - local_t;
+                (
+                    stops[i].color.0 * it + stops[next].color.0 * local_t,
+                    stops[i].color.1 * it + stops[next].color.1 * local_t,
+                    stops[i].color.2 * it + stops[next].color.2 * local_t,
+                    stops[i].color.3 * it + stops[next].color.3 * local_t,
+                )
+            }
+        }
+    }
+}
+
 impl D2DBrush {
     /// Resolve the colour at the given point.
-    pub fn color_at(&self, _px: f32, _py: f32) -> u32 {
-        match self {
-            D2DBrush::Solid(s) => {
-                let r = (s.color.0 * 255.0 * s.opacity) as u8;
-                let g = (s.color.1 * 255.0 * s.opacity) as u8;
-                let b = (s.color.2 * 255.0 * s.opacity) as u8;
-                let a = (s.color.3 * 255.0) as u8;
-                (a as u32) << 24 | (r as u32) << 16 | (g as u32) << 8 | b as u32
-            }
+    pub fn color_at(&self, px: f32, py: f32) -> u32 {
+        let (color, opacity) = match self {
+            D2DBrush::Solid(s) => ((s.color.0, s.color.1, s.color.2, s.color.3), s.opacity),
             D2DBrush::LinearGradient(lb) => {
                 let dx = lb.end_point.0 - lb.start_point.0;
                 let dy = lb.end_point.1 - lb.start_point.1;
                 let len_sq = dx * dx + dy * dy;
                 let t = if len_sq > 0.0001 {
-                    ((_px - lb.start_point.0) * dx + (_py - lb.start_point.1) * dy) / len_sq
+                    ((px - lb.start_point.0) * dx + (py - lb.start_point.1) * dy) / len_sq
                 } else {
                     0.0
                 };
-                let t = t.clamp(0.0, 1.0);
-                // Find the two stops surrounding t
-                let color = if lb.stops.is_empty() {
-                    (1.0, 1.0, 1.0, 1.0)
-                } else if lb.stops.len() == 1 {
-                    lb.stops[0].color
-                } else {
-                    let mut i = 0;
-                    for j in 0..lb.stops.len() {
-                        if lb.stops[j].position <= t {
-                            i = j;
-                        }
-                    }
-                    let next = (i + 1).min(lb.stops.len() - 1);
-                    if i == next {
-                        lb.stops[i].color
-                    } else {
-                        let span = lb.stops[next].position - lb.stops[i].position;
-                        let local_t = if span > 0.0 {
-                            (t - lb.stops[i].position) / span
-                        } else {
-                            0.0
-                        };
-                        let it = 1.0 - local_t;
-                        (
-                            lb.stops[i].color.0 * it + lb.stops[next].color.0 * local_t,
-                            lb.stops[i].color.1 * it + lb.stops[next].color.1 * local_t,
-                            lb.stops[i].color.2 * it + lb.stops[next].color.2 * local_t,
-                            lb.stops[i].color.3 * it + lb.stops[next].color.3 * local_t,
-                        )
-                    }
-                };
-                let r = (color.0 * 255.0) as u8;
-                let g = (color.1 * 255.0) as u8;
-                let b = (color.2 * 255.0) as u8;
-                let a = (color.3 * 255.0) as u8;
-                (a as u32) << 24 | (r as u32) << 16 | (g as u32) << 8 | b as u32
+                (interpolate_gradient(t, &lb.stops), 1.0)
             }
             D2DBrush::RadialGradient(rb) => {
-                let dx = _px - rb.center.0;
-                let dy = _py - rb.center.1;
-                let t = ((dx * dx) / (rb.radius_x * rb.radius_x)
-                    + (dy * dy) / (rb.radius_y * rb.radius_y))
-                    .sqrt()
-                    .min(1.0);
-                let color = if rb.stops.is_empty() {
-                    (1.0, 1.0, 1.0, 1.0)
+                let dx = px - rb.center.0;
+                let dy = py - rb.center.1;
+                let radius_x_sq = rb.radius_x * rb.radius_x;
+                let radius_y_sq = rb.radius_y * rb.radius_y;
+                let t = if radius_x_sq > 0.0 && radius_y_sq > 0.0 {
+                    ((dx * dx) / radius_x_sq + (dy * dy) / radius_y_sq)
+                        .sqrt()
+                        .min(1.0)
                 } else {
-                    let mut i = 0;
-                    for j in 0..rb.stops.len() {
-                        if rb.stops[j].position <= t {
-                            i = j;
-                        }
-                    }
-                    let next = (i + 1).min(rb.stops.len() - 1);
-                    if i == next {
-                        rb.stops[i].color
-                    } else {
-                        let span = rb.stops[next].position - rb.stops[i].position;
-                        let local_t = if span > 0.0 {
-                            (t - rb.stops[i].position) / span
-                        } else {
-                            0.0
-                        };
-                        let it = 1.0 - local_t;
-                        (
-                            rb.stops[i].color.0 * it + rb.stops[next].color.0 * local_t,
-                            rb.stops[i].color.1 * it + rb.stops[next].color.1 * local_t,
-                            rb.stops[i].color.2 * it + rb.stops[next].color.2 * local_t,
-                            rb.stops[i].color.3 * it + rb.stops[next].color.3 * local_t,
-                        )
-                    }
+                    1.0
                 };
-                let r = (color.0 * 255.0) as u8;
-                let g = (color.1 * 255.0) as u8;
-                let b = (color.2 * 255.0) as u8;
-                let a = (color.3 * 255.0) as u8;
-                (a as u32) << 24 | (r as u32) << 16 | (g as u32) << 8 | b as u32
+                (interpolate_gradient(t, &rb.stops), 1.0)
             }
-        }
+        };
+        // Apply the brush opacity to the resolved color uniformly. Gradient
+        // brushes carry no opacity field today (D2D1_BRUSH_PROPERTIES is not
+        // forwarded at the thunk layer), so their opacity is 1.0.
+        let r = (color.0 * 255.0 * opacity) as u8;
+        let g = (color.1 * 255.0 * opacity) as u8;
+        let b = (color.2 * 255.0 * opacity) as u8;
+        let a = (color.3 * 255.0) as u8;
+        (a as u32) << 24 | (r as u32) << 16 | (g as u32) << 8 | b as u32
     }
 }
 
@@ -286,6 +277,13 @@ pub struct HwndRenderTarget {
     pub stride: i32,
     /// Optional Metal-accelerated hardware renderer.
     pub hw_renderer: Option<MetalD2DRenderer>,
+    /// True between `begin_draw` and the first `flush_hardware`; makes
+    /// flushes idempotent so `end_draw` after a mid-frame flush (e.g. from
+    /// `draw_text`) does not commit the Metal frame twice.
+    hw_frame_active: bool,
+    /// True when hardware drawing occurred this frame; gates the GPU readback
+    /// in `flush_hardware` so frames without GPU work skip the sync + copy.
+    hw_dirty: bool,
 }
 
 // Manual Clone implementation: MetalD2DRenderer is not Clone.
@@ -302,6 +300,8 @@ impl Clone for HwndRenderTarget {
             pixels: self.pixels.clone(),
             stride: self.stride,
             hw_renderer: None, // Hardware renderer is not cloned.
+            hw_frame_active: false,
+            hw_dirty: false,
         }
     }
 }
@@ -330,6 +330,12 @@ pub struct D2DFactory {
     pub next_id: u64,
 }
 
+impl Default for D2DFactory {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl D2DFactory {
     pub fn new() -> Self {
         D2DFactory {
@@ -337,8 +343,11 @@ impl D2DFactory {
             next_id: 1,
         }
     }
-
     /// Create an HWND render target.
+    ///
+    /// Returns 0 (no render target created) if the requested dimensions are
+    /// invalid, to match the fail-closed behavior of D2D surface creation
+    /// without panicking on guest-controlled sizes.
     pub fn create_hwnd_render_target(
         &mut self,
         hwnd: u64,
@@ -347,8 +356,20 @@ impl D2DFactory {
         dpi: f32,
         pixel_format: D2DPixelFormat,
     ) -> u64 {
-        let stride = (width * 4) as i32;
-        let pixel_count = (stride * height as i32) as usize;
+        // Reject absurd dimensions up front: the buffer allocation below is
+        // guest-controlled, and 32-bit arithmetic on the stride could wrap.
+        const MAX_SURFACE_DIMENSION: u32 = 32768;
+        if width == 0
+            || height == 0
+            || width > MAX_SURFACE_DIMENSION
+            || height > MAX_SURFACE_DIMENSION
+        {
+            return 0;
+        }
+        let stride = (width as usize) * 4;
+        let Some(pixel_count) = stride.checked_mul(height as usize) else {
+            return 0;
+        };
         let id = self.next_id;
         self.next_id += 1;
 
@@ -361,8 +382,10 @@ impl D2DFactory {
             transform: d2d_identity_matrix(),
             state: RenderState::default(),
             pixels: vec![0u8; pixel_count],
-            stride,
+            stride: stride as i32,
             hw_renderer: None,
+            hw_frame_active: false,
+            hw_dirty: false,
         };
 
         self.render_targets
@@ -442,20 +465,36 @@ impl HwndRenderTarget {
         self.hw_renderer.is_some()
     }
 
-    /// Flush the hardware renderer: end the current frame and read back
-    /// pixels into the software buffer so that callers can access pixel data.
+    /// Flush the hardware renderer: end the current frame and, when GPU work
+    /// happened this frame, read back pixels into the software buffer so that
+    /// callers can access pixel data.
     ///
-    /// Called automatically by [`end_draw`] when the hardware renderer is
-    /// active. Can also be called manually to force a flush.
+    /// Flushing is idempotent per frame: at most one commit+readback happens
+    /// between `begin_draw` and `end_draw`, so a mid-frame flush (e.g. from
+    /// `draw_text`) followed by `end_draw` does not end the Metal frame
+    /// twice. Frames without GPU work skip the GPU→CPU readback entirely.
     pub fn flush_hardware(&mut self) {
+        if !self.hw_frame_active {
+            return;
+        }
+        self.hw_frame_active = false;
+        let dirty = self.hw_dirty;
+        self.hw_dirty = false;
         if let Some(ref mut hw) = self.hw_renderer {
             hw.end_frame();
-            // Read back pixel data for compatibility
-            if let Ok((_, _, stride, data)) = hw.readback() {
-                self.pixels = data;
-                self.stride = stride;
+            if dirty {
+                // Read back pixel data for compatibility
+                if let Ok((_, _, stride, data)) = hw.readback() {
+                    self.pixels = data;
+                    self.stride = stride;
+                }
             }
         }
+    }
+
+    /// Mark that GPU drawing occurred this frame (drives the readback gate).
+    fn mark_hw_dirty(&mut self) {
+        self.hw_dirty = true;
     }
 
     pub fn begin_draw(&mut self) {
@@ -463,13 +502,16 @@ impl HwndRenderTarget {
         // Start a hardware frame if hardware acceleration is available.
         if let Some(ref mut hw) = self.hw_renderer {
             hw.begin_frame();
+            self.hw_frame_active = true;
         }
     }
 
     pub fn end_draw(&mut self) {
-        self.state.drawing = false;
-        // Flush the hardware renderer (commit GPU commands, read back pixels).
+        // Flush the hardware renderer (commit GPU commands, read back pixels)
+        // before clearing the drawing flag; flush_hardware is a no-op when no
+        // frame is active, so repeated end_draw calls are safe.
         self.flush_hardware();
+        self.state.drawing = false;
     }
 
     pub fn clear(&mut self, color: (f32, f32, f32, f32)) {
@@ -488,20 +530,15 @@ impl HwndRenderTarget {
                 b as f32 / 255.0,
                 a as f32 / 255.0,
             );
+            self.mark_hw_dirty();
         } else {
-            // Software fallback: fill entire surface with the color.
-            for y in 0..self.height as i32 {
-                for x in 0..self.width as i32 {
-                    gdiplus_render::put_pixel(
-                        &mut self.pixels,
-                        self.width,
-                        self.height,
-                        self.stride,
-                        x,
-                        y,
-                        argb_color,
-                        GDIPLUS_COMPOSITING_MODE_SOURCE_COPY,
-                    );
+            // Software fallback: fill the entire surface with the constant
+            // ARGB pattern instead of a per-pixel function-call loop.
+            let pattern = argb_color.to_le_bytes();
+            let row_len = (self.width as usize) * 4;
+            for row in self.pixels.chunks_exact_mut(row_len) {
+                for chunk in row.chunks_exact_mut(4) {
+                    chunk.copy_from_slice(&pattern);
                 }
             }
         }
@@ -519,6 +556,7 @@ impl HwndRenderTarget {
 
         if let Some(ref hw) = self.hw_renderer {
             hw.draw_line(p1.0, p1.1, p2.0, p2.1, stroke_width, color);
+            self.mark_hw_dirty();
         } else {
             gdiplus_render::draw_line(
                 &mut self.pixels,
@@ -547,6 +585,7 @@ impl HwndRenderTarget {
 
         if let Some(ref hw) = self.hw_renderer {
             hw.fill_rect(rect.0, rect.1, rect.2, rect.3, color);
+            self.mark_hw_dirty();
         } else {
             gdiplus_render::fill_rect(
                 &mut self.pixels,
@@ -573,17 +612,22 @@ impl HwndRenderTarget {
         let color = brush_color_or_default(brush_id, brushes, rect.0, rect.1);
 
         if let Some(ref hw) = self.hw_renderer {
-            // Outline rectangle as 4 separate line segments.
+            // Outline rectangle as 4 line segments. The corners are shared
+            // endpoints between adjacent segments; each segment is clipped to
+            // exclude the shared endpoint so corner pixels are not drawn
+            // twice (double alpha blending).
             let (x, y, w, h) = rect;
             let sw = stroke_width;
-            // Top edge
-            hw.draw_line(x, y, x + w, y, sw, color);
-            // Bottom edge
-            hw.draw_line(x, y + h, x + w, y + h, sw, color);
-            // Left edge
-            hw.draw_line(x, y, x, y + h, sw, color);
-            // Right edge
-            hw.draw_line(x + w, y, x + w, y + h, sw, color);
+            let half = sw / 2.0;
+            // Top edge (excluding the right corner)
+            hw.draw_line(x, y + half, x + w - half, y + half, sw, color);
+            // Bottom edge (excluding the right corner)
+            hw.draw_line(x, y + h - half, x + w - half, y + h - half, sw, color);
+            // Left edge (excluding the bottom corner)
+            hw.draw_line(x + half, y, x + half, y + h - half, sw, color);
+            // Right edge (excluding the bottom corner)
+            hw.draw_line(x + w - half, y, x + w - half, y + h - half, sw, color);
+            self.mark_hw_dirty();
         } else {
             gdiplus_render::draw_rect(
                 &mut self.pixels,
@@ -614,6 +658,7 @@ impl HwndRenderTarget {
 
         if let Some(ref hw) = self.hw_renderer {
             hw.fill_ellipse(center.0, center.1, radius_x, radius_y, color, 32);
+            self.mark_hw_dirty();
         } else {
             // gdiplus_render::fill_ellipse uses (x, y, w, h) bounding rect
             let x = center.0 - radius_x;
@@ -660,6 +705,7 @@ impl HwndRenderTarget {
                 let y2 = cy + ry * a2.sin();
                 hw.draw_line(x1, y1, x2, y2, stroke_width, color);
             }
+            self.mark_hw_dirty();
         } else {
             let x = center.0 - radius_x;
             let y = center.1 - radius_y;
@@ -682,6 +728,7 @@ impl HwndRenderTarget {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn draw_text(
         &mut self,
         text: &str,
@@ -703,7 +750,10 @@ impl HwndRenderTarget {
         // Look up the text format
         let format = match formats.get(&format_id) {
             Some(f) => f,
-            None => return,
+            None => {
+                eprintln!("[d2d] draw_text: unknown text format id {format_id}");
+                return;
+            }
         };
 
         // Get brush color
@@ -733,7 +783,10 @@ impl HwndRenderTarget {
     ) {
         let bitmap = match bitmaps.get(&bitmap_id) {
             Some(b) => b,
-            None => return,
+            None => {
+                eprintln!("[d2d] draw_bitmap: unknown bitmap id {bitmap_id}");
+                return;
+            }
         };
 
         if let Some(ref hw) = self.hw_renderer {
@@ -747,6 +800,7 @@ impl HwndRenderTarget {
                 dest_rect.3,
                 opacity,
             );
+            self.mark_hw_dirty();
         } else {
             gdiplus_render::draw_image_rect(
                 &mut self.pixels,
@@ -971,7 +1025,7 @@ mod tests {
         target.clear((0.0, 0.0, 1.0, 1.0)); // Blue
 
         // Check a pixel
-        let idx = (0 * target.stride + 0 * 4) as usize;
+        let idx = 0usize;
         let pixel = u32::from_le_bytes([
             target.pixels[idx],
             target.pixels[idx + 1],
