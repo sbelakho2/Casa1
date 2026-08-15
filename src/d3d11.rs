@@ -525,6 +525,12 @@ impl D3d9StateBlock {
     }
 }
 
+impl Default for D3d9StateBlock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum FeatureLevel {
@@ -610,21 +616,11 @@ impl Default for RenderTargetBlendDesc {
 }
 
 /// D3D11_BLEND_DESC — full blend state with 8 independent render targets.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BlendStateDesc {
     pub alpha_to_coverage_enable: bool,
     pub independent_blend_enable: bool,
     pub render_target: [RenderTargetBlendDesc; 8],
-}
-
-impl Default for BlendStateDesc {
-    fn default() -> Self {
-        Self {
-            alpha_to_coverage_enable: false,
-            independent_blend_enable: false,
-            render_target: [RenderTargetBlendDesc::default(); 8],
-        }
-    }
 }
 
 /// D3D11_RASTERIZER_DESC — full rasterizer state.
@@ -690,11 +686,11 @@ impl Default for DepthStencilStateDesc {
             front_stencil_fail_op: 1, // D3D11_STENCIL_OP_KEEP = 1
             front_stencil_depth_fail_op: 1,
             front_stencil_pass_op: 1,
-            front_stencil_func: 2, // D3D11_COMPARISON_LESS = 2 (actually ALWAYS? spec says always for default, but KEEP is fine)
+            front_stencil_func: 8, // D3D11_COMPARISON_ALWAYS = 8 (D3D11 spec default)
             back_stencil_fail_op: 1,
             back_stencil_depth_fail_op: 1,
             back_stencil_pass_op: 1,
-            back_stencil_func: 2,
+            back_stencil_func: 8, // D3D11_COMPARISON_ALWAYS = 8 (D3D11 spec default)
         }
     }
 }
@@ -725,8 +721,8 @@ impl Default for SamplerStateDesc {
             max_anisotropy: 1,
             comparison_func: 1, // D3D11_COMPARISON_NEVER = 1
             border_color: [1.0, 1.0, 1.0, 1.0],
-            min_lod: -std::f32::MAX,
-            max_lod: std::f32::MAX,
+            min_lod: -f32::MAX,
+            max_lod: f32::MAX,
         }
     }
 }
@@ -833,6 +829,9 @@ struct ResourceRecord {
     bytes: Vec<u8>,
     mapped: bool,
     include_in_digests: bool,
+    /// Cached submission digest; `None` when the bytes were mutated since the
+    /// last digest computation (avoids re-hashing untouched resources).
+    digest: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -913,6 +912,9 @@ pub struct ContextBindings {
     shaders: BTreeMap<ShaderStage, ShaderId>,
     constant_buffers: BTreeMap<ShaderStage, Vec<D3d11ResourceId>>,
     shader_resources: BTreeMap<ShaderStage, Vec<D3d11ViewId>>,
+    /// Unordered access views, tracked independently from shader resources so
+    /// that binding CS SRVs and CS/OM UAVs does not clobber one set of binds.
+    unordered_access_views: BTreeMap<ShaderStage, Vec<D3d11ViewId>>,
     samplers: BTreeMap<ShaderStage, Vec<SamplerStateId>>,
 }
 
@@ -969,6 +971,11 @@ pub enum RecordedCommand {
         /// Raw DXGI_FORMAT u32 value.
         format: u32,
     },
+    CopyStructureCount {
+        dst: D3d11ResourceId,
+        src_view: D3d11ViewId,
+        aligned_byte_offset: u32,
+    },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -987,6 +994,9 @@ pub struct DeferredContext {
 pub struct Direct3D9Shim {
     enabled: bool,
     next_id: D3d9DeviceId,
+    next_vertex_buffer_id: D3d9VertexBufferId,
+    next_index_buffer_id: D3d9IndexBufferId,
+    next_texture_id: D3d9TextureId,
     pub vertex_buffers: BTreeMap<D3d9VertexBufferId, VertexBuffer9>,
     pub index_buffers: BTreeMap<D3d9IndexBufferId, IndexBuffer9>,
     pub textures: BTreeMap<D3d9TextureId, D3d9Texture>,
@@ -1032,6 +1042,9 @@ pub struct D3d11Device {
     counters: BTreeMap<u64, Counter>,
     /// D3D11 class linkage objects for shader class interfaces.
     class_linkage: BTreeMap<u64, ClassLinkage>,
+    /// Active rendering predicate id (set via `set_predication`). Draws are
+    /// skipped while a bound predicate reports false.
+    predication: Option<u64>,
 }
 
 impl D3d11Device {
@@ -1089,11 +1102,15 @@ impl D3d11Device {
         byte_width: usize,
         usage_hint: ResourceUsageHint,
     ) -> AppResult<D3d11ResourceId> {
+        // The descriptor width field is u32; clamp instead of wrapping so the
+        // recorded width never disagrees with the `byte_width`-based
+        // allocation.
+        let width = byte_width.min(u32::MAX as usize) as u32;
         self.create_resource(D3d11ResourceDesc {
             label: label.to_string(),
             dimension: ResourceDimension::Buffer,
             format: DxgiFormat::R32Float,
-            width: byte_width as u32,
+            width,
             height: 1,
             depth: 1,
             byte_width,
@@ -1598,11 +1615,10 @@ impl D3d11Device {
     }
 
     /// Returns the currently bound CS unordered access views (`Vec<D3d11ViewId>`).
-    /// UAVs are stored in shader_resources under the Cs stage (same as SRVs).
     pub fn cs_get_unordered_access_views(&self) -> Vec<D3d11ViewId> {
         self.immediate
             .bindings
-            .shader_resources
+            .unordered_access_views
             .get(&ShaderStage::Cs)
             .cloned()
             .unwrap_or_default()
@@ -1640,6 +1656,10 @@ impl D3d11Device {
         Ok(())
     }
 
+    /// Maps a resource for CPU access, returning a full copy of its bytes.
+    /// The full-buffer clone doubles memory traffic for large per-frame
+    /// mappings; callers that only write a subset should prefer
+    /// `update_subresource`.
     pub fn map(&mut self, resource: D3d11ResourceId) -> AppResult<Vec<u8>> {
         let record = self.resource_mut(resource)?;
         record.mapped = true;
@@ -1663,6 +1683,7 @@ impl D3d11Device {
             }
             record.bytes[..bytes.len()].copy_from_slice(bytes);
             record.mapped = false;
+            record.digest = None;
             record.backend_id
         };
         self.promote_texture_cpu_write_usage(resource)?;
@@ -1842,14 +1863,20 @@ impl D3d11Device {
             // d3d11 side we only see `SwapchainState`.  For the overwhelmingly
             // common single-backbuffer swapchain the index is 0; with N
             // backbuffers we mirror all of them so whichever index is
-            // presented gets fresh pixels.
+            // presented gets fresh pixels. A single staging buffer is reused
+            // across backbuffers to avoid a full allocation+copy per
+            // backbuffer per present, and mirror failures are propagated:
+            // this sync is the only path that makes the live window show
+            // rendered pixels.
+            let mut staging: Vec<u8> = Vec::new();
             for &backbuffer_id in &state.backbuffers {
-                if let Ok(d3d_resource) = self.resource(backbuffer_id) {
-                    let pixels = d3d_resource.bytes.clone();
-                    let _ = self
-                        .backend
-                        .overwrite_resource_bytes(backbuffer_id, &pixels);
-                }
+                let bytes = match self.resource(backbuffer_id) {
+                    Ok(record) => &record.bytes,
+                    Err(_) => continue,
+                };
+                staging.clear();
+                staging.extend_from_slice(bytes);
+                self.backend.overwrite_resource_bytes(backbuffer_id, &staging)?;
             }
         }
         let present = self
@@ -1910,7 +1937,11 @@ impl D3d11Device {
     }
 
     /// Merge consecutive command lists with identical bindings into fewer render passes.
-    /// Also batches small command lists together when bindings match.
+    /// Only lists whose commands are exclusively draws can be merged: clears,
+    /// copies, resolves and dispatches establish render-pass or execution
+    /// boundaries that must be preserved verbatim (e.g. four deferred lists
+    /// each clearing the same RTV to a different colour must remain four
+    /// separate passes, or the Metal plan applies only the first clear).
     fn merge_deferred_command_lists(&self, lists: &[D3d11CommandList]) -> Vec<D3d11CommandList> {
         if lists.is_empty() {
             return Vec::new();
@@ -1918,16 +1949,20 @@ impl D3d11Device {
 
         let mut merged: Vec<D3d11CommandList> = Vec::new();
         for list in lists {
-            if let Some(last) = merged.last_mut() {
-                if last.bindings == list.bindings {
-                    // Same bindings: merge commands into a single list to reduce
-                    // render-pass transitions.
+            match merged.last_mut() {
+                Some(last)
+                    if last.bindings == list.bindings
+                        && commands_are_draw_only(&last.commands)
+                        && commands_are_draw_only(&list.commands) =>
+                {
+                    // Same bindings, draw-only commands: merge commands into a
+                    // single list to reduce render-pass transitions.
                     last.commands.extend(list.commands.clone());
-                    continue;
                 }
+                // Different bindings or pass-boundary commands: start a new
+                // merged entry.
+                _ => merged.push(list.clone()),
             }
-            // Different bindings: start a new merged entry.
-            merged.push(list.clone());
         }
         merged
     }
@@ -1954,6 +1989,7 @@ impl D3d11Device {
                 mapped: false,
                 backend_id,
                 include_in_digests: true,
+                digest: None,
                 desc,
             },
         );
@@ -2053,15 +2089,16 @@ impl D3d11Device {
         list: crate::gfx::CommandListId,
         bindings: &ContextBindings,
         commands: &[RecordedCommand],
-        draw_calls: &mut u32,
-        indexed_draw_calls: &mut u32,
-        dispatch_calls: &mut u32,
+        stats: &mut SubmissionStats,
+        pass_started: bool,
     ) -> AppResult<()> {
         // A render pass is required only when the sequence actually issues draws
         // against bound attachments. We open it *lazily*, immediately before the
         // first clear or draw, rather than eagerly at the top of the command
         // list: a leading blit (e.g. CopyResource) would otherwise flush an
         // empty load-only pass and leave a spurious render pass in the plan.
+        // `pass_started` lets a coalescing caller open the pass once before the
+        // loop so merged sequences share a single render pass.
         let needs_render_pass = commands.iter().any(|command| {
             matches!(
                 command,
@@ -2069,7 +2106,7 @@ impl D3d11Device {
             )
         }) && (!bindings.render_targets.is_empty()
             || bindings.depth_target.is_some());
-        let mut pass_opened = false;
+        let mut pass_opened = pass_started;
 
         for command in commands {
             // Open the render pass just-in-time before the first attachment
@@ -2103,7 +2140,17 @@ impl D3d11Device {
                 RecordedCommand::UpdateSubresource { resource, bytes } => {
                     let backend_id = {
                         let record = self.resource_mut(*resource)?;
+                        if bytes.len() > record.bytes.len() {
+                            return Err(AppError::new(
+                                ReasonCode::RcD3dInvalidState,
+                                format!(
+                                    "update subresource payload exceeds resource {}",
+                                    record.desc.label
+                                ),
+                            ));
+                        }
                         record.bytes[..bytes.len()].copy_from_slice(bytes);
+                        record.digest = None;
                         record.backend_id
                     };
                     self.backend.overwrite_resource_bytes(backend_id, bytes)?;
@@ -2113,7 +2160,14 @@ impl D3d11Device {
                     let src_backend = self.resource(*src)?.backend_id;
                     let dst_backend = self.resource(*dst)?.backend_id;
                     let destination = self.resource_mut(*dst)?;
+                    if source_bytes.len() > destination.bytes.len() {
+                        return Err(AppError::new(
+                            ReasonCode::RcD3dInvalidState,
+                            "copy resource destination is smaller than source",
+                        ));
+                    }
                     destination.bytes = source_bytes;
+                    destination.digest = None;
                     self.backend
                         .record_copy_resource(list, src_backend, dst_backend)?;
                     // A blit closes the active render pass in the backend plan.
@@ -2128,8 +2182,18 @@ impl D3d11Device {
                 } => {
                     let source = self.resource(*src)?.bytes.clone();
                     let destination = self.resource_mut(*dst)?;
-                    let src_end = src_offset + size;
-                    let dst_end = dst_offset + size;
+                    let src_end = src_offset.checked_add(*size).ok_or_else(|| {
+                        AppError::new(
+                            ReasonCode::RcD3dInvalidState,
+                            "copy subresource region source offset overflow",
+                        )
+                    })?;
+                    let dst_end = dst_offset.checked_add(*size).ok_or_else(|| {
+                        AppError::new(
+                            ReasonCode::RcD3dInvalidState,
+                            "copy subresource region destination offset overflow",
+                        )
+                    })?;
                     if src_end > source.len() || dst_end > destination.bytes.len() {
                         return Err(AppError::new(
                             ReasonCode::RcD3dInvalidState,
@@ -2138,16 +2202,27 @@ impl D3d11Device {
                     }
                     destination.bytes[*dst_offset..dst_end]
                         .copy_from_slice(&source[*src_offset..src_end]);
+                    destination.digest = None;
                 }
                 RecordedCommand::ClearRenderTargetView { view, color } => {
                     let (resource_id, heap) = {
                         let view = self.view(*view)?;
-                        (view.info.resource, view.heap.expect("RTV heap"))
+                        (
+                            view.info.resource,
+                            view.heap.ok_or_else(|| {
+                                AppError::new(
+                                    ReasonCode::RcD3dInvalidState,
+                                    "render target view has no descriptor heap",
+                                )
+                            })?,
+                        )
                     };
                     let resource = self.resource_mut(resource_id)?;
                     for chunk in resource.bytes.chunks_mut(4) {
-                        chunk.copy_from_slice(color);
+                        let len = chunk.len().min(4);
+                        chunk[..len].copy_from_slice(&color[..len]);
                     }
+                    resource.digest = None;
                     self.backend.record_clear_rtv(list, heap, 0)?;
                 }
                 RecordedCommand::ClearDepthStencilView {
@@ -2163,7 +2238,15 @@ impl D3d11Device {
                     ];
                     let (resource_id, heap) = {
                         let view = self.view(*view)?;
-                        (view.info.resource, view.heap.expect("DSV heap"))
+                        (
+                            view.info.resource,
+                            view.heap.ok_or_else(|| {
+                                AppError::new(
+                                    ReasonCode::RcD3dInvalidState,
+                                    "depth stencil view has no descriptor heap",
+                                )
+                            })?,
+                        )
                     };
                     let resource = self.resource_mut(resource_id)?;
                     for chunk in resource.bytes.chunks_mut(5) {
@@ -2174,14 +2257,21 @@ impl D3d11Device {
                             chunk[4] = *stencil;
                         }
                     }
+                    resource.digest = None;
                     self.backend.record_clear_dsv(list, heap, 0)?;
                 }
                 RecordedCommand::Draw { vertices, .. } => {
-                    *draw_calls += 1;
+                    if self.predication_skips_draws() {
+                        continue;
+                    }
+                    stats.draw_calls += 1;
                     self.backend.record_draw(list, *vertices)?;
                 }
                 RecordedCommand::DrawIndexed { indices, .. } => {
-                    *indexed_draw_calls += 1;
+                    if self.predication_skips_draws() {
+                        continue;
+                    }
+                    stats.indexed_draw_calls += 1;
                     self.backend.record_draw(list, *indices)?;
                 }
                 RecordedCommand::ResolveSubresource {
@@ -2196,7 +2286,15 @@ impl D3d11Device {
                     // For MSAA resolve, use Average mode (D3D11 default).
                     // The CPU-side bytes are copied; the GPU command is recorded for Metal backend.
                     let source_bytes = self.resource(*src)?.bytes.clone();
-                    self.resource_mut(*dst)?.bytes = source_bytes;
+                    let destination = self.resource_mut(*dst)?;
+                    if source_bytes.len() > destination.bytes.len() {
+                        return Err(AppError::new(
+                            ReasonCode::RcD3dInvalidState,
+                            "resolve subresource destination is smaller than source",
+                        ));
+                    }
+                    destination.bytes = source_bytes;
+                    destination.digest = None;
                     self.backend.record_resolve_subresource(
                         list,
                         dst_backend,
@@ -2208,14 +2306,54 @@ impl D3d11Device {
                     pass_opened = false;
                 }
                 RecordedCommand::Dispatch { x, y, z } => {
-                    *dispatch_calls += 1;
+                    stats.dispatch_calls += 1;
                     self.backend.record_dispatch(list, *x, *y, *z)?;
                     // A compute dispatch closes the active render pass.
                     pass_opened = false;
                 }
+                RecordedCommand::CopyStructureCount {
+                    dst,
+                    src_view,
+                    aligned_byte_offset,
+                } => {
+                    // The software backend never evaluates append/consume
+                    // counters, so the truthful recorded count is zero; the
+                    // count is still written into the destination so games see
+                    // the documented no-output value instead of stale bytes.
+                    self.view(*src_view)?;
+                    let (backend_id, upload) = {
+                        let destination = self.resource_mut(*dst)?;
+                        let offset = *aligned_byte_offset as usize;
+                        let end = offset.checked_add(4).ok_or_else(|| {
+                            AppError::new(
+                                ReasonCode::RcD3dInvalidState,
+                                "copy structure count offset overflow",
+                            )
+                        })?;
+                        if end > destination.bytes.len() {
+                            return Err(AppError::new(
+                                ReasonCode::RcD3dInvalidState,
+                                "copy structure count out of bounds",
+                            ));
+                        }
+                        destination.bytes[offset..end].copy_from_slice(&0u32.to_le_bytes());
+                        destination.digest = None;
+                        (destination.backend_id, destination.bytes.clone())
+                    };
+                    self.backend.overwrite_resource_bytes(backend_id, &upload)?;
+                }
             }
         }
         Ok(())
+    }
+
+    /// Returns true when an active rendering predicate is bound and currently
+    /// reports false; conditional draws must then be skipped.
+    fn predication_skips_draws(&self) -> bool {
+        self.predication
+            .and_then(|id| self.predicates.get(&id))
+            .map(|predicate| !predicate.value)
+            .unwrap_or(false)
     }
 
     fn submit_sequences(
@@ -2244,9 +2382,12 @@ impl D3d11Device {
         capture_submission: bool,
     ) -> AppResult<SubmissionResult> {
         let mut immutable_streams = Vec::new();
-        let mut draw_calls = 0;
-        let mut indexed_draw_calls = 0;
-        let mut dispatch_calls = 0;
+        let mut stats = SubmissionStats {
+            draw_calls: 0,
+            indexed_draw_calls: 0,
+            dispatch_calls: 0,
+            executed_command_lists: 0,
+        };
         let all_sequences_empty = sequences.iter().all(|(_, commands)| commands.is_empty());
 
         // Coalescing fuses a *small draw submission burst* into a single backend
@@ -2281,14 +2422,30 @@ impl D3d11Device {
                 self.graphics_pipeline,
                 false,
             );
+            // All coalesced sequences share identical bindings and contain only
+            // draws, so the render pass is opened exactly once before the loop
+            // and shared by every merged sequence.
+            let bindings = &sequences[0].0;
+            let pass_started = !bindings.render_targets.is_empty()
+                || bindings.depth_target.is_some();
+            if pass_started {
+                let (color_formats, depth_format) = self.render_pass_formats(bindings)?;
+                let (load_action, store_action) = self.render_pass_actions(bindings)?;
+                self.backend.record_begin_render_pass(
+                    list,
+                    color_formats,
+                    depth_format,
+                    load_action,
+                    store_action,
+                )?;
+            }
             for (bindings, commands) in &sequences {
                 self.record_sequence_to_command_list(
                     list,
                     bindings,
                     commands,
-                    &mut draw_calls,
-                    &mut indexed_draw_calls,
-                    &mut dispatch_calls,
+                    &mut stats,
+                    pass_started,
                 )?;
             }
             immutable_streams.push(self.backend.close_command_list(list)?);
@@ -2303,9 +2460,8 @@ impl D3d11Device {
                     list,
                     bindings,
                     commands,
-                    &mut draw_calls,
-                    &mut indexed_draw_calls,
-                    &mut dispatch_calls,
+                    &mut stats,
+                    false,
                 )?;
                 immutable_streams.push(self.backend.close_command_list(list)?);
             }
@@ -2317,16 +2473,14 @@ impl D3d11Device {
             &immutable_streams,
             Some((self.fence, self.next_fence_value)),
         )?;
+        stats.executed_command_lists = immutable_streams.len();
         let (resource_digests, signature, hash) = if capture_submission {
             let resource_digests = self.collect_resource_digests();
             let gpu_profile = self.pipeline_profile_signature();
             let signature = build_submission_signature(
                 &gpu_profile,
                 self.feature_level,
-                draw_calls,
-                indexed_draw_calls,
-                dispatch_calls,
-                immutable_streams.len(),
+                stats,
                 &binding_signatures,
                 &resource_digests,
                 &backend_plan,
@@ -2338,9 +2492,9 @@ impl D3d11Device {
         };
         Ok(SubmissionResult {
             feature_level: self.feature_level,
-            draw_calls,
-            indexed_draw_calls,
-            dispatch_calls,
+            draw_calls: stats.draw_calls,
+            indexed_draw_calls: stats.indexed_draw_calls,
+            dispatch_calls: stats.dispatch_calls,
             executed_command_lists: immutable_streams.len(),
             resource_digests,
             hash,
@@ -2349,15 +2503,22 @@ impl D3d11Device {
         })
     }
 
-    fn collect_resource_digests(&self) -> BTreeMap<String, String> {
+    fn collect_resource_digests(&mut self) -> BTreeMap<String, String> {
         self.resources
-            .values()
+            .values_mut()
             .filter(|resource| resource.include_in_digests)
             .map(|resource| {
-                (
-                    resource.desc.label.clone(),
-                    util::sha256_bytes(&resource.bytes),
-                )
+                // Only re-hash resources mutated since the last submission;
+                // untouched resources reuse their cached digest.
+                let digest = resource
+                    .digest
+                    .clone()
+                    .unwrap_or_else(|| {
+                        let computed = util::sha256_bytes(&resource.bytes);
+                        resource.digest = Some(computed.clone());
+                        computed
+                    });
+                (resource.desc.label.clone(), digest)
             })
             .collect()
     }
@@ -2606,6 +2767,13 @@ impl D3d11Device {
                     .map(|resource| resource.desc.label.clone())
             })
         })?;
+        let unordered_access_views =
+            stage_binding_labels(&bindings.unordered_access_views, |view| {
+                self.view(view).and_then(|record| {
+                    self.resource(record.info.resource)
+                        .map(|resource| resource.desc.label.clone())
+                })
+            })?;
         let samplers = stage_binding_labels(&bindings.samplers, |id| {
             self.sampler_states
                 .get(&id)
@@ -2618,7 +2786,7 @@ impl D3d11Device {
                 })
         })?;
         Ok(format!(
-            "gpu={}|rtv=[{}]|dsv={}|vp={}|scissor={}|vb=[{}]|ib={}|topo={}|il={}|blend={}|rast={}|depth={}|shaders=[{}]|cb=[{}]|srv=[{}]|samp=[{}]",
+            "gpu={}|rtv=[{}]|dsv={}|vp={}|scissor={}|vb=[{}]|ib={}|topo={}|il={}|blend={}|rast={}|depth={}|shaders=[{}]|cb=[{}]|srv=[{}]|uav=[{}]|samp=[{}]",
             gpu_profile,
             render_targets.join(","),
             depth_target.unwrap_or_else(|| "none".to_string()),
@@ -2634,6 +2802,7 @@ impl D3d11Device {
             shaders.join(","),
             constant_buffers,
             shader_resources,
+            unordered_access_views,
             samplers,
         ))
     }
@@ -2783,6 +2952,72 @@ impl D3d11Device {
         id
     }
 
+    /// Release a resource: removes the CPU-side record and destroys the
+    /// backend resource. Ids are never reused (monotonic allocation), so live
+    /// handles remain unambiguous after removal.
+    pub fn destroy_resource(&mut self, resource: D3d11ResourceId) -> AppResult<()> {
+        let backend_id = self.resource(resource)?.backend_id;
+        self.resources.remove(&resource);
+        self.backend.destroy_resource(backend_id)
+    }
+
+    pub fn destroy_view(&mut self, view: D3d11ViewId) -> AppResult<()> {
+        self.view(view)?;
+        self.views.remove(&view);
+        Ok(())
+    }
+
+    pub fn destroy_blend_state(&mut self, id: BlendStateId) -> AppResult<()> {
+        remove_id_entry(&mut self.blend_states, id, "blend state")
+    }
+
+    pub fn destroy_rasterizer_state(&mut self, id: RasterizerStateId) -> AppResult<()> {
+        remove_id_entry(&mut self.rasterizer_states, id, "rasterizer state")
+    }
+
+    pub fn destroy_depth_stencil_state(&mut self, id: DepthStencilStateId) -> AppResult<()> {
+        remove_id_entry(&mut self.depth_stencil_states, id, "depth stencil state")
+    }
+
+    pub fn destroy_sampler_state(&mut self, id: SamplerStateId) -> AppResult<()> {
+        remove_id_entry(&mut self.sampler_states, id, "sampler state")
+    }
+
+    pub fn destroy_input_layout(&mut self, id: InputLayoutId) -> AppResult<()> {
+        remove_id_entry(&mut self.input_layouts, id, "input layout")
+    }
+
+    pub fn release_shader(&mut self, id: ShaderId) -> AppResult<()> {
+        remove_id_entry(&mut self.shaders, id, "shader")
+    }
+
+    pub fn destroy_predicate(&mut self, id: u64) -> AppResult<()> {
+        self.predicates.remove(&id).map(|_| ()).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!("unknown D3D11 predicate {id}"),
+            )
+        })
+    }
+
+    pub fn destroy_counter(&mut self, id: u64) -> AppResult<()> {
+        self.counters.remove(&id).map(|_| ()).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!("unknown D3D11 counter {id}"),
+            )
+        })
+    }
+
+    pub fn destroy_class_linkage(&mut self, id: u64) -> AppResult<()> {
+        self.class_linkage.remove(&id).map(|_| ()).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!("unknown D3D11 class linkage {id}"),
+            )
+        })
+    }
+
     // ── Device query methods ──────────────────────────────────────────
 
     pub fn check_format_support(&self, format: DxgiFormat) -> AppResult<crate::gfx::FormatMapping> {
@@ -2841,13 +3076,14 @@ impl D3d11Device {
     pub fn clear_state(&mut self) {
         self.immediate.bindings = ContextBindings::default();
         self.immediate.commands.clear();
+        self.predication = None;
     }
 
     pub fn cs_set_unordered_access_views(&mut self, uavs: Vec<D3d11ViewId>) {
-        // Store UAVs in shader_resources under Cs stage
+        // CS UAVs live in their own binding slot, independent of CS SRVs.
         self.immediate
             .bindings
-            .shader_resources
+            .unordered_access_views
             .insert(ShaderStage::Cs, uavs);
     }
 
@@ -2861,10 +3097,12 @@ impl D3d11Device {
         self.immediate.bindings.render_targets = render_targets;
         self.immediate.bindings.depth_target = depth_target;
         if !uavs.is_empty() {
+            // OM UAVs are visible to the pixel shader stage (D3D11 semantics);
+            // stored separately from CS SRVs/UAVs.
             self.immediate
                 .bindings
-                .shader_resources
-                .insert(ShaderStage::Cs, uavs);
+                .unordered_access_views
+                .insert(ShaderStage::Ps, uavs);
         }
     }
 
@@ -2885,21 +3123,37 @@ impl D3d11Device {
 
     pub fn copy_structure_count(
         &mut self,
-        _dst: D3d11ResourceId,
-        _src: D3d11ResourceId,
-        _aligned_byte_offset: u32,
+        dst: D3d11ResourceId,
+        src_view: D3d11ViewId,
+        aligned_byte_offset: u32,
     ) {
         // CopyStructureCount copies the append/consume counter from a UAV to
-        // a buffer at a given byte offset. Metal append/consume buffers use
-        // atomic counters that are managed by the GPU; the counter value is
-        // read back via a blit operation when needed. For the software backend,
-        // this is a no-op since structure counts are tracked implicitly.
+        // a buffer at a given byte offset. The software backend never
+        // evaluates append/consume counters, so the recorded count is zero;
+        // the command still validates its targets and writes the count into
+        // the destination at execution time.
+        self.immediate
+            .commands
+            .push(RecordedCommand::CopyStructureCount {
+                dst,
+                src_view,
+                aligned_byte_offset,
+            });
     }
-    /// ID3D11DeviceContext::SetPredication — records a predicate for conditional rendering.
-    /// The predicate is evaluated at draw time; if false, the draw is skipped.
-    pub fn set_predication(&mut self, _predicate: u64) {
-        // Predication is recorded but not yet evaluated at draw time in the
-        // software backend. All draws proceed unconditionally.
+
+    /// ID3D11DeviceContext::SetPredication — binds the active predicate for
+    /// conditional rendering. Draws issued while the bound predicate reports
+    /// false are skipped at execution time.
+    pub fn set_predication(&mut self, predicate: u64) {
+        if self.predicates.contains_key(&predicate) {
+            self.predication = Some(predicate);
+        }
+    }
+
+    /// ID3D11DeviceContext::SetPredication(NULL, ...) — clears conditional
+    /// rendering so subsequent draws proceed unconditionally.
+    pub fn clear_predication(&mut self) {
+        self.predication = None;
     }
 }
 
@@ -2909,94 +3163,94 @@ impl DeferredContext {
         render_targets: Vec<D3d11ViewId>,
         depth_target: Option<D3d11ViewId>,
     ) -> AppResult<()> {
-        let mut recording = self.lock()?;
+        let mut recording = self.lock_recording()?;
         recording.bindings.render_targets = render_targets;
         recording.bindings.depth_target = depth_target;
         Ok(())
     }
 
     pub fn rs_set_viewports(&self, viewport: Viewport) -> AppResult<()> {
-        self.lock()?.bindings.viewport = Some(viewport);
+        self.lock_recording()?.bindings.viewport = Some(viewport);
         Ok(())
     }
 
     pub fn rs_clear_viewports(&self) -> AppResult<()> {
-        self.lock()?.bindings.viewport = None;
+        self.lock_recording()?.bindings.viewport = None;
         Ok(())
     }
 
     pub fn rs_set_scissor_rects(&self, scissor_rect: ScissorRect) -> AppResult<()> {
-        self.lock()?.bindings.scissor_rect = Some(scissor_rect);
+        self.lock_recording()?.bindings.scissor_rect = Some(scissor_rect);
         Ok(())
     }
 
     pub fn rs_clear_scissor_rects(&self) -> AppResult<()> {
-        self.lock()?.bindings.scissor_rect = None;
+        self.lock_recording()?.bindings.scissor_rect = None;
         Ok(())
     }
 
     pub fn ia_set_vertex_buffers(&self, buffers: Vec<D3d11ResourceId>) -> AppResult<()> {
-        self.lock()?.bindings.vertex_buffers = buffers;
+        self.lock_recording()?.bindings.vertex_buffers = buffers;
         Ok(())
     }
 
     pub fn ia_set_index_buffer(&self, buffer: D3d11ResourceId) -> AppResult<()> {
-        self.lock()?.bindings.index_buffer = Some(buffer);
+        self.lock_recording()?.bindings.index_buffer = Some(buffer);
         Ok(())
     }
 
     pub fn ia_clear_index_buffer(&self) -> AppResult<()> {
-        self.lock()?.bindings.index_buffer = None;
+        self.lock_recording()?.bindings.index_buffer = None;
         Ok(())
     }
 
     pub fn ia_set_primitive_topology(&self, topology: u32) -> AppResult<()> {
-        self.lock()?.bindings.primitive_topology = Some(topology);
+        self.lock_recording()?.bindings.primitive_topology = Some(topology);
         Ok(())
     }
 
     pub fn ia_set_input_layout(&self, layout: InputLayoutId) -> AppResult<()> {
-        self.lock()?.bindings.input_layout = Some(layout);
+        self.lock_recording()?.bindings.input_layout = Some(layout);
         Ok(())
     }
 
     pub fn ia_clear_input_layout(&self) -> AppResult<()> {
-        self.lock()?.bindings.input_layout = None;
+        self.lock_recording()?.bindings.input_layout = None;
         Ok(())
     }
 
     pub fn om_set_blend_state(&self, state: BlendStateId) -> AppResult<()> {
-        self.lock()?.bindings.blend_state = Some(state);
+        self.lock_recording()?.bindings.blend_state = Some(state);
         Ok(())
     }
 
     pub fn om_clear_blend_state(&self) -> AppResult<()> {
-        self.lock()?.bindings.blend_state = None;
+        self.lock_recording()?.bindings.blend_state = None;
         Ok(())
     }
 
     pub fn rs_set_state(&self, state: RasterizerStateId) -> AppResult<()> {
-        self.lock()?.bindings.rasterizer_state = Some(state);
+        self.lock_recording()?.bindings.rasterizer_state = Some(state);
         Ok(())
     }
 
     pub fn rs_clear_state(&self) -> AppResult<()> {
-        self.lock()?.bindings.rasterizer_state = None;
+        self.lock_recording()?.bindings.rasterizer_state = None;
         Ok(())
     }
 
     pub fn om_set_depth_stencil_state(&self, state: DepthStencilStateId) -> AppResult<()> {
-        self.lock()?.bindings.depth_stencil_state = Some(state);
+        self.lock_recording()?.bindings.depth_stencil_state = Some(state);
         Ok(())
     }
 
     pub fn om_clear_depth_stencil_state(&self) -> AppResult<()> {
-        self.lock()?.bindings.depth_stencil_state = None;
+        self.lock_recording()?.bindings.depth_stencil_state = None;
         Ok(())
     }
 
     pub fn vs_set_shader(&self, shader: ShaderId) -> AppResult<()> {
-        self.lock()?
+        self.lock_recording()?
             .bindings
             .shaders
             .insert(ShaderStage::Vs, shader);
@@ -3004,12 +3258,12 @@ impl DeferredContext {
     }
 
     pub fn vs_clear_shader(&self) -> AppResult<()> {
-        self.lock()?.bindings.shaders.remove(&ShaderStage::Vs);
+        self.lock_recording()?.bindings.shaders.remove(&ShaderStage::Vs);
         Ok(())
     }
 
     pub fn ps_set_shader(&self, shader: ShaderId) -> AppResult<()> {
-        self.lock()?
+        self.lock_recording()?
             .bindings
             .shaders
             .insert(ShaderStage::Ps, shader);
@@ -3017,12 +3271,12 @@ impl DeferredContext {
     }
 
     pub fn ps_clear_shader(&self) -> AppResult<()> {
-        self.lock()?.bindings.shaders.remove(&ShaderStage::Ps);
+        self.lock_recording()?.bindings.shaders.remove(&ShaderStage::Ps);
         Ok(())
     }
 
     pub fn cs_set_shader(&self, shader: ShaderId) -> AppResult<()> {
-        self.lock()?
+        self.lock_recording()?
             .bindings
             .shaders
             .insert(ShaderStage::Cs, shader);
@@ -3030,12 +3284,12 @@ impl DeferredContext {
     }
 
     pub fn cs_clear_shader(&self) -> AppResult<()> {
-        self.lock()?.bindings.shaders.remove(&ShaderStage::Cs);
+        self.lock_recording()?.bindings.shaders.remove(&ShaderStage::Cs);
         Ok(())
     }
 
     pub fn vs_set_constant_buffers(&self, buffers: Vec<D3d11ResourceId>) -> AppResult<()> {
-        self.lock()?
+        self.lock_recording()?
             .bindings
             .constant_buffers
             .insert(ShaderStage::Vs, buffers);
@@ -3043,7 +3297,7 @@ impl DeferredContext {
     }
 
     pub fn ps_set_shader_resources(&self, resources: Vec<D3d11ViewId>) -> AppResult<()> {
-        self.lock()?
+        self.lock_recording()?
             .bindings
             .shader_resources
             .insert(ShaderStage::Ps, resources);
@@ -3051,7 +3305,7 @@ impl DeferredContext {
     }
 
     pub fn vs_set_samplers(&self, samplers: Vec<SamplerStateId>) -> AppResult<()> {
-        self.lock()?
+        self.lock_recording()?
             .bindings
             .samplers
             .insert(ShaderStage::Vs, samplers);
@@ -3059,7 +3313,7 @@ impl DeferredContext {
     }
 
     pub fn ps_set_samplers(&self, samplers: Vec<SamplerStateId>) -> AppResult<()> {
-        self.lock()?
+        self.lock_recording()?
             .bindings
             .samplers
             .insert(ShaderStage::Ps, samplers);
@@ -3067,7 +3321,7 @@ impl DeferredContext {
     }
 
     pub fn gs_set_shader(&self, shader: ShaderId) -> AppResult<()> {
-        self.lock()?
+        self.lock_recording()?
             .bindings
             .shaders
             .insert(ShaderStage::Gs, shader);
@@ -3075,12 +3329,12 @@ impl DeferredContext {
     }
 
     pub fn gs_clear_shader(&self) -> AppResult<()> {
-        self.lock()?.bindings.shaders.remove(&ShaderStage::Gs);
+        self.lock_recording()?.bindings.shaders.remove(&ShaderStage::Gs);
         Ok(())
     }
 
     pub fn hs_set_shader(&self, shader: ShaderId) -> AppResult<()> {
-        self.lock()?
+        self.lock_recording()?
             .bindings
             .shaders
             .insert(ShaderStage::Hs, shader);
@@ -3088,12 +3342,12 @@ impl DeferredContext {
     }
 
     pub fn hs_clear_shader(&self) -> AppResult<()> {
-        self.lock()?.bindings.shaders.remove(&ShaderStage::Hs);
+        self.lock_recording()?.bindings.shaders.remove(&ShaderStage::Hs);
         Ok(())
     }
 
     pub fn ds_set_shader(&self, shader: ShaderId) -> AppResult<()> {
-        self.lock()?
+        self.lock_recording()?
             .bindings
             .shaders
             .insert(ShaderStage::Ds, shader);
@@ -3101,12 +3355,12 @@ impl DeferredContext {
     }
 
     pub fn ds_clear_shader(&self) -> AppResult<()> {
-        self.lock()?.bindings.shaders.remove(&ShaderStage::Ds);
+        self.lock_recording()?.bindings.shaders.remove(&ShaderStage::Ds);
         Ok(())
     }
 
     pub fn vs_set_shader_resources(&self, resources: Vec<D3d11ViewId>) -> AppResult<()> {
-        self.lock()?
+        self.lock_recording()?
             .bindings
             .shader_resources
             .insert(ShaderStage::Vs, resources);
@@ -3114,7 +3368,7 @@ impl DeferredContext {
     }
 
     pub fn cs_set_shader_resources(&self, resources: Vec<D3d11ViewId>) -> AppResult<()> {
-        self.lock()?
+        self.lock_recording()?
             .bindings
             .shader_resources
             .insert(ShaderStage::Cs, resources);
@@ -3122,7 +3376,7 @@ impl DeferredContext {
     }
 
     pub fn gs_set_shader_resources(&self, resources: Vec<D3d11ViewId>) -> AppResult<()> {
-        self.lock()?
+        self.lock_recording()?
             .bindings
             .shader_resources
             .insert(ShaderStage::Gs, resources);
@@ -3130,7 +3384,7 @@ impl DeferredContext {
     }
 
     pub fn hs_set_shader_resources(&self, resources: Vec<D3d11ViewId>) -> AppResult<()> {
-        self.lock()?
+        self.lock_recording()?
             .bindings
             .shader_resources
             .insert(ShaderStage::Hs, resources);
@@ -3138,7 +3392,7 @@ impl DeferredContext {
     }
 
     pub fn ds_set_shader_resources(&self, resources: Vec<D3d11ViewId>) -> AppResult<()> {
-        self.lock()?
+        self.lock_recording()?
             .bindings
             .shader_resources
             .insert(ShaderStage::Ds, resources);
@@ -3146,7 +3400,7 @@ impl DeferredContext {
     }
 
     pub fn cs_set_constant_buffers(&self, buffers: Vec<D3d11ResourceId>) -> AppResult<()> {
-        self.lock()?
+        self.lock_recording()?
             .bindings
             .constant_buffers
             .insert(ShaderStage::Cs, buffers);
@@ -3154,7 +3408,7 @@ impl DeferredContext {
     }
 
     pub fn gs_set_constant_buffers(&self, buffers: Vec<D3d11ResourceId>) -> AppResult<()> {
-        self.lock()?
+        self.lock_recording()?
             .bindings
             .constant_buffers
             .insert(ShaderStage::Gs, buffers);
@@ -3162,7 +3416,7 @@ impl DeferredContext {
     }
 
     pub fn hs_set_constant_buffers(&self, buffers: Vec<D3d11ResourceId>) -> AppResult<()> {
-        self.lock()?
+        self.lock_recording()?
             .bindings
             .constant_buffers
             .insert(ShaderStage::Hs, buffers);
@@ -3170,7 +3424,7 @@ impl DeferredContext {
     }
 
     pub fn ds_set_constant_buffers(&self, buffers: Vec<D3d11ResourceId>) -> AppResult<()> {
-        self.lock()?
+        self.lock_recording()?
             .bindings
             .constant_buffers
             .insert(ShaderStage::Ds, buffers);
@@ -3178,7 +3432,7 @@ impl DeferredContext {
     }
 
     pub fn cs_set_samplers(&self, samplers: Vec<SamplerStateId>) -> AppResult<()> {
-        self.lock()?
+        self.lock_recording()?
             .bindings
             .samplers
             .insert(ShaderStage::Cs, samplers);
@@ -3186,7 +3440,7 @@ impl DeferredContext {
     }
 
     pub fn gs_set_samplers(&self, samplers: Vec<SamplerStateId>) -> AppResult<()> {
-        self.lock()?
+        self.lock_recording()?
             .bindings
             .samplers
             .insert(ShaderStage::Gs, samplers);
@@ -3194,7 +3448,7 @@ impl DeferredContext {
     }
 
     pub fn hs_set_samplers(&self, samplers: Vec<SamplerStateId>) -> AppResult<()> {
-        self.lock()?
+        self.lock_recording()?
             .bindings
             .samplers
             .insert(ShaderStage::Hs, samplers);
@@ -3202,7 +3456,7 @@ impl DeferredContext {
     }
 
     pub fn ds_set_samplers(&self, samplers: Vec<SamplerStateId>) -> AppResult<()> {
-        self.lock()?
+        self.lock_recording()?
             .bindings
             .samplers
             .insert(ShaderStage::Ds, samplers);
@@ -3210,16 +3464,16 @@ impl DeferredContext {
     }
 
     pub fn clear_state(&self) -> AppResult<()> {
-        let mut recording = self.lock()?;
+        let mut recording = self.lock_recording()?;
         recording.bindings = ContextBindings::default();
         recording.commands.clear();
         Ok(())
     }
 
     pub fn cs_set_unordered_access_views(&self, uavs: Vec<D3d11ViewId>) -> AppResult<()> {
-        self.lock()?
+        self.lock_recording()?
             .bindings
-            .shader_resources
+            .unordered_access_views
             .insert(ShaderStage::Cs, uavs);
         Ok(())
     }
@@ -3231,24 +3485,28 @@ impl DeferredContext {
         _uav_start_slot: u32,
         uavs: Vec<D3d11ViewId>,
     ) -> AppResult<()> {
-        let mut recording = self.lock()?;
+        let mut recording = self.lock_recording()?;
         recording.bindings.render_targets = render_targets;
         recording.bindings.depth_target = depth_target;
         if !uavs.is_empty() {
             recording
                 .bindings
-                .shader_resources
-                .insert(ShaderStage::Cs, uavs);
+                .unordered_access_views
+                .insert(ShaderStage::Ps, uavs);
         }
         Ok(())
     }
 
     pub fn generate_mips(&self, _view_srv: D3d11ViewId) -> AppResult<()> {
+        // MIP generation: in the software backend, textures are created with
+        // single-level storage and no mip chain to regenerate. Validate the
+        // context is still recording and accept the call.
+        let _recording = self.lock_recording()?;
         Ok(())
     }
 
     pub fn draw_auto(&self) -> AppResult<()> {
-        self.lock()?.commands.push(RecordedCommand::Draw {
+        self.lock_recording()?.commands.push(RecordedCommand::Draw {
             vertices: 0,
             kind: DrawCallKind::Regular,
         });
@@ -3257,15 +3515,25 @@ impl DeferredContext {
 
     pub fn copy_structure_count(
         &self,
-        _dst: D3d11ResourceId,
-        _src: D3d11ResourceId,
-        _aligned_byte_offset: u32,
+        dst: D3d11ResourceId,
+        src_view: D3d11ViewId,
+        aligned_byte_offset: u32,
     ) -> AppResult<()> {
+        // The software backend never evaluates append/consume counters, so the
+        // recorded count is zero; the recorded command validates its targets
+        // and writes the count into the destination at execution time.
+        self.lock_recording()?
+            .commands
+            .push(RecordedCommand::CopyStructureCount {
+                dst,
+                src_view,
+                aligned_byte_offset,
+            });
         Ok(())
     }
 
     pub fn update_subresource(&self, resource: D3d11ResourceId, bytes: &[u8]) -> AppResult<()> {
-        self.lock()?
+        self.lock_recording()?
             .commands
             .push(RecordedCommand::UpdateSubresource {
                 resource,
@@ -3275,7 +3543,7 @@ impl DeferredContext {
     }
 
     pub fn clear_render_target_view(&self, view: D3d11ViewId, color: [u8; 4]) -> AppResult<()> {
-        self.lock()?
+        self.lock_recording()?
             .commands
             .push(RecordedCommand::ClearRenderTargetView { view, color });
         Ok(())
@@ -3287,7 +3555,7 @@ impl DeferredContext {
         depth: u32,
         stencil: u8,
     ) -> AppResult<()> {
-        self.lock()?
+        self.lock_recording()?
             .commands
             .push(RecordedCommand::ClearDepthStencilView {
                 view,
@@ -3305,7 +3573,7 @@ impl DeferredContext {
         src_subresource: u32,
         format: u32,
     ) -> AppResult<()> {
-        self.lock()?
+        self.lock_recording()?
             .commands
             .push(RecordedCommand::ResolveSubresource {
                 dst,
@@ -3318,14 +3586,14 @@ impl DeferredContext {
     }
 
     pub fn copy_resource(&self, src: D3d11ResourceId, dst: D3d11ResourceId) -> AppResult<()> {
-        self.lock()?
+        self.lock_recording()?
             .commands
             .push(RecordedCommand::CopyResource { src, dst });
         Ok(())
     }
 
     pub fn draw(&self, vertices: u32) -> AppResult<()> {
-        self.lock()?.commands.push(RecordedCommand::Draw {
+        self.lock_recording()?.commands.push(RecordedCommand::Draw {
             vertices,
             kind: DrawCallKind::Regular,
         });
@@ -3333,7 +3601,7 @@ impl DeferredContext {
     }
 
     pub fn draw_instanced(&self, vertices: u32, instances: u32) -> AppResult<()> {
-        self.lock()?.commands.push(RecordedCommand::Draw {
+        self.lock_recording()?.commands.push(RecordedCommand::Draw {
             vertices,
             kind: DrawCallKind::Instanced { instances },
         });
@@ -3341,7 +3609,7 @@ impl DeferredContext {
     }
 
     pub fn draw_indexed(&self, indices: u32) -> AppResult<()> {
-        self.lock()?.commands.push(RecordedCommand::DrawIndexed {
+        self.lock_recording()?.commands.push(RecordedCommand::DrawIndexed {
             indices,
             kind: IndexedDrawCallKind::Regular,
         });
@@ -3349,7 +3617,7 @@ impl DeferredContext {
     }
 
     pub fn draw_indexed_instanced(&self, indices: u32, instances: u32) -> AppResult<()> {
-        self.lock()?.commands.push(RecordedCommand::DrawIndexed {
+        self.lock_recording()?.commands.push(RecordedCommand::DrawIndexed {
             indices,
             kind: IndexedDrawCallKind::Instanced { instances },
         });
@@ -3357,7 +3625,7 @@ impl DeferredContext {
     }
 
     pub fn dispatch(&self, x: u32, y: u32, z: u32) -> AppResult<()> {
-        self.lock()?
+        self.lock_recording()?
             .commands
             .push(RecordedCommand::Dispatch { x, y, z });
         Ok(())
@@ -3402,6 +3670,20 @@ impl DeferredContext {
             )
         })
     }
+
+    /// Locks the recording and rejects any further mutation once the context
+    /// has been finished. D3D11 raises `D3D11_ERROR_INVALID_CALL` on every
+    /// method call after `FinishCommandList`.
+    fn lock_recording(&self) -> AppResult<std::sync::MutexGuard<'_, DeferredRecording>> {
+        let recording = self.lock()?;
+        if recording.finished {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                "deferred context has already finished recording; method call rejected",
+            ));
+        }
+        Ok(recording)
+    }
 }
 
 // ── Deferred-context validation helpers ──────────────────────────────────
@@ -3410,13 +3692,22 @@ impl DeferredContext {
 /// are still valid on the device (i.e. have not been destroyed).
 fn validate_command_resources(command: &RecordedCommand, device: &D3d11Device) -> AppResult<()> {
     match command {
-        RecordedCommand::UpdateSubresource { resource, .. } => {
-            device.resource(*resource).map_err(|_| {
+        RecordedCommand::UpdateSubresource { resource, bytes } => {
+            let record = device.resource(*resource).map_err(|_| {
                 AppError::new(
                     ReasonCode::RcD3dInvalidState,
                     format!("command references destroyed resource {resource}"),
                 )
             })?;
+            if bytes.len() > record.bytes.len() {
+                return Err(AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    format!(
+                        "update subresource payload exceeds resource {}",
+                        record.desc.label
+                    ),
+                ));
+            }
         }
         RecordedCommand::CopyResource { src, dst }
         | RecordedCommand::CopySubresourceRegion { src, dst, .. } => {
@@ -3462,6 +3753,41 @@ fn validate_command_resources(command: &RecordedCommand, device: &D3d11Device) -
                     format!("command references destroyed source resource {src}"),
                 )
             })?;
+        }
+        RecordedCommand::CopyStructureCount {
+            dst,
+            src_view,
+            aligned_byte_offset,
+        } => {
+            let destination = device.resource(*dst).map_err(|_| {
+                AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    format!("command references destroyed destination resource {dst}"),
+                )
+            })?;
+            device.view(*src_view).map_err(|_| {
+                AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    format!("command references destroyed source view {src_view}"),
+                )
+            })?;
+            let end = (*aligned_byte_offset as usize)
+                .checked_add(4)
+                .ok_or_else(|| {
+                    AppError::new(
+                        ReasonCode::RcD3dInvalidState,
+                        "copy structure count offset overflow",
+                    )
+                })?;
+            if end > destination.bytes.len() {
+                return Err(AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    format!(
+                        "copy structure count out of bounds for resource {}",
+                        destination.desc.label
+                    ),
+                ));
+            }
         }
         RecordedCommand::Draw { .. }
         | RecordedCommand::DrawIndexed { .. }
@@ -3539,11 +3865,36 @@ fn validate_binding_consistency(
     Ok(())
 }
 
+/// Returns true when every command is a draw; such a list can be fused with
+/// another draw-only list without altering render-pass boundaries.
+fn commands_are_draw_only(commands: &[RecordedCommand]) -> bool {
+    commands.iter().all(|command| {
+        matches!(
+            command,
+            RecordedCommand::Draw { .. } | RecordedCommand::DrawIndexed { .. }
+        )
+    })
+}
+
+/// Removes a device-side object from its map, rejecting unknown ids so
+/// callers cannot silently release objects they do not own.
+fn remove_id_entry<T>(map: &mut BTreeMap<u64, T>, id: u64, kind: &str) -> AppResult<()> {
+    map.remove(&id).map(|_| ()).ok_or_else(|| {
+        AppError::new(
+            ReasonCode::RcD3dInvalidState,
+            format!("unknown D3D11 {kind} {id}"),
+        )
+    })
+}
+
 impl Direct3D9Shim {
     pub fn new(enabled: bool) -> Self {
         Direct3D9Shim {
             enabled,
             next_id: 1,
+            next_vertex_buffer_id: 1,
+            next_index_buffer_id: 1,
+            next_texture_id: 1,
             vertex_buffers: BTreeMap::new(),
             index_buffers: BTreeMap::new(),
             textures: BTreeMap::new(),
@@ -3564,13 +3915,17 @@ impl Direct3D9Shim {
         }
         let id = self.next_id;
         self.next_id += 1;
-        let device = Direct3D9Device {
+        let mut device = Direct3D9Device {
             id,
             state: D3d9StateBlock::new(),
             present_params: D3dPresentParameters::default(),
             swapchain_width: 640,
             swapchain_height: 480,
         };
+        // Keep the default viewport consistent with the default swapchain
+        // dimensions so default-state rendering covers the backbuffer.
+        device.state.viewport.width = device.swapchain_width;
+        device.state.viewport.height = device.swapchain_height;
         let dev = device.clone();
         self.devices.insert(id, device);
         Ok(dev)
@@ -3582,7 +3937,8 @@ impl Direct3D9Shim {
         fvf: u32,
         stride: u32,
     ) -> D3d9VertexBufferId {
-        let id = self.vertex_buffers.len() as D3d9VertexBufferId + 1;
+        let id = self.next_vertex_buffer_id;
+        self.next_vertex_buffer_id += 1;
         self.vertex_buffers.insert(
             id,
             VertexBuffer9 {
@@ -3597,7 +3953,8 @@ impl Direct3D9Shim {
     }
 
     pub fn alloc_index_buffer(&mut self, size: usize, format: bool) -> D3d9IndexBufferId {
-        let id = self.index_buffers.len() as D3d9IndexBufferId + 1;
+        let id = self.next_index_buffer_id;
+        self.next_index_buffer_id += 1;
         self.index_buffers.insert(
             id,
             IndexBuffer9 {
@@ -3617,12 +3974,17 @@ impl Direct3D9Shim {
         level_count: u32,
         format: u32,
     ) -> D3d9TextureId {
-        let id = self.textures.len() as D3d9TextureId + 1;
+        // Clamp to the D3D9 maximum texture dimension (16384) so the usize
+        // pixel-count arithmetic below can never overflow.
+        let width = width.min(16384);
+        let height = height.min(16384);
+        let id = self.next_texture_id;
+        self.next_texture_id += 1;
         let mut levels = Vec::new();
         let mut mip_w = width;
         let mut mip_h = height;
         for _ in 0..level_count {
-            let pixel_count = (mip_w * mip_h * 4) as usize;
+            let pixel_count = (mip_w as usize) * (mip_h as usize) * 4;
             levels.push(vec![0u8; pixel_count]);
             mip_w = (mip_w / 2).max(1);
             mip_h = (mip_h / 2).max(1);
@@ -3640,15 +4002,54 @@ impl Direct3D9Shim {
         id
     }
 
+    pub fn release_vertex_buffer(&mut self, id: D3d9VertexBufferId) -> AppResult<()> {
+        self.vertex_buffers.remove(&id).map(|_| ()).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!("unknown d3d9 vertex buffer {id}"),
+            )
+        })
+    }
+
+    pub fn release_index_buffer(&mut self, id: D3d9IndexBufferId) -> AppResult<()> {
+        self.index_buffers.remove(&id).map(|_| ()).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!("unknown d3d9 index buffer {id}"),
+            )
+        })
+    }
+
+    pub fn release_texture(&mut self, id: D3d9TextureId) -> AppResult<()> {
+        self.textures.remove(&id).map(|_| ()).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!("unknown d3d9 texture {id}"),
+            )
+        })
+    }
+
+    pub fn release_device(&mut self, id: D3d9DeviceId) -> AppResult<()> {
+        self.devices.remove(&id).map(|_| ()).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!("unknown d3d9 device {id}"),
+            )
+        })
+    }
+
     pub fn present(&mut self, device_id: D3d9DeviceId) -> AppResult<D3d9Frame> {
         let device = self.devices.get(&device_id).ok_or_else(|| {
             AppError::new(ReasonCode::RcD3d9NotSupported, "invalid d3d9 device id")
         })?;
-        let (w, h) = (device.swapchain_width, device.swapchain_height);
+        let (w, h) = (
+            device.swapchain_width.min(16384),
+            device.swapchain_height.min(16384),
+        );
         let pixels = self
             .render_target
             .clone()
-            .unwrap_or_else(|| (w, h, vec![0u8; (w * h * 4) as usize]));
+            .unwrap_or_else(|| (w, h, vec![0u8; (w as usize) * (h as usize) * 4]));
         let sig = format!("d3d9:present:device={}", device_id);
         Ok(D3d9Frame {
             hash: util::sha256_bytes(sig.as_bytes()),
@@ -3662,9 +4063,9 @@ impl Direct3D9Shim {
 
 impl Direct3D9Device {
     pub fn render_fixed_function_scene(&self, scene: &FixedFunctionScene) -> AppResult<D3d9Frame> {
-        let w = self.swapchain_width.max(1);
-        let h = self.swapchain_height.max(1);
-        let stride = (w * 4) as usize;
+        let w = self.swapchain_width.clamp(1, 16384);
+        let h = self.swapchain_height.clamp(1, 16384);
+        let stride = (w as usize) * 4;
         let mut pixels = vec![0u8; (h as usize) * stride];
 
         // Fill background with diffuse color
@@ -3680,11 +4081,11 @@ impl Direct3D9Device {
         }
 
         // Draw simple placeholder primitives based on state
-        let prim_count = scene.primitive_count.max(1).min(100) as usize;
+        let prim_count = scene.primitive_count.clamp(1, 100) as usize;
         for i in 0..prim_count {
             let cx = (w as f32) / 2.0;
             let cy = (h as f32) / 2.0;
-            let angle = (i as f32) * 6.2832 / (prim_count as f32);
+            let angle = (i as f32) * std::f32::consts::TAU / (prim_count as f32);
             let r = (w.min(h) as f32) * 0.3;
             let px = (cx + r * angle.cos()) as i32;
             let py = (cy + r * angle.sin()) as i32;
@@ -3866,17 +4267,25 @@ fn create_device_internal_with_backend(
     } else {
         request.requested_feature_levels
     };
+    // D3D11 device creation returns the first requested feature level the
+    // backend can satisfy, in request order. The Metal planner can satisfy
+    // 11_0 when the host GPU family supports mesh shaders; 10_1 is always
+    // supported.
+    let backend_mesh = backend.capabilities().mesh_shaders;
     let feature_level = requested
         .iter()
         .copied()
-        .find(|level| *level == FeatureLevel::Level10_1)
+        .find(|level| match level {
+            FeatureLevel::Level11_0 => backend_mesh,
+            FeatureLevel::Level10_1 => true,
+        })
         .ok_or_else(|| {
             AppError::new(
                 ReasonCode::RcD3dFeatureUnsupported,
                 "requested D3D11 feature levels are not supported by the Metal planner",
             )
             .with_hint(
-                "request feature level 10_1 when geometry or tessellation shaders are unavailable",
+                "request feature level 10_1, or 11_0 on mesh-shader-capable GPUs",
             )
         })?;
     let swapchain = match swapchain_desc {
@@ -3895,6 +4304,7 @@ fn create_device_internal_with_backend(
                     mapped: false,
                     backend_id: backbuffer,
                     include_in_digests: false,
+                    digest: None,
                     desc: D3d11ResourceDesc {
                         label: format!("swapchain-backbuffer-{index}"),
                         dimension: ResourceDimension::Texture2D,
@@ -3939,8 +4349,10 @@ fn create_device_internal_with_backend(
         // Metal has no native geometry shader stage; D3D11 geometry shaders are
         // unsupported on this backend regardless of the host GPU family.
         geometry_shader: false,
-        hull_shader: backend.capabilities().mesh_shaders,
-        domain_shader: backend.capabilities().mesh_shaders,
+        // Hull/domain (tessellation) stages only exist at feature level 11_0;
+        // a 10_1 device must not advertise them.
+        hull_shader: backend_mesh && feature_level == FeatureLevel::Level11_0,
+        domain_shader: backend_mesh && feature_level == FeatureLevel::Level11_0,
     };
     Ok(D3d11Device {
         next_id,
@@ -3967,6 +4379,7 @@ fn create_device_internal_with_backend(
         predicates: BTreeMap::new(),
         counters: BTreeMap::new(),
         class_linkage: BTreeMap::new(),
+        predication: None,
     })
 }
 
@@ -4089,13 +4502,20 @@ fn texture_usage_flags(hint: ResourceUsageHint) -> (bool, bool, bool, bool) {
     }
 }
 
-fn build_submission_signature(
-    gpu_profile: &str,
-    feature_level: FeatureLevel,
+/// Aggregate counters for a single submission, passed to signature building
+/// to keep the argument list small.
+#[derive(Debug, Clone, Copy)]
+struct SubmissionStats {
     draw_calls: u32,
     indexed_draw_calls: u32,
     dispatch_calls: u32,
     executed_command_lists: usize,
+}
+
+fn build_submission_signature(
+    gpu_profile: &str,
+    feature_level: FeatureLevel,
+    stats: SubmissionStats,
     binding_signatures: &[String],
     resource_digests: &BTreeMap<String, String>,
     backend_plan: &crate::gfx::MetalCommandBufferPlan,
@@ -4104,10 +4524,10 @@ fn build_submission_signature(
         "gpu={}|fl={:?}|lists={}|draw={}|draw_indexed={}|dispatch={}|render_passes={}|compute_passes={}|blit_passes={}|validation={}",
         gpu_profile,
         feature_level,
-        executed_command_lists,
-        draw_calls,
-        indexed_draw_calls,
-        dispatch_calls,
+        stats.executed_command_lists,
+        stats.draw_calls,
+        stats.indexed_draw_calls,
+        stats.dispatch_calls,
         backend_plan.render_passes.len(),
         backend_plan.compute_passes,
         backend_plan.blit_passes,
@@ -5351,5 +5771,229 @@ mod tests {
             .create_shader_resource_view(tex, DxgiFormat::R8G8B8A8Unorm)
             .expect("create SRV 2");
         assert_ne!(srv1, srv2, "multiple SRVs should have distinct IDs");
+    }
+
+    // ── Audit-fix regression tests ────────────────────────────────────
+
+    #[test]
+    fn deferred_context_oversized_update_subresource_rejected_on_finish() {
+        let mut device = create_device_internal_with_backend(
+            DeviceCreationRequest {
+                requested_feature_levels: vec![FeatureLevel::Level10_1],
+            },
+            None,
+            test_backend(host_gpu_profile_from_name("Apple M1 Max")),
+        )
+        .expect("create device");
+        let ctx = device.create_deferred_context();
+
+        let buf = device
+            .create_buffer("small-buf", 64, ResourceUsageHint::Generic)
+            .expect("create buffer");
+        ctx.update_subresource(buf, &vec![0u8; 1_000_000])
+            .expect("record oversized update");
+
+        let err = ctx.finish_command_list(&device).unwrap_err();
+        assert!(
+            err.to_string().contains("exceeds"),
+            "expected size validation error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn deferred_context_merge_never_fuses_clear_lists() {
+        let mut device = create_device_internal_with_backend(
+            DeviceCreationRequest {
+                requested_feature_levels: vec![FeatureLevel::Level10_1],
+            },
+            None,
+            test_backend(host_gpu_profile_from_name("Apple M1 Max")),
+        )
+        .expect("create device");
+
+        let tex = device
+            .create_texture_2d("clear-rt", 2, 2, DxgiFormat::B8G8R8A8Unorm)
+            .expect("create texture");
+        let rtv = device
+            .create_render_target_view(tex, DxgiFormat::B8G8R8A8Unorm)
+            .expect("create rtv");
+        let make_clear_list = |device: &D3d11Device| -> D3d11CommandList {
+            let ctx = device.create_deferred_context();
+            ctx.om_set_render_targets(vec![rtv], None).expect("set RT");
+            ctx.clear_render_target_view(rtv, [255, 0, 0, 255])
+                .expect("clear");
+            ctx.finish_command_list(device).expect("finish")
+        };
+
+        let lists = vec![make_clear_list(&device), make_clear_list(&device)];
+        let merged = device.merge_deferred_command_lists(&lists);
+        assert_eq!(
+            merged.len(),
+            2,
+            "clear lists must remain separate passes, got {} merged lists",
+            merged.len()
+        );
+    }
+
+    #[test]
+    fn predication_skips_draws_when_predicate_is_false() {
+        let mut device = create_device_internal_with_backend(
+            DeviceCreationRequest {
+                requested_feature_levels: vec![FeatureLevel::Level10_1],
+            },
+            None,
+            test_backend(host_gpu_profile_from_name("Apple M1 Max")),
+        )
+        .expect("create device");
+
+        let tex = device
+            .create_texture_2d("pred-rt", 2, 2, DxgiFormat::B8G8R8A8Unorm)
+            .expect("create texture");
+        let rtv = device
+            .create_render_target_view(tex, DxgiFormat::B8G8R8A8Unorm)
+            .expect("create rtv");
+        device.om_set_render_targets(vec![rtv], None);
+        device.ia_set_primitive_topology(4);
+
+        let predicate = device.create_predicate(PredicateType::Occlusion);
+        device.set_predication(predicate);
+        device.draw(3);
+        let submission = device.submit_immediate().expect("submit predicated workload");
+        assert_eq!(
+            submission.draw_calls, 0,
+            "draws under a false predicate must be skipped"
+        );
+
+        device.clear_predication();
+        device.draw(3);
+        let submission = device.submit_immediate().expect("submit unpredicated workload");
+        assert_eq!(submission.draw_calls, 1);
+    }
+
+    #[test]
+    fn copy_structure_count_writes_zero_count_into_destination() {
+        let mut device = create_device_internal_with_backend(
+            DeviceCreationRequest {
+                requested_feature_levels: vec![FeatureLevel::Level10_1],
+            },
+            None,
+            test_backend(host_gpu_profile_from_name("Apple M1 Max")),
+        )
+        .expect("create device");
+
+        let buf = device
+            .create_buffer("count-dst", 64, ResourceUsageHint::Generic)
+            .expect("create buffer");
+        device
+            .update_subresource(buf, &[0xAB; 64])
+            .expect("seed buffer");
+        let tex = device
+            .create_texture_2d("count-src", 2, 2, DxgiFormat::B8G8R8A8Unorm)
+            .expect("create texture");
+        let uav = device
+            .create_unordered_access_view(tex, DxgiFormat::B8G8R8A8Unorm)
+            .expect("create uav");
+
+        device.copy_structure_count(buf, uav, 8);
+        device.submit_immediate().expect("submit");
+
+        let bytes = device.resource(buf).expect("buffer record").bytes.clone();
+        assert_eq!(
+            &bytes[8..12],
+            &0u32.to_le_bytes(),
+            "recorded structure count must be written at the offset"
+        );
+        assert_eq!(bytes[0], 0xAB, "bytes before the offset must be untouched");
+    }
+
+    #[test]
+    fn device_creation_accepts_level11_0_request_on_mesh_backend() {
+        let apple11 = create_device_internal_with_backend(
+            DeviceCreationRequest {
+                requested_feature_levels: vec![FeatureLevel::Level11_0],
+            },
+            None,
+            test_backend(host_gpu_profile_from_name("Apple M5 Pro")),
+        )
+        .expect("11_0 request on mesh-capable backend");
+        assert_eq!(apple11.feature_level(), FeatureLevel::Level11_0);
+        assert!(apple11.caps().hull_shader, "11_0 device may advertise tessellation");
+
+        let err = create_device_internal_with_backend(
+            DeviceCreationRequest {
+                requested_feature_levels: vec![FeatureLevel::Level11_0],
+            },
+            None,
+            test_backend(host_gpu_profile_from_name("Apple M1 Max")),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("not supported"),
+            "expected unsupported error, got: {err}"
+        );
+
+        let apple7 = create_device_internal_with_backend(
+            DeviceCreationRequest {
+                requested_feature_levels: vec![FeatureLevel::Level10_1],
+            },
+            None,
+            test_backend(host_gpu_profile_from_name("Apple M1 Max")),
+        )
+        .expect("10_1 request");
+        assert_eq!(apple7.feature_level(), FeatureLevel::Level10_1);
+        assert!(
+            !apple7.caps().hull_shader,
+            "10_1 device must not advertise tessellation"
+        );
+    }
+
+    #[test]
+    fn destroy_resource_frees_record_and_rejects_double_destroy() {
+        let mut device = d3d11_create_device(DeviceCreationRequest {
+            requested_feature_levels: vec![FeatureLevel::Level10_1],
+        })
+        .expect("create device");
+
+        let buf = device
+            .create_buffer("doomed", 64, ResourceUsageHint::Generic)
+            .expect("create buffer");
+        device.destroy_resource(buf).expect("destroy resource");
+        assert!(device.resource(buf).is_err(), "destroyed resource must be gone");
+        let err = device.destroy_resource(buf).unwrap_err();
+        assert!(
+            err.to_string().contains("unknown"),
+            "double destroy must fail, got: {err}"
+        );
+    }
+
+    #[test]
+    fn cs_srvs_and_uavs_bind_independently() {
+        let mut device = d3d11_create_device(DeviceCreationRequest {
+            requested_feature_levels: vec![FeatureLevel::Level10_1],
+        })
+        .expect("create device");
+
+        let tex = device
+            .create_texture_2d("cs-tex", 2, 2, DxgiFormat::B8G8R8A8Unorm)
+            .expect("create texture");
+        let srv = device
+            .create_shader_resource_view(tex, DxgiFormat::B8G8R8A8Unorm)
+            .expect("create srv");
+        let uav = device
+            .create_unordered_access_view(tex, DxgiFormat::B8G8R8A8Unorm)
+            .expect("create uav");
+
+        device.cs_set_shader_resources(vec![srv]);
+        device.cs_set_unordered_access_views(vec![uav]);
+        assert_eq!(
+            device.cs_get_shader_resources(),
+            vec![srv],
+            "CS SRVs must survive UAV binding"
+        );
+        assert_eq!(
+            device.cs_get_unordered_access_views(),
+            vec![uav],
+            "CS UAVs must be tracked independently"
+        );
     }
 }
