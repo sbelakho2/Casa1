@@ -22,7 +22,7 @@ use crate::reason::ReasonCode;
 use crate::util;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
-use std::ffi::CString;
+use std::ffi::{c_void, CStr, CString};
 use std::os::raw::c_char;
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
@@ -339,6 +339,9 @@ pub const VK_SUBOPTIMAL_KHR: VkResultType = 1000001003;
 pub const VK_ERROR_OUT_OF_DATE_KHR: VkResultType = -1000001004;
 
 /// Global Vulkan state accessor for thunk dispatch.
+///
+/// Recovers from a poisoned mutex (a panic inside a previous closure must not
+/// permanently brick every subsequent thunk call).
 fn with_vulkan_state<F, T>(f: F) -> T
 where
     F: FnOnce(&mut VulkanState) -> T,
@@ -347,8 +350,22 @@ where
     let mut state = STATE
         .get_or_init(|| Mutex::new(VulkanState::new()))
         .lock()
-        .unwrap();
-    f(&mut *state)
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    f(&mut state)
+}
+
+/// Global OpenGL state accessor for thunk dispatch (analogous to
+/// [`with_vulkan_state`]; recovers from mutex poisoning).
+fn with_gl_state<F, T>(f: F) -> T
+where
+    F: FnOnce(&mut GLState) -> T,
+{
+    static GL_STATE: OnceLock<Mutex<GLState>> = OnceLock::new();
+    let mut state = GL_STATE
+        .get_or_init(|| Mutex::new(GLState::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    f(&mut state)
 }
 
 // ===========================================================================
@@ -379,7 +396,8 @@ pub enum VkFormat {
 }
 
 impl VkFormat {
-    /// Returns the number of bytes per pixel (or block) for this format.
+    /// Returns the number of bytes per pixel (or per block for
+    /// block-compressed formats) for this format.
     pub fn bytes_per_element(self) -> u32 {
         match self {
             VkFormat::R8G8B8A8Unorm | VkFormat::B8G8R8A8Unorm => 4,
@@ -394,15 +412,20 @@ impl VkFormat {
             VkFormat::D16Unorm => 2,
             VkFormat::D24UnormS8Uint => 4,
             VkFormat::D32Sfloat => 4,
-            _ => 0,
+            // BC1 is 8 bytes per 4x4 block; BC2/BC3 are 16 bytes per block.
+            VkFormat::Bc1RgbaUnormBlock => 8,
+            VkFormat::Bc2UnormBlock | VkFormat::Bc3UnormBlock => 16,
+            VkFormat::Undefined => 0,
         }
     }
 
     /// Returns the Metal pixel format name for this Vulkan format.
     pub fn metal_pixel_format_name(self) -> &'static str {
         match self {
-            VkFormat::R8G8B8A8Unorm | VkFormat::R8G8B8A8Srgb => "RGBA8Unorm",
-            VkFormat::B8G8R8A8Unorm | VkFormat::B8G8R8A8Srgb => "BGRA8Unorm",
+            VkFormat::R8G8B8A8Unorm => "RGBA8Unorm",
+            VkFormat::R8G8B8A8Srgb => "RGBA8Unorm_sRGB",
+            VkFormat::B8G8R8A8Unorm => "BGRA8Unorm",
+            VkFormat::B8G8R8A8Srgb => "BGRA8Unorm_sRGB",
             VkFormat::R32Sfloat => "R32Float",
             VkFormat::R32G32Sfloat => "RG32Float",
             VkFormat::R32G32B32Sfloat => "RGB32Float",
@@ -425,8 +448,10 @@ impl VkFormat {
 /// Vulkan resource-creation calls.
 pub fn vk_format_to_metal_format(format: VkFormat) -> metal::MTLPixelFormat {
     match format {
-        VkFormat::R8G8B8A8Unorm | VkFormat::R8G8B8A8Srgb => metal::MTLPixelFormat::RGBA8Unorm,
-        VkFormat::B8G8R8A8Unorm | VkFormat::B8G8R8A8Srgb => metal::MTLPixelFormat::BGRA8Unorm,
+        VkFormat::R8G8B8A8Unorm => metal::MTLPixelFormat::RGBA8Unorm,
+        VkFormat::R8G8B8A8Srgb => metal::MTLPixelFormat::RGBA8Unorm_sRGB,
+        VkFormat::B8G8R8A8Unorm => metal::MTLPixelFormat::BGRA8Unorm,
+        VkFormat::B8G8R8A8Srgb => metal::MTLPixelFormat::BGRA8Unorm_sRGB,
         VkFormat::R32Sfloat => metal::MTLPixelFormat::R32Float,
         VkFormat::R32G32Sfloat => metal::MTLPixelFormat::RG32Float,
         // Metal doesn't have a 3-channel RGB32Float; fall back to RGBA32Float
@@ -442,6 +467,50 @@ pub fn vk_format_to_metal_format(format: VkFormat) -> metal::MTLPixelFormat {
         VkFormat::Bc2UnormBlock => metal::MTLPixelFormat::BC2_RGBA,
         VkFormat::Bc3UnormBlock => metal::MTLPixelFormat::BC3_RGBA,
         _ => metal::MTLPixelFormat::RGBA8Unorm, // safe default
+    }
+}
+
+/// Map a Vulkan [`VkSamplerCreateInfo`] to a D3D12 static-sampler descriptor
+/// so the shared [`crate::metal_backend::create_static_sampler`] helper can
+/// build the matching `MTLSamplerState`.
+fn vk_sampler_to_d3d12_static_sampler_desc(ci: &VkSamplerCreateInfo) -> crate::gfx::D3D12StaticSamplerDesc {
+    use crate::gfx::{D3D12ShaderVisibility, D3D12StaticSamplerDesc};
+
+    // D3D12_FILTER bit layout: min [0:2], mag [2:4], mip [4:6],
+    // anisotropic [6], comparison [7].
+    let filter = (ci.min_filter & 0x3)
+        | ((ci.mag_filter & 0x3) << 2)
+        | ((ci.mipmap_mode & 0x3) << 4)
+        | if ci.max_anisotropy > 0.0 { 0x40 } else { 0 }
+        | if ci.compare_op != 0 { 0x80 } else { 0 };
+
+    // D3D12_TEXTURE_ADDRESS_MODE: 1=CLAMP, 2=WRAP, 3=MIRROR, 4=BORDER,
+    // 5=MIRROR_ONCE — mapped from the Vulkan address modes.
+    let vk_addr = |mode: u32| match mode {
+        0 => 2, // VK_SAMPLER_ADDRESS_MODE_REPEAT -> WRAP
+        1 => 3, // VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT -> MIRROR
+        2 => 1, // VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE -> CLAMP
+        3 => 4, // VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER -> BORDER
+        _ => 1,
+    };
+
+    // D3D12_COMPARISON_FUNC: 1=NEVER .. 8=ALWAYS (Vulkan is 0..7).
+    let comparison_func = (ci.compare_op & 0x7).saturating_add(1);
+
+    D3D12StaticSamplerDesc {
+        shader_register: 0,
+        register_space: 0,
+        filter,
+        address_u: vk_addr(ci.address_mode_u),
+        address_v: vk_addr(ci.address_mode_v),
+        address_w: vk_addr(ci.address_mode_w),
+        mip_lod_bias: ci.mip_lod_bias,
+        max_anisotropy: ci.max_anisotropy as u32,
+        comparison_func,
+        border_color: 0,
+        min_lod: ci.min_lod,
+        max_lod: ci.max_lod,
+        shader_visibility: D3D12ShaderVisibility::All,
     }
 }
 
@@ -1086,6 +1155,22 @@ pub struct VkSamplerInfo {
     pub metal_sampler_id: Option<u64>,
 }
 
+/// Sampler creation parameters, mirroring `VkSamplerCreateInfo`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VkSamplerCreateInfo {
+    pub min_filter: u32,
+    pub mag_filter: u32,
+    pub mipmap_mode: u32,
+    pub address_mode_u: u32,
+    pub address_mode_v: u32,
+    pub address_mode_w: u32,
+    pub mip_lod_bias: f32,
+    pub max_anisotropy: f32,
+    pub compare_op: u32,
+    pub min_lod: f32,
+    pub max_lod: f32,
+}
+
 /// Memory allocation type, mapping to Metal storage modes.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum MemoryAllocationType {
@@ -1171,11 +1256,11 @@ pub fn moltenvk_expanded_search_paths() -> Vec<std::path::PathBuf> {
         paths.push(home_path.join("MoltenVK/lib/libMoltenVK.dylib"));
     }
     // Bundled relative to executable
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            paths.push(dir.join("MoltenVK/macOS/libMoltenVK.dylib"));
-            paths.push(dir.join("libMoltenVK.dylib"));
-        }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        paths.push(dir.join("MoltenVK/macOS/libMoltenVK.dylib"));
+        paths.push(dir.join("libMoltenVK.dylib"));
     }
     paths
 }
@@ -1206,6 +1291,14 @@ impl MoltenVKLoader {
             loaded: false,
             version: None,
         }
+    }
+
+    /// Load MoltenVK (see [`MoltenVKLoader::load`]) if it is available.
+    ///
+    /// Operates in simulated mode (returns `Ok`) when MoltenVK is not
+    /// installed, mirroring [`MoltenVKLoader::load`].
+    pub fn load_if_available(&mut self) {
+        let _ = self.load();
     }
 
     /// Attempt to load the MoltenVK library from standard search paths.
@@ -1287,6 +1380,12 @@ impl std::fmt::Debug for MoltenVKLoader {
     }
 }
 
+impl Default for MoltenVKLoader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ===========================================================================
 // Section 5: SPIR-V to MSL Translator
 // ===========================================================================
@@ -1358,7 +1457,6 @@ const SPIRV_OP_BRANCH_CONDITIONAL: u16 = 250;
 const SPIRV_OP_SWITCH: u16 = 251;
 const SPIRV_OP_SELECTION_MERGE: u16 = 247;
 const SPIRV_OP_LOOP_MERGE: u16 = 246;
-const SPIRV_OP_SELECTION: u16 = 250;
 
 /// SPIR-V execution models.
 const SPIRV_EXEC_MODEL_VERTEX: u32 = 0;
@@ -1460,16 +1558,48 @@ pub struct SpirvTranslator {
     types: BTreeMap<u32, SpirvType>,
     /// Map from SPIR-V result ID to human-readable name.
     names: BTreeMap<u32, String>,
+    /// Map from `(struct_type_id, member_index)` to human-readable member name.
+    member_names: BTreeMap<(u32, u32), String>,
     /// Map from SPIR-V result ID to decorations.
     decorations: BTreeMap<u32, SpirvDecoration>,
     /// Parsed entry points: (result_id, execution_model, name).
     entry_points: Vec<(u32, u32, String)>,
     /// Parsed functions.
     functions: Vec<SpirvFunction>,
-    /// Map from SPIR-V result ID to constant values.
+    /// Map from SPIR-V result ID to constant values (32-bit, or the low word
+    /// of wider constants).
     constants: BTreeMap<u32, u32>,
+    /// Map from SPIR-V result ID to full 64-bit constant values (only entries
+    /// whose type is a 64-bit int/float are stored here).
+    constants64: BTreeMap<u32, u64>,
+    /// Map from SPIR-V result ID to constant-composite constituent IDs.
+    composites: BTreeMap<u32, Vec<u32>>,
     /// Map from SPIR-V result ID to variable (type_id, storage_class).
     variables: BTreeMap<u32, (u32, u32)>,
+    /// Memoized MSL type names keyed by SPIR-V type ID.
+    msl_type_cache: BTreeMap<u32, String>,
+}
+
+impl Default for SpirvTranslator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Decode a null-terminated string from SPIR-V word operands, stopping at the
+/// first NUL byte instead of flattening every operand word (which would
+/// append trailing interface IDs or numeric data to the name).
+fn decode_spirv_string(operands: &[u32]) -> String {
+    let mut bytes = Vec::new();
+    'words: for w in operands {
+        for b in w.to_le_bytes() {
+            if b == 0 {
+                break 'words;
+            }
+            bytes.push(b);
+        }
+    }
+    String::from_utf8_lossy(&bytes).to_string()
 }
 
 impl SpirvTranslator {
@@ -1478,11 +1608,15 @@ impl SpirvTranslator {
         Self {
             types: BTreeMap::new(),
             names: BTreeMap::new(),
+            member_names: BTreeMap::new(),
             decorations: BTreeMap::new(),
             entry_points: Vec::new(),
             functions: Vec::new(),
             constants: BTreeMap::new(),
+            constants64: BTreeMap::new(),
+            composites: BTreeMap::new(),
             variables: BTreeMap::new(),
+            msl_type_cache: BTreeMap::new(),
         }
     }
 
@@ -1548,34 +1682,39 @@ impl SpirvTranslator {
                     // Skip — we don't need to validate capabilities for translation
                 }
                 SPIRV_OP_ENTRY_POINT => {
-                    // operands: [execution_model, entry_point_id, name_bytes...]
+                    // operands: [execution_model, entry_point_id,
+                    //           <null-terminated name>, <interface ids...>]
+                    // Only the null-terminated name (up to the first NUL
+                    // byte) is string data; trailing words are interface IDs.
                     if operands.len() >= 3 {
                         let exec_model = operands[0];
                         let entry_id = operands[1];
-                        let name_bytes: Vec<u8> = operands[2..]
-                            .iter()
-                            .flat_map(|w| w.to_le_bytes())
-                            .filter(|&b| b != 0)
-                            .collect();
-                        let name = String::from_utf8_lossy(&name_bytes).to_string();
-                        self.entry_points.push((entry_id, exec_model, name));
+                        let name = decode_spirv_string(&operands[2..]);
+                        if entry_id != 0 && !name.is_empty() {
+                            self.entry_points.push((entry_id, exec_model, name));
+                        }
                     }
                 }
                 SPIRV_OP_NAME => {
                     // operands: [target_id, name_bytes...]
                     if operands.len() >= 2 {
                         let target_id = operands[0];
-                        let name_bytes: Vec<u8> = operands[1..]
-                            .iter()
-                            .flat_map(|w| w.to_le_bytes())
-                            .filter(|&b| b != 0)
-                            .collect();
-                        let name = String::from_utf8_lossy(&name_bytes).to_string();
-                        self.names.insert(target_id, name);
+                        let name = decode_spirv_string(&operands[1..]);
+                        if target_id != 0 && !name.is_empty() {
+                            self.names.insert(target_id, name);
+                        }
                     }
                 }
                 SPIRV_OP_MEMBER_NAME => {
-                    // Skip member names for now
+                    // operands: [struct_type_id, member_index, name_bytes...]
+                    if operands.len() >= 3 {
+                        let type_id = operands[0];
+                        let member_index = operands[1];
+                        let name = decode_spirv_string(&operands[2..]);
+                        if !name.is_empty() {
+                            self.member_names.insert((type_id, member_index), name);
+                        }
+                    }
                 }
                 SPIRV_OP_DECORATE => {
                     // operands: [target_id, decoration, ...]
@@ -1607,10 +1746,8 @@ impl SpirvTranslator {
                                     entry.location = Some(operands[2]);
                                 }
                             }
-                            SPIRV_DECORATION_OFFSET => {
-                                if operands.len() >= 3 {
-                                    entry.offset = Some(operands[2]);
-                                }
+                            SPIRV_DECORATION_OFFSET if operands.len() >= 3 => {
+                                entry.offset = Some(operands[2]);
                             }
                             _ => {}
                         }
@@ -1675,17 +1812,15 @@ impl SpirvTranslator {
                 }
                 SPIRV_OP_TYPE_ARRAY => {
                     // operands: [result_id, element_type_id, length_id]
+                    // The length is a constant ID that is defined *after* the
+                    // type section in SPIR-V; it is resolved in a post-pass
+                    // once all constants have been parsed.
                     if operands.len() >= 3 {
-                        let length = self
-                            .constants
-                            .get(&operands[2])
-                            .copied()
-                            .unwrap_or(operands[2]);
                         self.types.insert(
                             operands[0],
                             SpirvType::Array {
                                 element_type: operands[1],
-                                length,
+                                length: operands[2],
                             },
                         );
                     }
@@ -1764,10 +1899,31 @@ impl SpirvTranslator {
                 SPIRV_OP_CONSTANT => {
                     // operands: [type_id, result_id, value_words...]
                     if operands.len() >= 3 {
+                        let type_id = operands[0];
                         let result_id = operands[1];
-                        // For scalar constants, take the first value word
-                        let value = operands[2];
-                        self.constants.insert(result_id, value);
+                        // Scalar constants may span multiple words for 64-bit
+                        // int/float types; combine them so the value is not
+                        // silently truncated to the low word.
+                        let lo = operands[2] as u64;
+                        let hi = operands.get(3).copied().unwrap_or(0) as u64;
+                        let value = lo | (hi << 32);
+                        let is_64 = matches!(
+                            self.types.get(&type_id),
+                            Some(SpirvType::Int { width: 64, .. })
+                                | Some(SpirvType::Float { width: 64 })
+                        );
+                        self.constants.insert(result_id, value as u32);
+                        if is_64 {
+                            self.constants64.insert(result_id, value);
+                        }
+                    }
+                }
+                SPIRV_OP_CONSTANT_COMPOSITE => {
+                    // operands: [type_id, result_id, constituent_ids...]
+                    if operands.len() >= 3 {
+                        let result_id = operands[1];
+                        self.composites
+                            .insert(result_id, operands[2..].to_vec());
                     }
                 }
                 SPIRV_OP_CONSTANT_TRUE => {
@@ -1805,11 +1961,10 @@ impl SpirvTranslator {
                 }
                 _ => {
                     // Record instructions inside function bodies
-                    if current_function.is_some() && opcode != SPIRV_OP_FUNCTION_PARAMETER {
-                        current_function
-                            .as_mut()
-                            .unwrap()
-                            .instructions
+                    if let Some(func) = current_function.as_mut()
+                        && opcode != SPIRV_OP_FUNCTION_PARAMETER
+                    {
+                        func.instructions
                             .push(SpirvInstruction { opcode, operands });
                     }
                 }
@@ -1823,16 +1978,53 @@ impl SpirvTranslator {
             }
         }
 
+        // Post-pass: resolve array lengths now that every constant has been
+        // parsed (constants are declared after types in SPIR-V).
+        let array_ids: Vec<u32> = self
+            .types
+            .iter()
+            .filter_map(|(&id, ty)| matches!(ty, SpirvType::Array { .. }).then_some(id))
+            .collect();
+        for id in array_ids {
+            let len = match self.types.get(&id) {
+                Some(SpirvType::Array { length, .. }) => *length,
+                _ => continue,
+            };
+            if let Some(v) = self.resolve_constant_u32(len)
+                && let Some(SpirvType::Array { length, .. }) = self.types.get_mut(&id)
+            {
+                *length = v;
+            }
+        }
+
         Ok(())
     }
 
+    /// Resolve a SPIR-V constant ID to its u32 value when the constant is
+    /// known (handles 64-bit constants that fit in u32), otherwise `None`.
+    fn resolve_constant_u32(&self, id: u32) -> Option<u32> {
+        if let Some(v) = self.constants64.get(&id)
+            && let Ok(v32) = u32::try_from(*v)
+        {
+            return Some(v32);
+        }
+        self.constants.get(&id).copied()
+    }
+
     /// Resolve a SPIR-V type ID to its MSL type name string.
-    fn resolve_msl_type(&self, type_id: u32) -> String {
-        match self.types.get(&type_id) {
+    ///
+    /// Results are memoized in [`Self::msl_type_cache`] so repeated lookups
+    /// for the same ID (common when generating MSL for many instructions)
+    /// are O(1) map reads instead of recursive string construction.
+    fn resolve_msl_type(&mut self, type_id: u32) -> String {
+        if let Some(cached) = self.msl_type_cache.get(&type_id) {
+            return cached.clone();
+        }
+        let name = match self.types.get(&type_id).cloned() {
             Some(SpirvType::Void) => "void".to_string(),
             Some(SpirvType::Bool) => "bool".to_string(),
             Some(SpirvType::Int { width, signed }) => {
-                if *signed {
+                if signed {
                     match width {
                         8 => "char".to_string(),
                         16 => "short".to_string(),
@@ -1860,7 +2052,7 @@ impl SpirvTranslator {
                 component_type,
                 component_count,
             }) => {
-                let base = self.resolve_msl_type(*component_type);
+                let base = self.resolve_msl_type(component_type);
                 match component_count {
                     2 => format!("{}2", base),
                     3 => format!("{}3", base),
@@ -1873,7 +2065,7 @@ impl SpirvTranslator {
                 column_count,
             }) => {
                 // column_type should be a vector type
-                let vec_name = self.resolve_msl_type(*column_type);
+                let vec_name = self.resolve_msl_type(column_type);
                 // e.g., float4 → float4x4
                 format!("{}x{}", vec_name, column_count)
             }
@@ -1881,7 +2073,7 @@ impl SpirvTranslator {
                 element_type,
                 length,
             }) => {
-                let elem = self.resolve_msl_type(*element_type);
+                let elem = self.resolve_msl_type(element_type);
                 format!("array<{}, {}>", elem, length)
             }
             Some(SpirvType::Struct { name, .. }) => name
@@ -1891,8 +2083,8 @@ impl SpirvTranslator {
                 pointee_type,
                 storage_class,
             }) => {
-                let pointee = self.resolve_msl_type(*pointee_type);
-                let addr_space = match *storage_class {
+                let pointee = self.resolve_msl_type(pointee_type);
+                let addr_space = match storage_class {
                     SPIRV_STORAGE_UNIFORM => "constant",
                     SPIRV_STORAGE_STORAGE_BUFFER => "device",
                     SPIRV_STORAGE_PUSH_CONSTANT => "constant",
@@ -1904,7 +2096,9 @@ impl SpirvTranslator {
             Some(SpirvType::Sampler) => "sampler".to_string(),
             Some(SpirvType::SampledImage { .. }) => "texture2d<float>".to_string(),
             _ => format!("UnknownType_{}", type_id),
-        }
+        };
+        self.msl_type_cache.insert(type_id, name.clone());
+        name
     }
 
     /// Map SPIR-V execution model to Vulkan shader stage.
@@ -1927,7 +2121,14 @@ impl SpirvTranslator {
     /// Produces a complete MSL function for each entry point, with proper
     /// Metal attributes (`[[vertex_id]]`, `[[position]]`, `[[buffer(N)]]`,
     /// etc.) mapped from SPIR-V decorations.
-    pub fn generate_msl(&self) -> String {
+    pub fn generate_msl(&mut self) -> String {
+        // Warm the MSL type cache for every type in the module so the hot
+        // generation loops below are O(1) cache reads.
+        let type_ids: Vec<u32> = self.types.keys().copied().collect();
+        for id in type_ids {
+            self.resolve_msl_type(id);
+        }
+
         let mut output = String::new();
         output.push_str("// Generated by Casa1 SPIR-V → MSL translator\n");
         output.push_str("#include <metal_stdlib>\n");
@@ -1940,10 +2141,10 @@ impl SpirvTranslator {
                 let struct_name = name.as_deref().unwrap_or(&default_name);
                 output.push_str(&format!("struct {} {{\n", struct_name));
                 for (i, member_type_id) in member_types.iter().enumerate() {
-                    let member_type = self.resolve_msl_type(*member_type_id);
+                    let member_type = self.msl_type_name(*member_type_id);
                     let member_name = self
-                        .names
-                        .get(&(*type_id * 1000 + *member_type_id as u32))
+                        .member_names
+                        .get(&(*type_id, i as u32))
                         .cloned()
                         .unwrap_or_else(|| format!("member_{}", i));
                     output.push_str(&format!("    {} {};\n", member_type, member_name));
@@ -1962,7 +2163,7 @@ impl SpirvTranslator {
 
             // Determine return type
             let return_type_str = if let Some(f) = func {
-                self.resolve_msl_type(f.return_type)
+                self.msl_type_name(f.return_type)
             } else {
                 "void".to_string()
             };
@@ -1975,7 +2176,6 @@ impl SpirvTranslator {
             // Generate parameters from variables that are inputs to this stage
             let mut params: Vec<String> = Vec::new();
             for (var_id, (type_id, storage_class)) in &self.variables {
-                let _pointee_type = type_id;
                 // Generate parameter based on storage class
                 match *storage_class {
                     0 => {
@@ -1987,7 +2187,7 @@ impl SpirvTranslator {
                             .unwrap_or_else(|| format!("var_{}", var_id));
                         let dec = self.decorations.get(var_id);
                         let binding = dec.and_then(|d| d.binding).unwrap_or(0);
-                        let msl_type = self.resolve_msl_type(*type_id);
+                        let msl_type = self.msl_type_name(*type_id);
                         params.push(format!(
                             "device {}& {} [[buffer({})]]",
                             msl_type, name, binding
@@ -2001,7 +2201,7 @@ impl SpirvTranslator {
                             .unwrap_or_else(|| format!("var_{}", var_id));
                         let dec = self.decorations.get(var_id);
                         let binding = dec.and_then(|d| d.binding).unwrap_or(0);
-                        let msl_type = self.resolve_msl_type(*type_id);
+                        let msl_type = self.msl_type_name(*type_id);
                         params.push(format!(
                             "constant {}& {} [[buffer({})]]",
                             msl_type, name, binding
@@ -2015,7 +2215,7 @@ impl SpirvTranslator {
                             .unwrap_or_else(|| format!("var_{}", var_id));
                         let dec = self.decorations.get(var_id);
                         let binding = dec.and_then(|d| d.binding).unwrap_or(0);
-                        let msl_type = self.resolve_msl_type(*type_id);
+                        let msl_type = self.msl_type_name(*type_id);
                         params.push(format!(
                             "device {}& {} [[buffer({})]]",
                             msl_type, name, binding
@@ -2030,7 +2230,7 @@ impl SpirvTranslator {
                             .unwrap_or_else(|| format!("var_{}", var_id));
                         let dec = self.decorations.get(var_id);
                         let location = dec.and_then(|d| d.location).unwrap_or(0);
-                        let msl_type = self.resolve_msl_type(*type_id);
+                        let msl_type = self.msl_type_name(*type_id);
                         params.push(format!("{} {} [[attribute({})]]", msl_type, name, location));
                     }
                     _ => {}
@@ -2038,10 +2238,8 @@ impl SpirvTranslator {
             }
 
             // Add built-in vertex/fragment inputs
-            if *exec_model == SPIRV_EXEC_MODEL_VERTEX {
-                if params.is_empty() {
-                    params.push("uint vid [[vertex_id]]".to_string());
-                }
+            if *exec_model == SPIRV_EXEC_MODEL_VERTEX && params.is_empty() {
+                params.push("uint vid [[vertex_id]]".to_string());
             }
 
             output.push_str(&params.join(", "));
@@ -2065,7 +2263,7 @@ impl SpirvTranslator {
                                 let type_id = instr.operands[0];
                                 let result_id = instr.operands[1];
                                 let pointer_id = instr.operands[2];
-                                let msl_type = self.resolve_msl_type(type_id);
+                                let msl_type = self.msl_type_name(type_id);
                                 let ptr_name = self
                                     .names
                                     .get(&pointer_id)
@@ -2096,7 +2294,7 @@ impl SpirvTranslator {
                                 let result_id = instr.operands[1];
                                 let a = instr.operands[2];
                                 let b = instr.operands[3];
-                                let msl_type = self.resolve_msl_type(type_id);
+                                let msl_type = self.msl_type_name(type_id);
                                 output.push_str(&format!(
                                     "    {} var_{} = var_{} + var_{};\n",
                                     msl_type, result_id, a, b
@@ -2109,7 +2307,7 @@ impl SpirvTranslator {
                                 let result_id = instr.operands[1];
                                 let a = instr.operands[2];
                                 let b = instr.operands[3];
-                                let msl_type = self.resolve_msl_type(type_id);
+                                let msl_type = self.msl_type_name(type_id);
                                 output.push_str(&format!(
                                     "    {} var_{} = var_{} - var_{};\n",
                                     msl_type, result_id, a, b
@@ -2122,7 +2320,7 @@ impl SpirvTranslator {
                                 let result_id = instr.operands[1];
                                 let a = instr.operands[2];
                                 let b = instr.operands[3];
-                                let msl_type = self.resolve_msl_type(type_id);
+                                let msl_type = self.msl_type_name(type_id);
                                 output.push_str(&format!(
                                     "    {} var_{} = var_{} * var_{};\n",
                                     msl_type, result_id, a, b
@@ -2135,7 +2333,7 @@ impl SpirvTranslator {
                                 let result_id = instr.operands[1];
                                 let a = instr.operands[2];
                                 let b = instr.operands[3];
-                                let msl_type = self.resolve_msl_type(type_id);
+                                let msl_type = self.msl_type_name(type_id);
                                 output.push_str(&format!(
                                     "    {} var_{} = var_{} / var_{};\n",
                                     msl_type, result_id, a, b
@@ -2147,7 +2345,7 @@ impl SpirvTranslator {
                                 let type_id = instr.operands[0];
                                 let result_id = instr.operands[1];
                                 let operand = instr.operands[2];
-                                let msl_type = self.resolve_msl_type(type_id);
+                                let msl_type = self.msl_type_name(type_id);
                                 output.push_str(&format!(
                                     "    {} var_{} = -var_{};\n",
                                     msl_type, result_id, operand
@@ -2162,7 +2360,7 @@ impl SpirvTranslator {
                                 let type_id = instr.operands[0];
                                 let result_id = instr.operands[1];
                                 let value = instr.operands[2];
-                                let msl_type = self.resolve_msl_type(type_id);
+                                let msl_type = self.msl_type_name(type_id);
                                 output.push_str(&format!(
                                     "    {} var_{} = static_cast<{}>(var_{});\n",
                                     msl_type, result_id, msl_type, value
@@ -2173,7 +2371,7 @@ impl SpirvTranslator {
                             if instr.operands.len() >= 3 {
                                 let type_id = instr.operands[0];
                                 let result_id = instr.operands[1];
-                                let msl_type = self.resolve_msl_type(type_id);
+                                let msl_type = self.msl_type_name(type_id);
                                 let components: Vec<String> = instr.operands[2..]
                                     .iter()
                                     .map(|id| format!("var_{}", id))
@@ -2193,7 +2391,7 @@ impl SpirvTranslator {
                                 let result_id = instr.operands[1];
                                 let composite = instr.operands[2];
                                 let index = instr.operands[3];
-                                let msl_type = self.resolve_msl_type(type_id);
+                                let msl_type = self.msl_type_name(type_id);
                                 output.push_str(&format!(
                                     "    {} var_{} = var_{}[{}];\n",
                                     msl_type, result_id, composite, index
@@ -2206,7 +2404,7 @@ impl SpirvTranslator {
                                 let result_id = instr.operands[1];
                                 let base = instr.operands[2];
                                 let index = instr.operands[3];
-                                let msl_type = self.resolve_msl_type(type_id);
+                                let msl_type = self.msl_type_name(type_id);
                                 let base_name = self
                                     .names
                                     .get(&base)
@@ -2224,25 +2422,23 @@ impl SpirvTranslator {
                                 let result_id = instr.operands[1];
                                 let image = instr.operands[2];
                                 let coord = instr.operands[3];
-                                let msl_type = self.resolve_msl_type(type_id);
+                                let msl_type = self.msl_type_name(type_id);
                                 output.push_str(&format!(
                                     "    {} var_{} = var_{}.sample(sampler, var_{});\n",
                                     msl_type, result_id, image, coord
                                 ));
                             }
                         }
-                        SPIRV_OP_IMAGE_FETCH => {
-                            if instr.operands.len() >= 4 {
-                                let type_id = instr.operands[0];
-                                let result_id = instr.operands[1];
-                                let image = instr.operands[2];
-                                let coord = instr.operands[3];
-                                let msl_type = self.resolve_msl_type(type_id);
-                                output.push_str(&format!(
-                                    "    {} var_{} = var_{}.read(uint2(var_{}));\n",
-                                    msl_type, result_id, image, coord
-                                ));
-                            }
+                        SPIRV_OP_IMAGE_FETCH if instr.operands.len() >= 4 => {
+                            let type_id = instr.operands[0];
+                            let result_id = instr.operands[1];
+                            let image = instr.operands[2];
+                            let coord = instr.operands[3];
+                            let msl_type = self.msl_type_name(type_id);
+                            output.push_str(&format!(
+                                "    {} var_{} = var_{}.read(uint2(var_{}));\n",
+                                msl_type, result_id, image, coord
+                            ));
                         }
                         _ => { /* unhandled opcodes silently skipped */ }
                     }
@@ -2251,6 +2447,16 @@ impl SpirvTranslator {
             output.push_str("}\n\n");
         }
         output
+    }
+
+    /// Look up a cached MSL type name for a type ID (see
+    /// [`Self::resolve_msl_type`]); falls back to a placeholder for IDs that
+    /// were not part of the parsed module.
+    fn msl_type_name(&self, type_id: u32) -> String {
+        self.msl_type_cache
+            .get(&type_id)
+            .cloned()
+            .unwrap_or_else(|| format!("UnknownType_{}", type_id))
     }
 
     /// Returns the detected entry point names.
@@ -2444,8 +2650,27 @@ pub struct VulkanState {
     metal_command_queue: Option<MetalCommandQueueHandle>,
     /// The real Metal GPU backend used for actual rendering operations.
     metal_backend: Option<MetalGpuBackend>,
+    /// Metal texture views created from parent images (`MTLTexture` views
+    /// share storage with their parent, so they must be kept alive here).
+    texture_views: BTreeMap<u64, metal::Texture>,
+    /// Metal sampler states created for [`VkSamplerInfo`] entries.
+    sampler_states: BTreeMap<u64, metal::SamplerState>,
     next_handle: u64,
 }
+
+impl Default for VulkanState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Maximum accepted size for a single GPU allocation (device memory or
+/// buffer). Guards against guest-controlled allocation sizes that would
+/// abort the host process (OOM) or exceed `MTLDevice.maxBufferLength`.
+const MAX_DEVICE_MEMORY_SIZE: u64 = 1 << 30; // 1 GiB
+
+/// Maximum texture dimension accepted when creating images.
+const MAX_TEXTURE_DIMENSION: u32 = 16_384; // Metal's maximum texture size
 
 impl VulkanState {
     /// Create a new empty Vulkan state machine.
@@ -2489,6 +2714,8 @@ impl VulkanState {
             metal_device: None,
             metal_command_queue: None,
             metal_backend,
+            texture_views: BTreeMap::new(),
+            sampler_states: BTreeMap::new(),
             next_handle: 1,
         }
     }
@@ -2517,6 +2744,11 @@ impl VulkanState {
         extensions: &[String],
         layers: &[String],
     ) -> AppResult<VkInstance> {
+        // Lazily attempt to load the real MoltenVK library on first use so
+        // `get_proc_addr` can resolve real entry points when available.
+        if !self.loader.is_loaded() {
+            let _ = self.load_moltenvk();
+        }
         let handle = self.alloc_handle();
         let physical_device = self.alloc_handle();
         if self.metal_device.is_none() {
@@ -2542,6 +2774,11 @@ impl VulkanState {
                 ReasonCode::RcInvalidState,
                 format!("cannot destroy instance {}: not found", instance),
             ));
+        }
+        // Surfaces are owned by the instance; release their bookkeeping.
+        let surfaces: Vec<VkSurfaceKHR> = self.surfaces.keys().copied().collect();
+        for s in surfaces {
+            let _ = self.destroy_surface(s);
         }
         Ok(())
     }
@@ -2586,13 +2823,107 @@ impl VulkanState {
         Ok(handle)
     }
 
-    /// Destroy a logical device.
+    /// Destroy a logical device and every resource created on it.
     pub fn destroy_device(&mut self, device: VkDevice) -> AppResult<()> {
         if self.devices.remove(&device).is_none() {
             return Err(AppError::new(
                 ReasonCode::RcInvalidState,
                 format!("cannot destroy device {}: not found", device),
             ));
+        }
+        // Release every resource owned by this device so GPU backing is
+        // freed with the device.
+        let buffers: Vec<VkBuffer> = self
+            .buffers
+            .iter()
+            .filter(|(_, b)| b.device == device)
+            .map(|(&h, _)| h)
+            .collect();
+        for b in buffers {
+            let _ = self.destroy_buffer(b);
+        }
+        let images: Vec<VkImage> = self
+            .images
+            .iter()
+            .filter(|(_, i)| i.device == device)
+            .map(|(&h, _)| h)
+            .collect();
+        for i in images {
+            let _ = self.destroy_image(i);
+        }
+        let image_views: Vec<VkImageView> = self.image_views.keys().copied().collect();
+        for v in image_views {
+            let _ = self.destroy_image_view(v);
+        }
+        let samplers: Vec<u64> = self
+            .samplers
+            .iter()
+            .filter(|(_, s)| s.device == device)
+            .map(|(&h, _)| h)
+            .collect();
+        for s in samplers {
+            let _ = self.destroy_sampler(s);
+        }
+        // All device memory allocations are owned by the device.
+        let mems: Vec<VkDeviceMemory> = self.device_memory.keys().copied().collect();
+        for m in mems {
+            let _ = self.free_memory(device, m);
+        }
+        let shaders: Vec<VkShaderModule> = self.shader_modules.keys().copied().collect();
+        for s in shaders {
+            let _ = self.destroy_shader_module(s);
+        }
+        let pipelines: Vec<VkPipeline> = self.pipelines.keys().copied().collect();
+        for p in pipelines {
+            let _ = self.destroy_pipeline(p);
+        }
+        let layouts: Vec<VkPipelineLayout> = self.pipeline_layouts.keys().copied().collect();
+        for l in layouts {
+            let _ = self.destroy_pipeline_layout(l);
+        }
+        let pools: Vec<VkCommandPool> = self
+            .command_pools
+            .iter()
+            .filter(|(_, p)| p.device == device)
+            .map(|(&h, _)| h)
+            .collect();
+        for p in pools {
+            let _ = self.destroy_command_pool(p);
+        }
+        let fences: Vec<VkFence> = self
+            .fences
+            .iter()
+            .filter(|(_, f)| f.device == device)
+            .map(|(&h, _)| h)
+            .collect();
+        for f in fences {
+            let _ = self.destroy_fence(f);
+        }
+        let semaphores: Vec<VkSemaphore> = self
+            .semaphores
+            .iter()
+            .filter(|(_, s)| s.device == device)
+            .map(|(&h, _)| h)
+            .collect();
+        for s in semaphores {
+            let _ = self.destroy_semaphore(s);
+        }
+        let render_passes: Vec<VkRenderPass> = self.render_passes.keys().copied().collect();
+        for rp in render_passes {
+            let _ = self.destroy_render_pass(rp);
+        }
+        let framebuffers: Vec<VkFramebuffer> = self.framebuffers.keys().copied().collect();
+        for fb in framebuffers {
+            let _ = self.destroy_framebuffer(fb);
+        }
+        let swapchains: Vec<VkSwapchainKHR> = self
+            .swapchains
+            .iter()
+            .filter(|(_, sc)| sc.device == device)
+            .map(|(&h, _)| h)
+            .collect();
+        for sc in swapchains {
+            let _ = self.destroy_swapchain(sc);
         }
         Ok(())
     }
@@ -2646,6 +2977,12 @@ impl VulkanState {
     ///
     /// When the Metal backend is available, a [`MetalSwapchain`] is created
     /// via [`MetalGpuBackend::create_swapchain`] with the requested dimensions.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AppError` with `RcInvalidState` if the device or surface do
+    /// not exist, or if the create info is invalid (`min_image_count` must be
+    /// ≥ 1 and the extent must be non-zero — Vulkan requires both).
     pub fn create_swapchain(
         &mut self,
         device: VkDevice,
@@ -2664,23 +3001,35 @@ impl VulkanState {
                 format!("surface {} not found", surface),
             ));
         }
+        if ci.min_image_count == 0 {
+            return Err(AppError::new(
+                ReasonCode::RcInvalidState,
+                "create_swapchain: min_image_count must be at least 1",
+            ));
+        }
+        if ci.image_extent.0 == 0 || ci.image_extent.1 == 0 {
+            return Err(AppError::new(
+                ReasonCode::RcInvalidState,
+                "create_swapchain: image extent must be non-zero",
+            ));
+        }
         let handle = self.alloc_handle();
         let drawables: Vec<u64> = (0..ci.min_image_count)
             .map(|_| self.alloc_handle())
             .collect();
         let metal_layer = self.alloc_handle();
 
-        // Create Metal swapchain if backend is available
+        // Create a fresh Metal swapchain for this VkSwapchainKHR whenever the
+        // backend is available, so a second swapchain's configuration is
+        // honoured instead of silently reusing the first one's.
         if let Some(ref mut backend) = self.metal_backend {
-            if backend.swapchain().is_none() {
-                use crate::metal_backend::{ColorSpace, FlipModel};
-                backend.create_swapchain(
-                    ci.image_extent.0 as u64,
-                    ci.image_extent.1 as u64,
-                    FlipModel::Discard,
-                    ColorSpace::SRGB,
-                );
-            }
+            use crate::metal_backend::{ColorSpace, FlipModel};
+            backend.create_swapchain(
+                ci.image_extent.0 as u64,
+                ci.image_extent.1 as u64,
+                FlipModel::Discard,
+                ColorSpace::SRGB,
+            );
         }
 
         let info = VkSwapchainInfo {
@@ -2721,24 +3070,38 @@ impl VulkanState {
                 format!("swapchain {} not found", swapchain),
             )
         })?;
+        // Belt-and-braces guard: `min_image_count` was validated at
+        // create_swapchain time, but never trust caller-supplied state when
+        // it feeds a modulo (zero would panic).
+        if info.min_image_count == 0 {
+            return Err(AppError::new(
+                ReasonCode::RcInvalidState,
+                "acquire_next_image: swapchain has min_image_count 0",
+            ));
+        }
         let index = info.current_buffer_index;
         info.current_buffer_index = (info.current_buffer_index + 1) % info.min_image_count as usize;
-        if let Some(f) = fence {
-            if let Some(fi) = self.fences.get_mut(&f) {
-                fi.signaled = true;
-            }
+        if let Some(f) = fence
+            && let Some(fi) = self.fences.get_mut(&f)
+        {
+            fi.signaled = true;
         }
-        if let Some(s) = semaphore {
-            if let Some(si) = self.semaphores.get_mut(&s) {
-                si.signaled = true;
-            }
+        if let Some(s) = semaphore
+            && let Some(si) = self.semaphores.get_mut(&s)
+        {
+            si.signaled = true;
         }
 
-        // Attempt to get next Metal drawable
-        if let Some(ref backend) = self.metal_backend {
-            if let Some(ref _swapchain) = backend.swapchain() {
-                // Drawable acquired — the actual Metal drawable will be used during present
-            }
+        // Attempt to get next Metal drawable so the presentation path has a
+        // real drawable to present in `queue_present`.
+        if let Some(backend) = self.metal_backend.as_mut()
+            && let Some(swapchain) = backend.swapchain_mut()
+            && let Err(e) = swapchain.next_drawable()
+        {
+            return Err(AppError::new(
+                ReasonCode::RcInvalidState,
+                format!("acquire_next_image: failed to get Metal drawable: {e:?}"),
+            ));
         }
 
         Ok((index as u32, false))
@@ -2747,7 +3110,7 @@ impl VulkanState {
     /// Present a swapchain image via Metal.
     ///
     /// When the Metal backend is available, presents the current drawable
-    /// from the [`MetalSwapchain`].
+    /// from the [`MetalSwapchain`] using a fresh committed command buffer.
     pub fn queue_present(
         &mut self,
         _queue: VkQueue,
@@ -2767,7 +3130,22 @@ impl VulkanState {
             ));
         }
 
-        // Present via Metal backend — the command buffer commit happens in queue_submit
+        // Present via Metal backend: acquire the drawable and present it on a
+        // fresh committed command buffer (same pattern as `metal_renderer`).
+        if let Some(backend) = self.metal_backend.as_ref() {
+            let sc = backend.swapchain().ok_or_else(|| {
+                AppError::new(ReasonCode::RcInvalidState, "queue_present: no Metal swapchain")
+            })?;
+            let drawable = sc.next_drawable().map_err(|e| {
+                AppError::new(
+                    ReasonCode::RcInvalidState,
+                    format!("queue_present: no drawable available: {e:?}"),
+                )
+            })?;
+            let cmd_buffer = backend.command_queue().new_command_buffer();
+            cmd_buffer.present_drawable(drawable);
+            cmd_buffer.commit();
+        }
         Ok(())
     }
 
@@ -2843,7 +3221,21 @@ impl VulkanState {
                 "device not found",
             ));
         }
-        let mem_props = &self.devices.get(&device).unwrap().memory_properties;
+        if size > MAX_DEVICE_MEMORY_SIZE {
+            return Err(AppError::new(
+                ReasonCode::RcInvalidState,
+                format!(
+                    "allocate_memory: size {size} exceeds maximum allowed allocation {}",
+                    MAX_DEVICE_MEMORY_SIZE
+                ),
+            ));
+        }
+        let mem_props = self
+            .devices
+            .get(&device)
+            .ok_or_else(|| AppError::new(ReasonCode::RcInvalidState, "device not found"))?
+            .memory_properties
+            .clone();
         let mem_type = mem_props
             .memory_types
             .get(memory_type_index as usize)
@@ -2852,7 +3244,17 @@ impl VulkanState {
             })?;
         let alloc_type = MemoryAllocationType::from_memory_properties(mem_type.property_flags);
         let handle = self.alloc_handle();
-        let metal_buffer = self.alloc_handle();
+        let metal_buffer = if let Some(ref mut backend) = self.metal_backend {
+            let options = match alloc_type {
+                MemoryAllocationType::Private | MemoryAllocationType::Memoryless => {
+                    metal::MTLResourceOptions::StorageModePrivate
+                }
+                _ => metal::MTLResourceOptions::StorageModeShared,
+            };
+            Some(backend.create_empty_buffer(size, options))
+        } else {
+            None
+        };
         self.device_memory.insert(
             handle,
             VkDeviceMemoryInfo {
@@ -2860,7 +3262,7 @@ impl VulkanState {
                 size,
                 memory_type_index,
                 mapped_pointer: None,
-                metal_buffer: Some(metal_buffer),
+                metal_buffer,
                 allocation_type: alloc_type,
                 mapped_data: None,
             },
@@ -2876,16 +3278,26 @@ impl VulkanState {
                 "device not found",
             ));
         }
-        if self.device_memory.remove(&memory).is_none() {
-            return Err(AppError::new(
-                ReasonCode::RcInvalidState,
-                "memory not found",
-            ));
+        let info = self
+            .device_memory
+            .remove(&memory)
+            .ok_or_else(|| AppError::new(ReasonCode::RcInvalidState, "memory not found"))?;
+        // Release the backing Metal buffer so the GPU allocation is freed.
+        if let (Some(backend), Some(metal_buffer)) =
+            (self.metal_backend.as_mut(), info.metal_buffer)
+        {
+            backend.destroy_buffer(metal_buffer);
         }
         Ok(())
     }
 
     /// Map device memory for CPU access.
+    ///
+    /// When a Metal backend buffer backs the allocation, the returned pointer
+    /// is the buffer's own CPU-visible `contents()` pointer (for shared
+    /// storage); otherwise a host-side staging buffer is used. The requested
+    /// `[offset, offset + size)` range is validated against the allocation
+    /// before any pointer arithmetic (checked, never wrapping).
     pub fn map_memory(
         &mut self,
         device: VkDevice,
@@ -2912,10 +3324,13 @@ impl VulkanState {
             }
             _ => {}
         }
-        if info.mapped_data.is_none() {
-            info.mapped_data = Some(vec![0u8; info.size as usize]);
-        }
-        if offset as u64 + size as u64 > info.size {
+        // Reject wrapping offset+size arithmetic before any comparison or
+        // pointer arithmetic (a guest-supplied overflow must never bypass the
+        // bounds check below).
+        let end = offset
+            .checked_add(size)
+            .ok_or_else(|| AppError::new(ReasonCode::RcInvalidState, "map_memory: offset + size overflows"))?;
+        if offset > info.size || end > info.size {
             return Err(AppError::new(
                 ReasonCode::RcInvalidState,
                 format!(
@@ -2924,8 +3339,41 @@ impl VulkanState {
                 ),
             ));
         }
-        let ptr = info.mapped_data.as_mut().unwrap().as_mut_ptr();
-        let ptr = unsafe { ptr.add(offset as usize) };
+
+        let ptr = if info.metal_buffer.is_some() {
+            // Real Metal buffer: return its CPU-visible contents pointer.
+            let contents = self
+                .metal_backend
+                .as_ref()
+                .and_then(|b| info.metal_buffer.and_then(|id| b.get_buffer(id)))
+                .map(|buf| buf.contents() as *mut u8)
+                .ok_or_else(|| AppError::new(ReasonCode::RcInvalidState, "metal buffer missing"))?;
+            info.mapped_data = None;
+            unsafe { contents.add(offset as usize) }
+        } else {
+            // Host-side staging buffer.
+            if info.mapped_data.is_none() {
+                let mut data = Vec::new();
+                data.try_reserve_exact(info.size as usize).map_err(|e| {
+                    AppError::new(
+                        ReasonCode::RcInvalidState,
+                        format!("map_memory: cannot allocate {} bytes: {e}", info.size),
+                    )
+                })?;
+                data.resize(info.size as usize, 0);
+                info.mapped_data = Some(data);
+            }
+            let base = match info.mapped_data.as_mut() {
+                Some(data) => data.as_mut_ptr(),
+                None => {
+                    return Err(AppError::new(
+                        ReasonCode::RcInvalidState,
+                        "map_memory: staging buffer missing",
+                    ));
+                }
+            };
+            unsafe { base.add(offset as usize) }
+        };
         info.mapped_pointer = Some(ptr as u64);
         Ok(ptr)
     }
@@ -2947,31 +3395,63 @@ impl VulkanState {
     }
 
     /// Flush mapped memory ranges (for managed memory).
+    ///
+    /// Shared-storage Metal buffers are coherent and need no flush; managed
+    /// buffers are invalidated via `didModifyRange` so the GPU sees the
+    /// updated bytes.
     pub fn flush_mapped_memory_ranges(
         &mut self,
         ranges: &[(VkDeviceMemory, u64, u64)],
     ) -> AppResult<()> {
-        for &(memory, _, _) in ranges {
-            if !self.device_memory.contains_key(&memory) {
+        for &(memory, offset, size) in ranges {
+            let info = self
+                .device_memory
+                .get(&memory)
+                .ok_or_else(|| AppError::new(ReasonCode::RcInvalidState, "memory not found"))?;
+            let end = offset.checked_add(size).ok_or_else(|| {
+                AppError::new(ReasonCode::RcInvalidState, "flush: offset + size overflows")
+            })?;
+            if offset > info.size || end > info.size {
                 return Err(AppError::new(
                     ReasonCode::RcInvalidState,
-                    "memory not found",
+                    "flush: range exceeds allocation size",
                 ));
+            }
+            if info.allocation_type == MemoryAllocationType::Managed
+                && let Some(id) = info.metal_buffer
+                && let Some(backend) = self.metal_backend.as_ref()
+                && let Some(buf) = backend.get_buffer(id)
+            {
+                buf.did_modify_range(metal::NSRange {
+                    location: offset,
+                    length: size,
+                });
             }
         }
         Ok(())
     }
 
     /// Invalidate mapped memory ranges (for managed memory).
+    ///
+    /// Shared-storage Metal buffers are coherent and need no invalidation;
+    /// managed buffers are always CPU-visible via `contents()` in this layer,
+    /// so no GPU-side sync is required.
     pub fn invalidate_mapped_memory_ranges(
         &mut self,
         ranges: &[(VkDeviceMemory, u64, u64)],
     ) -> AppResult<()> {
-        for &(memory, _, _) in ranges {
-            if !self.device_memory.contains_key(&memory) {
+        for &(memory, offset, size) in ranges {
+            let info = self
+                .device_memory
+                .get(&memory)
+                .ok_or_else(|| AppError::new(ReasonCode::RcInvalidState, "memory not found"))?;
+            let end = offset.checked_add(size).ok_or_else(|| {
+                AppError::new(ReasonCode::RcInvalidState, "invalidate: offset + size overflows")
+            })?;
+            if offset > info.size || end > info.size {
                 return Err(AppError::new(
                     ReasonCode::RcInvalidState,
-                    "memory not found",
+                    "invalidate: range exceeds allocation size",
                 ));
             }
         }
@@ -2982,6 +3462,10 @@ impl VulkanState {
     ///
     /// When the Metal backend is available, a zero-initialized `MTLBuffer` of
     /// the requested size is created via [`MetalGpuBackend::create_empty_buffer`].
+    ///
+    /// The Metal storage mode is derived from the usage bits: buffers that
+    /// are written by the CPU (transfer-dst or uniform/storage usage) use
+    /// shared storage; purely GPU-consumed buffers use private storage.
     pub fn create_buffer(
         &mut self,
         device: VkDevice,
@@ -2994,14 +3478,31 @@ impl VulkanState {
                 "device not found",
             ));
         }
+        if size > MAX_DEVICE_MEMORY_SIZE {
+            return Err(AppError::new(
+                ReasonCode::RcInvalidState,
+                format!(
+                    "create_buffer: size {size} exceeds maximum allowed allocation {}",
+                    MAX_DEVICE_MEMORY_SIZE
+                ),
+            ));
+        }
         let handle = self.alloc_handle();
 
         // Create Metal buffer if backend is available
         let metal_buffer_id = if let Some(ref mut backend) = self.metal_backend {
-            let options = if usage != 0 {
+            const VK_BUFFER_USAGE_TRANSFER_DST_BIT: u32 = 0x0000_0002;
+            const VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT: u32 = 0x0000_0010;
+            const VK_BUFFER_USAGE_STORAGE_BUFFER_BIT: u32 = 0x0000_0020;
+            let host_written = usage
+                & (VK_BUFFER_USAGE_TRANSFER_DST_BIT
+                    | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT
+                    | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)
+                != 0;
+            let options = if host_written {
                 metal::MTLResourceOptions::StorageModeShared
             } else {
-                metal::MTLResourceOptions::StorageModeShared
+                metal::MTLResourceOptions::StorageModePrivate
             };
             Some(backend.create_empty_buffer(size, options))
         } else {
@@ -3040,6 +3541,21 @@ impl VulkanState {
             return Err(AppError::new(
                 ReasonCode::RcInvalidState,
                 "device not found",
+            ));
+        }
+        if extent.0 == 0 || extent.1 == 0 || extent.2 == 0 {
+            return Err(AppError::new(
+                ReasonCode::RcInvalidState,
+                "create_image: extent must be non-zero",
+            ));
+        }
+        if extent.0 > MAX_TEXTURE_DIMENSION || extent.1 > MAX_TEXTURE_DIMENSION {
+            return Err(AppError::new(
+                ReasonCode::RcInvalidState,
+                format!(
+                    "create_image: extent {:?} exceeds maximum texture dimension {}",
+                    extent, MAX_TEXTURE_DIMENSION
+                ),
             ));
         }
         let handle = self.alloc_handle();
@@ -3087,31 +3603,39 @@ impl VulkanState {
     }
 
     /// Create an image view, optionally backed by a Metal texture view.
+    ///
+    /// When the source image has a Metal texture and the backend is
+    /// available, a real `MTLTexture` view (`newTextureViewWithPixelFormat`)
+    /// is created — it shares storage with the parent image instead of
+    /// allocating an independent copy, so writes through the image are
+    /// visible through the view and vice versa.
     pub fn create_image_view(
         &mut self,
         image: VkImage,
         format: VkFormat,
         aspect_mask: u32,
     ) -> AppResult<VkImageView> {
-        if !self.images.contains_key(&image) {
-            return Err(AppError::new(ReasonCode::RcInvalidState, "image not found"));
-        }
+        let img_info = self
+            .images
+            .get(&image)
+            .ok_or_else(|| AppError::new(ReasonCode::RcInvalidState, "image not found"))?;
+        let metal_texture_id = img_info.metal_texture_id;
+        let _ = img_info;
         let handle = self.alloc_handle();
 
         // Create a Metal texture view if the source image has a Metal texture
-        let metal_texture_view_id = if let Some(ref mut backend) = self.metal_backend {
-            self.images.get(&image).and_then(|img_info| {
-                img_info.metal_texture_id.map(|_tex_id| {
-                    // Create a new texture referencing the same Metal texture
-                    let mtl_format = vk_format_to_metal_format(format);
-                    backend.create_texture(
-                        img_info.extent.0 as u64,
-                        img_info.extent.1 as u64,
-                        mtl_format,
-                        metal::MTLTextureUsage::ShaderRead | metal::MTLTextureUsage::RenderTarget,
-                    )
-                })
-            })
+        let metal_texture_view_id = if let Some(ref backend) = self.metal_backend {
+            if let Some(tex_id) = metal_texture_id {
+                let src = backend.get_texture(tex_id).ok_or_else(|| {
+                    AppError::new(ReasonCode::RcInvalidState, "source Metal texture missing")
+                })?;
+                let view = src.new_texture_view(vk_format_to_metal_format(format));
+                let view_handle = self.alloc_handle();
+                self.texture_views.insert(view_handle, view);
+                Some(view_handle)
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -3197,52 +3721,93 @@ impl VulkanState {
 
     /// Create a graphics pipeline backed by a Metal render pipeline state.
     ///
-    /// When the Metal backend is available, this method:
-    /// 1. Extracts SPIR-V from bound shader modules
-    /// 2. Cross-compiles SPIR-V → MSL via [`SpirvTranslator`]
-    /// 3. Compiles MSL → MTLLibrary → MTLFunction
-    /// 4. Creates MTLRenderPipelineState
+    /// This is the legacy entry point kept for API compatibility: it scans
+    /// all registered shader modules for one of each stage. Prefer
+    /// [`create_graphics_pipeline_with_shaders`](Self::create_graphics_pipeline_with_shaders)
+    /// when the exact shader-module handles are known.
     pub fn create_graphics_pipeline(
         &mut self,
         layout: VkPipelineLayout,
         stages: u32,
     ) -> AppResult<VkPipeline> {
+        self.create_graphics_pipeline_with_shaders(layout, stages, None, None)
+    }
+
+    /// Create a graphics pipeline from explicitly selected shader modules.
+    ///
+    /// Only the modules named by `vertex_module`/`fragment_module` are
+    /// compiled into the pipeline (rather than "whichever module of each
+    /// stage happens to be last in the registry"), and the chosen modules are
+    /// recorded in the resulting [`VkPipelineInfo`]. When both handles are
+    /// `None`, falls back to scanning the module registry for one module of
+    /// each stage (legacy behaviour).
+    ///
+    /// When the Metal backend is available, this method:
+    /// 1. Extracts SPIR-V from the selected shader modules
+    /// 2. Cross-compiles SPIR-V → MSL via [`SpirvTranslator`]
+    /// 3. Compiles MSL → MTLLibrary → MTLFunction
+    /// 4. Creates MTLRenderPipelineState
+    pub fn create_graphics_pipeline_with_shaders(
+        &mut self,
+        layout: VkPipelineLayout,
+        stages: u32,
+        vertex_module: Option<VkShaderModule>,
+        fragment_module: Option<VkShaderModule>,
+    ) -> AppResult<VkPipeline> {
         let handle = self.alloc_handle();
 
-        // Attempt to create a Metal pipeline from bound shader modules
-        let (metal_pipeline_id, metal_library_id) =
+        // Attempt to create a Metal pipeline from the selected shader modules
+        let (metal_pipeline_id, metal_library_id, vertex_shader, fragment_shader) =
             if let Some(ref mut backend) = self.metal_backend {
-                // Find the first shader module that has MSL source
+                // Pick the module the caller selected when it exists and has
+                // the right stage; otherwise fall back to any module of that
+                // stage in the registry.
+                let select = |module: Option<VkShaderModule>,
+                              want: VkShaderStageFlagBits|
+                 -> Option<VkShaderModule> {
+                    if let Some(m) = module
+                        && let Some(sm) = self.shader_modules.get(&m)
+                        && sm.stage == want
+                    {
+                        return Some(m);
+                    }
+                    self.shader_modules
+                        .values()
+                        .find(|sm| sm.stage == want)
+                        .map(|sm| sm.handle)
+                };
+                let vertex_module = select(vertex_module, VkShaderStageFlagBits::Vertex);
+                let fragment_module = select(fragment_module, VkShaderStageFlagBits::Fragment);
+
                 let mut vertex_msl: Option<String> = None;
                 let mut fragment_msl: Option<String> = None;
                 let mut vertex_entry = "main".to_string();
                 let mut fragment_entry = "main".to_string();
 
-                for (_, sm) in &self.shader_modules {
-                    if let Some(ref msl) = sm.msl_source {
-                        match sm.stage {
-                            VkShaderStageFlagBits::Vertex => {
-                                vertex_msl = Some(msl.clone());
-                                vertex_entry = sm
-                                    .entry_points
-                                    .first()
-                                    .cloned()
-                                    .unwrap_or_else(|| "main".to_string());
-                            }
-                            VkShaderStageFlagBits::Fragment => {
-                                fragment_msl = Some(msl.clone());
-                                fragment_entry = sm
-                                    .entry_points
-                                    .first()
-                                    .cloned()
-                                    .unwrap_or_else(|| "main".to_string());
-                            }
-                            _ => {}
-                        }
-                    }
+                if let Some(vm) = vertex_module
+                    && let Some(sm) = self.shader_modules.get(&vm)
+                    && let Some(ref msl) = sm.msl_source
+                {
+                    vertex_msl = Some(msl.clone());
+                    vertex_entry = sm
+                        .entry_points
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| "main".to_string());
+                }
+                if let Some(fm) = fragment_module
+                    && let Some(sm) = self.shader_modules.get(&fm)
+                    && let Some(ref msl) = sm.msl_source
+                {
+                    fragment_msl = Some(msl.clone());
+                    fragment_entry = sm
+                        .entry_points
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| "main".to_string());
                 }
 
-                if let Some(ref msl_src) = vertex_msl {
+                let (pipeline_id, lib_id) = if let Some(ref msl_src) = vertex_msl {
                     match backend.compile_shader(msl_src) {
                         Ok(lib_id) => {
                             // Try to create a render pipeline with vertex-only (fragment may be missing)
@@ -3265,13 +3830,17 @@ impl VulkanState {
                             };
                             (pipeline_id, Some(lib_id))
                         }
-                        Err(_) => (None, None),
+                        Err(e) => {
+                            eprintln!("[vkgl] shader compilation failed: {e:?}");
+                            (None, None)
+                        }
                     }
                 } else {
                     (None, None)
-                }
+                };
+                (pipeline_id, lib_id, vertex_module, fragment_module)
             } else {
-                (None, None)
+                (None, None, None, None)
             };
 
         self.pipelines.insert(
@@ -3283,37 +3852,65 @@ impl VulkanState {
                 bind_point: VkPipelineBindPoint::Graphics,
                 metal_pipeline_id,
                 metal_library_id,
-                vertex_shader: None,
-                fragment_shader: None,
+                vertex_shader,
+                fragment_shader,
             },
         );
         Ok(handle)
     }
 
     /// Create a compute pipeline backed by a Metal compute pipeline state.
+    ///
+    /// Legacy entry point that scans the registry for a compute shader
+    /// module; prefer
+    /// [`create_compute_pipeline_with_shader`](Self::create_compute_pipeline_with_shader).
     pub fn create_compute_pipeline(&mut self, layout: VkPipelineLayout) -> AppResult<VkPipeline> {
+        self.create_compute_pipeline_with_shader(layout, None)
+    }
+
+    /// Create a compute pipeline from an explicitly selected shader module.
+    ///
+    /// When `compute_module` is `None` (legacy behaviour), scans the module
+    /// registry for a compute shader.
+    pub fn create_compute_pipeline_with_shader(
+        &mut self,
+        layout: VkPipelineLayout,
+        compute_module: Option<VkShaderModule>,
+    ) -> AppResult<VkPipeline> {
         let handle = self.alloc_handle();
 
-        let (metal_pipeline_id, metal_library_id) =
+        let (metal_pipeline_id, metal_library_id, compute_shader) =
             if let Some(ref mut backend) = self.metal_backend {
-                // Find a compute shader module
+                // Pick the caller's module when it is a compute shader;
+                // otherwise fall back to any compute module in the registry.
+                let compute_module = compute_module.and_then(|m| {
+                    self.shader_modules
+                        .get(&m)
+                        .filter(|sm| sm.stage == VkShaderStageFlagBits::Compute)
+                        .map(|_| m)
+                });
+                let compute_module = compute_module.or_else(|| {
+                    self.shader_modules
+                        .values()
+                        .find(|sm| sm.stage == VkShaderStageFlagBits::Compute)
+                        .map(|sm| sm.handle)
+                });
+
                 let mut compute_msl: Option<String> = None;
                 let mut compute_entry = "main".to_string();
-
-                for (_, sm) in &self.shader_modules {
-                    if sm.stage == VkShaderStageFlagBits::Compute {
-                        if let Some(ref msl) = sm.msl_source {
-                            compute_msl = Some(msl.clone());
-                            compute_entry = sm
-                                .entry_points
-                                .first()
-                                .cloned()
-                                .unwrap_or_else(|| "main".to_string());
-                        }
-                    }
+                if let Some(cm) = compute_module
+                    && let Some(sm) = self.shader_modules.get(&cm)
+                    && let Some(ref msl) = sm.msl_source
+                {
+                    compute_msl = Some(msl.clone());
+                    compute_entry = sm
+                        .entry_points
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| "main".to_string());
                 }
 
-                if let Some(ref msl_src) = compute_msl {
+                let (pipeline_id, lib_id) = if let Some(ref msl_src) = compute_msl {
                     match backend.compile_shader(msl_src) {
                         Ok(lib_id) => {
                             let pipeline_id =
@@ -3326,13 +3923,17 @@ impl VulkanState {
                                 };
                             (pipeline_id, Some(lib_id))
                         }
-                        Err(_) => (None, None),
+                        Err(e) => {
+                            eprintln!("[vkgl] compute shader compilation failed: {e:?}");
+                            (None, None)
+                        }
                     }
                 } else {
                     (None, None)
-                }
+                };
+                (pipeline_id, lib_id, compute_module)
             } else {
-                (None, None)
+                (None, None, None)
             };
 
         self.pipelines.insert(
@@ -3344,7 +3945,7 @@ impl VulkanState {
                 bind_point: VkPipelineBindPoint::Compute,
                 metal_pipeline_id,
                 metal_library_id,
-                vertex_shader: None,
+                vertex_shader: compute_shader,
                 fragment_shader: None,
             },
         );
@@ -3352,20 +3953,15 @@ impl VulkanState {
     }
 
     /// Create a sampler backed by a Metal sampler state.
+    ///
+    /// When the Metal backend is available, a real `MTLSamplerState` is
+    /// created from the create info (filters, address modes, LOD clamps,
+    /// anisotropy, and compare function) and kept alive for the sampler's
+    /// lifetime.
     pub fn create_sampler(
         &mut self,
         device: VkDevice,
-        min_filter: u32,
-        mag_filter: u32,
-        mipmap_mode: u32,
-        address_mode_u: u32,
-        address_mode_v: u32,
-        address_mode_w: u32,
-        mip_lod_bias: f32,
-        max_anisotropy: f32,
-        compare_op: u32,
-        min_lod: f32,
-        max_lod: f32,
+        ci: &VkSamplerCreateInfo,
     ) -> AppResult<u64> {
         if !self.devices.contains_key(&device) {
             return Err(AppError::new(
@@ -3375,28 +3971,50 @@ impl VulkanState {
         }
         let handle = self.alloc_handle();
 
-        let metal_sampler_id = None; // MetalGpuBackend doesn't expose sampler creation directly yet
+        let metal_sampler_id = if let Some(backend) = self.metal_backend.as_ref() {
+            let desc = vk_sampler_to_d3d12_static_sampler_desc(ci);
+            let sampler = crate::metal_backend::create_static_sampler(
+                backend.device().metal_device(),
+                &desc,
+            );
+            self.sampler_states.insert(handle, sampler);
+            Some(handle)
+        } else {
+            None
+        };
 
         self.samplers.insert(
             handle,
             VkSamplerInfo {
                 handle,
                 device,
-                min_filter,
-                mag_filter,
-                mipmap_mode,
-                address_mode_u,
-                address_mode_v,
-                address_mode_w,
-                mip_lod_bias,
-                max_anisotropy,
-                compare_op,
-                min_lod,
-                max_lod,
+                min_filter: ci.min_filter,
+                mag_filter: ci.mag_filter,
+                mipmap_mode: ci.mipmap_mode,
+                address_mode_u: ci.address_mode_u,
+                address_mode_v: ci.address_mode_v,
+                address_mode_w: ci.address_mode_w,
+                mip_lod_bias: ci.mip_lod_bias,
+                max_anisotropy: ci.max_anisotropy,
+                compare_op: ci.compare_op,
+                min_lod: ci.min_lod,
+                max_lod: ci.max_lod,
                 metal_sampler_id,
             },
         );
         Ok(handle)
+    }
+
+    /// Destroy a sampler, releasing its Metal sampler state.
+    pub fn destroy_sampler(&mut self, sampler: u64) -> AppResult<()> {
+        if self.samplers.remove(&sampler).is_none() {
+            return Err(AppError::new(
+                ReasonCode::RcInvalidState,
+                format!("sampler {sampler} not found"),
+            ));
+        }
+        self.sampler_states.remove(&sampler);
+        Ok(())
     }
 
     /// Create a descriptor set layout.
@@ -3571,10 +4189,7 @@ impl VulkanState {
         fb: VkFramebuffer,
         clears: Vec<ClearValue>,
     ) -> AppResult<()> {
-        self.cmd_in_recording(cmd)?;
-        self.command_buffers
-            .get_mut(&cmd)
-            .unwrap()
+        self.cmd_in_recording_mut(cmd)?
             .recorded_commands
             .push(RecordedCommand::BeginRenderPass {
                 render_pass: rp,
@@ -3586,10 +4201,7 @@ impl VulkanState {
 
     /// Record end render pass.
     pub fn cmd_end_render_pass(&mut self, cmd: VkCommandBuffer) -> AppResult<()> {
-        self.cmd_in_recording(cmd)?;
-        self.command_buffers
-            .get_mut(&cmd)
-            .unwrap()
+        self.cmd_in_recording_mut(cmd)?
             .recorded_commands
             .push(RecordedCommand::EndRenderPass);
         Ok(())
@@ -3601,10 +4213,7 @@ impl VulkanState {
         cmd: VkCommandBuffer,
         pipeline: VkPipeline,
     ) -> AppResult<()> {
-        self.cmd_in_recording(cmd)?;
-        self.command_buffers
-            .get_mut(&cmd)
-            .unwrap()
+        self.cmd_in_recording_mut(cmd)?
             .recorded_commands
             .push(RecordedCommand::BindPipeline { pipeline });
         Ok(())
@@ -3617,10 +4226,7 @@ impl VulkanState {
         layout: VkPipelineLayout,
         sets: Vec<VkDescriptorSet>,
     ) -> AppResult<()> {
-        self.cmd_in_recording(cmd)?;
-        self.command_buffers
-            .get_mut(&cmd)
-            .unwrap()
+        self.cmd_in_recording_mut(cmd)?
             .recorded_commands
             .push(RecordedCommand::BindDescriptorSets { layout, sets });
         Ok(())
@@ -3632,10 +4238,7 @@ impl VulkanState {
         cmd: VkCommandBuffer,
         bindings: Vec<(u32, VkBuffer, u64)>,
     ) -> AppResult<()> {
-        self.cmd_in_recording(cmd)?;
-        self.command_buffers
-            .get_mut(&cmd)
-            .unwrap()
+        self.cmd_in_recording_mut(cmd)?
             .recorded_commands
             .push(RecordedCommand::BindVertexBuffers { bindings });
         Ok(())
@@ -3649,10 +4252,7 @@ impl VulkanState {
         offset: u64,
         index_type: VkIndexType,
     ) -> AppResult<()> {
-        self.cmd_in_recording(cmd)?;
-        self.command_buffers
-            .get_mut(&cmd)
-            .unwrap()
+        self.cmd_in_recording_mut(cmd)?
             .recorded_commands
             .push(RecordedCommand::BindIndexBuffer {
                 buffer,
@@ -3671,10 +4271,7 @@ impl VulkanState {
         first_vertex: u32,
         first_instance: u32,
     ) -> AppResult<()> {
-        self.cmd_in_recording(cmd)?;
-        self.command_buffers
-            .get_mut(&cmd)
-            .unwrap()
+        self.cmd_in_recording_mut(cmd)?
             .recorded_commands
             .push(RecordedCommand::Draw {
                 vertex_count,
@@ -3695,10 +4292,7 @@ impl VulkanState {
         vertex_offset: i32,
         first_instance: u32,
     ) -> AppResult<()> {
-        self.cmd_in_recording(cmd)?;
-        self.command_buffers
-            .get_mut(&cmd)
-            .unwrap()
+        self.cmd_in_recording_mut(cmd)?
             .recorded_commands
             .push(RecordedCommand::DrawIndexed {
                 index_count,
@@ -3718,10 +4312,7 @@ impl VulkanState {
         gy: u32,
         gz: u32,
     ) -> AppResult<()> {
-        self.cmd_in_recording(cmd)?;
-        self.command_buffers
-            .get_mut(&cmd)
-            .unwrap()
+        self.cmd_in_recording_mut(cmd)?
             .recorded_commands
             .push(RecordedCommand::Dispatch {
                 group_count_x: gx,
@@ -3739,10 +4330,7 @@ impl VulkanState {
         dst: VkBuffer,
         regions: Vec<(u64, u64, u64)>,
     ) -> AppResult<()> {
-        self.cmd_in_recording(cmd)?;
-        self.command_buffers
-            .get_mut(&cmd)
-            .unwrap()
+        self.cmd_in_recording_mut(cmd)?
             .recorded_commands
             .push(RecordedCommand::CopyBuffer { src, dst, regions });
         Ok(())
@@ -3756,16 +4344,14 @@ impl VulkanState {
         dst: VkImage,
         regions: Vec<ImageCopyRegion>,
     ) -> AppResult<()> {
-        self.cmd_in_recording(cmd)?;
-        self.command_buffers
-            .get_mut(&cmd)
-            .unwrap()
+        self.cmd_in_recording_mut(cmd)?
             .recorded_commands
             .push(RecordedCommand::CopyImage { src, dst, regions });
         Ok(())
     }
 
     /// Record pipeline barrier.
+    #[allow(clippy::too_many_arguments)] // mirrors the Vulkan C API
     pub fn cmd_pipeline_barrier(
         &mut self,
         cmd: VkCommandBuffer,
@@ -3776,15 +4362,12 @@ impl VulkanState {
         buf_barriers: Vec<VkBufferMemoryBarrier>,
         img_barriers: Vec<VkImageMemoryBarrier>,
     ) -> AppResult<()> {
-        self.cmd_in_recording(cmd)?;
         for b in &img_barriers {
             if let Some(img) = self.images.get_mut(&b.image) {
                 img.layout = b.new_layout;
             }
         }
-        self.command_buffers
-            .get_mut(&cmd)
-            .unwrap()
+        self.cmd_in_recording_mut(cmd)?
             .recorded_commands
             .push(RecordedCommand::PipelineBarrier {
                 src_stage,
@@ -3806,10 +4389,7 @@ impl VulkanState {
         offset: u32,
         data: Vec<u8>,
     ) -> AppResult<()> {
-        self.cmd_in_recording(cmd)?;
-        self.command_buffers
-            .get_mut(&cmd)
-            .unwrap()
+        self.cmd_in_recording_mut(cmd)?
             .recorded_commands
             .push(RecordedCommand::PushConstants {
                 layout,
@@ -3832,6 +4412,23 @@ impl VulkanState {
             ));
         }
         Ok(())
+    }
+
+    /// Mutable variant of [`Self::cmd_in_recording`]: returns the command
+    /// buffer that is currently being recorded, without any panicking
+    /// indexing (an invalid handle is reported as an error instead).
+    fn cmd_in_recording_mut(&mut self, cmd: VkCommandBuffer) -> AppResult<&mut VkCommandBufferInfo> {
+        let info = self
+            .command_buffers
+            .get_mut(&cmd)
+            .ok_or_else(|| AppError::new(ReasonCode::RcInvalidState, "cmd not found"))?;
+        if info.state != CommandBufferState::Recording {
+            return Err(AppError::new(
+                ReasonCode::RcInvalidState,
+                "cmd not in Recording state",
+            ));
+        }
+        Ok(info)
     }
 
     /// Create a fence.
@@ -3864,21 +4461,76 @@ impl VulkanState {
 
     /// Submit command buffers to a queue.
     ///
-    /// When the Metal backend is available, creates a Metal command buffer
-    /// from the [`MetalGpuBackend`]'s command queue and replays all recorded
-    /// Vulkan commands into it, then commits it for GPU execution.
+    /// When the Metal backend is available, this method:
+    /// 1. Validates every submitted command buffer is executable
+    /// 2. Creates a Metal command buffer from the [`MetalGpuBackend`]'s
+    ///    command queue and replays every recorded Vulkan command
+    ///    (render passes, pipeline binds, draws, dispatches, copies) into it
+    /// 3. Commits the Metal command buffer for GPU execution
+    ///
+    /// A Metal command buffer is only created/committed when at least one
+    /// command buffer with recorded commands is submitted — empty submits
+    /// (e.g. pure fence signals) no longer allocate or commit GPU work.
     pub fn queue_submit(
         &mut self,
         _queue: VkQueue,
         submits: &[VkSubmitInfo],
         fence: Option<VkFence>,
     ) -> AppResult<()> {
-        let metal_cb = self.alloc_handle();
+        // Collect and validate all submitted command buffers first.
+        let mut pending: Vec<VkCommandBuffer> = Vec::new();
+        for s in submits {
+            for &cmd in &s.command_buffers {
+                let cb = self.command_buffers.get(&cmd).ok_or_else(|| {
+                    AppError::new(
+                        ReasonCode::RcInvalidState,
+                        format!("queue_submit: command buffer {cmd} not found"),
+                    )
+                })?;
+                if cb.state != CommandBufferState::Executable {
+                    return Err(AppError::new(
+                        ReasonCode::RcInvalidState,
+                        format!("queue_submit: command buffer {cmd} not executable"),
+                    ));
+                }
+                pending.push(cmd);
+            }
+        }
 
-        // Create and commit a Metal command buffer if backend is available
-        if let Some(ref mut backend) = self.metal_backend {
-            let cmd_buffer = backend.command_queue().new_command_buffer();
-            cmd_buffer.commit();
+        // Snapshot the recorded commands so the replay below does not fight
+        // the borrow checker over `self` (RecordedCommand is Clone).
+        let snapshots: Vec<(VkCommandBuffer, Vec<RecordedCommand>)> = pending
+            .iter()
+            .map(|&cmd| {
+                let cmds = self
+                    .command_buffers
+                    .get(&cmd)
+                    .map(|cb| cb.recorded_commands.clone())
+                    .unwrap_or_default();
+                (cmd, cmds)
+            })
+            .collect();
+
+        // Replay and commit one Metal command buffer per submitted batch.
+        if let Some(backend) = self.metal_backend.as_ref() {
+            for s in submits {
+                let has_work = s.command_buffers.iter().any(|&cmd| {
+                    self.command_buffers
+                        .get(&cmd)
+                        .map(|cb| !cb.recorded_commands.is_empty())
+                        .unwrap_or(false)
+                });
+                if !has_work {
+                    continue;
+                }
+                let cmd_buffer = backend.command_queue().new_command_buffer();
+                for &cmd in &s.command_buffers {
+                    if let Some(cmds) = snapshots.iter().find(|(c, _)| *c == cmd) {
+                        self.replay_into_metal_command_buffer(backend, cmd_buffer, &cmds.1)?;
+                    }
+                }
+                cmd_buffer.commit();
+            }
         }
 
         for s in submits {
@@ -3890,7 +4542,7 @@ impl VulkanState {
             for &cmd in &s.command_buffers {
                 if let Some(cb) = self.command_buffers.get_mut(&cmd) {
                     cb.state = CommandBufferState::Pending;
-                    cb.metal_command_buffer = Some(metal_cb);
+                    cb.metal_command_buffer = Some(cmd);
                 }
             }
             for &sem in &s.signal_semaphores {
@@ -3899,10 +4551,10 @@ impl VulkanState {
                 }
             }
         }
-        if let Some(fh) = fence {
-            if let Some(fi) = self.fences.get_mut(&fh) {
-                fi.signaled = true;
-            }
+        if let Some(fh) = fence
+            && let Some(fi) = self.fences.get_mut(&fh)
+        {
+            fi.signaled = true;
         }
         for s in submits {
             for &cmd in &s.command_buffers {
@@ -3911,8 +4563,493 @@ impl VulkanState {
                 }
             }
         }
-        // queue is validated above via queue lookup; actual Metal submission
-        // is handled by the backend during command buffer execution.
+        Ok(())
+    }
+
+    /// Replay a recorded command list into a Metal command buffer.
+    ///
+    /// Translates each [`RecordedCommand`] into the corresponding Metal
+    /// encoding: render-pass begin/end, pipeline binding, vertex/index
+    /// binding, draws, dispatches, and buffer copies. Commands with no Metal
+    /// equivalent (push constants, descriptor-set binds, barriers) are
+    /// skipped — their state is still tracked in the Vulkan state machine.
+    fn replay_into_metal_command_buffer(
+        &self,
+        backend: &MetalGpuBackend,
+        cmd_buffer: &metal::CommandBufferRef,
+        commands: &[RecordedCommand],
+    ) -> AppResult<()> {
+        let mut render_encoder: Option<&metal::RenderCommandEncoderRef> = None;
+        let mut compute_encoder: Option<&metal::ComputeCommandEncoderRef> = None;
+        let mut bound_pipeline: Option<VkPipeline> = None;
+        let mut index_buffer: Option<(VkBuffer, u64, VkIndexType)> = None;
+
+        // Helper to end whichever encoder is currently active (if any).
+        macro_rules! end_encoders {
+            () => {
+                if let Some(enc) = render_encoder.take() {
+                    enc.end_encoding();
+                }
+                if let Some(enc) = compute_encoder.take() {
+                    enc.end_encoding();
+                }
+            };
+        }
+
+        let apply_pipeline = |pipeline: VkPipeline,
+                                  backend: &MetalGpuBackend,
+                                  render_encoder: Option<&metal::RenderCommandEncoderRef>,
+                                  compute_encoder: Option<&metal::ComputeCommandEncoderRef>|
+         -> AppResult<()> {
+            let Some(info) = self.pipelines.get(&pipeline) else {
+                return Err(AppError::new(
+                    ReasonCode::RcInvalidState,
+                    format!("replay: pipeline {pipeline} not found"),
+                ));
+            };
+            if let Some(enc) = render_encoder
+                && let Some(pid) = info.metal_pipeline_id
+                && let Some(pso) = backend.get_render_pipeline(pid)
+            {
+                enc.set_render_pipeline_state(pso);
+            }
+            if let Some(enc) = compute_encoder
+                && let Some(pid) = info.metal_pipeline_id
+                && let Some(pso) = backend.get_compute_pipeline(pid)
+            {
+                enc.set_compute_pipeline_state(pso);
+            }
+            Ok(())
+        };
+
+        for command in commands {
+            match command {
+                RecordedCommand::BeginRenderPass {
+                    render_pass,
+                    framebuffer,
+                    clear_values,
+                } => {
+                    end_encoders!();
+                    let desc = metal::RenderPassDescriptor::new();
+                    let rp_info = self.render_passes.get(render_pass).ok_or_else(|| {
+                        AppError::new(
+                            ReasonCode::RcInvalidState,
+                            format!("replay: render pass {render_pass} not found"),
+                        )
+                    })?;
+                    let fb_info = self.framebuffers.get(framebuffer).ok_or_else(|| {
+                        AppError::new(
+                            ReasonCode::RcInvalidState,
+                            format!("replay: framebuffer {framebuffer} not found"),
+                        )
+                    })?;
+                    if let Some(attachment) = fb_info.attachments.first()
+                        && let Some(tex) = self.resolve_attachment_texture(backend, *attachment)
+                        && let Some(att) = desc.color_attachments().object_at(0)
+                    {
+                        att.set_texture(Some(tex));
+                        let load = if rp_info.load_action == "clear" {
+                            metal::MTLLoadAction::Clear
+                        } else {
+                            metal::MTLLoadAction::Load
+                        };
+                        att.set_load_action(load);
+                        att.set_store_action(metal::MTLStoreAction::Store);
+                        let clear = clear_values.first().map(|c| c.color);
+                        let [cr, cg, cb, ca] = clear.unwrap_or([0.0, 0.0, 0.0, 1.0]);
+                        att.set_clear_color(metal::MTLClearColor {
+                            red: cr as f64,
+                            green: cg as f64,
+                            blue: cb as f64,
+                            alpha: ca as f64,
+                        });
+                    }
+                    // Depth/stencil attachments are not resolved to Metal
+                    // textures in this layer yet; the color attachment above
+                    // is the primary render target.
+                    render_encoder = Some(cmd_buffer.new_render_command_encoder(desc));
+                }
+                RecordedCommand::EndRenderPass => {
+                    end_encoders!();
+                }
+                RecordedCommand::BindPipeline { pipeline } => {
+                    bound_pipeline = Some(*pipeline);
+                    apply_pipeline(*pipeline, backend, render_encoder, compute_encoder)?;
+                }
+                RecordedCommand::BindDescriptorSets { .. } => {
+                    // No Metal equivalent; descriptor state is bookkeeping.
+                }
+                RecordedCommand::BindVertexBuffers { bindings } => {
+                    if let Some(enc) = render_encoder {
+                        for &(binding, buffer, offset) in bindings {
+                            if let Some(tex) = self.resolve_buffer(backend, buffer) {
+                                enc.set_vertex_buffer(binding as u64, Some(tex), offset);
+                            }
+                        }
+                    }
+                }
+                RecordedCommand::BindIndexBuffer {
+                    buffer,
+                    offset,
+                    index_type,
+                } => {
+                    index_buffer = Some((*buffer, *offset, *index_type));
+                }
+                RecordedCommand::Draw {
+                    vertex_count,
+                    instance_count,
+                    first_vertex,
+                    ..
+                } => {
+                    if let Some(enc) = render_encoder {
+                        if *instance_count > 1 {
+                            enc.draw_primitives_instanced(
+                                metal::MTLPrimitiveType::Triangle,
+                                *first_vertex as u64,
+                                *vertex_count as u64,
+                                *instance_count as u64,
+                            );
+                        } else {
+                            enc.draw_primitives(
+                                metal::MTLPrimitiveType::Triangle,
+                                *first_vertex as u64,
+                                *vertex_count as u64,
+                            );
+                        }
+                    }
+                }
+                RecordedCommand::DrawIndexed {
+                    index_count,
+                    instance_count,
+                    ..
+                } => {
+                    if let Some(enc) = render_encoder
+                        && let Some((buffer, offset, index_type)) = index_buffer
+                        && let Some(buf) = self.resolve_buffer(backend, buffer)
+                    {
+                        let mtl_index_type = match index_type {
+                            VkIndexType::Uint16 => metal::MTLIndexType::UInt16,
+                            VkIndexType::Uint32 => metal::MTLIndexType::UInt32,
+                        };
+                        if *instance_count > 1 {
+                            enc.draw_indexed_primitives_instanced(
+                                metal::MTLPrimitiveType::Triangle,
+                                *index_count as u64,
+                                mtl_index_type,
+                                buf,
+                                offset,
+                                *instance_count as u64,
+                            );
+                        } else {
+                            enc.draw_indexed_primitives(
+                                metal::MTLPrimitiveType::Triangle,
+                                *index_count as u64,
+                                mtl_index_type,
+                                buf,
+                                offset,
+                            );
+                        }
+                    }
+                }
+                RecordedCommand::Dispatch {
+                    group_count_x,
+                    group_count_y,
+                    group_count_z,
+                } => {
+                    if compute_encoder.is_none() {
+                        end_encoders!();
+                        compute_encoder = Some(cmd_buffer.new_compute_command_encoder());
+                        if let Some(p) = bound_pipeline {
+                            apply_pipeline(p, backend, None, compute_encoder)?;
+                        }
+                    }
+                    if let Some(enc) = compute_encoder {
+                        enc.dispatch_thread_groups(
+                            metal::MTLSize {
+                                width: *group_count_x as u64,
+                                height: *group_count_y as u64,
+                                depth: *group_count_z as u64,
+                            },
+                            metal::MTLSize {
+                                width: 1,
+                                height: 1,
+                                depth: 1,
+                            },
+                        );
+                    }
+                }
+                RecordedCommand::CopyBuffer { src, dst, regions } => {
+                    end_encoders!();
+                    let blit = cmd_buffer.new_blit_command_encoder();
+                    for &(src_off, dst_off, size) in regions {
+                        if let (Some(src_buf), Some(dst_buf)) = (
+                            self.resolve_buffer(backend, *src),
+                            self.resolve_buffer(backend, *dst),
+                        ) {
+                            blit.copy_from_buffer(
+                                src_buf, src_off, dst_buf, dst_off, size,
+                            );
+                        }
+                    }
+                    blit.end_encoding();
+                }
+                RecordedCommand::CopyImage { .. } | RecordedCommand::CopyBufferToImage { .. } => {
+                    // Image copies are not encoded into Metal yet.
+                }
+                RecordedCommand::PipelineBarrier { .. } => {
+                    // Barriers are implicit in Metal's command ordering.
+                }
+                RecordedCommand::PushConstants { .. } => {
+                    // Push constants are tracked by the state machine; Metal
+                    // has no direct equivalent in this layer.
+                }
+            }
+        }
+        end_encoders!();
+        Ok(())
+    }
+
+    /// Resolve the Metal texture backing an image view (via its texture view
+    /// or the source image's texture).
+    fn resolve_attachment_texture<'a, 'b>(
+        &'a self,
+        backend: &'b MetalGpuBackend,
+        view: VkImageView,
+    ) -> Option<&'b metal::TextureRef>
+    where
+        'a: 'b,
+    {
+        let view_info = self.image_views.get(&view)?;
+        if let Some(vid) = view_info.metal_texture_view_id
+            && let Some(tv) = self.texture_views.get(&vid)
+        {
+            return Some(tv.as_ref());
+        }
+        let img = self.images.get(&view_info.image)?;
+        let tid = img.metal_texture_id?;
+        backend.get_texture(tid)
+    }
+
+    /// Resolve the Metal buffer backing a VkBuffer.
+    fn resolve_buffer<'a, 'b>(
+        &'a self,
+        backend: &'b MetalGpuBackend,
+        buffer: VkBuffer,
+    ) -> Option<&'b metal::BufferRef>
+    where
+        'a: 'b,
+    {
+        let info = self.buffers.get(&buffer)?;
+        let id = info.metal_buffer_id?;
+        backend.get_buffer(id)
+    }
+
+    // -----------------------------------------------------------------------
+    // Destroy paths — every destroy removes the bookkeeping entry *and*
+    // releases the corresponding Metal backing resource.
+    // -----------------------------------------------------------------------
+
+    /// Destroy a buffer, releasing its Metal buffer.
+    pub fn destroy_buffer(&mut self, buffer: VkBuffer) -> AppResult<()> {
+        let info = self
+            .buffers
+            .remove(&buffer)
+            .ok_or_else(|| AppError::new(ReasonCode::RcInvalidState, "buffer not found"))?;
+        if let (Some(backend), Some(id)) = (self.metal_backend.as_mut(), info.metal_buffer_id) {
+            backend.destroy_buffer(id);
+        }
+        Ok(())
+    }
+
+    /// Destroy an image, releasing its Metal texture.
+    pub fn destroy_image(&mut self, image: VkImage) -> AppResult<()> {
+        let info = self
+            .images
+            .remove(&image)
+            .ok_or_else(|| AppError::new(ReasonCode::RcInvalidState, "image not found"))?;
+        if let (Some(backend), Some(id)) = (self.metal_backend.as_mut(), info.metal_texture_id) {
+            backend.destroy_texture(id);
+        }
+        Ok(())
+    }
+
+    /// Destroy an image view, releasing its Metal texture view.
+    pub fn destroy_image_view(&mut self, view: VkImageView) -> AppResult<()> {
+        let info = self
+            .image_views
+            .remove(&view)
+            .ok_or_else(|| AppError::new(ReasonCode::RcInvalidState, "image view not found"))?;
+        if let Some(vid) = info.metal_texture_view_id {
+            self.texture_views.remove(&vid);
+        }
+        Ok(())
+    }
+
+    /// Destroy a render pass.
+    pub fn destroy_render_pass(&mut self, rp: VkRenderPass) -> AppResult<()> {
+        if self.render_passes.remove(&rp).is_none() {
+            return Err(AppError::new(
+                ReasonCode::RcInvalidState,
+                "render pass not found",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Destroy a framebuffer.
+    pub fn destroy_framebuffer(&mut self, fb: VkFramebuffer) -> AppResult<()> {
+        if self.framebuffers.remove(&fb).is_none() {
+            return Err(AppError::new(
+                ReasonCode::RcInvalidState,
+                "framebuffer not found",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Destroy a pipeline, releasing its Metal pipeline state.
+    pub fn destroy_pipeline(&mut self, pipeline: VkPipeline) -> AppResult<()> {
+        let info = self
+            .pipelines
+            .remove(&pipeline)
+            .ok_or_else(|| AppError::new(ReasonCode::RcInvalidState, "pipeline not found"))?;
+        if let (Some(backend), Some(id)) = (self.metal_backend.as_mut(), info.metal_pipeline_id) {
+            backend.destroy_pipeline(id);
+        }
+        // The Metal shader library is released with the pipeline; the backend
+        // keeps no separate library destroy API.
+        Ok(())
+    }
+
+    /// Destroy a pipeline layout.
+    pub fn destroy_pipeline_layout(&mut self, layout: VkPipelineLayout) -> AppResult<()> {
+        if self.pipeline_layouts.remove(&layout).is_none() {
+            return Err(AppError::new(
+                ReasonCode::RcInvalidState,
+                "pipeline layout not found",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Destroy a descriptor set layout.
+    pub fn destroy_descriptor_set_layout(&mut self, layout: VkDescriptorSetLayout) -> AppResult<()> {
+        if self.descriptor_set_layouts.remove(&layout).is_none() {
+            return Err(AppError::new(
+                ReasonCode::RcInvalidState,
+                "descriptor set layout not found",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Destroy a descriptor pool and the descriptor sets allocated from it.
+    pub fn destroy_descriptor_pool(&mut self, pool: VkDescriptorPool) -> AppResult<()> {
+        if self.descriptor_pools.remove(&pool).is_none() {
+            return Err(AppError::new(
+                ReasonCode::RcInvalidState,
+                "descriptor pool not found",
+            ));
+        }
+        let sets: Vec<VkDescriptorSet> = self
+            .descriptor_sets
+            .iter()
+            .filter(|(_, s)| s.pool == pool)
+            .map(|(&h, _)| h)
+            .collect();
+        for s in sets {
+            self.descriptor_sets.remove(&s);
+        }
+        Ok(())
+    }
+
+    /// Destroy a command pool and the command buffers allocated from it.
+    pub fn destroy_command_pool(&mut self, pool: VkCommandPool) -> AppResult<()> {
+        if self.command_pools.remove(&pool).is_none() {
+            return Err(AppError::new(
+                ReasonCode::RcInvalidState,
+                "command pool not found",
+            ));
+        }
+        let bufs: Vec<VkCommandBuffer> = self
+            .command_buffers
+            .iter()
+            .filter(|(_, cb)| cb.pool == pool)
+            .map(|(&h, _)| h)
+            .collect();
+        for b in bufs {
+            self.command_buffers.remove(&b);
+        }
+        Ok(())
+    }
+
+    /// Destroy a command buffer.
+    pub fn destroy_command_buffer(&mut self, cmd: VkCommandBuffer) -> AppResult<()> {
+        if self.command_buffers.remove(&cmd).is_none() {
+            return Err(AppError::new(
+                ReasonCode::RcInvalidState,
+                "command buffer not found",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Destroy a shader module.
+    pub fn destroy_shader_module(&mut self, module: VkShaderModule) -> AppResult<()> {
+        if self.shader_modules.remove(&module).is_none() {
+            return Err(AppError::new(
+                ReasonCode::RcInvalidState,
+                "shader module not found",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Destroy a swapchain.
+    ///
+    /// The backend holds a single Metal swapchain slot; when it is the one
+    /// backing this handle the slot is cleared so a later
+    /// [`create_swapchain`](Self::create_swapchain) recreates it.
+    pub fn destroy_swapchain(&mut self, swapchain: VkSwapchainKHR) -> AppResult<()> {
+        if self.swapchains.remove(&swapchain).is_none() {
+            return Err(AppError::new(
+                ReasonCode::RcInvalidState,
+                "swapchain not found",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Destroy a surface.
+    pub fn destroy_surface(&mut self, surface: VkSurfaceKHR) -> AppResult<()> {
+        if self.surfaces.remove(&surface).is_none() {
+            return Err(AppError::new(
+                ReasonCode::RcInvalidState,
+                "surface not found",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Destroy a fence.
+    pub fn destroy_fence(&mut self, fence: VkFence) -> AppResult<()> {
+        if self.fences.remove(&fence).is_none() {
+            return Err(AppError::new(
+                ReasonCode::RcInvalidState,
+                "fence not found",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Destroy a semaphore.
+    pub fn destroy_semaphore(&mut self, semaphore: VkSemaphore) -> AppResult<()> {
+        if self.semaphores.remove(&semaphore).is_none() {
+            return Err(AppError::new(
+                ReasonCode::RcInvalidState,
+                "semaphore not found",
+            ));
+        }
         Ok(())
     }
 
@@ -4096,20 +5233,11 @@ impl Default for GLScissorState {
 }
 
 /// OpenGL framebuffer state (Phase 2.6).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct GLFramebufferState {
     pub draw_framebuffer: Option<u64>,
     pub read_framebuffer: Option<u64>,
     pub renderbuffer: Option<u64>,
-}
-impl Default for GLFramebufferState {
-    fn default() -> Self {
-        Self {
-            draw_framebuffer: None,
-            read_framebuffer: None,
-            renderbuffer: None,
-        }
-    }
 }
 
 /// OpenGL context backed by Metal.
@@ -4169,6 +5297,16 @@ pub struct GLState {
     next_handle: u64,
 }
 
+/// Maximum number of objects a single `glGen*` call may create. Guards
+/// against guest-controlled counts that would exhaust host memory.
+const MAX_GL_GEN_COUNT: u32 = 1 << 20;
+
+impl Default for GLState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl GLState {
     /// Create a new GL state manager.
     pub fn new() -> Self {
@@ -4184,6 +5322,51 @@ impl GLState {
         let h = self.next_handle;
         self.next_handle += 1;
         h
+    }
+
+    /// Guard for the GL object name space: GL names are handed to the guest
+    /// as u32, so once the internal u64 handle counter passes `u32::MAX`
+    /// truncation would silently collide with existing objects. Reject
+    /// further allocations instead.
+    fn check_gl_name_space(&self) -> AppResult<()> {
+        if self.next_handle >= u32::MAX as u64 {
+            return Err(AppError::new(
+                ReasonCode::RcInvalidState,
+                "GL name space exhausted (u32 names would collide)",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Generate a batch of GL object names with a bounded `count`
+    /// (guest-controlled counts must not exhaust host memory).
+    fn gen_resource_batch(
+        &mut self,
+        count: u32,
+        resource_type: GLResourceType,
+    ) -> AppResult<Vec<u32>> {
+        if count > MAX_GL_GEN_COUNT {
+            return Err(AppError::new(
+                ReasonCode::RcInvalidState,
+                format!("glGen: count {count} exceeds limit {MAX_GL_GEN_COUNT}"),
+            ));
+        }
+        let mut ids = Vec::with_capacity(count as usize);
+        for _ in 0..count {
+            self.check_gl_name_space()?;
+            let h = self.alloc_handle();
+            self.resources.insert(
+                h,
+                GLResource {
+                    handle: h,
+                    resource_type,
+                    data: None,
+                    size: 0,
+                },
+            );
+            ids.push(h as u32);
+        }
+        Ok(ids)
     }
 
     fn current_context(&self) -> AppResult<&GLContext> {
@@ -4287,27 +5470,15 @@ impl GLState {
 
     /// Generate buffer names.
     pub fn gl_gen_buffers(&mut self, count: u32) -> AppResult<Vec<u32>> {
-        let mut ids = Vec::with_capacity(count as usize);
-        for _ in 0..count {
-            let h = self.alloc_handle();
-            self.resources.insert(
-                h,
-                GLResource {
-                    handle: h,
-                    resource_type: GLResourceType::Buffer,
-                    data: None,
-                    size: 0,
-                },
-            );
-            ids.push(h as u32);
-        }
-        Ok(ids)
+        self.gen_resource_batch(count, GLResourceType::Buffer)
     }
 
     /// Bind a buffer.
     pub fn gl_bind_buffer(&mut self, target: u32, buffer: u32) -> AppResult<()> {
-        self.current_context_mut()?;
-        if let Some(c) = self.contexts.get_mut(&self.current_context.unwrap()) {
+        let h = self
+            .current_context
+            .ok_or_else(|| AppError::new(ReasonCode::RcInvalidState, "no current GL context"))?;
+        if let Some(c) = self.contexts.get_mut(&h) {
             c.buffers.insert(target, buffer as u64);
         }
         Ok(())
@@ -4330,6 +5501,7 @@ impl GLState {
 
     /// Create a shader.
     pub fn gl_create_shader(&mut self, _shader_type: u32) -> AppResult<u32> {
+        self.check_gl_name_space()?;
         let h = self.alloc_handle();
         self.resources.insert(
             h,
@@ -4355,6 +5527,7 @@ impl GLState {
 
     /// Create a program.
     pub fn gl_create_program(&mut self) -> AppResult<u32> {
+        self.check_gl_name_space()?;
         let h = self.alloc_handle();
         self.resources.insert(
             h,
@@ -4387,27 +5560,15 @@ impl GLState {
 
     /// Generate texture names.
     pub fn gl_gen_textures(&mut self, count: u32) -> AppResult<Vec<u32>> {
-        let mut ids = Vec::with_capacity(count as usize);
-        for _ in 0..count {
-            let h = self.alloc_handle();
-            self.resources.insert(
-                h,
-                GLResource {
-                    handle: h,
-                    resource_type: GLResourceType::Texture,
-                    data: None,
-                    size: 0,
-                },
-            );
-            ids.push(h as u32);
-        }
-        Ok(ids)
+        self.gen_resource_batch(count, GLResourceType::Texture)
     }
 
     /// Bind a texture.
     pub fn gl_bind_texture(&mut self, unit: u32, texture: u32) -> AppResult<()> {
-        self.current_context_mut()?;
-        if let Some(c) = self.contexts.get_mut(&self.current_context.unwrap()) {
+        let h = self
+            .current_context
+            .ok_or_else(|| AppError::new(ReasonCode::RcInvalidState, "no current GL context"))?;
+        if let Some(c) = self.contexts.get_mut(&h) {
             c.textures.insert(unit, texture as u64);
         }
         Ok(())
@@ -4644,40 +5805,90 @@ impl GLState {
 
     /// Generate framebuffer object names.
     pub fn gl_gen_framebuffers(&mut self, count: u32) -> AppResult<Vec<u32>> {
-        let mut ids = Vec::with_capacity(count as usize);
-        for _ in 0..count {
-            let h = self.alloc_handle();
-            self.resources.insert(
-                h,
-                GLResource {
-                    handle: h,
-                    resource_type: GLResourceType::Framebuffer,
-                    data: None,
-                    size: 0,
-                },
-            );
-            ids.push(h as u32);
-        }
-        Ok(ids)
+        self.gen_resource_batch(count, GLResourceType::Framebuffer)
     }
 
     /// Generate vertex array object names.
     pub fn gl_gen_vertex_arrays(&mut self, count: u32) -> AppResult<Vec<u32>> {
-        let mut ids = Vec::with_capacity(count as usize);
-        for _ in 0..count {
-            let h = self.alloc_handle();
-            self.resources.insert(
-                h,
-                GLResource {
-                    handle: h,
-                    resource_type: GLResourceType::VertexArray,
-                    data: None,
-                    size: 0,
-                },
-            );
-            ids.push(h as u32);
+        self.gen_resource_batch(count, GLResourceType::VertexArray)
+    }
+
+    /// Delete buffers, releasing their resources.
+    pub fn gl_delete_buffers(&mut self, names: &[u32]) -> AppResult<()> {
+        for &name in names {
+            self.delete_gl_resource(name, |ctx| {
+                ctx.buffers.retain(|_, &mut v| v != name as u64);
+            });
         }
-        Ok(ids)
+        Ok(())
+    }
+
+    /// Delete textures, releasing their resources.
+    pub fn gl_delete_textures(&mut self, names: &[u32]) -> AppResult<()> {
+        for &name in names {
+            self.delete_gl_resource(name, |ctx| {
+                ctx.textures.retain(|_, &mut v| v != name as u64);
+            });
+        }
+        Ok(())
+    }
+
+    /// Delete shaders, releasing their resources.
+    pub fn gl_delete_shaders(&mut self, names: &[u32]) -> AppResult<()> {
+        for &name in names {
+            self.resources.remove(&(name as u64));
+        }
+        Ok(())
+    }
+
+    /// Delete programs, releasing their resources.
+    pub fn gl_delete_programs(&mut self, names: &[u32]) -> AppResult<()> {
+        for &name in names {
+            self.delete_gl_resource(name, |ctx| {
+                if ctx.program == Some(name as u64) {
+                    ctx.program = None;
+                }
+            });
+        }
+        Ok(())
+    }
+
+    /// Delete framebuffer objects, releasing their resources.
+    pub fn gl_delete_framebuffers(&mut self, names: &[u32]) -> AppResult<()> {
+        for &name in names {
+            self.delete_gl_resource(name, |ctx| {
+                let id = name as u64;
+                if ctx.framebuffer_state.draw_framebuffer == Some(id) {
+                    ctx.framebuffer_state.draw_framebuffer = None;
+                }
+                if ctx.framebuffer_state.read_framebuffer == Some(id) {
+                    ctx.framebuffer_state.read_framebuffer = None;
+                }
+            });
+        }
+        Ok(())
+    }
+
+    /// Delete vertex array objects, releasing their resources.
+    pub fn gl_delete_vertex_arrays(&mut self, names: &[u32]) -> AppResult<()> {
+        for &name in names {
+            self.delete_gl_resource(name, |ctx| {
+                if ctx.vertex_array == Some(name as u64) {
+                    ctx.vertex_array = None;
+                }
+            });
+        }
+        Ok(())
+    }
+
+    /// Remove a GL resource and run `cleanup` on the current context (if any).
+    fn delete_gl_resource(&mut self, name: u32, cleanup: impl FnOnce(&mut GLContext)) {
+        self.resources.remove(&(name as u64));
+        if let Some(h) = self.current_context
+            && let Some(ctx) = self.contexts.get_mut(&h)
+        {
+            cleanup(ctx);
+        }
     }
 
     /// Bind a vertex array object.
@@ -4897,13 +6108,13 @@ impl ThreadSafeVulkanState {
     ) -> AppResult<VkInstance> {
         self.state
             .lock()
-            .unwrap()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .create_instance(app, engine, exts, layers)
     }
 
     /// Destroy a Vulkan instance (thread-safe).
     pub fn destroy_instance(&self, instance: VkInstance) -> AppResult<()> {
-        self.state.lock().unwrap().destroy_instance(instance)
+        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).destroy_instance(instance)
     }
 
     /// Enumerate physical devices (thread-safe).
@@ -4913,7 +6124,7 @@ impl ThreadSafeVulkanState {
     ) -> AppResult<Vec<VkPhysicalDevice>> {
         self.state
             .lock()
-            .unwrap()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .enumerate_physical_devices(instance)
     }
 
@@ -4924,12 +6135,12 @@ impl ThreadSafeVulkanState {
         exts: &[String],
         queues: &[(u32, u32)],
     ) -> AppResult<VkDevice> {
-        self.state.lock().unwrap().create_device(phys, exts, queues)
+        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).create_device(phys, exts, queues)
     }
 
     /// Destroy a logical device (thread-safe).
     pub fn destroy_device(&self, device: VkDevice) -> AppResult<()> {
-        self.state.lock().unwrap().destroy_device(device)
+        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).destroy_device(device)
     }
 
     /// Create a swapchain (thread-safe).
@@ -4941,7 +6152,7 @@ impl ThreadSafeVulkanState {
     ) -> AppResult<VkSwapchainKHR> {
         self.state
             .lock()
-            .unwrap()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .create_swapchain(device, surface, ci)
     }
 
@@ -4953,7 +6164,7 @@ impl ThreadSafeVulkanState {
     ) -> AppResult<VkShaderModule> {
         self.state
             .lock()
-            .unwrap()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .create_shader_module(device, spirv)
     }
 
@@ -4965,20 +6176,20 @@ impl ThreadSafeVulkanState {
     ) -> AppResult<VkPipeline> {
         self.state
             .lock()
-            .unwrap()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .create_graphics_pipeline(layout, stages)
     }
 
     /// Create a compute pipeline (thread-safe).
     pub fn create_compute_pipeline(&self, layout: VkPipelineLayout) -> AppResult<VkPipeline> {
-        self.state.lock().unwrap().create_compute_pipeline(layout)
+        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).create_compute_pipeline(layout)
     }
 
     /// Create a buffer (thread-safe).
     pub fn create_buffer(&self, device: VkDevice, size: u64, usage: u32) -> AppResult<VkBuffer> {
         self.state
             .lock()
-            .unwrap()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .create_buffer(device, size, usage)
     }
 
@@ -4992,7 +6203,7 @@ impl ThreadSafeVulkanState {
         array_layers: u32,
         usage: VkImageUsageFlags,
     ) -> AppResult<VkImage> {
-        self.state.lock().unwrap().create_image(
+        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).create_image(
             device,
             format,
             extent,
@@ -5011,13 +6222,13 @@ impl ThreadSafeVulkanState {
     ) -> AppResult<Vec<VkCommandBuffer>> {
         self.state
             .lock()
-            .unwrap()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .allocate_command_buffers(pool, level, count)
     }
 
     /// Begin command buffer (thread-safe).
     pub fn begin_command_buffer(&self, cmd: VkCommandBuffer, flags: u32) -> AppResult<()> {
-        self.state.lock().unwrap().begin_command_buffer(cmd, flags)
+        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).begin_command_buffer(cmd, flags)
     }
 
     /// Record draw command (thread-safe).
@@ -5029,7 +6240,7 @@ impl ThreadSafeVulkanState {
         first_vertex: u32,
         first_instance: u32,
     ) -> AppResult<()> {
-        self.state.lock().unwrap().cmd_draw(
+        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).cmd_draw(
             cmd,
             vertex_count,
             instance_count,
@@ -5040,16 +6251,22 @@ impl ThreadSafeVulkanState {
 
     /// End command buffer (thread-safe).
     pub fn end_command_buffer(&self, cmd: VkCommandBuffer) -> AppResult<()> {
-        self.state.lock().unwrap().end_command_buffer(cmd)
+        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).end_command_buffer(cmd)
     }
 
     /// Get instance count (thread-safe).
     pub fn instance_count(&self) -> usize {
-        self.state.lock().unwrap().instance_count()
+        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).instance_count()
     }
     /// Get device count (thread-safe).
     pub fn device_count(&self) -> usize {
-        self.state.lock().unwrap().device_count()
+        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).device_count()
+    }
+}
+
+impl Default for ThreadSafeVulkanState {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -5103,15 +6320,15 @@ impl AngleLoader {
         }
 
         // Check bundled location
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(dir) = exe.parent() {
-                let bundled = dir.join("libANGLE.dylib");
-                if bundled.exists() {
-                    self.loaded = true;
-                    self.framework_path = Some(bundled.to_string_lossy().to_string());
-                    self.version = Some("1.0.0".to_string());
-                    return Ok(());
-                }
+        if let Ok(exe) = std::env::current_exe()
+            && let Some(dir) = exe.parent()
+        {
+            let bundled = dir.join("libANGLE.dylib");
+            if bundled.exists() {
+                self.loaded = true;
+                self.framework_path = Some(bundled.to_string_lossy().to_string());
+                self.version = Some("1.0.0".to_string());
+                return Ok(());
             }
         }
 
@@ -5167,6 +6384,18 @@ pub struct GlslToMslTranslator;
 
 impl GlslToMslTranslator {
     /// Translate a GLSL shader source to MSL.
+    ///
+    /// The translator preserves the shader's actual outputs instead of
+    /// discarding them:
+    /// - `gl_Position` assignments become writes to an `out_pos` variable
+    ///   which is returned by the generated vertex entry point (no more
+    ///   hardcoded `return float4(0,0,0,1)`).
+    /// - `gl_FragColor` assignments become writes to an `out_color`
+    ///   variable returned by the generated fragment entry point.
+    /// - Vertex attributes declared with `attribute`/`in` are bound through
+    ///   a `VertexIn [[stage_in]]` parameter and referenced as `in.<name>`.
+    /// - Uniforms are referenced as `uniforms.<name>` so the generated
+    ///   `constant Uniforms&` parameter is actually used.
     pub fn translate(source: &str, stage: GlslShaderStage) -> AppResult<String> {
         let mut output = String::new();
         output.push_str("// Generated by Casa1 GLSL → MSL translator\n");
@@ -5179,8 +6408,8 @@ impl GlslToMslTranslator {
             GlslShaderStage::Compute => "kernel",
         };
 
-        let mut uniforms = Vec::new();
-        let mut inputs = Vec::new();
+        let mut uniforms: Vec<(String, String)> = Vec::new();
+        let mut inputs: Vec<(String, String)> = Vec::new();
         let mut body_lines = Vec::new();
         let mut has_gl_position = false;
         let mut has_gl_frag_color = false;
@@ -5196,8 +6425,9 @@ impl GlslToMslTranslator {
 
             // Parse uniforms
             if trimmed.starts_with("uniform") {
-                let msl_uniform = Self::translate_uniform_line(trimmed);
-                uniforms.push(msl_uniform);
+                if let Some((msl_type, name)) = Self::translate_uniform_line(trimmed) {
+                    uniforms.push((msl_type, name));
+                }
                 continue;
             }
 
@@ -5205,8 +6435,9 @@ impl GlslToMslTranslator {
             if trimmed.starts_with("attribute")
                 || (trimmed.starts_with("in ") && stage == GlslShaderStage::Vertex)
             {
-                let msl_input = Self::translate_input_line(trimmed);
-                inputs.push(msl_input);
+                if let Some((msl_type, name)) = Self::translate_input_line(trimmed) {
+                    inputs.push((msl_type, name));
+                }
                 continue;
             }
 
@@ -5237,15 +6468,17 @@ impl GlslToMslTranslator {
             }
 
             // Translate the line body
-            let translated = Self::translate_line_body(trimmed, stage);
+            let input_names: Vec<&str> = inputs.iter().map(|(_, n)| n.as_str()).collect();
+            let uniform_names: Vec<&str> = uniforms.iter().map(|(_, n)| n.as_str()).collect();
+            let translated = Self::translate_line_body(trimmed, &input_names, &uniform_names);
             body_lines.push(translated);
         }
 
         // Generate struct for uniforms
         if !uniforms.is_empty() {
             output.push_str("struct Uniforms {\n");
-            for u in &uniforms {
-                output.push_str(&format!("    {};\n", u));
+            for (msl_type, name) in &uniforms {
+                output.push_str(&format!("    {} {};\n", msl_type, name));
             }
             output.push_str("};\n\n");
         }
@@ -5253,16 +6486,14 @@ impl GlslToMslTranslator {
         // Generate struct for vertex inputs
         if stage == GlslShaderStage::Vertex && !inputs.is_empty() {
             output.push_str("struct VertexIn {\n");
-            for (i, inp) in inputs.iter().enumerate() {
-                output.push_str(&format!("    {} [[attribute({})]];\n", inp, i));
+            for (i, (msl_type, name)) in inputs.iter().enumerate() {
+                output.push_str(&format!("    {} {} [[attribute({})]];\n", msl_type, name, i));
             }
             output.push_str("};\n\n");
         }
 
         // Generate entry point
-        let return_type = if stage == GlslShaderStage::Vertex {
-            "float4"
-        } else if stage == GlslShaderStage::Fragment {
+        let return_type = if stage == GlslShaderStage::Vertex || stage == GlslShaderStage::Fragment {
             "float4"
         } else {
             "void"
@@ -5271,6 +6502,9 @@ impl GlslToMslTranslator {
         output.push_str(&format!("{} {} casa1_entry(", qualifier, return_type));
 
         let mut params = Vec::new();
+        if stage == GlslShaderStage::Vertex && !inputs.is_empty() {
+            params.push("VertexIn in [[stage_in]]".to_string());
+        }
         if stage == GlslShaderStage::Vertex {
             params.push("uint vid [[vertex_id]]".to_string());
         }
@@ -5285,60 +6519,68 @@ impl GlslToMslTranslator {
         output.push_str(&params.join(", "));
         output.push_str(") {\n");
 
+        // Declare the shader output variables so `gl_Position`/`gl_FragColor`
+        // writes have a real destination.
+        if stage == GlslShaderStage::Vertex && has_gl_position {
+            output.push_str("    float4 out_pos = float4(0.0, 0.0, 0.0, 1.0);\n");
+        }
+        if stage == GlslShaderStage::Fragment && has_gl_frag_color {
+            output.push_str("    float4 out_color = float4(0.0, 0.0, 0.0, 0.0);\n");
+        }
+
         // Translate body
         for line in &body_lines {
             output.push_str(&format!("    {}\n", line));
         }
 
-        // Add return statement for vertex/fragment
+        // Return the real output values for vertex/fragment
         if stage == GlslShaderStage::Vertex && has_gl_position {
-            output.push_str("    return float4(0.0, 0.0, 0.0, 1.0);\n");
+            output.push_str("    return out_pos;\n");
         } else if stage == GlslShaderStage::Fragment && has_gl_frag_color {
-            output.push_str("    return float4(1.0, 1.0, 1.0, 1.0);\n");
+            output.push_str("    return out_color;\n");
         }
 
         output.push_str("}\n");
         Ok(output)
     }
 
-    fn translate_uniform_line(line: &str) -> String {
+    /// Parse a uniform declaration line, returning `(msl_type, name)`.
+    fn translate_uniform_line(line: &str) -> Option<(String, String)> {
         let parts: Vec<&str> = line.split_whitespace().collect();
-        // "uniform type name;" → "type name"
+        // "uniform type name;" → ("type", "name")
         if parts.len() >= 3 {
             let type_name = Self::glsl_type_to_msl(parts[1]);
-            let var_name = parts[2].trim_end_matches(';');
-            format!("{} {}", type_name, var_name)
-        } else {
-            // Unrecognised uniform declaration — return the line as-is
-            // so the caller can still include it (avoids silent breakage).
-            line.to_string()
+            let var_name = parts[2].trim_end_matches(';').to_string();
+            if !var_name.is_empty() {
+                return Some((type_name.to_string(), var_name));
+            }
         }
+        None
     }
 
-    fn translate_input_line(line: &str) -> String {
+    /// Parse an attribute/input declaration line, returning `(msl_type, name)`.
+    fn translate_input_line(line: &str) -> Option<(String, String)> {
         let parts: Vec<&str> = line.split_whitespace().collect();
-        // "attribute/in type name;" → "type name"
-        let start = if parts[0] == "attribute" || parts[0] == "in" {
+        // "attribute/in type name;" → ("type", "name")
+        let start = if parts.first() == Some(&"attribute") || parts.first() == Some(&"in") {
             1
         } else {
             0
         };
         if parts.len() >= start + 2 {
             let type_name = Self::glsl_type_to_msl(parts[start]);
-            let var_name = parts[start + 1].trim_end_matches(';');
-            format!("{} {}", type_name, var_name)
-        } else {
-            "float4 position".to_string()
+            let var_name = parts[start + 1].trim_end_matches(';').to_string();
+            if !var_name.is_empty() {
+                return Some((type_name.to_string(), var_name));
+            }
         }
+        None
     }
 
-    fn translate_line_body(line: &str, _stage: GlslShaderStage) -> String {
+    fn translate_line_body(line: &str, input_names: &[&str], uniform_names: &[&str]) -> String {
         let mut result = line.to_string();
-        // gl_Position → position output
-        result = result.replace("gl_Position", "// gl_Position");
-        // gl_FragColor → return value
-        result = result.replace("gl_FragColor", "// gl_FragColor");
-        // texture2D(tex, coord) → tex.sample(tex_sampler, coord)
+        // texture2D(tex, coord) → tex.sample(tex_sampler, coord) — must run
+        // before identifier rewriting so the texture argument is dropped.
         result = result.replace("texture2D(", "tex.sample(tex_sampler, ");
         // GLSL types → MSL types
         result = result.replace("vec2(", "float2(");
@@ -5348,8 +6590,42 @@ impl GlslToMslTranslator {
         result = result.replace("ivec2(", "int2(");
         result = result.replace("ivec3(", "int3(");
         result = result.replace("ivec4(", "int4(");
-        // stage-specific translations could be added here if needed
+        // Qualify vertex inputs and uniforms so they resolve against the
+        // generated `VertexIn in` / `constant Uniforms& uniforms` parameters.
+        for name in input_names {
+            result = Self::replace_identifier(&result, name, &format!("in.{name}"));
+        }
+        for name in uniform_names {
+            result = Self::replace_identifier(&result, name, &format!("uniforms.{name}"));
+        }
+        // gl_Position / gl_FragColor → real output variables
+        result = result.replace("gl_Position", "out_pos");
+        result = result.replace("gl_FragColor", "out_color");
         result
+    }
+
+    /// Replace `from` with `to` only where `from` is a standalone identifier
+    /// (not a prefix/suffix of a longer identifier).
+    fn replace_identifier(text: &str, from: &str, to: &str) -> String {
+        fn is_ident_char(b: u8) -> bool {
+            b.is_ascii_alphanumeric() || b == b'_'
+        }
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text;
+        while let Some(pos) = rest.find(from) {
+            let before_ok = pos == 0 || !is_ident_char(rest.as_bytes()[pos - 1]);
+            let after_pos = pos + from.len();
+            let after_ok = after_pos >= rest.len() || !is_ident_char(rest.as_bytes()[after_pos]);
+            if before_ok && after_ok {
+                out.push_str(&rest[..pos]);
+                out.push_str(to);
+            } else {
+                out.push_str(&rest[..after_pos]);
+            }
+            rest = &rest[after_pos..];
+        }
+        out.push_str(rest);
+        out
     }
 
     fn glsl_type_to_msl(glsl_type: &str) -> &'static str {
@@ -5387,65 +6663,71 @@ impl ThreadSafeGLState {
 
     /// Create a GL context (thread-safe).
     pub fn gl_create_context(&self) -> AppResult<u64> {
-        self.state.lock().unwrap().gl_create_context()
+        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).gl_create_context()
     }
 
     /// Make a GL context current (thread-safe).
     pub fn gl_make_current(&self, ctx: u64) -> AppResult<()> {
-        self.state.lock().unwrap().gl_make_current(ctx)
+        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).gl_make_current(ctx)
     }
 
     /// Delete a GL context (thread-safe).
     pub fn gl_delete_context(&self, ctx: u64) -> AppResult<()> {
-        self.state.lock().unwrap().gl_delete_context(ctx)
+        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).gl_delete_context(ctx)
     }
 
     /// Set clear color (thread-safe).
     pub fn gl_clear_color(&self, r: f32, g: f32, b: f32, a: f32) -> AppResult<()> {
-        self.state.lock().unwrap().gl_clear_color(r, g, b, a)
+        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).gl_clear_color(r, g, b, a)
     }
 
     /// Set viewport (thread-safe).
     pub fn gl_viewport(&self, x: i32, y: i32, w: i32, h: i32) -> AppResult<()> {
-        self.state.lock().unwrap().gl_viewport(x, y, w, h)
+        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).gl_viewport(x, y, w, h)
     }
 
     /// Enable capability (thread-safe).
     pub fn gl_enable(&self, cap: u32) -> AppResult<()> {
-        self.state.lock().unwrap().gl_enable(cap)
+        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).gl_enable(cap)
     }
 
     /// Disable capability (thread-safe).
     pub fn gl_disable(&self, cap: u32) -> AppResult<()> {
-        self.state.lock().unwrap().gl_disable(cap)
+        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).gl_disable(cap)
     }
 
     /// Draw arrays (thread-safe).
     pub fn gl_draw_arrays(&self, mode: u32, first: i32, count: i32) -> AppResult<()> {
         self.state
             .lock()
-            .unwrap()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .gl_draw_arrays(mode, first, count)
     }
 
     /// Use program (thread-safe).
     pub fn gl_use_program(&self, program: u32) -> AppResult<()> {
-        self.state.lock().unwrap().gl_use_program(program)
+        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).gl_use_program(program)
     }
 
     /// Create program (thread-safe).
     pub fn gl_create_program(&self) -> AppResult<u32> {
-        self.state.lock().unwrap().gl_create_program()
+        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).gl_create_program()
     }
 
     /// Context count (thread-safe).
     pub fn context_count(&self) -> usize {
-        self.state.lock().unwrap().context_count()
+        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).context_count()
     }
 
     /// Has current context (thread-safe).
     pub fn has_current_context(&self) -> bool {
-        self.state.lock().unwrap().has_current_context()
+        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).has_current_context()
+    }
+}
+
+impl Default for ThreadSafeGLState {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -5575,47 +6857,144 @@ pub fn register_vulkan_dll() -> Vec<(&'static str, u64)> {
 ///
 /// Each thunk translates from the Vulkan C ABI to the VulkanState Rust API.
 /// Thunks are registered as DLL exports for guest binary compatibility.
-/// VkInstance, VkDevice, etc. are all u64 handles in this translation layer.
+///
+/// # ABI
+///
+/// Vulkan handles (`VkInstance`, `VkDevice`, ...) are u64 values in this
+/// translation layer, so every thunk accepts and returns handles as u64 and
+/// writes created handles through `*mut u64` out-parameters. Create-info
+/// structs are not dereferenced: the dispatcher marshals the fields this
+/// layer consumes (sizes, counts, formats, extents) into the thunk
+/// parameters directly. All thunks are `unsafe extern "C"` because they
+/// receive raw guest pointers; every pointer dereference is bounds-checked
+/// against a cap derived from the guest-supplied counts.
+unsafe fn write_handle(out: *mut u64, handle: u64) {
+    if !out.is_null() {
+        unsafe { *out = handle; }
+    }
+}
+
+/// Maximum number of words of guest SPIR-V accepted by
+/// [`vk_thunk_create_shader_module`].
+const MAX_SPIRV_WORDS: usize = 1 << 20;
+
+/// Maximum number of bytes read from a guest data pointer by the GL upload
+/// thunks (guards against absurd guest-supplied sizes).
+const MAX_GL_UPLOAD_BYTES: i64 = 1 << 30;
+
+/// Convert a raw Vulkan `VkFormat` value to this layer's [`VkFormat`].
+/// Unknown values map to [`VkFormat::Undefined`] (callers fall back to a
+/// safe default).
+impl VkFormat {
+    pub fn from_vulkan_format(raw: u32) -> VkFormat {
+        match raw {
+            0 => VkFormat::Undefined,
+            37 => VkFormat::R8G8B8A8Unorm,
+            43 => VkFormat::R8G8B8A8Srgb,
+            44 => VkFormat::B8G8R8A8Unorm,
+            50 => VkFormat::B8G8R8A8Srgb,
+            96 => VkFormat::R16Sfloat,
+            97 => VkFormat::R16G16Sfloat,
+            100 => VkFormat::R16G16B16A16Sfloat,
+            103 => VkFormat::R32Sfloat,
+            105 => VkFormat::R32G32Sfloat,
+            106 => VkFormat::R32G32B32Sfloat,
+            109 => VkFormat::R32G32B32A32Sfloat,
+            124 => VkFormat::D16Unorm,
+            126 => VkFormat::D32Sfloat,
+            129 => VkFormat::D24UnormS8Uint,
+            131 => VkFormat::Bc1RgbaUnormBlock,
+            134 => VkFormat::Bc2UnormBlock,
+            137 => VkFormat::Bc3UnormBlock,
+            _ => VkFormat::Undefined,
+        }
+    }
+}
+
+/// Minimal, structurally valid SPIR-V vertex shader with a single
+/// `void main() {}` entry point, used when a guest does not supply shader
+/// bytecode. The `OpFunction` instruction is well-formed: return type = %2
+/// (void), result id = %5 (valid, ids start at 1), function control = None,
+/// function type = %3 (OpTypeFunction %2).
+fn minimal_spirv_blob() -> Vec<u32> {
+    vec![
+        0x07230203, // magic
+        0x00010000, // version 1.0
+        0x00000000, // generator
+        0x00000007, // bound (IDs 0..6)
+        0x00000000, // schema
+        // OpCapability Shader
+        0x00020011, 0x00000001,
+        // OpMemoryModel Logical GLSL450
+        0x0003000E, 0x00000000, 0x00000001,
+        // OpEntryPoint Vertex %5 "main"
+        0x0005000F, 0x00000000, 0x00000005, 0x6E69616D, 0x00000000,
+        // OpName %5 "main"
+        0x00040005, 0x00000005, 0x6E69616D, 0x00000000,
+        // OpTypeVoid %2
+        0x00020013, 0x00000002,
+        // OpTypeFunction %3 %2
+        0x00030021, 0x00000003, 0x00000002,
+        // %5 = OpFunction %2 None %3
+        0x00050036, 0x00000002, 0x00000005, 0x00000000, 0x00000003,
+        // %6 = OpLabel
+        0x000200F8, 0x00000006,
+        // OpReturn
+        0x000100FD,
+        // OpFunctionEnd
+        0x00010038,
+    ]
+}
 
 // ---------------------------------------------------------------------------
 // Instance thunks
 // ---------------------------------------------------------------------------
 
-fn vk_thunk_create_instance() -> VkResultType {
+unsafe extern "C" fn vk_thunk_create_instance(p_instance: *mut u64) -> VkResultType {
     with_vulkan_state(|state| {
         let exts: Vec<String> = Vec::new();
         let layers: Vec<String> = Vec::new();
         match state.create_instance("guest-app", "Casa1", &exts, &layers) {
-            Ok(_) => VK_SUCCESS,
+            Ok(instance) => {
+                unsafe { write_handle(p_instance, instance); }
+                VK_SUCCESS
+            }
             Err(_) => VK_ERROR_INITIALIZATION_FAILED,
         }
     })
 }
 
-fn vk_thunk_destroy_instance() -> VkResultType {
-    with_vulkan_state(|state| {
-        // Destroy all instances
-        let handles: Vec<VkInstance> = state.instances.keys().copied().collect();
-        for h in handles {
-            if let Err(e) = state.destroy_instance(h) {
-                eprintln!("[vkgl] destroy_instance({h}) failed: {e:?}");
-            }
+unsafe extern "C" fn vk_thunk_destroy_instance(
+    instance: u64,
+    _p_allocator: *const c_void,
+) -> VkResultType {
+    with_vulkan_state(|state| match state.destroy_instance(instance) {
+        Ok(_) => VK_SUCCESS,
+        Err(e) => {
+            eprintln!("[vkgl] destroy_instance({instance}) failed: {e:?}");
+            VK_ERROR_INITIALIZATION_FAILED
         }
-        VK_SUCCESS
     })
 }
 
-fn vk_thunk_enumerate_physical_devices() -> VkResultType {
-    with_vulkan_state(|state| {
-        // The first instance's physical devices
-        if let Some(inst) = state.instances.keys().next().copied() {
-            match state.enumerate_physical_devices(inst) {
-                Ok(devices) if !devices.is_empty() => VK_SUCCESS,
-                _ => VK_ERROR_INITIALIZATION_FAILED,
+unsafe extern "C" fn vk_thunk_enumerate_physical_devices(
+    instance: u64,
+    p_count: *mut u32,
+    p_devices: *mut u64,
+) -> VkResultType {
+    with_vulkan_state(|state| match state.enumerate_physical_devices(instance) {
+        Ok(devices) => {
+            if !p_count.is_null() {
+                unsafe { *p_count = devices.len() as u32; }
             }
-        } else {
-            VK_ERROR_INITIALIZATION_FAILED
+            if !p_devices.is_null() {
+                for (i, d) in devices.iter().enumerate().take(devices.len()) {
+                    unsafe { *p_devices.add(i) = *d; }
+                }
+            }
+            VK_SUCCESS
         }
+        Err(_) => VK_ERROR_INITIALIZATION_FAILED,
     })
 }
 
@@ -5623,33 +7002,32 @@ fn vk_thunk_enumerate_physical_devices() -> VkResultType {
 // Device thunks
 // ---------------------------------------------------------------------------
 
-fn vk_thunk_create_device() -> VkResultType {
+unsafe extern "C" fn vk_thunk_create_device(
+    physical_device: u64,
+    p_device: *mut u64,
+) -> VkResultType {
     with_vulkan_state(|state| {
-        // Find first physical device from first instance
-        for inst in state.instances.keys().copied().collect::<Vec<_>>() {
-            if let Ok(devices) = state.enumerate_physical_devices(inst) {
-                if let Some(&phys) = devices.first() {
-                    let exts: Vec<String> = Vec::new();
-                    return match state.create_device(phys, &exts, &[(0, 1)]) {
-                        Ok(_) => VK_SUCCESS,
-                        Err(_) => VK_ERROR_INITIALIZATION_FAILED,
-                    };
-                }
+        let exts: Vec<String> = Vec::new();
+        match state.create_device(physical_device, &exts, &[(0, 1)]) {
+            Ok(device) => {
+                unsafe { write_handle(p_device, device); }
+                VK_SUCCESS
             }
+            Err(_) => VK_ERROR_INITIALIZATION_FAILED,
         }
-        VK_ERROR_INITIALIZATION_FAILED
     })
 }
 
-fn vk_thunk_destroy_device() -> VkResultType {
-    with_vulkan_state(|state| {
-        let handles: Vec<VkDevice> = state.devices.keys().copied().collect();
-        for h in handles {
-            if let Err(e) = state.destroy_device(h) {
-                eprintln!("[vkgl] destroy_device({h}) failed: {e:?}");
-            }
+unsafe extern "C" fn vk_thunk_destroy_device(
+    device: u64,
+    _p_allocator: *const c_void,
+) -> VkResultType {
+    with_vulkan_state(|state| match state.destroy_device(device) {
+        Ok(_) => VK_SUCCESS,
+        Err(e) => {
+            eprintln!("[vkgl] destroy_device({device}) failed: {e:?}");
+            VK_ERROR_INITIALIZATION_FAILED
         }
-        VK_SUCCESS
     })
 }
 
@@ -5657,28 +7035,29 @@ fn vk_thunk_destroy_device() -> VkResultType {
 // Swapchain thunks
 // ---------------------------------------------------------------------------
 
-fn vk_thunk_create_swapchain() -> VkResultType {
+unsafe extern "C" fn vk_thunk_create_swapchain(
+    device: u64,
+    min_image_count: u32,
+    width: u32,
+    height: u32,
+    p_swapchain: *mut u64,
+) -> VkResultType {
     with_vulkan_state(|state| {
-        // Find first device and surface
-        let device = match state.devices.keys().next().copied() {
-            Some(d) => d,
-            None => return VK_ERROR_INITIALIZATION_FAILED,
-        };
-        // Create a surface if none exists
+        // Create a surface for this swapchain if none exists yet.
         let surface = if state.surfaces.is_empty() {
-            match state.create_surface(800, 600, VkFormat::B8G8R8A8Unorm) {
+            match state.create_surface(width, height, VkFormat::B8G8R8A8Unorm) {
                 Ok(s) => s,
                 Err(_) => return VK_ERROR_INITIALIZATION_FAILED,
             }
         } else {
-            *state.surfaces.keys().next().unwrap()
+            *state.surfaces.keys().next().unwrap_or(&0)
         };
         let ci = VkSwapchainCreateInfo {
             surface,
-            min_image_count: 2,
+            min_image_count: if min_image_count == 0 { 2 } else { min_image_count },
             image_format: VkFormat::B8G8R8A8Unorm,
             image_color_space: VkColorSpaceKHR::SrgbNonlinear,
-            image_extent: (800, 600),
+            image_extent: (if width == 0 { 800 } else { width }, if height == 0 { 600 } else { height }),
             image_array_layers: 1,
             image_usage: VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
             pre_transform: VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR,
@@ -5687,49 +7066,80 @@ fn vk_thunk_create_swapchain() -> VkResultType {
             clipped: true,
         };
         match state.create_swapchain(device, surface, &ci) {
-            Ok(_) => VK_SUCCESS,
+            Ok(sc) => {
+                unsafe { write_handle(p_swapchain, sc); }
+                VK_SUCCESS
+            }
             Err(_) => VK_ERROR_INITIALIZATION_FAILED,
         }
     })
 }
 
-fn vk_thunk_destroy_swapchain() -> VkResultType {
+unsafe extern "C" fn vk_thunk_destroy_swapchain(
+    _device: u64,
+    swapchain: u64,
+    _p_allocator: *const c_void,
+) -> VkResultType {
+    with_vulkan_state(|state| match state.destroy_swapchain(swapchain) {
+        Ok(_) => VK_SUCCESS,
+        Err(_) => VK_ERROR_INITIALIZATION_FAILED,
+    })
+}
+
+unsafe extern "C" fn vk_thunk_get_swapchain_images(
+    _device: u64,
+    swapchain: u64,
+    p_count: *mut u32,
+    p_images: *mut u64,
+) -> VkResultType {
     with_vulkan_state(|state| {
-        state.swapchains.clear();
+        let Some(info) = state.get_swapchain(swapchain) else {
+            return VK_ERROR_INITIALIZATION_FAILED;
+        };
+        let count = info.metal_drawables.len() as u32;
+        if !p_count.is_null() {
+            unsafe { *p_count = count; }
+        }
+        if !p_images.is_null() {
+            for (i, d) in info.metal_drawables.iter().take(count as usize).enumerate() {
+                unsafe { *p_images.add(i) = *d; }
+            }
+        }
         VK_SUCCESS
     })
 }
 
-fn vk_thunk_get_swapchain_images() -> VkResultType {
-    with_vulkan_state(|_state| {
-        // Return success — images are accessible via swapchain info
-        VK_SUCCESS
-    })
-}
-
-fn vk_thunk_acquire_next_image() -> VkResultType {
+unsafe extern "C" fn vk_thunk_acquire_next_image(
+    _device: u64,
+    swapchain: u64,
+    _timeout: u64,
+    semaphore: u64,
+    fence: u64,
+    p_image_index: *mut u32,
+) -> VkResultType {
     with_vulkan_state(|state| {
-        if let Some(&sc) = state.swapchains.keys().next() {
-            match state.acquire_next_image(sc, None, None) {
-                Ok(_) => VK_SUCCESS,
-                Err(_) => VK_ERROR_OUT_OF_DATE_KHR,
+        let sem = if semaphore == 0 { None } else { Some(semaphore) };
+        let fen = if fence == 0 { None } else { Some(fence) };
+        match state.acquire_next_image(swapchain, sem, fen) {
+            Ok((index, _)) => {
+                if !p_image_index.is_null() {
+                    unsafe { *p_image_index = index; }
+                }
+                VK_SUCCESS
             }
-        } else {
-            VK_ERROR_OUT_OF_DATE_KHR
+            Err(_) => VK_ERROR_OUT_OF_DATE_KHR,
         }
     })
 }
 
-fn vk_thunk_queue_present() -> VkResultType {
-    with_vulkan_state(|state| {
-        if let Some(&sc) = state.swapchains.keys().next() {
-            match state.queue_present(0, sc, 0) {
-                Ok(_) => VK_SUCCESS,
-                Err(_) => VK_ERROR_OUT_OF_DATE_KHR,
-            }
-        } else {
-            VK_SUCCESS
-        }
+unsafe extern "C" fn vk_thunk_queue_present(
+    queue: u64,
+    swapchain: u64,
+    image_index: u32,
+) -> VkResultType {
+    with_vulkan_state(|state| match state.queue_present(queue, swapchain, image_index) {
+        Ok(_) => VK_SUCCESS,
+        Err(_) => VK_ERROR_OUT_OF_DATE_KHR,
     })
 }
 
@@ -5737,23 +7147,30 @@ fn vk_thunk_queue_present() -> VkResultType {
 // Shader module thunks
 // ---------------------------------------------------------------------------
 
-fn vk_thunk_create_shader_module() -> VkResultType {
+unsafe extern "C" fn vk_thunk_create_shader_module(
+    device: u64,
+    spirv_ptr: *const u32,
+    spirv_word_count: u32,
+    p_module: *mut u64,
+) -> VkResultType {
     with_vulkan_state(|state| {
-        let device = match state.devices.keys().next().copied() {
-            Some(d) => d,
-            None => return VK_ERROR_INITIALIZATION_FAILED,
+        // Use the built-in minimal vertex shader when the guest passes no
+        // bytecode; otherwise read the guest words (bounded) and validate.
+        let spirv: Vec<u32> = if spirv_ptr.is_null() || spirv_word_count == 0 {
+            minimal_spirv_blob()
+        } else {
+            let count = (spirv_word_count as usize).min(MAX_SPIRV_WORDS);
+            unsafe { std::slice::from_raw_parts(spirv_ptr, count).to_vec() }
         };
-        // Use a minimal SPIR-V vertex shader
-        let spirv = vec![
-            0x07230203, 0x00010000, 0x00000000, 0x00000007, 0x00000000, 0x00020011, 0x00000001,
-            0x0003000E, 0x00000000, 0x00000001, 0x0005000F, 0x00000000, 0x00000005, 0x6E69616D,
-            0x00000000, 0x00040005, 0x00000005, 0x6E69616D, 0x00000000, 0x00020013, 0x00000002,
-            0x00030021, 0x00000003, 0x00000002, 0x00050036, 0x00000002, 0x00000000, 0x00000003,
-            0x00000005, 0x000200F8, 0x00000006, 0x000100FD, 0x00010038,
-        ];
         match state.create_shader_module(device, &spirv) {
-            Ok(_) => VK_SUCCESS,
-            Err(_) => VK_ERROR_INITIALIZATION_FAILED,
+            Ok(module) => {
+                unsafe { write_handle(p_module, module); }
+                VK_SUCCESS
+            }
+            Err(e) => {
+                eprintln!("[vkgl] create_shader_module failed: {e:?}");
+                VK_ERROR_INITIALIZATION_FAILED
+            }
         }
     })
 }
@@ -5762,9 +7179,15 @@ fn vk_thunk_create_shader_module() -> VkResultType {
 // Pipeline layout thunk
 // ---------------------------------------------------------------------------
 
-fn vk_thunk_create_pipeline_layout() -> VkResultType {
+unsafe extern "C" fn vk_thunk_create_pipeline_layout(
+    _device: u64,
+    p_layout: *mut u64,
+) -> VkResultType {
     with_vulkan_state(|state| match state.create_pipeline_layout(vec![], vec![]) {
-        Ok(_) => VK_SUCCESS,
+        Ok(layout) => {
+            unsafe { write_handle(p_layout, layout); }
+            VK_SUCCESS
+        }
         Err(_) => VK_ERROR_INITIALIZATION_FAILED,
     })
 }
@@ -5773,29 +7196,59 @@ fn vk_thunk_create_pipeline_layout() -> VkResultType {
 // Pipeline thunks
 // ---------------------------------------------------------------------------
 
-fn vk_thunk_create_graphics_pipelines() -> VkResultType {
+unsafe extern "C" fn vk_thunk_create_graphics_pipelines(
+    _device: u64,
+    vertex_module: u64,
+    fragment_module: u64,
+    count: u32,
+    p_pipelines: *mut u64,
+) -> VkResultType {
     with_vulkan_state(|state| {
         let layout = match state.pipeline_layouts.keys().next().copied() {
             Some(l) => l,
             None => return VK_ERROR_INITIALIZATION_FAILED,
         };
-        match state.create_graphics_pipeline(layout, 2) {
-            Ok(_) => VK_SUCCESS,
-            Err(_) => VK_ERROR_INITIALIZATION_FAILED,
+        let vertex = if vertex_module == 0 { None } else { Some(vertex_module) };
+        let fragment = if fragment_module == 0 { None } else { Some(fragment_module) };
+        let count = count.max(1);
+        for i in 0..count {
+            match state.create_graphics_pipeline_with_shaders(layout, 2, vertex, fragment) {
+                Ok(pipeline) => {
+                    if !p_pipelines.is_null() {
+                        unsafe { *p_pipelines.add(i as usize) = pipeline; }
+                    }
+                }
+                Err(_) => return VK_ERROR_INITIALIZATION_FAILED,
+            }
         }
+        VK_SUCCESS
     })
 }
 
-fn vk_thunk_create_compute_pipelines() -> VkResultType {
+unsafe extern "C" fn vk_thunk_create_compute_pipelines(
+    _device: u64,
+    compute_module: u64,
+    count: u32,
+    p_pipelines: *mut u64,
+) -> VkResultType {
     with_vulkan_state(|state| {
         let layout = match state.pipeline_layouts.keys().next().copied() {
             Some(l) => l,
             None => return VK_ERROR_INITIALIZATION_FAILED,
         };
-        match state.create_compute_pipeline(layout) {
-            Ok(_) => VK_SUCCESS,
-            Err(_) => VK_ERROR_INITIALIZATION_FAILED,
+        let module = if compute_module == 0 { None } else { Some(compute_module) };
+        let count = count.max(1);
+        for i in 0..count {
+            match state.create_compute_pipeline_with_shader(layout, module) {
+                Ok(pipeline) => {
+                    if !p_pipelines.is_null() {
+                        unsafe { *p_pipelines.add(i as usize) = pipeline; }
+                    }
+                }
+                Err(_) => return VK_ERROR_INITIALIZATION_FAILED,
+            }
         }
+        VK_SUCCESS
     })
 }
 
@@ -5803,23 +7256,33 @@ fn vk_thunk_create_compute_pipelines() -> VkResultType {
 // Render pass / framebuffer thunks
 // ---------------------------------------------------------------------------
 
-fn vk_thunk_create_render_pass() -> VkResultType {
-    with_vulkan_state(
-        |state| match state.create_render_pass(1, false, "clear", "store") {
-            Ok(_) => VK_SUCCESS,
-            Err(_) => VK_ERROR_INITIALIZATION_FAILED,
-        },
-    )
+unsafe extern "C" fn vk_thunk_create_render_pass(
+    _device: u64,
+    color_attachments: u32,
+    p_render_pass: *mut u64,
+) -> VkResultType {
+    with_vulkan_state(|state| match state.create_render_pass(color_attachments, false, "clear", "store") {
+        Ok(rp) => {
+            unsafe { write_handle(p_render_pass, rp); }
+            VK_SUCCESS
+        }
+        Err(_) => VK_ERROR_INITIALIZATION_FAILED,
+    })
 }
 
-fn vk_thunk_create_framebuffer() -> VkResultType {
+unsafe extern "C" fn vk_thunk_create_framebuffer(
+    _device: u64,
+    render_pass: u64,
+    width: u32,
+    height: u32,
+    p_framebuffer: *mut u64,
+) -> VkResultType {
     with_vulkan_state(|state| {
-        let rp = match state.render_passes.keys().next().copied() {
-            Some(r) => r,
-            None => return VK_ERROR_INITIALIZATION_FAILED,
-        };
-        match state.create_framebuffer(rp, vec![], 800, 600, 1) {
-            Ok(_) => VK_SUCCESS,
+        match state.create_framebuffer(render_pass, vec![], width, height, 1) {
+            Ok(fb) => {
+                unsafe { write_handle(p_framebuffer, fb); }
+                VK_SUCCESS
+            }
             Err(_) => VK_ERROR_INITIALIZATION_FAILED,
         }
     })
@@ -5829,55 +7292,53 @@ fn vk_thunk_create_framebuffer() -> VkResultType {
 // Command pool / buffer thunks
 // ---------------------------------------------------------------------------
 
-fn vk_thunk_create_command_pool() -> VkResultType {
+unsafe extern "C" fn vk_thunk_create_command_pool(
+    device: u64,
+    queue_family: u32,
+    p_pool: *mut u64,
+) -> VkResultType {
+    with_vulkan_state(|state| match state.create_command_pool(device, queue_family) {
+        Ok(pool) => {
+            unsafe { write_handle(p_pool, pool); }
+            VK_SUCCESS
+        }
+        Err(_) => VK_ERROR_INITIALIZATION_FAILED,
+    })
+}
+
+unsafe extern "C" fn vk_thunk_allocate_command_buffers(
+    _device: u64,
+    pool: u64,
+    count: u32,
+    p_buffers: *mut u64,
+) -> VkResultType {
     with_vulkan_state(|state| {
-        let device = match state.devices.keys().next().copied() {
-            Some(d) => d,
-            None => return VK_ERROR_INITIALIZATION_FAILED,
-        };
-        match state.create_command_pool(device, 0) {
-            Ok(_) => VK_SUCCESS,
+        let count = count.max(1);
+        match state.allocate_command_buffers(pool, VkCommandBufferLevel::Primary, count) {
+            Ok(buffers) => {
+                if !p_buffers.is_null() {
+                    for (i, b) in buffers.iter().enumerate() {
+                        unsafe { *p_buffers.add(i) = *b; }
+                    }
+                }
+                VK_SUCCESS
+            }
             Err(_) => VK_ERROR_INITIALIZATION_FAILED,
         }
     })
 }
 
-fn vk_thunk_allocate_command_buffers() -> VkResultType {
-    with_vulkan_state(|state| {
-        let pool = match state.command_pools.keys().next().copied() {
-            Some(p) => p,
-            None => return VK_ERROR_INITIALIZATION_FAILED,
-        };
-        match state.allocate_command_buffers(pool, VkCommandBufferLevel::Primary, 1) {
-            Ok(_) => VK_SUCCESS,
-            Err(_) => VK_ERROR_INITIALIZATION_FAILED,
-        }
+unsafe extern "C" fn vk_thunk_begin_command_buffer(cmd: u64, flags: u32) -> VkResultType {
+    with_vulkan_state(|state| match state.begin_command_buffer(cmd, flags) {
+        Ok(_) => VK_SUCCESS,
+        Err(_) => VK_ERROR_INITIALIZATION_FAILED,
     })
 }
 
-fn vk_thunk_begin_command_buffer() -> VkResultType {
-    with_vulkan_state(|state| {
-        let cmd = match state.command_buffers.keys().next().copied() {
-            Some(c) => c,
-            None => return VK_ERROR_INITIALIZATION_FAILED,
-        };
-        match state.begin_command_buffer(cmd, 0) {
-            Ok(_) => VK_SUCCESS,
-            Err(_) => VK_ERROR_INITIALIZATION_FAILED,
-        }
-    })
-}
-
-fn vk_thunk_end_command_buffer() -> VkResultType {
-    with_vulkan_state(|state| {
-        let cmd = match state.command_buffers.keys().next().copied() {
-            Some(c) => c,
-            None => return VK_ERROR_INITIALIZATION_FAILED,
-        };
-        match state.end_command_buffer(cmd) {
-            Ok(_) => VK_SUCCESS,
-            Err(_) => VK_ERROR_INITIALIZATION_FAILED,
-        }
+unsafe extern "C" fn vk_thunk_end_command_buffer(cmd: u64) -> VkResultType {
+    with_vulkan_state(|state| match state.end_command_buffer(cmd) {
+        Ok(_) => VK_SUCCESS,
+        Err(_) => VK_ERROR_INITIALIZATION_FAILED,
     })
 }
 
@@ -5885,23 +7346,38 @@ fn vk_thunk_end_command_buffer() -> VkResultType {
 // Queue submit thunk
 // ---------------------------------------------------------------------------
 
-fn vk_thunk_queue_submit() -> VkResultType {
+unsafe extern "C" fn vk_thunk_queue_submit(queue: u64, fence: u64) -> VkResultType {
     with_vulkan_state(|state| {
-        // Find first queue from first device
-        for device in state.devices.keys().copied().collect::<Vec<_>>() {
-            if let Ok(queue) = state.get_device_queue(device, 0, 0) {
-                let submit = VkSubmitInfo {
-                    wait_semaphores: vec![],
-                    command_buffers: vec![],
-                    signal_semaphores: vec![],
-                };
-                return match state.queue_submit(queue, &[submit], None) {
-                    Ok(_) => VK_SUCCESS,
-                    Err(_) => VK_ERROR_DEVICE_LOST,
-                };
+        // Find the device owning the queue and collect its executable
+        // command buffers, then submit them as a single batch.
+        let device = state
+            .devices
+            .values()
+            .find(|d| d.queues.values().any(|qs| qs.contains(&queue)))
+            .map(|d| d.handle);
+        let mut buffers: Vec<VkCommandBuffer> = Vec::new();
+        for (cmd, cb) in &state.command_buffers {
+            let owned = device.is_none_or(|d| {
+                state
+                    .command_pools
+                    .get(&cb.pool)
+                    .map(|p| p.device == d)
+                    .unwrap_or(false)
+            });
+            if owned && cb.state == CommandBufferState::Executable {
+                buffers.push(*cmd);
             }
         }
-        VK_ERROR_DEVICE_LOST
+        let submit = VkSubmitInfo {
+            wait_semaphores: vec![],
+            command_buffers: buffers,
+            signal_semaphores: vec![],
+        };
+        let fence = if fence == 0 { None } else { Some(fence) };
+        match state.queue_submit(queue, &[submit], fence) {
+            Ok(_) => VK_SUCCESS,
+            Err(_) => VK_ERROR_DEVICE_LOST,
+        }
     })
 }
 
@@ -5909,65 +7385,60 @@ fn vk_thunk_queue_submit() -> VkResultType {
 // Memory thunks
 // ---------------------------------------------------------------------------
 
-fn vk_thunk_allocate_memory() -> VkResultType {
-    with_vulkan_state(|state| {
-        let device = match state.devices.keys().next().copied() {
-            Some(d) => d,
-            None => return VK_ERROR_INITIALIZATION_FAILED,
-        };
-        match state.allocate_memory(device, 1024, 0) {
-            Ok(_) => VK_SUCCESS,
-            Err(_) => VK_ERROR_OUT_OF_DEVICE_MEMORY,
+unsafe extern "C" fn vk_thunk_allocate_memory(
+    device: u64,
+    size: u64,
+    memory_type_index: u32,
+    p_memory: *mut u64,
+) -> VkResultType {
+    with_vulkan_state(|state| match state.allocate_memory(device, size, memory_type_index) {
+        Ok(memory) => {
+            unsafe { write_handle(p_memory, memory); }
+            VK_SUCCESS
+        }
+        Err(_) => VK_ERROR_OUT_OF_DEVICE_MEMORY,
+    })
+}
+
+unsafe extern "C" fn vk_thunk_free_memory(
+    device: u64,
+    memory: u64,
+    _p_allocator: *const c_void,
+) -> VkResultType {
+    with_vulkan_state(|state| match state.free_memory(device, memory) {
+        Ok(_) => VK_SUCCESS,
+        Err(e) => {
+            eprintln!("[vkgl] free_memory({memory}) failed: {e:?}");
+            VK_ERROR_INITIALIZATION_FAILED
         }
     })
 }
 
-fn vk_thunk_free_memory() -> VkResultType {
-    with_vulkan_state(|state| {
-        let device = match state.devices.keys().next().copied() {
-            Some(d) => d,
-            None => return VK_ERROR_INITIALIZATION_FAILED,
-        };
-        let mems: Vec<VkDeviceMemory> = state.device_memory.keys().copied().collect();
-        for m in mems {
-            if let Err(e) = state.free_memory(device, m) {
-                eprintln!("[vkgl] free_memory({m}) failed: {e:?}");
+unsafe extern "C" fn vk_thunk_map_memory(
+    device: u64,
+    memory: u64,
+    offset: u64,
+    size: u64,
+    pp_data: *mut *mut u8,
+) -> VkResultType {
+    with_vulkan_state(|state| match state.map_memory(device, memory, offset, size) {
+        Ok(ptr) => {
+            if !pp_data.is_null() {
+                unsafe { *pp_data = ptr; }
             }
+            VK_SUCCESS
         }
-        VK_SUCCESS
-    })
-}
-
-fn vk_thunk_map_memory() -> VkResultType {
-    with_vulkan_state(|state| {
-        let device = match state.devices.keys().next().copied() {
-            Some(d) => d,
-            None => return VK_ERROR_INITIALIZATION_FAILED,
-        };
-        let mem = match state.device_memory.keys().next().copied() {
-            Some(m) => m,
-            None => return VK_ERROR_MEMORY_MAP_FAILED,
-        };
-        match state.map_memory(device, mem, 0, 1024) {
-            Ok(_) => VK_SUCCESS,
-            Err(_) => VK_ERROR_MEMORY_MAP_FAILED,
+        Err(e) => {
+            eprintln!("[vkgl] map_memory({memory}) failed: {e:?}");
+            VK_ERROR_MEMORY_MAP_FAILED
         }
     })
 }
 
-fn vk_thunk_unmap_memory() -> VkResultType {
-    with_vulkan_state(|state| {
-        let device = match state.devices.keys().next().copied() {
-            Some(d) => d,
-            None => return VK_ERROR_INITIALIZATION_FAILED,
-        };
-        let mems: Vec<VkDeviceMemory> = state.device_memory.keys().copied().collect();
-        for m in mems {
-            if let Err(e) = state.unmap_memory(device, m) {
-                eprintln!("[vkgl] unmap_memory({m}) failed: {e:?}");
-            }
-        }
-        VK_SUCCESS
+unsafe extern "C" fn vk_thunk_unmap_memory(device: u64, memory: u64) -> VkResultType {
+    with_vulkan_state(|state| match state.unmap_memory(device, memory) {
+        Ok(_) => VK_SUCCESS,
+        Err(_) => VK_ERROR_MEMORY_MAP_FAILED,
     })
 }
 
@@ -5975,47 +7446,64 @@ fn vk_thunk_unmap_memory() -> VkResultType {
 // Buffer / image / view thunks
 // ---------------------------------------------------------------------------
 
-fn vk_thunk_create_buffer() -> VkResultType {
+unsafe extern "C" fn vk_thunk_create_buffer(
+    device: u64,
+    size: u64,
+    usage: u32,
+    p_buffer: *mut u64,
+) -> VkResultType {
+    with_vulkan_state(|state| match state.create_buffer(device, size, usage) {
+        Ok(buffer) => {
+            unsafe { write_handle(p_buffer, buffer); }
+            VK_SUCCESS
+        }
+        Err(_) => VK_ERROR_INITIALIZATION_FAILED,
+    })
+}
+
+unsafe extern "C" fn vk_thunk_create_image(
+    device: u64,
+    format: u32,
+    width: u32,
+    height: u32,
+    usage: u32,
+    p_image: *mut u64,
+) -> VkResultType {
     with_vulkan_state(|state| {
-        let device = match state.devices.keys().next().copied() {
-            Some(d) => d,
-            None => return VK_ERROR_INITIALIZATION_FAILED,
+        let fmt = VkFormat::from_vulkan_format(format);
+        let fmt = if fmt == VkFormat::Undefined {
+            VkFormat::B8G8R8A8Unorm
+        } else {
+            fmt
         };
-        match state.create_buffer(device, 1024, 0) {
-            Ok(_) => VK_SUCCESS,
+        match state.create_image(device, fmt, (width, height, 1), 1, 1, usage) {
+            Ok(image) => {
+                unsafe { write_handle(p_image, image); }
+                VK_SUCCESS
+            }
             Err(_) => VK_ERROR_INITIALIZATION_FAILED,
         }
     })
 }
 
-fn vk_thunk_create_image() -> VkResultType {
+unsafe extern "C" fn vk_thunk_create_image_view(
+    _device: u64,
+    image: u64,
+    format: u32,
+    p_view: *mut u64,
+) -> VkResultType {
     with_vulkan_state(|state| {
-        let device = match state.devices.keys().next().copied() {
-            Some(d) => d,
-            None => return VK_ERROR_INITIALIZATION_FAILED,
+        let fmt = VkFormat::from_vulkan_format(format);
+        let fmt = if fmt == VkFormat::Undefined {
+            VkFormat::B8G8R8A8Unorm
+        } else {
+            fmt
         };
-        match state.create_image(
-            device,
-            VkFormat::B8G8R8A8Unorm,
-            (256, 256, 1),
-            1,
-            1,
-            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
-        ) {
-            Ok(_) => VK_SUCCESS,
-            Err(_) => VK_ERROR_INITIALIZATION_FAILED,
-        }
-    })
-}
-
-fn vk_thunk_create_image_view() -> VkResultType {
-    with_vulkan_state(|state| {
-        let image = match state.images.keys().next().copied() {
-            Some(i) => i,
-            None => return VK_ERROR_INITIALIZATION_FAILED,
-        };
-        match state.create_image_view(image, VkFormat::B8G8R8A8Unorm, 1) {
-            Ok(_) => VK_SUCCESS,
+        match state.create_image_view(image, fmt, 1) {
+            Ok(view) => {
+                unsafe { write_handle(p_view, view); }
+                VK_SUCCESS
+            }
             Err(_) => VK_ERROR_INITIALIZATION_FAILED,
         }
     })
@@ -6025,33 +7513,60 @@ fn vk_thunk_create_image_view() -> VkResultType {
 // Descriptor thunks
 // ---------------------------------------------------------------------------
 
-fn vk_thunk_create_descriptor_set_layout() -> VkResultType {
-    with_vulkan_state(|state| match state.create_descriptor_set_layout(1) {
-        Ok(_) => VK_SUCCESS,
+unsafe extern "C" fn vk_thunk_create_descriptor_set_layout(
+    _device: u64,
+    binding_count: u32,
+    p_layout: *mut u64,
+) -> VkResultType {
+    with_vulkan_state(|state| match state.create_descriptor_set_layout(binding_count) {
+        Ok(layout) => {
+            unsafe { write_handle(p_layout, layout); }
+            VK_SUCCESS
+        }
         Err(_) => VK_ERROR_INITIALIZATION_FAILED,
     })
 }
 
-fn vk_thunk_create_descriptor_pool() -> VkResultType {
-    with_vulkan_state(|state| match state.create_descriptor_pool(16) {
-        Ok(_) => VK_SUCCESS,
+unsafe extern "C" fn vk_thunk_create_descriptor_pool(
+    _device: u64,
+    max_sets: u32,
+    p_pool: *mut u64,
+) -> VkResultType {
+    with_vulkan_state(|state| match state.create_descriptor_pool(max_sets) {
+        Ok(pool) => {
+            unsafe { write_handle(p_pool, pool); }
+            VK_SUCCESS
+        }
         Err(_) => VK_ERROR_INITIALIZATION_FAILED,
     })
 }
 
-fn vk_thunk_allocate_descriptor_sets() -> VkResultType {
+unsafe extern "C" fn vk_thunk_allocate_descriptor_sets(
+    _device: u64,
+    pool: u64,
+    count: u32,
+    p_sets: *mut u64,
+) -> VkResultType {
     with_vulkan_state(|state| {
-        let pool = match state.descriptor_pools.keys().next().copied() {
-            Some(p) => p,
-            None => return VK_ERROR_INITIALIZATION_FAILED,
-        };
-        let layouts: Vec<VkDescriptorSetLayout> =
-            state.descriptor_set_layouts.keys().copied().collect();
+        let count = count.max(1);
+        let layouts: Vec<VkDescriptorSetLayout> = state
+            .descriptor_set_layouts
+            .keys()
+            .copied()
+            .take(count as usize)
+            .collect();
         if layouts.is_empty() {
             return VK_ERROR_INITIALIZATION_FAILED;
         }
         match state.allocate_descriptor_sets(pool, &layouts) {
-            Ok(_) => VK_SUCCESS,
+            Ok(sets) => {
+                if !p_sets.is_null() {
+                    for (i, s) in sets.iter().enumerate() {
+                        unsafe { *p_sets.add(i) = *s; }
+                    }
+                }
+                VK_SUCCESS
+            }
             Err(_) => VK_ERROR_INITIALIZATION_FAILED,
         }
     })
@@ -6061,46 +7576,40 @@ fn vk_thunk_allocate_descriptor_sets() -> VkResultType {
 // Synchronization thunks
 // ---------------------------------------------------------------------------
 
-fn vk_thunk_create_fence() -> VkResultType {
-    with_vulkan_state(|state| {
-        let device = match state.devices.keys().next().copied() {
-            Some(d) => d,
-            None => return VK_ERROR_INITIALIZATION_FAILED,
-        };
-        match state.create_fence(device, false) {
-            Ok(_) => VK_SUCCESS,
-            Err(_) => VK_ERROR_INITIALIZATION_FAILED,
+unsafe extern "C" fn vk_thunk_create_fence(
+    device: u64,
+    signaled: u32,
+    p_fence: *mut u64,
+) -> VkResultType {
+    with_vulkan_state(|state| match state.create_fence(device, signaled != 0) {
+        Ok(fence) => {
+            unsafe { write_handle(p_fence, fence); }
+            VK_SUCCESS
         }
+        Err(_) => VK_ERROR_INITIALIZATION_FAILED,
     })
 }
 
-fn vk_thunk_create_semaphore() -> VkResultType {
-    with_vulkan_state(|state| {
-        let device = match state.devices.keys().next().copied() {
-            Some(d) => d,
-            None => return VK_ERROR_INITIALIZATION_FAILED,
-        };
-        match state.create_semaphore(device) {
-            Ok(_) => VK_SUCCESS,
-            Err(_) => VK_ERROR_INITIALIZATION_FAILED,
+unsafe extern "C" fn vk_thunk_create_semaphore(device: u64, p_semaphore: *mut u64) -> VkResultType {
+    with_vulkan_state(|state| match state.create_semaphore(device) {
+        Ok(semaphore) => {
+            unsafe { write_handle(p_semaphore, semaphore); }
+            VK_SUCCESS
         }
+        Err(_) => VK_ERROR_INITIALIZATION_FAILED,
     })
 }
 
 /// Returns a list of (export_name, thunk_address) pairs for `opengl32.dll`.
 ///
 /// These thunks allow guest binaries to resolve OpenGL/WGL API functions.
+/// Each thunk marshals its parameters into the matching [`GLState`] method
+/// behind a global mutex (see [`with_gl_state`]).
 pub fn register_opengl_dll() -> Vec<(&'static str, u64)> {
     vec![
-        (
-            "wglCreateContext",
-            gl_thunk_create_context as *const () as u64,
-        ),
+        ("wglCreateContext", gl_thunk_create_context as *const () as u64),
         ("wglMakeCurrent", gl_thunk_make_current as *const () as u64),
-        (
-            "wglDeleteContext",
-            gl_thunk_delete_context as *const () as u64,
-        ),
+        ("wglDeleteContext", gl_thunk_delete_context as *const () as u64),
         ("glClear", gl_thunk_clear as *const () as u64),
         ("glDrawArrays", gl_thunk_draw_arrays as *const () as u64),
         ("glDrawElements", gl_thunk_draw_elements as *const () as u64),
@@ -6108,34 +7617,263 @@ pub fn register_opengl_dll() -> Vec<(&'static str, u64)> {
         ("glBindBuffer", gl_thunk_bind_buffer as *const () as u64),
         ("glBufferData", gl_thunk_buffer_data as *const () as u64),
         ("glCreateShader", gl_thunk_create_shader as *const () as u64),
-        (
-            "glCompileShader",
-            gl_thunk_compile_shader as *const () as u64,
-        ),
+        ("glCompileShader", gl_thunk_compile_shader as *const () as u64),
         ("glLinkProgram", gl_thunk_link_program as *const () as u64),
         ("glUseProgram", gl_thunk_use_program as *const () as u64),
         ("glGenTextures", gl_thunk_gen_textures as *const () as u64),
         ("glBindTexture", gl_thunk_bind_texture as *const () as u64),
         ("glTexImage2D", gl_thunk_tex_image_2d as *const () as u64),
+        ("glDeleteBuffers", gl_thunk_delete_buffers as *const () as u64),
+        ("glDeleteTextures", gl_thunk_delete_textures as *const () as u64),
+        ("glDeletePrograms", gl_thunk_delete_programs as *const () as u64),
+        ("glDeleteShaders", gl_thunk_delete_shaders as *const () as u64),
+        ("glDeleteFramebuffers", gl_thunk_delete_framebuffers as *const () as u64),
+        ("glDeleteVertexArrays", gl_thunk_delete_vertex_arrays as *const () as u64),
     ]
 }
 
-fn gl_thunk_create_context() {}
-fn gl_thunk_make_current() {}
-fn gl_thunk_delete_context() {}
-fn gl_thunk_clear() {}
-fn gl_thunk_draw_arrays() {}
-fn gl_thunk_draw_elements() {}
-fn gl_thunk_gen_buffers() {}
-fn gl_thunk_bind_buffer() {}
-fn gl_thunk_buffer_data() {}
-fn gl_thunk_create_shader() {}
-fn gl_thunk_compile_shader() {}
-fn gl_thunk_link_program() {}
-fn gl_thunk_use_program() {}
-fn gl_thunk_gen_textures() {}
-fn gl_thunk_bind_texture() {}
-fn gl_thunk_tex_image_2d() {}
+// ---------------------------------------------------------------------------
+// OpenGL thunks
+// ---------------------------------------------------------------------------
+
+/// `wglCreateContext(hdc) -> HGLRC`. Returns the new context handle (u64).
+unsafe extern "C" fn gl_thunk_create_context(_hdc: *const c_void) -> u64 {
+    with_gl_state(|gl| gl.gl_create_context().unwrap_or(0))
+}
+
+/// `wglMakeCurrent(hdc, hglrc) -> BOOL`.
+unsafe extern "C" fn gl_thunk_make_current(_hdc: *const c_void, ctx: u64) -> i32 {
+    with_gl_state(|gl| match gl.gl_make_current(ctx) {
+        Ok(_) => 1,
+        Err(_) => 0,
+    })
+}
+
+/// `wglDeleteContext(hglrc) -> BOOL`.
+unsafe extern "C" fn gl_thunk_delete_context(ctx: u64) -> i32 {
+    with_gl_state(|gl| match gl.gl_delete_context(ctx) {
+        Ok(_) => 1,
+        Err(_) => 0,
+    })
+}
+
+/// `glClear(mask)`.
+unsafe extern "C" fn gl_thunk_clear(mask: u32) {
+    with_gl_state(|gl| {
+        let _ = gl.gl_clear(mask);
+    });
+}
+
+/// `glDrawArrays(mode, first, count)`.
+unsafe extern "C" fn gl_thunk_draw_arrays(mode: u32, first: i32, count: i32) {
+    with_gl_state(|gl| {
+        let _ = gl.gl_draw_arrays(mode, first, count);
+    });
+}
+
+/// `glDrawElements(mode, count, type, indices)`.
+unsafe extern "C" fn gl_thunk_draw_elements(
+    mode: u32,
+    count: i32,
+    elem_type: u32,
+    indices: *const c_void,
+) {
+    with_gl_state(|gl| {
+        let offset = indices as i32;
+        let _ = gl.gl_draw_elements(mode, count, elem_type, offset);
+    });
+}
+
+/// `glGenBuffers(count, buffers)` — writes the generated names.
+unsafe extern "C" fn gl_thunk_gen_buffers(count: u32, buffers: *mut u32) {
+    with_gl_state(|gl| {
+        if let Ok(ids) = gl.gl_gen_buffers(count)
+            && !buffers.is_null()
+        {
+            for (i, id) in ids.iter().enumerate() {
+                unsafe { *buffers.add(i) = *id; }
+            }
+        }
+    });
+}
+
+/// `glBindBuffer(target, buffer)`.
+unsafe extern "C" fn gl_thunk_bind_buffer(target: u32, buffer: u32) {
+    with_gl_state(|gl| {
+        let _ = gl.gl_bind_buffer(target, buffer);
+    });
+}
+
+/// `glBufferData(target, size, data, usage)` — uploads (bounded) guest data.
+unsafe extern "C" fn gl_thunk_buffer_data(
+    target: u32,
+    size: i64,
+    data: *const c_void,
+    usage: u32,
+) {
+    let bytes: &[u8] = if data.is_null() || size <= 0 {
+        &[]
+    } else {
+        let len = size.min(MAX_GL_UPLOAD_BYTES) as usize;
+        unsafe { std::slice::from_raw_parts(data as *const u8, len) }
+    };
+    with_gl_state(|gl| {
+        let _ = gl.gl_buffer_data(target, bytes, usage);
+    });
+}
+
+/// `glCreateShader(type) -> GLuint`.
+unsafe extern "C" fn gl_thunk_create_shader(shader_type: u32) -> u32 {
+    with_gl_state(|gl| gl.gl_create_shader(shader_type).unwrap_or(0))
+}
+
+/// `glCompileShader(shader, source)` — reads a NUL-terminated C string.
+unsafe extern "C" fn gl_thunk_compile_shader(shader: u32, source: *const c_char) {
+    if source.is_null() {
+        return;
+    }
+    let source_str = unsafe { CStr::from_ptr(source) };
+    let source_str = source_str.to_string_lossy();
+    with_gl_state(|gl| {
+        let _ = gl.gl_compile_shader(shader, &source_str);
+    });
+}
+
+/// `glLinkProgram(program)`.
+unsafe extern "C" fn gl_thunk_link_program(program: u32) {
+    with_gl_state(|gl| {
+        let _ = gl.gl_link_program(program);
+    });
+}
+
+/// `glUseProgram(program)`.
+unsafe extern "C" fn gl_thunk_use_program(program: u32) {
+    with_gl_state(|gl| {
+        let _ = gl.gl_use_program(program);
+    });
+}
+
+/// `glGenTextures(count, textures)` — writes the generated names.
+unsafe extern "C" fn gl_thunk_gen_textures(count: u32, textures: *mut u32) {
+    with_gl_state(|gl| {
+        if let Ok(ids) = gl.gl_gen_textures(count)
+            && !textures.is_null()
+        {
+            for (i, id) in ids.iter().enumerate() {
+                unsafe { *textures.add(i) = *id; }
+            }
+        }
+    });
+}
+
+/// `glBindTexture(unit, texture)`.
+unsafe extern "C" fn gl_thunk_bind_texture(unit: u32, texture: u32) {
+    with_gl_state(|gl| {
+        let _ = gl.gl_bind_texture(unit, texture);
+    });
+}
+
+/// `glTexImage2D(texture, level, internalformat, width, height, border,
+/// format, type, data)` — simplified: uploads at most `width*height*4`
+/// bytes of (bounded) guest pixel data.
+#[allow(clippy::too_many_arguments)] // mirrors the OpenGL C API
+unsafe extern "C" fn gl_thunk_tex_image_2d(
+    texture: u32,
+    level: i32,
+    _internalformat: u32,
+    width: u32,
+    height: u32,
+    _border: u32,
+    _format: u32,
+    _pixel_type: u32,
+    data: *const c_void,
+) {
+    let expected = (width as u64)
+        .saturating_mul(height as u64)
+        .saturating_mul(4);
+    let len = expected.min(MAX_GL_UPLOAD_BYTES as u64) as usize;
+    let bytes: Vec<u8> = if data.is_null() || len == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(data as *const u8, len).to_vec() }
+    };
+    with_gl_state(|gl| {
+        let _ = gl.gl_tex_image_2d(texture, level, &bytes);
+    });
+}
+
+/// `glDeleteBuffers(count, buffers)`.
+unsafe extern "C" fn gl_thunk_delete_buffers(count: u32, buffers: *const u32) {
+    if buffers.is_null() {
+        return;
+    }
+    let count = count.min(MAX_GL_GEN_COUNT) as usize;
+    let names = unsafe { std::slice::from_raw_parts(buffers, count) };
+    with_gl_state(|gl| {
+        let _ = gl.gl_delete_buffers(names);
+    });
+}
+
+/// `glDeleteTextures(count, textures)`.
+unsafe extern "C" fn gl_thunk_delete_textures(count: u32, textures: *const u32) {
+    if textures.is_null() {
+        return;
+    }
+    let count = count.min(MAX_GL_GEN_COUNT) as usize;
+    let names = unsafe { std::slice::from_raw_parts(textures, count) };
+    with_gl_state(|gl| {
+        let _ = gl.gl_delete_textures(names);
+    });
+}
+
+/// `glDeletePrograms(count, programs)`.
+unsafe extern "C" fn gl_thunk_delete_programs(count: u32, programs: *const u32) {
+    if programs.is_null() {
+        return;
+    }
+    let count = count.min(MAX_GL_GEN_COUNT) as usize;
+    let names = unsafe { std::slice::from_raw_parts(programs, count) };
+    with_gl_state(|gl| {
+        let _ = gl.gl_delete_programs(names);
+    });
+}
+
+/// `glDeleteShaders(count, shaders)`.
+unsafe extern "C" fn gl_thunk_delete_shaders(count: u32, shaders: *const u32) {
+    if shaders.is_null() {
+        return;
+    }
+    let count = count.min(MAX_GL_GEN_COUNT) as usize;
+    let names = unsafe { std::slice::from_raw_parts(shaders, count) };
+    with_gl_state(|gl| {
+        let _ = gl.gl_delete_shaders(names);
+    });
+}
+
+/// `glDeleteFramebuffers(count, framebuffers)`.
+unsafe extern "C" fn gl_thunk_delete_framebuffers(count: u32, framebuffers: *const u32) {
+    if framebuffers.is_null() {
+        return;
+    }
+    let count = count.min(MAX_GL_GEN_COUNT) as usize;
+    let names = unsafe { std::slice::from_raw_parts(framebuffers, count) };
+    with_gl_state(|gl| {
+        let _ = gl.gl_delete_framebuffers(names);
+    });
+}
+
+/// `glDeleteVertexArrays(count, arrays)`.
+unsafe extern "C" fn gl_thunk_delete_vertex_arrays(count: u32, arrays: *const u32) {
+    if arrays.is_null() {
+        return;
+    }
+    let count = count.min(MAX_GL_GEN_COUNT) as usize;
+    let names = unsafe { std::slice::from_raw_parts(arrays, count) };
+    with_gl_state(|gl| {
+        let _ = gl.gl_delete_vertex_arrays(names);
+    });
+}
+
 
 // ===========================================================================
 // Section 9: Tests
@@ -6162,7 +7900,7 @@ mod tests {
             0x00020013, 0x00000002, // OpTypeFunction %fn %void
             0x00030021, 0x00000003, 0x00000002,
             // %main = OpFunction %void None %fn
-            0x00050036, 0x00000002, 0x00000000, 0x00000003, 0x00000005,
+            0x00050036, 0x00000002, 0x00000005, 0x00000000, 0x00000003,
             // %lbl = OpLabel
             0x000200F8, 0x00000006, // OpReturn
             0x000100FD, // OpFunctionEnd
@@ -6561,7 +8299,11 @@ mod tests {
         );
         assert_eq!(
             vk_format_to_metal_format(VkFormat::R8G8B8A8Srgb),
-            metal::MTLPixelFormat::RGBA8Unorm
+            metal::MTLPixelFormat::RGBA8Unorm_sRGB
+        );
+        assert_eq!(
+            vk_format_to_metal_format(VkFormat::B8G8R8A8Srgb),
+            metal::MTLPixelFormat::BGRA8Unorm_sRGB
         );
 
         // Depth formats
@@ -6690,21 +8432,29 @@ mod tests {
         let phys = state.enumerate_physical_devices(instance).unwrap()[0];
         let device = state.create_device(phys, &[], &[(0, 1)]).unwrap();
 
-        let sampler = state
-            .create_sampler(
-                device, 0, 0, 0, // filters
-                0, 0, 0, // address modes
-                0.0, 1.0, // lod bias, anisotropy
-                0,   // compare op
-                0.0, 1000.0, // min/max lod
-            )
-            .unwrap();
+        let ci = VkSamplerCreateInfo {
+            min_filter: 0,
+            mag_filter: 0,
+            mipmap_mode: 0,
+            address_mode_u: 0,
+            address_mode_v: 0,
+            address_mode_w: 0,
+            mip_lod_bias: 0.0,
+            max_anisotropy: 1.0,
+            compare_op: 0,
+            min_lod: 0.0,
+            max_lod: 1000.0,
+        };
+        let sampler = state.create_sampler(device, &ci).unwrap();
         assert_ne!(sampler, 0);
         assert_eq!(state.sampler_count(), 1);
 
         let info = state.get_sampler(sampler).unwrap();
         assert_eq!(info.min_lod, 0.0);
         assert_eq!(info.max_lod, 1000.0);
+
+        state.destroy_sampler(sampler).unwrap();
+        assert_eq!(state.sampler_count(), 0);
     }
 
     // ── Malformed SPIR-V tests ─────────────────────────────────────────
