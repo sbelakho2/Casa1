@@ -30,6 +30,38 @@ use crate::real_audio::{pcm_bytes_to_float, RealAudioBackend};
 
 // ── Wave message constants ──────────────────────────────────────────────────
 
+/// Convert interleaved f32 samples to the device's PCM byte format
+/// (8-bit unsigned, 16-bit signed LE, or 32-bit float LE).
+fn capture_pcm_bytes(samples: &[f32], format: &WaveFormatEx) -> Vec<u8> {
+    let bytes_per_sample = (format.w_bits_per_sample as usize / 8).max(1);
+    let mut out = Vec::with_capacity(samples.len() * bytes_per_sample);
+    match format.w_bits_per_sample {
+        8 => {
+            for &sample in samples {
+                let value = (sample.clamp(-1.0, 1.0) * 127.0 + 128.0) as u8;
+                out.push(value);
+            }
+        }
+        32 => {
+            for &sample in samples {
+                out.extend_from_slice(&sample.clamp(-1.0, 1.0).to_le_bytes());
+            }
+        }
+        _ => {
+            // 16-bit (or unspecified) — signed little-endian PCM
+            for &sample in samples {
+                let value = if sample <= -1.0 {
+                    i16::MIN
+                } else {
+                    (sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16
+                };
+                out.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+    }
+    out
+}
+
 /// Sent to the callback when a wave device is opened.
 pub const WOM_OPEN: u32 = 0x3BB;
 /// Sent to the callback when a wave device is closed.
@@ -180,6 +212,15 @@ pub struct MmioChunkInfo {
 
 // ── MmioFile ────────────────────────────────────────────────────────────────
 
+/// Chunk stack entry: the guest-visible [`MmioChunkInfo`] plus bookkeeping
+/// about whether the chunk header was written by `mmioCreateChunk` (in which
+/// case `mmioAscend` must patch the size field).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MmioChunkEntry {
+    info: MmioChunkInfo,
+    created: bool,
+}
+
 /// An open multimedia I/O file, wrapping a [`std::fs::File`].
 #[derive(Debug)]
 pub struct MmioFile {
@@ -192,15 +233,22 @@ pub struct MmioFile {
     /// The flags the file was opened with.
     pub flags: u32,
     /// Current chunk stack for ascend/descend tracking.
-    pub chunk_stack: Vec<MmioChunkInfo>,
+    pub(crate) chunk_stack: Vec<MmioChunkEntry>,
     /// Total file size cached at open time.
     pub file_size: u64,
 }
 
-// SAFETY: On macOS, CoreAudio streams (cpal) are actually safe to send between
-// threads. The cpal crate conservatively marks Stream as !Send because the
-// *mut () in NotSendSyncAcrossAllPlatforms is a platform-agnostic marker, but
-// the CoreAudio AudioUnit/AudioQueue APIs used on macOS are thread-safe.
+// SAFETY: `RealAudioBackend` must never be moved between threads while its
+// cpal streams are live: cpal conservatively marks `Stream` as `!Send`
+// across all platforms, but the CoreAudio APIs used on macOS (AudioUnit /
+// AudioQueue) are thread-safe. Within Casa1 the backend is only ever
+// accessed through `WINMM_REAL_AUDIO` — a global `Mutex<Option<RealAudioBackend>>`
+// — so the streams are created, used, and dropped by whichever thread holds
+// the lock, never concurrently, and the backend itself never crosses a
+// thread boundary. Removing this impl would break the crate's lazy-static
+// backend stores in `real_audio.rs` (out of scope for this change), so the
+// invariant is documented and enforced by the mutex rather than by the type
+// system. Treat the backend as single-threaded (mutex-guarded) at all times.
 unsafe impl Send for crate::real_audio::RealAudioBackend {}
 
 // ── Global real audio backend (lazy) ─────────────────────────────────────────
@@ -326,6 +374,19 @@ impl WaveFormatEx {
     pub fn frame_size(&self) -> u16 {
         self.n_channels * (self.w_bits_per_sample / 8)
     }
+}
+
+/// Validate a WAVEFORMATEX for use with waveOut/waveIn.
+///
+/// Every subsequent operation divides guest data by `frame_size()`, so a
+/// zero frame size (channels == 0 or bits per sample < 8) or a zero sample
+/// rate would panic or produce garbage; reject such formats up front.
+fn is_valid_wave_format(format: &WaveFormatEx) -> bool {
+    format.n_channels >= 1
+        && format.n_channels <= 8
+        && format.n_samples_per_sec > 0
+        && format.w_bits_per_sample >= 8
+        && format.w_bits_per_sample.is_multiple_of(8)
 }
 
 /// Waveform-audio output device capabilities (`WAVEOUTCAPSW`).
@@ -757,6 +818,49 @@ impl Clone for MidiInputDevice {
     }
 }
 
+/// Shared per-device MIDI subscriber buffer (device handle → message queue).
+type MidiSubscriberBuffer = Arc<Mutex<VecDeque<Vec<u8>>>>;
+
+/// Shared CoreMIDI input poller.
+///
+/// A single background thread drains the global CoreMIDI input buffer and
+/// fans the messages out to every open MIDI input device. Without this,
+/// each device would spawn its own thread calling `drain_core_midi_input`,
+/// and with ≥ 2 open devices the messages would be split arbitrarily
+/// between them.
+#[derive(Default)]
+struct MidiInPoller {
+    thread: Option<JoinHandle<()>>,
+    stop: Arc<AtomicBool>,
+    subscribers: Vec<(u32, MidiSubscriberBuffer)>,
+}
+
+lazy_static::lazy_static! {
+    static ref MIDI_IN_POLLER: Mutex<MidiInPoller> = Mutex::new(MidiInPoller::default());
+}
+
+/// Unregister a MIDI input device from the shared poller, stopping the
+/// poller thread once the last subscriber leaves.
+///
+/// The join happens without holding the poller lock, so the poller thread
+/// (which takes the lock while fanning out) can always exit.
+fn unregister_midi_in_device(device_handle: u32) {
+    let joined = if let Ok(mut poller) = MIDI_IN_POLLER.lock() {
+        poller.subscribers.retain(|&(id, _)| id != device_handle);
+        if poller.subscribers.is_empty() {
+            poller.stop.store(true, Ordering::SeqCst);
+            poller.thread.take()
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    if let Some(thread) = joined {
+        let _ = thread.join();
+    }
+}
+
 // ── WinMM Subsystem ─────────────────────────────────────────────────────────
 
 /// Top-level WinMM subsystem state.
@@ -792,11 +896,46 @@ pub struct WinMmSubsystem {
     pub wave_in_thread_stop: HashMap<u32, Arc<AtomicBool>>,
     /// Join handles for wave-in capture threads, keyed by device handle.
     pub wave_in_threads: HashMap<u32, JoinHandle<()>>,
+    /// Per-device capture sessions (PCM bytes + byte count) shared with the
+    /// wave-in polling threads, keyed by device handle.
+    pub wave_in_capture_data: HashMap<u32, Arc<Mutex<WaveInCaptureSession>>>,
+}
+
+/// Captured audio pending guest delivery for a single wave-in device.
+///
+/// Filled by the wave-in polling thread (which reads the real backend's
+/// input stream) and consumed by `waveInGetPosition`; the dispatch layer
+/// copies `data` into guest WAVEHDR buffers and fires WIM_DATA.
+#[derive(Debug, Clone, Default)]
+pub struct WaveInCaptureSession {
+    /// Captured PCM bytes in the device's format (host-side, bounded).
+    pub data: Vec<u8>,
+    /// Total bytes captured since the session started.
+    pub bytes_captured: u64,
 }
 
 impl Default for WinMmSubsystem {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for WinMmSubsystem {
+    fn drop(&mut self) {
+        // Signal and join all capture threads and the async PlaySound thread
+        // so no background threads outlive the subsystem.
+        for stop in self.wave_in_thread_stop.values() {
+            stop.store(true, Ordering::SeqCst);
+        }
+        for (_, thread) in self.wave_in_threads.drain() {
+            let _ = thread.join();
+        }
+        self.wave_in_thread_stop.clear();
+        self.wave_in_capture_data.clear();
+        if let Some(thread) = self.play_sound_thread.take() {
+            PLAY_SOUND_STOP.store(true, Ordering::SeqCst);
+            let _ = thread.join();
+        }
     }
 }
 
@@ -820,6 +959,7 @@ impl WinMmSubsystem {
             play_sound_thread: None,
             wave_in_thread_stop: HashMap::new(),
             wave_in_threads: HashMap::new(),
+            wave_in_capture_data: HashMap::new(),
         }
     }
 
@@ -856,10 +996,15 @@ impl WinMmSubsystem {
             return (MMSYSERR_BADDEVICEID, 0);
         }
 
-        // Validate format — must be PCM
+        // Validate format — must be PCM / IEEE float with a sane geometry.
+        // `frame_size()` divides guest data on every write, so a zero frame
+        // size (n_channels == 0 or bits per sample < 8) must be rejected.
         if format.w_format_tag != WaveFormatEx::WAVE_FORMAT_PCM
             && format.w_format_tag != WaveFormatEx::WAVE_FORMAT_IEEE_FLOAT
         {
+            return (WAVERR_BADFORMAT, 0);
+        }
+        if !is_valid_wave_format(format) {
             return (WAVERR_BADFORMAT, 0);
         }
 
@@ -940,6 +1085,10 @@ impl WinMmSubsystem {
             None => return MMSYSERR_INVALHANDLE,
         };
 
+        // Drop fully-consumed buffers so the queue stays bounded over a
+        // long session (WOM_DONE delivery is handled by the dispatch layer).
+        device.buffers.retain(|b| !b.done);
+
         let buf = QueuedWaveBuffer {
             data: data.to_vec(),
             flags,
@@ -952,45 +1101,62 @@ impl WinMmSubsystem {
 
         // ── Push audio data to the real cpal output stream ────────────────
         if data.is_empty() {
+            // An empty buffer is trivially consumed.
+            if let Some(last) = device.buffers.last_mut() {
+                last.done = true;
+            }
             return MMSYSERR_NOERROR;
         }
 
-        if let Some(real_id) = device.real_device_id {
-            match WINMM_REAL_AUDIO.lock() {
-                Ok(mut guard) => {
-                    if let Some(backend) = guard.as_mut() {
-                        // Convert guest PCM bytes to host f32 samples
-                        let samples = pcm_bytes_to_float(
-                            data,
-                            device.format.w_format_tag,
-                            device.format.w_bits_per_sample,
-                            device.format.n_channels,
-                        );
-                        // Push the samples to the output stream's lock-free queue
-                        let _ = backend.push_wasapi_frames(
-                            real_id,
-                            &samples,
-                            device.format.n_channels,
-                            device.format.n_samples_per_sec,
-                        );
-                        // Update position counters
-                        device.total_bytes_consumed += data.len() as u64;
-                        device.total_frames_consumed +=
-                            (data.len() as u64) / device.format.frame_size() as u64;
+        let Some(real_id) = device.real_device_id else {
+            eprintln!("[winmm] wave_out_write: no real_device_id for handle {device_handle}");
+            device.buffers.pop();
+            return MMSYSERR_ERROR;
+        };
 
-                        // Mark the buffer as consumed — the audio is now in the
-                        // cpal callback's lock-free queue and will play out.
-                        if let Some(last) = device.buffers.last_mut() {
-                            last.done = true;
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!("[winmm] WINMM_REAL_AUDIO lock poisoned: {e}");
+        let push_result = WINMM_REAL_AUDIO.lock().map(|mut guard| {
+            guard.as_mut().map(|backend| {
+                // Convert guest PCM bytes to host f32 samples
+                let samples = pcm_bytes_to_float(
+                    data,
+                    device.format.w_format_tag,
+                    device.format.w_bits_per_sample,
+                    device.format.n_channels,
+                );
+                // Push the samples to the output stream's lock-free queue
+                backend.push_wasapi_frames(
+                    real_id,
+                    &samples,
+                    device.format.n_channels,
+                    device.format.n_samples_per_sec,
+                )
+            })
+        });
+
+        match push_result {
+            Ok(Some(Ok(()))) => {
+                // Only count and complete the buffer when the backend
+                // actually accepted the data, so position queries
+                // (TIME_BYTES/TIME_SAMPLES/TIME_MS) do not lie.
+                device.total_bytes_consumed += data.len() as u64;
+                let frame_size = device.format.frame_size().max(1) as u64;
+                device.total_frames_consumed += (data.len() as u64) / frame_size;
+                if let Some(last) = device.buffers.last_mut() {
+                    last.done = true;
                 }
             }
-        } else {
-            eprintln!("[winmm] wave_out_write: no real_device_id for handle {device_handle}");
+            Ok(_) => {
+                // Backend unavailable or push failed: the buffer was never
+                // queued, so remove it and report failure to the guest.
+                eprintln!("[winmm] wave_out_write: backend could not accept buffer");
+                device.buffers.pop();
+                return MMSYSERR_ERROR;
+            }
+            Err(e) => {
+                eprintln!("[winmm] WINMM_REAL_AUDIO lock poisoned: {e}");
+                device.buffers.pop();
+                return MMSYSERR_ERROR;
+            }
         }
 
         MMSYSERR_NOERROR
@@ -1057,6 +1223,10 @@ impl WinMmSubsystem {
     /// or TIME_MS). The PE runtime dispatch layer is responsible for writing
     /// the MMTIME struct into guest memory.
     ///
+    /// Position counters are kept as `u64` internally; they are truncated to
+    /// `u32` here at the guest boundary, matching Windows' DWORD MMTIME
+    /// semantics.
+    ///
     /// Returns `MMSYSERR_INVALHANDLE` if the handle is invalid.
     pub fn wave_out_get_position(
         &self,
@@ -1077,10 +1247,10 @@ impl WinMmSubsystem {
             MmtTime::TIME_SAMPLES => device.total_frames_consumed as u32,
             MmtTime::TIME_MS => {
                 if device.format.n_samples_per_sec > 0 {
-                    ((device.total_frames_consumed as u64)
+                    (device
+                        .total_frames_consumed
                         .saturating_mul(1000)
-                        / device.format.n_samples_per_sec as u64)
-                        as u32
+                        / device.format.n_samples_per_sec as u64) as u32
                 } else {
                     0
                 }
@@ -1129,8 +1299,12 @@ impl WinMmSubsystem {
     // ── Wave In functions ────────────────────────────────────────────────────
 
     /// Returns the number of wave input devices available.
+    ///
+    /// Reports the number of *available* devices (1, matching
+    /// `wave_in_get_dev_caps` / `wave_in_open`), not the number of
+    /// currently-open devices.
     pub fn wave_in_get_num_devs(&self) -> u32 {
-        self.wave_in_devices.len() as u32
+        1
     }
 
     /// Returns device capabilities for a wave input device.
@@ -1161,6 +1335,9 @@ impl WinMmSubsystem {
         {
             return (WAVERR_BADFORMAT, 0);
         }
+        if !is_valid_wave_format(format) {
+            return (WAVERR_BADFORMAT, 0);
+        }
 
         let handle = self.next_wave_in_handle;
         self.next_wave_in_handle += 1;
@@ -1180,6 +1357,21 @@ impl WinMmSubsystem {
         };
         device.is_open = false;
         device.is_capturing = false;
+        // Tear down the capture polling thread and the real input stream,
+        // mirroring wave_in_stop so open/close cycles do not leak threads
+        // or streams.
+        if let Some(stop) = self.wave_in_thread_stop.remove(&handle) {
+            stop.store(true, Ordering::SeqCst);
+        }
+        if let Some(thread) = self.wave_in_threads.remove(&handle) {
+            let _ = thread.join();
+        }
+        if let Ok(mut guard) = WINMM_REAL_AUDIO.lock()
+            && let Some(backend) = guard.as_mut()
+        {
+            backend.stop_input_stream();
+        }
+        self.wave_in_capture_data.remove(&handle);
         MMSYSERR_NOERROR
     }
 
@@ -1295,24 +1487,43 @@ impl WinMmSubsystem {
 
         device.is_capturing = true;
 
-        // Spawn a background polling thread that reads captured audio
-        // from the real backend and fills queued WAVEHDR buffers.
-        let _dev_handle = handle;
+        // Spawn a background polling thread that pulls captured audio from
+        // the real backend, converts it to the device's PCM format, and
+        // accumulates it for guest delivery.
         let stop = Arc::new(AtomicBool::new(false));
         let stop_clone = stop.clone();
-        let thread_builder = std::thread::Builder::new()
-            .name(format!("winmm-wavein-{handle}"));
+        let session = Arc::new(Mutex::new(WaveInCaptureSession::default()));
+        let session_clone = session.clone();
+        let format = device.format; // Copy
+        let thread_builder = std::thread::Builder::new().name(format!("winmm-wavein-{handle}"));
         let join_handle = match thread_builder.spawn(move || {
             let poll_interval = Duration::from_millis(20);
-            loop {
-                if stop_clone.load(Ordering::SeqCst) {
-                    break;
+            while !stop_clone.load(Ordering::SeqCst) {
+                // Read captured audio data from the real backend and convert
+                // it to PCM bytes in the device's format.
+                if let Ok(mut guard) = WINMM_REAL_AUDIO.lock()
+                    && let Some(backend) = guard.as_mut()
+                {
+                    let captured = backend.read_capture_data();
+                    if !captured.is_empty()
+                        && let Ok(mut sess) = session_clone.lock()
+                    {
+                        let bytes = capture_pcm_bytes(&captured, &format);
+                        sess.data.extend_from_slice(&bytes);
+                        sess.bytes_captured += bytes.len() as u64;
+                        // Bound the pending data (~4 seconds of PCM);
+                        // guest delivery drains it via the dispatch layer.
+                        let max_bytes = (format.n_samples_per_sec as usize
+                            * format.n_channels as usize
+                            * (format.w_bits_per_sample as usize / 8))
+                            .saturating_mul(4)
+                            .max(1024);
+                        if sess.data.len() > max_bytes {
+                            let excess = sess.data.len() - max_bytes;
+                            sess.data.drain(0..excess);
+                        }
+                    }
                 }
-                // Read captured audio data from the real backend.
-                // The actual buffer-filling and WIM_DATA callback
-                // delivery is handled by the PE runtime dispatch
-                // layer which reads the device's queued buffers.
-                // For now the thread simply keeps the stream alive.
                 std::thread::sleep(poll_interval);
             }
         }) {
@@ -1324,12 +1535,11 @@ impl WinMmSubsystem {
             }
         };
 
-        // Store the stop flag and thread handle on the device so that
-        // wave_in_stop / wave_in_reset can tear them down.
-        // (The WaveInDevice struct doesn't have these fields yet, so
-        //  we store them in a side-channel HashMap for now.)
+        // Store the stop flag, thread handle, and capture session so that
+        // wave_in_stop / wave_in_reset / wave_in_close can tear them down.
         self.wave_in_thread_stop.insert(handle, stop);
         self.wave_in_threads.insert(handle, join_handle);
+        self.wave_in_capture_data.insert(handle, session);
 
         MMSYSERR_NOERROR
     }
@@ -1349,12 +1559,13 @@ impl WinMmSubsystem {
         if let Some(thread) = self.wave_in_threads.remove(&handle) {
             let _ = thread.join();
         }
+        self.wave_in_capture_data.remove(&handle);
 
         // Stop the real audio input stream
-        if let Ok(mut guard) = WINMM_REAL_AUDIO.lock() {
-            if let Some(backend) = guard.as_mut() {
-                backend.stop_input_stream();
-            }
+        if let Ok(mut guard) = WINMM_REAL_AUDIO.lock()
+            && let Some(backend) = guard.as_mut()
+        {
+            backend.stop_input_stream();
         }
 
         // Mark the device as not capturing and mark all queued buffers as done
@@ -1383,12 +1594,13 @@ impl WinMmSubsystem {
         if let Some(thread) = self.wave_in_threads.remove(&handle) {
             let _ = thread.join();
         }
+        self.wave_in_capture_data.remove(&handle);
 
         // Stop the real audio input stream
-        if let Ok(mut guard) = WINMM_REAL_AUDIO.lock() {
-            if let Some(backend) = guard.as_mut() {
-                backend.stop_input_stream();
-            }
+        if let Ok(mut guard) = WINMM_REAL_AUDIO.lock()
+            && let Some(backend) = guard.as_mut()
+        {
+            backend.stop_input_stream();
         }
 
         if let Some(device) = self.wave_in_devices.iter_mut().find(|d| d.handle == handle) {
@@ -1405,12 +1617,19 @@ impl WinMmSubsystem {
     /// Get the capture position for a wave input device.
     ///
     /// Returns `(MMRESULT, bytes_captured)` so the PE runtime dispatch can
-    /// write the MMTIME struct into guest memory.
+    /// write the MMTIME struct into guest memory. The byte count reflects
+    /// the live value accumulated by the capture polling thread.
     pub fn wave_in_get_position(&mut self, handle: u32) -> (u32, u32) {
         let device = match self.wave_in_devices.iter_mut().find(|d| d.handle == handle) {
             Some(d) => d,
             None => return (MMSYSERR_INVALHANDLE, 0),
         };
+
+        if let Some(session) = self.wave_in_capture_data.get(&handle)
+            && let Ok(sess) = session.lock()
+        {
+            device.bytes_captured = sess.bytes_captured;
+        }
 
         (MMSYSERR_NOERROR, device.bytes_captured as u32)
     }
@@ -1575,7 +1794,9 @@ impl WinMmSubsystem {
             .position(|d| d.device_id == device_handle);
         match pos {
             Some(idx) => {
-                // Stop the polling thread first
+                // Unregister from the shared CoreMIDI poller first
+                unregister_midi_in_device(device_handle);
+                // Stop the per-device thread (if one exists)
                 let dev = &mut self.midi_in_devices[idx];
                 dev.midi_thread_stop.store(true, Ordering::SeqCst);
                 if let Some(handle) = dev.midi_thread.take() {
@@ -1590,10 +1811,11 @@ impl WinMmSubsystem {
 
     /// Start MIDI input capture.
     ///
-    /// Spawns a background thread that polls [`midi::drain_core_midi_input`]
-    /// and pushes received messages into [`MidiInputDevice::midi_buffer`].
-    /// The PE runtime dispatch layer can then read this buffer and deliver
-    /// MIM_DATA callbacks in guest context.
+    /// Registers this device with the shared CoreMIDI poller (a single
+    /// background thread that drains the global CoreMIDI buffer and fans
+    /// messages out to every open input device). The PE runtime dispatch
+    /// layer can then read the device's buffer and deliver MIM_DATA
+    /// callbacks in guest context.
     pub fn midi_in_start(&mut self, device_handle: u32) -> u32 {
         let dev = match self
             .midi_in_devices
@@ -1609,47 +1831,61 @@ impl WinMmSubsystem {
         }
         dev.state = MidiInState::Started;
 
-        // Signal the thread to keep running
-        dev.midi_thread_stop.store(false, Ordering::SeqCst);
-        let stop_flag = dev.midi_thread_stop.clone();
+        // Register this device as a subscriber of the shared poller.
         let buffer = dev.midi_buffer.clone();
+        if let Ok(mut poller) = MIDI_IN_POLLER.lock() {
+            poller.subscribers.retain(|&(id, _)| id != device_handle);
+            poller.subscribers.push((device_handle, buffer));
 
-        let handle = std::thread::Builder::new()
-            .name(format!("winmm-midi-in-{device_handle}"))
-            .spawn(move || {
-                loop {
-                    if stop_flag.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    // Poll CoreMIDI for incoming messages
-                    let messages = crate::midi::drain_core_midi_input();
-                    if !messages.is_empty() {
-                        if let Ok(mut buf) = buffer.lock() {
-                            for msg in &messages {
-                                buf.push_back(msg.data.clone());
+            // Spawn the shared poller thread on first use.
+            if poller.thread.is_none() {
+                let stop = Arc::new(AtomicBool::new(false));
+                let stop_clone = stop.clone();
+                poller.stop = stop.clone();
+                let spawned = std::thread::Builder::new()
+                    .name("winmm-midi-in-poller".to_string())
+                    .spawn(move || {
+                        while !stop_clone.load(Ordering::SeqCst) {
+                            // Poll CoreMIDI for incoming messages
+                            let messages = crate::midi::drain_core_midi_input();
+                            if !messages.is_empty()
+                                && let Ok(poller) = MIDI_IN_POLLER.lock()
+                            {
+                                for msg in &messages {
+                                    for (_, buf) in &poller.subscribers {
+                                        if let Ok(mut b) = buf.lock() {
+                                            b.push_back(msg.data.clone());
+                                            if b.len() > 1024 {
+                                                b.pop_front();
+                                            }
+                                        }
+                                    }
+                                }
                             }
+                            std::thread::sleep(Duration::from_millis(10));
                         }
+                    });
+                match spawned {
+                    Ok(h) => {
+                        poller.thread = Some(h);
                     }
-                    std::thread::sleep(Duration::from_millis(10));
+                    Err(e) => {
+                        eprintln!("[winmm] failed to spawn MIDI poller thread: {e}");
+                        poller.subscribers.retain(|&(id, _)| id != device_handle);
+                        poller.stop = Arc::new(AtomicBool::new(true));
+                        dev.state = MidiInState::Stopped;
+                        return MMSYSERR_ERROR;
+                    }
                 }
-            });
-
-        match handle {
-            Ok(h) => {
-                dev.midi_thread = Some(h);
-                MMSYSERR_NOERROR
-            }
-            Err(e) => {
-                eprintln!("[winmm] failed to spawn MIDI in thread: {e}");
-                dev.state = MidiInState::Stopped;
-                MMSYSERR_ERROR
             }
         }
+        MMSYSERR_NOERROR
     }
 
     /// Stop MIDI input capture.
     ///
-    /// Signals the background thread to stop and waits for it to finish.
+    /// Unregisters the device from the shared poller and stops its
+    /// per-device thread (if any).
     pub fn midi_in_stop(&mut self, device_handle: u32) -> u32 {
         let dev = match self
             .midi_in_devices
@@ -1661,6 +1897,7 @@ impl WinMmSubsystem {
         };
 
         dev.state = MidiInState::Stopped;
+        unregister_midi_in_device(device_handle);
         dev.midi_thread_stop.store(true, Ordering::SeqCst);
         if let Some(handle) = dev.midi_thread.take() {
             let _ = handle.join();
@@ -1682,6 +1919,7 @@ impl WinMmSubsystem {
         };
 
         dev.state = MidiInState::Stopped;
+        unregister_midi_in_device(device_handle);
         dev.midi_thread_stop.store(true, Ordering::SeqCst);
         if let Some(handle) = dev.midi_thread.take() {
             let _ = handle.join();
@@ -1723,19 +1961,20 @@ impl WinMmSubsystem {
 
     /// Parse a RIFF/WAV file and push its PCM audio data to the cpal backend.
     ///
-    /// Returns `true` if audio was successfully queued for playback.
-    fn play_sound_file_cpal(path: &str) -> bool {
+    /// Returns the duration of the queued audio in seconds on success, or
+    /// `None` if the file could not be read/parsed or queued.
+    fn play_sound_file_cpal(path: &str) -> Option<f64> {
         let file_data = match std::fs::read(path) {
             Ok(d) => d,
             Err(e) => {
                 eprintln!("[winmm] play_sound_file_cpal: cannot read '{path}': {e}");
-                return false;
+                return None;
             }
         };
 
         if file_data.len() < 12 {
             eprintln!("[winmm] play_sound_file_cpal: '{path}' too short for RIFF header");
-            return false;
+            return None;
         }
 
         // Validate RIFF header
@@ -1743,7 +1982,7 @@ impl WinMmSubsystem {
         let wave = u32::from_le_bytes([file_data[8], file_data[9], file_data[10], file_data[11]]);
         if riff != FOURCC_RIFF || wave != FOURCC_WAVE {
             eprintln!("[winmm] play_sound_file_cpal: '{path}' not a RIFF/WAV file");
-            return false;
+            return None;
         }
 
         // Walk chunks to find fmt and data
@@ -1787,7 +2026,12 @@ impl WinMmSubsystem {
 
         if pcm_data.is_empty() {
             eprintln!("[winmm] play_sound_file_cpal: no data chunk found in '{path}'");
-            return false;
+            return None;
+        }
+        // Guard against malformed headers that would divide by zero later.
+        if channels == 0 || sample_rate == 0 || bits_per_sample == 0 {
+            eprintln!("[winmm] play_sound_file_cpal: malformed format in '{path}'");
+            return None;
         }
 
         // Push to the cpal backend
@@ -1806,33 +2050,38 @@ impl WinMmSubsystem {
             Some(id) => id,
             None => {
                 eprintln!("[winmm] play_sound_file_cpal: failed to init audio backend");
-                return false;
+                return None;
             }
         };
 
-        match WINMM_REAL_AUDIO.lock() {
-            Ok(mut guard) => {
-                if let Some(backend) = guard.as_mut() {
-                    let samples = pcm_bytes_to_float(&pcm_data, format_tag, bits_per_sample, channels);
-                    let _ = backend.push_wasapi_frames(
-                        real_id,
-                        &samples,
-                        channels,
-                        sample_rate,
-                    );
-                    true
-                } else {
-                    false
-                }
-            }
-            Err(e) => {
-                eprintln!("[winmm] play_sound_file_cpal: lock error: {e}");
-                false
-            }
+        let pushed = if let Ok(mut guard) = WINMM_REAL_AUDIO.lock()
+            && let Some(backend) = guard.as_mut()
+        {
+            let samples = pcm_bytes_to_float(&pcm_data, format_tag, bits_per_sample, channels);
+            backend
+                .push_wasapi_frames(real_id, &samples, channels, sample_rate)
+                .is_ok()
+        } else {
+            false
+        };
+        if !pushed {
+            eprintln!("[winmm] play_sound_file_cpal: failed to queue audio");
+            return None;
         }
+
+        // Duration of the queued audio in seconds (for SND_SYNC blocking).
+        let bytes_per_frame = (bits_per_sample as usize / 8) * channels as usize;
+        let frames = pcm_data.len() / bytes_per_frame.max(1);
+        Some(frames as f64 / sample_rate as f64)
     }
 
     pub fn play_sound_w(&mut self, sound_name: Option<String>, _hmod: u64, flags: u32) -> u32 {
+        // SND_MEMORY means pszSound is a pointer to a sound image in guest
+        // memory, which this subsystem cannot dereference — reject it.
+        if flags & SND_MEMORY != 0 {
+            return 0; // FALSE
+        }
+
         // If no sound name provided and SND_NODEFAULT is set, return silently.
         let name = match sound_name {
             Some(ref n) if !n.is_empty() => n.clone(),
@@ -1840,45 +2089,39 @@ impl WinMmSubsystem {
                 if flags & SND_NODEFAULT != 0 {
                     return 0; // FALSE
                 }
-                // Play system beep via cpal
-                if let Some(real_id) = Self::ensure_system_beep() {
-                    if let Ok(mut guard) = WINMM_REAL_AUDIO.lock() {
-                        if let Some(backend) = guard.as_mut() {
-                            let _ = backend.push_wasapi_frames(
-                                real_id,
-                                &[0.0; 0], // silent — just opening the stream plays a beep
-                                1,
-                                44100,
-                            );
-                        }
-                    }
-                }
-                return 1; // TRUE
+                // Play a synthesized system beep
+                return Self::play_system_beep();
             }
         };
 
-        // Resolve the file path
-        let path = if flags & SND_FILENAME != 0 || flags & SND_ALIAS == 0 {
-            std::path::PathBuf::from(&name)
+        // Resolve the path. SND_ALIAS maps a small set of system aliases to
+        // the built-in beep; otherwise the name is treated as a file path.
+        let path = if flags & SND_ALIAS != 0 && flags & SND_FILENAME == 0 {
+            match name.to_ascii_lowercase().as_str() {
+                "systemasterisk" | "systemexclamation" | "systemhand" | "systemquestion"
+                | "systemdefault" | "systembeep" => {
+                    return Self::play_system_beep();
+                }
+                _ => return 0, // FALSE — unknown alias
+            }
         } else {
-            // For SND_ALIAS or SND_RESOURCE without proper loading, return FALSE
-            return 0;
+            std::path::PathBuf::from(&name)
         };
 
         if !path.exists() {
             if flags & SND_NODEFAULT != 0 {
                 return 0; // FALSE
             }
-            // Try system sound as fallback
-            Self::play_sound_file_cpal("/System/Library/Sounds/Ping.aiff");
-            return 1;
+            // Fall back to a synthesized beep instead of a system AIFF file,
+            // which the WAV-only parser cannot play.
+            return Self::play_system_beep();
         }
 
-        // Stop any currently looping async sound
-        if self.play_sound_thread.is_some() {
+        // Stop any currently playing async sound, joining the old thread so
+        // it cannot push audio after the new sound starts.
+        if let Some(thread) = self.play_sound_thread.take() {
             PLAY_SOUND_STOP.store(true, Ordering::SeqCst);
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            self.play_sound_thread.take();
+            let _ = thread.join();
         }
 
         let async_mode = flags & SND_ASYNC != 0;
@@ -1891,7 +2134,7 @@ impl WinMmSubsystem {
             let handle = std::thread::spawn(move || {
                 if loop_mode {
                     while !PLAY_SOUND_STOP.load(Ordering::SeqCst) {
-                        if !Self::play_sound_file_cpal(&path_str) {
+                        if Self::play_sound_file_cpal(&path_str).is_none() {
                             break;
                         }
                     }
@@ -1902,18 +2145,56 @@ impl WinMmSubsystem {
             self.play_sound_thread = Some(handle);
             1 // TRUE
         } else {
-            // Synchronous play
-            Self::play_sound_file_cpal(path.to_string_lossy().as_ref());
-            1 // TRUE
+            // SND_SYNC: block until the queued audio has played out.
+            let duration = Self::play_sound_file_cpal(path.to_string_lossy().as_ref());
+            match duration {
+                Some(secs) => {
+                    std::thread::sleep(Duration::from_secs_f64(secs + 0.05));
+                    1 // TRUE
+                }
+                None => 0, // FALSE — could not play
+            }
         }
     }
 
-    /// Ensure the audio backend is running with a simple beep-like format,
-    /// returning the device ID. Used when `PlaySoundW` is called with no
-    /// sound name (system default beep).
-    fn ensure_system_beep() -> Option<u64> {
+    /// Play a short synthesized system beep through the real audio backend.
+    ///
+    /// Used for `PlaySoundW` default/alias/fallback paths, replacing the
+    /// previous AIFF file that the WAV-only parser could never play.
+    fn play_system_beep() -> u32 {
         let fmt = WaveFormatEx::pcm(1, 44100, 16);
-        ensure_winmm_audio(&fmt)
+        let real_id = match ensure_winmm_audio(&fmt) {
+            Some(id) => id,
+            None => {
+                eprintln!("[winmm] play_system_beep: failed to init audio backend");
+                return 0;
+            }
+        };
+
+        // Synthesize an 880 Hz beep (~150 ms with a short decay envelope).
+        let sample_rate = 44100.0f32;
+        let frames = (sample_rate * 0.15) as usize;
+        let samples: Vec<f32> = (0..frames)
+            .map(|i| {
+                let t = i as f32 / sample_rate;
+                let envelope = if t < 0.01 {
+                    t / 0.01
+                } else {
+                    (-(t - 0.01) * 12.0).exp()
+                };
+                (2.0 * std::f32::consts::PI * 880.0 * t).sin() * envelope * 0.5
+            })
+            .collect();
+
+        let Ok(mut guard) = WINMM_REAL_AUDIO.lock() else {
+            return 0;
+        };
+        match guard.as_mut() {
+            Some(backend) => backend
+                .push_wasapi_frames(real_id, &samples, 1, 44100)
+                .is_ok() as u32,
+            None => 0,
+        }
     }
 
     // ── mmio implementation ──────────────────────────────────────────────────
@@ -2020,10 +2301,49 @@ impl WinMmSubsystem {
         }
     }
 
+    /// Reposition the file pointer within a multimedia file (mmioSeek).
+    ///
+    /// `origin` is `MMIO_SEEK_SET` (0), `MMIO_SEEK_CUR` (1), or
+    /// `MMIO_SEEK_END` (2). Returns the new file offset, or `-1` on failure
+    /// (invalid handle, unknown origin, negative target, or I/O error).
+    ///
+    /// Note: the guest-facing dispatch thunk must be wired in `pe_runtime.rs`
+    /// (outside this file's scope) for guests to call `mmioSeekW`.
+    pub fn mmio_seek(&mut self, handle: u32, offset: i32, origin: u32) -> i64 {
+        const MMIO_SEEK_SET: u32 = 0;
+        const MMIO_SEEK_CUR: u32 = 1;
+        const MMIO_SEEK_END: u32 = 2;
+
+        let mmio = match self.mmio_files.get_mut(&handle) {
+            Some(f) => f,
+            None => return -1,
+        };
+
+        let base = match origin {
+            MMIO_SEEK_SET => 0i64,
+            MMIO_SEEK_CUR => mmio.position as i64,
+            MMIO_SEEK_END => mmio.file_size as i64,
+            _ => return -1,
+        };
+        let target = base.saturating_add(offset as i64);
+        if target < 0 {
+            return -1;
+        }
+        match mmio.file.seek(SeekFrom::Start(target as u64)) {
+            Ok(pos) => {
+                mmio.position = pos;
+                pos as i64
+            }
+            Err(_) => -1,
+        }
+    }
+
     /// Ascend from a RIFF chunk (mmioAscend).
     ///
-    /// Moves the file pointer past the end of the chunk (to the next chunk
-    /// boundary, aligned to WORD).
+    /// For chunks created with `mmioCreateChunk` (which wrote a placeholder
+    /// size of 0), the real chunk size is patched back into the file header.
+    /// Then the file pointer is moved past the end of the chunk (aligned to
+    /// WORD).
     pub fn mmio_ascend(&mut self, handle: u32, _chunk: &MmioChunkInfo) -> u32 {
         let mmio = match self.mmio_files.get_mut(&handle) {
             Some(f) => f,
@@ -2031,11 +2351,34 @@ impl WinMmSubsystem {
         };
 
         // Pop the chunk from the stack (if any)
-        if let Some(chunk) = mmio.chunk_stack.pop() {
+        if let Some(entry) = mmio.chunk_stack.pop() {
+            let chunk = entry.info;
+            // If the chunk header was written by mmioCreateChunk, patch the
+            // placeholder cksize with the actual data size. The data ends at
+            // the current file position; the size region starts right after
+            // the 8-byte chunk header (the 4-byte form type of RIFF/LIST
+            // chunks is *inside* the size region).
+            let actual_data_end = if entry.created {
+                mmio.position
+            } else {
+                chunk.dw_data_offset as u64 + chunk.cksize as u64
+            };
+            if entry.created {
+                // The size region starts right after the 8-byte chunk header
+                // and runs to the current file position (the 4-byte form
+                // type of RIFF/LIST chunks is inside the size region).
+                let header_start = chunk.dw_data_offset as u64 - 8;
+                let cksize = actual_data_end.saturating_sub(header_start + 8) as u32;
+                if mmio.file.seek(SeekFrom::Start(header_start + 4)).is_err() {
+                    return MMIOERR_CANNOTWRITE;
+                }
+                if mmio.file.write_all(&cksize.to_le_bytes()).is_err() {
+                    return MMIOERR_CANNOTWRITE;
+                }
+            }
             // Seek to the end of this chunk's data
-            let data_end = chunk.dw_data_offset as u64 + chunk.cksize as u64;
             // Align to WORD (2-byte) boundary
-            let aligned_end = (data_end + 1) & !1u64;
+            let aligned_end = (actual_data_end + 1) & !1u64;
             if aligned_end > mmio.file_size {
                 // Extend the file if needed (writing case)
                 // We can't easily extend, but we can pad
@@ -2079,11 +2422,15 @@ impl WinMmSubsystem {
             None => return MMSYSERR_INVALHANDLE,
         };
 
-        // Determine the search range
+        // Determine the search range. For a parent chunk, children start
+        // after the parent's 4-byte form type (RIFF/LIST) or directly at the
+        // data offset, and end at the parent's data end.
         let (search_start, search_end) = if let Some(p) = parent {
+            let is_riff_like = p.ckid == FOURCC_RIFF || p.ckid == FOURCC_LIST;
+            let form_type_len = if is_riff_like { 4u64 } else { 0 };
             (
-                p.dw_data_offset as u64 + 8,
-                p.dw_data_offset as u64 + 8 + p.cksize as u64,
+                p.dw_data_offset as u64 + form_type_len,
+                p.dw_data_offset as u64 + p.cksize as u64,
             )
         } else {
             (mmio.position, mmio.file_size)
@@ -2127,7 +2474,10 @@ impl WinMmSubsystem {
                 }
 
                 // Push onto chunk stack
-                mmio.chunk_stack.push(*chunk);
+                mmio.chunk_stack.push(MmioChunkEntry {
+                    info: *chunk,
+                    created: false,
+                });
 
                 // Move position to start of chunk data
                 mmio.position = pos + 8;
@@ -2160,7 +2510,9 @@ impl WinMmSubsystem {
             None => return MMSYSERR_INVALHANDLE,
         };
 
-        // Record the data offset (right after the 8-byte header)
+        // Record the data offset (right after the 8-byte header). For
+        // RIFF/LIST chunks this points at the form type, matching the
+        // MMCKINFO.dwDataOffset semantics used by mmioDescend.
         chunk.dw_data_offset = mmio.position as u32 + 8;
 
         // Write chunk header: ckid (4 bytes) + placeholder cksize (4 bytes)
@@ -2178,13 +2530,15 @@ impl WinMmSubsystem {
             if mmio.file.write_all(&fcc).is_err() {
                 return MMIOERR_CANNOTWRITE;
             }
-            chunk.dw_data_offset = mmio.position as u32 + 12; // 8 header + 4 form type
         }
 
-        mmio.position = chunk.dw_data_offset as u64;
+        mmio.position = chunk.dw_data_offset as u64 + if chunk.ckid == FOURCC_RIFF || chunk.ckid == FOURCC_LIST { 4 } else { 0 };
 
         // Push onto stack so mmio_ascend can finalise the size
-        mmio.chunk_stack.push(*chunk);
+        mmio.chunk_stack.push(MmioChunkEntry {
+            info: *chunk,
+            created: true,
+        });
 
         MMSYSERR_NOERROR
     }
@@ -2510,5 +2864,101 @@ mod tests {
     fn test_midi_in_get_num_devs() {
         let mm = WinMmSubsystem::new();
         assert_eq!(mm.midi_in_get_num_devs(), 1);
+    }
+
+    #[test]
+    fn test_mmio_create_ascend_patches_chunk_sizes() {
+        let mut mm = WinMmSubsystem::new();
+        let path = std::env::temp_dir().join(format!(
+            "casa1-mmio-ascend-{}.wav",
+            std::process::id()
+        ));
+        let path_str = path.to_string_lossy().to_string();
+
+        let handle = mm.mmio_open_w(path_str.clone(), MMIO_WRITE | MMIO_CREATE);
+        assert_ne!(handle, 0, "mmioOpen for writing should succeed");
+
+        let mut riff = MmioChunkInfo {
+            ckid: FOURCC_RIFF,
+            fcc_type: FOURCC_WAVE,
+            ..Default::default()
+        };
+        assert_eq!(
+            mm.mmio_create_chunk(handle, &mut riff, 0),
+            MMSYSERR_NOERROR
+        );
+        let mut data = MmioChunkInfo {
+            ckid: FOURCC_DATA,
+            ..Default::default()
+        };
+        assert_eq!(
+            mm.mmio_create_chunk(handle, &mut data, 0),
+            MMSYSERR_NOERROR
+        );
+
+        let payload = [0xABu8; 32];
+        assert_eq!(
+            mm.mmio_write(handle, &payload, payload.len() as u32),
+            payload.len() as u32
+        );
+        assert_eq!(mm.mmio_ascend(handle, &data), MMSYSERR_NOERROR);
+        assert_eq!(mm.mmio_ascend(handle, &riff), MMSYSERR_NOERROR);
+        assert_eq!(mm.mmio_close(handle, 0), MMSYSERR_NOERROR);
+
+        // Re-open read-only and verify the patched sizes.
+        let handle = mm.mmio_open_w(path_str.clone(), MMIO_READ);
+        assert_ne!(handle, 0, "mmioOpen for reading should succeed");
+        let mut chunk = MmioChunkInfo {
+            ckid: FOURCC_RIFF,
+            ..Default::default()
+        };
+        assert_eq!(
+            mm.mmio_descend(handle, &mut chunk, None, MMIO_FIND_RIFF),
+            MMSYSERR_NOERROR
+        );
+        assert_eq!(chunk.ckid, FOURCC_RIFF);
+        assert_eq!(chunk.fcc_type, FOURCC_WAVE);
+        // 8 (RIFF hdr) + 4 (WAVE) + 8 (data hdr) + 32 (payload) - 8 = 44
+        assert_eq!(chunk.cksize, 44, "RIFF cksize must be patched");
+        let mut data = MmioChunkInfo {
+            ckid: FOURCC_DATA,
+            ..Default::default()
+        };
+        assert_eq!(
+            mm.mmio_descend(handle, &mut data, Some(&chunk), MMIO_FIND_CHUNK),
+            MMSYSERR_NOERROR
+        );
+        assert_eq!(data.cksize, 32, "data cksize must be patched");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_mmio_seek_positions() {
+        let mut mm = WinMmSubsystem::new();
+        let path = std::env::temp_dir().join(format!(
+            "casa1-mmio-seek-{}.bin",
+            std::process::id()
+        ));
+        let path_str = path.to_string_lossy().to_string();
+        let handle = mm.mmio_open_w(path_str.clone(), MMIO_WRITE | MMIO_CREATE);
+        assert_ne!(handle, 0);
+        assert_eq!(mm.mmio_write(handle, b"abcdefgh", 8), 8);
+
+        // SEEK_SET
+        assert_eq!(mm.mmio_seek(handle, 2, 0), 2);
+        // SEEK_CUR
+        assert_eq!(mm.mmio_seek(handle, 3, 1), 5);
+        // SEEK_END
+        assert_eq!(mm.mmio_seek(handle, -2, 2), 6);
+        // Negative target fails
+        assert_eq!(mm.mmio_seek(handle, -100, 0), -1);
+        // Unknown origin fails
+        assert_eq!(mm.mmio_seek(handle, 0, 99), -1);
+        // Invalid handle fails
+        assert_eq!(mm.mmio_seek(0xFFFF_FFFF, 0, 0), -1);
+
+        mm.mmio_close(handle, 0);
+        let _ = std::fs::remove_file(&path);
     }
 }

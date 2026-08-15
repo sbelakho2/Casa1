@@ -42,6 +42,14 @@ struct ActiveNote {
     instrument: u8,
     /// True if note-off was received while sustain pedal was held.
     sustained: bool,
+    /// Per-harmonic phase accumulators (one entry per waveform harmonic).
+    /// Updated incrementally so each sample needs a single `sin` per
+    /// harmonic instead of recomputing the full phase from scratch.
+    harmonic_phases: Vec<f64>,
+    /// Phase increment for the fundamental, per sample (radians/sample).
+    phase_increment: f64,
+    /// Current envelope gain: ramps to 1.0 during attack, then decays.
+    envelope: f64,
 }
 
 /// Per-channel state.
@@ -97,9 +105,6 @@ impl MidiSynthesizer {
         let data2 = ((msg >> 16) & 0xFF) as u8;
 
         let channel = status & 0x0F;
-        if channel >= 16 {
-            return;
-        }
 
         match status & 0xF0 {
             MIDI_STATUS_NOTE_OFF => {
@@ -178,9 +183,16 @@ impl MidiSynthesizer {
     /// Note On event.
     pub fn note_on(&mut self, channel: u8, note: u8, velocity: u8) {
         let ch = &mut self.channels[channel as usize];
+        // Retrigger semantics: a repeated note-on for the same note
+        // terminates the previous instance, so note-offs always resolve
+        // cleanly (this also prevents stuck notes when note-ons repeat
+        // while the sustain pedal is held).
+        ch.active_notes.retain(|n| n.note != note);
+
         let frequency = midi_note_to_frequency(note, ch.pitch_bend);
         let amplitude = (velocity as f64 / 127.0) * (ch.volume as f64 / 127.0) * self.master_volume;
         let instrument = ch.instrument;
+        let waveform_len = self.instrument_waveforms[instrument as usize].len();
 
         ch.active_notes.push(ActiveNote {
             channel,
@@ -191,6 +203,9 @@ impl MidiSynthesizer {
             amplitude,
             instrument,
             sustained: false,
+            harmonic_phases: vec![0.0; waveform_len],
+            phase_increment: 2.0 * std::f64::consts::PI * frequency / self.sample_rate as f64,
+            envelope: 0.0,
         });
     }
 
@@ -198,9 +213,9 @@ impl MidiSynthesizer {
     pub fn note_off(&mut self, channel: u8, note: u8) {
         let ch = &mut self.channels[channel as usize];
         if ch.sustain {
-            // Note is sustained — mark it but keep playing
-            // When sustain pedal is released, sustained notes will be removed
-            if let Some(n) = ch.active_notes.iter_mut().find(|n| n.note == note) {
+            // Note is sustained — mark all matching notes but keep playing.
+            // When sustain pedal is released, sustained notes are removed.
+            for n in ch.active_notes.iter_mut().filter(|n| n.note == note) {
                 n.sustained = true;
             }
             return;
@@ -253,6 +268,8 @@ impl MidiSynthesizer {
         for note in &mut ch.active_notes {
             if note.channel == channel {
                 note.frequency = midi_note_to_frequency(note.note, value);
+                note.phase_increment =
+                    2.0 * std::f64::consts::PI * note.frequency / self.sample_rate as f64;
             }
         }
     }
@@ -263,8 +280,16 @@ impl MidiSynthesizer {
         let mut left = vec![0.0f32; num_samples];
         let mut right = vec![0.0f32; num_samples];
 
+        // Per-note synthesis state is advanced incrementally: each note
+        // keeps per-harmonic phase accumulators and an envelope value, so
+        // the hot loop performs a single `sin` per harmonic instead of
+        // recomputing phases and the envelope from scratch per sample.
+        let inv_sample_rate = 1.0 / self.sample_rate as f64;
+        let attack_rate = 1.0 / (0.01 * self.sample_rate as f64); // 10 ms linear attack
+        let decay_factor = (-0.5 * inv_sample_rate).exp(); // exponential decay
+
         for ch_idx in 0..16 {
-            let ch = &self.channels[ch_idx];
+            let ch = &mut self.channels[ch_idx];
             if ch.active_notes.is_empty() {
                 continue;
             }
@@ -274,41 +299,33 @@ impl MidiSynthesizer {
             let pan_left = pan_angle.cos();
             let pan_right = pan_angle.sin();
 
-            for note in &ch.active_notes {
+            for note in &mut ch.active_notes {
                 let waveform = &self.instrument_waveforms[note.instrument as usize];
+                let phases = &mut note.harmonic_phases;
+                let mut env = note.envelope;
                 for i in 0..num_samples {
-                    let t = (note.sample_index + i as u64) as f64 / self.sample_rate as f64;
-                    let phase = 2.0 * std::f64::consts::PI * note.frequency * t;
-
                     // Generate sample using harmonic synthesis
                     let mut sample = 0.0;
                     for (harm_idx, &harm_amp) in waveform.iter().enumerate() {
-                        let harm = (harm_idx + 1) as f64;
-                        sample += (phase * harm).sin() * harm_amp;
+                        sample += phases[harm_idx].sin() * harm_amp;
+                        phases[harm_idx] += note.phase_increment * (harm_idx + 1) as f64;
                     }
 
                     // Normalize
                     sample *= note.amplitude * 0.3;
 
-                    // Apply envelope (simple adsr-like decay)
-                    let note_age = (note.sample_index + i as u64) as f64 / self.sample_rate as f64;
-                    let envelope = if note_age < 0.01 {
-                        note_age / 0.01 // Attack: 10ms
+                    // Incremental envelope (attack ramps to 1.0, then decays)
+                    sample *= env;
+                    if env < 1.0 {
+                        env = (env + attack_rate).min(1.0);
                     } else {
-                        (-note_age * 0.5).exp() // Exponential decay
-                    };
-
-                    sample *= envelope;
+                        env *= decay_factor;
+                    }
 
                     left[i] += (sample * pan_left) as f32;
                     right[i] += (sample * pan_right) as f32;
                 }
-            }
-        }
-
-        // Advance sample indices
-        for ch_idx in 0..16 {
-            for note in &mut self.channels[ch_idx].active_notes {
+                note.envelope = env;
                 note.sample_index += num_samples as u64;
             }
         }
@@ -502,11 +519,9 @@ pub fn midi_out_reset(_handle: MidiHandle) -> AppResult<()> {
     synth.reset();
     // Also send All Notes Off to real CoreMIDI device
     for channel in 0u8..16 {
-        let msg =
-            (0xB0 | (channel & 0x0F)) as u32 | ((MIDI_CTL_ALL_NOTES_OFF as u32) << 8) | (0 << 16);
+        let msg = (0xB0 | (channel & 0x0F)) as u32 | ((MIDI_CTL_ALL_NOTES_OFF as u32) << 8);
         send_to_core_midi(msg);
-        let msg2 =
-            (0xB0 | (channel & 0x0F)) as u32 | ((MIDI_CTL_ALL_SOUND_OFF as u32) << 8) | (0 << 16);
+        let msg2 = (0xB0 | (channel & 0x0F)) as u32 | ((MIDI_CTL_ALL_SOUND_OFF as u32) << 8);
         send_to_core_midi(msg2);
     }
     Ok(())
@@ -611,11 +626,15 @@ mod core_midi {
             out_client: *mut MIDIClientRef,
         ) -> i32;
 
+        pub fn MIDIClientDispose(client: MIDIClientRef) -> i32;
+
         pub fn MIDIOutputPortCreate(
             client: MIDIClientRef,
             port_name: CFStringRef,
             out_port: *mut MIDIPortRef,
         ) -> i32;
+
+        pub fn MIDIPortDispose(port: MIDIPortRef) -> i32;
 
         pub fn MIDISend(
             port: MIDIPortRef,
@@ -635,9 +654,14 @@ mod core_midi {
     }
 
     /// CoreMIDI property IDs.
-    pub const K_MIDI_PROPERTY_DISPLAY_NAME: i32 = 164_416_2816; // 'name'
+    ///
+    /// `kMIDIPropertyDisplayName` is the FourCC `'name'` = 0x6E616D65.
+    pub const K_MIDI_PROPERTY_DISPLAY_NAME: i32 = 0x6E61_6D65; // 'name'
 
     /// Create a CFString from a Rust string.
+    ///
+    /// Returns a +1 retained reference that the caller must release with
+    /// [`CFRelease`], or `null` on failure.
     pub fn cf_string_from_str(s: &str) -> CFStringRef {
         use std::ffi::c_void;
         unsafe {
@@ -651,6 +675,19 @@ mod core_midi {
                 ) -> CFStringRef;
             }
             CFStringCreateWithCString(ptr::null(), s.as_ptr() as *const i8, 0x08000100) // kCFStringEncodingUTF8
+        }
+    }
+
+    /// Release a +1 CoreFoundation object reference.
+    pub fn cf_release(cf: CFStringRef) {
+        unsafe {
+            #[link(name = "CoreFoundation", kind = "framework")]
+            unsafe extern "C" {
+                fn CFRelease(cf: *const std::ffi::c_void);
+            }
+            if !cf.is_null() {
+                CFRelease(cf);
+            }
         }
     }
 }
@@ -676,6 +713,9 @@ impl CoreMidiOutput {
         unsafe {
             let mut client: core_midi::MIDIClientRef = 0;
             let client_name = core_midi::cf_string_from_str("Casa1 MIDI Client");
+            if client_name.is_null() {
+                return Err("CFStringCreateWithCString failed".to_string());
+            }
 
             let status = core_midi::MIDIClientCreate(
                 client_name,
@@ -683,6 +723,7 @@ impl CoreMidiOutput {
                 std::ptr::null_mut(),
                 &mut client,
             );
+            core_midi::cf_release(client_name);
 
             if status != 0 {
                 return Err(format!("MIDIClientCreate failed with status {status}"));
@@ -690,10 +731,16 @@ impl CoreMidiOutput {
 
             let mut port: core_midi::MIDIPortRef = 0;
             let port_name = core_midi::cf_string_from_str("Casa1 MIDI Output");
+            if port_name.is_null() {
+                core_midi::MIDIClientDispose(client);
+                return Err("CFStringCreateWithCString failed".to_string());
+            }
 
             let status = core_midi::MIDIOutputPortCreate(client, port_name, &mut port);
+            core_midi::cf_release(port_name);
 
             if status != 0 {
+                core_midi::MIDIClientDispose(client);
                 return Err(format!("MIDIOutputPortCreate failed with status {status}"));
             }
 
@@ -732,7 +779,6 @@ impl CoreMidiOutput {
             // Read the CFString as a C string
             #[link(name = "CoreFoundation", kind = "framework")]
             unsafe extern "C" {
-                fn CFStringGetLength(the_string: core_midi::CFStringRef) -> isize;
                 fn CFStringGetCStringPtr(
                     the_string: core_midi::CFStringRef,
                     encoding: u32,
@@ -740,12 +786,16 @@ impl CoreMidiOutput {
             }
 
             let c_ptr = CFStringGetCStringPtr(name_ref, 0x08000100); // kCFStringEncodingUTF8
-            if c_ptr.is_null() {
-                return format!("MIDI Endpoint {endpoint}");
-            }
-            std::ffi::CStr::from_ptr(c_ptr)
-                .to_string_lossy()
-                .into_owned()
+            let name = if c_ptr.is_null() {
+                format!("MIDI Endpoint {endpoint}")
+            } else {
+                std::ffi::CStr::from_ptr(c_ptr)
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            // MIDIObjectGetStringProperty returns a +1 reference; release it.
+            core_midi::cf_release(name_ref);
+            name
         }
     }
 
@@ -843,8 +893,12 @@ impl CoreMidiOutput {
 #[cfg(target_os = "macos")]
 impl Drop for CoreMidiOutput {
     fn drop(&mut self) {
-        // CoreMIDI handles cleanup when the client is released.
-        // We don't need explicit cleanup as the handles are just u64 IDs.
+        // CoreMIDI client/port handles are opaque retained objects; they
+        // must be explicitly disposed. Ports first, then the client.
+        unsafe {
+            core_midi::MIDIPortDispose(self.port);
+            core_midi::MIDIClientDispose(self.client);
+        }
     }
 }
 
@@ -921,9 +975,13 @@ impl CoreMidiInput {
         unsafe {
             let mut client: core_midi::MIDIClientRef = 0;
             let client_name = core_midi::cf_string_from_str("Casa1 MIDI Input");
+            if client_name.is_null() {
+                return Err("CFStringCreateWithCString failed".to_string());
+            }
 
             let status =
                 core_midi::MIDIClientCreate(client_name, None, std::ptr::null_mut(), &mut client);
+            core_midi::cf_release(client_name);
 
             if status != 0 {
                 return Err(format!("MIDIClientCreate failed with status {status}"));
@@ -931,6 +989,10 @@ impl CoreMidiInput {
 
             let mut port: core_midi::MIDIPortRef = 0;
             let port_name = core_midi::cf_string_from_str("Casa1 MIDI Input Port");
+            if port_name.is_null() {
+                core_midi::MIDIClientDispose(client);
+                return Err("CFStringCreateWithCString failed".to_string());
+            }
 
             // The read proc callback stores received messages in the global buffer
             let read_proc: core_midi::MIDIReadProc = Some(midi_input_read_proc);
@@ -942,8 +1004,10 @@ impl CoreMidiInput {
                 std::ptr::null_mut(),
                 &mut port,
             );
+            core_midi::cf_release(port_name);
 
             if status != 0 {
+                core_midi::MIDIClientDispose(client);
                 return Err(format!("MIDIInputPortCreate failed with status {status}"));
             }
 
@@ -1002,6 +1066,20 @@ impl CoreMidiInput {
     }
 }
 
+#[cfg(target_os = "macos")]
+impl Drop for CoreMidiInput {
+    fn drop(&mut self) {
+        // Disconnect sources and dispose the opaque CoreMIDI objects.
+        unsafe {
+            for &source in &self.sources {
+                core_midi_input::MIDIPortDisconnectSource(self.port, source);
+            }
+            core_midi::MIDIPortDispose(self.port);
+            core_midi::MIDIClientDispose(self.client);
+        }
+    }
+}
+
 // Global buffer for received MIDI messages from CoreMIDI input.
 #[cfg(target_os = "macos")]
 lazy_static::lazy_static! {
@@ -1011,6 +1089,12 @@ lazy_static::lazy_static! {
 /// CoreMIDI input read callback.
 ///
 /// Parses `MIDIPacketList` and stores received messages in the global buffer.
+///
+/// # Safety
+///
+/// Packets are 4-byte aligned in memory while `MIDIPacket` requires 8-byte
+/// alignment, so all field reads use `read_unaligned` instead of forming
+/// references.
 #[cfg(target_os = "macos")]
 unsafe extern "C" fn midi_input_read_proc(
     pktlist: *const core_midi::MIDIPacketList,
@@ -1025,26 +1109,20 @@ unsafe extern "C" fn midi_input_read_proc(
         let num_packets = (*pktlist).num_packets;
         let mut messages = Vec::with_capacity(num_packets as usize);
 
-        let packet = &(*pktlist).packet[0];
-        let mut packet_ptr = packet as *const core_midi::MIDIPacket;
+        // The first packet is 8-byte aligned (it follows the u32 count with
+        // padding); subsequent packets are only 4-byte aligned, so every
+        // field is read unaligned.
+        let first = &(*pktlist).packet[0];
+        let mut packet_ptr = first as *const core_midi::MIDIPacket as *const u8;
         for _ in 0..num_packets {
-            if packet_ptr.is_null() {
-                break;
-            }
-            let pkt = &*packet_ptr;
-            let len = pkt.length as usize;
+            let timestamp = std::ptr::read_unaligned(packet_ptr as *const u64);
+            let len = std::ptr::read_unaligned(packet_ptr.add(8) as *const u16) as usize;
             if len > 0 && len <= 256 {
-                let data = pkt.data[..len].to_vec();
-                messages.push(ReceivedMidiMessage {
-                    data,
-                    timestamp: pkt.timestamp,
-                });
+                let data = std::slice::from_raw_parts(packet_ptr.add(10), len).to_vec();
+                messages.push(ReceivedMidiMessage { data, timestamp });
             }
-            // Advance to next packet
-            packet_ptr = ((packet_ptr as *const u8)
-                .wrapping_add(std::mem::size_of::<u64>() + std::mem::size_of::<u16>())
-                .wrapping_add((pkt.length as usize + 3) & !3))
-                as *const core_midi::MIDIPacket;
+            // Advance to next packet (10-byte header + 4-byte aligned data)
+            packet_ptr = packet_ptr.add(10 + ((len + 3) & !3));
         }
 
         // Store messages in the global buffer
@@ -1181,8 +1259,11 @@ pub struct MidiStreamPlayer {
     tempo_us_per_beat: u32,
     /// The time division (ticks per quarter note, default 480).
     time_division: u16,
-    /// Queued MIDI events with their absolute tick positions.
-    event_queue: Vec<(u32, u32)>, // (absolute_tick, midi_msg)
+    /// Queued MIDI events with their absolute tick positions, kept sorted
+    /// by tick so due events can be drained from the front in O(1) amortized.
+    event_queue: std::collections::VecDeque<(u32, u32)>, // (absolute_tick, midi_msg)
+    /// Whether `event_queue` is known to be sorted by tick.
+    events_sorted: bool,
     /// Current tick position.
     current_tick: u32,
     /// Total number of samples generated.
@@ -1198,7 +1279,8 @@ impl MidiStreamPlayer {
             paused: false,
             tempo_us_per_beat: 500000, // 120 BPM
             time_division: 480,
-            event_queue: Vec::new(),
+            event_queue: std::collections::VecDeque::new(),
+            events_sorted: true,
             current_tick: 0,
             total_samples: 0,
         }
@@ -1256,12 +1338,14 @@ impl MidiStreamPlayer {
     /// `dwOffset` style). We convert to absolute ticks internally.
     pub fn queue_event(&mut self, delta_ticks: u32, msg: u32) {
         let absolute_tick = self.current_tick + delta_ticks;
-        self.event_queue.push((absolute_tick, msg));
+        self.event_queue.push_back((absolute_tick, msg));
+        self.events_sorted = false;
     }
 
     /// Queue a MIDI event with an absolute tick position.
     pub fn queue_event_absolute(&mut self, tick: u32, msg: u32) {
-        self.event_queue.push((tick, msg));
+        self.event_queue.push_back((tick, msg));
+        self.events_sorted = false;
     }
 
     /// Get the current stream position (midiStreamPosition).
@@ -1275,8 +1359,10 @@ impl MidiStreamPlayer {
         } else {
             0
         };
-        // Song pointer position (in 16th notes)
-        let song_ptr = ticks / (self.time_division.max(1) as u32 / 4);
+        // Song pointer position (in 16th notes; a quarter note is
+        // time_division/4 ticks). Guard against tiny time divisions that
+        // would make the divisor zero.
+        let song_ptr = ticks / ((self.time_division as u32 / 4).max(1));
         MidiStreamPosition {
             ticks,
             ms,
@@ -1315,20 +1401,24 @@ impl MidiStreamPlayer {
             return (vec![0.0; num_samples], vec![0.0; num_samples]);
         }
 
-        // Process any due events
-        let events_to_process: Vec<u32> = self
+        // Ensure the queue is sorted so due events can be drained from the
+        // front instead of scanning the whole queue on every call.
+        if !self.events_sorted && !self.event_queue.is_empty() {
+            self.event_queue.make_contiguous().sort_unstable();
+        }
+        self.events_sorted = true;
+
+        // Process all due events
+        while self
             .event_queue
-            .iter()
-            .filter(|(tick, _)| *tick <= self.current_tick)
-            .map(|(_, msg)| *msg)
-            .collect();
-
-        // Remove processed events
-        self.event_queue
-            .retain(|(tick, _)| *tick > self.current_tick);
-
-        // Process events through the synthesizer
-        for msg in events_to_process {
+            .front()
+            .is_some_and(|&(tick, _)| tick <= self.current_tick)
+        {
+            // SAFETY: the guard above guarantees the queue is non-empty.
+            let (_, msg) = self
+                .event_queue
+                .pop_front()
+                .expect("queue front verified by guard above");
             self.synth.process_short_msg(msg);
             // Also send to CoreMIDI
             send_to_core_midi(msg);
@@ -1358,6 +1448,7 @@ impl MidiStreamPlayer {
     /// Clear all queued events.
     pub fn clear_events(&mut self) {
         self.event_queue.clear();
+        self.events_sorted = true;
     }
 }
 
@@ -1376,10 +1467,10 @@ lazy_static::lazy_static! {
 /// internal synthesizer.
 #[cfg(target_os = "macos")]
 pub fn send_to_core_midi(msg: u32) -> bool {
-    if let Ok(output) = CORE_MIDI_OUTPUT.lock() {
-        if let Some(ref midi_out) = *output {
-            return midi_out.send_short_msg(msg).is_ok();
-        }
+    if let Ok(output) = CORE_MIDI_OUTPUT.lock()
+        && let Some(ref midi_out) = *output
+    {
+        return midi_out.send_short_msg(msg).is_ok();
     }
     false
 }
@@ -1393,10 +1484,10 @@ pub fn send_to_core_midi(_msg: u32) -> bool {
 /// Send a MIDI long message (SysEx) to the real CoreMIDI device (if available).
 #[cfg(target_os = "macos")]
 pub fn send_sysex_to_core_midi(data: &[u8]) -> bool {
-    if let Ok(output) = CORE_MIDI_OUTPUT.lock() {
-        if let Some(ref midi_out) = *output {
-            return midi_out.send_long_msg(data).is_ok();
-        }
+    if let Ok(output) = CORE_MIDI_OUTPUT.lock()
+        && let Some(ref midi_out) = *output
+    {
+        return midi_out.send_long_msg(data).is_ok();
     }
     false
 }
@@ -1491,7 +1582,7 @@ mod tests {
         let mut synth = MidiSynthesizer::new(44100);
         let msg_on = 0x90u32 | (60u32 << 8) | (100u32 << 16);
         synth.process_short_msg(msg_on);
-        let msg_off = 0x80u32 | (60u32 << 8) | (0u32 << 16);
+        let msg_off = 0x80u32 | (60u32 << 8);
         synth.process_short_msg(msg_off);
         assert!(synth.channels[0].active_notes.is_empty());
     }
@@ -1536,6 +1627,25 @@ mod tests {
         synth.control_change(0, MIDI_CTL_SUSTAIN, 0); // Release sustain
         // Note should now be removed
         assert!(synth.channels[0].active_notes.is_empty());
+    }
+
+    #[test]
+    fn test_sustain_duplicate_note_on_does_not_stick() {
+        // A repeated note-on for an already-playing note retriggers it; with
+        // the sustain pedal held, releasing the pedal must not leave a
+        // stuck note behind.
+        let mut synth = MidiSynthesizer::new(44100);
+        synth.note_on(0, 60, 100);
+        synth.control_change(0, MIDI_CTL_SUSTAIN, 127); // Press sustain
+        synth.note_on(0, 60, 80); // Duplicate note-on (retrigger)
+        assert_eq!(synth.channels[0].active_notes.len(), 1);
+        synth.note_off(0, 60); // Release note
+        assert_eq!(synth.channels[0].active_notes.len(), 1); // still sustained
+        synth.control_change(0, MIDI_CTL_SUSTAIN, 0); // Release sustain
+        assert!(
+            synth.channels[0].active_notes.is_empty(),
+            "sustain release should remove the retriggered note"
+        );
     }
 
     #[test]
@@ -1591,7 +1701,7 @@ mod tests {
         // SysEx with a large payload (e.g., 4096 bytes)
         let mut synth = MidiSynthesizer::new(44100);
         let mut data = vec![0xF0u8];
-        data.extend(std::iter::repeat(0x41u8).take(4096));
+        data.extend(std::iter::repeat_n(0x41u8, 4096));
         data.push(0xF7);
         synth.process_long_msg(&data);
         // Should not panic
@@ -1643,7 +1753,7 @@ mod tests {
         assert_eq!(synth.channels[0].active_notes.len(), 1);
 
         // Note On with velocity 0 should act as Note Off
-        let msg = 0x90u32 | (60u32 << 8) | (0u32 << 16);
+        let msg = 0x90u32 | (60u32 << 8);
         synth.process_short_msg(msg);
         assert!(
             synth.channels[0].active_notes.is_empty(),

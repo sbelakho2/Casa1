@@ -95,6 +95,8 @@ struct QueuedBuffer {
     loop_length: Option<usize>,
     loop_count: u32,
     played_loops: u32,
+    /// Set by `exit_loop` to stop an otherwise-infinite loop.
+    loop_disabled: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -113,6 +115,15 @@ enum VoiceKind {
     },
 }
 
+/// Cheap discriminant of [`VoiceKind`] used to avoid cloning the full kind
+/// (which owns the sample queue) on every render pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VoiceKindTag {
+    Mastering,
+    Submix,
+    Source,
+}
+
 #[derive(Debug, Clone)]
 struct VoiceRecord {
     format: WaveFormat,
@@ -124,6 +135,9 @@ struct VoiceRecord {
     kind: VoiceKind,
     /// Effects chain for this voice (applied during rendering).
     effects_chain: VoiceEffectsChain,
+    /// Cached child voice IDs (voices whose destination is this voice),
+    /// maintained on create/destroy so renders avoid scanning all voices.
+    children: Vec<VoiceId>,
 }
 
 #[derive(Debug, Clone)]
@@ -153,6 +167,20 @@ pub const DSBCAPS_GETCURRENTPOSITION2: u32 = 0x0001_0000;
 
 /// Default DirectSound buffer size in bytes.
 const DSBUFFER_DEFAULT_SIZE: usize = 4096;
+
+/// Upper bound for a single DirectSound buffer allocation (64 MiB), to keep
+/// guest-supplied sizes from triggering multi-GB allocations.
+const MAX_DS_BUFFER_BYTES: usize = 64 * 1024 * 1024;
+
+/// Upper bound for a single render request (1M frames ≈ 21 s at 48 kHz).
+const MAX_RENDER_FRAMES: usize = 1_000_000;
+
+/// Upper bound for the host-side capture buffer (1 MiB ≈ 5.5 s of stereo
+/// 16-bit audio at 48 kHz).
+const MAX_CAPTURE_BUFFER_BYTES: usize = 1 << 20;
+
+/// Cap for the `notifications` / `latency_log` diagnostic logs.
+const MAX_LOG_ENTRIES: usize = 10_000;
 
 /// A single position notification entry (mirrors DSBPOSITIONNOTIFY).
 #[derive(Debug, Clone)]
@@ -188,6 +216,8 @@ struct LockedRegion {
 #[derive(Debug, Clone)]
 struct DirectSoundBufferRecord {
     device_id: DeviceId,
+    /// The `IDirectSound8` object that owns this buffer (for listener lookup).
+    direct_sound_id: DirectSoundId,
     format: WaveFormat,
     /// Interleaved f32 sample data.
     samples: Vec<f32>,
@@ -494,7 +524,7 @@ impl AudioSubsystem {
                 plugged: true,
             },
         );
-        self.notifications.push(format!("device_added:{id}:{name}"));
+        self.push_notification(format!("device_added:{id}:{name}"));
         id
     }
 
@@ -502,7 +532,7 @@ impl AudioSubsystem {
         let record = self.device_mut(device)?;
         record.plugged = false;
         record.info.is_default = false;
-        self.notifications.push(format!("device_removed:{device}"));
+        self.push_notification(format!("device_removed:{device}"));
         if self.default_device == device {
             let replacement = self
                 .devices
@@ -530,8 +560,7 @@ impl AudioSubsystem {
             new_default.info.is_default = true;
         }
         self.default_device = device;
-        self.notifications
-            .push(format!("default_changed:{old_default}->{device}"));
+        self.push_notification(format!("default_changed:{old_default}->{device}"));
 
         let active_mastering = self
             .voices
@@ -542,15 +571,13 @@ impl AudioSubsystem {
             })
             .collect::<Vec<_>>();
         if !active_mastering.is_empty() {
-            self.notifications
-                .push(format!("playback_stop:{old_default}"));
+            self.push_notification(format!("playback_stop:{old_default}"));
             for voice_id in active_mastering {
                 if let VoiceKind::Mastering { device_id } = &mut self.voice_mut(voice_id)?.kind {
                     *device_id = device;
                 }
             }
-            self.notifications
-                .push(format!("playback_recover:{device}"));
+            self.push_notification(format!("playback_recover:{device}"));
         }
 
         for client in self.audio_clients.values_mut() {
@@ -587,6 +614,7 @@ impl AudioSubsystem {
                 volume: 1.0,
                 frequency_ratio: 1.0,
                 effects_chain: VoiceEffectsChain::new(),
+                children: Vec::new(),
             },
         );
         Ok(id)
@@ -614,8 +642,13 @@ impl AudioSubsystem {
                 volume: 1.0,
                 frequency_ratio: 1.0,
                 effects_chain: VoiceEffectsChain::new(),
+                children: Vec::new(),
             },
         );
+        // Cache this voice as a child of its destination.
+        if let Some(parent) = self.voices.get_mut(&destination) {
+            parent.children.push(id);
+        }
         Ok(id)
     }
 
@@ -642,8 +675,13 @@ impl AudioSubsystem {
                 volume: 1.0,
                 effects_chain: VoiceEffectsChain::new(),
                 frequency_ratio: 1.0,
+                children: Vec::new(),
             },
         );
+        // Cache this voice as a child of its destination.
+        if let Some(parent) = self.voices.get_mut(&destination) {
+            parent.children.push(id);
+        }
         Ok(id)
     }
 
@@ -710,10 +748,27 @@ impl AudioSubsystem {
             source_format.sample_rate,
             destination_rate,
         );
-        let frame_count = resampled.len() / source_format.channels as usize;
+        let channels = source_format.channels as usize;
+        let frame_count = resampled.len() / channels;
+        if frame_count == 0 {
+            // An empty buffer with loop parameters would spin forever in the
+            // render loop (cursor >= frames is always true); reject it.
+            return Err(AppError::new(
+                ReasonCode::RcAudioUnsupported,
+                "cannot submit an empty source buffer",
+            ));
+        }
         let src_to_dst_ratio = destination_rate as f64 / source_format.sample_rate as f64;
-        let loop_begin_frame = loop_begin.map(|lb| (lb as f64 * src_to_dst_ratio) as usize);
-        let loop_length_frames = loop_length.map(|ll| (ll as f64 * src_to_dst_ratio) as usize);
+        // XAudio2 loop points are in samples (per channel); convert them to
+        // frames and clamp into the buffer so the render loop can never
+        // rewind to a position at/after the end of the data.
+        let loop_begin_frame = loop_begin
+            .map(|lb| ((lb as f64 * src_to_dst_ratio) / channels as f64) as usize)
+            .map(|lb| lb.min(frame_count.saturating_sub(1)));
+        let loop_length_frames = loop_length.map(|ll| {
+            (((ll as f64 * src_to_dst_ratio) / channels as f64) as usize)
+                .min(frame_count.saturating_sub(loop_begin_frame.unwrap_or(0)))
+        });
         let record = self.voice_mut(voice)?;
         match &mut record.kind {
             VoiceKind::Source { queue, .. } => queue.push_back(QueuedBuffer {
@@ -725,6 +780,7 @@ impl AudioSubsystem {
                 loop_length: loop_length_frames,
                 loop_count: loop_count.unwrap_or(0),
                 played_loops: 0,
+                loop_disabled: false,
             }),
             _ => {
                 return Err(AppError::new(
@@ -753,6 +809,18 @@ impl AudioSubsystem {
         let children = self.child_voice_ids(voice);
         for child in children {
             self.destroy_voice(child)?;
+        }
+        // Unlink this voice from its parent's cached child list.
+        let parent_id = self.voices.get(&voice).and_then(|record| match record.kind {
+            VoiceKind::Submix { destination, .. } | VoiceKind::Source { destination, .. } => {
+                Some(destination)
+            }
+            _ => None,
+        });
+        if let Some(parent_id) = parent_id
+            && let Some(parent) = self.voices.get_mut(&parent_id)
+        {
+            parent.children.retain(|&child| child != voice);
         }
         self.voices.remove(&voice).map(|_| ()).ok_or_else(|| {
             AppError::new(
@@ -834,8 +902,11 @@ impl AudioSubsystem {
         match &mut record.kind {
             VoiceKind::Source { queue, .. } => {
                 if let Some(buffer) = queue.front_mut() {
+                    // `loop_count == 0` means "loop forever", so it cannot
+                    // be used to disable looping; use an explicit flag.
+                    buffer.loop_disabled = true;
                     buffer.loop_count = 0;
-                    buffer.played_loops = buffer.loop_count;
+                    buffer.played_loops = 0;
                 }
                 Ok(())
             }
@@ -893,6 +964,7 @@ impl AudioSubsystem {
     }
 
     pub fn render_xaudio2(&mut self, mastering: VoiceId, frames: usize) -> AppResult<RenderOutput> {
+        Self::check_render_frames(frames)?;
         if !matches!(self.voice(mastering)?.kind, VoiceKind::Mastering { .. }) {
             return Err(AppError::new(
                 ReasonCode::RcAudioUnsupported,
@@ -917,7 +989,7 @@ impl AudioSubsystem {
             }
         };
         let latency_ms = measure_latency_ms(self.voice(mastering)?.format.sample_rate, frames);
-        self.latency_log.push(LatencyRecord {
+        self.push_latency_record(LatencyRecord {
             subsystem: "xaudio2".to_string(),
             device_id,
             measured_ms: latency_ms,
@@ -1064,6 +1136,7 @@ impl AudioSubsystem {
         client: AudioClientId,
         frames: usize,
     ) -> AppResult<RenderOutput> {
+        Self::check_render_frames(frames)?;
         let record = self.audio_client_mut(client)?;
         let channels = record.format.channels as usize;
         let mut samples = Vec::with_capacity(frames * channels);
@@ -1086,7 +1159,7 @@ impl AudioSubsystem {
         let device_id = record.device_id;
         let overflow_frames = record.overflow_frames;
         let underflow_frames = record.underflow_frames;
-        self.latency_log.push(LatencyRecord {
+        self.push_latency_record(LatencyRecord {
             subsystem: "wasapi".to_string(),
             device_id,
             measured_ms: latency_ms,
@@ -1163,14 +1236,18 @@ impl AudioSubsystem {
             .device_id;
         let id = self.alloc_id();
 
+        // Clamp guest-supplied sizes so a single hostile call cannot trigger
+        // a multi-GB allocation.
         let effective_size = if buffer_size_bytes > 0 {
-            buffer_size_bytes
+            buffer_size_bytes.min(MAX_DS_BUFFER_BYTES)
         } else {
             DSBUFFER_DEFAULT_SIZE
         };
-        // Convert bytes to frames then to f32 samples
-        let channels = format.channels as usize;
-        let frame_count = effective_size / (channels * 4); // f32 = 4 bytes
+        // Convert bytes to frames then to f32 samples (f32 = 4 bytes).
+        // Primary buffers skip format validation, so defend against a
+        // zero-channel format here.
+        let channels = (format.channels as usize).max(1);
+        let frame_count = effective_size / (channels * 4);
         let sample_count = frame_count * channels;
 
         self.direct_sound_buffers.insert(
@@ -1179,6 +1256,7 @@ impl AudioSubsystem {
                 cursor: 0,
                 write_cursor: 0,
                 device_id,
+                direct_sound_id: direct_sound,
                 format: format.clone(),
                 playing: false,
                 looping: false,
@@ -1252,10 +1330,19 @@ impl AudioSubsystem {
                 "DirectSound buffer is lost",
             ));
         }
-        let end = offset_samples + samples.len();
+        // Reject writes that overflow the buffer (or the address space)
+        // instead of panicking or growing the buffer without bound.
+        let end = offset_samples.checked_add(samples.len()).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcAudioUnsupported,
+                "DirectSound write offset overflow",
+            )
+        })?;
         if end > record.samples.len() {
-            // Extend the buffer
-            record.samples.resize(end, 0.0);
+            return Err(AppError::new(
+                ReasonCode::RcAudioUnsupported,
+                "DirectSound write exceeds buffer capacity",
+            ));
         }
         record.samples[offset_samples..end].copy_from_slice(samples);
         Ok(())
@@ -1283,24 +1370,32 @@ impl AudioSubsystem {
         }
         let _channels = record.format.channels as usize;
         let buffer_bytes = record.samples.len() * 4;
+        if buffer_bytes == 0 {
+            return Ok((0, 0, 0, 0));
+        }
+
+        // DirectSound Lock wraps offsets beyond the buffer end (modulo),
+        // so no arithmetic below can underflow for guest-controlled input.
+        let offset_bytes = offset_bytes % buffer_bytes;
 
         // Determine lock region
-        let (offset1, length1, offset2, length2) = if offset_bytes + length_bytes <= buffer_bytes {
-            // Single region (no wrap)
-            (offset_bytes, length_bytes, 0, 0)
-        } else {
-            // Wrap-around: two regions
-            let first_len = buffer_bytes - offset_bytes;
-            let second_len = length_bytes - first_len;
-            (offset_bytes, first_len, 0, second_len)
-        };
+        let (offset1, length1, offset2, length2) =
+            if offset_bytes.saturating_add(length_bytes) <= buffer_bytes {
+                // Single region (no wrap)
+                (offset_bytes, length_bytes, 0, 0)
+            } else {
+                // Wrap-around: two regions
+                let first_len = buffer_bytes - offset_bytes;
+                let second_len = length_bytes.saturating_sub(first_len);
+                (offset_bytes, first_len, 0, second_len)
+            };
 
         // Store the locked region
         record.locked_regions.push(LockedRegion {
             offset: offset1 / 4,
-            length1: length1,
+            length1,
             offset2: offset2 / 4,
-            length2: length2,
+            length2,
         });
 
         Ok((offset1, length1, offset2, length2))
@@ -1332,6 +1427,9 @@ impl AudioSubsystem {
         }
         record.playing = true;
         record.looping = (flags & 0x00000001) != 0; // DSBPLAY_LOOPING
+        // Re-arm DSBPN_OFFSETSTOP (u32::MAX) so it fires again on the next
+        // stop; ordinary offsets are re-armed on wrap-around.
+        record.fired_notifications.retain(|&offset| offset != u32::MAX);
         Ok(())
     }
 
@@ -1365,7 +1463,7 @@ impl AudioSubsystem {
                 "DirectSound buffer is lost",
             ));
         }
-        if !record.caps & DSBCAPS_CTRLVOLUME != 0 {
+        if record.caps & DSBCAPS_CTRLVOLUME == 0 {
             return Err(AppError::new(
                 ReasonCode::RcAudioUnsupported,
                 "buffer does not support volume control",
@@ -1511,7 +1609,7 @@ impl AudioSubsystem {
         notifies: Vec<DsPositionNotify>,
     ) -> AppResult<()> {
         let record = self.direct_sound_buffer_mut(buffer)?;
-        if !record.caps & DSBCAPS_CTRLPOSITIONNOTIFY != 0 {
+        if record.caps & DSBCAPS_CTRLPOSITIONNOTIFY == 0 {
             return Err(AppError::new(
                 ReasonCode::RcAudioUnsupported,
                 "buffer does not support position notification",
@@ -1559,12 +1657,11 @@ impl AudioSubsystem {
             }
         }
 
-        // Reset fired notifications when we wrap around
+        // Reset fired notifications when we wrap around; DSBPN_OFFSETSTOP
+        // (u32::MAX) is re-armed separately when playback (re)starts.
         let buffer_bytes = record.buffer_size_bytes as u32;
         if current_byte < buffer_bytes / 2 {
-            record
-                .fired_notifications
-                .retain(|&offset| offset == u32::MAX);
+            record.fired_notifications.clear();
         }
 
         Ok(events)
@@ -1709,8 +1806,9 @@ impl AudioSubsystem {
         buffer: DirectSoundBufferId,
         frames: usize,
     ) -> AppResult<RenderOutput> {
+        Self::check_render_frames(frames)?;
         // ── Gather immutable state before mutating ──────────────────────
-        let (channels, sample_rate, device_id, volume_db, pan_db, frequency, looping, is_lost) = {
+        let (channels, sample_rate, device_id, direct_sound_id, volume_db, pan_db, frequency, looping, is_lost) = {
             let record = self.direct_sound_buffers.get(&buffer).ok_or_else(|| {
                 AppError::new(
                     ReasonCode::RcAudioUnsupported,
@@ -1721,6 +1819,7 @@ impl AudioSubsystem {
                 record.format.channels as usize,
                 record.format.sample_rate,
                 record.device_id,
+                record.direct_sound_id,
                 record.volume_db,
                 record.pan_db,
                 record.frequency,
@@ -1741,21 +1840,18 @@ impl AudioSubsystem {
             });
         }
 
-        // Find the DirectSound object that owns this buffer (for listener lookup).
-        let ds_id = self
-            .direct_sound
-            .iter()
-            .find(|(_, ds)| ds.device_id == device_id)
-            .map(|(id, _)| *id);
-
-        // Retrieve 3D state (defaults if unset).
+        // Retrieve 3D state from the owning DirectSound object (each buffer
+        // records its owner at creation, so the listener of the wrong object
+        // is never applied).
         let ds3d_state = self
             .ds3d_buffer_states
             .get(&buffer)
             .cloned()
             .unwrap_or_default();
-        let listener = ds_id
-            .and_then(|id| self.ds3d_listener_state.get(&id).cloned())
+        let listener = self
+            .ds3d_listener_state
+            .get(&direct_sound_id)
+            .cloned()
             .unwrap_or_default();
 
         // Pre-compute volume/pan gains
@@ -1767,11 +1863,7 @@ impl AudioSubsystem {
 
         // ── Generate raw samples (now we can mutably borrow) ────────────
         let record = self.direct_sound_buffer_mut(buffer)?;
-        let total_frames = if channels > 0 {
-            record.samples.len() / channels
-        } else {
-            0
-        };
+        let total_frames = record.samples.len().checked_div(channels).unwrap_or(0);
         let mut samples = Vec::with_capacity(frames * channels);
         let mut fractional_cursor = record.cursor as f64;
 
@@ -1789,7 +1881,7 @@ impl AudioSubsystem {
                 // Handle looping or stopping at end
                 if new_frame >= total_frames {
                     if looping {
-                        fractional_cursor = fractional_cursor % total_frames as f64;
+                        fractional_cursor %= total_frames as f64;
                     } else {
                         record.playing = false;
                         record.cursor = total_frames;
@@ -1799,9 +1891,7 @@ impl AudioSubsystem {
                 }
             } else {
                 // Silence for non-playing or past-end
-                for _ in 0..channels {
-                    samples.push(0.0);
-                }
+                samples.extend(std::iter::repeat_n(0.0, channels));
             }
         }
 
@@ -1810,9 +1900,7 @@ impl AudioSubsystem {
         record.write_cursor = record.cursor;
 
         // Fill remaining silence if we stopped early
-        while samples.len() < frames * channels {
-            samples.push(0.0);
-        }
+        samples.extend(std::iter::repeat_n(0.0, frames * channels - samples.len()));
 
         let latency_ms = measure_latency_ms(sample_rate, frames);
 
@@ -1844,20 +1932,17 @@ impl AudioSubsystem {
             // reads it via IDirectSound3DBuffer8::GetFrequency.
             let _frequency_ratio = compute_doppler_shift(&ds3d_state, &listener);
 
-            // Channel panning: project the buffer position relative to the
-            // listener and pan between left/right based on the azimuth angle.
+            // Channel panning: HRTF gains (interaural level + time
+            // difference) computed from the buffer position relative to
+            // the listener.
             if channels >= 2 {
-                let pan = compute_channel_pan(&ds3d_state, &listener);
-                // pan is in [-1, 1]; -1 = full left, +1 = full right
+                let (left_gain, right_gain) = compute_hrtf_gains(&ds3d_state, &listener);
                 for frame in 0..frames {
                     let base = frame * channels;
                     // Apply distance & cone volume to all channels
                     for ch in 0..channels {
                         samples[base + ch] *= volume_multiplier;
                     }
-                    // Stereo pan for the first two channels
-                    let left_gain = (1.0 - pan) * 0.5;
-                    let right_gain = (1.0 + pan) * 0.5;
                     samples[base] *= left_gain;
                     if channels > 1 {
                         samples[base + 1] *= right_gain;
@@ -1871,7 +1956,7 @@ impl AudioSubsystem {
             }
         }
 
-        self.latency_log.push(LatencyRecord {
+        self.push_latency_record(LatencyRecord {
             subsystem: "directsound".to_string(),
             device_id,
             measured_ms: latency_ms,
@@ -1894,24 +1979,32 @@ impl AudioSubsystem {
         callbacks: &mut Vec<VoiceCallbackEvent>,
         underflow_frames: &mut u32,
     ) -> AppResult<Vec<f32>> {
-        let (format, started, volume, channel_volumes, kind_snapshot, effects_chain) = {
+        // Snapshot only cheap scalars up front; the full `kind` (which owns
+        // the sample queue) is never cloned, and the effects chain is
+        // applied through a short-lived borrow after recursion.
+        let (channels, sample_rate, volume, started, kind_tag, reverb_mix) = {
             let record = self.voice(voice)?;
             (
-                record.format.clone(),
-                record.started,
+                record.format.channels as usize,
+                record.format.sample_rate,
                 record.volume,
-                record.channel_volumes.clone(),
-                record.kind.clone(),
-                record.effects_chain.clone(),
+                record.started,
+                match record.kind {
+                    VoiceKind::Mastering { .. } => VoiceKindTag::Mastering,
+                    VoiceKind::Submix { .. } => VoiceKindTag::Submix,
+                    VoiceKind::Source { .. } => VoiceKindTag::Source,
+                },
+                match record.kind {
+                    VoiceKind::Submix { reverb_mix, .. } => reverb_mix,
+                    _ => 0.0,
+                },
             )
         };
-        let channels = format.channels as usize;
-        let sample_rate = format.sample_rate;
         if !started {
             return Ok(vec![0.0; frames * channels]);
         }
-        let mut mix = match kind_snapshot {
-            VoiceKind::Mastering { .. } => {
+        let mut mix = match kind_tag {
+            VoiceKindTag::Mastering => {
                 let child_ids = self.child_voice_ids(voice);
                 let mut mix = vec![0.0; frames * channels];
                 for child in child_ids {
@@ -1920,10 +2013,9 @@ impl AudioSubsystem {
                     let projected = self.project_to_parent(child, &child_mix, channels)?;
                     mix_in_place(&mut mix, &projected);
                 }
-                apply_levels(&mut mix, channels, volume, &channel_volumes);
                 mix
             }
-            VoiceKind::Submix { reverb_mix, .. } => {
+            VoiceKindTag::Submix => {
                 let child_ids = self.child_voice_ids(voice);
                 let mut mix = vec![0.0; frames * channels];
                 for child in child_ids {
@@ -1935,19 +2027,20 @@ impl AudioSubsystem {
                 if reverb_mix > 0.0 {
                     apply_reverb(&mut mix, channels, reverb_mix);
                 }
-                apply_levels(&mut mix, channels, volume, &channel_volumes);
                 mix
             }
-            VoiceKind::Source { .. } => {
-                let mut mix =
-                    self.consume_source_frames(voice, frames, callbacks, underflow_frames)?;
-                apply_levels(&mut mix, channels, volume, &channel_volumes);
-                mix
+            VoiceKindTag::Source => {
+                self.consume_source_frames(voice, frames, callbacks, underflow_frames)?
             }
         };
-        // Apply effects chain (if any effects are registered)
-        if !effects_chain.effect_clsids.is_empty() {
-            effects_chain.apply_chain(&mut mix, channels, sample_rate);
+        apply_levels(&mut mix, channels, volume, &self.voice(voice)?.channel_volumes);
+        // Apply effects chain (if any effects are registered), borrowing the
+        // chain briefly — no recursion happens at this point.
+        if !self.voice(voice)?.effects_chain.effect_clsids.is_empty() {
+            let record = self.voice(voice)?;
+            record
+                .effects_chain
+                .apply_chain(&mut mix, channels, sample_rate);
         }
         Ok(mix)
     }
@@ -1975,11 +2068,7 @@ impl AudioSubsystem {
                         let finished = queue
                             .front()
                             .expect("queue front verified by matches guard above");
-                        let will_loop = finished.loop_begin.is_some()
-                            && finished.loop_length.unwrap_or(0) > 0
-                            && (finished.loop_count == 0
-                                || finished.played_loops < finished.loop_count);
-                        if will_loop {
+                        if buffer_will_loop(finished) {
                             // Rewind to loop start
                             // SAFETY: matches! guard above guarantees queue.front_mut() is Some.
                             let buf = queue
@@ -2002,6 +2091,13 @@ impl AudioSubsystem {
                         *underflow_frames += 1;
                         continue;
                     };
+                    // Guard against a degenerate rewind (e.g. a loop point at
+                    // or past the end of an empty/looping buffer): skip the
+                    // frame instead of slicing out of bounds.
+                    if buffer.cursor >= buffer.frames {
+                        *underflow_frames += 1;
+                        continue;
+                    }
                     let sample_offset = buffer.cursor * channels;
                     let frame_samples = &buffer.samples[sample_offset..sample_offset + channels];
                     let write_offset = frame_index * channels;
@@ -2014,11 +2110,7 @@ impl AudioSubsystem {
                     let finished = queue
                         .front()
                         .expect("queue front verified by matches guard above");
-                    let will_loop = finished.loop_begin.is_some()
-                        && finished.loop_length.unwrap_or(0) > 0
-                        && (finished.loop_count == 0
-                            || finished.played_loops < finished.loop_count);
-                    if will_loop {
+                    if buffer_will_loop(finished) {
                         // SAFETY: matches! guard above guarantees queue.front_mut() is Some.
                         let buf = queue
                             .front_mut()
@@ -2049,17 +2141,11 @@ impl AudioSubsystem {
     }
 
     fn child_voice_ids(&self, parent: VoiceId) -> Vec<VoiceId> {
-        self.voices
-            .iter()
-            .filter_map(|(voice_id, voice)| match voice.kind {
-                VoiceKind::Submix { destination, .. } | VoiceKind::Source { destination, .. }
-                    if destination == parent =>
-                {
-                    Some(*voice_id)
-                }
-                _ => None,
-            })
-            .collect()
+        // Children are cached on the parent at creation, so rendering does
+        // not rescan all voices per parent.
+        self.voice(parent)
+            .map(|record| record.children.clone())
+            .unwrap_or_default()
     }
 
     fn project_to_parent(
@@ -2186,6 +2272,35 @@ impl AudioSubsystem {
         id
     }
 
+    /// Append a notification, capping the log so long sessions do not grow
+    /// memory without bound.
+    fn push_notification(&mut self, message: String) {
+        self.notifications.push(message);
+        if self.notifications.len() > MAX_LOG_ENTRIES {
+            self.notifications.drain(0..MAX_LOG_ENTRIES / 10);
+        }
+    }
+
+    /// Append a latency record, capping the log.
+    fn push_latency_record(&mut self, record: LatencyRecord) {
+        self.latency_log.push(record);
+        if self.latency_log.len() > MAX_LOG_ENTRIES {
+            self.latency_log.drain(0..MAX_LOG_ENTRIES / 10);
+        }
+    }
+
+    /// Reject render requests with guest-controlled frame counts large enough
+    /// to trigger multi-GB allocations.
+    fn check_render_frames(frames: usize) -> AppResult<()> {
+        if frames > MAX_RENDER_FRAMES {
+            return Err(AppError::new(
+                ReasonCode::RcAudioUnsupported,
+                format!("render request too large: {frames} frames"),
+            ));
+        }
+        Ok(())
+    }
+
     // ── Capture (waveIn) support ─────────────────────────────────────────────
 
     /// Start audio capture from a wave input device.
@@ -2250,7 +2365,24 @@ impl AudioSubsystem {
                 }
             }
         }
+        // Bound the buffer so a guest that never drains capture data cannot
+        // grow memory without limit (drop the oldest bytes when full).
+        if self.capture_buffer.len() > MAX_CAPTURE_BUFFER_BYTES {
+            let excess = self.capture_buffer.len() - MAX_CAPTURE_BUFFER_BYTES;
+            self.capture_buffer.drain(0..excess);
+        }
     }
+}
+
+/// Whether a queued buffer should rewind and loop instead of completing.
+///
+/// `loop_count == 0` means "loop forever"; `loop_disabled` is set by
+/// `exit_loop` and takes precedence so an infinite loop can be stopped.
+fn buffer_will_loop(buffer: &QueuedBuffer) -> bool {
+    !buffer.loop_disabled
+        && buffer.loop_begin.is_some()
+        && buffer.loop_length.unwrap_or(0) > 0
+        && (buffer.loop_count == 0 || buffer.played_loops < buffer.loop_count)
 }
 
 pub fn crc32_samples(samples: &[f32]) -> u32 {
@@ -2364,11 +2496,10 @@ fn apply_levels(samples: &mut [f32], channels: usize, volume: f32, channel_volum
 
 fn apply_reverb(samples: &mut [f32], channels: usize, wet: f32) {
     let mut previous = vec![0.0; channels];
-    for frame in 0..samples.len() / channels {
-        for channel in 0..channels {
-            let index = frame * channels + channel;
-            samples[index] += previous[channel] * wet;
-            previous[channel] = samples[index];
+    for frame in samples.chunks_exact_mut(channels) {
+        for (channel, sample) in frame.iter_mut().enumerate() {
+            *sample += previous[channel] * wet;
+            previous[channel] = *sample;
         }
     }
 }
@@ -2520,52 +2651,6 @@ fn compute_doppler_shift(state: &Ds3dBufferState, listener: &Ds3dListenerState) 
     (numerator / denominator).clamp(0.5, 2.0)
 }
 
-/// Compute the stereo pan value in `[-1, 1]` based on the azimuth angle
-/// of the buffer relative to the listener's forward vector.
-///
-/// - `-1` = full left
-/// - `0` = centre
-/// - `+1` = full right
-fn compute_channel_pan(state: &Ds3dBufferState, listener: &Ds3dListenerState) -> f32 {
-    // Vector from listener to buffer.
-    let dx = state.position[0] - listener.position[0];
-    let dy = state.position[1] - listener.position[1];
-    let dz = state.position[2] - listener.position[2];
-    let len = (dx * dx + dy * dy + dz * dz).sqrt();
-    if len <= f32::EPSILON {
-        return 0.0; // at listener position → centre
-    }
-
-    let nx = dx / len;
-    let ny = dy / len;
-    let nz = dz / len;
-
-    // Forward and up vectors from the listener.
-    let fw = listener.forward;
-    let up = listener.up;
-
-    // Compute the right vector as cross product of forward and up.
-    let right = [
-        fw[1] * up[2] - fw[2] * up[1],
-        fw[2] * up[0] - fw[0] * up[2],
-        fw[0] * up[1] - fw[1] * up[0],
-    ];
-
-    // Project the buffer direction onto the forward and right axes.
-    let fwd_dot = nx * fw[0] + ny * fw[1] + nz * fw[2];
-    let right_dot = nx * right[0] + ny * right[1] + nz * right[2];
-
-    // Azimuth angle in radians.  atan2(right_dot, fwd_dot) gives the
-    // horizontal angle: 0 = front, π/2 = right, π = behind, -π/2 = left.
-    let azimuth = fwd_dot.atan2(right_dot);
-
-    // Map azimuth from [-π, π] to [-1, 1] pan.
-    // Negative = left, Positive = right.
-    // Clamp to [-π/2, π/2] so sounds behind are still panned sensibly.
-    let clamped = azimuth.clamp(-std::f32::consts::FRAC_PI_2, std::f32::consts::FRAC_PI_2);
-    clamped / std::f32::consts::FRAC_PI_2
-}
-
 fn measure_latency_ms(sample_rate: u32, buffered_frames: usize) -> u32 {
     ((((buffered_frames as f32 / sample_rate as f32) * 1000.0).round() as u32) + 10).min(50)
 }
@@ -2675,29 +2760,6 @@ pub fn compute_hrtf_gains(
 
     // Clamp gains to reasonable range
     (left_gain.clamp(0.0, 1.5), right_gain.clamp(0.0, 1.5))
-}
-
-/// Apply HRTF spatialization to a stereo buffer.
-///
-/// Replaces the simple pan-based spatialization with HRTF gains computed
-/// from the buffer and listener 3D state.
-fn apply_hrtf_spatialization(
-    samples: &mut [f32],
-    channels: usize,
-    buffer_state: &Ds3dBufferState,
-    listener: &Ds3dListenerState,
-) {
-    if channels < 2 {
-        return;
-    }
-
-    let (left_gain, right_gain) = compute_hrtf_gains(buffer_state, listener);
-
-    for frame in 0..(samples.len() / channels) {
-        let base = frame * channels;
-        samples[base] *= left_gain;
-        samples[base + 1] *= right_gain;
-    }
 }
 
 // ── XAPO effects chain for voice mixing ──────────────────────────────────
@@ -3154,7 +3216,7 @@ pub struct XAudio2CallbackEvent {
 /// Debug configuration for the XAudio2 engine.
 ///
 /// Controls logging, break-on-error, and trace masking for debugging.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct XAudio2DebugConfiguration {
     /// Log mask: combination of `XA2LOG_*` bits.
     pub log_mask: u32,
@@ -3166,18 +3228,6 @@ pub struct XAudio2DebugConfiguration {
     pub trace_mask: u32,
     /// Whether logging is enabled at all.
     pub logging_enabled: bool,
-}
-
-impl Default for XAudio2DebugConfiguration {
-    fn default() -> Self {
-        Self {
-            log_mask: 0,
-            break_on_error: false,
-            break_on_malloc_failure: false,
-            trace_mask: 0,
-            logging_enabled: false,
-        }
-    }
 }
 
 /// Log mask bits for XAudio2 debug configuration.

@@ -30,9 +30,11 @@ const MS_ADPCM_COEFFICIENTS: [(i16, i16); MS_ADPCM_NUM_COEFFICIENTS] = [
 ];
 
 /// ADPCM delta adaptation table.
-/// Maps 4-bit nibbles to delta scaling values.
+/// Maps 4-bit nibbles to delta scaling values. This is the canonical
+/// Microsoft ADPCM adaptation table (symmetric): the second half mirrors
+/// the first so that equal deltas produce equal scaling on both directions.
 const MS_ADPCM_ADAPTATION_TABLE: [i16; 16] = [
-    230, 230, 230, 230, 307, 409, 512, 614, 307, 409, 512, 614, 768, 614, 768, 1230,
+    230, 230, 230, 230, 307, 409, 512, 614, 768, 614, 512, 409, 307, 230, 230, 230,
 ];
 
 // ── IMA ADPCM constants ────────────────────────────────────────────────────
@@ -152,7 +154,9 @@ const fn generate_alaw_table() -> [i16; 256] {
 /// [sample2_ch1_lo] [sample2_ch1_hi] [nibble_data...]
 /// ```
 pub fn decode_adpcm_ms(data: &[u8], channels: u16, samples_per_block: u16) -> Vec<i16> {
-    if data.is_empty() || channels == 0 || samples_per_block == 0 {
+    if data.is_empty() || channels == 0 || samples_per_block < 3 {
+        // A block must contain 2 initial samples plus at least 1 nibble per
+        // channel; anything smaller cannot be decoded.
         return Vec::new();
     }
 
@@ -176,11 +180,12 @@ pub fn decode_adpcm_ms(data: &[u8], channels: u16, samples_per_block: u16) -> Ve
     // Actually for MS ADPCM, the nibbles are arranged as:
     //   For stereo: nibble pairs are (left, right, left, right, ...)
     //   For mono: just sequential nibbles
-    // Total nibble bytes = (encoded_samples_per_channel * channels + 1) / 2
-    let nibble_data_size = (encoded_samples_per_channel * channels + 1) / 2;
+    // Total nibble bytes = ceil(encoded_samples_per_channel * channels / 2)
+    let nibble_data_size = (encoded_samples_per_channel * channels).div_ceil(2);
     let block_size = header_size + nibble_data_size;
 
-    // Calculate total number of blocks
+    // Calculate total number of blocks. A trailing partial block (smaller
+    // than `block_size`) cannot be decoded and is truncated.
     let num_blocks = data.len() / block_size;
     if num_blocks == 0 {
         return Vec::new();
@@ -201,39 +206,39 @@ pub fn decode_adpcm_ms(data: &[u8], channels: u16, samples_per_block: u16) -> Ve
         let mut deltas = vec![0i16; channels];
         let mut samples = vec![[0i16; 2]; channels]; // [s1, s2] per channel
 
-        for ch in 0..channels {
-            let offset = ch; // predictor bytes are interleaved at start
-            predictors[ch] = block_data[offset] as usize;
-            if predictors[ch] >= MS_ADPCM_NUM_COEFFICIENTS {
-                predictors[ch] = 0;
+        for (ch, pred) in predictors.iter_mut().enumerate() {
+            // Predictor bytes are interleaved at the start of the header
+            *pred = block_data[ch] as usize;
+            if *pred >= MS_ADPCM_NUM_COEFFICIENTS {
+                *pred = 0;
             }
         }
 
         // Delta values (2 bytes each, little-endian, interleaved by channel)
-        for ch in 0..channels {
+        for (ch, delta) in deltas.iter_mut().enumerate() {
             let offset = channels + ch * 2;
-            deltas[ch] = i16::from_le_bytes([block_data[offset], block_data[offset + 1]]);
+            *delta = i16::from_le_bytes([block_data[offset], block_data[offset + 1]]);
         }
 
         // Initial sample s1 (2 bytes each, little-endian, interleaved by channel)
-        for ch in 0..channels {
+        for (ch, sample) in samples.iter_mut().enumerate() {
             let offset = channels + channels * 2 + ch * 2;
-            samples[ch][0] = i16::from_le_bytes([block_data[offset], block_data[offset + 1]]);
+            sample[0] = i16::from_le_bytes([block_data[offset], block_data[offset + 1]]);
         }
 
         // Initial sample s2 (2 bytes each, little-endian, interleaved by channel)
-        for ch in 0..channels {
+        for (ch, sample) in samples.iter_mut().enumerate() {
             let offset = channels + channels * 2 + channels * 2 + ch * 2;
-            samples[ch][1] = i16::from_le_bytes([block_data[offset], block_data[offset + 1]]);
+            sample[1] = i16::from_le_bytes([block_data[offset], block_data[offset + 1]]);
         }
 
         // Output s2 first (oldest), then s1, then decoded samples
         // For stereo, output is interleaved: s2_l, s2_r, s1_l, s1_r
-        for ch in 0..channels {
-            pcm.push(samples[ch][1]); // s2
+        for sample in &samples {
+            pcm.push(sample[1]); // s2
         }
-        for ch in 0..channels {
-            pcm.push(samples[ch][0]); // s1
+        for sample in &samples {
+            pcm.push(sample[0]); // s1
         }
 
         // Decode nibble data
@@ -247,7 +252,7 @@ pub fn decode_adpcm_ms(data: &[u8], channels: u16, samples_per_block: u16) -> Ve
                 // For mono: sequential nibbles
                 let nibble_index = sample_idx * channels + ch;
                 let byte_index = nibble_index / 2;
-                let high_nibble = nibble_index % 2 == 0;
+                let high_nibble = nibble_index.is_multiple_of(2);
 
                 if byte_index >= nibble_data.len() {
                     pcm.push(0);
@@ -335,8 +340,8 @@ pub fn decode_adpcm_ima(data: &[u8], channels: u16, samples_per_block: u16) -> V
 
     // Nibble data: each byte contains 2 nibbles (2 samples)
     // For stereo, channels are interleaved in the nibble data
-    // Total nibble bytes per block = (encoded_samples * channels + 1) / 2
-    let nibble_bytes = (encoded_samples * channels + 1) / 2;
+    // Total nibble bytes per block = ceil(encoded_samples * channels / 2)
+    let nibble_bytes = (encoded_samples * channels).div_ceil(2);
     let block_size = header_size + nibble_bytes;
 
     let num_blocks = data.len() / block_size;
@@ -377,7 +382,7 @@ pub fn decode_adpcm_ima(data: &[u8], channels: u16, samples_per_block: u16) -> V
             for ch in 0..channels {
                 let nibble_index = sample_idx * channels + ch;
                 let byte_index = nibble_index / 2;
-                let high_nibble = nibble_index % 2 == 0;
+                let high_nibble = nibble_index.is_multiple_of(2);
 
                 if byte_index >= nibble_data.len() {
                     pcm.push(0);
@@ -852,7 +857,7 @@ mod tests {
         let channels = 1u16;
         let header_size = 7;
         let nibble_count = (samples_per_block - 2) as usize * channels as usize;
-        let nibble_bytes = (nibble_count + 1) / 2;
+        let nibble_bytes = nibble_count.div_ceil(2);
         let block_size = header_size + nibble_bytes;
 
         let mut block = vec![0u8; block_size];
@@ -883,7 +888,7 @@ mod tests {
         let channels = 1u16;
         let header_size = 4;
         let encoded_samples = (samples_per_block - 1) as usize;
-        let nibble_bytes = (encoded_samples + 1) / 2;
+        let nibble_bytes = encoded_samples.div_ceil(2);
         let block_size = header_size + nibble_bytes;
 
         let mut block = vec![0u8; block_size];
@@ -901,6 +906,17 @@ mod tests {
         for &sample in &result {
             assert_eq!(sample, 0, "Expected silence, got {}", sample);
         }
+    }
+
+    #[test]
+    fn test_adpcm_ms_tiny_samples_per_block_no_panic() {
+        // Malformed WAVE data with samples_per_block == 1 or 2 used to
+        // underflow on `samples_per_block - 2`; it must decode to nothing
+        // instead of panicking.
+        let result = decode_adpcm_ms(&[0u8; 16], 1, 1);
+        assert!(result.is_empty());
+        let result = decode_adpcm_ms(&[0u8; 16], 2, 2);
+        assert!(result.is_empty());
     }
 
     #[test]
