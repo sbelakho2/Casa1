@@ -14,6 +14,15 @@ fuzz_target!(|data: &[u8]| {
 
     // Test 2: If parsing succeeds, exercise higher-level PE APIs
     if let Ok(image) = pe::parse(data) {
+        // Invariant: the parsed section table must match the declared count
+        assert_eq!(
+            image.sections.len(),
+            image.number_of_sections as usize,
+            "parsed section count {} != declared {}",
+            image.sections.len(),
+            image.number_of_sections
+        );
+
         // Test resource blob lookup
         let _ = pe::find_resource_blob(
             data,

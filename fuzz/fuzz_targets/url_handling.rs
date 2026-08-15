@@ -19,27 +19,41 @@ fuzz_target!(|data: &[u8]| {
 fn parse_summary(input: &str) -> String {
     // Test steam:// URL parsing (comprehensive)
     let steam_result = match steam_protocol::parse_steam_protocol_url(input) {
-        Some(url) => format!(
-            "steam_ok:{}:{}:{}",
-            format!("{:?}", url.command),
-            url.query_params.len(),
-            url.raw_url.len(),
-        ),
+        Some(url) => {
+            assert!(
+                url.raw_url
+                    .chars()
+                    .next()
+                    .map_or(false, |c| c.is_ascii_alphabetic()),
+                "parsed URL {url:?} has no alphabetic scheme start"
+            );
+            format!(
+                "steam_ok:{}:{}:{}",
+                format!("{:?}", url.command),
+                url.query_params.len(),
+                url.raw_url.len(),
+            )
+        }
         None => "steam_err:parse_failed".to_string(),
     };
 
     // Test WinHttp URL cracking
     let stack = WinHttpStack::new();
     let crack_result = match stack.internet_crack_url_w(input, input.len() as u32) {
-        Ok((scheme, host, port, path, user, pass)) => format!(
-            "crack_ok:{}:{}:{}:{}:{}:{}",
-            scheme,
-            host,
-            port,
-            path,
-            user.is_some(),
-            pass.is_some(),
-        ),
+        Ok((scheme, host, port, path, user, pass)) => {
+            // A cracked URL always yields a non-empty scheme and path
+            assert!(!scheme.is_empty(), "cracked scheme is empty");
+            assert!(!path.is_empty(), "cracked path is empty");
+            format!(
+                "crack_ok:{}:{}:{}:{}:{}:{}",
+                scheme,
+                host,
+                port,
+                path,
+                user.is_some(),
+                pass.is_some(),
+            )
+        }
         Err(e) => format!("crack_err:{}:{}", e.code.as_u32(), e.message),
     };
 
