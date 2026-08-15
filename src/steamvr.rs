@@ -20,8 +20,10 @@
 //! | `TrackedDeviceClass_HMD` | 0 |
 //! | `TrackedDeviceClass_Invalid` | 5 |
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::time::Instant;
+
+use serde_json::Value;
 
 // ── OpenVR constants ──────────────────────────────────────────────────────
 
@@ -149,7 +151,13 @@ pub const PROP_DEVICE_CLASS: u32 = 1501;
 
 // ── Controller state ─────────────────────────────────────────────────────
 
-/// Controller state returned via `GetControllerState` (matches `vr::VRControllerState_t` layout).
+/// Controller state returned via `GetControllerState`.
+///
+/// The serialized form matches `vr::VRControllerState_t`:
+/// `{ u32 unPacketNum; u64 ulButtonPressed; u64 ulButtonTouched;
+///    VRControllerAxis_t rAxis[5]; }` (60 bytes) where `VRControllerAxis_t`
+/// is `{ f32 x; f32 y; }`. The real struct has **no** axis-type array, so
+/// `ul_axis_type` is kept only as internal bookkeeping and is not serialized.
 #[derive(Clone, Debug, Default)]
 #[repr(C)]
 pub struct ControllerState {
@@ -159,36 +167,63 @@ pub struct ControllerState {
     pub ul_button_pressed: u64,
     /// Bitmask of currently touched buttons.
     pub ul_button_touched: u64,
-    /// Analog axis positions: 5 axes (joystick X/Y, trigger, etc.).
+    /// Analog axis positions: 5 axes (joystick X/Y, trigger, etc.). Axes are
+    /// stored one `f32` per component; `to_bytes` interleaves them as
+    /// `(x, y)` pairs to match `VRControllerAxis_t[5]`.
     pub r_axis: [f32; 5],
-    /// Axis type identifiers (e.g. `k_eControllerAxis_Joystick`, `k_eControllerAxis_Trigger`).
+    /// Axis type identifiers (e.g. `k_eControllerAxis_Joystick`,
+    /// `k_eControllerAxis_Trigger`). Internal bookkeeping only — not part of
+    /// the guest-visible struct.
     pub ul_axis_type: [u32; 5],
 }
 
 impl ControllerState {
-    /// Size in bytes when serialized to guest memory.
+    /// Size in bytes when serialized to guest memory
+    /// (4 + 8 + 8 + 5 * (4 + 4) = 60).
     pub fn guest_size() -> usize {
-        4 + 8 + 8 + 5 * 4 + 5 * 4 // 4 + 8 + 8 + 20 + 20 = 60
+        4 + 8 + 8 + 5 * 4 * 2
     }
 
     /// Serialize to bytes for guest memory write.
+    ///
+    /// Emits the real `VRControllerState_t` layout: the 20-byte header,
+    /// then 5 `VRControllerAxis_t` `(x, y)` float pairs.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(Self::guest_size());
         bytes.extend_from_slice(&self.packet_num.to_le_bytes());
         bytes.extend_from_slice(&self.ul_button_pressed.to_le_bytes());
         bytes.extend_from_slice(&self.ul_button_touched.to_le_bytes());
-        for &v in &self.r_axis {
-            bytes.extend_from_slice(&v.to_le_bytes());
-        }
-        for &t in &self.ul_axis_type {
-            bytes.extend_from_slice(&t.to_le_bytes());
+        // 5 axes × (x, y): axis 0 = (r_axis[0], r_axis[1]), axis 1 =
+        // (r_axis[2], r_axis[3]), axis 2 = (r_axis[4], 0.0) etc.
+        for axis_index in 0..5 {
+            let x = self.r_axis.get(axis_index * 2).copied().unwrap_or(0.0);
+            let y = self
+                .r_axis
+                .get(axis_index * 2 + 1)
+                .copied()
+                .unwrap_or(0.0);
+            bytes.extend_from_slice(&x.to_le_bytes());
+            bytes.extend_from_slice(&y.to_le_bytes());
         }
         bytes
     }
 }
 
-// ── OpenVR axis type constants ───────────────────────────────────────────
+/// Raw controller input snapshot for one hand, driving the VR controller
+/// emulation from Steam Input / XInput-style data.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ControllerInputSnapshot {
+    /// XInput-style button bitmask.
+    pub buttons: u16,
+    /// Analog trigger value (0–255).
+    pub trigger: u8,
+    /// Thumb stick X (-32768–32767).
+    pub thumb_lx: i16,
+    /// Thumb stick Y (-32768–32767).
+    pub thumb_ly: i16,
+}
 
+// ── OpenVR axis type constants ───────────────────────────────────────────
 /// Axis type: joystick or thumbstick.
 pub const CONTROLLER_AXIS_JOYSTICK: u32 = 0;
 /// Axis type: trigger.
@@ -212,8 +247,8 @@ pub const BUTTON_DPAD_RIGHT: u64 = 0x020;
 pub const BUTTON_DPAD_DOWN: u64 = 0x040;
 /// A button (Vive controller).
 pub const BUTTON_A: u64 = 0x080;
-/// Touchpad / joystick click.
-pub const BUTTON_TOUCHPAD: u64 = 0x100;
+/// Touchpad / joystick click (real `k_EButton_SteamVR_Touchpad` mask).
+pub const BUTTON_TOUCHPAD: u64 = 0x1000;
 /// Axis 0 (joystick X).
 pub const BUTTON_AXIS0: u64 = 0x200;
 /// Axis 1 (joystick Y).
@@ -221,7 +256,7 @@ pub const BUTTON_AXIS1: u64 = 0x400;
 /// Axis 2 (trigger).
 pub const BUTTON_AXIS2: u64 = 0x800;
 /// Axis 3.
-pub const BUTTON_AXIS3: u64 = 0x1000;
+pub const BUTTON_AXIS3: u64 = 0x2000;
 
 /// VREvent type: button press.
 pub const VREVENT_BUTTON_PRESS: u32 = 200;
@@ -386,7 +421,14 @@ pub struct VRTexture {
 
 // ── Compositor frame timing ──────────────────────────────────────────────
 
-/// Compositor frame timing (matches `vr::Compositor_FrameTiming` layout).
+/// Compositor frame timing returned via `GetFrameTiming`.
+///
+/// NOTE: the real OpenVR `Compositor_FrameTiming` (a long sequence of
+/// `m_n...`/`m_fl...` counters, `m_nSize` first) is not mirrored here — the
+/// dispatch layer (pe_runtime.rs) serializes this struct field-by-field into
+/// guest memory, so changing the layout requires a coordinated change there.
+/// `size` still carries `sizeof(CompositorFrameTiming)` per the OpenVR
+/// convention so guests can version-check the struct.
 #[derive(Clone, Debug)]
 #[repr(C)]
 pub struct CompositorFrameTiming {
@@ -449,7 +491,12 @@ impl Default for CompositorFrameTiming {
 
 // ── Compositor cumulative stats ──────────────────────────────────────────
 
-/// Compositor cumulative statistics (matches OpenVR struct layout).
+/// Compositor cumulative statistics returned via `GetCumulativeStats`.
+///
+/// NOTE: as with [`CompositorFrameTiming`], the real OpenVR
+/// `Compositor_CumulativeStats` layout is not mirrored here because the
+/// dispatch layer (pe_runtime.rs) serializes this struct field-by-field;
+/// mirroring it requires a coordinated change there.
 #[derive(Clone, Debug)]
 #[repr(C)]
 pub struct CompositorCumulativeStats {
@@ -500,7 +547,12 @@ impl Default for CompositorCumulativeStats {
 
 // ── VR event ─────────────────────────────────────────────────────────────
 
-/// `VREvent` structure (matches `vr::VREvent_t` layout).
+/// `VREvent` structure (mirrors `vr::VREvent_t` layout).
+///
+/// The real `VREvent_Data_t` union is 64 bytes (`VREvent_Reserved_t` is the
+/// largest member), making `VREvent_t` 80 bytes with 8-byte alignment. The
+/// button mask for button events lives at `data[0..4]` (`VREvent_Controller_t
+/// .button`).
 #[derive(Clone, Debug)]
 #[repr(C)]
 pub struct VREvent {
@@ -510,8 +562,8 @@ pub struct VREvent {
     pub tracked_device_index: u32,
     /// Age of the event in seconds.
     pub event_age_seconds: f32,
-    /// Raw event data union (simplified as byte array).
-    pub data: [u8; 40],
+    /// Raw event data union (`VREvent_Data_t`, 64 bytes).
+    pub data: [u8; 64],
 }
 
 impl Default for VREvent {
@@ -520,30 +572,40 @@ impl Default for VREvent {
             event_type: 0,
             tracked_device_index: 0,
             event_age_seconds: 0.0,
-            data: [0; 40],
+            data: [0; 64],
         }
+    }
+}
+
+impl VREvent {
+    /// Sets the button mask carried by `VREvent_ButtonPress` /
+    /// `VREvent_ButtonUnpress` events, i.e. the `data.controller.button`
+    /// member of the real union.
+    pub fn set_button_mask(&mut self, mask: u64) {
+        self.data[..8].copy_from_slice(&mask.to_le_bytes());
+    }
+
+    /// Reads the button mask from `data.controller.button`.
+    pub fn button_mask(&self) -> u64 {
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&self.data[..8]);
+        u64::from_le_bytes(bytes)
     }
 }
 
 // ── HMD tracking state ──────────────────────────────────────────────────
 
 /// HMD tracking state for all tracked devices.
+#[derive(Default)]
 pub struct VRTrackingState {
     /// Poses for up to `k_unMaxTrackedDeviceCount` devices.
     pub poses: [TrackedDevicePose; K_UN_MAX_TRACKED_DEVICE_COUNT],
 }
 
-impl Default for VRTrackingState {
-    fn default() -> Self {
-        Self {
-            poses: Default::default(),
-        }
-    }
-}
-
 // ── Compositor state ────────────────────────────────────────────────────
 
 /// Compositor internal state.
+#[derive(Default)]
 pub struct VRCompositorState {
     /// Last submitted frame index.
     pub last_frame_index: u32,
@@ -557,19 +619,6 @@ pub struct VRCompositorState {
     pub explicit_timing_mode: u32,
     /// Last pose used for explicit timing.
     pub explicit_timing_last_pose: TrackedDevicePose,
-}
-
-impl Default for VRCompositorState {
-    fn default() -> Self {
-        Self {
-            last_frame_index: 0,
-            frame_timing: CompositorFrameTiming::default(),
-            cumulative_stats: CompositorCumulativeStats::default(),
-            last_submit_result: 0,
-            explicit_timing_mode: 0,
-            explicit_timing_last_pose: TrackedDevicePose::default(),
-        }
-    }
 }
 
 // ── Chaperone state ─────────────────────────────────────────────────────
@@ -595,11 +644,11 @@ impl Default for VRChaperoneState {
 }
 
 // ── Controller properties constants ──────────────────────────────────────
-
-/// Controller firmware version (int32).
-pub const PROP_FIRMWARE_VERSION: u32 = 1054;
-/// Controller hardware revision (int32).
-pub const PROP_HARDWARE_REVISION: u32 = 1055;
+//
+// NOTE: no `Prop_FirmwareVersion` / `Prop_HardwareRevision` constants exist
+// in real OpenVR — property IDs 1054/1055 are `Prop_Firmware_UpdateAvailable`
+// / `Prop_Firmware_ManualUpdate` (bools). The invented int32 properties were
+// removed so guests querying the real IDs get consistent answers.
 
 // ── Main SteamVR state container ────────────────────────────────────────
 
@@ -633,8 +682,8 @@ pub struct SteamVR {
     pub prev_left_buttons: u64,
     /// Previous right controller button mask for VREvent generation.
     pub prev_right_buttons: u64,
-    /// Pending VR events queue.
-    pub pending_events: Vec<VREvent>,
+    /// Pending VR events queue (FIFO).
+    pub pending_events: VecDeque<VREvent>,
     /// Controller serial number for device index 1.
     pub left_serial: String,
     /// Controller serial number for device index 2.
@@ -671,7 +720,7 @@ impl SteamVR {
             right_controller_state: ControllerState::default(),
             prev_left_buttons: 0,
             prev_right_buttons: 0,
-            pending_events: Vec::new(),
+            pending_events: VecDeque::new(),
             left_serial: "LHR00000001".to_string(),
             right_serial: "LHR00000002".to_string(),
             action_manifest: Vec::new(),
@@ -772,14 +821,8 @@ impl SteamVR {
     /// Maps Steam Input button/axis state to VR controller button/axis masks.
     pub fn update_controllers_from_steam_input(
         &mut self,
-        left_buttons: u16,
-        left_trigger: u8,
-        left_thumb_lx: i16,
-        left_thumb_ly: i16,
-        right_buttons: u16,
-        right_trigger: u8,
-        right_thumb_lx: i16,
-        right_thumb_ly: i16,
+        left: ControllerInputSnapshot,
+        right: ControllerInputSnapshot,
     ) {
         // Save previous button states for VREvent generation
         self.prev_left_buttons = self.left_controller_state.ul_button_pressed;
@@ -826,25 +869,25 @@ impl SteamVR {
 
         // Left controller
         self.left_controller_state.packet_num += 1;
-        self.left_controller_state.ul_button_pressed = xinput_to_vr(left_buttons);
+        self.left_controller_state.ul_button_pressed = xinput_to_vr(left.buttons);
         self.left_controller_state.ul_button_touched = self.left_controller_state.ul_button_pressed;
         // Axis 0: joystick X/Y
-        self.left_controller_state.r_axis[0] = normalize_axis_i16(left_thumb_lx);
-        self.left_controller_state.r_axis[1] = normalize_axis_i16(left_thumb_ly);
+        self.left_controller_state.r_axis[0] = normalize_axis_i16(left.thumb_lx);
+        self.left_controller_state.r_axis[1] = normalize_axis_i16(left.thumb_ly);
         // Axis 2: trigger
-        self.left_controller_state.r_axis[2] = left_trigger as f32 / 255.0;
+        self.left_controller_state.r_axis[2] = left.trigger as f32 / 255.0;
         // Axis types
         self.left_controller_state.ul_axis_type[0] = CONTROLLER_AXIS_JOYSTICK;
         self.left_controller_state.ul_axis_type[2] = CONTROLLER_AXIS_TRIGGER;
 
         // Right controller
         self.right_controller_state.packet_num += 1;
-        self.right_controller_state.ul_button_pressed = xinput_to_vr(right_buttons);
+        self.right_controller_state.ul_button_pressed = xinput_to_vr(right.buttons);
         self.right_controller_state.ul_button_touched =
             self.right_controller_state.ul_button_pressed;
-        self.right_controller_state.r_axis[0] = normalize_axis_i16(right_thumb_lx);
-        self.right_controller_state.r_axis[1] = normalize_axis_i16(right_thumb_ly);
-        self.right_controller_state.r_axis[2] = right_trigger as f32 / 255.0;
+        self.right_controller_state.r_axis[0] = normalize_axis_i16(right.thumb_lx);
+        self.right_controller_state.r_axis[1] = normalize_axis_i16(right.thumb_ly);
+        self.right_controller_state.r_axis[2] = right.trigger as f32 / 255.0;
         self.right_controller_state.ul_axis_type[0] = CONTROLLER_AXIS_JOYSTICK;
         self.right_controller_state.ul_axis_type[2] = CONTROLLER_AXIS_TRIGGER;
 
@@ -868,59 +911,108 @@ impl SteamVR {
         if changed == 0 {
             return;
         }
-        let now = self.last_frame_time.elapsed().as_secs_f32();
+        // Events are enqueued at the moment the button state changes, so the
+        // real OpenVR "seconds since the event occurred" is ~0.
         // Pressed bits
         let pressed = current & changed;
         // Released bits
         let released = prev & changed;
 
         if pressed != 0 {
-            let mut event = VREvent::default();
-            event.event_type = VREVENT_BUTTON_PRESS;
-            event.tracked_device_index = device_index;
-            event.event_age_seconds = now;
+            let mut event = VREvent {
+                event_type: VREVENT_BUTTON_PRESS,
+                tracked_device_index: device_index,
+                event_age_seconds: 0.0,
+                data: [0; 64],
+            };
             // Store the button mask in the data union
-            event.data[..8].copy_from_slice(&pressed.to_le_bytes());
-            self.pending_events.push(event);
+            event.set_button_mask(pressed);
+            self.pending_events.push_back(event);
         }
         if released != 0 {
-            let mut event = VREvent::default();
-            event.event_type = VREVENT_BUTTON_UNPRESS;
-            event.tracked_device_index = device_index;
-            event.event_age_seconds = now;
-            event.data[..8].copy_from_slice(&released.to_le_bytes());
-            self.pending_events.push(event);
+            let mut event = VREvent {
+                event_type: VREVENT_BUTTON_UNPRESS,
+                tracked_device_index: device_index,
+                event_age_seconds: 0.0,
+                data: [0; 64],
+            };
+            event.set_button_mask(released);
+            self.pending_events.push_back(event);
         }
     }
 
     // ── IVRInput methods ──────────────────────────────────────────────────
 
     /// `SetActionManifestPath(path)` — parse and cache action manifest.
-    pub fn set_action_manifest_path(&mut self, _path: &str) -> u32 {
+    ///
+    /// Tries to read the guest's `action_manifest.json` (an array of actions
+    /// with `name`/`type` fields, optionally grouped into `action_sets`).
+    /// When the path is not host-readable or yields no actions, falls back to
+    /// the built-in default action table so `GetActionHandle` keeps working.
+    /// Returns 0 on success (matching the real API's error code for
+    /// `VRInputError_None`).
+    pub fn set_action_manifest_path(&mut self, path: &str) -> u32 {
         if !self.action_manifest.is_empty() {
             return 0; // Already loaded
         }
-        let default_actions = [
-            ("system_button", ActionKind::Digital),
-            ("application_menu", ActionKind::Digital),
-            ("grip", ActionKind::Digital),
-            ("touchpad_press", ActionKind::Digital),
-            ("touchpad_touch", ActionKind::Digital),
-            ("trigger_press", ActionKind::Digital),
-            ("a_button", ActionKind::Digital),
-            ("joystick", ActionKind::Analog),
-            ("trigger", ActionKind::Analog),
-            ("hand_pose", ActionKind::Other),
-        ];
-        for (name, kind) in &default_actions {
-            let handle = self.next_handle;
-            self.next_handle += 1;
-            self.action_manifest.push(ActionManifestEntry {
-                handle,
-                kind: kind.clone(),
-                name: name.to_string(),
-                path: format!("/actions/{name}"),
-            });
+
+        let mut registered: u32 = 0;
+        if let Ok(contents) = std::fs::read_to_string(path)
+            && let Ok(manifest) = serde_json::from_str::<Value>(&contents)
+        {
+            let actions = manifest
+                .get("actions")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            for action in actions {
+                let Some(name) = action.get("name").and_then(Value::as_str) else {
+                    continue;
+                };
+                if name.is_empty() {
+                    continue;
+                }
+                let kind = match action.get("type").and_then(Value::as_str) {
+                    Some("boolean") => ActionKind::Digital,
+                    Some("vector1") | Some("vector2") | Some("scalar") => ActionKind::Analog,
+                    Some("pose") | Some("skeleton") | Some("vibration") => ActionKind::Other,
+                    _ => ActionKind::Other,
+                };
+                let handle = self.next_handle;
+                self.next_handle += 1;
+                self.action_manifest.push(ActionManifestEntry {
+                    handle,
+                    kind,
+                    name: name.to_string(),
+                    path: name.to_string(),
+                });
+                registered += 1;
+            }
+        }
+
+        if registered == 0 {
+            let default_actions = [
+                ("system_button", ActionKind::Digital),
+                ("application_menu", ActionKind::Digital),
+                ("grip", ActionKind::Digital),
+                ("touchpad_press", ActionKind::Digital),
+                ("touchpad_touch", ActionKind::Digital),
+                ("trigger_press", ActionKind::Digital),
+                ("a_button", ActionKind::Digital),
+                ("joystick", ActionKind::Analog),
+                ("trigger", ActionKind::Analog),
+                ("hand_pose", ActionKind::Other),
+            ];
+            for (name, kind) in &default_actions {
+                let handle = self.next_handle;
+                self.next_handle += 1;
+                self.action_manifest.push(ActionManifestEntry {
+                    handle,
+                    kind: kind.clone(),
+                    name: name.to_string(),
+                    path: format!("/actions/{name}"),
+                });
+            }
         }
         0
     }
@@ -992,15 +1084,15 @@ impl SteamVR {
             _ => (false, false),
         };
 
-        // Write InputDigitalActionData_t to guest buffer:
-        // bool active (u32), bool state (u32), u32 active_origin, u32[2] unused
+        // Write InputDigitalActionData_t to guest buffer (20 bytes):
+        // bool bState; bool bActive; VRInputOrigin_t activeOrigin (u64);
+        // u32 updateTime. `bState` (pressed) comes first in the real struct.
         if buffer.len() >= 20 {
             let active_u32: u32 = if active { 1 } else { 0 };
             let pressed_u32: u32 = if pressed { 1 } else { 0 };
-            buffer[..4].copy_from_slice(&active_u32.to_le_bytes());
-            buffer[4..8].copy_from_slice(&pressed_u32.to_le_bytes());
-            buffer[8..12].copy_from_slice(&0u32.to_le_bytes());
-            buffer[12..16].copy_from_slice(&0u32.to_le_bytes());
+            buffer[..4].copy_from_slice(&pressed_u32.to_le_bytes());
+            buffer[4..8].copy_from_slice(&active_u32.to_le_bytes());
+            buffer[8..16].copy_from_slice(&0u64.to_le_bytes());
             buffer[16..20].copy_from_slice(&0u32.to_le_bytes());
         }
         0
@@ -1040,21 +1132,21 @@ impl SteamVR {
             _ => (0.0, 0.0, false),
         };
 
-        // Write InputAnalogActionData_t to guest buffer:
-        // bool active (u32), u32 active_origin, float x, float y, float z,
-        // float delta_x, float delta_y, float delta_z, float[2] unused
-        if buffer.len() >= 48 {
+        // Write InputAnalogActionData_t to guest buffer (40 bytes):
+        // float x, y, z; float deltaX, deltaY, deltaZ; bool bActive;
+        // VRInputOrigin_t activeOrigin (u64); u32 updateTime.
+        // The analog values come first in the real struct.
+        if buffer.len() >= 40 {
             let active_u32: u32 = if active { 1 } else { 0 };
-            buffer[..4].copy_from_slice(&active_u32.to_le_bytes());
-            buffer[4..8].copy_from_slice(&0u32.to_le_bytes());
-            buffer[8..12].copy_from_slice(&x.to_le_bytes());
-            buffer[12..16].copy_from_slice(&y.to_le_bytes());
+            buffer[..4].copy_from_slice(&x.to_le_bytes());
+            buffer[4..8].copy_from_slice(&y.to_le_bytes());
+            buffer[8..12].copy_from_slice(&0.0f32.to_le_bytes());
+            buffer[12..16].copy_from_slice(&0.0f32.to_le_bytes());
             buffer[16..20].copy_from_slice(&0.0f32.to_le_bytes());
             buffer[20..24].copy_from_slice(&0.0f32.to_le_bytes());
-            buffer[24..28].copy_from_slice(&0.0f32.to_le_bytes());
-            buffer[28..32].copy_from_slice(&0.0f32.to_le_bytes());
-            buffer[32..36].copy_from_slice(&0.0f32.to_le_bytes());
-            buffer[36..40].copy_from_slice(&0.0f32.to_le_bytes());
+            buffer[24..28].copy_from_slice(&active_u32.to_le_bytes());
+            buffer[28..36].copy_from_slice(&0u64.to_le_bytes());
+            buffer[36..40].copy_from_slice(&0u32.to_le_bytes());
         }
         0
     }
@@ -1073,9 +1165,11 @@ impl SteamVR {
 
     /// Returns the tracked device class for the given device index.
     pub fn get_tracked_device_class(&self, device_index: u32) -> u32 {
-        if device_index == K_UN_TRACKED_DEVICE_INDEX_HMD && self.initialized {
+        if !self.is_hmd_present() {
+            TRACKED_DEVICE_CLASS_INVALID
+        } else if device_index == K_UN_TRACKED_DEVICE_INDEX_HMD {
             TRACKED_DEVICE_CLASS_HMD
-        } else if (device_index == 1 || device_index == 2) && self.initialized {
+        } else if device_index == 1 || device_index == 2 {
             TRACKED_DEVICE_CLASS_CONTROLLER
         } else {
             TRACKED_DEVICE_CLASS_INVALID
@@ -1083,19 +1177,21 @@ impl SteamVR {
     }
 
     /// Returns whether a tracked device is connected.
+    ///
+    /// Devices are only reported connected while the virtual HMD is enabled;
+    /// after `shutdown()` everything reports disconnected, matching the real
+    /// runtime's behavior once the compositor stops.
     pub fn is_tracked_device_connected(&self, device_index: u32) -> bool {
-        if device_index == K_UN_TRACKED_DEVICE_INDEX_HMD && self.initialized {
-            true
-        } else if (device_index == 1 || device_index == 2) && self.initialized {
-            true
-        } else {
-            false
-        }
+        self.is_hmd_present() && matches!(device_index, 0..=2)
     }
 
     /// Reads a string tracked device property and writes it into `buffer` as
-    /// UTF-16LE. Returns the number of bytes written (including null terminator),
-    /// or 0 if the property is not found.
+    /// UTF-16LE.
+    ///
+    /// Follows the OpenVR size contract: returns the **required** buffer size
+    /// in bytes (including the null terminator) so callers can retry with a
+    /// larger buffer; returns 0 if the property is not found. When the buffer
+    /// is large enough the string is copied including its terminator.
     pub fn get_prop_string(
         &self,
         device_index: u32,
@@ -1121,11 +1217,12 @@ impl SteamVR {
             _ => return 0,
         };
         let encoded: Vec<u16> = value.encode_utf16().chain(std::iter::once(0)).collect();
-        let max_chars = (buffer_len as usize / 2)
-            .min(buffer.len())
-            .min(encoded.len());
-        buffer[..max_chars].copy_from_slice(&encoded[..max_chars]);
-        (max_chars * 2) as u32
+        let required = encoded.len();
+        let capacity = (buffer_len as usize / 2).min(buffer.len());
+        if capacity >= required {
+            buffer[..required].copy_from_slice(&encoded);
+        }
+        (required * 2) as u32
     }
 
     /// Reads a bool tracked device property.
@@ -1204,8 +1301,6 @@ impl SteamVR {
                         2
                     }
                 } // left=1, right=2
-                PROP_FIRMWARE_VERSION => 1,
-                PROP_HARDWARE_REVISION => 1,
                 PROP_ADAPTER_INDEX => 0,
                 _ => 0,
             }
@@ -1290,11 +1385,11 @@ impl SteamVR {
         device_index: u32,
     ) -> TrackedDevicePose {
         if device_index == K_UN_TRACKED_DEVICE_INDEX_HMD && self.initialized {
-            self.tracking_state.poses[device_index as usize].clone()
+            self.tracking_state.poses[device_index as usize]
         } else if device_index == 1 && self.initialized {
-            self.left_controller.clone().unwrap_or_default()
+            self.left_controller.unwrap_or_default()
         } else if device_index == 2 && self.initialized {
-            self.right_controller.clone().unwrap_or_default()
+            self.right_controller.unwrap_or_default()
         } else {
             TrackedDevicePose::default()
         }
@@ -1302,9 +1397,10 @@ impl SteamVR {
 
     /// Polls for the next VR event. Returns `false` if no events are pending.
     /// Dequeues events from the internal `pending_events` queue (populated by
-    /// `update_controllers_from_steam_input`).
+    /// `update_controllers_from_steam_input`) in FIFO order, matching real
+    /// OpenVR event ordering.
     pub fn poll_next_event(&mut self, event: &mut VREvent, _size: u32) -> bool {
-        if let Some(ev) = self.pending_events.pop() {
+        if let Some(ev) = self.pending_events.pop_front() {
             *event = ev;
             true
         } else {
@@ -1370,7 +1466,6 @@ impl SteamVR {
         }
 
         let now = Instant::now();
-        let dt = now.duration_since(self.last_frame_time).as_secs_f64();
 
         // Compute a synthetic time-based offset for natural head sway.
         let t = self.frame_index as f64 * 0.016; // ~16 ms per frame
@@ -1393,54 +1488,34 @@ impl SteamVR {
 
         self.tracking_state.poses[K_UN_TRACKED_DEVICE_INDEX_HMD as usize] = hmd_pose;
 
-        // Update controller poses from stored state, with velocity prediction.
-        if let Some(ref pose) = self.left_controller {
-            let mut left = pose.clone();
-            // Estimate velocity from last frame's displacement.
-            if dt > 0.0 {
-                left.velocity[0] = (left.device_to_absolute_tracking[3]
-                    - self.tracking_state.poses[1].device_to_absolute_tracking[3])
-                    / dt as f32;
-                left.velocity[1] = (left.device_to_absolute_tracking[7]
-                    - self.tracking_state.poses[1].device_to_absolute_tracking[7])
-                    / dt as f32;
-                left.velocity[2] = (left.device_to_absolute_tracking[11]
-                    - self.tracking_state.poses[1].device_to_absolute_tracking[11])
-                    / dt as f32;
-            }
-            self.tracking_state.poses[1] = left;
+        // Controller poses are static in emulation (no motion controllers are
+        // tracked), so their velocity is genuinely zero; copying the stored
+        // pose directly avoids dead per-frame displacement math.
+        if let Some(pose) = self.left_controller {
+            self.tracking_state.poses[1] = pose;
         }
-        if let Some(ref pose) = self.right_controller {
-            let mut right = pose.clone();
-            if dt > 0.0 {
-                right.velocity[0] = (right.device_to_absolute_tracking[3]
-                    - self.tracking_state.poses[2].device_to_absolute_tracking[3])
-                    / dt as f32;
-                right.velocity[1] = (right.device_to_absolute_tracking[7]
-                    - self.tracking_state.poses[2].device_to_absolute_tracking[7])
-                    / dt as f32;
-                right.velocity[2] = (right.device_to_absolute_tracking[11]
-                    - self.tracking_state.poses[2].device_to_absolute_tracking[11])
-                    / dt as f32;
-            }
-            self.tracking_state.poses[2] = right;
+        if let Some(pose) = self.right_controller {
+            self.tracking_state.poses[2] = pose;
         }
 
-        // Mark devices 0 (HMD), 1 (left controller), 2 (right controller) as connected.
+        // Mark devices 0 (HMD), 1 (left controller), 2 (right controller) as
+        // connected. `tracking_result` must be `ETrackingResult_Running_OK`
+        // (200); 0 is not a valid `ETrackingResult` value and makes
+        // spec-compliant guests treat every pose as untracked.
         self.tracking_state.poses[0].pose_is_valid = 1u32;
-        self.tracking_state.poses[0].tracking_result = 0; // TrackingResult_Running_OK
+        self.tracking_state.poses[0].tracking_result = E_TRACKING_RESULT_RUNNING_OK;
         if self.left_controller.is_some() {
             self.tracking_state.poses[1].pose_is_valid = 1u32;
-            self.tracking_state.poses[1].tracking_result = 0;
+            self.tracking_state.poses[1].tracking_result = E_TRACKING_RESULT_RUNNING_OK;
         }
         if self.right_controller.is_some() {
             self.tracking_state.poses[2].pose_is_valid = 1u32;
-            self.tracking_state.poses[2].tracking_result = 0;
+            self.tracking_state.poses[2].tracking_result = E_TRACKING_RESULT_RUNNING_OK;
         }
 
         // Copy poses to output arrays.
-        *render_poses = self.tracking_state.poses.clone();
-        *game_poses = self.tracking_state.poses.clone();
+        *render_poses = self.tracking_state.poses;
+        *game_poses = self.tracking_state.poses;
 
         // Update compositor frame timing with predicted vsync.
         self.vsync_time_ns = std::time::SystemTime::now()
@@ -1485,7 +1560,7 @@ impl SteamVR {
 
     /// Sets the last pose for explicit timing mode.
     pub fn set_explicit_timing_last_pose(&mut self, pose: &TrackedDevicePose) {
-        self.compositor_state.explicit_timing_last_pose = pose.clone();
+        self.compositor_state.explicit_timing_last_pose = *pose;
     }
 
     // ── IVRChaperone methods ─────────────────────────────────────────────
@@ -1513,12 +1588,22 @@ impl SteamVR {
     /// Load a render model synchronously.
     ///
     /// `buffer` will receive the model data; returns the total size on success,
-    /// or 0 if the model name is unknown.
+    /// or 0 if the model name is unknown. Uses the data cached by
+    /// `load_render_model_async` when available, falling back to the built-in
+    /// generated meshes.
     pub fn load_render_model(&self, model_name: &str, buffer: &mut [u8]) -> u32 {
-        let model_data = match model_name {
-            "generic_hmd" => generate_hmd_render_model(),
-            "vr_controller_vive_1_5" => generate_controller_render_model(),
-            _ => return 0,
+        let cached = self
+            .loaded_render_models
+            .values()
+            .find(|(name, _)| name == model_name)
+            .map(|(_, data)| data.as_slice());
+        let model_data = match cached {
+            Some(data) => data,
+            None => match model_name {
+                "generic_hmd" => generate_hmd_render_model(),
+                "vr_controller_vive_1_5" => generate_controller_render_model(),
+                _ => return 0,
+            },
         };
         let len = model_data.len().min(buffer.len());
         buffer[..len].copy_from_slice(&model_data[..len]);
@@ -1766,31 +1851,42 @@ fn generate_controller_render_model() -> &'static [u8] {
 
 // ── fn_tables: IVRController and IVRInput function pointer tables ────────
 
+/// One vtable entry: `(thunk_name_or_stub, stack_cleanup_bytes)` for x86
+/// stdcall-style cleanup (arguments cleaned by the callee; `this` is passed
+/// as a regular stack argument in the dispatch convention used here).
+pub type FnTableEntry = (&'static str, u32);
+/// IVRController vtable (10 methods).
+pub type ControllerFnTable = [FnTableEntry; 10];
+/// IVRInput vtable (20 methods).
+pub type InputFnTable = [FnTableEntry; 20];
+
 /// Returns (controller_vtable, input_vtable) function tables matching the
 /// real OpenVR ABI at the given offsets.
 ///
-/// Each entry is `(thunk_variant_name_or_stub, stack_cleanup_bytes)`.
-pub fn controller_fn_tables() -> (
-    [(&'static str, u32); 10], // IVRController (10 methods)
-    [(&'static str, u32); 20], // IVRInput (20 methods)
-) {
+/// Each entry is `(thunk_variant_name_or_stub, stack_cleanup_bytes)`. Cleanup
+/// sizes are derived from the real x86 signatures:
+/// - `Release()` → 4 (`this`),
+/// - `TriggerHapticPulse(u32 axis, u16 duration)` → 12 (4 + 4 + 2 → 16-byte
+///   alignment),
+/// - `GetControllerState(u32 device, VRControllerState_t*)` → 8.
+pub fn controller_fn_tables() -> (ControllerFnTable, InputFnTable) {
     // IVRController_002 vtable (10 methods, offset 0 = Release)
-    let controller_vtable: [(&str, u32); 5] = [
-        ("Release", 4),               // 0: void Release()
-        ("TriggerHapticPulse", 16),   // 1: bool TriggerHapticPulse(u32 axis, u32 duration)
-        ("TriggerHapticPulseV2", 16), // 2: (unused)
-        ("GetControllerState", 12), // 3: bool GetControllerState(u32 device, VRControllerState_t*)
-        ("GetControllerStateForNextFrame", 12), // 4: same with predicted
-                                    // Remaining slots = unsupported
+    let controller_vtable: [FnTableEntry; 5] = [
+        ("Release", 4),             // 0: void Release()
+        ("TriggerHapticPulse", 12), // 1: bool TriggerHapticPulse(u32 axis, u16 duration)
+        ("TriggerHapticPulseV2", 12), // 2: (unused)
+        ("GetControllerState", 8),  // 3: bool GetControllerState(u32 device, VRControllerState_t*)
+        ("GetControllerStateForNextFrame", 8), // 4: same with predicted
+                                              // Remaining slots = unsupported
     ];
     // Pad to 10 entries
-    let mut controller_full: [(&str, u32); 10] = [("unsupported", 4); 10];
+    let mut controller_full: ControllerFnTable = [("unsupported", 4); 10];
     for (i, entry) in controller_vtable.iter().enumerate() {
         controller_full[i] = *entry;
     }
 
     // IVRInput_003 vtable (20 methods, offset 0 = Release)
-    let input_vtable: [(&str, u32); 11] = [
+    let input_vtable: [FnTableEntry; 11] = [
         ("Release", 4),                // 0
         ("SetActionManifestPath", 8),  // 1
         ("GetDigitalActionHandle", 8), // 2: u64 GetDigitalActionHandle(str name)
@@ -1799,12 +1895,12 @@ pub fn controller_fn_tables() -> (
         ("GetActionSetHandle", 8),     // 5
         ("GetDigitalActionData", 16),  // 6
         ("GetAnalogActionData", 16),   // 7
-        ("GetActionSetHandle", 12),    // 8: (duplicate in spec)
+        ("GetDigitalActionData", 16),  // 8: real slot 8 is GetDigitalActionData
         ("ActivateActionSet", 12),     // 9
         ("GetCurrentActionSet", 12),   // 10
                                        // Remaining = unsupported
     ];
-    let mut input_full: [(&str, u32); 20] = [("unsupported", 4); 20];
+    let mut input_full: InputFnTable = [("unsupported", 4); 20];
     for (i, entry) in input_vtable.iter().enumerate() {
         input_full[i] = *entry;
     }
