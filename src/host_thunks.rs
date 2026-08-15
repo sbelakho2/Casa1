@@ -267,8 +267,17 @@ pub fn read_guest_utf16_string_checked(
     let mut units = Vec::new();
     if length >= 0 {
         let count = (length as usize).min(max_units);
+        // `count * 2` could overflow usize for a huge `max_units`/`length`; a
+        // wrapped byte count would validate the wrong (tiny) range and let the
+        // read loop walk far beyond mapped memory. Check it explicitly.
+        let byte_len = count.checked_mul(2).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcGuestPointerOutOfRange,
+                format!("UTF-16 read length overflows: {count} code units"),
+            )
+        })?;
         // Validate the entire range upfront
-        validate_guest_pointer(memory, ptr, count * 2)?;
+        validate_guest_pointer(memory, ptr, byte_len)?;
         for i in 0..count {
             let cu = memory.read_u16(ptr + (i as u64 * 2)).unwrap_or(0);
             units.push(cu);
@@ -558,10 +567,7 @@ mod tests {
     fn test_utf16_read_null_terminated() {
         let mut mem = MemoryImage::default();
         // "Hi\0" in UTF-16LE
-        let data: Vec<u8> = [0x48, 0x00, 0x69, 0x00, 0x00, 0x00]
-            .iter()
-            .copied()
-            .collect();
+        let data: Vec<u8> = [0x48, 0x00, 0x69, 0x00, 0x00, 0x00].to_vec();
         mem.map_bytes(0x1000, &data);
         let s = read_guest_utf16_string_null_terminated(&mem, 0x1000, 256).unwrap();
         assert_eq!(s, "Hi");
@@ -571,10 +577,7 @@ mod tests {
     fn test_utf16_read_sized() {
         let mut mem = MemoryImage::default();
         // "ABCD" in UTF-16LE (no null terminator)
-        let data: Vec<u8> = [0x41, 0x00, 0x42, 0x00, 0x43, 0x00, 0x44, 0x00]
-            .iter()
-            .copied()
-            .collect();
+        let data: Vec<u8> = [0x41, 0x00, 0x42, 0x00, 0x43, 0x00, 0x44, 0x00].to_vec();
         mem.map_bytes(0x1000, &data);
         let s = read_guest_utf16_string_sized(&mem, 0x1000, 4, 256).unwrap();
         assert_eq!(s, "ABCD");
@@ -584,7 +587,7 @@ mod tests {
     fn test_utf16_truncated_surrogate_pair() {
         let mut mem = MemoryImage::default();
         // High surrogate without low surrogate (U+D800)
-        let data: Vec<u8> = [0x00, 0xD8, 0x00, 0x00].iter().copied().collect();
+        let data: Vec<u8> = [0x00, 0xD8, 0x00, 0x00].to_vec();
         mem.map_bytes(0x1000, &data);
         let s = read_guest_utf16_string_sized(&mem, 0x1000, 2, 256).unwrap();
         // U+D800 is an unpaired surrogate → replacement character
@@ -598,10 +601,7 @@ mod tests {
     fn test_utf16_invalid_surrogate_pair() {
         let mut mem = MemoryImage::default();
         // High surrogate followed by another high surrogate (invalid)
-        let data: Vec<u8> = [0x00, 0xD8, 0x01, 0xD8, 0x00, 0x00]
-            .iter()
-            .copied()
-            .collect();
+        let data: Vec<u8> = [0x00, 0xD8, 0x01, 0xD8, 0x00, 0x00].to_vec();
         mem.map_bytes(0x1000, &data);
         let s = read_guest_utf16_string_null_terminated(&mem, 0x1000, 256).unwrap();
         // Both should be replaced
@@ -615,10 +615,7 @@ mod tests {
     fn test_utf16_max_units_cap() {
         let mut mem = MemoryImage::default();
         // "ABCDE" in UTF-16LE with no null terminator
-        let data: Vec<u8> = [0x41, 0x00, 0x42, 0x00, 0x43, 0x00, 0x44, 0x00, 0x45, 0x00]
-            .iter()
-            .copied()
-            .collect();
+        let data: Vec<u8> = [0x41, 0x00, 0x42, 0x00, 0x43, 0x00, 0x44, 0x00, 0x45, 0x00].to_vec();
         mem.map_bytes(0x1000, &data);
         // Cap at 3 units even though 5 are available
         let s = read_guest_utf16_string_null_terminated(&mem, 0x1000, 3).unwrap();
@@ -670,10 +667,7 @@ mod tests {
     fn test_utf16_non_terminated_string() {
         let mut mem = MemoryImage::default();
         // Write "AB" without null terminator, followed by garbage
-        let data: Vec<u8> = [0x41, 0x00, 0x42, 0x00, 0xFF, 0xFF]
-            .iter()
-            .copied()
-            .collect();
+        let data: Vec<u8> = [0x41, 0x00, 0x42, 0x00, 0xFF, 0xFF].to_vec();
         mem.map_bytes(0x1000, &data);
         // Read exactly 2 code units (no null terminator expected)
         let s = read_guest_utf16_string_sized(&mem, 0x1000, 2, 256).unwrap();

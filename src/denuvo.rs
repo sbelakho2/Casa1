@@ -19,7 +19,7 @@
 use crate::cpu::MemoryImage;
 use crate::error::{AppError, AppResult};
 use crate::reason::ReasonCode;
-use crate::security::{AntiDebugState, DenuvoConfig, DenuvoEmulator, DenuvoVersion};
+use crate::security::{AntiDebugState, CodeSection, DenuvoConfig, DenuvoEmulator, DenuvoVersion};
 use aes::cipher::{BlockDecryptMut, KeyIvInit};
 #[cfg(test)]
 use aes::cipher::BlockEncryptMut;
@@ -154,6 +154,50 @@ pub struct EnhancedDenuvoEmulator {
     pub triggers_failed: u64,
     /// Session ID for this emulator instance (deterministic).
     pub session_id: u64,
+    /// Base address where the PE image is loaded in guest memory. Trigger
+    /// keys, tamper-hash keys, and the public API are all RVA-based; the
+    /// base is added only at the memory-access boundary.
+    #[serde(default)]
+    pub image_base: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Section containment lookup
+// ---------------------------------------------------------------------------
+
+/// Precomputed index for finding the code section containing an RVA in
+/// O(log S) instead of scanning all sections per query.
+struct SectionIndexLookup<'a> {
+    /// (section rva, section index) pairs sorted by rva.
+    by_rva: Vec<(u64, usize)>,
+    sections: &'a [CodeSection],
+}
+
+impl<'a> SectionIndexLookup<'a> {
+    fn new(sections: &'a [CodeSection]) -> Self {
+        let mut by_rva: Vec<(u64, usize)> = sections
+            .iter()
+            .enumerate()
+            .map(|(idx, s)| (s.rva, idx))
+            .collect();
+        by_rva.sort_unstable_by_key(|&(rva, _)| rva);
+        Self { by_rva, sections }
+    }
+
+    /// Returns the index of the section containing `rva`, if any.
+    fn find(&self, rva: u64) -> Option<usize> {
+        let pos = self.by_rva.partition_point(|&(start, _)| start <= rva);
+        if pos == 0 {
+            return None;
+        }
+        let (start, idx) = self.by_rva[pos - 1];
+        let section = &self.sections[idx];
+        if rva < start.saturating_add(section.size as u64) {
+            Some(idx)
+        } else {
+            None
+        }
+    }
 }
 
 impl EnhancedDenuvoEmulator {
@@ -170,6 +214,7 @@ impl EnhancedDenuvoEmulator {
             triggers_handled: 0,
             triggers_failed: 0,
             session_id,
+            image_base: 0,
         }
     }
 
@@ -185,6 +230,7 @@ impl EnhancedDenuvoEmulator {
     pub fn initialize(&mut self, memory: &mut MemoryImage, base: u64) -> AppResult<()> {
         // Initialize the base emulator
         self.base.initialize(memory, base)?;
+        self.image_base = base;
 
         // Set up triggers from the config's trigger points
         for &rva in &self.base.config.trigger_points {
@@ -202,7 +248,7 @@ impl EnhancedDenuvoEmulator {
         }
 
         // Set up tamper hash entries from code sections
-        for (idx, section) in self.base.config.code_sections.iter().enumerate() {
+        for section in &self.base.config.code_sections {
             self.tamper_hashes.insert(
                 section.rva,
                 TamperHashEntry {
@@ -213,14 +259,15 @@ impl EnhancedDenuvoEmulator {
                     verify_count: 0,
                 },
             );
-            // Associate triggers with sections based on proximity
-            for (&trigger_rva, trigger) in self.triggers.iter_mut() {
-                if trigger.section_index.is_none()
-                    && trigger_rva >= section.rva
-                    && trigger_rva < section.rva + section.size as u64
-                {
-                    trigger.section_index = Some(idx);
-                }
+        }
+
+        // Associate triggers with the code section that contains them,
+        // via a sorted interval lookup instead of an O(triggers × sections)
+        // scan.
+        let section_lookup = SectionIndexLookup::new(&self.base.config.code_sections);
+        for trigger in self.triggers.values_mut() {
+            if trigger.section_index.is_none() {
+                trigger.section_index = section_lookup.find(trigger.rva);
             }
         }
 
@@ -238,17 +285,30 @@ impl EnhancedDenuvoEmulator {
     /// - Call instructions to known Denuvo thunks
     /// - Indirect jumps through Denuvo's dispatch table
     /// - Specific byte sequences used as trigger markers
+    ///
+    /// Detected triggers are keyed by RVA (the same key space as
+    /// [`TriggerState::rva`] and the public trigger API); the image base is
+    /// added only when addressing guest memory.
     fn detect_triggers(&mut self, memory: &MemoryImage, base: u64) -> AppResult<()> {
+        // Precompute absolute section ranges for O(log S) containment checks
+        // instead of re-scanning every section per CALL instruction.
+        let mut section_ranges: Vec<(u64, u64, usize)> =
+            Vec::with_capacity(self.base.config.code_sections.len());
+        for (idx, section) in self.base.config.code_sections.iter().enumerate() {
+            let Some(start) = base.checked_add(section.rva) else {
+                continue;
+            };
+            section_ranges.push((start, start.saturating_add(section.size as u64), idx));
+        }
+        section_ranges.sort_unstable_by_key(|&(start, _, _)| start);
+
         // Scan each code section for trigger patterns
         for (idx, section) in self.base.config.code_sections.iter().enumerate() {
-            let abs_addr = if section.rva >= base {
-                section.rva
-            } else {
-                base + section.rva
+            let Some(abs_addr) = base.checked_add(section.rva) else {
+                continue;
             };
-            let data = match memory.read_bytes(abs_addr, section.size as usize) {
-                Ok(d) => d,
-                Err(_) => continue,
+            let Ok(data) = memory.read_bytes(abs_addr, section.size as usize) else {
+                continue;
             };
 
             // Scan for CALL rel32 instructions (E8 xx xx xx xx) that target
@@ -263,29 +323,24 @@ impl EnhancedDenuvoEmulator {
                         data[offset + 3],
                         data[offset + 4],
                     ]);
-                    let target = (abs_addr + offset as u64 + 5).wrapping_add(rel32 as u64);
+                    let target = abs_addr
+                        .wrapping_add(offset as u64 + 5)
+                        .wrapping_add(rel32 as u64);
 
                     // Check if target is outside all known code sections
-                    let in_section = self
-                        .base
-                        .config
-                        .code_sections
-                        .iter()
-                        .any(|s| target >= s.rva && target < s.rva + s.size as u64);
+                    let pos = section_ranges.partition_point(|&(start, _, _)| start <= target);
+                    let in_section = pos > 0 && target < section_ranges[pos - 1].1;
 
-                    if !in_section && !self.triggers.contains_key(&target) {
-                        let trigger_rva = abs_addr + offset as u64;
-                        self.triggers.insert(
-                            trigger_rva,
-                            TriggerState {
-                                rva: trigger_rva,
-                                trigger_type: TriggerType::CodeDecrypt,
-                                fired: false,
-                                hit_count: 0,
-                                section_index: Some(idx),
-                                last_fired_time: 0,
-                            },
-                        );
+                    if !in_section {
+                        let trigger_rva = section.rva.saturating_add(offset as u64);
+                        self.triggers.entry(trigger_rva).or_insert(TriggerState {
+                            rva: trigger_rva,
+                            trigger_type: TriggerType::CodeDecrypt,
+                            fired: false,
+                            hit_count: 0,
+                            section_index: Some(idx),
+                            last_fired_time: 0,
+                        });
                     }
                 }
                 offset += 1;
@@ -305,6 +360,10 @@ impl EnhancedDenuvoEmulator {
     /// 2. Performs the required action (decrypt, verify, etc.)
     /// 3. Updates the trigger state
     /// 4. Returns whether the trigger was successfully handled
+    ///
+    /// `rva` is a relative virtual address (the same key space used by
+    /// [`add_trigger`](Self::add_trigger) and [`trigger_rvas`](Self::trigger_rvas));
+    /// the image base is added at the guest-memory boundary.
     pub fn handle_trigger(&mut self, memory: &mut MemoryImage, rva: u64) -> AppResult<bool> {
         let trigger = match self.triggers.get_mut(&rva) {
             Some(t) => t,
@@ -317,26 +376,20 @@ impl EnhancedDenuvoEmulator {
         let trigger_type = trigger.trigger_type.clone();
         let section_index = trigger.section_index;
 
-        match trigger_type {
-            TriggerType::LicenseCheck => {
-                self.handle_license_trigger()?;
-            }
-            TriggerType::CodeDecrypt => {
-                self.handle_decrypt_trigger(memory, section_index)?;
-            }
-            TriggerType::IntegrityCheck => {
-                self.handle_integrity_trigger(memory, section_index)?;
-            }
+        let result = match trigger_type {
+            TriggerType::LicenseCheck => self.handle_license_trigger(),
+            TriggerType::CodeDecrypt => self.handle_decrypt_trigger(memory, section_index),
+            TriggerType::IntegrityCheck => self.handle_integrity_trigger(memory, section_index),
             TriggerType::AntiDebug => {
                 self.handle_anti_debug_trigger();
+                Ok(())
             }
-            TriggerType::HardwareBind => {
-                self.handle_hardware_bind_trigger()?;
-            }
-            TriggerType::Unknown(_) => {
-                // Unknown triggers: try to handle as a decrypt trigger
-                self.handle_decrypt_trigger(memory, section_index)?;
-            }
+            TriggerType::HardwareBind => self.handle_hardware_bind_trigger(),
+            TriggerType::Unknown(_) => self.handle_decrypt_trigger(memory, section_index),
+        };
+        if let Err(error) = result {
+            self.triggers_failed += 1;
+            return Err(error);
         }
 
         // Mark trigger as fired
@@ -367,9 +420,13 @@ impl EnhancedDenuvoEmulator {
     ) -> AppResult<()> {
         match section_index {
             Some(idx) => {
-                if idx < self.base.config.code_sections.len()
-                    && self.base.config.code_sections[idx].encrypted
-                {
+                if idx >= self.base.config.code_sections.len() {
+                    return Err(AppError::new(
+                        ReasonCode::RcDrmSectionNotFound,
+                        format!("decrypt trigger section index {idx} out of bounds"),
+                    ));
+                }
+                if self.base.config.code_sections[idx].encrypted {
                     self.base.decrypt_code_section(memory, idx)?;
                 }
             }
@@ -394,6 +451,14 @@ impl EnhancedDenuvoEmulator {
     ) -> AppResult<()> {
         match section_index {
             Some(idx) => {
+                // `section_index` is user-controlled via `add_trigger`, so it
+                // must be bounds-checked before dispatch.
+                if idx >= self.base.config.code_sections.len() {
+                    return Err(AppError::new(
+                        ReasonCode::RcDrmSectionNotFound,
+                        format!("integrity trigger section index {idx} out of bounds"),
+                    ));
+                }
                 self.base.verify_integrity(memory, idx)?;
             }
             None => {
@@ -470,8 +535,7 @@ impl EnhancedDenuvoEmulator {
     pub fn get_rdtsc_value(&self) -> u64 {
         use std::sync::atomic::{AtomicU64, Ordering};
         static RDTSC_COUNTER: AtomicU64 = AtomicU64::new(1_000_000);
-        let prev = RDTSC_COUNTER.fetch_add(self.anti_debug_timing.rdtsc_delta, Ordering::Relaxed);
-        prev
+        RDTSC_COUNTER.fetch_add(self.anti_debug_timing.rdtsc_delta, Ordering::Relaxed)
     }
 
     // -----------------------------------------------------------------------
@@ -502,13 +566,13 @@ impl EnhancedDenuvoEmulator {
         }
 
         // Also run the base emulator's integrity check
-        if let Some(section_idx) = self.find_section_index(rva_owned) {
-            if let Err(error) = self.base.verify_integrity(memory, section_idx) {
-                eprintln!(
-                    "[Denuvo] verify_tamper_hash: base integrity check failed for section {}: {}",
-                    section_idx, error
-                );
-            }
+        if let Some(section_idx) = self.find_section_index(rva_owned)
+            && let Err(error) = self.base.verify_integrity(memory, section_idx)
+        {
+            eprintln!(
+                "[Denuvo] verify_tamper_hash: base integrity check failed for section {}: {}",
+                section_idx, error
+            );
         }
 
         Ok(expected_hash)
@@ -613,7 +677,17 @@ impl EnhancedDenuvoEmulator {
         memory: &mut MemoryImage,
         section_index: usize,
     ) -> AppResult<()> {
-        let section = &self.base.config.code_sections[section_index];
+        let section = self
+            .base
+            .config
+            .code_sections
+            .get(section_index)
+            .ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcDrmSectionNotFound,
+                    format!("denuvo code section index {section_index} out of bounds"),
+                )
+            })?;
 
         // Derive combined key material from hardware ID + section hash + session ID
         let mut key_material = Vec::with_capacity(48);
@@ -636,7 +710,12 @@ impl EnhancedDenuvoEmulator {
             i
         };
 
-        let abs_addr = section.rva;
+        let abs_addr = self.image_base.checked_add(section.rva).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcDrmDecryptFailed,
+                "denuvo section address overflows",
+            )
+        })?;
         let mut data = section.decrypted.clone();
 
         // AES-128-CBC decrypt with PKCS7 padding
@@ -668,7 +747,17 @@ impl EnhancedDenuvoEmulator {
         memory: &mut MemoryImage,
         section_index: usize,
     ) -> AppResult<()> {
-        let section = &self.base.config.code_sections[section_index];
+        let section = self
+            .base
+            .config
+            .code_sections
+            .get(section_index)
+            .ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcDrmSectionNotFound,
+                    format!("denuvo code section index {section_index} out of bounds"),
+                )
+            })?;
 
         // Derive key from hardware ID + section hash + session ID + per-section nonce
         let mut key_material = Vec::with_capacity(64);
@@ -696,7 +785,12 @@ impl EnhancedDenuvoEmulator {
             k
         };
 
-        let abs_addr = section.rva;
+        let abs_addr = self.image_base.checked_add(section.rva).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcDrmDecryptFailed,
+                "denuvo section address overflows",
+            )
+        })?;
         let mut data = section.decrypted.clone();
 
         // AES-256-CBC decrypt with PKCS7 padding
@@ -727,11 +821,7 @@ impl EnhancedDenuvoEmulator {
 
     /// Finds the section index containing the given RVA.
     fn find_section_index(&self, rva: u64) -> Option<usize> {
-        self.base
-            .config
-            .code_sections
-            .iter()
-            .position(|s| rva >= s.rva && rva < s.rva + s.size as u64)
+        SectionIndexLookup::new(&self.base.config.code_sections).find(rva)
     }
 
     /// Returns the number of unfired triggers.
@@ -942,7 +1032,7 @@ mod tests {
             let block_size = 16usize;
             let pad_len = block_size - (plaintext.len() % block_size);
             let mut padded = plaintext.clone();
-            padded.extend(std::iter::repeat(pad_len as u8).take(pad_len));
+            padded.extend(std::iter::repeat_n(pad_len as u8, pad_len));
             type Aes128CbcEnc = cbc::Encryptor<aes::Aes128>;
             let enc = Aes128CbcEnc::new(&aes_key.into(), &iv.into());
             let ct = enc
@@ -1003,7 +1093,7 @@ mod tests {
         assert!(tsc2 > tsc1);
         // Delta should be approximately rdtsc_delta
         let delta = tsc2 - tsc1;
-        assert!(delta >= 1000 && delta <= 10000, "delta was {delta}");
+        assert!((1000..=10000).contains(&delta), "delta was {delta}");
     }
 
     #[test]
@@ -1090,7 +1180,7 @@ mod tests {
         let block_size = 16usize;
         let pad_len = block_size - (code.len() % block_size);
         let mut padded = code.clone();
-        padded.extend(std::iter::repeat(pad_len as u8).take(pad_len));
+        padded.extend(std::iter::repeat_n(pad_len as u8, pad_len));
         type Aes128CbcEnc = cbc::Encryptor<aes::Aes128>;
         let enc = Aes128CbcEnc::new(&aes_key.into(), &iv.into());
         let ct = enc
@@ -1170,7 +1260,7 @@ mod tests {
         let block_size = 16usize;
         let pad_len = block_size - (code.len() % block_size);
         let mut padded = code.clone();
-        padded.extend(std::iter::repeat(pad_len as u8).take(pad_len));
+        padded.extend(std::iter::repeat_n(pad_len as u8, pad_len));
         type Aes256CbcEnc = cbc::Encryptor<aes::Aes256>;
         let enc = Aes256CbcEnc::new(&aes_key.into(), &iv.into());
         let ct = enc
