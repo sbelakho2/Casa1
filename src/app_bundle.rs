@@ -23,6 +23,7 @@ use serde::Serialize;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 /// Configuration for creating an app bundle.
 #[derive(Debug, Clone, Serialize)]
@@ -66,12 +67,14 @@ impl Default for AppBundleConfig {
     }
 }
 
-/// Normalize an app name to a valid bundle identifier component.
+/// Normalize an app name to a valid bundle identifier component.  Restricted
+/// to ASCII alphanumerics so the result is always a valid ASCII bundle-ID
+/// segment and can never contain path separators or traversal sequences.
 fn normalize_name(name: &str) -> String {
     let sanitized: String = name
         .chars()
         .map(|c| {
-            if c.is_alphanumeric() || c == '-' || c == '.' {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '.' {
                 c
             } else {
                 '-'
@@ -111,9 +114,7 @@ fn generate_info_plist(config: &AppBundleConfig) -> String {
     plist.push_str(r#"<dict>"#);
 
     // Basic bundle metadata
-    plist.push_str(&format!(
-        r#"<key>CFBundleExecutable</key><string>casa1-wrapper</string>"#
-    ));
+    plist.push_str(r#"<key>CFBundleExecutable</key><string>casa1-wrapper</string>"#);
     plist.push_str(&format!(
         r#"<key>CFBundleIdentifier</key><string>{}</string>"#,
         xml_escape(&bundle_id)
@@ -126,19 +127,11 @@ fn generate_info_plist(config: &AppBundleConfig) -> String {
         r#"<key>CFBundleDisplayName</key><string>{}</string>"#,
         xml_escape(&config.app_name)
     ));
-    plist.push_str(&format!(
-        r#"<key>CFBundleIconFile</key><string>icon</string>"#
-    ));
-    plist.push_str(&format!(
-        r#"<key>CFBundlePackageType</key><string>APPL</string>"#
-    ));
-    plist.push_str(&format!(
-        r#"<key>CFBundleInfoDictionaryVersion</key><string>6.0</string>"#
-    ));
-    plist.push_str(&format!(r#"<key>CFBundleVersion</key><string>1</string>"#));
-    plist.push_str(&format!(
-        r#"<key>CFBundleShortVersionString</key><string>1.0</string>"#
-    ));
+    plist.push_str(r#"<key>CFBundleIconFile</key><string>icon</string>"#);
+    plist.push_str(r#"<key>CFBundlePackageType</key><string>APPL</string>"#);
+    plist.push_str(r#"<key>CFBundleInfoDictionaryVersion</key><string>6.0</string>"#);
+    plist.push_str(r#"<key>CFBundleVersion</key><string>1</string>"#);
+    plist.push_str(r#"<key>CFBundleShortVersionString</key><string>1.0</string>"#);
     plist.push_str(&format!(
         r#"<key>LSMinimumSystemVersion</key><string>{}</string>"#,
         xml_escape(min_version)
@@ -184,17 +177,31 @@ fn xml_escape(s: &str) -> String {
         .replace("'", "&apos;")
 }
 
+/// Shell-quote a guest-controlled value for interpolation into the wrapper
+/// script, removing NUL bytes (which `shlex::try_quote` rejects and which
+/// cannot appear in a shell script anyway).
+fn shell_quote(value: &str) -> String {
+    let cleaned = if value.contains('\0') {
+        value.replace('\0', "?")
+    } else {
+        value.to_string()
+    };
+    match shlex::try_quote(&cleaned) {
+        Ok(quoted) => quoted.into_owned(),
+        Err(_) => cleaned,
+    }
+}
+
 /// Generate the casa1-wrapper shell script.
 fn generate_wrapper_script(config: &AppBundleConfig) -> String {
-    let exe_path = &config.executable_path;
-    let ge_name = &config.ge_name;
+    let exe_path = shell_quote(&config.executable_path);
+    let ge_name = shell_quote(&config.ge_name);
     let args_str = match &config.args {
-        Some(a) => {
-            let quoted = shlex::try_quote(a).unwrap_or_else(|_| std::borrow::Cow::Owned(a.clone()));
-            format!("--args {}", quoted)
-        }
+        Some(a) => format!("--args {}", shell_quote(a)),
         None => String::new(),
     };
+    // Newlines in the display name would break out of the comment line.
+    let comment_name = config.app_name.replace(['\n', '\r'], " ");
 
     format!(
         r#"#!/bin/bash
@@ -216,7 +223,7 @@ fi
 
 exec "$CASA1_BIN" ge:run --ge "{}" --exe "{}" {}
 "#,
-        config.app_name,
+        comment_name,
         env!("CARGO_PKG_VERSION"),
         ge_name,
         exe_path,
@@ -241,7 +248,9 @@ pub fn create_app_bundle(config: &AppBundleConfig, apps_dir: &Path) -> AppResult
         ));
     }
 
-    let app_name = format!("{}.app", &config.app_name);
+    // Use the normalized name for the directory: the raw name may contain
+    // path separators or traversal sequences that would escape apps_dir.
+    let app_name = format!("{}.app", normalized_name);
     let app_path = apps_dir.join(&app_name);
 
     // Create directory structure
@@ -339,8 +348,16 @@ pub fn create_app_bundle(config: &AppBundleConfig, apps_dir: &Path) -> AppResult
         })?;
     }
 
-    // Register with Launch Services
-    register_with_launch_services(&app_path)?;
+    // Register with Launch Services.  Registration is auxiliary to bundle
+    // creation: a failure here must not leave the caller with a "failed"
+    // install of an otherwise complete bundle.
+    if let Err(e) = register_with_launch_services(&app_path) {
+        eprintln!(
+            "[app_bundle] Launch Services registration failed for {}: {}",
+            app_path.display(),
+            e.message
+        );
+    }
 
     Ok(app_path)
 }
@@ -386,27 +403,37 @@ pub fn register_with_launch_services(app_path: &Path) -> AppResult<()> {
     Ok(())
 }
 
-/// Check if an app bundle is registered with Launch Services by searching.
+/// Check if an app bundle is registered with Launch Services by dumping the
+/// LS registration database (Spotlight-based `mdfind` can be disabled or
+/// stale, and its substring match confused names inside other paths).
 pub fn is_app_registered(app_name: &str) -> AppResult<bool> {
     use std::process::Command;
 
-    let app_bundle = format!("{}.app", app_name);
-    let output = Command::new("mdfind")
-        .arg("kMDItemFSName")
-        .arg(&app_bundle)
+    let lsregister_path = "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister";
+    let needle = format!("{}.app", app_name);
+    let output = Command::new(lsregister_path)
+        .arg("-dump")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .output()
         .map_err(|e| {
             AppError::from_io(
                 ReasonCode::RcIo,
-                "failed to run mdfind for app registration check",
+                "failed to run lsregister for app registration check",
                 &e,
             )
         })?;
 
+    if !output.status.success() {
+        return Ok(false);
+    }
+
     let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(stdout.contains(&app_bundle))
+    Ok(stdout.lines().any(|line| {
+        line.trim_start()
+            .strip_prefix("path:")
+            .is_some_and(|rest| rest.trim().ends_with(&needle))
+    }))
 }
 
 /// List all Casa1-installed app bundles in the given apps directory.
@@ -434,7 +461,7 @@ pub fn list_installed_apps(apps_dir: &Path) -> AppResult<Vec<InstalledApp>> {
             )
         })?;
         let path = entry.path();
-        if path.extension().map_or(false, |ext| ext == "app") {
+        if path.extension().is_some_and(|ext| ext == "app") {
             let plist_path = path.join("Contents").join("Info.plist");
             if plist_path.exists() {
                 let plist_content = fs::read_to_string(&plist_path).unwrap_or_default();
@@ -481,16 +508,34 @@ pub fn uninstall_app(app_path: &Path) -> AppResult<()> {
         eprintln!("[app_bundle] failed to deregister app from Launch Services: {e}");
     }
 
-    // Remove the app bundle
-    if app_path.exists() {
-        fs::remove_dir_all(app_path).map_err(|e| {
-            AppError::from_io(
-                ReasonCode::RcIo,
-                format!("failed to remove app bundle: {}", app_path.display()),
-                &e,
-            )
-        })?;
+    // Check the target *before* removing: refuse symlinks and non-directories
+    // so a swapped path cannot redirect remove_dir_all at an unrelated tree,
+    // then remove directly without a separate exists() probe (TOCTOU).
+    let metadata = fs::symlink_metadata(app_path).map_err(|e| {
+        AppError::from_io(
+            ReasonCode::RcIo,
+            format!("failed to stat app bundle: {}", app_path.display()),
+            &e,
+        )
+    })?;
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() || !file_type.is_dir() {
+        return Err(AppError::new(
+            ReasonCode::RcIo,
+            format!(
+                "refusing to remove non-directory app bundle path: {}",
+                app_path.display()
+            ),
+        ));
     }
+
+    fs::remove_dir_all(app_path).map_err(|e| {
+        AppError::from_io(
+            ReasonCode::RcIo,
+            format!("failed to remove app bundle: {}", app_path.display()),
+            &e,
+        )
+    })?;
 
     Ok(())
 }
@@ -507,40 +552,71 @@ fn extract_plist_value(plist_xml: &str, key: &str) -> Option<String> {
     None
 }
 
+/// Registry for the currently-held App Nap activity token.
+///
+/// `beginActivityWithOptions:reason:` returns a +1 retained ObjC object.  The
+/// token is stored here (as a pointer-sized integer) so that
+/// [`allow_app_nap`] can end *and release* it, preventing one leaked ObjC
+/// object per prevent/allow cycle.
+static APP_NAP_TOKEN: OnceLock<Mutex<Option<usize>>> = OnceLock::new();
+
+fn app_nap_token_guard() -> std::sync::MutexGuard<'static, Option<usize>> {
+    APP_NAP_TOKEN
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Prevent App Nap during gameplay using NSProcessInfo activity assertion.
 pub fn prevent_app_nap() -> AppResult<()> {
     // Use the Objective-C runtime to create an activity assertion
     // This prevents macOS from throttling the app during gameplay
-    let result: u64 = unsafe {
+    unsafe {
         let cls = objc::class!(NSProcessInfo);
         let info: *mut objc::runtime::Object = msg_send![cls, processInfo];
         if info.is_null() {
             return Err(AppError::new(ReasonCode::RcIo, "NSProcessInfo is null"));
         }
         let reason: *mut objc::runtime::Object = msg_send![objc::class!(NSString), stringWithUTF8String: c"Casa1 Game Activity".as_ptr()];
-        let activity: u64 = msg_send![info, beginActivityWithOptions: 0x00FFFFFF reason: reason];
-        activity
-    };
-    if result == 0 {
-        return Err(AppError::new(
-            ReasonCode::RcIo,
-            "failed to create NSProcessActivity assertion",
-        ));
+        let activity: *mut objc::runtime::Object =
+            msg_send![info, beginActivityWithOptions: 0x00FFFFFF reason: reason];
+        if activity.is_null() {
+            return Err(AppError::new(
+                ReasonCode::RcIo,
+                "failed to create NSProcessActivity assertion",
+            ));
+        }
+        // Release any previously held token, then store the new one.
+        let mut guard = app_nap_token_guard();
+        if let Some(previous) = guard.take() {
+            let previous: *mut objc::runtime::Object = previous as *mut objc::runtime::Object;
+            let _: () = msg_send![previous, release];
+        }
+        *guard = Some(activity as usize);
     }
     Ok(())
 }
 
-/// End the App Nap prevention activity.
+/// End the App Nap prevention activity and release the retained activity
+/// token object.
 pub fn allow_app_nap(activity_id: u64) {
     if activity_id == 0 {
         return;
     }
+    let mut guard = app_nap_token_guard();
+    // Only release the token we actually created; a mismatched handle must
+    // not end up releasing an unrelated pointer.
+    if guard.take() != Some(activity_id as usize) {
+        return;
+    }
     unsafe {
+        let token: *mut objc::runtime::Object = activity_id as *mut objc::runtime::Object;
         let cls = objc::class!(NSProcessInfo);
         let info: *mut objc::runtime::Object = msg_send![cls, processInfo];
         if !info.is_null() {
-            let _: () = msg_send![info, endActivity: activity_id];
+            let _: () = msg_send![info, endActivity: token];
         }
+        let _: () = msg_send![token, release];
     }
 }
 
@@ -679,10 +755,34 @@ mod tests {
             ..Default::default()
         };
         let script = generate_wrapper_script(&config);
-        assert!(script.contains("C:\\Games\\game.exe"));
+        // The exe path is shell-quoted so it cannot inject additional
+        // commands into the wrapper script.
+        assert!(script.contains(r#""C:\\Games\\game.exe""#));
         assert!(script.contains("my-ge"));
         assert!(script.contains("App Wrapper"));
         assert!(script.starts_with("#!/bin/bash"));
+    }
+
+    #[test]
+    fn test_wrapper_script_quotes_injection_sensitive_values() {
+        let config = AppBundleConfig {
+            app_name: "Bad\n#injected".to_string(),
+            executable_path: r#"x"; rm -rf ~ #"#.to_string(),
+            ge_name: "$(touch /tmp/pwned)".to_string(),
+            args: Some("--port 80; reboot".to_string()),
+            ..Default::default()
+        };
+        let script = generate_wrapper_script(&config);
+        // A newline in app_name must not break out of the comment line.
+        assert!(!script.lines().any(|l| l.starts_with("#injected")));
+        // Exactly one exec line, and every payload appears shell-quoted.
+        let exec_lines: Vec<&str> = script.lines().filter(|l| l.starts_with("exec ")).collect();
+        assert_eq!(exec_lines.len(), 1);
+        let exec_line = exec_lines[0];
+        assert!(exec_line.contains(r"'$(touch /tmp/pwned)'"));
+        assert!(exec_line.contains(r#"'x"; rm -rf ~ #'"#));
+        assert!(exec_line.contains(r"'--port 80; reboot'"));
+        assert!(!exec_line.contains("--ge $("));
     }
 
     #[test]

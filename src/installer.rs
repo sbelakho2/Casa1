@@ -52,8 +52,7 @@ fn probe_dotnet_cli_exists() -> bool {
     std::process::Command::new("dotnet")
         .arg("--version")
         .output()
-        .ok()
-        .map_or(false, |o| o.status.success())
+        .is_ok_and(|o| o.status.success())
 }
 
 fn probe_dotnet_runtimes() -> Vec<(String, String)> {
@@ -115,22 +114,20 @@ fn probe_mono() -> (bool, Option<String>, Option<u32>) {
 /// "netcore" (.NET Core 1-3.1), or "net" (.NET 5+).
 fn classify_dotnet_version(version: &str) -> Option<(&'static str, u32, u32)> {
     // Strip leading 'v' or 'V'
-    let v = version.trim_start_matches(|c: char| c == 'v' || c == 'V');
+    let v = version.trim_start_matches(['v', 'V']);
 
     // Handle TFMoniker-style: net6.0, net8.0, netcoreapp3.1, net48, net472, etc.
-    if v.starts_with("net") {
-        if v.starts_with("netcoreapp") {
-            // netcoreapp1.0, netcoreapp2.0, netcoreapp3.1
-            let rest = &v["netcoreapp".len()..];
-            if let Some(dot) = rest.find('.') {
-                let major: u32 = rest[..dot].parse().ok()?;
-                let minor: u32 = rest[dot + 1..].parse().ok()?;
-                return Some(("netcore", major, minor));
-            }
-            return None;
+    if let Some(rest) = v.strip_prefix("netcoreapp") {
+        // netcoreapp1.0, netcoreapp2.0, netcoreapp3.1
+        if let Some(dot) = rest.find('.') {
+            let major: u32 = rest[..dot].parse().ok()?;
+            let minor: u32 = rest[dot + 1..].parse().ok()?;
+            return Some(("netcore", major, minor));
         }
+        return None;
+    }
+    if let Some(rest) = v.strip_prefix("net") {
         // net6.0, net7.0, net8.0, net9.0 or net48, net472
-        let rest = &v[3..]; // after "net"
         if let Some(dot) = rest.find('.') {
             // Has a decimal point: net6.0, net8.0
             let major: u32 = rest[..dot].parse().ok()?;
@@ -140,12 +137,12 @@ fn classify_dotnet_version(version: &str) -> Option<(&'static str, u32, u32)> {
             }
             return Some(("netcore", major, minor));
         }
-        // No decimal point: net48, net472 — these are .NET Framework 4.x
-        // "net48" -> major=4, minor=8; "net472" -> major=4, minor=7.2? No, minor=7
+        // No decimal point: net20, net35, net48, net472 — these are .NET Framework
+        // monikers where each digit encodes a version part (net48 -> 4.8).
         if rest.len() == 2 {
-            // net48 -> 4.8
-            let major = 4u32;
-            let minor: u32 = rest.parse().ok()?;
+            // net20 -> (2, 0), net35 -> (3, 5), net48 -> (4, 8)
+            let major: u32 = rest[..1].parse().ok()?;
+            let minor: u32 = rest[1..].parse().ok()?;
             return Some(("netfx", major, minor));
         }
         if rest.len() == 3 && rest.starts_with('4') {
@@ -411,14 +408,12 @@ impl InstallerEngine {
         user_silent_flags: Option<Vec<String>>,
     ) -> AppResult<InstallerRunResult> {
         let silent_flags = self.detect_silent_flags(spec.framework, user_silent_flags);
-        // Snapshot current state for rollback on failure
-        let _files_snapshot = self.files.clone();
-        let _registry_snapshot = self.registry.clone();
         for (path, bytes) in &spec.files {
             self.files.insert(normalize_path(path), bytes.clone());
         }
         for (key, value) in &spec.registry {
-            self.registry.insert(key.clone(), value.clone());
+            self.registry
+                .insert(normalize_registry_key(key), value.clone());
         }
         let telemetry = InstallerTelemetry {
             installer_id: spec.id.clone(),
@@ -434,9 +429,6 @@ impl InstallerEngine {
             silent_flags,
         };
         self.telemetry_log.push(telemetry.clone());
-        // If we wanted to simulate a failure, we'd restore snapshots here.
-        // Currently no failure path exists for GUI installers, but the snapshot
-        // is captured so that future error handling can roll back cleanly.
         Ok(InstallerRunResult {
             manifest_hash: self.tree_hash(),
             telemetry,
@@ -461,8 +453,9 @@ impl InstallerEngine {
                 created_files.push(normalized);
             }
             for (key, value) in &component.registry {
-                self.registry.insert(key.clone(), value.clone());
-                registry_changes.push(key.clone());
+                let normalized = normalize_registry_key(key);
+                self.registry.insert(normalized.clone(), value.clone());
+                registry_changes.push(normalized);
             }
             logs.push(format!("component:{}:{}", component.id, component.keypath));
         }
@@ -542,8 +535,9 @@ impl InstallerEngine {
                 removed_files.push(normalized);
             }
             for key in component.registry.keys() {
-                self.registry.remove(key);
-                removed_registry.push(key.clone());
+                let normalized = normalize_registry_key(key);
+                self.registry.remove(&normalized);
+                removed_registry.push(normalized);
             }
         }
         let telemetry = InstallerTelemetry {
@@ -753,7 +747,17 @@ impl InstallerEngine {
                         format!("download chunk path mismatch for {case_path}"),
                     ));
                 }
-                let end = offset + bytes.len();
+                let Some(end) = offset
+                    .checked_add(bytes.len())
+                    .filter(|&end| end <= assembled.len())
+                else {
+                    self.files = files_snapshot;
+                    self.registry = registry_snapshot;
+                    return Err(AppError::new(
+                        ReasonCode::RcIo,
+                        format!("download chunk out of bounds for {normalized}"),
+                    ));
+                };
                 assembled[*offset..end].copy_from_slice(bytes);
             }
             if assembled != operation.replacement {
@@ -818,6 +822,23 @@ pub fn search_magic_bytes(data: &[u8], magic: &[u8]) -> Option<usize> {
     data.windows(magic.len()).position(|window| window == magic)
 }
 
+/// Maximum bytes read for installer *detection* scans.  Detection only needs
+/// the MSI magic, PE headers and marker strings; a cap prevents a malicious
+/// multi-GB file from being slurped into memory once per engine.
+const MAX_DETECT_READ: u64 = 1024 * 1024 * 1024;
+
+/// Read a file for detection, bounded to [`MAX_DETECT_READ`] bytes.
+fn read_installer_capped(path: &Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let file = fs::File::open(path)?;
+    let mut data = Vec::new();
+    file.take(MAX_DETECT_READ + 1).read_to_end(&mut data)?;
+    if data.len() > MAX_DETECT_READ as usize {
+        data.truncate(MAX_DETECT_READ as usize);
+    }
+    Ok(data)
+}
+
 /// Extract the overlay data from a PE executable (data beyond the last PE
 /// section).  Returns the raw overlay bytes.
 pub fn extract_exe_overlay(path: &Path) -> AppResult<Vec<u8>> {
@@ -828,11 +849,16 @@ pub fn extract_exe_overlay(path: &Path) -> AppResult<Vec<u8>> {
             &e,
         )
     })?;
+    extract_exe_overlay_bytes(&data)
+}
 
+/// Byte-based variant of [`extract_exe_overlay`] that avoids re-reading the
+/// file from disk.
+fn extract_exe_overlay_bytes(data: &[u8]) -> AppResult<Vec<u8>> {
     if data.len() < 64 {
         return Err(AppError::new(
             ReasonCode::RcPeParseInvalid,
-            format!("file too small to be a PE: {}", path.display()),
+            "file too small to be a PE",
         ));
     }
 
@@ -841,7 +867,7 @@ pub fn extract_exe_overlay(path: &Path) -> AppResult<Vec<u8>> {
     if e_lfanew + 4 > data.len() {
         return Err(AppError::new(
             ReasonCode::RcPeParseInvalid,
-            format!("invalid e_lfanew in {}", path.display()),
+            "invalid e_lfanew in PE file",
         ));
     }
 
@@ -849,7 +875,15 @@ pub fn extract_exe_overlay(path: &Path) -> AppResult<Vec<u8>> {
     if &data[e_lfanew..e_lfanew + 4] != b"PE\x00\x00" {
         return Err(AppError::new(
             ReasonCode::RcPeParseInvalid,
-            format!("not a valid PE file: {}", path.display()),
+            "not a valid PE file",
+        ));
+    }
+
+    // COFF header (20 bytes) + optional-header magic (2 bytes) must be present
+    if e_lfanew + 28 > data.len() {
+        return Err(AppError::new(
+            ReasonCode::RcPeParseInvalid,
+            "PE header truncated",
         ));
     }
 
@@ -864,7 +898,7 @@ pub fn extract_exe_overlay(path: &Path) -> AppResult<Vec<u8>> {
     if sections_offset + num_sections * 40 > data.len() {
         return Err(AppError::new(
             ReasonCode::RcPeParseInvalid,
-            format!("section headers exceed file size in {}", path.display()),
+            "section headers exceed file size in PE file",
         ));
     }
 
@@ -914,18 +948,28 @@ pub fn read_pe_version_string(path: &Path, string_name: &str) -> AppResult<Optio
             &e,
         )
     })?;
+    Ok(pe_version_string_from_data(&data, string_name))
+}
 
+/// Byte-based variant of [`read_pe_version_string`] that avoids re-reading
+/// the file from disk.
+fn pe_version_string_from_data(data: &[u8], string_name: &str) -> Option<String> {
     if data.len() < 64 {
-        return Ok(None);
+        return None;
     }
 
     // DOS header
     let e_lfanew = u32::from_le_bytes([data[0x3C], data[0x3D], data[0x3E], data[0x3F]]) as usize;
     if e_lfanew + 4 > data.len() {
-        return Ok(None);
+        return None;
     }
     if &data[e_lfanew..e_lfanew + 4] != b"PE\x00\x00" {
-        return Ok(None);
+        return None;
+    }
+    // COFF header + optional-header magic must be present before reading
+    // any fields at e_lfanew + 20 .. +26.
+    if e_lfanew + 28 > data.len() {
+        return None;
     }
 
     // Number of data directories in optional header – stored at e_lfanew + 24 (COFF) and depends on magic
@@ -949,13 +993,13 @@ pub fn read_pe_version_string(path: &Path, string_name: &str) -> AppResult<Optio
                 16,
             )
         }
-        _ => return Ok(None),
+        _ => return None,
     };
 
     // Resource directory entry is the 3rd entry (index 2)
     let res_rva_offset = data_dir_offset + 2 * 8;
     if res_rva_offset + 8 > data.len() {
-        return Ok(None);
+        return None;
     }
     let res_rva = u32::from_le_bytes([
         data[res_rva_offset],
@@ -965,18 +1009,14 @@ pub fn read_pe_version_string(path: &Path, string_name: &str) -> AppResult<Optio
     ]) as usize;
 
     if res_rva == 0 {
-        return Ok(None);
+        return None;
     }
 
     // Walk the resource directory tree to find the version info
     // We use a simpler approach: scan the file for "VS_VERSION_INFO" or the string name
     // in the resource section area.
     // For simplicity, scan the entire file for the StringFileInfo structure.
-    if let Some(value) = scan_version_string(&data, string_name) {
-        return Ok(Some(value));
-    }
-
-    Ok(None)
+    scan_version_string(data, string_name)
 }
 
 /// Naive scan for a version-info string inside a resource section.
@@ -1046,14 +1086,49 @@ pub fn register_installed_app(
     Ok(())
 }
 
+/// Upper bound for a single decompressed block or CAB folder.  Installed files
+/// in real installers rarely approach this, and the cap prevents zip-bomb style
+/// decompression amplification from untrusted installer payloads.
+const MAX_DECOMPRESS_SIZE: usize = 1024 * 1024 * 1024;
+
 /// Decompress a zlib-compressed data block using flate2 (RFC 1950).
-/// Returns the decompressed bytes, or an error if decompression fails.
+/// Returns the decompressed bytes, or an error if decompression fails or the
+/// output exceeds [`MAX_DECOMPRESS_SIZE`].
 pub fn decompress_zlib_block(data: &[u8]) -> AppResult<Vec<u8>> {
-    let mut decoder = ZlibDecoder::new(data);
+    let decoder = ZlibDecoder::new(data);
     let mut decompressed = Vec::new();
-    decoder.read_to_end(&mut decompressed).map_err(|e| {
-        AppError::new(ReasonCode::RcIo, "zlib decompression failed").with_hint(e.to_string())
-    })?;
+    decoder
+        .take(MAX_DECOMPRESS_SIZE as u64 + 1)
+        .read_to_end(&mut decompressed)
+        .map_err(|e| {
+            AppError::new(ReasonCode::RcIo, "zlib decompression failed").with_hint(e.to_string())
+        })?;
+    if decompressed.len() > MAX_DECOMPRESS_SIZE {
+        return Err(AppError::new(
+            ReasonCode::RcIo,
+            "zlib decompression exceeded size limit",
+        ));
+    }
+    Ok(decompressed)
+}
+
+/// Decompress a raw-deflate-compressed data block (RFC 1951), bounded by
+/// [`MAX_DECOMPRESS_SIZE`].
+fn decompress_deflate_block(data: &[u8]) -> AppResult<Vec<u8>> {
+    let decoder = flate2::read::DeflateDecoder::new(data);
+    let mut decompressed = Vec::new();
+    decoder
+        .take(MAX_DECOMPRESS_SIZE as u64 + 1)
+        .read_to_end(&mut decompressed)
+        .map_err(|e| {
+            AppError::new(ReasonCode::RcIo, "deflate decompression failed").with_hint(e.to_string())
+        })?;
+    if decompressed.len() > MAX_DECOMPRESS_SIZE {
+        return Err(AppError::new(
+            ReasonCode::RcIo,
+            "deflate decompression exceeded size limit",
+        ));
+    }
     Ok(decompressed)
 }
 
@@ -1078,31 +1153,32 @@ impl InstallShieldEngine {
     /// * The presence of `ISc(` magic bytes (0x49 0x53 0x63 0x28) in the
     ///   overlay or throughout the file.
     pub fn detect(path: &Path) -> bool {
-        let data = match fs::read(path) {
-            Ok(d) => d,
-            Err(_) => return false,
-        };
+        match read_installer_capped(path) {
+            Ok(data) => Self::detect_from_bytes(&data),
+            Err(_) => false,
+        }
+    }
 
+    /// Byte-based detection: same heuristics as [`Self::detect`] but operates
+    /// on an in-memory buffer so the file is not re-read once per check.
+    fn detect_from_bytes(data: &[u8]) -> bool {
         if data.len() < 64 {
             return false;
         }
 
         // Check for "InstallShield" in version strings
-        let version_match = read_pe_version_string(path, "FileDescription")
-            .ok()
-            .flatten()
-            .map_or(false, |desc| desc.contains("InstallShield"));
+        let version_match = pe_version_string_from_data(data, "FileDescription")
+            .is_some_and(|desc| desc.contains("InstallShield"));
 
         // Check PE section names for "IS" prefix
-        let section_match = has_installshield_sections(&data);
+        let section_match = has_installshield_sections(data);
 
         // Check for ISc( magic in the overlay or throughout the file
-        let overlay_match = extract_exe_overlay(path).ok().map_or(false, |overlay| {
-            search_magic_bytes(&overlay, b"ISc(").is_some()
-        });
+        let overlay_match = extract_exe_overlay_bytes(data)
+            .is_ok_and(|overlay| search_magic_bytes(&overlay, b"ISc(").is_some());
 
         // Also check the whole file for the marker
-        let full_file_match = search_magic_bytes(&data, b"ISc(").is_some();
+        let full_file_match = search_magic_bytes(data, b"ISc(").is_some();
 
         version_match || section_match || overlay_match || full_file_match
     }
@@ -1110,7 +1186,7 @@ impl InstallShieldEngine {
     /// Extract files from a Microsoft CAB archive embedded in the overlay.
     ///
     /// Parses the CAB header (CFHEADER), walks the folder/file structures
-    /// (CFFOLDER / CFFILE), decompresses zlib/deflate data blocks (CFDATA),
+    /// (CFFOLDER / CFFILE), decompresses data blocks (CFDATA) once per folder,
     /// and writes each file into the engine's virtual filesystem.
     fn extract_cab_files(
         cab_bytes: &[u8],
@@ -1136,21 +1212,26 @@ impl InstallShieldEngine {
         let file_count = u16::from_le_bytes([cab_bytes[28], cab_bytes[29]]) as usize;
         let flags = u16::from_le_bytes([cab_bytes[30], cab_bytes[31]]);
 
-        // Flags bit 2 = reserved area present
-        let _reserved_size: usize = if flags & 4 != 0 {
+        // Flags bit 2 = reserved area present (its size field sits at offset 32)
+        let reserved_size: usize = if flags & 4 != 0 {
             u16::from_le_bytes([cab_bytes[32], cab_bytes[33]]) as usize
         } else {
             0
         };
-        // Header size: 36 bytes + folder entries + reserved + padding
-        let folders_offset = 36;
+        // Flags bit 1 = per-block CFDATA checksums present
+        let has_checksums = flags & 2 != 0;
+        // Header size: 36 bytes + reserved area + folder entries
+        let folders_offset = 36 + reserved_size;
         let files_offset = file_offset;
 
-        // Parse folder entries (CFFOLDER, each 8 bytes)
+        // Parse folder entries (CFFOLDER, each 8 bytes).  A truncated CAB may
+        // hold fewer entries than `folder_count` claims; only use the entries
+        // that were actually parsed.
         let mut folder_blocks_offset = Vec::new(); // offset of first data block for each folder
         let mut folder_comp_type = Vec::new(); // compression type per folder
         for i in 0..folder_count {
-            let fo = folders_offset + i * 8;
+            let fo = folders_offset.checked_add(i * 8);
+            let Some(fo) = fo else { break };
             if fo + 8 > cab_bytes.len() {
                 break;
             }
@@ -1163,6 +1244,17 @@ impl InstallShieldEngine {
             let comp_type = u16::from_le_bytes([cab_bytes[fo + 6], cab_bytes[fo + 7]]);
             folder_blocks_offset.push(block_offset);
             folder_comp_type.push(comp_type);
+        }
+        let parsed_folder_count = folder_blocks_offset.len();
+
+        // Decompress each folder exactly once and cache the result; multiple
+        // files in the same folder share the cached data.
+        let mut folder_data: Vec<Option<Vec<u8>>> = vec![None; parsed_folder_count];
+        for folder_idx in 0..parsed_folder_count {
+            let block_start = folder_blocks_offset[folder_idx];
+            let comp_type = folder_comp_type[folder_idx];
+            folder_data[folder_idx] =
+                Some(Self::decompress_cab_folder(cab_bytes, block_start, comp_type, has_checksums)?);
         }
 
         // Parse file entries (CFFILE, variable length)
@@ -1215,73 +1307,20 @@ impl InstallShieldEngine {
                 Err(_) => continue,
             };
 
-            // Find the corresponding data blocks for this folder
-            if folder_idx >= folder_count {
+            // Only reference folders that were actually parsed (a truncated
+            // CAB may have fewer folder entries than folder_count claims).
+            let Some(folder) = folder_data.get(folder_idx) else {
                 continue;
-            }
-            let block_start = folder_blocks_offset[folder_idx];
-            let comp_type = folder_comp_type[folder_idx];
-
-            // Collect all data blocks for this folder
-            let mut folder_decompressed = Vec::new();
-            let mut block_pos = block_start;
-            loop {
-                if block_pos + 4 > cab_bytes.len() {
-                    break;
-                }
-                // CFDATA header: 2 bytes checksum(optional), 2 bytes compressed size, 2 bytes uncompressed size
-                let data_hdr_size = if comp_type == 0 { 6 } else { 8 };
-                if block_pos + data_hdr_size > cab_bytes.len() {
-                    break;
-                }
-                let chk_offset = if comp_type == 0 { 0 } else { 2 };
-                let comp_size = u16::from_le_bytes([
-                    cab_bytes[block_pos + chk_offset],
-                    cab_bytes[block_pos + chk_offset + 1],
-                ]) as usize;
-                let uncomp_size = u16::from_le_bytes([
-                    cab_bytes[block_pos + chk_offset + 2],
-                    cab_bytes[block_pos + chk_offset + 3],
-                ]) as usize;
-
-                let data_start = block_pos + data_hdr_size;
-                if data_start + comp_size > cab_bytes.len() {
-                    break;
-                }
-                let block_data = &cab_bytes[data_start..data_start + comp_size];
-
-                if comp_type == 0 {
-                    // No compression (stored)
-                    folder_decompressed.extend_from_slice(block_data);
-                } else {
-                    // Compressed (deflate/zlib) – decompress
-                    match decompress_zlib_block(block_data) {
-                        Ok(d) => folder_decompressed.extend_from_slice(&d),
-                        Err(_) => {
-                            // Try raw deflate (no zlib wrapper)
-                            let mut decoder = flate2::read::DeflateDecoder::new(block_data);
-                            let mut buf = Vec::new();
-                            if decoder.read_to_end(&mut buf).is_ok() {
-                                folder_decompressed.extend_from_slice(&buf);
-                            }
-                            // If both fail, extend raw data
-                            else {
-                                folder_decompressed.extend_from_slice(block_data);
-                            }
-                        }
-                    }
-                }
-
-                // Check if this data block's uncomp_size is less than 0x8000,
-                // which signals the last block in this folder
-                if uncomp_size < 0x8000 {
-                    break;
-                }
-                block_pos = data_start + comp_size;
-            }
+            };
+            let Some(folder_decompressed) = folder else {
+                continue;
+            };
 
             // Extract this file's portion from the decompressed folder data
-            if folder_offset + uncomp_size <= folder_decompressed.len() {
+            if folder_offset
+                .checked_add(uncomp_size)
+                .is_some_and(|end| end <= folder_decompressed.len())
+            {
                 let file_bytes = &folder_decompressed[folder_offset..folder_offset + uncomp_size];
                 let file_path = normalize_path(&format!("{install_dir}/{filename}"));
                 engine.files.insert(file_path.clone(), file_bytes.to_vec());
@@ -1290,6 +1329,86 @@ impl InstallShieldEngine {
         }
 
         Ok(created_files)
+    }
+
+    /// Decompress all CFDATA blocks of one CAB folder, concatenating the
+    /// results.  CFDATA is laid out as `cbData(u16) @0, cbUncomp(u16) @2`,
+    /// optionally followed by a u32 checksum when the CFHEADER checksum flag
+    /// (bit 0x1) is set.  MSZIP (type 1) blocks carry a 4-byte `CKBB` prefix
+    /// and are raw deflate.
+    fn decompress_cab_folder(
+        cab_bytes: &[u8],
+        block_start: usize,
+        comp_type: u16,
+        has_checksums: bool,
+    ) -> AppResult<Vec<u8>> {
+        let mut folder_decompressed = Vec::new();
+        let mut block_pos = block_start;
+        loop {
+            // cbData + cbUncomp fields must be readable before anything else
+            if block_pos + 4 > cab_bytes.len() {
+                break;
+            }
+            let cb_data = u16::from_le_bytes([cab_bytes[block_pos], cab_bytes[block_pos + 1]])
+                as usize;
+            let cb_uncomp =
+                u16::from_le_bytes([cab_bytes[block_pos + 2], cab_bytes[block_pos + 3]]) as usize;
+            let hdr_size = if has_checksums { 8 } else { 4 };
+            if block_pos + hdr_size > cab_bytes.len() {
+                break;
+            }
+            let data_start = block_pos + hdr_size;
+            if data_start + cb_data > cab_bytes.len() {
+                break;
+            }
+            let block_data = &cab_bytes[data_start..data_start + cb_data];
+
+            if comp_type == 0 {
+                // No compression (stored)
+                folder_decompressed.extend_from_slice(block_data);
+            } else {
+                // Compressed – MSZIP blocks are raw deflate with a 4-byte
+                // "CKBB" prefix; everything else is tried as zlib first.
+                let payload = if comp_type == 1
+                    && block_data.len() >= 4
+                    && &block_data[..4] == b"CKBB"
+                {
+                    &block_data[4..]
+                } else {
+                    block_data
+                };
+                match decompress_zlib_block(payload) {
+                    Ok(d) => folder_decompressed.extend_from_slice(&d),
+                    Err(zlib_err) => match decompress_deflate_block(payload) {
+                        Ok(d) => folder_decompressed.extend_from_slice(&d),
+                        Err(_) => {
+                            return Err(AppError::new(
+                                ReasonCode::RcIo,
+                                format!(
+                                    "CAB data block could not be decompressed (compression type {comp_type})"
+                                ),
+                            )
+                            .with_hint(zlib_err.message.clone()))
+                        }
+                    },
+                }
+            }
+
+            if folder_decompressed.len() > MAX_DECOMPRESS_SIZE {
+                return Err(AppError::new(
+                    ReasonCode::RcIo,
+                    "CAB folder decompression exceeded size limit",
+                ));
+            }
+
+            // cbUncomp < 0x8000 signals the last block in this folder
+            if cb_uncomp < 0x8000 {
+                break;
+            }
+            block_pos = data_start + cb_data;
+        }
+
+        Ok(folder_decompressed)
     }
 
     /// Run an InstallShield installer.
@@ -1331,7 +1450,7 @@ impl InstallShieldEngine {
                         .windows(4)
                         .skip(1)
                         .position(|w| w == b"ISc(")
-                        .map(|pos| pos + 4)
+                        .map(|pos| pos + 1)
                         .unwrap_or(cab_content.len());
                     cab_content[..end.min(cab_content.len())].to_vec()
                 }
@@ -1548,21 +1667,22 @@ impl IssScript {
                             });
                         }
                     }
+                    "runtimes" | "postinstall"
+                        if key.to_lowercase().contains("run")
+                            || key.to_lowercase().contains("exec") =>
+                    {
+                        let parts: Vec<&str> = value.splitn(2, ' ').collect();
+                        commands.push(IssCommand::RunAfterInstall {
+                            path: parts.first().unwrap_or(&"").to_string(),
+                            args: parts.get(1).unwrap_or(&"").to_string(),
+                        });
+                    }
                     "runtimes" | "postinstall" => {
-                        if key.to_lowercase().contains("run") || key.to_lowercase().contains("exec")
-                        {
-                            let parts: Vec<&str> = value.splitn(2, ' ').collect();
-                            commands.push(IssCommand::RunAfterInstall {
-                                path: parts.first().unwrap_or(&"").to_string(),
-                                args: parts.get(1).unwrap_or(&"").to_string(),
-                            });
-                        } else {
-                            commands.push(IssCommand::SetVariable {
-                                section: current_section.clone(),
-                                key,
-                                value,
-                            });
-                        }
+                        commands.push(IssCommand::SetVariable {
+                            section: current_section.clone(),
+                            key,
+                            value,
+                        });
                     }
                     _ => {
                         commands.push(IssCommand::SetVariable {
@@ -1935,16 +2055,16 @@ impl ISSetupDllStub {
     /// extensions and updates registry accordingly.
     fn handle_on_register_files(&mut self, engine: &mut InstallerEngine) -> (bool, String) {
         let mut registered: Vec<String> = Vec::new();
-        let failed: Vec<String> = Vec::new();
 
         // Scan files for DLLs and OCXs that need registration
-        for (path, _bytes) in &engine.files {
+        for path in engine.files.keys() {
             let low = path.to_ascii_lowercase();
             if low.ends_with(".dll") || low.ends_with(".ocx") {
                 // Check if this DLL can be serviced by a VC runtime
-                let version = if low.contains("msvc") || low.contains("vcruntime") {
-                    "vc141"
-                } else if low.contains("msvcp") {
+                let version = if low.contains("msvc")
+                    || low.contains("vcruntime")
+                    || low.contains("msvcp")
+                {
                     "vc141"
                 } else {
                     // Generic COM registration
@@ -1988,13 +2108,12 @@ impl ISSetupDllStub {
             "ISSetup.dll OnRegisterFiles: no files registered (no DLLs/OCXs found)".to_string()
         } else {
             format!(
-                "ISSetup.dll OnRegisterFiles: registered {} component(s) ({} failed): {}",
+                "ISSetup.dll OnRegisterFiles: registered {} component(s): {}",
                 registered.len(),
-                failed.len(),
                 registered.join(", ")
             )
         };
-        (failed.is_empty(), log)
+        (true, log)
     }
 
     // ── OnUIInit ─────────────────────────────────────────────────────────
@@ -2086,32 +2205,31 @@ impl NsisEngine {
     /// * The presence of NSIS magic bytes `0x6E 0x73 0x69 0x73` (`nsis`) in
     ///   the overlay or throughout the file.
     pub fn detect(path: &Path) -> bool {
-        let data = match fs::read(path) {
-            Ok(d) => d,
-            Err(_) => return false,
-        };
+        match read_installer_capped(path) {
+            Ok(data) => Self::detect_from_bytes(&data),
+            Err(_) => false,
+        }
+    }
 
+    /// Byte-based detection: same heuristics as [`Self::detect`] but operates
+    /// on an in-memory buffer so the file is not re-read once per check.
+    fn detect_from_bytes(data: &[u8]) -> bool {
         if data.len() < 64 {
             return false;
         }
 
         // Check for "Nullsoft Installer" in version strings
-        let version_match = read_pe_version_string(path, "FileDescription")
-            .ok()
-            .flatten()
-            .map_or(false, |desc| {
-                desc.contains("Nullsoft") || desc.contains("NSIS")
-            });
+        let version_match = pe_version_string_from_data(data, "FileDescription")
+            .is_some_and(|desc| desc.contains("Nullsoft") || desc.contains("NSIS"));
 
         // Check for NSIS magic "nsis" in the overlay
-        let overlay_match = extract_exe_overlay(path).ok().map_or(false, |overlay| {
-            search_magic_bytes(&overlay, b"nsis").is_some()
-        });
+        let overlay_match = extract_exe_overlay_bytes(data)
+            .is_ok_and(|overlay| search_magic_bytes(&overlay, b"nsis").is_some());
 
         // Check for the NullsoftInstaller signature in the whole file,
         // or "nsis" magic in the header area
-        let full_file_match = search_magic_bytes(&data, b"NullsoftInstaller").is_some();
-        let header_match = search_magic_bytes(&data, b"nsis").is_some();
+        let full_file_match = search_magic_bytes(data, b"NullsoftInstaller").is_some();
+        let header_match = search_magic_bytes(data, b"nsis").is_some();
 
         version_match || overlay_match || full_file_match || header_match
     }
@@ -2126,8 +2244,18 @@ impl NsisEngine {
     ) -> AppResult<Vec<String>> {
         let mut created_files = Vec::new();
         let mut offset = header_offset;
+        // `next_header` is an untrusted offset: guard against cyclic chains
+        // (A -> B -> A) that would otherwise loop forever, and bound the total
+        // number of entries processed.
+        let mut visited: BTreeSet<usize> = BTreeSet::new();
+        let mut entries = 0usize;
+        const MAX_NSIS_ENTRIES: usize = 1_000_000;
 
         loop {
+            if entries >= MAX_NSIS_ENTRIES || !visited.insert(offset) {
+                break;
+            }
+            entries += 1;
             if offset + 12 > overlay.len() {
                 break;
             }
@@ -2200,9 +2328,7 @@ impl NsisEngine {
                     }
                     Err(_) => {
                         // Fallback: try raw deflate (no zlib wrapper)
-                        let mut decoder = flate2::read::DeflateDecoder::new(compressed_block);
-                        let mut buf = Vec::new();
-                        if decoder.read_to_end(&mut buf).is_ok() {
+                        if let Ok(buf) = decompress_deflate_block(compressed_block) {
                             let file_bytes = if buf.len() >= uncomp_size {
                                 buf[..uncomp_size].to_vec()
                             } else {
@@ -2380,41 +2506,39 @@ impl InnoSetupEngine {
     /// * Steam-specific markers in version info ("SteamSetup", "Steam")
     /// * ISDone.dll presence (Steam InnoSetup wrapper)
     pub fn detect(path: &Path) -> bool {
-        let data = match fs::read(path) {
-            Ok(d) => d,
-            Err(_) => return false,
-        };
+        match read_installer_capped(path) {
+            Ok(data) => Self::detect_from_bytes(&data),
+            Err(_) => false,
+        }
+    }
 
+    /// Byte-based detection: same heuristics as [`Self::detect`] but operates
+    /// on an in-memory buffer so the file is not re-read once per check.
+    fn detect_from_bytes(data: &[u8]) -> bool {
         if data.len() < 64 {
             return false;
         }
 
         // Check for "Inno Setup" in version strings
-        let version_match = read_pe_version_string(path, "FileDescription")
-            .ok()
-            .flatten()
-            .map_or(false, |desc| {
-                desc.contains("Inno Setup") || desc.contains("SteamSetup") || desc.contains("Steam")
-            });
+        let version_match = pe_version_string_from_data(data, "FileDescription").is_some_and(
+            |desc| desc.contains("Inno Setup") || desc.contains("SteamSetup") || desc.contains("Steam"),
+        );
 
         // Check for "Inno" magic in the overlay after sections
-        let overlay_match = extract_exe_overlay(path).ok().map_or(false, |overlay| {
-            search_magic_bytes(&overlay, b"Inno").is_some()
-        });
+        let overlay_match = extract_exe_overlay_bytes(data)
+            .is_ok_and(|overlay| search_magic_bytes(&overlay, b"Inno").is_some());
 
         // Search the entire file for "Inno" or "zbin" marker
-        let inno_match = search_magic_bytes(&data, b"Inno").is_some();
-        let setup_header_match = search_magic_bytes(&data, b"zbin").is_some();
+        let inno_match = search_magic_bytes(data, b"Inno").is_some();
+        let setup_header_match = search_magic_bytes(data, b"zbin").is_some();
 
         // Steam-specific: check for ISDone.dll embedded reference
-        let isdone_match = search_magic_bytes(&data, b"ISDone.dll").is_some()
-            || search_magic_bytes(&data, b"SteamSetup").is_some();
+        let isdone_match = search_magic_bytes(data, b"ISDone.dll").is_some()
+            || search_magic_bytes(data, b"SteamSetup").is_some();
 
         // Check for "Steam" in ProductName which is common for Steam installers
-        let product_name_match = read_pe_version_string(path, "ProductName")
-            .ok()
-            .flatten()
-            .map_or(false, |name| name.contains("Steam"));
+        let product_name_match = pe_version_string_from_data(data, "ProductName")
+            .is_some_and(|name| name.contains("Steam"));
 
         version_match
             || overlay_match
@@ -2427,22 +2551,21 @@ impl InnoSetupEngine {
     /// Check whether the installer at `path` is specifically a Steam
     /// installer (SteamSetup.exe).
     pub fn is_steam_installer(path: &Path) -> bool {
-        let data = match fs::read(path) {
-            Ok(d) => d,
-            Err(_) => return false,
+        let Ok(data) = read_installer_capped(path) else {
+            return false;
         };
 
         // Check for SteamSetup or Steam in version strings
-        if let Ok(Some(desc)) = read_pe_version_string(path, "FileDescription") {
-            if desc.contains("SteamSetup") || desc.contains("Steam") {
-                return true;
-            }
+        if pe_version_string_from_data(&data, "FileDescription")
+            .is_some_and(|desc| desc.contains("SteamSetup") || desc.contains("Steam"))
+        {
+            return true;
         }
 
-        if let Ok(Some(prod)) = read_pe_version_string(path, "ProductName") {
-            if prod.contains("Steam") {
-                return true;
-            }
+        if pe_version_string_from_data(&data, "ProductName")
+            .is_some_and(|prod| prod.contains("Steam"))
+        {
+            return true;
         }
 
         // Check for ISDone.dll (Steam's InnoSetup wrapper uses this)
@@ -2626,20 +2749,19 @@ impl InnoSetupEngine {
                 .position(|&b| b == 0)
                 .unwrap_or(decompressed.len() - name_start);
 
-            if name_len > 0 && name_len < 512 {
-                if let Ok(name) =
+            if name_len > 0
+                && name_len < 512
+                && let Ok(name) =
                     std::str::from_utf8(&decompressed[name_start..name_start + name_len])
-                {
-                    let normalized_name = name.replace('\\', "/");
-                    if !normalized_name.is_empty() {
-                        let file_path = normalize_path(&format!("{install_dir}/{normalized_name}"));
-                        let file_end = (data_offset + data_size).min(decompressed.len());
-                        let file_bytes = decompressed[data_offset..file_end].to_vec();
-                        engine.files.insert(file_path.clone(), file_bytes);
-                        created_files.push(file_path);
-                        entry_idx += 1;
-                    }
-                }
+                && !name.replace('\\', "/").is_empty()
+            {
+                let normalized_name = name.replace('\\', "/");
+                let file_path = normalize_path(&format!("{install_dir}/{normalized_name}"));
+                let file_end = (data_offset + data_size).min(decompressed.len());
+                let file_bytes = decompressed[data_offset..file_end].to_vec();
+                engine.files.insert(file_path.clone(), file_bytes);
+                created_files.push(file_path);
+                entry_idx += 1;
             }
 
             // Move to next entry: after the null-terminated name (aligned)
@@ -2680,7 +2802,7 @@ impl InnoSetupEngine {
         })?;
 
         // InnoSetup header after the "Inno" magic (4 bytes):
-        //   4 bytes: header_size
+        //   4 bytes: header_size (unused by extraction)
         //   4 bytes: compressed_data_offset
         //   4 bytes: compressed_data_size
         //   4 bytes: uncompressed_data_size
@@ -2691,12 +2813,6 @@ impl InnoSetupEngine {
             ));
         }
 
-        let _header_size = u32::from_le_bytes([
-            overlay[inno_offset + 4],
-            overlay[inno_offset + 5],
-            overlay[inno_offset + 6],
-            overlay[inno_offset + 7],
-        ]) as usize;
         let comp_off = u32::from_le_bytes([
             overlay[inno_offset + 8],
             overlay[inno_offset + 9],
@@ -2726,16 +2842,13 @@ impl InnoSetupEngine {
                 Ok(d) => d,
                 Err(_) => {
                     // Fallback: try raw deflate (some InnoSetup versions use this)
-                    let mut decoder = flate2::read::DeflateDecoder::new(compressed_block);
-                    let mut buf = Vec::new();
-                    decoder.read_to_end(&mut buf).map_err(|e| {
+                    decompress_deflate_block(compressed_block).map_err(|e| {
                         AppError::new(
                             ReasonCode::RcIo,
                             "InnoSetup zlib/deflate decompression failed",
                         )
-                        .with_hint(e.to_string())
-                    })?;
-                    buf
+                        .with_hint(e.message)
+                    })?
                 }
             };
 
@@ -2774,11 +2887,11 @@ impl InnoSetupEngine {
                 if !has_steam_exe {
                     // Log that we need to re-extract core Steam files
                     engine.registry.insert(
-                        format!("hklm/software/steam/recovery/partial_files"),
+                        "hklm/software/steam/recovery/partial_files".to_string(),
                         partial_count.to_string(),
                     );
                     engine.registry.insert(
-                        format!("hklm/software/steam/recovery/needs_resume"),
+                        "hklm/software/steam/recovery/needs_resume".to_string(),
                         "true".to_string(),
                     );
                 }
@@ -2786,11 +2899,11 @@ impl InnoSetupEngine {
 
             // Write Steam-specific registry entries
             engine.registry.insert(
-                format!("hklm/software/steam/installpath"),
+                "hklm/software/steam/installpath".to_string(),
                 install_dir.to_ascii_lowercase(),
             );
             engine.registry.insert(
-                format!("hklm/software/steam/installcomplete"),
+                "hklm/software/steam/installcomplete".to_string(),
                 "true".to_string(),
             );
 
@@ -2955,22 +3068,27 @@ impl InnoSetupEngine {
 /// which looks for the `MSI!` magic.  For the other frameworks we delegate
 /// to each engine's `detect()` method.
 pub fn detect_installer_type(path: &Path) -> InstallerFramework {
-    // MSI detection – read the file and check for "MSI!" magic
-    if let Ok(data) = fs::read(path) {
-        if data.len() >= 4 && &data[..4] == b"MSI!" {
-            return InstallerFramework::Msi;
-        }
+    // Read the file once (bounded) and run every detector over the same
+    // buffer instead of re-reading the whole file per engine.
+    let data = match read_installer_capped(path) {
+        Ok(data) => data,
+        Err(_) => return InstallerFramework::Custom,
+    };
+
+    // MSI detection – check for "MSI!" magic
+    if data.len() >= 4 && &data[..4] == b"MSI!" {
+        return InstallerFramework::Msi;
     }
 
-    if InstallShieldEngine::detect(path) {
+    if InstallShieldEngine::detect_from_bytes(&data) {
         return InstallerFramework::InstallShield;
     }
 
-    if NsisEngine::detect(path) {
+    if NsisEngine::detect_from_bytes(&data) {
         return InstallerFramework::Nsis;
     }
 
-    if InnoSetupEngine::detect(path) {
+    if InnoSetupEngine::detect_from_bytes(&data) {
         return InstallerFramework::InnoSetup;
     }
 
@@ -2983,6 +3101,13 @@ pub fn detect_installer_type(path: &Path) -> InstallerFramework {
 
 fn normalize_path(path: &str) -> String {
     path.replace('\\', "/").to_ascii_lowercase()
+}
+
+/// Normalize a registry key the same way paths are normalized, so keys
+/// written by different code paths (MSI components, GUI installers, the
+/// uninstall registry) can be matched by the substring detectors.
+fn normalize_registry_key(key: &str) -> String {
+    key.replace('\\', "/").to_ascii_lowercase()
 }
 
 fn stable_pairs(env: &BTreeMap<String, String>) -> String {
@@ -3001,6 +3126,11 @@ fn has_installshield_sections(data: &[u8]) -> bool {
 
     let e_lfanew = u32::from_le_bytes([data[0x3C], data[0x3D], data[0x3E], data[0x3F]]) as usize;
     if e_lfanew + 4 > data.len() || &data[e_lfanew..e_lfanew + 4] != b"PE\x00\x00" {
+        return false;
+    }
+    // COFF header + optional-header magic must be present before reading
+    // any fields at e_lfanew + 6 / +20.
+    if e_lfanew + 28 > data.len() {
         return false;
     }
 
