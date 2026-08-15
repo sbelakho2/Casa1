@@ -2,7 +2,8 @@
 //!
 //! Maps Windows paths to macOS paths within the Game Environment root directory.
 //! Uses real `std::fs` operations for actual disk I/O while maintaining the
-//! Windows filesystem semantics (case-insensitive, share modes, byte-range locks).
+//! Windows filesystem semantics (case-insensitive resolution, share-mode
+//! conflict enforcement). Byte-range locks are not yet implemented.
 //!
 //! Also implements NTFS Alternate Data Stream (ADS) support, mapping to macOS
 //! extended attributes via `xattr` FFI on macOS, or file-based storage on other platforms.
@@ -13,6 +14,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 #[cfg(target_os = "macos")]
 use std::ffi::CString;
@@ -44,6 +46,23 @@ pub const XATTR_COM_APPLE_QUARANTINE: &str = "com.apple.quarantine";
 pub const XATTR_ZONE_IDENTIFIER: &str = "com.casa1.zone.identifier";
 /// Prefix used for all ADS extended attribute names on macOS.
 const XATTR_ADS_PREFIX: &str = "com.casa1.ads.";
+
+/// Windows `FILE_SHARE_READ` share-mode flag.
+pub const FILE_SHARE_READ: u32 = 0x1;
+/// Windows `FILE_SHARE_WRITE` share-mode flag.
+pub const FILE_SHARE_WRITE: u32 = 0x2;
+/// Windows `FILE_SHARE_DELETE` share-mode flag.
+pub const FILE_SHARE_DELETE: u32 = 0x4;
+
+/// Read-access bit used in share-mode conflict tracking.
+const ACCESS_READ: u32 = 0x1;
+/// Write-access bit used in share-mode conflict tracking.
+const ACCESS_WRITE: u32 = 0x2;
+
+/// Chunk size used when streaming large files in [`backup_read_file`].
+const BACKUP_READ_CHUNK_SIZE: usize = 1 << 20;
+/// Maximum total size [`backup_read_file`] will buffer for one file.
+const MAX_BACKUP_READ_SIZE: u64 = 256 << 20;
 
 /// Parse a path that may contain NTFS Alternate Data Stream syntax
 /// (e.g., `file.exe:Zone.Identifier:$DATA` or `C:\path\file.exe:Zone.Identifier`)
@@ -145,17 +164,11 @@ fn is_drive_letter_colon(path: &str, pos: usize) -> bool {
         return false;
     }
     let prev = path.as_bytes()[pos - 1];
-    // Drive letter: single letter followed by colon, e.g., "C:"
-    if pos == 1 && prev.is_ascii_alphabetic() {
-        // Make sure it's not part of a longer path like "C:\..."
-        // "C:" is a drive letter. "file:Z" at pos 5 is not.
-        return true; // correct: colon at pos 1 after drive letter
-    }
-    // Handle paths like "C:\..." where colon at position 1
-    if pos == 1 && prev.is_ascii_alphabetic() {
-        return true; // correct: colon at pos 1 after drive letter (with backslash)
-    }
-    false
+    // A colon at position 1 preceded by a letter is a drive spec ("C:"),
+    // including drive-relative forms like "C:foo" (no drive semantics
+    // are applied here, but the colon must not be treated as an ADS
+    // separator either).
+    pos == 1 && prev.is_ascii_alphabetic()
 }
 
 /// Parse a stream specification string into name and type.
@@ -220,6 +233,10 @@ impl WindowsPathResolver {
 
     /// Resolve a Windows path to a real macOS path.
     /// E.g., "C:\Steam\Steam.exe" -> "/path/to/ge_root/drive_c/Steam/Steam.exe"
+    ///
+    /// The resolved path is verified to stay inside the GE root, including
+    /// through symlinks: the deepest existing ancestor is canonicalized and
+    /// must be within the canonicalized GE root.
     pub fn resolve(&self, windows_path: &str) -> AppResult<PathBuf> {
         let normalized = normalize_windows_path(windows_path);
         let (drive, relative) = split_drive(&normalized)?;
@@ -235,37 +252,100 @@ impl WindowsPathResolver {
         real_path.push(subdir);
 
         if !relative.is_empty() {
+            // Per-call cache of case-insensitive directory entries: an exact
+            // match costs one lookup, and each directory that misses an exact
+            // match is read at most once for the whole resolution chain.
+            let mut dir_cache: HashMap<PathBuf, HashMap<String, PathBuf>> = HashMap::new();
             // Split the relative path and do case-insensitive resolution
             for component in relative.split(['/', '\\']).filter(|s| !s.is_empty()) {
-                real_path = self.resolve_component(&real_path, component)?;
+                real_path = self.resolve_component(&real_path, component, &mut dir_cache)?;
             }
         }
+
+        self.verify_within_root(&real_path)?;
 
         Ok(real_path)
     }
 
     /// Resolve a single path component with case-insensitive matching.
-    fn resolve_component(&self, parent: &Path, component: &str) -> AppResult<PathBuf> {
+    fn resolve_component(
+        &self,
+        parent: &Path,
+        component: &str,
+        dir_cache: &mut HashMap<PathBuf, HashMap<String, PathBuf>>,
+    ) -> AppResult<PathBuf> {
         // First try exact match
         let exact = parent.join(component);
         if exact.exists() {
             return Ok(exact);
         }
 
-        // Try case-insensitive match
-        if let Ok(dir_entries) = fs::read_dir(parent) {
-            let component_lower = component.to_lowercase();
-            for entry in dir_entries.flatten() {
-                let name = entry.file_name();
-                let name_str = name.to_string_lossy();
-                if name_str.to_lowercase() == component_lower {
-                    return Ok(entry.path());
-                }
-            }
+        // Try case-insensitive match, using the cached entry set for this
+        // directory when available.
+        let component_lower = component.to_lowercase();
+        let entries = dir_cache.entry(parent.to_path_buf()).or_insert_with(|| {
+            fs::read_dir(parent)
+                .map(|dir| {
+                    dir.flatten()
+                        .map(|entry| {
+                            let name = entry.file_name();
+                            let name_str = name.to_string_lossy();
+                            (name_str.to_lowercase(), entry.path())
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        });
+        if let Some(path) = entries.get(&component_lower) {
+            return Ok(path.clone());
         }
 
         // No match found — return the path as-is (it may be created)
         Ok(parent.join(component))
+    }
+
+    /// Verify that `path` (which need not exist yet) cannot reach outside the
+    /// GE root through symlinks or other indirection.
+    ///
+    /// The deepest existing ancestor of `path` is canonicalized and must be
+    /// within the canonicalized GE root. This makes a symlink inside the GE
+    /// root pointing elsewhere (e.g. to `$HOME` or `/etc`) fail containment
+    /// for every operation that resolves through it.
+    pub fn verify_within_root(&self, path: &Path) -> AppResult<()> {
+        let Some(root) = fs::canonicalize(&self.ge_root).ok() else {
+            // The GE root does not exist yet; paths are lexically constructed
+            // under it and there is nothing on disk to escape through.
+            return Ok(());
+        };
+        let mut probe = path.to_path_buf();
+        loop {
+            if let Ok(canon) = fs::canonicalize(&probe) {
+                if canon.starts_with(&root) {
+                    return Ok(());
+                }
+                return Err(AppError::new(
+                    ReasonCode::RcFsSandboxEscape,
+                    format!(
+                        "path {} escapes the GE root via a symlink (resolves to {})",
+                        path.display(),
+                        canon.display()
+                    ),
+                ));
+            }
+            if !probe.pop() {
+                return Err(AppError::new(
+                    ReasonCode::RcFsSandboxEscape,
+                    format!("path {} has no existing ancestor inside the GE root", path.display()),
+                ));
+            }
+            // Defense in depth: never walk lexically above the GE root.
+            if !probe.starts_with(&self.ge_root) {
+                return Err(AppError::new(
+                    ReasonCode::RcFsSandboxEscape,
+                    format!("path {} leaves the GE root", path.display()),
+                ));
+            }
+        }
     }
 
     /// Get the GE root path.
@@ -311,6 +391,12 @@ fn normalize_windows_path(path: &str) -> String {
 fn split_drive(path: &str) -> AppResult<(String, String)> {
     // Handle "\\?\C:\path" format first (before colon search)
     if let Some(stripped) = path.strip_prefix("\\\\?\\") {
+        // Extended-length UNC paths (`\\?\UNC\server\share`) have no drive
+        // letter; surface them as an explicit "UNC" drive so callers get a
+        // clear error instead of silently mapping them into drive_c.
+        if let Some(rest) = stripped.strip_prefix("UNC\\") {
+            return Ok(("UNC".to_string(), rest.to_string()));
+        }
         return split_drive(stripped);
     }
 
@@ -333,6 +419,66 @@ fn split_drive(path: &str) -> AppResult<(String, String)> {
 // Real file handle
 // ---------------------------------------------------------------------------
 
+/// Access/share claims of a single open handle, used for share-mode conflict
+/// enforcement (Windows `FILE_SHARE_*` semantics).
+#[derive(Debug, Clone, Copy)]
+struct HandleClaim {
+    /// Access bits (`ACCESS_READ | ACCESS_WRITE`).
+    access: u32,
+    /// Windows share-mode flags (`FILE_SHARE_*`).
+    share: u32,
+}
+
+/// Registry of open handles per real path, used to reject conflicting opens.
+#[derive(Debug, Default)]
+struct ShareRegistry {
+    handles: Mutex<HashMap<PathBuf, Vec<HandleClaim>>>,
+}
+
+impl ShareRegistry {
+    /// Register a new handle claim, returning `false` when it conflicts with
+    /// an existing claim (mirrors Windows share-mode semantics).
+    fn register(&self, path: &Path, claim: HandleClaim) -> bool {
+        let mut handles = self.handles.lock().unwrap();
+        if let Some(claims) = handles.get(path)
+            && claims
+                .iter()
+                .any(|existing| share_conflict(*existing, claim))
+        {
+            return false;
+        }
+        handles.entry(path.to_path_buf()).or_default().push(claim);
+        true
+    }
+
+    /// Remove a handle claim when its handle is closed.
+    fn release(&self, path: &Path, claim: HandleClaim) {
+        let mut handles = self.handles.lock().unwrap();
+        if let Some(claims) = handles.get_mut(path) {
+            claims.retain(|c| !(c.access == claim.access && c.share == claim.share));
+            if claims.is_empty() {
+                handles.remove(path);
+            }
+        }
+    }
+}
+
+/// Two handles conflict when either one requests access that the other does
+/// not share (Windows `CreateFile` share-mode semantics).
+fn share_conflict(existing: HandleClaim, incoming: HandleClaim) -> bool {
+    (incoming.access & !existing.share) != 0 || (existing.access & !incoming.share) != 0
+}
+
+/// Options for [`RealFilesystem::open_file_with_options`], mirroring the
+/// `dwShareMode` and `dwFlagsAndAttributes` parameters of `CreateFile`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OpenFileOptions {
+    /// Windows `FILE_SHARE_*` share-mode flags (0 = exclusive).
+    pub share_mode: u32,
+    /// Windows `FILE_FLAG_DELETE_ON_CLOSE` semantics.
+    pub delete_on_close: bool,
+}
+
 /// Represents an open file in the guest filesystem with real OS backing.
 pub struct GuestFile {
     /// The real file on disk.
@@ -349,6 +495,8 @@ pub struct GuestFile {
     pub can_write: bool,
     /// Whether to delete on close.
     pub delete_on_close: bool,
+    /// Share-mode registry lease; releasing it frees the claim on drop.
+    share_lease: Option<(Arc<ShareRegistry>, HandleClaim)>,
 }
 
 impl GuestFile {
@@ -361,7 +509,7 @@ impl GuestFile {
         }
         self.file
             .read(buf)
-            .map_err(|e| AppError::new(ReasonCode::RcUnimplInsn, format!("read error: {e}")))
+            .map_err(|e| AppError::new(ReasonCode::RcIo, format!("read error: {e}")))
     }
 
     pub fn write(&mut self, buf: &[u8]) -> AppResult<usize> {
@@ -373,27 +521,53 @@ impl GuestFile {
         }
         self.file
             .write(buf)
-            .map_err(|e| AppError::new(ReasonCode::RcUnimplInsn, format!("write error: {e}")))
+            .map_err(|e| AppError::new(ReasonCode::RcIo, format!("write error: {e}")))
     }
 
     pub fn seek(&mut self, pos: SeekFrom) -> AppResult<u64> {
         self.file
             .seek(pos)
-            .map_err(|e| AppError::new(ReasonCode::RcUnimplInsn, format!("seek error: {e}")))
+            .map_err(|e| AppError::new(ReasonCode::RcIo, format!("seek error: {e}")))
     }
 
     pub fn flush(&mut self) -> AppResult<()> {
         self.file
             .flush()
-            .map_err(|e| AppError::new(ReasonCode::RcUnimplInsn, format!("flush error: {e}")))
+            .map_err(|e| AppError::new(ReasonCode::RcIo, format!("flush error: {e}")))
     }
 
     pub fn size(&self) -> AppResult<u64> {
         let metadata = self
             .file
             .metadata()
-            .map_err(|e| AppError::new(ReasonCode::RcUnimplInsn, format!("metadata error: {e}")))?;
+            .map_err(|e| AppError::new(ReasonCode::RcIo, format!("metadata error: {e}")))?;
         Ok(metadata.len())
+    }
+}
+
+impl std::fmt::Debug for GuestFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GuestFile")
+            .field("windows_path", &self.windows_path)
+            .field("real_path", &self.real_path)
+            .field("share_mode", &self.share_mode)
+            .field("can_read", &self.can_read)
+            .field("can_write", &self.can_write)
+            .field("delete_on_close", &self.delete_on_close)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for GuestFile {
+    fn drop(&mut self) {
+        // Honor FILE_FLAG_DELETE_ON_CLOSE semantics.
+        if self.delete_on_close {
+            let _ = fs::remove_file(&self.real_path);
+        }
+        // Release the share-mode claim.
+        if let Some((registry, claim)) = self.share_lease.take() {
+            registry.release(&self.real_path, claim);
+        }
     }
 }
 
@@ -404,12 +578,52 @@ impl GuestFile {
 /// Real filesystem operations using std::fs.
 pub struct RealFilesystem {
     resolver: WindowsPathResolver,
+    /// Registry of open handles per real path for share-mode enforcement.
+    share_registry: Arc<ShareRegistry>,
+    /// Optional path authorization hook (`(windows_path, is_write)` ->
+    /// `Ok(())`/`Err(reason)`), e.g. the AppContainer-style path allow lists
+    /// exposed by [`crate::sandbox::SandboxManager::validate_path_access`].
+    path_authorizer: Option<Box<PathAuthorizer>>,
 }
+
+/// Type of the optional path authorization hook installed via
+/// [`RealFilesystem::set_path_authorizer`].
+type PathAuthorizer = dyn Fn(&str, bool) -> Result<(), String> + Send + Sync;
 
 impl RealFilesystem {
     pub fn new(resolver: WindowsPathResolver) -> Self {
         // Ensure the GE root directory structure exists
-        Self { resolver }
+        Self {
+            resolver,
+            share_registry: Arc::new(ShareRegistry::default()),
+            path_authorizer: None,
+        }
+    }
+
+    /// Install an optional path authorization hook. When set, every file
+    /// operation first checks the Windows path against the hook and is
+    /// refused (`RcSandboxPathViolation`) when it returns an error.
+    ///
+    /// See [`crate::sandbox::SandboxManager::validate_path_access`] for the
+    /// AppContainer-style enforcement implementation.
+    pub fn set_path_authorizer<F>(&mut self, authorizer: F)
+    where
+        F: Fn(&str, bool) -> Result<(), String> + Send + Sync + 'static,
+    {
+        self.path_authorizer = Some(Box::new(authorizer));
+    }
+
+    /// Check the configured path authorizer (if any) before an operation.
+    fn authorize_path(&self, windows_path: &str, write: bool) -> AppResult<()> {
+        if let Some(authorizer) = &self.path_authorizer {
+            authorizer(windows_path, write).map_err(|reason| {
+                AppError::new(
+                    ReasonCode::RcSandboxPathViolation,
+                    format!("path denied by sandbox profile: {reason}"),
+                )
+            })?;
+        }
+        Ok(())
     }
 
     /// Initialize the filesystem by creating required directories.
@@ -447,6 +661,9 @@ impl RealFilesystem {
     }
 
     /// Open a file with real OS file operations.
+    ///
+    /// Equivalent to [`Self::open_file_with_options`] with default options
+    /// (`share_mode = 0` — exclusive — and `delete_on_close = false`).
     pub fn open_file(
         &self,
         windows_path: &str,
@@ -455,9 +672,55 @@ impl RealFilesystem {
         create: bool,
         truncate: bool,
     ) -> AppResult<GuestFile> {
-        let real_path = self.resolver.resolve(windows_path)?;
+        self.open_file_with_options(
+            windows_path,
+            can_read,
+            can_write,
+            create,
+            truncate,
+            OpenFileOptions::default(),
+        )
+    }
 
-        // Ensure parent directory exists
+    /// Open a file with real OS file operations.
+    ///
+    /// `options.share_mode` carries the Windows `FILE_SHARE_*` flags and is
+    /// enforced against other open handles; `options.delete_on_close`
+    /// implements `FILE_FLAG_DELETE_ON_CLOSE` (the file is removed when the
+    /// handle drops).
+    pub fn open_file_with_options(
+        &self,
+        windows_path: &str,
+        can_read: bool,
+        can_write: bool,
+        create: bool,
+        truncate: bool,
+        options: OpenFileOptions,
+    ) -> AppResult<GuestFile> {
+        if can_read {
+            self.authorize_path(windows_path, false)?;
+        }
+        if can_write {
+            self.authorize_path(windows_path, true)?;
+        }
+        let real_path = self.resolver.resolve(windows_path)?;
+        self.resolver.verify_within_root(&real_path)?;
+
+        // Enforce Windows share-mode semantics before touching the file.
+        let access = (if can_read { ACCESS_READ } else { 0 }) | (if can_write { ACCESS_WRITE } else { 0 });
+        let claim = HandleClaim { access, share: options.share_mode };
+        if !self.share_registry.register(&real_path, claim) {
+            return Err(AppError::new(
+                ReasonCode::RcFsSharingViolation,
+                format!(
+                    "cannot open {}: share-mode conflict (access=0x{access:x}, share=0x{:x})",
+                    real_path.display(),
+                    options.share_mode
+                ),
+            ));
+        }
+
+        // Ensure parent directory exists (containment was verified above).
         if let Some(parent) = real_path.parent() {
             fs::create_dir_all(parent).map_err(|e| {
                 AppError::new(
@@ -466,23 +729,23 @@ impl RealFilesystem {
                 )
             })?;
         }
+        self.resolver.verify_within_root(&real_path)?;
 
-        let mut options = fs::OpenOptions::new();
-        options.read(can_read).write(can_write);
+        // Open existing only (create/truncate are gated on write access).
+        let mut open_options = fs::OpenOptions::new();
+        open_options.read(can_read).write(can_write);
 
         if create && can_write {
-            options.create(true);
+            open_options.create(true);
         }
         if truncate && can_write {
-            options.truncate(true);
-        }
-        if !create && !can_write {
-            // Open existing only
+            open_options.truncate(true);
         }
 
-        let file = options.open(&real_path).map_err(|e| {
+        let file = open_options.open(&real_path).map_err(|e| {
+            self.share_registry.release(&real_path, claim);
             AppError::new(
-                ReasonCode::RcUnimplInsn,
+                ReasonCode::RcIo,
                 format!("cannot open file {}: {e}", real_path.display()),
             )
         })?;
@@ -491,15 +754,17 @@ impl RealFilesystem {
             file,
             windows_path: windows_path.to_string(),
             real_path,
-            share_mode: 0,
+            share_mode: options.share_mode,
             can_read,
             can_write,
-            delete_on_close: false,
+            delete_on_close: options.delete_on_close,
+            share_lease: Some((Arc::clone(&self.share_registry), claim)),
         })
     }
 
     /// Create a directory.
     pub fn create_directory(&self, windows_path: &str) -> AppResult<()> {
+        self.authorize_path(windows_path, true)?;
         let real_path = self.resolver.resolve(windows_path)?;
         fs::create_dir_all(&real_path).map_err(|e| {
             AppError::new(
@@ -511,18 +776,20 @@ impl RealFilesystem {
 
     /// Delete a file.
     pub fn delete_file(&self, windows_path: &str) -> AppResult<()> {
+        self.authorize_path(windows_path, true)?;
         let real_path = self.resolver.resolve(windows_path)?;
         fs::remove_file(&real_path).map_err(|e| {
-            AppError::new(ReasonCode::RcUnimplInsn, format!("cannot delete file: {e}"))
+            AppError::new(ReasonCode::RcIo, format!("cannot delete file: {e}"))
         })
     }
 
     /// Remove a directory.
     pub fn remove_directory(&self, windows_path: &str) -> AppResult<()> {
+        self.authorize_path(windows_path, true)?;
         let real_path = self.resolver.resolve(windows_path)?;
         fs::remove_dir_all(&real_path).map_err(|e| {
             AppError::new(
-                ReasonCode::RcUnimplInsn,
+                ReasonCode::RcIo,
                 format!("cannot remove directory: {e}"),
             )
         })
@@ -530,6 +797,8 @@ impl RealFilesystem {
 
     /// Move/rename a file.
     pub fn move_file(&self, src: &str, dst: &str) -> AppResult<()> {
+        self.authorize_path(src, false)?;
+        self.authorize_path(dst, true)?;
         let src_path = self.resolver.resolve(src)?;
         let dst_path = self.resolver.resolve(dst)?;
 
@@ -543,11 +812,13 @@ impl RealFilesystem {
         }
 
         fs::rename(&src_path, &dst_path)
-            .map_err(|e| AppError::new(ReasonCode::RcUnimplInsn, format!("cannot move file: {e}")))
+            .map_err(|e| AppError::new(ReasonCode::RcIo, format!("cannot move file: {e}")))
     }
 
     /// Copy a file.
     pub fn copy_file(&self, src: &str, dst: &str) -> AppResult<u64> {
+        self.authorize_path(src, false)?;
+        self.authorize_path(dst, true)?;
         let src_path = self.resolver.resolve(src)?;
         let dst_path = self.resolver.resolve(dst)?;
 
@@ -561,23 +832,26 @@ impl RealFilesystem {
         }
 
         fs::copy(&src_path, &dst_path)
-            .map_err(|e| AppError::new(ReasonCode::RcUnimplInsn, format!("cannot copy file: {e}")))
+            .map_err(|e| AppError::new(ReasonCode::RcIo, format!("cannot copy file: {e}")))
     }
 
     /// Check if a file exists.
     pub fn exists(&self, windows_path: &str) -> bool {
-        self.resolver
-            .resolve(windows_path)
-            .map(|p| p.exists())
-            .unwrap_or(false)
+        self.authorize_path(windows_path, false).is_ok()
+            && self
+                .resolver
+                .resolve(windows_path)
+                .map(|p| p.exists())
+                .unwrap_or(false)
     }
 
     /// Get file metadata.
     pub fn metadata(&self, windows_path: &str) -> AppResult<FileMetadata> {
+        self.authorize_path(windows_path, false)?;
         let real_path = self.resolver.resolve(windows_path)?;
         let meta = fs::metadata(&real_path).map_err(|e| {
             AppError::new(
-                ReasonCode::RcUnimplInsn,
+                ReasonCode::RcIo,
                 format!("cannot get metadata: {e}"),
             )
         })?;
@@ -594,12 +868,13 @@ impl RealFilesystem {
 
     /// Enumerate directory entries.
     pub fn enumerate_directory(&self, windows_path: &str) -> AppResult<Vec<DirEntry>> {
+        self.authorize_path(windows_path, false)?;
         let real_path = self.resolver.resolve(windows_path)?;
         let mut entries = Vec::new();
 
         let dir = fs::read_dir(&real_path).map_err(|e| {
             AppError::new(
-                ReasonCode::RcUnimplInsn,
+                ReasonCode::RcIo,
                 format!("cannot read directory: {e}"),
             )
         })?;
@@ -608,7 +883,7 @@ impl RealFilesystem {
             let name = entry.file_name().to_string_lossy().to_string();
             let meta = entry.metadata().map_err(|e| {
                 AppError::new(
-                    ReasonCode::RcUnimplInsn,
+                    ReasonCode::RcIo,
                     format!("cannot read entry metadata: {e}"),
                 )
             })?;
@@ -632,6 +907,35 @@ impl RealFilesystem {
     // NTFS Alternate Data Stream (ADS) support
     // -----------------------------------------------------------------------
 
+    /// Validate a stream name before it is used in an xattr name or a
+    /// sidecar filename. Rejects names that could traverse directories or
+    /// otherwise corrupt the storage mapping.
+    fn validate_stream_name(stream_name: &str) -> AppResult<()> {
+        let invalid = stream_name.is_empty()
+            || stream_name.contains(['/', '\\', ':', '\0'])
+            || stream_name == "."
+            || stream_name == "..";
+        if invalid {
+            return Err(AppError::new(
+                ReasonCode::RcFsPathInvalid,
+                format!("invalid alternate stream name '{stream_name}'"),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Escape a sidecar component so the `__` separator is unambiguous.
+    /// Every `_` is encoded as `_u`; the result never contains a bare `__`,
+    /// so the first `__` in a sidecar name is always the separator.
+    fn escape_sidecar_component(component: &str) -> String {
+        component.replace('_', "_u")
+    }
+
+    /// Inverse of [`Self::escape_sidecar_component`].
+    fn unescape_sidecar_component(component: &str) -> String {
+        component.replace("_u", "_")
+    }
+
     /// Read from an alternate data stream.
     ///
     /// On macOS, this maps to extended attributes via `getxattr()`.
@@ -639,6 +943,8 @@ impl RealFilesystem {
     /// For `Zone.Identifier`, also reads the `com.apple.quarantine` xattr.
     #[cfg(target_os = "macos")]
     pub fn read_alternate_stream(&self, path: &str, stream_name: &str) -> AppResult<Vec<u8>> {
+        Self::validate_stream_name(stream_name)?;
+        self.authorize_path(path, false)?;
         let real_path = self.resolver.resolve(path)?;
         let xattr_name = format!("{}{}", XATTR_ADS_PREFIX, stream_name);
 
@@ -664,7 +970,7 @@ impl RealFilesystem {
 
         if buf_size < 0 {
             let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::NotFound {
+            if is_xattr_not_found(&err) {
                 return Err(AppError::new(
                     ReasonCode::RcFsNotFound,
                     format!(
@@ -675,7 +981,7 @@ impl RealFilesystem {
                 ));
             }
             return Err(AppError::new(
-                ReasonCode::RcUnimplInsn,
+                ReasonCode::RcIo,
                 format!("getxattr failed: {err}"),
             ));
         }
@@ -696,8 +1002,18 @@ impl RealFilesystem {
 
         if result < 0 {
             let err = std::io::Error::last_os_error();
+            if is_xattr_not_found(&err) {
+                return Err(AppError::new(
+                    ReasonCode::RcFsNotFound,
+                    format!(
+                        "stream '{}' not found on {}",
+                        stream_name,
+                        real_path.display()
+                    ),
+                ));
+            }
             return Err(AppError::new(
-                ReasonCode::RcUnimplInsn,
+                ReasonCode::RcIo,
                 format!("getxattr read failed: {err}"),
             ));
         }
@@ -709,6 +1025,8 @@ impl RealFilesystem {
     /// Read from an alternate data stream (non-macOS fallback).
     #[cfg(not(target_os = "macos"))]
     pub fn read_alternate_stream(&self, path: &str, stream_name: &str) -> AppResult<Vec<u8>> {
+        Self::validate_stream_name(stream_name)?;
+        self.authorize_path(path, false)?;
         let real_path = self.resolver.resolve(path)?;
         let ads_path = Self::ads_sidecar_path(&real_path, stream_name);
 
@@ -724,7 +1042,7 @@ impl RealFilesystem {
                 )
             } else {
                 AppError::new(
-                    ReasonCode::RcUnimplInsn,
+                    ReasonCode::RcIo,
                     format!("failed to read stream '{}': {e}", ads_path.display()),
                 )
             }
@@ -745,6 +1063,8 @@ impl RealFilesystem {
         stream_name: &str,
         data: &[u8],
     ) -> AppResult<()> {
+        Self::validate_stream_name(stream_name)?;
+        self.authorize_path(path, true)?;
         let real_path = self.resolver.resolve(path)?;
         let xattr_name = format!("{}{}", XATTR_ADS_PREFIX, stream_name);
 
@@ -770,7 +1090,7 @@ impl RealFilesystem {
         if result < 0 {
             let err = std::io::Error::last_os_error();
             return Err(AppError::new(
-                ReasonCode::RcUnimplInsn,
+                ReasonCode::RcIo,
                 format!("setxattr failed: {err}"),
             ));
         }
@@ -791,6 +1111,8 @@ impl RealFilesystem {
         stream_name: &str,
         data: &[u8],
     ) -> AppResult<()> {
+        Self::validate_stream_name(stream_name)?;
+        self.authorize_path(path, true)?;
         let real_path = self.resolver.resolve(path)?;
         let ads_path = Self::ads_sidecar_path(&real_path, stream_name);
 
@@ -805,7 +1127,7 @@ impl RealFilesystem {
 
         fs::write(&ads_path, data).map_err(|e| {
             AppError::new(
-                ReasonCode::RcUnimplInsn,
+                ReasonCode::RcIo,
                 format!("failed to write stream '{}': {e}", ads_path.display()),
             )
         })?;
@@ -816,6 +1138,8 @@ impl RealFilesystem {
     /// Delete an alternate data stream.
     #[cfg(target_os = "macos")]
     pub fn delete_alternate_stream(&self, path: &str, stream_name: &str) -> AppResult<()> {
+        Self::validate_stream_name(stream_name)?;
+        self.authorize_path(path, true)?;
         let real_path = self.resolver.resolve(path)?;
         let xattr_name = format!("{}{}", XATTR_ADS_PREFIX, stream_name);
 
@@ -830,7 +1154,7 @@ impl RealFilesystem {
 
         if result < 0 {
             let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::NotFound {
+            if is_xattr_not_found(&err) {
                 return Err(AppError::new(
                     ReasonCode::RcFsNotFound,
                     format!(
@@ -841,7 +1165,7 @@ impl RealFilesystem {
                 ));
             }
             return Err(AppError::new(
-                ReasonCode::RcUnimplInsn,
+                ReasonCode::RcIo,
                 format!("removexattr failed: {err}"),
             ));
         }
@@ -852,6 +1176,8 @@ impl RealFilesystem {
     /// Delete an alternate data stream (non-macOS fallback).
     #[cfg(not(target_os = "macos"))]
     pub fn delete_alternate_stream(&self, path: &str, stream_name: &str) -> AppResult<()> {
+        Self::validate_stream_name(stream_name)?;
+        self.authorize_path(path, true)?;
         let real_path = self.resolver.resolve(path)?;
         let ads_path = Self::ads_sidecar_path(&real_path, stream_name);
 
@@ -867,7 +1193,7 @@ impl RealFilesystem {
                 )
             } else {
                 AppError::new(
-                    ReasonCode::RcUnimplInsn,
+                    ReasonCode::RcIo,
                     format!("failed to delete stream '{}': {e}", ads_path.display()),
                 )
             }
@@ -879,22 +1205,24 @@ impl RealFilesystem {
     /// List all alternate data streams for a file.
     #[cfg(target_os = "macos")]
     pub fn list_alternate_streams(&self, path: &str) -> AppResult<Vec<String>> {
+        self.authorize_path(path, false)?;
         let real_path = self.resolver.resolve(path)?;
 
         let c_path = CString::new(real_path.as_os_str().as_encoded_bytes())
             .map_err(|e| AppError::new(ReasonCode::RcCliInvalid, format!("invalid path: {e}")))?;
 
-        // SAFETY: listxattr FFI call — c_path is a valid CString, null buffer
-        // with size 0 queries the required buffer size (documented usage pattern).
+        // The attribute list can grow between the size query and the read
+        // (another process adding attributes concurrently). Retry with a
+        // larger buffer on ERANGE, and clamp the final slice as a guard.
         let buf_size = unsafe { libc::listxattr(c_path.as_ptr(), std::ptr::null_mut(), 0, 0) };
 
         if buf_size < 0 {
             let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::NotFound {
+            if is_xattr_not_found(&err) {
                 return Ok(Vec::new());
             }
             return Err(AppError::new(
-                ReasonCode::RcUnimplInsn,
+                ReasonCode::RcIo,
                 format!("listxattr failed: {err}"),
             ));
         }
@@ -904,9 +1232,7 @@ impl RealFilesystem {
         }
 
         let mut buf = vec![0u8; buf_size as usize];
-        // SAFETY: listxattr FFI call — c_path is a valid CString, buf is a
-        // valid Vec of buf_size bytes, and the return value is checked.
-        let result = unsafe {
+        let mut result = unsafe {
             libc::listxattr(
                 c_path.as_ptr(),
                 buf.as_mut_ptr() as *mut std::ffi::c_char,
@@ -914,24 +1240,42 @@ impl RealFilesystem {
                 0,
             )
         };
+        let mut attempts = 0;
+        while result < 0
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ERANGE)
+            && attempts < 4
+        {
+            attempts += 1;
+            buf.resize(buf.len().saturating_mul(2).max(buf.len() + 4096), 0);
+            // SAFETY: listxattr FFI call — c_path is a valid CString, buf is
+            // a valid Vec of the new size, and the return value is checked.
+            result = unsafe {
+                libc::listxattr(
+                    c_path.as_ptr(),
+                    buf.as_mut_ptr() as *mut std::ffi::c_char,
+                    buf.len(),
+                    0,
+                )
+            };
+        }
 
         if result < 0 {
             let err = std::io::Error::last_os_error();
             return Err(AppError::new(
-                ReasonCode::RcUnimplInsn,
+                ReasonCode::RcIo,
                 format!("listxattr read failed: {err}"),
             ));
         }
 
-        let names = parse_xattr_list(&buf[..result as usize]);
+        // Clamp defensively: never index past the buffer even if the list
+        // grew or shrank between the two calls.
+        let n = (result as usize).min(buf.len());
+        let names = parse_xattr_list(&buf[..n]);
         let stream_names: Vec<String> = names
             .into_iter()
             .filter_map(|name| {
-                if let Some(stripped) = name.strip_prefix(XATTR_ADS_PREFIX) {
-                    Some(stripped.to_string())
-                } else {
-                    None
-                }
+                name.strip_prefix(XATTR_ADS_PREFIX)
+                    .map(str::to_string)
             })
             .collect();
 
@@ -943,6 +1287,7 @@ impl RealFilesystem {
     /// Uses `.casa1_ads/` directory with `__` separator convention.
     #[cfg(not(target_os = "macos"))]
     pub fn list_alternate_streams(&self, path: &str) -> AppResult<Vec<String>> {
+        self.authorize_path(path, false)?;
         let real_path = self.resolver.resolve(path)?;
         let ads_dir = real_path.parent().map(|p| p.join(".casa1_ads"));
 
@@ -959,14 +1304,14 @@ impl RealFilesystem {
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
 
-        let prefix = format!("{}__", file_name);
+        let prefix = format!("{}__", Self::escape_sidecar_component(&file_name));
         let mut streams = Vec::new();
 
         if let Ok(entries) = fs::read_dir(&ads_dir) {
             for entry in entries.flatten() {
                 let name = entry.file_name().to_string_lossy().to_string();
                 if let Some(stream_name) = name.strip_prefix(&prefix) {
-                    streams.push(stream_name.to_string());
+                    streams.push(decode_stream_name_from_sidecar(stream_name));
                 }
             }
         }
@@ -980,13 +1325,26 @@ impl RealFilesystem {
 // -----------------------------------------------------------------------
 
 #[cfg(target_os = "macos")]
+/// Return whether an OS error means "attribute/file does not exist".
+///
+/// On macOS, a missing xattr commonly surfaces as `ENODATA`/`ENOATTR`,
+/// which `Error::kind()` does not map to `NotFound`.
+fn is_xattr_not_found(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::NotFound
+        || err.raw_os_error() == Some(libc::ENODATA)
+        || err.raw_os_error() == Some(libc::ENOATTR)
+}
+
+#[cfg(target_os = "macos")]
 /// Set the macOS quarantine extended attribute on a file.
 fn set_quarantine_xattr(path: &Path) -> AppResult<()> {
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let quarantine_data = format!("Casa1;{:x};", timestamp);
+    // macOS quarantine payload format: `app;timestamp;UUID` — the trailing
+    // UUID component is required for tooling to treat the file as quarantined.
+    let quarantine_data = format!("Casa1;{:x};{}", timestamp, uuid::Uuid::new_v4().simple());
 
     let c_path = CString::new(path.as_os_str().as_encoded_bytes())
         .map_err(|e| AppError::new(ReasonCode::RcCliInvalid, format!("invalid path: {e}")))?;
@@ -1010,7 +1368,7 @@ fn set_quarantine_xattr(path: &Path) -> AppResult<()> {
         let err = std::io::Error::last_os_error();
         if err.kind() == std::io::ErrorKind::PermissionDenied {
             return Err(AppError::new(
-                ReasonCode::RcUnimplInsn,
+                ReasonCode::RcIo,
                 format!("setxattr quarantine failed: {err}"),
             ));
         }
@@ -1026,18 +1384,18 @@ fn parse_xattr_list(buf: &[u8]) -> Vec<String> {
     let mut start = 0;
     for (i, &byte) in buf.iter().enumerate() {
         if byte == 0 {
-            if i > start {
-                if let Ok(name) = std::str::from_utf8(&buf[start..i]) {
-                    names.push(name.to_string());
-                }
+            if i > start
+                && let Ok(name) = std::str::from_utf8(&buf[start..i])
+            {
+                names.push(name.to_string());
             }
             start = i + 1;
         }
     }
-    if start < buf.len() {
-        if let Ok(name) = std::str::from_utf8(&buf[start..]) {
-            names.push(name.to_string());
-        }
+    if start < buf.len()
+        && let Ok(name) = std::str::from_utf8(&buf[start..])
+    {
+        names.push(name.to_string());
     }
     names
 }
@@ -1046,8 +1404,13 @@ fn parse_xattr_list(buf: &[u8]) -> Vec<String> {
 impl RealFilesystem {
     /// Get the sidecar file path for an ADS stream on non-macOS platforms.
     ///
-    /// Uses `.casa1_ads/` directory with `__` separator:
+    /// Uses `.casa1_ads/` directory with `__` separator, `_` escaping and
+    /// percent-encoding of dangerous characters:
     /// e.g., `file.txt:Zone.Identifier` → `.casa1_ads/file.txt__Zone.Identifier`
+    ///
+    /// Callers must validate the stream name first (see
+    /// [`Self::validate_stream_name`]); the escaping guarantees the result
+    /// stays inside the `.casa1_ads/` directory.
     fn ads_sidecar_path(real_path: &Path, stream_name: &str) -> PathBuf {
         let parent = real_path.parent().unwrap_or(Path::new("."));
         let file_name = real_path
@@ -1055,7 +1418,11 @@ impl RealFilesystem {
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
         let ads_dir = parent.join(".casa1_ads");
-        ads_dir.join(format!("{}__{}", file_name, stream_name))
+        ads_dir.join(format!(
+            "{}__{}",
+            Self::escape_sidecar_component(&file_name),
+            encode_stream_name_for_sidecar(stream_name)
+        ))
     }
 }
 
@@ -1063,10 +1430,54 @@ impl RealFilesystem {
 // Unified ADS sidecar path (used by virtual FS / GE layer)
 // ---------------------------------------------------------------------------
 
+/// Percent-encode characters that could escape the `.casa1_ads/` directory
+/// or corrupt the sidecar mapping. Applied to stream names when building
+/// sidecar file names; `_` is additionally escaped as `_u` so the `__`
+/// separator stays unambiguous.
+fn encode_stream_name_for_sidecar(stream_name: &str) -> String {
+    let mut encoded = String::with_capacity(stream_name.len());
+    for byte in stream_name.bytes() {
+        match byte {
+            b'%' => encoded.push_str("%25"),
+            b'/' => encoded.push_str("%2F"),
+            b'\\' => encoded.push_str("%5C"),
+            b':' => encoded.push_str("%3A"),
+            0 => encoded.push_str("%00"),
+            _ => encoded.push(byte as char),
+        }
+    }
+    RealFilesystem::escape_sidecar_component(&encoded)
+}
+
+/// Inverse of [`encode_stream_name_for_sidecar`].
+fn decode_stream_name_from_sidecar(encoded: &str) -> String {
+    let unescaped = RealFilesystem::unescape_sidecar_component(encoded);
+    let mut out = String::with_capacity(unescaped.len());
+    let mut rest = unescaped.as_str();
+    while !rest.is_empty() {
+        if let Some(hex) = rest
+            .strip_prefix('%')
+            .and_then(|r| r.get(..2))
+            .and_then(|h| u8::from_str_radix(h, 16).ok())
+        {
+            out.push(hex as char);
+            rest = &rest[3..];
+            continue;
+        }
+        let (ch, next) = rest.split_at(rest.chars().next().map_or(1, |c| c.len_utf8()));
+        out.push_str(ch);
+        rest = next;
+    }
+    out
+}
+
 /// Compute the sidecar file path for an ADS stream in the virtual filesystem.
 ///
 /// Convention: `.casa1_ads/file.txt__Zone.Identifier` for a stream named
-/// `Zone.Identifier` on the file `file.txt`.
+/// `Zone.Identifier` on the file `file.txt`. The stream name is percent-
+/// encoded (path separators, `:`, NUL, `%`) and `_` is escaped as `_u` in
+/// both components, so the result always stays inside the `.casa1_ads/`
+/// directory and the `__` separator is unambiguous.
 pub fn ads_sidecar_path_for(real_path: &Path, stream_name: &str) -> PathBuf {
     let parent = real_path.parent().unwrap_or(Path::new("."));
     let file_name = real_path
@@ -1074,21 +1485,30 @@ pub fn ads_sidecar_path_for(real_path: &Path, stream_name: &str) -> PathBuf {
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
     let ads_dir = parent.join(".casa1_ads");
-    ads_dir.join(format!("{}__{}", file_name, stream_name))
+    ads_dir.join(format!(
+        "{}__{}",
+        RealFilesystem::escape_sidecar_component(&file_name),
+        encode_stream_name_for_sidecar(stream_name)
+    ))
 }
 
 /// Extract the stream name from a sidecar file path.
 ///
+/// The sidecar name is `escape(base)__encode(stream)`; since `_` is escaped
+/// as `_u` in both components, the first `__` is always the separator and
+/// the decode is the exact inverse of the encode.
+///
 /// Returns `None` if the path does not follow the `.casa1_ads/name__stream` convention.
 pub fn ads_sidecar_to_stream(sidecar_path: &Path) -> Option<(String, String)> {
     let file_name = sidecar_path.file_name()?.to_str()?;
-    let separator = file_name.rfind("__")?;
-    let base_name = &file_name[..separator];
-    let stream_name = &file_name[separator + 2..];
-    if stream_name.is_empty() {
+    let (escaped_base, encoded_stream) = file_name.split_once("__")?;
+    if encoded_stream.is_empty() {
         return None;
     }
-    Some((base_name.to_string(), stream_name.to_string()))
+    Some((
+        RealFilesystem::unescape_sidecar_component(escaped_base),
+        decode_stream_name_from_sidecar(encoded_stream),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1153,12 +1573,50 @@ pub fn backup_read_file(
     let mut entries = Vec::new();
 
     // Read main data stream
-    match real_fs.open_file(windows_path, true, false, false, false) {
+    match real_fs.open_file_with_options(
+        windows_path,
+        true,
+        false,
+        false,
+        false,
+        OpenFileOptions {
+            share_mode: FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            delete_on_close: false,
+        },
+    ) {
         Ok(mut file) => {
             let size = file.size()?;
-            let mut data = vec![0u8; size as usize];
-            let bytes_read = file.read(&mut data)?;
-            data.truncate(bytes_read);
+            // The size is guest-controlled; stream in bounded chunks and
+            // refuse to buffer arbitrarily large (e.g. sparse, multi-GB)
+            // files so a malicious guest cannot OOM the emulator.
+            if size > MAX_BACKUP_READ_SIZE {
+                return Err(AppError::new(
+                    ReasonCode::RcBufferLimitExceeded,
+                    format!(
+                        "file {} is {size} bytes, exceeding the {} byte backup-read limit",
+                        windows_path, MAX_BACKUP_READ_SIZE
+                    ),
+                ));
+            }
+            let mut data = Vec::with_capacity(size as usize);
+            let mut chunk = vec![0u8; BACKUP_READ_CHUNK_SIZE];
+            loop {
+                let n = file.read(&mut chunk)?;
+                if n == 0 {
+                    break;
+                }
+                data.extend_from_slice(&chunk[..n]);
+                if data.len() as u64 > MAX_BACKUP_READ_SIZE {
+                    return Err(AppError::new(
+                        ReasonCode::RcBufferLimitExceeded,
+                        format!(
+                            "file {} exceeded the {} byte backup-read limit",
+                            windows_path, MAX_BACKUP_READ_SIZE
+                        ),
+                    ));
+                }
+            }
+            let bytes_read = data.len();
             entries.push(BackupStreamEntry {
                 stream_name: String::new(),
                 stream_type: ADS_STREAM_TYPE_DATA.to_string(),
@@ -1172,23 +1630,20 @@ pub fn backup_read_file(
     }
 
     // Enumerate alternate data streams
-    match real_fs.list_alternate_streams(windows_path) {
-        Ok(stream_names) => {
-            for stream_name in stream_names {
-                match real_fs.read_alternate_stream(windows_path, &stream_name) {
-                    Ok(data) => {
-                        entries.push(BackupStreamEntry {
-                            stream_name,
-                            stream_type: ADS_STREAM_TYPE_DATA.to_string(),
-                            size: data.len() as u64,
-                            data,
-                        });
-                    }
-                    Err(_) => continue, // Skip streams that can't be read
+    if let Ok(stream_names) = real_fs.list_alternate_streams(windows_path) {
+        for stream_name in stream_names {
+            match real_fs.read_alternate_stream(windows_path, &stream_name) {
+                Ok(data) => {
+                    entries.push(BackupStreamEntry {
+                        stream_name,
+                        stream_type: ADS_STREAM_TYPE_DATA.to_string(),
+                        size: data.len() as u64,
+                        data,
+                    });
                 }
+                Err(_) => continue, // Skip streams that can't be read
             }
         }
-        Err(_) => {} // No ADS is fine
     }
 
     Ok(BackupReadResult { entries })
@@ -1206,7 +1661,18 @@ pub fn backup_write_file(
     for entry in &backup.entries {
         if entry.stream_name.is_empty() {
             // Write main data stream
-            let mut file = real_fs.open_file(windows_path, false, true, true, true)?;
+            let mut file =
+                real_fs.open_file_with_options(
+                    windows_path,
+                    false,
+                    true,
+                    true,
+                    true,
+                    OpenFileOptions {
+                        share_mode: FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                        delete_on_close: false,
+                    },
+                )?;
             file.write(&entry.data)?;
             file.flush()?;
         } else {
@@ -1701,6 +2167,278 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Sandbox containment tests (symlink escapes)
+    // -----------------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn resolver_rejects_symlink_escape() {
+        let (tmp, _fs) = setup_fs();
+
+        // Create a symlink inside drive_c pointing outside the GE root
+        // (a separate directory that is NOT under the GE root).
+        let outside = tempfile::TempDir::new().unwrap();
+        let outside_dir = outside.path().to_path_buf();
+        fs::write(outside_dir.join("secret.txt"), b"top secret").unwrap();
+        let link = tmp.path().join("drive_c").join("evil_link");
+        std::os::unix::fs::symlink(&outside_dir, &link).unwrap();
+
+        let resolver = WindowsPathResolver::new(tmp.path());
+
+        // Resolving through the symlink must fail containment.
+        let result = resolver.resolve("C:\\evil_link\\secret.txt");
+        assert!(
+            result.is_err(),
+            "symlink escape must be rejected, got {result:?}"
+        );
+
+        // Creating a new file through the symlink must also fail.
+        let result = resolver.resolve("C:\\evil_link\\new_file.txt");
+        assert!(
+            result.is_err(),
+            "creation through a symlink escape must be rejected, got {result:?}"
+        );
+
+        // Regular paths still resolve.
+        assert!(resolver.resolve("C:\\Windows\\System32").is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn filesystem_rejects_symlink_escape_operations() {
+        let (_tmp, fs) = setup_fs();
+
+        // drive_c/escape -> a directory outside the GE root.
+        let outside = tempfile::TempDir::new().unwrap();
+        let outside_dir = outside.path().to_path_buf();
+        fs::write(outside_dir.join("victim.txt"), b"victim data").unwrap();
+        let link = _tmp.path().join("drive_c").join("escape");
+        std::os::unix::fs::symlink(&outside_dir, &link).unwrap();
+
+        // open_file through the symlink must fail.
+        let result = fs.open_file("C:\\escape\\victim.txt", true, false, false, false);
+        assert!(result.is_err(), "open through symlink must fail, got {result:?}");
+
+        // delete_file through the symlink must fail (must not delete outside files).
+        let result = fs.delete_file("C:\\escape\\victim.txt");
+        assert!(result.is_err(), "delete through symlink must fail, got {result:?}");
+        assert!(
+            outside_dir.join("victim.txt").exists(),
+            "outside file must be untouched"
+        );
+
+        // copy/move through the symlink must fail.
+        assert!(fs.copy_file("C:\\escape\\victim.txt", "C:\\copied.txt").is_err());
+        assert!(fs.move_file("C:\\escape\\victim.txt", "C:\\moved.txt").is_err());
+        assert!(!fs.exists("C:\\escape\\victim.txt"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_inside_root_still_allowed() {
+        let (tmp, fs) = setup_fs();
+
+        // A symlink that stays inside the GE root is fine.
+        fs.create_directory("C:\\real_dir").unwrap();
+        {
+            let mut f = fs.open_file("C:\\real_dir\\data.txt", false, true, true, false).unwrap();
+            f.write(b"data").unwrap();
+        }
+        let link = tmp.path().join("drive_c").join("alias");
+        std::os::unix::fs::symlink(tmp.path().join("drive_c").join("real_dir"), &link).unwrap();
+
+        assert!(fs.exists("C:\\alias\\data.txt"));
+        let meta = fs.metadata("C:\\alias\\data.txt");
+        assert!(meta.is_ok(), "in-root symlink should be allowed, got {meta:?}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Share-mode and delete-on-close tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn open_file_enforces_share_modes() {
+        let (_tmp, fs) = setup_fs();
+
+        // Exclusive open (share_mode=0) blocks a second open with access.
+        let handle = fs
+            .open_file_with_options(
+                "C:\\shared.txt",
+                true,
+                true,
+                true,
+                false,
+                OpenFileOptions::default(),
+            )
+            .unwrap();
+        let conflict = fs.open_file_with_options(
+            "C:\\shared.txt",
+            true,
+            false,
+            false,
+            false,
+            OpenFileOptions::default(),
+        );
+        assert!(
+            conflict.is_err(),
+            "exclusive open must conflict, got {conflict:?}"
+        );
+        drop(handle);
+
+        // After close, the file can be opened again.
+        assert!(fs
+            .open_file_with_options(
+                "C:\\shared.txt",
+                true,
+                false,
+                false,
+                false,
+                OpenFileOptions::default(),
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn open_file_share_read_allows_concurrent_readers() {
+        let (_tmp, fs) = setup_fs();
+        let _handle = fs
+            .open_file_with_options(
+                "C:\\shared.txt",
+                true,
+                true,
+                true,
+                false,
+                OpenFileOptions {
+                    share_mode: FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    delete_on_close: false,
+                },
+            )
+            .unwrap();
+
+        // A read-only open that shares read+write access is compatible with
+        // the existing read+write handle (Windows share-mode semantics: the
+        // second handle must share everything the first accesses).
+        let second = fs.open_file_with_options(
+            "C:\\shared.txt",
+            true,
+            false,
+            false,
+            false,
+            OpenFileOptions {
+                share_mode: FILE_SHARE_READ | FILE_SHARE_WRITE,
+                delete_on_close: false,
+            },
+        );
+        assert!(
+            second.is_ok(),
+            "shared read should be allowed, got {second:?}"
+        );
+    }
+
+    #[test]
+    fn delete_on_close_removes_file() {
+        let (_tmp, fs) = setup_fs();
+        {
+            let _handle = fs
+                .open_file_with_options(
+                    "C:\\temp_delete.txt",
+                    true,
+                    true,
+                    true,
+                    false,
+                    OpenFileOptions {
+                        share_mode: 0,
+                        delete_on_close: true,
+                    },
+                )
+                .unwrap();
+            assert!(fs.exists("C:\\temp_delete.txt"));
+        }
+        assert!(
+            !fs.exists("C:\\temp_delete.txt"),
+            "FILE_FLAG_DELETE_ON_CLOSE must remove the file on drop"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // ADS stream-name validation tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ads_rejects_traversal_stream_names() {
+        let (_tmp, fs) = setup_fs();
+        {
+            let mut file = fs
+                .open_file("C:\\ads_base.bin", false, true, true, false)
+                .unwrap();
+            file.write(b"base").unwrap();
+        }
+
+        for bad in ["..", ".", "a/b", r"a\b", "a:b", "a\0b"] {
+            let result = fs.write_alternate_stream("C:\\ads_base.bin", bad, b"data");
+            assert!(
+                result.is_err(),
+                "stream name {bad:?} must be rejected, got {result:?}"
+            );
+            let result = fs.read_alternate_stream("C:\\ads_base.bin", bad);
+            assert!(result.is_err(), "stream name {bad:?} must be rejected on read");
+        }
+    }
+
+    #[test]
+    fn ads_sidecar_roundtrip_with_escaped_components() {
+        let base = Path::new("some dir");
+        let stream = "Stream__Name_x";
+
+        let sidecar = ads_sidecar_path_for(&base.join("file_x.txt"), stream);
+        let decoded = ads_sidecar_to_stream(&sidecar).unwrap();
+        assert_eq!(decoded.0, "file_x.txt");
+        assert_eq!(decoded.1, stream);
+
+        // Traversal stream names are encoded, not escaped: the sidecar stays
+        // inside the .casa1_ads/ directory and round-trips exactly.
+        for evil in ["../evil", "a/b", "a\\b", "..", "a:b", "a%2Fb"] {
+            let sidecar = ads_sidecar_path_for(&base.join("file.txt"), evil);
+            let parent_dir = sidecar.parent().unwrap();
+            assert_eq!(
+                parent_dir.file_name().map(|n| n.to_string_lossy().to_string()),
+                Some(".casa1_ads".to_string()),
+                "sidecar for {evil:?} must stay inside .casa1_ads"
+            );
+            let decoded = ads_sidecar_to_stream(&sidecar).unwrap();
+            assert_eq!(decoded.0, "file.txt");
+            assert_eq!(decoded.1, evil, "encode/decode must round-trip {evil:?}");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Path authorizer tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn path_authorizer_blocks_operations() {
+        let (_tmp, mut fs) = setup_fs();
+
+        // Deny everything under a restricted root.
+        let denied = std::sync::Arc::new(std::sync::Mutex::new(true));
+        let denied_clone = Arc::clone(&denied);
+        fs.set_path_authorizer(move |path, _write| {
+            if *denied_clone.lock().unwrap() {
+                Err(format!("profile denies {path}"))
+            } else {
+                Ok(())
+            }
+        });
+
+        let result = fs.open_file("C:\\auth.txt", false, true, true, false);
+        assert!(result.is_err(), "authorizer must block open, got {result:?}");
+        assert!(fs.copy_file("C:\\a", "C:\\b").is_err());
+
+        *denied.lock().unwrap() = false;
+        assert!(fs.open_file("C:\\auth.txt", false, true, true, false).is_ok());
+    }
+
+    // -----------------------------------------------------------------------
     // Windows path normalization tests
     // -----------------------------------------------------------------------
 
@@ -1917,7 +2655,7 @@ mod tests {
 
         // Create a deeply nested directory structure with varying case
         let base = tmp.path().join("c_drive").join("DeepNest");
-        fs::create_dir_all(&base.join("SubOne").join("SubTwo").join("SubThree")).unwrap();
+        fs::create_dir_all(base.join("SubOne").join("SubTwo").join("SubThree")).unwrap();
         fs::write(
             base.join("SubOne")
                 .join("SubTwo")

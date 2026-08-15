@@ -60,22 +60,31 @@ pub enum AppContainerCapability {
 }
 
 impl AppContainerCapability {
-    /// Return the Windows SID string for this capability.
-    pub fn to_sid(&self) -> &'static str {
+    /// Return the Windows well-known capability SID string for this
+    /// capability, or `None` for capabilities that have no well-known
+    /// AppContainer capability SID (`codeGeneration`, `runFullTrust`,
+    /// `allowExecution`) — fabricating a SID for those would silently grant
+    /// the wrong capability.
+    ///
+    /// Values follow the documented well-known capability SIDs (S-1-15-3-N):
+    /// `internetClient`=1, `internetClientServer`=2,
+    /// `privateNetworkClientServer`=3, `documentsLibrary`=4,
+    /// `picturesLibrary`=5, `videosLibrary`=6, `musicLibrary`=7,
+    /// `enterpriseAuthentication`=8, `sharedUserCertificates`=9,
+    /// `removableStorage`=10.
+    pub fn to_sid(&self) -> Option<&'static str> {
         match self {
-            Self::DocumentsLibrary => "S-1-15-3-1",
-            Self::PicturesLibrary => "S-1-15-3-2",
-            Self::VideosLibrary => "S-1-15-3-3",
-            Self::MusicLibrary => "S-1-15-3-4",
-            Self::EnterpriseAuthentication => "S-1-15-3-5",
-            Self::SharedUserCertificates => "S-1-15-3-6",
-            Self::RemovableStorage => "S-1-15-3-7",
-            Self::InternetClient => "S-1-15-3-8",
-            Self::InternetClientServer => "S-1-15-3-9",
-            Self::PrivateNetworkClientServer => "S-1-15-3-10",
-            Self::CodeGeneration => "S-1-15-3-11",
-            Self::RunFullTrust => "S-1-15-3-12",
-            Self::AllowExecution => "S-1-15-3-13",
+            Self::InternetClient => Some("S-1-15-3-1"),
+            Self::InternetClientServer => Some("S-1-15-3-2"),
+            Self::PrivateNetworkClientServer => Some("S-1-15-3-3"),
+            Self::DocumentsLibrary => Some("S-1-15-3-4"),
+            Self::PicturesLibrary => Some("S-1-15-3-5"),
+            Self::VideosLibrary => Some("S-1-15-3-6"),
+            Self::MusicLibrary => Some("S-1-15-3-7"),
+            Self::EnterpriseAuthentication => Some("S-1-15-3-8"),
+            Self::SharedUserCertificates => Some("S-1-15-3-9"),
+            Self::RemovableStorage => Some("S-1-15-3-10"),
+            Self::CodeGeneration | Self::RunFullTrust | Self::AllowExecution => None,
         }
     }
 
@@ -140,6 +149,11 @@ pub struct AppContainerProfile {
     pub active: bool,
     /// Whether this is a Windows Sandbox (temporary VM) profile.
     pub is_sandbox: bool,
+    /// Whether this profile is explicitly unrestricted. When `true`, the
+    /// path allow lists are not enforced (this is an explicit opt-out; the
+    /// default is deny when an allow list is empty).
+    #[serde(default)]
+    pub unrestricted: bool,
 }
 
 impl AppContainerProfile {
@@ -156,6 +170,7 @@ impl AppContainerProfile {
             allowed_registry_keys: Vec::new(),
             active: false,
             is_sandbox: false,
+            unrestricted: false,
         }
     }
 
@@ -174,17 +189,32 @@ impl AppContainerProfile {
         self.capabilities.contains(capability)
     }
 
-    /// Add a path to the allowed read list.
+    /// Mark this profile as explicitly unrestricted (disables path-allow-list
+    /// enforcement for this profile).
+    pub fn set_unrestricted(&mut self, unrestricted: bool) {
+        self.unrestricted = unrestricted;
+    }
+
+    /// Return whether this profile is explicitly unrestricted.
+    pub fn is_unrestricted(&self) -> bool {
+        self.unrestricted
+    }
+
+    /// Add a path to the allowed read list. The path is normalized
+    /// (separators unified, `.`/`..` resolved) so that checks against it are
+    /// stable and allocation-free at validation time.
     pub fn add_read_path(&mut self, path: &str) {
-        if !self.allowed_read_paths.contains(&path.to_string()) {
-            self.allowed_read_paths.push(path.to_string());
+        let normalized = normalize_sandbox_path(path);
+        if !self.allowed_read_paths.contains(&normalized) {
+            self.allowed_read_paths.push(normalized);
         }
     }
 
-    /// Add a path to the allowed write list.
+    /// Add a path to the allowed write list. See [`Self::add_read_path`].
     pub fn add_write_path(&mut self, path: &str) {
-        if !self.allowed_write_paths.contains(&path.to_string()) {
-            self.allowed_write_paths.push(path.to_string());
+        let normalized = normalize_sandbox_path(path);
+        if !self.allowed_write_paths.contains(&normalized) {
+            self.allowed_write_paths.push(normalized);
         }
     }
 
@@ -326,6 +356,13 @@ impl SandboxManager {
             return Err(format!("AppContainer profile '{name}' already exists"));
         }
         let profile = AppContainerProfile::new(name, description);
+        // SIDs are derived from a 64-bit hash of the name; guard against
+        // collisions so `get_profile_by_sid` stays unambiguous.
+        if profiles.values().any(|p| p.sid == profile.sid) {
+            return Err(format!(
+                "AppContainer profile '{name}' would collide with an existing SID"
+            ));
+        }
         let clone = profile.clone();
         profiles.insert(name.to_string(), profile);
         Ok(clone)
@@ -375,6 +412,16 @@ impl SandboxManager {
             .get_mut(name)
             .ok_or_else(|| format!("AppContainer profile '{name}' not found"))?;
         profile.active = active;
+        Ok(())
+    }
+
+    /// Mark a profile as explicitly unrestricted or restricted.
+    pub fn set_profile_unrestricted(&self, name: &str, unrestricted: bool) -> Result<(), String> {
+        let mut profiles = self.profiles.lock().unwrap();
+        let profile = profiles
+            .get_mut(name)
+            .ok_or_else(|| format!("AppContainer profile '{name}' not found"))?;
+        profile.unrestricted = unrestricted;
         Ok(())
     }
 
@@ -500,11 +547,11 @@ impl SandboxManager {
                 xml.push_str("    <MappedFolder>\n");
                 xml.push_str(&format!(
                     "      <HostFolder>{}</HostFolder>\n",
-                    folder.host_path
+                    escape_xml_text(&folder.host_path)
                 ));
                 xml.push_str(&format!(
                     "      <SandboxFolder>{}</SandboxFolder>\n",
-                    folder.sandbox_path
+                    escape_xml_text(&folder.sandbox_path)
                 ));
                 xml.push_str(&format!(
                     "      <ReadOnly>{}</ReadOnly>\n",
@@ -541,10 +588,14 @@ impl SandboxManager {
         let total = profiles.len();
         let active = profiles.values().filter(|p| p.active).count();
         let sandbox_running = profiles.values().any(|p| p.active && p.is_sandbox);
+        // AppContainer is a Windows host feature; report actual availability
+        // instead of a constant so the summary stays trustworthy for UI and
+        // decision code.
+        let app_container_available = cfg!(target_os = "windows");
         // Capabilities are enforceable on all platforms where Casa1 runs.
         let capabilities_enforceable = cfg!(any(target_os = "macos", target_os = "windows"));
         SandboxEnvironmentSummary {
-            app_container_available: true,
+            app_container_available,
             profile_count: total,
             active_profile_count: active,
             sandbox_running,
@@ -554,31 +605,60 @@ impl SandboxManager {
 
     /// Validate whether a path is allowed for a given profile.
     ///
-    /// Returns `Ok(())` if the path is in the profile's allowed read or write
-    /// lists, or if the profile doesn't restrict that path.
+    /// This is the enforcement hook for AppContainer-style path isolation.
+    /// To wire it into filesystem operations, install it on a
+    /// [`crate::real_fs::RealFilesystem`] via `set_path_authorizer`
+    /// (see [`crate::real_fs`]).
+    ///
+    /// Semantics (fail closed):
+    /// - If the sandbox manager is disabled (kill switch), all paths are
+    ///   allowed.
+    /// - If the profile is explicitly unrestricted, all paths are allowed.
+    /// - Otherwise the path must equal an allowed entry or be a descendant
+    ///   of one at a component boundary. An empty allow list denies
+    ///   everything — the default is deny, not "no restrictions".
+    ///
+    /// Returns `Ok(())` if the path is allowed, `Err` otherwise.
     pub fn validate_path_access(
         &self,
         profile_name: &str,
         path: &str,
         write: bool,
     ) -> Result<(), String> {
+        // Kill switch: disabling the sandbox manager disables enforcement.
+        if !*self.enabled.lock().unwrap() {
+            return Ok(());
+        }
         let profile = self
             .get_profile(profile_name)
             .ok_or_else(|| format!("AppContainer profile '{profile_name}' not found"))?;
+        if profile.unrestricted {
+            return Ok(());
+        }
         let allowed = if write {
             &profile.allowed_write_paths
         } else {
             &profile.allowed_read_paths
         };
         if allowed.is_empty() {
-            // Empty allow list means no restrictions.
-            return Ok(());
+            // Fail closed: an empty allow list means deny, never allow.
+            return Err(format!(
+                "path '{path}' denied: profile '{profile_name}' allows no {} paths",
+                if write { "write" } else { "read" }
+            ));
         }
-        let normalized = path.replace('\\', "/");
-        if allowed
-            .iter()
-            .any(|p| normalized.starts_with(&p.replace('\\', "/")))
-        {
+        let normalized = normalize_sandbox_path(path);
+        let is_allowed = allowed.iter().any(|entry| {
+            // Entries are normalized at insertion time; legacy entries loaded
+            // from serialized profiles are normalized lazily here.
+            let entry = if entry.contains('\\') {
+                std::borrow::Cow::Owned(normalize_sandbox_path(entry))
+            } else {
+                std::borrow::Cow::Borrowed(entry.as_str())
+            };
+            path_is_allowed_descendant(&normalized, &entry)
+        });
+        if is_allowed {
             Ok(())
         } else {
             Err(format!(
@@ -599,11 +679,61 @@ impl Default for SandboxManager {
 // Public helper functions
 // ---------------------------------------------------------------------------
 
+/// Lexically normalize a Windows-style path for sandbox comparisons:
+/// separators are unified to `/` and `.`/`..` components are resolved
+/// without touching the filesystem.
+fn normalize_sandbox_path(path: &str) -> String {
+    let unified = path.replace('\\', "/");
+    let mut components: Vec<&str> = Vec::new();
+    for part in unified.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                components.pop();
+            }
+            _ => components.push(part),
+        }
+    }
+    components.join("/")
+}
+
+/// Return `true` when `path` equals `allowed` or is a descendant of it at a
+/// path-component boundary.
+///
+/// `C:/Windows/System32` allows `C:/Windows/System32/cmd.exe` but neither
+/// `C:/Windows/System32Malware/x.exe` (sibling prefix) nor any path that
+/// traverses out of the allowed root (`..` components are already resolved
+/// by [`normalize_sandbox_path`]).
+fn path_is_allowed_descendant(path: &str, allowed: &str) -> bool {
+    // An empty allowed entry is the normalized form of the root `/`.
+    if allowed.is_empty() {
+        return true;
+    }
+    path == allowed || path.strip_prefix(allowed).is_some_and(|r| r.starts_with('/'))
+}
+
+/// Escape a string for safe interpolation into Windows Sandbox (`.wsb`) XML.
+fn escape_xml_text(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&apos;"),
+            _ => escaped.push(c),
+        }
+    }
+    escaped
+}
+
 /// Generate a deterministic SID-like string for an AppContainer profile name.
 ///
 /// This is not a real Windows SID but provides a consistent identifier for
 /// each profile, mimicking the format `S-1-15-2-<hash>` used by Windows
-/// AppContainer profiles.
+/// AppContainer profiles. The full 64-bit hash is used (four 16-bit parts)
+/// to minimize collisions between distinct profile names.
 pub fn generate_app_container_sid(profile_name: &str) -> String {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -613,7 +743,8 @@ pub fn generate_app_container_sid(profile_name: &str) -> String {
     let part1 = (hash & 0xFFFF) as u32;
     let part2 = ((hash >> 16) & 0xFFFF) as u32;
     let part3 = ((hash >> 32) & 0xFFFF) as u32;
-    format!("S-1-15-2-{part1}-{part2}-{part3}")
+    let part4 = ((hash >> 48) & 0xFFFF) as u32;
+    format!("S-1-15-2-{part1}-{part2}-{part3}-{part4}")
 }
 
 /// Check if a SID string looks like an AppContainer SID.
@@ -784,12 +915,25 @@ mod tests {
     fn test_validate_path_access() {
         let manager = SandboxManager::new();
         manager.create_profile("AccessTest", "access test").unwrap();
-        // Empty allow list = no restrictions.
+        // Empty allow list = deny (fail closed).
+        assert!(
+            manager
+                .validate_path_access("AccessTest", "/any/path", false)
+                .is_err(),
+            "empty allow list must deny by default"
+        );
+        // Explicitly unrestricted profiles are allowed.
+        manager
+            .set_profile_unrestricted("AccessTest", true)
+            .unwrap();
         assert!(
             manager
                 .validate_path_access("AccessTest", "/any/path", false)
                 .is_ok()
         );
+        manager
+            .set_profile_unrestricted("AccessTest", false)
+            .unwrap();
         // Add a read path restriction.
         manager
             .add_read_path("AccessTest", "/Users/test/Documents")
@@ -807,16 +951,98 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_path_access_rejects_prefix_sibling() {
+        let mut profile = AppContainerProfile::new("PrefixTest", "prefix test");
+        profile.add_read_path("C:\\Windows\\System32");
+        let manager = SandboxManager::with_profiles(vec![profile]);
+
+        // A sibling directory sharing the prefix must be denied.
+        let result = manager.validate_path_access("PrefixTest", "C:\\Windows\\System32Malware\\x.exe", false);
+        assert!(result.is_err(), "prefix sibling must be denied, got {result:?}");
+        // Traversal through the allowed root must be denied.
+        let result = manager.validate_path_access(
+            "PrefixTest",
+            "C:\\Windows\\System32\\..\\..\\..\\Users\\Public\\steam.exe",
+            false,
+        );
+        assert!(result.is_err(), "traversal through allowed root must be denied, got {result:?}");
+        // A genuine descendant is allowed.
+        let result = manager.validate_path_access("PrefixTest", "C:\\Windows\\System32\\cmd.exe", false);
+        assert!(result.is_ok(), "descendant must be allowed, got {result:?}");
+        // The allowed root itself is allowed.
+        let result = manager.validate_path_access("PrefixTest", "C:\\Windows\\System32", false);
+        assert!(result.is_ok(), "allowed root itself must be allowed, got {result:?}");
+    }
+
+    #[test]
+    fn test_validate_path_access_disabled_manager_allows() {
+        let manager = SandboxManager::new();
+        manager.create_profile("KillSwitch", "kill switch test").unwrap();
+        manager
+            .add_read_path("KillSwitch", "/Users/test/Documents")
+            .unwrap();
+        assert!(
+            manager
+                .validate_path_access("KillSwitch", "/Users/test/Other", false)
+                .is_err()
+        );
+        // Disabling the manager is a documented kill switch.
+        manager.set_enabled(false);
+        assert!(
+            manager
+                .validate_path_access("KillSwitch", "/Users/test/Other", false)
+                .is_ok()
+        );
+    }
+
+    #[test]
     fn test_capability_to_sid() {
+        // Documented well-known AppContainer capability SIDs (S-1-15-3-N).
         assert_eq!(
             AppContainerCapability::InternetClient.to_sid(),
-            "S-1-15-3-8"
+            Some("S-1-15-3-1")
         );
-        assert_eq!(AppContainerCapability::RunFullTrust.to_sid(), "S-1-15-3-12");
+        assert_eq!(
+            AppContainerCapability::InternetClientServer.to_sid(),
+            Some("S-1-15-3-2")
+        );
+        assert_eq!(
+            AppContainerCapability::PrivateNetworkClientServer.to_sid(),
+            Some("S-1-15-3-3")
+        );
         assert_eq!(
             AppContainerCapability::DocumentsLibrary.to_sid(),
-            "S-1-15-3-1"
+            Some("S-1-15-3-4")
         );
+        assert_eq!(
+            AppContainerCapability::PicturesLibrary.to_sid(),
+            Some("S-1-15-3-5")
+        );
+        assert_eq!(
+            AppContainerCapability::VideosLibrary.to_sid(),
+            Some("S-1-15-3-6")
+        );
+        assert_eq!(
+            AppContainerCapability::MusicLibrary.to_sid(),
+            Some("S-1-15-3-7")
+        );
+        assert_eq!(
+            AppContainerCapability::EnterpriseAuthentication.to_sid(),
+            Some("S-1-15-3-8")
+        );
+        assert_eq!(
+            AppContainerCapability::SharedUserCertificates.to_sid(),
+            Some("S-1-15-3-9")
+        );
+        assert_eq!(
+            AppContainerCapability::RemovableStorage.to_sid(),
+            Some("S-1-15-3-10")
+        );
+        // No well-known capability SID exists for these; fabricating one
+        // would grant the wrong capability.
+        assert_eq!(AppContainerCapability::CodeGeneration.to_sid(), None);
+        assert_eq!(AppContainerCapability::RunFullTrust.to_sid(), None);
+        assert_eq!(AppContainerCapability::AllowExecution.to_sid(), None);
     }
 
     #[test]
@@ -854,6 +1080,8 @@ mod tests {
         assert_ne!(sid1, sid3);
         // All AppContainer SIDs start with the correct prefix.
         assert!(sid1.starts_with("S-1-15-2-"));
+        // The full 64-bit hash is used: four 16-bit parts.
+        assert_eq!(sid1.split('-').count(), 8, "SID should be S-1-15-2-p1-p2-p3-p4");
     }
 
     #[test]
@@ -876,7 +1104,11 @@ mod tests {
     fn test_environment_summary() {
         let manager = SandboxManager::new();
         let summary = manager.environment_summary();
+        // AppContainer availability reflects the actual host capability.
+        #[cfg(target_os = "windows")]
         assert!(summary.app_container_available);
+        #[cfg(not(target_os = "windows"))]
+        assert!(!summary.app_container_available);
         assert_eq!(summary.profile_count, 0);
         assert_eq!(summary.active_profile_count, 0);
         assert!(!summary.sandbox_running);
@@ -925,6 +1157,23 @@ mod tests {
         assert!(xml.contains("<MappedFolder>"));
         assert!(xml.contains("<HostFolder>/Users/test/Projects</HostFolder>"));
         assert!(xml.contains("<ReadOnly>true</ReadOnly>"));
+    }
+
+    #[test]
+    fn test_generate_wsb_xml_escapes_paths() {
+        let manager = SandboxManager::new();
+        let mut config = WindowsSandboxConfig::default();
+        config.mapped_folders.push(MappedFolder::new(
+            "/Users/a&b/Projects<1>",
+            "C:\\Sandbox\\\"Quoted\"\\'Path'",
+            false,
+        ));
+        manager.set_sandbox_config(config);
+        let xml = manager.generate_wsb_xml();
+        assert!(xml.contains("<HostFolder>/Users/a&amp;b/Projects&lt;1&gt;</HostFolder>"));
+        assert!(xml.contains("<SandboxFolder>C:\\Sandbox\\&quot;Quoted&quot;\\&apos;Path&apos;</SandboxFolder>"));
+        // Raw special characters must not appear inside element text.
+        assert!(!xml.contains("<HostFolder>/Users/a&b"));
     }
 
     #[test]

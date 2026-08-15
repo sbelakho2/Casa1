@@ -126,6 +126,17 @@ pub struct WslSupport {
     enabled: Mutex<bool>,
 }
 
+/// Shell-quote a string for safe interpolation into a command line.
+///
+/// Returns the quoted form, or `String::new()` when the string cannot be
+/// quoted safely (embedded NUL bytes); an empty tool name simply fails the
+/// lookup instead of injecting anything.
+fn shell_quote(s: &str) -> String {
+    shlex::try_quote(s)
+        .map(|quoted| quoted.into_owned())
+        .unwrap_or_default()
+}
+
 impl WslSupport {
     /// Create a new [`WslSupport`] instance and auto-detect the platform.
     pub fn new() -> Self {
@@ -251,9 +262,7 @@ impl WslSupport {
         } else if self.platform.host_is_macos {
             launch_wsl_command_macos(distribution, command, timeout_secs)
         } else {
-            Err(format!(
-                "unsupported host platform for WSL command execution"
-            ))
+            Err("unsupported host platform for WSL command execution".to_string())
         }
     }
 
@@ -267,11 +276,17 @@ impl WslSupport {
         self.launch_command(&default.name, command, timeout_secs)
     }
 
-    /// Check if a specific package/tool is available in a distribution.
-    pub fn check_tool_available(&self, distribution: &str, tool: &str) -> Result<bool, String> {
-        let result = self.launch_command(distribution, &format!("which {tool}"), Some(10))?;
-        Ok(result.exit_code == 0)
-    }
+/// Check if a specific package/tool is available in a distribution.
+pub fn check_tool_available(&self, distribution: &str, tool: &str) -> Result<bool, String> {
+    // Shell-quote the tool name so guest-supplied input can never inject
+    // additional commands into the launched shell.
+    let result = self.launch_command(
+        distribution,
+        &format!("which {}", shell_quote(tool)),
+        Some(10),
+    )?;
+    Ok(result.exit_code == 0)
+}
 
     /// Retrieve the Linux kernel version reported by a distribution.
     pub fn kernel_version(&self, distribution: &str) -> Result<Option<String>, String> {
@@ -317,60 +332,56 @@ impl Default for WslSupport {
 // ---------------------------------------------------------------------------
 
 /// Detect the current platform and determine WSL availability.
+///
+/// The result is cached process-wide (probes are only run once) and the
+/// tool probes run concurrently, so repeated construction of
+/// [`WslSupport`] does not pay serial subprocess spawn latency.
 pub fn detect_wsl_platform() -> WslPlatformInfo {
+    static WSL_PLATFORM_CACHE: std::sync::OnceLock<WslPlatformInfo> = std::sync::OnceLock::new();
+    WSL_PLATFORM_CACHE
+        .get_or_init(detect_wsl_platform_uncached)
+        .clone()
+}
+
+fn detect_wsl_platform_uncached() -> WslPlatformInfo {
     let host_is_windows = cfg!(target_os = "windows");
     let host_is_macos = cfg!(target_os = "macos");
-    let mut alternative_available = false;
-    let mut alternative_name: Option<String> = None;
 
-    if host_is_macos {
-        // Probe for Docker.
-        if let Ok(output) = std::process::Command::new("docker")
-            .arg("--version")
-            .output()
-        {
-            if output.status.success() {
-                alternative_available = true;
-                alternative_name = Some("docker".to_string());
+    let (alternative_available, alternative_name) = if host_is_macos {
+        // Probe for Docker, colima, multipass and lima concurrently; the
+        // first positive probe in priority order wins.
+        const PROBES: [(&str, &str); 4] = [
+            ("docker", "docker"),
+            ("colima", "colima"),
+            ("multipass", "multipass"),
+            ("limactl", "lima"),
+        ];
+        let handles: Vec<_> = PROBES
+            .iter()
+            .map(|(binary, name)| {
+                let binary = *binary;
+                let name = *name;
+                std::thread::spawn(move || {
+                    std::process::Command::new(binary)
+                        .arg("--version")
+                        .output()
+                        .ok()
+                        .filter(|output| output.status.success())
+                        .map(|_| name.to_string())
+                })
+            })
+            .collect();
+        let mut found = (false, None);
+        for handle in handles {
+            if let Ok(Some(name)) = handle.join() {
+                found = (true, Some(name));
+                break;
             }
         }
-        // Probe for colima.
-        if !alternative_available {
-            if let Ok(output) = std::process::Command::new("colima")
-                .arg("--version")
-                .output()
-            {
-                if output.status.success() {
-                    alternative_available = true;
-                    alternative_name = Some("colima".to_string());
-                }
-            }
-        }
-        // Probe for multipass.
-        if !alternative_available {
-            if let Ok(output) = std::process::Command::new("multipass")
-                .arg("--version")
-                .output()
-            {
-                if output.status.success() {
-                    alternative_available = true;
-                    alternative_name = Some("multipass".to_string());
-                }
-            }
-        }
-        // Probe for lima.
-        if !alternative_available {
-            if let Ok(output) = std::process::Command::new("limactl")
-                .arg("--version")
-                .output()
-            {
-                if output.status.success() {
-                    alternative_available = true;
-                    alternative_name = Some("lima".to_string());
-                }
-            }
-        }
-    }
+        found
+    } else {
+        (false, None)
+    };
 
     let wsl_version_detected = if host_is_windows {
         detect_wsl_version()
@@ -407,6 +418,47 @@ fn detect_wsl_version() -> Option<u32> {
     }
 }
 
+/// Parse a single line of `wsl.exe --list --verbose` output into a
+/// distribution, tolerating the `*` default marker and distribution names
+/// containing spaces.
+///
+/// Line layout is `[ *] <NAME...> <STATE> <VERSION>`. Lines that do not
+/// parse cleanly (header, empty, or unparseable state/version) are skipped.
+fn parse_wsl_list_line(line: &str) -> Option<WslDistribution> {
+    let trimmed = line.trim().trim_start_matches('*').trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let parts: Vec<&str> = trimmed.split_whitespace().collect();
+    if parts.len() < 3 {
+        return None;
+    }
+    let wsl_version = parts.last()?.parse::<u32>().ok()?;
+    let state = match parts[parts.len() - 2].to_ascii_lowercase().as_str() {
+        "running" => WslDistributionState::Running,
+        "installing" => WslDistributionState::Installing,
+        "failed" => WslDistributionState::Failed,
+        "stopped" => WslDistributionState::Stopped,
+        // Unknown state words (including localized headers) are skipped
+        // rather than defaulted.
+        _ => return None,
+    };
+    let name = parts[..parts.len() - 2].join(" ");
+    if name.is_empty() {
+        return None;
+    }
+    Some(WslDistribution {
+        name,
+        wsl_version,
+        state,
+        base_path: PathBuf::new(),
+        default_uid: 1000,
+        environment: HashMap::new(),
+        systemd_enabled: wsl_version == WSL_VERSION_2,
+        kernel_command_line: None,
+    })
+}
+
 /// Probe the Windows registry for installed WSL distributions (Windows only).
 fn probe_wsl_distributions() -> Result<Vec<WslDistribution>, String> {
     // On non-Windows platforms, return an empty list.
@@ -425,35 +477,103 @@ fn probe_wsl_distributions() -> Result<Vec<WslDistribution>, String> {
     let mut distributions = Vec::new();
     // Expected format (header + lines):
     //   NAME                   STATE           VERSION
-    //   Ubuntu-22.04           Running         2
-    //   Debian                 Stopped         2
+    //   * Ubuntu-22.04         Running         2
+    //   Kali Linux             Stopped         2
     for line in stdout.lines().skip(1) {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let parts: Vec<&str> = trimmed.split_whitespace().collect();
-        if parts.len() >= 3 {
-            let name = parts[0].to_string();
-            let state = match parts[1].to_lowercase().as_str() {
-                "running" => WslDistributionState::Running,
-                "installing" => WslDistributionState::Installing,
-                _ => WslDistributionState::Stopped,
-            };
-            let wsl_version = parts[2].parse::<u32>().unwrap_or(WSL_VERSION_2);
-            distributions.push(WslDistribution {
-                name,
-                wsl_version,
-                state,
-                base_path: PathBuf::new(),
-                default_uid: 1000,
-                environment: HashMap::new(),
-                systemd_enabled: wsl_version == WSL_VERSION_2,
-                kernel_command_line: None,
-            });
+        if let Some(distro) = parse_wsl_list_line(line) {
+            distributions.push(distro);
         }
     }
     Ok(distributions)
+}
+
+/// Wait for a child process to exit while draining its stdout/stderr pipes
+/// concurrently (preventing pipe-buffer deadlocks on large output), with an
+/// optional timeout.
+///
+/// On timeout the child (and its process tree on Windows) is killed and
+/// reaped before returning; the collected output is returned in both cases.
+/// Returns `(output, timed_out)`.
+fn wait_with_timeout(
+    child: &mut std::process::Child,
+    timeout: Option<std::time::Duration>,
+) -> Result<(std::process::Output, bool), String> {
+    let stdout_reader = child.stdout.take().map(|pipe| {
+        std::thread::spawn(move || {
+            let mut out = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut std::io::BufReader::new(pipe), &mut out);
+            out
+        })
+    });
+    let stderr_reader = child.stderr.take().map(|pipe| {
+        std::thread::spawn(move || {
+            let mut out = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut std::io::BufReader::new(pipe), &mut out);
+            out
+        })
+    });
+
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let _ = child.wait();
+                let stdout = stdout_reader
+                    .and_then(|handle| handle.join().ok())
+                    .unwrap_or_default();
+                let stderr = stderr_reader
+                    .and_then(|handle| handle.join().ok())
+                    .unwrap_or_default();
+                return Ok((
+                    std::process::Output {
+                        status,
+                        stdout,
+                        stderr,
+                    },
+                    false,
+                ));
+            }
+            Ok(None) => {
+                if let Some(limit) = timeout
+                    && start.elapsed() > limit
+                {
+                    kill_child_tree(child);
+                    let status = child
+                        .wait()
+                        .map_err(|e| format!("failed to reap child after timeout kill: {e}"))?;
+                    let stdout = stdout_reader
+                        .and_then(|handle| handle.join().ok())
+                        .unwrap_or_default();
+                    let stderr = stderr_reader
+                        .and_then(|handle| handle.join().ok())
+                        .unwrap_or_default();
+                    return Ok((
+                        std::process::Output {
+                            status,
+                            stdout,
+                            stderr,
+                        },
+                        true,
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(e) => {
+                return Err(format!("error waiting for child process: {e}"));
+            }
+        }
+    }
+}
+
+/// Kill a child process and, on Windows, its process tree (via `taskkill`).
+fn kill_child_tree(child: &mut std::process::Child) {
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            .output();
+    }
+    let _ = child.kill();
 }
 
 /// Execute a command in a WSL distribution on Windows via `wsl.exe`.
@@ -472,138 +592,49 @@ fn launch_wsl_command_windows(
         .spawn()
         .map_err(|e| format!("failed to spawn wsl.exe: {e}"))?;
 
-    let timeout = timeout_secs.unwrap_or(30);
-    let start = std::time::Instant::now();
-    loop {
-        if start.elapsed().as_secs() > timeout {
-            // We can't easily kill on non-Unix, but attempt it.
-            match std::process::Command::new("taskkill")
-                .args(["/PID", &child.id().to_string(), "/F"])
-                .output()
-            {
-                Ok(output) if !output.status.success() => {
-                    eprintln!(
-                        "[wsl] timeout: taskkill failed for PID {} with status {:?}",
-                        child.id(),
-                        output.status
-                    );
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    eprintln!(
-                        "[wsl] timeout: failed to invoke taskkill for PID {}: {}",
-                        child.id(),
-                        error
-                    );
-                }
-            }
-            return Ok(WslCommandResult {
-                stdout: String::new(),
-                stderr: String::new(),
-                exit_code: -1,
-                timed_out: true,
-            });
-        }
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let output = child
-                    .wait_with_output()
-                    .unwrap_or_else(|_| std::process::Output {
-                        stdout: Vec::new(),
-                        stderr: Vec::new(),
-                        status,
-                    });
-                return Ok(WslCommandResult {
-                    stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-                    stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-                    exit_code: status.code().unwrap_or(-1),
-                    timed_out: false,
-                });
-            }
-            Ok(None) => {
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-            Err(e) => {
-                return Err(format!("error waiting for wsl.exe: {e}"));
-            }
-        }
-    }
+    let timeout = timeout_secs.map(std::time::Duration::from_secs);
+    let (output, timed_out) = wait_with_timeout(&mut child, timeout)?;
+    Ok(WslCommandResult {
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        exit_code: output.status.code().unwrap_or(-1),
+        timed_out,
+    })
 }
 
-/// Execute a Linux command on macOS by shelling out to `/bin/bash`.
+/// Execute a Linux command on macOS inside a container/VM runtime.
 ///
-/// On macOS, there is no real WSL. This provides a best-effort fallback that
-/// runs the command via bash directly. For proper Linux binary execution, users
-/// should have Docker, colima, or another Linux VM tool installed.
+/// On macOS there is no real WSL. Commands are only ever executed inside a
+/// container (Docker/colima/Lima). There is deliberately no fallback to
+/// `/bin/bash -c` on the host: the command originates from emulated
+/// (untrusted) guest code via the `wslapi.dll` surface, and native host
+/// execution would bypass the sandbox with the Casa1 user's full privileges.
 fn launch_wsl_command_macos(
     distribution: &str,
     command: &str,
     timeout_secs: Option<u64>,
 ) -> Result<WslCommandResult, String> {
-    // Try Docker as the preferred alternative.
+    // Require a container runtime; refuse native host execution.
     let docker_check = std::process::Command::new("docker")
         .arg("--version")
         .output();
-    if let Ok(docker_output) = docker_check {
-        if docker_output.status.success() {
-            return launch_via_docker(distribution, command, timeout_secs);
-        }
+    if let Ok(docker_output) = docker_check
+        && docker_output.status.success()
+    {
+        return launch_via_docker(distribution, command, timeout_secs);
     }
-
-    // Fallback: run directly via bash (assumes the command is available natively).
-    let mut cmd = std::process::Command::new("/bin/bash");
-    cmd.arg("-c");
-    cmd.arg(command);
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
-
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("failed to spawn bash: {e}"))?;
-
-    let timeout = timeout_secs.unwrap_or(30);
-    let start = std::time::Instant::now();
-    loop {
-        if start.elapsed().as_secs() > timeout {
-            if let Err(error) = child.kill() {
-                return Err(format!(
-                    "timed out and failed to terminate bash process: {error}"
-                ));
-            }
-            return Ok(WslCommandResult {
-                stdout: String::new(),
-                stderr: String::new(),
-                exit_code: -1,
-                timed_out: true,
-            });
-        }
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let output = child
-                    .wait_with_output()
-                    .unwrap_or_else(|_| std::process::Output {
-                        stdout: Vec::new(),
-                        stderr: Vec::new(),
-                        status,
-                    });
-                return Ok(WslCommandResult {
-                    stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-                    stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-                    exit_code: status.code().unwrap_or(-1),
-                    timed_out: false,
-                });
-            }
-            Ok(None) => {
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-            Err(e) => {
-                return Err(format!("error waiting for bash: {e}"));
-            }
-        }
-    }
+    Err(
+        "no Linux runtime available on macOS (Docker/colima/Lima required); \
+         native host execution is refused for sandboxing"
+            .to_string(),
+    )
 }
 
 /// Launch a command inside a Docker container named after the distribution.
+///
+/// The container is given a unique name so a timed-out launch can be
+/// force-removed (`docker rm -f`); otherwise killing only the `docker`
+/// client would orphan a running container.
 fn launch_via_docker(
     distribution: &str,
     command: &str,
@@ -616,8 +647,26 @@ fn launch_via_docker(
         &distribution.to_lowercase()
     };
 
+    let container_name = format!(
+        "casa1_wsl_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0)
+    );
+
     let mut cmd = std::process::Command::new("docker");
-    cmd.args(["run", "--rm", image, "/bin/bash", "-c", command]);
+    cmd.args([
+        "run",
+        "--rm",
+        "--name",
+        container_name.as_str(),
+        image,
+        "/bin/bash",
+        "-c",
+        command,
+    ]);
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
 
@@ -625,46 +674,23 @@ fn launch_via_docker(
         .spawn()
         .map_err(|e| format!("failed to spawn docker: {e}"))?;
 
-    let timeout = timeout_secs.unwrap_or(60);
-    let start = std::time::Instant::now();
-    loop {
-        if start.elapsed().as_secs() > timeout {
-            if let Err(error) = child.kill() {
-                return Err(format!(
-                    "timed out and failed to terminate docker process: {error}"
-                ));
-            }
-            return Ok(WslCommandResult {
-                stdout: String::new(),
-                stderr: String::new(),
-                exit_code: -1,
-                timed_out: true,
-            });
-        }
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let output = child
-                    .wait_with_output()
-                    .unwrap_or_else(|_| std::process::Output {
-                        stdout: Vec::new(),
-                        stderr: Vec::new(),
-                        status,
-                    });
-                return Ok(WslCommandResult {
-                    stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-                    stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-                    exit_code: status.code().unwrap_or(-1),
-                    timed_out: false,
-                });
-            }
-            Ok(None) => {
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-            Err(e) => {
-                return Err(format!("error waiting for docker: {e}"));
-            }
-        }
+    let timeout = timeout_secs.map(std::time::Duration::from_secs);
+    let (output, timed_out) = wait_with_timeout(&mut child, timeout)?;
+
+    // The `--rm` flag only removes the container after it exits; if the
+    // client was killed on timeout, force-remove the container.
+    if timed_out {
+        let _ = std::process::Command::new("docker")
+            .args(["rm", "-f", &container_name])
+            .output();
     }
+
+    Ok(WslCommandResult {
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        exit_code: output.status.code().unwrap_or(-1),
+        timed_out,
+    })
 }
 
 /// Map a Windows path to a WSL path (e.g., `C:\Users` → `/mnt/c/Users`).
@@ -703,7 +729,14 @@ pub fn map_wsl_to_windows_path(wsl_path: &str) -> Option<String> {
         if rest.is_empty() || rest.len() < 2 {
             return None;
         }
-        let drive = rest[..1].to_ascii_uppercase();
+        // The drive component must be a single ASCII alphabetic letter;
+        // slicing at byte index 1 is only a UTF-8 char boundary when the
+        // first byte is ASCII.
+        let first = *rest.as_bytes().first()?;
+        if !first.is_ascii_alphabetic() {
+            return None;
+        }
+        let drive = (first as char).to_ascii_uppercase();
         let path_part = &rest[1..];
         let windows_path = format!("{drive}:{}", path_part.replace('/', "\\"));
         Some(windows_path)
@@ -765,10 +798,14 @@ impl WslApi {
                 format!("distribution '{distro_name}' is already registered"),
             ));
         }
+        // Registration is a metadata operation here; the distribution starts
+        // in the Stopped state. Callers that perform an actual installation
+        // should transition the state (Installing -> Stopped/Running) via
+        // `set_distribution_state` when installation completes.
         let distro = WslDistribution {
             name: distro_name.to_string(),
             wsl_version: WSL_VERSION_2,
-            state: WslDistributionState::Installing,
+            state: WslDistributionState::Stopped,
             base_path: PathBuf::from(tar_gz_path),
             ..Default::default()
         };
@@ -798,17 +835,32 @@ impl WslApi {
     }
 
     /// `WslLaunchInteractive` — Launch an interactive shell in a distribution.
+    ///
+    /// When `use_cwd` is set, the command runs with the host's current
+    /// working directory mapped into the Linux environment (best effort:
+    /// the mapping is skipped when the current directory cannot be mapped).
+    /// A full TTY/interactive mode requires a terminal host and is not
+    /// emulated here; the command still runs with piped output.
     pub fn launch_interactive(
         support: &WslSupport,
         distro_name: &str,
         command: &str,
-        _use_cwd: bool,
+        use_cwd: bool,
     ) -> WslApiResult<WslCommandResult> {
         let _distro = support.find_distribution(distro_name).ok_or_else(|| {
             WslApiError::new(3, format!("distribution '{distro_name}' not found"))
         })?;
+        let effective_command = if use_cwd {
+            std::env::current_dir()
+                .ok()
+                .and_then(|cwd| map_windows_to_wsl_path(&cwd.to_string_lossy()))
+                .map(|wsl_cwd| format!("cd {} && {}", shell_quote(&wsl_cwd), command))
+                .unwrap_or_else(|| command.to_string())
+        } else {
+            command.to_string()
+        };
         support
-            .launch_command(distro_name, command, None)
+            .launch_command(distro_name, &effective_command, None)
             .map_err(|e| WslApiError::new(4, e))
     }
 
@@ -819,10 +871,12 @@ impl WslApi {
         command: &str,
         timeout_ms: u64,
     ) -> WslApiResult<WslCommandResult> {
+        // Round sub-second timeouts up so a 1..=999 ms request is never
+        // truncated to a 0-second (immediate) timeout.
         let timeout_secs = if timeout_ms == 0 {
             None
         } else {
-            Some(timeout_ms / 1000)
+            Some(timeout_ms.div_ceil(1000))
         };
         support
             .launch_command(distro_name, command, timeout_secs)
@@ -1137,5 +1191,40 @@ mod tests {
         assert_eq!(map_wsl_to_windows_path("/home/user"), None);
         // Valid
         assert_eq!(map_wsl_to_windows_path("/mnt/c/"), Some("C:\\".to_string()));
+    }
+
+    #[test]
+    fn test_map_wsl_to_windows_path_rejects_non_ascii_drive() {
+        // Non-ASCII first characters must not panic the byte-index slice.
+        assert_eq!(map_wsl_to_windows_path("/mnt/é"), None);
+        assert_eq!(map_wsl_to_windows_path("/mnt/€/data"), None);
+        assert_eq!(map_wsl_to_windows_path("/mnt/ÿ/"), None);
+        assert_eq!(map_wsl_to_windows_path("/mnt/1/x"), None);
+        // ASCII drives still work.
+        assert_eq!(
+            map_wsl_to_windows_path("/mnt/z/etc/passwd"),
+            Some("Z:\\etc\\passwd".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_wsl_list_line() {
+        // Default marker `*` must be stripped.
+        let distro = parse_wsl_list_line("* Ubuntu-22.04           Running         2").unwrap();
+        assert_eq!(distro.name, "Ubuntu-22.04");
+        assert_eq!(distro.state, WslDistributionState::Running);
+        assert_eq!(distro.wsl_version, 2);
+
+        // Distribution names containing spaces.
+        let distro = parse_wsl_list_line("  Kali Linux            Stopped         2").unwrap();
+        assert_eq!(distro.name, "Kali Linux");
+        assert_eq!(distro.state, WslDistributionState::Stopped);
+
+        // Header and unparseable lines are skipped.
+        assert!(parse_wsl_list_line("  NAME                   STATE           VERSION").is_none());
+        assert!(parse_wsl_list_line("").is_none());
+        assert!(parse_wsl_list_line("* Distro   Running   not-a-version").is_none());
+        assert!(parse_wsl_list_line("Distro   WeirdState   2").is_none());
+        assert!(parse_wsl_list_line("Distro   Running").is_none());
     }
 }
