@@ -8,12 +8,27 @@ use serde_json::json;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub type Handle = u32;
+
+/// Upper bound for a single allocation whose size is guest-controlled.
+/// Windows fails these gracefully (ERROR_NOT_ENOUGH_MEMORY); a Rust `Vec`
+/// allocation of an absurd size aborts the process, so refuse before
+/// allocating.
+const MAX_ALLOCATION_SIZE: usize = 0x4000_0000; // 1 GiB
+/// Maximum number of pages committed by a single VirtualAlloc/MapViewOfFile
+/// call.  Bounds the per-page bookkeeping (each page is one BTreeSet entry)
+/// to ~4 GiB of committed address space.
+const MAX_COMMIT_PAGES: u64 = 0x10_0000;
+/// Iterations for bounded blocking polls (blocking ConnectNamedPipe and
+/// GetOverlappedResult).  Guest threads are scheduled cooperatively, so an
+/// unbounded host-side block would starve the signaler and hang the guest.
+const BLOCKING_POLL_ITERATIONS: usize = 5000;
 
 pub const WAIT_OBJECT_0: u32 = 0x0000_0000;
 pub const WAIT_ABANDONED: u32 = 0x0000_0080;
@@ -162,7 +177,7 @@ mod iconv_ffi {
                 return None;
             }
             // Allocate output buffer: 2 bytes per input byte (max for DBCS)
-            let outbuf_len = input.as_bytes().len().saturating_mul(2).saturating_add(8);
+            let outbuf_len = input.len().saturating_mul(2).saturating_add(8);
             if outbuf_len == 0 || outbuf_len > isize::MAX as usize {
                 return None;
             }
@@ -457,13 +472,17 @@ enum KernelObject {
     DirectorySearch(DirectorySearchObject),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct FileObject {
     normalized_path: String,
     host_path: PathBuf,
     ge_handle: Option<FileHandle>,
     position: u64,
     overlapped: bool,
+    /// Open host file descriptor used for positional reads/writes.  `None`
+    /// for directory handles or files that could not be opened; those fall
+    /// back to whole-file I/O.
+    host_file: Option<std::fs::File>,
 }
 
 type FileHandleObject = Rc<RefCell<FileObject>>;
@@ -554,6 +573,12 @@ struct SectionObject {
     base_address: u64,
     size: usize,
     protection: MemoryProtection,
+    /// Name of the section (None for anonymous sections created via
+    /// `create_section` / `heap_create`).
+    name: Option<String>,
+    /// Shared byte storage for file-mapping sections, so that every
+    /// `MapViewOfFile` view shares the same backing.
+    backing: Option<Arc<Mutex<Vec<u8>>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -597,7 +622,7 @@ pub fn pipe_name_to_uds_path(pipe_name: &str) -> String {
         .or_else(|| normalized.strip_prefix("\\\\?\\pipe\\"))
         .unwrap_or(&normalized);
     // Replace backslashes with underscores for safety
-    let safe_name = name.replace('\\', "_").replace('/', "_");
+    let safe_name = name.replace(['\\', '/'], "_");
     format!("{}/{}", PIPE_SOCKET_BASE_DIR, safe_name)
 }
 
@@ -637,74 +662,10 @@ struct NamedPipeState {
     max_instances: u32,
     /// Default timeout for WaitNamedPipe (in milliseconds).
     default_timeout: u32,
-}
-
-/// A simple wrapper around `libc::mmap` / `munmap` for shared memory backing.
-/// When dropped, the mapping is automatically unmapped.
-#[derive(Debug)]
-struct MmapBacking {
-    ptr: *mut u8,
-    length: usize,
-}
-
-// Safety: MmapBacking is only ever accessed behind Arc<Mutex<...>>.
-// SAFETY: Send is safe because the type only uses thread-safe internal state or is accessed under exclusive &mut
-unsafe impl Send for MmapBacking {}
-// SAFETY: Send is safe because the type only uses thread-safe internal state or is accessed under exclusive &mut
-unsafe impl Sync for MmapBacking {}
-
-impl MmapBacking {
-    /// Create a new anonymous mmap of the given length.
-    fn new(length: usize) -> Option<Self> {
-        let ptr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                length.max(1),
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1,
-                0,
-            )
-        };
-        if ptr == libc::MAP_FAILED {
-            None
-        } else {
-            Some(MmapBacking {
-                ptr: ptr as *mut u8,
-                length: length.max(1),
-            })
-        }
-    }
-
-    fn as_slice(&self) -> &[u8] {
-        // SAFETY: pointer is valid and non-null, length matches the allocated region
-        unsafe { std::slice::from_raw_parts(self.ptr, self.length) }
-    }
-
-    fn as_mut_slice(&mut self) -> &mut [u8] {
-        // SAFETY: pointer is valid and non-null, length matches the allocated region
-        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.length) }
-    }
-}
-
-impl Drop for MmapBacking {
-    fn drop(&mut self) {
-        if !self.ptr.is_null() {
-            // SAFETY: POSIX FFI for code page conversion and shared memory
-            unsafe {
-                libc::munmap(self.ptr as *mut libc::c_void, self.length);
-            }
-        }
-    }
-}
-
-impl Clone for MmapBacking {
-    fn clone(&self) -> Self {
-        // Create a new mmap and copy the data
-        let mut new = MmapBacking::new(self.length).expect("clone mmap backing");
-        new.as_mut_slice().copy_from_slice(self.as_slice());
-        new
-    }
+    /// Outbound buffer size as requested at creation time.
+    out_buffer_size: u32,
+    /// Inbound buffer size as requested at creation time.
+    in_buffer_size: u32,
 }
 
 /// Backing store for a shared-memory section created via CreateFileMappingW.
@@ -715,8 +676,6 @@ struct SharedMemorySection {
     /// The actual byte storage, reference-counted so that multiple
     /// `MapViewOfFile` calls share the same backing.
     data: Arc<Mutex<Vec<u8>>>,
-    /// Optional mmap backing for named sections that persist to disk.
-    mmap_backing: Option<Arc<Mutex<MmapBacking>>>,
     /// Maximum size requested at creation time.
     maximum_size: usize,
     /// Protection flags at creation time.
@@ -743,20 +702,17 @@ struct OverlappedRequest {
     state: OverlappedState,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct IoCompletionAssociation {
-    #[allow(dead_code)]
-    port_handle: Handle,
-    #[allow(dead_code)]
-    completion_key: u64,
-}
-
 #[derive(Debug, Clone)]
 struct VirtualRegion {
     base_address: u64,
     size: usize,
     committed: BTreeSet<u64>,
     protection: MemoryProtection,
+    /// Shared section backing for regions created by `map_view_of_file`
+    /// (`None` for plain `VirtualAlloc` regions).
+    backing: Option<Arc<Mutex<Vec<u8>>>>,
+    /// Offset into the section backing where this view starts.
+    backing_offset: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -764,6 +720,8 @@ struct HeapState {
     alignment: usize,
     next_address: u64,
     allocations: BTreeMap<u64, Vec<u8>>,
+    /// Freed (address, size) blocks available for reuse.
+    free_blocks: BTreeMap<u64, usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -806,7 +764,9 @@ pub struct Win32Subsystem {
     handle_generations: BTreeMap<Handle, u32>,
     protected_close_handles: BTreeSet<Handle>,
     overlapped: BTreeMap<u64, OverlappedRequest>,
-    io_completion_associations: BTreeMap<Handle, IoCompletionAssociation>,
+    /// File handles associated with an I/O completion port (the association
+    /// records only existence; the port itself lives in the handle table).
+    io_completion_associations: BTreeSet<Handle>,
     memory_regions: BTreeMap<u64, VirtualRegion>,
     heaps: BTreeMap<Handle, HeapState>,
     named_events: BTreeMap<String, EventWeak>,
@@ -820,6 +780,16 @@ pub struct Win32Subsystem {
     com_apartments: BTreeMap<u32, ApartmentModel>,
     com_registrations: BTreeMap<String, ComRegistration>,
     recently_closed_handles: VecDeque<(Handle, ObjectType)>,
+    /// Closed handle values recycled by `insert_object` (FIFO, so the oldest
+    /// freed value is reused first, which keeps generations meaningful).
+    closed_handle_values: VecDeque<Handle>,
+    /// Monotonic serial for `get_temp_file_name_w` uniqueness.
+    next_temp_file_serial: u32,
+    /// TLS slot indices freed via `tls_free`, reused by `tls_alloc`.
+    tls_free_slots: Vec<u32>,
+    /// Wall-clock time (ms) of the last full config save, used to throttle
+    /// `sync_entry` persistence.
+    last_config_save_wall_ms: u64,
     current_process_id: u32,
     current_thread_id: u32,
 }
@@ -846,7 +816,7 @@ impl Win32Subsystem {
             handle_generations: BTreeMap::new(),
             protected_close_handles: BTreeSet::new(),
             overlapped: BTreeMap::new(),
-            io_completion_associations: BTreeMap::new(),
+            io_completion_associations: BTreeSet::new(),
             memory_regions: BTreeMap::new(),
             heaps: BTreeMap::new(),
             named_events: BTreeMap::new(),
@@ -867,6 +837,10 @@ impl Win32Subsystem {
             com_apartments: BTreeMap::new(),
             com_registrations: BTreeMap::new(),
             recently_closed_handles: VecDeque::new(),
+            closed_handle_values: VecDeque::new(),
+            next_temp_file_serial: 0,
+            tls_free_slots: Vec::new(),
+            last_config_save_wall_ms: 0,
             current_process_id,
             current_thread_id,
         }
@@ -1085,16 +1059,16 @@ impl Win32Subsystem {
         inheritable: bool,
         name: Option<&str>,
     ) -> (Handle, bool) {
-        if let Some(name) = name {
-            if let Some(event) = self.named_events.get(name).and_then(Weak::upgrade) {
-                let handle = self.insert_object(
-                    ObjectType::Event,
-                    0x1F0003,
-                    inheritable,
-                    KernelObject::Event(event),
-                );
-                return (handle, true);
-            }
+        if let Some(name) = name
+            && let Some(event) = self.named_events.get(name).and_then(Weak::upgrade)
+        {
+            let handle = self.insert_object(
+                ObjectType::Event,
+                0x1F0003,
+                inheritable,
+                KernelObject::Event(event),
+            );
+            return (handle, true);
         }
 
         let event = Rc::new(RefCell::new(EventObject {
@@ -1140,7 +1114,7 @@ impl Win32Subsystem {
         &mut self,
         file_handle: Option<Handle>,
         existing_completion_port: Option<Handle>,
-        completion_key: u64,
+        _completion_key: u64,
         concurrent_threads: u32,
     ) -> AppResult<Handle> {
         if file_handle.is_none() && existing_completion_port.is_some() {
@@ -1169,7 +1143,7 @@ impl Win32Subsystem {
 
         if let Some(file_handle) = file_handle {
             self.handle_entry(file_handle)?;
-            if self.io_completion_associations.contains_key(&file_handle) {
+            if self.io_completion_associations.contains(&file_handle) {
                 return Err(AppError::new(
                     ReasonCode::RcCliInvalid,
                     format!(
@@ -1177,13 +1151,7 @@ impl Win32Subsystem {
                     ),
                 ));
             }
-            self.io_completion_associations.insert(
-                file_handle,
-                IoCompletionAssociation {
-                    port_handle,
-                    completion_key,
-                },
-            );
+            self.io_completion_associations.insert(file_handle);
         }
 
         Ok(port_handle)
@@ -1199,7 +1167,6 @@ impl Win32Subsystem {
         let entry = self.handle_entry_mut(completion_port)?;
         match &mut entry.object {
             KernelObject::IoCompletionPort(port) => {
-                let _concurrent_threads = port.concurrent_threads;
                 port.queue.push_back(IoCompletionPacket {
                     bytes_transferred,
                     completion_key,
@@ -1226,8 +1193,15 @@ impl Win32Subsystem {
         let entry = self.handle_entry_mut(completion_port)?;
         match &mut entry.object {
             KernelObject::IoCompletionPort(port) => {
+                // A non-zero `concurrent_threads` throttles how many
+                // completion packets may be handed out at once.
+                let cap = if port.concurrent_threads == 0 {
+                    max_packets
+                } else {
+                    max_packets.min(port.concurrent_threads as usize)
+                };
                 let mut packets = Vec::new();
-                while packets.len() < max_packets {
+                while packets.len() < cap {
                     let Some(packet) = port.queue.pop_front() else {
                         break;
                     };
@@ -1369,19 +1343,65 @@ impl Win32Subsystem {
     ) -> AppResult<WaitStatus> {
         let current_thread_id = self.current_thread_id;
         if alertable {
-            if let Some(thread_handle) = thread_handle {
-                let thread_id = self.thread_id(thread_handle)?;
-                if let Some(queue) = self.thread_apcs.get_mut(&thread_id) {
-                    if !queue.is_empty() {
-                        queue.pop_front();
-                        return Ok(WaitStatus::IoCompletion);
-                    }
-                }
+            let thread_id = match thread_handle {
+                Some(thread_handle) => Some(self.thread_id(thread_handle)?),
+                None => None,
+            };
+            if let Some(thread_id) = thread_id
+                && let Some(queue) = self.thread_apcs.get_mut(&thread_id)
+                && !queue.is_empty()
+            {
+                queue.pop_front();
+                return Ok(WaitStatus::IoCompletion);
             }
         }
 
-        let now = self.time.ticks_ms;
         let object_type = self.handle_entry(handle)?.descriptor.object_type;
+        if object_type == ObjectType::Process {
+            return self.wait_for_single_object_process(handle, timeout_ms);
+        }
+
+        // INFINITE waits stay non-blocking: guest threads are scheduled
+        // cooperatively and the callers (pe_runtime) pump pending threads
+        // between polls, so a host-side block here would starve the signaler.
+        if timeout_ms == u32::MAX {
+            return self.wait_for_single_object_instant(handle, object_type, current_thread_id);
+        }
+        let deadline = if timeout_ms == 0 {
+            None
+        } else {
+            Some(self.time.ticks_ms.saturating_add(timeout_ms as u64))
+        };
+        loop {
+            let status = self.wait_for_single_object_instant(handle, object_type, current_thread_id)?;
+            if !matches!(status, WaitStatus::Timeout) {
+                return Ok(status);
+            }
+            if timeout_ms == 0 {
+                return Ok(WaitStatus::Timeout);
+            }
+            if let Some(deadline) = deadline
+                && self.time.ticks_ms >= deadline
+            {
+                return Ok(WaitStatus::Timeout);
+            }
+            std::thread::sleep(Duration::from_millis(1));
+            // Advance the guest clock so the deadline above can expire.
+            self.record_sleep_observation(1, 1);
+        }
+    }
+
+    /// Single non-blocking signal-state check for a waitable object.
+    /// Consumes the signal only on success (auto-reset events, mutex
+    /// acquisition, semaphore decrement), matching `wait_for_single_object`
+    /// semantics for a zero-timeout poll.
+    fn wait_for_single_object_instant(
+        &mut self,
+        handle: Handle,
+        object_type: ObjectType,
+        current_thread_id: u32,
+    ) -> AppResult<WaitStatus> {
+        let now = self.time.ticks_ms;
         match object_type {
             ObjectType::Event => {
                 let entry = self.handle_entry_mut(handle)?;
@@ -1393,7 +1413,6 @@ impl Win32Subsystem {
                         }
                         Ok(WaitStatus::Object0)
                     } else {
-                        // timeout_ms unused in non-blocking path
                         Ok(WaitStatus::Timeout)
                     }
                 } else {
@@ -1411,7 +1430,6 @@ impl Win32Subsystem {
                         mutex.owner_thread_id = Some(current_thread_id);
                         Ok(WaitStatus::Object0)
                     } else {
-                        // timeout_ms unused in non-blocking path
                         Ok(WaitStatus::Timeout)
                     }
                 } else {
@@ -1425,7 +1443,6 @@ impl Win32Subsystem {
                         semaphore.count -= 1;
                         Ok(WaitStatus::Object0)
                     } else {
-                        // timeout_ms unused in non-blocking path
                         Ok(WaitStatus::Timeout)
                     }
                 } else {
@@ -1437,39 +1454,7 @@ impl Win32Subsystem {
                 if self.thread_state(thread_id)?.exit_code.is_some() {
                     Ok(WaitStatus::Object0)
                 } else {
-                    // timeout_ms unused in non-blocking path
                     Ok(WaitStatus::Timeout)
-                }
-            }
-            ObjectType::Process => {
-                let entry = self.handle_entry(handle)?;
-                if let KernelObject::Process(process) = &entry.object {
-                    if process.exit_code.is_some() {
-                        Ok(WaitStatus::Object0)
-                    } else if let Some(ref sync) = process.exit_sync {
-                        // Real blocking wait using the condvar.
-                        let (lock, cvar) = &**sync;
-                        let mut guard = lock.lock().unwrap();
-                        if guard.is_some() {
-                            return Ok(WaitStatus::Object0);
-                        }
-                        if timeout_ms == 0 {
-                            return Ok(WaitStatus::Timeout);
-                        }
-                        let timeout = Duration::from_millis(timeout_ms as u64);
-                        let result = cvar.wait_timeout(guard, timeout).unwrap();
-                        guard = result.0;
-                        if guard.is_some() {
-                            Ok(WaitStatus::Object0)
-                        } else {
-                            Ok(WaitStatus::Timeout)
-                        }
-                    } else {
-                        // timeout_ms unused when no exit_sync
-                        Ok(WaitStatus::Timeout)
-                    }
-                } else {
-                    invalid_handle("handle is not a process")
                 }
             }
             ObjectType::Timer => {
@@ -1479,7 +1464,6 @@ impl Win32Subsystem {
                         timer.signaled = true;
                         Ok(WaitStatus::Object0)
                     } else {
-                        // timeout_ms unused in non-blocking path
                         Ok(WaitStatus::Timeout)
                     }
                 } else {
@@ -1487,6 +1471,43 @@ impl Win32Subsystem {
                 }
             }
             _ => Ok(WaitStatus::Object0),
+        }
+    }
+
+    /// Blocking wait for a process object, driven by the `exit_sync` condvar
+    /// pair installed by `install_process_exit_sync`.
+    fn wait_for_single_object_process(
+        &mut self,
+        handle: Handle,
+        timeout_ms: u32,
+    ) -> AppResult<WaitStatus> {
+        let entry = self.handle_entry(handle)?;
+        if let KernelObject::Process(process) = &entry.object {
+            if process.exit_code.is_some() {
+                Ok(WaitStatus::Object0)
+            } else if let Some(ref sync) = process.exit_sync {
+                // Real blocking wait using the condvar.
+                let (lock, cvar) = &**sync;
+                let mut guard = lock.lock().unwrap();
+                if guard.is_some() {
+                    return Ok(WaitStatus::Object0);
+                }
+                if timeout_ms == 0 {
+                    return Ok(WaitStatus::Timeout);
+                }
+                let timeout = Duration::from_millis(timeout_ms as u64);
+                let result = cvar.wait_timeout(guard, timeout).unwrap();
+                guard = result.0;
+                if guard.is_some() {
+                    Ok(WaitStatus::Object0)
+                } else {
+                    Ok(WaitStatus::Timeout)
+                }
+            } else {
+                Ok(WaitStatus::Timeout)
+            }
+        } else {
+            invalid_handle("handle is not a process")
         }
     }
 
@@ -1502,73 +1523,95 @@ impl Win32Subsystem {
         let deadline = if timeout_ms == 0 || timeout_ms == u32::MAX {
             None
         } else {
-            Some(self.time.ticks_ms + timeout_ms as u64)
+            Some(self.time.ticks_ms.saturating_add(timeout_ms as u64))
         };
 
-        if alertable && !handles.is_empty() {
-            if let Some(thread_handle) = thread_handle {
-                if let Ok(thread_id) = self.thread_id(thread_handle) {
-                    if let Some(queue) = self.thread_apcs.get(&thread_id) {
-                        if !queue.is_empty() {
-                            return Ok((WaitStatus::IoCompletion, 0));
-                        }
-                    }
-                }
-            }
+        if alertable
+            && let Some(thread_handle) = thread_handle
+            && let Ok(thread_id) = self.thread_id(thread_handle)
+            && self.thread_apcs.get(&thread_id).is_some_and(|queue| !queue.is_empty())
+        {
+            return Ok((WaitStatus::IoCompletion, 0));
         }
 
-        'outer: loop {
-            for (i, &handle) in handles.iter().enumerate() {
-                let status = self.wait_for_single_object(handle, 0, false, None)?;
-                match status {
-                    WaitStatus::Object0 => {
-                        if !wait_all {
-                            return Ok((WaitStatus::Object0, i));
-                        }
-                    }
-                    WaitStatus::Abandoned => {
-                        if !wait_all {
-                            return Ok((WaitStatus::Abandoned, i));
-                        }
-                    }
-                    _ => {}
-                }
-            }
-
+        loop {
             if wait_all {
-                let all_signaled = handles.iter().all(|&h| {
-                    matches!(
-                        self.wait_for_single_object(h, 0, false, None),
-                        Ok(WaitStatus::Object0)
-                    )
-                });
+                // Non-destructive check first: for wait-all, the first pass
+                // must NOT consume auto-reset signals, otherwise a second
+                // (destructive) pass can never succeed and INFINITE waits
+                // loop forever.  Peek at the signal state, then do a single
+                // consuming pass once everything is ready.
+                let all_signaled = handles
+                    .iter()
+                    .try_fold(true, |acc, &handle| {
+                        let signaled = self.object_is_signaled(handle)?;
+                        Ok::<_, AppError>(acc && signaled)
+                    })?;
                 if all_signaled {
-                    return Ok((WaitStatus::Object0, 0));
+                    let mut abandoned = false;
+                    for &handle in handles {
+                        let status = self.wait_for_single_object(handle, 0, false, None)?;
+                        if status == WaitStatus::Abandoned {
+                            abandoned = true;
+                        }
+                    }
+                    return Ok((
+                        if abandoned {
+                            WaitStatus::Abandoned
+                        } else {
+                            WaitStatus::Object0
+                        },
+                        0,
+                    ));
+                }
+            } else {
+                for (i, &handle) in handles.iter().enumerate() {
+                    let status = self.wait_for_single_object(handle, 0, false, None)?;
+                    match status {
+                        WaitStatus::Object0 => return Ok((WaitStatus::Object0, i)),
+                        WaitStatus::Abandoned => return Ok((WaitStatus::Abandoned, i)),
+                        _ => {}
+                    }
                 }
             }
 
-            if let Some(deadline) = deadline {
-                if self.time.ticks_ms >= deadline {
-                    return Ok((WaitStatus::Timeout, handles.len().saturating_sub(1)));
-                }
+            if let Some(deadline) = deadline
+                && self.time.ticks_ms >= deadline
+            {
+                return Ok((WaitStatus::Timeout, usize::MAX));
             }
-
             if timeout_ms != 0 {
                 std::thread::sleep(Duration::from_millis(1));
                 // Advance the guest clock so the finite-timeout deadline
-                // check above can actually expire.  Without this the raw
-                // `thread::sleep` never bumps `ticks_ms`, so a finite
-                // (non-INFINITE) timeout would loop forever.
+                // check above can actually expire.
                 self.record_sleep_observation(1, 1);
             } else {
-                break 'outer;
+                return Ok((WaitStatus::Timeout, usize::MAX));
             }
         }
+    }
 
-        Ok((WaitStatus::Timeout, handles.len().saturating_sub(1)))
+    /// Non-destructive signal-state probe used by the wait-all path so that
+    /// auto-reset signals are not consumed before the final acquiring pass.
+    fn object_is_signaled(&self, handle: Handle) -> AppResult<bool> {
+        let entry = self.handle_entry(handle)?;
+        Ok(match &entry.object {
+            KernelObject::Event(event) => event.borrow().signaled,
+            KernelObject::Mutex(mutex) => mutex.abandoned || mutex.owner_thread_id.is_none(),
+            KernelObject::Semaphore(semaphore) => semaphore.count > 0,
+            KernelObject::Thread(thread) => self
+                .threads
+                .get(&thread.thread_id)
+                .is_some_and(|state| state.exit_code.is_some()),
+            KernelObject::Process(process) => process.exit_code.is_some(),
+            KernelObject::Timer(timer) => timer.signaled || self.time.ticks_ms >= timer.due_tick,
+            _ => true,
+        })
     }
 
     /// Named mutex support — maps a name to a mutex handle.
+    /// Returns `(handle, existed)`, mirroring `create_event`: the boolean is
+    /// true when a mutex with this name already existed.
     pub fn create_named_mutex(
         &mut self,
         name: &str,
@@ -1576,19 +1619,27 @@ impl Win32Subsystem {
         inheritable: bool,
     ) -> (Handle, bool) {
         if let Some(&handle) = self.named_mutexes.get(name) {
-            (handle, false)
-        } else {
-            let handle = self.create_mutex(initially_owned, inheritable);
-            self.named_mutexes.insert(name.to_string(), handle);
-            (handle, true)
+            // Reject stale entries left behind by closed handles; Windows
+            // forgets the name once the last handle is closed.
+            if self.handles.contains_key(&handle) {
+                return (handle, true);
+            }
+            self.named_mutexes.remove(name);
         }
+        let handle = self.create_mutex(initially_owned, inheritable);
+        self.named_mutexes.insert(name.to_string(), handle);
+        (handle, false)
     }
 
     pub fn open_named_mutex(&self, name: &str) -> Option<Handle> {
-        self.named_mutexes.get(name).copied()
+        self.named_mutexes
+            .get(name)
+            .copied()
+            .filter(|handle| self.handles.contains_key(handle))
     }
 
-    /// Named semaphore support.
+    /// Named semaphore support.  Returns `(handle, existed)` — the boolean is
+    /// true when a semaphore with this name already existed.
     pub fn create_named_semaphore(
         &mut self,
         name: &str,
@@ -1597,29 +1648,41 @@ impl Win32Subsystem {
         inheritable: bool,
     ) -> (Handle, bool) {
         if let Some(&handle) = self.named_semaphores.get(name) {
-            (handle, false)
-        } else {
-            let handle = self.create_semaphore(initial_count, maximum, inheritable);
-            self.named_semaphores.insert(name.to_string(), handle);
-            (handle, true)
+            // Reject stale entries left behind by closed handles; Windows
+            // forgets the name once the last handle is closed.
+            if self.handles.contains_key(&handle) {
+                return (handle, true);
+            }
+            self.named_semaphores.remove(name);
         }
+        let handle = self.create_semaphore(initial_count, maximum, inheritable);
+        self.named_semaphores.insert(name.to_string(), handle);
+        (handle, false)
     }
 
     pub fn open_named_semaphore(&self, name: &str) -> Option<Handle> {
-        self.named_semaphores.get(name).copied()
+        self.named_semaphores
+            .get(name)
+            .copied()
+            .filter(|handle| self.handles.contains_key(handle))
     }
 
     /// Named event support (open by name).
-    pub fn open_named_event(&self, name: &str) -> Option<Handle> {
-        // Named events use EventWeak; attempt to upgrade
-        self.named_events
-            .get(name)
-            .and_then(|weak| weak.upgrade())
-            .and_then(|_event_rc| {
-                // Return the first handle matching this named event
-                // This is a simplified approach; real Windows tracks names per-event
-                None
-            })
+    pub fn open_named_event(&mut self, name: &str) -> Option<Handle> {
+        let event = self.named_events.get(name).and_then(Weak::upgrade);
+        let event = match event {
+            Some(event) => event,
+            None => {
+                self.named_events.remove(name);
+                return None;
+            }
+        };
+        Some(self.insert_object(
+            ObjectType::Event,
+            0x1F0003,
+            false,
+            KernelObject::Event(event),
+        ))
     }
 
     pub fn queue_apc(&mut self, thread_handle: Handle, token: impl Into<String>) -> AppResult<()> {
@@ -1631,6 +1694,7 @@ impl Win32Subsystem {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn create_file_w(
         &mut self,
         path: &str,
@@ -1668,6 +1732,7 @@ impl Win32Subsystem {
                     ge_handle: None,
                     position: 0,
                     overlapped,
+                    host_file: None,
                 }))),
             ));
         }
@@ -1728,6 +1793,13 @@ impl Win32Subsystem {
         } else {
             None
         };
+        // Keep a real file descriptor for positional I/O so reads/writes do
+        // not re-read and rewrite the whole file on every syscall.
+        let host_file = OpenOptions::new()
+            .read(true)
+            .write(desired_access.write)
+            .open(&host_path)
+            .ok();
         Ok(self.insert_object(
             ObjectType::File,
             0x12019f,
@@ -1738,6 +1810,7 @@ impl Win32Subsystem {
                 ge_handle,
                 position: 0,
                 overlapped,
+                host_file,
             }))),
         ))
     }
@@ -1749,7 +1822,7 @@ impl Win32Subsystem {
                 format!("handle {handle} is protected from close"),
             ));
         }
-        let mut entry = self.handles.remove(&handle).ok_or_else(|| {
+        let entry = self.handles.remove(&handle).ok_or_else(|| {
             AppError::new(
                 ReasonCode::RcWin32InvalidHandle,
                 format!("invalid handle {handle}"),
@@ -1766,47 +1839,132 @@ impl Win32Subsystem {
                 self.ge.close_file_handle(&ge_handle)?;
             }
         }
-        if entry.descriptor.refcount > 1 {
-            entry.descriptor.refcount -= 1;
-            self.handles.insert(handle, entry);
-        } else {
-            // Increment the generation counter so stale references to the
-            // old handle value are detected by `validate_handle_generation`.
-            let generation = self.handle_generations.entry(handle).or_insert(0);
-            *generation = generation.saturating_add(1);
-            self.record_closed_handle(handle, entry.descriptor.object_type);
-            if let KernelObject::Thread(thread) = &entry.object {
-                self.cleanup_exited_thread_state(thread.thread_id);
+        // Windows forgets named objects once the last handle closes, so a
+        // guest can recreate a pipe/section/mutex/semaphore with the same
+        // name.  Drop name-table entries when no other handle references the
+        // object.
+        match &entry.object {
+            KernelObject::Mutex(_) => {
+                self.named_mutexes.retain(|_, stored| *stored != handle);
             }
+            KernelObject::Semaphore(_) => {
+                self.named_semaphores.retain(|_, stored| *stored != handle);
+            }
+            KernelObject::Pipe(pipe) => {
+                let name = pipe.name.clone();
+                let still_open = self.handles.values().any(|other| {
+                    matches!(&other.object, KernelObject::Pipe(other) if other.name == name)
+                });
+                if !still_open {
+                    self.named_pipes.remove(&name);
+                }
+            }
+            KernelObject::Section(section) => {
+                if let Some(ref name) = section.name {
+                    let still_open = self.handles.values().any(|other| {
+                        matches!(&other.object, KernelObject::Section(other)
+                            if other.name.as_deref() == Some(name.as_str()))
+                    });
+                    if !still_open {
+                        self.shared_memory_sections.remove(name);
+                    }
+                }
+            }
+            _ => {}
+        }
+        // Increment the generation counter so stale references to the old
+        // handle value are detected, and recycle the value so future
+        // allocations can reuse it (Windows reuses handle values).
+        let generation = self.handle_generations.entry(handle).or_insert(0);
+        *generation = generation.saturating_add(1);
+        self.closed_handle_values.push_back(handle);
+        self.record_closed_handle(handle, entry.descriptor.object_type);
+        if let KernelObject::Thread(thread) = &entry.object {
+            self.cleanup_exited_thread_state(thread.thread_id);
         }
         Ok(())
     }
 
     pub fn read_file(&mut self, handle: Handle, length: usize) -> AppResult<Vec<u8>> {
-        let entry = self.handle_entry_mut(handle)?;
-        match &mut entry.object {
-            KernelObject::File(file) => {
-                let mut file = file.borrow_mut();
-                let bytes = fs::read(&file.host_path).map_err(|error| {
-                    AppError::from_io(
-                        ReasonCode::RcIo,
-                        format!("failed to read {}", file.host_path.display()),
-                        &error,
-                    )
-                })?;
-                let start = file.position as usize;
-                let end = start.saturating_add(length).min(bytes.len());
-                file.position = end as u64;
-                Ok(bytes[start..end].to_vec())
+        let object_type = self.handle_entry(handle)?.descriptor.object_type;
+        match object_type {
+            ObjectType::File => {
+                let entry = self.handle_entry_mut(handle)?;
+                if let KernelObject::File(file) = &mut entry.object {
+                    let mut file = file.borrow_mut();
+                    let path_display = file.host_path.display().to_string();
+                    let position = file.position;
+                    if let Some(host_file) = file.host_file.as_mut() {
+                        let size = host_file.metadata().map_err(|error| {
+                            AppError::from_io(
+                                ReasonCode::RcIo,
+                                format!("failed to stat {path_display}"),
+                                &error,
+                            )
+                        })?.len();
+                        // Clamp the start position: a guest may seek past EOF
+                        // (Windows allows it) and reads must yield zero bytes,
+                        // not panic on a slice.
+                        let start = position.min(size);
+                        let to_read = (length as u64).min(size - start) as usize;
+                        let mut data = vec![0_u8; to_read];
+                        host_file.seek(SeekFrom::Start(start)).map_err(|error| {
+                            AppError::from_io(
+                                ReasonCode::RcIo,
+                                format!("failed to seek {path_display}"),
+                                &error,
+                            )
+                        })?;
+                        let mut read_total = 0usize;
+                        while read_total < data.len() {
+                            let n = host_file.read(&mut data[read_total..]).map_err(|error| {
+                                AppError::from_io(
+                                    ReasonCode::RcIo,
+                                    format!("failed to read {path_display}"),
+                                    &error,
+                                )
+                            })?;
+                            if n == 0 {
+                                break;
+                            }
+                            read_total += n;
+                        }
+                        data.truncate(read_total);
+                        file.position = start.saturating_add(read_total as u64);
+                        return Ok(data);
+                    }
+                    // Fallback for handles without an open descriptor
+                    // (directories, failed opens): whole-file read with
+                    // clamped slicing.
+                    let bytes = fs::read(&file.host_path).map_err(|error| {
+                        AppError::from_io(
+                            ReasonCode::RcIo,
+                            format!("failed to read {path_display}"),
+                            &error,
+                        )
+                    })?;
+                    let start = (file.position as usize).min(bytes.len());
+                    let end = start.saturating_add(length).min(bytes.len());
+                    file.position = end as u64;
+                    return Ok(bytes[start..end].to_vec());
+                }
+                invalid_handle("handle is not a file")
             }
-            KernelObject::Pipe(pipe) => {
-                // Read from named pipe backing buffer
-                let normalized = normalize_pipe_name(&pipe.name);
+            ObjectType::Pipe => {
+                let normalized = match &self.handle_entry(handle)?.object {
+                    KernelObject::Pipe(pipe) => normalize_pipe_name(&pipe.name),
+                    _ => return invalid_handle("handle is not a pipe"),
+                };
                 if let Some(state) = self.named_pipes.get(&normalized) {
+                    if state.server_disconnected {
+                        return Err(AppError::new(
+                            ReasonCode::RcIo,
+                            format!("pipe {normalized} is disconnected"),
+                        ));
+                    }
                     let buffer = state.buffer.lock().unwrap();
                     let available = buffer.len().min(length);
                     let data: Vec<u8> = buffer.iter().take(available).copied().collect();
-                    // We consume the data from the shared buffer
                     drop(buffer);
                     if let Some(state_mut) = self.named_pipes.get_mut(&normalized) {
                         let mut buf = state_mut.buffer.lock().unwrap();
@@ -1816,7 +1974,15 @@ impl Win32Subsystem {
                     }
                     Ok(data)
                 } else {
-                    Ok(Vec::new())
+                    // Legacy pipe without shared state: read from the
+                    // per-object buffer.
+                    let entry = self.handle_entry_mut(handle)?;
+                    if let KernelObject::Pipe(pipe) = &mut entry.object {
+                        let take = length.min(pipe.buffer.len());
+                        Ok(pipe.buffer.drain(..take).collect())
+                    } else {
+                        invalid_handle("handle is not a pipe")
+                    }
                 }
             }
             _ => invalid_handle("handle is not a file or pipe"),
@@ -1824,57 +1990,136 @@ impl Win32Subsystem {
     }
 
     pub fn write_file(&mut self, handle: Handle, bytes: &[u8]) -> AppResult<u32> {
-        let (normalized_path, host_path) = {
-            let entry = self.handle_entry_mut(handle)?;
-            match &mut entry.object {
-                KernelObject::File(file) => {
-                    let mut file = file.borrow_mut();
-                    let mut contents = if file.host_path.exists() {
-                        fs::read(&file.host_path).map_err(|error| {
-                            AppError::from_io(
-                                ReasonCode::RcIo,
-                                format!("failed to read {}", file.host_path.display()),
-                                &error,
-                            )
-                        })?
+        let object_type = self.handle_entry(handle)?.descriptor.object_type;
+        match object_type {
+            ObjectType::File => {
+                let (normalized_path, host_path) = {
+                    let entry = self.handle_entry_mut(handle)?;
+                    if let KernelObject::File(file) = &mut entry.object {
+                        let mut file = file.borrow_mut();
+                        let path_display = file.host_path.display().to_string();
+                        let pos = file.position;
+                        if let Some(host_file) = file.host_file.as_mut() {
+                            host_file.seek(SeekFrom::Start(pos)).map_err(|error| {
+                                AppError::from_io(
+                                    ReasonCode::RcIo,
+                                    format!("failed to seek {path_display}"),
+                                    &error,
+                                )
+                            })?;
+                            let mut written = 0usize;
+                            while written < bytes.len() {
+                                let n = host_file
+                                    .write(&bytes[written..])
+                                    .map_err(|error| {
+                                        AppError::from_io(
+                                            ReasonCode::RcIo,
+                                            format!("failed to write {path_display}"),
+                                            &error,
+                                        )
+                                    })?;
+                                if n == 0 {
+                                    return Err(AppError::new(
+                                        ReasonCode::RcIo,
+                                        format!("short write to {path_display}"),
+                                    ));
+                                }
+                                written += n;
+                            }
+                            file.position = pos.saturating_add(written as u64);
+                            (file.normalized_path.clone(), file.host_path.clone())
+                        } else {
+                            // Fallback for handles without an open descriptor:
+                            // whole-file read-modify-write with checked bounds.
+                            let mut contents = if file.host_path.exists() {
+                                fs::read(&file.host_path).map_err(|error| {
+                                    AppError::from_io(
+                                        ReasonCode::RcIo,
+                                        format!("failed to read {path_display}"),
+                                        &error,
+                                    )
+                                })?
+                            } else {
+                                Vec::new()
+                            };
+                            let start = file.position;
+                            // Bound the position before any usize arithmetic
+                            // so a guest seek to u64::MAX cannot overflow or
+                            // trigger an absurd allocation.
+                            if start > isize::MAX as u64 {
+                                return Err(AppError::new(
+                                    ReasonCode::RcMemoryAccessViolation,
+                                    "file write position is too large",
+                                ));
+                            }
+                            let start = start as usize;
+                            let end = start.checked_add(bytes.len()).ok_or_else(|| {
+                                AppError::new(
+                                    ReasonCode::RcMemoryAccessViolation,
+                                    "file write range overflows",
+                                )
+                            })?;
+                            if end > MAX_ALLOCATION_SIZE {
+                                return Err(AppError::new(
+                                    ReasonCode::RcMemoryAccessViolation,
+                                    format!(
+                                        "file write extends past the {MAX_ALLOCATION_SIZE}-byte cap"
+                                    ),
+                                ));
+                            }
+                            if contents.len() < end {
+                                contents.resize(end, 0);
+                            }
+                            contents[start..end].copy_from_slice(bytes);
+                            fs::write(&file.host_path, &contents).map_err(|error| {
+                                AppError::from_io(
+                                    ReasonCode::RcIo,
+                                    format!("failed to write {path_display}"),
+                                    &error,
+                                )
+                            })?;
+                            file.position = end as u64;
+                            (file.normalized_path.clone(), file.host_path.clone())
+                        }
                     } else {
-                        Vec::new()
-                    };
-                    let start = file.position as usize;
-                    if contents.len() < start {
-                        contents.resize(start, 0);
+                        return invalid_handle("handle is not a file");
                     }
-                    if contents.len() < start + bytes.len() {
-                        contents.resize(start + bytes.len(), 0);
-                    }
-                    contents[start..start + bytes.len()].copy_from_slice(bytes);
-                    fs::write(&file.host_path, &contents).map_err(|error| {
-                        AppError::from_io(
-                            ReasonCode::RcIo,
-                            format!("failed to write {}", file.host_path.display()),
-                            &error,
-                        )
-                    })?;
-                    file.position += bytes.len() as u64;
-                    (file.normalized_path.clone(), file.host_path.clone())
-                }
-                KernelObject::Pipe(pipe) => {
-                    // Write to named pipe backing buffer
-                    let normalized = normalize_pipe_name(&pipe.name);
-                    if let Some(state) = self.named_pipes.get_mut(&normalized) {
-                        let mut buffer = state.buffer.lock().unwrap();
-                        buffer.extend(bytes);
-                        state.data_ready.notify_all();
-                    }
-                    (String::new(), PathBuf::new())
-                }
-                _ => return invalid_handle("handle is not a file or pipe"),
+                };
+                self.sync_entry(&normalized_path, &host_path, false)?;
+                Ok(bytes.len() as u32)
             }
-        };
-        if !normalized_path.is_empty() {
-            self.sync_entry(&normalized_path, &host_path, false)?;
+            ObjectType::Pipe => {
+                let normalized = match &self.handle_entry(handle)?.object {
+                    KernelObject::Pipe(pipe) => normalize_pipe_name(&pipe.name),
+                    _ => return invalid_handle("handle is not a pipe"),
+                };
+                let disconnected = self
+                    .named_pipes
+                    .get(&normalized)
+                    .is_some_and(|state| state.server_disconnected);
+                if disconnected {
+                    return Err(AppError::new(
+                        ReasonCode::RcIo,
+                        format!("pipe {normalized} is disconnected"),
+                    ));
+                }
+                if let Some(state) = self.named_pipes.get_mut(&normalized) {
+                    let mut buffer = state.buffer.lock().unwrap();
+                    buffer.extend(bytes);
+                    state.data_ready.notify_all();
+                } else {
+                    // Legacy pipe without shared state: buffer on the object.
+                    let entry = self.handle_entry_mut(handle)?;
+                    if let KernelObject::Pipe(pipe) = &mut entry.object {
+                        pipe.buffer.extend_from_slice(bytes);
+                    } else {
+                        return invalid_handle("handle is not a pipe");
+                    }
+                }
+                Ok(bytes.len() as u32)
+            }
+            _ => invalid_handle("handle is not a file or pipe"),
         }
-        Ok(bytes.len() as u32)
     }
 
     pub fn flush_file_buffers(&mut self, handle: Handle) -> AppResult<()> {
@@ -1932,20 +2177,28 @@ impl Win32Subsystem {
         distance: i64,
         origin: SeekOrigin,
     ) -> AppResult<u64> {
-        let size = self.get_file_size_ex(handle)? as i64;
+        let size = self.get_file_size_ex(handle)? as i128;
         let entry = self.handle_entry_mut(handle)?;
         match &mut entry.object {
             KernelObject::File(file) => {
                 let mut file = file.borrow_mut();
                 let next = match origin {
-                    SeekOrigin::Begin => distance,
-                    SeekOrigin::Current => file.position as i64 + distance,
-                    SeekOrigin::End => size + distance,
+                    SeekOrigin::Begin => distance as i128,
+                    // i128 intermediate so a position near u64::MAX cannot
+                    // wrap when cast to i64.
+                    SeekOrigin::Current => file.position as i128 + distance as i128,
+                    SeekOrigin::End => size + distance as i128,
                 };
                 if next < 0 {
                     return Err(AppError::new(
                         ReasonCode::RcMemoryAccessViolation,
                         "negative file pointer is not allowed",
+                    ));
+                }
+                if next > i64::MAX as i128 {
+                    return Err(AppError::new(
+                        ReasonCode::RcCliInvalid,
+                        "file pointer exceeds the Windows signed 64-bit range",
                     ));
                 }
                 file.position = next as u64;
@@ -2056,7 +2309,7 @@ impl Win32Subsystem {
             )
         })?;
         self.ge.config.fs_state.entries.remove(&normalized_path);
-        self.ge.save_config()
+        self.save_config_now()
     }
 
     pub fn find_first_file_w(&mut self, path: &str) -> AppResult<(Handle, FindData)> {
@@ -2117,7 +2370,7 @@ impl Win32Subsystem {
             )
         })?;
         self.ge.config.fs_state.entries.remove(&normalized_path);
-        self.ge.save_config()
+        self.save_config_now()
     }
 
     pub fn move_file_ex_w(
@@ -2158,7 +2411,7 @@ impl Win32Subsystem {
         if let Some(entry) = self.ge.config.fs_state.entries.remove(&from_norm) {
             self.ge.config.fs_state.entries.insert(to_norm, entry);
         }
-        self.ge.save_config()
+        self.save_config_now()
     }
 
     pub fn copy_file_ex_w(&mut self, from: &str, to: &str, fail_if_exists: bool) -> AppResult<u64> {
@@ -2214,13 +2467,30 @@ impl Win32Subsystem {
                 &error,
             )
         })?;
-        let name = format!("{}{:04}.tmp", prefix, self.next_handle);
-        let full = format!(
-            "{}\\{}",
-            normalized_directory.trim_end_matches(['\\', '/']),
-            name
-        );
-        let (normalized_path, host_path) = self.resolve_host_path(&full)?;
+        // A dedicated monotonic counter keeps consecutive calls unique even
+        // when no handle is created in between (Windows guarantees unique
+        // names; `next_handle` only advances on handle creation).
+        let mut serial = self.next_temp_file_serial;
+        let (full, normalized_path, host_path) = loop {
+            let name = format!("{}{:04X}.tmp", prefix, serial & 0xFFFF);
+            let full = format!(
+                "{}\\{}",
+                normalized_directory.trim_end_matches(['\\', '/']),
+                name
+            );
+            let (normalized_path, host_path) = self.resolve_host_path(&full)?;
+            if !host_path.exists() {
+                break (full, normalized_path, host_path);
+            }
+            serial = serial.wrapping_add(1);
+            if serial == self.next_temp_file_serial {
+                return Err(AppError::new(
+                    ReasonCode::RcIo,
+                    "unable to allocate a unique temporary file name",
+                ));
+            }
+        };
+        self.next_temp_file_serial = serial.wrapping_add(1);
         self.ensure_parent_exists(&host_path)?;
         fs::write(&host_path, []).map_err(|error| {
             AppError::from_io(
@@ -2249,8 +2519,10 @@ impl Win32Subsystem {
                 &error,
             )
         })?;
-        let end = ((offset as usize) + length).min(bytes.len());
-        let transferred = end.saturating_sub(offset as usize) as u32;
+        // Clamp before adding: a near-u64::MAX offset must not overflow.
+        let start = (offset as usize).min(bytes.len());
+        let end = start.saturating_add(length).min(bytes.len());
+        let transferred = end.saturating_sub(start) as u32;
         let id = self.insert_overlapped(
             handle,
             event_handle,
@@ -2286,14 +2558,30 @@ impl Win32Subsystem {
             } else {
                 Vec::new()
             };
-            let start = offset as usize;
-            if contents.len() < start {
-                contents.resize(start, 0);
+            let start_u64 = offset;
+            if start_u64 > isize::MAX as u64 {
+                return Err(AppError::new(
+                    ReasonCode::RcMemoryAccessViolation,
+                    "file write offset is too large",
+                ));
             }
-            if contents.len() < start + bytes.len() {
-                contents.resize(start + bytes.len(), 0);
+            let start = start_u64 as usize;
+            let end = start.checked_add(bytes.len()).ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcMemoryAccessViolation,
+                    "file write range overflows",
+                )
+            })?;
+            if end > MAX_ALLOCATION_SIZE {
+                return Err(AppError::new(
+                    ReasonCode::RcMemoryAccessViolation,
+                    format!("file write extends past the {MAX_ALLOCATION_SIZE}-byte cap"),
+                ));
             }
-            contents[start..start + bytes.len()].copy_from_slice(bytes);
+            if contents.len() < end {
+                contents.resize(end, 0);
+            }
+            contents[start..end].copy_from_slice(bytes);
             fs::write(&file.host_path, &contents).map_err(|error| {
                 AppError::from_io(
                     ReasonCode::RcIo,
@@ -2319,6 +2607,47 @@ impl Win32Subsystem {
     }
 
     pub fn get_overlapped_result(&mut self, id: u64, wait: bool) -> AppResult<OverlappedResult> {
+        if wait {
+            // Blocking GetOverlappedResult: poll for completion for a bounded
+            // period (an unbounded block would starve cooperatively scheduled
+            // guest threads that complete the request).
+            for _ in 0..BLOCKING_POLL_ITERATIONS {
+                let request = self.overlapped.get(&id).cloned().ok_or_else(|| {
+                    AppError::new(
+                        ReasonCode::RcWin32InvalidHandle,
+                        format!("invalid overlapped id {id}"),
+                    )
+                })?;
+                match request.state {
+                    OverlappedState::Completed(bytes_transferred) => {
+                        self.overlapped.remove(&id);
+                        return Ok(OverlappedResult {
+                            id,
+                            bytes_transferred,
+                            completed: true,
+                            cancelled: false,
+                        });
+                    }
+                    OverlappedState::Cancelled => {
+                        self.overlapped.remove(&id);
+                        return Ok(OverlappedResult {
+                            id,
+                            bytes_transferred: 0,
+                            completed: false,
+                            cancelled: true,
+                        });
+                    }
+                    OverlappedState::Pending => {
+                        std::thread::sleep(Duration::from_millis(1));
+                        self.record_sleep_observation(1, 1);
+                    }
+                }
+            }
+            return Err(AppError::new(
+                ReasonCode::RcWin32Timeout,
+                format!("overlapped request {id} is still pending"),
+            ));
+        }
         let request = self.overlapped.get(&id).cloned().ok_or_else(|| {
             AppError::new(
                 ReasonCode::RcWin32InvalidHandle,
@@ -2326,22 +2655,26 @@ impl Win32Subsystem {
             )
         })?;
         match request.state {
-            OverlappedState::Completed(bytes_transferred) => Ok(OverlappedResult {
-                id,
-                bytes_transferred,
-                completed: true,
-                cancelled: false,
-            }),
-            OverlappedState::Cancelled => Ok(OverlappedResult {
-                id,
-                bytes_transferred: 0,
-                completed: false,
-                cancelled: true,
-            }),
-            OverlappedState::Pending if wait => Err(AppError::new(
-                ReasonCode::RcWin32Timeout,
-                format!("overlapped request {id} is still pending"),
-            )),
+            OverlappedState::Completed(bytes_transferred) => {
+                // A completed request is final; drop it so long-running
+                // guests do not accumulate one entry per overlapped op.
+                self.overlapped.remove(&id);
+                Ok(OverlappedResult {
+                    id,
+                    bytes_transferred,
+                    completed: true,
+                    cancelled: false,
+                })
+            }
+            OverlappedState::Cancelled => {
+                self.overlapped.remove(&id);
+                Ok(OverlappedResult {
+                    id,
+                    bytes_transferred: 0,
+                    completed: false,
+                    cancelled: true,
+                })
+            }
             OverlappedState::Pending => Ok(OverlappedResult {
                 id,
                 bytes_transferred: 0,
@@ -2393,24 +2726,44 @@ impl Win32Subsystem {
         event_handle: Option<Handle>,
         overlapped: bool,
     ) -> AppResult<Option<u64>> {
-        let entry = self.handle_entry_mut(handle)?;
-        match &mut entry.object {
-            KernelObject::Pipe(pipe) => {
-                if pipe.connected {
-                    self.signal_event_if_needed(event_handle)?;
-                    Ok(None)
-                } else if overlapped {
-                    let id = self.insert_overlapped(handle, event_handle, OverlappedState::Pending);
-                    Ok(Some(id))
-                } else {
-                    Err(AppError::new(
-                        ReasonCode::RcPipeBusy,
-                        format!("{} is not connected", pipe.name),
-                    ))
+        let pipe_name = {
+            let entry = self.handle_entry_mut(handle)?;
+            match &mut entry.object {
+                KernelObject::Pipe(pipe) => {
+                    if pipe.connected {
+                        self.signal_event_if_needed(event_handle)?;
+                        return Ok(None);
+                    }
+                    pipe.name.clone()
                 }
+                _ => return invalid_handle("handle is not a pipe"),
             }
-            _ => invalid_handle("handle is not a pipe"),
+        };
+        if overlapped {
+            let id = self.insert_overlapped(handle, event_handle, OverlappedState::Pending);
+            return Ok(Some(id));
         }
+        // Non-overlapped ConnectNamedPipe blocks until a client connects.
+        // Poll the shared state for a bounded period — guest threads are
+        // scheduled cooperatively, so an unbounded block would deadlock the
+        // emulator when the client lives in another guest thread.
+        let normalized = normalize_pipe_name(&pipe_name);
+        for _ in 0..BLOCKING_POLL_ITERATIONS {
+            if self
+                .named_pipes
+                .get(&normalized)
+                .is_some_and(|state| state.connected)
+            {
+                self.signal_event_if_needed(event_handle)?;
+                return Ok(None);
+            }
+            std::thread::sleep(Duration::from_millis(1));
+            self.record_sleep_observation(1, 1);
+        }
+        Err(AppError::new(
+            ReasonCode::RcPipeBusy,
+            format!("{} is not connected", pipe_name),
+        ))
     }
 
     pub fn call_named_pipe(&mut self, name: &str, request: &[u8]) -> AppResult<Vec<u8>> {
@@ -2428,11 +2781,21 @@ impl Win32Subsystem {
                     format!("{} is not registered", normalized),
                 )
             })?;
-        if let Some(entry) = self.handles.get_mut(&pipe_handle) {
-            if let KernelObject::Pipe(pipe) = &mut entry.object {
-                pipe.connected = true;
-                pipe.buffer = request.to_vec();
-            }
+        // Mirror `call_named_pipe_w`: the request goes into the shared
+        // named-pipe buffer so server-side `read_file` calls observe it
+        // (the per-object `PipeObject.buffer` is never read anywhere).
+        if let Some(state) = self.named_pipes.get_mut(&normalized) {
+            let mut buffer = state.buffer.lock().unwrap();
+            buffer.extend(request);
+            state.data_ready.notify_all();
+        }
+        if let Some(HandleEntry {
+            object: KernelObject::Pipe(pipe),
+            ..
+        }) = self.handles.get_mut(&pipe_handle)
+        {
+            pipe.connected = true;
+            pipe.buffer.extend_from_slice(request);
         }
         let pending_ids = self
             .overlapped
@@ -2442,11 +2805,11 @@ impl Win32Subsystem {
             .collect::<Vec<_>>();
         let mut events = Vec::new();
         for id in pending_ids {
-            if let Some(request) = self.overlapped.get_mut(&id) {
-                request.state = OverlappedState::Completed(
-                    request.len_hint(request_id_len(request, request_id_len_inner(request))) as u32,
-                );
-                events.push(request.event_handle);
+            if let Some(overlapped) = self.overlapped.get_mut(&id) {
+                // Complete pending connect requests with the actual byte
+                // count written by this call.
+                overlapped.state = OverlappedState::Completed(request.len() as u32);
+                events.push(overlapped.event_handle);
             }
         }
         for event_handle in events {
@@ -2462,25 +2825,59 @@ impl Win32Subsystem {
         allocation_type: AllocationType,
         protection: MemoryProtection,
     ) -> AppResult<u64> {
-        let base = base_address.unwrap_or_else(|| {
-            let current = self.next_virtual_address;
-            self.next_virtual_address += align_up(size as u64, 0x1000);
-            current
-        });
+        let aligned = align_up(size as u64, 0x1000);
+        let base = match base_address {
+            Some(base) => base,
+            None => {
+                let current = self.next_virtual_address;
+                self.next_virtual_address = current.checked_add(aligned).ok_or_else(|| {
+                    AppError::new(
+                        ReasonCode::RcMemoryAccessViolation,
+                        "virtual address space exhausted",
+                    )
+                })?;
+                current
+            }
+        };
+        // Reject ranges that would overflow u64 page arithmetic.
+        base.checked_add(aligned).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcCliInvalid,
+                format!("region {base:#x} + {aligned:#x} overflows the address space"),
+            )
+        })?;
         let region = self
             .memory_regions
             .entry(base)
             .or_insert_with(|| VirtualRegion {
                 base_address: base,
-                size: align_up(size as u64, 0x1000) as usize,
+                size: aligned as usize,
                 committed: BTreeSet::new(),
                 protection,
+                backing: None,
+                backing_offset: 0,
             });
-        region.protection = protection;
+        // A second call at the same base (e.g. committing a reservation) must
+        // extend the region instead of reporting free pages beyond its size.
+        if region.size < aligned as usize {
+            region.size = aligned as usize;
+        }
         match allocation_type {
             AllocationType::Reserve => {}
             AllocationType::Commit | AllocationType::ReserveCommit => {
-                let page_count = align_up(size as u64, 0x1000) / 0x1000;
+                let page_count = aligned / 0x1000;
+                if page_count > MAX_COMMIT_PAGES {
+                    return Err(AppError::new(
+                        ReasonCode::RcCliInvalid,
+                        format!(
+                            "commit of {page_count} pages exceeds the {MAX_COMMIT_PAGES} page cap"
+                        ),
+                    ));
+                }
+                // Windows VirtualAlloc(MEM_COMMIT) sets the protection of the
+                // committed range; with a single per-region protection the
+                // commit's protection wins.  Plain reserves leave it alone.
+                region.protection = protection;
                 for page in 0..page_count {
                     region.committed.insert(base + page * 0x1000);
                 }
@@ -2492,12 +2889,21 @@ impl Win32Subsystem {
     pub fn virtual_free(&mut self, base_address: u64, free_type: FreeType) -> AppResult<()> {
         match free_type {
             FreeType::Release => {
-                self.memory_regions.remove(&base_address);
+                if self.memory_regions.remove(&base_address).is_none() {
+                    return Err(AppError::new(
+                        ReasonCode::RcMemoryAccessViolation,
+                        format!("unknown region {base_address:#x}"),
+                    ));
+                }
             }
             FreeType::Decommit => {
-                if let Some(region) = self.memory_regions.get_mut(&base_address) {
-                    region.committed.clear();
-                }
+                let region = self.memory_regions.get_mut(&base_address).ok_or_else(|| {
+                    AppError::new(
+                        ReasonCode::RcMemoryAccessViolation,
+                        format!("unknown region {base_address:#x}"),
+                    )
+                })?;
+                region.committed.clear();
             }
         }
         Ok(())
@@ -2520,20 +2926,22 @@ impl Win32Subsystem {
     }
 
     pub fn virtual_query(&self, address: u64) -> MemoryBasicInformation {
-        for region in self.memory_regions.values() {
-            if address >= region.base_address && address < region.base_address + region.size as u64
-            {
-                return MemoryBasicInformation {
-                    base_address: region.base_address,
-                    region_size: region.size,
-                    state: if region.committed.is_empty() {
-                        MemoryState::Reserved
-                    } else {
-                        MemoryState::Committed
-                    },
-                    protection: region.protection,
-                };
-            }
+        // BTreeMap keys are sorted by base address: binary-search the
+        // containing region instead of scanning every region per query.
+        if let Some((_, region)) = self.memory_regions.range(..=address).next_back()
+            && let Some(end) = region.base_address.checked_add(region.size as u64)
+            && address < end
+        {
+            return MemoryBasicInformation {
+                base_address: region.base_address,
+                region_size: region.size,
+                state: if region.committed.is_empty() {
+                    MemoryState::Reserved
+                } else {
+                    MemoryState::Committed
+                },
+                protection: region.protection,
+            };
         }
         MemoryBasicInformation {
             base_address: 0,
@@ -2562,6 +2970,8 @@ impl Win32Subsystem {
                 base_address: base,
                 size,
                 protection,
+                name: None,
+                backing: None,
             }),
         ))
     }
@@ -2579,6 +2989,8 @@ impl Win32Subsystem {
                     write: true,
                     execute: false,
                 },
+                name: None,
+                backing: None,
             }),
         );
         self.heaps.insert(
@@ -2587,21 +2999,75 @@ impl Win32Subsystem {
                 alignment: alignment.max(8),
                 next_address: 0x2000_0000,
                 allocations: BTreeMap::new(),
+                free_blocks: BTreeMap::new(),
             },
         );
         handle
     }
 
     pub fn heap_alloc(&mut self, heap: Handle, size: usize) -> AppResult<u64> {
+        if size > MAX_ALLOCATION_SIZE {
+            return Err(AppError::new(
+                ReasonCode::RcCliInvalid,
+                format!(
+                    "heap allocation of {size} bytes exceeds the {MAX_ALLOCATION_SIZE}-byte cap"
+                ),
+            ));
+        }
         let state = self.heaps.get_mut(&heap).ok_or_else(|| {
             AppError::new(
                 ReasonCode::RcWin32InvalidHandle,
                 format!("invalid heap {heap}"),
             )
         })?;
+        // Reuse freed blocks first (best fit) so alloc/free loops do not
+        // grow the high-water pointer without bound.
+        if let Some((address, block_size)) = state
+            .free_blocks
+            .iter()
+            .filter(|(_, block_size)| **block_size >= size)
+            .min_by_key(|(_, block_size)| **block_size)
+        {
+            let (address, block_size) = (*address, *block_size);
+            state.free_blocks.remove(&address);
+            if block_size > size {
+                // Keep the remainder free; re-align it so future reuse keeps
+                // the heap's alignment guarantee.
+                let remainder_addr = align_up(
+                    address.saturating_add(size as u64),
+                    state.alignment as u64,
+                );
+                let used = remainder_addr - address;
+                if remainder_addr > address
+                    && remainder_addr < address.saturating_add(block_size as u64)
+                {
+                    state
+                        .free_blocks
+                        .insert(remainder_addr, block_size - used as usize);
+                }
+            }
+            let mut allocation = Vec::with_capacity(
+                align_up(size as u64, state.alignment as u64) as usize,
+            );
+            allocation.resize(size, 0);
+            state.allocations.insert(address, allocation);
+            return Ok(address);
+        }
         let address = align_up(state.next_address, state.alignment as u64);
-        state.next_address = address + size as u64 + state.alignment as u64;
-        state.allocations.insert(address, vec![0_u8; size]);
+        state.next_address = address
+            .checked_add(size as u64)
+            .and_then(|next| next.checked_add(state.alignment as u64))
+            .ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcMemoryAccessViolation,
+                    "heap address space exhausted",
+                )
+            })?;
+        let mut allocation = Vec::with_capacity(
+            align_up(size as u64, state.alignment as u64) as usize,
+        );
+        allocation.resize(size, 0);
+        state.allocations.insert(address, allocation);
         Ok(address)
     }
 
@@ -2639,6 +3105,14 @@ impl Win32Subsystem {
     }
 
     pub fn heap_realloc(&mut self, heap: Handle, address: u64, new_size: usize) -> AppResult<u64> {
+        if new_size > MAX_ALLOCATION_SIZE {
+            return Err(AppError::new(
+                ReasonCode::RcCliInvalid,
+                format!(
+                    "heap realloc of {new_size} bytes exceeds the {MAX_ALLOCATION_SIZE}-byte cap"
+                ),
+            ));
+        }
         let state = self.heaps.get_mut(&heap).ok_or_else(|| {
             AppError::new(
                 ReasonCode::RcWin32InvalidHandle,
@@ -2651,10 +3125,28 @@ impl Win32Subsystem {
                 format!("invalid heap pointer {address:#x}"),
             )
         })?;
-        allocation.resize(new_size, 0);
+        // Grow in place while the existing buffer has spare capacity so the
+        // pointer stays valid (no move) — the common small-growth case.
+        if new_size <= allocation.capacity() {
+            allocation.resize(new_size, 0);
+            state.allocations.insert(address, allocation);
+            return Ok(address);
+        }
+        let old_len = allocation.len();
         let new_address = align_up(state.next_address, state.alignment as u64);
-        state.next_address = new_address + new_size as u64 + state.alignment as u64;
+        state.next_address = new_address
+            .checked_add(new_size as u64)
+            .and_then(|next| next.checked_add(state.alignment as u64))
+            .ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcMemoryAccessViolation,
+                    "heap address space exhausted",
+                )
+            })?;
+        allocation.resize(new_size, 0);
         state.allocations.insert(new_address, allocation);
+        // The old block becomes free space for future reuse.
+        state.free_blocks.insert(address, old_len);
         Ok(new_address)
     }
 
@@ -2665,7 +3157,9 @@ impl Win32Subsystem {
                 format!("invalid heap {heap}"),
             )
         })?;
-        state.allocations.remove(&address);
+        if let Some(allocation) = state.allocations.remove(&address) {
+            state.free_blocks.insert(address, allocation.len());
+        }
         Ok(())
     }
 
@@ -2836,6 +3330,7 @@ impl Win32Subsystem {
     // -----------------------------------------------------------------------
 
     /// `CreateNamedPipeW` — creates a named-pipe server endpoint.
+    #[allow(clippy::too_many_arguments)]
     pub fn create_named_pipe_w(
         &mut self,
         name: &str,
@@ -2857,6 +3352,14 @@ impl Win32Subsystem {
             ));
         }
         let buf_size = out_buffer_size.max(in_buffer_size).max(4096) as usize;
+        if buf_size > MAX_ALLOCATION_SIZE {
+            return Err(AppError::new(
+                ReasonCode::RcCliInvalid,
+                format!(
+                    "pipe buffer size {buf_size} exceeds the {MAX_ALLOCATION_SIZE}-byte cap"
+                ),
+            ));
+        }
 
         // Compute UDS path if not explicitly provided
         let uds_path = uds_socket_path.unwrap_or_else(|| pipe_name_to_uds_path(&normalized));
@@ -2883,6 +3386,8 @@ impl Win32Subsystem {
             pipe_mode: pipe_mode & 0x0000_0003, // PIPE_WAIT or PIPE_NOWAIT
             max_instances,
             default_timeout,
+            out_buffer_size,
+            in_buffer_size,
         };
         self.named_pipes.insert(normalized.clone(), state.clone());
 
@@ -2910,6 +3415,8 @@ impl Win32Subsystem {
         // with `\\.\pipe\...`) will set `connected`.
         if let Some(state) = self.named_pipes.get_mut(&normalized) {
             state.server_created = true;
+            // A new connect cycle clears the previous disconnect.
+            state.server_disconnected = false;
         }
         Ok(())
     }
@@ -2920,15 +3427,18 @@ impl Win32Subsystem {
         match &entry.object {
             KernelObject::Pipe(pipe) => {
                 let normalized = normalize_pipe_name(&pipe.name);
-                let state = self.named_pipes.get(&normalized);
-                let (max_size, _cur_size) = if let Some(s) = state {
-                    let cur = s.buffer.lock().unwrap().len();
-                    (s.max_buffer_size as u32, cur as u32)
+                if let Some(state) = self.named_pipes.get(&normalized) {
+                    // (pipe_mode, max_instances, out_buffer_size, in_buffer_size)
+                    Ok((
+                        state.pipe_mode & 0x0000_0003,
+                        state.max_instances,
+                        state.out_buffer_size,
+                        state.in_buffer_size,
+                    ))
                 } else {
-                    (4096, 0)
-                };
-                // (pipe_mode, max_instances, out_buffer_size, in_buffer_size)
-                Ok((1, 1, max_size, max_size))
+                    // Legacy pipe without a named-pipe state record.
+                    Ok((PIPE_WAIT, 1, 4096, 4096))
+                }
             }
             _ => invalid_handle("handle is not a pipe"),
         }
@@ -2950,10 +3460,12 @@ impl Win32Subsystem {
             _ => return invalid_handle("handle is not a pipe"),
         };
         let normalized = normalize_pipe_name(&pipe_name);
-        if let Some(state) = self.named_pipes.get_mut(&normalized) {
-            if let Some(mode) = mode {
-                state.pipe_mode = mode;
-            }
+        if let Some(state) = self.named_pipes.get_mut(&normalized)
+            && let Some(mode) = mode
+        {
+            // Apply the same PIPE_WAIT/NOWAIT + READMODE mask used at
+            // creation so wait/info semantics see consistent bits.
+            state.pipe_mode = mode & 0x0000_0003;
             // max_collect_count and collect_data_timeout unused in current impl
         }
         Ok(())
@@ -2975,6 +3487,12 @@ impl Win32Subsystem {
                         format!("peek_named_pipe: pipe not found: {}", pipe.name),
                     )
                 })?;
+                if state.server_disconnected {
+                    return Err(AppError::new(
+                        ReasonCode::RcIo,
+                        format!("pipe {} is disconnected", pipe.name),
+                    ));
+                }
                 let buf = state.buffer.lock().unwrap();
                 let available = buf.len() as u32;
                 let to_copy = buffer.len().min(available as usize);
@@ -2999,6 +3517,8 @@ impl Win32Subsystem {
         if let Some(state) = self.named_pipes.get_mut(&normalized) {
             state.connected = false;
             state.server_disconnected = true;
+            // Windows discards queued data on disconnect.
+            state.buffer.lock().unwrap().clear();
             state.data_ready.notify_all();
         }
         Ok(())
@@ -3061,7 +3581,7 @@ impl Win32Subsystem {
         inheritable: bool,
     ) -> AppResult<Handle> {
         let normalized = normalize_pipe_name(pipe_name);
-        let (_buf, _ready) = {
+        let name = {
             let state = self.named_pipes.get_mut(&normalized).ok_or_else(|| {
                 AppError::new(
                     ReasonCode::RcFsNotFound,
@@ -3070,15 +3590,17 @@ impl Win32Subsystem {
             })?;
             // Mark as connected
             state.connected = true;
-            (state.buffer.clone(), state.data_ready.clone())
+            state.server_disconnected = false;
+            state.name.clone()
         };
-        // Return a pipe handle that shares the same buffer
+        // The pipe object shares the same buffer by name; `read_file` and
+        // `write_file` look the state up through the normalized name.
         Ok(self.insert_object(
             ObjectType::Pipe,
             0x1F0FFF,
             inheritable,
             KernelObject::Pipe(PipeObject {
-                name: normalized,
+                name,
                 connected: true,
                 buffer: Vec::new(),
             }),
@@ -3097,46 +3619,44 @@ impl Win32Subsystem {
         protection: MemoryProtection,
         inheritable: bool,
     ) -> AppResult<(Handle, bool)> {
+        if maximum_size > MAX_ALLOCATION_SIZE {
+            return Err(AppError::new(
+                ReasonCode::RcCliInvalid,
+                format!(
+                    "file mapping size {maximum_size} exceeds the {MAX_ALLOCATION_SIZE}-byte cap"
+                ),
+            ));
+        }
         let key = name.unwrap_or("").to_string();
-        if !key.is_empty() {
-            // Check existence before borrowing self mutably
-            let exists = self.shared_memory_sections.contains_key(&key);
-            if exists {
-                // Already exists — return a new handle to it
-                let section = self.shared_memory_sections.get(&key).unwrap();
-                let size = section.data.lock().unwrap().len();
-                let prot = section.protection;
-                // The section reference is no longer needed; the borrow ends here naturally
-                let _ = section;
-                let handle = self.insert_object(
-                    ObjectType::Section,
-                    0x1F0FFF,
-                    inheritable,
-                    KernelObject::Section(SectionObject {
-                        base_address: 0,
-                        size,
-                        protection: prot,
-                    }),
-                );
-                return Ok((handle, true));
-            }
+        if !key.is_empty()
+            && let Some(section) = self.shared_memory_sections.get(&key)
+        {
+            let size = section.data.lock().unwrap().len();
+            let prot = section.protection;
+            let backing = section.data.clone();
+            let handle = self.insert_object(
+                ObjectType::Section,
+                0x1F0FFF,
+                inheritable,
+                KernelObject::Section(SectionObject {
+                    base_address: 0,
+                    size,
+                    protection: prot,
+                    name: Some(key),
+                    backing: Some(backing),
+                }),
+            );
+            return Ok((handle, true));
         }
         let data = Arc::new(Mutex::new(vec![0_u8; maximum_size.max(1)]));
-        let mmap_backing = if !key.is_empty() {
-            // For named sections, optionally create an mmap backing
-            MmapBacking::new(maximum_size.max(1)).map(|m| Arc::new(Mutex::new(m)))
-        } else {
-            None
-        };
         let section = SharedMemorySection {
             name: key.clone(),
-            data,
-            mmap_backing,
+            data: data.clone(),
             maximum_size,
             protection,
         };
         if !key.is_empty() {
-            self.shared_memory_sections.insert(key, section.clone());
+            self.shared_memory_sections.insert(key.clone(), section);
         }
         let handle = self.insert_object(
             ObjectType::Section,
@@ -3146,6 +3666,8 @@ impl Win32Subsystem {
                 base_address: 0,
                 size: maximum_size,
                 protection,
+                name: (!key.is_empty()).then_some(key),
+                backing: Some(data),
             }),
         );
         Ok((handle, false))
@@ -3153,35 +3675,75 @@ impl Win32Subsystem {
 
     /// `MapViewOfFile` — return a base address for the shared memory section.
     /// We allocate a virtual address range in the guest's address space and
-    /// store the mapping.
+    /// store the mapping, tied to the section's shared byte storage so all
+    /// views of the same section observe the same data.
     pub fn map_view_of_file(
         &mut self,
         handle: Handle,
         offset: u64,
         bytes_to_map: usize,
     ) -> AppResult<u64> {
-        let entry = self.handle_entry(handle)?;
-        let (_protection, _) = match &entry.object {
-            KernelObject::Section(section) => (section.protection, section.size),
-            _ => return invalid_handle("handle is not a section"),
+        let (protection, section_size, backing) = {
+            let entry = self.handle_entry(handle)?;
+            match &entry.object {
+                KernelObject::Section(section) => {
+                    (section.protection, section.size, section.backing.clone())
+                }
+                _ => return invalid_handle("handle is not a section"),
+            }
         };
-        let _offset = offset;
-        let _bytes_to_map = bytes_to_map;
-        // Allocate a virtual address for the mapping
+        if offset > section_size as u64 {
+            return Err(AppError::new(
+                ReasonCode::RcCliInvalid,
+                format!(
+                    "map offset {offset:#x} exceeds section size {section_size:#x}"
+                ),
+            ));
+        }
+        let remaining = section_size as u64 - offset;
+        let view_size = if bytes_to_map == 0 {
+            remaining
+        } else {
+            (bytes_to_map as u64).min(remaining)
+        }
+        .max(1);
+        // `next_power_of_two` panics on overflow; reject absurd sizes instead.
+        let size = view_size
+            .checked_next_power_of_two()
+            .ok_or_else(|| {
+                AppError::new(ReasonCode::RcCliInvalid, "mapping size is too large")
+            })? as usize;
+        let page_count = (size / 0x1000) as u64;
+        if page_count > MAX_COMMIT_PAGES {
+            return Err(AppError::new(
+                ReasonCode::RcCliInvalid,
+                format!(
+                    "mapping of {page_count} pages exceeds the {MAX_COMMIT_PAGES} page cap"
+                ),
+            ));
+        }
         let base = self.next_virtual_address;
-        let size = bytes_to_map.max(0x1000).next_power_of_two();
-        self.next_virtual_address = self.next_virtual_address.saturating_add(size as u64);
+        self.next_virtual_address = self.next_virtual_address.checked_add(size as u64).ok_or_else(
+            || {
+                AppError::new(
+                    ReasonCode::RcMemoryAccessViolation,
+                    "virtual address space exhausted",
+                )
+            },
+        )?;
+        let mut committed = BTreeSet::new();
+        for page in 0..page_count {
+            committed.insert(base + page * 0x1000);
+        }
         self.memory_regions.insert(
             base,
             VirtualRegion {
                 base_address: base,
                 size,
-                committed: BTreeSet::from([base]),
-                protection: MemoryProtection {
-                    read: true,
-                    write: true,
-                    execute: false,
-                },
+                committed,
+                protection,
+                backing,
+                backing_offset: offset,
             },
         );
         Ok(base)
@@ -3189,8 +3751,32 @@ impl Win32Subsystem {
 
     /// `UnmapViewOfFile` — release a previously mapped view.
     pub fn unmap_view_of_file(&mut self, base_address: u64) -> AppResult<()> {
+        let is_mapping = self
+            .memory_regions
+            .get(&base_address)
+            .is_some_and(|region| region.backing.is_some());
+        if !is_mapping {
+            return Err(AppError::new(
+                ReasonCode::RcMemoryAccessViolation,
+                format!("{base_address:#x} is not a mapped file view"),
+            ));
+        }
         self.memory_regions.remove(&base_address);
         Ok(())
+    }
+
+    /// Returns the section backing and offset for a mapped view, if the
+    /// region was created by `map_view_of_file`.  Lets the memory model route
+    /// guest accesses to the section's shared storage.
+    pub fn mapped_view_section(&self, base_address: u64) -> Option<(u64, Arc<Mutex<Vec<u8>>>)> {
+        self.memory_regions
+            .get(&base_address)
+            .and_then(|region| {
+                region
+                    .backing
+                    .clone()
+                    .map(|backing| (region.backing_offset, backing))
+            })
     }
 
     pub fn set_thread_exit_code(&mut self, handle: Handle, exit_code: u32) -> AppResult<()> {
@@ -3287,7 +3873,15 @@ impl Win32Subsystem {
     }
 
     pub fn tls_alloc(&mut self) -> u32 {
+        // Reuse freed slots before allocating fresh ones.
+        if let Some(slot) = self.tls_free_slots.pop() {
+            return slot;
+        }
         let index = self.next_tls_slot;
+        if index == u32::MAX {
+            // TLS_OUT_OF_INDEXES — all slots exhausted.
+            return u32::MAX;
+        }
         self.next_tls_slot += 1;
         index
     }
@@ -3307,6 +3901,10 @@ impl Win32Subsystem {
         // Remove the TLS slot from all thread states
         for (_tid, state) in self.threads.iter_mut() {
             state.tls.remove(&slot);
+        }
+        // Make the slot index available for reuse.
+        if !self.tls_free_slots.contains(&slot) {
+            self.tls_free_slots.push(slot);
         }
     }
 
@@ -3335,7 +3933,7 @@ impl Win32Subsystem {
                 }
             }
         }
-        processes.sort_by(|left, right| left.process_id.cmp(&right.process_id));
+        processes.sort_by_key(|entry| entry.process_id);
         modules.sort_by(|left, right| {
             left.process_id
                 .cmp(&right.process_id)
@@ -3358,12 +3956,14 @@ impl Win32Subsystem {
 
     pub fn sleep(&mut self, milliseconds: u64) {
         // Advance the guest virtual clock by the full requested duration.
-        // Cap the actual host sleep to 1ms maximum — the guest's Sleep()
-        // should advance virtual time without blocking the host thread
-        // for the full duration (which would make the emulator unusably slow).
         self.record_sleep_observation(milliseconds, milliseconds);
-        // Only sleep 1ms max on the host to yield the CPU.
-        std::thread::sleep(Duration::from_millis(1));
+        // In live-pacing mode the host sleeps the full requested duration so
+        // guest timing tracks wall clock; otherwise yield only briefly and
+        // let the virtual clock drive timing (the guest Sleep() should not
+        // block the host thread for the full duration, which would make the
+        // emulator unusably slow).
+        let host_sleep_ms = paced_sleep_duration_ms(milliseconds, self.time.live_pacing);
+        std::thread::sleep(Duration::from_millis(host_sleep_ms));
     }
 
     pub fn sleep_ex(
@@ -3373,19 +3973,22 @@ impl Win32Subsystem {
         thread_handle: Option<Handle>,
     ) -> AppResult<WaitStatus> {
         if alertable {
-            if let Some(thread_handle) = thread_handle {
-                let thread_id = self.thread_id(thread_handle)?;
-                if let Some(queue) = self.thread_apcs.get_mut(&thread_id) {
-                    if !queue.is_empty() {
-                        queue.pop_front();
-                        return Ok(WaitStatus::IoCompletion);
-                    }
-                }
+            let thread_id = match thread_handle {
+                Some(thread_handle) => Some(self.thread_id(thread_handle)?),
+                None => None,
+            };
+            if let Some(thread_id) = thread_id
+                && let Some(queue) = self.thread_apcs.get_mut(&thread_id)
+                && !queue.is_empty()
+            {
+                queue.pop_front();
+                return Ok(WaitStatus::IoCompletion);
             }
         }
-        // Advance guest clock, cap host sleep to 1ms.
+        // Advance guest clock; pace the host sleep like `sleep`.
         self.record_sleep_observation(milliseconds, milliseconds);
-        std::thread::sleep(Duration::from_millis(1));
+        let host_sleep_ms = paced_sleep_duration_ms(milliseconds, self.time.live_pacing);
+        std::thread::sleep(Duration::from_millis(host_sleep_ms));
         Ok(WaitStatus::Object0)
     }
 
@@ -3396,7 +3999,11 @@ impl Win32Subsystem {
             .qpc
             .saturating_add(observed_ms.saturating_mul(self.time.perf_frequency / 1000));
         let drift_ms = observed_ms as i64 - requested_ms as i64;
-        if !self.time.dtm && requested_ms >= 10 && drift_ms.abs() > 2 {
+        if !self.time.dtm
+            && requested_ms >= 10
+            && drift_ms.abs() > 2
+            && self.time.drift_log.len() < 256
+        {
             self.time.drift_log.push(SleepObservation {
                 requested_ms,
                 observed_ms,
@@ -3702,6 +4309,27 @@ impl Win32Subsystem {
         Ok(())
     }
 
+    /// Serialize the config immediately and record the save time so a
+    /// following throttled save is not duplicated.
+    fn save_config_now(&mut self) -> AppResult<()> {
+        self.ge.save_config()?;
+        self.last_config_save_wall_ms = wall_clock_ms();
+        Ok(())
+    }
+
+    /// Serialize the config at most every 250 ms.  `sync_entry` runs on every
+    /// file write; a full-config JSON serialization per syscall makes games
+    /// that write logs/saves in a loop pay O(config) per write.  Metadata lost
+    /// by throttling is rebuilt on demand via `sync_existing_path_w`.
+    fn save_config_throttled(&mut self) -> AppResult<()> {
+        let now = wall_clock_ms();
+        if now.saturating_sub(self.last_config_save_wall_ms) >= 250 {
+            self.ge.save_config()?;
+            self.last_config_save_wall_ms = now;
+        }
+        Ok(())
+    }
+
     fn sync_entry(
         &mut self,
         normalized_path: &str,
@@ -3742,7 +4370,7 @@ impl Win32Subsystem {
                 last_write_time_ticks: ticks,
             },
         );
-        self.ge.save_config()
+        self.save_config_throttled()
     }
 
     fn find_data_for_child(&self, directory_path: &str, child_name: &str) -> AppResult<FindData> {
@@ -3839,6 +4467,10 @@ impl Win32Subsystem {
             .is_some_and(|state| state.exit_code.is_some())
         {
             self.threads.remove(&thread_id);
+            // Drop per-thread bookkeeping so guests that spawn many threads
+            // do not accumulate unbounded entries.
+            self.thread_apcs.remove(&thread_id);
+            self.com_apartments.remove(&thread_id);
         }
     }
 
@@ -3849,10 +4481,24 @@ impl Win32Subsystem {
         inheritable: bool,
         object: KernelObject,
     ) -> Handle {
-        let handle = self.next_handle;
-        self.next_handle = self.next_handle.saturating_add(4);
+        // Recycle closed handle values (FIFO) like Windows does, so closed
+        // values are reused and generation counters can detect stale
+        // references.  With recycling, `next_handle` saturation at u32::MAX
+        // is unreachable in practice (it would require ~2^30 live handles).
+        let handle = if let Some(handle) = self.closed_handle_values.pop_front() {
+            handle
+        } else {
+            let handle = self.next_handle;
+            self.next_handle = self.next_handle.saturating_add(4);
+            handle
+        };
         let generation = *self.handle_generations.get(&handle).unwrap_or(&0);
         self.handle_history.insert(handle, object_type);
+        // Keep only recent history for diagnostics; it grows one entry per
+        // handle value ever allocated.
+        if self.handle_history.len() > 1024 {
+            self.handle_history.pop_first();
+        }
         self.handles.insert(
             handle,
             HandleEntry {
@@ -3985,7 +4631,7 @@ pub fn windows_command_line_to_argv(command_line: &str) -> Vec<String> {
                 }
                 '"' => {
                     arg.push_str(&"\\".repeat(backslashes / 2));
-                    if backslashes % 2 == 0 {
+                    if backslashes.is_multiple_of(2) {
                         in_quotes = !in_quotes;
                     } else {
                         arg.push('"');
@@ -4056,16 +4702,34 @@ fn current_ticks(dtm: bool, ticks_ms: u64) -> u64 {
     }
 }
 
-fn paced_sleep_duration_ms(requested_ms: u64, _live_pacing: bool) -> u64 {
-    requested_ms
+fn paced_sleep_duration_ms(requested_ms: u64, live_pacing: bool) -> u64 {
+    if live_pacing {
+        // Real-time pacing: host sleeps the full requested duration so the
+        // guest's Sleep() tracks wall clock.
+        requested_ms
+    } else {
+        // Virtual-clock mode: the guest clock already advanced by the full
+        // amount; only yield briefly so the host stays responsive.
+        requested_ms.min(1)
+    }
 }
 
 fn align_up(value: u64, alignment: u64) -> u64 {
     if alignment == 0 {
         value
     } else {
-        value.div_ceil(alignment) * alignment
+        // Saturate on overflow; callers validate the result with checked_add.
+        value.div_ceil(alignment).saturating_mul(alignment)
     }
+}
+
+/// Host wall-clock time in milliseconds (used for config-save throttling,
+/// independent of the guest virtual clock).
+fn wall_clock_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn format_apartment(model: ApartmentModel) -> &'static str {
@@ -4160,24 +4824,6 @@ fn encode_cp1252(ch: char) -> AppResult<u8> {
     }
 }
 
-trait PipeRequestLen {
-    fn len_hint(&self, default: usize) -> usize;
-}
-
-impl PipeRequestLen for OverlappedRequest {
-    fn len_hint(&self, default: usize) -> usize {
-        default
-    }
-}
-
-fn request_id_len(request: &OverlappedRequest, default: usize) -> usize {
-    request.len_hint(default)
-}
-
-fn request_id_len_inner(_request: &OverlappedRequest) -> usize {
-    0
-}
-
 fn split_find_search_pattern(path: &str) -> (String, String) {
     let trimmed = path.trim_end_matches(['\\', '/']);
     if trimmed.len() < path.len() {
@@ -4212,10 +4858,11 @@ fn windows_pattern_matches(pattern: &str, candidate: &str) -> bool {
     if pattern == "*.*" {
         return true; // correct: *.* matches everything in Windows
     }
-    if let Some(prefix) = pattern.strip_suffix(".*") {
-        if !candidate.contains('.') && windows_pattern_matches(prefix, candidate) {
-            return true; // correct: "foo.*" matches "foo" without extension
-        }
+    if let Some(prefix) = pattern.strip_suffix(".*")
+        && !candidate.contains('.')
+        && windows_pattern_matches(prefix, candidate)
+    {
+        return true; // correct: "foo.*" matches "foo" without extension
     }
     let pattern_chars = pattern.chars().collect::<Vec<_>>();
     let candidate_chars = candidate.chars().collect::<Vec<_>>();
@@ -4265,22 +4912,24 @@ fn find_pattern_char_eq(left: char, right: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        CP_WIN1252, CreationDisposition, FileAccess, IoCompletionPacket, SeekOrigin, ShareMode,
-        WaitStatus, Win32Subsystem, iconv_ffi, paced_sleep_duration_ms, split_find_search_pattern,
-        windows_pattern_matches,
+        CP_WIN1252, CreationDisposition, FileAccess, IoCompletionPacket, MemoryProtection,
+        SeekOrigin, ShareMode, WaitStatus, Win32Subsystem, iconv_ffi, paced_sleep_duration_ms,
+        split_find_search_pattern, windows_pattern_matches,
     };
     use crate::ge::{GameEnvironment, GeArch, RegistryView};
     use std::fs;
 
     #[test]
-    fn paced_sleep_duration_preserves_non_live_requests() {
+    fn paced_sleep_duration_non_live_caps_host_sleep_at_1ms() {
+        // Without live pacing the guest clock drives timing; the host only
+        // yields briefly (0 ms for a zero-length sleep).
         assert_eq!(paced_sleep_duration_ms(0, false), 0);
         assert_eq!(paced_sleep_duration_ms(1, false), 1);
-        assert_eq!(paced_sleep_duration_ms(25, false), 25);
+        assert_eq!(paced_sleep_duration_ms(25, false), 1);
     }
 
     #[test]
-    fn paced_sleep_duration_preserves_live_requests() {
+    fn paced_sleep_duration_live_paces_the_full_duration() {
         assert_eq!(paced_sleep_duration_ms(0, true), 0);
         assert_eq!(paced_sleep_duration_ms(1, true), 1);
         assert_eq!(paced_sleep_duration_ms(8, true), 8);
@@ -4511,11 +5160,12 @@ mod tests {
             win32.close_handle(h).expect("close batch");
         }
 
+        // Closed values are recycled FIFO, so the next allocation reuses the
+        // oldest freed value (h1) — and must carry a fresh generation.
         let (h2, _) = win32.create_event(true, false, false, None);
-        if h2 == h1 {
-            let gen2 = win32.handle_generation(h2).expect("gen2");
-            assert_ne!(gen1, gen2, "recycled handle must get a new generation");
-        }
+        assert_eq!(h2, h1, "oldest closed handle value must be recycled");
+        let gen2 = win32.handle_generation(h2).expect("gen2");
+        assert_ne!(gen1, gen2, "recycled handle must get a new generation");
     }
 
     // ── Synchronization primitive tests ────────────────────────────────
@@ -4689,21 +5339,20 @@ mod tests {
         let (h1, _) = win32.create_event(true, false, false, None);
         let (h2, _) = win32.create_event(true, false, false, None);
 
-        // Timeout returns index = handles.len().saturating_sub(1) = 1 for 2 handles
+        // Timeout carries a `usize::MAX` sentinel, never a handle index.
         assert_eq!(
             win32
                 .wait_for_multiple_objects(&[h1, h2], true, 0, false, None)
                 .expect("wait"),
-            (WaitStatus::Timeout, 1usize),
+            (WaitStatus::Timeout, usize::MAX),
             "wait-all with no objects signalled should time out"
         );
         win32.set_event(h1).expect("set");
-        // Timeout returns index = handles.len().saturating_sub(1) = 1 for 2 handles
         assert_eq!(
             win32
                 .wait_for_multiple_objects(&[h1, h2], true, 0, false, None)
                 .expect("wait"),
-            (WaitStatus::Timeout, 1usize),
+            (WaitStatus::Timeout, usize::MAX),
             "wait-all with only one of two signalled should time out"
         );
         win32.set_event(h2).expect("set");
@@ -4720,6 +5369,39 @@ mod tests {
     }
 
     #[test]
+    fn wait_for_multiple_objects_wait_all_consumes_auto_reset_signals_once() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "wfa-auto", GeArch::X86, "win11-23h2")
+            .expect("create game environment");
+        let mut win32 = Win32Subsystem::new(ge, false);
+
+        // Auto-reset events: the wait-all must peek before consuming,
+        // otherwise the second (destructive) pass could never succeed and
+        // the wait would spin forever.
+        let (h1, _) = win32.create_event(false, false, false, None);
+        let (h2, _) = win32.create_event(false, false, false, None);
+        win32.set_event(h1).expect("set");
+        win32.set_event(h2).expect("set");
+        assert_eq!(
+            win32
+                .wait_for_multiple_objects(&[h1, h2], true, 0, false, None)
+                .expect("wait"),
+            (WaitStatus::Object0, 0usize),
+            "wait-all with both auto-reset events set should succeed"
+        );
+        // Signals were consumed exactly once.
+        assert_eq!(
+            win32
+                .wait_for_single_object(h1, 0, false, None)
+                .expect("wait"),
+            WaitStatus::Timeout,
+            "auto-reset signal should be consumed by the wait-all"
+        );
+        win32.close_handle(h1).expect("close");
+        win32.close_handle(h2).expect("close");
+    }
+
+    #[test]
     fn wait_for_multiple_objects_wait_any() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let ge = GameEnvironment::create_in(temp_dir.path(), "wfany", GeArch::X86, "win11-23h2")
@@ -4729,12 +5411,11 @@ mod tests {
         let (h1, _) = win32.create_event(false, false, false, None);
         let (h2, _) = win32.create_event(false, false, false, None);
 
-        // Timeout returns index = handles.len().saturating_sub(1) = 1 for 2 handles
         assert_eq!(
             win32
                 .wait_for_multiple_objects(&[h1, h2], false, 0, false, None)
                 .expect("wait"),
-            (WaitStatus::Timeout, 1usize),
+            (WaitStatus::Timeout, usize::MAX),
             "wait-any with no objects signalled should time out"
         );
         win32.set_event(h1).expect("set");
@@ -4958,9 +5639,8 @@ mod tests {
     fn code_page_conversion_empty_input() {
         let result = iconv_ffi::convert_to_utf8(CP_WIN1252, &[]);
         // Should return Some("") or None depending on platform
-        match result {
-            Some(s) => assert!(s.is_empty(), "empty input should produce empty output"),
-            None => {} // iconv not available
+        if let Some(s) = result {
+            assert!(s.is_empty(), "empty input should produce empty output");
         }
     }
 
@@ -4989,5 +5669,265 @@ mod tests {
     fn code_page_conversion_unsupported_codepage() {
         let result = iconv_ffi::convert_to_utf8(99999, b"test");
         assert_eq!(result, None, "unsupported code page should return None");
+    }
+
+    // ── Audit regression tests ─────────────────────────────────────────
+
+    #[test]
+    fn read_file_beyond_eof_returns_empty() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "reof", GeArch::X86, "win11-23h2")
+            .expect("create game environment");
+        let mut win32 = Win32Subsystem::new(ge, false);
+        let h = win32
+            .create_file_w(
+                "C:\\beyond_eof.txt",
+                FileAccess::read_write(),
+                ShareMode::all(),
+                CreationDisposition::CreateAlways,
+                false,
+                false,
+                false,
+            )
+            .expect("create file");
+        win32.write_file(h, b"abc").expect("write");
+        win32
+            .set_file_pointer_ex(h, 1000, SeekOrigin::Begin)
+            .expect("seek past EOF");
+        let data = win32.read_file(h, 16).expect("read past EOF");
+        assert!(data.is_empty(), "read past EOF must return zero bytes");
+        win32.close_handle(h).expect("close");
+    }
+
+    #[test]
+    fn write_file_huge_position_never_panics() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "wpos", GeArch::X86, "win11-23h2")
+            .expect("create game environment");
+        let mut win32 = Win32Subsystem::new(ge, false);
+        let h = win32
+            .create_file_w(
+                "C:\\huge_pos.txt",
+                FileAccess::read_write(),
+                ShareMode::all(),
+                CreationDisposition::CreateAlways,
+                false,
+                false,
+                false,
+            )
+            .expect("create file");
+        win32.write_file(h, b"abc").expect("write");
+        let pos = win32
+            .set_file_pointer_ex(h, i64::MAX, SeekOrigin::Begin)
+            .expect("seek to max signed position");
+        assert_eq!(pos, i64::MAX as u64);
+        // Writing at a huge position must either succeed (sparse) or fail
+        // cleanly — never overflow-panic or abort on allocation.
+        let result = win32.write_file(h, b"x");
+        assert!(
+            result.is_ok() || result.is_err(),
+            "write at huge position must not panic"
+        );
+        win32.close_handle(h).expect("close");
+    }
+
+    #[test]
+    fn named_mutex_recreated_after_close() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "nmx", GeArch::X86, "win11-23h2")
+            .expect("create game environment");
+        let mut win32 = Win32Subsystem::new(ge, false);
+        let (h1, existed) = win32.create_named_mutex("Global\\AuditMutex", false, false);
+        assert!(!existed, "first creation must report not-existed");
+        let (h2, existed) = win32.create_named_mutex("Global\\AuditMutex", false, false);
+        assert!(existed, "second creation must report existed");
+        assert_eq!(h1, h2, "re-opening the same name yields the same mutex");
+        win32.close_handle(h1).expect("close");
+        let (h3, existed) = win32.create_named_mutex("Global\\AuditMutex", false, false);
+        assert!(
+            !existed,
+            "name must be reusable after the last handle closes"
+        );
+        // The fresh mutex gets a fresh generation even if the handle value
+        // is recycled, so stale references to the old object are detected.
+        assert_ne!(
+            win32.handle_generation(h3),
+            Some(0),
+            "recreated mutex must carry a fresh generation"
+        );
+        win32.close_handle(h3).expect("close third");
+    }
+
+    #[test]
+    fn open_named_event_returns_existing_handle() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "oev", GeArch::X86, "win11-23h2")
+            .expect("create game environment");
+        let mut win32 = Win32Subsystem::new(ge, false);
+        let (h1, existed) = win32.create_event(true, false, false, Some("Global\\AuditEvent"));
+        assert!(!existed);
+        let h2 = win32
+            .open_named_event("Global\\AuditEvent")
+            .expect("open named event must succeed");
+        assert_ne!(h2, 0, "open must return a real handle");
+        win32.set_event(h2).expect("set via opened handle");
+        assert_eq!(
+            win32.wait_for_single_object(h1, 0, false, None).expect("wait"),
+            WaitStatus::Object0,
+            "opened handle must reference the same event"
+        );
+        win32.close_handle(h1).expect("close");
+        win32.close_handle(h2).expect("close");
+    }
+
+    #[test]
+    fn named_pipe_recreated_after_server_close() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "npipe", GeArch::X86, "win11-23h2")
+            .expect("create game environment");
+        let mut win32 = Win32Subsystem::new(ge, false);
+        let h = win32
+            .create_named_pipe_w(
+                r"\\.\pipe\audit-recreate",
+                0x3,
+                0,
+                1,
+                4096,
+                4096,
+                0,
+                false,
+                None,
+                None,
+            )
+            .expect("create pipe");
+        win32.close_handle(h).expect("close pipe");
+        let h2 = win32
+            .create_named_pipe_w(
+                r"\\.\pipe\audit-recreate",
+                0x3,
+                0,
+                1,
+                4096,
+                4096,
+                0,
+                false,
+                None,
+                None,
+            )
+            .expect("recreate pipe after close");
+        win32.close_handle(h2).expect("close recreated pipe");
+    }
+
+    #[test]
+    fn map_view_of_file_validates_offset_and_size() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "mview", GeArch::X86, "win11-23h2")
+            .expect("create game environment");
+        let mut win32 = Win32Subsystem::new(ge, false);
+        let (section, _) = win32
+            .create_file_mapping_w(
+                Some("Global\\AuditMap"),
+                0x10000,
+                MemoryProtection {
+                    read: true,
+                    write: true,
+                    execute: false,
+                },
+                false,
+            )
+            .expect("create mapping");
+        assert!(
+            win32.map_view_of_file(section, 0x20000, 0x1000).is_err(),
+            "offset beyond the section must fail"
+        );
+        let base = win32
+            .map_view_of_file(section, 0x1000, 0x1000)
+            .expect("map view at offset");
+        assert!(
+            win32.mapped_view_section(base).is_some(),
+            "mapped view must be tied to the section backing"
+        );
+        // Absurd sizes clamp to the section and must not panic.
+        assert!(
+            win32.map_view_of_file(section, 0, usize::MAX).is_ok(),
+            "huge map size must clamp to the section, not panic"
+        );
+        win32.unmap_view_of_file(base).expect("unmap");
+        assert!(
+            win32.unmap_view_of_file(base).is_err(),
+            "double unmap must fail"
+        );
+        win32.close_handle(section).expect("close section");
+    }
+
+    #[test]
+    fn heap_alloc_reuses_freed_blocks() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "hfree", GeArch::X86, "win11-23h2")
+            .expect("create game environment");
+        let mut win32 = Win32Subsystem::new(ge, false);
+        let heap = win32.heap_create(16, false);
+        let first = win32.heap_alloc(heap, 100).expect("alloc");
+        win32.heap_free(heap, first).expect("free");
+        let second = win32.heap_alloc(heap, 100).expect("alloc again");
+        assert_eq!(
+            first, second,
+            "freed block must be reused instead of growing the high-water mark"
+        );
+        win32.heap_destroy(heap).expect("destroy heap");
+    }
+
+    #[test]
+    fn get_temp_file_name_w_is_unique_across_consecutive_calls() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "tname", GeArch::X86, "win11-23h2")
+            .expect("create game environment");
+        let mut win32 = Win32Subsystem::new(ge, false);
+        let first = win32.get_temp_file_name_w("", "CASA").expect("first name");
+        let second = win32.get_temp_file_name_w("", "CASA").expect("second name");
+        assert_ne!(first, second, "consecutive temp names must be unique");
+    }
+
+    #[test]
+    fn tls_slots_are_reused_after_free() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "tls", GeArch::X86, "win11-23h2")
+            .expect("create game environment");
+        let mut win32 = Win32Subsystem::new(ge, false);
+        let first = win32.tls_alloc();
+        let second = win32.tls_alloc();
+        assert_ne!(first, second);
+        win32.tls_free(first);
+        assert_eq!(first, win32.tls_alloc(), "freed slot must be reused");
+    }
+
+    #[test]
+    fn wait_for_single_object_honors_finite_timeout() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "wto-finite", GeArch::X86, "win11-23h2")
+            .expect("create game environment");
+        let mut win32 = Win32Subsystem::new(ge, false);
+        let (h, _) = win32.create_event(true, false, false, None);
+        // A finite wait must block (polling) until the signal arrives rather
+        // than returning an instant spurious Timeout.
+        win32.set_event(h).expect("set");
+        assert_eq!(
+            win32
+                .wait_for_single_object(h, 5000, false, None)
+                .expect("wait"),
+            WaitStatus::Object0,
+            "signalled event must satisfy a finite-timeout wait"
+        );
+        win32.reset_event(h).expect("reset");
+        // A tiny finite timeout on an unsignalled object returns Timeout
+        // after honoring the deadline (1 ms poll + deadline check).
+        assert_eq!(
+            win32
+                .wait_for_single_object(h, 1, false, None)
+                .expect("wait"),
+            WaitStatus::Timeout,
+            "unsignalled event must time out after a finite wait"
+        );
+        win32.close_handle(h).expect("close");
     }
 }
