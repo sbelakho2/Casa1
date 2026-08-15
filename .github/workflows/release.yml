@@ -79,6 +79,7 @@ jobs:
       - check-reproducible
       - release-smoke-tests
       - check-checklist-gate
+      - audit-release-entitlements
     if: always()
     steps:
       - name: Evaluate checklist results
@@ -89,7 +90,7 @@ jobs:
           for job in check-compile check-format check-clippy check-tests \
                      check-no-insecure-tls check-dependency-audit \
                      check-licenses check-reproducible release-smoke-tests \
-                     check-checklist-gate; do
+                     check-checklist-gate audit-release-entitlements; do
             STATUS=""
             case "$job" in
               check-compile)           STATUS="${{ needs.check-compile.result }}" ;;
@@ -102,6 +103,7 @@ jobs:
               check-reproducible)      STATUS="${{ needs.check-reproducible.result }}" ;;
               release-smoke-tests)     STATUS="${{ needs.release-smoke-tests.result }}" ;;
               check-checklist-gate)    STATUS="${{ needs.check-checklist-gate.result }}" ;;
+              audit-release-entitlements) STATUS="${{ needs.audit-release-entitlements.result }}" ;;
             esac
 
             if [ "$STATUS" = "success" ]; then
@@ -154,7 +156,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run reproducibility check
-        run: ./ci/check_reproducible.sh --skip-clean
+        run: ./ci/check_reproducible.sh
 
   release-smoke-tests:
     name: Release Smoke Tests
@@ -173,3 +175,13 @@ jobs:
       - uses: actions/checkout@v4
       - name: Verify all checklist items are checked
         run: ./ci/check_release_gate.sh
+
+  audit-release-entitlements:
+    name: Audit Release Entitlements
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build, sign, and audit release binaries
+        run: ./ci/audit_release_entitlements.sh

@@ -22,11 +22,11 @@ fail() { echo "!! $*" >&2; }
 
 # ── Dependency count ──────────────────────────────────────────────────────────
 info "Counting total dependencies (direct + transitive) ..."
-DEP_COUNT="$(cargo metadata --format-version 1 --no-deps 2>/dev/null \
+DEP_COUNT="$(cargo metadata --format-version 1 2>/dev/null \
   | python3 -c "import json,sys; m=json.load(sys.stdin); print(len(m.get('packages',[])))" 2>/dev/null || true)"
 
 if [[ -n "$DEP_COUNT" ]]; then
-  info "Total direct dependencies: $DEP_COUNT"
+  info "Total dependencies (direct + transitive): $DEP_COUNT"
 else
   info "Could not determine dependency count (cargo metadata issue)"
 fi
@@ -34,7 +34,7 @@ fi
 # ── cargo audit ───────────────────────────────────────────────────────────────
 if command -v cargo-audit &>/dev/null || cargo audit --version &>/dev/null 2>&1; then
   info "Running cargo audit for known vulnerabilities ..."
-  if cargo audit --ignore RUSTSEC-2024-0370 2>&1; then
+  if cargo audit 2>&1; then
     PASS=$((PASS + 1))
     info "cargo audit — OK (no vulnerabilities found)"
   else

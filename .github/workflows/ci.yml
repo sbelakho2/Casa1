@@ -96,8 +96,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Count compiler warnings
         run: |
-          WARNING_COUNT=$(cargo check --all-targets 2>&1 | grep -c "^warning:" || true)
+          LOG_FILE=$(mktemp)
+          WARNING_COUNT=$(cargo check --all-targets 2>&1 | tee "$LOG_FILE" | grep -c "^warning:" || true)
           echo "Compiler warning count: $WARNING_COUNT"
           if [ "$WARNING_COUNT" -gt 0 ]; then
-            echo "::warning::$WARNING_COUNT compiler warnings detected"
+            echo "::error::$WARNING_COUNT compiler warnings detected — fix them before merging"
+            grep "^warning:" "$LOG_FILE" | head -20 || true
+            rm -f "$LOG_FILE"
+            exit 1
           fi
+          rm -f "$LOG_FILE"
