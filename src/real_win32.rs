@@ -34,8 +34,6 @@ pub struct ComApartmentState {
     registered_factories: BTreeMap<u32, RegisteredFactoryEntry>,
     /// Next registration token value.
     next_token: u32,
-    /// Out-of-process COM server child processes (EXE-based COM servers).
-    com_exe_servers: Vec<std::process::Child>,
 }
 
 /// COM threading model for apartments.
@@ -1089,6 +1087,15 @@ impl TaskbarListObject {
     /// Delete a tab from the taskbar.
     pub fn delete_tab(&mut self, hwnd: u64) {
         self.tabs.retain(|&t| t != hwnd);
+        // Prune per-HWND state so a guest cycling bogus handles cannot grow
+        // the side maps without bound.
+        self.progress_values.remove(&hwnd);
+        self.progress_states.remove(&hwnd);
+        self.overlay_icons.remove(&hwnd);
+        self.thumbnail_tooltips.remove(&hwnd);
+        if self.active_tab == Some(hwnd) {
+            self.active_tab = None;
+        }
     }
 
     /// Activate a tab.
@@ -1103,22 +1110,47 @@ impl TaskbarListObject {
 
     /// Set progress value for a tab (0-1000).
     pub fn set_progress_value(&mut self, hwnd: u64, value: u32) {
-        self.progress_values.insert(hwnd, value.min(1000));
+        if self.track_new_hwnd(hwnd) {
+            self.progress_values.insert(hwnd, value.min(1000));
+        }
     }
 
     /// Set progress state for a tab.
     pub fn set_progress_state(&mut self, hwnd: u64, state: u32) {
-        self.progress_states.insert(hwnd, state);
+        if self.track_new_hwnd(hwnd) {
+            self.progress_states.insert(hwnd, state);
+        }
     }
 
     /// Set overlay icon for a tab.
     pub fn set_overlay_icon(&mut self, hwnd: u64, icon: u64) {
-        self.overlay_icons.insert(hwnd, icon);
+        if self.track_new_hwnd(hwnd) {
+            self.overlay_icons.insert(hwnd, icon);
+        }
     }
 
     /// Set thumbnail tooltip for a tab.
     pub fn set_thumbnail_tooltip(&mut self, hwnd: u64, tip: String) {
-        self.thumbnail_tooltips.insert(hwnd, tip);
+        if self.track_new_hwnd(hwnd) {
+            self.thumbnail_tooltips.insert(hwnd, tip);
+        }
+    }
+
+    /// Bound the number of tracked HWNDs so guest-supplied bogus handles
+    /// cannot grow the per-HWND maps without limit.
+    fn track_new_hwnd(&mut self, hwnd: u64) -> bool {
+        const MAX_TRACKED_HWNDS: usize = 1024;
+        if self.tabs.contains(&hwnd) || self.progress_values.contains_key(&hwnd) {
+            return true;
+        }
+        let tracked = self.progress_values.len();
+        if tracked >= MAX_TRACKED_HWNDS {
+            eprintln!(
+                "[RealWin32] TaskbarList: tracked HWND limit ({MAX_TRACKED_HWNDS}) reached; ignoring {hwnd:#x}"
+            );
+            return false;
+        }
+        true
     }
 
     /// Is the taskbar list initialized?
@@ -1162,18 +1194,24 @@ pub const MIN_PIDL_SIZE: usize = 4;
 ///   [total_size: u16][item1_size: u16][item1_data...][itemN_size: u16][itemN_data...][0x0000]
 ///
 /// For simplicity, we store the UTF-16 path as a single item.
-pub fn pidl_from_path(path: &std::path::Path) -> Vec<u16> {
+/// Returns `None` if the path is too long to fit in a PIDL (u16 size fields).
+pub fn pidl_from_path(path: &std::path::Path) -> Option<Vec<u16>> {
     let wide: Vec<u16> = path.to_string_lossy().encode_utf16().collect();
     let item_data_len = wide.len();
     let item_size = 2 + item_data_len * 2; // size_u16 + data in bytes
-    let total_size = (2 + item_size + 2) as u16; // total_size + item + terminator
-    let mut pidl = Vec::with_capacity(total_size as usize / 2);
-    pidl.push(total_size);
+    let total_size = 2 + item_size + 2; // total_size + item + terminator
+    if item_size > u16::MAX as usize || total_size > u16::MAX as usize {
+        // A path this long cannot be represented in a PIDL; fail rather
+        // than silently truncating the size fields into a malformed PIDL.
+        return None;
+    }
+    let mut pidl = Vec::with_capacity(total_size / 2);
+    pidl.push(total_size as u16);
     pidl.push(item_size as u16);
     pidl.extend_from_slice(&wide);
     pidl.push(0); // null terminator for item
     pidl.push(0); // null terminator for PIDL
-    pidl
+    Some(pidl)
 }
 
 /// Extract the path from a PIDL.
@@ -1215,6 +1253,18 @@ pub fn pidl_eq(a: &[u16], b: &[u16]) -> bool {
     a == b
 }
 
+/// Whether `name` is a plain file name (no path separators, no `.`/`..`,
+/// not absolute). Used to prevent guest-controlled rename targets from
+/// escaping a parent directory.
+fn is_plain_file_name(name: &str) -> bool {
+    if name.is_empty() || name == "." || name == ".." {
+        return false;
+    }
+    let path = std::path::Path::new(name);
+    path.file_name()
+        .is_some_and(|f| f == std::ffi::OsStr::new(name))
+}
+
 /// Get the display name of a PIDL (just the filename component).
 pub fn pidl_display_name(pidl: &[u16]) -> String {
     if let Some(path) = pidl_to_path(pidl) {
@@ -1245,7 +1295,7 @@ pub struct ShellFolder {
 impl ShellFolder {
     /// Create a new ShellFolder for the given path.
     pub fn new(path: std::path::PathBuf) -> Self {
-        let pidl = pidl_from_path(&path);
+        let pidl = pidl_from_path(&path).unwrap_or_default();
         let entries = Self::list_entries(&path);
         Self {
             path,
@@ -1257,7 +1307,7 @@ impl ShellFolder {
 
     /// Create a ShellFolder with a parent.
     pub fn with_parent(path: std::path::PathBuf, parent: ShellFolder) -> Self {
-        let pidl = pidl_from_path(&path);
+        let pidl = pidl_from_path(&path).unwrap_or_default();
         let entries = Self::list_entries(&path);
         Self {
             path,
@@ -1299,11 +1349,21 @@ impl ShellFolder {
     }
 
     /// IShellFolder::EnumObjects — enumerate child items.
-    pub fn enum_objects(&self) -> EnumIdList {
+    ///
+    /// Lazily loads the entry list if this folder was created without one
+    /// (e.g. via [`bind_to_object`]) so that directory reads are deferred
+    /// until actually needed.
+    pub fn enum_objects(&mut self) -> EnumIdList {
+        if self.entries.is_empty() {
+            self.refresh();
+        }
         EnumIdList::new(self.entries.clone(), self.path.clone())
     }
 
     /// IShellFolder::BindToObject — navigate into a subfolder by PIDL.
+    ///
+    /// The child folder's entry list is loaded lazily on first enumeration
+    /// instead of re-reading the whole directory here.
     pub fn bind_to_object(&self, pidl: &[u16]) -> Option<ShellFolder> {
         let child_path = pidl_to_path(pidl)?;
         // Resolve relative to this folder if the path is not absolute
@@ -1313,14 +1373,18 @@ impl ShellFolder {
             self.path.join(&child_path)
         };
         if full_path.is_dir() {
-            let mut folder = ShellFolder::new(full_path);
-            folder.parent = Some(Box::new(ShellFolder {
-                path: self.path.clone(),
-                pidl: self.pidl.clone(),
-                parent: None,
+            let pidl = pidl_from_path(&full_path).unwrap_or_default();
+            Some(ShellFolder {
+                path: full_path,
+                pidl,
+                parent: Some(Box::new(ShellFolder {
+                    path: self.path.clone(),
+                    pidl: self.pidl.clone(),
+                    parent: None,
+                    entries: Vec::new(),
+                })),
                 entries: Vec::new(),
-            }));
-            Some(folder)
+            })
         } else {
             None
         }
@@ -1345,7 +1409,7 @@ impl ShellFolder {
             self.path.join(display_name)
         };
         if target.exists() {
-            Some(pidl_from_path(&target))
+            pidl_from_path(&target)
         } else {
             None
         }
@@ -1353,6 +1417,11 @@ impl ShellFolder {
 
     /// IShellFolder::SetNameOf — rename a PIDL item.
     pub fn set_name_of(&mut self, _pidl: &[u16], new_name: &str) -> Option<Vec<u16>> {
+        // Reject names that could escape this folder (absolute paths or
+        // `..` components) — the name must be a plain file name.
+        if !is_plain_file_name(new_name) {
+            return None;
+        }
         let child_path = pidl_to_path(_pidl)?;
         let full_path = if child_path.is_absolute() {
             child_path
@@ -1362,7 +1431,7 @@ impl ShellFolder {
         let new_path = self.path.join(new_name);
         if std::fs::rename(&full_path, &new_path).is_ok() {
             self.refresh();
-            Some(pidl_from_path(&new_path))
+            pidl_from_path(&new_path)
         } else {
             None
         }
@@ -1395,13 +1464,6 @@ impl EnumIdList {
         self.index = self.index.saturating_add(count).min(self.entries.len());
     }
 
-    /// Get the next item's PIDL.
-    pub fn next(&mut self) -> Option<Vec<u16>> {
-        let entry = self.entries.get(self.index)?;
-        self.index += 1;
-        Some(pidl_from_path(entry))
-    }
-
     /// Get the current count of remaining items.
     pub fn remaining(&self) -> usize {
         self.entries.len().saturating_sub(self.index)
@@ -1414,6 +1476,17 @@ impl EnumIdList {
             parent_path: self.parent_path.clone(),
             index: self.index,
         }
+    }
+}
+
+impl Iterator for EnumIdList {
+    type Item = Vec<u16>;
+
+    /// Get the next item's PIDL.
+    fn next(&mut self) -> Option<Vec<u16>> {
+        let entry = self.entries.get(self.index)?;
+        self.index += 1;
+        pidl_from_path(entry)
     }
 }
 
@@ -1444,7 +1517,7 @@ impl ShellFolderObject {
 
     /// IShellFolder::EnumObjects — get an enumerator for child items.
     pub fn enum_objects(&self) -> EnumIdList {
-        let inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
         inner.enum_objects()
     }
 
@@ -1452,7 +1525,6 @@ impl ShellFolderObject {
     pub fn bind_to_object(&self, pidl: &[u16]) -> Option<ShellFolderObject> {
         let inner = self.inner.lock().unwrap();
         inner.bind_to_object(pidl).map(|child| {
-            let _child_pidl = child.pidl.clone();
             ShellFolderObject {
                 clsid: self.clsid,
                 supported: self.supported.clone(),
@@ -1521,7 +1593,7 @@ pub fn sh_get_path_from_id_list_w(pidl: &[u16]) -> String {
 
 /// ILCreateFromPathW — create a PIDL from a filesystem path.
 pub fn il_create_from_path_w(path: &std::path::Path) -> Vec<u16> {
-    pidl_from_path(path)
+    pidl_from_path(path).unwrap_or_default()
 }
 
 /// SHBrowseForFolderW — open a native folder picker dialog via
@@ -1535,17 +1607,17 @@ pub fn sh_browse_for_folder_w(title: &str) -> Option<Vec<u16>> {
         let cls = match objc::runtime::Class::get("NSOpenPanel") {
             Some(c) => c,
             None => {
-                // Fallback: return Desktop PIDL if we can't show dialog
-                return Some(pidl_from_path(&ShellFolder::desktop().path));
+                // No dialog available — treat as cancelled.
+                return None;
             }
         };
         let panel: *mut objc::runtime::Object = objc::msg_send![cls, openPanel];
         if panel.is_null() {
-            return Some(pidl_from_path(&ShellFolder::desktop().path));
+            return None;
         }
-        let title_bytes = title.as_bytes();
+        let title_cstr = cstring_lossy(title);
         let title_ns: *mut objc::runtime::Object =
-            objc::msg_send![class!(NSString), stringWithUTF8String: title_bytes.as_ptr()];
+            objc::msg_send![class!(NSString), stringWithUTF8String: title_cstr.as_ptr()];
         let _: () = objc::msg_send![panel, setTitle: title_ns];
         let can_choose: u8 = 1;
         let _: () = objc::msg_send![panel, setCanChooseFiles: can_choose];
@@ -1564,17 +1636,30 @@ pub fn sh_browse_for_folder_w(title: &str) -> Option<Vec<u16>> {
                     let path = std::ffi::CStr::from_ptr(cstr)
                         .to_string_lossy()
                         .into_owned();
-                    return Some(pidl_from_path(&std::path::PathBuf::from(path)));
+                    return pidl_from_path(&std::path::PathBuf::from(path));
                 }
             }
         }
-        Some(pidl_from_path(&ShellFolder::desktop().path))
+        // Cancelled (or no selectable result) — None, not the Desktop.
+        None
     }
 
     #[cfg(not(target_os = "macos"))]
     {
-        // title is unused in the macOS implementation
-        Some(pidl_from_path(&ShellFolder::desktop().path))
+        // No native dialog available — treat as cancelled.
+        let _ = title;
+        None
+    }
+}
+
+/// Build a NUL-terminated C string from a guest-supplied string, replacing
+/// interior NUL bytes lossily so the result is always a valid C string.
+fn cstring_lossy(s: &str) -> std::ffi::CString {
+    if s.as_bytes().contains(&0) {
+        std::ffi::CString::new(s.replace('\0', "\u{FFFD}")).unwrap_or_default()
+    } else {
+        // SAFETY: checked above that the string contains no interior NULs.
+        unsafe { std::ffi::CString::from_vec_unchecked(s.as_bytes().to_vec()) }
     }
 }
 
@@ -1628,6 +1713,10 @@ impl ShellView {
 
     /// IShellView::CreateViewWindow — create an NSView that displays folder
     /// contents using TextLayer items for a simple list view.
+    ///
+    /// `parent_handle` is a guest-controlled handle that cannot be validated
+    /// as an Objective-C object from this module, so no messages are ever
+    /// sent to it; the view is created standalone with a fixed frame.
     pub fn create_view_window(&mut self, parent_handle: u64) -> u64 {
         self.parent_handle = parent_handle;
         self.active = true;
@@ -1635,6 +1724,14 @@ impl ShellView {
         #[cfg(target_os = "macos")]
         // SAFETY: Objective-C FFI for Win32 API shims on macOS
         unsafe {
+            // Release any previously created view before creating a new one
+            // so repeated CreateViewWindow calls cannot leak NSViews.
+            if self.view_handle != 0 {
+                let old_view = self.view_handle as *mut objc::runtime::Object;
+                let _: () = objc::msg_send![old_view, removeFromSuperview];
+                let _: () = objc::msg_send![old_view, release];
+                self.view_handle = 0;
+            }
             let nsview_class = match objc::runtime::Class::get("NSView") {
                 Some(c) => c,
                 None => return 0,
@@ -1643,18 +1740,22 @@ impl ShellView {
             if view.is_null() {
                 return 0;
             }
-            let parent: *mut objc::runtime::Object =
-                std::mem::transmute(parent_handle as *mut objc::runtime::Object);
-            let parent_frame: CGRect = objc::msg_send![parent, frame];
+            let view_frame = CGRect {
+                origin: CGPoint { x: 0.0, y: 0.0 },
+                size: CGSize {
+                    width: 800.0,
+                    height: 600.0,
+                },
+            };
             let view: *mut objc::runtime::Object =
-                objc::msg_send![view, initWithFrame: parent_frame];
+                objc::msg_send![view, initWithFrame: view_frame];
             if view.is_null() {
                 return 0;
             }
 
             // Add file name text layers
             if let Some(text_layer_class) = objc::runtime::Class::get("CATextLayer") {
-                let mut y_offset = parent_frame.size.height as f64 - 30.0;
+                let mut y_offset = view_frame.size.height - 30.0;
                 for entry in &self.entries {
                     let fname = entry
                         .file_name()
@@ -1663,8 +1764,8 @@ impl ShellView {
                     let layer: *mut objc::runtime::Object =
                         objc::msg_send![text_layer_class, layer];
                     if !layer.is_null() {
-                        let fname_bytes = fname.as_bytes();
-                        let string: *mut objc::runtime::Object = objc::msg_send![class!(NSString), stringWithUTF8String: fname_bytes.as_ptr()];
+                        let fname_cstr = cstring_lossy(&fname);
+                        let string: *mut objc::runtime::Object = objc::msg_send![class!(NSString), stringWithUTF8String: fname_cstr.as_ptr()];
                         let _: () = objc::msg_send![layer, setString: string];
                         // Set font size
                         let sys_font: *mut objc::runtime::Object =
@@ -1677,7 +1778,7 @@ impl ShellView {
                                 y: y_offset,
                             },
                             size: CGSize {
-                                width: parent_frame.size.width as f64 - 20.0,
+                                width: view_frame.size.width - 20.0,
                                 height: 20.0,
                             },
                         };
@@ -1690,7 +1791,6 @@ impl ShellView {
                 }
             }
 
-            let _: () = objc::msg_send![parent, addSubview: view];
             self.view_handle = view as u64;
             self.view_handle
         }
@@ -1708,8 +1808,7 @@ impl ShellView {
         // SAFETY: Objective-C FFI for Win32 API shims on macOS
         unsafe {
             if self.view_handle != 0 {
-                let view: *mut objc::runtime::Object =
-                    std::mem::transmute(self.view_handle as *mut objc::runtime::Object);
+                let view = self.view_handle as *mut objc::runtime::Object;
                 let hidden: u8 = if activate { 0 } else { 1 };
                 let _: () = objc::msg_send![view, setHidden: hidden];
             }
@@ -1733,8 +1832,7 @@ impl ShellView {
         // SAFETY: Objective-C FFI for Win32 API shims on macOS
         unsafe {
             if self.view_handle != 0 {
-                let view: *mut objc::runtime::Object =
-                    std::mem::transmute(self.view_handle as *mut objc::runtime::Object);
+                let view = self.view_handle as *mut objc::runtime::Object;
                 let _: () = objc::msg_send![view, removeFromSuperview];
                 let _: () = objc::msg_send![view, release];
                 self.view_handle = 0;
@@ -1918,13 +2016,18 @@ impl DropTargetImpl {
 }
 
 /// RegisterDragDrop — associates an IDropTarget with a window handle.
-pub fn register_drag_drop(window_handle: u64, _target: DropTargetImpl) -> u32 {
+///
+/// The caller's `target` (including its drag data and state) is stored
+/// as-is; a fresh empty target is never substituted.
+pub fn register_drag_drop(window_handle: u64, target: DropTargetImpl) -> u32 {
+    if window_handle == 0 {
+        return 0x8007_0057; // E_INVALIDARG
+    }
     let mut targets = GLOBAL_DROP_TARGETS.lock().unwrap();
     if targets.contains_key(&window_handle) {
         return 0x8004_0001; // DRAGDROP_E_ALREADYREGISTERED
     }
-    let impl_ = DropTargetImpl::new(window_handle);
-    targets.insert(window_handle, impl_);
+    targets.insert(window_handle, target);
     eprintln!(
         "[RealWin32] register_drag_drop: window={:#x} registered",
         window_handle
@@ -1947,28 +2050,16 @@ pub fn revoke_drag_drop(window_handle: u64) -> u32 {
 }
 
 /// DoDragDrop — initiates a drag operation.
+///
+/// On macOS, this would use NSDraggingSession. Until that is implemented,
+/// the drag is reported as cancelled (DROPEFFECT_NONE) and no pasteboard
+/// side effects are performed.
 pub fn do_drag_drop(_data: DragData, _allowed_effects: u32) -> u32 {
-    // On macOS, this would use NSDraggingSession.
-    // For now, return DROPEFFECT_NONE to indicate the drag completed
-    // without a drop action (cancelled).
-    //
     // In a full implementation, we would:
     // 1. Create an NSDraggingItem with the data
     // 2. Start a dragging session via NSView's beginDraggingSessionWithItems
     // 3. Run the modal drag loop
     // 4. Return the drop effect
-
-    #[cfg(target_os = "macos")]
-    // SAFETY: Objective-C FFI for Win32 API shims on macOS
-    unsafe {
-        // Placeholder: create a pasteboard-based drag
-        let drag_pboard_name: *mut objc::runtime::Object = objc::msg_send![class!(NSString), stringWithUTF8String: "NSDragPboard\0".as_ptr() as *const i8];
-        let pb: *mut objc::runtime::Object =
-            objc::msg_send![class!(NSPasteboard), pasteboardWithName: drag_pboard_name];
-        let _: () = objc::msg_send![pb, declareTypes: std::ptr::null::<objc::runtime::Object>() owner: std::ptr::null::<objc::runtime::Object>()];
-        // In a real implementation, we'd set pasteboard data and begin session
-    }
-
     DROPEFFECT_NONE
 }
 
@@ -2379,7 +2470,8 @@ impl PropertyStore {
                 let item: *mut objc::runtime::Object = objc::msg_send![cls, alloc];
                 let item: *mut objc::runtime::Object = objc::msg_send![item, initWithPath: nsstr];
                 if !item.is_null() {
-                    let authors_key: *mut objc::runtime::Object = objc::msg_send![class!(NSString), stringWithUTF8String: "kMDItemAuthors\0".as_ptr()];
+                    let authors_key: *mut objc::runtime::Object =
+                        objc::msg_send![class!(NSString), stringWithUTF8String: c"kMDItemAuthors".as_ptr()];
                     let authors: *mut objc::runtime::Object =
                         objc::msg_send![item, valueForAttribute: authors_key];
                     if !authors.is_null() {
@@ -2425,21 +2517,25 @@ impl PropertyStore {
     pub fn commit(&mut self) -> AppResult<()> {
         // Apply pending changes that can be written to the filesystem
         for (key, value) in self.pending_changes.drain() {
-            // For now, only PKEY_TITLE can be written (rename)
-            if key == property_keys::PKEY_TITLE {
-                if let PropVariant::LPWStr(new_name) = &value {
-                    let parent = self
-                        .target_path
-                        .parent()
-                        .unwrap_or(std::path::Path::new("/"));
-                    let new_path = parent.join(new_name);
-                    if let Err(e) = std::fs::rename(&self.target_path, &new_path) {
-                        eprintln!(
-                            "[RealWin32] PropertyStore::set_name: failed to rename '{}' to '{}': {e}",
-                            self.target_path.display(),
-                            new_path.display(),
-                        );
-                    }
+            // For now, only PKEY_TITLE can be written (rename). Only accept
+            // plain file names so a guest-supplied rename target cannot
+            // escape the parent directory.
+            if key == property_keys::PKEY_TITLE
+                && let PropVariant::LPWStr(new_name) = &value
+                && is_plain_file_name(new_name)
+            {
+                let parent = self
+                    .target_path
+                    .parent()
+                    .unwrap_or(std::path::Path::new("/"));
+                let new_path = parent.join(new_name);
+                if let Err(e) = std::fs::rename(&self.target_path, &new_path) {
+                    eprintln!(
+                        "[RealWin32] PropertyStore::set_name: failed to rename '{}' to '{}': {e}",
+                        self.target_path.display(),
+                        new_path.display(),
+                    );
+                } else {
                     self.target_path = new_path;
                 }
             }
@@ -2456,12 +2552,11 @@ impl PropertyStore {
 
     /// IPropertyStore::GetAt — get property key by index.
     pub fn get_at(&self, index: u32) -> Option<PropertyKey> {
-        let all_keys: Vec<&PropertyKey> = self
-            .properties
+        self.properties
             .keys()
             .chain(self.pending_changes.keys())
-            .collect();
-        all_keys.get(index as usize).copied().copied()
+            .nth(index as usize)
+            .copied()
     }
 }
 
@@ -2541,7 +2636,6 @@ impl DeltaTree {
             removed_nodes: Vec::new(),
         }
     }
-
     pub fn record_text_change(&mut self, xpath: String, old_text: String, new_text: String) {
         self.text_changes.push((xpath, old_text, new_text));
     }
@@ -2552,6 +2646,12 @@ impl DeltaTree {
 
     pub fn record_removal(&mut self, xpath: String) {
         self.removed_nodes.push(xpath);
+    }
+}
+
+impl Default for DeltaTree {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -2572,25 +2672,13 @@ pub struct XmlDomDocument {
 }
 
 /// IXMLDOMParseError.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct XmlDomParseError {
     pub error_code: i32,
     pub reason: String,
     pub line: u32,
     pub linepos: u32,
     pub src_text: String,
-}
-
-impl Default for XmlDomParseError {
-    fn default() -> Self {
-        Self {
-            error_code: 0,
-            reason: String::new(),
-            line: 0,
-            linepos: 0,
-            src_text: String::new(),
-        }
-    }
 }
 
 impl XmlDomDocument {
@@ -2603,6 +2691,15 @@ impl XmlDomDocument {
             delta: DeltaTree::new(),
         }
     }
+}
+
+impl Default for XmlDomDocument {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl XmlDomDocument {
 
     /// IXMLDOMDocument::loadXML — parse an XML string.
     pub fn load_xml(&mut self, xml: &str) -> bool {
@@ -2731,20 +2828,44 @@ impl XmlDomDocument {
         // For a minimal XSLT transform, extract text content from matched nodes.
         // Real XSLT is complex; this provides a simplified implementation
         // that handles common patterns like <xsl:value-of select="..."/>.
-        if let Ok(_style_doc) = roxmltree::Document::parse(stylesheet) {
-            if let Ok(xml_doc) = roxmltree::Document::parse(&self.xml_string) {
-                // Basic transform: return concatenated text of all elements
-                let parts: Vec<String> = xml_doc
-                    .descendants()
-                    .filter(|n| n.is_element())
-                    .filter_map(|n| n.text())
-                    .map(|t| t.to_string())
-                    .collect();
-                return parts.join("");
-            }
+        if let (Ok(_style_doc), Ok(xml_doc)) = (
+            roxmltree::Document::parse(stylesheet),
+            roxmltree::Document::parse(&self.xml_string),
+        ) {
+            // Basic transform: return concatenated text of all elements
+            let parts: Vec<String> = xml_doc
+                .descendants()
+                .filter(|n| n.is_element())
+                .filter_map(|n| n.text())
+                .map(|t| t.to_string())
+                .collect();
+            return parts.join("");
         }
         String::new()
     }
+}
+
+/// Maximum nesting depth when serialising an XML tree. Guards against
+/// stack overflow on deeply nested guest-supplied documents.
+const MAX_SERIALISE_DEPTH: usize = 256;
+
+/// Escape text/attribute values for inclusion in XML output.
+fn escape_xml(s: &str) -> String {
+    if !s.bytes().any(|b| matches!(b, b'&' | b'<' | b'>' | b'"' | b'\'')) {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// Helper: serialise a roxmltree node as an XML string fragment.
@@ -2755,6 +2876,9 @@ fn node_to_string(node: &roxmltree::Node) -> String {
 }
 
 fn serialise_node(node: &roxmltree::Node, out: &mut String, depth: usize) {
+    if depth > MAX_SERIALISE_DEPTH {
+        return;
+    }
     match node.node_type() {
         roxmltree::NodeType::Root => {
             for child in node.children() {
@@ -2770,7 +2894,7 @@ fn serialise_node(node: &roxmltree::Node, out: &mut String, depth: usize) {
                 out.push(' ');
                 out.push_str(attr.name());
                 out.push_str("=\"");
-                out.push_str(attr.value());
+                out.push_str(&escape_xml(attr.value()));
                 out.push('"');
             }
             let has_children = node.children().any(|c| {
@@ -2794,14 +2918,14 @@ fn serialise_node(node: &roxmltree::Node, out: &mut String, depth: usize) {
         }
         roxmltree::NodeType::Text => {
             if let Some(text) = node.text() {
-                out.push_str(text);
+                out.push_str(&escape_xml(text));
             }
         }
         roxmltree::NodeType::Comment => {
-            // Skip comments in output
+            // Comments are intentionally dropped from the serialised output.
         }
         roxmltree::NodeType::PI => {
-            // Skip processing instructions
+            // Processing instructions are intentionally dropped.
         }
     }
 }
@@ -2925,6 +3049,10 @@ impl ComObject for XmlDomDocumentObject {
 // Phase L7: MSHTML/Trident — HTML Rendering via WKWebView
 // ===========================================================================
 
+/// Cap on accumulated HTML content from `write`/`writeln` (bounds host
+/// memory growth from guest-controlled writes).
+const MAX_HTML_CONTENT: usize = 8 * 1024 * 1024;
+
 /// MSHTML Document — backed by WKWebView for HTML rendering.
 ///
 /// Uses WebKit's WKWebView via the objc runtime to render HTML content
@@ -2967,6 +3095,15 @@ impl MsHtmlDocument {
             scroll: true,
         }
     }
+}
+
+impl Default for MsHtmlDocument {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MsHtmlDocument {
 
     /// Create a WKWebView for rendering.
     pub fn create_webview(&mut self) -> u64 {
@@ -3002,6 +3139,9 @@ impl MsHtmlDocument {
                 let _: () = objc::msg_send![config, release];
                 return 0;
             }
+            // The webview retains the configuration; release our own
+            // reference so the configuration does not leak.
+            let _: () = objc::msg_send![config, release];
             self.webview_handle = wv as u64;
             self.webview_handle
         }
@@ -3012,14 +3152,39 @@ impl MsHtmlDocument {
     }
 
     /// IHTMLDocument2::write — write HTML to the document.
+    ///
+    /// The accumulated content is capped so guest-controlled writes cannot
+    /// grow host memory without bound.
     pub fn write(&mut self, html: &str) {
-        self.html_content.push_str(html);
+        self.push_html(html);
     }
 
     /// IHTMLDocument2::writeln — write HTML with newline.
     pub fn writeln(&mut self, html: &str) {
-        self.html_content.push_str(html);
-        self.html_content.push('\n');
+        self.push_html(html);
+        if self.html_content.len() < MAX_HTML_CONTENT {
+            self.html_content.push('\n');
+        }
+    }
+
+    /// Append HTML up to the content cap, dropping the excess.
+    fn push_html(&mut self, html: &str) {
+        let remaining = MAX_HTML_CONTENT.saturating_sub(self.html_content.len());
+        if html.len() <= remaining {
+            self.html_content.push_str(html);
+            return;
+        }
+        let mut end = 0;
+        for (idx, _) in html.char_indices() {
+            if idx >= remaining {
+                break;
+            }
+            end = idx;
+        }
+        self.html_content.push_str(&html[..end]);
+        eprintln!(
+            "[MsHtmlDocument] write: content exceeds {MAX_HTML_CONTENT} bytes; truncating"
+        );
     }
 
     /// IHTMLDocument2::open — open the document for writing.
@@ -3029,10 +3194,36 @@ impl MsHtmlDocument {
     }
 
     /// IHTMLDocument2::close — close the document and load content into WKWebView.
+    ///
+    /// The WKWebView is created lazily here (only if content was written),
+    /// so COM instances that never render content do not allocate one.
     pub fn close(&mut self) {
         self.is_open = false;
-        if self.webview_handle != 0 && !self.html_content.is_empty() {
-            self.load_html(&self.html_content);
+        if !self.html_content.is_empty() {
+            if self.webview_handle == 0 {
+                self.create_webview();
+            }
+            if self.webview_handle != 0 {
+                self.load_html(&self.html_content);
+            }
+        }
+    }
+
+    /// Release the WKWebView (if any) — must be called exactly once per
+    /// created webview.
+    pub fn destroy_webview(&mut self) {
+        #[cfg(target_os = "macos")]
+        // SAFETY: Objective-C FFI for Win32 API shims on macOS
+        unsafe {
+            if self.webview_handle != 0 {
+                let wv = self.webview_handle as *mut objc::runtime::Object;
+                let _: () = objc::msg_send![wv, release];
+                self.webview_handle = 0;
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.webview_handle = 0;
         }
     }
 
@@ -3041,8 +3232,10 @@ impl MsHtmlDocument {
         #[cfg(target_os = "macos")]
         // SAFETY: Objective-C FFI for Win32 API shims on macOS
         unsafe {
-            let wv: *mut objc::runtime::Object =
-                std::mem::transmute(self.webview_handle as *mut objc::runtime::Object);
+            if self.webview_handle == 0 {
+                return;
+            }
+            let wv = self.webview_handle as *mut objc::runtime::Object;
             let cstr = std::ffi::CString::new(html).unwrap_or_default();
             let nsstr: *mut objc::runtime::Object =
                 objc::msg_send![class!(NSString), stringWithUTF8String: cstr.as_ptr()];
@@ -3051,27 +3244,23 @@ impl MsHtmlDocument {
         }
     }
 
-    /// Evaluate JavaScript in WKWebView and return the result.
+    /// Evaluate JavaScript in WKWebView.
+    ///
+    /// `evaluateJavaScript:completionHandler:` returns `void` and delivers
+    /// its result asynchronously via the completion handler, so no return
+    /// value is read here (the handler is not supported by this shim).
     fn evaluate_javascript(&self, script: &str) -> Option<String> {
         #[cfg(target_os = "macos")]
         // SAFETY: Objective-C FFI for Win32 API shims on macOS
         unsafe {
-            let wv: *mut objc::runtime::Object =
-                std::mem::transmute(self.webview_handle as *mut objc::runtime::Object);
+            if self.webview_handle == 0 {
+                return None;
+            }
+            let wv = self.webview_handle as *mut objc::runtime::Object;
             let cstr = std::ffi::CString::new(script).unwrap_or_default();
             let nsstr: *mut objc::runtime::Object =
                 objc::msg_send![class!(NSString), stringWithUTF8String: cstr.as_ptr()];
-            let result: *mut objc::runtime::Object = objc::msg_send![wv, evaluateJavaScript: nsstr completionHandler: std::ptr::null_mut::<*mut objc::runtime::Object>()];
-            if !result.is_null() {
-                let cstr: *const i8 = objc::msg_send![result, UTF8String];
-                if !cstr.is_null() {
-                    return Some(
-                        std::ffi::CStr::from_ptr(cstr)
-                            .to_string_lossy()
-                            .into_owned(),
-                    );
-                }
-            }
+            let _: () = objc::msg_send![wv, evaluateJavaScript: nsstr completionHandler: std::ptr::null_mut::<*mut objc::runtime::Object>()];
             None
         }
         #[cfg(not(target_os = "macos"))]
@@ -3148,14 +3337,13 @@ impl MsHtmlDocument {
     }
 
     pub fn get_computed_style(&self, element_id: &str, _pseudo: &str) -> String {
-        if let Some(result) = self.evaluate_javascript(&format!(
-            "JSON.stringify(window.getComputedStyle(document.getElementById('{}')))",
-            element_id
-        )) {
-            result
-        } else {
-            String::new()
-        }
+        // Escape the guest-supplied id before embedding it in the script so
+        // it cannot break out of the string literal.
+        let escaped = element_id.replace('\\', "\\\\").replace('\'', "\\'");
+        self.evaluate_javascript(&format!(
+            "JSON.stringify(window.getComputedStyle(document.getElementById('{escaped}')))"
+        ))
+        .unwrap_or_default()
     }
 
     pub fn alert(&self, msg: &str) {
@@ -3284,6 +3472,12 @@ impl MsHtmlScript {
     }
 }
 
+impl Default for MsHtmlScript {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// IHTMLElement — single element.
 pub struct MsHtmlElement {
     pub inner_html: String,
@@ -3360,7 +3554,15 @@ impl MsHtmlTxtRange {
             html_text: String::new(),
         }
     }
+}
 
+impl Default for MsHtmlTxtRange {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MsHtmlTxtRange {
     pub fn get_text(&self) -> String {
         self.text.clone()
     }
@@ -3388,8 +3590,9 @@ pub struct MsHtmlDocumentObject {
 
 impl MsHtmlDocumentObject {
     pub fn new(clsid: [u8; 16]) -> Self {
-        let mut doc = MsHtmlDocument::new();
-        doc.create_webview();
+        // The WKWebView is created lazily on first close() so COM instances
+        // that never render content don't allocate a webview.
+        let doc = MsHtmlDocument::new();
         Self {
             clsid,
             supported: vec![ComIid::IUNKNOWN, ComIid::IHTML_DOCUMENT2],
@@ -3463,6 +3666,16 @@ impl ComObject for MsHtmlDocumentObject {
     }
 }
 
+impl Drop for MsHtmlDocumentObject {
+    fn drop(&mut self) {
+        // Release the WKWebView (if one was created) so the native object
+        // does not leak when the COM object is destroyed.
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.destroy_webview();
+        }
+    }
+}
+
 /// URL Moniker COM object (IMoniker) — for URL moniker binding.
 ///
 /// Supports BindToStorage and BindToObject for URL-based
@@ -3515,8 +3728,16 @@ impl UrlMonikerObject {
                 format!("UrlMoniker: HTTP request failed for {}: {e}", self.url),
             )
         })?;
-        let bytes = response.bytes().unwrap_or_default().to_vec();
-        Ok(bytes)
+        let bytes = response.bytes().map_err(|e| {
+            AppError::new(
+                ReasonCode::RcNetHttpRequestFailed,
+                format!(
+                    "UrlMoniker: failed to read response body for {}: {e}",
+                    self.url
+                ),
+            )
+        })?;
+        Ok(bytes.to_vec())
     }
 
     /// IMoniker::BindToObject — bind to a COM object from the storage.
@@ -3535,30 +3756,6 @@ impl ComObject for UrlMonikerObject {
     fn debug_name(&self) -> &str {
         &self.name
     }
-}
-
-/// COM apartment threading type for class registration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ComApartmentType {
-    /// Both STA and MTA.
-    Both,
-    /// Single-threaded apartment.
-    Apartment,
-    /// Multi-threaded apartment (free-threaded).
-    Free,
-}
-
-/// A COM class registry entry.
-#[derive(Debug, Clone)]
-pub struct ComClassEntry {
-    /// CLSID in GUID byte format.
-    pub clsid: [u8; 16],
-    /// ProgID string (e.g., "Shell.Application").
-    pub progid: Option<String>,
-    /// Human-readable description.
-    pub description: String,
-    /// Threading model.
-    pub apartment: ComApartmentType,
 }
 
 /// CLSCTX flags for CoCreateInstance.
@@ -3641,14 +3838,28 @@ impl ComApartmentState {
             thread_apartments: HashMap::new(),
             registered_factories: BTreeMap::new(),
             next_token: 1,
-            com_exe_servers: Vec::new(),
         }
     }
+}
 
+impl Default for ComApartmentState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ComApartmentState {
     /// CoInitializeEx — initialize the COM apartment.
     pub fn co_initialize(&mut self, model: ComApartmentModel) -> AppResult<()> {
         if self.initialized {
-            // S_FALSE — already initialized with same model (not an error)
+            // Re-initializing with a *different* apartment model is an error
+            // in real COM (RPC_E_CHANGED_MODE); the same model is a no-op.
+            if self.apartment_model != model {
+                return Err(AppError::new(
+                    ReasonCode::RcWin32InvalidHandle,
+                    "COM: apartment model conflict (RPC_E_CHANGED_MODE)",
+                ));
+            }
             return Ok(());
         }
         self.initialized = true;
@@ -3658,8 +3869,15 @@ impl ComApartmentState {
 
     /// CoInitializeEx with per-thread tracking.
     pub fn co_initialize_ex(&mut self, thread_id: u32, model: ComApartmentModel) -> AppResult<()> {
-        if self.thread_apartments.contains_key(&thread_id) {
-            // Already initialized for this thread — S_OK (not an error in COM)
+        if let Some(prev) = self.thread_apartments.get(&thread_id) {
+            // Re-initializing with a different model is an error
+            // (RPC_E_CHANGED_MODE); the same model is a no-op.
+            if *prev != model {
+                return Err(AppError::new(
+                    ReasonCode::RcWin32InvalidHandle,
+                    "COM: apartment model conflict (RPC_E_CHANGED_MODE)",
+                ));
+            }
             return Ok(());
         }
         self.thread_apartments.insert(thread_id, model);
@@ -3900,39 +4118,16 @@ impl ComApartmentState {
                     ),
                 ));
             }
-            // LOCAL_SERVER (out-of-process EXE) — try to launch the server
             if (dw_clsctx & clsctx::LOCAL_SERVER) != 0 {
-                let clsid_str = guid_to_string(&clsid);
-                // Look up the COM server registration path
-                // Simulate HKCR\\CLSID\\{clsid}\\LocalServer32 lookup
-                let server_path = format!("/fake/com/servers/{}/server.exe", clsid_str);
-                // Try to find a real EXE at the expected path
-                let exe_path = std::path::Path::new(&server_path);
-                if exe_path.exists() {
-                    match std::process::Command::new(exe_path).spawn() {
-                        Ok(child) => {
-                            self.com_exe_servers.push(child);
-                            eprintln!("[COM] Launched out-of-process server for CLSID {clsid_str}");
-                        }
-                        Err(e) => {
-                            eprintln!(
-                                "[COM] Failed to launch out-of-process server for CLSID {clsid_str}: {e}"
-                            );
-                        }
-                    }
-                } else {
-                    eprintln!(
-                        "[COM] Out-of-process server EXE not found at {server_path}; returning CLASS_E_CLASSNOTAVAILABLE"
-                    );
-                    return Err(AppError::new(
-                        ReasonCode::RcComClassNotRegistered,
-                        format!(
-                            "CLSID {} not available as local server: EXE not found at {}",
-                            guid_to_string(&clsid),
-                            server_path
-                        ),
-                    ));
-                }
+                // LOCAL_SERVER (out-of-process EXE) — we cannot host
+                // out-of-process servers on macOS, and we must never spawn
+                // guest-controlled executables on the host. The object is
+                // emulated in-process below instead; the simulated server
+                // handles are therefore not tracked.
+                eprintln!(
+                    "[COM] CoCreateInstance: emulating local server in-process for CLSID {}",
+                    guid_to_string(&clsid)
+                );
             }
         }
 
@@ -4098,7 +4293,7 @@ impl ComApartmentState {
             return Ok(true);
         }
         // Check against the full list of supported IIDs
-        Ok(obj.supported_iids.iter().any(|supported| *supported == iid))
+        Ok(obj.supported_iids.contains(&iid))
     }
 
     /// Get the vtable pointer for a COM object.
@@ -4211,12 +4406,15 @@ pub struct DispatchResult {
     pub arg_err: u32,
 }
 
+/// Custom dispatch handler: receives (name, invoke_flags, params).
+pub type DispatchHandler = Box<dyn Fn(&str, u16, &[Variant]) -> AppResult<Variant> + Send>;
+
 /// Type-erased dispatch interface stored per COM object.
 pub enum DispatchInterface {
     /// A simple property bag with named values.
     PropertyBag(BTreeMap<String, Variant>),
     /// A custom dispatch handler.
-    Custom(Box<dyn Fn(&str, u16, &[Variant]) -> AppResult<Variant> + Send>),
+    Custom(DispatchHandler),
 }
 
 /// GetIDsOfNames for a PropertyBag dispatch interface.
@@ -4354,19 +4552,11 @@ pub fn dispatch_invoke(
 
 /// Simulate a single message pump iteration for an STA apartment.
 /// Returns true if a message was processed.
+///
+/// This shim has no message queue to pump, so it always reports that no
+/// message was processed (the loop form was removed as dead scaffolding).
 pub fn apartment_message_pump() -> bool {
-    // In a real COM implementation, this would process window messages
-    // for the STA apartment thread. For now, it's a simple yield.
     false
-}
-
-/// Run the message pump until a quit condition is met.
-pub fn apartment_message_pump_loop() {
-    loop {
-        if !apartment_message_pump() {
-            break;
-        }
-    }
 }
 
 // ===========================================================================
@@ -4442,7 +4632,7 @@ pub struct Variant {
 
 /// BSTR structure in guest memory: [length: i32][char_data...][null_terminator]
 /// The pointer returned by SysAllocString points to the char_data.
-
+///
 /// SysAllocString — allocate a BSTR from a wide string.
 pub fn sys_alloc_string(src: &[u16]) -> Vec<u8> {
     if src.is_empty() {
@@ -4569,6 +4759,20 @@ pub fn variant_change_type(
         return Ok(());
     }
 
+    // A string source coerced to a numeric type would require dereferencing
+    // guest memory, which this module cannot do — fail loudly rather than
+    // silently coercing to 0.
+    if matches!(src_vt, VT_BSTR | VT_LPWSTR | VT_LPSTR)
+        && matches!(new_vt_base, VT_I1 | VT_UI1 | VT_I2 | VT_UI2 | VT_I4 | VT_UI4 | VT_I8 | VT_UI8 | VT_INT | VT_UINT | VT_R4 | VT_R8 | VT_CY | VT_DATE | VT_DECIMAL | VT_BOOL | VT_EMPTY | VT_NULL)
+    {
+        return Err(AppError::new(
+            ReasonCode::RcWin32InvalidHandle,
+            format!(
+                "VariantChangeType: cannot coerce VT_{src_vt} (string) to VT_{new_vt_base} without guest memory access"
+            ),
+        ));
+    }
+
     // Extract numeric value from source for coercion
     let numeric_val = variant_to_f64(src);
 
@@ -4626,12 +4830,14 @@ pub fn variant_change_type(
             dst.data = if numeric_val != 0.0 { 0xFFFFu64 } else { 0 };
         }
         VT_BSTR => {
-            // Convert any type to a BSTR string
-            let s = variant_to_string(src);
-            let wide: Vec<u16> = s.encode_utf16().collect();
-            let _bstr = sys_alloc_string(&wide);
-            dst.vt = VT_BSTR;
-            dst.data = 0; // Caller manages BSTR pointer
+            // A BSTR must live in guest memory (the data field is a guest
+            // pointer); this module has no guest memory access, so the
+            // conversion cannot produce a usable BSTR. The caller should
+            // allocate the BSTR itself (e.g. via SysAllocString) instead.
+            return Err(AppError::new(
+                ReasonCode::RcWin32InvalidHandle,
+                "VariantChangeType: cannot allocate a BSTR in guest memory",
+            ));
         }
         VT_ERROR => {
             dst.vt = VT_ERROR;
@@ -4682,7 +4888,7 @@ fn variant_to_f64(v: &Variant) -> f64 {
         VT_UI4 | VT_UINT => v.data as u32 as f64,
         VT_I8 => v.data as i64 as f64,
         VT_UI8 => v.data as f64,
-        VT_R4 => f32::from_bits(v.data as u32).to_bits() as f64,
+        VT_R4 => f32::from_bits(v.data as u32) as f64,
         VT_R8 => f64::from_bits(v.data),
         VT_CY => (v.data as i64) as f64 / 10000.0,
         VT_DATE => f64::from_bits(v.data),
@@ -4694,8 +4900,11 @@ fn variant_to_f64(v: &Variant) -> f64 {
             }
         }
         VT_BSTR | VT_LPWSTR => {
-            // Interpret data as a pointer to wide string and parse
-            // For simplicity, return 0 — real parsing would dereference guest memory
+            // Reading the string would require dereferencing guest memory,
+            // which this module cannot do. Coercing a string variant to a
+            // numeric type is rejected with an error by
+            // `variant_change_type`; a bare 0 here is only a fallback for
+            // direct callers.
             0.0
         }
         VT_ERROR => v.data as i32 as f64,
@@ -4731,7 +4940,8 @@ fn variant_to_string(v: &Variant) -> String {
             }
         }
         VT_BSTR | VT_LPWSTR => {
-            // Would dereference guest memory; return empty for now
+            // Would dereference guest memory; callers that need the string
+            // must read it from guest memory themselves.
             String::new()
         }
         VT_ERROR => format!("0x{:08X}", data as u32),
@@ -4751,23 +4961,6 @@ pub struct SafeArrayBound {
     pub l_bound: i32,
 }
 
-/// SAFEARRAY descriptor with all standard fields.
-/// Layout: [cbElements: u16, cDims: u16, fFeatures: u16, cbElements2: u16,
-///          cLocks: u32, pvData: u64, rgsabound: SafeArrayBound[cDims]]
-/// The `handle` (pvData) field stores an offset to the data payload within
-/// the serialized array buffer. Bounds follow the header in reverse order
-/// (innermost dimension first per Windows convention).
-#[repr(C)]
-pub struct SafeArrayDescriptor {
-    pub cb_elements: u16,
-    pub c_dims: u16,
-    pub f_features: u16,
-    pub cb_elements2: u16, // duplicate of cb_elements in some layouts
-    pub c_locks: u32,
-    pub handle: u64, // pointer to actual data
-                     // Followed by SafeArrayBound[c_dims]
-}
-
 /// SAFEARRAY feature flags.
 pub const FADF_AUTO: u16 = 0x0001;
 pub const FADF_STATIC: u16 = 0x0002;
@@ -4782,21 +4975,35 @@ pub const FADF_DISPATCH: u16 = 0x0400;
 pub const FADF_VARIANT: u16 = 0x0800;
 pub const FADF_RESERVED: u16 = 0xF000;
 
+/// Maximum number of SAFEARRAY dimensions accepted (bounds memory).
+const MAX_SAFEARRAY_DIMS: u32 = 256;
+/// Maximum serialised SAFEARRAY size accepted (bounds memory).
+const MAX_SAFEARRAY_BYTES: usize = 64 * 1024 * 1024;
+
 /// SafeArrayCreate — create a SAFEARRAY.
+///
+/// All sizes are bounded so guest-controlled dimensions cannot trigger
+/// enormous allocations.
 pub fn safe_array_create(vt: u16, c_dims: u32, bounds: &[SafeArrayBound]) -> Vec<u8> {
-    let c_dims = c_dims as u16;
+    let c_dims = (c_dims.min(MAX_SAFEARRAY_DIMS)) as u16;
     let elem_size = element_size(vt);
-    let mut total_elements: u32 = 1;
-    for b in bounds {
-        total_elements = total_elements.saturating_mul(b.elements);
+    let mut total_elements: u64 = 1;
+    for b in bounds.iter().take(c_dims as usize) {
+        total_elements = total_elements.saturating_mul(b.elements as u64);
     }
-    let data_size = (elem_size as u64) * (total_elements as u64);
+    let data_size = (elem_size as u64).saturating_mul(total_elements);
 
-    // Calculate descriptor size: header (24 bytes?) + c_dims * 8 bytes for bounds
+    // Calculate descriptor size: header (24 bytes) + c_dims * 8 bytes for bounds
     let header_size = 24 + (c_dims as usize) * 8;
-    let total_size = header_size + data_size as usize;
+    let total_size = header_size.saturating_add(data_size as usize).min(MAX_SAFEARRAY_BYTES);
 
-    let mut buf = vec![0u8; total_size];
+    let mut buf = Vec::new();
+    if buf.try_reserve_exact(total_size).is_err() {
+        // Allocation failed — return an empty buffer; all accessor
+        // functions validate the length and will report errors.
+        return buf;
+    }
+    buf.resize(total_size, 0);
     // Write header
     buf[0..2].copy_from_slice(&(elem_size as u16).to_le_bytes());
     buf[2..4].copy_from_slice(&c_dims.to_le_bytes());
@@ -4807,7 +5014,7 @@ pub fn safe_array_create(vt: u16, c_dims: u32, bounds: &[SafeArrayBound]) -> Vec
     // handle = pointer to data (offset header_size)
     buf[12..20].copy_from_slice(&(header_size as u64).to_le_bytes());
     // Write bounds
-    for (i, b) in bounds.iter().enumerate() {
+    for (i, b) in bounds.iter().take(c_dims as usize).enumerate() {
         let offset = 20 + i * 8;
         buf[offset..offset + 4].copy_from_slice(&b.elements.to_le_bytes());
         buf[offset + 4..offset + 8].copy_from_slice(&b.l_bound.to_le_bytes());
@@ -4856,20 +5063,50 @@ pub fn safe_array_access_data(sa_data: &[u8]) -> AppResult<u64> {
 pub fn safe_array_unaccess_data(_sa_ptr: u64) {}
 
 /// SafeArrayGetElement — get an element from a SAFEARRAY.
+///
+/// All descriptor lengths are validated before any indexing so that a
+/// truncated or malicious guest-supplied SAFEARRAY yields an error instead
+/// of a panic.
 pub fn safe_array_get_element(sa_data: &[u8], indices: &[i32]) -> AppResult<Vec<u8>> {
+    if sa_data.len() < 24 {
+        return Err(AppError::new(
+            ReasonCode::RcWin32InvalidHandle,
+            "SAFEARRAY too small",
+        ));
+    }
     let c_dims = u16::from_le_bytes([sa_data[2], sa_data[3]]) as usize;
-    if indices.len() != c_dims {
+    if c_dims == 0 || indices.len() != c_dims {
         return Err(AppError::new(
             ReasonCode::RcWin32InvalidHandle,
             "index count mismatch",
         ));
     }
+    let bounds_end = 20usize
+        .checked_add(c_dims.checked_mul(8).ok_or_else(|| {
+            AppError::new(ReasonCode::RcWin32InvalidHandle, "SAFEARRAY bounds overflow")
+        })?)
+        .ok_or_else(|| {
+            AppError::new(ReasonCode::RcWin32InvalidHandle, "SAFEARRAY bounds overflow")
+        })?;
+    if bounds_end > sa_data.len() {
+        return Err(AppError::new(
+            ReasonCode::RcWin32InvalidHandle,
+            "SAFEARRAY bounds truncated",
+        ));
+    }
     let elem_size = u16::from_le_bytes([sa_data[0], sa_data[1]]) as usize;
     let base_offset = safe_array_access_data(sa_data)? as usize;
+    if base_offset > sa_data.len() {
+        return Err(AppError::new(
+            ReasonCode::RcWin32InvalidHandle,
+            "SAFEARRAY data offset out of range",
+        ));
+    }
 
-    // Calculate flat index
-    let mut flat_index: i32 = 0;
-    let mut stride: i32 = 1;
+    // Calculate flat index using i128 arithmetic so no intermediate
+    // computation can overflow on hostile cDims/element counts.
+    let mut flat_index: i128 = 0;
+    let mut stride: i128 = 1;
     for dim in (0..c_dims).rev() {
         let bound_offset = 20 + dim * 8;
         let elements = u32::from_le_bytes([
@@ -4877,14 +5114,14 @@ pub fn safe_array_get_element(sa_data: &[u8], indices: &[i32]) -> AppResult<Vec<
             sa_data[bound_offset + 1],
             sa_data[bound_offset + 2],
             sa_data[bound_offset + 3],
-        ]) as i32;
+        ]) as i128;
         let l_bound = i32::from_le_bytes([
             sa_data[bound_offset + 4],
             sa_data[bound_offset + 5],
             sa_data[bound_offset + 6],
             sa_data[bound_offset + 7],
-        ]);
-        let idx = indices[dim] - l_bound;
+        ]) as i128;
+        let idx = indices[dim] as i128 - l_bound;
         if idx < 0 || idx >= elements {
             return Err(AppError::new(
                 ReasonCode::RcWin32InvalidHandle,
@@ -4894,29 +5131,79 @@ pub fn safe_array_get_element(sa_data: &[u8], indices: &[i32]) -> AppResult<Vec<
         flat_index += idx * stride;
         stride *= elements;
     }
+    if flat_index < 0 {
+        return Err(AppError::new(
+            ReasonCode::RcWin32InvalidHandle,
+            "index out of bounds",
+        ));
+    }
 
-    let offset = base_offset + (flat_index as usize) * elem_size;
-    Ok(sa_data[offset..offset + elem_size].to_vec())
+    let offset = base_offset
+        .checked_add((flat_index as usize).checked_mul(elem_size).ok_or_else(|| {
+            AppError::new(ReasonCode::RcWin32InvalidHandle, "SAFEARRAY offset overflow")
+        })?)
+        .ok_or_else(|| {
+            AppError::new(ReasonCode::RcWin32InvalidHandle, "SAFEARRAY offset overflow")
+        })?;
+    let end = offset.checked_add(elem_size).ok_or_else(|| {
+        AppError::new(ReasonCode::RcWin32InvalidHandle, "SAFEARRAY offset overflow")
+    })?;
+    if end > sa_data.len() {
+        return Err(AppError::new(
+            ReasonCode::RcWin32InvalidHandle,
+            "SAFEARRAY data truncated",
+        ));
+    }
+    Ok(sa_data[offset..end].to_vec())
 }
 
 /// SafeArrayPutElement — put an element into a SAFEARRAY.
+///
+/// All descriptor lengths are validated before any indexing so that a
+/// truncated or malicious guest-supplied SAFEARRAY yields an error instead
+/// of a panic.
 pub fn safe_array_put_element(
     sa_data: &mut [u8],
     indices: &[i32],
     element_data: &[u8],
 ) -> AppResult<()> {
+    if sa_data.len() < 24 {
+        return Err(AppError::new(
+            ReasonCode::RcWin32InvalidHandle,
+            "SAFEARRAY too small",
+        ));
+    }
     let c_dims = u16::from_le_bytes([sa_data[2], sa_data[3]]) as usize;
-    if indices.len() != c_dims {
+    if c_dims == 0 || indices.len() != c_dims {
         return Err(AppError::new(
             ReasonCode::RcWin32InvalidHandle,
             "index count mismatch",
         ));
     }
+    let bounds_end = 20usize
+        .checked_add(c_dims.checked_mul(8).ok_or_else(|| {
+            AppError::new(ReasonCode::RcWin32InvalidHandle, "SAFEARRAY bounds overflow")
+        })?)
+        .ok_or_else(|| {
+            AppError::new(ReasonCode::RcWin32InvalidHandle, "SAFEARRAY bounds overflow")
+        })?;
+    if bounds_end > sa_data.len() {
+        return Err(AppError::new(
+            ReasonCode::RcWin32InvalidHandle,
+            "SAFEARRAY bounds truncated",
+        ));
+    }
     let elem_size = u16::from_le_bytes([sa_data[0], sa_data[1]]) as usize;
     let base_offset = safe_array_access_data(sa_data)? as usize;
+    if base_offset > sa_data.len() {
+        return Err(AppError::new(
+            ReasonCode::RcWin32InvalidHandle,
+            "SAFEARRAY data offset out of range",
+        ));
+    }
 
-    let mut flat_index: i32 = 0;
-    let mut stride: i32 = 1;
+    let mut flat_index: i128 = 0;
+    let mut stride: i128 = 1;
     for dim in (0..c_dims).rev() {
         let bound_offset = 20 + dim * 8;
         let elements = u32::from_le_bytes([
@@ -4924,14 +5211,14 @@ pub fn safe_array_put_element(
             sa_data[bound_offset + 1],
             sa_data[bound_offset + 2],
             sa_data[bound_offset + 3],
-        ]) as i32;
+        ]) as i128;
         let l_bound = i32::from_le_bytes([
             sa_data[bound_offset + 4],
             sa_data[bound_offset + 5],
             sa_data[bound_offset + 6],
             sa_data[bound_offset + 7],
-        ]);
-        let idx = indices[dim] - l_bound;
+        ]) as i128;
+        let idx = indices[dim] as i128 - l_bound;
         if idx < 0 || idx >= elements {
             return Err(AppError::new(
                 ReasonCode::RcWin32InvalidHandle,
@@ -4941,12 +5228,31 @@ pub fn safe_array_put_element(
         flat_index += idx * stride;
         stride *= elements;
     }
-
-    let offset = base_offset + (flat_index as usize) * elem_size;
-    let end = offset + element_data.len().min(elem_size);
-    if end <= sa_data.len() {
-        sa_data[offset..end].copy_from_slice(&element_data[..end - offset]);
+    if flat_index < 0 {
+        return Err(AppError::new(
+            ReasonCode::RcWin32InvalidHandle,
+            "index out of bounds",
+        ));
     }
+
+    let offset = base_offset
+        .checked_add((flat_index as usize).checked_mul(elem_size).ok_or_else(|| {
+            AppError::new(ReasonCode::RcWin32InvalidHandle, "SAFEARRAY offset overflow")
+        })?)
+        .ok_or_else(|| {
+            AppError::new(ReasonCode::RcWin32InvalidHandle, "SAFEARRAY offset overflow")
+        })?;
+    let end = offset.checked_add(elem_size).ok_or_else(|| {
+        AppError::new(ReasonCode::RcWin32InvalidHandle, "SAFEARRAY offset overflow")
+    })?;
+    if end > sa_data.len() {
+        return Err(AppError::new(
+            ReasonCode::RcWin32InvalidHandle,
+            "SAFEARRAY data truncated",
+        ));
+    }
+    let n = element_data.len().min(elem_size);
+    sa_data[offset..offset + n].copy_from_slice(&element_data[..n]);
     Ok(())
 }
 
@@ -4966,6 +5272,12 @@ pub fn safe_array_get_lbound(sa_data: &[u8], dim: u32) -> AppResult<i32> {
         ));
     }
     let bound_offset = 20 + (dim as usize - 1) * 8;
+    if bound_offset + 8 > sa_data.len() {
+        return Err(AppError::new(
+            ReasonCode::RcWin32InvalidHandle,
+            "SAFEARRAY bounds truncated",
+        ));
+    }
     Ok(i32::from_le_bytes([
         sa_data[bound_offset + 4],
         sa_data[bound_offset + 5],
@@ -4990,6 +5302,12 @@ pub fn safe_array_get_ubound(sa_data: &[u8], dim: u32) -> AppResult<i32> {
         ));
     }
     let bound_offset = 20 + (dim as usize - 1) * 8;
+    if bound_offset + 8 > sa_data.len() {
+        return Err(AppError::new(
+            ReasonCode::RcWin32InvalidHandle,
+            "SAFEARRAY bounds truncated",
+        ));
+    }
     let elements = u32::from_le_bytes([
         sa_data[bound_offset],
         sa_data[bound_offset + 1],
@@ -5002,7 +5320,15 @@ pub fn safe_array_get_ubound(sa_data: &[u8], dim: u32) -> AppResult<i32> {
         sa_data[bound_offset + 6],
         sa_data[bound_offset + 7],
     ]);
-    Ok(l_bound + elements as i32 - 1)
+    l_bound
+        .checked_add(elements as i32)
+        .map(|v| v - 1)
+        .ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcWin32InvalidHandle,
+                "SAFEARRAY upper bound overflow",
+            )
+        })
 }
 
 /// Get the element size for a VARIANT type.
@@ -5013,9 +5339,11 @@ pub fn element_size(vt: u16) -> usize {
         VT_I2 | VT_UI2 | VT_BOOL => 2,
         VT_I4 | VT_UI4 | VT_R4 | VT_ERROR | VT_INT | VT_UINT => 4,
         VT_R8 | VT_CY | VT_DATE | VT_I8 | VT_UI8 => 8,
-        VT_BSTR | VT_UNKNOWN | VT_DISPATCH => 8, // pointers
+        VT_BSTR | VT_UNKNOWN | VT_DISPATCH | VT_LPSTR | VT_LPWSTR | VT_PTR | VT_INT_PTR
+        | VT_UINT_PTR => 8, // pointers
         VT_VARIANT => 16,
         VT_DECIMAL => 16,
+        VT_CLSID => 16,
         _ => 4, // default
     }
 }
@@ -5027,55 +5355,14 @@ pub fn element_size(vt: u16) -> usize {
 /// MSVC CRT implementation for guest code.
 pub struct MsvcCrt {
     errno_value: i32,
-    #[allow(dead_code)]
-    next_file_descriptor: i32,
-    #[allow(dead_code)]
-    open_files: BTreeMap<i32, CrtFileRecord>,
     heap_allocations: BTreeMap<u64, usize>,
     next_alloc_id: u64,
 }
 
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-struct CrtFileRecord {
-    path: String,
-    mode: String,
-    position: u64,
-}
-
 impl MsvcCrt {
     pub fn new() -> Self {
-        let mut open_files = BTreeMap::new();
-        // Standard file descriptors: 0=stdin, 1=stdout, 2=stderr
-        open_files.insert(
-            0,
-            CrtFileRecord {
-                path: "stdin".to_string(),
-                mode: "r".to_string(),
-                position: 0,
-            },
-        );
-        open_files.insert(
-            1,
-            CrtFileRecord {
-                path: "stdout".to_string(),
-                mode: "w".to_string(),
-                position: 0,
-            },
-        );
-        open_files.insert(
-            2,
-            CrtFileRecord {
-                path: "stderr".to_string(),
-                mode: "w".to_string(),
-                position: 0,
-            },
-        );
-
         Self {
             errno_value: 0,
-            next_file_descriptor: 3,
-            open_files,
             heap_allocations: BTreeMap::new(),
             next_alloc_id: 1,
         }
@@ -5130,20 +5417,26 @@ impl MsvcCrt {
             }
             return 0;
         }
-        if self.heap_allocations.contains_key(&ptr) {
-            self.heap_allocations.insert(ptr, new_size);
-            ptr
-        } else {
-            self.errno_value = 22;
-            0
+        use std::collections::btree_map::Entry;
+        match self.heap_allocations.entry(ptr) {
+            Entry::Occupied(mut entry) => {
+                entry.insert(new_size);
+                ptr
+            }
+            Entry::Vacant(_) => {
+                self.errno_value = 22;
+                0
+            }
         }
     }
 
     /// CRT _beginthreadex — create a thread.
+    ///
+    /// Thread creation is handled by the threads subsystem; this returns a
+    /// unique synthetic thread handle.
     pub fn crt_beginthreadex(&self) -> AppResult<u32> {
-        // Thread creation is handled by the threads subsystem
-        // This returns a synthetic thread handle
-        Ok(42)
+        static NEXT_THREAD_HANDLE: AtomicU32 = AtomicU32::new(1);
+        Ok(NEXT_THREAD_HANDLE.fetch_add(1, Ordering::Relaxed))
     }
 
     /// CRT atoi — convert string to integer.
@@ -5283,7 +5576,7 @@ impl MsvcCrt {
         match conversion {
             'd' | 'i' => {
                 let sign = if value < 0 {
-                    ""
+                    "-"
                 } else if force_sign {
                     "+"
                 } else if space_flag {
@@ -5292,17 +5585,18 @@ impl MsvcCrt {
                     ""
                 };
                 let abs_val = value.unsigned_abs();
-                let mut s = format!("{}{}", sign, abs_val);
+                let mut s = format!("{sign}{abs_val}");
                 if let Some(p) = precision {
-                    s = format!("{}{:0>width$}", sign, abs_val, width = p);
+                    s = format!("{sign}{:0>width$}", abs_val, width = p);
                 }
-                if let Some(w) = width {
-                    if s.len() < w {
-                        if left_justify {
-                            s = format!("{:<width$}", s, width = w);
-                        } else {
-                            s = format!("{:>width$}", s, width = w);
-                        }
+                if let Some(w) = width.filter(|&w| s.len() < w) {
+                    if left_justify {
+                        s = format!("{:<width$}", s, width = w);
+                    } else if pad_char == '0' {
+                        // Zero-pad between the sign and the digits.
+                        s = format!("{sign}{:0>width$}", &s[sign.len()..], width = w - sign.len());
+                    } else {
+                        s = format!("{:>width$}", s, width = w);
                     }
                 }
                 s
@@ -5324,14 +5618,13 @@ impl MsvcCrt {
             'x' => {
                 let val = value as u32;
                 let prefix = if alternate && val != 0 { "0x" } else { "" };
-                let mut s = format!("{}{:x}", prefix, val);
+                let mut s = format!("{prefix}{:x}", val);
                 if let Some(w) = width {
                     if pad_char == '0' {
                         s = format!(
-                            "{}{:0>width$}",
-                            prefix,
+                            "{prefix}{:0>width$}",
                             format!("{:x}", val),
-                            width = w - prefix.len()
+                            width = w.saturating_sub(prefix.len())
                         );
                     } else if left_justify {
                         s = format!("{:<width$}", s, width = w);
@@ -5344,14 +5637,13 @@ impl MsvcCrt {
             'X' => {
                 let val = value as u32;
                 let prefix = if alternate && val != 0 { "0X" } else { "" };
-                let mut s = format!("{}{:X}", prefix, val);
+                let mut s = format!("{prefix}{:X}", val);
                 if let Some(w) = width {
                     if pad_char == '0' {
                         s = format!(
-                            "{}{:0>width$}",
-                            prefix,
+                            "{prefix}{:0>width$}",
                             format!("{:X}", val),
-                            width = w - prefix.len()
+                            width = w.saturating_sub(prefix.len())
                         );
                     } else if left_justify {
                         s = format!("{:<width$}", s, width = w);
@@ -5364,14 +5656,13 @@ impl MsvcCrt {
             'o' => {
                 let val = value as u32;
                 let prefix = if alternate { "0" } else { "" };
-                let mut s = format!("{}{:o}", prefix, val);
+                let mut s = format!("{prefix}{:o}", val);
                 if let Some(w) = width {
                     if pad_char == '0' {
                         s = format!(
-                            "{}{:0>width$}",
-                            prefix,
+                            "{prefix}{:0>width$}",
                             format!("{:o}", val),
-                            width = w - prefix.len()
+                            width = w.saturating_sub(prefix.len())
                         );
                     } else if left_justify {
                         s = format!("{:<width$}", s, width = w);
@@ -5385,7 +5676,7 @@ impl MsvcCrt {
                 let f_val = value as f64;
                 let prec = precision.unwrap_or(6);
                 let sign = if f_val < 0.0 {
-                    ""
+                    "-"
                 } else if force_sign {
                     "+"
                 } else if space_flag {
@@ -5394,17 +5685,16 @@ impl MsvcCrt {
                     ""
                 };
                 let abs = f_val.abs();
-                let mut s = format!("{}{:.prec$}", sign, abs, prec = prec);
+                let mut s = format!("{sign}{abs:.prec$}", prec = prec);
                 if let Some(w) = width {
-                    if pad_char == '0' {
-                        // Zero-pad the integer part
-                        let dot_pos = s.find('.').unwrap_or(s.len());
-                        let int_part_len = dot_pos;
-                        if int_part_len < w {
-                            let padding = w - int_part_len;
-                            let zeros: String = std::iter::repeat('0').take(padding).collect();
-                            s = format!("{}{}{}", &s[..int_part_len], zeros, &s[int_part_len..]);
-                        }
+                    if pad_char == '0' && !left_justify && s.len() < w {
+                        // Zero-pad between the sign and the digits so the
+                        // total field width (including sign) is `w`.
+                        s = format!(
+                            "{sign}{:0>width$}",
+                            &s[sign.len()..],
+                            width = w.saturating_sub(sign.len())
+                        );
                     } else if s.len() < w {
                         if left_justify {
                             s = format!("{:<width$}", s, width = w);
@@ -5419,7 +5709,7 @@ impl MsvcCrt {
                 let f_val = value as f64;
                 let prec = precision.unwrap_or(6);
                 let sign = if f_val < 0.0 {
-                    ""
+                    "-"
                 } else if force_sign {
                     "+"
                 } else if space_flag {
@@ -5429,19 +5719,17 @@ impl MsvcCrt {
                 };
                 let abs = f_val.abs();
                 let mut s = if conversion == 'E' {
-                    format!("{}{:.prec$E}", sign, abs, prec = prec)
+                    format!("{sign}{abs:.prec$E}", prec = prec)
                 } else {
-                    format!("{}{:.prec$e}", sign, abs, prec = prec)
+                    format!("{sign}{abs:.prec$e}", prec = prec)
                 };
-                if let Some(w) = width {
-                    if s.len() < w {
-                        if left_justify {
-                            s = format!("{:<width$}", s, width = w);
-                        } else if pad_char == '0' {
-                            s = format!("{:0>width$}", s, width = w);
-                        } else {
-                            s = format!("{:>width$}", s, width = w);
-                        }
+                if let Some(w) = width.filter(|&w| s.len() < w) {
+                    if left_justify {
+                        s = format!("{:<width$}", s, width = w);
+                    } else if pad_char == '0' {
+                        s = format!("{:0>width$}", s, width = w);
+                    } else {
+                        s = format!("{:>width$}", s, width = w);
                     }
                 }
                 s
@@ -5450,7 +5738,7 @@ impl MsvcCrt {
                 let f_val = value as f64;
                 let prec = precision.unwrap_or(6);
                 let sign = if f_val < 0.0 {
-                    ""
+                    "-"
                 } else if force_sign {
                     "+"
                 } else if space_flag {
@@ -5460,19 +5748,17 @@ impl MsvcCrt {
                 };
                 let abs = f_val.abs();
                 let mut s = if conversion == 'G' {
-                    format!("{}{:.prec$}", sign, abs, prec = prec)
+                    format!("{sign}{abs:.prec$E}", prec = prec)
                 } else {
-                    format!("{}{:.prec$}", sign, abs, prec = prec)
+                    format!("{sign}{abs:.prec$e}", prec = prec)
                 };
-                if let Some(w) = width {
-                    if s.len() < w {
-                        if left_justify {
-                            s = format!("{:<width$}", s, width = w);
-                        } else if pad_char == '0' {
-                            s = format!("{:0>width$}", s, width = w);
-                        } else {
-                            s = format!("{:>width$}", s, width = w);
-                        }
+                if let Some(w) = width.filter(|&w| s.len() < w) {
+                    if left_justify {
+                        s = format!("{:<width$}", s, width = w);
+                    } else if pad_char == '0' {
+                        s = format!("{:0>width$}", s, width = w);
+                    } else {
+                        s = format!("{:>width$}", s, width = w);
                     }
                 }
                 s
@@ -5603,7 +5889,7 @@ impl MsvcCrt {
         let pad_char = if zero_pad && !left_justify { '0' } else { ' ' };
 
         let sign = if value < 0.0 {
-            ""
+            "-"
         } else if force_sign {
             "+"
         } else if space_flag {
@@ -5615,10 +5901,13 @@ impl MsvcCrt {
         match conversion {
             'd' | 'i' => {
                 let abs_val = value.abs() as i64;
-                let mut s = format!("{}{}", sign, abs_val);
-                if let Some(w) = width {
+                let mut s = format!("{sign}{abs_val}");
+                if let Some(w) = width.filter(|&w| s.len() < w) {
                     if left_justify {
                         s = format!("{:<width$}", s, width = w);
+                    } else if pad_char == '0' {
+                        // Zero-pad between the sign and the digits.
+                        s = format!("{sign}{:0>width$}", &s[sign.len()..], width = w - sign.len());
                     } else {
                         s = format!("{:>width$}", s, width = w);
                     }
@@ -5642,14 +5931,13 @@ impl MsvcCrt {
             'x' => {
                 let val = value.abs() as u64;
                 let prefix = if alternate && val != 0 { "0x" } else { "" };
-                let mut s = format!("{}{:x}", prefix, val);
+                let mut s = format!("{prefix}{:x}", val);
                 if let Some(w) = width {
                     if pad_char == '0' {
                         s = format!(
-                            "{}{:0>width$}",
-                            prefix,
+                            "{prefix}{:0>width$}",
                             format!("{:x}", val),
-                            width = w - prefix.len()
+                            width = w.saturating_sub(prefix.len())
                         );
                     } else if left_justify {
                         s = format!("{:<width$}", s, width = w);
@@ -5662,14 +5950,13 @@ impl MsvcCrt {
             'X' => {
                 let val = value.abs() as u64;
                 let prefix = if alternate && val != 0 { "0X" } else { "" };
-                let mut s = format!("{}{:X}", prefix, val);
+                let mut s = format!("{prefix}{:X}", val);
                 if let Some(w) = width {
                     if pad_char == '0' {
                         s = format!(
-                            "{}{:0>width$}",
-                            prefix,
+                            "{prefix}{:0>width$}",
                             format!("{:X}", val),
-                            width = w - prefix.len()
+                            width = w.saturating_sub(prefix.len())
                         );
                     } else if left_justify {
                         s = format!("{:<width$}", s, width = w);
@@ -5682,14 +5969,13 @@ impl MsvcCrt {
             'o' => {
                 let val = value.abs() as u64;
                 let prefix = if alternate { "0" } else { "" };
-                let mut s = format!("{}{:o}", prefix, val);
+                let mut s = format!("{prefix}{:o}", val);
                 if let Some(w) = width {
                     if pad_char == '0' {
                         s = format!(
-                            "{}{:0>width$}",
-                            prefix,
+                            "{prefix}{:0>width$}",
                             format!("{:o}", val),
-                            width = w - prefix.len()
+                            width = w.saturating_sub(prefix.len())
                         );
                     } else if left_justify {
                         s = format!("{:<width$}", s, width = w);
@@ -5702,17 +5988,16 @@ impl MsvcCrt {
             'f' | 'F' => {
                 let prec = precision.unwrap_or(6);
                 let abs = value.abs();
-                let mut s = format!("{}{:.prec$}", sign, abs, prec = prec);
+                let mut s = format!("{sign}{abs:.prec$}", prec = prec);
                 if let Some(w) = width {
-                    if pad_char == '0' && !left_justify {
-                        // Zero-pad the integer part
-                        let dot_pos = s.find('.').unwrap_or(s.len());
-                        let int_part_len = dot_pos;
-                        if int_part_len < w {
-                            let padding = w - int_part_len;
-                            let zeros: String = std::iter::repeat('0').take(padding).collect();
-                            s = format!("{}{}{}", &s[..int_part_len], zeros, &s[int_part_len..]);
-                        }
+                    if pad_char == '0' && !left_justify && s.len() < w {
+                        // Zero-pad between the sign and the digits so the
+                        // total field width (including sign) is `w`.
+                        s = format!(
+                            "{sign}{:0>width$}",
+                            &s[sign.len()..],
+                            width = w.saturating_sub(sign.len())
+                        );
                     } else if s.len() < w {
                         if left_justify {
                             s = format!("{:<width$}", s, width = w);
@@ -5727,19 +6012,17 @@ impl MsvcCrt {
                 let prec = precision.unwrap_or(6);
                 let abs = value.abs();
                 let mut s = if conversion == 'E' {
-                    format!("{}{:.prec$E}", sign, abs, prec = prec)
+                    format!("{sign}{abs:.prec$E}", prec = prec)
                 } else {
-                    format!("{}{:.prec$e}", sign, abs, prec = prec)
+                    format!("{sign}{abs:.prec$e}", prec = prec)
                 };
-                if let Some(w) = width {
-                    if s.len() < w {
-                        if left_justify {
-                            s = format!("{:<width$}", s, width = w);
-                        } else if pad_char == '0' {
-                            s = format!("{:0>width$}", s, width = w);
-                        } else {
-                            s = format!("{:>width$}", s, width = w);
-                        }
+                if let Some(w) = width.filter(|&w| s.len() < w) {
+                    if left_justify {
+                        s = format!("{:<width$}", s, width = w);
+                    } else if pad_char == '0' {
+                        s = format!("{:0>width$}", s, width = w);
+                    } else {
+                        s = format!("{:>width$}", s, width = w);
                     }
                 }
                 s
@@ -5747,16 +6030,18 @@ impl MsvcCrt {
             'g' | 'G' => {
                 let prec = precision.unwrap_or(6);
                 let abs = value.abs();
-                let mut s = format!("{}{:.prec$}", sign, abs, prec = prec);
-                if let Some(w) = width {
-                    if s.len() < w {
-                        if left_justify {
-                            s = format!("{:<width$}", s, width = w);
-                        } else if pad_char == '0' {
-                            s = format!("{:0>width$}", s, width = w);
-                        } else {
-                            s = format!("{:>width$}", s, width = w);
-                        }
+                let mut s = if conversion == 'G' {
+                    format!("{sign}{abs:.prec$E}", prec = prec)
+                } else {
+                    format!("{sign}{abs:.prec$e}", prec = prec)
+                };
+                if let Some(w) = width.filter(|&w| s.len() < w) {
+                    if left_justify {
+                        s = format!("{:<width$}", s, width = w);
+                    } else if pad_char == '0' {
+                        s = format!("{:0>width$}", s, width = w);
+                    } else {
+                        s = format!("{:>width$}", s, width = w);
                     }
                 }
                 s
@@ -5770,19 +6055,17 @@ impl MsvcCrt {
                 // Use scientific notation as a reasonable substitute for
                 // hex float notation since Rust lacks native %a support.
                 let mut s = if conversion == 'A' {
-                    format!("{}{:.prec$E}", sign, abs, prec = prec)
+                    format!("{sign}{abs:.prec$E}", prec = prec)
                 } else {
-                    format!("{}{:.prec$e}", sign, abs, prec = prec)
+                    format!("{sign}{abs:.prec$e}", prec = prec)
                 };
-                if let Some(w) = width {
-                    if s.len() < w {
-                        if left_justify {
-                            s = format!("{:<width$}", s, width = w);
-                        } else if pad_char == '0' {
-                            s = format!("{:0>width$}", s, width = w);
-                        } else {
-                            s = format!("{:>width$}", s, width = w);
-                        }
+                if let Some(w) = width.filter(|&w| s.len() < w) {
+                    if left_justify {
+                        s = format!("{:<width$}", s, width = w);
+                    } else if pad_char == '0' {
+                        s = format!("{:0>width$}", s, width = w);
+                    } else {
+                        s = format!("{:>width$}", s, width = w);
                     }
                 }
                 s
@@ -6247,6 +6530,12 @@ impl MsvcCrt {
     }
 }
 
+impl Default for MsvcCrt {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ===========================================================================
 // Shell32 / Shlwapi
 // ===========================================================================
@@ -6362,32 +6651,44 @@ pub struct FileVersionInfo {
 
 impl FileVersionInfo {
     /// Parse a VS_VERSIONINFO resource from raw bytes.
+    ///
+    /// The `VS_FIXEDFILEINFO` structure is located by scanning for its
+    /// signature (0xFEEF04BD), which accepts both standard `VS_VERSIONINFO`
+    /// resources (fixed file info follows the root header + "VS_VERSION_INFO"
+    /// key) and layouts with the structure at an arbitrary offset. Field
+    /// offsets follow the standard `VS_FIXEDFILEINFO` layout relative to the
+    /// signature.
     pub fn parse(data: &[u8]) -> AppResult<Self> {
-        if data.len() < 92 {
+        let sig = 0xFEEF_04BD_u32.to_le_bytes();
+        let sig_off = data
+            .windows(4)
+            .position(|w| w == sig)
+            .ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcWin32InvalidHandle,
+                    "invalid version info signature",
+                )
+            })?;
+        // Fields needed: dwFileVersionMS(+8), dwFileVersionLS(+12),
+        // dwFileFlags(+28), dwFileType(+36) — all within 40 bytes of the
+        // signature.
+        if sig_off + 40 > data.len() {
             return Err(AppError::new(
                 ReasonCode::RcWin32InvalidHandle,
                 "version info data too small",
             ));
         }
 
-        // Check for VS_FIXEDFILEINFO signature (0xFEEF04BD)
-        let signature = u32::from_le_bytes([data[40], data[41], data[42], data[43]]);
-        if signature != 0xFEEF_04BD {
-            return Err(AppError::new(
-                ReasonCode::RcWin32InvalidHandle,
-                format!("invalid version info signature: {signature:#010x}"),
-            ));
-        }
-
-        let version_ms = u32::from_le_bytes([data[48], data[49], data[50], data[51]]);
-        let version_ls = u32::from_le_bytes([data[52], data[53], data[54], data[55]]);
+        let signature = u32::from_le_bytes(data[sig_off..sig_off + 4].try_into().unwrap());
+        let version_ms = u32::from_le_bytes(data[sig_off + 8..sig_off + 12].try_into().unwrap());
+        let version_ls = u32::from_le_bytes(data[sig_off + 12..sig_off + 16].try_into().unwrap());
         let major = (version_ms >> 16) as u16;
         let minor = (version_ms & 0xFFFF) as u16;
         let patch = (version_ls >> 16) as u16;
         let build = (version_ls & 0xFFFF) as u16;
 
-        let file_flags = u32::from_le_bytes([data[56], data[57], data[58], data[59]]);
-        let file_type = u32::from_le_bytes([data[64], data[65], data[66], data[67]]);
+        let file_flags = u32::from_le_bytes(data[sig_off + 28..sig_off + 32].try_into().unwrap());
+        let file_type = u32::from_le_bytes(data[sig_off + 36..sig_off + 40].try_into().unwrap());
 
         // Parse StringFileInfo children (simplified)
         let mut string_info = BTreeMap::new();
@@ -6504,6 +6805,8 @@ pub struct XInputManager {
     connected: [bool; 4],
     vibration: [XInputVibration; 4],
     enabled: bool,
+    /// Monotonic packet counter used to stamp state updates.
+    packet_counter: u32,
 }
 
 impl XInputManager {
@@ -6530,8 +6833,18 @@ impl XInputManager {
                 },
             ],
             enabled: true,
+            packet_counter: 0,
         }
     }
+}
+
+impl Default for XInputManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl XInputManager {
 
     /// XInputGetState — get the state of a controller.
     pub fn get_state(&self, index: u32) -> AppResult<&XInputState> {
@@ -6619,6 +6932,7 @@ impl XInputManager {
                 "XInput: invalid controller index",
             ));
         }
+        self.packet_counter = self.packet_counter.max(initial_state.packet_number);
         self.connected[index as usize] = true;
         self.controllers[index as usize] = Some(initial_state);
         Ok(())
@@ -6638,12 +6952,22 @@ impl XInputManager {
     }
 
     /// Update controller state (from real input or replay).
+    ///
+    /// `packet_number` is advanced on every update (unless the caller
+    /// explicitly provides a newer value) so games that poll it to detect
+    /// state changes observe updates.
     pub fn update_state(&mut self, index: u32, state: XInputState) -> AppResult<()> {
         if index >= 4 || !self.connected[index as usize] {
             return Err(AppError::new(
                 ReasonCode::RcWin32InvalidHandle,
                 "XInput: controller not connected",
             ));
+        }
+        let next = self.packet_counter.wrapping_add(1);
+        self.packet_counter = next;
+        let mut state = state;
+        if state.packet_number < next {
+            state.packet_number = next;
         }
         self.controllers[index as usize] = Some(state);
         Ok(())
@@ -6851,7 +7175,7 @@ impl DirectInputDevice8 {
             _ => {
                 return Err(AppError::new(
                     ReasonCode::RcInputUnsupported,
-                    &format!("DirectInput: unknown force-feedback command {command}"),
+                    format!("DirectInput: unknown force-feedback command {command}"),
                 ));
             }
         }
@@ -6869,10 +7193,8 @@ impl DirectInputDevice8 {
             ));
         }
 
-        let gain_scaled =
-            (effect.gain.min(10000) as u32).saturating_mul(self.device_gain.min(10000)) / 10000;
-        let effective_magnitude =
-            (effect.magnitude.min(10000) as u32).saturating_mul(gain_scaled) / 10000;
+        let gain_scaled = effect.gain.min(10000).saturating_mul(self.device_gain.min(10000)) / 10000;
+        let effective_magnitude = effect.magnitude.min(10000).saturating_mul(gain_scaled) / 10000;
 
         // For periodic and constant effects, map the magnitude to motor speeds.
         // For condition effects (spring, damper, inertia, friction) we use a
@@ -6967,12 +7289,42 @@ pub enum BCryptKeyType {
     EcdhP384,
 }
 
+/// AES chaining mode for a BCrypt symmetric key.
+///
+/// Real BCrypt selects the chaining mode via `BCryptSetProperty`
+/// (`BCRYPT_CHAINING_MODE`), not by key length. The mode is tracked as key
+/// state so encrypt/decrypt do not silently misprocess keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BCryptChainingMode {
+    /// Infer the mode from the key length (16 bytes → CBC, 32 → GCM).
+    /// Legacy behaviour, used when no explicit mode was set.
+    Auto,
+    /// CBC (unauthenticated).
+    Cbc,
+    /// GCM (authenticated; the 16-byte tag is appended to the ciphertext).
+    Gcm,
+}
+
 /// BCrypt key handle.
 #[derive(Debug, Clone)]
 pub struct BCryptKey {
     pub algorithm: String,
     pub key_data: Vec<u8>,
     pub key_type: BCryptKeyType,
+    /// AES chaining mode (see [`BCryptChainingMode`]).
+    pub chaining_mode: BCryptChainingMode,
+}
+
+impl BCryptKey {
+    /// Set the AES chaining mode used by encrypt/decrypt.
+    pub fn set_chaining_mode(&mut self, mode: BCryptChainingMode) {
+        self.chaining_mode = mode;
+    }
+
+    /// Get the AES chaining mode used by encrypt/decrypt.
+    pub fn chaining_mode(&self) -> BCryptChainingMode {
+        self.chaining_mode
+    }
 }
 
 /// Result of a secret agreement (ECDH key exchange).
@@ -6999,6 +7351,15 @@ impl BCryptContext {
             key_counter: AtomicU64::new(1),
         }
     }
+}
+
+impl Default for BCryptContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BCryptContext {
 
     /// BCryptCreateHash — create a hash object.
     pub fn create_hash(&self, algorithm: &str) -> AppResult<BCryptHash> {
@@ -7137,6 +7498,7 @@ impl BCryptContext {
                 algorithm: algorithm.to_string(),
                 key_data: key_data.to_vec(),
                 key_type: BCryptKeyType::Symmetric,
+                chaining_mode: BCryptChainingMode::Auto,
             }),
             _ => Err(AppError::new(
                 ReasonCode::RcWin32InvalidHandle,
@@ -7149,8 +7511,15 @@ impl BCryptContext {
     pub fn generate_key_pair(&self, algorithm: &str, key_len: u32) -> AppResult<BCryptKey> {
         match algorithm {
             BCRYPT_RSA_ALGORITHM => {
-                // Generate a new RSA key pair using the `rsa` crate
-                let bits = if key_len == 0 { 2048 } else { key_len };
+                // Generate a new RSA key pair using the `rsa` crate.
+                // Clamp the guest-controlled size to the BCrypt-supported
+                // range (512..=16384 bits, multiple of 64) so hostile sizes
+                // cannot trigger enormous generation work.
+                let bits = if key_len == 0 {
+                    2048
+                } else {
+                    ((key_len.clamp(512, 16384)) / 64) * 64
+                };
                 let rng = &mut rand::thread_rng();
                 let private_key = rsa::RsaPrivateKey::new(rng, bits as usize).map_err(|e| {
                     AppError::new(
@@ -7168,6 +7537,7 @@ impl BCryptContext {
                     algorithm: BCRYPT_RSA_ALGORITHM.to_string(),
                     key_data: der_bytes.as_bytes().to_vec(),
                     key_type: BCryptKeyType::Rsa { bit_length: bits },
+                    chaining_mode: BCryptChainingMode::Auto,
                 })
             }
             BCRYPT_ECDSA_P256_ALGORITHM => {
@@ -7184,6 +7554,7 @@ impl BCryptContext {
                     algorithm: BCRYPT_ECDSA_P256_ALGORITHM.to_string(),
                     key_data: der_bytes.as_bytes().to_vec(),
                     key_type: BCryptKeyType::EcdsaP256,
+                    chaining_mode: BCryptChainingMode::Auto,
                 })
             }
             BCRYPT_ECDSA_P384_ALGORITHM => {
@@ -7200,6 +7571,7 @@ impl BCryptContext {
                     algorithm: BCRYPT_ECDSA_P384_ALGORITHM.to_string(),
                     key_data: der_bytes.as_bytes().to_vec(),
                     key_type: BCryptKeyType::EcdsaP384,
+                    chaining_mode: BCryptChainingMode::Auto,
                 })
             }
             _ => Err(AppError::new(
@@ -7362,13 +7734,28 @@ impl BCryptContext {
     }
 
     /// BCryptEncrypt — encrypt data with a symmetric key.
+    ///
+    /// The AES chaining mode comes from the key's [`BCryptChainingMode`]
+    /// (set via [`BCryptKey::set_chaining_mode`]); when `Auto` it is inferred
+    /// from the key length (16 bytes → CBC, 32 bytes → GCM) for legacy
+    /// compatibility. For GCM, the 16-byte authentication tag is appended to
+    /// the returned ciphertext.
     pub fn encrypt(key: &BCryptKey, plaintext: &[u8], iv: Option<&[u8; 16]>) -> AppResult<Vec<u8>> {
         match key.algorithm.as_str() {
             BCRYPT_AES_ALGORITHM => {
-                // Detect AES mode from key size or content: 16 bytes = AES-128-CBC
-                // For AES-GCM, the key data includes the key material and the nonce is passed as IV.
-                if key.key_data.len() == 16 {
-                    // AES-128-CBC (legacy support)
+                let use_cbc = match key.chaining_mode {
+                    BCryptChainingMode::Cbc => true,
+                    BCryptChainingMode::Gcm => false,
+                    BCryptChainingMode::Auto => key.key_data.len() == 16,
+                };
+                if use_cbc {
+                    // AES-128-CBC
+                    if key.key_data.len() != 16 {
+                        return Err(AppError::new(
+                            ReasonCode::RcWin32InvalidHandle,
+                            "BCrypt: CBC mode requires a 16-byte AES key",
+                        ));
+                    }
                     let iv_val = iv.copied().unwrap_or([0u8; 16]);
                     crate::network::aes_128_cbc_encrypt(
                         &key.key_data[..16].try_into().map_err(|_| {
@@ -7380,42 +7767,10 @@ impl BCryptContext {
                         &iv_val,
                         plaintext,
                     )
-                } else if key.key_data.len() == 32 {
-                    // AES-256-GCM
-                    use aes_gcm::aead::{AeadInPlace, KeyInit};
-                    use aes_gcm::{Aes256Gcm, Nonce};
-                    let cipher = Aes256Gcm::new_from_slice(&key.key_data).map_err(|e| {
-                        AppError::new(
-                            ReasonCode::RcWin32InvalidHandle,
-                            format!("BCrypt: AES-256-GCM key init failed: {e}"),
-                        )
-                    })?;
-                    let nonce_bytes = iv
-                        .map(|raw| {
-                            let mut n = [0u8; 12];
-                            n.copy_from_slice(&raw[..12]);
-                            n
-                        })
-                        .unwrap_or([0u8; 12]);
-                    let nonce = Nonce::from_slice(&nonce_bytes);
-                    let mut buf = plaintext.to_vec();
-                    cipher.encrypt_in_place(nonce, &[], &mut buf).map_err(|e| {
-                        AppError::new(
-                            ReasonCode::RcWin32InvalidHandle,
-                            format!("BCrypt: AES-256-GCM encrypt failed: {e}"),
-                        )
-                    })?;
-                    Ok(buf)
                 } else {
-                    // AES-128-GCM (16-byte key with GCM mode indicated by IV length or context)
+                    // GCM — the nonce is the first 12 bytes of the IV and
+                    // the 16-byte tag is appended to the ciphertext.
                     use aes_gcm::aead::{AeadInPlace, KeyInit};
-                    use aes_gcm::{Aes128Gcm, Nonce};
-                    let cipher = Aes128Gcm::new_from_slice(&key.key_data).map_err(|e| {
-                        AppError::new(
-                            ReasonCode::RcWin32InvalidHandle,
-                            format!("BCrypt: AES-128-GCM key init failed: {e}"),
-                        )
-                    })?;
                     let nonce_bytes = iv
                         .map(|raw| {
                             let mut n = [0u8; 12];
@@ -7423,14 +7778,46 @@ impl BCryptContext {
                             n
                         })
                         .unwrap_or([0u8; 12]);
-                    let nonce = Nonce::from_slice(&nonce_bytes);
+                    let nonce = aes_gcm::Nonce::from_slice(&nonce_bytes);
                     let mut buf = plaintext.to_vec();
-                    cipher.encrypt_in_place(nonce, &[], &mut buf).map_err(|e| {
-                        AppError::new(
-                            ReasonCode::RcWin32InvalidHandle,
-                            format!("BCrypt: AES-128-GCM encrypt failed: {e}"),
-                        )
-                    })?;
+                    match key.key_data.len() {
+                        16 => {
+                            let cipher = aes_gcm::Aes128Gcm::new_from_slice(&key.key_data)
+                                .map_err(|e| {
+                                    AppError::new(
+                                        ReasonCode::RcWin32InvalidHandle,
+                                        format!("BCrypt: AES-128-GCM key init failed: {e}"),
+                                    )
+                                })?;
+                            cipher.encrypt_in_place(nonce, &[], &mut buf).map_err(|e| {
+                                AppError::new(
+                                    ReasonCode::RcWin32InvalidHandle,
+                                    format!("BCrypt: AES-128-GCM encrypt failed: {e}"),
+                                )
+                            })?;
+                        }
+                        32 => {
+                            let cipher = aes_gcm::Aes256Gcm::new_from_slice(&key.key_data)
+                                .map_err(|e| {
+                                    AppError::new(
+                                        ReasonCode::RcWin32InvalidHandle,
+                                        format!("BCrypt: AES-256-GCM key init failed: {e}"),
+                                    )
+                                })?;
+                            cipher.encrypt_in_place(nonce, &[], &mut buf).map_err(|e| {
+                                AppError::new(
+                                    ReasonCode::RcWin32InvalidHandle,
+                                    format!("BCrypt: AES-256-GCM encrypt failed: {e}"),
+                                )
+                            })?;
+                        }
+                        len => {
+                            return Err(AppError::new(
+                                ReasonCode::RcWin32InvalidHandle,
+                                format!("BCrypt: AES-GCM key must be 16 or 32 bytes, got {len}"),
+                            ));
+                        }
+                    }
                     Ok(buf)
                 }
             }
@@ -7442,6 +7829,10 @@ impl BCryptContext {
     }
 
     /// BCryptDecrypt — decrypt data with a symmetric key.
+    ///
+    /// Mirrors [`BCryptContext::encrypt`]: the chaining mode comes from the
+    /// key state (or is inferred from key length in `Auto` mode), and GCM
+    /// input is expected to include the appended 16-byte authentication tag.
     pub fn decrypt(
         key: &BCryptKey,
         ciphertext: &[u8],
@@ -7449,8 +7840,19 @@ impl BCryptContext {
     ) -> AppResult<Vec<u8>> {
         match key.algorithm.as_str() {
             BCRYPT_AES_ALGORITHM => {
-                if key.key_data.len() == 16 {
-                    // AES-128-CBC (legacy support)
+                let use_cbc = match key.chaining_mode {
+                    BCryptChainingMode::Cbc => true,
+                    BCryptChainingMode::Gcm => false,
+                    BCryptChainingMode::Auto => key.key_data.len() == 16,
+                };
+                if use_cbc {
+                    // AES-128-CBC
+                    if key.key_data.len() != 16 {
+                        return Err(AppError::new(
+                            ReasonCode::RcWin32InvalidHandle,
+                            "BCrypt: CBC mode requires a 16-byte AES key",
+                        ));
+                    }
                     let iv_val = iv.copied().unwrap_or([0u8; 16]);
                     crate::network::aes_128_cbc_decrypt(
                         &key.key_data[..16].try_into().map_err(|_| {
@@ -7462,42 +7864,10 @@ impl BCryptContext {
                         &iv_val,
                         ciphertext,
                     )
-                } else if key.key_data.len() == 32 {
-                    // AES-256-GCM
-                    use aes_gcm::aead::{AeadInPlace, KeyInit};
-                    use aes_gcm::{Aes256Gcm, Nonce};
-                    let cipher = Aes256Gcm::new_from_slice(&key.key_data).map_err(|e| {
-                        AppError::new(
-                            ReasonCode::RcWin32InvalidHandle,
-                            format!("BCrypt: AES-256-GCM key init failed: {e}"),
-                        )
-                    })?;
-                    let nonce_bytes = iv
-                        .map(|raw| {
-                            let mut n = [0u8; 12];
-                            n.copy_from_slice(&raw[..12]);
-                            n
-                        })
-                        .unwrap_or([0u8; 12]);
-                    let nonce = Nonce::from_slice(&nonce_bytes);
-                    let mut buf = ciphertext.to_vec();
-                    cipher.decrypt_in_place(nonce, &[], &mut buf).map_err(|e| {
-                        AppError::new(
-                            ReasonCode::RcWin32InvalidHandle,
-                            format!("BCrypt: AES-256-GCM decrypt failed: {e}"),
-                        )
-                    })?;
-                    Ok(buf)
                 } else {
-                    // AES-128-GCM
+                    // GCM — the nonce is the first 12 bytes of the IV and
+                    // the last 16 bytes of the input are the auth tag.
                     use aes_gcm::aead::{AeadInPlace, KeyInit};
-                    use aes_gcm::{Aes128Gcm, Nonce};
-                    let cipher = Aes128Gcm::new_from_slice(&key.key_data).map_err(|e| {
-                        AppError::new(
-                            ReasonCode::RcWin32InvalidHandle,
-                            format!("BCrypt: AES-128-GCM key init failed: {e}"),
-                        )
-                    })?;
                     let nonce_bytes = iv
                         .map(|raw| {
                             let mut n = [0u8; 12];
@@ -7505,14 +7875,46 @@ impl BCryptContext {
                             n
                         })
                         .unwrap_or([0u8; 12]);
-                    let nonce = Nonce::from_slice(&nonce_bytes);
+                    let nonce = aes_gcm::Nonce::from_slice(&nonce_bytes);
                     let mut buf = ciphertext.to_vec();
-                    cipher.decrypt_in_place(nonce, &[], &mut buf).map_err(|e| {
-                        AppError::new(
-                            ReasonCode::RcWin32InvalidHandle,
-                            format!("BCrypt: AES-128-GCM decrypt failed: {e}"),
-                        )
-                    })?;
+                    match key.key_data.len() {
+                        16 => {
+                            let cipher = aes_gcm::Aes128Gcm::new_from_slice(&key.key_data)
+                                .map_err(|e| {
+                                    AppError::new(
+                                        ReasonCode::RcWin32InvalidHandle,
+                                        format!("BCrypt: AES-128-GCM key init failed: {e}"),
+                                    )
+                                })?;
+                            cipher.decrypt_in_place(nonce, &[], &mut buf).map_err(|e| {
+                                AppError::new(
+                                    ReasonCode::RcWin32InvalidHandle,
+                                    format!("BCrypt: AES-128-GCM decrypt failed: {e}"),
+                                )
+                            })?;
+                        }
+                        32 => {
+                            let cipher = aes_gcm::Aes256Gcm::new_from_slice(&key.key_data)
+                                .map_err(|e| {
+                                    AppError::new(
+                                        ReasonCode::RcWin32InvalidHandle,
+                                        format!("BCrypt: AES-256-GCM key init failed: {e}"),
+                                    )
+                                })?;
+                            cipher.decrypt_in_place(nonce, &[], &mut buf).map_err(|e| {
+                                AppError::new(
+                                    ReasonCode::RcWin32InvalidHandle,
+                                    format!("BCrypt: AES-256-GCM decrypt failed: {e}"),
+                                )
+                            })?;
+                        }
+                        len => {
+                            return Err(AppError::new(
+                                ReasonCode::RcWin32InvalidHandle,
+                                format!("BCrypt: AES-GCM key must be 16 or 32 bytes, got {len}"),
+                            ));
+                        }
+                    }
                     Ok(buf)
                 }
             }
@@ -7671,12 +8073,17 @@ impl BCryptContext {
     /// - `BCRYPT_KDF_HASH` (hash the secret with optional salt)
     /// - `BCRYPT_KDF_HMAC` (HMAC the secret with a salt)
     /// - `BCRYPT_KDF_SP80056A` (concatenation KDF per SP 800-56A)
+    ///
+    /// `output_len` is capped at 64 KiB so a guest-controlled length cannot
+    /// exhaust host memory.
     pub fn derive_key(
         secret: &BCryptSecret,
         kdf: &str,
         kdf_feedback: &[u8],
         output_len: u32,
     ) -> AppResult<Vec<u8>> {
+        const MAX_KDF_OUTPUT_LEN: u32 = 64 * 1024;
+        let output_len = output_len.min(MAX_KDF_OUTPUT_LEN);
         match kdf {
             "HASH" | "BCRYPT_KDF_HASH" => {
                 use sha2::{Digest, Sha256};
@@ -7724,7 +8131,7 @@ impl BCryptContext {
                 while derived.len() < output_len as usize {
                     let mut hasher = Sha256::new();
                     // Counter (4 bytes big-endian)
-                    hasher.update(&counter.to_be_bytes());
+                    hasher.update(counter.to_be_bytes());
                     // Shared secret
                     hasher.update(&secret.secret);
                     // Algorithm ID / OtherInfo (kdf_feedback)
@@ -7765,8 +8172,10 @@ pub struct TpTimer {
     pub id: u64,
     pub callback: u64,
     pub context: u64,
-    pub due_time_ms: u32,
-    pub period_ms: u32,
+    /// Due time in milliseconds since an arbitrary epoch (u64 to avoid
+    /// wraparound on long-running hosts).
+    pub due_time_ms: u64,
+    pub period_ms: u64,
     pub is_set: bool,
 }
 
@@ -7777,6 +8186,8 @@ pub struct TpWait {
     pub callback: u64,
     pub context: u64,
     pub handle: u64,
+    /// Whether this wait has already fired for the current registration.
+    pub fired: bool,
 }
 
 /// Manages Windows Thread Pool API objects.
@@ -7785,8 +8196,6 @@ pub struct ThreadPoolManager {
     work_items: BTreeMap<u64, TpWork>,
     timers: BTreeMap<u64, TpTimer>,
     waits: BTreeMap<u64, TpWait>,
-    /// Timestamp used for timer expiry calculations.
-    start_time: std::time::Instant,
 }
 
 impl ThreadPoolManager {
@@ -7796,9 +8205,17 @@ impl ThreadPoolManager {
             work_items: BTreeMap::new(),
             timers: BTreeMap::new(),
             waits: BTreeMap::new(),
-            start_time: std::time::Instant::now(),
         }
     }
+}
+
+impl Default for ThreadPoolManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ThreadPoolManager {
 
     /// CreateThreadpoolWork
     pub fn create_work(&mut self, callback: u64, context: u64) -> u64 {
@@ -7850,6 +8267,9 @@ impl ThreadPoolManager {
     }
 
     /// SetThreadpoolTimer
+    ///
+    /// A due time of 0 means "due immediately" (Windows semantics), so the
+    /// timer is always marked as set.
     pub fn set_timer(&mut self, id: u64, due_time_ms: u32, period_ms: u32) -> AppResult<()> {
         let timer = self.timers.get_mut(&id).ok_or_else(|| {
             AppError::new(
@@ -7857,9 +8277,9 @@ impl ThreadPoolManager {
                 format!("TP timer {id} not found"),
             )
         })?;
-        timer.due_time_ms = due_time_ms;
-        timer.period_ms = period_ms;
-        timer.is_set = due_time_ms > 0;
+        timer.due_time_ms = due_time_ms as u64;
+        timer.period_ms = period_ms as u64;
+        timer.is_set = true;
         Ok(())
     }
 
@@ -7878,6 +8298,7 @@ impl ThreadPoolManager {
                 callback,
                 context,
                 handle,
+                fired: false,
             },
         );
         id
@@ -7915,26 +8336,27 @@ impl ThreadPoolManager {
     /// Returns `Some((callback, context))` if a submitted work item is
     /// available, or `None` if the queue is empty.
     ///
+    /// The work object stays registered (it can be submitted again via
+    /// `SubmitThreadpoolWork`); it is only removed by `CloseThreadpoolWork`.
     /// The returned callback should be invoked by the pe_runtime in the
     /// guest context with the given context parameter.
     pub fn pop_work_callback(&mut self) -> Option<(u64, u64)> {
-        // Find the first submitted work item and remove it.
+        // Find the first submitted work item and mark it as dispatched.
         let id = self
             .work_items
             .iter()
             .find(|(_, w)| w.submitted)
             .map(|(&id, _)| id)?;
-        if let Some(work) = self.work_items.remove(&id) {
-            Some((work.callback, work.context))
-        } else {
-            None
-        }
+        let work = self.work_items.get_mut(&id)?;
+        work.submitted = false;
+        Some((work.callback, work.context))
     }
 
     /// Pop all pending work items and return their (callback, context) pairs.
     ///
     /// This drains all submitted-but-not-yet-executed work items at once,
-    /// which is useful for batch dispatch in the execution loop.
+    /// which is useful for batch dispatch in the execution loop. Work items
+    /// stay registered for later re-submission.
     pub fn drain_pending_work(&mut self) -> Vec<(u64, u64)> {
         let mut results = Vec::new();
         let pending_ids: Vec<u64> = self
@@ -7944,7 +8366,8 @@ impl ThreadPoolManager {
             .map(|(&id, _)| id)
             .collect();
         for id in pending_ids {
-            if let Some(work) = self.work_items.remove(&id) {
+            if let Some(work) = self.work_items.get_mut(&id) {
+                work.submitted = false;
                 results.push((work.callback, work.context));
             }
         }
@@ -7962,7 +8385,7 @@ impl ThreadPoolManager {
         let due_ids: Vec<u64> = self
             .timers
             .iter()
-            .filter(|(_, t)| t.is_set && current_time_ms >= t.due_time_ms as u64)
+            .filter(|(_, t)| t.is_set && current_time_ms >= t.due_time_ms)
             .map(|(&id, _)| id)
             .collect();
         for id in due_ids {
@@ -7970,7 +8393,7 @@ impl ThreadPoolManager {
                 due.push((timer.callback, timer.context));
                 if timer.period_ms > 0 {
                     // Re-arm periodic timer: advance due_time by period.
-                    timer.due_time_ms = timer.due_time_ms.wrapping_add(timer.period_ms);
+                    timer.due_time_ms = timer.due_time_ms.saturating_add(timer.period_ms);
                     timer.is_set = true;
                 } else {
                     // One-shot timer: mark as not set.
@@ -7985,8 +8408,11 @@ impl ThreadPoolManager {
     /// (callback, context) pairs for any matched waits.
     ///
     /// `signaled_handles` is a set of handles that are currently in the
-    /// signaled state.  Waits whose handle is in this set are removed and
-    /// their callbacks are returned for dispatch.
+    /// signaled state.  Waits whose handle is in this set (and that have not
+    /// already fired for the current registration) are marked as fired and
+    /// their callbacks are returned for dispatch. The wait stays registered
+    /// (like Windows thread-pool waits, which must be re-armed to fire
+    /// again); it is removed only by `CloseThreadpoolWait`.
     pub fn pop_signaled_waits(
         &mut self,
         signaled_handles: &std::collections::HashSet<u64>,
@@ -7995,11 +8421,12 @@ impl ThreadPoolManager {
         let signaled_ids: Vec<u64> = self
             .waits
             .iter()
-            .filter(|(_, w)| signaled_handles.contains(&w.handle))
+            .filter(|(_, w)| !w.fired && signaled_handles.contains(&w.handle))
             .map(|(&id, _)| id)
             .collect();
         for id in signaled_ids {
-            if let Some(wait) = self.waits.remove(&id) {
+            if let Some(wait) = self.waits.get_mut(&id) {
+                wait.fired = true;
                 signaled.push((wait.callback, wait.context));
             }
         }
@@ -8059,9 +8486,18 @@ impl SyncBarrier {
             self.sense.fetch_xor(1, Ordering::Release);
             true // Returns true for the last thread
         } else {
-            // Spin-wait until generation advances
+            // Spin-wait until generation advances, yielding the CPU after a
+            // bounded number of spins so other threads (including the last
+            // barrier thread in a cooperative emulator) get scheduled.
+            let mut spins = 0u32;
             while self.generation.load(Ordering::Acquire) == gen_val {
-                std::hint::spin_loop();
+                spins += 1;
+                if spins >= 1000 {
+                    spins = 0;
+                    std::thread::yield_now();
+                } else {
+                    std::hint::spin_loop();
+                }
             }
             false
         }
@@ -8126,6 +8562,8 @@ const MAX_STACK_FRAMES: usize = 256;
 /// DbgHelp symbol handler.
 pub struct DbgHelpContext {
     loaded_modules: BTreeMap<String, u64>,
+    /// Module base addresses → name, kept sorted for O(log n) address lookup.
+    module_bases: BTreeMap<u64, String>,
     symbols: BTreeMap<u64, SymbolInfo>,
     #[allow(dead_code)]
     next_sym_id: u64,
@@ -8135,10 +8573,20 @@ impl DbgHelpContext {
     pub fn new() -> Self {
         Self {
             loaded_modules: BTreeMap::new(),
+            module_bases: BTreeMap::new(),
             symbols: BTreeMap::new(),
             next_sym_id: 1,
         }
     }
+}
+
+impl Default for DbgHelpContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DbgHelpContext {
 
     /// SymInitialize — initialize the symbol handler for a process.
     pub fn sym_initialize(&mut self, _process_handle: u64) -> AppResult<()> {
@@ -8150,32 +8598,32 @@ impl DbgHelpContext {
     pub fn sym_cleanup(&mut self) {
         self.symbols.clear();
         self.loaded_modules.clear();
+        self.module_bases.clear();
     }
 
     /// SymLoadModuleEx — load symbols for a module.
     pub fn sym_load_module(&mut self, module_name: &str, base_address: u64) -> AppResult<()> {
         self.loaded_modules
             .insert(module_name.to_string(), base_address);
+        self.module_bases.insert(base_address, module_name.to_string());
         Ok(())
     }
 
     /// SymFromAddr — look up a symbol by address.
+    ///
+    /// Finds the closest symbol at or below the given address using the
+    /// sorted symbol table (O(log n)).
     pub fn sym_from_addr(&self, address: u64) -> AppResult<&SymbolInfo> {
-        // Find the closest symbol at or below the given address
-        let mut best: Option<(&u64, &SymbolInfo)> = None;
-        for (addr, sym) in &self.symbols {
-            if *addr <= address {
-                if best.is_none() || *addr > *best.unwrap().0 {
-                    best = Some((addr, sym));
-                }
-            }
-        }
-        best.map(|(_, sym)| sym).ok_or_else(|| {
-            AppError::new(
-                ReasonCode::RcWin32InvalidHandle,
-                format!("no symbol found at address {address:#x}"),
-            )
-        })
+        self.symbols
+            .range(..=address)
+            .next_back()
+            .map(|(_, sym)| sym)
+            .ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcWin32InvalidHandle,
+                    format!("no symbol found at address {address:#x}"),
+                )
+            })
     }
 
     /// StackWalk64 — walk the stack using a memory reader.
@@ -8266,16 +8714,11 @@ impl DbgHelpContext {
             // Compute displacement from nearest symbol
             let displacement = self.symbols.get(&ip).map(|_s| 0u64).unwrap_or_else(|| {
                 // Find closest symbol below this address
-                let mut best_disp = 0u64;
-                for (addr, _) in &self.symbols {
-                    if *addr <= ip {
-                        let d = ip - addr;
-                        if d < best_disp || best_disp == 0 {
-                            best_disp = d;
-                        }
-                    }
-                }
-                best_disp
+                self.symbols
+                    .range(..=ip)
+                    .next_back()
+                    .map(|(addr, _)| ip - addr)
+                    .unwrap_or(0)
             });
 
             frames.push(StackFrameInfo {
@@ -8390,6 +8833,7 @@ impl DbgHelpContext {
     /// # Returns
     /// A tuple of (addresses, frames_skipped) where addresses is the captured
     /// back trace and frames_skipped is the number of frames that were skipped.
+    #[allow(clippy::too_many_arguments)] // mirrors RtlCaptureStackBackTrace's parameter list
     pub fn rtl_capture_stack_back_trace<F>(
         &self,
         skip_frames: usize,
@@ -8436,17 +8880,13 @@ impl DbgHelpContext {
         );
     }
 
-    /// Find the module containing an address.
+    /// Find the module containing an address (O(log n) via the sorted
+    /// module base table).
     fn find_module_for_address(&self, address: u64) -> Option<String> {
-        let mut best: Option<(&str, u64)> = None;
-        for (name, base) in &self.loaded_modules {
-            if *base <= address {
-                if best.is_none() || *base > best.unwrap().1 {
-                    best = Some((name, *base));
-                }
-            }
-        }
-        best.map(|(name, _)| name.to_string())
+        self.module_bases
+            .range(..=address)
+            .next_back()
+            .map(|(_, name)| name.clone())
     }
 
     /// Get the count of loaded modules.
@@ -8758,7 +9198,7 @@ fn parse_acl(bytes: &[u8], offset: usize) -> Option<Acl> {
         let ace_type = bytes[ace_offset];
         let ace_flags = bytes[ace_offset + 1];
         let ace_size = u16::from_le_bytes([bytes[ace_offset + 2], bytes[ace_offset + 3]]);
-        if ace_size < 8 || (ace_offset as usize) + ace_size as usize > bytes.len() {
+        if ace_size < 8 || ace_offset + ace_size as usize > bytes.len() {
             break;
         }
         let mask = u32::from_le_bytes([
@@ -8846,6 +9286,15 @@ impl Advapi32Manager {
             },
         }
     }
+}
+
+impl Default for Advapi32Manager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Advapi32Manager {
 
     /// OpenSCManager — open the service control manager.
     pub fn open_sc_manager(&self) -> AppResult<u64> {
@@ -9004,20 +9453,58 @@ pub struct ServiceControlManager {
     next_handle: u64,
     /// Monotonically increasing virtual PID counter.
     next_pid: u32,
-    /// Tracked child processes, keyed by their assigned PID.
-    children: HashMap<u32, std::process::Child>,
 }
 
 impl ServiceControlManager {
-    /// Create an empty Service Control Manager.
+    /// Create an empty Service Control Manager, pre-seeded with the same
+    /// well-known services as [`Advapi32Manager`] so both SCM implementations
+    /// expose the same service set to Steam/games.
     pub fn new() -> Self {
+        let mut services = BTreeMap::new();
+        let mut next_handle = 1u64;
+        let mut insert = |name: &str, display: &str, pid: u32, services: &mut BTreeMap<String, ScmServiceRecord>| {
+            let handle = next_handle;
+            next_handle += 1;
+            services.insert(
+                name.to_string(),
+                ScmServiceRecord {
+                    name: name.to_string(),
+                    display_name: display.to_string(),
+                    status: ServiceStatus::Running,
+                    handle,
+                    executable_path: PathBuf::new(),
+                    pid: Some(pid),
+                },
+            );
+        };
+        insert(
+            "SteamClientService",
+            "Steam Client Service",
+            1234,
+            &mut services,
+        );
+        insert(
+            "Winmgmt",
+            "Windows Management Instrumentation",
+            5678,
+            &mut services,
+        );
+        insert("Audiosrv", "Windows Audio", 9012, &mut services);
         Self {
-            services: BTreeMap::new(),
-            next_handle: 1,
+            services,
+            next_handle,
             next_pid: 1000,
-            children: HashMap::new(),
         }
     }
+}
+
+impl Default for ServiceControlManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ServiceControlManager {
 
     /// OpenSCManagerW — open the service control manager.
     ///
@@ -9114,10 +9601,9 @@ impl ServiceControlManager {
 
     /// StartServiceW — start a registered service.
     ///
-    /// Attempts to spawn the service executable as a child process via
-    /// `std::process::Command`. If the spawn fails (the executable is
-    /// likely a Windows PE that cannot run natively on macOS), a
-    /// synthetic PID is assigned instead.
+    /// Service executables are guest-controlled paths and must never be
+    /// executed on the host; the service is simulated by assigning a
+    /// synthetic PID.
     pub fn start_service(
         &mut self,
         _svc_handle: u64,
@@ -9150,21 +9636,10 @@ impl ServiceControlManager {
             _ => {}
         }
 
-        // Try to spawn the service executable as a child process.
-        let pid = match std::process::Command::new(&record.executable_path).spawn() {
-            Ok(child) => {
-                let pid = child.id();
-                self.children.insert(pid, child);
-                pid
-            }
-            Err(_) => {
-                // Spawn failed (expected for Windows PEs on macOS) —
-                // assign a synthetic PID.
-                let pid = self.next_pid;
-                self.next_pid = self.next_pid.wrapping_add(1);
-                pid
-            }
-        };
+        // Assign a synthetic PID — never spawn the guest-supplied executable
+        // on the host.
+        let pid = self.next_pid;
+        self.next_pid = self.next_pid.wrapping_add(1);
 
         record.status = ServiceStatus::Running;
         record.pid = Some(pid);
@@ -9193,21 +9668,6 @@ impl ServiceControlManager {
         match control_code {
             0x01 => {
                 // SERVICE_CONTROL_STOP
-                if let Some(pid) = record.pid {
-                    // Kill the child process if we spawned it
-                    if let Some(mut child) = self.children.remove(&pid) {
-                        if let Err(e) = child.kill() {
-                            eprintln!(
-                                "[SCM] control_service(STOP): failed to kill child process pid {pid}: {e}"
-                            );
-                        }
-                        if let Err(e) = child.wait() {
-                            eprintln!(
-                                "[SCM] control_service(STOP): failed to wait for child process pid {pid}: {e}"
-                            );
-                        }
-                    }
-                }
                 record.status = ServiceStatus::Stopped;
                 record.pid = None;
             }
@@ -9227,7 +9687,9 @@ impl ServiceControlManager {
                 // SERVICE_CONTROL_INTERROGATE — no state change
             }
             0x05 => {
-                // SERVICE_CONTROL_SHUTDOWN — service is being shut down
+                // SERVICE_CONTROL_SHUTDOWN — service is being shut down.
+                // The service runs as a simulated process only (no host
+                // child), so this mirrors STOP: clear the state and PID.
                 record.status = ServiceStatus::Stopped;
                 record.pid = None;
             }
@@ -9366,11 +9828,6 @@ impl ServiceControlManager {
         })
     }
 
-    /// Return the number of tracked child processes (for testing).
-    pub fn child_count(&self) -> usize {
-        self.children.len()
-    }
-
     /// Get the number of registered services.
     pub fn service_count(&self) -> usize {
         self.services.len()
@@ -9471,7 +9928,7 @@ mod tests {
 
     #[test]
     fn crt_atof_various_inputs() {
-        assert!((MsvcCrt::crt_atof("3.14") - 3.14).abs() < 0.001);
+        assert!((MsvcCrt::crt_atof("3.14") - "3.14".parse::<f64>().unwrap()).abs() < 0.001);
         assert!((MsvcCrt::crt_atof("-2.5") - (-2.5)).abs() < 0.001);
         assert!((MsvcCrt::crt_atof("0.0") - 0.0).abs() < 0.001);
     }
@@ -9595,11 +10052,11 @@ mod tests {
         let mut data = vec![0u8; 128];
         // Set VS_FIXEDFILEINFO signature at offset 40
         data[40..44].copy_from_slice(&0xFEEF_04BD_u32.to_le_bytes());
-        // Set version at offset 48-55
+        // Set version at offset 48-55 (signature + 8/+12)
         data[48..52].copy_from_slice(&0x0001_0002_u32.to_le_bytes()); // 1.2
         data[52..56].copy_from_slice(&0x0003_0004_u32.to_le_bytes()); // 3.4
-        // Set file type at offset 64
-        data[64..68].copy_from_slice(&1_u32.to_le_bytes()); // VFT_APP
+        // Set file type at offset 76 (signature + 36, standard VS_FIXEDFILEINFO)
+        data[76..80].copy_from_slice(&1_u32.to_le_bytes()); // VFT_APP
 
         let info = FileVersionInfo::parse(&data).unwrap();
         assert_eq!(info.version, (1, 2, 3, 4));
@@ -9705,7 +10162,7 @@ mod tests {
         let xinput = XInputManager::new();
         let _result = xinput.get_state(4);
         assert!(_result.is_err(), "expected Err, got {_result:?}");
-        assert!(xinput.is_connected(4) == false);
+        assert!(!xinput.is_connected(4));
     }
 
     #[test]
@@ -9969,7 +10426,8 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(scm.service_count(), 1);
+        // 3 pre-seeded services (SteamClientService, Winmgmt, Audiosrv) + 1
+        assert_eq!(scm.service_count(), 4);
 
         let (status, pid) = scm.query_service_status(svc_handle).unwrap();
         assert_eq!(status, ServiceStatus::Stopped);
@@ -10074,11 +10532,12 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(scm.service_count(), 1);
+        // 3 pre-seeded services + 1
+        assert_eq!(scm.service_count(), 4);
 
         // Must be stopped to delete
         scm.delete_service(svc_handle).unwrap();
-        assert_eq!(scm.service_count(), 0);
+        assert_eq!(scm.service_count(), 3);
     }
 
     #[test]
@@ -10155,9 +10614,11 @@ mod tests {
         .unwrap();
 
         let names = scm.list_services();
-        assert_eq!(names.len(), 2);
+        // 3 pre-seeded services + SvcA + SvcB
+        assert_eq!(names.len(), 5);
         assert!(names.contains(&"SvcA"));
         assert!(names.contains(&"SvcB"));
+        assert!(names.contains(&"SteamClientService"));
     }
 
     #[test]
@@ -10313,6 +10774,13 @@ struct RegistryChangeSubscription {
     watch_subtree: bool,
 }
 
+/// Whether `key` is `sub_key` itself or a descendant of it. Matching is on
+/// key boundaries so `HKLM\\Software\\MyAppEvil` does not match a
+/// subscription for `HKLM\\Software\\MyApp`.
+fn is_key_in_subtree(key: &str, sub_key: &str) -> bool {
+    key == sub_key || key.starts_with(&format!("{sub_key}\\"))
+}
+
 impl RegistryChangeTracker {
     /// Create a new empty change tracker.
     pub fn new() -> Self {
@@ -10330,27 +10798,25 @@ impl RegistryChangeTracker {
 
     /// Bump the version counter for a registry key, indicating a change.
     ///
-    /// Also signals any subscribed event handles.
+    /// Also signals any subscribed event handles via the event-signal hook
+    /// installed with [`set_registry_event_signal_hook`].
     pub fn notify_change(&mut self, key: &str) {
         let normalized = key.to_lowercase();
-        let version = self.versions.entry(normalized).or_insert(0);
+        let version = self.versions.entry(normalized.clone()).or_insert(0);
         *version += 1;
 
         // Signal any subscriptions for this key or parent keys
         let mut to_signal = Vec::new();
         for (sub_key, subs) in &self.subscriptions {
-            if key.starts_with(sub_key) {
+            if is_key_in_subtree(&normalized, sub_key) {
                 for sub in subs {
                     to_signal.push(sub.event_handle);
                 }
             }
         }
-        // Note: actual event signaling is done by the caller (Win32Subsystem)
-        // since it owns the event objects. We just track the subscriptions.
-        eprintln!(
-            "[RegistryChangeTracker] notify_change: would signal {} event handles",
-            to_signal.len()
-        );
+        for handle in to_signal {
+            signal_event_handle(handle);
+        }
     }
 
     /// Subscribe to change notifications for a registry key.
@@ -10358,16 +10824,22 @@ impl RegistryChangeTracker {
     /// `event_handle` is the Win32 event handle to signal.
     /// `flags` is a combination of `REG_NOTIFY_CHANGE_*`.
     /// `watch_subtree` indicates whether to watch child keys.
+    ///
+    /// Duplicate subscriptions for the same `(key, event_handle, flags,
+    /// watch_subtree)` are ignored so repeated calls cannot grow the
+    /// subscription table without bound.
     pub fn subscribe(&mut self, key: &str, event_handle: u64, flags: u32, watch_subtree: bool) {
         let normalized = key.to_lowercase();
-        self.subscriptions
-            .entry(normalized.clone())
-            .or_default()
-            .push(RegistryChangeSubscription {
+        let subs = self.subscriptions.entry(normalized).or_default();
+        if !subs.iter().any(|s| {
+            s.event_handle == event_handle && s.flags == flags && s.watch_subtree == watch_subtree
+        }) {
+            subs.push(RegistryChangeSubscription {
                 event_handle,
                 flags,
                 watch_subtree,
             });
+        }
     }
 
     /// Remove all subscriptions for a given event handle.
@@ -10393,7 +10865,7 @@ impl RegistryChangeTracker {
         // Check child keys if watching subtree
         if watch_subtree {
             for (k, &v) in &self.versions {
-                if k.starts_with(&normalized) && k.len() > normalized.len() && v > observed_version
+                if is_key_in_subtree(k, &normalized) && k.len() > normalized.len() && v > observed_version
                 {
                     // Subkey version is newer than observed → change detected
                     return true;
@@ -10410,7 +10882,7 @@ impl RegistryChangeTracker {
         let mut result = Vec::new();
 
         for (sub_key, subs) in &self.subscriptions {
-            if normalized.starts_with(sub_key) {
+            if is_key_in_subtree(&normalized, sub_key) {
                 for sub in subs {
                     if sub.watch_subtree || normalized == *sub_key {
                         result.push((sub.event_handle, sub.flags, sub.watch_subtree));
@@ -10420,6 +10892,26 @@ impl RegistryChangeTracker {
         }
 
         result
+    }
+}
+
+/// Hook used to signal Win32 event handles. Installed by the host
+/// integration that owns the event objects (e.g. the Win32 subsystem);
+/// `notify_change` invokes it for every subscription event handle.
+type RegistryEventSignalHook = dyn Fn(u64) + Send + Sync;
+
+static REGISTRY_EVENT_SIGNAL_HOOK: Mutex<Option<Box<RegistryEventSignalHook>>> =
+    Mutex::new(None);
+
+/// Install (or remove, with `None`) the hook used by
+/// [`RegistryChangeTracker::notify_change`] to signal event handles.
+pub fn set_registry_event_signal_hook(hook: Option<Box<RegistryEventSignalHook>>) {
+    *REGISTRY_EVENT_SIGNAL_HOOK.lock().unwrap() = hook;
+}
+
+fn signal_event_handle(handle: u64) {
+    if let Some(hook) = REGISTRY_EVENT_SIGNAL_HOOK.lock().unwrap().as_ref() {
+        hook(handle);
     }
 }
 
@@ -10461,37 +10953,38 @@ pub enum RegNotifyResult {
 /// * `observed_version` - The last version the caller observed.
 /// * `timeout` - Maximum duration to wait (for sync mode).
 ///
-/// # Returns
-/// The current version of the key and a `RegNotifyResult`.
-pub fn reg_notify_change_key_value(
-    tracker: &mut RegistryChangeTracker,
-    key: &str,
-    watch_subtree: bool,
-    flags: u32,
-    async_notify: bool,
-    event_handle: u64,
-    observed_version: u64,
-    timeout: std::time::Duration,
-) -> (u64, RegNotifyResult) {
-    let current_version = tracker.version(key);
+    /// # Returns
+    /// The current version of the key and a `RegNotifyResult`.
+    ///
+    /// A zero `timeout` in sync mode means wait indefinitely (Windows
+    /// semantics); only a finite deadline yields `Timeout`.
+    #[allow(clippy::too_many_arguments)] // mirrors RegNotifyChangeKeyValue's parameter list
+    pub fn reg_notify_change_key_value(
+        tracker: &mut RegistryChangeTracker,
+        key: &str,
+        watch_subtree: bool,
+        flags: u32,
+        async_notify: bool,
+        event_handle: u64,
+        observed_version: u64,
+        timeout: std::time::Duration,
+    ) -> (u64, RegNotifyResult) {
+        let current_version = tracker.version(key);
 
-    // Check if already changed
-    if tracker.has_changed(key, observed_version, watch_subtree) {
-        return (current_version, RegNotifyResult::Changed);
-    }
+        // Check if already changed
+        if tracker.has_changed(key, observed_version, watch_subtree) {
+            return (current_version, RegNotifyResult::Changed);
+        }
 
-    if async_notify {
-        // Register for future notifications
-        tracker.subscribe(key, event_handle, flags, watch_subtree);
-        (current_version, RegNotifyResult::Pending)
-    } else {
-        // Sync (blocking) notification — simulate polling
-        // In a real implementation, this would block the calling thread.
-        // For the compatibility layer, we do a single check and return.
-        if timeout.is_zero() {
-            (current_version, RegNotifyResult::Timeout)
+        if async_notify {
+            // Register for future notifications. When a change occurs,
+            // `notify_change` signals `event_handle` through the hook
+            // installed with `set_registry_event_signal_hook`.
+            tracker.subscribe(key, event_handle, flags, watch_subtree);
+            (current_version, RegNotifyResult::Pending)
         } else {
-            // Poll with a short sleep
+            // Sync (blocking) notification — poll until a change is
+            // detected or the finite deadline passes.
             let start = std::time::Instant::now();
             let poll_interval = std::time::Duration::from_millis(50);
             loop {
@@ -10499,13 +10992,12 @@ pub fn reg_notify_change_key_value(
                 if tracker.has_changed(key, observed_version, watch_subtree) {
                     return (tracker.version(key), RegNotifyResult::Changed);
                 }
-                if start.elapsed() >= timeout {
+                if !timeout.is_zero() && start.elapsed() >= timeout {
                     return (tracker.version(key), RegNotifyResult::Timeout);
                 }
             }
         }
     }
-}
 
 // ===========================================================================
 // Gap 6.5: Out-of-Process COM Server Support
@@ -10535,6 +11027,23 @@ pub struct ComExeServerRegistry {
     next_token: u32,
 }
 
+/// Kill and reap a COM server's child process (if any), so revoking or
+/// replacing a registration cannot leave zombies or orphaned processes.
+fn terminate_server_process(mut entry: ComExeServerEntry) {
+    if let Some(mut child) = entry.process.take() {
+        if let Err(error) = child.kill() {
+            eprintln!(
+                "[real_win32] terminate_server_process: failed to kill process: {error}"
+            );
+        }
+        if let Err(error) = child.wait() {
+            eprintln!(
+                "[real_win32] terminate_server_process: failed to wait for process: {error}"
+            );
+        }
+    }
+}
+
 impl ComExeServerRegistry {
     pub fn new() -> Self {
         Self {
@@ -10546,8 +11055,10 @@ impl ComExeServerRegistry {
     /// CoRegisterClassObject for an EXE server.
     ///
     /// Registers a CLSID as being served by an out-of-process server.
-    /// If the server is not already running, attempts to launch it from the
-    /// registry-configured path (HKCR\AppID\{clsid}\LocalServer32).
+    ///
+    /// Guest-controlled executables are never launched on the host; the
+    /// server is simulated (no child process). Re-registering the same CLSID
+    /// replaces the previous registration.
     ///
     /// Returns the registration token on success.
     pub fn register_class_object(&mut self, clsid: &[u8; 16], exe_path: &str, app_id: &str) -> u32 {
@@ -10555,20 +11066,10 @@ impl ComExeServerRegistry {
         self.next_token += 1;
         let guid_str = guid_to_string(clsid);
 
-        // Try to launch the EXE server process
-        let process = match std::process::Command::new(exe_path)
-            .arg("-Embedding")
-            .spawn()
-        {
-            Ok(child) => Some(child),
-            Err(error) => {
-                eprintln!(
-                    "[real_win32] register_class_object: failed to launch '{}' for {}: {}",
-                    exe_path, guid_str, error
-                );
-                None
-            }
-        };
+        // Replace any previous registration for this CLSID.
+        if let Some(prev) = self.servers.remove(&guid_str) {
+            terminate_server_process(prev);
+        }
 
         self.servers.insert(
             guid_str,
@@ -10576,7 +11077,7 @@ impl ComExeServerRegistry {
                 clsid: *clsid,
                 app_id: app_id.to_string(),
                 registration_token: token,
-                process,
+                process: None,
                 exe_path: exe_path.to_string(),
             },
         );
@@ -10596,16 +11097,8 @@ impl ComExeServerRegistry {
             Some((k, _)) => k.clone(),
             None => return false,
         };
-        if let Some(mut entry) = self.servers.remove(&guid_str) {
-            // Try to terminate the child process gracefully
-            if let Some(ref mut child) = entry.process {
-                if let Err(error) = child.kill() {
-                    eprintln!(
-                        "[real_win32] revoke_class_object: failed to kill process for {}: {}",
-                        guid_str, error
-                    );
-                }
-            }
+        if let Some(entry) = self.servers.remove(&guid_str) {
+            terminate_server_process(entry);
             true
         } else {
             false
@@ -10622,21 +11115,22 @@ impl ComExeServerRegistry {
     }
 
     /// Check if an EXE server is running for the given CLSID.
+    ///
+    /// Registered servers are simulated, so a registered (not yet revoked)
+    /// server is always considered running.
     pub fn is_server_running(&mut self, clsid: &[u8; 16]) -> bool {
         let guid_str = guid_to_string(clsid);
-        self.servers.get_mut(&guid_str).map_or(false, |e| {
-            e.process
-                .as_mut()
-                .map_or(true, |process| match process.try_wait() {
-                    Ok(status) => status.is_none(),
-                    Err(error) => {
-                        eprintln!(
-                            "[real_win32] is_server_running: try_wait failed for {}: {}",
-                            guid_str, error
-                        );
-                        true
-                    }
-                })
+        self.servers.get_mut(&guid_str).is_some_and(|e| {
+            e.process.as_mut().is_none_or(|process| match process.try_wait() {
+                Ok(status) => status.is_none(),
+                Err(error) => {
+                    eprintln!(
+                        "[real_win32] is_server_running: try_wait failed for {}: {}",
+                        guid_str, error
+                    );
+                    true
+                }
+            })
         })
     }
 
@@ -10682,7 +11176,11 @@ impl MsHtmlDocument {
                     {
                         // Extract just the tag name (before any attributes)
                         let name = tag_name.split_whitespace().next().unwrap_or(&tag_name);
-                        elements.push(name.to_string());
+                        // Trim a trailing '/' from self-closing tags like <br/>
+                        let name = name.strip_suffix('/').unwrap_or(name);
+                        if !name.is_empty() {
+                            elements.push(name.to_string());
+                        }
                     }
                     tag_name.clear();
                     collecting_name = false;
@@ -10769,16 +11267,31 @@ impl HtmlPersistStream {
     }
 
     /// IPersistStreamInit::Load — load HTML from a byte stream.
+    ///
+    /// Accepts UTF-8 and UTF-16 (LE/BE, with BOM); undecodable input falls
+    /// back to lossy UTF-8 decoding instead of failing.
     pub fn load(&mut self, data: &[u8]) -> bool {
-        match String::from_utf8(data.to_vec()) {
-            Ok(html) => {
-                self.html = html;
-                self.initialized = true;
-                self.dirty = false;
-                true
-            }
-            Err(_) => false,
-        }
+        let html = if data.starts_with(&[0xFF, 0xFE]) || data.starts_with(&[0xFE, 0xFF]) {
+            // UTF-16 with BOM (common for real MSHTML streams)
+            let little_endian = data.starts_with(&[0xFF, 0xFE]);
+            let units: Vec<u16> = data[2..]
+                .chunks_exact(2)
+                .map(|c| {
+                    if little_endian {
+                        u16::from_le_bytes([c[0], c[1]])
+                    } else {
+                        u16::from_be_bytes([c[0], c[1]])
+                    }
+                })
+                .collect();
+            String::from_utf16_lossy(&units)
+        } else {
+            String::from_utf8_lossy(data).into_owned()
+        };
+        self.html = html;
+        self.initialized = true;
+        self.dirty = false;
+        true
     }
 
     /// IPersistStreamInit::Save — save HTML to bytes.
@@ -10851,11 +11364,20 @@ impl XmlDomDocument {
     }
 
     /// Get the node type string for the document element.
+    ///
+    /// Returns the actual node type of the parsed document ("document" for
+    /// the root, "element" for a root element, …), or empty when the
+    /// document cannot be parsed.
     pub fn get_node_type(&self) -> String {
-        if self.xml_string.is_empty() {
-            String::new()
-        } else {
-            "element".to_string()
+        match roxmltree::Document::parse(&self.xml_string) {
+            Ok(doc) => match doc.root().node_type() {
+                roxmltree::NodeType::Root => "document".to_string(),
+                roxmltree::NodeType::Element => "element".to_string(),
+                roxmltree::NodeType::Text => "text".to_string(),
+                roxmltree::NodeType::Comment => "comment".to_string(),
+                roxmltree::NodeType::PI => "processinginstruction".to_string(),
+            },
+            Err(_) => String::new(),
         }
     }
 
@@ -10887,7 +11409,7 @@ impl XmlDomDocument {
         if let Some(rest) = xpath.strip_prefix("//") {
             return doc
                 .descendants()
-                .filter(|n| n.is_element() && matches_xpath_name(n.tag_name().name(), rest))
+                .filter(|n| n.is_element() && matches_xpath_pattern(n, rest))
                 .map(|n| XmlNodeResult::from_roxmltree(&n))
                 .collect();
         }
@@ -10900,7 +11422,7 @@ impl XmlDomDocument {
 
         // Handle relative element name: "elementName"
         doc.descendants()
-            .filter(|n| n.is_element() && matches_xpath_name(n.tag_name().name(), xpath))
+            .filter(|n| n.is_element() && matches_xpath_pattern(n, xpath))
             .map(|n| XmlNodeResult::from_roxmltree(&n))
             .collect()
     }
@@ -10916,7 +11438,7 @@ impl XmlDomDocument {
             let mut next_nodes = Vec::new();
             for node in &current_nodes {
                 for child in node.children() {
-                    if child.is_element() && matches_xpath_name(child.tag_name().name(), part) {
+                    if child.is_element() && matches_xpath_pattern(&child, part) {
                         next_nodes.push(child);
                     }
                 }
@@ -10930,18 +11452,48 @@ impl XmlDomDocument {
     }
 }
 
-/// Check if a tag name matches an XPath name pattern (including wildcard).
-fn matches_xpath_name(tag: &str, pattern: &str) -> bool {
+/// Check if an element node matches an XPath name pattern, including
+/// wildcards and attribute predicates:
+/// - `"elementName"`, `"*"`
+/// - `"element[@attr]"` (attribute presence)
+/// - `"element[@attr='value']"` / `"element[@attr=\"value\"]"`
+fn matches_xpath_pattern(node: &roxmltree::Node, pattern: &str) -> bool {
     if pattern == "*" {
         return true;
     }
-    // Handle attribute predicates: "element[@attr]" or "element[@attr='value']"
     let base_name = if let Some(bracket_pos) = pattern.find('[') {
         &pattern[..bracket_pos]
     } else {
         pattern
     };
-    tag.eq_ignore_ascii_case(base_name)
+    let name_ok = base_name == "*" || node.tag_name().name().eq_ignore_ascii_case(base_name);
+    if !name_ok {
+        return false;
+    }
+
+    // Evaluate attribute predicates: [@attr] and [@attr='value'].
+    let mut rest = &pattern[base_name.len()..];
+    while let Some(inner) = rest.strip_prefix('[') {
+        let Some(end) = inner.find(']') else {
+            return false;
+        };
+        let pred = &inner[..end];
+        rest = &inner[end + 1..];
+        if let Some(eq_pos) = pred.find('=') {
+            let attr_name = pred[1..eq_pos].trim().trim_start_matches('@');
+            let quoted = pred[eq_pos + 1..].trim();
+            let value = quoted.trim_matches(|c| c == '\'' || c == '"');
+            if node.attribute(attr_name) != Some(value) {
+                return false;
+            }
+        } else {
+            let attr_name = pred.trim().trim_start_matches('@');
+            if node.attribute(attr_name).is_none() {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// Result of an XML node query — carries the node's name, value, type, and XML.
@@ -11063,7 +11615,17 @@ impl UrlMonikerObject {
         }
         // Quick check: if it's a file:// URL, check if the file exists
         if self.url.starts_with("file://") {
-            let path = self.url.trim_start_matches("file://");
+            let rest = self.url.trim_start_matches("file://");
+            // Strip the host component of file://localhost/... and
+            // file://127.0.0.1/...; remote hosts are not local files.
+            let path = rest
+                .strip_prefix("localhost/")
+                .or_else(|| rest.strip_prefix("127.0.0.1/"))
+                .unwrap_or(rest);
+            let local = path.starts_with('/') || !path.contains('/');
+            if !local {
+                return false;
+            }
             return std::path::Path::new(path).exists();
         }
         // For HTTP URLs, we can't do a synchronous check without blocking,
@@ -11648,19 +12210,19 @@ impl DirectInputDeviceStateTracker {
         self.acquired = false;
     }
 
-    /// Get the current device state (GetDeviceState).
-    ///
-    /// Returns the state as raw bytes, sized according to the current data format.
-    pub fn get_device_state(&self) -> Vec<u8> {
+    /// Write the current device state into `out` as raw bytes, sized
+    /// according to the current data format. Reuses the caller's buffer so
+    /// per-poll allocations are avoided.
+    pub fn write_device_state(&self, out: &mut Vec<u8>) {
+        out.clear();
         match &self.state {
-            DirectInputDeviceState::Keyboard(keys) => keys.to_vec(),
+            DirectInputDeviceState::Keyboard(keys) => out.extend_from_slice(keys),
             DirectInputDeviceState::Mouse { x, y, z, buttons } => {
-                let mut buf = Vec::with_capacity(20);
-                buf.extend_from_slice(&x.to_le_bytes());
-                buf.extend_from_slice(&y.to_le_bytes());
-                buf.extend_from_slice(&z.to_le_bytes());
-                buf.extend_from_slice(buttons);
-                buf
+                out.reserve(20);
+                out.extend_from_slice(&x.to_le_bytes());
+                out.extend_from_slice(&y.to_le_bytes());
+                out.extend_from_slice(&z.to_le_bytes());
+                out.extend_from_slice(buttons);
             }
             DirectInputDeviceState::Joystick {
                 x,
@@ -11673,26 +12235,34 @@ impl DirectInputDeviceStateTracker {
                 buttons,
                 pov,
             } => {
-                let mut buf = Vec::with_capacity(304);
-                buf.extend_from_slice(&x.to_le_bytes());
-                buf.extend_from_slice(&y.to_le_bytes());
-                buf.extend_from_slice(&z.to_le_bytes());
-                buf.extend_from_slice(&rx.to_le_bytes());
-                buf.extend_from_slice(&ry.to_le_bytes());
-                buf.extend_from_slice(&rz.to_le_bytes());
-                buf.extend_from_slice(&sliders[0].to_le_bytes());
-                buf.extend_from_slice(&sliders[1].to_le_bytes());
-                buf.extend_from_slice(&buttons[..]);
+                out.reserve(304);
+                out.extend_from_slice(&x.to_le_bytes());
+                out.extend_from_slice(&y.to_le_bytes());
+                out.extend_from_slice(&z.to_le_bytes());
+                out.extend_from_slice(&rx.to_le_bytes());
+                out.extend_from_slice(&ry.to_le_bytes());
+                out.extend_from_slice(&rz.to_le_bytes());
+                out.extend_from_slice(&sliders[0].to_le_bytes());
+                out.extend_from_slice(&sliders[1].to_le_bytes());
+                out.extend_from_slice(buttons);
                 // Fill remaining space with zeros for extra sliders, etc.
-                buf.resize(272, 0);
+                out.resize(272, 0);
                 for p in pov {
-                    buf.extend_from_slice(&p.to_le_bytes());
+                    out.extend_from_slice(&p.to_le_bytes());
                 }
                 // Fill remaining for extra data
-                buf.resize(304, 0);
-                buf
+                out.resize(304, 0);
             }
         }
+    }
+
+    /// Get the current device state (GetDeviceState).
+    ///
+    /// Returns the state as raw bytes, sized according to the current data format.
+    pub fn get_device_state(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        self.write_device_state(&mut buf);
+        buf
     }
 
     /// Get buffered input data (GetDeviceData).
@@ -11714,9 +12284,17 @@ impl DirectInputDeviceStateTracker {
     }
 
     /// Update the keyboard state with a key press/release event.
+    ///
+    /// The buffered event queue is capped so a guest that never drains it
+    /// cannot grow host memory without bound (oldest events are dropped).
     pub fn set_key_state(&mut self, scan_code: u8, pressed: bool) {
         if let DirectInputDeviceState::Keyboard(ref mut keys) = self.state {
             keys[scan_code as usize] = if pressed { 0x80 } else { 0x00 };
+            const MAX_BUFFERED_EVENTS: usize = 256;
+            if self.buffered_data.len() >= MAX_BUFFERED_EVENTS {
+                let excess = self.buffered_data.len() - MAX_BUFFERED_EVENTS + 1;
+                self.buffered_data.drain(..excess);
+            }
             // Also add to buffered data
             let data = BufferedInputData {
                 offset: scan_code as u32,
@@ -11749,6 +12327,7 @@ impl DirectInputDeviceStateTracker {
     }
 
     /// Update the joystick state.
+    #[allow(clippy::too_many_arguments)] // mirrors the DIJOYSTATE2 axis set
     pub fn update_joystick_state(
         &mut self,
         x: i32,
@@ -11803,6 +12382,7 @@ impl ShellFolder {
     ///   0x00400000 = SFGAO_BROWSABLE
     ///   0x01000000 = SFGAO_HIDDEN
     ///   0x02000000 = SFGAO_SYSTEM
+    ///   0x80000000 = SFGAO_LINK
     pub fn get_attributes_of(&self, pidls: &[Vec<u16>], requested_attrs: u32) -> u32 {
         let mut result = 0u32;
 
@@ -11840,39 +12420,41 @@ impl ShellFolder {
                     attrs |= 0x00000002; // SFGAO_CANMOVE
 
                     // Check if directory has sub-entries
-                    if let Ok(entries) = std::fs::read_dir(&full_path) {
-                        if entries.count() == 0 {
-                            attrs &= !0x00004000; // Remove HASSUBFOLDER if empty
-                        }
+                    if let Ok(entries) = std::fs::read_dir(&full_path)
+                        && entries.count() == 0
+                    {
+                        attrs &= !0x00004000; // Remove HASSUBFOLDER if empty
                     }
                 } else if full_path.is_file() {
                     // File-specific attributes
-                    if let Ok(metadata) = std::fs::metadata(&full_path) {
-                        // Check readonly
-                        if metadata.permissions().readonly() {
-                            attrs |= 0x00010000; // SFGAO_READONLY
-                        }
+                    if let Ok(metadata) = std::fs::metadata(&full_path)
+                        && metadata.permissions().readonly()
+                    {
+                        attrs |= 0x00010000; // SFGAO_READONLY
                     }
 
                     // Check hidden (dot files on macOS)
-                    if let Some(name) = full_path.file_name() {
-                        if name.to_string_lossy().starts_with('.') {
-                            attrs |= 0x01000000; // SFGAO_HIDDEN
-                        }
+                    if full_path
+                        .file_name()
+                        .is_some_and(|n| n.to_string_lossy().starts_with('.'))
+                    {
+                        attrs |= 0x01000000; // SFGAO_HIDDEN
                     }
 
                     // Check if file is a symlink
                     if full_path.is_symlink() {
-                        attrs |= 0x00000008; // SFGAO_LINK (not STORAGE)
+                        // SFGAO_LINK (0x80000000) — 0x8 is SFGAO_STORAGE
+                        attrs |= 0x8000_0000;
                     }
                 }
 
                 // Check hidden attribute (dot files)
-                if let Some(name) = full_path.file_name() {
-                    if name.to_string_lossy().starts_with('.') {
-                        attrs |= 0x01000000; // SFGAO_HIDDEN
-                        attrs |= 0x02000000; // SFGAO_SYSTEM
-                    }
+                if full_path
+                    .file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with('.'))
+                {
+                    attrs |= 0x01000000; // SFGAO_HIDDEN
+                    attrs |= 0x02000000; // SFGAO_SYSTEM
                 }
             }
 

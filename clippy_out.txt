@@ -1,4 +1,4 @@
-    Checking casa1 v0.1.0 (/Users/sabelakhoua/IdeaProjects/Casa1/.kilo/worktrees/fix-real-audio)
+    Checking casa1 v0.1.0 (/Users/sabelakhoua/IdeaProjects/Casa1/.kilo/worktrees/audit-real-win32)
 warning: redundant field names in struct initialization
     --> src/audio.rs:1301:13
      |
@@ -52,15 +52,6 @@ help: remove this attribute
 1305 |     #[link(name = "CoreVideo", kind = "framework")]
      |                                ^^^^^^^^^^^^^^^^^^
      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#duplicated_attributes
-
-warning: digits of hex, binary or octal literal not in groups of equal size
-     --> src/cpu.rs:28206:29
-      |
-28206 |         let start_address = 0x401d_c2;
-      |                             ^^^^^^^^^ help: consider: `0x0040_1dc2`
-      |
-      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#unusual_byte_groupings
-      = note: `#[warn(clippy::unusual_byte_groupings)]` on by default
 
 warning: digits grouped inconsistently by underscores
    --> src/midi.rs:638:51
@@ -220,12 +211,13 @@ help: if the documentation should include the empty line include it in the comme
      |
 
 warning: digits of hex, binary or octal literal not in groups of equal size
-    --> src/pe_runtime.rs:5368:50
-     |
-5368 |             && matches!(block_rva, Some(rva) if (0x0016_ca8..=0x0017_304).contains(&rva));
-     |                                                  ^^^^^^^^^^ help: consider: `0x0001_6ca8`
-     |
-     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#unusual_byte_groupings
+     --> src/cpu.rs:28206:29
+      |
+28206 |         let start_address = 0x401d_c2;
+      |                             ^^^^^^^^^ help: consider: `0x0040_1dc2`
+      |
+      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#unusual_byte_groupings
+      = note: `#[warn(clippy::unusual_byte_groupings)]` on by default
 
 warning: duplicated attribute
   --> src/steam_input.rs:26:33
@@ -244,14 +236,6 @@ help: remove this attribute
 26 | #[link(name = "CoreFoundation", kind = "framework")]
    |                                 ^^^^^^^^^^^^^^^^^^
    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#duplicated_attributes
-
-warning: digits of hex, binary or octal literal not in groups of equal size
-     --> src/pe_runtime.rs:71605:45
-      |
-71605 |         memory.write_u64(stack_base + 0x78, 0x1000_0004_5);
-      |                                             ^^^^^^^^^^^^^ help: consider: `0x0001_0000_0045`
-      |
-      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#unusual_byte_groupings
 
 warning: duplicated attribute
    --> src/video_decoder.rs:286:32
@@ -309,6 +293,22 @@ help: if the doc comment should not document function `vk_thunk_create_instance`
 5577 ~ // /// Thunks are registered as DLL exports for guest binary compatibility.
 5578 ~ // /// VkInstance, VkDevice, etc. are all u64 handles in this translation layer.
      |
+
+warning: digits of hex, binary or octal literal not in groups of equal size
+    --> src/pe_runtime.rs:5368:50
+     |
+5368 |             && matches!(block_rva, Some(rva) if (0x0016_ca8..=0x0017_304).contains(&rva));
+     |                                                  ^^^^^^^^^^ help: consider: `0x0001_6ca8`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#unusual_byte_groupings
+
+warning: digits of hex, binary or octal literal not in groups of equal size
+     --> src/pe_runtime.rs:71605:45
+      |
+71605 |         memory.write_u64(stack_base + 0x78, 0x1000_0004_5);
+      |                                             ^^^^^^^^^^^^^ help: consider: `0x0001_0000_0045`
+      |
+      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#unusual_byte_groupings
 
 warning: digits of hex, binary or octal literal not in groups of equal size
     --> src/seh.rs:1667:44
@@ -11947,22 +11947,6 @@ help: return the expression directly
 343 +         }
     |
 
-warning: manually reimplementing `div_ceil`
-   --> src/audio_format.rs:855:28
-    |
-855 |         let nibble_bytes = (nibble_count + 1) / 2;
-    |                            ^^^^^^^^^^^^^^^^^^^^^^ help: consider using `.div_ceil()`: `nibble_count.div_ceil(2)`
-    |
-    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_div_ceil
-
-warning: manually reimplementing `div_ceil`
-   --> src/audio_format.rs:886:28
-    |
-886 |         let nibble_bytes = (encoded_samples + 1) / 2;
-    |                            ^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using `.div_ceil()`: `encoded_samples.div_ceil(2)`
-    |
-    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_div_ceil
-
 warning: this `if` statement can be collapsed
    --> src/perf.rs:449:9
     |
@@ -12027,45 +12011,6 @@ help: collapse nested if block
 781 ~             }
     |
 
-warning: the loop variable `i` is used to index `output`
-   --> src/audio_ring_buffer.rs:497:18
-    |
-497 |         for i in 0..100 {
-    |                  ^^^^^^
-    |
-    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#needless_range_loop
-help: consider using an iterator and enumerate()
-    |
-497 -         for i in 0..100 {
-497 +         for (i, <item>) in output.iter().enumerate().take(100) {
-    |
-
-warning: the loop variable `i` is used to index `output`
-   --> src/audio_ring_buffer.rs:516:18
-    |
-516 |         for i in 0..10 {
-    |                  ^^^^^
-    |
-    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#needless_range_loop
-help: consider using an iterator and enumerate()
-    |
-516 -         for i in 0..10 {
-516 +         for (i, <item>) in output.iter().enumerate().take(10) {
-    |
-
-warning: the loop variable `i` is only used to index `output`
-   --> src/audio_ring_buffer.rs:520:18
-    |
-520 |         for i in 10..20 {
-    |                  ^^^^^^
-    |
-    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#needless_range_loop
-help: consider using an iterator
-    |
-520 -         for i in 10..20 {
-520 +         for <item> in output.iter().take(20).skip(10) {
-    |
-
 warning: you should consider adding a `Default` implementation for `AsyncFileReader`
     --> src/perf.rs:1164:5
      |
@@ -12086,32 +12031,6 @@ help: try adding this
 1165 +     }
 1166 + }
      |
-
-warning: the loop variable `i` is used to index `output2`
-   --> src/audio_ring_buffer.rs:552:18
-    |
-552 |         for i in 0..10 {
-    |                  ^^^^^
-    |
-    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#needless_range_loop
-help: consider using an iterator and enumerate()
-    |
-552 -         for i in 0..10 {
-552 +         for (i, <item>) in output2.iter().enumerate().take(10) {
-    |
-
-warning: the loop variable `i` is used to index `out2`
-   --> src/audio_ring_buffer.rs:576:18
-    |
-576 |         for i in 0..10 {
-    |                  ^^^^^
-    |
-    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#needless_range_loop
-help: consider using an iterator and enumerate()
-    |
-576 -         for i in 0..10 {
-576 +         for (i, <item>) in out2.iter().enumerate().take(10) {
-    |
 
 warning: this `if` statement can be collapsed
     --> src/perf.rs:1355:13
@@ -12153,6 +12072,406 @@ help: try adding this
 1430 + }
      |
 
+warning: usage of `contains_key` followed by `insert` on a `HashMap`
+   --> src/print.rs:204:9
+    |
+204 | /         if self.printers.contains_key(&handle) {
+205 | |             self.printers.insert(handle, info);
+206 | |             true
+207 | |         } else {
+208 | |             false
+209 | |         }
+    | |_________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#map_entry
+help: try
+    |
+204 ~         if let std::collections::hash_map::Entry::Occupied(mut e) = self.printers.entry(handle) {
+205 +             e.insert(info);
+206 +             true
+207 +         } else {
+208 +             false
+209 +         }
+    |
+
+warning: this `if` statement can be collapsed
+   --> src/real_audio.rs:210:9
+    |
+210 | /         if let Some(queue) = self.stream_queues.get(&device_id) {
+211 | |             if let Ok(mut q) = queue.lock() {
+212 | |                 q.extend(converted);
+...   |
+219 | |         }
+    | |_________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#collapsible_if
+help: collapse nested if block
+    |
+210 ~         if let Some(queue) = self.stream_queues.get(&device_id)
+211 ~             && let Ok(mut q) = queue.lock() {
+212 |                 q.extend(converted);
+...
+217 |                 }
+218 ~             }
+    |
+
+warning: this `if` statement can be collapsed
+   --> src/real_audio.rs:296:9
+    |
+296 | /         if let Some(queue) = self.stream_queues.get(&device_id) {
+297 | |             if let Ok(mut q) = queue.lock() {
+298 | |                 q.extend(converted);
+299 | |                 let max_samples = device.sample_rate as usize * device.channels as usize * 4;
+...   |
+304 | |         }
+    | |_________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#collapsible_if
+help: collapse nested if block
+    |
+296 ~         if let Some(queue) = self.stream_queues.get(&device_id)
+297 ~             && let Ok(mut q) = queue.lock() {
+298 |                 q.extend(converted);
+...
+302 |                 }
+303 ~             }
+    |
+
+warning: manual checked division
+   --> src/real_audio.rs:399:36
+    |
+399 |             let actual_frames = if channels > 0 {
+    |                                    ^^^^^^^^^^^^ check performed here
+400 |                 samples.len() / channels
+    |                 ------------------------ division performed here
+    |
+    = help: consider using `checked_div`
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_checked_ops
+
+warning: this `if` statement can be collapsed
+   --> src/real_audio.rs:453:9
+    |
+453 | /         if let Some(queue) = self.stream_queues.get(&device_id) {
+454 | |             if let Ok(mut q) = queue.lock() {
+455 | |                 q.extend(converted);
+456 | |                 let max_samples = device.sample_rate as usize * device.channels as usize * 4;
+...   |
+461 | |         }
+    | |_________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#collapsible_if
+help: collapse nested if block
+    |
+453 ~         if let Some(queue) = self.stream_queues.get(&device_id)
+454 ~             && let Ok(mut q) = queue.lock() {
+455 |                 q.extend(converted);
+...
+459 |                 }
+460 ~             }
+    |
+
+warning: manual checked division
+   --> src/real_audio.rs:572:32
+    |
+572 |         let queued_frames = if channels > 0 {
+    |                                ^^^^^^^^^^^^ check performed here
+573 |             queued_samples / channels
+    |             ------------------------- division performed here
+    |
+    = help: consider using `checked_div`
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_checked_ops
+
+warning: manually reimplementing `div_ceil`
+   --> src/audio_format.rs:855:28
+    |
+855 |         let nibble_bytes = (nibble_count + 1) / 2;
+    |                            ^^^^^^^^^^^^^^^^^^^^^^ help: consider using `.div_ceil()`: `nibble_count.div_ceil(2)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_div_ceil
+
+warning: manually reimplementing `div_ceil`
+   --> src/audio_format.rs:886:28
+    |
+886 |         let nibble_bytes = (encoded_samples + 1) / 2;
+    |                            ^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using `.div_ceil()`: `encoded_samples.div_ceil(2)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_div_ceil
+
+warning: the loop variable `i` is used to index `output`
+   --> src/audio_ring_buffer.rs:497:18
+    |
+497 |         for i in 0..100 {
+    |                  ^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#needless_range_loop
+help: consider using an iterator and enumerate()
+    |
+497 -         for i in 0..100 {
+497 +         for (i, <item>) in output.iter().enumerate().take(100) {
+    |
+
+warning: the loop variable `i` is used to index `output`
+   --> src/audio_ring_buffer.rs:516:18
+    |
+516 |         for i in 0..10 {
+    |                  ^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#needless_range_loop
+help: consider using an iterator and enumerate()
+    |
+516 -         for i in 0..10 {
+516 +         for (i, <item>) in output.iter().enumerate().take(10) {
+    |
+
+warning: the loop variable `i` is only used to index `output`
+   --> src/audio_ring_buffer.rs:520:18
+    |
+520 |         for i in 10..20 {
+    |                  ^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#needless_range_loop
+help: consider using an iterator
+    |
+520 -         for i in 10..20 {
+520 +         for <item> in output.iter().take(20).skip(10) {
+    |
+
+warning: the loop variable `i` is used to index `output2`
+   --> src/audio_ring_buffer.rs:552:18
+    |
+552 |         for i in 0..10 {
+    |                  ^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#needless_range_loop
+help: consider using an iterator and enumerate()
+    |
+552 -         for i in 0..10 {
+552 +         for (i, <item>) in output2.iter().enumerate().take(10) {
+    |
+
+warning: the loop variable `i` is used to index `out2`
+   --> src/audio_ring_buffer.rs:576:18
+    |
+576 |         for i in 0..10 {
+    |                  ^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#needless_range_loop
+help: consider using an iterator and enumerate()
+    |
+576 -         for i in 0..10 {
+576 +         for (i, <item>) in out2.iter().enumerate().take(10) {
+    |
+
+warning: casting to the same type is unnecessary (`i32` -> `i32`)
+    --> src/real_audio.rs:1115:25
+     |
+1115 |             let value = (b0 as i32) | ((b1 as i32) << 8) | ((b2 as i32) << 16);
+     |                         ^^^^^^^^^^^ help: try: `b0`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#unnecessary_cast
+
+warning: casting to the same type is unnecessary (`i32` -> `i32`)
+    --> src/real_audio.rs:1115:40
+     |
+1115 |             let value = (b0 as i32) | ((b1 as i32) << 8) | ((b2 as i32) << 16);
+     |                                        ^^^^^^^^^^^ help: try: `b1`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#unnecessary_cast
+
+warning: casting to the same type is unnecessary (`i32` -> `i32`)
+    --> src/real_audio.rs:1115:61
+     |
+1115 |             let value = (b0 as i32) | ((b1 as i32) << 8) | ((b2 as i32) << 16);
+     |                                                             ^^^^^^^^^^^ help: try: `b2`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#unnecessary_cast
+
+warning: casting to the same type is unnecessary (`i32` -> `i32`)
+    --> src/real_audio.rs:1135:25
+     |
+1135 |             let value = (b0 as i32) | ((b1 as i32) << 8) | ((b2 as i32) << 16);
+     |                         ^^^^^^^^^^^ help: try: `b0`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#unnecessary_cast
+
+warning: casting to the same type is unnecessary (`i32` -> `i32`)
+    --> src/real_audio.rs:1135:40
+     |
+1135 |             let value = (b0 as i32) | ((b1 as i32) << 8) | ((b2 as i32) << 16);
+     |                                        ^^^^^^^^^^^ help: try: `b1`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#unnecessary_cast
+
+warning: casting to the same type is unnecessary (`i32` -> `i32`)
+    --> src/real_audio.rs:1135:61
+     |
+1135 |             let value = (b0 as i32) | ((b1 as i32) << 8) | ((b2 as i32) << 16);
+     |                                                             ^^^^^^^^^^^ help: try: `b2`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#unnecessary_cast
+
+warning: the loop variable `ch` is only used to index `prev_samples`
+    --> src/real_audio.rs:1474:19
+     |
+1474 |         for ch in 0..num_channels {
+     |                   ^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#needless_range_loop
+help: consider using an iterator
+     |
+1474 -         for ch in 0..num_channels {
+1474 +         for <item> in prev_samples.iter().take(num_channels) {
+     |
+
+warning: the loop variable `ch` is only used to index `prev_samples`
+    --> src/real_audio.rs:1477:19
+     |
+1477 |         for ch in 0..num_channels {
+     |                   ^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#needless_range_loop
+help: consider using an iterator
+     |
+1477 -         for ch in 0..num_channels {
+1477 +         for <item> in prev_samples.iter().take(num_channels) {
+     |
+
+warning: manual checked division
+    --> src/real_audio.rs:1698:25
+     |
+1698 |     let num_blocks = if block_size > 0 {
+     |                         ^^^^^^^^^^^^^^ check performed here
+1699 |         adpcm_data.len() / block_size
+     |         ----------------------------- division performed here
+     |
+     = help: consider using `checked_div`
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_checked_ops
+
+warning: the loop variable `ch` is used to index `channel_samples`
+    --> src/real_audio.rs:1716:19
+     |
+1716 |         for ch in 0..num_channels {
+     |                   ^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#needless_range_loop
+help: consider using an iterator and enumerate()
+     |
+1716 -         for ch in 0..num_channels {
+1716 +         for (ch, <item>) in channel_samples.iter_mut().enumerate().take(num_channels) {
+     |
+
+warning: the loop variable `ch` is only used to index `channel_samples`
+    --> src/real_audio.rs:1782:23
+     |
+1782 |             for ch in 0..num_channels {
+     |                       ^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#needless_range_loop
+help: consider using an iterator
+     |
+1782 -             for ch in 0..num_channels {
+1782 +             for <item> in channel_samples.iter().take(num_channels) {
+     |
+
+warning: manually reimplementing `div_ceil`
+    --> src/real_audio.rs:1950:35
+     |
+1950 |             let bytes_per_coeff = (bits_per_coeff + 7) / 8;
+     |                                   ^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using `.div_ceil()`: `bits_per_coeff.div_ceil(8)`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_div_ceil
+
+warning: the loop variable `i` is used to index `mdct_coeffs`
+    --> src/real_audio.rs:1961:22
+     |
+1961 |             for i in 0..XMA_FRAME_SAMPLES.min(sf_data.len() / bytes_per_coeff.max(1)) {
+     |                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#needless_range_loop
+help: consider using an iterator and enumerate()
+     |
+1961 -             for i in 0..XMA_FRAME_SAMPLES.min(sf_data.len() / bytes_per_coeff.max(1)) {
+1961 +             for (i, <item>) in mdct_coeffs.iter_mut().enumerate().take(XMA_FRAME_SAMPLES.min(sf_data.len() / bytes_per_coeff.max(1))) {
+     |
+
+warning: the loop variable `i` is used to index `time_samples`
+    --> src/real_audio.rs:1985:22
+     |
+1985 |             for i in 0..half_frame {
+     |                      ^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#needless_range_loop
+help: consider using an iterator and enumerate()
+     |
+1985 -             for i in 0..half_frame {
+1985 +             for (i, <item>) in time_samples.iter().enumerate().take(half_frame) {
+     |
+
+warning: the loop variable `i` is used to index `time_samples`
+    --> src/real_audio.rs:2004:22
+     |
+2004 |             for i in half_frame..XMA_FRAME_SAMPLES {
+     |                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#needless_range_loop
+help: consider using an iterator and enumerate()
+     |
+2004 -             for i in half_frame..XMA_FRAME_SAMPLES {
+2004 +             for (i, <item>) in time_samples.iter().enumerate().take(XMA_FRAME_SAMPLES).skip(half_frame) {
+     |
+
+warning: the loop variable `n_idx` is used to index `time`
+    --> src/real_audio.rs:2078:18
+     |
+2078 |     for n_idx in 0..n {
+     |                  ^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#needless_range_loop
+help: consider using an iterator and enumerate()
+     |
+2078 -     for n_idx in 0..n {
+2078 +     for (n_idx, <item>) in time.iter_mut().enumerate().take(n) {
+     |
+
+warning: the loop variable `k` is used to index `coefficients`
+    --> src/real_audio.rs:2080:18
+     |
+2080 |         for k in 0..coefficients.len().min(half_n) {
+     |                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#needless_range_loop
+help: consider using an iterator and enumerate()
+     |
+2080 -         for k in 0..coefficients.len().min(half_n) {
+2080 +         for (k, <item>) in coefficients.iter().enumerate().take(coefficients.len().min(half_n)) {
+     |
+
+warning: the loop variable `n_idx` is used to index `time`
+    --> src/real_audio.rs:2088:18
+     |
+2088 |     for n_idx in 0..n {
+     |                  ^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#needless_range_loop
+help: consider using an iterator and enumerate()
+     |
+2088 -     for n_idx in 0..n {
+2088 +     for (n_idx, <item>) in time.iter_mut().enumerate().take(n) {
+     |
+
+warning: the loop variable `ch` is used to index `previous`
+    --> src/real_audio.rs:2387:19
+     |
+2387 |         for ch in 0..channels {
+     |                   ^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#needless_range_loop
+help: consider using an iterator and enumerate()
+     |
+2387 -         for ch in 0..channels {
+2387 +         for (ch, <item>) in previous.iter_mut().enumerate().take(channels) {
+     |
+
 warning: the loop variable `i` is used to index `output`
    --> src/audio_ring_buffer.rs:682:18
     |
@@ -12179,28 +12498,6 @@ help: consider using an iterator and enumerate()
 756 +         for (i, <item>) in out1.iter().enumerate().take(16) {
     |
 
-warning: usage of `contains_key` followed by `insert` on a `HashMap`
-   --> src/print.rs:204:9
-    |
-204 | /         if self.printers.contains_key(&handle) {
-205 | |             self.printers.insert(handle, info);
-206 | |             true
-207 | |         } else {
-208 | |             false
-209 | |         }
-    | |_________^
-    |
-    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#map_entry
-help: try
-    |
-204 ~         if let std::collections::hash_map::Entry::Occupied(mut e) = self.printers.entry(handle) {
-205 +             e.insert(info);
-206 +             true
-207 +         } else {
-208 +             false
-209 +         }
-    |
-
 warning: the loop variable `i` is used to index `out2`
    --> src/audio_ring_buffer.rs:772:18
     |
@@ -12213,6 +12510,19 @@ help: consider using an iterator and enumerate()
 772 -         for i in 0..16 {
 772 +         for (i, <item>) in out2.iter().enumerate().take(16) {
     |
+
+warning: the loop variable `band` is used to index `coeffs`
+    --> src/real_audio.rs:3387:25
+     |
+3387 |             for band in 0..4 {
+     |                         ^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#needless_range_loop
+help: consider using an iterator and enumerate()
+     |
+3387 -             for band in 0..4 {
+3387 +             for (band, <item>) in coeffs.iter().enumerate().take(4) {
+     |
 
 warning: manual implementation of `Option::map`
    --> src/real_fs.rs:930:17
@@ -12672,16 +12982,6 @@ warning: very complex type used. Consider factoring parts into `type` definition
      |
      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#type_complexity
 
-warning: this assertion is always `true`
-    --> src/cef_bridge.rs:6206:9
-     |
-6206 |         assert!(true, "JS execution should not panic");
-     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-     |
-     = help: remove the assertion
-     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#assertions_on_constants
-     = note: `#[warn(clippy::assertions_on_constants)]` on by default
-
 warning: you should consider adding a `Default` implementation for `MsvcCrt`
     --> src/real_win32.rs:5047:5
      |
@@ -12748,15 +13048,6 @@ help: collapse nested if block
 5305 |                         }
 5306 ~                     }
      |
-
-warning: this assertion is always `true`
-    --> src/cef_bridge.rs:6643:9
-     |
-6643 |         assert!(true, "settings were stored and shutdown succeeded");
-     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-     |
-     = help: remove the assertion
-     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#assertions_on_constants
 
 warning: manual implementation of `str::repeat` using iterators
     --> src/real_win32.rs:5405:49
@@ -12920,6 +13211,25 @@ help: collapse nested if block
 5785 |                         }
 5786 ~                     }
      |
+
+warning: this assertion is always `true`
+    --> src/cef_bridge.rs:6206:9
+     |
+6206 |         assert!(true, "JS execution should not panic");
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: remove the assertion
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#assertions_on_constants
+     = note: `#[warn(clippy::assertions_on_constants)]` on by default
+
+warning: this assertion is always `true`
+    --> src/cef_bridge.rs:6643:9
+     |
+6643 |         assert!(true, "settings were stored and shutdown succeeded");
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: remove the assertion
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#assertions_on_constants
 
 warning: you should consider adding a `Default` implementation for `XInputManager`
     --> src/real_win32.rs:6510:5
@@ -15864,6 +16174,19 @@ help: collapse nested if block
 908 ~                 }
     |
 
+warning: this `map_or` can be simplified
+     --> src/cpu.rs:28667:32
+      |
+28667 |             result.is_err() || result.as_ref().map_or(false, |o| o.is_none()),
+      |                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+      |
+      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#unnecessary_map_or
+help: use `is_ok_and` instead
+      |
+28667 -             result.is_err() || result.as_ref().map_or(false, |o| o.is_none()),
+28667 +             result.is_err() || result.as_ref().is_ok_and(|o| o.is_none()),
+      |
+
 warning: you should consider adding a `Default` implementation for `GuestFiberManager`
     --> src/threads.rs:1175:5
      |
@@ -15930,6 +16253,72 @@ help: collapse nested if block
 1293 ~             }
      |
 
+warning: this assertion is always `true`
+     --> src/cpu.rs:29565:13
+      |
+29565 |             assert!(true, "SHA1MSG2 completed without error");
+      |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+      |
+      = help: remove the assertion
+      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#assertions_on_constants
+
+error: approximate value of `f64::consts::PI` found
+     --> src/cpu.rs:29878:30
+      |
+29878 |         state.x87.stack.push(3.14_f64);
+      |                              ^^^^^^^^
+      |
+      = help: consider using the constant directly
+      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#approx_constant
+      = note: `#[deny(clippy::approx_constant)]` on by default
+
+warning: the loop variable `i` is used to index `result`
+     --> src/cpu.rs:31240:18
+      |
+31240 |         for i in 0..16 {
+      |                  ^^^^^
+      |
+      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#needless_range_loop
+help: consider using an iterator and enumerate()
+      |
+31240 -         for i in 0..16 {
+31240 +         for (i, <item>) in result.iter().enumerate() {
+      |
+
+warning: this operation has no effect
+     --> src/cpu.rs:31627:24
+      |
+31627 |         let expected = (0x00FFu64 << 16) | 0x0000;
+      |                        ^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider reducing it to: `(0x00FFu64 << 16)`
+      |
+      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#identity_op
+
+error: approximate value of `f{32, 64}::consts::PI` found
+     --> src/cpu.rs:32760:26
+      |
+32760 |         let value: f32 = 3.14159;
+      |                          ^^^^^^^
+      |
+      = help: consider using the constant directly
+      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#approx_constant
+
+error: approximate value of `f{32, 64}::consts::E` found
+     --> src/cpu.rs:32768:26
+      |
+32768 |         let value: f64 = 2.718281828;
+      |                          ^^^^^^^^^^^
+      |
+      = help: consider using the constant directly
+      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#approx_constant
+
+warning: the borrowed expression implements the required traits
+   --> src/crash_recovery.rs:893:51
+    |
+893 |         let tmp_files: Vec<_> = std::fs::read_dir(&dir.path())
+    |                                                   ^^^^^^^^^^^ help: change this to: `dir.path()`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#needless_borrows_for_generic_args
+
 warning: this function has too many arguments (9/7)
     --> src/user32.rs:1698:5
      |
@@ -15978,6 +16367,31 @@ help: collapse nested if block
 1824 |                     .insert((hwnd, GWL_WNDPROC), class_info.wnd_proc);
 1825 ~             }
      |
+
+warning: this operation has no effect
+   --> src/d2d.rs:974:19
+    |
+974 |         let idx = (0 * target.stride + 0 * 4) as usize;
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider reducing it to: `(0 * target.stride)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#identity_op
+
+error: this operation will always return zero. This is likely not the intended outcome
+   --> src/d2d.rs:974:20
+    |
+974 |         let idx = (0 * target.stride + 0 * 4) as usize;
+    |                    ^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#erasing_op
+    = note: `#[deny(clippy::erasing_op)]` on by default
+
+error: this operation will always return zero. This is likely not the intended outcome
+   --> src/d2d.rs:974:40
+    |
+974 |         let idx = (0 * target.stride + 0 * 4) as usize;
+    |                                        ^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#erasing_op
 
 warning: this `if` statement can be collapsed
     --> src/user32.rs:1828:9
@@ -16184,19 +16598,6 @@ help: collapse nested if block
 2774 |                                 );
 2775 ~                             }
      |
-
-warning: this `map_or` can be simplified
-     --> src/cpu.rs:28667:32
-      |
-28667 |             result.is_err() || result.as_ref().map_or(false, |o| o.is_none()),
-      |                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-      |
-      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#unnecessary_map_or
-help: use `is_ok_and` instead
-      |
-28667 -             result.is_err() || result.as_ref().map_or(false, |o| o.is_none()),
-28667 +             result.is_err() || result.as_ref().is_ok_and(|o| o.is_none()),
-      |
 
 warning: this `if` statement can be collapsed
     --> src/user32.rs:2948:13
@@ -16405,25 +16806,6 @@ help: try
 3987 +                     }
      |
 
-warning: this assertion is always `true`
-     --> src/cpu.rs:29565:13
-      |
-29565 |             assert!(true, "SHA1MSG2 completed without error");
-      |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-      |
-      = help: remove the assertion
-      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#assertions_on_constants
-
-error: approximate value of `f64::consts::PI` found
-     --> src/cpu.rs:29878:30
-      |
-29878 |         state.x87.stack.push(3.14_f64);
-      |                              ^^^^^^^^
-      |
-      = help: consider using the constant directly
-      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#approx_constant
-      = note: `#[deny(clippy::approx_constant)]` on by default
-
 warning: casting to the same type is unnecessary (`u64` -> `u64`)
     --> src/user32.rs:4667:58
      |
@@ -16516,19 +16898,6 @@ warning: this function has too many arguments (9/7)
      |
      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#too_many_arguments
 
-warning: the loop variable `i` is used to index `result`
-     --> src/cpu.rs:31240:18
-      |
-31240 |         for i in 0..16 {
-      |                  ^^^^^
-      |
-      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#needless_range_loop
-help: consider using an iterator and enumerate()
-      |
-31240 -         for i in 0..16 {
-31240 +         for (i, <item>) in result.iter().enumerate() {
-      |
-
 warning: clamp-like pattern without using clamp function
     --> src/user32.rs:5903:30
      |
@@ -16538,32 +16907,6 @@ warning: clamp-like pattern without using clamp function
      = note: clamp will panic if max < min, min.is_nan(), or max.is_nan()
      = note: clamp returns NaN if the input is NaN
      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_clamp
-
-warning: this operation has no effect
-     --> src/cpu.rs:31627:24
-      |
-31627 |         let expected = (0x00FFu64 << 16) | 0x0000;
-      |                        ^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider reducing it to: `(0x00FFu64 << 16)`
-      |
-      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#identity_op
-
-error: approximate value of `f{32, 64}::consts::PI` found
-     --> src/cpu.rs:32760:26
-      |
-32760 |         let value: f32 = 3.14159;
-      |                          ^^^^^^^
-      |
-      = help: consider using the constant directly
-      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#approx_constant
-
-error: approximate value of `f{32, 64}::consts::E` found
-     --> src/cpu.rs:32768:26
-      |
-32768 |         let value: f64 = 2.718281828;
-      |                          ^^^^^^^^^^^
-      |
-      = help: consider using the constant directly
-      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#approx_constant
 
 warning: this `if` statement can be collapsed
    --> src/util.rs:187:9
@@ -16785,38 +17128,14 @@ warning: deref which would be done by auto-deref
     |
     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#explicit_auto_deref
 
-warning: the borrowed expression implements the required traits
-   --> src/crash_recovery.rs:893:51
-    |
-893 |         let tmp_files: Vec<_> = std::fs::read_dir(&dir.path())
-    |                                                   ^^^^^^^^^^^ help: change this to: `dir.path()`
-    |
-    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#needless_borrows_for_generic_args
-
-warning: this operation has no effect
-   --> src/d2d.rs:974:19
-    |
-974 |         let idx = (0 * target.stride + 0 * 4) as usize;
-    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider reducing it to: `(0 * target.stride)`
-    |
-    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#identity_op
-
-error: this operation will always return zero. This is likely not the intended outcome
-   --> src/d2d.rs:974:20
-    |
-974 |         let idx = (0 * target.stride + 0 * 4) as usize;
-    |                    ^^^^^^^^^^^^^^^^^
-    |
-    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#erasing_op
-    = note: `#[deny(clippy::erasing_op)]` on by default
-
-error: this operation will always return zero. This is likely not the intended outcome
-   --> src/d2d.rs:974:40
-    |
-974 |         let idx = (0 * target.stride + 0 * 4) as usize;
-    |                                        ^^^^^
-    |
-    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#erasing_op
+error: approximate value of `f{32, 64}::consts::TAU` found
+    --> src/d3d11.rs:3687:38
+     |
+3687 |             let angle = (i as f32) * 6.2832 / (prim_count as f32);
+     |                                      ^^^^^^
+     |
+     = help: consider using the constant directly
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#approx_constant
 
 warning: this `if` statement can be collapsed
     --> src/vkgl.rs:1174:5
@@ -16894,15 +17213,6 @@ warning: called `unwrap` on `current_function` after checking its variant with `
      = help: try using `if let` or `match`
      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#unnecessary_unwrap
      = note: `#[warn(clippy::unnecessary_unwrap)]` on by default
-
-error: approximate value of `f{32, 64}::consts::TAU` found
-    --> src/d3d11.rs:3687:38
-     |
-3687 |             let angle = (i as f32) * 6.2832 / (prim_count as f32);
-     |                                      ^^^^^^
-     |
-     = help: consider using the constant directly
-     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#approx_constant
 
 warning: this `if` can be collapsed into the outer `match`
     --> src/vkgl.rs:1611:33
@@ -16992,6 +17302,15 @@ help: try adding this
 2454 + }
      |
 
+warning: this `repeat().take()` can be written more concisely
+   --> src/denuvo.rs:945:27
+    |
+945 |             padded.extend(std::iter::repeat(pad_len as u8).take(pad_len));
+    |                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using `repeat_n()` instead: `std::iter::repeat_n(pad_len as u8, pad_len)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_repeat_n
+    = note: `#[warn(clippy::manual_repeat_n)]` on by default
+
 warning: this `if` statement can be collapsed
     --> src/vkgl.rs:2674:9
      |
@@ -17013,6 +17332,15 @@ help: collapse nested if block
 2682 |                 );
 2683 ~             }
      |
+
+warning: manual `RangeInclusive::contains` implementation
+    --> src/denuvo.rs:1006:17
+     |
+1006 |         assert!(delta >= 1000 && delta <= 10000, "delta was {delta}");
+     |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: use: `(1000..=10000).contains(&delta)`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_range_contains
+     = note: `#[warn(clippy::manual_range_contains)]` on by default
 
 warning: this `if` statement can be collapsed
     --> src/vkgl.rs:2726:9
@@ -17083,6 +17411,14 @@ help: try
 2739 +             if let Some(_swapchain) = backend.swapchain() {
      |
 
+warning: this `repeat().take()` can be written more concisely
+    --> src/denuvo.rs:1093:23
+     |
+1093 |         padded.extend(std::iter::repeat(pad_len as u8).take(pad_len));
+     |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using `repeat_n()` instead: `std::iter::repeat_n(pad_len as u8, pad_len)`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_repeat_n
+
 warning: casting to the same type is unnecessary (`u64` -> `u64`)
     --> src/vkgl.rs:2918:12
      |
@@ -17090,6 +17426,14 @@ warning: casting to the same type is unnecessary (`u64` -> `u64`)
      |            ^^^^^^^^^^^^^ help: try: `offset`
      |
      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#unnecessary_cast
+
+warning: this `repeat().take()` can be written more concisely
+    --> src/denuvo.rs:1173:23
+     |
+1173 |         padded.extend(std::iter::repeat(pad_len as u8).take(pad_len));
+     |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using `repeat_n()` instead: `std::iter::repeat_n(pad_len as u8, pad_len)`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_repeat_n
 
 warning: casting to the same type is unnecessary (`u64` -> `u64`)
     --> src/vkgl.rs:2918:28
@@ -17333,15 +17677,6 @@ help: try adding this
 5384 + }
      |
 
-warning: this `repeat().take()` can be written more concisely
-   --> src/denuvo.rs:945:27
-    |
-945 |             padded.extend(std::iter::repeat(pad_len as u8).take(pad_len));
-    |                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using `repeat_n()` instead: `std::iter::repeat_n(pad_len as u8, pad_len)`
-    |
-    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_repeat_n
-    = note: `#[warn(clippy::manual_repeat_n)]` on by default
-
 warning: this `if` statement can be collapsed
     --> src/vkgl.rs:5630:13
      |
@@ -17363,31 +17698,6 @@ help: collapse nested if block
 5636 |                     };
 5637 ~                 }
      |
-
-warning: manual `RangeInclusive::contains` implementation
-    --> src/denuvo.rs:1006:17
-     |
-1006 |         assert!(delta >= 1000 && delta <= 10000, "delta was {delta}");
-     |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: use: `(1000..=10000).contains(&delta)`
-     |
-     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_range_contains
-     = note: `#[warn(clippy::manual_range_contains)]` on by default
-
-warning: this `repeat().take()` can be written more concisely
-    --> src/denuvo.rs:1093:23
-     |
-1093 |         padded.extend(std::iter::repeat(pad_len as u8).take(pad_len));
-     |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using `repeat_n()` instead: `std::iter::repeat_n(pad_len as u8, pad_len)`
-     |
-     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_repeat_n
-
-warning: this `repeat().take()` can be written more concisely
-    --> src/denuvo.rs:1173:23
-     |
-1173 |         padded.extend(std::iter::repeat(pad_len as u8).take(pad_len));
-     |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using `repeat_n()` instead: `std::iter::repeat_n(pad_len as u8, pad_len)`
-     |
-     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_repeat_n
 
 warning: this `if` statement can be collapsed
    --> src/webview2.rs:307:9
@@ -17604,6 +17914,36 @@ warning: needless call to `as_bytes`
     |
     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#needless_as_bytes
     = note: `#[warn(clippy::needless_as_bytes)]` on by default
+
+error: this boolean expression contains a logic bug
+    --> src/dwrite.rs:1398:17
+     |
+1398 |         assert!(!factory.font_collection.families.is_empty() || true);
+     |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: it would look like the following: `true`
+     |
+help: this expression can be optimized out by applying boolean operations to the outer expression
+    --> src/dwrite.rs:1398:18
+     |
+1398 |         assert!(!factory.font_collection.families.is_empty() || true);
+     |                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#overly_complex_bool_expr
+     = note: `#[deny(clippy::overly_complex_bool_expr)]` on by default
+
+warning: this operation has no effect
+    --> src/gdiplus_render.rs:1555:24
+     |
+1555 |             let idx = (1 * stride + 1 * 4) as usize;
+     |                        ^^^^^^^^^^ help: consider reducing it to: `stride`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#identity_op
+
+warning: this operation has no effect
+    --> src/gdiplus_render.rs:1555:37
+     |
+1555 |             let idx = (1 * stride + 1 * 4) as usize;
+     |                                     ^^^^^ help: consider reducing it to: `4`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#identity_op
 
 warning: used consecutive `str::replace` call
    --> src/win32.rs:600:26
@@ -17926,20 +18266,6 @@ help: collapse nested if block
 3384 ~             }
      |
 
-error: this boolean expression contains a logic bug
-    --> src/dwrite.rs:1398:17
-     |
-1398 |         assert!(!factory.font_collection.families.is_empty() || true);
-     |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: it would look like the following: `true`
-     |
-help: this expression can be optimized out by applying boolean operations to the outer expression
-    --> src/dwrite.rs:1398:18
-     |
-1398 |         assert!(!factory.font_collection.families.is_empty() || true);
-     |                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#overly_complex_bool_expr
-     = note: `#[deny(clippy::overly_complex_bool_expr)]` on by default
-
 warning: this `if` statement can be collapsed
     --> src/win32.rs:3378:17
      |
@@ -17987,22 +18313,6 @@ help: collapse nested if block
 4217 |             return true; // correct: "foo.*" matches "foo" without extension
 4218 ~         }
      |
-
-warning: this operation has no effect
-    --> src/gdiplus_render.rs:1555:24
-     |
-1555 |             let idx = (1 * stride + 1 * 4) as usize;
-     |                        ^^^^^^^^^^ help: consider reducing it to: `stride`
-     |
-     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#identity_op
-
-warning: this operation has no effect
-    --> src/gdiplus_render.rs:1555:37
-     |
-1555 |             let idx = (1 * stride + 1 * 4) as usize;
-     |                                     ^^^^^ help: consider reducing it to: `4`
-     |
-     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#identity_op
 
 warning: you should consider adding a `Default` implementation for `WinHttpStack`
    --> src/winhttp.rs:513:5
@@ -20257,9 +20567,6 @@ warning: this operation has no effect
      |
      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#identity_op
 
-warning: `casa1` (lib) generated 1246 warnings
-error: could not compile `casa1` (lib) due to 19 previous errors; 1246 warnings emitted
-warning: build failed, waiting for other jobs to finish...
 warning: you seem to be trying to use `match` for destructuring a single pattern. Consider using `if let`
     --> src/network.rs:4135:9
      |
@@ -20271,6 +20578,9 @@ warning: you seem to be trying to use `match` for destructuring a single pattern
      |
      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#single_match
 
+warning: `casa1` (lib) generated 1271 warnings
+error: could not compile `casa1` (lib) due to 19 previous errors; 1271 warnings emitted
+warning: build failed, waiting for other jobs to finish...
 warning: manual `RangeInclusive::contains` implementation
      --> src/pe_runtime.rs:34963:40
       |
@@ -20340,6 +20650,28 @@ warning: called `iter().copied().collect()` on a slice to create a `Vec`. Callin
       | |______________________^ help: try: `.to_vec()`
       |
       = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#iter_cloned_collect
+
+warning: manual `RangeInclusive::contains` implementation
+    --> src/real_audio.rs:4146:17
+     |
+4146 |         assert!(latency >= 10 && latency <= 50);
+     |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: use: `(10..=50).contains(&latency)`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_range_contains
+
+warning: used `assert_eq!` with a literal bool
+    --> src/real_audio.rs:4999:13
+     |
+4999 |             assert_eq!((*xb.buffer.add(1) - 0.5).abs() < 0.001, true);
+     |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#bool_assert_comparison
+     = note: `#[warn(clippy::bool_assert_comparison)]` on by default
+help: replace it with `assert!(..)`
+     |
+4999 -             assert_eq!((*xb.buffer.add(1) - 0.5).abs() < 0.001, true);
+4999 +             assert!((*xb.buffer.add(1) - 0.5).abs() < 0.001);
+     |
 
 warning: the borrowed expression implements the required traits
     --> src/real_fs.rs:1920:28
@@ -21000,7 +21332,6 @@ warning: used `assert_eq!` with a literal bool
      | |_________^
      |
      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#bool_assert_comparison
-     = note: `#[warn(clippy::bool_assert_comparison)]` on by default
 help: replace it with `assert!(..)`
      |
 7232 ~         assert!(
@@ -21216,5 +21547,5 @@ warning: useless use of `vec!`
      |
      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#useless_vec
 
-warning: `casa1` (lib test) generated 1388 warnings (1237 duplicates)
-error: could not compile `casa1` (lib test) due to 27 previous errors; 1388 warnings emitted
+warning: `casa1` (lib test) generated 1415 warnings (1262 duplicates)
+error: could not compile `casa1` (lib test) due to 27 previous errors; 1415 warnings emitted
