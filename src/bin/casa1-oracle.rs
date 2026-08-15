@@ -267,6 +267,7 @@ fn section3_api_set_suite() -> ApiSetSuite {
     ApiSetSuite {
         cases: [
             "api-ms-win-core-file-l1-1-0.dll",
+            "api-ms-win-core-com-l1-1-0.dll",
             "api-ms-win-crt-runtime-l1-1-0.dll",
             "ext-ms-win-ntuser-window-l1-1-0.dll",
             "custom.dll",
@@ -593,6 +594,9 @@ fn oracle_lookup_export(
 fn parse_forwarder(value: &str) -> Option<(String, DelayLoadSymbol)> {
     let (module, symbol) = value.split_once('.')?;
     if let Some(rest) = symbol.strip_prefix('#') {
+        // Parse failure (e.g. an ordinal beyond u16) fails loudly instead of
+        // silently truncating; the model keeps u16 to match the in-tree
+        // `ImportSymbol::ByOrdinal` consumer.
         let ordinal = rest.parse::<u16>().ok()?;
         Some((
             normalize_module_name(module),
@@ -610,6 +614,12 @@ fn parse_forwarder(value: &str) -> Option<(String, DelayLoadSymbol)> {
 
 fn oracle_api_set_resolve(dll_name: &str) -> String {
     let normalized = normalize_module_name(dll_name);
+    // Check the COM api-set contracts first: every `api-ms-win-core-com-*`
+    // name also starts with `api-ms-win-core-`, so the generic core arm must
+    // not shadow it.
+    if normalized.starts_with("api-ms-win-com-") || normalized.starts_with("api-ms-win-core-com-") {
+        return "ole32.dll".to_string();
+    }
     if normalized.starts_with("api-ms-win-core-") {
         return "kernel32.dll".to_string();
     }
@@ -623,9 +633,6 @@ fn oracle_api_set_resolve(dll_name: &str) -> String {
     }
     if normalized.starts_with("api-ms-win-shell-") {
         return "shell32.dll".to_string();
-    }
-    if normalized.starts_with("api-ms-win-com-") || normalized.starts_with("api-ms-win-core-com-") {
-        return "ole32.dll".to_string();
     }
     if normalized.starts_with("ext-ms-win-ntuser-") {
         return "user32.dll".to_string();

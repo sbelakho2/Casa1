@@ -142,8 +142,10 @@
 #![allow(non_snake_case)]
 #![allow(non_upper_case_globals)]
 // Many Windows API fields and constants are defined for API completeness even
-// when not yet exercised by current guest code paths.
-// TODO: Consider removing this and fixing dead_code warnings incrementally.
+// when not yet exercised by current guest code paths.  Removing this blanket
+// allow currently surfaces ~217 dead-code warnings across ~50 modules; it must
+// be removed incrementally (module by module), never in one pass, so the
+// parallel per-module zero-warning gates stay green.
 #![allow(dead_code)]
 #[macro_use]
 extern crate objc;

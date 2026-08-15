@@ -218,6 +218,24 @@ struct GeCreateResponse {
     pub winver: String,
 }
 
+/// A single path-component name that must not escape its parent directory.
+fn validate_component_name(name: &str, what: &str) -> AppResult<()> {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains(['/', '\\', ':'])
+        || name.starts_with('.')
+        || name.chars().any(char::is_control)
+    {
+        return Err(AppError::new(
+            ReasonCode::RcFsPathInvalid,
+            format!("{what} must be a single path component, got {name:?}"),
+        )
+        .with_hint("reject path separators, '..', and control characters"));
+    }
+    Ok(())
+}
+
 pub fn host_main<I, S>(args: I) -> i32
 where
     I: IntoIterator<Item = S>,
@@ -245,6 +263,7 @@ where
     let cli = HostCli::parse_from(args);
     match cli.command {
         HostCommand::GeCreate { name, arch, winver } => {
+            validate_component_name(&name, "game environment name")?;
             let ge = GameEnvironment::create(&name, arch.clone(), &winver)?;
             util::stable_json(&GeCreateResponse {
                 name,
@@ -343,15 +362,17 @@ where
             }
             insert_steam_zero_touch_inputs(
                 &mut env,
-                steam_update_plan.as_deref(),
-                steam_cert_chain.as_deref(),
-                steam_appmanifest.as_deref(),
-                steam_installscript.as_deref(),
-                steam_payload_root.as_deref(),
-                steam_libraryfolders.as_deref(),
-                steam_library_root.as_deref(),
-                steam_library_host_root.as_deref(),
-                steam_library_host_map.as_deref(),
+                SteamZeroTouchInputs {
+                    update_plan: steam_update_plan.as_deref(),
+                    cert_chain: steam_cert_chain.as_deref(),
+                    appmanifest: steam_appmanifest.as_deref(),
+                    installscript: steam_installscript.as_deref(),
+                    payload_root: steam_payload_root.as_deref(),
+                    libraryfolders: steam_libraryfolders.as_deref(),
+                    library_root: steam_library_root.as_deref(),
+                    library_host_root: steam_library_host_root.as_deref(),
+                    library_host_map: steam_library_host_map.as_deref(),
+                },
             )?;
             let installer = resolve_guest_path(&ge, &installer);
             let args = install_args(&installer, silent)?;
@@ -422,21 +443,41 @@ where
                     .map(|s| s.to_string_lossy().to_string())
                     .unwrap_or_else(|| "Unnamed".to_string())
             });
+            validate_component_name(&name, "app name")?;
             let apps_dir = ge.root.join("apps");
             fs::create_dir_all(&apps_dir).map_err(|e| {
-                AppError::from_io(ReasonCode::RcIo, format!("failed to create apps dir"), &e)
+                AppError::from_io(ReasonCode::RcIo, "failed to create apps dir", &e)
             })?;
 
             // Extract icon from the PE executable if no external icon source
             let icon_data = if let Some(icon_path) = icon_source {
                 Some(fs::read(&icon_path).map_err(|e| {
-                    AppError::from_io(ReasonCode::RcIo, format!("failed to read icon file"), &e)
+                    AppError::from_io(ReasonCode::RcIo, "failed to read icon file", &e)
                 })?)
             } else {
-                extract_icon_from_pe(&exe)
-                    .ok()
-                    .flatten()
-                    .and_then(|icon_img| crate::icon::icons_to_icns(&[icon_img]).ok())
+                match extract_icon_from_pe(&exe) {
+                    Ok(Some(icon_img)) => match crate::icon::icons_to_icns(&[icon_img]) {
+                        Ok(icns) => Some(icns),
+                        Err(e) => {
+                            eprintln!(
+                                "[cli] failed to convert extracted icon to ICNS for {}: {e}",
+                                exe.display()
+                            );
+                            None
+                        }
+                    },
+                    Ok(None) => {
+                        eprintln!("[cli] no icon found in PE executable: {}", exe.display());
+                        None
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[cli] icon extraction failed for {}: {e}",
+                            exe.display()
+                        );
+                        None
+                    }
+                }
             };
 
             let config = AppBundleConfig {
@@ -478,8 +519,18 @@ where
             }))
         }
         HostCommand::AppsUninstall { app_name } => {
+            validate_component_name(&app_name, "app name")?;
             let apps_dir = find_apps_dir()?;
             let app_path = apps_dir.join(&app_name).with_extension("app");
+            // Guard against symlink escape: resolve inside the apps dir.
+            let canonical_dir = apps_dir.canonicalize().unwrap_or_else(|_| apps_dir.clone());
+            let app_path = app_path.canonicalize().unwrap_or(app_path);
+            if !app_path.starts_with(&canonical_dir) {
+                return Err(AppError::new(
+                    ReasonCode::RcFsSandboxEscape,
+                    format!("refusing to uninstall app outside {}", canonical_dir.display()),
+                ));
+            }
             uninstall_app(&app_path)?;
             util::stable_json(&serde_json::json!({
                 "app_name": app_name,
@@ -557,7 +608,13 @@ where
             }
             profile.steam_install_dir = steam_dir;
             if let Some(args) = steam_args {
-                profile.extra_args = shlex::split(&args).unwrap_or_default();
+                profile.extra_args = shlex::split(&args).ok_or_else(|| {
+                    AppError::new(
+                        ReasonCode::RcCliInvalid,
+                        "failed to parse --steam-args string",
+                    )
+                    .with_hint("check shell quoting in --steam-args (unterminated quote?)")
+                })?;
             }
 
             // Execute the Steam launch pipeline.
@@ -597,7 +654,7 @@ fn dispatch_runner(ge: &GameEnvironment, job: &RunnerJob) -> AppResult<RunnerOut
         })?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        if let Ok(response) = serde_json::from_str::<ErrorResponse>(&stderr) {
+        if let Some(response) = parse_runner_error_response(&stderr) {
             return Err(AppError {
                 code: ReasonCode::from_u32(response.reason_code)
                     .unwrap_or(ReasonCode::RcRunnerProtocolInvalid),
@@ -619,6 +676,26 @@ fn dispatch_runner(ge: &GameEnvironment, job: &RunnerJob) -> AppResult<RunnerOut
         )
         .with_hint(error.to_string())
     })
+}
+
+/// Parse the runner's JSON `ErrorResponse` from its stderr.
+///
+/// The runner prints diagnostic lines to stderr before the JSON response and
+/// the response itself is pretty-printed (multi-line), so parsing the whole
+/// stderr as one JSON document fails.  The response is always the last thing
+/// the runner writes, so scan backwards for the last line that begins a JSON
+/// document and try parsing from there.
+fn parse_runner_error_response(stderr: &str) -> Option<ErrorResponse> {
+    let lines: Vec<&str> = stderr.lines().collect();
+    for start in (0..lines.len()).rev() {
+        let candidate = lines[start..].join("\n");
+        if candidate.trim_start().starts_with('{')
+            && let Ok(response) = serde_json::from_str::<ErrorResponse>(&candidate)
+        {
+            return Some(response);
+        }
+    }
+    None
 }
 
 fn ensure_runner_binary_is_current(runner_binary: &Path) -> AppResult<()> {
@@ -649,19 +726,27 @@ fn ensure_runner_binary_is_current(runner_binary: &Path) -> AppResult<()> {
                 None
             }
         };
-    let Some(runner_modified) = runner_modified else {
-        return Ok(());
-    };
-    let Some(current_modified) = current_modified else {
-        return Ok(());
-    };
-    if runner_modified >= current_modified {
+    // Rebuild whenever the runner binary is missing/stale or its modified
+    // time cannot be determined; a missing binary must not be silently
+    // skipped, or the subsequent spawn fails with a confusing error.
+    if let (Some(runner_modified), Some(current_modified)) = (runner_modified, current_modified)
+        && runner_modified >= current_modified
+    {
         return Ok(());
     }
 
+    // Mirror the current build profile so a release `macwin` refreshes the
+    // release `casa1-runner` instead of leaving a stale release sibling.
+    let is_release = current_executable
+        .components()
+        .any(|component| component.as_os_str() == "release");
+    let mut build_args = vec!["build", "--quiet", "--bin", "casa1-runner"];
+    if is_release {
+        build_args.push("--release");
+    }
     let output = Command::new("cargo")
         .current_dir(manifest_dir)
-        .args(["build", "--quiet", "--bin", "casa1-runner"])
+        .args(&build_args)
         .output()
         .map_err(|error| {
             AppError::from_io(
@@ -765,30 +850,35 @@ fn insert_input_replay(
     Ok(())
 }
 
+/// Optional Steam zero-touch install metadata flags.
+struct SteamZeroTouchInputs<'a> {
+    update_plan: Option<&'a Path>,
+    cert_chain: Option<&'a Path>,
+    appmanifest: Option<&'a Path>,
+    installscript: Option<&'a Path>,
+    payload_root: Option<&'a Path>,
+    libraryfolders: Option<&'a Path>,
+    library_root: Option<&'a str>,
+    library_host_root: Option<&'a Path>,
+    library_host_map: Option<&'a Path>,
+}
+
 fn insert_steam_zero_touch_inputs(
     env: &mut BTreeMap<String, String>,
-    steam_update_plan: Option<&Path>,
-    steam_cert_chain: Option<&Path>,
-    steam_appmanifest: Option<&Path>,
-    steam_installscript: Option<&Path>,
-    steam_payload_root: Option<&Path>,
-    steam_libraryfolders: Option<&Path>,
-    steam_library_root: Option<&str>,
-    steam_library_host_root: Option<&Path>,
-    steam_library_host_map: Option<&Path>,
+    inputs: SteamZeroTouchInputs<'_>,
 ) -> AppResult<()> {
     let required_steam_args = [
-        steam_update_plan.is_some(),
-        steam_cert_chain.is_some(),
-        steam_appmanifest.is_some(),
-        steam_installscript.is_some(),
-        steam_payload_root.is_some(),
+        inputs.update_plan.is_some(),
+        inputs.cert_chain.is_some(),
+        inputs.appmanifest.is_some(),
+        inputs.installscript.is_some(),
+        inputs.payload_root.is_some(),
     ];
     let has_any_steam_inputs = required_steam_args.iter().any(|present| *present)
-        || steam_libraryfolders.is_some()
-        || steam_library_root.is_some()
-        || steam_library_host_root.is_some()
-        || steam_library_host_map.is_some();
+        || inputs.libraryfolders.is_some()
+        || inputs.library_root.is_some()
+        || inputs.library_host_root.is_some()
+        || inputs.library_host_map.is_some();
     if !has_any_steam_inputs {
         return Ok(());
     }
@@ -799,16 +889,16 @@ fn insert_steam_zero_touch_inputs(
         )
         .with_hint("required flags: --steam-update-plan, --steam-cert-chain, --steam-appmanifest, --steam-installscript, --steam-payload-root"));
     }
-    if steam_library_host_root.is_some() && steam_library_root.is_none() {
+    if inputs.library_host_root.is_some() && inputs.library_root.is_none() {
         return Err(AppError::new(
             ReasonCode::RcCliInvalid,
             "Steam library host root requires --steam-library-root",
         )
         .with_hint("provide both --steam-library-root and --steam-library-host-root to map a guest Steam library drive onto an external host path"));
     }
-    if steam_library_host_map.is_some()
-        && steam_library_root.is_none()
-        && steam_libraryfolders.is_none()
+    if inputs.library_host_map.is_some()
+        && inputs.library_root.is_none()
+        && inputs.libraryfolders.is_none()
     {
         return Err(AppError::new(
             ReasonCode::RcCliInvalid,
@@ -816,7 +906,7 @@ fn insert_steam_zero_touch_inputs(
         )
         .with_hint("provide --steam-libraryfolders for metadata-driven selection, or --steam-library-root for an explicit library target"));
     }
-    if steam_library_host_root.is_some() && steam_library_host_map.is_some() {
+    if inputs.library_host_root.is_some() && inputs.library_host_map.is_some() {
         return Err(AppError::new(
             ReasonCode::RcCliInvalid,
             "Steam library host root and host map are mutually exclusive",
@@ -827,46 +917,47 @@ fn insert_steam_zero_touch_inputs(
     env.insert("CASA1_STEAM_ZERO_TOUCH".to_string(), "1".to_string());
     env.insert(
         "CASA1_STEAM_UPDATE_PLAN_PATH".to_string(),
-        steam_update_plan.expect("validated").display().to_string(),
+        inputs.update_plan.expect("validated").display().to_string(),
     );
     env.insert(
         "CASA1_STEAM_CERT_CHAIN_PATH".to_string(),
-        steam_cert_chain.expect("validated").display().to_string(),
+        inputs.cert_chain.expect("validated").display().to_string(),
     );
     env.insert(
         "CASA1_STEAM_APPMANIFEST_PATH".to_string(),
-        steam_appmanifest.expect("validated").display().to_string(),
+        inputs.appmanifest.expect("validated").display().to_string(),
     );
     env.insert(
         "CASA1_STEAM_INSTALLSCRIPT_PATH".to_string(),
-        steam_installscript
+        inputs
+            .installscript
             .expect("validated")
             .display()
             .to_string(),
     );
     env.insert(
         "CASA1_STEAM_PAYLOAD_ROOT".to_string(),
-        steam_payload_root.expect("validated").display().to_string(),
+        inputs.payload_root.expect("validated").display().to_string(),
     );
-    if let Some(steam_libraryfolders) = steam_libraryfolders {
+    if let Some(steam_libraryfolders) = inputs.libraryfolders {
         env.insert(
             "CASA1_STEAM_LIBRARYFOLDERS_PATH".to_string(),
             steam_libraryfolders.display().to_string(),
         );
     }
-    if let Some(steam_library_root) = steam_library_root {
+    if let Some(steam_library_root) = inputs.library_root {
         env.insert(
             "CASA1_STEAM_LIBRARY_ROOT".to_string(),
             steam_library_root.to_string(),
         );
     }
-    if let Some(steam_library_host_root) = steam_library_host_root {
+    if let Some(steam_library_host_root) = inputs.library_host_root {
         env.insert(
             "CASA1_STEAM_LIBRARY_HOST_ROOT".to_string(),
             steam_library_host_root.display().to_string(),
         );
     }
-    if let Some(steam_library_host_map) = steam_library_host_map {
+    if let Some(steam_library_host_map) = inputs.library_host_map {
         env.insert(
             "CASA1_STEAM_LIBRARY_HOST_MAP_PATH".to_string(),
             steam_library_host_map.display().to_string(),

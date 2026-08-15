@@ -107,6 +107,10 @@ pub struct DelayLoadCase {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DelayLoadSymbol {
     ByName { name: String },
+    // NOTE: kept as u16 to match the in-tree consumer `tests/section3.rs`
+    // (`ImportSymbol::ByOrdinal` is u16 and is owned by another fixer batch).
+    // Widening to u32 (consistent with `ExportSpec::ordinal`) requires a
+    // coordinated change of that consumer first.
     ByOrdinal { ordinal: u16 },
 }
 
