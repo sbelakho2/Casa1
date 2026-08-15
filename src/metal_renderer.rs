@@ -15,7 +15,6 @@ use crate::metal_backend::{
     dxgi_to_metal_format,
 };
 use crate::reason::ReasonCode;
-use std::collections::BTreeMap;
 
 // ---------------------------------------------------------------------------
 // Rendering types
@@ -212,6 +211,26 @@ impl ComparisonFunc {
     }
 }
 
+/// Index into the fixed depth-stencil state cache (2 depth flags × 2 write
+/// flags × 8 compare functions = 32 entries).
+fn depth_stencil_state_index(
+    depth_enable: bool,
+    depth_write_enable: bool,
+    depth_func: ComparisonFunc,
+) -> usize {
+    let func = match depth_func {
+        ComparisonFunc::Never => 0,
+        ComparisonFunc::Less => 1,
+        ComparisonFunc::Equal => 2,
+        ComparisonFunc::LessEqual => 3,
+        ComparisonFunc::Greater => 4,
+        ComparisonFunc::NotEqual => 5,
+        ComparisonFunc::GreaterEqual => 6,
+        ComparisonFunc::Always => 7,
+    };
+    ((depth_enable as usize) << 4) | ((depth_write_enable as usize) << 3) | func
+}
+
 /// Primitive topology.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrimitiveTopology {
@@ -261,7 +280,7 @@ pub struct MetalRenderContext {
     swapchain: Option<MetalSwapchain>,
     frame_index: u64,
     // Pipeline state cache
-    depth_stencil_states: BTreeMap<String, metal::DepthStencilState>,
+    depth_stencil_states: Vec<Option<metal::DepthStencilState>>,
     // CEF overlay compositing
     cef_overlay_texture: Option<metal::Texture>,
     cef_overlay_pipeline: Option<metal::RenderPipelineState>,
@@ -287,7 +306,7 @@ impl MetalRenderContext {
             command_queue,
             swapchain: None,
             frame_index: 0,
-            depth_stencil_states: BTreeMap::new(),
+            depth_stencil_states: vec![None; 32],
             cef_overlay_texture: None,
             cef_overlay_pipeline: None,
             cef_texture_width: 0,
@@ -336,14 +355,17 @@ impl MetalRenderContext {
     }
 
     /// Get or create a depth stencil state.
+    ///
+    /// The cache is a fixed 32-entry table (2 depth flags × 2 write flags × 8
+    /// compare functions) so the hot path does no allocation or map lookup.
     pub fn get_depth_stencil_state(
         &mut self,
         depth_enable: bool,
         depth_write_enable: bool,
         depth_func: ComparisonFunc,
     ) -> &metal::DepthStencilStateRef {
-        let key = format!("{depth_enable}_{depth_write_enable}_{:?}", depth_func);
-        if !self.depth_stencil_states.contains_key(&key) {
+        let idx = depth_stencil_state_index(depth_enable, depth_write_enable, depth_func);
+        if self.depth_stencil_states[idx].is_none() {
             let state = if depth_enable {
                 self.device
                     .create_depth_stencil_state(depth_func.to_metal(), depth_write_enable)
@@ -351,12 +373,17 @@ impl MetalRenderContext {
                 self.device
                     .create_depth_stencil_state(metal::MTLCompareFunction::Always, false)
             };
-            self.depth_stencil_states.insert(key.clone(), state);
+            self.depth_stencil_states[idx] = Some(state);
         }
-        self.depth_stencil_states.get(&key).unwrap()
+        self.depth_stencil_states[idx].as_ref().unwrap()
     }
 
     /// Begin a new frame.
+    ///
+    /// NOTE: this API is a placeholder that does not present — GPU work only
+    /// happens when the command buffer is committed and presented via
+    /// [`present`](Self::present). Callers that expect rendered frames should
+    /// use the swapchain present path instead.
     pub fn begin_frame(&mut self) -> AppResult<FrameContext> {
         let (width, height) = self
             .swapchain
@@ -375,12 +402,16 @@ impl MetalRenderContext {
     }
 
     /// End the current frame and present.
+    ///
+    /// NOTE: placeholder — this only advances the frame counter. The frame's
+    /// command buffer is committed and presented by the swapchain present path
+    /// ([`present`](Self::present)); a caller relying on this stub alone would
+    /// never submit GPU work.
     pub fn end_frame(&mut self) {
         self.frame_index += 1;
     }
 
     /// Present the swapchain.
-    /// Present the current frame.
     ///
     /// If the Steam overlay is active, this automatically uploads the latest
     /// CEF overlay frame and composites it on top of the game content via
@@ -398,7 +429,11 @@ impl MetalRenderContext {
             return self.composite_and_present();
         }
 
-        // Standard present without overlay compositing
+        self.present_standard()
+    }
+
+    /// Present the swapchain without any overlay compositing.
+    fn present_standard(&mut self) -> AppResult<()> {
         let swapchain = self
             .swapchain
             .as_ref()
@@ -425,22 +460,30 @@ impl MetalRenderContext {
     /// cached Metal texture. Call this once per frame *before* compositing.
     pub fn upload_cef_overlay_if_needed(&mut self) -> AppResult<()> {
         let frame_data = with_global_cef_compositor(|compositor| compositor.take_pending_frame());
-        let Some(frame) = frame_data else {
+        let Some(mut frame) = frame_data else {
             return Ok(());
         };
 
         let (width, height) = (frame.width, frame.height);
+        if width == 0 || height == 0 {
+            return Ok(());
+        }
 
         // Zero-copy path: if the frame carries an IOSurface, alias its storage
         // directly into a Metal texture instead of doing a CPU pixel upload.
-        if let Some(io_surface) = frame.io_surface {
-            if let Some(texture) = crate::metal_backend::create_texture_from_io_surface(
+        if let Some(io_surface) = frame.io_surface.take() {
+            let texture = crate::metal_backend::create_texture_from_io_surface(
                 self.device.device(),
                 io_surface,
                 metal::MTLPixelFormat::BGRA8Unorm,
                 width as u64,
                 height as u64,
-            ) {
+            );
+            // The frame's +1 reference is released here regardless of whether
+            // the texture was created: `newTextureWithDescriptor:iosurface:`
+            // keeps the surface alive for the lifetime of the texture.
+            release_io_surface(io_surface);
+            if let Some(texture) = texture {
                 self.cef_overlay_texture = Some(texture);
                 self.cef_texture_width = width;
                 self.cef_texture_height = height;
@@ -453,14 +496,16 @@ impl MetalRenderContext {
             }
         }
 
-        // Re-allocate texture if dimensions changed
+        // Re-allocate texture if dimensions changed. Both the IOSurface and
+        // the CPU path use BGRA8Unorm so the shared compositing shader samples
+        // identical colours regardless of which path delivered the frame.
         if self.cef_texture_width != width
             || self.cef_texture_height != height
             || self.cef_overlay_texture.is_none()
         {
             let descriptor = metal::TextureDescriptor::new();
             descriptor.set_texture_type(metal::MTLTextureType::D2);
-            descriptor.set_pixel_format(metal::MTLPixelFormat::RGBA8Unorm);
+            descriptor.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
             descriptor.set_width(width as u64);
             descriptor.set_height(height as u64);
             descriptor.set_usage(
@@ -474,8 +519,16 @@ impl MetalRenderContext {
             self.cef_texture_height = height;
         }
 
-        // Upload pixel data
+        // Upload pixel data. The frame's pixel buffer is untrusted (guest/CEF
+        // driven), so validate its length before handing it to Metal — a
+        // shorter buffer would otherwise be read past its end (OOB read, UB).
         if let Some(ref texture) = self.cef_overlay_texture {
+            let needed = (width as usize)
+                .saturating_mul(height as usize)
+                .saturating_mul(4);
+            if frame.pixels.len() < needed {
+                return Ok(());
+            }
             let region = metal::MTLRegion {
                 origin: metal::MTLOrigin { x: 0, y: 0, z: 0 },
                 size: metal::MTLSize {
@@ -485,6 +538,10 @@ impl MetalRenderContext {
                 },
             };
             let bytes_per_row = (width as u64) * 4;
+            // The compositor delivers RGBA byte order; the texture is
+            // BGRA8Unorm (matching the IOSurface path), so swap R/B in place
+            // before the upload so both paths sample identical colours.
+            rgba_to_bgra_in_place(&mut frame.pixels[..needed]);
             texture.replace_region(
                 region,
                 0,
@@ -504,16 +561,16 @@ impl MetalRenderContext {
     fn ensure_cef_overlay_pipeline(&mut self) -> AppResult<()> {
         // Always poll the async compiler first to drain any completed results,
         // even if we already have a pipeline (avoids leaking PipelineReady entries).
-        if let Some(ref mut compiler) = self.pipeline_compiler {
-            if self.cef_pipeline_request_id != 0 {
-                for ready in compiler.poll() {
-                    if ready.id == self.cef_pipeline_request_id {
-                        if let PipelineState::Render(ps) = ready.state {
-                            self.cef_overlay_pipeline = Some(ps);
-                            self.cef_pipeline_request_id = 0;
-                        }
-                        break;
+        if self.cef_pipeline_request_id != 0
+            && let Some(ref mut compiler) = self.pipeline_compiler
+        {
+            for ready in compiler.poll() {
+                if ready.id == self.cef_pipeline_request_id {
+                    if let PipelineState::Render(ps) = ready.state {
+                        self.cef_overlay_pipeline = Some(ps);
+                        self.cef_pipeline_request_id = 0;
                     }
+                    break;
                 }
             }
         }
@@ -627,6 +684,11 @@ impl MetalRenderContext {
     ///   1. The existing game content on the drawable is preserved (Load action).
     ///   2. The CEF/Steam UI overlay texture is alpha-blended on top.
     ///   3. Then the drawable is presented.
+    ///
+    /// When no overlay texture (no frame yet) or no overlay pipeline is
+    /// available, this falls back to the normal present path instead of
+    /// presenting an unrendered drawable (which would drop the game's content
+    /// for that frame).
     pub fn composite_and_present(&mut self) -> AppResult<()> {
         // Create command buffer first (mutable, no borrow conflicts)
         let cmd_buffer_ref = self.create_command_buffer();
@@ -636,6 +698,15 @@ impl MetalRenderContext {
         if self.cef_overlay_texture.is_some() {
             self.ensure_cef_overlay_pipeline()?;
         }
+
+        // Nothing to composite yet (no texture or pipeline): present the game
+        // content via the standard path instead of a blank drawable.
+        let (Some(texture), Some(pipeline)) = (
+            self.cef_overlay_texture.as_ref(),
+            self.cef_overlay_pipeline.as_ref(),
+        ) else {
+            return self.present_standard();
+        };
 
         // Get the drawable after all mutable operations — this borrows self
         // immutably for the rest of the function, so it must be last.
@@ -647,24 +718,19 @@ impl MetalRenderContext {
             swapchain.next_drawable()?
         };
 
-        // If we have a valid overlay texture, composite it onto the drawable
-        if let Some(ref texture) = self.cef_overlay_texture {
-            if let Some(ref pipeline) = self.cef_overlay_pipeline {
-                let descriptor = metal::RenderPassDescriptor::new();
-                let ca = descriptor.color_attachments().object_at(0).unwrap();
-                ca.set_texture(Some(drawable.texture()));
-                // Preserve existing game content
-                ca.set_load_action(metal::MTLLoadAction::Load);
-                ca.set_store_action(metal::MTLStoreAction::Store);
+        let descriptor = metal::RenderPassDescriptor::new();
+        let ca = descriptor.color_attachments().object_at(0).unwrap();
+        ca.set_texture(Some(drawable.texture()));
+        // Preserve existing game content
+        ca.set_load_action(metal::MTLLoadAction::Load);
+        ca.set_store_action(metal::MTLStoreAction::Store);
 
-                let encoder = cmd_buffer.new_render_command_encoder(descriptor);
-                encoder.set_render_pipeline_state(pipeline);
-                encoder.set_fragment_texture(0, Some(texture));
-                // Full-screen triangle (3 vertices, no index/vertex buffer needed)
-                encoder.draw_primitives(metal::MTLPrimitiveType::Triangle, 0, 3);
-                encoder.end_encoding();
-            }
-        }
+        let encoder = cmd_buffer.new_render_command_encoder(descriptor);
+        encoder.set_render_pipeline_state(pipeline);
+        encoder.set_fragment_texture(0, Some(texture));
+        // Full-screen triangle (3 vertices, no index/vertex buffer needed)
+        encoder.draw_primitives(metal::MTLPrimitiveType::Triangle, 0, 3);
+        encoder.end_encoding();
 
         cmd_buffer.present_drawable(drawable);
         cmd_buffer.commit();
@@ -673,11 +739,13 @@ impl MetalRenderContext {
     }
 
     /// Resize the CEF overlay texture. Call this when the window/browser is resized.
-    pub fn resize_cef_overlay(&mut self, _width: u32, _height: u32) {
-        // Force texture reallocation on next upload
+    ///
+    /// Forces a texture reallocation on the next upload at the given size.
+    pub fn resize_cef_overlay(&mut self, width: u32, height: u32) {
+        // Force texture reallocation on next upload, at the requested size.
         self.cef_overlay_texture = None;
-        self.cef_texture_width = 0;
-        self.cef_texture_height = 0;
+        self.cef_texture_width = width;
+        self.cef_texture_height = height;
     }
 }
 
@@ -709,7 +777,7 @@ fn build_cef_pipeline_descriptor(
 /// Inline Metal Shading Language source for the CEF overlay compositing pass.
 ///
 /// Uses a full-screen triangle (vertex_id only, no vertex buffer) and samples
-/// the RGBA8 overlay texture with linear filtering.
+/// the BGRA8 overlay texture with linear filtering.
 const CEF_OVERLAY_SHADER_SOURCE: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -764,6 +832,45 @@ unsafe impl Send for IoSurfacePtr {}
 // SAFETY: Send is safe because the type only uses thread-safe internal state or is accessed under exclusive &mut
 unsafe impl Sync for IoSurfacePtr {}
 
+/// Retain an IOSurfaceRef (+1) so it stays alive while stored in the compositor.
+#[cfg(target_os = "macos")]
+fn retain_io_surface(surface: *mut std::ffi::c_void) {
+    if !surface.is_null() {
+        // SAFETY: `surface` is a valid IOSurfaceRef (a CoreFoundation object);
+        // CFRetain is thread-safe and takes a +1 reference.
+        unsafe {
+            core_foundation::base::CFRetain(surface as *const std::ffi::c_void);
+        }
+    }
+}
+
+/// Release an IOSurfaceRef (−1). No-op for null pointers.
+#[cfg(target_os = "macos")]
+fn release_io_surface(surface: *mut std::ffi::c_void) {
+    if !surface.is_null() {
+        // SAFETY: `surface` is a valid IOSurfaceRef with a +1 reference owned
+        // by the caller (or the compositor/frame that calls this).
+        unsafe {
+            core_foundation::base::CFRelease(surface as *const std::ffi::c_void);
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn retain_io_surface(_surface: *mut std::ffi::c_void) {}
+
+#[cfg(not(target_os = "macos"))]
+fn release_io_surface(_surface: *mut std::ffi::c_void) {}
+
+/// Convert a tightly-packed RGBA8 pixel buffer to BGRA8 in place (swap the red
+/// and blue channels), so the CPU upload path matches the IOSurface path's
+/// BGRA byte order and both paths sample identical colours.
+fn rgba_to_bgra_in_place(pixels: &mut [u8]) {
+    for px in pixels.chunks_exact_mut(4) {
+        px.swap(0, 2);
+    }
+}
+
 /// Thread-safe pending frame data exchanged between the CEF bridge and the
 /// Metal compositor.
 pub struct CefMetalCompositor {
@@ -773,7 +880,8 @@ pub struct CefMetalCompositor {
     pending_pixels: Option<Vec<u8>>,
     /// Optional IOSurface handle for zero-copy frame exchange.
     /// When set, the compositor prefers IOSurface-backed textures over
-    /// CPU-side pixel uploads.
+    /// CPU-side pixel uploads. The compositor owns a +1 reference on the
+    /// surface from submit until the frame is consumed.
     pending_io_surface: Option<IoSurfacePtr>,
     /// Last frame number submitted (for tracking updates).
     last_frame_number: u64,
@@ -785,6 +893,12 @@ pub struct CefMetalCompositor {
     last_vsync_timestamp: u64,
     /// Target frame interval for 60fps compositing (~16.67ms in nanoseconds).
     vsync_interval_ns: u64,
+}
+
+impl Default for CefMetalCompositor {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl CefMetalCompositor {
@@ -804,30 +918,51 @@ impl CefMetalCompositor {
 
     /// Submit a new CEF overlay frame for compositing. Called by the CEF bridge
     /// when a new WKWebView snapshot is available.
+    ///
+    /// `pixels` are tightly-packed 32-bit RGBA bytes (R, G, B, A per pixel) in
+    /// top-down row order. They are converted to BGRA on upload to match the
+    /// IOSurface path.
     pub fn submit_frame(&mut self, width: u32, height: u32, pixels: Vec<u8>) {
+        // A CPU frame replaces any still-pending IOSurface reference.
+        self.clear_pending_io_surface();
         self.pending_width = width;
         self.pending_height = height;
         self.pending_pixels = Some(pixels);
-        self.pending_io_surface = None;
         self.last_frame_number += 1;
     }
 
     /// Submit a new CEF overlay frame via IOSurface (zero-copy path).
-    /// The IOSurface must contain RGBA8 pixel data at the given dimensions.
+    /// The IOSurface must contain BGRA8 pixel data at the given dimensions.
     ///
     /// # Safety
     /// `io_surface_ptr` must be a valid IOSurfaceRef with matching dimensions.
+    ///
+    /// The compositor retains its own reference on submit and releases it when
+    /// the frame is consumed (`take_pending_frame`), so the caller may release
+    /// its reference immediately after this call returns.
     pub unsafe fn submit_io_surface_frame(
         &mut self,
         width: u32,
         height: u32,
         io_surface_ptr: *mut std::ffi::c_void,
     ) {
+        // Replace any still-pending surface (releasing our old reference).
+        self.clear_pending_io_surface();
         self.pending_width = width;
         self.pending_height = height;
+        // Take our own reference so the surface stays alive until the frame is
+        // consumed, regardless of what the caller does with its copy.
+        retain_io_surface(io_surface_ptr);
         self.pending_io_surface = Some(IoSurfacePtr(io_surface_ptr));
         self.pending_pixels = None;
         self.last_frame_number += 1;
+    }
+
+    /// Drop the pending IOSurface reference, if any.
+    fn clear_pending_io_surface(&mut self) {
+        if let Some(ptr) = self.pending_io_surface.take() {
+            release_io_surface(ptr.0);
+        }
     }
 
     /// Take the pending frame data (if any) for upload to the Metal texture.
@@ -898,9 +1033,21 @@ pub struct PendingCefFrame {
     pub height: u32,
     pub pixels: Vec<u8>,
     /// Optional IOSurface pointer for zero-copy texture creation.
+    /// The frame owns a +1 reference, released when the frame is dropped
+    /// (see [`Drop`]).
     pub io_surface: Option<*mut std::ffi::c_void>,
     /// Monotonically increasing frame number.
     pub frame_number: u64,
+}
+
+impl Drop for PendingCefFrame {
+    fn drop(&mut self) {
+        // Release the +1 reference we own on the IOSurface, if the consumer
+        // has not taken it out of the frame (e.g. on early-return paths).
+        if let Some(surface) = self.io_surface {
+            release_io_surface(surface);
+        }
+    }
 }
 
 // Global singleton following the same pattern as GLOBAL_CEF_BRIDGE in cef_bridge.rs
@@ -912,8 +1059,8 @@ pub fn with_global_cef_compositor<F, R>(f: F) -> R
 where
     F: FnOnce(&mut CefMetalCompositor) -> R,
 {
-    let mut guard = GLOBAL_CEF_METAL_COMPOSITOR.lock().unwrap();
-    f(&mut *guard)
+    let mut guard = GLOBAL_CEF_METAL_COMPOSITOR.lock().unwrap_or_else(|e| e.into_inner());
+    f(&mut guard)
 }
 
 /// Submit a CEF overlay frame to the global compositor. This is the primary
@@ -951,6 +1098,9 @@ pub fn set_cef_compositor_game_active(active: bool) {
 
 /// Get the current time in nanoseconds from mach_absolute_time.
 /// Uses mach_timebase_info to convert from Mach absolute time units.
+///
+/// The multiplication is done in 128-bit so a long-running timer value cannot
+/// wrap around (timebase.numer is usually 125).
 fn mach_absolute_time() -> u64 {
     #[cfg(target_os = "macos")]
     {
@@ -960,7 +1110,8 @@ fn mach_absolute_time() -> u64 {
             let mut timebase: libc::mach_timebase_info = std::mem::zeroed();
             libc::mach_timebase_info(&mut timebase);
             let mach_time = libc::mach_absolute_time();
-            (mach_time * timebase.numer as u64) / timebase.denom as u64
+            let nanos = ((mach_time as u128) * (timebase.numer as u128)) / (timebase.denom as u128);
+            nanos.min(u64::MAX as u128) as u64
         }
     }
     #[cfg(not(target_os = "macos"))]
@@ -1033,7 +1184,10 @@ impl FrameContext {
 // Blend factor translation
 // ---------------------------------------------------------------------------
 
-/// Translate a D3D11 blend factor to Metal.
+/// Translate a D3D11 blend factor to Metal for the **RGB** channels.
+///
+/// `BlendFactor::BlendFactor` (D3D11_BLEND_BLEND_FACTOR) applies the blend
+/// constant to all components, so RGB factors map to Metal's `BlendColor`.
 pub fn blend_factor_to_metal(factor: BlendFactor) -> metal::MTLBlendFactor {
     match factor {
         BlendFactor::Zero => metal::MTLBlendFactor::Zero,
@@ -1047,7 +1201,18 @@ pub fn blend_factor_to_metal(factor: BlendFactor) -> metal::MTLBlendFactor {
         BlendFactor::DstColor => metal::MTLBlendFactor::DestinationColor,
         BlendFactor::InvDstColor => metal::MTLBlendFactor::OneMinusDestinationColor,
         BlendFactor::SrcAlphaSaturate => metal::MTLBlendFactor::SourceAlphaSaturated,
+        BlendFactor::BlendFactor => metal::MTLBlendFactor::BlendColor,
+    }
+}
+
+/// Translate a D3D11 blend factor to Metal for the **alpha** channel.
+///
+/// Alpha factors of `BlendFactor::BlendFactor` map to Metal's `BlendAlpha`
+/// (which uses only the alpha component of the blend constant).
+pub fn blend_factor_to_metal_alpha(factor: BlendFactor) -> metal::MTLBlendFactor {
+    match factor {
         BlendFactor::BlendFactor => metal::MTLBlendFactor::BlendAlpha,
+        other => blend_factor_to_metal(other),
     }
 }
 
@@ -1178,7 +1343,11 @@ mod tests {
         ctx.get_depth_stencil_state(true, true, ComparisonFunc::Less);
         ctx.get_depth_stencil_state(true, true, ComparisonFunc::Less);
         // If we get here without panic, caching works (no duplicate creation error)
-        assert_eq!(ctx.depth_stencil_states.len(), 1);
+        let idx = depth_stencil_state_index(true, true, ComparisonFunc::Less);
+        assert!(ctx.depth_stencil_states[idx].is_some());
+        // A different function variant occupies a different slot.
+        let other = depth_stencil_state_index(true, true, ComparisonFunc::Greater);
+        assert!(ctx.depth_stencil_states[other].is_none());
     }
 
     #[test]
@@ -1239,6 +1408,54 @@ mod tests {
             blend_op_to_metal(BlendOp::Subtract),
             metal::MTLBlendOperation::Subtract
         );
+    }
+
+    #[test]
+    fn blend_factor_translation_rgb_vs_alpha() {
+        // D3D11_BLEND_BLEND_FACTOR applies the blend constant to every
+        // component: RGB → BlendColor, alpha → BlendAlpha.
+        assert_eq!(
+            blend_factor_to_metal(BlendFactor::BlendFactor),
+            metal::MTLBlendFactor::BlendColor
+        );
+        assert_eq!(
+            blend_factor_to_metal_alpha(BlendFactor::BlendFactor),
+            metal::MTLBlendFactor::BlendAlpha
+        );
+        // Non-BlendFactor factors are identical in both variants.
+        assert_eq!(
+            blend_factor_to_metal(BlendFactor::SrcAlpha),
+            blend_factor_to_metal_alpha(BlendFactor::SrcAlpha)
+        );
+    }
+
+    #[test]
+    fn rgba_to_bgra_in_place_swaps_channels() {
+        // Both the IOSurface path (BGRA8) and the CPU path must sample the
+        // same colours; the CPU upload converts RGBA → BGRA exactly once.
+        let mut px = vec![0x11, 0x22, 0x33, 0xFF, 0xAA, 0xBB, 0xCC, 0x00];
+        rgba_to_bgra_in_place(&mut px);
+        assert_eq!(px, vec![0x33, 0x22, 0x11, 0xFF, 0xCC, 0xBB, 0xAA, 0x00]);
+        // Converting again must not be a no-op if re-run (safety check), so a
+        // second pass swaps back — callers must apply it exactly once.
+        rgba_to_bgra_in_place(&mut px);
+        assert_eq!(px, vec![0x11, 0x22, 0x33, 0xFF, 0xAA, 0xBB, 0xCC, 0x00]);
+    }
+
+    #[test]
+    fn compositor_io_surface_ownership_is_balanced() {
+        // Ownership bookkeeping is pointer-agnostic; a null surface must not
+        // crash retain/release paths.
+        retain_io_surface(std::ptr::null_mut());
+        release_io_surface(std::ptr::null_mut());
+
+        // submit_frame must not leak a previously pending IO surface
+        // reference (clear_pending_io_surface handles it).
+        let mut compositor = CefMetalCompositor::new();
+        compositor.submit_frame(2, 2, vec![0u8; 16]);
+        let frame = compositor.take_pending_frame().unwrap();
+        assert!(frame.io_surface.is_none());
+        assert!(compositor.take_pending_frame().is_none());
     }
 
     #[test]

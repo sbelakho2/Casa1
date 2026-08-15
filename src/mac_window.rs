@@ -63,6 +63,15 @@ struct MainQueue {
 /// This is the replacement for the old `assert_main_thread()` panic —
 /// instead of crashing, we properly dispatch to the main thread so that
 /// the PE runtime worker can safely call AppKit APIs.
+///
+/// # Invariant
+///
+/// The main loop MUST keep calling [`pump_main_queue`] as long as
+/// background threads may call this function — including during teardown,
+/// right up until the process exits. If the loop stops pumping while a
+/// thread is blocked here, that thread waits forever. The wait is bounded
+/// (10s) with a warning so a stalled main loop is diagnosable; the closure
+/// is still guaranteed to run and the returned value is always valid.
 fn run_on_main<F, R>(f: F) -> R
 where
     F: FnOnce() -> R,
@@ -108,11 +117,25 @@ where
         // Push the work item onto the queue.
         MAIN_QUEUE.pending.lock().unwrap().push_back(item);
 
-        // Block until the main thread processes this item.
+        // Block until the main thread processes this item. The wait is bounded
+        // so that a stalled main loop (e.g. during shutdown) is diagnosable;
+        // when it fires we keep waiting because the result is only valid after
+        // the closure has actually run.
         let (lock, cvar) = &*done_for_wait;
         let mut completed = lock.lock().unwrap();
+        let mut warned = false;
         while !*completed {
-            completed = cvar.wait(completed).unwrap();
+            let (guard, timeout) = cvar
+                .wait_timeout(completed, std::time::Duration::from_secs(10))
+                .unwrap();
+            completed = guard;
+            if timeout.timed_out() && !warned {
+                warned = true;
+                eprintln!(
+                    "[mac_window] run_on_main: main queue has not been pumped for 10s; \
+                     is the main loop still calling pump_main_queue()?"
+                );
+            }
         }
 
         // SAFETY: After the Condvar signals, the closure has written result_ptr.
@@ -126,10 +149,18 @@ where
 /// Process all pending main-thread work items.
 ///
 /// Must be called from the **main thread** — typically at the top of each
-/// iteration of `run_live_host_session()`'s event loop.  Each pending
-/// `MainQueueItem` is executed and its completion signal is set, unblocking
-/// the background thread that submitted it.
+/// iteration of `run_live_host_session()`'s event loop, and also during
+/// teardown so that no background thread is left blocked in
+/// [`run_on_main`].  Each pending `MainQueueItem` is executed and its
+/// completion signal is set, unblocking the background thread that
+/// submitted it.
 pub fn pump_main_queue() {
+    #[cfg(target_os = "macos")]
+    // SAFETY: pthread_main_np is a simple POSIX query.
+    debug_assert!(
+        unsafe { libc::pthread_main_np() != 0 },
+        "pump_main_queue() must be called from the main thread"
+    );
     let items = {
         let mut pending = MAIN_QUEUE.pending.lock().unwrap();
         std::mem::take(&mut *pending)
@@ -390,7 +421,7 @@ pub fn enumerate_nscreens() -> Vec<NSScreenInfo> {
     #[cfg(target_os = "macos")]
     // SAFETY: AppKit FFI for window management on macOS
     unsafe {
-        return run_on_main(move || {
+        run_on_main(move || {
             let mut result = Vec::new();
             if !process_is_app_bundle() {
                 return result;
@@ -400,7 +431,7 @@ pub fn enumerate_nscreens() -> Vec<NSScreenInfo> {
                 return result;
             }
             let count: usize = msg_send![screens, count];
-            let num_key: *mut objc::runtime::Object = msg_send![objc::class!(NSString), stringWithUTF8String: b"NSScreenNumber\0".as_ptr() as *const i8];
+            let num_key: *mut objc::runtime::Object = msg_send![objc::class!(NSString), stringWithUTF8String: c"NSScreenNumber".as_ptr()];
             for i in 0..count {
                 let screen: *mut objc::runtime::Object = msg_send![screens, objectAtIndex: i];
                 if screen.is_null() {
@@ -447,7 +478,7 @@ pub fn enumerate_nscreens() -> Vec<NSScreenInfo> {
                 });
             }
             result
-        });
+        })
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -462,7 +493,7 @@ pub fn get_backing_scale_factor(nswindow: *mut std::ffi::c_void) -> f64 {
     #[cfg(target_os = "macos")]
     // SAFETY: AppKit FFI for window management on macOS
     unsafe {
-        return run_on_main(move || {
+        run_on_main(move || {
             if nswindow.is_null() {
                 return 2.0;
             }
@@ -472,8 +503,8 @@ pub fn get_backing_scale_factor(nswindow: *mut std::ffi::c_void) -> f64 {
                 return 2.0;
             }
             let scale: f64 = msg_send![screen, backingScaleFactor];
-            return scale;
-        });
+            scale
+        })
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -487,13 +518,13 @@ pub fn set_layer_contents_scale(layer: *mut std::ffi::c_void, scale: f64) {
     #[cfg(target_os = "macos")]
     // SAFETY: AppKit FFI for window management on macOS
     unsafe {
-        return run_on_main(move || {
+        run_on_main(move || {
             if layer.is_null() {
                 return;
             }
             let l: *mut objc::runtime::Object = layer as *mut _;
             let _: () = msg_send![l, setContentsScale: scale];
-        });
+        })
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -529,8 +560,14 @@ pub fn map_window_style_to_ns_style(style: u32, _ex_style: u32) -> i32 {
     }
 
     if style & WS_POPUP != 0 {
-        // Popup windows have a border but are not titled
-        return NSWindowStyleMaskTitled | NSWindowStyleMaskClosable;
+        // Windows popups have a border but no caption (title bar) unless
+        // WS_CAPTION (both WS_BORDER|WS_DLGFRAME) is set; a titled NSWindow
+        // would add a title bar and close button, changing the look of menus
+        // and tooltips.
+        if style & WS_CAPTION == WS_CAPTION {
+            return NSWindowStyleMaskTitled | NSWindowStyleMaskClosable;
+        }
+        return NSWindowStyleMaskBorderless;
     }
 
     // Overlapped windows
@@ -576,7 +613,7 @@ pub fn init_nsapplication() -> bool {
     #[cfg(target_os = "macos")]
     // SAFETY: AppKit FFI for window management on macOS
     unsafe {
-        return run_on_main(move || {
+        run_on_main(move || {
             let cls_app = match objc::runtime::Class::get("NSApplication") {
                 Some(c) => c,
                 None => return false,
@@ -637,7 +674,7 @@ pub fn init_nsapplication() -> bool {
             set_shared_nsapp(shared_app as *mut std::ffi::c_void);
             set_nsapp_initialized(true);
             true
-        });
+        })
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -656,7 +693,7 @@ pub fn init_nsapplication_headless() -> bool {
     #[cfg(target_os = "macos")]
     // SAFETY: AppKit FFI for window management on macOS
     unsafe {
-        return run_on_main(move || {
+        run_on_main(move || {
             let cls_app = match objc::runtime::Class::get("NSApplication") {
                 Some(c) => c,
                 None => return false,
@@ -677,7 +714,7 @@ pub fn init_nsapplication_headless() -> bool {
             set_shared_nsapp(shared_app as *mut std::ffi::c_void);
             set_nsapp_initialized(true);
             true
-        });
+        })
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -687,6 +724,71 @@ pub fn init_nsapplication_headless() -> bool {
 }
 
 // ── NSWindow creation ────────────────────────────────────────────────────
+
+/// Resolve the screen that contains the requested window rect and return its
+/// `(top, height)` in the global bottom-up coordinate space.
+///
+/// Windows Y coordinates are measured from the top of the primary display,
+/// so flipping must happen against the target screen's frame — using the main
+/// screen's height for a window on a differently-sized secondary display puts
+/// it at the wrong vertical offset.
+///
+/// Falls back to the main screen (and finally to the requested height) when
+/// no screen can be resolved.
+///
+/// Must be called on the main thread.
+#[cfg(target_os = "macos")]
+// SAFETY: AppKit FFI for window management on macOS
+unsafe fn target_screen_top(x: f64, y: f64, w: f64, h: f64) -> (f64, f64) {
+    let cls_screen = match objc::runtime::Class::get("NSScreen") {
+        Some(c) => c,
+        None => return (h, h),
+    };
+    let screens: *mut objc::runtime::Object = msg_send![cls_screen, screens];
+    if screens.is_null() {
+        let main: *mut objc::runtime::Object = msg_send![cls_screen, mainScreen];
+        if main.is_null() {
+            return (h, h);
+        }
+        let frame: NSRect = msg_send![main, frame];
+        return (frame.origin.y + frame.size.height, frame.size.height);
+    }
+    let count: usize = msg_send![screens, count];
+    let mut tops = Vec::with_capacity(count);
+    let mut frames = Vec::with_capacity(count);
+    for i in 0..count {
+        let screen: *mut objc::runtime::Object = msg_send![screens, objectAtIndex: i];
+        if screen.is_null() {
+            continue;
+        }
+        let frame: NSRect = msg_send![screen, frame];
+        tops.push(frame.origin.y + frame.size.height);
+        frames.push(frame);
+    }
+    if frames.is_empty() {
+        return (h, h);
+    }
+    // The top of the virtual display space (primary display's top edge).
+    let global_top = tops.iter().copied().fold(f64::MIN, f64::max);
+    let cx = x + w / 2.0;
+    let cy = y + h / 2.0;
+    for (frame, top) in frames.iter().zip(&tops) {
+        let wx0 = frame.origin.x;
+        let wx1 = frame.origin.x + frame.size.width;
+        let wy0 = global_top - top;
+        let wy1 = global_top - frame.origin.y;
+        if cx >= wx0 && cx < wx1 && cy >= wy0 && cy < wy1 {
+            return (*top, frame.size.height);
+        }
+    }
+    // No screen contains the rect: fall back to the main screen.
+    let main: *mut objc::runtime::Object = msg_send![cls_screen, mainScreen];
+    if main.is_null() {
+        return (h, h);
+    }
+    let frame: NSRect = msg_send![main, frame];
+    (frame.origin.y + frame.size.height, frame.size.height)
+}
 
 /// Create a real NSWindow with the given properties.
 /// Returns a raw pointer to the NSWindow, or null on failure.
@@ -707,24 +809,20 @@ pub fn create_nswindow(
     #[cfg(target_os = "macos")]
     // SAFETY: AppKit FFI for window management on macOS
     unsafe {
-        return run_on_main(move || {
+        run_on_main(move || {
             // If forced window creation is active, skip the bundle check so
             // that real NSWindows are created even for the casa1-runner process.
-            if !force_window_creation() {
+            if !force_window_creation() && !process_is_app_bundle() {
                 // AppKit window materialization from a plain CLI/test executable is not
                 // reliable on macOS and can raise Objective-C exceptions that Rust
                 // cannot catch. Keep the Win32 window logically alive but headless
                 // unless we are running from a real `.app` bundle.
-                if !process_is_app_bundle() {
-                    return std::ptr::null_mut();
-                }
+                return std::ptr::null_mut();
             }
 
             // Ensure NSApp is initialized
-            if !nsapp_initialized() {
-                if !init_nsapplication() {
-                    return std::ptr::null_mut();
-                }
+            if !nsapp_initialized() && !init_nsapplication() {
+                return std::ptr::null_mut();
             }
 
             let cls_window = match objc::runtime::Class::get("NSWindow") {
@@ -738,21 +836,15 @@ pub fn create_nswindow(
             };
 
             // macOS uses a flipped coordinate system where y=0 is bottom.
-            // Resolve the height from NSScreen directly; querying `screen` on the
-            // NSWindow class object can raise an Objective-C exception.
-            let screen_height = match objc::runtime::Class::get("NSScreen") {
-                Some(cls_screen) => {
-                    let screen: *mut objc::runtime::Object = msg_send![cls_screen, mainScreen];
-                    if screen.is_null() {
-                        height as f64
-                    } else {
-                        let screen_frame: NSRect = msg_send![screen, frame];
-                        screen_frame.size.height
-                    }
-                }
-                None => height as f64,
-            };
-            let flipped_y = screen_height - (y as f64) - (height as f64);
+            // Resolve the screen that contains the requested position so the
+            // flip uses the correct display height on multi-monitor setups.
+            let (screen_top, _screen_height) = target_screen_top(
+                x as f64,
+                y as f64,
+                width as f64,
+                height as f64,
+            );
+            let flipped_y = screen_top - (y as f64) - (height as f64);
 
             let frame = NSRect::new(
                 NSPoint::new(x as f64, flipped_y),
@@ -794,7 +886,7 @@ pub fn create_nswindow(
             let _: () = msg_send![win, setReleasedWhenClosed: 1 /* YES */];
 
             win as *mut std::ffi::c_void
-        });
+        })
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -809,7 +901,7 @@ pub fn show_nswindow(ns_window: *mut std::ffi::c_void, show: bool) {
     #[cfg(target_os = "macos")]
     // SAFETY: AppKit FFI for window management on macOS
     unsafe {
-        return run_on_main(move || {
+        run_on_main(move || {
             if ns_window.is_null() {
                 return;
             }
@@ -825,7 +917,7 @@ pub fn show_nswindow(ns_window: *mut std::ffi::c_void, show: bool) {
             } else {
                 let _: () = msg_send![win, orderOut: std::ptr::null_mut::<std::ffi::c_void>()];
             }
-        });
+        })
     }
     #[cfg(not(target_os = "macos"))]
     let _ = (ns_window, show);
@@ -838,7 +930,7 @@ pub fn set_nswindow_title(ns_window: *mut std::ffi::c_void, title: &str) {
     #[cfg(target_os = "macos")]
     // SAFETY: AppKit FFI for window management on macOS
     unsafe {
-        return run_on_main(move || {
+        run_on_main(move || {
             if ns_window.is_null() {
                 return;
             }
@@ -846,7 +938,7 @@ pub fn set_nswindow_title(ns_window: *mut std::ffi::c_void, title: &str) {
             let title_ns = ns_string_from_str(&title);
             let _: () = msg_send![win, setTitle: title_ns];
             let _: () = msg_send![title_ns, release];
-        });
+        })
     }
     #[cfg(not(target_os = "macos"))]
     let _ = (ns_window, title);
@@ -863,40 +955,25 @@ pub fn set_nswindow_frame(
     #[cfg(target_os = "macos")]
     // SAFETY: AppKit FFI for window management on macOS
     unsafe {
-        return run_on_main(move || {
+        run_on_main(move || {
             if ns_window.is_null() {
                 return;
             }
             let win: *mut objc::runtime::Object = ns_window as *mut _;
 
-            // Get screen height for coordinate flipping from the window's actual
-            // screen, falling back to the main screen if it is not yet attached.
-            let screen: *mut objc::runtime::Object = msg_send![win, screen];
-            let screen_height = if screen.is_null() {
-                match objc::runtime::Class::get("NSScreen") {
-                    Some(cls_screen) => {
-                        let main_screen: *mut objc::runtime::Object = msg_send![cls_screen, mainScreen];
-                        if main_screen.is_null() {
-                            height as f64
-                        } else {
-                            let screen_frame: NSRect = msg_send![main_screen, frame];
-                            screen_frame.size.height
-                        }
-                    }
-                    None => height as f64,
-                }
-            } else {
-                let screen_frame: NSRect = msg_send![screen, frame];
-                screen_frame.size.height
-            };
-            let flipped_y = screen_height - (y as f64) - (height as f64);
+            // macOS uses a flipped coordinate system where y=0 is bottom.
+            // Resolve the screen that contains the requested position so the
+            // flip uses the correct display height on multi-monitor setups.
+            let (screen_top, _screen_height) =
+                target_screen_top(x as f64, y as f64, width as f64, height as f64);
+            let flipped_y = screen_top - (y as f64) - (height as f64);
 
             let frame = NSRect::new(
                 NSPoint::new(x as f64, flipped_y),
                 NSSize::new(width as f64, height as f64),
             );
             let _: () = msg_send![win, setFrame: frame display: 1 /* YES */ animate: 0 /* NO */];
-        });
+        })
     }
     #[cfg(not(target_os = "macos"))]
     let _ = (ns_window, x, y, width, height);
@@ -907,13 +984,13 @@ pub fn update_nswindow(ns_window: *mut std::ffi::c_void) {
     #[cfg(target_os = "macos")]
     // SAFETY: AppKit FFI for window management on macOS
     unsafe {
-        return run_on_main(move || {
+        run_on_main(move || {
             if ns_window.is_null() {
                 return;
             }
             let win: *mut objc::runtime::Object = ns_window as *mut _;
             let _: () = msg_send![win, display];
-        });
+        })
     }
     #[cfg(not(target_os = "macos"))]
     let _ = ns_window;
@@ -924,12 +1001,14 @@ pub fn nswindow_content_view(ns_window: *mut std::ffi::c_void) -> *mut std::ffi:
     #[cfg(target_os = "macos")]
     // SAFETY: AppKit FFI for window management on macOS
     unsafe {
-        if ns_window.is_null() {
-            return std::ptr::null_mut();
-        }
-        let win: *mut objc::runtime::Object = ns_window as *mut _;
-        let view: *mut objc::runtime::Object = msg_send![win, contentView];
-        view as *mut std::ffi::c_void
+        run_on_main(move || {
+            if ns_window.is_null() {
+                return std::ptr::null_mut();
+            }
+            let win: *mut objc::runtime::Object = ns_window as *mut _;
+            let view: *mut objc::runtime::Object = msg_send![win, contentView];
+            view as *mut std::ffi::c_void
+        })
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -939,18 +1018,33 @@ pub fn nswindow_content_view(ns_window: *mut std::ffi::c_void) -> *mut std::ffi:
     }
 }
 
+/// Remove any HWND→NSWindow association pointing at the given window pointer.
+///
+/// `[NSWindow close]` releases the window when `releasedWhenClosed` is set, so
+/// any map entry left behind would dangle; this drops them.
+fn remove_hwnd_nswindow_by_ptr(ns_window: *mut std::ffi::c_void) {
+    if ns_window.is_null() {
+        return;
+    }
+    let mut map = hwnd_to_nswindow_map().lock().unwrap();
+    map.retain(|_hwnd, ptr| ptr.as_ptr() != ns_window);
+}
+
 /// Close and release an NSWindow.
 pub fn close_nswindow(ns_window: *mut std::ffi::c_void) {
     #[cfg(target_os = "macos")]
     // SAFETY: AppKit FFI for window management on macOS
     unsafe {
-        return run_on_main(move || {
+        run_on_main(move || {
             if ns_window.is_null() {
                 return;
             }
             let win: *mut objc::runtime::Object = ns_window as *mut _;
             let _: () = msg_send![win, close];
-        });
+            // `[NSWindow close]` releases the window (releasedWhenClosed), so
+            // drop any HWND→NSWindow map entry for it before it dangles.
+            remove_hwnd_nswindow_by_ptr(ns_window);
+        })
     }
     #[cfg(not(target_os = "macos"))]
     let _ = ns_window;
@@ -963,7 +1057,7 @@ pub fn add_sublayer_to_view(view_ptr: *mut std::ffi::c_void, layer_ptr: *mut std
     #[cfg(target_os = "macos")]
     // SAFETY: AppKit FFI for window management on macOS
     unsafe {
-        return run_on_main(move || {
+        run_on_main(move || {
             if view_ptr.is_null() || layer_ptr.is_null() {
                 return;
             }
@@ -976,7 +1070,7 @@ pub fn add_sublayer_to_view(view_ptr: *mut std::ffi::c_void, layer_ptr: *mut std
             let sublayers: *mut objc::runtime::Object =
                 msg_send![view, performSelector: objc::sel!(layer)];
             let _: () = msg_send![sublayers, addSublayer: layer];
-        });
+        })
     }
     #[cfg(not(target_os = "macos"))]
     let _ = (view_ptr, layer_ptr);
@@ -987,14 +1081,14 @@ pub fn set_layer_frame(layer_ptr: *mut std::ffi::c_void, x: f64, y: f64, width: 
     #[cfg(target_os = "macos")]
     // SAFETY: AppKit FFI for window management on macOS
     unsafe {
-        return run_on_main(move || {
+        run_on_main(move || {
             if layer_ptr.is_null() {
                 return;
             }
             let layer: *mut objc::runtime::Object = layer_ptr as *mut _;
             let frame = NSRect::new(NSPoint::new(x, y), NSSize::new(width, height));
             let _: () = msg_send![layer, setFrame: frame];
-        });
+        })
     }
     #[cfg(not(target_os = "macos"))]
     let _ = (layer_ptr, x, y, width, height);
@@ -1022,24 +1116,27 @@ pub fn attach_cametal_layer_to_window(
     #[cfg(target_os = "macos")]
     // SAFETY: AppKit FFI for window management on macOS
     unsafe {
-        return run_on_main(move || {
+        run_on_main(move || {
             if ns_window.is_null() || metal_layer_ptr.is_null() {
                 return std::ptr::null_mut();
             }
 
             let layer: *mut objc::runtime::Object = metal_layer_ptr as *mut _;
 
-            // Set drawable size (may have changed since swapchain creation).
-            let size = NSSize::new(width as f64, height as f64);
-            let _: () = msg_send![layer, setDrawableSize: size];
-
-            // Set contentsScale for Retina / High-DPI support.
+            // Set contentsScale for Retina / High-DPI support, then size the
+            // drawable in *pixels* (drawableSize is pixel-based, so it must be
+            // scaled by contentsScale or the layer renders at half resolution).
             let scale = get_backing_scale_factor(ns_window);
             let _: () = msg_send![layer, setContentsScale: scale];
+            let size = NSSize::new((width as f64) * scale, (height as f64) * scale);
+            let _: () = msg_send![layer, setDrawableSize: size];
 
             // Get the content view.
             let win: *mut objc::runtime::Object = ns_window as *mut _;
             let content_view: *mut objc::runtime::Object = msg_send![win, contentView];
+            if content_view.is_null() {
+                return std::ptr::null_mut();
+            }
 
             // Ensure view is layer-backed.
             let _: () = msg_send![content_view, setWantsLayer: 1 /* YES */];
@@ -1051,7 +1148,7 @@ pub fn attach_cametal_layer_to_window(
             let _: () = msg_send![content_view, setLayer: layer];
 
             layer as *mut std::ffi::c_void
-        });
+        })
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -1069,19 +1166,20 @@ pub fn poll_nsevent() -> *mut std::ffi::c_void {
     #[cfg(target_os = "macos")]
     // SAFETY: AppKit FFI for window management on macOS
     unsafe {
-        return run_on_main(move || {
+        run_on_main(move || {
             // NSEventType constants
             // NSEventMaskAny = NSULongMax
             let mask: u64 = !0u64;
-            // NSDefaultRunLoopMode
+            // NSDefaultRunLoopMode is an NSString* constant, not an ObjC class
+            // (Class::get("NSDefaultRunLoopMode") always failed). Fetch it via
+            // the NSRunLoop class method; the returned constant needs no release.
             let mode: *mut std::ffi::c_void = {
-                let cls = match objc::runtime::Class::get("NSDefaultRunLoopMode") {
+                let cls = match objc::runtime::Class::get("NSRunLoop") {
                     Some(c) => c,
                     None => return std::ptr::null_mut(),
                 };
-                // NSDefaultRunLoopMode is a string constant NSString*
-                let ptr: *mut std::ffi::c_void = msg_send![cls, performSelector: objc::sel!(new)];
-                ptr
+                let mode_obj: *mut objc::runtime::Object = msg_send![cls, defaultRunLoopMode];
+                mode_obj as *mut std::ffi::c_void
             };
 
             let cls_event = match objc::runtime::Class::get("NSEvent") {
@@ -1098,7 +1196,7 @@ pub fn poll_nsevent() -> *mut std::ffi::c_void {
             ];
 
             event as *mut std::ffi::c_void
-        });
+        })
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -1401,9 +1499,18 @@ pub fn is_headless() -> bool {
 /// In headless mode, returns `false` without calling AppKit.
 pub fn nspasteboard_clear() -> bool {
     #[cfg(target_os = "macos")]
+    {
+        // In headless processes (CLI/test binaries) there is no main loop
+        // pumping the dispatch queue, so block before dispatching rather than
+        // inside the queued closure (which would hang forever).
+        if is_headless() {
+            return false;
+        }
+    }
+    #[cfg(target_os = "macos")]
     // SAFETY: AppKit FFI for window management on macOS
     unsafe {
-        return run_on_main(move || {
+        run_on_main(move || {
             // Guard: skip AppKit call in headless mode.
             if is_headless() {
                 return false;
@@ -1418,7 +1525,7 @@ pub fn nspasteboard_clear() -> bool {
             }
             let count: i64 = msg_send![pasteboard, clearContents];
             count >= 0
-        });
+        })
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -1430,15 +1537,25 @@ pub fn nspasteboard_clear() -> bool {
 /// Maps Win32 clipboard format identifiers to NSPasteboard types:
 /// - CF_TEXT / CF_OEMTEXT → NSPasteboardTypeString (public.utf8-plain-text)
 /// - CF_UNICODETEXT → NSPasteboardTypeString
+///
 /// All other formats are stored as raw data with a custom type.
 /// Returns true on success.
 pub fn nspasteboard_set_data(format: u32, data: &[u8]) -> bool {
     // Convert &[u8] to Vec<u8> for Send bound across the dispatch boundary.
     let data = data.to_vec();
     #[cfg(target_os = "macos")]
+    {
+        // In headless processes (CLI/test binaries) there is no main loop
+        // pumping the dispatch queue, so block before dispatching rather than
+        // inside the queued closure (which would hang forever).
+        if is_headless() {
+            return false;
+        }
+    }
+    #[cfg(target_os = "macos")]
     // SAFETY: AppKit FFI for window management on macOS
     unsafe {
-        return run_on_main(move || {
+        run_on_main(move || {
             // Guard: skip AppKit call in headless mode.
             if is_headless() {
                 return false;
@@ -1473,10 +1590,6 @@ pub fn nspasteboard_set_data(format: u32, data: &[u8]) -> bool {
                 if ns_string.is_null() {
                     return false;
                 }
-                let _arr: *mut objc::runtime::Object = msg_send![
-                    cls_nsstring, // NSArray actually
-                    alloc
-                ];
                 // Use objc to create an NSArray with the string
                 let cls_nsarray = objc::runtime::Class::get("NSArray").unwrap();
                 let objects = [ns_string];
@@ -1509,7 +1622,7 @@ pub fn nspasteboard_set_data(format: u32, data: &[u8]) -> bool {
                 let _: () = msg_send![pb_type_ns, release];
                 result > 0
             }
-        });
+        })
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -1522,9 +1635,18 @@ pub fn nspasteboard_set_data(format: u32, data: &[u8]) -> bool {
 /// Returns None if the requested format is not available.
 pub fn nspasteboard_get_data(format: u32, max_len: usize) -> Option<Vec<u8>> {
     #[cfg(target_os = "macos")]
+    {
+        // In headless processes (CLI/test binaries) there is no main loop
+        // pumping the dispatch queue, so block before dispatching rather than
+        // inside the queued closure (which would hang forever).
+        if is_headless() {
+            return None;
+        }
+    }
+    #[cfg(target_os = "macos")]
     // SAFETY: AppKit FFI for window management on macOS
     unsafe {
-        return run_on_main(move || {
+        run_on_main(move || {
             // Guard: skip AppKit call in headless mode.
             if is_headless() {
                 return None;
@@ -1567,7 +1689,7 @@ pub fn nspasteboard_get_data(format: u32, max_len: usize) -> Option<Vec<u8>> {
             }
             std::ptr::copy_nonoverlapping(bytes as *const u8, buf.as_mut_ptr(), read_len);
             Some(buf)
-        });
+        })
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -1579,9 +1701,18 @@ pub fn nspasteboard_get_data(format: u32, max_len: usize) -> Option<Vec<u8>> {
 /// Check if the macOS general pasteboard contains data in the given format.
 pub fn nspasteboard_is_format_available(format: u32) -> bool {
     #[cfg(target_os = "macos")]
+    {
+        // In headless processes (CLI/test binaries) there is no main loop
+        // pumping the dispatch queue, so block before dispatching rather than
+        // inside the queued closure (which would hang forever).
+        if is_headless() {
+            return false;
+        }
+    }
+    #[cfg(target_os = "macos")]
     // SAFETY: AppKit FFI for window management on macOS
     unsafe {
-        return run_on_main(move || {
+        run_on_main(move || {
             // Guard: skip AppKit call in headless mode.
             if is_headless() {
                 return false;
@@ -1606,10 +1737,14 @@ pub fn nspasteboard_is_format_available(format: u32) -> bool {
             let type_obj: *mut objc::runtime::Object = pb_type_ns;
             let ns_array: *mut objc::runtime::Object =
                 msg_send![objc::runtime::Class::get("NSArray").unwrap(), arrayWithObject: type_obj];
-            let available: bool = msg_send![pasteboard, availableTypeFromArray: ns_array];
+            // `availableTypeFromArray:` returns an NSString* (or nil). Reading
+            // it as a bool would only look at the low byte of the pointer and
+            // yield false negatives for 256-byte-aligned objects.
+            let available: *mut objc::runtime::Object =
+                msg_send![pasteboard, availableTypeFromArray: ns_array];
             let _: () = msg_send![pb_type_ns, release];
-            available
-        });
+            !available.is_null()
+        })
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -1638,11 +1773,15 @@ unsafe fn NSString_from_str(s: &str) -> *mut objc::runtime::Object {
 /// Flash the NSWindow's dock icon to indicate attention is needed.
 /// This calls `[NSApplication requestUserAttention:]` on macOS.
 /// On non-macOS platforms this is a no-op.
-pub fn flash_nswindow(_hwnd: u32, _flash: bool) -> bool {
+pub fn flash_nswindow(_hwnd: u32, flash: bool) -> bool {
     #[cfg(target_os = "macos")]
     // SAFETY: AppKit FFI for window management on macOS
     unsafe {
-        return run_on_main(move || {
+        run_on_main(move || {
+            if !flash {
+                // Nothing requested — success (no-op).
+                return true;
+            }
             use objc::runtime::Object;
             let app_cls = match objc::runtime::Class::get("NSApplication") {
                 Some(c) => c,
@@ -1652,16 +1791,15 @@ pub fn flash_nswindow(_hwnd: u32, _flash: bool) -> bool {
             if shared_app.is_null() {
                 return false;
             }
-            if _flash {
-                // NSInformationalRequest = 0, NSCriticalRequest = 1
-                let _: u64 = msg_send![shared_app, requestUserAttention: 0u64];
-            }
+            // NSInformationalRequest = 0, NSCriticalRequest = 1.
+            // `requestUserAttention:` returns void — do not read a return value.
+            let _: () = msg_send![shared_app, requestUserAttention: 0u64];
             true
-        });
+        })
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (_hwnd, _flash);
+        let _ = (_hwnd, flash);
         false
     }
 }
@@ -1768,11 +1906,15 @@ mod tests {
 
     #[test]
     fn test_map_style_popup_window() {
-        // Popup window → titled + closable (not resizable, not miniaturizable)
+        // Popup without caption → borderless (Windows popups have a border but
+        // no title bar; a titled NSWindow would add one).
         let result = map_window_style_to_ns_style(WS_POPUPWINDOW, 0);
+        assert_eq!(result, NSWindowStyleMaskBorderless);
+        // Popup WITH caption → titled + closable, but still not resizable
+        // (no thickframe).
+        let result = map_window_style_to_ns_style(WS_POPUPWINDOW | WS_CAPTION, 0);
         assert!(result & NSWindowStyleMaskTitled != 0);
         assert!(result & NSWindowStyleMaskClosable != 0);
-        // Popup without thickframe → not resizable
         assert!(result & NSWindowStyleMaskResizable == 0);
     }
 
@@ -1905,8 +2047,8 @@ mod tests {
         }
         // Should not panic on null view/layer
         add_sublayer_to_view(std::ptr::null_mut(), std::ptr::null_mut());
-        add_sublayer_to_view(0x1 as *mut _, std::ptr::null_mut());
-        add_sublayer_to_view(std::ptr::null_mut(), 0x1 as *mut _);
+        add_sublayer_to_view(std::ptr::dangling_mut(), std::ptr::null_mut());
+        add_sublayer_to_view(std::ptr::null_mut(), std::ptr::dangling_mut());
     }
 
     // ── NSEvent query helpers (non-macOS stubs) ───────────────────────────
