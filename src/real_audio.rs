@@ -13,11 +13,17 @@ use crate::error::{AppError, AppResult};
 use crate::reason::ReasonCode;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 // ---------------------------------------------------------------------------
 // Real audio device
 // ---------------------------------------------------------------------------
+
+/// Maximum number of latency records kept in the latency log.
+///
+/// The log is only used for diagnostics; cap it so a long-running emulator
+/// session with many stream opens cannot grow memory without bound.
+const MAX_LATENCY_LOG_ENTRIES: usize = 256;
 
 // ---------------------------------------------------------------------------
 // WASAPI exclusive-mode state
@@ -44,6 +50,13 @@ pub struct WasapiExclusiveState {
 #[derive(Debug, Clone)]
 pub struct RealAudioDevice {
     pub id: DeviceId,
+    /// Stable identity key used to match a device across enumeration calls.
+    ///
+    /// cpal 0.15 exposes no device ID, so we fall back to a
+    /// `name|channels|sample_rate` tuple. This keeps distinct devices with
+    /// identical display names separate and survives benign renames only when
+    /// the config also changes (in which case the device is re-detected).
+    pub key: String,
     pub name: String,
     pub channels: u16,
     pub sample_rate: u32,
@@ -70,12 +83,15 @@ pub struct RealAudioBackend {
     latency_log: Vec<LatencyRecord>,
     /// Per-client state for WASAPI exclusive-mode streams.
     exclusive_clients: HashMap<AudioClientId, WasapiExclusiveState>,
+    /// Negotiated (format, buffer frames) per device for exclusive-mode streams,
+    /// so reuse of an exclusive stream returns the real negotiated buffer size.
+    exclusive_streams: HashMap<DeviceId, (WaveFormat, usize)>,
     /// Auto-incrementing counter for AudioClientId values.
     next_audio_client_id: AudioClientId,
     /// Active capture (microphone/line-in) input stream, if any.
     input_stream: Option<cpal::Stream>,
     /// Shared buffer for captured audio data from the input stream callback.
-    capture_buffer: Arc<Mutex<Vec<f32>>>,
+    capture_buffer: Arc<Mutex<VecDeque<f32>>>,
 }
 
 impl RealAudioBackend {
@@ -87,56 +103,60 @@ impl RealAudioBackend {
 
         let default_device = host.default_output_device();
 
-        match host.output_devices() {
-            Ok(device_list) => {
-                for device in device_list {
-                    let name = device.name().unwrap_or_else(|_| "Unknown".to_string());
-                    let config = match device.default_output_config() {
-                        Ok(config) => Some(config),
-                        Err(error) => {
-                            eprintln!(
-                                "[RealAudio] new: failed to get default output config for '{name}': {error}"
-                            );
-                            None
-                        }
-                    };
-                    let channels = config.as_ref().map(|c| c.channels()).unwrap_or(2);
-                    let sample_rate = config.as_ref().map(|c| c.sample_rate().0).unwrap_or(48_000);
-                    let is_default = default_device
-                        .as_ref()
-                        .map(|d| d.name().map(|n| n == name).unwrap_or(false))
-                        .unwrap_or(false);
+            match host.output_devices() {
+                Ok(device_list) => {
+                    for device in device_list {
+                        let key = cpal_device_key(&device);
+                        let name = device.name().unwrap_or_else(|_| "Unknown".to_string());
+                        let config = match device.default_output_config() {
+                            Ok(config) => Some(config),
+                            Err(error) => {
+                                eprintln!(
+                                    "[RealAudio] new: failed to get default output config for '{name}': {error}"
+                                );
+                                None
+                            }
+                        };
+                        let channels = config.as_ref().map(|c| c.channels()).unwrap_or(2);
+                        let sample_rate =
+                            config.as_ref().map(|c| c.sample_rate().0).unwrap_or(48_000);
+                        let is_default = default_device
+                            .as_ref()
+                            .map(|d| d.name().map(|n| n == name).unwrap_or(false))
+                            .unwrap_or(false);
 
-                    devices.insert(
-                        next_device_id,
-                        RealAudioDevice {
-                            id: next_device_id,
-                            name,
-                            channels,
-                            sample_rate,
-                            is_default,
-                        },
-                    );
-                    next_device_id += 1;
+                        devices.insert(
+                            next_device_id,
+                            RealAudioDevice {
+                                id: next_device_id,
+                                key,
+                                name,
+                                channels,
+                                sample_rate,
+                                is_default,
+                            },
+                        );
+                        next_device_id += 1;
+                    }
+                }
+                Err(error) => {
+                    eprintln!("[RealAudio] new: failed to enumerate output devices: {error}");
                 }
             }
-            Err(error) => {
-                eprintln!("[RealAudio] new: failed to enumerate output devices: {error}");
-            }
-        }
 
-        Ok(Self {
-            host,
-            devices,
-            next_device_id,
-            streams: HashMap::new(),
-            stream_queues: HashMap::new(),
-            latency_log: Vec::new(),
-            exclusive_clients: HashMap::new(),
-            next_audio_client_id: 1,
-            input_stream: None,
-            capture_buffer: Arc::new(Mutex::new(Vec::new())),
-        })
+            Ok(Self {
+                host,
+                devices,
+                next_device_id,
+                streams: HashMap::new(),
+                stream_queues: HashMap::new(),
+                latency_log: Vec::new(),
+                exclusive_clients: HashMap::new(),
+                exclusive_streams: HashMap::new(),
+                next_audio_client_id: 1,
+                input_stream: None,
+                capture_buffer: Arc::new(Mutex::new(VecDeque::new())),
+            })
     }
 
     /// Enumerate all real output devices.
@@ -185,9 +205,9 @@ impl RealAudioBackend {
     ///
     /// Returns the device ID of the stream. Audio samples pushed via
     /// `push_xaudio2_samples` will be played through the real device.
-    pub fn open_xaudio2_master(&mut self, format: &WaveFormat) -> AppResult<DeviceId> {
+    pub fn open_xaudio2_master(&mut self, _format: &WaveFormat) -> AppResult<DeviceId> {
         let device_id = self.default_device_id()?;
-        self.ensure_stream(device_id, format)?;
+        self.ensure_stream(device_id, false)?;
         Ok(device_id)
     }
 
@@ -200,6 +220,9 @@ impl RealAudioBackend {
         source_rate: u32,
     ) -> AppResult<()> {
         let device = self.device_info(device_id)?;
+        if !self.stream_queues.contains_key(&device_id) {
+            return Err(stream_not_open_error(device_id));
+        }
         let converted = convert_and_resample(
             samples,
             source_channels,
@@ -207,17 +230,8 @@ impl RealAudioBackend {
             device.channels,
             device.sample_rate,
         );
-        if let Some(queue) = self.stream_queues.get(&device_id) {
-            if let Ok(mut q) = queue.lock() {
-                q.extend(converted);
-                // Limit queue to ~4 seconds of audio to prevent unbounded growth
-                let max_samples = device.sample_rate as usize * device.channels as usize * 4;
-                while q.len() > max_samples {
-                    q.pop_front();
-                }
-            }
-        }
-        Ok(())
+        let max_samples = max_output_queue_samples(device.sample_rate, device.channels);
+        self.enqueue_samples(device_id, &converted, max_samples)
     }
 
     /// Render XAudio2 voice graph and push to real output.
@@ -230,14 +244,8 @@ impl RealAudioBackend {
         let output = audio_subsystem.render_xaudio2(mastering_voice, frames)?;
         let format = audio_subsystem.voice_format(mastering_voice)?;
 
-        // Find the device this mastering voice is associated with
-        let device_id = match audio_subsystem.voice_started(mastering_voice) {
-            Ok(true) => {
-                // Use default device
-                self.default_device_id().unwrap_or(1)
-            }
-            _ => self.default_device_id().unwrap_or(1),
-        };
+        // Play back through the default output device.
+        let device_id = self.default_device_id()?;
 
         if !output.samples.is_empty() {
             self.push_xaudio2_samples(
@@ -256,24 +264,29 @@ impl RealAudioBackend {
     // -----------------------------------------------------------------------
 
     /// Open a real output stream for a WASAPI audio client.
+    ///
+    /// `event_driven` selects a small fixed buffer (lower latency) when `true`;
+    /// the stream falls back to the device default buffer if the device
+    /// rejects the small size.
     pub fn open_wasapi_client(
         &mut self,
-        format: &WaveFormat,
+        _format: &WaveFormat,
         buffer_frames: usize,
         event_driven: bool,
     ) -> AppResult<DeviceId> {
         let device_id = self.default_device_id()?;
-        self.ensure_stream(device_id, format)?;
+        self.ensure_stream(device_id, event_driven)?;
 
-        // Record latency
-        let latency_ms = measure_latency_ms(format.sample_rate, buffer_frames);
-        self.latency_log.push(LatencyRecord {
+        // Record latency using the device's actual sample rate so the recorded
+        // value is meaningful when the client format differs from the device.
+        let device_rate = self.device_info(device_id)?.sample_rate;
+        let latency_ms = measure_latency_ms(device_rate, buffer_frames);
+        self.push_latency_record(LatencyRecord {
             subsystem: "wasapi".to_string(),
             device_id,
             measured_ms: latency_ms,
         });
 
-        let _event_driven = event_driven; // Real cpal callback is inherently event-driven
         Ok(device_id)
     }
 
@@ -286,6 +299,9 @@ impl RealAudioBackend {
         source_rate: u32,
     ) -> AppResult<()> {
         let device = self.device_info(device_id)?;
+        if !self.stream_queues.contains_key(&device_id) {
+            return Err(stream_not_open_error(device_id));
+        }
         let converted = convert_and_resample(
             samples,
             source_channels,
@@ -293,16 +309,8 @@ impl RealAudioBackend {
             device.channels,
             device.sample_rate,
         );
-        if let Some(queue) = self.stream_queues.get(&device_id) {
-            if let Ok(mut q) = queue.lock() {
-                q.extend(converted);
-                let max_samples = device.sample_rate as usize * device.channels as usize * 4;
-                while q.len() > max_samples {
-                    q.pop_front();
-                }
-            }
-        }
-        Ok(())
+        let max_samples = max_output_queue_samples(device.sample_rate, device.channels);
+        self.enqueue_samples(device_id, &converted, max_samples)
     }
 
     // -----------------------------------------------------------------------
@@ -357,7 +365,7 @@ impl RealAudioBackend {
         );
 
         // Record latency
-        self.latency_log.push(LatencyRecord {
+        self.push_latency_record(LatencyRecord {
             subsystem: "wasapi_exclusive".to_string(),
             device_id,
             measured_ms: period_ms,
@@ -374,7 +382,9 @@ impl RealAudioBackend {
     /// (i.e. `samples.len() == buffer_frames * channels`). If the frame count
     /// does not match, `RcAudioBufferSizeMismatch` is returned.
     ///
-    /// Internally delegates to `push_wasapi_frames()` after validation.
+    /// The exclusive stream is built at exactly the client's format (channels
+    /// and sample rate), so samples are queued verbatim without resampling or
+    /// channel remapping.
     ///
     /// # Errors
     ///
@@ -393,14 +403,10 @@ impl RealAudioBackend {
         })?;
 
         let channels = state.format.channels as usize;
-        let expected_samples = state.buffer_frames * channels;
+        let expected_samples = state.buffer_frames.saturating_mul(channels);
 
         if samples.len() != expected_samples {
-            let actual_frames = if channels > 0 {
-                samples.len() / channels
-            } else {
-                0
-            };
+            let actual_frames = samples.len().checked_div(channels).unwrap_or(0);
             return Err(AppError::new(
                 ReasonCode::RcAudioBufferSizeMismatch,
                 format!(
@@ -413,14 +419,14 @@ impl RealAudioBackend {
             ));
         }
 
-        // Delegate to shared-mode push which handles channel/rate conversion.
-        // In exclusive mode the format matches exactly, so no resampling occurs.
-        self.push_wasapi_frames(
-            state.device_id,
-            samples,
-            state.format.channels,
+        // The stream was negotiated at exactly `state.format`; queue the
+        // samples verbatim so they play back at the correct rate and channel
+        // layout (resampling to the device default config would corrupt both).
+        let max_samples = max_output_queue_samples(
             state.format.sample_rate,
-        )
+            state.format.channels,
+        );
+        self.enqueue_samples(state.device_id, samples, max_samples)
     }
 
     // -----------------------------------------------------------------------
@@ -428,9 +434,9 @@ impl RealAudioBackend {
     // -----------------------------------------------------------------------
 
     /// Open a real output stream for a DirectSound buffer.
-    pub fn open_direct_sound_buffer(&mut self, format: &WaveFormat) -> AppResult<DeviceId> {
+    pub fn open_direct_sound_buffer(&mut self, _format: &WaveFormat) -> AppResult<DeviceId> {
         let device_id = self.default_device_id()?;
-        self.ensure_stream(device_id, format)?;
+        self.ensure_stream(device_id, false)?;
         Ok(device_id)
     }
 
@@ -443,6 +449,9 @@ impl RealAudioBackend {
         source_rate: u32,
     ) -> AppResult<()> {
         let device = self.device_info(device_id)?;
+        if !self.stream_queues.contains_key(&device_id) {
+            return Err(stream_not_open_error(device_id));
+        }
         let converted = convert_and_resample(
             samples,
             source_channels,
@@ -450,16 +459,8 @@ impl RealAudioBackend {
             device.channels,
             device.sample_rate,
         );
-        if let Some(queue) = self.stream_queues.get(&device_id) {
-            if let Ok(mut q) = queue.lock() {
-                q.extend(converted);
-                let max_samples = device.sample_rate as usize * device.channels as usize * 4;
-                while q.len() > max_samples {
-                    q.pop_front();
-                }
-            }
-        }
-        Ok(())
+        let max_samples = max_output_queue_samples(device.sample_rate, device.channels);
+        self.enqueue_samples(device_id, &converted, max_samples)
     }
 
     // -----------------------------------------------------------------------
@@ -469,13 +470,18 @@ impl RealAudioBackend {
     /// Refresh the device list, detecting newly connected or removed devices.
     ///
     /// Returns `(added_devices, removed_device_ids)`.
+    ///
+    /// Devices are matched across enumeration calls by their stable identity
+    /// key (name + channels + sample rate); existing stream IDs are preserved
+    /// for devices that are still present.
     pub fn detect_device_changes(&mut self) -> AppResult<(Vec<RealAudioDevice>, Vec<DeviceId>)> {
-        let mut current_names: BTreeMap<String, RealAudioDevice> = BTreeMap::new();
+        let mut current: BTreeMap<String, RealAudioDevice> = BTreeMap::new();
         let default_device = self.host.default_output_device();
 
         match self.host.output_devices() {
             Ok(device_list) => {
                 for device in device_list {
+                    let key = cpal_device_key(&device);
                     let name = device.name().unwrap_or_else(|_| "Unknown".to_string());
                     let config = match device.default_output_config() {
                         Ok(config) => Some(config),
@@ -487,24 +493,26 @@ impl RealAudioBackend {
                         }
                     };
                     let channels = config.as_ref().map(|c| c.channels()).unwrap_or(2);
-                    let sample_rate = config.as_ref().map(|c| c.sample_rate().0).unwrap_or(48_000);
+                    let sample_rate =
+                        config.as_ref().map(|c| c.sample_rate().0).unwrap_or(48_000);
                     let is_default = default_device
                         .as_ref()
                         .map(|d| d.name().map(|n| n == name).unwrap_or(false))
                         .unwrap_or(false);
 
-                    // Use existing device ID if we already know this device, otherwise
-                    // assign a temporary placeholder; real new-device IDs are assigned below.
+                    // Use the existing device ID if we already know this device,
+                    // otherwise a placeholder; new IDs are assigned below.
                     let existing_id = self
                         .devices
                         .values()
-                        .find(|d| d.name == name)
+                        .find(|d| d.key == key)
                         .map(|d| d.id)
                         .unwrap_or(0);
-                    current_names.insert(
-                        name.clone(),
+                    current.insert(
+                        key.clone(),
                         RealAudioDevice {
                             id: existing_id,
+                            key,
                             name,
                             channels,
                             sample_rate,
@@ -520,17 +528,24 @@ impl RealAudioBackend {
             }
         }
 
-        let existing_names: Vec<String> = self.devices.values().map(|d| d.name.clone()).collect();
-        let current_name_set: Vec<String> = current_names.keys().cloned().collect();
+        let current_keys: Vec<String> = current.keys().cloned().collect();
         let mut added = Vec::new();
 
-        // Detect added devices
-        for (name, mut device) in current_names {
-            if !existing_names.contains(&name) {
-                device.id = self.next_device_id;
-                self.next_device_id += 1;
-                added.push(device.clone());
-                self.devices.insert(device.id, device);
+        // Merge: refresh still-present devices in place, assign IDs to new ones.
+        for (key, mut device) in current {
+            match self.devices.values_mut().find(|d| d.key == key) {
+                Some(existing) => {
+                    existing.name = device.name;
+                    existing.channels = device.channels;
+                    existing.sample_rate = device.sample_rate;
+                    existing.is_default = device.is_default;
+                }
+                None => {
+                    device.id = self.next_device_id;
+                    self.next_device_id += 1;
+                    added.push(device.clone());
+                    self.devices.insert(device.id, device);
+                }
             }
         }
 
@@ -538,7 +553,7 @@ impl RealAudioBackend {
         let to_remove: Vec<DeviceId> = self
             .devices
             .iter()
-            .filter(|(_, device)| !current_name_set.contains(&device.name))
+            .filter(|(_, device)| !current_keys.contains(&device.key))
             .map(|(id, _)| *id)
             .collect();
 
@@ -546,6 +561,7 @@ impl RealAudioBackend {
             self.devices.remove(id);
             self.streams.remove(id);
             self.stream_queues.remove(id);
+            self.exclusive_streams.remove(id);
         }
 
         Ok((added, to_remove))
@@ -569,11 +585,7 @@ impl RealAudioBackend {
             .map(|q| q.lock().map(|q| q.len()).unwrap_or(0))
             .unwrap_or(0);
         let channels = device.channels as usize;
-        let queued_frames = if channels > 0 {
-            queued_samples / channels
-        } else {
-            0
-        };
+        let queued_frames = queued_samples.checked_div(channels).unwrap_or(0);
         let latency_ms = if device.sample_rate > 0 {
             ((queued_frames as f32 / device.sample_rate as f32) * 1000.0).round() as u32
         } else {
@@ -590,9 +602,10 @@ impl RealAudioBackend {
     pub fn close_stream(&mut self, device_id: DeviceId) {
         self.streams.remove(&device_id);
         self.stream_queues.remove(&device_id);
-        // Clean up any exclusive-mode clients using this device
+        // Clean up any exclusive-mode clients and streams using this device
         self.exclusive_clients
             .retain(|_, state| state.device_id != device_id);
+        self.exclusive_streams.remove(&device_id);
     }
 
     /// Close all output streams and exclusive-mode clients.
@@ -600,6 +613,7 @@ impl RealAudioBackend {
         self.streams.clear();
         self.stream_queues.clear();
         self.exclusive_clients.clear();
+        self.exclusive_streams.clear();
     }
 
     // -----------------------------------------------------------------------
@@ -607,11 +621,15 @@ impl RealAudioBackend {
     // -----------------------------------------------------------------------
 
     /// Ensure a cpal output stream exists for the given device.
-    fn ensure_stream(&mut self, device_id: DeviceId, format: &WaveFormat) -> AppResult<()> {
+    ///
+    /// `prefer_small_buffer` requests a small fixed buffer (lower latency);
+    /// if the device rejects it the stream falls back to the default buffer.
+    fn ensure_stream(&mut self, device_id: DeviceId, prefer_small_buffer: bool) -> AppResult<()> {
         if self.streams.contains_key(&device_id) {
             return Ok(());
         }
 
+        let device = self.device_info(device_id)?;
         let cpal_device = self.find_cpal_device(device_id)?;
         let supported_config = cpal_device.default_output_config().map_err(|e| {
             AppError::new(
@@ -619,60 +637,60 @@ impl RealAudioBackend {
                 format!("failed to get audio output config: {e}"),
             )
         })?;
+        let sample_format = supported_config.sample_format();
 
-        let queue: Arc<Mutex<VecDeque<f32>>> = Arc::new(Mutex::new(VecDeque::new()));
+        // Pre-allocate the queue to its maximum size so the producer never
+        // reallocates under the lock and the real-time callback stays
+        // allocation-free.
+        let max_samples = max_output_queue_samples(device.sample_rate, device.channels);
+        let queue: Arc<Mutex<VecDeque<f32>>> =
+            Arc::new(Mutex::new(VecDeque::with_capacity(max_samples)));
         let callback_queue = Arc::clone(&queue);
-        let error_callback = move |error: cpal::StreamError| {
-            eprintln!("[RealAudio] output stream error for device {device_id}: {error}");
-        };
 
-        let stream_config = supported_config.config();
-        let stream = match supported_config.sample_format() {
-            cpal::SampleFormat::F32 => cpal_device
-                .build_output_stream(
-                    &stream_config,
-                    move |data: &mut [f32], _| fill_output_f32(data, &callback_queue),
-                    error_callback,
-                    None,
-                )
-                .map_err(|e| {
-                    AppError::new(
-                        ReasonCode::RcAudioUnsupported,
-                        format!("failed to build f32 audio stream: {e}"),
+        let base_config = supported_config.config();
+        let mut buffer_size = base_config.buffer_size;
+        let stream = if prefer_small_buffer {
+            let mut small_config = base_config.clone();
+            small_config.buffer_size = cpal::BufferSize::Fixed(256);
+            match build_output_stream(
+                &cpal_device,
+                &small_config,
+                sample_format,
+                Arc::clone(&callback_queue),
+            ) {
+                Ok(stream) => {
+                    buffer_size = cpal::BufferSize::Fixed(256);
+                    stream
+                }
+                Err(_) => {
+                    // Fall back to the device default config.
+                    build_output_stream(
+                        &cpal_device,
+                        &base_config,
+                        sample_format,
+                        Arc::clone(&callback_queue),
                     )
-                })?,
-            cpal::SampleFormat::I16 => cpal_device
-                .build_output_stream(
-                    &stream_config,
-                    move |data: &mut [i16], _| fill_output_i16(data, &callback_queue),
-                    error_callback,
-                    None,
-                )
-                .map_err(|e| {
-                    AppError::new(
-                        ReasonCode::RcAudioUnsupported,
-                        format!("failed to build i16 audio stream: {e}"),
-                    )
-                })?,
-            cpal::SampleFormat::U16 => cpal_device
-                .build_output_stream(
-                    &stream_config,
-                    move |data: &mut [u16], _| fill_output_u16(data, &callback_queue),
-                    error_callback,
-                    None,
-                )
-                .map_err(|e| {
-                    AppError::new(
-                        ReasonCode::RcAudioUnsupported,
-                        format!("failed to build u16 audio stream: {e}"),
-                    )
-                })?,
-            other => {
-                return Err(AppError::new(
-                    ReasonCode::RcAudioUnsupported,
-                    format!("unsupported host audio sample format {other:?}"),
-                ));
+                    .map_err(|e| {
+                        AppError::new(
+                            ReasonCode::RcAudioUnsupported,
+                            format!("failed to build audio stream: {e}"),
+                        )
+                    })?
+                }
             }
+        } else {
+            build_output_stream(
+                &cpal_device,
+                &base_config,
+                sample_format,
+                Arc::clone(&callback_queue),
+            )
+            .map_err(|e| {
+                AppError::new(
+                    ReasonCode::RcAudioUnsupported,
+                    format!("failed to build audio stream: {e}"),
+                )
+            })?
         };
 
         stream.play().map_err(|e| {
@@ -682,16 +700,17 @@ impl RealAudioBackend {
             )
         })?;
 
-        // Record initial latency
-        let buffer_frames = stream_config.buffer_size;
+        // Record initial latency using the device's sample rate (the stream
+        // runs at the device rate in shared mode, not necessarily the client
+        // format's rate).
         let latency_ms = measure_latency_ms(
-            format.sample_rate,
-            match buffer_frames {
+            device.sample_rate,
+            match buffer_size {
                 cpal::BufferSize::Default => 1024,
                 cpal::BufferSize::Fixed(v) => v as usize,
             },
         );
-        self.latency_log.push(LatencyRecord {
+        self.push_latency_record(LatencyRecord {
             subsystem: "real_audio".to_string(),
             device_id,
             measured_ms: latency_ms,
@@ -715,17 +734,24 @@ impl RealAudioBackend {
         device_id: DeviceId,
         format: &WaveFormat,
     ) -> AppResult<usize> {
-        if self.streams.contains_key(&device_id) {
-            // Stream already exists - return the stored buffer size for this
-            // device if we have exclusive state for it.
-            for state in self.exclusive_clients.values() {
-                if state.device_id == device_id {
-                    return Ok(state.buffer_frames);
-                }
+        if let Some((stored_format, buffer_frames)) = self.exclusive_streams.get(&device_id) {
+            if stored_format == format {
+                // Same format as the existing exclusive stream: reuse it and
+                // return the actually negotiated buffer size.
+                return Ok(*buffer_frames);
             }
-            // Fallback: just return a reasonable default. The stream is already
-            // open so we can reuse it.
-            return Ok(256);
+            return Err(AppError::new(
+                ReasonCode::RcAudioUnsupported,
+                format!(
+                    "exclusive-mode stream on device {device_id} is already open with format {} ch, {} Hz, {:?}; requested {} ch, {} Hz, {:?}",
+                    stored_format.channels,
+                    stored_format.sample_rate,
+                    stored_format.sample_format,
+                    format.channels,
+                    format.sample_rate,
+                    format.sample_format,
+                ),
+            ));
         }
 
         let cpal_device = self.find_cpal_device(device_id)?;
@@ -766,11 +792,13 @@ impl RealAudioBackend {
         // cpal 0.15's with_sample_rate is infallible — it picks the closest
         // supported rate if the exact one is unavailable.
         let supported_config = matched.with_sample_rate(cpal::SampleRate(format.sample_rate));
+        let sample_format = supported_config.sample_format();
 
-        let queue: Arc<Mutex<VecDeque<f32>>> = Arc::new(Mutex::new(VecDeque::new()));
-        let error_callback = |error: cpal::StreamError| {
-            eprintln!("[RealAudio] stream build error: {error}");
-        };
+        // Pre-allocate the queue to its maximum size (the exclusive stream
+        // runs at the client format, so size from that).
+        let max_samples = max_output_queue_samples(format.sample_rate, format.channels);
+        let queue: Arc<Mutex<VecDeque<f32>>> =
+            Arc::new(Mutex::new(VecDeque::with_capacity(max_samples)));
 
         // Try progressively larger buffer sizes (target ≤10ms latency).
         // 64 frames @ 48kHz ≈ 1.3ms, 512 frames @ 48kHz ≈ 10.7ms.
@@ -782,43 +810,12 @@ impl RealAudioBackend {
             let mut stream_config = supported_config.config();
             stream_config.buffer_size = cpal::BufferSize::Fixed(frames);
 
-            let cb_queue = Arc::clone(&queue);
-            let err_cb = error_callback;
-
-            let result = match supported_config.sample_format() {
-                cpal::SampleFormat::F32 => cpal_device.build_output_stream(
-                    &stream_config,
-                    move |data: &mut [f32], _| fill_output_f32(data, &cb_queue),
-                    err_cb,
-                    None,
-                ),
-                cpal::SampleFormat::I16 => {
-                    let cb_queue = Arc::clone(&queue);
-                    cpal_device.build_output_stream(
-                        &stream_config,
-                        move |data: &mut [i16], _| fill_output_i16(data, &cb_queue),
-                        err_cb,
-                        None,
-                    )
-                }
-                cpal::SampleFormat::U16 => {
-                    let cb_queue = Arc::clone(&queue);
-                    cpal_device.build_output_stream(
-                        &stream_config,
-                        move |data: &mut [u16], _| fill_output_u16(data, &cb_queue),
-                        err_cb,
-                        None,
-                    )
-                }
-                other => {
-                    return Err(AppError::new(
-                        ReasonCode::RcAudioUnsupported,
-                        format!("unsupported host audio sample format {other:?}"),
-                    ));
-                }
-            };
-
-            match result {
+            match build_output_stream(
+                &cpal_device,
+                &stream_config,
+                sample_format,
+                Arc::clone(&queue),
+            ) {
                 Ok(s) => {
                     stream = Some(s);
                     chosen_frames = frames as usize;
@@ -847,6 +844,8 @@ impl RealAudioBackend {
 
         self.streams.insert(device_id, stream);
         self.stream_queues.insert(device_id, queue);
+        self.exclusive_streams
+            .insert(device_id, (format.clone(), chosen_frames));
 
         Ok(chosen_frames)
     }
@@ -862,18 +861,21 @@ impl RealAudioBackend {
         })?;
 
         for device in devices {
-            if device.name().map(|n| n == our_device.name).unwrap_or(false) {
+            // Match by the stable identity key first, then by display name as
+            // a fallback for devices enumerated before keys were recorded.
+            if cpal_device_key(&device) == our_device.key
+                || device.name().map(|n| n == our_device.name).unwrap_or(false)
+            {
                 return Ok(device);
             }
         }
 
-        // Fallback to default
-        self.host.default_output_device().ok_or_else(|| {
-            AppError::new(
-                ReasonCode::RcAudioUnsupported,
-                "no audio output device available",
-            )
-        })
+        // The device is gone: fail explicitly instead of silently routing
+        // audio to whatever the default device happens to be.
+        Err(AppError::new(
+            ReasonCode::RcAudioUnsupported,
+            format!("audio device '{}' is no longer available", our_device.name),
+        ))
     }
 
     // -----------------------------------------------------------------------
@@ -914,20 +916,23 @@ impl RealAudioBackend {
             buffer_size: cpal::BufferSize::Default,
         };
 
+        // Pre-reserve the capture buffer to its maximum size so the real-time
+        // callback never allocates while appending.
+        let max_samples = max_capture_samples(sample_rate, channels);
+        if let Ok(mut buf) = self.capture_buffer.lock() {
+            buf.reserve(max_samples);
+        }
+
         let stream = match supported_config.sample_format() {
             cpal::SampleFormat::F32 => input_device
                 .build_input_stream(
                     &stream_config,
                     move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                        if let Ok(mut buf) = capture_buf.lock() {
-                            buf.extend_from_slice(data);
-                            // Limit to ~4 seconds of audio to prevent unbounded growth
-                            let max_samples = sample_rate as usize * channels as usize * 4;
-                            while buf.len() > max_samples {
-                                let excess = buf.len().saturating_sub(max_samples);
-                                let drain_end = excess.min(buf.len());
-                                buf.drain(0..drain_end);
-                            }
+                        // try_lock: never block the real-time audio thread.
+                        // On contention the capture data is dropped rather than
+                        // risking an audio-thread stall.
+                        if let Ok(mut buf) = capture_buf.try_lock() {
+                            append_capped(&mut buf, data, max_samples, |&s| s);
                         }
                     },
                     error_callback,
@@ -943,22 +948,15 @@ impl RealAudioBackend {
                 .build_input_stream(
                     &stream_config,
                     move |data: &[i16], _: &cpal::InputCallbackInfo| {
-                        if let Ok(mut buf) = capture_buf.lock() {
-                            // Convert i16 to f32
-                            for &sample in data {
-                                let f = if sample == i16::MIN {
+                        if let Ok(mut buf) = capture_buf.try_lock() {
+                            // Convert i16 to f32 without per-sample push
+                            append_capped(&mut buf, data, max_samples, |&s| {
+                                if s == i16::MIN {
                                     -1.0
                                 } else {
-                                    sample as f32 / i16::MAX as f32
-                                };
-                                buf.push(f);
-                            }
-                            let max_samples = sample_rate as usize * channels as usize * 4;
-                            while buf.len() > max_samples {
-                                let excess = buf.len().saturating_sub(max_samples);
-                                let drain_end = excess.min(buf.len());
-                                buf.drain(0..drain_end);
-                            }
+                                    s as f32 / i16::MAX as f32
+                                }
+                            });
                         }
                     },
                     error_callback,
@@ -974,18 +972,11 @@ impl RealAudioBackend {
                 .build_input_stream(
                     &stream_config,
                     move |data: &[u16], _: &cpal::InputCallbackInfo| {
-                        if let Ok(mut buf) = capture_buf.lock() {
-                            // Convert u16 to f32
-                            for &sample in data {
-                                let f = (sample as f32 / u16::MAX as f32) * 2.0 - 1.0;
-                                buf.push(f);
-                            }
-                            let max_samples = sample_rate as usize * channels as usize * 4;
-                            while buf.len() > max_samples {
-                                let excess = buf.len().saturating_sub(max_samples);
-                                let drain_end = excess.min(buf.len());
-                                buf.drain(0..drain_end);
-                            }
+                        if let Ok(mut buf) = capture_buf.try_lock() {
+                            // Convert u16 to f32 without per-sample push
+                            append_capped(&mut buf, data, max_samples, |&s| {
+                                (s as f32 / u16::MAX as f32) * 2.0 - 1.0
+                            });
                         }
                     },
                     error_callback,
@@ -1032,10 +1023,140 @@ impl RealAudioBackend {
     /// Returns the captured f32 samples and clears the internal buffer.
     pub fn read_capture_data(&mut self) -> Vec<f32> {
         if let Ok(mut buf) = self.capture_buffer.lock() {
-            std::mem::take(&mut *buf)
+            buf.drain(..).collect()
         } else {
             Vec::new()
         }
+    }
+
+    /// Append samples to a device's output queue, keeping at most `max_samples`
+    /// samples (dropping the oldest excess).
+    ///
+    /// Runs on the app thread, never on the real-time audio callback thread.
+    /// The queue is pre-reserved to its maximum capacity at stream creation, so
+    /// appending never reallocates while the lock is held.
+    fn enqueue_samples(
+        &self,
+        device_id: DeviceId,
+        samples: &[f32],
+        max_samples: usize,
+    ) -> AppResult<()> {
+        let queue = self
+            .stream_queues
+            .get(&device_id)
+            .ok_or_else(|| stream_not_open_error(device_id))?;
+        let mut q = queue.lock().unwrap_or_else(|e| e.into_inner());
+        append_capped(&mut q, samples, max_samples, |&s| s);
+        Ok(())
+    }
+
+    /// Append a latency record, evicting the oldest entries once the log
+    /// exceeds [`MAX_LATENCY_LOG_ENTRIES`].
+    fn push_latency_record(&mut self, record: LatencyRecord) {
+        self.latency_log.push(record);
+        if self.latency_log.len() > MAX_LATENCY_LOG_ENTRIES {
+            let excess = self.latency_log.len() - MAX_LATENCY_LOG_ENTRIES;
+            self.latency_log.drain(0..excess);
+        }
+    }
+}
+
+/// Maximum number of queued output samples (~4 seconds of audio) for a stream
+/// running at `rate` Hz with `channels` channels.
+fn max_output_queue_samples(rate: u32, channels: u16) -> usize {
+    (rate.max(1) as usize) * (channels.max(1) as usize) * 4
+}
+
+/// Maximum number of captured samples (~4 seconds of audio).
+fn max_capture_samples(rate: u32, channels: u16) -> usize {
+    max_output_queue_samples(rate, channels)
+}
+
+/// Append converted samples to `buf`, keeping only the newest `max_samples`
+/// samples.
+///
+/// Never allocates when `buf` was pre-reserved for `max_samples` capacity:
+/// old samples are dropped from the front (O(1) per pop) before appending, and
+/// the incoming batch is truncated to the remaining room, so the buffer size
+/// never exceeds its capacity. If a single batch alone exceeds the cap, its
+/// oldest samples are dropped.
+fn append_capped<T>(
+    buf: &mut VecDeque<f32>,
+    samples: &[T],
+    max_samples: usize,
+    convert: impl Fn(&T) -> f32,
+) {
+    if max_samples == 0 {
+        buf.clear();
+        return;
+    }
+    let drop = buf
+        .len()
+        .saturating_add(samples.len())
+        .saturating_sub(max_samples);
+    for _ in 0..drop.min(buf.len()) {
+        buf.pop_front();
+    }
+    let room = max_samples.saturating_sub(buf.len());
+    let take = samples.len().min(room);
+    if take > 0 {
+        buf.extend(samples[samples.len() - take..].iter().map(convert));
+    }
+}
+
+/// Error returned when pushing samples to a stream that has been closed.
+fn stream_not_open_error(device_id: DeviceId) -> AppError {
+    AppError::new(
+        ReasonCode::RcAudioUnsupported,
+        format!("audio stream {device_id} is not open"),
+    )
+}
+
+/// Stable identity key for a cpal device: `name|channels|sample_rate`.
+///
+/// cpal 0.15 exposes no device ID, so this tuple is the most stable identity
+/// available: it keeps devices with identical display names but different
+/// configs distinct, and preserves IDs across enumeration when the config
+/// stays the same.
+fn cpal_device_key(device: &cpal::Device) -> String {
+    let name = device.name().unwrap_or_else(|_| "Unknown".to_string());
+    let config = device.default_output_config().ok();
+    let channels = config.as_ref().map(|c| c.channels()).unwrap_or(2);
+    let sample_rate = config.as_ref().map(|c| c.sample_rate().0).unwrap_or(48_000);
+    format!("{name}|{channels}|{sample_rate}")
+}
+
+/// Build an output stream for the given config and sample format, sharing the
+/// callback implementations between shared- and exclusive-mode streams.
+fn build_output_stream(
+    device: &cpal::Device,
+    config: &cpal::StreamConfig,
+    sample_format: cpal::SampleFormat,
+    queue: Arc<Mutex<VecDeque<f32>>>,
+) -> Result<cpal::Stream, cpal::BuildStreamError> {
+    let error_callback = |error: cpal::StreamError| {
+        eprintln!("[RealAudio] output stream error: {error}");
+    };
+    match sample_format {
+        cpal::SampleFormat::F32 => device.build_output_stream(
+            config,
+            move |data: &mut [f32], _| fill_output_f32(data, &queue),
+            error_callback,
+            None,
+        ),
+        cpal::SampleFormat::I16 => device.build_output_stream(
+            config,
+            move |data: &mut [i16], _| fill_output_i16(data, &queue),
+            error_callback,
+            None,
+        ),
+        cpal::SampleFormat::U16 => device.build_output_stream(
+            config,
+            move |data: &mut [u16], _| fill_output_u16(data, &queue),
+            error_callback,
+            None,
+        ),
+        _ => Err(cpal::BuildStreamError::InvalidArgument),
     }
 }
 
@@ -1067,10 +1188,7 @@ pub fn float_to_pcm16(samples: &[f32]) -> Vec<i16> {
 
 /// Convert f32 samples to u8 (8-bit unsigned, centered at 128).
 pub fn float_to_u8(samples: &[f32]) -> Vec<u8> {
-    samples
-        .iter()
-        .map(|&s| (((s.clamp(-1.0, 1.0) + 1.0) * 0.5) * 255.0) as u8)
-        .collect()
+    float_to_u8_pcm(samples)
 }
 
 /// Convert AudioSamples from the audio subsystem to f32.
@@ -1112,7 +1230,7 @@ pub fn pcm24_to_float(samples: &[u8]) -> Vec<f32> {
             let b1 = chunk[1] as i32;
             let b2 = chunk[2] as i32;
             // Little-endian 24-bit: assemble as i32 and sign-extend
-            let value = (b0 as i32) | ((b1 as i32) << 8) | ((b2 as i32) << 16);
+            let value = b0 | (b1 << 8) | (b2 << 16);
             // Sign-extend from 24-bit to 32-bit via arithmetic shift
             let value = (value << 8) >> 8;
             value as f32 / 8388608.0
@@ -1132,7 +1250,7 @@ pub fn pcm24_in_32_to_float(samples: &[u8]) -> Vec<f32> {
             let b1 = chunk[1] as i32;
             let b2 = chunk[2] as i32;
             // chunk[3] is padding (zero)
-            let value = (b0 as i32) | ((b1 as i32) << 8) | ((b2 as i32) << 16);
+            let value = b0 | (b1 << 8) | (b2 << 16);
             // Sign-extend from 24-bit via arithmetic shift
             let value = (value << 8) >> 8;
             value as f32 / 8388608.0
@@ -1471,11 +1589,11 @@ pub fn decode_ms_adpcm(
         }
 
         // Emit the two initial samples per channel
-        for ch in 0..num_channels {
-            output.push(prev_samples[ch][0] as i16);
+        for channel in prev_samples.iter().take(num_channels) {
+            output.push(channel[0] as i16);
         }
-        for ch in 0..num_channels {
-            output.push(prev_samples[ch][1] as i16);
+        for channel in prev_samples.iter().take(num_channels) {
+            output.push(channel[1] as i16);
         }
 
         // The compressed nibble data starts after headers
@@ -1488,11 +1606,13 @@ pub fn decode_ms_adpcm(
         let bytes_available = block.len().saturating_sub(nibble_start);
         let nibble_count = bytes_available * 2; // 2 nibbles per byte
 
-        for i in 0..(remaining.min(nibble_count)) {
-            let ch = if num_channels == 2 && remaining > 0 {
-                // Stereo interleave: nibbles are per-channel interleaved
-                // Each channel gets every other nibble starting at its offset
-                // ch = i % num_channels
+        // Each iteration decodes exactly one sample for channel `i % num_channels`.
+        // Every channel needs `remaining` samples, so the loop must run up to
+        // `remaining * num_channels` iterations (or fewer if the block holds
+        // fewer nibbles than that).
+        let total_iterations = (remaining * num_channels).min(nibble_count);
+        for i in 0..total_iterations {
+            let ch = if num_channels == 2 {
                 i % num_channels
             } else {
                 0
@@ -1567,34 +1687,23 @@ pub fn decode_ms_adpcm(
             output.push(new_sample as i16);
         }
 
-        // If we didn't get enough samples per block, pad with silence
-        let decoded_per_ch = remaining.min(nibble_count) + 2;
+        // If we didn't get enough samples per channel, pad with predicted
+        // continuation so every block yields exactly `samples_per_block`
+        // samples per channel.
+        let decoded_per_ch = 2 + remaining.min(nibble_count / num_channels);
         if decoded_per_ch < samples_per_block {
             let pad = samples_per_block - decoded_per_ch;
             // For stereo, pad interleaved
             for _ in 0..pad {
                 for ch in 0..num_channels {
-                    if ch == 0 || num_channels == 1 {
-                        let ch_idx = 0;
-                        let coeff = MS_ADPCM_COEFFICIENTS[predictors[ch_idx]];
-                        let predicted = (coeff.0 as i32 * prev_samples[ch_idx][0]
-                            + coeff.1 as i32 * prev_samples[ch_idx][1])
-                            / 256;
-                        let sample = predicted.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
-                        prev_samples[ch_idx][0] = prev_samples[ch_idx][1];
-                        prev_samples[ch_idx][1] = sample as i32;
-                        output.push(sample);
-                    } else {
-                        // For stereo ch2 when padding
-                        let coeff = MS_ADPCM_COEFFICIENTS[predictors[1]];
-                        let predicted = (coeff.0 as i32 * prev_samples[1][0]
-                            + coeff.1 as i32 * prev_samples[1][1])
-                            / 256;
-                        let sample = predicted.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
-                        prev_samples[1][0] = prev_samples[1][1];
-                        prev_samples[1][1] = sample as i32;
-                        output.push(sample);
-                    }
+                    let coeff = MS_ADPCM_COEFFICIENTS[predictors[ch]];
+                    let predicted = (coeff.0 as i32 * prev_samples[ch][0]
+                        + coeff.1 as i32 * prev_samples[ch][1])
+                        / 256;
+                    let sample = predicted.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+                    prev_samples[ch][0] = prev_samples[ch][1];
+                    prev_samples[ch][1] = sample as i32;
+                    output.push(sample);
                 }
             }
         }
@@ -1695,11 +1804,7 @@ pub fn decode_ima_adpcm(
     }
 
     // Total number of blocks
-    let num_blocks = if block_size > 0 {
-        adpcm_data.len() / block_size
-    } else {
-        0
-    };
+    let num_blocks = adpcm_data.len().checked_div(block_size).unwrap_or(0);
 
     // Estimate output capacity: each byte produces 2 samples per channel (4-bit nibbles)
     let samples_per_block = (per_channel_data_size - header_size) * 2 + 1; // +1 for initial sample
@@ -1713,13 +1818,8 @@ pub fn decode_ima_adpcm(
         // Decode each channel independently
         let mut channel_samples: [Vec<i16>; 2] = [Vec::new(), Vec::new()];
 
-        for ch in 0..num_channels {
-            let ch_offset = if num_channels == 1 {
-                0
-            } else {
-                // For stereo: ch1 data starts at 0, ch2 data starts at block_size/2
-                ch * per_channel_data_size
-            };
+        for (ch, channel_out) in channel_samples.iter_mut().take(num_channels).enumerate() {
+            let ch_offset = ch * per_channel_data_size;
 
             if ch_offset + header_size > block.len() {
                 continue;
@@ -1735,7 +1835,7 @@ pub fn decode_ima_adpcm(
 
             // Emit initial sample
             let initial_sample = predictor.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
-            channel_samples[ch].push(initial_sample);
+            channel_out.push(initial_sample);
 
             // Decode nibbles
             let nibble_start = ch_offset + header_size;
@@ -1768,7 +1868,7 @@ pub fn decode_ima_adpcm(
                     predictor = predictor.clamp(i16::MIN as i32, i16::MAX as i32);
 
                     let sample = predictor as i16;
-                    channel_samples[ch].push(sample);
+                    channel_out.push(sample);
 
                     // Update step index
                     step_index = (step_index + IMA_ADPCM_INDEX_TABLE[nibble as usize]).clamp(0, 88);
@@ -1779,12 +1879,12 @@ pub fn decode_ima_adpcm(
         // Interleave channels into output
         let max_frames = channel_samples[0].len().max(channel_samples[1].len());
         for frame in 0..max_frames {
-            for ch in 0..num_channels {
-                if frame < channel_samples[ch].len() {
-                    output.push(channel_samples[ch][frame]);
+            for samples in channel_samples.iter().take(num_channels) {
+                if frame < samples.len() {
+                    output.push(samples[frame]);
                 } else {
                     // Pad with last sample if channels are uneven
-                    output.push(channel_samples[ch].last().copied().unwrap_or(0));
+                    output.push(samples.last().copied().unwrap_or(0));
                 }
             }
         }
@@ -1888,8 +1988,8 @@ pub fn decode_xma(xma_data: &[u8], num_channels: u16) -> AppResult<Vec<i16>> {
         xma_data.to_vec()
     };
 
-    // State for overlap-add
-    let mut prev_frame = vec![0.0f32; XMA_FRAME_SAMPLES * num_channels];
+    // State for overlap-add: per-channel second half of the previous frame.
+    let mut prev_frame = [[0.0f32; XMA_FRAME_SAMPLES]; 2];
     let mut output = Vec::new();
 
     let mut offset = 0;
@@ -1919,77 +2019,67 @@ pub fn decode_xma(xma_data: &[u8], num_channels: u16) -> AppResult<Vec<i16>> {
             break;
         }
 
-        if quant_scale == 0 {
-            // Zero quantisation scale → silent frame
-            let frame_output = vec![0i16; XMA_FRAME_SAMPLES * num_channels];
-            for ch in 0..num_channels {
-                for i in 0..XMA_FRAME_SAMPLES {
-                    let idx = i * num_channels + ch;
-                    output.push(frame_output[idx]);
+        // Decode each subframe's quantised MDCT coefficients into per-channel
+        // time-domain samples. A zero quantisation scale marks a silent frame:
+        // the buffers stay zero and the frame flows through the same
+        // overlap-add state machine below, so mixed silent/non-silent streams
+        // keep consistent length and overlap state.
+        let mut channel_time = [[0.0f32; XMA_FRAME_SAMPLES]; 2];
+        if quant_scale != 0 {
+            for channel in channel_time
+                .iter_mut()
+                .take(num_channels.min(num_subframes))
+            {
+                // The subframe data contains quantised coefficients.
+                // We approximate the bit allocation: each coefficient gets
+                // a number of bits proportional to the quant_scale.
+                // For simplicity, we treat quant_scale as the number of bits
+                // per coefficient (clamped to a reasonable range).
+                let bits_per_coeff = quant_scale.clamp(2, 16);
+                let bytes_per_coeff = bits_per_coeff.div_ceil(8);
+                let subframe_size = XMA_FRAME_SAMPLES * bytes_per_coeff;
+
+                let sf_end = (offset + subframe_size).min(data.len());
+                let sf_data = &data[offset..sf_end];
+
+                // Dequantise coefficients from the byte stream.
+                // We read bytes_per_coeff bytes per coefficient and treat them
+                // as a signed integer, then scale by the quantisation step.
+                let quant_step = 1.0f32 / (1u32 << (bits_per_coeff - 1)) as f32;
+
+                let mut mdct_coeffs = [0.0f32; XMA_FRAME_SAMPLES];
+                let coeff_count = XMA_FRAME_SAMPLES.min(sf_data.len() / bytes_per_coeff);
+                for (i, coeff) in mdct_coeffs.iter_mut().take(coeff_count).enumerate() {
+                    let byte_start = i * bytes_per_coeff;
+                    let byte_end = (byte_start + bytes_per_coeff).min(sf_data.len());
+                    let mut raw_val: i32 = 0;
+                    for (j, &b) in sf_data[byte_start..byte_end].iter().enumerate() {
+                        raw_val |= (b as i32) << (j * 8);
+                    }
+
+                    // Sign-extend based on bits_per_coeff
+                    let sign_bit = 1 << (bits_per_coeff - 1);
+                    if raw_val & sign_bit != 0 {
+                        raw_val |= !((1 << bits_per_coeff) - 1);
+                    }
+
+                    *coeff = raw_val as f32 * quant_step;
                 }
+
+                offset += subframe_size;
+
+                // Apply inverse MDCT to get time-domain samples
+                imdct_into(&mdct_coeffs, channel);
             }
-            frame_index += 1;
-            continue;
         }
 
-        // For each subframe, extract quantised MDCT coefficients and decode.
-        for sf in 0..num_channels.min(num_subframes) {
-            // Each subframe contains XMA_FRAME_SAMPLES coefficients.
-            // We'll read from the bitstream at the current offset.
-            // For simplicity in this first-pass decoder, we parse a fixed
-            // number of bytes per sample.
-
-            let mut mdct_coeffs = vec![0.0f32; XMA_FRAME_SAMPLES];
-
-            // The subframe data contains quantised coefficients.
-            // We approximate the bit allocation: each coefficient gets
-            // a number of bits proportional to the quant_scale.
-            // For simplicity, we treat quant_scale as the number of bits
-            // per coefficient (clamped to a reasonable range).
-            let bits_per_coeff = quant_scale.clamp(2, 16);
-            let bytes_per_coeff = (bits_per_coeff + 7) / 8;
-            let subframe_size = XMA_FRAME_SAMPLES * bytes_per_coeff;
-
-            let sf_end = (offset + subframe_size).min(data.len());
-            let sf_data = &data[offset..sf_end];
-
-            // Dequantise coefficients from the byte stream.
-            // We read bytes_per_coeff bytes per coefficient and treat them
-            // as a signed integer, then scale by the quantisation step.
-            let quant_step = 1.0f32 / (1u32 << (bits_per_coeff - 1)) as f32;
-
-            for i in 0..XMA_FRAME_SAMPLES.min(sf_data.len() / bytes_per_coeff.max(1)) {
-                let byte_start = i * bytes_per_coeff;
-                let byte_end = (byte_start + bytes_per_coeff).min(sf_data.len());
-                let mut raw_val: i32 = 0;
-                for (j, &b) in sf_data[byte_start..byte_end].iter().enumerate() {
-                    raw_val |= (b as i32) << (j * 8);
-                }
-
-                // Sign-extend based on bits_per_coeff
-                let sign_bit = 1 << (bits_per_coeff - 1);
-                if raw_val & sign_bit != 0 {
-                    raw_val |= !((1 << bits_per_coeff) - 1);
-                }
-
-                mdct_coeffs[i] = raw_val as f32 * quant_step;
-            }
-
-            offset += subframe_size;
-
-            // Apply inverse MDCT to get time-domain samples
-            let time_samples = imdct(&mdct_coeffs);
-
-            // Overlap-add with previous frame
-            let half_frame = XMA_FRAME_SAMPLES / 2;
+        // Overlap-add with the previous frame, emitting frame-major
+        // interleaved PCM (the documented output order).
+        let half_frame = XMA_FRAME_SAMPLES / 2;
+        if frame_index > 0 {
             for i in 0..half_frame {
-                let prev_idx = if frame_index > 0 {
-                    i * num_channels + sf
-                } else {
-                    continue; // No previous frame for overlap at start
-                };
-                if frame_index > 0 && prev_idx < prev_frame.len() {
-                    let out_sample = time_samples[i] + prev_frame[prev_idx];
+                for sf in 0..num_channels {
+                    let out_sample = channel_time[sf][i] + prev_frame[sf][i];
                     let clamped = out_sample.clamp(-1.0, 1.0);
                     let pcm = if clamped <= -1.0 {
                         i16::MIN
@@ -1999,39 +2089,30 @@ pub fn decode_xma(xma_data: &[u8], num_channels: u16) -> AppResult<Vec<i16>> {
                     output.push(pcm);
                 }
             }
+        }
 
-            // Store second half for next frame's overlap
-            for i in half_frame..XMA_FRAME_SAMPLES {
-                let prev_idx = i * num_channels + sf;
-                if prev_idx < prev_frame.len() {
-                    prev_frame[prev_idx] = time_samples[i];
-                }
-            }
+        // Store the second half for the next frame's overlap
+        for sf in 0..num_channels {
+            prev_frame[sf][..half_frame].copy_from_slice(&channel_time[sf][half_frame..]);
         }
 
         frame_index += 1;
-
-        // Safety limit: prevent runaway parsing
-        if frame_index > 1024 {
-            break;
-        }
     }
 
-    // Flush remaining overlap samples (last half-frame)
+    // Flush remaining overlap samples (last half-frame), frame-major
+    // interleaved to match the frames above.
     if frame_index > 0 {
-        for i in 0..XMA_FRAME_SAMPLES / 2 {
-            for ch in 0..num_channels {
-                let idx = i * num_channels + ch;
-                if idx < prev_frame.len() {
-                    let clamped = prev_frame[idx].clamp(-1.0, 1.0);
-                    let pcm = if clamped <= -1.0 {
-                        i16::MIN
-                    } else {
-                        (clamped * i16::MAX as f32) as i16
-                    };
-                    output.push(pcm);
-                }
-            }
+        let half_frame = XMA_FRAME_SAMPLES / 2;
+        for out_idx in 0..half_frame * num_channels {
+            let i = out_idx / num_channels;
+            let sf = out_idx % num_channels;
+            let clamped = prev_frame[sf][i].clamp(-1.0, 1.0);
+            let pcm = if clamped <= -1.0 {
+                i16::MIN
+            } else {
+                (clamped * i16::MAX as f32) as i16
+            };
+            output.push(pcm);
         }
     }
 
@@ -2056,41 +2137,52 @@ pub fn decode_xma(xma_data: &[u8], num_channels: u16) -> AppResult<Vec<i16>> {
 ///
 /// The transform takes `N/2` spectral coefficients and produces `N` time-domain
 /// samples (with 50% overlap, the output is windowed for overlap-add).
+///
+/// The cosine matrix and window are precomputed once and shared, so decoding
+/// does not evaluate transcendental functions per sample or per subframe.
 fn imdct(coefficients: &[f32]) -> Vec<f32> {
-    let n = XMA_FRAME_SAMPLES;
-    let half_n = n / 2;
-    let mut time = vec![0.0f32; n];
-
-    // For a standard MDCT, N/2 input coefficients → N output samples.
-    // We use a simple DCT-IV approach.
-    //
-    // The inverse MDCT (IMDCT) is defined as:
-    //
-    //   y[n] = sum_{k=0}^{N/2-1} X[k] * cos(pi/N * (n + 1/2 + N/2) * (k + 1/2))
-    //
-    // for n = 0, ..., N-1.
-    //
-    // We implement this directly for clarity.
-
-    let scale = 2.0 / n as f32;
-    let pi_over_n = std::f32::consts::PI / n as f32;
-
-    for n_idx in 0..n {
-        let mut sum = 0.0f32;
-        for k in 0..coefficients.len().min(half_n) {
-            let angle = pi_over_n * (n_idx as f32 + 0.5 + half_n as f32) * (k as f32 + 0.5);
-            sum += coefficients[k] * angle.cos();
-        }
-        time[n_idx] = sum * scale;
-    }
-
-    // Apply sine window (standard for MDCT-based codecs)
-    for n_idx in 0..n {
-        let window = (std::f32::consts::PI * (n_idx as f32 + 0.5) / n as f32).sin();
-        time[n_idx] *= window;
-    }
-
+    let mut time = vec![0.0f32; XMA_FRAME_SAMPLES];
+    imdct_into(coefficients, &mut time);
     time
+}
+
+/// Precomputed IMDCT kernel: `matrix[i * half_n + k]` is
+/// `cos(pi/N * (i + 0.5 + N/2) * (k + 0.5)) * window[i] * scale`, so each
+/// output sample is a plain dot product of coefficients with one matrix row.
+static IMDCT_COS_MATRIX: OnceLock<Box<[f32]>> = OnceLock::new();
+
+fn imdct_matrix() -> &'static [f32] {
+    IMDCT_COS_MATRIX.get_or_init(|| {
+        let n = XMA_FRAME_SAMPLES;
+        let half_n = n / 2;
+        let pi_over_n = std::f32::consts::PI / n as f32;
+        let scale = 2.0 / n as f32;
+        let mut matrix = Vec::with_capacity(n * half_n);
+        for i in 0..n {
+            // Sine window (standard for MDCT-based codecs) folded with the
+            // output scale into the matrix row.
+            let window = (std::f32::consts::PI * (i as f32 + 0.5) / n as f32).sin() * scale;
+            for k in 0..half_n {
+                let angle = pi_over_n * (i as f32 + 0.5 + half_n as f32) * (k as f32 + 0.5);
+                matrix.push(angle.cos() * window);
+            }
+        }
+        matrix.into_boxed_slice()
+    })
+}
+
+/// Inverse MDCT writing into a caller-provided buffer (no allocation).
+fn imdct_into(coefficients: &[f32], time: &mut [f32]) {
+    let half_n = XMA_FRAME_SAMPLES / 2;
+    let matrix = imdct_matrix();
+    for (i, out) in time.iter_mut().enumerate() {
+        let row = &matrix[i * half_n..(i + 1) * half_n];
+        let mut sum = 0.0f32;
+        for (k, &coeff) in coefficients.iter().take(half_n).enumerate() {
+            sum += coeff * row[k];
+        }
+        *out = sum;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2221,11 +2313,17 @@ pub fn convert_and_resample(
     let source_channels = source_channels.max(1) as usize;
     let dest_channels = dest_channels.max(1) as usize;
 
-    if samples.is_empty() {
+    if samples.is_empty() || source_rate == 0 || dest_rate == 0 {
         return Vec::new();
     }
 
-    let source_frames = samples.len() / source_channels;
+    // Drop any trailing partial frame so the sample count is an exact multiple
+    // of the channel count; a caller submitting an odd/partial sample count
+    // must not crash the process.
+    let usable_samples = samples.len() - samples.len() % source_channels;
+    let usable = &samples[..usable_samples];
+
+    let source_frames = usable_samples / source_channels;
     if source_frames == 0 {
         return Vec::new();
     }
@@ -2240,7 +2338,7 @@ pub fn convert_and_resample(
     let mut resampled = vec![0.0f32; dest_frames * source_channels];
 
     if source_rate == dest_rate {
-        resampled.copy_from_slice(samples);
+        resampled.copy_from_slice(usable);
     } else {
         // Linear interpolation resampling
         for frame in 0..dest_frames {
@@ -2250,8 +2348,8 @@ pub fn convert_and_resample(
             let frac = source_pos - frame0 as f64;
 
             for ch in 0..source_channels {
-                let s0 = samples[frame0 * source_channels + ch];
-                let s1 = samples[frame1 * source_channels + ch];
+                let s0 = usable[frame0 * source_channels + ch];
+                let s1 = usable[frame1 * source_channels + ch];
                 resampled[frame * source_channels + ch] = s0 + (s1 - s0) * frac as f32;
             }
         }
@@ -2384,10 +2482,11 @@ pub fn apply_lowpass(samples: &mut [f32], channels: usize, cutoff: f32) {
     let mut previous = vec![0.0f32; channels];
 
     for frame in 0..samples.len() / channels {
-        for ch in 0..channels {
-            let idx = frame * channels + ch;
-            previous[ch] = previous[ch] + alpha * (samples[idx] - previous[ch]);
-            samples[idx] = previous[ch];
+        let base = frame * channels;
+        for (ch, prev) in previous.iter_mut().enumerate() {
+            let idx = base + ch;
+            *prev = *prev + alpha * (samples[idx] - *prev);
+            samples[idx] = *prev;
         }
     }
 }
@@ -2505,8 +2604,16 @@ impl XAPO_REGISTRATION_PROPERTIES {
 /// COM-style audio buffer descriptor used by XAPO::Process.
 ///
 /// Matches the Windows `XAPO_BUFFER` layout.
+///
+/// # Safety
+///
+/// `buffer` points into guest (emulated Windows) memory. The pointed-to audio
+/// data must stay mapped and valid for the duration of the XAPO `process`
+/// call; descriptors must not outlive the guest buffer they reference.
+/// This type is intentionally neither `Clone` (which would duplicate the raw
+/// pointer) nor `Send`/`Sync` (sharing it across threads is unsafe).
 #[repr(C)]
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct XAPO_BUFFER {
     /// Pointer to interleaved float audio samples in guest memory.
     pub buffer: *const f32,
@@ -2515,12 +2622,6 @@ pub struct XAPO_BUFFER {
     /// Number of valid audio frames in the buffer.
     pub valid_frame_count: u32,
 }
-
-// Safety: XAPO_BUFFER is only used as a read-only descriptor, not sent across threads.
-// SAFETY: Send is safe because the type only uses thread-safe internal state or is accessed under exclusive &mut
-unsafe impl Send for XAPO_BUFFER {}
-// SAFETY: Send is safe because the type only uses thread-safe internal state or is accessed under exclusive &mut
-unsafe impl Sync for XAPO_BUFFER {}
 
 // ---------------------------------------------------------------------------
 // XapoEffect trait
@@ -2568,12 +2669,8 @@ pub struct XapoReverb {
     wet: f32,
     /// Sample rate for delay calculation.
     sample_rate: u32,
-    /// Comb filter delay lengths in samples.
-    comb_delays: [usize; 4],
     /// Comb filter feedback coefficients.
     comb_feedback: [f32; 4],
-    /// All-pass filter delay lengths in samples.
-    allpass_delays: [usize; 2],
     /// All-pass filter feedback coefficient.
     allpass_feedback: f32,
     /// Comb filter delay line buffers.
@@ -2640,9 +2737,7 @@ impl XapoReverb {
         Self {
             wet: wet.clamp(0.0, 1.0),
             sample_rate,
-            comb_delays,
             comb_feedback,
-            allpass_delays,
             allpass_feedback: 0.5,
             comb_buffers,
             comb_positions: [0; 4],
@@ -2673,7 +2768,6 @@ impl XapoEffect for XapoReverb {
             // Sum through 4 parallel comb filters
             let mut comb_sum = 0.0f32;
             for c in 0..4 {
-                let _delay = self.comb_delays[c];
                 let pos = self.comb_positions[c];
                 let buf = &mut self.comb_buffers[c];
                 if buf.is_empty() {
@@ -2688,7 +2782,6 @@ impl XapoEffect for XapoReverb {
             // Feed through 2 series all-pass filters
             let mut ap_out = comb_sum * 0.25;
             for a in 0..2 {
-                let _delay = self.allpass_delays[a];
                 let pos = self.allpass_positions[a];
                 let buf = &mut self.allpass_buffers[a];
                 if buf.is_empty() {
@@ -3113,12 +3206,14 @@ pub struct XapoNormalize {
     max_observed: f32,
     /// Number of channels.
     channels: u16,
+    /// Sample rate.
+    sample_rate: u32,
     /// COM registration properties.
     registration: XAPO_REGISTRATION_PROPERTIES,
 }
 
 impl XapoNormalize {
-    pub fn new(target_peak: f32, channels: u16) -> Self {
+    pub fn new(target_peak: f32, channels: u16, sample_rate: u32) -> Self {
         let reg = XAPO_REGISTRATION_PROPERTIES::new(
             [
                 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -3131,6 +3226,7 @@ impl XapoNormalize {
             target_peak: target_peak.clamp(0.01, 1.0),
             max_observed: 0.0,
             channels: channels.max(1),
+            sample_rate,
             registration: reg,
         }
     }
@@ -3181,7 +3277,7 @@ impl XapoEffect for XapoNormalize {
     }
 
     fn sample_rate(&self) -> u32 {
-        48000
+        self.sample_rate
     }
 }
 
@@ -3366,26 +3462,46 @@ impl XapoEqualizer {
 impl XapoEffect for XapoEqualizer {
     fn process(&mut self, input: &[f32], output: &mut [f32]) -> AppResult<()> {
         let channels = self.channels as usize;
+        if output.len() < input.len() || input.is_empty() || channels == 0 {
+            return Ok(());
+        }
 
-        // Pre-compute biquad coefficients for each band
-        let coeffs: Vec<(f32, f32, f32, f32, f32)> = (0..4)
-            .map(|band| {
-                Self::peaking_coefficients(
-                    self.params.band_frequencies[band],
-                    self.params.band_gains_db[band],
-                    self.params.band_q[band],
-                    self.sample_rate as f32,
-                )
-            })
-            .collect();
+        // Pre-compute biquad coefficients for each band on the stack (no
+        // allocation per call; recomputed every call since parameters can
+        // change between buffers).
+        let coeffs = [
+            Self::peaking_coefficients(
+                self.params.band_frequencies[0],
+                self.params.band_gains_db[0],
+                self.params.band_q[0],
+                self.sample_rate as f32,
+            ),
+            Self::peaking_coefficients(
+                self.params.band_frequencies[1],
+                self.params.band_gains_db[1],
+                self.params.band_q[1],
+                self.sample_rate as f32,
+            ),
+            Self::peaking_coefficients(
+                self.params.band_frequencies[2],
+                self.params.band_gains_db[2],
+                self.params.band_q[2],
+                self.sample_rate as f32,
+            ),
+            Self::peaking_coefficients(
+                self.params.band_frequencies[3],
+                self.params.band_gains_db[3],
+                self.params.band_q[3],
+                self.sample_rate as f32,
+            ),
+        ];
 
         // Process each sample through all 4 bands in series
         for (i, &sample) in input.iter().enumerate() {
             let ch = i % channels;
             let mut y = sample;
 
-            for band in 0..4 {
-                let (b0, b1, b2, a1, a2) = coeffs[band];
+            for (band, &(b0, b1, b2, a1, a2)) in coeffs.iter().enumerate() {
                 let (x1, x2, y1, y2) = self.band_state[band][ch];
 
                 let new_y = b0 * y + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
@@ -3393,9 +3509,7 @@ impl XapoEffect for XapoEqualizer {
                 y = new_y;
             }
 
-            if i < output.len() {
-                output[i] = y;
-            }
+            output[i] = y;
         }
 
         Ok(())
@@ -3435,6 +3549,9 @@ pub struct XapoEffectChain {
     chain: Vec<u64>,
     /// Temporary buffer for inter-effect processing.
     temp_buffer: Vec<f32>,
+    /// Second reusable scratch buffer, alternated with `temp_buffer` so no
+    /// intermediate effect allocates on every processed buffer.
+    scratch_buffer: Vec<f32>,
 }
 
 impl XapoEffectChain {
@@ -3443,6 +3560,7 @@ impl XapoEffectChain {
         Self {
             chain: Vec::new(),
             temp_buffer: Vec::new(),
+            scratch_buffer: Vec::new(),
         }
     }
 
@@ -3451,6 +3569,7 @@ impl XapoEffectChain {
         Self {
             chain: handles,
             temp_buffer: Vec::new(),
+            scratch_buffer: Vec::new(),
         }
     }
 
@@ -3524,16 +3643,25 @@ impl XapoEffectChain {
         for (i, &handle) in self.chain.iter().enumerate() {
             if i == self.chain.len() - 1 {
                 // Last effect writes directly to output
-                manager.process_instance(handle, &self.temp_buffer[..input.len()], output);
+                if !manager.process_instance(handle, &self.temp_buffer[..input.len()], output) {
+                    // The instance is gone: zero the output so stale or
+                    // partially-written samples do not flow downstream.
+                    output.fill(0.0);
+                }
             } else {
-                // Intermediate effect: need a second temp buffer
-                let mut intermediate = vec![0.0f32; input.len()];
-                manager.process_instance(
+                // Intermediate effect: reuse the scratch buffer (grown only
+                // when the chain is configured with a larger buffer size).
+                if self.scratch_buffer.len() < input.len() {
+                    self.scratch_buffer.resize(input.len(), 0.0);
+                }
+                if !manager.process_instance(
                     handle,
                     &self.temp_buffer[..input.len()],
-                    &mut intermediate,
-                );
-                self.temp_buffer[..input.len()].copy_from_slice(&intermediate);
+                    &mut self.scratch_buffer[..input.len()],
+                ) {
+                    self.scratch_buffer[..input.len()].fill(0.0);
+                }
+                self.temp_buffer[..input.len()].copy_from_slice(&self.scratch_buffer[..input.len()]);
             }
         }
 
@@ -3701,13 +3829,13 @@ impl XapoManager {
             Box::new(|| Box::new(XapoCompressor::new(-24.0, 4.0, 5.0, 50.0, 2, 48000))),
         );
 
-        let norm = XapoNormalize::new(0.95, 2);
+        let norm = XapoNormalize::new(0.95, 2, 48000);
         let clsid_norm = norm.registration().clsid;
         let reg_norm = norm.registration().clone();
         self.register_effect(
             clsid_norm,
             reg_norm,
-            Box::new(|| Box::new(XapoNormalize::new(0.95, 2))),
+            Box::new(|| Box::new(XapoNormalize::new(0.95, 2, 48000))),
         );
 
         let eq = XapoEqualizer::new(EqualizerParameters::default(), 2, 48000);
@@ -3849,8 +3977,12 @@ pub fn calculate_buffer_callbacks(
 // Stream callback helpers
 // ---------------------------------------------------------------------------
 
+// Runs on the cpal real-time audio thread: must never block or allocate.
+// `try_lock` guarantees the callback never blocks on the producer; on the
+// rare occasion the lock is contended the callback emits silence instead of
+// risking a real-time deadline violation (priority inversion).
 fn fill_output_f32(output: &mut [f32], queue: &Arc<Mutex<VecDeque<f32>>>) {
-    let Ok(mut samples) = queue.lock() else {
+    let Ok(mut samples) = queue.try_lock() else {
         output.fill(0.0);
         return;
     };
@@ -3860,7 +3992,7 @@ fn fill_output_f32(output: &mut [f32], queue: &Arc<Mutex<VecDeque<f32>>>) {
 }
 
 fn fill_output_i16(output: &mut [i16], queue: &Arc<Mutex<VecDeque<f32>>>) {
-    let Ok(mut samples) = queue.lock() else {
+    let Ok(mut samples) = queue.try_lock() else {
         output.fill(0);
         return;
     };
@@ -3871,7 +4003,7 @@ fn fill_output_i16(output: &mut [i16], queue: &Arc<Mutex<VecDeque<f32>>>) {
 }
 
 fn fill_output_u16(output: &mut [u16], queue: &Arc<Mutex<VecDeque<f32>>>) {
-    let Ok(mut samples) = queue.lock() else {
+    let Ok(mut samples) = queue.try_lock() else {
         output.fill(u16::MAX / 2);
         return;
     };
@@ -4143,7 +4275,7 @@ mod tests {
     fn measure_latency_ms_small_buffer() {
         let latency = measure_latency_ms(48000, 128);
         // 128 frames at 48kHz ≈ 2.67ms + 10ms overhead = ~13ms
-        assert!(latency >= 10 && latency <= 50);
+        assert!((10..=50).contains(&latency));
     }
 
     // ── Audio format detection tests ───────────────────────────────────
@@ -4276,6 +4408,10 @@ mod tests {
 
         let result = decode_ms_adpcm(&stereo_data, stereo_data.len() as u16, 2, 6).unwrap();
 
+        // Every block must produce exactly `samples_per_block` frames per
+        // channel (the stereo decoder used to be short by ~half).
+        assert_eq!(result.len(), 2 * 6);
+
         // Interleaved: [ch1_100, ch2_-100, ch1_200, ch2_-200, ch1_pred...]
         assert_eq!(result[0], 100);
         assert_eq!(result[1], -100);
@@ -4287,6 +4423,32 @@ mod tests {
         // ch2: predictor 0 -> sample[n] = sample[n-2] -> -100
         assert_eq!(result[4], 100);
         assert_eq!(result[5], -100);
+    }
+
+    #[test]
+    fn decode_ms_adpcm_stereo_full_block_length() {
+        // Stereo block with enough nibble data for the full samples_per_block.
+        let mut stereo_data = Vec::new();
+        for _ in 0..2 {
+            stereo_data.extend_from_slice(&0u16.to_le_bytes()); // predictor
+            stereo_data.extend_from_slice(&32u16.to_le_bytes()); // delta
+            stereo_data.extend_from_slice(&100i16.to_le_bytes()); // sample1
+            stereo_data.extend_from_slice(&200i16.to_le_bytes()); // sample2
+        }
+        // 4 data bytes -> 4 nibbles per channel = exactly `remaining` (4)
+        // samples per channel with samples_per_block = 6.
+        stereo_data.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+
+        let result = decode_ms_adpcm(&stereo_data, stereo_data.len() as u16, 2, 6).unwrap();
+        assert_eq!(result.len(), 2 * 6);
+        // Frame-major interleaving: every pair is (ch1, ch2). Both channels
+        // share the same history, and predictor 0 (256, 0) predicts
+        // sample[n-2], so the sequence alternates 100, 200, 100, 200, ...
+        for frame in 0..6 {
+            let expected = if frame % 2 == 0 { 100 } else { 200 };
+            assert_eq!(result[frame * 2], expected);
+            assert_eq!(result[frame * 2 + 1], expected);
+        }
     }
 
     #[test]
@@ -4523,6 +4685,52 @@ mod tests {
         assert!(!result.is_empty());
         // Should be interleaved stereo
         assert!(result.len() >= 2);
+    }
+
+    #[test]
+    fn decode_xma_stereo_output_is_frame_major_interleaved() {
+        // Two subframes: channel 0 gets all-zero coefficients (pure silence),
+        // channel 1 gets a constant non-zero coefficient, so the decoded
+        // output must alternate (zero, non-zero) per frame.
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&0x02020000u32.to_le_bytes()); // 2 subframes, quant=2
+        frame.extend_from_slice(&[0u8; 256]); // subframe 0: all-zero coeffs
+        frame.extend_from_slice(&[0x02u8; 256]); // subframe 1: sign-extended -1 coeffs
+
+        let result = decode_xma(&frame, 2).unwrap();
+        assert!(!result.is_empty());
+        // Even positions (channel 0) are exactly zero; odd positions
+        // (channel 1) carry energy.
+        for (i, &s) in result.iter().enumerate() {
+            if i % 2 == 0 {
+                assert_eq!(s, 0);
+            }
+        }
+        assert!(
+            result.iter().skip(1).step_by(2).any(|&s| s != 0),
+            "channel 1 should contain decoded energy"
+        );
+    }
+
+    #[test]
+    fn convert_and_resample_partial_frame_does_not_panic() {
+        // An odd sample count that is not a multiple of the channel count
+        // (e.g. a DirectSound write of an odd number of samples) must not
+        // panic; the trailing partial frame is dropped.
+        let samples = vec![0.5f32, -0.5, 0.25]; // 1.5 frames of stereo
+        let result = convert_and_resample(&samples, 2, 48000, 2, 48000);
+        assert_eq!(result.len(), 2);
+        assert!((result[0] - 0.5).abs() < 0.001);
+        assert!((result[1] - (-0.5)).abs() < 0.001);
+    }
+
+    #[test]
+    fn convert_and_resample_zero_rates_do_not_panic() {
+        let samples = vec![0.5f32, -0.5, 0.25, -0.25];
+        // source_rate == 0 used to panic on division by zero
+        assert!(convert_and_resample(&samples, 2, 0, 2, 48000).is_empty());
+        // dest_rate == 0
+        assert!(convert_and_resample(&samples, 2, 48000, 2, 0).is_empty());
     }
 
     // ── convert_game_audio_to_float tests ───────────────────────────────
@@ -4862,7 +5070,7 @@ mod tests {
 
     #[test]
     fn xapo_normalize_scales_to_target() {
-        let mut norm = XapoNormalize::new(0.5, 1);
+        let mut norm = XapoNormalize::new(0.5, 1, 48000);
         let reg = norm.registration();
         assert!(reg.friendly_name[0] != 0);
 
@@ -4994,9 +5202,10 @@ mod tests {
         assert_eq!(xb.flags, XAPO_BUFFER_VALID);
         assert_eq!(xb.valid_frame_count, 2);
         // Verify we can read through the raw pointer
-        // SAFETY: CoreAudio FFI for audio playback
+        // SAFETY: the buffer is a live local array; the pointer stays valid for
+        // the duration of this test.
         unsafe {
-            assert_eq!((*xb.buffer.add(1) - 0.5).abs() < 0.001, true);
+            assert!((*xb.buffer.add(1) - 0.5).abs() < 0.001);
         }
     }
 }
