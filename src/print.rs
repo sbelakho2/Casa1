@@ -1,7 +1,17 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 /// Printer handle type
 pub type PrinterHandle = u64;
+
+/// Maximum spool bytes retained per job (the spool is only used for a debug
+/// hex dump in the generated PDF; the cap prevents unbounded guest-driven
+/// memory growth).
+const MAX_SPOOL_BYTES: usize = 64 * 1024 * 1024;
+
+/// Maximum number of completed jobs retained for status queries; older
+/// completed jobs are evicted so spool data cannot accumulate forever.
+const MAX_RETAINED_JOBS: usize = 32;
 
 /// Print job status
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -44,7 +54,6 @@ pub type PrinterDcHandle = u64;
 pub struct PrinterDc {
     pub handle: PrinterDcHandle,
     pub printer_name: String,
-    pub job_id: Option<u32>,
 }
 
 /// Print subsystem state
@@ -63,20 +72,7 @@ impl PrintSubsystem {
     pub fn new() -> Self {
         let mut printers = HashMap::new();
         // Add default "Microsoft Print to PDF" printer
-        printers.insert(
-            1,
-            PrinterInfo {
-                name: "Microsoft Print to PDF".to_string(),
-                port: "PORTPROMPT:".to_string(),
-                driver: "Microsoft Print to PDF".to_string(),
-                comment: "Print to PDF file".to_string(),
-                location: "".to_string(),
-                status: 0,       // PRINTER_STATUS_READY
-                attributes: 0x4, // PRINTER_ATTRIBUTE_DIRECT
-                jobs: 0,
-                default_priority: 1,
-            },
-        );
+        printers.insert(1, default_printer_info());
         PrintSubsystem {
             printers,
             jobs: HashMap::new(),
@@ -96,10 +92,23 @@ impl PrintSubsystem {
                 return Some(handle);
             }
         }
+        if name.is_none() {
+            // The default printer was deleted; restore it so a printer-less
+            // guest keeps working instead of failing every open.
+            let handle = self.next_handle;
+            self.next_handle = self.next_handle.wrapping_add(1);
+            self.printers.insert(handle, default_printer_info());
+            return Some(handle);
+        }
         None
     }
 
-    pub fn close_printer(&mut self, _handle: PrinterHandle) -> bool {
+    pub fn close_printer(&mut self, handle: PrinterHandle) -> bool {
+        // Cancel any in-flight job for this printer so its spool data does
+        // not linger after the handle is closed.
+        if let Some(job_id) = self.active_jobs.remove(&handle) {
+            self.jobs.remove(&job_id);
+        }
         true
     }
 
@@ -108,8 +117,15 @@ impl PrintSubsystem {
         printer_handle: PrinterHandle,
         doc_name: &str,
     ) -> Option<u32> {
+        if !self.printers.contains_key(&printer_handle) {
+            return None;
+        }
+        // Guard against wrap-around/collision of the u32 job-id space.
         let job_id = self.next_job_id;
-        self.next_job_id += 1;
+        if job_id == 0 || self.jobs.contains_key(&job_id) {
+            return None;
+        }
+        self.next_job_id = self.next_job_id.wrapping_add(1);
         self.jobs.insert(
             job_id,
             PrintJob {
@@ -146,16 +162,40 @@ impl PrintSubsystem {
 
         if let Some(job) = self.jobs.get_mut(&job_id) {
             job.status = PrintJobStatus::Completed;
-            // Clear active job for this printer
-            self.active_jobs.retain(|_, v| *v != job_id);
+        }
+        // Clear active job for this printer
+        self.active_jobs.retain(|_, v| *v != job_id);
+
+        // Generate PDF from spool data with proper page count and write it to
+        // a fixed output directory using a sanitized, guest-safe filename.
+        let pdf_data = self.generate_pdf(&spool_data, &document_name, page_count);
+        let output_path = print_output_path(job_id, &document_name);
+        if let Some(parent) = output_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Err(e) = std::fs::write(&output_path, &pdf_data) {
+            eprintln!(
+                "Failed to save print output to {}: {}",
+                output_path.display(),
+                e
+            );
         }
 
-        // Generate PDF from spool data with proper page count
-        let pdf_data = self.generate_pdf(&spool_data, &document_name, page_count);
-        // Write PDF to file
-        let filename = format!("print_{}_{}.pdf", job_id, document_name.replace(' ', "_"));
-        if let Err(e) = std::fs::write(&filename, &pdf_data) {
-            eprintln!("Failed to save print output: {}", e);
+        // Bound the retained job history so completed jobs (and their spool
+        // data) cannot accumulate without limit.
+        if self.jobs.len() > MAX_RETAINED_JOBS {
+            let mut oldest: Option<u32> = None;
+            for id in self.jobs.keys() {
+                if self.active_jobs.values().any(|active| active == id) {
+                    continue;
+                }
+                if oldest.is_none_or(|oldest| *id < oldest) {
+                    oldest = Some(*id);
+                }
+            }
+            if let Some(id) = oldest {
+                self.jobs.remove(&id);
+            }
         }
         true
     }
@@ -180,7 +220,11 @@ impl PrintSubsystem {
 
     pub fn write_printer(&mut self, job_id: u32, data: &[u8]) -> bool {
         if let Some(job) = self.jobs.get_mut(&job_id) {
-            job.spool_data.extend_from_slice(data);
+            if job.spool_data.len() < MAX_SPOOL_BYTES {
+                let remaining = MAX_SPOOL_BYTES - job.spool_data.len();
+                job.spool_data
+                    .extend_from_slice(&data[..remaining.min(data.len())]);
+            }
             true
         } else {
             false
@@ -201,11 +245,12 @@ impl PrintSubsystem {
     }
 
     pub fn set_printer(&mut self, handle: PrinterHandle, info: PrinterInfo) -> bool {
-        if self.printers.contains_key(&handle) {
-            self.printers.insert(handle, info);
-            true
-        } else {
-            false
+        match self.printers.entry(handle) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                entry.insert(info);
+                true
+            }
+            _ => false,
         }
     }
 
@@ -231,7 +276,6 @@ impl PrintSubsystem {
             PrinterDc {
                 handle,
                 printer_name: printer_name.to_string(),
-                job_id: None,
             },
         );
         Some(handle)
@@ -253,25 +297,39 @@ impl PrintSubsystem {
 
     /// Show macOS print dialog for a PDF
     pub fn show_print_dialog(pdf_data: &[u8]) -> bool {
-        let temp_path = format!(
-            "/tmp/casa1_print_{}.pdf",
+        // Write into a per-process temp dir and remove stale files so repeated
+        // dialog invocations cannot accumulate unbounded temp PDFs.
+        let temp_dir = std::env::temp_dir().join(format!("casa1_print_{}", std::process::id()));
+        if let Err(e) = std::fs::create_dir_all(&temp_dir) {
+            eprintln!("[print] failed to create temp dir {}: {e}", temp_dir.display());
+            return false;
+        }
+        cleanup_stale_temp_pdfs(&temp_dir);
+        let temp_path = temp_dir.join(format!(
+            "dialog_{}.pdf",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_nanos()
-        );
+        ));
         match std::fs::write(&temp_path, pdf_data) {
-            Ok(_) => {
-                if let Err(e) = std::process::Command::new("open").arg(&temp_path).spawn() {
+            Ok(_) => match std::process::Command::new("open").arg(&temp_path).spawn() {
+                Ok(mut child) => {
+                    let _ = child.wait();
+                    let _ = std::fs::remove_file(&temp_path);
+                    true
+                }
+                Err(e) => {
                     eprintln!(
                         "[print] failed to open PDF {} with system handler: {e}",
-                        temp_path
+                        temp_path.display()
                     );
+                    let _ = std::fs::remove_file(&temp_path);
+                    true
                 }
-                true
-            }
+            },
             Err(e) => {
-                eprintln!("[print] failed to write temp PDF {}: {e}", temp_path);
+                eprintln!("[print] failed to write temp PDF {}: {e}", temp_path.display());
                 false
             }
         }
@@ -328,9 +386,10 @@ impl PrintSubsystem {
             .replace('\\', "\\\\")
             .replace('(', "\\(")
             .replace(')', "\\)");
-        let actual_pages = page_count.max(1);
+        let actual_pages = page_count.max(1) as usize;
         let spool_hex = spool_data
             .iter()
+            .take(4096)
             .map(|b| format!("{:02x}", b))
             .collect::<String>();
 
@@ -341,7 +400,7 @@ impl PrintSubsystem {
 
         // Object 2: Pages tree node
         let kids_refs: Vec<String> = (0..actual_pages)
-            .map(|p| format!("{} 0 R", 3 + p as usize * 2))
+            .map(|p| format!("{} 0 R", 3 + p * 2))
             .collect();
         objects.push(format!(
             r"<< /Type /Pages /Kids [{}] /Count {} >>",
@@ -349,36 +408,35 @@ impl PrintSubsystem {
             actual_pages
         ));
 
-        // Generate page objects (2 objects per page: page + content stream)
-        let mut content_obj_num = 3 + actual_pages as usize * 2; // after page objects
+        // Page objects live at 3 + 2*p and their content streams at 4 + 2*p;
+        // the per-page font objects are appended after them at 3 + 2*pages + p.
         for page_num in 0..actual_pages {
-            let _page_obj_num = 3 + page_num as usize * 2;
+            let content_obj_num = 4 + page_num * 2;
+            let font_obj_num = 3 + actual_pages * 2 + page_num;
 
             // Page object
-            let _page_y = 700 - (page_num as i32 * 60);
             objects.push(format!(
                 r"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents {} 0 R /Resources << /Font << /F1 {} 0 R >> >> >>",
                 content_obj_num,
-                content_obj_num + 1, // font ref comes after content
+                font_obj_num,
             ));
 
-            // Content stream for this page
-            let content = if actual_pages == 1 && page_num == 0 {
-                // First/only page: include document info and spool data
+            let page_label = if actual_pages == 1 {
+                format!("Page {}", page_num + 1)
+            } else {
+                format!("Page {} of {}", page_num + 1, actual_pages)
+            };
+
+            // Build the content stream first so /Length matches its exact
+            // byte count.
+            let content = if page_num == 0 {
+                // First page: include document info and spool data
                 format!(
-                    r"<< /Length {} >> stream
-BT /F1 12 Tf 100 700 Td (Printed from Casa1 - {}) Tj ET
-BT /F1 10 Tf 100 680 Td (Page {}) Tj ET
-{}
-endstream",
-                    120 + safe_name.len()
-                        + if spool_hex.is_empty() {
-                            0
-                        } else {
-                            spool_hex.len() + 50
-                        },
+                    "BT /F1 12 Tf 100 700 Td (Printed from Casa1 - {}) Tj ET\n\
+                     BT /F1 10 Tf 100 680 Td ({}) Tj ET\n\
+                     {}",
                     safe_name,
-                    page_num + 1,
+                    page_label,
                     if spool_hex.is_empty() {
                         String::new()
                     } else {
@@ -388,19 +446,17 @@ endstream",
             } else {
                 // Subsequent pages: just header and page number
                 format!(
-                    r"<< /Length {} >> stream
-BT /F1 12 Tf 100 700 Td (Printed from Casa1 - {}) Tj ET
-BT /F1 10 Tf 100 680 Td (Page {} of {}) Tj ET
-endstream",
-                    80 + safe_name.len(),
+                    "BT /F1 12 Tf 100 700 Td (Printed from Casa1 - {}) Tj ET\n\
+                     BT /F1 10 Tf 100 680 Td ({}) Tj ET",
                     safe_name,
-                    page_num + 1,
-                    actual_pages
+                    page_label,
                 )
             };
-            objects.push(content);
-
-            content_obj_num += 2;
+            objects.push(format!(
+                "<< /Length {} >> stream\n{}\nendstream",
+                content.len(),
+                content
+            ));
         }
 
         // Add font resources (one font object per page shares the same definition)
@@ -409,6 +465,73 @@ endstream",
         }
 
         objects
+    }
+}
+
+/// Info for the built-in "Microsoft Print to PDF" printer.
+fn default_printer_info() -> PrinterInfo {
+    PrinterInfo {
+        name: "Microsoft Print to PDF".to_string(),
+        port: "PORTPROMPT:".to_string(),
+        driver: "Microsoft Print to PDF".to_string(),
+        comment: "Print to PDF file".to_string(),
+        location: "".to_string(),
+        status: 0,       // PRINTER_STATUS_READY
+        attributes: 0x4, // PRINTER_ATTRIBUTE_DIRECT
+        jobs: 0,
+        default_priority: 1,
+    }
+}
+
+/// Reduce a guest-controlled document name to `[A-Za-z0-9_-]` so it can never
+/// escape the output directory via `/`, `..` or other path metacharacters.
+fn sanitize_print_filename(name: &str) -> String {
+    let sanitized: String = name
+        .chars()
+        .take(64)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if sanitized.is_empty() {
+        "document".to_string()
+    } else {
+        sanitized
+    }
+}
+
+/// Fixed output location for generated print PDFs — never the process CWD.
+fn print_output_path(job_id: u32, document_name: &str) -> PathBuf {
+    let base = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join("Documents").join("Casa1-prints"))
+        .unwrap_or_else(|| std::env::temp_dir().join("casa1-prints"));
+    base.join(format!(
+        "print_{}_{}.pdf",
+        job_id,
+        sanitize_print_filename(document_name)
+    ))
+}
+
+/// Remove dialog temp PDFs older than one hour.
+fn cleanup_stale_temp_pdfs(temp_dir: &std::path::Path) {
+    let now = std::time::SystemTime::now();
+    if let Ok(entries) = std::fs::read_dir(temp_dir) {
+        for entry in entries.flatten() {
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            let Ok(modified) = metadata.modified() else {
+                continue;
+            };
+            if now.duration_since(modified).is_ok_and(|age| age.as_secs() > 3600) {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
     }
 }
 
