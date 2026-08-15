@@ -189,7 +189,7 @@ impl AudioRingBuffer {
         let overflow = write_count.saturating_sub(free);
         if overflow > 0 {
             self.dropped.fetch_add(overflow, Ordering::Release);
-            if let Ok(mut m) = self.metrics.lock() {
+            if let Ok(mut m) = self.metrics.try_lock() {
                 m.overflow_count += 1;
             }
         }
@@ -203,7 +203,7 @@ impl AudioRingBuffer {
         }
 
         // Update metrics
-        if let Ok(mut m) = self.metrics.lock() {
+        if let Ok(mut m) = self.metrics.try_lock() {
             m.total_written += write_count as u64;
             let fill = self.fill_samples();
             let fill_frames = fill / self.channels as usize;
@@ -247,7 +247,7 @@ impl AudioRingBuffer {
         if read_count < output.len() {
             output[read_count..].fill(0.0);
             let underrun_samples = output.len() - read_count;
-            if let Ok(mut m) = self.metrics.lock() {
+            if let Ok(mut m) = self.metrics.try_lock() {
                 m.underrun_count += 1;
                 m.underrun_duration_us += if self.sample_rate > 0 {
                     (underrun_samples as u64 * 1_000_000)
@@ -265,7 +265,7 @@ impl AudioRingBuffer {
             .store(head.wrapping_add(advanced), Ordering::Release);
 
         // Update metrics
-        if let Ok(mut m) = self.metrics.lock() {
+        if let Ok(mut m) = self.metrics.try_lock() {
             m.total_read += read_count as u64;
             // Record latency measurement
             let remaining = tail.wrapping_sub(head.wrapping_add(advanced));
@@ -319,7 +319,7 @@ impl AudioRingBuffer {
             } else {
                 output[read_count..].fill(0.0);
             }
-            if let Ok(mut m) = self.metrics.lock() {
+            if let Ok(mut m) = self.metrics.try_lock() {
                 m.underrun_count += 1;
                 let underrun_samples = output.len() - read_count;
                 m.underrun_duration_us += if self.sample_rate > 0 {
@@ -340,7 +340,7 @@ impl AudioRingBuffer {
             .store(head.wrapping_add(advanced), Ordering::Release);
 
         // Update metrics
-        if let Ok(mut m) = self.metrics.lock() {
+        if let Ok(mut m) = self.metrics.try_lock() {
             m.total_read += read_count as u64;
         }
 

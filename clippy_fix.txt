@@ -168,6 +168,15 @@ warning: digits grouped inconsistently by underscores
       |
       = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#inconsistent_digit_grouping
 
+warning: digits of hex, binary or octal literal not in groups of equal size
+     --> src/cpu.rs:28206:29
+      |
+28206 |         let start_address = 0x401d_c2;
+      |                             ^^^^^^^^^ help: consider: `0x0040_1dc2`
+      |
+      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#unusual_byte_groupings
+      = note: `#[warn(clippy::unusual_byte_groupings)]` on by default
+
 warning: empty line after doc comment
     --> src/real_win32.rs:4444:1
      |
@@ -184,15 +193,6 @@ help: if the documentation should include the empty line include it in the comme
      |
 4445 | ///
      |
-
-warning: digits of hex, binary or octal literal not in groups of equal size
-     --> src/cpu.rs:28206:29
-      |
-28206 |         let start_address = 0x401d_c2;
-      |                             ^^^^^^^^^ help: consider: `0x0040_1dc2`
-      |
-      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#unusual_byte_groupings
-      = note: `#[warn(clippy::unusual_byte_groupings)]` on by default
 
 warning: duplicated attribute
   --> src/steam_input.rs:26:33
@@ -11900,16 +11900,6 @@ warning: manual checked division
     = help: consider using `checked_div`
     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_checked_ops
 
-warning: this assertion is always `true`
-    --> src/cef_bridge.rs:6206:9
-     |
-6206 |         assert!(true, "JS execution should not panic");
-     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-     |
-     = help: remove the assertion
-     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#assertions_on_constants
-     = note: `#[warn(clippy::assertions_on_constants)]` on by default
-
 warning: casting to the same type is unnecessary (`i32` -> `i32`)
     --> src/real_audio.rs:1115:25
      |
@@ -11970,15 +11960,6 @@ help: consider using an iterator
 1474 -         for ch in 0..num_channels {
 1474 +         for <item> in prev_samples.iter().take(num_channels) {
      |
-
-warning: this assertion is always `true`
-    --> src/cef_bridge.rs:6643:9
-     |
-6643 |         assert!(true, "settings were stored and shutdown succeeded");
-     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-     |
-     = help: remove the assertion
-     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#assertions_on_constants
 
 warning: the loop variable `ch` is only used to index `prev_samples`
     --> src/real_audio.rs:1477:19
@@ -13357,6 +13338,16 @@ warning: the borrowed expression implements the required traits
      |
      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#needless_borrows_for_generic_args
 
+warning: this assertion is always `true`
+    --> src/cef_bridge.rs:6206:9
+     |
+6206 |         assert!(true, "JS execution should not panic");
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: remove the assertion
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#assertions_on_constants
+     = note: `#[warn(clippy::assertions_on_constants)]` on by default
+
 warning: this `if` statement can be collapsed
     --> src/scm.rs:2918:9
      |
@@ -13377,6 +13368,15 @@ help: collapse nested if block
 2921 |                 net.rx_buffer.extend(tx_data);
 2922 ~             }
      |
+
+warning: this assertion is always `true`
+    --> src/cef_bridge.rs:6643:9
+     |
+6643 |         assert!(true, "settings were stored and shutdown succeeded");
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: remove the assertion
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#assertions_on_constants
 
 warning: this manual char comparison can be written more succinctly
    --> src/security.rs:753:16
@@ -15625,19 +15625,6 @@ help: try
 346 +         insns.sort_by_key(|b| std::cmp::Reverse(b.frequency));
     |
 
-warning: this `map_or` can be simplified
-     --> src/cpu.rs:28667:32
-      |
-28667 |             result.is_err() || result.as_ref().map_or(false, |o| o.is_none()),
-      |                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-      |
-      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#unnecessary_map_or
-help: use `is_ok_and` instead
-      |
-28667 -             result.is_err() || result.as_ref().map_or(false, |o| o.is_none()),
-28667 +             result.is_err() || result.as_ref().is_ok_and(|o| o.is_none()),
-      |
-
 warning: consider using `sort_by_key`
    --> src/telemetry.rs:454:9
     |
@@ -15767,15 +15754,6 @@ help: try adding this
 573 + }
     |
 
-warning: this assertion is always `true`
-     --> src/cpu.rs:29565:13
-      |
-29565 |             assert!(true, "SHA1MSG2 completed without error");
-      |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-      |
-      = help: remove the assertion
-      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#assertions_on_constants
-
 warning: this `if` statement can be collapsed
    --> src/threads.rs:905:13
     |
@@ -15842,16 +15820,6 @@ help: try
 1271 +             }
      |
 
-error: approximate value of `f64::consts::PI` found
-     --> src/cpu.rs:29878:30
-      |
-29878 |         state.x87.stack.push(3.14_f64);
-      |                              ^^^^^^^^
-      |
-      = help: consider using the constant directly
-      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#approx_constant
-      = note: `#[deny(clippy::approx_constant)]` on by default
-
 warning: this `if` statement can be collapsed
     --> src/threads.rs:1290:9
      |
@@ -15870,78 +15838,6 @@ help: collapse nested if block
 1292 |                 fiber.state = Some(state.clone());
 1293 ~             }
      |
-
-warning: the loop variable `i` is used to index `result`
-     --> src/cpu.rs:31240:18
-      |
-31240 |         for i in 0..16 {
-      |                  ^^^^^
-      |
-      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#needless_range_loop
-help: consider using an iterator and enumerate()
-      |
-31240 -         for i in 0..16 {
-31240 +         for (i, <item>) in result.iter().enumerate() {
-      |
-
-warning: this operation has no effect
-     --> src/cpu.rs:31627:24
-      |
-31627 |         let expected = (0x00FFu64 << 16) | 0x0000;
-      |                        ^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider reducing it to: `(0x00FFu64 << 16)`
-      |
-      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#identity_op
-
-error: approximate value of `f{32, 64}::consts::PI` found
-     --> src/cpu.rs:32760:26
-      |
-32760 |         let value: f32 = 3.14159;
-      |                          ^^^^^^^
-      |
-      = help: consider using the constant directly
-      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#approx_constant
-
-error: approximate value of `f{32, 64}::consts::E` found
-     --> src/cpu.rs:32768:26
-      |
-32768 |         let value: f64 = 2.718281828;
-      |                          ^^^^^^^^^^^
-      |
-      = help: consider using the constant directly
-      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#approx_constant
-
-warning: the borrowed expression implements the required traits
-   --> src/crash_recovery.rs:893:51
-    |
-893 |         let tmp_files: Vec<_> = std::fs::read_dir(&dir.path())
-    |                                                   ^^^^^^^^^^^ help: change this to: `dir.path()`
-    |
-    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#needless_borrows_for_generic_args
-
-warning: this operation has no effect
-   --> src/d2d.rs:974:19
-    |
-974 |         let idx = (0 * target.stride + 0 * 4) as usize;
-    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider reducing it to: `(0 * target.stride)`
-    |
-    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#identity_op
-
-error: this operation will always return zero. This is likely not the intended outcome
-   --> src/d2d.rs:974:20
-    |
-974 |         let idx = (0 * target.stride + 0 * 4) as usize;
-    |                    ^^^^^^^^^^^^^^^^^
-    |
-    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#erasing_op
-    = note: `#[deny(clippy::erasing_op)]` on by default
-
-error: this operation will always return zero. This is likely not the intended outcome
-   --> src/d2d.rs:974:40
-    |
-974 |         let idx = (0 * target.stride + 0 * 4) as usize;
-    |                                        ^^^^^
-    |
-    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#erasing_op
 
 warning: this function has too many arguments (9/7)
     --> src/user32.rs:1698:5
@@ -16727,48 +16623,37 @@ warning: deref which would be done by auto-deref
     |
     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#explicit_auto_deref
 
-error: approximate value of `f{32, 64}::consts::TAU` found
-    --> src/d3d11.rs:3687:38
-     |
-3687 |             let angle = (i as f32) * 6.2832 / (prim_count as f32);
-     |                                      ^^^^^^
-     |
-     = help: consider using the constant directly
-     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#approx_constant
+warning: this `map_or` can be simplified
+     --> src/cpu.rs:28667:32
+      |
+28667 |             result.is_err() || result.as_ref().map_or(false, |o| o.is_none()),
+      |                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+      |
+      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#unnecessary_map_or
+help: use `is_ok_and` instead
+      |
+28667 -             result.is_err() || result.as_ref().map_or(false, |o| o.is_none()),
+28667 +             result.is_err() || result.as_ref().is_ok_and(|o| o.is_none()),
+      |
 
-warning: this `repeat().take()` can be written more concisely
-   --> src/denuvo.rs:945:27
-    |
-945 |             padded.extend(std::iter::repeat(pad_len as u8).take(pad_len));
-    |                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using `repeat_n()` instead: `std::iter::repeat_n(pad_len as u8, pad_len)`
-    |
-    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_repeat_n
-    = note: `#[warn(clippy::manual_repeat_n)]` on by default
+warning: this assertion is always `true`
+     --> src/cpu.rs:29565:13
+      |
+29565 |             assert!(true, "SHA1MSG2 completed without error");
+      |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+      |
+      = help: remove the assertion
+      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#assertions_on_constants
 
-warning: manual `RangeInclusive::contains` implementation
-    --> src/denuvo.rs:1006:17
-     |
-1006 |         assert!(delta >= 1000 && delta <= 10000, "delta was {delta}");
-     |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: use: `(1000..=10000).contains(&delta)`
-     |
-     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_range_contains
-     = note: `#[warn(clippy::manual_range_contains)]` on by default
-
-warning: this `repeat().take()` can be written more concisely
-    --> src/denuvo.rs:1093:23
-     |
-1093 |         padded.extend(std::iter::repeat(pad_len as u8).take(pad_len));
-     |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using `repeat_n()` instead: `std::iter::repeat_n(pad_len as u8, pad_len)`
-     |
-     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_repeat_n
-
-warning: this `repeat().take()` can be written more concisely
-    --> src/denuvo.rs:1173:23
-     |
-1173 |         padded.extend(std::iter::repeat(pad_len as u8).take(pad_len));
-     |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using `repeat_n()` instead: `std::iter::repeat_n(pad_len as u8, pad_len)`
-     |
-     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_repeat_n
+error: approximate value of `f64::consts::PI` found
+     --> src/cpu.rs:29878:30
+      |
+29878 |         state.x87.stack.push(3.14_f64);
+      |                              ^^^^^^^^
+      |
+      = help: consider using the constant directly
+      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#approx_constant
+      = note: `#[deny(clippy::approx_constant)]` on by default
 
 warning: this `if` statement can be collapsed
     --> src/vkgl.rs:1174:5
@@ -16811,6 +16696,19 @@ help: try adding this
 1203 +     }
 1204 + }
      |
+
+warning: the loop variable `i` is used to index `result`
+     --> src/cpu.rs:31240:18
+      |
+31240 |         for i in 0..16 {
+      |                  ^^^^^
+      |
+      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#needless_range_loop
+help: consider using an iterator and enumerate()
+      |
+31240 -         for i in 0..16 {
+31240 +         for (i, <item>) in result.iter().enumerate() {
+      |
 
 warning: you should consider adding a `Default` implementation for `SpirvTranslator`
     --> src/vkgl.rs:1477:5
@@ -16864,6 +16762,14 @@ help: collapse nested if block
 1613 ~                                 }
      |
 
+warning: this operation has no effect
+     --> src/cpu.rs:31627:24
+      |
+31627 |         let expected = (0x00FFu64 << 16) | 0x0000;
+      |                        ^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider reducing it to: `(0x00FFu64 << 16)`
+      |
+      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#identity_op
+
 warning: casting to the same type is unnecessary (`u32` -> `u32`)
     --> src/vkgl.rs:1946:50
      |
@@ -16913,6 +16819,24 @@ help: collapse nested if block
 2244 |                                 ));
 2245 ~                             }
      |
+
+error: approximate value of `f{32, 64}::consts::PI` found
+     --> src/cpu.rs:32760:26
+      |
+32760 |         let value: f32 = 3.14159;
+      |                          ^^^^^^^
+      |
+      = help: consider using the constant directly
+      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#approx_constant
+
+error: approximate value of `f{32, 64}::consts::E` found
+     --> src/cpu.rs:32768:26
+      |
+32768 |         let value: f64 = 2.718281828;
+      |                          ^^^^^^^^^^^
+      |
+      = help: consider using the constant directly
+      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#approx_constant
 
 warning: you should consider adding a `Default` implementation for `VulkanState`
     --> src/vkgl.rs:2456:5
@@ -17174,20 +17098,6 @@ help: replace the manual implementation with a derive attribute
 4101 | pub struct GLFramebufferState {
      |
 
-error: this boolean expression contains a logic bug
-    --> src/dwrite.rs:1398:17
-     |
-1398 |         assert!(!factory.font_collection.families.is_empty() || true);
-     |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: it would look like the following: `true`
-     |
-help: this expression can be optimized out by applying boolean operations to the outer expression
-    --> src/dwrite.rs:1398:18
-     |
-1398 |         assert!(!factory.font_collection.families.is_empty() || true);
-     |                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#overly_complex_bool_expr
-     = note: `#[deny(clippy::overly_complex_bool_expr)]` on by default
-
 warning: you should consider adding a `Default` implementation for `GLState`
     --> src/vkgl.rs:4174:5
      |
@@ -17208,6 +17118,14 @@ help: try adding this
 4175 +     }
 4176 + }
      |
+
+warning: the borrowed expression implements the required traits
+   --> src/crash_recovery.rs:893:51
+    |
+893 |         let tmp_files: Vec<_> = std::fs::read_dir(&dir.path())
+    |                                                   ^^^^^^^^^^^ help: change this to: `dir.path()`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#needless_borrows_for_generic_args
 
 warning: you should consider adding a `Default` implementation for `ThreadSafeVulkanState`
     --> src/vkgl.rs:4884:5
@@ -17311,6 +17229,31 @@ help: collapse nested if block
 5636 |                     };
 5637 ~                 }
      |
+
+warning: this operation has no effect
+   --> src/d2d.rs:974:19
+    |
+974 |         let idx = (0 * target.stride + 0 * 4) as usize;
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider reducing it to: `(0 * target.stride)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#identity_op
+
+error: this operation will always return zero. This is likely not the intended outcome
+   --> src/d2d.rs:974:20
+    |
+974 |         let idx = (0 * target.stride + 0 * 4) as usize;
+    |                    ^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#erasing_op
+    = note: `#[deny(clippy::erasing_op)]` on by default
+
+error: this operation will always return zero. This is likely not the intended outcome
+   --> src/d2d.rs:974:40
+    |
+974 |         let idx = (0 * target.stride + 0 * 4) as usize;
+    |                                        ^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#erasing_op
 
 warning: this `if` statement can be collapsed
    --> src/webview2.rs:307:9
@@ -17420,22 +17363,6 @@ help: try adding this
 566 +     }
 567 + }
     |
-
-warning: this operation has no effect
-    --> src/gdiplus_render.rs:1555:24
-     |
-1555 |             let idx = (1 * stride + 1 * 4) as usize;
-     |                        ^^^^^^^^^^ help: consider reducing it to: `stride`
-     |
-     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#identity_op
-
-warning: this operation has no effect
-    --> src/gdiplus_render.rs:1555:37
-     |
-1555 |             let idx = (1 * stride + 1 * 4) as usize;
-     |                                     ^^^^^ help: consider reducing it to: `4`
-     |
-     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#identity_op
 
 warning: casting raw pointers to the same type and constness is unnecessary (`*mut objc::runtime::Object` -> `*mut objc::runtime::Object`)
     --> src/webview2.rs:1240:42
@@ -17912,6 +17839,15 @@ help: collapse nested if block
 4217 |             return true; // correct: "foo.*" matches "foo" without extension
 4218 ~         }
      |
+
+error: approximate value of `f{32, 64}::consts::TAU` found
+    --> src/d3d11.rs:3687:38
+     |
+3687 |             let angle = (i as f32) * 6.2832 / (prim_count as f32);
+     |                                      ^^^^^^
+     |
+     = help: consider using the constant directly
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#approx_constant
 
 warning: you should consider adding a `Default` implementation for `WinHttpStack`
    --> src/winhttp.rs:513:5
@@ -18985,6 +18921,40 @@ help: collapse nested if block
 4460 ~         }
      |
 
+warning: this `repeat().take()` can be written more concisely
+   --> src/denuvo.rs:945:27
+    |
+945 |             padded.extend(std::iter::repeat(pad_len as u8).take(pad_len));
+    |                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using `repeat_n()` instead: `std::iter::repeat_n(pad_len as u8, pad_len)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_repeat_n
+    = note: `#[warn(clippy::manual_repeat_n)]` on by default
+
+warning: manual `RangeInclusive::contains` implementation
+    --> src/denuvo.rs:1006:17
+     |
+1006 |         assert!(delta >= 1000 && delta <= 10000, "delta was {delta}");
+     |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: use: `(1000..=10000).contains(&delta)`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_range_contains
+     = note: `#[warn(clippy::manual_range_contains)]` on by default
+
+warning: this `repeat().take()` can be written more concisely
+    --> src/denuvo.rs:1093:23
+     |
+1093 |         padded.extend(std::iter::repeat(pad_len as u8).take(pad_len));
+     |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using `repeat_n()` instead: `std::iter::repeat_n(pad_len as u8, pad_len)`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_repeat_n
+
+warning: this `repeat().take()` can be written more concisely
+    --> src/denuvo.rs:1173:23
+     |
+1173 |         padded.extend(std::iter::repeat(pad_len as u8).take(pad_len));
+     |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using `repeat_n()` instead: `std::iter::repeat_n(pad_len as u8, pad_len)`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_repeat_n
+
 warning: this `if` statement can be collapsed
    --> src/wininet.rs:315:17
     |
@@ -19413,51 +19383,6 @@ help: replace the manual implementation with a derive attribute and mark the def
 348 ~     Null,
     |
 
-warning: called `iter().copied().collect()` on a slice to create a `Vec`. Calling `to_vec()` is both faster and more readable
-   --> src/host_thunks.rs:561:65
-    |
-561 |           let data: Vec<u8> = [0x48, 0x00, 0x69, 0x00, 0x00, 0x00]
-    |  _________________________________________________________________^
-562 | |             .iter()
-563 | |             .copied()
-564 | |             .collect();
-    | |______________________^ help: try: `.to_vec()`
-    |
-    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#iter_cloned_collect
-    = note: `#[warn(clippy::iter_cloned_collect)]` on by default
-
-warning: called `iter().copied().collect()` on a slice to create a `Vec`. Calling `to_vec()` is both faster and more readable
-   --> src/host_thunks.rs:574:77
-    |
-574 |           let data: Vec<u8> = [0x41, 0x00, 0x42, 0x00, 0x43, 0x00, 0x44, 0x00]
-    |  _____________________________________________________________________________^
-575 | |             .iter()
-576 | |             .copied()
-577 | |             .collect();
-    | |______________________^ help: try: `.to_vec()`
-    |
-    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#iter_cloned_collect
-
-warning: called `iter().copied().collect()` on a slice to create a `Vec`. Calling `to_vec()` is both faster and more readable
-   --> src/host_thunks.rs:587:53
-    |
-587 |         let data: Vec<u8> = [0x00, 0xD8, 0x00, 0x00].iter().copied().collect();
-    |                                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^ help: try: `.to_vec()`
-    |
-    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#iter_cloned_collect
-
-warning: called `iter().copied().collect()` on a slice to create a `Vec`. Calling `to_vec()` is both faster and more readable
-   --> src/host_thunks.rs:601:65
-    |
-601 |           let data: Vec<u8> = [0x00, 0xD8, 0x01, 0xD8, 0x00, 0x00]
-    |  _________________________________________________________________^
-602 | |             .iter()
-603 | |             .copied()
-604 | |             .collect();
-    | |______________________^ help: try: `.to_vec()`
-    |
-    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#iter_cloned_collect
-
 warning: casting to the same type is unnecessary (`u64` -> `u64`)
    --> src/wmi.rs:588:44
     |
@@ -19465,18 +19390,6 @@ warning: casting to the same type is unnecessary (`u64` -> `u64`)
     |                                            ^^^^^^^^^^^^^^^^^^^ help: try: `total_ram_kb`
     |
     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#unnecessary_cast
-
-warning: called `iter().copied().collect()` on a slice to create a `Vec`. Calling `to_vec()` is both faster and more readable
-   --> src/host_thunks.rs:618:89
-    |
-618 |           let data: Vec<u8> = [0x41, 0x00, 0x42, 0x00, 0x43, 0x00, 0x44, 0x00, 0x45, 0x00]
-    |  _________________________________________________________________________________________^
-619 | |             .iter()
-620 | |             .copied()
-621 | |             .collect();
-    | |______________________^ help: try: `.to_vec()`
-    |
-    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#iter_cloned_collect
 
 warning: casting to the same type is unnecessary (`u64` -> `u64`)
    --> src/wmi.rs:589:40
@@ -19528,18 +19441,6 @@ warning: manually constructing a nul-terminated string
     |                                                   ^^^^^^^^^^^^^^^^^ help: use a `c""` literal: `c"IOAccelerator"`
     |
     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_c_str_literals
-
-warning: called `iter().copied().collect()` on a slice to create a `Vec`. Calling `to_vec()` is both faster and more readable
-   --> src/host_thunks.rs:673:65
-    |
-673 |           let data: Vec<u8> = [0x41, 0x00, 0x42, 0x00, 0xFF, 0xFF]
-    |  _________________________________________________________________^
-674 | |             .iter()
-675 | |             .copied()
-676 | |             .collect();
-    | |______________________^ help: try: `.to_vec()`
-    |
-    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#iter_cloned_collect
 
 warning: manually constructing a nul-terminated string
    --> src/wmi.rs:732:17
@@ -19603,14 +19504,6 @@ help: collapse nested if block
 1113 |                         return Some(obj);
 1114 ~                     }
      |
-
-warning: manually reimplementing `div_ceil`
-   --> src/icon.rs:451:24
-    |
-451 |         let row_size = ((width * bpp as u32 + 31) / 32) * 4;
-    |                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using `.div_ceil()`: `(width * bpp as u32).div_ceil(32)`
-    |
-    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_div_ceil
 
 warning: this `if` statement can be collapsed
     --> src/wmi.rs:1533:13
@@ -19699,20 +19592,6 @@ help: collapse nested if block
 1560 |                         });
 1561 ~                     }
      |
-
-warning: needlessly taken reference of both operands
-   --> src/icon.rs:472:17
-    |
-472 |         assert!(&png[0..8] == &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
-    |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    |
-    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#op_ref
-    = note: `#[warn(clippy::op_ref)]` on by default
-help: use the values directly
-    |
-472 -         assert!(&png[0..8] == &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
-472 +         assert!(png[0..8] == [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
-    |
 
 warning: this function has too many arguments (8/7)
     --> src/wmi.rs:1712:5
@@ -19904,6 +19783,136 @@ help: collapse nested if block
 550 ~         }
     |
 
+error: this boolean expression contains a logic bug
+    --> src/dwrite.rs:1398:17
+     |
+1398 |         assert!(!factory.font_collection.families.is_empty() || true);
+     |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: it would look like the following: `true`
+     |
+help: this expression can be optimized out by applying boolean operations to the outer expression
+    --> src/dwrite.rs:1398:18
+     |
+1398 |         assert!(!factory.font_collection.families.is_empty() || true);
+     |                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#overly_complex_bool_expr
+     = note: `#[deny(clippy::overly_complex_bool_expr)]` on by default
+
+warning: useless use of `vec!`
+     --> src/pe_runtime.rs:77106:31
+      |
+77106 |     memory.map_bytes(address, &vec![0; TIME_ZONE_INFORMATION_SIZE]);
+      |                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: you can use a slice directly: `&[0; TIME_ZONE_INFORMATION_SIZE]`
+      |
+      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#useless_vec
+      = note: `#[warn(clippy::useless_vec)]` on by default
+
+warning: this operation has no effect
+    --> src/gdiplus_render.rs:1555:24
+     |
+1555 |             let idx = (1 * stride + 1 * 4) as usize;
+     |                        ^^^^^^^^^^ help: consider reducing it to: `stride`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#identity_op
+
+warning: this operation has no effect
+    --> src/gdiplus_render.rs:1555:37
+     |
+1555 |             let idx = (1 * stride + 1 * 4) as usize;
+     |                                     ^^^^^ help: consider reducing it to: `4`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#identity_op
+
+warning: called `iter().copied().collect()` on a slice to create a `Vec`. Calling `to_vec()` is both faster and more readable
+   --> src/host_thunks.rs:561:65
+    |
+561 |           let data: Vec<u8> = [0x48, 0x00, 0x69, 0x00, 0x00, 0x00]
+    |  _________________________________________________________________^
+562 | |             .iter()
+563 | |             .copied()
+564 | |             .collect();
+    | |______________________^ help: try: `.to_vec()`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#iter_cloned_collect
+    = note: `#[warn(clippy::iter_cloned_collect)]` on by default
+
+warning: called `iter().copied().collect()` on a slice to create a `Vec`. Calling `to_vec()` is both faster and more readable
+   --> src/host_thunks.rs:574:77
+    |
+574 |           let data: Vec<u8> = [0x41, 0x00, 0x42, 0x00, 0x43, 0x00, 0x44, 0x00]
+    |  _____________________________________________________________________________^
+575 | |             .iter()
+576 | |             .copied()
+577 | |             .collect();
+    | |______________________^ help: try: `.to_vec()`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#iter_cloned_collect
+
+warning: called `iter().copied().collect()` on a slice to create a `Vec`. Calling `to_vec()` is both faster and more readable
+   --> src/host_thunks.rs:587:53
+    |
+587 |         let data: Vec<u8> = [0x00, 0xD8, 0x00, 0x00].iter().copied().collect();
+    |                                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^ help: try: `.to_vec()`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#iter_cloned_collect
+
+warning: called `iter().copied().collect()` on a slice to create a `Vec`. Calling `to_vec()` is both faster and more readable
+   --> src/host_thunks.rs:601:65
+    |
+601 |           let data: Vec<u8> = [0x00, 0xD8, 0x01, 0xD8, 0x00, 0x00]
+    |  _________________________________________________________________^
+602 | |             .iter()
+603 | |             .copied()
+604 | |             .collect();
+    | |______________________^ help: try: `.to_vec()`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#iter_cloned_collect
+
+warning: called `iter().copied().collect()` on a slice to create a `Vec`. Calling `to_vec()` is both faster and more readable
+   --> src/host_thunks.rs:618:89
+    |
+618 |           let data: Vec<u8> = [0x41, 0x00, 0x42, 0x00, 0x43, 0x00, 0x44, 0x00, 0x45, 0x00]
+    |  _________________________________________________________________________________________^
+619 | |             .iter()
+620 | |             .copied()
+621 | |             .collect();
+    | |______________________^ help: try: `.to_vec()`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#iter_cloned_collect
+
+warning: called `iter().copied().collect()` on a slice to create a `Vec`. Calling `to_vec()` is both faster and more readable
+   --> src/host_thunks.rs:673:65
+    |
+673 |           let data: Vec<u8> = [0x41, 0x00, 0x42, 0x00, 0xFF, 0xFF]
+    |  _________________________________________________________________^
+674 | |             .iter()
+675 | |             .copied()
+676 | |             .collect();
+    | |______________________^ help: try: `.to_vec()`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#iter_cloned_collect
+
+warning: manually reimplementing `div_ceil`
+   --> src/icon.rs:451:24
+    |
+451 |         let row_size = ((width * bpp as u32 + 31) / 32) * 4;
+    |                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using `.div_ceil()`: `(width * bpp as u32).div_ceil(32)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_div_ceil
+
+warning: needlessly taken reference of both operands
+   --> src/icon.rs:472:17
+    |
+472 |         assert!(&png[0..8] == &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+    |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#op_ref
+    = note: `#[warn(clippy::op_ref)]` on by default
+help: use the values directly
+    |
+472 -         assert!(&png[0..8] == &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+472 +         assert!(png[0..8] == [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+    |
+
 warning: unnecessary use of `to_string`
     --> src/import_coverage.rs:2396:38
      |
@@ -19960,15 +19969,6 @@ warning: unnecessary use of `to_string`
      |                                      ^^^^^^^^^^^^^^^^^^^^^^^^^^ help: replace it with: `"crypt32.dll"`
      |
      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#unnecessary_to_owned
-
-warning: useless use of `vec!`
-     --> src/pe_runtime.rs:77106:31
-      |
-77106 |     memory.map_bytes(address, &vec![0; TIME_ZONE_INFORMATION_SIZE]);
-      |                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: you can use a slice directly: `&[0; TIME_ZONE_INFORMATION_SIZE]`
-      |
-      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#useless_vec
-      = note: `#[warn(clippy::useless_vec)]` on by default
 
 warning: length comparison to zero
     --> src/jit.rs:6457:17
@@ -20030,6 +20030,9 @@ warning: manual creation of a dangling pointer
      |
      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_dangling_ptr
 
+warning: `casa1` (lib) generated 1241 warnings
+error: could not compile `casa1` (lib) due to 19 previous errors; 1241 warnings emitted
+warning: build failed, waiting for other jobs to finish...
 warning: you seem to be trying to use `match` for destructuring a single pattern. Consider using `if let`
     --> src/network.rs:4135:9
      |
@@ -20041,9 +20044,6 @@ warning: you seem to be trying to use `match` for destructuring a single pattern
      |
      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#single_match
 
-warning: `casa1` (lib) generated 1241 warnings
-error: could not compile `casa1` (lib) due to 19 previous errors; 1241 warnings emitted
-warning: build failed, waiting for other jobs to finish...
 warning: manual `RangeInclusive::contains` implementation
      --> src/pe_runtime.rs:34963:40
       |

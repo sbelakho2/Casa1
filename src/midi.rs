@@ -84,6 +84,10 @@ pub struct MidiSynthesizer {
     /// General MIDI instrument waveforms (harmonic content per instrument).
     /// Each instrument is defined as a set of harmonic amplitudes.
     instrument_waveforms: Vec<Vec<f64>>,
+    /// Reused output buffers so `generate_samples` does not allocate on
+    /// every audio callback pass (real-time path).
+    scratch_left: Vec<f32>,
+    scratch_right: Vec<f32>,
 }
 
 impl MidiSynthesizer {
@@ -95,6 +99,8 @@ impl MidiSynthesizer {
             sample_rate,
             master_volume: 0.5,
             instrument_waveforms,
+            scratch_left: Vec::new(),
+            scratch_right: Vec::new(),
         }
     }
 
@@ -277,8 +283,15 @@ impl MidiSynthesizer {
     /// Generate audio samples (interleaved stereo float32).
     /// Returns `(left_samples, right_samples)`.
     pub fn generate_samples(&mut self, num_samples: usize) -> (Vec<f32>, Vec<f32>) {
-        let mut left = vec![0.0f32; num_samples];
-        let mut right = vec![0.0f32; num_samples];
+        // Reuse preallocated buffers to keep the real-time path free of
+        // per-call allocations.
+        self.scratch_left.resize(num_samples, 0.0);
+        self.scratch_right.resize(num_samples, 0.0);
+        let left = &mut self.scratch_left;
+        let right = &mut self.scratch_right;
+        for sample in left.iter_mut().chain(right.iter_mut()) {
+            *sample = 0.0;
+        }
 
         // Per-note synthesis state is advanced incrementally: each note
         // keeps per-harmonic phase accumulators and an envelope value, so
@@ -330,7 +343,7 @@ impl MidiSynthesizer {
             }
         }
 
-        (left, right)
+        (left.clone(), right.clone())
     }
 
     /// Reset all channels (all notes off, reset controllers).
