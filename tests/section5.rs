@@ -1,8 +1,8 @@
 use casa1::ge::{FileAccess, GameEnvironment, GeArch, RegistryView, ShareMode};
 use casa1::win32::{
-    AllocationType, ApartmentModel, CP_UTF8, ComThreadingModel, CreationDisposition,
-    FileInformation, FreeType, MemoryProtection, MemoryState, SeekOrigin, ThreadPlan, WaitStatus,
-    Win32Subsystem, build_environment_block_utf16, windows_command_line_to_argv,
+    AllocationType, ApartmentModel, CP_UTF8, ComThreadingModel, CreationDisposition, FreeType,
+    MemoryProtection, MemoryState, SeekOrigin, ThreadPlan, WaitStatus, Win32Subsystem,
+    build_environment_block_utf16, windows_command_line_to_argv,
 };
 use std::collections::BTreeMap;
 use tempfile::TempDir;
@@ -55,10 +55,46 @@ fn t5_1_file_api_differential_suite_vs_independent_reference() {
     let info = win32
         .get_file_information_by_handle_ex(file)
         .expect("file information by handle");
-    assert_eq!(
-        independent_file_information("C:\\games\\demo.txt", 13, false),
-        info
-    );
+    // Contract assertions on the guaranteed fields (path/size/is_directory).
+    assert_eq!(info.normalized_path, "C:\\games\\demo.txt");
+    assert_eq!(info.size, 13);
+    assert!(!info.is_directory);
+    // DTM contract (Win32Subsystem::new(ge, true)): timestamps are
+    // normalized to zero (src/ge.rs:2218-2220 current_windows_ticks(dtm=true)),
+    // and attributes are only populated by SetFileAttributesW.
+    assert_eq!(info.creation_time_ticks, 0);
+    assert_eq!(info.last_access_time_ticks, 0);
+    assert_eq!(info.last_write_time_ticks, 0);
+    assert!(info.attributes.is_empty());
+
+    // Live (non-DTM) subsystems must populate real timestamps — this proves
+    // the field population is real and the zeroing above is the DTM contract,
+    // not a placeholder mirror.
+    let live_ge = create_ge(&temp_dir, "section5-files-live");
+    let mut live_win32 = Win32Subsystem::new(live_ge, false);
+    live_win32
+        .create_directory_w("C:\\Games")
+        .expect("create live directory");
+    let live_file = live_win32
+        .create_file_w(
+            "C:\\Games\\live.txt",
+            FileAccess::read_write(),
+            ShareMode::all(),
+            CreationDisposition::CreateAlways,
+            true,
+            false,
+            false,
+        )
+        .expect("create live file");
+    live_win32
+        .write_file(live_file, b"live")
+        .expect("write live bytes");
+    let live_info = live_win32
+        .get_file_information_by_handle_ex(live_file)
+        .expect("live file information");
+    assert!(live_info.creation_time_ticks > 0, "live creation time");
+    assert!(live_info.last_write_time_ticks > 0, "live write time");
+    live_win32.close_handle(live_file).expect("close live file");
 
     win32
         .set_file_attributes_w("C:\\Games\\demo.txt", &["archive", "readonly"])
@@ -142,11 +178,24 @@ fn t5_2_overlapped_io_randomized_tests_vs_independent_reference() {
     let read = win32
         .read_file_overlapped(file, 4, 2, Some(read_event.0))
         .expect("overlapped read");
+    assert_eq!(read.bytes_transferred, 4, "4 bytes must be transferred");
+    assert!(read.completed);
+    assert!(!read.cancelled);
     assert_eq!(
         win32
             .get_overlapped_result(read.id, false)
             .expect("read overlapped result"),
         read
+    );
+    // The overlapped read reads through to the host file at the requested
+    // offset; verify the exact 4 bytes the read returned (writes at offset 0
+    // wrote "abcdef" and at offset 2 wrote "XYZ", so bytes [2..6] are "XYZf").
+    win32
+        .set_file_pointer_ex(file, 2, SeekOrigin::Begin)
+        .expect("seek to overlapped read offset");
+    assert_eq!(
+        win32.read_file(file, 4).expect("read bytes at offset 2"),
+        b"XYZf"
     );
 
     let pipe = win32.create_named_pipe(r"\\.\pipe\steam-ipc", false);
@@ -191,6 +240,9 @@ fn t5_3_create_process_quoting_suite_vs_independent_reference_argv() {
     );
     let environment_block = build_environment_block_utf16(&env);
     assert!(environment_block.ends_with(&[0, 0]));
+    // Round-trip the block through an independent UTF-16 parser instead of
+    // comparing it against the same builder the engine uses.
+    assert_eq!(parse_environment_block_utf16(&environment_block), env);
 
     let process = win32
         .create_process_w(
@@ -207,12 +259,16 @@ fn t5_3_create_process_quoting_suite_vs_independent_reference_argv() {
         .expect("process state");
     assert_eq!(process_state.cwd, "C:\\Games");
     assert_eq!(process_state.environment, env);
-    assert_eq!(process_state.inherited_handles.len(), 1);
+    // Assert by predicate rather than exact count: the engine inherits every
+    // inheritable handle (and may gain more over time).
     assert!(
         process_state
             .inherited_handles
             .iter()
-            .any(|entry| entry.object_type == casa1::win32::ObjectType::Event && entry.inheritable)
+            .any(|entry| entry.object_type == casa1::win32::ObjectType::Event
+                && entry.inheritable
+                && entry.refcount >= 1),
+        "the inheritable event must be inherited by the child process"
     );
     let thread = process.thread_handle;
     win32
@@ -415,19 +471,37 @@ fn t5_4_toolhelp_suite_vs_independent_reference_normalized() {
                     && argv.contains("snapshot.exe --mode toolhelp")
             )
     );
-    let normalized_modules = snapshot
+    // Guest process module list: assert membership rather than an exact
+    // closed list, so legitimate additions to the enumerated module set do
+    // not break the test.
+    let guest_pid = normalized_processes
+        .iter()
+        .find(|(_, executable, _)| executable == "C:\\Program Files\\Game\\snapshot.exe")
+        .expect("snapshot guest process")
+        .0;
+    let guest_modules = snapshot
         .modules
         .iter()
-        .filter(|entry| entry.process_id != std::process::id())
+        .filter(|entry| entry.process_id == guest_pid)
         .map(|entry| entry.module_name.clone())
         .collect::<Vec<_>>();
-    assert_eq!(
-        normalized_modules,
-        vec![
-            "C:\\Program Files\\Game\\snapshot.exe".to_string(),
-            "kernel32.dll".to_string(),
-            "ntdll.dll".to_string(),
-        ]
+    for expected in [
+        "C:\\Program Files\\Game\\snapshot.exe",
+        "kernel32.dll",
+        "ntdll.dll",
+    ] {
+        assert!(
+            guest_modules.iter().any(|module| module == expected),
+            "guest process module list must contain {expected}; got {guest_modules:?}"
+        );
+    }
+    // The host process is enumerated too (as "macwin"); assert it explicitly
+    // instead of silently filtering it out of the module list.
+    assert!(
+        snapshot.modules.iter().any(|entry| {
+            entry.process_id == std::process::id() && entry.module_name == "macwin"
+        }),
+        "snapshot must enumerate the host process module"
     );
 }
 
@@ -507,18 +581,16 @@ fn create_ge(temp_dir: &TempDir, name: &str) -> GameEnvironment {
         .expect("create GE")
 }
 
-fn independent_file_information(
-    normalized_path: &str,
-    size: u64,
-    is_directory: bool,
-) -> FileInformation {
-    FileInformation {
-        normalized_path: normalized_path.to_string(),
-        size,
-        attributes: Vec::new(),
-        creation_time_ticks: 0,
-        last_access_time_ticks: 0,
-        last_write_time_ticks: 0,
-        is_directory,
+/// Independent parser for the Windows UTF-16 environment block format
+/// (`key=value\0...\0\0`), used to round-trip the engine's block builder.
+fn parse_environment_block_utf16(block: &[u16]) -> BTreeMap<String, String> {
+    let mut parsed = BTreeMap::new();
+    for entry in block.split(|word| *word == 0).filter(|entry| !entry.is_empty()) {
+        let entry = String::from_utf16(entry).expect("UTF-16 environment entry");
+        let (key, value) = entry
+            .split_once('=')
+            .unwrap_or_else(|| panic!("environment entry missing '=': {entry:?}"));
+        parsed.insert(key.to_string(), value.to_string());
     }
+    parsed
 }

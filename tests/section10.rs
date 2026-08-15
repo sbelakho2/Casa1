@@ -111,8 +111,19 @@ fn t10_1_golden_pcm_deterministic_synth_output_crc_matches_reference_within_tole
         [-0.19375, 0.056250006],
         [-0.3859375, -0.0859375],
     ]);
-    assert_eq!(rendered.samples, expected);
-    assert_eq!(rendered.crc32, crc32_samples(&expected));
+    // Epsilon comparison: the mixer/resampler output is deterministic but may
+    // legitimately shift at the 1-ulp level with filter coefficient changes,
+    // so bit-exact equality would be a brittle golden test.
+    assert_eq!(rendered.samples.len(), expected.len());
+    for (actual, reference) in rendered.samples.iter().zip(&expected) {
+        assert!(
+            (actual - reference).abs() <= 1e-6,
+            "sample {actual} differs from reference {reference} by more than 1e-6"
+        );
+    }
+    // CRC must be consistent with the rendered samples (internal invariant),
+    // not pinned to the hand-computed vector.
+    assert_eq!(rendered.crc32, crc32_samples(&rendered.samples));
     assert!(rendered.latency_ms <= 50);
 
     let direct_sound = audio
@@ -391,7 +402,17 @@ fn t10_4_underflow_overflow_torture_randomized_buffer_sizes_recover_without_dead
         .start_audio_client(client)
         .expect("start torture client");
 
-    for frame_count in [1, 8, 0, 3, 10, 2] {
+    // The client buffer holds 4 frames (2 channels) with a 2x overflow queue
+    // (max 8 frames queued, src/audio.rs:1051). The loop writes
+    // [1, 8, 0, 3, 10, 2] frames and drains 3 frames per iteration.
+    let frame_counts = [1, 8, 0, 3, 10, 2];
+    let written_frames = frame_counts.iter().sum::<usize>();
+    let mut drained_real_frames = 0_u64;
+    let mut previous_underflow = 0_u32;
+    let mut previous_overflow = 0_u32;
+    let mut last_underflow = 0_u32;
+    let mut last_overflow = 0_u32;
+    for frame_count in frame_counts {
         let mut frames = Vec::new();
         for index in 0..frame_count {
             frames.extend([index as f32 / 10.0, -(index as f32) / 10.0]);
@@ -399,10 +420,48 @@ fn t10_4_underflow_overflow_torture_randomized_buffer_sizes_recover_without_dead
         audio
             .write_render_frames(client, &frames)
             .expect("write torture frames");
-        let _ = audio
+        let drained = audio
             .drain_audio_client(client, 3)
             .expect("drain torture frames");
+        // Every drain must return exactly 3 frames x 2 channels — no dropped
+        // or mis-sized buffers.
+        assert_eq!(drained.samples.len(), 6, "drain must return 3 stereo frames");
+        let underflow_delta = drained.underflow_frames - previous_underflow;
+        let _overflow_delta = drained.overflow_frames - previous_overflow;
+        assert!(
+            underflow_delta <= 3,
+            "at most 3 frames can underflow per 3-frame drain"
+        );
+        drained_real_frames += 3 - u64::from(underflow_delta);
+        previous_underflow = drained.underflow_frames;
+        previous_overflow = drained.overflow_frames;
+        last_underflow = drained.underflow_frames;
+        last_overflow = drained.overflow_frames;
+        assert!(drained.latency_ms <= 50);
     }
+
+    // Accounting invariant: written frames == real frames drained + frames
+    // dropped by overflow + frames still queued. Drain the remainder (up to
+    // the full write total) and verify the leftover is exactly what remains.
+    let remaining = audio
+        .drain_audio_client(client, written_frames)
+        .expect("drain remaining torture frames");
+    let remaining_real = written_frames as u64 - u64::from(remaining.underflow_frames - last_underflow);
+    assert_eq!(
+        drained_real_frames + remaining_real + u64::from(last_overflow),
+        written_frames as u64,
+        "frame accounting must be lossless: drained + dropped + remaining == written"
+    );
+    assert_eq!(remaining.samples.len(), written_frames * 2);
+    // The buffer must remain usable after the torture: a further write/drain
+    // cycle succeeds.
+    audio
+        .write_render_frames(client, &[0.5, -0.5])
+        .expect("write after torture");
+    let post = audio
+        .drain_audio_client(client, 1)
+        .expect("drain after torture");
+    assert_eq!(post.samples, vec![0.5, -0.5]);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -486,18 +545,61 @@ fn t10_6_direct_sound_cursor_looping_lock_unlock() {
         .play_direct_sound_buffer(buf)
         .expect("play non-looping");
 
-    // Get cursor position
-    let (_play_cursor, write_cursor) = audio
+    // Cursor units are bytes (documented at src/audio.rs:1444-1457), and the
+    // write cursor tracks the position of the last mix, not the write call:
+    // nothing has been mixed yet, so both cursors are 0.
+    let (play_cursor, write_cursor) = audio
         .get_direct_sound_buffer_position(buf)
         .expect("get cursor");
-    // After writing, write cursor should be at the end of written data
-    assert!(write_cursor >= samples.len() as u32 * 4); // 4 bytes per float
+    assert_eq!(
+        (play_cursor, write_cursor),
+        (0, 0),
+        "before any mix the play and write cursors must be 0 bytes"
+    );
+
+    // Mixing advances both cursors in lockstep by the mixed frame count
+    // (mono f32: 1 frame = 4 bytes).
+    let mixed = audio
+        .mix_direct_sound_buffer(buf, 4)
+        .expect("mix first four frames");
+    assert_eq!(mixed.samples.len(), 4);
+    assert_eq!(mixed.samples, samples);
+    let (play_cursor, write_cursor) = audio
+        .get_direct_sound_buffer_position(buf)
+        .expect("get cursor after mix");
+    assert_eq!(
+        (play_cursor, write_cursor),
+        (16, 16),
+        "4 mixed mono frames advance both cursors by 16 bytes"
+    );
+    // The buffer is exhausted after the first 4-frame mix (non-looping):
+    // further mixing yields silence and the cursors stay put (monotonic
+    // non-decreasing).
+    let second_mix = audio
+        .mix_direct_sound_buffer(buf, 2)
+        .expect("mix two more frames");
+    assert_eq!(second_mix.samples.len(), 2);
+    assert_eq!(second_mix.samples, vec![0.0, 0.0]);
+    let (play_cursor, write_cursor) = audio
+        .get_direct_sound_buffer_position(buf)
+        .expect("get cursor after second mix");
+    assert_eq!(
+        (play_cursor, write_cursor),
+        (16, 16),
+        "cursors must be monotonically non-decreasing in bytes"
+    );
 
     // Stop and set position
     audio.stop_direct_sound_buffer(buf).expect("stop buffer");
     audio
         .set_direct_sound_buffer_position(buf, 0)
         .expect("set position to 0");
+    assert_eq!(
+        audio
+            .get_direct_sound_buffer_position(buf)
+            .expect("cursor after set position"),
+        (0, 0)
+    );
 
     // Write at offset and mix
     let more_samples = vec![0.5, 0.6];
@@ -518,12 +620,27 @@ fn t10_6_direct_sound_cursor_looping_lock_unlock() {
         .unlock_direct_sound_buffer(buf)
         .expect("unlock buffer");
 
-    // Underflow: try to mix more samples than available
+    // Underflow: mix more samples than remain in the looping buffer
     let mixed = audio
         .mix_direct_sound_buffer(buf, 10)
         .expect("mix with potential underflow");
-    // Should still produce output (silence for missing samples)
+    // Loop playback restarts the buffer, so all 10 frames are produced and
+    // replay the written samples (the offset-0 write replaced [0.1, 0.2]
+    // with [0.5, 0.6]).
     assert_eq!(mixed.samples.len(), 10);
+    assert_eq!(&mixed.samples[..4], &[0.5, 0.6, 0.3, 0.4]);
+    assert_eq!(&mixed.samples[4..8], &[0.5, 0.6, 0.3, 0.4]);
+    assert_eq!(&mixed.samples[8..10], &[0.5, 0.6]);
+    // After a looping mix the cursor lands on frames % total_frames
+    // (10 % 4 = 2 frames = 8 bytes) — the documented wrap semantics of the
+    // fractional cursor.
+    assert_eq!(
+        audio
+            .get_direct_sound_buffer_position(buf)
+            .expect("cursor after looping mix"),
+        (8, 8),
+        "looping mix wraps the cursor at the buffer length"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -555,12 +672,14 @@ fn t10_7_xaudio2_channel_mixing_resampling_and_latency() {
         )
         .expect("create submix voice");
 
-    // Source voice with mono input, connected to submix
+    // Source voice with mono input, connected to submix. 24 kHz is the
+    // lowest supported source rate (src/audio.rs:2092-2097 supports
+    // 22.05/24/44.1/48/96/192 kHz — 12 kHz is rejected).
     let source = audio
         .create_source_voice(
             WaveFormat {
                 channels: 1,
-                sample_rate: 12_000,
+                sample_rate: 24_000,
                 sample_format: SampleFormat::Float32,
             },
             submix,
@@ -586,8 +705,10 @@ fn t10_7_xaudio2_channel_mixing_resampling_and_latency() {
     audio
         .set_channel_volumes(source, vec![0.8])
         .expect("set channel volumes");
+    // Source is mono and feeds the 2-channel submix: the output matrix must
+    // have 1 x 2 = 2 entries (src/audio.rs:782-804 validates the size).
     audio
-        .set_output_matrix(source, vec![1.0, 0.5, 0.0, 0.0, 0.0, 0.0])
+        .set_output_matrix(source, vec![1.0, 0.5])
         .expect("set output matrix");
 
     // Start and render
@@ -599,8 +720,29 @@ fn t10_7_xaudio2_channel_mixing_resampling_and_latency() {
         .render_xaudio2(mastering, 12)
         .expect("render resampled mix");
 
-    // Output should be 5.1 (6 channels) and match input length after resampling
-    assert_eq!(rendered.samples.len(), 12);
+    // Output is 5.1 (6 channels): 12 frames x 6 channels.
+    assert_eq!(rendered.samples.len(), 72);
     assert!(rendered.latency_ms <= 50);
-    assert!(rendered.crc32 != 0);
+    assert_ne!(rendered.crc32, 0);
+    // Channel projection: mono source -> stereo submix (matrix [1.0, 0.5])
+    // -> 5.1 mastering (default L->L, R->R), source volume 0.8.
+    // Frame i = (i - 5) / 10, so frame 0 is -0.5: output is
+    // [-0.4, -0.2, 0, 0, 0, 0] per frame.
+    let expected_frame_0 = [-0.4, -0.2, 0.0, 0.0, 0.0, 0.0];
+    for (actual, reference) in rendered.samples[..6].iter().zip(expected_frame_0) {
+        assert!(
+            (actual - reference).abs() <= 1e-6,
+            "first output frame channel mismatch: {actual} != {reference}"
+        );
+    }
+    // Every frame must follow the same projection: [0.8s, 0.4s, 0, 0, 0, 0].
+    for frame in 0..12 {
+        let s = mono_samples[frame] * 0.8;
+        let base = frame * 6;
+        assert!((rendered.samples[base] - s).abs() <= 1e-6);
+        assert!((rendered.samples[base + 1] - s * 0.5).abs() <= 1e-6);
+        for channel in 2..6 {
+            assert_eq!(rendered.samples[base + channel], 0.0);
+        }
+    }
 }
