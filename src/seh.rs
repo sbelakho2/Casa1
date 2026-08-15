@@ -63,7 +63,7 @@ pub struct UnwindInfo {
 }
 
 /// x64 context (subset of Windows CONTEXT64).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct X64Context {
     pub rax: u64,
     pub rcx: u64,
@@ -83,31 +83,6 @@ pub struct X64Context {
     pub r15: u64,
     pub rip: u64,
     pub xmm: [Xmm128; 16],
-}
-
-impl Default for X64Context {
-    fn default() -> Self {
-        Self {
-            rax: 0,
-            rcx: 0,
-            rdx: 0,
-            rbx: 0,
-            rsp: 0,
-            rbp: 0,
-            rsi: 0,
-            rdi: 0,
-            r8: 0,
-            r9: 0,
-            r10: 0,
-            r11: 0,
-            r12: 0,
-            r13: 0,
-            r14: 0,
-            r15: 0,
-            rip: 0,
-            xmm: [Xmm128::default(); 16],
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -180,6 +155,11 @@ pub fn parse_unwind_info(data: &[u8], rva: u32) -> Option<UnwindInfo> {
     }
     let version_and_flags = data[offset];
     let version = version_and_flags & 0x07;
+    // Per the PE/COFF spec only UNWIND_INFO version 1 is defined; anything
+    // else is corrupt data and must fail closed instead of being mis-unwound.
+    if version != 1 {
+        return None;
+    }
     let flags = (version_and_flags >> 3) & 0x1f;
     let prolog_size = data[offset + 1];
     let code_count = data[offset + 2];
@@ -203,7 +183,6 @@ pub fn parse_unwind_info(data: &[u8], rva: u32) -> Option<UnwindInfo> {
     while i < code_count as usize {
         let code_offset = codes_start + i * 2;
         let code_byte = data[code_offset];
-        let _info = data[code_offset + 1];
         let op = code_byte & 0x0f;
         let op_info = code_byte >> 4;
         match op {
@@ -313,7 +292,9 @@ pub fn parse_unwind_info(data: &[u8], rva: u32) -> Option<UnwindInfo> {
                 codes.push(UnwindCode::PushMachineFrame { code: op_info });
             }
             _ => {
-                // Unknown unwind code — skip
+                // Unknown unwind opcode (9–15) — corrupt data; fail closed
+                // rather than silently skipping it and mis-unwinding.
+                return None;
             }
         }
         // Advance past this code and any inline operand nodes it consumed.
@@ -478,10 +459,10 @@ pub fn virtual_unwind(
                 // The register was pushed at [RSP] in the prolog.
                 // Read the saved value from [RSP] and restore it.
                 let saved = read_u64_from_guest(memory_reader, context.rsp);
-                if let Some(val) = saved {
-                    if let Some(reg_ref) = get_nonvolatile_register(context, register) {
-                        *reg_ref = val;
-                    }
+                if let (Some(val), Some(reg_ref)) =
+                    (saved, get_nonvolatile_register(context, register))
+                {
+                    *reg_ref = val;
                 }
                 context.rsp += 8;
             }
@@ -492,21 +473,22 @@ pub fn virtual_unwind(
                 context.rsp += size as u64;
             }
             UnwindCode::SetFramePointer { register, offset } => {
-                // RSP was set to R[register] + offset in the prolog.
-                // Restore RSP from the frame pointer register + offset.
+                // The prolog established the frame register as
+                // `R[register] = RSP_final + offset` (e.g. `lea rbp,[rsp+N]`),
+                // so the unwind effect is `RSP = R[register] - offset`.
                 let fp_val = get_nonvolatile_register(context, register)
                     .copied()
                     .unwrap_or(0);
-                context.rsp = fp_val.wrapping_add(offset as u64);
+                context.rsp = fp_val.wrapping_sub(offset as u64);
             }
             UnwindCode::SaveNonVolatile { register, offset } => {
                 // Register was saved at [final_RSP + offset] (offset scaled by 8).
                 let addr = context.rsp.wrapping_add(offset as u64);
                 let saved = read_u64_from_guest(memory_reader, addr);
-                if let Some(val) = saved {
-                    if let Some(reg_ref) = get_nonvolatile_register(context, register) {
-                        *reg_ref = val;
-                    }
+                if let (Some(val), Some(reg_ref)) =
+                    (saved, get_nonvolatile_register(context, register))
+                {
+                    *reg_ref = val;
                 }
                 // RSP is NOT adjusted — the save was relative to final RSP.
             }
@@ -514,10 +496,10 @@ pub fn virtual_unwind(
                 // Same as SaveNonVolatile but with 32-bit unscaled offset.
                 let addr = context.rsp.wrapping_add(offset as u64);
                 let saved = read_u64_from_guest(memory_reader, addr);
-                if let Some(val) = saved {
-                    if let Some(reg_ref) = get_nonvolatile_register(context, register) {
-                        *reg_ref = val;
-                    }
+                if let (Some(val), Some(reg_ref)) =
+                    (saved, get_nonvolatile_register(context, register))
+                {
+                    *reg_ref = val;
                 }
             }
             UnwindCode::SaveXmm128 { register, offset } => {
@@ -548,19 +530,19 @@ pub fn virtual_unwind(
                 // Offsets from RSP: err=0|RIP=0/8 CS=8/16 RFLAGS=16/24 OldRSP=24/32 SS=32/40
                 let rip_offset = error_code_offset;
                 if let Some(saved_rip) =
-                    read_u64_from_guest(memory_reader, context.rsp + rip_offset)
+                    read_u64_from_guest(memory_reader, context.rsp.wrapping_add(rip_offset))
                 {
                     context.rip = saved_rip;
                 }
                 // Read the saved RSP (value before exception) from the frame
                 let rsp_offset = error_code_offset + 24; // 24 bytes past RIP = OldRSP
                 if let Some(saved_rsp) =
-                    read_u64_from_guest(memory_reader, context.rsp + rsp_offset)
+                    read_u64_from_guest(memory_reader, context.rsp.wrapping_add(rsp_offset))
                 {
                     context.rsp = saved_rsp;
                 } else {
                     // If we can't read the old RSP, at least advance past the frame
-                    context.rsp += error_code_offset + 40; // frame total = error + 5*8
+                    context.rsp = context.rsp.wrapping_add(error_code_offset + 40); // frame total = error + 5*8
                 }
                 // A machine frame is the complete return mechanism: it already
                 // supplies both RIP and the caller's RSP. There is no separate
@@ -591,18 +573,21 @@ pub fn virtual_unwind(
 
     // If the function has an exception handler (EHANDLER or UHANDLER),
     // return the handler RVA so the caller can dispatch to it.
-    if unwind_info.flags & 0x01 != 0 || unwind_info.flags & 0x02 != 0 {
-        if let Some(handler_rva) = unwind_info.handler_rva {
-            return UnwindResult::HandlerFound(handler_rva);
-        }
+    if let Some(handler_rva) = unwind_info.handler_rva.filter(|_| {
+        unwind_info.flags & 0x01 != 0 || unwind_info.flags & 0x02 != 0
+    }) {
+        return UnwindResult::HandlerFound(handler_rva);
     }
 
     UnwindResult::Completed
 }
 
-/// Restore a saved context (RtlRestoreContext equivalent).
+/// Return the target RIP to resume at (RtlRestoreContext equivalent).
 ///
-/// Copies all register values from `context` into the CPU state, including RIP.
+/// The full `X64Context` is delivered to the caller, which is responsible
+/// for applying every register value (including RIP) back into the CPU
+/// state; this helper only extracts the resume address.
+///
 /// This is used to resume execution at a different location after an exception
 /// has been handled (e.g., by a VEH handler that modified the context).
 ///
@@ -636,18 +621,22 @@ pub fn rtl_restore_context(context: &X64Context) -> Result<(), crate::error::App
     // Dispatch through VEH chain to give handlers a chance to examine/modify
     // the context before restoration.
     let veh_result = dispatch_vectored_handlers(&record, context);
+    // RtlRestoreContext always transfers control whether or not a handler
+    // claimed the dispatch, so every disposition maps to Ok(()) and the
+    // caller applies the (potentially handler-modified) context.
     match veh_result {
-        EXCEPTION_CONTINUE_EXECUTION | EXCEPTION_HANDLED => {
-            // Handler acknowledged the restoration — return Ok so the caller
-            // can apply the (potentially handler-modified) context.
-            Ok(())
-        }
-        _ => {
+        EXCEPTION_CONTINUE_SEARCH => {
             // No handler claimed it — still return the context so the caller
             // can apply it. This matches Windows behaviour where
             // RtlRestoreContext always transfers control even without a handler.
             Ok(())
         }
+        EXCEPTION_CONTINUE_EXECUTION | EXCEPTION_HANDLED => {
+            // Handler acknowledged the restoration — return Ok so the caller
+            // can apply the (potentially handler-modified) context.
+            Ok(())
+        }
+        _ => Ok(()),
     }
 }
 
@@ -669,7 +658,19 @@ pub fn unwind_frames(
     memory_reader: &MemoryReader<'_>,
     handler_callback: &mut dyn FnMut(u32, &X64Context) -> bool,
 ) -> UnwindResult {
+    // Bound the walk: a real user-mode stack is never this deep, and a
+    // cyclic/corrupt guest stack (e.g. a return address that always reads
+    // back into the same function) must terminate instead of spinning.
+    const MAX_UNWIND_FRAMES: u32 = 4096;
+    let mut frames_unwound: u32 = 0;
+    let mut prev_rsp = context.rsp;
     loop {
+        if frames_unwound >= MAX_UNWIND_FRAMES {
+            eprintln!("[seh] unwind_frames: frame limit ({MAX_UNWIND_FRAMES}) exceeded — cyclic or corrupt guest stack");
+            return UnwindResult::NotFound;
+        }
+        frames_unwound += 1;
+
         let rva = context.rip.wrapping_sub(image_base) as u32;
         let rf = match find_runtime_function(image_base, rva) {
             Some(rf) => rf,
@@ -715,14 +716,24 @@ pub fn unwind_frames(
                     // Handler claimed the exception, stop unwinding.
                     return UnwindResult::HandlerFound(handler_rva);
                 }
-                // Handler didn't claim it, continue unwinding.
+                // Handler didn't claim it — continue unwinding, but only if
+                // the frame actually made stack progress; a corrupt stack
+                // that cannot advance must terminate the walk.
+                if context.rsp <= prev_rsp {
+                    return UnwindResult::NotFound;
+                }
+                prev_rsp = context.rsp;
                 eprintln!(
                     "[seh] unwind: handler at {:#x} did not claim exception",
                     handler_address
                 );
             }
             UnwindResult::Completed => {
-                // Reached a base frame (leaf function or no handler).
+                // Reached a base frame (leaf function or no handler). Verify
+                // forward progress before declaring completion.
+                if context.rsp <= prev_rsp {
+                    return UnwindResult::NotFound;
+                }
                 return UnwindResult::Completed;
             }
             UnwindResult::Collided => {
@@ -749,18 +760,18 @@ pub fn unwind_frames(
 /// # Arguments
 ///
 /// * `target_frame` - If non-zero, the frame RVA where unwinding should stop.
-///                    Unwinding stops when the restored RIP falls within this
-///                    frame's range (begin_addr .. end_addr).
-/// * `target_rip`   - If non-zero, the final RIP value to set after unwinding
-///                    to the target frame. Used for collided unwind continuation.
-/// * `seh`          - The SEH subsystem containing .pdata and unwind info.
+///   Unwinding stops when the restored RIP falls within this frame's range
+///   (`begin_addr .. end_addr`).
+/// * `target_rip` - If non-zero, the final RIP value to set after unwinding to
+///   the target frame. Used for collided unwind continuation.
+/// * `seh` - The SEH subsystem containing .pdata and unwind info.
 /// * `memory_reader` - Callback to read guest memory (stack).
 ///
 /// # Returns
 ///
 /// * `Ok(())` - Unwind completed successfully. Context has been updated to
-///              reflect the caller's frame (or target frame if target_frame
-///              was specified).
+///   reflect the caller's frame (or target frame if `target_frame` was
+///   specified).
 /// * `Err(AppError)` - Unwind failed (e.g., no unwind info found for a frame).
 pub fn rtl_unwind(
     target_frame: u64,
@@ -770,8 +781,20 @@ pub fn rtl_unwind(
     seh: &mut SehSubsystem,
     memory_reader: &MemoryReader<'_>,
 ) -> Result<(), crate::error::AppError> {
+    // Bound the walk so a cyclic/corrupt guest stack terminates instead of
+    // spinning forever (mirrors `dispatch`'s MAX_UNWIND_FRAMES guard).
+    const MAX_UNWIND_FRAMES: u32 = 4096;
     let mut frames_unwound: u32 = 0;
+    let mut prev_rsp = context.rsp;
     loop {
+        if frames_unwound >= MAX_UNWIND_FRAMES {
+            return Err(crate::error::AppError::new(
+                ReasonCode::SehException,
+                format!(
+                    "rtl_unwind: frame limit ({MAX_UNWIND_FRAMES}) exceeded — cyclic or corrupt stack"
+                ),
+            ));
+        }
         let rva = context.rip.wrapping_sub(image_base) as u32;
 
         // Check if we've reached the target frame.
@@ -796,7 +819,7 @@ pub fn rtl_unwind(
 
         // Find the runtime function for the current RIP.
         let rf = match seh.find_runtime_function(image_base, rva) {
-            Some(rf) => rf.clone(),
+            Some(rf) => rf,
             None => {
                 // No function table entry for this RIP. During an exit unwind
                 // (target_frame == 0) this is the natural termination of the
@@ -815,15 +838,18 @@ pub fn rtl_unwind(
             }
         };
 
-        // Get the unwind info for this function.
-        let unwind_info = match seh.get_unwind_info(rf.unwind_info_addr) {
+        // Get the unwind info for this function (image-aware: the RVA space
+        // is shared between all loaded images, so lookups must be scoped to
+        // the image being unwound).
+        let unwind_info_addr = rf.unwind_info_addr;
+        let unwind_info = match seh.get_unwind_info_for_image(image_base, unwind_info_addr) {
             Some(ui) => ui.clone(),
             None => {
                 return Err(crate::error::AppError::new(
                     ReasonCode::SehException,
                     format!(
                         "rtl_unwind: no unwind info for RVA {:#x}",
-                        rf.unwind_info_addr
+                        unwind_info_addr
                     ),
                 ));
             }
@@ -849,7 +875,7 @@ pub fn rtl_unwind(
                 let Some(chained_rva) = active_info.chained_info_rva else {
                     break res;
                 };
-                match seh.get_unwind_info(chained_rva) {
+                match seh.get_unwind_info_for_image(image_base, chained_rva) {
                     Some(next) => {
                         active_info = next.clone();
                         continue;
@@ -863,8 +889,18 @@ pub fn rtl_unwind(
         match result {
             UnwindResult::Completed => {
                 // Successfully unwound one frame. Continue to the next one
-                // in the loop (which will check target_frame again).
+                // in the loop (which will check target_frame again), but
+                // only if the stack actually advanced.
                 frames_unwound += 1;
+                if context.rsp <= prev_rsp {
+                    return Err(crate::error::AppError::new(
+                        ReasonCode::SehException,
+                        format!(
+                            "rtl_unwind: no stack progress at RVA {rva:#x} — corrupt stack"
+                        ),
+                    ));
+                }
+                prev_rsp = context.rsp;
                 continue;
             }
             UnwindResult::Collided => {
@@ -977,6 +1013,13 @@ pub struct TryBlock {
 /// Global VEH state behind a mutex.
 use std::sync::{Arc, Mutex};
 
+/// Acquire a mutex, recovering from poisoning. A panicked lock holder must
+/// not silently disable exception dispatch for the rest of the process —
+/// the chains tolerate poison by returning the (possibly stale) data.
+fn recover_lock<T>(mtx: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mtx.lock().unwrap_or_else(|p| p.into_inner())
+}
+
 lazy_static::lazy_static! {
     static ref VEH_CHAIN: Mutex<Vec<(VehHandle, VeHandlerNode)>> = Mutex::new(Vec::new());
 
@@ -1008,6 +1051,11 @@ const MAX_VEH_DISPATCH_DEPTH: u32 = 8;
 
 static NEXT_VEH_HANDLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
+/// Maximum number of registered VEH/VCH handlers. Windows has no explicit
+/// cap, but a guest that registers handlers in a loop must be bounded; a
+/// rejected registration returns the invalid handle 0.
+const MAX_VEH_HANDLERS: usize = 1024;
+
 /// Maximum depth for following CHAININFO entries during unwind.
 /// Prevents infinite loops with corrupt or cyclic unwind data.
 const MAX_CHAIN_DEPTH: u32 = 32;
@@ -1021,50 +1069,51 @@ const MAX_PENDING_GUEST_VEH: usize = 256;
 /// Enforces `MAX_PENDING_GUEST_VEH` to prevent unbounded growth.
 /// Returns `true` if the entry was accepted, `false` if the queue is full.
 pub fn push_pending_guest_veh(callback: u64, record: ExceptionRecord, context: X64Context) -> bool {
-    if let Ok(mut pending) = PENDING_GUEST_VEH.lock() {
-        if pending.len() >= MAX_PENDING_GUEST_VEH {
-            eprintln!(
-                "[seh] WARNING: pending guest VEH queue full ({} entries), dropping callback {:#x}",
-                MAX_PENDING_GUEST_VEH, callback
-            );
-            return false;
-        }
-        pending.push((callback, record, context));
-        return true;
+    let mut pending = recover_lock(&PENDING_GUEST_VEH);
+    if pending.len() >= MAX_PENDING_GUEST_VEH {
+        eprintln!(
+            "[seh] WARNING: pending guest VEH queue full ({} entries), dropping callback {:#x}",
+            MAX_PENDING_GUEST_VEH, callback
+        );
+        return false;
     }
-    false
+    pending.push((callback, record, context));
+    true
 }
 
 /// Drain all pending guest VEH callback entries (called from PeHostRuntime
 /// after SEH/VEH dispatch returns).
 pub fn drain_pending_guest_veh() -> Vec<(u64, ExceptionRecord, X64Context)> {
-    if let Ok(mut pending) = PENDING_GUEST_VEH.lock() {
-        std::mem::take(&mut *pending)
-    } else {
-        Vec::new()
-    }
+    let mut pending = recover_lock(&PENDING_GUEST_VEH);
+    std::mem::take(&mut *pending)
 }
 
 /// Add a vectored exception handler to the global chain.
 ///
-/// Returns a `VehHandle` that can be used with `remove_vectored_handler`.
+/// Returns a `VehHandle` that can be used with `remove_vectored_handler`,
+/// or `VehHandle(0)` if the chain is full.
 pub fn add_vectored_handler(handler: VectoredExceptionHandler, first_chance: bool) -> VehHandle {
     let handle = VehHandle(NEXT_VEH_HANDLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
     let node = VeHandlerNode {
         handler,
         first_chance,
     };
-    if let Ok(mut chain) = VEH_CHAIN.lock() {
-        chain.push((handle, node));
+    let mut chain = recover_lock(&VEH_CHAIN);
+    if chain.len() >= MAX_VEH_HANDLERS {
+        eprintln!(
+            "[seh] WARNING: VEH chain full ({} handlers), rejecting registration",
+            MAX_VEH_HANDLERS
+        );
+        return VehHandle(0);
     }
+    chain.push((handle, node));
     handle
 }
 
 /// Remove a previously registered vectored exception handler.
 pub fn remove_vectored_handler(handle: VehHandle) {
-    if let Ok(mut chain) = VEH_CHAIN.lock() {
-        chain.retain(|(h, _)| *h != handle);
-    }
+    let mut chain = recover_lock(&VEH_CHAIN);
+    chain.retain(|(h, _)| *h != handle);
 }
 
 /// Helper: RAII guard for VEH dispatch depth tracking.
@@ -1134,11 +1183,7 @@ pub fn dispatch_vectored_handlers(record: &ExceptionRecord, context: &X64Context
     // Clone the handler list under the lock, then release before invoking.
     // This prevents deadlocks if a handler callback tries to add/remove handlers.
     let handlers: Vec<(bool, VectoredExceptionHandler)> = {
-        let chain = VEH_CHAIN.lock();
-        let chain = match chain {
-            Ok(c) => c,
-            Err(_) => return EXCEPTION_CONTINUE_SEARCH,
-        };
+        let chain = recover_lock(&VEH_CHAIN);
         chain
             .iter()
             .map(|(_, node)| (node.first_chance, node.handler.clone()))
@@ -1146,7 +1191,7 @@ pub fn dispatch_vectored_handlers(record: &ExceptionRecord, context: &X64Context
     };
     // Lock is released here — safe to invoke callbacks.
 
-    // First-chance handlers run first (in registration order).
+    // First-chance handlers run first, in registration order.
     for (first_chance, handler) in &handlers {
         if *first_chance {
             let result = handler(&pointers);
@@ -1156,8 +1201,10 @@ pub fn dispatch_vectored_handlers(record: &ExceptionRecord, context: &X64Context
         }
     }
 
-    // Then last-chance handlers.
-    for (first_chance, handler) in &handlers {
+    // Then last-chance handlers, in reverse registration order (matching
+    // Windows, where the most recently registered last-chance handler runs
+    // first).
+    for (first_chance, handler) in handlers.iter().rev() {
         if !*first_chance {
             let result = handler(&pointers);
             if result != EXCEPTION_CONTINUE_SEARCH {
@@ -1197,21 +1244,26 @@ static NEXT_VCH_HANDLE: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 ///
 /// Continue handlers are invoked after all VEH and frame-based handlers have
 /// processed the exception. They receive the same `ExceptionPointers` as VEH
-/// handlers.
+/// handlers. Returns `VchHandle(0)` if the chain is full.
 pub fn add_vectored_continue_handler(handler: VectoredContinueHandler) -> VchHandle {
     let handle = VchHandle(NEXT_VCH_HANDLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
     let node = VchHandlerNode { handler };
-    if let Ok(mut chain) = VCH_CHAIN.lock() {
-        chain.push((handle, node));
+    let mut chain = recover_lock(&VCH_CHAIN);
+    if chain.len() >= MAX_VEH_HANDLERS {
+        eprintln!(
+            "[seh] WARNING: VCH chain full ({} handlers), rejecting registration",
+            MAX_VEH_HANDLERS
+        );
+        return VchHandle(0);
     }
+    chain.push((handle, node));
     handle
 }
 
 /// Remove a previously registered vectored continue handler.
 pub fn remove_vectored_continue_handler(handle: VchHandle) {
-    if let Ok(mut chain) = VCH_CHAIN.lock() {
-        chain.retain(|(h, _)| *h != handle);
-    }
+    let mut chain = recover_lock(&VCH_CHAIN);
+    chain.retain(|(h, _)| *h != handle);
 }
 
 /// Dispatch through the vectored continue handler chain.
@@ -1220,6 +1272,14 @@ pub fn remove_vectored_continue_handler(handle: VchHandle) {
 /// handled or not). Returns `EXCEPTION_CONTINUE_SEARCH` if no handler claimed
 /// the exception, or the handler's return value otherwise.
 pub fn dispatch_vectored_continue_handlers(record: &ExceptionRecord, context: &X64Context) -> i32 {
+    // Re-entrancy guard (same depth limit as VEH dispatch): a continue
+    // handler that itself triggers an exception must not recurse without
+    // bound, or the host stack overflows.
+    let _guard = match VehDepthGuard::try_acquire() {
+        Some(g) => g,
+        None => return EXCEPTION_CONTINUE_SEARCH,
+    };
+
     let pointers = ExceptionPointers {
         record: record.clone(),
         context: context.clone(),
@@ -1228,11 +1288,7 @@ pub fn dispatch_vectored_continue_handlers(record: &ExceptionRecord, context: &X
     // Clone the handler list under the lock, then release before invoking.
     // This prevents deadlocks if a handler callback tries to add/remove handlers.
     let handlers: Vec<VectoredContinueHandler> = {
-        let chain = VCH_CHAIN.lock();
-        let chain = match chain {
-            Ok(c) => c,
-            Err(_) => return EXCEPTION_CONTINUE_SEARCH,
-        };
+        let chain = recover_lock(&VCH_CHAIN);
         chain.iter().map(|(_, node)| node.handler.clone()).collect()
     };
     // Lock is released here — safe to invoke callbacks.
@@ -1251,35 +1307,46 @@ pub fn dispatch_vectored_continue_handlers(record: &ExceptionRecord, context: &X
 ///
 /// Given the exception record, current context, and the scope table for the
 /// function where the exception occurred, this function attempts to find a
-/// matching handler. Supports nested exceptions by walking the linked list
-/// of ExceptionRecord, and collided unwinds by returning NotFound when the
-/// current frame's handlers don't match, allowing the caller to unwind further.
+/// matching handler. Scope offsets are relative to the start of the function,
+/// so the caller must supply `function_begin_rva` (the RVA of the enclosing
+/// RUNTIME_FUNCTION) to translate the fault RIP before comparing.
+///
+/// The language-specific handler at `handler_offset` is **not** invoked here —
+/// the caller must invoke it in guest context and honor its return value
+/// (EXCEPTION_CONTINUE_SEARCH means the handler declined and the search must
+/// continue up the chain). This function only reports *which* scope (if any)
+/// guards the fault address.
 pub fn seh_dispatch(
-    _exception_record: &ExceptionRecord,
+    exception_record: &ExceptionRecord,
     context: &X64Context,
     scope_table: &ScopeTable,
     image_base: u64,
+    function_begin_rva: u32,
 ) -> UnwindResult {
-    let fault_rva = context.rip.wrapping_sub(image_base) as u32;
-    let fault_offset = fault_rva;
+    // The fault address (from the exception record) is what the scope scan
+    // matches against; fall back to the context RIP if the record carries no
+    // address. The offset must be function-relative, not image-relative:
+    // ScopeRecord offsets are relative to the function start.
+    let fault_rip = if exception_record.address != 0 {
+        exception_record.address
+    } else {
+        context.rip
+    };
+    let fault_rva = fault_rip.wrapping_sub(image_base) as u32;
+    let fault_offset = fault_rva.wrapping_sub(function_begin_rva);
 
-    // Walk the scope records in the function. Scopes are stored as a flat
-    // array; nested try blocks have their begin/end ranges nested within.
-    for scope in &scope_table.scopes {
+    // Only trust `count` entries: a table whose Vec is longer than its
+    // declared count carries trailing garbage that must not be searched.
+    let scopes = scope_table.scopes.iter().take(scope_table.count as usize);
+    for scope in scopes {
         if fault_offset >= scope.begin_offset && fault_offset < scope.end_offset {
-            // Found a guarding scope with a handler.
-            // The handler is a language-specific function that examines the
-            // exception record and decides whether to handle it.
-            // If it accepts, we return HandlerFound; otherwise we continue
-            // searching outer scopes or unwind to the caller.
-            let handler_offset = scope.handler_offset;
-            let _target_offset = scope.target_offset; // for finally handlers
-
-            // In a full implementation, the language-specific handler would be
-            // called here. It returns TRUE if it handles the exception, FALSE
-            // to continue searching. For now, we optimistically return the
-            // handler offset so the caller can dispatch to it.
-            return UnwindResult::HandlerFound(handler_offset);
+            // Found a guarding scope with a handler. A zero handler offset is
+            // corrupt metadata — no guest code can be dispatched to, so keep
+            // searching rather than claiming a handler that cannot run.
+            if scope.handler_offset == 0 {
+                continue;
+            }
+            return UnwindResult::HandlerFound(scope.handler_offset);
         }
     }
 
@@ -1299,8 +1366,11 @@ pub fn seh_dispatch(
 pub struct SehSubsystem {
     /// Parsed `.pdata` tables per image base address.
     pdata_tables: HashMap<u64, Vec<RuntimeFunction>>,
-    /// Cached parsed UNWIND_INFO indexed by RVA.
-    unwind_cache: HashMap<u32, UnwindInfo>,
+    /// Cached parsed UNWIND_INFO keyed by (image_base, rva). Keying by RVA
+    /// alone is unsafe: every PE image's unwind data starts near RVA 0x1000
+    /// and the JIT image shares the same RVA space, so a bare-RVA cache can
+    /// return one image's unwind info for another image's frame.
+    unwind_cache: HashMap<(u64, u32), UnwindInfo>,
     /// Raw unwind data blobs indexed by image base (for lazy parsing).
     unwind_data: HashMap<u64, Vec<u8>>,
 }
@@ -1322,17 +1392,13 @@ impl SehSubsystem {
 
     /// Register raw unwind data (the full section containing UNWIND_INFO).
     ///
-    /// When replacing existing unwind data, the unwind cache is cleared to
-    /// prevent stale entries. All subsequent `get_unwind_info()` calls will
-    /// re-parse from the fresh data.
+    /// When replacing existing unwind data, the unwind cache entries for this
+    /// image are dropped (other images' entries are unaffected) to prevent
+    /// stale entries. All subsequent `get_unwind_info()` calls will re-parse
+    /// from the fresh data.
     pub fn register_unwind_data(&mut self, image_base: u64, data: Vec<u8>) {
         self.unwind_data.insert(image_base, data);
-        // Invalidate the entire unwind cache because the raw data has changed
-        // and any previously-parsed entries may now point to stale/invalid
-        // locations within the old data blob. A full clear is safe since
-        // entries are parsed on demand; the alternative (selective invalidation
-        // by RVA range) is fragile without tracking which image an RVA belongs to.
-        self.unwind_cache.clear();
+        self.unwind_cache.retain(|(cached_base, _), _| *cached_base != image_base);
     }
 
     /// Get a reference to the raw unwind data blob for a given image base.
@@ -1343,25 +1409,73 @@ impl SehSubsystem {
     }
 
     /// Find the `RuntimeFunction` for a given RVA in a specific image.
+    ///
+    /// `.pdata` entries are sorted by `begin_addr` per the PE spec, so a
+    /// binary search (partition point) resolves a fault RVA in O(log n).
+    /// A linear fallback covers unsorted/corrupt tables.
     pub fn find_runtime_function(&self, image_base: u64, rva: u32) -> Option<&RuntimeFunction> {
         let functions = self.pdata_tables.get(&image_base)?;
+        let idx = functions.partition_point(|rf| rf.begin_addr <= rva);
+        if idx > 0 {
+            let cand = &functions[idx - 1];
+            if rva >= cand.begin_addr && rva < cand.end_addr {
+                return Some(cand);
+            }
+        }
+        // Fallback for unsorted or overlapping entries.
         functions
             .iter()
             .find(|rf| rva >= rf.begin_addr && rva < rf.end_addr)
     }
 
-    /// Get or parse unwind info for a given RVA.
+    /// Get or parse unwind info for a given RVA **within one specific image**.
+    ///
+    /// The RVA space is shared across all loaded images (PE images and the
+    /// JIT image), so lookups must be scoped to the image being unwound.
+    /// Entries are cached under `(image_base, rva)` and parsed only from that
+    /// image's own unwind-data blob.
+    pub fn get_unwind_info_for_image(
+        &mut self,
+        image_base: u64,
+        rva: u32,
+    ) -> Option<&UnwindInfo> {
+        let key = (image_base, rva);
+        if !self.unwind_cache.contains_key(&key) {
+            let data = self.unwind_data.get(&image_base)?;
+            let info = parse_unwind_info(data, rva)?;
+            self.unwind_cache.insert(key, info);
+        }
+        self.unwind_cache.get(&key)
+    }
+
+    /// Get or parse unwind info for a given RVA without an image context.
+    ///
+    /// Kept for callers that do not know the image base. Any cached per-image
+    /// entry for the RVA is reused; otherwise every registered image is
+    /// consulted and each successful parse is cached per-image, so a shared
+    /// RVA can never leak between images. Prefer [`get_unwind_info_for_image`]
+    /// when the image base is known.
     pub fn get_unwind_info(&mut self, rva: u32) -> Option<&UnwindInfo> {
-        if !self.unwind_cache.contains_key(&rva) {
-            // Try to find the unwind data blob that contains this RVA
-            for (_, data) in &self.unwind_data {
-                if let Some(info) = parse_unwind_info(data, rva) {
-                    self.unwind_cache.insert(rva, info);
-                    break;
-                }
+        // Cache hit: an entry for this RVA already exists for some image.
+        let cached_image = self
+            .unwind_cache
+            .keys()
+            .find_map(|(image_base, cached_rva)| (*cached_rva == rva).then_some(*image_base));
+        if let Some(image_base) = cached_image {
+            return self.unwind_cache.get(&(image_base, rva));
+        }
+        // Parse on demand, caching each successful parse per image. The
+        // per-image key guarantees a shared RVA can never leak between
+        // images; the cache hit is resolved with a single borrow below.
+        let images: Vec<u64> = self.unwind_data.keys().copied().collect();
+        let mut found_image: Option<u64> = None;
+        for image_base in images {
+            if self.get_unwind_info_for_image(image_base, rva).is_some() {
+                found_image = Some(image_base);
+                break;
             }
         }
-        self.unwind_cache.get(&rva)
+        found_image.and_then(|image_base| self.unwind_cache.get(&(image_base, rva)))
     }
 
     /// Perform virtual_unwind for a given RVA. Looks up the RuntimeFunction,
@@ -1374,10 +1488,10 @@ impl SehSubsystem {
         memory_reader: &MemoryReader<'_>,
     ) -> UnwindResult {
         let rf = match self.find_runtime_function(image_base, rva) {
-            Some(rf) => rf.clone(),
+            Some(rf) => rf,
             None => return UnwindResult::NotFound,
         };
-        let unwind_info = match self.get_unwind_info(rf.unwind_info_addr) {
+        let unwind_info = match self.get_unwind_info_for_image(image_base, rf.unwind_info_addr) {
             Some(ui) => ui.clone(),
             None => return UnwindResult::NotFound,
         };
@@ -1440,54 +1554,19 @@ impl SehSubsystem {
             let rva = current_context.rip.wrapping_sub(image_base) as u32;
 
             // Scoped lookup to avoid overlapping borrows on self.
-            // First, find the runtime function with an immutable borrow.
-            let rf = {
-                let functions = self.pdata_tables.get(&image_base);
-                match functions {
-                    Some(functions) => functions
-                        .iter()
-                        .find(|rf| rva >= rf.begin_addr && rva < rf.end_addr)
-                        .cloned(),
-                    None => break,
-                }
-            };
+            let rf = self.find_runtime_function(image_base, rva).cloned();
             let rf = match rf {
                 Some(rf) => rf,
                 None => break,
             };
 
-            // Get or parse unwind info — uses mutable borrow on cache only.
-            let unwind_info = {
-                // Check cache first (immutable borrow on unwind_cache).
-                let cached = self.unwind_cache.get(&rf.unwind_info_addr).cloned();
-                match cached {
-                    Some(ui) => ui,
-                    None => {
-                        // Parse from unwind_data and insert into cache.
-                        let mut parsed: Option<UnwindInfo> = None;
-                        // Immutable borrow on unwind_data to parse.
-                        for (_, data) in &self.unwind_data {
-                            if let Some(info) = parse_unwind_info(data, rf.unwind_info_addr) {
-                                parsed = Some(info);
-                                break;
-                            }
-                        }
-                        match parsed {
-                            Some(info) => {
-                                let rva = rf.unwind_info_addr;
-                                self.unwind_cache.insert(rva, info.clone());
-                                info
-                            }
-                            None => break,
-                        }
-                    }
-                }
+            // Image-scoped lookup: the unwind RVA belongs to this image's
+            // unwind-data blob, never to another image with the same RVA.
+            let unwind_info = match self.get_unwind_info_for_image(image_base, rf.unwind_info_addr)
+            {
+                Some(ui) => ui.clone(),
+                None => break,
             };
-
-            // Check if this frame has an exception handler (EHANDLER or UHANDLER).
-            if unwind_info.flags & 0x01 != 0 || unwind_info.flags & 0x02 != 0 {
-                return Ok(());
-            }
 
             // Use the caller-supplied guest memory reader so virtual_unwind
             // can read return addresses and saved registers from the actual
@@ -1523,31 +1602,24 @@ impl SehSubsystem {
                             );
                             break;
                         }
-                        let next = {
-                            let cached = self.unwind_cache.get(&rva).cloned();
-                            match cached {
-                                Some(ui) => Some(ui),
-                                None => {
-                                    let mut parsed: Option<UnwindInfo> = None;
-                                    for (_, data) in &self.unwind_data {
-                                        if let Some(info) = parse_unwind_info(data, rva) {
-                                            parsed = Some(info);
-                                            break;
-                                        }
-                                    }
-                                    if let Some(info) = parsed.clone() {
-                                        self.unwind_cache.insert(rva, info);
-                                    }
-                                    parsed
-                                }
-                            }
+                        let Some(next) =
+                            self.get_unwind_info_for_image(image_base, rva).cloned()
+                        else {
+                            break;
                         };
-                        let Some(next) = next else { break };
                         match virtual_unwind(&next, &mut current_context, memory_reader) {
                             UnwindResult::Collided => {
                                 chain_rva = next.chained_info_rva;
                             }
-                            UnwindResult::HandlerFound(_) => {
+                            UnwindResult::HandlerFound(handler_rva) => {
+                                if !Self::claim_language_handler(
+                                    image_base,
+                                    handler_rva,
+                                    &record,
+                                    &current_context,
+                                ) {
+                                    break;
+                                }
                                 return Ok(());
                             }
                             _ => {
@@ -1569,10 +1641,22 @@ impl SehSubsystem {
                     break;
                 }
                 UnwindResult::HandlerFound(handler_rva) => {
-                    eprintln!(
-                        "[seh] rtl_unwind_handler: handler found at RVA {:#x}",
-                        handler_rva
-                    );
+                    // The frame has a language-specific handler (EHANDLER /
+                    // UHANDLER). Queue it for guest-side invocation — the
+                    // runtime drains the pending queue after dispatch — and
+                    // only claim the exception when the handler can actually
+                    // run. A zero handler RVA or a full queue is corrupt /
+                    // overloaded state: fail closed instead of silently
+                    // swallowing the exception (which would livelock the
+                    // runtime by retrying the faulting instruction).
+                    if !Self::claim_language_handler(
+                        image_base,
+                        handler_rva,
+                        &record,
+                        &current_context,
+                    ) {
+                        break;
+                    }
                     return Ok(());
                 }
                 UnwindResult::NotFound => {
@@ -1583,10 +1667,7 @@ impl SehSubsystem {
 
         // Step 3: No handler claimed the exception after full unwind.
         // Log diagnostic information for the undispatched exception.
-        let veh_handler_count = {
-            let chain = VEH_CHAIN.lock();
-            chain.as_ref().map(|c| c.len()).unwrap_or(0)
-        };
+        let veh_handler_count = recover_lock(&VEH_CHAIN).len();
         let pdata_count: usize = self.pdata_tables.values().map(|v| v.len()).sum();
         eprintln!(
             "[seh] unhandled exception: code={:#x}, address={:#x}, \
@@ -1598,6 +1679,29 @@ impl SehSubsystem {
             ReasonCode::SehException,
             format!("unhandled exception code={code:#x} at address={address:#x} (collided unwind)",),
         ))
+    }
+
+    /// Queue a frame's language-specific handler (EHANDLER/UHANDLER) for
+    /// guest-side invocation and claim the exception.
+    ///
+    /// The runtime drains the pending guest VEH queue after dispatch and
+    /// invokes the callback in guest context; the handler's return value is
+    /// then honored there. Returns `false` (and does **not** claim) when the
+    /// handler metadata is corrupt (zero RVA) or the queue is full — in both
+    /// cases claiming would swallow the exception without the handler ever
+    /// running.
+    fn claim_language_handler(
+        image_base: u64,
+        handler_rva: u32,
+        record: &ExceptionRecord,
+        context: &X64Context,
+    ) -> bool {
+        if handler_rva == 0 {
+            eprintln!("[seh] dispatch: corrupt handler RVA 0 — not claiming exception");
+            return false;
+        }
+        let handler_address = image_base.wrapping_add(handler_rva as u64);
+        push_pending_guest_veh(handler_address, record.clone(), context.clone())
     }
 
     /// Generate an exception record and dispatch.
@@ -1634,11 +1738,12 @@ mod tests {
 
     /// Helper: build a minimal valid UNWIND_INFO blob.
     fn make_unwind_info(version: u8, flags: u8, codes: &[(u8, u8)]) -> Vec<u8> {
-        let mut buf = Vec::new();
-        buf.push((version & 0x07) | ((flags & 0x1f) << 3)); // version_and_flags
-        buf.push(0x10); // prolog_size
-        buf.push(codes.len() as u8); // code_count
-        buf.push(0x00); // frame_register + frame_offset
+        let mut buf = vec![
+            (version & 0x07) | ((flags & 0x1f) << 3), // version_and_flags
+            0x10,                                     // prolog_size
+            codes.len() as u8,                        // code_count
+            0x00,                                     // frame_register + frame_offset
+        ];
         for &(code, info) in codes {
             buf.push((info << 4) | (code & 0x0f));
             buf.push(0x00); // second byte (op-info)
@@ -1664,7 +1769,7 @@ mod tests {
         data.extend_from_slice(&0x1150u32.to_le_bytes());
         data.extend_from_slice(&0x2100u32.to_le_bytes());
 
-        let functions = parse_pdata(&data, 0x14000_0000);
+        let functions = parse_pdata(&data, 0x1_4000_0000);
         assert_eq!(functions.len(), 2);
         assert_eq!(functions[0].begin_addr, 0x1000);
         assert_eq!(functions[0].end_addr, 0x1050);
@@ -1774,7 +1879,7 @@ mod tests {
             count: 0,
             scopes: vec![],
         };
-        let result = seh_dispatch(&record, &context, &scope_table, 0x14000_0000);
+        let result = seh_dispatch(&record, &context, &scope_table, 0x1_4000_0000, 0x1000);
         assert_eq!(result, UnwindResult::NotFound);
     }
 
@@ -1788,7 +1893,7 @@ mod tests {
             STATUS_ACCESS_VIOLATION,
             0x1000,
             &context,
-            0x14000_0000,
+            0x1_4000_0000,
             &no_memory,
         );
         assert!(result.is_err(), "expected Err, got {result:?}");
@@ -1821,11 +1926,12 @@ mod tests {
 
     /// Helper: build a UNWIND_INFO blob with extra data appended after codes.
     fn make_unwind_info_full(version: u8, flags: u8, codes: &[(u8, u8)], extra: &[u8]) -> Vec<u8> {
-        let mut buf = Vec::new();
-        buf.push((version & 0x07) | ((flags & 0x1f) << 3)); // version_and_flags
-        buf.push(0x10); // prolog_size
-        buf.push(codes.len() as u8); // code_count
-        buf.push(0x00); // frame_register + frame_offset
+        let mut buf = vec![
+            (version & 0x07) | ((flags & 0x1f) << 3), // version_and_flags
+            0x10,                                     // prolog_size
+            codes.len() as u8,                        // code_count
+            0x00,                                     // frame_register + frame_offset
+        ];
         for &(code, info) in codes {
             buf.push((info << 4) | (code & 0x0f));
             buf.push(0x00);
@@ -1910,10 +2016,12 @@ mod tests {
         let stack_base = 0x7fff_0000u64;
         let mem_reader = slice_memory_reader(&stack, stack_base);
 
-        let mut ctx = X64Context::default();
-        ctx.rbp = 0xdeadbeef; // current RBP (matches saved value)
-        ctx.rsp = stack_base; // RSP points to local alloc start
-        ctx.rip = 0x140001000; // current RIP inside function
+        let mut ctx = X64Context {
+            rbp: 0xdeadbeef,     // current RBP (matches saved value)
+            rsp: stack_base,     // RSP points to local alloc start
+            rip: 0x140001000,    // current RIP inside function
+            ..X64Context::default()
+        };
 
         let result = virtual_unwind(
             &parse_unwind_info(&unwind_data, 0).unwrap(),
@@ -1972,35 +2080,17 @@ mod tests {
         // Slot 6-7: SaveNonVolatile (op=4, info=7) + offset low + offset high
         //
         // Total: 8 slots = 4 entries, which is even. Then handler_area follows at DWORD boundary.
-
-        // Rebuild properly:
-        let mut buf = Vec::new();
-        buf.push((1 & 0x07) | ((0 & 0x1f) << 3)); // version=1, flags=0
-        buf.push(0x10); // prolog_size
-        buf.push(4); // code_count = 4
-        buf.push(0x00); // frame_register + frame_offset
-
-        // Code 0: UWOP_PUSH_NONVOL, reg=5 (slot 0)
-        buf.push(0x50); // info=5 << 4 | op=0
-        buf.push(0x00); // slot 1: unused (second byte of code)
-
-        // Code 1: UWOP_ALLOC_LARGE, op_info=0 (slot 2)
-        buf.push(0x10); // info=1 << 4 (but op_info=0) | op=1
-        // Wait, op=1, op_info=0 => 0x01
-        // Hmm let me reconsider. The code byte is: (op_info << 4) | op
-        // So for AllocLarge with op_info=0: byte = (0 << 4) | 1 = 0x01
-        // And the info byte is 0x00 (the second byte of the code slot)
-        // But we also need the 16-bit size, which occupies the next 2 bytes (the next slot)
-
-        // Let me just use a different approach - build the bytes manually
-        buf.clear();
-        buf.push(0x01); // version=1, flags=0: (1 & 0x07) | ((0 & 0x1f) << 3) = 0x01
+        //
+        // Build the binary layout manually: the code slots are 2 bytes each,
+        // and codes with inline operands (ALLOC_LARGE 16-bit, SAVE_NONVOL)
+        // consume additional slots. code_count = 7 total slots consumed.
+        let mut buf = vec![0x01]; // version=1, flags=0
         buf.push(0x10); // prolog_size
         buf.push(4); // code_count = 4
         buf.push(0x00); // frame_register=0, frame_offset=0
 
         // Slot 0 (bytes 4-5): UWOP_PUSH_NONVOL, reg=5
-        buf.push((5 << 4) | 0); // op=0, info=5 => 0x50
+        buf.push(0x50); // op=0, info=5
         buf.push(0x00); // unused
 
         // Slot 1 (bytes 6-7): UWOP_ALLOC_LARGE, op_info=0, 16-bit size=0x20 (0x100/8)
@@ -2084,15 +2174,15 @@ mod tests {
         // Let me redo the binary layout properly:
         // code_count = 7 (4 logical codes, consuming 7 slots due to extra data)
 
-        let mut buf = Vec::new();
-        // Header (4 bytes)
-        buf.push(0x01); // version=1, flags=0
-        buf.push(0x10); // prolog_size
-        buf.push(7); // code_count = 7 (total slots consumed)
-        buf.push(0x00); // frame_register=0, frame_offset=0
+        let mut buf = vec![
+            0x01, // version=1, flags=0
+            0x10, // prolog_size
+            7,    // code_count = 7 (total slots consumed)
+            0x00, // frame_register=0, frame_offset=0
+        ];
 
         // Slot 0: UWOP_PUSH_NONVOL, reg=5
-        buf.push((5 << 4) | 0); // code byte: op=0, info=5
+        buf.push(0x50); // code byte: op=0, info=5
         buf.push(0x00); // second byte (unused for push)
 
         // Slot 1: UWOP_ALLOC_LARGE, op_info=0
@@ -2170,8 +2260,10 @@ mod tests {
         let stack_base = 0x7fff_0000u64;
         let mem_reader = slice_memory_reader(&stack, stack_base);
 
-        let mut ctx = X64Context::default();
-        ctx.rsp = stack_base; // RSP points to start of allocated space
+        let mut ctx = X64Context {
+            rsp: stack_base, // RSP points to start of allocated space
+            ..X64Context::default()
+        };
 
         let result = virtual_unwind(&unwind_info, &mut ctx, &mem_reader);
 
@@ -2188,8 +2280,10 @@ mod tests {
         let codes = vec![(0, 5)]; // push rbp only
         let unwind_data = make_unwind_info(1, 0x04, &codes); // flags=0x04 = UNW_FLAG_CHAININFO
 
-        let mut ctx = X64Context::default();
-        ctx.rsp = 0x1000;
+        let mut ctx = X64Context {
+            rsp: 0x1000,
+            ..X64Context::default()
+        };
         let mem_reader = |_: u64, _: &mut [u8]| false; // dummy reader
 
         let result = virtual_unwind(
@@ -2224,9 +2318,11 @@ mod tests {
         let stack_base = 0x7fff_0000u64;
         let mem_reader = slice_memory_reader(&stack, stack_base);
 
-        let mut ctx = X64Context::default();
-        ctx.rsp = stack_base;
-        ctx.rbp = 0xdeadbeef;
+        let mut ctx = X64Context {
+            rsp: stack_base,
+            rbp: 0xdeadbeef,
+            ..X64Context::default()
+        };
 
         let unwind_info = parse_unwind_info(&unwind_data, 0).expect("should parse");
         let result = virtual_unwind(&unwind_info, &mut ctx, &mem_reader);
@@ -2265,8 +2361,10 @@ mod tests {
         let stack_base = 0x7fff_0000u64;
         let mem_reader = slice_memory_reader(&stack, stack_base);
 
-        let mut ctx = X64Context::default();
-        ctx.rsp = stack_base; // RSP points to start of machine frame
+        let mut ctx = X64Context {
+            rsp: stack_base, // RSP points to start of machine frame
+            ..X64Context::default()
+        };
 
         let result = virtual_unwind(
             &parse_unwind_info(&unwind_data, 0).unwrap(),
@@ -2352,9 +2450,11 @@ mod tests {
 
         let mem_reader = slice_memory_reader(&stack, stack_base);
 
-        let mut ctx = X64Context::default();
-        ctx.rsp = stack_base;
-        ctx.rbp = rbp_val; // frame pointer
+        let mut ctx = X64Context {
+            rsp: stack_base,
+            rbp: rbp_val, // frame pointer
+            ..X64Context::default()
+        };
 
         let result = virtual_unwind(
             &parse_unwind_info(&unwind_data, 0).unwrap(),
@@ -2371,21 +2471,21 @@ mod tests {
     fn test_virtual_unwind_save_xmm128() {
         // Function saves XMM6 at [RSP+0x20] (offset=0x20/16=2)
         // Codes: UWOP_PUSH_NONVOL(reg=5), UWOP_ALLOC_SMALL(size=0x30), UWOP_SAVE_XMM128(reg=6, offset=0x20)
-        let _codes = vec![(0, 5), (2, 4), (6, 6)];
 
         // Build UNWIND_INFO with proper slot accounting
         // PushNonVolatile: 1 slot
         // AllocSmall: 1 slot
         // SaveXmm128: 2 slots (code + 16-bit offset)
         // Total: 4 slots (even)
-        let mut buf = Vec::new();
-        buf.push(0x01); // version=1, flags=0
-        buf.push(0x10); // prolog_size
-        buf.push(4); // code_count = 4 (total slots)
-        buf.push(0x00); // frame_register, frame_offset
+        let mut buf = vec![
+            0x01, // version=1, flags=0
+            0x10, // prolog_size
+            4,    // code_count = 4 (total slots)
+            0x00, // frame_register, frame_offset
+        ];
 
         // Slot 0: UWOP_PUSH_NONVOL reg=5
-        buf.push((5 << 4) | 0);
+        buf.push(0x50);
         buf.push(0x00);
 
         // Slot 1: UWOP_ALLOC_SMALL info=4 (size=4*8+8=0x28... wait, let me use info=5 for 0x30)
@@ -2426,9 +2526,11 @@ mod tests {
         let stack_base = 0x7fff_0000u64;
         let mem_reader = slice_memory_reader(&stack, stack_base);
 
-        let mut ctx = X64Context::default();
-        ctx.rsp = stack_base;
-        ctx.rbp = 0xabcddcba;
+        let mut ctx = X64Context {
+            rsp: stack_base,
+            rbp: 0xabcddcba,
+            ..X64Context::default()
+        };
 
         let result = virtual_unwind(&unwind_info, &mut ctx, &mem_reader);
 
@@ -2457,20 +2559,24 @@ mod tests {
 
     #[test]
     fn test_seh_dispatch_with_scope() {
-        // Scope table with one scope that covers RIP range
+        // Scope table with one scope that covers RIP range. Scope offsets are
+        // relative to the function start (RVA 0x10): fault RVA 0x50 maps to
+        // function-relative offset 0x40, inside the guarded region.
         let record = ExceptionRecord::new(STATUS_ACCESS_VIOLATION, 0x140001050);
-        let mut context = X64Context::default();
-        context.rip = 0x140001050; // inside scope 0
+        let context = X64Context {
+            rip: 0x140001050, // inside scope 0
+            ..X64Context::default()
+        };
         let scope_table = ScopeTable {
             count: 1,
             scopes: vec![ScopeRecord {
-                begin_offset: 0x40, // relative to image base
+                begin_offset: 0x40, // relative to function start
                 end_offset: 0x80,
                 handler_offset: 0x200, // handler at image_base + 0x200
                 target_offset: 0,
             }],
         };
-        let result = seh_dispatch(&record, &context, &scope_table, 0x140001000);
+        let result = seh_dispatch(&record, &context, &scope_table, 0x140001000, 0x10);
         assert_eq!(
             result,
             UnwindResult::HandlerFound(0x200),
@@ -2482,18 +2588,20 @@ mod tests {
     fn test_seh_dispatch_outside_scope() {
         // RIP is outside all scopes — should return NotFound
         let record = ExceptionRecord::new(STATUS_ACCESS_VIOLATION, 0x140001050);
-        let mut context = X64Context::default();
-        context.rip = 0x140001050;
+        let context = X64Context {
+            rip: 0x140001050,
+            ..X64Context::default()
+        };
         let scope_table = ScopeTable {
             count: 1,
             scopes: vec![ScopeRecord {
-                begin_offset: 0x100, // doesn't cover 0x50 (relative to image base)
+                begin_offset: 0x100, // doesn't cover offset 0x40 (relative to function start)
                 end_offset: 0x200,
                 handler_offset: 0x300,
                 target_offset: 0,
             }],
         };
-        let result = seh_dispatch(&record, &context, &scope_table, 0x140001000);
+        let result = seh_dispatch(&record, &context, &scope_table, 0x140001000, 0x10);
         assert_eq!(
             result,
             UnwindResult::NotFound,
@@ -2535,8 +2643,10 @@ mod tests {
         let stack_base = 0x7fff_0000u64;
         let mem_reader = slice_memory_reader(&stack, stack_base);
 
-        let mut ctx = X64Context::default();
-        ctx.rsp = stack_base;
+        let mut ctx = X64Context {
+            rsp: stack_base,
+            ..X64Context::default()
+        };
 
         let result = virtual_unwind(&unwind_info, &mut ctx, &mem_reader);
 
@@ -2562,7 +2672,7 @@ mod tests {
         pdata.extend_from_slice(&0x1300u32.to_le_bytes());
         pdata.extend_from_slice(&0x2100u32.to_le_bytes());
 
-        let image_base = 0x14000_0000;
+        let image_base = 0x1_4000_0000;
         seh.register_pdata(image_base, &pdata);
 
         // Verify we can find runtime functions
@@ -2585,14 +2695,15 @@ mod tests {
         // Test AllocLarge with op_info=1 (32-bit unscaled size)
         // Prolog: push rbp; sub rsp, 0x10000 (64KB)
         // Codes: PushNonVolatile(reg=5), AllocLarge(info=1, size=0x10000)
-        let mut buf = Vec::new();
-        buf.push(0x01); // version=1, flags=0
-        buf.push(0x10); // prolog_size
-        buf.push(4); // code_count = 4 slots (push=1, alloc_large=3)
-        buf.push(0x00); // frame_register, frame_offset
+        let mut buf = vec![
+            0x01, // version=1, flags=0
+            0x10, // prolog_size
+            4,    // code_count = 4 slots (push=1, alloc_large=3)
+            0x00, // frame_register, frame_offset
+        ];
 
         // Slot 0: UWOP_PUSH_NONVOL reg=5
-        buf.push((5 << 4) | 0);
+        buf.push(0x50);
         buf.push(0x00);
 
         // Slot 1: UWOP_ALLOC_LARGE op_info=1 (32-bit)
@@ -2625,8 +2736,10 @@ mod tests {
         let stack_base = 0x7fff_0000u64;
         let mem_reader = slice_memory_reader(&stack, stack_base);
 
-        let mut ctx = X64Context::default();
-        ctx.rsp = stack_base;
+        let mut ctx = X64Context {
+            rsp: stack_base,
+            ..X64Context::default()
+        };
 
         let result = virtual_unwind(&unwind_info, &mut ctx, &mem_reader);
 
@@ -2645,18 +2758,19 @@ mod tests {
         // NOTE: 0x200 (512 bytes) cannot be encoded by UWOP_ALLOC_SMALL because
         // op_info is only 4 bits (max 15 => 15*8+8 = 0x80). A 0x200 allocation
         // must use UWOP_ALLOC_LARGE (op_info=0, 16-bit scaled size = 0x200/8 = 0x40).
-        let mut buf = Vec::new();
-        buf.push(0x01); // version=1, flags=0
-        buf.push(0x10); // prolog_size
-        buf.push(6); // code_count = 6 slots (push=1, alloc_large=2, save_far=3)
-        buf.push(0x00);
+        let mut buf = vec![
+            0x01, // version=1, flags=0
+            0x10, // prolog_size
+            6,    // code_count = 6 slots (push=1, alloc_large=2, save_far=3)
+            0x00,
+        ];
 
         // Slot 0: UWOP_PUSH_NONVOL reg=5
-        buf.push((5 << 4) | 0);
+        buf.push(0x50);
         buf.push(0x00);
 
         // Slot 1: UWOP_ALLOC_LARGE op_info=0 (16-bit scaled size follows)
-        buf.push((0 << 4) | 1); // op=1, info=0 => 0x01
+        buf.push(0x01); // op=1, info=0
         buf.push(0x00);
 
         // Slot 2: 16-bit scaled size = 0x200 / 8 = 0x40
@@ -2695,9 +2809,11 @@ mod tests {
         let stack_base = 0x7fff_0000u64;
         let mem_reader = slice_memory_reader(&stack, stack_base);
 
-        let mut ctx = X64Context::default();
-        ctx.rsp = stack_base;
-        ctx.r12 = 0x12345678;
+        let mut ctx = X64Context {
+            rsp: stack_base,
+            r12: 0x12345678,
+            ..X64Context::default()
+        };
 
         let result = virtual_unwind(&unwind_info, &mut ctx, &mem_reader);
 
@@ -2773,7 +2889,7 @@ mod tests {
         // Test rtl_unwind with a single function that pushes RBP and allocates.
         // Set up a SehSubsystem with one .pdata entry and unwind info.
         let mut seh = SehSubsystem::new();
-        let image_base = 0x14000_0000u64;
+        let image_base = 0x1_4000_0000u64;
 
         // Build unwind info: push rbp; sub rsp, 0x28
         let codes = vec![(0, 5), (2, 4)]; // push rbp, alloc 0x28 (= 4*8+8)
@@ -2800,10 +2916,12 @@ mod tests {
         let stack_base = 0x7fff_0000u64;
         let mem_reader = slice_memory_reader(&stack, stack_base);
 
-        let mut ctx = X64Context::default();
-        ctx.rip = 0x140001000; // inside the function
-        ctx.rsp = stack_base;
-        ctx.rbp = 0xdeadbeef;
+        let mut ctx = X64Context {
+            rip: 0x140001000, // inside the function
+            rsp: stack_base,
+            rbp: 0xdeadbeef,
+            ..X64Context::default()
+        };
 
         // rtl_unwind with target_frame=0 (no target), target_rip=0
         let result = rtl_unwind(0, 0, image_base, &mut ctx, &mut seh, &mem_reader);
@@ -2820,7 +2938,7 @@ mod tests {
         // We set up two functions: func_A (0x1000-0x1050) calls func_B (0x1100-0x1150).
         // The unwind should stop at func_A when target_frame is set to func_A's RVA range.
         let mut seh = SehSubsystem::new();
-        let image_base = 0x14000_0000u64;
+        let image_base = 0x1_4000_0000u64;
 
         // Build unwind info for both functions: push rbp only
         let codes_a = vec![(0, 5)]; // func_A: push rbp
@@ -2853,10 +2971,12 @@ mod tests {
         let stack_base = 0x7fff_0000u64;
         let mem_reader = slice_memory_reader(&stack, stack_base);
 
-        let mut ctx = X64Context::default();
-        ctx.rip = 0x140001100; // inside func_B
-        ctx.rsp = stack_base;
-        ctx.rbp = 0xbabababa;
+        let mut ctx = X64Context {
+            rip: 0x140001100, // inside func_B
+            rsp: stack_base,
+            rbp: 0xbabababa,
+            ..X64Context::default()
+        };
 
         // Target frame = any address in func_A's range (0x1000-0x1050 relative)
         // We use 0x140001000 (image_base + 0x1000)
@@ -2894,7 +3014,7 @@ mod tests {
         // Test rtl_unwind with target_rip set: when stopping at the target
         // frame, RIP is overwritten with target_rip.
         let mut seh = SehSubsystem::new();
-        let image_base = 0x14000_0000u64;
+        let image_base = 0x1_4000_0000u64;
 
         // One function: push rbp
         let codes = vec![(0, 5)];
@@ -2917,10 +3037,12 @@ mod tests {
         let stack_base = 0x7fff_0000u64;
         let mem_reader = slice_memory_reader(&stack, stack_base);
 
-        let mut ctx = X64Context::default();
-        ctx.rip = 0x140001000;
-        ctx.rsp = stack_base;
-        ctx.rbp = 0xcafebabe;
+        let mut ctx = X64Context {
+            rip: 0x140001000,
+            rsp: stack_base,
+            rbp: 0xcafebabe,
+            ..X64Context::default()
+        };
 
         // target_rip = 0x14000ffff — after unwinding, RIP should be this value
         let result = rtl_unwind(0, 0x14000ffff, image_base, &mut ctx, &mut seh, &mem_reader);
@@ -2947,10 +3069,12 @@ mod tests {
         // Instead, we need to set a target_frame and verify target_rip is applied.
 
         // Let me use target_frame=image_base+0x1000 (the function itself)
-        let mut ctx2 = X64Context::default();
-        ctx2.rip = 0x140001000;
-        ctx2.rsp = stack_base;
-        ctx2.rbp = 0xcafebabe;
+        let mut ctx2 = X64Context {
+            rip: 0x140001000,
+            rsp: stack_base,
+            rbp: 0xcafebabe,
+            ..X64Context::default()
+        };
 
         let result2 = rtl_unwind(
             image_base + 0x1000,
@@ -2971,13 +3095,15 @@ mod tests {
         // When there is no runtime function for the current RIP,
         // rtl_unwind should return Err.
         let mut seh = SehSubsystem::new();
-        let image_base = 0x14000_0000u64;
+        let image_base = 0x1_4000_0000u64;
 
         let mem_reader = |_: u64, _: &mut [u8]| false;
 
-        let mut ctx = X64Context::default();
-        ctx.rip = 0x140009999; // no .pdata covers this address
-        ctx.rsp = 0x7fff_0000;
+        let mut ctx = X64Context {
+            rip: 0x140009999, // no .pdata covers this address
+            rsp: 0x7fff_0000,
+            ..X64Context::default()
+        };
 
         let result = rtl_unwind(0, 0, image_base, &mut ctx, &mut seh, &mem_reader);
         assert!(
@@ -2990,7 +3116,7 @@ mod tests {
     fn test_rtl_unwind_multiple_frames() {
         // Unwind through three nested frames to verify multi-frame unwinding.
         let mut seh = SehSubsystem::new();
-        let image_base = 0x14000_0000u64;
+        let image_base = 0x1_4000_0000u64;
 
         // All three functions have the same prolog: push rbp; sub rsp, 0x28
         let codes = vec![(0, 5), (2, 4)]; // push rbp, alloc 0x28 (= 4*8+8)
@@ -3105,10 +3231,12 @@ mod tests {
         let stack_base = 0x7fff_0000u64;
         let mem_reader = slice_memory_reader(&stack, stack_base);
 
-        let mut ctx = X64Context::default();
-        ctx.rip = image_base + 0x1200; // inside func_C
-        ctx.rsp = stack_base; // RSP points to func_C's locals
-        ctx.rbp = func_c_rbp;
+        let mut ctx = X64Context {
+            rip: image_base + 0x1200, // inside func_C
+            rsp: stack_base,          // RSP points to func_C's locals
+            rbp: func_c_rbp,
+            ..X64Context::default()
+        };
 
         // Unwind all three frames (target_frame=0)
         let result = rtl_unwind(0, 0, image_base, &mut ctx, &mut seh, &mem_reader);
@@ -3141,9 +3269,11 @@ mod tests {
         let stack_base = 0x7fff_0000u64;
         let mem_reader = slice_memory_reader(&stack, stack_base);
 
-        let mut ctx = X64Context::default();
-        ctx.rsp = stack_base;
-        ctx.rbp = 0xdeadbeef;
+        let mut ctx = X64Context {
+            rsp: stack_base,
+            rbp: 0xdeadbeef,
+            ..X64Context::default()
+        };
 
         let unwind_info = parse_unwind_info(&unwind_data, 0).expect("should parse");
         let result = virtual_unwind(&unwind_info, &mut ctx, &mem_reader);
@@ -3164,7 +3294,7 @@ mod tests {
         // (primary) entry's codes complete the frame before the return address
         // is popped.
         let mut seh = SehSubsystem::new();
-        let image_base = 0x14000_0000u64;
+        let image_base = 0x1_4000_0000u64;
 
         // Secondary region (unwind1 @ 0x2000): allocated 0x28 of stack and
         // chains to the primary entry. CHAININFO requires an appended
@@ -3200,10 +3330,12 @@ mod tests {
         stack[0x30..0x38].copy_from_slice(&0x1_4000_bbbbu64.to_le_bytes());
         let mem_reader = slice_memory_reader(&stack, stack_base);
 
-        let mut ctx = X64Context::default();
-        ctx.rip = 0x1_4000_1000;
-        ctx.rsp = stack_base;
-        ctx.rbp = 0xf00d;
+        let mut ctx = X64Context {
+            rip: 0x1_4000_1000,
+            rsp: stack_base,
+            rbp: 0xf00d,
+            ..X64Context::default()
+        };
 
         let result = rtl_unwind(0, 0, image_base, &mut ctx, &mut seh, &mem_reader);
 
@@ -3390,20 +3522,22 @@ mod tests {
             STATUS_ACCESS_VIOLATION,
             0x140001000,
             &context,
-            0x14000_0000,
+            0x1_4000_0000,
             &no_memory,
         );
         assert!(result.is_err(), "should fail with no .pdata");
     }
 
     /// Test: Corrupt unwind metadata — invalid handler address.
-    /// An unwind info entry with EHANDLER flag but a handler RVA of 0
-    /// should still be handled without panic.
+    /// An unwind info entry with EHANDLER flag but a handler RVA of 0 is
+    /// corrupt metadata: dispatch must fail closed (Err) instead of claiming
+    /// a handler that can never run, which would silently swallow the
+    /// exception and livelock the runtime.
     #[test]
     fn test_corrupt_unwind_invalid_handler_address() {
         let _guard = VEH_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let mut seh = SehSubsystem::new();
-        let image_base = 0x14000_0000u64;
+        let image_base = 0x1_4000_0000u64;
 
         // Build unwind info with EHANDLER flag and handler RVA = 0
         let codes = vec![(0, 5)]; // push rbp
@@ -3422,11 +3556,14 @@ mod tests {
         seh.register_pdata(image_base, &pdata);
 
         let no_memory = |_addr: u64, _buf: &mut [u8]| false;
-        let mut context = X64Context::default();
         // Set RIP to the fault address so dispatch can find the .pdata entry
-        context.rip = 0x140001000;
+        let context = X64Context {
+            rip: 0x140001000,
+            ..X64Context::default()
+        };
 
-        // Dispatch should not panic even with handler_rva=0
+        // Dispatch must not panic and must fail closed (the handler RVA 0 is
+        // not dispatchable).
         let result = seh.dispatch(
             STATUS_ACCESS_VIOLATION,
             0x140001000,
@@ -3434,10 +3571,9 @@ mod tests {
             image_base,
             &no_memory,
         );
-        // It should find the handler (EHANDLER flag set) and return Ok
         assert!(
-            result.is_ok(),
-            "dispatch with invalid handler address should not panic"
+            result.is_err(),
+            "dispatch with corrupt (zero) handler address must fail closed"
         );
     }
 
@@ -3471,19 +3607,20 @@ mod tests {
     /// Test: Corrupt unwind metadata — invalid version number.
     #[test]
     fn test_corrupt_unwind_data_invalid_version() {
-        // Version 0 is reserved/invalid
+        // Version 0 is reserved/invalid; per the PE/COFF spec only version 1
+        // is defined, so parsing must fail closed instead of mis-unwinding.
         let data = make_unwind_info(0, 0, &[]);
-        let info = parse_unwind_info(&data, 0);
-        // Version 0 is technically parseable but should be noted as invalid
-        if let Some(info) = info {
-            assert_eq!(info.version, 0, "version should be 0");
-        }
+        assert!(
+            parse_unwind_info(&data, 0).is_none(),
+            "version 0 must be rejected"
+        );
 
-        // Version > 1 is also unusual but we parse anyway
+        // Version > 1 is also undefined; reject it the same way.
         let data2 = make_unwind_info(2, 0, &[]);
-        let info2 = parse_unwind_info(&data2, 0);
-        assert!(info2.is_some(), "version 2 should still parse");
-        assert_eq!(info2.unwrap().version, 2);
+        assert!(
+            parse_unwind_info(&data2, 0).is_none(),
+            "version 2 must be rejected"
+        );
     }
 
     /// Test: Verify Windows-compatible ordering — first-chance VEH handlers
@@ -3545,7 +3682,7 @@ mod tests {
     fn test_veh_before_seh_first_chance() {
         let _guard = VEH_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let mut seh = SehSubsystem::new();
-        let image_base = 0x14000_0000u64;
+        let image_base = 0x1_4000_0000u64;
 
         // Register a VEH handler that handles the exception
         let handler: VectoredExceptionHandler = Arc::new(|ptrs| {
@@ -3659,7 +3796,7 @@ mod tests {
     #[test]
     fn test_chain_depth_limit() {
         let mut seh = SehSubsystem::new();
-        let image_base = 0x14000_0000u64;
+        let image_base = 0x1_4000_0000u64;
 
         // Create a self-referencing CHAININFO entry that would loop forever.
         // The chained RUNTIME_FUNCTION points back to the same unwind info.
@@ -3680,9 +3817,11 @@ mod tests {
         seh.register_pdata(image_base, &pdata);
 
         let no_memory = |_addr: u64, _buf: &mut [u8]| false;
-        let mut ctx = X64Context::default();
-        ctx.rip = 0x140001000;
-        ctx.rsp = 0x7fff_0000;
+        let mut ctx = X64Context {
+            rip: 0x140001000,
+            rsp: 0x7fff_0000,
+            ..X64Context::default()
+        };
 
         // This should terminate (not infinite loop) and return an error
         let result = rtl_unwind(0, 0, image_base, &mut ctx, &mut seh, &no_memory);
@@ -3704,8 +3843,10 @@ mod tests {
         let mem_reader = |_: u64, _: &mut [u8]| false;
 
         // Zero RSP
-        let mut ctx = X64Context::default();
-        ctx.rsp = 0;
+        let mut ctx = X64Context {
+            rsp: 0,
+            ..X64Context::default()
+        };
         let result = virtual_unwind(&unwind_info, &mut ctx, &mem_reader);
         assert_eq!(
             result,
@@ -3714,8 +3855,10 @@ mod tests {
         );
 
         // Misaligned RSP (not 8-byte aligned)
-        let mut ctx2 = X64Context::default();
-        ctx2.rsp = 0x7fff_0003; // misaligned
+        let mut ctx2 = X64Context {
+            rsp: 0x7fff_0003, // misaligned
+            ..X64Context::default()
+        };
         let result2 = virtual_unwind(&unwind_info, &mut ctx2, &mem_reader);
         assert_eq!(
             result2,
@@ -3724,8 +3867,10 @@ mod tests {
         );
 
         // Properly aligned RSP should work normally
-        let mut ctx3 = X64Context::default();
-        ctx3.rsp = 0x7fff_0000; // aligned
+        let mut ctx3 = X64Context {
+            rsp: 0x7fff_0000, // aligned
+            ..X64Context::default()
+        };
         let result3 = virtual_unwind(&unwind_info, &mut ctx3, &mem_reader);
         // Should not be NotFound due to alignment (may be Completed or other)
         assert_ne!(
@@ -3768,7 +3913,7 @@ mod tests {
     fn test_unhandled_exception_diagnostics() {
         let _guard = VEH_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let mut seh = SehSubsystem::new();
-        let image_base = 0x14000_0000u64;
+        let image_base = 0x1_4000_0000u64;
 
         // Register .pdata with one function that has no handler
         let codes = vec![(0, 5), (2, 4)]; // push rbp, alloc 0x28
@@ -3809,5 +3954,234 @@ mod tests {
                 "error message should contain exception code"
             );
         }
+    }
+
+    /// Test: UWOP_SET_FPREG with a nonzero frame offset restores RSP as
+    /// `R[frame_register] - offset` (not `+ offset`).
+    ///
+    /// Prolog: `push rbp; sub rsp, 0x20; lea rbp, [rsp+0x20]` — the frame
+    /// register is established as RBP = RSP_final + 0x20, so unwinding must
+    /// set RSP = RBP - 0x20. The header byte encodes frame_offset=2 (2*16).
+    #[test]
+    fn test_virtual_unwind_set_frame_pointer_nonzero_offset() {
+        let codes = vec![(0, 5), (2, 3), (3, 5)]; // push rbp, alloc 0x20, set_fp
+        let mut unwind_data = make_unwind_info(1, 0, &codes);
+        // Header byte 3: (frame_offset << 4) | frame_register = (2 << 4) | 5.
+        unwind_data[3] = 0x25;
+
+        // Stack layout at unwind entry (RSP = RBP - 0x20):
+        // [RSP+0x00..0x20): locals
+        // [RSP+0x20]: saved RBP
+        // [RSP+0x28]: return address
+        let mut stack = vec![0u8; 0x30];
+        stack[0x20..0x28].copy_from_slice(&0x0bad_f00du64.to_le_bytes()); // saved RBP
+        stack[0x28..0x30].copy_from_slice(&0x14000beefu64.to_le_bytes()); // return addr
+
+        let stack_base = 0x7fff_0000u64;
+        let rbp_val = stack_base + 0x20; // RBP = RSP_final + 0x20
+        let mem_reader = slice_memory_reader(&stack, stack_base);
+
+        let mut ctx = X64Context {
+            rsp: stack_base,
+            rbp: rbp_val,
+            ..X64Context::default()
+        };
+
+        let result = virtual_unwind(
+            &parse_unwind_info(&unwind_data, 0).unwrap(),
+            &mut ctx,
+            &mem_reader,
+        );
+
+        assert_eq!(result, UnwindResult::Completed);
+        assert_eq!(ctx.rbp, 0x0bad_f00d, "RBP should be restored from stack");
+        assert_eq!(ctx.rip, 0x14000beef, "RIP should be return address");
+        assert_eq!(
+            ctx.rsp,
+            stack_base + 0x30,
+            "RSP must be restored via RBP - offset (SET_FPREG sign)"
+        );
+    }
+
+    /// Test: the unwind cache is keyed per image — two images sharing the
+    /// same unwind RVA must never return each other's unwind info.
+    #[test]
+    fn test_unwind_cache_image_isolated() {
+        let mut seh = SehSubsystem::new();
+        let base_a = 0x1_4000_0000u64;
+        let base_b = 0x1_5000_0000u64;
+
+        // Same RVA 0x2000 in both images' blobs, with different codes.
+        let ua = make_unwind_info(1, 0, &[(0, 5)]); // push rbp
+        let ub = make_unwind_info(1, 0, &[(0, 3)]); // push rbx
+        let mut da = vec![0u8; 0x2000 + ua.len()];
+        da[0x2000..0x2000 + ua.len()].copy_from_slice(&ua);
+        let mut db = vec![0u8; 0x2000 + ub.len()];
+        db[0x2000..0x2000 + ub.len()].copy_from_slice(&ub);
+        seh.register_unwind_data(base_a, da);
+        seh.register_unwind_data(base_b, db);
+
+        let ia = seh.get_unwind_info_for_image(base_a, 0x2000).unwrap().clone();
+        let ib = seh.get_unwind_info_for_image(base_b, 0x2000).unwrap().clone();
+        assert_eq!(ia.codes[0], UnwindCode::PushNonVolatile { register: 5 });
+        assert_eq!(ib.codes[0], UnwindCode::PushNonVolatile { register: 3 });
+
+        // Re-fetching in the opposite order must still return the same info
+        // for each image (no cross-image cache poisoning).
+        let ib2 = seh.get_unwind_info_for_image(base_b, 0x2000).unwrap().clone();
+        let ia2 = seh.get_unwind_info_for_image(base_a, 0x2000).unwrap().clone();
+        assert_eq!(ib2.codes[0], UnwindCode::PushNonVolatile { register: 3 });
+        assert_eq!(ia2.codes[0], UnwindCode::PushNonVolatile { register: 5 });
+    }
+
+    /// Test: `dispatch` actually queues an EHANDLER frame's language handler
+    /// for guest invocation (via the pending guest VEH queue) instead of
+    /// silently swallowing the exception.
+    #[test]
+    fn test_dispatch_invokes_ehandler_via_pending_queue() {
+        let _guard = VEH_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // Clear any leftover entries from earlier dispatches.
+        drain_pending_guest_veh();
+
+        let mut seh = SehSubsystem::new();
+        let image_base = 0x1_4000_0000u64;
+        let codes = vec![(0, 5)]; // push rbp
+        let handler_rva = 0x3000u32;
+        let unwind_data = make_unwind_info_full(1, 0x01, &codes, &handler_rva.to_le_bytes());
+
+        let mut data = vec![0u8; 0x3000];
+        data[0x2000..0x2000 + unwind_data.len()].copy_from_slice(&unwind_data);
+        seh.register_unwind_data(image_base, data);
+
+        let mut pdata = Vec::new();
+        pdata.extend_from_slice(&0x1000u32.to_le_bytes());
+        pdata.extend_from_slice(&0x1050u32.to_le_bytes());
+        pdata.extend_from_slice(&0x2000u32.to_le_bytes());
+        seh.register_pdata(image_base, &pdata);
+
+        let no_memory = |_addr: u64, _buf: &mut [u8]| false;
+        let context = X64Context {
+            rip: 0x140001000,
+            rsp: 0x7fff_0000,
+            ..X64Context::default()
+        };
+
+        let result = seh.dispatch(
+            STATUS_ACCESS_VIOLATION,
+            0x140001000,
+            &context,
+            image_base,
+            &no_memory,
+        );
+        assert!(result.is_ok(), "EHANDLER frame must be claimed");
+
+        let pending = drain_pending_guest_veh();
+        assert_eq!(pending.len(), 1, "exactly one handler must be queued");
+        assert_eq!(
+            pending[0].0,
+            image_base + handler_rva as u64,
+            "queued handler must be the frame's language handler address"
+        );
+        assert_eq!(pending[0].1.code, STATUS_ACCESS_VIOLATION);
+    }
+
+    /// Test: `rtl_unwind` terminates (Err) on a cyclic guest stack instead
+    /// of spinning forever.
+    #[test]
+    fn test_rtl_unwind_bounded_cyclic_stack() {
+        let mut seh = SehSubsystem::new();
+        let image_base = 0x1_4000_0000u64;
+
+        let codes = vec![(0, 5)]; // push rbp
+        let unwind_data = make_unwind_info(1, 0, &codes);
+        let mut data = vec![0u8; 0x2000 + unwind_data.len()];
+        data[0x2000..0x2000 + unwind_data.len()].copy_from_slice(&unwind_data);
+        seh.register_unwind_data(image_base, data);
+
+        let mut pdata = Vec::new();
+        pdata.extend_from_slice(&0x1000u32.to_le_bytes());
+        pdata.extend_from_slice(&0x1050u32.to_le_bytes());
+        pdata.extend_from_slice(&0x2000u32.to_le_bytes());
+        seh.register_pdata(image_base, &pdata);
+
+        // The "return address" points back into the same function, so every
+        // unwind iteration lands in the same .pdata entry.
+        let mut stack = vec![0u8; 16];
+        stack[0..8].copy_from_slice(&0x1234u64.to_le_bytes()); // saved RBP
+        stack[8..16].copy_from_slice(&(image_base + 0x1000u64).to_le_bytes()); // cyclic ret
+        let stack_base = 0x7fff_0000u64;
+        let mem_reader = slice_memory_reader(&stack, stack_base);
+
+        let mut ctx = X64Context {
+            rip: 0x140001000,
+            rsp: stack_base,
+            ..X64Context::default()
+        };
+
+        let result = rtl_unwind(0, 0, image_base, &mut ctx, &mut seh, &mem_reader);
+        assert!(
+            result.is_err(),
+            "cyclic stack must terminate with Err (frame limit), not hang"
+        );
+    }
+
+    /// Test: `unwind_frames` terminates (NotFound) when a handler repeatedly
+    /// declines on a cyclic guest stack instead of spinning forever.
+    #[test]
+    fn test_unwind_frames_bounded() {
+        let mut seh = SehSubsystem::new();
+        let image_base = 0x1_4000_0000u64;
+
+        let codes = vec![(0, 5)]; // push rbp
+        let handler_rva = 0x3000u32;
+        let unwind_data = make_unwind_info_full(1, 0x01, &codes, &handler_rva.to_le_bytes());
+        let mut data = vec![0u8; 0x2000 + unwind_data.len()];
+        data[0x2000..0x2000 + unwind_data.len()].copy_from_slice(&unwind_data);
+        seh.register_unwind_data(image_base, data);
+
+        let mut pdata = Vec::new();
+        pdata.extend_from_slice(&0x1000u32.to_le_bytes());
+        pdata.extend_from_slice(&0x1050u32.to_le_bytes());
+        pdata.extend_from_slice(&0x2000u32.to_le_bytes());
+        seh.register_pdata(image_base, &pdata);
+
+        // Cyclic return address keeps the walk inside the same function while
+        // the (declining) handler prevents normal completion.
+        let mut stack = vec![0u8; 16];
+        stack[0..8].copy_from_slice(&0x1234u64.to_le_bytes());
+        stack[8..16].copy_from_slice(&(image_base + 0x1000u64).to_le_bytes());
+        let stack_base = 0x7fff_0000u64;
+        let mem_reader = slice_memory_reader(&stack, stack_base);
+
+        let mut ctx = X64Context {
+            rip: 0x140001000,
+            rsp: stack_base,
+            ..X64Context::default()
+        };
+
+        let unwind_info = seh.get_unwind_info_for_image(image_base, 0x2000).unwrap().clone();
+        let find = |ib: u64, rva: u32| seh.find_runtime_function(ib, rva).cloned();
+        let get = move |_rva: u32| Some(unwind_info.clone());
+        let mut handler_calls = 0u32;
+        let result = unwind_frames(
+            image_base,
+            &mut ctx,
+            &find,
+            &get,
+            &mem_reader,
+            &mut |_, _| {
+                handler_calls += 1;
+                false // handler always declines
+            },
+        );
+        assert_eq!(
+            result,
+            UnwindResult::NotFound,
+            "bounded walk must terminate with NotFound, not hang"
+        );
+        assert!(
+            handler_calls > 1,
+            "declining handler must have been invoked multiple times"
+        );
     }
 }

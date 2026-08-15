@@ -1,0 +1,164 @@
+warning: unreachable expression
+     --> src/pe_runtime.rs:65207:9
+      |
+65202 |               return Ok(Arc::clone(&cached.cached));
+      |               ------------------------------------- any code following this expression is unreachable
+...
+65207 | /         if let Some(jit) = jit_runtime {
+65208 | |             if jit.is_compiled(rip) {
+65209 | |                 let _ = jit.unchain_target(rip);
+65210 | |             }
+65211 | |         }
+      | |_________^ unreachable expression
+      |
+      = note: `#[warn(unreachable_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `lhs`
+     --> src/cpu.rs:16265:38
+      |
+16265 |             IrInstruction::Compare { lhs, rhs, width } => {
+      |                                      ^^^ help: try ignoring the field: `lhs: _`
+      |
+      = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `rhs`
+     --> src/cpu.rs:16265:43
+      |
+16265 |             IrInstruction::Compare { lhs, rhs, width } => {
+      |                                           ^^^ help: try ignoring the field: `rhs: _`
+
+warning: unused variable: `width`
+     --> src/cpu.rs:16265:48
+      |
+16265 |             IrInstruction::Compare { lhs, rhs, width } => {
+      |                                                ^^^^^ help: try ignoring the field: `width: _`
+
+warning: unused variable: `lhs`
+     --> src/cpu.rs:16268:35
+      |
+16268 |             IrInstruction::Test { lhs, rhs, width } => {
+      |                                   ^^^ help: try ignoring the field: `lhs: _`
+
+warning: unused variable: `rhs`
+     --> src/cpu.rs:16268:40
+      |
+16268 |             IrInstruction::Test { lhs, rhs, width } => {
+      |                                        ^^^ help: try ignoring the field: `rhs: _`
+
+warning: unused variable: `width`
+     --> src/cpu.rs:16268:45
+      |
+16268 |             IrInstruction::Test { lhs, rhs, width } => {
+      |                                             ^^^^^ help: try ignoring the field: `width: _`
+
+warning: unused variable: `jit_runtime`
+     --> src/pe_runtime.rs:65191:5
+      |
+65191 |     jit_runtime: Option<&mut crate::jit::JitRuntime>,
+      |     ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_jit_runtime`
+
+warning: `casa1` (lib test) generated 8 warnings (run `cargo fix --lib -p casa1 --tests` to apply 7 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.36s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/lib.rs (target/debug/deps/casa1-7ce754b9b667f95d)
+
+running 95 tests
+test seh::tests::test_restore_context ... ok
+test seh::tests::test_corrupt_unwind_data_truncated ... ok
+test seh::tests::test_corrupt_unwind_data_invalid_version ... ok
+test seh::tests::test_parse_pdata_empty ... ok
+test seh::tests::test_parse_pdata ... ok
+test seh::tests::test_parse_unwind_info_push_nonvol ... ok
+test seh::tests::test_parse_unwind_info_with_handler_rva ... ok
+test seh::tests::test_parse_unwind_info ... ok
+test seh::tests::test_seh_dispatch_no_handler ... ok
+test seh::tests::test_seh_dispatch_outside_scope ... ok
+test seh::tests::test_seh_dispatch_with_scope ... ok
+test seh::tests::test_seh_with_uhandler_flag ... ok
+test seh::tests::test_stack_pointer_validation ... ok
+test seh::tests::test_pending_guest_veh_limit ... ok
+test seh::tests::test_rtl_unwind_not_found ... ok
+test seh::tests::test_rtl_restore_context_basic ... ok
+test seh::tests::test_unwind_info ... ok
+test seh::tests::test_seh_subsystem_register_pdata ... ok
+test seh::tests::test_rtl_unwind_with_target_frame ... ok
+test seh::tests::test_collided_unwind_follow_chain ... ok
+test seh::tests::test_rtl_unwind_multiple_frames ... ok
+test seh::tests::test_unwind_cache_image_isolated ... ok
+test seh::tests::test_rtl_unwind_with_target_rip ... ok
+test seh::tests::test_rtl_unwind_single_frame ... ok
+test seh::tests::test_dispatch_invokes_ehandler_via_pending_queue ... ok
+test seh::tests::test_chain_depth_limit ... ok
+test seh::tests::test_virtual_unwind_alloc_large_32bit ... ok
+test seh::tests::test_virtual_unwind_chaininfo ... ok
+test seh::tests::test_virtual_unwind_ehandler ... ok
+test seh::tests::test_virtual_unwind_push_machine_frame ... ok
+test seh::tests::test_virtual_unwind_push_nonvol ... ok
+test seh::tests::test_virtual_unwind_save_nonvol ... ok
+test seh::tests::test_virtual_unwind_save_nonvol_far ... ok
+test seh::tests::test_virtual_unwind_save_xmm128 ... ok
+test seh::tests::test_virtual_unwind_set_frame_pointer ... ok
+test seh::tests::test_virtual_unwind_set_frame_pointer_nonzero_offset ... ok
+test seh::tests::test_virtual_unwind_with_ehandler_flag_restores_registers ... ok
+test seh::tests::test_first_chance_last_chance_ordering ... ok
+test seh::tests::test_corrupt_unwind_missing_runtime_function ... ok
+test seh::tests::test_corrupt_unwind_invalid_handler_address ... ok
+test seh::tests::test_rtl_restore_context_with_veh_handler ... ok
+test seh::tests::test_seh_subsystem_dispatch_no_veh ... ok
+test seh::tests::test_unwind_frames_bounded ... ok
+test seh::tests::test_unhandled_exception_diagnostics ... ok
+test threads::tests::apc_queue_disabled_blocks_delivery ... ok
+test threads::tests::apc_queue_deliver_returns_entries ... ok
+test threads::tests::apc_queue_peek_and_count ... ok
+test threads::tests::condition_variable_wake ... ok
+test seh::tests::test_vectored_continue_handler_handles ... ok
+test seh::tests::test_rtl_unwind_bounded_cyclic_stack ... ok
+test threads::tests::event_auto_reset_is_signaled_clears ... ok
+test seh::tests::test_vectored_continue_handlers_called ... ok
+test threads::tests::event_auto_reset_clears_after_wait ... ok
+test seh::tests::test_veh_add_handler_during_dispatch ... ok
+test seh::tests::test_veh_add_remove ... ok
+test threads::tests::event_manual_reset_set_and_wait ... ok
+test threads::tests::concurrency_guest_barrier_stress ... ok
+test threads::tests::event_reset_clears_signaled_state ... ok
+test threads::tests::concurrency_guest_mutex_high_contention ... ok
+test seh::tests::test_veh_before_seh_first_chance ... ok
+test seh::tests::test_veh_continue_execution ... ok
+test seh::tests::test_veh_dispatch ... ok
+test threads::tests::guest_event_auto_reset ... ok
+test threads::tests::concurrency_guest_init_once_parallel ... ok
+test seh::tests::test_veh_nested_exception_during_dispatch ... ok
+test threads::tests::guest_event_manual_reset ... ok
+test seh::tests::test_veh_remove_handler_during_dispatch ... ok
+test threads::tests::guest_init_once ... ok
+test threads::tests::guest_mutex_acquire_and_release ... ok
+test threads::tests::guest_mutex_recursive_acquire ... ok
+test threads::tests::guest_barrier_sync ... ok
+test threads::tests::guest_semaphore_basic ... ok
+test threads::tests::mutex_acquire_and_release ... ok
+test threads::tests::mutex_recursive_acquire ... ok
+test threads::tests::mutex_release_from_non_owner_fails ... ok
+test threads::tests::mutex_try_acquire_fails_when_owned ... ok
+test threads::tests::semaphore_release_and_wait ... ok
+test threads::tests::srwlock_exclusive_and_shared ... ok
+test threads::tests::semaphore_release_returns_previous_count ... ok
+test threads::tests::thread_id_allocation_is_unique ... ok
+test threads::tests::enhanced_thread_pool_queue_and_dequeue ... ok
+test threads::tests::guest_semaphore_exceeds_max ... ok
+test threads::tests::semaphore_release_exceeds_max_fails ... ok
+test threads::tests::guest_iocp_post_and_dequeue ... ok
+test threads::tests::fiber_manager_delete_returns_callbacks ... ok
+test threads::tests::fiber_fls_slots ... ok
+test threads::tests::enhanced_thread_pool_timer_create_delete ... ok
+test threads::tests::fiber_manager_create_and_switch ... ok
+test threads::tests::event_blocking_wait ... ok
+test threads::tests::mutex_blocking_acquire ... ok
+test threads::tests::semaphore_blocking_wait ... ok
+test threads::tests::concurrency_iocp_multi_producer_consumer ... ok
+test threads::tests::concurrency_guest_semaphore_multi_thread ... ok
+test threads::tests::guest_mutex_blocking_acquire ... ok
+test threads::tests::guest_semaphore_blocking_wait ... ok
+
+test result: ok. 95 passed; 0 failed; 0 ignored; 0 measured; 2451 filtered out; finished in 0.07s
+
