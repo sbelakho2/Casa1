@@ -145,8 +145,20 @@ fn test_create_process_w_consecutive_ids_increment() {
     let (_tmp, mut win32) = setup_win32();
     let r1 = create_test_process(&mut win32, "C:\\a.exe", "a.exe", false);
     let r2 = create_test_process(&mut win32, "C:\\b.exe", "b.exe", false);
-    assert_eq!(r2.process_id, r1.process_id + 1);
-    assert_eq!(r2.thread_id, r1.thread_id + 1);
+    // Each process must get a strictly increasing, unique ID (the exact +1
+    // relationship is an implementation detail and not asserted).
+    assert!(
+        r2.process_id > r1.process_id,
+        "later processes must get strictly greater process IDs ({} then {})",
+        r1.process_id,
+        r2.process_id
+    );
+    assert!(
+        r2.thread_id > r1.thread_id,
+        "later processes must get strictly greater thread IDs ({} then {})",
+        r1.thread_id,
+        r2.thread_id
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -181,6 +181,36 @@ fn t17_3_steam_named_pipe_creation() {
         read_back, message,
         "IPC message should round-trip correctly"
     );
+
+    // Distinct from the plain round-trip in t18_1: the duplex Steam IPC pipe must
+    // preserve message ordering across multiple queued messages, and must carry the
+    // server's reply back to the client.
+    let second = b"SteamIPC:RequestAppState";
+    let third = b"SteamIPC:RequestDownload";
+    win32.write_file(client, second).expect("second client write");
+    win32.write_file(client, third).expect("third client write");
+    assert_eq!(
+        win32
+            .read_file(server, second.len())
+            .expect("read second"),
+        second,
+        "messages must be delivered in FIFO order"
+    );
+    assert_eq!(
+        win32
+            .read_file(server, third.len())
+            .expect("read third"),
+        third,
+        "messages must be delivered in FIFO order"
+    );
+
+    let reply = b"SteamIPC:Reply";
+    win32.write_file(server, reply).expect("server reply");
+    assert_eq!(
+        win32.read_file(client, 64).expect("client read reply"),
+        reply,
+        "duplex reply must reach the client"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -249,7 +279,7 @@ fn t17_4_steam_filesystem_layout() {
 
 #[test]
 fn t17_5_steam_service_registration() {
-    // Create an SCM controller with default config (SCM disabled by default)
+    // The SCM controller starts disabled with its documented defaults.
     let config = ScmConfig::default();
     let controller = ScmController::new(config);
 
@@ -267,6 +297,51 @@ fn t17_5_steam_service_registration() {
         !controller.config.enabled,
         "SCM should be disabled by default"
     );
+
+    // Exercise the real lifecycle: registering a service means configuring the VM
+    // and driving it through start → pause → resume → stop, with state transitions
+    // asserted at every step (a config/state struct that ignores these calls fails).
+    let shared = tempfile::tempdir().expect("shared dir");
+    let mut active = ScmController::new(ScmConfig {
+        enabled: true,
+        cpu_count: 8,
+        memory_mb: 8192,
+        shared_directory: Some(shared.path().to_string_lossy().to_string()),
+        ..ScmConfig::default()
+    });
+
+    active.start_vm().expect("start VM");
+    assert_eq!(active.vm_state, casa1::scm::VmState::Running);
+    assert!(
+        active.virtio_net.connected,
+        "virtio-net must connect on start"
+    );
+    assert!(
+        active.virtio_fs.mounted,
+        "configured shared directory must mount on start"
+    );
+
+    active.pause_vm().expect("pause VM");
+    assert_eq!(active.vm_state, casa1::scm::VmState::Paused);
+
+    active.resume_vm().expect("resume VM");
+    assert_eq!(active.vm_state, casa1::scm::VmState::Running);
+
+    active.stop_vm().expect("stop VM");
+    assert_eq!(active.vm_state, casa1::scm::VmState::Stopped);
+    assert!(!active.virtio_net.connected, "virtio-net must drop on stop");
+    assert!(
+        !active.virtio_fs.mounted,
+        "shared directory must unmount on stop"
+    );
+
+    // Invalid transitions must be rejected rather than silently accepted.
+    let double_stop = active.stop_vm().expect_err("stop on stopped VM must fail");
+    assert_eq!(double_stop.code, casa1::reason::ReasonCode::RcInvalidState);
+
+    active.start_vm().expect("restart VM");
+    let double_start = active.start_vm().expect_err("double start must fail");
+    assert_eq!(double_start.code, casa1::reason::ReasonCode::RcInvalidState);
 }
 
 // ---------------------------------------------------------------------------
@@ -324,17 +399,17 @@ fn t17_7_steam_webhelper_launch() {
     // Initialize CEF bridge (which manages steamwebhelper.exe / WKWebView)
     let mut bridge = CefBridge::new();
 
-    // Initialize CEF — WKWebView may not be available in headless/CI environments.
-    // If initialization fails due to WKWebView unavailability, the test passes
-    // (we verified the bridge was constructed and the init path was exercised).
-    let init_result = bridge.cef_initialize(CefSettings::default());
-    if let Err(e) = init_result {
-        eprintln!(
-            "note: t17_7 skipped CEF browser tests — WKWebView unavailable ({:?})",
-            e
-        );
+    // Gate on an explicit capability probe (WKWebViewManager::is_available — the same
+    // probe cef_initialize consults internally), not on the init result: if WKWebView
+    // is unavailable (headless/CI), skip with a clear message; if the probe says the
+    // bridge is available but initialization still fails, that is a real failure.
+    if !casa1::cef_bridge::WKWebViewManager::new().is_available() {
+        eprintln!("note: t17_7 skipped CEF browser tests — WKWebView unavailable");
         return;
     }
+    bridge
+        .cef_initialize(CefSettings::default())
+        .expect("CEF init must succeed when the availability probe reports available");
 
     // Create a browser (simulates steamwebhelper.exe launch)
     let window_info = CefWindowInfo {
@@ -379,7 +454,7 @@ fn t17_7_steam_webhelper_launch() {
 #[test]
 fn t17_8_steam_network_initialization() {
     // Create a Steam protocol stack
-    let stack = SteamProtocolStack::new();
+    let mut stack = SteamProtocolStack::new();
 
     // Verify initial state
     assert_eq!(
@@ -402,4 +477,34 @@ fn t17_8_steam_network_initialization() {
         stack.auth.auth_status == AuthStatus::NotAuthenticated,
         "initial auth status should be NotAuthenticated"
     );
+
+    // Exercise the real connection state machine without touching the well-known
+    // Steam CM servers (src/steam_protocol.rs `steam_zero_touch_default_servers_not_contacted`):
+    // connect to a loopback port nothing is listening on. The attempt must drive the
+    // stack through Resolving → Connecting → Error and report RcNetConnectionFailed,
+    // then disconnect() must restore the idle state.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let closed_addr = listener.local_addr().expect("local addr");
+    drop(listener); // port is now closed — connect must fail fast
+
+    let failed = stack
+        .connect(Some(&closed_addr.to_string()))
+        .expect_err("connect to a closed loopback port must fail");
+    assert_eq!(
+        failed.code,
+        casa1::reason::ReasonCode::RcNetConnectionFailed
+    );
+    assert_eq!(
+        stack.state,
+        ConnectionState::Error,
+        "failed connect must leave the stack in Error state"
+    );
+    assert!(
+        stack.current_server.is_some(),
+        "the attempted server must be recorded"
+    );
+
+    stack.disconnect().expect("disconnect");
+    assert_eq!(stack.state, ConnectionState::Disconnected);
+    assert_eq!(stack.auth.auth_status, AuthStatus::NotAuthenticated);
 }

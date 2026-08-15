@@ -126,6 +126,22 @@ fn t28c_01_co_create_instance_unknown_clsid() {
         result.is_ok(),
         "CoCreateInstance should succeed even with mismatched IID (validation deferred to QI)"
     );
+    let handle = result.unwrap();
+    // ...but the mismatch must be rejected when the interface is queried:
+    // QueryInterface(IDispatch) on an IShellLinkW object is E_NOINTERFACE.
+    assert!(
+        !state
+            .com_query_interface(handle, ComIid::IDISPATCH)
+            .expect("QI must be queryable"),
+        "mismatched IID must be rejected at QueryInterface time"
+    );
+    assert!(
+        state
+            .com_query_interface(handle, ComIid::IUNKNOWN)
+            .expect("QI IUnknown"),
+        "IUnknown must always be queryable"
+    );
+    state.com_release(handle).expect("release");
 }
 
 // ===========================================================================
@@ -644,7 +660,11 @@ fn t28c_06b_variant_i4_copy_clear() {
 
 #[test]
 fn t28c_06c_variant_bstr_copy_clear() {
-    // Simulate a BSTR pointer in a variant
+    // Documented VariantCopy contract for pointer types (VT_BSTR, VT_UNKNOWN,
+    // VT_DISPATCH, VT_ARRAY|VT_VARIANT): the copy is SHALLOW — vt and the
+    // pointer data field are copied verbatim (no duplicate allocation). The
+    // source must be left intact and variant_clear resets the destination to
+    // VT_EMPTY without touching the source.
     let src = Variant {
         vt: VT_BSTR,
         w_reserved1: 0,
@@ -657,11 +677,13 @@ fn t28c_06c_variant_bstr_copy_clear() {
     assert_eq!(v_vt(&dst), VT_BSTR);
     assert_eq!(v_data(&dst), 0x1234);
 
-    // Clear should zero the data field
+    // Clear must reset the destination and leave the source untouched.
     variant_clear(&mut dst);
     assert_eq!(v_vt(&dst), VT_EMPTY);
     let dst_data = v_data(&dst);
     assert_eq!(dst_data, 0);
+    assert_eq!(v_vt(&src), VT_BSTR, "source vt must be preserved");
+    assert_eq!(v_data(&src), 0x1234, "source pointer must be preserved");
 }
 
 #[test]

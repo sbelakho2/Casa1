@@ -1,6 +1,3 @@
-#![allow(clippy::unnecessary_sort_by)]
-#![allow(clippy::type_complexity)]
-
 //! Phase 1 — Steam Bootstrap Crash Diagnostic Test
 //!
 //! This test runs Steam.exe with comprehensive API call tracing enabled
@@ -186,6 +183,22 @@ fn t23_1_steam_bootstrap_diagnostic() {
                 "No steam_api_init trace events captured — Steam may not have started, \
                  or the trace category was not enabled"
             );
+            // The captured events must carry real dispatch data: every event names a
+            // thunk, and the init sequence must have produced a caller-RVA trail.
+            assert!(
+                api_events.iter().all(|e| !e.call_id.is_empty()),
+                "every steam_api_init event must name a thunk"
+            );
+            assert!(
+                api_events
+                    .iter()
+                    .any(|e| e.parameters.contains_key("caller_rva")),
+                "steam_api_init events must record caller RVAs"
+            );
+            assert!(
+                !trace_events.is_empty(),
+                "at least one trace event must be captured overall"
+            );
 
             // If the crash workaround was triggered, we should see a SteamZeroRecord event.
             let zero_record = process_events
@@ -344,7 +357,7 @@ fn t23_2_steam_import_coverage() {
     eprintln!("{}", "-".repeat(80));
 
     let mut sorted_dlls: Vec<_> = all_imports.iter().collect();
-    sorted_dlls.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+    sorted_dlls.sort_by_key(|entry| std::cmp::Reverse(entry.1.len()));
 
     for (dll, functions) in &sorted_dlls {
         eprintln!(
@@ -359,6 +372,23 @@ fn t23_2_steam_import_coverage() {
     eprintln!("=== Import Coverage Summary ===");
     eprintln!("Total DLLs: {}", all_imports.len());
     eprintln!("Total import functions: {}", total_imports);
+
+    // Real assertions so the diagnostic cannot pass vacuously: Steam.exe imports a
+    // large, well-known function set across many DLLs, and every DLL must contribute
+    // at least one import.
+    assert!(
+        total_imports >= 100,
+        "Steam.exe must import at least 100 functions, got {total_imports}"
+    );
+    assert!(
+        all_imports.len() >= 10,
+        "Steam.exe must import from at least 10 DLLs, got {}",
+        all_imports.len()
+    );
+    assert!(
+        all_imports.values().all(|functions| !functions.is_empty()),
+        "every imported DLL must contribute at least one function"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -425,11 +455,7 @@ fn t23_3_import_coverage_matrix() {
     eprintln!("{}", "-".repeat(100));
 
     let mut sorted_dlls: Vec<_> = dll_coverage.iter().collect();
-    sorted_dlls.sort_by(|a, b| {
-        let a_missing = a.1.1.len();
-        let b_missing = b.1.1.len();
-        b_missing.cmp(&a_missing)
-    });
+    sorted_dlls.sort_by_key(|entry| std::cmp::Reverse(entry.1 .1.len()));
 
     for (dll, (supported, unsupported)) in &sorted_dlls {
         let total_dll = supported.len() + unsupported.len();
@@ -528,7 +554,15 @@ fn t23_4_steam_regression() {
     );
     eprintln!("✓ No SteamZeroRecord event emitted (workaround did not trigger)");
 
-    // 3. Verify the post-execution record-table check.
+    // 3. Verify the post-execution record-table check. NOTE: the runtime emits a
+    // `table_populated` bool, but that bool is self-verification — a buggy runtime
+    // could report `true` without reading anything. Instead, recompute the verdict
+    // from the RAW guest-memory values the runtime read (record_base is the u32 at
+    // mapped_image_base + 0x2a270; first_opcode is the u32 stored at record_base):
+    // the event must carry both, the table address must be non-zero, and the first
+    // opcode must be non-zero. (A memory-exposing execution API would allow reading
+    // 0x42a270 directly; until one exists, these raw parameters are the closest
+    // independent observable.)
     let table_check: Vec<_> = trace_events
         .iter()
         .filter(|e| e.call_id == "SteamRecordTablePostExec")
@@ -539,31 +573,52 @@ fn t23_4_steam_regression() {
         "Expected exactly one SteamRecordTablePostExec trace event, found {}",
         table_check.len(),
     );
-    let table_populated = table_check[0]
+    let record_base = table_check[0]
         .parameters
-        .get("table_populated")
-        .and_then(|v: &serde_json::Value| v.as_bool())
-        .unwrap_or(false);
-    assert!(
-        table_populated,
-        "Record table at global 0x42a270 is empty (first opcode is 0 or address is 0)\n\
+        .get("record_base")
+        .and_then(|v: &serde_json::Value| v.as_str())
+        .unwrap_or("0x0");
+    let first_opcode = table_check[0]
+        .parameters
+        .get("first_opcode")
+        .and_then(|v: &serde_json::Value| v.as_str())
+        .unwrap_or("null");
+    assert_ne!(
+        record_base, "0x0",
+        "record table global at mapped_image_base + 0x2a270 must be non-zero\n\
          Parameters: {:#?}",
         table_check[0].parameters,
     );
-    eprintln!("✓ Record table is populated after execution");
+    assert!(
+        first_opcode != "null" && first_opcode != "0x0",
+        "first opcode of the record table must be non-zero\n\
+         Parameters: {:#?}",
+        table_check[0].parameters,
+    );
+    eprintln!("✓ Record table is populated after execution (base {record_base}, first opcode {first_opcode})");
 
-    // 4. Also check the pre-execution SteamInitialGlobals event.
+    // 4. Also check the pre-execution SteamInitialGlobals event: it probes the
+    // startup globals directly from guest memory before execution. The startup
+    // state global must be non-zero once imports are bound (a zero value is the
+    // documented indicator of the crash path).
     let initial_globals: Vec<_> = trace_events
         .iter()
         .filter(|e| e.call_id == "SteamInitialGlobals")
         .collect();
     if let Some(globals) = initial_globals.first() {
-        let array_count = globals
+        let startup_state = globals
             .parameters
-            .get("array_count")
+            .get("startup_state")
             .and_then(|v: &serde_json::Value| v.as_str())
-            .unwrap_or("0");
-        eprintln!("✓ SteamInitialGlobals: array_count = {array_count}");
+            .unwrap_or("0x0");
+        eprintln!("✓ SteamInitialGlobals: startup_state = {startup_state}");
+        assert_ne!(
+            startup_state, "0x0",
+            "startup-state global (selected_base + 0x45715c) must be non-zero \
+             after imports are bound"
+        );
+    } else {
+        panic!("SteamInitialGlobals trace event missing — startup probe did not run");
     }
 
     eprintln!("\n=== Regression test PASSED ===");
@@ -644,6 +699,7 @@ fn t23_5_x86_decode_coverage() {
     // ── 3. Decode each executable section ────────────────────────────
     // Use HashMap<String, usize> because DecodedOpcode does not implement Ord/Hash.
     // We convert opcodes to their debug string representation for map keys.
+    #[allow(clippy::type_complexity)]
     let mut section_results: Vec<(String, usize, HashMap<String, usize>, Vec<(usize, String)>)> =
         Vec::new();
 
@@ -778,7 +834,7 @@ fn t23_5_x86_decode_coverage() {
 
         // Sort by frequency descending
         let mut sorted: Vec<(&String, &usize)> = opcodes.iter().collect();
-        sorted.sort_by(|a, b| b.1.cmp(a.1));
+        sorted.sort_by_key(|entry| std::cmp::Reverse(*entry.1));
 
         for (opcode, count) in sorted.iter().take(30) {
             let pct = (**count as f64 / *total as f64) * 100.0;
@@ -807,6 +863,19 @@ fn t23_5_x86_decode_coverage() {
     eprintln!("Total decode errors:         {}", total_decode_errors);
     eprintln!("Unique opcodes encountered:  {}", all_opcodes.len());
 
+    // Real assertions so this diagnostic cannot pass vacuously: the executable
+    // sections of Steam.exe must decode to a substantial instruction stream with a
+    // meaningful opcode set.
+    assert!(
+        total_instructions > 0,
+        "no instructions decoded from Steam.exe executable sections"
+    );
+    assert!(
+        all_opcodes.len() >= 10,
+        "expected a substantial opcode set, got {} unique opcodes",
+        all_opcodes.len()
+    );
+
     // Count how many opcodes are currently unknown (would need new variants)
     // All DecodedOpcodes in the enum are "known" — unknown bytes cause decode_block
     // to return an error (AppError). So decode_errors == unknown opcodes.
@@ -820,7 +889,7 @@ fn t23_5_x86_decode_coverage() {
     // Top 20 most common opcodes
     eprintln!("\nTop 20 most common opcodes:");
     let mut sorted_global: Vec<(&String, &usize)> = all_opcodes.iter().collect();
-    sorted_global.sort_by(|a, b| b.1.cmp(a.1));
+    sorted_global.sort_by_key(|entry| std::cmp::Reverse(*entry.1));
     eprintln!("{:<8}  {:<6}  {:<8}  Opcode", "Count", "Pct", "Cumul");
     eprintln!("{:-<60}", "");
     let mut cumul = 0usize;
@@ -847,9 +916,21 @@ fn t23_5_x86_decode_coverage() {
             for i in &insns {
                 eprintln!("    @{:#x}: {:?} size={}", i.address, i.opcode, i.size);
             }
+            // `push esi` (1 B), `push edi` (1 B), `mov edi, [esp+0xc]` (4 B) —
+            // the decoder must produce exactly these three instructions.
+            assert_eq!(
+                insns.len(),
+                3,
+                "known byte sequence must decode to 3 instructions"
+            );
+            assert_eq!(
+                insns.iter().map(|i| i.size).sum::<usize>(),
+                sanity_bytes.len(),
+                "decoded instructions must cover the whole sanity buffer"
+            );
         }
         Err(e) => {
-            eprintln!("  FAILED: {e:?}");
+            panic!("sanity decode of known bytes failed: {e:?}");
         }
     }
 

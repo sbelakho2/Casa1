@@ -56,7 +56,15 @@ fn fresh_state() -> GdiplusState {
 // t33_01 — GdiplusStartup / GdiplusShutdown lifecycle
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// KNOWN-ISSUE: the real GDI+ lifecycle logic lives in the private
+// `PeHostRuntime` dispatch arms (HostThunk::GdiplusStartup/GdiplusShutdown,
+// src/pe_runtime.rs:2456-2457, dispatch at ~43600) and is not reachable from
+// integration tests (PeHostRuntime and its dispatch entry point are private).
+// This test previously simulated the lifecycle by hand-editing GdiplusState
+// fields, which verified nothing but the test's own writes. It is #[ignore]d
+// until a public GDI+ dispatch entry point exists.
 #[test]
+#[ignore] // no public Gdip* dispatch API: lifecycle logic lives in the private PeHostRuntime dispatch arms
 fn t33_01_startup_shutdown_lifecycle() {
     let mut state = fresh_state();
     assert!(!state.initialized, "should start uninitialized");
@@ -378,7 +386,13 @@ fn t33_12_matrix_identity() {
     assert!((m.elements[5] - 0.0).abs() < f32::EPSILON);
 }
 
+// KNOWN-ISSUE: matrix operations are only implemented in the private
+// `PeHostRuntime` dispatch arms (HostThunk::GdipSetMatrixElements/
+// GdipInvertMatrix etc., src/pe_runtime.rs:2508-2519); GdiplusMatrix itself is
+// a plain data struct with only `identity()`. This test previously hand-rolled
+// the operation on struct fields, verifying nothing but its own writes.
 #[test]
+#[ignore] // no public Gdip* dispatch API: matrix ops live in the private PeHostRuntime dispatch arms
 fn t33_13_matrix_set_elements() {
     let mut state = fresh_state();
     let m = GdiplusMatrix::identity();
@@ -399,7 +413,13 @@ fn t33_13_matrix_set_elements() {
     }
 }
 
+// KNOWN-ISSUE: matrix operations are only implemented in the private
+// `PeHostRuntime` dispatch arms (HostThunk::GdipSetMatrixElements/
+// GdipInvertMatrix etc., src/pe_runtime.rs:2508-2519); GdiplusMatrix itself is
+// a plain data struct with only `identity()`. This test previously hand-rolled
+// the operation on struct fields, verifying nothing but its own writes.
 #[test]
+#[ignore] // no public Gdip* dispatch API: matrix ops live in the private PeHostRuntime dispatch arms
 fn t33_14_matrix_get_elements() {
     let mut state = fresh_state();
     let m = GdiplusMatrix {
@@ -417,7 +437,13 @@ fn t33_14_matrix_get_elements() {
     }
 }
 
+// KNOWN-ISSUE: matrix operations are only implemented in the private
+// `PeHostRuntime` dispatch arms (HostThunk::GdipSetMatrixElements/
+// GdipInvertMatrix etc., src/pe_runtime.rs:2508-2519); GdiplusMatrix itself is
+// a plain data struct with only `identity()`. This test previously hand-rolled
+// the operation on struct fields, verifying nothing but its own writes.
 #[test]
+#[ignore] // no public Gdip* dispatch API: matrix ops live in the private PeHostRuntime dispatch arms
 fn t33_15_matrix_translate() {
     let mut state = fresh_state();
     let m = GdiplusMatrix::identity();
@@ -437,7 +463,13 @@ fn t33_15_matrix_translate() {
     }
 }
 
+// KNOWN-ISSUE: matrix operations are only implemented in the private
+// `PeHostRuntime` dispatch arms (HostThunk::GdipSetMatrixElements/
+// GdipInvertMatrix etc., src/pe_runtime.rs:2508-2519); GdiplusMatrix itself is
+// a plain data struct with only `identity()`. This test previously hand-rolled
+// the operation on struct fields, verifying nothing but its own writes.
 #[test]
+#[ignore] // no public Gdip* dispatch API: matrix ops live in the private PeHostRuntime dispatch arms
 fn t33_16_matrix_scale() {
     let mut state = fresh_state();
     let m = GdiplusMatrix::identity();
@@ -457,7 +489,13 @@ fn t33_16_matrix_scale() {
     }
 }
 
+// KNOWN-ISSUE: matrix operations are only implemented in the private
+// `PeHostRuntime` dispatch arms (HostThunk::GdipSetMatrixElements/
+// GdipInvertMatrix etc., src/pe_runtime.rs:2508-2519); GdiplusMatrix itself is
+// a plain data struct with only `identity()`. This test previously hand-rolled
+// the operation on struct fields, verifying nothing but its own writes.
 #[test]
+#[ignore] // no public Gdip* dispatch API: matrix ops live in the private PeHostRuntime dispatch arms
 fn t33_17_matrix_invert() {
     let mut state = fresh_state();
     // Create a simple scale+translate matrix and invert it
@@ -527,7 +565,13 @@ fn t33_18_matrix_delete() {
 // t33_19 — Transform (set/reset/get world transform)
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// KNOWN-ISSUE: world-transform operations are only implemented in the private
+// `PeHostRuntime` dispatch arms (HostThunk::GdipSetWorldTransform/
+// GdipResetWorldTransform/GdipGetWorldTransform, src/pe_runtime.rs:2517-2519).
+// This test previously wrote the transform fields by hand, verifying nothing
+// but its own writes.
 #[test]
+#[ignore] // no public Gdip* dispatch API: transform ops live in the private PeHostRuntime dispatch arms
 fn t33_19_world_transform() {
     let mut state = fresh_state();
     let hdc: u64 = 0x100;
@@ -564,7 +608,12 @@ fn t33_19_world_transform() {
 // t33_20 — Clipping operations
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// KNOWN-ISSUE: clip operations are only implemented in the private
+// `PeHostRuntime` dispatch arms (HostThunk::GdipSetClipRect/GdipResetClip,
+// src/pe_runtime.rs:2521-2524). This test previously wrote the clip fields by
+// hand, verifying nothing but its own writes.
 #[test]
+#[ignore] // no public Gdip* dispatch API: clip ops live in the private PeHostRuntime dispatch arms
 fn t33_20_clip_rect_reset_and_bounds() {
     let mut state = fresh_state();
     let hdc: u64 = 0x200;
@@ -612,7 +661,13 @@ fn t33_20_clip_rect_reset_and_bounds() {
 // t33_21 — Graphics save/restore (containers)
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// KNOWN-ISSUE: the real GdipSaveGraphics/GdipRestoreGraphics logic lives in
+// the private `PeHostRuntime` dispatch arms (src/pe_runtime.rs:43937-43963,
+// 43965+) and is not reachable from integration tests. This test previously
+// re-implemented the save/restore algorithm by hand, verifying nothing but
+// its own writes. #[ignore]d until a public GDI+ dispatch entry point exists.
 #[test]
+#[ignore] // no public Gdip* dispatch API: save/restore logic lives in the private PeHostRuntime dispatch arms
 fn t33_21_graphics_save_restore() {
     let mut state = fresh_state();
     let hdc: u64 = 0x300;
@@ -698,7 +753,13 @@ fn t33_21_graphics_save_restore() {
     }
 }
 
+// KNOWN-ISSUE: the real GdipBeginContainer/GdipEndContainer logic lives in
+// the private `PeHostRuntime` dispatch arms (src/pe_runtime.rs:2530-2531) and
+// is not reachable from integration tests. This test previously re-implemented
+// the container algorithm by hand, verifying nothing but its own writes.
+// #[ignore]d until a public GDI+ dispatch entry point exists.
 #[test]
+#[ignore] // no public Gdip* dispatch API: container logic lives in the private PeHostRuntime dispatch arms
 fn t33_22_graphics_begin_end_container() {
     let mut state = fresh_state();
     let hdc: u64 = 0x400;
@@ -962,7 +1023,7 @@ fn t33_28_image_attributes_create_dispose() {
 fn t33_29_image_attributes_color_matrix() {
     let mut state = fresh_state();
 
-    let mut attrs = GdiplusImageAttributes {
+    let attrs = GdiplusImageAttributes {
         color_keys: BTreeMap::new(),
         color_matrix: None,
     };
@@ -977,19 +1038,44 @@ fn t33_29_image_attributes_color_matrix() {
             [0.0, 0.0, 0.0, 0.0, 1.0],
         ],
     };
-    attrs.color_matrix = Some((0, matrix)); // ColorAdjustType::Default = 0
+    let mut attrs = attrs;
+    attrs.color_matrix = Some((0, matrix.clone())); // ColorAdjustType::Default = 0
 
-    let _handle = state.alloc_handle(GdiplusObject::ImageAttributes(Box::new(attrs)));
+    let handle = state.alloc_handle(GdiplusObject::ImageAttributes(Box::new(attrs)));
 
-    // Verify matrix was stored
-    // (In a real scenario we'd read it back; for now, just verify no panic)
+    // The image attributes must be stored and readable back through the
+    // public API, with the grayscale color matrix intact.
+    match state.get(handle).expect("image attributes should be stored") {
+        GdiplusObject::ImageAttributes(stored) => {
+            let (adjust_type, stored_matrix) = stored
+                .color_matrix
+                .clone()
+                .expect("color matrix must be stored");
+            assert_eq!(adjust_type, 0, "ColorAdjustType::Default = 0");
+            for row in 0..5 {
+                for col in 0..5 {
+                    assert!(
+                        (stored_matrix.m[row][col] - matrix.m[row][col]).abs() < f32::EPSILON,
+                        "matrix[{row}][{col}] must round-trip"
+                    );
+                }
+            }
+        }
+        _ => panic!("expected ImageAttributes object"),
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // t33_30 — Quality settings
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// KNOWN-ISSUE: quality setters are only implemented in the private
+// `PeHostRuntime` dispatch arms (HostThunk::GdipSetSmoothingMode/
+// GdipSetCompositingMode etc.). The default-value assertions are covered by
+// t33_36 (which exercises the real `create_graphics_from_hdc`); the
+// set-and-read-back part previously wrote fields by hand.
 #[test]
+#[ignore] // no public Gdip* dispatch API: quality setters live in the private PeHostRuntime dispatch arms
 fn t33_30_quality_settings() {
     let mut state = fresh_state();
     let hdc: u64 = 0x600;
@@ -1241,9 +1327,7 @@ fn t33_35_handle_allocation_monotonic() {
     let h3 = state.alloc_handle(GdiplusObject::Matrix(Box::new(GdiplusMatrix::identity())));
     assert!(h1 < h2, "handles should increase monotonically");
     assert!(h2 < h3, "handles should increase monotonically");
-    assert_eq!(h1, 0xDD010000);
-    assert_eq!(h2, 0xDD010001);
-    assert_eq!(h3, 0xDD010002);
+    assert_eq!(h3 - h2, 1, "handles must be dense and consecutive");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1722,15 +1806,34 @@ fn t33_47_renderer_draw_string() {
         GDIPLUS_COMPOSITING_MODE_SOURCE_COPY,
     );
 
-    // String rendering produces coloured blocks; verify at least some pixels were set
-    let idx = (5 * stride + 5 * 4) as usize;
-    let pixel = u32::from_le_bytes([
-        pixels[idx],
-        pixels[idx + 1],
-        pixels[idx + 2],
-        pixels[idx + 3],
-    ]);
-    assert_eq!(pixel, 0xFFFFFFFF, "first character block should be white");
+    // Documented renderer contract: each character is drawn as a solid block
+    // of `font_size * 0.6` × `font_size * 1.2` pixels (clamped to a minimum of
+    // 4×8). For font_size 12.0: char_w = 7, char_h = 14. "Hi" draws two blocks
+    // starting at (5,5). Assert the whole first block is white and that pixels
+    // below the blocks are untouched (0) — not just a single placeholder pixel.
+    let char_w = 7usize;
+    let char_h = 14usize;
+    for py in 0..char_h {
+        for px in 0..char_w {
+            let idx = (5 + py) * stride as usize + (5 + px) * 4;
+            let pixel = u32::from_le_bytes([
+                pixels[idx],
+                pixels[idx + 1],
+                pixels[idx + 2],
+                pixels[idx + 3],
+            ]);
+            assert_eq!(
+                pixel, 0xFFFFFFFF,
+                "character block pixel ({px},{py}) must be white"
+            );
+        }
+    }
+    let below = 5 * stride as usize + 5 * 4 + char_h * stride as usize;
+    assert_eq!(
+        pixels[below],
+        0,
+        "pixels below the text blocks must be untouched"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

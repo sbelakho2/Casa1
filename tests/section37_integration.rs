@@ -14,7 +14,9 @@
 mod support;
 
 use casa1::audio::{AudioSamples, AudioSubsystem, SampleFormat, SourceBuffer, WaveFormat};
-use casa1::cpu::{CpuState, GuestArch, IrInstruction, MemoryImage, Register, XmmValue, execute_ir};
+use casa1::cpu::{
+    CpuState, GuestArch, IrInstruction, MemoryImage, MemoryOperand, Register, XmmValue, execute_ir,
+};
 use casa1::network::{
     AddressFamily, Certificate, Cookie, HttpProtocolFlags, NetworkStack, QuicConfig, SockAddr,
     aes_128_cbc_decrypt, aes_128_cbc_encrypt, aes_256_gcm_decrypt, aes_256_gcm_encrypt,
@@ -311,14 +313,25 @@ fn e7_build_activation_context_from_pe_manifest() {
 
     if let Some(ref manifest) = parsed.embedded_manifest {
         let plan = build_activation_context(manifest);
-        // VC runtime detection from manifest — check vc_runtime_bindings
-        let _has_vc_dlls = plan.vc_runtime_bindings.iter().any(|b| {
+        // Documented contract: every VC runtime DLL (msvcp*/vcruntime*)
+        // referenced by the embedded manifest must be detected in
+        // vc_runtime_bindings. The sample PE embeds a VC141 manifest, so the
+        // detection must fire.
+        let manifest_mentions_vc = manifest.assemblies.iter().any(|assembly| {
+            let name = assembly.name.to_lowercase();
+            name.contains("msvcp") || name.contains("vcruntime")
+        });
+        let has_vc_dlls = plan.vc_runtime_bindings.iter().any(|b| {
             b.dlls
                 .iter()
                 .any(|dll| dll.contains("msvcp") || dll.contains("vcruntime"))
         });
-        // The sample PE has a VC141 manifest, so VC runtime should be detected
-        // It's okay if not (depending on manifest contents), just verify no panic
+        if manifest_mentions_vc {
+            assert!(
+                has_vc_dlls,
+                "VC runtime DLLs in the manifest must be detected in the activation context"
+            );
+        }
         assert!(
             plan.vc_runtime_bindings.len() <= 10,
             "activation context should be bounded"
@@ -696,9 +709,9 @@ fn e7_crypto_aes_128_cbc_encrypt_decrypt_round_trip() {
         0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
         0x0f,
     ];
-    let plaintext = b"Hello Casa1 AES-CBC test!!"; // 24 bytes, block-aligned (multiple of 16)
+    let plaintext = b"Hello Casa1 AES-CBC test!!"; // 24 bytes — not block-aligned
 
-    // Pad to 32 bytes to ensure block alignment
+    // Pad to 32 bytes (a multiple of 16) to ensure block alignment
     let padded = {
         let mut v = plaintext.to_vec();
         v.resize(32, 0x00);
@@ -754,20 +767,41 @@ fn e7_crypto_rsa_sign_verify() {
 
 #[test]
 fn e7_crypto_ecdsa_p256_verify() {
-    const ECDSA_PUBLIC_PEM: &str = "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEPjYt919yJcGTho/pY00Zy9Gegq8t\n/HKI7RNLcR8eZTL6b+jDSzqJNxL3f2g62soLB8AaK7UNQYuJcvkxji+sRQ==\n-----END PUBLIC KEY-----\n";
+    use p256::ecdsa::signature::Signer;
+    use p256::ecdsa::{Signature, SigningKey};
+    use p256::pkcs8::EncodePublicKey;
+
+    // Real P-256 round trip: generate a keypair, sign the message, and verify
+    // through the Casa1 verifier. A signature over a different message (or a
+    // corrupted signature) must be rejected.
+    use rand::SeedableRng;
+    let mut rng = rand::rngs::StdRng::seed_from_u64(0xECDA);
+    let signing_key = SigningKey::random(&mut rng);
+    let public_pem = signing_key
+        .verifying_key()
+        .to_public_key_pem(der::pem::LineEnding::LF)
+        .expect("public key PEM");
 
     let message = b"ECDSA P-256 verification test";
-    let valid_signature_der = hex::decode(
-        "3044022066c6e5c8d7c8f6a8e8c9d8e7f6a5b4c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f8a7\
-         0220109a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b7c",
-    )
-    .expect("hex decode");
-    let result = ecdsa_p256_verify(ECDSA_PUBLIC_PEM, message, &valid_signature_der);
-    // The test just ensures the function runs without panic and returns a result
-    // Actual verification depends on the key/signature matching
+    let signature: Signature = signing_key.sign(message);
+    let signature_der = signature.to_der().as_bytes().to_vec();
+
+    ecdsa_p256_verify(&public_pem, message, &signature_der)
+        .expect("a valid signature for the message must verify");
+
+    // Tampered message must be rejected.
+    let tampered = b"Tampered ECDSA message!";
     assert!(
-        result.is_ok() || result.is_err(),
-        "ecdsa verify should return a result"
+        ecdsa_p256_verify(&public_pem, tampered, &signature_der).is_err(),
+        "signature over a different message must fail verification"
+    );
+
+    // Corrupted signature bytes must be rejected.
+    let mut corrupted = signature_der.clone();
+    corrupted[0] ^= 0xFF;
+    assert!(
+        ecdsa_p256_verify(&public_pem, message, &corrupted).is_err(),
+        "corrupted signature bytes must fail verification"
     );
 }
 
@@ -795,8 +829,11 @@ fn e7_cpu_execute_ir_with_mapped_memory() {
     // Map some data into memory
     let address: u64 = 0x1000;
     memory.map_bytes(address, &42_u64.to_le_bytes());
+    // Also map the scratch region the IR store/load round trip writes to.
+    memory.map_bytes(0x2000, &[0u8; 16]);
 
-    // Read value from memory into RAX, add to RBX using IR instructions
+    // Read value from memory into RAX, add to RBX using IR instructions, and
+    // write the result back through a real memory store + load round trip.
     let instructions = vec![
         IrInstruction::MovImm {
             dst: Register::Rax,
@@ -807,10 +844,51 @@ fn e7_cpu_execute_ir_with_mapped_memory() {
             value: 200,
             width: 8,
         },
+        // Store RAX (300) at [0x2000], then load it back into RBX.
+        IrInstruction::StoreMemory {
+            src: Register::Rax,
+            address: MemoryOperand {
+                base: None,
+                index: None,
+                scale: 0,
+                displacement: 0x2000,
+                rip_relative: false,
+                rip_base: 0,
+                segment: None,
+                absolute_address: None,
+                address_size_32: false,
+            },
+            width: 8,
+        },
+        IrInstruction::LoadMemory {
+            dst: Register::Rbx,
+            address: MemoryOperand {
+                base: None,
+                index: None,
+                scale: 0,
+                displacement: 0x2000,
+                rip_relative: false,
+                rip_base: 0,
+                segment: None,
+                absolute_address: None,
+                address_size_32: false,
+            },
+            width: 8,
+        },
     ];
 
     execute_ir(&mut state, &mut memory, &instructions).expect("execute_ir");
     assert_eq!(state.get(Register::Rax), 300, "100 + 200 = 300");
+    assert_eq!(
+        state.get(Register::Rbx),
+        300,
+        "store/load round trip must preserve the value"
+    );
+    assert_eq!(
+        memory.read_u64(0x2000).expect("read stored value"),
+        300,
+        "the stored value must be visible in guest memory"
+    );
 }
 
 #[test]

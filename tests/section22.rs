@@ -206,8 +206,22 @@ fn t22_3_vulkan_state_lifecycle() {
         compute_dispatches: 0,
     };
 
-    assert_eq!(sample.name, "triangle_test");
-    assert_eq!(sample.draw_calls, 1);
+    // Exercise the actual render lifecycle instead of re-asserting the literals
+    // written into the struct: the sample must render through the loader with no
+    // validation errors, and the artifact must be deterministic across runs.
+    let frame = loader.render_sample(&sample).expect("render sample");
+    assert!(
+        frame.validation_errors.is_empty(),
+        "expected no validation errors, got {:?}",
+        frame.validation_errors
+    );
+    let repeat = loader
+        .render_sample(&sample)
+        .expect("render sample again");
+    assert_eq!(
+        frame.hash, repeat.hash,
+        "rendering the same sample must be deterministic"
+    );
 
     // Test OpenGL driver
     let gl_driver = casa1::vkgl::opengl_driver();
@@ -347,6 +361,51 @@ fn t22_5_drm_steamstub_decrypt() {
     assert_eq!(
         header.code_section_size, 128,
         "code section size should match"
+    );
+
+    // Now exercise the actual decrypt path (the point of this test): load the stub
+    // with the XOR key from the header and verify the decrypted section equals the
+    // original `i ^ 0xAB` payload, that the bytes land back in guest memory, and
+    // that the entry point is restored.
+    let mut loader = SteamstubLoader::new();
+    loader.header = Some(header.clone());
+    let app_key = header.key_data; // [0xAB; 16]
+    loader
+        .load_steamstub(&mut memory, base_addr, &app_key)
+        .expect("load/decrypt steamstub");
+
+    assert!(loader.loaded, "loader must report loaded after decryption");
+    let decrypted = loader
+        .decrypted_text
+        .expect("decrypted text must be populated");
+    let expected: Vec<u8> = (0..128).map(|i| i as u8).collect();
+    assert_eq!(
+        decrypted, expected,
+        "decrypted section must equal the original payload"
+    );
+    assert_eq!(
+        memory.read_bytes(code_addr, 128).expect("read back memory"),
+        expected,
+        "decrypted bytes must be written back into guest memory"
+    );
+    let entry = memory.read_u32(base_addr + pe_offset + 40).expect("read entry");
+    assert_eq!(
+        entry, 0x1000,
+        "AddressOfEntryPoint must be restored to original_entry_point"
+    );
+
+    // Wrong key: decryption must NOT produce the original payload.
+    let mut wrong_loader = SteamstubLoader::new();
+    wrong_loader.header = Some(header);
+    wrong_loader
+        .load_steamstub(&mut memory, base_addr, &[0xCD; 16])
+        .expect("load with wrong key");
+    let wrong = wrong_loader
+        .decrypted_text
+        .expect("decrypted text with wrong key");
+    assert_ne!(
+        wrong, expected,
+        "decrypting with the wrong key must not yield the original payload"
     );
 }
 
@@ -712,6 +771,35 @@ fn t22_11_behavioral_verification() {
         summary.contains("9/9 steps passed"),
         "summary should report 9/9 steps passed, got: {summary}"
     );
+
+    // Negative path: a failed step must flip `all_passed()`, be recorded with its
+    // error, and appear in the summary as a failure (a verifier that always
+    // reports success would pass these).
+    let mut failing = BehavioralVerifier::new();
+    failing.begin_step(BehavioralTestStep::ConnectToCM);
+    failing.end_step(
+        BehavioralTestStep::ConnectToCM,
+        false,
+        Some("connection refused".to_string()),
+    );
+    assert!(
+        !failing.all_passed(),
+        "a failed step must make all_passed() false"
+    );
+    assert_eq!(failing.results.len(), 1);
+    assert!(
+        !failing.results[0].passed,
+        "the failed step must be recorded as failed"
+    );
+    let failure_summary = failing.summary();
+    assert!(
+        !failure_summary.contains("9/9 steps passed"),
+        "failure summary must not claim full success, got: {failure_summary}"
+    );
+    assert!(
+        failure_summary.to_lowercase().contains("fail"),
+        "failure summary must mention the failure, got: {failure_summary}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -813,6 +901,28 @@ fn t22_12_end_to_end_integration() {
     assert_eq!(
         present.effective_sync_interval, 1,
         "sync interval should be 1"
+    );
+
+    // Distinct E2E assertions (vs t21_4/t21_10): presenting must advance the frame
+    // index and expose the presented frame with the swapchain's dimensions/format.
+    let present2 = runtime.present(swapchain, 1, false).expect("present again");
+    assert_eq!(
+        present2.displayed_frame_index,
+        present.displayed_frame_index + 1,
+        "each present must advance the displayed frame index"
+    );
+    assert_eq!(present.displayed_frame_index, 1, "first present is frame 1");
+
+    let presented = runtime
+        .presented_frame(swapchain)
+        .expect("presented frame");
+    assert_eq!(presented.width, 1280);
+    assert_eq!(presented.height, 720);
+    assert_eq!(presented.format, DxgiFormat::R8G8B8A8Unorm);
+    assert_eq!(
+        presented.bytes.len(),
+        1280 * 720 * 4,
+        "presented frame must carry a full RGBA8 buffer"
     );
 
     // Verify visual fidelity infrastructure works alongside rendering

@@ -31,6 +31,29 @@ fn create_runtime_with_backend() -> D3d12Runtime {
     D3d12Runtime::from_backend(backend)
 }
 
+
+/// Set up the common command-list scaffolding (allocator, root signature,
+/// compute PSO, graphics command list) used by every raytracing test.
+fn setup_command_list(runtime: &mut D3d12Runtime, label: &str) -> u64 {
+    let allocator = runtime.create_command_allocator();
+    let root_sig = runtime.create_root_signature(RootSignatureDesc {
+        descriptor_tables: vec![],
+        root_constants: 0,
+        ..Default::default()
+    });
+    let pso = runtime.create_pipeline_state(
+        root_sig,
+        PipelineStateDesc {
+            label: label.to_string(),
+            compute: true,
+            render_target_formats: vec![],
+            depth_format: None,
+        },
+    );
+    runtime.create_graphics_command_list(allocator, pso, false)
+}
+
+
 // ---------------------------------------------------------------------------
 // t28_01: BLAS creation — bottom-level acceleration structure
 // ---------------------------------------------------------------------------
@@ -67,22 +90,7 @@ fn t28_01_blas_creation_bottom_level() {
     };
 
     // Build the BLAS
-    let allocator = runtime.create_command_allocator();
-    let root_sig = runtime.create_root_signature(RootSignatureDesc {
-        descriptor_tables: vec![],
-        root_constants: 0,
-        ..Default::default()
-    });
-    let pso = runtime.create_pipeline_state(
-        root_sig,
-        PipelineStateDesc {
-            label: "raytrace_blas".to_string(),
-            compute: true,
-            render_target_formats: vec![],
-            depth_format: None,
-        },
-    );
-    let list_id = runtime.create_graphics_command_list(allocator, pso, false);
+    let list_id = setup_command_list(&mut runtime, "raytrace_blas");
 
     let result = runtime.build_raytracing_acceleration_structure(list_id, &desc);
     assert!(result.is_ok(), "BLAS build should succeed");
@@ -133,22 +141,7 @@ fn t28_02_tlas_creation_top_level() {
         scratch_address: 0x2_0000_1000,
     };
 
-    let allocator = runtime.create_command_allocator();
-    let root_sig = runtime.create_root_signature(RootSignatureDesc {
-        descriptor_tables: vec![],
-        root_constants: 0,
-        ..Default::default()
-    });
-    let pso = runtime.create_pipeline_state(
-        root_sig,
-        PipelineStateDesc {
-            label: "raytrace_tlas".to_string(),
-            compute: true,
-            render_target_formats: vec![],
-            depth_format: None,
-        },
-    );
-    let list_id = runtime.create_graphics_command_list(allocator, pso, false);
+    let list_id = setup_command_list(&mut runtime, "raytrace_tlas");
 
     let result = runtime.build_raytracing_acceleration_structure(list_id, &desc);
     assert!(result.is_ok(), "TLAS build should succeed");
@@ -165,9 +158,12 @@ fn t28_02_tlas_creation_top_level() {
     let accel = accel.unwrap();
     assert!(accel.is_top_level, "TLAS should be top-level");
     assert!(accel.built, "TLAS should be marked as built");
-    assert!(
-        accel.size >= 64 + 2 * 64,
-        "TLAS size should accommodate 2 instances"
+    // Documented TLAS sizing (src/d3d12.rs): 64-byte header + 72-byte
+    // instance descriptor per instance, floored at the 256-byte minimum
+    // viable size. 64 + 2*72 = 208 < 256, so the floor applies.
+    assert_eq!(
+        accel.size, 256,
+        "TLAS size must be the documented header + per-instance size, floored at 256"
     );
 }
 
@@ -206,22 +202,7 @@ fn t28_03_copy_acceleration_structure() {
         scratch_address: 0x3_0000_1000,
     };
 
-    let allocator = runtime.create_command_allocator();
-    let root_sig = runtime.create_root_signature(RootSignatureDesc {
-        descriptor_tables: vec![],
-        root_constants: 0,
-        ..Default::default()
-    });
-    let pso = runtime.create_pipeline_state(
-        root_sig,
-        PipelineStateDesc {
-            label: "raytrace_copy_src".to_string(),
-            compute: true,
-            render_target_formats: vec![],
-            depth_format: None,
-        },
-    );
-    let list_id = runtime.create_graphics_command_list(allocator, pso, false);
+    let list_id = setup_command_list(&mut runtime, "raytrace_copy_src");
 
     runtime
         .build_raytracing_acceleration_structure(list_id, &desc)
@@ -293,22 +274,7 @@ fn t28_04_compact_acceleration_structure() {
         scratch_address: 0x4_0000_1000,
     };
 
-    let allocator = runtime.create_command_allocator();
-    let root_sig = runtime.create_root_signature(RootSignatureDesc {
-        descriptor_tables: vec![],
-        root_constants: 0,
-        ..Default::default()
-    });
-    let pso = runtime.create_pipeline_state(
-        root_sig,
-        PipelineStateDesc {
-            label: "raytrace_compact".to_string(),
-            compute: true,
-            render_target_formats: vec![],
-            depth_format: None,
-        },
-    );
-    let list_id = runtime.create_graphics_command_list(allocator, pso, false);
+    let list_id = setup_command_list(&mut runtime, "raytrace_compact");
 
     runtime
         .build_raytracing_acceleration_structure(list_id, &desc)
@@ -362,22 +328,7 @@ fn t28_05_postbuild_info_compacted_size() {
         scratch_address: 0x5_0000_1000,
     };
 
-    let allocator = runtime.create_command_allocator();
-    let root_sig = runtime.create_root_signature(RootSignatureDesc {
-        descriptor_tables: vec![],
-        root_constants: 0,
-        ..Default::default()
-    });
-    let pso = runtime.create_pipeline_state(
-        root_sig,
-        PipelineStateDesc {
-            label: "raytrace_postbuild".to_string(),
-            compute: true,
-            render_target_formats: vec![],
-            depth_format: None,
-        },
-    );
-    let list_id = runtime.create_graphics_command_list(allocator, pso, false);
+    let list_id = setup_command_list(&mut runtime, "raytrace_postbuild");
 
     runtime
         .build_raytracing_acceleration_structure(list_id, &desc)
@@ -433,22 +384,7 @@ fn t28_06_postbuild_info_serialization() {
         scratch_address: 0x6_0000_1000,
     };
 
-    let allocator = runtime.create_command_allocator();
-    let root_sig = runtime.create_root_signature(RootSignatureDesc {
-        descriptor_tables: vec![],
-        root_constants: 0,
-        ..Default::default()
-    });
-    let pso = runtime.create_pipeline_state(
-        root_sig,
-        PipelineStateDesc {
-            label: "raytrace_serialize".to_string(),
-            compute: true,
-            render_target_formats: vec![],
-            depth_format: None,
-        },
-    );
-    let list_id = runtime.create_graphics_command_list(allocator, pso, false);
+    let list_id = setup_command_list(&mut runtime, "raytrace_serialize");
 
     runtime
         .build_raytracing_acceleration_structure(list_id, &desc)
@@ -486,22 +422,7 @@ fn t28_06_postbuild_info_serialization() {
 fn t28_07_dispatch_rays_shader_table() {
     let mut runtime = create_runtime();
 
-    let allocator = runtime.create_command_allocator();
-    let root_sig = runtime.create_root_signature(RootSignatureDesc {
-        descriptor_tables: vec![],
-        root_constants: 0,
-        ..Default::default()
-    });
-    let pso = runtime.create_pipeline_state(
-        root_sig,
-        PipelineStateDesc {
-            label: "raytrace_dispatch".to_string(),
-            compute: true,
-            render_target_formats: vec![],
-            depth_format: None,
-        },
-    );
-    let list_id = runtime.create_graphics_command_list(allocator, pso, false);
+    let list_id = setup_command_list(&mut runtime, "raytrace_dispatch");
 
     // Set up a raytracing pipeline state
     let dxil_bytecode = vec![
@@ -551,22 +472,7 @@ fn t28_07_dispatch_rays_shader_table() {
 fn t28_08_dispatch_rays_zero_dimensions() {
     let mut runtime = create_runtime();
 
-    let allocator = runtime.create_command_allocator();
-    let root_sig = runtime.create_root_signature(RootSignatureDesc {
-        descriptor_tables: vec![],
-        root_constants: 0,
-        ..Default::default()
-    });
-    let pso = runtime.create_pipeline_state(
-        root_sig,
-        PipelineStateDesc {
-            label: "raytrace_zero".to_string(),
-            compute: true,
-            render_target_formats: vec![],
-            depth_format: None,
-        },
-    );
-    let list_id = runtime.create_graphics_command_list(allocator, pso, false);
+    let list_id = setup_command_list(&mut runtime, "raytrace_zero");
 
     // Dispatch with zero dimensions — should still return Ok
     let dispatch_desc = D3D12DispatchRaysDesc {
@@ -628,22 +534,7 @@ fn t28_09_as_serialization_deserialization() {
         scratch_address: 0x9_0000_1000,
     };
 
-    let allocator = runtime.create_command_allocator();
-    let root_sig = runtime.create_root_signature(RootSignatureDesc {
-        descriptor_tables: vec![],
-        root_constants: 0,
-        ..Default::default()
-    });
-    let pso = runtime.create_pipeline_state(
-        root_sig,
-        PipelineStateDesc {
-            label: "raytrace_serde".to_string(),
-            compute: true,
-            render_target_formats: vec![],
-            depth_format: None,
-        },
-    );
-    let list_id = runtime.create_graphics_command_list(allocator, pso, false);
+    let list_id = setup_command_list(&mut runtime, "raytrace_serde");
 
     runtime
         .build_raytracing_acceleration_structure(list_id, &desc)
@@ -667,11 +558,34 @@ fn t28_09_as_serialization_deserialization() {
     );
     assert!(deserialize_result.is_ok(), "Deserialize AS should succeed");
 
-    // Verify the final AS exists
-    assert!(
-        runtime.acceleration_structure(0x9_0000_3000).is_some(),
-        "Deserialized AS should exist"
-    );
+    // Verify the final AS exists and that the round trip propagated the
+    // source AS metadata: the deserialized structure must have the same size,
+    // type, and built state as the original BLAS (a round trip that drops or
+    // fabricates metadata fails here).
+    let src = runtime
+        .acceleration_structure(0x9_0000_0000)
+        .expect("source AS should exist");
+    let serialized = runtime
+        .acceleration_structure(0x9_0000_2000)
+        .expect("serialized AS should exist");
+    let deserialized = runtime
+        .acceleration_structure(0x9_0000_3000)
+        .expect("deserialized AS should exist");
+    for (stage, record) in [("serialized", serialized), ("deserialized", deserialized)] {
+        assert_eq!(
+            record.size, src.size,
+            "{stage} AS must preserve the source size"
+        );
+        assert_eq!(
+            record.is_top_level, src.is_top_level,
+            "{stage} AS must preserve the source type"
+        );
+        assert_eq!(record.built, src.built, "{stage} AS must stay built");
+        assert!(
+            record.metal_accel_handle > 0,
+            "{stage} AS must carry a Metal handle"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -697,22 +611,7 @@ fn t28_10_tlas_serialization_info() {
         scratch_address: 0xA_0000_1000,
     };
 
-    let allocator = runtime.create_command_allocator();
-    let root_sig = runtime.create_root_signature(RootSignatureDesc {
-        descriptor_tables: vec![],
-        root_constants: 0,
-        ..Default::default()
-    });
-    let pso = runtime.create_pipeline_state(
-        root_sig,
-        PipelineStateDesc {
-            label: "raytrace_tlas_ser".to_string(),
-            compute: true,
-            render_target_formats: vec![],
-            depth_format: None,
-        },
-    );
-    let list_id = runtime.create_graphics_command_list(allocator, pso, false);
+    let list_id = setup_command_list(&mut runtime, "raytrace_tlas_ser");
 
     runtime
         .build_raytracing_acceleration_structure(list_id, &desc)
@@ -732,10 +631,22 @@ fn t28_10_tlas_serialization_info() {
     );
 
     let num_blas = u64::from_le_bytes(output_buf[8..16].try_into().unwrap());
-    // For a TLAS with 3 instances, num_blas should be 1 (since is_top_level == true)
+    // The documented serialization model (src/d3d12.rs): a top-level AS reports
+    // exactly one bottom-level pointer entry; a bottom-level AS reports zero
+    // (covered by t28_06). Cross-check the serialized size against the stored
+    // record so the query must agree with the acceleration structure itself.
     assert_eq!(
         num_blas, 1,
         "TLAS serialization should report 1 bottom-level pointer"
+    );
+    let serialized_size = u64::from_le_bytes(output_buf[0..8].try_into().unwrap());
+    assert_eq!(
+        serialized_size,
+        runtime
+            .acceleration_structure(0xA_0000_0000)
+            .expect("TLAS should be stored")
+            .size,
+        "serialized size must match the stored TLAS record"
     );
 }
 
@@ -750,26 +661,37 @@ fn t28_11_raytracing_tier_feature_detection() {
     // Check device info for raytracing capability
     let device_info = runtime.device_info();
 
-    // The D3d12FeatureOptions has a raytracing field
-    // When created without a real backend, it may be false
-    // But the types should still reflect the feature correctly
+    // The D3d12FeatureOptions raytracing flag must mirror the backend
+    // capability (src/d3d12.rs `device_info`), and the adapter must be
+    // identified — a runtime whose feature reporting is disconnected from
+    // its backend fails here.
+    let caps = runtime.backend().capabilities();
+    assert_eq!(
+        device_info.features.raytracing, caps.raytracing,
+        "D3D12 raytracing feature flag must mirror the backend capability"
+    );
+    assert!(
+        !device_info.adapter.name.is_empty(),
+        "device info must report a named adapter"
+    );
+
+    // D3D12_RAYTRACING_TIER_1_1 contract: any raytracing-capable device must
+    // also support argument buffers (the Metal feature raytracing depends on
+    // for resource binding, per host_gpu_profile_from_name).
     if device_info.features.raytracing {
-        // On a Metal 3.0+ device, raytracing should be supported
         assert!(
-            device_info.features.argument_buffers || device_info.features.unified_memory,
-            "Raytracing-capable device should have modern feature support"
+            caps.argument_buffers,
+            "raytracing-capable device must support argument buffers"
         );
     }
 
-    // Verify the D3D12_RAYTRACING_TIER constants are accessible
-    // These would be checked via QueryFeature in the PE runtime
-    let caps = runtime.backend().capabilities();
-
-    // If we have a real backend, capability flags should be accessible
-    if !device_info.adapter.name.is_empty() {
-        // Always true check - validates the caps struct is accessible
-        let _ = caps.raytracing;
-    }
+    // Tearing is the documented always-on presentation feature.
+    assert!(
+        runtime
+            .backend()
+            .query_feature(casa1::gfx::FeatureQuery::Tearing),
+        "Tearing must be reported"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -780,22 +702,7 @@ fn t28_11_raytracing_tier_feature_detection() {
 fn t28_12_raytracing_pipeline_state_management() {
     let mut runtime = create_runtime();
 
-    let allocator = runtime.create_command_allocator();
-    let root_sig = runtime.create_root_signature(RootSignatureDesc {
-        descriptor_tables: vec![],
-        root_constants: 0,
-        ..Default::default()
-    });
-    let pso = runtime.create_pipeline_state(
-        root_sig,
-        PipelineStateDesc {
-            label: "raytrace_pso".to_string(),
-            compute: true,
-            render_target_formats: vec![],
-            depth_format: None,
-        },
-    );
-    let list_id = runtime.create_graphics_command_list(allocator, pso, false);
+    let list_id = setup_command_list(&mut runtime, "raytrace_pso");
 
     // Create multiple raytracing PSOs
     let dxil_bytecode_1 = vec![0x44, 0x58, 0x42, 0x43, 0x01];
@@ -835,22 +742,7 @@ fn t28_12_raytracing_pipeline_state_management() {
 fn t28_13_multiple_acceleration_structures() {
     let mut runtime = create_runtime();
 
-    let allocator = runtime.create_command_allocator();
-    let root_sig = runtime.create_root_signature(RootSignatureDesc {
-        descriptor_tables: vec![],
-        root_constants: 0,
-        ..Default::default()
-    });
-    let pso = runtime.create_pipeline_state(
-        root_sig,
-        PipelineStateDesc {
-            label: "raytrace_multi_as".to_string(),
-            compute: true,
-            render_target_formats: vec![],
-            depth_format: None,
-        },
-    );
-    let list_id = runtime.create_graphics_command_list(allocator, pso, false);
+    let list_id = setup_command_list(&mut runtime, "raytrace_multi_as");
 
     // Build multiple BLASes
     for i in 0..5 {
@@ -940,22 +832,7 @@ fn t28_14_visualization_copy_mode() {
         scratch_address: 0xD_0000_1000,
     };
 
-    let allocator = runtime.create_command_allocator();
-    let root_sig = runtime.create_root_signature(RootSignatureDesc {
-        descriptor_tables: vec![],
-        root_constants: 0,
-        ..Default::default()
-    });
-    let pso = runtime.create_pipeline_state(
-        root_sig,
-        PipelineStateDesc {
-            label: "raytrace_viz".to_string(),
-            compute: true,
-            render_target_formats: vec![],
-            depth_format: None,
-        },
-    );
-    let list_id = runtime.create_graphics_command_list(allocator, pso, false);
+    let list_id = setup_command_list(&mut runtime, "raytrace_viz");
 
     runtime
         .build_raytracing_acceleration_structure(list_id, &desc)
@@ -1009,22 +886,7 @@ fn t28_15_postbuild_info_tools_visualization() {
         scratch_address: 0xE_0000_1000,
     };
 
-    let allocator = runtime.create_command_allocator();
-    let root_sig = runtime.create_root_signature(RootSignatureDesc {
-        descriptor_tables: vec![],
-        root_constants: 0,
-        ..Default::default()
-    });
-    let pso = runtime.create_pipeline_state(
-        root_sig,
-        PipelineStateDesc {
-            label: "raytrace_tools_viz".to_string(),
-            compute: true,
-            render_target_formats: vec![],
-            depth_format: None,
-        },
-    );
-    let list_id = runtime.create_graphics_command_list(allocator, pso, false);
+    let list_id = setup_command_list(&mut runtime, "raytrace_tools_viz");
 
     runtime
         .build_raytracing_acceleration_structure(list_id, &desc)

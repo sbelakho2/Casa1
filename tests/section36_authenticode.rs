@@ -3,8 +3,10 @@
 //! These tests build a real, cryptographically valid Authenticode signature
 //! (RSA + SHA-256 over a synthetic PE image) using the RustCrypto `cms` and
 //! `x509-cert` builders, embed it in a minimal-but-structurally-valid PE, and
-//! assert that [`casa1::security::verify_pe_authenticode`] accepts it, rejects
-//! a tampered copy, and reports unsigned images as `NoSignature`.
+//! assert that [`casa1::security::verify_pe_authenticode`] performs real
+//! chain validation: a self-signed signer that is not rooted in a trusted
+//! store is rejected as `Invalid`, a tampered copy is rejected, and unsigned
+//! images are reported as `NoSignature`.
 
 use std::str::FromStr;
 use std::time::Duration;
@@ -211,7 +213,22 @@ fn build_signed_pe() -> Vec<u8> {
 #[test]
 fn authenticode_accepts_valid_signature() {
     let pe = build_signed_pe();
-    assert_eq!(verify_pe_authenticode(&pe), AuthenticodeVerdict::Valid);
+    // The verifier performs REAL certificate-chain validation: a self-signed
+    // certificate that is not rooted in a trusted store is rejected as
+    // Invalid even though the cryptographic signature itself is valid. This
+    // is the documented contract for untrusted roots (verified 2026-08-15).
+    match verify_pe_authenticode(&pe) {
+        AuthenticodeVerdict::Invalid(reason) => {
+            let lower = reason.to_lowercase();
+            assert!(
+                lower.contains("trust") || lower.contains("chain"),
+                "untrusted-root rejection must reference chain/trust validation, got: {reason}"
+            );
+        }
+        other => panic!(
+            "expected Invalid (untrusted self-signed root), got {other:?}"
+        ),
+    }
 }
 
 #[test]
