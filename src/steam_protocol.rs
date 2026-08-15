@@ -33,8 +33,8 @@ use url::Url;
 /// Read a `u16` from `data[offset..offset+2]` (big-endian), returning an
 /// `AppError` if the slice is out of bounds.
 fn read_u16_be(data: &[u8], offset: usize) -> AppResult<u16> {
-    data.get(offset..offset + 2)
-        .map(|s| u16::from_be_bytes(s.try_into().unwrap()))
+    let s = data
+        .get(offset..offset + 2)
         .ok_or_else(|| {
             AppError::new(
                 ReasonCode::RcNetProtocolError,
@@ -43,14 +43,15 @@ fn read_u16_be(data: &[u8], offset: usize) -> AppResult<u16> {
                     data.len()
                 ),
             )
-        })
+        })?;
+    Ok(u16::from_be_bytes([s[0], s[1]]))
 }
 
 /// Read a `u32` from `data[offset..offset+4]` (big-endian), returning an
 /// `AppError` if the slice is out of bounds.
 fn read_u32_be(data: &[u8], offset: usize) -> AppResult<u32> {
-    data.get(offset..offset + 4)
-        .map(|s| u32::from_be_bytes(s.try_into().unwrap()))
+    let s = data
+        .get(offset..offset + 4)
         .ok_or_else(|| {
             AppError::new(
                 ReasonCode::RcNetProtocolError,
@@ -59,14 +60,15 @@ fn read_u32_be(data: &[u8], offset: usize) -> AppResult<u32> {
                     data.len()
                 ),
             )
-        })
+        })?;
+    Ok(u32::from_be_bytes([s[0], s[1], s[2], s[3]]))
 }
 
 /// Read a `u32` from `data[offset..offset+4]` (little-endian), returning an
 /// `AppError` if the slice is out of bounds.
 fn read_u32_le(data: &[u8], offset: usize) -> AppResult<u32> {
-    data.get(offset..offset + 4)
-        .map(|s| u32::from_le_bytes(s.try_into().unwrap()))
+    let s = data
+        .get(offset..offset + 4)
         .ok_or_else(|| {
             AppError::new(
                 ReasonCode::RcNetProtocolError,
@@ -75,12 +77,13 @@ fn read_u32_le(data: &[u8], offset: usize) -> AppResult<u32> {
                     data.len()
                 ),
             )
-        })
+        })?;
+    Ok(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
 }
 
 /// Get a sub-slice from `data[start..end]`, returning an `AppError` if out of
 /// bounds.
-fn get_slice<'a>(data: &'a [u8], start: usize, end: usize) -> AppResult<&'a [u8]> {
+fn get_slice(data: &[u8], start: usize, end: usize) -> AppResult<&[u8]> {
     data.get(start..end).ok_or_else(|| {
         AppError::new(
             ReasonCode::RcNetProtocolError,
@@ -107,6 +110,23 @@ const EXTENDED_HEADER_SIZE: u8 = 36;
 
 /// AES-256 key length in bytes.
 const AES_KEY_LEN: usize = 32;
+
+/// Maximum accepted CM frame body size (bytes). `total_len` is read directly
+/// from the network and must be bounded before any allocation.
+const MAX_FRAME_BODY_SIZE: usize = 16 * 1024 * 1024;
+
+/// Maximum number of files accepted in a depot manifest (allocation bound).
+const MAX_MANIFEST_FILES: u32 = 1_000_000;
+
+/// Maximum number of chunks accepted per manifest file (allocation bound).
+const MAX_MANIFEST_CHUNKS: u32 = 1_000_000;
+
+/// Maximum accepted file size from a depot manifest (1 TiB) — guards
+/// `vec![0u8; manifest.size]` against an absurd untrusted size.
+const MAX_MANIFEST_FILE_SIZE: u64 = 1 << 40;
+
+/// STUN/TURN indication class bit (RFC 5766: 0b0010 in bits 4-5).
+const TURN_INDICATION_CLASS: u16 = 0x0010;
 
 /// Default CM server list (can be overridden by configuration).
 const DEFAULT_CM_SERVERS: &[&str] = &[
@@ -181,6 +201,22 @@ const TURN_ATTR_RESERVATION_TOKEN: u16 = 0x0022;
 
 /// Default Steam Datagram Relay server.
 const DEFAULT_SDR_SERVER: &str = "sdr.steam.com:27018";
+
+// ---------------------------------------------------------------------------
+// LaunchServices (macOS) — steam:// URL scheme registration
+// ---------------------------------------------------------------------------
+
+// `LSSetDefaultHandlerForURLScheme` lives in LaunchServices, which is part
+// of the CoreServices framework; the link attribute must be present or the
+// final binary fails to link with an undefined symbol.
+#[cfg(target_os = "macos")]
+#[link(name = "CoreServices", kind = "framework")]
+unsafe extern "C" {
+    fn LSSetDefaultHandlerForURLScheme(
+        inURLScheme: *const libc::c_char,
+        inHandlerBundleID: *const libc::c_char,
+    ) -> i32;
+}
 
 // ---------------------------------------------------------------------------
 // Type aliases for GameNetworkingSockets
@@ -674,6 +710,10 @@ pub enum GnsConnectionState {
 /// - STUN binding requests are used for NAT traversal
 /// - SDR relay is available for peers behind restrictive NATs
 /// - Falls back to in-memory queue when no UDP socket is available
+/// Shared in-memory fallback queue for GNS messages when no UDP socket is
+/// bound: `(connection handle, channel, payload)`.
+type SignalQueue = std::sync::Arc<std::sync::Mutex<Vec<(GnsConnectionHandle, i32, Vec<u8>)>>>;
+
 #[derive(Debug)]
 pub struct GameNetworkingSockets {
     /// Active connections map.
@@ -697,9 +737,13 @@ pub struct GameNetworkingSockets {
     /// Incoming message queue (decrypted messages ready for consumption).
     incoming_queue: VecDeque<SteamNetworkingMessage>,
     /// In-memory fallback queue (used when no UDP socket is bound).
-    signal_r: std::sync::Arc<std::sync::Mutex<Vec<(GnsConnectionHandle, Vec<u8>)>>>,
+    signal_r: SignalQueue,
     /// Receive buffer for UDP socket reads.
     recv_buf: Vec<u8>,
+    /// Datagrams consumed by TURN handling that belong to direct P2P traffic;
+    /// they are re-delivered through `poll_incoming_messages` instead of being
+    /// dropped.
+    pending_packets: VecDeque<(Vec<u8>, SocketAddr)>,
     /// TURN relay server address.
     turn_relay_addr: Option<SocketAddr>,
     /// The address allocated on the TURN server (XOR-RELAYED-ADDRESS).
@@ -728,6 +772,7 @@ impl GameNetworkingSockets {
             incoming_queue: VecDeque::new(),
             signal_r: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             recv_buf: vec![0u8; 65535],
+            pending_packets: VecDeque::new(),
             turn_relay_addr: None,
             turn_relayed_addr: None,
             turn_allocate_lifetime: 0,
@@ -895,6 +940,17 @@ impl GameNetworkingSockets {
             ));
         }
 
+        // Only a success response (0x0101) carries a usable mapped address;
+        // an error response (0x0111) with a matching transaction ID must not
+        // be treated as a successful binding.
+        let resp_type = read_u16_be(data, 0)?;
+        if resp_type != STUN_BINDING_RESPONSE {
+            return Err(AppError::new(
+                ReasonCode::RcNetProtocolError,
+                format!("GNS: STUN response type {resp_type:#06x} is not a binding response"),
+            ));
+        }
+
         // Parse attributes (start at offset 20)
         let mut offset = 20;
         let mut external: Option<SocketAddr> = None;
@@ -909,37 +965,36 @@ impl GameNetworkingSockets {
 
             let attr_value = get_slice(data, offset + 4, offset + 4 + attr_len)?;
 
-            match attr_type {
-                STUN_ATTR_XOR_MAPPED_ADDRESS | STUN_ATTR_MAPPED_ADDRESS => {
-                    if attr_value.len() >= 8 {
-                        let family = attr_value[1]; // 0x01 = IPv4, 0x02 = IPv6
-                        let port = u16::from_be_bytes(attr_value[2..4].try_into().unwrap());
-                        if family == 0x01 && attr_value.len() >= 8 {
-                            // IPv4: XOR with magic cookie for XOR-MAPPED-ADDRESS
-                            let ip_bytes = if attr_type == STUN_ATTR_XOR_MAPPED_ADDRESS {
-                                [
-                                    attr_value[4] ^ (STUN_MAGIC_COOKIE >> 24) as u8,
-                                    attr_value[5] ^ (STUN_MAGIC_COOKIE >> 16) as u8,
-                                    attr_value[6] ^ (STUN_MAGIC_COOKIE >> 8) as u8,
-                                    attr_value[7] ^ STUN_MAGIC_COOKIE as u8,
-                                ]
-                            } else {
-                                [attr_value[4], attr_value[5], attr_value[6], attr_value[7]]
-                            };
-                            let xor_port = if attr_type == STUN_ATTR_XOR_MAPPED_ADDRESS {
-                                port ^ (STUN_MAGIC_COOKIE >> 16) as u16
-                            } else {
-                                port
-                            };
-                            external = Some(SocketAddr::from((ip_bytes, xor_port)));
-                        }
-                        // Prefer XOR-MAPPED-ADDRESS over MAPPED-ADDRESS
-                        if attr_type == STUN_ATTR_XOR_MAPPED_ADDRESS {
-                            break;
-                        }
-                    }
+            if matches!(
+                attr_type,
+                STUN_ATTR_XOR_MAPPED_ADDRESS | STUN_ATTR_MAPPED_ADDRESS
+            ) && attr_value.len() >= 8
+            {
+                let family = attr_value[1]; // 0x01 = IPv4, 0x02 = IPv6
+                let port = u16::from_be_bytes([attr_value[2], attr_value[3]]);
+                if family == 0x01 {
+                    // IPv4: XOR with magic cookie for XOR-MAPPED-ADDRESS
+                    let ip_bytes = if attr_type == STUN_ATTR_XOR_MAPPED_ADDRESS {
+                        [
+                            attr_value[4] ^ (STUN_MAGIC_COOKIE >> 24) as u8,
+                            attr_value[5] ^ (STUN_MAGIC_COOKIE >> 16) as u8,
+                            attr_value[6] ^ (STUN_MAGIC_COOKIE >> 8) as u8,
+                            attr_value[7] ^ STUN_MAGIC_COOKIE as u8,
+                        ]
+                    } else {
+                        [attr_value[4], attr_value[5], attr_value[6], attr_value[7]]
+                    };
+                    let xor_port = if attr_type == STUN_ATTR_XOR_MAPPED_ADDRESS {
+                        port ^ (STUN_MAGIC_COOKIE >> 16) as u16
+                    } else {
+                        port
+                    };
+                    external = Some(SocketAddr::from((ip_bytes, xor_port)));
                 }
-                _ => {}
+                // Prefer XOR-MAPPED-ADDRESS over MAPPED-ADDRESS
+                if attr_type == STUN_ATTR_XOR_MAPPED_ADDRESS {
+                    break;
+                }
             }
 
             offset += 4 + attr_len;
@@ -1058,8 +1113,6 @@ impl GameNetworkingSockets {
     pub fn create_session(&mut self) -> AppResult<GnsConnectionHandle> {
         let handle = self.next_handle;
         self.next_handle += 1;
-        self.connections
-            .insert(handle, GnsConnectionState::Connecting);
         // Generate random session keys for this connection
         let mut send_key = [0u8; 32];
         let mut recv_key = [0u8; 32];
@@ -1094,8 +1147,9 @@ impl GameNetworkingSockets {
     ///
     /// If a UDP socket is bound and the peer address is known (via
     /// routing table), the message is encrypted with AES-256-GCM and
-    /// sent over UDP. If the peer address is an SDR relay, the message
-    /// is wrapped in an SDR datagram first.
+    /// sent over UDP. If the peer address is an SDR relay, the GCM
+    /// packet is sent directly to the relay endpoint (SDR datagram
+    /// framing is not yet implemented).
     ///
     /// Falls back to in-memory queue if no UDP socket is available
     /// (useful for local testing).
@@ -1122,7 +1176,9 @@ impl GameNetworkingSockets {
         if let Some(ref socket) = self.udp_socket {
             // Determine the target address from routing table or SDR relay
             let target = if let Some(relay) = self.sdr_relay {
-                // SDR relay mode: wrap in SDR datagram
+                // SDR relay mode: the GCM packet is sent directly to the relay
+                // endpoint. (Full SDR datagram framing is not yet implemented,
+                // so the packet is not wrapped in an SDR header.)
                 relay
             } else if let Some(peer_addr) = self.routing_table.get(&handle) {
                 *peer_addr
@@ -1136,7 +1192,7 @@ impl GameNetworkingSockets {
 
             // Include channel number in the wire format for multi-channel support
             let mut packet = Vec::with_capacity(4 + wire.len());
-            packet.extend_from_slice(&(channel as i32).to_le_bytes());
+            packet.extend_from_slice(&channel.to_le_bytes());
             packet.extend_from_slice(&wire);
 
             // Send over UDP
@@ -1183,13 +1239,54 @@ impl GameNetworkingSockets {
         &self,
         handle: GnsConnectionHandle,
         data: &[u8],
-        _channel: i32,
+        channel: i32,
     ) -> AppResult<()> {
         let mut queue = self.signal_r.lock().map_err(|e| {
             AppError::new(ReasonCode::RcCacheCorrupt, format!("GNS: lock error: {e}"))
         })?;
-        queue.push((handle, data.to_vec()));
+        queue.push((handle, channel, data.to_vec()));
         Ok(())
+    }
+
+    /// Process a single UDP packet received from `src_addr`: parse the
+    /// channel number, decrypt with the matching connection's recv key, and
+    /// queue the plaintext message.
+    fn handle_udp_packet(&mut self, packet: &[u8], src_addr: SocketAddr) {
+        if packet.len() < 4 {
+            return; // malformed, skip
+        }
+
+        // Parse the channel number from the first 4 bytes
+        let channel = i32::from_le_bytes([packet[0], packet[1], packet[2], packet[3]]);
+        let wire_data = &packet[4..];
+
+        // Try to find the connection by matching the source address
+        // in the routing table
+        let handle_opt = self
+            .routing_table
+            .iter()
+            .find(|(_, addr)| **addr == src_addr)
+            .map(|(handle, _)| *handle);
+
+        if let Some(handle) = handle_opt {
+            // Try to decrypt with the connection's recv key
+            match self.decrypt_message(handle, wire_data) {
+                Ok(plaintext) => {
+                    self.incoming_queue.push_back(SteamNetworkingMessage {
+                        data: plaintext,
+                        conn: handle,
+                        channel,
+                        sender_id: 0,
+                    });
+                }
+                Err(e) => {
+                    eprintln!("GNS: failed to decrypt message from {src_addr}: {e}");
+                }
+            }
+        } else {
+            // Unknown source — queue as-is with a temporary handle
+            eprintln!("GNS: received message from unknown peer {src_addr}");
+        }
     }
 
     /// Poll all incoming messages across all connections.
@@ -1204,59 +1301,41 @@ impl GameNetworkingSockets {
             let mut queue = self.signal_r.lock().map_err(|e| {
                 AppError::new(ReasonCode::RcCacheCorrupt, format!("GNS: lock error: {e}"))
             })?;
-            for (conn, data) in queue.drain(..) {
+            for (conn, channel, data) in queue.drain(..) {
                 self.incoming_queue.push_back(SteamNetworkingMessage {
                     data,
                     conn,
-                    channel: 0,
+                    channel,
                     sender_id: 0,
                 });
             }
         }
 
-        // Then, if we have a UDP socket, read all pending datagrams
-        if let Some(ref socket) = self.udp_socket {
+        // Then, if we have a UDP socket, read all pending datagrams.
+        // The socket is cloned so packets can be processed via &mut self.
+        let socket = match self.udp_socket.as_ref() {
+            Some(sock) => Some(sock.try_clone().map_err(|e| {
+                AppError::new(
+                    ReasonCode::RcNetSocketCreateFailed,
+                    format!("GNS: socket clone failed: {e}"),
+                )
+            })?),
+            None => None,
+        };
+
+        if let Some(socket) = socket {
+            // Deliver packets that TURN handling set aside because they were
+            // not addressed to the relay (they would otherwise be lost).
+            let pending: Vec<(Vec<u8>, SocketAddr)> = self.pending_packets.drain(..).collect();
+            for (packet, src_addr) in pending {
+                self.handle_udp_packet(&packet, src_addr);
+            }
+
             loop {
                 match socket.recv_from(&mut self.recv_buf) {
                     Ok((n, src_addr)) => {
-                        let packet = &self.recv_buf[..n];
-                        if packet.len() < 4 {
-                            continue; // malformed, skip
-                        }
-
-                        // Parse the channel number from the first 4 bytes
-                        let _channel = i32::from_le_bytes(packet[0..4].try_into().unwrap());
-                        let wire_data = &packet[4..];
-
-                        // Try to find the connection by matching the source address
-                        // in the routing table
-                        let handle_opt = self
-                            .routing_table
-                            .iter()
-                            .find(|(_, addr)| **addr == src_addr)
-                            .map(|(handle, _)| *handle);
-
-                        if let Some(handle) = handle_opt {
-                            // Try to decrypt with the connection's recv key
-                            match self.decrypt_message(handle, wire_data) {
-                                Ok(plaintext) => {
-                                    self.incoming_queue.push_back(SteamNetworkingMessage {
-                                        data: plaintext,
-                                        conn: handle,
-                                        channel: 0,
-                                        sender_id: 0,
-                                    });
-                                }
-                                Err(e) => {
-                                    eprintln!(
-                                        "GNS: failed to decrypt message from {src_addr}: {e}"
-                                    );
-                                }
-                            }
-                        } else {
-                            // Unknown source — queue as-is with a temporary handle
-                            eprintln!("GNS: received message from unknown peer {src_addr}");
-                        }
+                        let packet = self.recv_buf[..n].to_vec();
+                        self.handle_udp_packet(&packet, src_addr);
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         // No more data available (non-blocking socket)
@@ -1277,21 +1356,17 @@ impl GameNetworkingSockets {
 
     /// Close a GNS session.
     pub fn close_session(&mut self, handle: GnsConnectionHandle) -> AppResult<()> {
-        match self.connections.get_mut(&handle) {
-            Some(state) => {
-                *state = GnsConnectionState::Closing;
-                *state = GnsConnectionState::Closed;
-                self.connections.remove(&handle);
-                self.routing_table.remove(&handle);
-                self.send_keys.remove(&handle);
-                self.recv_keys.remove(&handle);
-                Ok(())
-            }
-            None => Err(AppError::new(
+        if !self.connections.contains_key(&handle) {
+            return Err(AppError::new(
                 ReasonCode::RcNetConnectionFailed,
                 format!("GNS: session {handle} not found"),
-            )),
+            ));
         }
+        self.connections.remove(&handle);
+        self.routing_table.remove(&handle);
+        self.send_keys.remove(&handle);
+        self.recv_keys.remove(&handle);
+        Ok(())
     }
 
     /// Get the state of a connection.
@@ -1310,20 +1385,30 @@ impl GameNetworkingSockets {
 
     /// Build a STUN/TURN request message with the given method and attributes.
     ///
-    /// Returns (wire_bytes, transaction_id) where transaction_id can be used
-    /// to match the response.
-    fn build_stun_request(&self, method: u16, attributes: &[StunAttribute]) -> (Vec<u8>, [u8; 12]) {
+    /// The caller supplies the 12-byte transaction ID so that TURN XOR
+    /// attributes (XOR-PEER-ADDRESS, XOR-RELAYED-ADDRESS) can be obfuscated
+    /// with the same transaction ID (RFC 5766 §6.3/§9.2).
+    fn build_stun_request(
+        &self,
+        method: u16,
+        tx_id: &[u8; 12],
+        attributes: &[StunAttribute],
+    ) -> AppResult<Vec<u8>> {
         let mut request = Vec::with_capacity(20);
         request.extend_from_slice(&method.to_be_bytes()); // Message Type
         request.extend_from_slice(&[0u8; 2]); // Message Length — updated below after attributes are appended
         request.extend_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes()); // Magic Cookie
-        // Transaction ID (12 random bytes)
-        let mut tx_id = [0u8; 12];
-        rand::thread_rng().fill_bytes(&mut tx_id);
-        request.extend_from_slice(&tx_id);
+        request.extend_from_slice(tx_id);
 
         // Append attributes
         for attr in attributes {
+            let attr_len = attr.value.len();
+            if attr_len > u16::MAX as usize {
+                return Err(AppError::new(
+                    ReasonCode::RcNetSendFailed,
+                    format!("GNS: TURN attribute {} too large: {attr_len} bytes", attr.attr_type),
+                ));
+            }
             let padded_len = if attr.value.len() % 4 == 0 {
                 attr.value.len()
             } else {
@@ -1334,15 +1419,22 @@ impl GameNetworkingSockets {
             request.extend_from_slice(&attr.value);
             // Padding to 4-byte boundary
             if padded_len > attr.value.len() {
-                request.extend(std::iter::repeat(0u8).take(padded_len - attr.value.len()));
+                request.extend(std::iter::repeat_n(0u8, padded_len - attr.value.len()));
             }
         }
 
-        // Update message length
-        let len = (request.len() - 20) as u16;
-        request[2..4].copy_from_slice(&len.to_be_bytes());
+        // Update message length; the STUN length field is 16 bits, so a
+        // message that cannot fit must be rejected instead of truncated.
+        let len = request.len() - 20;
+        if len > u16::MAX as usize {
+            return Err(AppError::new(
+                ReasonCode::RcNetSendFailed,
+                format!("GNS: TURN request too large for STUN length field: {len} bytes"),
+            ));
+        }
+        request[2..4].copy_from_slice(&(len as u16).to_be_bytes());
 
-        (request, tx_id)
+        Ok(request)
     }
 
     /// Perform TURN Allocate request (RFC 5766 Section 6).
@@ -1364,7 +1456,9 @@ impl GameNetworkingSockets {
             },
         ];
 
-        let (request, tx_id) = self.build_stun_request(TURN_METHOD_ALLOCATE, &attributes);
+        let mut tx_id = [0u8; 12];
+        rand::thread_rng().fill_bytes(&mut tx_id);
+        let request = self.build_stun_request(TURN_METHOD_ALLOCATE, &tx_id, &attributes)?;
 
         // Get a UDP socket (use existing or create temporary)
         let socket = if let Some(ref sock) = self.udp_socket {
@@ -1432,6 +1526,16 @@ impl GameNetworkingSockets {
             ));
         }
 
+        // Only a success response (Allocate = 0x0103) carries a relayed
+        // address; error responses must not be processed as successes.
+        let resp_type = read_u16_be(data, 0)?;
+        if resp_type != TURN_METHOD_ALLOCATE | 0x0100 {
+            return Err(AppError::new(
+                ReasonCode::RcNetProtocolError,
+                format!("GNS: TURN Allocate response type {resp_type:#06x} is not a success response"),
+            ));
+        }
+
         // Parse attributes from the response
         let mut offset = 20;
         let mut relayed_addr: Option<SocketAddr> = None;
@@ -1447,29 +1551,16 @@ impl GameNetworkingSockets {
 
             let attr_value = get_slice(data, offset + 4, offset + 4 + attr_len)?;
 
-            match attr_type {
-                TURN_ATTR_XOR_RELAYED_ADDRESS => {
-                    if attr_value.len() >= 8 {
-                        let family = attr_value[1];
-                        let port = u16::from_be_bytes(attr_value[2..4].try_into().unwrap());
-                        if family == 0x01 && attr_value.len() >= 8 {
-                            let ip_bytes = [
-                                attr_value[4] ^ (STUN_MAGIC_COOKIE >> 24) as u8,
-                                attr_value[5] ^ (STUN_MAGIC_COOKIE >> 16) as u8,
-                                attr_value[6] ^ (STUN_MAGIC_COOKIE >> 8) as u8,
-                                attr_value[7] ^ STUN_MAGIC_COOKIE as u8,
-                            ];
-                            let xor_port = port ^ (STUN_MAGIC_COOKIE >> 16) as u16;
-                            relayed_addr = Some(SocketAddr::from((ip_bytes, xor_port)));
-                        }
-                    }
-                }
-                TURN_ATTR_LIFETIME => {
-                    if attr_value.len() >= 4 {
-                        lifetime = Some(u32::from_be_bytes(attr_value[0..4].try_into().unwrap()));
-                    }
-                }
-                _ => {}
+            if attr_type == TURN_ATTR_XOR_RELAYED_ADDRESS {
+                // XOR-RELAYED-ADDRESS is obfuscated with the transaction ID
+                // of the Allocate request (RFC 5766 §6.3), not the STUN magic
+                // cookie.
+                relayed_addr = decode_xor_address(attr_value, &tx_id);
+            }
+            if attr_type == TURN_ATTR_LIFETIME && attr_value.len() >= 4 {
+                lifetime = Some(u32::from_be_bytes([
+                    attr_value[0], attr_value[1], attr_value[2], attr_value[3],
+                ]));
             }
 
             offset += 4 + attr_len;
@@ -1506,15 +1597,21 @@ impl GameNetworkingSockets {
             AppError::new(ReasonCode::RcInvalidState, "GNS: no TURN relay configured")
         })?;
 
+        // The transaction ID must be generated before encoding the
+        // XOR-PEER-ADDRESS attribute: the peer address is obfuscated with it
+        // (RFC 5766 §9.2).
+        let mut tx_id = [0u8; 12];
+        rand::thread_rng().fill_bytes(&mut tx_id);
+
         // Build XOR-PEER-ADDRESS value
-        let peer_value = encode_xor_peer_address(peer_addr);
+        let peer_value = encode_xor_peer_address(peer_addr, &tx_id);
 
         let attributes = vec![StunAttribute {
             attr_type: TURN_ATTR_XOR_PEER_ADDRESS,
             value: peer_value,
         }];
 
-        let (request, tx_id) = self.build_stun_request(TURN_METHOD_CREATE_PERMISSION, &attributes);
+        let request = self.build_stun_request(TURN_METHOD_CREATE_PERMISSION, &tx_id, &attributes)?;
 
         let socket = if let Some(ref sock) = self.udp_socket {
             sock.try_clone().map_err(|e| {
@@ -1572,6 +1669,18 @@ impl GameNetworkingSockets {
             ));
         }
 
+        // Only a success response (CreatePermission = 0x0108) indicates the
+        // permission was granted.
+        let resp_type = read_u16_be(data, 0)?;
+        if resp_type != TURN_METHOD_CREATE_PERMISSION | 0x0100 {
+            return Err(AppError::new(
+                ReasonCode::RcNetProtocolError,
+                format!(
+                    "GNS: TURN CreatePermission response type {resp_type:#06x} is not a success response"
+                ),
+            ));
+        }
+
         Ok(())
     }
 
@@ -1583,8 +1692,13 @@ impl GameNetworkingSockets {
             AppError::new(ReasonCode::RcInvalidState, "GNS: no TURN relay configured")
         })?;
 
+        // The transaction ID must be generated before encoding the
+        // XOR-PEER-ADDRESS attribute (RFC 5766 §9.2).
+        let mut tx_id = [0u8; 12];
+        rand::thread_rng().fill_bytes(&mut tx_id);
+
         // Build XOR-PEER-ADDRESS value
-        let peer_attr = encode_xor_peer_address(peer_addr);
+        let peer_attr = encode_xor_peer_address(peer_addr, &tx_id);
 
         let attributes = vec![
             StunAttribute {
@@ -1597,8 +1711,13 @@ impl GameNetworkingSockets {
             },
         ];
 
-        // Send indication (method with 0x0010 indication class)
-        let (request, _tx_id) = self.build_stun_request(TURN_METHOD_SEND, &attributes);
+        // Send indication: the indication class bit (0x0010) must be set,
+        // otherwise the message is a request and the relay rejects it.
+        let request = self.build_stun_request(
+            TURN_METHOD_SEND | TURN_INDICATION_CLASS,
+            &tx_id,
+            &attributes,
+        )?;
 
         let socket = self.udp_socket.as_ref().ok_or_else(|| {
             AppError::new(
@@ -1634,12 +1753,15 @@ impl GameNetworkingSockets {
         loop {
             match socket.recv_from(&mut self.recv_buf) {
                 Ok((n, src_addr)) => {
-                    // Only process datagrams from the TURN relay
-                    let is_from_relay = self.turn_relay_addr.map_or(false, |r| src_addr == r);
+                    // Only process datagrams from the TURN relay; anything
+                    // else belongs to direct P2P traffic. recv_from has
+                    // already removed it from the socket, so buffer it and
+                    // let poll_incoming_messages deliver it — otherwise the
+                    // packet would be silently lost.
+                    let is_from_relay = self.turn_relay_addr == Some(src_addr);
                     if !is_from_relay {
-                        // This datagram is for the general GNS handler, not TURN
-                        // Push it back conceptually — we'll skip it here since
-                        // poll_incoming_messages will pick it up on the next call.
+                        self.pending_packets
+                            .push_back((self.recv_buf[..n].to_vec(), src_addr));
                         continue;
                     }
 
@@ -1648,11 +1770,19 @@ impl GameNetworkingSockets {
                         continue;
                     }
 
-                    // Check message type (should be TURN Data indication)
-                    let msg_type = u16::from_be_bytes(packet[0..2].try_into().unwrap());
-                    if msg_type != TURN_METHOD_DATA {
+                    // Check message type (should be a TURN Data indication:
+                    // method 0x007 with the 0x0010 indication class bit set).
+                    let msg_type = u16::from_be_bytes([packet[0], packet[1]]);
+                    if msg_type != TURN_METHOD_DATA | TURN_INDICATION_CLASS {
                         continue;
                     }
+
+                    // The XOR-PEER-ADDRESS inside a Data indication is
+                    // obfuscated with the indication's own transaction ID.
+                    let tx_id: [u8; 12] = match packet[8..20].try_into() {
+                        Ok(tx) => tx,
+                        Err(_) => continue,
+                    };
 
                     // Parse attributes
                     let mut offset = 20;
@@ -1661,10 +1791,9 @@ impl GameNetworkingSockets {
 
                     while offset + 4 <= packet.len() {
                         let attr_type =
-                            u16::from_be_bytes(packet[offset..offset + 2].try_into().unwrap());
+                            u16::from_be_bytes([packet[offset], packet[offset + 1]]);
                         let attr_len =
-                            u16::from_be_bytes(packet[offset + 2..offset + 4].try_into().unwrap())
-                                as usize;
+                            u16::from_be_bytes([packet[offset + 2], packet[offset + 3]]) as usize;
 
                         if offset + 4 + attr_len > packet.len() {
                             break;
@@ -1672,28 +1801,11 @@ impl GameNetworkingSockets {
 
                         let attr_value = &packet[offset + 4..offset + 4 + attr_len];
 
-                        match attr_type {
-                            TURN_ATTR_XOR_PEER_ADDRESS => {
-                                if attr_value.len() >= 8 {
-                                    let family = attr_value[1];
-                                    let port =
-                                        u16::from_be_bytes(attr_value[2..4].try_into().unwrap());
-                                    if family == 0x01 && attr_value.len() >= 8 {
-                                        let ip_bytes = [
-                                            attr_value[4] ^ (STUN_MAGIC_COOKIE >> 24) as u8,
-                                            attr_value[5] ^ (STUN_MAGIC_COOKIE >> 16) as u8,
-                                            attr_value[6] ^ (STUN_MAGIC_COOKIE >> 8) as u8,
-                                            attr_value[7] ^ STUN_MAGIC_COOKIE as u8,
-                                        ];
-                                        let xor_port = port ^ (STUN_MAGIC_COOKIE >> 16) as u16;
-                                        peer_addr = Some(SocketAddr::from((ip_bytes, xor_port)));
-                                    }
-                                }
-                            }
-                            TURN_ATTR_DATA => {
-                                data = Some(attr_value.to_vec());
-                            }
-                            _ => {}
+                        if attr_type == TURN_ATTR_XOR_PEER_ADDRESS {
+                            peer_addr = decode_xor_address(attr_value, &tx_id);
+                        }
+                        if attr_type == TURN_ATTR_DATA {
+                            data = Some(attr_value.to_vec());
                         }
 
                         offset += 4 + attr_len;
@@ -1720,41 +1832,77 @@ impl GameNetworkingSockets {
     }
 }
 
+impl Default for GameNetworkingSockets {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// A STUN/TURN attribute for use with `build_stun_request`.
 struct StunAttribute {
     attr_type: u16,
     value: Vec<u8>,
 }
 
-/// Encode a SocketAddr as an XOR-PEER-ADDRESS attribute value (RFC 5766).
-fn encode_xor_peer_address(addr: SocketAddr) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(8);
+/// Encode a SocketAddr as an XOR-PEER-ADDRESS attribute value (RFC 5766 §9.2).
+///
+/// The port is XORed with the first 2 bytes of the transaction ID and the
+/// address with the first 4 (IPv4) or all 16 (IPv6) bytes of the transaction
+/// ID — not with the STUN magic cookie.
+fn encode_xor_peer_address(addr: SocketAddr, tx_id: &[u8; 12]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(20);
     buf.push(0); // reserved
+    let xor_port = |port: u16| port ^ u16::from_be_bytes([tx_id[0], tx_id[1]]);
     match addr {
         SocketAddr::V4(v4) => {
             buf.push(0x01); // family = IPv4
-            let port = v4.port();
-            let xor_port = port ^ (STUN_MAGIC_COOKIE >> 16) as u16;
-            buf.extend_from_slice(&xor_port.to_be_bytes());
+            buf.extend_from_slice(&xor_port(v4.port()).to_be_bytes());
             let ip = v4.ip().octets();
-            buf.push(ip[0] ^ (STUN_MAGIC_COOKIE >> 24) as u8);
-            buf.push(ip[1] ^ (STUN_MAGIC_COOKIE >> 16) as u8);
-            buf.push(ip[2] ^ (STUN_MAGIC_COOKIE >> 8) as u8);
-            buf.push(ip[3] ^ STUN_MAGIC_COOKIE as u8);
+            for i in 0..4 {
+                buf.push(ip[i] ^ tx_id[i]);
+            }
         }
         SocketAddr::V6(v6) => {
             buf.push(0x02); // family = IPv6
-            let port = v6.port();
-            let xor_port = port ^ (STUN_MAGIC_COOKIE >> 16) as u16;
-            buf.extend_from_slice(&xor_port.to_be_bytes());
+            buf.extend_from_slice(&xor_port(v6.port()).to_be_bytes());
             let ip = v6.ip().octets();
-            // XOR with transaction ID (not available here — use magic cookie only for simplicity)
-            for &octet in &ip {
-                buf.push(octet);
+            for (i, octet) in ip.iter().enumerate() {
+                buf.push(octet ^ tx_id.get(i).copied().unwrap_or(0));
             }
         }
     }
     buf
+}
+
+/// Decode a TURN XOR address attribute (XOR-RELAYED-ADDRESS or
+/// XOR-PEER-ADDRESS) using the transaction ID of the corresponding
+/// request/indication (RFC 5766 §6.3/§9.2).
+fn decode_xor_address(attr_value: &[u8], tx_id: &[u8; 12]) -> Option<SocketAddr> {
+    if attr_value.len() < 8 {
+        return None;
+    }
+    let family = attr_value[1];
+    let port = u16::from_be_bytes([attr_value[2], attr_value[3]]);
+    let xor_port = port ^ u16::from_be_bytes([tx_id[0], tx_id[1]]);
+    match family {
+        0x01 if attr_value.len() >= 8 => {
+            let ip = [
+                attr_value[4] ^ tx_id[0],
+                attr_value[5] ^ tx_id[1],
+                attr_value[6] ^ tx_id[2],
+                attr_value[7] ^ tx_id[3],
+            ];
+            Some(SocketAddr::from((ip, xor_port)))
+        }
+        0x02 if attr_value.len() >= 20 => {
+            let mut ip = [0u8; 16];
+            for (i, byte) in ip.iter_mut().enumerate() {
+                *byte = attr_value[4 + i] ^ tx_id.get(i).copied().unwrap_or(0);
+            }
+            Some(SocketAddr::from((ip, xor_port)))
+        }
+        _ => None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1848,25 +1996,31 @@ impl SteamProtocolStack {
 
         self.state = ConnectionState::Resolving;
 
+        let mut last_error: Option<AppError> = None;
+
         for addr_str in &servers {
             self.current_server = Some(addr_str.to_string());
             self.state = ConnectionState::Connecting;
 
-            let addr = addr_str
-                .to_socket_addrs()
-                .map_err(|e| {
-                    AppError::new(
+            let addr = match addr_str.to_socket_addrs() {
+                Ok(mut addrs) => match addrs.next() {
+                    Some(addr) => addr,
+                    None => {
+                        last_error = Some(AppError::new(
+                            ReasonCode::RcNetDnsResolutionFailed,
+                            format!("SteamProtocol: no address for {addr_str}"),
+                        ));
+                        continue;
+                    }
+                },
+                Err(e) => {
+                    last_error = Some(AppError::new(
                         ReasonCode::RcNetDnsResolutionFailed,
                         format!("SteamProtocol: DNS resolution failed for {addr_str}: {e:?}"),
-                    )
-                })?
-                .next()
-                .ok_or_else(|| {
-                    AppError::new(
-                        ReasonCode::RcNetDnsResolutionFailed,
-                        format!("SteamProtocol: no address for {addr_str}"),
-                    )
-                })?;
+                    ));
+                    continue;
+                }
+            };
 
             match TcpStream::connect_timeout(&addr, self.connect_timeout) {
                 Ok(stream) => {
@@ -1881,22 +2035,39 @@ impl SteamProtocolStack {
                     self.message_count = 0;
                     self.last_heartbeat = Some(Instant::now());
 
-                    // Perform encryption handshake
-                    self.perform_encryption_handshake()?;
-                    return Ok(());
+                    // Perform encryption handshake; on failure, close the
+                    // stream and try the next server instead of aborting.
+                    match self.perform_encryption_handshake() {
+                        Ok(()) => return Ok(()),
+                        Err(e) => {
+                            eprintln!(
+                                "SteamProtocol: encryption handshake with {addr_str} failed: {e}"
+                            );
+                            self.stream = None;
+                            self.cipher = None;
+                            self.session_key = None;
+                            self.state = ConnectionState::Disconnected;
+                            last_error = Some(e);
+                        }
+                    }
                 }
-                Err(_) => {
-                    // Try next server
-                    continue;
+                Err(e) => {
+                    eprintln!("SteamProtocol: connect to {addr_str} failed: {e}");
+                    last_error = Some(AppError::new(
+                        ReasonCode::RcNetConnectionFailed,
+                        format!("SteamProtocol: connect to {addr_str} failed: {e}"),
+                    ));
                 }
             }
         }
 
         self.state = ConnectionState::Error;
-        Err(AppError::new(
-            ReasonCode::RcNetConnectionFailed,
-            "SteamProtocol: failed to connect to any CM server",
-        ))
+        Err(last_error.unwrap_or_else(|| {
+            AppError::new(
+                ReasonCode::RcNetConnectionFailed,
+                "SteamProtocol: failed to connect to any CM server",
+            )
+        }))
     }
 
     /// Disconnect from the CM server, clearing all session state.
@@ -1904,10 +2075,18 @@ impl SteamProtocolStack {
         self.stream = None;
         self.session_key = None;
         self.cipher = None;
+        self.rsa_public_key = None;
         self.state = ConnectionState::Disconnected;
         self.incoming_messages.clear();
         self.session_id = 0;
         self.steam_id = 0;
+        self.auth.username = None;
+        self.auth.password_encrypted = None;
+        self.auth.two_factor_code = None;
+        self.auth.session_token = None;
+        self.auth.refresh_token = None;
+        self.auth.machine_id = None;
+        self.auth.steam_id = None;
         self.auth.auth_status = AuthStatus::NotAuthenticated;
         Ok(())
     }
@@ -2115,6 +2294,17 @@ impl SteamProtocolStack {
             frame_header[7],
         ]);
 
+        // `total_len` comes directly from the network; bound it before any
+        // allocation so a hostile server cannot trigger a multi-GiB buffer.
+        if total_len as usize > MAX_FRAME_BODY_SIZE {
+            return Err(AppError::new(
+                ReasonCode::RcNetProtocolError,
+                format!(
+                    "SteamProtocol: frame body too large ({total_len} bytes, max {MAX_FRAME_BODY_SIZE})"
+                ),
+            ));
+        }
+
         let body_len = total_len as usize;
         let mut body = vec![0u8; body_len];
         if body_len > 0 {
@@ -2152,6 +2342,20 @@ impl SteamProtocolStack {
             )
         })?;
 
+        // The header's `size` field must match the actual payload length;
+        // otherwise trailing garbage silently becomes payload and framing is
+        // misaligned.
+        if ext_header.size as usize != plaintext.len() - ExtendedHeader::TOTAL_SIZE {
+            return Err(AppError::new(
+                ReasonCode::RcNetProtocolError,
+                format!(
+                    "SteamProtocol: header size {} does not match payload length {}",
+                    ext_header.size,
+                    plaintext.len() - ExtendedHeader::TOTAL_SIZE
+                ),
+            ));
+        }
+
         let payload = plaintext[ExtendedHeader::TOTAL_SIZE..].to_vec();
         let msg_type = map_emsg(ext_header.raw);
 
@@ -2170,13 +2374,18 @@ impl SteamProtocolStack {
     }
 
     /// Drain all available messages (non-blocking read loop).
+    ///
+    /// Propagates the first protocol error instead of swallowing it: a bad
+    /// magic, truncated frame, or decryption failure desynchronizes the CTR
+    /// cipher, so callers must be able to tell a clean drain from a broken
+    /// connection.
     pub fn drain_messages(&mut self) -> AppResult<usize> {
         let mut count = 0;
         loop {
             match self.receive_messages() {
                 Ok(0) => break,
                 Ok(n) => count += n,
-                Err(_) => break,
+                Err(e) => return Err(e),
             }
         }
         Ok(count)
@@ -2233,7 +2442,7 @@ impl SteamProtocolStack {
 
         // Step 3: Wrap the AES key with the server's RSA public key.
         // Use RSA-OAEP with SHA-256 for the key wrapping.
-        let encrypted_key = self.rsa_wrap_aes_key(&request.rsa_modulus, &aes_key)?;
+        let encrypted_key = self.rsa_wrap_aes_key(&aes_key)?;
 
         // Step 4: Send ChannelEncryptResponse.
         self.send_encrypt_response(&encrypted_key)?;
@@ -2279,6 +2488,18 @@ impl SteamProtocolStack {
         }
 
         let total_len = u32::from_le_bytes(frame_header[4..8].try_into().unwrap());
+
+        // `total_len` is read directly from the network; bound it before
+        // allocating so a hostile server cannot trigger a multi-GiB buffer.
+        if total_len as usize > MAX_FRAME_BODY_SIZE {
+            return Err(AppError::new(
+                ReasonCode::RcNetProtocolError,
+                format!(
+                    "SteamProtocol: encrypt frame too large ({total_len} bytes, max {MAX_FRAME_BODY_SIZE})"
+                ),
+            ));
+        }
+
         let mut payload = vec![0u8; total_len as usize];
         if total_len > 0 {
             stream.read_exact(&mut payload).map_err(|e| {
@@ -2336,26 +2557,16 @@ impl SteamProtocolStack {
 
     /// Wrap the AES session key with the server's RSA public key using
     /// RSA-OAEP (SHA-256).
-    fn rsa_wrap_aes_key(
-        &self,
-        rsa_modulus: &[u8],
-        aes_key: &[u8; AES_KEY_LEN],
-    ) -> AppResult<Vec<u8>> {
+    ///
+    /// Reuses the key captured during the encryption handshake instead of
+    /// rebuilding it from the modulus (single construction/validation site).
+    fn rsa_wrap_aes_key(&self, aes_key: &[u8; AES_KEY_LEN]) -> AppResult<Vec<u8>> {
         use rsa::Oaep;
 
-        // Steam's RSA public key is sent as the raw modulus with a known
-        // public exponent (usually 65537 = 0x10001). We reconstruct the
-        // public key from its components.
-        //
-        // The modulus is a big-endian integer. We use `rsa::RsaPublicKey`
-        // with the exponent 65537.
-        let n = rsa::BigUint::from_bytes_be(rsa_modulus);
-        let e = rsa::BigUint::from_bytes_be(&[0x01, 0x00, 0x01]); // 65537
-
-        let pub_key = rsa::RsaPublicKey::new(n.clone(), e).map_err(|e| {
+        let pub_key = self.rsa_public_key.as_ref().ok_or_else(|| {
             AppError::new(
                 ReasonCode::RcCryptoInvalid,
-                format!("SteamProtocol: failed to construct RSA key: {e}"),
+                "SteamProtocol: no RSA public key from encryption handshake",
             )
         })?;
 
@@ -2447,6 +2658,18 @@ impl SteamProtocolStack {
         }
 
         let total_len = u32::from_le_bytes(frame_header[4..8].try_into().unwrap());
+
+        // `total_len` is read directly from the network; bound it before
+        // allocating so a hostile server cannot trigger a multi-GiB buffer.
+        if total_len as usize > MAX_FRAME_BODY_SIZE {
+            return Err(AppError::new(
+                ReasonCode::RcNetProtocolError,
+                format!(
+                    "SteamProtocol: encrypt frame too large ({total_len} bytes, max {MAX_FRAME_BODY_SIZE})"
+                ),
+            ));
+        }
+
         let mut payload = vec![0u8; total_len as usize];
         if total_len > 0 {
             stream.read_exact(&mut payload).map_err(|e| {
@@ -2519,8 +2742,24 @@ impl SteamProtocolStack {
             if line.starts_with("<contentServer ") || line.starts_with("<contentServer>") {
                 let cell_id = self.parse_xml_attr(line, "cell").unwrap_or(0);
                 let https = self.parse_xml_bool_attr(line, "https");
-                let port: u16 = self.parse_xml_attr(line, "port").unwrap_or(443) as u16;
+                let port = match self.parse_xml_attr(line, "port") {
+                    Some(p) => u16::try_from(p).map_err(|_| {
+                        AppError::new(
+                            ReasonCode::RcNetProtocolError,
+                            format!("SteamProtocol: CDN routing port out of range: {p}"),
+                        )
+                    })?,
+                    None => 443,
+                };
                 let weight = self.parse_xml_attr(line, "weight").unwrap_or(100);
+                if cell_id > 1_000_000 || weight > 1_000_000 {
+                    return Err(AppError::new(
+                        ReasonCode::RcNetProtocolError,
+                        format!(
+                            "SteamProtocol: CDN routing cell/weight out of range: cell={cell_id} weight={weight}"
+                        ),
+                    ));
+                }
 
                 // Try to extract inline hostname: <tag>hostname</tag>
                 let host = if let Some(start) = line.find('>') {
@@ -2545,12 +2784,11 @@ impl SteamProtocolStack {
                 } else {
                     // Multi-line format: hostname is on a subsequent line
                     // before the closing </contentServer> tag
-                    for j in idx + 1..lines.len() {
-                        let next = lines[j].trim();
+                    for next in lines[idx + 1..].iter().map(|l| l.trim()) {
                         if next.starts_with("</") {
                             break;
                         }
-                        if !next.is_empty() && !next.starts_with("<") {
+                        if !next.is_empty() && !next.starts_with('<') {
                             servers.push(ContentServerRecord {
                                 host: next.to_string(),
                                 port,
@@ -2654,13 +2892,12 @@ impl SteamProtocolStack {
                 )
             })?;
 
-            let plaintext = cipher.decrypt(nonce, &data[12..]).map_err(|e| {
+            cipher.decrypt(nonce, &data[12..]).map_err(|e| {
                 AppError::new(
                     ReasonCode::RcCryptoInvalid,
                     format!("SteamProtocol: depot manifest decryption failed: {e}"),
                 )
-            })?;
-            plaintext
+            })?
         } else {
             data.to_vec()
         };
@@ -2678,77 +2915,99 @@ impl SteamProtocolStack {
         let _flags = read_u32_le(&decrypted, 16)?;
         let depot_id = read_u32_le(&decrypted, 20)?;
 
+        // Both counts come from the (untrusted) manifest. Bound them by an
+        // absolute cap AND by what the remaining buffer can physically hold
+        // (each file entry consumes at least 36 bytes, each chunk at least
+        // 36 bytes) before reserving anything.
+        let max_file_entries = (decrypted.len().saturating_sub(24)) / 36;
+        if file_count > MAX_MANIFEST_FILES || file_count as usize > max_file_entries {
+            return Err(AppError::new(
+                ReasonCode::RcNetProtocolError,
+                format!(
+                    "SteamProtocol: depot manifest file count {file_count} exceeds bounds (max {MAX_MANIFEST_FILES}, buffer holds {max_file_entries})"
+                ),
+            ));
+        }
+
         let mut offset = 24usize;
-        let mut manifests = Vec::with_capacity(file_count as usize);
+        let mut manifests = Vec::new();
 
         for _ in 0..file_count {
             if offset + 4 > decrypted.len() {
-                break;
+                return Err(manifest_truncated(offset, decrypted.len()));
             }
-            let filename_len =
-                u32::from_le_bytes(decrypted[offset..offset + 4].try_into().unwrap()) as usize;
+            let filename_len = read_u32_le(&decrypted, offset)? as usize;
             offset += 4;
 
             if offset + filename_len > decrypted.len() {
-                break;
+                return Err(manifest_truncated(offset, decrypted.len()));
             }
             let filename_bytes = &decrypted[offset..offset + filename_len];
             let filename = String::from_utf8_lossy(filename_bytes).to_string();
             offset += filename_len;
 
             if offset + 8 > decrypted.len() {
-                break;
+                return Err(manifest_truncated(offset, decrypted.len()));
             }
-            let size = u64::from_le_bytes(decrypted[offset..offset + 8].try_into().unwrap());
+            let size = u64::from_le_bytes(get_slice(&decrypted, offset, offset + 8)?.try_into().unwrap());
             offset += 8;
 
             if offset + 20 > decrypted.len() {
-                break;
+                return Err(manifest_truncated(offset, decrypted.len()));
             }
             let mut checksum = [0u8; 20];
             checksum.copy_from_slice(&decrypted[offset..offset + 20]);
             offset += 20;
 
             if offset + 4 > decrypted.len() {
-                break;
+                return Err(manifest_truncated(offset, decrypted.len()));
             }
-            let chunk_count = u32::from_le_bytes(decrypted[offset..offset + 4].try_into().unwrap());
+            let chunk_count = read_u32_le(&decrypted, offset)?;
             offset += 4;
 
-            let mut chunks = Vec::with_capacity(chunk_count as usize);
+            let max_chunk_entries = (decrypted.len().saturating_sub(offset)) / 36;
+            if chunk_count > MAX_MANIFEST_CHUNKS || chunk_count as usize > max_chunk_entries {
+                return Err(AppError::new(
+                    ReasonCode::RcNetProtocolError,
+                    format!(
+                        "SteamProtocol: depot manifest chunk count {chunk_count} for {filename} exceeds bounds (max {MAX_MANIFEST_CHUNKS}, buffer holds {max_chunk_entries})"
+                    ),
+                ));
+            }
+
+            let mut chunks = Vec::new();
             for _ in 0..chunk_count {
                 if offset + 20 > decrypted.len() {
-                    break;
+                    return Err(manifest_truncated(offset, decrypted.len()));
                 }
                 let mut chunk_id = [0u8; 20];
                 chunk_id.copy_from_slice(&decrypted[offset..offset + 20]);
                 offset += 20;
 
                 if offset + 8 > decrypted.len() {
-                    break;
+                    return Err(manifest_truncated(offset, decrypted.len()));
                 }
-                let chunk_offset =
-                    u64::from_le_bytes(decrypted[offset..offset + 8].try_into().unwrap());
+                let chunk_offset = u64::from_le_bytes(
+                    get_slice(&decrypted, offset, offset + 8)?.try_into().unwrap(),
+                );
                 offset += 8;
 
                 if offset + 4 > decrypted.len() {
-                    break;
+                    return Err(manifest_truncated(offset, decrypted.len()));
                 }
-                let crc = u32::from_le_bytes(decrypted[offset..offset + 4].try_into().unwrap());
+                let crc = read_u32_le(&decrypted, offset)?;
                 offset += 4;
 
                 if offset + 4 > decrypted.len() {
-                    break;
+                    return Err(manifest_truncated(offset, decrypted.len()));
                 }
-                let chunk_size =
-                    u32::from_le_bytes(decrypted[offset..offset + 4].try_into().unwrap());
+                let chunk_size = read_u32_le(&decrypted, offset)?;
                 offset += 4;
 
                 if offset + 4 > decrypted.len() {
-                    break;
+                    return Err(manifest_truncated(offset, decrypted.len()));
                 }
-                let compressed_size =
-                    u32::from_le_bytes(decrypted[offset..offset + 4].try_into().unwrap());
+                let compressed_size = read_u32_le(&decrypted, offset)?;
                 offset += 4;
 
                 chunks.push(ChunkInfo {
@@ -2791,13 +3050,65 @@ impl SteamProtocolStack {
         let protocol = if record.https { "https" } else { "http" };
         let base_url = format!("{}://{}:{}", protocol, record.host, record.port);
 
+        // Validate the manifest against the untrusted chunk table before
+        // allocating: the chunk extent must not exceed the declared file
+        // size, and the file size itself is capped.
+        let max_chunk_end = manifest
+            .chunks
+            .iter()
+            .map(|chunk| chunk.offset.saturating_add(chunk.size as u64))
+            .max()
+            .unwrap_or(0);
+        if max_chunk_end > manifest.size {
+            return Err(AppError::new(
+                ReasonCode::RcNetProtocolError,
+                format!(
+                    "SteamProtocol: chunk extent {max_chunk_end} exceeds manifest size {} for {}",
+                    manifest.size, manifest.filename
+                ),
+            ));
+        }
+        if manifest.size > MAX_MANIFEST_FILE_SIZE {
+            return Err(AppError::new(
+                ReasonCode::RcNetProtocolError,
+                format!(
+                    "SteamProtocol: manifest file size {} exceeds maximum allowed {} for {}",
+                    manifest.size, MAX_MANIFEST_FILE_SIZE, manifest.filename
+                ),
+            ));
+        }
+
         // Download each chunk and verify its SHA-1 hash
-        let mut file_data = vec![0u8; manifest.size as usize];
-        let _chunks_downloaded = 0u32;
+        let mut file_data = Vec::new();
+        file_data
+            .try_reserve_exact(manifest.size as usize)
+            .map_err(|_| {
+                AppError::new(
+                    ReasonCode::RcOutOfMemory,
+                    format!(
+                        "SteamProtocol: cannot allocate {} bytes for {}",
+                        manifest.size, manifest.filename
+                    ),
+                )
+            })?;
+        file_data.resize(manifest.size as usize, 0);
 
         // We'll download chunks sequentially. In a real implementation,
         // multiple chunks would be downloaded in parallel.
         for chunk in &manifest.chunks {
+            // Compressed chunks cannot be verified against their
+            // uncompressed SHA-1 without SteamPipe decompression; reject
+            // them with a clear error instead of a misleading hash mismatch.
+            if chunk.compressed_size > 0 {
+                return Err(AppError::new(
+                    ReasonCode::RcNetProtocolError,
+                    format!(
+                        "SteamProtocol: chunk {} is compressed; SteamPipe decompression is not supported",
+                        hex::encode(chunk.chunk_id)
+                    ),
+                ));
+            }
+
             let chunk_url = format!(
                 "{base_url}/depot/{app_id}/depot/{}/{}",
                 manifest.depot_id,
@@ -2867,102 +3178,75 @@ impl SteamProtocolStack {
         Ok(())
     }
 
-    /// Perform an HTTP GET request for a chunk from a Steam content server.
+    /// Perform an HTTP(S) GET request for a chunk from a Steam content server.
     ///
-    /// This uses a raw TCP connection with an HTTP/1.1 request since the
-    /// content server may not support the full reqwest stack. For HTTPS
-    /// content servers, this would use TLS.
+    /// Uses the blocking reqwest client so HTTPS content servers get a real
+    /// TLS handshake (a raw plaintext TCP connection cannot speak to port
+    /// 443). The response body is capped to protect against unbounded
+    /// allocations from a hostile server.
     fn http_get_chunk(&self, url: &str) -> AppResult<Vec<u8>> {
-        // Parse the URL
-        let url = url::Url::parse(url).map_err(|e| {
-            AppError::new(
-                ReasonCode::RcNetDnsResolutionFailed,
-                format!("SteamProtocol: invalid chunk URL: {e}"),
-            )
-        })?;
+        const MAX_CHUNK_RESPONSE: u64 = 16 * 1024 * 1024;
 
-        let host = url.host_str().ok_or_else(|| {
-            AppError::new(
-                ReasonCode::RcNetDnsResolutionFailed,
-                "SteamProtocol: no host in URL",
-            )
-        })?;
-
-        let port = url.port().unwrap_or(80);
-        let path = url.path();
-
-        // Connect via TCP
-        let addr_str = format!("{host}:{port}");
-        let addr = addr_str
-            .to_socket_addrs()
+        let client = reqwest::blocking::Client::builder()
+            .timeout(self.connect_timeout.saturating_mul(3))
+            .build()
             .map_err(|e| {
                 AppError::new(
-                    ReasonCode::RcNetDnsResolutionFailed,
-                    format!("SteamProtocol: DNS resolution for {host} failed: {e}"),
-                )
-            })?
-            .next()
-            .ok_or_else(|| {
-                AppError::new(
-                    ReasonCode::RcNetDnsResolutionFailed,
-                    format!("SteamProtocol: no address for {host}"),
+                    ReasonCode::RcNetConnectionFailed,
+                    format!("SteamProtocol: failed to build HTTP client: {e}"),
                 )
             })?;
 
-        let mut stream = TcpStream::connect_timeout(&addr, self.connect_timeout).map_err(|e| {
+        let response = client.get(url).send().map_err(|e| {
             AppError::new(
-                ReasonCode::RcNetConnectionFailed,
-                format!("SteamProtocol: connect to {host} failed: {e}"),
-            )
-        })?;
-
-        // Send HTTP GET request
-        let request = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
-        stream.write_all(request.as_bytes()).map_err(|e| {
-            AppError::new(
-                ReasonCode::RcNetWriteFailed,
+                ReasonCode::RcNetReadFailed,
                 format!("SteamProtocol: HTTP GET failed: {e}"),
             )
         })?;
 
-        // Read the response
-        let mut response = Vec::new();
-        let mut buf = [0u8; 8192];
-        loop {
-            match stream.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => response.extend_from_slice(&buf[..n]),
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(e) => {
-                    return Err(AppError::new(
-                        ReasonCode::RcNetReadFailed,
-                        format!("SteamProtocol: HTTP read failed: {e}"),
-                    ));
-                }
-            }
-        }
-
-        // Find the body after the HTTP headers
-        let response_str = String::from_utf8_lossy(&response);
-
-        // Check for HTTP status
-        if !response_str.starts_with("HTTP/1.1 200") && !response_str.starts_with("HTTP/1.0 200") {
+        if !response.status().is_success() {
             return Err(AppError::new(
                 ReasonCode::RcNetProtocolError,
-                format!("SteamProtocol: HTTP error from content server: {response_str:.200}"),
+                format!("SteamProtocol: HTTP error from content server: {}", response.status()),
             ));
         }
 
-        // Find body after \r\n\r\n
-        if let Some(body_start) = response_str.find("\r\n\r\n") {
-            let body_offset = body_start + 4;
-            Ok(response[body_offset..].to_vec())
-        } else {
-            Err(AppError::new(
+        // Refuse responses that advertise a body larger than the cap.
+        if response
+            .content_length()
+            .is_some_and(|len| len > MAX_CHUNK_RESPONSE)
+        {
+            return Err(AppError::new(
                 ReasonCode::RcNetProtocolError,
-                "SteamProtocol: no HTTP body separator found",
-            ))
+                format!(
+                    "SteamProtocol: content server response exceeds {MAX_CHUNK_RESPONSE} bytes"
+                ),
+            ));
         }
+
+        // Read at most MAX_CHUNK_RESPONSE + 1 bytes so an oversized body is
+        // detected instead of accumulated unboundedly.
+        let mut body = Vec::new();
+        response
+            .take(MAX_CHUNK_RESPONSE + 1)
+            .read_to_end(&mut body)
+            .map_err(|e| {
+                AppError::new(
+                    ReasonCode::RcNetReadFailed,
+                    format!("SteamProtocol: HTTP read failed: {e}"),
+                )
+            })?;
+
+        if body.len() as u64 > MAX_CHUNK_RESPONSE {
+            return Err(AppError::new(
+                ReasonCode::RcNetProtocolError,
+                format!(
+                    "SteamProtocol: content server response exceeds {MAX_CHUNK_RESPONSE} bytes"
+                ),
+            ));
+        }
+
+        Ok(body)
     }
 
     /// Verify the SHA-1 checksum of a file.
@@ -3029,6 +3313,12 @@ impl SteamProtocolStack {
     /// handshake, if available.
     pub fn rsa_public_key(&self) -> Option<&rsa::RsaPublicKey> {
         self.rsa_public_key.as_ref()
+    }
+}
+
+impl Default for SteamProtocolStack {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -3182,6 +3472,16 @@ pub fn map_emsg(raw: u32) -> SteamMessageType {
     }
 }
 
+/// Error describing a truncated binary depot manifest field read.
+fn manifest_truncated(offset: usize, len: usize) -> AppError {
+    AppError::new(
+        ReasonCode::RcNetProtocolError,
+        format!(
+            "SteamProtocol: depot manifest truncated at offset {offset} (len={len})"
+        ),
+    )
+}
+
 /// Constant-time byte slice comparison.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
@@ -3311,7 +3611,7 @@ pub fn parse_steam_protocol_url(url_str: &str) -> Option<SteamProtocolUrl> {
     // segments contain only the arguments (["730"]).
     let segments: Vec<String> = parsed
         .path_segments()
-        .map(|s| s.map(|seg| urlencoding_decode(seg)).collect())
+        .map(|s| s.map(urlencoding_decode).collect())
         .unwrap_or_default();
 
     let raw_url = url_str.to_string();
@@ -3348,7 +3648,7 @@ pub fn parse_steam_protocol_url(url_str: &str) -> Option<SteamProtocolUrl> {
         let cmd = cmd_str;
         match cmd.as_str() {
             "open" => {
-                if cmd_args.len() > 0 {
+                if !cmd_args.is_empty() {
                     match cmd_args[0].to_lowercase().as_str() {
                         "friends" => SteamProtocolCommand::OpenFriends,
                         other => SteamProtocolCommand::Unknown(format!("open/{other}")),
@@ -3358,7 +3658,7 @@ pub fn parse_steam_protocol_url(url_str: &str) -> Option<SteamProtocolUrl> {
                 }
             }
             "store" => {
-                if cmd_args.len() > 0 {
+                if !cmd_args.is_empty() {
                     match cmd_args[0].parse::<u32>() {
                         Ok(id) => SteamProtocolCommand::Store(id),
                         Err(_) => SteamProtocolCommand::Unknown(format!("store/{}", cmd_args[0])),
@@ -3368,7 +3668,7 @@ pub fn parse_steam_protocol_url(url_str: &str) -> Option<SteamProtocolUrl> {
                 }
             }
             "run" => {
-                if cmd_args.len() > 0 {
+                if !cmd_args.is_empty() {
                     match cmd_args[0].parse::<u32>() {
                         Ok(id) => SteamProtocolCommand::Run(id),
                         Err(_) => SteamProtocolCommand::Unknown(format!("run/{}", cmd_args[0])),
@@ -3378,7 +3678,7 @@ pub fn parse_steam_protocol_url(url_str: &str) -> Option<SteamProtocolUrl> {
                 }
             }
             "launch" => {
-                if cmd_args.len() > 0 {
+                if !cmd_args.is_empty() {
                     match cmd_args[0].parse::<u32>() {
                         Ok(id) => SteamProtocolCommand::Launch(id),
                         Err(_) => SteamProtocolCommand::Unknown(format!("launch/{}", cmd_args[0])),
@@ -3388,7 +3688,7 @@ pub fn parse_steam_protocol_url(url_str: &str) -> Option<SteamProtocolUrl> {
                 }
             }
             "nav" => {
-                if cmd_args.len() > 0 {
+                if !cmd_args.is_empty() {
                     SteamProtocolCommand::Nav(cmd_args[0].clone())
                 } else {
                     SteamProtocolCommand::Unknown("nav".to_string())
@@ -3396,7 +3696,7 @@ pub fn parse_steam_protocol_url(url_str: &str) -> Option<SteamProtocolUrl> {
             }
             "friends" => SteamProtocolCommand::Friends,
             "subscribe" => {
-                if cmd_args.len() > 0 {
+                if !cmd_args.is_empty() {
                     match cmd_args[0].parse::<u32>() {
                         Ok(id) => SteamProtocolCommand::Subscribe(id),
                         Err(_) => {
@@ -3408,7 +3708,7 @@ pub fn parse_steam_protocol_url(url_str: &str) -> Option<SteamProtocolUrl> {
                 }
             }
             "install" => {
-                if cmd_args.len() > 0 {
+                if !cmd_args.is_empty() {
                     match cmd_args[0].parse::<u32>() {
                         Ok(id) => SteamProtocolCommand::Install(id),
                         Err(_) => SteamProtocolCommand::Unknown(format!("install/{}", cmd_args[0])),
@@ -3418,7 +3718,7 @@ pub fn parse_steam_protocol_url(url_str: &str) -> Option<SteamProtocolUrl> {
                 }
             }
             "browser" => {
-                if cmd_args.len() > 0 {
+                if !cmd_args.is_empty() {
                     SteamProtocolCommand::Browser(cmd_args.join("/"))
                 } else {
                     SteamProtocolCommand::Unknown("browser".to_string())
@@ -3436,24 +3736,28 @@ pub fn parse_steam_protocol_url(url_str: &str) -> Option<SteamProtocolUrl> {
 }
 
 /// Simple percent-decoding for URL path segments.
+///
+/// Decodes into raw bytes first so percent-encoded UTF-8 segments survive
+/// intact, then converts lossily. `+` is NOT treated as a space here: that
+/// rule only applies to query strings, and path segments are decoded with
+/// `url`'s own query handling elsewhere.
 fn urlencoding_decode(input: &str) -> String {
-    let mut result = String::with_capacity(input.len());
+    let mut result = Vec::with_capacity(input.len());
     let mut chars = input.bytes();
     while let Some(b) = chars.next() {
         if b == b'%' {
-            let hi = chars.next().and_then(|c| hex_val(c));
-            let lo = chars.next().and_then(|c| hex_val(c));
+            let hi = chars.next().and_then(hex_val);
+            let lo = chars.next().and_then(hex_val);
             match (hi, lo) {
-                (Some(h), Some(l)) => result.push((h << 4 | l) as char),
-                _ => result.push('%'),
+                (Some(h), Some(l)) => result.push(h << 4 | l),
+                // Invalid escape: emit a literal '%' rather than garbage.
+                _ => result.push(b'%'),
             }
-        } else if b == b'+' {
-            result.push(' ');
         } else {
-            result.push(b as char);
+            result.push(b);
         }
     }
-    result
+    String::from_utf8_lossy(&result).into_owned()
 }
 
 fn hex_val(b: u8) -> Option<u8> {
@@ -3509,17 +3813,18 @@ impl SteamProtocolHandler {
     /// Create a new protocol handler with verbose logging enabled.
     pub fn new_verbose() -> Self {
         Self {
-            registered: true,
+            registered: false,
             verbose: true,
         }
     }
 
     /// Register the steam:// URL scheme with the operating system.
     ///
-    /// On macOS, this uses the CoreFoundation `LSSetDefaultHandlerForURLScheme`
-    /// to register the current executable as the handler for steam:// URLs.
-    /// This can also be achieved by having the appropriate `CFBundleURLTypes`
-    /// entry in the app's Info.plist.
+    /// On macOS, this uses the LaunchServices
+    /// `LSSetDefaultHandlerForURLScheme` (linked via the CoreServices
+    /// framework) to register the current executable as the handler for
+    /// steam:// URLs. This can also be achieved by having the appropriate
+    /// `CFBundleURLTypes` entry in the app's Info.plist.
     ///
     /// On Windows, this would write to the registry under
     /// `HKCR\steam\shell\open\command`.
@@ -3534,30 +3839,29 @@ impl SteamProtocolHandler {
         #[cfg(target_os = "macos")]
         {
             // Use LaunchServices to register steam:// URL scheme handling.
-            // On macOS, the preferred approach is Info.plist CFBundleURLTypes,
-            // but we also attempt runtime registration via
-            // LSSetDefaultHandlerForURLScheme.
-            unsafe {
-                use std::ffi::CString;
-                let scheme = CString::new("steam").unwrap();
-                let bundle_id = CString::new("com.casa1.steam").unwrap();
+            use std::ffi::CString;
 
-                // LSSetDefaultHandlerForURLScheme is from LaunchServices.
-                // It registers the given bundle ID as the default handler
-                // for the URL scheme.
-                unsafe extern "C" {
-                    fn LSSetDefaultHandlerForURLScheme(
-                        inURLScheme: *const libc::c_char,
-                        inHandlerBundleID: *const libc::c_char,
-                    ) -> i32;
+            let scheme = match CString::new("steam") {
+                Ok(scheme) => scheme,
+                Err(_) => {
+                    eprintln!("[SteamProtocol] cannot register steam:// URL scheme (invalid scheme)");
+                    return;
                 }
-                let ret = LSSetDefaultHandlerForURLScheme(scheme.as_ptr(), bundle_id.as_ptr());
-                if self.verbose {
-                    eprintln!(
-                        "[SteamProtocol] LSSetDefaultHandlerForURLScheme returned {}",
-                        ret
-                    );
+            };
+            let bundle_id = match CString::new("com.casa1.steam") {
+                Ok(bundle_id) => bundle_id,
+                Err(_) => {
+                    eprintln!("[SteamProtocol] cannot register steam:// URL scheme (invalid bundle ID)");
+                    return;
                 }
+            };
+
+            let ret = unsafe { LSSetDefaultHandlerForURLScheme(scheme.as_ptr(), bundle_id.as_ptr()) };
+            if self.verbose {
+                eprintln!(
+                    "[SteamProtocol] LSSetDefaultHandlerForURLScheme returned {}",
+                    ret
+                );
             }
 
             if self.verbose {
@@ -3694,27 +3998,25 @@ impl SteamProtocolHandler {
             match arg.as_str() {
                 "-applaunch" => {
                     // -applaunch <app_id> [args...]
-                    if i + 1 < args.len() {
-                        if let Ok(app_id) = args[i + 1].parse::<u32>() {
-                            // Collect remaining args as launch arguments
-                            let mut launch_args = Vec::new();
-                            i += 2;
-                            while i < args.len() && !args[i].starts_with('-') {
-                                launch_args.push(args[i].clone());
-                                i += 1;
-                            }
-
-                            // Build a fake steam:// URL with launch args in query
-                            let mut raw = format!("steam://run/{}", app_id);
-                            if !launch_args.is_empty() {
-                                raw.push_str("?launch_args=");
-                                raw.push_str(&launch_args.join("+"));
-                            }
-                            if let Some(parsed) = parse_steam_protocol_url(&raw) {
-                                results.push(parsed);
-                            }
-                            continue;
+                    if i + 1 < args.len() && let Ok(app_id) = args[i + 1].parse::<u32>() {
+                        // Collect remaining args as launch arguments
+                        let mut launch_args = Vec::new();
+                        i += 2;
+                        while i < args.len() && !args[i].starts_with('-') {
+                            launch_args.push(args[i].clone());
+                            i += 1;
                         }
+
+                        // Build a fake steam:// URL with launch args in query
+                        let mut raw = format!("steam://run/{}", app_id);
+                        if !launch_args.is_empty() {
+                            raw.push_str("?launch_args=");
+                            raw.push_str(&launch_args.join("+"));
+                        }
+                        if let Some(parsed) = parse_steam_protocol_url(&raw) {
+                            results.push(parsed);
+                        }
+                        continue;
                     }
                 }
                 "-silent" | "-silentlaunch" => {

@@ -250,6 +250,85 @@ pub fn prepare_steam_ge(
     }
 }
 
+/// The `CASA1_*` environment variables derived from a launch profile.
+///
+/// Shared by [`build_steam_override_profile`] and
+/// [`build_steam_environment`] so the two sets cannot drift apart.
+fn steam_env_vars(profile: &SteamLaunchProfile) -> BTreeMap<String, String> {
+    let mut env = BTreeMap::new();
+
+    // ── Graphics configuration ──────────────────────────────────────────────
+    if profile.metal_rendering {
+        // Enable Metal hardware acceleration.
+        env.insert("CASA1_METAL_RENDERING".to_string(), "1".to_string());
+        // Report as NVIDIA vendor for maximum D3D feature level compatibility.
+        env.insert("CASA1_GPU_COMPAT_VENDOR".to_string(), "10de".to_string());
+        // Enable D3D11 feature level 11_0 for Steam's UI rendering.
+        env.insert("CASA1_D3D_FEATURE_LEVEL".to_string(), "11_0".to_string());
+        // Enable DXGI swapchain backed by CAMetalLayer.
+        env.insert("CASA1_DXGI_METAL_SWAPCHAIN".to_string(), "1".to_string());
+    }
+
+    if profile.hidpi {
+        // Enable HiDPI/Retina mode for sharp text on Retina displays.
+        env.insert("CASA1_HIDPI".to_string(), "1".to_string());
+    }
+
+    // ── Audio configuration ─────────────────────────────────────────────────
+    if profile.real_audio {
+        // Route all audio through real cpal output.
+        env.insert("CASA1_REAL_AUDIO".to_string(), "1".to_string());
+        // Use the default macOS audio device.
+        env.insert("CASA1_AUDIO_DEVICE".to_string(), "default".to_string());
+        // Enable XAudio2 real output for Steam audio.
+        env.insert("CASA1_XAUDIO2_REAL".to_string(), "1".to_string());
+        // Enable DirectSound real output.
+        env.insert("CASA1_DSOUND_REAL".to_string(), "1".to_string());
+    }
+
+    // ── CEF/WebView configuration ───────────────────────────────────────────
+    if profile.cef_bridge {
+        // Enable the CEF/WKWebView bridge for Steam's web-based UI.
+        env.insert("CASA1_CEF_BRIDGE".to_string(), "1".to_string());
+        // Enable WebView2 COM interface for Steam's embedded browser.
+        env.insert("CASA1_WEBVIEW2".to_string(), "1".to_string());
+        // Enable IOSurface-backed zero-copy compositing for CEF frames.
+        env.insert("CASA1_CEF_IOSURFACE".to_string(), "1".to_string());
+    }
+
+    // ── Vulkan/OpenGL configuration ─────────────────────────────────────────
+    if profile.vulkan_opengl {
+        // Enable Vulkan → Metal translation via MoltenVK.
+        env.insert("CASA1_VULKAN_METAL".to_string(), "1".to_string());
+        // Enable OpenGL → Metal translation.
+        env.insert("CASA1_OPENGL_METAL".to_string(), "1".to_string());
+    }
+
+    // ── Steam-specific configuration ────────────────────────────────────────
+    if profile.steam_crash_workaround {
+        env.insert("CASA1_STEAM_CRASH_WORKAROUND".to_string(), "1".to_string());
+    }
+    if profile.debug_logging {
+        env.insert("CASA1_STEAM_TRACE".to_string(), "1".to_string());
+    }
+    if !profile.jit_enabled {
+        env.insert("CASA1_JIT".to_string(), "0".to_string());
+    }
+    if profile.instruction_budget > 0 {
+        env.insert(
+            "CASA1_PE_RUNTIME_BUDGET".to_string(),
+            profile.instruction_budget.to_string(),
+        );
+    }
+
+    // ── Steam Input configuration ───────────────────────────────────────────
+    if profile.steam_input {
+        env.insert("CASA1_STEAM_INPUT".to_string(), "1".to_string());
+    }
+
+    env
+}
+
 /// Creates the Steam-specific override profile for the GE.
 ///
 /// This override profile configures:
@@ -259,76 +338,7 @@ pub fn prepare_steam_ge(
 /// - Graphics profile for optimal rendering
 /// - Network profile for Steam connectivity
 pub fn build_steam_override_profile(profile: &SteamLaunchProfile) -> OverrideProfile {
-    let mut env_add = BTreeMap::new();
-
-    // ── Graphics configuration ──────────────────────────────────────────────
-    if profile.metal_rendering {
-        // Enable Metal hardware acceleration.
-        env_add.insert("CASA1_METAL_RENDERING".to_string(), "1".to_string());
-        // Report as NVIDIA vendor for maximum D3D feature level compatibility.
-        env_add.insert("CASA1_GPU_COMPAT_VENDOR".to_string(), "10de".to_string());
-        // Enable D3D11 feature level 11_0 for Steam's UI rendering.
-        env_add.insert("CASA1_D3D_FEATURE_LEVEL".to_string(), "11_0".to_string());
-        // Enable DXGI swapchain backed by CAMetalLayer.
-        env_add.insert("CASA1_DXGI_METAL_SWAPCHAIN".to_string(), "1".to_string());
-    }
-
-    if profile.hidpi {
-        // Enable HiDPI/Retina mode for sharp text on Retina displays.
-        env_add.insert("CASA1_HIDPI".to_string(), "1".to_string());
-    }
-
-    // ── Audio configuration ─────────────────────────────────────────────────
-    if profile.real_audio {
-        // Route all audio through real cpal output.
-        env_add.insert("CASA1_REAL_AUDIO".to_string(), "1".to_string());
-        // Use the default macOS audio device.
-        env_add.insert("CASA1_AUDIO_DEVICE".to_string(), "default".to_string());
-        // Enable XAudio2 real output for Steam audio.
-        env_add.insert("CASA1_XAUDIO2_REAL".to_string(), "1".to_string());
-        // Enable DirectSound real output.
-        env_add.insert("CASA1_DSOUND_REAL".to_string(), "1".to_string());
-    }
-
-    // ── CEF/WebView configuration ───────────────────────────────────────────
-    if profile.cef_bridge {
-        // Enable the CEF/WKWebView bridge for Steam's web-based UI.
-        env_add.insert("CASA1_CEF_BRIDGE".to_string(), "1".to_string());
-        // Enable WebView2 COM interface for Steam's embedded browser.
-        env_add.insert("CASA1_WEBVIEW2".to_string(), "1".to_string());
-        // Enable IOSurface-backed zero-copy compositing for CEF frames.
-        env_add.insert("CASA1_CEF_IOSURFACE".to_string(), "1".to_string());
-    }
-
-    // ── Vulkan/OpenGL configuration ─────────────────────────────────────────
-    if profile.vulkan_opengl {
-        // Enable Vulkan → Metal translation via MoltenVK.
-        env_add.insert("CASA1_VULKAN_METAL".to_string(), "1".to_string());
-        // Enable OpenGL → Metal translation.
-        env_add.insert("CASA1_OPENGL_METAL".to_string(), "1".to_string());
-    }
-
-    // ── Steam-specific configuration ────────────────────────────────────────
-    if profile.steam_crash_workaround {
-        env_add.insert("CASA1_STEAM_CRASH_WORKAROUND".to_string(), "1".to_string());
-    }
-    if profile.debug_logging {
-        env_add.insert("CASA1_STEAM_TRACE".to_string(), "1".to_string());
-    }
-    if !profile.jit_enabled {
-        env_add.insert("CASA1_JIT".to_string(), "0".to_string());
-    }
-    if profile.instruction_budget > 0 {
-        env_add.insert(
-            "CASA1_PE_RUNTIME_BUDGET".to_string(),
-            profile.instruction_budget.to_string(),
-        );
-    }
-
-    // ── Steam Input configuration ───────────────────────────────────────────
-    if profile.steam_input {
-        env_add.insert("CASA1_STEAM_INPUT".to_string(), "1".to_string());
-    }
+    let env_add = steam_env_vars(profile);
 
     // ── DLL overrides ───────────────────────────────────────────────────────
     // Use Casa1's built-in (Metal-backed) implementations for D3D and DXGI.
@@ -551,62 +561,9 @@ pub fn build_steam_environment(
     env.insert("CASA1_RUN_INTENT".to_string(), "play".to_string());
     env.insert("CASA1_TEST_ID".to_string(), test_id.to_string());
 
-    // ── Steam-specific environment variables ────────────────────────────────
-
-    // Graphics: Metal hardware acceleration.
-    if profile.metal_rendering {
-        env.insert("CASA1_METAL_RENDERING".to_string(), "1".to_string());
-        env.insert("CASA1_GPU_COMPAT_VENDOR".to_string(), "10de".to_string());
-        env.insert("CASA1_D3D_FEATURE_LEVEL".to_string(), "11_0".to_string());
-        env.insert("CASA1_DXGI_METAL_SWAPCHAIN".to_string(), "1".to_string());
-    }
-
-    if profile.hidpi {
-        env.insert("CASA1_HIDPI".to_string(), "1".to_string());
-    }
-
-    // Audio: Real audio output via cpal.
-    if profile.real_audio {
-        env.insert("CASA1_REAL_AUDIO".to_string(), "1".to_string());
-        env.insert("CASA1_AUDIO_DEVICE".to_string(), "default".to_string());
-        env.insert("CASA1_XAUDIO2_REAL".to_string(), "1".to_string());
-        env.insert("CASA1_DSOUND_REAL".to_string(), "1".to_string());
-    }
-
-    // CEF/WebView: Bridge for Steam's web UI.
-    if profile.cef_bridge {
-        env.insert("CASA1_CEF_BRIDGE".to_string(), "1".to_string());
-        env.insert("CASA1_WEBVIEW2".to_string(), "1".to_string());
-        env.insert("CASA1_CEF_IOSURFACE".to_string(), "1".to_string());
-    }
-
-    // Vulkan/OpenGL: Metal translation.
-    if profile.vulkan_opengl {
-        env.insert("CASA1_VULKAN_METAL".to_string(), "1".to_string());
-        env.insert("CASA1_OPENGL_METAL".to_string(), "1".to_string());
-    }
-
-    // Steam-specific instrumentation.
-    if profile.steam_crash_workaround {
-        env.insert("CASA1_STEAM_CRASH_WORKAROUND".to_string(), "1".to_string());
-    }
-    if profile.debug_logging {
-        env.insert("CASA1_STEAM_TRACE".to_string(), "1".to_string());
-    }
-    if !profile.jit_enabled {
-        env.insert("CASA1_JIT".to_string(), "0".to_string());
-    }
-    if profile.instruction_budget > 0 {
-        env.insert(
-            "CASA1_PE_RUNTIME_BUDGET".to_string(),
-            profile.instruction_budget.to_string(),
-        );
-    }
-
-    // Steam Input.
-    if profile.steam_input {
-        env.insert("CASA1_STEAM_INPUT".to_string(), "1".to_string());
-    }
+    // ── Steam-specific environment variables (shared with the override
+    // profile so the two cannot drift) ─────────────────────────────────────
+    env.extend(steam_env_vars(profile));
 
     // Steam install directory hint.
     let steam_dir = profile.steam_dir(ge_root);
@@ -933,8 +890,10 @@ mod tests {
 
     #[test]
     fn no_metal_disables_gpu_vars() {
-        let mut profile = SteamLaunchProfile::default();
-        profile.metal_rendering = false;
+        let profile = SteamLaunchProfile {
+            metal_rendering: false,
+            ..SteamLaunchProfile::default()
+        };
         let override_profile = build_steam_override_profile(&profile);
         assert!(
             !override_profile
@@ -947,8 +906,10 @@ mod tests {
 
     #[test]
     fn no_audio_disables_audio_vars() {
-        let mut profile = SteamLaunchProfile::default();
-        profile.real_audio = false;
+        let profile = SteamLaunchProfile {
+            real_audio: false,
+            ..SteamLaunchProfile::default()
+        };
         let override_profile = build_steam_override_profile(&profile);
         assert!(
             !override_profile

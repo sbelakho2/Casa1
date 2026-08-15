@@ -1,0 +1,179 @@
+warning: unreachable expression
+     --> src/pe_runtime.rs:65207:9
+      |
+65202 |               return Ok(Arc::clone(&cached.cached));
+      |               ------------------------------------- any code following this expression is unreachable
+...
+65207 | /         if let Some(jit) = jit_runtime {
+65208 | |             if jit.is_compiled(rip) {
+65209 | |                 let _ = jit.unchain_target(rip);
+65210 | |             }
+65211 | |         }
+      | |_________^ unreachable expression
+      |
+      = note: `#[warn(unreachable_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `lhs`
+     --> src/cpu.rs:16265:38
+      |
+16265 |             IrInstruction::Compare { lhs, rhs, width } => {
+      |                                      ^^^ help: try ignoring the field: `lhs: _`
+      |
+      = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `rhs`
+     --> src/cpu.rs:16265:43
+      |
+16265 |             IrInstruction::Compare { lhs, rhs, width } => {
+      |                                           ^^^ help: try ignoring the field: `rhs: _`
+
+warning: unused variable: `width`
+     --> src/cpu.rs:16265:48
+      |
+16265 |             IrInstruction::Compare { lhs, rhs, width } => {
+      |                                                ^^^^^ help: try ignoring the field: `width: _`
+
+warning: unused variable: `lhs`
+     --> src/cpu.rs:16268:35
+      |
+16268 |             IrInstruction::Test { lhs, rhs, width } => {
+      |                                   ^^^ help: try ignoring the field: `lhs: _`
+
+warning: unused variable: `rhs`
+     --> src/cpu.rs:16268:40
+      |
+16268 |             IrInstruction::Test { lhs, rhs, width } => {
+      |                                        ^^^ help: try ignoring the field: `rhs: _`
+
+warning: unused variable: `width`
+     --> src/cpu.rs:16268:45
+      |
+16268 |             IrInstruction::Test { lhs, rhs, width } => {
+      |                                             ^^^^^ help: try ignoring the field: `width: _`
+
+warning: unused variable: `jit_runtime`
+     --> src/pe_runtime.rs:65191:5
+      |
+65191 |     jit_runtime: Option<&mut crate::jit::JitRuntime>,
+      |     ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_jit_runtime`
+
+warning: `casa1` (lib test) generated 8 warnings (run `cargo fix --lib -p casa1 --tests` to apply 7 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.49s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/lib.rs (target/debug/deps/casa1-7ce754b9b667f95d)
+
+running 110 tests
+test cef_bridge::tests::steam_web_helper_inject_bridge ... ok
+test cef_bridge::tests::steam_web_helper_cef_query ... ok
+test cef_bridge::tests::steam_web_helper_launch ... ok
+test cef_bridge::tests::steam_web_helper_shutdown ... ok
+test cef_bridge::tests::steam_web_helper_tick ... ok
+test error::tests::last_error_maps_dotnet_steam_media ... ok
+test pe_runtime::tests::steam_api_from_import_maps_context_init ... ok
+test pe_runtime::tests::steam_api_from_import_maps_create_interface ... ok
+test import_coverage::tests::test_steam_exe_imports_contains_known_dlls ... ok
+test pe_runtime::tests::steam_api_from_import_maps_init ... ok
+test pe_runtime::tests::steam_api_is_import_supported_for_all_flat_exports ... ok
+test steam::tests::steam_install_target_path_maps_payload_files_into_install_root ... ok
+test cpu::tests::decode_and_execute_live_steam_pcmp_eq_por_pmovmskb_updates_mask ... ok
+test cpu::tests::decode_and_execute_live_steam_movss_block_preserves_neighbor_vector_fields ... ok
+test cpu::tests::decode_and_execute_live_steam_bsf_updates_index_and_zf ... ok
+test pe_runtime::tests::steam_api_from_import_maps_register_callback ... ok
+test pe_runtime::tests::steam_api_from_import_maps_shutdown ... ok
+test security::tests::steamstub_xor_decrypt ... ok
+test steam::tests::steam_install_target_path_skips_nsis_plugin_payloads ... ok
+test steam_input::tests::normalize_axis_works ... ok
+test cpu::tests::decode_and_execute_live_steam_pcmpistri_equal_any_most_significant_match ... ok
+test cpu::tests::decode_and_execute_live_steam_pshuflw_then_movlhps_broadcasts_word ... ok
+test cpu::tests::decode_and_execute_live_steam_not_al_then_test_sets_low_byte ... ok
+test cpu::tests::decode_and_execute_live_steam_shr_cl_imm8_then_test_updates_low_byte ... ok
+test steam_input::tests::normalize_trigger_works ... ok
+test security::tests::steamstub_header_parsing ... ok
+test steam_integration::tests::overlay_input_capture_when_active ... ok
+test steam_integration::tests::overlay_manager_custom_url ... ok
+test steam_integration::tests::overlay_manager_default_state ... ok
+test steam_integration::tests::overlay_manager_default_url ... ok
+test steam_integration::tests::overlay_manager_double_toggle ... ok
+test steam_integration::tests::overlay_manager_set_active ... ok
+test steam_integration::tests::overlay_manager_set_active_noop ... ok
+test steam_integration::tests::steam_boot_config_default ... ok
+test steam_integration::tests::overlay_manager_toggle ... ok
+test steam_integration::tests::steam_named_pipe_manager ... ok
+test steam_integration::tests::parse_app_manifest_basic ... ok
+test steam_integration::tests::steam_boot_config_command_line ... ok
+test steam_integration::tests::steam_boot_config_paths ... ok
+test steam_integration::tests::steam_paths_constants ... ok
+test steam_launch::tests::debug_profile_enables_tracing ... ok
+test steam_launch::tests::default_profile_has_metal_rendering ... ok
+test steam_launch::tests::build_environment_has_required_vars ... ok
+test steam_launch::tests::no_audio_disables_audio_vars ... ok
+test steam_launch::tests::no_metal_disables_gpu_vars ... ok
+test steam_launch::tests::offline_profile_disables_network ... ok
+test steam_launch::tests::override_profile_has_dll_overrides ... ok
+test steam_launch::tests::override_profile_has_audio_env_vars ... ok
+test steam_launch::tests::override_profile_has_metal_env_vars ... ok
+test steam_launch::tests::performance_profile_disables_debug ... ok
+test steam_launch::tests::steam_args_build_correctly ... ok
+test steam_integration::tests::steam_smoke_ge_root_loads ... ok
+test steam_launch::tests::steam_args_offline_mode ... ok
+test steam_launch::tests::steam_exe_path_resolves ... ok
+test steam_protocol::tests::cdn_routing_parsing ... ok
+test steam_protocol::tests::cdn_routing_parsing_empty ... ok
+test steam_protocol::tests::chunk_verification_fail ... ok
+test steam_protocol::tests::chunk_verification_pass ... ok
+test steam_protocol::tests::constant_time_eq_behaves_correctly ... ok
+test steam_protocol::tests::depot_manifest_parsing ... ok
+test steam_protocol::tests::deserialize_message_bad_magic ... ok
+test steam_protocol::tests::deserialize_message_too_short ... ok
+test steam_protocol::tests::depot_manifest_parsing_empty ... ok
+test steam_integration::tests::steam_library_scanner_empty ... ok
+test steam_protocol::tests::encrypt_decrypt_roundtrip ... ok
+test steam_protocol::tests::extended_header_encoding ... ok
+test steam_protocol::tests::extended_header_rejects_bad_header_size ... ok
+test steam_protocol::tests::gns_accept_session ... ok
+test steam_protocol::tests::gns_close_nonexistent_session ... ok
+test steam_protocol::tests::gns_message_send_poll ... ok
+test steam_integration::tests::steam_environment_creates_default_config ... ok
+test steam_protocol::tests::gns_session_create_and_close ... ok
+test steam_protocol::tests::file_checksum_verification ... ok
+test steam_protocol::tests::file_checksum_verification_fail ... ok
+test steam_integration::tests::steam_environment_verifies_installation ... ok
+test steam_protocol::tests::malformed_cdn_routing_empty ... ok
+test steam_protocol::tests::malformed_depot_manifest_too_short_returns_error ... ok
+test steam_protocol::tests::malformed_depot_manifest_truncated_gcm ... ok
+test steam_protocol::tests::malformed_deserialize_message_bad_magic ... ok
+test steam_integration::tests::steam_library_scanner_with_games ... ok
+test steam_protocol::tests::malformed_deserialize_message_truncated ... ok
+test steam_protocol::tests::malformed_extended_header_bad_size ... ok
+test steam_protocol::tests::malformed_extended_header_truncated ... ok
+test steam_protocol::tests::malformed_encrypted_frame_too_short ... ok
+test steam_protocol::tests::malformed_read_helpers_reject_short_input ... ok
+test steam_protocol::tests::malformed_read_u32_le_rejects_short_input ... ok
+test steam_protocol::tests::message_enum_mapping ... ok
+test steam_protocol::tests::protocol_stack_initialises_in_disconnected_state ... ok
+test steam_integration::tests::steam_environment_creates_directories ... ok
+test steam_protocol::tests::session_cipher_encrypt_decrypt ... ok
+test steam_protocol::tests::session_cipher_multiple_roundtrips ... ok
+test steam_integration::tests::steam_smoke_pe_parse ... ok
+test steam_protocol::tests::steam_message_serialize_deserialize_roundtrip ... ok
+test steam_protocol::tests::session_cipher_send_recv_independence ... ok
+test steam_protocol::tests::steam_client_state_machine ... ok
+test steam_protocol::tests::steam_message_serialize_with_payload ... ok
+test steam_protocol::tests::steam_zero_touch_default_servers_not_contacted ... ok
+test steam_protocol::tests::steam_zero_touch_stack_uses_no_network ... ok
+test steam_protocol::tests::steam_zero_touch_encrypt_decrypt_roundtrip_no_network ... ok
+test steam_protocol::tests::steam_zero_touch_gns_uses_no_network ... ok
+test pe_runtime::tests::steam_api_register_callback_stores_callback ... ok
+test pe_runtime::tests::steam_api_init_sets_initialized_flag ... ok
+test pe_runtime::tests::steam_api_unregister_callback_removes_callback ... ok
+test pe_runtime::tests::steam_api_context_init_initialises_context ... ok
+test pe_runtime::tests::steam_api_create_interface_returns_non_null ... ok
+test pe_runtime::tests::steam_api_shutdown_clears_state ... ok
+test steam_input::tests::trigger_repeated_haptic_pulse_runs ... ok
+test steam_input::tests::haptic_target_filters_correct_motor ... ok
+test steam_input::tests::send_hid_rumble_no_panic ... ok
+test steam_protocol::tests::rsa_key_wrap_and_unwrap ... ok
+
+test result: ok. 110 passed; 0 failed; 0 ignored; 0 measured; 2431 filtered out; finished in 10.93s
+

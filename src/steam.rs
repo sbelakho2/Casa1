@@ -428,20 +428,28 @@ impl SteamClient {
         )?;
         let state = self.ui.window_state(hwnd)?;
         self.logs.push(format!("boot:{}", state.title));
+        let steam_exe = self
+            .path_case
+            .get(&format!("{}/steam.exe", self.ge_root))
+            .cloned()
+            .ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcIo,
+                    "Steam.exe path-case entry missing after update",
+                )
+            })?;
         Ok(SteamBootResult {
             login_window_title: state.title,
-            steam_exe: self.path_case[&format!("{}/steam.exe", self.ge_root)].clone(),
+            steam_exe,
         })
     }
 
     pub fn self_update(&mut self, plan: &SteamUpdatePlan) -> AppResult<()> {
-        let files_snapshot = self.files.clone();
-        let path_case_snapshot = self.path_case.clone();
-        for (path, bytes) in &plan.files {
+        // Validate every target path up front so no file is written (and no
+        // snapshot is needed) when an escape is detected.
+        for path in plan.files.keys() {
             let normalized = normalize_path(path);
             if !normalized.starts_with(&self.ge_root) {
-                self.files = files_snapshot;
-                self.path_case = path_case_snapshot;
                 self.logs.push(format!(
                     "steam-update-failed:{}:{}",
                     ReasonCode::RcSteamUpdateFailed.name(),
@@ -452,11 +460,24 @@ impl SteamClient {
                     format!("update attempted to escape GE root: {path}"),
                 ));
             }
+        }
+
+        // Snapshot the file maps only when a mid-write failure is simulated
+        // (test hook); the normal path must not clone every installed byte
+        // (potentially gigabytes of game data) for the whole update.
+        let rollback = plan.fail_after_write.is_some().then(|| {
+            (self.files.clone(), self.path_case.clone())
+        });
+
+        for (path, bytes) in &plan.files {
+            let normalized = normalize_path(path);
             self.write_file(path, bytes.clone());
             self.logs.push(format!("update-write:{normalized}"));
             if plan.fail_after_write.as_deref() == Some(path) {
-                self.files = files_snapshot;
-                self.path_case = path_case_snapshot;
+                if let Some((files, path_case)) = rollback {
+                    self.files = files;
+                    self.path_case = path_case;
+                }
                 self.logs.push(format!(
                     "steam-update-failed:{}:{}",
                     ReasonCode::RcSteamUpdateFailed.name(),
@@ -742,16 +763,23 @@ impl SteamClient {
             )
             .as_bytes(),
         );
+        let executable_cwd = self
+            .path_case
+            .get(&executable_normalized)
+            .map(|case| parent_dir(case))
+            .unwrap_or_else(|| parent_dir(&executable));
+        let steam_exe_path_case = self
+            .path_case
+            .get(&format!("{}/steam.exe", self.ge_root))
+            .cloned()
+            .unwrap_or_else(|| format!("{}/steam.exe", self.ge_root));
         Ok(GameLaunchResult {
             executable,
-            cwd: parent_dir(&self.path_case[&executable_normalized]),
+            cwd: executable_cwd,
             env: BTreeMap::from([
                 ("SteamAppId".to_string(), app_id.to_string()),
                 ("SteamGameId".to_string(), app_id.to_string()),
-                (
-                    "SteamPath".to_string(),
-                    self.path_case[&format!("{}/steam.exe", self.ge_root)].clone(),
-                ),
+                ("SteamPath".to_string(), steam_exe_path_case),
                 ("SteamLibraryPath".to_string(), depot.library_root.clone()),
             ]),
             window_title,
@@ -1083,12 +1111,18 @@ fn steam_app_manifest_bytes(manifest: &DepotManifest) -> Vec<u8> {
     format!(
         "\"AppState\"\n{{\n\t\"appid\"\t\"{}\"\n\t\"name\"\t\"{}\"\n\t\"installdir\"\t\"{}\"\n\t\"launch\"\t\"{}\"\n\t\"prerequisites\"\t\"{}\"\n}}\n",
         manifest.app_id,
-        manifest.game_name,
-        manifest.install_dir,
-        manifest.launch_exe,
+        vdf_escape(&manifest.game_name),
+        vdf_escape(&manifest.install_dir),
+        vdf_escape(&manifest.launch_exe),
         prerequisites,
     )
     .into_bytes()
+}
+
+/// Escape `\` and `"` per VDF quoting rules so emitted metadata round-trips
+/// through the project's own VDF parser.
+fn vdf_escape(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1262,7 +1296,7 @@ fn collect_payload_files(payload_root: &Path) -> AppResult<BTreeMap<String, Vec<
 fn parse_vdf_document(contents: &str) -> AppResult<BTreeMap<String, VdfNode>> {
     let tokens = tokenize_vdf(contents)?;
     let mut index = 0;
-    let document = parse_vdf_map(&tokens, &mut index)?;
+    let document = parse_vdf_map(&tokens, &mut index, 0)?;
     if index != tokens.len() {
         return Err(AppError::new(
             ReasonCode::RcIo,
@@ -1271,6 +1305,10 @@ fn parse_vdf_document(contents: &str) -> AppResult<BTreeMap<String, VdfNode>> {
     }
     Ok(document)
 }
+
+/// Maximum VDF nesting depth; unbounded recursion on adversarial input would
+/// overflow the stack.
+const VDF_MAX_DEPTH: usize = 128;
 
 fn tokenize_vdf(contents: &str) -> AppResult<Vec<VdfToken>> {
     let bytes = contents.as_bytes();
@@ -1285,6 +1323,15 @@ fn tokenize_vdf(contents: &str) -> AppResult<Vec<VdfToken>> {
                     index += 1;
                 }
             }
+            b'/' if index + 1 < bytes.len() && bytes[index + 1] == b'*' => {
+                // Block comment `/* ... */`.
+                index += 2;
+                while index + 1 < bytes.len() && !(bytes[index] == b'*' && bytes[index + 1] == b'/')
+                {
+                    index += 1;
+                }
+                index = (index + 2).min(bytes.len());
+            }
             b'{' => {
                 tokens.push(VdfToken::OpenBrace);
                 index += 1;
@@ -1295,18 +1342,36 @@ fn tokenize_vdf(contents: &str) -> AppResult<Vec<VdfToken>> {
             }
             b'"' => {
                 index += 1;
-                let start = index;
-                while index < bytes.len() && bytes[index] != b'"' {
-                    index += 1;
+                let mut value = Vec::new();
+                let mut closed = false;
+                while index < bytes.len() {
+                    match bytes[index] {
+                        b'\\' if index + 1 < bytes.len() && bytes[index + 1] == b'"' => {
+                            value.push(b'"');
+                            index += 2;
+                        }
+                        b'\\' if index + 1 < bytes.len() && bytes[index + 1] == b'\\' => {
+                            value.push(b'\\');
+                            index += 2;
+                        }
+                        b'"' => {
+                            closed = true;
+                            index += 1;
+                            break;
+                        }
+                        byte => {
+                            value.push(byte);
+                            index += 1;
+                        }
+                    }
                 }
-                if index >= bytes.len() {
+                if !closed {
                     return Err(AppError::new(
                         ReasonCode::RcIo,
                         "unterminated quoted string in Steam metadata",
                     ));
                 }
-                tokens.push(VdfToken::String(contents[start..index].to_string()));
-                index += 1;
+                tokens.push(VdfToken::String(String::from_utf8_lossy(&value).into_owned()));
             }
             _ => {
                 return Err(
@@ -1319,7 +1384,17 @@ fn tokenize_vdf(contents: &str) -> AppResult<Vec<VdfToken>> {
     Ok(tokens)
 }
 
-fn parse_vdf_map(tokens: &[VdfToken], index: &mut usize) -> AppResult<BTreeMap<String, VdfNode>> {
+fn parse_vdf_map(
+    tokens: &[VdfToken],
+    index: &mut usize,
+    depth: usize,
+) -> AppResult<BTreeMap<String, VdfNode>> {
+    if depth > VDF_MAX_DEPTH {
+        return Err(AppError::new(
+            ReasonCode::RcIo,
+            "Steam metadata nesting exceeds maximum depth",
+        ));
+    }
     let mut map = BTreeMap::new();
     while *index < tokens.len() {
         match &tokens[*index] {
@@ -1349,7 +1424,7 @@ fn parse_vdf_map(tokens: &[VdfToken], index: &mut usize) -> AppResult<BTreeMap<S
                     }
                     VdfToken::OpenBrace => {
                         *index += 1;
-                        map.insert(key, VdfNode::Object(parse_vdf_map(tokens, index)?));
+                        map.insert(key, VdfNode::Object(parse_vdf_map(tokens, index, depth + 1)?));
                     }
                     VdfToken::CloseBrace => {
                         return Err(AppError::new(
@@ -1452,8 +1527,14 @@ fn split_registry_entry(entry_path: &str) -> AppResult<(String, String, String)>
             format!("invalid Steam registry entry {entry_path}"),
         ));
     }
-    let hive = parts.first().cloned().expect("validated");
-    let value_name = parts.last().cloned().expect("validated");
+    let hive = parts
+        .first()
+        .cloned()
+        .ok_or_else(|| AppError::new(ReasonCode::RcIo, format!("invalid Steam registry entry {entry_path}")))?;
+    let value_name = parts
+        .last()
+        .cloned()
+        .ok_or_else(|| AppError::new(ReasonCode::RcIo, format!("invalid Steam registry entry {entry_path}")))?;
     let key = parts[1..parts.len() - 1].join("\\");
     Ok((hive, key, value_name))
 }
@@ -1656,6 +1737,12 @@ const MAX_CHUNK_RETRIES: u32 = 3;
 /// Base delay (ms) for exponential backoff when retrying chunks.
 const RETRY_BASE_DELAY_MS: u64 = 1000;
 
+/// Maximum entries accepted from a SteamPipe .csm header (allocation bound).
+const MAX_STEAMPIPE_ENTRIES: usize = 1_000_000;
+
+/// Maximum depots accepted from a SteamPipe .csb header (allocation bound).
+const MAX_STEAMPIPE_DEPOTS: usize = 10_000;
+
 // ---------------------------------------------------------------------------
 // Content server tracking
 // ---------------------------------------------------------------------------
@@ -1738,8 +1825,7 @@ impl ContentServerList {
     pub fn seed_defaults(&mut self) {
         let records: Vec<ProtoContentServerRecord> = DEFAULT_CONTENT_SERVERS
             .iter()
-            .enumerate()
-            .map(|(_i, host)| ProtoContentServerRecord {
+            .map(|host| ProtoContentServerRecord {
                 host: host.to_string(),
                 port: 443,
                 https: true,
@@ -1864,7 +1950,7 @@ impl DownloadProgress {
             self.speed_bps = (downloaded as f64 / secs) as u64;
             let remaining = self.total_bytes.saturating_sub(downloaded);
             if self.speed_bps > 0 {
-                self.eta_secs = remaining / self.speed_bps;
+                self.eta_secs = remaining.checked_div(self.speed_bps).unwrap_or(0);
             }
         }
     }
@@ -1891,7 +1977,10 @@ pub struct FileDownload {
 
 impl FileDownload {
     pub fn new(filename: String, size: u64, checksum: [u8; 20], chunks: Vec<ChunkInfo>) -> Self {
-        let data = Vec::with_capacity(size as usize);
+        // Do not pre-allocate `size` bytes: `size` comes from an untrusted
+        // depot manifest and a hostile value would request a huge allocation
+        // (OOM abort) before any download has even started. The buffer grows
+        // as chunks arrive and is bounded by the chunk extent checks.
         Self {
             filename,
             size,
@@ -1899,7 +1988,7 @@ impl FileDownload {
             chunks,
             downloaded_bytes: 0,
             state: DownloadState::Pending,
-            data,
+            data: Vec::new(),
         }
     }
 }
@@ -1928,12 +2017,14 @@ pub struct DownloadSession {
 }
 
 impl DownloadSession {
-    pub fn new(app_id: u32, depot_id: u32, total_bytes: u64) -> Self {
+    pub fn new(app_id: u32, depot_id: u32) -> Self {
         Self {
             app_id,
             depot_id,
             files: Vec::new(),
-            progress: DownloadProgress::new(total_bytes),
+            // total_bytes is accumulated by add_file(); starting at 0 avoids
+            // double-counting when callers also pass a precomputed total.
+            progress: DownloadProgress::new(0),
             state: DownloadState::Pending,
             start_time: None,
             active_server: None,
@@ -2145,10 +2236,10 @@ impl ContentManager {
         self.ensure_content_servers()?;
 
         // Try the best server by latency first
-        if let Some(best) = self.server_list.best_server() {
-            if best.latency_ms.unwrap_or(9999) < 500 {
-                return Ok(best.base_url());
-            }
+        if let Some(best) = self.server_list.best_server()
+            && best.latency_ms.unwrap_or(9999) < 500
+        {
+            return Ok(best.base_url());
         }
 
         // Fall back to round-robin
@@ -2216,12 +2307,21 @@ impl ContentManager {
         }
 
         let data = response.body;
-        let compressed_size = chunk.compressed_size;
-        let expected_size = if compressed_size > 0 {
-            compressed_size as usize
-        } else {
-            chunk.size as usize
-        };
+
+        // Compressed chunks cannot be verified against their uncompressed
+        // SHA-1 (`chunk_id`) without SteamPipe decompression (Oodle/zlib).
+        // Reject them with a clear error instead of failing with a
+        // misleading "SHA-1 mismatch" on the raw compressed bytes.
+        if chunk.compressed_size > 0 {
+            return Err(AppError::new(
+                ReasonCode::RcNetProtocolError,
+                format!(
+                    "chunk {} is compressed (SteamPipe decompression not supported)",
+                    hex::encode(chunk.chunk_id)
+                ),
+            ));
+        }
+        let expected_size = chunk.size as usize;
 
         // Verify chunk size
         if data.len() != expected_size {
@@ -2234,10 +2334,6 @@ impl ContentManager {
             ));
         }
 
-        // For compressed chunks, decompression would use the SteamPipe
-        // format (Oodle or zlib). For now, pass through raw data.
-        // In a full implementation, compressed_size != chunk.size would
-        // trigger Oodle/zlib decompression.
         let chunk_data = data;
 
         // Verify SHA-1 hash of the chunk data
@@ -2257,15 +2353,40 @@ impl ContentManager {
         file: &mut FileDownload,
     ) -> AppResult<Vec<u8>> {
         file.state = DownloadState::Downloading;
-        let mut assembled = Vec::with_capacity(file.size as usize);
+        let mut assembled = Vec::new();
 
         for chunk in &file.chunks {
             let chunk_data = self.download_chunk(server_url, depot_id, chunk)?;
             let offset = assembled.len() as u64;
+            // Chunk offsets come from the (untrusted) depot manifest: a chunk
+            // starting before the current assembled length is an ordering or
+            // overlap violation. Reject it instead of underflowing (which
+            // panics in debug and requests a near-u64::MAX pad in release).
+            if chunk.offset < offset {
+                file.state = DownloadState::Failed;
+                return Err(AppError::new(
+                    ReasonCode::RcIo,
+                    format!(
+                        "chunk offset {} below assembled length {offset} for {}",
+                        chunk.offset, file.filename
+                    ),
+                ));
+            }
+            let end = chunk.offset.saturating_add(chunk_data.len() as u64);
+            if end > file.size {
+                file.state = DownloadState::Failed;
+                return Err(AppError::new(
+                    ReasonCode::RcIo,
+                    format!(
+                        "chunk extent {end} exceeds file size {} for {}",
+                        file.size, file.filename
+                    ),
+                ));
+            }
             if offset != chunk.offset {
                 // Pad to correct offset if needed (e.g., sparse files)
                 let pad = (chunk.offset - offset) as usize;
-                assembled.extend(std::iter::repeat(0u8).take(pad));
+                assembled.extend(std::iter::repeat_n(0u8, pad));
             }
             assembled.extend_from_slice(&chunk_data);
             file.downloaded_bytes += chunk_data.len() as u64;
@@ -2283,8 +2404,8 @@ impl ContentManager {
         }
 
         file.state = DownloadState::Completed;
-        file.data = assembled.clone();
-        Ok(assembled)
+        file.data = assembled;
+        Ok(file.data.clone())
     }
 
     /// Helper for [`process_downloads`] that downloads chunks and verifies
@@ -2297,14 +2418,29 @@ impl ContentManager {
         checksum: [u8; 20],
         file_size: u64,
     ) -> AppResult<Vec<u8>> {
-        let mut assembled = Vec::with_capacity(file_size as usize);
+        let mut assembled = Vec::new();
 
         for chunk in chunks {
             let chunk_data = self.download_chunk(server_url, depot_id, chunk)?;
             let offset = assembled.len() as u64;
+            // See download_file_chunks: reject out-of-order/overlapping
+            // chunk offsets instead of underflowing.
+            if chunk.offset < offset {
+                return Err(AppError::new(
+                    ReasonCode::RcIo,
+                    format!("chunk offset {} below assembled length {offset}", chunk.offset),
+                ));
+            }
+            let end = chunk.offset.saturating_add(chunk_data.len() as u64);
+            if end > file_size {
+                return Err(AppError::new(
+                    ReasonCode::RcIo,
+                    format!("chunk extent {end} exceeds file size {file_size}"),
+                ));
+            }
             if offset != chunk.offset {
                 let pad = (chunk.offset - offset) as usize;
-                assembled.extend(std::iter::repeat(0u8).take(pad));
+                assembled.extend(std::iter::repeat_n(0u8, pad));
             }
             assembled.extend_from_slice(&chunk_data);
         }
@@ -2329,8 +2465,9 @@ impl ContentManager {
         depot_id: u32,
         manifests: Vec<ProtoDepotManifest>,
     ) -> AppResult<()> {
-        let total_bytes: u64 = manifests.iter().map(|m| m.size).sum();
-        let mut session = DownloadSession::new(app_id, depot_id, total_bytes);
+        // The session total is accumulated by add_file(); passing a separate
+        // sum here would double-count every file's bytes.
+        let mut session = DownloadSession::new(app_id, depot_id);
 
         for manifest in manifests {
             let file = FileDownload::new(
@@ -2414,21 +2551,28 @@ impl ContentManager {
                 ) {
                     Ok(data) => {
                         // Re-borrow to update the file
-                        if let Some(session) = self.downloads.get_mut(&app_id) {
-                            if let Some(f) = session.files.get_mut(idx) {
-                                f.data = data;
-                                f.downloaded_bytes = f.size;
-                                f.state = DownloadState::Completed;
-                            }
+                        if let Some(session) = self.downloads.get_mut(&app_id)
+                            && let Some(f) = session.files.get_mut(idx)
+                        {
+                            f.data = data;
+                            f.downloaded_bytes = f.size;
+                            f.state = DownloadState::Completed;
                         }
                     }
                     Err(e) => {
-                        if let Some(session) = self.downloads.get_mut(&app_id) {
-                            if let Some(f) = session.files.get_mut(idx) {
-                                f.state = DownloadState::Failed;
-                            }
+                        if let Some(session) = self.downloads.get_mut(&app_id)
+                            && let Some(f) = session.files.get_mut(idx)
+                        {
+                            f.state = DownloadState::Failed;
                         }
-                        self.server_list.report_health(&server_url, false, None);
+                        // report_health matches on the bare hostname, not the
+                        // full base URL, so extract the host before reporting.
+                        let host = server_url
+                            .split("://")
+                            .nth(1)
+                            .and_then(|rest| rest.split(':').next())
+                            .unwrap_or(&server_url);
+                        self.server_list.report_health(host, false, None);
                         return Err(e);
                     }
                 }
@@ -2576,18 +2720,28 @@ impl ContentManager {
         let depot_id = u32::from_le_bytes(data[4..8].try_into().unwrap());
         let file_count = u32::from_le_bytes(data[8..12].try_into().unwrap());
 
-        let mut entries = Vec::with_capacity(file_count as usize);
+        // `file_count` comes from an untrusted file header; cap it before
+        // building the entries vector.
+        if file_count as usize > MAX_STEAMPIPE_ENTRIES {
+            return Err(AppError::new(
+                ReasonCode::RcIo,
+                format!("SteamPipe .csm file count {file_count} exceeds maximum"),
+            ));
+        }
+
+        let mut entries = Vec::new();
         let mut offset = 12usize;
 
         for _ in 0..file_count {
-            if offset + 44 > data.len() {
+            // Fixed-size fields consume 40 bytes (size, sha, crc, flags,
+            // name_len); the filename + 4-byte-alignment padding follows.
+            if offset + 40 > data.len() {
                 return Err(AppError::new(
                     ReasonCode::RcIo,
                     "SteamPipe .csm file truncated",
                 ));
             }
 
-            // Read fixed-size fields (filename hash placeholder, size, sha, crc, flags)
             let size = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
             offset += 8;
             let mut sha_hash = [0u8; 20];
@@ -2601,7 +2755,10 @@ impl ContentManager {
                 u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
             offset += 4;
 
-            if offset + name_len > data.len() {
+            // Pad to 4-byte alignment
+            let padding = (4 - (name_len % 4)) % 4;
+
+            if offset + name_len + padding > data.len() {
                 return Err(AppError::new(
                     ReasonCode::RcIo,
                     "SteamPipe .csm filename truncated",
@@ -2609,11 +2766,7 @@ impl ContentManager {
             }
 
             let filename = String::from_utf8_lossy(&data[offset..offset + name_len]).to_string();
-            offset += name_len;
-
-            // Pad to 4-byte alignment
-            let padding = (4 - (name_len % 4)) % 4;
-            offset += padding;
+            offset += name_len + padding;
 
             entries.push(SteamPipeManifestEntry {
                 filename,
@@ -2645,8 +2798,17 @@ impl ContentManager {
         let app_id = u32::from_le_bytes(data[4..8].try_into().unwrap());
         let depot_count = u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize;
 
+        // `depot_count` comes from an untrusted file header; bound it by
+        // both an absolute cap and the bytes available (8 per depot entry).
+        if depot_count > MAX_STEAMPIPE_DEPOTS || depot_count > (data.len() - 12) / 8 {
+            return Err(AppError::new(
+                ReasonCode::RcIo,
+                format!("SteamPipe .csb depot count {depot_count} exceeds bounds"),
+            ));
+        }
+
         let mut offset = 12usize;
-        let mut depot_ids = Vec::with_capacity(depot_count);
+        let mut depot_ids = Vec::new();
 
         for _ in 0..depot_count {
             if offset + 8 > data.len() {
@@ -2700,13 +2862,13 @@ impl ContentManager {
             if chunk_offset + 12 <= data.len() {
                 // Probe for manifest header
                 let remaining = data[chunk_offset..].to_vec();
-                match self.parse_steampipe_csm(&remaining) {
-                    Ok(csm) => {
+                if let Ok(csm) = self.parse_steampipe_csm(&remaining) {
+                    // Advance past exactly this manifest so any subsequent
+                    // depot's data region is not consumed.
+                    if let Some(manifest_len) = steampipe_csm_byte_len(&remaining) {
                         manifests.insert(*depot_id, csm);
-                        // Advance offset past the manifest
-                        chunk_offset = data.len();
+                        chunk_offset += manifest_len;
                     }
-                    Err(_) => {}
                 }
             }
 
@@ -2728,11 +2890,14 @@ impl ContentManager {
 
     /// Stage a downloaded file into the content manager's temporary storage.
     pub fn stage_downloaded_file(&mut self, app_id: u32, filename: &str, data: Vec<u8>) {
-        if let Some(session) = self.downloads.get_mut(&app_id) {
-            if let Some(file) = session.files.iter_mut().find(|f| f.filename == filename) {
-                file.data = data;
-                file.state = DownloadState::Completed;
-            }
+        if let Some(session) = self.downloads.get_mut(&app_id)
+            && let Some(file) = session
+                .files
+                .iter_mut()
+                .find(|f| f.filename == filename)
+        {
+            file.data = data;
+            file.state = DownloadState::Completed;
         }
     }
 
@@ -2758,7 +2923,9 @@ impl ContentManager {
 
         let mut files = BTreeMap::new();
         for file in &session.files {
-            if !file.data.is_empty() {
+            // Keep legitimate zero-size files (declared size 0); only skip
+            // files whose data is missing while a non-zero size is expected.
+            if !file.data.is_empty() || file.size == 0 {
                 files.insert(file.filename.clone(), file.data.clone());
             }
         }
@@ -2788,15 +2955,27 @@ impl ContentManager {
     /// Create an install manifest from a depot manifest, suitable for
     /// SteamClient. This maps protocol-level [`ProtoDepotManifest`] entries
     /// into a high-level [`DepotManifest`] that the installer can consume.
+    ///
+    /// `depot_manifests` selects which downloaded files belong to this depot;
+    /// downloaded files not described by any manifest are excluded.
     pub fn create_install_manifest(
         &self,
         app_id: u32,
         game_name: &str,
         install_dir: &str,
         launch_exe: &str,
-        _depot_manifests: &[ProtoDepotManifest],
+        depot_manifests: &[ProtoDepotManifest],
         downloaded_files: &BTreeMap<String, Vec<u8>>,
     ) -> DepotManifest {
+        let mut files = BTreeMap::new();
+        for manifest in depot_manifests {
+            let bytes = downloaded_files
+                .get(&manifest.filename)
+                .or_else(|| downloaded_files.get(&normalize_path(&manifest.filename)));
+            if let Some(bytes) = bytes {
+                files.insert(manifest.filename.clone(), bytes.clone());
+            }
+        }
         DepotManifest {
             app_id,
             game_name: game_name.to_string(),
@@ -2804,7 +2983,7 @@ impl ContentManager {
             launch_exe: launch_exe.to_string(),
             library_root: None,
             prerequisites: Vec::new(),
-            files: downloaded_files.clone(),
+            files,
         }
     }
 
@@ -2826,7 +3005,10 @@ impl ContentManager {
                 Err(e) => {
                     last_error = Some(e);
                     if attempt < max_retries {
-                        let delay = Duration::from_millis(RETRY_BASE_DELAY_MS * (1u64 << attempt));
+                        // Cap the backoff shift so huge retry counts cannot
+                        // overflow (debug panic) or wrap (release).
+                        let delay =
+                            Duration::from_millis(RETRY_BASE_DELAY_MS * (1u64 << attempt.min(20)));
                         std::thread::sleep(delay);
                     }
                 }
@@ -2846,6 +3028,34 @@ impl Default for ContentManager {
     fn default() -> Self {
         Self::new(NetworkStack::new())
     }
+}
+
+/// Compute the exact byte length consumed by a `.csm` manifest at the start
+/// of `data`, or `None` if the manifest is truncated. Mirrors the layout
+/// walked by [`ContentManager::parse_steampipe_csm`] so a bundle parser can
+/// advance past exactly one manifest without consuming trailing depots.
+fn steampipe_csm_byte_len(data: &[u8]) -> Option<usize> {
+    if data.len() < 12 {
+        return None;
+    }
+    let file_count = u32::from_le_bytes(data[8..12].try_into().ok()?) as usize;
+    if file_count > MAX_STEAMPIPE_ENTRIES {
+        return None;
+    }
+    let mut offset = 12usize;
+    for _ in 0..file_count {
+        offset = offset.checked_add(40)?;
+        if offset > data.len() {
+            return None;
+        }
+        let name_len = u32::from_le_bytes(data[offset - 4..offset].try_into().ok()?) as usize;
+        let padding = (4 - (name_len % 4)) % 4;
+        offset = offset.checked_add(name_len)?.checked_add(padding)?;
+        if offset > data.len() {
+            return None;
+        }
+    }
+    Some(offset)
 }
 
 #[cfg(test)]
