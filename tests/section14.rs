@@ -1,7 +1,7 @@
 use casa1::reason::ReasonCode;
 use casa1::vkgl::{
-    load_opengl_driver, load_vulkan_loader, opengl_driver, vulkan_loader, OpenGlSample,
-    VulkanSample,
+    OpenGlSample, VulkanSample, load_opengl_driver, load_vulkan_loader, opengl_driver,
+    vulkan_loader,
 };
 
 fn expected_vulkan_hash(sample: &VulkanSample) -> String {
@@ -27,7 +27,10 @@ fn expected_gl_hash(sample: &OpenGlSample) -> String {
 #[test]
 fn t14_1_vulkan_loader_runs_sample_and_matches_windows_reference_hash() {
     let loader = vulkan_loader();
-    assert_eq!(loader.enumerate_physical_devices(), vec!["Casa1 MoltenVK Adapter"]);
+    assert_eq!(
+        loader.enumerate_physical_devices(),
+        vec!["Casa1 MoltenVK Adapter"]
+    );
     assert_eq!(
         loader.enumerate_instance_extension_properties(),
         vec![
@@ -38,7 +41,10 @@ fn t14_1_vulkan_loader_runs_sample_and_matches_windows_reference_hash() {
     );
     let sample = VulkanSample {
         name: "triangle".to_string(),
-        required_instance_extensions: vec!["VK_KHR_surface".to_string(), "VK_EXT_metal_surface".to_string()],
+        required_instance_extensions: vec![
+            "VK_KHR_surface".to_string(),
+            "VK_EXT_metal_surface".to_string(),
+        ],
         required_device_extensions: vec!["VK_KHR_swapchain".to_string()],
         clear_color: [7, 11, 19, 255],
         draw_calls: 3,
@@ -71,10 +77,16 @@ fn t14_2_opengl_sample_matches_windows_reference_hash() {
 fn t14_3_capability_truth_rejects_unadvertised_extensions() {
     let loader = vulkan_loader();
     let driver = opengl_driver();
-    assert!(loader
-        .enumerate_instance_extension_properties()
-        .contains(&"VK_EXT_metal_surface".to_string()));
-    assert!(driver.extensions().contains(&"GL_ARB_framebuffer_object".to_string()));
+    assert!(
+        loader
+            .enumerate_instance_extension_properties()
+            .contains(&"VK_EXT_metal_surface".to_string())
+    );
+    assert!(
+        driver
+            .extensions()
+            .contains(&"GL_ARB_framebuffer_object".to_string())
+    );
 
     let bad_vk = loader.render_sample(&VulkanSample {
         name: "mesh-shader".to_string(),
@@ -84,7 +96,10 @@ fn t14_3_capability_truth_rejects_unadvertised_extensions() {
         draw_calls: 1,
         compute_dispatches: 0,
     });
-    assert_eq!(bad_vk.expect_err("vk extension failure").code, ReasonCode::RcVulkanNotSupported);
+    assert_eq!(
+        bad_vk.expect_err("vk extension failure").code,
+        ReasonCode::RcVulkanNotSupported
+    );
 
     let bad_gl = driver.render_sample(&OpenGlSample {
         name: "bindless-texture".to_string(),
@@ -93,7 +108,10 @@ fn t14_3_capability_truth_rejects_unadvertised_extensions() {
         triangle_count: 1,
         uses_framebuffer_object: false,
     });
-    assert_eq!(bad_gl.expect_err("gl extension failure").code, ReasonCode::RcOpenGlNotSupported);
+    assert_eq!(
+        bad_gl.expect_err("gl extension failure").code,
+        ReasonCode::RcOpenGlNotSupported
+    );
 }
 
 #[test]

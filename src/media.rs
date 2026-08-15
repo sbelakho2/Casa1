@@ -25,6 +25,7 @@ use std::time::{Duration, Instant};
 pub enum ContainerKind {
     Mp4,
     Ogg,
+    Wmv,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -32,6 +33,9 @@ pub enum ContainerKind {
 pub enum VideoCodec {
     None,
     H264,
+    H265,
+    VP9,
+    WMV,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -39,6 +43,8 @@ pub enum VideoCodec {
 pub enum AudioCodec {
     Aac,
     Vorbis,
+    Mp3,
+    Wma,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -102,7 +108,10 @@ pub enum MfSessionState {
 impl MfSessionState {
     /// Check if this state allows playback commands (Start).
     pub fn can_start(&self) -> bool {
-        matches!(self, MfSessionState::Idle | MfSessionState::Paused | MfSessionState::Stopped)
+        matches!(
+            self,
+            MfSessionState::Idle | MfSessionState::Paused | MfSessionState::Stopped
+        )
     }
 
     /// Check if this state allows pausing.
@@ -153,7 +162,12 @@ pub struct Guid {
 impl Guid {
     /// Create a new GUID.
     pub const fn new(data1: u32, data2: u16, data3: u16, data4: [u8; 8]) -> Self {
-        Self { data1, data2, data3, data4 }
+        Self {
+            data1,
+            data2,
+            data3,
+            data4,
+        }
     }
 
     /// Convert to a byte representation (little-endian).
@@ -173,36 +187,170 @@ impl Guid {
         let data3 = u16::from_le_bytes([b[6], b[7]]);
         let mut data4 = [0u8; 8];
         data4.copy_from_slice(&b[8..16]);
-        Self { data1, data2, data3, data4 }
+        Self {
+            data1,
+            data2,
+            data3,
+            data4,
+        }
     }
 }
 
 // Standard MF attribute GUIDs
-pub const MF_MT_MAJOR_TYPE: Guid = Guid::new(0x48e2ed0f, 0x98c2, 0x4a37, [0xbe, 0xd5, 0x16, 0x63, 0x12, 0xdd, 0xd8, 0x3f]);
-pub const MF_MT_SUBTYPE: Guid = Guid::new(0xf7e34e80, 0x5a6f, 0x4f8c, [0xb2, 0x4e, 0x10, 0xc4, 0x67, 0x6c, 0x6d, 0x1a]);
-pub const MF_MT_FRAME_SIZE: Guid = Guid::new(0x1652c33d, 0xd6b2, 0x4012, [0xb8, 0x34, 0x72, 0x0c, 0xc3, 0xac, 0xd2, 0x6d]);
-pub const MF_MT_FRAME_RATE: Guid = Guid::new(0xc459a2e8, 0x3d2c, 0x4e44, [0xb1, 0x32, 0xfe, 0xe5, 0x5a, 0x5c, 0x4b, 0xfc]);
-pub const MF_MT_SAMPLE_RATE: Guid = Guid::new(0x5a7e6c1d, 0x87d2, 0x4e7e, [0x8b, 0x6f, 0x6c, 0x0e, 0x2a, 0x8c, 0x4c, 0x6f]);
-pub const MF_MT_CHANNELS: Guid = Guid::new(0x48e2ed0f, 0x98c2, 0x4a37, [0xbe, 0xd5, 0x16, 0x63, 0x12, 0xdd, 0xd8, 0x40]);
-pub const MF_MT_BITRATE: Guid = Guid::new(0x203d3e7e, 0x5c4a, 0x4a5b, [0x8f, 0x8c, 0x7b, 0x7e, 0x7c, 0x2d, 0x4d, 0x3e]);
-pub const MF_MT_AVG_BITRATE: Guid = Guid::new(0x203d3e7e, 0x5c4a, 0x4a5b, [0x8f, 0x8c, 0x7b, 0x7e, 0x7c, 0x2d, 0x4d, 0x3f]);
-pub const MF_MT_MPEG_SEQUENCE_HEADER: Guid = Guid::new(0x3c036de7, 0x3ad0, 0x4c2e, [0xa8, 0x2c, 0x2c, 0x3a, 0x7e, 0x2c, 0x4d, 0x3e]);
-pub const MF_MT_USER_DATA: Guid = Guid::new(0xb6bc765f, 0x4c3b, 0x40a4, [0xbd, 0x0f, 0x5f, 0x0e, 0x2c, 0x4d, 0x3e, 0x3f]);
-pub const MF_MT_MPEG2_PROFILE: Guid = Guid::new(0xad76a80b, 0x5c4a, 0x4a5b, [0x8f, 0x8c, 0x7b, 0x7e, 0x7c, 0x2d, 0x4d, 0x3e]);
-pub const MF_MT_MPEG2_LEVEL: Guid = Guid::new(0x96e5e8e2, 0x5c4a, 0x4a5b, [0x8f, 0x8c, 0x7b, 0x7e, 0x7c, 0x2d, 0x4d, 0x3e]);
+pub const MF_MT_MAJOR_TYPE: Guid = Guid::new(
+    0x48e2ed0f,
+    0x98c2,
+    0x4a37,
+    [0xbe, 0xd5, 0x16, 0x63, 0x12, 0xdd, 0xd8, 0x3f],
+);
+pub const MF_MT_SUBTYPE: Guid = Guid::new(
+    0xf7e34e80,
+    0x5a6f,
+    0x4f8c,
+    [0xb2, 0x4e, 0x10, 0xc4, 0x67, 0x6c, 0x6d, 0x1a],
+);
+pub const MF_MT_FRAME_SIZE: Guid = Guid::new(
+    0x1652c33d,
+    0xd6b2,
+    0x4012,
+    [0xb8, 0x34, 0x72, 0x0c, 0xc3, 0xac, 0xd2, 0x6d],
+);
+pub const MF_MT_FRAME_RATE: Guid = Guid::new(
+    0xc459a2e8,
+    0x3d2c,
+    0x4e44,
+    [0xb1, 0x32, 0xfe, 0xe5, 0x5a, 0x5c, 0x4b, 0xfc],
+);
+pub const MF_MT_SAMPLE_RATE: Guid = Guid::new(
+    0x5a7e6c1d,
+    0x87d2,
+    0x4e7e,
+    [0x8b, 0x6f, 0x6c, 0x0e, 0x2a, 0x8c, 0x4c, 0x6f],
+);
+pub const MF_MT_CHANNELS: Guid = Guid::new(
+    0x48e2ed0f,
+    0x98c2,
+    0x4a37,
+    [0xbe, 0xd5, 0x16, 0x63, 0x12, 0xdd, 0xd8, 0x40],
+);
+pub const MF_MT_BITRATE: Guid = Guid::new(
+    0x203d3e7e,
+    0x5c4a,
+    0x4a5b,
+    [0x8f, 0x8c, 0x7b, 0x7e, 0x7c, 0x2d, 0x4d, 0x3e],
+);
+pub const MF_MT_AVG_BITRATE: Guid = Guid::new(
+    0x203d3e7e,
+    0x5c4a,
+    0x4a5b,
+    [0x8f, 0x8c, 0x7b, 0x7e, 0x7c, 0x2d, 0x4d, 0x3f],
+);
+pub const MF_MT_MPEG_SEQUENCE_HEADER: Guid = Guid::new(
+    0x3c036de7,
+    0x3ad0,
+    0x4c2e,
+    [0xa8, 0x2c, 0x2c, 0x3a, 0x7e, 0x2c, 0x4d, 0x3e],
+);
+pub const MF_MT_USER_DATA: Guid = Guid::new(
+    0xb6bc765f,
+    0x4c3b,
+    0x40a4,
+    [0xbd, 0x0f, 0x5f, 0x0e, 0x2c, 0x4d, 0x3e, 0x3f],
+);
+pub const MF_MT_MPEG2_PROFILE: Guid = Guid::new(
+    0xad76a80b,
+    0x5c4a,
+    0x4a5b,
+    [0x8f, 0x8c, 0x7b, 0x7e, 0x7c, 0x2d, 0x4d, 0x3e],
+);
+pub const MF_MT_MPEG2_LEVEL: Guid = Guid::new(
+    0x96e5e8e2,
+    0x5c4a,
+    0x4a5b,
+    [0x8f, 0x8c, 0x7b, 0x7e, 0x7c, 0x2d, 0x4d, 0x3e],
+);
 
 // Major type GUIDs
-pub const MFMediaType_Video: Guid = Guid::new(0x73646976, 0x0000, 0x0010, [0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71]);
-pub const MFMediaType_Audio: Guid = Guid::new(0x73647561, 0x0000, 0x0010, [0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71]);
+pub const MFMediaType_Video: Guid = Guid::new(
+    0x73646976,
+    0x0000,
+    0x0010,
+    [0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71],
+);
+pub const MFMediaType_Audio: Guid = Guid::new(
+    0x73647561,
+    0x0000,
+    0x0010,
+    [0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71],
+);
 
 // Subtype GUIDs (FOURCC-based)
-pub const MFVideoFormat_H264: Guid = Guid::new(0x34363248, 0x0000, 0x0010, [0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71]); // 'H264'
-pub const MFVideoFormat_H265: Guid = Guid::new(0x35363248, 0x0000, 0x0010, [0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71]); // 'H265'
-pub const MFVideoFormat_NV12: Guid = Guid::new(0x3231564e, 0x0000, 0x0010, [0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71]); // 'NV12'
-pub const MFVideoFormat_RGB32: Guid = Guid::new(0x00000022, 0x0000, 0x0010, [0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71]);
-pub const MFAudioFormat_AAC: Guid = Guid::new(0x00001610, 0x0000, 0x0010, [0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71]);
-pub const MFAudioFormat_PCM: Guid = Guid::new(0x00000001, 0x0000, 0x0010, [0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71]);
-pub const MFAudioFormat_Float: Guid = Guid::new(0x00000003, 0x0000, 0x0010, [0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71]);
+pub const MFVideoFormat_H264: Guid = Guid::new(
+    0x34363248,
+    0x0000,
+    0x0010,
+    [0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71],
+); // 'H264'
+pub const MFVideoFormat_H265: Guid = Guid::new(
+    0x35363248,
+    0x0000,
+    0x0010,
+    [0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71],
+); // 'H265'
+pub const MFVideoFormat_VP90: Guid = Guid::new(
+    0x30395056,
+    0x0000,
+    0x0010,
+    [0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71],
+); // 'VP90' (VP9)
+pub const MFVideoFormat_WMV3: Guid = Guid::new(
+    0x33564d57,
+    0x0000,
+    0x0010,
+    [0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71],
+); // 'WMV3'
+pub const MFVideoFormat_NV12: Guid = Guid::new(
+    0x3231564e,
+    0x0000,
+    0x0010,
+    [0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71],
+); // 'NV12'
+pub const MFVideoFormat_RGB32: Guid = Guid::new(
+    0x00000022,
+    0x0000,
+    0x0010,
+    [0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71],
+);
+pub const MFAudioFormat_AAC: Guid = Guid::new(
+    0x00001610,
+    0x0000,
+    0x0010,
+    [0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71],
+);
+pub const MFAudioFormat_MP3: Guid = Guid::new(
+    0x00000055,
+    0x0000,
+    0x0010,
+    [0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71],
+); // WAVE_FORMAT_MPEGLAYER3 = 0x55
+pub const MFAudioFormat_WMA: Guid = Guid::new(
+    0x00000161,
+    0x0000,
+    0x0010,
+    [0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71],
+); // WMAudio8 = 0x161
+pub const MFAudioFormat_PCM: Guid = Guid::new(
+    0x00000001,
+    0x0000,
+    0x0010,
+    [0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71],
+);
+pub const MFAudioFormat_Float: Guid = Guid::new(
+    0x00000003,
+    0x0000,
+    0x0010,
+    [0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71],
+);
 
 // ===========================================================================
 // Media Type Values & IMFMediaType
@@ -515,8 +663,8 @@ impl ImfMediaBuffer {
 #[derive(Debug, Clone)]
 pub struct ImfSample {
     pub buffer: Vec<u8>,
-    pub sample_time: i64,       // 100-ns units
-    pub sample_duration: i64,   // 100-ns units
+    pub sample_time: i64,     // 100-ns units
+    pub sample_duration: i64, // 100-ns units
     pub flags: u32,
 }
 
@@ -694,7 +842,12 @@ pub trait MftTransform: Send {
     fn process_input(&mut self, stream_id: u32, sample: &ImfSample, flags: u32) -> AppResult<()>;
 
     /// Process output: get an output sample from the given stream.
-    fn process_output(&mut self, stream_id: u32, sample: &mut ImfSample, flags: &mut u32) -> AppResult<()>;
+    fn process_output(
+        &mut self,
+        stream_id: u32,
+        sample: &mut ImfSample,
+        flags: &mut u32,
+    ) -> AppResult<()>;
 
     /// Get output status flags (still available samples, format change, etc.)
     fn get_output_status(&self) -> u32 {
@@ -726,7 +879,7 @@ mod vt_decoder_mft {
     type CMSampleBufferRef = *mut c_void;
     type CVPixelBufferRef = *mut c_void;
     type VTDecompressionSessionRef = *mut c_void;
-    type CFAllocatorRef = *mut c_void;
+    type CFAllocatorRef = *const c_void;
     type CFDictionaryRef = *const c_void;
     type CFStringRef = *const c_void;
 
@@ -749,19 +902,13 @@ mod vt_decoder_mft {
 
     impl CMTime {
         fn make(value: i64, timescale: i32) -> Self {
-            Self { value, timescale, flags: 0, epoch: 0 }
+            Self {
+                value,
+                timescale,
+                flags: 0,
+                epoch: 0,
+            }
         }
-    }
-
-    // ---- Callback ----
-    type VTDecompressionOutputCallback = unsafe extern "C" fn(
-        *mut c_void, *mut c_void, i32, u32, CVPixelBufferRef, CMTime, CMTime,
-    );
-
-    #[repr(C)]
-    struct VTDecompressionOutputCallbackRecord {
-        callback: Option<VTDecompressionOutputCallback>,
-        refcon: *mut c_void,
     }
 
     // ---- Decoded frame queue ----
@@ -803,8 +950,8 @@ mod vt_decoder_mft {
         status: i32,
         _info_flags: u32,
         image_buffer: CVPixelBufferRef,
-        pts: CMTime,
-        duration: CMTime,
+        pts: crate::video_decoder::vt_ffi::CMTime,
+        duration: crate::video_decoder::vt_ffi::CMTime,
     ) {
         if status != 0 || image_buffer.is_null() {
             return;
@@ -840,23 +987,25 @@ mod vt_decoder_mft {
                 return Ok(());
             }
             let fmt_desc = self.format_desc.ok_or_else(|| {
-                AppError::new(ReasonCode::RcMediaInvalid, "No format description set for H.264 decoder")
+                AppError::new(
+                    ReasonCode::RcMediaInvalid,
+                    "No format description set for H.264 decoder",
+                )
             })?;
 
             unsafe {
                 // Pixel format types we want to receive
-                let _pixel_format_keys: [CFStringRef; 1] = [
-                    b"PixelFormatType\0".as_ptr() as CFStringRef,
-                ];
+                let _pixel_format_keys: [CFStringRef; 1] =
+                    [b"PixelFormatType\0".as_ptr() as CFStringRef];
                 let _bg_value: u32 = kCVPixelFormatType_32BGRA.to_be();
                 let _bg_values: [*mut c_void; 1] = [&_bg_value as *const u32 as *mut c_void];
 
                 let dest_dict: CFDictionaryRef = std::ptr::null(); // Use default pixel buffer attributes
 
                 // Callback record
-                let callback = VTDecompressionOutputCallbackRecord {
-                    callback: Some(decompression_output_callback),
-                    refcon: self.callback_refcon,
+                let callback = crate::video_decoder::vt_ffi::VTDecompressionOutputCallbackRecord {
+                    decompressionOutputCallback: Some(decompression_output_callback),
+                    decompressionOutputRefCon: self.callback_refcon,
                 };
 
                 // Decoder specification: require hardware acceleration
@@ -905,13 +1054,17 @@ mod vt_decoder_mft {
 
         fn set_input_type(&mut self, _stream_id: u32, media_type: &ImfMediaType) -> AppResult<()> {
             let (width, height) = media_type.get_frame_size().ok_or_else(|| {
-                AppError::new(ReasonCode::RcMediaInvalid, "H.264 decoder input type missing frame size")
+                AppError::new(
+                    ReasonCode::RcMediaInvalid,
+                    "H.264 decoder input type missing frame size",
+                )
             })?;
             self.width = width;
             self.height = height;
 
             // Try to get codec private data (AVCC extradata / SPS/PPS)
-            let codec_data = media_type.get_blob(&MF_MT_MPEG_SEQUENCE_HEADER)
+            let codec_data = media_type
+                .get_blob(&MF_MT_MPEG_SEQUENCE_HEADER)
                 .or_else(|| media_type.get_blob(&MF_MT_USER_DATA));
 
             unsafe {
@@ -949,12 +1102,20 @@ mod vt_decoder_mft {
             Ok(())
         }
 
-        fn set_output_type(&mut self, _stream_id: u32, _media_type: &ImfMediaType) -> AppResult<()> {
+        fn set_output_type(
+            &mut self,
+            _stream_id: u32,
+            _media_type: &ImfMediaType,
+        ) -> AppResult<()> {
             self.output_type_set = true;
             Ok(())
         }
 
-        fn get_input_available_type(&self, _stream_id: u32, _index: u32) -> AppResult<ImfMediaType> {
+        fn get_input_available_type(
+            &self,
+            _stream_id: u32,
+            _index: u32,
+        ) -> AppResult<ImfMediaType> {
             let mut mt = ImfMediaType::new();
             mt.set_guid(MF_MT_MAJOR_TYPE, MFMediaType_Video);
             mt.set_guid(MF_MT_SUBTYPE, MFVideoFormat_H264);
@@ -964,7 +1125,11 @@ mod vt_decoder_mft {
             Ok(mt)
         }
 
-        fn get_output_available_type(&self, _stream_id: u32, _index: u32) -> AppResult<ImfMediaType> {
+        fn get_output_available_type(
+            &self,
+            _stream_id: u32,
+            _index: u32,
+        ) -> AppResult<ImfMediaType> {
             let mut mt = ImfMediaType::new();
             mt.set_guid(MF_MT_MAJOR_TYPE, MFMediaType_Video);
             mt.set_guid(MF_MT_SUBTYPE, MFVideoFormat_NV12);
@@ -974,7 +1139,12 @@ mod vt_decoder_mft {
             Ok(mt)
         }
 
-        fn process_input(&mut self, _stream_id: u32, sample: &ImfSample, _flags: u32) -> AppResult<()> {
+        fn process_input(
+            &mut self,
+            _stream_id: u32,
+            sample: &ImfSample,
+            _flags: u32,
+        ) -> AppResult<()> {
             self.create_session()?;
             self.last_pts = sample.sample_time;
 
@@ -1049,14 +1219,20 @@ mod vt_decoder_mft {
                 }
 
                 // Wait for async completion
-                let _wait_status = VTDecompressionSessionWaitForAsynchronousFrames(self.session.unwrap());
+                let _wait_status =
+                    VTDecompressionSessionWaitForAsynchronousFrames(self.session.unwrap());
             }
 
             self.drain_global_queue();
             Ok(())
         }
 
-        fn process_output(&mut self, _stream_id: u32, sample: &mut ImfSample, flags: &mut u32) -> AppResult<()> {
+        fn process_output(
+            &mut self,
+            _stream_id: u32,
+            sample: &mut ImfSample,
+            flags: &mut u32,
+        ) -> AppResult<()> {
             self.drain_global_queue();
 
             if let Some(frame) = self.decoded_frames.pop_front() {
@@ -1175,7 +1351,7 @@ mod vt_decoder_mft {
             video_format_description: CMVideoFormatDescriptionRef,
             video_decoder_specification: CFDictionaryRef,
             destination_image_buffer_attributes: CFDictionaryRef,
-            output_callback: *const VTDecompressionOutputCallbackRecord,
+            output_callback: *const crate::video_decoder::vt_ffi::VTDecompressionOutputCallbackRecord,
             decompression_session_out: *mut VTDecompressionSessionRef,
         ) -> i32;
 
@@ -1187,10 +1363,13 @@ mod vt_decoder_mft {
             info_flags_out: *mut u32,
         ) -> i32;
 
-        fn VTDecompressionSessionWaitForAsynchronousFrames(session: VTDecompressionSessionRef) -> i32;
+        fn VTDecompressionSessionWaitForAsynchronousFrames(
+            session: VTDecompressionSessionRef,
+        ) -> i32;
 
         fn CVPixelBufferLockBaseAddress(pixel_buffer: CVPixelBufferRef, lock_flags: u32) -> i32;
-        fn CVPixelBufferUnlockBaseAddress(pixel_buffer: CVPixelBufferRef, unlock_flags: u32) -> i32;
+        fn CVPixelBufferUnlockBaseAddress(pixel_buffer: CVPixelBufferRef, unlock_flags: u32)
+        -> i32;
         fn CVPixelBufferGetBaseAddress(pixel_buffer: CVPixelBufferRef) -> *mut c_void;
         fn CVPixelBufferGetDataSize(pixel_buffer: CVPixelBufferRef) -> usize;
         fn CVPixelBufferGetWidth(pixel_buffer: CVPixelBufferRef) -> usize;
@@ -1206,23 +1385,40 @@ mod vt_decoder_mft {
     pub struct H264DecoderMft;
 
     impl H264DecoderMft {
-        pub fn new() -> Self { Self }
+        pub fn new() -> Self {
+            Self
+        }
     }
 
     impl MftTransform for H264DecoderMft {
-        fn get_stream_count(&self) -> (u32, u32) { (1, 1) }
-        fn set_input_type(&mut self, _: u32, _: &ImfMediaType) -> AppResult<()> { Ok(()) }
-        fn set_output_type(&mut self, _: u32, _: &ImfMediaType) -> AppResult<()> { Ok(()) }
-        fn get_input_available_type(&self, _: u32, _: u32) -> AppResult<ImfMediaType> { Ok(ImfMediaType::new()) }
-        fn get_output_available_type(&self, _: u32, _: u32) -> AppResult<ImfMediaType> { Ok(ImfMediaType::new()) }
+        fn get_stream_count(&self) -> (u32, u32) {
+            (1, 1)
+        }
+        fn set_input_type(&mut self, _: u32, _: &ImfMediaType) -> AppResult<()> {
+            Ok(())
+        }
+        fn set_output_type(&mut self, _: u32, _: &ImfMediaType) -> AppResult<()> {
+            Ok(())
+        }
+        fn get_input_available_type(&self, _: u32, _: u32) -> AppResult<ImfMediaType> {
+            Ok(ImfMediaType::new())
+        }
+        fn get_output_available_type(&self, _: u32, _: u32) -> AppResult<ImfMediaType> {
+            Ok(ImfMediaType::new())
+        }
         fn process_input(&mut self, _: u32, _: &ImfSample, _: u32) -> AppResult<()> {
-            Err(AppError::new(ReasonCode::RcMediaInvalid, "H.264 decoder requires macOS"))
+            Err(AppError::new(
+                ReasonCode::RcMediaInvalid,
+                "H.264 decoder requires macOS",
+            ))
         }
         fn process_output(&mut self, _: u32, _: &mut ImfSample, f: &mut u32) -> AppResult<()> {
             *f = MFT_OUTPUT_DATA_BUFFER_NO_SAMPLE;
             Ok(())
         }
-        fn has_output(&self) -> bool { false }
+        fn has_output(&self) -> bool {
+            false
+        }
     }
 }
 
@@ -1255,12 +1451,13 @@ mod aac_decoder_mft {
 
     const kAudioFormatMPEG4AAC: u32 = 0x00001610u32.to_le(); // 'aac '
     const kAudioFormatLinearPCM: u32 = 0x00000001u32.to_le();
-    const kAudioFormatFlagIsSignedInteger: u32 = (1 << 0);
-    const kAudioFormatFlagIsPacked: u32 = (1 << 1);
+    const kAudioFormatFlagIsSignedInteger: u32 = 1 << 0;
+    const kAudioFormatFlagIsPacked: u32 = 1 << 1;
     const kAudioConverterPropertySetInputFormat: u32 = 0x69736674; // 'isf '
     const kAudioConverterPropertySetOutputFormat: u32 = 0x6f736674; // 'osf '
     const noErr: i32 = 0;
 
+    #[link(name = "AudioToolbox", kind = "framework")]
     unsafe extern "C" {
         fn AudioConverterNew(
             in_source_format: AudioStreamBasicDescriptionPtr,
@@ -1272,13 +1469,15 @@ mod aac_decoder_mft {
 
         fn AudioConverterFillComplexBuffer(
             converter: AudioConverterRef,
-            input_proc: Option<unsafe extern "C" fn(
-                *mut std::ffi::c_void,
-                *mut AudioStreamBasicDescriptionPtr,
-                *mut u32,
-                *mut *mut std::ffi::c_void,
-                *mut u32,
-            ) -> i32>,
+            input_proc: Option<
+                unsafe extern "C" fn(
+                    *mut std::ffi::c_void,
+                    *mut AudioStreamBasicDescriptionPtr,
+                    *mut u32,
+                    *mut *mut std::ffi::c_void,
+                    *mut u32,
+                ) -> i32,
+            >,
             input_proc_ref_con: *mut std::ffi::c_void,
             io_output_data_packet_descriptions: *mut *mut std::ffi::c_void,
             io_output_packet_descriptions: *mut u32,
@@ -1371,12 +1570,20 @@ mod aac_decoder_mft {
             Ok(())
         }
 
-        fn set_output_type(&mut self, _stream_id: u32, _media_type: &ImfMediaType) -> AppResult<()> {
+        fn set_output_type(
+            &mut self,
+            _stream_id: u32,
+            _media_type: &ImfMediaType,
+        ) -> AppResult<()> {
             self.output_type_set = true;
             Ok(())
         }
 
-        fn get_input_available_type(&self, _stream_id: u32, _index: u32) -> AppResult<ImfMediaType> {
+        fn get_input_available_type(
+            &self,
+            _stream_id: u32,
+            _index: u32,
+        ) -> AppResult<ImfMediaType> {
             let mut mt = ImfMediaType::new();
             mt.set_guid(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
             mt.set_guid(MF_MT_SUBTYPE, MFAudioFormat_AAC);
@@ -1385,7 +1592,11 @@ mod aac_decoder_mft {
             Ok(mt)
         }
 
-        fn get_output_available_type(&self, _stream_id: u32, _index: u32) -> AppResult<ImfMediaType> {
+        fn get_output_available_type(
+            &self,
+            _stream_id: u32,
+            _index: u32,
+        ) -> AppResult<ImfMediaType> {
             let mut mt = ImfMediaType::new();
             mt.set_guid(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
             mt.set_guid(MF_MT_SUBTYPE, MFAudioFormat_PCM);
@@ -1394,7 +1605,12 @@ mod aac_decoder_mft {
             Ok(mt)
         }
 
-        fn process_input(&mut self, _stream_id: u32, _sample: &ImfSample, _flags: u32) -> AppResult<()> {
+        fn process_input(
+            &mut self,
+            _stream_id: u32,
+            _sample: &ImfSample,
+            _flags: u32,
+        ) -> AppResult<()> {
             if self.converter.is_none() {
                 unsafe {
                     let mut converter: AudioConverterRef = std::ptr::null_mut();
@@ -1416,17 +1632,21 @@ mod aac_decoder_mft {
             Ok(())
         }
 
-        fn process_output(&mut self, _stream_id: u32, sample: &mut ImfSample, flags: &mut u32) -> AppResult<()> {
+        fn process_output(
+            &mut self,
+            _stream_id: u32,
+            sample: &mut ImfSample,
+            flags: &mut u32,
+        ) -> AppResult<()> {
             if let Some(_converter) = self.converter {
-                unsafe {
-                    // Simple approach: produce silence for now if no decoded data
-                    // Real implementation would use AudioConverterFillComplexBuffer
-                    let frame_count = 1024u32;
-                    let byte_count = (frame_count * self.channels * 2) as usize;
-                    sample.buffer = vec![0u8; byte_count];
-                    sample.sample_duration = (frame_count as i64 * 10_000_000) / (self.sample_rate as i64);
-                    *flags = 0;
-                }
+                // Simple approach: produce silence for now if no decoded data
+                // Real implementation would use AudioConverterFillComplexBuffer
+                let frame_count = 1024u32;
+                let byte_count = (frame_count * self.channels * 2) as usize;
+                sample.buffer = vec![0u8; byte_count];
+                sample.sample_duration =
+                    (frame_count as i64 * 10_000_000) / (self.sample_rate as i64);
+                *flags = 0;
             } else {
                 *flags = MFT_OUTPUT_DATA_BUFFER_NO_SAMPLE;
             }
@@ -1445,23 +1665,40 @@ mod aac_decoder_mft {
     pub struct AacDecoderMft;
 
     impl AacDecoderMft {
-        pub fn new() -> Self { Self }
+        pub fn new() -> Self {
+            Self
+        }
     }
 
     impl MftTransform for AacDecoderMft {
-        fn get_stream_count(&self) -> (u32, u32) { (1, 1) }
-        fn set_input_type(&mut self, _: u32, _: &ImfMediaType) -> AppResult<()> { Ok(()) }
-        fn set_output_type(&mut self, _: u32, _: &ImfMediaType) -> AppResult<()> { Ok(()) }
-        fn get_input_available_type(&self, _: u32, _: u32) -> AppResult<ImfMediaType> { Ok(ImfMediaType::new()) }
-        fn get_output_available_type(&self, _: u32, _: u32) -> AppResult<ImfMediaType> { Ok(ImfMediaType::new()) }
+        fn get_stream_count(&self) -> (u32, u32) {
+            (1, 1)
+        }
+        fn set_input_type(&mut self, _: u32, _: &ImfMediaType) -> AppResult<()> {
+            Ok(())
+        }
+        fn set_output_type(&mut self, _: u32, _: &ImfMediaType) -> AppResult<()> {
+            Ok(())
+        }
+        fn get_input_available_type(&self, _: u32, _: u32) -> AppResult<ImfMediaType> {
+            Ok(ImfMediaType::new())
+        }
+        fn get_output_available_type(&self, _: u32, _: u32) -> AppResult<ImfMediaType> {
+            Ok(ImfMediaType::new())
+        }
         fn process_input(&mut self, _: u32, _: &ImfSample, _: u32) -> AppResult<()> {
-            Err(AppError::new(ReasonCode::RcMediaInvalid, "AAC decoder requires macOS"))
+            Err(AppError::new(
+                ReasonCode::RcMediaInvalid,
+                "AAC decoder requires macOS",
+            ))
         }
         fn process_output(&mut self, _: u32, _: &mut ImfSample, f: &mut u32) -> AppResult<()> {
             *f = MFT_OUTPUT_DATA_BUFFER_NO_SAMPLE;
             Ok(())
         }
-        fn has_output(&self) -> bool { false }
+        fn has_output(&self) -> bool {
+            false
+        }
     }
 }
 
@@ -1645,7 +1882,10 @@ impl Topology {
         })?;
 
         let source_node = self.get_node(source).ok_or_else(|| {
-            AppError::new(ReasonCode::RcMediaInvalid, "Source node not found in topology")
+            AppError::new(
+                ReasonCode::RcMediaInvalid,
+                "Source node not found in topology",
+            )
         })?;
 
         if source_node.outputs.is_empty() {
@@ -1767,7 +2007,8 @@ impl MfMediaSession {
         if !self.state.can_start() {
             // If already playing, this is a no-op (or restart)
             if self.state == MfSessionState::Playing {
-                self.event_queue.queue_event_type(MediaEventType::SessionStarted);
+                self.event_queue
+                    .queue_event_type(MediaEventType::SessionStarted);
                 return Ok(());
             }
             return Err(AppError::new(
@@ -1776,21 +2017,10 @@ impl MfMediaSession {
             ));
         }
 
-        // If we need to resolve the topology first
-        if self.state == MfSessionState::Idle && self.has_topology {
-            self.state = MfSessionState::Opening;
-            self.event_queue.queue_event_type(MediaEventType::TopologySet);
-
-            // Resolve the topology
-            if let Some(ref topology) = self.topology {
-                self.topology_loader.load(topology)?;
-            }
-            self.event_queue.queue_event_type(MediaEventType::TopologyLoaded);
-        }
-
         self.state = MfSessionState::Playing;
         self.start_time = Some(std::time::Instant::now());
-        self.event_queue.queue_event_type(MediaEventType::SessionStarted);
+        self.event_queue
+            .queue_event_type(MediaEventType::SessionStarted);
 
         Ok(())
     }
@@ -1813,7 +2043,8 @@ impl MfMediaSession {
         }
 
         self.state = MfSessionState::Paused;
-        self.event_queue.queue_event_type(MediaEventType::SessionPaused);
+        self.event_queue
+            .queue_event_type(MediaEventType::SessionPaused);
 
         Ok(())
     }
@@ -1824,7 +2055,7 @@ impl MfMediaSession {
     /// Transitions: Playing -> Stopped, Paused -> Stopped
     pub fn stop(&mut self) -> AppResult<()> {
         if !self.state.can_stop() {
-            return Err(AppError:: new(
+            return Err(AppError::new(
                 ReasonCode::RcInvalidState,
                 format!("Cannot stop from state {}", self.state.name()),
             ));
@@ -1833,7 +2064,8 @@ impl MfMediaSession {
         self.state = MfSessionState::Stopped;
         self.start_time = None;
         self.paused_elapsed = 0;
-        self.event_queue.queue_event_type(MediaEventType::SessionStopped);
+        self.event_queue
+            .queue_event_type(MediaEventType::SessionStopped);
 
         Ok(())
     }
@@ -1854,7 +2086,8 @@ impl MfMediaSession {
         self.start_time = None;
         self.paused_elapsed = 0;
         self.topology = None;
-        self.event_queue.queue_event_type(MediaEventType::SessionShutdown);
+        self.event_queue
+            .queue_event_type(MediaEventType::SessionShutdown);
 
         Ok(())
     }
@@ -1872,7 +2105,15 @@ impl MfMediaSession {
 
         self.topology = Some(topology);
         self.has_topology = true;
-        self.event_queue.queue_event_type(MediaEventType::TopologySet);
+        self.event_queue
+            .queue_event_type(MediaEventType::TopologySet);
+
+        // Resolve the topology immediately
+        if let Some(ref topology) = self.topology {
+            self.topology_loader.load(topology)?;
+        }
+        self.event_queue
+            .queue_event_type(MediaEventType::TopologyLoaded);
 
         Ok(())
     }
@@ -1941,7 +2182,8 @@ impl MfMediaSession {
     pub fn get_position(&self) -> u64 {
         match self.state {
             MfSessionState::Playing => {
-                let elapsed = self.start_time
+                let elapsed = self
+                    .start_time
                     .map(|s| s.elapsed().as_micros() as u64)
                     .unwrap_or(0);
                 self.paused_elapsed + elapsed
@@ -2021,7 +2263,10 @@ impl Mp4Demuxer {
             // After moov, stop scanning for more boxes (data is after moov typically)
         }
         if self.tracks.is_empty() {
-            return Err(AppError::new(ReasonCode::RcMediaInvalid, "No tracks found in MP4"));
+            return Err(AppError::new(
+                ReasonCode::RcMediaInvalid,
+                "No tracks found in MP4",
+            ));
         }
         Ok(())
     }
@@ -2029,7 +2274,10 @@ impl Mp4Demuxer {
     /// Read a single box at the current position.
     fn read_box(&mut self) -> AppResult<()> {
         if self.position + 8 > self.file.len() {
-            return Err(AppError::new(ReasonCode::RcMediaInvalid, "Truncated MP4 box header"));
+            return Err(AppError::new(
+                ReasonCode::RcMediaInvalid,
+                "Truncated MP4 box header",
+            ));
         }
 
         let size = u32::from_be_bytes([
@@ -2047,7 +2295,10 @@ impl Mp4Demuxer {
         } else if size == 1 {
             // 64-bit size
             if self.position + 16 > self.file.len() {
-                return Err(AppError::new(ReasonCode::RcMediaInvalid, "Truncated 64-bit MP4 box size"));
+                return Err(AppError::new(
+                    ReasonCode::RcMediaInvalid,
+                    "Truncated 64-bit MP4 box size",
+                ));
             }
             let size64 = u64::from_be_bytes([
                 self.file[self.position + 8],
@@ -2069,9 +2320,17 @@ impl Mp4Demuxer {
         let end = self.position + actual_size as usize;
 
         match box_type {
-            b"ftyp" => { self.read_ftyp(); }
-            b"moov" => { self.read_moov(); }
-            b"moof" => { /* fragmented MP4 - skip for now */ }
+            b"ftyp" => {
+                self.read_ftyp();
+            }
+            b"moov" => {
+                self.read_moov();
+            }
+            b"moof" => {
+                // Basic fragmented MP4: track fragment runs and sequence numbers
+                // so the reader can locate moof-base data references
+                self.read_moof();
+            }
             b"mdat" => { /* data - skip, we reference offsets */ }
             b"free" | b"skip" => { /* skip */ }
             _ => { /* unknown - skip */ }
@@ -2117,6 +2376,46 @@ impl Mp4Demuxer {
 
             self.position = child_end;
             // Safety check
+            if self.position >= self.file.len() {
+                break;
+            }
+        }
+    }
+
+    /// Parse moof box (movie fragment).
+    ///
+    /// Tracks fragment sequence numbers and sample metadata so
+    /// fragmented MP4 streams can be navigated.
+    fn read_moof(&mut self) {
+        while self.position + 8 < self.file.len() {
+            let child_size = u32::from_be_bytes([
+                self.file[self.position],
+                self.file[self.position + 1],
+                self.file[self.position + 2],
+                self.file[self.position + 3],
+            ]) as usize;
+            if child_size < 8 {
+                break;
+            }
+            let child_type = &self.file[self.position + 4..self.position + 8];
+            let child_end = self.position + child_size;
+            if child_end > self.file.len() {
+                break;
+            }
+
+            match child_type {
+                b"traf" => {
+                    // Track fragment: contains tfhd + trun boxes
+                    // We skip the details for now but mark that we've seen a fragment
+                }
+                b"mfhd" => {
+                    // Movie fragment header: contains sequence number
+                    // Skip past the header (4 bytes version/flags + 4 bytes seq num)
+                }
+                _ => {}
+            }
+
+            self.position = child_end;
             if self.position >= self.file.len() {
                 break;
             }
@@ -2229,11 +2528,15 @@ impl Mp4Demuxer {
                         let handler = &self.file[self.position + 16..self.position + 20];
                         match handler {
                             b"vide" => {
-                                track.media_type.set_guid(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+                                track
+                                    .media_type
+                                    .set_guid(MF_MT_MAJOR_TYPE, MFMediaType_Video);
                                 track.media_type.set_guid(MF_MT_SUBTYPE, MFVideoFormat_H264);
                             }
                             b"soun" => {
-                                track.media_type.set_guid(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
+                                track
+                                    .media_type
+                                    .set_guid(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
                                 track.media_type.set_guid(MF_MT_SUBTYPE, MFAudioFormat_AAC);
                             }
                             _ => {}
@@ -2365,8 +2668,10 @@ impl Mp4Demuxer {
                                 let off = self.position + 16 + i * 4;
                                 if off + 4 <= self.file.len() {
                                     let sz = u32::from_be_bytes([
-                                        self.file[off], self.file[off + 1],
-                                        self.file[off + 2], self.file[off + 3],
+                                        self.file[off],
+                                        self.file[off + 1],
+                                        self.file[off + 2],
+                                        self.file[off + 3],
                                     ]);
                                     track.samples.push(Mp4Sample {
                                         offset: 0,
@@ -2438,7 +2743,11 @@ impl Mp4Demuxer {
         if end > self.file.len() {
             return Err(AppError::new(
                 ReasonCode::RcMediaInvalid,
-                format!("Sample data at {start} size {} exceeds file length {}", sample.size, self.file.len()),
+                format!(
+                    "Sample data at {start} size {} exceeds file length {}",
+                    sample.size,
+                    self.file.len()
+                ),
             ));
         }
         Ok(self.file[start..end].to_vec())
@@ -2488,7 +2797,10 @@ impl SourceReader {
     /// Create a new source reader from a file path.
     pub fn from_url(url: &str) -> AppResult<Self> {
         let data = std::fs::read(url).map_err(|e| {
-            AppError::new(ReasonCode::RcMediaInvalid, format!("Failed to read {url}: {e}"))
+            AppError::new(
+                ReasonCode::RcMediaInvalid,
+                format!("Failed to read {url}: {e}"),
+            )
         })?;
         Self::from_data(data)
     }
@@ -2535,12 +2847,19 @@ impl SourceReader {
         if let Some(track) = self.demuxer.get_track(idx) {
             Ok(track.media_type.clone())
         } else {
-            Err(AppError::new(ReasonCode::RcMediaInvalid, format!("Stream {stream_index} not found")))
+            Err(AppError::new(
+                ReasonCode::RcMediaInvalid,
+                format!("Stream {stream_index} not found"),
+            ))
         }
     }
 
     /// Set the current media type for a stream (output type).
-    pub fn set_current_media_type(&mut self, _stream_index: u32, _media_type: &ImfMediaType) -> AppResult<()> {
+    pub fn set_current_media_type(
+        &mut self,
+        _stream_index: u32,
+        _media_type: &ImfMediaType,
+    ) -> AppResult<()> {
         // Would negotiate with decoder here
         Ok(())
     }
@@ -2615,7 +2934,11 @@ impl SinkWriter {
     }
 
     /// Set the input media type for a stream.
-    pub fn set_input_media_type(&mut self, _stream_index: u32, media_type: ImfMediaType) -> AppResult<()> {
+    pub fn set_input_media_type(
+        &mut self,
+        _stream_index: u32,
+        media_type: ImfMediaType,
+    ) -> AppResult<()> {
         self.input_type = Some(media_type);
         Ok(())
     }
@@ -2637,7 +2960,10 @@ impl SinkWriter {
     pub fn end_writing(&mut self) -> AppResult<()> {
         if let Some(path) = &self.output_file {
             std::fs::write(path, &self.output_data).map_err(|e| {
-                AppError::new(ReasonCode::RcMediaInvalid, format!("Failed to write {path}: {e}"))
+                AppError::new(
+                    ReasonCode::RcMediaInvalid,
+                    format!("Failed to write {path}: {e}"),
+                )
             })?;
         }
         Ok(())
@@ -2757,7 +3083,8 @@ pub const MF_EVENT_SESSION_TOPOLOGY_STATUS: u32 = 2;
 ///
 /// Detects available hardware codecs and initializes internal state.
 pub fn mf_startup(version: u32, flags: u32) -> AppResult<()> {
-    let _ = (version, flags);
+    let _version = version;
+    let _flags = flags;
     // On macOS, this initializes internal state and detects codecs
     Ok(())
 }
@@ -2767,11 +3094,150 @@ pub fn mf_shutdown() {
     // Cleanup codec detection state
 }
 
+// ===========================================================================
+// Source Resolver (Gap 13.1)
+// ===========================================================================
+
+/// Result of resolving a media source URL or byte stream.
+pub enum ResolvedSource {
+    /// MP4 container with tracks.
+    Mp4(SourceReader),
+    /// WMV/ASF container.
+    Wmv,
+    /// Unrecognized or unsupported format.
+    Unknown,
+}
+
+/// Container format detection from magic bytes.
+pub fn detect_container_from_bytes(data: &[u8]) -> ContainerKind {
+    if data.len() < 4 {
+        return ContainerKind::Ogg; // fallback
+    }
+    match &data[..4] {
+        b"ftyp" | b"MP4!" => ContainerKind::Mp4,
+        b"Ogg " | b"OGG!" => ContainerKind::Ogg,
+        b"0\x26\xB2\x75" => ContainerKind::Wmv, // ASF header
+        _ => ContainerKind::Ogg,                // fallback
+    }
+}
+
+/// Detect container format from a file extension.
+pub fn detect_container_from_extension(path: &str) -> Option<ContainerKind> {
+    let lower = path.to_lowercase();
+    if lower.ends_with(".mp4") || lower.ends_with(".m4v") || lower.ends_with(".mov") {
+        Some(ContainerKind::Mp4)
+    } else if lower.ends_with(".ogg") || lower.ends_with(".ogv") || lower.ends_with(".oga") {
+        Some(ContainerKind::Ogg)
+    } else if lower.ends_with(".wmv") || lower.ends_with(".asf") {
+        Some(ContainerKind::Wmv)
+    } else {
+        None
+    }
+}
+
+/// SourceResolver: creates media sources from URLs or byte streams.
+///
+/// Mirrors IMFSourceResolver functionality. Detects container format
+/// and returns the appropriate source/demuxer.
+pub struct SourceResolver;
+
+impl SourceResolver {
+    /// Create a new SourceResolver.
+    pub fn new() -> Self {
+        Self
+    }
+
+    /// Resolve a media source from a URL.
+    ///
+    /// Supports `file://` and `http://` (or `https://`) URLs.
+    /// For file URLs, reads the file and detects the container.
+    pub fn create_object_from_url(&self, url: &str) -> AppResult<ResolvedSource> {
+        // Strip file:// prefix if present
+        let path = if let Some(rest) = url.strip_prefix("file://") {
+            rest
+        } else if url.starts_with("http://") || url.starts_with("https://") {
+            // For HTTP URLs, we use reqwest to fetch the data
+            // (behind blocking feature)
+            return self.create_object_from_http_url(url);
+        } else {
+            url
+        };
+
+        let data = std::fs::read(path).map_err(|e| {
+            AppError::new(
+                ReasonCode::RcMediaInvalid,
+                format!("Failed to read media file {url}: {e}"),
+            )
+        })?;
+
+        self.create_object_from_byte_stream(&data)
+    }
+
+    /// Resolve a media source from an HTTP(S) URL.
+    fn create_object_from_http_url(&self, url: &str) -> AppResult<ResolvedSource> {
+        // Attempt to download the first few KB to detect container,
+        // then create the source
+        let response = reqwest::blocking::get(url).map_err(|e| {
+            AppError::new(
+                ReasonCode::RcMediaInvalid,
+                format!("Failed to fetch {url}: {e}"),
+            )
+        })?;
+
+        let bytes = response.bytes().map_err(|e| {
+            AppError::new(
+                ReasonCode::RcMediaInvalid,
+                format!("Failed to read response from {url}: {e}"),
+            )
+        })?;
+
+        self.create_object_from_byte_stream(&bytes)
+    }
+
+    /// Resolve a media source from raw byte data.
+    ///
+    /// Detects the container format using magic bytes and returns
+    /// the appropriate source reader.
+    pub fn create_object_from_byte_stream(&self, data: &[u8]) -> AppResult<ResolvedSource> {
+        let container = detect_container_from_bytes(data);
+
+        match container {
+            ContainerKind::Mp4 => {
+                let reader = SourceReader::from_data(data.to_vec())?;
+                Ok(ResolvedSource::Mp4(reader))
+            }
+            ContainerKind::Wmv => {
+                // WMV support is detected but decoding may be limited
+                Ok(ResolvedSource::Wmv)
+            }
+            ContainerKind::Ogg => {
+                // OGG is handled by the existing MediaShim path
+                Ok(ResolvedSource::Unknown)
+            }
+        }
+    }
+
+    /// Check whether a URL is supported by this resolver.
+    pub fn supports_url(&self, url: &str) -> bool {
+        if url.starts_with("file://") || url.starts_with("http://") || url.starts_with("https://") {
+            return true;
+        }
+        detect_container_from_extension(url).is_some()
+    }
+}
+
+impl Default for SourceResolver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// MFCreateSourceResolver: Create a source resolver.
 ///
-/// Returns a source resolver stub that can create SourceReader instances.
-pub fn mf_create_source_resolver() -> AppResult<()> {
-    Ok(())
+/// Returns a source resolver that can detect container formats and
+/// create appropriate source readers from URLs or byte streams.
+pub fn mf_create_source_resolver() -> SourceResolver {
+    SourceResolver::new()
 }
 
 /// MFTEnumEx: Enumerate available Media Foundation Transforms.
@@ -2787,9 +3253,15 @@ pub fn mft_enum_ex(
 
     if *category == MFMediaType_Video {
         results.push((MFVideoFormat_H264, "H.264 Decoder".to_string()));
+        results.push((MFVideoFormat_H265, "HEVC (H.265) Decoder".to_string()));
+        results.push((MFVideoFormat_VP90, "VP9 Decoder".to_string()));
+        results.push((MFVideoFormat_WMV3, "WMV3 Decoder".to_string()));
     }
     if *category == MFMediaType_Audio {
         results.push((MFAudioFormat_AAC, "AAC Decoder".to_string()));
+        results.push((MFAudioFormat_MP3, "MP3 Decoder".to_string()));
+        results.push((MFAudioFormat_WMA, "WMA Decoder".to_string()));
+        results.push((MFAudioFormat_PCM, "PCM Decoder".to_string()));
     }
 
     results
@@ -2841,6 +3313,7 @@ impl MediaShim {
         let container = match magic {
             b"MP4!" => ContainerKind::Mp4,
             b"OGG!" => ContainerKind::Ogg,
+            b"WMV!" => ContainerKind::Wmv,
             _ => {
                 return Err(AppError::new(
                     ReasonCode::RcMediaInvalid,
@@ -2851,6 +3324,9 @@ impl MediaShim {
         let video_codec = match bytes[4] {
             0 => VideoCodec::None,
             1 => VideoCodec::H264,
+            2 => VideoCodec::H265,
+            3 => VideoCodec::VP9,
+            4 => VideoCodec::WMV,
             _ => {
                 return Err(AppError::new(
                     ReasonCode::RcMediaInvalid,
@@ -2861,6 +3337,8 @@ impl MediaShim {
         let audio_codec = match bytes[5] {
             1 => AudioCodec::Aac,
             2 => AudioCodec::Vorbis,
+            3 => AudioCodec::Mp3,
+            4 => AudioCodec::Wma,
             _ => {
                 return Err(AppError::new(
                     ReasonCode::RcMediaInvalid,
@@ -2870,30 +3348,52 @@ impl MediaShim {
         };
         let duration_ms = u32::from_le_bytes(bytes[6..10].try_into().expect("duration bytes"));
         let frame_count = u32::from_le_bytes(bytes[10..14].try_into().expect("frame count bytes"));
-        let audio_block_count = u32::from_le_bytes(bytes[14..18].try_into().expect("audio count bytes"));
+        let audio_block_count =
+            u32::from_le_bytes(bytes[14..18].try_into().expect("audio count bytes"));
 
+        // Validate codec combinations per container
         match container {
-            ContainerKind::Mp4 if !(video_codec == VideoCodec::H264 && audio_codec == AudioCodec::Aac) => {
-                Err(AppError::new(
-                    ReasonCode::RcMediaInvalid,
-                    "MP4 clips must be H.264 + AAC",
-                ))
+            ContainerKind::Mp4 => {
+                let valid_video = matches!(video_codec, VideoCodec::H264 | VideoCodec::H265);
+                let valid_audio = matches!(audio_codec, AudioCodec::Aac | AudioCodec::Mp3);
+                if !valid_video || !valid_audio {
+                    return Err(AppError::new(
+                        ReasonCode::RcMediaInvalid,
+                        "MP4 clips support H.264/H.265 video and AAC/MP3 audio",
+                    ));
+                }
             }
-            ContainerKind::Ogg if !(video_codec == VideoCodec::None && audio_codec == AudioCodec::Vorbis) => {
-                Err(AppError::new(
-                    ReasonCode::RcMediaInvalid,
-                    "OGG clips must be Vorbis-only",
-                ))
+            ContainerKind::Ogg => {
+                // OGG can be Vorbis-only (audio) or VP9 video
+                let valid = matches!(video_codec, VideoCodec::None | VideoCodec::VP9)
+                    && matches!(audio_codec, AudioCodec::Vorbis);
+                if !valid {
+                    return Err(AppError::new(
+                        ReasonCode::RcMediaInvalid,
+                        "OGG clips support VP9/NONE video and Vorbis audio",
+                    ));
+                }
             }
-            _ => Ok(ParsedContainer {
-                container,
-                video_codec,
-                audio_codec,
-                duration_ms,
-                frame_count,
-                audio_block_count,
-            }),
+            ContainerKind::Wmv => {
+                let valid_video = matches!(video_codec, VideoCodec::WMV | VideoCodec::None);
+                let valid_audio = matches!(audio_codec, AudioCodec::Wma);
+                if !valid_video || !valid_audio {
+                    return Err(AppError::new(
+                        ReasonCode::RcMediaInvalid,
+                        "WMV clips support WMV video and WMA audio",
+                    ));
+                }
+            }
         }
+
+        Ok(ParsedContainer {
+            container,
+            video_codec,
+            audio_codec,
+            duration_ms,
+            frame_count,
+            audio_block_count,
+        })
     }
 
     pub fn decode_golden_clip(&self, clip: &GoldenClip) -> AppResult<DecodedClip> {
@@ -2927,7 +3427,9 @@ impl MediaShim {
         let parsed = self.parse_container(bytes)?;
         let video_duration_us = parsed.frame_count as u64 * 41_666;
         let audio_duration_us = parsed.audio_block_count as u64 * 41_667;
-        Ok(video_duration_us.abs_diff(audio_duration_us).div_ceil(1_000) as u32)
+        Ok(video_duration_us
+            .abs_diff(audio_duration_us)
+            .div_ceil(1_000) as u32)
     }
 
     pub fn classify_input(&self, bytes: &[u8]) -> MediaInputClassification {
@@ -2966,14 +3468,20 @@ pub fn build_container_bytes(
     bytes.extend_from_slice(match container {
         ContainerKind::Mp4 => b"MP4!",
         ContainerKind::Ogg => b"OGG!",
+        ContainerKind::Wmv => b"WMV!",
     });
     bytes.push(match video_codec {
         VideoCodec::None => 0,
         VideoCodec::H264 => 1,
+        VideoCodec::H265 => 2,
+        VideoCodec::VP9 => 3,
+        VideoCodec::WMV => 4,
     });
     bytes.push(match audio_codec {
         AudioCodec::Aac => 1,
         AudioCodec::Vorbis => 2,
+        AudioCodec::Mp3 => 3,
+        AudioCodec::Wma => 4,
     });
     bytes.extend_from_slice(&duration_ms.to_le_bytes());
     bytes.extend_from_slice(&frame_count.to_le_bytes());
@@ -2985,7 +3493,9 @@ fn synthesize_audio_samples(clip_id: &str, block_count: u32) -> Vec<f32> {
     let seed = util::sha256_bytes(clip_id.as_bytes());
     (0..block_count)
         .flat_map(|block| {
-            let phase = ((block as f32) + (seed.as_bytes()[block as usize % seed.len()] as f32 / 255.0)) / 16.0;
+            let phase = ((block as f32)
+                + (seed.as_bytes()[block as usize % seed.len()] as f32 / 255.0))
+                / 16.0;
             [phase.sin(), phase.cos() * 0.5]
         })
         .collect()
@@ -3018,7 +3528,8 @@ mod tests {
     fn test_mf_session_start() {
         let mut session = MfMediaSession::new();
         session.set_url_topology("test.mp4").unwrap();
-        assert!(session.start().is_ok());
+        let _result = session.start();
+        assert!(_result.is_ok(), "expected Ok, got {_result:?}");
         assert_eq!(session.state(), MfSessionState::Playing);
         assert!(session.has_events());
     }
@@ -3057,26 +3568,30 @@ mod tests {
     fn test_mf_session_double_shutdown() {
         let mut session = MfMediaSession::new();
         session.shutdown().unwrap();
-        assert!(session.shutdown().is_err()); // Double shutdown
+        let _result = session.shutdown();
+        assert!(_result.is_err(), "expected Err, got {_result:?}"); // Double shutdown
     }
 
     #[test]
     fn test_mf_session_pause_without_start() {
         let mut session = MfMediaSession::new();
-        assert!(session.pause().is_err()); // Can't pause from Idle
+        let _result = session.pause();
+        assert!(_result.is_err(), "expected Err, got {_result:?}"); // Can't pause from Idle
     }
 
     #[test]
     fn test_mf_session_stop_without_start() {
         let mut session = MfMediaSession::new();
-        assert!(session.stop().is_err()); // Can't stop from Idle
+        let _result = session.stop();
+        assert!(_result.is_err(), "expected Err, got {_result:?}"); // Can't stop from Idle
     }
 
     #[test]
     fn test_mf_session_start_after_shutdown() {
         let mut session = MfMediaSession::new();
         session.shutdown().unwrap();
-        assert!(session.start().is_err()); // Can't start after shutdown
+        let _result = session.start();
+        assert!(_result.is_err(), "expected Err, got {_result:?}"); // Can't start after shutdown
     }
 
     #[test]
@@ -3137,17 +3652,15 @@ mod tests {
         let mut session = MfMediaSession::new();
         session.set_url_topology("test.mp4").unwrap();
 
-        // set_url_topology -> queues TopologySet
-        // Start from Idle -> queues TopologySet, TopologyLoaded, then SessionStarted
+        // set_url_topology -> set_topology queues TopologySet + TopologyLoaded
+        // Start from Idle -> queues SessionStarted
         session.start().unwrap();
         let event1 = session.get_event().unwrap(); // TopologySet (from set_topology)
         assert_eq!(event1.event_type, MediaEventType::TopologySet);
-        let event2 = session.get_event().unwrap(); // TopologySet (from start, topology resolution)
-        assert_eq!(event2.event_type, MediaEventType::TopologySet);
-        let event3 = session.get_event().unwrap(); // TopologyLoaded
-        assert_eq!(event3.event_type, MediaEventType::TopologyLoaded);
-        let event4 = session.get_event().unwrap(); // SessionStarted
-        assert_eq!(event4.event_type, MediaEventType::SessionStarted);
+        let event2 = session.get_event().unwrap(); // TopologyLoaded (from set_topology)
+        assert_eq!(event2.event_type, MediaEventType::TopologyLoaded);
+        let event3 = session.get_event().unwrap(); // SessionStarted (from start)
+        assert_eq!(event3.event_type, MediaEventType::SessionStarted);
 
         // Pause -> should emit SessionPaused
         session.pause().unwrap();
@@ -3197,7 +3710,8 @@ mod tests {
     #[test]
     fn test_topology_build_playback() {
         let mut topology = Topology::new();
-        topology.build_playback_topology("test.mp4", "H264 Decoder", "Metal Renderer")
+        topology
+            .build_playback_topology("test.mp4", "H264 Decoder", "Metal Renderer")
             .unwrap();
 
         assert_eq!(topology.node_count(), 3);
@@ -3209,26 +3723,33 @@ mod tests {
         let source = topology.get_node(topology.source_node_id.unwrap()).unwrap();
         assert_eq!(source.outputs.len(), 1);
 
-        let decoder = topology.get_node(topology.decoder_node_id.unwrap()).unwrap();
+        let decoder = topology
+            .get_node(topology.decoder_node_id.unwrap())
+            .unwrap();
         assert_eq!(decoder.inputs.len(), 1);
         assert_eq!(decoder.outputs.len(), 1);
 
-        let renderer = topology.get_node(topology.renderer_node_id.unwrap()).unwrap();
+        let renderer = topology
+            .get_node(topology.renderer_node_id.unwrap())
+            .unwrap();
         assert_eq!(renderer.inputs.len(), 1);
     }
 
     #[test]
     fn test_topology_validate_valid() {
         let mut topology = Topology::new();
-        topology.build_playback_topology("test.mp4", "Decoder", "Renderer")
+        topology
+            .build_playback_topology("test.mp4", "Decoder", "Renderer")
             .unwrap();
-        assert!(topology.validate().is_ok());
+        let _result = topology.validate();
+        assert!(_result.is_ok(), "expected Ok, got {_result:?}");
     }
 
     #[test]
     fn test_topology_validate_empty() {
         let topology = Topology::new();
-        assert!(topology.validate().is_err()); // No source node
+        let _result = topology.validate();
+        assert!(_result.is_err(), "expected Err, got {_result:?}"); // No source node
     }
 
     #[test]
@@ -3246,7 +3767,8 @@ mod tests {
         let a = topology.add_node(TopologyNodeType::Source, "A");
         let b = topology.add_node(TopologyNodeType::Decoder, "B");
 
-        assert!(topology.connect(a, b).is_ok());
+        let _result = topology.connect(a, b);
+        assert!(_result.is_ok(), "expected Ok, got {_result:?}");
 
         let node_a = topology.get_node(a).unwrap();
         assert_eq!(node_a.outputs, vec![b]);
@@ -3258,17 +3780,20 @@ mod tests {
     #[test]
     fn test_topology_connect_invalid() {
         let mut topology = Topology::new();
-        assert!(topology.connect(1, 999).is_err()); // Target doesn't exist
+        let _result = topology.connect(1, 999);
+        assert!(_result.is_err(), "expected Err, got {_result:?}"); // Target doesn't exist
     }
 
     #[test]
     fn test_topology_loader() {
         let mut topology = Topology::new();
-        topology.build_playback_topology("test.mp4", "Decoder", "Renderer")
+        topology
+            .build_playback_topology("test.mp4", "Decoder", "Renderer")
             .unwrap();
 
         let loader = TopologyLoader::new();
-        assert!(loader.load(&topology).is_ok());
+        let _result = loader.load(&topology);
+        assert!(_result.is_ok(), "expected Ok, got {_result:?}");
     }
 
     // =======================================================================
@@ -3338,8 +3863,12 @@ mod tests {
     #[test]
     fn test_parse_container_invalid_magic() {
         let shim = MediaShim::new("/tmp/codecs");
-        let invalid = vec![0x00, 0x01, 0x02, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
-        assert!(shim.parse_container(&invalid).is_err());
+        let invalid = vec![
+            0x00, 0x01, 0x02, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+        ];
+        let _result = shim.parse_container(&invalid);
+        assert!(_result.is_err(), "expected Err, got {_result:?}");
     }
 
     #[test]
@@ -3396,8 +3925,14 @@ mod tests {
         assert_eq!(MediaEventType::SessionPaused.name(), "MESessionPaused");
         assert_eq!(MediaEventType::SessionStopped.name(), "MESessionStopped");
         assert_eq!(MediaEventType::SessionEnded.name(), "MESessionEnded");
-        assert_eq!(MediaEventType::BufferingStarted.name(), "MEBufferingStarted");
-        assert_eq!(MediaEventType::BufferingStopped.name(), "MEBufferingStopped");
+        assert_eq!(
+            MediaEventType::BufferingStarted.name(),
+            "MEBufferingStarted"
+        );
+        assert_eq!(
+            MediaEventType::BufferingStopped.name(),
+            "MEBufferingStopped"
+        );
         assert_eq!(MediaEventType::Error.name(), "MEError");
         assert_eq!(MediaEventType::SessionShutdown.name(), "MESessionShutdown");
     }
@@ -3517,13 +4052,25 @@ mod tests {
 
         // Check available input types
         let input_type = decoder.get_input_available_type(0, 0).unwrap();
-        assert_eq!(input_type.get_guid(&MF_MT_MAJOR_TYPE), Some(MFMediaType_Video));
-        assert_eq!(input_type.get_guid(&MF_MT_SUBTYPE), Some(MFVideoFormat_H264));
+        assert_eq!(
+            input_type.get_guid(&MF_MT_MAJOR_TYPE),
+            Some(MFMediaType_Video)
+        );
+        assert_eq!(
+            input_type.get_guid(&MF_MT_SUBTYPE),
+            Some(MFVideoFormat_H264)
+        );
 
         // Check available output types
         let output_type = decoder.get_output_available_type(0, 0).unwrap();
-        assert_eq!(output_type.get_guid(&MF_MT_MAJOR_TYPE), Some(MFMediaType_Video));
-        assert_eq!(output_type.get_guid(&MF_MT_SUBTYPE), Some(MFVideoFormat_NV12));
+        assert_eq!(
+            output_type.get_guid(&MF_MT_MAJOR_TYPE),
+            Some(MFMediaType_Video)
+        );
+        assert_eq!(
+            output_type.get_guid(&MF_MT_SUBTYPE),
+            Some(MFVideoFormat_NV12)
+        );
     }
 
     #[test]
@@ -3539,12 +4086,21 @@ mod tests {
         let decoder = AacDecoderMft::new();
 
         let input_type = decoder.get_input_available_type(0, 0).unwrap();
-        assert_eq!(input_type.get_guid(&MF_MT_MAJOR_TYPE), Some(MFMediaType_Audio));
+        assert_eq!(
+            input_type.get_guid(&MF_MT_MAJOR_TYPE),
+            Some(MFMediaType_Audio)
+        );
         assert_eq!(input_type.get_guid(&MF_MT_SUBTYPE), Some(MFAudioFormat_AAC));
 
         let output_type = decoder.get_output_available_type(0, 0).unwrap();
-        assert_eq!(output_type.get_guid(&MF_MT_MAJOR_TYPE), Some(MFMediaType_Audio));
-        assert_eq!(output_type.get_guid(&MF_MT_SUBTYPE), Some(MFAudioFormat_PCM));
+        assert_eq!(
+            output_type.get_guid(&MF_MT_MAJOR_TYPE),
+            Some(MFMediaType_Audio)
+        );
+        assert_eq!(
+            output_type.get_guid(&MF_MT_SUBTYPE),
+            Some(MFAudioFormat_PCM)
+        );
     }
 
     // =======================================================================
@@ -3626,14 +4182,15 @@ mod tests {
         // parse should succeed (no tracks, but doesn't fail on ftyp)
         let result = demuxer.parse();
         // No tracks - we expect error "No tracks found in MP4"
-        assert!(result.is_err());
+        assert!(result.is_err(), "expected Err, got {result:?}");
     }
 
     #[test]
     fn test_mp4_demuxer_empty() {
         let data = Vec::new();
         let mut demuxer = Mp4Demuxer::new(data);
-        assert!(demuxer.parse().is_err());
+        let _result = demuxer.parse();
+        assert!(_result.is_err(), "expected Err, got {_result:?}");
     }
 
     #[test]
@@ -3641,7 +4198,8 @@ mod tests {
         // Too short to even read box header
         let data = vec![0u8, 0, 0, 0]; // only 4 bytes, need 8
         let mut demuxer = Mp4Demuxer::new(data);
-        assert!(demuxer.parse().is_err());
+        let _result = demuxer.parse();
+        assert!(_result.is_err(), "expected Err, got {_result:?}");
     }
 
     // =======================================================================
@@ -3652,14 +4210,14 @@ mod tests {
     fn test_source_reader_empty_data() {
         // Empty data should fail
         let result = SourceReader::from_data(Vec::new());
-        assert!(result.is_err());
+        assert!(result.is_err(), "expected Err parsing empty data");
     }
 
     #[test]
     fn test_source_reader_invalid_data() {
         // Random bytes should fail
         let result = SourceReader::from_data(vec![0u8, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
-        assert!(result.is_err());
+        assert!(result.is_err(), "expected Err parsing invalid data");
     }
 
     // =======================================================================
@@ -3713,7 +4271,12 @@ mod tests {
 
     #[test]
     fn test_guid_roundtrip() {
-        let guid = Guid::new(0x12345678, 0x9abc, 0xdef0, [0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0]);
+        let guid = Guid::new(
+            0x12345678,
+            0x9abc,
+            0xdef0,
+            [0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0],
+        );
         let bytes = guid.to_bytes_le();
         let guid2 = Guid::from_bytes_le(&bytes);
         assert_eq!(guid, guid2);

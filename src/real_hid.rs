@@ -315,7 +315,7 @@ fn parse_ioreg_devices(text: &str) -> Vec<HostController> {
 fn is_game_controller(vendor_id: u16, _product_id: u16, product: &str) -> bool {
     // Check by known vendor ID.
     if KNOWN_VIDS.contains(&vendor_id) {
-        return true;
+        return true; // correct: vendor is a known game controller VID
     }
 
     // Check product name for controller-related keywords.
@@ -427,7 +427,7 @@ mod tests {
     fn test_hid_monitor_initial_scan_returns_all() {
         let mut monitor = HidMonitor::new();
         // Before first scan, poll_for_changes returns all current controllers.
-        let (added, removed) = monitor.poll_for_changes().unwrap();
+        let (_added, removed) = monitor.poll_for_changes().unwrap();
         // Added may be empty if no controllers are connected, which is fine.
         assert!(removed.is_empty());
         assert!(monitor.initialized);
@@ -445,9 +445,17 @@ mod tests {
 
     #[test]
     fn test_is_game_controller_known_vid() {
-        assert!(is_game_controller(VID_MICROSOFT, 0x028E, "Xbox 360 Controller"));
+        assert!(is_game_controller(
+            VID_MICROSOFT,
+            0x028E,
+            "Xbox 360 Controller"
+        ));
         assert!(is_game_controller(VID_SONY, 0x0CE6, "DualSense"));
-        assert!(is_game_controller(VID_NINTENDO, 0x2006, "Switch Pro Controller"));
+        assert!(is_game_controller(
+            VID_NINTENDO,
+            0x2006,
+            "Switch Pro Controller"
+        ));
     }
 
     #[test]

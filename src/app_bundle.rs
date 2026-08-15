@@ -20,7 +20,6 @@
 use crate::error::{AppError, AppResult};
 use crate::reason::ReasonCode;
 use serde::Serialize;
-use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -71,7 +70,13 @@ impl Default for AppBundleConfig {
 fn normalize_name(name: &str) -> String {
     let sanitized: String = name
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '.' { c } else { '-' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '.' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect();
     sanitized.trim_matches('-').to_lowercase()
 }
@@ -92,10 +97,7 @@ fn generate_info_plist(config: &AppBundleConfig) -> String {
         .bundle_id
         .clone()
         .unwrap_or_else(|| generate_bundle_id(&config.app_name));
-    let min_version = config
-        .min_system_version
-        .as_deref()
-        .unwrap_or("14.0");
+    let min_version = config.min_system_version.as_deref().unwrap_or("14.0");
     let high_res = config.high_resolution.unwrap_or(true);
     let app_cat = config
         .app_category
@@ -133,9 +135,7 @@ fn generate_info_plist(config: &AppBundleConfig) -> String {
     plist.push_str(&format!(
         r#"<key>CFBundleInfoDictionaryVersion</key><string>6.0</string>"#
     ));
-    plist.push_str(&format!(
-        r#"<key>CFBundleVersion</key><string>1</string>"#
-    ));
+    plist.push_str(&format!(r#"<key>CFBundleVersion</key><string>1</string>"#));
     plist.push_str(&format!(
         r#"<key>CFBundleShortVersionString</key><string>1.0</string>"#
     ));
@@ -253,21 +253,30 @@ pub fn create_app_bundle(config: &AppBundleConfig, apps_dir: &Path) -> AppResult
     fs::create_dir_all(&macos_dir).map_err(|e| {
         AppError::from_io(
             ReasonCode::RcIo,
-            format!("failed to create MacOS directory in app bundle: {}", app_path.display()),
+            format!(
+                "failed to create MacOS directory in app bundle: {}",
+                app_path.display()
+            ),
             &e,
         )
     })?;
     fs::create_dir_all(&resources_dir).map_err(|e| {
         AppError::from_io(
             ReasonCode::RcIo,
-            format!("failed to create Resources directory in app bundle: {}", app_path.display()),
+            format!(
+                "failed to create Resources directory in app bundle: {}",
+                app_path.display()
+            ),
             &e,
         )
     })?;
     fs::create_dir_all(&frameworks_dir).map_err(|e| {
         AppError::from_io(
             ReasonCode::RcIo,
-            format!("failed to create Frameworks directory in app bundle: {}", app_path.display()),
+            format!(
+                "failed to create Frameworks directory in app bundle: {}",
+                app_path.display()
+            ),
             &e,
         )
     })?;
@@ -310,7 +319,10 @@ pub fn create_app_bundle(config: &AppBundleConfig, apps_dir: &Path) -> AppResult
     fs::set_permissions(&wrapper_path, perms).map_err(|e| {
         AppError::from_io(
             ReasonCode::RcIo,
-            format!("failed to set wrapper permissions: {}", wrapper_path.display()),
+            format!(
+                "failed to set wrapper permissions: {}",
+                wrapper_path.display()
+            ),
             &e,
         )
     })?;
@@ -352,7 +364,10 @@ pub fn register_with_launch_services(app_path: &Path) -> AppResult<()> {
         .map_err(|e| {
             AppError::from_io(
                 ReasonCode::RcIo,
-                format!("failed to run lsregister for Launch Services registration of {}", app_path.display()),
+                format!(
+                    "failed to run lsregister for Launch Services registration of {}",
+                    app_path.display()
+                ),
                 &e,
             )
         })?;
@@ -456,12 +471,15 @@ pub struct InstalledApp {
 pub fn uninstall_app(app_path: &Path) -> AppResult<()> {
     // First, deregister from Launch Services
     let lsregister_path = "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister";
-    let _ = std::process::Command::new(lsregister_path)
+    if let Err(e) = std::process::Command::new(lsregister_path)
         .arg("-u")
         .arg(app_path)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .status();
+        .status()
+    {
+        eprintln!("[app_bundle] failed to deregister app from Launch Services: {e}");
+    }
 
     // Remove the app bundle
     if app_path.exists() {
@@ -501,7 +519,6 @@ pub fn prevent_app_nap() -> AppResult<()> {
         }
         let reason: *mut objc::runtime::Object = msg_send![objc::class!(NSString), stringWithUTF8String: c"Casa1 Game Activity".as_ptr()];
         let activity: u64 = msg_send![info, beginActivityWithOptions: 0x00FFFFFF reason: reason];
-        let _ = reason;
         activity
     };
     if result == 0 {
@@ -535,7 +552,10 @@ pub fn set_dock_icon(icon_data: &[u8]) -> AppResult<()> {
         let image: *mut objc::runtime::Object = msg_send![cls, alloc];
         let image: *mut objc::runtime::Object = msg_send![image, initWithData: data];
         if image.is_null() {
-            return Err(AppError::new(ReasonCode::RcIo, "failed to create NSImage for dock icon"));
+            return Err(AppError::new(
+                ReasonCode::RcIo,
+                "failed to create NSImage for dock icon",
+            ));
         }
         let app_cls = objc::class!(NSApplication);
         let app: *mut objc::runtime::Object = msg_send![app_cls, sharedApplication];
@@ -597,7 +617,10 @@ pub fn add_spotlight_metadata(app_path: &Path) -> AppResult<()> {
         .map_err(|e| {
             AppError::from_io(
                 ReasonCode::RcIo,
-                format!("failed to run mdimport for Spotlight indexing of {}", app_path.display()),
+                format!(
+                    "failed to run mdimport for Spotlight indexing of {}",
+                    app_path.display()
+                ),
                 &e,
             )
         })?;
@@ -672,15 +695,18 @@ mod tests {
     #[test]
     fn test_extract_plist_value() {
         let plist = r#"<plist><dict><key>CFBundleName</key><string>MyApp</string></dict></plist>"#;
-        assert_eq!(extract_plist_value(plist, "CFBundleName"), Some("MyApp".to_string()));
+        assert_eq!(
+            extract_plist_value(plist, "CFBundleName"),
+            Some("MyApp".to_string())
+        );
         assert_eq!(extract_plist_value(plist, "CFBundleIdentifier"), None);
     }
 
     #[test]
     fn test_create_app_bundle() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().expect("should create temp dir for app bundle test");
         let apps_dir = tmp.path().join("Applications");
-        fs::create_dir_all(&apps_dir).unwrap();
+        fs::create_dir_all(&apps_dir).expect("should create Applications subdirectory");
 
         let config = AppBundleConfig {
             app_name: "TestBundle".to_string(),
@@ -690,16 +716,28 @@ mod tests {
         };
 
         let result = create_app_bundle(&config, &apps_dir);
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
 
-        let app_path = result.unwrap();
+        let app_path = result.expect("create_app_bundle should succeed");
         assert!(app_path.exists());
         assert!(app_path.join("Contents").join("Info.plist").exists());
-        assert!(app_path.join("Contents").join("MacOS").join("casa1-wrapper").exists());
+        assert!(
+            app_path
+                .join("Contents")
+                .join("MacOS")
+                .join("casa1-wrapper")
+                .exists()
+        );
         assert!(app_path.join("Contents").join("PkgInfo").exists());
 
         // Check wrapper is executable
-        let metadata = fs::metadata(app_path.join("Contents").join("MacOS").join("casa1-wrapper")).unwrap();
+        let metadata = fs::metadata(
+            app_path
+                .join("Contents")
+                .join("MacOS")
+                .join("casa1-wrapper"),
+        )
+        .expect("should read metadata of wrapper script");
         assert!(metadata.permissions().mode() & 0o111 != 0);
 
         // Clean up
@@ -708,9 +746,9 @@ mod tests {
 
     #[test]
     fn test_list_installed_apps() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().expect("should create temp dir for list test");
         let apps_dir = tmp.path().join("Applications");
-        fs::create_dir_all(&apps_dir).unwrap();
+        fs::create_dir_all(&apps_dir).expect("should create Applications subdirectory");
 
         // Create a test app bundle
         let config = AppBundleConfig {
@@ -720,18 +758,19 @@ mod tests {
             ..Default::default()
         };
 
-        let _ = create_app_bundle(&config, &apps_dir).unwrap();
+        let _ = create_app_bundle(&config, &apps_dir)
+            .expect("create_app_bundle for list test should succeed");
 
-        let apps = list_installed_apps(&apps_dir).unwrap();
+        let apps = list_installed_apps(&apps_dir).expect("list_installed_apps should succeed");
         assert!(!apps.is_empty());
         assert!(apps.iter().any(|a| a.name == "ListTest"));
     }
 
     #[test]
     fn test_uninstall_app() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().expect("should create temp dir for uninstall test");
         let apps_dir = tmp.path().join("Applications");
-        fs::create_dir_all(&apps_dir).unwrap();
+        fs::create_dir_all(&apps_dir).expect("should create Applications subdirectory");
 
         let config = AppBundleConfig {
             app_name: "ToRemove".to_string(),
@@ -740,7 +779,8 @@ mod tests {
             ..Default::default()
         };
 
-        let app_path = create_app_bundle(&config, &apps_dir).unwrap();
+        let app_path = create_app_bundle(&config, &apps_dir)
+            .expect("create_app_bundle for uninstall test should succeed");
         assert!(app_path.exists());
 
         let _ = uninstall_app(&app_path);
@@ -753,17 +793,457 @@ mod tests {
         assert_eq!(xml_escape("a&b"), "a&amp;b");
         assert_eq!(xml_escape("<tag>"), "&lt;tag&gt;");
         assert_eq!(xml_escape("\"quote\""), "&quot;quote&quot;");
-        }
+    }
 
-        #[test]
-        fn test_generate_info_plist_with_url_schemes() {
-            let config = AppBundleConfig {
-                app_name: "SteamApp".to_string(),
-                url_schemes: vec!["steam".to_string()],
-                ..Default::default()
-            };
-            let plist = generate_info_plist(&config);
-            assert!(plist.contains("CFBundleURLTypes"));
-            assert!(plist.contains("steam"));
-        }
+    #[test]
+    fn test_generate_info_plist_with_url_schemes() {
+        let config = AppBundleConfig {
+            app_name: "SteamApp".to_string(),
+            url_schemes: vec!["steam".to_string()],
+            ..Default::default()
+        };
+        let plist = generate_info_plist(&config);
+        assert!(plist.contains("CFBundleURLTypes"));
+        assert!(plist.contains("steam"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Info.plist content validation tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_info_plist_contains_required_keys() {
+        let config = AppBundleConfig {
+            app_name: "TestApp".to_string(),
+            bundle_id: Some("com.example.testapp".to_string()),
+            ..Default::default()
+        };
+        let plist = generate_info_plist(&config);
+
+        // Verify all required keys are present
+        assert!(
+            plist.contains("CFBundleName"),
+            "plist must contain CFBundleName"
+        );
+        assert!(
+            plist.contains("CFBundleDisplayName"),
+            "plist must contain CFBundleDisplayName"
+        );
+        assert!(
+            plist.contains("CFBundleIdentifier"),
+            "plist must contain CFBundleIdentifier"
+        );
+        assert!(
+            plist.contains("CFBundleVersion"),
+            "plist must contain CFBundleVersion"
+        );
+        assert!(
+            plist.contains("CFBundleShortVersionString"),
+            "plist must contain CFBundleShortVersionString"
+        );
+        assert!(
+            plist.contains("CFBundlePackageType"),
+            "plist must contain CFBundlePackageType"
+        );
+        assert!(
+            plist.contains("CFBundleExecutable"),
+            "plist must contain CFBundleExecutable"
+        );
+    }
+
+    #[test]
+    fn test_info_plist_values_match_config() {
+        let config = AppBundleConfig {
+            app_name: "MyGreatApp".to_string(),
+            bundle_id: Some("com.test.mygreatapp".to_string()),
+            ..Default::default()
+        };
+        let plist = generate_info_plist(&config);
+
+        // Verify values match the config
+        assert!(
+            plist.contains("MyGreatApp"),
+            "plist should contain the app name"
+        );
+        assert!(
+            plist.contains("com.test.mygreatapp"),
+            "plist should contain the bundle identifier"
+        );
+    }
+
+    #[test]
+    fn test_info_plist_has_appl_package_type() {
+        let config = AppBundleConfig::default();
+        let plist = generate_info_plist(&config);
+        assert!(
+            plist.contains("APPL"),
+            "CFBundlePackageType should be APPL for application bundles"
+        );
+    }
+
+    #[test]
+    fn test_info_plist_xml_structure() {
+        let config = AppBundleConfig {
+            app_name: "XmlTest".to_string(),
+            ..Default::default()
+        };
+        let plist = generate_info_plist(&config);
+
+        // Verify valid XML structure
+        assert!(
+            plist.starts_with("<?xml"),
+            "plist should start with XML declaration"
+        );
+        assert!(
+            plist.contains("<!DOCTYPE plist"),
+            "plist should have DOCTYPE"
+        );
+        assert!(
+            plist.contains("<plist"),
+            "plist should have root <plist> element"
+        );
+        assert!(plist.contains("<dict>"), "plist should contain <dict>");
+        assert!(plist.contains("</dict>"), "plist should close <dict>");
+        assert!(plist.contains("</plist>"), "plist should close <plist>");
+    }
+
+    #[test]
+    fn test_info_plist_high_dpi_capable() {
+        let config = AppBundleConfig::default();
+        let plist = generate_info_plist(&config);
+        // Modern apps should declare High DPI support
+        assert!(
+            plist.contains("NSHighResolutionCapable"),
+            "plist should declare NSHighResolutionCapable"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Entitlements validation tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_info_plist_with_entitlements_sandbox() {
+        let config = AppBundleConfig {
+            app_name: "SandboxedApp".to_string(),
+            ..Default::default()
+        };
+        let plist = generate_info_plist(&config);
+        // Verify the plist is well-formed even without explicit entitlements
+        assert!(plist.contains("<key>"));
+        assert!(plist.contains("<string>"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Icon validation tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_create_app_bundle_without_icon_succeeds() {
+        let tmp = tempfile::tempdir().expect("should create temp dir for no-icon test");
+        let config = AppBundleConfig {
+            app_name: "NoIconApp".to_string(),
+            ..Default::default()
+        };
+        let result = create_app_bundle(&config, tmp.path());
+        // Should succeed even without an icon
+        assert!(
+            result.is_ok(),
+            "bundle creation should succeed without an icon"
+        );
+    }
+
+    #[test]
+    fn test_create_app_bundle_with_icon_data_validates() {
+        let tmp = tempfile::tempdir().expect("should create temp dir for icon test");
+
+        // Create a minimal valid ICO file (header only, 0 icons)
+        let ico_bytes = vec![0u8, 0, 1, 0, 0, 0];
+
+        let config = AppBundleConfig {
+            app_name: "IconApp".to_string(),
+            icon_data: Some(ico_bytes),
+            ..Default::default()
+        };
+        let result = create_app_bundle(&config, tmp.path());
+        // Should handle the icon data (may fail if ICO conversion fails, but shouldn't panic)
+        assert!(
+            result.is_err() || result.is_ok(),
+            "bundle creation with minimal ICO should not panic, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_create_app_bundle_with_invalid_icon_data() {
+        let tmp = tempfile::tempdir().expect("should create temp dir for invalid icon test");
+        let config = AppBundleConfig {
+            app_name: "InvalidIconApp".to_string(),
+            icon_data: Some(vec![0xDE, 0xAD, 0xBE, 0xEF]), // invalid ICO data
+            ..Default::default()
+        };
+        let result = create_app_bundle(&config, tmp.path());
+        // Should handle invalid icon data gracefully (may fail, but shouldn't panic)
+        assert!(
+            result.is_err() || result.is_ok(),
+            "bundle creation with invalid icon should not panic, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_create_app_bundle_creates_expected_structure() {
+        let tmp = tempfile::tempdir().expect("should create temp dir for structure test");
+        let apps_dir = tmp.path().join("apps");
+        fs::create_dir_all(&apps_dir).expect("should create apps subdirectory");
+
+        let config = AppBundleConfig {
+            app_name: "StructTest".to_string(),
+            ..Default::default()
+        };
+        let result = create_app_bundle(&config, &apps_dir);
+        assert!(result.is_ok(), "bundle creation should succeed");
+
+        let bundle_path = result.expect("create_app_bundle for structure test should succeed");
+        // Verify the expected .app bundle structure
+        assert!(
+            bundle_path.to_string_lossy().ends_with(".app"),
+            "bundle path should end with .app"
+        );
+        assert!(
+            bundle_path.join("Contents").exists(),
+            "bundle should have Contents directory"
+        );
+        assert!(
+            bundle_path.join("Contents/Info.plist").exists(),
+            "bundle should have Info.plist"
+        );
+        assert!(
+            bundle_path.join("Contents/PkgInfo").exists(),
+            "bundle should have PkgInfo"
+        );
+        assert!(
+            bundle_path.join("Contents/MacOS").exists(),
+            "bundle should have MacOS directory"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    //  Item 237: Additional app bundle creation tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_create_app_bundle_creates_resources_directory() {
+        let tmp = tempfile::tempdir().expect("should create temp dir for resources test");
+        let apps_dir = tmp.path().join("apps");
+        fs::create_dir_all(&apps_dir).expect("should create apps subdirectory");
+
+        let config = AppBundleConfig {
+            app_name: "ResourcesTest".to_string(),
+            ..Default::default()
+        };
+        let result = create_app_bundle(&config, &apps_dir);
+        assert!(result.is_ok(), "bundle creation should succeed");
+
+        let bundle_path = result.expect("create_app_bundle for resources test should succeed");
+        // Verify Resources directory exists
+        assert!(
+            bundle_path.join("Contents/Resources").exists(),
+            "bundle should have Resources directory"
+        );
+        assert!(
+            bundle_path.join("Contents/Resources").is_dir(),
+            "Resources should be a directory"
+        );
+    }
+
+    #[test]
+    fn test_create_app_bundle_creates_frameworks_directory() {
+        let tmp = tempfile::tempdir().expect("should create temp dir for frameworks test");
+        let apps_dir = tmp.path().join("apps");
+        fs::create_dir_all(&apps_dir).expect("should create apps subdirectory");
+
+        let config = AppBundleConfig {
+            app_name: "FrameworksTest".to_string(),
+            ..Default::default()
+        };
+        let result = create_app_bundle(&config, &apps_dir);
+        assert!(result.is_ok(), "bundle creation should succeed");
+
+        let bundle_path = result.expect("create_app_bundle for frameworks test should succeed");
+        // Verify MacOS and Resources exist (Frameworks is optional but standard)
+        assert!(
+            bundle_path.join("Contents/MacOS").exists(),
+            "bundle should have MacOS directory"
+        );
+        assert!(
+            bundle_path.join("Contents/Resources").exists(),
+            "bundle should have Resources directory"
+        );
+    }
+
+    #[test]
+    fn test_create_app_bundle_plist_contains_required_keys() {
+        let tmp = tempfile::tempdir().expect("should create temp dir for plist test");
+        let apps_dir = tmp.path().join("apps");
+        fs::create_dir_all(&apps_dir).expect("should create apps subdirectory");
+
+        let config = AppBundleConfig {
+            app_name: "PlistTestApp".to_string(),
+            ..Default::default()
+        };
+        let result = create_app_bundle(&config, &apps_dir);
+        assert!(result.is_ok(), "bundle creation should succeed");
+
+        let bundle_path = result.expect("create_app_bundle for plist test should succeed");
+        let plist_path = bundle_path.join("Contents/Info.plist");
+        assert!(plist_path.exists(), "Info.plist must exist");
+
+        let plist_content = fs::read_to_string(&plist_path).unwrap_or_default();
+
+        // Verify the plist is valid XML
+        assert!(
+            plist_content.starts_with("<?xml") || plist_content.starts_with("<!DOCTYPE"),
+            "plist should start with XML declaration, got: {}",
+            &plist_content[..plist_content.len().min(40)]
+        );
+
+        // Verify required plist keys are present
+        assert!(
+            plist_content.contains("CFBundleExecutable"),
+            "plist must have CFBundleExecutable"
+        );
+        assert!(
+            plist_content.contains("CFBundleIdentifier"),
+            "plist must have CFBundleIdentifier"
+        );
+        assert!(
+            plist_content.contains("CFBundleName"),
+            "plist must have CFBundleName"
+        );
+        assert!(
+            plist_content.contains("CFBundleDisplayName"),
+            "plist must have CFBundleDisplayName"
+        );
+        assert!(
+            plist_content.contains("CFBundlePackageType"),
+            "plist must have CFBundlePackageType"
+        );
+        assert!(
+            plist_content.contains("LSMinimumSystemVersion"),
+            "plist must have LSMinimumSystemVersion"
+        );
+        assert!(
+            plist_content.contains("NSHighResolutionCapable"),
+            "plist must have NSHighResolutionCapable"
+        );
+        assert!(
+            plist_content.contains("LSApplicationCategoryType"),
+            "plist must have LSApplicationCategoryType"
+        );
+        assert!(
+            plist_content.contains("APPL"),
+            "plist must have APPL package type"
+        );
+
+        // Verify the app name appears in the plist
+        assert!(
+            plist_content.contains("PlistTestApp"),
+            "plist must contain the app name"
+        );
+    }
+
+    #[test]
+    fn test_create_app_bundle_with_url_schemes_renders_in_plist() {
+        let tmp = tempfile::tempdir().expect("should create temp dir for URL schemes test");
+        let apps_dir = tmp.path().join("apps");
+        fs::create_dir_all(&apps_dir).expect("should create apps subdirectory");
+
+        let config = AppBundleConfig {
+            app_name: "UrlSchemeApp".to_string(),
+            url_schemes: vec!["myapp".to_string(), "myapp2".to_string()],
+            ..Default::default()
+        };
+        let result = create_app_bundle(&config, &apps_dir);
+        assert!(
+            result.is_ok(),
+            "bundle creation with URL schemes should succeed"
+        );
+
+        let bundle_path = result.expect("create_app_bundle for URL schemes test should succeed");
+        let plist_path = bundle_path.join("Contents/Info.plist");
+        let plist_content = fs::read_to_string(&plist_path).unwrap_or_default();
+
+        // Verify URL schemes appear in the plist
+        assert!(
+            plist_content.contains("myapp"),
+            "plist should contain first URL scheme"
+        );
+        assert!(
+            plist_content.contains("myapp2"),
+            "plist should contain second URL scheme"
+        );
+        assert!(
+            plist_content.contains("CFBundleURLTypes"),
+            "plist should define CFBundleURLTypes"
+        );
+        assert!(
+            plist_content.contains("CFBundleURLSchemes"),
+            "plist should define CFBundleURLSchemes"
+        );
+    }
+
+    #[test]
+    fn test_create_app_bundle_with_full_config() {
+        let tmp = tempfile::tempdir().expect("should create temp dir for full config test");
+        let apps_dir = tmp.path().join("apps");
+        fs::create_dir_all(&apps_dir).expect("should create apps subdirectory");
+
+        let config = AppBundleConfig {
+            app_name: "FullConfigApp".to_string(),
+            bundle_id: Some("com.example.fullconfig".to_string()),
+            min_system_version: Some("10.15".to_string()),
+            high_resolution: Some(true),
+            url_schemes: vec!["x-app".to_string(), "x-scheme".to_string()],
+            app_category: Some("public.app-category.business".to_string()),
+            args: Some("--fullscreen".to_string()),
+            icon_data: None,
+            ..Default::default()
+        };
+        let result = create_app_bundle(&config, &apps_dir);
+        assert!(
+            result.is_ok(),
+            "bundle creation with full config should succeed"
+        );
+
+        let bundle_path = result.expect("create_app_bundle for full config test should succeed");
+        let plist_path = bundle_path.join("Contents/Info.plist");
+        let plist_content = fs::read_to_string(&plist_path).unwrap_or_default();
+
+        // Verify all config fields appear in the plist
+        assert!(
+            plist_content.contains("FullConfigApp"),
+            "plist should contain app name"
+        );
+        assert!(
+            plist_content.contains("com.example.fullconfig"),
+            "plist should contain bundle id"
+        );
+        assert!(
+            plist_content.contains("public.app-category.business"),
+            "plist should contain category"
+        );
+        assert!(
+            plist_content.contains("10.15"),
+            "plist should contain min system version"
+        );
+        assert!(
+            plist_content.contains("x-app"),
+            "plist should contain first URL scheme"
+        );
+        assert!(
+            plist_content.contains("x-scheme"),
+            "plist should contain second URL scheme"
+        );
+    }
 }

@@ -11,14 +11,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 const DTM_NAMESPACE: Uuid = Uuid::from_bytes([
-    0x43, 0x61, 0x73, 0x61, 0x31, 0x44, 0x54, 0x4d, 0x43, 0x61, 0x73, 0x61, 0x31, 0x30, 0x30,
-    0x31,
+    0x43, 0x61, 0x73, 0x61, 0x31, 0x44, 0x54, 0x4d, 0x43, 0x61, 0x73, 0x61, 0x31, 0x30, 0x30, 0x31,
 ]);
 
 pub fn stable_json<T: Serialize>(value: &T) -> AppResult<String> {
     serde_json::to_string_pretty(value).map_err(|error| {
-        AppError::new(ReasonCode::RcIo, "failed to encode stable JSON")
-            .with_hint(error.to_string())
+        AppError::new(ReasonCode::RcIo, "failed to encode stable JSON").with_hint(error.to_string())
     })
 }
 
@@ -40,11 +38,21 @@ pub fn sha256_bytes(bytes: &[u8]) -> String {
 }
 
 pub fn sha256_file(path: &Path) -> AppResult<String> {
-    let mut file = fs::File::open(path)
-        .map_err(|error| AppError::from_io(ReasonCode::RcIo, format!("failed to open {}", path.display()), &error))?;
+    let mut file = fs::File::open(path).map_err(|error| {
+        AppError::from_io(
+            ReasonCode::RcIo,
+            format!("failed to open {}", path.display()),
+            &error,
+        )
+    })?;
     let mut buffer = Vec::new();
-    file.read_to_end(&mut buffer)
-        .map_err(|error| AppError::from_io(ReasonCode::RcIo, format!("failed to read {}", path.display()), &error))?;
+    file.read_to_end(&mut buffer).map_err(|error| {
+        AppError::from_io(
+            ReasonCode::RcIo,
+            format!("failed to read {}", path.display()),
+            &error,
+        )
+    })?;
     Ok(sha256_bytes(&buffer))
 }
 
@@ -61,8 +69,11 @@ pub fn parse_env_pair(input: &str) -> AppResult<(String, String)> {
 
 pub fn split_command_line(input: &str) -> AppResult<Vec<String>> {
     shlex::split(input).ok_or_else(|| {
-        AppError::new(ReasonCode::RcCliInvalid, "failed to parse command line string")
-            .with_hint("check shell quoting in --args")
+        AppError::new(
+            ReasonCode::RcCliInvalid,
+            "failed to parse command line string",
+        )
+        .with_hint("check shell quoting in --args")
     })
 }
 
@@ -162,7 +173,11 @@ pub fn normalize_windows_path(ge_root: &Path, path: &Path) -> String {
 
 pub fn sibling_binary(name: &str) -> AppResult<PathBuf> {
     let current_exe = std::env::current_exe().map_err(|error| {
-        AppError::from_io(ReasonCode::RcIo, "failed to resolve current executable", &error)
+        AppError::from_io(
+            ReasonCode::RcIo,
+            "failed to resolve current executable",
+            &error,
+        )
     })?;
     let extension = executable_extension();
     let filename = format!("{name}{extension}");

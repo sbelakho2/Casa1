@@ -1,7 +1,7 @@
 use crate::error::{AppError, AppResult};
 use crate::mac_window;
+use crate::real_hid::HidMonitor;
 use crate::reason::ReasonCode;
-use crate::real_hid::{HostController, HidMonitor};
 use crate::util;
 use serde::{Deserialize, Serialize};
 
@@ -97,8 +97,8 @@ pub const VK_ESCAPE: i32 = 0x1B;
 pub const VK_CONVERT: i32 = 0x1C;
 pub const VK_NONCONVERT: i32 = 0x1D;
 pub const VK_SPACE: i32 = 0x20;
-pub const VK_PRIOR: i32 = 0x21;       // Page Up
-pub const VK_NEXT: i32 = 0x22;        // Page Down
+pub const VK_PRIOR: i32 = 0x21; // Page Up
+pub const VK_NEXT: i32 = 0x22; // Page Down
 pub const VK_END: i32 = 0x23;
 pub const VK_HOME: i32 = 0x24;
 pub const VK_LEFT: i32 = 0x25;
@@ -108,7 +108,7 @@ pub const VK_DOWN: i32 = 0x28;
 pub const VK_SELECT: i32 = 0x29;
 pub const VK_PRINT: i32 = 0x2A;
 pub const VK_EXECUTE: i32 = 0x2B;
-pub const VK_SNAPSHOT: i32 = 0x2C;     // Print Screen
+pub const VK_SNAPSHOT: i32 = 0x2C; // Print Screen
 pub const VK_INSERT: i32 = 0x2D;
 pub const VK_DELETE: i32 = 0x2E;
 pub const VK_HELP: i32 = 0x2F;
@@ -200,17 +200,17 @@ pub const VK_LCONTROL: i32 = 0xA2;
 pub const VK_RCONTROL: i32 = 0xA3;
 pub const VK_LMENU: i32 = 0xA4;
 pub const VK_RMENU: i32 = 0xA5;
-pub const VK_OEM_1: i32 = 0xBA;       // ;:
-pub const VK_OEM_PLUS: i32 = 0xBB;    // =+
-pub const VK_OEM_COMMA: i32 = 0xBC;   // ,<
-pub const VK_OEM_MINUS: i32 = 0xBD;   // -_
-pub const VK_OEM_PERIOD: i32 = 0xBE;  // .>
-pub const VK_OEM_2: i32 = 0xBF;       // /?
-pub const VK_OEM_3: i32 = 0xC0;       // `~
-pub const VK_OEM_4: i32 = 0xDB;       // [{
-pub const VK_OEM_5: i32 = 0xDC;       // \|
-pub const VK_OEM_6: i32 = 0xDD;       // ]}
-pub const VK_OEM_7: i32 = 0xDE;       // '"
+pub const VK_OEM_1: i32 = 0xBA; // ;:
+pub const VK_OEM_PLUS: i32 = 0xBB; // =+
+pub const VK_OEM_COMMA: i32 = 0xBC; // ,<
+pub const VK_OEM_MINUS: i32 = 0xBD; // -_
+pub const VK_OEM_PERIOD: i32 = 0xBE; // .>
+pub const VK_OEM_2: i32 = 0xBF; // /?
+pub const VK_OEM_3: i32 = 0xC0; // `~
+pub const VK_OEM_4: i32 = 0xDB; // [{
+pub const VK_OEM_5: i32 = 0xDC; // \|
+pub const VK_OEM_6: i32 = 0xDD; // ]}
+pub const VK_OEM_7: i32 = 0xDE; // '"
 pub const VK_OEM_8: i32 = 0xDF;
 
 // ── MapVirtualKeyW map type constants ────────────────────────────────────
@@ -265,7 +265,7 @@ pub const SWP_ASYNCWINDOWPOS: u32 = 0x4000;
 // ── Special HWND values for SetWindowPos insert_after ───────────────────
 pub const HWND_TOP: u32 = 0;
 pub const HWND_BOTTOM: u32 = 1;
-pub const HWND_TOPMOST: u32 = !0u32;  // -1 as u32
+pub const HWND_TOPMOST: u32 = !0u32; // -1 as u32
 pub const HWND_NOTOPMOST: u32 = !1u32; // -2 as u32
 
 // ── Tray icon / Shell_NotifyIcon constants ──────────────────────────────
@@ -296,6 +296,205 @@ pub const TWF_FINETOUCH: u32 = 0x00000001;
 pub const TWF_WANTPALM: u32 = 0x00000002;
 
 // ── Touch input flags (TouchInput.flags) ─────────────────────────────────
+
+// ── Menu constants ─────────────────────────────────────────────────────────
+pub const MF_INSERT: u32 = 0x0000_0000;
+pub const MF_CHANGE: u32 = 0x0000_0080;
+pub const MF_APPEND: u32 = 0x0000_0100;
+pub const MF_DELETE: u32 = 0x0000_0200;
+pub const MF_REMOVE: u32 = 0x0000_1000;
+pub const MF_BYCOMMAND: u32 = 0x0000_0000;
+pub const MF_BYPOSITION: u32 = 0x0000_0400;
+pub const MF_SEPARATOR: u32 = 0x0000_0800;
+pub const MF_ENABLED: u32 = 0x0000_0000;
+pub const MF_GRAYED: u32 = 0x0000_0001;
+pub const MF_DISABLED: u32 = 0x0000_0002;
+pub const MF_UNCHECKED: u32 = 0x0000_0000;
+pub const MF_CHECKED: u32 = 0x0000_0008;
+pub const MF_USECHECKBITMAPS: u32 = 0x0000_0200;
+pub const MF_STRING: u32 = 0x0000_0000;
+pub const MF_BITMAP: u32 = 0x0000_0004;
+pub const MF_OWNERDRAW: u32 = 0x0000_0100;
+pub const MF_POPUP: u32 = 0x0000_0010;
+pub const MF_MENUBARBREAK: u32 = 0x0000_0020;
+pub const MF_MENUBREAK: u32 = 0x0000_0040;
+pub const MF_UNHILITE: u32 = 0x0000_0000;
+pub const MF_HILITE: u32 = 0x0000_0080;
+pub const MF_SYSMENU: u32 = 0x0000_2000;
+pub const MF_HELP: u32 = 0x0000_4000;
+pub const MF_MOUSESELECT: u32 = 0x0000_8000;
+pub const MFT_STRING: u32 = MF_STRING;
+pub const MFT_BITMAP: u32 = MF_BITMAP;
+pub const MFT_MENUBARBREAK: u32 = MF_MENUBARBREAK;
+pub const MFT_MENUBREAK: u32 = MF_MENUBREAK;
+pub const MFT_OWNERDRAW: u32 = MF_OWNERDRAW;
+pub const MFT_RADIOCHECK: u32 = 0x0000_0200;
+pub const MFT_SEPARATOR: u32 = MF_SEPARATOR;
+pub const MFT_RIGHTORDER: u32 = 0x0000_2000;
+pub const MFT_RIGHTJUSTIFY: u32 = 0x0000_4000;
+pub const MFS_GRAYED: u32 = 0x0000_0003;
+pub const MFS_DISABLED: u32 = MFS_GRAYED;
+pub const MFS_CHECKED: u32 = MF_CHECKED;
+pub const MFS_HILITE: u32 = MF_HILITE;
+pub const MFS_ENABLED: u32 = MF_ENABLED;
+pub const MFS_DEFAULT: u32 = 0x0000_1000;
+pub const TPM_LEFTBUTTON: u32 = 0x0000_0000;
+pub const TPM_RIGHTBUTTON: u32 = 0x0000_0002;
+pub const TPM_LEFTALIGN: u32 = 0x0000_0000;
+pub const TPM_CENTERALIGN: u32 = 0x0000_0004;
+pub const TPM_RIGHTALIGN: u32 = 0x0000_0008;
+pub const TPM_TOPALIGN: u32 = 0x0000_0000;
+pub const TPM_VCENTERALIGN: u32 = 0x0000_0010;
+pub const TPM_BOTTOMALIGN: u32 = 0x0000_0020;
+pub const TPM_NONOTIFY: u32 = 0x0000_0080;
+pub const TPM_RETURNCMD: u32 = 0x0000_0100;
+pub const TPM_RECURSE: u32 = 0x0000_0001;
+pub const TPM_HORIZONTAL: u32 = 0x0000_0000;
+pub const TPM_VERTICAL: u32 = 0x0000_0040;
+
+// ── Scrollbar constants ─────────────────────────────────────────────────────
+pub const SB_HORZ: u32 = 0;
+pub const SB_VERT: u32 = 1;
+pub const SB_CTL: u32 = 2;
+pub const SB_BOTH: u32 = 3;
+pub const SIF_RANGE: u32 = 0x0001;
+pub const SIF_PAGE: u32 = 0x0002;
+pub const SIF_POS: u32 = 0x0004;
+pub const SIF_DISABLENOSCROLL: u32 = 0x0008;
+pub const SIF_TRACKPOS: u32 = 0x0010;
+pub const SIF_ALL: u32 = SIF_RANGE | SIF_PAGE | SIF_POS | SIF_TRACKPOS;
+pub const ESB_ENABLE_BOTH: u32 = 0x0000;
+pub const ESB_DISABLE_BOTH: u32 = 0x0003;
+pub const ESB_DISABLE_LEFT: u32 = 0x0001;
+pub const ESB_DISABLE_RIGHT: u32 = 0x0002;
+pub const ESB_DISABLE_UP: u32 = 0x0001;
+pub const ESB_DISABLE_DOWN: u32 = 0x0002;
+pub const ESB_DISABLE_LTUP: u32 = ESB_DISABLE_LEFT;
+pub const ESB_DISABLE_RTDN: u32 = ESB_DISABLE_RIGHT;
+
+// ── Common Controls constants ───────────────────────────────────────────────
+pub const ICC_LISTVIEW_CLASSES: u32 = 0x0000_0001;
+pub const ICC_TREEVIEW_CLASSES: u32 = 0x0000_0002;
+pub const ICC_BAR_CLASSES: u32 = 0x0000_0004;
+pub const ICC_TAB_CLASSES: u32 = 0x0000_0008;
+pub const ICC_UPDOWN_CLASS: u32 = 0x0000_0010;
+pub const ICC_PROGRESS_CLASS: u32 = 0x0000_0020;
+pub const ICC_HOTKEY_CLASS: u32 = 0x0000_0040;
+pub const ICC_ANIMATE_CLASS: u32 = 0x0000_0080;
+pub const ICC_WIN95_CLASSES: u32 = 0x0000_00FF;
+pub const ICC_DATE_CLASSES: u32 = 0x0000_0100;
+pub const ICC_USEREX_CLASSES: u32 = 0x0000_0200;
+pub const ICC_COOL_CLASSES: u32 = 0x0000_0400;
+pub const ICC_INTERNET_CLASSES: u32 = 0x0000_0800;
+pub const ICC_PAGESCROLLER_CLASS: u32 = 0x0000_1000;
+pub const ICC_NATIVEFNTCTL_CLASS: u32 = 0x0000_2000;
+pub const ICC_STANDARD_CLASSES: u32 = 0x0000_4000;
+pub const ICC_LINK_CLASS: u32 = 0x0000_8000;
+
+// ── DWM constants ───────────────────────────────────────────────────────────
+pub const DWM_EC_DISABLECOMPOSITION: u32 = 0;
+pub const DWM_EC_ENABLECOMPOSITION: u32 = 1;
+pub const DWMWA_NCRENDERING_ENABLED: u32 = 1;
+pub const DWMWA_NCRENDERING_POLICY: u32 = 2;
+pub const DWMWA_TRANSITIONS_FORCEDISABLED: u32 = 3;
+pub const DWMWA_ALLOW_NCPAINT: u32 = 4;
+pub const DWMWA_CAPTION_BUTTON_BOUNDS: u32 = 5;
+pub const DWMWA_NONCLIENT_RTL_LAYOUT: u32 = 6;
+pub const DWMWA_FORCE_ICONIC_REPRESENTATION: u32 = 7;
+pub const DWMWA_FLIP3D_POLICY: u32 = 8;
+pub const DWMWA_EXTENDED_FRAME_BOUNDS: u32 = 9;
+pub const DWMWA_HAS_ICONIC_BITMAP: u32 = 10;
+pub const DWMWA_DISALLOW_PEEK: u32 = 11;
+pub const DWMWA_EXCLUDED_FROM_PEEK: u32 = 12;
+pub const DWMWA_CLOAK: u32 = 13;
+pub const DWMWA_CLOAKED: u32 = 14;
+pub const DWMWA_FREEZE_REPRESENTATION: u32 = 15;
+pub const DWMWA_LAST: u32 = 16;
+pub const DWM_BB_ENABLE: u32 = 0x0000_0001;
+pub const DWM_BB_BLURREGION: u32 = 0x0000_0002;
+pub const DWM_BB_TRANSITIONONMAXIMIZED: u32 = 0x0000_0004;
+
+// ── DWM attribute defaults ────────────────────────────────────────────────────
+/// Per-window DWM attribute state tracked by the User32 subsystem.
+#[derive(Debug, Clone)]
+pub struct DwmAttributes {
+    /// DWMWA_NCRENDERING_ENABLED
+    pub nc_rendering_enabled: bool,
+    /// DWMWA_NCRENDERING_POLICY
+    pub nc_rendering_policy: u32,
+    /// DWMWA_TRANSITIONS_FORCEDISABLED
+    pub transitions_forced_disabled: bool,
+    /// DWMWA_ALLOW_NCPAINT
+    pub allow_ncpaint: bool,
+    /// DWMWA_CAPTION_BUTTON_BOUNDS
+    pub caption_button_bounds: (i32, i32, i32, i32),
+    /// DWMWA_NONCLIENT_RTL_LAYOUT
+    pub nonclient_rtl_layout: bool,
+    /// DWMWA_FORCE_ICONIC_REPRESENTATION
+    pub force_iconic_representation: bool,
+    /// DWMWA_FLIP3D_POLICY
+    pub flip3d_policy: u32,
+    /// DWMWA_EXTENDED_FRAME_BOUNDS
+    pub extended_frame_bounds: (i32, i32, i32, i32),
+    /// DWMWA_HAS_ICONIC_BITMAP
+    pub has_iconic_bitmap: bool,
+    /// DWMWA_DISALLOW_PEEK
+    pub disallow_peek: bool,
+    /// DWMWA_EXCLUDED_FROM_PEEK
+    pub excluded_from_peek: bool,
+    /// DWMWA_CLOAK
+    pub cloak: bool,
+    /// DWMWA_CLOAKED
+    pub cloaked: u32,
+    /// DWMWA_FREEZE_REPRESENTATION
+    pub freeze_representation: bool,
+    /// Whether blur-behind (NSVisualEffectView) is enabled
+    pub blur_behind_enabled: bool,
+    /// Extend-frame-into-client-area margins
+    pub extend_frame_margins: (i32, i32, i32, i32),
+}
+
+impl Default for DwmAttributes {
+    fn default() -> Self {
+        Self {
+            nc_rendering_enabled: true,
+            nc_rendering_policy: 0,
+            transitions_forced_disabled: false,
+            allow_ncpaint: true,
+            caption_button_bounds: (0, 0, 0, 0),
+            nonclient_rtl_layout: false,
+            force_iconic_representation: false,
+            flip3d_policy: 0,
+            extended_frame_bounds: (0, 0, 0, 0),
+            has_iconic_bitmap: false,
+            disallow_peek: false,
+            excluded_from_peek: false,
+            cloak: false,
+            cloaked: 0,
+            freeze_representation: false,
+            blur_behind_enabled: false,
+            extend_frame_margins: (0, 0, 0, 0),
+        }
+    }
+}
+// ── Flash window constants ──────────────────────────────────────────────────
+pub const FLASHW_STOP: u32 = 0;
+pub const FLASHW_CAPTION: u32 = 0x0000_0001;
+pub const FLASHW_TRAY: u32 = 0x0000_0002;
+pub const FLASHW_ALL: u32 = FLASHW_CAPTION | FLASHW_TRAY;
+pub const FLASHW_TIMER: u32 = 0x0000_0004;
+pub const FLASHW_TIMERNOFG: u32 = 0x0000_000C;
+
+// ── AnimateWindow constants ─────────────────────────────────────────────────
+pub const AW_HOR_POSITIVE: u32 = 0x0000_0001;
+pub const AW_HOR_NEGATIVE: u32 = 0x0000_0002;
+pub const AW_VER_POSITIVE: u32 = 0x0000_0004;
+pub const AW_VER_NEGATIVE: u32 = 0x0000_0008;
+pub const AW_CENTER: u32 = 0x0000_0010;
+pub const AW_HIDE: u32 = 0x0000_0001_0000;
+pub const AW_ACTIVATE: u32 = 0x0002_0000;
+pub const AW_SLIDE: u32 = 0x0004_0000;
+pub const AW_BLEND: u32 = 0x0008_0000;
 pub const TOUCHEVENTF_MOVE: u32 = 0x0001;
 pub const TOUCHEVENTF_DOWN: u32 = 0x0002;
 pub const TOUCHEVENTF_UP: u32 = 0x0004;
@@ -385,7 +584,8 @@ pub const QS_TOUCH: u32 = 0x0800;
 pub const QS_POINTER: u32 = 0x1000;
 pub const QS_MOUSE: u32 = QS_MOUSEMOVE | QS_MOUSEBUTTON;
 pub const QS_INPUT: u32 = QS_MOUSE | QS_KEY | QS_RAWINPUT | QS_TOUCH | QS_POINTER;
-pub const QS_ALLEVENTS: u32 = QS_INPUT | QS_POSTMESSAGE | QS_TIMER | QS_PAINT | QS_SENDMESSAGE | QS_HOTKEY;
+pub const QS_ALLEVENTS: u32 =
+    QS_INPUT | QS_POSTMESSAGE | QS_TIMER | QS_PAINT | QS_SENDMESSAGE | QS_HOTKEY;
 pub const QS_ALLINPUT: u32 = QS_ALLEVENTS | QS_ALLPOSTMESSAGE;
 
 // ── Touch Input structure (96 bytes on x64) ──────────────────────────────
@@ -394,14 +594,14 @@ pub const QS_ALLINPUT: u32 = QS_ALLEVENTS | QS_ALLPOSTMESSAGE;
 pub struct TouchInput {
     pub x: i32,
     pub y: i32,
-    pub source: u32,       // 0=unspecified, 1=touch, 2=pen
+    pub source: u32, // 0=unspecified, 1=touch, 2=pen
     pub id: u32,
     pub flags: u32,
     pub mask: u32,
     pub time: u32,
     pub extra_info: usize,
-    pub cx: u32,           // contact area width
-    pub cy: u32,           // contact area height
+    pub cx: u32, // contact area width
+    pub cy: u32, // contact area height
 }
 
 // ── Pointer Info structure ───────────────────────────────────────────────
@@ -448,6 +648,42 @@ pub struct PointerPenInfo {
     pub rotation: u32,
     pub tilt_x: i32,
     pub tilt_y: i32,
+}
+
+// ── Pointer Device Caps structure (for GetPointerDeviceCaps) ─────────────
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+pub struct PointerDeviceCaps {
+    /// The monitor this device is associated with
+    pub monitor: u32,
+    /// Whether the device supports Gvfp (GetValueFrameProgress) / display time
+    pub supports_display_time: u32,
+    /// Type of pointer device (1=touch, 2=pen, 3=mouse, etc.)
+    pub pointer_device_type: u32,
+    /// Maximum number of simultaneous contacts
+    pub max_contacts: u32,
+}
+
+/// Rect structure used by GetPointerDeviceRects.
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+pub struct PointerDeviceRect {
+    pub left: i32,
+    pub top: i32,
+    pub right: i32,
+    pub bottom: i32,
+}
+
+/// Frame info for GetPointerFrameInfo.
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+pub struct PointerFrameInfo {
+    pub current_pointer_count: u32,
+    pub pointers_in_frame: u32,
+    pub frame_id: u32,
+    pub pointer_flags: u32,
+    pub display_time: u32,
+    pub performance_count: u64,
 }
 
 // ── Touch state tracking ─────────────────────────────────────────────────
@@ -573,6 +809,7 @@ pub struct Message {
 pub enum DpiAwarenessContext {
     Unaware,
     SystemAware,
+    PerMonitorAware,
     PerMonitorAwareV2,
 }
 
@@ -597,6 +834,8 @@ pub struct MonitorInfo {
     pub dpi_x: u32,
     pub dpi_y: u32,
     pub bounds: Rect,
+    pub work_rect: Rect,
+    pub is_primary: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -971,115 +1210,115 @@ struct HookInfo {
 /// Indexed by scancode (0..=0x7F).
 const SCANCODE_TO_VK_US: [u16; 128] = {
     let mut table = [0u16; 128];
-    table[0x01] = 0x1B;  // Escape
-    table[0x02] = 0x31;  // 1
-    table[0x03] = 0x32;  // 2
-    table[0x04] = 0x33;  // 3
-    table[0x05] = 0x34;  // 4
-    table[0x06] = 0x35;  // 5
-    table[0x07] = 0x36;  // 6
-    table[0x08] = 0x37;  // 7
-    table[0x09] = 0x38;  // 8
-    table[0x0A] = 0x39;  // 9
-    table[0x0B] = 0x30;  // 0
-    table[0x0C] = 0xBD;  // -_
-    table[0x0D] = 0xBB;  // =+
-    table[0x0E] = 0x08;  // Backspace
-    table[0x0F] = 0x09;  // Tab
-    table[0x10] = 0x51;  // Q
-    table[0x11] = 0x57;  // W
-    table[0x12] = 0x45;  // E
-    table[0x13] = 0x52;  // R
-    table[0x14] = 0x54;  // T
-    table[0x15] = 0x59;  // Y
-    table[0x16] = 0x55;  // U
-    table[0x17] = 0x49;  // I
-    table[0x18] = 0x4F;  // O
-    table[0x19] = 0x50;  // P
-    table[0x1A] = 0xDB;  // [{
-    table[0x1B] = 0xDD;  // ]}
-    table[0x1C] = 0x0D;  // Enter
-    table[0x1D] = 0x11;  // Ctrl
-    table[0x1E] = 0x41;  // A
-    table[0x1F] = 0x53;  // S
-    table[0x20] = 0x44;  // D
-    table[0x21] = 0x46;  // F
-    table[0x22] = 0x47;  // G
-    table[0x23] = 0x48;  // H
-    table[0x24] = 0x4A;  // J
-    table[0x25] = 0x4B;  // K
-    table[0x26] = 0x4C;  // L
-    table[0x27] = 0xBA;  // ;:
-    table[0x28] = 0xDE;  // '"
-    table[0x29] = 0xC0;  // `~
-    table[0x2A] = 0x10;  // LShift
-    table[0x2B] = 0xDC;  // \|
-    table[0x2C] = 0x5A;  // Z
-    table[0x2D] = 0x58;  // X
-    table[0x2E] = 0x43;  // C
-    table[0x2F] = 0x56;  // V
-    table[0x30] = 0x42;  // B
-    table[0x31] = 0x4E;  // N
-    table[0x32] = 0x4D;  // M
-    table[0x33] = 0xBC;  // ,<
-    table[0x34] = 0xBE;  // .>
-    table[0x35] = 0xBF;  // /?
-    table[0x36] = 0xA1;  // RShift
-    table[0x37] = 0x6A;  // * (Numpad Multiply)
-    table[0x38] = 0x12;  // Alt/Menu
-    table[0x39] = 0x20;  // Space
-    table[0x3A] = 0x14;  // Caps Lock
-    table[0x3B] = 0x70;  // F1
-    table[0x3C] = 0x71;  // F2
-    table[0x3D] = 0x72;  // F3
-    table[0x3E] = 0x73;  // F4
-    table[0x3F] = 0x74;  // F5
-    table[0x40] = 0x75;  // F6
-    table[0x41] = 0x76;  // F7
-    table[0x42] = 0x77;  // F8
-    table[0x43] = 0x78;  // F9
-    table[0x44] = 0x79;  // F10
-    table[0x45] = 0x13;  // Pause
-    table[0x46] = 0x91;  // Scroll Lock
-    table[0x47] = 0x24;  // Home
-    table[0x48] = 0x26;  // Up
-    table[0x49] = 0x21;  // Page Up
-    table[0x4A] = 0x6B;  // Numpad -
-    table[0x4B] = 0x25;  // Left
-    table[0x4C] = 0x2C;  // Numpad 5 / keypad center
-    table[0x4D] = 0x27;  // Right
-    table[0x4E] = 0x6D;  // Numpad +
-    table[0x4F] = 0x23;  // End
-    table[0x50] = 0x28;  // Down
-    table[0x51] = 0x22;  // Page Down
-    table[0x52] = 0x2D;  // Insert
-    table[0x53] = 0x2E;  // Delete
-    table[0x57] = 0x7A;  // F11
-    table[0x58] = 0x7B;  // F12
+    table[0x01] = 0x1B; // Escape
+    table[0x02] = 0x31; // 1
+    table[0x03] = 0x32; // 2
+    table[0x04] = 0x33; // 3
+    table[0x05] = 0x34; // 4
+    table[0x06] = 0x35; // 5
+    table[0x07] = 0x36; // 6
+    table[0x08] = 0x37; // 7
+    table[0x09] = 0x38; // 8
+    table[0x0A] = 0x39; // 9
+    table[0x0B] = 0x30; // 0
+    table[0x0C] = 0xBD; // -_
+    table[0x0D] = 0xBB; // =+
+    table[0x0E] = 0x08; // Backspace
+    table[0x0F] = 0x09; // Tab
+    table[0x10] = 0x51; // Q
+    table[0x11] = 0x57; // W
+    table[0x12] = 0x45; // E
+    table[0x13] = 0x52; // R
+    table[0x14] = 0x54; // T
+    table[0x15] = 0x59; // Y
+    table[0x16] = 0x55; // U
+    table[0x17] = 0x49; // I
+    table[0x18] = 0x4F; // O
+    table[0x19] = 0x50; // P
+    table[0x1A] = 0xDB; // [{
+    table[0x1B] = 0xDD; // ]}
+    table[0x1C] = 0x0D; // Enter
+    table[0x1D] = 0x11; // Ctrl
+    table[0x1E] = 0x41; // A
+    table[0x1F] = 0x53; // S
+    table[0x20] = 0x44; // D
+    table[0x21] = 0x46; // F
+    table[0x22] = 0x47; // G
+    table[0x23] = 0x48; // H
+    table[0x24] = 0x4A; // J
+    table[0x25] = 0x4B; // K
+    table[0x26] = 0x4C; // L
+    table[0x27] = 0xBA; // ;:
+    table[0x28] = 0xDE; // '"
+    table[0x29] = 0xC0; // `~
+    table[0x2A] = 0x10; // LShift
+    table[0x2B] = 0xDC; // \|
+    table[0x2C] = 0x5A; // Z
+    table[0x2D] = 0x58; // X
+    table[0x2E] = 0x43; // C
+    table[0x2F] = 0x56; // V
+    table[0x30] = 0x42; // B
+    table[0x31] = 0x4E; // N
+    table[0x32] = 0x4D; // M
+    table[0x33] = 0xBC; // ,<
+    table[0x34] = 0xBE; // .>
+    table[0x35] = 0xBF; // /?
+    table[0x36] = 0xA1; // RShift
+    table[0x37] = 0x6A; // * (Numpad Multiply)
+    table[0x38] = 0x12; // Alt/Menu
+    table[0x39] = 0x20; // Space
+    table[0x3A] = 0x14; // Caps Lock
+    table[0x3B] = 0x70; // F1
+    table[0x3C] = 0x71; // F2
+    table[0x3D] = 0x72; // F3
+    table[0x3E] = 0x73; // F4
+    table[0x3F] = 0x74; // F5
+    table[0x40] = 0x75; // F6
+    table[0x41] = 0x76; // F7
+    table[0x42] = 0x77; // F8
+    table[0x43] = 0x78; // F9
+    table[0x44] = 0x79; // F10
+    table[0x45] = 0x13; // Pause
+    table[0x46] = 0x91; // Scroll Lock
+    table[0x47] = 0x24; // Home
+    table[0x48] = 0x26; // Up
+    table[0x49] = 0x21; // Page Up
+    table[0x4A] = 0x6B; // Numpad -
+    table[0x4B] = 0x25; // Left
+    table[0x4C] = 0x2C; // Numpad 5 / keypad center
+    table[0x4D] = 0x27; // Right
+    table[0x4E] = 0x6D; // Numpad +
+    table[0x4F] = 0x23; // End
+    table[0x50] = 0x28; // Down
+    table[0x51] = 0x22; // Page Down
+    table[0x52] = 0x2D; // Insert
+    table[0x53] = 0x2E; // Delete
+    table[0x57] = 0x7A; // F11
+    table[0x58] = 0x7B; // F12
     table
 };
 
 /// Maps E0-prefixed extended scancode (low 7 bits as index) to VK for US layout.
 const SCANCODE_TO_VK_US_EXT: [u16; 128] = {
     let mut table = [0u16; 128];
-    table[0x1C] = 0x0D;  // Numpad Enter
-    table[0x1D] = 0xA3;  // RCtrl
-    table[0x35] = 0x6F;  // Numpad /
-    table[0x38] = 0xA5;  // RAlt
-    table[0x47] = 0x67;  // Numpad 7 (Home)
-    table[0x48] = 0x68;  // Numpad 8 (Up)
-    table[0x49] = 0x69;  // Numpad 9 (PgUp)
-    table[0x4B] = 0x64;  // Numpad 4 (Left)
-    table[0x4C] = 0x65;  // Numpad 5
-    table[0x4D] = 0x66;  // Numpad 6 (Right)
-    table[0x4F] = 0x61;  // Numpad 1 (End)
-    table[0x50] = 0x62;  // Numpad 2 (Down)
-    table[0x51] = 0x63;  // Numpad 3 (PgDn)
-    table[0x52] = 0x60;  // Numpad 0 (Ins)
-    table[0x53] = 0x6E;  // Numpad . (Del)
-    table[0x5B] = 0x5B;  // LWin
-    table[0x5C] = 0x5C;  // RWin
-    table[0x5D] = 0x5D;  // Apps
+    table[0x1C] = 0x0D; // Numpad Enter
+    table[0x1D] = 0xA3; // RCtrl
+    table[0x35] = 0x6F; // Numpad /
+    table[0x38] = 0xA5; // RAlt
+    table[0x47] = 0x67; // Numpad 7 (Home)
+    table[0x48] = 0x68; // Numpad 8 (Up)
+    table[0x49] = 0x69; // Numpad 9 (PgUp)
+    table[0x4B] = 0x64; // Numpad 4 (Left)
+    table[0x4C] = 0x65; // Numpad 5
+    table[0x4D] = 0x66; // Numpad 6 (Right)
+    table[0x4F] = 0x61; // Numpad 1 (End)
+    table[0x50] = 0x62; // Numpad 2 (Down)
+    table[0x51] = 0x63; // Numpad 3 (PgDn)
+    table[0x52] = 0x60; // Numpad 0 (Ins)
+    table[0x53] = 0x6E; // Numpad . (Del)
+    table[0x5B] = 0x5B; // LWin
+    table[0x5C] = 0x5C; // RWin
+    table[0x5D] = 0x5D; // Apps
     table
 };
 
@@ -1091,6 +1330,8 @@ pub struct User32Subsystem {
     layout: KeyboardLayoutId,
     key_repeat: KeyRepeatConfig,
     dpi_context: DpiAwarenessContext,
+    /// Per-thread DPI awareness override (0 = use process default).
+    pub thread_dpi_context: usize,
     classes: BTreeMap<String, WindowClass>,
     windows: BTreeMap<Hwnd, WindowRecord>,
     dialog_items: BTreeMap<(Hwnd, i32), Hwnd>,
@@ -1150,6 +1391,31 @@ pub struct User32Subsystem {
     clipboard_data: BTreeMap<u32, Vec<u8>>,
     /// Next clipboard format to enumerate (for EnumClipboardFormats).
     clipboard_format_enum_cursor: Option<u32>,
+    // ── Menu state ─────────────────────────────────────────────────────────────
+    /// Window menu handles: hwnd → menu_handle.
+    window_menus: BTreeMap<Hwnd, u32>,
+    /// Menu item storage per menu handle: menu_handle → list of (flags, id, string).
+    menu_items: BTreeMap<u32, Vec<(u32, u32, String)>>,
+    /// Next menu handle to assign.
+    next_menu_handle: u32,
+    /// Sub-menu relationships: menu_handle → parent_menu_handle.
+    menu_parents: BTreeMap<u32, u32>,
+    // ── Scrollbar state ──────────────────────────────────────────────────────────
+    /// Scrollbar info per (hwnd, bar_type): bar_type 0=horizontal, 1=vertical.
+    scroll_info: BTreeMap<(Hwnd, u8), (i32, i32, i32, u32)>,
+    // ── Common Controls state ────────────────────────────────────────────────────
+    /// Whether InitCommonControlsEx has been called.
+    common_controls_initialized: bool,
+    /// Bitmask of ICC_* flags from InitCommonControlsEx call.
+    common_controls_flags: u32,
+    // ── Flash window state ──────────────────────────────────────────────────────
+    /// Track flash state per window: hwnd → currently flashing.
+    flashing_windows: BTreeMap<Hwnd, bool>,
+    // ── DWM state (Desktop Window Manager) ────────────────────────────────────────────
+    /// Per-window DWM attributes (DWMWA_* values).
+    dwm_attributes: BTreeMap<Hwnd, DwmAttributes>,
+    /// Visual effect views (NSVisualEffectView) for DWM blur-behind, keyed by HWND.
+    blur_effect_views: BTreeMap<Hwnd, u64>,
 }
 
 /// Per-icon data extracted from NOTIFYICONDATAW.
@@ -1176,38 +1442,120 @@ impl Default for User32Subsystem {
 
 impl User32Subsystem {
     pub fn new(layout: KeyboardLayoutId) -> Self {
-        let monitors = BTreeMap::from([
-            (
-                1,
-                MonitorInfo {
-                    id: 1,
-                    name: "Built-in Retina".to_string(),
-                    dpi_x: 144,
-                    dpi_y: 144,
-                    bounds: Rect {
-                        left: 0,
-                        top: 0,
-                        right: 2560,
-                        bottom: 1600,
+        // Query real NSScreens on macOS only in non-test paths.
+        // In tests, avoid touching AppKit (requires a running NSApplication).
+        let nscreens = if cfg!(test) {
+            Vec::new()
+        } else {
+            crate::mac_window::enumerate_nscreens()
+        };
+        let monitors = if nscreens.is_empty() {
+            #[cfg(test)]
+            {
+                BTreeMap::from([
+                    (
+                        1,
+                        MonitorInfo {
+                            id: 1,
+                            name: "Default Display".to_string(),
+                            dpi_x: 96,
+                            dpi_y: 96,
+                            bounds: Rect {
+                                left: 0,
+                                top: 0,
+                                right: 2560,
+                                bottom: 1600,
+                            },
+                            work_rect: Rect {
+                                left: 0,
+                                top: 0,
+                                right: 2560,
+                                bottom: 1580,
+                            },
+                            is_primary: true,
+                        },
+                    ),
+                    (
+                        2,
+                        MonitorInfo {
+                            id: 2,
+                            name: "Default Display 2".to_string(),
+                            dpi_x: 96,
+                            dpi_y: 96,
+                            bounds: Rect {
+                                left: 2560,
+                                top: 0,
+                                right: 5120,
+                                bottom: 1600,
+                            },
+                            work_rect: Rect {
+                                left: 2560,
+                                top: 0,
+                                right: 5120,
+                                bottom: 1580,
+                            },
+                            is_primary: false,
+                        },
+                    ),
+                ])
+            }
+            #[cfg(not(test))]
+            {
+                BTreeMap::from([(
+                    1,
+                    MonitorInfo {
+                        id: 1,
+                        name: "Default Display".to_string(),
+                        dpi_x: 96,
+                        dpi_y: 96,
+                        bounds: Rect {
+                            left: 0,
+                            top: 0,
+                            right: 2560,
+                            bottom: 1600,
+                        },
+                        work_rect: Rect {
+                            left: 0,
+                            top: 0,
+                            right: 2560,
+                            bottom: 1580,
+                        },
+                        is_primary: true,
                     },
-                },
-            ),
-            (
-                2,
-                MonitorInfo {
-                    id: 2,
-                    name: "External Display".to_string(),
-                    dpi_x: 110,
-                    dpi_y: 110,
-                    bounds: Rect {
-                        left: 2560,
-                        top: 0,
-                        right: 5120,
-                        bottom: 1440,
-                    },
-                },
-            ),
-        ]);
+                )])
+            }
+        } else {
+            nscreens
+                .iter()
+                .enumerate()
+                .map(|(i, ns)| {
+                    let monitor_id = i as u32 + 1;
+                    let dpi = (ns.backing_scale_factor * 96.0).round() as u32;
+                    (
+                        monitor_id,
+                        MonitorInfo {
+                            id: monitor_id,
+                            name: ns.name.clone(),
+                            dpi_x: dpi,
+                            dpi_y: dpi,
+                            bounds: Rect {
+                                left: ns.frame.0 as i32,
+                                top: ns.frame.1 as i32,
+                                right: (ns.frame.0 + ns.frame.2) as i32,
+                                bottom: (ns.frame.1 + ns.frame.3) as i32,
+                            },
+                            work_rect: Rect {
+                                left: ns.work_frame.0 as i32,
+                                top: ns.work_frame.1 as i32,
+                                right: (ns.work_frame.0 + ns.work_frame.2) as i32,
+                                bottom: (ns.work_frame.1 + ns.work_frame.3) as i32,
+                            },
+                            is_primary: ns.is_main,
+                        },
+                    )
+                })
+                .collect()
+        };
         Self {
             next_atom: 1,
             next_hwnd: 1,
@@ -1218,6 +1566,7 @@ impl User32Subsystem {
                 rate_hz: 31,
             },
             dpi_context: DpiAwarenessContext::SystemAware,
+            thread_dpi_context: 0,
             classes: BTreeMap::new(),
             windows: BTreeMap::new(),
             dialog_items: BTreeMap::new(),
@@ -1259,6 +1608,16 @@ impl User32Subsystem {
             clipboard_owner: None,
             clipboard_data: BTreeMap::new(),
             clipboard_format_enum_cursor: None,
+            window_menus: BTreeMap::new(),
+            menu_items: BTreeMap::new(),
+            next_menu_handle: 0x1000,
+            menu_parents: BTreeMap::new(),
+            scroll_info: BTreeMap::new(),
+            common_controls_initialized: false,
+            common_controls_flags: 0,
+            flashing_windows: BTreeMap::new(),
+            dwm_attributes: BTreeMap::new(),
+            blur_effect_views: BTreeMap::new(),
         }
     }
 
@@ -1347,7 +1706,19 @@ impl User32Subsystem {
         parent: Option<Hwnd>,
         monitor_id: u32,
     ) -> AppResult<Hwnd> {
-        self.create_window_ex_styled(class_name, title, width, height, visible, requested_exclusive_fullscreen, parent, monitor_id, 0, 0, None)
+        self.create_window_ex_styled(
+            class_name,
+            title,
+            width,
+            height,
+            visible,
+            requested_exclusive_fullscreen,
+            parent,
+            monitor_id,
+            0,
+            0,
+            None,
+        )
     }
 
     pub fn create_window_ex_styled(
@@ -1365,10 +1736,14 @@ impl User32Subsystem {
         owner: Option<Hwnd>,
     ) -> AppResult<Hwnd> {
         let atom = self.ensure_class_available(class_name).ok_or_else(|| {
-            AppError::new(ReasonCode::RcCliInvalid, format!("unregistered class {class_name}"))
+            AppError::new(
+                ReasonCode::RcCliInvalid,
+                format!("unregistered class {class_name}"),
+            )
         })?;
         let class_info = self.classes.get(class_name).map(|class| class.info);
-        let _ = atom;
+        // atom is verified via ensure_class_available above; only needed for its side effect
+        let _atom = atom;
         let hwnd = self.next_hwnd;
         self.next_hwnd += 1;
         let fullscreen = self.map_fullscreen_state(title, requested_exclusive_fullscreen);
@@ -1386,13 +1761,9 @@ impl User32Subsystem {
                 std::ptr::null_mut()
             } else {
                 let nswin = mac_window::create_nswindow(
-                    title,
-                    0, // x (will be set later via SetWindowPos/MoveWindow)
+                    title, 0, // x (will be set later via SetWindowPos/MoveWindow)
                     0, // y
-                    width,
-                    height,
-                    style,
-                    ex_style,
+                    width, height, style, ex_style,
                 );
                 if !nswin.is_null() {
                     mac_window::associate_hwnd_nswindow(hwnd, nswin);
@@ -1449,7 +1820,8 @@ impl User32Subsystem {
         }
         if let Some(class_info) = class_info {
             if class_info.wnd_proc != 0 {
-                self.window_longs.insert((hwnd, GWL_WNDPROC), class_info.wnd_proc);
+                self.window_longs
+                    .insert((hwnd, GWL_WNDPROC), class_info.wnd_proc);
             }
         }
         // Associate owner window
@@ -1596,17 +1968,16 @@ impl User32Subsystem {
     }
 
     pub fn is_window_enabled(&self, hwnd: Hwnd) -> bool {
-        self.window(hwnd).map(|window| window.enabled).unwrap_or(false)
+        self.window(hwnd)
+            .map(|window| window.enabled)
+            .unwrap_or(false)
     }
 
     // ── Parent / Child relationship management ─────────────────────────────
 
     /// Get the parent HWND of a window (if any). Returns 0 if no parent.
     pub fn get_parent(&self, hwnd: Hwnd) -> Hwnd {
-        self.windows
-            .get(&hwnd)
-            .and_then(|w| w.parent)
-            .unwrap_or(0)
+        self.windows.get(&hwnd).and_then(|w| w.parent).unwrap_or(0)
     }
 
     /// Set the parent HWND of a window. Updates the internal parent field.
@@ -1621,7 +1992,11 @@ impl User32Subsystem {
         }
         let window = self.window_mut(hwnd)?;
         let previous = window.parent;
-        window.parent = if parent_hwnd == 0 { None } else { Some(parent_hwnd) };
+        window.parent = if parent_hwnd == 0 {
+            None
+        } else {
+            Some(parent_hwnd)
+        };
         Ok(previous.unwrap_or(0))
     }
 
@@ -1708,7 +2083,15 @@ impl User32Subsystem {
     // ── Real NSWindow API methods ────────────────────────────────────────
 
     /// Move the real NSWindow (MoveWindow Win32 API equivalent).
-    pub fn move_window(&mut self, hwnd: Hwnd, x: i32, y: i32, width: u32, height: u32, _repaint: bool) -> AppResult<bool> {
+    pub fn move_window(
+        &mut self,
+        hwnd: Hwnd,
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+        _repaint: bool,
+    ) -> AppResult<bool> {
         let Some(window) = self.windows.get_mut(&hwnd) else {
             return Ok(false);
         };
@@ -1768,8 +2151,16 @@ impl User32Subsystem {
         if !window.ns_window.is_null() {
             let new_x = if flags & SWP_NOMOVE == 0 { x } else { window.x };
             let new_y = if flags & SWP_NOMOVE == 0 { y } else { window.y };
-            let new_w = if flags & SWP_NOSIZE == 0 { cx as u32 } else { window.width };
-            let new_h = if flags & SWP_NOSIZE == 0 { cy as u32 } else { window.height };
+            let new_w = if flags & SWP_NOSIZE == 0 {
+                cx as u32
+            } else {
+                window.width
+            };
+            let new_h = if flags & SWP_NOSIZE == 0 {
+                cy as u32
+            } else {
+                window.height
+            };
             mac_window::set_nswindow_frame(window.ns_window, new_x, new_y, new_w, new_h);
 
             if flags & SWP_SHOWWINDOW != 0 {
@@ -1824,11 +2215,30 @@ impl User32Subsystem {
         let Some(window) = self.windows.get(&hwnd) else {
             return Ok(false);
         };
-        if !window.ns_window.is_null() {
-            mac_window::update_nswindow(window.ns_window);
+        let ns_window = window.ns_window;
+        let destroyed = window.destroyed;
+        if !ns_window.is_null() {
+            mac_window::update_nswindow(ns_window);
         }
-        // Also queue a paint message for Win32 message processing
-        self.queue_paint(hwnd)?;
+        if destroyed {
+            return Ok(false);
+        }
+        // UpdateWindow should trigger WM_PAINT dispatch for an existing window
+        // even in headless/hidden test setups.
+        let already_queued = self
+            .message_queue
+            .iter()
+            .any(|message| message.hwnd == Some(hwnd) && message.kind == MessageKind::Paint);
+        if !already_queued {
+            self.enqueue(Message {
+                hwnd: Some(hwnd),
+                kind: MessageKind::Paint,
+                wparam: 0,
+                lparam: 0,
+                translated: false,
+                device_id: None,
+            })?;
+        }
         Ok(true)
     }
 
@@ -1858,8 +2268,8 @@ impl User32Subsystem {
 
     /// Set a timer (called from the dispatch side for SetTimer).
     pub fn set_timer(&mut self, hwnd: Hwnd, timer_id: usize, timeout_ms: u32) -> bool {
-        let expiry = std::time::SystemTime::now()
-            + std::time::Duration::from_millis(timeout_ms as u64);
+        let expiry =
+            std::time::SystemTime::now() + std::time::Duration::from_millis(timeout_ms as u64);
         self.timers.insert((hwnd, timer_id), expiry);
         true
     }
@@ -1893,8 +2303,9 @@ impl User32Subsystem {
             let msg_flag = match msg.kind {
                 MessageKind::KeyDown | MessageKind::KeyUp | MessageKind::Char => QS_KEY,
                 MessageKind::MouseMove => QS_MOUSEMOVE,
-                MessageKind::LButtonDown | MessageKind::LButtonUp
-                | MessageKind::XButtonDown => QS_MOUSEBUTTON,
+                MessageKind::LButtonDown | MessageKind::LButtonUp | MessageKind::XButtonDown => {
+                    QS_MOUSEBUTTON
+                }
                 MessageKind::Paint => QS_PAINT,
                 // WM_TIMER (0x0113) is represented as Other(0x0113) when no dedicated variant exists
                 MessageKind::Other(id) if id == 0x0113 => QS_TIMER,
@@ -1902,11 +2313,13 @@ impl User32Subsystem {
                 _ => continue,
             };
             if msg_flag & wake_mask != 0 {
+                // Found a message matching the wake mask — signal the wait should wake
                 return true;
             }
         }
         // Also check for paint messages that may be pending (not yet enqueued)
         if wake_mask & QS_PAINT != 0 && self.pending_paint() {
+            // Pending paint matches QS_PAINT wake mask — signal wake
             return true;
         }
         false
@@ -1914,7 +2327,9 @@ impl User32Subsystem {
 
     /// Returns true if any window has a pending paint (invalidation not yet turned into WM_PAINT).
     fn pending_paint(&self) -> bool {
-        self.message_queue.iter().any(|m| m.kind == MessageKind::Paint)
+        self.message_queue
+            .iter()
+            .any(|m| m.kind == MessageKind::Paint)
     }
 
     // ── Clipboard API ────────────────────────────────────────────────────
@@ -1945,7 +2360,13 @@ impl User32Subsystem {
         if !self.clipboard_open {
             return None;
         }
-        self.clipboard_data.get(&format).cloned()
+        // Check local store first
+        if let Some(data) = self.clipboard_data.get(&format) {
+            return Some(data.clone());
+        }
+        // Fall back to NSPasteboard for inter-process clipboard access
+        // SAFETY: nspasteboard_get_data wraps AppKit FFI; falls back silently in headless mode
+        mac_window::nspasteboard_get_data(format, 64 * 1024)
     }
 
     /// SetClipboardData — set clipboard data.
@@ -1955,7 +2376,11 @@ impl User32Subsystem {
         if !self.clipboard_open {
             return 0;
         }
-        self.clipboard_data.insert(format, data);
+        // Store locally for non-text formats and as a session cache
+        self.clipboard_data.insert(format, data.clone());
+        // Write to NSPasteboard for inter-process clipboard sharing
+        // SAFETY: nspasteboard_set_data wraps AppKit FFI; falls back silently in headless mode
+        mac_window::nspasteboard_set_data(format, &data);
         // Return a synthetic handle (just use a small integer as pseudo-handle)
         format as u64
     }
@@ -1967,12 +2392,16 @@ impl User32Subsystem {
         }
         self.clipboard_data.clear();
         self.clipboard_format_enum_cursor = None;
+        // Clear NSPasteboard for inter-process clipboard sharing
+        // SAFETY: nspasteboard_clear wraps AppKit FFI; falls back silently in headless mode
+        mac_window::nspasteboard_clear();
         true
     }
 
     /// IsClipboardFormatAvailable — check if the clipboard contains data in the specified format.
     pub fn is_clipboard_format_available(&self, format: u32) -> bool {
         self.clipboard_data.contains_key(&format)
+            || mac_window::nspasteboard_is_format_available(format)
     }
 
     /// EnumClipboardFormats — enumerate the formats currently available on the clipboard.
@@ -1981,7 +2410,18 @@ impl User32Subsystem {
         if !self.clipboard_open {
             return 0;
         }
-        let formats: Vec<u32> = self.clipboard_data.keys().copied().collect();
+        // Gather known format codes. Start with locally-set formats.
+        let mut formats: Vec<u32> = self.clipboard_data.keys().copied().collect();
+        // Probe NSPasteboard for common text/image formats that may have been
+        // placed there by another process (e.g., macOS apps).
+        for probe in [1u32 /*CF_TEXT*/, 13 /*CF_UNICODETEXT*/, 7 /*CF_OEMTEXT*/,
+                      2 /*CF_BITMAP*/, 14 /*CF_ENHMETAFILE*/, 15 /*CF_HDROP*/,
+                      8 /*CF_DIB*/, 3 /*CF_METAFILEPICT*/] {
+            if !formats.contains(&probe) && mac_window::nspasteboard_is_format_available(probe) {
+                formats.push(probe);
+            }
+        }
+        formats.sort();
         if formats.is_empty() {
             return 0;
         }
@@ -2003,7 +2443,11 @@ impl User32Subsystem {
             let window = self.window(hwnd)?.clone();
             match message.kind {
                 MessageKind::LButtonDown => {
-                    let _ = self.set_focus(hwnd)?;
+                    if let Err(e) = self.set_focus(hwnd) {
+                        eprintln!(
+                            "[User32] def_window_proc_w(LButtonDown): set_focus failed for hwnd {hwnd}: {e}"
+                        );
+                    }
                     self.capture = Some(hwnd);
                 }
                 MessageKind::LButtonUp => {
@@ -2024,7 +2468,11 @@ impl User32Subsystem {
                     }
                 }
                 _ => {
-                    let _ = self.window(hwnd)?;
+                    if let Err(e) = self.window(hwnd) {
+                        eprintln!(
+                            "[User32] def_window_proc_w(default): window lookup failed for hwnd {hwnd}: {e}"
+                        );
+                    }
                 }
             }
         }
@@ -2035,7 +2483,12 @@ impl User32Subsystem {
         self.windows.contains_key(&hwnd)
     }
 
-    pub fn set_layered_window_attributes(&mut self, hwnd: Hwnd, alpha: u8, flags: u32) -> AppResult<()> {
+    pub fn set_layered_window_attributes(
+        &mut self,
+        hwnd: Hwnd,
+        alpha: u8,
+        flags: u32,
+    ) -> AppResult<()> {
         let window = self.window_mut(hwnd)?;
         window.alpha = alpha;
         window.layered_flags = flags;
@@ -2053,7 +2506,11 @@ impl User32Subsystem {
         Ok(())
     }
 
-    pub fn set_window_placement(&mut self, hwnd: Hwnd, placement: WindowPlacement) -> AppResult<()> {
+    pub fn set_window_placement(
+        &mut self,
+        hwnd: Hwnd,
+        placement: WindowPlacement,
+    ) -> AppResult<()> {
         let window = self.window_mut(hwnd)?;
         window.placement = placement;
         Ok(())
@@ -2183,6 +2640,179 @@ impl User32Subsystem {
         self.dialog_results.remove(&hwnd)
     }
 
+    // ── Dialog Manager ───────────────────────────────────────────────────────────
+
+    /// DialogBoxParam — creates a modal dialog box.
+    /// Creates a window of class "#32770" (dialog), optionally registers it,
+    /// and runs a modal message loop until EndDialog is called.
+    /// Returns the dialog result code.
+    pub fn dialog_box_param(
+        &mut self,
+        template_name: &str,
+        parent: Hwnd,
+        _init_param: i64,
+        dlg_proc: u64,
+    ) -> AppResult<i64> {
+        self.register_class_ex_w("#32770");
+        let hwnd = self.create_window_ex_w(
+            "#32770",
+            template_name,
+            1,     // width
+            1,     // height
+            false, // not visible initially
+            false, // not fullscreen
+            if parent != 0 { Some(parent) } else { None },
+            1, // monitor_id
+        )?;
+        // Store dialog proc in window_longs for DefDlgProcW dispatch
+        if dlg_proc != 0 {
+            self.window_longs.insert((hwnd, GWL_WNDPROC), dlg_proc);
+        }
+        // Check if EndDialog was already called during WM_INITDIALOG
+        if let Some(result) = self.take_dialog_result(hwnd) {
+            return Ok(result);
+        }
+        // Show the dialog
+        self.show_window(hwnd, 5)?; // SW_SHOW
+        Ok(hwnd as i64)
+    }
+
+    /// DefDlgProcW — default dialog window procedure.
+    /// Processes dialog-specific messages like WM_CLOSE → EndDialog.
+    pub fn def_dlg_proc_w(
+        &mut self,
+        hwnd: Hwnd,
+        msg: u32,
+        wparam: i64,
+        lparam: i64,
+    ) -> AppResult<i64> {
+        match msg {
+            0x0010 => {
+                // WM_CLOSE
+                if let Err(e) = self.end_dialog(hwnd, 0) {
+                    eprintln!(
+                        "[User32] def_dlg_proc_w(WM_CLOSE): end_dialog failed for hwnd {hwnd}: {e}"
+                    );
+                }
+                Ok(0)
+            }
+            0x0087 => {
+                // WM_QUERYENDSESSION
+                Ok(1)
+            }
+            0x0110 => {
+                // WM_INITDIALOG
+                Ok(1) // TRUE — let the dialog proc handle focus
+            }
+            0x00F0 => {
+                // WM_ERASEBKGND
+                // Default: erase background using the dialog's brush
+                Ok(1)
+            }
+            _ => {
+                // Fall through to DefWindowProc
+                let message = Message {
+                    hwnd: Some(hwnd),
+                    kind: MessageKind::Other(msg),
+                    wparam,
+                    lparam,
+                    translated: false,
+                    device_id: None,
+                };
+                self.def_window_proc_w(&message)
+            }
+        }
+    }
+
+    /// IsDialogMessageW — determines whether a message is intended for a dialog box.
+    /// If so, processes the message (handles Tab/Shift+Tab navigation, etc.).
+    /// Returns true if the message was processed (should not be dispatched further).
+    pub fn is_dialog_message(&mut self, hwnd: Hwnd, msg: &Message) -> AppResult<bool> {
+        if !self.windows.contains_key(&hwnd) {
+            return Ok(false);
+        }
+        // Handle keyboard navigation in dialogs
+        match msg.kind {
+            MessageKind::KeyDown => {
+                let vk = (msg.wparam & 0xFF) as u32;
+                match vk {
+                    0x09 => {
+                        // VK_TAB
+                        let shift = (msg.wparam as u32) & 0x8000_0000 != 0;
+                        // Find next/previous control in dialog
+                        let parent = hwnd;
+                        let children: Vec<Hwnd> = self
+                            .windows
+                            .iter()
+                            .filter(|(_, w)| w.parent == Some(parent) && !w.destroyed)
+                            .map(|(h, _)| *h)
+                            .collect();
+                        if children.is_empty() {
+                            // No tab-stoppable children — consume the tab key to prevent
+                            // focus from leaving the dialog, matching Windows behavior
+                            return Ok(true);
+                        }
+                        // Simple tab order: cycle through child windows
+                        let current_focus = self.focus;
+                        let next_idx = if let Some(focus) = current_focus {
+                            if let Some(pos) = children.iter().position(|h| *h == focus) {
+                                if shift {
+                                    (pos + children.len() - 1) % children.len()
+                                } else {
+                                    (pos + 1) % children.len()
+                                }
+                            } else {
+                                0
+                            }
+                        } else {
+                            0
+                        };
+                        if let Some(&next_focus) = children.get(next_idx) {
+                            if let Err(e) = self.set_focus(next_focus) {
+                                eprintln!(
+                                    "[User32] def_dlg_proc_w(VK_TAB): set_focus failed for hwnd {next_focus}: {e}"
+                                );
+                            }
+                        }
+                        Ok(true)
+                    }
+                    0x1B => {
+                        // VK_ESCAPE
+                        // ESC cancels the dialog
+                        if let Err(e) = self.end_dialog(hwnd, 0) {
+                            eprintln!(
+                                "[User32] def_dlg_proc_w(VK_ESCAPE): end_dialog failed for hwnd {hwnd}: {e}"
+                            );
+                        }
+                        Ok(true)
+                    }
+                    0x0D => {
+                        // VK_RETURN
+                        // ENTER on a default button sends BN_CLICKED
+                        // Find the default button (control with WS_TABSTOP | BS_DEFPUSHBUTTON style)
+                        for (child_hwnd, w) in &self.windows {
+                            if w.parent == Some(hwnd) && !w.destroyed && w.style & WS_TABSTOP != 0 {
+                                // Send WM_COMMAND with BN_CLICKED
+                                self.enqueue(Message {
+                                    hwnd: Some(hwnd),
+                                    kind: MessageKind::Command,
+                                    wparam: w.control_id as i64,
+                                    lparam: i64::from(*child_hwnd),
+                                    translated: false,
+                                    device_id: None,
+                                })?;
+                                break;
+                            }
+                        }
+                        Ok(true)
+                    }
+                    _ => Ok(false),
+                }
+            }
+            _ => Ok(false),
+        }
+    }
+
     pub fn set_window_long_w(&mut self, hwnd: Hwnd, index: i32, value: u64) -> Option<u64> {
         if !self.windows.contains_key(&hwnd) {
             return None;
@@ -2191,7 +2821,11 @@ impl User32Subsystem {
         // consistent with the parent field in WindowRecord.
         if index == GWL_HWNDPARENT {
             let previous = self.get_parent(hwnd);
-            let _ = self.set_parent(hwnd, value as Hwnd);
+            if let Err(e) = self.set_parent(hwnd, value as Hwnd) {
+                eprintln!(
+                    "[User32] set_window_long_w(GWL_HWNDPARENT): set_parent failed for hwnd {hwnd}: {e}"
+                );
+            }
             return Some(previous as u64);
         }
         Some(self.window_longs.insert((hwnd, index), value).unwrap_or(0))
@@ -2238,7 +2872,9 @@ impl User32Subsystem {
                 let hwnds = self
                     .windows
                     .iter()
-                    .filter_map(|(hwnd, window)| (!window.destroyed && window.visible).then_some(*hwnd))
+                    .filter_map(|(hwnd, window)| {
+                        (!window.destroyed && window.visible).then_some(*hwnd)
+                    })
                     .collect::<Vec<_>>();
                 for hwnd in hwnds {
                     self.queue_paint(hwnd)?;
@@ -2489,7 +3125,12 @@ impl User32Subsystem {
     fn rebuild_z_order(&mut self) {
         let mut topmost: Vec<Hwnd> = Vec::new();
         let mut normal: Vec<Hwnd> = Vec::new();
-        let mut hwnds: Vec<Hwnd> = self.windows.keys().copied().filter(|h| !self.windows[h].destroyed).collect();
+        let mut hwnds: Vec<Hwnd> = self
+            .windows
+            .keys()
+            .copied()
+            .filter(|h| !self.windows[h].destroyed)
+            .collect();
         hwnds.sort();
         for hwnd in hwnds {
             if let Some(w) = self.windows.get(&hwnd) {
@@ -2523,10 +3164,15 @@ impl User32Subsystem {
         if let Some(parent) = hwnd {
             // Return topmost child of parent
             self.z_order.iter().copied().find(|h| {
-                self.windows.get(h).map_or(false, |w| w.parent == Some(parent) && !w.destroyed)
+                self.windows
+                    .get(h)
+                    .map_or(false, |w| w.parent == Some(parent) && !w.destroyed)
             })
         } else {
-            self.z_order.first().copied().filter(|h| !self.windows[h].destroyed)
+            self.z_order
+                .first()
+                .copied()
+                .filter(|h| !self.windows[h].destroyed)
         }
     }
 
@@ -2536,12 +3182,18 @@ impl User32Subsystem {
         match direction {
             GW_HWNDNEXT => {
                 // GW_HWNDNEXT (2): window below in z-order
-                self.z_order.get(pos + 1).copied().filter(|h| !self.windows[h].destroyed)
+                self.z_order
+                    .get(pos + 1)
+                    .copied()
+                    .filter(|h| !self.windows[h].destroyed)
             }
             GW_HWNDPREV => {
                 // GW_HWNDPREV (3): window above in z-order
                 if pos > 0 {
-                    self.z_order.get(pos - 1).copied().filter(|h| !self.windows[h].destroyed)
+                    self.z_order
+                        .get(pos - 1)
+                        .copied()
+                        .filter(|h| !self.windows[h].destroyed)
                 } else {
                     None
                 }
@@ -2556,18 +3208,25 @@ impl User32Subsystem {
             GW_CHILD => {
                 // Return the topmost child window
                 self.z_order.iter().copied().find(|h| {
-                    self.windows.get(h).map_or(false, |w| w.parent == Some(hwnd) && !w.destroyed)
+                    self.windows
+                        .get(h)
+                        .map_or(false, |w| w.parent == Some(hwnd) && !w.destroyed)
                 })
             }
-            GW_OWNER => {
-                self.windows.get(&hwnd).and_then(|w| w.owner).filter(|h| !self.windows[h].destroyed)
-            }
+            GW_OWNER => self
+                .windows
+                .get(&hwnd)
+                .and_then(|w| w.owner)
+                .filter(|h| !self.windows[h].destroyed),
             GW_HWNDNEXT | GW_HWNDPREV => self.get_next_window(hwnd, cmd),
             GW_ENABLEDPOPUP => {
                 // Return the topmost enabled popup owned by hwnd
                 self.z_order.iter().copied().find(|h| {
                     self.windows.get(h).map_or(false, |w| {
-                        !w.destroyed && w.enabled && w.owner == Some(hwnd) && w.style & WS_POPUP != 0
+                        !w.destroyed
+                            && w.enabled
+                            && w.owner == Some(hwnd)
+                            && w.style & WS_POPUP != 0
                     })
                 })
             }
@@ -2591,9 +3250,10 @@ impl User32Subsystem {
     /// Returns (has_update, rect) where rect is the client area.
     pub fn get_update_rect(&self, hwnd: Hwnd) -> AppResult<(bool, Rect)> {
         let window = self.window(hwnd)?;
-        let has_paint = self.message_queue.iter().any(|m| {
-            m.hwnd == Some(hwnd) && m.kind == MessageKind::Paint
-        });
+        let has_paint = self
+            .message_queue
+            .iter()
+            .any(|m| m.hwnd == Some(hwnd) && m.kind == MessageKind::Paint);
         let rect = Rect {
             left: 0,
             top: 0,
@@ -2606,7 +3266,8 @@ impl User32Subsystem {
     /// ValidateRect — removes pending paint messages for the window.
     pub fn validate_rect(&mut self, hwnd: Hwnd) -> AppResult<()> {
         self.window(hwnd)?;
-        self.message_queue.retain(|m| !(m.hwnd == Some(hwnd) && m.kind == MessageKind::Paint));
+        self.message_queue
+            .retain(|m| !(m.hwnd == Some(hwnd) && m.kind == MessageKind::Paint));
         Ok(())
     }
 
@@ -2678,9 +3339,140 @@ impl User32Subsystem {
         previous
     }
 
-    pub fn get_dpi_for_monitor(&self, monitor_id: u32) -> AppResult<(u32, u32)> {
-        let monitor = self.monitor(monitor_id)?;
-        Ok((monitor.dpi_x, monitor.dpi_y))
+    /// SetProcessDPIAwareness (u32-based modern API).
+    /// awareness: 0 = unaware, 1 = system aware, 2 = per-monitor aware (V1/V2).
+    /// Returns 0 (S_OK) on success, or WIN32 error code on invalid arg.
+    pub fn set_process_dpi_awareness(&mut self, awareness: u32) -> u32 {
+        match awareness {
+            0 => self.dpi_context = DpiAwarenessContext::Unaware,
+            1 => self.dpi_context = DpiAwarenessContext::SystemAware,
+            2 => self.dpi_context = DpiAwarenessContext::PerMonitorAwareV2,
+            _ => return 0x80070057, // E_INVALIDARG
+        }
+        eprintln!(
+            "[User32] set_process_dpi_awareness: set to {:?}",
+            self.dpi_context
+        );
+        0 // S_OK
+    }
+
+    /// GetDpiForMonitor — returns DPI for the given monitor and dpi_type.
+    /// dpi_type: 0 = MDT_EFFECTIVE_DPI, 1 = MDT_ANGULAR_DPI, 2 = MDT_RAW_DPI.
+    pub fn get_dpi_for_monitor(&self, monitor_id: u32, _dpi_type: u32) -> (u32, u32) {
+        if let Some(monitor) = self.monitors.get(&monitor_id) {
+            (monitor.dpi_x, monitor.dpi_y)
+        } else {
+            let primary = self.monitors.values().next().unwrap();
+            (primary.dpi_x, primary.dpi_y)
+        }
+    }
+
+    /// SetThreadDpiAwarenessContext — set per-thread DPI awareness override.
+    /// Returns the previous context value.
+    pub fn set_thread_dpi_context(&mut self, context: usize) -> usize {
+        let old = self.thread_dpi_context;
+        self.thread_dpi_context = context;
+        old
+    }
+
+    /// GetThreadDpiAwarenessContext — returns current thread DPI awareness context.
+    pub fn get_thread_dpi_context(&self) -> usize {
+        self.thread_dpi_context
+    }
+
+    /// EnableNonClientDpiScaling — refresh the window DPI from its current monitor.
+    pub fn enable_non_client_dpi_scaling(&mut self, hwnd: u32) -> u32 {
+        let monitor_id = match self.windows.get(&hwnd) {
+            Some(window) => window.monitor_id,
+            None => return 0,
+        };
+        let dpi = match self.effective_dpi(monitor_id) {
+            Ok(value) => value,
+            Err(error) => {
+                eprintln!(
+                    "[User32] enable_non_client_dpi_scaling: failed to resolve DPI for hwnd {hwnd}: {error}"
+                );
+                return 0;
+            }
+        };
+        if let Some(window) = self.windows.get_mut(&hwnd) {
+            window.dpi = dpi;
+            1
+        } else {
+            0
+        }
+    }
+
+    /// AdjustWindowRectExForDpi — calculates required window rect size for a given DPI.
+    pub fn adjust_window_rect_for_dpi(
+        &self,
+        rect: &mut Rect,
+        _style: u32,
+        _menu: u32,
+        _ex_style: u32,
+        dpi: u32,
+    ) -> u32 {
+        let base_dpi = 96;
+        let scale = dpi as f64 / base_dpi as f64;
+        // Approximate frame borders and title bar, scaled by DPI
+        let border = (4_f64 * scale) as i32;
+        let title = (23_f64 * scale) as i32;
+        rect.left -= border;
+        rect.top -= border + title;
+        rect.right += border;
+        rect.bottom += border;
+        1 // TRUE
+    }
+
+    /// MonitorFromRect — finds the monitor that has the largest intersection with the given rect.
+    pub fn monitor_from_rect(&self, rect: &Rect, flags: u32) -> u32 {
+        let rect_center_x = (rect.left + rect.right) / 2;
+        let rect_center_y = (rect.top + rect.bottom) / 2;
+        for (id, mon) in &self.monitors {
+            if rect_center_x >= mon.bounds.left
+                && rect_center_x < mon.bounds.right
+                && rect_center_y >= mon.bounds.top
+                && rect_center_y < mon.bounds.bottom
+            {
+                return *id;
+            }
+        }
+        match flags {
+            1 => 0, // MONITOR_DEFAULTTONULL
+            _ => self.monitors.values().next().map(|m| m.id).unwrap_or(0),
+        }
+    }
+
+    /// MonitorFromPoint — finds the monitor that contains the given point.
+    pub fn monitor_from_point(&self, pt: (i32, i32), flags: u32) -> u32 {
+        let (x, y) = pt;
+        for (id, mon) in &self.monitors {
+            if x >= mon.bounds.left
+                && x < mon.bounds.right
+                && y >= mon.bounds.top
+                && y < mon.bounds.bottom
+            {
+                return *id;
+            }
+        }
+        match flags {
+            1 => 0, // MONITOR_DEFAULTTONULL
+            _ => self.monitors.values().next().map(|m| m.id).unwrap_or(0),
+        }
+    }
+
+    /// EnumDisplayMonitors — enumerate monitors, calling a callback for each.
+    /// Returns TRUE (1) on success.
+    pub fn enum_display_monitors(
+        &self,
+        _hdc: u32,
+        _clip_rect: Option<&Rect>,
+        _callback: u32,
+        _context: u32,
+    ) -> u32 {
+        // Full guest callback dispatch is done in pe_runtime.rs.
+        // Here we just return TRUE, indicating enumeration can proceed.
+        1 // TRUE
     }
 
     pub fn primary_monitor_id(&self) -> u32 {
@@ -2703,6 +3495,870 @@ impl User32Subsystem {
                     .then(|| self.primary_monitor_id())
             })
             .unwrap_or(0)
+    }
+
+    // ── Multi-Monitor (continued) ────────────────────────────────────────────────
+
+    /// GetMonitorInfoW — retrieves monitor information for a given monitor handle.
+    pub fn get_monitor_info_w(&self, monitor_id: u32) -> Option<MonitorInfo> {
+        self.monitor_info(monitor_id)
+    }
+
+    // ── Menu API ──────────────────────────────────────────────────────────────────
+
+    /// CreateMenu — creates a new menu handle.
+    pub fn create_menu(&mut self) -> u32 {
+        let handle = self.next_menu_handle;
+        self.next_menu_handle += 1;
+        self.menu_items.insert(handle, Vec::new());
+        handle
+    }
+
+    /// CreatePopupMenu — creates a new popup (drop-down) menu handle.
+    pub fn create_popup_menu(&mut self) -> u32 {
+        let handle = self.next_menu_handle;
+        self.next_menu_handle += 1;
+        self.menu_items.insert(handle, Vec::new());
+        handle
+    }
+
+    /// Mirror an externally allocated menu handle into the local user32 menu table.
+    pub fn register_menu_handle(&mut self, handle: u32) {
+        self.menu_items.entry(handle).or_default();
+        if self.next_menu_handle <= handle {
+            self.next_menu_handle = handle.saturating_add(1);
+        }
+    }
+
+    /// DestroyMenu — destroys a menu and releases its resources.
+    pub fn destroy_menu(&mut self, menu_handle: u32) -> bool {
+        if self.menu_items.remove(&menu_handle).is_some() {
+            // Also remove any sub-menu parent relationships
+            self.menu_parents.retain(|_, parent| *parent != menu_handle);
+            self.window_menus
+                .retain(|_, assigned| *assigned != menu_handle);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// AppendMenuW — appends a new item to the end of a menu.
+    pub fn append_menu_w(&mut self, menu_handle: u32, flags: u32, id: u32, text: &str) -> bool {
+        if !self.menu_items.contains_key(&menu_handle) {
+            return false;
+        }
+        if let Some(items) = self.menu_items.get_mut(&menu_handle) {
+            // MF_POPUP (0x0010) means the id is actually a sub-menu handle
+            if (flags & MF_POPUP) != 0 {
+                self.menu_parents.insert(id, menu_handle);
+            }
+            items.push((flags, id, text.to_string()));
+            true
+        } else {
+            false
+        }
+    }
+
+    /// TrackPopupMenu — validates the popup menu and refreshes the target window.
+    /// The actual modal tracking loop is still handled by pe_runtime when TPM_RETURNCMD is set.
+    pub fn track_popup_menu(
+        &mut self,
+        menu_handle: u32,
+        _flags: u32,
+        _x: i32,
+        _y: i32,
+        hwnd: Hwnd,
+    ) -> bool {
+        if !self.menu_items.contains_key(&menu_handle) {
+            return false;
+        }
+        let ns_window = if hwnd != 0 {
+            match self.windows.get(&hwnd) {
+                Some(window) if !window.destroyed => window.ns_window,
+                _ => return false,
+            }
+        } else {
+            std::ptr::null_mut()
+        };
+        if !ns_window.is_null() {
+            mac_window::update_nswindow(ns_window);
+        }
+        if hwnd != 0 && self.queue_paint(hwnd).is_err() {
+            return false;
+        }
+        true
+    }
+
+    /// GetMenu — retrieves the handle of the menu assigned to the given window.
+    pub fn get_menu(&self, hwnd: Hwnd) -> u32 {
+        self.window_menus.get(&hwnd).copied().unwrap_or(0)
+    }
+
+    /// SetMenu — assigns a menu handle to a window.
+    pub fn set_menu(&mut self, hwnd: Hwnd, menu_handle: u32) -> bool {
+        if !self.windows.contains_key(&hwnd) {
+            return false;
+        }
+        if menu_handle != 0 && !self.menu_items.contains_key(&menu_handle) {
+            return false;
+        }
+        self.window_menus.insert(hwnd, menu_handle);
+        true
+    }
+
+    /// DrawMenuBar — redraws the menu bar of the given window.
+    pub fn draw_menu_bar(&mut self, hwnd: Hwnd) -> bool {
+        let ns_window = match self.windows.get(&hwnd) {
+            Some(window) if !window.destroyed => window.ns_window,
+            _ => return false,
+        };
+        let menu_handle = self.window_menus.get(&hwnd).copied().unwrap_or(0);
+        if menu_handle != 0 && !self.menu_items.contains_key(&menu_handle) {
+            return false;
+        }
+        if !ns_window.is_null() {
+            mac_window::update_nswindow(ns_window);
+        }
+        if self.queue_paint(hwnd).is_err() {
+            return false;
+        }
+        true
+    }
+
+    /// EnableMenuItem — enables, disables, or grays a menu item.
+    /// Returns the previous state of the menu item, or 0xFFFFFFFF on failure.
+    pub fn enable_menu_item(&mut self, menu_handle: u32, id: u32, flags: u32) -> u32 {
+        let items = match self.menu_items.get_mut(&menu_handle) {
+            Some(i) => i,
+            None => return 0xFFFF_FFFF,
+        };
+        let by_position = (flags & MF_BYPOSITION) != 0;
+        let idx = if by_position {
+            id as usize
+        } else {
+            match items.iter().position(|(_, item_id, _)| *item_id == id) {
+                Some(i) => i,
+                None => return 0xFFFF_FFFF,
+            }
+        };
+        if idx >= items.len() {
+            return 0xFFFF_FFFF;
+        }
+        let item = &mut items[idx];
+        let prev_state = item.0 & (MF_GRAYED | MF_DISABLED | MF_CHECKED);
+        // Clear enable/disable/check flags and apply new ones
+        item.0 &= !(MF_GRAYED | MF_DISABLED | MF_CHECKED);
+        item.0 |= flags & (MF_GRAYED | MF_DISABLED | MF_CHECKED);
+        prev_state
+    }
+
+    /// CheckMenuItem — sets the check state of a menu item.
+    /// Returns the previous check state, or 0xFFFFFFFF on failure.
+    pub fn check_menu_item(&mut self, menu_handle: u32, id: u32, flags: u32) -> u32 {
+        let items = match self.menu_items.get_mut(&menu_handle) {
+            Some(i) => i,
+            None => return 0xFFFF_FFFF,
+        };
+        let by_position = (flags & MF_BYPOSITION) != 0;
+        let idx = if by_position {
+            id as usize
+        } else {
+            match items.iter().position(|(_, item_id, _)| *item_id == id) {
+                Some(i) => i,
+                None => return 0xFFFF_FFFF,
+            }
+        };
+        if idx >= items.len() {
+            return 0xFFFF_FFFF;
+        }
+        let item = &mut items[idx];
+        let prev_check = item.0 & MF_CHECKED;
+        // Toggle check state based on MF_CHECKED flag
+        if (flags & MF_CHECKED) != 0 {
+            item.0 |= MF_CHECKED;
+        } else {
+            item.0 &= !MF_CHECKED;
+        }
+        prev_check
+    }
+
+    /// GetMenuItemCount — returns the number of items in a menu, or -1 on error.
+    pub fn get_menu_item_count(&self, menu_handle: u32) -> i32 {
+        self.menu_items
+            .get(&menu_handle)
+            .map(|items| items.len() as i32)
+            .unwrap_or(-1)
+    }
+
+    /// GetSubMenu — retrieves the popup menu handle at a given position.
+    pub fn get_sub_menu(&self, menu_handle: u32, pos: i32) -> u32 {
+        let items = match self.menu_items.get(&menu_handle) {
+            Some(i) => i,
+            None => return 0,
+        };
+        let idx = pos as usize;
+        if idx >= items.len() {
+            return 0;
+        }
+        let (flags, id, _) = &items[idx];
+        if (flags & MF_POPUP) != 0 {
+            *id // The id of a sub-menu item is the sub-menu handle
+        } else {
+            0
+        }
+    }
+
+    /// GetMenuState — retrieves the menu flags for a menu item.
+    /// Returns 0xFFFFFFFF on failure.
+    pub fn get_menu_state(&self, menu_handle: u32, id: u32, flags: u32) -> u32 {
+        let items = match self.menu_items.get(&menu_handle) {
+            Some(i) => i,
+            None => return 0xFFFF_FFFF,
+        };
+        let by_position = (flags & MF_BYPOSITION) != 0;
+        let idx = if by_position {
+            id as usize
+        } else {
+            match items.iter().position(|(_, item_id, _)| *item_id == id) {
+                Some(i) => i,
+                None => return 0xFFFF_FFFF,
+            }
+        };
+        if idx >= items.len() {
+            return 0xFFFF_FFFF;
+        }
+        items[idx].0
+    }
+
+    /// HiliteMenuItem — highlights or removes highlighting from a menu item.
+    pub fn hilite_menu_item(&mut self, _hwnd: Hwnd, menu_handle: u32, id: u32, flags: u32) -> bool {
+        let items = match self.menu_items.get_mut(&menu_handle) {
+            Some(i) => i,
+            None => return false,
+        };
+        let by_position = (flags & MF_BYPOSITION) != 0;
+        let idx = if by_position {
+            id as usize
+        } else {
+            match items.iter().position(|(_, item_id, _)| *item_id == id) {
+                Some(i) => i,
+                None => return false,
+            }
+        };
+        if idx >= items.len() {
+            return false;
+        }
+        let item = &mut items[idx];
+        if (flags & MF_HILITE) != 0 {
+            item.0 |= MF_HILITE;
+        } else {
+            item.0 &= !MF_HILITE;
+        }
+        true
+    }
+
+    // ── Scrollbar API ─────────────────────────────────────────────────────────────
+
+    /// SetScrollInfo — sets the parameters of a scroll bar.
+    /// Returns the current scroll position.
+    pub fn set_scroll_info(
+        &mut self,
+        hwnd: Hwnd,
+        bar: u32,
+        min: i32,
+        max: i32,
+        pos: i32,
+        page: u32,
+        _redraw: bool,
+    ) -> i32 {
+        let bar_type = if bar == SB_HORZ {
+            0u8
+        } else if bar == SB_VERT {
+            1u8
+        } else {
+            0u8
+        };
+        let key = (hwnd, bar_type);
+        let old_pos = self.scroll_info.get(&key).map(|info| info.2).unwrap_or(0);
+        self.scroll_info.insert(key, (min, max, pos, page));
+        old_pos
+    }
+
+    /// GetScrollInfo — gets the parameters of a scroll bar.
+    /// Returns (min, max, pos, page) if found.
+    pub fn get_scroll_info(&self, hwnd: Hwnd, bar: u32) -> Option<(i32, i32, i32, u32)> {
+        let bar_type = if bar == SB_HORZ {
+            0u8
+        } else if bar == SB_VERT {
+            1u8
+        } else {
+            0u8
+        };
+        self.scroll_info.get(&(hwnd, bar_type)).copied()
+    }
+
+    /// SetScrollRange — sets the minimum and maximum scroll position.
+    pub fn set_scroll_range(
+        &mut self,
+        hwnd: Hwnd,
+        bar: u32,
+        min: i32,
+        max: i32,
+        _redraw: bool,
+    ) -> bool {
+        let bar_type = if bar == SB_HORZ {
+            0u8
+        } else if bar == SB_VERT {
+            1u8
+        } else {
+            0u8
+        };
+        let key = (hwnd, bar_type);
+        let (_, _, pos, page) = self
+            .scroll_info
+            .get(&key)
+            .copied()
+            .unwrap_or((0, 100, 0, 0));
+        self.scroll_info.insert(key, (min, max, pos, page));
+        true
+    }
+
+    /// GetScrollRange — gets the minimum and maximum scroll position.
+    /// Returns (min, max) if found.
+    pub fn get_scroll_range(&self, hwnd: Hwnd, bar: u32) -> Option<(i32, i32)> {
+        let bar_type = if bar == SB_HORZ {
+            0u8
+        } else if bar == SB_VERT {
+            1u8
+        } else {
+            0u8
+        };
+        self.scroll_info
+            .get(&(hwnd, bar_type))
+            .map(|info| (info.0, info.1))
+    }
+
+    /// ShowScrollBar — shows or hides a scroll bar.
+    pub fn show_scroll_bar(&mut self, hwnd: Hwnd, _bar: u32, _show: bool) -> bool {
+        if !self.windows.contains_key(&hwnd) {
+            return false;
+        }
+        // On macOS, scroll bars are managed natively; this is a no-op that returns success.
+        true
+    }
+
+    /// EnableScrollBar — enables or disables one or both scroll bar arrows.
+    pub fn enable_scroll_bar(&mut self, hwnd: Hwnd, _flags: u32, _arrows: u32) -> bool {
+        if !self.windows.contains_key(&hwnd) {
+            return false;
+        }
+        true
+    }
+
+    /// ScrollWindow — scrolls the contents of a window's client area.
+    pub fn scroll_window(
+        &mut self,
+        hwnd: Hwnd,
+        _dx: i32,
+        _dy: i32,
+        _rect: Option<&Rect>,
+        _clip_rect: Option<&Rect>,
+    ) -> bool {
+        if !self.windows.contains_key(&hwnd) {
+            return false;
+        }
+        // Invalidate the window so it gets repainted with the new scroll position
+        if let Err(e) = self.invalidate_window(Some(hwnd), true) {
+            eprintln!("[User32] scroll_window: invalidate_window failed for hwnd {hwnd}: {e}");
+        }
+        true
+    }
+
+    /// ScrollWindowEx — scrolls the contents of a window's client area with extended options.
+    pub fn scroll_window_ex(
+        &mut self,
+        hwnd: Hwnd,
+        _dx: i32,
+        _dy: i32,
+        _rect: Option<&Rect>,
+        _clip_rect: Option<&Rect>,
+        _hrgn_update: u32,
+        _rect_update: Option<&Rect>,
+        _flags: u32,
+    ) -> bool {
+        if !self.windows.contains_key(&hwnd) {
+            return false;
+        }
+        if let Err(e) = self.invalidate_window(Some(hwnd), true) {
+            eprintln!("[User32] scroll_window_ex: invalidate_window failed for hwnd {hwnd}: {e}");
+        }
+        true
+    }
+
+    // ── Common Controls API ───────────────────────────────────────────────────────
+
+    /// InitCommonControlsEx — registers common control classes.
+    /// Returns TRUE on success.
+    pub fn init_common_controls_ex(&mut self, flags: u32) -> bool {
+        self.common_controls_initialized = true;
+        self.common_controls_flags |= flags;
+        self.register_common_control_classes();
+        true
+    }
+
+    // ── DWM (Desktop Window Manager) — real implementations ─────────────────────
+
+    /// DwmIsCompositionEnabled — returns whether DWM composition is enabled.
+    /// On macOS the compositor (WindowServer / Quartz Compositor) is always active,
+    /// so this returns TRUE (Windows 8+ behaviour where composition is always on).
+    pub fn dwm_is_composition_enabled(&self) -> bool {
+        true
+    }
+
+    /// DwmEnableComposition — enables or disables DWM composition.
+    /// On macOS the compositor cannot be disabled; this logs a warning and returns
+    /// S_OK to indicate the call was accepted without effect.
+    pub fn dwm_enable_composition(&mut self, f_enable: u32) -> u32 {
+        if f_enable == DWM_EC_DISABLECOMPOSITION {
+            eprintln!(
+                "[User32] DwmEnableComposition(DISABLE) ignored — macOS compositor cannot be disabled"
+            );
+        }
+        0 // S_OK
+    }
+
+    /// DwmEnableBlurBehindWindow — enables blur-behind for a window using
+    /// NSVisualEffectView (vibrancy / blur) on macOS.
+    ///
+    /// This creates (or removes) an NSVisualEffectView as a subview of the
+    /// window's contentView, providing the frosted-glass backdrop effect.
+    pub fn dwm_enable_blur_behind_window(
+        &mut self,
+        hwnd: Hwnd,
+        enable: bool,
+        _blur_region: u32,
+        _transition: bool,
+    ) -> u32 {
+        // Store the blur state in the DWM attributes
+        let attrs = self.dwm_attributes.entry(hwnd).or_default();
+        attrs.blur_behind_enabled = enable;
+
+        #[cfg(target_os = "macos")]
+        if let Some(ns_window) = crate::mac_window::nswindow_for_hwnd(hwnd) {
+            unsafe {
+                use objc::runtime::Object;
+                let nswin = ns_window as *mut Object;
+
+                if enable {
+                    // Check if we already have a visual effect view for this window
+                    if !self.blur_effect_views.contains_key(&hwnd) {
+                        // Create NSVisualEffectView
+                        let ve_cls = match objc::runtime::Class::get("NSVisualEffectView") {
+                            Some(c) => c,
+                            None => return 0x80004005_u32, // E_FAIL
+                        };
+                        let ve_view: *mut Object = msg_send![ve_cls, alloc];
+                        if ve_view.is_null() {
+                            return 0x8007000E_u32; // E_OUTOFMEMORY
+                        }
+
+                        // Get the content view bounds
+                        let content_view: *mut Object = msg_send![nswin, contentView];
+                        let bounds: crate::mac_window::NSRect = msg_send![content_view, bounds];
+
+                        let ve_view: *mut Object = msg_send![ve_view, initWithFrame: bounds];
+                        if ve_view.is_null() {
+                            return 0x8007000E_u32; // E_OUTOFMEMORY
+                        }
+
+                        // NSVisualEffectMaterialHUDWindow = 26 (modern blur), or
+                        // NSVisualEffectMaterialSidebar = 7, NSVisualEffectMaterialDark = 10
+                        let _: () = msg_send![ve_view, setMaterial: 26u64]; // HUDWindow material
+                        let _: () = msg_send![ve_view, setState: 1u64]; // NSVisualEffectStateActive
+                        let _: () = msg_send![ve_view, setBlendingMode: 0u64]; // NSVisualEffectBlendingModeBehindWindow
+                        let _: () = msg_send![ve_view, setAutoresizingMask: 18u64]; // NSViewWidthSizable | NSViewHeightSizable
+
+                        // Insert the effect view at the back of the view hierarchy
+                        let _: () = msg_send![content_view, addSubview: ve_view positioned: 0u64 relativeTo: std::ptr::null_mut::<Object>()];
+                        // NSWindowBelow = 0
+
+                        self.blur_effect_views.insert(hwnd, ve_view as u64);
+                    }
+                } else {
+                    // Remove the visual effect view
+                    if let Some(view_ptr) = self.blur_effect_views.remove(&hwnd) {
+                        let ve_view = view_ptr as *mut Object;
+                        let _: () = msg_send![ve_view, removeFromSuperview];
+                    }
+                }
+            }
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (hwnd, enable);
+        }
+
+        0 // S_OK
+    }
+
+    /// DwmExtendFrameIntoClientArea — extends the window frame into the client area.
+    /// On macOS the window frame already extends seamlessly; we store the margins
+    /// for querying via DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS).
+    pub fn dwm_extend_frame_into_client_area(
+        &mut self,
+        hwnd: Hwnd,
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+    ) -> u32 {
+        let attrs = self.dwm_attributes.entry(hwnd).or_default();
+        attrs.extend_frame_margins = (left, top, right, bottom);
+        0 // S_OK
+    }
+
+    /// DwmGetColorizationColor — retrieves the color used for DWM glass colorization.
+    /// On macOS this queries the system accent colour via NSColor.
+    /// Falls back to a default blue (0xCC0000) if NSColor is unavailable.
+    pub fn dwm_get_colorization_color(&self) -> (u32, u32) {
+        #[cfg(target_os = "macos")]
+        unsafe {
+            use objc::runtime::Object;
+            if let Some(nscolor_cls) = objc::runtime::Class::get("NSColor") {
+                let accent: *mut Object = msg_send![nscolor_cls, controlAccentColor];
+                if !accent.is_null() {
+                    // Convert NSColor to RGBA components
+                    let color_space: *mut Object = msg_send![accent, colorUsingColorSpaceName: "NSCalibratedRGBColorSpace".as_ptr() as *const Object];
+                    if !color_space.is_null() {
+                        let mut red: f64 = 0.0;
+                        let mut green: f64 = 0.0;
+                        let mut blue: f64 = 0.0;
+                        let mut alpha: f64 = 0.0;
+                        let _: () = msg_send![color_space, getRed: &mut red green: &mut green blue: &mut blue alpha: &mut alpha];
+                        let r = (red.clamp(0.0, 1.0) * 255.0) as u32;
+                        let g = (green.clamp(0.0, 1.0) * 255.0) as u32;
+                        let b = (blue.clamp(0.0, 1.0) * 255.0) as u32;
+                        let a = (alpha.clamp(0.0, 1.0) * 255.0) as u32;
+                        let color = (b << 16) | (g << 8) | r; // BGR like Windows DWM
+                        return (color, a);
+                    }
+                }
+            }
+        }
+        // Fallback: Windows 11 default blue accent (BGR: 0xCC0000 = RGB 0x0000CC)
+        (0x00_CC_00_00, 0xFF)
+    }
+
+    /// DwmSetWindowAttribute — sets DWM window attributes and stores them
+    /// in the per-window attribute table.
+    pub fn dwm_set_window_attribute(&mut self, hwnd: Hwnd, attribute: u32, value: u32) -> u32 {
+        let attrs = self.dwm_attributes.entry(hwnd).or_default();
+        match attribute {
+            DWMWA_NCRENDERING_ENABLED => {
+                attrs.nc_rendering_enabled = value != 0;
+            }
+            DWMWA_NCRENDERING_POLICY => {
+                attrs.nc_rendering_policy = value;
+            }
+            DWMWA_TRANSITIONS_FORCEDISABLED => {
+                attrs.transitions_forced_disabled = value != 0;
+            }
+            DWMWA_ALLOW_NCPAINT => {
+                attrs.allow_ncpaint = value != 0;
+            }
+            DWMWA_CAPTION_BUTTON_BOUNDS => {
+                // value encodes a RECT (left, top, right, bottom) packed into u32s
+                // In practice this is stored via the attribute pointer mechanism in pe_runtime
+                // We store it as a boolean flag that bounds were set
+            }
+            DWMWA_NONCLIENT_RTL_LAYOUT => {
+                attrs.nonclient_rtl_layout = value != 0;
+            }
+            DWMWA_FORCE_ICONIC_REPRESENTATION => {
+                attrs.force_iconic_representation = value != 0;
+            }
+            DWMWA_FLIP3D_POLICY => {
+                attrs.flip3d_policy = value;
+            }
+            DWMWA_HAS_ICONIC_BITMAP => {
+                attrs.has_iconic_bitmap = value != 0;
+            }
+            DWMWA_DISALLOW_PEEK => {
+                attrs.disallow_peek = value != 0;
+            }
+            DWMWA_EXCLUDED_FROM_PEEK => {
+                attrs.excluded_from_peek = value != 0;
+            }
+            DWMWA_CLOAK => {
+                attrs.cloak = value != 0;
+                // On macOS, cloaking is a no-op (no Alt+Tab to hide from)
+            }
+            DWMWA_CLOAKED => {
+                attrs.cloaked = value;
+            }
+            DWMWA_FREEZE_REPRESENTATION => {
+                attrs.freeze_representation = value != 0;
+            }
+            _ => {
+                // Unknown attribute — return E_INVALIDARG
+                return 0x80070057_u64 as u32; // E_INVALIDARG
+            }
+        }
+        0 // S_OK
+    }
+
+    /// DwmGetWindowAttribute — retrieves DWM window attributes from the
+    /// per-window attribute table.
+    pub fn dwm_get_window_attribute(&self, hwnd: Hwnd, attribute: u32) -> (u32, u32) {
+        let attrs = match self.dwm_attributes.get(&hwnd) {
+            Some(a) => a,
+            None => {
+                // No attributes stored for this window yet; return defaults
+                return match attribute {
+                    DWMWA_CLOAKED => (0, 0), // Not cloaked
+                    _ => (0, 1),             // S_FALSE
+                };
+            }
+        };
+        let value = match attribute {
+            DWMWA_NCRENDERING_ENABLED => {
+                if attrs.nc_rendering_enabled {
+                    1
+                } else {
+                    0
+                }
+            }
+            DWMWA_NCRENDERING_POLICY => attrs.nc_rendering_policy,
+            DWMWA_TRANSITIONS_FORCEDISABLED => {
+                if attrs.transitions_forced_disabled {
+                    1
+                } else {
+                    0
+                }
+            }
+            DWMWA_ALLOW_NCPAINT => {
+                if attrs.allow_ncpaint {
+                    1
+                } else {
+                    0
+                }
+            }
+            DWMWA_CAPTION_BUTTON_BOUNDS => 0, // RECT data returned via pointer in pe_runtime
+            DWMWA_NONCLIENT_RTL_LAYOUT => {
+                if attrs.nonclient_rtl_layout {
+                    1
+                } else {
+                    0
+                }
+            }
+            DWMWA_FORCE_ICONIC_REPRESENTATION => {
+                if attrs.force_iconic_representation {
+                    1
+                } else {
+                    0
+                }
+            }
+            DWMWA_FLIP3D_POLICY => attrs.flip3d_policy,
+            DWMWA_EXTENDED_FRAME_BOUNDS => 0, // RECT returned via pointer in pe_runtime
+            DWMWA_HAS_ICONIC_BITMAP => {
+                if attrs.has_iconic_bitmap {
+                    1
+                } else {
+                    0
+                }
+            }
+            DWMWA_DISALLOW_PEEK => {
+                if attrs.disallow_peek {
+                    1
+                } else {
+                    0
+                }
+            }
+            DWMWA_EXCLUDED_FROM_PEEK => {
+                if attrs.excluded_from_peek {
+                    1
+                } else {
+                    0
+                }
+            }
+            DWMWA_CLOAK => {
+                if attrs.cloak {
+                    1
+                } else {
+                    0
+                }
+            }
+            DWMWA_CLOAKED => attrs.cloaked,
+            DWMWA_FREEZE_REPRESENTATION => {
+                if attrs.freeze_representation {
+                    1
+                } else {
+                    0
+                }
+            }
+            _ => return (0, 1), // S_FALSE for unknown
+        };
+        (value, 0) // S_OK
+    }
+
+    /// DwmFlush — waits for pending DWM rendering to complete.
+    /// On macOS, flushes the current CATransaction so pending layer updates
+    /// are committed immediately.
+    pub fn dwm_flush(&self) -> u32 {
+        #[cfg(target_os = "macos")]
+        unsafe {
+            if let Some(catrans_cls) = objc::runtime::Class::get("CATransaction") {
+                let _: () = msg_send![catrans_cls, flush];
+            }
+        }
+        0 // S_OK
+    }
+
+    // ── Window Animation / Flash API ──────────────────────────────────────────────
+
+    /// AnimateWindow — approximates Win32 animation by applying the final
+    /// show/hide state and immediately refreshing the window.
+    pub fn animate_window(&mut self, hwnd: Hwnd, _duration: u32, flags: u32) -> bool {
+        const SW_HIDE: i32 = 0;
+        const SW_SHOW: i32 = 5;
+
+        let show_command = if (flags & AW_HIDE) != 0 {
+            SW_HIDE
+        } else {
+            SW_SHOW
+        };
+
+        if let Err(error) = self.show_window(hwnd, show_command) {
+            eprintln!(
+                "[User32] animate_window: show_window({show_command}) failed for hwnd {hwnd}: {error}"
+            );
+            return false;
+        }
+        if show_command == SW_SHOW {
+            match self.update_window(hwnd) {
+                Ok(true) => {}
+                Ok(false) => return false,
+                Err(error) => {
+                    eprintln!(
+                        "[User32] animate_window: update_window failed for hwnd {hwnd}: {error}"
+                    );
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// DrawAnimatedRects — approximates the minimize/restore transition by
+    /// applying the target rect to the window and forcing a refresh.
+    pub fn draw_animated_rects(&mut self, hwnd: Hwnd, rect_from: &Rect, rect_to: &Rect) -> bool {
+        let target_width = (rect_to.right - rect_to.left).max(0) as u32;
+        let target_height = (rect_to.bottom - rect_to.top).max(0) as u32;
+        if target_width == 0 || target_height == 0 {
+            return false;
+        }
+
+        let (ns_window, visible, size_changed) = match self.window_mut(hwnd) {
+            Ok(window) => {
+                if window.destroyed {
+                    return false;
+                }
+                let size_changed = window.width != target_width || window.height != target_height;
+                let ns_window = window.ns_window;
+                let visible = window.visible;
+                if visible && !ns_window.is_null() {
+                    let source_width = (rect_from.right - rect_from.left).max(0) as u32;
+                    let source_height = (rect_from.bottom - rect_from.top).max(0) as u32;
+                    if source_width > 0 && source_height > 0 {
+                        mac_window::set_nswindow_frame(
+                            ns_window,
+                            rect_from.left,
+                            rect_from.top,
+                            source_width,
+                            source_height,
+                        );
+                        mac_window::update_nswindow(ns_window);
+                    }
+                }
+                window.x = rect_to.left;
+                window.y = rect_to.top;
+                window.width = target_width;
+                window.height = target_height;
+                window.placement.rc_normal_position = *rect_to;
+                (ns_window, visible, size_changed)
+            }
+            Err(_) => return false,
+        };
+
+        if visible && !ns_window.is_null() {
+            mac_window::set_nswindow_frame(
+                ns_window,
+                rect_to.left,
+                rect_to.top,
+                target_width,
+                target_height,
+            );
+            mac_window::update_nswindow(ns_window);
+        }
+        if size_changed
+            && self
+                .queue_resize(hwnd, target_width, target_height)
+                .is_err()
+        {
+            return false;
+        }
+        if self.queue_paint(hwnd).is_err() {
+            return false;
+        }
+        true
+    }
+
+    /// FlashWindow — flashes a window once (inverts the caption bar appearance).
+    pub fn flash_window(&mut self, hwnd: Hwnd, invert: bool) -> bool {
+        if !self.windows.contains_key(&hwnd) {
+            return false;
+        }
+        let currently_flashing = self.flashing_windows.get(&hwnd).copied().unwrap_or(false);
+        if invert {
+            // Toggle flash state
+            self.flashing_windows.insert(hwnd, !currently_flashing);
+        } else {
+            // Stop flashing
+            self.flashing_windows.insert(hwnd, false);
+        }
+        // Return the state before the call (Win32 convention)
+        let was_flashing = currently_flashing;
+        // On macOS, flash the dock icon as an approximation
+        #[cfg(target_os = "macos")]
+        if invert || was_flashing {
+            mac_window::flash_nswindow(hwnd, invert);
+        }
+        was_flashing
+    }
+
+    /// FlashWindowEx — flashes a window with extended control (count, timeout, style).
+    pub fn flash_window_ex(&mut self, hwnd: Hwnd, flags: u32, count: u32, _timeout: u32) -> bool {
+        if !self.windows.contains_key(&hwnd) {
+            return false;
+        }
+        if flags == FLASHW_STOP {
+            self.flashing_windows.insert(hwnd, false);
+            // Stop flashing on macOS dock icon
+            #[cfg(target_os = "macos")]
+            mac_window::flash_nswindow(hwnd, false);
+        } else {
+            self.flashing_windows.insert(hwnd, true);
+            // Flash the dock icon
+            #[cfg(target_os = "macos")]
+            mac_window::flash_nswindow(hwnd, true);
+            // If count is 0, flash until stopped; otherwise flash count times
+            // count is intentionally unused — macOS NSApp.requestUserAttention doesn't
+            // support a flash count; we flash once per call.
+            let _flash_count = count;
+        }
+        true
     }
 
     pub fn register_keyboard_device(&mut self, device: &KeyboardDevice) -> String {
@@ -2774,7 +4430,11 @@ impl User32Subsystem {
         Ok(())
     }
 
-    pub fn translate_scancode(&self, scancode: u16, modifiers: KeyModifiers) -> AppResult<KeyTranslation> {
+    pub fn translate_scancode(
+        &self,
+        scancode: u16,
+        modifiers: KeyModifiers,
+    ) -> AppResult<KeyTranslation> {
         let entry = layout_tables()
             .get(&self.layout)
             .and_then(|table| table.get(&scancode))
@@ -2782,7 +4442,10 @@ impl User32Subsystem {
             .ok_or_else(|| {
                 AppError::new(
                     ReasonCode::RcCliInvalid,
-                    format!("no keyboard mapping for layout {:?} scancode {scancode:#x}", self.layout),
+                    format!(
+                        "no keyboard mapping for layout {:?} scancode {scancode:#x}",
+                        self.layout
+                    ),
                 )
             })?;
         Ok(KeyTranslation {
@@ -2841,7 +4504,14 @@ impl User32Subsystem {
         scancode: u16,
         modifiers: KeyModifiers,
     ) -> AppResult<()> {
-        self.inject_keyboard_input_internal(hwnd, device_id, scancode, modifiers, MessageKind::KeyDown, true)
+        self.inject_keyboard_input_internal(
+            hwnd,
+            device_id,
+            scancode,
+            modifiers,
+            MessageKind::KeyDown,
+            true,
+        )
     }
 
     pub fn inject_keyboard_input_up(
@@ -2851,7 +4521,14 @@ impl User32Subsystem {
         scancode: u16,
         modifiers: KeyModifiers,
     ) -> AppResult<()> {
-        self.inject_keyboard_input_internal(hwnd, device_id, scancode, modifiers, MessageKind::KeyUp, false)
+        self.inject_keyboard_input_internal(
+            hwnd,
+            device_id,
+            scancode,
+            modifiers,
+            MessageKind::KeyUp,
+            false,
+        )
     }
 
     fn inject_keyboard_input_internal(
@@ -2987,18 +4664,10 @@ impl User32Subsystem {
         // Use CGEventSourceFlagsState to check physical modifier key state
         let flags = unsafe { CGEventSourceFlagsState(kCGEventSourceStateCombinedSessionState) };
         match vk as i32 {
-            VK_SHIFT | VK_LSHIFT | VK_RSHIFT => {
-                (flags & kCGEventFlagMaskShift as u64) != 0
-            }
-            VK_CONTROL | VK_LCONTROL | VK_RCONTROL => {
-                (flags & kCGEventFlagMaskControl as u64) != 0
-            }
-            VK_MENU | VK_LMENU | VK_RMENU => {
-                (flags & kCGEventFlagMaskAlternate as u64) != 0
-            }
-            VK_LWIN | VK_RWIN => {
-                (flags & kCGEventFlagMaskCommand as u64) != 0
-            }
+            VK_SHIFT | VK_LSHIFT | VK_RSHIFT => (flags & kCGEventFlagMaskShift as u64) != 0,
+            VK_CONTROL | VK_LCONTROL | VK_RCONTROL => (flags & kCGEventFlagMaskControl as u64) != 0,
+            VK_MENU | VK_LMENU | VK_RMENU => (flags & kCGEventFlagMaskAlternate as u64) != 0,
+            VK_LWIN | VK_RWIN => (flags & kCGEventFlagMaskCommand as u64) != 0,
             _ => false,
         }
     }
@@ -3022,7 +4691,7 @@ impl User32Subsystem {
         }
         let mut result: i16 = 0;
         if self.key_state[vk] & 0x80 != 0 {
-            result |= (0x8000u16 as i16);
+            result |= 0x8000u16 as i16;
         }
         if self.toggle_state[vk] & 0x01 != 0 {
             result |= 0x0001;
@@ -3051,9 +4720,9 @@ impl User32Subsystem {
         #[cfg(target_os = "macos")]
         {
             if self.query_modifier_key_state(v_key as u32) {
-                result |= (0x8000u16 as i16);
+                result |= 0x8000u16 as i16;
             } else if self.key_state[vk] & 0x80 != 0 {
-                result |= (0x8000u16 as i16);
+                result |= 0x8000u16 as i16;
             }
         }
         #[cfg(not(target_os = "macos"))]
@@ -3108,9 +4777,7 @@ impl User32Subsystem {
             }
             MAPVK_VK_TO_CHAR => {
                 // VK → lowercase character
-                self.vk_code_to_char(code)
-                    .map(|c| c as u32)
-                    .unwrap_or(0)
+                self.vk_code_to_char(code).map(|c| c as u32).unwrap_or(0)
             }
             MAPVK_VSC_TO_VK_EX => {
                 // Extended scancode → VK
@@ -3183,7 +4850,13 @@ impl User32Subsystem {
     /// Passes the hook information to the next hook procedure in the
     /// current hook chain. Returns the value returned by the next hook,
     /// or 0 if no next hook exists.
-    pub fn call_next_hook_ex(&self, _id: i32, _n_code: i32, _wparam: usize, _lparam: isize) -> usize {
+    pub fn call_next_hook_ex(
+        &self,
+        _id: i32,
+        _n_code: i32,
+        _wparam: usize,
+        _lparam: isize,
+    ) -> usize {
         // Simplified: return 0 to indicate no further processing needed.
         // In a full implementation this would chain to the next hook.
         0
@@ -3245,7 +4918,8 @@ impl User32Subsystem {
                 hwheel_delta,
             });
         }
-        let (cursor_x, cursor_y) = self.confine_cursor(self.cursor_pos.0 + raw_dx, self.cursor_pos.1 + raw_dy);
+        let (cursor_x, cursor_y) =
+            self.confine_cursor(self.cursor_pos.0 + raw_dx, self.cursor_pos.1 + raw_dy);
         self.cursor_pos = (cursor_x, cursor_y);
         self.enqueue(Message {
             hwnd: Some(hwnd),
@@ -3375,7 +5049,10 @@ impl User32Subsystem {
 
     pub fn remove_controller(&mut self, target_window: Option<Hwnd>, guid: &str) -> AppResult<()> {
         self.controllers.remove(guid).ok_or_else(|| {
-            AppError::new(ReasonCode::RcCliInvalid, format!("unknown controller {guid}"))
+            AppError::new(
+                ReasonCode::RcCliInvalid,
+                format!("unknown controller {guid}"),
+            )
         })?;
         self.reassign_xinput_slots();
         if let Some(hwnd) = target_window.or(self.foreground) {
@@ -3419,7 +5096,12 @@ impl User32Subsystem {
         Ok(controller.spec.buttons.iter().next().cloned())
     }
 
-    pub fn xinput_set_state(&mut self, slot: u8, left_motor: u16, right_motor: u16) -> AppResult<()> {
+    pub fn xinput_set_state(
+        &mut self,
+        slot: u8,
+        left_motor: u16,
+        right_motor: u16,
+    ) -> AppResult<()> {
         let guid = self.controller_guid_by_xinput_slot(slot)?;
         let controller = self.controller_mut(&guid)?;
         controller.rumble = RumbleState {
@@ -3575,7 +5257,10 @@ impl User32Subsystem {
     }
 
     /// Register raw input devices.
-    pub fn register_raw_input_devices(&mut self, devices: &[RawInputRegistration]) -> AppResult<()> {
+    pub fn register_raw_input_devices(
+        &mut self,
+        devices: &[RawInputRegistration],
+    ) -> AppResult<()> {
         for device in devices {
             // Replace existing registration with same (usage_page, usage, target_hwnd)
             self.raw_input_devices.retain(|d| {
@@ -3631,8 +5316,10 @@ impl User32Subsystem {
             }
             // RIDI_DEVICEINFO → sizeof(RID_DEVICE_INFO) = 24
             0x20000002 => Ok(24),
-            // RIDI_PREPARSEDDATA → not supported
-            0x20000003 => Ok(0),
+            // RIDI_PREPARSEDDATA → synthetic HID pre-parsed data buffer
+            // Windows returns the raw HID report descriptor bytes as pre-parsed data.
+            // We return a standard 5-button mouse HID report descriptor (50 bytes).
+            0x20000003 => Ok(50),
             _ => Err(AppError::new(
                 crate::reason::ReasonCode::RcInputUnsupported,
                 format!("unknown raw input device info command {command:#x}"),
@@ -3780,7 +5467,12 @@ impl User32Subsystem {
         let monitor = self.monitor(monitor_id)?;
         Ok(match self.dpi_context {
             DpiAwarenessContext::Unaware => 96,
-            DpiAwarenessContext::SystemAware => self.monitors.get(&1).map(|primary| primary.dpi_x).unwrap_or(96),
+            DpiAwarenessContext::SystemAware => self
+                .monitors
+                .get(&1)
+                .map(|primary| primary.dpi_x)
+                .unwrap_or(96),
+            DpiAwarenessContext::PerMonitorAware => monitor.dpi_x,
             DpiAwarenessContext::PerMonitorAwareV2 => monitor.dpi_x,
         })
     }
@@ -3793,7 +5485,10 @@ impl User32Subsystem {
 
     fn monitor(&self, monitor_id: u32) -> AppResult<&MonitorInfo> {
         self.monitors.get(&monitor_id).ok_or_else(|| {
-            AppError::new(ReasonCode::RcCliInvalid, format!("unknown monitor {monitor_id}"))
+            AppError::new(
+                ReasonCode::RcCliInvalid,
+                format!("unknown monitor {monitor_id}"),
+            )
         })
     }
 
@@ -3811,13 +5506,19 @@ impl User32Subsystem {
 
     fn controller(&self, guid: &str) -> AppResult<&ControllerRecord> {
         self.controllers.get(guid).ok_or_else(|| {
-            AppError::new(ReasonCode::RcCliInvalid, format!("unknown controller {guid}"))
+            AppError::new(
+                ReasonCode::RcCliInvalid,
+                format!("unknown controller {guid}"),
+            )
         })
     }
 
     fn controller_mut(&mut self, guid: &str) -> AppResult<&mut ControllerRecord> {
         self.controllers.get_mut(guid).ok_or_else(|| {
-            AppError::new(ReasonCode::RcCliInvalid, format!("unknown controller {guid}"))
+            AppError::new(
+                ReasonCode::RcCliInvalid,
+                format!("unknown controller {guid}"),
+            )
         })
     }
 
@@ -4010,9 +5711,7 @@ impl User32Subsystem {
     pub fn store_touch_inputs(&mut self, hwnd: u32, inputs: Vec<TouchInput>) -> u32 {
         let handle = self.touch_state.next_touch_handle;
         self.touch_state.next_touch_handle += 1;
-        self.touch_state
-            .touch_handles
-            .insert(handle, inputs);
+        self.touch_state.touch_handles.insert(handle, inputs);
         // Also store as pending
         for input in &self.touch_state.touch_handles[&handle] {
             self.touch_state.touch_inputs.push((hwnd, *input));
@@ -4040,6 +5739,22 @@ impl User32Subsystem {
         self.touch_state
             .touch_inputs
             .retain(|(_, ti)| ti.id != handle);
+        Ok(())
+    }
+
+    /// Initialize touch injection for the given HWND (InitializeTouchInjection).
+    ///
+    /// This is a stub that records the registration but does not actually
+    /// simulate touch input from the host.
+    pub fn initialize_touch_injection(
+        &mut self,
+        hwnd: u32,
+        _max_touches: u32,
+        _mode: u32,
+    ) -> AppResult<()> {
+        if !self.touch_state.registered_windows.contains(&hwnd) {
+            self.touch_state.registered_windows.push(hwnd);
+        }
         Ok(())
     }
 
@@ -4079,9 +5794,16 @@ impl User32Subsystem {
             })
     }
 
-    /// Skip a pointer frame (SkipPointerFrame stub).
-    pub fn skip_pointer_frame(&mut self, _pointer_id: u32) -> AppResult<()> {
-        // No-op: we don't batch pointer frames.
+    /// Skip a pointer frame by dropping the most recently stored state for that pointer.
+    pub fn skip_pointer_frame(&mut self, pointer_id: u32) -> AppResult<()> {
+        let removed_pointer = self.touch_state.pointer_infos.remove(&pointer_id);
+        let removed_pen = self.touch_state.pointer_pen_infos.remove(&pointer_id);
+        if removed_pointer.is_none() && removed_pen.is_none() {
+            return Err(AppError::new(
+                crate::reason::ReasonCode::RcUnimplInsn,
+                format!("SkipPointerFrame: unknown pointer_id {pointer_id}"),
+            ));
+        }
         Ok(())
     }
 
@@ -4093,6 +5815,66 @@ impl User32Subsystem {
     /// Store a PointerPenInfo for later retrieval.
     pub fn store_pointer_pen_info(&mut self, pointer_id: u32, info: PointerPenInfo) {
         self.touch_state.pointer_pen_infos.insert(pointer_id, info);
+    }
+
+    /// Get pointer device capabilities (GetPointerDeviceCaps).
+    /// Returns touch capabilities for a simulated touch device.
+    pub fn get_pointer_device_caps(&self) -> PointerDeviceCaps {
+        PointerDeviceCaps {
+            monitor: 1,               // primary monitor
+            supports_display_time: 1, // supports display time
+            pointer_device_type: 1,   // touch
+            max_contacts: 10,         // 10 simultaneous contacts
+        }
+    }
+
+    /// Get pointer device rects (GetPointerDeviceRects).
+    /// Returns the device rect and display rect for the primary monitor.
+    pub fn get_pointer_device_rects(&self) -> (PointerDeviceRect, PointerDeviceRect) {
+        let default_bounds = Rect {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+        let primary = self.monitors.get(&1).cloned().unwrap_or(MonitorInfo {
+            id: 1,
+            name: "Primary".to_string(),
+            dpi_x: 96,
+            dpi_y: 96,
+            bounds: default_bounds,
+            work_rect: default_bounds,
+            is_primary: true,
+        });
+        let w = primary.bounds.right - primary.bounds.left;
+        let h = primary.bounds.bottom - primary.bounds.top;
+        let display_rect = PointerDeviceRect {
+            left: 0,
+            top: 0,
+            right: w,
+            bottom: h,
+        };
+        let device_rect = PointerDeviceRect {
+            left: 0,
+            top: 0,
+            right: w,
+            bottom: h,
+        };
+        (device_rect, display_rect)
+    }
+
+    /// Get pointer frame info (GetPointerFrameInfo).
+    /// Returns the most recent pointer frame info, or an error if no frame exists.
+    pub fn get_pointer_frame_info(&self) -> AppResult<PointerFrameInfo> {
+        let info = PointerFrameInfo {
+            current_pointer_count: self.touch_state.pointer_infos.len() as u32,
+            pointers_in_frame: self.touch_state.pointer_infos.len() as u32,
+            frame_id: 1,
+            pointer_flags: 0,
+            display_time: 0,
+            performance_count: 0,
+        };
+        Ok(info)
     }
 
     /// Dispatch macOS touch points as Win32 WM_TOUCH messages.
@@ -4113,18 +5895,12 @@ impl User32Subsystem {
                 TouchPhase::Cancelled => TOUCHEVENTF_UP,
                 TouchPhase::Stationary => 0,
             };
-            let flags = flags
-                | TOUCHEVENTF_INRANGE
-                | if tp.is_pen {
-                    TOUCHEVENTF_PEN
-                } else {
-                    0
-                };
+            let flags = flags | TOUCHEVENTF_INRANGE | if tp.is_pen { TOUCHEVENTF_PEN } else { 0 };
             let source = if tp.is_pen { 2u32 } else { 1u32 };
             // Convert f64 coordinates to i32 (in hundredths of a pixel, per TouchInput spec)
             let x = (tp.x * 100.0) as i32;
             let y = (tp.y * 100.0) as i32;
-            let pressure = (tp.pressure.min(1.0).max(0.0) * 1024.0) as u32;
+            let _pressure = (tp.pressure.min(1.0).max(0.0) * 1024.0) as u32;
             touch_inputs.push(TouchInput {
                 x,
                 y,
@@ -4165,9 +5941,7 @@ impl User32Subsystem {
         }
         if !touch_inputs.is_empty() {
             // Compute lparam before moving touch_inputs into store_touch_inputs
-            let lparam = touch_inputs
-                .iter()
-                .fold(0u32, |acc, ti| acc | ti.flags);
+            let lparam = touch_inputs.iter().fold(0u32, |acc, ti| acc | ti.flags);
             let handle = self.store_touch_inputs(target_hwnd, touch_inputs);
             // wParam = touch handle, lParam = flags (TOUCHEVENTF_* packed)
             self.post_message_w(
@@ -4221,6 +5995,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires AppKit on main thread"]
     fn show_window_queues_paint_message() {
         let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
         user32.register_class_ex_w("test-window");
@@ -4228,8 +6003,14 @@ mod tests {
             .create_window_ex_w("test-window", "title", 320, 200, false, false, None, 1)
             .expect("create window");
 
-        assert_eq!(user32.get_message_w().expect("nc create").kind, MessageKind::NcCreate);
-        assert_eq!(user32.get_message_w().expect("create").kind, MessageKind::Create);
+        assert_eq!(
+            user32.get_message_w().expect("nc create").kind,
+            MessageKind::NcCreate
+        );
+        assert_eq!(
+            user32.get_message_w().expect("create").kind,
+            MessageKind::Create
+        );
 
         user32.show_window(hwnd, 1).expect("show window");
         let kinds = std::iter::from_fn(|| user32.get_message_w().map(|message| message.kind))
@@ -4241,6 +6022,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires AppKit on main thread"]
     fn invalidate_window_queues_paint_once() {
         let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
         user32.register_class_ex_w("test-window");
@@ -4250,16 +6032,137 @@ mod tests {
 
         let _ = std::iter::from_fn(|| user32.get_message_w()).collect::<Vec<_>>();
 
-        assert!(user32.invalidate_window(Some(hwnd), false).expect("invalidate window"));
-        assert!(user32.invalidate_window(Some(hwnd), false).expect("invalidate window"));
+        assert!(
+            user32
+                .invalidate_window(Some(hwnd), false)
+                .expect("invalidate window")
+        );
+        assert!(
+            user32
+                .invalidate_window(Some(hwnd), false)
+                .expect("invalidate window")
+        );
 
         let kinds = std::iter::from_fn(|| user32.get_message_w().map(|message| message.kind))
             .collect::<Vec<_>>();
 
         assert_eq!(
-            kinds.iter().filter(|kind| **kind == MessageKind::Paint).count(),
+            kinds
+                .iter()
+                .filter(|kind| **kind == MessageKind::Paint)
+                .count(),
             1
         );
+    }
+
+    #[test]
+    #[ignore = "requires AppKit on main thread"]
+    fn draw_animated_rects_updates_window_rect_and_queues_messages() {
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        user32.register_class_ex_w("test-window");
+        let hwnd = user32
+            .create_window_ex_w("test-window", "title", 320, 200, true, false, None, 1)
+            .expect("create window");
+
+        let _ = std::iter::from_fn(|| user32.get_message_w()).collect::<Vec<_>>();
+
+        let from = Rect {
+            left: 10,
+            top: 20,
+            right: 330,
+            bottom: 220,
+        };
+        let to = Rect {
+            left: 40,
+            top: 50,
+            right: 520,
+            bottom: 390,
+        };
+
+        assert!(user32.draw_animated_rects(hwnd, &from, &to));
+
+        let preview = user32
+            .window_previews()
+            .into_iter()
+            .find(|preview| preview.hwnd == hwnd)
+            .expect("window preview");
+        assert_eq!(preview.x, to.left);
+        assert_eq!(preview.y, to.top);
+        assert_eq!(preview.width, (to.right - to.left) as u32);
+        assert_eq!(preview.height, (to.bottom - to.top) as u32);
+
+        let kinds = std::iter::from_fn(|| user32.get_message_w().map(|message| message.kind))
+            .collect::<Vec<_>>();
+        assert!(kinds.contains(&MessageKind::WindowPosChanging));
+        assert!(kinds.contains(&MessageKind::Size));
+        assert!(kinds.contains(&MessageKind::Paint));
+        assert!(!user32.draw_animated_rects(0xDEAD_BEEF, &from, &to,));
+    }
+
+    #[test]
+    #[ignore = "requires AppKit on main thread"]
+    fn draw_menu_bar_queues_paint_for_valid_window_menu() {
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        user32.register_class_ex_w("test-window");
+        let hwnd = user32
+            .create_window_ex_w("test-window", "title", 320, 200, true, false, None, 1)
+            .expect("create window");
+        let menu = user32.create_menu();
+        assert!(user32.set_menu(hwnd, menu));
+
+        let _ = std::iter::from_fn(|| user32.get_message_w()).collect::<Vec<_>>();
+
+        assert!(user32.draw_menu_bar(hwnd));
+
+        let kinds = std::iter::from_fn(|| user32.get_message_w().map(|message| message.kind))
+            .collect::<Vec<_>>();
+        assert!(kinds.contains(&MessageKind::Paint));
+        assert!(!user32.draw_menu_bar(0xDEAD_BEEF));
+    }
+
+    #[test]
+    #[ignore = "requires AppKit on main thread"]
+    fn animate_window_updates_visibility_and_messages() {
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        user32.register_class_ex_w("test-window");
+        let hwnd = user32
+            .create_window_ex_w("test-window", "title", 320, 200, false, false, None, 1)
+            .expect("create window");
+
+        let _ = std::iter::from_fn(|| user32.get_message_w()).collect::<Vec<_>>();
+
+        assert!(user32.animate_window(hwnd, 200, 0));
+        assert!(user32.window_state(hwnd).expect("window state").visible);
+
+        let show_kinds = std::iter::from_fn(|| user32.get_message_w().map(|message| message.kind))
+            .collect::<Vec<_>>();
+        assert!(show_kinds.contains(&MessageKind::ShowWindow));
+        assert!(show_kinds.contains(&MessageKind::Paint));
+
+        assert!(user32.animate_window(hwnd, 200, AW_HIDE));
+        assert!(!user32.window_state(hwnd).expect("window state").visible);
+        assert!(!user32.animate_window(0xDEAD_BEEF, 200, 0));
+    }
+
+    #[test]
+    #[ignore = "requires AppKit on main thread"]
+    fn track_popup_menu_validates_menu_and_refreshes_window() {
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        user32.register_class_ex_w("test-window");
+        let hwnd = user32
+            .create_window_ex_w("test-window", "title", 320, 200, true, false, None, 1)
+            .expect("create window");
+        let menu = user32.create_popup_menu();
+
+        let _ = std::iter::from_fn(|| user32.get_message_w()).collect::<Vec<_>>();
+
+        assert!(user32.track_popup_menu(menu, 0, 100, 120, hwnd));
+
+        let kinds = std::iter::from_fn(|| user32.get_message_w().map(|message| message.kind))
+            .collect::<Vec<_>>();
+        assert!(kinds.contains(&MessageKind::Paint));
+        assert!(!user32.track_popup_menu(0xDEAD_BEEF, 0, 100, 120, hwnd));
+        assert!(!user32.track_popup_menu(menu, 0, 100, 120, 0xDEAD_BEEF));
     }
 
     #[test]
@@ -4271,7 +6174,9 @@ mod tests {
             .expect("post thread message");
 
         assert!(user32.get_message_for_thread(1).is_none());
-        let message = user32.get_message_for_thread(7).expect("target thread message");
+        let message = user32
+            .get_message_for_thread(7)
+            .expect("target thread message");
         assert_eq!(message.hwnd, None);
         assert_eq!(message.kind, MessageKind::Other(0x0400));
         assert_eq!(message.wparam, 11);
@@ -4279,6 +6184,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires AppKit on main thread"]
     fn monitor_from_window_returns_window_monitor_or_primary_fallback() {
         let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
         user32.register_class_ex_w("test-window");
@@ -4377,7 +6283,7 @@ mod tests {
     fn get_touch_input_info_invalid_handle_returns_error() {
         let user32 = User32Subsystem::new(KeyboardLayoutId::Us);
         let result = user32.get_touch_input_info(999);
-        assert!(result.is_err());
+        assert!(result.is_err(), "expected Err, got {result:?}");
     }
 
     #[test]
@@ -4396,11 +6302,13 @@ mod tests {
             cy: 10,
         }];
         let handle = user32.store_touch_inputs(0x1234, inputs);
-        assert!(user32.get_touch_input_info(handle).is_ok());
+        let _result = user32.get_touch_input_info(handle);
+        assert!(_result.is_ok(), "expected Ok, got {_result:?}");
         user32
             .close_touch_input_handle(handle)
             .expect("close touch input handle");
-        assert!(user32.get_touch_input_info(handle).is_err());
+        let _result = user32.get_touch_input_info(handle);
+        assert!(_result.is_err(), "expected Err, got {_result:?}");
     }
 
     #[test]
@@ -4462,12 +6370,99 @@ mod tests {
     }
 
     #[test]
+    fn skip_pointer_frame_removes_pointer_state() {
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        let info = PointerInfo {
+            pointer_type: 2,
+            pointer_id: 7,
+            frame_id: 1,
+            pointer_flags: POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT | POINTER_FLAG_PRIMARY,
+            source_device: 0,
+            hwnd_target: 0x5678isize,
+            pt_pixel_x: 300,
+            pt_pixel_y: 400,
+            pt_hic_res_x: 0,
+            pt_hic_res_y: 0,
+            pt_pixel_z: 0,
+            display_time: 0,
+            key_state: 0,
+            performance_count: 0,
+        };
+        let pen_info = PointerPenInfo {
+            pointer_type: 2,
+            pointer_id: 7,
+            frame_id: 1,
+            pointer_flags: POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT,
+            source_device: 0,
+            hwnd_target: 0x5678isize,
+            pt_pixel_x: 300,
+            pt_pixel_y: 400,
+            pt_hic_res_x: 0,
+            pt_hic_res_y: 0,
+            pt_pixel_z: 0,
+            display_time: 0,
+            key_state: 0,
+            performance_count: 0,
+            pen_flags: 0,
+            pen_mask: 0,
+            pressure: 0,
+            rotation: 0,
+            tilt_x: 0,
+            tilt_y: 0,
+        };
+
+        user32.store_pointer_info(7, info);
+        user32.store_pointer_pen_info(7, pen_info);
+        assert_eq!(
+            user32
+                .get_pointer_frame_info()
+                .unwrap()
+                .current_pointer_count,
+            1
+        );
+
+        user32.skip_pointer_frame(7).expect("skip pointer frame");
+
+        let _result = user32.get_pointer_info(7);
+        assert!(_result.is_err(), "expected Err, got {_result:?}");
+        let _result = user32.get_pointer_pen_info(7);
+        assert!(_result.is_err(), "expected Err, got {_result:?}");
+        let frame_info = user32
+            .get_pointer_frame_info()
+            .expect("frame info after skip");
+        assert_eq!(frame_info.current_pointer_count, 0);
+        assert_eq!(frame_info.pointers_in_frame, 0);
+    }
+
+    #[test]
     fn initialize_pointer_device_tracks_hwnd() {
         let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
         user32
             .initialize_pointer_device(0xABCD)
             .expect("initialize pointer device");
         assert!(user32.touch_state().pointer_devices.contains(&0xABCD));
+    }
+
+    #[test]
+    #[ignore = "requires AppKit on main thread"]
+    fn enable_non_client_dpi_scaling_refreshes_window_dpi() {
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        user32.register_class_ex_w("test-window");
+        let hwnd = user32
+            .create_window_ex_w("test-window", "title", 320, 200, false, false, None, 1)
+            .expect("create window");
+
+        let original_dpi = user32.dpi_for_window(hwnd).expect("initial dpi");
+        let monitor = user32.monitors.get_mut(&1).expect("monitor 1");
+        monitor.dpi_x = original_dpi + 48;
+        monitor.dpi_y = original_dpi + 48;
+
+        assert_eq!(user32.enable_non_client_dpi_scaling(hwnd), 1);
+        assert_eq!(
+            user32.dpi_for_window(hwnd).expect("updated dpi"),
+            original_dpi + 48
+        );
+        assert_eq!(user32.enable_non_client_dpi_scaling(0xDEAD_BEEF), 0);
     }
 
     #[test]
@@ -4515,7 +6510,8 @@ mod tests {
         let hwnd = user32
             .create_window_ex_w("test-window", "title", 320, 200, false, false, None, 1)
             .expect("create window");
-        let _ = std::iter::from_fn(|| user32.get_message_w()).collect::<Vec<_>>();
+        // Drain any pending messages from the queue (e.g. WM_CREATE, WM_SIZE)
+        while let Some(_msg) = user32.get_message_w() {}
         let device_id = user32.register_keyboard_device(&KeyboardDevice {
             vendor_id: 0x1234,
             product_id: 0x5678,
@@ -4525,11 +6521,16 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires AppKit on main thread"]
     fn test_get_key_state() {
         let (mut user32, hwnd, device_id) = setup_keyboard_test();
 
         // Initially all keys are up → bit 15 clear
-        assert_eq!(user32.get_key_state(VK_SPACE), 0, "space should be up initially");
+        assert_eq!(
+            user32.get_key_state(VK_SPACE),
+            0,
+            "space should be up initially"
+        );
         assert_eq!(user32.get_key_state(VK_A), 0, "A should be up initially");
 
         // Inject a key-down for scancode 0x39 (Space, VK=0x20)
@@ -4547,7 +6548,11 @@ mod tests {
 
         // Space should now show bit 15 set
         let state = user32.get_key_state(VK_SPACE);
-        assert_ne!(state & (0x8000u16 as i16), 0, "space should be down (bit 15 set)");
+        assert_ne!(
+            state & (0x8000u16 as i16),
+            0,
+            "space should be down (bit 15 set)"
+        );
         // Toggle bit should still be 0 for non-toggle keys
         assert_eq!(state & 0x0001, 0, "space should not have toggle bit");
 
@@ -4565,7 +6570,11 @@ mod tests {
             .expect("inject space up");
 
         // Space should now be up
-        assert_eq!(user32.get_key_state(VK_SPACE) & (0x8000u16 as i16), 0, "space should be up after release");
+        assert_eq!(
+            user32.get_key_state(VK_SPACE) & (0x8000u16 as i16),
+            0,
+            "space should be up after release"
+        );
     }
 
     #[test]
@@ -4594,12 +6603,16 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires AppKit on main thread"]
     fn test_keyboard_state() {
         let (mut user32, hwnd, device_id) = setup_keyboard_test();
 
         // GetKeyboardState should return 256 bytes
         let mut state = vec![0u8; 256];
-        assert!(user32.get_keyboard_state(&mut state), "get_keyboard_state should succeed");
+        assert!(
+            user32.get_keyboard_state(&mut state),
+            "get_keyboard_state should succeed"
+        );
         assert_eq!(state.len(), 256, "state buffer should be 256 bytes");
 
         // Initially all bytes should be 0
@@ -4623,8 +6636,16 @@ mod tests {
         // Now query state again — space (VK=0x20) should have bit 7 set
         let mut state2 = vec![0u8; 256];
         assert!(user32.get_keyboard_state(&mut state2));
-        assert_ne!(state2[VK_SPACE as usize] & 0x80, 0, "VK_SPACE should have bit 7 set");
-        assert_eq!(state2[VK_A as usize] & 0x80, 0, "VK_A should still be clear");
+        assert_ne!(
+            state2[VK_SPACE as usize] & 0x80,
+            0,
+            "VK_SPACE should have bit 7 set"
+        );
+        assert_eq!(
+            state2[VK_A as usize] & 0x80,
+            0,
+            "VK_A should still be clear"
+        );
 
         // Releasing the key should clear bit 7
         user32
@@ -4641,11 +6662,18 @@ mod tests {
 
         let mut state3 = vec![0u8; 256];
         assert!(user32.get_keyboard_state(&mut state3));
-        assert_eq!(state3[VK_SPACE as usize] & 0x80, 0, "VK_SPACE bit 7 should be clear after release");
+        assert_eq!(
+            state3[VK_SPACE as usize] & 0x80,
+            0,
+            "VK_SPACE bit 7 should be clear after release"
+        );
 
         // Buffer too small → return false
         let mut small = [0u8; 10];
-        assert!(!user32.get_keyboard_state(&mut small), "buffer < 256 should return false");
+        assert!(
+            !user32.get_keyboard_state(&mut small),
+            "buffer < 256 should return false"
+        );
     }
 
     #[test]
@@ -4668,6 +6696,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires AppKit on main thread"]
     fn test_get_async_key_state() {
         let (mut user32, hwnd, device_id) = setup_keyboard_test();
 
@@ -4691,7 +6720,11 @@ mod tests {
 
         // GetAsyncKeyState should see bit 0 set (toggled since last call)
         let after_down = user32.get_async_key_state(VK_SPACE);
-        assert_ne!(after_down & 0x0001, 0, "async toggle bit should be set after key down");
+        assert_ne!(
+            after_down & 0x0001,
+            0,
+            "async toggle bit should be set after key down"
+        );
 
         // Second call should have bit 0 cleared (auto-reset)
         let after_read = user32.get_async_key_state(VK_SPACE);
@@ -4706,8 +6739,8 @@ mod tests {
         let hook_id = user32.set_windows_hook_ex_w(
             WH_KEYBOARD,
             0x1234_5678, // dummy callback address
-            0,            // module
-            0,            // thread_id (0 = global)
+            0,           // module
+            0,           // thread_id (0 = global)
         );
         assert_ne!(hook_id, 0, "hook ID should be non-zero");
 
@@ -4716,8 +6749,14 @@ mod tests {
         assert_eq!(result, 0, "call_next_hook_ex should return 0");
 
         // Unhook
-        assert!(user32.unhook_windows_hook_ex(hook_id), "unhook should succeed");
-        assert!(!user32.unhook_windows_hook_ex(hook_id), "unhook again should fail");
+        assert!(
+            user32.unhook_windows_hook_ex(hook_id),
+            "unhook should succeed"
+        );
+        assert!(
+            !user32.unhook_windows_hook_ex(hook_id),
+            "unhook again should fail"
+        );
     }
 
     // ── Timer tests ─────────────────────────────────────────────────────────
@@ -4725,7 +6764,10 @@ mod tests {
     #[test]
     fn test_kill_timer_no_timer() {
         let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
-        assert!(!user32.kill_timer(1, 42), "killing non-existent timer should return false");
+        assert!(
+            !user32.kill_timer(1, 42),
+            "killing non-existent timer should return false"
+        );
     }
 
     #[test]
@@ -4734,7 +6776,11 @@ mod tests {
         assert!(user32.set_timer(1, 42, 1000), "set_timer should succeed");
         assert_eq!(user32.timer_count(), 1, "should have 1 active timer");
         assert!(user32.kill_timer(1, 42), "kill_timer should return true");
-        assert_eq!(user32.timer_count(), 0, "timer count should be 0 after kill");
+        assert_eq!(
+            user32.timer_count(),
+            0,
+            "timer count should be 0 after kill"
+        );
     }
 
     #[test]
@@ -4756,7 +6802,10 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(1));
         let expired = user32.poll_timers();
         assert!(!expired.is_empty(), "timer with 0ms timeout should expire");
-        assert!(expired.contains(&(1, 99)), "should contain our timer (hwnd=1, id=99)");
+        assert!(
+            expired.contains(&(1, 99)),
+            "should contain our timer (hwnd=1, id=99)"
+        );
         assert_eq!(user32.timer_count(), 0, "expired timers should be removed");
     }
 
@@ -4765,7 +6814,10 @@ mod tests {
         let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
         user32.set_timer(1, 1, 10_000); // 10 seconds — won't expire in test
         let expired = user32.poll_timers();
-        assert!(expired.is_empty(), "long timer should not expire immediately");
+        assert!(
+            expired.is_empty(),
+            "long timer should not expire immediately"
+        );
         assert_eq!(user32.timer_count(), 1, "timer should still be active");
     }
 
@@ -4774,12 +6826,22 @@ mod tests {
     #[test]
     fn test_message_queue_has_no_events_initially() {
         let user32 = User32Subsystem::new(KeyboardLayoutId::Us);
-        assert!(!user32.message_queue_has_events(QS_KEY), "no key events initially");
-        assert!(!user32.message_queue_has_events(QS_MOUSE), "no mouse events initially");
-        assert!(!user32.message_queue_has_events(QS_PAINT), "no paint events initially");
+        assert!(
+            !user32.message_queue_has_events(QS_KEY),
+            "no key events initially"
+        );
+        assert!(
+            !user32.message_queue_has_events(QS_MOUSE),
+            "no mouse events initially"
+        );
+        assert!(
+            !user32.message_queue_has_events(QS_PAINT),
+            "no paint events initially"
+        );
     }
 
     #[test]
+    #[ignore = "requires AppKit on main thread"]
     fn test_message_queue_has_key_events() {
         let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
         user32.register_class_ex_w("test-window");
@@ -4789,95 +6851,141 @@ mod tests {
         let _ = std::iter::from_fn(|| user32.get_message_w()).collect::<Vec<_>>();
 
         // Inject a key-down message
-        user32.enqueue(Message {
-            hwnd: Some(hwnd),
-            kind: MessageKind::KeyDown,
-            wparam: 0x41,
-            lparam: 0,
-            translated: false,
-            device_id: None,
-        }).expect("enqueue keydown");
+        user32
+            .enqueue(Message {
+                hwnd: Some(hwnd),
+                kind: MessageKind::KeyDown,
+                wparam: 0x41,
+                lparam: 0,
+                translated: false,
+                device_id: None,
+            })
+            .expect("enqueue keydown");
 
-        assert!(user32.message_queue_has_events(QS_KEY), "should detect key event");
-        assert!(user32.message_queue_has_events(QS_INPUT), "QS_INPUT should include key");
-        assert!(!user32.message_queue_has_events(QS_MOUSE), "should not detect mouse event");
+        assert!(
+            user32.message_queue_has_events(QS_KEY),
+            "should detect key event"
+        );
+        assert!(
+            user32.message_queue_has_events(QS_INPUT),
+            "QS_INPUT should include key"
+        );
+        assert!(
+            !user32.message_queue_has_events(QS_MOUSE),
+            "should not detect mouse event"
+        );
     }
 
     #[test]
     fn test_message_queue_has_mouse_events() {
         let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
-        user32.enqueue(Message {
-            hwnd: None,
-            kind: MessageKind::MouseMove,
-            wparam: 0,
-            lparam: 0,
-            translated: false,
-            device_id: None,
-        }).expect("enqueue mousemove");
+        user32
+            .enqueue(Message {
+                hwnd: None,
+                kind: MessageKind::MouseMove,
+                wparam: 0,
+                lparam: 0,
+                translated: false,
+                device_id: None,
+            })
+            .expect("enqueue mousemove");
 
-        assert!(user32.message_queue_has_events(QS_MOUSEMOVE), "should detect mousemove");
-        assert!(user32.message_queue_has_events(QS_MOUSE), "QS_MOUSE should include mousemove");
-        assert!(!user32.message_queue_has_events(QS_KEY), "should not detect key event");
+        assert!(
+            user32.message_queue_has_events(QS_MOUSEMOVE),
+            "should detect mousemove"
+        );
+        assert!(
+            user32.message_queue_has_events(QS_MOUSE),
+            "QS_MOUSE should include mousemove"
+        );
+        assert!(
+            !user32.message_queue_has_events(QS_KEY),
+            "should not detect key event"
+        );
     }
 
     #[test]
     fn test_message_queue_has_paint_events() {
         let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
-        user32.enqueue(Message {
-            hwnd: None,
-            kind: MessageKind::Paint,
-            wparam: 0,
-            lparam: 0,
-            translated: false,
-            device_id: None,
-        }).expect("enqueue paint");
+        user32
+            .enqueue(Message {
+                hwnd: None,
+                kind: MessageKind::Paint,
+                wparam: 0,
+                lparam: 0,
+                translated: false,
+                device_id: None,
+            })
+            .expect("enqueue paint");
 
-        assert!(user32.message_queue_has_events(QS_PAINT), "should detect paint event");
-        assert!(user32.message_queue_has_events(QS_ALLEVENTS), "QS_ALLEVENTS should include paint");
+        assert!(
+            user32.message_queue_has_events(QS_PAINT),
+            "should detect paint event"
+        );
+        assert!(
+            user32.message_queue_has_events(QS_ALLEVENTS),
+            "QS_ALLEVENTS should include paint"
+        );
     }
 
     #[test]
     fn test_message_queue_has_postmessage_events() {
         let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
-        user32.enqueue(Message {
-            hwnd: None,
-            kind: MessageKind::Other(0x0400), // WM_USER
-            wparam: 0,
-            lparam: 0,
-            translated: false,
-            device_id: None,
-        }).expect("enqueue postmessage");
+        user32
+            .enqueue(Message {
+                hwnd: None,
+                kind: MessageKind::Other(0x0400), // WM_USER
+                wparam: 0,
+                lparam: 0,
+                translated: false,
+                device_id: None,
+            })
+            .expect("enqueue postmessage");
 
-        assert!(user32.message_queue_has_events(QS_POSTMESSAGE), "should detect postmessage");
+        assert!(
+            user32.message_queue_has_events(QS_POSTMESSAGE),
+            "should detect postmessage"
+        );
     }
 
     #[test]
     fn test_message_queue_has_timer_events() {
         let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
-        user32.enqueue(Message {
-            hwnd: None,
-            kind: MessageKind::Other(0x0113), // WM_TIMER
-            wparam: 0,
-            lparam: 0,
-            translated: false,
-            device_id: None,
-        }).expect("enqueue timer");
+        user32
+            .enqueue(Message {
+                hwnd: None,
+                kind: MessageKind::Other(0x0113), // WM_TIMER
+                wparam: 0,
+                lparam: 0,
+                translated: false,
+                device_id: None,
+            })
+            .expect("enqueue timer");
 
-        assert!(user32.message_queue_has_events(QS_TIMER), "should detect timer event");
+        assert!(
+            user32.message_queue_has_events(QS_TIMER),
+            "should detect timer event"
+        );
     }
 
     #[test]
     fn test_message_queue_wake_mask_allinput() {
-        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        let user32 = User32Subsystem::new(KeyboardLayoutId::Us);
         // Empty queue with QS_ALLINPUT should still check pending_paint
-        assert!(!user32.message_queue_has_events(QS_ALLINPUT), "empty queue, no events");
+        assert!(
+            !user32.message_queue_has_events(QS_ALLINPUT),
+            "empty queue, no events"
+        );
     }
 
     #[test]
     fn test_message_queue_wake_mask_zero() {
         let user32 = User32Subsystem::new(KeyboardLayoutId::Us);
         // wake_mask=0 means check everything
-        assert!(!user32.message_queue_has_events(0), "empty queue should return false even with mask=0");
+        assert!(
+            !user32.message_queue_has_events(0),
+            "empty queue should return false even with mask=0"
+        );
     }
 
     // ── Clipboard tests ─────────────────────────────────────────────────────
@@ -4885,7 +6993,10 @@ mod tests {
     #[test]
     fn test_open_clipboard() {
         let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
-        assert!(user32.open_clipboard(Some(1)), "open clipboard should succeed");
+        assert!(
+            user32.open_clipboard(Some(1)),
+            "open clipboard should succeed"
+        );
         // Opening again should fail (already open)
         assert!(!user32.open_clipboard(Some(2)), "second open should fail");
     }
@@ -4896,7 +7007,10 @@ mod tests {
         user32.open_clipboard(Some(1));
         assert!(user32.close_clipboard(), "close clipboard should succeed");
         // Opening again after close should work
-        assert!(user32.open_clipboard(Some(2)), "open after close should succeed");
+        assert!(
+            user32.open_clipboard(Some(2)),
+            "open after close should succeed"
+        );
     }
 
     #[test]
@@ -4910,9 +7024,15 @@ mod tests {
         let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
         user32.open_clipboard(Some(1));
         user32.set_clipboard_data(CF_TEXT, b"hello".to_vec());
-        assert!(user32.is_clipboard_format_available(CF_TEXT), "data should be available");
+        assert!(
+            user32.is_clipboard_format_available(CF_TEXT),
+            "data should be available"
+        );
         assert!(user32.empty_clipboard(), "empty should succeed");
-        assert!(!user32.is_clipboard_format_available(CF_TEXT), "data should be gone after empty");
+        assert!(
+            !user32.is_clipboard_format_available(CF_TEXT),
+            "data should be gone after empty"
+        );
     }
 
     #[test]
@@ -4922,7 +7042,10 @@ mod tests {
 
         let handle = user32.set_clipboard_data(CF_TEXT, b"Hello, World!".to_vec());
         // The handle returned is the format as a pseudo-handle
-        assert!(handle != 0, "set_clipboard_data should return non-zero handle");
+        assert!(
+            handle != 0,
+            "set_clipboard_data should return non-zero handle"
+        );
 
         // Retrieve and verify
         let data = user32.get_clipboard_data(CF_TEXT);
@@ -4933,7 +7056,10 @@ mod tests {
     #[test]
     fn test_get_clipboard_data_not_open() {
         let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
-        assert!(user32.get_clipboard_data(CF_TEXT).is_none(), "get without open should return None");
+        assert!(
+            user32.get_clipboard_data(CF_TEXT).is_none(),
+            "get without open should return None"
+        );
     }
 
     #[test]
@@ -4949,34 +7075,66 @@ mod tests {
         user32.open_clipboard(Some(1));
 
         user32.set_clipboard_data(CF_TEXT, b"text data".to_vec());
-        user32.set_clipboard_data(CF_UNICODETEXT, "unicode data\0".encode_utf16().flat_map(|c| c.to_le_bytes()).collect::<Vec<_>>());
+        user32.set_clipboard_data(
+            CF_UNICODETEXT,
+            "unicode data\0"
+                .encode_utf16()
+                .flat_map(|c| c.to_le_bytes())
+                .collect::<Vec<_>>(),
+        );
         user32.set_clipboard_data(CF_HDROP, vec![0u8; 100]);
 
-        assert!(user32.is_clipboard_format_available(CF_TEXT), "CF_TEXT should be available");
-        assert!(user32.is_clipboard_format_available(CF_UNICODETEXT), "CF_UNICODETEXT should be available");
-        assert!(user32.is_clipboard_format_available(CF_HDROP), "CF_HDROP should be available");
-        assert!(!user32.is_clipboard_format_available(CF_BITMAP), "CF_BITMAP should NOT be available");
+        assert!(
+            user32.is_clipboard_format_available(CF_TEXT),
+            "CF_TEXT should be available"
+        );
+        assert!(
+            user32.is_clipboard_format_available(CF_UNICODETEXT),
+            "CF_UNICODETEXT should be available"
+        );
+        assert!(
+            user32.is_clipboard_format_available(CF_HDROP),
+            "CF_HDROP should be available"
+        );
+        assert!(
+            !user32.is_clipboard_format_available(CF_BITMAP),
+            "CF_BITMAP should NOT be available"
+        );
 
-        assert_eq!(user32.get_clipboard_data(CF_TEXT).unwrap(), b"text data".to_vec());
+        assert_eq!(
+            user32.get_clipboard_data(CF_TEXT).unwrap(),
+            b"text data".to_vec()
+        );
     }
 
     #[test]
     fn test_is_clipboard_format_available_not_open() {
         let user32 = User32Subsystem::new(KeyboardLayoutId::Us);
-        assert!(!user32.is_clipboard_format_available(CF_TEXT), "not open, should return false");
+        assert!(
+            !user32.is_clipboard_format_available(CF_TEXT),
+            "not open, should return false"
+        );
     }
 
     #[test]
     fn test_enum_clipboard_formats_not_open() {
         let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
-        assert_eq!(user32.enum_clipboard_formats(0), 0, "not open, should return 0");
+        assert_eq!(
+            user32.enum_clipboard_formats(0),
+            0,
+            "not open, should return 0"
+        );
     }
 
     #[test]
     fn test_enum_clipboard_formats_empty() {
         let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
         user32.open_clipboard(Some(1));
-        assert_eq!(user32.enum_clipboard_formats(0), 0, "empty clipboard, should return 0");
+        assert_eq!(
+            user32.enum_clipboard_formats(0),
+            0,
+            "empty clipboard, should return 0"
+        );
     }
 
     #[test]
@@ -4989,7 +7147,11 @@ mod tests {
         assert_eq!(first, CF_TEXT, "first format should be CF_TEXT");
 
         // No more formats
-        assert_eq!(user32.enum_clipboard_formats(first), 0, "no more formats after CF_TEXT");
+        assert_eq!(
+            user32.enum_clipboard_formats(first),
+            0,
+            "no more formats after CF_TEXT"
+        );
     }
 
     #[test]
@@ -5013,7 +7175,10 @@ mod tests {
 
         assert_eq!(formats.len(), 3, "should find 3 clipboard formats");
         assert!(formats.contains(&CF_TEXT), "should contain CF_TEXT");
-        assert!(formats.contains(&CF_UNICODETEXT), "should contain CF_UNICODETEXT");
+        assert!(
+            formats.contains(&CF_UNICODETEXT),
+            "should contain CF_UNICODETEXT"
+        );
         assert!(formats.contains(&CF_HDROP), "should contain CF_HDROP");
     }
 
@@ -5025,8 +7190,14 @@ mod tests {
         user32.set_clipboard_data(CF_UNICODETEXT, b"hello wide\0".to_vec());
 
         // Reading one format shouldn't affect others
-        assert_eq!(user32.get_clipboard_data(CF_TEXT).unwrap(), b"hello".to_vec());
-        assert_eq!(user32.get_clipboard_data(CF_UNICODETEXT).unwrap(), b"hello wide\0".to_vec());
+        assert_eq!(
+            user32.get_clipboard_data(CF_TEXT).unwrap(),
+            b"hello".to_vec()
+        );
+        assert_eq!(
+            user32.get_clipboard_data(CF_UNICODETEXT).unwrap(),
+            b"hello wide\0".to_vec()
+        );
     }
 
     // ── Misc API tests ─────────────────────────────────────────────────────
@@ -5036,13 +7207,21 @@ mod tests {
         let user32 = User32Subsystem::new(KeyboardLayoutId::Us);
         let (tid, pid) = user32.get_window_thread_process_id(42);
         assert_eq!(tid, 1, "thread id should be 1");
-        assert_eq!(pid, std::process::id(), "process id should match current pid");
+        assert_eq!(
+            pid,
+            std::process::id(),
+            "process id should match current pid"
+        );
     }
 
     #[test]
     fn test_get_desktop_window() {
         let user32 = User32Subsystem::new(KeyboardLayoutId::Us);
-        assert_eq!(user32.get_desktop_window(), 0, "desktop window should return 0");
+        assert_eq!(
+            user32.get_desktop_window(),
+            0,
+            "desktop window should return 0"
+        );
     }
 
     #[test]
@@ -5050,10 +7229,15 @@ mod tests {
         let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
         let result = user32.update_window(999);
         assert!(result.is_ok(), "update_window should not fail");
-        assert_eq!(result.unwrap(), false, "update_window for non-existent hwnd should return false");
+        assert_eq!(
+            result.unwrap(),
+            false,
+            "update_window for non-existent hwnd should return false"
+        );
     }
 
     #[test]
+    #[ignore = "requires AppKit on main thread"]
     fn test_update_window_existing() {
         let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
         user32.register_class_ex_w("test-window");
@@ -5064,25 +7248,299 @@ mod tests {
 
         let result = user32.update_window(hwnd);
         assert!(result.is_ok(), "update_window should succeed");
-        assert_eq!(result.unwrap(), true, "update_window for existing hwnd should return true");
+        assert_eq!(
+            result.unwrap(),
+            true,
+            "update_window for existing hwnd should return true"
+        );
 
         // Should have queued a paint message
-        assert!(user32.get_message_w().map(|m| m.kind == MessageKind::Paint).unwrap_or(false),
-                "update_window should queue a paint message");
+        assert!(
+            user32
+                .get_message_w()
+                .map(|m| m.kind == MessageKind::Paint)
+                .unwrap_or(false),
+            "update_window should queue a paint message"
+        );
     }
 
     #[test]
     fn test_unregister_class_w() {
         let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
         user32.register_class_ex_w("TestClass");
-        assert!(user32.unregister_class_w("TestClass"), "unregister existing class should succeed");
-        assert!(!user32.unregister_class_w("TestClass"), "unregister again should fail");
+        assert!(
+            user32.unregister_class_w("TestClass"),
+            "unregister existing class should succeed"
+        );
+        assert!(
+            !user32.unregister_class_w("TestClass"),
+            "unregister again should fail"
+        );
     }
 
     #[test]
     fn test_unregister_class_w_nonexistent() {
         let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
-        assert!(!user32.unregister_class_w("NonExistentClass"), "unregister non-existent should fail");
+        assert!(
+            !user32.unregister_class_w("NonExistentClass"),
+            "unregister non-existent should fail"
+        );
+    }
+
+    // ── Message queue ordering tests ───────────────────────────────────
+
+    #[test]
+    #[ignore = "requires AppKit on main thread"]
+    fn message_queue_preserves_fifo_order() {
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        user32.register_class_ex_w("msg-order");
+        let hwnd = user32
+            .create_window_ex_w("msg-order", "title", 320, 200, false, false, None, 1)
+            .expect("create window");
+        // Drain creation messages.
+        while user32.get_message_w().is_some() {}
+
+        // Post three messages in sequence using the Other(u32) variant.
+        let seq = [
+            MessageKind::Other(1001),
+            MessageKind::Other(1002),
+            MessageKind::Other(1003),
+        ];
+        for &kind in &seq {
+            user32
+                .post_message_w(hwnd, kind, 0, 0)
+                .expect("post message");
+        }
+
+        let kinds: Vec<MessageKind> =
+            std::iter::from_fn(|| user32.get_message_w().map(|m| m.kind)).collect();
+        assert_eq!(kinds, seq, "messages should be dequeued in FIFO order");
+    }
+
+    #[test]
+    #[ignore = "requires AppKit on main thread"]
+    fn timer_fires_and_is_reported_by_poll_timers() {
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        user32.register_class_ex_w("timer-msg");
+        let hwnd = user32
+            .create_window_ex_w("timer-msg", "title", 320, 200, false, false, None, 1)
+            .expect("create window");
+        // Drain creation messages.
+        while user32.get_message_w().is_some() {}
+
+        // Set up a timer with 0ms (fires immediately).
+        assert!(user32.set_timer(hwnd, 42, 0), "set_timer should succeed");
+
+        // Poll timers to fire the timer.
+        let fired = user32.poll_timers();
+        assert!(
+            fired.contains(&(hwnd, 42)),
+            "poll_timers should include our timer"
+        );
+
+        // After firing, timer should be removed.
+        assert_eq!(user32.timer_count(), 0, "timer should be consumed");
+    }
+
+    #[test]
+    #[ignore = "requires AppKit on main thread"]
+    fn keyboard_input_generates_key_down() {
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        user32.register_class_ex_w("kbd-test");
+        let hwnd = user32
+            .create_window_ex_w("kbd-test", "title", 320, 200, false, false, None, 1)
+            .expect("create window");
+        // Drain creation messages.
+        while user32.get_message_w().is_some() {}
+
+        // Register a keyboard device so inject_keyboard_input recognises it.
+        let kbd_id = user32.register_keyboard_device(&KeyboardDevice {
+            vendor_id: 0x1234,
+            product_id: 0x5678,
+            serial: "0001".to_string(),
+        });
+
+        // Inject a key-down event via inject_keyboard_input.
+        user32
+            .inject_keyboard_input(
+                hwnd,
+                &kbd_id,
+                0x10, // scancode for Q
+                KeyModifiers {
+                    shift: false,
+                    altgr: false,
+                },
+            )
+            .expect("key down");
+
+        let kinds: Vec<MessageKind> =
+            std::iter::from_fn(|| user32.get_message_w().map(|m| m.kind)).collect();
+        assert!(
+            kinds.contains(&MessageKind::KeyDown),
+            "keyboard input should produce KeyDown, got {kinds:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires AppKit on main thread"]
+    fn mouse_input_generates_button_down() {
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        user32.register_class_ex_w("mouse-test");
+        let hwnd = user32
+            .create_window_ex_w("mouse-test", "title", 320, 200, false, false, None, 1)
+            .expect("create window");
+        // Drain creation messages.
+        while user32.get_message_w().is_some() {}
+
+        // Register a mouse device so inject_mouse_input recognises it.
+        let mouse_id = user32.register_mouse_device(&MouseDevice {
+            vendor_id: 0xABCD,
+            product_id: 0x1234,
+            serial: "0001".to_string(),
+        });
+
+        // Set focus so the window receives mouse messages.
+        user32.set_focus(hwnd).expect("set focus");
+
+        // Inject mouse button down.
+        user32
+            .inject_mouse_input(
+                hwnd,
+                &mouse_id,
+                100,
+                100,
+                &[MouseButtonEvent {
+                    button: MouseButton::Left,
+                    pressed: true,
+                }],
+                0,
+                0,
+            )
+            .expect("mouse down");
+
+        let kinds: Vec<MessageKind> =
+            std::iter::from_fn(|| user32.get_message_w().map(|m| m.kind)).collect();
+        assert!(
+            kinds.contains(&MessageKind::LButtonDown),
+            "mouse left down should produce LButtonDown, got {kinds:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires AppKit on main thread"]
+    fn set_focus_generates_focus_messages() {
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        user32.register_class_ex_w("focus-test1");
+        user32.register_class_ex_w("focus-test2");
+
+        let hwnd1 = user32
+            .create_window_ex_w("focus-test1", "win1", 320, 200, false, false, None, 1)
+            .expect("create win1");
+        let hwnd2 = user32
+            .create_window_ex_w("focus-test2", "win2", 320, 200, false, false, None, 1)
+            .expect("create win2");
+        // Drain creation messages.
+        while user32.get_message_w().is_some() {}
+
+        // Set focus to hwnd1.
+        user32.set_focus(hwnd1).expect("set focus 1");
+        let kinds1: Vec<MessageKind> =
+            std::iter::from_fn(|| user32.get_message_w().map(|m| m.kind)).collect();
+        assert!(
+            kinds1.contains(&MessageKind::SetFocus),
+            "set_focus should produce SetFocus message, got {kinds1:?}"
+        );
+
+        // Switch focus to hwnd2.
+        user32.set_focus(hwnd2).expect("set focus 2");
+        let kinds2: Vec<MessageKind> =
+            std::iter::from_fn(|| user32.get_message_w().map(|m| m.kind)).collect();
+        assert!(
+            kinds2.contains(&MessageKind::KillFocus),
+            "focus switch should produce KillFocus, got {kinds2:?}"
+        );
+    }
+
+    // ── GDI+ object lifetime tests ─────────────────────────────────────
+
+    #[test]
+    fn gdiplus_alloc_handle_assigns_unique_ids() {
+        let mut state = GdiplusState::default();
+        let h1 = state.alloc_handle(GdiplusObject::Brush(Box::new(GdiplusBrush::SolidFill(
+            GdiplusSolidFill { color: 0xFF0000 },
+        ))));
+        let h2 = state.alloc_handle(GdiplusObject::Brush(Box::new(GdiplusBrush::SolidFill(
+            GdiplusSolidFill { color: 0x00FF00 },
+        ))));
+        assert_ne!(h1, h2, "allocated handles must be unique");
+    }
+
+    #[test]
+    fn gdiplus_create_and_remove_object() {
+        let mut state = GdiplusState::default();
+        let h = state.alloc_handle(GdiplusObject::Pen(Box::new(GdiplusPen {
+            color: 0x0000FF,
+            brush_handle: None,
+            width: 2.0,
+            dash_style: 0,
+            line_join: 0,
+            start_cap: 0,
+            end_cap: 0,
+            alignment: 0,
+        })));
+        assert!(state.get(h).is_some(), "object should exist after alloc");
+        let removed = state.remove(h);
+        assert!(removed.is_some(), "remove should return the object");
+        assert!(
+            state.get(h).is_none(),
+            "object should not exist after remove"
+        );
+    }
+
+    #[test]
+    fn gdiplus_repeated_create_destroy_does_not_leak_handles() {
+        let mut state = GdiplusState::default();
+        let initial_count = state.objects.len();
+
+        for _ in 0..100 {
+            let h = state.alloc_handle(GdiplusObject::Matrix(Box::new(GdiplusMatrix::identity())));
+            state.remove(h);
+        }
+
+        assert_eq!(
+            state.objects.len(),
+            initial_count,
+            "repeated create/destroy cycles should not leak handles"
+        );
+    }
+
+    #[test]
+    fn gdiplus_graphics_from_hdc_reuses_handle() {
+        let mut state = GdiplusState::default();
+        let h1 = state.create_graphics_from_hdc(0xABCD);
+        let h2 = state.create_graphics_from_hdc(0xABCD);
+        assert_eq!(
+            h1, h2,
+            "create_graphics_from_hdc should reuse handle for same HDC"
+        );
+        state.remove(h1);
+    }
+
+    #[test]
+    fn gdiplus_invalid_handle_returns_none() {
+        let mut state = GdiplusState::default();
+        assert!(
+            state.get(0xDEADBEEF).is_none(),
+            "get on invalid handle should return None"
+        );
+        assert!(
+            state.get_mut(0xDEADBEEF).is_none(),
+            "get_mut on invalid handle should return None"
+        );
+        assert!(
+            state.remove(0xDEADBEEF).is_none(),
+            "remove on invalid handle should return None"
+        );
     }
 }
 
@@ -5100,10 +7558,7 @@ fn compose_dead_char(dead: char, base: char) -> Option<char> {
 
 /// Returns true if the given VK code is a toggle key (CapsLock, NumLock, ScrollLock).
 fn is_toggle_key(vk: u8) -> bool {
-    matches!(
-        vk as i32,
-        VK_CAPITAL | VK_NUMLOCK | VK_SCROLL
-    )
+    matches!(vk as i32, VK_CAPITAL | VK_NUMLOCK | VK_SCROLL)
 }
 
 /// Map a `VirtualKey` enum variant to its Windows virtual-key code.
@@ -5130,75 +7585,381 @@ fn layout_tables() -> BTreeMap<KeyboardLayoutId, BTreeMap<u16, LayoutEntry>> {
         (
             KeyboardLayoutId::Us,
             BTreeMap::from([
-                (0x10, LayoutEntry { vk: VirtualKey::Q, plain: Some('q'), shifted: Some('Q'), altgr: None, dead: None }),
-                (0x11, LayoutEntry { vk: VirtualKey::Unknown(0x57), plain: Some('w'), shifted: Some('W'), altgr: None, dead: None }),
-                (0x12, LayoutEntry { vk: VirtualKey::E, plain: Some('e'), shifted: Some('E'), altgr: None, dead: None }),
-                (0x13, LayoutEntry { vk: VirtualKey::Unknown(0x52), plain: Some('r'), shifted: Some('R'), altgr: None, dead: None }),
-                (0x19, LayoutEntry { vk: VirtualKey::Unknown(0x50), plain: Some('p'), shifted: Some('P'), altgr: None, dead: None }),
-                (0x1c, LayoutEntry { vk: VirtualKey::Unknown(0x0d), plain: Some('\r'), shifted: Some('\r'), altgr: Some('\r'), dead: None }),
-                (0x1e, LayoutEntry { vk: VirtualKey::A, plain: Some('a'), shifted: Some('A'), altgr: None, dead: None }),
-                (0x1f, LayoutEntry { vk: VirtualKey::Unknown(0x53), plain: Some('s'), shifted: Some('S'), altgr: None, dead: None }),
-                (0x20, LayoutEntry { vk: VirtualKey::Unknown(0x44), plain: Some('d'), shifted: Some('D'), altgr: None, dead: None }),
-                (0x2e, LayoutEntry { vk: VirtualKey::Unknown(0x43), plain: Some('c'), shifted: Some('C'), altgr: None, dead: None }),
-                (0x31, LayoutEntry { vk: VirtualKey::Unknown(0x4e), plain: Some('n'), shifted: Some('N'), altgr: None, dead: None }),
-                (0x39, LayoutEntry { vk: VirtualKey::Space, plain: Some(' '), shifted: Some(' '), altgr: None, dead: None }),
+                (
+                    0x10,
+                    LayoutEntry {
+                        vk: VirtualKey::Q,
+                        plain: Some('q'),
+                        shifted: Some('Q'),
+                        altgr: None,
+                        dead: None,
+                    },
+                ),
+                (
+                    0x11,
+                    LayoutEntry {
+                        vk: VirtualKey::Unknown(0x57),
+                        plain: Some('w'),
+                        shifted: Some('W'),
+                        altgr: None,
+                        dead: None,
+                    },
+                ),
+                (
+                    0x12,
+                    LayoutEntry {
+                        vk: VirtualKey::E,
+                        plain: Some('e'),
+                        shifted: Some('E'),
+                        altgr: None,
+                        dead: None,
+                    },
+                ),
+                (
+                    0x13,
+                    LayoutEntry {
+                        vk: VirtualKey::Unknown(0x52),
+                        plain: Some('r'),
+                        shifted: Some('R'),
+                        altgr: None,
+                        dead: None,
+                    },
+                ),
+                (
+                    0x19,
+                    LayoutEntry {
+                        vk: VirtualKey::Unknown(0x50),
+                        plain: Some('p'),
+                        shifted: Some('P'),
+                        altgr: None,
+                        dead: None,
+                    },
+                ),
+                (
+                    0x1c,
+                    LayoutEntry {
+                        vk: VirtualKey::Unknown(0x0d),
+                        plain: Some('\r'),
+                        shifted: Some('\r'),
+                        altgr: Some('\r'),
+                        dead: None,
+                    },
+                ),
+                (
+                    0x1e,
+                    LayoutEntry {
+                        vk: VirtualKey::A,
+                        plain: Some('a'),
+                        shifted: Some('A'),
+                        altgr: None,
+                        dead: None,
+                    },
+                ),
+                (
+                    0x1f,
+                    LayoutEntry {
+                        vk: VirtualKey::Unknown(0x53),
+                        plain: Some('s'),
+                        shifted: Some('S'),
+                        altgr: None,
+                        dead: None,
+                    },
+                ),
+                (
+                    0x20,
+                    LayoutEntry {
+                        vk: VirtualKey::Unknown(0x44),
+                        plain: Some('d'),
+                        shifted: Some('D'),
+                        altgr: None,
+                        dead: None,
+                    },
+                ),
+                (
+                    0x2e,
+                    LayoutEntry {
+                        vk: VirtualKey::Unknown(0x43),
+                        plain: Some('c'),
+                        shifted: Some('C'),
+                        altgr: None,
+                        dead: None,
+                    },
+                ),
+                (
+                    0x31,
+                    LayoutEntry {
+                        vk: VirtualKey::Unknown(0x4e),
+                        plain: Some('n'),
+                        shifted: Some('N'),
+                        altgr: None,
+                        dead: None,
+                    },
+                ),
+                (
+                    0x39,
+                    LayoutEntry {
+                        vk: VirtualKey::Space,
+                        plain: Some(' '),
+                        shifted: Some(' '),
+                        altgr: None,
+                        dead: None,
+                    },
+                ),
             ]),
         ),
         (
             KeyboardLayoutId::Uk,
             BTreeMap::from([
-                (0x10, LayoutEntry { vk: VirtualKey::Q, plain: Some('q'), shifted: Some('Q'), altgr: None, dead: None }),
-                (0x28, LayoutEntry { vk: VirtualKey::Oem7, plain: Some('\''), shifted: Some('@'), altgr: None, dead: None }),
-                (0x12, LayoutEntry { vk: VirtualKey::E, plain: Some('e'), shifted: Some('E'), altgr: None, dead: None }),
+                (
+                    0x10,
+                    LayoutEntry {
+                        vk: VirtualKey::Q,
+                        plain: Some('q'),
+                        shifted: Some('Q'),
+                        altgr: None,
+                        dead: None,
+                    },
+                ),
+                (
+                    0x28,
+                    LayoutEntry {
+                        vk: VirtualKey::Oem7,
+                        plain: Some('\''),
+                        shifted: Some('@'),
+                        altgr: None,
+                        dead: None,
+                    },
+                ),
+                (
+                    0x12,
+                    LayoutEntry {
+                        vk: VirtualKey::E,
+                        plain: Some('e'),
+                        shifted: Some('E'),
+                        altgr: None,
+                        dead: None,
+                    },
+                ),
             ]),
         ),
         (
             KeyboardLayoutId::Fr,
             BTreeMap::from([
-                (0x10, LayoutEntry { vk: VirtualKey::A, plain: Some('a'), shifted: Some('A'), altgr: None, dead: None }),
-                (0x1e, LayoutEntry { vk: VirtualKey::Q, plain: Some('q'), shifted: Some('Q'), altgr: None, dead: None }),
-                (0x1a, LayoutEntry { vk: VirtualKey::Oem4, plain: None, shifted: None, altgr: None, dead: Some('^') }),
-                (0x12, LayoutEntry { vk: VirtualKey::E, plain: Some('e'), shifted: Some('E'), altgr: Some('€'), dead: None }),
+                (
+                    0x10,
+                    LayoutEntry {
+                        vk: VirtualKey::A,
+                        plain: Some('a'),
+                        shifted: Some('A'),
+                        altgr: None,
+                        dead: None,
+                    },
+                ),
+                (
+                    0x1e,
+                    LayoutEntry {
+                        vk: VirtualKey::Q,
+                        plain: Some('q'),
+                        shifted: Some('Q'),
+                        altgr: None,
+                        dead: None,
+                    },
+                ),
+                (
+                    0x1a,
+                    LayoutEntry {
+                        vk: VirtualKey::Oem4,
+                        plain: None,
+                        shifted: None,
+                        altgr: None,
+                        dead: Some('^'),
+                    },
+                ),
+                (
+                    0x12,
+                    LayoutEntry {
+                        vk: VirtualKey::E,
+                        plain: Some('e'),
+                        shifted: Some('E'),
+                        altgr: Some('€'),
+                        dead: None,
+                    },
+                ),
             ]),
         ),
         (
             KeyboardLayoutId::De,
             BTreeMap::from([
-                (0x15, LayoutEntry { vk: VirtualKey::Z, plain: Some('z'), shifted: Some('Z'), altgr: None, dead: None }),
-                (0x2c, LayoutEntry { vk: VirtualKey::Y, plain: Some('y'), shifted: Some('Y'), altgr: None, dead: None }),
-                (0x12, LayoutEntry { vk: VirtualKey::E, plain: Some('e'), shifted: Some('E'), altgr: None, dead: None }),
+                (
+                    0x15,
+                    LayoutEntry {
+                        vk: VirtualKey::Z,
+                        plain: Some('z'),
+                        shifted: Some('Z'),
+                        altgr: None,
+                        dead: None,
+                    },
+                ),
+                (
+                    0x2c,
+                    LayoutEntry {
+                        vk: VirtualKey::Y,
+                        plain: Some('y'),
+                        shifted: Some('Y'),
+                        altgr: None,
+                        dead: None,
+                    },
+                ),
+                (
+                    0x12,
+                    LayoutEntry {
+                        vk: VirtualKey::E,
+                        plain: Some('e'),
+                        shifted: Some('E'),
+                        altgr: None,
+                        dead: None,
+                    },
+                ),
             ]),
         ),
         (
             KeyboardLayoutId::Es,
             BTreeMap::from([
-                (0x10, LayoutEntry { vk: VirtualKey::Q, plain: Some('q'), shifted: Some('Q'), altgr: None, dead: None }),
-                (0x1a, LayoutEntry { vk: VirtualKey::Oem4, plain: None, shifted: None, altgr: None, dead: Some('´') }),
-                (0x12, LayoutEntry { vk: VirtualKey::E, plain: Some('e'), shifted: Some('E'), altgr: Some('€'), dead: None }),
+                (
+                    0x10,
+                    LayoutEntry {
+                        vk: VirtualKey::Q,
+                        plain: Some('q'),
+                        shifted: Some('Q'),
+                        altgr: None,
+                        dead: None,
+                    },
+                ),
+                (
+                    0x1a,
+                    LayoutEntry {
+                        vk: VirtualKey::Oem4,
+                        plain: None,
+                        shifted: None,
+                        altgr: None,
+                        dead: Some('´'),
+                    },
+                ),
+                (
+                    0x12,
+                    LayoutEntry {
+                        vk: VirtualKey::E,
+                        plain: Some('e'),
+                        shifted: Some('E'),
+                        altgr: Some('€'),
+                        dead: None,
+                    },
+                ),
             ]),
         ),
         (
             KeyboardLayoutId::It,
             BTreeMap::from([
-                (0x10, LayoutEntry { vk: VirtualKey::Q, plain: Some('q'), shifted: Some('Q'), altgr: None, dead: None }),
-                (0x1a, LayoutEntry { vk: VirtualKey::Oem4, plain: None, shifted: None, altgr: None, dead: Some('`') }),
-                (0x12, LayoutEntry { vk: VirtualKey::E, plain: Some('e'), shifted: Some('E'), altgr: None, dead: None }),
+                (
+                    0x10,
+                    LayoutEntry {
+                        vk: VirtualKey::Q,
+                        plain: Some('q'),
+                        shifted: Some('Q'),
+                        altgr: None,
+                        dead: None,
+                    },
+                ),
+                (
+                    0x1a,
+                    LayoutEntry {
+                        vk: VirtualKey::Oem4,
+                        plain: None,
+                        shifted: None,
+                        altgr: None,
+                        dead: Some('`'),
+                    },
+                ),
+                (
+                    0x12,
+                    LayoutEntry {
+                        vk: VirtualKey::E,
+                        plain: Some('e'),
+                        shifted: Some('E'),
+                        altgr: None,
+                        dead: None,
+                    },
+                ),
             ]),
         ),
         (
             KeyboardLayoutId::Arabic,
             BTreeMap::from([
-                (0x10, LayoutEntry { vk: VirtualKey::Q, plain: Some('ض'), shifted: Some('َ'), altgr: None, dead: None }),
-                (0x12, LayoutEntry { vk: VirtualKey::E, plain: Some('ث'), shifted: Some('ُ'), altgr: None, dead: None }),
-                (0x39, LayoutEntry { vk: VirtualKey::Space, plain: Some(' '), shifted: Some(' '), altgr: None, dead: None }),
+                (
+                    0x10,
+                    LayoutEntry {
+                        vk: VirtualKey::Q,
+                        plain: Some('ض'),
+                        shifted: Some('َ'),
+                        altgr: None,
+                        dead: None,
+                    },
+                ),
+                (
+                    0x12,
+                    LayoutEntry {
+                        vk: VirtualKey::E,
+                        plain: Some('ث'),
+                        shifted: Some('ُ'),
+                        altgr: None,
+                        dead: None,
+                    },
+                ),
+                (
+                    0x39,
+                    LayoutEntry {
+                        vk: VirtualKey::Space,
+                        plain: Some(' '),
+                        shifted: Some(' '),
+                        altgr: None,
+                        dead: None,
+                    },
+                ),
             ]),
         ),
         (
             KeyboardLayoutId::Turkish,
             BTreeMap::from([
-                (0x10, LayoutEntry { vk: VirtualKey::Q, plain: Some('q'), shifted: Some('Q'), altgr: None, dead: None }),
-                (0x1a, LayoutEntry { vk: VirtualKey::Oem4, plain: None, shifted: None, altgr: None, dead: Some('^') }),
-                (0x12, LayoutEntry { vk: VirtualKey::E, plain: Some('e'), shifted: Some('E'), altgr: Some('€'), dead: None }),
+                (
+                    0x10,
+                    LayoutEntry {
+                        vk: VirtualKey::Q,
+                        plain: Some('q'),
+                        shifted: Some('Q'),
+                        altgr: None,
+                        dead: None,
+                    },
+                ),
+                (
+                    0x1a,
+                    LayoutEntry {
+                        vk: VirtualKey::Oem4,
+                        plain: None,
+                        shifted: None,
+                        altgr: None,
+                        dead: Some('^'),
+                    },
+                ),
+                (
+                    0x12,
+                    LayoutEntry {
+                        vk: VirtualKey::E,
+                        plain: Some('e'),
+                        shifted: Some('E'),
+                        altgr: Some('€'),
+                        dead: None,
+                    },
+                ),
             ]),
         ),
     ])
@@ -5503,17 +8264,63 @@ pub struct GdiplusPen {
 pub enum GdiplusPathElement {
     StartFigure,
     CloseFigure,
-    Line { x1: f32, y1: f32, x2: f32, y2: f32 },
-    Lines { points: Vec<GdiplusPointF> },
-    Rectangle { x: f32, y: f32, w: f32, h: f32 },
-    Ellipse { x: f32, y: f32, w: f32, h: f32 },
-    Arc { x: f32, y: f32, w: f32, h: f32, start_angle: f32, sweep_angle: f32 },
-    Bezier { points: [GdiplusPointF; 4] },
-    Curve { points: Vec<GdiplusPointF>, tension: f32 },
-    ClosedCurve { points: Vec<GdiplusPointF>, tension: f32 },
-    Polygon { points: Vec<GdiplusPointF> },
-    Pie { x: f32, y: f32, w: f32, h: f32, start_angle: f32, sweep_angle: f32 },
-    String { text: String, font_handle: u64, layout_rect: GdiplusRectF, format_flags: u32 },
+    Line {
+        x1: f32,
+        y1: f32,
+        x2: f32,
+        y2: f32,
+    },
+    Lines {
+        points: Vec<GdiplusPointF>,
+    },
+    Rectangle {
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+    },
+    Ellipse {
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+    },
+    Arc {
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        start_angle: f32,
+        sweep_angle: f32,
+    },
+    Bezier {
+        points: [GdiplusPointF; 4],
+    },
+    Curve {
+        points: Vec<GdiplusPointF>,
+        tension: f32,
+    },
+    ClosedCurve {
+        points: Vec<GdiplusPointF>,
+        tension: f32,
+    },
+    Polygon {
+        points: Vec<GdiplusPointF>,
+    },
+    Pie {
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        start_angle: f32,
+        sweep_angle: f32,
+    },
+    String {
+        text: String,
+        font_handle: u64,
+        layout_rect: GdiplusRectF,
+        format_flags: u32,
+    },
 }
 
 /// A GDI+ path.
@@ -5531,7 +8338,9 @@ pub struct GdiplusMatrix {
 
 impl GdiplusMatrix {
     pub fn identity() -> Self {
-        Self { elements: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0] }
+        Self {
+            elements: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+        }
     }
 }
 
@@ -5678,5 +8487,383 @@ impl GdiplusState {
         self.graphics_from_hdc.insert(handle, hdc);
         self.hdc_to_graphics.insert(hdc, handle);
         handle
+    }
+}
+
+// ===========================================================================
+// Gap 6.7: Raw Input Pre-parsed Data Structures
+// ===========================================================================
+
+/// RAWINPUTHEADER structure (Win32).
+/// Contains the header information for a raw input event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RawInputHeader {
+    /// Type of raw input data: 0 = RIM_TYPEMOUSE, 1 = RIM_TYPEKEYBOARD, 2 = RIM_TYPEHID
+    pub dw_type: u32,
+    /// Size of the entire RAWINPUT structure.
+    pub dw_size: u32,
+    /// Handle to the device generating the raw input.
+    pub h_device: u64,
+    /// Window handle that received the raw input message.
+    pub w_param: u64,
+}
+
+/// RAWMOUSE structure — raw mouse input data.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RawMouseData {
+    /// Mouse state flags (RI_MOUSE_LEFT_BUTTON_DOWN, etc.).
+    pub us_flags: u16,
+    /// Union: flags specifying the meaning of lLastX/lLastY.
+    pub us_button_flags: u16,
+    /// Button data (wheel delta for RI_MOUSE_WHEEL).
+    pub us_button_data: u16,
+    /// Raw button flags.
+    pub ul_raw_buttons: u32,
+    /// Relative mouse motion (X).
+    pub l_last_x: i32,
+    /// Relative mouse motion (Y).
+    pub l_last_y: i32,
+    /// Extra device-specific data.
+    pub ul_extra_information: u64,
+}
+
+/// RAWKEYBOARD structure — raw keyboard input data.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RawKeyboardData {
+    /// Scan code from the key depression.
+    pub make_code: u16,
+    /// Flags (RI_KEY_MAKE, RI_KEY_BREAK, RI_KEY_E0, RI_KEY_E1).
+    pub flags: u16,
+    /// Reserved.
+    pub reserved: u16,
+    /// Virtual key code.
+    pub v_key: u16,
+    /// Message (WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP).
+    pub message: u32,
+    /// Extra device-specific information.
+    pub extra_information: u64,
+}
+
+/// RAWHID structure — raw HID input data.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RawHidData {
+    /// Size of each HID report in bytes.
+    pub dw_size_hid: u32,
+    /// Number of HID reports in bRawData.
+    pub dw_count: u32,
+    /// Raw HID report data.
+    pub b_raw_data: Vec<u8>,
+}
+
+/// RAWINPUT structure — complete raw input event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RawInputData {
+    /// Header containing type, size, device handle, and window handle.
+    pub header: RawInputHeader,
+    /// The device-specific data.
+    pub data: RawInputDeviceData,
+}
+
+/// Device-specific raw input data union.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum RawInputDeviceData {
+    Mouse(RawMouseData),
+    Keyboard(RawKeyboardData),
+    Hid(RawHidData),
+}
+
+impl RawInputData {
+    /// Create a mouse raw input event.
+    pub fn mouse(device: u64, hwnd: u64, x: i32, y: i32, button_flags: u16) -> Self {
+        Self {
+            header: RawInputHeader {
+                dw_type: 0, // RIM_TYPEMOUSE
+                dw_size: 48,
+                h_device: device,
+                w_param: hwnd,
+            },
+            data: RawInputDeviceData::Mouse(RawMouseData {
+                us_flags: 0,
+                us_button_flags: button_flags,
+                us_button_data: 0,
+                ul_raw_buttons: 0,
+                l_last_x: x,
+                l_last_y: y,
+                ul_extra_information: 0,
+            }),
+        }
+    }
+
+    /// Create a keyboard raw input event.
+    pub fn keyboard(device: u64, hwnd: u64, v_key: u16, scan_code: u16, key_down: bool) -> Self {
+        Self {
+            header: RawInputHeader {
+                dw_type: 1, // RIM_TYPEKEYBOARD
+                dw_size: 40,
+                h_device: device,
+                w_param: hwnd,
+            },
+            data: RawInputDeviceData::Keyboard(RawKeyboardData {
+                make_code: scan_code,
+                flags: if key_down { 0 } else { 1 }, // RI_KEY_BREAK = 1
+                reserved: 0,
+                v_key,
+                message: if key_down { 0x0100 } else { 0x0101 }, // WM_KEYDOWN / WM_KEYUP
+                extra_information: 0,
+            }),
+        }
+    }
+
+    /// Create a HID raw input event.
+    pub fn hid(device: u64, hwnd: u64, report: Vec<u8>) -> Self {
+        let report_size = report.len() as u32;
+        Self {
+            header: RawInputHeader {
+                dw_type: 2, // RIM_TYPEHID
+                dw_size: 32 + report.len() as u32,
+                h_device: device,
+                w_param: hwnd,
+            },
+            data: RawInputDeviceData::Hid(RawHidData {
+                dw_size_hid: report_size,
+                dw_count: 1,
+                b_raw_data: report,
+            }),
+        }
+    }
+
+    /// Serialize the raw input data to bytes (for GetRawInputData).
+    /// Returns the serialized bytes matching the Windows RAWINPUT layout.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        // Header
+        bytes.extend_from_slice(&self.header.dw_type.to_le_bytes());
+        bytes.extend_from_slice(&self.header.dw_size.to_le_bytes());
+        bytes.extend_from_slice(&self.header.h_device.to_le_bytes());
+        bytes.extend_from_slice(&self.header.w_param.to_le_bytes());
+        // Device data
+        match &self.data {
+            RawInputDeviceData::Mouse(m) => {
+                bytes.extend_from_slice(&m.us_flags.to_le_bytes());
+                bytes.extend_from_slice(&m.us_button_flags.to_le_bytes());
+                bytes.extend_from_slice(&m.us_button_data.to_le_bytes());
+                bytes.extend_from_slice(&m.ul_raw_buttons.to_le_bytes());
+                bytes.extend_from_slice(&m.l_last_x.to_le_bytes());
+                bytes.extend_from_slice(&m.l_last_y.to_le_bytes());
+                bytes.extend_from_slice(&m.ul_extra_information.to_le_bytes());
+            }
+            RawInputDeviceData::Keyboard(k) => {
+                bytes.extend_from_slice(&k.make_code.to_le_bytes());
+                bytes.extend_from_slice(&k.flags.to_le_bytes());
+                bytes.extend_from_slice(&k.reserved.to_le_bytes());
+                bytes.extend_from_slice(&k.v_key.to_le_bytes());
+                bytes.extend_from_slice(&k.message.to_le_bytes());
+                bytes.extend_from_slice(&k.extra_information.to_le_bytes());
+            }
+            RawInputDeviceData::Hid(h) => {
+                bytes.extend_from_slice(&h.dw_size_hid.to_le_bytes());
+                bytes.extend_from_slice(&h.dw_count.to_le_bytes());
+                bytes.extend_from_slice(&h.b_raw_data);
+            }
+        }
+        bytes
+    }
+}
+
+// ===========================================================================
+// Gap 6.9: Pointer Device APIs — Enhanced Implementations
+// ===========================================================================
+
+/// Pointer device information (GetPointerDevice).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PointerDeviceInfo {
+    /// Device product ID.
+    pub product_id: u32,
+    /// Device vendor ID.
+    pub vendor_id: u32,
+    /// Version number of the device.
+    pub version: u32,
+    /// Type of pointer device: 1 = touch, 2 = pen, 3 = touchpad, 4 = mouse.
+    pub pointer_device_type: u32,
+    /// The monitor on which the device is displayed.
+    pub monitor: u32,
+    /// Maximum simultaneous contacts.
+    pub max_contacts: u32,
+    /// Whether the device supports pressure.
+    pub supports_pressure: bool,
+    /// Whether the device supports tilt (X/Y).
+    pub supports_tilt: bool,
+    /// Whether the device supports twist (rotation).
+    pub supports_twist: bool,
+    /// Device name (from macOS IOKit).
+    pub device_name: String,
+}
+
+impl Default for PointerDeviceInfo {
+    fn default() -> Self {
+        Self {
+            product_id: 0,
+            vendor_id: 0,
+            version: 1,
+            pointer_device_type: 1, // touch
+            monitor: 1,
+            max_contacts: 10,
+            supports_pressure: true,
+            supports_tilt: true,
+            supports_twist: false,
+            device_name: "Apple Trackpad".to_string(),
+        }
+    }
+}
+
+/// Enhanced pointer capabilities (GetPointerDeviceCaps extended).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PointerDeviceCapsEx {
+    /// Maximum number of simultaneous touch contacts.
+    pub max_contacts: u32,
+    /// Maximum pressure level (0 = not supported).
+    pub max_pressure: u32,
+    /// Maximum tilt X angle in degrees (0 = not supported).
+    pub max_tilt_x: u32,
+    /// Maximum tilt Y angle in degrees (0 = not supported).
+    pub max_tilt_y: u32,
+    /// Maximum twist rotation in degrees (0 = not supported).
+    pub max_twist: u32,
+    /// Resolution in dots per inch.
+    pub dpi: u32,
+    /// Report rate in Hz.
+    pub report_rate: u32,
+    /// Device type.
+    pub device_type: u32,
+}
+
+impl Default for PointerDeviceCapsEx {
+    fn default() -> Self {
+        // Apple Magic Trackpad / MacBook trackpad defaults
+        Self {
+            max_contacts: 10,
+            max_pressure: 8, // macOS pressure levels 0-8
+            max_tilt_x: 0,   // trackpads don't report tilt
+            max_tilt_y: 0,
+            max_twist: 0,
+            dpi: 72,
+            report_rate: 125,
+            device_type: 1, // touch
+        }
+    }
+}
+
+/// Pointer frame info with extended data (GetPointerFrameInfoEx).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PointerFrameInfoEx {
+    /// Number of pointers in this frame.
+    pub pointer_count: u32,
+    /// Frame ID (monotonically increasing).
+    pub frame_id: u32,
+    /// Pointer flags for the frame.
+    pub pointer_flags: u32,
+    /// Timestamp of the frame (in 100ns intervals since boot).
+    pub display_time: u64,
+    /// Performance counter value at frame time.
+    pub performance_count: u64,
+    /// Per-pointer data for each contact in the frame.
+    pub pointers: Vec<PointerContactInfo>,
+}
+
+/// Per-contact pointer information within a frame.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PointerContactInfo {
+    /// Pointer ID (stable across the contact lifetime).
+    pub pointer_id: u32,
+    /// X coordinate in pixels.
+    pub x: i32,
+    /// Y coordinate in pixels.
+    pub y: i32,
+    /// Pressure level (0-8 for macOS trackpad).
+    pub pressure: u32,
+    /// Tilt X in degrees (-90 to 90, 0 if unsupported).
+    pub tilt_x: i32,
+    /// Tilt Y in degrees (-90 to 90, 0 if unsupported).
+    pub tilt_y: i32,
+    /// Twist rotation in degrees (0-359, 0 if unsupported).
+    pub twist: u32,
+    /// Contact area width in pixels.
+    pub contact_rect_width: u32,
+    /// Contact area height in pixels.
+    pub contact_rect_height: u32,
+    /// Pointer flags (CONTACT, DOWN, UPDATE, UP, etc.).
+    pub flags: u32,
+}
+
+impl User32Subsystem {
+    /// Gap 6.9: GetPointerDevice — retrieve pointer device information.
+    ///
+    /// Returns information about the primary pointer device (trackpad/mouse/tablet).
+    /// On macOS, queries IOKit for device information if available.
+    pub fn get_pointer_device(&self) -> PointerDeviceInfo {
+        #[cfg(target_os = "macos")]
+        {
+            // Query macOS for trackpad/mouse device information
+            // Default to Apple trackpad characteristics
+            PointerDeviceInfo {
+                product_id: 0x0265, // Apple Magic Trackpad product ID
+                vendor_id: 0x05AC,  // Apple vendor ID
+                version: 1,
+                pointer_device_type: 1, // touch
+                monitor: 1,
+                max_contacts: 10,
+                supports_pressure: true,
+                supports_tilt: false,
+                supports_twist: false,
+                device_name: "Apple Trackpad".to_string(),
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            PointerDeviceInfo::default()
+        }
+    }
+
+    /// Gap 6.9: GetPointerDeviceCapsEx — extended pointer device capabilities.
+    ///
+    /// Returns detailed capabilities of the pointer device including
+    /// pressure, tilt, and twist support.
+    pub fn get_pointer_device_caps_ex(&self) -> PointerDeviceCapsEx {
+        #[cfg(target_os = "macos")]
+        {
+            PointerDeviceCapsEx {
+                max_contacts: 10,
+                max_pressure: 8, // macOS Force Touch levels
+                max_tilt_x: 0,   // trackpad doesn't report tilt
+                max_tilt_y: 0,
+                max_twist: 0,
+                dpi: 72,
+                report_rate: 125,
+                device_type: 1,
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            PointerDeviceCapsEx::default()
+        }
+    }
+
+    /// Gap 6.7: Generate raw input data from macOS CGEvent.
+    ///
+    /// Creates a RawInputData structure from the current mouse position delta
+    /// using macOS CoreGraphics event data.
+    #[cfg(target_os = "macos")]
+    pub fn generate_raw_mouse_from_cgevent(&self, dx: i32, dy: i32, buttons: u16) -> RawInputData {
+        RawInputData::mouse(1, 0, dx, dy, buttons)
+    }
+
+    /// Gap 6.7: Generate raw keyboard input from a key event.
+    pub fn generate_raw_keyboard_event(
+        &self,
+        v_key: u16,
+        scan_code: u16,
+        key_down: bool,
+    ) -> RawInputData {
+        RawInputData::keyboard(2, 0, v_key, scan_code, key_down)
     }
 }

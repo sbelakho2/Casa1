@@ -26,7 +26,6 @@ use std::ffi::CString;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // SCM configuration
@@ -142,18 +141,11 @@ pub enum VZDeviceConfiguration {
         mount_tag: String,
     },
     /// Virtio-NET with optional MAC address.
-    VirtioNet {
-        mac_address: Option<String>,
-    },
+    VirtioNet { mac_address: Option<String> },
     /// Serial port for console I/O.
-    SerialPort {
-        handler: SerialHandler,
-    },
+    SerialPort { handler: SerialHandler },
     /// Block storage device (disk image).
-    Storage {
-        path: String,
-        readonly: bool,
-    },
+    Storage { path: String, readonly: bool },
     /// Entropy device for guest random number generation.
     Entropy,
 }
@@ -381,7 +373,10 @@ impl VZVirtualMachineHandle {
         #[cfg(target_os = "macos")]
         {
             unsafe {
-                let _ = Self::vz_request_stop_sync(self.vm);
+                let stop_result = Self::vz_request_stop_sync(self.vm);
+                if !stop_result {
+                    eprintln!("SCM: VZ requestStop completed but reported failure");
+                }
                 Ok(())
             }
         }
@@ -453,17 +448,14 @@ impl VZVirtualMachineHandle {
             }
         }
 
-        let block = BlockLiteral::<
-            extern "C" fn(*const std::ffi::c_void, *mut objc::runtime::Object),
-        > {
-            isa: std::ptr::null_mut(),
-            flags: BLOCK_FLAGS_STACK,
-            reserved: 0,
-            invoke: completion_handler as *const extern "C" fn(
-                *const std::ffi::c_void,
-                *mut objc::runtime::Object,
-            ),
-        };
+        let block =
+            BlockLiteral::<extern "C" fn(*const std::ffi::c_void, *mut objc::runtime::Object)> {
+                isa: std::ptr::null_mut(),
+                flags: BLOCK_FLAGS_STACK,
+                reserved: 0,
+                invoke: completion_handler
+                    as *const extern "C" fn(*const std::ffi::c_void, *mut objc::runtime::Object),
+            };
 
         let _: () = msg_send![
             vm,
@@ -499,17 +491,14 @@ impl VZVirtualMachineHandle {
             VZ_STOP_RESULT.store(true, Ordering::SeqCst);
         }
 
-        let block = BlockLiteral::<
-            extern "C" fn(*const std::ffi::c_void, *mut objc::runtime::Object),
-        > {
-            isa: std::ptr::null_mut(),
-            flags: BLOCK_FLAGS_STACK,
-            reserved: 0,
-            invoke: stop_completion as *const extern "C" fn(
-                *const std::ffi::c_void,
-                *mut objc::runtime::Object,
-            ),
-        };
+        let block =
+            BlockLiteral::<extern "C" fn(*const std::ffi::c_void, *mut objc::runtime::Object)> {
+                isa: std::ptr::null_mut(),
+                flags: BLOCK_FLAGS_STACK,
+                reserved: 0,
+                invoke: stop_completion
+                    as *const extern "C" fn(*const std::ffi::c_void, *mut objc::runtime::Object),
+            };
 
         let _: () = msg_send![
             vm,
@@ -545,17 +534,14 @@ impl VZVirtualMachineHandle {
             VZ_PAUSE_RESULT.store(true, Ordering::SeqCst);
         }
 
-        let block = BlockLiteral::<
-            extern "C" fn(*const std::ffi::c_void, *mut objc::runtime::Object),
-        > {
-            isa: std::ptr::null_mut(),
-            flags: BLOCK_FLAGS_STACK,
-            reserved: 0,
-            invoke: pause_completion as *const extern "C" fn(
-                *const std::ffi::c_void,
-                *mut objc::runtime::Object,
-            ),
-        };
+        let block =
+            BlockLiteral::<extern "C" fn(*const std::ffi::c_void, *mut objc::runtime::Object)> {
+                isa: std::ptr::null_mut(),
+                flags: BLOCK_FLAGS_STACK,
+                reserved: 0,
+                invoke: pause_completion
+                    as *const extern "C" fn(*const std::ffi::c_void, *mut objc::runtime::Object),
+            };
 
         let _: () = msg_send![
             vm,
@@ -591,17 +577,14 @@ impl VZVirtualMachineHandle {
             VZ_RESUME_RESULT.store(true, Ordering::SeqCst);
         }
 
-        let block = BlockLiteral::<
-            extern "C" fn(*const std::ffi::c_void, *mut objc::runtime::Object),
-        > {
-            isa: std::ptr::null_mut(),
-            flags: BLOCK_FLAGS_STACK,
-            reserved: 0,
-            invoke: resume_completion as *const extern "C" fn(
-                *const std::ffi::c_void,
-                *mut objc::runtime::Object,
-            ),
-        };
+        let block =
+            BlockLiteral::<extern "C" fn(*const std::ffi::c_void, *mut objc::runtime::Object)> {
+                isa: std::ptr::null_mut(),
+                flags: BLOCK_FLAGS_STACK,
+                reserved: 0,
+                invoke: resume_completion
+                    as *const extern "C" fn(*const std::ffi::c_void, *mut objc::runtime::Object),
+            };
 
         let _: () = msg_send![
             vm,
@@ -637,17 +620,14 @@ impl VZVirtualMachineHandle {
             VZ_REQSTOP_RESULT.store(true, Ordering::SeqCst);
         }
 
-        let block = BlockLiteral::<
-            extern "C" fn(*const std::ffi::c_void, *mut objc::runtime::Object),
-        > {
-            isa: std::ptr::null_mut(),
-            flags: BLOCK_FLAGS_STACK,
-            reserved: 0,
-            invoke: reqstop_completion as *const extern "C" fn(
-                *const std::ffi::c_void,
-                *mut objc::runtime::Object,
-            ),
-        };
+        let block =
+            BlockLiteral::<extern "C" fn(*const std::ffi::c_void, *mut objc::runtime::Object)> {
+                isa: std::ptr::null_mut(),
+                flags: BLOCK_FLAGS_STACK,
+                reserved: 0,
+                invoke: reqstop_completion
+                    as *const extern "C" fn(*const std::ffi::c_void, *mut objc::runtime::Object),
+            };
 
         let _: () = msg_send![
             vm,
@@ -756,8 +736,10 @@ fn load_virtualization_framework() -> bool {
     use std::sync::OnceLock;
     static LOADED: OnceLock<bool> = OnceLock::new();
     *LOADED.get_or_init(|| unsafe {
-        // Check if VZVirtualMachine class is already available
-        if objc::runtime::Class::get("VZVirtualMachine").is_some() {
+        // Check if VZVirtualMachine class is already available in the
+        // Objective-C runtime (indicates the framework was already loaded).
+        let framework_already_loaded = objc::runtime::Class::get("VZVirtualMachine").is_some();
+        if framework_already_loaded {
             return true;
         }
         // Load the framework bundle
@@ -765,8 +747,7 @@ fn load_virtualization_framework() -> bool {
             Some(c) => c,
             None => return false,
         };
-        let path_str =
-            CString::new("/System/Library/Frameworks/Virtualization.framework").unwrap();
+        let path_str = CString::new("/System/Library/Frameworks/Virtualization.framework").unwrap();
         let ns_string_cls = match objc::runtime::Class::get("NSString") {
             Some(c) => c,
             None => return false,
@@ -941,16 +922,14 @@ pub fn create_vz_virtual_machine(
                         if let Some(cls_gpu) =
                             objc::runtime::Class::get("VZVirtioGraphicsDeviceConfiguration")
                         {
-                            let gpu_alloc: *mut objc::runtime::Object =
-                                msg_send![cls_gpu, alloc];
+                            let gpu_alloc: *mut objc::runtime::Object = msg_send![cls_gpu, alloc];
                             let gpu: *mut objc::runtime::Object = msg_send![gpu_alloc, init];
                             if let Some(cls_scanout) =
                                 objc::runtime::Class::get("VZVirtioGraphicsScanoutConfiguration")
                             {
                                 let so_alloc: *mut objc::runtime::Object =
                                     msg_send![cls_scanout, alloc];
-                                let scanout: *mut objc::runtime::Object =
-                                    msg_send![so_alloc, init];
+                                let scanout: *mut objc::runtime::Object = msg_send![so_alloc, init];
                                 let scanouts_array: *mut objc::runtime::Object = {
                                     let cls_arr = objc::runtime::Class::get("NSArray").unwrap();
                                     let args = [scanout];
@@ -990,11 +969,9 @@ pub fn create_vz_virtual_machine(
                                 let cls_url = objc::runtime::Class::get("NSURL").unwrap();
                                 msg_send![cls_url, fileURLWithPath: ns_dir]
                             };
-                            if let Some(cls_share) =
-                                objc::runtime::Class::get("VZSharedDirectory")
+                            if let Some(cls_share) = objc::runtime::Class::get("VZSharedDirectory")
                             {
-                                let share: *mut objc::runtime::Object =
-                                    msg_send![cls_share, alloc];
+                                let share: *mut objc::runtime::Object = msg_send![cls_share, alloc];
                                 let share: *mut objc::runtime::Object =
                                     msg_send![share, initWithURL: dir_url readOnly: false];
                                 let _: () = msg_send![fs_dev, setShare: share];
@@ -1010,21 +987,16 @@ pub fn create_vz_virtual_machine(
                         if let Some(cls_net) =
                             objc::runtime::Class::get("VZVirtioNetworkDeviceConfiguration")
                         {
-                            let net_alloc: *mut objc::runtime::Object =
-                                msg_send![cls_net, alloc];
-                            let net_dev: *mut objc::runtime::Object =
-                                msg_send![net_alloc, init];
+                            let net_alloc: *mut objc::runtime::Object = msg_send![cls_net, alloc];
+                            let net_dev: *mut objc::runtime::Object = msg_send![net_alloc, init];
 
                             if let Some(mac) = mac_address {
                                 let mac_str = CString::new(mac.as_str()).unwrap();
                                 let ns_mac: *mut objc::runtime::Object = {
-                                    let cls_str =
-                                        objc::runtime::Class::get("NSString").unwrap();
+                                    let cls_str = objc::runtime::Class::get("NSString").unwrap();
                                     msg_send![cls_str, stringWithUTF8String: mac_str.as_ptr()]
                                 };
-                                if let Some(cls_mac) =
-                                    objc::runtime::Class::get("VZMACAddress")
-                                {
+                                if let Some(cls_mac) = objc::runtime::Class::get("VZMACAddress") {
                                     let mac_addr: *mut objc::runtime::Object =
                                         msg_send![cls_mac, alloc];
                                     let mac_addr: *mut objc::runtime::Object = msg_send![
@@ -1073,8 +1045,7 @@ pub fn create_vz_virtual_machine(
                         if let Some(cls_disk) =
                             objc::runtime::Class::get("VZDiskImageStorageDeviceAttachment")
                         {
-                            let disk_alloc: *mut objc::runtime::Object =
-                                msg_send![cls_disk, alloc];
+                            let disk_alloc: *mut objc::runtime::Object = msg_send![cls_disk, alloc];
                             let disk: *mut objc::runtime::Object = msg_send![
                                 disk_alloc,
                                 initWithURL: storage_url
@@ -1108,8 +1079,7 @@ pub fn create_vz_virtual_machine(
                         {
                             let ent_alloc: *mut objc::runtime::Object =
                                 msg_send![cls_entropy, alloc];
-                            let ent_dev: *mut objc::runtime::Object =
-                                msg_send![ent_alloc, init];
+                            let ent_dev: *mut objc::runtime::Object = msg_send![ent_alloc, init];
                             Some(ent_dev)
                         } else {
                             None
@@ -1131,8 +1101,7 @@ pub fn create_vz_virtual_machine(
             let valid: bool = msg_send![vz_config, validateWithError: error_ptr];
             if !valid {
                 let error_msg = if !error.is_null() {
-                    let desc: *mut objc::runtime::Object =
-                        msg_send![error, localizedDescription];
+                    let desc: *mut objc::runtime::Object = msg_send![error, localizedDescription];
                     let cstr: *const i8 = msg_send![desc, UTF8String];
                     if !cstr.is_null() {
                         std::ffi::CStr::from_ptr(cstr)
@@ -1154,13 +1123,12 @@ pub fn create_vz_virtual_machine(
             }
 
             // --- Create VZVirtualMachine ---
-            let cls_vm =
-                objc::runtime::Class::get("VZVirtualMachine").ok_or_else(|| {
-                    AppError::new(
-                        ReasonCode::RcVulkanNotSupported,
-                        "SCM: VZVirtualMachine class not found",
-                    )
-                })?;
+            let cls_vm = objc::runtime::Class::get("VZVirtualMachine").ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcVulkanNotSupported,
+                    "SCM: VZVirtualMachine class not found",
+                )
+            })?;
             let vm_alloc: *mut objc::runtime::Object = msg_send![cls_vm, alloc];
             let vm: *mut objc::runtime::Object =
                 msg_send![vm_alloc, initWithConfiguration: vz_config];
@@ -1199,9 +1167,7 @@ pub enum BootLoaderType {
         command_line: String,
     },
     /// Windows EFI boot with variable store path.
-    WindowsEfi {
-        efi_variable_store_path: String,
-    },
+    WindowsEfi { efi_variable_store_path: String },
 }
 
 /// ARM64 virtual machine configuration.
@@ -1356,6 +1322,7 @@ impl VirtioGpuMetal {
                 )
             })?;
 
+        #[allow(unused_mut)]
         let mut gpu = Self {
             scanout_width: width,
             scanout_height: height,
@@ -1494,15 +1461,12 @@ impl VirtioGpuMetal {
 
         #[cfg(target_os = "macos")]
         {
-            if let (Some(texture_ptr), Some(queue_ptr)) =
-                (self.metal_texture, self.command_queue)
-            {
+            if let (Some(texture_ptr), Some(queue_ptr)) = (self.metal_texture, self.command_queue) {
                 unsafe {
                     let texture = texture_ptr as *mut objc::runtime::Object;
                     let queue = queue_ptr as *mut objc::runtime::Object;
 
-                    let cmd_buffer: *mut objc::runtime::Object =
-                        msg_send![queue, commandBuffer];
+                    let cmd_buffer: *mut objc::runtime::Object = msg_send![queue, commandBuffer];
                     if cmd_buffer.is_null() {
                         return Err(AppError::new(
                             ReasonCode::RcD3dInvalidState,
@@ -1527,8 +1491,8 @@ impl VirtioGpuMetal {
                         if src_offset < self.framebuffer.len() {
                             // Use replaceRegion:mipmapLevel:withBytes:bytesPerRow:
                             // to update the texture from the CPU framebuffer
+                            // Source pointer for the dirty region within the framebuffer.
                             let region_data = self.framebuffer.as_ptr().add(src_offset);
-                            let _ = region_data; // Used in the msg_send below
 
                             // MTLRegion: { origin: {x, y, z}, size: {w, h, d} }
                             #[repr(C)]
@@ -1556,7 +1520,7 @@ impl VirtioGpuMetal {
                                 texture,
                                 replaceRegion: region
                                 mipmapLevel: 0u64
-                                withBytes: self.framebuffer.as_ptr().add(src_offset) as *const std::ffi::c_void
+                                withBytes: region_data as *const std::ffi::c_void
                                 bytesPerRow: bytes_per_row
                             ];
                         }
@@ -1601,14 +1565,12 @@ impl VirtioGpuMetal {
         {
             if let Some(texture_ptr) = self.metal_texture.take() {
                 unsafe {
-                    let _: () =
-                        msg_send![texture_ptr as *mut objc::runtime::Object, release];
+                    let _: () = msg_send![texture_ptr as *mut objc::runtime::Object, release];
                 }
             }
             if let Some(queue_ptr) = self.command_queue.take() {
                 unsafe {
-                    let _: () =
-                        msg_send![queue_ptr as *mut objc::runtime::Object, release];
+                    let _: () = msg_send![queue_ptr as *mut objc::runtime::Object, release];
                 }
             }
             self.init_metal_resources();
@@ -1617,7 +1579,6 @@ impl VirtioGpuMetal {
         Ok(())
     }
 }
-
 
 impl std::fmt::Debug for VirtioGpuMetal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1771,9 +1732,8 @@ impl VirtioFsBridge {
             AppError::from_io(ReasonCode::RcIo, "SCM: failed to open file for reading", &e)
         })?;
 
-        file.seek(SeekFrom::Start(position)).map_err(|e| {
-            AppError::from_io(ReasonCode::RcIo, "SCM: failed to seek", &e)
-        })?;
+        file.seek(SeekFrom::Start(position))
+            .map_err(|e| AppError::from_io(ReasonCode::RcIo, "SCM: failed to seek", &e))?;
 
         let bytes_read = file.read(buffer).map_err(|e| {
             AppError::from_io(
@@ -1815,16 +1775,11 @@ impl VirtioFsBridge {
             .write(true)
             .open(&host_path)
             .map_err(|e| {
-                AppError::from_io(
-                    ReasonCode::RcIo,
-                    "SCM: failed to open file for writing",
-                    &e,
-                )
+                AppError::from_io(ReasonCode::RcIo, "SCM: failed to open file for writing", &e)
             })?;
 
-        file.seek(SeekFrom::Start(position)).map_err(|e| {
-            AppError::from_io(ReasonCode::RcIo, "SCM: failed to seek", &e)
-        })?;
+        file.seek(SeekFrom::Start(position))
+            .map_err(|e| AppError::from_io(ReasonCode::RcIo, "SCM: failed to seek", &e))?;
 
         let bytes_written = file.write(data).map_err(|e| {
             AppError::from_io(
@@ -1861,7 +1816,7 @@ impl VirtioFsBridge {
                 return Err(AppError::new(
                     ReasonCode::RcFsPathInvalid,
                     format!("SCM: invalid seek whence: {whence}"),
-                ))
+                ));
             }
         };
 
@@ -1869,9 +1824,9 @@ impl VirtioFsBridge {
             AppError::from_io(ReasonCode::RcIo, "SCM: failed to open file for seek", &e)
         })?;
 
-        let new_pos = file.seek(seek_from).map_err(|e| {
-            AppError::from_io(ReasonCode::RcIo, "SCM: seek failed", &e)
-        })?;
+        let new_pos = file
+            .seek(seek_from)
+            .map_err(|e| AppError::from_io(ReasonCode::RcIo, "SCM: seek failed", &e))?;
 
         if let Some(fh) = self.file_handles.get_mut(&handle) {
             fh.position = new_pos;
@@ -1983,11 +1938,7 @@ impl VirtioFsBridge {
         let mut names = Vec::new();
         for entry in entries {
             let entry = entry.map_err(|e| {
-                AppError::from_io(
-                    ReasonCode::RcIo,
-                    "SCM: failed to read directory entry",
-                    &e,
-                )
+                AppError::from_io(ReasonCode::RcIo, "SCM: failed to read directory entry", &e)
             })?;
             if let Some(name) = entry.file_name().to_str() {
                 names.push(name.to_string());
@@ -2087,8 +2038,7 @@ impl VirtioNetBridge {
         }
 
         let copy_len = buffer.len().min(self.rx_buffer.len());
-        buffer[..copy_len
-].copy_from_slice(&self.rx_buffer[..copy_len]);
+        buffer[..copy_len].copy_from_slice(&self.rx_buffer[..copy_len]);
         self.rx_buffer.drain(..copy_len);
         self.stats.bytes_received += copy_len as u64;
         self.stats.packets_received += 1;
@@ -2219,11 +2169,7 @@ pub fn measure_component(component: &str, data: &[u8]) -> AppResult<[u8; 32]> {
 ///
 /// The PCR value is updated to `SHA-256( old_pcr || new_data )`.
 /// The measurement is appended to the measurement log.
-pub fn extend_pcr(
-    state: &mut MeasuredLaunchState,
-    pcr_index: usize,
-    data: &[u8],
-) -> AppResult<()> {
+pub fn extend_pcr(state: &mut MeasuredLaunchState, pcr_index: usize, data: &[u8]) -> AppResult<()> {
     if pcr_index >= 8 {
         return Err(AppError::new(
             ReasonCode::RcFsPathInvalid,
@@ -2544,12 +2490,16 @@ impl WindowsKernelShim {
 
     /// Complete an IRP by ID with the given NTSTATUS code.
     pub fn complete_irp(&mut self, irp_id: u64, status: i32) -> AppResult<()> {
-        let irp = self.irp_queue.iter_mut().find(|i| i.irp_id == irp_id).ok_or_else(|| {
-            AppError::new(
-                ReasonCode::RcNotFound,
-                format!("SCM: IRP not found: {irp_id}"),
-            )
-        })?;
+        let irp = self
+            .irp_queue
+            .iter_mut()
+            .find(|i| i.irp_id == irp_id)
+            .ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcNotFound,
+                    format!("SCM: IRP not found: {irp_id}"),
+                )
+            })?;
         irp.status = status;
         irp.completed = true;
         Ok(())
@@ -2705,11 +2655,21 @@ impl ScmController {
         self.kernel_shim.ntoskrnl_base = 0xFFFFF800_00000000;
         self.kernel_shim.hal_base = self.kernel_shim.ntoskrnl_base + 0x200000;
 
-        self.kernel_shim.registered_drivers.push("ntoskrnl.exe".to_string());
-        self.kernel_shim.registered_drivers.push("hal.dll".to_string());
-        self.kernel_shim.registered_drivers.push("ksecdd.sys".to_string());
-        self.kernel_shim.registered_drivers.push("ndis.sys".to_string());
-        self.kernel_shim.registered_drivers.push("dxgkrnl.sys".to_string());
+        self.kernel_shim
+            .registered_drivers
+            .push("ntoskrnl.exe".to_string());
+        self.kernel_shim
+            .registered_drivers
+            .push("hal.dll".to_string());
+        self.kernel_shim
+            .registered_drivers
+            .push("ksecdd.sys".to_string());
+        self.kernel_shim
+            .registered_drivers
+            .push("ndis.sys".to_string());
+        self.kernel_shim
+            .registered_drivers
+            .push("dxgkrnl.sys".to_string());
 
         self.kernel_shim.loaded = true;
         Ok(())
@@ -2724,8 +2684,14 @@ impl ScmController {
             ));
         }
 
-        self.kernel_shim.driver_objects.insert(name.to_string(), base);
-        if !self.kernel_shim.registered_drivers.contains(&name.to_string()) {
+        self.kernel_shim
+            .driver_objects
+            .insert(name.to_string(), base);
+        if !self
+            .kernel_shim
+            .registered_drivers
+            .contains(&name.to_string())
+        {
             self.kernel_shim.registered_drivers.push(name.to_string());
         }
 
@@ -2753,7 +2719,8 @@ impl ScmController {
             let src_start = (row * width * 4) as usize;
             let src_end = src_start + (width as usize * 4).min(pixels.len() - src_start);
             let dst_start = ((y + row) * fb_width + x) as usize * 4;
-            let dst_end = dst_start + (width as usize * 4).min(self.virtio_gpu.framebuffer.len() - dst_start);
+            let dst_end =
+                dst_start + (width as usize * 4).min(self.virtio_gpu.framebuffer.len() - dst_start);
 
             if src_end > src_start && dst_end > dst_start {
                 let copy_len = dst_end - dst_start;
@@ -2827,9 +2794,10 @@ impl ScmRunnerIntegration {
             None
         };
 
-        let fs_bridge = config.shared_directory.as_ref().map(|dir| {
-            VirtioFsBridge::new(dir, "casa1-shared")
-        });
+        let fs_bridge = config
+            .shared_directory
+            .as_ref()
+            .map(|dir| VirtioFsBridge::new(dir, "casa1-shared"));
 
         let net_bridge = if config.virtio_net {
             Some(VirtioNetBridge::new("02:00:00:00:00:01"))
@@ -2874,7 +2842,12 @@ impl ScmRunnerIntegration {
             cpu_count: self.controller.config.cpu_count,
             memory_mb: self.controller.config.memory_mb,
             boot_loader: BootLoaderType::LinuxKernel {
-                kernel_path: self.controller.config.kernel_path.clone().unwrap_or_default(),
+                kernel_path: self
+                    .controller
+                    .config
+                    .kernel_path
+                    .clone()
+                    .unwrap_or_default(),
                 initrd_path: None,
                 command_line: "console=hvc0 root=/dev/vda".to_string(),
             },
@@ -3048,10 +3021,12 @@ mod tests {
         controller
             .register_driver("eac_driver.sys", 0xFFFFF800_00200000)
             .expect("register driver");
-        assert!(controller
-            .kernel_shim
-            .registered_drivers
-            .contains(&"eac_driver.sys".to_string()));
+        assert!(
+            controller
+                .kernel_shim
+                .registered_drivers
+                .contains(&"eac_driver.sys".to_string())
+        );
     }
 
     #[test]
@@ -3118,11 +3093,26 @@ mod tests {
         assert_eq!(vz_config.cpu_count, 8);
         assert_eq!(vz_config.memory_size, 8192 * 1024 * 1024);
 
-        let has_gpu = vz_config.devices.iter().any(|d| matches!(d, VZDeviceConfiguration::VirtioGpu));
-        let has_fs = vz_config.devices.iter().any(|d| matches!(d, VZDeviceConfiguration::VirtioFs { .. }));
-        let has_net = vz_config.devices.iter().any(|d| matches!(d, VZDeviceConfiguration::VirtioNet { .. }));
-        let has_serial = vz_config.devices.iter().any(|d| matches!(d, VZDeviceConfiguration::SerialPort { .. }));
-        let has_entropy = vz_config.devices.iter().any(|d| matches!(d, VZDeviceConfiguration::Entropy));
+        let has_gpu = vz_config
+            .devices
+            .iter()
+            .any(|d| matches!(d, VZDeviceConfiguration::VirtioGpu));
+        let has_fs = vz_config
+            .devices
+            .iter()
+            .any(|d| matches!(d, VZDeviceConfiguration::VirtioFs { .. }));
+        let has_net = vz_config
+            .devices
+            .iter()
+            .any(|d| matches!(d, VZDeviceConfiguration::VirtioNet { .. }));
+        let has_serial = vz_config
+            .devices
+            .iter()
+            .any(|d| matches!(d, VZDeviceConfiguration::SerialPort { .. }));
+        let has_entropy = vz_config
+            .devices
+            .iter()
+            .any(|d| matches!(d, VZDeviceConfiguration::Entropy));
 
         assert!(has_gpu, "VirtioGpu device should be present");
         assert!(has_fs, "VirtioFs device should be present");
@@ -3147,7 +3137,8 @@ mod tests {
         let mut gpu = VirtioGpuMetal::create_metal_backed_gpu(1280, 720).expect("create Metal GPU");
 
         let pixels = vec![0xAB; 100 * 100 * 4];
-        gpu.update_scanout(&pixels, 10, 20, 100, 100).expect("update scanout");
+        gpu.update_scanout(&pixels, 10, 20, 100, 100)
+            .expect("update scanout");
 
         assert_eq!(gpu.dirty_rects.len(), 1);
         let rect = &gpu.dirty_rects[0];
@@ -3185,7 +3176,8 @@ mod tests {
         assert_eq!(&buffer[..11], b"hello world");
 
         bridge.close(handle).expect("close file");
-        assert!(bridge.read(handle, &mut buffer).is_err());
+        let _result = bridge.read(handle, &mut buffer);
+        assert!(_result.is_err(), "expected Err, got {_result:?}");
     }
 
     #[test]
@@ -3224,7 +3216,9 @@ mod tests {
         bridge.rx_buffer.extend(tx_data);
 
         let mut rx_buffer = vec![0u8; 64];
-        let received = bridge.receive_packet(&mut rx_buffer).expect("receive packet");
+        let received = bridge
+            .receive_packet(&mut rx_buffer)
+            .expect("receive packet");
         assert_eq!(received, 6);
         assert_eq!(&rx_buffer[..6], &packet);
         assert_eq!(bridge.stats.bytes_received, 6);
@@ -3336,8 +3330,10 @@ mod tests {
         assert_eq!(svc.state, ServiceState::Stopped);
         assert!(svc.pid.is_none());
 
-        assert!(shim.create_service("Winmgmt", "Dup", 0, 0, "").is_err());
-        assert!(shim.start_service("NoSuchService").is_err());
+        let _result = shim.create_service("Winmgmt", "Dup", 0, 0, "");
+        assert!(_result.is_err(), "expected Err, got {_result:?}");
+        let _result = shim.start_service("NoSuchService");
+        assert!(_result.is_err(), "expected Err, got {_result:?}");
     }
 
     #[test]

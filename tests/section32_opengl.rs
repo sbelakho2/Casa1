@@ -9,12 +9,7 @@
 
 mod support;
 
-use casa1::vkgl::{
-    GLState, GLBlendState, GLDepthState, GLStencilState,
-    GLRasterizerState, GLScissorState, GLFramebufferState,
-    AngleLoader, GlslToMslTranslator, GlslShaderStage,
-    ThreadSafeGLState,
-};
+use casa1::vkgl::{AngleLoader, GLState, GlslShaderStage, ThreadSafeGLState};
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // t32_01 — WGL context creation / make current / delete
@@ -54,10 +49,12 @@ fn t32_01_wgl_context_lifecycle() {
     assert!(!gl.has_current_context());
 
     // Delete non-existent context should fail
-    assert!(gl.gl_delete_context(9999).is_err());
+    let _result = gl.gl_delete_context(9999);
+    assert!(_result.is_err(), "expected Err, got {_result:?}");
 
     // Make non-existent context current should fail
-    assert!(gl.gl_make_current(9999).is_err());
+    let _result = gl.gl_make_current(9999);
+    assert!(_result.is_err(), "expected Err, got {_result:?}");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -93,8 +90,8 @@ fn t32_02_gl_state_defaults() {
     // Check rasterizer state defaults (Phase 2.6)
     assert!(!ctx_ref.rasterizer_state.cull_face_enabled);
     assert_eq!(ctx_ref.rasterizer_state.cull_face_mode, 0x0405); // GL_BACK
-    assert_eq!(ctx_ref.rasterizer_state.front_face, 0x0901);     // GL_CCW
-    assert_eq!(ctx_ref.rasterizer_state.polygon_mode, 0x1B02);   // GL_FILL
+    assert_eq!(ctx_ref.rasterizer_state.front_face, 0x0901); // GL_CCW
+    assert_eq!(ctx_ref.rasterizer_state.polygon_mode, 0x1B02); // GL_FILL
     assert_eq!(ctx_ref.rasterizer_state.line_width, 1.0);
     assert_eq!(ctx_ref.rasterizer_state.point_size, 1.0);
 
@@ -130,8 +127,10 @@ fn t32_03_gl_draw_call_recording() {
     gl.gl_make_current(ctx).unwrap();
 
     // Draw without program should fail
-    assert!(gl.gl_draw_arrays(0x0004, 0, 3).is_err());
-    assert!(gl.gl_draw_elements(0x0004, 6, 0x1405, 0).is_err());
+    let _result = gl.gl_draw_arrays(0x0004, 0, 3);
+    assert!(_result.is_err(), "expected Err, got {_result:?}");
+    let _result = gl.gl_draw_elements(0x0004, 6, 0x1405, 0);
+    assert!(_result.is_err(), "expected Err, got {_result:?}");
 
     // Create and bind program
     let prog = gl.gl_create_program().unwrap();
@@ -359,7 +358,7 @@ fn t32_06_angle_detection() {
     // Detect should succeed even if ANGLE is not installed (graceful fallback)
     let result = loader.detect();
     // Either ANGLE is found (loaded = true) or not found (loaded = false, no error)
-    assert!(result.is_ok());
+    assert!(result.is_ok(), "expected Ok, got {result:?}");
 
     // Verify default implementation
     let default_loader = AngleLoader::default();
@@ -424,8 +423,18 @@ fn t32_08_opengl_driver_info() {
     assert!(!driver.renderer.is_empty());
 
     // Check specific extensions
-    assert!(driver.extensions().iter().any(|e| e.contains("framebuffer")));
-    assert!(driver.extensions().iter().any(|e| e.contains("vertex_array")));
+    assert!(
+        driver
+            .extensions()
+            .iter()
+            .any(|e| e.contains("framebuffer"))
+    );
+    assert!(
+        driver
+            .extensions()
+            .iter()
+            .any(|e| e.contains("vertex_array"))
+    );
 
     // Unsupported driver
     let err = casa1::vkgl::load_opengl_driver(false).unwrap_err();
@@ -466,33 +475,81 @@ void main() {
 fn t32_10_dll_registration_exports() {
     let vk_exports = casa1::vkgl::register_vulkan_dll();
     assert!(!vk_exports.is_empty());
-    assert!(vk_exports.iter().any(|(name, _)| *name == "vkCreateInstance"));
-    assert!(vk_exports.iter().any(|(name, _)| *name == "vkDestroyInstance"));
+    assert!(
+        vk_exports
+            .iter()
+            .any(|(name, _)| *name == "vkCreateInstance")
+    );
+    assert!(
+        vk_exports
+            .iter()
+            .any(|(name, _)| *name == "vkDestroyInstance")
+    );
     assert!(vk_exports.iter().any(|(name, _)| *name == "vkCreateDevice"));
-    assert!(vk_exports.iter().any(|(name, _)| *name == "vkDestroyDevice"));
-    assert!(vk_exports.iter().any(|(name, _)| *name == "vkCreateSwapchainKHR"));
-    assert!(vk_exports.iter().any(|(name, _)| *name == "vkCreateShaderModule"));
-    assert!(vk_exports.iter().any(|(name, _)| *name == "vkCreateGraphicsPipelines"));
-    assert!(vk_exports.iter().any(|(name, _)| *name == "vkCreateComputePipelines"));
+    assert!(
+        vk_exports
+            .iter()
+            .any(|(name, _)| *name == "vkDestroyDevice")
+    );
+    assert!(
+        vk_exports
+            .iter()
+            .any(|(name, _)| *name == "vkCreateSwapchainKHR")
+    );
+    assert!(
+        vk_exports
+            .iter()
+            .any(|(name, _)| *name == "vkCreateShaderModule")
+    );
+    assert!(
+        vk_exports
+            .iter()
+            .any(|(name, _)| *name == "vkCreateGraphicsPipelines")
+    );
+    assert!(
+        vk_exports
+            .iter()
+            .any(|(name, _)| *name == "vkCreateComputePipelines")
+    );
     assert!(vk_exports.iter().any(|(name, _)| *name == "vkQueueSubmit"));
     assert!(vk_exports.iter().any(|(name, _)| *name == "vkCreateBuffer"));
     assert!(vk_exports.iter().any(|(name, _)| *name == "vkCreateImage"));
-    assert!(vk_exports.iter().any(|(name, _)| *name == "vkAllocateMemory"));
+    assert!(
+        vk_exports
+            .iter()
+            .any(|(name, _)| *name == "vkAllocateMemory")
+    );
     assert!(vk_exports.iter().any(|(name, _)| *name == "vkCreateFence"));
-    assert!(vk_exports.iter().any(|(name, _)| *name == "vkCreateSemaphore"));
+    assert!(
+        vk_exports
+            .iter()
+            .any(|(name, _)| *name == "vkCreateSemaphore")
+    );
 
     let gl_exports = casa1::vkgl::register_opengl_dll();
     assert!(!gl_exports.is_empty());
-    assert!(gl_exports.iter().any(|(name, _)| *name == "wglCreateContext"));
+    assert!(
+        gl_exports
+            .iter()
+            .any(|(name, _)| *name == "wglCreateContext")
+    );
     assert!(gl_exports.iter().any(|(name, _)| *name == "wglMakeCurrent"));
-    assert!(gl_exports.iter().any(|(name, _)| *name == "wglDeleteContext"));
+    assert!(
+        gl_exports
+            .iter()
+            .any(|(name, _)| *name == "wglDeleteContext")
+    );
     assert!(gl_exports.iter().any(|(name, _)| *name == "glDrawArrays"));
     assert!(gl_exports.iter().any(|(name, _)| *name == "glDrawElements"));
     assert!(gl_exports.iter().any(|(name, _)| *name == "glGenBuffers"));
     assert!(gl_exports.iter().any(|(name, _)| *name == "glBindBuffer"));
     assert!(gl_exports.iter().any(|(name, _)| *name == "glBufferData"));
     assert!(gl_exports.iter().any(|(name, _)| *name == "glCreateShader"));
-    assert!(gl_exports.iter().any(|(name, _)| *name == "glCompileShader"));
+    assert!(
+        gl_exports
+            .iter()
+            .any(|(name, _)| *name == "glCompileShader")
+    );
     assert!(gl_exports.iter().any(|(name, _)| *name == "glLinkProgram"));
     assert!(gl_exports.iter().any(|(name, _)| *name == "glUseProgram"));
     assert!(gl_exports.iter().any(|(name, _)| *name == "glGenTextures"));

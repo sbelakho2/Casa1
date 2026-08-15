@@ -6,8 +6,8 @@
 //! reverb DSP, and device hotplug detection.
 
 use crate::audio::{
-    AudioClientId, AudioDeviceInfo, DeviceId,
-    LatencyRecord, RenderOutput, SampleFormat, VoiceId, WaveFormat,
+    AudioClientId, AudioDeviceInfo, DeviceId, LatencyRecord, RenderOutput, SampleFormat, VoiceId,
+    WaveFormat,
 };
 use crate::error::{AppError, AppResult};
 use crate::reason::ReasonCode;
@@ -59,6 +59,8 @@ pub struct RealAudioDevice {
 /// Each XAudio2 mastering voice, WASAPI audio client, or DirectSound buffer
 /// that starts playback gets its own `cpal` output stream. Audio data is
 /// pushed into a lock-free queue and consumed by the real-time audio callback.
+///
+/// Also manages a single capture (microphone/line-in) input stream.
 pub struct RealAudioBackend {
     host: cpal::Host,
     devices: BTreeMap<DeviceId, RealAudioDevice>,
@@ -70,6 +72,10 @@ pub struct RealAudioBackend {
     exclusive_clients: HashMap<AudioClientId, WasapiExclusiveState>,
     /// Auto-incrementing counter for AudioClientId values.
     next_audio_client_id: AudioClientId,
+    /// Active capture (microphone/line-in) input stream, if any.
+    input_stream: Option<cpal::Stream>,
+    /// Shared buffer for captured audio data from the input stream callback.
+    capture_buffer: Arc<Mutex<Vec<f32>>>,
 }
 
 impl RealAudioBackend {
@@ -81,28 +87,41 @@ impl RealAudioBackend {
 
         let default_device = host.default_output_device();
 
-        if let Some(device_list) = host.output_devices().ok() {
-            for device in device_list {
-                let name = device.name().unwrap_or_else(|_| "Unknown".to_string());
-                let config = device.default_output_config().ok();
-                let channels = config.as_ref().map(|c| c.channels()).unwrap_or(2);
-                let sample_rate = config.as_ref().map(|c| c.sample_rate().0).unwrap_or(48_000);
-                let is_default = default_device
-                    .as_ref()
-                    .map(|d| d.name().map(|n| n == name).unwrap_or(false))
-                    .unwrap_or(false);
+        match host.output_devices() {
+            Ok(device_list) => {
+                for device in device_list {
+                    let name = device.name().unwrap_or_else(|_| "Unknown".to_string());
+                    let config = match device.default_output_config() {
+                        Ok(config) => Some(config),
+                        Err(error) => {
+                            eprintln!(
+                                "[RealAudio] new: failed to get default output config for '{name}': {error}"
+                            );
+                            None
+                        }
+                    };
+                    let channels = config.as_ref().map(|c| c.channels()).unwrap_or(2);
+                    let sample_rate = config.as_ref().map(|c| c.sample_rate().0).unwrap_or(48_000);
+                    let is_default = default_device
+                        .as_ref()
+                        .map(|d| d.name().map(|n| n == name).unwrap_or(false))
+                        .unwrap_or(false);
 
-                devices.insert(
-                    next_device_id,
-                    RealAudioDevice {
-                        id: next_device_id,
-                        name,
-                        channels,
-                        sample_rate,
-                        is_default,
-                    },
-                );
-                next_device_id += 1;
+                    devices.insert(
+                        next_device_id,
+                        RealAudioDevice {
+                            id: next_device_id,
+                            name,
+                            channels,
+                            sample_rate,
+                            is_default,
+                        },
+                    );
+                    next_device_id += 1;
+                }
+            }
+            Err(error) => {
+                eprintln!("[RealAudio] new: failed to enumerate output devices: {error}");
             }
         }
 
@@ -115,6 +134,8 @@ impl RealAudioBackend {
             latency_log: Vec::new(),
             exclusive_clients: HashMap::new(),
             next_audio_client_id: 1,
+            input_stream: None,
+            capture_buffer: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
@@ -164,10 +185,7 @@ impl RealAudioBackend {
     ///
     /// Returns the device ID of the stream. Audio samples pushed via
     /// `push_xaudio2_samples` will be played through the real device.
-    pub fn open_xaudio2_master(
-        &mut self,
-        format: &WaveFormat,
-    ) -> AppResult<DeviceId> {
+    pub fn open_xaudio2_master(&mut self, format: &WaveFormat) -> AppResult<DeviceId> {
         let device_id = self.default_device_id()?;
         self.ensure_stream(device_id, format)?;
         Ok(device_id)
@@ -255,7 +273,7 @@ impl RealAudioBackend {
             measured_ms: latency_ms,
         });
 
-        let _ = event_driven; // Real cpal callback is inherently event-driven
+        let _event_driven = event_driven; // Real cpal callback is inherently event-driven
         Ok(device_id)
     }
 
@@ -387,7 +405,10 @@ impl RealAudioBackend {
                 ReasonCode::RcAudioBufferSizeMismatch,
                 format!(
                     "exclusive-mode buffer size mismatch: expected {} frames ({} samples), got {} frames ({} samples)",
-                    state.buffer_frames, expected_samples, actual_frames, samples.len(),
+                    state.buffer_frames,
+                    expected_samples,
+                    actual_frames,
+                    samples.len(),
                 ),
             ));
         }
@@ -407,10 +428,7 @@ impl RealAudioBackend {
     // -----------------------------------------------------------------------
 
     /// Open a real output stream for a DirectSound buffer.
-    pub fn open_direct_sound_buffer(
-        &mut self,
-        format: &WaveFormat,
-    ) -> AppResult<DeviceId> {
+    pub fn open_direct_sound_buffer(&mut self, format: &WaveFormat) -> AppResult<DeviceId> {
         let device_id = self.default_device_id()?;
         self.ensure_stream(device_id, format)?;
         Ok(device_id)
@@ -455,26 +473,49 @@ impl RealAudioBackend {
         let mut current_names: BTreeMap<String, RealAudioDevice> = BTreeMap::new();
         let default_device = self.host.default_output_device();
 
-        if let Some(device_list) = self.host.output_devices().ok() {
-            for device in device_list {
-                let name = device.name().unwrap_or_else(|_| "Unknown".to_string());
-                let config = device.default_output_config().ok();
-                let channels = config.as_ref().map(|c| c.channels()).unwrap_or(2);
-                let sample_rate = config.as_ref().map(|c| c.sample_rate().0).unwrap_or(48_000);
-                let is_default = default_device
-                    .as_ref()
-                    .map(|d| d.name().map(|n| n == name).unwrap_or(false))
-                    .unwrap_or(false);
+        match self.host.output_devices() {
+            Ok(device_list) => {
+                for device in device_list {
+                    let name = device.name().unwrap_or_else(|_| "Unknown".to_string());
+                    let config = match device.default_output_config() {
+                        Ok(config) => Some(config),
+                        Err(error) => {
+                            eprintln!(
+                                "[RealAudio] detect_device_changes: failed to get config for '{name}': {error}"
+                            );
+                            None
+                        }
+                    };
+                    let channels = config.as_ref().map(|c| c.channels()).unwrap_or(2);
+                    let sample_rate = config.as_ref().map(|c| c.sample_rate().0).unwrap_or(48_000);
+                    let is_default = default_device
+                        .as_ref()
+                        .map(|d| d.name().map(|n| n == name).unwrap_or(false))
+                        .unwrap_or(false);
 
-                current_names.insert(
-                    name.clone(),
-                    RealAudioDevice {
-                        id: 0, // placeholder
-                        name,
-                        channels,
-                        sample_rate,
-                        is_default,
-                    },
+                    // Use existing device ID if we already know this device, otherwise
+                    // assign a temporary placeholder; real new-device IDs are assigned below.
+                    let existing_id = self
+                        .devices
+                        .values()
+                        .find(|d| d.name == name)
+                        .map(|d| d.id)
+                        .unwrap_or(0);
+                    current_names.insert(
+                        name.clone(),
+                        RealAudioDevice {
+                            id: existing_id,
+                            name,
+                            channels,
+                            sample_rate,
+                            is_default,
+                        },
+                    );
+                }
+            }
+            Err(error) => {
+                eprintln!(
+                    "[RealAudio] detect_device_changes: failed to enumerate output devices: {error}"
                 );
             }
         }
@@ -550,7 +591,8 @@ impl RealAudioBackend {
         self.streams.remove(&device_id);
         self.stream_queues.remove(&device_id);
         // Clean up any exclusive-mode clients using this device
-        self.exclusive_clients.retain(|_, state| state.device_id != device_id);
+        self.exclusive_clients
+            .retain(|_, state| state.device_id != device_id);
     }
 
     /// Close all output streams and exclusive-mode clients.
@@ -565,11 +607,7 @@ impl RealAudioBackend {
     // -----------------------------------------------------------------------
 
     /// Ensure a cpal output stream exists for the given device.
-    fn ensure_stream(
-        &mut self,
-        device_id: DeviceId,
-        format: &WaveFormat,
-    ) -> AppResult<()> {
+    fn ensure_stream(&mut self, device_id: DeviceId, format: &WaveFormat) -> AppResult<()> {
         if self.streams.contains_key(&device_id) {
             return Ok(());
         }
@@ -584,8 +622,8 @@ impl RealAudioBackend {
 
         let queue: Arc<Mutex<VecDeque<f32>>> = Arc::new(Mutex::new(VecDeque::new()));
         let callback_queue = Arc::clone(&queue);
-        let error_callback = |error: cpal::StreamError| {
-            let _ = error;
+        let error_callback = move |error: cpal::StreamError| {
+            eprintln!("[RealAudio] output stream error for device {device_id}: {error}");
         };
 
         let stream_config = supported_config.config();
@@ -633,7 +671,7 @@ impl RealAudioBackend {
                 return Err(AppError::new(
                     ReasonCode::RcAudioUnsupported,
                     format!("unsupported host audio sample format {other:?}"),
-                ))
+                ));
             }
         };
 
@@ -727,12 +765,11 @@ impl RealAudioBackend {
         // Pin to the exact sample rate requested.
         // cpal 0.15's with_sample_rate is infallible — it picks the closest
         // supported rate if the exact one is unavailable.
-        let supported_config = matched
-            .with_sample_rate(cpal::SampleRate(format.sample_rate));
+        let supported_config = matched.with_sample_rate(cpal::SampleRate(format.sample_rate));
 
         let queue: Arc<Mutex<VecDeque<f32>>> = Arc::new(Mutex::new(VecDeque::new()));
         let error_callback = |error: cpal::StreamError| {
-            let _ = error;
+            eprintln!("[RealAudio] stream build error: {error}");
         };
 
         // Try progressively larger buffer sizes (target ≤10ms latency).
@@ -776,10 +813,8 @@ impl RealAudioBackend {
                 other => {
                     return Err(AppError::new(
                         ReasonCode::RcAudioUnsupported,
-                        format!(
-                            "unsupported host audio sample format {other:?}"
-                        ),
-                    ))
+                        format!("unsupported host audio sample format {other:?}"),
+                    ));
                 }
             };
 
@@ -840,6 +875,168 @@ impl RealAudioBackend {
             )
         })
     }
+
+    // -----------------------------------------------------------------------
+    // Input (capture) stream support
+    // -----------------------------------------------------------------------
+
+    /// Start an input (microphone/line-in) capture stream using cpal.
+    ///
+    /// Uses the default input device and the given sample rate / channel count.
+    /// Captured f32 samples are appended to `self.capture_buffer`.
+    pub fn start_input_stream(&mut self, sample_rate: u32, channels: u16) -> AppResult<()> {
+        // Drop any existing input stream first
+        self.input_stream = None;
+
+        let input_device = self.host.default_input_device().ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcAudioUnsupported,
+                "no default audio input device available",
+            )
+        })?;
+
+        let supported_config = input_device.default_input_config().map_err(|e| {
+            AppError::new(
+                ReasonCode::RcAudioUnsupported,
+                format!("failed to get audio input config: {e}"),
+            )
+        })?;
+
+        let capture_buf = Arc::clone(&self.capture_buffer);
+        let error_callback = |error: cpal::StreamError| {
+            eprintln!("[RealAudio] input stream error: {error}");
+        };
+
+        // Build stream config matching requested format
+        let stream_config: cpal::StreamConfig = cpal::StreamConfig {
+            channels,
+            sample_rate: cpal::SampleRate(sample_rate),
+            buffer_size: cpal::BufferSize::Default,
+        };
+
+        let stream = match supported_config.sample_format() {
+            cpal::SampleFormat::F32 => input_device
+                .build_input_stream(
+                    &stream_config,
+                    move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                        if let Ok(mut buf) = capture_buf.lock() {
+                            buf.extend_from_slice(data);
+                            // Limit to ~4 seconds of audio to prevent unbounded growth
+                            let max_samples = sample_rate as usize * channels as usize * 4;
+                            while buf.len() > max_samples {
+                                let excess = buf.len().saturating_sub(max_samples);
+                                let drain_end = excess.min(buf.len());
+                                buf.drain(0..drain_end);
+                            }
+                        }
+                    },
+                    error_callback,
+                    None,
+                )
+                .map_err(|e| {
+                    AppError::new(
+                        ReasonCode::RcAudioUnsupported,
+                        format!("failed to build f32 input stream: {e}"),
+                    )
+                })?,
+            cpal::SampleFormat::I16 => input_device
+                .build_input_stream(
+                    &stream_config,
+                    move |data: &[i16], _: &cpal::InputCallbackInfo| {
+                        if let Ok(mut buf) = capture_buf.lock() {
+                            // Convert i16 to f32
+                            for &sample in data {
+                                let f = if sample == i16::MIN {
+                                    -1.0
+                                } else {
+                                    sample as f32 / i16::MAX as f32
+                                };
+                                buf.push(f);
+                            }
+                            let max_samples = sample_rate as usize * channels as usize * 4;
+                            while buf.len() > max_samples {
+                                let excess = buf.len().saturating_sub(max_samples);
+                                let drain_end = excess.min(buf.len());
+                                buf.drain(0..drain_end);
+                            }
+                        }
+                    },
+                    error_callback,
+                    None,
+                )
+                .map_err(|e| {
+                    AppError::new(
+                        ReasonCode::RcAudioUnsupported,
+                        format!("failed to build i16 input stream: {e}"),
+                    )
+                })?,
+            cpal::SampleFormat::U16 => input_device
+                .build_input_stream(
+                    &stream_config,
+                    move |data: &[u16], _: &cpal::InputCallbackInfo| {
+                        if let Ok(mut buf) = capture_buf.lock() {
+                            // Convert u16 to f32
+                            for &sample in data {
+                                let f = (sample as f32 / u16::MAX as f32) * 2.0 - 1.0;
+                                buf.push(f);
+                            }
+                            let max_samples = sample_rate as usize * channels as usize * 4;
+                            while buf.len() > max_samples {
+                                let excess = buf.len().saturating_sub(max_samples);
+                                let drain_end = excess.min(buf.len());
+                                buf.drain(0..drain_end);
+                            }
+                        }
+                    },
+                    error_callback,
+                    None,
+                )
+                .map_err(|e| {
+                    AppError::new(
+                        ReasonCode::RcAudioUnsupported,
+                        format!("failed to build u16 input stream: {e}"),
+                    )
+                })?,
+            other => {
+                return Err(AppError::new(
+                    ReasonCode::RcAudioUnsupported,
+                    format!("unsupported host input sample format {other:?}"),
+                ));
+            }
+        };
+
+        stream.play().map_err(|e| {
+            AppError::new(
+                ReasonCode::RcAudioUnsupported,
+                format!("failed to start input stream: {e}"),
+            )
+        })?;
+
+        self.input_stream = Some(stream);
+        Ok(())
+    }
+
+    /// Stop the active input (capture) stream, if any.
+    pub fn stop_input_stream(&mut self) {
+        if let Some(stream) = self.input_stream.take() {
+            eprintln!("[RealAudio] stopping input stream (drop will release resources)");
+            drop(stream); // Dropping the stream stops it
+        }
+        if let Ok(mut buf) = self.capture_buffer.lock() {
+            buf.clear();
+        }
+    }
+
+    /// Read captured audio data from the internal buffer.
+    ///
+    /// Returns the captured f32 samples and clears the internal buffer.
+    pub fn read_capture_data(&mut self) -> Vec<f32> {
+        if let Ok(mut buf) = self.capture_buffer.lock() {
+            std::mem::take(&mut *buf)
+        } else {
+            Vec::new()
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -881,6 +1078,189 @@ pub fn convert_samples_to_float(samples: &crate::audio::AudioSamples) -> Vec<f32
     match samples {
         crate::audio::AudioSamples::Pcm16(values) => pcm16_to_float(values),
         crate::audio::AudioSamples::Float32(values) => values.clone(),
+    }
+}
+
+/// Convert 8-bit unsigned PCM samples to f32.
+///
+/// 8-bit PCM uses unsigned representation with 128 as the centre (silence).
+/// Range: 0..255 maps to -1.0..+1.0.
+pub fn u8_to_float(samples: &[u8]) -> Vec<f32> {
+    samples
+        .iter()
+        .map(|&s| (s as f32 - 128.0) / 128.0)
+        .collect()
+}
+
+/// Convert f32 samples to 8-bit unsigned PCM.
+pub fn float_to_u8_pcm(samples: &[f32]) -> Vec<u8> {
+    samples
+        .iter()
+        .map(|&s| (((s.clamp(-1.0, 1.0) + 1.0) * 0.5) * 255.0) as u8)
+        .collect()
+}
+
+/// Convert 24-bit PCM samples (packed in 3 bytes, little-endian) to f32.
+///
+/// 24-bit PCM uses signed two's complement in 3-byte containers.
+/// Range: -8388608..8388607 maps to -1.0..+1.0.
+pub fn pcm24_to_float(samples: &[u8]) -> Vec<f32> {
+    samples
+        .chunks_exact(3)
+        .map(|chunk| {
+            let b0 = chunk[0] as i32;
+            let b1 = chunk[1] as i32;
+            let b2 = chunk[2] as i32;
+            // Little-endian 24-bit: assemble as i32 and sign-extend
+            let value = (b0 as i32) | ((b1 as i32) << 8) | ((b2 as i32) << 16);
+            // Sign-extend from 24-bit to 32-bit via arithmetic shift
+            let value = (value << 8) >> 8;
+            value as f32 / 8388608.0
+        })
+        .collect()
+}
+
+/// Convert 24-bit PCM samples (in 4-byte containers, little-endian) to f32.
+///
+/// Some Windows audio formats store 24-bit samples in 32-bit containers
+/// where the most significant byte is zero.
+pub fn pcm24_in_32_to_float(samples: &[u8]) -> Vec<f32> {
+    samples
+        .chunks_exact(4)
+        .map(|chunk| {
+            let b0 = chunk[0] as i32;
+            let b1 = chunk[1] as i32;
+            let b2 = chunk[2] as i32;
+            // chunk[3] is padding (zero)
+            let value = (b0 as i32) | ((b1 as i32) << 8) | ((b2 as i32) << 16);
+            // Sign-extend from 24-bit via arithmetic shift
+            let value = (value << 8) >> 8;
+            value as f32 / 8388608.0
+        })
+        .collect()
+}
+
+/// Convert f32 samples to 24-bit PCM (packed 3 bytes, little-endian).
+pub fn float_to_pcm24(samples: &[f32]) -> Vec<u8> {
+    let mut output = Vec::with_capacity(samples.len() * 3);
+    for &s in samples {
+        let clamped = s.clamp(-1.0, 1.0);
+        let value = (clamped * 8388608.0) as i32;
+        let value = value.clamp(-8388608, 8388607);
+        // Store as unsigned 24-bit LE
+        let uval = value as u32 & 0xFFFFFF;
+        output.push((uval & 0xFF) as u8);
+        output.push(((uval >> 8) & 0xFF) as u8);
+        output.push(((uval >> 16) & 0xFF) as u8);
+    }
+    output
+}
+
+/// Convert 32-bit signed integer PCM samples to f32.
+///
+/// Range: -2147483648..2147483647 maps to -1.0..+1.0.
+pub fn pcm32_to_float(samples: &[i32]) -> Vec<f32> {
+    samples
+        .iter()
+        .map(|&s| {
+            if s == i32::MIN {
+                -1.0
+            } else {
+                s as f32 / i32::MAX as f32
+            }
+        })
+        .collect()
+}
+
+/// Convert f32 samples to 32-bit signed integer PCM.
+pub fn float_to_pcm32(samples: &[f32]) -> Vec<i32> {
+    samples
+        .iter()
+        .map(|&s| (s.clamp(-1.0, 1.0) * i32::MAX as f32) as i32)
+        .collect()
+}
+
+/// Convert raw PCM bytes to f32 samples based on the wave format tag and
+/// bits-per-sample.
+///
+/// Handles:
+/// - `0x0001` (PCM): 8-bit unsigned, 16-bit signed, 24-bit (packed or in
+///   32-bit containers), 32-bit signed
+/// - `0x0003` (IEEE float): 32-bit float
+///
+/// Returns interleaved f32 samples in the range [-1.0, +1.0].
+pub fn pcm_bytes_to_float(
+    data: &[u8],
+    wave_format_tag: u16,
+    bits_per_sample: u16,
+    _channels: u16,
+) -> Vec<f32> {
+    match wave_format_tag {
+        0x0003 => {
+            // IEEE float — 32-bit
+            data.chunks_exact(4)
+                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .collect()
+        }
+        0x0001 => match bits_per_sample {
+            8 => u8_to_float(data),
+            16 => {
+                let i16_samples: Vec<i16> = data
+                    .chunks_exact(2)
+                    .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
+                    .collect();
+                pcm16_to_float(&i16_samples)
+            }
+            24 => pcm24_to_float(data),
+            32 => {
+                let i32_samples: Vec<i32> = data
+                    .chunks_exact(4)
+                    .map(|chunk| i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                    .collect();
+                pcm32_to_float(&i32_samples)
+            }
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    }
+}
+
+/// Convert f32 samples to raw PCM bytes based on the wave format tag and
+/// bits-per-sample.
+///
+/// Inverse of [`pcm_bytes_to_float`].
+pub fn float_to_pcm_bytes(samples: &[f32], wave_format_tag: u16, bits_per_sample: u16) -> Vec<u8> {
+    match wave_format_tag {
+        0x0003 => {
+            // IEEE float — 32-bit
+            let mut bytes = Vec::with_capacity(samples.len() * 4);
+            for &s in samples {
+                bytes.extend_from_slice(&s.to_le_bytes());
+            }
+            bytes
+        }
+        0x0001 => match bits_per_sample {
+            8 => float_to_u8_pcm(samples),
+            16 => {
+                let i16_samples = float_to_pcm16(samples);
+                let mut bytes = Vec::with_capacity(i16_samples.len() * 2);
+                for s in i16_samples {
+                    bytes.extend_from_slice(&s.to_le_bytes());
+                }
+                bytes
+            }
+            24 => float_to_pcm24(samples),
+            32 => {
+                let i32_samples = float_to_pcm32(samples);
+                let mut bytes = Vec::with_capacity(i32_samples.len() * 4);
+                for s in i32_samples {
+                    bytes.extend_from_slice(&s.to_le_bytes());
+                }
+                bytes
+            }
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
     }
 }
 
@@ -1028,9 +1408,7 @@ pub fn decode_ms_adpcm(
     if block_size < header_size {
         return Err(AppError::new(
             ReasonCode::RcAudioUnsupported,
-            format!(
-                "MS ADPCM block size {block_size} < header size {header_size}"
-            ),
+            format!("MS ADPCM block size {block_size} < header size {header_size}"),
         ));
     }
 
@@ -1232,20 +1610,17 @@ pub fn decode_ms_adpcm(
 /// Maps a step index (0–88) to a quantisation step size.
 const IMA_ADPCM_STEP_TABLE: [i16; 89] = [
     7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 19, 21, 23, 25, 28, 31, 34, 37, 41, 45, 50, 55, 60, 66,
-    73, 80, 88, 97, 107, 118, 130, 143, 157, 173, 190, 209, 230, 253, 279, 307, 337, 371, 408,
-    449, 494, 544, 598, 658, 724, 796, 876, 963, 1060, 1166, 1282, 1411, 1552, 1707, 1878, 2066,
-    2272, 2499, 2749, 3024, 3327, 3660, 4026, 4428, 4871, 5358, 5894, 6484, 7132, 7845, 8630,
-    9493, 10442, 11487, 12635, 13899, 15289, 16818, 18500, 20350, 22385, 24623, 27086, 29794,
-    32767,
+    73, 80, 88, 97, 107, 118, 130, 143, 157, 173, 190, 209, 230, 253, 279, 307, 337, 371, 408, 449,
+    494, 544, 598, 658, 724, 796, 876, 963, 1060, 1166, 1282, 1411, 1552, 1707, 1878, 2066, 2272,
+    2499, 2749, 3024, 3327, 3660, 4026, 4428, 4871, 5358, 5894, 6484, 7132, 7845, 8630, 9493,
+    10442, 11487, 12635, 13899, 15289, 16818, 18500, 20350, 22385, 24623, 27086, 29794, 32767,
 ];
 
 /// IMA/DVI ADPCM step index table (16 entries).
 ///
 /// Each 4-bit nibble maps to an index adjustment applied to the step index
 /// after decoding a sample.
-const IMA_ADPCM_INDEX_TABLE: [i16; 16] = [
-    -1, -1, -1, -1, 2, 4, 6, 8, -1, -1, -1, -1, 2, 4, 6, 8,
-];
+const IMA_ADPCM_INDEX_TABLE: [i16; 16] = [-1, -1, -1, -1, 2, 4, 6, 8, -1, -1, -1, -1, 2, 4, 6, 8];
 
 /// Decode IMA/DVI ADPCM compressed audio to interleaved 16-bit PCM.
 ///
@@ -1396,28 +1771,20 @@ pub fn decode_ima_adpcm(
                     channel_samples[ch].push(sample);
 
                     // Update step index
-                    step_index = (step_index + IMA_ADPCM_INDEX_TABLE[nibble as usize])
-                        .clamp(0, 88);
+                    step_index = (step_index + IMA_ADPCM_INDEX_TABLE[nibble as usize]).clamp(0, 88);
                 }
             }
         }
 
         // Interleave channels into output
-        let max_frames = channel_samples[0]
-            .len()
-            .max(channel_samples[1].len());
+        let max_frames = channel_samples[0].len().max(channel_samples[1].len());
         for frame in 0..max_frames {
             for ch in 0..num_channels {
                 if frame < channel_samples[ch].len() {
                     output.push(channel_samples[ch][frame]);
                 } else {
                     // Pad with last sample if channels are uneven
-                    output.push(
-                        channel_samples[ch]
-                            .last()
-                            .copied()
-                            .unwrap_or(0),
-                    );
+                    output.push(channel_samples[ch].last().copied().unwrap_or(0));
                 }
             }
         }
@@ -1775,7 +2142,8 @@ pub fn convert_game_audio_to_float(
             let mut pcm = Vec::with_capacity(sample_count);
             for chunk in data.chunks(3) {
                 if chunk.len() == 3 {
-                    let raw = (chunk[0] as i32) | ((chunk[1] as i32) << 8) | ((chunk[2] as i32) << 16);
+                    let raw =
+                        (chunk[0] as i32) | ((chunk[1] as i32) << 8) | ((chunk[2] as i32) << 16);
                     // Sign-extend from 24 bits
                     let sample = if raw & 0x800000 != 0 {
                         raw | !0xFFFFFF
@@ -1814,7 +2182,8 @@ pub fn convert_game_audio_to_float(
             let mut float_samples = Vec::with_capacity(sample_count);
             for chunk in data.chunks(4) {
                 if chunk.len() == 4 {
-                    float_samples.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+                    float_samples
+                        .push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
                 }
             }
             Ok(float_samples)
@@ -1915,30 +2284,14 @@ fn remap_channel(source: &[f32], channel: usize, output_channels: usize) -> f32 
     match (source.len(), output_channels) {
         (1, _) => source[0],
         (2, 1) => (source[0] + source[1]) * 0.5,
-        (2, _) => source[channel.min(1)],
-        // Mono from multi-channel: downmix all
-        (_, 1) => source.iter().copied().sum::<f32>() / source.len() as f32,
-        // 5.1 source (6 ch) → 2 ch stereo: FL+FC, FR+FC with LFE mixed in
-        (6, 2) => match channel {
-            0 => source[0] + source[2] * 0.5 + source[3] * 0.3,   // FL ← FL + 0.5*FC + 0.3*LFE
-            1 => source[1] + source[2] * 0.5 + source[3] * 0.3,   // FR ← FR + 0.5*FC + 0.3*LFE
-            _ => 0.0,
-        },
-        // 7.1 source (8 ch) → 2 ch stereo
-        (8, 2) => match channel {
-            0 => source[0] + source[2] * 0.5 + source[3] * 0.3,   // FL
-            1 => source[1] + source[2] * 0.5 + source[3] * 0.3,   // FR
-            _ => 0.0,
-        },
-        // 5.1 source → 5.1 output: pass through
-        (6, 6) => source[channel],
-        // 7.1 source → 7.1 output: pass through
-        (8, 8) => source[channel],
         // 2 ch → 5.1: duplicate stereo to front, silence others
+        // LFE (channel 3) uses 0.0 since there is no low-frequency content
+        // in a pure stereo source.
         (2, 6) => match channel {
-            0 | 2 => source[0],  // FL, FC ← FL
-            1 | 3 => source[1],  // FR, LFE ← FR (LFE gets FR as placeholder)
-            _ => 0.0,             // RL, RR silent
+            0 | 2 => source[0], // FL, FC ← FL
+            1 => source[1],     // FR ← FR
+            3 => 0.0,           // LFE ← 0 (no LFE content in stereo source)
+            _ => 0.0,           // RL, RR silent
         },
         // 2 ch → 7.1
         (2, 8) => match channel {
@@ -1946,18 +2299,37 @@ fn remap_channel(source: &[f32], channel: usize, output_channels: usize) -> f32 
             1 | 3 => source[1],
             _ => 0.0,
         },
+        (2, _) => source[channel.min(1)],
+        // Mono from multi-channel: downmix all
+        (_, 1) => source.iter().copied().sum::<f32>() / source.len() as f32,
+        // 5.1 source (6 ch) → 2 ch stereo: FL+FC, FR+FC with LFE mixed in
+        (6, 2) => match channel {
+            0 => source[0] + source[2] * 0.5 + source[3] * 0.3, // FL ← FL + 0.5*FC + 0.3*LFE
+            1 => source[1] + source[2] * 0.5 + source[3] * 0.3, // FR ← FR + 0.5*FC + 0.3*LFE
+            _ => 0.0,
+        },
+        // 7.1 source (8 ch) → 2 ch stereo
+        (8, 2) => match channel {
+            0 => source[0] + source[2] * 0.5 + source[3] * 0.3, // FL
+            1 => source[1] + source[2] * 0.5 + source[3] * 0.3, // FR
+            _ => 0.0,
+        },
+        // 5.1 source → 5.1 output: pass through
+        (6, 6) => source[channel],
+        // 7.1 source → 7.1 output: pass through
+        (8, 8) => source[channel],
         // 5.1 → 7.1: SL/SR are copied from RL/RR
         (6, 8) => match channel {
             0..=3 => source[channel],
-            4 | 6 => source[4],   // RL → RL, SL → RL
-            5 | 7 => source[5],   // RR → RR, SR → RR
+            4 | 6 => source[4], // RL → RL, SL → RL
+            5 | 7 => source[5], // RR → RR, SR → RR
             _ => 0.0,
         },
         // 7.1 → 5.1: mix SL into RL, SR into RR
         (8, 6) => match channel {
             0..=3 => source[channel],
-            4 => (source[4] + source[6]) * 0.5,   // RL ← (RL + SL) * 0.5
-            5 => (source[5] + source[7]) * 0.5,   // RR ← (RR + SR) * 0.5
+            4 => (source[4] + source[6]) * 0.5, // RL ← (RL + SL) * 0.5
+            5 => (source[5] + source[7]) * 0.5, // RR ← (RR + SR) * 0.5
             _ => 0.0,
         },
         // Fallback: direct channel or silence
@@ -2022,10 +2394,7 @@ pub fn apply_lowpass(samples: &mut [f32], channels: usize, cutoff: f32) {
 
 /// Normalize audio samples to use the full dynamic range.
 pub fn normalize_samples(samples: &mut [f32]) {
-    let max_abs = samples
-        .iter()
-        .map(|s| s.abs())
-        .fold(0.0f32, f32::max);
+    let max_abs = samples.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
 
     if max_abs > 0.0 && max_abs < 1.0 {
         let scale = 1.0 / max_abs;
@@ -2050,20 +2419,17 @@ pub fn mix_streams(destination: &mut [f32], source: &[f32]) {
 
 /// CLSID_XAPO: {5EC3B1C3-5E4B-4f4e-B0E0-7B7D1E7B9E7C}
 pub const CLSID_XAPO: [u8; 16] = [
-    0xC3, 0xB1, 0xC3, 0x5E, 0x4B, 0x5E, 0x4E, 0x4F,
-    0xB0, 0xE0, 0x7B, 0x7D, 0x1E, 0x7B, 0x9E, 0x7C,
+    0xC3, 0xB1, 0xC3, 0x5E, 0x4B, 0x5E, 0x4E, 0x4F, 0xB0, 0xE0, 0x7B, 0x7D, 0x1E, 0x7B, 0x9E, 0x7C,
 ];
 
 /// IID_IXAPO: {A1109C34-E46B-47c7-8E0F-7B7D1E7B9E7C}
 pub const IID_IXAPO: [u8; 16] = [
-    0x34, 0x9C, 0x10, 0xA1, 0x6B, 0xE4, 0xC7, 0x47,
-    0x8E, 0x0F, 0x7B, 0x7D, 0x1E, 0x7B, 0x9E, 0x7C,
+    0x34, 0x9C, 0x10, 0xA1, 0x6B, 0xE4, 0xC7, 0x47, 0x8E, 0x0F, 0x7B, 0x7D, 0x1E, 0x7B, 0x9E, 0x7C,
 ];
 
 /// IID_IXAPOParameters: {A1109C35-E46B-47c7-8E0F-7B7D1E7B9E7D}
 pub const IID_IXAPOParameters: [u8; 16] = [
-    0x35, 0x9C, 0x10, 0xA1, 0x6B, 0xE4, 0xC7, 0x47,
-    0x8E, 0x0F, 0x7B, 0x7D, 0x1E, 0x7B, 0x9E, 0x7D,
+    0x35, 0x9C, 0x10, 0xA1, 0x6B, 0xE4, 0xC7, 0x47, 0x8E, 0x0F, 0x7B, 0x7D, 0x1E, 0x7B, 0x9E, 0x7D,
 ];
 
 // ── XAPO flags ──────────────────────────────────────────────────────────────
@@ -2151,7 +2517,9 @@ pub struct XAPO_BUFFER {
 }
 
 // Safety: XAPO_BUFFER is only used as a read-only descriptor, not sent across threads.
+// SAFETY: Send is safe because the type only uses thread-safe internal state or is accessed under exclusive &mut
 unsafe impl Send for XAPO_BUFFER {}
+// SAFETY: Send is safe because the type only uses thread-safe internal state or is accessed under exclusive &mut
 unsafe impl Sync for XAPO_BUFFER {}
 
 // ---------------------------------------------------------------------------
@@ -2260,9 +2628,11 @@ impl XapoReverb {
             vec![0.0f32; allpass_delays[1] * channels_usize],
         ];
 
-        let mut reg = XAPO_REGISTRATION_PROPERTIES::new(
-            [0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01],
+        let reg = XAPO_REGISTRATION_PROPERTIES::new(
+            [
+                0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x01,
+            ],
             "Schroeder Reverb",
             XAPO_FLAG_INPLACE,
         );
@@ -2303,7 +2673,7 @@ impl XapoEffect for XapoReverb {
             // Sum through 4 parallel comb filters
             let mut comb_sum = 0.0f32;
             for c in 0..4 {
-                let delay = self.comb_delays[c];
+                let _delay = self.comb_delays[c];
                 let pos = self.comb_positions[c];
                 let buf = &mut self.comb_buffers[c];
                 if buf.is_empty() {
@@ -2318,7 +2688,7 @@ impl XapoEffect for XapoReverb {
             // Feed through 2 series all-pass filters
             let mut ap_out = comb_sum * 0.25;
             for a in 0..2 {
-                let delay = self.allpass_delays[a];
+                let _delay = self.allpass_delays[a];
                 let pos = self.allpass_positions[a];
                 let buf = &mut self.allpass_buffers[a];
                 if buf.is_empty() {
@@ -2377,9 +2747,11 @@ pub struct XapoLowPass {
 
 impl XapoLowPass {
     pub fn new(cutoff: f32, channels: u16, sample_rate: u32) -> Self {
-        let mut reg = XAPO_REGISTRATION_PROPERTIES::new(
-            [0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02],
+        let reg = XAPO_REGISTRATION_PROPERTIES::new(
+            [
+                0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x02,
+            ],
             "One-Pole Low-Pass Filter",
             XAPO_FLAG_INPLACE,
         );
@@ -2457,9 +2829,11 @@ pub struct XapoHighPass {
 
 impl XapoHighPass {
     pub fn new(cutoff: f32, channels: u16, sample_rate: u32) -> Self {
-        let mut reg = XAPO_REGISTRATION_PROPERTIES::new(
-            [0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03],
+        let reg = XAPO_REGISTRATION_PROPERTIES::new(
+            [
+                0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x03,
+            ],
             "One-Pole High-Pass Filter",
             XAPO_FLAG_INPLACE,
         );
@@ -2547,9 +2921,11 @@ impl XapoEcho {
     pub fn new(delay_ms: f32, feedback: f32, wet: f32, channels: u16, sample_rate: u32) -> Self {
         let ch = channels.max(1) as usize;
         let delay_frames = ((delay_ms.max(1.0) * sample_rate as f32) / 1000.0).round() as usize;
-        let mut reg = XAPO_REGISTRATION_PROPERTIES::new(
-            [0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04],
+        let reg = XAPO_REGISTRATION_PROPERTIES::new(
+            [
+                0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x04,
+            ],
             "Echo / Delay",
             XAPO_FLAG_INPLACE,
         );
@@ -2568,7 +2944,7 @@ impl XapoEcho {
 
 impl XapoEffect for XapoEcho {
     fn process(&mut self, input: &[f32], output: &mut [f32]) -> AppResult<()> {
-        let ch = self.channels as usize;
+        let _ch = self.channels as usize;
         let total = input.len();
         if output.len() < total || total == 0 || self.delay_buffer.is_empty() {
             return Ok(());
@@ -2629,10 +3005,19 @@ pub struct XapoCompressor {
 }
 
 impl XapoCompressor {
-    pub fn new(threshold_db: f32, ratio: f32, attack_ms: f32, release_ms: f32, channels: u16, sample_rate: u32) -> Self {
-        let mut reg = XAPO_REGISTRATION_PROPERTIES::new(
-            [0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05],
+    pub fn new(
+        threshold_db: f32,
+        ratio: f32,
+        attack_ms: f32,
+        release_ms: f32,
+        channels: u16,
+        sample_rate: u32,
+    ) -> Self {
+        let reg = XAPO_REGISTRATION_PROPERTIES::new(
+            [
+                0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x05,
+            ],
             "Dynamic Range Compressor",
             XAPO_FLAG_INPLACE,
         );
@@ -2734,9 +3119,11 @@ pub struct XapoNormalize {
 
 impl XapoNormalize {
     pub fn new(target_peak: f32, channels: u16) -> Self {
-        let mut reg = XAPO_REGISTRATION_PROPERTIES::new(
-            [0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x06],
+        let reg = XAPO_REGISTRATION_PROPERTIES::new(
+            [
+                0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x06,
+            ],
             "Normalize to Peak",
             XAPO_FLAG_INPLACE,
         );
@@ -2751,7 +3138,7 @@ impl XapoNormalize {
 
 impl XapoEffect for XapoNormalize {
     fn process(&mut self, input: &[f32], output: &mut [f32]) -> AppResult<()> {
-        let ch = self.channels as usize;
+        let _ch = self.channels as usize;
         let total = input.len();
         if output.len() < total || total == 0 {
             return Ok(());
@@ -2813,7 +3200,10 @@ pub struct ReverbParameters {
 
 impl Default for ReverbParameters {
     fn default() -> Self {
-        Self { wet_dry_mix: 0.5, delay_ms: 50.0 }
+        Self {
+            wet_dry_mix: 0.5,
+            delay_ms: 50.0,
+        }
     }
 }
 
@@ -2853,7 +3243,12 @@ pub struct CompressorParameters {
 
 impl Default for CompressorParameters {
     fn default() -> Self {
-        Self { threshold_db: -24.0, ratio: 4.0, attack_ms: 5.0, release_ms: 50.0 }
+        Self {
+            threshold_db: -24.0,
+            ratio: 4.0,
+            attack_ms: 5.0,
+            release_ms: 50.0,
+        }
     }
 }
 
@@ -2870,7 +3265,11 @@ pub struct EchoParameters {
 
 impl Default for EchoParameters {
     fn default() -> Self {
-        Self { delay_ms: 200.0, feedback: 0.5, wet_dry_mix: 0.5 }
+        Self {
+            delay_ms: 200.0,
+            feedback: 0.5,
+            wet_dry_mix: 0.5,
+        }
     }
 }
 
@@ -2903,8 +3302,10 @@ impl XapoEqualizer {
         let zero_state: Vec<(f32, f32, f32, f32)> = (0..ch).map(|_| (0.0, 0.0, 0.0, 0.0)).collect();
 
         let mut reg = XAPO_REGISTRATION_PROPERTIES::new(
-            [0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07],
+            [
+                0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x07,
+            ],
             "Parametric 4-Band Equalizer",
             XAPO_FLAG_INPLACE,
         );
@@ -2938,7 +3339,12 @@ impl XapoEqualizer {
     }
 
     /// Compute biquad coefficients for a peaking EQ filter.
-    fn peaking_coefficients(freq: f32, gain_db: f32, q: f32, sample_rate: f32) -> (f32, f32, f32, f32, f32) {
+    fn peaking_coefficients(
+        freq: f32,
+        gain_db: f32,
+        q: f32,
+        sample_rate: f32,
+    ) -> (f32, f32, f32, f32, f32) {
         let a = 10.0_f32.powf(gain_db / 40.0);
         let w0 = 2.0 * std::f32::consts::PI * freq / sample_rate;
         let cos_w0 = w0.cos();
@@ -3122,7 +3528,11 @@ impl XapoEffectChain {
             } else {
                 // Intermediate effect: need a second temp buffer
                 let mut intermediate = vec![0.0f32; input.len()];
-                manager.process_instance(handle, &self.temp_buffer[..input.len()], &mut intermediate);
+                manager.process_instance(
+                    handle,
+                    &self.temp_buffer[..input.len()],
+                    &mut intermediate,
+                );
                 self.temp_buffer[..input.len()].copy_from_slice(&intermediate);
             }
         }
@@ -3249,37 +3659,65 @@ impl XapoManager {
         let reverb = XapoReverb::new(0.5, 48000, 2);
         let clsid = reverb.registration().clsid;
         let reg = reverb.registration().clone();
-        self.register_effect(clsid, reg, Box::new(|| Box::new(XapoReverb::new(0.5, 48000, 2))));
+        self.register_effect(
+            clsid,
+            reg,
+            Box::new(|| Box::new(XapoReverb::new(0.5, 48000, 2))),
+        );
 
         let lp = XapoLowPass::new(0.5, 2, 48000);
         let clsid_lp = lp.registration().clsid;
         let reg_lp = lp.registration().clone();
-        self.register_effect(clsid_lp, reg_lp, Box::new(|| Box::new(XapoLowPass::new(0.5, 2, 48000))));
+        self.register_effect(
+            clsid_lp,
+            reg_lp,
+            Box::new(|| Box::new(XapoLowPass::new(0.5, 2, 48000))),
+        );
 
         let hp = XapoHighPass::new(0.5, 2, 48000);
         let clsid_hp = hp.registration().clsid;
         let reg_hp = hp.registration().clone();
-        self.register_effect(clsid_hp, reg_hp, Box::new(|| Box::new(XapoHighPass::new(0.5, 2, 48000))));
+        self.register_effect(
+            clsid_hp,
+            reg_hp,
+            Box::new(|| Box::new(XapoHighPass::new(0.5, 2, 48000))),
+        );
 
         let echo = XapoEcho::new(200.0, 0.5, 0.5, 2, 48000);
         let clsid_echo = echo.registration().clsid;
         let reg_echo = echo.registration().clone();
-        self.register_effect(clsid_echo, reg_echo, Box::new(|| Box::new(XapoEcho::new(200.0, 0.5, 0.5, 2, 48000))));
+        self.register_effect(
+            clsid_echo,
+            reg_echo,
+            Box::new(|| Box::new(XapoEcho::new(200.0, 0.5, 0.5, 2, 48000))),
+        );
 
         let comp = XapoCompressor::new(-24.0, 4.0, 5.0, 50.0, 2, 48000);
         let clsid_comp = comp.registration().clsid;
         let reg_comp = comp.registration().clone();
-        self.register_effect(clsid_comp, reg_comp, Box::new(|| Box::new(XapoCompressor::new(-24.0, 4.0, 5.0, 50.0, 2, 48000))));
+        self.register_effect(
+            clsid_comp,
+            reg_comp,
+            Box::new(|| Box::new(XapoCompressor::new(-24.0, 4.0, 5.0, 50.0, 2, 48000))),
+        );
 
         let norm = XapoNormalize::new(0.95, 2);
         let clsid_norm = norm.registration().clsid;
         let reg_norm = norm.registration().clone();
-        self.register_effect(clsid_norm, reg_norm, Box::new(|| Box::new(XapoNormalize::new(0.95, 2))));
+        self.register_effect(
+            clsid_norm,
+            reg_norm,
+            Box::new(|| Box::new(XapoNormalize::new(0.95, 2))),
+        );
 
         let eq = XapoEqualizer::new(EqualizerParameters::default(), 2, 48000);
         let clsid_eq = eq.registration().clsid;
         let reg_eq = eq.registration().clone();
-        self.register_effect(clsid_eq, reg_eq, Box::new(|| Box::new(XapoEqualizer::new(EqualizerParameters::default(), 2, 48000))));
+        self.register_effect(
+            clsid_eq,
+            reg_eq,
+            Box::new(|| Box::new(XapoEqualizer::new(EqualizerParameters::default(), 2, 48000))),
+        );
     }
 
     /// Create a new instance of a registered effect by CLSID.
@@ -3293,22 +3731,20 @@ impl XapoManager {
         let effect = factory();
         let handle = self.next_handle;
         self.next_handle += 1;
-        self.instances.insert(handle, XapoInstance {
-            effect,
-            clsid: *clsid,
-        });
+        self.instances.insert(
+            handle,
+            XapoInstance {
+                effect,
+                clsid: *clsid,
+            },
+        );
         Some(handle)
     }
 
     /// Process audio through an effect instance.
     ///
     /// Returns `true` if the instance was found and processed, `false` otherwise.
-    pub fn process_instance(
-        &mut self,
-        handle: u64,
-        input: &[f32],
-        output: &mut [f32],
-    ) -> bool {
+    pub fn process_instance(&mut self, handle: u64, input: &[f32], output: &mut [f32]) -> bool {
         if let Some(instance) = self.instances.get_mut(&handle) {
             instance.effect.process(input, output).is_ok()
         } else {
@@ -3336,18 +3772,25 @@ impl XapoManager {
     }
 
     /// Return the registration properties for a registered effect by CLSID.
-    pub fn registration_properties(&self, clsid: &[u8; 16]) -> Option<&XAPO_REGISTRATION_PROPERTIES> {
+    pub fn registration_properties(
+        &self,
+        clsid: &[u8; 16],
+    ) -> Option<&XAPO_REGISTRATION_PROPERTIES> {
         self.registered.get(clsid).map(|(reg, _)| reg)
     }
 
     /// Return the registration properties for an active instance.
     pub fn instance_registration(&self, handle: u64) -> Option<&XAPO_REGISTRATION_PROPERTIES> {
-        self.instances.get(&handle).map(|inst| inst.effect.registration())
+        self.instances
+            .get(&handle)
+            .map(|inst| inst.effect.registration())
     }
 
     /// Return the effect channels for an active instance.
     pub fn instance_channels(&self, handle: u64) -> Option<u16> {
-        self.instances.get(&handle).map(|inst| inst.effect.channels())
+        self.instances
+            .get(&handle)
+            .map(|inst| inst.effect.channels())
     }
 
     /// Check if a CLSID has been registered.
@@ -3470,7 +3913,7 @@ mod tests {
     #[ignore] // Requires real audio hardware; hangs on headless/CI
     fn real_audio_backend_creates() {
         let backend = RealAudioBackend::new();
-        assert!(backend.is_ok());
+        assert!(backend.is_ok(), "expected audio backend to initialize");
         let backend = backend.unwrap();
         let devices = backend.enumerate_devices();
         // On CI or headless systems, there may be no devices
@@ -3636,10 +4079,8 @@ mod tests {
 
     #[test]
     fn calculate_buffer_callbacks_partial_render() {
-        let buffers: Vec<(usize, String)> = vec![
-            (100, "buf_a".to_string()),
-            (100, "buf_b".to_string()),
-        ];
+        let buffers: Vec<(usize, String)> =
+            vec![(100, "buf_a".to_string()), (100, "buf_b".to_string())];
         let callbacks = calculate_buffer_callbacks(&buffers, 150);
         // Only buf_a completes within 150 frames
         assert_eq!(callbacks.len(), 1);
@@ -3647,18 +4088,18 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Requires real audio hardware
+    #[ignore] // Requires real audio hardware (no mock device available in CI)
     fn default_device_detection() {
         let backend = RealAudioBackend::new().unwrap();
         let devices = backend.enumerate_devices();
         if !devices.is_empty() {
             let default_id = backend.default_device_id();
-            assert!(default_id.is_ok());
+            assert!(default_id.is_ok(), "expected Ok, got {default_id:?}");
         }
     }
 
     #[test]
-    #[ignore] // Requires real audio hardware
+    #[ignore] // Requires real audio hardware (cannot create stream without physical device)
     fn latency_log_records_entries() {
         let backend = RealAudioBackend::new().unwrap();
         let log = backend.latency_log();
@@ -3667,12 +4108,12 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Requires real audio hardware
+    #[ignore] // Requires real audio hardware (needs hotpluggable physical device to test)
     fn device_hotplug_detect_changes() {
         let mut backend = RealAudioBackend::new().unwrap();
         // Calling detect_device_changes should succeed even if no changes
         let result = backend.detect_device_changes();
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
     }
 
     #[test]
@@ -3851,12 +4292,12 @@ mod tests {
     #[test]
     fn decode_ms_adpcm_invalid_predictor_returns_error() {
         // Predictor index 7 is out of range (0-6)
-        let mut block = vec![7u8, 0, 64, 0, 100, 0, 200, 0, 0x00];
+        let block = vec![7u8, 0, 64, 0, 100, 0, 200, 0, 0x00];
         let _ = block;
         // Actually build properly
         let block = build_ms_adpcm_mono_block(7, 64, 100, 200, &[0]);
         let result = decode_ms_adpcm(&block, block.len() as u16, 1, 4);
-        assert!(result.is_err());
+        assert!(result.is_err(), "expected Err, got {result:?}");
     }
 
     #[test]
@@ -3864,7 +4305,7 @@ mod tests {
         // Block smaller than header
         let block = vec![0u8, 0]; // Only 2 bytes, header requires 8
         let result = decode_ms_adpcm(&block, 8, 1, 4);
-        assert!(result.is_err());
+        assert!(result.is_err(), "expected Err, got {result:?}");
     }
 
     #[test]
@@ -3876,17 +4317,13 @@ mod tests {
     #[test]
     fn decode_ms_adpcm_unsupported_channels() {
         let result = decode_ms_adpcm(&[0; 24], 24, 3, 6);
-        assert!(result.is_err());
+        assert!(result.is_err(), "expected Err, got {result:?}");
     }
 
     // ── IMA ADPCM decoder tests ─────────────────────────────────────────
 
     /// Build a mono IMA ADPCM block: [predictor(2B)][step_index(1B)][reserved(1B)][nibbles...]
-    fn build_ima_adpcm_mono_block(
-        predictor: i16,
-        step_index: u8,
-        nibbles: &[u8],
-    ) -> Vec<u8> {
+    fn build_ima_adpcm_mono_block(predictor: i16, step_index: u8, nibbles: &[u8]) -> Vec<u8> {
         let mut block = Vec::new();
         block.extend_from_slice(&predictor.to_le_bytes());
         block.push(step_index);
@@ -4015,7 +4452,7 @@ mod tests {
     #[test]
     fn decode_ima_adpcm_unsupported_channels() {
         let result = decode_ima_adpcm(&[0; 8], 3, 4);
-        assert!(result.is_err());
+        assert!(result.is_err(), "expected Err, got {result:?}");
     }
 
     // ── XMA decoder tests ───────────────────────────────────────────────
@@ -4023,13 +4460,13 @@ mod tests {
     #[test]
     fn decode_xma_empty_data_returns_error() {
         let result = decode_xma(&[], 2);
-        assert!(result.is_err());
+        assert!(result.is_err(), "expected Err, got {result:?}");
     }
 
     #[test]
     fn decode_xma_unsupported_channels() {
         let result = decode_xma(&[0; 16], 3);
-        assert!(result.is_err());
+        assert!(result.is_err(), "expected Err, got {result:?}");
     }
 
     #[test]
@@ -4056,7 +4493,7 @@ mod tests {
         // Frame with num_subframes=0 should cause termination
         let frame = vec![0u8; 8]; // header all zeros + padding
         let result = decode_xma(&frame, 1);
-        assert!(result.is_err());
+        assert!(result.is_err(), "expected Err, got {result:?}");
     }
 
     #[test]
@@ -4070,7 +4507,7 @@ mod tests {
 
         let result = decode_xma(&frame, 1);
         // Should succeed after byte-swap
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
         let samples = result.unwrap();
         assert!(!samples.is_empty());
     }
@@ -4093,10 +4530,7 @@ mod tests {
     #[test]
     fn convert_game_audio_pcm16_to_float() {
         let pcm: Vec<i16> = vec![0, i16::MAX, i16::MIN, 1000];
-        let data: Vec<u8> = pcm
-            .iter()
-            .flat_map(|s| s.to_le_bytes())
-            .collect();
+        let data: Vec<u8> = pcm.iter().flat_map(|s| s.to_le_bytes()).collect();
 
         let result =
             convert_game_audio_to_float(&data, AudioFormat::Pcm16, 1, 48000, 0, 0).unwrap();
@@ -4194,8 +4628,7 @@ mod tests {
         frame.extend_from_slice(&0x01000000u32.to_le_bytes()); // silent frame
         frame.extend_from_slice(&[0u8; 64]);
 
-        let result =
-            convert_game_audio_to_float(&frame, AudioFormat::Xma, 1, 48000, 0, 0).unwrap();
+        let result = convert_game_audio_to_float(&frame, AudioFormat::Xma, 1, 48000, 0, 0).unwrap();
         assert!(!result.is_empty());
         // Silent frame should produce zeros
         for &s in &result {
@@ -4277,38 +4710,52 @@ mod tests {
     // ── XAPO effect tests ────────────────────────────────────────────────
 
     fn make_reverb_clsid() -> [u8; 16] {
-        [0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01]
+        [
+            0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x01,
+        ]
     }
 
     fn make_lowpass_clsid() -> [u8; 16] {
-        [0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02]
+        [
+            0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x02,
+        ]
     }
 
     fn make_highpass_clsid() -> [u8; 16] {
-        [0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03]
+        [
+            0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x03,
+        ]
     }
 
     fn make_echo_clsid() -> [u8; 16] {
-        [0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04]
+        [
+            0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x04,
+        ]
     }
 
     fn make_compressor_clsid() -> [u8; 16] {
-        [0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05]
+        [
+            0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x05,
+        ]
     }
 
     fn make_normalize_clsid() -> [u8; 16] {
-        [0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x06]
+        [
+            0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x06,
+        ]
     }
 
     fn make_equalizer_clsid() -> [u8; 16] {
-        [0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07]
+        [
+            0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x07,
+        ]
     }
 
     #[test]
@@ -4323,16 +4770,21 @@ mod tests {
 
         let input = vec![1.0f32, -1.0, 0.5, -0.5];
         let mut output = vec![0.0f32; 4];
-        assert!(reverb.process(&input, &mut output).is_ok());
+        let _result = reverb.process(&input, &mut output);
+        assert!(_result.is_ok(), "expected Ok, got {_result:?}");
         // After reverb processing, output should differ from input
-        let changed = input.iter().zip(output.iter()).any(|(a, b)| (a - b).abs() > 0.001);
+        let changed = input
+            .iter()
+            .zip(output.iter())
+            .any(|(a, b)| (a - b).abs() > 0.001);
         assert!(changed);
 
         reverb.reset();
         // After reset, processing silence should produce silence
         let silence = vec![0.0f32; 4];
         let mut out2 = vec![1.0f32; 4];
-        assert!(reverb.process(&silence, &mut out2).is_ok());
+        let _result = reverb.process(&silence, &mut out2);
+        assert!(_result.is_ok(), "expected Ok, got {_result:?}");
         for &s in &out2 {
             assert!((s).abs() < 0.001);
         }
@@ -4347,7 +4799,8 @@ mod tests {
         // Alternating signal (high frequency)
         let input = vec![1.0f32, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0, -1.0];
         let mut output = vec![0.0f32; 8];
-        assert!(lp.process(&input, &mut output).is_ok());
+        let _result = lp.process(&input, &mut output);
+        assert!(_result.is_ok(), "expected Ok, got {_result:?}");
         let max_out = output.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
         assert!(max_out < 1.0);
     }
@@ -4361,7 +4814,8 @@ mod tests {
         // DC signal (constant)
         let input = vec![0.5f32; 16];
         let mut output = vec![0.0f32; 16];
-        assert!(hp.process(&input, &mut output).is_ok());
+        let _result = hp.process(&input, &mut output);
+        assert!(_result.is_ok(), "expected Ok, got {_result:?}");
         // DC should be attenuated toward zero
         let steady_state: f32 = output.iter().skip(8).sum();
         assert!(steady_state.abs() < 1.0);
@@ -4377,7 +4831,8 @@ mod tests {
         // Input: impulse at frame 0
         let input = vec![1.0f32, 0.0, 0.0, 0.0, 0.0];
         let mut output = vec![0.0f32; 5];
-        assert!(echo.process(&input, &mut output).is_ok());
+        let _result = echo.process(&input, &mut output);
+        assert!(_result.is_ok(), "expected Ok, got {_result:?}");
         // With the read-before-write delay line and 1 frame delay,
         // the impulse appears at output[1] (delayed by 1 frame).
         assert!((output[0] - 0.0).abs() < 0.001);
@@ -4398,7 +4853,8 @@ mod tests {
         // Loud signal above threshold
         let input = vec![0.8f32; 480]; // 10ms at 48kHz
         let mut output = vec![0.0f32; 480];
-        assert!(comp.process(&input, &mut output).is_ok());
+        let _result = comp.process(&input, &mut output);
+        assert!(_result.is_ok(), "expected Ok, got {_result:?}");
         // Output should be quieter than input
         let avg_out: f32 = output.iter().sum::<f32>() / 480.0;
         assert!(avg_out < 0.8);
@@ -4412,7 +4868,8 @@ mod tests {
 
         let input = vec![0.25f32, -0.25, 0.1, -0.1];
         let mut output = vec![0.0f32; 4];
-        assert!(norm.process(&input, &mut output).is_ok());
+        let _result = norm.process(&input, &mut output);
+        assert!(_result.is_ok(), "expected Ok, got {_result:?}");
         // Peak should be scaled toward 0.5
         let max_out = output.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
         assert!((max_out - 0.5).abs() < 0.001);
@@ -4433,7 +4890,9 @@ mod tests {
         assert_eq!(mgr.registered_count(), 7);
 
         // Create a reverb instance
-        let handle = mgr.create_instance(&make_reverb_clsid()).expect("reverb should be registered");
+        let handle = mgr
+            .create_instance(&make_reverb_clsid())
+            .expect("reverb should be registered");
         assert!(handle > 0);
 
         // Process through the instance
@@ -4441,7 +4900,10 @@ mod tests {
         let mut output = vec![0.0f32; 4];
         let processed = mgr.process_instance(handle, &input, &mut output);
         assert!(processed);
-        let changed = input.iter().zip(output.iter()).any(|(a, b)| (a - b).abs() > 0.001);
+        let changed = input
+            .iter()
+            .zip(output.iter())
+            .any(|(a, b)| (a - b).abs() > 0.001);
         assert!(changed);
 
         // Reset
@@ -4532,6 +4994,7 @@ mod tests {
         assert_eq!(xb.flags, XAPO_BUFFER_VALID);
         assert_eq!(xb.valid_frame_count, 2);
         // Verify we can read through the raw pointer
+        // SAFETY: CoreAudio FFI for audio playback
         unsafe {
             assert_eq!((*xb.buffer.add(1) - 0.5).abs() < 0.001, true);
         }

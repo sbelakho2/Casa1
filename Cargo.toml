@@ -2,6 +2,7 @@
 name = "casa1"
 version = "0.1.0"
 edition = "2024"
+license = "MIT OR Apache-2.0"
 
 [lib]
 name = "casa1"
@@ -24,10 +25,13 @@ cbc = "0.1"
 cipher = { version = "0.4", features = ["block-padding"] }
 ctr = "0.9"
 hmac = "0.12"
+md5 = "0.7"
 crossbeam-channel = "0.5"
 cpal = "0.15"
 minifb = "0.27"
-p256 = { version = "0.13", features = ["ecdsa", "pem"] }
+ecdsa = { version = "0.16", features = ["der", "pem", "pkcs8"] }
+p256 = { version = "0.13", features = ["ecdsa", "pem", "pkcs8"] }
+p384 = { version = "0.13", features = ["ecdsa", "pem", "pkcs8"] }
 rand = "0.8"
 getrandom = "0.2"
 rsa = { version = "0.9", features = ["sha2", "pem"] }
@@ -55,6 +59,11 @@ flate2 = "1.1"
 png = "0.17"
 tungstenite = { version = "0.26", optional = true }
 ffmpeg-next = { version = "7.0", optional = true, default-features = false }
+quinn = "0.11"
+rustls = "0.23"
+tokio = { version = "1", features = ["rt", "macros", "sync", "time", "net"] }
+rustls-pemfile = "2"
+rcgen = "0.13"
 
 [features]
 default = ["metal", "vulkan", "opengl"]
@@ -65,12 +74,18 @@ moltenvk = ["vulkan"]
 angle = ["opengl"]
 websocket = ["tungstenite"]
 ffmpeg = ["ffmpeg-next"]
+proptest = []
+dev-insecure-tls = []
+
+[lints.rust]
+unexpected_cfgs = { level = "allow" }
 
 [dev-dependencies]
 tempfile = "3.20"
 criterion = { version = "0.5", features = ["html_reports"] }
 cms = { version = "0.2", features = ["builder"] }
 x509-cert = { version = "0.2", features = ["builder"] }
+proptest = "1"
 
 [profile.bench]
 debug = 1

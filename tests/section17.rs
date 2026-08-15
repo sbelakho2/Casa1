@@ -79,17 +79,32 @@ fn t17_1_steam_registry_initialization() {
 
     // Verify values can be read back
     let steam_path = ge
-        .registry_get_value("HKCU", r"Software\Valve\Steam", "SteamPath", RegistryView::Native)
+        .registry_get_value(
+            "HKCU",
+            r"Software\Valve\Steam",
+            "SteamPath",
+            RegistryView::Native,
+        )
         .expect("get SteamPath")
         .expect("SteamPath should exist");
-    assert_eq!(steam_path.data, serde_json::json!("C:\\Steam"), "SteamPath value");
+    assert_eq!(
+        steam_path.data,
+        serde_json::json!("C:\\Steam"),
+        "SteamPath value"
+    );
 
     let steam_exe = ge
-        .registry_get_value("HKCU", r"Software\Valve\Steam", "SteamExe", RegistryView::Native)
+        .registry_get_value(
+            "HKCU",
+            r"Software\Valve\Steam",
+            "SteamExe",
+            RegistryView::Native,
+        )
         .expect("get SteamExe")
         .expect("SteamExe should exist");
     assert_eq!(
-        steam_exe.data, serde_json::json!("C:\\Steam\\Steam.exe"),
+        steam_exe.data,
+        serde_json::json!("C:\\Steam\\Steam.exe"),
         "SteamExe value"
     );
 }
@@ -162,7 +177,10 @@ fn t17_3_steam_named_pipe_creation() {
 
     // Server reads the message
     let read_back = win32.read_file(server, 64).expect("server read");
-    assert_eq!(read_back, message, "IPC message should round-trip correctly");
+    assert_eq!(
+        read_back, message,
+        "IPC message should round-trip correctly"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -245,7 +263,10 @@ fn t17_5_steam_service_registration() {
     // Verify the service configuration
     assert_eq!(controller.config.cpu_count, 4, "default CPU count");
     assert_eq!(controller.config.memory_mb, 4096, "default memory");
-    assert!(!controller.config.enabled, "SCM should be disabled by default");
+    assert!(
+        !controller.config.enabled,
+        "SCM should be disabled by default"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -257,8 +278,12 @@ fn t17_6_steam_dll_resolution() {
     let (_tmp, mut win32) = setup_win32("steam-dll");
 
     // Create directories first
-    win32.create_directory_w(r"C:\Steam").expect("create Steam dir");
-    win32.create_directory_w(r"C:\Steam\bin").expect("create bin dir");
+    win32
+        .create_directory_w(r"C:\Steam")
+        .expect("create Steam dir");
+    win32
+        .create_directory_w(r"C:\Steam\bin")
+        .expect("create bin dir");
 
     // Create mock Steam DLLs using write_file_overwrite_w
     let dlls = [
@@ -303,10 +328,10 @@ fn t17_7_steam_webhelper_launch() {
     // If initialization fails due to WKWebView unavailability, the test passes
     // (we verified the bridge was constructed and the init path was exercised).
     let init_result = bridge.cef_initialize(CefSettings::default());
-    if init_result.is_err() {
+    if let Err(e) = init_result {
         eprintln!(
             "note: t17_7 skipped CEF browser tests — WKWebView unavailable ({:?})",
-            init_result.unwrap_err()
+            e
         );
         return;
     }

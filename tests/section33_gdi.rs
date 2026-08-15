@@ -1,3 +1,6 @@
+#![allow(clippy::needless_range_loop)]
+#![allow(clippy::erasing_op)]
+
 //! Section 33 — GDI+ Completion (Phase 2.7)
 //!
 //! Tests the full GDI+ subsystem surface area:
@@ -23,26 +26,20 @@ mod support;
 
 use casa1::pe_runtime::HostThunk;
 use casa1::user32::{
-    GdiplusStatus, GdiplusState, GdiplusObject, GdiplusBrush, GdiplusSolidFill,
-    GdiplusLineBrush, GdiplusTextureBrush, GdiplusPen, GdiplusPath, GdiplusPathElement,
-    GdiplusMatrix, GdiplusFont, GdiplusFontFamily, GdiplusImage, GdiplusBitmap,
-    GdiplusImageAttributes, GdiplusGraphics, GdiplusGraphicsState, GdiplusContainer,
-    GdiplusStartupInput, GdiplusPointF, GdiplusColorMatrix, GdiplusBitmapData, GdiplusRectF,
-    GDIPLUS_SMOOTHING_MODE_DEFAULT, GDIPLUS_SMOOTHING_MODE_HIGH_QUALITY,
-    GDIPLUS_COMPOSITING_MODE_SOURCE_OVER, GDIPLUS_COMPOSITING_MODE_SOURCE_COPY,
+    GDIPLUS_COMPOSITING_MODE_SOURCE_COPY, GDIPLUS_COMPOSITING_MODE_SOURCE_OVER,
     GDIPLUS_COMPOSITING_QUALITY_DEFAULT, GDIPLUS_COMPOSITING_QUALITY_HIGH_QUALITY,
-    GDIPLUS_INTERPOLATION_DEFAULT, GDIPLUS_INTERPOLATION_HIGH_QUALITY_BICUBIC,
-    GDIPLUS_PIXEL_OFFSET_DEFAULT, GDIPLUS_PIXEL_OFFSET_HALF,
-    GDIPLUS_DASH_STYLE_SOLID, GDIPLUS_DASH_STYLE_DASH, GDIPLUS_DASH_STYLE_DOT,
-    GDIPLUS_LINE_JOIN_MITER, GDIPLUS_LINE_JOIN_ROUND,
-    GDIPLUS_LINE_CAP_FLAT, GDIPLUS_LINE_CAP_ROUND,
-    GDIPLUS_FILL_MODE_ALTERNATE, GDIPLUS_FILL_MODE_WINDING,
-    GDIPLUS_PIXEL_FORMAT_32BPP_ARGB, GDIPLUS_PIXEL_FORMAT_24BPP_RGB,
-    GDIPLUS_TEXT_RENDERING_HINT_SYSTEM_DEFAULT, GDIPLUS_TEXT_RENDERING_HINT_ANTI_ALIAS,
-    GDIPLUS_WRAP_MODE_TILE, GDIPLUS_WRAP_MODE_CLAMP,
-    GDIPLUS_FONT_STYLE_REGULAR, GDIPLUS_FONT_STYLE_BOLD,
-    GDIPLUS_IMAGE_LOCK_MODE_READ, GDIPLUS_IMAGE_LOCK_MODE_WRITE,
-    GDIPLUS_UNIT_PIXEL, GDIPLUS_UNIT_WORLD,
+    GDIPLUS_DASH_STYLE_DASH, GDIPLUS_DASH_STYLE_DOT, GDIPLUS_FILL_MODE_ALTERNATE,
+    GDIPLUS_FILL_MODE_WINDING, GDIPLUS_FONT_STYLE_BOLD, GDIPLUS_INTERPOLATION_DEFAULT,
+    GDIPLUS_INTERPOLATION_HIGH_QUALITY_BICUBIC, GDIPLUS_LINE_CAP_FLAT, GDIPLUS_LINE_CAP_ROUND,
+    GDIPLUS_LINE_JOIN_MITER, GDIPLUS_LINE_JOIN_ROUND, GDIPLUS_PIXEL_FORMAT_24BPP_RGB,
+    GDIPLUS_PIXEL_FORMAT_32BPP_ARGB, GDIPLUS_PIXEL_OFFSET_DEFAULT, GDIPLUS_PIXEL_OFFSET_HALF,
+    GDIPLUS_SMOOTHING_MODE_DEFAULT, GDIPLUS_SMOOTHING_MODE_HIGH_QUALITY,
+    GDIPLUS_TEXT_RENDERING_HINT_ANTI_ALIAS, GDIPLUS_TEXT_RENDERING_HINT_SYSTEM_DEFAULT,
+    GDIPLUS_UNIT_PIXEL, GDIPLUS_WRAP_MODE_CLAMP, GDIPLUS_WRAP_MODE_TILE, GdiplusBitmap,
+    GdiplusBrush, GdiplusColorMatrix, GdiplusContainer, GdiplusFont, GdiplusFontFamily,
+    GdiplusGraphicsState, GdiplusImage, GdiplusImageAttributes, GdiplusLineBrush, GdiplusMatrix,
+    GdiplusObject, GdiplusPath, GdiplusPathElement, GdiplusPen, GdiplusPointF, GdiplusRectF,
+    GdiplusSolidFill, GdiplusStartupInput, GdiplusState, GdiplusStatus, GdiplusTextureBrush,
 };
 
 use std::collections::BTreeMap;
@@ -71,7 +68,9 @@ fn t33_01_startup_shutdown_lifecycle() {
     assert_eq!(state.token, 0xABCD_0001);
 
     // Allocate an object while initialized
-    let h = state.alloc_handle(GdiplusObject::Brush(Box::new(GdiplusBrush::SolidFill(GdiplusSolidFill { color: 0xFF0000 }))));
+    let h = state.alloc_handle(GdiplusObject::Brush(Box::new(GdiplusBrush::SolidFill(
+        GdiplusSolidFill { color: 0xFF0000 },
+    ))));
     assert!(state.get(h).is_some());
 
     // Simulate GdiplusShutdown
@@ -113,14 +112,20 @@ fn t33_02_graphics_create_from_hdc() {
     // Delete graphics
     let removed = state.remove(gfx_handle);
     assert!(removed.is_some(), "should remove graphics object");
-    assert!(state.get(gfx_handle).is_none(), "should be gone after removal");
+    assert!(
+        state.get(gfx_handle).is_none(),
+        "should be gone after removal"
+    );
 }
 
 #[test]
 fn t33_03_graphics_delete_invalid() {
     let mut state = fresh_state();
     let removed = state.remove(0xDEAD_BEEF);
-    assert!(removed.is_none(), "removing non-existent handle should return None");
+    assert!(
+        removed.is_none(),
+        "removing non-existent handle should return None"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -196,13 +201,19 @@ fn t33_06_brush_texture() {
 #[test]
 fn t33_07_brush_delete() {
     let mut state = fresh_state();
-    let handle = state.alloc_handle(GdiplusObject::Brush(Box::new(
-        GdiplusBrush::SolidFill(GdiplusSolidFill { color: 0 })
-    )));
-    assert!(state.get(handle).is_some());
+    let handle = state.alloc_handle(GdiplusObject::Brush(Box::new(GdiplusBrush::SolidFill(
+        GdiplusSolidFill { color: 0 },
+    ))));
+    assert!(
+        state.get(handle).is_some(),
+        "handle should be valid after alloc"
+    );
     let removed = state.remove(handle);
-    assert!(removed.is_some());
-    assert!(state.get(handle).is_none());
+    assert!(removed.is_some(), "removed object should be present");
+    assert!(
+        state.get(handle).is_none(),
+        "handle should be invalid after remove"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -246,7 +257,10 @@ fn t33_08_pen_create_and_properties() {
 
     match state.get(handle).expect("pen should still exist") {
         GdiplusObject::Pen(p) => {
-            assert!((p.width - 5.0).abs() < f32::EPSILON, "width should be updated");
+            assert!(
+                (p.width - 5.0).abs() < f32::EPSILON,
+                "width should be updated"
+            );
             assert_eq!(p.color, 0xFFFF0000, "color should be updated");
             assert_eq!(p.dash_style, GDIPLUS_DASH_STYLE_DOT);
             assert_eq!(p.line_join, GDIPLUS_LINE_JOIN_MITER);
@@ -269,7 +283,12 @@ fn t33_09_path_add_geometry() {
 
     // Start figure, add line, close
     path.elements.push(GdiplusPathElement::StartFigure);
-    path.elements.push(GdiplusPathElement::Line { x1: 0.0, y1: 0.0, x2: 100.0, y2: 100.0 });
+    path.elements.push(GdiplusPathElement::Line {
+        x1: 0.0,
+        y1: 0.0,
+        x2: 100.0,
+        y2: 100.0,
+    });
     path.elements.push(GdiplusPathElement::CloseFigure);
 
     let handle = state.alloc_handle(GdiplusObject::Path(Box::new(path)));
@@ -293,15 +312,25 @@ fn t33_10_path_add_rectangle_and_ellipse() {
         fill_mode: GDIPLUS_FILL_MODE_WINDING,
         elements: Vec::new(),
     };
-    path.elements.push(GdiplusPathElement::Rectangle { x: 10.0, y: 20.0, w: 100.0, h: 50.0 });
-    path.elements.push(GdiplusPathElement::Ellipse { x: 0.0, y: 0.0, w: 50.0, h: 50.0 });
+    path.elements.push(GdiplusPathElement::Rectangle {
+        x: 10.0,
+        y: 20.0,
+        w: 100.0,
+        h: 50.0,
+    });
+    path.elements.push(GdiplusPathElement::Ellipse {
+        x: 0.0,
+        y: 0.0,
+        w: 50.0,
+        h: 50.0,
+    });
 
     let handle = state.alloc_handle(GdiplusObject::Path(Box::new(path)));
 
     match state.get(handle).expect("path should exist") {
         GdiplusObject::Path(p) => {
             assert_eq!(p.elements.len(), 2);
-            if let GdiplusPathElement::Rectangle { x, y, w, h } = &p.elements[0] {
+            if let GdiplusPathElement::Rectangle { x, y: _, w: _, h } = &p.elements[0] {
                 assert!((*x - 10.0).abs() < f32::EPSILON);
                 assert!((*h - 50.0).abs() < f32::EPSILON);
             } else {
@@ -315,7 +344,10 @@ fn t33_10_path_add_rectangle_and_ellipse() {
 #[test]
 fn t33_11_path_set_fill_mode() {
     let mut state = fresh_state();
-    let mut path = GdiplusPath { fill_mode: GDIPLUS_FILL_MODE_ALTERNATE, elements: Vec::new() };
+    let path = GdiplusPath {
+        fill_mode: GDIPLUS_FILL_MODE_ALTERNATE,
+        elements: Vec::new(),
+    };
     let handle = state.alloc_handle(GdiplusObject::Path(Box::new(path)));
 
     // Change fill mode via get_mut
@@ -370,7 +402,9 @@ fn t33_13_matrix_set_elements() {
 #[test]
 fn t33_14_matrix_get_elements() {
     let mut state = fresh_state();
-    let m = GdiplusMatrix { elements: [1.0, 2.0, 3.0, 4.0, 5.0, 6.0] };
+    let m = GdiplusMatrix {
+        elements: [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+    };
     let handle = state.alloc_handle(GdiplusObject::Matrix(Box::new(m)));
 
     match state.get(handle).expect("matrix should exist") {
@@ -427,7 +461,9 @@ fn t33_16_matrix_scale() {
 fn t33_17_matrix_invert() {
     let mut state = fresh_state();
     // Create a simple scale+translate matrix and invert it
-    let m = GdiplusMatrix { elements: [2.0, 0.0, 0.0, 4.0, 10.0, 20.0] };
+    let m = GdiplusMatrix {
+        elements: [2.0, 0.0, 0.0, 4.0, 10.0, 20.0],
+    };
     let handle = state.alloc_handle(GdiplusObject::Matrix(Box::new(m)));
 
     if let Some(GdiplusObject::Matrix(matrix)) = state.get_mut(handle) {
@@ -436,8 +472,10 @@ fn t33_17_matrix_invert() {
         assert!(det.abs() > f32::EPSILON, "matrix should be invertible");
         let inv_det = 1.0 / det;
         matrix.elements = [
-            e[3] * inv_det, -e[1] * inv_det,
-            -e[2] * inv_det, e[0] * inv_det,
+            e[3] * inv_det,
+            -e[1] * inv_det,
+            -e[2] * inv_det,
+            e[0] * inv_det,
             (e[2] * e[5] - e[3] * e[4]) * inv_det,
             (e[1] * e[4] - e[0] * e[5]) * inv_det,
         ];
@@ -447,12 +485,19 @@ fn t33_17_matrix_invert() {
     match state.get(handle).expect("matrix should exist") {
         GdiplusObject::Matrix(matrix) => {
             // Approximate check: inverted * original ≈ identity
-            let a = 2.0; let b = 0.0; let c = 0.0; let d = 4.0; let tx = 10.0; let ty = 20.0;
+            let a = 2.0;
+            let b = 0.0;
+            let c = 0.0;
+            let d = 4.0;
+            let tx = 10.0;
+            let ty = 20.0;
             let det = a * d - b * c;
             let inv_det = 1.0 / det;
             let expected = [
-                d * inv_det, -b * inv_det,
-                -c * inv_det, a * inv_det,
+                d * inv_det,
+                -b * inv_det,
+                -c * inv_det,
+                a * inv_det,
                 (c * ty - d * tx) * inv_det,
                 (b * tx - a * ty) * inv_det,
             ];
@@ -460,7 +505,8 @@ fn t33_17_matrix_invert() {
                 assert!(
                     (matrix.elements[i] - expected[i]).abs() < 0.001,
                     "element {i} mismatch: {} vs {}",
-                    matrix.elements[i], expected[i]
+                    matrix.elements[i],
+                    expected[i]
                 );
             }
         }
@@ -486,7 +532,8 @@ fn t33_19_world_transform() {
     let mut state = fresh_state();
     let hdc: u64 = 0x100;
     let gfx_handle = state.create_graphics_from_hdc(hdc);
-    let matrix_handle = state.alloc_handle(GdiplusObject::Matrix(Box::new(GdiplusMatrix::identity())));
+    let matrix_handle =
+        state.alloc_handle(GdiplusObject::Matrix(Box::new(GdiplusMatrix::identity())));
 
     // Set world transform
     if let Some(GdiplusObject::Graphics(gfx)) = state.get_mut(gfx_handle) {
@@ -604,7 +651,11 @@ fn t33_21_graphics_save_restore() {
     }
 
     // Verify modified
-    match state.get(gfx_handle).expect("graphics should exist").clone() {
+    match state
+        .get(gfx_handle)
+        .expect("graphics should exist")
+        .clone()
+    {
         GdiplusObject::Graphics(gfx) => {
             assert_eq!(gfx.smoothing_mode, GDIPLUS_SMOOTHING_MODE_DEFAULT);
         }
@@ -612,26 +663,36 @@ fn t33_21_graphics_save_restore() {
     }
 
     // Restore state
-    if let Some(GdiplusObject::Graphics(gfx)) = state.get_mut(gfx_handle) {
-        if let Some(pos) = gfx.container_stack.iter().position(|c| c.id == saved_state_id) {
-            let container = gfx.container_stack.remove(pos);
-            gfx.smoothing_mode = container.saved_state.smoothing_mode;
-            gfx.compositing_mode = container.saved_state.compositing_mode;
-            gfx.compositing_quality = container.saved_state.compositing_quality;
-            gfx.interpolation_mode = container.saved_state.interpolation_mode;
-            gfx.pixel_offset_mode = container.saved_state.pixel_offset_mode;
-            gfx.text_rendering_hint = container.saved_state.text_rendering_hint;
-            gfx.clip_rect = container.saved_state.clip_rect;
-            gfx.world_transform = container.saved_state.world_transform;
-        }
+    if let Some(GdiplusObject::Graphics(gfx)) = state.get_mut(gfx_handle)
+        && let Some(pos) = gfx
+            .container_stack
+            .iter()
+            .position(|c| c.id == saved_state_id)
+    {
+        let container = gfx.container_stack.remove(pos);
+        gfx.smoothing_mode = container.saved_state.smoothing_mode;
+        gfx.compositing_mode = container.saved_state.compositing_mode;
+        gfx.compositing_quality = container.saved_state.compositing_quality;
+        gfx.interpolation_mode = container.saved_state.interpolation_mode;
+        gfx.pixel_offset_mode = container.saved_state.pixel_offset_mode;
+        gfx.text_rendering_hint = container.saved_state.text_rendering_hint;
+        gfx.clip_rect = container.saved_state.clip_rect;
+        gfx.world_transform = container.saved_state.world_transform;
     }
 
     // Verify restored
-    match state.get(gfx_handle).expect("graphics should exist").clone() {
+    match state
+        .get(gfx_handle)
+        .expect("graphics should exist")
+        .clone()
+    {
         GdiplusObject::Graphics(gfx) => {
             assert_eq!(gfx.smoothing_mode, GDIPLUS_SMOOTHING_MODE_HIGH_QUALITY);
             assert_eq!(gfx.compositing_mode, GDIPLUS_COMPOSITING_MODE_SOURCE_COPY);
-            assert_eq!(gfx.interpolation_mode, GDIPLUS_INTERPOLATION_HIGH_QUALITY_BICUBIC);
+            assert_eq!(
+                gfx.interpolation_mode,
+                GDIPLUS_INTERPOLATION_HIGH_QUALITY_BICUBIC
+            );
         }
         _ => panic!("expected Graphics object"),
     }
@@ -674,27 +735,38 @@ fn t33_22_graphics_begin_end_container() {
     }
 
     // End container (restore state)
-    if let Some(GdiplusObject::Graphics(gfx)) = state.get_mut(gfx_handle) {
-        if let Some(pos) = gfx.container_stack.iter().position(|c| c.id == container_id) {
-            let container = gfx.container_stack.remove(pos);
-            gfx.smoothing_mode = container.saved_state.smoothing_mode;
-            gfx.compositing_mode = container.saved_state.compositing_mode;
-            gfx.compositing_quality = container.saved_state.compositing_quality;
-            gfx.interpolation_mode = container.saved_state.interpolation_mode;
-            gfx.pixel_offset_mode = container.saved_state.pixel_offset_mode;
-            gfx.text_rendering_hint = container.saved_state.text_rendering_hint;
-            gfx.clip_rect = container.saved_state.clip_rect;
-            gfx.world_transform = container.saved_state.world_transform;
-        }
+    if let Some(GdiplusObject::Graphics(gfx)) = state.get_mut(gfx_handle)
+        && let Some(pos) = gfx
+            .container_stack
+            .iter()
+            .position(|c| c.id == container_id)
+    {
+        let container = gfx.container_stack.remove(pos);
+        gfx.smoothing_mode = container.saved_state.smoothing_mode;
+        gfx.compositing_mode = container.saved_state.compositing_mode;
+        gfx.compositing_quality = container.saved_state.compositing_quality;
+        gfx.interpolation_mode = container.saved_state.interpolation_mode;
+        gfx.pixel_offset_mode = container.saved_state.pixel_offset_mode;
+        gfx.text_rendering_hint = container.saved_state.text_rendering_hint;
+        gfx.clip_rect = container.saved_state.clip_rect;
+        gfx.world_transform = container.saved_state.world_transform;
     }
 
     // Verify state is restored
-    match state.get(gfx_handle).expect("graphics should exist").clone() {
+    match state
+        .get(gfx_handle)
+        .expect("graphics should exist")
+        .clone()
+    {
         GdiplusObject::Graphics(gfx) => {
-            assert_eq!(gfx.smoothing_mode, GDIPLUS_SMOOTHING_MODE_HIGH_QUALITY,
-                "smoothing mode should be restored");
-            assert_eq!(gfx.pixel_offset_mode, GDIPLUS_PIXEL_OFFSET_DEFAULT,
-                "pixel offset should be restored");
+            assert_eq!(
+                gfx.smoothing_mode, GDIPLUS_SMOOTHING_MODE_HIGH_QUALITY,
+                "smoothing mode should be restored"
+            );
+            assert_eq!(
+                gfx.pixel_offset_mode, GDIPLUS_PIXEL_OFFSET_DEFAULT,
+                "pixel offset should be restored"
+            );
         }
         _ => panic!("expected Graphics object"),
     }
@@ -765,9 +837,12 @@ fn t33_24_bitmap_get_width_height_format() {
 fn t33_25_bitmap_dispose_image() {
     let mut state = fresh_state();
     let bitmap = GdiplusBitmap {
-        width: 1, height: 1,
+        width: 1,
+        height: 1,
         pixel_format: GDIPLUS_PIXEL_FORMAT_32BPP_ARGB,
-        stride: 4, pixels: vec![0; 4], locked: false,
+        stride: 4,
+        pixels: vec![0; 4],
+        locked: false,
     };
     let handle = state.alloc_handle(GdiplusObject::Image(Box::new(GdiplusImage::Bitmap(bitmap))));
     assert!(state.get(handle).is_some());
@@ -784,7 +859,9 @@ fn t33_26_font_create_and_delete() {
     let mut state = fresh_state();
 
     // Create font family
-    let family = GdiplusFontFamily { name: "Arial".to_string() };
+    let family = GdiplusFontFamily {
+        name: "Arial".to_string(),
+    };
     let family_handle = state.alloc_handle(GdiplusObject::FontFamily(Box::new(family)));
 
     match state.get(family_handle).expect("font family should exist") {
@@ -831,7 +908,10 @@ fn t33_27_text_rendering_hint() {
     // Default hint
     match state.get(gfx_handle).expect("graphics should exist") {
         GdiplusObject::Graphics(gfx) => {
-            assert_eq!(gfx.text_rendering_hint, GDIPLUS_TEXT_RENDERING_HINT_SYSTEM_DEFAULT);
+            assert_eq!(
+                gfx.text_rendering_hint,
+                GDIPLUS_TEXT_RENDERING_HINT_SYSTEM_DEFAULT
+            );
         }
         _ => panic!("expected Graphics object"),
     }
@@ -843,7 +923,10 @@ fn t33_27_text_rendering_hint() {
 
     match state.get(gfx_handle).expect("graphics should exist") {
         GdiplusObject::Graphics(gfx) => {
-            assert_eq!(gfx.text_rendering_hint, GDIPLUS_TEXT_RENDERING_HINT_ANTI_ALIAS);
+            assert_eq!(
+                gfx.text_rendering_hint,
+                GDIPLUS_TEXT_RENDERING_HINT_ANTI_ALIAS
+            );
         }
         _ => panic!("expected Graphics object"),
     }
@@ -938,8 +1021,14 @@ fn t33_30_quality_settings() {
         GdiplusObject::Graphics(gfx) => {
             assert_eq!(gfx.smoothing_mode, GDIPLUS_SMOOTHING_MODE_HIGH_QUALITY);
             assert_eq!(gfx.compositing_mode, GDIPLUS_COMPOSITING_MODE_SOURCE_COPY);
-            assert_eq!(gfx.compositing_quality, GDIPLUS_COMPOSITING_QUALITY_HIGH_QUALITY);
-            assert_eq!(gfx.interpolation_mode, GDIPLUS_INTERPOLATION_HIGH_QUALITY_BICUBIC);
+            assert_eq!(
+                gfx.compositing_quality,
+                GDIPLUS_COMPOSITING_QUALITY_HIGH_QUALITY
+            );
+            assert_eq!(
+                gfx.interpolation_mode,
+                GDIPLUS_INTERPOLATION_HIGH_QUALITY_BICUBIC
+            );
             assert_eq!(gfx.pixel_offset_mode, GDIPLUS_PIXEL_OFFSET_HALF);
         }
         _ => panic!("expected Graphics object"),
@@ -1130,7 +1219,12 @@ fn t33_34_pointf_and_rectf() {
     assert!((pt.x - 10.5).abs() < f32::EPSILON);
     assert!((pt.y - 20.5).abs() < f32::EPSILON);
 
-    let rect = GdiplusRectF { x: 1.0, y: 2.0, width: 100.0, height: 200.0 };
+    let rect = GdiplusRectF {
+        x: 1.0,
+        y: 2.0,
+        width: 100.0,
+        height: 200.0,
+    };
     assert!((rect.x - 1.0).abs() < f32::EPSILON);
     assert!((rect.width - 100.0).abs() < f32::EPSILON);
 }
@@ -1170,7 +1264,10 @@ fn t33_36_graphics_state_defaults() {
             assert_eq!(gfx.compositing_quality, GDIPLUS_COMPOSITING_QUALITY_DEFAULT);
             assert_eq!(gfx.interpolation_mode, GDIPLUS_INTERPOLATION_DEFAULT);
             assert_eq!(gfx.pixel_offset_mode, GDIPLUS_PIXEL_OFFSET_DEFAULT);
-            assert_eq!(gfx.text_rendering_hint, GDIPLUS_TEXT_RENDERING_HINT_SYSTEM_DEFAULT);
+            assert_eq!(
+                gfx.text_rendering_hint,
+                GDIPLUS_TEXT_RENDERING_HINT_SYSTEM_DEFAULT
+            );
             assert!(gfx.clip_rect.is_none());
             assert!(gfx.world_transform.is_none());
             assert!(gfx.container_stack.is_empty());
@@ -1191,8 +1288,14 @@ fn t33_37_multiple_hdc_graphics() {
     let g2 = state.create_graphics_from_hdc(0x200);
     let g3 = state.create_graphics_from_hdc(0x300);
 
-    assert_ne!(g1, g2, "different HDCs should get different graphics handles");
-    assert_ne!(g2, g3, "different HDCs should get different graphics handles");
+    assert_ne!(
+        g1, g2,
+        "different HDCs should get different graphics handles"
+    );
+    assert_ne!(
+        g2, g3,
+        "different HDCs should get different graphics handles"
+    );
 
     // Same HDC returns cached
     let g1_cached = state.create_graphics_from_hdc(0x100);
@@ -1207,22 +1310,76 @@ fn t33_37_multiple_hdc_graphics() {
 fn t33_38_path_element_variants() {
     let _ = GdiplusPathElement::StartFigure;
     let _ = GdiplusPathElement::CloseFigure;
-    let _ = GdiplusPathElement::Line { x1: 0.0, y1: 0.0, x2: 1.0, y2: 1.0 };
-    let _ = GdiplusPathElement::Rectangle { x: 0.0, y: 0.0, w: 1.0, h: 1.0 };
-    let _ = GdiplusPathElement::Ellipse { x: 0.0, y: 0.0, w: 1.0, h: 1.0 };
-    let _ = GdiplusPathElement::Arc { x: 0.0, y: 0.0, w: 1.0, h: 1.0, start_angle: 0.0, sweep_angle: 90.0 };
-    let _ = GdiplusPathElement::Bezier { points: [
-        GdiplusPointF { x: 0.0, y: 0.0 },
-        GdiplusPointF { x: 1.0, y: 1.0 },
-        GdiplusPointF { x: 2.0, y: 2.0 },
-        GdiplusPointF { x: 3.0, y: 3.0 },
-    ]};
-    let _ = GdiplusPathElement::Polygon { points: vec![GdiplusPointF { x: 0.0, y: 0.0 }] };
-    let _ = GdiplusPathElement::Pie { x: 0.0, y: 0.0, w: 1.0, h: 1.0, start_angle: 0.0, sweep_angle: 90.0 };
-    let _ = GdiplusPathElement::String { text: "hello".to_string(), font_handle: 0, layout_rect: GdiplusRectF { x: 0.0, y: 0.0, width: 100.0, height: 20.0 }, format_flags: 0 };
-    let _ = GdiplusPathElement::Lines { points: vec![GdiplusPointF { x: 0.0, y: 0.0 }, GdiplusPointF { x: 1.0, y: 1.0 }] };
-    let _ = GdiplusPathElement::Curve { points: vec![GdiplusPointF { x: 0.0, y: 0.0 }], tension: 0.5 };
-    let _ = GdiplusPathElement::ClosedCurve { points: vec![GdiplusPointF { x: 0.0, y: 0.0 }], tension: 0.5 };
+    let _ = GdiplusPathElement::Line {
+        x1: 0.0,
+        y1: 0.0,
+        x2: 1.0,
+        y2: 1.0,
+    };
+    let _ = GdiplusPathElement::Rectangle {
+        x: 0.0,
+        y: 0.0,
+        w: 1.0,
+        h: 1.0,
+    };
+    let _ = GdiplusPathElement::Ellipse {
+        x: 0.0,
+        y: 0.0,
+        w: 1.0,
+        h: 1.0,
+    };
+    let _ = GdiplusPathElement::Arc {
+        x: 0.0,
+        y: 0.0,
+        w: 1.0,
+        h: 1.0,
+        start_angle: 0.0,
+        sweep_angle: 90.0,
+    };
+    let _ = GdiplusPathElement::Bezier {
+        points: [
+            GdiplusPointF { x: 0.0, y: 0.0 },
+            GdiplusPointF { x: 1.0, y: 1.0 },
+            GdiplusPointF { x: 2.0, y: 2.0 },
+            GdiplusPointF { x: 3.0, y: 3.0 },
+        ],
+    };
+    let _ = GdiplusPathElement::Polygon {
+        points: vec![GdiplusPointF { x: 0.0, y: 0.0 }],
+    };
+    let _ = GdiplusPathElement::Pie {
+        x: 0.0,
+        y: 0.0,
+        w: 1.0,
+        h: 1.0,
+        start_angle: 0.0,
+        sweep_angle: 90.0,
+    };
+    let _ = GdiplusPathElement::String {
+        text: "hello".to_string(),
+        font_handle: 0,
+        layout_rect: GdiplusRectF {
+            x: 0.0,
+            y: 0.0,
+            width: 100.0,
+            height: 20.0,
+        },
+        format_flags: 0,
+    };
+    let _ = GdiplusPathElement::Lines {
+        points: vec![
+            GdiplusPointF { x: 0.0, y: 0.0 },
+            GdiplusPointF { x: 1.0, y: 1.0 },
+        ],
+    };
+    let _ = GdiplusPathElement::Curve {
+        points: vec![GdiplusPointF { x: 0.0, y: 0.0 }],
+        tension: 0.5,
+    };
+    let _ = GdiplusPathElement::ClosedCurve {
+        points: vec![GdiplusPointF { x: 0.0, y: 0.0 }],
+        tension: 0.5,
+    };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1271,37 +1428,42 @@ fn t33_41_bitmap_pixel_get_set() {
     let handle = state.alloc_handle(GdiplusObject::Image(Box::new(GdiplusImage::Bitmap(bmp))));
 
     // Set pixel at (1, 1) to red
-    if let Some(GdiplusObject::Image(img)) = state.get_mut(handle) {
-        if let GdiplusImage::Bitmap(b) = &mut **img {
-            let idx = (1 * b.stride + 1 * 4) as usize;
-            let bytes = 0xFFFF0000u32.to_le_bytes();
-            b.pixels[idx..idx + 4].copy_from_slice(&bytes);
-        }
+    if let Some(GdiplusObject::Image(img)) = state.get_mut(handle)
+        && let GdiplusImage::Bitmap(b) = &mut **img
+    {
+        let idx = (b.stride + 4) as usize;
+        let bytes = 0xFFFF0000u32.to_le_bytes();
+        b.pixels[idx..idx + 4].copy_from_slice(&bytes);
     }
 
     // Get pixel at (1, 1) and verify
-    if let Some(GdiplusObject::Image(img)) = state.get(handle) {
-        if let GdiplusImage::Bitmap(b) = &**img {
-            let idx = (1 * b.stride + 1 * 4) as usize;
-            let color = u32::from_le_bytes([
-                b.pixels[idx], b.pixels[idx + 1],
-                b.pixels[idx + 2], b.pixels[idx + 3],
-            ]);
-            assert_eq!(color, 0xFFFF0000, "bitmap get/set pixel at (1,1) should be red");
-        }
+    if let Some(GdiplusObject::Image(img)) = state.get(handle)
+        && let GdiplusImage::Bitmap(b) = &**img
+    {
+        let idx = (b.stride + 4) as usize;
+        let color = u32::from_le_bytes([
+            b.pixels[idx],
+            b.pixels[idx + 1],
+            b.pixels[idx + 2],
+            b.pixels[idx + 3],
+        ]);
+        assert_eq!(
+            color, 0xFFFF0000,
+            "bitmap get/set pixel at (1,1) should be red"
+        );
     }
 
     // Verify out-of-bounds access doesn't panic (edge case)
-    if let Some(GdiplusObject::Image(img)) = state.get(handle) {
-        if let GdiplusImage::Bitmap(b) = &**img {
-            let x = 10u32;
-            let y = 10u32;
-            if x < b.width && y < b.height {
-                let idx = (y as i32 * b.stride + x as i32 * 4) as usize;
-                if idx + 3 < b.pixels.len() {
-                    // Should not reach here for 4x4 bitmap
-                    panic!("out-of-bounds access should not be valid");
-                }
+    if let Some(GdiplusObject::Image(img)) = state.get(handle)
+        && let GdiplusImage::Bitmap(b) = &**img
+    {
+        let x = 10u32;
+        let y = 10u32;
+        if x < b.width && y < b.height {
+            let idx = (y as i32 * b.stride + x as i32 * 4) as usize;
+            if idx + 3 < b.pixels.len() {
+                // Should not reach here for 4x4 bitmap
+                panic!("out-of-bounds access should not be valid");
             }
         }
     }
@@ -1322,17 +1484,41 @@ fn t33_42_renderer_fill_rect() {
     let stride = 40i32; // 10 * 4
     let color = 0xFF00FF00u32; // green
 
-    fill_rect(&mut pixels, 10, 10, stride, 2.0, 2.0, 6.0, 6.0, color, GDIPLUS_COMPOSITING_MODE_SOURCE_COPY);
+    fill_rect(
+        &mut pixels,
+        10,
+        10,
+        stride,
+        2.0,
+        2.0,
+        6.0,
+        6.0,
+        color,
+        GDIPLUS_COMPOSITING_MODE_SOURCE_COPY,
+    );
 
     // Inside fill area
     let idx = (4 * stride + 4 * 4) as usize;
-    let pixel = u32::from_le_bytes([pixels[idx], pixels[idx+1], pixels[idx+2], pixels[idx+3]]);
+    let pixel = u32::from_le_bytes([
+        pixels[idx],
+        pixels[idx + 1],
+        pixels[idx + 2],
+        pixels[idx + 3],
+    ]);
     assert_eq!(pixel, 0xFF00FF00, "inside fill rect should be green");
 
     // Outside fill area (top-left)
-    let idx_out = (0 * stride + 0 * 4) as usize;
-    let pixel_out = u32::from_le_bytes([pixels[idx_out], pixels[idx_out+1], pixels[idx_out+2], pixels[idx_out+3]]);
-    assert_eq!(pixel_out, 0x00000000, "outside fill rect should be transparent");
+    let idx_out = (0 * stride) as usize;
+    let pixel_out = u32::from_le_bytes([
+        pixels[idx_out],
+        pixels[idx_out + 1],
+        pixels[idx_out + 2],
+        pixels[idx_out + 3],
+    ]);
+    assert_eq!(
+        pixel_out, 0x00000000,
+        "outside fill rect should be transparent"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1347,17 +1533,43 @@ fn t33_43_renderer_draw_line() {
     let stride = 80i32;
 
     // Draw a horizontal red line at y=10 from x=2 to x=18
-    draw_line(&mut pixels, 20, 20, stride, 2.0, 10.0, 18.0, 10.0, 0xFFFF0000, 1.0, GDIPLUS_COMPOSITING_MODE_SOURCE_COPY);
+    draw_line(
+        &mut pixels,
+        20,
+        20,
+        stride,
+        2.0,
+        10.0,
+        18.0,
+        10.0,
+        0xFFFF0000,
+        1.0,
+        GDIPLUS_COMPOSITING_MODE_SOURCE_COPY,
+        GDIPLUS_SMOOTHING_MODE_DEFAULT,
+    );
 
     // Check pixels on the line
     let idx = (10 * stride + 5 * 4) as usize;
-    let pixel = u32::from_le_bytes([pixels[idx], pixels[idx+1], pixels[idx+2], pixels[idx+3]]);
+    let pixel = u32::from_le_bytes([
+        pixels[idx],
+        pixels[idx + 1],
+        pixels[idx + 2],
+        pixels[idx + 3],
+    ]);
     assert_eq!(pixel, 0xFFFF0000, "pixel on drawn line should be red");
 
     // Check pixel off the line (row 0)
-    let idx_off = (0 * stride + 0 * 4) as usize;
-    let pixel_off = u32::from_le_bytes([pixels[idx_off], pixels[idx_off+1], pixels[idx_off+2], pixels[idx_off+3]]);
-    assert_eq!(pixel_off, 0x00000000, "pixel off line should be transparent");
+    let idx_off = (0 * stride) as usize;
+    let pixel_off = u32::from_le_bytes([
+        pixels[idx_off],
+        pixels[idx_off + 1],
+        pixels[idx_off + 2],
+        pixels[idx_off + 3],
+    ]);
+    assert_eq!(
+        pixel_off, 0x00000000,
+        "pixel off line should be transparent"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1371,11 +1583,27 @@ fn t33_44_renderer_fill_ellipse() {
     let mut pixels = vec![0u8; 40 * 40 * 4];
     let stride = 160i32;
 
-    fill_ellipse(&mut pixels, 40, 40, stride, 5.0, 5.0, 30.0, 30.0, 0xFF0000FF, GDIPLUS_COMPOSITING_MODE_SOURCE_COPY);
+    fill_ellipse(
+        &mut pixels,
+        40,
+        40,
+        stride,
+        5.0,
+        5.0,
+        30.0,
+        30.0,
+        0xFF0000FF,
+        GDIPLUS_COMPOSITING_MODE_SOURCE_COPY,
+    );
 
     // Centre should be filled
     let idx = (20 * stride + 20 * 4) as usize;
-    let pixel = u32::from_le_bytes([pixels[idx], pixels[idx+1], pixels[idx+2], pixels[idx+3]]);
+    let pixel = u32::from_le_bytes([
+        pixels[idx],
+        pixels[idx + 1],
+        pixels[idx + 2],
+        pixels[idx + 3],
+    ]);
     assert_eq!(pixel, 0xFF0000FF, "centre of filled ellipse should be blue");
 }
 
@@ -1395,17 +1623,38 @@ fn t33_45_renderer_fill_polygon() {
         GdiplusPointF { x: 10.0, y: 18.0 },
     ];
 
-    fill_polygon(&mut pixels, 20, 20, stride, &pts, 0xFF00FFFF, GDIPLUS_COMPOSITING_MODE_SOURCE_COPY);
+    fill_polygon(
+        &mut pixels,
+        20,
+        20,
+        stride,
+        &pts,
+        0xFF00FFFF,
+        GDIPLUS_COMPOSITING_MODE_SOURCE_COPY,
+    );
 
     // Centre-ish should be filled
     let idx = (10 * stride + 10 * 4) as usize;
-    let pixel = u32::from_le_bytes([pixels[idx], pixels[idx+1], pixels[idx+2], pixels[idx+3]]);
+    let pixel = u32::from_le_bytes([
+        pixels[idx],
+        pixels[idx + 1],
+        pixels[idx + 2],
+        pixels[idx + 3],
+    ]);
     assert_eq!(pixel, 0xFF00FFFF, "centre of filled polygon should be cyan");
 
     // Top edge (non-fill area in a triangle)
-    let idx_top = (1 * stride + 10 * 4) as usize;
-    let pixel_top = u32::from_le_bytes([pixels[idx_top], pixels[idx_top+1], pixels[idx_top+2], pixels[idx_top+3]]);
-    assert_eq!(pixel_top, 0x00000000, "outside polygon should be transparent");
+    let idx_top = (stride + 10 * 4) as usize;
+    let pixel_top = u32::from_le_bytes([
+        pixels[idx_top],
+        pixels[idx_top + 1],
+        pixels[idx_top + 2],
+        pixels[idx_top + 3],
+    ]);
+    assert_eq!(
+        pixel_top, 0x00000000,
+        "outside polygon should be transparent"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1423,15 +1672,30 @@ fn t33_46_renderer_draw_image() {
     let src_stride = 12i32;
     let mut src = vec![0u8; (src_stride * 3) as usize];
     let red_bytes = 0xFFFF0000u32.to_le_bytes();
-    let idx_src = (1 * src_stride + 1 * 4) as usize;
+    let idx_src = (src_stride + 4) as usize;
     src[idx_src..idx_src + 4].copy_from_slice(&red_bytes);
 
-    draw_image(&mut dst, 20, 20, dst_stride, &src, 3, 3, src_stride, 5.0, 5.0, GDIPLUS_COMPOSITING_MODE_SOURCE_COPY);
+    draw_image(
+        &mut dst,
+        20,
+        20,
+        dst_stride,
+        &src,
+        3,
+        3,
+        src_stride,
+        5.0,
+        5.0,
+        GDIPLUS_COMPOSITING_MODE_SOURCE_COPY,
+    );
 
     // The red pixel from src (1,1) should appear at dst (6,6)
     let idx = (6 * dst_stride + 6 * 4) as usize;
-    let pixel = u32::from_le_bytes([dst[idx], dst[idx+1], dst[idx+2], dst[idx+3]]);
-    assert_eq!(pixel, 0xFFFF0000, "drawn image pixel at (6,6) should be red");
+    let pixel = u32::from_le_bytes([dst[idx], dst[idx + 1], dst[idx + 2], dst[idx + 3]]);
+    assert_eq!(
+        pixel, 0xFFFF0000,
+        "drawn image pixel at (6,6) should be red"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1445,11 +1709,27 @@ fn t33_47_renderer_draw_string() {
     let mut pixels = vec![0u8; 50 * 50 * 4];
     let stride = 200i32;
 
-    draw_string(&mut pixels, 50, 50, stride, "Hi", 5.0, 5.0, 12.0, 0xFFFFFFFF, GDIPLUS_COMPOSITING_MODE_SOURCE_COPY);
+    draw_string(
+        &mut pixels,
+        50,
+        50,
+        stride,
+        "Hi",
+        5.0,
+        5.0,
+        12.0,
+        0xFFFFFFFF,
+        GDIPLUS_COMPOSITING_MODE_SOURCE_COPY,
+    );
 
     // String rendering produces coloured blocks; verify at least some pixels were set
     let idx = (5 * stride + 5 * 4) as usize;
-    let pixel = u32::from_le_bytes([pixels[idx], pixels[idx+1], pixels[idx+2], pixels[idx+3]]);
+    let pixel = u32::from_le_bytes([
+        pixels[idx],
+        pixels[idx + 1],
+        pixels[idx + 2],
+        pixels[idx + 3],
+    ]);
     assert_eq!(pixel, 0xFFFFFFFF, "first character block should be white");
 }
 
@@ -1465,14 +1745,41 @@ fn t33_48_renderer_alpha_blend() {
     let stride = 40i32;
 
     // Fill entire area with opaque white
-    fill_rect(&mut pixels, 10, 10, stride, 0.0, 0.0, 10.0, 10.0, 0xFFFFFFFF, GDIPLUS_COMPOSITING_MODE_SOURCE_COPY);
+    fill_rect(
+        &mut pixels,
+        10,
+        10,
+        stride,
+        0.0,
+        0.0,
+        10.0,
+        10.0,
+        0xFFFFFFFF,
+        GDIPLUS_COMPOSITING_MODE_SOURCE_COPY,
+    );
 
     // Now overlay semi-transparent red at (2,2)-(7,7)
-    fill_rect(&mut pixels, 10, 10, stride, 2.0, 2.0, 5.0, 5.0, 0x80FF0000, GDIPLUS_COMPOSITING_MODE_SOURCE_OVER);
+    fill_rect(
+        &mut pixels,
+        10,
+        10,
+        stride,
+        2.0,
+        2.0,
+        5.0,
+        5.0,
+        0x80FF0000,
+        GDIPLUS_COMPOSITING_MODE_SOURCE_OVER,
+    );
 
     // Pixel at (4,4) should be blended (not pure red, not pure white)
     let idx = (4 * stride + 4 * 4) as usize;
-    let pixel = u32::from_le_bytes([pixels[idx], pixels[idx+1], pixels[idx+2], pixels[idx+3]]);
+    let pixel = u32::from_le_bytes([
+        pixels[idx],
+        pixels[idx + 1],
+        pixels[idx + 2],
+        pixels[idx + 3],
+    ]);
     let r = (pixel >> 16) & 0xFF;
     let b = pixel & 0xFF;
     // With source-over, red should be visible but blue should still have some value

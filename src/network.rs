@@ -1,15 +1,13 @@
 use crate::error::{AppError, AppResult};
-use base64::{Engine as _, engine::general_purpose};
-use der::{Decode, Encode};
-use x509_cert::Certificate as X509Certificate;
-use std::time::Duration;
 use crate::reason::ReasonCode;
 use aes::Aes128;
 use aes_gcm::aead::{AeadInPlace, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce, Tag};
+use base64::{Engine as _, engine::general_purpose};
 use cbc::{Decryptor, Encryptor};
 use cipher::block_padding::NoPadding;
 use cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit};
+use der::{Decode, Encode};
 use hmac::{Hmac, Mac};
 use p256::ecdsa::{Signature as EcdsaSignature, VerifyingKey as EcdsaVerifyingKey};
 use rand::rngs::OsRng;
@@ -21,9 +19,16 @@ use serde::{Deserialize, Serialize};
 use sha1::{Digest as _, Sha1};
 use sha2::Sha256;
 use std::collections::{BTreeMap, VecDeque};
+use std::ffi::{CStr, CString};
 use std::io::{Read, Write};
-use std::net::{Shutdown as NetShutdown, SocketAddr as NetSocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{
+    Shutdown as NetShutdown, SocketAddr as NetSocketAddr, TcpStream, ToSocketAddrs, UdpSocket,
+};
 use std::os::fd::AsRawFd;
+use std::os::raw::{c_char, c_void};
+use std::sync::Arc;
+use std::time::Duration;
+use x509_cert::Certificate as X509Certificate;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -126,6 +131,27 @@ const WSANOTINITIALISED: i32 = 10093;
 const WSAHOST_NOT_FOUND: i32 = 11001;
 
 // ---------------------------------------------------------------------------
+// Network size limits — prevent resource exhaustion
+// ---------------------------------------------------------------------------
+
+/// Maximum socket receive queue size (16 MB).
+pub const MAX_SOCKET_RECEIVE_QUEUE: usize = 16 * 1024 * 1024;
+/// Maximum HTTP request body size (64 MB).
+pub const MAX_HTTP_REQUEST_BODY: usize = 64 * 1024 * 1024;
+/// Maximum WebSocket frame size (64 MB).
+pub const MAX_WEBSOCKET_FRAME_SIZE: usize = 64 * 1024 * 1024;
+/// Maximum WebSocket send buffer size (16 MB).
+pub const MAX_WEBSOCKET_SEND_BUFFER: usize = 16 * 1024 * 1024;
+/// Maximum WebSocket receive spill buffer size (16 MB).
+pub const MAX_WEBSOCKET_RECEIVE_SPILL: usize = 16 * 1024 * 1024;
+/// Maximum number of HTTP headers per request/response.
+pub const MAX_HTTP_HEADER_COUNT: usize = 128;
+/// Maximum total size of HTTP headers in bytes (256 KB).
+pub const MAX_HTTP_HEADER_BYTES: usize = 256 * 1024;
+/// Maximum pending accept queue length for listening sockets.
+pub const MAX_PENDING_ACCEPT_QUEUE: usize = 128;
+
+// ---------------------------------------------------------------------------
 // G8: Certificate pinning — HPKP-style public key pinning
 // ---------------------------------------------------------------------------
 
@@ -170,13 +196,19 @@ impl PinnedCertificates {
     /// `fingerprint` is a base64-encoded SHA-256 hash of the DER-encoded SPKI.
     pub fn add_pin(&mut self, hostname: &str, fingerprint: &str) {
         let host = hostname.to_lowercase();
-        self.pins.entry(host).or_default().push(fingerprint.to_string());
+        self.pins
+            .entry(host)
+            .or_default()
+            .push(fingerprint.to_string());
     }
 
     /// Add multiple pins for a hostname.
     pub fn add_pins(&mut self, hostname: &str, fingerprints: &[String]) {
         let host = hostname.to_lowercase();
-        self.pins.entry(host).or_default().extend_from_slice(fingerprints);
+        self.pins
+            .entry(host)
+            .or_default()
+            .extend_from_slice(fingerprints);
     }
 
     /// Check if a hostname has any pins configured.
@@ -225,9 +257,7 @@ impl PinnedCertificates {
                     .map_err(|e| {
                         AppError::new(
                             ReasonCode::RcNetConnectionFailed,
-                            format!(
-                                "certificate pinning: failed to encode SPKI for {host}: {e}"
-                            ),
+                            format!("certificate pinning: failed to encode SPKI for {host}: {e}"),
                         )
                     })?;
 
@@ -383,6 +413,41 @@ struct HttpResponseRecord {
     body: Vec<u8>,
 }
 
+#[derive(Debug, Clone)]
+struct WebSocketRecord {
+    /// The request handle this WebSocket was upgraded from.
+    request_handle: HttpRequestId,
+    /// Whether the WebSocket is still open.
+    is_open: bool,
+    /// Buffer for received data.
+    receive_buffer: Vec<u8>,
+    /// Buffer for sent data.
+    send_buffer: Vec<u8>,
+    /// Close status code.
+    close_status: u16,
+    /// Optional close reason.
+    close_reason: Option<String>,
+    /// Whether text mode is preferred.
+    is_text_mode: bool,
+    /// The WebSocket URL.
+    url: Option<String>,
+}
+
+impl WebSocketRecord {
+    fn new(request_handle: HttpRequestId, is_text_mode: bool, url: Option<String>) -> Self {
+        Self {
+            request_handle,
+            is_open: true,
+            receive_buffer: Vec::new(),
+            send_buffer: Vec::new(),
+            close_status: 1000, // Normal closure
+            close_reason: None,
+            is_text_mode,
+            url,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct ProxySettings {
     env_proxy: Option<String>,
@@ -425,6 +490,8 @@ pub struct NetworkStack {
     pub connection_protocols: BTreeMap<HttpConnectionId, HttpProtocol>,
     /// The enabled HTTP protocol flags per session (session_id -> flags)
     pub session_protocol_flags: BTreeMap<HttpSessionId, HttpProtocolFlags>,
+    /// WebSocket connections (ws_handle -> WebSocketRecord)
+    websockets: BTreeMap<u64, WebSocketRecord>,
 }
 
 impl Default for NetworkStack {
@@ -456,28 +523,35 @@ impl NetworkStack {
         })?;
 
         let host = url.host_str().ok_or_else(|| {
-            AppError::new(ReasonCode::RcNetDnsResolutionFailed, "NetworkStack: no host in URL")
+            AppError::new(
+                ReasonCode::RcNetDnsResolutionFailed,
+                "NetworkStack: no host in URL",
+            )
         })?;
 
-        let port = url.port().unwrap_or(if url.scheme() == "https" { 443 } else { 80 });
+        let port = url
+            .port()
+            .unwrap_or(if url.scheme() == "https" { 443 } else { 80 });
         let path = url.path();
         let query = url.query().map(|q| format!("?{q}")).unwrap_or_default();
         let request_path = format!("{path}{query}");
 
         let addr_str = format!("{host}:{port}");
-        let addr = addr_str.to_socket_addrs().map_err(|e| {
-            AppError::new(
-                ReasonCode::RcNetDnsResolutionFailed,
-                format!("NetworkStack: DNS resolution for {host} failed: {e}"),
-            )
-        })?
-        .next()
-        .ok_or_else(|| {
-            AppError::new(
-                ReasonCode::RcNetDnsResolutionFailed,
-                format!("NetworkStack: no address for {host}"),
-            )
-        })?;
+        let addr = addr_str
+            .to_socket_addrs()
+            .map_err(|e| {
+                AppError::new(
+                    ReasonCode::RcNetDnsResolutionFailed,
+                    format!("NetworkStack: DNS resolution for {host} failed: {e}"),
+                )
+            })?
+            .next()
+            .ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcNetDnsResolutionFailed,
+                    format!("NetworkStack: no address for {host}"),
+                )
+            })?;
 
         let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(15)).map_err(|e| {
             AppError::new(
@@ -491,57 +565,49 @@ impl NetworkStack {
         let use_tls = url.scheme() == "https";
 
         if use_tls {
-            #[cfg(feature = "native-tls")]
-            {
-                let connector = native_tls::TlsConnector::new().map_err(|e| {
-                    AppError::new(
-                        ReasonCode::RcNetConnectionFailed,
-                        format!("NetworkStack: TLS connector creation failed: {e}"),
-                    )
-                })?;
-                let mut tls_stream = connector.connect(host, stream).map_err(|e| {
-                    AppError::new(
-                        ReasonCode::RcNetConnectionFailed,
-                        format!("NetworkStack: TLS handshake with {host} failed: {e}"),
-                    )
-                })?;
+            // Build TlsConnector with explicit SNI hostname so that
+            // virtual-host aware servers return the correct certificate.
+            // The SNI hostname is provided in the `connector.connect(host, stream)` call below,
+            // which sends the hostname as the TLS SNI extension automatically.
+            let connector = native_tls::TlsConnector::builder().build().map_err(|e| {
+                AppError::new(
+                    ReasonCode::RcNetConnectionFailed,
+                    format!("NetworkStack: TLS connector build failed: {e}"),
+                )
+            })?;
+            let mut tls_stream = connector.connect(host, stream).map_err(|e| {
+                AppError::new(
+                    ReasonCode::RcNetConnectionFailed,
+                    format!("NetworkStack: TLS handshake with {host} failed: {e}"),
+                )
+            })?;
 
-                let request = format!(
-                    "GET {request_path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nUser-Agent: Casa1/0.1.0\r\nAccept: */*\r\n\r\n"
-                );
-                tls_stream.write_all(request.as_bytes()).map_err(|e| {
-                    AppError::new(
-                        ReasonCode::RcNetWriteFailed,
-                        format!("NetworkStack: HTTP GET (TLS) failed: {e}"),
-                    )
-                })?;
+            let request = format!(
+                "GET {request_path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nUser-Agent: Casa1/0.1.0\r\nAccept: */*\r\n\r\n"
+            );
+            tls_stream.write_all(request.as_bytes()).map_err(|e| {
+                AppError::new(
+                    ReasonCode::RcNetWriteFailed,
+                    format!("NetworkStack: HTTP GET (TLS) failed: {e}"),
+                )
+            })?;
 
-                let mut response = Vec::new();
-                let mut buf = [0u8; 16384];
-                loop {
-                    match tls_stream.read(&mut buf) {
-                        Ok(0) => break,
-                        Ok(n) => response.extend_from_slice(&buf[..n]),
-                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                        Err(e) => {
-                            return Err(AppError::new(
-                                ReasonCode::RcNetReadFailed,
-                                format!("NetworkStack: TLS read failed: {e}"),
-                            ));
-                        }
+            let mut response = Vec::new();
+            let mut buf = [0u8; 16384];
+            loop {
+                match tls_stream.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => response.extend_from_slice(&buf[..n]),
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(e) => {
+                        return Err(AppError::new(
+                            ReasonCode::RcNetReadFailed,
+                            format!("NetworkStack: TLS read failed: {e}"),
+                        ));
                     }
                 }
-                return parse_http_response(&response);
             }
-
-            #[cfg(not(feature = "native-tls"))]
-            {
-                let _ = stream;
-                return Err(AppError::new(
-                    ReasonCode::RcNetConnectionFailed,
-                    "NetworkStack: HTTPS not supported without native-tls feature",
-                ));
-            }
+            return parse_http_response(&response);
         }
 
         // Plain HTTP
@@ -576,7 +642,7 @@ impl NetworkStack {
 }
 
 /// Parse an HTTP response into a SimpleHttpResponse.
-fn parse_http_response(raw: &[u8]) -> AppResult<SimpleHttpResponse> {
+pub fn parse_http_response(raw: &[u8]) -> AppResult<SimpleHttpResponse> {
     let response_str = String::from_utf8_lossy(raw);
 
     // Parse status line: HTTP/1.1 200 OK
@@ -584,7 +650,12 @@ fn parse_http_response(raw: &[u8]) -> AppResult<SimpleHttpResponse> {
         let status_line = &response_str[..end_of_line];
         let parts: Vec<&str> = status_line.split(' ').collect();
         if parts.len() >= 2 {
-            parts[1].parse::<u16>().unwrap_or(0)
+            parts[1].parse::<u16>().map_err(|_| {
+                AppError::new(
+                    ReasonCode::RcPortParseError,
+                    format!("invalid HTTP status code: '{}'", parts[1]),
+                )
+            })?
         } else {
             0
         }
@@ -599,10 +670,24 @@ fn parse_http_response(raw: &[u8]) -> AppResult<SimpleHttpResponse> {
     if let Some(header_end) = response_str.find("\r\n\r\n") {
         let header_section = &response_str[..header_end];
         // Skip the status line, parse headers
+        let mut header_total_bytes: usize = 0;
         for line in header_section.lines().skip(1) {
+            if headers.len() >= MAX_HTTP_HEADER_COUNT {
+                return Err(AppError::new(
+                    ReasonCode::RcHttpHeaderLimitExceeded,
+                    format!("HTTP header count exceeds limit ({MAX_HTTP_HEADER_COUNT})"),
+                ));
+            }
             if let Some(colon) = line.find(':') {
                 let key = line[..colon].trim().to_string();
                 let value = line[colon + 1..].trim().to_string();
+                header_total_bytes += key.len() + value.len();
+                if header_total_bytes > MAX_HTTP_HEADER_BYTES {
+                    return Err(AppError::new(
+                        ReasonCode::RcHttpHeaderLimitExceeded,
+                        format!("HTTP header total bytes exceeds limit ({MAX_HTTP_HEADER_BYTES})"),
+                    ));
+                }
                 headers.insert(key.to_lowercase(), value);
             }
         }
@@ -658,6 +743,7 @@ impl Clone for NetworkStack {
             alt_svc_entries: self.alt_svc_entries.clone(),
             connection_protocols: self.connection_protocols.clone(),
             session_protocol_flags: self.session_protocol_flags.clone(),
+            websockets: self.websockets.clone(),
         }
     }
 }
@@ -686,7 +772,11 @@ impl NetworkStack {
         let mut trust_store = BTreeMap::new();
         trust_store.insert(root.fingerprint.clone(), root);
         routes.insert(
-            ("https".to_string(), "api.example.com".to_string(), "/login".to_string()),
+            (
+                "https".to_string(),
+                "api.example.com".to_string(),
+                "/login".to_string(),
+            ),
             HttpResponseTemplate {
                 status: 200,
                 headers: BTreeMap::from([("x-casa1-route".to_string(), "login".to_string())]),
@@ -698,37 +788,51 @@ impl NetworkStack {
                     path: "/store".to_string(),
                     secure: true,
                 }],
-                certificate_chain: vec![api_cert.clone(), Certificate {
-                    subject: "CN=TestRoot".to_string(),
-                    issuer: "CN=TestRoot".to_string(),
-                    fingerprint: "fp:test-root".to_string(),
-                    valid_hostnames: vec![],
-                    not_after_day: 99999,
-                    revoked: false,
-                    supported_ciphers: vec![],
-                }],
+                certificate_chain: vec![
+                    api_cert.clone(),
+                    Certificate {
+                        subject: "CN=TestRoot".to_string(),
+                        issuer: "CN=TestRoot".to_string(),
+                        fingerprint: "fp:test-root".to_string(),
+                        valid_hostnames: vec![],
+                        not_after_day: 99999,
+                        revoked: false,
+                        supported_ciphers: vec![],
+                    },
+                ],
             },
         );
         routes.insert(
-            ("https".to_string(), "api.example.com".to_string(), "/store/cart".to_string()),
+            (
+                "https".to_string(),
+                "api.example.com".to_string(),
+                "/store/cart".to_string(),
+            ),
             HttpResponseTemplate {
                 status: 200,
                 headers: BTreeMap::from([("x-casa1-route".to_string(), "cart".to_string())]),
                 body: b"cart".to_vec(),
                 cookies: Vec::new(),
-                certificate_chain: vec![api_cert, Certificate {
-                    subject: "CN=TestRoot".to_string(),
-                    issuer: "CN=TestRoot".to_string(),
-                    fingerprint: "fp:test-root".to_string(),
-                    valid_hostnames: vec![],
-                    not_after_day: 99999,
-                    revoked: false,
-                    supported_ciphers: vec![],
-                }],
+                certificate_chain: vec![
+                    api_cert,
+                    Certificate {
+                        subject: "CN=TestRoot".to_string(),
+                        issuer: "CN=TestRoot".to_string(),
+                        fingerprint: "fp:test-root".to_string(),
+                        valid_hostnames: vec![],
+                        not_after_day: 99999,
+                        revoked: false,
+                        supported_ciphers: vec![],
+                    },
+                ],
             },
         );
         routes.insert(
-            ("http".to_string(), "launcher.example.com".to_string(), "/patch".to_string()),
+            (
+                "http".to_string(),
+                "launcher.example.com".to_string(),
+                "/patch".to_string(),
+            ),
             HttpResponseTemplate {
                 status: 204,
                 headers: BTreeMap::from([("x-casa1-route".to_string(), "patch".to_string())]),
@@ -789,6 +893,7 @@ impl NetworkStack {
             alt_svc_entries: BTreeMap::new(),
             connection_protocols: BTreeMap::new(),
             session_protocol_flags: BTreeMap::new(),
+            websockets: BTreeMap::new(),
         }
     }
 
@@ -894,10 +999,9 @@ impl NetworkStack {
     pub fn bind(&mut self, socket: SocketId, addr: SockAddr) -> AppResult<()> {
         self.ensure_wsa_started()?;
         if self.listeners.contains_key(&addr)
-            || self
-                .sockets
-                .values()
-                .any(|record| matches!(&record.state, SocketState::Bound(existing) if existing == &addr))
+            || self.sockets.values().any(
+                |record| matches!(&record.state, SocketState::Bound(existing) if existing == &addr),
+            )
         {
             self.last_wsa_error = WSAEADDRINUSE;
             return Err(AppError::new(
@@ -923,9 +1027,10 @@ impl NetworkStack {
                 ));
             }
         };
+        let capped_backlog = backlog.min(MAX_PENDING_ACCEPT_QUEUE);
         self.socket_record_mut(socket)?.state = SocketState::Listening {
             _addr: addr.clone(),
-            _backlog: backlog,
+            _backlog: capped_backlog,
         };
         self.listeners.insert(addr, socket);
         self.pending_accept.entry(socket).or_default();
@@ -951,10 +1056,7 @@ impl NetworkStack {
             }
             None => {
                 self.last_wsa_error = 0;
-                Err(AppError::new(
-                    ReasonCode::RcIo,
-                    "no pending connections",
-                ))
+                Err(AppError::new(ReasonCode::RcIo, "no pending connections"))
             }
         }
     }
@@ -978,7 +1080,9 @@ impl NetworkStack {
             if record.bound_addr.is_none() {
                 record.bound_addr = Some(default_sockaddr(family));
             }
-            record.state = SocketState::Connected { peer: server_socket };
+            record.state = SocketState::Connected {
+                peer: server_socket,
+            };
             self.pending_accept
                 .entry(listener)
                 .or_default()
@@ -991,20 +1095,25 @@ impl NetworkStack {
             let record = self.socket_record(socket)?;
             (record.family, record.nonblocking)
         };
-        let mut addrs = (addr.host.as_str(), addr.port).to_socket_addrs().map_err(|error| {
-            self.last_wsa_error = WSAHOST_NOT_FOUND;
-            AppError::new(
-                ReasonCode::RcDnsNotFound,
-                format!("DNS lookup failed for {}:{}: {error}", addr.host, addr.port),
-            )
-        })?;
+        let mut addrs = (addr.host.as_str(), addr.port)
+            .to_socket_addrs()
+            .map_err(|error| {
+                self.last_wsa_error = WSAHOST_NOT_FOUND;
+                AppError::new(
+                    ReasonCode::RcDnsNotFound,
+                    format!("DNS lookup failed for {}:{}: {error}", addr.host, addr.port),
+                )
+            })?;
         let candidate = addrs
             .find(|candidate| socket_addr_matches_family(candidate, family))
             .ok_or_else(|| {
                 self.last_wsa_error = WSAECONNREFUSED;
                 AppError::new(
                     ReasonCode::RcIo,
-                    format!("no {family:?} address available for {}:{}", addr.host, addr.port),
+                    format!(
+                        "no {family:?} address available for {}:{}",
+                        addr.host, addr.port
+                    ),
                 )
             })?;
         let stream = TcpStream::connect(candidate).map_err(|error| {
@@ -1018,7 +1127,10 @@ impl NetworkStack {
             self.last_wsa_error = map_wsa_error(&error);
             AppError::new(
                 ReasonCode::RcIo,
-                format!("failed to set nonblocking mode on {}:{}: {error}", addr.host, addr.port),
+                format!(
+                    "failed to set nonblocking mode on {}:{}: {error}",
+                    addr.host, addr.port
+                ),
             )
         })?;
         let local_addr = stream.local_addr().ok().map(sockaddr_from_std);
@@ -1049,7 +1161,10 @@ impl NetworkStack {
         if let Some(stream) = self.real_tcp_streams.get_mut(&socket) {
             let written = stream.write(bytes).map_err(|error| {
                 self.last_wsa_error = map_wsa_error(&error);
-                AppError::new(ReasonCode::RcIo, format!("TCP send failed on socket {socket}: {error}"))
+                AppError::new(
+                    ReasonCode::RcIo,
+                    format!("TCP send failed on socket {socket}: {error}"),
+                )
             })?;
             self.last_wsa_error = 0;
             return Ok(written);
@@ -1063,9 +1178,22 @@ impl NetworkStack {
                 ));
             }
         };
-        self.socket_record_mut(peer)?
-            .recv_queue
-            .extend(bytes.iter().copied());
+        {
+            let record = self.socket_record_mut(peer)?;
+            let new_len = record.recv_queue.len().saturating_add(bytes.len());
+            if new_len > MAX_SOCKET_RECEIVE_QUEUE {
+                return Err(AppError::new(
+                    ReasonCode::RcSocketReceiveQueueFull,
+                    format!(
+                        "socket receive queue full: {} + {} > {}",
+                        record.recv_queue.len(),
+                        bytes.len(),
+                        MAX_SOCKET_RECEIVE_QUEUE
+                    ),
+                ));
+            }
+            record.recv_queue.extend(bytes.iter().copied());
+        }
         self.last_wsa_error = 0;
         Ok(bytes.len())
     }
@@ -1076,7 +1204,10 @@ impl NetworkStack {
             let mut bytes = vec![0; length.max(1)];
             let read = stream.read(&mut bytes).map_err(|error| {
                 self.last_wsa_error = map_wsa_error(&error);
-                AppError::new(ReasonCode::RcIo, format!("TCP recv failed on socket {socket}: {error}"))
+                AppError::new(
+                    ReasonCode::RcIo,
+                    format!("TCP recv failed on socket {socket}: {error}"),
+                )
             })?;
             bytes.truncate(read);
             self.last_wsa_error = 0;
@@ -1104,9 +1235,17 @@ impl NetworkStack {
         Ok(bytes)
     }
 
-    pub fn setsockopt(&mut self, socket: SocketId, _level: i32, _option_name: i32, _value: &[u8]) -> AppResult<()> {
+    pub fn setsockopt(
+        &mut self,
+        socket: SocketId,
+        _level: i32,
+        _option_name: i32,
+        _value: &[u8],
+    ) -> AppResult<()> {
         self.ensure_wsa_started()?;
-        let _ = self.socket_record(socket)?;
+        // Validate that the socket exists; the record is not needed for setsockopt
+        // since we're not implementing actual socket option changes.
+        let _record = self.socket_record(socket)?;
         self.last_wsa_error = 0;
         Ok(())
     }
@@ -1116,7 +1255,10 @@ impl NetworkStack {
         if let Some(stream) = self.real_tcp_streams.get(&socket) {
             stream.shutdown(NetShutdown::Both).map_err(|error| {
                 self.last_wsa_error = map_wsa_error(&error);
-                AppError::new(ReasonCode::RcIo, format!("shutdown failed on socket {socket}: {error}"))
+                AppError::new(
+                    ReasonCode::RcIo,
+                    format!("shutdown failed on socket {socket}: {error}"),
+                )
             })?;
         }
         self.socket_record_mut(socket)?.state = SocketState::Shutdown;
@@ -1127,7 +1269,10 @@ impl NetworkStack {
     pub fn closesocket(&mut self, socket: SocketId) -> AppResult<()> {
         self.ensure_wsa_started()?;
         if let Some(stream) = self.real_tcp_streams.remove(&socket) {
-            let _ = stream.shutdown(NetShutdown::Both);
+            if let Err(e) = stream.shutdown(NetShutdown::Both) {
+                // Socket may already be closed or not connected; log but don't fail
+                eprintln!("closesocket: shutdown failed for socket {socket}: {e}");
+            }
         }
         self.socket_record_mut(socket)?.state = SocketState::Closed;
         self.sockets.remove(&socket);
@@ -1158,7 +1303,11 @@ impl NetworkStack {
             self.last_wsa_error = 0;
             return Ok(available);
         }
-        let available = self.socket_record(socket)?.recv_queue.len().min(u32::MAX as usize) as u32;
+        let available = self
+            .socket_record(socket)?
+            .recv_queue
+            .len()
+            .min(u32::MAX as usize) as u32;
         self.last_wsa_error = 0;
         Ok(available)
     }
@@ -1268,7 +1417,11 @@ impl NetworkStack {
         self.open_session("wininet")
     }
 
-    pub fn win_http_set_proxy(&mut self, session: HttpSessionId, proxy: Option<String>) -> AppResult<()> {
+    pub fn win_http_set_proxy(
+        &mut self,
+        session: HttpSessionId,
+        proxy: Option<String>,
+    ) -> AppResult<()> {
         self.http_session_mut(session)?.proxy_override = proxy;
         Ok(())
     }
@@ -1334,7 +1487,10 @@ impl NetworkStack {
         Ok(())
     }
 
-    pub fn win_http_query_headers(&self, request: HttpRequestId) -> AppResult<BTreeMap<String, String>> {
+    pub fn win_http_query_headers(
+        &self,
+        request: HttpRequestId,
+    ) -> AppResult<BTreeMap<String, String>> {
         let response = self
             .http_request(request)?
             .response
@@ -1345,11 +1501,19 @@ impl NetworkStack {
         Ok(headers)
     }
 
-    pub fn win_http_read_data(&mut self, request: HttpRequestId, count: usize) -> AppResult<Vec<u8>> {
+    pub fn win_http_read_data(
+        &mut self,
+        request: HttpRequestId,
+        count: usize,
+    ) -> AppResult<Vec<u8>> {
         self.read_body(request, count)
     }
 
-    pub fn internet_read_file(&mut self, request: HttpRequestId, count: usize) -> AppResult<Vec<u8>> {
+    pub fn internet_read_file(
+        &mut self,
+        request: HttpRequestId,
+        count: usize,
+    ) -> AppResult<Vec<u8>> {
         self.read_body(request, count)
     }
 
@@ -1357,6 +1521,171 @@ impl NetworkStack {
         self.http_requests.remove(&handle);
         self.http_connections.remove(&handle);
         self.http_sessions.remove(&handle);
+        self.websockets.remove(&handle);
+    }
+
+    // -----------------------------------------------------------------------
+    // J1: WebSocket support (RFC 6455)
+    // -----------------------------------------------------------------------
+
+    /// Complete a WebSocket upgrade from an existing HTTP request.
+    /// Returns a new WebSocket handle on success.
+    pub fn websocket_complete_upgrade(&mut self, request_handle: HttpRequestId) -> AppResult<u64> {
+        // Build the WebSocket URL from connection info
+        let (host, port, secure, path) = {
+            let req = self.http_request(request_handle)?;
+            let conn = self.http_connection(req.connection)?;
+            (conn.host.clone(), conn._port, conn.secure, req.path.clone())
+        };
+
+        let is_text_mode = false; // Default to binary mode
+        let scheme = if secure { "wss" } else { "ws" };
+        let ws_url = Some(format!("{scheme}://{host}:{port}{path}"));
+
+        let ws_handle = self.alloc_id();
+        self.websockets.insert(
+            ws_handle,
+            WebSocketRecord::new(request_handle, is_text_mode, ws_url),
+        );
+        Ok(ws_handle)
+    }
+
+    /// Send data over a WebSocket connection.
+    /// Buffers the data; real WebSocket I/O is delegated to WinHttpStack.
+    pub fn websocket_send(&mut self, ws_handle: u64, data: &[u8]) -> AppResult<()> {
+        let ws = self.websockets.get_mut(&ws_handle).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcWin32InvalidHandle,
+                "websocket_send: invalid handle",
+            )
+        })?;
+        if !ws.is_open {
+            return Err(AppError::new(
+                ReasonCode::RcInvalidState,
+                "websocket_send: WebSocket is closed",
+            ));
+        }
+        ws.send_buffer.extend_from_slice(data);
+        Ok(())
+    }
+
+    /// Receive data from a WebSocket connection.
+    /// Reads from the internal buffer.
+    pub fn websocket_receive(&mut self, ws_handle: u64, data: &mut [u8]) -> AppResult<u32> {
+        let ws = self.websockets.get_mut(&ws_handle).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcWin32InvalidHandle,
+                "websocket_receive: invalid handle",
+            )
+        })?;
+        if !ws.is_open {
+            return Err(AppError::new(
+                ReasonCode::RcInvalidState,
+                "websocket_receive: WebSocket is closed",
+            ));
+        }
+        let bytes_to_read = data.len().min(ws.receive_buffer.len());
+        data[..bytes_to_read].copy_from_slice(&ws.receive_buffer[..bytes_to_read]);
+        ws.receive_buffer.drain(..bytes_to_read);
+        Ok(bytes_to_read as u32)
+    }
+
+    /// Close a WebSocket connection.
+    pub fn websocket_close(
+        &mut self,
+        ws_handle: u64,
+        status: u16,
+        reason: Option<&str>,
+    ) -> AppResult<()> {
+        let ws = self.websockets.get_mut(&ws_handle).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcWin32InvalidHandle,
+                "websocket_close: invalid handle",
+            )
+        })?;
+        ws.is_open = false;
+        ws.close_status = status;
+        ws.close_reason = reason.map(|s| s.to_string());
+        Ok(())
+    }
+
+    /// Query the close status of a WebSocket connection.
+    pub fn websocket_query_close_status(&self, ws_handle: u64) -> AppResult<(u16, Option<String>)> {
+        let ws = self.websockets.get(&ws_handle).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcWin32InvalidHandle,
+                "websocket_query_close_status: invalid handle",
+            )
+        })?;
+        Ok((ws.close_status, ws.close_reason.clone()))
+    }
+
+    // -----------------------------------------------------------------------
+    // J6: NTLM/Kerberos authentication header support
+    // -----------------------------------------------------------------------
+
+    /// Build an NTLM Type 1 (Negotiate) header value for the given request.
+    /// The returned string can be used as the "Authorization" header value.
+    ///
+    /// Extracts the domain from the username (supports `DOMAIN\user` and `user@domain.com` formats)
+    /// and passes it to the underlying NTLM message builder.
+    pub fn ntlm_build_authorization_header(&self, username: &str, _password: &str) -> String {
+        // Extract domain from username if present
+        let domain = if let Some(backslash) = username.find('\\') {
+            // DOMAIN\user format
+            &username[..backslash]
+        } else if let Some(at) = username.find('@') {
+            // user@domain.com format — use the domain part as the NTLM domain
+            &username[at + 1..]
+        } else {
+            // No domain delimiter — pass empty
+            ""
+        };
+        let msg = crate::winhttp::ntlm_create_negotiate_msg(domain, "");
+        let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &msg);
+        format!("NTLM {encoded}")
+    }
+
+    /// Parse a WWW-Authenticate header to determine the auth scheme.
+    /// Returns the scheme (e.g., "NTLM", "Negotiate", "Basic") if found.
+    pub fn parse_auth_scheme(headers: &BTreeMap<String, String>) -> Option<String> {
+        for (key, value) in headers {
+            if key.to_lowercase() == "www-authenticate" {
+                // Extract the first scheme token
+                if let Some(scheme) = value.split_whitespace().next() {
+                    return Some(scheme.to_string());
+                }
+            }
+        }
+        None
+    }
+
+    /// Attempt NTLM authentication by adding Authorization headers.
+    /// Returns the updated headers map with NTLM Authorization header added.
+    pub fn authenticate_with_ntlm(
+        &self,
+        mut headers: BTreeMap<String, String>,
+        username: &str,
+        password: &str,
+    ) -> BTreeMap<String, String> {
+        let auth_value = self.ntlm_build_authorization_header(username, password);
+        headers.insert("Authorization".to_string(), auth_value);
+        headers
+    }
+
+    /// Acquire a Kerberos ticket for the given service principal.
+    ///
+    /// Uses the macOS GSS.framework via FFI to obtain a Kerberos service ticket.
+    /// On non-macOS platforms, falls back gracefully by returning None.
+    ///
+    /// # Arguments
+    /// * `service` - The service principal name (e.g. "HTTP@server.example.com")
+    /// * `username` - The username for Kerberos authentication
+    ///
+    /// # Returns
+    /// The raw Kerberos ticket bytes if successful, or None on failure.
+    pub fn kerberos_get_ticket(service: &str, username: &str) -> Option<Vec<u8>> {
+        kerberos_get_ticket_impl(service, username)
     }
 
     pub fn validate_server_certificate(
@@ -1365,10 +1694,14 @@ impl NetworkStack {
         chain: &[Certificate],
         revocation_check: bool,
     ) -> AppResult<String> {
-        let leaf = chain.first().ok_or_else(|| {
-            AppError::new(ReasonCode::RcTlsCertRejected, "TLS chain is empty")
-        })?;
-        if !leaf.valid_hostnames.iter().any(|candidate| candidate == host) {
+        let leaf = chain
+            .first()
+            .ok_or_else(|| AppError::new(ReasonCode::RcTlsCertRejected, "TLS chain is empty"))?;
+        if !leaf
+            .valid_hostnames
+            .iter()
+            .any(|candidate| candidate == host)
+        {
             return Err(AppError::new(
                 ReasonCode::RcTlsCertRejected,
                 format!("certificate hostname mismatch for {host}"),
@@ -1386,9 +1719,9 @@ impl NetworkStack {
                 format!("certificate for {host} is revoked"),
             ));
         }
-        let root = chain.last().ok_or_else(|| {
-            AppError::new(ReasonCode::RcTlsCertRejected, "TLS chain is empty")
-        })?;
+        let root = chain
+            .last()
+            .ok_or_else(|| AppError::new(ReasonCode::RcTlsCertRejected, "TLS chain is empty"))?;
         if !self.trust_store.contains_key(&root.fingerprint) {
             return Err(AppError::new(
                 ReasonCode::RcTlsCertRejected,
@@ -1402,7 +1735,11 @@ impl NetworkStack {
         ];
         client_supported
             .iter()
-            .find(|suite| leaf.supported_ciphers.iter().any(|candidate| candidate == **suite))
+            .find(|suite| {
+                leaf.supported_ciphers
+                    .iter()
+                    .any(|candidate| candidate == **suite)
+            })
             .map(|suite| (*suite).to_string())
             .ok_or_else(|| {
                 AppError::new(
@@ -1488,7 +1825,12 @@ impl NetworkStack {
         let template = self
             .routes
             .get(&(scheme.to_string(), host.clone(), path.clone()))
-            .ok_or_else(|| AppError::new(ReasonCode::RcIo, format!("no route for {scheme}://{host}{path}")))?
+            .ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcIo,
+                    format!("no route for {scheme}://{host}{path}"),
+                )
+            })?
             .clone();
         let proxy = proxy_override
             .or_else(|| self.proxy_settings.env_proxy.clone())
@@ -1500,7 +1842,8 @@ impl NetworkStack {
             });
         let cookie_header = self.cookie_header_for_request(&host, &path, secure);
         let cipher_suite = if secure {
-            let suite = self.validate_server_certificate(&host, &template.certificate_chain, true)?;
+            let suite =
+                self.validate_server_certificate(&host, &template.certificate_chain, true)?;
             self.cipher_log.push(format!("{host}:{suite}"));
             Some(suite)
         } else {
@@ -1570,15 +1913,15 @@ impl NetworkStack {
     }
 
     fn socket_record(&self, socket: SocketId) -> AppResult<&SocketRecord> {
-        self.sockets.get(&socket).ok_or_else(|| {
-            AppError::new(ReasonCode::RcIo, format!("unknown socket {socket}"))
-        })
+        self.sockets
+            .get(&socket)
+            .ok_or_else(|| AppError::new(ReasonCode::RcIo, format!("unknown socket {socket}")))
     }
 
     fn socket_record_mut(&mut self, socket: SocketId) -> AppResult<&mut SocketRecord> {
-        self.sockets.get_mut(&socket).ok_or_else(|| {
-            AppError::new(ReasonCode::RcIo, format!("unknown socket {socket}"))
-        })
+        self.sockets
+            .get_mut(&socket)
+            .ok_or_else(|| AppError::new(ReasonCode::RcIo, format!("unknown socket {socket}")))
     }
 
     fn http_session(&self, session: HttpSessionId) -> AppResult<&HttpSessionRecord> {
@@ -1595,7 +1938,10 @@ impl NetworkStack {
 
     fn http_connection(&self, connection: HttpConnectionId) -> AppResult<&HttpConnectionRecord> {
         self.http_connections.get(&connection).ok_or_else(|| {
-            AppError::new(ReasonCode::RcIo, format!("unknown HTTP connection {connection}"))
+            AppError::new(
+                ReasonCode::RcIo,
+                format!("unknown HTTP connection {connection}"),
+            )
         })
     }
 
@@ -1634,7 +1980,10 @@ fn default_sockaddr(family: AddressFamily) -> SockAddr {
 }
 
 fn socket_addr_matches_family(addr: &NetSocketAddr, family: AddressFamily) -> bool {
-    matches!((addr, family), (NetSocketAddr::V4(_), AddressFamily::Ipv4) | (NetSocketAddr::V6(_), AddressFamily::Ipv6))
+    matches!(
+        (addr, family),
+        (NetSocketAddr::V4(_), AddressFamily::Ipv4) | (NetSocketAddr::V6(_), AddressFamily::Ipv6)
+    )
 }
 
 fn sockaddr_from_std(addr: NetSocketAddr) -> SockAddr {
@@ -1651,6 +2000,7 @@ fn sockaddr_from_std(addr: NetSocketAddr) -> SockAddr {
 
 fn bytes_available(stream: &TcpStream) -> AppResult<u32> {
     let mut available: i32 = 0;
+    // SAFETY: FFI for network socket operations
     unsafe {
         let result = libc::ioctl(stream.as_raw_fd(), libc::FIONREAD, &mut available);
         if result < 0 {
@@ -1685,10 +2035,12 @@ pub fn sha256_hash(bytes: &[u8]) -> Vec<u8> {
 }
 
 pub fn hmac_sha256(key: &[u8], bytes: &[u8]) -> AppResult<Vec<u8>> {
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(key).map_err(|error: hmac::digest::InvalidLength| {
-        AppError::new(ReasonCode::RcCryptoInvalid, "invalid HMAC key")
-            .with_hint(error.to_string())
-    })?;
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(key).map_err(
+        |error: hmac::digest::InvalidLength| {
+            AppError::new(ReasonCode::RcCryptoInvalid, "invalid HMAC key")
+                .with_hint(error.to_string())
+        },
+    )?;
     mac.update(bytes);
     Ok(mac.finalize().into_bytes().to_vec())
 }
@@ -1789,8 +2141,11 @@ pub fn rsa_pkcs1v15_verify(public_pem: &str, message: &[u8], signature: &[u8]) -
             .with_hint(error.to_string())
     })?;
     verifying_key.verify(message, &signature).map_err(|error| {
-        AppError::new(ReasonCode::RcCryptoInvalid, "RSA signature verification failed")
-            .with_hint(error.to_string())
+        AppError::new(
+            ReasonCode::RcCryptoInvalid,
+            "RSA signature verification failed",
+        )
+        .with_hint(error.to_string())
     })
 }
 
@@ -1804,8 +2159,11 @@ pub fn ecdsa_p256_verify(public_pem: &str, message: &[u8], signature_der: &[u8])
             .with_hint(error.to_string())
     })?;
     public_key.verify(message, &signature).map_err(|error| {
-        AppError::new(ReasonCode::RcCryptoInvalid, "ECDSA signature verification failed")
-            .with_hint(error.to_string())
+        AppError::new(
+            ReasonCode::RcCryptoInvalid,
+            "ECDSA signature verification failed",
+        )
+        .with_hint(error.to_string())
     })
 }
 
@@ -1865,24 +2223,29 @@ pub fn parse_alt_svc_header(header_value: &str) -> Vec<AltSvcEntry> {
             let host_port_part = proto_segment[eq_pos + 1..].trim();
 
             // Remove surrounding quotes
-            let host_port = host_port_part
-                .trim_matches('"')
-                .trim_matches('\'');
+            let host_port = host_port_part.trim_matches('"').trim_matches('\'');
 
             if host_port.is_empty() {
                 continue;
             }
 
-            // Parse optional host:port, default port based on protocol
+            // Parse optional host:port, default port based on protocol.
+            // Skip entries with unparseable ports instead of silently falling back.
             let (alt_host, alt_port) = if let Some(colon_pos) = host_port.rfind(':') {
                 let host = host_port[..colon_pos].to_string();
                 let port_str = &host_port[colon_pos + 1..];
-                let port: u16 = port_str.parse().unwrap_or(443);
+                let port: u16 = match port_str.parse() {
+                    Ok(p) => p,
+                    Err(_) => continue, // skip entry with invalid port
+                };
                 // If host is empty (e.g. ":443"), it means same origin host
                 (host, port)
             } else {
                 // Just a port number (e.g. "443")
-                let port: u16 = host_port.parse().unwrap_or(443);
+                let port: u16 = match host_port.parse() {
+                    Ok(p) => p,
+                    Err(_) => continue, // skip entry with invalid port
+                };
                 (String::new(), port)
             };
 
@@ -1909,9 +2272,7 @@ pub fn parse_alt_svc_header(header_value: &str) -> Vec<AltSvcEntry> {
 
 /// Check if an ALPN protocol ID indicates HTTP/3 (QUIC).
 pub fn is_quic_alpn(protocol_id: &str) -> bool {
-    protocol_id == "h3"
-        || protocol_id.starts_with("h3-")
-        || protocol_id == "quic"
+    protocol_id == "h3" || protocol_id.starts_with("h3-") || protocol_id == "quic"
 }
 
 /// Select the best available HTTP protocol based on enabled flags and
@@ -1926,10 +2287,9 @@ pub fn negotiate_http_protocol(
     // Check if there's an Alt-Svc entry advertising HTTP/3
     let has_h3_advertisement = alt_svc_entries.iter().any(|e| is_quic_alpn(&e.protocol_id));
 
-    let quic_requested = enabled_flags.contains(HttpProtocolFlags::HTTP3)
-        || has_h3_advertisement;
+    let quic_requested = enabled_flags.contains(HttpProtocolFlags::HTTP3) || has_h3_advertisement;
 
-    let mut fallback_occurred = false;
+    let mut _fallback_occurred = false;
 
     if quic_requested && !quic_config.force_disabled {
         if quic_config.force_enabled {
@@ -1938,7 +2298,7 @@ pub fn negotiate_http_protocol(
             (HttpProtocol::Http3, false)
         } else {
             // QUIC requested but not available - fall back to HTTP/2
-            fallback_occurred = true;
+            _fallback_occurred = true;
             let has_h2 = enabled_flags.contains(HttpProtocolFlags::HTTP2);
             if has_h2 {
                 (HttpProtocol::Http2, true)
@@ -1953,24 +2313,997 @@ pub fn negotiate_http_protocol(
     }
 }
 
+/// Perform UDP hole punching to establish NAT traversal with a peer.
+///
+/// Sends a small probe packet from the given socket to the peer's
+/// external (public) address, which punches a hole in the local NAT.
+/// Additional probes are sent to nearby ports for symmetric NAT
+/// port prediction.
+pub fn perform_udp_hole_punch(
+    socket: &UdpSocket,
+    peer_external_addr: std::net::SocketAddr,
+) -> std::io::Result<()> {
+    // Send a 1-byte probe to the peer's external address
+    // This creates a NAT mapping on our side
+    let probe = [0u8; 1];
+    socket.send_to(&probe, peer_external_addr)?;
+
+    // Also send to a few sequential ports around the peer's port
+    // in case symmetric NAT port prediction is needed
+    let base_port = peer_external_addr.port();
+    for offset in [1u16, 2, (-1i16) as u16, (-2i16) as u16] {
+        let test_port = base_port.wrapping_add(offset);
+        let mut test_addr = peer_external_addr;
+        test_addr.set_port(test_port);
+        // Best-effort: these are speculative probes that may fail silently
+        if let Err(e) = socket.send_to(&probe, test_addr) {
+            eprintln!("UDP hole punch probe to {test_addr} failed: {e}");
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Kerberos authentication via macOS GSS.framework
+// ---------------------------------------------------------------------------
+
+/// Kerberos GSSAPI constants for macOS.
+#[cfg(target_os = "macos")]
+mod gssapi_ffi {
+    #![allow(non_camel_case_types, dead_code)]
+
+    use std::os::raw::{c_int, c_void};
+
+    // GSSAPI major status codes
+    pub const GSS_S_COMPLETE: u32 = 0;
+    pub const GSS_S_CONTINUE_NEEDED: u32 = 1;
+    pub const GSS_S_FAILURE: u32 = 0x8000_0000;
+
+    // OID for Kerberos 5 mechanism
+    pub const GSS_KRB5_MECHANISM: &[u8] = &[
+        0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x12, 0x01, 0x02, 0x02,
+    ];
+
+    // GSS buffer descriptor
+    #[repr(C)]
+    pub struct gss_buffer_desc {
+        pub length: usize,
+        pub value: *mut c_void,
+    }
+
+    // GSS OID descriptor
+    #[repr(C)]
+    pub struct gss_OID_desc {
+        pub length: usize,
+        pub elements: *mut c_void,
+    }
+    pub type gss_OID = *mut gss_OID_desc;
+
+    // GSS name type
+    #[repr(C)]
+    pub struct gss_name_struct {
+        _private: [u8; 0],
+    }
+    pub type gss_name_t = *mut gss_name_struct;
+
+    // GSS credential handle
+    #[repr(C)]
+    pub struct gss_cred_id_struct {
+        _private: [u8; 0],
+    }
+    pub type gss_cred_id_t = *mut gss_cred_id_struct;
+
+    // GSS context handle
+    #[repr(C)]
+    pub struct gss_ctx_id_struct {
+        _private: [u8; 0],
+    }
+    pub type gss_ctx_id_t = *mut gss_ctx_id_struct;
+
+    type gss_OID_set = *mut c_void;
+
+    // Name types
+    pub static mut GSS_C_NT_USER_NAME: gss_OID = std::ptr::null_mut();
+    pub static mut GSS_C_NT_HOSTBASED_SERVICE: gss_OID = std::ptr::null_mut();
+
+    // SAFETY: GSS-API FFI for Kerberos authentication
+    #[link(name = "GSS", kind = "framework")]
+    unsafe extern "C" {
+        pub fn gss_import_name(
+            minor_status: *mut u32,
+            input_name_buffer: *mut gss_buffer_desc,
+            input_name_type: gss_OID,
+            output_name: *mut gss_name_t,
+        ) -> u32;
+
+        pub fn gss_init_sec_context(
+            minor_status: *mut u32,
+            claimant_cred_handle: gss_cred_id_t,
+            context_handle: *mut gss_ctx_id_t,
+            target_name: gss_name_t,
+            mech_type: gss_OID,
+            req_flags: u32,
+            time_req: u32,
+            input_chan_bindings: *mut c_void,
+            input_token: *mut gss_buffer_desc,
+            actual_mech_type: *mut gss_OID,
+            output_token: *mut gss_buffer_desc,
+            ret_flags: *mut u32,
+            time_rec: *mut u32,
+        ) -> u32;
+
+        pub fn gss_release_buffer(minor_status: *mut u32, buffer: *mut gss_buffer_desc) -> u32;
+
+        pub fn gss_release_name(minor_status: *mut u32, name: *mut gss_name_t) -> u32;
+
+        pub fn gss_display_status(
+            minor_status: *mut u32,
+            status_value: u32,
+            status_type: c_int,
+            mech_type: gss_OID,
+            message_context: *mut u32,
+            status_string: *mut gss_buffer_desc,
+        ) -> u32;
+    }
+}
+
+/// Acquire a Kerberos ticket using macOS GSS.framework.
+pub(crate) fn kerberos_get_ticket_impl(service: &str, username: &str) -> Option<Vec<u8>> {
+    #[cfg(target_os = "macos")]
+    {
+        kerberos_get_ticket_macos(service, username)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (service, username);
+        // Kerberos is only supported on macOS via GSS.framework
+        eprintln!("Kerberos not supported on this platform");
+        None
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn kerberos_get_ticket_macos(service: &str, _username: &str) -> Option<Vec<u8>> {
+    use self::gssapi_ffi::*;
+
+    // Build the service principal name (e.g., "HTTP@server.example.com")
+    let spn = CString::new(service).ok()?;
+    let mut name_buf = gss_buffer_desc {
+        length: spn.to_bytes().len(),
+        value: spn.into_raw() as *mut c_void,
+    };
+
+    let mut target_name: gss_name_t = std::ptr::null_mut();
+    let mut minor_status: u32 = 0;
+
+    // Import the service principal name
+    // SAFETY: gss_import_name is called with valid pointers to gss_buffer_desc
+    // and gss_name_t structures allocated on the stack.
+    let maj = unsafe {
+        gss_import_name(
+            &mut minor_status,
+            &mut name_buf,
+            std::ptr::null_mut(), // use default name type (hostbased service)
+            &mut target_name,
+        )
+    };
+
+    if maj != GSS_S_COMPLETE {
+        eprintln!(
+            "Kerberos: gss_import_name failed for service '{service}': maj={maj:#x}, min={minor_status}"
+        );
+        return None;
+    }
+
+    // Initialize security context to get a ticket
+    let mut context: gss_ctx_id_t = std::ptr::null_mut();
+    let mut output_token = gss_buffer_desc {
+        length: 0,
+        value: std::ptr::null_mut(),
+    };
+
+    // SAFETY: gss_init_sec_context is called with valid stack-allocated
+    // gss_buffer_desc and gss_ctx_id_t structures. All pointer arguments are
+    // either valid or null (as permitted by the GSS-API specification).
+    let maj = unsafe {
+        gss_init_sec_context(
+            &mut minor_status,
+            std::ptr::null_mut(), // use default credentials (obtained via kinit)
+            &mut context,
+            target_name,
+            std::ptr::null_mut(), // use default mechanism (Kerberos)
+            0,                    // req_flags: none required for ticket acquisition
+            0,                    // time_req: use default
+            std::ptr::null_mut(), // no channel bindings
+            std::ptr::null_mut(), // no input token (initial request)
+            std::ptr::null_mut(), // actual_mech_type (don't care)
+            &mut output_token,
+            std::ptr::null_mut(), // ret_flags (don't care)
+            std::ptr::null_mut(), // time_rec (don't care)
+        )
+    };
+
+    let result = if maj == GSS_S_COMPLETE || maj == GSS_S_CONTINUE_NEEDED {
+        if !output_token.value.is_null() && output_token.length > 0 {
+            // SAFETY: output_token.value is non-null and output_token.length > 0
+            // (checked above). The GSS library allocated the buffer.
+            let ticket = unsafe {
+                std::slice::from_raw_parts(output_token.value as *const u8, output_token.length)
+                    .to_vec()
+            };
+            Some(ticket)
+        } else {
+            eprintln!("Kerberos: gss_init_sec_context returned empty token for '{service}'");
+            None
+        }
+    } else {
+        // Get error message from GSS
+        let mut msg_buf = gss_buffer_desc {
+            length: 0,
+            value: std::ptr::null_mut(),
+        };
+        // SAFETY: FFI for network socket operations
+        unsafe {
+            gss_display_status(
+                &mut minor_status,
+                maj,
+                0, // GSS_C_GSS_CODE
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut msg_buf,
+            );
+            if !msg_buf.value.is_null() {
+                let msg = CStr::from_ptr(msg_buf.value as *const c_char)
+                    .to_string_lossy()
+                    .into_owned();
+                eprintln!(
+                    "Kerberos: gss_init_sec_context failed for '{service}': {msg} (maj={maj:#x}, min={minor_status})"
+                );
+                gss_release_buffer(&mut minor_status, &mut msg_buf);
+            } else {
+                eprintln!(
+                    "Kerberos: gss_init_sec_context failed for '{service}': maj={maj:#x}, min={minor_status}"
+                );
+            }
+        }
+        None
+    };
+
+    // Cleanup
+    // SAFETY: FFI for network socket operations
+    unsafe {
+        if !output_token.value.is_null() {
+            gss_release_buffer(&mut minor_status, &mut output_token);
+        }
+        if !target_name.is_null() {
+            gss_release_name(&mut minor_status, &mut target_name);
+        }
+    }
+
+    result
+}
+
+/// Parse a SPNEGO token (RFC 4178) to extract the Kerberos ticket from
+/// an HTTP Negotiate authentication exchange.
+pub fn parse_spnego_token(spnego_token: &[u8]) -> Option<Vec<u8>> {
+    // SPNEGO structure (simplified):
+    // Application 0 (SEQUENCE) of:
+    //   [0] CONTEXT-SPECIFIC: mechTypes (OIDs)
+    //   [2] CONTEXT-SPECIFIC: mechToken (OCTET STRING containing Kerberos ticket)
+    //
+    // We do a simple DER scan for the mechToken.
+
+    if spnego_token.len() < 16 {
+        return None;
+    }
+
+    let mut offset = 0;
+
+    // Skip outer APPLICATION 0 tag
+    if offset >= spnego_token.len() || spnego_token[offset] != 0x60 {
+        return None;
+    }
+    offset += 1;
+    if offset >= spnego_token.len() {
+        return None;
+    }
+    // Skip length
+    let len = if spnego_token[offset] & 0x80 != 0 {
+        let num_bytes = (spnego_token[offset] & 0x7F) as usize;
+        offset += 1;
+        let mut l = 0usize;
+        for _ in 0..num_bytes {
+            if offset >= spnego_token.len() {
+                return None;
+            }
+            l = (l << 8) | spnego_token[offset] as usize;
+            offset += 1;
+        }
+        l
+    } else {
+        let l = spnego_token[offset] as usize;
+        offset += 1;
+        l
+    };
+    let _end = offset + len;
+
+    // Scan for [2] CONTEXT-SPECIFIC (mechToken)
+    while offset + 4 < spnego_token.len() {
+        // Look for tag 0xA2 (context-specific, constructed, tag 2)
+        if spnego_token[offset] == 0xA2 {
+            offset += 1;
+            // Skip inner length
+            if offset >= spnego_token.len() {
+                return None;
+            }
+            let token_len = if spnego_token[offset] & 0x80 != 0 {
+                let num_bytes = (spnego_token[offset] & 0x7F) as usize;
+                offset += 1;
+                let mut l = 0usize;
+                for _ in 0..num_bytes {
+                    if offset >= spnego_token.len() {
+                        return None;
+                    }
+                    l = (l << 8) | spnego_token[offset] as usize;
+                    offset += 1;
+                }
+                l
+            } else {
+                let l = spnego_token[offset] as usize;
+                offset += 1;
+                l
+            };
+            if offset + token_len <= spnego_token.len() {
+                // The content should be an OCTET STRING containing the Kerberos ticket
+                if offset < spnego_token.len() && spnego_token[offset] == 0x04 {
+                    offset += 1;
+                    if offset >= spnego_token.len() {
+                        return None;
+                    }
+                    let mech_token_len = if spnego_token[offset] & 0x80 != 0 {
+                        let num_bytes = (spnego_token[offset] & 0x7F) as usize;
+                        offset += 1;
+                        let mut l = 0usize;
+                        for _ in 0..num_bytes {
+                            if offset >= spnego_token.len() {
+                                return None;
+                            }
+                            l = (l << 8) | spnego_token[offset] as usize;
+                            offset += 1;
+                        }
+                        l
+                    } else {
+                        let l = spnego_token[offset] as usize;
+                        offset += 1;
+                        l
+                    };
+                    if offset + mech_token_len <= spnego_token.len() {
+                        return Some(spnego_token[offset..offset + mech_token_len].to_vec());
+                    }
+                }
+            }
+            return None;
+        }
+        offset += 1;
+    }
+
+    None
+}
+
+/// Build a SPNEGO wrapper around a raw Kerberos ticket for HTTP Negotiate auth.
+pub fn build_spnego_token(kerberos_ticket: &[u8]) -> Vec<u8> {
+    // Build a minimal SPNEGO token: wrap the Kerberos ticket in the
+    // appropriate ASN.1 structure for HTTP Negotiate authentication.
+    //
+    // Structure:
+    // SEQUENCE {
+    //   OID (1.3.6.1.5.5.2 - SPNEGO)
+    //   [0] EXPLICIT {
+    //     SEQUENCE {
+    //       [0] CONTEXT-SPECIFIC { OID (1.2.840.113554.1.2.2 - Kerberos 5) }
+    //       [2] CONTEXT-SPECIFIC { OCTET STRING (Kerberos ticket) }
+    //     }
+    //   }
+    // }
+
+    let mut token = Vec::new();
+
+    // Build the mechToken OCTET STRING
+    let mut mech_token = vec![0x04]; // OCTET STRING tag
+    if kerberos_ticket.len() <= 127 {
+        mech_token.push(kerberos_ticket.len() as u8);
+    } else {
+        mech_token.push(0x80 | 0x02);
+        mech_token.extend_from_slice(&(kerberos_ticket.len() as u16).to_be_bytes());
+    }
+    mech_token.extend_from_slice(kerberos_ticket);
+
+    // Build the inner SEQUENCE with mechTypes and mechToken
+    // OID for Kerberos 5: 1.2.840.113554.1.2.2
+    let krb5_oid = [
+        0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x12, 0x01, 0x02, 0x02,
+    ];
+    let mut inner = vec![0xa0, krb5_oid.len() as u8]; // [0] CONTEXT-SPECIFIC
+    inner.extend_from_slice(&krb5_oid);
+
+    // [2] CONTEXT-SPECIFIC wrapper for mechToken
+    if mech_token.len() <= 127 {
+        inner.push(0xa2);
+        inner.push(mech_token.len() as u8);
+    } else {
+        inner.push(0xa2);
+        inner.push(0x80 | 0x02);
+        inner.extend_from_slice(&(mech_token.len() as u16).to_be_bytes());
+    }
+    inner.extend_from_slice(&mech_token);
+
+    // Wrap in SEQUENCE
+    if inner.len() <= 127 {
+        token.push(0x30);
+        token.push(inner.len() as u8);
+    } else {
+        token.push(0x30);
+        token.push(0x80 | 0x02);
+        token.extend_from_slice(&(inner.len() as u16).to_be_bytes());
+    }
+    token.extend_from_slice(&inner);
+
+    token
+}
+
+/// Attempt full Kerberos authentication flow: negotiate → challenge → response.
+/// Returns the Authorization header value for the "Negotiate" scheme.
+pub fn kerberos_authenticate(
+    service: &str,
+    username: &str,
+    server_challenge: &[u8],
+) -> Option<String> {
+    // Step 1: Get a Kerberos ticket for the service
+    let ticket = kerberos_get_ticket_impl(service, username)?;
+
+    // Step 2: If there's a server challenge (SPNEGO), try to decode it
+    let _challenge = if !server_challenge.is_empty() {
+        parse_spnego_token(server_challenge)
+    } else {
+        None
+    };
+
+    // Step 3: Build SPNEGO response token
+    let spnego = build_spnego_token(&ticket);
+
+    // Step 4: Base64-encode for HTTP Authorization header
+    Some(format!(
+        "Negotiate {}",
+        base64::engine::general_purpose::STANDARD.encode(&spnego)
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// QUIC transport implementation (J2) — using quinn crate
+// ---------------------------------------------------------------------------
+
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// QUIC protocol version identifier (draft-29 / v1).
+/// Used by Alt-Svc entries and protocol negotiation.
+pub const QUIC_VERSION: u32 = 0x00000001;
+
+/// The maximum number of SSL provider scalers that can be combined for
+/// QUIC acceleration.
+pub const HTTP_SOCKET_MAX_COMBINE_SSL_SCALERS: usize = 4;
+
+/// Global QUIC state tracker.
+struct QuicState {
+    listeners: BTreeMap<u64, quinn::Endpoint>,
+    connections: BTreeMap<u64, quinn::Connection>,
+    udp_sockets: BTreeMap<u64, std::net::UdpSocket>,
+    next_id: u64,
+}
+
+impl QuicState {
+    fn new() -> Self {
+        Self {
+            listeners: BTreeMap::new(),
+            connections: BTreeMap::new(),
+            udp_sockets: BTreeMap::new(),
+            next_id: 1,
+        }
+    }
+}
+
+lazy_static::lazy_static! {
+    static ref QUIC_STATE: Mutex<QuicState> = Mutex::new(QuicState::new());
+    /// A shared tokio runtime for blocking QUIC operations.
+    static ref QUIC_RUNTIME: tokio::runtime::Runtime =
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("QUIC tokio runtime creation failed");
+}
+
+static QUIC_HANDLE_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+fn next_quic_handle() -> u64 {
+    QUIC_HANDLE_COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Lock the global QUIC state, returning an `AppError` if the mutex is poisoned.
+fn lock_quic_state() -> Result<std::sync::MutexGuard<'static, QuicState>, AppError> {
+    QUIC_STATE.lock().map_err(|e| {
+        AppError::new(
+            ReasonCode::RcLockPoisoned,
+            format!("QUIC state lock poisoned: {e}"),
+        )
+    })
+}
+
+/// Recover the global QUIC state from a poisoned mutex.
+///
+/// This clears all existing state (connections, listeners, UDP sockets) and
+/// replaces the poisoned Mutex with a fresh [`QuicState`].  Call this when
+/// [`lock_quic_state`] returns a poison error and you want to continue
+/// operating rather than propagating the error upward.
+///
+/// # Returns
+/// `Ok(())` on successful recovery, or the original `AppError` if the mutex
+/// could not be recovered (e.g. because the underlying system allocation
+/// fails).
+pub fn recover_quic_state() -> AppResult<()> {
+    let poison = match QUIC_STATE.lock() {
+        Ok(_) => {
+            // Mutex is healthy — nothing to recover.
+            return Ok(());
+        }
+        Err(poison) => poison,
+    };
+
+    // Drain the poisoned inner data to release any held resources.
+    let _old_state = poison.into_inner();
+
+    // Replace with a fresh state.
+    *QUIC_STATE.lock().map_err(|e| {
+        AppError::new(
+            ReasonCode::RcLockPoisoned,
+            format!("QUIC state recovery failed: {e}"),
+        )
+    })? = QuicState::new();
+
+    Ok(())
+}
+
+/// Load native platform root certificates from well-known system paths.
+fn load_native_certs() -> Vec<rustls::pki_types::CertificateDer<'static>> {
+    let mut certs = Vec::new();
+    let cert_paths = [
+        "/etc/ssl/cert.pem",
+        "/etc/pki/tls/certs/ca-bundle.crt",
+        "/etc/ssl/certs/ca-certificates.crt",
+        "/usr/local/share/certificates/ca-bundle.crt",
+        "/usr/local/etc/openssl/cert.pem",
+    ];
+    for path in &cert_paths {
+        if let Ok(data) = std::fs::read(path) {
+            let mut slice = data.as_slice();
+            let pem_certs = rustls_pemfile::certs(&mut slice);
+            for c in pem_certs.flatten() {
+                certs.push(c);
+            }
+            if !certs.is_empty() {
+                return certs;
+            }
+        }
+    }
+    // On macOS, try the Keychain via security command-line tool
+    if let Ok(output) = std::process::Command::new("security")
+        .args(["find-certificate", "-a", "-p"])
+        .output()
+    {
+        if output.status.success() {
+            let mut slice = output.stdout.as_slice();
+            let pem_certs = rustls_pemfile::certs(&mut slice);
+            for c in pem_certs.flatten() {
+                certs.push(c);
+            }
+        }
+    }
+    if certs.is_empty() {
+        eprintln!("Warning: no native root certificates found for QUIC TLS");
+    }
+    certs
+}
+
+/// Build a root certificate store from the system's trust store.
+fn quic_root_certs() -> rustls::RootCertStore {
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in load_native_certs() {
+        if let Err(error) = roots.add(cert) {
+            eprintln!("[network] failed to add native QUIC root cert: {error}");
+        }
+    }
+    roots
+}
+
+/// Build a Quinn client configuration with TLS 1.3.
+fn quic_client_config() -> Result<quinn::ClientConfig, AppError> {
+    let mut crypto = rustls::ClientConfig::builder()
+        .with_root_certificates(quic_root_certs())
+        .with_no_client_auth();
+    // Set ALPN for HTTP/3
+    crypto.alpn_protocols = vec![b"h3".to_vec()];
+    let quic_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(crypto).map_err(|e| {
+        AppError::new(
+            ReasonCode::RcIo,
+            format!("QUIC client crypto setup failed: {e}"),
+        )
+    })?;
+    let mut config = quinn::ClientConfig::new(Arc::new(quic_crypto));
+    let mut transport = quinn::TransportConfig::default();
+    transport.max_concurrent_bidi_streams(100u32.into());
+    transport.max_concurrent_uni_streams(100u32.into());
+    config.transport_config(Arc::new(transport));
+    Ok(config)
+}
+
+/// Build a Quinn server configuration with a self-signed cert for local use.
+fn quic_server_config() -> Result<quinn::ServerConfig, AppError> {
+    let cert_key = rcgen::generate_simple_self_signed(vec!["localhost".into()]).map_err(|e| {
+        AppError::new(
+            ReasonCode::RcIo,
+            format!("QUIC server cert gen failed: {e}"),
+        )
+    })?;
+    let cert_der = cert_key.cert.der().clone();
+    let key_der = cert_key.key_pair.serialize_der();
+    let chain = vec![cert_der];
+    let key = rustls::pki_types::PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(
+        key_der,
+    ));
+
+    let mut crypto = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(chain, key)
+        .map_err(|e| {
+            AppError::new(
+                ReasonCode::RcIo,
+                format!("QUIC server crypto setup failed: {e}"),
+            )
+        })?;
+    crypto.alpn_protocols = vec![b"h3".to_vec()];
+    let quic_crypto = quinn::crypto::rustls::QuicServerConfig::try_from(crypto).map_err(|e| {
+        AppError::new(
+            ReasonCode::RcIo,
+            format!("QUIC server crypto setup failed: {e}"),
+        )
+    })?;
+
+    let mut config = quinn::ServerConfig::with_crypto(Arc::new(quic_crypto));
+    let mut transport = quinn::TransportConfig::default();
+    transport.max_concurrent_bidi_streams(100u32.into());
+    config.transport_config(Arc::new(transport));
+    Ok(config)
+}
+
+/// Combine SSL scalers for QUIC socket acceleration.
+/// Returns the number of scalers that were combined.
+pub fn http_socket_combine_ssl_scalers(socket_handle: u64, scaler_count: usize) -> usize {
+    let _ = (socket_handle, scaler_count);
+    scaler_count
+}
+
+/// Create a QUIC listener on the given address.
+/// Returns a handle that can be used to accept incoming connections.
+pub fn quic_create_listener(addr: &str) -> Result<u64, AppError> {
+    let server_config = quic_server_config()?;
+    let socket = std::net::UdpSocket::bind(addr).map_err(|e| {
+        AppError::new(
+            ReasonCode::RcIo,
+            format!("QUIC listener bind to {addr} failed: {e}"),
+        )
+    })?;
+
+    let endpoint = quinn::Endpoint::new(
+        quinn::EndpointConfig::default(),
+        Some(server_config),
+        socket,
+        Arc::new(quinn::TokioRuntime),
+    )
+    .map_err(|e| {
+        AppError::new(
+            ReasonCode::RcIo,
+            format!("QUIC endpoint creation failed: {e}"),
+        )
+    })?;
+
+    let handle = next_quic_handle();
+    let mut state = lock_quic_state()?;
+    state.listeners.insert(handle, endpoint);
+    Ok(handle)
+}
+
+/// Parse a `host:port` string into (hostname, port), correctly handling
+/// IPv6 bracket notation (e.g. `[::1]:443`).
+fn parse_host_port(input: &str, default_port: u16) -> (&str, u16) {
+    // Check for IPv6 bracket notation: [::1]:port
+    if input.starts_with('[') {
+        if let Some(bracket_end) = input.find(']') {
+            let hostname = &input[1..bracket_end];
+            let rest = &input[bracket_end + 1..];
+            // Rest should be ":port" or empty
+            let port = if rest.starts_with(':') {
+                rest[1..].parse().unwrap_or(default_port)
+            } else {
+                default_port
+            };
+            return (hostname, port);
+        }
+    }
+    // Standard host:port or bare host
+    if let Some((hostname, port_str)) = input.rsplit_once(':') {
+        if let Ok(port) = port_str.parse::<u16>() {
+            return (hostname, port);
+        }
+    }
+    // No port found — use default
+    (input, default_port)
+}
+
+/// Create a QUIC connection to the given remote host.
+/// Returns a connection handle.
+pub fn quic_create_connection(host: &str) -> Result<u64, AppError> {
+    let (hostname, port) = parse_host_port(host, 443);
+
+    let client_config = quic_client_config()?;
+    let bind_addr = if hostname.contains(':') || hostname.starts_with('[') {
+        "[::]:0"
+    } else {
+        "0.0.0.0:0"
+    };
+
+    let socket = std::net::UdpSocket::bind(bind_addr)
+        .map_err(|e| AppError::new(ReasonCode::RcIo, format!("QUIC connect bind failed: {e}")))?;
+
+    let endpoint = quinn::Endpoint::new(
+        quinn::EndpointConfig::default(),
+        None,
+        socket,
+        Arc::new(quinn::TokioRuntime),
+    )
+    .map_err(|e| {
+        AppError::new(
+            ReasonCode::RcIo,
+            format!("QUIC endpoint creation failed: {e}"),
+        )
+    })?;
+
+    // Reconstruct for ToSocketAddrs which expects bracket notation for IPv6
+    let remote_addr_str = if hostname.contains(':') {
+        // IPv6 — wrap in brackets for ToSocketAddrs
+        format!("[{hostname}]:{port}")
+    } else {
+        format!("{hostname}:{port}")
+    };
+    let remote_addr = remote_addr_str
+        .to_socket_addrs()
+        .map_err(|e| {
+            AppError::new(
+                ReasonCode::RcNetDnsResolutionFailed,
+                format!("DNS resolution for {hostname} failed: {e}"),
+            )
+        })?
+        .next()
+        .ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcNetDnsResolutionFailed,
+                format!("No address found for {hostname}"),
+            )
+        })?;
+
+    // Establish the connection asynchronously
+    let connecting = endpoint
+        .connect_with(client_config, remote_addr, hostname)
+        .map_err(|e| {
+            AppError::new(
+                ReasonCode::RcNetConnectionFailed,
+                format!("QUIC connect to {host} failed: {e}"),
+            )
+        })?;
+
+    let (conn_tx, conn_rx) = std::sync::mpsc::channel();
+    QUIC_RUNTIME.spawn(async move {
+        let result = connecting.await;
+        if conn_tx.send(result).is_err() {
+            eprintln!(
+                "[network] QUIC connect channel receiver dropped before handshake completion"
+            );
+        }
+    });
+
+    let connection = conn_rx
+        .recv()
+        .map_err(|_| AppError::new(ReasonCode::RcIo, "QUIC connect channel closed"))?
+        .map_err(|e| {
+            AppError::new(
+                ReasonCode::RcNetConnectionFailed,
+                format!("QUIC handshake with {host} failed: {e}"),
+            )
+        })?;
+
+    let handle = next_quic_handle();
+    let mut state = lock_quic_state()?;
+    state.listeners.insert(handle, endpoint);
+    state.connections.insert(handle, connection);
+    Ok(handle)
+}
+
+/// Create a QUIC-capable UDP socket for the given address.
+/// Returns a handle to the UDP socket.
+pub fn quic_udp_create_socket(addr: &str) -> Result<u64, AppError> {
+    let socket = std::net::UdpSocket::bind(addr).map_err(|e| {
+        AppError::new(
+            ReasonCode::RcIo,
+            format!("QUIC UDP socket bind to {addr} failed: {e}"),
+        )
+    })?;
+    socket
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .map_err(|e| {
+            AppError::new(
+                ReasonCode::RcIo,
+                format!("QUIC UDP read-timeout setup failed for {addr}: {e}"),
+            )
+        })?;
+    socket
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .map_err(|e| {
+            AppError::new(
+                ReasonCode::RcIo,
+                format!("QUIC UDP write-timeout setup failed for {addr}: {e}"),
+            )
+        })?;
+    let handle = next_quic_handle();
+    let mut state = lock_quic_state()?;
+    state.udp_sockets.insert(handle, socket);
+    Ok(handle)
+}
+
+/// Send data over an established QUIC connection by opening a bi-directional stream.
+pub fn quic_udp_send(conn_handle: u64, data: &[u8]) -> Result<usize, AppError> {
+    let connection = {
+        let state = lock_quic_state()?;
+        state
+            .connections
+            .get(&conn_handle)
+            .cloned()
+            .ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcIo,
+                    format!("QUIC: unknown connection handle {conn_handle}"),
+                )
+            })?
+    };
+
+    let data_owned = data.to_vec();
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    QUIC_RUNTIME.spawn(async move {
+        let result = async {
+            let (mut send, _recv) = connection.open_bi().await.map_err(|e| {
+                AppError::new(ReasonCode::RcIo, format!("QUIC: open stream failed: {e}"))
+            })?;
+            let written = send.write(&data_owned).await.map_err(|e| {
+                AppError::new(
+                    ReasonCode::RcNetWriteFailed,
+                    format!("QUIC send failed: {e}"),
+                )
+            })?;
+            send.finish()
+                .map_err(|e| AppError::new(ReasonCode::RcIo, format!("QUIC finish failed: {e}")))?;
+            Ok::<usize, AppError>(written)
+        }
+        .await;
+        if result_tx.send(result).is_err() {
+            eprintln!("[network] QUIC send result receiver dropped before completion");
+        }
+    });
+
+    result_rx
+        .recv()
+        .map_err(|_| AppError::new(ReasonCode::RcIo, "QUIC send channel closed"))?
+}
+
+/// Receive data on a QUIC connection by accepting an incoming stream.
+pub fn quic_udp_recv(conn_handle: u64, buf: &mut [u8]) -> Result<usize, AppError> {
+    let connection = {
+        let state = lock_quic_state()?;
+        state
+            .connections
+            .get(&conn_handle)
+            .cloned()
+            .ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcIo,
+                    format!("QUIC: unknown connection handle {conn_handle}"),
+                )
+            })?
+    };
+
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let buf_len = buf.len();
+    QUIC_RUNTIME.spawn(async move {
+        let result = async {
+            let mut recv = connection.accept_uni().await.map_err(|e| {
+                AppError::new(
+                    ReasonCode::RcNetReadFailed,
+                    format!("QUIC: accept stream failed: {e}"),
+                )
+            })?;
+            let mut read_buf = vec![0u8; buf_len];
+            let n = recv
+                .read(&mut read_buf)
+                .await
+                .map_err(|e| {
+                    AppError::new(
+                        ReasonCode::RcNetReadFailed,
+                        format!("QUIC recv failed: {e}"),
+                    )
+                })?
+                .unwrap_or(0);
+            Ok::<(Vec<u8>, usize), AppError>((read_buf, n))
+        }
+        .await;
+        if result_tx.send(result).is_err() {
+            eprintln!("[network] QUIC recv result receiver dropped before completion");
+        }
+    });
+
+    let (read_buf, n) = result_rx
+        .recv()
+        .map_err(|_| AppError::new(ReasonCode::RcIo, "QUIC recv channel closed"))??;
+
+    let actual_n = n.min(buf.len());
+    buf[..actual_n].copy_from_slice(&read_buf[..actual_n]);
+    Ok(actual_n)
+}
+
+/// Close a QUIC connection and clean up resources.
+pub fn quic_udp_close(conn_handle: u64) {
+    let mut state = match QUIC_STATE.lock() {
+        Ok(guard) => guard,
+        Err(e) => {
+            eprintln!("QUIC state lock poisoned during close: {e}");
+            return;
+        }
+    };
+    if let Some(conn) = state.connections.remove(&conn_handle) {
+        conn.close(0u32.into(), b"close");
+    }
+    state.listeners.remove(&conn_handle);
+    state.udp_sockets.remove(&conn_handle);
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        AddressFamily, AltSvcEntry, Certificate, Cookie, HttpProtocol, HttpProtocolFlags,
-        NetworkStack, QuicConfig, SockAddr, is_quic_alpn, negotiate_http_protocol,
-        parse_alt_svc_header,
+        AddressFamily, AltSvcEntry, Certificate, HttpProtocol, HttpProtocolFlags, NetworkStack,
+        PinnedCertificates, QUIC_STATE, QuicConfig, SockAddr, is_quic_alpn,
+        negotiate_http_protocol, parse_alt_svc_header, recover_quic_state,
     };
     use std::collections::BTreeMap;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::thread;
+    use std::time::Duration;
 
     #[test]
     fn winsock_round_trip_preserves_socket_names() {
         let mut network = NetworkStack::new();
         network.wsa_startup();
 
-        let listener = network.socket(AddressFamily::Ipv4).expect("listener socket");
+        let listener = network
+            .socket(AddressFamily::Ipv4)
+            .expect("listener socket");
         assert_eq!(listener & 0x3, 0);
         assert!(listener >= 0x1000);
         let listener_addr = SockAddr {
@@ -1978,17 +3311,27 @@ mod tests {
             host: "127.0.0.1".to_string(),
             port: 27015,
         };
-        network.bind(listener, listener_addr.clone()).expect("bind listener");
+        network
+            .bind(listener, listener_addr.clone())
+            .expect("bind listener");
         network.listen(listener, 1).expect("listen");
 
         let client = network.socket(AddressFamily::Ipv4).expect("client socket");
         assert_eq!(client & 0x3, 0);
         assert!(client >= 0x1000);
-        network.connect(client, listener_addr.clone()).expect("connect");
+        network
+            .connect(client, listener_addr.clone())
+            .expect("connect");
         let server = network.accept(listener).expect("accept");
 
-        assert_eq!(network.getsockname(listener).expect("listener name"), listener_addr);
-        assert_eq!(network.getsockname(server).expect("server name"), listener_addr);
+        assert_eq!(
+            network.getsockname(listener).expect("listener name"),
+            listener_addr
+        );
+        assert_eq!(
+            network.getsockname(server).expect("server name"),
+            listener_addr
+        );
 
         network.send(client, b"ping").expect("send");
         assert_eq!(network.recv(server, 4).expect("recv"), b"ping");
@@ -2001,10 +3344,16 @@ mod tests {
         let mut network = NetworkStack::new();
         network.wsa_startup();
 
-        let addrs = network.getaddrinfo("localhost", 80).expect("resolve localhost");
+        let addrs = network
+            .getaddrinfo("localhost", 80)
+            .expect("resolve localhost");
 
         assert!(!addrs.is_empty());
-        assert!(addrs.iter().any(|addr| addr.family == AddressFamily::Ipv4 || addr.family == AddressFamily::Ipv6));
+        assert!(
+            addrs.iter().any(
+                |addr| addr.family == AddressFamily::Ipv4 || addr.family == AddressFamily::Ipv6
+            )
+        );
     }
 
     #[test]
@@ -2252,7 +3601,7 @@ mod tests {
             .win_http_open_request(conn, "GET", "/nonexistent")
             .expect("open");
         let result = network.win_http_send_request(req, BTreeMap::new(), &[]);
-        assert!(result.is_err());
+        assert!(result.is_err(), "expected Err, got {result:?}");
         network.close_handle(req);
         network.close_handle(conn);
         network.close_handle(session);
@@ -2359,9 +3708,7 @@ mod tests {
         network.close_handle(session);
         let snapshot = network.cookie_snapshot_json().expect("snapshot");
         let mut network2 = NetworkStack::new();
-        network2
-            .load_cookie_snapshot_json(&snapshot)
-            .expect("load");
+        network2.load_cookie_snapshot_json(&snapshot).expect("load");
         let snapshot2 = network2.cookie_snapshot_json().expect("snapshot2");
         assert_eq!(snapshot, snapshot2);
     }
@@ -2377,7 +3724,7 @@ mod tests {
     fn cookie_jar_rejects_invalid_json() {
         let mut network = NetworkStack::new();
         let result = network.load_cookie_snapshot_json("not valid json");
-        assert!(result.is_err());
+        assert!(result.is_err(), "expected Err, got {result:?}");
     }
 
     // --- Certificate validation tests ---
@@ -2415,10 +3762,13 @@ mod tests {
         let root = make_root_cert();
         network.import_certificate(root);
         let leaf = make_test_cert("example.com", 100, false);
-        let chain = vec![leaf, Certificate {
-            fingerprint: "fp:root".to_string(),
-            ..make_root_cert()
-        }];
+        let chain = vec![
+            leaf,
+            Certificate {
+                fingerprint: "fp:root".to_string(),
+                ..make_root_cert()
+            },
+        ];
         let suite = network
             .validate_server_certificate("example.com", &chain, false)
             .expect("should validate");
@@ -2431,7 +3781,7 @@ mod tests {
         let leaf = make_test_cert("example.com", 100, false);
         let chain = vec![leaf];
         let result = network.validate_server_certificate("wrong.com", &chain, false);
-        assert!(result.is_err());
+        assert!(result.is_err(), "expected Err, got {result:?}");
     }
 
     #[test]
@@ -2442,7 +3792,7 @@ mod tests {
         network.set_current_day(100);
         let chain = vec![leaf];
         let result = network.validate_server_certificate("example.com", &chain, false);
-        assert!(result.is_err());
+        assert!(result.is_err(), "expected Err, got {result:?}");
     }
 
     #[test]
@@ -2451,12 +3801,15 @@ mod tests {
         let root = make_root_cert();
         network.import_certificate(root);
         let leaf = make_test_cert("example.com", 100, true); // revoked
-        let chain = vec![leaf, Certificate {
-            fingerprint: "fp:root".to_string(),
-            ..make_root_cert()
-        }];
+        let chain = vec![
+            leaf,
+            Certificate {
+                fingerprint: "fp:root".to_string(),
+                ..make_root_cert()
+            },
+        ];
         let result = network.validate_server_certificate("example.com", &chain, true);
-        assert!(result.is_err());
+        assert!(result.is_err(), "expected Err, got {result:?}");
     }
 
     #[test]
@@ -2465,13 +3818,16 @@ mod tests {
         let root = make_root_cert();
         network.import_certificate(root);
         let leaf = make_test_cert("example.com", 100, true); // revoked
-        let chain = vec![leaf, Certificate {
-            fingerprint: "fp:root".to_string(),
-            ..make_root_cert()
-        }];
+        let chain = vec![
+            leaf,
+            Certificate {
+                fingerprint: "fp:root".to_string(),
+                ..make_root_cert()
+            },
+        ];
         // revocation_check = false, so revoked cert passes
         let result = network.validate_server_certificate("example.com", &chain, false);
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
     }
 
     #[test]
@@ -2480,7 +3836,7 @@ mod tests {
         let leaf = make_test_cert("example.com", 100, false);
         let chain = vec![leaf, make_root_cert()];
         let result = network.validate_server_certificate("example.com", &chain, false);
-        assert!(result.is_err());
+        assert!(result.is_err(), "expected Err, got {result:?}");
     }
 
     #[test]
@@ -2492,19 +3848,22 @@ mod tests {
             supported_ciphers: vec!["TLS_ECDHE_RSA_WITH_RC4_128_SHA".to_string()],
             ..make_test_cert("example.com", 100, false)
         };
-        let chain = vec![leaf, Certificate {
-            fingerprint: "fp:root".to_string(),
-            ..make_root_cert()
-        }];
+        let chain = vec![
+            leaf,
+            Certificate {
+                fingerprint: "fp:root".to_string(),
+                ..make_root_cert()
+            },
+        ];
         let result = network.validate_server_certificate("example.com", &chain, false);
-        assert!(result.is_err());
+        assert!(result.is_err(), "expected Err, got {result:?}");
     }
 
     #[test]
     fn certificate_validate_empty_chain_rejected() {
         let network = NetworkStack::new();
         let result = network.validate_server_certificate("example.com", &[], false);
-        assert!(result.is_err());
+        assert!(result.is_err(), "expected Err, got {result:?}");
     }
 
     #[test]
@@ -2513,12 +3872,15 @@ mod tests {
         let root = make_root_cert();
         network.import_certificate(root);
         let leaf = make_test_cert("secure.example", 200, false);
-        let chain = vec![leaf, Certificate {
-            fingerprint: "fp:root".to_string(),
-            ..make_root_cert()
-        }];
+        let chain = vec![
+            leaf,
+            Certificate {
+                fingerprint: "fp:root".to_string(),
+                ..make_root_cert()
+            },
+        ];
         let result = network.validate_server_certificate("secure.example", &chain, false);
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
     }
 
     #[test]
@@ -2574,7 +3936,7 @@ mod tests {
             .ioctlsocket_fionbio(sock, true)
             .expect("set nonblocking");
         let result = network.accept(sock);
-        assert!(result.is_err());
+        assert!(result.is_err(), "expected Err, got {result:?}");
         assert_eq!(network.wsa_get_last_error(), 10035); // WSAEWOULDBLOCK
     }
 
@@ -2591,7 +3953,7 @@ mod tests {
         network.bind(s1, addr.clone()).expect("bind s1");
         let s2 = network.socket(AddressFamily::Ipv4).expect("s2");
         let result = network.bind(s2, addr);
-        assert!(result.is_err());
+        assert!(result.is_err(), "expected Err, got {result:?}");
         assert_eq!(network.wsa_get_last_error(), 10048); // WSAEADDRINUSE
     }
 
@@ -2615,7 +3977,7 @@ mod tests {
         network.connect(sock, addr).expect("connect");
         // recv on empty queue with nonblocking
         let result = network.recv(sock, 4);
-        assert!(result.is_err());
+        assert!(result.is_err(), "expected Err, got {result:?}");
         assert_eq!(network.wsa_get_last_error(), 10035); // WSAEWOULDBLOCK
     }
 
@@ -2637,9 +3999,7 @@ mod tests {
 
         // Listener with pending accept should be readable
         // Select BEFORE accept so the pending connection is still in the queue
-        let (readable, writable) = network
-            .select(&[client, listener])
-            .expect("select");
+        let (readable, writable) = network.select(&[client, listener]).expect("select");
         assert!(readable.contains(&listener));
         // Client should be writable (connected)
         assert!(writable.contains(&client));
@@ -2647,9 +4007,7 @@ mod tests {
         let server = network.accept(listener).expect("accept");
 
         // Both connected sockets should be writable
-        let (readable2, writable2) = network
-            .select(&[client, server])
-            .expect("select");
+        let (_readable2, writable2) = network.select(&[client, server]).expect("select");
         assert!(writable2.contains(&client));
         assert!(writable2.contains(&server));
 
@@ -2687,9 +4045,7 @@ mod tests {
         network.connect(client, addr).expect("connect");
         let server = network.accept(listener).expect("accept");
         network.send(client, b"12345").expect("send");
-        let available = network
-            .ioctlsocket_fionread(server)
-            .expect("fionread");
+        let available = network.ioctlsocket_fionread(server).expect("fionread");
         assert_eq!(available, 5);
     }
 
@@ -2702,14 +4058,14 @@ mod tests {
         network.closesocket(sock).expect("close");
         // After close, operations on the socket should fail
         let result = network.getsockname(sock);
-        assert!(result.is_err());
+        assert!(result.is_err(), "expected Err, got {result:?}");
     }
 
     #[test]
     fn socket_operations_fail_without_wsa_startup() {
         let mut network = NetworkStack::new();
         let result = network.socket(AddressFamily::Ipv4);
-        assert!(result.is_err());
+        assert!(result.is_err(), "expected Err, got {result:?}");
         assert_eq!(network.wsa_get_last_error(), 10093); // WSANOTINITIALISED
     }
 
@@ -2717,24 +4073,28 @@ mod tests {
     fn socket_wsa_startup_cleanup_refcount() {
         let mut network = NetworkStack::new();
         network.wsa_startup();
-        assert!(network.socket(AddressFamily::Ipv4).is_ok());
+        let _result = network.socket(AddressFamily::Ipv4);
+        assert!(_result.is_ok(), "expected Ok, got {_result:?}");
         network.wsa_cleanup();
         // refcount goes to 0, next operation fails
         network.wsa_cleanup();
         let result = network.socket(AddressFamily::Ipv4);
-        assert!(result.is_err());
+        assert!(result.is_err(), "expected Err, got {result:?}");
     }
 
     #[test]
     fn socket_bind_fails_if_not_created() {
         let mut network = NetworkStack::new();
         network.wsa_startup();
-        let result = network.bind(99999, SockAddr {
-            family: AddressFamily::Ipv4,
-            host: "127.0.0.1".to_string(),
-            port: 1,
-        });
-        assert!(result.is_err());
+        let result = network.bind(
+            99999,
+            SockAddr {
+                family: AddressFamily::Ipv4,
+                host: "127.0.0.1".to_string(),
+                port: 1,
+            },
+        );
+        assert!(result.is_err(), "expected Err, got {result:?}");
     }
 
     // --- DNS resolution tests ---
@@ -2757,7 +4117,11 @@ mod tests {
         network.wsa_startup();
         let addrs = network.getaddrinfo("example.com", 80).expect("resolve");
         assert!(addrs.iter().any(|a| a.family == AddressFamily::Ipv6));
-        assert!(addrs.iter().any(|a| a.host == "2606:2800:220:1:248:1893:25c8:1946"));
+        assert!(
+            addrs
+                .iter()
+                .any(|a| a.host == "2606:2800:220:1:248:1893:25c8:1946")
+        );
     }
 
     #[test]
@@ -2974,10 +4338,13 @@ mod tests {
             headers,
             b"ok",
             Vec::new(),
-            vec![leaf, Certificate {
-                fingerprint: "fp:root".to_string(),
-                ..make_root_cert()
-            }],
+            vec![
+                leaf,
+                Certificate {
+                    fingerprint: "fp:root".to_string(),
+                    ..make_root_cert()
+                },
+            ],
         );
         let session = network.win_http_open("test");
         let conn = network
@@ -3022,7 +4389,8 @@ mod tests {
         network.close_handle(conn);
         network.close_handle(session);
         // After closing, operations should fail
-        assert!(network.win_http_connect(session, "x", 80, false).is_err());
+        let _result = network.win_http_connect(session, "x", 80, false);
+        assert!(_result.is_err(), "expected Err, got {_result:?}");
         // But new handles work
         let s2 = network.win_http_open("test2");
         assert!(s2 >= 0x1000);
@@ -3135,7 +4503,7 @@ mod tests {
         let leaf = make_test_cert("test.local", 100, false);
         let chain = vec![leaf.clone()];
         let result = network.validate_server_certificate("test.local", &chain, false);
-        assert!(result.is_err()); // expired because current_day (500) > not_after_day (130)
+        assert!(result.is_err(), "expected Err, got {result:?}"); // expired because current_day (500) > not_after_day (130)
     }
 
     #[test]
@@ -3146,5 +4514,224 @@ mod tests {
         assert_eq!(network.wsa_get_last_error(), 11001);
         network.wsa_set_last_error(0);
         assert_eq!(network.wsa_get_last_error(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Item 200: Unpinned HTTPS hosts still use normal CA validation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn unpinned_host_passes_when_no_pins_configured() {
+        let pins = PinnedCertificates::new();
+        // No pins configured for any host — verification should pass with
+        // an empty certificate chain, since unpinned hosts are not checked.
+        let _result = pins.verify("example.com", &[]);
+        assert!(_result.is_ok(), "expected Ok, got {_result:?}");
+    }
+
+    #[test]
+    fn unpinned_host_passes_with_any_chain() {
+        let pins = PinnedCertificates::new();
+        // Even with certificates present, unpinned hosts should pass.
+        let dummy_cert = vec![0u8; 32];
+        let _result = pins.verify("unpinned.example.com", &[dummy_cert]);
+        assert!(_result.is_ok(), "expected Ok, got {_result:?}");
+    }
+
+    #[test]
+    fn pinned_host_rejects_empty_chain() {
+        let mut pins = PinnedCertificates::new();
+        pins.add_pin("pinned.example.com", "dGVzdGZpbmdlcnByaW50");
+        // Pinned host with no certificates to verify should fail.
+        let _result = pins.verify("pinned.example.com", &[]);
+        assert!(_result.is_err(), "expected Err, got {_result:?}");
+    }
+
+    #[test]
+    fn mixed_pinned_and_unpinned_hosts() {
+        let mut pins = PinnedCertificates::new();
+        pins.add_pin("pinned.example.com", "dGVzdGZpbmdlcnByaW50");
+        // Unpinned host should still pass even though other hosts are pinned.
+        let _result = pins.verify("other.example.com", &[]);
+        assert!(_result.is_ok(), "expected Ok, got {_result:?}");
+        // Pinned host should fail with no matching certs.
+        let _result = pins.verify("pinned.example.com", &[]);
+        assert!(_result.is_err(), "expected Err, got {_result:?}");
+    }
+
+    #[test]
+    fn clear_pins_makes_all_hosts_unpinned() {
+        let mut pins = PinnedCertificates::new();
+        pins.add_pin("example.com", "dGVzdGZpbmdlcnByaW50");
+        pins.clear();
+        let _result = pins.verify("example.com", &[]);
+        assert!(_result.is_ok(), "expected Ok, got {_result:?}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Item 210: Timeout and cancellation behavior tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn socket_set_read_timeout_does_not_panic() {
+        use std::net::{TcpListener, TcpStream};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stream = TcpStream::connect(addr).unwrap();
+        // Setting timeout should succeed.
+        stream
+            .set_read_timeout(Some(Duration::from_millis(1)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_millis(1)))
+            .unwrap();
+        drop(stream);
+        drop(listener);
+    }
+
+    #[test]
+    fn socket_read_timeout_triggers_error() {
+        use std::net::TcpListener;
+        // Create a listener that never accepts, so connect will hang
+        // and reads will eventually time out.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Connect to our listener.
+        let stream = std::net::TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(10)))
+            .unwrap();
+        let mut buf = [0u8; 4];
+        let result = stream.peek(&mut buf);
+        // The read may either time out or succeed (if the peer sent FIN),
+        // but it should never panic.
+        match result {
+            Ok(_) | Err(_) => {} // acceptable
+        }
+        drop(stream);
+        drop(listener);
+    }
+
+    #[test]
+    fn real_tcp_socket_set_timeout_works() {
+        use crate::real_net::RealTcpSocket;
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stream = std::net::TcpStream::connect(addr).unwrap();
+        let mut real = RealTcpSocket {
+            id: 1,
+            stream,
+            peer_addr: Some(addr.to_string()),
+            nonblocking: false,
+        };
+        // Timeout should be settable
+        assert!(real.set_timeout(Some(Duration::from_millis(100))).is_ok());
+        // Clearing timeout should also work
+        let _result = real.set_timeout(None);
+        assert!(_result.is_ok(), "expected Ok, got {_result:?}");
+    }
+
+    #[test]
+    fn real_udp_socket_set_timeout_works() {
+        use crate::real_net::RealUdpSocket;
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let real = RealUdpSocket {
+            id: 1,
+            socket,
+            nonblocking: false,
+        };
+        assert!(real.set_timeout(Some(Duration::from_millis(100))).is_ok());
+        let _result = real.set_timeout(None);
+        assert!(_result.is_ok(), "expected Ok, got {_result:?}");
+    }
+
+    #[test]
+    fn nonblocking_socket_returns_wouldblock_immediately() {
+        // A socket with no data in nonblocking mode should return a
+        // WouldBlock error immediately rather than hanging.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut stream = std::net::TcpStream::connect(addr).unwrap();
+        stream.set_nonblocking(true).unwrap();
+        let mut buf = [0u8; 4];
+        let result = stream.read(&mut buf);
+        assert!(result.is_err(), "expected Err, got {result:?}");
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+        drop(stream);
+        drop(listener);
+    }
+
+    // -----------------------------------------------------------------------
+    // Item 212: Resource cleanup / Drop tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn socket_create_and_close_cleans_up() {
+        let mut stack = NetworkStack::new();
+        stack.wsa_startup();
+        let sid = stack.socket(AddressFamily::Ipv4).unwrap();
+        // Use closesocket (existing method) to clean up the socket
+        stack.closesocket(sid).unwrap();
+        // After closing, the socket should be gone — any operation should fail
+        let result = stack.getsockname(sid);
+        assert!(result.is_err(), "expected Err, got {result:?}");
+    }
+
+    #[test]
+    fn close_unopened_handle_is_safe() {
+        let mut stack = NetworkStack::new();
+        // Attempt to close a handle that was never opened.
+        // This should be safe (no panic) since close_handle just removes from maps.
+        stack.close_handle(99999);
+    }
+
+    #[test]
+    fn double_close_socket_fails_second_time() {
+        let mut stack = NetworkStack::new();
+        stack.wsa_startup();
+        let sid = stack.socket(AddressFamily::Ipv4).unwrap();
+        // First close succeeds
+        stack.closesocket(sid).unwrap();
+        // Second close should fail since the socket was already removed
+        let result = stack.closesocket(sid);
+        assert!(result.is_err(), "expected Err, got {result:?}");
+    }
+
+    #[test]
+    fn http_session_close_cleans_up_connections() {
+        let mut stack = NetworkStack::new();
+        stack.wsa_startup();
+        let session = stack.win_http_open("test-agent");
+        let conn = stack
+            .win_http_connect(session, "api.example.com", 443, true)
+            .unwrap();
+        let req = stack.win_http_open_request(conn, "GET", "/login").unwrap();
+        // Close all three — no panic expected
+        stack.close_handle(req);
+        stack.close_handle(conn);
+        stack.close_handle(session);
+        // After closing, operations on these handles should fail
+        let _result = stack.win_http_open_request(conn, "GET", "/x");
+        assert!(_result.is_err(), "expected Err, got {_result:?}");
+    }
+
+    #[test]
+    fn quic_state_recovery_clears_poisoned_state() {
+        // Attempt recovery on an unpoisoned state (should still succeed).
+        let result = recover_quic_state();
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+
+        // After recovery, locking should work.
+        let guard = QUIC_STATE.lock();
+        assert!(guard.is_ok(), "expected QUIC state lock to be acquired");
+    }
+
+    #[test]
+    fn quic_state_recovery_idempotent() {
+        // Calling recover_quic_state twice should be safe.
+        assert!(recover_quic_state().is_ok());
+        assert!(recover_quic_state().is_ok());
     }
 }

@@ -7,6 +7,8 @@
 //! - Root signature binding mapping
 //! - Error handling (invalid DXIL, truncated containers)
 
+#![allow(clippy::cloned_ref_to_slice_refs)]
+
 use casa1::shader::*;
 
 // ---------------------------------------------------------------------------
@@ -21,9 +23,9 @@ fn make_minimal_dxil(instruction_count: u32, entry_name: &str) -> Vec<u8> {
     let mut data = Vec::new();
 
     // DXIL header
-    data.extend_from_slice(b"DXIL");               // magic
-    data.extend_from_slice(&1u32.to_le_bytes());    // version
-    data.extend_from_slice(&3u32.to_le_bytes());    // part count (PROG, SIGN, META)
+    data.extend_from_slice(b"DXIL"); // magic
+    data.extend_from_slice(&1u32.to_le_bytes()); // version
+    data.extend_from_slice(&3u32.to_le_bytes()); // part count (PROG, SIGN, META)
 
     // Part descriptors start at offset 12
     let descriptors_end = 12 + 3 * 12; // = 48
@@ -57,11 +59,11 @@ fn make_minimal_dxil(instruction_count: u32, entry_name: &str) -> Vec<u8> {
 
     // PROG part payload (24-byte header)
     data.extend_from_slice(&instruction_count.to_le_bytes()); // instruction count
-    data.extend_from_slice(&64u32.to_le_bytes());             // IR size
-    data.extend_from_slice(&1u32.to_le_bytes());              // threadgroup x
-    data.extend_from_slice(&1u32.to_le_bytes());              // threadgroup y
-    data.extend_from_slice(&1u32.to_le_bytes());              // threadgroup z
-    data.extend_from_slice(&0u32.to_le_bytes());              // resource use count = 0
+    data.extend_from_slice(&64u32.to_le_bytes()); // IR size
+    data.extend_from_slice(&1u32.to_le_bytes()); // threadgroup x
+    data.extend_from_slice(&1u32.to_le_bytes()); // threadgroup y
+    data.extend_from_slice(&1u32.to_le_bytes()); // threadgroup z
+    data.extend_from_slice(&0u32.to_le_bytes()); // resource use count = 0
 
     // LLVM bitcode magic (minimal, no actual instructions)
     data.extend_from_slice(&LLVM_BC_MAGIC.to_be_bytes());
@@ -127,7 +129,11 @@ fn t20_1_empty_vs() {
     let input = test_input(dxil, ShaderStage::Vs, root);
 
     let result = translate_shader(&input);
-    assert!(result.is_ok(), "empty VS should translate: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "empty VS should translate: {:?}",
+        result.err()
+    );
 
     let output = result.unwrap();
     let msl = String::from_utf8_lossy(&output.mtl_library_bytes);
@@ -144,8 +150,14 @@ fn t20_1_empty_vs() {
         "MSL should contain a return statement"
     );
     // Should have proper function mapping
-    assert!(!output.function_mapping.is_empty(), "should have function mapping");
-    assert!(output.cache_key.contains("vs"), "cache key should reference vertex stage");
+    assert!(
+        !output.function_mapping.is_empty(),
+        "should have function mapping"
+    );
+    assert!(
+        output.cache_key.contains("vs"),
+        "cache key should reference vertex stage"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -159,7 +171,11 @@ fn t20_2_simple_ps() {
     let input = test_input(dxil, ShaderStage::Ps, root);
 
     let result = translate_shader(&input);
-    assert!(result.is_ok(), "simple PS should translate: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "simple PS should translate: {:?}",
+        result.err()
+    );
 
     let output = result.unwrap();
     let msl = String::from_utf8_lossy(&output.mtl_library_bytes);
@@ -187,7 +203,11 @@ fn t20_3_add_instruction() {
     let input = test_input(dxil, ShaderStage::Cs, root);
 
     let result = translate_shader(&input);
-    assert!(result.is_ok(), "compute shader should translate: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "compute shader should translate: {:?}",
+        result.err()
+    );
 
     let output = result.unwrap();
     let msl = String::from_utf8_lossy(&output.mtl_library_bytes);
@@ -211,7 +231,11 @@ fn t20_4_texture_sample() {
     let input = test_input(dxil, ShaderStage::Ps, root);
 
     let result = translate_shader(&input);
-    assert!(result.is_ok(), "texture sample shader should translate: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "texture sample shader should translate: {:?}",
+        result.err()
+    );
 
     let output = result.unwrap();
     let msl = String::from_utf8_lossy(&output.mtl_library_bytes);
@@ -236,7 +260,11 @@ fn t20_5_buffer_load() {
     let input = test_input(dxil, ShaderStage::Cs, root);
 
     let result = translate_shader(&input);
-    assert!(result.is_ok(), "buffer load should translate: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "buffer load should translate: {:?}",
+        result.err()
+    );
 
     let output = result.unwrap();
     let msl = String::from_utf8_lossy(&output.mtl_library_bytes);
@@ -308,7 +336,11 @@ fn t20_7_cache_eviction() {
         "cache size {} should be limited (<= 4500)",
         total_size
     );
-    assert!(cache.len() < 10, "cache should have evicted entries, but has {}", cache.len());
+    assert!(
+        cache.len() < 10,
+        "cache should have evicted entries, but has {}",
+        cache.len()
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -364,7 +396,10 @@ fn t20_9_invalid_dxil() {
     assert!(result.is_err(), "invalid DXIL should produce error");
 
     let error = result.unwrap_err();
-    assert_eq!(error.failing_pass, "parse", "error should come from parse pass");
+    assert_eq!(
+        error.failing_pass, "parse",
+        "error should come from parse pass"
+    );
     assert!(!error.message.is_empty(), "error should have a message");
 }
 
@@ -391,8 +426,10 @@ fn t20_10_truncated_container() {
 
     // Check that the error is specifically about the container
     assert!(
-        error.message.contains("part") || error.message.contains("range")
-            || error.message.contains("DXIL") || error.message.contains("header"),
+        error.message.contains("part")
+            || error.message.contains("range")
+            || error.message.contains("DXIL")
+            || error.message.contains("header"),
         "error message should reference container: {}",
         error.message
     );
@@ -411,7 +448,10 @@ fn t20_cache_key_determinism() {
 
     let key1 = shader_cache_key(&input1).unwrap();
     let key2 = shader_cache_key(&input2).unwrap();
-    assert_eq!(key1, key2, "identical inputs must produce identical cache keys");
+    assert_eq!(
+        key1, key2,
+        "identical inputs must produce identical cache keys"
+    );
 }
 
 #[test]
@@ -477,7 +517,10 @@ fn t20_translate_shader_returns_mapping() {
         "should map original entry name"
     );
     let msl_fn = output.function_mapping.get("my_entry").unwrap();
-    assert!(msl_fn.starts_with("msl_vs_"), "MSL function should be prefixed");
+    assert!(
+        msl_fn.starts_with("msl_vs_"),
+        "MSL function should be prefixed"
+    );
 }
 
 #[test]
@@ -485,7 +528,10 @@ fn t20_compile_msl_source_wraps() {
     let source = "#include <metal_stdlib>\nusing namespace metal;\n";
     let compiled = compile_msl_source(source, "main").expect("compile MSL");
     let as_str = String::from_utf8_lossy(&compiled);
-    assert!(as_str.starts_with("MTLCOMPILED|"), "should have compiled wrapper");
+    assert!(
+        as_str.starts_with("MTLCOMPILED|"),
+        "should have compiled wrapper"
+    );
     assert!(as_str.contains(source), "should contain original source");
 }
 

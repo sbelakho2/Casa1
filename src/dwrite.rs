@@ -72,9 +72,13 @@ const KCT_FONT_ATTRIBUTE_NAME: &str = "NSFont";
 
 // ── Function pointer type aliases ───────────────────────────────────────
 
-type CTFontCreateWithNameFn =
-    unsafe extern "C" fn(name: CFStringRef, size: CGFloat, matrix: *const CGAffineTransform) -> CTFontRef;
-type CTLineCreateWithAttributedStringFn = unsafe extern "C" fn(attr_string: CFStringRef) -> CTLineRef;
+type CTFontCreateWithNameFn = unsafe extern "C" fn(
+    name: CFStringRef,
+    size: CGFloat,
+    matrix: *const CGAffineTransform,
+) -> CTFontRef;
+type CTLineCreateWithAttributedStringFn =
+    unsafe extern "C" fn(attr_string: CFStringRef) -> CTLineRef;
 type CTLineGetImageBoundsFn =
     unsafe extern "C" fn(line: CTLineRef, context: CGContextRef) -> CGRect;
 type CTLineGetTypographicBoundsFn = unsafe extern "C" fn(
@@ -83,8 +87,12 @@ type CTLineGetTypographicBoundsFn = unsafe extern "C" fn(
     descent: *mut CGFloat,
     leading: *mut CGFloat,
 ) -> CGFloat;
-type CTFontGetGlyphsForCharactersFn =
-    unsafe extern "C" fn(font: CTFontRef, chars: *const UniChar, glyphs: *mut CGGlyph, count: CFIndex) -> bool;
+type CTFontGetGlyphsForCharactersFn = unsafe extern "C" fn(
+    font: CTFontRef,
+    chars: *const UniChar,
+    glyphs: *mut CGGlyph,
+    count: CFIndex,
+) -> bool;
 type CTFontGetAdvancesForGlyphsFn = unsafe extern "C" fn(
     font: CTFontRef,
     orientation: u32,
@@ -105,8 +113,11 @@ type CTFontCopyTableFn =
     unsafe extern "C" fn(font: CTFontRef, table: u32, options: u32) -> CFDataRef;
 type CTFontDescriptorCreateWithNameAndSizeFn =
     unsafe extern "C" fn(name: CFStringRef, size: CGFloat) -> CTFontDescriptorRef;
-type CTFontCreateWithFontDescriptorFn =
-    unsafe extern "C" fn(descriptor: CTFontDescriptorRef, size: CGFloat, matrix: *const CGAffineTransform) -> CTFontRef;
+type CTFontCreateWithFontDescriptorFn = unsafe extern "C" fn(
+    descriptor: CTFontDescriptorRef,
+    size: CGFloat,
+    matrix: *const CGAffineTransform,
+) -> CTFontRef;
 type CTFontCollectionCreateFromAvailableFontsFn =
     unsafe extern "C" fn(options: *const CFDictionaryRef) -> CTFontCollectionRef;
 type CTFontCollectionCreateMatchingFontDescriptorsFn =
@@ -118,19 +129,21 @@ type CTFontGetSymbolicTraitsFn = unsafe extern "C" fn(font: CTFontRef) -> u32;
 type CFStringGetCStringPtrFn =
     unsafe extern "C" fn(theString: CFStringRef, encoding: u32) -> *const i8;
 type CFStringGetLengthFn = unsafe extern "C" fn(theString: CFStringRef) -> CFIndex;
-type CFStringGetCStringFn =
-    unsafe extern "C" fn(theString: CFStringRef, buffer: *mut i8, bufferSize: CFIndex, encoding: u32) -> u8;
+type CFStringGetCStringFn = unsafe extern "C" fn(
+    theString: CFStringRef,
+    buffer: *mut i8,
+    bufferSize: CFIndex,
+    encoding: u32,
+) -> u8;
 type CFNumberGetValueFn =
     unsafe extern "C" fn(number: CFNumberRef, theType: u32, valuePtr: *mut c_void) -> u8;
 type CFArrayGetCountFn = unsafe extern "C" fn(theArray: CFArrayRef) -> CFIndex;
-type CFArrayGetValueAtIndexFn = unsafe extern "C" fn(theArray: CFArrayRef, idx: CFIndex) -> *const c_void;
+type CFArrayGetValueAtIndexFn =
+    unsafe extern "C" fn(theArray: CFArrayRef, idx: CFIndex) -> *const c_void;
 type CFReleaseFn = unsafe extern "C" fn(cf: CFTypeRef);
 type CFRetainFn = unsafe extern "C" fn(cf: CFTypeRef) -> CFTypeRef;
-type CFStringCreateWithCStringFn = unsafe extern "C" fn(
-    allocator: *const c_void,
-    cStr: *const u8,
-    encoding: u32,
-) -> CFStringRef;
+type CFStringCreateWithCStringFn =
+    unsafe extern "C" fn(allocator: *const c_void, cStr: *const u8, encoding: u32) -> CFStringRef;
 type CFDataGetBytePtrFn = unsafe extern "C" fn(theData: CFDataRef) -> *const u8;
 type CFDataGetLengthFn = unsafe extern "C" fn(theData: CFDataRef) -> CFIndex;
 type CFAttributedStringCreateFn = unsafe extern "C" fn(
@@ -334,13 +347,26 @@ pub struct DWriteTextLayout {
     pub metrics: TextMetrics,
 }
 
+/// Result of a glyph rendering operation: a pixel bitmap with dimensions.
+#[derive(Debug, Clone)]
+pub struct RenderedGlyphs {
+    /// RGBA pixel data (width × height × 4 bytes).
+    pub pixels: Vec<u8>,
+    /// Width of the rendered bitmap in pixels.
+    pub width: u32,
+    /// Height of the rendered bitmap in pixels.
+    pub height: u32,
+}
+
 // ── dlopen helpers ──────────────────────────────────────────────────────
 
 /// Load a symbol from a dynamic library by path.
 unsafe fn load_symbol<T: Clone>(lib: &libloading::Library, symbol: &str) -> Option<T> {
-    lib.get(symbol.as_bytes())
-        .ok()
-        .map(|s: libloading::Symbol<'_, T>| -> T { (*s).clone() })
+    unsafe {
+        lib.get(symbol.as_bytes())
+            .ok()
+            .map(|s: libloading::Symbol<'_, T>| -> T { (*s).clone() })
+    }
 }
 
 /// Load the Core Text and Core Graphics function pointers.
@@ -367,7 +393,9 @@ impl DWriteFactory {
     /// Create a new DWrite factory, loading Core Text via dlopen.
     pub fn new() -> Self {
         let mut factory = DWriteFactory {
-            font_collection: DWriteFontCollection { families: Vec::new() },
+            font_collection: DWriteFontCollection {
+                families: Vec::new(),
+            },
             ct_font_create_with_name: None,
             ct_line_create_with_attributed_string: None,
             ct_line_get_image_bounds: None,
@@ -413,38 +441,94 @@ impl DWriteFactory {
                     };
                 }
                 load_sym!(ct_font_create_with_name, ct_lib, "CTFontCreateWithName");
-                load_sym!(ct_line_create_with_attributed_string, ct_lib, "CTLineCreateWithAttributedString");
+                load_sym!(
+                    ct_line_create_with_attributed_string,
+                    ct_lib,
+                    "CTLineCreateWithAttributedString"
+                );
                 load_sym!(ct_line_get_image_bounds, ct_lib, "CTLineGetImageBounds");
-                load_sym!(ct_line_get_typographic_bounds, ct_lib, "CTLineGetTypographicBounds");
-                load_sym!(ct_font_get_glyphs_for_characters, ct_lib, "CTFontGetGlyphsForCharacters");
-                load_sym!(ct_font_get_advances_for_glyphs, ct_lib, "CTFontGetAdvancesForGlyphs");
+                load_sym!(
+                    ct_line_get_typographic_bounds,
+                    ct_lib,
+                    "CTLineGetTypographicBounds"
+                );
+                load_sym!(
+                    ct_font_get_glyphs_for_characters,
+                    ct_lib,
+                    "CTFontGetGlyphsForCharacters"
+                );
+                load_sym!(
+                    ct_font_get_advances_for_glyphs,
+                    ct_lib,
+                    "CTFontGetAdvancesForGlyphs"
+                );
                 load_sym!(ct_font_copy_full_name, ct_lib, "CTFontCopyFullName");
                 load_sym!(ct_font_copy_family_name, ct_lib, "CTFontCopyFamilyName");
-                load_sym!(ct_font_copy_postscript_name, ct_lib, "CTFontCopyPostScriptName");
+                load_sym!(
+                    ct_font_copy_postscript_name,
+                    ct_lib,
+                    "CTFontCopyPostScriptName"
+                );
                 load_sym!(ct_font_get_ascent, ct_lib, "CTFontGetAscent");
                 load_sym!(ct_font_get_descent, ct_lib, "CTFontGetDescent");
                 load_sym!(ct_font_get_leading, ct_lib, "CTFontGetLeading");
                 load_sym!(ct_font_get_units_per_em, ct_lib, "CTFontGetUnitsPerEm");
                 load_sym!(ct_font_copy_table, ct_lib, "CTFontCopyTable");
-                load_sym!(ct_font_descriptor_create_with_name_and_size, ct_lib, "CTFontDescriptorCreateWithNameAndSize");
-                load_sym!(ct_font_create_with_font_descriptor, ct_lib, "CTFontCreateWithFontDescriptor");
-                load_sym!(ct_font_collection_create_from_available_fonts, ct_lib, "CTFontCollectionCreateFromAvailableFonts");
-                load_sym!(ct_font_collection_create_matching_font_descriptors, ct_lib, "CTFontCollectionCreateMatchingFontDescriptors");
-                load_sym!(ct_font_descriptor_copy_attribute, ct_lib, "CTFontDescriptorCopyAttribute");
+                load_sym!(
+                    ct_font_descriptor_create_with_name_and_size,
+                    ct_lib,
+                    "CTFontDescriptorCreateWithNameAndSize"
+                );
+                load_sym!(
+                    ct_font_create_with_font_descriptor,
+                    ct_lib,
+                    "CTFontCreateWithFontDescriptor"
+                );
+                load_sym!(
+                    ct_font_collection_create_from_available_fonts,
+                    ct_lib,
+                    "CTFontCollectionCreateFromAvailableFonts"
+                );
+                load_sym!(
+                    ct_font_collection_create_matching_font_descriptors,
+                    ct_lib,
+                    "CTFontCollectionCreateMatchingFontDescriptors"
+                );
+                load_sym!(
+                    ct_font_descriptor_copy_attribute,
+                    ct_lib,
+                    "CTFontDescriptorCopyAttribute"
+                );
                 load_sym!(ct_font_get_weight, ct_lib, "CTFontGetWeight");
-                load_sym!(ct_font_get_symbolic_traits, ct_lib, "CTFontGetSymbolicTraits");
+                load_sym!(
+                    ct_font_get_symbolic_traits,
+                    ct_lib,
+                    "CTFontGetSymbolicTraits"
+                );
                 load_sym!(cf_string_get_c_string_ptr, cg_lib, "CFStringGetCStringPtr");
                 load_sym!(cf_string_get_length, cg_lib, "CFStringGetLength");
                 load_sym!(cf_string_get_c_string, cg_lib, "CFStringGetCString");
                 load_sym!(cf_number_get_value, cg_lib, "CFNumberGetValue");
                 load_sym!(cf_array_get_count, cg_lib, "CFArrayGetCount");
-                load_sym!(cf_array_get_value_at_index, cg_lib, "CFArrayGetValueAtIndex");
+                load_sym!(
+                    cf_array_get_value_at_index,
+                    cg_lib,
+                    "CFArrayGetValueAtIndex"
+                );
                 load_sym!(cf_release, cg_lib, "CFRelease");
                 load_sym!(cf_retain, cg_lib, "CFRetain");
-                load_sym!(cf_string_create_with_c_string, cg_lib, "CFStringCreateWithCString");
+                load_sym!(
+                    cf_string_create_with_c_string,
+                    cg_lib,
+                    "CFStringCreateWithCString"
+                );
                 load_sym!(cf_data_get_byte_ptr, cg_lib, "CFDataGetBytePtr");
                 load_sym!(cf_data_get_length, cg_lib, "CFDataGetLength");
-                load_sym!(cf_attributed_string_create, cg_lib, "CFAttributedStringCreate");
+                load_sym!(
+                    cf_attributed_string_create,
+                    cg_lib,
+                    "CFAttributedStringCreate"
+                );
                 load_sym!(cf_dictionary_create, cg_lib, "CFDictionaryCreate");
             }
 
@@ -458,39 +542,54 @@ impl DWriteFactory {
     // ── CFString helpers ────────────────────────────────────────────────
 
     unsafe fn cf_string_create(&self, s: &str) -> Option<CFStringRef> {
-        let cstr = CString::new(s).ok()?;
-        let create = self.cf_string_create_with_c_string?;
-        Some(create(std::ptr::null(), cstr.as_ptr() as *const u8, KCFStringEncodingUTF8))
+        unsafe {
+            let cstr = CString::new(s).ok()?;
+            let create = self.cf_string_create_with_c_string?;
+            Some(create(
+                std::ptr::null(),
+                cstr.as_ptr() as *const u8,
+                KCFStringEncodingUTF8,
+            ))
+        }
     }
 
     unsafe fn cf_string_to_rust(&self, cfstr: CFStringRef) -> Option<String> {
-        // Try the fast path first
-        if let Some(get_ptr) = self.cf_string_get_c_string_ptr {
-            let ptr = get_ptr(cfstr, KCFStringEncodingUTF8);
-            if !ptr.is_null() {
-                let cstr = CStr::from_ptr(ptr);
-                return cstr.to_str().ok().map(|s| s.to_string());
+        unsafe {
+            // Try the fast path first
+            if let Some(get_ptr) = self.cf_string_get_c_string_ptr {
+                let ptr = get_ptr(cfstr, KCFStringEncodingUTF8);
+                if !ptr.is_null() {
+                    let cstr = CStr::from_ptr(ptr);
+                    return cstr.to_str().ok().map(|s| s.to_string());
+                }
             }
-        }
 
-        // Fallback: use CFStringGetCString
-        let get_cstr = self.cf_string_get_c_string?;
-        let get_len = self.cf_string_get_length?;
-        let length = get_len(cfstr) as usize;
-        let buffer_size = length * 4 + 1;
-        let mut buffer = vec![0i8; buffer_size];
-        let result = get_cstr(cfstr, buffer.as_mut_ptr(), buffer_size as isize, KCFStringEncodingUTF8);
-        if result != 0 {
-            let cstr = CStr::from_ptr(buffer.as_ptr());
-            cstr.to_str().ok().map(|s| s.to_string())
-        } else {
-            None
+            // Fallback: use CFStringGetCString
+            let get_cstr = self.cf_string_get_c_string?;
+            let get_len = self.cf_string_get_length?;
+            let length = get_len(cfstr) as usize;
+            let buffer_size = length * 4 + 1;
+            let mut buffer = vec![0i8; buffer_size];
+            let result = get_cstr(
+                cfstr,
+                buffer.as_mut_ptr(),
+                buffer_size as isize,
+                KCFStringEncodingUTF8,
+            );
+            if result != 0 {
+                let cstr = CStr::from_ptr(buffer.as_ptr());
+                cstr.to_str().ok().map(|s| s.to_string())
+            } else {
+                None
+            }
         }
     }
 
     unsafe fn cf_release(&self, obj: CFTypeRef) {
-        if let Some(release) = self.cf_release {
-            release(obj);
+        unsafe {
+            if let Some(release) = self.cf_release {
+                release(obj);
+            }
         }
     }
 
@@ -550,7 +649,12 @@ impl DWriteFactory {
     }
 
     /// Measure glyph positions using Core Text.
-    pub fn measure_glyphs(&self, text: &str, format: &DWriteTextFormat, max_width: f32) -> Vec<f32> {
+    pub fn measure_glyphs(
+        &self,
+        text: &str,
+        format: &DWriteTextFormat,
+        max_width: f32,
+    ) -> Vec<f32> {
         // Use simple per-character advance estimation
         let mut positions = Vec::new();
         if text.is_empty() {
@@ -576,7 +680,13 @@ impl DWriteFactory {
                             utf16.len() as isize,
                         );
                         if ok {
-                            let mut advances = vec![CGSize { width: 0.0, height: 0.0 }; utf16.len()];
+                            let mut advances = vec![
+                                CGSize {
+                                    width: 0.0,
+                                    height: 0.0
+                                };
+                                utf16.len()
+                            ];
                             get_advances(
                                 font,
                                 CTFontOrientationDefault,
@@ -626,14 +736,25 @@ impl DWriteFactory {
     }
 
     /// Measure text metrics.
-    fn measure_text(&self, text: &str, format: &DWriteTextFormat, max_width: f32, max_height: f32) -> TextMetrics {
+    fn measure_text(
+        &self,
+        text: &str,
+        format: &DWriteTextFormat,
+        max_width: f32,
+        max_height: f32,
+    ) -> TextMetrics {
         if text.is_empty() {
             return TextMetrics::default();
         }
 
         // Use Core Text if available (via proper CFAttributedString)
         unsafe {
-            if let (Some(create_line), Some(get_typographic_bounds), Some(create_attr_str), Some(create_dict)) = (
+            if let (
+                Some(create_line),
+                Some(get_typographic_bounds),
+                Some(create_attr_str),
+                Some(create_dict),
+            ) = (
                 self.ct_line_create_with_attributed_string,
                 self.ct_line_get_typographic_bounds,
                 self.cf_attributed_string_create,
@@ -674,7 +795,12 @@ impl DWriteFactory {
                                             let mut ascent: CGFloat = 0.0;
                                             let mut descent: CGFloat = 0.0;
                                             let mut leading: CGFloat = 0.0;
-                                            let width = get_typographic_bounds(line, &mut ascent, &mut descent, &mut leading);
+                                            let width = get_typographic_bounds(
+                                                line,
+                                                &mut ascent,
+                                                &mut descent,
+                                                &mut leading,
+                                            );
                                             let height = ascent + descent + leading;
                                             self.cf_release(line);
                                             self.cf_release(attr_str);
@@ -735,10 +861,19 @@ impl DWriteFactory {
 
     /// Enumerate the system font collection using Core Text.
     pub fn get_system_font_collection(&self) -> DWriteFontCollection {
-        let mut collection = DWriteFontCollection { families: Vec::new() };
+        let mut collection = DWriteFontCollection {
+            families: Vec::new(),
+        };
 
         unsafe {
-            if let (Some(create_collection), Some(matching_descriptors), Some(get_count), Some(get_value), Some(copy_attr), Some(create_string)) = (
+            if let (
+                Some(create_collection),
+                Some(matching_descriptors),
+                Some(get_count),
+                Some(get_value),
+                Some(copy_attr),
+                Some(create_string),
+            ) = (
                 self.ct_font_collection_create_from_available_fonts,
                 self.ct_font_collection_create_matching_font_descriptors,
                 self.cf_array_get_count,
@@ -795,19 +930,19 @@ impl DWriteFactory {
                             // Get font traits (weight, etc.)
                             let mut weight = DWRITE_FONT_WEIGHT_NORMAL;
                             let mut style = DWRITE_FONT_STYLE_NORMAL;
-                            let mut stretch = DWRITE_FONT_STRETCH_NORMAL;
+                            let stretch = DWRITE_FONT_STRETCH_NORMAL;
 
                             let traits_cf = copy_attr(desc, traits_key);
                             if !traits_cf.is_null() {
                                 // Try to extract weight from traits dictionary
-                                if let Some(get_value_fn) = self.cf_number_get_value {
+                                if let Some(_get_value_fn) = self.cf_number_get_value {
                                     let weight_key = create_string(
                                         std::ptr::null(),
                                         b"CTFontWeightTrait\0" as *const u8,
                                         KCFStringEncodingUTF8,
                                     );
                                     if !weight_key.is_null() {
-                                        let dict = traits_cf as CFDictionaryRef;
+                                        let _dict = traits_cf as CFDictionaryRef;
                                         // We'd need CFDictionaryGetValue, but for simplicity
                                         // we'll estimate from the font descriptor
                                         self.cf_release(weight_key);
@@ -911,24 +1046,214 @@ impl DWriteTextFormat {
 // ── DWriteTextLayout methods ────────────────────────────────────────────
 
 impl DWriteTextLayout {
-    /// Draw the text layout using Core Text (renders to a CGContext).
-    /// Since we don't have a real CGContext, this is a placeholder that
-    /// returns glyph position data for the software rasterizer.
-    pub fn draw(&self) -> Vec<(f32, f32, u16)> {
-        // Returns (x, y, glyph_index) for each glyph
-        let mut glyphs = Vec::new();
-        let mut i = 0;
-        for (char_idx, _) in self.text.char_indices() {
-            if i + 1 < self.glyph_positions.len() {
-                glyphs.push((
-                    self.glyph_positions[i],
-                    self.glyph_positions[i + 1],
-                    char_idx as u16,
-                ));
-                i += 2;
-            }
+    /// Draw the text layout using Core Text, rendering glyphs into a pixel
+    /// buffer via a Core Graphics bitmap context.
+    ///
+    /// Returns a [`RenderedGlyphs`] struct containing RGBA pixel data, or
+    /// `None` if Core Text is unavailable or rendering fails.
+    ///
+    /// # Safety
+    ///
+    /// `factory` must contain valid Core Text function pointers loaded via
+    /// `dlopen`. Passing a null or dangling factory is undefined behavior.
+    pub fn draw(&self, factory: &DWriteFactory) -> Option<RenderedGlyphs> {
+        // Determine the bitmap dimensions from metrics or fallback.
+        let width = (self.metrics.width.max(1.0)) as u32;
+        let height = (self.metrics.height.max(1.0)) as u32;
+        if width == 0 || height == 0 || self.text.is_empty() {
+            return Some(RenderedGlyphs {
+                pixels: vec![0u8; (width * height * 4) as usize],
+                width,
+                height,
+            });
         }
-        glyphs
+
+        // Attempt to render via Core Text.
+        unsafe {
+            let (
+                Some(create_font),
+                Some(create_line),
+                Some(get_image_bounds),
+                Some(create_attr_str),
+                Some(create_dict),
+                Some(ref release),
+            ) = (
+                factory.ct_font_create_with_name,
+                factory.ct_line_create_with_attributed_string,
+                factory.ct_line_get_image_bounds,
+                factory.cf_attributed_string_create,
+                factory.cf_dictionary_create,
+                factory.cf_release,
+            ) else {
+                // Fallback: return empty bitmap
+                return Some(RenderedGlyphs {
+                    pixels: vec![0u8; (width * height * 4) as usize],
+                    width,
+                    height,
+                });
+            };
+
+            // Load Core Graphics functions needed for bitmap rendering.
+            let cg_lib = libloading::Library::new(
+                "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics",
+            )
+            .ok()?;
+
+            type CGColorSpaceCreateDeviceRGBFn =
+                unsafe extern "C" fn() -> CGColorSpaceRef;
+            let color_space_sym: libloading::Symbol<CGColorSpaceCreateDeviceRGBFn> =
+                cg_lib.get(b"CGColorSpaceCreateDeviceRGB").ok()?;
+            let color_space = color_space_sym();
+            if color_space.is_null() {
+                return None;
+            }
+
+            type CGBitmapContextCreateFn = unsafe extern "C" fn(
+                data: *mut u8,
+                width: usize,
+                height: usize,
+                bits_per_component: usize,
+                bytes_per_row: usize,
+                space: CGColorSpaceRef,
+                bitmap_info: u32,
+            ) -> CGContextRef;
+            let bmp_ctx_sym: libloading::Symbol<CGBitmapContextCreateFn> =
+                cg_lib.get(b"CGBitmapContextCreate").ok()?;
+
+            type CGContextReleaseFn = unsafe extern "C" fn(ctx: CGContextRef);
+            let ctx_release_sym: libloading::Symbol<CGContextReleaseFn> =
+                cg_lib.get(b"CGContextRelease").ok()?;
+
+            type CGContextTranslateCTMFn =
+                unsafe extern "C" fn(ctx: CGContextRef, tx: CGFloat, ty: CGFloat);
+            let translate_sym: libloading::Symbol<CGContextTranslateCTMFn> =
+                cg_lib.get(b"CGContextTranslateCTM").ok()?;
+
+            type CGContextSetRGBFillColorFn = unsafe extern "C" fn(
+                ctx: CGContextRef,
+                r: CGFloat,
+                g: CGFloat,
+                b: CGFloat,
+                a: CGFloat,
+            );
+            let set_color_sym: libloading::Symbol<CGContextSetRGBFillColorFn> =
+                cg_lib.get(b"CGContextSetRGBFillColor").ok()?;
+
+            type CTLineDrawFn = unsafe extern "C" fn(line: CTLineRef, ctx: CGContextRef);
+            let line_draw_sym: libloading::Symbol<CTLineDrawFn> =
+                cg_lib.get(b"CTLineDraw").ok()?;
+
+            // SAFETY: All function pointers have been loaded from the system
+            // CoreGraphics framework which is always present on macOS.
+
+            // Build the attributed string using Core Text.
+            let cf_name = factory.cf_string_create(&self.format.font_family)?;
+            let font = create_font(cf_name, self.format.font_size as CGFloat, std::ptr::null());
+            if font.is_null() {
+                release(cf_name);
+                return None;
+            }
+
+            let cf_text = factory.cf_string_create(&self.text)?;
+            let attr_name = factory.cf_string_create(KCT_FONT_ATTRIBUTE_NAME)?;
+
+            let keys: [*const c_void; 1] = [attr_name as *const c_void];
+            let values: [*const c_void; 1] = [font as *const c_void];
+            let dict = create_dict(
+                std::ptr::null(),
+                keys.as_ptr(),
+                values.as_ptr(),
+                1,
+                std::ptr::null(),
+                std::ptr::null(),
+            );
+
+            if dict.is_null() {
+                release(cf_text);
+                release(attr_name);
+                release(font);
+                release(cf_name);
+                return None;
+            }
+
+            let attr_str = create_attr_str(std::ptr::null(), cf_text, dict);
+            if attr_str.is_null() {
+                release(dict);
+                release(cf_text);
+                release(attr_name);
+                release(font);
+                release(cf_name);
+                return None;
+            }
+
+            let line = create_line(attr_str);
+            if line.is_null() {
+                release(attr_str);
+                release(dict);
+                release(cf_text);
+                release(attr_name);
+                release(font);
+                release(cf_name);
+                return None;
+            }
+
+            // Get the typographic bounds to determine the image size.
+            let bounds = get_image_bounds(line, std::ptr::null());
+
+            // Compute pixel dimensions from bounds, with a minimum of 1x1.
+            let bmp_w = (bounds.size.width.ceil().max(1.0)) as u32;
+            let bmp_h = (bounds.size.height.ceil().max(1.0)) as u32;
+
+            // Allocate the pixel buffer.
+            let row_bytes = bmp_w * 4;
+            let buf_size = (row_bytes * bmp_h) as usize;
+            let mut pixel_buf: Vec<u8> = vec![0u8; buf_size];
+
+            // Create the bitmap context.
+            let ctx = bmp_ctx_sym(
+                pixel_buf.as_mut_ptr(),
+                bmp_w as usize,
+                bmp_h as usize,
+                8, // bits per component
+                row_bytes as usize,
+                color_space,
+                1u32, // kCGImageAlphaPremultipliedFirst
+            );
+
+            if ctx.is_null() {
+                release(line);
+                release(attr_str);
+                release(dict);
+                release(cf_text);
+                release(attr_name);
+                release(font);
+                release(cf_name);
+                return None;
+            }
+
+            // Set white fill color and translate so the text renders at origin.
+            set_color_sym(ctx, 1.0, 1.0, 1.0, 1.0);
+            translate_sym(ctx, -bounds.origin.x, -bounds.origin.y);
+            line_draw_sym(line, ctx);
+
+            // Release the CGContext.
+            ctx_release_sym(ctx);
+
+            // Release Core Foundation objects.
+            release(line);
+            release(attr_str);
+            release(dict);
+            release(cf_text);
+            release(attr_name);
+            release(font);
+            release(cf_name);
+
+            return Some(RenderedGlyphs {
+                pixels: pixel_buf,
+                width: bmp_w,
+                height: bmp_h,
+            });
+        }
     }
 
     pub fn get_metrics(&self) -> TextMetrics {
@@ -936,15 +1261,126 @@ impl DWriteTextLayout {
     }
 
     pub fn get_overhang_metrics(&self) -> OverhangMetrics {
-        OverhangMetrics::default()
+        // Compute overhang from glyph positions relative to the layout metrics.
+        // Overhang measures how far glyphs extend beyond the formatted area.
+        let mut min_x = f32::MAX;
+        let mut min_y = f32::MAX;
+        let mut max_x = f32::MIN;
+        let mut max_y = f32::MIN;
+        let glyph_count = self.glyph_positions.len() / 2;
+        for i in 0..glyph_count {
+            let gx = self.glyph_positions[i * 2];
+            let gy = self.glyph_positions[i * 2 + 1];
+            min_x = min_x.min(gx);
+            min_y = min_y.min(gy);
+            max_x = max_x.max(gx);
+            max_y = max_y.max(gy);
+        }
+        if glyph_count == 0 {
+            return OverhangMetrics::default();
+        }
+        // The glyph bounding box extends from (min_x, min_y) to roughly
+        // (max_x + char_advance, max_y + line_height). Use font size as
+        // approximate char advance and line height.
+        let char_advance = self.format.font_size * 0.6;
+        let line_height = self.format.font_size * 1.2;
+        OverhangMetrics {
+            left: if min_x < 0.0 { -min_x } else { 0.0 },
+            top: if min_y < 0.0 { -min_y } else { 0.0 },
+            right: if max_x + char_advance > self.metrics.width {
+                (max_x + char_advance) - self.metrics.width
+            } else {
+                0.0
+            },
+            bottom: if max_y + line_height > self.metrics.height {
+                (max_y + line_height) - self.metrics.height
+            } else {
+                0.0
+            },
+        }
     }
 
-    pub fn hit_test_point(&self, _point_x: f32, _point_y: f32) -> Option<HitTestResult> {
-        None
+    pub fn hit_test_point(&self, point_x: f32, point_y: f32) -> Option<HitTestResult> {
+        // Find the glyph whose bounding box contains the point.
+        // Each glyph occupies a rectangle from (gx, gy) to
+        // (gx + char_advance, gy + line_height).
+        let glyph_count = self.glyph_positions.len() / 2;
+        if glyph_count == 0 {
+            return None;
+        }
+        let char_advance = self.format.font_size * 0.6;
+        let line_height = self.format.font_size * 1.2;
+        let mut best_idx = 0usize;
+        let mut best_dist = f32::MAX;
+        let mut is_trailing = false;
+        for i in 0..glyph_count {
+            let gx = self.glyph_positions[i * 2];
+            let gy = self.glyph_positions[i * 2 + 1];
+            // Check if point is within this glyph's bounding box
+            if point_x >= gx
+                && point_x < gx + char_advance
+                && point_y >= gy
+                && point_y < gy + line_height
+            {
+                // Point is inside this glyph. Determine trailing hit.
+                let glyph_center_x = gx + char_advance * 0.5;
+                is_trailing = point_x > glyph_center_x;
+                best_idx = i;
+                break;
+            }
+            // Compute distance to glyph center for nearest match
+            let cx = gx + char_advance * 0.5;
+            let cy = gy + line_height * 0.5;
+            let dist = (point_x - cx).powi(2) + (point_y - cy).powi(2);
+            if dist < best_dist {
+                best_dist = dist;
+                best_idx = i;
+                is_trailing = point_x > (gx + char_advance * 0.5);
+            }
+        }
+        let gx = self.glyph_positions[best_idx * 2];
+        let gy = self.glyph_positions[best_idx * 2 + 1];
+        Some(HitTestResult {
+            is_text: true,
+            is_trailing_hit: is_trailing,
+            point: CGPoint {
+                x: point_x as CGFloat,
+                y: point_y as CGFloat,
+            },
+            metrics: HitTestMetrics {
+                width: char_advance,
+                height: line_height,
+                x: gx,
+                y: gy,
+            },
+        })
     }
 
-    pub fn hit_test_text_position(&self, _text_position: u32) -> Option<HitTestResult> {
-        None
+    pub fn hit_test_text_position(&self, text_position: u32) -> Option<HitTestResult> {
+        // Map a text position (character index) to a screen location.
+        let glyph_count = self.glyph_positions.len() / 2;
+        if glyph_count == 0 || self.text.is_empty() {
+            return None;
+        }
+        let idx = (text_position as usize).min(glyph_count - 1);
+        let gx = self.glyph_positions[idx * 2];
+        let gy = self.glyph_positions[idx * 2 + 1];
+        let char_advance = self.format.font_size * 0.6;
+        let line_height = self.format.font_size * 1.2;
+        Some(HitTestResult {
+            is_text: true,
+            is_trailing_hit: false,
+            point: CGPoint {
+                x: gx as CGFloat,
+                y: gy as CGFloat,
+            },
+            metrics: HitTestMetrics {
+                width: char_advance,
+                height: line_height,
+                x: gx,
+                y: gy,
+            },
+        })
     }
 }
 
@@ -1014,10 +1450,16 @@ mod tests {
         assert_eq!(format.text_alignment, DWRITE_TEXT_ALIGNMENT_CENTER);
 
         format.set_paragraph_alignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-        assert_eq!(format.paragraph_alignment, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        assert_eq!(
+            format.paragraph_alignment,
+            DWRITE_PARAGRAPH_ALIGNMENT_CENTER
+        );
 
         format.set_reading_direction(DWRITE_READING_DIRECTION_RIGHT_TO_LEFT);
-        assert_eq!(format.reading_direction, DWRITE_READING_DIRECTION_RIGHT_TO_LEFT);
+        assert_eq!(
+            format.reading_direction,
+            DWRITE_READING_DIRECTION_RIGHT_TO_LEFT
+        );
 
         format.set_word_wrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
         assert_eq!(format.word_wrapping, DWRITE_WORD_WRAPPING_NO_WRAP);

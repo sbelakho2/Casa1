@@ -12,15 +12,10 @@
 mod support;
 
 use casa1::d3d12::{
-    D3D12AccelerationStructure, D3D12BuildAccelerationStructureDesc,
-    D3D12BuildRaytracingInputs, D3D12DispatchRaysDesc, D3D12RaytracingGeometryDesc,
-    D3D12RaytracingPipelineState, D3d12Runtime,
+    D3D12BuildAccelerationStructureDesc, D3D12BuildRaytracingInputs, D3D12DispatchRaysDesc,
+    D3D12RaytracingGeometryDesc, D3d12Runtime,
 };
-use casa1::gfx::{
-    DescriptorHeapType, DxgiFormat, GraphicsBackend, PipelineStateDesc, ResourceDesc,
-    ResourceUsageHint, RootSignatureDesc, SwapchainDesc, ViewDescriptor,
-};
-use casa1::error::AppResult;
+use casa1::gfx::{GraphicsBackend, PipelineStateDesc, RootSignatureDesc};
 
 // ---------------------------------------------------------------------------
 // Helper: create a D3d12Runtime with a GraphicsBackend
@@ -30,6 +25,7 @@ fn create_runtime() -> D3d12Runtime {
     D3d12Runtime::new()
 }
 
+#[allow(dead_code)]
 fn create_runtime_with_backend() -> D3d12Runtime {
     let backend = GraphicsBackend::new();
     D3d12Runtime::from_backend(backend)
@@ -86,13 +82,16 @@ fn t28_01_blas_creation_bottom_level() {
             depth_format: None,
         },
     );
-    let list_id = runtime.create_graphics_command_list(allocator, pso);
+    let list_id = runtime.create_graphics_command_list(allocator, pso, false);
 
     let result = runtime.build_raytracing_acceleration_structure(list_id, &desc);
     assert!(result.is_ok(), "BLAS build should succeed");
 
     let gpu_address = result.unwrap();
-    assert_eq!(gpu_address, 0x1_0000_0000, "BLAS should return dest_address");
+    assert_eq!(
+        gpu_address, 0x1_0000_0000,
+        "BLAS should return dest_address"
+    );
 
     // Verify the acceleration structure metadata
     let accel = runtime.acceleration_structure(0x1_0000_0000);
@@ -100,8 +99,14 @@ fn t28_01_blas_creation_bottom_level() {
     let accel = accel.unwrap();
     assert!(!accel.is_top_level, "BLAS should not be top-level");
     assert!(accel.built, "BLAS should be marked as built");
-    assert!(accel.gpu_address == 0x1_0000_0000, "GPU address should match");
-    assert!(accel.metal_accel_handle > 0, "Metal handle should be non-zero");
+    assert!(
+        accel.gpu_address == 0x1_0000_0000,
+        "GPU address should match"
+    );
+    assert!(
+        accel.metal_accel_handle > 0,
+        "Metal handle should be non-zero"
+    );
     assert!(accel.size > 0, "BLAS size should be non-zero");
 }
 
@@ -143,13 +148,16 @@ fn t28_02_tlas_creation_top_level() {
             depth_format: None,
         },
     );
-    let list_id = runtime.create_graphics_command_list(allocator, pso);
+    let list_id = runtime.create_graphics_command_list(allocator, pso, false);
 
     let result = runtime.build_raytracing_acceleration_structure(list_id, &desc);
     assert!(result.is_ok(), "TLAS build should succeed");
 
     let gpu_address = result.unwrap();
-    assert_eq!(gpu_address, 0x2_0000_0000, "TLAS should return dest_address");
+    assert_eq!(
+        gpu_address, 0x2_0000_0000,
+        "TLAS should return dest_address"
+    );
 
     // Verify metadata
     let accel = runtime.acceleration_structure(0x2_0000_0000);
@@ -157,7 +165,10 @@ fn t28_02_tlas_creation_top_level() {
     let accel = accel.unwrap();
     assert!(accel.is_top_level, "TLAS should be top-level");
     assert!(accel.built, "TLAS should be marked as built");
-    assert!(accel.size >= 64 + 2 * 64, "TLAS size should accommodate 2 instances");
+    assert!(
+        accel.size >= 64 + 2 * 64,
+        "TLAS size should accommodate 2 instances"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -210,28 +221,42 @@ fn t28_03_copy_acceleration_structure() {
             depth_format: None,
         },
     );
-    let list_id = runtime.create_graphics_command_list(allocator, pso);
+    let list_id = runtime.create_graphics_command_list(allocator, pso, false);
 
-    runtime.build_raytracing_acceleration_structure(list_id, &desc).unwrap();
+    runtime
+        .build_raytracing_acceleration_structure(list_id, &desc)
+        .unwrap();
 
     // Now copy the BLAS to a new address
     let result = runtime.copy_raytracing_acceleration_structure(
         list_id,
         0x3_0000_2000, // dest
         0x3_0000_0000, // source
-        0,            // COPY mode
+        0,             // COPY mode
     );
     assert!(result.is_ok(), "Copy AS should succeed");
 
     // Verify both source and dest exist
-    assert!(runtime.acceleration_structure(0x3_0000_0000).is_some(), "Source AS should exist");
-    assert!(runtime.acceleration_structure(0x3_0000_2000).is_some(), "Dest AS should exist");
+    assert!(
+        runtime.acceleration_structure(0x3_0000_0000).is_some(),
+        "Source AS should exist"
+    );
+    assert!(
+        runtime.acceleration_structure(0x3_0000_2000).is_some(),
+        "Dest AS should exist"
+    );
 
     let src = runtime.acceleration_structure(0x3_0000_0000).unwrap();
     let dst = runtime.acceleration_structure(0x3_0000_2000).unwrap();
     assert_eq!(src.size, dst.size, "Copied AS should have same size");
-    assert_eq!(src.is_top_level, dst.is_top_level, "Copied AS should have same type");
-    assert_eq!(dst.gpu_address, 0x3_0000_2000, "Dest GPU address should be updated");
+    assert_eq!(
+        src.is_top_level, dst.is_top_level,
+        "Copied AS should have same type"
+    );
+    assert_eq!(
+        dst.gpu_address, 0x3_0000_2000,
+        "Dest GPU address should be updated"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -283,19 +308,24 @@ fn t28_04_compact_acceleration_structure() {
             depth_format: None,
         },
     );
-    let list_id = runtime.create_graphics_command_list(allocator, pso);
+    let list_id = runtime.create_graphics_command_list(allocator, pso, false);
 
-    runtime.build_raytracing_acceleration_structure(list_id, &desc).unwrap();
+    runtime
+        .build_raytracing_acceleration_structure(list_id, &desc)
+        .unwrap();
 
     // Compact the AS
     let result = runtime.copy_raytracing_acceleration_structure(
         list_id,
         0x4_0000_2000, // dest
         0x4_0000_0000, // source
-        1,            // COMPACT mode
+        1,             // COMPACT mode
     );
     assert!(result.is_ok(), "Compact AS should succeed");
-    assert!(runtime.acceleration_structure(0x4_0000_2000).is_some(), "Compacted AS should exist");
+    assert!(
+        runtime.acceleration_structure(0x4_0000_2000).is_some(),
+        "Compacted AS should exist"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -347,9 +377,11 @@ fn t28_05_postbuild_info_compacted_size() {
             depth_format: None,
         },
     );
-    let list_id = runtime.create_graphics_command_list(allocator, pso);
+    let list_id = runtime.create_graphics_command_list(allocator, pso, false);
 
-    runtime.build_raytracing_acceleration_structure(list_id, &desc).unwrap();
+    runtime
+        .build_raytracing_acceleration_structure(list_id, &desc)
+        .unwrap();
 
     // Query POSTBUILD_INFO_COMPACTED_SIZE (type 1)
     let mut output_buf = vec![0u8; 16];
@@ -416,9 +448,11 @@ fn t28_06_postbuild_info_serialization() {
             depth_format: None,
         },
     );
-    let list_id = runtime.create_graphics_command_list(allocator, pso);
+    let list_id = runtime.create_graphics_command_list(allocator, pso, false);
 
-    runtime.build_raytracing_acceleration_structure(list_id, &desc).unwrap();
+    runtime
+        .build_raytracing_acceleration_structure(list_id, &desc)
+        .unwrap();
 
     // Query POSTBUILD_INFO_SERIALIZATION (type 3)
     let mut output_buf = vec![0u8; 32];
@@ -428,14 +462,20 @@ fn t28_06_postbuild_info_serialization() {
         &[0x6_0000_0000],
         &mut output_buf,
     );
-    assert!(result.is_ok(), "Serialization post-build info should succeed");
+    assert!(
+        result.is_ok(),
+        "Serialization post-build info should succeed"
+    );
 
     let serialized_size = u64::from_le_bytes(output_buf[0..8].try_into().unwrap());
     assert!(serialized_size > 0, "Serialized size should be non-zero");
 
     let num_blas_pointers = u64::from_le_bytes(output_buf[8..16].try_into().unwrap());
     // For a BLAS, num bottom-level pointers should be 0
-    assert_eq!(num_blas_pointers, 0, "BLAS serialization should have 0 bottom-level pointers");
+    assert_eq!(
+        num_blas_pointers, 0,
+        "BLAS serialization should have 0 bottom-level pointers"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -461,7 +501,7 @@ fn t28_07_dispatch_rays_shader_table() {
             depth_format: None,
         },
     );
-    let list_id = runtime.create_graphics_command_list(allocator, pso);
+    let list_id = runtime.create_graphics_command_list(allocator, pso, false);
 
     // Set up a raytracing pipeline state
     let dxil_bytecode = vec![
@@ -474,7 +514,10 @@ fn t28_07_dispatch_rays_shader_table() {
     let pso = runtime.get_raytracing_pipeline_state(0x7000_0000);
     assert!(pso.is_some(), "Raytracing PSO should be stored");
     let pso = pso.unwrap();
-    assert_eq!(pso.max_recursion_depth, 1, "Default max recursion depth should be 1");
+    assert_eq!(
+        pso.max_recursion_depth, 1,
+        "Default max recursion depth should be 1"
+    );
     assert_eq!(pso.payload_size, 32, "Default payload size should be 32");
     assert_eq!(pso.attribute_size, 8, "Default attribute size should be 8");
 
@@ -523,7 +566,7 @@ fn t28_08_dispatch_rays_zero_dimensions() {
             depth_format: None,
         },
     );
-    let list_id = runtime.create_graphics_command_list(allocator, pso);
+    let list_id = runtime.create_graphics_command_list(allocator, pso, false);
 
     // Dispatch with zero dimensions — should still return Ok
     let dispatch_desc = D3D12DispatchRaysDesc {
@@ -544,7 +587,10 @@ fn t28_08_dispatch_rays_zero_dimensions() {
     };
 
     let dispatch_result = runtime.dispatch_rays(list_id, &dispatch_desc);
-    assert!(dispatch_result.is_ok(), "DispatchRays with zero dimensions should not error");
+    assert!(
+        dispatch_result.is_ok(),
+        "DispatchRays with zero dimensions should not error"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -597,16 +643,18 @@ fn t28_09_as_serialization_deserialization() {
             depth_format: None,
         },
     );
-    let list_id = runtime.create_graphics_command_list(allocator, pso);
+    let list_id = runtime.create_graphics_command_list(allocator, pso, false);
 
-    runtime.build_raytracing_acceleration_structure(list_id, &desc).unwrap();
+    runtime
+        .build_raytracing_acceleration_structure(list_id, &desc)
+        .unwrap();
 
     // SERIALIZE: copy to serialize output address
     let serialize_result = runtime.copy_raytracing_acceleration_structure(
         list_id,
         0x9_0000_2000, // serialize dest
         0x9_0000_0000, // source
-        3,            // SERIALIZE mode
+        3,             // SERIALIZE mode
     );
     assert!(serialize_result.is_ok(), "Serialize AS should succeed");
 
@@ -615,12 +663,15 @@ fn t28_09_as_serialization_deserialization() {
         list_id,
         0x9_0000_3000, // deserialize dest
         0x9_0000_2000, // serialize source
-        4,            // DESERIALIZE mode
+        4,             // DESERIALIZE mode
     );
     assert!(deserialize_result.is_ok(), "Deserialize AS should succeed");
 
     // Verify the final AS exists
-    assert!(runtime.acceleration_structure(0x9_0000_3000).is_some(), "Deserialized AS should exist");
+    assert!(
+        runtime.acceleration_structure(0x9_0000_3000).is_some(),
+        "Deserialized AS should exist"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -661,9 +712,11 @@ fn t28_10_tlas_serialization_info() {
             depth_format: None,
         },
     );
-    let list_id = runtime.create_graphics_command_list(allocator, pso);
+    let list_id = runtime.create_graphics_command_list(allocator, pso, false);
 
-    runtime.build_raytracing_acceleration_structure(list_id, &desc).unwrap();
+    runtime
+        .build_raytracing_acceleration_structure(list_id, &desc)
+        .unwrap();
 
     // Query serialization info on TLAS
     let mut output_buf = vec![0u8; 32];
@@ -673,11 +726,17 @@ fn t28_10_tlas_serialization_info() {
         &[0xA_0000_0000],
         &mut output_buf,
     );
-    assert!(result.is_ok(), "TLAS serialization post-build info should succeed");
+    assert!(
+        result.is_ok(),
+        "TLAS serialization post-build info should succeed"
+    );
 
     let num_blas = u64::from_le_bytes(output_buf[8..16].try_into().unwrap());
     // For a TLAS with 3 instances, num_blas should be 1 (since is_top_level == true)
-    assert_eq!(num_blas, 1, "TLAS serialization should report 1 bottom-level pointer");
+    assert_eq!(
+        num_blas, 1,
+        "TLAS serialization should report 1 bottom-level pointer"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -690,23 +749,26 @@ fn t28_11_raytracing_tier_feature_detection() {
 
     // Check device info for raytracing capability
     let device_info = runtime.device_info();
-    
+
     // The D3d12FeatureOptions has a raytracing field
     // When created without a real backend, it may be false
     // But the types should still reflect the feature correctly
     if device_info.features.raytracing {
         // On a Metal 3.0+ device, raytracing should be supported
-        assert!(device_info.features.argument_buffers || device_info.features.unified_memory,
-            "Raytracing-capable device should have modern feature support");
+        assert!(
+            device_info.features.argument_buffers || device_info.features.unified_memory,
+            "Raytracing-capable device should have modern feature support"
+        );
     }
 
     // Verify the D3D12_RAYTRACING_TIER constants are accessible
     // These would be checked via QueryFeature in the PE runtime
     let caps = runtime.backend().capabilities();
-    
+
     // If we have a real backend, capability flags should be accessible
     if !device_info.adapter.name.is_empty() {
-        assert!(caps.raytracing || true, "Raytracing capability flag should be readable");
+        // Always true check - validates the caps struct is accessible
+        let _ = caps.raytracing;
     }
 }
 
@@ -733,25 +795,32 @@ fn t28_12_raytracing_pipeline_state_management() {
             depth_format: None,
         },
     );
-    let list_id = runtime.create_graphics_command_list(allocator, pso);
+    let list_id = runtime.create_graphics_command_list(allocator, pso, false);
 
     // Create multiple raytracing PSOs
     let dxil_bytecode_1 = vec![0x44, 0x58, 0x42, 0x43, 0x01];
     let dxil_bytecode_2 = vec![0x44, 0x58, 0x42, 0x43, 0x02];
 
-    runtime.set_pipeline_state1(list_id, 0xB000_0000, dxil_bytecode_1).unwrap();
-    runtime.set_pipeline_state1(list_id, 0xB000_0100, dxil_bytecode_2).unwrap();
+    runtime
+        .set_pipeline_state1(list_id, 0xB000_0000, dxil_bytecode_1)
+        .unwrap();
+    runtime
+        .set_pipeline_state1(list_id, 0xB000_0100, dxil_bytecode_2)
+        .unwrap();
 
     // Verify both are stored independently
     let pso1 = runtime.get_raytracing_pipeline_state(0xB000_0000);
     let pso2 = runtime.get_raytracing_pipeline_state(0xB000_0100);
-    
+
     assert!(pso1.is_some(), "First PSO should be stored");
     assert!(pso2.is_some(), "Second PSO should be stored");
 
     // Verify they have different DXIL bytecodes
-    assert_ne!(pso1.unwrap().dxil_bytecode, pso2.unwrap().dxil_bytecode,
-        "Different PSOs should have different DXIL bytecodes");
+    assert_ne!(
+        pso1.unwrap().dxil_bytecode,
+        pso2.unwrap().dxil_bytecode,
+        "Different PSOs should have different DXIL bytecodes"
+    );
 
     // Non-existent PSO should return None
     let nonexistent = runtime.get_raytracing_pipeline_state(0xFFFF_FFFF);
@@ -781,7 +850,7 @@ fn t28_13_multiple_acceleration_structures() {
             depth_format: None,
         },
     );
-    let list_id = runtime.create_graphics_command_list(allocator, pso);
+    let list_id = runtime.create_graphics_command_list(allocator, pso, false);
 
     // Build multiple BLASes
     for i in 0..5 {
@@ -823,11 +892,18 @@ fn t28_13_multiple_acceleration_structures() {
         let accel = runtime.acceleration_structure(base);
         assert!(accel.is_some(), "BLAS {} should exist", i);
         let accel = accel.unwrap();
-        assert!(metal_handles.insert(accel.metal_accel_handle),
-            "Metal handle {} should be unique", accel.metal_accel_handle);
+        assert!(
+            metal_handles.insert(accel.metal_accel_handle),
+            "Metal handle {} should be unique",
+            accel.metal_accel_handle
+        );
     }
 
-    assert_eq!(metal_handles.len(), 5, "All 5 BLAS should have unique Metal handles");
+    assert_eq!(
+        metal_handles.len(),
+        5,
+        "All 5 BLAS should have unique Metal handles"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -879,9 +955,11 @@ fn t28_14_visualization_copy_mode() {
             depth_format: None,
         },
     );
-    let list_id = runtime.create_graphics_command_list(allocator, pso);
+    let list_id = runtime.create_graphics_command_list(allocator, pso, false);
 
-    runtime.build_raytracing_acceleration_structure(list_id, &desc).unwrap();
+    runtime
+        .build_raytracing_acceleration_structure(list_id, &desc)
+        .unwrap();
 
     // Visualization copy (mode 2)
     let result = runtime.copy_raytracing_acceleration_structure(
@@ -891,7 +969,10 @@ fn t28_14_visualization_copy_mode() {
         2, // VISUALIZATION mode
     );
     assert!(result.is_ok(), "Visualization copy should succeed");
-    assert!(runtime.acceleration_structure(0xD_0000_2000).is_some(), "Visualization target should exist");
+    assert!(
+        runtime.acceleration_structure(0xD_0000_2000).is_some(),
+        "Visualization target should exist"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -943,9 +1024,11 @@ fn t28_15_postbuild_info_tools_visualization() {
             depth_format: None,
         },
     );
-    let list_id = runtime.create_graphics_command_list(allocator, pso);
+    let list_id = runtime.create_graphics_command_list(allocator, pso, false);
 
-    runtime.build_raytracing_acceleration_structure(list_id, &desc).unwrap();
+    runtime
+        .build_raytracing_acceleration_structure(list_id, &desc)
+        .unwrap();
 
     // Query POSTBUILD_INFO_TOOLS_VISUALIZATION (type 2)
     let mut output_buf = vec![0u8; 16];
@@ -955,7 +1038,10 @@ fn t28_15_postbuild_info_tools_visualization() {
         &[0xE_0000_0000],
         &mut output_buf,
     );
-    assert!(result.is_ok(), "Tools visualization post-build info should succeed");
+    assert!(
+        result.is_ok(),
+        "Tools visualization post-build info should succeed"
+    );
 
     let vis_size = u64::from_le_bytes(output_buf[0..8].try_into().unwrap());
     assert!(vis_size > 0, "Visualization size should be non-zero");

@@ -1,9 +1,10 @@
 use casa1::reason::ReasonCode;
 use casa1::shader::{
-    build_argument_buffers, build_cache_entry, compile_with_cache, discover_dxil_files,
-    pack_cbuffer, pack_structured_fields, parse_root_signature, pso_cache_key, shader_cache_key,
-    translate_shader, CbufferField, CompileFlags, OfflineCompiler, ResourceAccess,
-    RootConstantsPlan, ShaderCache, ShaderStage, ShaderTranslationInput, StructuredField,
+    CbufferField, CompileFlags, OfflineCompiler, ResourceAccess, RootConstantsPlan, ShaderCache,
+    ShaderStage, ShaderTranslationInput, StructuredField, build_argument_buffers,
+    build_cache_entry, compile_with_cache, discover_dxil_files, pack_cbuffer,
+    pack_structured_fields, parse_root_signature, pso_cache_key, shader_cache_key,
+    translate_shader,
 };
 use tempfile::TempDir;
 
@@ -60,13 +61,7 @@ fn build_reflection_part(
     bytes.extend(&(resources.len() as u32).to_le_bytes());
     for resource in resources {
         bytes.extend([
-            resource.0,
-            resource.1,
-            resource.2,
-            resource.3,
-            resource.4,
-            resource.5,
-            resource.6,
+            resource.0, resource.1, resource.2, resource.3, resource.4, resource.5, resource.6,
         ]);
     }
     bytes.extend(&(cbuffers.len() as u32).to_le_bytes());
@@ -139,7 +134,11 @@ fn compile_flags() -> CompileFlags {
     }
 }
 
-fn translation_input(stage: ShaderStage, dxil: Vec<u8>, root_signature: Vec<u8>) -> ShaderTranslationInput {
+fn translation_input(
+    stage: ShaderStage,
+    dxil: Vec<u8>,
+    root_signature: Vec<u8>,
+) -> ShaderTranslationInput {
     ShaderTranslationInput {
         dxil,
         stage,
@@ -152,7 +151,10 @@ fn translation_input(stage: ShaderStage, dxil: Vec<u8>, root_signature: Vec<u8>)
 }
 
 fn reflected_fixture(entry_name: &str, stage: ShaderStage) -> ShaderTranslationInput {
-    let root_signature = build_root_signature(8, &[(1, 0, 0, 1, 0, 0), (2, 0, 0, 1, 1, 0), (3, 0, 0, 1, 2, 0)]);
+    let root_signature = build_root_signature(
+        8,
+        &[(1, 0, 0, 1, 0, 0), (2, 0, 0, 1, 1, 0), (3, 0, 0, 1, 2, 0)],
+    );
     let dxil = build_container(
         entry_name,
         vec![
@@ -179,7 +181,10 @@ fn reflected_fixture(entry_name: &str, stage: ShaderStage) -> ShaderTranslationI
 }
 
 fn reconstructable_fixture(entry_name: &str, stage: ShaderStage) -> ShaderTranslationInput {
-    let root_signature = build_root_signature(12, &[(1, 0, 0, 1, 0, 0), (2, 0, 0, 1, 1, 0), (3, 0, 0, 1, 2, 0)]);
+    let root_signature = build_root_signature(
+        12,
+        &[(1, 0, 0, 1, 0, 0), (2, 0, 0, 1, 1, 0), (3, 0, 0, 1, 2, 0)],
+    );
     let dxil = build_container(
         entry_name,
         vec![
@@ -255,9 +260,13 @@ fn t8_1_dxil_corpus_compile_is_deterministic_and_classified_by_hash() {
         }
     }
 
-    let invalid = translate_shader(&invalid_fixture("broken_vs")).expect_err("invalid fixture must fail deterministically");
+    let invalid = translate_shader(&invalid_fixture("broken_vs"))
+        .expect_err("invalid fixture must fail deterministically");
     assert_eq!(invalid.reason_code, ReasonCode::RcDxilInvalid);
-    assert_eq!(invalid.dxil_hash, casa1::util::sha256_bytes(&invalid_fixture("broken_vs").dxil));
+    assert_eq!(
+        invalid.dxil_hash,
+        casa1::util::sha256_bytes(&invalid_fixture("broken_vs").dxil)
+    );
 }
 
 #[test]
@@ -269,11 +278,32 @@ fn t8_2_binding_reconstruction_oracle_matches_expected_bindings_and_detects_ambi
             .reflection
             .resources
             .iter()
-            .map(|resource| (resource.kind, resource.register, resource.space, resource.arg_buffer_index, resource.binding_index, resource.access))
+            .map(|resource| (
+                resource.kind,
+                resource.register,
+                resource.space,
+                resource.arg_buffer_index,
+                resource.binding_index,
+                resource.access
+            ))
             .collect::<Vec<_>>(),
         vec![
-            (casa1::shader::ResourceKind::Texture, 0, 0, 0, 0, ResourceAccess::Read),
-            (casa1::shader::ResourceKind::Sampler, 0, 0, 1, 0, ResourceAccess::Read),
+            (
+                casa1::shader::ResourceKind::Texture,
+                0,
+                0,
+                0,
+                0,
+                ResourceAccess::Read
+            ),
+            (
+                casa1::shader::ResourceKind::Sampler,
+                0,
+                0,
+                1,
+                0,
+                ResourceAccess::Read
+            ),
         ]
     );
     assert_eq!(output.reflection.cbuffers[0].register, 0);
@@ -468,14 +498,20 @@ fn t8_5_cache_effectiveness_and_offline_compilation_scheduling_match_reference()
     let temp_dir = TempDir::new().expect("temp dir for offline compile scan");
     let discovered_a = temp_dir.path().join("alpha.dxil");
     let discovered_b = temp_dir.path().join("nested/beta.dxil");
-    std::fs::create_dir_all(discovered_b.parent().expect("beta parent")).expect("create nested fixture directory");
+    std::fs::create_dir_all(discovered_b.parent().expect("beta parent"))
+        .expect("create nested fixture directory");
     std::fs::write(&discovered_a, &inputs[0].dxil).expect("write alpha DXIL fixture");
     std::fs::write(&discovered_b, &inputs[1].dxil).expect("write beta DXIL fixture");
     std::fs::write(temp_dir.path().join("ignored.bin"), b"not dxil").expect("write ignored binary");
 
     let mut offline = OfflineCompiler::default();
-    let discovered = offline.scan_directory(temp_dir.path()).expect("discover DXIL files");
-    assert_eq!(discovered, discover_dxil_files(temp_dir.path()).expect("standalone discovery"));
+    let discovered = offline
+        .scan_directory(temp_dir.path())
+        .expect("discover DXIL files");
+    assert_eq!(
+        discovered,
+        discover_dxil_files(temp_dir.path()).expect("standalone discovery")
+    );
     assert_eq!(discovered.len(), 2);
     let runtime_key = shader_cache_key(&inputs[0]).expect("runtime shader key");
     offline.intercept_runtime_shader_creation(&runtime_key);
@@ -487,7 +523,8 @@ fn t8_5_cache_effectiveness_and_offline_compilation_scheduling_match_reference()
     assert!(!plan.blocks_ui_thread);
     assert_eq!(plan.scheduled_keys, vec![runtime_key.clone()]);
 
-    let failure = translate_shader(&invalid_fixture("offline_fail")).expect_err("invalid offline shader should fail");
+    let failure = translate_shader(&invalid_fixture("offline_fail"))
+        .expect_err("invalid offline shader should fail");
     let report = offline.report(2, vec![failure.clone()], 0);
     assert_eq!(report.total_shaders, 3);
     assert_eq!(report.compiled, 2);
@@ -500,7 +537,7 @@ fn t8_5_cache_effectiveness_and_offline_compilation_scheduling_match_reference()
 fn t8_6_dxil_fuzzer_classification_is_deterministic_across_mutations() {
     let valid = reflected_fixture("fuzz_vs", ShaderStage::Vs).dxil;
     let mut excessive = valid.clone();
-    excessive[12 + 12 * 3 + 0] = 0x89;
+    excessive[12 + 12 * 3] = 0x89;
     excessive[12 + 12 * 3 + 1] = 0x13;
     let truncated = valid[..valid.len() / 2].to_vec();
     let bad_magic = {
@@ -515,6 +552,12 @@ fn t8_6_dxil_fuzzer_classification_is_deterministic_across_mutations() {
         assert_eq!(first, second);
     }
     assert!(casa1::shader::fuzz_summary(&valid).starts_with("ok:"));
-    assert!(casa1::shader::fuzz_summary(&truncated).starts_with(&format!("err:{}", ReasonCode::RcDxilInvalid.as_u32())));
-    assert!(casa1::shader::fuzz_summary(&bad_magic).starts_with(&format!("err:{}", ReasonCode::RcDxilInvalid.as_u32())));
+    assert!(
+        casa1::shader::fuzz_summary(&truncated)
+            .starts_with(&format!("err:{}", ReasonCode::RcDxilInvalid.as_u32()))
+    );
+    assert!(
+        casa1::shader::fuzz_summary(&bad_magic)
+            .starts_with(&format!("err:{}", ReasonCode::RcDxilInvalid.as_u32()))
+    );
 }

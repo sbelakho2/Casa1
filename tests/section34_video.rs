@@ -5,17 +5,13 @@
 //!   - P4.2: Media Foundation Pipeline (session state machine, topology, event generation)
 
 use casa1::media::{
-    create_media_session, create_media_session_with_flags,
-    MfEventQueue, MfMediaSession, MfSessionState,
-    MediaEvent, MediaEventType,
-    Topology, TopologyNodeType, TopologyLoader,
+    MediaEvent, MediaEventType, MfEventQueue, MfMediaSession, MfSessionState, Topology,
+    TopologyLoader, TopologyNodeType, create_media_session, create_media_session_with_flags,
 };
 use casa1::video_decoder::{
-    ColorSpace, MetalTextureFormat, MetalTextureUpload,
-    MfTransform, MftMessageType,
-    VideoCodec, VideoDecoder, VideoDecoderConfig, VideoFrame,
-    parse_h264_annex_b, parse_h264_sps, yuv420p_to_rgba,
-    prepare_metal_texture_upload,
+    ColorSpace, MetalTextureFormat, MetalTextureUpload, MfTransform, MftMessageType, VideoCodec,
+    VideoDecoder, VideoDecoderConfig, VideoFrame, parse_h264_annex_b, parse_h264_sps,
+    prepare_metal_texture_upload, yuv420p_to_rgba,
 };
 
 // ===========================================================================
@@ -31,7 +27,7 @@ fn t34_01_video_decoder_creation_all_codecs() {
     let codecs = [
         (VideoCodec::H264, 1920, 1080, 30.0),
         (VideoCodec::H265, 1920, 1080, 30.0),
-        (VideoCodec::VP9,  1280,  720, 60.0),
+        (VideoCodec::VP9, 1280, 720, 60.0),
         (VideoCodec::Unknown, 640, 480, 24.0),
     ];
 
@@ -44,8 +40,15 @@ fn t34_01_video_decoder_creation_all_codecs() {
             bitrate: 5_000_000,
         };
         let decoder = VideoDecoder::new(config);
-        assert!(!decoder.has_frames(), "Fresh decoder should have no frames for {codec:?}");
-        assert_eq!(decoder.queued_frame_count(), 0, "queued_frame_count should be 0 for {codec:?}");
+        assert!(
+            !decoder.has_frames(),
+            "Fresh decoder should have no frames for {codec:?}"
+        );
+        assert_eq!(
+            decoder.queued_frame_count(),
+            0,
+            "queued_frame_count should be 0 for {codec:?}"
+        );
         assert_eq!(decoder.config().codec, codec);
         assert_eq!(decoder.config().width, width);
     }
@@ -81,7 +84,10 @@ fn t34_02_decode_h264_nal_unit() {
     // On macOS (VideoToolbox) or with ffmpeg feature, this should succeed.
     // Without either, it should fail with a "no decoder" error.
     if cfg!(any(target_os = "macos", feature = "ffmpeg")) {
-        assert!(result.is_ok(), "decode_packet should succeed with a decoder available");
+        assert!(
+            result.is_ok(),
+            "decode_packet should succeed with a decoder available"
+        );
     }
 }
 
@@ -102,13 +108,16 @@ fn t34_03_feed_data_legacy() {
 
     let stream = vec![
         0x00, 0x00, 0x00, 0x01, 0x67, 0x64, 0x00, 0x1E, 0xAC, // SPS
-        0x00, 0x00, 0x00, 0x01, 0x68, 0xEE, 0x3C, 0x80,       // PPS
+        0x00, 0x00, 0x00, 0x01, 0x68, 0xEE, 0x3C, 0x80, // PPS
         0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84, 0x00, 0xAD, // IDR
     ];
 
     let result = decoder.feed_data(&stream);
     if cfg!(any(target_os = "macos", feature = "ffmpeg")) {
-        assert!(result.is_ok(), "feed_data should succeed with a decoder available");
+        assert!(
+            result.is_ok(),
+            "feed_data should succeed with a decoder available"
+        );
     } else {
         assert!(result.is_err(), "feed_data should fail without a decoder");
     }
@@ -181,7 +190,7 @@ fn t34_05_video_decoder_flush() {
     }
 
     // Flush should never panic
-    let frames = decoder.flush();
+    let _frames = decoder.flush();
     // After flush, the decoder should report no frames
     assert!(!decoder.has_frames());
     assert_eq!(decoder.queued_frame_count(), 0);
@@ -208,8 +217,8 @@ fn t34_06_video_decoder_reset() {
 
     // Feed some data
     let stream = vec![
-        0x00, 0x00, 0x00, 0x01, 0x67, 0x64, 0x00, 0x1E, 0xAC,
-        0x00, 0x00, 0x00, 0x01, 0x68, 0xEE, 0x3C, 0x80,
+        0x00, 0x00, 0x00, 0x01, 0x67, 0x64, 0x00, 0x1E, 0xAC, 0x00, 0x00, 0x00, 0x01, 0x68, 0xEE,
+        0x3C, 0x80,
     ];
     let _ = decoder.decode_packet(&stream, 0);
 
@@ -232,10 +241,10 @@ fn t34_06_video_decoder_reset() {
 #[test]
 fn t34_07_parse_h264_annex_b() {
     // Build a concatenated H.264 Annex B stream with SPS + PPS + SEI + IDR
-    let sps  = vec![0x00, 0x00, 0x00, 0x01, 0x67, 0x64, 0x00, 0x1E, 0xAC, 0x52];
-    let pps  = vec![0x00, 0x00, 0x00, 0x01, 0x68, 0xEE, 0x3C, 0x80];
-    let sei  = vec![0x00, 0x00, 0x00, 0x01, 0x06, 0x05, 0x04];
-    let idr  = vec![0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84, 0x00, 0xAD, 0xB7];
+    let sps = vec![0x00, 0x00, 0x00, 0x01, 0x67, 0x64, 0x00, 0x1E, 0xAC, 0x52];
+    let pps = vec![0x00, 0x00, 0x00, 0x01, 0x68, 0xEE, 0x3C, 0x80];
+    let sei = vec![0x00, 0x00, 0x00, 0x01, 0x06, 0x05, 0x04];
+    let idr = vec![0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84, 0x00, 0xAD, 0xB7];
 
     let mut stream = Vec::new();
     stream.extend_from_slice(&sps);
@@ -247,10 +256,10 @@ fn t34_07_parse_h264_annex_b() {
     assert_eq!(nalus.len(), 4, "Should find 4 NAL units");
 
     // Verify NAL unit types
-    assert_eq!(nalus[0][0] & 0x1F, 7,  "First NAL should be SPS (type 7)");
-    assert_eq!(nalus[1][0] & 0x1F, 8,  "Second NAL should be PPS (type 8)");
-    assert_eq!(nalus[2][0] & 0x1F, 6,  "Third NAL should be SEI (type 6)");
-    assert_eq!(nalus[3][0] & 0x1F, 5,  "Fourth NAL should be IDR (type 5)");
+    assert_eq!(nalus[0][0] & 0x1F, 7, "First NAL should be SPS (type 7)");
+    assert_eq!(nalus[1][0] & 0x1F, 8, "Second NAL should be PPS (type 8)");
+    assert_eq!(nalus[2][0] & 0x1F, 6, "Third NAL should be SEI (type 6)");
+    assert_eq!(nalus[3][0] & 0x1F, 5, "Fourth NAL should be IDR (type 5)");
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -271,13 +280,17 @@ fn t34_08_parse_h264_sps_resolution() {
 
     // A realistic SPS for 1920x1080 (common real-world SPS)
     let sps_1080p: Vec<u8> = vec![
-        0x67, 0x64, 0x00, 0x1e, 0xac, 0xd9, 0x40, 0xb4, 0x2f, 0xf9,
-        0x61, 0x01, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10,
-        0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10,
+        0x67, 0x64, 0x00, 0x1e, 0xac, 0xd9, 0x40, 0xb4, 0x2f, 0xf9, 0x61, 0x01, 0x10, 0x10, 0x10,
+        0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10,
         0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10,
     ];
     let (w, h) = parse_h264_sps(&sps_1080p);
-    assert!(w > 0 && h > 0, "Should extract resolution from SPS, got {}x{}", w, h);
+    assert!(
+        w > 0 && h > 0,
+        "Should extract resolution from SPS, got {}x{}",
+        w,
+        h
+    );
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -296,11 +309,15 @@ fn t34_09_yuv420p_to_rgba_conversion() {
 
     // Set some distinct Y values
     yuv[0] = 255; // White pixel at (0,0)
-    yuv[1] = 0;   // Black pixel at (1,0)
-    yuv[5] = 76;  // Mid-gray at (1,1)
+    yuv[1] = 0; // Black pixel at (1,0)
+    yuv[5] = 76; // Mid-gray at (1,1)
 
     let rgba = yuv420p_to_rgba(&yuv, width, height);
-    assert_eq!(rgba.len(), (width * height * 4) as usize, "RGBA buffer should be 4 bytes per pixel");
+    assert_eq!(
+        rgba.len(),
+        (width * height * 4) as usize,
+        "RGBA buffer should be 4 bytes per pixel"
+    );
 
     // Check pixel (0,0) has non-zero R/G/B since Y=255 maps to white
     assert!(rgba[0] > 0 || rgba[1] > 0 || rgba[2] > 0);
@@ -321,11 +338,13 @@ fn t34_10_metal_upload_prepare_rgba() {
         pts: 0,
         duration: 33_333,
         texture_id: None,
+        metal_texture: None,
         color_space: ColorSpace::Rec709,
     };
 
-    let upload = prepare_metal_texture_upload(&frame, MetalTextureFormat::RGBA8Unorm, ColorSpace::Rec709)
-        .expect("RGBA upload preparation should succeed");
+    let upload =
+        prepare_metal_texture_upload(&frame, MetalTextureFormat::RGBA8Unorm, ColorSpace::Rec709)
+            .expect("RGBA upload preparation should succeed");
     assert_eq!(upload.format, MetalTextureFormat::RGBA8Unorm);
     assert_eq!(upload.bytes_per_row, 16, "4x4 RGBA = 16 bytes per row");
     assert_eq!(upload.data.len(), 64, "4x4 RGBA = 64 bytes total");
@@ -341,9 +360,9 @@ fn t34_10_metal_upload_prepare_rgba() {
 fn t34_11_metal_upload_prepare_bgra() {
     // Create a frame with known RGBA pixel values
     let rgba_pixels: Vec<u8> = vec![
-        255, 0, 0, 255,   // Red pixel     -> BGRA: B=0, G=0, R=255, A=255
-        0, 255, 0, 255,   // Green pixel   -> BGRA: B=0, G=255, R=0, A=255
-        0, 0, 255, 255,   // Blue pixel    -> BGRA: B=255, G=0, R=0, A=255
+        255, 0, 0, 255, // Red pixel     -> BGRA: B=0, G=0, R=255, A=255
+        0, 255, 0, 255, // Green pixel   -> BGRA: B=0, G=255, R=0, A=255
+        0, 0, 255, 255, // Blue pixel    -> BGRA: B=255, G=0, R=0, A=255
         128, 128, 128, 255, // Gray pixel  -> BGRA: B=128, G=128, R=128, A=255
     ];
 
@@ -354,30 +373,32 @@ fn t34_11_metal_upload_prepare_bgra() {
         pts: 0,
         duration: 33_333,
         texture_id: None,
+        metal_texture: None,
         color_space: ColorSpace::Rec709,
     };
 
-    let upload = prepare_metal_texture_upload(&frame, MetalTextureFormat::BGRA8Unorm, ColorSpace::Rec709)
-        .expect("BGRA upload preparation should succeed");
+    let upload =
+        prepare_metal_texture_upload(&frame, MetalTextureFormat::BGRA8Unorm, ColorSpace::Rec709)
+            .expect("BGRA upload preparation should succeed");
     assert_eq!(upload.format, MetalTextureFormat::BGRA8Unorm);
 
     // Verify channel swap: RGBA -> BGRA (R and B swapped)
     // First pixel: RGBA(255,0,0,255) -> BGRA(0,0,255,255)
-    assert_eq!(upload.data[0], 0,   "B channel should be original R=0");
-    assert_eq!(upload.data[1], 0,   "G channel unchanged");
+    assert_eq!(upload.data[0], 0, "B channel should be original R=0");
+    assert_eq!(upload.data[1], 0, "G channel unchanged");
     assert_eq!(upload.data[2], 255, "R channel should be original B=255");
     assert_eq!(upload.data[3], 255, "A channel unchanged");
 
     // Second pixel: RGBA(0,255,0,255) -> BGRA(0,255,0,255)
-    assert_eq!(upload.data[4], 0,   "B=0");
+    assert_eq!(upload.data[4], 0, "B=0");
     assert_eq!(upload.data[5], 255, "G=255");
-    assert_eq!(upload.data[6], 0,   "R=0");
+    assert_eq!(upload.data[6], 0, "R=0");
     assert_eq!(upload.data[7], 255, "A=255");
 
     // Third pixel: RGBA(0,0,255,255) -> BGRA(255,0,0,255)
-    assert_eq!(upload.data[8],  255, "B=255");
-    assert_eq!(upload.data[9],  0,   "G=0");
-    assert_eq!(upload.data[10], 0,   "R=0");
+    assert_eq!(upload.data[8], 255, "B=255");
+    assert_eq!(upload.data[9], 0, "G=0");
+    assert_eq!(upload.data[10], 0, "R=0");
     assert_eq!(upload.data[11], 255, "A=255");
 }
 
@@ -394,6 +415,7 @@ fn t34_12_metal_upload_prepare_nv12() {
         pts: 0,
         duration: 33_333,
         texture_id: None,
+        metal_texture: None,
         color_space: ColorSpace::Rec709,
     };
 
@@ -401,8 +423,15 @@ fn t34_12_metal_upload_prepare_nv12() {
         .expect("NV12 upload preparation should succeed");
     assert_eq!(upload.format, MetalTextureFormat::NV12);
     // NV12: Y plane (16 bytes) + interleaved UV (8 bytes for 2x2 chroma)
-    assert_eq!(upload.data.len(), 24, "NV12 for 4x4: 16 Y + 8 UV = 24 bytes");
-    assert_eq!(upload.bytes_per_row, 4, "NV12 Y plane bytes per row = width");
+    assert_eq!(
+        upload.data.len(),
+        24,
+        "NV12 for 4x4: 16 Y + 8 UV = 24 bytes"
+    );
+    assert_eq!(
+        upload.bytes_per_row, 4,
+        "NV12 Y plane bytes per row = width"
+    );
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -414,37 +443,53 @@ fn t34_13_color_space_conversion_variants() {
     let frame = VideoFrame {
         width: 2,
         height: 2,
-        data: vec![128u8; 2 * 2 * 4],
+        data: vec![
+            255, 0, 0, 255, // red
+            0, 255, 0, 255, // green
+            0, 0, 255, 255, // blue
+            128, 128, 128, 255, // gray
+        ],
         pts: 0,
         duration: 33_333,
         texture_id: None,
+        metal_texture: None,
         color_space: ColorSpace::Rec709,
     };
 
     // Test Rec.601
-    let upload_601 = prepare_metal_texture_upload(&frame, MetalTextureFormat::NV12, ColorSpace::Rec601)
-        .expect("Rec.601 NV12 should succeed");
-    assert_eq!(upload_601.data.len(), 6, "NV12 for 2x2: 4 Y + 2 UV = 6 bytes");
+    let upload_601 =
+        prepare_metal_texture_upload(&frame, MetalTextureFormat::NV12, ColorSpace::Rec601)
+            .expect("Rec.601 NV12 should succeed");
+    assert_eq!(
+        upload_601.data.len(),
+        6,
+        "NV12 for 2x2: 4 Y + 2 UV = 6 bytes"
+    );
 
     // Test Rec.709 (default)
-    let upload_709 = prepare_metal_texture_upload(&frame, MetalTextureFormat::NV12, ColorSpace::Rec709)
-        .expect("Rec.709 NV12 should succeed");
+    let upload_709 =
+        prepare_metal_texture_upload(&frame, MetalTextureFormat::NV12, ColorSpace::Rec709)
+            .expect("Rec.709 NV12 should succeed");
     assert_eq!(upload_709.data.len(), 6);
 
     // Test Rec.2020
-    let upload_2020 = prepare_metal_texture_upload(&frame, MetalTextureFormat::NV12, ColorSpace::Rec2020)
-        .expect("Rec.2020 NV12 should succeed");
+    let upload_2020 =
+        prepare_metal_texture_upload(&frame, MetalTextureFormat::NV12, ColorSpace::Rec2020)
+            .expect("Rec.2020 NV12 should succeed");
     assert_eq!(upload_2020.data.len(), 6);
 
     // Test Unknown (defaults to Rec.709)
-    let upload_unknown = prepare_metal_texture_upload(&frame, MetalTextureFormat::NV12, ColorSpace::Unknown)
-        .expect("Unknown color space NV12 should succeed");
+    let upload_unknown =
+        prepare_metal_texture_upload(&frame, MetalTextureFormat::NV12, ColorSpace::Unknown)
+            .expect("Unknown color space NV12 should succeed");
     assert_eq!(upload_unknown.data.len(), 6);
 
     // The different color spaces should produce different NV12 values
     // (since they have different Kr/Kb coefficients)
-    assert_ne!(upload_601.data, upload_709.data,
-        "Rec.601 and Rec.709 should produce different NV12 data");
+    assert_ne!(
+        upload_601.data, upload_709.data,
+        "Rec.601 and Rec.709 should produce different NV12 data"
+    );
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -506,16 +551,23 @@ fn t34_16_mf_transform_lifecycle() {
     assert_eq!(transform.input_queued(), 0);
 
     // ProcessMessage — all message types accepted
-    assert!(transform.process_message(MftMessageType::Reset).is_ok());
-    assert!(transform.process_message(MftMessageType::NewStream).is_ok());
-    assert!(transform.process_message(MftMessageType::Flush).is_ok());
-    assert!(transform.process_message(MftMessageType::Drain).is_ok());
+    let _result = transform.process_message(MftMessageType::Reset);
+    assert!(_result.is_ok(), "expected Ok, got {_result:?}");
+    let _result = transform.process_message(MftMessageType::NewStream);
+    assert!(_result.is_ok(), "expected Ok, got {_result:?}");
+    let _result = transform.process_message(MftMessageType::Flush);
+    assert!(_result.is_ok(), "expected Ok, got {_result:?}");
+    let _result = transform.process_message(MftMessageType::Drain);
+    assert!(_result.is_ok(), "expected Ok, got {_result:?}");
 
     // ProcessInput
     let sps = vec![0x00, 0x00, 0x00, 0x01, 0x67, 0x64, 0x00, 0x1E, 0xAC];
     let result = transform.process_input(&sps, 0);
     if cfg!(any(target_os = "macos", feature = "ffmpeg")) {
-        assert!(result.is_ok(), "process_input should succeed with a decoder");
+        assert!(
+            result.is_ok(),
+            "process_input should succeed with a decoder"
+        );
     }
 
     // ProcessOutput — should not panic
@@ -547,9 +599,9 @@ fn t34_17_color_space_enum() {
 
 #[test]
 fn t34_18_video_codec_enum_values() {
-    assert_eq!(VideoCodec::H264    as u32, 0);
-    assert_eq!(VideoCodec::H265    as u32, 1);
-    assert_eq!(VideoCodec::VP9     as u32, 2);
+    assert_eq!(VideoCodec::H264 as u32, 0);
+    assert_eq!(VideoCodec::H265 as u32, 1);
+    assert_eq!(VideoCodec::VP9 as u32, 2);
     assert_eq!(VideoCodec::Unknown as u32, 3);
 }
 
@@ -564,17 +616,26 @@ fn t34_18_video_codec_enum_values() {
 #[test]
 fn t34_19_session_initial_state() {
     let session = MfMediaSession::new();
-    assert_eq!(session.state(), MfSessionState::Idle,
-        "Fresh session should be in Idle state");
-    assert!(session.is_active(),
-        "Fresh session should be active (not shut down)");
-    assert!(!session.has_events(),
-        "Fresh session should have no events");
+    assert_eq!(
+        session.state(),
+        MfSessionState::Idle,
+        "Fresh session should be in Idle state"
+    );
+    assert!(
+        session.is_active(),
+        "Fresh session should be active (not shut down)"
+    );
+    assert!(!session.has_events(), "Fresh session should have no events");
     assert_eq!(session.event_count(), 0);
-    assert_eq!(session.get_position(), 0,
-        "Position should be 0 before starting");
-    assert!(session.source_url().is_none(),
-        "No source URL before setting topology");
+    assert_eq!(
+        session.get_position(),
+        0,
+        "Position should be 0 before starting"
+    );
+    assert!(
+        session.source_url().is_none(),
+        "No source URL before setting topology"
+    );
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -646,25 +707,19 @@ fn t34_21_session_invalid_transitions() {
     let mut session = MfMediaSession::new();
 
     // Cannot pause from Idle
-    assert!(session.pause().is_err(),
-        "Cannot pause from Idle");
+    assert!(session.pause().is_err(), "Cannot pause from Idle");
 
     // Cannot stop from Idle
-    assert!(session.stop().is_err(),
-        "Cannot stop from Idle");
+    assert!(session.stop().is_err(), "Cannot stop from Idle");
 
     // Cannot start after shutdown
     session.shutdown().unwrap();
-    assert!(session.start().is_err(),
-        "Cannot start after shutdown");
-    assert!(session.pause().is_err(),
-        "Cannot pause after shutdown");
-    assert!(session.stop().is_err(),
-        "Cannot stop after shutdown");
+    assert!(session.start().is_err(), "Cannot start after shutdown");
+    assert!(session.pause().is_err(), "Cannot pause after shutdown");
+    assert!(session.stop().is_err(), "Cannot stop after shutdown");
 
     // Double shutdown
-    assert!(session.shutdown().is_err(),
-        "Double shutdown should fail");
+    assert!(session.shutdown().is_err(), "Double shutdown should fail");
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -681,8 +736,10 @@ fn t34_22_session_shutdown() {
 
     // Setting topology on a shut down session should fail
     let topology = Topology::new();
-    assert!(session.set_topology(topology).is_err(),
-        "Cannot set topology on shut-down session");
+    assert!(
+        session.set_topology(topology).is_err(),
+        "Cannot set topology on shut-down session"
+    );
 
     // Shutdown emits SessionShutdown event
     // (but we didn't consume from new() — shutdown emits it)
@@ -711,34 +768,46 @@ fn t34_23_session_position_tracking() {
 
     std::thread::sleep(std::time::Duration::from_micros(2000));
     let pos_after_start = session.get_position();
-    assert!(pos_after_start > 0,
-        "Position should increase after start, got {pos_after_start}");
+    assert!(
+        pos_after_start > 0,
+        "Position should increase after start, got {pos_after_start}"
+    );
 
     // Position should be less than ~10ms (we slept 2ms)
-    assert!(pos_after_start < 10_000,
-        "Position should be roughly the elapsed time");
+    assert!(
+        pos_after_start < 10_000,
+        "Position should be roughly the elapsed time"
+    );
 
     // Position freezes during pause
     session.pause().unwrap();
     session.get_event(); // SessionPaused
     let pos_at_pause = session.get_position();
     std::thread::sleep(std::time::Duration::from_micros(1000));
-    assert_eq!(session.get_position(), pos_at_pause,
-        "Position should freeze during pause");
+    assert_eq!(
+        session.get_position(),
+        pos_at_pause,
+        "Position should freeze during pause"
+    );
 
     // Position resumes after restart
     session.start().unwrap();
     session.get_event(); // SessionStarted
     std::thread::sleep(std::time::Duration::from_micros(1000));
     let pos_after_resume = session.get_position();
-    assert!(pos_after_resume > pos_at_pause,
-        "Position should increase after resume");
+    assert!(
+        pos_after_resume > pos_at_pause,
+        "Position should increase after resume"
+    );
 
     // Stop resets position to 0
     session.stop().unwrap();
     session.get_event(); // SessionStopped
-    assert_eq!(session.get_position(), 0,
-        "Position should reset to 0 after stop");
+    assert_eq!(
+        session.get_position(),
+        0,
+        "Position should reset to 0 after stop"
+    );
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -795,8 +864,11 @@ fn t34_25_event_queue_overflow() {
 
     assert_eq!(queue.event_count(), 3);
     let first = queue.get_event().unwrap();
-    assert_eq!(first.event_type, MediaEventType::SessionPaused,
-        "Oldest event should have been dropped due to overflow");
+    assert_eq!(
+        first.event_type,
+        MediaEventType::SessionPaused,
+        "Oldest event should have been dropped due to overflow"
+    );
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -834,17 +906,23 @@ fn t34_26_media_event_construction() {
 
 #[test]
 fn t34_27_media_event_type_names() {
-    assert_eq!(MediaEventType::SessionStarted.name(),    "MESessionStarted");
-    assert_eq!(MediaEventType::SessionPaused.name(),     "MESessionPaused");
-    assert_eq!(MediaEventType::SessionStopped.name(),    "MESessionStopped");
-    assert_eq!(MediaEventType::SessionEnded.name(),      "MESessionEnded");
-    assert_eq!(MediaEventType::BufferingStarted.name(),  "MEBufferingStarted");
-    assert_eq!(MediaEventType::BufferingStopped.name(),  "MEBufferingStopped");
-    assert_eq!(MediaEventType::Error.name(),             "MEError");
-    assert_eq!(MediaEventType::SessionShutdown.name(),   "MESessionShutdown");
-    assert_eq!(MediaEventType::TopologySet.name(),       "METopologySet");
-    assert_eq!(MediaEventType::TopologyLoaded.name(),    "METopologyLoaded");
-    assert_eq!(MediaEventType::RateChanged.name(),       "MERateChanged");
+    assert_eq!(MediaEventType::SessionStarted.name(), "MESessionStarted");
+    assert_eq!(MediaEventType::SessionPaused.name(), "MESessionPaused");
+    assert_eq!(MediaEventType::SessionStopped.name(), "MESessionStopped");
+    assert_eq!(MediaEventType::SessionEnded.name(), "MESessionEnded");
+    assert_eq!(
+        MediaEventType::BufferingStarted.name(),
+        "MEBufferingStarted"
+    );
+    assert_eq!(
+        MediaEventType::BufferingStopped.name(),
+        "MEBufferingStopped"
+    );
+    assert_eq!(MediaEventType::Error.name(), "MEError");
+    assert_eq!(MediaEventType::SessionShutdown.name(), "MESessionShutdown");
+    assert_eq!(MediaEventType::TopologySet.name(), "METopologySet");
+    assert_eq!(MediaEventType::TopologyLoaded.name(), "METopologyLoaded");
+    assert_eq!(MediaEventType::RateChanged.name(), "MERateChanged");
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -853,12 +931,12 @@ fn t34_27_media_event_type_names() {
 
 #[test]
 fn t34_28_session_state_names() {
-    assert_eq!(MfSessionState::Idle.name(),      "Idle");
-    assert_eq!(MfSessionState::Opening.name(),   "Opening");
-    assert_eq!(MfSessionState::Playing.name(),   "Playing");
-    assert_eq!(MfSessionState::Paused.name(),    "Paused");
-    assert_eq!(MfSessionState::Stopped.name(),   "Stopped");
-    assert_eq!(MfSessionState::Shutdown.name(),  "Shutdown");
+    assert_eq!(MfSessionState::Idle.name(), "Idle");
+    assert_eq!(MfSessionState::Opening.name(), "Opening");
+    assert_eq!(MfSessionState::Playing.name(), "Playing");
+    assert_eq!(MfSessionState::Paused.name(), "Paused");
+    assert_eq!(MfSessionState::Stopped.name(), "Stopped");
+    assert_eq!(MfSessionState::Shutdown.name(), "Shutdown");
 }
 
 #[test]
@@ -901,7 +979,8 @@ fn t34_28b_session_state_can_transitions() {
 fn t34_29_topology_build_playback() {
     let mut topology = Topology::new();
 
-    topology.build_playback_topology("movie.mp4", "H264 Decoder", "Metal Renderer")
+    topology
+        .build_playback_topology("movie.mp4", "H264 Decoder", "Metal Renderer")
         .expect("build_playback_topology should succeed");
 
     assert_eq!(topology.node_count(), 3);
@@ -915,15 +994,31 @@ fn t34_29_topology_build_playback() {
     assert_eq!(source.source_url.as_deref(), Some("movie.mp4"));
     assert_eq!(source.outputs.len(), 1, "Source should connect to decoder");
 
-    let decoder = topology.get_node(topology.decoder_node_id.unwrap()).unwrap();
+    let decoder = topology
+        .get_node(topology.decoder_node_id.unwrap())
+        .unwrap();
     assert_eq!(decoder.node_type, TopologyNodeType::Decoder);
-    assert_eq!(decoder.inputs.len(), 1, "Decoder should receive from source");
-    assert_eq!(decoder.outputs.len(), 1, "Decoder should connect to renderer");
+    assert_eq!(
+        decoder.inputs.len(),
+        1,
+        "Decoder should receive from source"
+    );
+    assert_eq!(
+        decoder.outputs.len(),
+        1,
+        "Decoder should connect to renderer"
+    );
     assert_eq!(decoder.output_format.as_deref(), Some("RGBA"));
 
-    let renderer = topology.get_node(topology.renderer_node_id.unwrap()).unwrap();
+    let renderer = topology
+        .get_node(topology.renderer_node_id.unwrap())
+        .unwrap();
     assert_eq!(renderer.node_type, TopologyNodeType::Renderer);
-    assert_eq!(renderer.inputs.len(), 1, "Renderer should receive from decoder");
+    assert_eq!(
+        renderer.inputs.len(),
+        1,
+        "Renderer should receive from decoder"
+    );
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -934,15 +1029,20 @@ fn t34_29_topology_build_playback() {
 fn t34_30_topology_validation() {
     // Empty topology should fail validation
     let topology = Topology::new();
-    assert!(topology.validate().is_err(),
-        "Empty topology should fail validation");
+    assert!(
+        topology.validate().is_err(),
+        "Empty topology should fail validation"
+    );
 
     // Built topology should pass validation
     let mut topology = Topology::new();
-    topology.build_playback_topology("test.mp4", "Decoder", "Renderer")
+    topology
+        .build_playback_topology("test.mp4", "Decoder", "Renderer")
         .unwrap();
-    assert!(topology.validate().is_ok(),
-        "Built playback topology should pass validation");
+    assert!(
+        topology.validate().is_ok(),
+        "Built playback topology should pass validation"
+    );
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -960,8 +1060,10 @@ fn t34_31_topology_custom_nodes_and_connections() {
     assert_eq!(topology.node_count(), 3);
 
     // Connect source → decoder → output
-    assert!(topology.connect(src_id, dec_id).is_ok());
-    assert!(topology.connect(dec_id, out_id).is_ok());
+    let _result = topology.connect(src_id, dec_id);
+    assert!(_result.is_ok(), "expected Ok, got {_result:?}");
+    let _result = topology.connect(dec_id, out_id);
+    assert!(_result.is_ok(), "expected Ok, got {_result:?}");
 
     // Verify connections
     let src = topology.get_node(src_id).unwrap();
@@ -985,16 +1087,22 @@ fn t34_32_topology_connect_invalid() {
     let valid_id = topology.add_node(TopologyNodeType::Source, "Valid");
 
     // Connecting from valid to non-existent
-    assert!(topology.connect(valid_id, 999).is_err(),
-        "Cannot connect to non-existent node");
+    assert!(
+        topology.connect(valid_id, 999).is_err(),
+        "Cannot connect to non-existent node"
+    );
 
     // Connecting from non-existent
-    assert!(topology.connect(999, valid_id).is_err(),
-        "Cannot connect from non-existent node");
+    assert!(
+        topology.connect(999, valid_id).is_err(),
+        "Cannot connect from non-existent node"
+    );
 
     // Both non-existent
-    assert!(topology.connect(999, 888).is_err(),
-        "Cannot connect two non-existent nodes");
+    assert!(
+        topology.connect(999, 888).is_err(),
+        "Cannot connect two non-existent nodes"
+    );
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -1003,10 +1111,10 @@ fn t34_32_topology_connect_invalid() {
 
 #[test]
 fn t34_33_topology_node_type_enum() {
-    assert_eq!(TopologyNodeType::Source   as u32, 0);
-    assert_eq!(TopologyNodeType::Decoder  as u32, 1);
+    assert_eq!(TopologyNodeType::Source as u32, 0);
+    assert_eq!(TopologyNodeType::Decoder as u32, 1);
     assert_eq!(TopologyNodeType::Renderer as u32, 2);
-    assert_eq!(TopologyNodeType::Output   as u32, 3);
+    assert_eq!(TopologyNodeType::Output as u32, 3);
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -1016,12 +1124,15 @@ fn t34_33_topology_node_type_enum() {
 #[test]
 fn t34_34_topology_loader() {
     let mut topology = Topology::new();
-    topology.build_playback_topology("test.mp4", "Decoder", "Renderer")
+    topology
+        .build_playback_topology("test.mp4", "Decoder", "Renderer")
         .unwrap();
 
     let loader = TopologyLoader::new();
-    assert!(loader.load(&topology).is_ok(),
-        "TopologyLoader should load a valid topology");
+    assert!(
+        loader.load(&topology).is_ok(),
+        "TopologyLoader should load a valid topology"
+    );
 
     // Clearing the loader should not panic
     loader.clear();
@@ -1053,7 +1164,8 @@ fn t34_36_session_set_clear_topology() {
     assert!(session.topology().is_none());
 
     let mut topology = Topology::new();
-    topology.build_playback_topology("clip.ogg", "Decoder", "Renderer")
+    topology
+        .build_playback_topology("clip.ogg", "Decoder", "Renderer")
         .unwrap();
 
     session.set_topology(topology).unwrap();
@@ -1075,9 +1187,14 @@ fn t34_36_session_set_clear_topology() {
 fn t34_37_session_set_url_topology() {
     let mut session = MfMediaSession::new();
 
-    session.set_url_topology("http://example.com/stream.mpd").unwrap();
+    session
+        .set_url_topology("http://example.com/stream.mpd")
+        .unwrap();
     assert!(session.topology().is_some());
-    assert_eq!(session.source_url().unwrap(), "http://example.com/stream.mpd");
+    assert_eq!(
+        session.source_url().unwrap(),
+        "http://example.com/stream.mpd"
+    );
 
     // Verify the topology has correct structure
     let topology = session.topology().unwrap();
@@ -1093,6 +1210,7 @@ fn t34_38_session_event_generation() {
     let mut session = MfMediaSession::new();
     session.set_url_topology("test.mp4").unwrap();
     session.get_event().unwrap(); // consume TopologySet
+    session.get_event().unwrap(); // consume TopologyLoaded
 
     // Start → SessionStarted
     session.start().unwrap();
@@ -1143,12 +1261,16 @@ fn t34_40_session_peek_event() {
     let mut session = MfMediaSession::new();
     session.set_url_topology("test.mp4").unwrap();
     session.get_event().unwrap(); // consume TopologySet
+    session.get_event().unwrap(); // consume TopologyLoaded
     session.start().unwrap();
 
     // Peek at the first event (SessionStarted) without consuming
     let peeked = session.peek_event();
-    assert!(peeked.is_some());
-    assert_eq!(peeked.unwrap().event_type, MediaEventType::SessionStarted);
+    assert!(peeked.is_some(), "peek_event should return SessionStarted");
+    assert_eq!(
+        peeked.expect("peeked should be Some").event_type,
+        MediaEventType::SessionStarted
+    );
 
     // Event should still be there after peek
     assert!(session.has_events());
@@ -1183,8 +1305,11 @@ fn t34_41_topology_node_connections() {
 
     // Duplicate connections should not add
     source.connect_to(decoder.id);
-    assert_eq!(source.outputs, vec![2],
-        "Duplicate connections should be ignored");
+    assert_eq!(
+        source.outputs,
+        vec![2],
+        "Duplicate connections should be ignored"
+    );
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -1217,8 +1342,11 @@ fn t34_43_session_multi_cycle() {
 
     for cycle in 0..3 {
         session.start().unwrap();
-        assert_eq!(session.state(), MfSessionState::Playing,
-            "Cycle {cycle}: should be Playing after start");
+        assert_eq!(
+            session.state(),
+            MfSessionState::Playing,
+            "Cycle {cycle}: should be Playing after start"
+        );
 
         // Consume events (may include topology events on first cycle)
         loop {
@@ -1231,13 +1359,19 @@ fn t34_43_session_multi_cycle() {
         }
 
         session.pause().unwrap();
-        assert_eq!(session.state(), MfSessionState::Paused,
-            "Cycle {cycle}: should be Paused after pause");
+        assert_eq!(
+            session.state(),
+            MfSessionState::Paused,
+            "Cycle {cycle}: should be Paused after pause"
+        );
         session.get_event().unwrap(); // SessionPaused
 
         session.stop().unwrap();
-        assert_eq!(session.state(), MfSessionState::Stopped,
-            "Cycle {cycle}: should be Stopped after stop");
+        assert_eq!(
+            session.state(),
+            MfSessionState::Stopped,
+            "Cycle {cycle}: should be Stopped after stop"
+        );
         session.get_event().unwrap(); // SessionStopped
     }
 }
@@ -1255,6 +1389,7 @@ fn t34_44_video_frame_construction() {
         pts: 100_000,
         duration: 33_333,
         texture_id: Some(42),
+        metal_texture: None,
         color_space: ColorSpace::Rec709,
     };
 

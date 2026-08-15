@@ -1,11 +1,13 @@
 use crate::error::{AppError, AppResult};
 use crate::reason::ReasonCode;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
+use std::sync::LazyLock;
 use std::time::Instant;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,5 +89,328 @@ impl JsonlLogger {
             AppError::from_io(ReasonCode::RcIo, "failed to flush JSONL logger", &error)
         })?;
         Ok(event)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Redaction patterns
+// ---------------------------------------------------------------------------
+
+static REDACTION_PATTERNS: LazyLock<Vec<(&'static str, Regex)>> = LazyLock::new(|| {
+    vec![
+        // Bearer / token headers
+        (
+            "bearer_token",
+            Regex::new(r"(?i)(bearer\s+|token[=:\s]*)[^\s,;]+").unwrap(),
+        ),
+        // Authorization header (Basic, Digest, Negotiate, etc.)
+        (
+            "auth_header",
+            Regex::new(r"(?i)(authorization[=:\s]*(?:basic|digest|negotiate|bearer)\s*)[^\s,;]+")
+                .unwrap(),
+        ),
+        // Cookies
+        (
+            "cookie",
+            Regex::new(r"(?i)(cookie[=:\s]*)[^\s,;]+").unwrap(),
+        ),
+        // Set-Cookie
+        (
+            "set_cookie",
+            Regex::new(r"(?i)(set-cookie[=:\s]*)[^\s,;]+").unwrap(),
+        ),
+        // Password / passwd in URLs or params
+        (
+            "password",
+            Regex::new(r"(?i)((?:password|passwd|pwd)[=:\s]+)[^\s,;&]+").unwrap(),
+        ),
+        // API keys
+        (
+            "api_key",
+            Regex::new(r"(?i)((?:api[_-]?key|apikey)[=:\s]+)[^\s,;&]+").unwrap(),
+        ),
+        // Secret keys
+        (
+            "secret_key",
+            Regex::new(r"(?i)((?:secret[_-]?key|secretkey)[=:\s]+)[^\s,;&]+").unwrap(),
+        ),
+        // Access tokens (OAuth, etc.)
+        (
+            "access_token",
+            Regex::new(r"(?i)((?:access[_-]?token)[=:\s]+)[^\s,;&]+").unwrap(),
+        ),
+        // Refresh tokens
+        (
+            "refresh_token",
+            Regex::new(r"(?i)((?:refresh[_-]?token)[=:\s]+)[^\s,;&]+").unwrap(),
+        ),
+        // Credentials in URLs: http://user:pass@host
+        (
+            "url_credentials",
+            Regex::new(r"(?i)(://[^/\s:]+:)[^@\s]+(@)").unwrap(),
+        ),
+        // PEM-encoded certificates (multi-line)
+        (
+            "certificate_pem",
+            Regex::new(r"(?is)(-----BEGIN [A-Z ]+-----).+?(-----END [A-Z ]+-----)").unwrap(),
+        ),
+        // Certificate thumbprint / hash / serial number
+        (
+            "cert_thumbprint",
+            Regex::new(r"(?i)(cert(?:ificate)?[._-]?(?:thumbprint|hash|serial|sha256|sha1)?[=:\s]*)[a-f0-9]{32,}()").unwrap(),
+        ),
+        // JWT tokens: header.payload.signature (standalone, without "Bearer " prefix).
+        // Bearer+JWT cases are handled by the bearer_token pattern above which
+        // redacts the entire token.  First segment >= 15 chars avoids matching
+        // domain names like "ftp.example.com".
+        (
+            "jwt_token",
+            Regex::new(r"(?i)([a-z0-9_-]{15,}\.[a-z0-9_-]+\.)[a-z0-9_-]+()").unwrap(),
+        ),
+        // Session tokens / session IDs
+        (
+            "session_token",
+            Regex::new(r"(?i)(session[._-]?(?:id|token|key)[=:\s]*)[a-f0-9]{16,64}()").unwrap(),
+        ),
+        // X.509 Distinguished Name fields (word boundary before prefix to avoid
+        // matching e.g. the trailing 'e' in "certificate:").
+        // Uses a consuming (?:^|[^a-zA-Z]) group instead of (?<![a-zA-Z])
+        // lookbehind because the `regex` crate does not support lookarounds.
+        (
+            "x509_dn",
+            Regex::new(r"(?i)((?:^|[^a-zA-Z])(?:CN|O|OU|L|ST|C|E)[=:]\s*)[a-zA-Z0-9\s.,'()-]{3,80}()").unwrap(),
+        ),
+    ]
+});
+
+/// Redact sensitive values from a log message string.
+///
+/// Replaces values associated with tokens, cookies, passwords, API keys,
+/// and other credentials with `[REDACTED]`. The key/name portion is preserved
+/// so the log remains useful for debugging.
+pub fn redact_sensitive(input: &str) -> String {
+    let mut result = input.to_string();
+    for (_name, pattern) in REDACTION_PATTERNS.iter() {
+        result = pattern
+            .replace_all(&result, "${1}[REDACTED]${2}")
+            .to_string();
+    }
+    result
+}
+
+// ---------------------------------------------------------------------------
+// Subsystem boundary event helpers
+// ---------------------------------------------------------------------------
+
+/// Create a standard set of KV pairs for a subsystem boundary crossing.
+///
+/// Every major subsystem (PE loader, thread creator, graphics init, audio init,
+/// network connect) should log a structured boundary event on entry and exit
+/// so operational flow can be traced without embedding secrets in log messages.
+pub fn boundary_kv(
+    subsystem: &str,
+    direction: &str,
+    detail: Option<&str>,
+) -> BTreeMap<String, Value> {
+    let mut kv = BTreeMap::new();
+    kv.insert("boundary".to_string(), Value::String(subsystem.to_string()));
+    kv.insert(
+        "direction".to_string(),
+        Value::String(direction.to_string()),
+    );
+    if let Some(d) = detail {
+        kv.insert("detail".to_string(), Value::String(d.to_string()));
+    }
+    kv
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+    use std::path::PathBuf;
+
+    fn temp_log_path() -> PathBuf {
+        std::env::temp_dir().join(format!("casa1_log_test_{}.jsonl", std::process::id()))
+    }
+
+    #[test]
+    fn test_redact_bearer_token() {
+        let input = "Sending request with Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.payload";
+        let redacted = redact_sensitive(input);
+        assert!(redacted.contains("[REDACTED]"));
+        assert!(!redacted.contains("eyJhbGciOiJIUzI1NiJ9"));
+        assert!(redacted.contains("Bearer"));
+    }
+
+    #[test]
+    fn test_redact_password() {
+        let input = "Login with password=supersecret123 failed";
+        let redacted = redact_sensitive(input);
+        assert!(redacted.contains("password=[REDACTED]"));
+        assert!(!redacted.contains("supersecret123"));
+    }
+
+    #[test]
+    fn test_redact_api_key() {
+        let input = "api_key=sk-abc123def456&user=test";
+        let redacted = redact_sensitive(input);
+        assert!(redacted.contains("api_key=[REDACTED]"));
+        assert!(!redacted.contains("sk-abc123def456"));
+        assert!(redacted.contains("user=test"));
+    }
+
+    #[test]
+    fn test_redact_cookie() {
+        let input = "Cookie: session_id=abc123; auth_token=xyz789";
+        let redacted = redact_sensitive(input);
+        assert!(redacted.contains("[REDACTED]"));
+        assert!(!redacted.contains("abc123"));
+    }
+
+    #[test]
+    fn test_redact_access_token() {
+        let input = "access_token=ghp_abcdefghijklmnop";
+        let redacted = redact_sensitive(input);
+        assert!(redacted.contains("access_token=[REDACTED]"));
+        assert!(!redacted.contains("ghp_abcdefghijklmnop"));
+    }
+
+    #[test]
+    fn test_redact_url_credentials() {
+        let input = "Connecting to ftp://admin:s3cr3t@ftp.example.com/files";
+        let redacted = redact_sensitive(input);
+        assert!(redacted.contains("[REDACTED]"));
+        assert!(!redacted.contains("s3cr3t"));
+        assert!(redacted.contains("ftp.example.com"));
+    }
+
+    #[test]
+    fn test_redact_no_match() {
+        let input = "Normal log message with no sensitive data";
+        assert_eq!(redact_sensitive(input), input);
+    }
+
+    #[test]
+    fn test_redact_case_insensitive() {
+        let input = "PASSWORD=Secret123 API_KEY=key456";
+        let redacted = redact_sensitive(input);
+        assert!(redacted.contains("[REDACTED]"));
+        assert!(!redacted.contains("Secret123"));
+        assert!(!redacted.contains("key456"));
+    }
+
+    #[test]
+    fn test_redact_secret_key() {
+        let input = "secret_key=wJalrXUtnFEMI/K7MDENG/bPxRfiCY";
+        let redacted = redact_sensitive(input);
+        assert!(redacted.contains("secret_key=[REDACTED]"));
+        assert!(!redacted.contains("wJalrXUtnFEMI"));
+    }
+
+    #[test]
+    fn test_redact_pem_certificate() {
+        let input =
+            "Loaded certificate:\n-----BEGIN CERTIFICATE-----\nMIIF9DCB\n-----END CERTIFICATE-----";
+        let redacted = redact_sensitive(input);
+        assert!(
+            redacted.contains("-----BEGIN CERTIFICATE-----[REDACTED]-----END CERTIFICATE-----"),
+            "PEM certificate body should be redacted; got: {redacted:?}"
+        );
+        assert!(
+            !redacted.contains("MIIF9DCB"),
+            "PEM body data leaked through"
+        );
+    }
+
+    #[test]
+    fn test_redact_cert_thumbprint() {
+        let input = "cert_thumbprint=abcdef0123456789abcdef0123456789abcdef01";
+        let redacted = redact_sensitive(input);
+        assert!(redacted.contains("cert_thumbprint=[REDACTED]"));
+        assert!(!redacted.contains("abcdef0123456789abcdef0123456789abcdef01"));
+    }
+
+    #[test]
+    fn test_redact_jwt_token() {
+        // Standalone JWT (no "Bearer " or "token=" prefix — those are handled
+        // by the bearer_token pattern which redacts the entire token).
+        let input = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signature123";
+        let redacted = redact_sensitive(input);
+        assert!(redacted.contains("[REDACTED]"));
+        assert!(!redacted.contains("signature123"));
+        // The pattern should keep the prefix up to the second dot
+        assert!(redacted.contains("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0."));
+    }
+
+    #[test]
+    fn test_redact_session_token() {
+        let input = "session_token=a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
+        let redacted = redact_sensitive(input);
+        assert!(redacted.contains("session_token=[REDACTED]"));
+        assert!(!redacted.contains("a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"));
+    }
+
+    #[test]
+    fn test_redact_x509_dn() {
+        let input = "Issuer: CN=MyCA,O=MyOrg,C=US";
+        let redacted = redact_sensitive(input);
+        assert!(redacted.contains("[REDACTED]"));
+        assert!(!redacted.contains("MyCA"));
+    }
+
+    #[test]
+    fn test_boundary_kv_enter() {
+        let kv = boundary_kv("pe_loader", "enter", Some("kernel32.dll"));
+        assert_eq!(kv.get("boundary").unwrap(), "pe_loader");
+        assert_eq!(kv.get("direction").unwrap(), "enter");
+        assert_eq!(kv.get("detail").unwrap(), "kernel32.dll");
+    }
+
+    #[test]
+    fn test_boundary_kv_exit_no_detail() {
+        let kv = boundary_kv("network", "exit", None);
+        assert_eq!(kv.get("boundary").unwrap(), "network");
+        assert_eq!(kv.get("direction").unwrap(), "exit");
+        assert!(kv.get("detail").is_none());
+    }
+
+    #[test]
+    fn test_boundary_kv_all_subsystems() {
+        for (subsystem, detail) in &[
+            ("pe_loader", "kernel32.dll"),
+            ("thread", "12345"),
+            ("graphics", "metal"),
+            ("audio", "coreaudio"),
+            ("network", "steam://connect"),
+        ] {
+            let kv = boundary_kv(subsystem, "enter", Some(detail));
+            assert_eq!(kv.get("boundary").unwrap(), subsystem);
+            assert_eq!(kv.get("direction").unwrap(), "enter");
+            assert_eq!(kv.get("detail").unwrap(), detail);
+        }
+    }
+
+    #[test]
+    fn test_jsonl_logger_writes_events() {
+        let path = temp_log_path();
+        let mut logger = JsonlLogger::new(&path, 1234, false).expect("create logger");
+        let event = logger
+            .log("test", "info", ReasonCode::RcIo, "hello", BTreeMap::new())
+            .expect("log event");
+        assert_eq!(event.event_id, 1);
+        assert_eq!(event.pid, 1234);
+        assert_eq!(event.module, "test");
+
+        // Read back and verify
+        let mut contents = String::new();
+        File::open(&path)
+            .expect("open log")
+            .read_to_string(&mut contents)
+            .expect("read log");
+        assert!(contents.contains("hello"));
+
+        // Cleanup
+        let _ = std::fs::remove_file(&path);
     }
 }

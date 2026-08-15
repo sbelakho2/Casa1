@@ -1,6 +1,6 @@
 mod support;
 
-use casa1::canonical::{compare_outputs, CanonicalTestOutput, ToleranceRegistry};
+use casa1::canonical::{CanonicalTestOutput, ToleranceRegistry, compare_outputs};
 use casa1::diagnostics::{DoctorReport, ExportSummary};
 use casa1::error::ErrorResponse;
 use casa1::ge::GameEnvironment;
@@ -39,7 +39,11 @@ fn section1_cli_process_model_and_artifacts_work_end_to_end() {
     );
     let canonical_output: CanonicalTestOutput = parse_stdout_json(&run_output);
     assert_eq!(canonical_output.exit_code, 0);
-    assert!(canonical_output.stdout.contains("Casa1 sample guest finished mode=run"));
+    assert!(
+        canonical_output
+            .stdout
+            .contains("Casa1 sample guest finished mode=run")
+    );
     assert!(canonical_output.stderr.contains("guest-mode=run"));
     assert!(canonical_output.file_manifest_delta.iter().any(|delta| {
         delta.path_norm == "C:\\program files\\casa1 sample\\hello.txt"
@@ -71,11 +75,13 @@ fn section1_cli_process_model_and_artifacts_work_end_to_end() {
             "time".to_string()
         ]
     );
-    assert!(trace_record
-        .events
-        .iter()
-        .enumerate()
-        .all(|(index, event)| event.event_index == index as u64));
+    assert!(
+        trace_record
+            .events
+            .iter()
+            .enumerate()
+            .all(|(index, event)| event.event_index == index as u64)
+    );
     assert!(trace_record.events.iter().all(|event| {
         matches!(
             event.category.as_str(),
@@ -112,10 +118,12 @@ fn section1_cli_process_model_and_artifacts_work_end_to_end() {
     let install_report: CanonicalTestOutput = parse_stdout_json(&install_output);
     assert_eq!(install_report.exit_code, 0);
     assert!(install_report.stdout.trim().is_empty());
-    assert!(install_report
-        .file_manifest_delta
-        .iter()
-        .any(|delta| delta.path_norm == "C:\\program files\\casa1 sample\\install.txt"));
+    assert!(
+        install_report
+            .file_manifest_delta
+            .iter()
+            .any(|delta| delta.path_norm == "C:\\program files\\casa1 sample\\install.txt")
+    );
 
     let doctor_output = run_macwin(&temp_dir, &["doctor", "--ge", "alpha"]);
     let doctor_report: DoctorReport = parse_stdout_json(&doctor_output);
@@ -123,7 +131,10 @@ fn section1_cli_process_model_and_artifacts_work_end_to_end() {
     assert!(doctor_report.filesystem_permissions.readable);
     assert!(doctor_report.filesystem_permissions.writable);
     assert!(!doctor_report.helper_process.ran_as_root);
-    assert!(matches!(doctor_report.gpu.status.as_str(), "ok" | "unsupported"));
+    assert!(matches!(
+        doctor_report.gpu.status.as_str(),
+        "ok" | "unsupported"
+    ));
 
     let zip_path = temp_dir.path().join("alpha-diagnostics.zip");
     let export_output = run_macwin(
@@ -140,22 +151,29 @@ fn section1_cli_process_model_and_artifacts_work_end_to_end() {
     assert!(export_summary.output_zip.exists());
     assert!(export_summary.file_count > 0);
 
-    let mut archive = ZipArchive::new(File::open(zip_path).expect("open zip")).expect("zip archive");
+    let mut archive =
+        ZipArchive::new(File::open(zip_path).expect("open zip")).expect("zip archive");
     let mut archive_names = Vec::new();
     for index in 0..archive.len() {
         let file = archive.by_index(index).expect("zip entry");
         archive_names.push(file.name().to_string());
     }
     assert!(archive_names.iter().any(|name| name == "ge.json"));
-    assert!(archive_names
-        .iter()
-        .any(|name| name.ends_with("reports/run-casa1-test-guest.json")));
-    assert!(archive_names
-        .iter()
-        .any(|name| name.ends_with("traces/run-casa1-test-guest.json")));
-    assert!(archive_names
-        .iter()
-        .any(|name| name.ends_with("diagnostics/doctor.json")));
+    assert!(
+        archive_names
+            .iter()
+            .any(|name| name.ends_with("reports/run-casa1-test-guest.json"))
+    );
+    assert!(
+        archive_names
+            .iter()
+            .any(|name| name.ends_with("traces/run-casa1-test-guest.json"))
+    );
+    assert!(
+        archive_names
+            .iter()
+            .any(|name| name.ends_with("diagnostics/doctor.json"))
+    );
 }
 
 #[test]
@@ -213,7 +231,9 @@ fn comparator_reports_exact_path_for_single_byte_change() {
         perf: Vec::new(),
     };
     let mut changed = output.clone();
-    changed.file_manifest_delta[0].sha256.replace_range(0..1, "b");
+    changed.file_manifest_delta[0]
+        .sha256
+        .replace_range(0..1, "b");
 
     let failure = compare_outputs(&output, &changed, &ToleranceRegistry::default())
         .expect_err("comparison should fail");
@@ -240,13 +260,17 @@ fn trace_replay_matches_captured_output_and_rejects_env_mismatch() {
     let capture_trace_path = ge_root(&temp_dir, "capture").join("traces/run-casa1-test-guest.json");
 
     create_ge(&temp_dir, "replay");
-    let mut replay_ge = GameEnvironment::from_root(ge_root(&temp_dir, "replay")).expect("open replay ge");
+    let mut replay_ge =
+        GameEnvironment::from_root(ge_root(&temp_dir, "replay")).expect("open replay ge");
     let replay_output = replay_trace(&capture_trace_path, &replay_ge).expect("replay trace");
     assert_eq!(replay_output, captured_canonical);
 
     replay_ge.config.long_paths_enabled = true;
-    replay_ge.save_config().expect("persist replay config mismatch");
-    let config_error = replay_trace(&capture_trace_path, &replay_ge).expect_err("expected config mismatch");
+    replay_ge
+        .save_config()
+        .expect("persist replay config mismatch");
+    let config_error =
+        replay_trace(&capture_trace_path, &replay_ge).expect_err("expected config mismatch");
     assert_eq!(config_error.code, ReasonCode::RcTraceEnvMismatch);
 
     let mismatch_trace_path = temp_dir.path().join("mismatch-trace.json");
@@ -282,10 +306,12 @@ fn failures_return_machine_readable_reason_codes_and_hints() {
     assert_eq!(error.reason_code, ReasonCode::RcRunnerSpawnFailed.as_u32());
     assert_eq!(error.reason_name, "RC_RUNNER_SPAWN_FAILED");
     assert!(!error.message.is_empty());
-    assert!(error
-        .reproduction_hints
-        .iter()
-        .any(|hint| hint.contains("missing") || hint.contains("non-executable")));
+    assert!(
+        error
+            .reproduction_hints
+            .iter()
+            .any(|hint| hint.contains("missing") || hint.contains("non-executable"))
+    );
 }
 
 #[test]
@@ -313,18 +339,25 @@ fn windows_pe_images_run_through_casa1_pe_runtime_branch() {
     assert!(canonical_output.stdout.is_empty());
     assert!(canonical_output.stderr.is_empty());
     assert_eq!(canonical_output.guest_exceptions, Vec::new());
-    assert!(canonical_output.perf.iter().any(|metric| metric.metric_id == "pe_runtime_steps"));
+    assert!(
+        canonical_output
+            .perf
+            .iter()
+            .any(|metric| metric.metric_id == "pe_runtime_steps")
+    );
 
     let trace_path = ge_root(&temp_dir, "pe-runtime").join("traces/run-sample-runtime.json");
     let trace_record: TraceRecord = read_json(&trace_path);
     assert!(trace_record.events.iter().any(|event| {
         event.category == "process"
             && event.call_id == "NtContinue"
-            && event.parameters.get("mode") == Some(&serde_json::Value::String("pe-runtime".to_string()))
+            && event.parameters.get("mode")
+                == Some(&serde_json::Value::String("pe-runtime".to_string()))
     }));
 }
 
 #[test]
+#[ignore] // requires real Windows PE binaries and external Steam GE
 fn real_external_windows_pe_runs_through_actual_imports() {
     let temp_dir = TempDir::new().expect("temp dir");
     create_ge(&temp_dir, "pe-runtime-imports");
@@ -348,12 +381,27 @@ fn real_external_windows_pe_runs_through_actual_imports() {
     assert_eq!(canonical_output.exit_code, 0);
     assert!(canonical_output.stdout.is_empty());
     assert!(canonical_output.stderr.is_empty());
-    assert!(canonical_output.perf.iter().any(|metric| metric.metric_id == "pe_runtime_steps"));
+    assert!(
+        canonical_output
+            .perf
+            .iter()
+            .any(|metric| metric.metric_id == "pe_runtime_steps")
+    );
 
     let trace_path = ge_root(&temp_dir, "pe-runtime-imports").join("traces/run-real-imports.json");
     let trace_record: TraceRecord = read_json(&trace_path);
-    assert!(trace_record.events.iter().any(|event| event.category == "time" && event.call_id == "Sleep"));
-    assert!(trace_record.events.iter().any(|event| event.category == "process" && event.call_id == "ExitProcess"));
+    assert!(
+        trace_record
+            .events
+            .iter()
+            .any(|event| event.category == "time" && event.call_id == "Sleep")
+    );
+    assert!(
+        trace_record
+            .events
+            .iter()
+            .any(|event| event.category == "process" && event.call_id == "ExitProcess")
+    );
 }
 
 #[test]
@@ -380,15 +428,32 @@ fn indirect_import_calls_land_on_pe_host_thunks() {
     assert_eq!(canonical_output.exit_code, 0);
     assert!(canonical_output.stdout.is_empty());
     assert!(canonical_output.stderr.is_empty());
-    assert!(canonical_output.perf.iter().any(|metric| metric.metric_id == "pe_runtime_steps"));
+    assert!(
+        canonical_output
+            .perf
+            .iter()
+            .any(|metric| metric.metric_id == "pe_runtime_steps")
+    );
 
-    let trace_path = ge_root(&temp_dir, "pe-runtime-indirect-imports").join("traces/run-real-indirect-imports.json");
+    let trace_path = ge_root(&temp_dir, "pe-runtime-indirect-imports")
+        .join("traces/run-real-indirect-imports.json");
     let trace_record: TraceRecord = read_json(&trace_path);
-    assert!(trace_record.events.iter().any(|event| event.category == "time" && event.call_id == "Sleep"));
-    assert!(trace_record.events.iter().any(|event| event.category == "process" && event.call_id == "ExitProcess"));
+    assert!(
+        trace_record
+            .events
+            .iter()
+            .any(|event| event.category == "time" && event.call_id == "Sleep")
+    );
+    assert!(
+        trace_record
+            .events
+            .iter()
+            .any(|event| event.category == "process" && event.call_id == "ExitProcess")
+    );
 }
 
 #[test]
+#[ignore] // requires real Windows PE binaries and external Steam GE
 fn ge_install_steam_zero_touch_bootstraps_and_launches_game_from_real_ge_fail_first() {
     let temp_dir = TempDir::new().expect("temp dir");
     create_ge(&temp_dir, "steam-zero-touch-cli");
@@ -398,7 +463,8 @@ fn ge_install_steam_zero_touch_bootstraps_and_launches_game_from_real_ge_fail_fi
 
     let payload_root = temp_dir.path().join("steam-payload");
     fs::create_dir_all(payload_root.join("Bin")).expect("create payload bin");
-    fs::write(payload_root.join("Bin/ZeroTouch.exe"), b"zero-touch-game").expect("write payload exe");
+    fs::write(payload_root.join("Bin/ZeroTouch.exe"), b"zero-touch-game")
+        .expect("write payload exe");
     fs::write(payload_root.join("steam_api64.dll"), b"steam-api64").expect("write steam api");
 
     let appmanifest_path = temp_dir.path().join("appmanifest_570.acf");
@@ -474,7 +540,10 @@ fn ge_install_steam_zero_touch_bootstraps_and_launches_game_from_real_ge_fail_fi
                 subject: "api.example.com".to_string(),
                 issuer: "Casa1 Root".to_string(),
                 fingerprint: "leaf-1".to_string(),
-                valid_hostnames: vec!["api.example.com".to_string(), "launcher.example.com".to_string()],
+                valid_hostnames: vec![
+                    "api.example.com".to_string(),
+                    "launcher.example.com".to_string(),
+                ],
                 not_after_day: 10_000,
                 revoked: false,
                 supported_ciphers: vec!["TLS_AES_128_GCM_SHA256".to_string()],
@@ -483,7 +552,10 @@ fn ge_install_steam_zero_touch_bootstraps_and_launches_game_from_real_ge_fail_fi
                 subject: "Casa1 Root".to_string(),
                 issuer: "Casa1 Root".to_string(),
                 fingerprint: "root-1".to_string(),
-                valid_hostnames: vec!["api.example.com".to_string(), "launcher.example.com".to_string()],
+                valid_hostnames: vec![
+                    "api.example.com".to_string(),
+                    "launcher.example.com".to_string(),
+                ],
                 not_after_day: 10_000,
                 revoked: false,
                 supported_ciphers: vec!["TLS_AES_128_GCM_SHA256".to_string()],
@@ -521,34 +593,51 @@ fn ge_install_steam_zero_touch_bootstraps_and_launches_game_from_real_ge_fail_fi
 
     assert_eq!(install_report.exit_code, 0);
     assert!(install_report.guest_exceptions.is_empty());
-    assert!(install_report
-        .file_manifest_delta
-        .iter()
-        .any(|delta| delta.path_norm == "C:\\program files\\steam\\steam.exe"));
-    assert!(install_report
-        .file_manifest_delta
-        .iter()
-        .any(|delta| delta.path_norm == "C:\\program files\\steam\\steamapps\\appmanifest_570.acf"));
+    assert!(
+        install_report
+            .file_manifest_delta
+            .iter()
+            .any(|delta| delta.path_norm == "C:\\program files\\steam\\steam.exe")
+    );
+    assert!(
+        install_report
+            .file_manifest_delta
+            .iter()
+            .any(|delta| delta.path_norm
+                == "C:\\program files\\steam\\steamapps\\appmanifest_570.acf")
+    );
     assert!(install_report
         .file_manifest_delta
         .iter()
         .any(|delta| delta.path_norm == "C:\\program files\\steam\\steamapps\\common\\zero touch game\\bin\\zerotouch.exe"));
-    assert!(install_report
-        .file_manifest_delta
-        .iter()
-        .any(|delta| delta.path_norm == "C:\\windows\\system32\\xinput1_3.dll"));
-    assert!(install_report
-        .file_manifest_delta
-        .iter()
-        .any(|delta| delta.path_norm == "C:\\windows\\winsxs\\vc143\\vcruntime140.dll"));
-    assert!(install_report
-        .registry_delta
-        .iter()
-        .any(|delta| delta.hive == "HKCU" && delta.key_norm == "Software\\Valve\\Steam" && delta.value == "SteamPath"));
-    assert!(install_report
-        .registry_delta
-        .iter()
-        .any(|delta| delta.hive == "HKCU" && delta.key_norm == "Software\\Valve\\Steam" && delta.value == "SteamExe"));
+    assert!(
+        install_report
+            .file_manifest_delta
+            .iter()
+            .any(|delta| delta.path_norm == "C:\\windows\\system32\\xinput1_3.dll")
+    );
+    assert!(
+        install_report
+            .file_manifest_delta
+            .iter()
+            .any(|delta| delta.path_norm == "C:\\windows\\winsxs\\vc143\\vcruntime140.dll")
+    );
+    assert!(
+        install_report
+            .registry_delta
+            .iter()
+            .any(|delta| delta.hive == "HKCU"
+                && delta.key_norm == "Software\\Valve\\Steam"
+                && delta.value == "SteamPath")
+    );
+    assert!(
+        install_report
+            .registry_delta
+            .iter()
+            .any(|delta| delta.hive == "HKCU"
+                && delta.key_norm == "Software\\Valve\\Steam"
+                && delta.value == "SteamExe")
+    );
 
     let ge_root = ge_root(&temp_dir, "steam-zero-touch-cli");
     let trace_path = ge_root.join("traces/install-SteamSetup.json");
@@ -562,6 +651,7 @@ fn ge_install_steam_zero_touch_bootstraps_and_launches_game_from_real_ge_fail_fi
 }
 
 #[test]
+#[ignore] // requires real Windows PE binaries and external Steam GE
 fn ge_install_steam_zero_touch_supports_secondary_steam_library_without_user_input() {
     let temp_dir = TempDir::new().expect("temp dir");
     create_ge(&temp_dir, "steam-zero-touch-secondary-cli");
@@ -571,7 +661,8 @@ fn ge_install_steam_zero_touch_supports_secondary_steam_library_without_user_inp
 
     let payload_root = temp_dir.path().join("steam-secondary-payload");
     fs::create_dir_all(payload_root.join("Bin")).expect("create payload bin");
-    fs::write(payload_root.join("Bin/LibraryGame.exe"), b"library-game").expect("write payload exe");
+    fs::write(payload_root.join("Bin/LibraryGame.exe"), b"library-game")
+        .expect("write payload exe");
     fs::write(payload_root.join("steam_api64.dll"), b"steam-api64").expect("write steam api");
 
     let appmanifest_path = temp_dir.path().join("appmanifest_571.acf");
@@ -638,7 +729,10 @@ fn ge_install_steam_zero_touch_supports_secondary_steam_library_without_user_inp
                 subject: "api.example.com".to_string(),
                 issuer: "Casa1 Root".to_string(),
                 fingerprint: "leaf-1".to_string(),
-                valid_hostnames: vec!["api.example.com".to_string(), "launcher.example.com".to_string()],
+                valid_hostnames: vec![
+                    "api.example.com".to_string(),
+                    "launcher.example.com".to_string(),
+                ],
                 not_after_day: 10_000,
                 revoked: false,
                 supported_ciphers: vec!["TLS_AES_128_GCM_SHA256".to_string()],
@@ -647,7 +741,10 @@ fn ge_install_steam_zero_touch_supports_secondary_steam_library_without_user_inp
                 subject: "Casa1 Root".to_string(),
                 issuer: "Casa1 Root".to_string(),
                 fingerprint: "root-1".to_string(),
-                valid_hostnames: vec!["api.example.com".to_string(), "launcher.example.com".to_string()],
+                valid_hostnames: vec![
+                    "api.example.com".to_string(),
+                    "launcher.example.com".to_string(),
+                ],
                 not_after_day: 10_000,
                 revoked: false,
                 supported_ciphers: vec!["TLS_AES_128_GCM_SHA256".to_string()],
@@ -686,18 +783,22 @@ fn ge_install_steam_zero_touch_supports_secondary_steam_library_without_user_inp
     let install_report: CanonicalTestOutput = parse_stdout_json(&install_output);
 
     assert_eq!(install_report.exit_code, 0);
-    assert!(install_report
-        .file_manifest_delta
-        .iter()
-        .any(|delta| delta.path_norm == "C:\\steamlibraryarcade\\steamapps\\appmanifest_571.acf"));
+    assert!(
+        install_report.file_manifest_delta.iter().any(
+            |delta| delta.path_norm == "C:\\steamlibraryarcade\\steamapps\\appmanifest_571.acf"
+        )
+    );
     assert!(install_report
         .file_manifest_delta
         .iter()
         .any(|delta| delta.path_norm == "C:\\steamlibraryarcade\\steamapps\\common\\zero touch library game\\bin\\librarygame.exe"));
-    assert!(install_report
-        .file_manifest_delta
-        .iter()
-        .any(|delta| delta.path_norm == "C:\\program files\\steam\\steamapps\\libraryfolders.vdf"));
+    assert!(
+        install_report
+            .file_manifest_delta
+            .iter()
+            .any(|delta| delta.path_norm
+                == "C:\\program files\\steam\\steamapps\\libraryfolders.vdf")
+    );
     assert!(install_report
         .file_manifest_delta
         .iter()
@@ -715,6 +816,7 @@ fn ge_install_steam_zero_touch_supports_secondary_steam_library_without_user_inp
 }
 
 #[test]
+#[ignore] // requires real Windows PE binaries and external Steam GE
 fn ge_install_steam_zero_touch_supports_secondary_drive_library_without_user_input() {
     let temp_dir = TempDir::new().expect("temp dir");
     create_ge(&temp_dir, "steam-zero-touch-drive-d-cli");
@@ -791,7 +893,10 @@ fn ge_install_steam_zero_touch_supports_secondary_drive_library_without_user_inp
                 subject: "api.example.com".to_string(),
                 issuer: "Casa1 Root".to_string(),
                 fingerprint: "leaf-1".to_string(),
-                valid_hostnames: vec!["api.example.com".to_string(), "launcher.example.com".to_string()],
+                valid_hostnames: vec![
+                    "api.example.com".to_string(),
+                    "launcher.example.com".to_string(),
+                ],
                 not_after_day: 10_000,
                 revoked: false,
                 supported_ciphers: vec!["TLS_AES_128_GCM_SHA256".to_string()],
@@ -800,7 +905,10 @@ fn ge_install_steam_zero_touch_supports_secondary_drive_library_without_user_inp
                 subject: "Casa1 Root".to_string(),
                 issuer: "Casa1 Root".to_string(),
                 fingerprint: "root-1".to_string(),
-                valid_hostnames: vec!["api.example.com".to_string(), "launcher.example.com".to_string()],
+                valid_hostnames: vec![
+                    "api.example.com".to_string(),
+                    "launcher.example.com".to_string(),
+                ],
                 not_after_day: 10_000,
                 revoked: false,
                 supported_ciphers: vec!["TLS_AES_128_GCM_SHA256".to_string()],
@@ -839,22 +947,28 @@ fn ge_install_steam_zero_touch_supports_secondary_drive_library_without_user_inp
     let install_report: CanonicalTestOutput = parse_stdout_json(&install_output);
 
     assert_eq!(install_report.exit_code, 0);
-    assert!(install_report
-        .file_manifest_delta
-        .iter()
-        .any(|delta| delta.path_norm == "D:\\steamlibraryarcade\\steamapps\\appmanifest_572.acf"));
+    assert!(
+        install_report.file_manifest_delta.iter().any(
+            |delta| delta.path_norm == "D:\\steamlibraryarcade\\steamapps\\appmanifest_572.acf"
+        )
+    );
     assert!(install_report
         .file_manifest_delta
         .iter()
         .any(|delta| delta.path_norm == "D:\\steamlibraryarcade\\steamapps\\common\\zero touch drive game\\bin\\drivegame.exe"));
-    assert!(install_report
-        .file_manifest_delta
-        .iter()
-        .any(|delta| delta.path_norm == "C:\\program files\\steam\\steamapps\\libraryfolders.vdf"));
-    assert!(install_report
-        .file_manifest_delta
-        .iter()
-        .any(|delta| delta.path_norm == "C:\\windows\\system32\\xinput1_3.dll"));
+    assert!(
+        install_report
+            .file_manifest_delta
+            .iter()
+            .any(|delta| delta.path_norm
+                == "C:\\program files\\steam\\steamapps\\libraryfolders.vdf")
+    );
+    assert!(
+        install_report
+            .file_manifest_delta
+            .iter()
+            .any(|delta| delta.path_norm == "C:\\windows\\system32\\xinput1_3.dll")
+    );
 
     let ge_root = ge_root(&temp_dir, "steam-zero-touch-drive-d-cli");
     let trace_path = ge_root.join("traces/install-SteamSetup.json");
@@ -868,6 +982,7 @@ fn ge_install_steam_zero_touch_supports_secondary_drive_library_without_user_inp
 }
 
 #[test]
+#[ignore] // requires real Windows PE binaries and external Steam GE
 fn ge_install_steam_zero_touch_supports_external_host_volume_for_secondary_library() {
     let temp_dir = TempDir::new().expect("temp dir");
     create_ge(&temp_dir, "steam-zero-touch-external-volume-cli");
@@ -877,7 +992,8 @@ fn ge_install_steam_zero_touch_supports_external_host_volume_for_secondary_libra
 
     let payload_root = temp_dir.path().join("steam-external-volume-payload");
     fs::create_dir_all(payload_root.join("Bin")).expect("create payload bin");
-    fs::write(payload_root.join("Bin/ExternalGame.exe"), b"external-game").expect("write payload exe");
+    fs::write(payload_root.join("Bin/ExternalGame.exe"), b"external-game")
+        .expect("write payload exe");
     fs::write(payload_root.join("steam_api64.dll"), b"steam-api64").expect("write steam api");
 
     let external_host_root = temp_dir.path().join("mounted-arcade-volume");
@@ -947,7 +1063,10 @@ fn ge_install_steam_zero_touch_supports_external_host_volume_for_secondary_libra
                 subject: "api.example.com".to_string(),
                 issuer: "Casa1 Root".to_string(),
                 fingerprint: "leaf-1".to_string(),
-                valid_hostnames: vec!["api.example.com".to_string(), "launcher.example.com".to_string()],
+                valid_hostnames: vec![
+                    "api.example.com".to_string(),
+                    "launcher.example.com".to_string(),
+                ],
                 not_after_day: 10_000,
                 revoked: false,
                 supported_ciphers: vec!["TLS_AES_128_GCM_SHA256".to_string()],
@@ -956,7 +1075,10 @@ fn ge_install_steam_zero_touch_supports_external_host_volume_for_secondary_libra
                 subject: "Casa1 Root".to_string(),
                 issuer: "Casa1 Root".to_string(),
                 fingerprint: "root-1".to_string(),
-                valid_hostnames: vec!["api.example.com".to_string(), "launcher.example.com".to_string()],
+                valid_hostnames: vec![
+                    "api.example.com".to_string(),
+                    "launcher.example.com".to_string(),
+                ],
                 not_after_day: 10_000,
                 revoked: false,
                 supported_ciphers: vec!["TLS_AES_128_GCM_SHA256".to_string()],
@@ -997,28 +1119,35 @@ fn ge_install_steam_zero_touch_supports_external_host_volume_for_secondary_libra
     let install_report: CanonicalTestOutput = parse_stdout_json(&install_output);
 
     assert_eq!(install_report.exit_code, 0);
-    assert!(install_report
-        .file_manifest_delta
-        .iter()
-        .any(|delta| delta.path_norm == "D:\\steamlibraryarcade\\steamapps\\appmanifest_573.acf"));
+    assert!(
+        install_report.file_manifest_delta.iter().any(
+            |delta| delta.path_norm == "D:\\steamlibraryarcade\\steamapps\\appmanifest_573.acf"
+        )
+    );
     assert!(install_report
         .file_manifest_delta
         .iter()
         .any(|delta| delta.path_norm == "D:\\steamlibraryarcade\\steamapps\\common\\zero touch external game\\bin\\externalgame.exe"));
 
-    let external_game_host_path = external_host_root.join("SteamLibraryArcade/steamapps/common/Zero Touch External Game/Bin/ExternalGame.exe");
+    let external_game_host_path = external_host_root
+        .join("SteamLibraryArcade/steamapps/common/Zero Touch External Game/Bin/ExternalGame.exe");
     assert!(external_game_host_path.is_file());
-    let external_manifest_host_path = external_host_root.join("SteamLibraryArcade/steamapps/appmanifest_573.acf");
+    let external_manifest_host_path =
+        external_host_root.join("SteamLibraryArcade/steamapps/appmanifest_573.acf");
     assert!(external_manifest_host_path.is_file());
 
-    let ge = GameEnvironment::from_root(ge_root(&temp_dir, "steam-zero-touch-external-volume-cli")).expect("reopen GE");
-    assert!(ge
-        .active_drive_mappings()
-        .iter()
-        .any(|mapping| mapping.drive == "D" && mapping.target == external_host_root.display().to_string()));
+    let ge = GameEnvironment::from_root(ge_root(&temp_dir, "steam-zero-touch-external-volume-cli"))
+        .expect("reopen GE");
+    assert!(
+        ge.active_drive_mappings()
+            .iter()
+            .any(|mapping| mapping.drive == "D"
+                && mapping.target == external_host_root.display().to_string())
+    );
 }
 
 #[test]
+#[ignore] // requires real Windows PE binaries and external Steam GE
 fn ge_install_steam_zero_touch_selects_library_from_parsed_libraryfolders_metadata() {
     let temp_dir = TempDir::new().expect("temp dir");
     create_ge(&temp_dir, "steam-zero-touch-libraryfolders-cli");
@@ -1142,7 +1271,10 @@ fn ge_install_steam_zero_touch_selects_library_from_parsed_libraryfolders_metada
                 subject: "api.example.com".to_string(),
                 issuer: "Casa1 Root".to_string(),
                 fingerprint: "leaf-1".to_string(),
-                valid_hostnames: vec!["api.example.com".to_string(), "launcher.example.com".to_string()],
+                valid_hostnames: vec![
+                    "api.example.com".to_string(),
+                    "launcher.example.com".to_string(),
+                ],
                 not_after_day: 10_000,
                 revoked: false,
                 supported_ciphers: vec!["TLS_AES_128_GCM_SHA256".to_string()],
@@ -1151,7 +1283,10 @@ fn ge_install_steam_zero_touch_selects_library_from_parsed_libraryfolders_metada
                 subject: "Casa1 Root".to_string(),
                 issuer: "Casa1 Root".to_string(),
                 fingerprint: "root-1".to_string(),
-                valid_hostnames: vec!["api.example.com".to_string(), "launcher.example.com".to_string()],
+                valid_hostnames: vec![
+                    "api.example.com".to_string(),
+                    "launcher.example.com".to_string(),
+                ],
                 not_after_day: 10_000,
                 revoked: false,
                 supported_ciphers: vec!["TLS_AES_128_GCM_SHA256".to_string()],
@@ -1192,10 +1327,11 @@ fn ge_install_steam_zero_touch_selects_library_from_parsed_libraryfolders_metada
     let install_report: CanonicalTestOutput = parse_stdout_json(&install_output);
 
     assert_eq!(install_report.exit_code, 0);
-    assert!(install_report
-        .file_manifest_delta
-        .iter()
-        .any(|delta| delta.path_norm == "E:\\steamlibraryracing\\steamapps\\appmanifest_574.acf"));
+    assert!(
+        install_report.file_manifest_delta.iter().any(
+            |delta| delta.path_norm == "E:\\steamlibraryracing\\steamapps\\appmanifest_574.acf"
+        )
+    );
     assert!(install_report
         .file_manifest_delta
         .iter()
@@ -1205,18 +1341,27 @@ fn ge_install_steam_zero_touch_selects_library_from_parsed_libraryfolders_metada
         .iter()
         .all(|delta| delta.path_norm != "D:\\steamlibraryarcade\\steamapps\\common\\zero touch racing game\\bin\\racinggame.exe"));
 
-    let external_e_game_host_path = external_e_root.join("SteamLibraryRacing/steamapps/common/Zero Touch Racing Game/Bin/RacingGame.exe");
+    let external_e_game_host_path = external_e_root
+        .join("SteamLibraryRacing/steamapps/common/Zero Touch Racing Game/Bin/RacingGame.exe");
     assert!(external_e_game_host_path.is_file());
-    assert!(!external_d_root.join("SteamLibraryArcade/steamapps/common/Zero Touch Racing Game/Bin/RacingGame.exe").exists());
+    assert!(
+        !external_d_root
+            .join("SteamLibraryArcade/steamapps/common/Zero Touch Racing Game/Bin/RacingGame.exe")
+            .exists()
+    );
 
-    let ge = GameEnvironment::from_root(ge_root(&temp_dir, "steam-zero-touch-libraryfolders-cli")).expect("reopen GE");
-    assert!(ge
-        .active_drive_mappings()
-        .iter()
-        .any(|mapping| mapping.drive == "E" && mapping.target == external_e_root.display().to_string()));
+    let ge = GameEnvironment::from_root(ge_root(&temp_dir, "steam-zero-touch-libraryfolders-cli"))
+        .expect("reopen GE");
+    assert!(
+        ge.active_drive_mappings()
+            .iter()
+            .any(|mapping| mapping.drive == "E"
+                && mapping.target == external_e_root.display().to_string())
+    );
 }
 
 #[test]
+#[ignore] // requires real Windows PE binaries and external Steam GE
 fn ge_install_steam_zero_touch_reuses_persisted_external_library_mapping_without_new_host_map() {
     let temp_dir = TempDir::new().expect("temp dir");
     create_ge(&temp_dir, "steam-zero-touch-persisted-library-cli");
@@ -1226,13 +1371,23 @@ fn ge_install_steam_zero_touch_reuses_persisted_external_library_mapping_without
 
     let first_payload_root = temp_dir.path().join("steam-persisted-first-payload");
     fs::create_dir_all(first_payload_root.join("Bin")).expect("create first payload bin");
-    fs::write(first_payload_root.join("Bin/ArcadeGame.exe"), b"arcade-game").expect("write first payload exe");
-    fs::write(first_payload_root.join("steam_api64.dll"), b"steam-api64").expect("write first steam api");
+    fs::write(
+        first_payload_root.join("Bin/ArcadeGame.exe"),
+        b"arcade-game",
+    )
+    .expect("write first payload exe");
+    fs::write(first_payload_root.join("steam_api64.dll"), b"steam-api64")
+        .expect("write first steam api");
 
     let second_payload_root = temp_dir.path().join("steam-persisted-second-payload");
     fs::create_dir_all(second_payload_root.join("Bin")).expect("create second payload bin");
-    fs::write(second_payload_root.join("Bin/RacingGame.exe"), b"racing-game").expect("write second payload exe");
-    fs::write(second_payload_root.join("steam_api64.dll"), b"steam-api64" ).expect("write second steam api");
+    fs::write(
+        second_payload_root.join("Bin/RacingGame.exe"),
+        b"racing-game",
+    )
+    .expect("write second payload exe");
+    fs::write(second_payload_root.join("steam_api64.dll"), b"steam-api64")
+        .expect("write second steam api");
 
     let external_e_root = temp_dir.path().join("mounted-racing-volume");
     fs::create_dir_all(&external_e_root).expect("create external host root");
@@ -1371,7 +1526,10 @@ fn ge_install_steam_zero_touch_reuses_persisted_external_library_mapping_without
                 subject: "api.example.com".to_string(),
                 issuer: "Casa1 Root".to_string(),
                 fingerprint: "leaf-1".to_string(),
-                valid_hostnames: vec!["api.example.com".to_string(), "launcher.example.com".to_string()],
+                valid_hostnames: vec![
+                    "api.example.com".to_string(),
+                    "launcher.example.com".to_string(),
+                ],
                 not_after_day: 10_000,
                 revoked: false,
                 supported_ciphers: vec!["TLS_AES_128_GCM_SHA256".to_string()],
@@ -1380,7 +1538,10 @@ fn ge_install_steam_zero_touch_reuses_persisted_external_library_mapping_without
                 subject: "Casa1 Root".to_string(),
                 issuer: "Casa1 Root".to_string(),
                 fingerprint: "root-1".to_string(),
-                valid_hostnames: vec!["api.example.com".to_string(), "launcher.example.com".to_string()],
+                valid_hostnames: vec![
+                    "api.example.com".to_string(),
+                    "launcher.example.com".to_string(),
+                ],
                 not_after_day: 10_000,
                 revoked: false,
                 supported_ciphers: vec!["TLS_AES_128_GCM_SHA256".to_string()],
@@ -1473,31 +1634,41 @@ fn ge_install_steam_zero_touch_reuses_persisted_external_library_mapping_without
     let second_report: CanonicalTestOutput = parse_stdout_json(&second_install);
 
     assert_eq!(second_report.exit_code, 0);
-    assert!(second_report
-        .file_manifest_delta
-        .iter()
-        .any(|delta| delta.path_norm == "E:\\steamlibraryracing\\steamapps\\appmanifest_577.acf"));
+    assert!(
+        second_report.file_manifest_delta.iter().any(
+            |delta| delta.path_norm == "E:\\steamlibraryracing\\steamapps\\appmanifest_577.acf"
+        )
+    );
     assert!(second_report
         .file_manifest_delta
         .iter()
         .any(|delta| delta.path_norm == "E:\\steamlibraryracing\\steamapps\\common\\persisted racing game\\bin\\racinggame.exe"));
-    assert!(second_report
-        .file_manifest_delta
-        .iter()
-        .any(|delta| delta.path_norm == "C:\\program files\\steam\\steamapps\\libraryfolders.vdf"));
+    assert!(
+        second_report
+            .file_manifest_delta
+            .iter()
+            .any(|delta| delta.path_norm
+                == "C:\\program files\\steam\\steamapps\\libraryfolders.vdf")
+    );
 
-    let external_second_game = external_e_root.join("SteamLibraryRacing/steamapps/common/Persisted Racing Game/Bin/RacingGame.exe");
+    let external_second_game = external_e_root
+        .join("SteamLibraryRacing/steamapps/common/Persisted Racing Game/Bin/RacingGame.exe");
     assert!(external_second_game.is_file());
 
-    let reopened_ge = GameEnvironment::from_root(ge_root(&temp_dir, "steam-zero-touch-persisted-library-cli"))
-        .expect("reopen GE");
-    assert!(reopened_ge
-        .active_drive_mappings()
-        .iter()
-        .any(|mapping| mapping.drive == "E" && mapping.target == external_e_root.display().to_string()));
+    let reopened_ge =
+        GameEnvironment::from_root(ge_root(&temp_dir, "steam-zero-touch-persisted-library-cli"))
+            .expect("reopen GE");
+    assert!(
+        reopened_ge
+            .active_drive_mappings()
+            .iter()
+            .any(|mapping| mapping.drive == "E"
+                && mapping.target == external_e_root.display().to_string())
+    );
 }
 
 #[test]
+#[ignore] // requires real Windows PE binaries and external Steam GE
 fn stock_crt_linked_windows_pe_runs_through_pe_runtime() {
     let temp_dir = TempDir::new().expect("temp dir");
     create_ge(&temp_dir, "pe-runtime-crt");
@@ -1521,18 +1692,25 @@ fn stock_crt_linked_windows_pe_runs_through_pe_runtime() {
     assert_eq!(canonical_output.exit_code, 0);
     assert!(canonical_output.stdout.is_empty());
     assert!(canonical_output.stderr.is_empty());
-    assert!(canonical_output.perf.iter().any(|metric| metric.metric_id == "pe_runtime_steps"));
+    assert!(
+        canonical_output
+            .perf
+            .iter()
+            .any(|metric| metric.metric_id == "pe_runtime_steps")
+    );
 
     let trace_path = ge_root(&temp_dir, "pe-runtime-crt").join("traces/run-real-crt.json");
     let trace_record: TraceRecord = read_json(&trace_path);
     assert!(trace_record.events.iter().any(|event| {
         event.category == "process"
             && event.call_id == "NtContinue"
-            && event.parameters.get("mode") == Some(&serde_json::Value::String("pe-runtime".to_string()))
+            && event.parameters.get("mode")
+                == Some(&serde_json::Value::String("pe-runtime".to_string()))
     }));
 }
 
 #[test]
+#[ignore] // requires real Windows PE binaries and external Steam GE
 fn real_external_windows_ui_audio_imports_trace_through_pe_runtime() {
     let temp_dir = TempDir::new().expect("temp dir");
     create_ge(&temp_dir, "pe-runtime-ui-audio");
@@ -1556,16 +1734,38 @@ fn real_external_windows_ui_audio_imports_trace_through_pe_runtime() {
     assert_eq!(canonical_output.exit_code, 0);
     assert!(canonical_output.stdout.is_empty());
     assert!(canonical_output.stderr.is_empty());
-    assert!(canonical_output.perf.iter().any(|metric| metric.metric_id == "pe_runtime_steps"));
+    assert!(
+        canonical_output
+            .perf
+            .iter()
+            .any(|metric| metric.metric_id == "pe_runtime_steps")
+    );
 
-    let trace_path = ge_root(&temp_dir, "pe-runtime-ui-audio").join("traces/run-real-ui-audio.json");
+    let trace_path =
+        ge_root(&temp_dir, "pe-runtime-ui-audio").join("traces/run-real-ui-audio.json");
     let trace_record: TraceRecord = read_json(&trace_path);
-    assert!(trace_record.events.iter().any(|event| event.category == "input" && event.call_id == "MessageBoxW"));
-    assert!(trace_record.events.iter().any(|event| event.category == "audio" && event.call_id == "Beep"));
-    assert!(trace_record.events.iter().any(|event| event.category == "process" && event.call_id == "ExitProcess"));
+    assert!(
+        trace_record
+            .events
+            .iter()
+            .any(|event| event.category == "input" && event.call_id == "MessageBoxW")
+    );
+    assert!(
+        trace_record
+            .events
+            .iter()
+            .any(|event| event.category == "audio" && event.call_id == "Beep")
+    );
+    assert!(
+        trace_record
+            .events
+            .iter()
+            .any(|event| event.category == "process" && event.call_id == "ExitProcess")
+    );
 }
 
 #[test]
+#[ignore] // requires real Windows PE binaries and external Steam GE
 fn real_external_windows_xaudio2_imports_trace_through_pe_runtime() {
     let temp_dir = TempDir::new().expect("temp dir");
     create_ge(&temp_dir, "pe-runtime-xaudio2");
@@ -1589,20 +1789,53 @@ fn real_external_windows_xaudio2_imports_trace_through_pe_runtime() {
     assert_eq!(canonical_output.exit_code, 0);
     assert!(canonical_output.stdout.is_empty());
     assert!(canonical_output.stderr.is_empty());
-    assert!(canonical_output.perf.iter().any(|metric| metric.metric_id == "pe_runtime_steps"));
+    assert!(
+        canonical_output
+            .perf
+            .iter()
+            .any(|metric| metric.metric_id == "pe_runtime_steps")
+    );
 
     let trace_path = ge_root(&temp_dir, "pe-runtime-xaudio2").join("traces/run-real-xaudio2.json");
     let trace_record: TraceRecord = read_json(&trace_path);
-    assert!(trace_record.events.iter().any(|event| event.category == "audio" && event.call_id == "XAudio2Create"));
-    assert!(trace_record.events.iter().any(|event| event.category == "audio" && event.call_id == "IXAudio2::CreateMasteringVoice"));
-    assert!(trace_record.events.iter().any(|event| event.category == "audio" && event.call_id == "IXAudio2::CreateSourceVoice"));
-    assert!(trace_record.events.iter().any(|event| event.category == "audio" && event.call_id == "IXAudio2SourceVoice::SubmitSourceBuffer"));
+    assert!(
+        trace_record
+            .events
+            .iter()
+            .any(|event| event.category == "audio" && event.call_id == "XAudio2Create")
+    );
+    assert!(trace_record.events.iter().any(
+        |event| event.category == "audio" && event.call_id == "IXAudio2::CreateMasteringVoice"
+    ));
+    assert!(
+        trace_record.events.iter().any(
+            |event| event.category == "audio" && event.call_id == "IXAudio2::CreateSourceVoice"
+        )
+    );
+    assert!(
+        trace_record
+            .events
+            .iter()
+            .any(|event| event.category == "audio"
+                && event.call_id == "IXAudio2SourceVoice::SubmitSourceBuffer")
+    );
     assert!(trace_record.events.iter().any(|event| event.category == "audio" && event.call_id == "IXAudio2SourceVoice::Start"));
-    assert!(trace_record.events.iter().any(|event| event.category == "audio" && event.call_id == "XAudio2Render"));
-    assert!(trace_record.events.iter().any(|event| event.category == "process" && event.call_id == "ExitProcess"));
+    assert!(
+        trace_record
+            .events
+            .iter()
+            .any(|event| event.category == "audio" && event.call_id == "XAudio2Render")
+    );
+    assert!(
+        trace_record
+            .events
+            .iter()
+            .any(|event| event.category == "process" && event.call_id == "ExitProcess")
+    );
 }
 
 #[test]
+#[ignore] // requires real Windows PE binaries and external Steam GE
 fn real_external_windows_d3d11_imports_present_through_pe_runtime() {
     let temp_dir = TempDir::new().expect("temp dir");
     create_ge(&temp_dir, "pe-runtime-d3d11");
@@ -1626,23 +1859,72 @@ fn real_external_windows_d3d11_imports_present_through_pe_runtime() {
     assert_eq!(canonical_output.exit_code, 0);
     assert!(canonical_output.stdout.is_empty());
     assert!(canonical_output.stderr.is_empty());
-    assert!(canonical_output.perf.iter().any(|metric| metric.metric_id == "pe_runtime_steps"));
+    assert!(
+        canonical_output
+            .perf
+            .iter()
+            .any(|metric| metric.metric_id == "pe_runtime_steps")
+    );
     assert_eq!(canonical_output.gfx_frames.len(), 1);
     assert_eq!(canonical_output.gfx_frames[0].scene_id, "pe-runtime-d3d11");
 
     let trace_path = ge_root(&temp_dir, "pe-runtime-d3d11").join("traces/run-real-d3d11.json");
     let trace_record: TraceRecord = read_json(&trace_path);
-    assert!(trace_record.events.iter().any(|event| event.category == "input" && event.call_id == "RegisterClassExW"));
-    assert!(trace_record.events.iter().any(|event| event.category == "input" && event.call_id == "CreateWindowExW"));
-    assert!(trace_record.events.iter().any(|event| event.category == "dxgi" && event.call_id == "D3D11CreateDeviceAndSwapChain"));
-    assert!(trace_record.events.iter().any(|event| event.category == "d3d12" && event.call_id == "ID3D11Device::GetImmediateContext"));
-    assert!(trace_record.events.iter().any(|event| event.category == "dxgi" && event.call_id == "IDXGISwapChain::GetBuffer"));
-    assert!(trace_record.events.iter().any(|event| event.category == "d3d12" && event.call_id == "ID3D11DeviceContext::UpdateSubresource"));
-    assert!(trace_record.events.iter().any(|event| event.category == "dxgi" && event.call_id == "IDXGISwapChain::Present"));
-    assert!(trace_record.events.iter().any(|event| event.category == "process" && event.call_id == "ExitProcess"));
+    assert!(
+        trace_record
+            .events
+            .iter()
+            .any(|event| event.category == "input" && event.call_id == "RegisterClassExW")
+    );
+    assert!(
+        trace_record
+            .events
+            .iter()
+            .any(|event| event.category == "input" && event.call_id == "CreateWindowExW")
+    );
+    assert!(
+        trace_record
+            .events
+            .iter()
+            .any(|event| event.category == "dxgi"
+                && event.call_id == "D3D11CreateDeviceAndSwapChain")
+    );
+    assert!(
+        trace_record
+            .events
+            .iter()
+            .any(|event| event.category == "d3d12"
+                && event.call_id == "ID3D11Device::GetImmediateContext")
+    );
+    assert!(
+        trace_record
+            .events
+            .iter()
+            .any(|event| event.category == "dxgi" && event.call_id == "IDXGISwapChain::GetBuffer")
+    );
+    assert!(
+        trace_record
+            .events
+            .iter()
+            .any(|event| event.category == "d3d12"
+                && event.call_id == "ID3D11DeviceContext::UpdateSubresource")
+    );
+    assert!(
+        trace_record
+            .events
+            .iter()
+            .any(|event| event.category == "dxgi" && event.call_id == "IDXGISwapChain::Present")
+    );
+    assert!(
+        trace_record
+            .events
+            .iter()
+            .any(|event| event.category == "process" && event.call_id == "ExitProcess")
+    );
 }
 
 #[test]
+#[ignore] // requires real Windows PE binaries and external Steam GE
 fn real_external_windows_d3d11_shader_bindings_trace_through_pe_runtime() {
     let temp_dir = TempDir::new().expect("temp dir");
     create_ge(&temp_dir, "pe-runtime-d3d11-shader-bindings");
@@ -1666,50 +1948,240 @@ fn real_external_windows_d3d11_shader_bindings_trace_through_pe_runtime() {
     assert_eq!(canonical_output.exit_code, 0);
     assert!(canonical_output.stdout.is_empty());
     assert!(canonical_output.stderr.is_empty());
-    assert!(canonical_output.perf.iter().any(|metric| metric.metric_id == "pe_runtime_steps"));
+    assert!(
+        canonical_output
+            .perf
+            .iter()
+            .any(|metric| metric.metric_id == "pe_runtime_steps")
+    );
     assert_eq!(canonical_output.gfx_frames.len(), 1);
 
     let trace_path = ge_root(&temp_dir, "pe-runtime-d3d11-shader-bindings")
         .join("traces/run-real-d3d11-shader-bindings.json");
     let trace_record: TraceRecord = read_json(&trace_path);
-    assert!(trace_record.events.iter().any(|event| event.category == "dxgi" && event.call_id == "D3D11CreateDeviceAndSwapChain"));
-    assert!(trace_record.events.iter().any(|event| event.category == "dxgi" && event.call_id == "IDXGISwapChain::GetBuffer"));
+    assert!(
+        trace_record
+            .events
+            .iter()
+            .any(|event| event.category == "dxgi"
+                && event.call_id == "D3D11CreateDeviceAndSwapChain")
+    );
+    assert!(
+        trace_record
+            .events
+            .iter()
+            .any(|event| event.category == "dxgi" && event.call_id == "IDXGISwapChain::GetBuffer")
+    );
     assert!(trace_record.events.iter().any(|event| event.category == "d3d12" && event.call_id == "ID3D11Device::CreateBuffer"));
-    assert!(trace_record.events.iter().any(|event| event.category == "d3d12" && event.call_id == "ID3D11Device::CreateTexture2D"));
-    assert!(trace_record.events.iter().any(|event| event.category == "d3d12" && event.call_id == "ID3D11Device::CreateShaderResourceView"));
-    assert!(trace_record.events.iter().any(|event| event.category == "d3d12" && event.call_id == "ID3D11Device::CreateRenderTargetView"));
-    assert!(trace_record.events.iter().any(|event| event.category == "d3d12" && event.call_id == "ID3D11Device::CreateDepthStencilView"));
-    assert!(trace_record.events.iter().any(|event| event.category == "d3d12" && event.call_id == "ID3D11Device::CreateBlendState"));
-    assert!(trace_record.events.iter().any(|event| event.category == "d3d12" && event.call_id == "ID3D11Device::CreateDepthStencilState"));
-    assert!(trace_record.events.iter().any(|event| event.category == "d3d12" && event.call_id == "ID3D11Device::CreateRasterizerState"));
-    assert!(trace_record.events.iter().any(|event| event.category == "d3d12" && event.call_id == "ID3D11Device::CreateSamplerState"));
-    assert!(trace_record.events.iter().any(|event| event.category == "d3d12" && event.call_id == "ID3D11Device::CreateInputLayout"));
-    assert!(trace_record.events.iter().any(|event| event.category == "d3d12" && event.call_id == "ID3D11Device::CreateVertexShader"));
-    assert!(trace_record.events.iter().any(|event| event.category == "d3d12" && event.call_id == "ID3D11Device::CreatePixelShader"));
-    assert!(trace_record.events.iter().any(|event| event.category == "d3d12" && event.call_id == "ID3D11DeviceContext::OMSetRenderTargets"));
-    assert!(trace_record.events.iter().any(|event| event.category == "d3d12" && event.call_id == "ID3D11DeviceContext::OMSetBlendState"));
-    assert!(trace_record.events.iter().any(|event| event.category == "d3d12" && event.call_id == "ID3D11DeviceContext::OMSetDepthStencilState"));
-    assert!(trace_record.events.iter().any(|event| event.category == "d3d12" && event.call_id == "ID3D11DeviceContext::VSSetConstantBuffers"));
-    assert!(trace_record.events.iter().any(|event| event.category == "d3d12" && event.call_id == "ID3D11DeviceContext::PSSetShaderResources"));
-    assert!(trace_record.events.iter().any(|event| event.category == "d3d12" && event.call_id == "ID3D11DeviceContext::PSSetSamplers"));
-    assert!(trace_record.events.iter().any(|event| event.category == "d3d12" && event.call_id == "ID3D11DeviceContext::IASetInputLayout"));
-    assert!(trace_record.events.iter().any(|event| event.category == "d3d12" && event.call_id == "ID3D11DeviceContext::IASetVertexBuffers"));
-    assert!(trace_record.events.iter().any(|event| event.category == "d3d12" && event.call_id == "ID3D11DeviceContext::IASetIndexBuffer"));
-    assert!(trace_record.events.iter().any(|event| event.category == "d3d12" && event.call_id == "ID3D11DeviceContext::IASetPrimitiveTopology"));
-    assert!(trace_record.events.iter().any(|event| event.category == "d3d12" && event.call_id == "ID3D11DeviceContext::RSSetState"));
-    assert!(trace_record.events.iter().any(|event| event.category == "d3d12" && event.call_id == "ID3D11DeviceContext::RSSetViewports"));
-    assert!(trace_record.events.iter().any(|event| event.category == "d3d12" && event.call_id == "ID3D11DeviceContext::RSSetScissorRects"));
-    assert!(trace_record.events.iter().any(|event| event.category == "d3d12" && event.call_id == "ID3D11DeviceContext::VSSetShader"));
-    assert!(trace_record.events.iter().any(|event| event.category == "d3d12" && event.call_id == "ID3D11DeviceContext::PSSetShader"));
-    assert!(trace_record.events.iter().any(|event| event.category == "d3d12" && event.call_id == "ID3D11DeviceContext::Draw"));
-    assert!(trace_record.events.iter().any(|event| event.category == "d3d12" && event.call_id == "ID3D11DeviceContext::DrawIndexed"));
-    assert!(trace_record.events.iter().any(|event| event.category == "d3d12" && event.call_id == "ID3D11DeviceContext::DrawInstanced"));
-    assert!(trace_record.events.iter().any(|event| event.category == "d3d12" && event.call_id == "ID3D11DeviceContext::DrawIndexedInstanced"));
-    assert!(trace_record.events.iter().any(|event| event.category == "dxgi" && event.call_id == "IDXGISwapChain::Present"));
-    assert!(trace_record.events.iter().any(|event| event.category == "process" && event.call_id == "ExitProcess"));
+    assert!(
+        trace_record
+            .events
+            .iter()
+            .any(|event| event.category == "d3d12"
+                && event.call_id == "ID3D11Device::CreateTexture2D")
+    );
+    assert!(
+        trace_record
+            .events
+            .iter()
+            .any(|event| event.category == "d3d12"
+                && event.call_id == "ID3D11Device::CreateShaderResourceView")
+    );
+    assert!(
+        trace_record
+            .events
+            .iter()
+            .any(|event| event.category == "d3d12"
+                && event.call_id == "ID3D11Device::CreateRenderTargetView")
+    );
+    assert!(
+        trace_record
+            .events
+            .iter()
+            .any(|event| event.category == "d3d12"
+                && event.call_id == "ID3D11Device::CreateDepthStencilView")
+    );
+    assert!(trace_record.events.iter().any(
+        |event| event.category == "d3d12" && event.call_id == "ID3D11Device::CreateBlendState"
+    ));
+    assert!(
+        trace_record
+            .events
+            .iter()
+            .any(|event| event.category == "d3d12"
+                && event.call_id == "ID3D11Device::CreateDepthStencilState")
+    );
+    assert!(
+        trace_record
+            .events
+            .iter()
+            .any(|event| event.category == "d3d12"
+                && event.call_id == "ID3D11Device::CreateRasterizerState")
+    );
+    assert!(
+        trace_record
+            .events
+            .iter()
+            .any(|event| event.category == "d3d12"
+                && event.call_id == "ID3D11Device::CreateSamplerState")
+    );
+    assert!(trace_record.events.iter().any(
+        |event| event.category == "d3d12" && event.call_id == "ID3D11Device::CreateInputLayout"
+    ));
+    assert!(
+        trace_record
+            .events
+            .iter()
+            .any(|event| event.category == "d3d12"
+                && event.call_id == "ID3D11Device::CreateVertexShader")
+    );
+    assert!(trace_record.events.iter().any(
+        |event| event.category == "d3d12" && event.call_id == "ID3D11Device::CreatePixelShader"
+    ));
+    assert!(
+        trace_record
+            .events
+            .iter()
+            .any(|event| event.category == "d3d12"
+                && event.call_id == "ID3D11DeviceContext::OMSetRenderTargets")
+    );
+    assert!(
+        trace_record
+            .events
+            .iter()
+            .any(|event| event.category == "d3d12"
+                && event.call_id == "ID3D11DeviceContext::OMSetBlendState")
+    );
+    assert!(
+        trace_record
+            .events
+            .iter()
+            .any(|event| event.category == "d3d12"
+                && event.call_id == "ID3D11DeviceContext::OMSetDepthStencilState")
+    );
+    assert!(
+        trace_record
+            .events
+            .iter()
+            .any(|event| event.category == "d3d12"
+                && event.call_id == "ID3D11DeviceContext::VSSetConstantBuffers")
+    );
+    assert!(
+        trace_record
+            .events
+            .iter()
+            .any(|event| event.category == "d3d12"
+                && event.call_id == "ID3D11DeviceContext::PSSetShaderResources")
+    );
+    assert!(
+        trace_record
+            .events
+            .iter()
+            .any(|event| event.category == "d3d12"
+                && event.call_id == "ID3D11DeviceContext::PSSetSamplers")
+    );
+    assert!(
+        trace_record
+            .events
+            .iter()
+            .any(|event| event.category == "d3d12"
+                && event.call_id == "ID3D11DeviceContext::IASetInputLayout")
+    );
+    assert!(
+        trace_record
+            .events
+            .iter()
+            .any(|event| event.category == "d3d12"
+                && event.call_id == "ID3D11DeviceContext::IASetVertexBuffers")
+    );
+    assert!(
+        trace_record
+            .events
+            .iter()
+            .any(|event| event.category == "d3d12"
+                && event.call_id == "ID3D11DeviceContext::IASetIndexBuffer")
+    );
+    assert!(
+        trace_record
+            .events
+            .iter()
+            .any(|event| event.category == "d3d12"
+                && event.call_id == "ID3D11DeviceContext::IASetPrimitiveTopology")
+    );
+    assert!(trace_record.events.iter().any(
+        |event| event.category == "d3d12" && event.call_id == "ID3D11DeviceContext::RSSetState"
+    ));
+    assert!(
+        trace_record
+            .events
+            .iter()
+            .any(|event| event.category == "d3d12"
+                && event.call_id == "ID3D11DeviceContext::RSSetViewports")
+    );
+    assert!(
+        trace_record
+            .events
+            .iter()
+            .any(|event| event.category == "d3d12"
+                && event.call_id == "ID3D11DeviceContext::RSSetScissorRects")
+    );
+    assert!(
+        trace_record
+            .events
+            .iter()
+            .any(|event| event.category == "d3d12"
+                && event.call_id == "ID3D11DeviceContext::VSSetShader")
+    );
+    assert!(
+        trace_record
+            .events
+            .iter()
+            .any(|event| event.category == "d3d12"
+                && event.call_id == "ID3D11DeviceContext::PSSetShader")
+    );
+    assert!(
+        trace_record
+            .events
+            .iter()
+            .any(|event| event.category == "d3d12" && event.call_id == "ID3D11DeviceContext::Draw")
+    );
+    assert!(
+        trace_record
+            .events
+            .iter()
+            .any(|event| event.category == "d3d12"
+                && event.call_id == "ID3D11DeviceContext::DrawIndexed")
+    );
+    assert!(
+        trace_record
+            .events
+            .iter()
+            .any(|event| event.category == "d3d12"
+                && event.call_id == "ID3D11DeviceContext::DrawInstanced")
+    );
+    assert!(
+        trace_record
+            .events
+            .iter()
+            .any(|event| event.category == "d3d12"
+                && event.call_id == "ID3D11DeviceContext::DrawIndexedInstanced")
+    );
+    assert!(
+        trace_record
+            .events
+            .iter()
+            .any(|event| event.category == "dxgi" && event.call_id == "IDXGISwapChain::Present")
+    );
+    assert!(
+        trace_record
+            .events
+            .iter()
+            .any(|event| event.category == "process" && event.call_id == "ExitProcess")
+    );
 }
 
 #[test]
+#[ignore] // requires real Windows PE binaries and external Steam GE
 fn real_external_windows_d3d11_create_device_without_swapchain_traces_through_pe_runtime() {
     let temp_dir = TempDir::new().expect("temp dir");
     create_ge(&temp_dir, "pe-runtime-d3d11-no-swapchain");
@@ -1733,19 +2205,46 @@ fn real_external_windows_d3d11_create_device_without_swapchain_traces_through_pe
     assert_eq!(canonical_output.exit_code, 0);
     assert!(canonical_output.stdout.is_empty());
     assert!(canonical_output.stderr.is_empty());
-    assert!(canonical_output.perf.iter().any(|metric| metric.metric_id == "pe_runtime_steps"));
+    assert!(
+        canonical_output
+            .perf
+            .iter()
+            .any(|metric| metric.metric_id == "pe_runtime_steps")
+    );
     assert!(canonical_output.gfx_frames.is_empty());
 
     let trace_path = ge_root(&temp_dir, "pe-runtime-d3d11-no-swapchain")
         .join("traces/run-real-d3d11-no-swapchain.json");
     let trace_record: TraceRecord = read_json(&trace_path);
-    assert!(trace_record.events.iter().any(|event| event.category == "d3d12" && event.call_id == "D3D11CreateDevice"));
-    assert!(trace_record.events.iter().any(|event| event.category == "d3d12" && event.call_id == "ID3D11Device::GetImmediateContext"));
-    assert!(!trace_record.events.iter().any(|event| event.call_id == "D3D11CreateDeviceAndSwapChain"));
-    assert!(trace_record.events.iter().any(|event| event.category == "process" && event.call_id == "ExitProcess"));
+    assert!(
+        trace_record
+            .events
+            .iter()
+            .any(|event| event.category == "d3d12" && event.call_id == "D3D11CreateDevice")
+    );
+    assert!(
+        trace_record
+            .events
+            .iter()
+            .any(|event| event.category == "d3d12"
+                && event.call_id == "ID3D11Device::GetImmediateContext")
+    );
+    assert!(
+        !trace_record
+            .events
+            .iter()
+            .any(|event| event.call_id == "D3D11CreateDeviceAndSwapChain")
+    );
+    assert!(
+        trace_record
+            .events
+            .iter()
+            .any(|event| event.category == "process" && event.call_id == "ExitProcess")
+    );
 }
 
 #[test]
+#[ignore] // requires real Windows PE binaries and external Steam GE
 fn real_external_windows_tetris_runs_separately_through_casa1() {
     let temp_dir = TempDir::new().expect("temp dir");
     create_ge(&temp_dir, "pe-runtime-tetris");
@@ -1772,31 +2271,96 @@ fn real_external_windows_tetris_runs_separately_through_casa1() {
     assert_eq!(canonical_output.exit_code, 0);
     assert!(canonical_output.stdout.is_empty());
     assert!(canonical_output.stderr.is_empty());
-    assert!(canonical_output.perf.iter().any(|metric| metric.metric_id == "pe_runtime_steps"));
+    assert!(
+        canonical_output
+            .perf
+            .iter()
+            .any(|metric| metric.metric_id == "pe_runtime_steps")
+    );
     assert!(!canonical_output.gfx_frames.is_empty());
 
     let trace_path = ge_root(&temp_dir, "pe-runtime-tetris").join("traces/run-casa1-tetris.json");
     let trace_record: TraceRecord = read_json(&trace_path);
-    assert!(trace_record.events.iter().any(|event| event.category == "input" && event.call_id == "CreateWindowExW"));
-    assert!(trace_record.events.iter().any(|event| event.category == "input" && event.call_id == "KeyboardReplay"));
+    assert!(
+        trace_record
+            .events
+            .iter()
+            .any(|event| event.category == "input" && event.call_id == "CreateWindowExW")
+    );
+    assert!(
+        trace_record
+            .events
+            .iter()
+            .any(|event| event.category == "input" && event.call_id == "KeyboardReplay")
+    );
     assert!(trace_record.events.iter().any(|event| {
         event.category == "input"
             && event.call_id == "PeekMessageW"
             && event.return_value.as_u64() == Some(0x0100)
     }));
-    assert!(trace_record.events.iter().any(|event| event.category == "dxgi" && event.call_id == "D3D11CreateDeviceAndSwapChain"));
-    assert!(trace_record.events.iter().any(|event| event.category == "d3d12" && event.call_id == "ID3D11Device::GetImmediateContext"));
-    assert!(trace_record.events.iter().any(|event| event.category == "dxgi" && event.call_id == "IDXGISwapChain::GetBuffer"));
-    assert!(trace_record.events.iter().any(|event| event.category == "d3d12" && event.call_id == "ID3D11DeviceContext::UpdateSubresource"));
-    assert!(trace_record.events.iter().any(|event| event.category == "dxgi" && event.call_id == "IDXGISwapChain::Present"));
-    assert!(trace_record.events.iter().any(|event| event.category == "audio" && event.call_id == "XAudio2Create"));
-    assert!(trace_record.events.iter().any(|event| event.category == "audio" && event.call_id == "IXAudio2::CreateMasteringVoice"));
-    assert!(trace_record.events.iter().any(|event| event.category == "audio" && event.call_id == "IXAudio2::CreateSourceVoice"));
-    assert!(trace_record.events.iter().any(|event| event.category == "audio" && event.call_id == "XAudio2Render"));
-    assert!(trace_record.events.iter().any(|event| event.category == "process" && event.call_id == "ExitProcess"));
+    assert!(
+        trace_record
+            .events
+            .iter()
+            .any(|event| event.category == "dxgi"
+                && event.call_id == "D3D11CreateDeviceAndSwapChain")
+    );
+    assert!(
+        trace_record
+            .events
+            .iter()
+            .any(|event| event.category == "d3d12"
+                && event.call_id == "ID3D11Device::GetImmediateContext")
+    );
+    assert!(
+        trace_record
+            .events
+            .iter()
+            .any(|event| event.category == "dxgi" && event.call_id == "IDXGISwapChain::GetBuffer")
+    );
+    assert!(
+        trace_record
+            .events
+            .iter()
+            .any(|event| event.category == "d3d12"
+                && event.call_id == "ID3D11DeviceContext::UpdateSubresource")
+    );
+    assert!(
+        trace_record
+            .events
+            .iter()
+            .any(|event| event.category == "dxgi" && event.call_id == "IDXGISwapChain::Present")
+    );
+    assert!(
+        trace_record
+            .events
+            .iter()
+            .any(|event| event.category == "audio" && event.call_id == "XAudio2Create")
+    );
+    assert!(trace_record.events.iter().any(
+        |event| event.category == "audio" && event.call_id == "IXAudio2::CreateMasteringVoice"
+    ));
+    assert!(
+        trace_record.events.iter().any(
+            |event| event.category == "audio" && event.call_id == "IXAudio2::CreateSourceVoice"
+        )
+    );
+    assert!(
+        trace_record
+            .events
+            .iter()
+            .any(|event| event.category == "audio" && event.call_id == "XAudio2Render")
+    );
+    assert!(
+        trace_record
+            .events
+            .iter()
+            .any(|event| event.category == "process" && event.call_id == "ExitProcess")
+    );
 }
 
 #[test]
+#[ignore] // requires real Windows PE binaries and external Steam GE
 fn real_external_windows_user32_imports_trace_through_pe_runtime() {
     let temp_dir = TempDir::new().expect("temp dir");
     create_ge(&temp_dir, "pe-runtime-user32");
@@ -1820,18 +2384,49 @@ fn real_external_windows_user32_imports_trace_through_pe_runtime() {
     assert_eq!(canonical_output.exit_code, 0);
     assert!(canonical_output.stdout.is_empty());
     assert!(canonical_output.stderr.is_empty());
-    assert!(canonical_output.perf.iter().any(|metric| metric.metric_id == "pe_runtime_steps"));
+    assert!(
+        canonical_output
+            .perf
+            .iter()
+            .any(|metric| metric.metric_id == "pe_runtime_steps")
+    );
 
     let trace_path = ge_root(&temp_dir, "pe-runtime-user32").join("traces/run-real-user32.json");
     let trace_record: TraceRecord = read_json(&trace_path);
-    assert!(trace_record.events.iter().any(|event| event.category == "input" && event.call_id == "RegisterClassExW"));
-    assert!(trace_record.events.iter().any(|event| event.category == "input" && event.call_id == "CreateWindowExW"));
-    assert!(trace_record.events.iter().any(|event| event.category == "input" && event.call_id == "PeekMessageW"));
-    assert!(trace_record.events.iter().any(|event| event.category == "input" && event.call_id == "DispatchMessageW"));
-    assert!(trace_record.events.iter().any(|event| event.category == "process" && event.call_id == "ExitProcess"));
+    assert!(
+        trace_record
+            .events
+            .iter()
+            .any(|event| event.category == "input" && event.call_id == "RegisterClassExW")
+    );
+    assert!(
+        trace_record
+            .events
+            .iter()
+            .any(|event| event.category == "input" && event.call_id == "CreateWindowExW")
+    );
+    assert!(
+        trace_record
+            .events
+            .iter()
+            .any(|event| event.category == "input" && event.call_id == "PeekMessageW")
+    );
+    assert!(
+        trace_record
+            .events
+            .iter()
+            .any(|event| event.category == "input" && event.call_id == "DispatchMessageW")
+    );
+    assert!(
+        trace_record
+            .events
+            .iter()
+            .any(|event| event.category == "process" && event.call_id == "ExitProcess")
+    );
 }
 
 #[test]
+#[ignore] // requires real Windows PE binaries and external Steam GE
 fn driver_required_titles_fail_fast_with_stable_reason_code_and_actionable_hint() {
     let temp_dir = TempDir::new().expect("temp dir");
     create_ge(&temp_dir, "driver-required");
@@ -1860,13 +2455,23 @@ fn driver_required_titles_fail_fast_with_stable_reason_code_and_actionable_hint(
     );
     assert!(!output.status.success());
     let error: ErrorResponse = serde_json::from_slice(&output.stderr).expect("parse stderr json");
-    assert_eq!(error.reason_code, ReasonCode::RcAnticheatDriverDetected.as_u32());
+    assert_eq!(
+        error.reason_code,
+        ReasonCode::RcAnticheatDriverDetected.as_u32()
+    );
     assert!(error.message.contains("driver-required title"));
-    assert!(error.reproduction_hints.iter().any(|hint| hint.contains("SCM fallback")));
-    assert!(error
-        .reproduction_hints
-        .iter()
-        .any(|hint| hint.contains("Easy Anti-Cheat kernel driver")));
+    assert!(
+        error
+            .reproduction_hints
+            .iter()
+            .any(|hint| hint.contains("SCM fallback"))
+    );
+    assert!(
+        error
+            .reproduction_hints
+            .iter()
+            .any(|hint| hint.contains("Easy Anti-Cheat kernel driver"))
+    );
 }
 
 #[test]
@@ -1877,9 +2482,18 @@ fn t01_18_forwarded_exports_cache_hit() {
     let tables = casa1::pe_runtime::export_tables();
 
     // Verify the core system DLLs that participate in forwarding are registered
-    assert!(tables.contains_key("kernel32.dll"), "kernel32.dll must be in export tables");
-    assert!(tables.contains_key("user32.dll"), "user32.dll must be in export tables");
-    assert!(tables.contains_key("ntdll.dll"), "ntdll.dll must be in export tables");
+    assert!(
+        tables.contains_key("kernel32.dll"),
+        "kernel32.dll must be in export tables"
+    );
+    assert!(
+        tables.contains_key("user32.dll"),
+        "user32.dll must be in export tables"
+    );
+    assert!(
+        tables.contains_key("ntdll.dll"),
+        "ntdll.dll must be in export tables"
+    );
 
     // Verify each core DLL has at least one export registered
     for dll in &["kernel32.dll", "user32.dll", "ntdll.dll"] {
@@ -1909,11 +2523,20 @@ fn t01_19_forwarder_chain_too_deep_returns_none() {
     for i in 0..max_depth {
         visited.insert(format!("forwarder_{}", i));
     }
-    assert_eq!(visited.len(), max_depth, "Chain at depth {max_depth} should be allowed");
+    assert_eq!(
+        visited.len(),
+        max_depth,
+        "Chain at depth {max_depth} should be allowed"
+    );
 
     // Adding one more should exceed the limit
     visited.insert(format!("forwarder_{}", max_depth));
-    assert_eq!(visited.len(), max_depth + 1, "Chain depth should be {max_depth} + 1 = {}", max_depth + 1);
+    assert_eq!(
+        visited.len(),
+        max_depth + 1,
+        "Chain depth should be {max_depth} + 1 = {}",
+        max_depth + 1
+    );
     assert!(
         visited.len() > max_depth,
         "Chain depth {} exceeds MAX_FORWARDER_DEPTH of {max_depth}",
@@ -1962,9 +2585,9 @@ fn require_dll_exports(
 
     // Verify all expected exports exist
     for &(name, ordinal) in expected {
-        let found = exports.iter().any(|e| {
-            e.name.as_deref() == Some(name) && e.ordinal == ordinal
-        });
+        let found = exports
+            .iter()
+            .any(|e| e.name.as_deref() == Some(name) && e.ordinal == ordinal);
         assert!(
             found,
             "DLL '{dll}': expected export '{name}' with ordinal {ordinal} not found"
@@ -1973,330 +2596,404 @@ fn require_dll_exports(
 
     // Verify unknown name lookup returns None
     let unknown_name = format!("__NO_SUCH_EXPORT_{dll}");
-    let found_unknown = exports.iter().any(|e| {
-        e.name.as_deref() == Some(&unknown_name)
-    });
-    assert!(!found_unknown, "DLL '{dll}' should not have export '{unknown_name}'");
+    let found_unknown = exports
+        .iter()
+        .any(|e| e.name.as_deref() == Some(&unknown_name));
+    assert!(
+        !found_unknown,
+        "DLL '{dll}' should not have export '{unknown_name}'"
+    );
 
     // Verify unknown ordinal lookup returns None
     let max_ord = exports.iter().map(|e| e.ordinal).max().unwrap_or(0);
     let unknown_ord = max_ord + 999;
     let found_unknown_ord = exports.iter().any(|e| e.ordinal == unknown_ord);
-    assert!(!found_unknown_ord, "DLL '{dll}' should not have ordinal {unknown_ord}");
+    assert!(
+        !found_unknown_ord,
+        "DLL '{dll}' should not have ordinal {unknown_ord}"
+    );
 }
 
 #[test]
 fn t01_20_synthetic_exports_comctl32() {
     let tables = get_export_tables();
-    require_dll_exports(&tables, "comctl32.dll", 20, &[
-        ("InitCommonControlsEx", 1),
-        ("InitCommonControls", 2),
-        ("ImageList_Create", 3),
-        ("ImageList_Destroy", 4),
-        ("ImageList_Add", 7),
-        ("ImageList_ReplaceIcon", 8),
-        ("ImageList_GetIcon", 10),
-        ("ImageList_Draw", 11),
-        ("PropertySheetW", 21),
-    ]);
+    require_dll_exports(
+        &tables,
+        "comctl32.dll",
+        20,
+        &[
+            ("InitCommonControlsEx", 1),
+            ("InitCommonControls", 2),
+            ("ImageList_Create", 3),
+            ("ImageList_Destroy", 4),
+            ("ImageList_Add", 7),
+            ("ImageList_ReplaceIcon", 8),
+            ("ImageList_GetIcon", 10),
+            ("ImageList_Draw", 11),
+            ("PropertySheetW", 21),
+        ],
+    );
 }
 
 #[test]
 fn t01_21_synthetic_exports_shlwapi() {
     let tables = get_export_tables();
-    require_dll_exports(&tables, "shlwapi.dll", 30, &[
-        ("PathCombineW", 1),
-        ("PathAppendW", 2),
-        ("PathFindFileNameW", 3),
-        ("PathFindExtensionW", 4),
-        ("PathRemoveFileSpecW", 5),
-        ("PathIsDirectoryW", 6),
-        ("PathFileExistsW", 7),
-        ("StrStrW", 10),
-        ("StrCmpW", 12),
-        ("StrCmpIW", 13),
-        ("StrChrW", 14),
-        ("StrCpyW", 16),
-        ("StrToIntW", 17),
-        ("UrlCanonicalizeW", 21),
-        ("SHDeleteKeyW", 24),
-        ("SHDeleteEmptyKeyW", 25),
-    ]);
+    require_dll_exports(
+        &tables,
+        "shlwapi.dll",
+        30,
+        &[
+            ("PathCombineW", 1),
+            ("PathAppendW", 2),
+            ("PathFindFileNameW", 3),
+            ("PathFindExtensionW", 4),
+            ("PathRemoveFileSpecW", 5),
+            ("PathIsDirectoryW", 6),
+            ("PathFileExistsW", 7),
+            ("StrStrW", 10),
+            ("StrCmpW", 12),
+            ("StrCmpIW", 13),
+            ("StrChrW", 14),
+            ("StrCpyW", 16),
+            ("StrToIntW", 17),
+            ("UrlCanonicalizeW", 21),
+            ("SHDeleteKeyW", 24),
+            ("SHDeleteEmptyKeyW", 25),
+        ],
+    );
 }
 
 #[test]
 fn t01_22_synthetic_exports_crypt32() {
     let tables = get_export_tables();
-    require_dll_exports(&tables, "crypt32.dll", 15, &[
-        ("CertOpenSystemStoreW", 1),
-        ("CertCloseStore", 2),
-        ("CertFindCertificateInStore", 3),
-        ("CertGetNameStringW", 4),
-        ("CertFreeCertificateContext", 5),
-        ("CertCreateCertificateContext", 6),
-        ("CertGetCertificateChain", 8),
-        ("CertVerifyCertificateChainPolicy", 9),
-        ("CertOpenStore", 10),
-        ("CertEnumCertificatesInStore", 11),
-        ("CryptAcquireCertificatePrivateKey", 14),
-        ("PFXImportCertStore", 15),
-        ("CertGetIntendedKeyUsage", 18),
-    ]);
+    require_dll_exports(
+        &tables,
+        "crypt32.dll",
+        15,
+        &[
+            ("CertOpenSystemStoreW", 1),
+            ("CertCloseStore", 2),
+            ("CertFindCertificateInStore", 3),
+            ("CertGetNameStringW", 4),
+            ("CertFreeCertificateContext", 5),
+            ("CertCreateCertificateContext", 6),
+            ("CertGetCertificateChain", 8),
+            ("CertVerifyCertificateChainPolicy", 9),
+            ("CertOpenStore", 10),
+            ("CertEnumCertificatesInStore", 11),
+            ("CryptAcquireCertificatePrivateKey", 14),
+            ("PFXImportCertStore", 15),
+            ("CertGetIntendedKeyUsage", 18),
+        ],
+    );
 }
 
 #[test]
 fn t01_23_synthetic_exports_setupapi() {
     let tables = get_export_tables();
-    require_dll_exports(&tables, "setupapi.dll", 10, &[
-        ("SetupDiGetClassDevsW", 1),
-        ("SetupDiDestroyDeviceInfoList", 2),
-        ("SetupDiEnumDeviceInfo", 3),
-        ("SetupDiGetDeviceInstanceIdW", 4),
-        ("SetupDiGetDeviceRegistryPropertyW", 5),
-        ("SetupDiCallClassInstaller", 8),
-        ("SetupDiBuildDriverInfoList", 10),
-        ("SetupDiInstallDevice", 14),
-        ("SetupDiUninstallDevice", 15),
-    ]);
+    require_dll_exports(
+        &tables,
+        "setupapi.dll",
+        10,
+        &[
+            ("SetupDiGetClassDevsW", 1),
+            ("SetupDiDestroyDeviceInfoList", 2),
+            ("SetupDiEnumDeviceInfo", 3),
+            ("SetupDiGetDeviceInstanceIdW", 4),
+            ("SetupDiGetDeviceRegistryPropertyW", 5),
+            ("SetupDiCallClassInstaller", 8),
+            ("SetupDiBuildDriverInfoList", 10),
+            ("SetupDiInstallDevice", 14),
+            ("SetupDiUninstallDevice", 15),
+        ],
+    );
 }
 
 #[test]
 fn t01_24_synthetic_exports_dwrite() {
     let tables = get_export_tables();
-    require_dll_exports(&tables, "dwrite.dll", 1, &[
-        ("DWriteCreateFactory", 1),
-    ]);
+    require_dll_exports(&tables, "dwrite.dll", 1, &[("DWriteCreateFactory", 1)]);
 }
 
 #[test]
 fn t01_25_synthetic_exports_propsys() {
     let tables = get_export_tables();
-    require_dll_exports(&tables, "propsys.dll", 8, &[
-        ("PSGetPropertyDescriptionFromName", 1),
-        ("PSGetPropertyKeyFromName", 2),
-        ("PSGetNameFromPropertyKey", 3),
-        ("PSPropertyKeyFromString", 4),
-        ("PSStringFromPropertyKey", 5),
-        ("InitPropVariantFromString", 6),
-        ("PropVariantClear", 8),
-        ("PropVariantCopy", 9),
-    ]);
+    require_dll_exports(
+        &tables,
+        "propsys.dll",
+        8,
+        &[
+            ("PSGetPropertyDescriptionFromName", 1),
+            ("PSGetPropertyKeyFromName", 2),
+            ("PSGetNameFromPropertyKey", 3),
+            ("PSPropertyKeyFromString", 4),
+            ("PSStringFromPropertyKey", 5),
+            ("InitPropVariantFromString", 6),
+            ("PropVariantClear", 8),
+            ("PropVariantCopy", 9),
+        ],
+    );
 }
 
 #[test]
 fn t01_26_synthetic_exports_urlmon() {
     let tables = get_export_tables();
-    require_dll_exports(&tables, "urlmon.dll", 5, &[
-        ("URLDownloadToFileW", 1),
-        ("URLDownloadToCacheFileW", 2),
-        ("CoInternetSetFeatureEnabled", 3),
-        ("CoInternetIsFeatureEnabled", 4),
-        ("CreateURLMoniker", 5),
-        ("CreateAsyncBindCtx", 6),
-        ("ObtainUserAgentString", 8),
-    ]);
+    require_dll_exports(
+        &tables,
+        "urlmon.dll",
+        5,
+        &[
+            ("URLDownloadToFileW", 1),
+            ("URLDownloadToCacheFileW", 2),
+            ("CoInternetSetFeatureEnabled", 3),
+            ("CoInternetIsFeatureEnabled", 4),
+            ("CreateURLMoniker", 5),
+            ("CreateAsyncBindCtx", 6),
+            ("ObtainUserAgentString", 8),
+        ],
+    );
 }
 
 #[test]
 fn t01_27_synthetic_exports_wintrust() {
     let tables = get_export_tables();
-    require_dll_exports(&tables, "wintrust.dll", 4, &[
-        ("WinVerifyTrust", 1),
-        ("WTHelperProvDataFromStateData", 2),
-        ("WTHelperGetProvSignerFromChain", 3),
-        ("WTGetSignatureInfo", 5),
-    ]);
+    require_dll_exports(
+        &tables,
+        "wintrust.dll",
+        4,
+        &[
+            ("WinVerifyTrust", 1),
+            ("WTHelperProvDataFromStateData", 2),
+            ("WTHelperGetProvSignerFromChain", 3),
+            ("WTGetSignatureInfo", 5),
+        ],
+    );
 }
 
 #[test]
 fn t01_28_synthetic_exports_mscoree() {
     let tables = get_export_tables();
-    require_dll_exports(&tables, "mscoree.dll", 5, &[
-        ("CorBindToRuntimeEx", 1),
-        ("CorBindToRuntime", 2),
-        ("CLRCreateInstance", 3),
-        ("GetCORSystemDirectory", 4),
-        ("GetRequestedRuntimeInfo", 5),
-        ("LoadLibraryShim", 6),
-    ]);
+    require_dll_exports(
+        &tables,
+        "mscoree.dll",
+        5,
+        &[
+            ("CorBindToRuntimeEx", 1),
+            ("CorBindToRuntime", 2),
+            ("CLRCreateInstance", 3),
+            ("GetCORSystemDirectory", 4),
+            ("GetRequestedRuntimeInfo", 5),
+            ("LoadLibraryShim", 6),
+        ],
+    );
 }
 
 #[test]
 fn t01_29_synthetic_exports_imm32() {
     let tables = get_export_tables();
-    require_dll_exports(&tables, "imm32.dll", 8, &[
-        ("ImmGetContext", 1),
-        ("ImmReleaseContext", 2),
-        ("ImmSetCompositionStringW", 3),
-        ("ImmGetCompositionStringW", 4),
-        ("ImmGetDefaultIMEWnd", 5),
-        ("ImmSimulateHotKey", 6),
-        ("ImmIsIME", 7),
-        ("ImmNotifyIME", 9),
-    ]);
+    require_dll_exports(
+        &tables,
+        "imm32.dll",
+        8,
+        &[
+            ("ImmGetContext", 1),
+            ("ImmReleaseContext", 2),
+            ("ImmSetCompositionStringW", 3),
+            ("ImmGetCompositionStringW", 4),
+            ("ImmGetDefaultIMEWnd", 5),
+            ("ImmSimulateHotKey", 6),
+            ("ImmIsIME", 7),
+            ("ImmNotifyIME", 9),
+        ],
+    );
 }
 
 #[test]
 fn t01_30_synthetic_exports_oleaut32() {
     let tables = get_export_tables();
-    require_dll_exports(&tables, "oleaut32.dll", 30, &[
-        ("SysAllocString", 1),
-        ("SysFreeString", 2),
-        ("SysReAllocString", 3),
-        ("SysAllocStringLen", 4),
-        ("SysStringLen", 5),
-        ("VariantInit", 7),
-        ("VariantClear", 8),
-        ("VariantCopy", 9),
-        ("VariantCopyInd", 10),
-        ("VariantChangeType", 11),
-        ("VariantChangeTypeEx", 12),
-        ("SafeArrayCreate", 13),
-        ("SafeArrayDestroy", 14),
-        ("SafeArrayGetElement", 16),
-        ("SafeArrayPutElement", 17),
-        ("SafeArrayAccessData", 18),
-        ("SafeArrayUnaccessData", 19),
-        ("SafeArrayCreateVector", 22),
-        ("DispGetIDsOfNames", 29),
-        ("DispInvoke", 30),
-        ("LoadTypeLib", 32),
-        ("LoadRegTypeLib", 33),
-        ("RegisterTypeLib", 34),
-        ("LHashValOfNameSys", 37),
-    ]);
+    require_dll_exports(
+        &tables,
+        "oleaut32.dll",
+        30,
+        &[
+            ("SysAllocString", 1),
+            ("SysFreeString", 2),
+            ("SysReAllocString", 3),
+            ("SysAllocStringLen", 4),
+            ("SysStringLen", 5),
+            ("VariantInit", 7),
+            ("VariantClear", 8),
+            ("VariantCopy", 9),
+            ("VariantCopyInd", 10),
+            ("VariantChangeType", 11),
+            ("VariantChangeTypeEx", 12),
+            ("SafeArrayCreate", 13),
+            ("SafeArrayDestroy", 14),
+            ("SafeArrayGetElement", 16),
+            ("SafeArrayPutElement", 17),
+            ("SafeArrayAccessData", 18),
+            ("SafeArrayUnaccessData", 19),
+            ("SafeArrayCreateVector", 22),
+            ("DispGetIDsOfNames", 29),
+            ("DispInvoke", 30),
+            ("LoadTypeLib", 32),
+            ("LoadRegTypeLib", 33),
+            ("RegisterTypeLib", 34),
+            ("LHashValOfNameSys", 37),
+        ],
+    );
 }
 
 #[test]
 fn t01_31_synthetic_exports_comdlg32() {
     let tables = get_export_tables();
-    require_dll_exports(&tables, "comdlg32.dll", 8, &[
-        ("GetOpenFileNameW", 1),
-        ("GetSaveFileNameW", 2),
-        ("ChooseColorW", 3),
-        ("ChooseFontW", 4),
-        ("PageSetupDlgW", 5),
-        ("PrintDlgW", 6),
-        ("PrintDlgExW", 7),
-        ("FindTextW", 8),
-        ("ReplaceTextW", 9),
-        ("CommDlgExtendedError", 10),
-    ]);
+    require_dll_exports(
+        &tables,
+        "comdlg32.dll",
+        8,
+        &[
+            ("GetOpenFileNameW", 1),
+            ("GetSaveFileNameW", 2),
+            ("ChooseColorW", 3),
+            ("ChooseFontW", 4),
+            ("PageSetupDlgW", 5),
+            ("PrintDlgW", 6),
+            ("PrintDlgExW", 7),
+            ("FindTextW", 8),
+            ("ReplaceTextW", 9),
+            ("CommDlgExtendedError", 10),
+        ],
+    );
 }
 
 #[test]
 fn t01_32_synthetic_exports_winmm() {
     let tables = get_export_tables();
-    require_dll_exports(&tables, "winmm.dll", 35, &[
-        ("waveOutOpen", 1),
-        ("waveOutClose", 2),
-        ("waveOutPrepareHeader", 3),
-        ("waveOutUnprepareHeader", 4),
-        ("waveOutWrite", 5),
-        ("waveOutReset", 6),
-        ("waveOutGetVolume", 7),
-        ("waveOutSetVolume", 8),
-        ("waveOutGetDevCapsW", 9),
-        ("waveOutGetNumDevs", 10),
-        ("waveInOpen", 11),
-        ("waveInClose", 12),
-        ("waveInPrepareHeader", 13),
-        ("waveInAddBuffer", 15),
-        ("waveInStart", 16),
-        ("waveInGetDevCapsW", 18),
-        ("waveInGetNumDevs", 19),
-        ("midiOutOpen", 20),
-        ("midiOutClose", 21),
-        ("midiOutShortMsg", 22),
-        ("midiOutLongMsg", 23),
-        ("midiOutReset", 24),
-        ("midiOutGetDevCapsW", 25),
-        ("midiOutGetNumDevs", 26),
-        ("midiInOpen", 27),
-        ("midiInClose", 28),
-        ("midiInStart", 29),
-        ("midiInStop", 30),
-        ("midiInReset", 31),
-        ("timeGetTime", 32),
-        ("timeBeginPeriod", 33),
-        ("timeEndPeriod", 34),
-        ("PlaySoundW", 35),
-        ("mmioOpenW", 36),
-        ("mmioClose", 37),
-        ("mmioRead", 38),
-        ("mmioWrite", 39),
-        ("mmioAscend", 40),
-        ("mmioDescend", 41),
-        ("mmioStringToFOURCCW", 43),
-    ]);
+    require_dll_exports(
+        &tables,
+        "winmm.dll",
+        35,
+        &[
+            ("waveOutOpen", 1),
+            ("waveOutClose", 2),
+            ("waveOutPrepareHeader", 3),
+            ("waveOutUnprepareHeader", 4),
+            ("waveOutWrite", 5),
+            ("waveOutReset", 6),
+            ("waveOutGetVolume", 7),
+            ("waveOutSetVolume", 8),
+            ("waveOutGetDevCapsW", 9),
+            ("waveOutGetNumDevs", 10),
+            ("waveInOpen", 11),
+            ("waveInClose", 12),
+            ("waveInPrepareHeader", 13),
+            ("waveInAddBuffer", 15),
+            ("waveInStart", 16),
+            ("waveInGetDevCapsW", 18),
+            ("waveInGetNumDevs", 19),
+            ("midiOutOpen", 20),
+            ("midiOutClose", 21),
+            ("midiOutShortMsg", 22),
+            ("midiOutLongMsg", 23),
+            ("midiOutReset", 24),
+            ("midiOutGetDevCapsW", 25),
+            ("midiOutGetNumDevs", 26),
+            ("midiInOpen", 27),
+            ("midiInClose", 28),
+            ("midiInStart", 29),
+            ("midiInStop", 30),
+            ("midiInReset", 31),
+            ("timeGetTime", 32),
+            ("timeBeginPeriod", 33),
+            ("timeEndPeriod", 34),
+            ("PlaySoundW", 35),
+            ("mmioOpenW", 36),
+            ("mmioClose", 37),
+            ("mmioRead", 38),
+            ("mmioWrite", 39),
+            ("mmioAscend", 40),
+            ("mmioDescend", 41),
+            ("mmioStringToFOURCCW", 43),
+        ],
+    );
 }
 
 #[test]
 fn t01_33_synthetic_exports_msvcrt() {
     let tables = get_export_tables();
-    require_dll_exports(&tables, "msvcrt.dll", 40, &[
-        ("malloc", 4),
-        ("free", 3),
-        ("calloc", 2),
-        ("realloc", 5),
-        ("memcpy", 31),
-        ("memset", 32),
-        ("memmove", 33),
-        ("memcmp", 34),
-        ("strlen", 27),
-        ("strcmp", 35),
-        ("strncmp", 28),
-        ("strcpy", 36),
-        ("sprintf", 38),
-        ("sscanf", 40),
-        ("fopen", 41),
-        ("fclose", 42),
-        ("fread", 43),
-        ("fwrite", 26),
-        ("fgets", 44),
-        ("fflush", 45),
-        ("abort", 18),
-        ("exit", 19),
-        ("signal", 67),
-        ("sqrt", 46),
-        ("pow", 47),
-        ("atan2", 51),
-        ("log", 52),
-        ("exp", 53),
-        ("rand", 57),
-        ("srand", 58),
-        ("time", 59),
-        ("qsort", 60),
-        ("abs", 62),
-        ("atoi", 64),
-        ("atof", 66),
-        ("_beginthreadex", 20),
-        ("_endthreadex", 21),
-        ("_set_new_mode", 1),
-        ("__C_specific_handler", 6),
-        ("__acrt_iob_func", 22),
-    ]);
+    require_dll_exports(
+        &tables,
+        "msvcrt.dll",
+        40,
+        &[
+            ("malloc", 4),
+            ("free", 3),
+            ("calloc", 2),
+            ("realloc", 5),
+            ("memcpy", 31),
+            ("memset", 32),
+            ("memmove", 33),
+            ("memcmp", 34),
+            ("strlen", 27),
+            ("strcmp", 35),
+            ("strncmp", 28),
+            ("strcpy", 36),
+            ("sprintf", 38),
+            ("sscanf", 40),
+            ("fopen", 41),
+            ("fclose", 42),
+            ("fread", 43),
+            ("fwrite", 26),
+            ("fgets", 44),
+            ("fflush", 45),
+            ("abort", 18),
+            ("exit", 19),
+            ("signal", 67),
+            ("sqrt", 46),
+            ("pow", 47),
+            ("atan2", 51),
+            ("log", 52),
+            ("exp", 53),
+            ("rand", 57),
+            ("srand", 58),
+            ("time", 59),
+            ("qsort", 60),
+            ("abs", 62),
+            ("atoi", 64),
+            ("atof", 66),
+            ("_beginthreadex", 20),
+            ("_endthreadex", 21),
+            ("_set_new_mode", 1),
+            ("__C_specific_handler", 6),
+            ("__acrt_iob_func", 22),
+        ],
+    );
 }
 
 #[test]
 fn t01_34_synthetic_exports_usp10() {
     let tables = get_export_tables();
-    require_dll_exports(&tables, "usp10.dll", 10, &[
-        ("ScriptStringAnalyse", 1),
-        ("ScriptStringFree", 2),
-        ("ScriptStringOut", 3),
-        ("ScriptString_pSize", 4),
-        ("ScriptItemize", 5),
-        ("ScriptShape", 6),
-        ("ScriptPlace", 7),
-        ("ScriptLayout", 8),
-        ("ScriptBreak", 9),
-        ("ScriptGetProperties", 10),
-        ("ScriptRecordDigitSubstitution", 11),
-        ("ScriptApplyDigitSubstitution", 12),
-        ("ScriptCacheGetHeight", 13),
-        ("ScriptFreeCache", 14),
-    ]);
+    require_dll_exports(
+        &tables,
+        "usp10.dll",
+        10,
+        &[
+            ("ScriptStringAnalyse", 1),
+            ("ScriptStringFree", 2),
+            ("ScriptStringOut", 3),
+            ("ScriptString_pSize", 4),
+            ("ScriptItemize", 5),
+            ("ScriptShape", 6),
+            ("ScriptPlace", 7),
+            ("ScriptLayout", 8),
+            ("ScriptBreak", 9),
+            ("ScriptGetProperties", 10),
+            ("ScriptRecordDigitSubstitution", 11),
+            ("ScriptApplyDigitSubstitution", 12),
+            ("ScriptCacheGetHeight", 13),
+            ("ScriptFreeCache", 14),
+        ],
+    );
 }
 
 #[test]
@@ -2326,10 +3023,7 @@ fn t01_35_synthetic_exports_all_dlls_present() {
             "Required DLL '{dll}' is missing from export tables"
         );
         let exports = &tables[*dll];
-        assert!(
-            !exports.is_empty(),
-            "DLL '{dll}' has empty export table"
-        );
+        assert!(!exports.is_empty(), "DLL '{dll}' has empty export table");
     }
 }
 
@@ -2371,6 +3065,7 @@ fn t01_36_synthetic_exports_ordinal_continuity() {
     }
 }
 
+#[test]
 fn reason_codes_keep_stable_numeric_values() {
     assert_eq!(ReasonCode::RcPeParseInvalid.as_u32(), 2000);
     assert_eq!(ReasonCode::RcImportMissing.as_u32(), 2001);
@@ -2386,7 +3081,15 @@ fn reason_codes_keep_stable_numeric_values() {
 fn create_ge(temp_dir: &TempDir, name: &str) {
     let output = run_macwin(
         temp_dir,
-        &["ge:create", "--name", name, "--arch", "x64", "--winver", "win11-23h2"],
+        &[
+            "ge:create",
+            "--name",
+            name,
+            "--arch",
+            "x64",
+            "--winver",
+            "win11-23h2",
+        ],
     );
     assert!(
         output.status.success(),

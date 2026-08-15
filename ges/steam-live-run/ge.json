@@ -21,7 +21,136 @@
       "requires_permission": true
     }
   ],
-  "override_profiles": [],
+  "override_profiles": [
+    {
+      "id": "steam-optimal",
+      "match_rule": {
+        "install_path_wildcard": {
+          "pattern": "**/Steam.exe"
+        }
+      },
+      "payload": {
+        "env_add": {
+          "CASA1_AUDIO_DEVICE": "default",
+          "CASA1_CEF_BRIDGE": "1",
+          "CASA1_CEF_IOSURFACE": "1",
+          "CASA1_D3D_FEATURE_LEVEL": "11_0",
+          "CASA1_DSOUND_REAL": "1",
+          "CASA1_DXGI_METAL_SWAPCHAIN": "1",
+          "CASA1_GPU_COMPAT_VENDOR": "10de",
+          "CASA1_HIDPI": "1",
+          "CASA1_METAL_RENDERING": "1",
+          "CASA1_OPENGL_METAL": "1",
+          "CASA1_REAL_AUDIO": "1",
+          "CASA1_STEAM_CRASH_WORKAROUND": "1",
+          "CASA1_STEAM_INPUT": "1",
+          "CASA1_VULKAN_METAL": "1",
+          "CASA1_WEBVIEW2": "1",
+          "CASA1_XAUDIO2_REAL": "1"
+        },
+        "env_remove": [],
+        "reg_set": [],
+        "reg_delete": [],
+        "dll_override": [
+          {
+            "name": "d3d11",
+            "mode": "Builtin"
+          },
+          {
+            "name": "d3d10",
+            "mode": "Builtin"
+          },
+          {
+            "name": "d3d9",
+            "mode": "Builtin"
+          },
+          {
+            "name": "dxgi",
+            "mode": "Builtin"
+          },
+          {
+            "name": "d3d12",
+            "mode": "Builtin"
+          },
+          {
+            "name": "dcomp",
+            "mode": "Builtin"
+          },
+          {
+            "name": "d2d1",
+            "mode": "Builtin"
+          },
+          {
+            "name": "dwrite",
+            "mode": "Builtin"
+          },
+          {
+            "name": "xaudio2_7",
+            "mode": "Builtin"
+          },
+          {
+            "name": "xaudio2_9",
+            "mode": "Builtin"
+          },
+          {
+            "name": "dsound",
+            "mode": "Builtin"
+          },
+          {
+            "name": "winmm",
+            "mode": "Builtin"
+          },
+          {
+            "name": "mfplat",
+            "mode": "Builtin"
+          },
+          {
+            "name": "libcef",
+            "mode": "Builtin"
+          },
+          {
+            "name": "webview2",
+            "mode": "Builtin"
+          },
+          {
+            "name": "vulkan-1",
+            "mode": "Builtin"
+          },
+          {
+            "name": "opengl32",
+            "mode": "Builtin"
+          }
+        ],
+        "cpu_profile": null,
+        "gfx_profile": {
+          "feature_masks": [
+            "metal",
+            "d3d11_fl11_0",
+            "d3d10_fl10_1",
+            "d3d9_ex",
+            "dxgi_1_6",
+            "bc1237_compression",
+            "msaa_8x",
+            "hdr10"
+          ],
+          "shader_flags": [
+            "dxil_to_msl",
+            "async_pipeline_compile",
+            "shader_cache"
+          ]
+        },
+        "input_profile": null,
+        "network_profile": {
+          "policy": "allow_all",
+          "whitelist": []
+        },
+        "fs_profile": {
+          "case_mode": "insensitive",
+          "long_paths_enabled": true
+        }
+      }
+    }
+  ],
   "fs_state": {
     "entries": {
       "C:\\users\\casa1\\appdata\\local\\temp\\steamsetup.exe": {

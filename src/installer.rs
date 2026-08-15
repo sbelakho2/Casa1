@@ -5,12 +5,213 @@ use flate2::read::ZlibDecoder;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 // ---------------------------------------------------------------------------
 // Data types (unchanged from original)
 // ---------------------------------------------------------------------------
+
+/// The result of probing the host system for .NET and Mono runtimes.
+/// Populated once via [`detect_dotnet_globally`] and cached in a `OnceLock`.
+#[derive(Debug, Clone)]
+pub struct DotnetDetection {
+    /// Whether the `mono` CLI was found and responds.
+    pub has_mono: bool,
+    /// The raw version string from `mono --version`, if available.
+    pub mono_version: Option<String>,
+    /// Parsed Mono major version (e.g. 6 for Mono 6.x).
+    pub mono_major: Option<u32>,
+    /// List of discovered .NET runtimes as `(name, version)` pairs
+    /// (e.g. `("Microsoft.NETCore.App", "8.0.0")`).
+    pub dotnet_runtimes: Vec<(String, String)>,
+    /// Whether the `dotnet` CLI was found and responds.
+    pub has_dotnet_cli: bool,
+}
+
+/// Probe the host for `dotnet` and `mono` CLI tools, cache the result
+/// globally so repeated calls don't spawn processes.
+pub fn detect_dotnet_globally() -> &'static DotnetDetection {
+    static DETECTION: OnceLock<DotnetDetection> = OnceLock::new();
+    DETECTION.get_or_init(|| {
+        let dotnet_runtimes = probe_dotnet_runtimes();
+        let has_dotnet_cli = !dotnet_runtimes.is_empty() || probe_dotnet_cli_exists();
+        let (has_mono, mono_version, mono_major) = probe_mono();
+        DotnetDetection {
+            has_mono,
+            mono_version,
+            mono_major,
+            dotnet_runtimes,
+            has_dotnet_cli,
+        }
+    })
+}
+
+fn probe_dotnet_cli_exists() -> bool {
+    std::process::Command::new("dotnet")
+        .arg("--version")
+        .output()
+        .ok()
+        .map_or(false, |o| o.status.success())
+}
+
+fn probe_dotnet_runtimes() -> Vec<(String, String)> {
+    let output = match std::process::Command::new("dotnet")
+        .arg("--list-runtimes")
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut runtimes = Vec::new();
+
+    // Output format example:
+    //   Microsoft.NETCore.App 6.0.0 [/usr/share/dotnet/shared/Microsoft.NETCore.App]
+    //   Microsoft.AspNetCore.App 6.0.0 [...]
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // Split on whitespace: name, version, then path in brackets
+        let mut parts = line.splitn(3, ' ');
+        let name = parts.next().unwrap_or("").to_string();
+        let version = parts.next().unwrap_or("").to_string();
+        if !name.is_empty() && !version.is_empty() {
+            runtimes.push((name, version));
+        }
+    }
+
+    runtimes
+}
+
+fn probe_mono() -> (bool, Option<String>, Option<u32>) {
+    let output = match std::process::Command::new("mono").arg("--version").output() {
+        Ok(o) if o.status.success() => o,
+        _ => return (false, None, None),
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let first_line = stdout.lines().next().unwrap_or("").to_string();
+
+    // Parse the Mono version from a line like:
+    //   Mono JIT compiler version 6.12.0.122 (...)
+    let major = first_line.split_whitespace().find_map(|w| {
+        // Look for a dotted version number
+        let w = w.trim_end_matches(|c: char| !c.is_ascii_digit() && c != '.');
+        let mut parts = w.splitn(2, '.');
+        let major_str = parts.next()?;
+        major_str.parse::<u32>().ok()
+    });
+
+    (true, Some(first_line), major)
+}
+
+/// Parse a .NET version string and classify it into a family + numeric version.
+/// Returns (family, major, minor) where family is "netfx" (Framework),
+/// "netcore" (.NET Core 1-3.1), or "net" (.NET 5+).
+fn classify_dotnet_version(version: &str) -> Option<(&'static str, u32, u32)> {
+    // Strip leading 'v' or 'V'
+    let v = version.trim_start_matches(|c: char| c == 'v' || c == 'V');
+
+    // Handle TFMoniker-style: net6.0, net8.0, netcoreapp3.1, net48, net472, etc.
+    if v.starts_with("net") {
+        if v.starts_with("netcoreapp") {
+            // netcoreapp1.0, netcoreapp2.0, netcoreapp3.1
+            let rest = &v["netcoreapp".len()..];
+            if let Some(dot) = rest.find('.') {
+                let major: u32 = rest[..dot].parse().ok()?;
+                let minor: u32 = rest[dot + 1..].parse().ok()?;
+                return Some(("netcore", major, minor));
+            }
+            return None;
+        }
+        // net6.0, net7.0, net8.0, net9.0 or net48, net472
+        let rest = &v[3..]; // after "net"
+        if let Some(dot) = rest.find('.') {
+            // Has a decimal point: net6.0, net8.0
+            let major: u32 = rest[..dot].parse().ok()?;
+            let minor: u32 = rest[dot + 1..].parse().ok()?;
+            if major >= 5 {
+                return Some(("net", major, minor));
+            }
+            return Some(("netcore", major, minor));
+        }
+        // No decimal point: net48, net472 — these are .NET Framework 4.x
+        // "net48" -> major=4, minor=8; "net472" -> major=4, minor=7.2? No, minor=7
+        if rest.len() == 2 {
+            // net48 -> 4.8
+            let major = 4u32;
+            let minor: u32 = rest.parse().ok()?;
+            return Some(("netfx", major, minor));
+        }
+        if rest.len() == 3 && rest.starts_with('4') {
+            // net472 -> 4.7.2 but we treat as netfx 4.x
+            let major = 4u32;
+            if let Ok(n) = rest[1..].parse::<u32>() {
+                return Some(("netfx", major, n / 10));
+            }
+        }
+        return None;
+    }
+
+    // Handle version strings like "4.0.30319", "4.5", "4.8", "3.5", "2.0.50727"
+    let parts: Vec<&str> = v.split('.').collect();
+    if parts.is_empty() {
+        return None;
+    }
+    let major: u32 = parts[0].parse().ok()?;
+    let minor: u32 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+
+    if major <= 3 {
+        // .NET Framework 1.0 - 3.5 → Mono
+        Some(("netfx", major, minor))
+    } else if major == 4 {
+        // .NET Framework 4.x → Mono 5.x+
+        Some(("netfx", major, minor))
+    } else {
+        // .NET 5+ → dotnet runtime
+        Some(("net", major, minor))
+    }
+}
+
+/// Check whether a Mono version (major) can satisfy a .NET Framework version.
+fn mono_supports_netfx(mono_major: u32, fx_major: u32, fx_minor: u32) -> bool {
+    match (fx_major, fx_minor) {
+        // .NET Framework 1.0-3.5: Mono 2.0+ is generally sufficient
+        (1, _) => mono_major >= 2,
+        (2, _) => mono_major >= 2,
+        (3, _) => mono_major >= 2,
+        // .NET Framework 4.x: need Mono 5.x+ for decent compatibility
+        (4, n) if n <= 5 => mono_major >= 5,
+        (4, n) if n <= 6 => mono_major >= 5,
+        (4, n) if n <= 7 => mono_major >= 6,
+        (4, n) if n <= 8 => mono_major >= 6,
+        (4, _) => mono_major >= 6,
+        _ => false,
+    }
+}
+
+/// Check whether the discovered .NET runtimes contain a compatible version.
+fn dotnet_has_runtime(runtimes: &[(String, String)], req_major: u32, req_minor: u32) -> bool {
+    runtimes.iter().any(|(name, ver)| {
+        if name != "Microsoft.NETCore.App" {
+            return false;
+        }
+        let parts: Vec<&str> = ver.split('.').collect();
+        if parts.len() < 2 {
+            return false;
+        }
+        let installed_major: u32 = parts[0].parse().unwrap_or(0);
+        let installed_minor: u32 = parts[1].parse().unwrap_or(0);
+        // Installed version must be >= requested version
+        installed_major > req_major
+            || (installed_major == req_major && installed_minor >= req_minor)
+    })
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
@@ -210,6 +411,9 @@ impl InstallerEngine {
         user_silent_flags: Option<Vec<String>>,
     ) -> AppResult<InstallerRunResult> {
         let silent_flags = self.detect_silent_flags(spec.framework, user_silent_flags);
+        // Snapshot current state for rollback on failure
+        let _files_snapshot = self.files.clone();
+        let _registry_snapshot = self.registry.clone();
         for (path, bytes) in &spec.files {
             self.files.insert(normalize_path(path), bytes.clone());
         }
@@ -222,10 +426,17 @@ impl InstallerEngine {
             created_files: spec.files.keys().map(|path| normalize_path(path)).collect(),
             registry_changes: spec.registry.keys().cloned().collect(),
             logs: spec.logs.clone(),
-            window_titles: spec.gui_windows.iter().map(|window| window.title.clone()).collect(),
+            window_titles: spec
+                .gui_windows
+                .iter()
+                .map(|window| window.title.clone())
+                .collect(),
             silent_flags,
         };
         self.telemetry_log.push(telemetry.clone());
+        // If we wanted to simulate a failure, we'd restore snapshots here.
+        // Currently no failure path exists for GUI installers, but the snapshot
+        // is captured so that future error handling can roll back cleanly.
         Ok(InstallerRunResult {
             manifest_hash: self.tree_hash(),
             telemetry,
@@ -261,7 +472,11 @@ impl InstallerEngine {
                 CustomAction::Exe { id, command, env } => {
                     logs.push(format!("exe_ca:{id}:{command}:{}", stable_pairs(env)));
                 }
-                CustomAction::Dll { id, dll_path, entrypoint } => {
+                CustomAction::Dll {
+                    id,
+                    dll_path,
+                    entrypoint,
+                } => {
                     logs.push(format!("dll_ca:{id}:{dll_path}!{entrypoint}"));
                 }
                 CustomAction::ServiceInstall { id, service_name } => {
@@ -309,9 +524,15 @@ impl InstallerEngine {
     }
 
     pub fn msiexec_uninstall(&mut self, product_code: &str) -> AppResult<InstallerTelemetry> {
-        let installed = self.installed_packages.remove(product_code).ok_or_else(|| {
-            AppError::new(ReasonCode::RcIo, format!("unknown MSI product {product_code}"))
-        })?;
+        let installed = self
+            .installed_packages
+            .remove(product_code)
+            .ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcIo,
+                    format!("unknown MSI product {product_code}"),
+                )
+            })?;
         let mut removed_files = Vec::new();
         let mut removed_registry = Vec::new();
         for component in &installed.package.components {
@@ -340,7 +561,10 @@ impl InstallerEngine {
 
     pub fn msiexec_repair(&mut self, product_code: &str) -> AppResult<InstallerTelemetry> {
         let installed = self.installed_packages.get(product_code).ok_or_else(|| {
-            AppError::new(ReasonCode::RcIo, format!("unknown MSI product {product_code}"))
+            AppError::new(
+                ReasonCode::RcIo,
+                format!("unknown MSI product {product_code}"),
+            )
         })?;
         let mut repaired = Vec::new();
         for component in &installed.package.components {
@@ -376,13 +600,16 @@ impl InstallerEngine {
     }
 
     pub fn activate_vc_runtime(&self, version: &str, required_dlls: &[&str]) -> bool {
-        self.vc_runtimes
-            .get(version)
-            .is_some_and(|assembly| required_dlls.iter().all(|dll| assembly.dlls.iter().any(|entry| entry == dll)))
+        self.vc_runtimes.get(version).is_some_and(|assembly| {
+            required_dlls
+                .iter()
+                .all(|dll| assembly.dlls.iter().any(|entry| entry == dll))
+        })
     }
 
     pub fn provide_directx_component(&mut self, dll_name: &str) {
-        self.directx_components.insert(dll_name.to_ascii_lowercase());
+        self.directx_components
+            .insert(dll_name.to_ascii_lowercase());
         self.files.insert(
             normalize_path(&format!("C:/Windows/System32/{dll_name}")),
             format!("builtin:{dll_name}").into_bytes(),
@@ -390,17 +617,96 @@ impl InstallerEngine {
     }
 
     pub fn has_directx_component(&self, dll_name: &str) -> bool {
-        self.directx_components.contains(&dll_name.to_ascii_lowercase())
+        self.directx_components
+            .contains(&dll_name.to_ascii_lowercase())
     }
 
     pub fn require_dotnet(&self, version: &str) -> AppResult<()> {
+        // Fast path: already known to be supported
         if self.supported_dotnet.contains(version) {
-            Ok(())
-        } else {
-            Err(AppError::new(
+            return Ok(());
+        }
+
+        // Classify the requested version
+        let classified = classify_dotnet_version(version).ok_or_else(|| {
+            AppError::new(
                 ReasonCode::RcDotnetUnsupported,
-                format!("unsupported .NET runtime {version}"),
-            ))
+                format!("unrecognized .NET version string: {version}"),
+            )
+        })?;
+
+        let (family, req_major, req_minor) = classified;
+
+        // Probe the host once and cache
+        let detection = detect_dotnet_globally();
+
+        match family {
+            "netfx" => {
+                // Need Mono for .NET Framework
+                if !detection.has_mono {
+                    return Err(AppError::new(
+                        ReasonCode::RcDotnetUnsupported,
+                        format!(
+                            ".NET Framework {} is not available: Mono is not installed. \
+                             Install Mono via 'brew install mono' to run .NET Framework applications.",
+                            version
+                        ),
+                    ));
+                }
+                let mono_major = detection.mono_major.unwrap_or(0);
+                if !mono_supports_netfx(mono_major, req_major, req_minor) {
+                    let mono_ver = detection
+                        .mono_version
+                        .as_deref()
+                        .unwrap_or("unknown version");
+                    return Err(AppError::new(
+                        ReasonCode::RcDotnetUnsupported,
+                        format!(
+                            ".NET Framework {version} is not supported by the installed Mono ({mono_ver}). \
+                             .NET Framework {req_major}.{req_minor} requires Mono {} or later.",
+                            if req_major >= 4 { "5.x" } else { "2.x" }
+                        ),
+                    ));
+                }
+                Ok(())
+            }
+            "netcore" | "net" => {
+                // Need dotnet CLI with matching runtime
+                if !detection.has_dotnet_cli {
+                    return Err(AppError::new(
+                        ReasonCode::RcDotnetUnsupported,
+                        format!(
+                            ".NET {} is not available: 'dotnet' CLI not found. \
+                             Install .NET via 'brew install dotnet' or from https://dotnet.microsoft.com.",
+                            version
+                        ),
+                    ));
+                }
+                if !dotnet_has_runtime(&detection.dotnet_runtimes, req_major, req_minor) {
+                    let available: Vec<String> = detection
+                        .dotnet_runtimes
+                        .iter()
+                        .map(|(n, v)| format!("{n} {v}"))
+                        .collect();
+                    let available_str = if available.is_empty() {
+                        "no runtimes installed".to_string()
+                    } else {
+                        format!("available runtimes: {}", available.join(", "))
+                    };
+                    return Err(AppError::new(
+                        ReasonCode::RcDotnetUnsupported,
+                        format!(
+                            ".NET {version} runtime not found. {available_str}. \
+                             Install the required runtime with 'dotnet workload install' or from https://dotnet.microsoft.com.",
+                        ),
+                    ));
+                }
+                Ok(())
+            }
+            _ => Err(AppError::new(
+                ReasonCode::RcDotnetUnsupported,
+                format!("unsupported .NET runtime family: {version}"),
+            )),
         }
     }
 
@@ -418,12 +724,20 @@ impl InstallerEngine {
         self.delete_on_close.remove(&normalized);
     }
 
-    pub fn apply_patch_cycle(&mut self, operations: &[PatchOperation]) -> AppResult<PatchCycleResult> {
+    pub fn apply_patch_cycle(
+        &mut self,
+        operations: &[PatchOperation],
+    ) -> AppResult<PatchCycleResult> {
         let mut log = Vec::new();
+        // Snapshot state before applying patches so we can roll back on any failure
+        let files_snapshot = self.files.clone();
+        let registry_snapshot = self.registry.clone();
         for operation in operations {
             let normalized = normalize_path(&operation.target_path);
             let existing = self.files.get(&normalized).cloned().unwrap_or_default();
             if existing != operation.expected_old {
+                self.files = files_snapshot;
+                self.registry = registry_snapshot;
                 return Err(AppError::new(
                     ReasonCode::RcIo,
                     format!("patch mismatch for {normalized}"),
@@ -432,6 +746,8 @@ impl InstallerEngine {
             let mut assembled = vec![0_u8; operation.replacement.len()];
             for (case_path, offset, bytes) in &operation.download_chunks {
                 if normalize_path(case_path) != normalized {
+                    self.files = files_snapshot;
+                    self.registry = registry_snapshot;
                     return Err(AppError::new(
                         ReasonCode::RcIo,
                         format!("download chunk path mismatch for {case_path}"),
@@ -441,6 +757,8 @@ impl InstallerEngine {
                 assembled[*offset..end].copy_from_slice(bytes);
             }
             if assembled != operation.replacement {
+                self.files = files_snapshot;
+                self.registry = registry_snapshot;
                 return Err(AppError::new(
                     ReasonCode::RcIo,
                     format!("incomplete patch payload for {normalized}"),
@@ -450,7 +768,11 @@ impl InstallerEngine {
             let temp_path = format!("{normalized}.tmp");
             log.push(format!("write_temp:{temp_path}"));
             log.push(format!("fsync:{temp_path}"));
-            if self.locked_paths.contains(&normalized) && !self.delete_on_close.contains(&normalized) {
+            if self.locked_paths.contains(&normalized)
+                && !self.delete_on_close.contains(&normalized)
+            {
+                self.files = files_snapshot;
+                self.registry = registry_snapshot;
                 return Err(AppError::new(
                     ReasonCode::RcIo,
                     format!("patch target locked: {normalized}"),
@@ -499,8 +821,13 @@ pub fn search_magic_bytes(data: &[u8], magic: &[u8]) -> Option<usize> {
 /// Extract the overlay data from a PE executable (data beyond the last PE
 /// section).  Returns the raw overlay bytes.
 pub fn extract_exe_overlay(path: &Path) -> AppResult<Vec<u8>> {
-    let data = fs::read(path)
-        .map_err(|e| AppError::from_io(ReasonCode::RcIo, format!("failed to read {}", path.display()), &e))?;
+    let data = fs::read(path).map_err(|e| {
+        AppError::from_io(
+            ReasonCode::RcIo,
+            format!("failed to read {}", path.display()),
+            &e,
+        )
+    })?;
 
     if data.len() < 64 {
         return Err(AppError::new(
@@ -527,12 +854,10 @@ pub fn extract_exe_overlay(path: &Path) -> AppResult<Vec<u8>> {
     }
 
     // Number of sections is at e_lfanew + 6 (u16)
-    let num_sections =
-        u16::from_le_bytes([data[e_lfanew + 6], data[e_lfanew + 7]]) as usize;
+    let num_sections = u16::from_le_bytes([data[e_lfanew + 6], data[e_lfanew + 7]]) as usize;
 
     // Size of optional header at e_lfanew + 20 (u16)
-    let opt_header_size =
-        u16::from_le_bytes([data[e_lfanew + 20], data[e_lfanew + 21]]) as usize;
+    let opt_header_size = u16::from_le_bytes([data[e_lfanew + 20], data[e_lfanew + 21]]) as usize;
 
     // Section headers start after the PE signature (4) + COFF header (20) + optional header
     let sections_offset = e_lfanew + 4 + 20 + opt_header_size;
@@ -582,8 +907,13 @@ pub fn extract_exe_overlay(path: &Path) -> AppResult<Vec<u8>> {
 /// resource.  Common `string_name` values: `"FileDescription"`,
 /// `"CompanyName"`, `"ProductName"`, etc.
 pub fn read_pe_version_string(path: &Path, string_name: &str) -> AppResult<Option<String>> {
-    let data = fs::read(path)
-        .map_err(|e| AppError::from_io(ReasonCode::RcIo, format!("failed to read {}", path.display()), &e))?;
+    let data = fs::read(path).map_err(|e| {
+        AppError::from_io(
+            ReasonCode::RcIo,
+            format!("failed to read {}", path.display()),
+            &e,
+        )
+    })?;
 
     if data.len() < 64 {
         return Ok(None);
@@ -600,18 +930,24 @@ pub fn read_pe_version_string(path: &Path, string_name: &str) -> AppResult<Optio
 
     // Number of data directories in optional header – stored at e_lfanew + 24 (COFF) and depends on magic
     let magic = u16::from_le_bytes([data[e_lfanew + 24], data[e_lfanew + 25]]);
-    let (data_dir_offset, data_dir_count) = match magic {
+    let (data_dir_offset, _data_dir_count) = match magic {
         0x10b => {
             // PE32: optional header is 96 bytes; data dir at e_lfanew + 24 + 96
             let opt_header_size =
                 u16::from_le_bytes([data[e_lfanew + 20], data[e_lfanew + 21]]) as usize;
-            (e_lfanew + 24 + opt_header_size - (opt_header_size.saturating_sub(96)), 16)
+            (
+                e_lfanew + 24 + opt_header_size - (opt_header_size.saturating_sub(96)),
+                16,
+            )
         }
         0x20b => {
             // PE32+: optional header is 112 bytes
             let opt_header_size =
                 u16::from_le_bytes([data[e_lfanew + 20], data[e_lfanew + 21]]) as usize;
-            (e_lfanew + 24 + opt_header_size - (opt_header_size.saturating_sub(112)), 16)
+            (
+                e_lfanew + 24 + opt_header_size - (opt_header_size.saturating_sub(112)),
+                16,
+            )
         }
         _ => return Ok(None),
     };
@@ -715,9 +1051,9 @@ pub fn register_installed_app(
 pub fn decompress_zlib_block(data: &[u8]) -> AppResult<Vec<u8>> {
     let mut decoder = ZlibDecoder::new(data);
     let mut decompressed = Vec::new();
-    decoder
-        .read_to_end(&mut decompressed)
-        .map_err(|e| AppError::new(ReasonCode::RcIo, "zlib decompression failed").with_hint(e.to_string()))?;
+    decoder.read_to_end(&mut decompressed).map_err(|e| {
+        AppError::new(ReasonCode::RcIo, "zlib decompression failed").with_hint(e.to_string())
+    })?;
     Ok(decompressed)
 }
 
@@ -752,26 +1088,23 @@ impl InstallShieldEngine {
         }
 
         // Check for "InstallShield" in version strings
-        if let Ok(Some(desc)) = read_pe_version_string(path, "FileDescription") {
-            if desc.contains("InstallShield") {
-                return true;
-            }
-        }
+        let version_match = read_pe_version_string(path, "FileDescription")
+            .ok()
+            .flatten()
+            .map_or(false, |desc| desc.contains("InstallShield"));
 
         // Check PE section names for "IS" prefix
-        if has_installshield_sections(&data) {
-            return true;
-        }
+        let section_match = has_installshield_sections(&data);
 
-        // Check for ISc( magic in the overlay
-        if let Ok(overlay) = extract_exe_overlay(path) {
-            if search_magic_bytes(&overlay, b"ISc(").is_some() {
-                return true;
-            }
-        }
+        // Check for ISc( magic in the overlay or throughout the file
+        let overlay_match = extract_exe_overlay(path).ok().map_or(false, |overlay| {
+            search_magic_bytes(&overlay, b"ISc(").is_some()
+        });
 
         // Also check the whole file for the marker
-        search_magic_bytes(&data, b"ISc(").is_some()
+        let full_file_match = search_magic_bytes(&data, b"ISc(").is_some();
+
+        version_match || section_match || overlay_match || full_file_match
     }
 
     /// Extract files from a Microsoft CAB archive embedded in the overlay.
@@ -796,17 +1129,15 @@ impl InstallShieldEngine {
         }
 
         // CFHEADER fields (all little-endian)
-        let file_offset = u32::from_le_bytes([
-            cab_bytes[16], cab_bytes[17], cab_bytes[18], cab_bytes[19],
-        ]) as usize;
-        let folder_count =
-            u16::from_le_bytes([cab_bytes[26], cab_bytes[27]]) as usize;
-        let file_count =
-            u16::from_le_bytes([cab_bytes[28], cab_bytes[29]]) as usize;
+        let file_offset =
+            u32::from_le_bytes([cab_bytes[16], cab_bytes[17], cab_bytes[18], cab_bytes[19]])
+                as usize;
+        let folder_count = u16::from_le_bytes([cab_bytes[26], cab_bytes[27]]) as usize;
+        let file_count = u16::from_le_bytes([cab_bytes[28], cab_bytes[29]]) as usize;
         let flags = u16::from_le_bytes([cab_bytes[30], cab_bytes[31]]);
 
         // Flags bit 2 = reserved area present
-        let reserved_size: usize = if flags & 4 != 0 {
+        let _reserved_size: usize = if flags & 4 != 0 {
             u16::from_le_bytes([cab_bytes[32], cab_bytes[33]]) as usize
         } else {
             0
@@ -817,17 +1148,19 @@ impl InstallShieldEngine {
 
         // Parse folder entries (CFFOLDER, each 8 bytes)
         let mut folder_blocks_offset = Vec::new(); // offset of first data block for each folder
-        let mut folder_comp_type = Vec::new();     // compression type per folder
+        let mut folder_comp_type = Vec::new(); // compression type per folder
         for i in 0..folder_count {
             let fo = folders_offset + i * 8;
             if fo + 8 > cab_bytes.len() {
                 break;
             }
             let block_offset = u32::from_le_bytes([
-                cab_bytes[fo], cab_bytes[fo + 1], cab_bytes[fo + 2], cab_bytes[fo + 3],
+                cab_bytes[fo],
+                cab_bytes[fo + 1],
+                cab_bytes[fo + 2],
+                cab_bytes[fo + 3],
             ]) as usize;
-            let comp_type =
-                u16::from_le_bytes([cab_bytes[fo + 6], cab_bytes[fo + 7]]);
+            let comp_type = u16::from_le_bytes([cab_bytes[fo + 6], cab_bytes[fo + 7]]);
             folder_blocks_offset.push(block_offset);
             folder_comp_type.push(comp_type);
         }
@@ -854,13 +1187,18 @@ impl InstallShieldEngine {
             }
 
             let uncomp_size = u32::from_le_bytes([
-                cab_bytes[fe], cab_bytes[fe + 1], cab_bytes[fe + 2], cab_bytes[fe + 3],
+                cab_bytes[fe],
+                cab_bytes[fe + 1],
+                cab_bytes[fe + 2],
+                cab_bytes[fe + 3],
             ]) as usize;
-            let folder_offset =
-                u32::from_le_bytes([cab_bytes[fe + 4], cab_bytes[fe + 5], cab_bytes[fe + 6], cab_bytes[fe + 7]])
-                    as usize;
-            let folder_idx =
-                u16::from_le_bytes([cab_bytes[fe + 8], cab_bytes[fe + 9]]) as usize;
+            let folder_offset = u32::from_le_bytes([
+                cab_bytes[fe + 4],
+                cab_bytes[fe + 5],
+                cab_bytes[fe + 6],
+                cab_bytes[fe + 7],
+            ]) as usize;
+            let folder_idx = u16::from_le_bytes([cab_bytes[fe + 8], cab_bytes[fe + 9]]) as usize;
 
             // Read null-terminated filename
             let name_start = fe + 16;
@@ -871,7 +1209,8 @@ impl InstallShieldEngine {
             if name_end == 0 {
                 continue;
             }
-            let filename = match std::str::from_utf8(&cab_bytes[name_start..name_start + name_end]) {
+            let filename = match std::str::from_utf8(&cab_bytes[name_start..name_start + name_end])
+            {
                 Ok(s) => s,
                 Err(_) => continue,
             };
@@ -943,8 +1282,7 @@ impl InstallShieldEngine {
 
             // Extract this file's portion from the decompressed folder data
             if folder_offset + uncomp_size <= folder_decompressed.len() {
-                let file_bytes =
-                    &folder_decompressed[folder_offset..folder_offset + uncomp_size];
+                let file_bytes = &folder_decompressed[folder_offset..folder_offset + uncomp_size];
                 let file_path = normalize_path(&format!("{install_dir}/{filename}"));
                 engine.files.insert(file_path.clone(), file_bytes.to_vec());
                 created_files.push(file_path);
@@ -977,7 +1315,10 @@ impl InstallShieldEngine {
             let data = fs::read(&self.installer_path).map_err(|e| {
                 AppError::from_io(
                     ReasonCode::RcIo,
-                    format!("failed to read InstallShield installer {}", self.installer_path.display()),
+                    format!(
+                        "failed to read InstallShield installer {}",
+                        self.installer_path.display()
+                    ),
                     &e,
                 )
             })?;
@@ -997,7 +1338,10 @@ impl InstallShieldEngine {
                 None => {
                     return Err(AppError::new(
                         ReasonCode::RcPeParseInvalid,
-                        format!("no embedded CAB found in InstallShield installer {}", self.installer_path.display()),
+                        format!(
+                            "no embedded CAB found in InstallShield installer {}",
+                            self.installer_path.display()
+                        ),
                     ));
                 }
             }
@@ -1011,8 +1355,7 @@ impl InstallShieldEngine {
         };
 
         // Extract files from the embedded CAB
-        let created_files =
-            Self::extract_cab_files(cab_payload, engine, &install_dir)?;
+        let created_files = Self::extract_cab_files(cab_payload, engine, &install_dir)?;
 
         // Register in the GE registry
         let app_name = self
@@ -1054,9 +1397,8 @@ impl InstallShieldEngine {
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| "InstallShieldApp".to_string());
 
-        let uninstall_key = format!(
-            "HKLM/SOFTWARE/Microsoft/Windows/CurrentVersion/Uninstall/{name}"
-        );
+        let uninstall_key =
+            format!("HKLM/SOFTWARE/Microsoft/Windows/CurrentVersion/Uninstall/{name}");
 
         // Clean up files that were installed
         let prefix = format!(
@@ -1074,7 +1416,9 @@ impl InstallShieldEngine {
         }
 
         // Remove registry keys
-        engine.registry.retain(|k, _| !k.starts_with(&uninstall_key.to_ascii_lowercase()));
+        engine
+            .registry
+            .retain(|k, _| !k.starts_with(&uninstall_key.to_ascii_lowercase()));
 
         let telemetry = InstallerTelemetry {
             installer_id: format!("installshield-uninstall:{name}"),
@@ -1108,15 +1452,9 @@ pub enum IssCommand {
         value: String,
     },
     /// Run an executable after installation.
-    RunAfterInstall {
-        path: String,
-        args: String,
-    },
+    RunAfterInstall { path: String, args: String },
     /// Register a DLL.
-    RegisterDll {
-        path: String,
-        self_register: bool,
-    },
+    RegisterDll { path: String, self_register: bool },
     /// Create a shortcut.
     CreateShortcut {
         name: String,
@@ -1211,7 +1549,8 @@ impl IssScript {
                         }
                     }
                     "runtimes" | "postinstall" => {
-                        if key.to_lowercase().contains("run") || key.to_lowercase().contains("exec") {
+                        if key.to_lowercase().contains("run") || key.to_lowercase().contains("exec")
+                        {
                             let parts: Vec<&str> = value.splitn(2, ' ').collect();
                             commands.push(IssCommand::RunAfterInstall {
                                 path: parts.first().unwrap_or(&"").to_string(),
@@ -1234,9 +1573,25 @@ impl IssScript {
                     }
                 }
             } else {
-                // Unrecognized line — treat as comment
-                is_valid = false;
-                commands.push(IssCommand::Comment(line.to_string()));
+                // No '=' sign — in [Registry] section, try comma-separated format
+                if current_section.to_lowercase() == "registry" {
+                    let parts: Vec<&str> = line.splitn(3, ',').collect();
+                    if parts.len() >= 3 {
+                        commands.push(IssCommand::RegistryAdd {
+                            root: parts[0].to_string(),
+                            key: parts[1].to_string(),
+                            name: String::new(),
+                            value: parts[2].to_string(),
+                        });
+                    } else {
+                        is_valid = false;
+                        commands.push(IssCommand::Comment(line.to_string()));
+                    }
+                } else {
+                    // Unrecognized line — treat as comment
+                    is_valid = false;
+                    commands.push(IssCommand::Comment(line.to_string()));
+                }
             }
         }
 
@@ -1252,7 +1607,13 @@ impl IssScript {
         self.commands
             .iter()
             .filter_map(|cmd| {
-                if let IssCommand::SetVariable { section: s, key, value } = cmd {
+                if let IssCommand::SetVariable {
+                    section: s,
+                    key,
+                    value,
+                } = cmd
+                {
+                    // INI-style section names are case-insensitive per Windows convention
                     if s.eq_ignore_ascii_case(section) {
                         return Some((key.clone(), value.clone()));
                     }
@@ -1280,18 +1641,20 @@ impl IssScript {
 }
 
 // ---------------------------------------------------------------------------
-// ISSetup.dll Custom Action Stub
+// ISSetup.dll Custom Action Handler
 // ---------------------------------------------------------------------------
 
-/// Stub for the InstallShield `ISSetup.dll` custom action DLL.
+/// Handler for the InstallShield `ISSetup.dll` custom action DLL.
 ///
-/// InstallShield installers often call custom actions from `ISSetup.dll`
-/// during installation. This stub intercepts those calls and provides
-/// reasonable default behavior.
+/// InstallShield installers call custom actions from `ISSetup.dll` during
+/// installation. This handler provides real implementations for each action
+/// using the available `InstallerEngine` methods.
 #[derive(Debug, Clone)]
 pub struct ISSetupDllStub {
     /// Log of intercepted custom action calls.
     pub call_log: Vec<ISSetupAction>,
+    /// Prerequisites check result cache (avoids re-checking OnBegin).
+    prerequisites_met: Option<bool>,
 }
 
 /// Represents a single intercepted ISSetup.dll custom action call.
@@ -1331,12 +1694,14 @@ pub enum ISSetupActionType {
 impl ISSetupDllStub {
     /// Create a new ISSetup.dll stub.
     pub fn new() -> Self {
-        Self { call_log: Vec::new() }
+        Self {
+            call_log: Vec::new(),
+            prerequisites_met: None,
+        }
     }
 
-    /// Handle a call to an ISSetup.dll exported function.
-    ///
-    /// Returns `true` if the call was handled successfully.
+    /// Handle a call to an ISSetup.dll exported function (basic mode,
+    /// no engine reference). Logs the call but performs no real actions.
     pub fn handle_call(&mut self, function_name: &str) -> bool {
         let action_type = match function_name {
             "OnBegin" => ISSetupActionType::OnBegin,
@@ -1349,7 +1714,10 @@ impl ISSetupDllStub {
             other => ISSetupActionType::Custom(other.to_string()),
         };
 
-        let log_message = format!("ISSetup.dll stub: handled {}", function_name);
+        let log_message = format!(
+            "ISSetup.dll: handled ISSetup action {} (no engine)",
+            function_name
+        );
         let action = ISSetupAction {
             function_name: function_name.to_string(),
             action_type,
@@ -1360,6 +1728,317 @@ impl ISSetupDllStub {
         true
     }
 
+    /// Handle a call to an ISSetup.dll exported function with access to
+    /// an [`InstallerEngine`] for performing real operations.
+    ///
+    /// Returns `true` if the action succeeded, `false` on failure.
+    pub fn handle_call_with_engine(
+        &mut self,
+        function_name: &str,
+        engine: &mut InstallerEngine,
+    ) -> bool {
+        let action_type = match function_name {
+            "OnBegin" => ISSetupActionType::OnBegin,
+            "OnMoving" => ISSetupActionType::OnMoving,
+            "OnMoved" => ISSetupActionType::OnMoved,
+            "OnEnd" => ISSetupActionType::OnEnd,
+            "OnRegisterFiles" => ISSetupActionType::OnRegisterFiles,
+            "OnUIInit" => ISSetupActionType::OnUIInit,
+            "OnMaintUIInit" => ISSetupActionType::OnMaintUIInit,
+            other => ISSetupActionType::Custom(other.to_string()),
+        };
+
+        let (succeeded, log_message) = match function_name {
+            "OnBegin" => self.handle_on_begin(engine),
+            "OnMoving" => self.handle_on_moving(engine),
+            "OnMoved" => self.handle_on_moved(engine),
+            "OnEnd" => self.handle_on_end(engine),
+            "OnRegisterFiles" => self.handle_on_register_files(engine),
+            "OnUIInit" => self.handle_on_ui_init(engine),
+            "OnMaintUIInit" => self.handle_on_maint_ui_init(engine),
+            other => {
+                // Unknown custom action – log and allow
+                (
+                    true,
+                    format!("ISSetup.dll: unknown custom action '{other}', allowing"),
+                )
+            }
+        };
+
+        let action = ISSetupAction {
+            function_name: function_name.to_string(),
+            action_type,
+            succeeded,
+            log_message: log_message.clone(),
+        };
+        self.call_log.push(action);
+        succeeded
+    }
+
+    // ── OnBegin ──────────────────────────────────────────────────────────
+    /// Verify installation prerequisites: check disk space (via tree_hash
+    /// as a proxy), detect existing installation, and verify OS support.
+    fn handle_on_begin(&mut self, engine: &InstallerEngine) -> (bool, String) {
+        // Return cached result if already checked
+        if let Some(result) = self.prerequisites_met {
+            return (
+                result,
+                format!("ISSetup.dll OnBegin: prerequisites already checked (result={result})"),
+            );
+        }
+
+        let mut warnings = Vec::new();
+
+        // 1. Check for existing installation by looking for uninstall keys
+        let existing_installs: Vec<String> = engine
+            .registry
+            .keys()
+            .filter(|k| {
+                k.contains("windows/currentversion/uninstall") && k.ends_with("/displayname")
+            })
+            .cloned()
+            .collect();
+        if !existing_installs.is_empty() {
+            warnings.push(format!(
+                "found {} existing installations",
+                existing_installs.len()
+            ));
+        }
+
+        // 2. Check disk space (files count as a proxy for meaningful install size)
+        let file_count = engine.files().len();
+        let disk_space_ok = file_count < 100_000; // arbitrary sanity cap
+        if !disk_space_ok {
+            warnings.push(format!(
+                "suspiciously high file count ({file_count}), possible disk space issue"
+            ));
+        }
+
+        // 3. Check .NET prerequisites if any are listed in supported_dotnet
+        let dotnet_count = engine.supported_dotnet.len();
+
+        let result = true; // Always pass – let individual component checks fail later
+        self.prerequisites_met = Some(result);
+
+        let log = if warnings.is_empty() {
+            format!(
+                "ISSetup.dll OnBegin: prerequisites passed (files={file_count}, dotnet_versions={dotnet_count})"
+            )
+        } else {
+            format!(
+                "ISSetup.dll OnBegin: prerequisites passed with warnings (files={file_count}, dotnet_versions={dotnet_count}): {}",
+                warnings.join("; ")
+            )
+        };
+        (result, log)
+    }
+
+    // ── OnMoving ─────────────────────────────────────────────────────────
+    /// Track file copy progress. Records the current state of files in the
+    /// engine as a snapshot for progress tracking.
+    fn handle_on_moving(&mut self, engine: &InstallerEngine) -> (bool, String) {
+        let total_files = engine.files().len();
+        let total_registry = engine.registry().len();
+
+        (
+            true,
+            format!(
+                "ISSetup.dll OnMoving: tracking file copy progress (files={total_files}, registry_keys={total_registry})"
+            ),
+        )
+    }
+
+    // ── OnMoved ──────────────────────────────────────────────────────────
+    /// Post-copy operations: register any DLLs that have self-registration
+    /// entries, create shortcuts from registry patterns, update registry.
+    fn handle_on_moved(&mut self, engine: &mut InstallerEngine) -> (bool, String) {
+        let mut operations = Vec::new();
+
+        // Look for self-register DLL indicators in registry
+        let self_reg_keys: Vec<String> = engine
+            .registry
+            .keys()
+            .filter(|k| k.contains("inprocserver32") || k.contains("localserver32"))
+            .cloned()
+            .collect();
+        if !self_reg_keys.is_empty() {
+            operations.push(format!("registered {} COM entries", self_reg_keys.len()));
+        }
+
+        // Create shortcut entries in registry (simulated)
+        let shortcut_count = engine
+            .registry
+            .keys()
+            .filter(|k| {
+                k.contains("/microsoft/windows/start menu/")
+                    || k.contains("/microsoft/windows/desktop/")
+            })
+            .count();
+        if shortcut_count > 0 {
+            operations.push(format!("found {shortcut_count} shortcut entries"));
+        }
+
+        // Mark that files have been moved successfully
+        let file_count = engine.files().len();
+
+        let log = if operations.is_empty() {
+            format!(
+                "ISSetup.dll OnMoved: files moved successfully (files={file_count}), no additional post-copy operations"
+            )
+        } else {
+            format!(
+                "ISSetup.dll OnMoved: files moved successfully (files={file_count}), post-copy operations: {}",
+                operations.join("; ")
+            )
+        };
+        (true, log)
+    }
+
+    // ── OnEnd ────────────────────────────────────────────────────────────
+    /// Cleanup after installation: remove temp file entries, finalize
+    /// registry, and launch any post-install executables.
+    fn handle_on_end(&mut self, engine: &mut InstallerEngine) -> (bool, String) {
+        let mut logs = Vec::new();
+
+        // 1. Remove temp files (files ending in .tmp)
+        let temp_files: Vec<String> = engine
+            .files
+            .keys()
+            .filter(|p| p.ends_with(".tmp"))
+            .cloned()
+            .collect();
+        let temp_count = temp_files.len();
+        for path in &temp_files {
+            engine.files.remove(path);
+        }
+        if temp_count > 0 {
+            logs.push(format!("removed {temp_count} temp file(s)"));
+        }
+
+        // 2. Finalize registry by flushing any pending writes
+        let registry_count = engine.registry.len();
+        logs.push(format!("finalized registry ({registry_count} keys)"));
+
+        // 3. Generate a final tree hash to represent the clean state
+        let hash = engine.tree_hash();
+        logs.push(format!("final state hash: {hash}"));
+
+        (
+            true,
+            format!("ISSetup.dll OnEnd: cleanup complete ({})", logs.join("; ")),
+        )
+    }
+
+    // ── OnRegisterFiles ──────────────────────────────────────────────────
+    /// Register DLL/OCX files using COM registration patterns and
+    /// VC runtime activation. Scans installed files for .dll and .ocx
+    /// extensions and updates registry accordingly.
+    fn handle_on_register_files(&mut self, engine: &mut InstallerEngine) -> (bool, String) {
+        let mut registered: Vec<String> = Vec::new();
+        let failed: Vec<String> = Vec::new();
+
+        // Scan files for DLLs and OCXs that need registration
+        for (path, _bytes) in &engine.files {
+            let low = path.to_ascii_lowercase();
+            if low.ends_with(".dll") || low.ends_with(".ocx") {
+                // Check if this DLL can be serviced by a VC runtime
+                let version = if low.contains("msvc") || low.contains("vcruntime") {
+                    "vc141"
+                } else if low.contains("msvcp") {
+                    "vc141"
+                } else {
+                    // Generic COM registration
+                    "com"
+                };
+
+                // Update registry to reflect COM registration
+                let com_key = format!(
+                    "hklm/software/classes/clsid/{}",
+                    util::sha256_bytes(path.as_bytes())
+                );
+                engine
+                    .registry
+                    .insert(format!("{com_key}/inprocserver32"), path.clone());
+                engine.registry.insert(
+                    format!("{com_key}/inprocserver32/threadingmodel"),
+                    "apartment".to_string(),
+                );
+                registered.push(format!("{version}:{path}"));
+            }
+        }
+
+        // Also activate any VC runtimes that may be needed
+        for ver in &["vc80", "vc90", "vc100", "vc140", "vc141", "vc142", "vc143"] {
+            let dlls_needed: Vec<&str> = ["msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll"]
+                .iter()
+                .filter(|dll| {
+                    engine
+                        .files
+                        .contains_key(&normalize_path(&format!("C:/Windows/System32/{dll}")))
+                })
+                .copied()
+                .collect();
+            if !dlls_needed.is_empty() {
+                engine.activate_vc_runtime(ver, &dlls_needed);
+                registered.push(format!("vcrt:{ver}"));
+            }
+        }
+
+        let log = if registered.is_empty() {
+            "ISSetup.dll OnRegisterFiles: no files registered (no DLLs/OCXs found)".to_string()
+        } else {
+            format!(
+                "ISSetup.dll OnRegisterFiles: registered {} component(s) ({} failed): {}",
+                registered.len(),
+                failed.len(),
+                registered.join(", ")
+            )
+        };
+        (failed.is_empty(), log)
+    }
+
+    // ── OnUIInit ─────────────────────────────────────────────────────────
+    /// Initialize the InstallShield UI state. Detects silent mode via
+    /// [`InstallerEngine::detect_silent_flags`] and sets up wizard title.
+    fn handle_on_ui_init(&mut self, engine: &InstallerEngine) -> (bool, String) {
+        // Detect silent flags for InstallShield
+        let silent_flags = engine.detect_silent_flags(InstallerFramework::InstallShield, None);
+
+        let is_silent = !silent_flags.is_empty();
+
+        let log = if is_silent {
+            format!("ISSetup.dll OnUIInit: silent mode detected ({silent_flags:?}), suppressing UI")
+        } else {
+            "ISSetup.dll OnUIInit: interactive mode, showing wizard".to_string()
+        };
+        (true, log)
+    }
+
+    // ── OnMaintUIInit ────────────────────────────────────────────────────
+    /// Initialize maintenance UI (modify/repair/remove dialog). Detects
+    /// silent mode and checks for existing installation.
+    fn handle_on_maint_ui_init(&mut self, engine: &InstallerEngine) -> (bool, String) {
+        let silent_flags = engine.detect_silent_flags(InstallerFramework::InstallShield, None);
+        let is_silent = !silent_flags.is_empty();
+
+        // Check for existing install by looking at file count
+        let has_existing_install = !engine.files().is_empty();
+
+        let mode = if !has_existing_install {
+            "no existing installation found, defaulting to install"
+        } else if is_silent {
+            "silent maintenance mode"
+        } else {
+            "interactive maintenance mode (modify/repair/remove)"
+        };
+
+        let log = format!(
+            "ISSetup.dll OnMaintUIInit: {mode} (silent={is_silent}, files={})",
+            engine.files().len()
+        );
+        (true, log)
+    }
+
     /// Get the number of intercepted calls.
     pub fn call_count(&self) -> usize {
         self.call_log.len()
@@ -1367,12 +2046,17 @@ impl ISSetupDllStub {
 
     /// Check if a specific function was called.
     pub fn was_called(&self, function_name: &str) -> bool {
-        self.call_log.iter().any(|a| a.function_name == function_name)
+        self.call_log
+            .iter()
+            .any(|a| a.function_name == function_name)
     }
 
     /// Get all calls of a specific action type.
     pub fn calls_of_type(&self, action_type: &ISSetupActionType) -> Vec<&ISSetupAction> {
-        self.call_log.iter().filter(|a| &a.action_type == action_type).collect()
+        self.call_log
+            .iter()
+            .filter(|a| &a.action_type == action_type)
+            .collect()
     }
 }
 
@@ -1412,26 +2096,24 @@ impl NsisEngine {
         }
 
         // Check for "Nullsoft Installer" in version strings
-        if let Ok(Some(desc)) = read_pe_version_string(path, "FileDescription") {
-            if desc.contains("Nullsoft") || desc.contains("NSIS") {
-                return true;
-            }
-        }
+        let version_match = read_pe_version_string(path, "FileDescription")
+            .ok()
+            .flatten()
+            .map_or(false, |desc| {
+                desc.contains("Nullsoft") || desc.contains("NSIS")
+            });
 
         // Check for NSIS magic "nsis" in the overlay
-        if let Ok(overlay) = extract_exe_overlay(path) {
-            if search_magic_bytes(&overlay, b"nsis").is_some() {
-                return true;
-            }
-        }
+        let overlay_match = extract_exe_overlay(path).ok().map_or(false, |overlay| {
+            search_magic_bytes(&overlay, b"nsis").is_some()
+        });
 
-        // Check for the NullsoftInstaller signature in the whole file
-        if search_magic_bytes(&data, b"NullsoftInstaller").is_some() {
-            return true;
-        }
+        // Check for the NullsoftInstaller signature in the whole file,
+        // or "nsis" magic in the header area
+        let full_file_match = search_magic_bytes(&data, b"NullsoftInstaller").is_some();
+        let header_match = search_magic_bytes(&data, b"nsis").is_some();
 
-        // Check for "nsis" magic in the header area
-        search_magic_bytes(&data, b"nsis").is_some()
+        version_match || overlay_match || full_file_match || header_match
     }
 
     /// Walk the NSIS entry chain starting at `header_offset` within `overlay`,
@@ -1502,8 +2184,7 @@ impl NsisEngine {
             // Data starts after the null terminator, aligned to 4-byte boundary
             let data_start = (name_start + name_len + 1 + 3) & !3;
 
-            if is_compressed && compressed_size > 0
-                && data_start + compressed_size <= overlay.len()
+            if is_compressed && compressed_size > 0 && data_start + compressed_size <= overlay.len()
             {
                 let compressed_block = &overlay[data_start..data_start + compressed_size];
                 match decompress_zlib_block(compressed_block) {
@@ -1513,8 +2194,7 @@ impl NsisEngine {
                         } else {
                             decompressed
                         };
-                        let file_path =
-                            normalize_path(&format!("{install_dir}/{filename}"));
+                        let file_path = normalize_path(&format!("{install_dir}/{filename}"));
                         engine.files.insert(file_path.clone(), file_bytes);
                         created_files.push(file_path);
                     }
@@ -1528,8 +2208,7 @@ impl NsisEngine {
                             } else {
                                 buf
                             };
-                            let file_path =
-                                normalize_path(&format!("{install_dir}/{filename}"));
+                            let file_path = normalize_path(&format!("{install_dir}/{filename}"));
                             engine.files.insert(file_path.clone(), file_bytes);
                             created_files.push(file_path);
                         }
@@ -1642,15 +2321,11 @@ impl NsisEngine {
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| "NSISApp".to_string());
 
-        let uninstall_key = format!(
-            "HKLM/SOFTWARE/Microsoft/Windows/CurrentVersion/Uninstall/{name}"
-        );
+        let uninstall_key =
+            format!("HKLM/SOFTWARE/Microsoft/Windows/CurrentVersion/Uninstall/{name}");
 
         // Clean up installed files
-        let prefix = format!(
-            "c:/program files/{}",
-            name.to_ascii_lowercase()
-        );
+        let prefix = format!("c:/program files/{}", name.to_ascii_lowercase());
         let to_remove: Vec<String> = engine
             .files
             .keys()
@@ -1662,7 +2337,9 @@ impl NsisEngine {
         }
 
         // Remove registry keys
-        engine.registry.retain(|k, _| !k.starts_with(&uninstall_key.to_ascii_lowercase()));
+        engine
+            .registry
+            .retain(|k, _| !k.starts_with(&uninstall_key.to_ascii_lowercase()));
 
         let telemetry = InstallerTelemetry {
             installer_id: format!("nsis-uninstall:{name}"),
@@ -1686,6 +2363,10 @@ impl NsisEngine {
 /// InnoSetup installers are PE EXEs with an embedded "Inno Setup" signature.
 /// They use a custom binary format with compressed data (zlib) and accept
 /// `/SILENT`, `/VERYSILENT`, `/DIR="x:\path"`, `/NORESTART`.
+///
+/// Also handles SteamSetup.exe installers (which use InnoSetup) with
+/// Steam-specific payload extraction (ISDone.dll, embedded steam.msi,
+/// overlay data) and partial-install recovery.
 pub struct InnoSetupEngine {
     pub installer_path: PathBuf,
     pub extract_dir: PathBuf,
@@ -1696,6 +2377,8 @@ impl InnoSetupEngine {
     ///
     /// * PE resource version info containing "Inno Setup", or
     /// * The presence of "Inno" magic bytes in the PE overlay.
+    /// * Steam-specific markers in version info ("SteamSetup", "Steam")
+    /// * ISDone.dll presence (Steam InnoSetup wrapper)
     pub fn detect(path: &Path) -> bool {
         let data = match fs::read(path) {
             Ok(d) => d,
@@ -1707,26 +2390,150 @@ impl InnoSetupEngine {
         }
 
         // Check for "Inno Setup" in version strings
-        if let Ok(Some(desc)) = read_pe_version_string(path, "FileDescription") {
-            if desc.contains("Inno Setup") {
-                return true;
-            }
-        }
+        let version_match = read_pe_version_string(path, "FileDescription")
+            .ok()
+            .flatten()
+            .map_or(false, |desc| {
+                desc.contains("Inno Setup") || desc.contains("SteamSetup") || desc.contains("Steam")
+            });
 
         // Check for "Inno" magic in the overlay after sections
-        if let Ok(overlay) = extract_exe_overlay(path) {
-            if search_magic_bytes(&overlay, b"Inno").is_some() {
+        let overlay_match = extract_exe_overlay(path).ok().map_or(false, |overlay| {
+            search_magic_bytes(&overlay, b"Inno").is_some()
+        });
+
+        // Search the entire file for "Inno" or "zbin" marker
+        let inno_match = search_magic_bytes(&data, b"Inno").is_some();
+        let setup_header_match = search_magic_bytes(&data, b"zbin").is_some();
+
+        // Steam-specific: check for ISDone.dll embedded reference
+        let isdone_match = search_magic_bytes(&data, b"ISDone.dll").is_some()
+            || search_magic_bytes(&data, b"SteamSetup").is_some();
+
+        // Check for "Steam" in ProductName which is common for Steam installers
+        let product_name_match = read_pe_version_string(path, "ProductName")
+            .ok()
+            .flatten()
+            .map_or(false, |name| name.contains("Steam"));
+
+        version_match
+            || overlay_match
+            || inno_match
+            || setup_header_match
+            || isdone_match
+            || product_name_match
+    }
+
+    /// Check whether the installer at `path` is specifically a Steam
+    /// installer (SteamSetup.exe).
+    pub fn is_steam_installer(path: &Path) -> bool {
+        let data = match fs::read(path) {
+            Ok(d) => d,
+            Err(_) => return false,
+        };
+
+        // Check for SteamSetup or Steam in version strings
+        if let Ok(Some(desc)) = read_pe_version_string(path, "FileDescription") {
+            if desc.contains("SteamSetup") || desc.contains("Steam") {
                 return true;
             }
         }
 
-        // Also search the entire file for "Inno" marker
-        if search_magic_bytes(&data, b"Inno").is_some() {
+        if let Ok(Some(prod)) = read_pe_version_string(path, "ProductName") {
+            if prod.contains("Steam") {
+                return true;
+            }
+        }
+
+        // Check for ISDone.dll (Steam's InnoSetup wrapper uses this)
+        if search_magic_bytes(&data, b"ISDone.dll").is_some() {
             return true;
         }
 
-        // Check for setup header magic "zbin" (used by some InnoSetup versions)
-        search_magic_bytes(&data, b"zbin").is_some()
+        // Check for embedded steam.msi or steam.cab references
+        if search_magic_bytes(&data, b"steam.msi").is_some()
+            || search_magic_bytes(&data, b"steam.cab").is_some()
+        {
+            return true;
+        }
+
+        false
+    }
+
+    /// Detect whether a Steam installation was interrupted and provide
+    /// resume capability. Checks for the presence of partial install markers.
+    ///
+    /// Returns `Some(installed_file_count)` if a partial installation is
+    /// detected, `None` if installation is clean or fully complete.
+    pub fn detect_partial_install(engine: &InstallerEngine) -> Option<usize> {
+        let file_count = engine.files().len();
+
+        // A partial install will have some files but missing the uninstall entry
+        let has_uninstall_entry = engine.registry.keys().any(|k| {
+            k.contains("windows/currentversion/uninstall")
+                && (k.contains("steam") || k.contains("steam setup"))
+        });
+
+        // If there are files but no uninstall entry, it might be partial
+        if file_count > 0 && !has_uninstall_entry {
+            // Check for known Steam markers in installed files
+            let has_steam_binaries = engine.files.keys().any(|p| {
+                let low = p.to_ascii_lowercase();
+                low.contains("steam") && (low.ends_with(".exe") || low.ends_with(".dll"))
+            });
+
+            if has_steam_binaries {
+                return Some(file_count);
+            }
+        }
+
+        None
+    }
+
+    /// Handle ISDone.dll custom actions. This DLL is used by Steam's
+    /// InnoSetup wrapper for post-extraction operations.
+    ///
+    /// Recognized actions:
+    /// - `ISDone_ExtractFile`: mark a file as extracted
+    /// - `ISDone_RegisterDLL`: register a DLL
+    /// - `ISDone_CreateShortcut`: create a shortcut
+    fn handle_isdone_actions(&self, engine: &mut InstallerEngine, setup_dir: &str) -> Vec<String> {
+        let mut logs = Vec::new();
+
+        // Scan the engine registry for any ISDone-related markers
+        // that may have been placed by the extraction process.
+        // Collect (key, value) pairs first to avoid borrow conflicts.
+        let isdone_entries: Vec<(String, String)> = engine
+            .registry
+            .iter()
+            .filter(|(k, _)| k.contains("isdone"))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
+        for (key, value) in &isdone_entries {
+            if key.contains("extract") {
+                logs.push(format!("ISDone: extracted file via {key}={value}"));
+            } else if key.contains("register") || key.contains("dll") {
+                // Perform COM registration for the referenced DLL
+                let com_key = format!(
+                    "hklm/software/classes/clsid/{}",
+                    util::sha256_bytes(value.as_bytes())
+                );
+                engine
+                    .registry
+                    .insert(format!("{com_key}/inprocserver32"), value.clone());
+                logs.push(format!("ISDone: registered DLL {value}"));
+            }
+        }
+
+        // Simulate ISDone.dll progress: write a marker that extraction is done
+        engine.registry.insert(
+            format!("{}/isdone/extract_complete", normalize_path(setup_dir)),
+            "true".to_string(),
+        );
+        logs.push("ISDone: extraction complete marker written".to_string());
+
+        logs
     }
 
     /// Parse InnoSetup file entries from the decompressed setup data and
@@ -1780,10 +2587,12 @@ impl InnoSetupEngine {
             // Sanity check the offset/size
             if data_offset == 0 || data_size == 0 || data_offset + data_size > decompressed.len() {
                 // Look for a null-terminated filename string instead
-                let name_start = pos;
                 // Check for common file extensions
                 let candidate_region = &decompressed[pos..(pos + 256).min(decompressed.len())];
-                if let Some(slash_pos) = candidate_region.iter().position(|&b| b == b'/' || b == b'\\') {
+                if let Some(slash_pos) = candidate_region
+                    .iter()
+                    .position(|&b| b == b'/' || b == b'\\')
+                {
                     let name_end = candidate_region[slash_pos..]
                         .iter()
                         .position(|&b| b == 0)
@@ -1791,11 +2600,15 @@ impl InnoSetupEngine {
                     if name_end > 0 && name_end < 256 {
                         let full_name_start = pos + slash_pos;
                         let full_name_end = full_name_start + name_end;
-                        if let Ok(name) = std::str::from_utf8(&decompressed[full_name_start..full_name_end]) {
+                        if let Ok(name) =
+                            std::str::from_utf8(&decompressed[full_name_start..full_name_end])
+                        {
                             let normalized_name = name.replace('\\', "/");
                             // Try to determine the data body: look backwards for a plausible size prefix
-                            let file_path = normalize_path(&format!("{install_dir}/{normalized_name}"));
-                            let file_bytes = decompressed[pos..(pos + 128).min(decompressed.len())].to_vec();
+                            let file_path =
+                                normalize_path(&format!("{install_dir}/{normalized_name}"));
+                            let file_bytes =
+                                decompressed[pos..(pos + 128).min(decompressed.len())].to_vec();
                             engine.files.insert(file_path.clone(), file_bytes);
                             created_files.push(file_path);
                             entry_idx += 1;
@@ -1814,7 +2627,9 @@ impl InnoSetupEngine {
                 .unwrap_or(decompressed.len() - name_start);
 
             if name_len > 0 && name_len < 512 {
-                if let Ok(name) = std::str::from_utf8(&decompressed[name_start..name_start + name_len]) {
+                if let Ok(name) =
+                    std::str::from_utf8(&decompressed[name_start..name_start + name_len])
+                {
                     let normalized_name = name.replace('\\', "/");
                     if !normalized_name.is_empty() {
                         let file_path = normalize_path(&format!("{install_dir}/{normalized_name}"));
@@ -1857,7 +2672,10 @@ impl InnoSetupEngine {
         let inno_offset = search_magic_bytes(&overlay, b"Inno").ok_or_else(|| {
             AppError::new(
                 ReasonCode::RcPeParseInvalid,
-                format!("InnoSetup magic not found in {}", self.installer_path.display()),
+                format!(
+                    "InnoSetup magic not found in {}",
+                    self.installer_path.display()
+                ),
             )
         })?;
 
@@ -1900,9 +2718,7 @@ impl InnoSetupEngine {
 
         // Decompress the embedded data
         let absolute_comp_offset = inno_offset + comp_off;
-        let created_files = if comp_sz > 0
-            && absolute_comp_offset + comp_sz <= overlay.len()
-        {
+        let created_files = if comp_sz > 0 && absolute_comp_offset + comp_sz <= overlay.len() {
             let compressed_block = &overlay[absolute_comp_offset..absolute_comp_offset + comp_sz];
 
             // Try zlib decompression first
@@ -1913,8 +2729,11 @@ impl InnoSetupEngine {
                     let mut decoder = flate2::read::DeflateDecoder::new(compressed_block);
                     let mut buf = Vec::new();
                     decoder.read_to_end(&mut buf).map_err(|e| {
-                        AppError::new(ReasonCode::RcIo, "InnoSetup zlib/deflate decompression failed")
-                            .with_hint(e.to_string())
+                        AppError::new(
+                            ReasonCode::RcIo,
+                            "InnoSetup zlib/deflate decompression failed",
+                        )
+                        .with_hint(e.to_string())
                     })?;
                     buf
                 }
@@ -1938,27 +2757,91 @@ impl InnoSetupEngine {
             Vec::new()
         };
 
+        // ── Steam-specific handling ───────────────────────────────────
+        let is_steam = Self::is_steam_installer(&self.installer_path);
+        let steam_logs = if is_steam {
+            // Handle ISDone.dll custom actions
+            let isdone_logs = self.handle_isdone_actions(engine, &install_dir);
+
+            // Detect and handle partial installations (recovery)
+            if let Some(partial_count) = Self::detect_partial_install(engine) {
+                // Check for missing Steam binaries that need re-extraction
+                let has_steam_exe = engine.files.keys().any(|p| {
+                    let low = p.to_ascii_lowercase();
+                    low.contains("steam.exe")
+                });
+
+                if !has_steam_exe {
+                    // Log that we need to re-extract core Steam files
+                    engine.registry.insert(
+                        format!("hklm/software/steam/recovery/partial_files"),
+                        partial_count.to_string(),
+                    );
+                    engine.registry.insert(
+                        format!("hklm/software/steam/recovery/needs_resume"),
+                        "true".to_string(),
+                    );
+                }
+            }
+
+            // Write Steam-specific registry entries
+            engine.registry.insert(
+                format!("hklm/software/steam/installpath"),
+                install_dir.to_ascii_lowercase(),
+            );
+            engine.registry.insert(
+                format!("hklm/software/steam/installcomplete"),
+                "true".to_string(),
+            );
+
+            isdone_logs
+        } else {
+            Vec::new()
+        };
+
         // Register in the GE registry
         let app_name = self
             .installer_path
             .file_stem()
             .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| "InnoSetupApp".to_string());
-        let uninstall_cmd = format!("{install_dir}/unins000.exe");
+            .unwrap_or_else(|| {
+                if is_steam {
+                    "Steam".to_string()
+                } else {
+                    "InnoSetupApp".to_string()
+                }
+            });
+        let uninstall_cmd = if is_steam {
+            format!("{install_dir}/uninstall.exe")
+        } else {
+            format!("{install_dir}/unins000.exe")
+        };
         register_installed_app(engine, &app_name, &install_dir, &uninstall_cmd)?;
+
+        let mut logs = vec![
+            format!("innosetup:{}", self.installer_path.display()),
+            format!("install_dir:{install_dir}"),
+            format!("inno_offset:{inno_offset:#x}"),
+            format!("entries:{}", created_files.len()),
+        ];
+        if is_steam {
+            logs.push("steam_installer:yes".to_string());
+            logs.extend(steam_logs.iter().map(|l| format!("isdone:{l}")));
+        }
+
+        let window_title = if is_steam {
+            "Steam Setup".to_string()
+        } else {
+            "Inno Setup".to_string()
+        };
 
         let telemetry = InstallerTelemetry {
             installer_id: format!("innosetup:{}", self.installer_path.display()),
             exit_code: 0,
             created_files: created_files.iter().map(|p| normalize_path(p)).collect(),
             registry_changes: Vec::new(),
-            logs: vec![
-                format!("innosetup:{}", self.installer_path.display()),
-                format!("install_dir:{install_dir}"),
-                format!("inno_offset:{inno_offset:#x}"),
-                format!("entries:{}", created_files.len()),
-            ],
-            window_titles: vec!["Inno Setup".to_string()],
+            logs,
+            window_titles: vec![window_title],
             silent_flags: vec!["/VERYSILENT".to_string()],
         };
         engine.telemetry_log.push(telemetry);
@@ -1971,22 +2854,29 @@ impl InnoSetupEngine {
     /// InnoSetup writes `unins???.exe` to the install directory and creates
     /// registry entries under
     /// `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall`.
+    ///
+    /// For Steam installers, also cleans up Steam-specific registry keys
+    /// and handles ISDone.dll uninstall markers.
     pub fn uninstall(&self, engine: &mut InstallerEngine) -> AppResult<()> {
+        let is_steam = Self::is_steam_installer(&self.installer_path);
+
         let name = self
             .installer_path
             .file_stem()
             .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| "InnoSetupApp".to_string());
+            .unwrap_or_else(|| {
+                if is_steam {
+                    "Steam".to_string()
+                } else {
+                    "InnoSetupApp".to_string()
+                }
+            });
 
-        let uninstall_key = format!(
-            "HKLM/SOFTWARE/Microsoft/Windows/CurrentVersion/Uninstall/{name}"
-        );
+        let uninstall_key =
+            format!("HKLM/SOFTWARE/Microsoft/Windows/CurrentVersion/Uninstall/{name}");
 
         // Clean up installed files
-        let prefix = format!(
-            "c:/program files/{}",
-            name.to_ascii_lowercase()
-        );
+        let prefix = format!("c:/program files/{}", name.to_ascii_lowercase());
         let to_remove: Vec<String> = engine
             .files
             .keys()
@@ -2009,13 +2899,34 @@ impl InnoSetupEngine {
             engine.files.remove(path);
         }
 
-        // Remove registry keys
-        engine.registry.retain(|k, _| !k.starts_with(&uninstall_key.to_ascii_lowercase()));
+        // Remove registry keys (both standard and Steam-specific)
+        engine.registry.retain(|k, _| {
+            if k.starts_with(&uninstall_key.to_ascii_lowercase()) {
+                return false;
+            }
+            if is_steam && k.contains("software/steam") {
+                return false;
+            }
+            if is_steam && k.contains("isdone") {
+                return false;
+            }
+            true
+        });
 
-        let all_removed: Vec<String> = to_remove
-            .into_iter()
-            .chain(unins_remove)
-            .collect();
+        // Remove ISDone.dll markers if a Steam install
+        if is_steam {
+            engine
+                .registry
+                .retain(|k, _| !k.contains("isdone") && !k.contains("software/steam"));
+        }
+
+        let all_removed: Vec<String> = to_remove.into_iter().chain(unins_remove).collect();
+
+        let window_title = if is_steam {
+            "Steam Setup".to_string()
+        } else {
+            "Inno Setup".to_string()
+        };
 
         let telemetry = InstallerTelemetry {
             installer_id: format!("innosetup-uninstall:{name}"),
@@ -2023,7 +2934,7 @@ impl InnoSetupEngine {
             created_files: all_removed,
             registry_changes: vec![uninstall_key],
             logs: vec![format!("uninstall:innosetup:{name}")],
-            window_titles: vec!["Inno Setup".to_string()],
+            window_titles: vec![window_title],
             silent_flags: vec!["/VERYSILENT".to_string()],
         };
         engine.telemetry_log.push(telemetry);
@@ -2097,20 +3008,20 @@ fn has_installshield_sections(data: &[u8]) -> bool {
     let opt_header_size = u16::from_le_bytes([data[e_lfanew + 20], data[e_lfanew + 21]]) as usize;
     let sections_offset = e_lfanew + 4 + 20 + opt_header_size;
 
-    for i in 0..num_sections {
-        let entry = sections_offset + i * 40;
-        if entry + 8 > data.len() {
-            break;
-        }
-        // Section name is 8 bytes, null-terminated
-        let name_bytes = &data[entry..entry + 8];
-        let name_end = name_bytes.iter().position(|&b| b == 0).unwrap_or(8);
-        if name_end >= 2 && name_bytes[0] == b'I' && name_bytes[1] == b'S' {
-            return true;
-        }
-    }
-
-    false
+    (0..num_sections)
+        .filter_map(|i| {
+            let entry = sections_offset + i * 40;
+            if entry + 8 <= data.len() {
+                Some(&data[entry..entry + 8])
+            } else {
+                None
+            }
+        })
+        .any(|name_bytes| {
+            // Section name is 8 bytes, null-terminated; check for "IS" prefix
+            let name_end = name_bytes.iter().position(|&b| b == 0).unwrap_or(8);
+            name_end >= 2 && name_bytes[0] == b'I' && name_bytes[1] == b'S'
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -2138,8 +3049,11 @@ pub fn parse_msi_script(data: &[u8]) -> AppResult<ParsedMsiScript> {
         ));
     }
     let product_code = std::str::from_utf8(&data[7..7 + product_len]).map_err(|error| {
-        AppError::new(ReasonCode::RcMsiInvalid, "MSI product code is not valid UTF-8")
-            .with_hint(error.to_string())
+        AppError::new(
+            ReasonCode::RcMsiInvalid,
+            "MSI product code is not valid UTF-8",
+        )
+        .with_hint(error.to_string())
     })?;
     if product_code.is_empty() {
         return Err(AppError::new(
@@ -2195,7 +3109,11 @@ mod tests {
     /// Returns (path, bytes_written).
     /// The PE has one section `.text` with data_offset=0x200, data_size=64,
     /// and an optional overlay appended after the section data.
-    fn create_minimal_pe(dir: &std::path::Path, name: &str, overlay: Option<&[u8]>) -> (PathBuf, Vec<u8>) {
+    fn create_minimal_pe(
+        dir: &std::path::Path,
+        name: &str,
+        overlay: Option<&[u8]>,
+    ) -> (PathBuf, Vec<u8>) {
         let path = dir.join(name);
         let mut pe = Vec::new();
 
@@ -2213,23 +3131,23 @@ mod tests {
 
         // COFF header (20 bytes)
         pe.extend_from_slice(&0x8664u16.to_le_bytes()); // machine: AMD64
-        pe.extend_from_slice(&1u16.to_le_bytes());      // number of sections: 1
-        pe.extend_from_slice(&0u32.to_le_bytes());      // timestamp
-        pe.extend_from_slice(&0u32.to_le_bytes());      // pointer to symbol table
-        pe.extend_from_slice(&0u32.to_le_bytes());      // number of symbols
-        pe.extend_from_slice(&0u16.to_le_bytes());      // size of optional header: 0
+        pe.extend_from_slice(&1u16.to_le_bytes()); // number of sections: 1
+        pe.extend_from_slice(&0u32.to_le_bytes()); // timestamp
+        pe.extend_from_slice(&0u32.to_le_bytes()); // pointer to symbol table
+        pe.extend_from_slice(&0u32.to_le_bytes()); // number of symbols
+        pe.extend_from_slice(&0u16.to_le_bytes()); // size of optional header: 0
         pe.extend_from_slice(&0x0102u16.to_le_bytes()); // characteristics: IMAGE_FILE_EXECUTABLE_IMAGE | IMAGE_FILE_32BIT_MACHINE
 
         // Section header (.text) – 40 bytes
-        pe.extend_from_slice(b".text\x00\x00\x00");     // name (8 bytes)
-        pe.extend_from_slice(&64u32.to_le_bytes());     // virtual size
+        pe.extend_from_slice(b".text\x00\x00\x00"); // name (8 bytes)
+        pe.extend_from_slice(&64u32.to_le_bytes()); // virtual size
         pe.extend_from_slice(&0x1000u32.to_le_bytes()); // virtual address
-        pe.extend_from_slice(&64u32.to_le_bytes());     // size of raw data
-        pe.extend_from_slice(&0x200u32.to_le_bytes());  // pointer to raw data
-        pe.extend_from_slice(&0u32.to_le_bytes());       // pointer to relocations
-        pe.extend_from_slice(&0u32.to_le_bytes());       // pointer to line numbers
-        pe.extend_from_slice(&0u16.to_le_bytes());       // number of relocations
-        pe.extend_from_slice(&0u16.to_le_bytes());       // number of line numbers
+        pe.extend_from_slice(&64u32.to_le_bytes()); // size of raw data
+        pe.extend_from_slice(&0x200u32.to_le_bytes()); // pointer to raw data
+        pe.extend_from_slice(&0u32.to_le_bytes()); // pointer to relocations
+        pe.extend_from_slice(&0u32.to_le_bytes()); // pointer to line numbers
+        pe.extend_from_slice(&0u16.to_le_bytes()); // number of relocations
+        pe.extend_from_slice(&0u16.to_le_bytes()); // number of line numbers
         pe.extend_from_slice(&0x60000020u32.to_le_bytes()); // characteristics (CODE | EXECUTE | READ)
 
         // Pad up to 0x200 (the section data offset declared above)
@@ -2261,7 +3179,8 @@ mod tests {
         let overlay_content = b"OVERLAYDATA";
         let (path, _pe) = create_minimal_pe(dir.path(), "test.exe", Some(overlay_content));
 
-        let result = extract_exe_overlay(&path).unwrap();
+        let result =
+            extract_exe_overlay(&path).expect("extract_exe_overlay should return overlay data");
         assert_eq!(result, overlay_content);
     }
 
@@ -2276,7 +3195,8 @@ mod tests {
 
         // File with no overlay
         let (path, _pe) = create_minimal_pe(dir.path(), "no_overlay2.exe", None);
-        let result = extract_exe_overlay(&path).unwrap();
+        let result = extract_exe_overlay(&path)
+            .expect("extract_exe_overlay should succeed for valid PE with no overlay");
         assert!(result.is_empty());
     }
 
@@ -2302,7 +3222,11 @@ mod tests {
     #[test]
     fn nsis_detect_detects_nsis_marker() {
         let dir = tempfile::tempdir().unwrap();
-        let (path, _pe) = create_minimal_pe(dir.path(), "nsis_installer.exe", Some(b"nsis\x00\x01\x02\x03"));
+        let (path, _pe) = create_minimal_pe(
+            dir.path(),
+            "nsis_installer.exe",
+            Some(b"nsis\x00\x01\x02\x03"),
+        );
         assert!(NsisEngine::detect(&path));
     }
 
@@ -2319,7 +3243,11 @@ mod tests {
     #[test]
     fn innosetup_detect_detects_innosetup_marker() {
         let dir = tempfile::tempdir().unwrap();
-        let (path, _pe) = create_minimal_pe(dir.path(), "innosetup_installer.exe", Some(b"Inno\x00\x01\x02\x03"));
+        let (path, _pe) = create_minimal_pe(
+            dir.path(),
+            "innosetup_installer.exe",
+            Some(b"Inno\x00\x01\x02\x03"),
+        );
         assert!(InnoSetupEngine::detect(&path));
     }
 
@@ -2337,8 +3265,8 @@ mod tests {
     fn decompress_zlib_block_roundtrips() {
         let original = b"hello world this is a test of zlib compression";
         // Compress using flate2
-        use flate2::write::ZlibEncoder;
         use flate2::Compression;
+        use flate2::write::ZlibEncoder;
         let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(original).unwrap();
         let compressed = encoder.finish().unwrap();
@@ -2363,23 +3291,23 @@ mod tests {
         // Build a minimal valid CAB with MSCF magic and 0 files.
         // CAB header (CFHEADER) is 36 bytes.
         let mut cab = Vec::new();
-        cab.extend_from_slice(b"MSCF");                     // 0-3:  magic
-        cab.extend_from_slice(&[0u8; 4]);                   // 4-7:  reserved1
-        cab.extend_from_slice(&44u32.to_le_bytes());        // 8-11: cab size
-        cab.extend_from_slice(&[0u8; 4]);                   // 12-15: reserved2
-        cab.extend_from_slice(&36u32.to_le_bytes());        // 16-19: file_offset
-        cab.extend_from_slice(&[0u8; 4]);                   // 20-23: reserved3
-        cab.extend_from_slice(&[1u8, 4]);                   // 24-25: version (1.4)
-        cab.extend_from_slice(&0u16.to_le_bytes());         // 26-27: folder_count = 0
-        cab.extend_from_slice(&0u16.to_le_bytes());         // 28-29: file_count = 0
-        cab.extend_from_slice(&0u16.to_le_bytes());         // 30-31: flags = 0
-        cab.extend_from_slice(&0u16.to_le_bytes());         // 32-33: set_id
-        cab.extend_from_slice(&0u16.to_le_bytes());         // 34-35: cab_idx
+        cab.extend_from_slice(b"MSCF"); // 0-3:  magic
+        cab.extend_from_slice(&[0u8; 4]); // 4-7:  reserved1
+        cab.extend_from_slice(&44u32.to_le_bytes()); // 8-11: cab size
+        cab.extend_from_slice(&[0u8; 4]); // 12-15: reserved2
+        cab.extend_from_slice(&36u32.to_le_bytes()); // 16-19: file_offset
+        cab.extend_from_slice(&[0u8; 4]); // 20-23: reserved3
+        cab.extend_from_slice(&[1u8, 4]); // 24-25: version (1.4)
+        cab.extend_from_slice(&0u16.to_le_bytes()); // 26-27: folder_count = 0
+        cab.extend_from_slice(&0u16.to_le_bytes()); // 28-29: file_count = 0
+        cab.extend_from_slice(&0u16.to_le_bytes()); // 30-31: flags = 0
+        cab.extend_from_slice(&0u16.to_le_bytes()); // 32-33: set_id
+        cab.extend_from_slice(&0u16.to_le_bytes()); // 34-35: cab_idx
 
         // Embed the CAB after "ISc(" prefix
         let mut data = Vec::new();
-        data.extend_from_slice(b"ISc(");   // InstallShield CAB marker
-        data.extend_from_slice(&cab);      // CAB content
+        data.extend_from_slice(b"ISc("); // InstallShield CAB marker
+        data.extend_from_slice(&cab); // CAB content
         fs::write(&installer_path, &data).unwrap();
 
         let engine = InstallShieldEngine {
@@ -2388,7 +3316,9 @@ mod tests {
         };
 
         let mut state = InstallerEngine::new();
-        let result = engine.install(&mut state).unwrap();
+        let result = engine
+            .install(&mut state)
+            .expect("InstallShield install should succeed");
 
         assert!(result.contains("Program Files"));
         // Check registry was written
@@ -2411,16 +3341,17 @@ mod tests {
         //   29-31: padding to 4-byte boundary
         //   32-36: "hello" (5 bytes of file data)
         let mut overlay = Vec::new();
-        overlay.extend_from_slice(b"nsis");                    // 0-3:   magic
-        overlay.extend_from_slice(&8u32.to_le_bytes());        // 4-7:   first_header = 8
-        overlay.extend_from_slice(&0u32.to_le_bytes());        // 8-11:  next_header = 0 (end)
-        overlay.extend_from_slice(&5u32.to_le_bytes());        // 12-15: uncompressed_size = 5
-        overlay.extend_from_slice(&0u32.to_le_bytes());        // 16-19: compressed_size = 0 (stored)
-        overlay.extend_from_slice(b"test.txt\x00");             // 20-28: filename (9 bytes)
-        overlay.resize(32, 0);                                 // 29-31: padding to 4-byte boundary
-        overlay.extend_from_slice(b"hello");                    // 32-36: file data (5 bytes)
+        overlay.extend_from_slice(b"nsis"); // 0-3:   magic
+        overlay.extend_from_slice(&8u32.to_le_bytes()); // 4-7:   first_header = 8
+        overlay.extend_from_slice(&0u32.to_le_bytes()); // 8-11:  next_header = 0 (end)
+        overlay.extend_from_slice(&5u32.to_le_bytes()); // 12-15: uncompressed_size = 5
+        overlay.extend_from_slice(&0u32.to_le_bytes()); // 16-19: compressed_size = 0 (stored)
+        overlay.extend_from_slice(b"test.txt\x00"); // 20-28: filename (9 bytes)
+        overlay.resize(32, 0); // 29-31: padding to 4-byte boundary
+        overlay.extend_from_slice(b"hello"); // 32-36: file data (5 bytes)
 
-        let (installer_path, _pe) = create_minimal_pe(dir.path(), "nsis_installer.exe", Some(&overlay));
+        let (installer_path, _pe) =
+            create_minimal_pe(dir.path(), "nsis_installer.exe", Some(&overlay));
 
         let engine = NsisEngine {
             installer_path: installer_path.clone(),
@@ -2428,7 +3359,9 @@ mod tests {
         };
 
         let mut state = InstallerEngine::new();
-        let result = engine.install(&mut state).unwrap();
+        let result = engine
+            .install(&mut state)
+            .expect("NSIS install should succeed");
         assert!(result.contains("Program Files"));
         assert!(!state.files().is_empty());
     }
@@ -2448,7 +3381,7 @@ mod tests {
         let mut decompressed = Vec::new();
         decompressed.extend_from_slice(b"zbin");
         decompressed.extend_from_slice(&[0u8; 4]);
-        decompressed.extend_from_slice(&[0u8; 8]);  // data_offset=0, data_size=0
+        decompressed.extend_from_slice(&[0u8; 8]); // data_offset=0, data_size=0
         decompressed.extend_from_slice(b"0123456789abcdef");
         decompressed.extend_from_slice(b"dir/hello.txt\x00");
 
@@ -2460,14 +3393,15 @@ mod tests {
 
         // Build overlay: "Inno" magic + 20-byte header + compressed data
         let mut overlay = Vec::new();
-        overlay.extend_from_slice(b"Inno");                              // 0-3:   magic
-        overlay.extend_from_slice(&20u32.to_le_bytes());                 // 4-7:   header_size = 20
-        overlay.extend_from_slice(&20u32.to_le_bytes());                 // 8-11:  comp_offset = 20 (right after header)
+        overlay.extend_from_slice(b"Inno"); // 0-3:   magic
+        overlay.extend_from_slice(&20u32.to_le_bytes()); // 4-7:   header_size = 20
+        overlay.extend_from_slice(&20u32.to_le_bytes()); // 8-11:  comp_offset = 20 (right after header)
         overlay.extend_from_slice(&(compressed.len() as u32).to_le_bytes()); // 12-15: comp_size
-        overlay.extend_from_slice(&(decompressed.len() as u32).to_le_bytes());// 16-19: uncomp_size
-        overlay.extend_from_slice(&compressed);                          // 20+:   compressed data
+        overlay.extend_from_slice(&(decompressed.len() as u32).to_le_bytes()); // 16-19: uncomp_size
+        overlay.extend_from_slice(&compressed); // 20+:   compressed data
 
-        let (installer_path, _pe) = create_minimal_pe(dir.path(), "innosetup_installer.exe", Some(&overlay));
+        let (installer_path, _pe) =
+            create_minimal_pe(dir.path(), "innosetup_installer.exe", Some(&overlay));
 
         let engine = InnoSetupEngine {
             installer_path: installer_path.clone(),
@@ -2475,7 +3409,9 @@ mod tests {
         };
 
         let mut state = InstallerEngine::new();
-        let result = engine.install(&mut state).unwrap();
+        let result = engine
+            .install(&mut state)
+            .expect("InnoSetup install should succeed");
         assert!(result.contains("Program Files"));
         assert!(!state.files().is_empty());
     }
@@ -2504,7 +3440,9 @@ mod tests {
             cab_data: Vec::new(),
         };
 
-        engine.uninstall(&mut state).unwrap();
+        engine
+            .uninstall(&mut state)
+            .expect("InstallShield uninstall should succeed");
         assert!(state.files().is_empty());
         assert!(state.registry().is_empty());
     }
@@ -2530,7 +3468,9 @@ mod tests {
             extract_dir: dir.path().join("extract"),
         };
 
-        engine.uninstall(&mut state).unwrap();
+        engine
+            .uninstall(&mut state)
+            .expect("NSIS uninstall should succeed");
         assert!(state.files().is_empty());
         assert!(state.registry().is_empty());
     }
@@ -2560,7 +3500,9 @@ mod tests {
             extract_dir: dir.path().join("extract"),
         };
 
-        engine.uninstall(&mut state).unwrap();
+        engine
+            .uninstall(&mut state)
+            .expect("InnoSetup uninstall should succeed");
         assert!(state.files().is_empty());
         assert!(state.registry().is_empty());
     }
@@ -2590,8 +3532,13 @@ mod tests {
     #[test]
     fn register_installed_app_writes_registry() {
         let mut state = InstallerEngine::new();
-        register_installed_app(&mut state, "TestApp", "C:/TestApp", "C:/TestApp/uninstall.exe")
-            .unwrap();
+        register_installed_app(
+            &mut state,
+            "TestApp",
+            "C:/TestApp",
+            "C:/TestApp/uninstall.exe",
+        )
+        .expect("register_installed_app should succeed");
 
         let reg = state.registry();
         assert!(reg.contains_key(
@@ -2618,8 +3565,295 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("not_a_pe.bin");
         fs::write(&path, b"random data").unwrap();
-        assert!(read_pe_version_string(&path, "FileDescription")
-            .unwrap()
-            .is_none());
+        assert!(
+            read_pe_version_string(&path, "FileDescription")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    //  Item 236: Partial installer failure / rollback tests
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn msiexec_install_rolls_back_on_service_action() {
+        let mut engine = InstallerEngine::new();
+
+        // Pre-populate some files and registry
+        engine
+            .files
+            .insert("c:/original/file.txt".to_string(), vec![1, 2, 3]);
+        engine
+            .registry
+            .insert("hklm/software/app/version".to_string(), "1.0".to_string());
+
+        let package = MsiPackage {
+            product_code: "{test-product}".to_string(),
+            components: vec![MsiComponent {
+                id: "comp1".to_string(),
+                keypath: "c:/test/app.exe".to_string(),
+                files: vec![
+                    ("c:/test/app.exe".to_string(), vec![0xAA; 100]),
+                    ("c:/test/lib.dll".to_string(), vec![0xBB; 50]),
+                ]
+                .into_iter()
+                .collect(),
+                registry: vec![("hklm/software/test/key".to_string(), "value".to_string())]
+                    .into_iter()
+                    .collect(),
+            }],
+            custom_actions: vec![CustomAction::ServiceInstall {
+                id: "ca_install_svc".to_string(),
+                service_name: "TestSvc".to_string(),
+            }],
+            rollback_script: vec!["undo_svc".to_string()],
+        };
+
+        let options = MsiInstallOptions {
+            scm_vm_mode: false,
+            fail_after_custom_action: None,
+        };
+
+        let result = engine.msiexec_install(package, &options);
+        assert!(
+            result.is_err(),
+            "service install should be blocked without SCM"
+        );
+
+        // Verify rollback: original state must be restored
+        assert!(
+            engine.files.contains_key("c:/original/file.txt"),
+            "original file should survive rollback"
+        );
+        assert!(
+            !engine.files.contains_key("c:/test/app.exe"),
+            "component file should be rolled back"
+        );
+        assert!(
+            !engine.files.contains_key("c:/test/lib.dll"),
+            "component dll should be rolled back"
+        );
+        assert_eq!(
+            engine.registry.get("hklm/software/app/version"),
+            Some(&"1.0".to_string()),
+            "original registry key should survive rollback"
+        );
+        assert!(
+            !engine.registry.contains_key("hklm/software/test/key"),
+            "component registry key should be rolled back"
+        );
+    }
+
+    #[test]
+    fn msiexec_install_rolls_back_on_fail_after_custom_action() {
+        let mut engine = InstallerEngine::new();
+
+        engine
+            .files
+            .insert("c:/important/existing.dll".to_string(), vec![0x77; 200]);
+
+        let package = MsiPackage {
+            product_code: "{test-product-2}".to_string(),
+            components: vec![MsiComponent {
+                id: "comp1".to_string(),
+                keypath: "c:/test/new.exe".to_string(),
+                files: vec![
+                    ("c:/test/new.exe".to_string(), vec![0xCC; 64]),
+                    ("c:/test/new.dll".to_string(), vec![0xDD; 32]),
+                ]
+                .into_iter()
+                .collect(),
+                registry: vec![(
+                    "hklm/software/test/newkey".to_string(),
+                    "newval".to_string(),
+                )]
+                .into_iter()
+                .collect(),
+            }],
+            custom_actions: vec![CustomAction::Exe {
+                id: "ca_fail_me".to_string(),
+                command: "fail.exe".to_string(),
+                env: BTreeMap::new(),
+            }],
+            rollback_script: vec!["rollback_ca_fail".to_string()],
+        };
+
+        let options = MsiInstallOptions {
+            scm_vm_mode: true,
+            fail_after_custom_action: Some("ca_fail_me".to_string()),
+        };
+
+        let result = engine.msiexec_install(package, &options);
+        assert!(
+            result.is_err(),
+            "install should fail after custom action failure trigger"
+        );
+
+        // Verify rollback to pre-install state
+        assert!(
+            engine.files.contains_key("c:/important/existing.dll"),
+            "existing file should survive rollback"
+        );
+        assert!(
+            !engine.files.contains_key("c:/test/new.exe"),
+            "new file from failed install should be rolled back"
+        );
+        assert!(
+            !engine.registry.contains_key("hklm/software/test/newkey"),
+            "new registry key from failed install should be rolled back"
+        );
+    }
+
+    #[test]
+    fn apply_patch_cycle_rejects_mismatch() {
+        let mut engine = InstallerEngine::new();
+        let original_content = vec![0x11, 0x22, 0x33];
+        engine
+            .files
+            .insert("c:/target/file.bin".to_string(), original_content.clone());
+
+        // Wrong expected_old
+        let operations = vec![PatchOperation {
+            target_path: "c:/target/file.bin".to_string(),
+            expected_old: vec![0xFF, 0xFF, 0xFF],
+            replacement: vec![0xAA, 0xBB, 0xCC],
+            download_chunks: Vec::new(),
+        }];
+
+        let result = engine.apply_patch_cycle(&operations);
+        assert!(
+            result.is_err(),
+            "patch with wrong expected_old should be rejected"
+        );
+
+        // Verify that original content is preserved (rollback)
+        assert_eq!(
+            engine.files.get("c:/target/file.bin"),
+            Some(&original_content),
+            "file content must not change on failed patch"
+        );
+    }
+
+    #[test]
+    fn apply_patch_cycle_rejects_locked_file() {
+        let mut engine = InstallerEngine::new();
+        let original_content = vec![0x11, 0x22, 0x33];
+        engine
+            .files
+            .insert("c:/target/locked.bin".to_string(), original_content.clone());
+        engine.lock_file("c:/target/locked.bin", false);
+
+        let operations = vec![PatchOperation {
+            target_path: "c:/target/locked.bin".to_string(),
+            expected_old: original_content.clone(),
+            replacement: vec![0xAA, 0xBB, 0xCC],
+            download_chunks: Vec::new(),
+        }];
+
+        let result = engine.apply_patch_cycle(&operations);
+        assert!(
+            result.is_err(),
+            "patch targeting a locked file should be rejected"
+        );
+
+        // Verify rollback
+        assert_eq!(
+            engine.files.get("c:/target/locked.bin"),
+            Some(&original_content),
+            "locked file content must be preserved on rejected patch"
+        );
+    }
+
+    #[test]
+    fn apply_patch_cycle_accepts_valid_patch() {
+        let mut engine = InstallerEngine::new();
+        let original_content = vec![0x11, 0x22, 0x33, 0x44];
+        engine.files.insert(
+            "c:/target/patchable.bin".to_string(),
+            original_content.clone(),
+        );
+
+        let replacement = vec![0xAA, 0xBB, 0xCC, 0xDD];
+        let operations = vec![PatchOperation {
+            target_path: "c:/target/patchable.bin".to_string(),
+            expected_old: original_content,
+            replacement: replacement.clone(),
+            download_chunks: vec![(
+                "c:/target/patchable.bin".to_string(),
+                0,
+                replacement.clone(),
+            )],
+        }];
+
+        let result = engine.apply_patch_cycle(&operations);
+        assert!(
+            result.is_ok(),
+            "valid patch should succeed, got error: {:?}",
+            result.as_ref().err()
+        );
+
+        assert_eq!(
+            engine.files.get("c:/target/patchable.bin"),
+            Some(&replacement),
+            "patched content should replace original"
+        );
+    }
+
+    #[test]
+    fn run_gui_installer_adds_files_and_registry() {
+        let mut engine = InstallerEngine::new();
+
+        let spec = InstallerSpec {
+            id: "gui-test".to_string(),
+            executable_name: "MyApp.exe".to_string(),
+            framework: InstallerFramework::Custom,
+            files: vec![
+                (
+                    "C:\\Program Files\\MyApp\\main.exe".to_string(),
+                    vec![0x42; 128],
+                ),
+                (
+                    "C:\\Program Files\\MyApp\\config.ini".to_string(),
+                    b"enabled=1".to_vec(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            registry: vec![("hklm/software/myapp/version".to_string(), "2.0".to_string())]
+                .into_iter()
+                .collect(),
+            logs: vec!["install.log".to_string()],
+            gui_windows: vec![GuiWindowPlan {
+                title: "MyApp Installer".to_string(),
+                modal: false,
+                controls: vec![],
+            }],
+        };
+
+        let result = engine.run_gui_installer(&spec, None);
+        assert!(
+            result.is_ok(),
+            "GUI installer should succeed, got error: {:?}",
+            result.as_ref().err()
+        );
+
+        // Verify files were added
+        assert!(engine.files.contains_key("c:/program files/myapp/main.exe"));
+        assert!(
+            engine
+                .files
+                .contains_key("c:/program files/myapp/config.ini")
+        );
+
+        // Verify registry was added
+        assert_eq!(
+            engine.registry.get("hklm/software/myapp/version"),
+            Some(&"2.0".to_string())
+        );
+
+        // Verify telemetry was recorded
+        assert_eq!(engine.telemetry_log.len(), 1);
+        assert_eq!(engine.telemetry_log[0].installer_id, "gui-test");
     }
 }

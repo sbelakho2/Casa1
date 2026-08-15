@@ -1,5 +1,5 @@
 #!/bin/bash
-cd /Users/sabelakhoua/IdeaProjects/Casa1
+# Run from the repo root directory
 
 echo "=== G5: FastThunk ==="
 grep -n 'FastThunkTable\|fn register_fast_thunk\|fn allocate_thunk\|emit_arm64' src/jit.rs || echo "NOT FOUND"

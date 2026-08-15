@@ -2,8 +2,8 @@ mod support;
 
 use casa1::canonical::CanonicalTestOutput;
 use casa1::ge::{
-    DllOverride, DllOverrideMode, FileAccess, FsEntryKind, FsProfile, GameEnvironment,
-    GfxProfile, InputProfile, NetworkPolicy, NetworkProfile, OverrideMatchRule, OverridePayload,
+    DllOverride, DllOverrideMode, FileAccess, FsEntryKind, FsProfile, GameEnvironment, GfxProfile,
+    InputProfile, NetworkPolicy, NetworkProfile, OverrideMatchRule, OverridePayload,
     OverrideProfile, RegistrySetOverride, RegistryView, ReparseKind, ShareMode,
 };
 use casa1::logging::LogEvent;
@@ -120,7 +120,10 @@ fn windows_path_parsing_handles_normalization_devices_long_paths_and_reserved_na
 
     let long_path = format!(
         "C:\\{}",
-        (0..40).map(|index| format!("segment{index:02}")).collect::<Vec<_>>().join("\\")
+        (0..40)
+            .map(|index| format!("segment{index:02}"))
+            .collect::<Vec<_>>()
+            .join("\\")
     );
     let too_long = ge
         .parse_windows_path(&long_path, None)
@@ -129,7 +132,8 @@ fn windows_path_parsing_handles_normalization_devices_long_paths_and_reserved_na
 
     ge.config.long_paths_enabled = true;
     ge.save_config().expect("save long path policy");
-    assert!(ge.parse_windows_path(&long_path, None).is_ok());
+    let _result = ge.parse_windows_path(&long_path, None);
+    assert!(_result.is_ok(), "expected Ok, got {_result:?}");
 }
 
 #[test]
@@ -208,7 +212,10 @@ fn case_insensitive_creation_opening_enumeration_and_metadata_work() {
         .expect("get metadata");
     assert_eq!(metadata.kind, FsEntryKind::File);
     assert_eq!(metadata.original_case, "ReadMe.TXT");
-    assert_eq!(metadata.attributes, vec!["archive".to_string(), "hidden".to_string()]);
+    assert_eq!(
+        metadata.attributes,
+        vec!["archive".to_string(), "hidden".to_string()]
+    );
     assert!(metadata.creation_time_ticks > 0);
     assert!(metadata.last_access_time_ticks > 0);
     assert!(metadata.last_write_time_ticks > 0);
@@ -218,7 +225,10 @@ fn case_insensitive_creation_opening_enumeration_and_metadata_work() {
         .get_file_metadata("C:\\case\\readme.txt")
         .expect("reopen metadata");
     assert_eq!(reopened_metadata.original_case, "ReadMe.TXT");
-    assert_eq!(reopened_metadata.attributes, vec!["archive".to_string(), "hidden".to_string()]);
+    assert_eq!(
+        reopened_metadata.attributes,
+        vec!["archive".to_string(), "hidden".to_string()]
+    );
     assert_eq!(
         reopened
             .enumerate_directory("C:\\CASE")
@@ -239,7 +249,10 @@ fn t2_2_case_collision_suite_matches_independent_oracle() {
     let directory_collision = ge
         .create_directory(&suite.collision_directory, false)
         .expect_err("oracle case collision should fail");
-    assert_eq!(directory_collision.code.as_u32(), suite.directory_collision_code);
+    assert_eq!(
+        directory_collision.code.as_u32(),
+        suite.directory_collision_code
+    );
 
     ge.write_file(&suite.ascii_file, b"hello", false)
         .expect("write oracle ASCII file");
@@ -253,7 +266,10 @@ fn t2_2_case_collision_suite_matches_independent_oracle() {
     let unicode_collision = ge
         .write_file(&suite.unicode_lookup, b"duplicate", false)
         .expect_err("oracle unicode collision should fail");
-    assert_eq!(unicode_collision.code.as_u32(), suite.unicode_collision_code);
+    assert_eq!(
+        unicode_collision.code.as_u32(),
+        suite.unicode_collision_code
+    );
     assert_eq!(
         ge.enumerate_directory(&suite.enumeration_path)
             .expect("oracle enumeration should succeed"),
@@ -273,20 +289,36 @@ fn sharing_modes_and_byte_range_locks_reject_conflicts() {
         .expect("write data.bin");
 
     let exclusive_handle = ge
-        .open_file("C:\\Locks\\DATA.BIN", FileAccess::read_write(), ShareMode::none())
+        .open_file(
+            "C:\\Locks\\DATA.BIN",
+            FileAccess::read_write(),
+            ShareMode::none(),
+        )
         .expect("open exclusive handle");
     let sharing_violation = ge
-        .open_file("C:\\locks\\data.bin", FileAccess::read_only(), ShareMode::all())
+        .open_file(
+            "C:\\locks\\data.bin",
+            FileAccess::read_only(),
+            ShareMode::all(),
+        )
         .expect_err("second open should conflict");
     assert_eq!(sharing_violation.code, ReasonCode::RcFsSharingViolation);
     ge.close_file_handle(&exclusive_handle)
         .expect("close exclusive handle");
 
     let lock_a = ge
-        .open_file("C:\\Locks\\data.bin", FileAccess::read_write(), ShareMode::all())
+        .open_file(
+            "C:\\Locks\\data.bin",
+            FileAccess::read_write(),
+            ShareMode::all(),
+        )
         .expect("open lock handle A");
     let lock_b = ge
-        .open_file("C:\\LOCKS\\DATA.BIN", FileAccess::read_write(), ShareMode::all())
+        .open_file(
+            "C:\\LOCKS\\DATA.BIN",
+            FileAccess::read_write(),
+            ShareMode::all(),
+        )
         .expect("open lock handle B");
     ge.lock_file_range(&lock_a, 0, 8, true)
         .expect("lock first range");
@@ -319,13 +351,21 @@ fn sharing_modes_and_byte_range_locks_reject_conflicts_across_processes() {
         false,
     );
     let sharing_violation = ge
-        .open_file("C:\\locks\\data.bin", FileAccess::read_only(), ShareMode::all())
+        .open_file(
+            "C:\\locks\\data.bin",
+            FileAccess::read_only(),
+            ShareMode::all(),
+        )
         .expect_err("helper-held file should conflict across processes");
     assert_eq!(sharing_violation.code, ReasonCode::RcFsSharingViolation);
     release_hold_file(&mut hold_child, &mut hold_stdin);
 
     let lock_owner = ge
-        .open_file("C:\\Locks\\data.bin", FileAccess::read_write(), ShareMode::all())
+        .open_file(
+            "C:\\Locks\\data.bin",
+            FileAccess::read_write(),
+            ShareMode::all(),
+        )
         .expect("open lock owner after release");
     ge.close_file_handle(&lock_owner)
         .expect("close post-release handle");
@@ -340,7 +380,11 @@ fn sharing_modes_and_byte_range_locks_reject_conflicts_across_processes() {
         true,
     );
     let lock_handle = ge
-        .open_file("C:\\LOCKS\\DATA.BIN", FileAccess::read_write(), ShareMode::all())
+        .open_file(
+            "C:\\LOCKS\\DATA.BIN",
+            FileAccess::read_write(),
+            ShareMode::all(),
+        )
         .expect("open competing handle");
     let lock_violation = ge
         .lock_file_range(&lock_handle, 4, 4, true)
@@ -363,15 +407,8 @@ fn t2_3_lock_share_suite_matches_independent_oracle() {
     ge.write_file(&suite.path, b"0123456789", false)
         .expect("write oracle lock file");
 
-    let (mut hold_child, mut hold_stdin) = spawn_hold_file(
-        &temp_dir,
-        "t2-lock",
-        &suite.path,
-        "none",
-        None,
-        None,
-        false,
-    );
+    let (mut hold_child, mut hold_stdin) =
+        spawn_hold_file(&temp_dir, "t2-lock", &suite.path, "none", None, None, false);
     let share_violation = ge
         .open_file(&suite.path, FileAccess::read_only(), ShareMode::all())
         .expect_err("oracle share conflict should fail");
@@ -412,8 +449,13 @@ fn reparse_points_resolve_inside_sandbox_and_block_escape_targets() {
     ge.create_directory("C:\\Sandbox", false)
         .expect("create sandbox directory");
 
-    ge.create_reparse_point("C:\\Sandbox\\Inside", "C:\\Allowed", ReparseKind::Junction, false)
-        .expect("create in-sandbox junction");
+    ge.create_reparse_point(
+        "C:\\Sandbox\\Inside",
+        "C:\\Allowed",
+        ReparseKind::Junction,
+        false,
+    )
+    .expect("create in-sandbox junction");
     let reparse_db_path = ge_root(&temp_dir, "reparse").join("fs/reparse.db.json");
     let ge_json_path = ge_root(&temp_dir, "reparse").join("ge.json");
     let inside_sidecar = fs::read_to_string(&reparse_db_path).expect("read reparse sidecar db");
@@ -522,10 +564,15 @@ fn registry_engine_supports_types_crud_hkcr_merge_and_wow64_views() {
         .expect("enumerate values");
     assert_eq!(values.len(), 6);
     assert_eq!(
-        ge.registry_get_value("HKCU", "Software\\Casa1\\Types", "Binary", RegistryView::Native)
-            .expect("get binary")
-            .expect("binary exists")
-            .value_type,
+        ge.registry_get_value(
+            "HKCU",
+            "Software\\Casa1\\Types",
+            "Binary",
+            RegistryView::Native
+        )
+        .expect("get binary")
+        .expect("binary exists")
+        .value_type,
         "REG_BINARY"
     );
 
@@ -575,8 +622,13 @@ fn registry_engine_supports_types_crud_hkcr_merge_and_wow64_views() {
         json!(1)
     );
 
-    ge.registry_delete_value("HKCU", "Software\\Casa1\\Types", "Binary", RegistryView::Native)
-        .expect("delete value");
+    ge.registry_delete_value(
+        "HKCU",
+        "Software\\Casa1\\Types",
+        "Binary",
+        RegistryView::Native,
+    )
+    .expect("delete value");
     let values_after_delete = ge
         .registry_enum_values("HKCU", "Software\\Casa1\\Types", RegistryView::Native)
         .expect("enumerate values after delete");
@@ -601,9 +653,11 @@ fn registry_watchers_receive_change_notifications() {
         RegistryView::Native,
     )
     .expect("first change");
-    assert!(watcher
-        .wait_for_change(Duration::from_millis(100))
-        .expect("first watcher wake"));
+    assert!(
+        watcher
+            .wait_for_change(Duration::from_millis(100))
+            .expect("first watcher wake")
+    );
 
     ge.registry_set_value(
         "HKCU",
@@ -614,12 +668,16 @@ fn registry_watchers_receive_change_notifications() {
         RegistryView::Native,
     )
     .expect("second change");
-    assert!(watcher
-        .wait_for_change(Duration::from_millis(100))
-        .expect("second watcher wake"));
-    assert!(!watcher
-        .wait_for_change(Duration::from_millis(20))
-        .expect("no more changes"));
+    assert!(
+        watcher
+            .wait_for_change(Duration::from_millis(100))
+            .expect("second watcher wake")
+    );
+    assert!(
+        !watcher
+            .wait_for_change(Duration::from_millis(20))
+            .expect("no more changes")
+    );
 }
 
 #[test]
@@ -630,7 +688,12 @@ fn t2_4_registry_notify_suite_matches_independent_oracle_counts() {
     let ge = open_ge(&temp_dir, "t2-registry");
 
     let mut watcher = ge
-        .registry_watch(&suite.hive, &suite.key, suite.recursive, RegistryView::Native)
+        .registry_watch(
+            &suite.hive,
+            &suite.key,
+            suite.recursive,
+            RegistryView::Native,
+        )
         .expect("create oracle registry watcher");
     let mut wake_count = 0_u64;
     for operation in suite.operations {
@@ -640,7 +703,14 @@ fn t2_4_registry_notify_suite_matches_independent_oracle_counts() {
                 value_type,
                 data,
             } => ge
-                .registry_set_value(&suite.hive, &suite.key, &value, &value_type, data, RegistryView::Native)
+                .registry_set_value(
+                    &suite.hive,
+                    &suite.key,
+                    &value,
+                    &value_type,
+                    data,
+                    RegistryView::Native,
+                )
                 .expect("oracle registry set"),
             RegistryNotifyOperation::Delete { value } => ge
                 .registry_delete_value(&suite.hive, &suite.key, &value, RegistryView::Native)
@@ -750,7 +820,8 @@ fn override_matching_priority_and_application_are_logged_before_guest_execution(
             },
         },
     ];
-    ge.set_override_profiles(profiles).expect("save override profiles");
+    ge.set_override_profiles(profiles)
+        .expect("save override profiles");
 
     let direct_match = ge
         .match_override_for_identity(&casa1::ge::ExecutableIdentity {
@@ -842,14 +913,12 @@ fn override_matching_reads_product_and_file_version_from_pe_version_resources() 
             file_version: "1.2.3.4".to_string(),
         },
         payload: OverridePayload {
-            env_add: btreemap(vec![(
-                "CASA1_VERSION_MATCH".to_string(),
-                "hit".to_string(),
-            )]),
+            env_add: btreemap(vec![("CASA1_VERSION_MATCH".to_string(), "hit".to_string())]),
             ..OverridePayload::default()
         },
     }];
-    ge.save_config().expect("persist version-match override profile");
+    ge.save_config()
+        .expect("persist version-match override profile");
 
     let identity = ge
         .executable_identity(&program)
@@ -875,7 +944,15 @@ fn override_matching_reads_product_and_file_version_from_pe_version_resources() 
 fn create_ge(temp_dir: &TempDir, name: &str, arch: &str) {
     let output = run_macwin(
         temp_dir,
-        &["ge:create", "--name", name, "--arch", arch, "--winver", "win11-23h2"],
+        &[
+            "ge:create",
+            "--name",
+            name,
+            "--arch",
+            arch,
+            "--winver",
+            "win11-23h2",
+        ],
     );
     assert!(
         output.status.success(),
@@ -963,7 +1040,9 @@ fn spawn_hold_file(
 fn wait_for_hold_file_ready(stdout: ChildStdout) {
     let mut reader = BufReader::new(stdout);
     let mut line = String::new();
-    reader.read_line(&mut line).expect("read hold-file ready line");
+    reader
+        .read_line(&mut line)
+        .expect("read hold-file ready line");
     assert!(
         !line.trim().is_empty(),
         "helper hold-file did not emit a ready line"
@@ -971,9 +1050,7 @@ fn wait_for_hold_file_ready(stdout: ChildStdout) {
 }
 
 fn release_hold_file(child: &mut Child, stdin: &mut ChildStdin) {
-    stdin
-        .write_all(b"\n")
-        .expect("release helper-held file");
+    stdin.write_all(b"\n").expect("release helper-held file");
     let status = child.wait().expect("wait for helper hold-file");
     assert!(
         status.success(),

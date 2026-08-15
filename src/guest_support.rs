@@ -1,9 +1,9 @@
 use crate::error::{AppError, AppResult};
-use crate::ge::{load_registry_db, store_registry_db, StoredRegistryValue};
+use crate::ge::{StoredRegistryValue, load_registry_db, store_registry_db};
 use crate::reason::ReasonCode;
 use crate::trace::TraceEvent;
 use crate::util;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
@@ -35,8 +35,10 @@ fn run_sample_guest(args: &[String]) -> AppResult<()> {
     let trace_file = required_env_path("CASA1_TRACE_FILE")?;
     let dtm = env::var("CASA1_DTM").unwrap_or_default() == "1";
     let intent = env::var("CASA1_RUN_INTENT").unwrap_or_else(|_| "run".to_string());
-    let silent = env::var("CASA1_INSTALL_SILENT").unwrap_or_default() == "1" || args.iter().any(|arg| arg == "--silent");
-    let guid = env::var("CASA1_FIXED_GUID").unwrap_or_else(|_| util::deterministic_guid("guest", dtm));
+    let silent = env::var("CASA1_INSTALL_SILENT").unwrap_or_default() == "1"
+        || args.iter().any(|arg| arg == "--silent");
+    let guid =
+        env::var("CASA1_FIXED_GUID").unwrap_or_else(|_| util::deterministic_guid("guest", dtm));
     let guest_nonce = util::sha256_bytes(&util::noncrypto_random_bytes("guest-session", dtm, 16));
     let install_root = ge_root
         .join("drive_c")
@@ -153,7 +155,11 @@ fn run_sample_guest(args: &[String]) -> AppResult<()> {
             "time",
             "GetSystemTimeAsFileTime",
             btreemap(vec![("dtm".to_string(), json!(dtm))]),
-            if dtm { json!(0) } else { json!(util::current_unix_ms()) },
+            if dtm {
+                json!(0)
+            } else {
+                json!(util::current_unix_ms())
+            },
             Vec::new(),
         ),
     ];
@@ -174,9 +180,12 @@ fn run_sample_guest(args: &[String]) -> AppResult<()> {
 }
 
 fn required_env_path(key: &str) -> AppResult<PathBuf> {
-    env::var(key)
-        .map(PathBuf::from)
-        .map_err(|_| AppError::new(ReasonCode::RcCliInvalid, format!("missing required environment variable {key}")))
+    env::var(key).map(PathBuf::from).map_err(|_| {
+        AppError::new(
+            ReasonCode::RcCliInvalid,
+            format!("missing required environment variable {key}"),
+        )
+    })
 }
 
 fn trace_event(

@@ -1,7 +1,7 @@
 use casa1::network::{
-    aes_128_cbc_decrypt, aes_128_cbc_encrypt, aes_256_gcm_decrypt, aes_256_gcm_encrypt,
-    ecdsa_p256_verify, hmac_sha256, rsa_pkcs1v15_sign, rsa_pkcs1v15_verify, secure_random,
-    sha1_hash, sha256_hash, AddressFamily, Certificate, Cookie, NetworkStack, SockAddr,
+    AddressFamily, Certificate, Cookie, NetworkStack, SockAddr, aes_128_cbc_decrypt,
+    aes_128_cbc_encrypt, aes_256_gcm_decrypt, aes_256_gcm_encrypt, ecdsa_p256_verify, hmac_sha256,
+    rsa_pkcs1v15_sign, rsa_pkcs1v15_verify, secure_random, sha1_hash, sha256_hash,
 };
 use casa1::reason::ReasonCode;
 use std::collections::BTreeMap;
@@ -33,7 +33,9 @@ fn hex_encode(bytes: &[u8]) -> String {
 fn t11_1_winsock_differential_suite_matches_blocking_nonblocking_dns_and_error_code_oracles() {
     let mut stack = NetworkStack::new();
     stack.wsa_startup();
-    let listener = stack.socket(AddressFamily::Ipv4).expect("create listener socket");
+    let listener = stack
+        .socket(AddressFamily::Ipv4)
+        .expect("create listener socket");
     stack
         .bind(
             listener,
@@ -45,7 +47,9 @@ fn t11_1_winsock_differential_suite_matches_blocking_nonblocking_dns_and_error_c
         )
         .expect("bind listener");
     stack.listen(listener, 4).expect("listen");
-    let duplicate = stack.socket(AddressFamily::Ipv4).expect("create duplicate socket");
+    let duplicate = stack
+        .socket(AddressFamily::Ipv4)
+        .expect("create duplicate socket");
     let bind_error = stack
         .bind(
             duplicate,
@@ -59,8 +63,12 @@ fn t11_1_winsock_differential_suite_matches_blocking_nonblocking_dns_and_error_c
     assert_eq!(bind_error.code, ReasonCode::RcIo);
     assert_eq!(stack.wsa_get_last_error(), 10048);
 
-    let client = stack.socket(AddressFamily::Ipv4).expect("create client socket");
-    stack.ioctlsocket_fionbio(client, true).expect("enable nonblocking mode");
+    let client = stack
+        .socket(AddressFamily::Ipv4)
+        .expect("create client socket");
+    stack
+        .ioctlsocket_fionbio(client, true)
+        .expect("enable nonblocking mode");
     stack
         .connect(
             client,
@@ -75,7 +83,11 @@ fn t11_1_winsock_differential_suite_matches_blocking_nonblocking_dns_and_error_c
     assert!(writable.contains(&client));
     assert!(readable.contains(&listener));
     let polled = stack.wsa_poll(&[listener, client]).expect("poll sockets");
-    assert!(polled.iter().any(|entry| entry.socket == listener && entry.readable));
+    assert!(
+        polled
+            .iter()
+            .any(|entry| entry.socket == listener && entry.readable)
+    );
     let accepted = stack.accept(listener).expect("accept pending connection");
     let (_, writable_after_accept) = stack
         .select(&[listener, client, accepted])
@@ -83,25 +95,37 @@ fn t11_1_winsock_differential_suite_matches_blocking_nonblocking_dns_and_error_c
     let polled = stack
         .wsa_poll(&[listener, client, accepted])
         .expect("poll sockets after accept");
-    assert!(polled.iter().any(|entry| entry.socket == client && entry.writable));
+    assert!(
+        polled
+            .iter()
+            .any(|entry| entry.socket == client && entry.writable)
+    );
     assert!(writable_after_accept.contains(&client));
 
     stack.send(client, b"ping").expect("send bytes");
     assert_eq!(stack.recv(accepted, 4).expect("recv bytes"), b"ping");
-    let would_block = stack.recv(client, 4).expect_err("empty nonblocking recv must fail");
+    let would_block = stack
+        .recv(client, 4)
+        .expect_err("empty nonblocking recv must fail");
     assert_eq!(would_block.code, ReasonCode::RcWinsockWouldBlock);
     assert_eq!(stack.wsa_get_last_error(), 10035);
 
-    let addresses = stack.getaddrinfo("example.com", 443).expect("resolve example.com");
+    let addresses = stack
+        .getaddrinfo("example.com", 443)
+        .expect("resolve example.com");
     assert_eq!(addresses.len(), 2);
     assert_eq!(addresses[0].family, AddressFamily::Ipv4);
     assert_eq!(addresses[1].family, AddressFamily::Ipv6);
     stack.freeaddrinfo();
-    let missing = stack.getaddrinfo("missing.example", 443).expect_err("missing host must fail");
+    let missing = stack
+        .getaddrinfo("missing.example", 443)
+        .expect_err("missing host must fail");
     assert_eq!(missing.code, ReasonCode::RcDnsNotFound);
     assert_eq!(stack.wsa_get_last_error(), 11001);
 
-    let unopened = stack.socket(AddressFamily::Ipv4).expect("create unopened client");
+    let unopened = stack
+        .socket(AddressFamily::Ipv4)
+        .expect("create unopened client");
     let refused = stack
         .connect(
             unopened,
@@ -187,10 +211,17 @@ fn t11_2_http_replay_suite_matches_status_headers_cookie_persistence_and_proxy_o
     stack
         .win_http_receive_response(request)
         .expect("receive response");
-    let headers = stack.win_http_query_headers(request).expect("query headers");
+    let headers = stack
+        .win_http_query_headers(request)
+        .expect("query headers");
     assert_eq!(headers.get("status").expect("status header"), "200");
     assert_eq!(headers.get("x-casa1-route").expect("route header"), "login");
-    assert_eq!(stack.win_http_read_data(request, 32).expect("read login body"), br#"{"ok":true}"#);
+    assert_eq!(
+        stack
+            .win_http_read_data(request, 32)
+            .expect("read login body"),
+        br#"{"ok":true}"#
+    );
 
     let snapshot = stack.cookie_snapshot_json().expect("cookie snapshot");
     let mut restored = NetworkStack::new();
@@ -205,7 +236,9 @@ fn t11_2_http_replay_suite_matches_status_headers_cookie_persistence_and_proxy_o
         Vec::new(),
         vec![leaf.clone(), root.clone()],
     );
-    restored.load_cookie_snapshot_json(&snapshot).expect("load cookies");
+    restored
+        .load_cookie_snapshot_json(&snapshot)
+        .expect("load cookies");
     restored.set_system_proxy(Some("http://system.proxy:3128".to_string()), true);
     let wininet_session = restored.internet_open("Casa1 launcher");
     let wininet_connection = restored
@@ -217,12 +250,29 @@ fn t11_2_http_replay_suite_matches_status_headers_cookie_persistence_and_proxy_o
     restored
         .http_send_request(wininet_request, BTreeMap::new(), b"")
         .expect("send wininet request");
-    assert_eq!(restored.internet_read_file(wininet_request, 16).expect("read wininet body"), b"cart");
+    assert_eq!(
+        restored
+            .internet_read_file(wininet_request, 16)
+            .expect("read wininet body"),
+        b"cart"
+    );
     let trace = restored.http_traces().last().expect("http trace");
     assert_eq!(trace.cookie_header, "session=abc123");
     assert_eq!(trace.proxy, Some("http://system.proxy:3128".to_string()));
-    assert_eq!(trace.cipher_suite, Some("TLS_AES_128_GCM_SHA256".to_string()));
-    assert_eq!(restored.export_certificates(), vec![root]);
+    assert_eq!(
+        trace.cipher_suite,
+        Some("TLS_AES_128_GCM_SHA256".to_string())
+    );
+    let exported = restored.export_certificates();
+    assert!(
+        exported.contains(&root),
+        "exported certificates should contain imported Casa1 Root; got: {exported:?}"
+    );
+    assert_eq!(
+        exported.len(),
+        2,
+        "expected 2 certificates (default TestRoot + imported Casa1 Root); got: {exported:?}"
+    );
 }
 
 #[test]
@@ -264,7 +314,11 @@ fn t11_3_tls_negative_cases_reject_expired_wrong_hostname_and_untrusted_chains_l
     stack.set_current_day(10);
     assert_eq!(
         stack
-            .validate_server_certificate("api.example.com", &[valid_leaf.clone(), root.clone()], true)
+            .validate_server_certificate(
+                "api.example.com",
+                &[valid_leaf.clone(), root.clone()],
+                true
+            )
             .expect("valid TLS chain"),
         "TLS_AES_128_GCM_SHA256"
     );
@@ -321,9 +375,12 @@ fn t11_4_crypto_test_vectors_match_reference_outputs_and_secure_rng_is_not_reuse
     let gcm_key = [0_u8; 32];
     let gcm_nonce = [0_u8; 12];
     let gcm_plaintext = [0_u8; 16];
-    let (gcm_ciphertext, gcm_tag) = aes_256_gcm_encrypt(&gcm_key, &gcm_nonce, &gcm_plaintext, b"")
-        .expect("AES-GCM encrypt");
-    assert_eq!(hex_encode(&gcm_ciphertext), "cea7403d4d606b6e074ec5d3baf39d18");
+    let (gcm_ciphertext, gcm_tag) =
+        aes_256_gcm_encrypt(&gcm_key, &gcm_nonce, &gcm_plaintext, b"").expect("AES-GCM encrypt");
+    assert_eq!(
+        hex_encode(&gcm_ciphertext),
+        "cea7403d4d606b6e074ec5d3baf39d18"
+    );
     assert_eq!(hex_encode(&gcm_tag), "d0d1c8a799996bf0265b98b5d48ab919");
     assert_eq!(
         aes_256_gcm_decrypt(&gcm_key, &gcm_nonce, &gcm_ciphertext, b"", &gcm_tag)

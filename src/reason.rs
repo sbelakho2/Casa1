@@ -15,6 +15,7 @@ pub enum ReasonCode {
     RcDiagnosticsExportFailed = 1008,
     RcHelperPermissionDenied = 1009,
     RcEntitlementAuditFailed = 1010,
+    RcEntitlementValidationError = 1011,
     RcFsPathInvalid = 1100,
     RcFsAlreadyExists = 1101,
     RcFsNotFound = 1102,
@@ -23,12 +24,15 @@ pub enum ReasonCode {
     RcFsSharingViolation = 1105,
     RcFsLockViolation = 1106,
     RcFsSandboxEscape = 1107,
+    RcSandboxPathViolation = 1108,
     RcRegistryNotFound = 1200,
     RcWin32InvalidHandle = 1300,
     RcWin32Timeout = 1301,
     RcComClassNotRegistered = 1302,
     RcMemoryAccessViolation = 1303,
     RcPipeBusy = 1304,
+    RcComObjectError = 1305,
+    RcHandleStaleOrInvalid = 1306,
     RcPeParseInvalid = 2000,
     RcImportMissing = 2001,
     RcUnimplInsn = 2002,
@@ -36,7 +40,19 @@ pub enum ReasonCode {
     RcAnticheatDriverDetected = 2004,
     RcTlsCertRejected = 2005,
     RcMsiCustomActionServiceBlocked = 2006,
+    RcTlsValidationFailed = 2007,
+    RcBufferLimitExceeded = 2008,
+    RcInvalidGuestEnum = 2009,
     RcJitCodeAllocFailed = 2010,
+    RcParserTruncation = 2011,
+    RcUnsupportedPlatform = 2012,
+    RcTlsCertificatePinMismatch = 2013,
+    RcUnsupportedPlatformApi = 2014,
+    RcParserTruncated = 2015,
+    RcJitCompilationError = 2016,
+    RcExecutableMemoryExhausted = 2017,
+    RcGuestPointerOutOfRange = 2018,
+    RcGuestStringInvalid = 2019,
     RcInputUnsupported = 2100,
     RcDxilInvalid = 2101,
     RcDxilBindingAmbiguous = 2102,
@@ -45,6 +61,8 @@ pub enum ReasonCode {
     RcD3d9NotSupported = 2105,
     RcVulkanNotSupported = 2106,
     RcOpenGlNotSupported = 2107,
+    RcInvalidState = 2108,
+    RcNotFound = 2109,
     RcAudioUnsupported = 2200,
     RcAudioBufferSizeMismatch = 2201,
     RcWinsockWouldBlock = 2300,
@@ -56,8 +74,6 @@ pub enum ReasonCode {
     RcNetworkUnreachable = 2700,
     RcNetworkProtocolInvalid = 2701,
     RcMsiInvalid = 2702,
-    RcInvalidState = 2108,
-    RcNotFound = 2109,
     RcNetDnsResolutionFailed = 2703,
     RcNetConnectionFailed = 2704,
     RcNetWriteFailed = 2705,
@@ -67,6 +83,11 @@ pub enum ReasonCode {
     RcNetHttpHeaderNotFound = 2709,
     RcNetSocketCreateFailed = 2710,
     RcNetSendFailed = 2711,
+    RcWebSocketFrameTooLarge = 2712,
+    RcHttpHeaderLimitExceeded = 2713,
+    RcPortParseError = 2714,
+    RcRequestBodyTooLarge = 2715,
+    RcSocketReceiveQueueFull = 2716,
     RcDrmInitFailed = 2800,
     RcDrmDecryptFailed = 2801,
     RcDrmIntegrityFailed = 2802,
@@ -80,7 +101,13 @@ pub enum ReasonCode {
     RcTelemetryRanking = 2903,
     SehException = 3000,
     VeHandlerUnhandled = 3001,
-    Halted = 3100,
+    RcCrashRecoveryError = 3002,
+    Halted = 3102,
+    RcSignalHandlerError = 3103,
+    RcInvalidParameter = 3100,
+    RcOutOfMemory = 3200,
+    RcOutOfMemoryHint = 3201,
+    RcLockPoisoned = 3300,
 }
 
 impl ReasonCode {
@@ -102,6 +129,7 @@ impl ReasonCode {
             1008 => Some(Self::RcDiagnosticsExportFailed),
             1009 => Some(Self::RcHelperPermissionDenied),
             1010 => Some(Self::RcEntitlementAuditFailed),
+            1011 => Some(Self::RcEntitlementValidationError),
             1100 => Some(Self::RcFsPathInvalid),
             1101 => Some(Self::RcFsAlreadyExists),
             1102 => Some(Self::RcFsNotFound),
@@ -110,12 +138,15 @@ impl ReasonCode {
             1105 => Some(Self::RcFsSharingViolation),
             1106 => Some(Self::RcFsLockViolation),
             1107 => Some(Self::RcFsSandboxEscape),
+            1108 => Some(Self::RcSandboxPathViolation),
             1200 => Some(Self::RcRegistryNotFound),
             1300 => Some(Self::RcWin32InvalidHandle),
             1301 => Some(Self::RcWin32Timeout),
             1302 => Some(Self::RcComClassNotRegistered),
             1303 => Some(Self::RcMemoryAccessViolation),
             1304 => Some(Self::RcPipeBusy),
+            1305 => Some(Self::RcComObjectError),
+            1306 => Some(Self::RcHandleStaleOrInvalid),
             2000 => Some(Self::RcPeParseInvalid),
             2001 => Some(Self::RcImportMissing),
             2002 => Some(Self::RcUnimplInsn),
@@ -123,6 +154,19 @@ impl ReasonCode {
             2004 => Some(Self::RcAnticheatDriverDetected),
             2005 => Some(Self::RcTlsCertRejected),
             2006 => Some(Self::RcMsiCustomActionServiceBlocked),
+            2007 => Some(Self::RcTlsValidationFailed),
+            2008 => Some(Self::RcBufferLimitExceeded),
+            2009 => Some(Self::RcInvalidGuestEnum),
+            2010 => Some(Self::RcJitCodeAllocFailed),
+            2011 => Some(Self::RcParserTruncation),
+            2012 => Some(Self::RcUnsupportedPlatform),
+            2013 => Some(Self::RcTlsCertificatePinMismatch),
+            2014 => Some(Self::RcUnsupportedPlatformApi),
+            2015 => Some(Self::RcParserTruncated),
+            2016 => Some(Self::RcJitCompilationError),
+            2017 => Some(Self::RcExecutableMemoryExhausted),
+            2018 => Some(Self::RcGuestPointerOutOfRange),
+            2019 => Some(Self::RcGuestStringInvalid),
             2100 => Some(Self::RcInputUnsupported),
             2101 => Some(Self::RcDxilInvalid),
             2102 => Some(Self::RcDxilBindingAmbiguous),
@@ -131,6 +175,8 @@ impl ReasonCode {
             2105 => Some(Self::RcD3d9NotSupported),
             2106 => Some(Self::RcVulkanNotSupported),
             2107 => Some(Self::RcOpenGlNotSupported),
+            2108 => Some(Self::RcInvalidState),
+            2109 => Some(Self::RcNotFound),
             2200 => Some(Self::RcAudioUnsupported),
             2201 => Some(Self::RcAudioBufferSizeMismatch),
             2300 => Some(Self::RcWinsockWouldBlock),
@@ -142,8 +188,6 @@ impl ReasonCode {
             2700 => Some(Self::RcNetworkUnreachable),
             2701 => Some(Self::RcNetworkProtocolInvalid),
             2702 => Some(Self::RcMsiInvalid),
-            2108 => Some(Self::RcInvalidState),
-            2109 => Some(Self::RcNotFound),
             2703 => Some(Self::RcNetDnsResolutionFailed),
             2704 => Some(Self::RcNetConnectionFailed),
             2705 => Some(Self::RcNetWriteFailed),
@@ -153,6 +197,11 @@ impl ReasonCode {
             2709 => Some(Self::RcNetHttpHeaderNotFound),
             2710 => Some(Self::RcNetSocketCreateFailed),
             2711 => Some(Self::RcNetSendFailed),
+            2712 => Some(Self::RcWebSocketFrameTooLarge),
+            2713 => Some(Self::RcHttpHeaderLimitExceeded),
+            2714 => Some(Self::RcPortParseError),
+            2715 => Some(Self::RcRequestBodyTooLarge),
+            2716 => Some(Self::RcSocketReceiveQueueFull),
             2800 => Some(Self::RcDrmInitFailed),
             2801 => Some(Self::RcDrmDecryptFailed),
             2802 => Some(Self::RcDrmIntegrityFailed),
@@ -166,8 +215,13 @@ impl ReasonCode {
             2903 => Some(Self::RcTelemetryRanking),
             3000 => Some(Self::SehException),
             3001 => Some(Self::VeHandlerUnhandled),
-            3100 => Some(Self::Halted),
-            2010 => Some(Self::RcJitCodeAllocFailed),
+            3002 => Some(Self::RcCrashRecoveryError),
+            3100 => Some(Self::RcInvalidParameter),
+            3102 => Some(Self::Halted),
+            3103 => Some(Self::RcSignalHandlerError),
+            3200 => Some(Self::RcOutOfMemory),
+            3201 => Some(Self::RcOutOfMemoryHint),
+            3300 => Some(Self::RcLockPoisoned),
             _ => None,
         }
     }
@@ -186,6 +240,7 @@ impl ReasonCode {
             Self::RcDiagnosticsExportFailed => "RC_DIAGNOSTICS_EXPORT_FAILED",
             Self::RcHelperPermissionDenied => "RC_HELPER_PERMISSION_DENIED",
             Self::RcEntitlementAuditFailed => "RC_ENTITLEMENT_AUDIT_FAILED",
+            Self::RcEntitlementValidationError => "RC_ENTITLEMENT_VALIDATION_ERROR",
             Self::RcFsPathInvalid => "RC_FS_PATH_INVALID",
             Self::RcFsAlreadyExists => "RC_FS_ALREADY_EXISTS",
             Self::RcFsNotFound => "RC_FS_NOT_FOUND",
@@ -194,12 +249,15 @@ impl ReasonCode {
             Self::RcFsSharingViolation => "RC_FS_SHARING_VIOLATION",
             Self::RcFsLockViolation => "RC_FS_LOCK_VIOLATION",
             Self::RcFsSandboxEscape => "RC_FS_SANDBOX_ESCAPE",
+            Self::RcSandboxPathViolation => "RC_SANDBOX_PATH_VIOLATION",
             Self::RcRegistryNotFound => "RC_REGISTRY_NOT_FOUND",
             Self::RcWin32InvalidHandle => "RC_WIN32_INVALID_HANDLE",
             Self::RcWin32Timeout => "RC_WIN32_TIMEOUT",
             Self::RcComClassNotRegistered => "RC_COM_CLASS_NOT_REGISTERED",
             Self::RcMemoryAccessViolation => "RC_MEMORY_ACCESS_VIOLATION",
             Self::RcPipeBusy => "RC_PIPE_BUSY",
+            Self::RcComObjectError => "RC_COM_OBJECT_ERROR",
+            Self::RcHandleStaleOrInvalid => "RC_HANDLE_STALE_OR_INVALID",
             Self::RcPeParseInvalid => "RC_PE_PARSE_INVALID",
             Self::RcImportMissing => "RC_IMPORT_MISSING",
             Self::RcUnimplInsn => "RC_UNIMPL_INSN",
@@ -207,6 +265,18 @@ impl ReasonCode {
             Self::RcAnticheatDriverDetected => "RC_ANTICHEAT_DRIVER_DETECTED",
             Self::RcTlsCertRejected => "RC_TLS_CERT_REJECTED",
             Self::RcMsiCustomActionServiceBlocked => "RC_MSI_CUSTOM_ACTION_SERVICE_BLOCKED",
+            Self::RcTlsValidationFailed => "RC_TLS_VALIDATION_FAILED",
+            Self::RcBufferLimitExceeded => "RC_BUFFER_LIMIT_EXCEEDED",
+            Self::RcInvalidGuestEnum => "RC_INVALID_GUEST_ENUM",
+            Self::RcParserTruncation => "RC_PARSER_TRUNCATION",
+            Self::RcUnsupportedPlatform => "RC_UNSUPPORTED_PLATFORM",
+            Self::RcTlsCertificatePinMismatch => "RC_TLS_CERTIFICATE_PIN_MISMATCH",
+            Self::RcUnsupportedPlatformApi => "RC_UNSUPPORTED_PLATFORM_API",
+            Self::RcParserTruncated => "RC_PARSER_TRUNCATED",
+            Self::RcJitCompilationError => "RC_JIT_COMPILATION_ERROR",
+            Self::RcExecutableMemoryExhausted => "RC_EXECUTABLE_MEMORY_EXHAUSTED",
+            Self::RcGuestPointerOutOfRange => "RC_GUEST_POINTER_OUT_OF_RANGE",
+            Self::RcGuestStringInvalid => "RC_GUEST_STRING_INVALID",
             Self::RcInputUnsupported => "RC_INPUT_UNSUPPORTED",
             Self::RcDxilInvalid => "RC_DXIL_INVALID",
             Self::RcDxilBindingAmbiguous => "RC_DXIL_BINDING_AMBIGUOUS",
@@ -237,6 +307,11 @@ impl ReasonCode {
             Self::RcNetHttpHeaderNotFound => "RC_NET_HTTP_HEADER_NOT_FOUND",
             Self::RcNetSocketCreateFailed => "RC_NET_SOCKET_CREATE_FAILED",
             Self::RcNetSendFailed => "RC_NET_SEND_FAILED",
+            Self::RcWebSocketFrameTooLarge => "RC_WEBSOCKET_FRAME_TOO_LARGE",
+            Self::RcHttpHeaderLimitExceeded => "RC_HTTP_HEADER_LIMIT_EXCEEDED",
+            Self::RcPortParseError => "RC_PORT_PARSE_ERROR",
+            Self::RcRequestBodyTooLarge => "RC_REQUEST_BODY_TOO_LARGE",
+            Self::RcSocketReceiveQueueFull => "RC_SOCKET_RECEIVE_QUEUE_FULL",
             Self::RcDrmInitFailed => "RC_DRM_INIT_FAILED",
             Self::RcDrmDecryptFailed => "RC_DRM_DECRYPT_FAILED",
             Self::RcDrmIntegrityFailed => "RC_DRM_INTEGRITY_FAILED",
@@ -250,8 +325,234 @@ impl ReasonCode {
             Self::RcTelemetryRanking => "RC_TELEMETRY_RANKING",
             Self::SehException => "SEH_EXCEPTION",
             Self::VeHandlerUnhandled => "VE_HANDLER_UNHANDLED",
+            Self::RcCrashRecoveryError => "RC_CRASH_RECOVERY_ERROR",
+            Self::RcInvalidParameter => "RC_INVALID_PARAMETER",
             Self::Halted => "HALTED",
+            Self::RcSignalHandlerError => "RC_SIGNAL_HANDLER_ERROR",
+            Self::RcOutOfMemory => "RC_OUT_OF_MEMORY",
+            Self::RcOutOfMemoryHint => "RC_OUT_OF_MEMORY_HINT",
             Self::RcJitCodeAllocFailed => "RC_JIT_CODE_ALLOC_FAILED",
+            Self::RcLockPoisoned => "RC_LOCK_POISONED",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn reason_code_values_are_stable() {
+        // These values must never change — they are part of the stable API.
+        assert_eq!(ReasonCode::Success as u32, 0);
+        assert_eq!(ReasonCode::RcIo as u32, 1003);
+        assert_eq!(ReasonCode::RcPeParseInvalid as u32, 2000);
+        assert_eq!(ReasonCode::RcTlsCertRejected as u32, 2005);
+        assert_eq!(ReasonCode::RcJitCodeAllocFailed as u32, 2010);
+        assert_eq!(ReasonCode::RcOutOfMemory as u32, 3200);
+        assert_eq!(ReasonCode::RcTlsValidationFailed as u32, 2007);
+        assert_eq!(ReasonCode::RcBufferLimitExceeded as u32, 2008);
+        assert_eq!(ReasonCode::RcInvalidGuestEnum as u32, 2009);
+        assert_eq!(ReasonCode::RcWebSocketFrameTooLarge as u32, 2712);
+        assert_eq!(ReasonCode::RcHttpHeaderLimitExceeded as u32, 2713);
+        assert_eq!(ReasonCode::RcTlsCertificatePinMismatch as u32, 2013);
+        assert_eq!(ReasonCode::RcUnsupportedPlatformApi as u32, 2014);
+        assert_eq!(ReasonCode::RcParserTruncated as u32, 2015);
+        assert_eq!(ReasonCode::RcJitCompilationError as u32, 2016);
+        assert_eq!(ReasonCode::RcExecutableMemoryExhausted as u32, 2017);
+        assert_eq!(ReasonCode::RcGuestPointerOutOfRange as u32, 2018);
+        assert_eq!(ReasonCode::RcGuestStringInvalid as u32, 2019);
+        assert_eq!(ReasonCode::RcSocketReceiveQueueFull as u32, 2716);
+        assert_eq!(ReasonCode::RcRequestBodyTooLarge as u32, 2715);
+        assert_eq!(ReasonCode::RcSignalHandlerError as u32, 3103);
+        assert_eq!(ReasonCode::RcComObjectError as u32, 1305);
+        assert_eq!(ReasonCode::RcHandleStaleOrInvalid as u32, 1306);
+        assert_eq!(ReasonCode::RcSandboxPathViolation as u32, 1108);
+        assert_eq!(ReasonCode::RcEntitlementValidationError as u32, 1011);
+        assert_eq!(ReasonCode::RcCrashRecoveryError as u32, 3002);
+    }
+
+    #[test]
+    fn reason_code_values_are_unique() {
+        // Collect every ReasonCode discriminant and verify no two share the same value.
+        let codes: Vec<(ReasonCode, u32)> = vec![
+            (ReasonCode::Success, 0),
+            (ReasonCode::RcCliInvalid, 1000),
+            (ReasonCode::RcGeExists, 1001),
+            (ReasonCode::RcGeNotFound, 1002),
+            (ReasonCode::RcIo, 1003),
+            (ReasonCode::RcRunnerSpawnFailed, 1004),
+            (ReasonCode::RcRunnerProtocolInvalid, 1005),
+            (ReasonCode::RcTraceEnvMismatch, 1006),
+            (ReasonCode::RcCompareMismatch, 1007),
+            (ReasonCode::RcDiagnosticsExportFailed, 1008),
+            (ReasonCode::RcHelperPermissionDenied, 1009),
+            (ReasonCode::RcEntitlementAuditFailed, 1010),
+            (ReasonCode::RcEntitlementValidationError, 1011),
+            (ReasonCode::RcFsPathInvalid, 1100),
+            (ReasonCode::RcFsAlreadyExists, 1101),
+            (ReasonCode::RcFsNotFound, 1102),
+            (ReasonCode::RcFsReservedName, 1103),
+            (ReasonCode::RcFsPathTooLong, 1104),
+            (ReasonCode::RcFsSharingViolation, 1105),
+            (ReasonCode::RcFsLockViolation, 1106),
+            (ReasonCode::RcFsSandboxEscape, 1107),
+            (ReasonCode::RcSandboxPathViolation, 1108),
+            (ReasonCode::RcRegistryNotFound, 1200),
+            (ReasonCode::RcWin32InvalidHandle, 1300),
+            (ReasonCode::RcWin32Timeout, 1301),
+            (ReasonCode::RcComClassNotRegistered, 1302),
+            (ReasonCode::RcMemoryAccessViolation, 1303),
+            (ReasonCode::RcPipeBusy, 1304),
+            (ReasonCode::RcComObjectError, 1305),
+            (ReasonCode::RcHandleStaleOrInvalid, 1306),
+            (ReasonCode::RcPeParseInvalid, 2000),
+            (ReasonCode::RcImportMissing, 2001),
+            (ReasonCode::RcUnimplInsn, 2002),
+            (ReasonCode::RcD3dFeatureUnsupported, 2003),
+            (ReasonCode::RcAnticheatDriverDetected, 2004),
+            (ReasonCode::RcTlsCertRejected, 2005),
+            (ReasonCode::RcMsiCustomActionServiceBlocked, 2006),
+            (ReasonCode::RcTlsValidationFailed, 2007),
+            (ReasonCode::RcBufferLimitExceeded, 2008),
+            (ReasonCode::RcInvalidGuestEnum, 2009),
+            (ReasonCode::RcJitCodeAllocFailed, 2010),
+            (ReasonCode::RcParserTruncation, 2011),
+            (ReasonCode::RcUnsupportedPlatform, 2012),
+            (ReasonCode::RcTlsCertificatePinMismatch, 2013),
+            (ReasonCode::RcUnsupportedPlatformApi, 2014),
+            (ReasonCode::RcParserTruncated, 2015),
+            (ReasonCode::RcJitCompilationError, 2016),
+            (ReasonCode::RcExecutableMemoryExhausted, 2017),
+            (ReasonCode::RcGuestPointerOutOfRange, 2018),
+            (ReasonCode::RcGuestStringInvalid, 2019),
+            (ReasonCode::RcInputUnsupported, 2100),
+            (ReasonCode::RcDxilInvalid, 2101),
+            (ReasonCode::RcDxilBindingAmbiguous, 2102),
+            (ReasonCode::RcCacheCorrupt, 2103),
+            (ReasonCode::RcD3dInvalidState, 2104),
+            (ReasonCode::RcD3d9NotSupported, 2105),
+            (ReasonCode::RcVulkanNotSupported, 2106),
+            (ReasonCode::RcOpenGlNotSupported, 2107),
+            (ReasonCode::RcInvalidState, 2108),
+            (ReasonCode::RcNotFound, 2109),
+            (ReasonCode::RcAudioUnsupported, 2200),
+            (ReasonCode::RcAudioBufferSizeMismatch, 2201),
+            (ReasonCode::RcWinsockWouldBlock, 2300),
+            (ReasonCode::RcDnsNotFound, 2301),
+            (ReasonCode::RcCryptoInvalid, 2302),
+            (ReasonCode::RcDotnetUnsupported, 2400),
+            (ReasonCode::RcSteamUpdateFailed, 2500),
+            (ReasonCode::RcMediaInvalid, 2600),
+            (ReasonCode::RcNetworkUnreachable, 2700),
+            (ReasonCode::RcNetworkProtocolInvalid, 2701),
+            (ReasonCode::RcMsiInvalid, 2702),
+            (ReasonCode::RcNetDnsResolutionFailed, 2703),
+            (ReasonCode::RcNetConnectionFailed, 2704),
+            (ReasonCode::RcNetWriteFailed, 2705),
+            (ReasonCode::RcNetReadFailed, 2706),
+            (ReasonCode::RcNetProtocolError, 2707),
+            (ReasonCode::RcNetHttpRequestFailed, 2708),
+            (ReasonCode::RcNetHttpHeaderNotFound, 2709),
+            (ReasonCode::RcNetSocketCreateFailed, 2710),
+            (ReasonCode::RcNetSendFailed, 2711),
+            (ReasonCode::RcWebSocketFrameTooLarge, 2712),
+            (ReasonCode::RcHttpHeaderLimitExceeded, 2713),
+            (ReasonCode::RcPortParseError, 2714),
+            (ReasonCode::RcRequestBodyTooLarge, 2715),
+            (ReasonCode::RcSocketReceiveQueueFull, 2716),
+            (ReasonCode::RcDrmInitFailed, 2800),
+            (ReasonCode::RcDrmDecryptFailed, 2801),
+            (ReasonCode::RcDrmIntegrityFailed, 2802),
+            (ReasonCode::RcDrmLicenseInvalid, 2803),
+            (ReasonCode::RcDrmPackUnsupported, 2804),
+            (ReasonCode::RcDrmSectionNotFound, 2805),
+            (ReasonCode::RcDrmRegionNotFound, 2806),
+            (ReasonCode::RcWmiParseError, 2900),
+            (ReasonCode::RcWmiClassNotFound, 2901),
+            (ReasonCode::RcWmiObjectNotFound, 2902),
+            (ReasonCode::RcTelemetryRanking, 2903),
+            (ReasonCode::SehException, 3000),
+            (ReasonCode::VeHandlerUnhandled, 3001),
+            (ReasonCode::RcCrashRecoveryError, 3002),
+            (ReasonCode::Halted, 3102),
+            (ReasonCode::RcSignalHandlerError, 3103),
+            (ReasonCode::RcInvalidParameter, 3100),
+            (ReasonCode::RcOutOfMemory, 3200),
+            (ReasonCode::RcOutOfMemoryHint, 3201),
+            (ReasonCode::RcLockPoisoned, 3300),
+        ];
+
+        let mut seen: HashSet<u32> = HashSet::new();
+        for (code, expected_value) in &codes {
+            let actual = *code as u32;
+            assert_eq!(
+                actual, *expected_value,
+                "numeric value mismatch for {:?}: expected {}, got {}",
+                code, expected_value, actual
+            );
+            assert!(
+                seen.insert(*expected_value),
+                "duplicate numeric value {} shared by {:?} and a previous code",
+                expected_value,
+                code
+            );
+        }
+    }
+
+    #[test]
+    fn reason_code_roundtrip() {
+        // Test all codes roundtrip through from_u32
+        for code in [
+            ReasonCode::Success,
+            ReasonCode::RcCliInvalid,
+            ReasonCode::RcIo,
+            ReasonCode::RcPeParseInvalid,
+            ReasonCode::RcTlsCertRejected,
+            ReasonCode::RcNetworkUnreachable,
+            ReasonCode::RcOutOfMemory,
+            ReasonCode::RcTlsValidationFailed,
+            ReasonCode::RcBufferLimitExceeded,
+            ReasonCode::RcPortParseError,
+            ReasonCode::RcLockPoisoned,
+            ReasonCode::RcTlsCertificatePinMismatch,
+            ReasonCode::RcUnsupportedPlatformApi,
+            ReasonCode::RcParserTruncated,
+            ReasonCode::RcJitCompilationError,
+            ReasonCode::RcExecutableMemoryExhausted,
+            ReasonCode::RcGuestPointerOutOfRange,
+            ReasonCode::RcGuestStringInvalid,
+            ReasonCode::RcSocketReceiveQueueFull,
+            ReasonCode::RcRequestBodyTooLarge,
+            ReasonCode::RcSignalHandlerError,
+            ReasonCode::RcComObjectError,
+            ReasonCode::RcHandleStaleOrInvalid,
+            ReasonCode::RcSandboxPathViolation,
+            ReasonCode::RcEntitlementValidationError,
+            ReasonCode::RcCrashRecoveryError,
+        ] {
+            let value = code.as_u32();
+            assert_eq!(
+                ReasonCode::from_u32(value),
+                Some(code),
+                "roundtrip failed for {:?}",
+                code
+            );
+        }
+    }
+
+    #[test]
+    fn reason_code_names_are_nonempty() {
+        // Enumerate all codes and check names
+        for value in [
+            0u32, 1000, 1001, 1002, 1003, 1011, 1100, 1101, 1108, 1300, 1305, 1306, 2000, 2001,
+            2002, 2005, 2010, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2200, 2300, 2700, 2715,
+            2716, 3000, 3001, 3002, 3100, 3103, 3200, 3300,
+        ] {
+            if let Some(code) = ReasonCode::from_u32(value) {
+                assert!(!code.name().is_empty(), "name is empty for code {}", value);
+            }
         }
     }
 }

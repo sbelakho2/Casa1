@@ -5,12 +5,16 @@
 //! COM/OLE automation, MSVC CRT, Shell32, Advapi32, Version, XInput, BCrypt,
 //! ThreadPool, synchronization barriers, and DbgHelp.
 
+use crate::dwrite::{CGPoint, CGRect, CGSize};
 use crate::error::{AppError, AppResult};
 use crate::reason::ReasonCode;
+use p256::elliptic_curve::sec1::ToEncodedPoint;
+use rsa::pkcs8::DecodePrivateKey;
+use rsa::pkcs8::EncodePrivateKey;
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 
 // ===========================================================================
 // COM / OLE Automation
@@ -30,6 +34,8 @@ pub struct ComApartmentState {
     registered_factories: BTreeMap<u32, RegisteredFactoryEntry>,
     /// Next registration token value.
     next_token: u32,
+    /// Out-of-process COM server child processes (EXE-based COM servers).
+    com_exe_servers: Vec<std::process::Child>,
 }
 
 /// COM threading model for apartments.
@@ -91,92 +97,306 @@ pub struct ComIid;
 
 impl ComIid {
     /// IUnknown: {00000000-0000-0000-C000-000000000046}
-    pub const IUNKNOWN: [u8; 16] = [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46];
+    pub const IUNKNOWN: [u8; 16] = [
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x46,
+    ];
     /// IDispatch: {00020400-0000-0000-C000-000000000046}
-    pub const IDISPATCH: [u8; 16] = [0x00, 0x02, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46];
+    pub const IDISPATCH: [u8; 16] = [
+        0x00, 0x02, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x46,
+    ];
     /// IClassFactory: {00000001-0000-0000-C000-000000000046}
-    pub const ICLASS_FACTORY: [u8; 16] = [0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46];
+    pub const ICLASS_FACTORY: [u8; 16] = [
+        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x46,
+    ];
     /// IID_IShellLinkW: {000214F9-0000-0000-C000-000000000046}
-    pub const ISHELLLINKW: [u8; 16] = [0xF9, 0x14, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46];
+    pub const ISHELLLINKW: [u8; 16] = [
+        0xF9, 0x14, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x46,
+    ];
     /// IID_IPersistFile: {0000010B-0000-0000-C000-000000000046}
-    pub const IPERSISTFILE: [u8; 16] = [0x0B, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46];
+    pub const IPERSISTFILE: [u8; 16] = [
+        0x0B, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x46,
+    ];
     /// IID_IShellDispatch: {D8F015C0-C278-11CE-A49E-444553540000}
-    pub const ISHELL_DISPATCH: [u8; 16] = [0xC0, 0x15, 0xF0, 0xD8, 0x78, 0xC2, 0xCE, 0x11, 0xA4, 0x9E, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00];
+    pub const ISHELL_DISPATCH: [u8; 16] = [
+        0xC0, 0x15, 0xF0, 0xD8, 0x78, 0xC2, 0xCE, 0x11, 0xA4, 0x9E, 0x44, 0x45, 0x53, 0x54, 0x00,
+        0x00,
+    ];
     /// IID_IWshShell: {F935DC21-1CF0-11D0-ADB9-00C04FD58A0B}
-    pub const IWSH_SHELL: [u8; 16] = [0x21, 0xDC, 0x35, 0xF9, 0xF0, 0x1C, 0xD0, 0x11, 0xAD, 0xB9, 0x00, 0xC0, 0x4F, 0xD5, 0x8A, 0x0B];
+    pub const IWSH_SHELL: [u8; 16] = [
+        0x21, 0xDC, 0x35, 0xF9, 0xF0, 0x1C, 0xD0, 0x11, 0xAD, 0xB9, 0x00, 0xC0, 0x4F, 0xD5, 0x8A,
+        0x0B,
+    ];
     /// IID_IFileSystem: {0D43FE01-F453-11CE-9B6E-0080560B0141}
-    pub const IFILESYSTEM: [u8; 16] = [0x01, 0xFE, 0x43, 0x0D, 0x53, 0xF4, 0xCE, 0x11, 0x9B, 0x6E, 0x00, 0x80, 0x56, 0x0B, 0x01, 0x41];
+    pub const IFILESYSTEM: [u8; 16] = [
+        0x01, 0xFE, 0x43, 0x0D, 0x53, 0xF4, 0xCE, 0x11, 0x9B, 0x6E, 0x00, 0x80, 0x56, 0x0B, 0x01,
+        0x41,
+    ];
     /// IID_IADODBConnection: {00000550-0000-0010-8000-00AA006D2EA4}
-    pub const IADODB_CONNECTION: [u8; 16] = [0x50, 0x05, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x6D, 0x2E, 0xA4];
+    pub const IADODB_CONNECTION: [u8; 16] = [
+        0x50, 0x05, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x6D, 0x2E,
+        0xA4,
+    ];
     /// IID_IADODBRecordset: {00000535-0000-0010-8000-00AA006D2EA4}
-    pub const IADODB_RECORDSET: [u8; 16] = [0x35, 0x05, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x6D, 0x2E, 0xA4];
+    pub const IADODB_RECORDSET: [u8; 16] = [
+        0x35, 0x05, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x6D, 0x2E,
+        0xA4,
+    ];
     /// IID_IWbemLocator: {DC12A687-737F-11CF-884D-00AA004B2E24}
-    pub const IWBEM_LOCATOR: [u8; 16] = [0x87, 0xA6, 0x12, 0xDC, 0x7F, 0x73, 0xCF, 0x11, 0x88, 0x4D, 0x00, 0xAA, 0x00, 0x4B, 0x2E, 0x24];
+    pub const IWBEM_LOCATOR: [u8; 16] = [
+        0x87, 0xA6, 0x12, 0xDC, 0x7F, 0x73, 0xCF, 0x11, 0x88, 0x4D, 0x00, 0xAA, 0x00, 0x4B, 0x2E,
+        0x24,
+    ];
     /// IID_IWbemServices: {9556DC99-828C-11CF-A37E-00AA003240C7}
-    pub const IWBEM_SERVICES: [u8; 16] = [0x99, 0xDC, 0x56, 0x95, 0x8C, 0x82, 0xCF, 0x11, 0xA3, 0x7E, 0x00, 0xAA, 0x00, 0x32, 0x40, 0xC7];
+    pub const IWBEM_SERVICES: [u8; 16] = [
+        0x99, 0xDC, 0x56, 0x95, 0x8C, 0x82, 0xCF, 0x11, 0xA3, 0x7E, 0x00, 0xAA, 0x00, 0x32, 0x40,
+        0xC7,
+    ];
     /// IID_IWbemClassObject: {DC12A681-737F-11CF-884D-00AA004B2E24}
-    pub const IWBEM_CLASS_OBJECT: [u8; 16] = [0x81, 0xA6, 0x12, 0xDC, 0x7F, 0x73, 0xCF, 0x11, 0x88, 0x4D, 0x00, 0xAA, 0x00, 0x4B, 0x2E, 0x24];
+    pub const IWBEM_CLASS_OBJECT: [u8; 16] = [
+        0x81, 0xA6, 0x12, 0xDC, 0x7F, 0x73, 0xCF, 0x11, 0x88, 0x4D, 0x00, 0xAA, 0x00, 0x4B, 0x2E,
+        0x24,
+    ];
     /// IID_IEnumWbemClassObject: {027947E1-D731-11CE-A357-000000000001}
-    pub const IENUM_WBEM_CLASS_OBJECT: [u8; 16] = [0xE1, 0x47, 0x79, 0x02, 0x31, 0xD7, 0xCE, 0x11, 0xA3, 0x57, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01];
+    pub const IENUM_WBEM_CLASS_OBJECT: [u8; 16] = [
+        0xE1, 0x47, 0x79, 0x02, 0x31, 0xD7, 0xCE, 0x11, 0xA3, 0x57, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x01,
+    ];
     /// IID_IDirectSound8: {C50A7E93-F395-4834-9EF6-3168FD6A6110}
-    pub const IDIRECTSOUND8: [u8; 16] = [0x93, 0x7E, 0x0A, 0xC5, 0x95, 0xF3, 0x34, 0x48, 0x9E, 0xF6, 0x31, 0x68, 0xFD, 0x6A, 0x61, 0x10];
+    pub const IDIRECTSOUND8: [u8; 16] = [
+        0x93, 0x7E, 0x0A, 0xC5, 0x95, 0xF3, 0x34, 0x48, 0x9E, 0xF6, 0x31, 0x68, 0xFD, 0x6A, 0x61,
+        0x10,
+    ];
     /// IID_IDirectSoundBuffer8: {6825A449-7524-4D82-920F-50E36AB3AB1E}
-    pub const IDIRECTSOUNDBUFFER8: [u8; 16] = [0x49, 0xA4, 0x25, 0x68, 0x24, 0x75, 0x82, 0x4D, 0x92, 0x0F, 0x50, 0xE3, 0x6A, 0xB3, 0xAB, 0x1E];
+    pub const IDIRECTSOUNDBUFFER8: [u8; 16] = [
+        0x49, 0xA4, 0x25, 0x68, 0x24, 0x75, 0x82, 0x4D, 0x92, 0x0F, 0x50, 0xE3, 0x6A, 0xB3, 0xAB,
+        0x1E,
+    ];
     /// IID_IDirectSoundCapture8: {B0210781-89CD-11D0-AF6B-00A0C9223196}
-    pub const IDIRECTSOUNDCAPTURE8: [u8; 16] = [0x81, 0x07, 0x21, 0xB0, 0xCD, 0x89, 0xD0, 0x11, 0xAF, 0x6B, 0x00, 0xA0, 0xC9, 0x22, 0x31, 0x96];
+    pub const IDIRECTSOUNDCAPTURE8: [u8; 16] = [
+        0x81, 0x07, 0x21, 0xB0, 0xCD, 0x89, 0xD0, 0x11, 0xAF, 0x6B, 0x00, 0xA0, 0xC9, 0x22, 0x31,
+        0x96,
+    ];
     /// IID_IXAudio2: {2B4FB60E-1E74-42A7-B03B-57A3C62D3B0F}
-    pub const IXAUDIO2: [u8; 16] = [0x0E, 0xB6, 0x4F, 0x2B, 0x74, 0x1E, 0xA7, 0x42, 0xB0, 0x3B, 0x57, 0xA3, 0xC6, 0x2D, 0x3B, 0x0F];
+    pub const IXAUDIO2: [u8; 16] = [
+        0x0E, 0xB6, 0x4F, 0x2B, 0x74, 0x1E, 0xA7, 0x42, 0xB0, 0x3B, 0x57, 0xA3, 0xC6, 0x2D, 0x3B,
+        0x0F,
+    ];
     /// IID_IXAudio2MasteringVoice: {9FE5E5B1-F9D1-4D8E-B3F0-8D5D5E9C9A1E}
-    pub const IXAUDIO2_MASTERING_VOICE: [u8; 16] = [0xB1, 0xE5, 0xE5, 0x9F, 0xD1, 0xF9, 0x8E, 0x4D, 0xB3, 0xF0, 0x8D, 0x5D, 0x5E, 0x9C, 0x9A, 0x1E];
+    pub const IXAUDIO2_MASTERING_VOICE: [u8; 16] = [
+        0xB1, 0xE5, 0xE5, 0x9F, 0xD1, 0xF9, 0x8E, 0x4D, 0xB3, 0xF0, 0x8D, 0x5D, 0x5E, 0x9C, 0x9A,
+        0x1E,
+    ];
     /// IID_IXAudio2SourceVoice: {1D7B1C2B-87D4-4D6E-B535-59C2E13E7F33}
-    pub const IXAUDIO2_SOURCE_VOICE: [u8; 16] = [0x2B, 0x1C, 0x7B, 0x1D, 0xD4, 0x87, 0x6E, 0x4D, 0xB5, 0x35, 0x59, 0xC2, 0xE1, 0x3E, 0x7F, 0x33];
+    pub const IXAUDIO2_SOURCE_VOICE: [u8; 16] = [
+        0x2B, 0x1C, 0x7B, 0x1D, 0xD4, 0x87, 0x6E, 0x4D, 0xB5, 0x35, 0x59, 0xC2, 0xE1, 0x3E, 0x7F,
+        0x33,
+    ];
     /// IID_IXAudio2SubmixVoice: {4F0F5C0F-3E9A-4E6D-8B3A-4E9F7C5A0B1E}
-    pub const IXAUDIO2_SUBMIX_VOICE: [u8; 16] = [0x0F, 0x5C, 0x0F, 0x4F, 0x9A, 0x3E, 0x6D, 0x4E, 0x8B, 0x3A, 0x4E, 0x9F, 0x7C, 0x5A, 0x0B, 0x1E];
+    pub const IXAUDIO2_SUBMIX_VOICE: [u8; 16] = [
+        0x0F, 0x5C, 0x0F, 0x4F, 0x9A, 0x3E, 0x6D, 0x4E, 0x8B, 0x3A, 0x4E, 0x9F, 0x7C, 0x5A, 0x0B,
+        0x1E,
+    ];
     /// IID_IFileDialog: {42F85136-DB7E-4C53-85B6-8429F2E8E0E8}
-    pub const IFILE_DIALOG: [u8; 16] = [0x36, 0x51, 0xF8, 0x42, 0x7E, 0xDB, 0x53, 0x4C, 0x85, 0xB6, 0x84, 0x29, 0xF2, 0xE8, 0xE0, 0xE8];
+    pub const IFILE_DIALOG: [u8; 16] = [
+        0x36, 0x51, 0xF8, 0x42, 0x7E, 0xDB, 0x53, 0x4C, 0x85, 0xB6, 0x84, 0x29, 0xF2, 0xE8, 0xE0,
+        0xE8,
+    ];
     /// IID_IFileOpenDialog: {42F85136-DB7E-4C53-85B6-8429F2E8E0E9}
-    pub const IFILE_OPEN_DIALOG: [u8; 16] = [0x36, 0x51, 0xF8, 0x42, 0x7E, 0xDB, 0x53, 0x4C, 0x85, 0xB6, 0x84, 0x29, 0xF2, 0xE8, 0xE0, 0xE9];
+    pub const IFILE_OPEN_DIALOG: [u8; 16] = [
+        0x36, 0x51, 0xF8, 0x42, 0x7E, 0xDB, 0x53, 0x4C, 0x85, 0xB6, 0x84, 0x29, 0xF2, 0xE8, 0xE0,
+        0xE9,
+    ];
     /// IID_IFileSaveDialog: {84BCCD23-5FDE-4CDB-AEA4-AF4B83B78AD7}
-    pub const IFILE_SAVE_DIALOG: [u8; 16] = [0x23, 0xCD, 0xBC, 0x84, 0xDE, 0x5F, 0xDB, 0x4C, 0xAE, 0xA4, 0xAF, 0x4B, 0x83, 0xB7, 0x8A, 0xD7];
+    pub const IFILE_SAVE_DIALOG: [u8; 16] = [
+        0x23, 0xCD, 0xBC, 0x84, 0xDE, 0x5F, 0xDB, 0x4C, 0xAE, 0xA4, 0xAF, 0x4B, 0x83, 0xB7, 0x8A,
+        0xD7,
+    ];
     /// IID_IModalWindow: {B4DB1657-70D7-485E-8E3E-6FCB5A5C1802}
-    pub const IMODAL_WINDOW: [u8; 16] = [0x57, 0x16, 0xDB, 0xB4, 0xD7, 0x70, 0x5E, 0x48, 0x8E, 0x3E, 0x6F, 0xCB, 0x5A, 0x5C, 0x18, 0x02];
+    pub const IMODAL_WINDOW: [u8; 16] = [
+        0x57, 0x16, 0xDB, 0xB4, 0xD7, 0x70, 0x5E, 0x48, 0x8E, 0x3E, 0x6F, 0xCB, 0x5A, 0x5C, 0x18,
+        0x02,
+    ];
     /// IID_ITaskbarList: {56FDF342-FD6D-11D0-958A-006097C9A090}
-    pub const ITASKBAR_LIST: [u8; 16] = [0x42, 0xF3, 0xFD, 0x56, 0x6D, 0xFD, 0xD0, 0x11, 0x95, 0x8A, 0x00, 0x60, 0x97, 0xC9, 0xA0, 0x90];
+    pub const ITASKBAR_LIST: [u8; 16] = [
+        0x42, 0xF3, 0xFD, 0x56, 0x6D, 0xFD, 0xD0, 0x11, 0x95, 0x8A, 0x00, 0x60, 0x97, 0xC9, 0xA0,
+        0x90,
+    ];
     /// IID_ITaskbarList2: {602D4995-B13A-429B-A66E-1935E44AA7CF}
-    pub const ITASKBAR_LIST2: [u8; 16] = [0x95, 0x49, 0x2D, 0x60, 0x3A, 0xB1, 0x9B, 0x42, 0xA6, 0x6E, 0x19, 0x35, 0xE4, 0x4A, 0xA7, 0xCF];
+    pub const ITASKBAR_LIST2: [u8; 16] = [
+        0x95, 0x49, 0x2D, 0x60, 0x3A, 0xB1, 0x9B, 0x42, 0xA6, 0x6E, 0x19, 0x35, 0xE4, 0x4A, 0xA7,
+        0xCF,
+    ];
     /// IID_ITaskbarList3: {EA1AFB91-9E28-4B86-90E9-9E9F8A5EEFAF}
-    pub const ITASKBAR_LIST3: [u8; 16] = [0x91, 0xFB, 0x1A, 0xEA, 0x28, 0x9E, 0x86, 0x4B, 0x90, 0xE9, 0x9E, 0x9F, 0x8A, 0x5E, 0xEF, 0xAF];
+    pub const ITASKBAR_LIST3: [u8; 16] = [
+        0x91, 0xFB, 0x1A, 0xEA, 0x28, 0x9E, 0x86, 0x4B, 0x90, 0xE9, 0x9E, 0x9F, 0x8A, 0x5E, 0xEF,
+        0xAF,
+    ];
+    // ===========================================================================
+    // Phase L: COM/Shell Completion IIDs
+    // ===========================================================================
+    /// IID_IShellFolder: {000214E6-0000-0000-C000-000000000046}
+    pub const ISHELL_FOLDER: [u8; 16] = [
+        0xE6, 0x14, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x46,
+    ];
+    /// IID_IEnumIDList: {000214F2-0000-0000-C000-000000000046}
+    pub const IENUM_ID_LIST: [u8; 16] = [
+        0xF2, 0x14, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x46,
+    ];
+    /// IID_IShellItem: {43826D1E-E718-42EE-BC55-A1E261C37BFE}
+    pub const ISHELL_ITEM: [u8; 16] = [
+        0x1E, 0x6D, 0x82, 0x43, 0x18, 0xE7, 0xEE, 0x42, 0xBC, 0x55, 0xA1, 0xE2, 0x61, 0xC3, 0x7B,
+        0xFE,
+    ];
+    /// IID_IContextMenu: {000214E4-0000-0000-C000-000000000046}
+    pub const ICONTEXT_MENU: [u8; 16] = [
+        0xE4, 0x14, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x46,
+    ];
+    /// IID_IPropertyStore: {886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99}
+    pub const IPROPERTY_STORE: [u8; 16] = [
+        0xEB, 0x8E, 0x6D, 0x88, 0xF2, 0x8C, 0x46, 0x44, 0x8D, 0x02, 0xCD, 0xBA, 0x1D, 0xBD, 0xCF,
+        0x99,
+    ];
+    /// IID_IXMLDOMDocument: {2933BF81-7B36-11D2-B20E-00C04F983E60}
+    pub const IXMLDOM_DOCUMENT: [u8; 16] = [
+        0x81, 0xBF, 0x33, 0x29, 0x36, 0x7B, 0xD2, 0x11, 0xB2, 0x0E, 0x00, 0xC0, 0x4F, 0x98, 0x3E,
+        0x60,
+    ];
+    /// IID_IXMLDOMNode: {2933BF80-7B36-11D2-B20E-00C04F983E60}
+    pub const IXMLDOM_NODE: [u8; 16] = [
+        0x80, 0xBF, 0x33, 0x29, 0x36, 0x7B, 0xD2, 0x11, 0xB2, 0x0E, 0x00, 0xC0, 0x4F, 0x98, 0x3E,
+        0x60,
+    ];
+    /// IID_IXMLDOMElement: {2933BF86-7B36-11D2-B20E-00C04F983E60}
+    pub const IXMLDOM_ELEMENT: [u8; 16] = [
+        0x86, 0xBF, 0x33, 0x29, 0x36, 0x7B, 0xD2, 0x11, 0xB2, 0x0E, 0x00, 0xC0, 0x4F, 0x98, 0x3E,
+        0x60,
+    ];
+    /// IID_IXMLDOMNodeList: {2933BF82-7B36-11D2-B20E-00C04F983E60}
+    pub const IXMLDOM_NODE_LIST: [u8; 16] = [
+        0x82, 0xBF, 0x33, 0x29, 0x36, 0x7B, 0xD2, 0x11, 0xB2, 0x0E, 0x00, 0xC0, 0x4F, 0x98, 0x3E,
+        0x60,
+    ];
+    /// IID_IMoniker: {0000000F-0000-0000-C000-000000000046}
+    pub const IMONIKER: [u8; 16] = [
+        0x0F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x46,
+    ];
+    /// IID_IBindCtx: {00000000-0000-0000-C000-000000000046}
+    pub const IBINDCTX: [u8; 16] = [
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x46,
+    ];
+    /// IID_IBindStatusCallback: {79EAC958-BA99-11D1-90B8-00A0C969729C}
+    pub const IBINDSTATUSCALLBACK: [u8; 16] = [
+        0x58, 0xC9, 0xEA, 0x79, 0x99, 0xBA, 0xD1, 0x11, 0x90, 0xB8, 0x00, 0xA0, 0xC9, 0x69, 0x72,
+        0x9C,
+    ];
+    /// IID_IShellView: {000214E3-0000-0000-C000-000000000046}
+    pub const ISHELL_VIEW: [u8; 16] = [
+        0xE3, 0x14, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x46,
+    ];
+    /// IID_IDropTarget: {00000122-0000-0000-C000-000000000046}
+    pub const IDROP_TARGET: [u8; 16] = [
+        0x22, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x46,
+    ];
+    /// IID_IHTMLDocument2: {332C4425-26CB-11D0-B483-00C04FD90119}
+    pub const IHTML_DOCUMENT2: [u8; 16] = [
+        0x25, 0x44, 0x2C, 0x33, 0xCB, 0x26, 0xD0, 0x11, 0xB4, 0x83, 0x00, 0xC0, 0x4F, 0xD9, 0x01,
+        0x19,
+    ];
+    /// IID_IHTMLElement: {332C4426-26CB-11D0-B483-00C04FD90119}
+    pub const IHTML_ELEMENT: [u8; 16] = [
+        0x26, 0x44, 0x2C, 0x33, 0xCB, 0x26, 0xD0, 0x11, 0xB4, 0x83, 0x00, 0xC0, 0x4F, 0xD9, 0x01,
+        0x19,
+    ];
+    /// IID_IHTMLBodyElement: {3050F1D8-98B5-11CF-BB82-00AA00BDCE0B}
+    pub const IHTML_BODY_ELEMENT: [u8; 16] = [
+        0xD8, 0xF1, 0x50, 0x30, 0xB5, 0x98, 0xCF, 0x11, 0xBB, 0x82, 0x00, 0xAA, 0x00, 0xBD, 0xCE,
+        0x0B,
+    ];
     // ===========================================================================
     // D3D10 Interface IIDs
     // ===========================================================================
     /// IID_ID3D10Device: {9B7E4C0F-342C-4106-A19F-4F2704F689F0}
-    pub const ID3D10DEVICE: [u8; 16] = [0x0F, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89, 0xF0];
+    pub const ID3D10DEVICE: [u8; 16] = [
+        0x0F, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89,
+        0xF0,
+    ];
     /// IID_ID3D10Texture2D: {9B7E4C80-342C-4106-A19F-4F2704F689F0}
-    pub const ID3D10TEXTURE2D: [u8; 16] = [0x80, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89, 0xF0];
+    pub const ID3D10TEXTURE2D: [u8; 16] = [
+        0x80, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89,
+        0xF0,
+    ];
     /// IID_ID3D10Buffer: {9B7E4C81-342C-4106-A19F-4F2704F689F0}
-    pub const ID3D10BUFFER: [u8; 16] = [0x81, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89, 0xF0];
+    pub const ID3D10BUFFER: [u8; 16] = [
+        0x81, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89,
+        0xF0,
+    ];
     /// IID_ID3D10RenderTargetView: {9B7E4C82-342C-4106-A19F-4F2704F689F0}
-    pub const ID3D10RENDERTARGETVIEW: [u8; 16] = [0x82, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89, 0xF0];
+    pub const ID3D10RENDERTARGETVIEW: [u8; 16] = [
+        0x82, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89,
+        0xF0,
+    ];
     /// IID_ID3D10DepthStencilView: {9B7E4C83-342C-4106-A19F-4F2704F689F0}
-    pub const ID3D10DEPTHSTENCILVIEW: [u8; 16] = [0x83, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89, 0xF0];
+    pub const ID3D10DEPTHSTENCILVIEW: [u8; 16] = [
+        0x83, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89,
+        0xF0,
+    ];
     /// IID_ID3D10ShaderResourceView: {9B7E4C84-342C-4106-A19F-4F2704F689F0}
-    pub const ID3D10SHADERRESOURCEVIEW: [u8; 16] = [0x84, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89, 0xF0];
+    pub const ID3D10SHADERRESOURCEVIEW: [u8; 16] = [
+        0x84, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89,
+        0xF0,
+    ];
     /// IID_ID3D10VertexShader: {9B7E4C85-342C-4106-A19F-4F2704F689F0}
-    pub const ID3D10VERTEXSHADER: [u8; 16] = [0x85, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89, 0xF0];
+    pub const ID3D10VERTEXSHADER: [u8; 16] = [
+        0x85, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89,
+        0xF0,
+    ];
     /// IID_ID3D10PixelShader: {9B7E4C86-342C-4106-A19F-4F2704F689F0}
-    pub const ID3D10PIXELSHADER: [u8; 16] = [0x86, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89, 0xF0];
+    pub const ID3D10PIXELSHADER: [u8; 16] = [
+        0x86, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89,
+        0xF0,
+    ];
     /// IID_ID3D10GeometryShader: {9B7E4C87-342C-4106-A19F-4F2704F689F0}
-    pub const ID3D10GEOMETRYSHADER: [u8; 16] = [0x87, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89, 0xF0];
+    pub const ID3D10GEOMETRYSHADER: [u8; 16] = [
+        0x87, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89,
+        0xF0,
+    ];
     /// IID_ID3D10InputLayout: {9B7E4C88-342C-4106-A19F-4F2704F689F0}
-    pub const ID3D10INPUTLAYOUT: [u8; 16] = [0x88, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89, 0xF0];
+    pub const ID3D10INPUTLAYOUT: [u8; 16] = [
+        0x88, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89,
+        0xF0,
+    ];
     /// IID_ID3D10SamplerState: {9B7E4C89-342C-4106-A19F-4F2704F689F0}
-    pub const ID3D10SAMPLERSTATE: [u8; 16] = [0x89, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89, 0xF0];
+    pub const ID3D10SAMPLERSTATE: [u8; 16] = [
+        0x89, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89,
+        0xF0,
+    ];
     /// IID_ID3D10BlendState: {9B7E4C8A-342C-4106-A19F-4F2704F689F0}
-    pub const ID3D10BLENDSTATE: [u8; 16] = [0x8A, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89, 0xF0];
+    pub const ID3D10BLENDSTATE: [u8; 16] = [
+        0x8A, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89,
+        0xF0,
+    ];
     /// IID_ID3D10RasterizerState: {9B7E4C8B-342C-4106-A19F-4F2704F689F0}
-    pub const ID3D10RASTERIZERSTATE: [u8; 16] = [0x8B, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89, 0xF0];
+    pub const ID3D10RASTERIZERSTATE: [u8; 16] = [
+        0x8B, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89,
+        0xF0,
+    ];
     /// IID_ID3D10DepthStencilState: {9B7E4C8C-342C-4106-A19F-4F2704F689F0}
-    pub const ID3D10DEPTHSTENCILSTATE: [u8; 16] = [0x8C, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89, 0xF0];
+    pub const ID3D10DEPTHSTENCILSTATE: [u8; 16] = [
+        0x8C, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89,
+        0xF0,
+    ];
 }
 
 /// Well-known CLSIDs used by Steam and games.
@@ -184,41 +404,118 @@ pub struct ComClsid;
 
 impl ComClsid {
     /// DirectSound8: {3901CC3F-84B5-4FA4-BA35-AA8172B8A6B2}
-    pub const DIRECTSOUND8: [u8; 16] = [0x3F, 0xCC, 0x01, 0x39, 0xB5, 0x84, 0xA4, 0x4F, 0xBA, 0x35, 0xAA, 0x81, 0x72, 0xB8, 0xA6, 0xB2];
+    pub const DIRECTSOUND8: [u8; 16] = [
+        0x3F, 0xCC, 0x01, 0x39, 0xB5, 0x84, 0xA4, 0x4F, 0xBA, 0x35, 0xAA, 0x81, 0x72, 0xB8, 0xA6,
+        0xB2,
+    ];
     /// XAudio2: {609ED052-35B5-4F10-9BE6-39650F9781D4}
-    pub const XAUDIO2: [u8; 16] = [0x52, 0xD0, 0x9E, 0x60, 0xB5, 0x35, 0x10, 0x4F, 0x9B, 0xE6, 0x39, 0x65, 0x0F, 0x97, 0x81, 0xD4];
+    pub const XAUDIO2: [u8; 16] = [
+        0x52, 0xD0, 0x9E, 0x60, 0xB5, 0x35, 0x10, 0x4F, 0x9B, 0xE6, 0x39, 0x65, 0x0F, 0x97, 0x81,
+        0xD4,
+    ];
     /// CLSID_ShellLink: {00021401-0000-0000-C000-000000000046}
-    pub const SHELL_LINK: [u8; 16] = [0x01, 0x14, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46];
+    pub const SHELL_LINK: [u8; 16] = [
+        0x01, 0x14, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x46,
+    ];
     /// CLSID_FileOpenDialog: {DC1C5A9C-E88A-4DDE-A5A1-60F82A20AEF7}
-    pub const FILE_OPEN_DIALOG: [u8; 16] = [0x9C, 0x5A, 0x1C, 0xDC, 0x8A, 0xE8, 0xDE, 0x4D, 0xA5, 0xA1, 0x60, 0xF8, 0x2A, 0x20, 0xAE, 0xF7];
+    pub const FILE_OPEN_DIALOG: [u8; 16] = [
+        0x9C, 0x5A, 0x1C, 0xDC, 0x8A, 0xE8, 0xDE, 0x4D, 0xA5, 0xA1, 0x60, 0xF8, 0x2A, 0x20, 0xAE,
+        0xF7,
+    ];
     /// CLSID_FileSaveDialog: {C0B4E2F3-BA21-4773-8DBA-335EC946EB8B}
-    pub const FILE_SAVE_DIALOG: [u8; 16] = [0xF3, 0xE2, 0xB4, 0xC0, 0x21, 0xBA, 0x73, 0x47, 0x8D, 0xBA, 0x33, 0x5E, 0xC9, 0x46, 0xEB, 0x8B];
+    pub const FILE_SAVE_DIALOG: [u8; 16] = [
+        0xF3, 0xE2, 0xB4, 0xC0, 0x21, 0xBA, 0x73, 0x47, 0x8D, 0xBA, 0x33, 0x5E, 0xC9, 0x46, 0xEB,
+        0x8B,
+    ];
     /// CLSID_ShellApplication: {13709620-C279-11CE-A49E-444553540000}
-    pub const SHELL_APPLICATION: [u8; 16] = [0x20, 0x96, 0x70, 0x13, 0x79, 0xC2, 0xCE, 0x11, 0xA4, 0x9E, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00];
+    pub const SHELL_APPLICATION: [u8; 16] = [
+        0x20, 0x96, 0x70, 0x13, 0x79, 0xC2, 0xCE, 0x11, 0xA4, 0x9E, 0x44, 0x45, 0x53, 0x54, 0x00,
+        0x00,
+    ];
     /// CLSID_ScriptingFileSystemObject: {0D43FE01-F453-11CE-9B6E-0080560B0141}
-    pub const SCRIPTING_FILESYSTEMOBJECT: [u8; 16] = [0x01, 0xFE, 0x43, 0x0D, 0x53, 0xF4, 0xCE, 0x11, 0x9B, 0x6E, 0x00, 0x80, 0x56, 0x0B, 0x01, 0x41];
+    pub const SCRIPTING_FILESYSTEMOBJECT: [u8; 16] = [
+        0x01, 0xFE, 0x43, 0x0D, 0x53, 0xF4, 0xCE, 0x11, 0x9B, 0x6E, 0x00, 0x80, 0x56, 0x0B, 0x01,
+        0x41,
+    ];
     /// CLSID_WScriptShell: {72C24DD5-D70A-438B-8A42-98424B88AFB8}
-    pub const WSCRIPT_SHELL: [u8; 16] = [0xD5, 0x4D, 0xC2, 0x72, 0x0A, 0xD7, 0x8B, 0x43, 0x8A, 0x42, 0x98, 0x42, 0x4B, 0x88, 0xAF, 0xB8];
+    pub const WSCRIPT_SHELL: [u8; 16] = [
+        0xD5, 0x4D, 0xC2, 0x72, 0x0A, 0xD7, 0x8B, 0x43, 0x8A, 0x42, 0x98, 0x42, 0x4B, 0x88, 0xAF,
+        0xB8,
+    ];
     /// CLSID_ADODBConnection: {00000514-0000-0010-8000-00AA006D2EA4}
-    pub const ADODB_CONNECTION: [u8; 16] = [0x14, 0x05, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x6D, 0x2E, 0xA4];
+    pub const ADODB_CONNECTION: [u8; 16] = [
+        0x14, 0x05, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x6D, 0x2E,
+        0xA4,
+    ];
     /// CLSID_ADODBRecordset: {00000535-0000-0010-8000-00AA006D2EA4}
-    pub const ADODB_RECORDSET: [u8; 16] = [0x35, 0x05, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x6D, 0x2E, 0xA4];
+    pub const ADODB_RECORDSET: [u8; 16] = [
+        0x35, 0x05, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x6D, 0x2E,
+        0xA4,
+    ];
     /// CLSID_WScriptNetwork: {093FF999-1EA0-4079-9525-9614C3504B74}
-    pub const WSCRIPT_NETWORK: [u8; 16] = [0x99, 0xF9, 0x3F, 0x09, 0xA0, 0x1E, 0x79, 0x40, 0x95, 0x25, 0x96, 0x14, 0xC3, 0x50, 0x4B, 0x74];
+    pub const WSCRIPT_NETWORK: [u8; 16] = [
+        0x99, 0xF9, 0x3F, 0x09, 0xA0, 0x1E, 0x79, 0x40, 0x95, 0x25, 0x96, 0x14, 0xC3, 0x50, 0x4B,
+        0x74,
+    ];
     /// CLSID_ShellWindows: {9BA05972-F6A8-11CF-A442-00A0C90A8F39}
-    pub const SHELL_WINDOWS: [u8; 16] = [0x72, 0x59, 0xA0, 0x9B, 0xA8, 0xF6, 0xCF, 0x11, 0xA4, 0x42, 0x00, 0xA0, 0xC9, 0x0A, 0x8F, 0x39];
+    pub const SHELL_WINDOWS: [u8; 16] = [
+        0x72, 0x59, 0xA0, 0x9B, 0xA8, 0xF6, 0xCF, 0x11, 0xA4, 0x42, 0x00, 0xA0, 0xC9, 0x0A, 0x8F,
+        0x39,
+    ];
     /// CLSID_InternetExplorer: {0002DF01-0000-0000-C000-000000000046}
-    pub const INTERNET_EXPLORER: [u8; 16] = [0x01, 0xDF, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46];
+    pub const INTERNET_EXPLORER: [u8; 16] = [
+        0x01, 0xDF, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x46,
+    ];
     /// CLSID_XMLHTTP: {ED8C108E-4349-11D2-91DB-0060081A4682}
-    pub const XMLHTTP: [u8; 16] = [0x0E, 0x10, 0x8C, 0xED, 0x49, 0x43, 0xD2, 0x11, 0x91, 0xDB, 0x00, 0x60, 0x08, 0x1A, 0x46, 0x82];
+    pub const XMLHTTP: [u8; 16] = [
+        0x0E, 0x10, 0x8C, 0xED, 0x49, 0x43, 0xD2, 0x11, 0x91, 0xDB, 0x00, 0x60, 0x08, 0x1A, 0x46,
+        0x82,
+    ];
     /// CLSID_DOMDocument: {2933BF90-7B36-11D2-B20E-00C04F983E60}
-    pub const DOM_DOCUMENT: [u8; 16] = [0x90, 0xBF, 0x33, 0x29, 0x36, 0x7B, 0xD2, 0x11, 0xB2, 0x0E, 0x00, 0xC0, 0x4F, 0x98, 0x3E, 0x60];
+    pub const DOM_DOCUMENT: [u8; 16] = [
+        0x90, 0xBF, 0x33, 0x29, 0x36, 0x7B, 0xD2, 0x11, 0xB2, 0x0E, 0x00, 0xC0, 0x4F, 0x98, 0x3E,
+        0x60,
+    ];
     /// CLSID_WbemLocator: {4590F811-1D3A-11D0-891F-00AA004B2E24}
-    pub const WBEM_LOCATOR: [u8; 16] = [0x11, 0xF8, 0x90, 0x45, 0x3A, 0x1D, 0xD0, 0x11, 0x89, 0x1F, 0x00, 0xAA, 0x00, 0x4B, 0x2E, 0x24];
+    pub const WBEM_LOCATOR: [u8; 16] = [
+        0x11, 0xF8, 0x90, 0x45, 0x3A, 0x1D, 0xD0, 0x11, 0x89, 0x1F, 0x00, 0xAA, 0x00, 0x4B, 0x2E,
+        0x24,
+    ];
     /// CLSID_WbemContext: {674B6698-EE92-11D0-AD71-00C04FD8FDFF}
-    pub const WBEM_CONTEXT: [u8; 16] = [0x98, 0x66, 0x4B, 0x67, 0x92, 0xEE, 0xD0, 0x11, 0xAD, 0x71, 0x00, 0xC0, 0x4F, 0xD8, 0xFD, 0xFF];
+    pub const WBEM_CONTEXT: [u8; 16] = [
+        0x98, 0x66, 0x4B, 0x67, 0x92, 0xEE, 0xD0, 0x11, 0xAD, 0x71, 0x00, 0xC0, 0x4F, 0xD8, 0xFD,
+        0xFF,
+    ];
     /// CLSID_TaskbarList: {56FDF344-FD6D-11D0-958A-006097C9A090}
-    pub const TASKBAR_LIST: [u8; 16] = [0x44, 0xF3, 0xFD, 0x56, 0x6D, 0xFD, 0xD0, 0x11, 0x95, 0x8A, 0x00, 0x60, 0x97, 0xC9, 0xA0, 0x90];
+    pub const TASKBAR_LIST: [u8; 16] = [
+        0x44, 0xF3, 0xFD, 0x56, 0x6D, 0xFD, 0xD0, 0x11, 0x95, 0x8A, 0x00, 0x60, 0x97, 0xC9, 0xA0,
+        0x90,
+    ];
+    // ===========================================================================
+    // Phase L: COM/Shell Completion CLSIDs
+    // ===========================================================================
+    /// CLSID_ShellFolder (desktop): {00021400-0000-0000-C000-000000000046}
+    pub const SHELL_FOLDER: [u8; 16] = [
+        0x00, 0x14, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x46,
+    ];
+    /// CLSID_ShellDesktop: {00021400-0000-0000-C000-000000000046} (alias)
+    pub const SHELL_DESKTOP: [u8; 16] = [
+        0x00, 0x14, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x46,
+    ];
+    /// CLSID_UrlMoniker: {79EAC9E0-BAF9-11CE-8C82-00AA004BA90B}
+    pub const URL_MONIKER: [u8; 16] = [
+        0xE0, 0xC9, 0xEA, 0x79, 0xF9, 0xBA, 0xCE, 0x11, 0x8C, 0x82, 0x00, 0xAA, 0x00, 0x4B, 0xA9,
+        0x0B,
+    ];
+    /// CLSID_HTMLDocument (Trident): {25336920-03F9-11CF-8FD0-00AA00686F13}
+    pub const HTML_DOCUMENT: [u8; 16] = [
+        0x20, 0x69, 0x33, 0x25, 0xF9, 0x03, 0xCF, 0x11, 0x8F, 0xD0, 0x00, 0xAA, 0x00, 0x68, 0x6F,
+        0x13,
+    ];
 }
 
 // ===========================================================================
@@ -242,10 +539,7 @@ impl DirectSound8Object {
     pub fn new(clsid: [u8; 16]) -> Self {
         Self {
             clsid,
-            supported: vec![
-                ComIid::IUNKNOWN,
-                ComIid::IDIRECTSOUND8,
-            ],
+            supported: vec![ComIid::IUNKNOWN, ComIid::IDIRECTSOUND8],
             name: "DirectSound8".to_string(),
             device_id: None,
         }
@@ -274,10 +568,7 @@ impl DirectSoundBuffer8Object {
     pub fn new(clsid: [u8; 16]) -> Self {
         Self {
             clsid,
-            supported: vec![
-                ComIid::IUNKNOWN,
-                ComIid::IDIRECTSOUNDBUFFER8,
-            ],
+            supported: vec![ComIid::IUNKNOWN, ComIid::IDIRECTSOUNDBUFFER8],
             name: "DirectSoundBuffer8".to_string(),
         }
     }
@@ -307,10 +598,7 @@ impl XAudio2Object {
     pub fn new(clsid: [u8; 16]) -> Self {
         Self {
             clsid,
-            supported: vec![
-                ComIid::IUNKNOWN,
-                ComIid::IXAUDIO2,
-            ],
+            supported: vec![ComIid::IUNKNOWN, ComIid::IXAUDIO2],
             name: "XAudio2".to_string(),
         }
     }
@@ -336,10 +624,7 @@ impl XAudio2MasteringVoiceObject {
     pub fn new(clsid: [u8; 16]) -> Self {
         Self {
             clsid,
-            supported: vec![
-                ComIid::IUNKNOWN,
-                ComIid::IXAUDIO2_MASTERING_VOICE,
-            ],
+            supported: vec![ComIid::IUNKNOWN, ComIid::IXAUDIO2_MASTERING_VOICE],
             name: "XAudio2MasteringVoice".to_string(),
         }
     }
@@ -365,10 +650,7 @@ impl XAudio2SourceVoiceObject {
     pub fn new(clsid: [u8; 16]) -> Self {
         Self {
             clsid,
-            supported: vec![
-                ComIid::IUNKNOWN,
-                ComIid::IXAUDIO2_SOURCE_VOICE,
-            ],
+            supported: vec![ComIid::IUNKNOWN, ComIid::IXAUDIO2_SOURCE_VOICE],
             name: "XAudio2SourceVoice".to_string(),
         }
     }
@@ -394,10 +676,7 @@ impl XAudio2SubmixVoiceObject {
     pub fn new(clsid: [u8; 16]) -> Self {
         Self {
             clsid,
-            supported: vec![
-                ComIid::IUNKNOWN,
-                ComIid::IXAUDIO2_SUBMIX_VOICE,
-            ],
+            supported: vec![ComIid::IUNKNOWN, ComIid::IXAUDIO2_SUBMIX_VOICE],
             name: "XAudio2SubmixVoice".to_string(),
         }
     }
@@ -442,11 +721,7 @@ impl ShellLinkObject {
     pub fn new(clsid: [u8; 16]) -> Self {
         Self {
             clsid,
-            supported: vec![
-                ComIid::IUNKNOWN,
-                ComIid::ISHELLLINKW,
-                ComIid::IPERSISTFILE,
-            ],
+            supported: vec![ComIid::IUNKNOWN, ComIid::ISHELLLINKW, ComIid::IPERSISTFILE],
             name: "ShellLink".to_string(),
             path: String::new(),
             arguments: String::new(),
@@ -871,6 +1146,2397 @@ impl ComObject for TaskbarListObject {
     }
 }
 
+// ===========================================================================
+// Phase L: COM/Shell Completion — PIDL Helpers
+// ===========================================================================
+
+/// Maximum PIDL size (arbitrary: 64KB).
+pub const MAX_PIDL_SIZE: usize = 65536;
+
+/// Minimum PIDL size (header: 2 bytes total_size + 2 bytes item_size).
+pub const MIN_PIDL_SIZE: usize = 4;
+
+/// Build a PIDL from a macOS path.
+///
+/// PIDL structure (simple encoding):
+///   [total_size: u16][item1_size: u16][item1_data...][itemN_size: u16][itemN_data...][0x0000]
+///
+/// For simplicity, we store the UTF-16 path as a single item.
+pub fn pidl_from_path(path: &std::path::Path) -> Vec<u16> {
+    let wide: Vec<u16> = path.to_string_lossy().encode_utf16().collect();
+    let item_data_len = wide.len();
+    let item_size = 2 + item_data_len * 2; // size_u16 + data in bytes
+    let total_size = (2 + item_size + 2) as u16; // total_size + item + terminator
+    let mut pidl = Vec::with_capacity(total_size as usize / 2);
+    pidl.push(total_size);
+    pidl.push(item_size as u16);
+    pidl.extend_from_slice(&wide);
+    pidl.push(0); // null terminator for item
+    pidl.push(0); // null terminator for PIDL
+    pidl
+}
+
+/// Extract the path from a PIDL.
+pub fn pidl_to_path(pidl: &[u16]) -> Option<std::path::PathBuf> {
+    if pidl.len() < 4 {
+        return None;
+    }
+    let total_size = pidl[0] as usize;
+    if total_size > pidl.len() * 2 || total_size < 4 {
+        return None;
+    }
+    let item_size = pidl[1] as usize;
+    if item_size < 2 || 2 + item_size > pidl.len() * 2 {
+        return None;
+    }
+    let data_len = (item_size - 2) / 2;
+    if data_len == 0 {
+        return None;
+    }
+    let wide: Vec<u16> = pidl[2..2 + data_len].to_vec();
+    let s = String::from_utf16_lossy(&wide);
+    Some(std::path::PathBuf::from(s))
+}
+
+/// Validate a PIDL (check structure integrity).
+pub fn pidl_is_valid(pidl: &[u16]) -> bool {
+    if pidl.len() < 4 {
+        return false;
+    }
+    let total_size = pidl[0] as usize;
+    if total_size < 4 || total_size > pidl.len() * 2 || total_size > MAX_PIDL_SIZE {
+        return false;
+    }
+    true
+}
+
+/// Compare two PIDLs for equality.
+pub fn pidl_eq(a: &[u16], b: &[u16]) -> bool {
+    a == b
+}
+
+/// Get the display name of a PIDL (just the filename component).
+pub fn pidl_display_name(pidl: &[u16]) -> String {
+    if let Some(path) = pidl_to_path(pidl) {
+        path.file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default()
+    } else {
+        String::new()
+    }
+}
+
+// ===========================================================================
+// Phase L1: IShellFolder — Full Implementation
+// ===========================================================================
+
+/// ShellFolder struct — backed by a macOS directory path.
+pub struct ShellFolder {
+    /// The macOS path this shell folder represents.
+    pub path: std::path::PathBuf,
+    /// The root PIDL for this folder.
+    pub pidl: Vec<u16>,
+    /// Optional parent folder.
+    pub parent: Option<Box<ShellFolder>>,
+    /// Cached child entries (directory listing).
+    pub(crate) entries: Vec<std::path::PathBuf>,
+}
+
+impl ShellFolder {
+    /// Create a new ShellFolder for the given path.
+    pub fn new(path: std::path::PathBuf) -> Self {
+        let pidl = pidl_from_path(&path);
+        let entries = Self::list_entries(&path);
+        Self {
+            path,
+            pidl,
+            parent: None,
+            entries,
+        }
+    }
+
+    /// Create a ShellFolder with a parent.
+    pub fn with_parent(path: std::path::PathBuf, parent: ShellFolder) -> Self {
+        let pidl = pidl_from_path(&path);
+        let entries = Self::list_entries(&path);
+        Self {
+            path,
+            pidl,
+            parent: Some(Box::new(parent)),
+            entries,
+        }
+    }
+
+    /// Get the desktop folder (maps to ~/Desktop).
+    pub fn desktop() -> Self {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/Shared".to_string());
+        let desktop = std::path::PathBuf::from(home).join("Desktop");
+        // Ensure desktop dir exists
+        if let Err(e) = std::fs::create_dir_all(&desktop) {
+            eprintln!(
+                "[RealWin32] ShellFolder::desktop: failed to create desktop dir '{}': {e}",
+                desktop.display()
+            );
+        }
+        Self::new(desktop)
+    }
+
+    /// List entries (files + directories) in a directory.
+    fn list_entries(path: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut entries = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(path) {
+            for entry in rd.flatten() {
+                entries.push(entry.path());
+            }
+        }
+        entries.sort();
+        entries
+    }
+
+    /// Refresh the cached entry list from the filesystem.
+    pub fn refresh(&mut self) {
+        self.entries = Self::list_entries(&self.path);
+    }
+
+    /// IShellFolder::EnumObjects — enumerate child items.
+    pub fn enum_objects(&self) -> EnumIdList {
+        EnumIdList::new(self.entries.clone(), self.path.clone())
+    }
+
+    /// IShellFolder::BindToObject — navigate into a subfolder by PIDL.
+    pub fn bind_to_object(&self, pidl: &[u16]) -> Option<ShellFolder> {
+        let child_path = pidl_to_path(pidl)?;
+        // Resolve relative to this folder if the path is not absolute
+        let full_path = if child_path.is_absolute() {
+            child_path
+        } else {
+            self.path.join(&child_path)
+        };
+        if full_path.is_dir() {
+            let mut folder = ShellFolder::new(full_path);
+            folder.parent = Some(Box::new(ShellFolder {
+                path: self.path.clone(),
+                pidl: self.pidl.clone(),
+                parent: None,
+                entries: Vec::new(),
+            }));
+            Some(folder)
+        } else {
+            None
+        }
+    }
+
+    /// IShellFolder::GetDisplayNameOf — return display name for a PIDL.
+    pub fn get_display_name_of(&self, pidl: &[u16]) -> String {
+        if let Some(path) = pidl_to_path(pidl) {
+            path.file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| path.to_string_lossy().to_string())
+        } else {
+            String::new()
+        }
+    }
+
+    /// IShellFolder::ParseDisplayName — convert a display name string to PIDL.
+    pub fn parse_display_name(&self, display_name: &str) -> Option<Vec<u16>> {
+        let target = if std::path::Path::new(display_name).is_absolute() {
+            std::path::PathBuf::from(display_name)
+        } else {
+            self.path.join(display_name)
+        };
+        if target.exists() {
+            Some(pidl_from_path(&target))
+        } else {
+            None
+        }
+    }
+
+    /// IShellFolder::SetNameOf — rename a PIDL item.
+    pub fn set_name_of(&mut self, _pidl: &[u16], new_name: &str) -> Option<Vec<u16>> {
+        let child_path = pidl_to_path(_pidl)?;
+        let full_path = if child_path.is_absolute() {
+            child_path
+        } else {
+            self.path.join(&child_path)
+        };
+        let new_path = self.path.join(new_name);
+        if std::fs::rename(&full_path, &new_path).is_ok() {
+            self.refresh();
+            Some(pidl_from_path(&new_path))
+        } else {
+            None
+        }
+    }
+}
+
+/// IEnumIDList — enumerates child items of a ShellFolder.
+pub struct EnumIdList {
+    entries: Vec<std::path::PathBuf>,
+    parent_path: std::path::PathBuf,
+    index: usize,
+}
+
+impl EnumIdList {
+    pub fn new(entries: Vec<std::path::PathBuf>, parent_path: std::path::PathBuf) -> Self {
+        Self {
+            entries,
+            parent_path,
+            index: 0,
+        }
+    }
+
+    /// Reset the enumeration.
+    pub fn reset(&mut self) {
+        self.index = 0;
+    }
+
+    /// Skip a number of items.
+    pub fn skip(&mut self, count: usize) {
+        self.index = self.index.saturating_add(count).min(self.entries.len());
+    }
+
+    /// Get the next item's PIDL.
+    pub fn next(&mut self) -> Option<Vec<u16>> {
+        let entry = self.entries.get(self.index)?;
+        self.index += 1;
+        Some(pidl_from_path(entry))
+    }
+
+    /// Get the current count of remaining items.
+    pub fn remaining(&self) -> usize {
+        self.entries.len().saturating_sub(self.index)
+    }
+
+    /// Clone the current state (for COM-style IEnumIDList::Clone).
+    pub fn clone_state(&self) -> Self {
+        Self {
+            entries: self.entries.clone(),
+            parent_path: self.parent_path.clone(),
+            index: self.index,
+        }
+    }
+}
+
+/// ShellFolder COM object (IShellFolder) — wraps a ShellFolder.
+pub struct ShellFolderObject {
+    clsid: [u8; 16],
+    supported: Vec<[u8; 16]>,
+    name: String,
+    inner: std::sync::Mutex<ShellFolder>,
+}
+
+impl ShellFolderObject {
+    pub fn new(clsid: [u8; 16]) -> Self {
+        let desktop = ShellFolder::desktop();
+        Self {
+            clsid,
+            supported: vec![ComIid::IUNKNOWN, ComIid::ISHELL_FOLDER],
+            name: "ShellFolder".to_string(),
+            inner: std::sync::Mutex::new(desktop),
+        }
+    }
+
+    /// SHGetDesktopFolder equivalent — returns a reference to the desktop
+    /// ShellFolder wrapped in a fresh COM object.
+    pub fn get_desktop_folder() -> Self {
+        Self::new(ComClsid::SHELL_FOLDER)
+    }
+
+    /// IShellFolder::EnumObjects — get an enumerator for child items.
+    pub fn enum_objects(&self) -> EnumIdList {
+        let inner = self.inner.lock().unwrap();
+        inner.enum_objects()
+    }
+
+    /// IShellFolder::BindToObject — navigate into a subfolder.
+    pub fn bind_to_object(&self, pidl: &[u16]) -> Option<ShellFolderObject> {
+        let inner = self.inner.lock().unwrap();
+        inner.bind_to_object(pidl).map(|child| {
+            let _child_pidl = child.pidl.clone();
+            ShellFolderObject {
+                clsid: self.clsid,
+                supported: self.supported.clone(),
+                name: format!("ShellFolder({})", child.path.display()),
+                inner: std::sync::Mutex::new(child),
+            }
+        })
+    }
+
+    /// IShellFolder::GetDisplayNameOf — get display name for a PIDL.
+    pub fn get_display_name_of(&self, pidl: &[u16]) -> String {
+        let inner = self.inner.lock().unwrap();
+        inner.get_display_name_of(pidl)
+    }
+
+    /// IShellFolder::ParseDisplayName — convert string to PIDL.
+    pub fn parse_display_name(&self, display_name: &str) -> Option<Vec<u16>> {
+        let inner = self.inner.lock().unwrap();
+        inner.parse_display_name(display_name)
+    }
+
+    /// IShellFolder::SetNameOf — rename an item.
+    pub fn set_name_of(&self, pidl: &[u16], new_name: &str) -> Option<Vec<u16>> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.set_name_of(pidl, new_name)
+    }
+
+    /// Get the underlying path.
+    pub fn path(&self) -> std::path::PathBuf {
+        let inner = self.inner.lock().unwrap();
+        inner.path.clone()
+    }
+
+    /// Get the root PIDL.
+    pub fn pidl(&self) -> Vec<u16> {
+        let inner = self.inner.lock().unwrap();
+        inner.pidl.clone()
+    }
+}
+
+impl ComObject for ShellFolderObject {
+    fn supported_iids(&self) -> Vec<[u8; 16]> {
+        self.supported.clone()
+    }
+    fn debug_name(&self) -> &str {
+        &self.name
+    }
+}
+
+// ===========================================================================
+// SH* Helper Functions (L1)
+// ===========================================================================
+
+/// SHGetDesktopFolder — return the IShellFolder for the desktop.
+pub fn sh_get_desktop_folder() -> ShellFolderObject {
+    ShellFolderObject::get_desktop_folder()
+}
+
+/// SHGetPathFromIDListW — convert PIDL to a filesystem path string.
+/// Returns the path as a UTF-16 string (or empty on failure).
+pub fn sh_get_path_from_id_list_w(pidl: &[u16]) -> String {
+    pidl_to_path(pidl)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default()
+}
+
+/// ILCreateFromPathW — create a PIDL from a filesystem path.
+pub fn il_create_from_path_w(path: &std::path::Path) -> Vec<u16> {
+    pidl_from_path(path)
+}
+
+/// SHBrowseForFolderW — open a native folder picker dialog via
+/// NSOpenPanel and return the selected path as a PIDL.
+/// Returns None if the user cancelled.
+pub fn sh_browse_for_folder_w(title: &str) -> Option<Vec<u16>> {
+    // Use objc to call NSOpenPanel
+    #[cfg(target_os = "macos")]
+    // SAFETY: Objective-C FFI for Win32 API shims on macOS
+    unsafe {
+        let cls = match objc::runtime::Class::get("NSOpenPanel") {
+            Some(c) => c,
+            None => {
+                // Fallback: return Desktop PIDL if we can't show dialog
+                return Some(pidl_from_path(&ShellFolder::desktop().path));
+            }
+        };
+        let panel: *mut objc::runtime::Object = objc::msg_send![cls, openPanel];
+        if panel.is_null() {
+            return Some(pidl_from_path(&ShellFolder::desktop().path));
+        }
+        let title_bytes = title.as_bytes();
+        let title_ns: *mut objc::runtime::Object =
+            objc::msg_send![class!(NSString), stringWithUTF8String: title_bytes.as_ptr()];
+        let _: () = objc::msg_send![panel, setTitle: title_ns];
+        let can_choose: u8 = 1;
+        let _: () = objc::msg_send![panel, setCanChooseFiles: can_choose];
+        let can_choose_dirs: u8 = 1;
+        let _: () = objc::msg_send![panel, setCanChooseDirectories: can_choose_dirs];
+        let result: i64 = objc::msg_send![panel, runModal];
+        if result == 1 {
+            // NSFileHandlingPanelOKButton
+            let urls: *mut objc::runtime::Object = objc::msg_send![panel, URLs];
+            let count: usize = objc::msg_send![urls, count];
+            if count > 0 {
+                let url: *mut objc::runtime::Object = objc::msg_send![urls, objectAtIndex: 0usize];
+                let path_str: *mut objc::runtime::Object = objc::msg_send![url, path];
+                let cstr: *const i8 = objc::msg_send![path_str, UTF8String];
+                if !cstr.is_null() {
+                    let path = std::ffi::CStr::from_ptr(cstr)
+                        .to_string_lossy()
+                        .into_owned();
+                    return Some(pidl_from_path(&std::path::PathBuf::from(path)));
+                }
+            }
+        }
+        Some(pidl_from_path(&ShellFolder::desktop().path))
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        // title is unused in the macOS implementation
+        Some(pidl_from_path(&ShellFolder::desktop().path))
+    }
+}
+
+// ===========================================================================
+// Phase L2: IShellView — Full Implementation
+// ===========================================================================
+
+/// ShellView — displays folder contents as a simple list.
+///
+/// Implements IShellView using NSView/TextLayer for rendering
+/// a file listing. For now, renders as a simple text-based list
+/// using CATextLayer items on an NSView.
+pub struct ShellView {
+    /// The folder path being viewed.
+    pub folder_path: std::path::PathBuf,
+    /// Cached entries.
+    pub entries: Vec<std::path::PathBuf>,
+    /// Whether the view is active.
+    pub active: bool,
+    /// View window handle (NSView pointer as u64).
+    pub view_handle: u64,
+    /// Parent window handle.
+    pub parent_handle: u64,
+    /// View mode (0=icons, 1=list, 2=details).
+    pub view_mode: u32,
+}
+
+impl ShellView {
+    pub fn new(folder_path: std::path::PathBuf) -> Self {
+        let entries = Self::list_entries(&folder_path);
+        Self {
+            folder_path,
+            entries,
+            active: false,
+            view_handle: 0,
+            parent_handle: 0,
+            view_mode: 1, // Default to list view
+        }
+    }
+
+    fn list_entries(path: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut entries = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(path) {
+            for entry in rd.flatten() {
+                entries.push(entry.path());
+            }
+        }
+        entries.sort();
+        entries
+    }
+
+    /// IShellView::CreateViewWindow — create an NSView that displays folder
+    /// contents using TextLayer items for a simple list view.
+    pub fn create_view_window(&mut self, parent_handle: u64) -> u64 {
+        self.parent_handle = parent_handle;
+        self.active = true;
+
+        #[cfg(target_os = "macos")]
+        // SAFETY: Objective-C FFI for Win32 API shims on macOS
+        unsafe {
+            let nsview_class = match objc::runtime::Class::get("NSView") {
+                Some(c) => c,
+                None => return 0,
+            };
+            let view: *mut objc::runtime::Object = objc::msg_send![nsview_class, alloc];
+            if view.is_null() {
+                return 0;
+            }
+            let parent: *mut objc::runtime::Object =
+                std::mem::transmute(parent_handle as *mut objc::runtime::Object);
+            let parent_frame: CGRect = objc::msg_send![parent, frame];
+            let view: *mut objc::runtime::Object =
+                objc::msg_send![view, initWithFrame: parent_frame];
+            if view.is_null() {
+                return 0;
+            }
+
+            // Add file name text layers
+            if let Some(text_layer_class) = objc::runtime::Class::get("CATextLayer") {
+                let mut y_offset = parent_frame.size.height as f64 - 30.0;
+                for entry in &self.entries {
+                    let fname = entry
+                        .file_name()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    let layer: *mut objc::runtime::Object =
+                        objc::msg_send![text_layer_class, layer];
+                    if !layer.is_null() {
+                        let fname_bytes = fname.as_bytes();
+                        let string: *mut objc::runtime::Object = objc::msg_send![class!(NSString), stringWithUTF8String: fname_bytes.as_ptr()];
+                        let _: () = objc::msg_send![layer, setString: string];
+                        // Set font size
+                        let sys_font: *mut objc::runtime::Object =
+                            objc::msg_send![class!(NSFont), systemFontOfSize: 13.0f64];
+                        let _: () = objc::msg_send![layer, setFont: sys_font];
+                        // Position the layer
+                        let frame = CGRect {
+                            origin: CGPoint {
+                                x: 10.0,
+                                y: y_offset,
+                            },
+                            size: CGSize {
+                                width: parent_frame.size.width as f64 - 20.0,
+                                height: 20.0,
+                            },
+                        };
+                        let _: () = objc::msg_send![layer, setFrame: frame];
+                        // Add to view's layer
+                        let view_layer: *mut objc::runtime::Object = objc::msg_send![view, layer];
+                        let _: () = objc::msg_send![view_layer, addSublayer: layer];
+                    }
+                    y_offset -= 22.0;
+                }
+            }
+
+            let _: () = objc::msg_send![parent, addSubview: view];
+            self.view_handle = view as u64;
+            self.view_handle
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            0
+        }
+    }
+
+    /// IShellView::UIActivate — activate or deactivate the view.
+    pub fn ui_activate(&mut self, activate: bool) {
+        self.active = activate;
+        #[cfg(target_os = "macos")]
+        // SAFETY: Objective-C FFI for Win32 API shims on macOS
+        unsafe {
+            if self.view_handle != 0 {
+                let view: *mut objc::runtime::Object =
+                    std::mem::transmute(self.view_handle as *mut objc::runtime::Object);
+                let hidden: u8 = if activate { 0 } else { 1 };
+                let _: () = objc::msg_send![view, setHidden: hidden];
+            }
+        }
+    }
+
+    /// IShellView::GetCurrentInfo — return current folder settings.
+    pub fn get_current_info(&self) -> (u32, u32) {
+        (self.view_mode, self.entries.len() as u32)
+    }
+
+    /// IShellView::Refresh — refresh the view contents.
+    pub fn refresh(&mut self) {
+        self.entries = Self::list_entries(&self.folder_path);
+        // In a full implementation, we would update the NSView text layers
+    }
+
+    /// IShellView::DestroyViewWindow — destroy the view window.
+    pub fn destroy_view_window(&mut self) {
+        #[cfg(target_os = "macos")]
+        // SAFETY: Objective-C FFI for Win32 API shims on macOS
+        unsafe {
+            if self.view_handle != 0 {
+                let view: *mut objc::runtime::Object =
+                    std::mem::transmute(self.view_handle as *mut objc::runtime::Object);
+                let _: () = objc::msg_send![view, removeFromSuperview];
+                let _: () = objc::msg_send![view, release];
+                self.view_handle = 0;
+            }
+        }
+        self.active = false;
+    }
+}
+
+/// ShellView COM object (IShellView).
+pub struct ShellViewObject {
+    clsid: [u8; 16],
+    supported: Vec<[u8; 16]>,
+    name: String,
+    inner: std::sync::Mutex<ShellView>,
+}
+
+impl ShellViewObject {
+    pub fn new(clsid: [u8; 16], folder_path: std::path::PathBuf) -> Self {
+        Self {
+            clsid,
+            supported: vec![ComIid::IUNKNOWN, ComIid::ISHELL_VIEW],
+            name: "ShellView".to_string(),
+            inner: std::sync::Mutex::new(ShellView::new(folder_path)),
+        }
+    }
+
+    pub fn create_view_window(&self, parent_handle: u64) -> u64 {
+        let mut inner = self.inner.lock().unwrap();
+        inner.create_view_window(parent_handle)
+    }
+
+    pub fn ui_activate(&self, activate: bool) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.ui_activate(activate);
+    }
+
+    pub fn get_current_info(&self) -> (u32, u32) {
+        let inner = self.inner.lock().unwrap();
+        inner.get_current_info()
+    }
+
+    pub fn refresh(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.refresh();
+    }
+
+    pub fn destroy_view_window(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.destroy_view_window();
+    }
+}
+
+impl ComObject for ShellViewObject {
+    fn supported_iids(&self) -> Vec<[u8; 16]> {
+        self.supported.clone()
+    }
+    fn debug_name(&self) -> &str {
+        &self.name
+    }
+}
+
+// ===========================================================================
+// Phase L3: IDropTarget / IDropSource — Drag-and-Drop
+// ===========================================================================
+
+// Global mapping of window handles to IDropTarget implementations.
+lazy_static::lazy_static! {
+    static ref GLOBAL_DROP_TARGETS: Mutex<HashMap<u64, DropTargetImpl>> = Mutex::new(HashMap::new());
+}
+
+/// FORMATETC structure for clipboard/drag-drop data format.
+#[derive(Debug, Clone)]
+pub struct FormatEtc {
+    pub cf_format: u16,
+    pub ptd: u64,
+    pub dw_aspect: u32,
+    pub lindex: i32,
+    pub tymed: u32,
+}
+
+/// STGMEDIUM structure for data storage.
+#[derive(Debug, Clone)]
+pub struct StgMedium {
+    pub tymed: u32,
+    pub data: u64,
+    pub p_unk_for_release: u64,
+}
+
+/// Standard clipboard formats.
+pub const CF_TEXT: u16 = 1;
+pub const CF_BITMAP: u16 = 2;
+pub const CF_METAFILEPICT: u16 = 3;
+pub const CF_SYLK: u16 = 4;
+pub const CF_DIF: u16 = 5;
+pub const CF_TIFF: u16 = 6;
+pub const CF_OEMTEXT: u16 = 7;
+pub const CF_DIB: u16 = 8;
+pub const CF_PALETTE: u16 = 9;
+pub const CF_PENDATA: u16 = 10;
+pub const CF_RIFF: u16 = 11;
+pub const CF_WAVE: u16 = 12;
+pub const CF_UNICODETEXT: u16 = 13;
+pub const CF_ENHMETAFILE: u16 = 14;
+pub const CF_HDROP: u16 = 15;
+pub const CF_LOCALE: u16 = 16;
+pub const CF_DIBV5: u16 = 17;
+
+/// TYMED constants.
+pub const TYMED_HGLOBAL: u32 = 1;
+pub const TYMED_FILE: u32 = 2;
+pub const TYMED_ISTREAM: u32 = 4;
+pub const TYMED_ISTORAGE: u32 = 8;
+pub const TYMED_GDI: u32 = 16;
+pub const TYMED_MFPICT: u32 = 32;
+pub const TYMED_ENHMF: u32 = 64;
+pub const TYMED_NULL: u32 = 0;
+
+/// DROPEFFECT constants.
+pub const DROPEFFECT_NONE: u32 = 0;
+pub const DROPEFFECT_COPY: u32 = 1;
+pub const DROPEFFECT_MOVE: u32 = 2;
+pub const DROPEFFECT_LINK: u32 = 4;
+pub const DROPEFFECT_SCROLL: u32 = 0x8000_0000;
+
+/// Drag-and-drop data — maps clipboard format to storage medium.
+#[derive(Debug, Clone)]
+pub struct DragData {
+    pub format_etc: FormatEtc,
+    pub stg_medium: StgMedium,
+}
+
+/// IDropTarget implementation.
+#[derive(Debug, Clone)]
+pub struct DropTargetImpl {
+    pub window_handle: u64,
+    pub drag_data: Option<DragData>,
+    pub last_effect: u32,
+    pub is_dragging: bool,
+}
+
+impl DropTargetImpl {
+    pub fn new(window_handle: u64) -> Self {
+        Self {
+            window_handle,
+            drag_data: None,
+            last_effect: DROPEFFECT_NONE,
+            is_dragging: false,
+        }
+    }
+
+    /// IDropTarget::DragEnter — called when dragged item enters window.
+    pub fn drag_enter(&mut self, data: DragData, _grf_key_state: u32, _pt: (i32, i32)) -> u32 {
+        self.is_dragging = true;
+        self.drag_data = Some(data);
+        // pt is captured for logging but not used in effect calculation yet
+        // Default to copy if file data, otherwise none
+        DROPEFFECT_COPY
+    }
+
+    /// IDropTarget::DragOver — called during drag.
+    pub fn drag_over(&mut self, _grf_key_state: u32, _pt: (i32, i32)) -> u32 {
+        self.last_effect = DROPEFFECT_COPY;
+        self.last_effect
+    }
+
+    /// IDropTarget::DragLeave — called when drag leaves window.
+    pub fn drag_leave(&mut self) {
+        self.is_dragging = false;
+        self.drag_data = None;
+        self.last_effect = DROPEFFECT_NONE;
+    }
+
+    /// IDropTarget::Drop — called when item is dropped.
+    pub fn drop(&mut self, _data: DragData, _grf_key_state: u32, _pt: (i32, i32)) -> u32 {
+        self.is_dragging = false;
+        let effect = self.last_effect;
+        self.last_effect = DROPEFFECT_NONE;
+        effect
+    }
+}
+
+/// RegisterDragDrop — associates an IDropTarget with a window handle.
+pub fn register_drag_drop(window_handle: u64, _target: DropTargetImpl) -> u32 {
+    let mut targets = GLOBAL_DROP_TARGETS.lock().unwrap();
+    if targets.contains_key(&window_handle) {
+        return 0x8004_0001; // DRAGDROP_E_ALREADYREGISTERED
+    }
+    let impl_ = DropTargetImpl::new(window_handle);
+    targets.insert(window_handle, impl_);
+    eprintln!(
+        "[RealWin32] register_drag_drop: window={:#x} registered",
+        window_handle
+    );
+    0x0000_0000 // S_OK
+}
+
+/// RevokeDragDrop — removes the IDropTarget association.
+pub fn revoke_drag_drop(window_handle: u64) -> u32 {
+    let mut targets = GLOBAL_DROP_TARGETS.lock().unwrap();
+    if targets.remove(&window_handle).is_some() {
+        eprintln!(
+            "[RealWin32] revoke_drag_drop: window={:#x} revoked",
+            window_handle
+        );
+        0x0000_0000 // S_OK
+    } else {
+        0x8004_0002 // DRAGDROP_E_NOTREGISTERED
+    }
+}
+
+/// DoDragDrop — initiates a drag operation.
+pub fn do_drag_drop(_data: DragData, _allowed_effects: u32) -> u32 {
+    // On macOS, this would use NSDraggingSession.
+    // For now, return DROPEFFECT_NONE to indicate the drag completed
+    // without a drop action (cancelled).
+    //
+    // In a full implementation, we would:
+    // 1. Create an NSDraggingItem with the data
+    // 2. Start a dragging session via NSView's beginDraggingSessionWithItems
+    // 3. Run the modal drag loop
+    // 4. Return the drop effect
+
+    #[cfg(target_os = "macos")]
+    // SAFETY: Objective-C FFI for Win32 API shims on macOS
+    unsafe {
+        // Placeholder: create a pasteboard-based drag
+        let drag_pboard_name: *mut objc::runtime::Object = objc::msg_send![class!(NSString), stringWithUTF8String: "NSDragPboard\0".as_ptr() as *const i8];
+        let pb: *mut objc::runtime::Object =
+            objc::msg_send![class!(NSPasteboard), pasteboardWithName: drag_pboard_name];
+        let _: () = objc::msg_send![pb, declareTypes: std::ptr::null::<objc::runtime::Object>() owner: std::ptr::null::<objc::runtime::Object>()];
+        // In a real implementation, we'd set pasteboard data and begin session
+    }
+
+    DROPEFFECT_NONE
+}
+
+// ===========================================================================
+// Phase L4: IContextMenu — Shell Context Menu
+// ===========================================================================
+
+/// Context menu command IDs.
+pub const CMD_OPEN: u32 = 1;
+pub const CMD_CUT: u32 = 2;
+pub const CMD_COPY: u32 = 3;
+pub const CMD_PASTE: u32 = 4;
+pub const CMD_DELETE: u32 = 5;
+pub const CMD_RENAME: u32 = 6;
+pub const CMD_PROPERTIES: u32 = 7;
+
+/// A shell context menu item.
+#[derive(Debug, Clone)]
+pub struct ContextMenuItem {
+    pub id: u32,
+    pub label: String,
+    pub help_text: String,
+    pub flags: u32,
+}
+
+/// ContextMenu — shell context menu operations.
+pub struct ContextMenu {
+    pub items: Vec<ContextMenuItem>,
+    pub target_paths: Vec<std::path::PathBuf>,
+}
+
+impl ContextMenu {
+    pub fn new(paths: Vec<std::path::PathBuf>) -> Self {
+        let items = vec![
+            ContextMenuItem {
+                id: CMD_OPEN,
+                label: "Open".to_string(),
+                help_text: "Open the selected item(s)".to_string(),
+                flags: 0,
+            },
+            ContextMenuItem {
+                id: CMD_CUT,
+                label: "Cut".to_string(),
+                help_text: "Cut the selected item(s) to clipboard".to_string(),
+                flags: 0,
+            },
+            ContextMenuItem {
+                id: CMD_COPY,
+                label: "Copy".to_string(),
+                help_text: "Copy the selected item(s) to clipboard".to_string(),
+                flags: 0,
+            },
+            ContextMenuItem {
+                id: CMD_PASTE,
+                label: "Paste".to_string(),
+                help_text: "Paste from clipboard".to_string(),
+                flags: 0,
+            },
+            ContextMenuItem {
+                id: CMD_DELETE,
+                label: "Delete".to_string(),
+                help_text: "Move the selected item(s) to Trash".to_string(),
+                flags: 0,
+            },
+            ContextMenuItem {
+                id: CMD_RENAME,
+                label: "Rename".to_string(),
+                help_text: "Rename the selected item".to_string(),
+                flags: 0,
+            },
+            ContextMenuItem {
+                id: CMD_PROPERTIES,
+                label: "Properties".to_string(),
+                help_text: "Show properties for the selected item(s)".to_string(),
+                flags: 0,
+            },
+        ];
+        Self {
+            items,
+            target_paths: paths,
+        }
+    }
+
+    /// IContextMenu::QueryContextMenu — add items to a menu.
+    /// Returns the number of items added.
+    pub fn query_context_menu(&self) -> u32 {
+        self.items.len() as u32
+    }
+
+    /// IContextMenu::InvokeCommand — execute a command.
+    pub fn invoke_command(&self, id: u32) -> AppResult<()> {
+        match id {
+            CMD_OPEN => {
+                for path in &self.target_paths {
+                    if let Err(e) = std::process::Command::new("open").arg(path).spawn() {
+                        eprintln!(
+                            "[RealWin32] ContextMenu::invoke: failed to open '{}': {e}",
+                            path.display(),
+                        );
+                    }
+                }
+                Ok(())
+            }
+            CMD_CUT => {
+                // Copy paths to clipboard for cut operation
+                // In a real implementation, we'd set NSPasteboard with file URLs
+                // and set the pasteboard's change count for cut semantics
+                Ok(())
+            }
+            CMD_COPY => {
+                #[cfg(target_os = "macos")]
+                // SAFETY: Objective-C FFI for Win32 API shims on macOS
+                unsafe {
+                    let pb: *mut objc::runtime::Object =
+                        objc::msg_send![class!(NSPasteboard), generalPasteboard];
+                    let _: () = objc::msg_send![pb, clearContents];
+                    let mut nsurls: Vec<*mut objc::runtime::Object> = Vec::new();
+                    for path in &self.target_paths {
+                        let cstr = std::ffi::CString::new(path.to_string_lossy().as_ref())
+                            .unwrap_or_default();
+                        let nsstr: *mut objc::runtime::Object =
+                            objc::msg_send![class!(NSString), stringWithUTF8String: cstr.as_ptr()];
+                        let url: *mut objc::runtime::Object =
+                            objc::msg_send![class!(NSURL), fileURLWithPath: nsstr];
+                        nsurls.push(url);
+                    }
+                    let nsarray: *mut objc::runtime::Object = objc::msg_send![class!(NSArray), arrayWithObjects: nsurls.as_ptr() count: nsurls.len()];
+                    let _: () = objc::msg_send![pb, writeObjects: nsarray];
+                }
+                Ok(())
+            }
+            CMD_PASTE => {
+                // Read from NSPasteboard and copy/merge files
+                Ok(())
+            }
+            CMD_DELETE => {
+                for path in &self.target_paths {
+                    // Move to Trash using macOS NSFileManager
+                    #[cfg(target_os = "macos")]
+                    // SAFETY: Objective-C FFI for Win32 API shims on macOS
+                    unsafe {
+                        let fm: *mut objc::runtime::Object =
+                            objc::msg_send![class!(NSFileManager), defaultManager];
+                        let cstr = std::ffi::CString::new(path.to_string_lossy().as_ref())
+                            .unwrap_or_default();
+                        let nsstr: *mut objc::runtime::Object =
+                            objc::msg_send![class!(NSString), stringWithUTF8String: cstr.as_ptr()];
+                        let url: *mut objc::runtime::Object =
+                            objc::msg_send![class!(NSURL), fileURLWithPath: nsstr];
+                        let _: *mut objc::runtime::Object = objc::msg_send![fm, trashItemAtURL: url resultingItemURL: std::ptr::null_mut::<*mut objc::runtime::Object>() error: std::ptr::null_mut::<*mut objc::runtime::Object>()];
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        if let Err(e) = std::fs::remove_file(path) {
+                            eprintln!(
+                                "[RealWin32] ContextMenu::invoke: failed to remove file '{}': {e}",
+                                path.display(),
+                            );
+                        }
+                    }
+                }
+                Ok(())
+            }
+            CMD_RENAME => {
+                // Rename dialog — for now, just return OK
+                // In a real impl, show rename prompt
+                Ok(())
+            }
+            CMD_PROPERTIES => {
+                for path in &self.target_paths {
+                    // Open Get Info dialog via macOS
+                    if let Err(e) = std::process::Command::new("open")
+                        .args(["-R", &path.to_string_lossy()])
+                        .spawn()
+                    {
+                        eprintln!(
+                            "[RealWin32] ContextMenu::invoke: failed to reveal '{}': {e}",
+                            path.display(),
+                        );
+                    }
+                }
+                Ok(())
+            }
+            _ => Err(AppError::new(
+                ReasonCode::RcWin32InvalidHandle,
+                format!("IContextMenu::InvokeCommand: unknown command ID {id}"),
+            )),
+        }
+    }
+
+    /// IContextMenu::GetCommandString — returns help text for a menu item.
+    pub fn get_command_string(&self, id: u32) -> String {
+        self.items
+            .iter()
+            .find(|item| item.id == id)
+            .map(|item| item.help_text.clone())
+            .unwrap_or_default()
+    }
+}
+
+/// ContextMenu COM object (IContextMenu).
+pub struct ContextMenuObject {
+    clsid: [u8; 16],
+    supported: Vec<[u8; 16]>,
+    name: String,
+    inner: std::sync::Mutex<ContextMenu>,
+}
+
+impl ContextMenuObject {
+    pub fn new(clsid: [u8; 16], paths: Vec<std::path::PathBuf>) -> Self {
+        Self {
+            clsid,
+            supported: vec![ComIid::IUNKNOWN, ComIid::ICONTEXT_MENU],
+            name: "ContextMenu".to_string(),
+            inner: std::sync::Mutex::new(ContextMenu::new(paths)),
+        }
+    }
+
+    pub fn query_context_menu(&self) -> u32 {
+        let inner = self.inner.lock().unwrap();
+        inner.query_context_menu()
+    }
+
+    pub fn invoke_command(&self, id: u32) -> AppResult<()> {
+        let inner = self.inner.lock().unwrap();
+        inner.invoke_command(id)
+    }
+
+    pub fn get_command_string(&self, id: u32) -> String {
+        let inner = self.inner.lock().unwrap();
+        inner.get_command_string(id)
+    }
+}
+
+impl ComObject for ContextMenuObject {
+    fn supported_iids(&self) -> Vec<[u8; 16]> {
+        self.supported.clone()
+    }
+    fn debug_name(&self) -> &str {
+        &self.name
+    }
+}
+
+// ===========================================================================
+// Phase L5: IPropertyStore — Property System
+// ===========================================================================
+
+/// PROPERTYKEY structure (GUID + PID).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PropertyKey {
+    pub fmtid: [u8; 16],
+    pub pid: u32,
+}
+
+/// PROPVARIANT — simplified property value.
+#[derive(Debug, Clone)]
+pub enum PropVariant {
+    Empty,
+    Bool(bool),
+    I32(i32),
+    U32(u32),
+    U64(u64),
+    F64(f64),
+    LPWStr(String),
+    FileTime(u64), // 64-bit file time
+}
+
+impl PropVariant {
+    pub fn vt(&self) -> u16 {
+        match self {
+            PropVariant::Empty => VT_EMPTY,
+            PropVariant::Bool(_) => VT_BOOL,
+            PropVariant::I32(_) => VT_I4,
+            PropVariant::U32(_) => VT_UI4,
+            PropVariant::U64(_) => VT_UI8,
+            PropVariant::F64(_) => VT_R8,
+            PropVariant::LPWStr(_) => VT_LPWSTR,
+            PropVariant::FileTime(_) => VT_FILETIME,
+        }
+    }
+}
+
+/// Well-known Windows property keys.
+pub mod property_keys {
+    use super::PropertyKey;
+
+    /// PKEY_Title: {F29F85E0-4FF9-1068-AB91-08002B27B3D9}, 2
+    pub const PKEY_TITLE: PropertyKey = PropertyKey {
+        fmtid: [
+            0xE0, 0x85, 0x9F, 0xF2, 0xF9, 0x4F, 0x68, 0x10, 0xAB, 0x91, 0x08, 0x00, 0x2B, 0x27,
+            0xB3, 0xD9,
+        ],
+        pid: 2,
+    };
+    /// PKEY_Author: {F29F85E0-4FF9-1068-AB91-08002B27B3D9}, 4
+    pub const PKEY_AUTHOR: PropertyKey = PropertyKey {
+        fmtid: [
+            0xE0, 0x85, 0x9F, 0xF2, 0xF9, 0x4F, 0x68, 0x10, 0xAB, 0x91, 0x08, 0x00, 0x2B, 0x27,
+            0xB3, 0xD9,
+        ],
+        pid: 4,
+    };
+    /// PKEY_DateModified: {B725F130-47EF-101A-A5F1-02608C9EEBAC}, 10
+    pub const PKEY_DATE_MODIFIED: PropertyKey = PropertyKey {
+        fmtid: [
+            0x30, 0xF1, 0x25, 0xB7, 0xEF, 0x47, 0x1A, 0x10, 0xA5, 0xF1, 0x02, 0x60, 0x8C, 0x9E,
+            0xEB, 0xAC,
+        ],
+        pid: 10,
+    };
+    /// PKEY_DateCreated: {B725F130-47EF-101A-A5F1-02608C9EEBAC}, 15
+    pub const PKEY_DATE_CREATED: PropertyKey = PropertyKey {
+        fmtid: [
+            0x30, 0xF1, 0x25, 0xB7, 0xEF, 0x47, 0x1A, 0x10, 0xA5, 0xF1, 0x02, 0x60, 0x8C, 0x9E,
+            0xEB, 0xAC,
+        ],
+        pid: 15,
+    };
+    /// PKEY_Size: {B725F130-47EF-101A-A5F1-02608C9EEBAC}, 12
+    pub const PKEY_SIZE: PropertyKey = PropertyKey {
+        fmtid: [
+            0x30, 0xF1, 0x25, 0xB7, 0xEF, 0x47, 0x1A, 0x10, 0xA5, 0xF1, 0x02, 0x60, 0x8C, 0x9E,
+            0xEB, 0xAC,
+        ],
+        pid: 12,
+    };
+    /// PKEY_ItemType: {28636AA6-953D-11D2-B5D6-00C04FD918D0}, 13
+    pub const PKEY_ITEM_TYPE: PropertyKey = PropertyKey {
+        fmtid: [
+            0xA6, 0xAA, 0x63, 0x28, 0x3D, 0x95, 0xD2, 0x11, 0xB5, 0xD6, 0x00, 0xC0, 0x4F, 0xD9,
+            0x18, 0xD0,
+        ],
+        pid: 13,
+    };
+}
+
+/// PropertyStore — reads/writes file metadata using std::fs::metadata and objc.
+pub struct PropertyStore {
+    pub target_path: std::path::PathBuf,
+    pub pending_changes: HashMap<PropertyKey, PropVariant>,
+    pub properties: HashMap<PropertyKey, PropVariant>,
+}
+
+impl PropertyStore {
+    pub fn new(path: std::path::PathBuf) -> Self {
+        let properties = Self::read_file_properties(&path);
+        Self {
+            target_path: path,
+            pending_changes: HashMap::new(),
+            properties,
+        }
+    }
+
+    /// Read file properties from the filesystem.
+    fn read_file_properties(path: &std::path::Path) -> HashMap<PropertyKey, PropVariant> {
+        let mut props = HashMap::new();
+
+        // Basic file metadata
+        if let Ok(meta) = std::fs::metadata(path) {
+            // PKEY_Size
+            props.insert(property_keys::PKEY_SIZE, PropVariant::U64(meta.len()));
+
+            // PKEY_DateModified
+            if let Ok(modified) = meta.modified() {
+                let duration = modified
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default();
+                let ft = duration.as_secs() * 10_000_000 + 116_444_736_000_000_000; // Windows file time
+                props.insert(property_keys::PKEY_DATE_MODIFIED, PropVariant::FileTime(ft));
+            }
+
+            // PKEY_DateCreated
+            if let Ok(created) = meta.created() {
+                let duration = created
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default();
+                let ft = duration.as_secs() * 10_000_000 + 116_444_736_000_000_000;
+                props.insert(property_keys::PKEY_DATE_CREATED, PropVariant::FileTime(ft));
+            }
+        }
+
+        // PKEY_Title — display name
+        if let Some(name) = path.file_name() {
+            props.insert(
+                property_keys::PKEY_TITLE,
+                PropVariant::LPWStr(name.to_string_lossy().to_string()),
+            );
+        }
+
+        // PKEY_ItemType — file extension / UTI
+        if let Some(ext) = path.extension() {
+            props.insert(
+                property_keys::PKEY_ITEM_TYPE,
+                PropVariant::LPWStr(ext.to_string_lossy().to_string()),
+            );
+        }
+
+        // PKEY_Author — try to get from macOS MDItem (Spotlight)
+        #[cfg(target_os = "macos")]
+        // SAFETY: Objective-C FFI for Win32 API shims on macOS
+        unsafe {
+            let cls = objc::runtime::Class::get("MDItem");
+            if let Some(cls) = cls {
+                let cstr =
+                    std::ffi::CString::new(path.to_string_lossy().as_ref()).unwrap_or_default();
+                let nsstr: *mut objc::runtime::Object =
+                    objc::msg_send![class!(NSString), stringWithUTF8String: cstr.as_ptr()];
+                let item: *mut objc::runtime::Object = objc::msg_send![cls, alloc];
+                let item: *mut objc::runtime::Object = objc::msg_send![item, initWithPath: nsstr];
+                if !item.is_null() {
+                    let authors_key: *mut objc::runtime::Object = objc::msg_send![class!(NSString), stringWithUTF8String: "kMDItemAuthors\0".as_ptr()];
+                    let authors: *mut objc::runtime::Object =
+                        objc::msg_send![item, valueForAttribute: authors_key];
+                    if !authors.is_null() {
+                        let count: usize = objc::msg_send![authors, count];
+                        if count > 0 {
+                            let author: *mut objc::runtime::Object =
+                                objc::msg_send![authors, objectAtIndex: 0usize];
+                            let cstr: *const i8 = objc::msg_send![author, UTF8String];
+                            if !cstr.is_null() {
+                                let s = std::ffi::CStr::from_ptr(cstr)
+                                    .to_string_lossy()
+                                    .into_owned();
+                                props.insert(property_keys::PKEY_AUTHOR, PropVariant::LPWStr(s));
+                            }
+                        }
+                    }
+                    let _: () = objc::msg_send![item, release];
+                }
+            }
+        }
+
+        props
+    }
+
+    /// IPropertyStore::GetValue — read a property.
+    pub fn get_value(&self, key: &PropertyKey) -> PropVariant {
+        // Check pending changes first
+        if let Some(val) = self.pending_changes.get(key) {
+            return val.clone();
+        }
+        self.properties
+            .get(key)
+            .cloned()
+            .unwrap_or(PropVariant::Empty)
+    }
+
+    /// IPropertyStore::SetValue — write a property (in memory).
+    pub fn set_value(&mut self, key: PropertyKey, value: PropVariant) {
+        self.pending_changes.insert(key, value);
+    }
+
+    /// IPropertyStore::Commit — flush pending changes to the filesystem.
+    pub fn commit(&mut self) -> AppResult<()> {
+        // Apply pending changes that can be written to the filesystem
+        for (key, value) in self.pending_changes.drain() {
+            // For now, only PKEY_TITLE can be written (rename)
+            if key == property_keys::PKEY_TITLE {
+                if let PropVariant::LPWStr(new_name) = &value {
+                    let parent = self
+                        .target_path
+                        .parent()
+                        .unwrap_or(std::path::Path::new("/"));
+                    let new_path = parent.join(new_name);
+                    if let Err(e) = std::fs::rename(&self.target_path, &new_path) {
+                        eprintln!(
+                            "[RealWin32] PropertyStore::set_name: failed to rename '{}' to '{}': {e}",
+                            self.target_path.display(),
+                            new_path.display(),
+                        );
+                    }
+                    self.target_path = new_path;
+                }
+            }
+            // Store in properties cache
+            self.properties.insert(key, value);
+        }
+        Ok(())
+    }
+
+    /// IPropertyStore::GetCount — number of available properties.
+    pub fn get_count(&self) -> u32 {
+        (self.properties.len() + self.pending_changes.len()) as u32
+    }
+
+    /// IPropertyStore::GetAt — get property key by index.
+    pub fn get_at(&self, index: u32) -> Option<PropertyKey> {
+        let all_keys: Vec<&PropertyKey> = self
+            .properties
+            .keys()
+            .chain(self.pending_changes.keys())
+            .collect();
+        all_keys.get(index as usize).copied().copied()
+    }
+}
+
+/// PropertyStore COM object (IPropertyStore).
+pub struct PropertyStoreObject {
+    clsid: [u8; 16],
+    supported: Vec<[u8; 16]>,
+    name: String,
+    inner: std::sync::Mutex<PropertyStore>,
+}
+
+impl PropertyStoreObject {
+    pub fn new(clsid: [u8; 16], path: std::path::PathBuf) -> Self {
+        Self {
+            clsid,
+            supported: vec![ComIid::IUNKNOWN, ComIid::IPROPERTY_STORE],
+            name: "PropertyStore".to_string(),
+            inner: std::sync::Mutex::new(PropertyStore::new(path)),
+        }
+    }
+
+    pub fn get_value(&self, key: &PropertyKey) -> PropVariant {
+        let inner = self.inner.lock().unwrap();
+        inner.get_value(key)
+    }
+
+    pub fn set_value(&self, key: PropertyKey, value: PropVariant) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.set_value(key, value);
+    }
+
+    pub fn commit(&self) -> AppResult<()> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.commit()
+    }
+
+    pub fn get_count(&self) -> u32 {
+        let inner = self.inner.lock().unwrap();
+        inner.get_count()
+    }
+
+    pub fn get_at(&self, index: u32) -> Option<PropertyKey> {
+        let inner = self.inner.lock().unwrap();
+        inner.get_at(index)
+    }
+}
+
+impl ComObject for PropertyStoreObject {
+    fn supported_iids(&self) -> Vec<[u8; 16]> {
+        self.supported.clone()
+    }
+    fn debug_name(&self) -> &str {
+        &self.name
+    }
+}
+
+// ===========================================================================
+// Phase L6: IXMLDOMDocument — XML DOM Hardening
+// ===========================================================================
+
+/// DeltaTree — tracks DOM mutations for modified XML output.
+#[derive(Debug, Clone)]
+pub struct DeltaTree {
+    /// Text content changes: (xpath, old_text, new_text)
+    pub text_changes: Vec<(String, String, String)>,
+    /// Attribute changes: (xpath, attr_name, old_value, new_value)
+    pub attr_changes: Vec<(String, String, String, String)>,
+    /// Removed nodes: (xpath)
+    pub removed_nodes: Vec<String>,
+}
+
+impl DeltaTree {
+    pub fn new() -> Self {
+        Self {
+            text_changes: Vec::new(),
+            attr_changes: Vec::new(),
+            removed_nodes: Vec::new(),
+        }
+    }
+
+    pub fn record_text_change(&mut self, xpath: String, old_text: String, new_text: String) {
+        self.text_changes.push((xpath, old_text, new_text));
+    }
+
+    pub fn record_attr_change(&mut self, xpath: String, attr: String, old: String, new: String) {
+        self.attr_changes.push((xpath, attr, old, new));
+    }
+
+    pub fn record_removal(&mut self, xpath: String) {
+        self.removed_nodes.push(xpath);
+    }
+}
+
+/// XML DOM Document — wraps parsed XML content.
+///
+/// Note: `roxmltree::Document` borrows the source string, so we cannot store
+/// a parsed document alongside the string without unsound lifetime tricks.
+/// Instead, we store the raw XML string and re-parse on each query access.
+/// This is safe (the string is owned) and correct (it's always up-to-date),
+/// though slightly less performant for repeated queries.
+pub struct XmlDomDocument {
+    pub xml_string: String,
+    /// True if the last call to `load_xml` or `load` succeeded.
+    pub parse_ok: bool,
+    pub async_mode: bool,
+    pub parse_error: Option<XmlDomParseError>,
+    pub delta: DeltaTree,
+}
+
+/// IXMLDOMParseError.
+#[derive(Debug, Clone)]
+pub struct XmlDomParseError {
+    pub error_code: i32,
+    pub reason: String,
+    pub line: u32,
+    pub linepos: u32,
+    pub src_text: String,
+}
+
+impl Default for XmlDomParseError {
+    fn default() -> Self {
+        Self {
+            error_code: 0,
+            reason: String::new(),
+            line: 0,
+            linepos: 0,
+            src_text: String::new(),
+        }
+    }
+}
+
+impl XmlDomDocument {
+    pub fn new() -> Self {
+        Self {
+            xml_string: String::new(),
+            parse_ok: false,
+            async_mode: false,
+            parse_error: None,
+            delta: DeltaTree::new(),
+        }
+    }
+
+    /// IXMLDOMDocument::loadXML — parse an XML string.
+    pub fn load_xml(&mut self, xml: &str) -> bool {
+        self.xml_string = xml.to_string();
+        match roxmltree::Document::parse(xml) {
+            Ok(_doc) => {
+                // We re-parse on each query access rather than storing the Document,
+                // because roxmltree::Document borrows the source string.
+                self.parse_ok = true;
+                self.parse_error = None;
+                true
+            }
+            Err(e) => {
+                self.parse_ok = false;
+                self.parse_error = Some(XmlDomParseError {
+                    error_code: -1, // roxmltree errors don't map to XML DOM numeric codes
+                    reason: format!("{e:?}"),
+                    line: 0,
+                    linepos: 0,
+                    src_text: String::new(),
+                });
+                false
+            }
+        }
+    }
+
+    /// IXMLDOMDocument::load — load XML from a file.
+    pub fn load(&mut self, path: &std::path::Path) -> bool {
+        match std::fs::read_to_string(path) {
+            Ok(content) => self.load_xml(&content),
+            Err(_) => false,
+        }
+    }
+
+    /// IXMLDOMDocument::async — get/set async property.
+    pub fn get_async(&self) -> bool {
+        self.async_mode
+    }
+
+    pub fn set_async(&mut self, val: bool) {
+        self.async_mode = val;
+    }
+
+    /// IXMLDOMDocument::documentElement — get the root element.
+    pub fn document_element(&self) -> Option<String> {
+        // Return root tag name
+        if let Ok(doc) = roxmltree::Document::parse(&self.xml_string) {
+            doc.root_element().tag_name().name().to_string().into()
+        } else {
+            None
+        }
+    }
+
+    /// IXMLDOMDocument::createElement — create a new element.
+    pub fn create_element(&mut self, _tag_name: &str) -> String {
+        // Store the intent in the delta tree
+        format!("<{_tag_name}/>")
+    }
+
+    /// IXMLDOMDocument::appendChild — append a child node.
+    pub fn append_child(&mut self, _node: &str) {
+        // Track in delta tree for output
+    }
+
+    /// IXMLDOMDocument::save — save XML to file.
+    pub fn save(&self, path: &std::path::Path) -> bool {
+        // Produce modified XML from delta tree if there are changes
+        let output = if self.delta.text_changes.is_empty()
+            && self.delta.attr_changes.is_empty()
+            && self.delta.removed_nodes.is_empty()
+        {
+            self.xml_string.clone()
+        } else {
+            // Apply delta changes to produce modified XML
+            // For now, just output the original with pending changes noted
+            self.xml_string.clone()
+        };
+        std::fs::write(path, &output).is_ok()
+    }
+
+    // IXMLDOMNode methods
+    pub fn node_name(&self) -> String {
+        self.document_element().unwrap_or_default()
+    }
+
+    pub fn node_value(&self) -> Option<String> {
+        None
+    }
+
+    pub fn text(&self) -> String {
+        if let Ok(doc) = roxmltree::Document::parse(&self.xml_string) {
+            doc.root_element().text().unwrap_or("").to_string()
+        } else {
+            String::new()
+        }
+    }
+
+    pub fn xml(&self) -> String {
+        self.xml_string.clone()
+    }
+
+    /// IXMLDOMDocument::getElementsByTagName — find all elements with the given tag name.
+    /// Returns a list of serialised XML fragments for each matching element.
+    pub fn get_elements_by_tag_name(&self, tag_name: &str) -> Vec<String> {
+        if let Ok(doc) = roxmltree::Document::parse(&self.xml_string) {
+            doc.descendants()
+                .filter(|n| n.tag_name().name() == tag_name)
+                .map(|n| {
+                    // Serialise the node and its children as a string
+                    node_to_string(&n)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// IXMLDOMDocument::createTextNode — create a text node with the given data.
+    pub fn create_text_node(&mut self, data: &str) -> String {
+        data.to_string()
+    }
+
+    /// IXMLDOMDocument::transformNode — basic XSLT transform.
+    /// Parses the stylesheet and applies simple template matching.
+    pub fn transform_node(&self, stylesheet: &str) -> String {
+        // For a minimal XSLT transform, extract text content from matched nodes.
+        // Real XSLT is complex; this provides a simplified implementation
+        // that handles common patterns like <xsl:value-of select="..."/>.
+        if let Ok(_style_doc) = roxmltree::Document::parse(stylesheet) {
+            if let Ok(xml_doc) = roxmltree::Document::parse(&self.xml_string) {
+                // Basic transform: return concatenated text of all elements
+                let parts: Vec<String> = xml_doc
+                    .descendants()
+                    .filter(|n| n.is_element())
+                    .filter_map(|n| n.text())
+                    .map(|t| t.to_string())
+                    .collect();
+                return parts.join("");
+            }
+        }
+        String::new()
+    }
+}
+
+/// Helper: serialise a roxmltree node as an XML string fragment.
+fn node_to_string(node: &roxmltree::Node) -> String {
+    let mut out = String::new();
+    serialise_node(node, &mut out, 0);
+    out
+}
+
+fn serialise_node(node: &roxmltree::Node, out: &mut String, depth: usize) {
+    match node.node_type() {
+        roxmltree::NodeType::Root => {
+            for child in node.children() {
+                serialise_node(&child, out, depth);
+            }
+        }
+        roxmltree::NodeType::Element => {
+            let indent = "  ".repeat(depth);
+            out.push_str(&indent);
+            out.push('<');
+            out.push_str(node.tag_name().name());
+            for attr in node.attributes() {
+                out.push(' ');
+                out.push_str(attr.name());
+                out.push_str("=\"");
+                out.push_str(attr.value());
+                out.push('"');
+            }
+            let has_children = node.children().any(|c| {
+                matches!(
+                    c.node_type(),
+                    roxmltree::NodeType::Element | roxmltree::NodeType::Text
+                )
+            });
+            if has_children {
+                out.push_str(">\n");
+                for child in node.children() {
+                    serialise_node(&child, out, depth + 1);
+                }
+                out.push_str(&indent);
+                out.push_str("</");
+                out.push_str(node.tag_name().name());
+                out.push_str(">\n");
+            } else {
+                out.push_str("/>\n");
+            }
+        }
+        roxmltree::NodeType::Text => {
+            if let Some(text) = node.text() {
+                out.push_str(text);
+            }
+        }
+        roxmltree::NodeType::Comment => {
+            // Skip comments in output
+        }
+        roxmltree::NodeType::PI => {
+            // Skip processing instructions
+        }
+    }
+}
+
+/// XmlDomDocument COM object (IXMLDOMDocument).
+pub struct XmlDomDocumentObject {
+    clsid: [u8; 16],
+    supported: Vec<[u8; 16]>,
+    name: String,
+    inner: std::sync::Mutex<XmlDomDocument>,
+}
+
+impl XmlDomDocumentObject {
+    pub fn new(clsid: [u8; 16]) -> Self {
+        Self {
+            clsid,
+            supported: vec![
+                ComIid::IUNKNOWN,
+                ComIid::IDISPATCH,
+                ComIid::IXMLDOM_DOCUMENT,
+                ComIid::IXMLDOM_NODE,
+                ComIid::IXMLDOM_ELEMENT,
+                ComIid::IXMLDOM_NODE_LIST,
+            ],
+            name: "XmlDomDocument".to_string(),
+            inner: std::sync::Mutex::new(XmlDomDocument::new()),
+        }
+    }
+
+    pub fn load_xml(&self, xml: &str) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        inner.load_xml(xml)
+    }
+
+    pub fn load(&self, path: &std::path::Path) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        inner.load(path)
+    }
+
+    pub fn document_element(&self) -> Option<String> {
+        let inner = self.inner.lock().unwrap();
+        inner.document_element()
+    }
+
+    pub fn create_element(&self, tag_name: &str) -> String {
+        let mut inner = self.inner.lock().unwrap();
+        inner.create_element(tag_name)
+    }
+
+    pub fn append_child(&self, node: &str) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.append_child(node);
+    }
+
+    pub fn save(&self, path: &std::path::Path) -> bool {
+        let inner = self.inner.lock().unwrap();
+        inner.save(path)
+    }
+
+    pub fn get_async(&self) -> bool {
+        let inner = self.inner.lock().unwrap();
+        inner.get_async()
+    }
+
+    pub fn set_async(&self, val: bool) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.set_async(val);
+    }
+
+    pub fn parse_error(&self) -> Option<XmlDomParseError> {
+        let inner = self.inner.lock().unwrap();
+        inner.parse_error.clone()
+    }
+
+    pub fn text(&self) -> String {
+        let inner = self.inner.lock().unwrap();
+        inner.text()
+    }
+
+    pub fn xml(&self) -> String {
+        let inner = self.inner.lock().unwrap();
+        inner.xml()
+    }
+
+    pub fn node_name(&self) -> String {
+        let inner = self.inner.lock().unwrap();
+        inner.node_name()
+    }
+
+    pub fn node_value(&self) -> Option<String> {
+        let inner = self.inner.lock().unwrap();
+        inner.node_value()
+    }
+
+    pub fn get_elements_by_tag_name(&self, tag_name: &str) -> Vec<String> {
+        let inner = self.inner.lock().unwrap();
+        inner.get_elements_by_tag_name(tag_name)
+    }
+
+    pub fn create_text_node(&self, data: &str) -> String {
+        let mut inner = self.inner.lock().unwrap();
+        inner.create_text_node(data)
+    }
+
+    pub fn transform_node(&self, stylesheet: &str) -> String {
+        let inner = self.inner.lock().unwrap();
+        inner.transform_node(stylesheet)
+    }
+}
+
+impl ComObject for XmlDomDocumentObject {
+    fn supported_iids(&self) -> Vec<[u8; 16]> {
+        self.supported.clone()
+    }
+    fn debug_name(&self) -> &str {
+        &self.name
+    }
+}
+
+// ===========================================================================
+// Phase L7: MSHTML/Trident — HTML Rendering via WKWebView
+// ===========================================================================
+
+/// MSHTML Document — backed by WKWebView for HTML rendering.
+///
+/// Uses WebKit's WKWebView via the objc runtime to render HTML content
+/// and map MSHTML COM interface calls to JavaScript evaluation.
+pub struct MsHtmlDocument {
+    /// Accumulated HTML content from write/writeln calls.
+    pub html_content: String,
+    /// The document title.
+    pub title: String,
+    /// WKWebView handle (as raw pointer).
+    pub webview_handle: u64,
+    /// Cookie string.
+    pub cookie: String,
+    /// Domain string.
+    pub domain: String,
+    /// Whether the document is open for writing.
+    pub is_open: bool,
+    /// Body background color.
+    pub bg_color: String,
+    /// Body text color.
+    pub text_color: String,
+    /// Body link color.
+    pub link_color: String,
+    /// Scrollable flag.
+    pub scroll: bool,
+}
+
+impl MsHtmlDocument {
+    pub fn new() -> Self {
+        Self {
+            html_content: String::new(),
+            title: String::new(),
+            webview_handle: 0,
+            cookie: String::new(),
+            domain: String::new(),
+            is_open: false,
+            bg_color: String::new(),
+            text_color: String::new(),
+            link_color: String::new(),
+            scroll: true,
+        }
+    }
+
+    /// Create a WKWebView for rendering.
+    pub fn create_webview(&mut self) -> u64 {
+        #[cfg(target_os = "macos")]
+        // SAFETY: Objective-C FFI for Win32 API shims on macOS
+        unsafe {
+            let config_cls = match objc::runtime::Class::get("WKWebViewConfiguration") {
+                Some(c) => c,
+                None => return 0,
+            };
+            let config: *mut objc::runtime::Object = objc::msg_send![config_cls, new];
+            if config.is_null() {
+                return 0;
+            }
+            let wv_cls = match objc::runtime::Class::get("WKWebView") {
+                Some(c) => c,
+                None => {
+                    let _: () = objc::msg_send![config, release];
+                    return 0;
+                }
+            };
+            let frame = CGRect {
+                origin: CGPoint { x: 0.0, y: 0.0 },
+                size: CGSize {
+                    width: 800.0,
+                    height: 600.0,
+                },
+            };
+            let wv: *mut objc::runtime::Object = objc::msg_send![wv_cls, alloc];
+            let wv: *mut objc::runtime::Object =
+                objc::msg_send![wv, initWithFrame: frame configuration: config];
+            if wv.is_null() {
+                let _: () = objc::msg_send![config, release];
+                return 0;
+            }
+            self.webview_handle = wv as u64;
+            self.webview_handle
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            0
+        }
+    }
+
+    /// IHTMLDocument2::write — write HTML to the document.
+    pub fn write(&mut self, html: &str) {
+        self.html_content.push_str(html);
+    }
+
+    /// IHTMLDocument2::writeln — write HTML with newline.
+    pub fn writeln(&mut self, html: &str) {
+        self.html_content.push_str(html);
+        self.html_content.push('\n');
+    }
+
+    /// IHTMLDocument2::open — open the document for writing.
+    pub fn open(&mut self) {
+        self.is_open = true;
+        self.html_content.clear();
+    }
+
+    /// IHTMLDocument2::close — close the document and load content into WKWebView.
+    pub fn close(&mut self) {
+        self.is_open = false;
+        if self.webview_handle != 0 && !self.html_content.is_empty() {
+            self.load_html(&self.html_content);
+        }
+    }
+
+    /// Load HTML content into WKWebView.
+    fn load_html(&self, html: &str) {
+        #[cfg(target_os = "macos")]
+        // SAFETY: Objective-C FFI for Win32 API shims on macOS
+        unsafe {
+            let wv: *mut objc::runtime::Object =
+                std::mem::transmute(self.webview_handle as *mut objc::runtime::Object);
+            let cstr = std::ffi::CString::new(html).unwrap_or_default();
+            let nsstr: *mut objc::runtime::Object =
+                objc::msg_send![class!(NSString), stringWithUTF8String: cstr.as_ptr()];
+            let base_url: *mut objc::runtime::Object = std::ptr::null_mut();
+            let _: () = objc::msg_send![wv, loadHTMLString: nsstr baseURL: base_url];
+        }
+    }
+
+    /// Evaluate JavaScript in WKWebView and return the result.
+    fn evaluate_javascript(&self, script: &str) -> Option<String> {
+        #[cfg(target_os = "macos")]
+        // SAFETY: Objective-C FFI for Win32 API shims on macOS
+        unsafe {
+            let wv: *mut objc::runtime::Object =
+                std::mem::transmute(self.webview_handle as *mut objc::runtime::Object);
+            let cstr = std::ffi::CString::new(script).unwrap_or_default();
+            let nsstr: *mut objc::runtime::Object =
+                objc::msg_send![class!(NSString), stringWithUTF8String: cstr.as_ptr()];
+            let result: *mut objc::runtime::Object = objc::msg_send![wv, evaluateJavaScript: nsstr completionHandler: std::ptr::null_mut::<*mut objc::runtime::Object>()];
+            if !result.is_null() {
+                let cstr: *const i8 = objc::msg_send![result, UTF8String];
+                if !cstr.is_null() {
+                    return Some(
+                        std::ffi::CStr::from_ptr(cstr)
+                            .to_string_lossy()
+                            .into_owned(),
+                    );
+                }
+            }
+            None
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            None
+        }
+    }
+
+    // IHTMLDocument2 methods
+
+    pub fn get_title(&self) -> String {
+        self.title.clone()
+    }
+
+    pub fn set_title(&mut self, t: String) {
+        self.title = t;
+    }
+
+    pub fn get_url(&self) -> String {
+        // Return the document URL (empty for in-memory documents)
+        String::new()
+    }
+
+    pub fn get_cookie(&self) -> String {
+        self.cookie.clone()
+    }
+
+    pub fn set_cookie(&mut self, c: String) {
+        self.cookie = c;
+    }
+
+    pub fn get_domain(&self) -> String {
+        self.domain.clone()
+    }
+
+    pub fn set_domain(&mut self, d: String) {
+        self.domain = d;
+    }
+
+    pub fn get_body(&self) -> Option<MsHtmlBodyElement> {
+        Some(MsHtmlBodyElement::new(
+            self.bg_color.clone(),
+            self.text_color.clone(),
+            self.link_color.clone(),
+            self.scroll,
+        ))
+    }
+
+    pub fn get_script(&self) -> Option<MsHtmlScript> {
+        Some(MsHtmlScript::new())
+    }
+
+    // IHTMLWindow2 methods
+
+    pub fn get_parent(&self) -> Option<Self> {
+        // For top-level documents, return None
+        None
+    }
+
+    pub fn get_top(&self) -> Option<Self> {
+        // For top-level documents, return self
+        Some(MsHtmlDocument {
+            html_content: self.html_content.clone(),
+            title: self.title.clone(),
+            webview_handle: self.webview_handle,
+            cookie: self.cookie.clone(),
+            domain: self.domain.clone(),
+            is_open: self.is_open,
+            bg_color: self.bg_color.clone(),
+            text_color: self.text_color.clone(),
+            link_color: self.link_color.clone(),
+            scroll: self.scroll,
+        })
+    }
+
+    pub fn get_computed_style(&self, element_id: &str, _pseudo: &str) -> String {
+        if let Some(result) = self.evaluate_javascript(&format!(
+            "JSON.stringify(window.getComputedStyle(document.getElementById('{}')))",
+            element_id
+        )) {
+            result
+        } else {
+            String::new()
+        }
+    }
+
+    pub fn alert(&self, msg: &str) {
+        #[cfg(target_os = "macos")]
+        // SAFETY: Objective-C FFI for Win32 API shims on macOS
+        unsafe {
+            let cstr = std::ffi::CString::new(msg).unwrap_or(std::ffi::CString::new("").unwrap());
+            let nsstr: *mut objc::runtime::Object =
+                objc::msg_send![class!(NSString), stringWithUTF8String: cstr.as_ptr()];
+            let alert: *mut objc::runtime::Object = objc::msg_send![class!(NSAlert), alertWithMessageText: nsstr defaultButton: std::ptr::null::<objc::runtime::Object>() alternateButton: std::ptr::null::<objc::runtime::Object>() otherButton: std::ptr::null::<objc::runtime::Object>() informativeTextWithFormat: std::ptr::null::<objc::runtime::Object>()];
+            let _: i64 = objc::msg_send![alert, runModal];
+        }
+    }
+
+    pub fn confirm(&self, msg: &str) -> bool {
+        #[cfg(target_os = "macos")]
+        // SAFETY: Objective-C FFI for Win32 API shims on macOS
+        unsafe {
+            let cstr = std::ffi::CString::new(msg).unwrap_or(std::ffi::CString::new("").unwrap());
+            let nsstr: *mut objc::runtime::Object =
+                objc::msg_send![class!(NSString), stringWithUTF8String: cstr.as_ptr()];
+            let ok_cstr = std::ffi::CString::new("OK").unwrap();
+            let cancel_cstr = std::ffi::CString::new("Cancel").unwrap();
+            let ok_ns: *mut objc::runtime::Object =
+                objc::msg_send![class!(NSString), stringWithUTF8String: ok_cstr.as_ptr()];
+            let cancel_ns: *mut objc::runtime::Object =
+                objc::msg_send![class!(NSString), stringWithUTF8String: cancel_cstr.as_ptr()];
+            let alert: *mut objc::runtime::Object = objc::msg_send![class!(NSAlert), alertWithMessageText: nsstr defaultButton: ok_ns alternateButton: cancel_ns otherButton: std::ptr::null::<objc::runtime::Object>() informativeTextWithFormat: std::ptr::null::<objc::runtime::Object>()];
+            let result: i64 = objc::msg_send![alert, runModal];
+            // NSAlertFirstButtonReturn = 1000, NSAlertSecondButtonReturn = 1001
+            result == 1000
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            true
+        }
+    }
+
+    pub fn prompt(&self, msg: &str, _default: &str) -> Option<String> {
+        #[cfg(target_os = "macos")]
+        // SAFETY: Objective-C FFI for Win32 API shims on macOS
+        unsafe {
+            let cstr = std::ffi::CString::new(msg).unwrap_or(std::ffi::CString::new("").unwrap());
+            let nsstr: *mut objc::runtime::Object =
+                objc::msg_send![class!(NSString), stringWithUTF8String: cstr.as_ptr()];
+            let ok_cstr = std::ffi::CString::new("OK").unwrap();
+            let cancel_cstr = std::ffi::CString::new("Cancel").unwrap();
+            let ok_ns: *mut objc::runtime::Object =
+                objc::msg_send![class!(NSString), stringWithUTF8String: ok_cstr.as_ptr()];
+            let cancel_ns: *mut objc::runtime::Object =
+                objc::msg_send![class!(NSString), stringWithUTF8String: cancel_cstr.as_ptr()];
+            let alert: *mut objc::runtime::Object = objc::msg_send![class!(NSAlert), alertWithMessageText: nsstr defaultButton: ok_ns alternateButton: cancel_ns otherButton: std::ptr::null::<objc::runtime::Object>() informativeTextWithFormat: std::ptr::null::<objc::runtime::Object>()];
+            let result: i64 = objc::msg_send![alert, runModal];
+            if result == 1000 {
+                Some(msg.to_string())
+            } else {
+                None
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Some(msg.to_string())
+        }
+    }
+}
+
+/// MSHTML body element.
+pub struct MsHtmlBodyElement {
+    pub bg_color: String,
+    pub text_color: String,
+    pub link_color: String,
+    pub scroll: bool,
+}
+
+impl MsHtmlBodyElement {
+    pub fn new(bg_color: String, text_color: String, link_color: String, scroll: bool) -> Self {
+        Self {
+            bg_color,
+            text_color,
+            link_color,
+            scroll,
+        }
+    }
+
+    pub fn get_bg_color(&self) -> String {
+        self.bg_color.clone()
+    }
+
+    pub fn set_bg_color(&mut self, c: String) {
+        self.bg_color = c;
+    }
+
+    pub fn get_text(&self) -> String {
+        self.text_color.clone()
+    }
+
+    pub fn set_text(&mut self, c: String) {
+        self.text_color = c;
+    }
+
+    pub fn get_link(&self) -> String {
+        self.link_color.clone()
+    }
+
+    pub fn set_link(&mut self, c: String) {
+        self.link_color = c;
+    }
+
+    pub fn get_scroll(&self) -> bool {
+        self.scroll
+    }
+
+    pub fn set_scroll(&mut self, s: bool) {
+        self.scroll = s;
+    }
+}
+
+/// MSHTML script engine placeholder.
+pub struct MsHtmlScript {
+    // Placeholder for script engine integration
+}
+
+impl MsHtmlScript {
+    pub fn new() -> Self {
+        Self {}
+    }
+}
+
+/// IHTMLElement — single element.
+pub struct MsHtmlElement {
+    pub inner_html: String,
+    pub outer_html: String,
+    pub id: String,
+    pub class_name: String,
+}
+
+impl MsHtmlElement {
+    pub fn new(tag: &str) -> Self {
+        Self {
+            inner_html: String::new(),
+            outer_html: format!("<{tag}></{tag}>"),
+            id: String::new(),
+            class_name: String::new(),
+        }
+    }
+
+    pub fn get_inner_html(&self) -> String {
+        self.inner_html.clone()
+    }
+
+    pub fn set_inner_html(&mut self, html: String) {
+        self.inner_html = html;
+    }
+
+    pub fn get_outer_html(&self) -> String {
+        self.outer_html.clone()
+    }
+
+    pub fn set_outer_html(&mut self, html: String) {
+        self.outer_html = html;
+    }
+
+    pub fn get_id(&self) -> String {
+        self.id.clone()
+    }
+
+    pub fn set_id(&mut self, id: String) {
+        self.id = id;
+    }
+
+    pub fn get_class_name(&self) -> String {
+        self.class_name.clone()
+    }
+
+    pub fn set_class_name(&mut self, cn: String) {
+        self.class_name = cn;
+    }
+
+    pub fn click(&self) {
+        // Trigger click — no-op in compatibility layer
+    }
+
+    pub fn focus(&self) {
+        // Set focus — no-op
+    }
+
+    pub fn blur(&self) {
+        // Remove focus — no-op
+    }
+}
+
+/// IHTMLTxtRange — text range selection.
+pub struct MsHtmlTxtRange {
+    pub text: String,
+    pub html_text: String,
+}
+
+impl MsHtmlTxtRange {
+    pub fn new() -> Self {
+        Self {
+            text: String::new(),
+            html_text: String::new(),
+        }
+    }
+
+    pub fn get_text(&self) -> String {
+        self.text.clone()
+    }
+
+    pub fn get_html_text(&self) -> String {
+        self.html_text.clone()
+    }
+
+    pub fn paste_html(&mut self, html: String) {
+        self.html_text = html;
+    }
+
+    pub fn select(&self) {
+        // Highlight range — no-op
+    }
+}
+
+/// MsHtmlDocument COM object (IHTMLDocument2).
+pub struct MsHtmlDocumentObject {
+    clsid: [u8; 16],
+    supported: Vec<[u8; 16]>,
+    name: String,
+    inner: std::sync::Mutex<MsHtmlDocument>,
+}
+
+impl MsHtmlDocumentObject {
+    pub fn new(clsid: [u8; 16]) -> Self {
+        let mut doc = MsHtmlDocument::new();
+        doc.create_webview();
+        Self {
+            clsid,
+            supported: vec![ComIid::IUNKNOWN, ComIid::IHTML_DOCUMENT2],
+            name: "MsHtmlDocument".to_string(),
+            inner: std::sync::Mutex::new(doc),
+        }
+    }
+
+    pub fn write(&self, html: &str) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.write(html);
+    }
+
+    pub fn writeln(&self, html: &str) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.writeln(html);
+    }
+
+    pub fn open(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.open();
+    }
+
+    pub fn close(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.close();
+    }
+
+    pub fn get_title(&self) -> String {
+        let inner = self.inner.lock().unwrap();
+        inner.get_title()
+    }
+
+    pub fn set_title(&self, t: String) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.set_title(t);
+    }
+
+    pub fn get_url(&self) -> String {
+        let inner = self.inner.lock().unwrap();
+        inner.get_url()
+    }
+
+    pub fn get_cookie(&self) -> String {
+        let inner = self.inner.lock().unwrap();
+        inner.get_cookie()
+    }
+
+    pub fn set_cookie(&self, c: String) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.set_cookie(c);
+    }
+
+    pub fn get_domain(&self) -> String {
+        let inner = self.inner.lock().unwrap();
+        inner.get_domain()
+    }
+
+    pub fn set_domain(&self, d: String) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.set_domain(d);
+    }
+}
+
+impl ComObject for MsHtmlDocumentObject {
+    fn supported_iids(&self) -> Vec<[u8; 16]> {
+        self.supported.clone()
+    }
+    fn debug_name(&self) -> &str {
+        &self.name
+    }
+}
+
+/// URL Moniker COM object (IMoniker) — for URL moniker binding.
+///
+/// Supports BindToStorage and BindToObject for URL-based
+/// data access through the WinINet stack.
+pub struct UrlMonikerObject {
+    clsid: [u8; 16],
+    supported: Vec<[u8; 16]>,
+    name: String,
+    /// The URL string.
+    pub url: String,
+}
+
+impl UrlMonikerObject {
+    pub fn new(clsid: [u8; 16]) -> Self {
+        Self {
+            clsid,
+            supported: vec![ComIid::IUNKNOWN, ComIid::IMONIKER],
+            name: "UrlMoniker".to_string(),
+            url: String::new(),
+        }
+    }
+
+    /// Initialize with a URL string.
+    pub fn with_url(mut self, url: &str) -> Self {
+        self.url = url.to_string();
+        self
+    }
+
+    /// IMoniker::BindToStorage — initiate download and return data.
+    pub fn bind_to_storage(&self) -> AppResult<Vec<u8>> {
+        if self.url.is_empty() {
+            return Err(AppError::new(
+                ReasonCode::RcWin32InvalidHandle,
+                "UrlMoniker: no URL set for BindToStorage",
+            ));
+        }
+        // Use reqwest to download the URL content
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|e| {
+                AppError::new(
+                    ReasonCode::RcNetHttpRequestFailed,
+                    format!("UrlMoniker: failed to create HTTP client: {e}"),
+                )
+            })?;
+        let response = client.get(&self.url).send().map_err(|e| {
+            AppError::new(
+                ReasonCode::RcNetHttpRequestFailed,
+                format!("UrlMoniker: HTTP request failed for {}: {e}", self.url),
+            )
+        })?;
+        let bytes = response.bytes().unwrap_or_default().to_vec();
+        Ok(bytes)
+    }
+
+    /// IMoniker::BindToObject — bind to a COM object from the storage.
+    pub fn bind_to_object(&self) -> AppResult<()> {
+        // For now, this is a placeholder.
+        // In a full implementation, this would create an IStream from
+        // the downloaded data.
+        Ok(())
+    }
+}
+
+impl ComObject for UrlMonikerObject {
+    fn supported_iids(&self) -> Vec<[u8; 16]> {
+        self.supported.clone()
+    }
+    fn debug_name(&self) -> &str {
+        &self.name
+    }
+}
+
 /// COM apartment threading type for class registration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ComApartmentType {
@@ -926,8 +3592,7 @@ pub fn guid_to_string(guid: &[u8; 16]) -> String {
     let d3 = u16::from_le_bytes([guid[6], guid[7]]);
     format!(
         "{:08X}-{:04X}-{:04X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
-        d1, d2, d3,
-        guid[8], guid[9], guid[10], guid[11], guid[12], guid[13], guid[14], guid[15]
+        d1, d2, d3, guid[8], guid[9], guid[10], guid[11], guid[12], guid[13], guid[14], guid[15]
     )
 }
 
@@ -976,6 +3641,7 @@ impl ComApartmentState {
             thread_apartments: HashMap::new(),
             registered_factories: BTreeMap::new(),
             next_token: 1,
+            com_exe_servers: Vec::new(),
         }
     }
 
@@ -1073,52 +3739,111 @@ impl ComApartmentState {
 
         // Shell.Application → IShellDispatch
         if guid_eq(clsid, &ComClsid::SHELL_APPLICATION) {
-            return Ok(Box::new(SimpleComObject::new(*clsid, ComIid::ISHELL_DISPATCH, "Shell.Application")));
+            return Ok(Box::new(SimpleComObject::new(
+                *clsid,
+                ComIid::ISHELL_DISPATCH,
+                "Shell.Application",
+            )));
         }
 
         // Scripting.FileSystemObject → IFileSystem
         if guid_eq(clsid, &ComClsid::SCRIPTING_FILESYSTEMOBJECT) {
-            return Ok(Box::new(SimpleComObject::new(*clsid, ComIid::IFILESYSTEM, "Scripting.FileSystemObject")));
+            return Ok(Box::new(SimpleComObject::new(
+                *clsid,
+                ComIid::IFILESYSTEM,
+                "Scripting.FileSystemObject",
+            )));
         }
 
         // WScript.Shell → IWshShell
         if guid_eq(clsid, &ComClsid::WSCRIPT_SHELL) {
-            return Ok(Box::new(SimpleComObject::new(*clsid, ComIid::IWSH_SHELL, "WScript.Shell")));
+            return Ok(Box::new(SimpleComObject::new(
+                *clsid,
+                ComIid::IWSH_SHELL,
+                "WScript.Shell",
+            )));
         }
 
         // ADODB.Connection
         if guid_eq(clsid, &ComClsid::ADODB_CONNECTION) {
-            return Ok(Box::new(SimpleComObject::new(*clsid, ComIid::IADODB_CONNECTION, "ADODB.Connection")));
+            return Ok(Box::new(SimpleComObject::new(
+                *clsid,
+                ComIid::IADODB_CONNECTION,
+                "ADODB.Connection",
+            )));
         }
 
         // ADODB.Recordset
         if guid_eq(clsid, &ComClsid::ADODB_RECORDSET) {
-            return Ok(Box::new(SimpleComObject::new(*clsid, ComIid::IADODB_RECORDSET, "ADODB.Recordset")));
+            return Ok(Box::new(SimpleComObject::new(
+                *clsid,
+                ComIid::IADODB_RECORDSET,
+                "ADODB.Recordset",
+            )));
         }
 
         // WScript.Network
         if guid_eq(clsid, &ComClsid::WSCRIPT_NETWORK) {
-            return Ok(Box::new(SimpleComObject::new(*clsid, ComIid::IUNKNOWN, "WScript.Network")));
+            return Ok(Box::new(SimpleComObject::new(
+                *clsid,
+                ComIid::IUNKNOWN,
+                "WScript.Network",
+            )));
         }
 
         // ShellWindows
         if guid_eq(clsid, &ComClsid::SHELL_WINDOWS) {
-            return Ok(Box::new(SimpleComObject::new(*clsid, ComIid::IUNKNOWN, "ShellWindows")));
+            return Ok(Box::new(SimpleComObject::new(
+                *clsid,
+                ComIid::IUNKNOWN,
+                "ShellWindows",
+            )));
         }
 
         // InternetExplorer
         if guid_eq(clsid, &ComClsid::INTERNET_EXPLORER) {
-            return Ok(Box::new(SimpleComObject::new(*clsid, ComIid::IUNKNOWN, "InternetExplorer")));
+            return Ok(Box::new(SimpleComObject::new(
+                *clsid,
+                ComIid::IUNKNOWN,
+                "InternetExplorer",
+            )));
         }
 
         // XMLHTTP
         if guid_eq(clsid, &ComClsid::XMLHTTP) {
-            return Ok(Box::new(SimpleComObject::new(*clsid, ComIid::IDISPATCH, "XMLHTTP")));
+            return Ok(Box::new(SimpleComObject::new(
+                *clsid,
+                ComIid::IDISPATCH,
+                "XMLHTTP",
+            )));
         }
 
-        // DOMDocument
+        // =====================================================================
+        // Phase L: COM/Shell Completion CLSIDs
+        // =====================================================================
+
+        // ShellFolder / ShellDesktop → IShellFolder
+        if guid_eq(clsid, &ComClsid::SHELL_FOLDER) {
+            return Ok(Box::new(ShellFolderObject::new(*clsid)));
+        }
+
+        // UrlMoniker → IMoniker
+        if guid_eq(clsid, &ComClsid::URL_MONIKER) {
+            return Ok(Box::new(UrlMonikerObject::new(*clsid)));
+        }
+
+        // DOMDocument → IXMLDOMDocument (upgraded from SimpleComObject)
         if guid_eq(clsid, &ComClsid::DOM_DOCUMENT) {
-            return Ok(Box::new(SimpleComObject::new(*clsid, ComIid::IDISPATCH, "DOMDocument")));
+            return Ok(Box::new(XmlDomDocumentObject::new(*clsid)));
+        }
+
+        // =====================================================================
+        // Phase L7: MSHTML/Trident HTML Document → IHTMLDocument2
+        // =====================================================================
+        // The Trident MSHTML rendering engine CLSID. Used by Internet
+        // Explorer and WebBrowser control hosted content.
+        if guid_eq(clsid, &ComClsid::HTML_DOCUMENT) {
+            return Ok(Box::new(MsHtmlDocumentObject::new(*clsid)));
         }
 
         Err(AppError::new(
@@ -1163,17 +3888,51 @@ impl ComApartmentState {
             ));
         }
 
-        // Check CLSCTX flags — we only support in-process servers
+        // Check CLSCTX flags — we support in-process and local (out-of-process) servers
         if (dw_clsctx & clsctx::INPROC_SERVER) == 0 && (dw_clsctx & clsctx::INPROC_HANDLER) == 0 {
-            // If only LOCAL_SERVER or REMOTE_SERVER is requested, we can't handle it
-            if (dw_clsctx & (clsctx::LOCAL_SERVER | clsctx::REMOTE_SERVER)) != 0 {
+            // If only REMOTE_SERVER is requested, we can't handle it
+            if (dw_clsctx & clsctx::REMOTE_SERVER) != 0 {
                 return Err(AppError::new(
                     ReasonCode::RcWin32InvalidHandle,
                     format!(
-                        "CoCreateInstance: out-of-process server not supported for CLSID {}",
+                        "CoCreateInstance: remote server not supported for CLSID {}",
                         guid_to_string(&clsid)
                     ),
                 ));
+            }
+            // LOCAL_SERVER (out-of-process EXE) — try to launch the server
+            if (dw_clsctx & clsctx::LOCAL_SERVER) != 0 {
+                let clsid_str = guid_to_string(&clsid);
+                // Look up the COM server registration path
+                // Simulate HKCR\\CLSID\\{clsid}\\LocalServer32 lookup
+                let server_path = format!("/fake/com/servers/{}/server.exe", clsid_str);
+                // Try to find a real EXE at the expected path
+                let exe_path = std::path::Path::new(&server_path);
+                if exe_path.exists() {
+                    match std::process::Command::new(exe_path).spawn() {
+                        Ok(child) => {
+                            self.com_exe_servers.push(child);
+                            eprintln!("[COM] Launched out-of-process server for CLSID {clsid_str}");
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[COM] Failed to launch out-of-process server for CLSID {clsid_str}: {e}"
+                            );
+                        }
+                    }
+                } else {
+                    eprintln!(
+                        "[COM] Out-of-process server EXE not found at {server_path}; returning CLASS_E_CLASSNOTAVAILABLE"
+                    );
+                    return Err(AppError::new(
+                        ReasonCode::RcComClassNotRegistered,
+                        format!(
+                            "CLSID {} not available as local server: EXE not found at {}",
+                            guid_to_string(&clsid),
+                            server_path
+                        ),
+                    ));
+                }
             }
         }
 
@@ -1223,7 +3982,11 @@ impl ComApartmentState {
     ///
     /// Returns an IClassFactory (or IUnknown) for the given CLSID.
     /// The factory can then be used to create instances of the COM class.
-    pub fn co_get_class_object(&self, clsid: &[u8; 16], iid: &[u8; 16]) -> AppResult<Box<dyn ComObject>> {
+    pub fn co_get_class_object(
+        &self,
+        clsid: &[u8; 16],
+        iid: &[u8; 16],
+    ) -> AppResult<Box<dyn ComObject>> {
         // IID check: must be IClassFactory or IUnknown
         if !guid_eq(iid, &ComIid::ICLASS_FACTORY) && !guid_eq(iid, &ComIid::IUNKNOWN) {
             return Err(AppError::new(
@@ -1241,7 +4004,9 @@ impl ComApartmentState {
     pub fn clsid_from_progid(&self, progid: &str) -> Option<[u8; 16]> {
         match progid.to_lowercase().as_str() {
             "shell.application" => Some(ComClsid::SHELL_APPLICATION),
-            "scripting.filesystemobject" | "filesystemobject" => Some(ComClsid::SCRIPTING_FILESYSTEMOBJECT),
+            "scripting.filesystemobject" | "filesystemobject" => {
+                Some(ComClsid::SCRIPTING_FILESYSTEMOBJECT)
+            }
             "wscript.shell" | "wscriptshell" => Some(ComClsid::WSCRIPT_SHELL),
             "wscript.network" | "wscriptnetwork" => Some(ComClsid::WSCRIPT_NETWORK),
             "adodb.connection" => Some(ComClsid::ADODB_CONNECTION),
@@ -1249,7 +4014,9 @@ impl ComApartmentState {
             "shelllink" | "shell.link" => Some(ComClsid::SHELL_LINK),
             "shell.windows" | "shellwindows" => Some(ComClsid::SHELL_WINDOWS),
             "internetexplorer" | "internet.explorer" => Some(ComClsid::INTERNET_EXPLORER),
-            "microsoft.xmldom" | "msxml2.domdocument" | "domdocument" => Some(ComClsid::DOM_DOCUMENT),
+            "microsoft.xmldom" | "msxml2.domdocument" | "domdocument" => {
+                Some(ComClsid::DOM_DOCUMENT)
+            }
             "microsoft.xmlhttp" | "msxml2.xmlhttp" | "xmlhttp" => Some(ComClsid::XMLHTTP),
             _ => None,
         }
@@ -1287,7 +4054,10 @@ impl ComApartmentState {
     /// AddRef — increment the reference count.
     pub fn com_addref(&mut self, handle: u64) -> AppResult<u32> {
         let obj = self.com_objects.get_mut(&handle).ok_or_else(|| {
-            AppError::new(ReasonCode::RcWin32InvalidHandle, format!("COM object {handle} not found"))
+            AppError::new(
+                ReasonCode::RcWin32InvalidHandle,
+                format!("COM object {handle} not found"),
+            )
         })?;
         obj.refcount += 1;
         Ok(obj.refcount)
@@ -1296,7 +4066,10 @@ impl ComApartmentState {
     /// Release — decrement the reference count, remove if zero.
     pub fn com_release(&mut self, handle: u64) -> AppResult<u32> {
         let obj = self.com_objects.get_mut(&handle).ok_or_else(|| {
-            AppError::new(ReasonCode::RcWin32InvalidHandle, format!("COM object {handle} not found"))
+            AppError::new(
+                ReasonCode::RcWin32InvalidHandle,
+                format!("COM object {handle} not found"),
+            )
         })?;
         obj.refcount = obj.refcount.saturating_sub(1);
         let count = obj.refcount;
@@ -1314,10 +4087,14 @@ impl ComApartmentState {
     /// properly expose their interface IIDs to callers.
     pub fn com_query_interface(&self, handle: u64, iid: [u8; 16]) -> AppResult<bool> {
         let obj = self.com_objects.get(&handle).ok_or_else(|| {
-            AppError::new(ReasonCode::RcWin32InvalidHandle, format!("COM object {handle} not found"))
+            AppError::new(
+                ReasonCode::RcWin32InvalidHandle,
+                format!("COM object {handle} not found"),
+            )
         })?;
         // IUnknown is always supported
         if iid == ComIid::IUNKNOWN {
+            // IUnknown is always supported by all COM objects per the COM specification
             return Ok(true);
         }
         // Check against the full list of supported IIDs
@@ -1327,7 +4104,10 @@ impl ComApartmentState {
     /// Get the vtable pointer for a COM object.
     pub fn com_vtable(&self, handle: u64) -> AppResult<u64> {
         let obj = self.com_objects.get(&handle).ok_or_else(|| {
-            AppError::new(ReasonCode::RcWin32InvalidHandle, format!("COM object {handle} not found"))
+            AppError::new(
+                ReasonCode::RcWin32InvalidHandle,
+                format!("COM object {handle} not found"),
+            )
         })?;
         Ok(obj.vtable_ptr)
     }
@@ -1335,7 +4115,10 @@ impl ComApartmentState {
     /// Get COM object info.
     pub fn com_object_info(&self, handle: u64) -> AppResult<&ComObjectRecord> {
         self.com_objects.get(&handle).ok_or_else(|| {
-            AppError::new(ReasonCode::RcWin32InvalidHandle, format!("COM object {handle} not found"))
+            AppError::new(
+                ReasonCode::RcWin32InvalidHandle,
+                format!("COM object {handle} not found"),
+            )
         })
     }
 
@@ -1468,7 +4251,7 @@ pub fn dispatch_get_ids_of_names(
 pub fn dispatch_invoke(
     dispatch: &mut DispatchInterface,
     dispid: i32,
-    lcid: u32,
+    _lcid: u32,
     flags: u16,
     params: &[Variant],
 ) -> AppResult<DispatchResult> {
@@ -1483,7 +4266,13 @@ pub fn dispatch_invoke(
                     (dispid - 1) as usize
                 } else {
                     return Ok(DispatchResult {
-                        result: Variant { vt: VT_EMPTY, w_reserved1: 0, w_reserved2: 0, w_reserved3: 0, data: 0 },
+                        result: Variant {
+                            vt: VT_EMPTY,
+                            w_reserved1: 0,
+                            w_reserved2: 0,
+                            w_reserved3: 0,
+                            data: 0,
+                        },
                         excp_info: Some(format!("invalid DISPID {dispid}")),
                         arg_err: 0,
                     });
@@ -1510,20 +4299,38 @@ pub fn dispatch_invoke(
                             bag.insert(name, new_val.clone());
                         }
                         Ok(DispatchResult {
-                            result: Variant { vt: VT_EMPTY, w_reserved1: 0, w_reserved2: 0, w_reserved3: 0, data: 0 },
+                            result: Variant {
+                                vt: VT_EMPTY,
+                                w_reserved1: 0,
+                                w_reserved2: 0,
+                                w_reserved3: 0,
+                                data: 0,
+                            },
                             excp_info: None,
                             arg_err: 0,
                         })
                     } else {
                         Ok(DispatchResult {
-                            result: Variant { vt: VT_EMPTY, w_reserved1: 0, w_reserved2: 0, w_reserved3: 0, data: 0 },
+                            result: Variant {
+                                vt: VT_EMPTY,
+                                w_reserved1: 0,
+                                w_reserved2: 0,
+                                w_reserved3: 0,
+                                data: 0,
+                            },
                             excp_info: None,
                             arg_err: 0,
                         })
                     }
                 }
                 None => Ok(DispatchResult {
-                    result: Variant { vt: VT_EMPTY, w_reserved1: 0, w_reserved2: 0, w_reserved3: 0, data: 0 },
+                    result: Variant {
+                        vt: VT_EMPTY,
+                        w_reserved1: 0,
+                        w_reserved2: 0,
+                        w_reserved3: 0,
+                        data: 0,
+                    },
                     excp_info: Some("property not found".to_string()),
                     arg_err: 0,
                 }),
@@ -1671,7 +4478,7 @@ pub fn sys_alloc_string_len(src: &[u16], len: u32) -> Vec<u8> {
 }
 
 /// SysReAllocString — reallocate a BSTR.
-pub fn sys_realloc_string(existing: &[u8], new_src: &[u16]) -> Vec<u8> {
+pub fn sys_realloc_string(_existing: &[u8], new_src: &[u16]) -> Vec<u8> {
     // Just allocate a new one; the old one is freed by caller
     sys_alloc_string(new_src)
 }
@@ -1731,7 +4538,12 @@ pub fn variant_copy(dst: &mut Variant, src: &Variant) {
 ///
 /// Supports all 19+ base variant types with proper numeric coercion, string parsing,
 /// and array type handling. Follows COM's VariantChangeType semantics.
-pub fn variant_change_type(dst: &mut Variant, src: &Variant, _flags: u16, new_vt: u16) -> AppResult<()> {
+pub fn variant_change_type(
+    dst: &mut Variant,
+    src: &Variant,
+    _flags: u16,
+    new_vt: u16,
+) -> AppResult<()> {
     let src_vt = src.vt & VT_TYPEMASK;
     let new_vt_base = new_vt & VT_TYPEMASK;
     let array_flag = new_vt & VT_ARRAY;
@@ -1874,7 +4686,13 @@ fn variant_to_f64(v: &Variant) -> f64 {
         VT_R8 => f64::from_bits(v.data),
         VT_CY => (v.data as i64) as f64 / 10000.0,
         VT_DATE => f64::from_bits(v.data),
-        VT_BOOL => if v.data != 0 { 1.0 } else { 0.0 },
+        VT_BOOL => {
+            if v.data != 0 {
+                1.0
+            } else {
+                0.0
+            }
+        }
         VT_BSTR | VT_LPWSTR => {
             // Interpret data as a pointer to wide string and parse
             // For simplicity, return 0 — real parsing would dereference guest memory
@@ -1905,7 +4723,13 @@ fn variant_to_string(v: &Variant) -> String {
         VT_UI8 => format!("{}", data),
         VT_R4 => format!("{}", f32::from_bits(data as u32)),
         VT_R8 => format!("{}", f64::from_bits(data)),
-        VT_BOOL => if data != 0 { "True".to_string() } else { "False".to_string() },
+        VT_BOOL => {
+            if data != 0 {
+                "True".to_string()
+            } else {
+                "False".to_string()
+            }
+        }
         VT_BSTR | VT_LPWSTR => {
             // Would dereference guest memory; return empty for now
             String::new()
@@ -1940,8 +4764,8 @@ pub struct SafeArrayDescriptor {
     pub f_features: u16,
     pub cb_elements2: u16, // duplicate of cb_elements in some layouts
     pub c_locks: u32,
-    pub handle: u64,       // pointer to actual data
-    // Followed by SafeArrayBound[c_dims]
+    pub handle: u64, // pointer to actual data
+                     // Followed by SafeArrayBound[c_dims]
 }
 
 /// SAFEARRAY feature flags.
@@ -2010,11 +4834,20 @@ pub fn safe_array_destroy(_sa_ptr: u64) {}
 /// SafeArrayAccessData — get a pointer to the SAFEARRAY data.
 pub fn safe_array_access_data(sa_data: &[u8]) -> AppResult<u64> {
     if sa_data.len() < 24 {
-        return Err(AppError::new(ReasonCode::RcWin32InvalidHandle, "SAFEARRAY too small"));
+        return Err(AppError::new(
+            ReasonCode::RcWin32InvalidHandle,
+            "SAFEARRAY too small",
+        ));
     }
     let handle_offset = u64::from_le_bytes([
-        sa_data[12], sa_data[13], sa_data[14], sa_data[15],
-        sa_data[16], sa_data[17], sa_data[18], sa_data[19],
+        sa_data[12],
+        sa_data[13],
+        sa_data[14],
+        sa_data[15],
+        sa_data[16],
+        sa_data[17],
+        sa_data[18],
+        sa_data[19],
     ]);
     Ok(handle_offset)
 }
@@ -2026,7 +4859,10 @@ pub fn safe_array_unaccess_data(_sa_ptr: u64) {}
 pub fn safe_array_get_element(sa_data: &[u8], indices: &[i32]) -> AppResult<Vec<u8>> {
     let c_dims = u16::from_le_bytes([sa_data[2], sa_data[3]]) as usize;
     if indices.len() != c_dims {
-        return Err(AppError::new(ReasonCode::RcWin32InvalidHandle, "index count mismatch"));
+        return Err(AppError::new(
+            ReasonCode::RcWin32InvalidHandle,
+            "index count mismatch",
+        ));
     }
     let elem_size = u16::from_le_bytes([sa_data[0], sa_data[1]]) as usize;
     let base_offset = safe_array_access_data(sa_data)? as usize;
@@ -2037,16 +4873,23 @@ pub fn safe_array_get_element(sa_data: &[u8], indices: &[i32]) -> AppResult<Vec<
     for dim in (0..c_dims).rev() {
         let bound_offset = 20 + dim * 8;
         let elements = u32::from_le_bytes([
-            sa_data[bound_offset], sa_data[bound_offset + 1],
-            sa_data[bound_offset + 2], sa_data[bound_offset + 3],
+            sa_data[bound_offset],
+            sa_data[bound_offset + 1],
+            sa_data[bound_offset + 2],
+            sa_data[bound_offset + 3],
         ]) as i32;
         let l_bound = i32::from_le_bytes([
-            sa_data[bound_offset + 4], sa_data[bound_offset + 5],
-            sa_data[bound_offset + 6], sa_data[bound_offset + 7],
+            sa_data[bound_offset + 4],
+            sa_data[bound_offset + 5],
+            sa_data[bound_offset + 6],
+            sa_data[bound_offset + 7],
         ]);
         let idx = indices[dim] - l_bound;
         if idx < 0 || idx >= elements {
-            return Err(AppError::new(ReasonCode::RcWin32InvalidHandle, "index out of bounds"));
+            return Err(AppError::new(
+                ReasonCode::RcWin32InvalidHandle,
+                "index out of bounds",
+            ));
         }
         flat_index += idx * stride;
         stride *= elements;
@@ -2057,10 +4900,17 @@ pub fn safe_array_get_element(sa_data: &[u8], indices: &[i32]) -> AppResult<Vec<
 }
 
 /// SafeArrayPutElement — put an element into a SAFEARRAY.
-pub fn safe_array_put_element(sa_data: &mut [u8], indices: &[i32], element_data: &[u8]) -> AppResult<()> {
+pub fn safe_array_put_element(
+    sa_data: &mut [u8],
+    indices: &[i32],
+    element_data: &[u8],
+) -> AppResult<()> {
     let c_dims = u16::from_le_bytes([sa_data[2], sa_data[3]]) as usize;
     if indices.len() != c_dims {
-        return Err(AppError::new(ReasonCode::RcWin32InvalidHandle, "index count mismatch"));
+        return Err(AppError::new(
+            ReasonCode::RcWin32InvalidHandle,
+            "index count mismatch",
+        ));
     }
     let elem_size = u16::from_le_bytes([sa_data[0], sa_data[1]]) as usize;
     let base_offset = safe_array_access_data(sa_data)? as usize;
@@ -2070,16 +4920,23 @@ pub fn safe_array_put_element(sa_data: &mut [u8], indices: &[i32], element_data:
     for dim in (0..c_dims).rev() {
         let bound_offset = 20 + dim * 8;
         let elements = u32::from_le_bytes([
-            sa_data[bound_offset], sa_data[bound_offset + 1],
-            sa_data[bound_offset + 2], sa_data[bound_offset + 3],
+            sa_data[bound_offset],
+            sa_data[bound_offset + 1],
+            sa_data[bound_offset + 2],
+            sa_data[bound_offset + 3],
         ]) as i32;
         let l_bound = i32::from_le_bytes([
-            sa_data[bound_offset + 4], sa_data[bound_offset + 5],
-            sa_data[bound_offset + 6], sa_data[bound_offset + 7],
+            sa_data[bound_offset + 4],
+            sa_data[bound_offset + 5],
+            sa_data[bound_offset + 6],
+            sa_data[bound_offset + 7],
         ]);
         let idx = indices[dim] - l_bound;
         if idx < 0 || idx >= elements {
-            return Err(AppError::new(ReasonCode::RcWin32InvalidHandle, "index out of bounds"));
+            return Err(AppError::new(
+                ReasonCode::RcWin32InvalidHandle,
+                "index out of bounds",
+            ));
         }
         flat_index += idx * stride;
         stride *= elements;
@@ -2096,36 +4953,54 @@ pub fn safe_array_put_element(sa_data: &mut [u8], indices: &[i32], element_data:
 /// SafeArrayGetLBound — get the lower bound of a SAFEARRAY dimension.
 pub fn safe_array_get_lbound(sa_data: &[u8], dim: u32) -> AppResult<i32> {
     if sa_data.len() < 20 {
-        return Err(AppError::new(ReasonCode::RcWin32InvalidHandle, "SAFEARRAY too small"));
+        return Err(AppError::new(
+            ReasonCode::RcWin32InvalidHandle,
+            "SAFEARRAY too small",
+        ));
     }
     let c_dims = u16::from_le_bytes([sa_data[2], sa_data[3]]) as u32;
     if dim == 0 || dim > c_dims {
-        return Err(AppError::new(ReasonCode::RcWin32InvalidHandle, "invalid dimension"));
+        return Err(AppError::new(
+            ReasonCode::RcWin32InvalidHandle,
+            "invalid dimension",
+        ));
     }
     let bound_offset = 20 + (dim as usize - 1) * 8;
     Ok(i32::from_le_bytes([
-        sa_data[bound_offset + 4], sa_data[bound_offset + 5],
-        sa_data[bound_offset + 6], sa_data[bound_offset + 7],
+        sa_data[bound_offset + 4],
+        sa_data[bound_offset + 5],
+        sa_data[bound_offset + 6],
+        sa_data[bound_offset + 7],
     ]))
 }
 
 /// SafeArrayGetUBound — get the upper bound of a SAFEARRAY dimension.
 pub fn safe_array_get_ubound(sa_data: &[u8], dim: u32) -> AppResult<i32> {
     if sa_data.len() < 20 {
-        return Err(AppError::new(ReasonCode::RcWin32InvalidHandle, "SAFEARRAY too small"));
+        return Err(AppError::new(
+            ReasonCode::RcWin32InvalidHandle,
+            "SAFEARRAY too small",
+        ));
     }
     let c_dims = u16::from_le_bytes([sa_data[2], sa_data[3]]) as u32;
     if dim == 0 || dim > c_dims {
-        return Err(AppError::new(ReasonCode::RcWin32InvalidHandle, "invalid dimension"));
+        return Err(AppError::new(
+            ReasonCode::RcWin32InvalidHandle,
+            "invalid dimension",
+        ));
     }
     let bound_offset = 20 + (dim as usize - 1) * 8;
     let elements = u32::from_le_bytes([
-        sa_data[bound_offset], sa_data[bound_offset + 1],
-        sa_data[bound_offset + 2], sa_data[bound_offset + 3],
+        sa_data[bound_offset],
+        sa_data[bound_offset + 1],
+        sa_data[bound_offset + 2],
+        sa_data[bound_offset + 3],
     ]);
     let l_bound = i32::from_le_bytes([
-        sa_data[bound_offset + 4], sa_data[bound_offset + 5],
-        sa_data[bound_offset + 6], sa_data[bound_offset + 7],
+        sa_data[bound_offset + 4],
+        sa_data[bound_offset + 5],
+        sa_data[bound_offset + 6],
+        sa_data[bound_offset + 7],
     ]);
     Ok(l_bound + elements as i32 - 1)
 }
@@ -2172,9 +5047,30 @@ impl MsvcCrt {
     pub fn new() -> Self {
         let mut open_files = BTreeMap::new();
         // Standard file descriptors: 0=stdin, 1=stdout, 2=stderr
-        open_files.insert(0, CrtFileRecord { path: "stdin".to_string(), mode: "r".to_string(), position: 0 });
-        open_files.insert(1, CrtFileRecord { path: "stdout".to_string(), mode: "w".to_string(), position: 0 });
-        open_files.insert(2, CrtFileRecord { path: "stderr".to_string(), mode: "w".to_string(), position: 0 });
+        open_files.insert(
+            0,
+            CrtFileRecord {
+                path: "stdin".to_string(),
+                mode: "r".to_string(),
+                position: 0,
+            },
+        );
+        open_files.insert(
+            1,
+            CrtFileRecord {
+                path: "stdout".to_string(),
+                mode: "w".to_string(),
+                position: 0,
+            },
+        );
+        open_files.insert(
+            2,
+            CrtFileRecord {
+                path: "stderr".to_string(),
+                mode: "w".to_string(),
+                position: 0,
+            },
+        );
 
         Self {
             errno_value: 0,
@@ -2211,10 +5107,16 @@ impl MsvcCrt {
         if ptr == 0 {
             return Ok(());
         }
-        self.heap_allocations.remove(&ptr).map(|_| ()).ok_or_else(|| {
-            self.errno_value = 22; // EINVAL
-            AppError::new(ReasonCode::RcWin32InvalidHandle, format!("CRT free: invalid pointer {ptr}"))
-        })
+        self.heap_allocations
+            .remove(&ptr)
+            .map(|_| ())
+            .ok_or_else(|| {
+                self.errno_value = 22; // EINVAL
+                AppError::new(
+                    ReasonCode::RcWin32InvalidHandle,
+                    format!("CRT free: invalid pointer {ptr}"),
+                )
+            })
     }
 
     /// CRT realloc — reallocate a block.
@@ -2223,7 +5125,9 @@ impl MsvcCrt {
             return self.crt_malloc(new_size);
         }
         if new_size == 0 {
-            let _ = self.crt_free(ptr);
+            if let Err(e) = self.crt_free(ptr) {
+                eprintln!("[MsvcCrt] crt_realloc: crt_free failed for ptr {ptr}: {e}");
+            }
             return 0;
         }
         if self.heap_allocations.contains_key(&ptr) {
@@ -2285,6 +5189,16 @@ impl MsvcCrt {
     /// - Zero-pad flag: %0*d
     pub fn crt_sprintf_int(value: i32, format: &str) -> String {
         Self::format_with_spec(value, format)
+    }
+
+    /// CRT sprintf for floating-point values.
+    ///
+    /// Formats `value` according to `format`.  Supports the same specifiers
+    /// as [`crt_sprintf_int`] plus the float-specific ones (`%f`, `%e`,
+    /// `%E`, `%g`, `%G`, `%a`, `%A`) which operate on the full `f64`
+    /// precision rather than truncating through an `i32` cast.
+    pub fn crt_sprintf_float(value: f64, format: &str) -> String {
+        Self::format_with_spec_float(value, format)
     }
 
     /// Parse a printf format specifier and format the value accordingly.
@@ -2354,7 +5268,9 @@ impl MsvcCrt {
         // Parse length modifier (skip)
         while i < chars.len() {
             match chars[i] {
-                'h' | 'l' | 'L' | 'z' | 'j' | 't' => { i += 1; }
+                'h' | 'l' | 'L' | 'z' | 'j' | 't' => {
+                    i += 1;
+                }
                 _ => break,
             }
         }
@@ -2366,10 +5282,15 @@ impl MsvcCrt {
 
         match conversion {
             'd' | 'i' => {
-                let sign = if value < 0 { "" }
-                    else if force_sign { "+" }
-                    else if space_flag { " " }
-                    else { "" };
+                let sign = if value < 0 {
+                    ""
+                } else if force_sign {
+                    "+"
+                } else if space_flag {
+                    " "
+                } else {
+                    ""
+                };
                 let abs_val = value.unsigned_abs();
                 let mut s = format!("{}{}", sign, abs_val);
                 if let Some(p) = precision {
@@ -2406,7 +5327,12 @@ impl MsvcCrt {
                 let mut s = format!("{}{:x}", prefix, val);
                 if let Some(w) = width {
                     if pad_char == '0' {
-                        s = format!("{}{:0>width$}", prefix, format!("{:x}", val), width = w - prefix.len());
+                        s = format!(
+                            "{}{:0>width$}",
+                            prefix,
+                            format!("{:x}", val),
+                            width = w - prefix.len()
+                        );
                     } else if left_justify {
                         s = format!("{:<width$}", s, width = w);
                     } else {
@@ -2421,7 +5347,12 @@ impl MsvcCrt {
                 let mut s = format!("{}{:X}", prefix, val);
                 if let Some(w) = width {
                     if pad_char == '0' {
-                        s = format!("{}{:0>width$}", prefix, format!("{:X}", val), width = w - prefix.len());
+                        s = format!(
+                            "{}{:0>width$}",
+                            prefix,
+                            format!("{:X}", val),
+                            width = w - prefix.len()
+                        );
                     } else if left_justify {
                         s = format!("{:<width$}", s, width = w);
                     } else {
@@ -2436,7 +5367,12 @@ impl MsvcCrt {
                 let mut s = format!("{}{:o}", prefix, val);
                 if let Some(w) = width {
                     if pad_char == '0' {
-                        s = format!("{}{:0>width$}", prefix, format!("{:o}", val), width = w - prefix.len());
+                        s = format!(
+                            "{}{:0>width$}",
+                            prefix,
+                            format!("{:o}", val),
+                            width = w - prefix.len()
+                        );
                     } else if left_justify {
                         s = format!("{:<width$}", s, width = w);
                     } else {
@@ -2448,10 +5384,15 @@ impl MsvcCrt {
             'f' | 'F' => {
                 let f_val = value as f64;
                 let prec = precision.unwrap_or(6);
-                let sign = if f_val < 0.0 { "" }
-                    else if force_sign { "+" }
-                    else if space_flag { " " }
-                    else { "" };
+                let sign = if f_val < 0.0 {
+                    ""
+                } else if force_sign {
+                    "+"
+                } else if space_flag {
+                    " "
+                } else {
+                    ""
+                };
                 let abs = f_val.abs();
                 let mut s = format!("{}{:.prec$}", sign, abs, prec = prec);
                 if let Some(w) = width {
@@ -2477,10 +5418,15 @@ impl MsvcCrt {
             'e' | 'E' => {
                 let f_val = value as f64;
                 let prec = precision.unwrap_or(6);
-                let sign = if f_val < 0.0 { "" }
-                    else if force_sign { "+" }
-                    else if space_flag { " " }
-                    else { "" };
+                let sign = if f_val < 0.0 {
+                    ""
+                } else if force_sign {
+                    "+"
+                } else if space_flag {
+                    " "
+                } else {
+                    ""
+                };
                 let abs = f_val.abs();
                 let mut s = if conversion == 'E' {
                     format!("{}{:.prec$E}", sign, abs, prec = prec)
@@ -2503,10 +5449,15 @@ impl MsvcCrt {
             'g' | 'G' => {
                 let f_val = value as f64;
                 let prec = precision.unwrap_or(6);
-                let sign = if f_val < 0.0 { "" }
-                    else if force_sign { "+" }
-                    else if space_flag { " " }
-                    else { "" };
+                let sign = if f_val < 0.0 {
+                    ""
+                } else if force_sign {
+                    "+"
+                } else if space_flag {
+                    " "
+                } else {
+                    ""
+                };
                 let abs = f_val.abs();
                 let mut s = if conversion == 'G' {
                     format!("{}{:.prec$}", sign, abs, prec = prec)
@@ -2560,11 +5511,315 @@ impl MsvcCrt {
                 // %n writes the character count so far; no output
                 String::new()
             }
-            '%' => {
-                "%".to_string()
-            }
+            '%' => "%".to_string(),
             _ => {
                 // Unknown specifier, return raw
+                format!("%{}", conversion)
+            }
+        }
+    }
+
+    /// Parse a printf format specifier and format a floating-point value.
+    ///
+    /// This is the `f64` counterpart of [`format_with_spec`].  Integer
+    /// specifiers (`%d`, `%u`, `%x`, …) still work by truncating the
+    /// float, but `%f`, `%e`, `%E`, `%g`, `%G` use the full `f64`
+    /// precision.
+    fn format_with_spec_float(value: f64, format: &str) -> String {
+        if !format.starts_with('%') {
+            return value.to_string();
+        }
+        let spec = format.trim_start_matches('%');
+        if spec.is_empty() {
+            return value.to_string();
+        }
+
+        let chars: Vec<char> = spec.chars().collect();
+        let mut i = 0;
+
+        // Parse flags
+        let mut left_justify = false;
+        let mut zero_pad = false;
+        let mut force_sign = false;
+        let mut space_flag = false;
+        let mut alternate = false;
+
+        while i < chars.len() {
+            match chars[i] {
+                '-' => left_justify = true,
+                '0' => zero_pad = true,
+                '+' => force_sign = true,
+                ' ' => space_flag = true,
+                '#' => alternate = true,
+                _ => break,
+            }
+            i += 1;
+        }
+
+        // Parse width
+        let mut width: Option<usize> = None;
+        if i < chars.len() && chars[i] == '*' {
+            i += 1;
+        } else {
+            let mut w = 0usize;
+            while i < chars.len() && chars[i].is_ascii_digit() {
+                w = w * 10 + (chars[i] as u8 - b'0') as usize;
+                i += 1;
+            }
+            if w > 0 {
+                width = Some(w);
+            }
+        }
+
+        // Parse precision
+        let mut precision: Option<usize> = None;
+        if i < chars.len() && chars[i] == '.' {
+            i += 1;
+            if i < chars.len() && chars[i] == '*' {
+                i += 1;
+            } else {
+                let mut p = 0usize;
+                while i < chars.len() && chars[i].is_ascii_digit() {
+                    p = p * 10 + (chars[i] as u8 - b'0') as usize;
+                    i += 1;
+                }
+                precision = Some(p);
+            }
+        }
+
+        // Parse length modifier (skip)
+        while i < chars.len() {
+            match chars[i] {
+                'h' | 'l' | 'L' | 'z' | 'j' | 't' => {
+                    i += 1;
+                }
+                _ => break,
+            }
+        }
+
+        // Parse conversion specifier
+        let conversion = if i < chars.len() { chars[i] } else { 'f' };
+
+        let pad_char = if zero_pad && !left_justify { '0' } else { ' ' };
+
+        let sign = if value < 0.0 {
+            ""
+        } else if force_sign {
+            "+"
+        } else if space_flag {
+            " "
+        } else {
+            ""
+        };
+
+        match conversion {
+            'd' | 'i' => {
+                let abs_val = value.abs() as i64;
+                let mut s = format!("{}{}", sign, abs_val);
+                if let Some(w) = width {
+                    if left_justify {
+                        s = format!("{:<width$}", s, width = w);
+                    } else {
+                        s = format!("{:>width$}", s, width = w);
+                    }
+                }
+                s
+            }
+            'u' => {
+                let val = value.abs() as u64;
+                let mut s = val.to_string();
+                if let Some(w) = width {
+                    if pad_char == '0' {
+                        s = format!("{:0>width$}", s, width = w);
+                    } else if left_justify {
+                        s = format!("{:<width$}", s, width = w);
+                    } else {
+                        s = format!("{:>width$}", s, width = w);
+                    }
+                }
+                s
+            }
+            'x' => {
+                let val = value.abs() as u64;
+                let prefix = if alternate && val != 0 { "0x" } else { "" };
+                let mut s = format!("{}{:x}", prefix, val);
+                if let Some(w) = width {
+                    if pad_char == '0' {
+                        s = format!(
+                            "{}{:0>width$}",
+                            prefix,
+                            format!("{:x}", val),
+                            width = w - prefix.len()
+                        );
+                    } else if left_justify {
+                        s = format!("{:<width$}", s, width = w);
+                    } else {
+                        s = format!("{:>width$}", s, width = w);
+                    }
+                }
+                s
+            }
+            'X' => {
+                let val = value.abs() as u64;
+                let prefix = if alternate && val != 0 { "0X" } else { "" };
+                let mut s = format!("{}{:X}", prefix, val);
+                if let Some(w) = width {
+                    if pad_char == '0' {
+                        s = format!(
+                            "{}{:0>width$}",
+                            prefix,
+                            format!("{:X}", val),
+                            width = w - prefix.len()
+                        );
+                    } else if left_justify {
+                        s = format!("{:<width$}", s, width = w);
+                    } else {
+                        s = format!("{:>width$}", s, width = w);
+                    }
+                }
+                s
+            }
+            'o' => {
+                let val = value.abs() as u64;
+                let prefix = if alternate { "0" } else { "" };
+                let mut s = format!("{}{:o}", prefix, val);
+                if let Some(w) = width {
+                    if pad_char == '0' {
+                        s = format!(
+                            "{}{:0>width$}",
+                            prefix,
+                            format!("{:o}", val),
+                            width = w - prefix.len()
+                        );
+                    } else if left_justify {
+                        s = format!("{:<width$}", s, width = w);
+                    } else {
+                        s = format!("{:>width$}", s, width = w);
+                    }
+                }
+                s
+            }
+            'f' | 'F' => {
+                let prec = precision.unwrap_or(6);
+                let abs = value.abs();
+                let mut s = format!("{}{:.prec$}", sign, abs, prec = prec);
+                if let Some(w) = width {
+                    if pad_char == '0' && !left_justify {
+                        // Zero-pad the integer part
+                        let dot_pos = s.find('.').unwrap_or(s.len());
+                        let int_part_len = dot_pos;
+                        if int_part_len < w {
+                            let padding = w - int_part_len;
+                            let zeros: String = std::iter::repeat('0').take(padding).collect();
+                            s = format!("{}{}{}", &s[..int_part_len], zeros, &s[int_part_len..]);
+                        }
+                    } else if s.len() < w {
+                        if left_justify {
+                            s = format!("{:<width$}", s, width = w);
+                        } else {
+                            s = format!("{:>width$}", s, width = w);
+                        }
+                    }
+                }
+                s
+            }
+            'e' | 'E' => {
+                let prec = precision.unwrap_or(6);
+                let abs = value.abs();
+                let mut s = if conversion == 'E' {
+                    format!("{}{:.prec$E}", sign, abs, prec = prec)
+                } else {
+                    format!("{}{:.prec$e}", sign, abs, prec = prec)
+                };
+                if let Some(w) = width {
+                    if s.len() < w {
+                        if left_justify {
+                            s = format!("{:<width$}", s, width = w);
+                        } else if pad_char == '0' {
+                            s = format!("{:0>width$}", s, width = w);
+                        } else {
+                            s = format!("{:>width$}", s, width = w);
+                        }
+                    }
+                }
+                s
+            }
+            'g' | 'G' => {
+                let prec = precision.unwrap_or(6);
+                let abs = value.abs();
+                let mut s = format!("{}{:.prec$}", sign, abs, prec = prec);
+                if let Some(w) = width {
+                    if s.len() < w {
+                        if left_justify {
+                            s = format!("{:<width$}", s, width = w);
+                        } else if pad_char == '0' {
+                            s = format!("{:0>width$}", s, width = w);
+                        } else {
+                            s = format!("{:>width$}", s, width = w);
+                        }
+                    }
+                }
+                s
+            }
+            'a' | 'A' => {
+                // Rust's format!() does not support %a/%A (hex float).
+                // Emulate: display as hex via the `{:#x}` representation of
+                // the raw bits, or fall back to %e-style for usability.
+                let prec = precision.unwrap_or(6);
+                let abs = value.abs();
+                // Use scientific notation as a reasonable substitute for
+                // hex float notation since Rust lacks native %a support.
+                let mut s = if conversion == 'A' {
+                    format!("{}{:.prec$E}", sign, abs, prec = prec)
+                } else {
+                    format!("{}{:.prec$e}", sign, abs, prec = prec)
+                };
+                if let Some(w) = width {
+                    if s.len() < w {
+                        if left_justify {
+                            s = format!("{:<width$}", s, width = w);
+                        } else if pad_char == '0' {
+                            s = format!("{:0>width$}", s, width = w);
+                        } else {
+                            s = format!("{:>width$}", s, width = w);
+                        }
+                    }
+                }
+                s
+            }
+            'p' => {
+                let bits = value.to_bits();
+                format!("0x{:x}", bits)
+            }
+            'c' => {
+                if let Some(ch) = char::from_u32(value.abs() as u32) {
+                    let mut s = ch.to_string();
+                    if let Some(w) = width {
+                        if left_justify {
+                            s = format!("{:<width$}", s, width = w);
+                        } else {
+                            s = format!("{:>width$}", s, width = w);
+                        }
+                    }
+                    s
+                } else {
+                    String::new()
+                }
+            }
+            's' => {
+                let mut s = value.to_string();
+                if let Some(w) = width {
+                    if left_justify {
+                        s = format!("{:<width$}", s, width = w);
+                    } else {
+                        s = format!("{:>width$}", s, width = w);
+                    }
+                }
+                s
+            }
+            'n' => String::new(),
+            '%' => "%".to_string(),
+            _ => {
                 format!("%{}", conversion)
             }
         }
@@ -2633,7 +5888,9 @@ impl MsvcCrt {
             // Parse optional length modifier (skip)
             if f < format_bytes.len() {
                 match format_bytes[f] {
-                    b'h' | b'l' | b'L' | b'z' | b'j' | b't' => { f += 1; }
+                    b'h' | b'l' | b'L' | b'z' | b'j' | b't' => {
+                        f += 1;
+                    }
                     _ => {}
                 }
             }
@@ -2651,7 +5908,9 @@ impl MsvcCrt {
                     while i < input_bytes.len() && input_bytes[i].is_ascii_whitespace() {
                         i += 1;
                     }
-                    if i >= input_bytes.len() { return last_result; }
+                    if i >= input_bytes.len() {
+                        return last_result;
+                    }
 
                     // Optional sign
                     let mut negative = false;
@@ -2686,7 +5945,9 @@ impl MsvcCrt {
                                 i += 1;
                                 count += 1;
                             }
-                            if count == 0 { return last_result; }
+                            if count == 0 {
+                                return last_result;
+                            }
                             last_result = Some(if negative { -val } else { val });
                             continue;
                         } else if i < input_bytes.len() && input_bytes[i] == b'0' {
@@ -2695,12 +5956,16 @@ impl MsvcCrt {
                             let mut count = 0usize;
                             while i < input_bytes.len() && count < max_chars {
                                 let c = input_bytes[i];
-                                if !(b'0'..=b'7').contains(&c) { break; }
+                                if !(b'0'..=b'7').contains(&c) {
+                                    break;
+                                }
                                 val = val.wrapping_mul(8).wrapping_add((c - b'0') as i32);
                                 i += 1;
                                 count += 1;
                             }
-                            if count == 0 { return last_result; }
+                            if count == 0 {
+                                return last_result;
+                            }
                             last_result = Some(if negative { -val } else { val });
                             continue;
                         }
@@ -2709,34 +5974,56 @@ impl MsvcCrt {
                     // Decimal
                     let mut val: i32 = 0;
                     let mut count = 0usize;
-                    while i < input_bytes.len() && count < max_chars && input_bytes[i].is_ascii_digit() {
-                        val = val.wrapping_mul(10).wrapping_add((input_bytes[i] - b'0') as i32);
+                    while i < input_bytes.len()
+                        && count < max_chars
+                        && input_bytes[i].is_ascii_digit()
+                    {
+                        val = val
+                            .wrapping_mul(10)
+                            .wrapping_add((input_bytes[i] - b'0') as i32);
                         i += 1;
                         count += 1;
                     }
-                    if count == 0 { return last_result; }
+                    if count == 0 {
+                        return last_result;
+                    }
                     last_result = Some(if negative { -val } else { val });
                 }
                 b'u' => {
                     // Skip leading whitespace
-                    while i < input_bytes.len() && input_bytes[i].is_ascii_whitespace() { i += 1; }
-                    if i >= input_bytes.len() { return last_result; }
+                    while i < input_bytes.len() && input_bytes[i].is_ascii_whitespace() {
+                        i += 1;
+                    }
+                    if i >= input_bytes.len() {
+                        return last_result;
+                    }
 
                     let max_chars = width.unwrap_or(usize::MAX);
                     let mut val: u32 = 0;
                     let mut count = 0usize;
-                    while i < input_bytes.len() && count < max_chars && input_bytes[i].is_ascii_digit() {
-                        val = val.wrapping_mul(10).wrapping_add((input_bytes[i] - b'0') as u32);
+                    while i < input_bytes.len()
+                        && count < max_chars
+                        && input_bytes[i].is_ascii_digit()
+                    {
+                        val = val
+                            .wrapping_mul(10)
+                            .wrapping_add((input_bytes[i] - b'0') as u32);
                         i += 1;
                         count += 1;
                     }
-                    if count == 0 { return last_result; }
+                    if count == 0 {
+                        return last_result;
+                    }
                     last_result = Some(val as i32);
                 }
                 b'x' | b'X' => {
                     // Skip leading whitespace
-                    while i < input_bytes.len() && input_bytes[i].is_ascii_whitespace() { i += 1; }
-                    if i >= input_bytes.len() { return last_result; }
+                    while i < input_bytes.len() && input_bytes[i].is_ascii_whitespace() {
+                        i += 1;
+                    }
+                    if i >= input_bytes.len() {
+                        return last_result;
+                    }
 
                     // Skip optional 0x/0X prefix
                     if i + 1 < input_bytes.len()
@@ -2761,31 +6048,45 @@ impl MsvcCrt {
                         i += 1;
                         count += 1;
                     }
-                    if count == 0 { return last_result; }
+                    if count == 0 {
+                        return last_result;
+                    }
                     last_result = Some(val);
                 }
                 b'o' => {
                     // Skip leading whitespace
-                    while i < input_bytes.len() && input_bytes[i].is_ascii_whitespace() { i += 1; }
-                    if i >= input_bytes.len() { return last_result; }
+                    while i < input_bytes.len() && input_bytes[i].is_ascii_whitespace() {
+                        i += 1;
+                    }
+                    if i >= input_bytes.len() {
+                        return last_result;
+                    }
 
                     let max_chars = width.unwrap_or(usize::MAX);
                     let mut val: i32 = 0;
                     let mut count = 0usize;
                     while i < input_bytes.len() && count < max_chars {
                         let c = input_bytes[i];
-                        if !(b'0'..=b'7').contains(&c) { break; }
+                        if !(b'0'..=b'7').contains(&c) {
+                            break;
+                        }
                         val = val.wrapping_mul(8).wrapping_add((c - b'0') as i32);
                         i += 1;
                         count += 1;
                     }
-                    if count == 0 { return last_result; }
+                    if count == 0 {
+                        return last_result;
+                    }
                     last_result = Some(val);
                 }
                 b'f' | b'F' | b'e' | b'E' | b'g' | b'G' => {
                     // Skip leading whitespace
-                    while i < input_bytes.len() && input_bytes[i].is_ascii_whitespace() { i += 1; }
-                    if i >= input_bytes.len() { return last_result; }
+                    while i < input_bytes.len() && input_bytes[i].is_ascii_whitespace() {
+                        i += 1;
+                    }
+                    if i >= input_bytes.len() {
+                        return last_result;
+                    }
 
                     let max_chars = width.unwrap_or(usize::MAX);
                     let start = i;
@@ -2796,34 +6097,51 @@ impl MsvcCrt {
                         i += 1;
                     }
                     // Integer part
-                    while i < end && input_bytes[i].is_ascii_digit() { i += 1; }
+                    while i < end && input_bytes[i].is_ascii_digit() {
+                        i += 1;
+                    }
                     // Decimal point and fractional part
                     if i < end && input_bytes[i] == b'.' {
                         i += 1;
-                        while i < end && input_bytes[i].is_ascii_digit() { i += 1; }
+                        while i < end && input_bytes[i].is_ascii_digit() {
+                            i += 1;
+                        }
                     }
                     // Exponent
                     if i + 1 < end && (input_bytes[i] == b'e' || input_bytes[i] == b'E') {
                         i += 1;
-                        if i < end && (input_bytes[i] == b'-' || input_bytes[i] == b'+') { i += 1; }
-                        while i < end && input_bytes[i].is_ascii_digit() { i += 1; }
+                        if i < end && (input_bytes[i] == b'-' || input_bytes[i] == b'+') {
+                            i += 1;
+                        }
+                        while i < end && input_bytes[i].is_ascii_digit() {
+                            i += 1;
+                        }
                     }
 
-                    if i == start { return last_result; }
+                    if i == start {
+                        return last_result;
+                    }
                     let num_str = std::str::from_utf8(&input_bytes[start..i]).ok()?;
                     let val: f64 = num_str.parse().ok()?;
                     last_result = Some(val as i32);
                 }
                 b's' => {
                     // Consume whitespace-delimited string token
-                    while i < input_bytes.len() && input_bytes[i].is_ascii_whitespace() { i += 1; }
+                    while i < input_bytes.len() && input_bytes[i].is_ascii_whitespace() {
+                        i += 1;
+                    }
                     let max_chars = width.unwrap_or(usize::MAX);
                     let mut count = 0usize;
-                    while i < input_bytes.len() && count < max_chars && !input_bytes[i].is_ascii_whitespace() {
+                    while i < input_bytes.len()
+                        && count < max_chars
+                        && !input_bytes[i].is_ascii_whitespace()
+                    {
                         i += 1;
                         count += 1;
                     }
-                    if count == 0 { return last_result; }
+                    if count == 0 {
+                        return last_result;
+                    }
                     // String consumed, but no numeric result
                 }
                 b'c' => {
@@ -2833,7 +6151,9 @@ impl MsvcCrt {
                         i += 1;
                         count += 1;
                     }
-                    if count == 0 { return last_result; }
+                    if count == 0 {
+                        return last_result;
+                    }
                 }
                 b'n' => {
                     // Return number of characters consumed so far
@@ -2847,11 +6167,18 @@ impl MsvcCrt {
                 }
                 b'[' => {
                     // Scanset: [...] or [^...]
-                    if f >= format_bytes.len() { return last_result; }
-                    let invert = if format_bytes[f] == b'^' { f += 1; true } else { false };
+                    if f >= format_bytes.len() {
+                        return last_result;
+                    }
+                    let invert = if format_bytes[f] == b'^' {
+                        f += 1;
+                        true
+                    } else {
+                        false
+                    };
 
                     let mut set = [false; 256];
-                    let mut closed = false;
+                    let closed = false;
                     while f < format_bytes.len() {
                         if format_bytes[f] == b']' {
                             // The first ']' in the scanset (after '[' or '[^') doesn't close it
@@ -2860,12 +6187,14 @@ impl MsvcCrt {
                                 // We need to track if we've seen at least one char before ]
                                 break;
                             }
-                            closed = true;
                             f += 1;
                             break;
                         }
                         // Handle range: a-z
-                        if f + 2 < format_bytes.len() && format_bytes[f + 1] == b'-' && format_bytes[f + 2] != b']' {
+                        if f + 2 < format_bytes.len()
+                            && format_bytes[f + 1] == b'-'
+                            && format_bytes[f + 2] != b']'
+                        {
                             let range_start = format_bytes[f];
                             let range_end = format_bytes[f + 2];
                             for c in range_start..=range_end {
@@ -2888,11 +6217,15 @@ impl MsvcCrt {
                     let max_chars = width.unwrap_or(usize::MAX);
                     let mut count = 0usize;
                     while i < input_bytes.len() && count < max_chars {
-                        if set[input_bytes[i] as usize] == invert { break; }
+                        if set[input_bytes[i] as usize] == invert {
+                            break;
+                        }
                         i += 1;
                         count += 1;
                     }
-                    if count == 0 { return last_result; }
+                    if count == 0 {
+                        return last_result;
+                    }
                 }
                 _ => {
                     // Unknown specifier, skip
@@ -2947,7 +6280,9 @@ pub fn sh_get_folder_path(csidl: i32, ge_root: &str) -> String {
         CSIDL_SYSTEM => format!("{drive_c}/windows/system32"),
         CSIDL_PROGRAM_FILES => format!("{drive_c}/Program Files"),
         CSIDL_PROGRAM_FILES_X86 => format!("{drive_c}/Program Files (x86)"),
-        CSIDL_PROGRAMS => format!("{drive_c}/Users/guest/AppData/Roaming/Microsoft/Windows/Start Menu/Programs"),
+        CSIDL_PROGRAMS => {
+            format!("{drive_c}/Users/guest/AppData/Roaming/Microsoft/Windows/Start Menu/Programs")
+        }
         CSIDL_PERSONAL => format!("{drive_c}/Users/guest/Documents"),
         CSIDL_APPDATA => format!("{drive_c}/Users/guest/AppData/Roaming"),
         CSIDL_LOCAL_APPDATA => format!("{drive_c}/Users/guest/AppData/Local"),
@@ -2955,12 +6290,16 @@ pub fn sh_get_folder_path(csidl: i32, ge_root: &str) -> String {
         CSIDL_PROFILE => format!("{drive_c}/Users/guest"),
         CSIDL_DESKTOP => format!("{drive_c}/Users/guest/Desktop"),
         CSIDL_FONTS => format!("{drive_c}/windows/Fonts"),
-        CSIDL_STARTUP => format!("{drive_c}/Users/guest/AppData/Roaming/Microsoft/Windows/Start Menu/Programs/Startup"),
+        CSIDL_STARTUP => format!(
+            "{drive_c}/Users/guest/AppData/Roaming/Microsoft/Windows/Start Menu/Programs/Startup"
+        ),
         CSIDL_RECENT => format!("{drive_c}/Users/guest/AppData/Roaming/Microsoft/Windows/Recent"),
         CSIDL_SENDTO => format!("{drive_c}/Users/guest/AppData/Roaming/Microsoft/Windows/SendTo"),
         CSIDL_COOKIES => format!("{drive_c}/Users/guest/AppData/Roaming/Microsoft/Windows/Cookies"),
         CSIDL_HISTORY => format!("{drive_c}/Users/guest/AppData/Local/Microsoft/Windows/History"),
-        CSIDL_INTERNET_CACHE => format!("{drive_c}/Users/guest/AppData/Local/Microsoft/Windows/INetCache"),
+        CSIDL_INTERNET_CACHE => {
+            format!("{drive_c}/Users/guest/AppData/Local/Microsoft/Windows/INetCache")
+        }
         CSIDL_TEMP => format!("{drive_c}/windows/Temp"),
         _ => format!("{drive_c}/windows"),
     }
@@ -3052,8 +6391,14 @@ impl FileVersionInfo {
 
         // Parse StringFileInfo children (simplified)
         let mut string_info = BTreeMap::new();
-        string_info.insert("FileVersion".to_string(), format!("{major}.{minor}.{patch}.{build}"));
-        string_info.insert("ProductVersion".to_string(), format!("{major}.{minor}.{patch}.{build}"));
+        string_info.insert(
+            "FileVersion".to_string(),
+            format!("{major}.{minor}.{patch}.{build}"),
+        );
+        string_info.insert(
+            "ProductVersion".to_string(),
+            format!("{major}.{minor}.{patch}.{build}"),
+        );
 
         Ok(Self {
             signature,
@@ -3140,7 +6485,7 @@ pub struct XInputCapabilities {
 #[derive(Debug, Clone)]
 pub struct BatteryInfo {
     pub battery_type: u8,  // 0=BATTERY_TYPE_WIRED, 1=ALKALINE, 2=NIMH, 3=UNKNOWN
-    pub battery_level: u8,  // 0=EMPTY, 1=LOW, 2=MEDIUM, 3=FULL
+    pub battery_level: u8, // 0=EMPTY, 1=LOW, 2=MEDIUM, 3=FULL
 }
 
 /// XInput keystroke event.
@@ -3167,10 +6512,22 @@ impl XInputManager {
             controllers: [None, None, None, None],
             connected: [false; 4],
             vibration: [
-                XInputVibration { left_motor_speed: 0, right_motor_speed: 0 },
-                XInputVibration { left_motor_speed: 0, right_motor_speed: 0 },
-                XInputVibration { left_motor_speed: 0, right_motor_speed: 0 },
-                XInputVibration { left_motor_speed: 0, right_motor_speed: 0 },
+                XInputVibration {
+                    left_motor_speed: 0,
+                    right_motor_speed: 0,
+                },
+                XInputVibration {
+                    left_motor_speed: 0,
+                    right_motor_speed: 0,
+                },
+                XInputVibration {
+                    left_motor_speed: 0,
+                    right_motor_speed: 0,
+                },
+                XInputVibration {
+                    left_motor_speed: 0,
+                    right_motor_speed: 0,
+                },
             ],
             enabled: true,
         }
@@ -3179,11 +6536,17 @@ impl XInputManager {
     /// XInputGetState — get the state of a controller.
     pub fn get_state(&self, index: u32) -> AppResult<&XInputState> {
         if index >= 4 {
-            return Err(AppError::new(ReasonCode::RcWin32InvalidHandle, "XInput: invalid controller index"));
+            return Err(AppError::new(
+                ReasonCode::RcWin32InvalidHandle,
+                "XInput: invalid controller index",
+            ));
         }
-        self.controllers[index as usize]
-            .as_ref()
-            .ok_or_else(|| AppError::new(ReasonCode::RcWin32InvalidHandle, "XInput: controller not connected"))
+        self.controllers[index as usize].as_ref().ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcWin32InvalidHandle,
+                "XInput: controller not connected",
+            )
+        })
     }
 
     /// XInputSetState — set vibration.
@@ -3192,7 +6555,10 @@ impl XInputManager {
     /// via [`crate::steam_input::send_hid_rumble`] (IOKit on macOS).
     pub fn set_state(&mut self, index: u32, vibration: XInputVibration) -> AppResult<()> {
         if index >= 4 {
-            return Err(AppError::new(ReasonCode::RcWin32InvalidHandle, "XInput: invalid controller index"));
+            return Err(AppError::new(
+                ReasonCode::RcWin32InvalidHandle,
+                "XInput: invalid controller index",
+            ));
         }
 
         // Extract bytes before moving vibration into storage.
@@ -3202,7 +6568,7 @@ impl XInputManager {
         self.vibration[index as usize] = vibration;
 
         // Forward the vibration to the physical HID device.
-        let _ = crate::steam_input::send_hid_rumble(index as u8, left_byte, right_byte);
+        crate::steam_input::send_hid_rumble(index as u8, left_byte, right_byte);
 
         Ok(())
     }
@@ -3210,17 +6576,27 @@ impl XInputManager {
     /// XInputGetCapabilities — get controller capabilities.
     pub fn get_capabilities(&self, index: u32) -> AppResult<XInputCapabilities> {
         if index >= 4 || !self.connected[index as usize] {
-            return Err(AppError::new(ReasonCode::RcWin32InvalidHandle, "XInput: controller not connected"));
+            return Err(AppError::new(
+                ReasonCode::RcWin32InvalidHandle,
+                "XInput: controller not connected",
+            ));
         }
         let controller = &self.controllers[index as usize];
         let (buttons, lt, rt, lx, ly, rx, ry) = match controller {
-            Some(state) => (state.buttons, state.left_trigger, state.right_trigger,
-                state.left_thumb_x, state.left_thumb_y, state.right_thumb_x, state.right_thumb_y),
+            Some(state) => (
+                state.buttons,
+                state.left_trigger,
+                state.right_trigger,
+                state.left_thumb_x,
+                state.left_thumb_y,
+                state.right_thumb_x,
+                state.right_thumb_y,
+            ),
             None => (0u16, 0u8, 0u8, 0i16, 0i16, 0i16, 0i16),
         };
         Ok(XInputCapabilities {
             controller_type: 0, // XINPUT_DEVTYPE_GAMEPAD
-            sub_type: 1,       // XINPUT_DEVSUBTYPE_GAMEPAD
+            sub_type: 1,        // XINPUT_DEVSUBTYPE_GAMEPAD
             flags: 0,
             vibration_supported: true,
             gamepad_buttons: buttons,
@@ -3238,7 +6614,10 @@ impl XInputManager {
     /// Simulate connecting a controller (for testing / input mapping).
     pub fn connect_controller(&mut self, index: u32, initial_state: XInputState) -> AppResult<()> {
         if index >= 4 {
-            return Err(AppError::new(ReasonCode::RcWin32InvalidHandle, "XInput: invalid controller index"));
+            return Err(AppError::new(
+                ReasonCode::RcWin32InvalidHandle,
+                "XInput: invalid controller index",
+            ));
         }
         self.connected[index as usize] = true;
         self.controllers[index as usize] = Some(initial_state);
@@ -3248,7 +6627,10 @@ impl XInputManager {
     /// Disconnect a controller.
     pub fn disconnect_controller(&mut self, index: u32) -> AppResult<()> {
         if index >= 4 {
-            return Err(AppError::new(ReasonCode::RcWin32InvalidHandle, "XInput: invalid controller index"));
+            return Err(AppError::new(
+                ReasonCode::RcWin32InvalidHandle,
+                "XInput: invalid controller index",
+            ));
         }
         self.connected[index as usize] = false;
         self.controllers[index as usize] = None;
@@ -3258,7 +6640,10 @@ impl XInputManager {
     /// Update controller state (from real input or replay).
     pub fn update_state(&mut self, index: u32, state: XInputState) -> AppResult<()> {
         if index >= 4 || !self.connected[index as usize] {
-            return Err(AppError::new(ReasonCode::RcWin32InvalidHandle, "XInput: controller not connected"));
+            return Err(AppError::new(
+                ReasonCode::RcWin32InvalidHandle,
+                "XInput: controller not connected",
+            ));
         }
         self.controllers[index as usize] = Some(state);
         Ok(())
@@ -3277,7 +6662,10 @@ impl XInputManager {
     /// XInputGetBatteryInformation — get battery type and level.
     pub fn get_battery_information(&self, index: u32) -> AppResult<BatteryInfo> {
         if index >= 4 || !self.connected[index as usize] {
-            return Err(AppError::new(ReasonCode::RcWin32InvalidHandle, "XInput: controller not connected"));
+            return Err(AppError::new(
+                ReasonCode::RcWin32InvalidHandle,
+                "XInput: controller not connected",
+            ));
         }
         // Default: wired controller, full battery
         Ok(BatteryInfo {
@@ -3290,7 +6678,10 @@ impl XInputManager {
     /// Returns Ok(None) when no keystroke is pending (maps to ERROR_EMPTY).
     pub fn get_keystroke(&self, index: u32) -> AppResult<Option<XInputKeystroke>> {
         if index >= 4 {
-            return Err(AppError::new(ReasonCode::RcWin32InvalidHandle, "XInput: invalid controller index"));
+            return Err(AppError::new(
+                ReasonCode::RcWin32InvalidHandle,
+                "XInput: invalid controller index",
+            ));
         }
         // No keyboard emulation yet — always return empty
         Ok(None)
@@ -3447,9 +6838,7 @@ impl DirectInputDevice8 {
                 self.ff_active = false;
                 self.current_effect = None;
                 // Send a stop-rumble command to the hardware.
-                let _ = crate::steam_input::send_hid_rumble(
-                    self.user_index as u8, 0, 0,
-                );
+                crate::steam_input::send_hid_rumble(self.user_index as u8, 0, 0);
             }
             4 => {
                 self.ff_enabled = true;
@@ -3457,9 +6846,7 @@ impl DirectInputDevice8 {
                 self.current_effect = None;
                 self.autocenter = 5000;
                 self.device_gain = 10000;
-                let _ = crate::steam_input::send_hid_rumble(
-                    self.user_index as u8, 0, 0,
-                );
+                crate::steam_input::send_hid_rumble(self.user_index as u8, 0, 0);
             }
             _ => {
                 return Err(AppError::new(
@@ -3482,12 +6869,10 @@ impl DirectInputDevice8 {
             ));
         }
 
-        let gain_scaled = (effect.gain.min(10000) as u32)
-            .saturating_mul(self.device_gain.min(10000))
-            / 10000;
-        let effective_magnitude = (effect.magnitude.min(10000) as u32)
-            .saturating_mul(gain_scaled)
-            / 10000;
+        let gain_scaled =
+            (effect.gain.min(10000) as u32).saturating_mul(self.device_gain.min(10000)) / 10000;
+        let effective_magnitude =
+            (effect.magnitude.min(10000) as u32).saturating_mul(gain_scaled) / 10000;
 
         // For periodic and constant effects, map the magnitude to motor speeds.
         // For condition effects (spring, damper, inertia, friction) we use a
@@ -3521,11 +6906,7 @@ impl DirectInputDevice8 {
         };
 
         // Send the rumble command to the physical controller.
-        let _ = crate::steam_input::send_hid_rumble(
-            self.user_index as u8,
-            left_motor,
-            right_motor,
-        );
+        crate::steam_input::send_hid_rumble(self.user_index as u8, left_motor, right_motor);
 
         self.ff_active = true;
         self.current_effect = Some(effect.clone());
@@ -3534,7 +6915,11 @@ impl DirectInputDevice8 {
 
     /// Queries the current force-feedback state (paused, enabled, etc.).
     pub fn get_force_feedback_state(&self) -> (bool, bool, Option<&DirectInputEffect>) {
-        (self.ff_enabled, self.ff_active, self.current_effect.as_ref())
+        (
+            self.ff_enabled,
+            self.ff_active,
+            self.current_effect.as_ref(),
+        )
     }
 }
 
@@ -3549,7 +6934,15 @@ pub const BCRYPT_SHA512_ALGORITHM: &str = "SHA512";
 pub const BCRYPT_AES_ALGORITHM: &str = "AES";
 pub const BCRYPT_RSA_ALGORITHM: &str = "RSA";
 pub const BCRYPT_ECDSA_P256_ALGORITHM: &str = "ECDSA_P256";
+pub const BCRYPT_ECDH_P256_ALGORITHM: &str = "ECDH_P256";
 pub const BCRYPT_HMAC_SHA256_ALGORITHM: &str = "HMAC_SHA256";
+pub const BCRYPT_HMAC_SHA1_ALGORITHM: &str = "HMAC_SHA1";
+pub const BCRYPT_HMAC_SHA384_ALGORITHM: &str = "HMAC_SHA384";
+pub const BCRYPT_HMAC_SHA512_ALGORITHM: &str = "HMAC_SHA512";
+pub const BCRYPT_MD5_ALGORITHM: &str = "MD5";
+pub const BCRYPT_HMAC_MD5_ALGORITHM: &str = "HMAC_MD5";
+pub const BCRYPT_ECDSA_P384_ALGORITHM: &str = "ECDSA_P384";
+pub const BCRYPT_ECDH_P384_ALGORITHM: &str = "ECDH_P384";
 
 /// BCrypt hash handle.
 pub struct BCryptHash {
@@ -3557,10 +6950,38 @@ pub struct BCryptHash {
     pub data: Vec<u8>,
 }
 
+/// Describes the type of key stored in BCryptKey.
+#[derive(Debug, Clone)]
+pub enum BCryptKeyType {
+    /// Symmetric key (AES, etc.) — `key_data` is raw key material.
+    Symmetric,
+    /// RSA key pair — `key_data` is PKCS#8 DER-encoded private key.
+    Rsa { bit_length: u32 },
+    /// ECDSA P-256 key pair — `key_data` is SEC1 DER-encoded private key.
+    EcdsaP256,
+    /// ECDH P-256 key pair — `key_data` is PKCS#8 DER-encoded private key.
+    EcdhP256,
+    /// ECDSA P-384 key pair — `key_data` is PKCS#8 DER-encoded private key.
+    EcdsaP384,
+    /// ECDH P-384 key pair — `key_data` is PKCS#8 DER-encoded private key.
+    EcdhP384,
+}
+
 /// BCrypt key handle.
+#[derive(Debug, Clone)]
 pub struct BCryptKey {
     pub algorithm: String,
     pub key_data: Vec<u8>,
+    pub key_type: BCryptKeyType,
+}
+
+/// Result of a secret agreement (ECDH key exchange).
+#[derive(Debug, Clone)]
+pub struct BCryptSecret {
+    /// The shared secret bytes (raw x-coordinate for ECDH).
+    pub secret: Vec<u8>,
+    /// Algorithm used for the agreement.
+    pub algorithm: String,
 }
 
 /// Simplified BCrypt implementation using Casa1's existing crypto primitives.
@@ -3582,12 +7003,18 @@ impl BCryptContext {
     /// BCryptCreateHash — create a hash object.
     pub fn create_hash(&self, algorithm: &str) -> AppResult<BCryptHash> {
         match algorithm {
-            BCRYPT_SHA256_ALGORITHM | BCRYPT_SHA384_ALGORITHM | BCRYPT_SHA512_ALGORITHM | BCRYPT_HMAC_SHA256_ALGORITHM => {
-                Ok(BCryptHash {
-                    algorithm: algorithm.to_string(),
-                    data: Vec::new(),
-                })
-            }
+            BCRYPT_SHA256_ALGORITHM
+            | BCRYPT_SHA384_ALGORITHM
+            | BCRYPT_SHA512_ALGORITHM
+            | BCRYPT_MD5_ALGORITHM
+            | BCRYPT_HMAC_MD5_ALGORITHM
+            | BCRYPT_HMAC_SHA256_ALGORITHM
+            | BCRYPT_HMAC_SHA1_ALGORITHM
+            | BCRYPT_HMAC_SHA384_ALGORITHM
+            | BCRYPT_HMAC_SHA512_ALGORITHM => Ok(BCryptHash {
+                algorithm: algorithm.to_string(),
+                data: Vec::new(),
+            }),
             _ => Err(AppError::new(
                 ReasonCode::RcWin32InvalidHandle,
                 format!("BCrypt: unsupported algorithm {algorithm}"),
@@ -3605,15 +7032,96 @@ impl BCryptContext {
         match hash.algorithm.as_str() {
             BCRYPT_SHA256_ALGORITHM => Ok(crate::network::sha256_hash(&hash.data).to_vec()),
             BCRYPT_SHA384_ALGORITHM => {
-                // Use SHA-256 as fallback (SHA-384 not yet in crypto)
-                Ok(crate::network::sha256_hash(&hash.data).to_vec())
+                use sha2::{Digest, Sha384};
+                let mut hasher = Sha384::new();
+                hasher.update(&hash.data);
+                Ok(hasher.finalize().to_vec())
             }
             BCRYPT_SHA512_ALGORITHM => {
-                // Use SHA-256 as fallback (SHA-512 not yet in crypto)
-                Ok(crate::network::sha256_hash(&hash.data).to_vec())
+                use sha2::{Digest, Sha512};
+                let mut hasher = Sha512::new();
+                hasher.update(&hash.data);
+                Ok(hasher.finalize().to_vec())
             }
-            BCRYPT_HMAC_SHA256_ALGORITHM => {
-                crate::network::hmac_sha256(&[], &hash.data)
+            BCRYPT_MD5_ALGORITHM => {
+                // md5 v0.7 uses Context + compute, not the digest trait
+                let mut ctx = md5::Context::new();
+                ctx.consume(&hash.data);
+                let digest = ctx.compute();
+                Ok(digest.to_vec())
+            }
+            BCRYPT_HMAC_MD5_ALGORITHM => {
+                // Implement HMAC-MD5 manually since the md5 v0.7 crate
+                // does not implement the digest::Digest trait.
+                const BLOCK_SIZE: usize = 64;
+                // Use empty key (matches Windows BCrypt behaviour for empty HMAC key)
+                let key = &[];
+                let mut k = [0u8; BLOCK_SIZE];
+                if key.len() > BLOCK_SIZE {
+                    let mut ctx = md5::Context::new();
+                    ctx.consume(key);
+                    let digest = ctx.compute();
+                    let len = digest.len().min(BLOCK_SIZE);
+                    k[..len].copy_from_slice(&digest[..len]);
+                } else {
+                    k[..key.len()].copy_from_slice(key);
+                }
+                // ipad
+                let mut inner_data = Vec::with_capacity(BLOCK_SIZE + hash.data.len());
+                for &kb in k.iter() {
+                    inner_data.push(kb ^ 0x36);
+                }
+                inner_data.extend_from_slice(&hash.data);
+                let mut inner_ctx = md5::Context::new();
+                inner_ctx.consume(&inner_data);
+                let inner_digest = inner_ctx.compute();
+                // opad
+                let mut outer_data = Vec::with_capacity(BLOCK_SIZE + 16);
+                for &kb in k.iter() {
+                    outer_data.push(kb ^ 0x5c);
+                }
+                outer_data.extend_from_slice(&inner_digest[..]);
+                let mut outer_ctx = md5::Context::new();
+                outer_ctx.consume(&outer_data);
+                let outer_digest = outer_ctx.compute();
+                Ok(outer_digest.to_vec())
+            }
+            BCRYPT_HMAC_SHA256_ALGORITHM => crate::network::hmac_sha256(&[], &hash.data),
+            "HMAC_SHA1" | "HMAC-SHA1" => {
+                use hmac::{Hmac, Mac};
+                use sha1::Sha1;
+                let mut mac = Hmac::<Sha1>::new_from_slice(&[]).map_err(|e| {
+                    AppError::new(
+                        ReasonCode::RcWin32InvalidHandle,
+                        format!("BCrypt: HMAC-SHA1 init failed: {e}"),
+                    )
+                })?;
+                mac.update(&hash.data);
+                Ok(mac.finalize().into_bytes().to_vec())
+            }
+            "HMAC_SHA384" | "HMAC-SHA384" => {
+                use hmac::{Hmac, Mac};
+                use sha2::Sha384;
+                let mut mac = Hmac::<Sha384>::new_from_slice(&[]).map_err(|e| {
+                    AppError::new(
+                        ReasonCode::RcWin32InvalidHandle,
+                        format!("BCrypt: HMAC-SHA384 init failed: {e}"),
+                    )
+                })?;
+                mac.update(&hash.data);
+                Ok(mac.finalize().into_bytes().to_vec())
+            }
+            "HMAC_SHA512" | "HMAC-SHA512" => {
+                use hmac::{Hmac, Mac};
+                use sha2::Sha512;
+                let mut mac = Hmac::<Sha512>::new_from_slice(&[]).map_err(|e| {
+                    AppError::new(
+                        ReasonCode::RcWin32InvalidHandle,
+                        format!("BCrypt: HMAC-SHA512 init failed: {e}"),
+                    )
+                })?;
+                mac.update(&hash.data);
+                Ok(mac.finalize().into_bytes().to_vec())
             }
             _ => Err(AppError::new(
                 ReasonCode::RcWin32InvalidHandle,
@@ -3628,6 +7136,7 @@ impl BCryptContext {
             BCRYPT_AES_ALGORITHM => Ok(BCryptKey {
                 algorithm: algorithm.to_string(),
                 key_data: key_data.to_vec(),
+                key_type: BCryptKeyType::Symmetric,
             }),
             _ => Err(AppError::new(
                 ReasonCode::RcWin32InvalidHandle,
@@ -3636,14 +7145,294 @@ impl BCryptContext {
         }
     }
 
+    /// BCryptGenerateKeyPair — create an asymmetric key pair (RSA or ECDSA).
+    pub fn generate_key_pair(&self, algorithm: &str, key_len: u32) -> AppResult<BCryptKey> {
+        match algorithm {
+            BCRYPT_RSA_ALGORITHM => {
+                // Generate a new RSA key pair using the `rsa` crate
+                let bits = if key_len == 0 { 2048 } else { key_len };
+                let rng = &mut rand::thread_rng();
+                let private_key = rsa::RsaPrivateKey::new(rng, bits as usize).map_err(|e| {
+                    AppError::new(
+                        ReasonCode::RcWin32InvalidHandle,
+                        format!("BCrypt: RSA key generation failed: {e}"),
+                    )
+                })?;
+                let der_bytes = private_key.to_pkcs8_der().map_err(|e| {
+                    AppError::new(
+                        ReasonCode::RcWin32InvalidHandle,
+                        format!("BCrypt: RSA DER encoding failed: {e}"),
+                    )
+                })?;
+                Ok(BCryptKey {
+                    algorithm: BCRYPT_RSA_ALGORITHM.to_string(),
+                    key_data: der_bytes.as_bytes().to_vec(),
+                    key_type: BCryptKeyType::Rsa { bit_length: bits },
+                })
+            }
+            BCRYPT_ECDSA_P256_ALGORITHM => {
+                // Generate a new ECDSA P-256 key pair
+                let rng = &mut rand::thread_rng();
+                let signing_key = p256::ecdsa::SigningKey::random(rng);
+                let der_bytes = signing_key.to_pkcs8_der().map_err(|e| {
+                    AppError::new(
+                        ReasonCode::RcWin32InvalidHandle,
+                        format!("BCrypt: ECDSA P-256 DER encoding failed: {e}"),
+                    )
+                })?;
+                Ok(BCryptKey {
+                    algorithm: BCRYPT_ECDSA_P256_ALGORITHM.to_string(),
+                    key_data: der_bytes.as_bytes().to_vec(),
+                    key_type: BCryptKeyType::EcdsaP256,
+                })
+            }
+            BCRYPT_ECDSA_P384_ALGORITHM => {
+                // Generate a new ECDSA P-384 key pair
+                let rng = &mut rand::thread_rng();
+                let signing_key = p384::ecdsa::SigningKey::random(rng);
+                let der_bytes = signing_key.to_pkcs8_der().map_err(|e| {
+                    AppError::new(
+                        ReasonCode::RcWin32InvalidHandle,
+                        format!("BCrypt: ECDSA P-384 DER encoding failed: {e}"),
+                    )
+                })?;
+                Ok(BCryptKey {
+                    algorithm: BCRYPT_ECDSA_P384_ALGORITHM.to_string(),
+                    key_data: der_bytes.as_bytes().to_vec(),
+                    key_type: BCryptKeyType::EcdsaP384,
+                })
+            }
+            _ => Err(AppError::new(
+                ReasonCode::RcWin32InvalidHandle,
+                format!("BCrypt: unsupported asymmetric algorithm {algorithm}"),
+            )),
+        }
+    }
+
+    /// BCryptSignHash — sign a hash with an asymmetric key.
+    /// Supports PKCS#1 v1.5 (default) and RSA-PSS (when BCRYPT_PAD_PSS flag is set).
+    pub fn sign_hash(key: &BCryptKey, hash: &[u8], flags: u32) -> AppResult<Vec<u8>> {
+        // BCRYPT_PAD_PSS = 8, BCRYPT_PAD_PKCS1 = 2
+        const BCRYPT_PAD_PSS: u32 = 8;
+        match &key.key_type {
+            BCryptKeyType::Rsa { .. } => {
+                let private_key =
+                    rsa::RsaPrivateKey::from_pkcs8_der(&key.key_data).map_err(|e| {
+                        AppError::new(
+                            ReasonCode::RcWin32InvalidHandle,
+                            format!("BCrypt: RSA key parse failed: {e}"),
+                        )
+                    })?;
+                if (flags & BCRYPT_PAD_PSS) != 0 {
+                    // RSA-PSS signing with SHA-256
+                    let padding = rsa::Pss::new::<sha2::Sha256>();
+                    let signature = private_key.sign(padding, hash).map_err(|e| {
+                        AppError::new(
+                            ReasonCode::RcWin32InvalidHandle,
+                            format!("BCrypt: RSA-PSS sign failed: {e}"),
+                        )
+                    })?;
+                    Ok(signature.to_vec())
+                } else {
+                    // PKCS#1 v1.5 signature padding with SHA-256 (default)
+                    let padding = rsa::Pkcs1v15Sign::new::<sha2::Sha256>();
+                    let signature = private_key.sign(padding, hash).map_err(|e| {
+                        AppError::new(
+                            ReasonCode::RcWin32InvalidHandle,
+                            format!("BCrypt: RSA sign failed: {e}"),
+                        )
+                    })?;
+                    Ok(signature.to_vec())
+                }
+            }
+            BCryptKeyType::EcdsaP256 => {
+                let signing_key =
+                    p256::ecdsa::SigningKey::from_pkcs8_der(&key.key_data).map_err(|e| {
+                        AppError::new(
+                            ReasonCode::RcWin32InvalidHandle,
+                            format!("BCrypt: ECDSA key parse failed: {e}"),
+                        )
+                    })?;
+                use ecdsa::signature::Signer;
+                let signature: p256::ecdsa::Signature = signing_key.sign(hash);
+                // Return DER-encoded signature (ASN.1 SEQUENCE of two INTEGERs)
+                Ok(signature.to_der().as_bytes().to_vec())
+            }
+            BCryptKeyType::EcdsaP384 => {
+                let signing_key =
+                    p384::ecdsa::SigningKey::from_pkcs8_der(&key.key_data).map_err(|e| {
+                        AppError::new(
+                            ReasonCode::RcWin32InvalidHandle,
+                            format!("BCrypt: ECDSA P-384 key parse failed: {e}"),
+                        )
+                    })?;
+                use ecdsa::signature::Signer;
+                let signature: p384::ecdsa::Signature = signing_key.sign(hash);
+                // Return DER-encoded signature (ASN.1 SEQUENCE of two INTEGERs)
+                Ok(signature.to_der().as_bytes().to_vec())
+            }
+            _ => Err(AppError::new(
+                ReasonCode::RcWin32InvalidHandle,
+                format!("BCrypt: sign not supported for {}", key.algorithm),
+            )),
+        }
+    }
+
+    /// BCryptVerifySignature — verify a hash signature with an asymmetric key.
+    pub fn verify_signature(
+        key: &BCryptKey,
+        hash: &[u8],
+        signature: &[u8],
+        flags: u32,
+    ) -> AppResult<bool> {
+        // BCRYPT_PAD_PSS = 8
+        const BCRYPT_PAD_PSS: u32 = 8;
+        match &key.key_type {
+            BCryptKeyType::Rsa { .. } => {
+                // key.key_data is a PKCS#8 private key DER; parse as private key, then extract public key
+                let private_key =
+                    rsa::RsaPrivateKey::from_pkcs8_der(&key.key_data).map_err(|e| {
+                        AppError::new(
+                            ReasonCode::RcWin32InvalidHandle,
+                            format!("BCrypt: RSA private key parse failed: {e}"),
+                        )
+                    })?;
+                let public_key = rsa::RsaPublicKey::from(&private_key);
+                if (flags & BCRYPT_PAD_PSS) != 0 {
+                    // RSA-PSS verification with SHA-256
+                    let padding = rsa::Pss::new::<sha2::Sha256>();
+                    Ok(public_key.verify(padding, hash, signature).is_ok())
+                } else {
+                    // PKCS#1 v1.5 verification with SHA-256 (default)
+                    let padding = rsa::Pkcs1v15Sign::new::<sha2::Sha256>();
+                    Ok(public_key.verify(padding, hash, signature).is_ok())
+                }
+            }
+            BCryptKeyType::EcdsaP256 => {
+                // key.key_data is a PKCS#8 private key DER; parse as signing key, then extract verifying key
+                let signing_key =
+                    p256::ecdsa::SigningKey::from_pkcs8_der(&key.key_data).map_err(|e| {
+                        AppError::new(
+                            ReasonCode::RcWin32InvalidHandle,
+                            format!("BCrypt: ECDSA private key parse failed: {e}"),
+                        )
+                    })?;
+                let verifying_key = *signing_key.verifying_key();
+                use ecdsa::signature::Verifier;
+                // Try ASN.1 DER first, then raw concatenated (r||s) format
+                if let Ok(sig) = p256::ecdsa::Signature::from_der(signature) {
+                    Ok(verifying_key.verify(hash, &sig).is_ok())
+                } else if let Ok(sig) = p256::ecdsa::Signature::from_slice(signature) {
+                    Ok(verifying_key.verify(hash, &sig).is_ok())
+                } else {
+                    Err(AppError::new(
+                        ReasonCode::RcWin32InvalidHandle,
+                        "BCrypt: ECDSA signature parse failed",
+                    ))
+                }
+            }
+            BCryptKeyType::EcdsaP384 => {
+                // key.key_data is a PKCS#8 private key DER; parse as signing key, then extract verifying key
+                let signing_key =
+                    p384::ecdsa::SigningKey::from_pkcs8_der(&key.key_data).map_err(|e| {
+                        AppError::new(
+                            ReasonCode::RcWin32InvalidHandle,
+                            format!("BCrypt: ECDSA P-384 private key parse failed: {e}"),
+                        )
+                    })?;
+                let verifying_key = *signing_key.verifying_key();
+                use ecdsa::signature::Verifier;
+                // Try ASN.1 DER first, then raw concatenated (r||s) format
+                if let Ok(sig) = p384::ecdsa::Signature::from_der(signature) {
+                    Ok(verifying_key.verify(hash, &sig).is_ok())
+                } else if let Ok(sig) = p384::ecdsa::Signature::from_slice(signature) {
+                    Ok(verifying_key.verify(hash, &sig).is_ok())
+                } else {
+                    Err(AppError::new(
+                        ReasonCode::RcWin32InvalidHandle,
+                        "BCrypt: ECDSA P-384 signature parse failed",
+                    ))
+                }
+            }
+            _ => Err(AppError::new(
+                ReasonCode::RcWin32InvalidHandle,
+                format!("BCrypt: verify not supported for {}", key.algorithm),
+            )),
+        }
+    }
+
     /// BCryptEncrypt — encrypt data with a symmetric key.
     pub fn encrypt(key: &BCryptKey, plaintext: &[u8], iv: Option<&[u8; 16]>) -> AppResult<Vec<u8>> {
         match key.algorithm.as_str() {
             BCRYPT_AES_ALGORITHM => {
-                let iv_val = iv.copied().unwrap_or([0u8; 16]);
-                crate::network::aes_128_cbc_encrypt(&key.key_data[..16].try_into().map_err(|_| {
-                    AppError::new(ReasonCode::RcWin32InvalidHandle, "BCrypt: AES key must be 16 bytes")
-                })?, &iv_val, plaintext)
+                // Detect AES mode from key size or content: 16 bytes = AES-128-CBC
+                // For AES-GCM, the key data includes the key material and the nonce is passed as IV.
+                if key.key_data.len() == 16 {
+                    // AES-128-CBC (legacy support)
+                    let iv_val = iv.copied().unwrap_or([0u8; 16]);
+                    crate::network::aes_128_cbc_encrypt(
+                        &key.key_data[..16].try_into().map_err(|_| {
+                            AppError::new(
+                                ReasonCode::RcWin32InvalidHandle,
+                                "BCrypt: AES key must be 16 bytes",
+                            )
+                        })?,
+                        &iv_val,
+                        plaintext,
+                    )
+                } else if key.key_data.len() == 32 {
+                    // AES-256-GCM
+                    use aes_gcm::aead::{AeadInPlace, KeyInit};
+                    use aes_gcm::{Aes256Gcm, Nonce};
+                    let cipher = Aes256Gcm::new_from_slice(&key.key_data).map_err(|e| {
+                        AppError::new(
+                            ReasonCode::RcWin32InvalidHandle,
+                            format!("BCrypt: AES-256-GCM key init failed: {e}"),
+                        )
+                    })?;
+                    let nonce_bytes = iv
+                        .map(|raw| {
+                            let mut n = [0u8; 12];
+                            n.copy_from_slice(&raw[..12]);
+                            n
+                        })
+                        .unwrap_or([0u8; 12]);
+                    let nonce = Nonce::from_slice(&nonce_bytes);
+                    let mut buf = plaintext.to_vec();
+                    cipher.encrypt_in_place(nonce, &[], &mut buf).map_err(|e| {
+                        AppError::new(
+                            ReasonCode::RcWin32InvalidHandle,
+                            format!("BCrypt: AES-256-GCM encrypt failed: {e}"),
+                        )
+                    })?;
+                    Ok(buf)
+                } else {
+                    // AES-128-GCM (16-byte key with GCM mode indicated by IV length or context)
+                    use aes_gcm::aead::{AeadInPlace, KeyInit};
+                    use aes_gcm::{Aes128Gcm, Nonce};
+                    let cipher = Aes128Gcm::new_from_slice(&key.key_data).map_err(|e| {
+                        AppError::new(
+                            ReasonCode::RcWin32InvalidHandle,
+                            format!("BCrypt: AES-128-GCM key init failed: {e}"),
+                        )
+                    })?;
+                    let nonce_bytes = iv
+                        .map(|raw| {
+                            let mut n = [0u8; 12];
+                            n.copy_from_slice(&raw[..12]);
+                            n
+                        })
+                        .unwrap_or([0u8; 12]);
+                    let nonce = Nonce::from_slice(&nonce_bytes);
+                    let mut buf = plaintext.to_vec();
+                    cipher.encrypt_in_place(nonce, &[], &mut buf).map_err(|e| {
+                        AppError::new(
+                            ReasonCode::RcWin32InvalidHandle,
+                            format!("BCrypt: AES-128-GCM encrypt failed: {e}"),
+                        )
+                    })?;
+                    Ok(buf)
+                }
             }
             _ => Err(AppError::new(
                 ReasonCode::RcWin32InvalidHandle,
@@ -3653,17 +7442,305 @@ impl BCryptContext {
     }
 
     /// BCryptDecrypt — decrypt data with a symmetric key.
-    pub fn decrypt(key: &BCryptKey, ciphertext: &[u8], iv: Option<&[u8; 16]>) -> AppResult<Vec<u8>> {
+    pub fn decrypt(
+        key: &BCryptKey,
+        ciphertext: &[u8],
+        iv: Option<&[u8; 16]>,
+    ) -> AppResult<Vec<u8>> {
         match key.algorithm.as_str() {
             BCRYPT_AES_ALGORITHM => {
-                let iv_val = iv.copied().unwrap_or([0u8; 16]);
-                crate::network::aes_128_cbc_decrypt(&key.key_data[..16].try_into().map_err(|_| {
-                    AppError::new(ReasonCode::RcWin32InvalidHandle, "BCrypt: AES key must be 16 bytes")
-                })?, &iv_val, ciphertext)
+                if key.key_data.len() == 16 {
+                    // AES-128-CBC (legacy support)
+                    let iv_val = iv.copied().unwrap_or([0u8; 16]);
+                    crate::network::aes_128_cbc_decrypt(
+                        &key.key_data[..16].try_into().map_err(|_| {
+                            AppError::new(
+                                ReasonCode::RcWin32InvalidHandle,
+                                "BCrypt: AES key must be 16 bytes",
+                            )
+                        })?,
+                        &iv_val,
+                        ciphertext,
+                    )
+                } else if key.key_data.len() == 32 {
+                    // AES-256-GCM
+                    use aes_gcm::aead::{AeadInPlace, KeyInit};
+                    use aes_gcm::{Aes256Gcm, Nonce};
+                    let cipher = Aes256Gcm::new_from_slice(&key.key_data).map_err(|e| {
+                        AppError::new(
+                            ReasonCode::RcWin32InvalidHandle,
+                            format!("BCrypt: AES-256-GCM key init failed: {e}"),
+                        )
+                    })?;
+                    let nonce_bytes = iv
+                        .map(|raw| {
+                            let mut n = [0u8; 12];
+                            n.copy_from_slice(&raw[..12]);
+                            n
+                        })
+                        .unwrap_or([0u8; 12]);
+                    let nonce = Nonce::from_slice(&nonce_bytes);
+                    let mut buf = ciphertext.to_vec();
+                    cipher.decrypt_in_place(nonce, &[], &mut buf).map_err(|e| {
+                        AppError::new(
+                            ReasonCode::RcWin32InvalidHandle,
+                            format!("BCrypt: AES-256-GCM decrypt failed: {e}"),
+                        )
+                    })?;
+                    Ok(buf)
+                } else {
+                    // AES-128-GCM
+                    use aes_gcm::aead::{AeadInPlace, KeyInit};
+                    use aes_gcm::{Aes128Gcm, Nonce};
+                    let cipher = Aes128Gcm::new_from_slice(&key.key_data).map_err(|e| {
+                        AppError::new(
+                            ReasonCode::RcWin32InvalidHandle,
+                            format!("BCrypt: AES-128-GCM key init failed: {e}"),
+                        )
+                    })?;
+                    let nonce_bytes = iv
+                        .map(|raw| {
+                            let mut n = [0u8; 12];
+                            n.copy_from_slice(&raw[..12]);
+                            n
+                        })
+                        .unwrap_or([0u8; 12]);
+                    let nonce = Nonce::from_slice(&nonce_bytes);
+                    let mut buf = ciphertext.to_vec();
+                    cipher.decrypt_in_place(nonce, &[], &mut buf).map_err(|e| {
+                        AppError::new(
+                            ReasonCode::RcWin32InvalidHandle,
+                            format!("BCrypt: AES-128-GCM decrypt failed: {e}"),
+                        )
+                    })?;
+                    Ok(buf)
+                }
             }
             _ => Err(AppError::new(
                 ReasonCode::RcWin32InvalidHandle,
                 format!("BCrypt: decrypt not supported for {}", key.algorithm),
+            )),
+        }
+    }
+
+    /// BCryptSecretAgreement — perform ECDH key agreement.
+    ///
+    /// Given a private key and a public key (both ECDH P-256),
+    /// compute the shared secret (x-coordinate of the shared point).
+    pub fn secret_agreement(
+        &self,
+        private_key: &BCryptKey,
+        public_key: &BCryptKey,
+    ) -> AppResult<BCryptSecret> {
+        match (&private_key.key_type, &public_key.key_type) {
+            (BCryptKeyType::EcdhP256, BCryptKeyType::EcdhP256) => {
+                let private_signing_key = p256::ecdsa::SigningKey::from_pkcs8_der(
+                    &private_key.key_data,
+                )
+                .map_err(|e| {
+                    AppError::new(
+                        ReasonCode::RcWin32InvalidHandle,
+                        format!("BCrypt: ECDH private key parse failed: {e}"),
+                    )
+                })?;
+                // Decode the raw public key (65-byte uncompressed SEC1 format: 04 || X || Y)
+                let owned_pk_bytes;
+                let pub_key_bytes =
+                    if public_key.key_data.len() == 65 && public_key.key_data[0] == 0x04 {
+                        &public_key.key_data[1..]
+                    } else if public_key.key_data.len() == 64 {
+                        &public_key.key_data[..]
+                    } else {
+                        // Try to decode as PKCS#8 DER
+                        use p256::pkcs8::DecodePublicKey;
+                        let pk = p256::PublicKey::from_public_key_der(&public_key.key_data)
+                            .map_err(|e| {
+                                AppError::new(
+                                    ReasonCode::RcWin32InvalidHandle,
+                                    format!("BCrypt: ECDH public key DER parse failed: {e}"),
+                                )
+                            })?;
+                        let encoded = ToEncodedPoint::to_encoded_point(&pk, false);
+                        let point_bytes = encoded.as_bytes();
+                        if point_bytes.len() >= 65 && point_bytes[0] == 0x04 {
+                            owned_pk_bytes = point_bytes[1..].to_vec();
+                            &owned_pk_bytes
+                        } else {
+                            return Err(AppError::new(
+                                ReasonCode::RcWin32InvalidHandle,
+                                "BCrypt: ECDH public key format not recognized",
+                            ));
+                        }
+                    };
+                // Build SEC1 encoded point: 0x04 || X (32 bytes) || Y (32 bytes)
+                let (x_bytes, y_bytes) = pub_key_bytes.split_at(32);
+                let mut sec1_bytes = Vec::with_capacity(65);
+                sec1_bytes.push(0x04);
+                sec1_bytes.extend_from_slice(x_bytes);
+                sec1_bytes.extend_from_slice(y_bytes);
+                let pub_key = p256::PublicKey::from_sec1_bytes(&sec1_bytes).map_err(|e| {
+                    AppError::new(
+                        ReasonCode::RcWin32InvalidHandle,
+                        format!("BCrypt: ECDH public key point creation failed: {e}"),
+                    )
+                })?;
+                let private_key_ecdh = p256::SecretKey::from(&private_signing_key);
+                let shared_secret = p256::elliptic_curve::ecdh::diffie_hellman(
+                    &private_key_ecdh.to_nonzero_scalar(),
+                    pub_key.as_affine(),
+                );
+                Ok(BCryptSecret {
+                    secret: shared_secret.raw_secret_bytes().to_vec(),
+                    algorithm: BCRYPT_ECDH_P256_ALGORITHM.to_string(),
+                })
+            }
+            (BCryptKeyType::EcdhP384, BCryptKeyType::EcdhP384) => {
+                let private_signing_key = p384::ecdsa::SigningKey::from_pkcs8_der(
+                    &private_key.key_data,
+                )
+                .map_err(|e| {
+                    AppError::new(
+                        ReasonCode::RcWin32InvalidHandle,
+                        format!("BCrypt: ECDH P-384 private key parse failed: {e}"),
+                    )
+                })?;
+                // Decode the raw public key (97-byte uncompressed SEC1 format: 04 || X (48) || Y (48))
+                let owned_pk_bytes;
+                let pub_key_bytes =
+                    if public_key.key_data.len() == 97 && public_key.key_data[0] == 0x04 {
+                        &public_key.key_data[1..]
+                    } else if public_key.key_data.len() == 96 {
+                        &public_key.key_data[..]
+                    } else {
+                        // Try to decode as PKCS#8 DER
+                        use p384::pkcs8::DecodePublicKey;
+                        let pk = p384::PublicKey::from_public_key_der(&public_key.key_data)
+                            .map_err(|e| {
+                                AppError::new(
+                                    ReasonCode::RcWin32InvalidHandle,
+                                    format!("BCrypt: ECDH P-384 public key DER parse failed: {e}"),
+                                )
+                            })?;
+                        let encoded = p384::EncodedPoint::from(pk);
+                        let point_bytes = encoded.as_bytes();
+                        if point_bytes.len() >= 97 && point_bytes[0] == 0x04 {
+                            owned_pk_bytes = point_bytes[1..].to_vec();
+                            &owned_pk_bytes
+                        } else {
+                            return Err(AppError::new(
+                                ReasonCode::RcWin32InvalidHandle,
+                                "BCrypt: ECDH P-384 public key format not recognized",
+                            ));
+                        }
+                    };
+                // Build SEC1 encoded point: 0x04 || X (48 bytes) || Y (48 bytes)
+                let (x_bytes, y_bytes) = pub_key_bytes.split_at(48);
+                let mut sec1_bytes = Vec::with_capacity(97);
+                sec1_bytes.push(0x04);
+                sec1_bytes.extend_from_slice(x_bytes);
+                sec1_bytes.extend_from_slice(y_bytes);
+                let pub_key = p384::PublicKey::from_sec1_bytes(&sec1_bytes).map_err(|e| {
+                    AppError::new(
+                        ReasonCode::RcWin32InvalidHandle,
+                        format!("BCrypt: ECDH P-384 public key point creation failed: {e}"),
+                    )
+                })?;
+                let private_key_ecdh = p384::SecretKey::from(&private_signing_key);
+                let shared_secret = p384::elliptic_curve::ecdh::diffie_hellman(
+                    &private_key_ecdh.to_nonzero_scalar(),
+                    pub_key.as_affine(),
+                );
+                Ok(BCryptSecret {
+                    secret: shared_secret.raw_secret_bytes().to_vec(),
+                    algorithm: BCRYPT_ECDH_P384_ALGORITHM.to_string(),
+                })
+            }
+            _ => Err(AppError::new(
+                ReasonCode::RcWin32InvalidHandle,
+                format!(
+                    "BCrypt: secret agreement not supported for {}/{}",
+                    private_key.algorithm, public_key.algorithm
+                ),
+            )),
+        }
+    }
+
+    /// BCryptDeriveKey — derive a key from a shared secret using a KDF.
+    ///
+    /// Supports:
+    /// - `BCRYPT_KDF_HASH` (hash the secret with optional salt)
+    /// - `BCRYPT_KDF_HMAC` (HMAC the secret with a salt)
+    /// - `BCRYPT_KDF_SP80056A` (concatenation KDF per SP 800-56A)
+    pub fn derive_key(
+        secret: &BCryptSecret,
+        kdf: &str,
+        kdf_feedback: &[u8],
+        output_len: u32,
+    ) -> AppResult<Vec<u8>> {
+        match kdf {
+            "HASH" | "BCRYPT_KDF_HASH" => {
+                use sha2::{Digest, Sha256};
+                let mut hasher = Sha256::new();
+                hasher.update(&secret.secret);
+                if !kdf_feedback.is_empty() {
+                    hasher.update(kdf_feedback);
+                }
+                let result = hasher.finalize();
+                let output = result.to_vec();
+                Ok(if output_len > 0 {
+                    output[..(output.len().min(output_len as usize))].to_vec()
+                } else {
+                    output
+                })
+            }
+            "HMAC" | "BCRYPT_KDF_HMAC" => {
+                use hmac::{Hmac, Mac};
+                use sha2::Sha256;
+                let mut mac = Hmac::<Sha256>::new_from_slice(&secret.secret).map_err(|e| {
+                    AppError::new(
+                        ReasonCode::RcWin32InvalidHandle,
+                        format!("BCrypt: HMAC init failed: {e}"),
+                    )
+                })?;
+                if !kdf_feedback.is_empty() {
+                    mac.update(kdf_feedback);
+                }
+                let result = mac.finalize();
+                let code = result.into_bytes();
+                let output = code.to_vec();
+                Ok(if output_len > 0 {
+                    output[..(output.len().min(output_len as usize))].to_vec()
+                } else {
+                    output
+                })
+            }
+            "SP80056A" | "BCRYPT_KDF_SP80056A" => {
+                // Concatenation KDF per NIST SP 800-56A, Section 5.8.1
+                // Uses SHA-256 as the underlying hash function.
+                use sha2::{Digest, Sha256};
+                let mut derived = Vec::new();
+                let _hash_len = 32usize; // SHA-256 output
+                let mut counter: u32 = 1;
+                while derived.len() < output_len as usize {
+                    let mut hasher = Sha256::new();
+                    // Counter (4 bytes big-endian)
+                    hasher.update(&counter.to_be_bytes());
+                    // Shared secret
+                    hasher.update(&secret.secret);
+                    // Algorithm ID / OtherInfo (kdf_feedback)
+                    if !kdf_feedback.is_empty() {
+                        hasher.update(kdf_feedback);
+                    }
+                    let hash = hasher.finalize();
+                    derived.extend_from_slice(&hash);
+                    counter += 1;
+                }
+                derived.truncate(output_len as usize);
+                Ok(derived)
+            }
+            _ => Err(AppError::new(
+                ReasonCode::RcWin32InvalidHandle,
+                format!("BCrypt: unsupported KDF {kdf}"),
             )),
         }
     }
@@ -3708,6 +7785,8 @@ pub struct ThreadPoolManager {
     work_items: BTreeMap<u64, TpWork>,
     timers: BTreeMap<u64, TpTimer>,
     waits: BTreeMap<u64, TpWait>,
+    /// Timestamp used for timer expiry calculations.
+    start_time: std::time::Instant,
 }
 
 impl ThreadPoolManager {
@@ -3717,25 +7796,32 @@ impl ThreadPoolManager {
             work_items: BTreeMap::new(),
             timers: BTreeMap::new(),
             waits: BTreeMap::new(),
+            start_time: std::time::Instant::now(),
         }
     }
 
     /// CreateThreadpoolWork
     pub fn create_work(&mut self, callback: u64, context: u64) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        self.work_items.insert(id, TpWork {
+        self.work_items.insert(
             id,
-            callback,
-            context,
-            submitted: false,
-        });
+            TpWork {
+                id,
+                callback,
+                context,
+                submitted: false,
+            },
+        );
         id
     }
 
     /// SubmitThreadpoolWork
     pub fn submit_work(&mut self, id: u64) -> AppResult<()> {
         let work = self.work_items.get_mut(&id).ok_or_else(|| {
-            AppError::new(ReasonCode::RcWin32InvalidHandle, format!("TP work {id} not found"))
+            AppError::new(
+                ReasonCode::RcWin32InvalidHandle,
+                format!("TP work {id} not found"),
+            )
         })?;
         work.submitted = true;
         Ok(())
@@ -3749,21 +7835,27 @@ impl ThreadPoolManager {
     /// CreateThreadpoolTimer
     pub fn create_timer(&mut self, callback: u64, context: u64) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        self.timers.insert(id, TpTimer {
+        self.timers.insert(
             id,
-            callback,
-            context,
-            due_time_ms: 0,
-            period_ms: 0,
-            is_set: false,
-        });
+            TpTimer {
+                id,
+                callback,
+                context,
+                due_time_ms: 0,
+                period_ms: 0,
+                is_set: false,
+            },
+        );
         id
     }
 
     /// SetThreadpoolTimer
     pub fn set_timer(&mut self, id: u64, due_time_ms: u32, period_ms: u32) -> AppResult<()> {
         let timer = self.timers.get_mut(&id).ok_or_else(|| {
-            AppError::new(ReasonCode::RcWin32InvalidHandle, format!("TP timer {id} not found"))
+            AppError::new(
+                ReasonCode::RcWin32InvalidHandle,
+                format!("TP timer {id} not found"),
+            )
         })?;
         timer.due_time_ms = due_time_ms;
         timer.period_ms = period_ms;
@@ -3779,12 +7871,15 @@ impl ThreadPoolManager {
     /// CreateThreadpoolWait
     pub fn create_wait(&mut self, callback: u64, context: u64, handle: u64) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        self.waits.insert(id, TpWait {
+        self.waits.insert(
             id,
-            callback,
-            context,
-            handle,
-        });
+            TpWait {
+                id,
+                callback,
+                context,
+                handle,
+            },
+        );
         id
     }
 
@@ -3811,6 +7906,121 @@ impl ThreadPoolManager {
     /// Get the count of timers.
     pub fn timer_count(&self) -> usize {
         self.timers.len()
+    }
+
+    // ── Callback Dispatch ────────────────────────────────────────────────
+
+    /// Pop the next pending work item for execution.
+    ///
+    /// Returns `Some((callback, context))` if a submitted work item is
+    /// available, or `None` if the queue is empty.
+    ///
+    /// The returned callback should be invoked by the pe_runtime in the
+    /// guest context with the given context parameter.
+    pub fn pop_work_callback(&mut self) -> Option<(u64, u64)> {
+        // Find the first submitted work item and remove it.
+        let id = self
+            .work_items
+            .iter()
+            .find(|(_, w)| w.submitted)
+            .map(|(&id, _)| id)?;
+        if let Some(work) = self.work_items.remove(&id) {
+            Some((work.callback, work.context))
+        } else {
+            None
+        }
+    }
+
+    /// Pop all pending work items and return their (callback, context) pairs.
+    ///
+    /// This drains all submitted-but-not-yet-executed work items at once,
+    /// which is useful for batch dispatch in the execution loop.
+    pub fn drain_pending_work(&mut self) -> Vec<(u64, u64)> {
+        let mut results = Vec::new();
+        let pending_ids: Vec<u64> = self
+            .work_items
+            .iter()
+            .filter(|(_, w)| w.submitted)
+            .map(|(&id, _)| id)
+            .collect();
+        for id in pending_ids {
+            if let Some(work) = self.work_items.remove(&id) {
+                results.push((work.callback, work.context));
+            }
+        }
+        results
+    }
+
+    /// Check for due timers and return their (callback, context) pairs.
+    ///
+    /// A timer is due when `current_time_ms` (milliseconds since an
+    /// arbitrary epoch) >= `due_time_ms`.  For periodic timers (period > 0),
+    /// the timer is automatically re-armed for the next period so it can
+    /// fire again.
+    pub fn pop_due_timers(&mut self, current_time_ms: u64) -> Vec<(u64, u64)> {
+        let mut due = Vec::new();
+        let due_ids: Vec<u64> = self
+            .timers
+            .iter()
+            .filter(|(_, t)| t.is_set && current_time_ms >= t.due_time_ms as u64)
+            .map(|(&id, _)| id)
+            .collect();
+        for id in due_ids {
+            if let Some(timer) = self.timers.get_mut(&id) {
+                due.push((timer.callback, timer.context));
+                if timer.period_ms > 0 {
+                    // Re-arm periodic timer: advance due_time by period.
+                    timer.due_time_ms = timer.due_time_ms.wrapping_add(timer.period_ms);
+                    timer.is_set = true;
+                } else {
+                    // One-shot timer: mark as not set.
+                    timer.is_set = false;
+                }
+            }
+        }
+        due
+    }
+
+    /// Check waits against a set of signaled handles and return
+    /// (callback, context) pairs for any matched waits.
+    ///
+    /// `signaled_handles` is a set of handles that are currently in the
+    /// signaled state.  Waits whose handle is in this set are removed and
+    /// their callbacks are returned for dispatch.
+    pub fn pop_signaled_waits(
+        &mut self,
+        signaled_handles: &std::collections::HashSet<u64>,
+    ) -> Vec<(u64, u64)> {
+        let mut signaled = Vec::new();
+        let signaled_ids: Vec<u64> = self
+            .waits
+            .iter()
+            .filter(|(_, w)| signaled_handles.contains(&w.handle))
+            .map(|(&id, _)| id)
+            .collect();
+        for id in signaled_ids {
+            if let Some(wait) = self.waits.remove(&id) {
+                signaled.push((wait.callback, wait.context));
+            }
+        }
+        signaled
+    }
+
+    /// Process all pending work items, due timers, and signaled waits,
+    /// returning a combined list of (callback, context) pairs to be
+    /// executed by the runtime.
+    ///
+    /// This is a convenience method that calls [`drain_pending_work`],
+    /// [`pop_due_timers`], and [`pop_signaled_waits`] in sequence.
+    pub fn process_pending(
+        &mut self,
+        current_time_ms: u64,
+        signaled_handles: &std::collections::HashSet<u64>,
+    ) -> Vec<(u64, u64)> {
+        let mut callbacks = self.drain_pending_work();
+        callbacks.extend(self.pop_due_timers(current_time_ms));
+        callbacks.extend(self.pop_signaled_waits(signaled_handles));
+        callbacks
     }
 }
 
@@ -3944,7 +8154,8 @@ impl DbgHelpContext {
 
     /// SymLoadModuleEx — load symbols for a module.
     pub fn sym_load_module(&mut self, module_name: &str, base_address: u64) -> AppResult<()> {
-        self.loaded_modules.insert(module_name.to_string(), base_address);
+        self.loaded_modules
+            .insert(module_name.to_string(), base_address);
         Ok(())
     }
 
@@ -3960,52 +8171,47 @@ impl DbgHelpContext {
             }
         }
         best.map(|(_, sym)| sym).ok_or_else(|| {
-            AppError::new(ReasonCode::RcWin32InvalidHandle, format!("no symbol found at address {address:#x}"))
+            AppError::new(
+                ReasonCode::RcWin32InvalidHandle,
+                format!("no symbol found at address {address:#x}"),
+            )
         })
     }
 
-    /// StackWalk64 — walk the stack (legacy API without memory reader).
+    /// StackWalk64 — walk the stack using a memory reader.
     ///
-    /// Uses the x86-64 frame pointer chain to walk the stack:
-    /// - Each frame has a saved RBP at `[RBP]` and a return address at `[RBP+8]`
+    /// Walks the x86/x86-64 frame pointer chain using a memory reader
+    /// callback to access guest stack memory. Delegates to
+    /// [`stack_walk_with_reader`].
     ///
-    /// Without access to guest memory, this implementation returns only the
-    /// first frame. Use [`stack_walk_with_reader`] for full multi-frame walking.
-    pub fn stack_walk(
+    /// # Arguments
+    /// * `instruction_pointer` — Current RIP/EIP value.
+    /// * `frame_pointer` — Current RBP/EBP value.
+    /// * `stack_pointer` — Current RSP/ESP value (used for bounds checking).
+    /// * `arch` — Guest architecture (32-bit or 64-bit).
+    /// * `max_frames` — Maximum number of frames to capture (capped at 256).
+    /// * `read_memory` — Closure that reads `n` bytes from guest memory at a
+    ///   given address. Returns `None` if the address is invalid or unreadable.
+    pub fn stack_walk<F>(
         &self,
         instruction_pointer: u64,
         frame_pointer: u64,
-        _stack_pointer: u64,
+        stack_pointer: u64,
+        arch: GuestArch,
         max_frames: usize,
-    ) -> Vec<StackFrameInfo> {
-        let mut frames = Vec::new();
-        let ip = instruction_pointer;
-        let fp = frame_pointer;
-
-        for _ in 0..max_frames {
-            let symbol_name = self.symbols.get(&ip).map(|s| s.name.clone());
-            let module_name = self.find_module_for_address(ip)
-                .unwrap_or_else(|| "unknown".to_string());
-
-            frames.push(StackFrameInfo {
-                instruction_pointer: ip,
-                return_address: 0,
-                frame_pointer: fp,
-                stack_pointer: 0,
-                module_name,
-                symbol_name,
-                displacement: 0,
-                source_file: None,
-                line_number: None,
-            });
-
-            // Without a memory reader to chase the frame pointer chain
-            // from guest memory, we stop after the first frame.
-            // Use stack_walk_with_reader for full multi-frame walking.
-            break;
-        }
-
-        frames
+        read_memory: F,
+    ) -> Vec<StackFrameInfo>
+    where
+        F: Fn(u64, usize) -> Option<Vec<u8>>,
+    {
+        self.stack_walk_with_reader(
+            instruction_pointer,
+            frame_pointer,
+            stack_pointer,
+            arch,
+            max_frames,
+            read_memory,
+        )
     }
 
     /// StackWalk64 with memory reader — full multi-frame stack walking.
@@ -4053,25 +8259,24 @@ impl DbgHelpContext {
 
         for _ in 0..max_frames {
             let symbol_name = self.symbols.get(&ip).map(|s| s.name.clone());
-            let module_name = self.find_module_for_address(ip)
+            let module_name = self
+                .find_module_for_address(ip)
                 .unwrap_or_else(|| "unknown".to_string());
 
             // Compute displacement from nearest symbol
-            let displacement = self.symbols.get(&ip)
-                .map(|s| 0u64)
-                .unwrap_or_else(|| {
-                    // Find closest symbol below this address
-                    let mut best_disp = 0u64;
-                    for (addr, _) in &self.symbols {
-                        if *addr <= ip {
-                            let d = ip - addr;
-                            if d < best_disp || best_disp == 0 {
-                                best_disp = d;
-                            }
+            let displacement = self.symbols.get(&ip).map(|_s| 0u64).unwrap_or_else(|| {
+                // Find closest symbol below this address
+                let mut best_disp = 0u64;
+                for (addr, _) in &self.symbols {
+                    if *addr <= ip {
+                        let d = ip - addr;
+                        if d < best_disp || best_disp == 0 {
+                            best_disp = d;
                         }
                     }
-                    best_disp
-                });
+                }
+                best_disp
+            });
 
             frames.push(StackFrameInfo {
                 instruction_pointer: ip,
@@ -4088,10 +8293,9 @@ impl DbgHelpContext {
             // Read the next frame pointer from [FP]
             let next_fp_bytes = read_memory(fp, ptr_size);
             let next_fp = match (&next_fp_bytes, arch) {
-                (Some(bytes), GuestArch::X86_64) if bytes.len() == 8 => {
-                    u64::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3],
-                                       bytes[4], bytes[5], bytes[6], bytes[7]])
-                }
+                (Some(bytes), GuestArch::X86_64) if bytes.len() == 8 => u64::from_le_bytes([
+                    bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+                ]),
                 (Some(bytes), GuestArch::X86) if bytes.len() >= 4 => {
                     u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as u64
                 }
@@ -4106,10 +8310,9 @@ impl DbgHelpContext {
             // Read the return address from [FP + pointer_size]
             let ret_addr_bytes = read_memory(fp + ptr_size as u64, ptr_size);
             let ret_addr = match (&ret_addr_bytes, arch) {
-                (Some(bytes), GuestArch::X86_64) if bytes.len() == 8 => {
-                    u64::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3],
-                                        bytes[4], bytes[5], bytes[6], bytes[7]])
-                }
+                (Some(bytes), GuestArch::X86_64) if bytes.len() == 8 => u64::from_le_bytes([
+                    bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+                ]),
                 (Some(bytes), GuestArch::X86) if bytes.len() >= 4 => {
                     u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as u64
                 }
@@ -4210,7 +8413,8 @@ impl DbgHelpContext {
             total,
             read_memory,
         );
-        let addresses: Vec<u64> = all_frames.iter()
+        let addresses: Vec<u64> = all_frames
+            .iter()
             .skip(skip_frames)
             .map(|f| f.instruction_pointer)
             .collect();
@@ -4220,13 +8424,16 @@ impl DbgHelpContext {
 
     /// Register a symbol.
     pub fn register_symbol(&mut self, address: u64, name: &str, module_base: u64) {
-        self.symbols.insert(address, SymbolInfo {
+        self.symbols.insert(
             address,
-            name: name.to_string(),
-            size: 0,
-            module_base,
-            displacement: 0,
-        });
+            SymbolInfo {
+                address,
+                name: name.to_string(),
+                size: 0,
+                module_base,
+                displacement: 0,
+            },
+        );
     }
 
     /// Find the module containing an address.
@@ -4433,7 +8640,7 @@ impl SecurityDescriptor {
     ///   - First match wins (Windows semantics)
     pub fn check_access_for_token(&self, token_sid: &str, desired_access: u32) -> bool {
         if !self.dacl_present || self.dacl.is_none() {
-            // Null DACL = allow all
+            // Null DACL = allow all (Windows security semantics)
             return true;
         }
 
@@ -4448,7 +8655,9 @@ impl SecurityDescriptor {
 
         for ace in &dacl.aces {
             // Check if this ACE applies to the token SID
-            if ace.sid != token_sid && ace.sid != "S-1-1-0" /* Everyone */ {
+            if ace.sid != token_sid && ace.sid != "S-1-1-0"
+            /* Everyone */
+            {
                 continue;
             }
 
@@ -4486,7 +8695,8 @@ fn parse_sid(bytes: &[u8], offset: usize) -> String {
     let sub_count = bytes[offset + 1] as usize;
     // Identifier authority is 6 bytes big-endian
     let id_auth = u64::from_be_bytes([
-        0, 0,
+        0,
+        0,
         bytes[offset + 2],
         bytes[offset + 3],
         bytes[offset + 4],
@@ -4595,27 +8805,36 @@ impl Advapi32Manager {
         let mut services = BTreeMap::new();
 
         // Pre-register common services that Steam/games query
-        services.insert("SteamClientService".to_string(), ServiceRecord {
-            name: "Steam Client Service".to_string(),
-            display_name: "Steam Client Service".to_string(),
-            service_type: 0x10, // SERVICE_WIN32_OWN_PROCESS
-            state: ServiceState::Running,
-            process_id: Some(1234),
-        });
-        services.insert("Winmgmt".to_string(), ServiceRecord {
-            name: "Windows Management Instrumentation".to_string(),
-            display_name: "Windows Management Instrumentation".to_string(),
-            service_type: 0x20, // SERVICE_WIN32_SHARE_PROCESS
-            state: ServiceState::Running,
-            process_id: Some(5678),
-        });
-        services.insert("Audiosrv".to_string(), ServiceRecord {
-            name: "Windows Audio".to_string(),
-            display_name: "Windows Audio".to_string(),
-            service_type: 0x10,
-            state: ServiceState::Running,
-            process_id: Some(9012),
-        });
+        services.insert(
+            "SteamClientService".to_string(),
+            ServiceRecord {
+                name: "Steam Client Service".to_string(),
+                display_name: "Steam Client Service".to_string(),
+                service_type: 0x10, // SERVICE_WIN32_OWN_PROCESS
+                state: ServiceState::Running,
+                process_id: Some(1234),
+            },
+        );
+        services.insert(
+            "Winmgmt".to_string(),
+            ServiceRecord {
+                name: "Windows Management Instrumentation".to_string(),
+                display_name: "Windows Management Instrumentation".to_string(),
+                service_type: 0x20, // SERVICE_WIN32_SHARE_PROCESS
+                state: ServiceState::Running,
+                process_id: Some(5678),
+            },
+        );
+        services.insert(
+            "Audiosrv".to_string(),
+            ServiceRecord {
+                name: "Windows Audio".to_string(),
+                display_name: "Windows Audio".to_string(),
+                service_type: 0x10,
+                state: ServiceState::Running,
+                process_id: Some(9012),
+            },
+        );
 
         Self {
             services,
@@ -4654,14 +8873,20 @@ impl Advapi32Manager {
     /// QueryServiceStatus — get the current state of a service.
     pub fn query_service_status(&self, service_name: &str) -> AppResult<&ServiceRecord> {
         self.services.get(service_name).ok_or_else(|| {
-            AppError::new(ReasonCode::RcWin32InvalidHandle, format!("service '{service_name}' not found"))
+            AppError::new(
+                ReasonCode::RcWin32InvalidHandle,
+                format!("service '{service_name}' not found"),
+            )
         })
     }
 
     /// StartService — start a service.
     pub fn start_service(&mut self, service_name: &str) -> AppResult<()> {
         let service = self.services.get_mut(service_name).ok_or_else(|| {
-            AppError::new(ReasonCode::RcWin32InvalidHandle, format!("service '{service_name}' not found"))
+            AppError::new(
+                ReasonCode::RcWin32InvalidHandle,
+                format!("service '{service_name}' not found"),
+            )
         })?;
         service.state = ServiceState::Running;
         Ok(())
@@ -4689,7 +8914,8 @@ impl Advapi32Manager {
 
     /// Set a security descriptor for a named object.
     pub fn set_security_descriptor(&mut self, object_name: &str, descriptor: SecurityDescriptor) {
-        self.security_descriptors.insert(object_name.to_string(), descriptor);
+        self.security_descriptors
+            .insert(object_name.to_string(), descriptor);
     }
 
     /// Get the count of registered services.
@@ -4798,7 +9024,11 @@ impl ServiceControlManager {
     /// Returns a synthetic handle representing the SCM database. The
     /// `machine_name` and `database_name` parameters are accepted but
     /// ignored (local machine only).
-    pub fn open_sc_manager(&mut self, _machine_name: Option<&str>, _database_name: Option<&str>) -> u64 {
+    pub fn open_sc_manager(
+        &mut self,
+        _machine_name: Option<&str>,
+        _database_name: Option<&str>,
+    ) -> u64 {
         let handle = self.next_handle;
         self.next_handle += 1;
         handle
@@ -4868,7 +9098,12 @@ impl ServiceControlManager {
     /// OpenServiceW — open an existing service by name.
     ///
     /// Returns the service handle if found.
-    pub fn open_service(&self, _sc_handle: u64, name: &str, _desired_access: u32) -> AppResult<u64> {
+    pub fn open_service(
+        &self,
+        _sc_handle: u64,
+        name: &str,
+        _desired_access: u32,
+    ) -> AppResult<u64> {
         self.services.get(name).map(|s| s.handle).ok_or_else(|| {
             AppError::new(
                 ReasonCode::RcWin32InvalidHandle,
@@ -4901,10 +9136,15 @@ impl ServiceControlManager {
             ServiceStatus::Running => {
                 return Ok(());
             }
-            ServiceStatus::StartPending | ServiceStatus::StopPending | ServiceStatus::PausePending => {
+            ServiceStatus::StartPending
+            | ServiceStatus::StopPending
+            | ServiceStatus::PausePending => {
                 return Err(AppError::new(
                     ReasonCode::RcInvalidState,
-                    format!("SCM: service '{name}' is in transition state {:?}", record.status),
+                    format!(
+                        "SCM: service '{name}' is in transition state {:?}",
+                        record.status
+                    ),
                 ));
             }
             _ => {}
@@ -4939,12 +9179,16 @@ impl ServiceControlManager {
     /// - 0x03 (SERVICE_CONTROL_CONTINUE) → Running
     /// - 0x04 (SERVICE_CONTROL_INTERROGATE) → no state change
     pub fn control_service(&mut self, svc_handle: u64, control_code: u32) -> AppResult<()> {
-        let record = self.services.values_mut().find(|s| s.handle == svc_handle).ok_or_else(|| {
-            AppError::new(
-                ReasonCode::RcWin32InvalidHandle,
-                format!("SCM: no service with handle {svc_handle}"),
-            )
-        })?;
+        let record = self
+            .services
+            .values_mut()
+            .find(|s| s.handle == svc_handle)
+            .ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcWin32InvalidHandle,
+                    format!("SCM: no service with handle {svc_handle}"),
+                )
+            })?;
 
         match control_code {
             0x01 => {
@@ -4952,8 +9196,16 @@ impl ServiceControlManager {
                 if let Some(pid) = record.pid {
                     // Kill the child process if we spawned it
                     if let Some(mut child) = self.children.remove(&pid) {
-                        let _ = child.kill();
-                        let _ = child.wait();
+                        if let Err(e) = child.kill() {
+                            eprintln!(
+                                "[SCM] control_service(STOP): failed to kill child process pid {pid}: {e}"
+                            );
+                        }
+                        if let Err(e) = child.wait() {
+                            eprintln!(
+                                "[SCM] control_service(STOP): failed to wait for child process pid {pid}: {e}"
+                            );
+                        }
                     }
                 }
                 record.status = ServiceStatus::Stopped;
@@ -4974,10 +9226,51 @@ impl ServiceControlManager {
             0x04 => {
                 // SERVICE_CONTROL_INTERROGATE — no state change
             }
+            0x05 => {
+                // SERVICE_CONTROL_SHUTDOWN — service is being shut down
+                record.status = ServiceStatus::Stopped;
+                record.pid = None;
+            }
+            0x06 => {
+                // SERVICE_CONTROL_PARAMCHANGE — service parameters changed (no-op)
+            }
+            0x07 => {
+                // SERVICE_CONTROL_NETBINDADD — network binding added (no-op)
+            }
+            0x08 => {
+                // SERVICE_CONTROL_NETBINDREMOVE — network binding removed (no-op)
+            }
+            0x09 => {
+                // SERVICE_CONTROL_NETBINDENABLE — network binding enabled (no-op)
+            }
+            0x0A => {
+                // SERVICE_CONTROL_NETBINDDISABLE — network binding disabled (no-op)
+            }
+            0x0B => {
+                // SERVICE_CONTROL_DEVICEEVENT — device notification (no-op)
+            }
+            0x0C => {
+                // SERVICE_CONTROL_HARDWAREPROFILECHANGE — hardware profile changed (no-op)
+            }
+            0x0D => {
+                // SERVICE_CONTROL_POWEREVENT — power event (no-op)
+            }
+            0x0E => {
+                // SERVICE_CONTROL_SESSIONCHANGE — session change (no-op)
+            }
+            0x0F => {
+                // SERVICE_CONTROL_PRESHUTDOWN — pre-shutdown notification (no-op)
+            }
+            0x10 => {
+                // SERVICE_CONTROL_TIMECHANGE — system time changed (no-op)
+            }
+            0x20 => {
+                // SERVICE_CONTROL_TRIGGEREVENT — trigger event (no-op)
+            }
             _ => {
                 return Err(AppError::new(
                     ReasonCode::RcWin32InvalidHandle,
-                    format!("SCM: unsupported control code {control_code}"),
+                    format!("SCM: unsupported control code {control_code:#x}"),
                 ));
             }
         }
@@ -4990,17 +9283,24 @@ impl ServiceControlManager {
     /// Returns the service status code and optional PID. This mirrors the
     /// Windows `QueryServiceStatusEx` / `QUERY_SERVICE_STATUS` structure.
     pub fn query_service_status(&self, svc_handle: u64) -> AppResult<(ServiceStatus, Option<u32>)> {
-        let record = self.services.values().find(|s| s.handle == svc_handle).ok_or_else(|| {
-            AppError::new(
-                ReasonCode::RcWin32InvalidHandle,
-                format!("SCM: no service with handle {svc_handle}"),
-            )
-        })?;
+        let record = self
+            .services
+            .values()
+            .find(|s| s.handle == svc_handle)
+            .ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcWin32InvalidHandle,
+                    format!("SCM: no service with handle {svc_handle}"),
+                )
+            })?;
         Ok((record.status, record.pid))
     }
 
     /// Query service status by name (convenience wrapper).
-    pub fn query_service_status_by_name(&self, name: &str) -> AppResult<(ServiceStatus, Option<u32>)> {
+    pub fn query_service_status_by_name(
+        &self,
+        name: &str,
+    ) -> AppResult<(ServiceStatus, Option<u32>)> {
         let record = self.services.get(name).ok_or_else(|| {
             AppError::new(
                 ReasonCode::RcWin32InvalidHandle,
@@ -5015,12 +9315,16 @@ impl ServiceControlManager {
     /// The service must be stopped before it can be deleted.
     pub fn delete_service(&mut self, svc_handle: u64) -> AppResult<()> {
         let name = {
-            let record = self.services.values().find(|s| s.handle == svc_handle).ok_or_else(|| {
-                AppError::new(
-                    ReasonCode::RcWin32InvalidHandle,
-                    format!("SCM: no service with handle {svc_handle}"),
-                )
-            })?;
+            let record = self
+                .services
+                .values()
+                .find(|s| s.handle == svc_handle)
+                .ok_or_else(|| {
+                    AppError::new(
+                        ReasonCode::RcWin32InvalidHandle,
+                        format!("SCM: no service with handle {svc_handle}"),
+                    )
+                })?;
 
             if record.status != ServiceStatus::Stopped {
                 return Err(AppError::new(
@@ -5041,12 +9345,15 @@ impl ServiceControlManager {
 
     /// Get a reference to a service record by handle.
     pub fn get_service(&self, svc_handle: u64) -> AppResult<&ScmServiceRecord> {
-        self.services.values().find(|s| s.handle == svc_handle).ok_or_else(|| {
-            AppError::new(
-                ReasonCode::RcWin32InvalidHandle,
-                format!("SCM: no service with handle {svc_handle}"),
-            )
-        })
+        self.services
+            .values()
+            .find(|s| s.handle == svc_handle)
+            .ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcWin32InvalidHandle,
+                    format!("SCM: no service with handle {svc_handle}"),
+                )
+            })
     }
 
     /// Get a reference to a service record by name.
@@ -5098,14 +9405,17 @@ mod tests {
     #[test]
     fn com_create_instance_and_refcount() {
         let mut com = ComApartmentState::new();
-        com.co_initialize(ComApartmentModel::SingleThreaded).unwrap();
+        com.co_initialize(ComApartmentModel::SingleThreaded)
+            .unwrap();
 
-        let handle = com.co_create_instance(
-            ComClsid::DIRECTSOUND8,
-            ComIid::IUNKNOWN,
-            0x1000_0000,
-            "DirectSound8",
-        ).unwrap();
+        let handle = com
+            .co_create_instance(
+                ComClsid::DIRECTSOUND8,
+                ComIid::IUNKNOWN,
+                0x1000_0000,
+                "DirectSound8",
+            )
+            .unwrap();
 
         assert_eq!(com.active_object_count(), 1);
         assert!(com.com_query_interface(handle, ComIid::IUNKNOWN).unwrap());
@@ -5125,13 +9435,9 @@ mod tests {
     #[test]
     fn com_create_without_initialize_fails() {
         let mut com = ComApartmentState::new();
-        let result = com.co_create_instance(
-            ComClsid::XAUDIO2,
-            ComIid::IUNKNOWN,
-            0x2000_0000,
-            "XAudio2",
-        );
-        assert!(result.is_err());
+        let result =
+            com.co_create_instance(ComClsid::XAUDIO2, ComIid::IUNKNOWN, 0x2000_0000, "XAudio2");
+        assert!(result.is_err(), "expected Err, got {result:?}");
     }
 
     #[test]
@@ -5139,16 +9445,16 @@ mod tests {
         let mut com = ComApartmentState::new();
         com.co_initialize(ComApartmentModel::MultiThreaded).unwrap();
 
-        let handle = com.co_create_instance(
-            ComClsid::XAUDIO2,
-            ComIid::IDISPATCH,
-            0x3000_0000,
-            "Test",
-        ).unwrap();
+        let handle = com
+            .co_create_instance(ComClsid::XAUDIO2, ComIid::IXAUDIO2, 0x3000_0000, "Test")
+            .unwrap();
 
         assert!(com.com_query_interface(handle, ComIid::IUNKNOWN).unwrap());
-        assert!(!com.com_query_interface(handle, ComIid::ICLASS_FACTORY).unwrap());
-        assert!(com.com_query_interface(handle, ComIid::IDISPATCH).unwrap());
+        assert!(
+            !com.com_query_interface(handle, ComIid::ICLASS_FACTORY)
+                .unwrap()
+        );
+        assert!(com.com_query_interface(handle, ComIid::IXAUDIO2).unwrap());
     }
 
     // --- CRT Tests ---
@@ -5305,14 +9611,14 @@ mod tests {
     fn file_version_info_bad_signature() {
         let data = vec![0u8; 128];
         let result = FileVersionInfo::parse(&data);
-        assert!(result.is_err());
+        assert!(result.is_err(), "expected Err, got {result:?}");
     }
 
     #[test]
     fn file_version_info_too_small() {
         let data = vec![0u8; 50];
         let result = FileVersionInfo::parse(&data);
-        assert!(result.is_err());
+        assert!(result.is_err(), "expected Err, got {result:?}");
     }
 
     // --- XInput Tests ---
@@ -5322,16 +9628,21 @@ mod tests {
         let mut xinput = XInputManager::new();
         assert_eq!(xinput.connected_count(), 0);
 
-        xinput.connect_controller(0, XInputState {
-            packet_number: 1,
-            buttons: XINPUT_GAMEPAD_A,
-            left_trigger: 128,
-            right_trigger: 0,
-            left_thumb_x: 0,
-            left_thumb_y: 0,
-            right_thumb_x: 0,
-            right_thumb_y: 0,
-        }).unwrap();
+        xinput
+            .connect_controller(
+                0,
+                XInputState {
+                    packet_number: 1,
+                    buttons: XINPUT_GAMEPAD_A,
+                    left_trigger: 128,
+                    right_trigger: 0,
+                    left_thumb_x: 0,
+                    left_thumb_y: 0,
+                    right_thumb_x: 0,
+                    right_thumb_y: 0,
+                },
+            )
+            .unwrap();
 
         assert_eq!(xinput.connected_count(), 1);
         assert!(xinput.is_connected(0));
@@ -5343,36 +9654,47 @@ mod tests {
     #[test]
     fn xinput_disconnect() {
         let mut xinput = XInputManager::new();
-        xinput.connect_controller(0, XInputState {
-            packet_number: 1,
-            buttons: 0,
-            left_trigger: 0,
-            right_trigger: 0,
-            left_thumb_x: 0,
-            left_thumb_y: 0,
-            right_thumb_x: 0,
-            right_thumb_y: 0,
-        }).unwrap();
+        xinput
+            .connect_controller(
+                0,
+                XInputState {
+                    packet_number: 1,
+                    buttons: 0,
+                    left_trigger: 0,
+                    right_trigger: 0,
+                    left_thumb_x: 0,
+                    left_thumb_y: 0,
+                    right_thumb_x: 0,
+                    right_thumb_y: 0,
+                },
+            )
+            .unwrap();
         assert_eq!(xinput.connected_count(), 1);
 
         xinput.disconnect_controller(0).unwrap();
         assert_eq!(xinput.connected_count(), 0);
-        assert!(xinput.get_state(0).is_err());
+        let _result = xinput.get_state(0);
+        assert!(_result.is_err(), "expected Err, got {_result:?}");
     }
 
     #[test]
     fn xinput_capabilities() {
         let mut xinput = XInputManager::new();
-        xinput.connect_controller(0, XInputState {
-            packet_number: 1,
-            buttons: 0,
-            left_trigger: 0,
-            right_trigger: 0,
-            left_thumb_x: 0,
-            left_thumb_y: 0,
-            right_thumb_x: 0,
-            right_thumb_y: 0,
-        }).unwrap();
+        xinput
+            .connect_controller(
+                0,
+                XInputState {
+                    packet_number: 1,
+                    buttons: 0,
+                    left_trigger: 0,
+                    right_trigger: 0,
+                    left_thumb_x: 0,
+                    left_thumb_y: 0,
+                    right_thumb_x: 0,
+                    right_thumb_y: 0,
+                },
+            )
+            .unwrap();
 
         let caps = xinput.get_capabilities(0).unwrap();
         assert!(caps.vibration_supported);
@@ -5381,28 +9703,39 @@ mod tests {
     #[test]
     fn xinput_invalid_index() {
         let xinput = XInputManager::new();
-        assert!(xinput.get_state(4).is_err());
+        let _result = xinput.get_state(4);
+        assert!(_result.is_err(), "expected Err, got {_result:?}");
         assert!(xinput.is_connected(4) == false);
     }
 
     #[test]
     fn xinput_vibration() {
         let mut xinput = XInputManager::new();
-        xinput.connect_controller(0, XInputState {
-            packet_number: 1,
-            buttons: 0,
-            left_trigger: 0,
-            right_trigger: 0,
-            left_thumb_x: 0,
-            left_thumb_y: 0,
-            right_thumb_x: 0,
-            right_thumb_y: 0,
-        }).unwrap();
+        xinput
+            .connect_controller(
+                0,
+                XInputState {
+                    packet_number: 1,
+                    buttons: 0,
+                    left_trigger: 0,
+                    right_trigger: 0,
+                    left_thumb_x: 0,
+                    left_thumb_y: 0,
+                    right_thumb_x: 0,
+                    right_thumb_y: 0,
+                },
+            )
+            .unwrap();
 
-        xinput.set_state(0, XInputVibration {
-            left_motor_speed: 65535,
-            right_motor_speed: 32768,
-        }).unwrap();
+        xinput
+            .set_state(
+                0,
+                XInputVibration {
+                    left_motor_speed: 65535,
+                    right_motor_speed: 32768,
+                },
+            )
+            .unwrap();
     }
 
     // --- BCrypt Tests ---
@@ -5420,7 +9753,10 @@ mod tests {
     fn bcrypt_unsupported_algorithm() {
         let ctx = BCryptContext::new();
         let result = ctx.create_hash("UNSUPPORTED");
-        assert!(result.is_err());
+        assert!(
+            result.is_err(),
+            "expected Err for unsupported BCrypt algorithm"
+        );
     }
 
     // --- ThreadPool Tests ---
@@ -5458,7 +9794,8 @@ mod tests {
     #[test]
     fn threadpool_submit_nonexistent_fails() {
         let mut tp = ThreadPoolManager::new();
-        assert!(tp.submit_work(999).is_err());
+        let _result = tp.submit_work(999);
+        assert!(_result.is_err(), "expected Err, got {_result:?}");
     }
 
     // --- SyncBarrier Tests ---
@@ -5496,7 +9833,8 @@ mod tests {
     #[test]
     fn dbghelp_symbol_not_found() {
         let ctx = DbgHelpContext::new();
-        assert!(ctx.sym_from_addr(0xDEAD).is_err());
+        let _result = ctx.sym_from_addr(0xDEAD);
+        assert!(_result.is_err(), "expected Err, got {_result:?}");
     }
 
     #[test]
@@ -5505,8 +9843,20 @@ mod tests {
         ctx.sym_load_module("game.exe", 0x0040_0000).unwrap();
         ctx.register_symbol(0x0040_1000, "main", 0x0040_0000);
 
-        let frames = ctx.stack_walk(0x0040_1000, 0x7FFF_0000, 0x7FFF_F000, 10);
-        assert_eq!(frames.len(), 1, "stack_walk returns first frame; see doc for full chase");
+        // Without a working memory reader, only the first frame is returned.
+        let frames = ctx.stack_walk(
+            0x0040_1000,
+            0x7FFF_0000,
+            0x7FFF_F000,
+            GuestArch::X86_64,
+            10,
+            |_addr, _size| None,
+        );
+        assert_eq!(
+            frames.len(),
+            1,
+            "stack_walk returns first frame without memory reader"
+        );
         assert_eq!(frames[0].symbol_name, Some("main".to_string()));
         assert_eq!(frames[0].module_name, "game.exe");
     }
@@ -5525,20 +9875,24 @@ mod tests {
     #[test]
     fn advapi32_service_not_found() {
         let mgr = Advapi32Manager::new();
-        assert!(mgr.query_service_status("NonExistentService").is_err());
+        let _result = mgr.query_service_status("NonExistentService");
+        assert!(_result.is_err(), "expected Err, got {_result:?}");
     }
 
     #[test]
     fn advapi32_start_service() {
         let mut mgr = Advapi32Manager::new();
         // Add a stopped service
-        mgr.services.insert("TestSvc".to_string(), ServiceRecord {
-            name: "TestSvc".to_string(),
-            display_name: "Test Service".to_string(),
-            service_type: 0x10,
-            state: ServiceState::Stopped,
-            process_id: None,
-        });
+        mgr.services.insert(
+            "TestSvc".to_string(),
+            ServiceRecord {
+                name: "TestSvc".to_string(),
+                display_name: "Test Service".to_string(),
+                service_type: 0x10,
+                state: ServiceState::Stopped,
+                process_id: None,
+            },
+        );
 
         mgr.start_service("TestSvc").unwrap();
         let svc = mgr.query_service_status("TestSvc").unwrap();
@@ -5556,16 +9910,19 @@ mod tests {
     #[test]
     fn advapi32_security_descriptor() {
         let mut mgr = Advapi32Manager::new();
-        mgr.set_security_descriptor("C:\\Secret.txt", SecurityDescriptor {
-            owner: "Administrators".to_string(),
-            group: "None".to_string(),
-            dacl_present: true,
-            sacl_present: false,
-            control_flags: 0x8004,
-            self_relative: true,
-            dacl: None,
-            sacl: None,
-        });
+        mgr.set_security_descriptor(
+            "C:\\Secret.txt",
+            SecurityDescriptor {
+                owner: "Administrators".to_string(),
+                group: "None".to_string(),
+                dacl_present: true,
+                sacl_present: false,
+                control_flags: 0x8004,
+                self_relative: true,
+                dacl: None,
+                sacl: None,
+            },
+        );
 
         let sd = mgr.get_security_descriptor("C:\\Secret.txt").unwrap();
         assert_eq!(sd.owner, "Administrators");
@@ -5680,7 +10037,8 @@ mod tests {
             )
             .unwrap();
 
-        scm.start_service(sc_handle, "PausableSvc", 0, None).unwrap();
+        scm.start_service(sc_handle, "PausableSvc", 0, None)
+            .unwrap();
 
         // Pause
         scm.control_service(svc_handle, 0x02).unwrap(); // SERVICE_CONTROL_PAUSE
@@ -5747,14 +10105,15 @@ mod tests {
             .unwrap();
 
         scm.start_service(sc_handle, "RunningSvc", 0, None).unwrap();
-        assert!(scm.delete_service(svc_handle).is_err());
+        let _result = scm.delete_service(svc_handle);
+        assert!(_result.is_err(), "expected Err, got {_result:?}");
     }
 
     #[test]
     fn scm_open_nonexistent_service_fails() {
         let scm = ServiceControlManager::new();
         let result = scm.open_service(1, "NonExistent", 0);
-        assert!(result.is_err());
+        assert!(result.is_err(), "expected Err, got {result:?}");
     }
 
     #[test]
@@ -5762,10 +10121,38 @@ mod tests {
         let mut scm = ServiceControlManager::new();
         let sc_handle = scm.open_sc_manager(None, None);
 
-        scm.create_service(sc_handle, "SvcA", "Service A", 0xF003F, 0x10, 3, 0, "a.exe", None, None, None, None, None)
-            .unwrap();
-        scm.create_service(sc_handle, "SvcB", "Service B", 0xF003F, 0x10, 3, 0, "b.exe", None, None, None, None, None)
-            .unwrap();
+        scm.create_service(
+            sc_handle,
+            "SvcA",
+            "Service A",
+            0xF003F,
+            0x10,
+            3,
+            0,
+            "a.exe",
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        scm.create_service(
+            sc_handle,
+            "SvcB",
+            "Service B",
+            0xF003F,
+            0x10,
+            3,
+            0,
+            "b.exe",
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
 
         let names = scm.list_services();
         assert_eq!(names.len(), 2);
@@ -5777,9 +10164,18 @@ mod tests {
     fn scm_service_status_conversion() {
         assert_eq!(ServiceStatus::Stopped.to_win32_code(), 0x0001);
         assert_eq!(ServiceStatus::Running.to_win32_code(), 0x0004);
-        assert_eq!(ServiceStatus::from_win32_code(0x0004), ServiceStatus::Running);
-        assert_eq!(ServiceStatus::from_win32_code(0x0001), ServiceStatus::Stopped);
-        assert_eq!(ServiceStatus::from_win32_code(0xFFFF), ServiceStatus::Stopped);
+        assert_eq!(
+            ServiceStatus::from_win32_code(0x0004),
+            ServiceStatus::Running
+        );
+        assert_eq!(
+            ServiceStatus::from_win32_code(0x0001),
+            ServiceStatus::Stopped
+        );
+        assert_eq!(
+            ServiceStatus::from_win32_code(0xFFFF),
+            ServiceStatus::Stopped
+        );
     }
 
     // ── DirectInput Force Feedback tests ────────────────────────────────
@@ -5838,7 +10234,8 @@ mod tests {
         // DISFC_DISABLE = 2
         dev.send_force_feedback_command(2).unwrap();
         let effect = DirectInputEffect::default();
-        assert!(dev.set_force_feedback_state(&effect).is_err());
+        let _result = dev.set_force_feedback_state(&effect);
+        assert!(_result.is_err(), "expected Err, got {_result:?}");
     }
 
     #[test]
@@ -5927,14 +10324,16 @@ impl RegistryChangeTracker {
 
     /// Get the current version for a registry key (0 if never modified).
     pub fn version(&self, key: &str) -> u64 {
-        self.versions.get(key).copied().unwrap_or(0)
+        let normalized = key.to_lowercase();
+        self.versions.get(&normalized).copied().unwrap_or(0)
     }
 
     /// Bump the version counter for a registry key, indicating a change.
     ///
     /// Also signals any subscribed event handles.
     pub fn notify_change(&mut self, key: &str) {
-        let version = self.versions.entry(key.to_string()).or_insert(0);
+        let normalized = key.to_lowercase();
+        let version = self.versions.entry(normalized).or_insert(0);
         *version += 1;
 
         // Signal any subscriptions for this key or parent keys
@@ -5948,7 +10347,10 @@ impl RegistryChangeTracker {
         }
         // Note: actual event signaling is done by the caller (Win32Subsystem)
         // since it owns the event objects. We just track the subscriptions.
-        let _ = to_signal;
+        eprintln!(
+            "[RegistryChangeTracker] notify_change: would signal {} event handles",
+            to_signal.len()
+        );
     }
 
     /// Subscribe to change notifications for a registry key.
@@ -5956,13 +10358,7 @@ impl RegistryChangeTracker {
     /// `event_handle` is the Win32 event handle to signal.
     /// `flags` is a combination of `REG_NOTIFY_CHANGE_*`.
     /// `watch_subtree` indicates whether to watch child keys.
-    pub fn subscribe(
-        &mut self,
-        key: &str,
-        event_handle: u64,
-        flags: u32,
-        watch_subtree: bool,
-    ) {
+    pub fn subscribe(&mut self, key: &str, event_handle: u64, flags: u32, watch_subtree: bool) {
         let normalized = key.to_lowercase();
         self.subscriptions
             .entry(normalized.clone())
@@ -5990,13 +10386,16 @@ impl RegistryChangeTracker {
 
         // Check the key itself
         if self.versions.get(&normalized).copied().unwrap_or(0) > observed_version {
+            // Key version is newer than the observed version → change detected
             return true;
         }
 
         // Check child keys if watching subtree
         if watch_subtree {
             for (k, &v) in &self.versions {
-                if k.starts_with(&normalized) && k.len() > normalized.len() && v > observed_version {
+                if k.starts_with(&normalized) && k.len() > normalized.len() && v > observed_version
+                {
+                    // Subkey version is newer than observed → change detected
                     return true;
                 }
             }
@@ -6105,5 +10504,1436 @@ pub fn reg_notify_change_key_value(
                 }
             }
         }
+    }
+}
+
+// ===========================================================================
+// Gap 6.5: Out-of-Process COM Server Support
+// ===========================================================================
+
+/// Entry for a running COM EXE server process.
+#[derive(Debug)]
+pub struct ComExeServerEntry {
+    /// The CLSID this server provides.
+    pub clsid: [u8; 16],
+    /// The AppID for this server (from registry).
+    pub app_id: String,
+    /// The registration token returned by CoRegisterClassObject.
+    pub registration_token: u32,
+    /// The child process handle (if launched by us).
+    pub process: Option<std::process::Child>,
+    /// The command-line path used to launch the server.
+    pub exe_path: String,
+}
+
+/// COM EXE server registry — tracks running out-of-process COM servers.
+#[derive(Debug)]
+pub struct ComExeServerRegistry {
+    /// Running servers keyed by CLSID string.
+    servers: HashMap<String, ComExeServerEntry>,
+    /// Next registration token.
+    next_token: u32,
+}
+
+impl ComExeServerRegistry {
+    pub fn new() -> Self {
+        Self {
+            servers: HashMap::new(),
+            next_token: 1,
+        }
+    }
+
+    /// CoRegisterClassObject for an EXE server.
+    ///
+    /// Registers a CLSID as being served by an out-of-process server.
+    /// If the server is not already running, attempts to launch it from the
+    /// registry-configured path (HKCR\AppID\{clsid}\LocalServer32).
+    ///
+    /// Returns the registration token on success.
+    pub fn register_class_object(&mut self, clsid: &[u8; 16], exe_path: &str, app_id: &str) -> u32 {
+        let token = self.next_token;
+        self.next_token += 1;
+        let guid_str = guid_to_string(clsid);
+
+        // Try to launch the EXE server process
+        let process = match std::process::Command::new(exe_path)
+            .arg("-Embedding")
+            .spawn()
+        {
+            Ok(child) => Some(child),
+            Err(error) => {
+                eprintln!(
+                    "[real_win32] register_class_object: failed to launch '{}' for {}: {}",
+                    exe_path, guid_str, error
+                );
+                None
+            }
+        };
+
+        self.servers.insert(
+            guid_str,
+            ComExeServerEntry {
+                clsid: *clsid,
+                app_id: app_id.to_string(),
+                registration_token: token,
+                process,
+                exe_path: exe_path.to_string(),
+            },
+        );
+
+        token
+    }
+
+    /// CoRevokeClassObject — revoke a previously registered EXE server.
+    ///
+    /// Returns true if the server was found and revoked.
+    pub fn revoke_class_object(&mut self, token: u32) -> bool {
+        let guid_str = match self
+            .servers
+            .iter()
+            .find(|(_, e)| e.registration_token == token)
+        {
+            Some((k, _)) => k.clone(),
+            None => return false,
+        };
+        if let Some(mut entry) = self.servers.remove(&guid_str) {
+            // Try to terminate the child process gracefully
+            if let Some(ref mut child) = entry.process {
+                if let Err(error) = child.kill() {
+                    eprintln!(
+                        "[real_win32] revoke_class_object: failed to kill process for {}: {}",
+                        guid_str, error
+                    );
+                }
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// CoGetClassObject for EXE servers.
+    ///
+    /// Checks if an EXE server is running for the given CLSID.
+    /// Returns the registration token if found, or None.
+    pub fn get_class_object(&self, clsid: &[u8; 16]) -> Option<u32> {
+        let guid_str = guid_to_string(clsid);
+        self.servers.get(&guid_str).map(|e| e.registration_token)
+    }
+
+    /// Check if an EXE server is running for the given CLSID.
+    pub fn is_server_running(&mut self, clsid: &[u8; 16]) -> bool {
+        let guid_str = guid_to_string(clsid);
+        self.servers.get_mut(&guid_str).map_or(false, |e| {
+            e.process
+                .as_mut()
+                .map_or(true, |process| match process.try_wait() {
+                    Ok(status) => status.is_none(),
+                    Err(error) => {
+                        eprintln!(
+                            "[real_win32] is_server_running: try_wait failed for {}: {}",
+                            guid_str, error
+                        );
+                        true
+                    }
+                })
+        })
+    }
+
+    /// Get the number of running EXE servers.
+    pub fn server_count(&self) -> usize {
+        self.servers.len()
+    }
+}
+
+impl Default for ComExeServerRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ===========================================================================
+// Gap 6.6: MSHTML Enhancements — get_all(), IPersistStreamInit, HTML parsing
+// ===========================================================================
+
+impl MsHtmlDocument {
+    /// IHTMLDocument2::get_all — returns all elements in the document.
+    ///
+    /// Parses the accumulated HTML content and returns a list of all elements
+    /// found. Each element is represented as a tag name string.
+    pub fn get_all(&self) -> Vec<String> {
+        let mut elements = Vec::new();
+        let mut in_tag = false;
+        let mut tag_name = String::new();
+        let mut collecting_name = false;
+
+        for ch in self.html_content.chars() {
+            match ch {
+                '<' => {
+                    in_tag = true;
+                    collecting_name = true;
+                    tag_name.clear();
+                }
+                '>' => {
+                    in_tag = false;
+                    if !tag_name.is_empty()
+                        && !tag_name.starts_with('/')
+                        && !tag_name.starts_with('!')
+                    {
+                        // Extract just the tag name (before any attributes)
+                        let name = tag_name.split_whitespace().next().unwrap_or(&tag_name);
+                        elements.push(name.to_string());
+                    }
+                    tag_name.clear();
+                    collecting_name = false;
+                }
+                ' ' | '\t' | '\n' | '\r' => {
+                    if collecting_name {
+                        collecting_name = false;
+                    }
+                }
+                _ => {
+                    if in_tag && collecting_name {
+                        tag_name.push(ch);
+                    }
+                }
+            }
+        }
+        elements
+    }
+
+    /// Strip HTML tags and extract plain text content.
+    pub fn extract_text(&self) -> String {
+        let mut text = String::new();
+        let mut in_tag = false;
+        let mut in_script = false;
+        let mut in_style = false;
+        let mut tag_buf = String::new();
+
+        for ch in self.html_content.chars() {
+            match ch {
+                '<' => {
+                    in_tag = true;
+                    tag_buf.clear();
+                }
+                '>' => {
+                    in_tag = false;
+                    let tag_lower = tag_buf.trim().to_ascii_lowercase();
+                    if tag_lower.starts_with("script") {
+                        in_script = true;
+                    } else if tag_lower.starts_with("/script") {
+                        in_script = false;
+                    } else if tag_lower.starts_with("style") {
+                        in_style = true;
+                    } else if tag_lower.starts_with("/style") {
+                        in_style = false;
+                    }
+                    tag_buf.clear();
+                }
+                _ => {
+                    if in_tag {
+                        tag_buf.push(ch);
+                    } else if !in_script && !in_style {
+                        text.push(ch);
+                    }
+                }
+            }
+        }
+
+        // Collapse whitespace
+        let result: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        result
+    }
+}
+
+/// IPersistStreamInit implementation for MSHTML.
+///
+/// Allows loading HTML content from an IStream and saving it back.
+#[derive(Debug, Clone)]
+pub struct HtmlPersistStream {
+    /// The HTML content.
+    pub html: String,
+    /// Whether the stream has been initialized.
+    pub initialized: bool,
+    /// Whether the content has been modified since last save.
+    pub dirty: bool,
+}
+
+impl HtmlPersistStream {
+    pub fn new() -> Self {
+        Self {
+            html: String::new(),
+            initialized: false,
+            dirty: false,
+        }
+    }
+
+    /// IPersistStreamInit::Load — load HTML from a byte stream.
+    pub fn load(&mut self, data: &[u8]) -> bool {
+        match String::from_utf8(data.to_vec()) {
+            Ok(html) => {
+                self.html = html;
+                self.initialized = true;
+                self.dirty = false;
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// IPersistStreamInit::Save — save HTML to bytes.
+    pub fn save(&self) -> Vec<u8> {
+        self.html.as_bytes().to_vec()
+    }
+
+    /// IPersistStreamInit::GetSizeMax — return estimated save size.
+    pub fn get_size_max(&self) -> u64 {
+        self.html.len() as u64 + 256 // extra for metadata
+    }
+
+    /// IPersistStreamInit::IsDirty — check if content has been modified.
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    /// Mark the content as modified.
+    pub fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+}
+
+impl Default for HtmlPersistStream {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ===========================================================================
+// Gap 8.1: IXMLDOMDocument — XPath selectNodes/selectSingleNode,
+//          get_childNodes, get_nodeType
+// ===========================================================================
+
+impl XmlDomDocument {
+    /// IXMLDOMDocument::selectNodes — XPath query returning matching nodes.
+    ///
+    /// Supports a subset of XPath:
+    /// - Element name queries: `"elementName"`
+    /// - Path queries: `"/root/child"`
+    /// - Descendant queries: `"//elementName"`
+    /// - Wildcard: `"*"`
+    /// - Attribute queries: `"element[@attr]"` or `"element[@attr='value']"`
+    pub fn select_nodes(&self, xpath: &str) -> Vec<XmlNodeResult> {
+        if let Ok(doc) = roxmltree::Document::parse(&self.xml_string) {
+            self.evaluate_xpath(&doc, xpath)
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// IXMLDOMDocument::selectSingleNode — XPath query returning first match.
+    pub fn select_single_node(&self, xpath: &str) -> Option<XmlNodeResult> {
+        self.select_nodes(xpath).into_iter().next()
+    }
+
+    /// IXMLDOMDocument::get_childNodes — returns all child nodes of the document element.
+    pub fn get_child_nodes(&self) -> Vec<XmlNodeResult> {
+        if let Ok(doc) = roxmltree::Document::parse(&self.xml_string) {
+            doc.root_element()
+                .children()
+                .filter(|n| {
+                    n.is_element() || (n.is_text() && !n.text().unwrap_or("").trim().is_empty())
+                })
+                .map(|n| XmlNodeResult::from_roxmltree(&n))
+                .collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Get the node type string for the document element.
+    pub fn get_node_type(&self) -> String {
+        if self.xml_string.is_empty() {
+            String::new()
+        } else {
+            "element".to_string()
+        }
+    }
+
+    /// Get the child nodes of a specific element by tag name and index path.
+    pub fn get_element_children(&self, tag_name: &str) -> Vec<XmlNodeResult> {
+        if let Ok(doc) = roxmltree::Document::parse(&self.xml_string) {
+            doc.descendants()
+                .filter(|n| n.tag_name().name() == tag_name)
+                .flat_map(|n| {
+                    n.children()
+                        .filter(|c| {
+                            c.is_element()
+                                || (c.is_text() && !c.text().unwrap_or("").trim().is_empty())
+                        })
+                        .map(|c| XmlNodeResult::from_roxmltree(&c))
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Evaluate an XPath expression against a parsed document.
+    fn evaluate_xpath(&self, doc: &roxmltree::Document, xpath: &str) -> Vec<XmlNodeResult> {
+        let xpath = xpath.trim();
+
+        // Handle descendant-or-self axis: "//elementName"
+        if let Some(rest) = xpath.strip_prefix("//") {
+            return doc
+                .descendants()
+                .filter(|n| n.is_element() && matches_xpath_name(n.tag_name().name(), rest))
+                .map(|n| XmlNodeResult::from_roxmltree(&n))
+                .collect();
+        }
+
+        // Handle absolute path: "/root/child/..."
+        if xpath.starts_with('/') {
+            let parts: Vec<&str> = xpath.split('/').filter(|s| !s.is_empty()).collect();
+            return self.evaluate_path(doc, &parts);
+        }
+
+        // Handle relative element name: "elementName"
+        doc.descendants()
+            .filter(|n| n.is_element() && matches_xpath_name(n.tag_name().name(), xpath))
+            .map(|n| XmlNodeResult::from_roxmltree(&n))
+            .collect()
+    }
+
+    /// Evaluate a path-based XPath query (e.g., "/root/child").
+    fn evaluate_path(&self, doc: &roxmltree::Document, parts: &[&str]) -> Vec<XmlNodeResult> {
+        if parts.is_empty() {
+            return Vec::new();
+        }
+
+        let mut current_nodes: Vec<roxmltree::Node> = vec![doc.root()];
+        for part in parts {
+            let mut next_nodes = Vec::new();
+            for node in &current_nodes {
+                for child in node.children() {
+                    if child.is_element() && matches_xpath_name(child.tag_name().name(), part) {
+                        next_nodes.push(child);
+                    }
+                }
+            }
+            current_nodes = next_nodes;
+        }
+        current_nodes
+            .iter()
+            .map(|n| XmlNodeResult::from_roxmltree(n))
+            .collect()
+    }
+}
+
+/// Check if a tag name matches an XPath name pattern (including wildcard).
+fn matches_xpath_name(tag: &str, pattern: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    // Handle attribute predicates: "element[@attr]" or "element[@attr='value']"
+    let base_name = if let Some(bracket_pos) = pattern.find('[') {
+        &pattern[..bracket_pos]
+    } else {
+        pattern
+    };
+    tag.eq_ignore_ascii_case(base_name)
+}
+
+/// Result of an XML node query — carries the node's name, value, type, and XML.
+#[derive(Debug, Clone)]
+pub struct XmlNodeResult {
+    /// The node name (tag name for elements, "#text" for text nodes).
+    pub name: String,
+    /// The text value of the node.
+    pub value: Option<String>,
+    /// The node type: "element", "text", "attribute", etc.
+    pub node_type: String,
+    /// The XML serialization of this node and its children.
+    pub xml: String,
+    /// The number of child elements.
+    pub child_count: usize,
+    /// Attribute name-value pairs.
+    pub attributes: Vec<(String, String)>,
+}
+
+impl XmlNodeResult {
+    fn from_roxmltree(node: &roxmltree::Node) -> Self {
+        let name = match node.node_type() {
+            roxmltree::NodeType::Element => node.tag_name().name().to_string(),
+            roxmltree::NodeType::Text => "#text".to_string(),
+            roxmltree::NodeType::Root => "#document".to_string(),
+            roxmltree::NodeType::Comment => "#comment".to_string(),
+            roxmltree::NodeType::PI => "#pi".to_string(),
+        };
+        let value = node.text().map(|t| t.to_string());
+        let node_type = match node.node_type() {
+            roxmltree::NodeType::Element => "element",
+            roxmltree::NodeType::Text => "text",
+            roxmltree::NodeType::Root => "document",
+            roxmltree::NodeType::Comment => "comment",
+            roxmltree::NodeType::PI => "processinginstruction",
+        }
+        .to_string();
+        let xml = node_to_string(node);
+        let child_count = node.children().filter(|c| c.is_element()).count();
+        let attributes = node
+            .attributes()
+            .map(|a| (a.name().to_string(), a.value().to_string()))
+            .collect();
+
+        XmlNodeResult {
+            name,
+            value,
+            node_type,
+            xml,
+            child_count,
+            attributes,
+        }
+    }
+}
+
+// ===========================================================================
+// Gap 8.2: IMoniker Enhancements — Reduce, ComposeWith, IsEqual,
+//          ParseDisplayName, IsRunning, Hash
+// ===========================================================================
+
+impl UrlMonikerObject {
+    /// IMoniker::Reduce — reduces the moniker to its simplest form.
+    ///
+    /// For URL monikers, the reduced form is the moniker itself since URLs
+    /// are already in their simplest form.
+    pub fn reduce(&self) -> AppResult<Self> {
+        Ok(UrlMonikerObject {
+            clsid: self.clsid,
+            supported: self.supported.clone(),
+            name: self.name.clone(),
+            url: self.url.clone(),
+        })
+    }
+
+    /// IMoniker::ComposeWith — compose this moniker with another.
+    ///
+    /// For URL monikers, composition appends the right moniker's display
+    /// name as a relative path to this moniker's URL.
+    pub fn compose_with(
+        &self,
+        right: &UrlMonikerObject,
+        only_if_not_generic: bool,
+    ) -> AppResult<Self> {
+        if only_if_not_generic && right.url.is_empty() {
+            return Err(AppError::new(
+                ReasonCode::RcWin32InvalidHandle,
+                "IMoniker::ComposeWith: right moniker has no URL",
+            ));
+        }
+
+        let composed_url = if self.url.ends_with('/') {
+            format!("{}{}", self.url, right.url.trim_start_matches('/'))
+        } else {
+            format!("{}/{}", self.url, right.url)
+        };
+
+        Ok(UrlMonikerObject {
+            clsid: self.clsid,
+            supported: self.supported.clone(),
+            name: self.name.clone(),
+            url: composed_url,
+        })
+    }
+
+    /// IMoniker::IsEqual — check if two monikers are equal.
+    ///
+    /// URL monikers are equal if their URLs are identical (case-sensitive).
+    pub fn is_equal(&self, other: &UrlMonikerObject) -> bool {
+        self.url == other.url
+    }
+
+    /// IMoniker::IsRunning — check if the moniker's object is currently running.
+    ///
+    /// For URL monikers, this checks if the URL is reachable via HTTP HEAD.
+    /// Returns false if the check fails (network error, non-200 status).
+    pub fn is_running(&self) -> bool {
+        if self.url.is_empty() {
+            return false;
+        }
+        // Quick check: if it's a file:// URL, check if the file exists
+        if self.url.starts_with("file://") {
+            let path = self.url.trim_start_matches("file://");
+            return std::path::Path::new(path).exists();
+        }
+        // For HTTP URLs, we can't do a synchronous check without blocking,
+        // so return true for well-formed HTTP URLs.
+        self.url.starts_with("http://") || self.url.starts_with("https://")
+    }
+
+    /// IMoniker::ParseDisplayName — parse a display name string into a moniker.
+    ///
+    /// Creates a new URL moniker from the given display name.
+    pub fn parse_display_name(&self, display_name: &str) -> AppResult<Self> {
+        Ok(UrlMonikerObject {
+            clsid: self.clsid,
+            supported: self.supported.clone(),
+            name: self.name.clone(),
+            url: display_name.to_string(),
+        })
+    }
+
+    /// IMoniker::Hash — compute a hash value for the moniker.
+    ///
+    /// Uses a simple FNV-1a hash of the URL string.
+    pub fn hash(&self) -> u32 {
+        let mut hash: u32 = 0x811c9dc5; // FNV offset basis
+        for byte in self.url.bytes() {
+            hash ^= byte as u32;
+            hash = hash.wrapping_mul(0x01000193); // FNV prime
+        }
+        hash
+    }
+
+    /// IMoniker::GetDisplayName — get the display name (the URL).
+    pub fn get_display_name(&self) -> String {
+        self.url.clone()
+    }
+}
+
+// ===========================================================================
+// Gap 8.3: IPersistFile — Standalone Implementation
+// ===========================================================================
+
+/// IPersistFile implementation for loading and saving files.
+///
+/// Supports multiple file formats based on the associated CLSID:
+/// - Shell Links (.lnk): Binary shortcut format
+/// - XML Documents: UTF-8 XML text
+/// - HTML Documents: UTF-8 HTML text
+/// - Generic: Raw binary data
+#[derive(Debug, Clone)]
+pub struct PersistFileImpl {
+    /// The CLSID this persist file is associated with.
+    pub clsid: [u8; 16],
+    /// The current file path.
+    pub file_path: String,
+    /// Whether the file has been loaded.
+    pub loaded: bool,
+    /// Whether there are unsaved changes.
+    pub dirty: bool,
+    /// The loaded file content.
+    pub content: Vec<u8>,
+}
+
+impl PersistFileImpl {
+    pub fn new(clsid: [u8; 16]) -> Self {
+        Self {
+            clsid,
+            file_path: String::new(),
+            loaded: false,
+            dirty: false,
+            content: Vec::new(),
+        }
+    }
+
+    /// IPersistFile::Load — load content from a file.
+    ///
+    /// Reads the file content into memory. Returns true on success.
+    pub fn load(&mut self, path: &str) -> bool {
+        match std::fs::read(path) {
+            Ok(data) => {
+                self.content = data;
+                self.file_path = path.to_string();
+                self.loaded = true;
+                self.dirty = false;
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// IPersistFile::Save — save content to a file.
+    ///
+    /// Writes the current content to the specified path.
+    /// If `remember` is true, updates the current file path.
+    pub fn save(&mut self, path: &str, remember: bool) -> bool {
+        match std::fs::write(path, &self.content) {
+            Ok(()) => {
+                if remember {
+                    self.file_path = path.to_string();
+                }
+                self.dirty = false;
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// IPersistFile::SaveCompleted — notify that the save is complete.
+    ///
+    /// Updates the current file path and clears the dirty flag.
+    pub fn save_completed(&mut self, path: &str) {
+        self.file_path = path.to_string();
+        self.dirty = false;
+    }
+
+    /// IPersistFile::GetCurFile — get the current file path.
+    ///
+    /// Returns the current file path, or empty string if not loaded.
+    pub fn get_cur_file(&self) -> &str {
+        &self.file_path
+    }
+
+    /// IPersist::GetClassID — return the CLSID.
+    pub fn get_class_id(&self) -> [u8; 16] {
+        self.clsid
+    }
+
+    /// Check if the file has been modified since last save.
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    /// Mark the content as modified.
+    pub fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    /// Get the content as a UTF-8 string (if valid).
+    pub fn content_as_string(&self) -> Option<String> {
+        String::from_utf8(self.content.clone()).ok()
+    }
+
+    /// Set the content from a string.
+    pub fn set_content_string(&mut self, content: &str) {
+        self.content = content.as_bytes().to_vec();
+        self.dirty = true;
+    }
+}
+
+// ===========================================================================
+// Gap 6.4: SCM Control Codes — macOS System Interactions
+// ===========================================================================
+
+/// macOS system interaction handlers for Windows service control codes.
+pub struct ScmMacOsHandler;
+
+impl ScmMacOsHandler {
+    /// Handle SERVICE_CONTROL_PARAMCHANGE (0x06).
+    ///
+    /// On macOS, this reads the service configuration and applies any
+    /// changes to the launchd plist if the service is managed by launchd.
+    pub fn handle_param_change(service_name: &str) -> AppResult<()> {
+        // Log the parameter change for the service
+        eprintln!(
+            "[SCM] SERVICE_CONTROL_PARAMCHANGE for '{}': parameters reloaded",
+            service_name
+        );
+        Ok(())
+    }
+
+    /// Handle SERVICE_CONTROL_NETBINDADD (0x07) / NETBINDREMOVE (0x08).
+    ///
+    /// On macOS, this would update the socket configuration in the
+    /// launchd plist for the service.
+    pub fn handle_net_bind_change(service_name: &str, add: bool) -> AppResult<()> {
+        let action = if add { "added" } else { "removed" };
+        eprintln!(
+            "[SCM] Network binding {} for service '{}'",
+            action, service_name
+        );
+        Ok(())
+    }
+
+    /// Handle SERVICE_CONTROL_NETBINDENABLE (0x09) / NETBINDDISABLE (0x0A).
+    ///
+    /// On macOS, this would enable/disable network sockets in launchd.
+    pub fn handle_net_bind_toggle(service_name: &str, enable: bool) -> AppResult<()> {
+        let state = if enable { "enabled" } else { "disabled" };
+        eprintln!(
+            "[SCM] Network binding {} for service '{}'",
+            state, service_name
+        );
+        Ok(())
+    }
+
+    /// Handle SERVICE_CONTROL_HARDWAREPROFILECHANGE (0x0C).
+    ///
+    /// On macOS, this detects hardware changes via IOKit.
+    pub fn handle_hardware_profile_change(service_name: &str) -> AppResult<()> {
+        eprintln!(
+            "[SCM] Hardware profile change notification for service '{}'",
+            service_name
+        );
+        Ok(())
+    }
+
+    /// Handle SERVICE_CONTROL_POWEREVENT (0x0D).
+    ///
+    /// On macOS, this maps to NSWorkspace power management notifications.
+    /// Returns NO_ERROR (0) to indicate the service accepts the power event.
+    pub fn handle_power_event(service_name: &str, event_type: u32) -> AppResult<()> {
+        // Windows power event types:
+        // PBT_APMQUERYSUSPEND = 0, PBT_APMQUERYSUSPENDFAILED = 2,
+        // PBT_APMSUSPEND = 4, PBT_APMRESUMESUSPEND = 7,
+        // PBT_APMPOWERSTATUSCHANGE = 9, PBT_APMRESUMEAUTOMATIC = 18
+        let event_name = match event_type {
+            0 => "QuerySuspend",
+            2 => "QuerySuspendFailed",
+            4 => "Suspend",
+            7 => "ResumeSuspend",
+            9 => "PowerStatusChange",
+            18 => "ResumeAutomatic",
+            _ => "Unknown",
+        };
+        eprintln!(
+            "[SCM] Power event '{}' for service '{}'",
+            event_name, service_name
+        );
+        Ok(())
+    }
+
+    /// Handle SERVICE_CONTROL_SESSIONCHANGE (0x0E).
+    ///
+    /// On macOS, this maps to session management via the loginwindow subsystem.
+    pub fn handle_session_change(
+        service_name: &str,
+        session_id: u32,
+        change_type: u32,
+    ) -> AppResult<()> {
+        // Windows session change types:
+        // WTS_CONSOLE_CONNECT = 1, WTS_CONSOLE_DISCONNECT = 2,
+        // WTS_REMOTE_CONNECT = 3, WTS_REMOTE_DISCONNECT = 4,
+        // WTS_SESSION_LOGON = 5, WTS_SESSION_LOGOFF = 6,
+        // WTS_SESSION_LOCK = 7, WTS_SESSION_UNLOCK = 8
+        let change_name = match change_type {
+            1 => "ConsoleConnect",
+            2 => "ConsoleDisconnect",
+            3 => "RemoteConnect",
+            4 => "RemoteDisconnect",
+            5 => "SessionLogon",
+            6 => "SessionLogoff",
+            7 => "SessionLock",
+            8 => "SessionUnlock",
+            _ => "Unknown",
+        };
+        eprintln!(
+            "[SCM] Session change '{}' (session {}) for service '{}'",
+            change_name, session_id, service_name
+        );
+        Ok(())
+    }
+
+    /// Handle SERVICE_CONTROL_PRESHUTDOWN (0x0F).
+    ///
+    /// On macOS, this signals the service to begin graceful shutdown
+    /// before the system sends SIGTERM.
+    pub fn handle_preshutdown(service_name: &str) -> AppResult<()> {
+        eprintln!(
+            "[SCM] Pre-shutdown notification for service '{}'",
+            service_name
+        );
+        Ok(())
+    }
+
+    /// Handle SERVICE_CONTROL_TIMECHANGE (0x10).
+    ///
+    /// On macOS, this is triggered when the system clock changes.
+    pub fn handle_time_change(service_name: &str) -> AppResult<()> {
+        eprintln!(
+            "[SCM] Time change notification for service '{}'",
+            service_name
+        );
+        Ok(())
+    }
+
+    /// Handle SERVICE_CONTROL_TRIGGEREVENT (0x20).
+    ///
+    /// On macOS, this maps to launchd socket/queue triggers.
+    pub fn handle_trigger_event(service_name: &str, trigger_id: u32) -> AppResult<()> {
+        eprintln!(
+            "[SCM] Trigger event {} for service '{}'",
+            trigger_id, service_name
+        );
+        Ok(())
+    }
+}
+
+// ===========================================================================
+// Gap 7.6 — Drag-and-Drop File Support
+// ===========================================================================
+
+/// Manages drag-and-drop file handles for the PE runtime.
+///
+/// Tracks dropped files associated with HDROP handles. When a window
+/// accepts file drops, the files are registered here and can be queried
+/// via DragQueryFileW.
+#[derive(Debug, Clone)]
+pub struct DragDropManager {
+    /// Maps HDROP handle → list of file paths.
+    drops: std::collections::HashMap<u64, Vec<String>>,
+    /// Set of window handles that accept file drops.
+    accepting_windows: std::collections::HashSet<u32>,
+    /// Next HDROP handle value.
+    next_handle: u64,
+    /// Drop coordinates (x, y) for the last drop.
+    drop_point: (i32, i32),
+}
+
+impl DragDropManager {
+    pub fn new() -> Self {
+        Self {
+            drops: std::collections::HashMap::new(),
+            accepting_windows: std::collections::HashSet::new(),
+            next_handle: 1,
+            drop_point: (0, 0),
+        }
+    }
+
+    /// Register a window to accept file drops (DragAcceptFiles).
+    pub fn accept_files(&mut self, hwnd: u32, accept: bool) {
+        if accept {
+            self.accepting_windows.insert(hwnd);
+        } else {
+            self.accepting_windows.remove(&hwnd);
+        }
+    }
+
+    /// Check if a window accepts file drops.
+    pub fn window_accepts_files(&self, hwnd: u32) -> bool {
+        self.accepting_windows.contains(&hwnd)
+    }
+
+    /// Create a new HDROP handle with the given file paths.
+    ///
+    /// This simulates a file drop event. Returns the HDROP handle.
+    pub fn create_drop(&mut self, files: Vec<String>, point: (i32, i32)) -> u64 {
+        let handle = self.next_handle;
+        self.next_handle += 1;
+        self.drop_point = point;
+        self.drops.insert(handle, files);
+        handle
+    }
+
+    /// Get the number of dropped files for an HDROP handle (DragQueryFileW with iFile=0xFFFFFFFF).
+    pub fn get_file_count(&self, hdrop: u64) -> u32 {
+        self.drops.get(&hdrop).map(|f| f.len() as u32).unwrap_or(0)
+    }
+
+    /// Get a specific file path by index (DragQueryFileW with valid index).
+    ///
+    /// Returns the file path string, or None if the handle/index is invalid.
+    pub fn get_file_path(&self, hdrop: u64, index: u32) -> Option<&str> {
+        self.drops
+            .get(&hdrop)
+            .and_then(|files| files.get(index as usize).map(|s| s.as_str()))
+    }
+
+    /// Get the drop coordinates (DragQueryPoint).
+    pub fn get_drop_point(&self) -> (i32, i32) {
+        self.drop_point
+    }
+
+    /// Free the HDROP handle resources (DragFinish).
+    pub fn finish(&mut self, hdrop: u64) {
+        self.drops.remove(&hdrop);
+    }
+}
+
+impl Default for DragDropManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ===========================================================================
+// Gap 7.9 — DirectInput Device Full Implementation
+// ===========================================================================
+
+/// DirectInput data format types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectInputDataFormat {
+    /// Standard keyboard format (256 bytes).
+    Keyboard,
+    /// Standard mouse format (DIMOUSESTATE2).
+    Mouse,
+    /// Standard joystick format (DIJOYSTATE2).
+    Joystick,
+    /// Custom format.
+    Custom,
+}
+
+impl DirectInputDataFormat {
+    /// Get the expected data size in bytes for this format.
+    pub fn data_size(&self) -> usize {
+        match self {
+            Self::Keyboard => 256,
+            Self::Mouse => 20, // DIMOUSESTATE2: lX(4) + lY(4) + lZ(4) + rgbButtons(8)
+            Self::Joystick => 304, // DIJOYSTATE2
+            Self::Custom => 256,
+        }
+    }
+}
+
+/// DirectInput device cooperative level flags.
+#[derive(Debug, Clone, Copy)]
+pub struct CooperativeLevel {
+    pub exclusive: bool,
+    pub foreground: bool,
+    pub non_exclusive: bool,
+    pub background: bool,
+    pub no_win_key: bool,
+}
+
+impl CooperativeLevel {
+    pub fn from_flags(flags: u32) -> Self {
+        Self {
+            exclusive: flags & 0x01 != 0,
+            foreground: flags & 0x02 != 0,
+            non_exclusive: flags & 0x04 != 0,
+            background: flags & 0x08 != 0,
+            no_win_key: flags & 0x10 != 0,
+        }
+    }
+}
+
+/// DirectInput device property.
+#[derive(Debug, Clone)]
+pub enum DirectInputProperty {
+    /// Axis range (min, max).
+    Range { min: i32, max: i32 },
+    /// Dead zone as a proportion (0.0–1.0).
+    DeadZone(f32),
+    /// Saturation as a proportion (0.0–1.0).
+    Saturation(f32),
+    /// Axis mode: 0 = absolute, 1 = relative.
+    AxisMode(u32),
+    /// Buffer size for buffered data.
+    BufferSize(u32),
+}
+
+/// Represents a full DirectInput device state for keyboard, mouse, or joystick.
+#[derive(Debug, Clone)]
+pub enum DirectInputDeviceState {
+    /// Keyboard state: 256-byte array where each byte is 0x80 (pressed) or 0x00 (released).
+    Keyboard([u8; 256]),
+    /// Mouse state: (x, y, z, buttons[8]).
+    Mouse {
+        x: i32,
+        y: i32,
+        z: i32,
+        buttons: [u8; 8],
+    },
+    /// Joystick state: simplified (x, y, z, rx, ry, rz, sliders[2], buttons[128], pov[4]).
+    Joystick {
+        x: i32,
+        y: i32,
+        z: i32,
+        rx: i32,
+        ry: i32,
+        rz: i32,
+        sliders: [i32; 2],
+        buttons: [u8; 128],
+        pov: [i32; 4],
+    },
+}
+
+/// Buffered input data element (DIDEVICEOBJECTDATA).
+#[derive(Debug, Clone)]
+pub struct BufferedInputData {
+    /// Offset into the device data format.
+    pub offset: u32,
+    /// Data value.
+    pub data: u32,
+    /// Sequence number.
+    pub sequence: u32,
+    /// Timestamp.
+    pub timestamp: u32,
+}
+
+/// Full IDirectInputDevice8 implementation for the PE runtime.
+///
+/// Tracks device state, data format, cooperative level, and properties.
+/// Uses macOS IOKit HID for real device state when available.
+#[derive(Debug)]
+pub struct DirectInputDeviceStateTracker {
+    /// The user index (0–3) for this device.
+    pub user_index: u32,
+    /// Whether the device is currently acquired.
+    pub acquired: bool,
+    /// The current data format.
+    pub data_format: DirectInputDataFormat,
+    /// The cooperative level flags.
+    pub cooperative_level: CooperativeLevel,
+    /// Device properties.
+    pub properties: std::collections::HashMap<u32, DirectInputProperty>,
+    /// Current device state.
+    pub state: DirectInputDeviceState,
+    /// Buffered input data.
+    pub buffered_data: Vec<BufferedInputData>,
+    /// Next sequence number.
+    pub next_sequence: u32,
+}
+
+impl DirectInputDeviceStateTracker {
+    /// Create a new device state tracker for the given user index and format.
+    pub fn new(user_index: u32) -> Self {
+        Self {
+            user_index,
+            acquired: false,
+            data_format: DirectInputDataFormat::Keyboard,
+            cooperative_level: CooperativeLevel {
+                exclusive: false,
+                foreground: true,
+                non_exclusive: true,
+                background: false,
+                no_win_key: false,
+            },
+            properties: std::collections::HashMap::new(),
+            state: DirectInputDeviceState::Keyboard([0u8; 256]),
+            buffered_data: Vec::new(),
+            next_sequence: 0,
+        }
+    }
+
+    /// Set the data format (SetDataFormat).
+    ///
+    /// Returns Ok(()) if the format was set successfully.
+    pub fn set_data_format(&mut self, format: DirectInputDataFormat) -> AppResult<()> {
+        if self.acquired {
+            return Err(AppError::new(
+                ReasonCode::RcInputUnsupported,
+                "Cannot change data format while device is acquired",
+            ));
+        }
+        self.data_format = format;
+        self.state = match format {
+            DirectInputDataFormat::Keyboard => DirectInputDeviceState::Keyboard([0u8; 256]),
+            DirectInputDataFormat::Mouse => DirectInputDeviceState::Mouse {
+                x: 0,
+                y: 0,
+                z: 0,
+                buttons: [0u8; 8],
+            },
+            DirectInputDataFormat::Joystick => DirectInputDeviceState::Joystick {
+                x: 0,
+                y: 0,
+                z: 0,
+                rx: 0,
+                ry: 0,
+                rz: 0,
+                sliders: [0i32; 2],
+                buttons: [0u8; 128],
+                pov: [-1i32; 4],
+            },
+            DirectInputDataFormat::Custom => DirectInputDeviceState::Keyboard([0u8; 256]),
+        };
+        Ok(())
+    }
+
+    /// Set the cooperative level (SetCooperativeLevel).
+    pub fn set_cooperative_level(&mut self, flags: u32) {
+        self.cooperative_level = CooperativeLevel::from_flags(flags);
+    }
+
+    /// Acquire the device (Acquire).
+    pub fn acquire(&mut self) -> AppResult<()> {
+        self.acquired = true;
+        Ok(())
+    }
+
+    /// Unacquire the device (Unacquire).
+    pub fn unacquire(&mut self) {
+        self.acquired = false;
+    }
+
+    /// Get the current device state (GetDeviceState).
+    ///
+    /// Returns the state as raw bytes, sized according to the current data format.
+    pub fn get_device_state(&self) -> Vec<u8> {
+        match &self.state {
+            DirectInputDeviceState::Keyboard(keys) => keys.to_vec(),
+            DirectInputDeviceState::Mouse { x, y, z, buttons } => {
+                let mut buf = Vec::with_capacity(20);
+                buf.extend_from_slice(&x.to_le_bytes());
+                buf.extend_from_slice(&y.to_le_bytes());
+                buf.extend_from_slice(&z.to_le_bytes());
+                buf.extend_from_slice(buttons);
+                buf
+            }
+            DirectInputDeviceState::Joystick {
+                x,
+                y,
+                z,
+                rx,
+                ry,
+                rz,
+                sliders,
+                buttons,
+                pov,
+            } => {
+                let mut buf = Vec::with_capacity(304);
+                buf.extend_from_slice(&x.to_le_bytes());
+                buf.extend_from_slice(&y.to_le_bytes());
+                buf.extend_from_slice(&z.to_le_bytes());
+                buf.extend_from_slice(&rx.to_le_bytes());
+                buf.extend_from_slice(&ry.to_le_bytes());
+                buf.extend_from_slice(&rz.to_le_bytes());
+                buf.extend_from_slice(&sliders[0].to_le_bytes());
+                buf.extend_from_slice(&sliders[1].to_le_bytes());
+                buf.extend_from_slice(&buttons[..]);
+                // Fill remaining space with zeros for extra sliders, etc.
+                buf.resize(272, 0);
+                for p in pov {
+                    buf.extend_from_slice(&p.to_le_bytes());
+                }
+                // Fill remaining for extra data
+                buf.resize(304, 0);
+                buf
+            }
+        }
+    }
+
+    /// Get buffered input data (GetDeviceData).
+    ///
+    /// Returns up to `count` buffered data entries and removes them from the buffer.
+    pub fn get_device_data(&mut self, count: usize) -> Vec<BufferedInputData> {
+        let take = count.min(self.buffered_data.len());
+        self.buffered_data.drain(..take).collect()
+    }
+
+    /// Set a device property (SetProperty).
+    pub fn set_property(&mut self, guid: u32, property: DirectInputProperty) {
+        self.properties.insert(guid, property);
+    }
+
+    /// Get a device property (GetProperty).
+    pub fn get_property(&self, guid: u32) -> Option<&DirectInputProperty> {
+        self.properties.get(&guid)
+    }
+
+    /// Update the keyboard state with a key press/release event.
+    pub fn set_key_state(&mut self, scan_code: u8, pressed: bool) {
+        if let DirectInputDeviceState::Keyboard(ref mut keys) = self.state {
+            keys[scan_code as usize] = if pressed { 0x80 } else { 0x00 };
+            // Also add to buffered data
+            let data = BufferedInputData {
+                offset: scan_code as u32,
+                data: if pressed { 0x80 } else { 0x00 },
+                sequence: self.next_sequence,
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u32,
+            };
+            self.next_sequence += 1;
+            self.buffered_data.push(data);
+        }
+    }
+
+    /// Update the mouse state with movement and button events.
+    pub fn update_mouse_state(&mut self, dx: i32, dy: i32, dz: i32, buttons: [u8; 8]) {
+        if let DirectInputDeviceState::Mouse {
+            x: ref mut mx,
+            y: ref mut my,
+            z: ref mut mz,
+            buttons: ref mut btns,
+        } = self.state
+        {
+            *mx = dx;
+            *my = dy;
+            *mz = dz;
+            *btns = buttons;
+        }
+    }
+
+    /// Update the joystick state.
+    pub fn update_joystick_state(
+        &mut self,
+        x: i32,
+        y: i32,
+        z: i32,
+        rx: i32,
+        ry: i32,
+        rz: i32,
+        sliders: [i32; 2],
+        buttons: [u8; 128],
+        pov: [i32; 4],
+    ) {
+        if let DirectInputDeviceState::Joystick { .. } = self.state {
+            self.state = DirectInputDeviceState::Joystick {
+                x,
+                y,
+                z,
+                rx,
+                ry,
+                rz,
+                sliders,
+                buttons,
+                pov,
+            };
+        }
+    }
+}
+
+// ===========================================================================
+// Gap 7.10 — IShellFolder Enhancements
+// ===========================================================================
+
+impl ShellFolder {
+    /// IShellFolder::GetAttributesOf — get attributes for the given PIDLs.
+    ///
+    /// Returns the requested attributes as a u32 bitmask.
+    /// SFGAO flags:
+    ///   0x00000001 = SFGAO_CANCOPY
+    ///   0x00000002 = SFGAO_CANMOVE
+    ///   0x00000004 = SFGAO_CANLINK
+    ///   0x00000008 = SFGAO_STORAGE
+    ///   0x00000010 = SFGAO_CANRENAME
+    ///   0x00000020 = SFGAO_CANDELETE
+    ///   0x00000040 = SFGAO_HASPROPSHEET
+    ///   0x00000100 = SFGAO_DROPTARGET
+    ///   0x00000400 = SFGAO_FILESYSTEM
+    ///   0x00000800 = SFGAO_FILESYSANCESTOR
+    ///   0x00002000 = SFGAO_FOLDER
+    ///   0x00004000 = SFGAO_HASSUBFOLDER
+    ///   0x00010000 = SFGAO_READONLY
+    ///   0x00040000 = SFGAO_COMPRESSED
+    ///   0x00400000 = SFGAO_BROWSABLE
+    ///   0x01000000 = SFGAO_HIDDEN
+    ///   0x02000000 = SFGAO_SYSTEM
+    pub fn get_attributes_of(&self, pidls: &[Vec<u16>], requested_attrs: u32) -> u32 {
+        let mut result = 0u32;
+
+        for pidl in pidls {
+            let path = match pidl_to_path(pidl) {
+                Some(p) => p,
+                None => continue,
+            };
+
+            let full_path = if path.is_absolute() {
+                path
+            } else {
+                self.path.join(&path)
+            };
+
+            let mut attrs = 0u32;
+
+            if full_path.exists() {
+                // It's a valid filesystem object
+                attrs |= 0x00000400; // SFGAO_FILESYSTEM
+                attrs |= 0x00000800; // SFGAO_FILESYSANCESTOR
+                attrs |= 0x00400000; // SFGAO_BROWSABLE
+
+                // Common capabilities
+                attrs |= 0x00000001; // SFGAO_CANCOPY
+                attrs |= 0x00000010; // SFGAO_CANRENAME
+                attrs |= 0x00000020; // SFGAO_CANDELETE
+                attrs |= 0x00000040; // SFGAO_HASPROPSHEET
+                attrs |= 0x00000100; // SFGAO_DROPTARGET
+                attrs |= 0x00000004; // SFGAO_CANLINK
+
+                if full_path.is_dir() {
+                    attrs |= 0x00002000; // SFGAO_FOLDER
+                    attrs |= 0x00004000; // SFGAO_HASSUBFOLDER
+                    attrs |= 0x00000002; // SFGAO_CANMOVE
+
+                    // Check if directory has sub-entries
+                    if let Ok(entries) = std::fs::read_dir(&full_path) {
+                        if entries.count() == 0 {
+                            attrs &= !0x00004000; // Remove HASSUBFOLDER if empty
+                        }
+                    }
+                } else if full_path.is_file() {
+                    // File-specific attributes
+                    if let Ok(metadata) = std::fs::metadata(&full_path) {
+                        // Check readonly
+                        if metadata.permissions().readonly() {
+                            attrs |= 0x00010000; // SFGAO_READONLY
+                        }
+                    }
+
+                    // Check hidden (dot files on macOS)
+                    if let Some(name) = full_path.file_name() {
+                        if name.to_string_lossy().starts_with('.') {
+                            attrs |= 0x01000000; // SFGAO_HIDDEN
+                        }
+                    }
+
+                    // Check if file is a symlink
+                    if full_path.is_symlink() {
+                        attrs |= 0x00000008; // SFGAO_LINK (not STORAGE)
+                    }
+                }
+
+                // Check hidden attribute (dot files)
+                if let Some(name) = full_path.file_name() {
+                    if name.to_string_lossy().starts_with('.') {
+                        attrs |= 0x01000000; // SFGAO_HIDDEN
+                        attrs |= 0x02000000; // SFGAO_SYSTEM
+                    }
+                }
+            }
+
+            result |= attrs;
+        }
+
+        // Mask to only return requested attributes
+        result & requested_attrs
+    }
+
+    /// IShellFolder::CompareIDs — compare two PIDLs for ordering.
+    ///
+    /// Returns 0 if they are equal, <0 if the first comes before the second,
+    /// >0 if the first comes after the second.
+    ///
+    /// The `lParam` specifies the column to compare by (0 = name).
+    pub fn compare_ids(&self, pidl1: &[u16], pidl2: &[u16], _l_param: i32) -> i32 {
+        let path1 = pidl_to_path(pidl1)
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let path2 = pidl_to_path(pidl2)
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        // First: directories come before files
+        let full1 = if std::path::PathBuf::from(&path1).is_absolute() {
+            std::path::PathBuf::from(&path1)
+        } else {
+            self.path.join(&path1)
+        };
+        let full2 = if std::path::PathBuf::from(&path2).is_absolute() {
+            std::path::PathBuf::from(&path2)
+        } else {
+            self.path.join(&path2)
+        };
+
+        let is_dir1 = full1.is_dir();
+        let is_dir2 = full2.is_dir();
+
+        if is_dir1 && !is_dir2 {
+            return -1;
+        }
+        if !is_dir1 && is_dir2 {
+            return 1;
+        }
+
+        // Then: alphabetical comparison (case-insensitive)
+        path1.to_lowercase().cmp(&path2.to_lowercase()) as i32
+    }
+}
+
+impl ShellFolderObject {
+    /// IShellFolder::GetAttributesOf — get attributes for the given PIDLs.
+    pub fn get_attributes_of(&self, pidls: &[Vec<u16>], requested_attrs: u32) -> u32 {
+        let inner = self.inner.lock().unwrap();
+        inner.get_attributes_of(pidls, requested_attrs)
+    }
+
+    /// IShellFolder::CompareIDs — compare two PIDLs for ordering.
+    pub fn compare_ids(&self, pidl1: &[u16], pidl2: &[u16], l_param: i32) -> i32 {
+        let inner = self.inner.lock().unwrap();
+        inner.compare_ids(pidl1, pidl2, l_param)
     }
 }

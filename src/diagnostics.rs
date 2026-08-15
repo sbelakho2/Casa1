@@ -156,15 +156,20 @@ pub fn doctor(ge: &GameEnvironment) -> AppResult<DoctorReport> {
             ReasonCode::RcHelperPermissionDenied,
             "helper filesystem probe failed",
         )
-        .with_hint(String::from_utf8_lossy(&helper_output.stderr).trim().to_string()));
+        .with_hint(
+            String::from_utf8_lossy(&helper_output.stderr)
+                .trim()
+                .to_string(),
+        ));
     }
-    let helper_probe = serde_json::from_slice::<HelperFilesystemProbe>(&helper_output.stdout).map_err(|error| {
-        AppError::new(
-            ReasonCode::RcRunnerProtocolInvalid,
-            "failed to parse helper filesystem probe",
-        )
-        .with_hint(error.to_string())
-    })?;
+    let helper_probe = serde_json::from_slice::<HelperFilesystemProbe>(&helper_output.stdout)
+        .map_err(|error| {
+            AppError::new(
+                ReasonCode::RcRunnerProtocolInvalid,
+                "failed to parse helper filesystem probe",
+            )
+            .with_hint(error.to_string())
+        })?;
 
     let report = DoctorReport {
         ge_name: ge.config.name.clone(),
@@ -188,7 +193,7 @@ pub fn doctor(ge: &GameEnvironment) -> AppResult<DoctorReport> {
 }
 
 pub fn export_diagnostics(ge: &GameEnvironment, output_zip: &Path) -> AppResult<ExportSummary> {
-    let _ = doctor(ge)?;
+    doctor(ge)?;
     util::ensure_parent(output_zip)?;
     let file = File::create(output_zip).map_err(|error| {
         AppError::from_io(
@@ -212,10 +217,14 @@ pub fn export_diagnostics(ge: &GameEnvironment, output_zip: &Path) -> AppResult<
         let relative = path.strip_prefix(&ge.root).expect("GE-relative path");
         let archive_path = relative.to_string_lossy().replace('\\', "/");
         if path.is_dir() {
-            writer.add_directory(archive_path, options).map_err(zip_error)?;
+            writer
+                .add_directory(archive_path, options)
+                .map_err(zip_error)?;
             continue;
         }
-        writer.start_file(archive_path, options).map_err(zip_error)?;
+        writer
+            .start_file(archive_path, options)
+            .map_err(zip_error)?;
         let mut input = File::open(&path).map_err(|error| {
             AppError::from_io(
                 ReasonCode::RcDiagnosticsExportFailed,
@@ -298,6 +307,17 @@ fn gpu_check() -> GpuCheck {
     let metal_framework_present = Path::new("/System/Library/Frameworks/Metal.framework").exists();
     let profile = detected_host_gpu_profile();
     let usable_profile = apple_silicon && metal_framework_present;
+
+    // Enrich the GPU check with real Metal device capabilities when available.
+    // This uses the new `report_metal_device_capabilities()` from metal_backend
+    // to provide accurate feature detection based on both GPU family and OS version.
+    let metal_caps = crate::metal_backend::report_metal_device_capabilities().ok();
+
+    let mesh_shaders = metal_caps
+        .as_ref()
+        .map(|c| c.supports_mesh_shaders)
+        .unwrap_or(usable_profile && profile.capabilities.mesh_shaders);
+
     GpuCheck {
         status: if usable_profile {
             "ok".to_string()
@@ -312,13 +332,268 @@ fn gpu_check() -> GpuCheck {
         argument_buffers: usable_profile && profile.capabilities.argument_buffers,
         memoryless_render_targets: usable_profile && profile.capabilities.memoryless_render_targets,
         timestamp_queries: usable_profile && profile.capabilities.timestamp_queries,
-        mesh_shaders: usable_profile && profile.capabilities.mesh_shaders,
+        mesh_shaders,
     }
+}
+
+/// Generate a detailed Metal device capability report for diagnostics output.
+///
+/// Returns a serializable report of the Metal device capabilities including
+/// GPU family, OS version, and supported features. Returns `None` if no
+/// Metal device is available.
+pub fn metal_capability_report() -> Option<crate::metal_backend::MetalCapabilityReport> {
+    crate::metal_backend::report_metal_device_capabilities().ok()
+}
+
+// ===========================================================================
+// Standalone Diagnostics Command
+// ===========================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiagnosticsReport {
+    pub environment: EnvironmentInfo,
+    pub features: FeatureInfo,
+    pub platform: PlatformInfo,
+    pub graphics: GraphicsInfo,
+    pub audio: AudioInfo,
+    pub security: SecurityInfo,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnvironmentInfo {
+    pub os: String,
+    pub architecture: String,
+    pub rust_version: String,
+    pub casa1_version: String,
+    pub build_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeatureInfo {
+    pub metal: bool,
+    pub vulkan: bool,
+    pub opengl: bool,
+    pub moltenvk: bool,
+    pub angle: bool,
+    pub websocket: bool,
+    pub ffmpeg: bool,
+    pub proptest: bool,
+    pub dev_insecure_tls: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlatformInfo {
+    pub macos_version: String,
+    pub cpu_type: String,
+    pub apple_silicon: bool,
+    pub memory_gb: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphicsInfo {
+    pub gpu_name: String,
+    pub metal_family: String,
+    pub unified_memory: bool,
+    pub metal_device_available: bool,
+    pub metal_framework_present: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioInfo {
+    pub host_api: String,
+    pub default_output_device: Option<String>,
+    pub default_input_device: Option<String>,
+    pub output_device_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecurityInfo {
+    pub insecure_tls_enabled: bool,
+    pub code_signing: String,
+}
+
+pub fn run_diagnostics() -> AppResult<DiagnosticsReport> {
+    let environment = collect_environment_info();
+    let features = collect_feature_info();
+    let platform = collect_platform_info();
+    let graphics = collect_graphics_info();
+    let audio = collect_audio_info();
+    let security = collect_security_info();
+
+    Ok(DiagnosticsReport {
+        environment,
+        features,
+        platform,
+        graphics,
+        audio,
+        security,
+    })
+}
+
+fn collect_environment_info() -> EnvironmentInfo {
+    EnvironmentInfo {
+        os: format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
+        architecture: std::env::consts::ARCH.to_string(),
+        rust_version: rustc_version(),
+        casa1_version: env!("CARGO_PKG_VERSION").to_string(),
+        build_id: crate::BUILD_ID.to_string(),
+    }
+}
+
+fn rustc_version() -> String {
+    Command::new("rustc")
+        .arg("--version")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_else(|_| "unknown".to_string())
+}
+
+fn collect_feature_info() -> FeatureInfo {
+    FeatureInfo {
+        metal: cfg!(feature = "metal"),
+        vulkan: cfg!(feature = "vulkan"),
+        opengl: cfg!(feature = "opengl"),
+        moltenvk: cfg!(feature = "moltenvk"),
+        angle: cfg!(feature = "angle"),
+        websocket: cfg!(feature = "websocket"),
+        ffmpeg: cfg!(feature = "ffmpeg"),
+        proptest: cfg!(feature = "proptest"),
+        dev_insecure_tls: cfg!(feature = "dev-insecure-tls"),
+    }
+}
+
+fn collect_platform_info() -> PlatformInfo {
+    let macos_version = macos_product_version();
+    let cpu_type = sysctl_string("machdep.cpu.brand_string")
+        .or_else(|| {
+            if std::env::consts::ARCH == "aarch64" {
+                Some("Apple Silicon".to_string())
+            } else {
+                Some("Intel".to_string())
+            }
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+    let apple_silicon = std::env::consts::ARCH == "aarch64";
+    let memory_gb = sysctl_u64("hw.memsize")
+        .map(|bytes| bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+        .unwrap_or(0.0);
+
+    PlatformInfo {
+        macos_version,
+        cpu_type,
+        apple_silicon,
+        memory_gb: (memory_gb * 10.0).round() / 10.0,
+    }
+}
+
+fn collect_graphics_info() -> GraphicsInfo {
+    let metal_framework_present =
+        std::path::Path::new("/System/Library/Frameworks/Metal.framework").exists();
+    let profile = detected_host_gpu_profile();
+
+    let metal_device_available = metal_framework_present && check_metal_device_available();
+
+    GraphicsInfo {
+        gpu_name: profile.adapter.name,
+        metal_family: profile.adapter.metal_family,
+        unified_memory: profile.capabilities.unified_memory,
+        metal_device_available,
+        metal_framework_present,
+    }
+}
+
+fn check_metal_device_available() -> bool {
+    use objc::runtime::Class;
+    let cls = Class::get("MTLCreateSystemDefaultDevice");
+    cls.is_some()
+}
+
+fn collect_audio_info() -> AudioInfo {
+    use cpal::traits::{DeviceTrait, HostTrait};
+
+    let host = cpal::default_host();
+    let host_api = host.id().name().to_string();
+
+    let default_output_device = host
+        .default_output_device()
+        .map(|d| d.name().unwrap_or_else(|_| "unknown".to_string()));
+
+    let default_input_device = host
+        .default_input_device()
+        .map(|d| d.name().unwrap_or_else(|_| "unknown".to_string()));
+
+    let output_device_count = host.output_devices().map(|d| d.count()).unwrap_or(0);
+
+    AudioInfo {
+        host_api,
+        default_output_device,
+        default_input_device,
+        output_device_count,
+    }
+}
+
+fn collect_security_info() -> SecurityInfo {
+    let insecure_tls_enabled = cfg!(feature = "dev-insecure-tls");
+    let code_signing = check_code_signing_status();
+
+    SecurityInfo {
+        insecure_tls_enabled,
+        code_signing,
+    }
+}
+
+fn check_code_signing_status() -> String {
+    let current_exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(_) => return "unknown (cannot resolve executable)".to_string(),
+    };
+    let output = Command::new("/usr/bin/codesign")
+        .arg("-v")
+        .arg(&current_exe)
+        .output();
+    match output {
+        Ok(result) => {
+            if result.status.success() {
+                "signed".to_string()
+            } else {
+                let stderr = String::from_utf8_lossy(&result.stderr).trim().to_string();
+                if stderr.contains("not signed") || stderr.contains("code object is not signed") {
+                    "not signed".to_string()
+                } else {
+                    format!("unsigned ({})", stderr)
+                }
+            }
+        }
+        Err(_) => "codesign tool not found".to_string(),
+    }
+}
+
+fn macos_product_version() -> String {
+    Command::new("sw_vers")
+        .arg("-productVersion")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_else(|_| "unknown".to_string())
+}
+
+fn sysctl_string(name: &str) -> Option<String> {
+    let output = Command::new("sysctl").arg("-n").arg(name).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn sysctl_u64(name: &str) -> Option<u64> {
+    let value = sysctl_string(name)?;
+    value.parse().ok()
 }
 
 fn probe_filesystem(path: &Path) -> AppResult<HelperFilesystemProbe> {
     let readable = fs::read_dir(path).is_ok();
-    let probe_path = path.join("tmp").join(format!("helper-probe-{}.tmp", std::process::id()));
+    let probe_path = path
+        .join("tmp")
+        .join(format!("helper-probe-{}.tmp", std::process::id()));
     let writable = util::write_string(&probe_path, "probe")
         .and_then(|_| {
             fs::remove_file(&probe_path).map_err(|error| {
@@ -359,7 +634,7 @@ fn hold_file_command(
             return Err(AppError::new(
                 ReasonCode::RcCliInvalid,
                 format!("unsupported hold-file share mode {other}"),
-            ))
+            ));
         }
     };
     let handle = ge.open_file(path, FileAccess::read_write(), share_mode)?;
@@ -382,7 +657,11 @@ fn hold_file_command(
     })?;
     let mut buffer = String::new();
     std::io::stdin().read_line(&mut buffer).map_err(|error| {
-        AppError::from_io(ReasonCode::RcIo, "failed to wait on hold-file stdin", &error)
+        AppError::from_io(
+            ReasonCode::RcIo,
+            "failed to wait on hold-file stdin",
+            &error,
+        )
     })?;
     ge.close_file_handle(&handle)
 }
@@ -652,8 +931,18 @@ pub fn compare_frames(
     reference: &FrameCapture,
     tolerance: f32,
 ) -> FrameComparisonResult {
-    let ssim = compute_ssim(&captured.pixels, &reference.pixels, captured.width, captured.height);
-    let psnr = compute_psnr(&captured.pixels, &reference.pixels, captured.width, captured.height);
+    let ssim = compute_ssim(
+        &captured.pixels,
+        &reference.pixels,
+        captured.width,
+        captured.height,
+    );
+    let psnr = compute_psnr(
+        &captured.pixels,
+        &reference.pixels,
+        captured.width,
+        captured.height,
+    );
     let (matching, total) = compute_pixel_diff(&captured.pixels, &reference.pixels, tolerance);
     let pixel_match_percentage = if total > 0 {
         (matching as f64 / total as f64) * 100.0
@@ -900,8 +1189,10 @@ pub fn verify_color_space(frame: &FrameCapture, expected: ColorSpace) -> AppResu
                 let base_i = i * 4;
                 let base_prev = (i - 1) * 4;
                 let d8_r = (frame.pixels[base_i] as i16 - frame.pixels[base_prev] as i16).abs();
-                let d8_g = (frame.pixels[base_i + 1] as i16 - frame.pixels[base_prev + 1] as i16).abs();
-                let d8_b = (frame.pixels[base_i + 2] as i16 - frame.pixels[base_prev + 2] as i16).abs();
+                let d8_g =
+                    (frame.pixels[base_i + 1] as i16 - frame.pixels[base_prev + 1] as i16).abs();
+                let d8_b =
+                    (frame.pixels[base_i + 2] as i16 - frame.pixels[base_prev + 2] as i16).abs();
 
                 // If linear diff is significant (> 0.01) but 8-bit diff is tiny (< 2),
                 // the gamma encoding is inconsistent.
@@ -954,9 +1245,15 @@ impl std::fmt::Display for BehavioralTestStep {
             BehavioralTestStep::OpenOverlay => write!(f, "OpenOverlay"),
             BehavioralTestStep::SaveToCloud { key, .. } => write!(f, "SaveToCloud({key})"),
             BehavioralTestStep::LoadFromCloud { key } => write!(f, "LoadFromCloud({key})"),
-            BehavioralTestStep::SubscribeWorkshop { item_id } => write!(f, "SubscribeWorkshop({item_id})"),
-            BehavioralTestStep::UnlockAchievement { name } => write!(f, "UnlockAchievement({name})"),
-            BehavioralTestStep::VerifyAchievement { name } => write!(f, "VerifyAchievement({name})"),
+            BehavioralTestStep::SubscribeWorkshop { item_id } => {
+                write!(f, "SubscribeWorkshop({item_id})")
+            }
+            BehavioralTestStep::UnlockAchievement { name } => {
+                write!(f, "UnlockAchievement({name})")
+            }
+            BehavioralTestStep::VerifyAchievement { name } => {
+                write!(f, "VerifyAchievement({name})")
+            }
         }
     }
 }
@@ -1026,8 +1323,7 @@ impl BehavioralVerifier {
             let status = if result.passed { "PASS" } else { "FAIL" };
             report.push_str(&format!(
                 "  [{status}] {} ({}ms)\n",
-                result.step,
-                result.duration_ms,
+                result.step, result.duration_ms,
             ));
             if let Some(ref err) = result.error {
                 report.push_str(&format!("         Error: {err}\n"));
@@ -1037,10 +1333,7 @@ impl BehavioralVerifier {
     }
 
     /// Attempt to connect to the Steam CM server and record the result.
-    pub fn run_connect_to_cm(
-        &mut self,
-        steam_protocol: &mut SteamProtocolStack,
-    ) -> bool {
+    pub fn run_connect_to_cm(&mut self, steam_protocol: &mut SteamProtocolStack) -> bool {
         self.begin_step(BehavioralTestStep::ConnectToCM);
         let result = steam_protocol.connect(None);
         let passed = result.is_ok();
@@ -1074,11 +1367,7 @@ impl BehavioralVerifier {
     }
 
     /// Attempt to browse the Steam store and record the result.
-    pub fn run_browse_store(
-        &mut self,
-        steam_protocol: &mut SteamProtocolStack,
-        url: &str,
-    ) -> bool {
+    pub fn run_browse_store(&mut self, steam_protocol: &mut SteamProtocolStack, url: &str) -> bool {
         let step = BehavioralTestStep::BrowseStore {
             url: url.to_string(),
         };
@@ -1113,11 +1402,7 @@ impl BehavioralVerifier {
     }
 
     /// Attempt to launch an app and record the result.
-    pub fn run_launch_app(
-        &mut self,
-        steam_protocol: &mut SteamProtocolStack,
-        app_id: u32,
-    ) -> bool {
+    pub fn run_launch_app(&mut self, steam_protocol: &mut SteamProtocolStack, app_id: u32) -> bool {
         let step = BehavioralTestStep::LaunchApp { app_id };
         self.begin_step(step.clone());
         // Send app usage event (1 = GameLaunch) to simulate launching
@@ -1224,11 +1509,16 @@ impl StressTestRunner {
     ///
     /// The `allocator` closure should return the current allocated byte count.
     /// The test runs multiple iterations and checks for memory growth.
-    pub fn run_memory_leak_test(&mut self, allocator: &mut dyn FnMut() -> usize) -> StressTestResult {
+    pub fn run_memory_leak_test(
+        &mut self,
+        allocator: &mut dyn FnMut() -> usize,
+    ) -> StressTestResult {
         let iterations = 100;
         let memory_start = allocator();
 
         for _ in 0..iterations {
+            // Exercise the allocator to trigger potential leak paths;
+            // the intermediate allocation count is intentionally not tracked.
             let _ = allocator();
         }
 
@@ -1267,6 +1557,8 @@ impl StressTestRunner {
 
         // Simulate GPU resource allocations across iterations
         for _ in 0..iterations {
+            // Exercise the GPU allocator to trigger potential leak paths;
+            // the intermediate allocation count is intentionally not tracked.
             let _ = allocator();
         }
 
@@ -1275,8 +1567,8 @@ impl StressTestRunner {
 
         // A leak is detected if final allocations exceed starting allocations
         // by more than 5% (allowing normal fluctuation)
-        let gpu_leak_detected = gpu_end > gpu_start
-            && (gpu_end - gpu_start) > ((gpu_start as f64 * 0.05) as usize);
+        let gpu_leak_detected =
+            gpu_end > gpu_start && (gpu_end - gpu_start) > ((gpu_start as f64 * 0.05) as usize);
 
         let result = StressTestResult {
             elapsed_seconds: 0,
@@ -1328,11 +1620,17 @@ impl StressTestRunner {
                     let helper = std::thread::spawn(move || {
                         // Initial connection: send a 4-byte payload, then close.
                         if let Ok((mut stream, _)) = listener.accept() {
-                            let _ = std::io::Write::write_all(&mut stream, &[0xCA, 0xFE, 0x01, 0x00]);
+                            if let Err(e) =
+                                std::io::Write::write_all(&mut stream, &[0xCA, 0xFE, 0x01, 0x00])
+                            {
+                                eprintln!("stress-test helper: write_all failed: {e}");
+                            }
                         }
                         // Reconnect: accept the second connection so the client's
                         // reconnect succeeds deterministically.
-                        let _ = listener.accept();
+                        if let Err(e) = listener.accept() {
+                            eprintln!("stress-test helper: second accept failed: {e}");
+                        }
                     });
 
                     // Main thread: connect a TcpStream to the listener
@@ -1368,12 +1666,18 @@ impl StressTestRunner {
                             }
 
                             // Wait for the helper thread to finish
-                            let _ = helper.join();
+                            if let Err(panic_payload) = helper.join() {
+                                eprintln!("stress-test: helper thread panicked: {panic_payload:?}");
+                            }
                         }
                         Err(e) => {
                             errors.push(format!("iteration {i}: connect failed: {e}"));
                             disconnects += 1;
-                            let _ = helper.join();
+                            if let Err(panic_payload) = helper.join() {
+                                eprintln!(
+                                    "stress-test: helper thread panicked (after connect failure): {panic_payload:?}"
+                                );
+                            }
                         }
                     }
                 }
@@ -1431,7 +1735,9 @@ impl StressTestRunner {
             // Ensure the counter was actually used (prevent dead-code elimination)
             if running_counter == 0 {
                 // This branch is unreachable but ensures the counter is "used"
-                errors.push(format!("iteration {i}: running counter zeroed unexpectedly"));
+                errors.push(format!(
+                    "iteration {i}: running counter zeroed unexpectedly"
+                ));
             }
 
             // Simulate game exit (cleanup)
@@ -1465,5 +1771,1066 @@ impl StressTestRunner {
 
         self.result = Some(result.clone());
         result
+    }
+}
+
+// ─── Minidump Writer ─────────────────────────────────────────────────────────
+//
+// Windows minidump (.mdmp) format writer.
+// Produces MINIDUMP_HEADER + MINIDUMP_DIRECTORY + streams (exception, system
+// info, thread list, module list, memory list) in a single Vec<u8>.
+
+/// MINIDUMP_TYPE flags — the subset we write.
+pub const MINIDUMP_TYPE_NORMAL: u32 = 0x00000000;
+pub const MINIDUMP_TYPE_WITH_DATA_SEGS: u32 = 0x00000001;
+pub const MINIDUMP_TYPE_WITH_FULL_MEMORY: u32 = 0x00000002;
+
+/// Fixed signature for all minidump files.
+const MINIDUMP_SIGNATURE: u32 = 0x504D444D; // 'MDMP'
+
+/// Version field (major.minor packed).
+const MINIDUMP_VERSION: u32 = 0x0000_A793;
+
+/// Stream type constants.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MinidumpStreamType {
+    Unused = 0,
+    Exception = 3,
+    SystemInfo = 4,
+    ThreadList = 5,
+    ModuleList = 8,
+    MemoryList = 9,
+    Memory64List = 13,
+}
+
+/// Fixed 128-byte header at offset 0.
+#[derive(Debug, Clone, Copy)]
+#[repr(C, packed)]
+struct MinidumpHeader {
+    signature: u32, // MDMP
+    version: u32,   // A793
+    number_of_streams: u32,
+    stream_directory_rva: u32,
+    check_sum: u32, // 0
+    _reserved: u32, // 0
+    time_date_stamp: u32,
+    flags: u64,
+}
+
+/// Directory entry pointing to a stream.
+#[derive(Debug, Clone, Copy)]
+#[repr(C, packed)]
+struct MinidumpDirectory {
+    stream_type: u32,
+    data_size: u32,
+    rva: u32,
+}
+
+/// MINIDUMP_EXCEPTION (the exception record inside MINIDUMP_EXCEPTION_STREAM).
+#[derive(Debug, Clone, Copy)]
+#[repr(C, packed)]
+struct MinidumpException {
+    exception_code: u32,
+    exception_flags: u32,
+    exception_record: u64, // next exception (nested)
+    exception_address: u64,
+    number_parameters: u32,
+    _reserved: u32,
+    exception_information: [u64; 15],
+}
+
+/// MINIDUMP_EXCEPTION_STREAM (wraps exception record + context).
+#[derive(Debug, Clone, Copy)]
+#[repr(C, packed)]
+struct MinidumpExceptionStream {
+    thread_id: u32,
+    _alignment: u32,
+    exception: MinidumpException,
+    context_stream_rva: u32,
+}
+
+/// Simplified CPU context (subset of CONTEXT for x64).
+#[derive(Debug, Clone, Copy)]
+#[repr(C, packed)]
+struct MinidumpContext {
+    // CONTEXT header
+    p1_home: [u64; 4],
+    p2_home: [u64; 4],
+    p3_home: [u64; 4],
+    p4_home: [u64; 4],
+    p5_home: [u64; 4],
+    p6_home: [u64; 4],
+    context_flags: u32,
+    mx_csr: u32,
+    // Integer registers
+    seg_cs: u16,
+    seg_ds: u16,
+    seg_es: u16,
+    seg_fs: u16,
+    seg_gs: u16,
+    seg_ss: u16,
+    eflags: u32,
+    dr0: u64,
+    dr1: u64,
+    dr2: u64,
+    dr3: u64,
+    dr6: u64,
+    dr7: u64,
+    rax: u64,
+    rcx: u64,
+    rdx: u64,
+    rbx: u64,
+    rsp: u64,
+    rbp: u64,
+    rsi: u64,
+    rdi: u64,
+    r8: u64,
+    r9: u64,
+    r10: u64,
+    r11: u64,
+    r12: u64,
+    r13: u64,
+    r14: u64,
+    r15: u64,
+    rip: u64,
+    // Floating-point / XMM (simplified)
+    float_save: [u8; 512],
+}
+
+impl MinidumpContext {
+    const CONTEXT_AMD64: u32 = 0x0010_0000;
+    const CONTEXT_CONTROL: u32 = 0x0000_0001;
+    const CONTEXT_INTEGER: u32 = 0x0000_0002;
+    const CONTEXT_SEGMENTS: u32 = 0x0000_0004;
+    const CONTEXT_FLOATING_POINT: u32 = 0x0000_0008;
+    const CONTEXT_DEBUG_REGISTERS: u32 = 0x0000_0010;
+    const CONTEXT_FULL: u32 = Self::CONTEXT_CONTROL
+        | Self::CONTEXT_INTEGER
+        | Self::CONTEXT_SEGMENTS
+        | Self::CONTEXT_FLOATING_POINT;
+
+    fn new(rip: u64, rsp: u64) -> Self {
+        Self {
+            p1_home: [0; 4],
+            p2_home: [0; 4],
+            p3_home: [0; 4],
+            p4_home: [0; 4],
+            p5_home: [0; 4],
+            p6_home: [0; 4],
+            context_flags: Self::CONTEXT_AMD64 | Self::CONTEXT_FULL,
+            mx_csr: 0x1F80, // default MXCSR
+            seg_cs: 0x33,
+            seg_ds: 0x2B,
+            seg_es: 0x2B,
+            seg_fs: 0x53,
+            seg_gs: 0x2B,
+            seg_ss: 0x2B,
+            eflags: 0,
+            dr0: 0,
+            dr1: 0,
+            dr2: 0,
+            dr3: 0,
+            dr6: 0,
+            dr7: 0,
+            rax: 0,
+            rcx: 0,
+            rdx: 0,
+            rbx: 0,
+            rsp,
+            rbp: 0,
+            rsi: 0,
+            rdi: 0,
+            r8: 0,
+            r9: 0,
+            r10: 0,
+            r11: 0,
+            r12: 0,
+            r13: 0,
+            r14: 0,
+            r15: 0,
+            rip,
+            float_save: [0u8; 512],
+        }
+    }
+}
+
+/// MINIDUMP_SYSTEM_INFO.
+#[derive(Debug, Clone, Copy)]
+#[repr(C, packed)]
+struct MinidumpSystemInfo {
+    processor_architecture: u16, // 9 = AMD64
+    processor_level: u16,
+    processor_revision: u16,
+    number_of_processors: u8,
+    product_type: u8,
+    major_version: u32,
+    minor_version: u32,
+    build_number: u32,
+    platform_id: u32,
+    csd_version_rva: u32,
+    _reserved: [u32; 3],
+}
+
+/// MINIDUMP_THREAD.
+#[derive(Debug, Clone, Copy)]
+#[repr(C, packed)]
+struct MinidumpThread {
+    thread_id: u32,
+    suspend_count: u32,
+    priority_class: u32,
+    priority: u32,
+    teb: u64,
+    stack: MinidumpMemoryDescriptor,
+    thread_context: MinidumpLocationDescriptor,
+}
+
+/// MINIDUMP_THREAD_LIST.
+#[derive(Debug, Clone, Copy)]
+#[repr(C, packed)]
+struct MinidumpThreadList {
+    number_of_threads: u32,
+    threads: [MinidumpThread; 0], // variable-length — written manually
+}
+
+/// MINIDUMP_MODULE.
+#[derive(Debug, Clone, Copy)]
+#[repr(C, packed)]
+struct MinidumpModule {
+    base_of_image: u64,
+    size_of_image: u32,
+    check_sum: u32,
+    time_date_stamp: u32,
+    module_name_rva: u32,
+    version_info: [u32; 4], // dw*Info
+    cv_record: MinidumpLocationDescriptor,
+    misc_record: MinidumpLocationDescriptor,
+    _reserved0: u64,
+    _reserved1: u64,
+}
+
+/// MINIDUMP_MODULE_LIST.
+#[derive(Debug, Clone, Copy)]
+#[repr(C, packed)]
+struct MinidumpModuleList {
+    number_of_modules: u32,
+    modules: [MinidumpModule; 0],
+}
+
+/// MINIDUMP_MEMORY_DESCRIPTOR (for MemoryList stream).
+#[derive(Debug, Clone, Copy)]
+#[repr(C, packed)]
+struct MinidumpMemoryDescriptor {
+    start_of_memory_range: u64,
+    memory: MinidumpLocationDescriptor,
+}
+
+/// MINIDUMP_MEMORY_DESCRIPTOR64 (for Memory64List stream — contiguous data).
+#[derive(Debug, Clone, Copy)]
+#[repr(C, packed)]
+struct MinidumpMemoryDescriptor64 {
+    start_of_memory_range: u64,
+    data_size: u64,
+}
+
+/// MINIDUMP_LOCATION_DESCRIPTOR.
+#[derive(Debug, Clone, Copy)]
+#[repr(C, packed)]
+struct MinidumpLocationDescriptor {
+    data_size: u32,
+    rva: u32,
+}
+
+/// Helper: write any Pod type as bytes.
+fn le_write<T: Copy>(buf: &mut Vec<u8>, val: &T) {
+    let bytes = unsafe {
+        std::slice::from_raw_parts(val as *const T as *const u8, std::mem::size_of::<T>())
+    };
+    buf.extend_from_slice(bytes);
+}
+
+// ---------------------------------------------------------------------------
+// Checked read helpers for parsing minidump / binary data
+// ---------------------------------------------------------------------------
+
+/// Read a `u32` from `buf` at `offset` in little-endian order.
+///
+/// Returns `None` if there aren't enough bytes starting at `offset`.
+fn read_u32_le(buf: &[u8], offset: usize) -> Option<u32> {
+    if offset + 4 > buf.len() {
+        return None;
+    }
+    Some(u32::from_le_bytes(
+        buf[offset..offset + 4].try_into().unwrap(),
+    ))
+}
+
+/// Read a `u64` from `buf` at `offset` in little-endian order.
+///
+/// Returns `None` if there aren't enough bytes starting at `offset`.
+fn read_u64_le(buf: &[u8], offset: usize) -> Option<u64> {
+    if offset + 8 > buf.len() {
+        return None;
+    }
+    Some(u64::from_le_bytes(
+        buf[offset..offset + 8].try_into().unwrap(),
+    ))
+}
+
+/// Read a slice of `len` bytes from `buf` starting at `offset`.
+///
+/// Returns `None` if the slice would exceed the buffer boundary.
+fn read_bytes(buf: &[u8], offset: usize, len: usize) -> Option<&[u8]> {
+    if offset.saturating_add(len) > buf.len() {
+        return None;
+    }
+    Some(&buf[offset..offset + len])
+}
+
+/// Parsed minidump header fields (the subset we validate).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedMinidumpHeader {
+    pub signature: u32,
+    pub version: u32,
+    pub number_of_streams: u32,
+    pub stream_directory_rva: u32,
+    pub flags: u64,
+}
+
+/// Validate a minidump buffer by checking the header signature, version,
+/// and that the stream directory fits within the buffer.
+///
+/// Returns the parsed header on success, or an error string on failure.
+/// This function never panics — all reads are bounds-checked.
+pub fn parse_minidump_header(buf: &[u8]) -> Result<ParsedMinidumpHeader, String> {
+    // Header is 32 bytes for the fields we care about (the full header is 128
+    // but the first 32 contain signature, version, streams, dir_rva, checksum,
+    // reserved, timestamp, flags).
+    if buf.len() < 32 {
+        return Err(format!(
+            "minidump buffer too small for header: {} bytes (need at least 32)",
+            buf.len()
+        ));
+    }
+
+    let signature = read_u32_le(buf, 0).ok_or("failed to read signature")?;
+    if signature != MINIDUMP_SIGNATURE {
+        return Err(format!(
+            "invalid minidump signature: 0x{signature:08X} (expected 0x{MINIDUMP_SIGNATURE:08X})"
+        ));
+    }
+
+    let version = read_u32_le(buf, 4).ok_or("failed to read version")?;
+    let number_of_streams = read_u32_le(buf, 8).ok_or("failed to read stream count")?;
+    let stream_directory_rva = read_u32_le(buf, 12).ok_or("failed to read directory RVA")?;
+    let flags = read_u64_le(buf, 24).ok_or("failed to read flags")?;
+
+    // Validate that the stream directory fits in the buffer
+    let dir_size = number_of_streams as usize * 12; // each directory entry is 12 bytes
+    if number_of_streams > 0 {
+        let dir_end = stream_directory_rva as usize + dir_size;
+        if dir_end > buf.len() {
+            return Err(format!(
+                "stream directory (rva={}, {} streams, {} bytes) exceeds buffer length {}",
+                stream_directory_rva,
+                number_of_streams,
+                dir_size,
+                buf.len()
+            ));
+        }
+    }
+
+    Ok(ParsedMinidumpHeader {
+        signature,
+        version,
+        number_of_streams,
+        stream_directory_rva,
+        flags,
+    })
+}
+
+/// Parameters for building a minidump.
+#[derive(Debug, Clone)]
+pub struct MinidumpParams<'a> {
+    /// Exception code (e.g. STATUS_ACCESS_VIOLATION = 0xC0000005, STATUS_BREAKPOINT = 0x80000003).
+    pub exception_code: u32,
+    /// Exception flags (0 for continuable).
+    pub exception_flags: u32,
+    /// Address where the exception occurred.
+    pub exception_address: u64,
+    /// Thread ID that faulted.
+    pub thread_id: u32,
+    /// RIP at the time of the fault.
+    pub rip: u64,
+    /// RSP at the time of the fault.
+    pub rsp: u64,
+    /// Optional list of loaded modules: (base, size, name).
+    pub modules: &'a [(u64, u32, &'a str)],
+    /// Optional list of memory regions to include: (start, data).
+    pub memory_regions: &'a [(u64, &'a [u8])],
+    /// Optional list of additional threads: (thread_id, teb, stack_start, stack_data).
+    pub threads: &'a [(u32, u64, u64, &'a [u8])],
+}
+
+/// Build a complete Windows minidump (.mdmp) byte buffer from the given
+/// exception parameters. Returns the raw bytes ready to write to a file.
+pub fn build_minidump(params: &MinidumpParams<'_>) -> Vec<u8> {
+    // ── Step 1: Gather stream data ──────────────────────────────────────────
+    // We'll write 5–6 streams depending on what's provided.
+    // Stream order: Exception (3), SystemInfo (4), ThreadList (5),
+    //               ModuleList (8), Memory64List (13)
+
+    // Stream 1: Exception stream + context
+    let exception_stream_data = build_exception_stream(params);
+    let context_data = build_context(params.rip, params.rsp);
+
+    // Stream 2: SystemInfo
+    let system_info_data = build_system_info();
+
+    // Stream 3: ThreadList
+    let thread_list_data = build_thread_list(params);
+
+    // Stream 4: ModuleList (if any modules provided)
+    let module_list_data = if !params.modules.is_empty() {
+        Some(build_module_list(params.modules))
+    } else {
+        None
+    };
+
+    // Stream 5: Memory64List (if any memory regions provided)
+    let memory64_data = if !params.memory_regions.is_empty() {
+        Some(build_memory64_list(params.memory_regions))
+    } else {
+        None
+    };
+
+    // ── Step 2: Count streams and compute layout ────────────────────────────
+    let mut stream_types: Vec<u32> = Vec::new();
+    stream_types.push(MinidumpStreamType::Exception as u32);
+    stream_types.push(MinidumpStreamType::SystemInfo as u32);
+    stream_types.push(MinidumpStreamType::ThreadList as u32);
+    if module_list_data.is_some() {
+        stream_types.push(MinidumpStreamType::ModuleList as u32);
+    }
+    if memory64_data.is_some() {
+        stream_types.push(MinidumpStreamType::Memory64List as u32);
+    }
+
+    let num_streams = stream_types.len() as u32;
+
+    // Header: 128 bytes
+    // Directory: num_streams * 12 bytes
+    // Then each stream's data
+
+    let header_size = 128u32;
+    let dir_size = num_streams * 12;
+    let dir_rva = header_size;
+
+    // Compute RVAs for each stream's data (after header + directory)
+    let mut current_rva = header_size + dir_size;
+
+    // We'll collect (stream_type, data_size, rva) triples
+    #[derive(Clone)]
+    struct StreamSlot {
+        stream_type: u32,
+        data_size: u32,
+        rva: u32,
+        data: Vec<u8>,
+    }
+
+    let mut slots: Vec<StreamSlot> = Vec::new();
+
+    // Exception stream
+    {
+        let size = exception_stream_data.len() as u32;
+        slots.push(StreamSlot {
+            stream_type: MinidumpStreamType::Exception as u32,
+            data_size: size,
+            rva: current_rva,
+            data: exception_stream_data,
+        });
+        current_rva += size;
+    }
+
+    // Context data (appended after exception stream)
+    // The exception stream's context_stream_rva points here
+    let context_rva = current_rva;
+    let context_size = context_data.len() as u32;
+    // Rebuild the exception stream with the correct context_rva.
+    let exception_stream_data_fixed = build_exception_stream_with_context_rva(params, context_rva);
+    // Replace the slot's data
+    slots[0].data = exception_stream_data_fixed;
+    slots[0].data_size = slots[0].data.len() as u32;
+
+    current_rva += context_size;
+
+    // Context data as a separate blob (not a stream, just raw bytes).
+    // It is referenced by the exception stream's context_stream_rva field
+    // and will be placed in the output at context_rva after all stream
+    // data has been written (see step 3c below).
+
+    // SystemInfo stream
+    {
+        let size = system_info_data.len() as u32;
+        slots.push(StreamSlot {
+            stream_type: MinidumpStreamType::SystemInfo as u32,
+            data_size: size,
+            rva: current_rva,
+            data: system_info_data,
+        });
+        current_rva += size;
+    }
+
+    // ThreadList stream
+    {
+        let size = thread_list_data.len() as u32;
+        slots.push(StreamSlot {
+            stream_type: MinidumpStreamType::ThreadList as u32,
+            data_size: size,
+            rva: current_rva,
+            data: thread_list_data,
+        });
+        current_rva += size;
+    }
+
+    // ModuleList stream (optional)
+    if let Some(data) = module_list_data {
+        let size = data.len() as u32;
+        slots.push(StreamSlot {
+            stream_type: MinidumpStreamType::ModuleList as u32,
+            data_size: size,
+            rva: current_rva,
+            data,
+        });
+        current_rva += size;
+    }
+
+    // Memory64List stream (optional)
+    // This stream is special: it contains the descriptors AND the raw memory data.
+    if let Some(data) = memory64_data {
+        let size = data.len() as u32;
+        slots.push(StreamSlot {
+            stream_type: MinidumpStreamType::Memory64List as u32,
+            data_size: size,
+            rva: current_rva,
+            data,
+        });
+        let _ = current_rva + size; // advance rva (value not read after this point)
+    }
+
+    // ── Step 3: Write everything ────────────────────────────────────────────
+    let mut final_buf = Vec::new();
+
+    // 3a. Header
+    let header = MinidumpHeader {
+        signature: MINIDUMP_SIGNATURE,
+        version: MINIDUMP_VERSION,
+        number_of_streams: num_streams,
+        stream_directory_rva: dir_rva,
+        check_sum: 0,
+        _reserved: 0,
+        time_date_stamp: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as u32,
+        flags: MINIDUMP_TYPE_NORMAL as u64,
+    };
+    le_write(&mut final_buf, &header);
+
+    // Pad header to 128 bytes
+    while final_buf.len() < 128 {
+        final_buf.push(0);
+    }
+
+    // 3b. Directory entries
+    for slot in &slots {
+        let dir = MinidumpDirectory {
+            stream_type: slot.stream_type,
+            data_size: slot.data_size,
+            rva: slot.rva,
+        };
+        le_write(&mut final_buf, &dir);
+    }
+
+    // 3c. Rebuild data in RVA order
+    // Sort slots by rva
+    let mut sorted_slots = slots.clone();
+    sorted_slots.sort_by_key(|s| s.rva);
+
+    let mut cursor = final_buf.len() as u32;
+    for slot in &sorted_slots {
+        // Pad to the correct RVA if needed
+        while cursor < slot.rva {
+            final_buf.push(0);
+            cursor += 1;
+        }
+        final_buf.extend_from_slice(&slot.data);
+        cursor += slot.data.len() as u32;
+    }
+
+    // 3d. Insert context data at context_rva (referenced by exception stream's
+    //     context_stream_rva field).  This is NOT a stream — it's raw data that
+    //     the exception stream points to.  context_rva lies right after the
+    //     exception stream but before SystemInfo, so we pad to it and write it.
+    let context_end = context_rva + context_size;
+    while cursor < context_rva {
+        final_buf.push(0);
+        cursor += 1;
+    }
+    final_buf.extend_from_slice(&context_data);
+    cursor = context_end; // advance past context data
+
+    // 3e. If there are remaining bytes after context_end before the next stream
+    //     (shouldn't happen with correct layout, but be safe), pad.
+    while cursor < sorted_slots.last().map(|s| s.rva).unwrap_or(cursor) {
+        final_buf.push(0);
+        cursor += 1;
+    }
+
+    final_buf
+}
+
+/// Build just the exception stream (without context).
+fn build_exception_stream(params: &MinidumpParams<'_>) -> Vec<u8> {
+    // Placeholder context_rva — will be patched
+    build_exception_stream_with_context_rva(params, 0)
+}
+
+/// Build exception stream with a specific context_rva.
+fn build_exception_stream_with_context_rva(
+    params: &MinidumpParams<'_>,
+    context_rva: u32,
+) -> Vec<u8> {
+    let exception = MinidumpException {
+        exception_code: params.exception_code,
+        exception_flags: params.exception_flags,
+        exception_record: 0, // no nested exception
+        exception_address: params.exception_address,
+        number_parameters: 0,
+        _reserved: 0,
+        exception_information: [0u64; 15],
+    };
+    let stream = MinidumpExceptionStream {
+        thread_id: params.thread_id,
+        _alignment: 0,
+        exception,
+        context_stream_rva: context_rva,
+    };
+    let mut buf = Vec::with_capacity(std::mem::size_of::<MinidumpExceptionStream>());
+    le_write(&mut buf, &stream);
+    buf
+}
+
+/// Build a CPU context block.
+fn build_context(rip: u64, rsp: u64) -> Vec<u8> {
+    let ctx = MinidumpContext::new(rip, rsp);
+    let mut buf = Vec::with_capacity(std::mem::size_of::<MinidumpContext>());
+    le_write(&mut buf, &ctx);
+    buf
+}
+
+/// Build a SYSTEM_INFO stream.
+fn build_system_info() -> Vec<u8> {
+    let info = MinidumpSystemInfo {
+        processor_architecture: 9, // PROCESSOR_ARCHITECTURE_AMD64
+        processor_level: 6,        // family
+        processor_revision: 0,     // stepping
+        number_of_processors: std::thread::available_parallelism()
+            .map(|n| n.get() as u8)
+            .unwrap_or(4),
+        product_type: 1,   // VER_NT_WORKSTATION
+        major_version: 10, // Windows 10
+        minor_version: 0,
+        build_number: 19041,
+        platform_id: 2, // VER_PLATFORM_WIN32_NT
+        csd_version_rva: 0,
+        _reserved: [0; 3],
+    };
+    let mut buf = Vec::with_capacity(std::mem::size_of::<MinidumpSystemInfo>());
+    le_write(&mut buf, &info);
+    buf
+}
+
+/// Build a THREAD_LIST stream.
+fn build_thread_list(params: &MinidumpParams<'_>) -> Vec<u8> {
+    let num_threads = 1 + params.threads.len();
+    let mut buf = Vec::new();
+
+    // Write number_of_threads as u32
+    buf.extend_from_slice(&(num_threads as u32).to_le_bytes());
+
+    // Main faulting thread
+    let main_thread = MinidumpThread {
+        thread_id: params.thread_id,
+        suspend_count: 0,
+        priority_class: 0,
+        priority: 8, // THREAD_PRIORITY_NORMAL
+        teb: 0,
+        stack: MinidumpMemoryDescriptor {
+            start_of_memory_range: 0,
+            memory: MinidumpLocationDescriptor {
+                data_size: 0,
+                rva: 0,
+            },
+        },
+        thread_context: MinidumpLocationDescriptor {
+            data_size: 0,
+            rva: 0,
+        },
+    };
+    le_write(&mut buf, &main_thread);
+
+    // Additional threads (simplified — no context data attached)
+    for &(tid, teb, _stack_start, _stack_data) in params.threads {
+        let thread = MinidumpThread {
+            thread_id: tid,
+            suspend_count: 0,
+            priority_class: 0,
+            priority: 8,
+            teb,
+            stack: MinidumpMemoryDescriptor {
+                start_of_memory_range: 0,
+                memory: MinidumpLocationDescriptor {
+                    data_size: 0,
+                    rva: 0,
+                },
+            },
+            thread_context: MinidumpLocationDescriptor {
+                data_size: 0,
+                rva: 0,
+            },
+        };
+        le_write(&mut buf, &thread);
+    }
+
+    buf
+}
+
+/// Build a MODULE_LIST stream.
+fn build_module_list(modules: &[(u64, u32, &str)]) -> Vec<u8> {
+    let num_modules = modules.len() as u32;
+    let mut buf = Vec::new();
+
+    buf.extend_from_slice(&num_modules.to_le_bytes());
+
+    // We'll collect module name strings after the fixed-size entries
+    let mut name_offsets: Vec<(usize, String)> = Vec::new();
+
+    for &(base, size, name) in modules {
+        let entry_offset = buf.len(); // where we'll compute name RVA later
+        let module = MinidumpModule {
+            base_of_image: base,
+            size_of_image: size,
+            check_sum: 0,
+            time_date_stamp: 0,
+            module_name_rva: 0, // computed and patched below after names are serialized
+            version_info: [0; 4],
+            cv_record: MinidumpLocationDescriptor {
+                data_size: 0,
+                rva: 0,
+            },
+            misc_record: MinidumpLocationDescriptor {
+                data_size: 0,
+                rva: 0,
+            },
+            _reserved0: 0,
+            _reserved1: 0,
+        };
+        le_write(&mut buf, &module);
+        name_offsets.push((entry_offset, name.to_string()));
+    }
+
+    // Now write module names after all fixed-size entries, and patch RVAs
+    let names_base = buf.len() as u32;
+    for (i, &(entry_offset, ref name)) in name_offsets.iter().enumerate() {
+        let name_rva = names_base
+            + name_offsets[..i]
+                .iter()
+                .map(|(_, n)| n.len() as u32 + 2) // +2 for null terminator
+                .sum::<u32>();
+
+        // Patch module_name_rva in the entry
+        let patch_offset = entry_offset
+            + std::mem::size_of::<u64>()  // base_of_image
+            + std::mem::size_of::<u32>()  // size_of_image
+            + std::mem::size_of::<u32>()  // check_sum
+            + std::mem::size_of::<u32>(); // time_date_stamp
+
+        let rva_bytes = name_rva.to_le_bytes();
+        buf[patch_offset..patch_offset + 4].copy_from_slice(&rva_bytes);
+
+        // Write the name as UTF-16LE null-terminated string
+        for ch in name.encode_utf16() {
+            buf.extend_from_slice(&ch.to_le_bytes());
+        }
+        buf.extend_from_slice(&[0u8; 2]); // null terminator
+    }
+
+    buf
+}
+
+/// Build a MEMORY64_LIST stream (descriptors + raw data).
+fn build_memory64_list(regions: &[(u64, &[u8])]) -> Vec<u8> {
+    let num_regions = regions.len() as u64;
+    let mut buf = Vec::new();
+
+    // number_of_memory_ranges (u64)
+    buf.extend_from_slice(&num_regions.to_le_bytes());
+
+    // total_memory_size — computed after we know all sizes
+    let total_size: u64 = regions.iter().map(|(_, data)| data.len() as u64).sum();
+    buf.extend_from_slice(&total_size.to_le_bytes());
+
+    // Descriptors
+    for &(start, data) in regions {
+        let desc = MinidumpMemoryDescriptor64 {
+            start_of_memory_range: start,
+            data_size: data.len() as u64,
+        };
+        le_write(&mut buf, &desc);
+    }
+
+    // Raw memory data (appended after descriptors)
+    for &(_, data) in regions {
+        buf.extend_from_slice(data);
+    }
+
+    buf
+}
+
+#[cfg(test)]
+mod minidump_tests {
+    use super::*;
+
+    #[test]
+    fn minidump_header_signature() {
+        let buf = build_minidump(&MinidumpParams {
+            exception_code: 0xC0000005,
+            exception_flags: 0,
+            exception_address: 0x140001234,
+            thread_id: 100,
+            rip: 0x140001234,
+            rsp: 0x7FFFFFFF0000,
+            modules: &[],
+            memory_regions: &[],
+            threads: &[],
+        });
+        // Verify signature at offset 0
+        assert!(buf.len() >= 128, "buffer too small: {}", buf.len());
+        let sig = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+        assert_eq!(sig, MINIDUMP_SIGNATURE, "bad signature");
+        let version = u32::from_le_bytes(buf[4..8].try_into().unwrap());
+        assert_eq!(version, MINIDUMP_VERSION, "bad version");
+        let num_streams = u32::from_le_bytes(buf[8..12].try_into().unwrap());
+        // Exception(3), SystemInfo(4), ThreadList(5) → 3 streams
+        assert_eq!(num_streams, 3, "expected 3 streams");
+    }
+
+    #[test]
+    fn minidump_with_modules_and_memory() {
+        let stack_data = [0x41u8; 256];
+        let heap_data = [0x42u8; 64];
+        let buf = build_minidump(&MinidumpParams {
+            exception_code: crate::seh::STATUS_BREAKPOINT,
+            exception_flags: 0,
+            exception_address: 0x140002000,
+            thread_id: 200,
+            rip: 0x140002000,
+            rsp: 0x7FFFFF0000,
+            modules: &[
+                (0x140000000, 0x1000, "test.exe"),
+                (0x7FFF0000, 0x2000, "ntdll.dll"),
+            ],
+            memory_regions: &[
+                (0x7FFFFEF000, &stack_data[..]),
+                (0x7FFFFF0000, &heap_data[..]),
+            ],
+            threads: &[(201, 0x7FFFFF8000, 0x7FFFFEF000, &stack_data[..])],
+        });
+        let sig = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+        assert_eq!(sig, MINIDUMP_SIGNATURE);
+        // 3 + ModuleList(1) + Memory64List(1) = 5 streams
+        let num_streams = u32::from_le_bytes(buf[8..12].try_into().unwrap());
+        assert_eq!(num_streams, 5, "expected 5 streams with modules+memory");
+    }
+
+    #[test]
+    fn minidump_context_size() {
+        let _ctx = MinidumpContext::new(0x140000000, 0x7FFFFFFF0000);
+        assert_eq!(std::mem::size_of::<MinidumpContext>(), 912);
+    }
+
+    // ── Checked read helper tests ──────────────────────────────────────────
+
+    #[test]
+    fn read_u32_le_valid() {
+        let buf: Vec<u8> = 0x01020304_u32.to_le_bytes().to_vec();
+        assert_eq!(read_u32_le(&buf, 0), Some(0x01020304));
+    }
+
+    #[test]
+    fn read_u32_le_truncated() {
+        let buf = [0x01, 0x02, 0x03]; // only 3 bytes
+        assert_eq!(read_u32_le(&buf, 0), None);
+    }
+
+    #[test]
+    fn read_u32_le_offset_at_boundary() {
+        let buf = [0u8; 8];
+        assert_eq!(read_u32_le(&buf, 4), Some(0));
+        assert_eq!(read_u32_le(&buf, 5), None);
+    }
+
+    #[test]
+    fn read_u64_le_valid() {
+        let buf: Vec<u8> = 0x0102030405060708_u64.to_le_bytes().to_vec();
+        assert_eq!(read_u64_le(&buf, 0), Some(0x0102030405060708));
+    }
+
+    #[test]
+    fn read_u64_le_truncated() {
+        let buf = [0u8; 7];
+        assert_eq!(read_u64_le(&buf, 0), None);
+    }
+
+    #[test]
+    fn read_bytes_valid() {
+        let buf = [1, 2, 3, 4, 5];
+        assert_eq!(read_bytes(&buf, 1, 3), Some(&[2, 3, 4][..]));
+    }
+
+    #[test]
+    fn read_bytes_exceeds_buffer() {
+        let buf = [1, 2, 3];
+        assert_eq!(read_bytes(&buf, 1, 3), None);
+    }
+
+    // ── Malformed minidump tests ───────────────────────────────────────────
+
+    #[test]
+    fn parse_minidump_empty_buffer() {
+        let result = parse_minidump_header(&[]);
+        assert!(result.is_err(), "expected Err, got {result:?}");
+        assert!(result.unwrap_err().contains("too small"));
+    }
+
+    #[test]
+    fn parse_minidump_truncated_header() {
+        // Only 16 bytes — not enough for the full 32-byte header
+        let mut buf = vec![0u8; 16];
+        buf[0..4].copy_from_slice(&MINIDUMP_SIGNATURE.to_le_bytes());
+        let result = parse_minidump_header(&buf);
+        assert!(result.is_err(), "expected Err, got {result:?}");
+        assert!(result.unwrap_err().contains("too small"));
+    }
+
+    #[test]
+    fn parse_minidump_invalid_signature() {
+        let mut buf = vec![0u8; 128];
+        buf[0..4].copy_from_slice(&0xDEADBEEF_u32.to_le_bytes()); // wrong signature
+        let result = parse_minidump_header(&buf);
+        assert!(result.is_err(), "expected Err, got {result:?}");
+        assert!(result.unwrap_err().contains("invalid minidump signature"));
+    }
+
+    #[test]
+    fn parse_minidump_valid_header() {
+        let dump = build_minidump(&MinidumpParams {
+            exception_code: 0xC0000005,
+            exception_flags: 0,
+            exception_address: 0x140001234,
+            thread_id: 100,
+            rip: 0x140001234,
+            rsp: 0x7FFFFFFF0000,
+            modules: &[],
+            memory_regions: &[],
+            threads: &[],
+        });
+        let header = parse_minidump_header(&dump).expect("valid minidump");
+        assert_eq!(header.signature, MINIDUMP_SIGNATURE);
+        assert_eq!(header.version, MINIDUMP_VERSION);
+        assert_eq!(header.number_of_streams, 3); // Exception, SystemInfo, ThreadList
+    }
+
+    #[test]
+    fn parse_minidump_stream_directory_exceeds_buffer() {
+        let mut buf = vec![0u8; 128];
+        // Write valid signature and version
+        buf[0..4].copy_from_slice(&MINIDUMP_SIGNATURE.to_le_bytes());
+        buf[4..8].copy_from_slice(&MINIDUMP_VERSION.to_le_bytes());
+        // Claim 1000 streams but buffer is only 128 bytes
+        buf[8..12].copy_from_slice(&1000u32.to_le_bytes());
+        // Stream directory at offset 128 (just past the buffer)
+        buf[12..16].copy_from_slice(&128u32.to_le_bytes());
+        // Fill flags
+        buf[24..32].copy_from_slice(&0u64.to_le_bytes());
+
+        let result = parse_minidump_header(&buf);
+        assert!(result.is_err(), "expected Err, got {result:?}");
+        assert!(result.unwrap_err().contains("exceeds buffer"));
+    }
+
+    #[test]
+    fn parse_minidump_corrupted_stream_directory_offset() {
+        // Valid header but stream directory offset points outside the buffer
+        let mut buf = vec![0u8; 128];
+        buf[0..4].copy_from_slice(&MINIDUMP_SIGNATURE.to_le_bytes());
+        buf[4..8].copy_from_slice(&MINIDUMP_VERSION.to_le_bytes());
+        buf[8..12].copy_from_slice(&1u32.to_le_bytes()); // 1 stream
+        buf[12..16].copy_from_slice(&0xFFFFFFFF_u32.to_le_bytes()); // directory offset out of bounds
+        buf[24..32].copy_from_slice(&0u64.to_le_bytes()); // flags
+
+        let result = parse_minidump_header(&buf);
+        assert!(
+            result.is_err(),
+            "should reject out-of-bounds directory offset"
+        );
+    }
+
+    #[test]
+    fn parse_minidump_zero_streams_ok() {
+        let mut buf = vec![0u8; 128];
+        buf[0..4].copy_from_slice(&MINIDUMP_SIGNATURE.to_le_bytes());
+        buf[4..8].copy_from_slice(&MINIDUMP_VERSION.to_le_bytes());
+        buf[8..12].copy_from_slice(&0u32.to_le_bytes()); // 0 streams
+        buf[12..16].copy_from_slice(&128u32.to_le_bytes()); // directory at end of header
+        buf[24..32].copy_from_slice(&0u64.to_le_bytes());
+
+        let result = parse_minidump_header(&buf);
+        assert!(
+            result.is_ok(),
+            "zero streams should be valid: {:?}",
+            result.err()
+        );
+        let header = result.unwrap();
+        assert_eq!(header.number_of_streams, 0);
+    }
+
+    #[test]
+    fn parse_minidump_corrupted_version() {
+        let mut buf = vec![0u8; 128];
+        buf[0..4].copy_from_slice(&MINIDUMP_SIGNATURE.to_le_bytes());
+        buf[4..8].copy_from_slice(&0xDEADBEEF_u32.to_le_bytes()); // invalid version
+        buf[8..12].copy_from_slice(&0u32.to_le_bytes());
+        buf[12..16].copy_from_slice(&128u32.to_le_bytes());
+        buf[24..32].copy_from_slice(&0u64.to_le_bytes());
+
+        // The parser must not panic on corrupted version (Item 246).
+        // It may return Ok (if the header structure is still valid) or Err.
+        let _ = parse_minidump_header(&buf);
+    }
+
+    #[test]
+    fn parse_minidump_stream_count_overflow() {
+        let mut buf = vec![0u8; 128];
+        buf[0..4].copy_from_slice(&MINIDUMP_SIGNATURE.to_le_bytes());
+        buf[4..8].copy_from_slice(&MINIDUMP_VERSION.to_le_bytes());
+        // Claim huge number of streams so stream_directory_rva * stream_count overflows
+        buf[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
+        buf[12..16].copy_from_slice(&0u32.to_le_bytes());
+        buf[24..32].copy_from_slice(&0u64.to_le_bytes());
+
+        let result = parse_minidump_header(&buf);
+        assert!(result.is_err(), "should reject absurd stream count");
     }
 }

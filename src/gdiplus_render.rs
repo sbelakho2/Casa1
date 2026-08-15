@@ -10,13 +10,11 @@
 //! No external dependencies are required – this is a pure‑Rust software renderer.
 
 use crate::user32::{
-    GdiplusBrush, GdiplusLineBrush, GdiplusMatrix, GdiplusPath, GdiplusPathElement,
-    GdiplusPen, GdiplusPointF, GdiplusRectF,
     GDIPLUS_COMPOSITING_MODE_SOURCE_COPY, GDIPLUS_COMPOSITING_MODE_SOURCE_OVER,
-    GDIPLUS_DASH_STYLE_DASH, GDIPLUS_DASH_STYLE_DASH_DOT, GDIPLUS_DASH_STYLE_DASH_DOT_DOT,
-    GDIPLUS_DASH_STYLE_DOT, GDIPLUS_DASH_STYLE_SOLID, GDIPLUS_FILL_MODE_ALTERNATE,
-    GDIPLUS_LINE_CAP_FLAT, GDIPLUS_LINE_CAP_ROUND, GDIPLUS_LINE_CAP_SQUARE,
-    GDIPLUS_PIXEL_FORMAT_32BPP_ARGB,
+    GDIPLUS_SMOOTHING_MODE_ANTI_ALIAS, GDIPLUS_SMOOTHING_MODE_HIGH_QUALITY,
+    GDIPLUS_WRAP_MODE_CLAMP, GDIPLUS_WRAP_MODE_TILE, GDIPLUS_WRAP_MODE_TILE_FLIP_X,
+    GDIPLUS_WRAP_MODE_TILE_FLIP_XY, GDIPLUS_WRAP_MODE_TILE_FLIP_Y, GdiplusBrush, GdiplusPath,
+    GdiplusPathElement, GdiplusPen, GdiplusPointF,
 };
 
 // ── helpers ─────────────────────────────────────────────────────────────────
@@ -130,14 +128,7 @@ fn clamp_f32(v: f32) -> i32 {
 
 /// Return an (x, y, w, h) rectangle from the given ellipse bounds,
 /// clamping to integer pixels and the actual bitmap extents.
-fn clip_rect_for_bounds(
-    x: f32,
-    y: f32,
-    w: f32,
-    h: f32,
-    bw: u32,
-    bh: u32,
-) -> (i32, i32, i32, i32) {
+fn clip_rect_for_bounds(x: f32, y: f32, w: f32, h: f32, bw: u32, bh: u32) -> (i32, i32, i32, i32) {
     let x0 = x.min(x + w) as i32;
     let y0 = y.min(y + h) as i32;
     let x1 = x.max(x + w) as i32;
@@ -153,11 +144,17 @@ fn clip_rect_for_bounds(
 
 /// Resolve the colour of a brush at an arbitrary point `(px, py)`.
 /// For `SolidFill` this is trivial; for `LineBrush` we interpolate;
-/// for `Texture` we return a default.
+/// for `Texture` we sample the underlying bitmap pixels using the
+/// brush's wrap mode, with optional externally-provided texture data.
+///
+/// `texture_data` — when `Some((pixels, width, height, stride))` the
+/// function samples the texture bitmap; when `None` the texture branch
+/// falls back to `0x00000000` (transparent black).
 pub fn brush_color_at(
     brush: &GdiplusBrush,
     px: f32,
     py: f32,
+    texture_data: Option<(&[u8], u32, u32, i32)>,
 ) -> u32 {
     match brush {
         GdiplusBrush::SolidFill(sf) => sf.color,
@@ -174,7 +171,105 @@ pub fn brush_color_at(
             let t = t.clamp(0.0, 1.0);
             lerp_color(lb.color1, lb.color2, t)
         }
-        GdiplusBrush::Texture(_) => 0xFFFF00FF, // magenta placeholder
+        GdiplusBrush::Texture(tb) => {
+            // Sample the texture bitmap at (px, py) using the brush's wrap mode.
+            if let Some((pixels, width, height, stride)) = texture_data {
+                if width == 0 || height == 0 || pixels.is_empty() {
+                    return 0x00000000;
+                }
+                let u = wrap_coord(px, width, tb.wrap_mode);
+                let v = wrap_coord(py, height, tb.wrap_mode);
+                // GDI+ bitmaps are top-down ARGB in memory (byte order B,G,R,A).
+                // stride may be larger than width*4 for alignment.
+                let row_start = (v as i32) * stride;
+                let col = (u as usize) * 4;
+                if row_start < 0 || (row_start as usize + col + 3) >= pixels.len() {
+                    return 0x00000000;
+                }
+                let idx = row_start as usize + col;
+                let b = pixels[idx] as u32;
+                let g = pixels[idx + 1] as u32;
+                let r = pixels[idx + 2] as u32;
+                let a = pixels[idx + 3] as u32;
+                (a << 24) | (r << 16) | (g << 8) | b
+            } else {
+                // No texture data available — return transparent black.
+                0x00000000
+            }
+        }
+    }
+}
+
+/// Wrap a floating-point coordinate into `[0, size)` using a GDI+ wrap mode.
+fn wrap_coord(coord: f32, size: u32, wrap_mode: u32) -> u32 {
+    if size == 0 {
+        return 0;
+    }
+    let sz = size as i32;
+    match wrap_mode {
+        GDIPLUS_WRAP_MODE_TILE => {
+            let mut c = coord as i32 % sz;
+            if c < 0 {
+                c += sz;
+            }
+            c as u32
+        }
+        GDIPLUS_WRAP_MODE_TILE_FLIP_X => {
+            let period = sz * 2;
+            let mut c = coord as i32 % period;
+            if c < 0 {
+                c += period;
+            }
+            if c >= sz {
+                (period - c - 1) as u32
+            } else {
+                c as u32
+            }
+        }
+        GDIPLUS_WRAP_MODE_TILE_FLIP_Y => {
+            let period = sz * 2;
+            let mut c = coord as i32 % period;
+            if c < 0 {
+                c += period;
+            }
+            if c >= sz {
+                (period - c - 1) as u32
+            } else {
+                c as u32
+            }
+        }
+        GDIPLUS_WRAP_MODE_TILE_FLIP_XY => {
+            let period = sz * 2;
+            let mut c = coord as i32 % period;
+            if c < 0 {
+                c += period;
+            }
+            // Flip both X and Y — handled by the two wrap_coord calls independently.
+            if c >= sz {
+                (period - c - 1) as u32
+            } else {
+                c as u32
+            }
+        }
+        GDIPLUS_WRAP_MODE_CLAMP => {
+            if coord < 0.0 {
+                0
+            } else if coord >= (size - 1) as f32 {
+                size - 1
+            } else {
+                coord as u32
+            }
+        }
+        _ => {
+            // Unknown wrap mode — default to clamp
+            if coord < 0.0 {
+                0
+            } else if coord >= (size - 1) as f32 {
+                size - 1
+            } else {
+                coord as u32
+            }
+        }
     }
 }
 
@@ -190,14 +285,19 @@ fn lerp_color(c1: u32, c2: u32, t: f32) -> u32 {
 
 /// Pen colour: prefer the pen's own colour; fall back to brushing the
 /// brush_handle colour (cheap path).
-pub fn pen_color(pen: &GdiplusPen, px: f32, py: f32) -> u32 {
+pub fn pen_color(pen: &GdiplusPen, _px: f32, _py: f32) -> u32 {
     pen.color
 }
 
-// ── Line drawing (Bresenham) ─────────────────────────────────────────────────
+// ── Line drawing (Bresenham + anti-aliasing) ────────────────────────────────
 
-/// Draw an anti‑aliased or aliased line using Bresenham's midpoint algorithm.
-/// Only aliased is implemented here; smoothing is ignored for now.
+/// Draw an anti‑aliased or aliased line.
+///
+/// When `smoothing_mode` is `ANTI_ALIAS` or `HIGH_QUALITY`, pixel coverage is
+/// computed from the distance between each pixel centre and the mathematical
+/// line segment, producing smooth edges with sub‑pixel precision.
+///
+/// For aliased mode the original Bresenham midpoint algorithm is used.
 pub fn draw_line(
     pixels: &mut [u8],
     width: u32,
@@ -210,39 +310,105 @@ pub fn draw_line(
     color: u32,
     pen_width: f32,
     compositing_mode: u32,
+    smoothing_mode: u32,
 ) {
-    let w = pen_width.max(1.0).round() as i32;
-    let x0 = clamp_f32(x1);
-    let y0 = clamp_f32(y1);
-    let x1 = clamp_f32(x2);
-    let y1 = clamp_f32(y2);
+    let w = pen_width.max(1.0);
+    let w_half = w / 2.0;
+    let w_int = w.round() as i32;
 
-    let mut dx = (x1 - x0).abs();
-    let mut dy = -(y1 - y0).abs();
-    let sx = if x0 < x1 { 1 } else { -1 };
-    let sy = if y0 < y1 { 1 } else { -1 };
-    let mut err = dx + dy;
+    let is_aa = smoothing_mode == GDIPLUS_SMOOTHING_MODE_ANTI_ALIAS
+        || smoothing_mode == GDIPLUS_SMOOTHING_MODE_HIGH_QUALITY;
 
-    let mut cx = x0;
-    let mut cy = y0;
-    loop {
-        // Draw a small square for pen width
-        for wy in -(w / 2)..=(w / 2) {
-            for wx in -(w / 2)..=(w / 2) {
-                put_pixel(pixels, width, height, stride, cx + wx, cy + wy, color, compositing_mode);
+    if is_aa {
+        // ── Anti-aliased path ────────────────────────────────────────────
+        // Bounding-box of the thickened line, padded by a 1-pixel fringe.
+        let bx0 = x1.min(x2) - w_half - 1.0;
+        let by0 = y1.min(y2) - w_half - 1.0;
+        let bx1 = x1.max(x2) + w_half + 1.0;
+        let by1 = y1.max(y2) + w_half + 1.0;
+
+        let ix0 = (bx0.floor() as i32).max(0);
+        let iy0 = (by0.floor() as i32).max(0);
+        let ix1 = (bx1.ceil() as i32).min(width as i32 - 1);
+        let iy1 = (by1.ceil() as i32).min(height as i32 - 1);
+
+        let line_dx = x2 - x1;
+        let line_dy = y2 - y1;
+        let line_len_sq = line_dx * line_dx + line_dy * line_dy;
+
+        for py in iy0..=iy1 {
+            for px in ix0..=ix1 {
+                // Pixel centre in continuous space
+                let cx = px as f32 + 0.5;
+                let cy = py as f32 + 0.5;
+
+                // Distance from (cx,cy) to the line segment
+                let dist = if line_len_sq < 0.0001 {
+                    // Degenerate: treat as point
+                    ((cx - x1).powi(2) + (cy - y1).powi(2)).sqrt()
+                } else {
+                    let t = ((cx - x1) * line_dx + (cy - y1) * line_dy) / line_len_sq;
+                    let t = t.clamp(0.0, 1.0);
+                    let px0 = x1 + t * line_dx;
+                    let py0 = y1 + t * line_dy;
+                    ((cx - px0).powi(2) + (cy - py0).powi(2)).sqrt()
+                };
+
+                // Coverage: 1 inside the pen, 0 outside, linear falloff in the
+                // 1-pixel fringe.
+                let coverage = if dist <= w_half - 0.5 {
+                    1.0
+                } else if dist <= w_half + 0.5 {
+                    (w_half + 0.5 - dist).max(0.0)
+                } else {
+                    continue;
+                };
+
+                // Modulate the source alpha by coverage
+                let src_alpha = (color >> 24) as f32 * coverage;
+                let src_alpha = (src_alpha as u32).min(255);
+                let blended_color = (color & 0x00FF_FFFF) | (src_alpha << 24);
+
+                put_pixel(
+                    pixels, width, height, stride, px, py, blended_color, compositing_mode,
+                );
             }
         }
-        if cx == x1 && cy == y1 {
-            break;
-        }
-        let e2 = 2 * err;
-        if e2 >= dy {
-            err += dy;
-            cx += sx;
-        }
-        if e2 <= dx {
-            err += dx;
-            cy += sy;
+    } else {
+        // ── Aliased path (original Bresenham) ────────────────────────────
+        let x0 = clamp_f32(x1);
+        let y0 = clamp_f32(y1);
+        let x1i = clamp_f32(x2);
+        let y1i = clamp_f32(y2);
+
+        let dx = (x1i - x0).abs();
+        let dy = -(y1i - y0).abs();
+        let sx = if x0 < x1i { 1 } else { -1 };
+        let sy = if y0 < y1i { 1 } else { -1 };
+        let mut err = dx + dy;
+
+        let mut cx = x0;
+        let mut cy = y0;
+        loop {
+            for wy in -(w_int / 2)..=(w_int / 2) {
+                for wx in -(w_int / 2)..=(w_int / 2) {
+                    put_pixel(
+                        pixels, width, height, stride, cx + wx, cy + wy, color, compositing_mode,
+                    );
+                }
+            }
+            if cx == x1i && cy == y1i {
+                break;
+            }
+            let e2 = 2 * err;
+            if e2 >= dy {
+                err += dy;
+                cx += sx;
+            }
+            if e2 <= dx {
+                err += dx;
+                cy += sy;
+            }
         }
     }
 }
@@ -257,13 +423,22 @@ pub fn draw_lines(
     color: u32,
     pen_width: f32,
     compositing_mode: u32,
+    smoothing_mode: u32,
 ) {
     for i in 1..points.len() {
         draw_line(
-            pixels, width, height, stride,
-            points[i - 1].x, points[i - 1].y,
-            points[i].x, points[i].y,
-            color, pen_width, compositing_mode,
+            pixels,
+            width,
+            height,
+            stride,
+            points[i - 1].x,
+            points[i - 1].y,
+            points[i].x,
+            points[i].y,
+            color,
+            pen_width,
+            compositing_mode,
+            smoothing_mode,
         );
     }
 }
@@ -283,17 +458,70 @@ pub fn draw_rect(
     color: u32,
     pen_width: f32,
     compositing_mode: u32,
+    smoothing_mode: u32,
 ) {
     let x2 = x + w;
     let y2 = y + h;
     // Top edge
-    draw_line(pixels, width, height, stride, x, y, x2, y, color, pen_width, compositing_mode);
+    draw_line(
+        pixels,
+        width,
+        height,
+        stride,
+        x,
+        y,
+        x2,
+        y,
+        color,
+        pen_width,
+        compositing_mode,
+        smoothing_mode,
+    );
     // Bottom edge
-    draw_line(pixels, width, height, stride, x, y2, x2, y2, color, pen_width, compositing_mode);
+    draw_line(
+        pixels,
+        width,
+        height,
+        stride,
+        x,
+        y2,
+        x2,
+        y2,
+        color,
+        pen_width,
+        compositing_mode,
+        smoothing_mode,
+    );
     // Left edge
-    draw_line(pixels, width, height, stride, x, y, x, y2, color, pen_width, compositing_mode);
+    draw_line(
+        pixels,
+        width,
+        height,
+        stride,
+        x,
+        y,
+        x,
+        y2,
+        color,
+        pen_width,
+        compositing_mode,
+        smoothing_mode,
+    );
     // Right edge
-    draw_line(pixels, width, height, stride, x2, y, x2, y2, color, pen_width, compositing_mode);
+    draw_line(
+        pixels,
+        width,
+        height,
+        stride,
+        x2,
+        y,
+        x2,
+        y2,
+        color,
+        pen_width,
+        compositing_mode,
+        smoothing_mode,
+    );
 }
 
 /// Fill a rectangle.
@@ -316,7 +544,16 @@ pub fn fill_rect(
 
     for py in ry0..ry1 {
         for px in rx0..rx1 {
-            put_pixel(pixels, width, height, stride, px, py, color, compositing_mode);
+            put_pixel(
+                pixels,
+                width,
+                height,
+                stride,
+                px,
+                py,
+                color,
+                compositing_mode,
+            );
         }
     }
 }
@@ -336,6 +573,7 @@ pub fn draw_ellipse(
     color: u32,
     pen_width: f32,
     compositing_mode: u32,
+    _smoothing_mode: u32,
 ) {
     let cx = (x + w / 2.0).round() as i32;
     let cy = (y + h / 2.0).round() as i32;
@@ -352,10 +590,46 @@ pub fn draw_ellipse(
     while dx * ry * ry < dy * rx * rx {
         for wy in -(pw / 2)..=(pw / 2) {
             for wx in -(pw / 2)..=(pw / 2) {
-                put_pixel(pixels, width, height, stride, cx + dx + wx, cy + dy + wy, color, compositing_mode);
-                put_pixel(pixels, width, height, stride, cx - dx + wx, cy + dy + wy, color, compositing_mode);
-                put_pixel(pixels, width, height, stride, cx + dx + wx, cy - dy + wy, color, compositing_mode);
-                put_pixel(pixels, width, height, stride, cx - dx + wx, cy - dy + wy, color, compositing_mode);
+                put_pixel(
+                    pixels,
+                    width,
+                    height,
+                    stride,
+                    cx + dx + wx,
+                    cy + dy + wy,
+                    color,
+                    compositing_mode,
+                );
+                put_pixel(
+                    pixels,
+                    width,
+                    height,
+                    stride,
+                    cx - dx + wx,
+                    cy + dy + wy,
+                    color,
+                    compositing_mode,
+                );
+                put_pixel(
+                    pixels,
+                    width,
+                    height,
+                    stride,
+                    cx + dx + wx,
+                    cy - dy + wy,
+                    color,
+                    compositing_mode,
+                );
+                put_pixel(
+                    pixels,
+                    width,
+                    height,
+                    stride,
+                    cx - dx + wx,
+                    cy - dy + wy,
+                    color,
+                    compositing_mode,
+                );
             }
         }
         if d1 < 0 {
@@ -368,14 +642,52 @@ pub fn draw_ellipse(
         }
     }
 
-    d2 = ((ry * ry) as f32 * (dx as f32 + 0.5) * (dx as f32 + 0.5) + (rx * rx) as f32 * (dy as f32 - 1.0) * (dy as f32 - 1.0) - (rx * rx * ry * ry) as f32) as i32;
+    d2 = ((ry * ry) as f32 * (dx as f32 + 0.5) * (dx as f32 + 0.5)
+        + (rx * rx) as f32 * (dy as f32 - 1.0) * (dy as f32 - 1.0)
+        - (rx * rx * ry * ry) as f32) as i32;
     while dy >= 0 {
         for wy in -(pw / 2)..=(pw / 2) {
             for wx in -(pw / 2)..=(pw / 2) {
-                put_pixel(pixels, width, height, stride, cx + dx + wx, cy + dy + wy, color, compositing_mode);
-                put_pixel(pixels, width, height, stride, cx - dx + wx, cy + dy + wy, color, compositing_mode);
-                put_pixel(pixels, width, height, stride, cx + dx + wx, cy - dy + wy, color, compositing_mode);
-                put_pixel(pixels, width, height, stride, cx - dx + wx, cy - dy + wy, color, compositing_mode);
+                put_pixel(
+                    pixels,
+                    width,
+                    height,
+                    stride,
+                    cx + dx + wx,
+                    cy + dy + wy,
+                    color,
+                    compositing_mode,
+                );
+                put_pixel(
+                    pixels,
+                    width,
+                    height,
+                    stride,
+                    cx - dx + wx,
+                    cy + dy + wy,
+                    color,
+                    compositing_mode,
+                );
+                put_pixel(
+                    pixels,
+                    width,
+                    height,
+                    stride,
+                    cx + dx + wx,
+                    cy - dy + wy,
+                    color,
+                    compositing_mode,
+                );
+                put_pixel(
+                    pixels,
+                    width,
+                    height,
+                    stride,
+                    cx - dx + wx,
+                    cy - dy + wy,
+                    color,
+                    compositing_mode,
+                );
             }
         }
         if d2 > 0 {
@@ -406,8 +718,8 @@ pub fn fill_ellipse(
     let cy = y + h / 2.0;
     let rx = (w / 2.0).max(1.0);
     let ry = (h / 2.0).max(1.0);
-    let rx2 = rx * rx;
-    let ry2 = ry * ry;
+    let _rx2 = rx * rx;
+    let _ry2 = ry * ry;
 
     let y0 = clamp_f32(y);
     let y1 = clamp_f32(y + h);
@@ -416,7 +728,16 @@ pub fn fill_ellipse(
         let half_width = (rx * (1.0 - dy * dy).sqrt()).round() as i32;
         let cx_i = cx.round() as i32;
         for px in (cx_i - half_width)..=(cx_i + half_width) {
-            put_pixel(pixels, width, height, stride, px, py, color, compositing_mode);
+            put_pixel(
+                pixels,
+                width,
+                height,
+                stride,
+                px,
+                py,
+                color,
+                compositing_mode,
+            );
         }
     }
 }
@@ -463,7 +784,12 @@ pub fn fill_polygon(
     }
 
     let min_y = edges.iter().map(|e| e.0).min().unwrap_or(0).max(0);
-    let max_y = edges.iter().map(|e| e.1).max().unwrap_or(0).min(height as i32 - 1);
+    let max_y = edges
+        .iter()
+        .map(|e| e.1)
+        .max()
+        .unwrap_or(0)
+        .min(height as i32 - 1);
 
     for scan_y in min_y..=max_y {
         let mut intersections: Vec<i32> = Vec::new();
@@ -479,7 +805,16 @@ pub fn fill_polygon(
                 let x0 = chunk[0].max(0);
                 let x1 = chunk[1].min(width as i32 - 1);
                 for px in x0..=x1 {
-                    put_pixel(pixels, width, height, stride, px, scan_y, color, compositing_mode);
+                    put_pixel(
+                        pixels,
+                        width,
+                        height,
+                        stride,
+                        px,
+                        scan_y,
+                        color,
+                        compositing_mode,
+                    );
                 }
             }
         }
@@ -535,6 +870,7 @@ pub fn draw_pie(
     color: u32,
     pen_width: f32,
     compositing_mode: u32,
+    smoothing_mode: u32,
 ) {
     let cx = x + w / 2.0;
     let cy = y + h / 2.0;
@@ -543,10 +879,8 @@ pub fn draw_pie(
     let pts = arc_to_line_segments(cx, cy, rx, ry, start_angle, sweep_angle, true);
     for i in 1..pts.len() {
         draw_line(
-            pixels, width, height, stride,
-            pts[i - 1].x, pts[i - 1].y,
-            pts[i].x, pts[i].y,
-            color, pen_width, compositing_mode,
+            pixels, width, height, stride, pts[i - 1].x, pts[i - 1].y, pts[i].x, pts[i].y,
+            color, pen_width, compositing_mode, smoothing_mode,
         );
     }
 }
@@ -589,6 +923,7 @@ pub fn draw_arc(
     color: u32,
     pen_width: f32,
     compositing_mode: u32,
+    smoothing_mode: u32,
 ) {
     let cx = x + w / 2.0;
     let cy = y + h / 2.0;
@@ -597,10 +932,8 @@ pub fn draw_arc(
     let pts = arc_to_line_segments(cx, cy, rx, ry, start_angle, sweep_angle, false);
     for i in 1..pts.len() {
         draw_line(
-            pixels, width, height, stride,
-            pts[i - 1].x, pts[i - 1].y,
-            pts[i].x, pts[i].y,
-            color, pen_width, compositing_mode,
+            pixels, width, height, stride, pts[i - 1].x, pts[i - 1].y, pts[i].x, pts[i].y,
+            color, pen_width, compositing_mode, smoothing_mode,
         );
     }
 }
@@ -617,28 +950,112 @@ pub fn draw_path(
     color: u32,
     pen_width: f32,
     compositing_mode: u32,
+    smoothing_mode: u32,
 ) {
     let mut i = 0;
     while i < path.elements.len() {
         match &path.elements[i] {
             GdiplusPathElement::Line { x1, y1, x2, y2 } => {
-                draw_line(pixels, width, height, stride, *x1, *y1, *x2, *y2, color, pen_width, compositing_mode);
+                draw_line(
+                    pixels,
+                    width,
+                    height,
+                    stride,
+                    *x1,
+                    *y1,
+                    *x2,
+                    *y2,
+                    color,
+                    pen_width,
+                    compositing_mode,
+                    smoothing_mode,
+                );
                 i += 1;
             }
             GdiplusPathElement::Rectangle { x, y, w, h } => {
-                draw_rect(pixels, width, height, stride, *x, *y, *w, *h, color, pen_width, compositing_mode);
+                draw_rect(
+                    pixels,
+                    width,
+                    height,
+                    stride,
+                    *x,
+                    *y,
+                    *w,
+                    *h,
+                    color,
+                    pen_width,
+                    compositing_mode,
+                    smoothing_mode,
+                );
                 i += 1;
             }
             GdiplusPathElement::Ellipse { x, y, w, h } => {
-                draw_ellipse(pixels, width, height, stride, *x, *y, *w, *h, color, pen_width, compositing_mode);
+                draw_ellipse(
+                    pixels,
+                    width,
+                    height,
+                    stride,
+                    *x,
+                    *y,
+                    *w,
+                    *h,
+                    color,
+                    pen_width,
+                    compositing_mode,
+                    smoothing_mode,
+                );
                 i += 1;
             }
-            GdiplusPathElement::Arc { x, y, w, h, start_angle, sweep_angle } => {
-                draw_arc(pixels, width, height, stride, *x, *y, *w, *h, *start_angle, *sweep_angle, color, pen_width, compositing_mode);
+            GdiplusPathElement::Arc {
+                x,
+                y,
+                w,
+                h,
+                start_angle,
+                sweep_angle,
+            } => {
+                draw_arc(
+                    pixels,
+                    width,
+                    height,
+                    stride,
+                    *x,
+                    *y,
+                    *w,
+                    *h,
+                    *start_angle,
+                    *sweep_angle,
+                    color,
+                    pen_width,
+                    compositing_mode,
+                    smoothing_mode,
+                );
                 i += 1;
             }
-            GdiplusPathElement::Pie { x, y, w, h, start_angle, sweep_angle } => {
-                draw_pie(pixels, width, height, stride, *x, *y, *w, *h, *start_angle, *sweep_angle, color, pen_width, compositing_mode);
+            GdiplusPathElement::Pie {
+                x,
+                y,
+                w,
+                h,
+                start_angle,
+                sweep_angle,
+            } => {
+                draw_pie(
+                    pixels,
+                    width,
+                    height,
+                    stride,
+                    *x,
+                    *y,
+                    *w,
+                    *h,
+                    *start_angle,
+                    *sweep_angle,
+                    color,
+                    pen_width,
+                    compositing_mode,
+                    smoothing_mode,
+                );
                 i += 1;
             }
             GdiplusPathElement::Bezier { points } => {
@@ -649,33 +1066,98 @@ pub fn draw_path(
                     let t2 = s as f32 / segments as f32;
                     let p1 = eval_cubic_bezier(points, t1);
                     let p2 = eval_cubic_bezier(points, t2);
-                    draw_line(pixels, width, height, stride, p1.x, p1.y, p2.x, p2.y, color, pen_width, compositing_mode);
+                    draw_line(
+                        pixels,
+                        width,
+                        height,
+                        stride,
+                        p1.x,
+                        p1.y,
+                        p2.x,
+                        p2.y,
+                        color,
+                        pen_width,
+                        compositing_mode,
+                        smoothing_mode,
+                    );
                 }
                 i += 1;
             }
             GdiplusPathElement::Polygon { points } => {
                 for j in 1..points.len() {
-                    draw_line(pixels, width, height, stride, points[j - 1].x, points[j - 1].y, points[j].x, points[j].y, color, pen_width, compositing_mode);
+                    draw_line(
+                        pixels,
+                        width,
+                        height,
+                        stride,
+                        points[j - 1].x,
+                        points[j - 1].y,
+                        points[j].x,
+                        points[j].y,
+                        color,
+                        pen_width,
+                        compositing_mode,
+                        smoothing_mode,
+                    );
                 }
                 i += 1;
             }
             GdiplusPathElement::Lines { points } => {
                 for j in 1..points.len() {
-                    draw_line(pixels, width, height, stride, points[j - 1].x, points[j - 1].y, points[j].x, points[j].y, color, pen_width, compositing_mode);
+                    draw_line(
+                        pixels,
+                        width,
+                        height,
+                        stride,
+                        points[j - 1].x,
+                        points[j - 1].y,
+                        points[j].x,
+                        points[j].y,
+                        color,
+                        pen_width,
+                        compositing_mode,
+                        smoothing_mode,
+                    );
                 }
                 i += 1;
             }
             GdiplusPathElement::Curve { points, tension: _ } => {
                 // Simple approximation: treat as polyline
                 for j in 1..points.len() {
-                    draw_line(pixels, width, height, stride, points[j - 1].x, points[j - 1].y, points[j].x, points[j].y, color, pen_width, compositing_mode);
+                    draw_line(
+                        pixels,
+                        width,
+                        height,
+                        stride,
+                        points[j - 1].x,
+                        points[j - 1].y,
+                        points[j].x,
+                        points[j].y,
+                        color,
+                        pen_width,
+                        compositing_mode,
+                        smoothing_mode,
+                    );
                 }
                 i += 1;
             }
             GdiplusPathElement::ClosedCurve { points, tension: _ } => {
                 for j in 0..points.len() {
                     let j2 = (j + 1) % points.len();
-                    draw_line(pixels, width, height, stride, points[j].x, points[j].y, points[j2].x, points[j2].y, color, pen_width, compositing_mode);
+                    draw_line(
+                        pixels,
+                        width,
+                        height,
+                        stride,
+                        points[j].x,
+                        points[j].y,
+                        points[j2].x,
+                        points[j2].y,
+                        color,
+                        pen_width,
+                        compositing_mode,
+                        smoothing_mode,
+                    );
                 }
                 i += 1;
             }
@@ -710,7 +1192,10 @@ pub fn fill_path(
             GdiplusPathElement::Rectangle { x, y, w, h } => {
                 poly_points.push(GdiplusPointF { x: *x, y: *y });
                 poly_points.push(GdiplusPointF { x: *x + *w, y: *y });
-                poly_points.push(GdiplusPointF { x: *x + *w, y: *y + *h });
+                poly_points.push(GdiplusPointF {
+                    x: *x + *w,
+                    y: *y + *h,
+                });
                 poly_points.push(GdiplusPointF { x: *x, y: *y + *h });
             }
             GdiplusPathElement::Ellipse { x, y, w, h } => {
@@ -727,7 +1212,14 @@ pub fn fill_path(
                     });
                 }
             }
-            GdiplusPathElement::Pie { x, y, w, h, start_angle, sweep_angle } => {
+            GdiplusPathElement::Pie {
+                x,
+                y,
+                w,
+                h,
+                start_angle,
+                sweep_angle,
+            } => {
                 let cx = x + w / 2.0;
                 let cy = y + h / 2.0;
                 let rx = w / 2.0;
@@ -759,7 +1251,15 @@ pub fn fill_path(
         }
     }
     if poly_points.len() >= 3 {
-        fill_polygon(pixels, width, height, stride, &poly_points, color, compositing_mode);
+        fill_polygon(
+            pixels,
+            width,
+            height,
+            stride,
+            &poly_points,
+            color,
+            compositing_mode,
+        );
     }
 }
 
@@ -807,7 +1307,16 @@ pub fn draw_image(
                 src_pixels[src_idx + 2],
                 src_pixels[src_idx + 3],
             ]);
-            put_pixel(dst_pixels, dst_width, dst_height, dst_stride, ox + sx, oy + sy, color, compositing_mode);
+            put_pixel(
+                dst_pixels,
+                dst_width,
+                dst_height,
+                dst_stride,
+                ox + sx,
+                oy + sy,
+                color,
+                compositing_mode,
+            );
         }
     }
 }
@@ -835,8 +1344,10 @@ pub fn draw_image_rect(
 
     for py in 0..oh {
         for px in 0..ow {
-            let src_x = (px as f32 / ow as f32 * src_width as f32).min((src_width - 1) as f32) as i32;
-            let src_y = (py as f32 / oh as f32 * src_height as f32).min((src_height - 1) as f32) as i32;
+            let src_x =
+                (px as f32 / ow as f32 * src_width as f32).min((src_width - 1) as f32) as i32;
+            let src_y =
+                (py as f32 / oh as f32 * src_height as f32).min((src_height - 1) as f32) as i32;
             let src_idx = (src_y * src_stride + src_x * 4) as usize;
             if src_idx + 3 >= src_pixels.len() {
                 continue;
@@ -847,7 +1358,16 @@ pub fn draw_image_rect(
                 src_pixels[src_idx + 2],
                 src_pixels[src_idx + 3],
             ]);
-            put_pixel(dst_pixels, dst_width, dst_height, dst_stride, ox + px, oy + py, color, compositing_mode);
+            put_pixel(
+                dst_pixels,
+                dst_width,
+                dst_height,
+                dst_stride,
+                ox + px,
+                oy + py,
+                color,
+                compositing_mode,
+            );
         }
     }
 }
@@ -878,7 +1398,16 @@ pub fn draw_string(
         let cx = ox + (i as i32 * char_w);
         for py in oy..(oy + char_h) {
             for px in cx..(cx + char_w) {
-                put_pixel(pixels, width, height, stride, px, py, color, compositing_mode);
+                put_pixel(
+                    pixels,
+                    width,
+                    height,
+                    stride,
+                    px,
+                    py,
+                    color,
+                    compositing_mode,
+                );
             }
         }
     }
@@ -888,7 +1417,7 @@ pub fn draw_string(
 
 /// Helper: resolve a GDI+ object's compositing mode for a given graphics handle.
 /// If the handle is invalid, returns SOURCE_OVER as default.
-pub fn get_compositing_mode(brush_color: u32) -> u32 {
+pub fn get_compositing_mode(_brush_color: u32) -> u32 {
     // This is passed through from the dispatch handler; we don't look up state here.
     GDIPLUS_COMPOSITING_MODE_SOURCE_OVER
 }
@@ -896,6 +1425,7 @@ pub fn get_compositing_mode(brush_color: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::user32::GdiplusLineBrush;
 
     fn make_buffer(w: u32, h: u32) -> (Vec<u8>, i32) {
         let stride = (w * 4) as i32;
@@ -910,7 +1440,16 @@ mod tests {
     #[test]
     fn test_put_pixel_simple() {
         let (mut buf, stride) = make_buffer(10, 10);
-        put_pixel(&mut buf, 10, 10, stride, 5, 5, 0xFFFF0000, GDIPLUS_COMPOSITING_MODE_SOURCE_COPY);
+        put_pixel(
+            &mut buf,
+            10,
+            10,
+            stride,
+            5,
+            5,
+            0xFFFF0000,
+            GDIPLUS_COMPOSITING_MODE_SOURCE_COPY,
+        );
         assert_eq!(get_pixel(&buf, stride, 5, 5), 0xFFFF0000);
     }
 
@@ -918,8 +1457,26 @@ mod tests {
     fn test_put_pixel_clip() {
         let (mut buf, stride) = make_buffer(10, 10);
         // Outside bounds should not panic
-        put_pixel(&mut buf, 10, 10, stride, 20, 20, 0xFFFF0000, GDIPLUS_COMPOSITING_MODE_SOURCE_COPY);
-        put_pixel(&mut buf, 10, 10, stride, -1, -1, 0xFFFF0000, GDIPLUS_COMPOSITING_MODE_SOURCE_COPY);
+        put_pixel(
+            &mut buf,
+            10,
+            10,
+            stride,
+            20,
+            20,
+            0xFFFF0000,
+            GDIPLUS_COMPOSITING_MODE_SOURCE_COPY,
+        );
+        put_pixel(
+            &mut buf,
+            10,
+            10,
+            stride,
+            -1,
+            -1,
+            0xFFFF0000,
+            GDIPLUS_COMPOSITING_MODE_SOURCE_COPY,
+        );
     }
 
     #[test]
@@ -937,13 +1494,27 @@ mod tests {
     #[test]
     fn test_source_copy() {
         let blended = blend_pixel(0x80FF0000, 0xFF0000FF, GDIPLUS_COMPOSITING_MODE_SOURCE_COPY);
-        assert_eq!(blended, 0x80FF0000, "source copy should replace dst entirely");
+        assert_eq!(
+            blended, 0x80FF0000,
+            "source copy should replace dst entirely"
+        );
     }
 
     #[test]
     fn test_fill_rect() {
         let (mut buf, stride) = make_buffer(20, 20);
-        fill_rect(&mut buf, 20, 20, stride, 5.0, 5.0, 10.0, 10.0, 0xFFFF0000, GDIPLUS_COMPOSITING_MODE_SOURCE_COPY);
+        fill_rect(
+            &mut buf,
+            20,
+            20,
+            stride,
+            5.0,
+            5.0,
+            10.0,
+            10.0,
+            0xFFFF0000,
+            GDIPLUS_COMPOSITING_MODE_SOURCE_COPY,
+        );
         // Check a pixel inside
         assert_eq!(get_pixel(&buf, stride, 10, 10), 0xFFFF0000);
         // Check a pixel outside
@@ -953,7 +1524,20 @@ mod tests {
     #[test]
     fn test_draw_line() {
         let (mut buf, stride) = make_buffer(20, 20);
-        draw_line(&mut buf, 20, 20, stride, 2.0, 10.0, 18.0, 10.0, 0xFFFF0000, 1.0, GDIPLUS_COMPOSITING_MODE_SOURCE_COPY);
+        draw_line(
+            &mut buf,
+            20,
+            20,
+            stride,
+            2.0,
+            10.0,
+            18.0,
+            10.0,
+            0xFFFF0000,
+            1.0,
+            GDIPLUS_COMPOSITING_MODE_SOURCE_COPY,
+            0, // smoothing_mode: aliased
+        );
         // The horizontal line should set some pixels at y=10
         assert_eq!(get_pixel(&buf, stride, 5, 10), 0xFFFF0000);
         assert_eq!(get_pixel(&buf, stride, 15, 10), 0xFFFF0000);
@@ -962,7 +1546,7 @@ mod tests {
     #[test]
     fn test_draw_image() {
         let (mut dst, dstride) = make_buffer(10, 10);
-        let (src, sstride) = make_buffer(3, 3);
+        let (_src, sstride) = make_buffer(3, 3);
         // We'd need to fill src first, then draw
         let src_copy = {
             let stride = sstride;
@@ -972,14 +1556,37 @@ mod tests {
             v[idx..idx + 4].copy_from_slice(&0xFFFF0000u32.to_le_bytes());
             v
         };
-        draw_image(&mut dst, 10, 10, dstride, &src_copy, 3, 3, sstride, 2.0, 2.0, GDIPLUS_COMPOSITING_MODE_SOURCE_COPY);
+        draw_image(
+            &mut dst,
+            10,
+            10,
+            dstride,
+            &src_copy,
+            3,
+            3,
+            sstride,
+            2.0,
+            2.0,
+            GDIPLUS_COMPOSITING_MODE_SOURCE_COPY,
+        );
         assert_eq!(get_pixel(&dst, dstride, 3, 3), 0xFFFF0000);
     }
 
     #[test]
     fn test_fill_ellipse() {
         let (mut buf, stride) = make_buffer(40, 40);
-        fill_ellipse(&mut buf, 40, 40, stride, 5.0, 5.0, 30.0, 30.0, 0xFF00FF00, GDIPLUS_COMPOSITING_MODE_SOURCE_COPY);
+        fill_ellipse(
+            &mut buf,
+            40,
+            40,
+            stride,
+            5.0,
+            5.0,
+            30.0,
+            30.0,
+            0xFF00FF00,
+            GDIPLUS_COMPOSITING_MODE_SOURCE_COPY,
+        );
         // Centre should be filled
         assert_eq!(get_pixel(&buf, stride, 20, 20), 0xFF00FF00);
     }
@@ -992,7 +1599,15 @@ mod tests {
             GdiplusPointF { x: 18.0, y: 2.0 },
             GdiplusPointF { x: 10.0, y: 18.0 },
         ];
-        fill_polygon(&mut buf, 20, 20, stride, &pts, 0xFF0000FF, GDIPLUS_COMPOSITING_MODE_SOURCE_COPY);
+        fill_polygon(
+            &mut buf,
+            20,
+            20,
+            stride,
+            &pts,
+            0xFF0000FF,
+            GDIPLUS_COMPOSITING_MODE_SOURCE_COPY,
+        );
         // Centre-ish should be filled
         assert_eq!(get_pixel(&buf, stride, 10, 10), 0xFF0000FF);
     }
@@ -1000,7 +1615,7 @@ mod tests {
     #[test]
     fn test_brush_color_solid() {
         let brush = GdiplusBrush::SolidFill(crate::user32::GdiplusSolidFill { color: 0xFFAABBCC });
-        assert_eq!(brush_color_at(&brush, 0.0, 0.0), 0xFFAABBCC);
+        assert_eq!(brush_color_at(&brush, 0.0, 0.0, None), 0xFFAABBCC);
     }
 
     #[test]
@@ -1013,10 +1628,207 @@ mod tests {
             wrap_mode: 0,
         });
         // At the start point
-        let c = brush_color_at(&brush, 0.0, 0.0);
+        let c = brush_color_at(&brush, 0.0, 0.0, None);
         assert_eq!(c, 0xFFFF0000);
         // At the end point
-        let c = brush_color_at(&brush, 10.0, 0.0);
+        let c = brush_color_at(&brush, 10.0, 0.0, None);
         assert_eq!(c, 0xFF0000FF);
+    }
+
+    #[test]
+    fn test_brush_color_texture() {
+        // 2x2 ARGB bitmap: red, green, blue, white (byte order B,G,R,A)
+        let pixels: Vec<u8> = vec![
+            0x00, 0x00, 0xFF, 0xFF, // (0,0) = red
+            0x00, 0xFF, 0x00, 0xFF, // (1,0) = green
+            0xFF, 0x00, 0x00, 0xFF, // (0,1) = blue
+            0xFF, 0xFF, 0xFF, 0xFF, // (1,1) = white
+        ];
+        let brush = GdiplusBrush::Texture(crate::user32::GdiplusTextureBrush {
+            image_handle: 1,
+            wrap_mode: 0,
+        });
+        let td = Some((pixels.as_slice(), 2, 2, 8));
+        assert_eq!(
+            brush_color_at(&brush, 0.0, 0.0, td),
+            0xFFFF0000,
+            "(0,0) should be red"
+        );
+        assert_eq!(
+            brush_color_at(&brush, 1.0, 0.0, td),
+            0xFF00FF00,
+            "(1,0) should be green"
+        );
+        assert_eq!(
+            brush_color_at(&brush, 0.0, 1.0, td),
+            0xFF0000FF,
+            "(0,1) should be blue"
+        );
+        assert_eq!(
+            brush_color_at(&brush, 1.0, 1.0, td),
+            0xFFFFFFFF,
+            "(1,1) should be white"
+        );
+        // Wrap mode TILE: (2,0) wraps to (0,0)
+        assert_eq!(
+            brush_color_at(&brush, 2.0, 0.0, td),
+            0xFFFF0000,
+            "(2,0) with tile wrap should be red"
+        );
+        // No texture data should return transparent black
+        assert_eq!(
+            brush_color_at(&brush, 0.0, 0.0, None),
+            0x00000000,
+            "no texture data should return transparent black"
+        );
+    }
+
+    // ── GDI resource cleanup tests ─────────────────────────────────────
+
+    #[test]
+    fn repeated_put_pixel_no_panic() {
+        let width = 64u32;
+        let height = 64u32;
+        let stride = (width * 4) as i32;
+        let mut pixels = vec![0u8; (stride * height as i32) as usize];
+
+        for _ in 0..100 {
+            for y in 0..height {
+                for x in (0..width).step_by(4) {
+                    put_pixel(
+                        &mut pixels,
+                        width,
+                        height,
+                        stride,
+                        x as i32,
+                        y as i32,
+                        0xFFFF0000,
+                        GDIPLUS_COMPOSITING_MODE_SOURCE_COPY,
+                    );
+                }
+            }
+            // Clear
+            pixels.fill(0);
+        }
+    }
+
+    #[test]
+    fn repeated_blend_pixel_no_panic() {
+        let width = 32u32;
+        let height = 32u32;
+        let stride = (width * 4) as i32;
+        let mut pixels = vec![0u8; (stride * height as i32) as usize];
+
+        for i in 0..200 {
+            let color = if i % 2 == 0 { 0x80FF0000 } else { 0x4000FF00 };
+            for y in 0..height {
+                for x in (0..width).step_by(8) {
+                    put_pixel(
+                        &mut pixels,
+                        width,
+                        height,
+                        stride,
+                        x as i32,
+                        y as i32,
+                        color,
+                        GDIPLUS_COMPOSITING_MODE_SOURCE_OVER,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn draw_rect_repeated_create_destroy_no_leak() {
+        let width = 16u32;
+        let height = 16u32;
+        let stride = (width * 4) as i32;
+
+        for _ in 0..50 {
+            let mut pixels = vec![0u8; (stride * height as i32) as usize];
+            // Draw a filled rectangle
+            for y in 0..height {
+                for x in 0..width {
+                    put_pixel(
+                        &mut pixels,
+                        width,
+                        height,
+                        stride,
+                        x as i32,
+                        y as i32,
+                        0xFFFFFFFF,
+                        GDIPLUS_COMPOSITING_MODE_SOURCE_COPY,
+                    );
+                }
+            }
+            // "Destroy" — pixels go out of scope and are freed
+            assert_eq!(pixels.len(), (stride * height as i32) as usize);
+        }
+    }
+
+    #[test]
+    fn out_of_bounds_put_pixel_is_noop() {
+        let width = 4u32;
+        let height = 4u32;
+        let stride = 16i32;
+        let mut pixels = vec![0u8; 64];
+
+        // These should all be no-ops (no panic, no OOB write)
+        put_pixel(
+            &mut pixels,
+            width,
+            height,
+            stride,
+            -1,
+            0,
+            0xFF0000FF,
+            GDIPLUS_COMPOSITING_MODE_SOURCE_COPY,
+        );
+        put_pixel(
+            &mut pixels,
+            width,
+            height,
+            stride,
+            0,
+            -1,
+            0xFF0000FF,
+            GDIPLUS_COMPOSITING_MODE_SOURCE_COPY,
+        );
+        put_pixel(
+            &mut pixels,
+            width,
+            height,
+            stride,
+            4,
+            0,
+            0xFF0000FF,
+            GDIPLUS_COMPOSITING_MODE_SOURCE_COPY,
+        );
+        put_pixel(
+            &mut pixels,
+            width,
+            height,
+            stride,
+            0,
+            4,
+            0xFF0000FF,
+            GDIPLUS_COMPOSITING_MODE_SOURCE_COPY,
+        );
+        put_pixel(
+            &mut pixels,
+            width,
+            height,
+            stride,
+            100,
+            100,
+            0xFF0000FF,
+            GDIPLUS_COMPOSITING_MODE_SOURCE_COPY,
+        );
+
+        // All pixels should still be zero
+        assert!(
+            pixels.iter().all(|&b| b == 0),
+            "out-of-bounds writes should be no-ops"
+        );
     }
 }

@@ -63,3 +63,18 @@ done
   --binary "$release_dir/casa1-helper" \
   --binary "$release_dir/casa1-test-guest" \
   --binary "$release_dir/casa1-oracle"
+
+# ---------------------------------------------------------------------------
+# Verify that insecure development features are NOT enabled in release builds
+# ---------------------------------------------------------------------------
+echo "Checking Cargo.toml for insecure default features..."
+
+# Extract the default = [...] line from [features] and ensure dev-insecure-tls
+# is not present. This prevents accidental inclusion of TLS bypass in release.
+if grep -Pzo '(?s)\[features\].*?default\s*=\s*\[([^\]]*)\]' Cargo.toml | grep -q 'dev-insecure-tls'; then
+  echo "ERROR: 'dev-insecure-tls' found in default features in Cargo.toml." >&2
+  echo "Remove it before cutting a release." >&2
+  exit 1
+fi
+
+echo "OK: dev-insecure-tls is not in default features."

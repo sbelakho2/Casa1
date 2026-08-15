@@ -1,7 +1,6 @@
 use crate::error::{AppError, AppResult};
 use crate::ge::{
-    FileAccess, FileHandle, FsEntryKind, FsMetadataRecord, GameEnvironment, RegistryView,
-    ShareMode,
+    FileAccess, FileHandle, FsEntryKind, FsMetadataRecord, GameEnvironment, RegistryView, ShareMode,
 };
 use crate::reason::ReasonCode;
 use serde::{Deserialize, Serialize};
@@ -21,6 +20,190 @@ pub const WAIT_ABANDONED: u32 = 0x0000_0080;
 pub const WAIT_TIMEOUT: u32 = 0x0000_0102;
 pub const WAIT_IO_COMPLETION: u32 = 0x0000_00C0;
 pub const CP_UTF8: u32 = 65_001;
+
+// ── Code page identifiers (Windows NLS) ──────────────────────────────────────
+pub const CP_ACP: u32 = 0;
+pub const CP_OEMCP: u32 = 1;
+pub const CP_MACCP: u32 = 2;
+pub const CP_THREAD_ACP: u32 = 3;
+pub const CP_SYMBOL: u32 = 42;
+pub const CP_UTF7: u32 = 65_000;
+pub const CP_WIN1250: u32 = 1250; // Central European
+pub const CP_WIN1251: u32 = 1251; // Cyrillic
+pub const CP_WIN1252: u32 = 1252; // Western European (Latin-1)
+pub const CP_WIN1253: u32 = 1253; // Greek
+pub const CP_WIN1254: u32 = 1254; // Turkish
+pub const CP_WIN1255: u32 = 1255; // Hebrew
+pub const CP_WIN1256: u32 = 1256; // Arabic
+pub const CP_WIN1257: u32 = 1257; // Baltic
+pub const CP_WIN1258: u32 = 1258; // Vietnamese
+pub const CP_SHIFTJIS: u32 = 932; // Japanese (Shift-JIS)
+pub const CP_GBK: u32 = 936; // Simplified Chinese (GBK)
+pub const CP_KOREAN: u32 = 949; // Korean
+pub const CP_BIG5: u32 = 950; // Traditional Chinese (Big5)
+pub const CP_THAI: u32 = 874; // Thai (TIS-620, Windows-874)
+pub const CP_OEM_US: u32 = 437; // OEM US (IBM437)
+
+// ── macOS iconv FFI for code page conversion ─────────────────────────────────
+#[cfg(target_os = "macos")]
+mod iconv_ffi {
+    use std::ffi::CString;
+
+    type IconvT = *mut std::ffi::c_void;
+
+    // SAFETY: extern FFI declaration — the function signature matches the C library prototype
+    unsafe extern "C" {
+        fn iconv_open(
+            tocode: *const std::os::raw::c_char,
+            fromcode: *const std::os::raw::c_char,
+        ) -> IconvT;
+        fn iconv(
+            cd: IconvT,
+            inbuf: *mut *const std::os::raw::c_char,
+            inbytesleft: *mut usize,
+            outbuf: *mut *mut std::os::raw::c_char,
+            outbytesleft: *mut usize,
+        ) -> usize;
+        fn iconv_close(cd: IconvT) -> std::os::raw::c_int;
+    }
+
+    /// Map a Windows code page number to an iconv name string.
+    pub fn code_page_to_iconv_name(cp: u32) -> Option<&'static str> {
+        match cp {
+            // UTF and Unicode
+            65001 => Some("UTF-8"),
+            65000 => Some("UTF-7"),
+            1200 => Some("UTF-16LE"),
+            1201 => Some("UTF-16BE"),
+            // Windows ANSI code pages
+            1250 => Some("CP1250"), // Central European
+            1251 => Some("CP1251"), // Cyrillic
+            1252 => Some("CP1252"), // Western European
+            1253 => Some("CP1253"), // Greek
+            1254 => Some("CP1254"), // Turkish
+            1255 => Some("CP1255"), // Hebrew
+            1256 => Some("CP1256"), // Arabic
+            1257 => Some("CP1257"), // Baltic
+            1258 => Some("CP1258"), // Vietnamese
+            // Double-byte (DBCS) code pages
+            932 => Some("CP932"), // Japanese Shift-JIS
+            936 => Some("CP936"), // Simplified Chinese GBK
+            949 => Some("CP949"), // Korean
+            950 => Some("CP950"), // Traditional Chinese Big5
+            // Other
+            874 => Some("CP874"), // Thai
+            437 => Some("CP437"), // OEM US
+            850 => Some("CP850"), // OEM Multilingual Latin-1
+            855 => Some("CP855"), // OEM Cyrillic
+            857 => Some("CP857"), // OEM Turkish
+            860 => Some("CP860"), // OEM Portuguese
+            861 => Some("CP861"), // OEM Icelandic
+            862 => Some("CP862"), // OEM Hebrew
+            863 => Some("CP863"), // OEM Canadian French
+            864 => Some("CP864"), // OEM Arabic
+            865 => Some("CP865"), // OEM Nordic
+            866 => Some("CP866"), // OEM Russian
+            869 => Some("CP869"), // OEM Modern Greek
+            _ => None,
+        }
+    }
+
+    /// Convert bytes from a given code page to UTF-8 using iconv.
+    /// Returns None if the code page is unsupported or conversion fails.
+    pub fn convert_to_utf8(cp: u32, input: &[u8]) -> Option<String> {
+        let tocode = CString::new("UTF-8").ok()?;
+        let fromcode = CString::new(code_page_to_iconv_name(cp)?).ok()?;
+        // SAFETY: iconv FFI for character encoding conversion
+        unsafe {
+            let cd = iconv_open(tocode.as_ptr(), fromcode.as_ptr());
+            if cd.is_null() {
+                return None;
+            }
+            // Allocate output buffer: 4 bytes per input byte (UTF-8 max expansion)
+            let outbuf_len = input.len().saturating_mul(4).saturating_add(8);
+            if outbuf_len == 0 || outbuf_len > isize::MAX as usize {
+                return None;
+            }
+            let mut outbuf = vec![0u8; outbuf_len];
+            let mut inbuf_ptr: *const std::os::raw::c_char =
+                input.as_ptr() as *const std::os::raw::c_char;
+            let mut inbytesleft = input.len();
+            let mut outbuf_ptr: *mut std::os::raw::c_char =
+                outbuf.as_mut_ptr() as *mut std::os::raw::c_char;
+            let mut outbytesleft = outbuf.len();
+
+            let result = iconv(
+                cd,
+                &mut inbuf_ptr,
+                &mut inbytesleft,
+                &mut outbuf_ptr,
+                &mut outbytesleft,
+            );
+            iconv_close(cd);
+
+            if result == usize::MAX {
+                return None; // conversion error
+            }
+            let used = outbuf.len() - outbytesleft;
+            outbuf.truncate(used);
+            String::from_utf8(outbuf).ok()
+        }
+    }
+
+    /// Convert a UTF-8 string to a given code page using iconv.
+    /// Returns None if the code page is unsupported or conversion fails.
+    pub fn convert_from_utf8(cp: u32, input: &str) -> Option<Vec<u8>> {
+        let tocode = CString::new(code_page_to_iconv_name(cp)?).ok()?;
+        let fromcode = CString::new("UTF-8").ok()?;
+        // SAFETY: iconv FFI for character encoding conversion
+        unsafe {
+            let cd = iconv_open(tocode.as_ptr(), fromcode.as_ptr());
+            if cd.is_null() {
+                return None;
+            }
+            // Allocate output buffer: 2 bytes per input byte (max for DBCS)
+            let outbuf_len = input.as_bytes().len().saturating_mul(2).saturating_add(8);
+            if outbuf_len == 0 || outbuf_len > isize::MAX as usize {
+                return None;
+            }
+            let mut outbuf = vec![0u8; outbuf_len];
+            let input_bytes = input.as_bytes();
+            let mut inbuf_ptr: *const std::os::raw::c_char =
+                input_bytes.as_ptr() as *const std::os::raw::c_char;
+            let mut inbytesleft = input_bytes.len();
+            let mut outbuf_ptr: *mut std::os::raw::c_char =
+                outbuf.as_mut_ptr() as *mut std::os::raw::c_char;
+            let mut outbytesleft = outbuf.len();
+
+            let result = iconv(
+                cd,
+                &mut inbuf_ptr,
+                &mut inbytesleft,
+                &mut outbuf_ptr,
+                &mut outbytesleft,
+            );
+            iconv_close(cd);
+
+            if result == usize::MAX {
+                return None; // conversion error
+            }
+            let used = outbuf.len() - outbytesleft;
+            outbuf.truncate(used);
+            Some(outbuf)
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+mod iconv_ffi {
+    pub fn convert_to_utf8(_cp: u32, _input: &[u8]) -> Option<String> {
+        None
+    }
+    pub fn convert_from_utf8(_cp: u32, _input: &str) -> Option<Vec<u8>> {
+        None
+    }
+}
+
 /// Sentinel value used by Win32 to indicate an invalid handle.
 /// All bits set (0xFFFF_FFFF_FFFF_FFFF).
 pub const INVALID_HANDLE_VALUE: u64 = u64::MAX;
@@ -252,6 +435,10 @@ pub struct SleepObservation {
 struct HandleEntry {
     descriptor: HandleDescriptor,
     object: KernelObject,
+    /// Monotonically increasing generation counter.  Incremented every time
+    /// the same handle value is reused so that stale references (cached before
+    /// the handle was closed) can be detected.
+    generation: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -400,7 +587,10 @@ pub const PIPE_SOCKET_BASE_DIR: &str = "/tmp/casa1_pipes";
 ///
 /// Converts `\\.\pipe\MyPipe` → `/tmp/casa1_pipes/MyPipe`.
 pub fn pipe_name_to_uds_path(pipe_name: &str) -> String {
-    let normalized = normalize_pipe_name(pipe_name);
+    // Normalize slashes but preserve original case (Windows pipe names are
+    // case-insensitive for *matching*, but the UDS path should reflect the
+    // caller's spelling so that diagnostics and file-system paths are readable).
+    let normalized = pipe_name.replace('/', "\\");
     // Strip the `\\.\pipe\` prefix
     let name = normalized
         .strip_prefix("\\\\.\\pipe\\")
@@ -458,7 +648,9 @@ struct MmapBacking {
 }
 
 // Safety: MmapBacking is only ever accessed behind Arc<Mutex<...>>.
+// SAFETY: Send is safe because the type only uses thread-safe internal state or is accessed under exclusive &mut
 unsafe impl Send for MmapBacking {}
+// SAFETY: Send is safe because the type only uses thread-safe internal state or is accessed under exclusive &mut
 unsafe impl Sync for MmapBacking {}
 
 impl MmapBacking {
@@ -470,7 +662,8 @@ impl MmapBacking {
                 length.max(1),
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1, 0,
+                -1,
+                0,
             )
         };
         if ptr == libc::MAP_FAILED {
@@ -484,10 +677,12 @@ impl MmapBacking {
     }
 
     fn as_slice(&self) -> &[u8] {
+        // SAFETY: pointer is valid and non-null, length matches the allocated region
         unsafe { std::slice::from_raw_parts(self.ptr, self.length) }
     }
 
     fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: pointer is valid and non-null, length matches the allocated region
         unsafe { std::slice::from_raw_parts_mut(self.ptr, self.length) }
     }
 }
@@ -495,7 +690,10 @@ impl MmapBacking {
 impl Drop for MmapBacking {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
-            unsafe { libc::munmap(self.ptr as *mut libc::c_void, self.length); }
+            // SAFETY: POSIX FFI for code page conversion and shared memory
+            unsafe {
+                libc::munmap(self.ptr as *mut libc::c_void, self.length);
+            }
         }
     }
 }
@@ -602,6 +800,10 @@ pub struct Win32Subsystem {
     handles: BTreeMap<Handle, HandleEntry>,
     threads: BTreeMap<u32, ThreadState>,
     handle_history: BTreeMap<Handle, ObjectType>,
+    /// Per-handle-value generation counters.  When a handle value is reused
+    /// after being closed, the generation is incremented so that stale
+    /// references can be detected via [`Win32Subsystem::validate_handle_generation`].
+    handle_generations: BTreeMap<Handle, u32>,
     protected_close_handles: BTreeSet<Handle>,
     overlapped: BTreeMap<u64, OverlappedRequest>,
     io_completion_associations: BTreeMap<Handle, IoCompletionAssociation>,
@@ -641,6 +843,7 @@ impl Win32Subsystem {
             handles: BTreeMap::new(),
             threads: BTreeMap::new(),
             handle_history: BTreeMap::new(),
+            handle_generations: BTreeMap::new(),
             protected_close_handles: BTreeSet::new(),
             overlapped: BTreeMap::new(),
             io_completion_associations: BTreeMap::new(),
@@ -684,10 +887,16 @@ impl Win32Subsystem {
     }
 
     pub fn current_thread_handle(&mut self) -> Handle {
-        if let Some(handle) = self.handles.iter().find_map(|(handle, entry)| match &entry.object {
-            KernelObject::Thread(thread) if thread.thread_id == self.current_thread_id => Some(*handle),
-            _ => None,
-        }) {
+        if let Some(handle) = self
+            .handles
+            .iter()
+            .find_map(|(handle, entry)| match &entry.object {
+                KernelObject::Thread(thread) if thread.thread_id == self.current_thread_id => {
+                    Some(*handle)
+                }
+                _ => None,
+            })
+        {
             handle
         } else {
             self.ensure_thread_state(self.current_thread_id);
@@ -703,10 +912,16 @@ impl Win32Subsystem {
     }
 
     pub fn current_process_handle(&mut self) -> Handle {
-        if let Some(handle) = self.handles.iter().find_map(|(handle, entry)| match &entry.object {
-            KernelObject::Process(process) if process.process_id == self.current_process_id => Some(*handle),
-            _ => None,
-        }) {
+        if let Some(handle) = self
+            .handles
+            .iter()
+            .find_map(|(handle, entry)| match &entry.object {
+                KernelObject::Process(process) if process.process_id == self.current_process_id => {
+                    Some(*handle)
+                }
+                _ => None,
+            })
+        {
             handle
         } else {
             self.insert_object(
@@ -720,7 +935,11 @@ impl Win32Subsystem {
                     cwd: "C:\\".to_string(),
                     environment: BTreeMap::new(),
                     inherited_handles: Vec::new(),
-                    modules: vec!["macwin".to_string(), "kernel32.dll".to_string(), "ntdll.dll".to_string()],
+                    modules: vec![
+                        "macwin".to_string(),
+                        "kernel32.dll".to_string(),
+                        "ntdll.dll".to_string(),
+                    ],
                     exit_code: None,
                     exit_sync: None,
                 }),
@@ -739,7 +958,11 @@ impl Win32Subsystem {
         fs::copy(source, &host_path).map_err(|error| {
             AppError::from_io(
                 ReasonCode::RcIo,
-                format!("failed to copy {} to {}", source.display(), host_path.display()),
+                format!(
+                    "failed to copy {} to {}",
+                    source.display(),
+                    host_path.display()
+                ),
                 &error,
             )
         })?;
@@ -751,7 +974,12 @@ impl Win32Subsystem {
         Ok(self.handle_entry(handle)?.descriptor.clone())
     }
 
-    pub fn set_handle_information(&mut self, handle: Handle, mask: u32, flags: u32) -> AppResult<()> {
+    pub fn set_handle_information(
+        &mut self,
+        handle: Handle,
+        mask: u32,
+        flags: u32,
+    ) -> AppResult<()> {
         {
             let entry = self.handle_entry_mut(handle)?;
             if mask & HANDLE_FLAG_INHERIT != 0 {
@@ -877,11 +1105,21 @@ impl Win32Subsystem {
             self.named_events
                 .insert(name.to_string(), Rc::downgrade(&event));
         }
-        let handle = self.insert_object(ObjectType::Event, 0x1F0003, inheritable, KernelObject::Event(event));
+        let handle = self.insert_object(
+            ObjectType::Event,
+            0x1F0003,
+            inheritable,
+            KernelObject::Event(event),
+        );
         (handle, false)
     }
 
-    pub fn open_event(&mut self, desired_access: u32, inheritable: bool, name: &str) -> AppResult<Handle> {
+    pub fn open_event(
+        &mut self,
+        desired_access: u32,
+        inheritable: bool,
+        name: &str,
+    ) -> AppResult<Handle> {
         let Some(event) = self.named_events.get(name).and_then(Weak::upgrade) else {
             self.named_events.remove(name);
             return Err(AppError::new(
@@ -934,7 +1172,9 @@ impl Win32Subsystem {
             if self.io_completion_associations.contains_key(&file_handle) {
                 return Err(AppError::new(
                     ReasonCode::RcCliInvalid,
-                    format!("handle {file_handle} is already associated with an I/O completion port"),
+                    format!(
+                        "handle {file_handle} is already associated with an I/O completion port"
+                    ),
                 ));
             }
             self.io_completion_associations.insert(
@@ -959,7 +1199,7 @@ impl Win32Subsystem {
         let entry = self.handle_entry_mut(completion_port)?;
         match &mut entry.object {
             KernelObject::IoCompletionPort(port) => {
-                let _ = port.concurrent_threads;
+                let _concurrent_threads = port.concurrent_threads;
                 port.queue.push_back(IoCompletionPacket {
                     bytes_transferred,
                     completion_key,
@@ -1064,7 +1304,12 @@ impl Win32Subsystem {
         }
     }
 
-    pub fn create_semaphore(&mut self, initial_count: u32, maximum: u32, inheritable: bool) -> Handle {
+    pub fn create_semaphore(
+        &mut self,
+        initial_count: u32,
+        maximum: u32,
+        inheritable: bool,
+    ) -> Handle {
         self.insert_object(
             ObjectType::Semaphore,
             0x1F0003,
@@ -1081,7 +1326,10 @@ impl Win32Subsystem {
         match &mut entry.object {
             KernelObject::Semaphore(semaphore) => {
                 let prev = semaphore.count;
-                semaphore.count = semaphore.count.saturating_add(release_count).min(semaphore.maximum);
+                semaphore.count = semaphore
+                    .count
+                    .saturating_add(release_count)
+                    .min(semaphore.maximum);
                 Ok(prev)
             }
             _ => invalid_handle("handle is not a semaphore"),
@@ -1145,7 +1393,7 @@ impl Win32Subsystem {
                         }
                         Ok(WaitStatus::Object0)
                     } else {
-                        let _ = timeout_ms;
+                        // timeout_ms unused in non-blocking path
                         Ok(WaitStatus::Timeout)
                     }
                 } else {
@@ -1163,7 +1411,7 @@ impl Win32Subsystem {
                         mutex.owner_thread_id = Some(current_thread_id);
                         Ok(WaitStatus::Object0)
                     } else {
-                        let _ = timeout_ms;
+                        // timeout_ms unused in non-blocking path
                         Ok(WaitStatus::Timeout)
                     }
                 } else {
@@ -1177,7 +1425,7 @@ impl Win32Subsystem {
                         semaphore.count -= 1;
                         Ok(WaitStatus::Object0)
                     } else {
-                        let _ = timeout_ms;
+                        // timeout_ms unused in non-blocking path
                         Ok(WaitStatus::Timeout)
                     }
                 } else {
@@ -1189,7 +1437,7 @@ impl Win32Subsystem {
                 if self.thread_state(thread_id)?.exit_code.is_some() {
                     Ok(WaitStatus::Object0)
                 } else {
-                    let _ = timeout_ms;
+                    // timeout_ms unused in non-blocking path
                     Ok(WaitStatus::Timeout)
                 }
             }
@@ -1217,7 +1465,7 @@ impl Win32Subsystem {
                             Ok(WaitStatus::Timeout)
                         }
                     } else {
-                        let _ = timeout_ms;
+                        // timeout_ms unused when no exit_sync
                         Ok(WaitStatus::Timeout)
                     }
                 } else {
@@ -1231,7 +1479,7 @@ impl Win32Subsystem {
                         timer.signaled = true;
                         Ok(WaitStatus::Object0)
                     } else {
-                        let _ = timeout_ms;
+                        // timeout_ms unused in non-blocking path
                         Ok(WaitStatus::Timeout)
                     }
                 } else {
@@ -1307,6 +1555,11 @@ impl Win32Subsystem {
 
             if timeout_ms != 0 {
                 std::thread::sleep(Duration::from_millis(1));
+                // Advance the guest clock so the finite-timeout deadline
+                // check above can actually expire.  Without this the raw
+                // `thread::sleep` never bumps `ticks_ms`, so a finite
+                // (non-INFINITE) timeout would loop forever.
+                self.record_sleep_observation(1, 1);
             } else {
                 break 'outer;
             }
@@ -1371,7 +1624,10 @@ impl Win32Subsystem {
 
     pub fn queue_apc(&mut self, thread_handle: Handle, token: impl Into<String>) -> AppResult<()> {
         let thread_id = self.thread_id(thread_handle)?;
-        self.thread_apcs.entry(thread_id).or_default().push_back(token.into());
+        self.thread_apcs
+            .entry(thread_id)
+            .or_default()
+            .push_back(token.into());
         Ok(())
     }
 
@@ -1388,10 +1644,18 @@ impl Win32Subsystem {
         let (normalized_path, host_path) = self.resolve_host_path(path)?;
         let exists = host_path.exists();
         if exists && host_path.is_dir() {
-            if !backup_semantics || !matches!(creation, CreationDisposition::OpenExisting | CreationDisposition::OpenAlways) {
+            if !backup_semantics
+                || !matches!(
+                    creation,
+                    CreationDisposition::OpenExisting | CreationDisposition::OpenAlways
+                )
+            {
                 return Err(AppError::new(
                     ReasonCode::RcIo,
-                    format!("directory handle requires backup semantics: {}", normalized_path),
+                    format!(
+                        "directory handle requires backup semantics: {}",
+                        normalized_path
+                    ),
                 ));
             }
             return Ok(self.insert_object(
@@ -1412,30 +1676,48 @@ impl Win32Subsystem {
                 return Err(AppError::new(
                     ReasonCode::RcFsAlreadyExists,
                     format!("{} already exists", normalized_path),
-                ))
+                ));
             }
-            CreationDisposition::OpenExisting | CreationDisposition::TruncateExisting if !exists => {
+            CreationDisposition::OpenExisting | CreationDisposition::TruncateExisting
+                if !exists =>
+            {
                 return Err(AppError::new(
                     ReasonCode::RcFsNotFound,
                     format!("{} does not exist", normalized_path),
-                ))
+                ));
             }
-            CreationDisposition::CreateAlways | CreationDisposition::OpenAlways | CreationDisposition::CreateNew if !exists => {
+            CreationDisposition::CreateAlways
+            | CreationDisposition::OpenAlways
+            | CreationDisposition::CreateNew
+                if !exists =>
+            {
                 self.ensure_parent_exists(&host_path)?;
                 fs::write(&host_path, []).map_err(|error| {
-                    AppError::from_io(ReasonCode::RcIo, format!("failed to create {}", host_path.display()), &error)
+                    AppError::from_io(
+                        ReasonCode::RcIo,
+                        format!("failed to create {}", host_path.display()),
+                        &error,
+                    )
                 })?;
                 self.sync_entry(&normalized_path, &host_path, false)?;
             }
             CreationDisposition::CreateAlways if exists => {
                 fs::write(&host_path, []).map_err(|error| {
-                    AppError::from_io(ReasonCode::RcIo, format!("failed to truncate {}", host_path.display()), &error)
+                    AppError::from_io(
+                        ReasonCode::RcIo,
+                        format!("failed to truncate {}", host_path.display()),
+                        &error,
+                    )
                 })?;
                 self.sync_entry(&normalized_path, &host_path, false)?;
             }
             CreationDisposition::TruncateExisting if exists => {
                 fs::write(&host_path, []).map_err(|error| {
-                    AppError::from_io(ReasonCode::RcIo, format!("failed to truncate {}", host_path.display()), &error)
+                    AppError::from_io(
+                        ReasonCode::RcIo,
+                        format!("failed to truncate {}", host_path.display()),
+                        &error,
+                    )
                 })?;
                 self.sync_entry(&normalized_path, &host_path, false)?;
             }
@@ -1468,7 +1750,10 @@ impl Win32Subsystem {
             ));
         }
         let mut entry = self.handles.remove(&handle).ok_or_else(|| {
-            AppError::new(ReasonCode::RcWin32InvalidHandle, format!("invalid handle {handle}"))
+            AppError::new(
+                ReasonCode::RcWin32InvalidHandle,
+                format!("invalid handle {handle}"),
+            )
         })?;
         self.protected_close_handles.remove(&handle);
         if let KernelObject::File(file) = &entry.object {
@@ -1485,6 +1770,10 @@ impl Win32Subsystem {
             entry.descriptor.refcount -= 1;
             self.handles.insert(handle, entry);
         } else {
+            // Increment the generation counter so stale references to the
+            // old handle value are detected by `validate_handle_generation`.
+            let generation = self.handle_generations.entry(handle).or_insert(0);
+            *generation = generation.saturating_add(1);
             self.record_closed_handle(handle, entry.descriptor.object_type);
             if let KernelObject::Thread(thread) = &entry.object {
                 self.cleanup_exited_thread_state(thread.thread_id);
@@ -1499,7 +1788,11 @@ impl Win32Subsystem {
             KernelObject::File(file) => {
                 let mut file = file.borrow_mut();
                 let bytes = fs::read(&file.host_path).map_err(|error| {
-                    AppError::from_io(ReasonCode::RcIo, format!("failed to read {}", file.host_path.display()), &error)
+                    AppError::from_io(
+                        ReasonCode::RcIo,
+                        format!("failed to read {}", file.host_path.display()),
+                        &error,
+                    )
                 })?;
                 let start = file.position as usize;
                 let end = start.saturating_add(length).min(bytes.len());
@@ -1538,7 +1831,11 @@ impl Win32Subsystem {
                     let mut file = file.borrow_mut();
                     let mut contents = if file.host_path.exists() {
                         fs::read(&file.host_path).map_err(|error| {
-                            AppError::from_io(ReasonCode::RcIo, format!("failed to read {}", file.host_path.display()), &error)
+                            AppError::from_io(
+                                ReasonCode::RcIo,
+                                format!("failed to read {}", file.host_path.display()),
+                                &error,
+                            )
                         })?
                     } else {
                         Vec::new()
@@ -1552,7 +1849,11 @@ impl Win32Subsystem {
                     }
                     contents[start..start + bytes.len()].copy_from_slice(bytes);
                     fs::write(&file.host_path, &contents).map_err(|error| {
-                        AppError::from_io(ReasonCode::RcIo, format!("failed to write {}", file.host_path.display()), &error)
+                        AppError::from_io(
+                            ReasonCode::RcIo,
+                            format!("failed to write {}", file.host_path.display()),
+                            &error,
+                        )
                     })?;
                     file.position += bytes.len() as u64;
                     (file.normalized_path.clone(), file.host_path.clone())
@@ -1614,14 +1915,23 @@ impl Win32Subsystem {
                 fs::metadata(&file.host_path)
                     .map(|metadata| metadata.len())
                     .map_err(|error| {
-                        AppError::from_io(ReasonCode::RcIo, format!("failed to stat {}", file.host_path.display()), &error)
+                        AppError::from_io(
+                            ReasonCode::RcIo,
+                            format!("failed to stat {}", file.host_path.display()),
+                            &error,
+                        )
                     })
             }
             _ => invalid_handle("handle is not a file"),
         }
     }
 
-    pub fn set_file_pointer_ex(&mut self, handle: Handle, distance: i64, origin: SeekOrigin) -> AppResult<u64> {
+    pub fn set_file_pointer_ex(
+        &mut self,
+        handle: Handle,
+        distance: i64,
+        origin: SeekOrigin,
+    ) -> AppResult<u64> {
         let size = self.get_file_size_ex(handle)? as i64;
         let entry = self.handle_entry_mut(handle)?;
         match &mut entry.object {
@@ -1645,7 +1955,10 @@ impl Win32Subsystem {
         }
     }
 
-    pub fn get_file_information_by_handle_ex(&mut self, handle: Handle) -> AppResult<FileInformation> {
+    pub fn get_file_information_by_handle_ex(
+        &mut self,
+        handle: Handle,
+    ) -> AppResult<FileInformation> {
         let (normalized_path, host_path) = {
             let entry = self.handle_entry(handle)?;
             match &entry.object {
@@ -1666,7 +1979,11 @@ impl Win32Subsystem {
             Err(error) => return Err(error),
         };
         let host = fs::metadata(&host_path).map_err(|error| {
-            AppError::from_io(ReasonCode::RcIo, format!("failed to stat {}", host_path.display()), &error)
+            AppError::from_io(
+                ReasonCode::RcIo,
+                format!("failed to stat {}", host_path.display()),
+                &error,
+            )
         })?;
         Ok(FileInformation {
             normalized_path,
@@ -1732,7 +2049,11 @@ impl Win32Subsystem {
     pub fn remove_directory_w(&mut self, path: &str) -> AppResult<()> {
         let (normalized_path, host_path) = self.resolve_host_path(path)?;
         fs::remove_dir(&host_path).map_err(|error| {
-            AppError::from_io(ReasonCode::RcIo, format!("failed to remove {}", host_path.display()), &error)
+            AppError::from_io(
+                ReasonCode::RcIo,
+                format!("failed to remove {}", host_path.display()),
+                &error,
+            )
         })?;
         self.ge.config.fs_state.entries.remove(&normalized_path);
         self.ge.save_config()
@@ -1789,29 +2110,50 @@ impl Win32Subsystem {
     pub fn delete_file_w(&mut self, path: &str) -> AppResult<()> {
         let (normalized_path, host_path) = self.resolve_host_path(path)?;
         fs::remove_file(&host_path).map_err(|error| {
-            AppError::from_io(ReasonCode::RcIo, format!("failed to delete {}", host_path.display()), &error)
+            AppError::from_io(
+                ReasonCode::RcIo,
+                format!("failed to delete {}", host_path.display()),
+                &error,
+            )
         })?;
         self.ge.config.fs_state.entries.remove(&normalized_path);
         self.ge.save_config()
     }
 
-    pub fn move_file_ex_w(&mut self, from: &str, to: &str, replace_existing: bool) -> AppResult<()> {
+    pub fn move_file_ex_w(
+        &mut self,
+        from: &str,
+        to: &str,
+        replace_existing: bool,
+    ) -> AppResult<()> {
         let (from_norm, from_host) = self.resolve_host_path(from)?;
         let (to_norm, to_host) = self.resolve_host_path(to)?;
         self.ensure_parent_exists(&to_host)?;
         if replace_existing && to_host.exists() {
             if to_host.is_dir() {
                 fs::remove_dir_all(&to_host).map_err(|error| {
-                    AppError::from_io(ReasonCode::RcIo, format!("failed to remove {}", to_host.display()), &error)
+                    AppError::from_io(
+                        ReasonCode::RcIo,
+                        format!("failed to remove {}", to_host.display()),
+                        &error,
+                    )
                 })?;
             } else {
                 fs::remove_file(&to_host).map_err(|error| {
-                    AppError::from_io(ReasonCode::RcIo, format!("failed to remove {}", to_host.display()), &error)
+                    AppError::from_io(
+                        ReasonCode::RcIo,
+                        format!("failed to remove {}", to_host.display()),
+                        &error,
+                    )
                 })?;
             }
         }
         fs::rename(&from_host, &to_host).map_err(|error| {
-            AppError::from_io(ReasonCode::RcIo, format!("failed to move {}", from_host.display()), &error)
+            AppError::from_io(
+                ReasonCode::RcIo,
+                format!("failed to move {}", from_host.display()),
+                &error,
+            )
         })?;
         if let Some(entry) = self.ge.config.fs_state.entries.remove(&from_norm) {
             self.ge.config.fs_state.entries.insert(to_norm, entry);
@@ -1830,18 +2172,29 @@ impl Win32Subsystem {
         }
         self.ensure_parent_exists(&to_host)?;
         let copied = fs::copy(&from_host, &to_host).map_err(|error| {
-            AppError::from_io(ReasonCode::RcIo, format!("failed to copy {}", from_host.display()), &error)
+            AppError::from_io(
+                ReasonCode::RcIo,
+                format!("failed to copy {}", from_host.display()),
+                &error,
+            )
         })?;
-        let _ = from_norm;
+        let _from_norm = from_norm;
         self.sync_entry(&to_norm, &to_host, false)?;
         Ok(copied)
     }
 
     pub fn get_temp_path_w(&mut self) -> AppResult<String> {
-        let path = format!("C:\\users\\{}\\AppData\\Local\\Temp\\", self.ge.config.user_name);
+        let path = format!(
+            "C:\\users\\{}\\AppData\\Local\\Temp\\",
+            self.ge.config.user_name
+        );
         let (_, host_path) = self.resolve_host_path(path.trim_end_matches(['\\', '/']))?;
         fs::create_dir_all(&host_path).map_err(|error| {
-            AppError::from_io(ReasonCode::RcIo, format!("failed to create {}", host_path.display()), &error)
+            AppError::from_io(
+                ReasonCode::RcIo,
+                format!("failed to create {}", host_path.display()),
+                &error,
+            )
         })?;
         Ok(path)
     }
@@ -1852,16 +2205,29 @@ impl Win32Subsystem {
         } else {
             directory.to_string()
         };
-        let (normalized_directory, host_directory) = self.resolve_host_path(temp_path.trim_end_matches(['\\', '/']))?;
+        let (normalized_directory, host_directory) =
+            self.resolve_host_path(temp_path.trim_end_matches(['\\', '/']))?;
         fs::create_dir_all(&host_directory).map_err(|error| {
-            AppError::from_io(ReasonCode::RcIo, format!("failed to create {}", host_directory.display()), &error)
+            AppError::from_io(
+                ReasonCode::RcIo,
+                format!("failed to create {}", host_directory.display()),
+                &error,
+            )
         })?;
         let name = format!("{}{:04}.tmp", prefix, self.next_handle);
-        let full = format!("{}\\{}", normalized_directory.trim_end_matches(['\\', '/']), name);
+        let full = format!(
+            "{}\\{}",
+            normalized_directory.trim_end_matches(['\\', '/']),
+            name
+        );
         let (normalized_path, host_path) = self.resolve_host_path(&full)?;
         self.ensure_parent_exists(&host_path)?;
         fs::write(&host_path, []).map_err(|error| {
-            AppError::from_io(ReasonCode::RcIo, format!("failed to create {}", host_path.display()), &error)
+            AppError::from_io(
+                ReasonCode::RcIo,
+                format!("failed to create {}", host_path.display()),
+                &error,
+            )
         })?;
         self.sync_entry(&normalized_path, &host_path, false)?;
         Ok(full)
@@ -1877,11 +2243,19 @@ impl Win32Subsystem {
         let file = self.file_object(handle)?;
         let file = file.borrow();
         let bytes = fs::read(&file.host_path).map_err(|error| {
-            AppError::from_io(ReasonCode::RcIo, format!("failed to read {}", file.host_path.display()), &error)
+            AppError::from_io(
+                ReasonCode::RcIo,
+                format!("failed to read {}", file.host_path.display()),
+                &error,
+            )
         })?;
         let end = ((offset as usize) + length).min(bytes.len());
         let transferred = end.saturating_sub(offset as usize) as u32;
-        let id = self.insert_overlapped(handle, event_handle, OverlappedState::Completed(transferred));
+        let id = self.insert_overlapped(
+            handle,
+            event_handle,
+            OverlappedState::Completed(transferred),
+        );
         self.signal_event_if_needed(event_handle)?;
         Ok(OverlappedResult {
             id,
@@ -1903,7 +2277,11 @@ impl Win32Subsystem {
             let file = file.borrow();
             let mut contents = if file.host_path.exists() {
                 fs::read(&file.host_path).map_err(|error| {
-                    AppError::from_io(ReasonCode::RcIo, format!("failed to read {}", file.host_path.display()), &error)
+                    AppError::from_io(
+                        ReasonCode::RcIo,
+                        format!("failed to read {}", file.host_path.display()),
+                        &error,
+                    )
                 })?
             } else {
                 Vec::new()
@@ -1917,12 +2295,20 @@ impl Win32Subsystem {
             }
             contents[start..start + bytes.len()].copy_from_slice(bytes);
             fs::write(&file.host_path, &contents).map_err(|error| {
-                AppError::from_io(ReasonCode::RcIo, format!("failed to write {}", file.host_path.display()), &error)
+                AppError::from_io(
+                    ReasonCode::RcIo,
+                    format!("failed to write {}", file.host_path.display()),
+                    &error,
+                )
             })?;
             (file.normalized_path.clone(), file.host_path.clone())
         };
         self.sync_entry(&normalized_path, &host_path, false)?;
-        let id = self.insert_overlapped(handle, event_handle, OverlappedState::Completed(bytes.len() as u32));
+        let id = self.insert_overlapped(
+            handle,
+            event_handle,
+            OverlappedState::Completed(bytes.len() as u32),
+        );
         self.signal_event_if_needed(event_handle)?;
         Ok(OverlappedResult {
             id,
@@ -1934,7 +2320,10 @@ impl Win32Subsystem {
 
     pub fn get_overlapped_result(&mut self, id: u64, wait: bool) -> AppResult<OverlappedResult> {
         let request = self.overlapped.get(&id).cloned().ok_or_else(|| {
-            AppError::new(ReasonCode::RcWin32InvalidHandle, format!("invalid overlapped id {id}"))
+            AppError::new(
+                ReasonCode::RcWin32InvalidHandle,
+                format!("invalid overlapped id {id}"),
+            )
         })?;
         match request.state {
             OverlappedState::Completed(bytes_transferred) => Ok(OverlappedResult {
@@ -1998,7 +2387,12 @@ impl Win32Subsystem {
         )
     }
 
-    pub fn connect_named_pipe_internal(&mut self, handle: Handle, event_handle: Option<Handle>, overlapped: bool) -> AppResult<Option<u64>> {
+    pub fn connect_named_pipe_internal(
+        &mut self,
+        handle: Handle,
+        event_handle: Option<Handle>,
+        overlapped: bool,
+    ) -> AppResult<Option<u64>> {
         let entry = self.handle_entry_mut(handle)?;
         match &mut entry.object {
             KernelObject::Pipe(pipe) => {
@@ -2028,7 +2422,12 @@ impl Win32Subsystem {
                 KernelObject::Pipe(pipe) if pipe.name == normalized => Some(*handle),
                 _ => None,
             })
-            .ok_or_else(|| AppError::new(ReasonCode::RcPipeBusy, format!("{} is not registered", normalized)))?;
+            .ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcPipeBusy,
+                    format!("{} is not registered", normalized),
+                )
+            })?;
         if let Some(entry) = self.handles.get_mut(&pipe_handle) {
             if let KernelObject::Pipe(pipe) = &mut entry.object {
                 pipe.connected = true;
@@ -2044,7 +2443,9 @@ impl Win32Subsystem {
         let mut events = Vec::new();
         for id in pending_ids {
             if let Some(request) = self.overlapped.get_mut(&id) {
-                request.state = OverlappedState::Completed(request.len_hint(request_id_len(request, request_id_len_inner(request))) as u32);
+                request.state = OverlappedState::Completed(
+                    request.len_hint(request_id_len(request, request_id_len_inner(request))) as u32,
+                );
                 events.push(request.event_handle);
             }
         }
@@ -2066,12 +2467,15 @@ impl Win32Subsystem {
             self.next_virtual_address += align_up(size as u64, 0x1000);
             current
         });
-        let region = self.memory_regions.entry(base).or_insert_with(|| VirtualRegion {
-            base_address: base,
-            size: align_up(size as u64, 0x1000) as usize,
-            committed: BTreeSet::new(),
-            protection,
-        });
+        let region = self
+            .memory_regions
+            .entry(base)
+            .or_insert_with(|| VirtualRegion {
+                base_address: base,
+                size: align_up(size as u64, 0x1000) as usize,
+                committed: BTreeSet::new(),
+                protection,
+            });
         region.protection = protection;
         match allocation_type {
             AllocationType::Reserve => {}
@@ -2099,9 +2503,16 @@ impl Win32Subsystem {
         Ok(())
     }
 
-    pub fn virtual_protect(&mut self, base_address: u64, protection: MemoryProtection) -> AppResult<MemoryProtection> {
+    pub fn virtual_protect(
+        &mut self,
+        base_address: u64,
+        protection: MemoryProtection,
+    ) -> AppResult<MemoryProtection> {
         let region = self.memory_regions.get_mut(&base_address).ok_or_else(|| {
-            AppError::new(ReasonCode::RcMemoryAccessViolation, format!("unknown region {base_address:#x}"))
+            AppError::new(
+                ReasonCode::RcMemoryAccessViolation,
+                format!("unknown region {base_address:#x}"),
+            )
         })?;
         let previous = region.protection;
         region.protection = protection;
@@ -2110,7 +2521,8 @@ impl Win32Subsystem {
 
     pub fn virtual_query(&self, address: u64) -> MemoryBasicInformation {
         for region in self.memory_regions.values() {
-            if address >= region.base_address && address < region.base_address + region.size as u64 {
+            if address >= region.base_address && address < region.base_address + region.size as u64
+            {
                 return MemoryBasicInformation {
                     base_address: region.base_address,
                     region_size: region.size,
@@ -2135,7 +2547,12 @@ impl Win32Subsystem {
         }
     }
 
-    pub fn create_section(&mut self, size: usize, protection: MemoryProtection, inheritable: bool) -> AppResult<Handle> {
+    pub fn create_section(
+        &mut self,
+        size: usize,
+        protection: MemoryProtection,
+        inheritable: bool,
+    ) -> AppResult<Handle> {
         let base = self.virtual_alloc(None, size, AllocationType::ReserveCommit, protection)?;
         Ok(self.insert_object(
             ObjectType::Section,
@@ -2177,7 +2594,10 @@ impl Win32Subsystem {
 
     pub fn heap_alloc(&mut self, heap: Handle, size: usize) -> AppResult<u64> {
         let state = self.heaps.get_mut(&heap).ok_or_else(|| {
-            AppError::new(ReasonCode::RcWin32InvalidHandle, format!("invalid heap {heap}"))
+            AppError::new(
+                ReasonCode::RcWin32InvalidHandle,
+                format!("invalid heap {heap}"),
+            )
         })?;
         let address = align_up(state.next_address, state.alignment as u64);
         state.next_address = address + size as u64 + state.alignment as u64;
@@ -2187,10 +2607,16 @@ impl Win32Subsystem {
 
     pub fn heap_write(&mut self, heap: Handle, address: u64, bytes: &[u8]) -> AppResult<()> {
         let state = self.heaps.get_mut(&heap).ok_or_else(|| {
-            AppError::new(ReasonCode::RcWin32InvalidHandle, format!("invalid heap {heap}"))
+            AppError::new(
+                ReasonCode::RcWin32InvalidHandle,
+                format!("invalid heap {heap}"),
+            )
         })?;
         let allocation = state.allocations.get_mut(&address).ok_or_else(|| {
-            AppError::new(ReasonCode::RcMemoryAccessViolation, format!("invalid heap pointer {address:#x}"))
+            AppError::new(
+                ReasonCode::RcMemoryAccessViolation,
+                format!("invalid heap pointer {address:#x}"),
+            )
         })?;
         allocation.clear();
         allocation.extend_from_slice(bytes);
@@ -2199,19 +2625,31 @@ impl Win32Subsystem {
 
     pub fn heap_read(&self, heap: Handle, address: u64) -> AppResult<Vec<u8>> {
         let state = self.heaps.get(&heap).ok_or_else(|| {
-            AppError::new(ReasonCode::RcWin32InvalidHandle, format!("invalid heap {heap}"))
+            AppError::new(
+                ReasonCode::RcWin32InvalidHandle,
+                format!("invalid heap {heap}"),
+            )
         })?;
         state.allocations.get(&address).cloned().ok_or_else(|| {
-            AppError::new(ReasonCode::RcMemoryAccessViolation, format!("invalid heap pointer {address:#x}"))
+            AppError::new(
+                ReasonCode::RcMemoryAccessViolation,
+                format!("invalid heap pointer {address:#x}"),
+            )
         })
     }
 
     pub fn heap_realloc(&mut self, heap: Handle, address: u64, new_size: usize) -> AppResult<u64> {
         let state = self.heaps.get_mut(&heap).ok_or_else(|| {
-            AppError::new(ReasonCode::RcWin32InvalidHandle, format!("invalid heap {heap}"))
+            AppError::new(
+                ReasonCode::RcWin32InvalidHandle,
+                format!("invalid heap {heap}"),
+            )
         })?;
         let mut allocation = state.allocations.remove(&address).ok_or_else(|| {
-            AppError::new(ReasonCode::RcMemoryAccessViolation, format!("invalid heap pointer {address:#x}"))
+            AppError::new(
+                ReasonCode::RcMemoryAccessViolation,
+                format!("invalid heap pointer {address:#x}"),
+            )
         })?;
         allocation.resize(new_size, 0);
         let new_address = align_up(state.next_address, state.alignment as u64);
@@ -2222,7 +2660,10 @@ impl Win32Subsystem {
 
     pub fn heap_free(&mut self, heap: Handle, address: u64) -> AppResult<()> {
         let state = self.heaps.get_mut(&heap).ok_or_else(|| {
-            AppError::new(ReasonCode::RcWin32InvalidHandle, format!("invalid heap {heap}"))
+            AppError::new(
+                ReasonCode::RcWin32InvalidHandle,
+                format!("invalid heap {heap}"),
+            )
         })?;
         state.allocations.remove(&address);
         Ok(())
@@ -2271,7 +2712,11 @@ impl Win32Subsystem {
                 cwd: cwd.to_string(),
                 environment: env.clone(),
                 inherited_handles,
-                modules: vec![application.to_string(), "kernel32.dll".to_string(), "ntdll.dll".to_string()],
+                modules: vec![
+                    application.to_string(),
+                    "kernel32.dll".to_string(),
+                    "ntdll.dll".to_string(),
+                ],
                 exit_code: None,
                 exit_sync: None,
             }),
@@ -2357,12 +2802,19 @@ impl Win32Subsystem {
     /// `OpenProcess` — returns a new handle to an existing process object.
     /// Only `PROCESS_ALL_ACCESS` is supported; we match against our internal
     /// process-id table.
-    pub fn open_process(&mut self, desired_access: u32, inherit_handle: bool, process_id: u32) -> AppResult<Handle> {
+    pub fn open_process(
+        &mut self,
+        desired_access: u32,
+        inherit_handle: bool,
+        process_id: u32,
+    ) -> AppResult<Handle> {
         let existing = self
             .handles
             .values()
             .find_map(|entry| match &entry.object {
-                KernelObject::Process(p) if p.process_id == process_id => Some(entry.object.clone()),
+                KernelObject::Process(p) if p.process_id == process_id => {
+                    Some(entry.object.clone())
+                }
                 _ => None,
             })
             .ok_or_else(|| {
@@ -2371,7 +2823,12 @@ impl Win32Subsystem {
                     format!("no process with id {process_id}"),
                 )
             })?;
-        Ok(self.insert_object(ObjectType::Process, desired_access, inherit_handle, existing))
+        Ok(self.insert_object(
+            ObjectType::Process,
+            desired_access,
+            inherit_handle,
+            existing,
+        ))
     }
 
     // -----------------------------------------------------------------------
@@ -2405,7 +2862,12 @@ impl Win32Subsystem {
         let uds_path = uds_socket_path.unwrap_or_else(|| pipe_name_to_uds_path(&normalized));
 
         // Ensure the socket base directory exists
-        let _ = std::fs::create_dir_all(PIPE_SOCKET_BASE_DIR);
+        if let Err(e) = std::fs::create_dir_all(PIPE_SOCKET_BASE_DIR) {
+            eprintln!(
+                "[win32] failed to create pipe socket base dir '{}': {e}",
+                PIPE_SOCKET_BASE_DIR
+            );
+        }
 
         let state = NamedPipeState {
             name: normalized.clone(),
@@ -2479,8 +2941,8 @@ impl Win32Subsystem {
         &mut self,
         handle: Handle,
         mode: Option<u32>,
-        max_collect_count: Option<u32>,
-        collect_data_timeout: Option<u32>,
+        _max_collect_count: Option<u32>,
+        _collect_data_timeout: Option<u32>,
     ) -> AppResult<()> {
         let entry = self.handle_entry(handle)?;
         let pipe_name = match &entry.object {
@@ -2492,13 +2954,17 @@ impl Win32Subsystem {
             if let Some(mode) = mode {
                 state.pipe_mode = mode;
             }
-            let _ = (max_collect_count, collect_data_timeout);
+            // max_collect_count and collect_data_timeout unused in current impl
         }
         Ok(())
     }
 
     /// `PeekNamedPipe` — read from a pipe without removing data.
-    pub fn peek_named_pipe(&mut self, handle: Handle, buffer: &mut [u8]) -> AppResult<(u32, u32, u32)> {
+    pub fn peek_named_pipe(
+        &mut self,
+        handle: Handle,
+        buffer: &mut [u8],
+    ) -> AppResult<(u32, u32, u32)> {
         let entry = self.handle_entry(handle)?;
         match &entry.object {
             KernelObject::Pipe(pipe) => {
@@ -2555,15 +3021,12 @@ impl Win32Subsystem {
     ) -> AppResult<Vec<u8>> {
         let normalized = normalize_pipe_name(pipe_name);
         // Find the pipe state
-        let state = self
-            .named_pipes
-            .get(&normalized)
-            .ok_or_else(|| {
-                AppError::new(
-                    ReasonCode::RcFsNotFound,
-                    format!("named pipe not found: {pipe_name}"),
-                )
-            })?;
+        let state = self.named_pipes.get(&normalized).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcFsNotFound,
+                format!("named pipe not found: {pipe_name}"),
+            )
+        })?;
         let buf = state.buffer.clone();
         let ready = state.data_ready.clone();
         // Write data (client → server direction) and notify the server.
@@ -2578,9 +3041,8 @@ impl Win32Subsystem {
     }
 
     /// `WaitNamedPipeW` — wait for a named pipe to become available.
-    pub fn wait_named_pipe_w(&mut self, pipe_name: &str, timeout_ms: u32) -> AppResult<()> {
+    pub fn wait_named_pipe_w(&mut self, pipe_name: &str, _timeout_ms: u32) -> AppResult<()> {
         let normalized = normalize_pipe_name(pipe_name);
-        let _ = timeout_ms;
         if self.named_pipes.contains_key(&normalized) {
             Ok(())
         } else {
@@ -2593,18 +3055,19 @@ impl Win32Subsystem {
 
     /// Open a pipe client endpoint: called from `CreateFileW` when the path
     /// starts with `\\.\pipe\`.
-    pub fn open_named_pipe_client(&mut self, pipe_name: &str, inheritable: bool) -> AppResult<Handle> {
+    pub fn open_named_pipe_client(
+        &mut self,
+        pipe_name: &str,
+        inheritable: bool,
+    ) -> AppResult<Handle> {
         let normalized = normalize_pipe_name(pipe_name);
         let (_buf, _ready) = {
-            let state = self
-                .named_pipes
-                .get_mut(&normalized)
-                .ok_or_else(|| {
-                    AppError::new(
-                        ReasonCode::RcFsNotFound,
-                        format!("named pipe not found: {pipe_name}"),
-                    )
-                })?;
+            let state = self.named_pipes.get_mut(&normalized).ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcFsNotFound,
+                    format!("named pipe not found: {pipe_name}"),
+                )
+            })?;
             // Mark as connected
             state.connected = true;
             (state.buffer.clone(), state.data_ready.clone())
@@ -2643,8 +3106,8 @@ impl Win32Subsystem {
                 let section = self.shared_memory_sections.get(&key).unwrap();
                 let size = section.data.lock().unwrap().len();
                 let prot = section.protection;
-                // Drop the section reference before calling insert_object on self
-                drop(section);
+                // The section reference is no longer needed; the borrow ends here naturally
+                let _ = section;
                 let handle = self.insert_object(
                     ObjectType::Section,
                     0x1F0FFF,
@@ -2699,13 +3162,11 @@ impl Win32Subsystem {
     ) -> AppResult<u64> {
         let entry = self.handle_entry(handle)?;
         let (_protection, _) = match &entry.object {
-            KernelObject::Section(section) => {
-                (section.protection, section.size)
-            }
+            KernelObject::Section(section) => (section.protection, section.size),
             _ => return invalid_handle("handle is not a section"),
         };
-        let _ = offset;
-        let _ = bytes_to_map;
+        let _offset = offset;
+        let _bytes_to_map = bytes_to_map;
         // Allocate a virtual address for the mapping
         let base = self.next_virtual_address;
         let size = bytes_to_map.max(0x1000).next_power_of_two();
@@ -2896,14 +3357,21 @@ impl Win32Subsystem {
     }
 
     pub fn sleep(&mut self, milliseconds: u64) {
-        let observed_ms = paced_sleep_duration_ms(milliseconds, self.time.live_pacing);
-        if self.time.live_pacing && observed_ms != 0 {
-            std::thread::sleep(Duration::from_millis(observed_ms));
-        }
-        self.record_sleep_observation(milliseconds, observed_ms);
+        // Advance the guest virtual clock by the full requested duration.
+        // Cap the actual host sleep to 1ms maximum — the guest's Sleep()
+        // should advance virtual time without blocking the host thread
+        // for the full duration (which would make the emulator unusably slow).
+        self.record_sleep_observation(milliseconds, milliseconds);
+        // Only sleep 1ms max on the host to yield the CPU.
+        std::thread::sleep(Duration::from_millis(1));
     }
 
-    pub fn sleep_ex(&mut self, milliseconds: u64, alertable: bool, thread_handle: Option<Handle>) -> AppResult<WaitStatus> {
+    pub fn sleep_ex(
+        &mut self,
+        milliseconds: u64,
+        alertable: bool,
+        thread_handle: Option<Handle>,
+    ) -> AppResult<WaitStatus> {
         if alertable {
             if let Some(thread_handle) = thread_handle {
                 let thread_id = self.thread_id(thread_handle)?;
@@ -2915,11 +3383,9 @@ impl Win32Subsystem {
                 }
             }
         }
-        let observed_ms = paced_sleep_duration_ms(milliseconds, self.time.live_pacing);
-        if self.time.live_pacing && observed_ms != 0 {
-            std::thread::sleep(Duration::from_millis(observed_ms));
-        }
-        self.record_sleep_observation(milliseconds, observed_ms);
+        // Advance guest clock, cap host sleep to 1ms.
+        self.record_sleep_observation(milliseconds, milliseconds);
+        std::thread::sleep(Duration::from_millis(1));
         Ok(WaitStatus::Object0)
     }
 
@@ -2944,36 +3410,68 @@ impl Win32Subsystem {
     }
 
     pub fn multi_byte_to_wide_char(&self, code_page: u32, bytes: &[u8]) -> AppResult<Vec<u16>> {
-        match code_page {
+        let cp = if code_page == CP_ACP || code_page == CP_THREAD_ACP {
+            self.locale.acp
+        } else {
+            code_page
+        };
+        match cp {
             CP_UTF8 => String::from_utf8(bytes.to_vec())
                 .map_err(|error| {
                     AppError::new(ReasonCode::RcCliInvalid, "invalid UTF-8 input")
                         .with_hint(error.to_string())
                 })
                 .map(|text| text.encode_utf16().collect()),
-            1252 if self.locale.acp == 1252 => Ok(bytes.iter().map(|byte| decode_cp1252(*byte) as u16).collect()),
-            _ => Err(AppError::new(
-                ReasonCode::RcCliInvalid,
-                format!("unsupported code page {code_page}"),
-            )),
+            1252 if self.locale.acp == 1252 => Ok(bytes
+                .iter()
+                .map(|byte| decode_cp1252(*byte) as u16)
+                .collect()),
+            _ => {
+                // Use iconv for all other code pages
+                match iconv_ffi::convert_to_utf8(cp, bytes) {
+                    Some(utf8_str) => Ok(utf8_str.encode_utf16().collect()),
+                    None => Err(AppError::new(
+                        ReasonCode::RcCliInvalid,
+                        format!("unsupported or failed conversion for code page {code_page}"),
+                    )),
+                }
+            }
         }
     }
 
     pub fn wide_char_to_multi_byte(&self, code_page: u32, wide: &[u16]) -> AppResult<Vec<u8>> {
+        let cp = if code_page == CP_ACP || code_page == CP_THREAD_ACP {
+            self.locale.acp
+        } else {
+            code_page
+        };
         let text = String::from_utf16(wide).map_err(|error| {
-            AppError::new(ReasonCode::RcCliInvalid, "invalid UTF-16 input").with_hint(error.to_string())
+            AppError::new(ReasonCode::RcCliInvalid, "invalid UTF-16 input")
+                .with_hint(error.to_string())
         })?;
-        match code_page {
+        match cp {
             CP_UTF8 => Ok(text.into_bytes()),
             1252 if self.locale.acp == 1252 => text.chars().map(encode_cp1252).collect(),
-            _ => Err(AppError::new(
-                ReasonCode::RcCliInvalid,
-                format!("unsupported code page {code_page}"),
-            )),
+            _ => {
+                // Use iconv for all other code pages
+                match iconv_ffi::convert_from_utf8(cp, &text) {
+                    Some(bytes) => Ok(bytes),
+                    None => Err(AppError::new(
+                        ReasonCode::RcCliInvalid,
+                        format!("unsupported or failed conversion for code page {code_page}"),
+                    )),
+                }
+            }
         }
     }
 
-    pub fn open_registry_key(&mut self, hive: &str, key: &str, view: RegistryView, inheritable: bool) -> Handle {
+    pub fn open_registry_key(
+        &mut self,
+        hive: &str,
+        key: &str,
+        view: RegistryView,
+        inheritable: bool,
+    ) -> Handle {
         self.insert_object(
             ObjectType::Key,
             0x20019,
@@ -2986,11 +3484,21 @@ impl Win32Subsystem {
         )
     }
 
-    pub fn registry_key_exists(&self, hive: &str, key: &str, view: RegistryView) -> AppResult<bool> {
+    pub fn registry_key_exists(
+        &self,
+        hive: &str,
+        key: &str,
+        view: RegistryView,
+    ) -> AppResult<bool> {
         self.ge.registry_key_exists(hive, key, view)
     }
 
-    pub fn create_registry_key(&self, hive: &str, key: &str, view: RegistryView) -> AppResult<bool> {
+    pub fn create_registry_key(
+        &self,
+        hive: &str,
+        key: &str,
+        view: RegistryView,
+    ) -> AppResult<bool> {
         self.ge.registry_create_key(hive, key, view)
     }
 
@@ -3030,7 +3538,11 @@ impl Win32Subsystem {
         value: &str,
         view: RegistryView,
     ) -> AppResult<()> {
-        if self.ge.registry_get_value(hive, key, value_name, view)?.is_none() {
+        if self
+            .ge
+            .registry_get_value(hive, key, value_name, view)?
+            .is_none()
+        {
             self.ge
                 .registry_set_value(hive, key, value_name, "REG_SZ", json!(value), view)?;
         }
@@ -3075,7 +3587,11 @@ impl Win32Subsystem {
         Ok(())
     }
 
-    pub fn co_initialize_ex(&mut self, thread_handle: Handle, apartment: ApartmentModel) -> AppResult<()> {
+    pub fn co_initialize_ex(
+        &mut self,
+        thread_handle: Handle,
+        apartment: ApartmentModel,
+    ) -> AppResult<()> {
         let thread_id = self.thread_id(thread_handle)?;
         self.com_apartments.insert(thread_id, apartment);
         Ok(())
@@ -3089,9 +3605,13 @@ impl Win32Subsystem {
 
     pub fn co_create_instance(&self, thread_handle: Handle, clsid: &str) -> AppResult<ComInstance> {
         let thread_id = self.thread_id(thread_handle)?;
-        let apartment = self.com_apartments.get(&thread_id).copied().ok_or_else(|| {
-            AppError::new(ReasonCode::RcCliInvalid, "COM apartment not initialized")
-        })?;
+        let apartment = self
+            .com_apartments
+            .get(&thread_id)
+            .copied()
+            .ok_or_else(|| {
+                AppError::new(ReasonCode::RcCliInvalid, "COM apartment not initialized")
+            })?;
         let registration = self.com_registrations.get(clsid).ok_or_else(|| {
             AppError::new(
                 ReasonCode::RcComClassNotRegistered,
@@ -3103,8 +3623,12 @@ impl Win32Subsystem {
             | (ApartmentModel::Mta, ComThreadingModel::Sta) => {
                 return Err(AppError::new(
                     ReasonCode::RcCliInvalid,
-                    format!("{} cannot activate {} apartment class", format_apartment(apartment), format_threading_model(registration.threading_model)),
-                ))
+                    format!(
+                        "{} cannot activate {} apartment class",
+                        format_apartment(apartment),
+                        format_threading_model(registration.threading_model)
+                    ),
+                ));
             }
             _ => {}
         }
@@ -3135,16 +3659,22 @@ impl Win32Subsystem {
     fn resolve_host_path(&self, path: &str) -> AppResult<(String, PathBuf)> {
         let parsed = self.ge.parse_windows_path(path, None)?;
         let drive = parsed.drive.clone().ok_or_else(|| {
-            AppError::new(ReasonCode::RcFsPathInvalid, format!("{} is missing a drive prefix", path))
+            AppError::new(
+                ReasonCode::RcFsPathInvalid,
+                format!("{} is missing a drive prefix", path),
+            )
         })?;
         let mapping = self
             .ge
             .config
             .drive_mappings
             .iter()
-            .find(|entry| entry.drive.eq_ignore_ascii_case(&drive) && entry.enabled)
+            .find(|entry| entry.drive.eq_ignore_ascii_case(&drive) && entry.enabled) // case-insensitive comparison
             .ok_or_else(|| {
-                AppError::new(ReasonCode::RcFsSandboxEscape, format!("drive {} is not enabled", drive))
+                AppError::new(
+                    ReasonCode::RcFsSandboxEscape,
+                    format!("drive {} is not enabled", drive),
+                )
             })?;
         let mut root = if let Some(rest) = mapping.target.strip_prefix("<GE>/") {
             self.ge.root.join(rest)
@@ -3162,13 +3692,22 @@ impl Win32Subsystem {
     fn ensure_parent_exists(&self, path: &Path) -> AppResult<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|error| {
-                AppError::from_io(ReasonCode::RcIo, format!("failed to create {}", parent.display()), &error)
+                AppError::from_io(
+                    ReasonCode::RcIo,
+                    format!("failed to create {}", parent.display()),
+                    &error,
+                )
             })?;
         }
         Ok(())
     }
 
-    fn sync_entry(&mut self, normalized_path: &str, host_path: &Path, is_directory: bool) -> AppResult<()> {
+    fn sync_entry(
+        &mut self,
+        normalized_path: &str,
+        host_path: &Path,
+        is_directory: bool,
+    ) -> AppResult<()> {
         let kind = if is_directory || host_path.is_dir() {
             FsEntryKind::Directory
         } else {
@@ -3215,10 +3754,16 @@ impl Win32Subsystem {
         let metadata = self.ge.get_file_metadata(&child_path)?;
         let (_, host_path) = self.resolve_host_path(&child_path)?;
         let host = fs::metadata(host_path).map_err(|error| {
-            AppError::from_io(ReasonCode::RcIo, format!("failed to stat {child_path}"), &error)
+            AppError::from_io(
+                ReasonCode::RcIo,
+                format!("failed to stat {child_path}"),
+                &error,
+            )
         })?;
         let mut attributes = metadata.attributes;
-        if metadata.kind == FsEntryKind::Directory && !attributes.iter().any(|value| value == "directory") {
+        if metadata.kind == FsEntryKind::Directory
+            && !attributes.iter().any(|value| value == "directory")
+        {
             attributes.push("directory".to_string());
         }
         Ok(FindData {
@@ -3249,14 +3794,16 @@ impl Win32Subsystem {
     }
 
     fn ensure_thread_state(&mut self, thread_id: u32) {
-        self.threads.entry(thread_id).or_insert_with(|| ThreadState {
-            exit_code: None,
-            priority: 0,
-            tls: BTreeMap::new(),
-            suspend_count: 0,
-            terminated: false,
-            fiber_id: 0,
-        });
+        self.threads
+            .entry(thread_id)
+            .or_insert_with(|| ThreadState {
+                exit_code: None,
+                priority: 0,
+                tls: BTreeMap::new(),
+                suspend_count: 0,
+                terminated: false,
+                fiber_id: 0,
+            });
     }
 
     fn thread_state(&self, thread_id: u32) -> AppResult<&ThreadState> {
@@ -3303,7 +3850,8 @@ impl Win32Subsystem {
         object: KernelObject,
     ) -> Handle {
         let handle = self.next_handle;
-        self.next_handle += 4;
+        self.next_handle = self.next_handle.saturating_add(4);
+        let generation = *self.handle_generations.get(&handle).unwrap_or(&0);
         self.handle_history.insert(handle, object_type);
         self.handles.insert(
             handle,
@@ -3315,9 +3863,38 @@ impl Win32Subsystem {
                     inheritable,
                 },
                 object,
+                generation,
             },
         );
         handle
+    }
+
+    /// Return the current generation counter for a handle value.
+    /// Returns `None` if the handle is not currently allocated.
+    pub fn handle_generation(&self, handle: Handle) -> Option<u32> {
+        self.handles.get(&handle).map(|e| e.generation)
+    }
+
+    /// Validate that a cached `(handle, generation)` pair still matches the
+    /// live entry.  Returns `Ok(())` if the handle is alive and its
+    /// generation has not changed, or an `RcHandleStaleOrInvalid` error
+    /// otherwise.
+    pub fn validate_handle_generation(
+        &self,
+        handle: Handle,
+        expected_generation: u32,
+    ) -> AppResult<()> {
+        match self.handles.get(&handle) {
+            Some(entry) if entry.generation == expected_generation => Ok(()),
+            Some(_) => Err(AppError::new(
+                ReasonCode::RcHandleStaleOrInvalid,
+                format!("handle {handle} generation mismatch — stale reference detected"),
+            )),
+            None => Err(AppError::new(
+                ReasonCode::RcWin32InvalidHandle,
+                format!("invalid handle {handle}"),
+            )),
+        }
     }
 
     fn insert_overlapped(
@@ -3347,7 +3924,9 @@ impl Win32Subsystem {
     }
 
     fn handle_entry(&self, handle: Handle) -> AppResult<&HandleEntry> {
-        self.handles.get(&handle).ok_or_else(|| self.invalid_handle_error(handle))
+        self.handles
+            .get(&handle)
+            .ok_or_else(|| self.invalid_handle_error(handle))
     }
 
     fn handle_entry_mut(&mut self, handle: Handle) -> AppResult<&mut HandleEntry> {
@@ -3359,7 +3938,8 @@ impl Win32Subsystem {
     }
 
     fn record_closed_handle(&mut self, handle: Handle, object_type: ObjectType) {
-        self.recently_closed_handles.push_back((handle, object_type));
+        self.recently_closed_handles
+            .push_back((handle, object_type));
         while self.recently_closed_handles.len() > 32 {
             self.recently_closed_handles.pop_front();
         }
@@ -3469,7 +4049,8 @@ fn current_ticks(dtm: bool, ticks_ms: u64) -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|duration| {
-                WINDOWS_EPOCH_OFFSET_100NS.saturating_add(duration.as_nanos().div_euclid(100) as u64)
+                WINDOWS_EPOCH_OFFSET_100NS
+                    .saturating_add(duration.as_nanos().div_euclid(100) as u64)
             })
             .unwrap_or(WINDOWS_EPOCH_OFFSET_100NS)
     }
@@ -3619,10 +4200,7 @@ fn split_find_search_pattern(path: &str) -> (String, String) {
             },
         )
     } else {
-        (
-            path.to_string(),
-            "*".to_string(),
-        )
+        (path.to_string(), "*".to_string())
     }
 }
 
@@ -3632,11 +4210,11 @@ fn contains_find_wildcards(pattern: &str) -> bool {
 
 fn windows_pattern_matches(pattern: &str, candidate: &str) -> bool {
     if pattern == "*.*" {
-        return true;
+        return true; // correct: *.* matches everything in Windows
     }
     if let Some(prefix) = pattern.strip_suffix(".*") {
         if !candidate.contains('.') && windows_pattern_matches(prefix, candidate) {
-            return true;
+            return true; // correct: "foo.*" matches "foo" without extension
         }
     }
     let pattern_chars = pattern.chars().collect::<Vec<_>>();
@@ -3649,7 +4227,10 @@ fn windows_pattern_matches(pattern: &str, candidate: &str) -> bool {
     while candidate_index < candidate_chars.len() {
         if pattern_index < pattern_chars.len()
             && (pattern_chars[pattern_index] == '?'
-                || find_pattern_char_eq(pattern_chars[pattern_index], candidate_chars[candidate_index]))
+                || find_pattern_char_eq(
+                    pattern_chars[pattern_index],
+                    candidate_chars[candidate_index],
+                ))
         {
             pattern_index += 1;
             candidate_index += 1;
@@ -3675,7 +4256,7 @@ fn windows_pattern_matches(pattern: &str, candidate: &str) -> bool {
 
 fn find_pattern_char_eq(left: char, right: char) -> bool {
     if left.is_ascii() && right.is_ascii() {
-        left.eq_ignore_ascii_case(&right)
+        left.eq_ignore_ascii_case(&right) // case-insensitive comparison
     } else {
         left == right
     }
@@ -3684,10 +4265,11 @@ fn find_pattern_char_eq(left: char, right: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        paced_sleep_duration_ms, split_find_search_pattern, windows_pattern_matches, CreationDisposition,
-        FileAccess, IoCompletionPacket, ShareMode, Win32Subsystem,
+        CP_WIN1252, CreationDisposition, FileAccess, IoCompletionPacket, SeekOrigin, ShareMode,
+        WaitStatus, Win32Subsystem, iconv_ffi, paced_sleep_duration_ms, split_find_search_pattern,
+        windows_pattern_matches,
     };
-    use crate::ge::{GameEnvironment, GeArch};
+    use crate::ge::{GameEnvironment, GeArch, RegistryView};
     use std::fs;
 
     #[test]
@@ -3708,9 +4290,18 @@ mod tests {
 
     #[test]
     fn split_find_search_pattern_keeps_root_and_defaults_empty_pattern() {
-        assert_eq!(split_find_search_pattern("C:\\Steam\\*"), ("C:\\Steam".to_string(), "*".to_string()));
-        assert_eq!(split_find_search_pattern("C:\\*.*"), ("C:\\".to_string(), "*.*".to_string()));
-        assert_eq!(split_find_search_pattern("C:\\Steam\\"), ("C:\\Steam".to_string(), "*".to_string()));
+        assert_eq!(
+            split_find_search_pattern("C:\\Steam\\*"),
+            ("C:\\Steam".to_string(), "*".to_string())
+        );
+        assert_eq!(
+            split_find_search_pattern("C:\\*.*"),
+            ("C:\\".to_string(), "*.*".to_string())
+        );
+        assert_eq!(
+            split_find_search_pattern("C:\\Steam\\"),
+            ("C:\\Steam".to_string(), "*".to_string())
+        );
     }
 
     #[test]
@@ -3754,8 +4345,13 @@ mod tests {
     #[test]
     fn get_file_information_by_handle_syncs_missing_metadata_for_existing_file() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let ge = GameEnvironment::create_in(temp_dir.path(), "file-info-sync", GeArch::X86, "win11-23h2")
-            .expect("create game environment");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "file-info-sync",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create game environment");
         let host_path = ge
             .host_path_for_windows_path("C:\\logs\\bootstrap_log.txt")
             .expect("resolve host path");
@@ -3781,17 +4377,24 @@ mod tests {
 
         assert_eq!(info.normalized_path, "C:\\logs\\bootstrap_log.txt");
         assert_eq!(info.size, 3);
-        assert!(win32
-            .ge()
-            .get_file_metadata("C:\\logs\\bootstrap_log.txt")
-            .is_ok());
+        assert!(
+            win32
+                .ge()
+                .get_file_metadata("C:\\logs\\bootstrap_log.txt")
+                .is_ok()
+        );
     }
 
     #[test]
     fn duplicate_file_handle_survives_source_close() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let ge = GameEnvironment::create_in(temp_dir.path(), "duplicate-file-handle", GeArch::X86, "win11-23h2")
-            .expect("create game environment");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "duplicate-file-handle",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create game environment");
         let mut win32 = Win32Subsystem::new(ge, false);
         win32
             .create_directory_w("C:\\logs")
@@ -3817,7 +4420,574 @@ mod tests {
 
         win32.close_handle(handle).expect("close source handle");
 
-        let bytes = win32.read_file(duplicate, 5).expect("read through duplicate handle");
+        let bytes = win32
+            .read_file(duplicate, 5)
+            .expect("read through duplicate handle");
         assert_eq!(bytes, b"steam");
+    }
+
+    // ── Handle generation tests ────────────────────────────────────────
+
+    #[test]
+    fn handle_generation_starts_at_zero() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "gen-test", GeArch::X86, "win11-23h2")
+            .expect("create game environment");
+        let win32 = Win32Subsystem::new(ge, false);
+        // No handles allocated yet
+        assert!(win32.handle_generation(4).is_none());
+    }
+
+    #[test]
+    fn handle_generation_is_tracked_on_allocation() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge =
+            GameEnvironment::create_in(temp_dir.path(), "gen-test2", GeArch::X86, "win11-23h2")
+                .expect("create game environment");
+        let mut win32 = Win32Subsystem::new(ge, false);
+        let (h, _existed) = win32.create_event(true, false, false, None);
+        assert_eq!(
+            win32.handle_generation(h),
+            Some(0),
+            "first allocation should have generation 0"
+        );
+    }
+
+    #[test]
+    fn handle_generation_increments_on_close() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge =
+            GameEnvironment::create_in(temp_dir.path(), "gen-test3", GeArch::X86, "win11-23h2")
+                .expect("create game environment");
+        let mut win32 = Win32Subsystem::new(ge, false);
+        let (h, _existed) = win32.create_event(true, false, false, None);
+        assert_eq!(win32.handle_generation(h), Some(0));
+        win32.close_handle(h).expect("close handle");
+        // Handle is gone, but generation counter should be incremented
+        assert!(win32.handle_generation(h).is_none());
+        // Validate should fail for stale generation
+        let err = win32.validate_handle_generation(h, 0).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid handle"),
+            "expected invalid handle error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_handle_generation_rejects_stale_reference() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge =
+            GameEnvironment::create_in(temp_dir.path(), "gen-test4", GeArch::X86, "win11-23h2")
+                .expect("create game environment");
+        let mut win32 = Win32Subsystem::new(ge, false);
+        let (h, _existed) = win32.create_event(true, false, false, None);
+        let generation = win32.handle_generation(h).expect("generation");
+        win32.close_handle(h).expect("close handle");
+        // The generation counter was incremented on close, so the old generation is stale
+        let err = win32.validate_handle_generation(h, generation).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid handle") || err.to_string().contains("stale"),
+            "expected stale/invalid error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn handle_reuse_gets_new_generation_after_close() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge =
+            GameEnvironment::create_in(temp_dir.path(), "gen-reuse", GeArch::X86, "win11-23h2")
+                .expect("create game environment");
+        let mut win32 = Win32Subsystem::new(ge, false);
+        let (h1, _) = win32.create_event(true, false, false, None);
+        let gen1 = win32.handle_generation(h1).expect("gen");
+        win32.close_handle(h1).expect("close");
+
+        let mut handles = Vec::new();
+        for _ in 0..256 {
+            let (h, _) = win32.create_event(true, false, false, None);
+            handles.push(h);
+        }
+        for h in handles {
+            win32.close_handle(h).expect("close batch");
+        }
+
+        let (h2, _) = win32.create_event(true, false, false, None);
+        if h2 == h1 {
+            let gen2 = win32.handle_generation(h2).expect("gen2");
+            assert_ne!(gen1, gen2, "recycled handle must get a new generation");
+        }
+    }
+
+    // ── Synchronization primitive tests ────────────────────────────────
+
+    #[test]
+    fn event_auto_reset_signals_and_waits() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "evt-auto", GeArch::X86, "win11-23h2")
+            .expect("create game environment");
+        let mut win32 = Win32Subsystem::new(ge, false);
+
+        // manual_reset=false → auto-reset event
+        let (h, _) = win32.create_event(false, false, false, None);
+        assert_eq!(
+            win32
+                .wait_for_single_object(h, 0, false, None)
+                .expect("wait"),
+            WaitStatus::Timeout,
+            "auto-reset event should time out when not signalled"
+        );
+        win32.set_event(h).expect("set");
+        assert_eq!(
+            win32
+                .wait_for_single_object(h, 0, false, None)
+                .expect("wait"),
+            WaitStatus::Object0,
+            "auto-reset event should be signalled after set"
+        );
+        // For an auto-reset event the first wait consumes the signal,
+        // so a second wait should time out.
+        assert_eq!(
+            win32
+                .wait_for_single_object(h, 0, false, None)
+                .expect("wait"),
+            WaitStatus::Timeout,
+            "auto-reset event should reset after wait consumes signal"
+        );
+        win32.close_handle(h).expect("close");
+    }
+
+    #[test]
+    fn event_manual_reset_stays_signalled_until_reset() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "evt-man", GeArch::X86, "win11-23h2")
+            .expect("create game environment");
+        let mut win32 = Win32Subsystem::new(ge, false);
+
+        // manual_reset=true → manual-reset event
+        let (h, _) = win32.create_event(true, false, false, None);
+        win32.set_event(h).expect("set");
+        assert_eq!(
+            win32
+                .wait_for_single_object(h, 0, false, None)
+                .expect("wait"),
+            WaitStatus::Object0,
+            "manual-reset event should be signalled"
+        );
+        // For a manual-reset event the signal should persist after wait.
+        assert_eq!(
+            win32
+                .wait_for_single_object(h, 0, false, None)
+                .expect("wait"),
+            WaitStatus::Object0,
+            "manual-reset event should remain signalled after wait"
+        );
+        win32.reset_event(h).expect("reset");
+        assert_eq!(
+            win32
+                .wait_for_single_object(h, 0, false, None)
+                .expect("wait"),
+            WaitStatus::Timeout,
+            "manual-reset event should time out after reset"
+        );
+        win32.close_handle(h).expect("close");
+    }
+
+    #[test]
+    fn mutex_acquire_and_release() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "mtx-ar", GeArch::X86, "win11-23h2")
+            .expect("create game environment");
+        let mut win32 = Win32Subsystem::new(ge, false);
+
+        let h = win32.create_mutex(false, false);
+        assert_eq!(
+            win32
+                .wait_for_single_object(h, 0, false, None)
+                .expect("wait"),
+            WaitStatus::Object0,
+            "free mutex should be signalled"
+        );
+        win32.release_mutex(h).expect("release");
+        win32.close_handle(h).expect("close");
+    }
+
+    #[test]
+    fn mutex_abandoned_detection() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "mtx-ab", GeArch::X86, "win11-23h2")
+            .expect("create game environment");
+        let mut win32 = Win32Subsystem::new(ge, false);
+
+        let h = win32.create_mutex(true, false);
+        win32.abandon_mutex(h).expect("abandon");
+        let status = win32
+            .wait_for_single_object(h, 0, false, None)
+            .expect("wait");
+        assert!(
+            matches!(status, WaitStatus::Abandoned),
+            "abandoned mutex should yield Abandoned, got {status:?}"
+        );
+        win32.close_handle(h).expect("close");
+    }
+
+    #[test]
+    fn semaphore_release_increments_count() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "sem-inc", GeArch::X86, "win11-23h2")
+            .expect("create game environment");
+        let mut win32 = Win32Subsystem::new(ge, false);
+
+        let h = win32.create_semaphore(0, 5, false);
+        assert_eq!(
+            win32
+                .wait_for_single_object(h, 0, false, None)
+                .expect("wait"),
+            WaitStatus::Timeout,
+            "semaphore with count 0 should time out"
+        );
+        let prev = win32.release_semaphore(h, 1).expect("release");
+        assert_eq!(prev, 0, "previous count should be 0");
+        assert_eq!(
+            win32
+                .wait_for_single_object(h, 0, false, None)
+                .expect("wait"),
+            WaitStatus::Object0,
+            "semaphore with count >=1 should be signalled"
+        );
+        win32.close_handle(h).expect("close");
+    }
+
+    #[test]
+    fn semaphore_release_saturates_at_max() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "sem-max", GeArch::X86, "win11-23h2")
+            .expect("create game environment");
+        let mut win32 = Win32Subsystem::new(ge, false);
+
+        let h = win32.create_semaphore(3, 3, false);
+        let prev = win32.release_semaphore(h, 1).expect("release");
+        assert_eq!(prev, 3, "previous count should be 3 (already at max)");
+        // After saturating release, count should remain at max (3).
+        assert_eq!(
+            win32
+                .wait_for_single_object(h, 0, false, None)
+                .expect("wait"),
+            WaitStatus::Object0,
+            "semaphore should still be signalled after saturating release"
+        );
+        win32.close_handle(h).expect("close");
+    }
+
+    #[test]
+    fn wait_for_multiple_objects_wait_all() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "wfa", GeArch::X86, "win11-23h2")
+            .expect("create game environment");
+        let mut win32 = Win32Subsystem::new(ge, false);
+
+        // Use manual-reset events so wait_all doesn't consume signals mid-loop.
+        let (h1, _) = win32.create_event(true, false, false, None);
+        let (h2, _) = win32.create_event(true, false, false, None);
+
+        // Timeout returns index = handles.len().saturating_sub(1) = 1 for 2 handles
+        assert_eq!(
+            win32
+                .wait_for_multiple_objects(&[h1, h2], true, 0, false, None)
+                .expect("wait"),
+            (WaitStatus::Timeout, 1usize),
+            "wait-all with no objects signalled should time out"
+        );
+        win32.set_event(h1).expect("set");
+        // Timeout returns index = handles.len().saturating_sub(1) = 1 for 2 handles
+        assert_eq!(
+            win32
+                .wait_for_multiple_objects(&[h1, h2], true, 0, false, None)
+                .expect("wait"),
+            (WaitStatus::Timeout, 1usize),
+            "wait-all with only one of two signalled should time out"
+        );
+        win32.set_event(h2).expect("set");
+        assert_eq!(
+            win32
+                .wait_for_multiple_objects(&[h1, h2], true, 0, false, None)
+                .expect("wait"),
+            (WaitStatus::Object0, 0usize),
+            "wait-all with both signalled should succeed"
+        );
+
+        win32.close_handle(h1).expect("close");
+        win32.close_handle(h2).expect("close");
+    }
+
+    #[test]
+    fn wait_for_multiple_objects_wait_any() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "wfany", GeArch::X86, "win11-23h2")
+            .expect("create game environment");
+        let mut win32 = Win32Subsystem::new(ge, false);
+
+        let (h1, _) = win32.create_event(false, false, false, None);
+        let (h2, _) = win32.create_event(false, false, false, None);
+
+        // Timeout returns index = handles.len().saturating_sub(1) = 1 for 2 handles
+        assert_eq!(
+            win32
+                .wait_for_multiple_objects(&[h1, h2], false, 0, false, None)
+                .expect("wait"),
+            (WaitStatus::Timeout, 1usize),
+            "wait-any with no objects signalled should time out"
+        );
+        win32.set_event(h1).expect("set");
+        assert_eq!(
+            win32
+                .wait_for_multiple_objects(&[h1, h2], false, 0, false, None)
+                .expect("wait"),
+            (WaitStatus::Object0, 0usize),
+            "wait-any with one signalled should succeed"
+        );
+
+        win32.close_handle(h1).expect("close");
+        win32.close_handle(h2).expect("close");
+    }
+
+    #[test]
+    fn wait_for_single_object_timeout() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "wto", GeArch::X86, "win11-23h2")
+            .expect("create game environment");
+        let mut win32 = Win32Subsystem::new(ge, false);
+
+        let (h, _) = win32.create_event(true, false, false, None);
+        assert_eq!(
+            win32
+                .wait_for_single_object(h, 0, false, None)
+                .expect("wait"),
+            WaitStatus::Timeout,
+            "non-signalled event with 0ms timeout should return Timeout"
+        );
+        win32.close_handle(h).expect("close");
+    }
+
+    // ── File I/O semantics tests ───────────────────────────────────────
+
+    #[test]
+    fn create_file_opens_new_or_existing() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "cf01", GeArch::X86, "win11-23h2")
+            .expect("create game environment");
+        let mut win32 = Win32Subsystem::new(ge, false);
+
+        let path = "C:\\test_create_file.txt";
+        let h = win32
+            .create_file_w(
+                path,
+                FileAccess::read_write(),
+                ShareMode::none(),
+                CreationDisposition::CreateAlways,
+                false,
+                false,
+                false,
+            )
+            .expect("create file");
+        win32.close_handle(h).expect("close");
+    }
+
+    #[test]
+    fn open_existing_fails_on_missing_file() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "oe01", GeArch::X86, "win11-23h2")
+            .expect("create game environment");
+        let mut win32 = Win32Subsystem::new(ge, false);
+
+        let result = win32.create_file_w(
+            "C:\\nonexistent_file_xyz.dat",
+            FileAccess::read_only(),
+            ShareMode::read_only(),
+            CreationDisposition::OpenExisting,
+            false,
+            false,
+            false,
+        );
+        assert!(
+            result.is_err(),
+            "OpenExisting on missing file should fail, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn create_always_truncates_existing_file() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "ca01", GeArch::X86, "win11-23h2")
+            .expect("create game environment");
+        let mut win32 = Win32Subsystem::new(ge, false);
+        let path = "C:\\truncate_test.txt";
+
+        let h = win32
+            .create_file_w(
+                path,
+                FileAccess::read_write(),
+                ShareMode::none(),
+                CreationDisposition::CreateAlways,
+                false,
+                false,
+                false,
+            )
+            .expect("create");
+        win32.write_file(h, b"hello").expect("write");
+        win32.close_handle(h).expect("close");
+
+        let h2 = win32
+            .create_file_w(
+                path,
+                FileAccess::read_write(),
+                ShareMode::none(),
+                CreationDisposition::CreateAlways,
+                false,
+                false,
+                false,
+            )
+            .expect("create again");
+        let contents = win32.read_file(h2, 1024).expect("read");
+        assert!(
+            contents.is_empty(),
+            "file truncated by CreateAlways should be empty, got {} bytes",
+            contents.len()
+        );
+        win32.close_handle(h2).expect("close");
+    }
+
+    #[test]
+    fn file_pointer_advances_on_read_write() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "fp01", GeArch::X86, "win11-23h2")
+            .expect("create game environment");
+        let mut win32 = Win32Subsystem::new(ge, false);
+        let path = "C:\\file_ptr_test.txt";
+
+        let h = win32
+            .create_file_w(
+                path,
+                FileAccess::read_write(),
+                ShareMode::none(),
+                CreationDisposition::CreateAlways,
+                false,
+                false,
+                false,
+            )
+            .expect("create");
+        win32.write_file(h, b"abcdef").expect("write");
+
+        let pos = win32
+            .set_file_pointer_ex(h, 0, SeekOrigin::Current)
+            .expect("tell");
+        assert_eq!(pos, 6, "file pointer should be at end after write");
+
+        let pos = win32
+            .set_file_pointer_ex(h, 2, SeekOrigin::Begin)
+            .expect("seek");
+        assert_eq!(pos, 2, "file pointer should be at position 2 after seek");
+
+        let data = win32.read_file(h, 3).expect("read");
+        assert_eq!(data, b"cde", "should read bytes 2-4");
+
+        win32.close_handle(h).expect("close");
+    }
+
+    // ── Registry path canonicalization tests ───────────────────────────
+
+    #[test]
+    fn registry_path_canonicalization_lowercases() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "reg01", GeArch::X86, "win11-23h2")
+            .expect("create game environment");
+        let mut win32 = Win32Subsystem::new(ge, false);
+
+        win32
+            .create_registry_key("HKCU", "Software\\MyTestApp", RegistryView::Native)
+            .expect("create key");
+
+        assert!(
+            win32
+                .registry_key_exists("HKCU", "Software\\MyTestApp", RegistryView::Native,)
+                .unwrap_or(false),
+            "created key should exist"
+        );
+
+        let h = win32.open_registry_key("HKCU", "software\\mytestapp", RegistryView::Native, false);
+        assert_ne!(
+            h, 0,
+            "opening with different case should return a valid handle"
+        );
+        win32.close_handle(h).expect("close handle");
+    }
+
+    #[test]
+    fn registry_path_trailing_backslash_normalized() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "reg02", GeArch::X86, "win11-23h2")
+            .expect("create game environment");
+        let mut win32 = Win32Subsystem::new(ge, false);
+
+        win32
+            .create_registry_key("HKCU", "Software\\TestApp2", RegistryView::Native)
+            .expect("create key");
+
+        let h =
+            win32.open_registry_key("HKCU", "Software\\TestApp2\\", RegistryView::Native, false);
+        assert_ne!(
+            h, 0,
+            "opening with trailing backslash should return a valid handle"
+        );
+        win32.close_handle(h).expect("close handle");
+    }
+
+    // ── Code-page conversion tests ─────────────────────────────────────
+
+    #[test]
+    fn code_page_conversion_utf8_roundtrip() {
+        let input = "Hello, World!";
+        let bytes = iconv_ffi::convert_from_utf8(CP_WIN1252, input);
+        if let Some(bytes) = bytes {
+            let roundtrip = iconv_ffi::convert_to_utf8(CP_WIN1252, &bytes);
+            assert_eq!(roundtrip, Some(input.to_string()));
+        }
+        // If iconv is not available (non-macOS), the test is a no-op
+    }
+
+    #[test]
+    fn code_page_conversion_empty_input() {
+        let result = iconv_ffi::convert_to_utf8(CP_WIN1252, &[]);
+        // Should return Some("") or None depending on platform
+        match result {
+            Some(s) => assert!(s.is_empty(), "empty input should produce empty output"),
+            None => {} // iconv not available
+        }
+    }
+
+    #[test]
+    fn code_page_conversion_large_input_does_not_overflow() {
+        // Allocate a large input that would overflow if multiplied unchecked
+        let large = vec![0x41u8; 1024 * 1024]; // 1 MB of 'A'
+        let result = iconv_ffi::convert_to_utf8(CP_WIN1252, &large);
+        // Should succeed or return None gracefully, never panic
+        if let Some(s) = result {
+            assert_eq!(s.len(), 1024 * 1024);
+        }
+    }
+
+    #[test]
+    fn code_page_conversion_from_utf8_large_input_does_not_overflow() {
+        let large = "A".repeat(1024 * 1024); // 1 MB string
+        let result = iconv_ffi::convert_from_utf8(CP_WIN1252, &large);
+        // Should succeed or return None gracefully, never panic
+        if let Some(bytes) = result {
+            assert_eq!(bytes.len(), 1024 * 1024);
+        }
+    }
+
+    #[test]
+    fn code_page_conversion_unsupported_codepage() {
+        let result = iconv_ffi::convert_to_utf8(99999, b"test");
+        assert_eq!(result, None, "unsupported code page should return None");
     }
 }

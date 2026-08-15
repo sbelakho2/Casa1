@@ -8,8 +8,8 @@
 use casa1::cpu::MemoryImage;
 use casa1::d3d12::D3d12Runtime;
 use casa1::diagnostics::{
-    compare_frames, compute_pixel_diff, compute_psnr, compute_ssim, BehavioralTestStep,
-    BehavioralVerifier, FrameCapture, StressTestConfig, StressTestRunner,
+    BehavioralTestStep, BehavioralVerifier, FrameCapture, StressTestConfig, StressTestRunner,
+    compare_frames, compute_pixel_diff, compute_psnr, compute_ssim,
 };
 use casa1::gfx::{
     DescriptorHeapType, DxgiFormat, HeapType, PipelineStateDesc, ResourceDesc, ResourceState,
@@ -53,10 +53,7 @@ fn t22_1_shader_translation_conformance() {
         msl_source.contains("#include <metal_stdlib>"),
         "MSL output should include metal_stdlib"
     );
-    assert!(
-        !msl_source.is_empty(),
-        "MSL source should not be empty"
-    );
+    assert!(!msl_source.is_empty(), "MSL source should not be empty");
 
     // Test HLSL intrinsic translation
     use casa1::shader_compiler::translate_hlsl_intrinsic;
@@ -170,7 +167,9 @@ fn t22_2_metal_backend_resource_tracking() {
 
     // Destroy all resources
     for resource in &resources {
-        runtime.destroy_resource(*resource).expect("destroy resource");
+        runtime
+            .destroy_resource(*resource)
+            .expect("destroy resource");
     }
 
     // After destroying all resources, verify the heap still exists
@@ -263,7 +262,10 @@ fn t22_4_drm_denuvo_integrity() {
     let integrity_ok = emulator
         .verify_integrity(&memory, 0)
         .expect("verify integrity");
-    assert!(integrity_ok, "integrity check should pass on unmodified code");
+    assert!(
+        integrity_ok,
+        "integrity check should pass on unmodified code"
+    );
 
     assert_eq!(
         emulator.integrity_checks_passed, 1,
@@ -277,7 +279,10 @@ fn t22_4_drm_denuvo_integrity() {
     // Verify the license token
     let valid = emulator.verify_license_token(&token);
     assert!(valid, "license token should be valid");
-    assert!(emulator.license_verified, "license should be verified after verification");
+    assert!(
+        emulator.license_verified,
+        "license should be verified after verification"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -327,16 +332,22 @@ fn t22_5_drm_steamstub_decrypt() {
     memory.map_bytes(code_addr, &encrypted_code);
 
     // Detect Steamstub header
-    let header = SteamstubLoader::detect_steamstub(&memory, base_addr)
-        .expect("detect steamstub");
+    let header = SteamstubLoader::detect_steamstub(&memory, base_addr).expect("detect steamstub");
 
     assert!(header.is_some(), "Steamstub header should be detected");
 
     let header = header.unwrap();
     assert_eq!(header.magic, 0x53545542, "magic should be STUB");
     assert_eq!(header.app_id, 12345, "app_id should match");
-    assert_eq!(header.encryption_type, EncryptionType::Xor, "should use XOR encryption");
-    assert_eq!(header.code_section_size, 128, "code section size should match");
+    assert_eq!(
+        header.encryption_type,
+        EncryptionType::Xor,
+        "should use XOR encryption"
+    );
+    assert_eq!(
+        header.code_section_size, 128,
+        "code section size should match"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -431,15 +442,13 @@ fn t22_7_steam_protocol_stack() {
     };
 
     let serialized = serialize_message(&msg);
-    assert!(!serialized.is_empty(), "serialized message should not be empty");
+    assert!(
+        !serialized.is_empty(),
+        "serialized message should not be empty"
+    );
 
     // Verify the serialized data starts with the Steam magic
-    let magic = u32::from_le_bytes([
-        serialized[0],
-        serialized[1],
-        serialized[2],
-        serialized[3],
-    ]);
+    let magic = u32::from_le_bytes([serialized[0], serialized[1], serialized[2], serialized[3]]);
     assert_eq!(magic, 0x31305356, "should start with Steam magic 'VS01'");
 
     // Disconnect should succeed
@@ -464,7 +473,11 @@ fn t22_8_performance_optimizations() {
     let addr = 0x1000u64;
     for _ in 0..9 {
         let tier = profiler.record_execution(addr, 10);
-        assert_eq!(tier, casa1::perf::CompilationTier::Uncompiled, "should be uncompiled below hot threshold");
+        assert_eq!(
+            tier,
+            casa1::perf::CompilationTier::Uncompiled,
+            "should be uncompiled below hot threshold"
+        );
     }
 
     // 10th execution should trigger baseline
@@ -496,9 +509,7 @@ fn t22_8_performance_optimizations() {
     assert_eq!(misses, 1, "should have 1 miss");
 
     // Insert and then hit
-    cache
-        .insert("test.dat", vec![1, 2, 3, 4])
-        .expect("insert");
+    cache.insert("test.dat", vec![1, 2, 3, 4]).expect("insert");
     assert!(cache.get("test.dat").is_some(), "cache hit");
     let (hits, misses, _) = cache.stats();
     assert_eq!(hits, 1, "should have 1 hit");
@@ -512,17 +523,25 @@ fn t22_8_performance_optimizations() {
     assert_eq!(chaining.block_count(), 2, "should have 2 blocks");
 
     // Record execution to set fallthrough target
-    chaining.record_execution(0x1000, 0x2000).expect("record execution");
+    chaining
+        .record_execution(0x1000, 0x2000)
+        .expect("record execution");
 
     // Execute 10+ times to make it hot
     for _ in 0..10 {
-        chaining.record_execution(0x1000, 0x2000).expect("record execution");
+        chaining
+            .record_execution(0x1000, 0x2000)
+            .expect("record execution");
     }
 
     // Try to chain
     let chained = chaining.try_chain(0x1000);
     assert!(chained, "block should be chained after 10+ executions");
-    assert_eq!(chaining.active_chain_count(), 1, "should have 1 active chain");
+    assert_eq!(
+        chaining.active_chain_count(),
+        1,
+        "should have 1 active chain"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -554,7 +573,10 @@ fn t22_9_visual_fidelity_ssim() {
 
     // Pixel diff of identical frames should be 100% match
     let (matching, total) = compute_pixel_diff(&frame_a.pixels, &frame_b.pixels, 0.0);
-    assert_eq!(matching, total, "all pixels should match for identical frames");
+    assert_eq!(
+        matching, total,
+        "all pixels should match for identical frames"
+    );
 
     // Create a slightly different frame
     let frame_c = FrameCapture::new_solid(width, height, 130, 66, 34, 255);
@@ -576,7 +598,10 @@ fn t22_9_visual_fidelity_ssim() {
     // Compare using compare_frames
     let result = compare_frames(&frame_a, &frame_a, 0.0);
     assert!(result.passes, "identical frames should pass comparison");
-    assert!(result.ssim >= 0.99, "SSIM should be near 1.0 for identical frames");
+    assert!(
+        result.ssim >= 0.99,
+        "SSIM should be near 1.0 for identical frames"
+    );
 
     // Compare with tolerance
     let result_with_tolerance = compare_frames(&frame_a, &frame_c, 0.05);
@@ -620,10 +645,7 @@ fn t22_10_stress_memory_leak_detection() {
         !result.memory_leak_detected,
         "no memory leak should be detected with stable allocator"
     );
-    assert_eq!(
-        result.iterations, 100,
-        "should run 100 iterations"
-    );
+    assert_eq!(result.iterations, 100, "should run 100 iterations");
 
     // Test network resilience
     let net_result = runner.run_network_resilience_test();
@@ -631,10 +653,7 @@ fn t22_10_stress_memory_leak_detection() {
         net_result.passed,
         "network resilience test should pass on localhost"
     );
-    assert_eq!(
-        net_result.iterations, 10,
-        "should run 10 iterations"
-    );
+    assert_eq!(net_result.iterations, 10, "should run 10 iterations");
 
     // Test multi-game cycling
     let game_result = runner.run_multi_game_cycling_test(&[730, 570, 480]);
@@ -642,10 +661,7 @@ fn t22_10_stress_memory_leak_detection() {
         game_result.passed,
         "multi-game cycling should pass with valid app IDs"
     );
-    assert_eq!(
-        game_result.iterations, 3,
-        "should cycle through 3 games"
-    );
+    assert_eq!(game_result.iterations, 3, "should cycle through 3 games");
 }
 
 // ---------------------------------------------------------------------------
@@ -688,10 +704,7 @@ fn t22_11_behavioral_verification() {
         verifier.all_passed(),
         "all behavioral test steps should pass"
     );
-    assert_eq!(
-        verifier.results.len(), 9,
-        "should have 9 results"
-    );
+    assert_eq!(verifier.results.len(), 9, "should have 9 results");
 
     // Generate summary
     let summary = verifier.summary();
@@ -758,7 +771,7 @@ fn t22_12_end_to_end_integration() {
     // Create command queue, allocator, and list
     let queue = runtime.create_command_queue();
     let allocator = runtime.create_command_allocator();
-    let list = runtime.create_graphics_command_list(allocator, pso);
+    let list = runtime.create_graphics_command_list(allocator, pso, false);
 
     // Record rendering commands
     runtime
@@ -770,7 +783,9 @@ fn t22_12_end_to_end_integration() {
             "store",
         )
         .expect("begin render pass");
-    runtime.record_clear_rtv(list, rtv_heap, 0).expect("clear RTV");
+    runtime
+        .record_clear_rtv(list, rtv_heap, 0)
+        .expect("clear RTV");
     runtime.record_draw(list, 3).expect("draw triangle");
     runtime.end_render_pass(list).expect("end render pass");
 
@@ -783,7 +798,10 @@ fn t22_12_end_to_end_integration() {
 
     // Verify execution
     assert_eq!(plan.render_passes.len(), 1, "should have 1 render pass");
-    assert_eq!(plan.render_passes[0].draw_calls, 1, "should have 1 draw call");
+    assert_eq!(
+        plan.render_passes[0].draw_calls, 1,
+        "should have 1 draw call"
+    );
     assert_eq!(
         runtime.fence_value(fence).expect("fence value"),
         1,
@@ -792,7 +810,10 @@ fn t22_12_end_to_end_integration() {
 
     // Present
     let present = runtime.present(swapchain, 1, false).expect("present");
-    assert_eq!(present.effective_sync_interval, 1, "sync interval should be 1");
+    assert_eq!(
+        present.effective_sync_interval, 1,
+        "sync interval should be 1"
+    );
 
     // Verify visual fidelity infrastructure works alongside rendering
     let frame = FrameCapture::new_solid(1280, 720, 0, 0, 128, 255);

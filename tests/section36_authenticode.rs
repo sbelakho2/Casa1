@@ -9,18 +9,18 @@
 use std::str::FromStr;
 use std::time::Duration;
 
-use casa1::security::{verify_pe_authenticode, AuthenticodeVerdict};
+use casa1::security::{AuthenticodeVerdict, verify_pe_authenticode};
 
+use cms::builder::{SignedDataBuilder, SignerInfoBuilder};
 use cms::cert::{CertificateChoices, IssuerAndSerialNumber};
 use cms::content_info::ContentInfo;
 use cms::signed_data::{EncapsulatedContentInfo, SignerIdentifier};
-use cms::builder::{SignedDataBuilder, SignerInfoBuilder};
 
-use der::{Any, Decode, Encode};
 use der::asn1::ObjectIdentifier;
+use der::{Any, Decode, Encode};
 
-use rand::rngs::StdRng;
 use rand::SeedableRng;
+use rand::rngs::StdRng;
 use rsa::pkcs1v15::SigningKey;
 use rsa::pkcs8::EncodePublicKey;
 use rsa::{RsaPrivateKey, RsaPublicKey};
@@ -148,15 +148,8 @@ fn build_certificate(signer: &SigningKey<Sha256>, private_key: &RsaPrivateKey) -
     let validity = Validity::from_now(Duration::new(3600, 0)).unwrap();
     let subject = Name::from_str("CN=Casa1 Authenticode Test").unwrap();
 
-    let builder = CertificateBuilder::new(
-        Profile::Root,
-        serial,
-        validity,
-        subject,
-        pub_key,
-        signer,
-    )
-    .unwrap();
+    let builder =
+        CertificateBuilder::new(Profile::Root, serial, validity, subject, pub_key, signer).unwrap();
     builder.build().unwrap()
 }
 
@@ -236,7 +229,10 @@ fn authenticode_rejects_tampered_image() {
 fn authenticode_reports_unsigned_image() {
     // A well-formed PE with an empty security data directory is unsigned.
     let pe = build_pe_body();
-    assert_eq!(verify_pe_authenticode(&pe), AuthenticodeVerdict::NoSignature);
+    assert_eq!(
+        verify_pe_authenticode(&pe),
+        AuthenticodeVerdict::NoSignature
+    );
 }
 
 #[test]

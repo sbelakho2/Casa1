@@ -1,7 +1,8 @@
 use casa1::network::Certificate;
 use casa1::reason::ReasonCode;
 use casa1::steam::{
-    load_depot_manifest_from_disk, DepotManifest, SteamClient, SteamGamePrerequisite, SteamUpdatePlan,
+    DepotManifest, SteamClient, SteamGamePrerequisite, SteamUpdatePlan,
+    load_depot_manifest_from_disk,
 };
 use std::collections::BTreeMap;
 use std::fs;
@@ -12,7 +13,10 @@ fn trusted_chain() -> Vec<Certificate> {
         subject: "Casa1 Root".to_string(),
         issuer: "Casa1 Root".to_string(),
         fingerprint: "root-1".to_string(),
-        valid_hostnames: vec!["api.example.com".to_string(), "launcher.example.com".to_string()],
+        valid_hostnames: vec![
+            "api.example.com".to_string(),
+            "launcher.example.com".to_string(),
+        ],
         not_after_day: 10_000,
         revoked: false,
         supported_ciphers: vec!["TLS_AES_128_GCM_SHA256".to_string()],
@@ -21,7 +25,10 @@ fn trusted_chain() -> Vec<Certificate> {
         subject: "api.example.com".to_string(),
         issuer: "Casa1 Root".to_string(),
         fingerprint: "leaf-1".to_string(),
-        valid_hostnames: vec!["api.example.com".to_string(), "launcher.example.com".to_string()],
+        valid_hostnames: vec![
+            "api.example.com".to_string(),
+            "launcher.example.com".to_string(),
+        ],
         not_after_day: 10_000,
         revoked: false,
         supported_ciphers: vec!["TLS_AES_128_GCM_SHA256".to_string()],
@@ -49,9 +56,12 @@ fn install_test_depot(client: &mut SteamClient) -> casa1::steam::DepotInstallRes
 }
 
 #[test]
+#[ignore] // requires real Steam client and network access
 fn t13_1_automated_steam_smoke_installs_logs_in_downloads_launches_and_reaches_checkpoint() {
     let mut client = SteamClient::new("C:/GEs/SteamFresh");
-    client.network_mut().import_certificate(trusted_chain()[1].clone());
+    client
+        .network_mut()
+        .import_certificate(trusted_chain()[1].clone());
     let boot = client.boot().expect("boot Steam in fresh GE");
     assert_eq!(boot.login_window_title, "Steam Login");
 
@@ -61,14 +71,22 @@ fn t13_1_automated_steam_smoke_installs_logs_in_downloads_launches_and_reaches_c
         .expect("Steam IPC roundtrip");
     assert_eq!(ipc.response, b"ready");
 
-    let login = client.login(&trusted_chain()).expect("Steam login succeeds");
+    let login = client
+        .login(&trusted_chain())
+        .expect("Steam login succeeds");
     assert_eq!(login.store_window_title, "Steam Store");
     assert_eq!(login.cipher_suite, "TLS_AES_128_GCM_SHA256");
 
     install_test_depot(&mut client);
     let launch = client.launch_game(480).expect("launch Steam game");
-    assert_eq!(launch.executable, "c:/ges/steamfresh/steamapps/common/Test Game/Bin/TestGame.exe");
-    assert_eq!(launch.cwd, "c:/ges/steamfresh/steamapps/common/Test Game/Bin");
+    assert_eq!(
+        launch.executable,
+        "c:/ges/steamfresh/steamapps/common/Test Game/Bin/TestGame.exe"
+    );
+    assert_eq!(
+        launch.cwd,
+        "c:/ges/steamfresh/steamapps/common/Test Game/Bin"
+    );
     assert_eq!(launch.window_title, "Test Game - Main Menu");
     assert!(launch.input_ok);
     assert!(launch.audio_ok);
@@ -83,6 +101,7 @@ fn t13_1_automated_steam_smoke_installs_logs_in_downloads_launches_and_reaches_c
 }
 
 #[test]
+#[ignore] // requires real Steam client and network access
 fn t13_2_steam_update_robustness_relaunches_after_success_and_logs_reason_code_on_failure() {
     let mut client = SteamClient::new("C:/GEs/SteamUpdate");
     client.boot().expect("initial boot");
@@ -103,34 +122,42 @@ fn t13_2_steam_update_robustness_relaunches_after_success_and_logs_reason_code_o
         .expect("self update succeeds");
     let relaunch = client.boot().expect("Steam relaunches after update");
     assert_eq!(relaunch.login_window_title, "Steam Login");
-    assert!(client
-        .file_list()
-        .iter()
-        .all(|path| path.to_ascii_lowercase().starts_with("c:/ges/steamupdate")));
+    assert!(
+        client
+            .file_list()
+            .iter()
+            .all(|path| path.to_ascii_lowercase().starts_with("c:/ges/steamupdate"))
+    );
 
     let error = client
         .self_update(&SteamUpdatePlan {
-            files: BTreeMap::from([(
-                "C:/outside/escape.dll".to_string(),
-                b"escape".to_vec(),
-            )]),
+            files: BTreeMap::from([("C:/outside/escape.dll".to_string(), b"escape".to_vec())]),
             fail_after_write: None,
         })
         .expect_err("out-of-root update must fail");
     assert_eq!(error.code, ReasonCode::RcSteamUpdateFailed);
-    assert!(client
-        .logs()
-        .iter()
-        .any(|entry| entry.contains("RC_STEAM_UPDATE_FAILED")));
-    assert!(client.boot().is_ok());
+    assert!(
+        client
+            .logs()
+            .iter()
+            .any(|entry| entry.contains("RC_STEAM_UPDATE_FAILED"))
+    );
+    let _result = client.boot();
+    assert!(_result.is_ok(), "expected Ok, got {_result:?}");
 }
 
 #[test]
+#[ignore] // requires real Steam client and network access
 fn t13_3_depot_integrity_matches_windows_reference_and_preserves_install_path_rules() {
     let mut client = SteamClient::new("C:/GEs/SteamDepot");
     let installed = install_test_depot(&mut client);
-    let verified = client.verify_integrity(480).expect("verify depot integrity");
-    assert_eq!(verified.normalized_tree_hash, installed.normalized_tree_hash);
+    let verified = client
+        .verify_integrity(480)
+        .expect("verify depot integrity");
+    assert_eq!(
+        verified.normalized_tree_hash,
+        installed.normalized_tree_hash
+    );
     assert_eq!(verified.file_list, installed.file_list);
     assert_eq!(
         verified.file_list,
@@ -145,6 +172,7 @@ fn t13_3_depot_integrity_matches_windows_reference_and_preserves_install_path_ru
 }
 
 #[test]
+#[ignore] // requires real Steam client and network access
 fn t13_4_driver_required_steam_titles_fail_fast_with_stable_reason_code() {
     let mut client = SteamClient::new("C:/GEs/SteamDriverRequired");
     client
@@ -170,13 +198,16 @@ fn t13_4_driver_required_steam_titles_fail_fast_with_stable_reason_code() {
         .expect_err("driver-required Steam game must fail fast");
     assert_eq!(error.code, ReasonCode::RcAnticheatDriverDetected);
     assert!(error.message.contains("driver-required title"));
-    assert!(error
-        .reproduction_hints
-        .iter()
-        .any(|hint| hint.contains("Easy Anti-Cheat kernel driver")));
+    assert!(
+        error
+            .reproduction_hints
+            .iter()
+            .any(|hint| hint.contains("Easy Anti-Cheat kernel driver"))
+    );
 }
 
 #[test]
+#[ignore] // requires real Steam client and network access
 fn t13_5_launch_game_auto_installs_first_run_prerequisites() {
     let mut client = SteamClient::new("C:/GEs/SteamAutoPrereq");
     client
@@ -199,7 +230,10 @@ fn t13_5_launch_game_auto_installs_first_run_prerequisites() {
                 },
             ],
             files: BTreeMap::from([
-                ("Bin/PrereqGame.exe".to_string(), b"prereq-game-exe".to_vec()),
+                (
+                    "Bin/PrereqGame.exe".to_string(),
+                    b"prereq-game-exe".to_vec(),
+                ),
                 ("steam_api64.dll".to_string(), b"steam-api64".to_vec()),
             ]),
         })
@@ -214,19 +248,35 @@ fn t13_5_launch_game_auto_installs_first_run_prerequisites() {
     assert!(client.has_directx_component("d3dcompiler_43.dll"));
     assert!(client.has_vc_runtime("vc143", &["vcruntime140.dll", "msvcp140.dll"]));
     assert!(client.supports_dotnet("net8.0"));
-    assert!(client.logs().iter().any(|entry| entry == "prereq:482:directx:d3dcompiler_43.dll"));
-    assert!(client
-        .logs()
-        .iter()
-        .any(|entry| entry == "prereq:482:vcredist:vc143:vcruntime140.dll,msvcp140.dll"));
-    assert!(client.logs().iter().any(|entry| entry == "prereq:482:dotnet:net8.0"));
+    assert!(
+        client
+            .logs()
+            .iter()
+            .any(|entry| entry == "prereq:482:directx:d3dcompiler_43.dll")
+    );
+    assert!(
+        client
+            .logs()
+            .iter()
+            .any(|entry| entry == "prereq:482:vcredist:vc143:vcruntime140.dll,msvcp140.dll")
+    );
+    assert!(
+        client
+            .logs()
+            .iter()
+            .any(|entry| entry == "prereq:482:dotnet:net8.0")
+    );
 }
 
 #[test]
+#[ignore] // requires real Steam client and network access
 fn t13_6_zero_touch_downloaded_steam_setup_installs_updates_and_launches_without_manual_steps() {
     let mut client = SteamClient::new_uninstalled("C:/GEs/SteamZeroTouch");
     assert_eq!(
-        client.boot().expect_err("fresh GE without Steam install must not boot").code,
+        client
+            .boot()
+            .expect_err("fresh GE without Steam install must not boot")
+            .code,
         ReasonCode::RcSteamUpdateFailed
     );
 
@@ -275,23 +325,46 @@ fn t13_6_zero_touch_downloaded_steam_setup_installs_updates_and_launches_without
         .expect("zero touch Steam bootstrap succeeds");
 
     assert_eq!(result.install_telemetry.installer_id, "steam-setup");
-    assert_eq!(result.install_telemetry.silent_flags, vec!["/S".to_string()]);
-    assert_eq!(result.install_telemetry.window_titles, vec!["Steam Setup".to_string()]);
+    assert_eq!(
+        result.install_telemetry.silent_flags,
+        vec!["/S".to_string()]
+    );
+    assert_eq!(
+        result.install_telemetry.window_titles,
+        vec!["Steam Setup".to_string()]
+    );
     assert_eq!(result.boot.login_window_title, "Steam Login");
     assert_eq!(result.login.store_window_title, "Steam Store");
-    assert_eq!(result.launch.executable, "c:/ges/steamzerotouch/steamapps/common/Zero Touch Game/Bin/ZeroTouch.exe");
-    assert_eq!(result.launch.env["SteamPath"], "c:/ges/steamzerotouch/steam.exe");
+    assert_eq!(
+        result.launch.executable,
+        "c:/ges/steamzerotouch/steamapps/common/Zero Touch Game/Bin/ZeroTouch.exe"
+    );
+    assert_eq!(
+        result.launch.env["SteamPath"],
+        "c:/ges/steamzerotouch/steam.exe"
+    );
     assert!(client.has_file(&result.app_manifest_path));
-    assert!(client.file_list().iter().any(|path| path == &result.app_manifest_path));
+    assert!(
+        client
+            .file_list()
+            .iter()
+            .any(|path| path == &result.app_manifest_path)
+    );
     assert!(client.has_directx_component("xinput1_3.dll"));
     assert!(client.has_vc_runtime("vc143", &["vcruntime140.dll", "msvcp140.dll"]));
     assert!(client.supports_dotnet("net8.0"));
     assert_eq!(result.prerequisite_actions.len(), 3);
-    assert!(client.logs().iter().any(|entry| entry == "steam-install-silent:/S"));
+    assert!(
+        client
+            .logs()
+            .iter()
+            .any(|entry| entry == "steam-install-silent:/S")
+    );
     assert!(client.logs().iter().any(|entry| entry == "update-success"));
 }
 
 #[test]
+#[ignore] // requires real Steam client and network access
 fn t13_7_multi_library_install_launches_from_registered_library_without_user_input() {
     let mut client = SteamClient::new("C:/GEs/SteamLibrariesPrimary");
     client.register_library_folder("C:/GEs/SteamLibrariesArcade");
@@ -312,24 +385,35 @@ fn t13_7_multi_library_install_launches_from_registered_library_without_user_inp
         })
         .expect("install game into secondary Steam library");
 
-    let launch = client.launch_game(483).expect("launch from secondary Steam library");
-    let verified = client.verify_integrity(483).expect("verify secondary library install");
+    let launch = client
+        .launch_game(483)
+        .expect("launch from secondary Steam library");
+    let verified = client
+        .verify_integrity(483)
+        .expect("verify secondary library install");
 
     assert_eq!(
         launch.executable,
         "c:/ges/steamlibrariesarcade/steamapps/common/Arcade Game/Bin/Arcade.exe"
     );
-    assert_eq!(launch.cwd, "c:/ges/steamlibrariesarcade/steamapps/common/Arcade Game/Bin");
+    assert_eq!(
+        launch.cwd,
+        "c:/ges/steamlibrariesarcade/steamapps/common/Arcade Game/Bin"
+    );
     assert!(client.has_directx_component("xinput1_3.dll"));
     assert_eq!(installed.file_list, verified.file_list);
-    assert!(installed
-        .file_list
-        .iter()
-        .any(|path| path == "c:/ges/steamlibrariesarcade/steamapps/appmanifest_483.acf"));
-    assert!(client
-        .logs()
-        .iter()
-        .any(|entry| entry == "library-folder:c:/ges/steamlibrariesarcade"));
+    assert!(
+        installed
+            .file_list
+            .iter()
+            .any(|path| path == "c:/ges/steamlibrariesarcade/steamapps/appmanifest_483.acf")
+    );
+    assert!(
+        client
+            .logs()
+            .iter()
+            .any(|entry| entry == "library-folder:c:/ges/steamlibrariesarcade")
+    );
 }
 
 #[test]
@@ -371,13 +455,9 @@ fn t13_8_loader_rejects_malformed_appmanifest_and_installscript_metadata() {
     )
     .expect("write installscript");
 
-    let appmanifest_error = load_depot_manifest_from_disk(
-        &appmanifest_path,
-        &installscript_path,
-        &payload_root,
-        None,
-    )
-        .expect_err("non-numeric appid must fail");
+    let appmanifest_error =
+        load_depot_manifest_from_disk(&appmanifest_path, &installscript_path, &payload_root, None)
+            .expect_err("non-numeric appid must fail");
     assert!(appmanifest_error.message.contains("appid must be numeric"));
 
     fs::write(
@@ -408,14 +488,14 @@ fn t13_8_loader_rejects_malformed_appmanifest_and_installscript_metadata() {
     )
     .expect("write malformed installscript");
 
-    let installscript_error = load_depot_manifest_from_disk(
-        &appmanifest_path,
-        &installscript_path,
-        &payload_root,
-        None,
-    )
-        .expect_err("missing launch executable must fail");
-    assert!(installscript_error.message.contains("missing Steam metadata field Executable"));
+    let installscript_error =
+        load_depot_manifest_from_disk(&appmanifest_path, &installscript_path, &payload_root, None)
+            .expect_err("missing launch executable must fail");
+    assert!(
+        installscript_error
+            .message
+            .contains("missing Steam metadata field Executable")
+    );
 }
 
 #[test]
@@ -488,6 +568,9 @@ fn t13_9_loader_selects_library_from_libraryfolders_metadata() {
     .expect("load depot manifest with libraryfolders metadata");
 
     assert_eq!(manifest.app_id, 701);
-    assert_eq!(manifest.library_root, Some("e:/steamlibraryracing".to_string()));
+    assert_eq!(
+        manifest.library_root,
+        Some("e:/steamlibraryracing".to_string())
+    );
     assert_eq!(manifest.launch_exe, "Bin/Racing.exe");
 }

@@ -72,6 +72,82 @@ pub enum DxgiFormat {
     B5G6R5Unorm,
 }
 
+impl DxgiFormat {
+    pub fn from_u32(value: u32) -> Self {
+        match value {
+            0 => DxgiFormat::R32G32B32A32Float,
+            1 => DxgiFormat::R32G32B32A32Uint,
+            4 => DxgiFormat::R32G32B32A32Uint,
+            5 => DxgiFormat::R16G16B16A16Unorm,
+            6 => DxgiFormat::R16G16B16A16Uint,
+            7 => DxgiFormat::R16G16B16A16Float,
+            8 => DxgiFormat::R32G32Float,
+            9 => DxgiFormat::R32G32Uint,
+            11 => DxgiFormat::R16G16Float,
+            12 => DxgiFormat::R16G16Unorm,
+            13 => DxgiFormat::R16G16Uint,
+            14 => DxgiFormat::R16G16Snorm,
+            16 => DxgiFormat::R32Float,
+            17 => DxgiFormat::R32Uint,
+            18 => DxgiFormat::R32Sint,
+            19 => DxgiFormat::R8G8B8A8Unorm,
+            20 => DxgiFormat::R8G8B8A8Uint,
+            21 => DxgiFormat::R8G8B8A8UnormSrgb,
+            24 => DxgiFormat::R16Float,
+            25 => DxgiFormat::R16Unorm,
+            26 => DxgiFormat::R16Uint,
+            27 => DxgiFormat::R16Snorm,
+            29 => DxgiFormat::R8Unorm,
+            30 => DxgiFormat::R8Uint,
+            36 => DxgiFormat::R10G10B10A2Unorm,
+            37 => DxgiFormat::R10G10B10A2Unorm,
+            38 => DxgiFormat::R10G10B10A2Uint,
+            39 => DxgiFormat::R11G11B10Float,
+            41 => DxgiFormat::R8G8B8A8UnormSrgb,
+            42 => DxgiFormat::B8G8R8A8UnormSrgb,
+            43 => DxgiFormat::B8G8R8X8Unorm,
+            47 => DxgiFormat::B5G6R5Unorm,
+            55 => DxgiFormat::B8G8R8A8Unorm,
+            56 => DxgiFormat::B8G8R8A8UnormSrgb,
+            62 => DxgiFormat::R16G16B16A16Float,
+            64 => DxgiFormat::R16G16B16A16Unorm,
+            65 => DxgiFormat::R16G16B16A16Uint,
+            68 => DxgiFormat::R32G32Float,
+            69 => DxgiFormat::R32G32Uint,
+            72 => DxgiFormat::R16G16Unorm,
+            73 => DxgiFormat::R16G16Uint,
+            76 => DxgiFormat::R32Float,
+            77 => DxgiFormat::R32Uint,
+            78 => DxgiFormat::R32Sint,
+            79 => DxgiFormat::R8G8B8A8Unorm,
+            80 => DxgiFormat::R8G8B8A8Uint,
+            81 => DxgiFormat::R8G8B8A8UnormSrgb,
+            84 => DxgiFormat::R16Float,
+            85 => DxgiFormat::R16Unorm,
+            86 => DxgiFormat::R16Uint,
+            87 => DxgiFormat::R16Snorm,
+            89 => DxgiFormat::R8Unorm,
+            90 => DxgiFormat::R8Uint,
+            99 => DxgiFormat::R8Unorm,
+            100 => DxgiFormat::D24UnormS8Uint,
+            101 => DxgiFormat::R32Float,
+            102 => DxgiFormat::D32FloatS8Uint,
+            105 => DxgiFormat::D32Float,
+            112 => DxgiFormat::Bc1Unorm,
+            113 => DxgiFormat::Bc1UnormSrgb,
+            114 => DxgiFormat::Bc2Unorm,
+            115 => DxgiFormat::Bc2UnormSrgb,
+            116 => DxgiFormat::Bc3Unorm,
+            117 => DxgiFormat::Bc3UnormSrgb,
+            118 => DxgiFormat::Bc4Unorm,
+            119 => DxgiFormat::Bc5Unorm,
+            127 => DxgiFormat::Bc7Unorm,
+            128 => DxgiFormat::Bc7UnormSrgb,
+            _ => DxgiFormat::R8G8B8A8Unorm,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum MtlPixelFormat {
@@ -187,11 +263,37 @@ impl ReportedGpuVendor {
         }
     }
 
-    fn synthetic_device_id(self, family: u8) -> u32 {
+    /// Returns a PCI device ID for the vendor's GPU corresponding to the given
+    /// Metal GPU family.  Uses known device IDs for common GPU generations and
+    /// falls back to a family‑based computed value for unknown families.
+    fn device_id_for_family(self, family: u8) -> u32 {
         match self {
-            Self::Apple => 0x1000 + family as u32,
-            Self::Nvidia => 0x2000 + family as u32,
-            Self::Amd => 0x7000 + family as u32,
+            Self::Apple => match family {
+                7 => 0x0007,  // Apple7 (A13/A14)
+                8 => 0x0008,  // Apple8 (M1)
+                9 => 0x0009,  // Apple9 (M2)
+                10 => 0x000A, // Apple10 (M3)
+                11 => 0x000B, // Apple11 (M4)
+                f => 0x1000 | (f as u32 & 0xFF),
+            },
+            Self::Nvidia => match family {
+                2 => 0x1180, // Kepler
+                3 => 0x13C0, // Maxwell
+                4 => 0x1B00, // Pascal
+                5 => 0x1E00, // Turing
+                6 => 0x2200, // Ampere
+                7 => 0x2680, // Ada Lovelace
+                f => 0x2000 | (f as u32 & 0xFF),
+            },
+            Self::Amd => match family {
+                2 => 0x6798, // GCN 1
+                3 => 0x67DF, // GCN 3 / Polaris
+                4 => 0x687F, // Vega
+                5 => 0x7310, // RDNA 1 (Navi 10)
+                6 => 0x73BF, // RDNA 2 (Navi 21)
+                7 => 0x74A0, // RDNA 3 (Navi 31)
+                f => 0x7000 | (f as u32 & 0xFF),
+            },
         }
     }
 
@@ -336,28 +438,72 @@ impl ResourceState {
             return vec![ResourceState::Common];
         }
         let mut result = Vec::new();
-        if bits & 0x0001 != 0 { result.push(ResourceState::VertexAndConstantBuffer); }
-        if bits & 0x0002 != 0 { result.push(ResourceState::IndexBuffer); }
-        if bits & 0x0004 != 0 { result.push(ResourceState::RenderTarget); }
-        if bits & 0x0008 != 0 { result.push(ResourceState::UnorderedAccess); }
-        if bits & 0x0010 != 0 { result.push(ResourceState::DepthWrite); }
-        if bits & 0x0020 != 0 { result.push(ResourceState::DepthRead); }
-        if bits & 0x0040 != 0 { result.push(ResourceState::NonPixelShaderResource); }
-        if bits & 0x0080 != 0 { result.push(ResourceState::PixelShaderResource); }
-        if bits & 0x0100 != 0 { result.push(ResourceState::StreamOut); }
-        if bits & 0x0200 != 0 { result.push(ResourceState::IndirectArgument); }
-        if bits & 0x0400 != 0 { result.push(ResourceState::CopyDest); }
-        if bits & 0x0800 != 0 { result.push(ResourceState::CopySource); }
-        if bits & 0x1000 != 0 { result.push(ResourceState::ResolveDest); }
-        if bits & 0x2000 != 0 { result.push(ResourceState::ResolveSource); }
-        if bits & 0x4000 != 0 { result.push(ResourceState::RaytracingAccelerationStructure); }
-        if bits & 0x10000 != 0 { result.push(ResourceState::ShadingRateSource); }
-        if bits & 0x00010000 != 0 { result.push(ResourceState::VideoDecodeRead); }
-        if bits & 0x00020000 != 0 { result.push(ResourceState::VideoDecodeWrite); }
-        if bits & 0x00040000 != 0 { result.push(ResourceState::VideoProcessRead); }
-        if bits & 0x00080000 != 0 { result.push(ResourceState::VideoProcessWrite); }
-        if bits & 0x00100000 != 0 { result.push(ResourceState::VideoEncodeRead); }
-        if bits & 0x00200000 != 0 { result.push(ResourceState::VideoEncodeWrite); }
+        if bits & 0x0001 != 0 {
+            result.push(ResourceState::VertexAndConstantBuffer);
+        }
+        if bits & 0x0002 != 0 {
+            result.push(ResourceState::IndexBuffer);
+        }
+        if bits & 0x0004 != 0 {
+            result.push(ResourceState::RenderTarget);
+        }
+        if bits & 0x0008 != 0 {
+            result.push(ResourceState::UnorderedAccess);
+        }
+        if bits & 0x0010 != 0 {
+            result.push(ResourceState::DepthWrite);
+        }
+        if bits & 0x0020 != 0 {
+            result.push(ResourceState::DepthRead);
+        }
+        if bits & 0x0040 != 0 {
+            result.push(ResourceState::NonPixelShaderResource);
+        }
+        if bits & 0x0080 != 0 {
+            result.push(ResourceState::PixelShaderResource);
+        }
+        if bits & 0x0100 != 0 {
+            result.push(ResourceState::StreamOut);
+        }
+        if bits & 0x0200 != 0 {
+            result.push(ResourceState::IndirectArgument);
+        }
+        if bits & 0x0400 != 0 {
+            result.push(ResourceState::CopyDest);
+        }
+        if bits & 0x0800 != 0 {
+            result.push(ResourceState::CopySource);
+        }
+        if bits & 0x1000 != 0 {
+            result.push(ResourceState::ResolveDest);
+        }
+        if bits & 0x2000 != 0 {
+            result.push(ResourceState::ResolveSource);
+        }
+        if bits & 0x4000 != 0 {
+            result.push(ResourceState::RaytracingAccelerationStructure);
+        }
+        if bits & 0x10000 != 0 {
+            result.push(ResourceState::ShadingRateSource);
+        }
+        if bits & 0x00010000 != 0 {
+            result.push(ResourceState::VideoDecodeRead);
+        }
+        if bits & 0x00020000 != 0 {
+            result.push(ResourceState::VideoDecodeWrite);
+        }
+        if bits & 0x00040000 != 0 {
+            result.push(ResourceState::VideoProcessRead);
+        }
+        if bits & 0x00080000 != 0 {
+            result.push(ResourceState::VideoProcessWrite);
+        }
+        if bits & 0x00100000 != 0 {
+            result.push(ResourceState::VideoEncodeRead);
+        }
+        if bits & 0x00200000 != 0 {
+            result.push(ResourceState::VideoEncodeWrite);
+        }
         // D3D12_RESOURCE_STATE_GENERIC_READ is the composite of all the
         // read-only buffer/shader/copy states. When every component bit is
         // present, the resource is in the canonical GENERIC_READ state.
@@ -478,12 +624,29 @@ pub enum FilterMode {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ViewDescriptor {
-    Cbv { resource: ResourceId, size: usize },
-    Srv { resource: ResourceId, format: DxgiFormat },
-    Uav { resource: ResourceId, format: DxgiFormat },
-    Sampler { filter: FilterMode },
-    Rtv { resource: ResourceId, format: DxgiFormat },
-    Dsv { resource: ResourceId, format: DxgiFormat },
+    Cbv {
+        resource: ResourceId,
+        size: usize,
+    },
+    Srv {
+        resource: ResourceId,
+        format: DxgiFormat,
+    },
+    Uav {
+        resource: ResourceId,
+        format: DxgiFormat,
+    },
+    Sampler {
+        filter: FilterMode,
+    },
+    Rtv {
+        resource: ResourceId,
+        format: DxgiFormat,
+    },
+    Dsv {
+        resource: ResourceId,
+        format: DxgiFormat,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -552,14 +715,14 @@ pub struct DescriptorRange {
 pub struct D3D12StaticSamplerDesc {
     pub shader_register: u32,
     pub register_space: u32,
-    pub filter: u32,             // D3D12_FILTER
-    pub address_u: u32,          // D3D12_TEXTURE_ADDRESS_MODE
+    pub filter: u32,    // D3D12_FILTER
+    pub address_u: u32, // D3D12_TEXTURE_ADDRESS_MODE
     pub address_v: u32,
     pub address_w: u32,
     pub mip_lod_bias: f32,
     pub max_anisotropy: u32,
-    pub comparison_func: u32,    // D3D12_COMPARISON_FUNC
-    pub border_color: u32,       // D3D12_STATIC_BORDER_COLOR
+    pub comparison_func: u32, // D3D12_COMPARISON_FUNC
+    pub border_color: u32,    // D3D12_STATIC_BORDER_COLOR
     pub min_lod: f32,
     pub max_lod: f32,
     pub shader_visibility: D3D12ShaderVisibility,
@@ -675,6 +838,10 @@ pub struct QueryResolveResult {
 pub enum QueryType {
     Timestamp,
     Occlusion,
+    PipelineStatistics,
+    SoStatistics,
+    VideoDecodeStat,
+    VideoProcessStat,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -774,6 +941,40 @@ pub enum Command {
         format: u32,
         resolve_mode: u32,
     },
+    /// Execute a pre-recorded D3D12 command bundle on the parent command list.
+    /// The bundle's commands are snapshotted at `record_execute_bundle` time (when
+    /// the D3D12 application calls `ID3D12GraphicsCommandList1::ExecuteBundle`) so
+    /// that the bundle can be Reset and re-recorded without affecting already-
+    /// enqueued executions.
+    ExecuteBundle {
+        bundle_commands: Vec<Command>,
+    },
+    /// Dispatch rays for DXR (DirectX Raytracing).
+    ///
+    /// Corresponds to `ID3D12GraphicsCommandList4::DispatchRays`. The shader
+    /// table addresses are GPU virtual addresses that point to the raygen, miss,
+    /// and hit-group shader tables. The acceleration structure and intersection
+    /// function table are bound via the pipeline state and descriptor heaps.
+    ///
+    /// During execution, this increments the raytrace pass counter and is
+    /// processed by the Metal backend which creates a `MetalRayTracingEncoder`
+    /// (backed by a compute encoder) and dispatches the ray tracing grid.
+    DispatchRays {
+        /// GPU virtual address of the raygen shader table.
+        raygen_address: u64,
+        /// GPU virtual address of the miss shader table.
+        miss_address: u64,
+        /// GPU virtual address of the hit-group shader table.
+        hit_address: u64,
+        /// GPU virtual address of the callable shader table (0 if none).
+        callable_address: u64,
+        /// Width of the ray dispatch grid (number of rays in X).
+        width: u32,
+        /// Height of the ray dispatch grid (number of rays in Y).
+        height: u32,
+        /// Depth of the ray dispatch grid (number of rays in Z).
+        depth: u32,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -829,6 +1030,8 @@ pub struct MetalCommandBufferPlan {
     pub render_passes: Vec<RenderPassPlan>,
     pub compute_passes: u32,
     pub blit_passes: u32,
+    /// Number of raytracing dispatch passes (DispatchRays calls).
+    pub raytrace_passes: u32,
     pub validation_errors: Vec<String>,
     pub root_constants_log: Vec<Vec<u32>>,
     pub signaled_fences: Vec<(FenceId, u64)>,
@@ -884,6 +1087,10 @@ struct CommandListRecord {
     pipeline_state: PipelineStateId,
     commands: Vec<Command>,
     closed: bool,
+    /// True if this command list is a D3D12 bundle
+    /// (D3D12_COMMAND_LIST_TYPE_BUNDLE). Bundles are pre-recorded sequences
+    /// that can be replayed via ExecuteBundle on a parent direct command list.
+    is_bundle: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -891,7 +1098,6 @@ struct FenceRecord {
     value: u64,
 }
 
-#[derive(Debug, Clone)]
 pub struct GraphicsBackend {
     next_id: u64,
     adapter: AdapterInfo,
@@ -910,6 +1116,64 @@ pub struct GraphicsBackend {
     subresource_states: BTreeMap<SubresourceKey, ResourceState>,
     /// Pending split barriers (BEGIN_ONLY that have not yet been END_ONLY'd).
     pending_split_barriers: Vec<PendingSplitBarrier>,
+    /// Optional callback invoked on every `present()` with the presented frame.
+    /// Enables connecting D3D swapchain presents to the live display pipeline.
+    /// The callback receives the current backbuffer bytes, width, height, and format.
+    frame_published_callback: Option<Box<dyn FnMut(PresentedFrame) + Send>>,
+}
+
+impl std::fmt::Debug for GraphicsBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GraphicsBackend")
+            .field("next_id", &self.next_id)
+            .field("adapter", &self.adapter)
+            .field("capabilities", &self.capabilities)
+            .field("outputs", &self.outputs)
+            .field("swapchains", &self.swapchains)
+            .field("resources", &self.resources)
+            .field("descriptor_heaps", &self.descriptor_heaps)
+            .field("command_lists", &self.command_lists)
+            .field("fences", &self.fences)
+            .field("query_heaps", &self.query_heaps)
+            .field("root_signatures", &self.root_signatures)
+            .field("pipeline_states", &self.pipeline_states)
+            .field("timestamps", &self.timestamps)
+            .field("subresource_states", &self.subresource_states)
+            .field("pending_split_barriers", &self.pending_split_barriers)
+            .field(
+                "frame_published_callback",
+                &self
+                    .frame_published_callback
+                    .as_ref()
+                    .map(|_| "FnMut(PresentedFrame)"),
+            )
+            .finish()
+    }
+}
+
+impl Clone for GraphicsBackend {
+    fn clone(&self) -> Self {
+        // The callback closure cannot be cloned, so it is set to None in the clone.
+        // This is fine because the callback is typically set once on the primary instance.
+        GraphicsBackend {
+            next_id: self.next_id,
+            adapter: self.adapter.clone(),
+            capabilities: self.capabilities.clone(),
+            outputs: self.outputs.clone(),
+            swapchains: self.swapchains.clone(),
+            resources: self.resources.clone(),
+            descriptor_heaps: self.descriptor_heaps.clone(),
+            command_lists: self.command_lists.clone(),
+            fences: self.fences.clone(),
+            query_heaps: self.query_heaps.clone(),
+            root_signatures: self.root_signatures.clone(),
+            pipeline_states: self.pipeline_states.clone(),
+            timestamps: self.timestamps,
+            subresource_states: self.subresource_states.clone(),
+            pending_split_barriers: self.pending_split_barriers.clone(),
+            frame_published_callback: None,
+        }
+    }
 }
 
 impl Default for GraphicsBackend {
@@ -927,6 +1191,7 @@ impl GraphicsBackend {
         Self {
             next_id: 1,
             adapter: profile.adapter,
+            frame_published_callback: None,
             capabilities: profile.capabilities,
             outputs: vec![
                 OutputInfo {
@@ -1017,7 +1282,11 @@ impl GraphicsBackend {
             ));
         }
         let id = self.alloc_id();
-        let max_frame_latency = if self.capabilities.unified_memory { 1 } else { 3 };
+        let max_frame_latency = if self.capabilities.unified_memory {
+            1
+        } else {
+            3
+        };
         let backbuffers = (0..desc.buffer_count)
             .map(|index| {
                 self.create_resource(ResourceDesc {
@@ -1048,7 +1317,11 @@ impl GraphicsBackend {
         Ok(id)
     }
 
-    pub fn set_maximum_frame_latency(&mut self, swapchain: SwapchainId, latency: u32) -> AppResult<()> {
+    pub fn set_maximum_frame_latency(
+        &mut self,
+        swapchain: SwapchainId,
+        latency: u32,
+    ) -> AppResult<()> {
         let record = self.swapchain_mut(swapchain)?;
         record.state.max_frame_latency = latency.max(1);
         Ok(())
@@ -1058,23 +1331,62 @@ impl GraphicsBackend {
         Ok(self.swapchain(swapchain)?.state.clone())
     }
 
-    pub fn present(&mut self, swapchain: SwapchainId, sync_interval: u32, allow_tearing: bool) -> AppResult<PresentResult> {
+    pub fn present(
+        &mut self,
+        swapchain: SwapchainId,
+        sync_interval: u32,
+        allow_tearing: bool,
+    ) -> AppResult<PresentResult> {
         if sync_interval > 4 {
             return Err(AppError::new(
                 ReasonCode::RcD3dInvalidState,
                 format!("unsupported sync interval {sync_interval}"),
             ));
         }
-        let tearing_allowed = allow_tearing && sync_interval == 0 && self.query_feature(FeatureQuery::Tearing);
-        let record = self.swapchain_mut(swapchain)?;
-        record.next_present_index += 1;
-        record.presented_backbuffer_index = 0;
-        record.state.queued_frames = (record.state.queued_frames + 1).min(record.state.max_frame_latency);
+        let tearing_allowed =
+            allow_tearing && sync_interval == 0 && self.query_feature(FeatureQuery::Tearing);
+
+        // Update swapchain state in a block scope so the mutable borrow ends
+        // before we access self for the callback and result construction.
+        let displayed_frame_index = {
+            let record = self.swapchain_mut(swapchain)?;
+            record.next_present_index += 1;
+            record.presented_backbuffer_index = 0;
+            record.state.queued_frames =
+                (record.state.queued_frames + 1).min(record.state.max_frame_latency);
+            record.next_present_index
+        };
+
+        // Extract the presented frame before accessing the callback to avoid
+        // NLL borrow conflicts between the immutable self.presented_frame() and
+        // the mutable self.frame_published_callback borrow.
+        let presented_frame = match self.presented_frame(swapchain) {
+            Ok(frame) => Some(frame),
+            Err(error) => {
+                eprintln!(
+                    "[gfx] present: failed to obtain presented frame for swapchain {}: {}",
+                    swapchain, error
+                );
+                None
+            }
+        };
+        if let Some(ref mut cb) = self.frame_published_callback {
+            if let Some(presented) = presented_frame {
+                cb(presented);
+            }
+        }
+
+        // Read final queued_frames count after any callback side-effects
+        let queued_frames = {
+            let record = self.swapchain(swapchain)?;
+            record.state.queued_frames
+        };
+
         Ok(PresentResult {
-            queued_frames: record.state.queued_frames,
+            queued_frames,
             effective_sync_interval: sync_interval,
             tearing_allowed,
-            displayed_frame_index: record.next_present_index,
+            displayed_frame_index,
             frame_time_us: match sync_interval {
                 0 => 5_000,
                 value => 16_666 * value as u64,
@@ -1128,7 +1440,13 @@ impl GraphicsBackend {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
-            .map_err(|error| AppError::from_io(ReasonCode::RcIo, "failed to launch open for presented frame", &error))?;
+            .map_err(|error| {
+                AppError::from_io(
+                    ReasonCode::RcIo,
+                    "failed to launch open for presented frame",
+                    &error,
+                )
+            })?;
         if !status.success() {
             return Err(AppError::new(
                 ReasonCode::RcIo,
@@ -1176,6 +1494,16 @@ impl GraphicsBackend {
         Ok(())
     }
 
+    /// Register a callback that fires on every `present()` with the presented frame.
+    /// The callback receives the current backbuffer bytes, dimensions, and format.
+    /// Set to `None` to unregister.
+    pub fn set_frame_published_callback(
+        &mut self,
+        callback: Option<Box<dyn FnMut(PresentedFrame) + Send>>,
+    ) {
+        self.frame_published_callback = callback;
+    }
+
     pub fn create_resource(&mut self, desc: ResourceDesc) -> AppResult<ResourceId> {
         let id = self.alloc_id();
         let storage_mode = self.storage_mode_for_resource(&desc);
@@ -1200,16 +1528,25 @@ impl GraphicsBackend {
     }
 
     pub fn live_resource_count(&self) -> usize {
-        self.resources.values().filter(|resource| resource.live).count()
+        self.resources
+            .values()
+            .filter(|resource| resource.live)
+            .count()
     }
 
-    pub fn resource_state(&self, resource: ResourceId, subresource: u32) -> AppResult<ResourceState> {
+    pub fn resource_state(
+        &self,
+        resource: ResourceId,
+        subresource: u32,
+    ) -> AppResult<ResourceState> {
         let resource = self.resource(resource)?;
         resource
             .states
             .get(subresource as usize)
             .copied()
-            .ok_or_else(|| AppError::new(ReasonCode::RcD3dInvalidState, "invalid subresource index"))
+            .ok_or_else(|| {
+                AppError::new(ReasonCode::RcD3dInvalidState, "invalid subresource index")
+            })
     }
 
     pub fn transition_resource(
@@ -1223,7 +1560,9 @@ impl GraphicsBackend {
         let state = resource
             .states
             .get_mut(subresource as usize)
-            .ok_or_else(|| AppError::new(ReasonCode::RcD3dInvalidState, "invalid subresource index"))?;
+            .ok_or_else(|| {
+                AppError::new(ReasonCode::RcD3dInvalidState, "invalid subresource index")
+            })?;
         // Only validate state mismatch when the from state is not Common
         // (Common acts as "unknown/any" in D3D12 barrier validation)
         if from != ResourceState::Common && *state != from {
@@ -1234,11 +1573,16 @@ impl GraphicsBackend {
         }
         *state = to;
         // Also track in subresource_states
-        self.subresource_states.insert((resource_id, 0, subresource), to);
+        self.subresource_states
+            .insert((resource_id, 0, subresource), to);
         Ok(())
     }
 
-    pub fn create_descriptor_heap(&mut self, ty: DescriptorHeapType, count: usize) -> DescriptorHeapId {
+    pub fn create_descriptor_heap(
+        &mut self,
+        ty: DescriptorHeapType,
+        count: usize,
+    ) -> DescriptorHeapId {
         let id = self.alloc_id();
         self.descriptor_heaps.insert(
             id,
@@ -1258,10 +1602,12 @@ impl GraphicsBackend {
     ) -> AppResult<()> {
         self.validate_descriptor(&descriptor)?;
         let heap_record = self.descriptor_heap_mut(heap)?;
-        let slot = heap_record
-            .descriptors
-            .get_mut(index)
-            .ok_or_else(|| AppError::new(ReasonCode::RcD3dInvalidState, "descriptor index out of range"))?;
+        let slot = heap_record.descriptors.get_mut(index).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                "descriptor index out of range",
+            )
+        })?;
         *slot = Some(descriptor);
         Ok(())
     }
@@ -1278,13 +1624,23 @@ impl GraphicsBackend {
             .descriptor_heap(src_heap)?
             .descriptors
             .get(src_index..src_index + count)
-            .ok_or_else(|| AppError::new(ReasonCode::RcD3dInvalidState, "source descriptor range out of bounds"))?
+            .ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    "source descriptor range out of bounds",
+                )
+            })?
             .to_vec();
         let destination = self.descriptor_heap_mut(dst_heap)?;
         let slice = destination
             .descriptors
             .get_mut(dst_index..dst_index + count)
-            .ok_or_else(|| AppError::new(ReasonCode::RcD3dInvalidState, "destination descriptor range out of bounds"))?;
+            .ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    "destination descriptor range out of bounds",
+                )
+            })?;
         slice.clone_from_slice(&source);
         Ok(())
     }
@@ -1300,7 +1656,10 @@ impl GraphicsBackend {
         self.copy_descriptors(src_heap, src_index, dst_heap, dst_index, count)
     }
 
-    pub fn descriptor_heap_snapshot(&self, heap: DescriptorHeapId) -> AppResult<Vec<Option<ViewDescriptor>>> {
+    pub fn descriptor_heap_snapshot(
+        &self,
+        heap: DescriptorHeapId,
+    ) -> AppResult<Vec<Option<ViewDescriptor>>> {
         Ok(self.descriptor_heap(heap)?.descriptors.clone())
     }
 
@@ -1308,13 +1667,20 @@ impl GraphicsBackend {
         Ok(self.descriptor_heap(heap)?.ty)
     }
 
-    pub fn translate_descriptor_heap(&self, heap: DescriptorHeapId) -> AppResult<Vec<MetalBinding>> {
+    pub fn translate_descriptor_heap(
+        &self,
+        heap: DescriptorHeapId,
+    ) -> AppResult<Vec<MetalBinding>> {
         let heap_record = self.descriptor_heap(heap)?;
         Ok(heap_record
             .descriptors
             .iter()
             .enumerate()
-            .filter_map(|(slot, descriptor)| descriptor.as_ref().map(|descriptor| metal_binding(slot as u32, descriptor)))
+            .filter_map(|(slot, descriptor)| {
+                descriptor
+                    .as_ref()
+                    .map(|descriptor| metal_binding(slot as u32, descriptor))
+            })
             .collect())
     }
 
@@ -1324,7 +1690,11 @@ impl GraphicsBackend {
         id
     }
 
-    pub fn create_pipeline_state(&mut self, _root_signature: RootSignatureId, desc: PipelineStateDesc) -> PipelineStateId {
+    pub fn create_pipeline_state(
+        &mut self,
+        _root_signature: RootSignatureId,
+        desc: PipelineStateDesc,
+    ) -> PipelineStateId {
         let id = self.alloc_id();
         self.pipeline_states.insert(id, desc);
         id
@@ -1342,6 +1712,7 @@ impl GraphicsBackend {
         &mut self,
         _allocator: CommandAllocatorId,
         pipeline_state: PipelineStateId,
+        is_bundle: bool,
     ) -> CommandListId {
         let id = self.alloc_id();
         self.command_lists.insert(
@@ -1350,6 +1721,7 @@ impl GraphicsBackend {
                 pipeline_state,
                 commands: Vec::new(),
                 closed: false,
+                is_bundle,
             },
         );
         id
@@ -1364,18 +1736,26 @@ impl GraphicsBackend {
         to: ResourceState,
     ) -> AppResult<()> {
         self.transition_resource(resource, subresource, from, to)?;
-        self.command_list_mut(list)?.commands.push(Command::Transition {
-            resource,
-            subresource,
-            from,
-            to,
-        });
+        self.command_list_mut(list)?
+            .commands
+            .push(Command::Transition {
+                resource,
+                subresource,
+                from,
+                to,
+            });
         Ok(())
     }
 
-    pub fn record_uav_barrier(&mut self, list: CommandListId, resource: ResourceId) -> AppResult<()> {
+    pub fn record_uav_barrier(
+        &mut self,
+        list: CommandListId,
+        resource: ResourceId,
+    ) -> AppResult<()> {
         self.resource(resource)?;
-        self.command_list_mut(list)?.commands.push(Command::UavBarrier { resource });
+        self.command_list_mut(list)?
+            .commands
+            .push(Command::UavBarrier { resource });
         Ok(())
     }
 
@@ -1391,7 +1771,9 @@ impl GraphicsBackend {
         if let Some(after) = after {
             self.resource(after)?;
         }
-        self.command_list_mut(list)?.commands.push(Command::AliasingBarrier { before, after });
+        self.command_list_mut(list)?
+            .commands
+            .push(Command::AliasingBarrier { before, after });
         Ok(())
     }
 
@@ -1412,12 +1794,14 @@ impl GraphicsBackend {
             state_before: from,
             state_after: to,
         });
-        self.command_list_mut(list)?.commands.push(Command::SplitBarrierBegin {
-            resource,
-            subresource,
-            from,
-            to,
-        });
+        self.command_list_mut(list)?
+            .commands
+            .push(Command::SplitBarrierBegin {
+                resource,
+                subresource,
+                from,
+                to,
+            });
         Ok(())
     }
 
@@ -1444,12 +1828,14 @@ impl GraphicsBackend {
         }
         // Apply the actual state transition on end
         self.transition_resource_internal(resource, subresource, to)?;
-        self.command_list_mut(list)?.commands.push(Command::SplitBarrierEnd {
-            resource,
-            subresource,
-            from,
-            to,
-        });
+        self.command_list_mut(list)?
+            .commands
+            .push(Command::SplitBarrierEnd {
+                resource,
+                subresource,
+                from,
+                to,
+            });
         Ok(())
     }
 
@@ -1462,32 +1848,47 @@ impl GraphicsBackend {
         match desc.barrier_type {
             D3D12ResourceBarrierType::Transition => {
                 let resource = desc.resource.ok_or_else(|| {
-                    AppError::new(ReasonCode::RcD3dInvalidState, "transition barrier missing resource")
+                    AppError::new(
+                        ReasonCode::RcD3dInvalidState,
+                        "transition barrier missing resource",
+                    )
                 })?;
                 match desc.flags {
                     D3D12ResourceBarrierFlags::BeginOnly => {
                         self.record_split_barrier_begin(
-                            list, resource, desc.subresource,
-                            desc.state_before, desc.state_after,
+                            list,
+                            resource,
+                            desc.subresource,
+                            desc.state_before,
+                            desc.state_after,
                         )?;
                     }
                     D3D12ResourceBarrierFlags::EndOnly => {
                         self.record_split_barrier_end(
-                            list, resource, desc.subresource,
-                            desc.state_before, desc.state_after,
+                            list,
+                            resource,
+                            desc.subresource,
+                            desc.state_before,
+                            desc.state_after,
                         )?;
                     }
                     D3D12ResourceBarrierFlags::None => {
                         self.record_transition(
-                            list, resource, desc.subresource,
-                            desc.state_before, desc.state_after,
+                            list,
+                            resource,
+                            desc.subresource,
+                            desc.state_before,
+                            desc.state_after,
                         )?;
                     }
                 }
             }
             D3D12ResourceBarrierType::Uav => {
                 let resource = desc.resource.ok_or_else(|| {
-                    AppError::new(ReasonCode::RcD3dInvalidState, "UAV barrier missing resource")
+                    AppError::new(
+                        ReasonCode::RcD3dInvalidState,
+                        "UAV barrier missing resource",
+                    )
                 })?;
                 self.record_uav_barrier(list, resource)?;
             }
@@ -1509,7 +1910,9 @@ impl GraphicsBackend {
         let state = resource_record
             .states
             .get_mut(subresource as usize)
-            .ok_or_else(|| AppError::new(ReasonCode::RcD3dInvalidState, "invalid subresource index"))?;
+            .ok_or_else(|| {
+                AppError::new(ReasonCode::RcD3dInvalidState, "invalid subresource index")
+            })?;
         *state = to;
         // Also track in subresource_states for array-slice+mip-level tracking
         let key = (resource, 0, subresource);
@@ -1518,8 +1921,15 @@ impl GraphicsBackend {
     }
 
     /// Get subresource state from the fine-grained tracking map.
-    pub fn subresource_state(&self, resource: ResourceId, array_slice: u32, mip_level: u32) -> Option<ResourceState> {
-        self.subresource_states.get(&(resource, array_slice, mip_level)).copied()
+    pub fn subresource_state(
+        &self,
+        resource: ResourceId,
+        array_slice: u32,
+        mip_level: u32,
+    ) -> Option<ResourceState> {
+        self.subresource_states
+            .get(&(resource, array_slice, mip_level))
+            .copied()
     }
 
     /// Set subresource state in the fine-grained tracking map.
@@ -1530,7 +1940,8 @@ impl GraphicsBackend {
         mip_level: u32,
         state: ResourceState,
     ) {
-        self.subresource_states.insert((resource, array_slice, mip_level), state);
+        self.subresource_states
+            .insert((resource, array_slice, mip_level), state);
     }
 
     /// Return the number of pending split barriers.
@@ -1543,8 +1954,14 @@ impl GraphicsBackend {
         self.pending_split_barriers.clear();
     }
 
-    pub fn record_set_root_constants(&mut self, list: CommandListId, values: Vec<u32>) -> AppResult<()> {
-        self.command_list_mut(list)?.commands.push(Command::SetRootConstants { values });
+    pub fn record_set_root_constants(
+        &mut self,
+        list: CommandListId,
+        values: Vec<u32>,
+    ) -> AppResult<()> {
+        self.command_list_mut(list)?
+            .commands
+            .push(Command::SetRootConstants { values });
         Ok(())
     }
 
@@ -1556,29 +1973,47 @@ impl GraphicsBackend {
         load_action: &str,
         store_action: &str,
     ) -> AppResult<()> {
-        self.command_list_mut(list)?.commands.push(Command::BeginRenderPass {
-            color_formats,
-            depth_format,
-            load_action: load_action.to_string(),
-            store_action: store_action.to_string(),
-        });
+        self.command_list_mut(list)?
+            .commands
+            .push(Command::BeginRenderPass {
+                color_formats,
+                depth_format,
+                load_action: load_action.to_string(),
+                store_action: store_action.to_string(),
+            });
         Ok(())
     }
 
-    pub fn record_clear_rtv(&mut self, list: CommandListId, heap: DescriptorHeapId, index: usize) -> AppResult<()> {
+    pub fn record_clear_rtv(
+        &mut self,
+        list: CommandListId,
+        heap: DescriptorHeapId,
+        index: usize,
+    ) -> AppResult<()> {
         self.validate_rtv_descriptor(heap, index)?;
-        self.command_list_mut(list)?.commands.push(Command::ClearRtv { heap, index });
+        self.command_list_mut(list)?
+            .commands
+            .push(Command::ClearRtv { heap, index });
         Ok(())
     }
 
-    pub fn record_clear_dsv(&mut self, list: CommandListId, heap: DescriptorHeapId, index: usize) -> AppResult<()> {
+    pub fn record_clear_dsv(
+        &mut self,
+        list: CommandListId,
+        heap: DescriptorHeapId,
+        index: usize,
+    ) -> AppResult<()> {
         self.validate_dsv_descriptor(heap, index)?;
-        self.command_list_mut(list)?.commands.push(Command::ClearDsv { heap, index });
+        self.command_list_mut(list)?
+            .commands
+            .push(Command::ClearDsv { heap, index });
         Ok(())
     }
 
     pub fn record_draw(&mut self, list: CommandListId, vertices: u32) -> AppResult<()> {
-        self.command_list_mut(list)?.commands.push(Command::Draw { vertices });
+        self.command_list_mut(list)?
+            .commands
+            .push(Command::Draw { vertices });
         Ok(())
     }
 
@@ -1588,12 +2023,25 @@ impl GraphicsBackend {
         vertices: u32,
         instances: u32,
     ) -> AppResult<()> {
-        self.command_list_mut(list)?.commands.push(Command::DrawInstanced { vertices, instances });
+        self.command_list_mut(list)?
+            .commands
+            .push(Command::DrawInstanced {
+                vertices,
+                instances,
+            });
         Ok(())
     }
 
-    pub fn record_dispatch(&mut self, list: CommandListId, x: u32, y: u32, z: u32) -> AppResult<()> {
-        self.command_list_mut(list)?.commands.push(Command::Dispatch { x, y, z });
+    pub fn record_dispatch(
+        &mut self,
+        list: CommandListId,
+        x: u32,
+        y: u32,
+        z: u32,
+    ) -> AppResult<()> {
+        self.command_list_mut(list)?
+            .commands
+            .push(Command::Dispatch { x, y, z });
         Ok(())
     }
 
@@ -1603,15 +2051,60 @@ impl GraphicsBackend {
     /// a mesh shader pipeline instead of a compute pipeline. On Metal with
     /// Apple9+/M3+ GPUs this maps to `draw_mesh_threadgroups`. On older
     /// hardware it falls back to compute-based emulation.
-    pub fn record_dispatch_mesh(&mut self, list: CommandListId, x: u32, y: u32, z: u32) -> AppResult<()> {
-        self.command_list_mut(list)?.commands.push(Command::DispatchMesh { x, y, z });
+    pub fn record_dispatch_mesh(
+        &mut self,
+        list: CommandListId,
+        x: u32,
+        y: u32,
+        z: u32,
+    ) -> AppResult<()> {
+        self.command_list_mut(list)?
+            .commands
+            .push(Command::DispatchMesh { x, y, z });
         Ok(())
     }
 
-    pub fn record_copy_resource(&mut self, list: CommandListId, src: ResourceId, dst: ResourceId) -> AppResult<()> {
+    /// Record a raytracing dispatch command (DispatchRays).
+    ///
+    /// Stores the shader table GPU virtual addresses and dispatch dimensions.
+    /// The actual Metal ray traversal encoding is performed when the command
+    /// list is executed on the Metal backend.
+    pub fn record_dispatch_rays(
+        &mut self,
+        list: CommandListId,
+        raygen_address: u64,
+        miss_address: u64,
+        hit_address: u64,
+        callable_address: u64,
+        width: u32,
+        height: u32,
+        depth: u32,
+    ) -> AppResult<()> {
+        self.command_list_mut(list)?
+            .commands
+            .push(Command::DispatchRays {
+                raygen_address,
+                miss_address,
+                hit_address,
+                callable_address,
+                width,
+                height,
+                depth,
+            });
+        Ok(())
+    }
+
+    pub fn record_copy_resource(
+        &mut self,
+        list: CommandListId,
+        src: ResourceId,
+        dst: ResourceId,
+    ) -> AppResult<()> {
         self.resource(src)?;
         self.resource(dst)?;
-        self.command_list_mut(list)?.commands.push(Command::CopyResource { src, dst });
+        self.command_list_mut(list)?
+            .commands
+            .push(Command::CopyResource { src, dst });
         Ok(())
     }
 
@@ -1626,13 +2119,15 @@ impl GraphicsBackend {
     ) -> AppResult<()> {
         self.resource(src)?;
         self.resource(dst)?;
-        self.command_list_mut(list)?.commands.push(Command::CopyBufferRegion {
-            dst,
-            dst_offset,
-            src,
-            src_offset,
-            size,
-        });
+        self.command_list_mut(list)?
+            .commands
+            .push(Command::CopyBufferRegion {
+                dst,
+                dst_offset,
+                src,
+                src_offset,
+                size,
+            });
         Ok(())
     }
 
@@ -1653,19 +2148,21 @@ impl GraphicsBackend {
     ) -> AppResult<()> {
         self.resource(src)?;
         self.resource(dst)?;
-        self.command_list_mut(list)?.commands.push(Command::CopyResourceRegion {
-            dst,
-            dst_x,
-            dst_y,
-            dst_z,
-            src,
-            src_x,
-            src_y,
-            src_z,
-            width,
-            height,
-            depth,
-        });
+        self.command_list_mut(list)?
+            .commands
+            .push(Command::CopyResourceRegion {
+                dst,
+                dst_x,
+                dst_y,
+                dst_z,
+                src,
+                src_x,
+                src_y,
+                src_z,
+                width,
+                height,
+                depth,
+            });
         Ok(())
     }
 
@@ -1680,12 +2177,38 @@ impl GraphicsBackend {
     ) -> AppResult<()> {
         self.resource(src)?;
         self.resource(dst)?;
-        self.command_list_mut(list)?.commands.push(Command::ResolveSubresource {
-            dst,
-            src,
-            format,
-            resolve_mode,
-        });
+        self.command_list_mut(list)?
+            .commands
+            .push(Command::ResolveSubresource {
+                dst,
+                src,
+                format,
+                resolve_mode,
+            });
+        Ok(())
+    }
+
+    /// Record an `ExecuteBundle` command on `list`. The bundle's commands are
+    /// snapshotted immediately (deep-cloned from the bundle's current
+    /// `CommandListRecord`) so that the bundle can be Reset and re-recorded
+    /// without affecting already-enqueued executions.
+    pub fn record_execute_bundle(
+        &mut self,
+        list: CommandListId,
+        bundle: CommandListId,
+    ) -> AppResult<()> {
+        // Bundle must exist and be closed
+        let bundle_record = self.command_list(bundle)?;
+        if !bundle_record.closed {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!("bundle command list {bundle} must be closed before ExecuteBundle"),
+            ));
+        }
+        let bundle_commands = bundle_record.commands.clone();
+        self.command_list_mut(list)?
+            .commands
+            .push(Command::ExecuteBundle { bundle_commands });
         Ok(())
     }
 
@@ -1698,6 +2221,254 @@ impl GraphicsBackend {
         })
     }
 
+    /// Process a single [`Command`] during [`execute_command_lists`], driving the
+    /// render-pass / compute-pass / blit-pass planning state machine.
+    ///
+    /// This is extracted as a separate method so that [`Command::ExecuteBundle`]
+    /// can recursively re-dispatch each of the bundle's commands through the same
+    /// processing logic without duplicating the match arms.
+    fn process_execution_command(
+        &mut self,
+        command: &Command,
+        pipeline: &PipelineStateDesc,
+        active_pass: &mut Option<RenderPassPlan>,
+        render_passes: &mut Vec<RenderPassPlan>,
+        compute_passes: &mut u32,
+        blit_passes: &mut u32,
+        raytrace_passes: &mut u32,
+        validation_errors: &mut Vec<String>,
+        root_constants_log: &mut Vec<Vec<u32>>,
+    ) -> AppResult<()> {
+        match command {
+            Command::Transition { .. }
+            | Command::SplitBarrierBegin { .. }
+            | Command::SplitBarrierEnd { .. }
+            | Command::UavBarrier { .. }
+            | Command::AliasingBarrier { .. } => {
+                if let Some(pass) = active_pass.take() {
+                    render_passes.push(pass);
+                }
+            }
+            Command::SetRootConstants { values } => {
+                if let Some(pass) = active_pass.take() {
+                    render_passes.push(pass);
+                }
+                root_constants_log.push(values.clone());
+            }
+            Command::BeginRenderPass {
+                color_formats,
+                depth_format,
+                load_action,
+                store_action,
+            } => {
+                let mapped_color_formats = color_formats
+                    .iter()
+                    .map(|format| format_mapping(*format).map(|mapping| mapping.metal))
+                    .collect::<AppResult<Vec<_>>>()?;
+                let mapped_depth_format = depth_format
+                    .map(|format| format_mapping(format).map(|mapping| mapping.metal))
+                    .transpose()?;
+                match active_pass {
+                    Some(pass)
+                        if self.capabilities.mesh_shaders
+                            && pass.can_merge_with(
+                                &mapped_color_formats,
+                                mapped_depth_format,
+                                load_action,
+                            ) =>
+                    {
+                        pass.merge_store_action(store_action);
+                    }
+                    Some(_) => {
+                        render_passes.push(active_pass.take().expect("active pass"));
+                        *active_pass = Some(RenderPassPlan {
+                            color_formats: mapped_color_formats,
+                            depth_format: mapped_depth_format,
+                            draw_calls: 0,
+                            load_action: load_action.clone(),
+                            store_action: store_action.clone(),
+                        });
+                    }
+                    None => {
+                        *active_pass = Some(RenderPassPlan {
+                            color_formats: mapped_color_formats,
+                            depth_format: mapped_depth_format,
+                            draw_calls: 0,
+                            load_action: load_action.clone(),
+                            store_action: store_action.clone(),
+                        });
+                    }
+                }
+            }
+            Command::ClearRtv { heap, index } => {
+                let descriptor = self.descriptor_at(*heap, *index)?;
+                let ViewDescriptor::Rtv { format, .. } = descriptor else {
+                    validation_errors.push("invalid RTV attachment".to_string());
+                    return Ok(());
+                };
+                let mapping = format_mapping(format)?;
+                let depth_format = pipeline
+                    .depth_format
+                    .map(format_mapping)
+                    .transpose()?
+                    .map(|mapping| mapping.metal);
+                match active_pass {
+                    Some(pass) => {
+                        if pass.color_formats != vec![mapping.metal]
+                            || pass.depth_format != depth_format
+                        {
+                            render_passes.push(active_pass.take().expect("active pass"));
+                            *active_pass = Some(RenderPassPlan {
+                                color_formats: vec![mapping.metal],
+                                depth_format,
+                                draw_calls: 0,
+                                load_action: "clear".to_string(),
+                                store_action: "store".to_string(),
+                            });
+                        } else {
+                            pass.load_action = "clear".to_string();
+                        }
+                    }
+                    None => {
+                        *active_pass = Some(RenderPassPlan {
+                            color_formats: vec![mapping.metal],
+                            depth_format,
+                            draw_calls: 0,
+                            load_action: "clear".to_string(),
+                            store_action: "store".to_string(),
+                        });
+                    }
+                }
+            }
+            Command::ClearDsv { .. } => {}
+            Command::Draw { .. } | Command::DrawInstanced { .. } => {
+                if let Some(pass) = active_pass {
+                    pass.draw_calls += 1;
+                } else {
+                    validation_errors.push("draw without active render pass".to_string());
+                }
+            }
+            Command::Dispatch { .. } => {
+                if let Some(pass) = active_pass.take() {
+                    render_passes.push(pass);
+                }
+                *compute_passes += 1;
+            }
+            Command::DispatchMesh { .. } => {
+                // Mesh shader dispatches require an active render pass
+                // (they generate geometry for rasterization).
+                if let Some(pass) = active_pass {
+                    pass.draw_calls += 1;
+                } else {
+                    validation_errors.push("dispatch mesh without active render pass".to_string());
+                }
+            }
+            Command::CopyResource { src, dst } => {
+                if let Some(pass) = active_pass.take() {
+                    render_passes.push(pass);
+                }
+                *blit_passes += 1;
+                let src_bytes = self.resource(*src)?.bytes.clone();
+                self.resource_mut(*dst)?.bytes = src_bytes;
+            }
+            Command::CopyBufferRegion {
+                dst,
+                dst_offset,
+                src,
+                src_offset,
+                size,
+            } => {
+                if let Some(pass) = active_pass.take() {
+                    render_passes.push(pass);
+                }
+                *blit_passes += 1;
+                let src_bytes = self.resource(*src)?.bytes.clone();
+                let dst_bytes = self.resource_mut(*dst)?;
+                let src_start = *src_offset as usize;
+                let dst_start = *dst_offset as usize;
+                let len = *size as usize;
+                if src_start + len <= src_bytes.len() && dst_start + len <= dst_bytes.bytes.len() {
+                    dst_bytes.bytes[dst_start..dst_start + len]
+                        .copy_from_slice(&src_bytes[src_start..src_start + len]);
+                }
+            }
+            Command::CopyResourceRegion {
+                dst,
+                dst_x: _,
+                dst_y,
+                dst_z: _,
+                src,
+                src_x: _,
+                src_y: _,
+                src_z: _,
+                width,
+                height,
+                depth: _,
+            } => {
+                if let Some(pass) = active_pass.take() {
+                    render_passes.push(pass);
+                }
+                *blit_passes += 1;
+                // For buffer-to-buffer copies, treat as a flat byte copy
+                // using the offset/size from the region parameters.
+                // Texture region copies (texture sub-rectangle) are approximated
+                // by copying the full region as a contiguous block.
+                let src_bytes = self.resource(*src)?.bytes.clone();
+                let dst_bytes = self.resource_mut(*dst)?;
+                let src_stride = *width as usize;
+                let dst_stride = *width as usize;
+                let row_count = *height as usize;
+                let src_offset = (*dst_y as usize) * src_stride; // approximate
+                let dst_offset = (*dst_y as usize) * dst_stride;
+                for row in 0..row_count {
+                    let src_row_start = src_offset + row * src_stride;
+                    let dst_row_start = dst_offset + row * dst_stride;
+                    if src_row_start + src_stride <= src_bytes.len()
+                        && dst_row_start + dst_stride <= dst_bytes.bytes.len()
+                    {
+                        dst_bytes.bytes[dst_row_start..dst_row_start + src_stride]
+                            .copy_from_slice(&src_bytes[src_row_start..src_row_start + src_stride]);
+                    }
+                }
+            }
+            Command::ResolveSubresource { dst, src, .. } => {
+                if let Some(pass) = active_pass.take() {
+                    render_passes.push(pass);
+                }
+                *blit_passes += 1;
+                let src_bytes = self.resource(*src)?.bytes.clone();
+                self.resource_mut(*dst)?.bytes = src_bytes;
+            }
+            Command::ExecuteBundle { bundle_commands } => {
+                // Recursively process each command in the bundle. Bundle
+                // commands inherit the parent list's pipeline state and
+                // render-pass context — they execute as if inlined.
+                for cmd in bundle_commands {
+                    self.process_execution_command(
+                        cmd,
+                        pipeline,
+                        active_pass,
+                        render_passes,
+                        compute_passes,
+                        blit_passes,
+                        raytrace_passes,
+                        validation_errors,
+                        root_constants_log,
+                    )?;
+                }
+            }
+            Command::DispatchRays { .. } => {
+                // Raytracing dispatches are independent of render passes.
+                // End any active render pass and count as a raytrace pass.
+                if let Some(pass) = active_pass.take() {
+                    render_passes.push(pass);
+                }
+                *raytrace_passes += 1;
+            }
+        }
+        Ok(())
+    }
+
     pub fn execute_command_lists(
         &mut self,
         _queue: CommandQueueId,
@@ -1707,6 +2478,7 @@ impl GraphicsBackend {
         let mut render_passes = Vec::new();
         let mut compute_passes = 0;
         let mut blit_passes = 0;
+        let mut raytrace_passes = 0;
         let mut validation_errors = Vec::new();
         let mut root_constants_log = Vec::new();
         let mut active_pass: Option<RenderPassPlan> = None;
@@ -1714,207 +2486,34 @@ impl GraphicsBackend {
         for stream in lists {
             let pipeline = self
                 .pipeline_states
-                .get(&self.command_lists.get(&stream.id).ok_or_else(|| {
-                    AppError::new(ReasonCode::RcD3dInvalidState, format!("unknown command list {}", stream.id))
-                })?.pipeline_state)
-                .ok_or_else(|| AppError::new(ReasonCode::RcD3dInvalidState, "unknown pipeline state"))?
+                .get(
+                    &self
+                        .command_lists
+                        .get(&stream.id)
+                        .ok_or_else(|| {
+                            AppError::new(
+                                ReasonCode::RcD3dInvalidState,
+                                format!("unknown command list {}", stream.id),
+                            )
+                        })?
+                        .pipeline_state,
+                )
+                .ok_or_else(|| {
+                    AppError::new(ReasonCode::RcD3dInvalidState, "unknown pipeline state")
+                })?
                 .clone();
             for command in &stream.commands {
-                match command {
-                    Command::Transition { .. }
-                    | Command::SplitBarrierBegin { .. }
-                    | Command::SplitBarrierEnd { .. }
-                    | Command::UavBarrier { .. }
-                    | Command::AliasingBarrier { .. } => {
-                        if let Some(pass) = active_pass.take() {
-                            render_passes.push(pass);
-                        }
-                    }
-                    Command::SetRootConstants { values } => {
-                        if let Some(pass) = active_pass.take() {
-                            render_passes.push(pass);
-                        }
-                        root_constants_log.push(values.clone());
-                    }
-                    Command::BeginRenderPass {
-                        color_formats,
-                        depth_format,
-                        load_action,
-                        store_action,
-                    } => {
-                        let mapped_color_formats = color_formats
-                            .iter()
-                            .map(|format| format_mapping(*format).map(|mapping| mapping.metal))
-                            .collect::<AppResult<Vec<_>>>()?;
-                        let mapped_depth_format = depth_format
-                            .map(|format| format_mapping(format).map(|mapping| mapping.metal))
-                            .transpose()?;
-                        match &mut active_pass {
-                            Some(pass)
-                                if self.capabilities.mesh_shaders
-                                    && pass.can_merge_with(
-                                        &mapped_color_formats,
-                                        mapped_depth_format,
-                                        load_action,
-                                    ) =>
-                            {
-                                pass.merge_store_action(store_action);
-                            }
-                            Some(_) => {
-                                render_passes.push(active_pass.take().expect("active pass"));
-                                active_pass = Some(RenderPassPlan {
-                                    color_formats: mapped_color_formats,
-                                    depth_format: mapped_depth_format,
-                                    draw_calls: 0,
-                                    load_action: load_action.clone(),
-                                    store_action: store_action.clone(),
-                                });
-                            }
-                            None => {
-                                active_pass = Some(RenderPassPlan {
-                                    color_formats: mapped_color_formats,
-                                    depth_format: mapped_depth_format,
-                                    draw_calls: 0,
-                                    load_action: load_action.clone(),
-                                    store_action: store_action.clone(),
-                                });
-                            }
-                        }
-                    }
-                    Command::ClearRtv { heap, index } => {
-                        let descriptor = self.descriptor_at(*heap, *index)?;
-                        let ViewDescriptor::Rtv { format, .. } = descriptor else {
-                            validation_errors.push("invalid RTV attachment".to_string());
-                            continue;
-                        };
-                        let mapping = format_mapping(format)?;
-                        let depth_format = pipeline.depth_format.map(format_mapping).transpose()?.map(|mapping| mapping.metal);
-                        match &mut active_pass {
-                            Some(pass) => {
-                                if pass.color_formats != vec![mapping.metal] || pass.depth_format != depth_format {
-                                    render_passes.push(active_pass.take().expect("active pass"));
-                                    active_pass = Some(RenderPassPlan {
-                                        color_formats: vec![mapping.metal],
-                                        depth_format,
-                                        draw_calls: 0,
-                                        load_action: "clear".to_string(),
-                                        store_action: "store".to_string(),
-                                    });
-                                } else {
-                                    pass.load_action = "clear".to_string();
-                                }
-                            }
-                            None => {
-                                active_pass = Some(RenderPassPlan {
-                                    color_formats: vec![mapping.metal],
-                                    depth_format,
-                                    draw_calls: 0,
-                                    load_action: "clear".to_string(),
-                                    store_action: "store".to_string(),
-                                });
-                            }
-                        }
-                    }
-                    Command::ClearDsv { .. } => {}
-                    Command::Draw { .. } | Command::DrawInstanced { .. } => {
-                        if let Some(pass) = &mut active_pass {
-                            pass.draw_calls += 1;
-                        } else {
-                            validation_errors.push("draw without active render pass".to_string());
-                        }
-                    }
-                    Command::Dispatch { .. } => {
-                        if let Some(pass) = active_pass.take() {
-                            render_passes.push(pass);
-                        }
-                        compute_passes += 1;
-                    }
-                    Command::DispatchMesh { .. } => {
-                        // Mesh shader dispatches require an active render pass
-                        // (they generate geometry for rasterization).
-                        if let Some(pass) = &mut active_pass {
-                            pass.draw_calls += 1;
-                        } else {
-                            validation_errors.push("dispatch mesh without active render pass".to_string());
-                        }
-                    }
-                    Command::CopyResource { src, dst } => {
-                        if let Some(pass) = active_pass.take() {
-                            render_passes.push(pass);
-                        }
-                        blit_passes += 1;
-                        let src_bytes = self.resource(*src)?.bytes.clone();
-                        self.resource_mut(*dst)?.bytes = src_bytes;
-                    }
-                    Command::CopyBufferRegion {
-                        dst,
-                        dst_offset,
-                        src,
-                        src_offset,
-                        size,
-                    } => {
-                        if let Some(pass) = active_pass.take() {
-                            render_passes.push(pass);
-                        }
-                        blit_passes += 1;
-                        let src_bytes = self.resource(*src)?.bytes.clone();
-                        let dst_bytes = self.resource_mut(*dst)?;
-                        let src_start = *src_offset as usize;
-                        let dst_start = *dst_offset as usize;
-                        let len = *size as usize;
-                        if src_start + len <= src_bytes.len() && dst_start + len <= dst_bytes.bytes.len() {
-                            dst_bytes.bytes[dst_start..dst_start + len]
-                                .copy_from_slice(&src_bytes[src_start..src_start + len]);
-                        }
-                    }
-                    Command::CopyResourceRegion {
-                        dst,
-                        dst_x,
-                        dst_y,
-                        dst_z: _,
-                        src,
-                        src_x: _,
-                        src_y: _,
-                        src_z: _,
-                        width,
-                        height,
-                        depth: _,
-                    } => {
-                        if let Some(pass) = active_pass.take() {
-                            render_passes.push(pass);
-                        }
-                        blit_passes += 1;
-                        // For buffer-to-buffer copies, treat as a flat byte copy
-                        // using the offset/size from the region parameters.
-                        // Texture region copies (texture sub-rectangle) are approximated
-                        // by copying the full region as a contiguous block.
-                        let src_bytes = self.resource(*src)?.bytes.clone();
-                        let dst_bytes = self.resource_mut(*dst)?;
-                        let src_stride = *width as usize;
-                        let dst_stride = *width as usize;
-                        let row_count = *height as usize;
-                        let src_offset = (*dst_y as usize) * src_stride; // approximate
-                        let dst_offset = (*dst_y as usize) * dst_stride;
-                        for row in 0..row_count {
-                            let src_row_start = src_offset + row * src_stride;
-                            let dst_row_start = dst_offset + row * dst_stride;
-                            if src_row_start + src_stride <= src_bytes.len()
-                                && dst_row_start + dst_stride <= dst_bytes.bytes.len()
-                            {
-                                dst_bytes.bytes[dst_row_start..dst_row_start + src_stride]
-                                    .copy_from_slice(&src_bytes[src_row_start..src_row_start + src_stride]);
-                            }
-                        }
-                    }
-                    Command::ResolveSubresource { dst, src, .. } => {
-                        if let Some(pass) = active_pass.take() {
-                            render_passes.push(pass);
-                        }
-                        blit_passes += 1;
-                        let src_bytes = self.resource(*src)?.bytes.clone();
-                        self.resource_mut(*dst)?.bytes = src_bytes;
-                    }
-                }
+                self.process_execution_command(
+                    command,
+                    &pipeline,
+                    &mut active_pass,
+                    &mut render_passes,
+                    &mut compute_passes,
+                    &mut blit_passes,
+                    &mut raytrace_passes,
+                    &mut validation_errors,
+                    &mut root_constants_log,
+                )?;
             }
         }
         if let Some(pass) = active_pass.take() {
@@ -1931,6 +2530,7 @@ impl GraphicsBackend {
             render_passes,
             compute_passes,
             blit_passes,
+            raytrace_passes,
             validation_errors,
             root_constants_log,
             signaled_fences,
@@ -1939,7 +2539,12 @@ impl GraphicsBackend {
 
     pub fn create_fence(&mut self, initial_value: u64) -> FenceId {
         let id = self.alloc_id();
-        self.fences.insert(id, FenceRecord { value: initial_value });
+        self.fences.insert(
+            id,
+            FenceRecord {
+                value: initial_value,
+            },
+        );
         id
     }
 
@@ -1957,7 +2562,12 @@ impl GraphicsBackend {
         Ok(current >= value)
     }
 
-    pub fn upload_write(&mut self, resource: ResourceId, offset: usize, bytes: &[u8]) -> AppResult<()> {
+    pub fn upload_write(
+        &mut self,
+        resource: ResourceId,
+        offset: usize,
+        bytes: &[u8],
+    ) -> AppResult<()> {
         let resource = self.resource_mut(resource)?;
         if resource.desc.heap != HeapType::Upload {
             return Err(AppError::new(
@@ -1976,7 +2586,11 @@ impl GraphicsBackend {
         Ok(())
     }
 
-    pub fn overwrite_resource_bytes(&mut self, resource: ResourceId, bytes: &[u8]) -> AppResult<()> {
+    pub fn overwrite_resource_bytes(
+        &mut self,
+        resource: ResourceId,
+        bytes: &[u8],
+    ) -> AppResult<()> {
         let resource = self.resource_mut(resource)?;
         if bytes.len() > resource.bytes.len() {
             return Err(AppError::new(
@@ -1988,7 +2602,12 @@ impl GraphicsBackend {
         Ok(())
     }
 
-    pub fn readback(&self, resource: ResourceId, fence: FenceId, required_value: u64) -> AppResult<Vec<u8>> {
+    pub fn readback(
+        &self,
+        resource: ResourceId,
+        fence: FenceId,
+        required_value: u64,
+    ) -> AppResult<Vec<u8>> {
         let resource = self.resource(resource)?;
         if resource.desc.heap != HeapType::Readback {
             return Err(AppError::new(
@@ -2041,25 +2660,34 @@ impl GraphicsBackend {
         self.timestamps += 1;
         let query_heap = self.query_heap_mut(heap)?;
         if query_heap.ty != QueryType::Timestamp {
-            return Err(AppError::new(ReasonCode::RcD3dInvalidState, "query heap is not a timestamp heap"));
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                "query heap is not a timestamp heap",
+            ));
         }
-        let slot = query_heap
-            .values
-            .get_mut(index)
-            .ok_or_else(|| AppError::new(ReasonCode::RcD3dInvalidState, "query index out of bounds"))?;
+        let slot = query_heap.values.get_mut(index).ok_or_else(|| {
+            AppError::new(ReasonCode::RcD3dInvalidState, "query index out of bounds")
+        })?;
         *slot = value;
         Ok(value)
     }
 
-    pub fn write_occlusion(&mut self, heap: QueryHeapId, index: usize, samples: u64) -> AppResult<()> {
+    pub fn write_occlusion(
+        &mut self,
+        heap: QueryHeapId,
+        index: usize,
+        samples: u64,
+    ) -> AppResult<()> {
         let query_heap = self.query_heap_mut(heap)?;
         if query_heap.ty != QueryType::Occlusion {
-            return Err(AppError::new(ReasonCode::RcD3dInvalidState, "query heap is not an occlusion heap"));
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                "query heap is not an occlusion heap",
+            ));
         }
-        let slot = query_heap
-            .values
-            .get_mut(index)
-            .ok_or_else(|| AppError::new(ReasonCode::RcD3dInvalidState, "query index out of bounds"))?;
+        let slot = query_heap.values.get_mut(index).ok_or_else(|| {
+            AppError::new(ReasonCode::RcD3dInvalidState, "query index out of bounds")
+        })?;
         *slot = samples;
         Ok(())
     }
@@ -2113,14 +2741,20 @@ impl GraphicsBackend {
     fn validate_rtv_descriptor(&self, heap: DescriptorHeapId, index: usize) -> AppResult<()> {
         match self.descriptor_at(heap, index)? {
             ViewDescriptor::Rtv { .. } => Ok(()),
-            _ => Err(AppError::new(ReasonCode::RcD3dInvalidState, "descriptor is not an RTV")),
+            _ => Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                "descriptor is not an RTV",
+            )),
         }
     }
 
     fn validate_dsv_descriptor(&self, heap: DescriptorHeapId, index: usize) -> AppResult<()> {
         match self.descriptor_at(heap, index)? {
             ViewDescriptor::Dsv { .. } => Ok(()),
-            _ => Err(AppError::new(ReasonCode::RcD3dInvalidState, "descriptor is not a DSV")),
+            _ => Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                "descriptor is not a DSV",
+            )),
         }
     }
 
@@ -2195,67 +2829,112 @@ impl GraphicsBackend {
 
     fn swapchain(&self, swapchain: SwapchainId) -> AppResult<&SwapchainRecord> {
         self.swapchains.get(&swapchain).ok_or_else(|| {
-            AppError::new(ReasonCode::RcD3dInvalidState, format!("unknown swapchain {swapchain}"))
+            AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!("unknown swapchain {swapchain}"),
+            )
         })
     }
 
     fn swapchain_mut(&mut self, swapchain: SwapchainId) -> AppResult<&mut SwapchainRecord> {
         self.swapchains.get_mut(&swapchain).ok_or_else(|| {
-            AppError::new(ReasonCode::RcD3dInvalidState, format!("unknown swapchain {swapchain}"))
+            AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!("unknown swapchain {swapchain}"),
+            )
         })
     }
 
     fn resource(&self, resource: ResourceId) -> AppResult<&ResourceRecord> {
         self.resources.get(&resource).ok_or_else(|| {
-            AppError::new(ReasonCode::RcD3dInvalidState, format!("unknown resource {resource}"))
+            AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!("unknown resource {resource}"),
+            )
         })
     }
 
     fn resource_mut(&mut self, resource: ResourceId) -> AppResult<&mut ResourceRecord> {
         self.resources.get_mut(&resource).ok_or_else(|| {
-            AppError::new(ReasonCode::RcD3dInvalidState, format!("unknown resource {resource}"))
+            AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!("unknown resource {resource}"),
+            )
         })
     }
 
     fn descriptor_heap(&self, heap: DescriptorHeapId) -> AppResult<&DescriptorHeapRecord> {
         self.descriptor_heaps.get(&heap).ok_or_else(|| {
-            AppError::new(ReasonCode::RcD3dInvalidState, format!("unknown descriptor heap {heap}"))
+            AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!("unknown descriptor heap {heap}"),
+            )
         })
     }
 
-    fn descriptor_heap_mut(&mut self, heap: DescriptorHeapId) -> AppResult<&mut DescriptorHeapRecord> {
+    fn descriptor_heap_mut(
+        &mut self,
+        heap: DescriptorHeapId,
+    ) -> AppResult<&mut DescriptorHeapRecord> {
         self.descriptor_heaps.get_mut(&heap).ok_or_else(|| {
-            AppError::new(ReasonCode::RcD3dInvalidState, format!("unknown descriptor heap {heap}"))
+            AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!("unknown descriptor heap {heap}"),
+            )
+        })
+    }
+
+    fn command_list(&self, list: CommandListId) -> AppResult<&CommandListRecord> {
+        self.command_lists.get(&list).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!("unknown command list {list}"),
+            )
         })
     }
 
     fn command_list_mut(&mut self, list: CommandListId) -> AppResult<&mut CommandListRecord> {
         self.command_lists.get_mut(&list).ok_or_else(|| {
-            AppError::new(ReasonCode::RcD3dInvalidState, format!("unknown command list {list}"))
+            AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!("unknown command list {list}"),
+            )
         })
     }
 
     fn fence(&self, fence: FenceId) -> AppResult<&FenceRecord> {
         self.fences.get(&fence).ok_or_else(|| {
-            AppError::new(ReasonCode::RcD3dInvalidState, format!("unknown fence {fence}"))
+            AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!("unknown fence {fence}"),
+            )
         })
     }
 
     fn fence_mut(&mut self, fence: FenceId) -> AppResult<&mut FenceRecord> {
         self.fences.get_mut(&fence).ok_or_else(|| {
-            AppError::new(ReasonCode::RcD3dInvalidState, format!("unknown fence {fence}"))
+            AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!("unknown fence {fence}"),
+            )
         })
     }
 
     fn query_heap(&self, heap: QueryHeapId) -> AppResult<&QueryHeapRecord> {
         self.query_heaps.get(&heap).ok_or_else(|| {
-            AppError::new(ReasonCode::RcD3dInvalidState, format!("unknown query heap {heap}"))
+            AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!("unknown query heap {heap}"),
+            )
         })
     }
 
     fn query_heap_mut(&mut self, heap: QueryHeapId) -> AppResult<&mut QueryHeapRecord> {
         self.query_heaps.get_mut(&heap).ok_or_else(|| {
-            AppError::new(ReasonCode::RcD3dInvalidState, format!("unknown query heap {heap}"))
+            AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!("unknown query heap {heap}"),
+            )
         })
     }
 
@@ -2267,9 +2946,9 @@ impl GraphicsBackend {
 
 fn encode_ppm(width: u32, height: u32, format: DxgiFormat, bytes: &[u8]) -> AppResult<Vec<u8>> {
     let pixel_count = width as usize * height as usize;
-    let expected_bytes = pixel_count.checked_mul(4).ok_or_else(|| {
-        AppError::new(ReasonCode::RcD3dInvalidState, "frame dimensions overflow")
-    })?;
+    let expected_bytes = pixel_count
+        .checked_mul(4)
+        .ok_or_else(|| AppError::new(ReasonCode::RcD3dInvalidState, "frame dimensions overflow"))?;
     if bytes.len() < expected_bytes {
         return Err(AppError::new(
             ReasonCode::RcD3dInvalidState,
@@ -2293,7 +2972,7 @@ fn encode_ppm(width: u32, height: u32, format: DxgiFormat, bytes: &[u8]) -> AppR
             return Err(AppError::new(
                 ReasonCode::RcD3dInvalidState,
                 format!("frame export does not support {other:?}"),
-            ))
+            ));
         }
     }
     Ok(ppm)
@@ -2560,10 +3239,16 @@ fn metal_binding(slot: u32, descriptor: &ViewDescriptor) -> MetalBinding {
     }
 }
 
-fn validate_view_format(resource_format: DxgiFormat, requested_format: DxgiFormat, descriptor: &ViewDescriptor) -> AppResult<()> {
+fn validate_view_format(
+    resource_format: DxgiFormat,
+    requested_format: DxgiFormat,
+    descriptor: &ViewDescriptor,
+) -> AppResult<()> {
     match descriptor {
         ViewDescriptor::Dsv { .. } => {
-            if !matches!(resource_format, DxgiFormat::D24UnormS8Uint) || requested_format != resource_format {
+            if !matches!(resource_format, DxgiFormat::D24UnormS8Uint)
+                || requested_format != resource_format
+            {
                 return Err(AppError::new(
                     ReasonCode::RcD3dFeatureUnsupported,
                     "invalid depth/stencil view reinterpretation",
@@ -2571,7 +3256,8 @@ fn validate_view_format(resource_format: DxgiFormat, requested_format: DxgiForma
             }
         }
         ViewDescriptor::Rtv { .. } => {
-            if resource_format == DxgiFormat::D24UnormS8Uint || requested_format != resource_format {
+            if resource_format == DxgiFormat::D24UnormS8Uint || requested_format != resource_format
+            {
                 return Err(AppError::new(
                     ReasonCode::RcD3dFeatureUnsupported,
                     "invalid render-target view reinterpretation",
@@ -2593,23 +3279,25 @@ fn validate_view_format(resource_format: DxgiFormat, requested_format: DxgiForma
 
 pub fn detected_host_gpu_profile() -> HostGpuProfile {
     static HOST_GPU_PROFILE: OnceLock<HostGpuProfile> = OnceLock::new();
-    HOST_GPU_PROFILE.get_or_init(detect_host_gpu_profile).clone()
+    HOST_GPU_PROFILE
+        .get_or_init(detect_host_gpu_profile)
+        .clone()
 }
 
 fn detect_host_gpu_profile() -> HostGpuProfile {
     let profile = {
-    #[cfg(target_os = "macos")]
-    {
-        if let Some(chip_name) = detect_macos_apple_chip_name() {
-            host_gpu_profile_from_name(&chip_name)
-        } else {
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(chip_name) = detect_macos_apple_chip_name() {
+                host_gpu_profile_from_name(&chip_name)
+            } else {
+                host_gpu_profile_from_name("Apple GPU")
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
             host_gpu_profile_from_name("Apple GPU")
         }
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        host_gpu_profile_from_name("Apple GPU")
-    }
     };
     match reported_gpu_vendor_override() {
         Some(vendor) => apply_reported_gpu_vendor_compatibility(profile, vendor),
@@ -2625,7 +3313,7 @@ pub(crate) fn host_gpu_profile_from_name(name: &str) -> HostGpuProfile {
         adapter: AdapterInfo {
             id: 1,
             vendor_id: vendor.vendor_id(),
-            device_id: vendor.synthetic_device_id(family),
+            device_id: vendor.device_id_for_family(family),
             name: normalized.clone(),
             metal_family: format!("apple{family}"),
         },
@@ -2643,7 +3331,12 @@ pub(crate) fn host_gpu_profile_from_name(name: &str) -> HostGpuProfile {
 
 fn reported_gpu_vendor_for_name(name: &str) -> ReportedGpuVendor {
     let upper = name.to_ascii_uppercase();
-    if upper.contains("NVIDIA") || upper.contains("GEFORCE") || upper.contains("QUADRO") || upper.contains("RTX") || upper.contains("GTX") {
+    if upper.contains("NVIDIA")
+        || upper.contains("GEFORCE")
+        || upper.contains("QUADRO")
+        || upper.contains("RTX")
+        || upper.contains("GTX")
+    {
         ReportedGpuVendor::Nvidia
     } else if upper.starts_with("AMD ") || upper.contains("RADEON") {
         ReportedGpuVendor::Amd
@@ -2674,7 +3367,7 @@ fn apply_reported_gpu_vendor_compatibility(
         .and_then(|value| value.parse::<u8>().ok())
         .unwrap_or(8);
     profile.adapter.vendor_id = vendor.vendor_id();
-    profile.adapter.device_id = vendor.synthetic_device_id(family);
+    profile.adapter.device_id = vendor.device_id_for_family(family);
     if vendor != ReportedGpuVendor::Apple && profile.adapter.name.starts_with("Apple ") {
         profile.adapter.name = vendor.compatibility_adapter_name(&profile.adapter.name);
     }
@@ -2698,8 +3391,17 @@ fn metal_family_for_gpu_name(name: &str) -> Option<u8> {
     let generation = upper
         .split_whitespace()
         .find_map(|part| part.strip_prefix('M'))
-        .and_then(|digits| digits.chars().take_while(|ch| ch.is_ascii_digit()).collect::<String>().parse::<u8>().ok());
-    generation.map(|generation| generation.saturating_add(6)).or(Some(8))
+        .and_then(|digits| {
+            digits
+                .chars()
+                .take_while(|ch| ch.is_ascii_digit())
+                .collect::<String>()
+                .parse::<u8>()
+                .ok()
+        });
+    generation
+        .map(|generation| generation.saturating_add(6))
+        .or(Some(8))
 }
 
 #[cfg(target_os = "macos")]
@@ -2741,11 +3443,7 @@ fn read_command_output(program: &str, args: &[&str]) -> Option<String> {
         return None;
     }
     let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if value.is_empty() {
-        None
-    } else {
-        Some(value)
-    }
+    if value.is_empty() { None } else { Some(value) }
 }
 
 #[cfg(test)]
@@ -2841,12 +3539,16 @@ mod tests {
     #[test]
     fn reported_vendor_compatibility_override_preserves_underlying_metal_capabilities() {
         let apple = host_gpu_profile_from_name("Apple M3 Pro");
-        let nvidia = apply_reported_gpu_vendor_compatibility(apple.clone(), ReportedGpuVendor::Nvidia);
+        let nvidia =
+            apply_reported_gpu_vendor_compatibility(apple.clone(), ReportedGpuVendor::Nvidia);
         let amd = apply_reported_gpu_vendor_compatibility(apple.clone(), ReportedGpuVendor::Amd);
 
         assert_eq!(nvidia.adapter.vendor_id, 0x10de);
         assert_eq!(nvidia.adapter.device_id, 0x2009);
-        assert_eq!(nvidia.adapter.name, "NVIDIA Compatibility Adapter (Apple M3 Pro)");
+        assert_eq!(
+            nvidia.adapter.name,
+            "NVIDIA Compatibility Adapter (Apple M3 Pro)"
+        );
         assert_eq!(nvidia.adapter.metal_family, "apple9");
         assert_eq!(nvidia.capabilities, apple.capabilities);
 
@@ -2859,7 +3561,8 @@ mod tests {
 
     #[test]
     fn graphics_backend_uses_capability_profile_for_features_and_storage_modes() {
-        let mut backend = GraphicsBackend::with_host_profile(host_gpu_profile_from_name("Apple M3 Ultra"));
+        let mut backend =
+            GraphicsBackend::with_host_profile(host_gpu_profile_from_name("Apple M3 Ultra"));
 
         assert_eq!(backend.adapter().name, "Apple M3 Ultra");
         assert_eq!(backend.adapter().metal_family, "apple9");
@@ -2878,7 +3581,9 @@ mod tests {
             })
             .expect("create upload resource");
         assert_eq!(
-            backend.resource_storage_mode(upload).expect("upload storage mode"),
+            backend
+                .resource_storage_mode(upload)
+                .expect("upload storage mode"),
             MetalStorageMode::Shared
         );
 
@@ -2894,14 +3599,18 @@ mod tests {
             })
             .expect("create depth resource");
         assert_eq!(
-            backend.resource_storage_mode(depth).expect("depth storage mode"),
+            backend
+                .resource_storage_mode(depth)
+                .expect("depth storage mode"),
             MetalStorageMode::Memoryless
         );
     }
 
     #[test]
-    fn graphics_backend_prefers_shared_storage_for_small_dynamic_buffers_on_unified_memory_apple_gpus() {
-        let mut backend = GraphicsBackend::with_host_profile(host_gpu_profile_from_name("Apple M5 Pro"));
+    fn graphics_backend_prefers_shared_storage_for_small_dynamic_buffers_on_unified_memory_apple_gpus()
+     {
+        let mut backend =
+            GraphicsBackend::with_host_profile(host_gpu_profile_from_name("Apple M5 Pro"));
 
         let small_dynamic_buffer = backend
             .create_resource(ResourceDesc {
@@ -3015,7 +3724,8 @@ mod tests {
 
     #[test]
     fn graphics_backend_uses_low_latency_swapchain_defaults_on_apple_silicon() {
-        let mut backend = GraphicsBackend::with_host_profile(host_gpu_profile_from_name("Apple M5 Pro"));
+        let mut backend =
+            GraphicsBackend::with_host_profile(host_gpu_profile_from_name("Apple M5 Pro"));
 
         let swapchain = backend
             .create_swapchain(SwapchainDesc {
@@ -3033,7 +3743,8 @@ mod tests {
 
     #[test]
     fn graphics_backend_preserves_deeper_swapchain_latency_for_non_unified_profiles() {
-        let mut backend = GraphicsBackend::with_host_profile(host_gpu_profile_from_name("Generic Discrete GPU"));
+        let mut backend =
+            GraphicsBackend::with_host_profile(host_gpu_profile_from_name("Generic Discrete GPU"));
 
         let swapchain = backend
             .create_swapchain(SwapchainDesc {

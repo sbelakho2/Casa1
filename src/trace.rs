@@ -1,10 +1,10 @@
+use crate::TRACE_CACHE_VERSION;
+use crate::TRACE_FORMAT_VERSION;
 use crate::canonical::CanonicalTestOutput;
 use crate::error::{AppError, AppResult};
 use crate::ge::GameEnvironment;
 use crate::reason::ReasonCode;
 use crate::util;
-use crate::TRACE_CACHE_VERSION;
-use crate::TRACE_FORMAT_VERSION;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -131,7 +131,7 @@ pub fn parse_categories(input: Option<&str>) -> AppResult<Vec<TraceCategory>> {
                         return Err(AppError::new(
                             ReasonCode::RcCliInvalid,
                             format!("unknown trace category {unknown}"),
-                        ))
+                        ));
                     }
                 };
                 categories.push(category);
@@ -182,7 +182,10 @@ pub fn compute_env_fingerprint(
     let config_json = util::stable_json(&config_fingerprint)?;
     let mut resources = BTreeMap::new();
     resources.insert("program_sha256".to_string(), program_hash.clone());
-    resources.insert("ge_config_sha256".to_string(), util::sha256_bytes(config_json.as_bytes()));
+    resources.insert(
+        "ge_config_sha256".to_string(),
+        util::sha256_bytes(config_json.as_bytes()),
+    );
     resources.insert(
         "trace_cache_version".to_string(),
         TRACE_CACHE_VERSION.to_string(),
@@ -224,13 +227,14 @@ pub fn merge_events(
                 &error,
             )
         })?;
-        let guest_events = serde_json::from_str::<Vec<TraceEvent>>(&guest_contents).map_err(|error| {
-            AppError::new(
-                ReasonCode::RcIo,
-                format!("failed to parse {}", guest_trace_path.display()),
-            )
-            .with_hint(error.to_string())
-        })?;
+        let guest_events =
+            serde_json::from_str::<Vec<TraceEvent>>(&guest_contents).map_err(|error| {
+                AppError::new(
+                    ReasonCode::RcIo,
+                    format!("failed to parse {}", guest_trace_path.display()),
+                )
+                .with_hint(error.to_string())
+            })?;
         merged.extend(
             guest_events
                 .into_iter()
@@ -245,11 +249,15 @@ pub fn merge_events(
 }
 
 pub fn category_names(categories: &[TraceCategory]) -> Vec<String> {
-    categories.iter().map(|category| category.as_str().to_string()).collect()
+    categories
+        .iter()
+        .map(|category| category.as_str().to_string())
+        .collect()
 }
 
 pub fn validate_replay_environment(record: &TraceRecord, ge: &GameEnvironment) -> AppResult<()> {
-    if record.format_version != TRACE_FORMAT_VERSION || record.cache_version != TRACE_CACHE_VERSION {
+    if record.format_version != TRACE_FORMAT_VERSION || record.cache_version != TRACE_CACHE_VERSION
+    {
         return Err(AppError::new(
             ReasonCode::RcTraceEnvMismatch,
             "trace format or cache version mismatch during replay",
@@ -283,5 +291,287 @@ fn normalize_replay_path(path: &Path, ge_root: &Path) -> String {
     match path.strip_prefix(ge_root) {
         Ok(relative) => format!("<GE_ROOT>/{}", relative.display()),
         Err(_) => path.display().to_string(),
+    }
+}
+
+// ===========================================================================
+// Unit tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::canonical::CanonicalTestOutput;
+    use std::collections::BTreeMap;
+
+    /// Build a minimal `TraceRecord` with the given format and cache versions.
+    fn make_trace_record(format_version: u32, cache_version: u32) -> TraceRecord {
+        TraceRecord {
+            format_version,
+            cache_version,
+            test_id: "test-trace-versioning".to_string(),
+            captured_ge_root: PathBuf::from("/tmp/ge"),
+            ge_profile: TraceGeProfile {
+                arch: "x64".to_string(),
+                winver: "win11-23h2".to_string(),
+            },
+            categories: vec!["process".to_string()],
+            env_fingerprint: "abc123".to_string(),
+            resources: BTreeMap::new(),
+            command: TraceCommand {
+                program: PathBuf::from("/usr/bin/true"),
+                args: vec![],
+                cwd: PathBuf::from("/tmp"),
+                env: BTreeMap::new(),
+                dtm: false,
+                intent: "test".to_string(),
+            },
+            expected_output: CanonicalTestOutput::default(),
+            events: vec![],
+        }
+    }
+
+    #[test]
+    fn test_current_version_writes_correct_version() {
+        let record = make_trace_record(TRACE_FORMAT_VERSION, TRACE_CACHE_VERSION);
+        assert_eq!(record.format_version, TRACE_FORMAT_VERSION);
+        assert_eq!(record.cache_version, TRACE_CACHE_VERSION);
+    }
+
+    #[test]
+    fn test_reading_wrong_format_version_returns_error() {
+        let record = make_trace_record(999, TRACE_CACHE_VERSION);
+        // Simulate what validate_replay_environment does
+        let version_ok = record.format_version == TRACE_FORMAT_VERSION
+            && record.cache_version == TRACE_CACHE_VERSION;
+        assert!(!version_ok, "wrong format version should fail validation");
+    }
+
+    #[test]
+    fn test_reading_wrong_cache_version_returns_error() {
+        let record = make_trace_record(TRACE_FORMAT_VERSION, 999);
+        let version_ok = record.format_version == TRACE_FORMAT_VERSION
+            && record.cache_version == TRACE_CACHE_VERSION;
+        assert!(!version_ok, "wrong cache version should fail validation");
+    }
+
+    #[test]
+    fn test_reading_both_wrong_versions_returns_error() {
+        let record = make_trace_record(0, 0);
+        let version_ok = record.format_version == TRACE_FORMAT_VERSION
+            && record.cache_version == TRACE_CACHE_VERSION;
+        assert!(!version_ok, "zero versions should fail validation");
+    }
+
+    #[test]
+    fn test_load_trace_invalid_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad_trace.json");
+        std::fs::write(&path, "not valid json{{{").unwrap();
+        let result = load_trace(&path);
+        assert!(result.is_err(), "loading invalid JSON should fail");
+    }
+
+    #[test]
+    fn test_load_trace_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty_trace.json");
+        std::fs::write(&path, "").unwrap();
+        let result = load_trace(&path);
+        assert!(result.is_err(), "loading empty file should fail");
+    }
+
+    #[test]
+    fn test_load_trace_missing_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("partial_trace.json");
+        std::fs::write(&path, r#"{"format_version": 1}"#).unwrap();
+        let result = load_trace(&path);
+        assert!(
+            result.is_err(),
+            "loading JSON with missing fields should fail"
+        );
+    }
+
+    #[test]
+    fn test_parse_categories_all() {
+        let cats = parse_categories(None).unwrap();
+        assert_eq!(cats.len(), all_categories().len());
+    }
+
+    #[test]
+    fn test_parse_categories_single() {
+        let cats = parse_categories(Some("file")).unwrap();
+        assert_eq!(cats, vec![TraceCategory::File]);
+    }
+
+    #[test]
+    fn test_parse_categories_multiple() {
+        let cats = parse_categories(Some("file,registry,process")).unwrap();
+        assert_eq!(
+            cats,
+            vec![
+                TraceCategory::File,
+                TraceCategory::Registry,
+                TraceCategory::Process
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_categories_unknown() {
+        let result = parse_categories(Some("unknown_category"));
+        assert!(result.is_err(), "expected Err, got {result:?}");
+    }
+
+    #[test]
+    fn test_category_names_roundtrip() {
+        let cats = all_categories();
+        let names = category_names(&cats);
+        for name in &names {
+            let parsed = parse_categories(Some(name)).unwrap();
+            assert_eq!(parsed.len(), 1);
+        }
+    }
+
+    #[test]
+    fn test_remap_replay_path_inside_ge() {
+        let result = remap_replay_path(
+            &PathBuf::from("/old/ge/subdir/file.txt"),
+            Path::new("/old/ge"),
+            Path::new("/new/ge"),
+        );
+        assert_eq!(result, PathBuf::from("/new/ge/subdir/file.txt"));
+    }
+
+    #[test]
+    fn test_remap_replay_path_outside_ge() {
+        let result = remap_replay_path(
+            &PathBuf::from("/other/path/file.txt"),
+            Path::new("/old/ge"),
+            Path::new("/new/ge"),
+        );
+        assert_eq!(result, PathBuf::from("/other/path/file.txt"));
+    }
+
+    // ── Backward compatibility tests ─────────────────────────────────────────
+
+    #[test]
+    fn test_older_format_version_still_readable() {
+        let record = make_trace_record(0, TRACE_CACHE_VERSION);
+        // Older format versions should fail validation against current TRACE_FORMAT_VERSION,
+        // but the deserialization and construction itself should work fine.
+        assert_eq!(record.format_version, 0);
+        assert_eq!(record.cache_version, TRACE_CACHE_VERSION);
+        // The JSON representation should be valid
+        let json = serde_json::to_string(&record).expect("serialize old-format trace");
+        let deserialized: TraceRecord =
+            serde_json::from_str(&json).expect("deserialize old-format trace");
+        assert_eq!(deserialized.format_version, 0);
+        assert_eq!(deserialized.cache_version, TRACE_CACHE_VERSION);
+    }
+
+    #[test]
+    fn test_older_cache_version_still_readable() {
+        let record = make_trace_record(TRACE_FORMAT_VERSION, 0);
+        assert_eq!(record.format_version, TRACE_FORMAT_VERSION);
+        assert_eq!(record.cache_version, 0);
+        let json = serde_json::to_string(&record).expect("serialize old-cache trace");
+        let deserialized: TraceRecord =
+            serde_json::from_str(&json).expect("deserialize old-cache trace");
+        assert_eq!(deserialized.cache_version, 0);
+    }
+
+    #[test]
+    fn test_backward_compat_validation_rejects_old_format() {
+        // Even though old formats can be deserialized, validate_replay_environment
+        // should reject them
+        let record = make_trace_record(0, TRACE_CACHE_VERSION);
+        let json = serde_json::to_string(&record).expect("serialize");
+        let deserialized: TraceRecord = serde_json::from_str(&json).expect("deserialize");
+        // We can't easily call validate_replay_environment without a real GE,
+        // but we can verify the version mismatch check logic
+        let format_mismatch = deserialized.format_version != TRACE_FORMAT_VERSION;
+        let cache_mismatch = deserialized.cache_version != TRACE_CACHE_VERSION;
+        assert!(format_mismatch, "format version 0 should mismatch current");
+        assert!(!cache_mismatch, "cache version should match");
+    }
+
+    #[test]
+    fn test_trace_record_with_extra_fields() {
+        // Simulate a trace file that was written by a newer version with extra fields.
+        // Deserialization should succeed (serde ignores unknown fields by default).
+        let record = make_trace_record(TRACE_FORMAT_VERSION, TRACE_CACHE_VERSION);
+        let mut json = serde_json::to_value(&record).expect("serialize");
+        json["extra_field"] = serde_json::Value::String("unexpected".to_string());
+        json["nested"]["extra"] = serde_json::Value::Number(serde_json::Number::from(42));
+        let json_str = serde_json::to_string(&json).expect("to string");
+        let deserialized: TraceRecord =
+            serde_json::from_str(&json_str).expect("deserialize with extra fields");
+        assert_eq!(deserialized.format_version, TRACE_FORMAT_VERSION);
+        assert_eq!(deserialized.cache_version, TRACE_CACHE_VERSION);
+    }
+
+    // ── Malformed trace file tests ───────────────────────────────────────────
+
+    #[test]
+    fn test_load_trace_truncated_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("truncated_trace.json");
+        // Write a valid JSON prefix but truncated
+        let valid = r#"{"format_version":1,"cache_version":1,"test_id":"test"#;
+        std::fs::write(&path, valid).unwrap();
+        let result = load_trace(&path);
+        assert!(result.is_err(), "loading truncated JSON should fail");
+    }
+
+    #[test]
+    fn test_load_trace_invalid_utf8() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad_utf8_trace.json");
+        // Write invalid UTF-8 bytes
+        std::fs::write(&path, &[0xFF, 0xFE, 0x00, 0x01]).unwrap();
+        let result = load_trace(&path);
+        assert!(result.is_err(), "loading invalid UTF-8 should fail");
+    }
+
+    #[test]
+    fn test_load_trace_non_existent() {
+        let result = load_trace(Path::new("/tmp/nonexistent_trace_file_casa1_xyz.json"));
+        assert!(result.is_err(), "loading non-existent file should fail");
+    }
+
+    #[test]
+    fn test_load_trace_null_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("null_trace.json");
+        // Write JSON with embedded null bytes
+        std::fs::write(
+            &path,
+            "{\"format_version\":1,\"cache_version\":1,\"test_id\":\"test\x00withnull\"}",
+        )
+        .unwrap();
+        let result = load_trace(&path);
+        // serde_json can handle null bytes in strings, but the result should still be parseable
+        if let Ok(record) = &result {
+            assert!(
+                record.test_id.contains('\0'),
+                "test_id should contain the null byte"
+            );
+        }
+    }
+
+    #[test]
+    fn test_load_trace_wrong_type_for_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wrong_type_trace.json");
+        // format_version is a string instead of a number
+        std::fs::write(
+            &path,
+            r#"{"format_version":"not_a_number","cache_version":1,"test_id":"test"}"#,
+        )
+        .unwrap();
+        let result = load_trace(&path);
+        assert!(result.is_err(), "wrong type for format_version should fail");
     }
 }

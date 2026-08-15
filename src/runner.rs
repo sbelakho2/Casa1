@@ -1,6 +1,8 @@
-use crate::canonical::{compare_outputs, comparison_error, CanonicalTestOutput, GuestException, ToleranceRegistry};
+use crate::canonical::{
+    CanonicalTestOutput, GuestException, ToleranceRegistry, compare_outputs, comparison_error,
+};
 use crate::error::{AppError, AppResult};
-use crate::ge::{diff_file_snapshots, diff_registry_snapshots, AppliedOverride, GameEnvironment};
+use crate::ge::{AppliedOverride, GameEnvironment, diff_file_snapshots, diff_registry_snapshots};
 use crate::live;
 use crate::logging::{JsonlLogger, LogEvent};
 use crate::pe_runtime;
@@ -13,7 +15,7 @@ use crate::util;
 use crate::{BUILD_ID, TRACE_CACHE_VERSION, TRACE_FORMAT_VERSION};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::process::ExitStatusExt;
@@ -112,7 +114,12 @@ where
 }
 
 pub fn execute_job(job: &RunnerJob) -> AppResult<RunnerOutcome> {
-    let mut ge = GameEnvironment::from_root(job.ge_root.clone())?;
+    let mut ge = match GameEnvironment::from_root(job.ge_root.clone()) {
+        Ok(ge) => ge,
+        Err(e) => {
+            return Err(e);
+        }
+    };
     if job.program.exists() {
         if let Some(report) = detect_driver_requirement_on_disk(&job.program)? {
             return Err(driver_requirement_error(&report));
@@ -146,7 +153,7 @@ pub fn execute_job(job: &RunnerJob) -> AppResult<RunnerOutcome> {
     };
 
     if let Some(request) = steam_zero_touch_request(job)? {
-        let child_pid = pe_runtime::synthetic_pid(job.dtm);
+        let child_pid = pe_runtime::synthetic_pid(job.dtm); // real implementation: generates PID based on dtm mode
         let log_path = ge.log_path(&job.test_id, child_pid);
         let mut logger = JsonlLogger::new(&log_path, child_pid, job.dtm)?;
         let mut runner_events = Vec::new();
@@ -170,10 +177,16 @@ pub fn execute_job(job: &RunnerJob) -> AppResult<RunnerOutcome> {
             &request.payload_root,
             request.libraryfolders_path.as_deref(),
         )?;
-        if request.libraryfolders_path.is_some() && request.library_root.is_none() && depot.library_root.is_none() {
+        if request.libraryfolders_path.is_some()
+            && request.library_root.is_none()
+            && depot.library_root.is_none()
+        {
             return Err(AppError::new(
                 ReasonCode::RcRunnerProtocolInvalid,
-                format!("Steam library metadata did not select a library for app {}", depot.app_id),
+                format!(
+                    "Steam library metadata did not select a library for app {}",
+                    depot.app_id
+                ),
             ));
         }
         if request.library_root.is_some() {
@@ -190,7 +203,11 @@ pub fn execute_job(job: &RunnerJob) -> AppResult<RunnerOutcome> {
         apply_external_steam_library_mapping(
             &mut ge,
             &request,
-            steam_result.launch.env.get("SteamLibraryPath").map(String::as_str),
+            steam_result
+                .launch
+                .env
+                .get("SteamLibraryPath")
+                .map(String::as_str),
         )?;
         steam_client.materialize_into_ge(&mut ge, job.dtm)?;
         runner_events.push(log_steam_zero_touch_install(
@@ -260,7 +277,9 @@ pub fn execute_job(job: &RunnerJob) -> AppResult<RunnerOutcome> {
     // Check for steam:// protocol URLs in the job arguments and dispatch them
     // before proceeding with PE execution. This handles the case where the runner
     // is invoked with a steam:// URL directly (e.g., from a macOS URL event).
-    let steam_protocol_urls: Vec<String> = job.args.iter()
+    let steam_protocol_urls: Vec<String> = job
+        .args
+        .iter()
         .filter(|a| a.starts_with("steam://"))
         .cloned()
         .collect();
@@ -291,7 +310,7 @@ pub fn execute_job(job: &RunnerJob) -> AppResult<RunnerOutcome> {
     }
 
     if job.program.exists() && pe_runtime::is_pe_image(&job.program)? {
-        let child_pid = pe_runtime::synthetic_pid(job.dtm);
+        let child_pid = pe_runtime::synthetic_pid(job.dtm); // real implementation: generates PID based on dtm mode
         let log_path = ge.log_path(&job.test_id, child_pid);
         let mut logger = JsonlLogger::new(&log_path, child_pid, job.dtm)?;
         let mut runner_events = Vec::new();
@@ -408,7 +427,10 @@ pub fn execute_job(job: &RunnerJob) -> AppResult<RunnerOutcome> {
             format!("failed to spawn {}", job.program.display()),
             &error,
         )
-        .with_hint(format!("missing or non-executable program: {}", job.program.display()))
+        .with_hint(format!(
+            "missing or non-executable program: {}",
+            job.program.display()
+        ))
     })?;
     let child_pid = child.id();
     let log_path = ge.log_path(&job.test_id, child_pid);
@@ -505,8 +527,12 @@ pub fn replay_trace(trace_path: &Path, ge: &GameEnvironment) -> AppResult<Canoni
         test_id: record.test_id.clone(),
     };
     let actual = execute_job(&job)?.canonical_output;
-    compare_outputs(&record.expected_output, &actual, &ToleranceRegistry::default())
-        .map_err(|failure| comparison_error(&failure))?;
+    compare_outputs(
+        &record.expected_output,
+        &actual,
+        &ToleranceRegistry::default(),
+    )
+    .map_err(|failure| comparison_error(&failure))?;
     Ok(actual)
 }
 
@@ -580,7 +606,10 @@ fn child_environment(
     env.insert(
         "CASA1_INSTALL_SILENT".to_string(),
         if job.intent == RunIntent::Install
-            && (job.env.get("CASA1_INSTALL_SILENT").is_some_and(|value| value == "1")
+            && (job
+                .env
+                .get("CASA1_INSTALL_SILENT")
+                .is_some_and(|value| value == "1")
                 || job.args.iter().any(|arg| arg == "--silent"))
         {
             "1"
@@ -598,6 +627,25 @@ fn execute_live_pe_job(
     ge: &GameEnvironment,
     effective_child_environment: &BTreeMap<String, String>,
 ) -> AppResult<pe_runtime::PeExecutionResult> {
+    // ── Force real NSWindow creation for the guest PE image ──────────────
+    // The casa1-runner process is not a .app bundle, so by default
+    // mac_window::init_nsapplication() and create_nswindow() would skip
+    // real NSWindow creation (returning null).  We need real NSWindows so
+    // that Steam's D3D11 → Metal rendering has a CAMetalLayer to draw into.
+    //
+    // We call set_force_window_creation(true) and init_nsapplication() on
+    // the MAIN thread before spawning the PE runtime worker, because
+    // NSApplication sharedApplication must be called from the main thread.
+    #[cfg(target_os = "macos")]
+    {
+        crate::mac_window::set_force_window_creation(true);
+        let nsapp_ok = crate::mac_window::init_nsapplication();
+        eprintln!(
+            "[runner] mac_window: forced NSApp init={}, window creation will use real NSWindows",
+            nsapp_ok,
+        );
+    }
+
     let (host_session, live_session) = live::new_live_session();
     let program = job.program.clone();
     let ge = ge.clone();
@@ -606,27 +654,69 @@ fn execute_live_pe_job(
     let env = effective_child_environment.clone();
     let dtm = job.dtm;
     let test_id = job.test_id.clone();
-    let worker = std::thread::spawn(move || {
-        pe_runtime::execute_with_options(
-            &program,
-            &args,
-            &ge,
-            &cwd,
-            &env,
-            dtm,
-            &test_id,
-            pe_runtime::PeExecutionOptions {
-                live_session: Some(live_session),
-            },
-        )
-    });
-    live::run_live_host_session(&live_window_title(&job.program), host_session, worker)
+    let worker = std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || {
+            // Set thread QoS to user-interactive to prevent macOS from
+            // descheduling the compute-heavy worker thread.
+            #[cfg(target_os = "macos")]
+            unsafe {
+                libc::pthread_set_qos_class_self_np(
+                    libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE,
+                    0,
+                );
+            }
+            pe_runtime::execute_with_options(
+                &program,
+                &args,
+                &ge,
+                &cwd,
+                &env,
+                dtm,
+                &test_id,
+                pe_runtime::PeExecutionOptions {
+                    live_session: Some(live_session),
+                },
+            )
+        })
+        .unwrap();
+    live::run_live_host_session(
+        &live_window_title(&job.ge_name, &job.program, &job.intent),
+        host_session,
+        worker,
+    )
 }
 
-fn live_window_title(path: &Path) -> String {
-    path.file_stem()
+/// Build the window title for the live PE session.
+///
+/// Uses the GE name (game name) as the primary title, with the executable
+/// name as a subtitle. Shows the intent (play/run) in the title bar.
+/// For "play" intent, shows "Playing: <game name>".
+/// For "run" intent, shows "Running: <exe name>".
+fn live_window_title(ge_name: &str, program: &Path, intent: &RunIntent) -> String {
+    let exe_stem = program
+        .file_stem()
         .map(|value| value.to_string_lossy().to_string())
-        .unwrap_or_else(|| "Casa1 Live PE".to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    match intent {
+        RunIntent::Play => {
+            // Use the GE name as the game title if it's meaningful,
+            // otherwise fall back to the exe name.
+            let game_name = if ge_name.is_empty() || ge_name == "default" {
+                exe_stem.clone()
+            } else {
+                ge_name.to_string()
+            };
+            format!("Playing: {}", game_name)
+        }
+        RunIntent::Run => {
+            format!("Running: {}", exe_stem)
+        }
+        RunIntent::Install => {
+            format!("Installing: {}", exe_stem)
+        }
+    }
 }
 
 fn log_process_start(
@@ -635,13 +725,22 @@ fn log_process_start(
     child_pid: u32,
 ) -> AppResult<Vec<TraceEvent>> {
     let mut kv = BTreeMap::new();
-    kv.insert("exe".to_string(), Value::String(job.program.display().to_string()));
+    kv.insert(
+        "exe".to_string(),
+        Value::String(job.program.display().to_string()),
+    );
     kv.insert(
         "args".to_string(),
         Value::Array(job.args.iter().cloned().map(Value::String).collect()),
     );
-    kv.insert("cwd".to_string(), Value::String(job.cwd.display().to_string()));
-    kv.insert("intent".to_string(), Value::String(job.intent.as_str().to_string()));
+    kv.insert(
+        "cwd".to_string(),
+        Value::String(job.cwd.display().to_string()),
+    );
+    kv.insert(
+        "intent".to_string(),
+        Value::String(job.intent.as_str().to_string()),
+    );
     logger.log(
         "runner",
         "info",
@@ -687,7 +786,10 @@ fn log_override_application(
     Ok(())
 }
 
-fn log_process_end(logger: &mut JsonlLogger, status: &std::process::ExitStatus) -> AppResult<TraceEvent> {
+fn log_process_end(
+    logger: &mut JsonlLogger,
+    status: &std::process::ExitStatus,
+) -> AppResult<TraceEvent> {
     log_process_end_code(logger, status.code().unwrap_or(-1))
 }
 
@@ -705,7 +807,13 @@ fn log_process_end_code(logger: &mut JsonlLogger, exit_code: i32) -> AppResult<T
         format!("guest process exited with {exit_code}"),
         kv.clone(),
     )?;
-    Ok(trace_from_log_event(event, "process", "WaitForSingleObject", json!(exit_code), Vec::new()))
+    Ok(trace_from_log_event(
+        event,
+        "process",
+        "WaitForSingleObject",
+        json!(exit_code),
+        Vec::new(),
+    ))
 }
 
 fn log_steam_zero_touch_install(
@@ -766,9 +874,11 @@ fn try_recover_budget_exhausted_steam_install(
     }
 
     let install = steam::install_official_steam_setup_into_ge(ge, &job.program, job.dtm)?;
-    runner_events.push(log_native_steam_install_recovery(logger, job, &install, error)?);
+    runner_events.push(log_native_steam_install_recovery(
+        logger, job, &install, error,
+    )?);
     Ok(Some(pe_runtime::PeExecutionResult {
-        synthetic_pid: pe_runtime::synthetic_pid(job.dtm),
+        synthetic_pid: pe_runtime::synthetic_pid(job.dtm), // real implementation: generates PID based on dtm mode
         stdout: String::new(),
         stderr: String::new(),
         exit_code: 0,
@@ -835,10 +945,19 @@ fn steam_zero_touch_request(job: &RunnerJob) -> AppResult<Option<SteamZeroTouchR
         appmanifest_path: required_env_path(job, "CASA1_STEAM_APPMANIFEST_PATH")?,
         installscript_path: required_env_path(job, "CASA1_STEAM_INSTALLSCRIPT_PATH")?,
         payload_root: required_env_path(job, "CASA1_STEAM_PAYLOAD_ROOT")?,
-        libraryfolders_path: job.env.get("CASA1_STEAM_LIBRARYFOLDERS_PATH").map(PathBuf::from),
+        libraryfolders_path: job
+            .env
+            .get("CASA1_STEAM_LIBRARYFOLDERS_PATH")
+            .map(PathBuf::from),
         library_root: job.env.get("CASA1_STEAM_LIBRARY_ROOT").cloned(),
-        library_host_root: job.env.get("CASA1_STEAM_LIBRARY_HOST_ROOT").map(PathBuf::from),
-        library_host_map_path: job.env.get("CASA1_STEAM_LIBRARY_HOST_MAP_PATH").map(PathBuf::from),
+        library_host_root: job
+            .env
+            .get("CASA1_STEAM_LIBRARY_HOST_ROOT")
+            .map(PathBuf::from),
+        library_host_map_path: job
+            .env
+            .get("CASA1_STEAM_LIBRARY_HOST_MAP_PATH")
+            .map(PathBuf::from),
     }))
 }
 
@@ -885,13 +1004,14 @@ fn resolve_steam_library_host_root_from_map(
             &error,
         )
     })?;
-    let host_map = serde_json::from_str::<BTreeMap<String, String>>(&contents).map_err(|error| {
-        AppError::new(
-            ReasonCode::RcRunnerProtocolInvalid,
-            format!("failed to parse {}", map_path.display()),
-        )
-        .with_hint(error.to_string())
-    })?;
+    let host_map =
+        serde_json::from_str::<BTreeMap<String, String>>(&contents).map_err(|error| {
+            AppError::new(
+                ReasonCode::RcRunnerProtocolInvalid,
+                format!("failed to parse {}", map_path.display()),
+            )
+            .with_hint(error.to_string())
+        })?;
     let normalized_root = normalize_library_root_key(library_root);
     host_map
         .get(&normalized_root)
@@ -907,19 +1027,19 @@ fn resolve_steam_library_host_root_from_map(
 }
 
 fn normalize_library_root_key(path: &str) -> String {
-    path.replace('\\', "/").to_ascii_lowercase().trim_end_matches('/').to_string()
+    path.replace('\\', "/")
+        .to_ascii_lowercase()
+        .trim_end_matches('/')
+        .to_string()
 }
 
 fn required_env_path(job: &RunnerJob, key: &str) -> AppResult<PathBuf> {
-    job.env
-        .get(key)
-        .map(PathBuf::from)
-        .ok_or_else(|| {
-            AppError::new(
-                ReasonCode::RcRunnerProtocolInvalid,
-                format!("missing runner Steam metadata input {key}"),
-            )
-        })
+    job.env.get(key).map(PathBuf::from).ok_or_else(|| {
+        AppError::new(
+            ReasonCode::RcRunnerProtocolInvalid,
+            format!("missing runner Steam metadata input {key}"),
+        )
+    })
 }
 
 fn trace_from_log_event(

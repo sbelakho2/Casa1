@@ -1,8 +1,8 @@
 use casa1::gfx::{
-    format_mapping, Command, DescriptorHeapType, DxgiFormat, EmulationStrategy, FeatureQuery,
-    FilterMode, FrameArtifact, GraphicsBackend, HeapType, PipelineStateDesc, QueryType,
-    ResourceDesc, ResourceState, ResourceUsageHint, RootSignatureDesc, SceneSpec, SwapchainDesc,
-    ViewDescriptor,
+    Command, DescriptorHeapType, DxgiFormat, EmulationStrategy, FeatureQuery, FilterMode,
+    FrameArtifact, GraphicsBackend, HeapType, PipelineStateDesc, QueryType, ResourceDesc,
+    ResourceState, ResourceUsageHint, RootSignatureDesc, SceneSpec, SwapchainDesc, ViewDescriptor,
+    format_mapping,
 };
 use casa1::reason::ReasonCode;
 use std::fs;
@@ -40,11 +40,17 @@ fn t7_1_dxgi_swapchain_oracle_suite_matches_expected_present_resize_and_latency_
         backend.adapter().metal_family != "apple7" && backend.adapter().metal_family != "apple8"
     );
     assert_eq!(
-        backend.query_format_support(DxgiFormat::Bc1Unorm).expect("BC1 support").strategy,
+        backend
+            .query_format_support(DxgiFormat::Bc1Unorm)
+            .expect("BC1 support")
+            .strategy,
         EmulationStrategy::ConversionShader
     );
     assert_eq!(
-        backend.query_format_support(DxgiFormat::B5G6R5Unorm).expect("B5G6R5 support").strategy,
+        backend
+            .query_format_support(DxgiFormat::B5G6R5Unorm)
+            .expect("B5G6R5 support")
+            .strategy,
         EmulationStrategy::Swizzle
     );
 
@@ -59,20 +65,28 @@ fn t7_1_dxgi_swapchain_oracle_suite_matches_expected_present_resize_and_latency_
     backend
         .set_maximum_frame_latency(swapchain, 2)
         .expect("set maximum frame latency");
-    let present0 = backend.present(swapchain, 0, true).expect("tearing present");
+    let present0 = backend
+        .present(swapchain, 0, true)
+        .expect("tearing present");
     let present1 = backend.present(swapchain, 4, false).expect("vsync present");
-    let present2 = backend.present(swapchain, 1, false).expect("bounded queue depth present");
+    let present2 = backend
+        .present(swapchain, 1, false)
+        .expect("bounded queue depth present");
     assert!(present0.tearing_allowed);
     assert_eq!(present0.effective_sync_interval, 0);
     assert_eq!(present1.effective_sync_interval, 4);
     assert_eq!(present2.queued_frames, 2);
 
-    let before_resize = backend.swapchain_state(swapchain).expect("swapchain state before resize");
+    let before_resize = backend
+        .swapchain_state(swapchain)
+        .expect("swapchain state before resize");
     let old_backbuffers = before_resize.backbuffers.clone();
     backend
         .resize_buffers(swapchain, 2, 1920, 1080, DxgiFormat::R8G8B8A8Unorm)
         .expect("resize swapchain buffers");
-    let after_resize = backend.swapchain_state(swapchain).expect("swapchain state after resize");
+    let after_resize = backend
+        .swapchain_state(swapchain)
+        .expect("swapchain state after resize");
     assert_eq!(after_resize.id, before_resize.id);
     assert_eq!(after_resize.desc.buffer_count, 2);
     assert_eq!(after_resize.desc.width, 1920);
@@ -165,7 +179,12 @@ fn t7_2_d3d12_microtests_cover_barriers_descriptors_aliasing_root_constants_quer
         ResourceState::RenderTarget
     );
     let wrong_barrier = backend
-        .transition_resource(color, 1, ResourceState::RenderTarget, ResourceState::PixelShaderResource)
+        .transition_resource(
+            color,
+            1,
+            ResourceState::RenderTarget,
+            ResourceState::PixelShaderResource,
+        )
         .expect_err("mismatched barrier must fail");
     assert_eq!(wrong_barrier.code, ReasonCode::RcD3dInvalidState);
 
@@ -174,7 +193,9 @@ fn t7_2_d3d12_microtests_cover_barriers_descriptors_aliasing_root_constants_quer
     let dsv_heap = backend.create_descriptor_heap(DescriptorHeapType::Dsv, 1);
     let sampler_heap = backend.create_descriptor_heap(DescriptorHeapType::Sampler, 1);
 
-    backend.upload_write(upload, 0, &[1, 2, 3, 4]).expect("write upload bytes");
+    backend
+        .upload_write(upload, 0, &[1, 2, 3, 4])
+        .expect("write upload bytes");
     backend
         .write_descriptor(
             cbv_srv_uav_heap,
@@ -224,7 +245,9 @@ fn t7_2_d3d12_microtests_cover_barriers_descriptors_aliasing_root_constants_quer
         DescriptorHeapType::CbvSrvUav
     );
     assert_eq!(
-        backend.descriptor_heap_snapshot(cbv_srv_uav_heap).expect("descriptor snapshot"),
+        backend
+            .descriptor_heap_snapshot(cbv_srv_uav_heap)
+            .expect("descriptor snapshot"),
         vec![
             Some(ViewDescriptor::Cbv {
                 resource: upload,
@@ -312,22 +335,33 @@ fn t7_2_d3d12_microtests_cover_barriers_descriptors_aliasing_root_constants_quer
     );
     let queue = backend.create_command_queue();
     let allocator = backend.create_command_allocator();
-    let list = backend.create_graphics_command_list(allocator, pipeline_state);
+    let list = backend.create_graphics_command_list(allocator, pipeline_state, false);
     backend
         .record_set_root_constants(list, vec![1, 2, 3, 4])
         .expect("set root constants");
-    backend.record_clear_rtv(list, rtv_heap, 0).expect("clear RTV");
-    backend.record_clear_dsv(list, dsv_heap, 0).expect("clear DSV");
+    backend
+        .record_clear_rtv(list, rtv_heap, 0)
+        .expect("clear RTV");
+    backend
+        .record_clear_dsv(list, dsv_heap, 0)
+        .expect("clear DSV");
     backend.record_draw(list, 3).expect("record draw");
-    backend.record_uav_barrier(list, color).expect("record UAV barrier");
+    backend
+        .record_uav_barrier(list, color)
+        .expect("record UAV barrier");
     backend
         .record_aliasing_barrier(list, Some(color), Some(readback))
         .expect("record aliasing barrier");
     backend
         .record_copy_resource(list, upload, readback)
         .expect("record upload to readback copy");
-    let closed = backend.close_command_list(list).expect("close command list");
-    assert!(matches!(closed.commands[0], Command::SetRootConstants { .. }));
+    let closed = backend
+        .close_command_list(list)
+        .expect("close command list");
+    assert!(matches!(
+        closed.commands[0],
+        Command::SetRootConstants { .. }
+    ));
     let fence = backend.create_fence(0);
     let plan = backend
         .execute_command_lists(queue, &[closed], Some((fence, 7)))
@@ -340,7 +374,9 @@ fn t7_2_d3d12_microtests_cover_barriers_descriptors_aliasing_root_constants_quer
     assert_eq!(plan.signaled_fences, vec![(fence, 7)]);
     assert_eq!(backend.fence_value(fence).expect("fence value"), 7);
     assert_eq!(
-        backend.readback(readback, fence, 7).expect("readback bytes")[..4],
+        backend
+            .readback(readback, fence, 7)
+            .expect("readback bytes")[..4],
         [1, 2, 3, 4]
     );
 
@@ -353,7 +389,9 @@ fn t7_2_d3d12_microtests_cover_barriers_descriptors_aliasing_root_constants_quer
         .expect("second timestamp query");
     assert!(second_timestamp > first_timestamp);
     assert_eq!(
-        backend.resolve_query_data(timestamp_heap).expect("resolve timestamps"),
+        backend
+            .resolve_query_data(timestamp_heap)
+            .expect("resolve timestamps"),
         casa1::gfx::QueryResolveResult {
             values: vec![first_timestamp, second_timestamp],
             emulated: true,
@@ -364,7 +402,9 @@ fn t7_2_d3d12_microtests_cover_barriers_descriptors_aliasing_root_constants_quer
         .write_occlusion(occlusion_heap, 0, 77)
         .expect("write occlusion sample count");
     assert_eq!(
-        backend.resolve_query_data(occlusion_heap).expect("resolve occlusion"),
+        backend
+            .resolve_query_data(occlusion_heap)
+            .expect("resolve occlusion"),
         casa1::gfx::QueryResolveResult {
             values: vec![77],
             emulated: false,
@@ -428,9 +468,10 @@ fn t7_4_metal_validation_gate_reports_zero_errors_across_scene_suite() {
 
     for scene in scenes {
         let FrameArtifact {
-            validation_errors,
-            ..
-        } = backend.render_scene(&scene).expect("render validation scene");
+            validation_errors, ..
+        } = backend
+            .render_scene(&scene)
+            .expect("render validation scene");
         assert!(validation_errors.is_empty());
     }
 }
@@ -459,7 +500,9 @@ fn t7_5_resource_create_destroy_soak_keeps_live_set_bounded_and_frame_times_stab
                 usage_hint: ResourceUsageHint::Generic,
             })
             .expect("create transient resource");
-        backend.destroy_resource(resource).expect("destroy transient resource");
+        backend
+            .destroy_resource(resource)
+            .expect("destroy transient resource");
         frame_times.push(
             backend
                 .present(swapchain, 1, false)

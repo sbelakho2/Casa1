@@ -29,8 +29,8 @@ fn t18_1_named_pipe_server_client_roundtrip() {
             4096, // in buffer
             0,    // default timeout
             false,
-            None,  // security_descriptor
-            None,  // uds_socket_path
+            None, // security_descriptor
+            None, // uds_socket_path
         )
         .expect("create named pipe server");
 
@@ -40,13 +40,13 @@ fn t18_1_named_pipe_server_client_roundtrip() {
         .expect("open named pipe client");
 
     // Connect the server
-    win32.connect_named_pipe(server).expect("connect named pipe");
+    win32
+        .connect_named_pipe(server)
+        .expect("connect named pipe");
 
     // Write from client
     let written = b"Hello from client!";
-    win32
-        .write_file(client, written)
-        .expect("client write");
+    win32.write_file(client, written).expect("client write");
 
     // Read on server
     let read_back = win32.read_file(server, 64).expect("server read");
@@ -54,9 +54,7 @@ fn t18_1_named_pipe_server_client_roundtrip() {
 
     // Write from server
     let response = b"Response from server!";
-    win32
-        .write_file(server, response)
-        .expect("server write");
+    win32.write_file(server, response).expect("server write");
 
     // Read on client
     let client_read = win32.read_file(client, 64).expect("client read");
@@ -76,10 +74,10 @@ fn t18_2_named_pipe_get_info() {
             r"\\.\pipe\test_get_info",
             3,
             1,
-            5,     // max_instances
-            8192,  // out_buffer_size
-            4096,  // in_buffer_size
-            1000,  // default_timeout
+            5,    // max_instances
+            8192, // out_buffer_size
+            4096, // in_buffer_size
+            1000, // default_timeout
             false,
             None,
             None,
@@ -267,14 +265,19 @@ fn t18_6_shared_memory_create_map_unmap() {
     let (handle2, existed2) = win32
         .create_file_mapping_w(Some("Local\\TestSection"), 4096, prot, false)
         .expect("re-open file mapping");
-    assert!(existed2, "re-opening existing section should return existed=true");
+    assert!(
+        existed2,
+        "re-opening existing section should return existed=true"
+    );
 
     let base2 = win32
         .map_view_of_file(handle2, 0, 4096)
         .expect("re-map view");
     assert!(base2 > 0, "re-map base should be non-zero");
 
-    win32.unmap_view_of_file(base2).expect("unmap re-mapped view");
+    win32
+        .unmap_view_of_file(base2)
+        .expect("unmap re-mapped view");
 }
 
 // ---------------------------------------------------------------------------
@@ -297,9 +300,7 @@ fn t18_7_shared_memory_multiple_views() {
         .expect("create file mapping");
 
     // Map two views
-    let view1 = win32
-        .map_view_of_file(handle, 0, 4096)
-        .expect("map view 1");
+    let view1 = win32.map_view_of_file(handle, 0, 4096).expect("map view 1");
     let view2 = win32
         .map_view_of_file(handle, 4096, 4096)
         .expect("map view 2");
@@ -348,7 +349,10 @@ fn t18_8_call_named_pipe_roundtrip() {
     let response = win32
         .call_named_pipe_w(r"\\.\pipe\test_call_pipe", b"request", 4096, 500)
         .expect("call named pipe");
-    assert!(response.is_empty(), "response should be empty (no server reply)");
+    assert!(
+        response.is_empty(),
+        "response should be empty (no server reply)"
+    );
 
     // The request data was left in the buffer – server reads it.
     let request = win32.read_file(server, 64).expect("server read request");
@@ -382,8 +386,8 @@ fn t18_9_pipe_security_descriptor_stored() {
             4096,
             4096,
             0,
-            true,  // inheritable
-            Some(0xDEADBEEF),  // security_descriptor (fake pointer)
+            true,             // inheritable
+            Some(0xDEADBEEF), // security_descriptor (fake pointer)
             None,
         )
         .expect("create named pipe with security descriptor");
@@ -425,7 +429,9 @@ fn t18_10_anonymous_pipe() {
         .open_named_pipe_client(r"\\.\pipe\casa1_anon_1", false)
         .expect("open anon pipe write end");
 
-    win32.connect_named_pipe(read_handle).expect("connect anon pipe");
+    win32
+        .connect_named_pipe(read_handle)
+        .expect("connect anon pipe");
 
     // Write through write handle, read through read handle
     win32

@@ -49,3 +49,66 @@ path = "fuzz_targets/http_headers.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "registry_path"
+path = "fuzz_targets/registry_path.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "spirv_parser"
+path = "fuzz_targets/spirv_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "steam_protocol"
+path = "fuzz_targets/steam_protocol.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "winhttp_url"
+path = "fuzz_targets/winhttp_url.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "filesystem_path"
+path = "fuzz_targets/filesystem_path.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "video_packet"
+path = "fuzz_targets/video_packet.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "http_response"
+path = "fuzz_targets/http_response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "websocket"
+path = "fuzz_targets/websocket.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "url_handling"
+path = "fuzz_targets/url_handling.rs"
+test = false
+doc = false
+bench = false

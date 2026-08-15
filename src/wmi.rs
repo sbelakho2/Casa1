@@ -6,41 +6,95 @@
 // All WMI classes return macOS-equivalent values using system calls
 // (sysctl, sw_vers, hostname, etc.).
 
-use std::collections::HashMap;
-use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
 use crate::error::{AppError, AppResult};
 use crate::reason::ReasonCode;
+use std::collections::HashMap;
+use std::ffi::CString;
+use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 // ============================================================================
 // macOS System Info Query Helpers
 // ============================================================================
 
-/// Run a sysctl command and return the result as a trimmed string.
+/// Call sysctlbyname and return the raw bytes.
+///
+/// Uses the direct `libc::sysctlbyname` C API instead of spawning a
+/// `/usr/sbin/sysctl` subprocess.
+///
+/// # Safety
+///
+/// Calls libc::sysctlbyname which is safe for any well-formed C string
+/// name; the kernel validates the MIB name internally.
+fn sysctl_raw(name: &str) -> Option<Vec<u8>> {
+    let c_name = CString::new(name).ok()?;
+    let mut len: libc::size_t = 0;
+
+    // First call with null oldp to query the required buffer size.
+    // SAFETY: sysctlbyname with null oldp never writes, only queries size.
+    let rc = unsafe {
+        libc::sysctlbyname(c_name.as_ptr(), std::ptr::null_mut(), &mut len, std::ptr::null_mut(), 0)
+    };
+    if rc != 0 || len == 0 {
+        return None;
+    }
+
+    let mut buf = vec![0u8; len];
+    // SAFETY: sysctlbyname writes at most `len` bytes into `buf`, which
+    // we have pre-sized to that length.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            c_name.as_ptr(),
+            buf.as_mut_ptr() as *mut libc::c_void,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    buf.truncate(len);
+    Some(buf)
+}
+
+/// Run a sysctl query and return the result as a trimmed string.
+///
+/// Uses the direct `libc::sysctlbyname` C API instead of spawning a
+/// `/usr/sbin/sysctl` subprocess.
 fn sysctl_value(name: &str) -> Option<String> {
-    Command::new("/usr/sbin/sysctl")
-        .arg("-n")
-        .arg(name)
-        .output()
-        .ok()
-        .and_then(|out| {
-            if out.status.success() {
-                let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                if s.is_empty() { None } else { Some(s) }
-            } else {
-                None
-            }
-        })
+    let raw = sysctl_raw(name)?;
+    let s = String::from_utf8_lossy(&raw).trim_end_matches('\0').to_string();
+    if s.is_empty() { None } else { Some(s) }
 }
 
-/// Run a sysctl command and parse the result as u64.
+/// Run a sysctl query and parse the result as u64.
+///
+/// Handles both 8-byte (u64) and 4-byte (u32 promoted) returns.
 fn sysctl_u64(name: &str) -> Option<u64> {
-    sysctl_value(name).and_then(|s| s.parse::<u64>().ok())
+    let raw = sysctl_raw(name)?;
+    match raw.len() {
+        8 => {
+            // SAFETY: checked length == 8 above
+            Some(u64::from_ne_bytes(raw[..8].try_into().ok()?))
+        }
+        4 => {
+            // SAFETY: checked length >= 4 above
+            Some(u32::from_ne_bytes(raw[..4].try_into().ok()?) as u64)
+        }
+        _ => None,
+    }
 }
 
-/// Run a sysctl command and parse the result as u32.
+/// Run a sysctl query and parse the result as u32.
 fn sysctl_u32(name: &str) -> Option<u32> {
-    sysctl_value(name).and_then(|s| s.parse::<u32>().ok())
+    let raw = sysctl_raw(name)?;
+    if raw.len() >= 4 {
+        // SAFETY: checked length >= 4 above
+        Some(u32::from_ne_bytes(raw[..4].try_into().ok()?))
+    } else {
+        None
+    }
 }
 
 /// Get total physical RAM in bytes.
@@ -72,51 +126,47 @@ fn logical_cpu_count() -> u32 {
     sysctl_u32("hw.logicalcpu").unwrap_or(8)
 }
 
-/// Get hostname.
+/// Get hostname via direct `libc::gethostname()` call.
 fn host_name() -> String {
-    Command::new("hostname")
-        .output()
-        .ok()
-        .and_then(|out| {
-            if out.status.success() {
-                Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
-            } else {
-                None
-            }
-        })
-        .unwrap_or_else(|| "localhost".to_string())
+    let mut buf = [0i8; 256];
+    // SAFETY: gethostname writes at most 255 bytes + NUL into buf,
+    // which is 256 bytes. The buffer is stack-allocated and valid.
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr(), buf.len()) };
+    if rc != 0 {
+        return "localhost".to_string();
+    }
+    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    String::from_utf8_lossy(
+        &buf[..len].iter().map(|&c| c as u8).collect::<Vec<_>>(),
+    )
+    .to_string()
 }
 
-/// Get macOS version string (e.g., "14.5").
+/// Get macOS version string (e.g., "14.5") via direct sysctl.
+///
+/// Uses `kern.osproductversion` on modern macOS, falling back to
+/// deriving from `kern.osrelease` (Darwin kernel version).
 fn os_version() -> String {
-    Command::new("/usr/bin/sw_vers")
-        .arg("-productVersion")
-        .output()
-        .ok()
-        .and_then(|out| {
-            if out.status.success() {
-                Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
-            } else {
-                None
+    // Prefer the macOS-specific sysctl (available since macOS 10.13+)
+    if let Some(v) = sysctl_value("kern.osproductversion") {
+        return v;
+    }
+    // Fallback: kern.osrelease gives Darwin version (e.g., "23.6.0")
+    // macOS 14.x = Darwin 23.x, macOS 13.x = Darwin 22.x, etc.
+    if let Some(darwin) = sysctl_value("kern.osrelease") {
+        if let Some(major_str) = darwin.split('.').next() {
+            if let Ok(major) = major_str.parse::<u32>() {
+                let macos_ver = major.saturating_sub(9);
+                return format!("{}.0", macos_ver);
             }
-        })
-        .unwrap_or_else(|| "14.0".to_string())
+        }
+    }
+    "14.0".to_string()
 }
 
-/// Get macOS build number (e.g., "23F79").
+/// Get macOS build number (e.g., "23F79") via direct sysctl.
 fn os_build_number() -> String {
-    Command::new("/usr/bin/sw_vers")
-        .arg("-buildVersion")
-        .output()
-        .ok()
-        .and_then(|out| {
-            if out.status.success() {
-                Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
-            } else {
-                None
-            }
-        })
-        .unwrap_or_else(|| "0".to_string())
+    sysctl_value("kern.osversion").unwrap_or_else(|| "0".to_string())
 }
 
 /// Get current user name.
@@ -126,7 +176,11 @@ fn user_name() -> String {
 
 /// Generate a macOS marketing name from version string.
 fn os_marketing_name(version: &str) -> String {
-    let major: u32 = version.split('.').next().and_then(|s| s.parse().ok()).unwrap_or(14);
+    let major: u32 = version
+        .split('.')
+        .next()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(14);
     match major {
         15 => "macOS Sequoia",
         14 => "macOS Sonoma",
@@ -134,31 +188,29 @@ fn os_marketing_name(version: &str) -> String {
         12 => "macOS Monterey",
         11 => "macOS Big Sur",
         10 => "macOS Catalina",
-        _  => "macOS",
-    }.to_string()
+        _ => "macOS",
+    }
+    .to_string()
 }
 
 /// Get system boot time as DMTF datetime string.
+///
+/// Uses the direct `libc::sysctl` API on `kern.boottime` which returns a
+/// `timeval` struct, avoiding the string-parsing hack needed with the old
+/// `sysctl -n kern.boottime` shell-out.
 fn boot_time_dmtf() -> String {
-    // Use sysctl kern.boottime to get boot timestamp
-    let boottime_str = sysctl_value("kern.boottime").unwrap_or_default();
-    // Parse "{ sec = 123456, usec = 789 }" format
-    let sec = boottime_str
-        .split(|c: char| c == ',' || c == ' ' || c == '=')
-        .filter_map(|s| {
-            let s = s.trim();
-            if s.starts_with(|c: char| c.is_ascii_digit()) {
-                s.parse::<u64>().ok()
-            } else {
-                None
-            }
-        })
-        .next()
-        .unwrap_or_else(|| {
-            // Fallback: current time minus 1 hour
-            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
-            now.as_secs().saturating_sub(3600)
-        });
+    // Use direct sysctl for kern.boottime which returns a struct timeval
+    let raw = sysctl_raw("kern.boottime").unwrap_or_default();
+    // kern.boottime returns struct timeval { tv_sec: i64, tv_usec: i32 }
+    let sec = if raw.len() >= 8 {
+        i64::from_ne_bytes(raw[..8].try_into().unwrap_or([0i64.to_ne_bytes()[0]; 8])) as u64
+    } else {
+        // Fallback: current time minus 1 hour
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        now.as_secs().saturating_sub(3600)
+    };
 
     // Convert to DMTF datetime: YYYYMMDDHHMMSS.******±UUU
     let secs = sec as i64;
@@ -206,7 +258,9 @@ fn is_leap_year(y: i64) -> bool {
 
 /// Get current time as DMTF datetime.
 fn now_dmtf() -> String {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
     let total_secs = now.as_secs() as i64;
     let days = total_secs / 86400;
     let time_secs = total_secs % 86400;
@@ -218,7 +272,9 @@ fn now_dmtf() -> String {
     let mut remaining = days;
     loop {
         let diy = if is_leap_year(year) { 366 } else { 365 };
-        if remaining < diy { break; }
+        if remaining < diy {
+            break;
+        }
         remaining -= diy;
         year += 1;
     }
@@ -229,7 +285,9 @@ fn now_dmtf() -> String {
     };
     let mut month = 1u32;
     for &d in &md {
-        if remaining < d { break; }
+        if remaining < d {
+            break;
+        }
         remaining -= d;
         month += 1;
     }
@@ -242,25 +300,25 @@ fn now_dmtf() -> String {
     )
 }
 
-/// Get current screen dimensions via macOS system_profiler or defaults.
+/// Get current screen dimensions via CoreGraphics API.
+///
+/// Uses `CGMainDisplayID` / `CGDisplayPixelsWide` / `CGDisplayPixelsHigh`
+/// from the CoreGraphics framework instead of spawning `system_profiler`.
 fn screen_resolution() -> (u32, u32) {
-    // Try using system_profiler for display info
-    let output = Command::new("/usr/sbin/system_profiler")
-        .args(["SPDisplaysDataType"])
-        .output()
-        .ok();
-    if let Some(out) = output {
-        let text = String::from_utf8_lossy(&out.stdout);
-        for line in text.lines() {
-            let trimmed = line.trim();
-            if let Some(res) = trimmed.strip_prefix("Resolution: ") {
-                let parts: Vec<&str> = res.split(" x ").collect();
-                if parts.len() == 2 {
-                    let w = parts[0].trim().parse::<u32>().unwrap_or(1920);
-                    let h = parts[1].trim().parse::<u32>().unwrap_or(1080);
-                    return (w, h);
-                }
-            }
+    #[cfg(target_os = "macos")]
+    {
+        unsafe extern "C" {
+            fn CGMainDisplayID() -> u32;
+            fn CGDisplayPixelsWide(display: u32) -> usize;
+            fn CGDisplayPixelsHigh(display: u32) -> usize;
+        }
+        // SAFETY: CoreGraphics display functions are safe to call on macOS;
+        // they query the window server for the main display dimensions.
+        let display = unsafe { CGMainDisplayID() };
+        let width = unsafe { CGDisplayPixelsWide(display) };
+        let height = unsafe { CGDisplayPixelsHigh(display) };
+        if width > 0 && height > 0 {
+            return (width as u32, height as u32);
         }
     }
     // Default to Retina-like resolution
@@ -311,7 +369,11 @@ impl WmiObject {
         }
     }
 
-    pub fn set<K: Into<String>, V: Into<WmiPropertyValue>>(&mut self, key: K, value: V) -> &mut Self {
+    pub fn set<K: Into<String>, V: Into<WmiPropertyValue>>(
+        &mut self,
+        key: K,
+        value: V,
+    ) -> &mut Self {
         self.properties.insert(key.into(), value.into());
         self
     }
@@ -343,31 +405,45 @@ impl WmiObject {
 }
 
 impl From<String> for WmiPropertyValue {
-    fn from(s: String) -> Self { WmiPropertyValue::String(s) }
+    fn from(s: String) -> Self {
+        WmiPropertyValue::String(s)
+    }
 }
 
 impl From<&str> for WmiPropertyValue {
-    fn from(s: &str) -> Self { WmiPropertyValue::String(s.to_string()) }
+    fn from(s: &str) -> Self {
+        WmiPropertyValue::String(s.to_string())
+    }
 }
 
 impl From<u32> for WmiPropertyValue {
-    fn from(v: u32) -> Self { WmiPropertyValue::Uint32(v) }
+    fn from(v: u32) -> Self {
+        WmiPropertyValue::Uint32(v)
+    }
 }
 
 impl From<u64> for WmiPropertyValue {
-    fn from(v: u64) -> Self { WmiPropertyValue::Uint64(v) }
+    fn from(v: u64) -> Self {
+        WmiPropertyValue::Uint64(v)
+    }
 }
 
 impl From<i32> for WmiPropertyValue {
-    fn from(v: i32) -> Self { WmiPropertyValue::Int32(v) }
+    fn from(v: i32) -> Self {
+        WmiPropertyValue::Int32(v)
+    }
 }
 
 impl From<bool> for WmiPropertyValue {
-    fn from(v: bool) -> Self { WmiPropertyValue::Bool(v) }
+    fn from(v: bool) -> Self {
+        WmiPropertyValue::Bool(v)
+    }
 }
 
 impl From<u16> for WmiPropertyValue {
-    fn from(v: u16) -> Self { WmiPropertyValue::Uint16(v) }
+    fn from(v: u16) -> Self {
+        WmiPropertyValue::Uint16(v)
+    }
 }
 
 // ============================================================================
@@ -388,7 +464,6 @@ pub trait WmiClassProvider: Send + Sync {
     fn clone_box(&self) -> Box<dyn WmiClassProvider>;
 }
 
-
 // ============================================================================
 // Win32_ComputerSystem Provider
 // ============================================================================
@@ -407,7 +482,10 @@ impl Win32ComputerSystemProvider {
         WmiObject::new("Win32_ComputerSystem")
             .set("Name", hostname.clone())
             .set("Manufacturer", "Apple Inc.")
-            .set("Model", sysctl_value("hw.model").unwrap_or_else(|| "Mac".to_string()))
+            .set(
+                "Model",
+                sysctl_value("hw.model").unwrap_or_else(|| "Mac".to_string()),
+            )
             .set("TotalPhysicalMemory", total_ram)
             .set("NumberOfProcessors", logical)
             .set("Domain", domain)
@@ -479,7 +557,9 @@ impl WmiClassProvider for Win32ProcessorProvider {
     }
 
     fn enum_objects(&self) -> AppResult<Vec<WmiObject>> {
-        Ok((0..physical_cpu_count()).map(|_| self.build_object()).collect())
+        Ok((0..physical_cpu_count())
+            .map(|_| self.build_object())
+            .collect())
     }
 }
 
@@ -509,7 +589,10 @@ impl Win32OperatingSystemProvider {
             .set("FreePhysicalMemory", avail_ram_kb as u64)
             .set("FreeVirtualMemory", avail_ram_kb as u64)
             .set("TotalVirtualMemorySize", (total_ram_kb + 2_097_152) as u64) // ~2 GB page file
-            .set("LastBootUpTime", WmiPropertyValue::DateTime(boot_time_dmtf()))
+            .set(
+                "LastBootUpTime",
+                WmiPropertyValue::DateTime(boot_time_dmtf()),
+            )
             .set("CSName", hostname)
             .set("RegisteredUser", user_name())
             .set("SerialNumber", "00000-00000-00000-00000")
@@ -569,7 +652,7 @@ impl Win32VideoControllerProvider {
             .set("DriverVersion", "1.0")
             .set("VideoProcessor", "Apple Graphics")
             .set("VideoArchitecture", 1u16) // VGA
-            .set("VideoMemoryType", 2u16)  // VRAM
+            .set("VideoMemoryType", 2u16) // VRAM
             .set("CurrentHorizontalResolution", width)
             .set("CurrentVerticalResolution", height)
             .set("CurrentRefreshRate", 60u32)
@@ -580,50 +663,216 @@ impl Win32VideoControllerProvider {
             .clone()
     }
 
+    /// Get GPU model name via IOKit IOAccelerator registry.
     fn get_gpu_name() -> String {
-        let output = Command::new("/usr/sbin/system_profiler")
-            .args(["SPDisplaysDataType"])
-            .output()
-            .ok();
-        if let Some(out) = output {
-            let text = String::from_utf8_lossy(&out.stdout);
-            for line in text.lines() {
-                let trimmed = line.trim();
-                if let Some(name) = trimmed.strip_prefix("Chipset Model: ") {
-                    return name.trim().to_string();
-                }
+        // Use IOKit to query the IOAccelerator (GPU) name from the IORegistry.
+        #[cfg(target_os = "macos")]
+        {
+            let name = Self::iokit_gpu_name();
+            if !name.is_empty() {
+                return name;
+            }
+        }
+        // Fallback: use hw.model to infer GPU family
+        if let Some(model) = sysctl_value("hw.model") {
+            if model.contains("Pro") || model.contains("Max") || model.contains("Ultra") {
+                return format!("Apple {} GPU", model);
             }
         }
         "Apple GPU".to_string()
     }
 
+    /// Query IOKit IOAccelerator for the GPU name.
+    #[cfg(target_os = "macos")]
+    fn iokit_gpu_name() -> String {
+        unsafe extern "C" {
+            fn IOServiceGetMatchingService(
+                mainPort: libc::c_uint,
+                matching: *mut libc::c_void,
+            ) -> libc::c_uint;
+            fn IOServiceMatching(name: *const libc::c_char) -> *mut libc::c_void;
+            fn CFStringCreateWithCString(
+                allocator: *const libc::c_void,
+                cStr: *const libc::c_char,
+                encoding: u32,
+            ) -> *const libc::c_void;
+            fn IORegistryEntryCreateCFProperty(
+                entry: libc::c_uint,
+                key: *const libc::c_void,
+                allocator: *const libc::c_void,
+                options: u32,
+            ) -> *mut libc::c_void;
+            fn CFStringGetCString(
+                theString: *const libc::c_void,
+                buffer: *mut libc::c_char,
+                bufferSize: isize,
+                encoding: u32,
+            ) -> u8;
+            fn CFRelease(cf: *const libc::c_void);
+            fn IOObjectRelease(object: libc::c_uint) -> i32;
+        }
+        const CF_STRING_ENCODING_UTF8: u32 = 0x08000100;
+
+        // SAFETY: IOKit functions are safe to call on macOS; they query the IORegistry.
+        let matching = unsafe { IOServiceMatching("IOAccelerator\0".as_ptr() as *const i8) };
+        if matching.is_null() {
+            return String::new();
+        }
+        // SAFETY: IOServiceGetMatchingService consumes the matching dictionary.
+        let service = unsafe { IOServiceGetMatchingService(0, matching) };
+        if service == 0 {
+            return String::new();
+        }
+
+        // Create a CFString key for "Model" — IORegistryEntryCreateCFProperty
+        // requires the key to be a CFStringRef, not a raw C string.
+        let model_cfstr = unsafe {
+            CFStringCreateWithCString(
+                std::ptr::null(),
+                "Model\0".as_ptr() as *const libc::c_char,
+                CF_STRING_ENCODING_UTF8,
+            )
+        };
+        if model_cfstr.is_null() {
+            // Release the IO service before returning.
+            unsafe { IOObjectRelease(service) };
+            return String::new();
+        }
+
+        // SAFETY: IORegistryEntryCreateCFProperty returns a CFString or NULL.
+        // Use null() for allocator: CoreFoundation accepts NULL as "use default allocator".
+        let cf_prop = unsafe {
+            IORegistryEntryCreateCFProperty(service, model_cfstr, std::ptr::null(), 0)
+        };
+        // SAFETY: Release the IO service object and the CFString key.
+        unsafe { IOObjectRelease(service) };
+        unsafe { CFRelease(model_cfstr) };
+
+        if cf_prop.is_null() {
+            return String::new();
+        }
+
+        let mut buf = [0i8; 256];
+        // SAFETY: CFStringGetCString copies the string content into buf.
+        let success = unsafe {
+            CFStringGetCString(
+                cf_prop,
+                buf.as_mut_ptr(),
+                buf.len() as isize,
+                CF_STRING_ENCODING_UTF8,
+            )
+        };
+        // SAFETY: Release the CFString.
+        unsafe { CFRelease(cf_prop) };
+
+        if success != 0 {
+            let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+            let name = String::from_utf8_lossy(
+                &buf[..len].iter().map(|&c| c as u8).collect::<Vec<_>>(),
+            )
+            .to_string();
+            if !name.is_empty() {
+                return name;
+            }
+        }
+        String::new()
+    }
+
+    /// Get VRAM size in bytes via IOKit IOAccelerator registry.
     fn get_vram_bytes() -> u64 {
-        let output = Command::new("/usr/sbin/system_profiler")
-            .args(["SPDisplaysDataType"])
-            .output()
-            .ok();
-        if let Some(out) = output {
-            let text = String::from_utf8_lossy(&out.stdout);
-            for line in text.lines() {
-                let trimmed = line.trim();
-                if let Some(vram) = trimmed.strip_prefix("VRAM (Total): ") {
-                    // e.g., "VRAM (Total): 10 GB" or "VRAM (Total): 1536 MB"
-                    let vram = vram.trim();
-                    if let Some(gb) = vram.strip_suffix(" GB") {
-                        if let Ok(n) = gb.trim().parse::<u64>() {
-                            return n * 1024 * 1024 * 1024;
-                        }
-                    }
-                    if let Some(mb) = vram.strip_suffix(" MB") {
-                        if let Ok(n) = mb.trim().parse::<u64>() {
-                            return n * 1024 * 1024;
-                        }
-                    }
-                }
+        #[cfg(target_os = "macos")]
+        {
+            let vram = Self::iokit_vram_bytes();
+            if vram > 0 {
+                return vram;
             }
         }
         // Default: 2 GB
         2 * 1024 * 1024 * 1024
+    }
+
+    /// Query IOKit IOAccelerator for VRAM size.
+    #[cfg(target_os = "macos")]
+    fn iokit_vram_bytes() -> u64 {
+        unsafe extern "C" {
+            fn IOServiceGetMatchingService(
+                mainPort: libc::c_uint,
+                matching: *mut libc::c_void,
+            ) -> libc::c_uint;
+            fn IOServiceMatching(name: *const libc::c_char) -> *mut libc::c_void;
+            fn CFStringCreateWithCString(
+                allocator: *const libc::c_void,
+                cStr: *const libc::c_char,
+                encoding: u32,
+            ) -> *const libc::c_void;
+            fn IORegistryEntryCreateCFProperty(
+                entry: libc::c_uint,
+                key: *const libc::c_void,
+                allocator: *const libc::c_void,
+                options: u32,
+            ) -> *mut libc::c_void;
+            fn CFNumberGetValue(
+                number: *const libc::c_void,
+                theType: u32,
+                valuePtr: *mut libc::c_void,
+            ) -> u8;
+            fn CFRelease(cf: *const libc::c_void);
+            fn IOObjectRelease(object: libc::c_uint) -> i32;
+        }
+        const CF_STRING_ENCODING_UTF8: u32 = 0x08000100;
+        const KCF_NUMBER_S64_TYPE: u32 = 14; // kCFNumberSInt64Type
+
+        // SAFETY: IOKit functions are safe to call on macOS.
+        let matching = unsafe { IOServiceMatching("IOAccelerator\0".as_ptr() as *const i8) };
+        if matching.is_null() {
+            return 0;
+        }
+        // SAFETY: IOServiceGetMatchingService consumes the matching dictionary.
+        let service = unsafe { IOServiceGetMatchingService(0, matching) };
+        if service == 0 {
+            return 0;
+        }
+
+        // Create a CFString key for "VRAM (total)" — IORegistryEntryCreateCFProperty
+        // requires the key to be a CFStringRef, not a raw C string.
+        let vram_cfstr = unsafe {
+            CFStringCreateWithCString(
+                std::ptr::null(),
+                "VRAM (total)\0".as_ptr() as *const libc::c_char,
+                CF_STRING_ENCODING_UTF8,
+            )
+        };
+        if vram_cfstr.is_null() {
+            // Release the IO service before returning.
+            unsafe { IOObjectRelease(service) };
+            return 0;
+        }
+
+        // SAFETY: IORegistryEntryCreateCFProperty returns a CFNumber or NULL.
+        // Use null() for allocator: CoreFoundation accepts NULL as "use default allocator".
+        let cf_num = unsafe {
+            IORegistryEntryCreateCFProperty(service, vram_cfstr, std::ptr::null(), 0)
+        };
+        // SAFETY: Release the IO service object and the CFString key.
+        unsafe { IOObjectRelease(service) };
+        unsafe { CFRelease(vram_cfstr) };
+
+        if cf_num.is_null() {
+            return 0;
+        }
+
+        let mut vram_val: i64 = 0;
+        // SAFETY: CFNumberGetValue writes the numeric value into vram_val.
+        let success = unsafe {
+            CFNumberGetValue(cf_num, KCF_NUMBER_S64_TYPE, &mut vram_val as *mut _ as *mut libc::c_void)
+        };
+        // SAFETY: Release the CFNumber.
+        unsafe { CFRelease(cf_num) };
+
+        if success != 0 && vram_val > 0 {
+            return vram_val as u64;
+        }
+        0
     }
 }
 
@@ -672,45 +921,39 @@ impl Win32DiskDriveProvider {
             .clone()
     }
 
+    /// Get disk info using `libc::statfs()` and `std::fs` metadata.
+    ///
+    /// Replaces the old shell-out to `/usr/sbin/diskutil`.
     fn get_disk_info() -> (String, u64, String, u32) {
-        // Try using diskutil
-        let output = Command::new("/usr/sbin/diskutil")
-            .args(["info", "/"])
-            .output()
-            .ok();
-        if let Some(out) = output {
-            let text = String::from_utf8_lossy(&out.stdout);
-            let mut model = "APPLE SSD".to_string();
-            let mut size: u64 = 256 * 1024 * 1024 * 1024; // 256 GB default
-            let mut partitions = 2u32;
-
-            for line in text.lines() {
-                let trimmed = line.trim();
-                if let Some(m) = trimmed.strip_prefix("Device / Media Name:") {
-                    model = format!("APPLE SSD {}", m.trim());
-                }
-                if let Some(s) = trimmed.strip_prefix("Disk Size:") {
-                    // Parse "256.0 GB (256000000000 Bytes)" or similar
-                    let s = s.trim();
-                    if let Some(bytes_str) = s.split('(').nth(1) {
-                        if let Some(bytes) = bytes_str.split_whitespace().next() {
-                            if let Ok(b) = bytes.replace(',', "").parse::<u64>() {
-                                size = b;
-                            }
-                        }
-                    }
-                }
-                if trimmed.contains("Partition") || trimmed.contains("Synthetic") {
-                    // Count partitions roughly
-                }
+        // Use statfs to get filesystem statistics for the root volume.
+        let root_path = match std::ffi::CString::new("/") {
+            Ok(p) => p,
+            Err(_) => {
+                return ("APPLE SSD".to_string(), 256 * 1024 * 1024 * 1024, "NVMe".to_string(), 2);
             }
-
-            return (model, size, "NVMe".to_string(), partitions);
+        };
+        // SAFETY: statfs writes filesystem metadata into the provided struct.
+        // The path "/" is always valid on macOS; zeroed statfs is a safe initial state.
+        let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+        let rc = unsafe { libc::statfs(root_path.as_ptr(), &mut stat) };
+        if rc == 0 {
+            // f_blocks * f_bsize = total size in bytes
+            let total_bytes = stat.f_blocks as u64 * stat.f_bsize as u64;
+            // Get filesystem type name from f_fstypename
+            // SAFETY: f_fstypename is a null-terminated C string written by statfs.
+            let fstype = unsafe { std::ffi::CStr::from_ptr(stat.f_fstypename.as_ptr()) }
+                .to_string_lossy()
+                .to_string();
+            let interface = if fstype.contains("apfs") || fstype.contains("hfs") {
+                "NVMe".to_string()
+            } else {
+                "SCSI".to_string()
+            };
+            return ("APPLE SSD".to_string(), total_bytes, interface, 2u32);
         }
 
-        // Fallback using sysctl
-        let size = sysctl_u64("hw.disk0.size").unwrap_or(256 * 1024 * 1024 * 1024);
-        ("APPLE SSD".to_string(), size, "NVMe".to_string(), 2)
+        // Fallback: default values
+        ("APPLE SSD".to_string(), 256 * 1024 * 1024 * 1024, "NVMe".to_string(), 2)
     }
 }
 
@@ -755,13 +998,17 @@ impl Win32NetworkAdapterProvider {
                 .set("Manufacturer", "Microsoft")
                 .set("NetEnabled", false)
                 .set("Index", 0u32)
-                .clone()
+                .clone(),
         );
 
         // Try to get active network interfaces
-        let output = Command::new("/sbin/ifconfig")
-            .output()
-            .ok();
+        let output = match Command::new("/sbin/ifconfig").output() {
+            Ok(out) => Some(out),
+            Err(e) => {
+                eprintln!("[wmi] network_info: failed to run ifconfig: {e}");
+                None
+            }
+        };
         if let Some(out) = output {
             let text = String::from_utf8_lossy(&out.stdout);
             let mut current_iface: Option<String> = None;
@@ -772,26 +1019,43 @@ impl Win32NetworkAdapterProvider {
             for line in text.lines() {
                 if line.is_empty() {
                     if let Some(name) = current_iface.take() {
-                        if name != "lo0" && !name.starts_with("gif") && !name.starts_with("stf")
-                            && !name.starts_with("awdl") && !name.starts_with("llw")
+                        if name != "lo0"
+                            && !name.starts_with("gif")
+                            && !name.starts_with("stf")
+                            && !name.starts_with("awdl")
+                            && !name.starts_with("llw")
                         {
                             let ip_enabled = !current_ips.is_empty();
                             objects.push(
                                 WmiObject::new("Win32_NetworkAdapter")
                                     .set("Name", name.clone())
-                                    .set("MACAddress", current_mac.clone().unwrap_or_else(|| "00:00:00:00:00:00".to_string()))
+                                    .set(
+                                        "MACAddress",
+                                        current_mac
+                                            .clone()
+                                            .unwrap_or_else(|| "00:00:00:00:00:00".to_string()),
+                                    )
                                     .set("IPEnabled", ip_enabled)
-                                    .set("IPAddress", WmiPropertyValue::Array(
-                                        current_ips.iter().map(|ip| WmiPropertyValue::String(ip.clone())).collect()
-                                    ))
-                                    .set("NetConnectionStatus", if ip_enabled { 2u32 } else { 0u32 }) // 2=connected
+                                    .set(
+                                        "IPAddress",
+                                        WmiPropertyValue::Array(
+                                            current_ips
+                                                .iter()
+                                                .map(|ip| WmiPropertyValue::String(ip.clone()))
+                                                .collect(),
+                                        ),
+                                    )
+                                    .set(
+                                        "NetConnectionStatus",
+                                        if ip_enabled { 2u32 } else { 0u32 },
+                                    ) // 2=connected
                                     .set("AdapterType", "Ethernet 802.3")
                                     .set("Description", name)
                                     .set("Speed", 1000000000u64)
                                     .set("Manufacturer", "Apple")
                                     .set("NetEnabled", is_up)
                                     .set("Index", objects.len() as u32)
-                                    .clone()
+                                    .clone(),
                             );
                         }
                     }
@@ -811,7 +1075,12 @@ impl Win32NetworkAdapterProvider {
                     let mac = trimmed.trim_start_matches("ether ").trim().to_string();
                     current_mac = Some(mac);
                 } else if trimmed.starts_with("inet ") {
-                    let ip = trimmed.trim_start_matches("inet ").split_whitespace().next().unwrap_or("").to_string();
+                    let ip = trimmed
+                        .trim_start_matches("inet ")
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("")
+                        .to_string();
                     if !ip.is_empty() {
                         current_ips.push(ip);
                     }
@@ -876,7 +1145,10 @@ impl Win32BiosProvider {
             .set("Name", "Apple Boot ROM")
             .set("Version", version)
             .set("Manufacturer", "Apple Inc.")
-            .set("ReleaseDate", WmiPropertyValue::DateTime("20230101000000.000000+000".to_string()))
+            .set(
+                "ReleaseDate",
+                WmiPropertyValue::DateTime("20230101000000.000000+000".to_string()),
+            )
             .set("Status", "OK")
             .set("SerialNumber", "000000000000")
             .set("SMBIOSBIOSVersion", "1.0")
@@ -929,48 +1201,34 @@ impl Win32LogicalDiskProvider {
             .clone()
     }
 
+    /// Get disk space info using `libc::statfs()`.
+    ///
+    /// Replaces the old shell-out to `/usr/sbin/diskutil`.
     fn get_disk_space() -> (u64, u64, String) {
-        // Try using diskutil
-        let output = Command::new("/usr/sbin/diskutil")
-            .args(["info", "/"])
-            .output()
-            .ok();
-        if let Some(out) = output {
-            let text = String::from_utf8_lossy(&out.stdout);
-            let mut total: u64 = 512 * 1024 * 1024 * 1024; // 512 GB default
-            let mut free: u64 = 256 * 1024 * 1024 * 1024; // 256 GB default
-            let mut name = "Macintosh HD".to_string();
-
-            for line in text.lines() {
-                let trimmed = line.trim();
-                if let Some(s) = trimmed.strip_prefix("Disk Size:") {
-                    let s = s.trim();
-                    if let Some(bytes_str) = s.split('(').nth(1) {
-                        if let Some(bytes) = bytes_str.split_whitespace().next() {
-                            if let Ok(b) = bytes.replace(',', "").parse::<u64>() {
-                                total = b;
-                            }
-                        }
-                    }
-                }
-                if let Some(s) = trimmed.strip_prefix("Volume Free Space:") {
-                    let s = s.trim();
-                    if let Some(bytes_str) = s.split('(').nth(1) {
-                        if let Some(bytes) = bytes_str.split_whitespace().next() {
-                            if let Ok(b) = bytes.replace(',', "").parse::<u64>() {
-                                free = b;
-                            }
-                        }
-                    }
-                }
-                if let Some(n) = trimmed.strip_prefix("Volume Name:") {
-                    name = n.trim().to_string();
-                }
+        let root_path = match std::ffi::CString::new("/") {
+            Ok(p) => p,
+            Err(_) => {
+                return (512 * 1024 * 1024 * 1024, 256 * 1024 * 1024 * 1024, "Macintosh HD".to_string());
             }
-            return (total, free, name);
+        };
+        // SAFETY: statfs writes filesystem metadata into the provided struct.
+        // The path "/" is always valid on macOS; zeroed statfs is safe.
+        let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+        let rc = unsafe { libc::statfs(root_path.as_ptr(), &mut stat) };
+        if rc == 0 {
+            let total = stat.f_blocks as u64 * stat.f_bsize as u64;
+            let free = stat.f_bfree as u64 * stat.f_bsize as u64;
+            // SAFETY: f_mntonname and f_fstypename are null-terminated C strings.
+            let _fstype = unsafe { std::ffi::CStr::from_ptr(stat.f_fstypename.as_ptr()) }
+                .to_string_lossy()
+                .to_string();
+            return (total, free, "Macintosh HD".to_string());
         }
 
-        // Fallback using statfs or defaults
+        // Fallback: use std::fs
+        if let Ok(_meta) = std::fs::metadata("/") {
+            // We can't get accurate free space from std::fs metadata, so use defaults
+        }
         (512 * 1024 * 1024 * 1024, 256 * 1024 * 1024 * 1024, "Macintosh HD".to_string())
     }
 }
@@ -1057,7 +1315,10 @@ impl Win32ComputerSystemProductProvider {
             .set("IdentifyingNumber", "00000000000000000")
             .set("SKUNumber", "")
             .set("Vendor", "Apple Inc.")
-            .set("Version", sysctl_value("hw.model").unwrap_or_else(|| "Mac".to_string()))
+            .set(
+                "Version",
+                sysctl_value("hw.model").unwrap_or_else(|| "Mac".to_string()),
+            )
             .set("UUID", "00000000-0000-0000-0000-000000000000")
             .clone()
     }
@@ -1093,13 +1354,23 @@ pub struct WqlQuery {
 
 #[derive(Debug, Clone)]
 pub enum WqlWhereClause {
-    Simple { property: String, op: WqlOp, value: String },
+    Simple {
+        property: String,
+        op: WqlOp,
+        value: String,
+    },
     And(Vec<WqlWhereClause>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum WqlOp {
-    Eq, Neq, Lt, Le, Gt, Ge, Like,
+    Eq,
+    Neq,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Like,
 }
 
 impl WqlOp {
@@ -1198,10 +1469,8 @@ fn parse_where_clause(s: &str) -> AppResult<WqlWhereClause> {
     // Check for AND
     let and_parts: Vec<&str> = split_by_and(trimmed);
     if and_parts.len() > 1 {
-        let clauses: AppResult<Vec<WqlWhereClause>> = and_parts
-            .into_iter()
-            .map(parse_simple_condition)
-            .collect();
+        let clauses: AppResult<Vec<WqlWhereClause>> =
+            and_parts.into_iter().map(parse_simple_condition).collect();
         return Ok(WqlWhereClause::And(clauses?));
     }
 
@@ -1216,12 +1485,16 @@ fn split_by_and(s: &str) -> Vec<&str> {
     let chars: Vec<char> = s.chars().collect();
 
     for (i, _) in chars.iter().enumerate() {
-        if chars[i] == '(' { depth += 1; }
-        if chars[i] == ')' { depth = depth.saturating_sub(1); }
-        if depth == 0 && i + 3 < s.len() && &upper[i..i+3] == "AND" {
+        if chars[i] == '(' {
+            depth += 1;
+        }
+        if chars[i] == ')' {
+            depth = depth.saturating_sub(1);
+        }
+        if depth == 0 && i + 3 < s.len() && &upper[i..i + 3] == "AND" {
             // Make sure it's a word boundary
-            let prev_is_boundary = i == 0 || chars[i-1] == ' ';
-            let next_is_boundary = i + 3 >= s.len() || chars[i+3] == ' ';
+            let prev_is_boundary = i == 0 || chars[i - 1] == ' ';
+            let next_is_boundary = i + 3 >= s.len() || chars[i + 3] == ' ';
             if prev_is_boundary && next_is_boundary {
                 parts.push(s[start..i].trim());
                 start = i + 3;
@@ -1315,7 +1588,11 @@ fn unquote(s: &str) -> String {
 /// Evaluate a WHERE condition against a WmiObject.
 pub fn evaluate_condition(obj: &WmiObject, clause: &WqlWhereClause) -> bool {
     match clause {
-        WqlWhereClause::Simple { property, op, value } => {
+        WqlWhereClause::Simple {
+            property,
+            op,
+            value,
+        } => {
             let prop_value = match obj.properties.get(property) {
                 Some(v) => v,
                 None => return false,
@@ -1331,21 +1608,19 @@ pub fn evaluate_condition(obj: &WmiObject, clause: &WqlWhereClause) -> bool {
                 WqlOp::Le => values_compare(prop_value, value) != std::cmp::Ordering::Greater,
             }
         }
-        WqlWhereClause::And(clauses) => {
-            clauses.iter().all(|c| evaluate_condition(obj, c))
-        }
+        WqlWhereClause::And(clauses) => clauses.iter().all(|c| evaluate_condition(obj, c)),
     }
 }
 
 fn values_equal(prop: &WmiPropertyValue, value: &str) -> bool {
     match prop {
-        WmiPropertyValue::String(s) => s.eq_ignore_ascii_case(value),
+        WmiPropertyValue::String(s) => s.eq_ignore_ascii_case(value), // case-insensitive comparison
         WmiPropertyValue::Uint32(v) => value.parse::<u32>().map(|n| *v == n).unwrap_or(false),
         WmiPropertyValue::Uint64(v) => value.parse::<u64>().map(|n| *v == n).unwrap_or(false),
         WmiPropertyValue::Int32(v) => value.parse::<i32>().map(|n| *v == n).unwrap_or(false),
         WmiPropertyValue::Bool(v) => {
-            value.eq_ignore_ascii_case("true") && *v
-                || value.eq_ignore_ascii_case("false") && !*v
+            value.eq_ignore_ascii_case("true") && *v // case-insensitive comparison
+                || value.eq_ignore_ascii_case("false") && !*v // case-insensitive comparison
                 || value.parse::<u32>().map(|n| (*v && n != 0) || (!*v && n == 0)).unwrap_or(false)
         }
         WmiPropertyValue::Uint16(v) => value.parse::<u16>().map(|n| *v == n).unwrap_or(false),
@@ -1356,28 +1631,40 @@ fn values_equal(prop: &WmiPropertyValue, value: &str) -> bool {
 fn values_like(prop: &WmiPropertyValue, pattern: &str) -> bool {
     let prop_str = match prop {
         WmiPropertyValue::String(s) => s,
-        WmiPropertyValue::Uint32(v) => return pattern.parse::<u32>().map(|p| *v == p).unwrap_or(false),
+        WmiPropertyValue::Uint32(v) => {
+            return pattern.parse::<u32>().map(|p| *v == p).unwrap_or(false);
+        }
         _ => return false,
     };
 
     // Simple wildcard matching: % matches any sequence, _ matches single char
-    let regex_pattern = pattern
-        .replace('%', ".*")
-        .replace('_', ".");
+    let regex_pattern = pattern.replace('%', ".*").replace('_', ".");
 
     if let Ok(re) = regex::Regex::new(&format!("^(?i){}$", regex_pattern)) {
         re.is_match(prop_str)
     } else {
-        prop_str.eq_ignore_ascii_case(pattern.trim_matches('%'))
+        prop_str.eq_ignore_ascii_case(pattern.trim_matches('%')) // case-insensitive comparison
     }
 }
 
 fn values_compare(prop: &WmiPropertyValue, value: &str) -> std::cmp::Ordering {
     match prop {
-        WmiPropertyValue::Uint32(v) => value.parse::<u32>().map(|n| (*v).cmp(&n)).unwrap_or(std::cmp::Ordering::Equal),
-        WmiPropertyValue::Uint64(v) => value.parse::<u64>().map(|n| (*v).cmp(&n)).unwrap_or(std::cmp::Ordering::Equal),
-        WmiPropertyValue::Int32(v) => value.parse::<i32>().map(|n| (*v).cmp(&n)).unwrap_or(std::cmp::Ordering::Equal),
-        WmiPropertyValue::Uint16(v) => value.parse::<u16>().map(|n| (*v).cmp(&n)).unwrap_or(std::cmp::Ordering::Equal),
+        WmiPropertyValue::Uint32(v) => value
+            .parse::<u32>()
+            .map(|n| (*v).cmp(&n))
+            .unwrap_or(std::cmp::Ordering::Equal),
+        WmiPropertyValue::Uint64(v) => value
+            .parse::<u64>()
+            .map(|n| (*v).cmp(&n))
+            .unwrap_or(std::cmp::Ordering::Equal),
+        WmiPropertyValue::Int32(v) => value
+            .parse::<i32>()
+            .map(|n| (*v).cmp(&n))
+            .unwrap_or(std::cmp::Ordering::Equal),
+        WmiPropertyValue::Uint16(v) => value
+            .parse::<u16>()
+            .map(|n| (*v).cmp(&n))
+            .unwrap_or(std::cmp::Ordering::Equal),
         WmiPropertyValue::String(s) => s.to_lowercase().cmp(&value.to_lowercase()),
         _ => std::cmp::Ordering::Equal,
     }
@@ -1425,8 +1712,8 @@ impl WbemLocator {
     pub fn connect_server(
         &self,
         server: Option<&str>,
-        _user: Option<&str>,
-        _password: Option<&str>,
+        user: Option<&str>,
+        password: Option<&str>,
         _locale: Option<&str>,
         _flags: u32,
         _authority: Option<&str>,
@@ -1435,10 +1722,13 @@ impl WbemLocator {
         let namespace = namespace.unwrap_or("root\\cimv2");
         let server = server.unwrap_or("localhost");
 
-        // We accept all connections and return our service
-        eprintln!(
-            "WbemLocator::ConnectServer(server={server:?}, namespace={namespace:?})"
-        );
+        // Log all parameters so authentication context is not silently discarded
+        let user_str = user.unwrap_or("<none>");
+        let pass_str = if password.is_some() { "<supplied>" } else { "<none>" };
+        eprintln!("WbemLocator::ConnectServer(server={server:?}, namespace={namespace:?}, user={user_str:?}, password={pass_str})");
+
+        // Note: WMI authentication (user/password) is not enforced on macOS;
+        // the connection is accepted unconditionally.
 
         Ok(self.service.clone())
     }
@@ -1497,7 +1787,12 @@ impl WbemServices {
     }
 
     /// ExecQuery — execute a WQL query and return results.
-    pub fn exec_query(&self, _query_format: &str, query: &str, _flags: u32) -> AppResult<Vec<WmiObject>> {
+    pub fn exec_query(
+        &self,
+        _query_format: &str,
+        query: &str,
+        _flags: u32,
+    ) -> AppResult<Vec<WmiObject>> {
         eprintln!("WbemServices::ExecQuery(query={query:?})");
 
         let parsed = parse_wql(query)?;
@@ -1512,23 +1807,29 @@ impl WbemServices {
 
         // Apply WHERE filter
         let filtered = if let Some(ref where_clause) = parsed.where_clause {
-            objects.into_iter().filter(|obj| evaluate_condition(obj, where_clause)).collect()
+            objects
+                .into_iter()
+                .filter(|obj| evaluate_condition(obj, where_clause))
+                .collect()
         } else {
             objects
         };
 
         // Apply column projection
         let projected = if let Some(ref columns) = parsed.select_columns {
-            filtered.into_iter().map(|obj| {
-                let mut projected_obj = WmiObject::new(&obj.class_name);
-                projected_obj.keys = obj.keys.clone();
-                for col in columns {
-                    if let Some(val) = obj.properties.get(col) {
-                        projected_obj.properties.insert(col.clone(), val.clone());
+            filtered
+                .into_iter()
+                .map(|obj| {
+                    let mut projected_obj = WmiObject::new(&obj.class_name);
+                    projected_obj.keys = obj.keys.clone();
+                    for col in columns {
+                        if let Some(val) = obj.properties.get(col) {
+                            projected_obj.properties.insert(col.clone(), val.clone());
+                        }
                     }
-                }
-                projected_obj
-            }).collect()
+                    projected_obj
+                })
+                .collect()
         } else {
             filtered
         };
@@ -1628,7 +1929,9 @@ impl WbemClassObject {
 
     /// Set a property value.
     pub fn put(&mut self, property_name: &str, value: WmiPropertyValue) {
-        self.object.properties.insert(property_name.to_string(), value);
+        self.object
+            .properties
+            .insert(property_name.to_string(), value);
     }
 
     /// Get all property names.
@@ -1685,7 +1988,10 @@ pub struct EnumWbemObjects {
 
 impl EnumWbemObjects {
     pub fn new(objects: Vec<WbemClassObject>) -> Self {
-        Self { objects, position: 0 }
+        Self {
+            objects,
+            position: 0,
+        }
     }
 
     pub fn from_wmi_objects(objects: Vec<WmiObject>) -> Self {
@@ -1789,11 +2095,17 @@ mod tests {
 
     #[test]
     fn test_wql_parse_where() {
-        let query = parse_wql("SELECT * FROM Win32_Processor WHERE Name = 'Apple Silicon'").unwrap();
+        let query =
+            parse_wql("SELECT * FROM Win32_Processor WHERE Name = 'Apple Silicon'").unwrap();
         assert!(query.select_columns.is_none());
         assert_eq!(query.from_class, "Win32_Processor");
         assert!(query.where_clause.is_some());
-        if let Some(WqlWhereClause::Simple { ref property, ref op, ref value }) = query.where_clause {
+        if let Some(WqlWhereClause::Simple {
+            ref property,
+            ref op,
+            ref value,
+        }) = query.where_clause
+        {
             assert_eq!(property, "Name");
             assert_eq!(*op, WqlOp::Eq);
             assert_eq!(value, "Apple Silicon");
@@ -1805,7 +2117,10 @@ mod tests {
     #[test]
     fn test_wql_parse_select_columns() {
         let query = parse_wql("SELECT Name, Manufacturer FROM Win32_ComputerSystem").unwrap();
-        assert_eq!(query.select_columns, Some(vec!["Name".to_string(), "Manufacturer".to_string()]));
+        assert_eq!(
+            query.select_columns,
+            Some(vec!["Name".to_string(), "Manufacturer".to_string()])
+        );
         assert_eq!(query.from_class, "Win32_ComputerSystem");
         assert!(query.where_clause.is_none());
     }
@@ -1814,7 +2129,12 @@ mod tests {
     fn test_wql_parse_where_with_number() {
         let query = parse_wql("SELECT * FROM Win32_LogicalDisk WHERE DriveType = 3").unwrap();
         assert_eq!(query.from_class, "Win32_LogicalDisk");
-        if let Some(WqlWhereClause::Simple { ref property, ref op, ref value }) = query.where_clause {
+        if let Some(WqlWhereClause::Simple {
+            ref property,
+            ref op,
+            ref value,
+        }) = query.where_clause
+        {
             assert_eq!(property, "DriveType");
             assert_eq!(*op, WqlOp::Eq);
             assert_eq!(value, "3");
@@ -1825,9 +2145,15 @@ mod tests {
 
     #[test]
     fn test_wql_parse_like() {
-        let query = parse_wql("SELECT * FROM Win32_ComputerSystem WHERE Name LIKE '%host%'").unwrap();
+        let query =
+            parse_wql("SELECT * FROM Win32_ComputerSystem WHERE Name LIKE '%host%'").unwrap();
         assert_eq!(query.from_class, "Win32_ComputerSystem");
-        if let Some(WqlWhereClause::Simple { ref property, ref op, ref value }) = query.where_clause {
+        if let Some(WqlWhereClause::Simple {
+            ref property,
+            ref op,
+            ref value,
+        }) = query.where_clause
+        {
             assert_eq!(property, "Name");
             assert_eq!(*op, WqlOp::Like);
             assert_eq!(value, "%host%");
@@ -1838,7 +2164,10 @@ mod tests {
 
     #[test]
     fn test_wql_parse_and() {
-        let query = parse_wql("SELECT * FROM Win32_Processor WHERE Name = 'Apple Silicon' AND Architecture = 9").unwrap();
+        let query = parse_wql(
+            "SELECT * FROM Win32_Processor WHERE Name = 'Apple Silicon' AND Architecture = 9",
+        )
+        .unwrap();
         if let Some(WqlWhereClause::And(ref clauses)) = query.where_clause {
             assert_eq!(clauses.len(), 2);
         } else {
@@ -1854,7 +2183,10 @@ mod tests {
         let obj = &objects[0];
         assert_eq!(obj.class_name, "Win32_ComputerSystem");
         assert!(obj.get_string("Name").is_some());
-        assert_eq!(obj.get_string("Manufacturer").as_deref(), Some("Apple Inc."));
+        assert_eq!(
+            obj.get_string("Manufacturer").as_deref(),
+            Some("Apple Inc.")
+        );
         assert!(obj.get_u64("TotalPhysicalMemory").unwrap() > 0);
         assert!(obj.get_u32("NumberOfProcessors").unwrap() > 0);
         assert!(obj.get_string("PrimaryOwnerName").is_some());
@@ -1907,7 +2239,10 @@ mod tests {
         assert_eq!(objects.len(), 1);
         let obj = &objects[0];
         assert!(obj.get_string("Model").is_some());
-        assert_eq!(obj.get_string("MediaType").as_deref(), Some("Fixed hard disk media"));
+        assert_eq!(
+            obj.get_string("MediaType").as_deref(),
+            Some("Fixed hard disk media")
+        );
         assert!(obj.get_u64("Size").unwrap() > 0);
     }
 
@@ -1917,7 +2252,10 @@ mod tests {
         let objects = provider.enum_objects().unwrap();
         assert_eq!(objects.len(), 1);
         let obj = &objects[0];
-        assert_eq!(obj.get_string("Manufacturer").as_deref(), Some("Apple Inc."));
+        assert_eq!(
+            obj.get_string("Manufacturer").as_deref(),
+            Some("Apple Inc.")
+        );
         assert!(obj.get_string("Version").is_some());
     }
 
@@ -1938,15 +2276,23 @@ mod tests {
         let objects = provider.enum_objects().unwrap();
         assert!(!objects.is_empty());
         // At least a loopback adapter
-        assert!(objects.iter().any(|o| o.get_string("Name").as_deref() == Some("Loopback Adapter")));
+        assert!(
+            objects
+                .iter()
+                .any(|o| o.get_string("Name").as_deref() == Some("Loopback Adapter"))
+        );
     }
 
     #[test]
     fn test_wbem_locator_connect() {
         let locator = WbemLocator::new();
-        let service = locator.connect_server(None, None, None, None, 0, None, Some("root\\cimv2")).unwrap();
+        let service = locator
+            .connect_server(None, None, None, None, 0, None, Some("root\\cimv2"))
+            .unwrap();
         // Verify the service works
-        let objects = service.exec_query("WQL", "SELECT * FROM Win32_ComputerSystem", 0).unwrap();
+        let objects = service
+            .exec_query("WQL", "SELECT * FROM Win32_ComputerSystem", 0)
+            .unwrap();
         assert_eq!(objects.len(), 1);
         assert_eq!(objects[0].class_name, "Win32_ComputerSystem");
     }
@@ -1954,7 +2300,9 @@ mod tests {
     #[test]
     fn test_wbem_services_query() {
         let service = create_default_wmi_service();
-        let objects = service.exec_query("WQL", "SELECT * FROM Win32_Processor", 0).unwrap();
+        let objects = service
+            .exec_query("WQL", "SELECT * FROM Win32_Processor", 0)
+            .unwrap();
         assert!(!objects.is_empty());
         assert_eq!(objects[0].class_name, "Win32_Processor");
     }
@@ -1962,14 +2310,26 @@ mod tests {
     #[test]
     fn test_wbem_services_query_with_where() {
         let service = create_default_wmi_service();
-        let objects = service.exec_query("WQL", "SELECT * FROM Win32_Processor WHERE Name = 'Apple Silicon'", 0).unwrap();
+        let objects = service
+            .exec_query(
+                "WQL",
+                "SELECT * FROM Win32_Processor WHERE Name = 'Apple Silicon'",
+                0,
+            )
+            .unwrap();
         assert!(!objects.is_empty());
     }
 
     #[test]
     fn test_wbem_services_query_select_columns() {
         let service = create_default_wmi_service();
-        let objects = service.exec_query("WQL", "SELECT Name, Manufacturer FROM Win32_ComputerSystem", 0).unwrap();
+        let objects = service
+            .exec_query(
+                "WQL",
+                "SELECT Name, Manufacturer FROM Win32_ComputerSystem",
+                0,
+            )
+            .unwrap();
         assert_eq!(objects.len(), 1);
         let obj = &objects[0];
         assert!(obj.get_string("Name").is_some());
@@ -1981,7 +2341,9 @@ mod tests {
     #[test]
     fn test_wbem_class_object_get() {
         let service = create_default_wmi_service();
-        let objects = service.exec_query("WQL", "SELECT * FROM Win32_ComputerSystem", 0).unwrap();
+        let objects = service
+            .exec_query("WQL", "SELECT * FROM Win32_ComputerSystem", 0)
+            .unwrap();
         assert_eq!(objects.len(), 1);
         let class_obj = WbemClassObject::new(objects[0].clone());
         assert!(class_obj.get("Name").is_some());
@@ -1993,7 +2355,10 @@ mod tests {
     fn test_wbem_class_object_put() {
         let obj = WmiObject::new("Win32_Test");
         let mut class_obj = WbemClassObject::new(obj);
-        class_obj.put("TestProperty", WmiPropertyValue::String("test_value".to_string()));
+        class_obj.put(
+            "TestProperty",
+            WmiPropertyValue::String("test_value".to_string()),
+        );
         assert_eq!(
             class_obj.get("TestProperty").map(|v| match v {
                 WmiPropertyValue::String(s) => s.as_str(),
@@ -2006,7 +2371,9 @@ mod tests {
     #[test]
     fn test_wbem_class_object_get_names() {
         let service = create_default_wmi_service();
-        let objects = service.exec_query("WQL", "SELECT * FROM Win32_ComputerSystem", 0).unwrap();
+        let objects = service
+            .exec_query("WQL", "SELECT * FROM Win32_ComputerSystem", 0)
+            .unwrap();
         let class_obj = WbemClassObject::new(objects[0].clone());
         let names = class_obj.get_names();
         assert!(names.contains(&"Name".to_string()));
@@ -2016,7 +2383,9 @@ mod tests {
     #[test]
     fn test_wbem_enum_next() {
         let service = create_default_wmi_service();
-        let objects = service.exec_query("WQL", "SELECT * FROM Win32_Processor", 0).unwrap();
+        let objects = service
+            .exec_query("WQL", "SELECT * FROM Win32_Processor", 0)
+            .unwrap();
         let mut enum_objs = EnumWbemObjects::from_wmi_objects(objects);
         let count = enum_objs.count();
         assert!(count > 0);
@@ -2040,7 +2409,9 @@ mod tests {
     #[test]
     fn test_wbem_enum_clone() {
         let service = create_default_wmi_service();
-        let objects = service.exec_query("WQL", "SELECT * FROM Win32_Processor", 0).unwrap();
+        let objects = service
+            .exec_query("WQL", "SELECT * FROM Win32_Processor", 0)
+            .unwrap();
         let enum_objs = EnumWbemObjects::from_wmi_objects(objects);
         let cloned = enum_objs.clone_enum();
         assert_eq!(cloned.count(), enum_objs.count());
@@ -2049,7 +2420,9 @@ mod tests {
     #[test]
     fn test_create_instance_enum() {
         let service = create_default_wmi_service();
-        let objects = service.create_instance_enum("Win32_OperatingSystem", 0).unwrap();
+        let objects = service
+            .create_instance_enum("Win32_OperatingSystem", 0)
+            .unwrap();
         assert_eq!(objects.len(), 1);
         assert_eq!(objects[0].class_name, "Win32_OperatingSystem");
     }
@@ -2087,7 +2460,7 @@ mod tests {
     #[test]
     fn test_wql_parse_error() {
         let result = parse_wql("NOT A WQL QUERY");
-        assert!(result.is_err());
+        assert!(result.is_err(), "expected Err, got {result:?}");
     }
 
     #[test]

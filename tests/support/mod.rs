@@ -94,11 +94,34 @@ pub fn sample_pe32_bytes() -> Vec<u8> {
 fn sample_pe_bytes_with_format(format: SamplePeFormat) -> Vec<u8> {
     let file_alignment = 0x200;
     let section_alignment = 0x1000;
-    let (machine, image_base, pointer_bytes, optional_header_size, load_config_size, tls_directory_size, optional_magic) =
-        match format {
-            SamplePeFormat::Pe32 => (0x014c, SAMPLE_IMAGE_BASE_X86, 4_usize, 0xe0_u32, 0x5c_u32, 24_usize, 0x10b_u16),
-            SamplePeFormat::Pe32Plus => (0x8664, SAMPLE_IMAGE_BASE, 8_usize, 0xf0_u32, 0x94_u32, 40_usize, 0x20b_u16),
-        };
+    let (
+        machine,
+        image_base,
+        pointer_bytes,
+        optional_header_size,
+        load_config_size,
+        tls_directory_size,
+        optional_magic,
+    ) = match format {
+        SamplePeFormat::Pe32 => (
+            0x014c,
+            SAMPLE_IMAGE_BASE_X86,
+            4_usize,
+            0xe0_u32,
+            0x5c_u32,
+            24_usize,
+            0x10b_u16,
+        ),
+        SamplePeFormat::Pe32Plus => (
+            0x8664,
+            SAMPLE_IMAGE_BASE,
+            8_usize,
+            0xf0_u32,
+            0x94_u32,
+            40_usize,
+            0x20b_u16,
+        ),
+    };
     let import_table_size = pointer_bytes * 3;
     let delay_import_table_size = pointer_bytes * 2;
     let callback_array_size = pointer_bytes * 2;
@@ -118,12 +141,25 @@ fn sample_pe_bytes_with_format(format: SamplePeFormat) -> Vec<u8> {
     let mut data = TestSection::new(".data", 0x3000, 0xc000_0040);
     let mut reloc = TestSection::new(".reloc", 0x4000, 0x4200_0040);
 
-    let reloc_target_rva = data.alloc(&encode_pointer_le(image_base + 0x1234, pointer_bytes), pointer_bytes);
+    let reloc_target_rva = data.alloc(
+        &encode_pointer_le(image_base + 0x1234, pointer_bytes),
+        pointer_bytes,
+    );
     assert_eq!(reloc_target_rva, SAMPLE_RELOC_TARGET_RVA);
     let tls_index_rva = data.alloc(&0_u32.to_le_bytes(), 4);
     let callback_array_rva = data.reserve(callback_array_size, pointer_bytes);
-    patch_pointer_le(&mut data, callback_array_rva, image_base + SAMPLE_TLS_CALLBACK_RVA as u64, pointer_bytes);
-    patch_pointer_le(&mut data, callback_array_rva + pointer_bytes as u32, 0, pointer_bytes);
+    patch_pointer_le(
+        &mut data,
+        callback_array_rva,
+        image_base + SAMPLE_TLS_CALLBACK_RVA as u64,
+        pointer_bytes,
+    );
+    patch_pointer_le(
+        &mut data,
+        callback_array_rva + pointer_bytes as u32,
+        0,
+        pointer_bytes,
+    );
 
     let export_directory_rva = rdata.reserve(40, 4);
     let export_dll_name_rva = rdata.alloc(b"sample.dll\0", 1);
@@ -147,16 +183,37 @@ fn sample_pe_bytes_with_format(format: SamplePeFormat) -> Vec<u8> {
     rdata.patch_u32(export_directory_rva + 28, functions_rva);
     rdata.patch_u32(export_directory_rva + 32, names_rva);
     rdata.patch_u32(export_directory_rva + 36, ordinals_rva);
-    let export_directory_size = rdata.virtual_address + rdata.data.len() as u32 - export_directory_start;
+    let export_directory_size =
+        rdata.virtual_address + rdata.data.len() as u32 - export_directory_start;
 
     let import_dll_name_rva = rdata.alloc(b"api-ms-win-core-file-l1-1-0.dll\0", 1);
     let create_file_name_rva = rdata.alloc(&hint_name_bytes("CreateFileW"), 2);
     let import_int_rva = rdata.reserve(import_table_size, pointer_bytes);
     let import_iat_rva = rdata.reserve(import_table_size, pointer_bytes);
-    patch_pointer_le(&mut rdata, import_int_rva, create_file_name_rva as u64, pointer_bytes);
-    patch_pointer_le(&mut rdata, import_int_rva + pointer_bytes as u32, ordinal_flag | 17, pointer_bytes);
-    patch_pointer_le(&mut rdata, import_iat_rva, create_file_name_rva as u64, pointer_bytes);
-    patch_pointer_le(&mut rdata, import_iat_rva + pointer_bytes as u32, ordinal_flag | 17, pointer_bytes);
+    patch_pointer_le(
+        &mut rdata,
+        import_int_rva,
+        create_file_name_rva as u64,
+        pointer_bytes,
+    );
+    patch_pointer_le(
+        &mut rdata,
+        import_int_rva + pointer_bytes as u32,
+        ordinal_flag | 17,
+        pointer_bytes,
+    );
+    patch_pointer_le(
+        &mut rdata,
+        import_iat_rva,
+        create_file_name_rva as u64,
+        pointer_bytes,
+    );
+    patch_pointer_le(
+        &mut rdata,
+        import_iat_rva + pointer_bytes as u32,
+        ordinal_flag | 17,
+        pointer_bytes,
+    );
     let import_descriptor_rva = rdata.reserve(40, 4);
     rdata.patch_u32(import_descriptor_rva, import_int_rva);
     rdata.patch_u32(import_descriptor_rva + 12, import_dll_name_rva);
@@ -166,8 +223,18 @@ fn sample_pe_bytes_with_format(format: SamplePeFormat) -> Vec<u8> {
     let forwarded_name_rva = rdata.alloc(&hint_name_bytes("Forwarded"), 2);
     let delay_int_rva = rdata.reserve(delay_import_table_size, pointer_bytes);
     let delay_iat_rva = rdata.reserve(delay_import_table_size, pointer_bytes);
-    patch_pointer_le(&mut rdata, delay_int_rva, forwarded_name_rva as u64, pointer_bytes);
-    patch_pointer_le(&mut rdata, delay_iat_rva, forwarded_name_rva as u64, pointer_bytes);
+    patch_pointer_le(
+        &mut rdata,
+        delay_int_rva,
+        forwarded_name_rva as u64,
+        pointer_bytes,
+    );
+    patch_pointer_le(
+        &mut rdata,
+        delay_iat_rva,
+        forwarded_name_rva as u64,
+        pointer_bytes,
+    );
     let delay_descriptor_rva = rdata.reserve(64, 4);
     rdata.patch_u32(delay_descriptor_rva + 4, delay_dll_name_rva);
     rdata.patch_u32(delay_descriptor_rva + 12, delay_iat_rva);
@@ -176,19 +243,59 @@ fn sample_pe_bytes_with_format(format: SamplePeFormat) -> Vec<u8> {
     let load_config_rva = rdata.reserve(load_config_size as usize, pointer_bytes);
     rdata.patch_u32(load_config_rva, load_config_size);
     if pointer_bytes == 8 {
-        patch_pointer_le(&mut rdata, load_config_rva + 0x60, image_base + SAMPLE_RELOC_TARGET_RVA as u64, pointer_bytes);
+        patch_pointer_le(
+            &mut rdata,
+            load_config_rva + 0x60,
+            image_base + SAMPLE_RELOC_TARGET_RVA as u64,
+            pointer_bytes,
+        );
         patch_pointer_le(&mut rdata, load_config_rva + 0x68, 1, pointer_bytes);
-        patch_pointer_le(&mut rdata, load_config_rva + 0x70, image_base + SAMPLE_ENTRY_RVA as u64, pointer_bytes);
-        patch_pointer_le(&mut rdata, load_config_rva + 0x78, image_base + SAMPLE_TLS_CALLBACK_RVA as u64, pointer_bytes);
-        patch_pointer_le(&mut rdata, load_config_rva + 0x80, image_base + 0x2080, pointer_bytes);
+        patch_pointer_le(
+            &mut rdata,
+            load_config_rva + 0x70,
+            image_base + SAMPLE_ENTRY_RVA as u64,
+            pointer_bytes,
+        );
+        patch_pointer_le(
+            &mut rdata,
+            load_config_rva + 0x78,
+            image_base + SAMPLE_TLS_CALLBACK_RVA as u64,
+            pointer_bytes,
+        );
+        patch_pointer_le(
+            &mut rdata,
+            load_config_rva + 0x80,
+            image_base + 0x2080,
+            pointer_bytes,
+        );
         patch_pointer_le(&mut rdata, load_config_rva + 0x88, 2, pointer_bytes);
         rdata.patch_u32(load_config_rva + 0x90, 0x500);
     } else {
-        patch_pointer_le(&mut rdata, load_config_rva + 0x40, image_base + SAMPLE_RELOC_TARGET_RVA as u64, pointer_bytes);
+        patch_pointer_le(
+            &mut rdata,
+            load_config_rva + 0x40,
+            image_base + SAMPLE_RELOC_TARGET_RVA as u64,
+            pointer_bytes,
+        );
         patch_pointer_le(&mut rdata, load_config_rva + 0x44, 1, pointer_bytes);
-        patch_pointer_le(&mut rdata, load_config_rva + 0x48, image_base + SAMPLE_ENTRY_RVA as u64, pointer_bytes);
-        patch_pointer_le(&mut rdata, load_config_rva + 0x4c, image_base + SAMPLE_TLS_CALLBACK_RVA as u64, pointer_bytes);
-        patch_pointer_le(&mut rdata, load_config_rva + 0x50, image_base + 0x2080, pointer_bytes);
+        patch_pointer_le(
+            &mut rdata,
+            load_config_rva + 0x48,
+            image_base + SAMPLE_ENTRY_RVA as u64,
+            pointer_bytes,
+        );
+        patch_pointer_le(
+            &mut rdata,
+            load_config_rva + 0x4c,
+            image_base + SAMPLE_TLS_CALLBACK_RVA as u64,
+            pointer_bytes,
+        );
+        patch_pointer_le(
+            &mut rdata,
+            load_config_rva + 0x50,
+            image_base + 0x2080,
+            pointer_bytes,
+        );
         patch_pointer_le(&mut rdata, load_config_rva + 0x54, 2, pointer_bytes);
         rdata.patch_u32(load_config_rva + 0x58, 0x500);
     }
@@ -199,14 +306,24 @@ fn sample_pe_bytes_with_format(format: SamplePeFormat) -> Vec<u8> {
     rdata.patch_u32(debug_directory_rva + 20, SAMPLE_ENTRY_RVA);
 
     let tls_directory_rva = rdata.reserve(tls_directory_size, pointer_bytes);
-    patch_pointer_le(&mut rdata, tls_directory_rva, image_base + reloc_target_rva as u64, pointer_bytes);
+    patch_pointer_le(
+        &mut rdata,
+        tls_directory_rva,
+        image_base + reloc_target_rva as u64,
+        pointer_bytes,
+    );
     patch_pointer_le(
         &mut rdata,
         tls_directory_rva + pointer_bytes as u32,
         image_base + reloc_target_rva as u64 + pointer_bytes as u64,
         pointer_bytes,
     );
-    patch_pointer_le(&mut rdata, tls_directory_rva + (pointer_bytes as u32 * 2), image_base + tls_index_rva as u64, pointer_bytes);
+    patch_pointer_le(
+        &mut rdata,
+        tls_directory_rva + (pointer_bytes as u32 * 2),
+        image_base + tls_index_rva as u64,
+        pointer_bytes,
+    );
     patch_pointer_le(
         &mut rdata,
         tls_directory_rva + (pointer_bytes as u32 * 3),
@@ -214,7 +331,13 @@ fn sample_pe_bytes_with_format(format: SamplePeFormat) -> Vec<u8> {
         pointer_bytes,
     );
 
-    reloc.alloc(&relocation_block(SAMPLE_RELOC_TARGET_RVA & !0xfff, SAMPLE_RELOC_TARGET_RVA & 0xfff), 4);
+    reloc.alloc(
+        &relocation_block(
+            SAMPLE_RELOC_TARGET_RVA & !0xfff,
+            SAMPLE_RELOC_TARGET_RVA & 0xfff,
+        ),
+        4,
+    );
 
     let manifest = embedded_manifest_xml().into_bytes();
     let version = version_resource_blob("Casa1 Demo", "1.2.3.4");
@@ -226,7 +349,10 @@ fn sample_pe_bytes_with_format(format: SamplePeFormat) -> Vec<u8> {
     let dos_stub_size = 0x80;
     let nt_headers_size = 4 + 20 + optional_header_size;
     let section_headers_size = sections.len() as u32 * 40;
-    let size_of_headers = align_u32(dos_stub_size + nt_headers_size + section_headers_size, file_alignment);
+    let size_of_headers = align_u32(
+        dos_stub_size + nt_headers_size + section_headers_size,
+        file_alignment,
+    );
 
     let mut raw_pointer = size_of_headers;
     for section in &mut sections {
@@ -241,7 +367,13 @@ fn sample_pe_bytes_with_format(format: SamplePeFormat) -> Vec<u8> {
     let mut directories = BTreeMap::new();
     directories.insert(0_u32, (export_directory_rva, export_directory_size));
     directories.insert(1_u32, (import_descriptor_rva, 40));
-    directories.insert(2_u32, (0x5000, sections.last().expect("resource section").data.len() as u32));
+    directories.insert(
+        2_u32,
+        (
+            0x5000,
+            sections.last().expect("resource section").data.len() as u32,
+        ),
+    );
     directories.insert(5_u32, (0x4000, sections[3].data.len() as u32));
     directories.insert(6_u32, (debug_directory_rva, 28));
     directories.insert(9_u32, (tls_directory_rva, 40));
@@ -264,8 +396,19 @@ fn sample_pe_bytes_with_format(format: SamplePeFormat) -> Vec<u8> {
     write_u16(&mut bytes, optional, optional_magic);
     bytes[optional + 2] = 14;
     bytes[optional + 3] = 0;
-    write_u32(&mut bytes, optional + 4, sections[0].raw_size_aligned(file_alignment));
-    write_u32(&mut bytes, optional + 8, sections[1..].iter().map(|section| section.raw_size_aligned(file_alignment)).sum());
+    write_u32(
+        &mut bytes,
+        optional + 4,
+        sections[0].raw_size_aligned(file_alignment),
+    );
+    write_u32(
+        &mut bytes,
+        optional + 8,
+        sections[1..]
+            .iter()
+            .map(|section| section.raw_size_aligned(file_alignment))
+            .sum(),
+    );
     write_u32(&mut bytes, optional + 16, SAMPLE_ENTRY_RVA);
     write_u32(&mut bytes, optional + 20, 0x1000);
     write_u32(&mut bytes, optional + 32, section_alignment);
@@ -303,11 +446,27 @@ fn sample_pe_bytes_with_format(format: SamplePeFormat) -> Vec<u8> {
     let mut section_header_offset = optional + optional_header_size as usize;
     for section in &sections {
         bytes[section_header_offset..section_header_offset + 8].copy_from_slice(&section.name);
-        write_u32(&mut bytes, section_header_offset + 8, section.data.len() as u32);
-        write_u32(&mut bytes, section_header_offset + 12, section.virtual_address);
-        write_u32(&mut bytes, section_header_offset + 16, section.raw_size_aligned(file_alignment));
+        write_u32(
+            &mut bytes,
+            section_header_offset + 8,
+            section.data.len() as u32,
+        );
+        write_u32(
+            &mut bytes,
+            section_header_offset + 12,
+            section.virtual_address,
+        );
+        write_u32(
+            &mut bytes,
+            section_header_offset + 16,
+            section.raw_size_aligned(file_alignment),
+        );
         write_u32(&mut bytes, section_header_offset + 20, section.raw_pointer);
-        write_u32(&mut bytes, section_header_offset + 36, section.characteristics);
+        write_u32(
+            &mut bytes,
+            section_header_offset + 36,
+            section.characteristics,
+        );
         section_header_offset += 40;
     }
 
@@ -319,7 +478,7 @@ fn sample_pe_bytes_with_format(format: SamplePeFormat) -> Vec<u8> {
 }
 
 pub fn external_manifest_xml() -> String {
-        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
     <assemblyIdentity type="win32" name="Casa1.External" version="2.0.0.0" processorArchitecture="amd64"/>
     <application xmlns="urn:schemas-microsoft-com:asm.v3">
@@ -333,7 +492,7 @@ pub fn external_manifest_xml() -> String {
 }
 
 pub fn embedded_manifest_xml() -> String {
-        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
     <assemblyIdentity type="win32" name="Casa1.Sample" version="1.0.0.0" processorArchitecture="amd64"/>
   <dependency>
@@ -388,11 +547,19 @@ fn build_resource_section(section_rva: u32, entries: Vec<(u32, Vec<u8>)>) -> Vec
         let data_entry_offset = type_dir_offset + 48;
 
         write_u32(&mut bytes, 16 + index * 8, type_id);
-        write_u32(&mut bytes, 20 + index * 8, 0x8000_0000 | type_dir_offset as u32);
+        write_u32(
+            &mut bytes,
+            20 + index * 8,
+            0x8000_0000 | type_dir_offset as u32,
+        );
 
         write_directory_header(&mut bytes, type_dir_offset, 1);
         write_u32(&mut bytes, type_dir_offset + 16, 1);
-        write_u32(&mut bytes, type_dir_offset + 20, 0x8000_0000 | name_dir_offset as u32);
+        write_u32(
+            &mut bytes,
+            type_dir_offset + 20,
+            0x8000_0000 | name_dir_offset as u32,
+        );
 
         write_directory_header(&mut bytes, name_dir_offset, 1);
         write_u32(&mut bytes, name_dir_offset + 16, 1033);
@@ -450,7 +617,13 @@ fn string_block(key: &str, value: &str) -> Vec<u8> {
     )
 }
 
-fn version_block(key: &str, ty: u16, value: &[u8], value_length: u16, children: Vec<Vec<u8>>) -> Vec<u8> {
+fn version_block(
+    key: &str,
+    ty: u16,
+    value: &[u8],
+    value_length: u16,
+    children: Vec<Vec<u8>>,
+) -> Vec<u8> {
     let mut bytes = vec![0_u8; 6];
     bytes.extend_from_slice(&utf16z_bytes(key));
     align_vec(&mut bytes, 4);
@@ -513,7 +686,7 @@ fn align_vec(bytes: &mut Vec<u8>, alignment: usize) {
 }
 
 fn align_usize(value: usize, alignment: usize) -> usize {
-    if value % alignment == 0 {
+    if value.is_multiple_of(alignment) {
         value
     } else {
         value + (alignment - (value % alignment))
@@ -521,7 +694,7 @@ fn align_usize(value: usize, alignment: usize) -> usize {
 }
 
 fn align_u32(value: u32, alignment: u32) -> u32 {
-    if value % alignment == 0 {
+    if value.is_multiple_of(alignment) {
         value
     } else {
         value + (alignment - (value % alignment))
@@ -1239,7 +1412,10 @@ exit_five:
     );
 }
 
-fn build_test_root_signature(root_constants: u32, descriptors: &[(u8, u8, u8, u8, u8, u8)]) -> Vec<u8> {
+fn build_test_root_signature(
+    root_constants: u32,
+    descriptors: &[(u8, u8, u8, u8, u8, u8)],
+) -> Vec<u8> {
     let mut bytes = Vec::new();
     bytes.extend(&(descriptors.len() as u32).to_le_bytes());
     bytes.extend(&root_constants.to_le_bytes());
@@ -1292,13 +1468,7 @@ fn build_test_reflection_part(
     bytes.extend(&(resources.len() as u32).to_le_bytes());
     for resource in resources {
         bytes.extend([
-            resource.0,
-            resource.1,
-            resource.2,
-            resource.3,
-            resource.4,
-            resource.5,
-            resource.6,
+            resource.0, resource.1, resource.2, resource.3, resource.4, resource.5, resource.6,
         ]);
     }
     bytes.extend(&(cbuffers.len() as u32).to_le_bytes());
@@ -1363,7 +1533,10 @@ fn build_test_dxil_container(entry_name: &str, parts: Vec<([u8; 4], Vec<u8>)>) -
 }
 
 fn build_test_vertex_dxil() -> Vec<u8> {
-    let root_signature = build_test_root_signature(8, &[(1, 0, 0, 1, 0, 0), (2, 0, 0, 1, 1, 0), (3, 0, 0, 1, 2, 0)]);
+    let root_signature = build_test_root_signature(
+        8,
+        &[(1, 0, 0, 1, 0, 0), (2, 0, 0, 1, 1, 0), (3, 0, 0, 1, 2, 0)],
+    );
     build_test_dxil_container(
         "main_vs",
         vec![
@@ -1390,7 +1563,10 @@ fn build_test_vertex_dxil() -> Vec<u8> {
 }
 
 fn build_test_pixel_dxil() -> Vec<u8> {
-    let root_signature = build_test_root_signature(8, &[(1, 0, 0, 1, 0, 0), (2, 0, 0, 1, 1, 0), (3, 0, 0, 1, 2, 0)]);
+    let root_signature = build_test_root_signature(
+        8,
+        &[(1, 0, 0, 1, 0, 0), (2, 0, 0, 1, 1, 0), (3, 0, 0, 1, 2, 0)],
+    );
     build_test_dxil_container(
         "main_ps",
         vec![
@@ -2368,13 +2544,21 @@ pub fn lifecycle_log_lines(plan: &LifecyclePlan) -> Vec<String> {
 
 fn lifecycle_log_line(event: &casa1::pe::LifecycleEvent) -> String {
     let (stage, value) = match event.stage {
-        LifecycleStage::TlsProcessAttach(callback) => ("tls_process_attach".to_string(), Some(callback)),
+        LifecycleStage::TlsProcessAttach(callback) => {
+            ("tls_process_attach".to_string(), Some(callback))
+        }
         LifecycleStage::DllMainProcessAttach => ("dllmain_process_attach".to_string(), None),
-        LifecycleStage::TlsProcessDetach(callback) => ("tls_process_detach".to_string(), Some(callback)),
+        LifecycleStage::TlsProcessDetach(callback) => {
+            ("tls_process_detach".to_string(), Some(callback))
+        }
         LifecycleStage::DllMainProcessDetach => ("dllmain_process_detach".to_string(), None),
-        LifecycleStage::TlsThreadAttach(callback) => ("tls_thread_attach".to_string(), Some(callback)),
+        LifecycleStage::TlsThreadAttach(callback) => {
+            ("tls_thread_attach".to_string(), Some(callback))
+        }
         LifecycleStage::DllMainThreadAttach => ("dllmain_thread_attach".to_string(), None),
-        LifecycleStage::TlsThreadDetach(callback) => ("tls_thread_detach".to_string(), Some(callback)),
+        LifecycleStage::TlsThreadDetach(callback) => {
+            ("tls_thread_detach".to_string(), Some(callback))
+        }
         LifecycleStage::DllMainThreadDetach => ("dllmain_thread_detach".to_string(), None),
     };
     serde_json::to_string(&LifecycleLogEntry {

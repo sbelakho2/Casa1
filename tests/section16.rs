@@ -6,9 +6,10 @@ use casa1::media::MediaShim;
 use casa1::pe;
 use casa1::reason::ReasonCode;
 use casa1::security::{
-    audit_embedded_entitlements, audit_entitlement_targets, collect_crash_artifact,
-    nightly_sanitizer_commands, parse_http_request, CrashModule, CrashSnapshot, CrashThread,
-    EntitlementAuditReport, EntitlementAuditTarget, FilesystemSandbox, NetworkPolicyEnforcer,
+    CrashModule, CrashSnapshot, CrashThread, EntitlementAuditReport, EntitlementAuditTarget,
+    FilesystemSandbox, NetworkPolicyEnforcer, audit_embedded_entitlements,
+    audit_entitlement_targets, collect_crash_artifact, nightly_sanitizer_commands,
+    parse_http_request,
 };
 use casa1::shader;
 use std::collections::BTreeMap;
@@ -119,7 +120,11 @@ fn t16_1_entitlement_audit_allows_only_runner_jit_entitlements() {
     )
     .expect("audit rejected target");
     assert!(!rejected.approved);
-    assert!(rejected.unexpected_targets.contains(&"casa1-helper".to_string()));
+    assert!(
+        rejected
+            .unexpected_targets
+            .contains(&"casa1-helper".to_string())
+    );
 }
 
 #[test]
@@ -232,11 +237,16 @@ fn t16_1_entitlement_audit_cli_enforces_signed_binary_set_end_to_end() {
     assert!(!rejected.status.success());
     let error: ErrorResponse =
         serde_json::from_slice(&rejected.stderr).expect("parse entitlement audit error");
-    assert_eq!(error.reason_code, ReasonCode::RcEntitlementAuditFailed.as_u32());
-    assert!(error
-        .reproduction_hints
-        .iter()
-        .any(|hint| hint.contains("casa1-helper-bad")));
+    assert_eq!(
+        error.reason_code,
+        ReasonCode::RcEntitlementAuditFailed.as_u32()
+    );
+    assert!(
+        error
+            .reproduction_hints
+            .iter()
+            .any(|hint| hint.contains("casa1-helper-bad"))
+    );
 }
 
 #[test]
@@ -245,20 +255,24 @@ fn t16_2_sandbox_escape_suite_blocks_traversal_sensitive_paths_and_toctou() {
         "/Users/test/Casa1/GE",
         &["/Users/test/Documents".to_string()],
     );
-    assert!(sandbox
-        .authorize(
-            "/Users/test/Casa1/GE/game/save.dat",
-            "/Users/test/Casa1/GE/game/save.dat",
-            "/Users/test/Casa1/GE/game/save.dat",
-        )
-        .is_ok());
-    assert!(sandbox
-        .authorize(
-            "/Users/test/Documents/mods/mod.zip",
-            "/Users/test/Documents/mods/mod.zip",
-            "/Users/test/Documents/mods/mod.zip",
-        )
-        .is_ok());
+    assert!(
+        sandbox
+            .authorize(
+                "/Users/test/Casa1/GE/game/save.dat",
+                "/Users/test/Casa1/GE/game/save.dat",
+                "/Users/test/Casa1/GE/game/save.dat",
+            )
+            .is_ok()
+    );
+    assert!(
+        sandbox
+            .authorize(
+                "/Users/test/Documents/mods/mod.zip",
+                "/Users/test/Documents/mods/mod.zip",
+                "/Users/test/Documents/mods/mod.zip",
+            )
+            .is_ok()
+    );
     let traversal = sandbox
         .authorize(
             "../secret.txt",
@@ -268,7 +282,11 @@ fn t16_2_sandbox_escape_suite_blocks_traversal_sensitive_paths_and_toctou() {
         .expect_err("traversal must fail");
     assert_eq!(traversal.code, ReasonCode::RcFsPathInvalid);
     let system = sandbox
-        .authorize("/System/Library/foo", "/System/Library/foo", "/System/Library/foo")
+        .authorize(
+            "/System/Library/foo",
+            "/System/Library/foo",
+            "/System/Library/foo",
+        )
         .expect_err("system path must fail");
     assert_eq!(system.code, ReasonCode::RcFsSandboxEscape);
     let other_home = sandbox
@@ -310,20 +328,25 @@ fn t16_3_network_deny_mode_returns_stable_windows_unreachable_errors_and_logs() 
         policy: NetworkPolicy::AllowAll,
         whitelist: Vec::new(),
     });
-    assert!(allow.connect("api.example.com", "203.0.113.10").is_ok());
+    let _result = allow.connect("api.example.com", "203.0.113.10");
+    assert!(_result.is_ok(), "expected Ok, got {_result:?}");
 
     let mut whitelist = NetworkPolicyEnforcer::new(NetworkProfile {
         policy: NetworkPolicy::AllowOnlyWhitelist,
         whitelist: vec!["api.example.com".to_string(), "203.0.113.20".to_string()],
     });
-    assert!(whitelist.connect("api.example.com", "203.0.113.10").is_ok());
-    assert!(whitelist.connect("launcher.example.com", "203.0.113.20").is_ok());
-    assert!(whitelist.connect("blocked.example.com", "203.0.113.99").is_err());
+    let _result = whitelist.connect("api.example.com", "203.0.113.10");
+    assert!(_result.is_ok(), "expected Ok, got {_result:?}");
+    let _result = whitelist.connect("launcher.example.com", "203.0.113.20");
+    assert!(_result.is_ok(), "expected Ok, got {_result:?}");
+    let _result = whitelist.connect("blocked.example.com", "203.0.113.99");
+    assert!(_result.is_err(), "expected Err, got {_result:?}");
 }
 
 #[test]
 fn t16_4_fuzz_regression_suite_classifies_permanent_inputs_and_crash_artifact_is_deterministic() {
-    let msi_error = parse_msi_script(&load_fixture("msi_invalid")).expect_err("MSI regression input must classify");
+    let msi_error = parse_msi_script(&load_fixture("msi_invalid"))
+        .expect_err("MSI regression input must classify");
     assert_eq!(msi_error.code, ReasonCode::RcMsiInvalid);
 
     let media = MediaShim::new("C:/GEs/FuzzMedia");
@@ -332,10 +355,12 @@ fn t16_4_fuzz_regression_suite_classifies_permanent_inputs_and_crash_artifact_is
         .expect_err("media regression input must classify");
     assert_eq!(media_error.code, ReasonCode::RcMediaInvalid);
 
-    let http_error = parse_http_request(&load_fixture("http_invalid")).expect_err("HTTP regression input must classify");
+    let http_error = parse_http_request(&load_fixture("http_invalid"))
+        .expect_err("HTTP regression input must classify");
     assert_eq!(http_error.code, ReasonCode::RcNetworkProtocolInvalid);
 
-    let pe_error = pe::parse(&load_fixture("pe_short")).expect_err("PE regression input must classify");
+    let pe_error =
+        pe::parse(&load_fixture("pe_short")).expect_err("PE regression input must classify");
     assert_eq!(pe_error.code, ReasonCode::RcPeParseInvalid);
 
     let dxil_summary = shader::fuzz_summary(&load_fixture("dxil_short"));
@@ -367,7 +392,10 @@ fn t16_4_fuzz_regression_suite_classifies_permanent_inputs_and_crash_artifact_is
         ],
         threads: vec![CrashThread {
             tid: 42,
-            stack: vec!["game.exe!Crash+0x10".to_string(), "kernel32!BaseThreadInitThunk".to_string()],
+            stack: vec![
+                "game.exe!Crash+0x10".to_string(),
+                "kernel32!BaseThreadInitThunk".to_string(),
+            ],
         }],
         host_stack: vec![
             "macwin!dispatch_runner".to_string(),
@@ -395,7 +423,9 @@ fn t16_4_fuzz_regression_suite_classifies_permanent_inputs_and_crash_artifact_is
     let file = fs::File::open(output).expect("open crash zip");
     let mut archive = zip::ZipArchive::new(file).expect("read crash zip");
     let log_tail = {
-        let mut entry = archive.by_name("artifact/log_tail.txt").expect("log tail entry");
+        let mut entry = archive
+            .by_name("artifact/log_tail.txt")
+            .expect("log tail entry");
         let mut text = String::new();
         use std::io::Read;
         entry.read_to_string(&mut text).expect("read log tail");
@@ -405,4 +435,188 @@ fn t16_4_fuzz_regression_suite_classifies_permanent_inputs_and_crash_artifact_is
     assert!(!log_tail.contains("/Users/alice/"));
     assert!(log_tail.contains("<redacted-email>"));
     assert!(log_tail.contains("/Users/<redacted>/Casa1/GE/game.log"));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// t16_5 — Shader translation: resource bindings, samplers, push constants
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn t16_5_shader_resource_binding_translation() {
+    // Build a root signature with descriptor table entries for SRV, UAV, sampler
+    // Root signature format: [count:u32][root_constants:u32][descriptors:6*N bytes]
+    // descriptor = kind:u8 reg:u8 space:u8 desc_count:u8 arg_idx:u8 bind_idx:u8
+    let root_sig = vec![
+        0x03, 0x00, 0x00, 0x00, // 3 descriptors
+        0x00, 0x00, 0x00, 0x00, // 0 root constants
+        // SRV (kind=0): register 0, space 0, count 1, arg 0, bind 0
+        0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+        // UAV (kind=1): register 1, space 0, count 1, arg 0, bind 1
+        0x01, 0x01, 0x00, 0x01, 0x00, 0x01,
+        // Sampler (kind=2): register 0, space 0, count 1, arg 0, bind 2
+        0x02, 0x00, 0x00, 0x01, 0x00, 0x02,
+    ];
+    let root_info = shader::parse_root_signature(&root_sig).expect("parse root sig");
+    assert_eq!(root_info.descriptors.len(), 3);
+    assert_eq!(root_info.root_constants_count, 0);
+
+    let arg_bufs = shader::build_argument_buffers(&root_info);
+    assert_eq!(arg_bufs.len(), 3);
+    assert_eq!(arg_bufs[0].table_index, 0);
+    assert_eq!(arg_bufs[0].binding_count, 1);
+    assert_eq!(arg_bufs[0].bindings[0].register, 0);
+
+    // Test root constants plan
+    let plan = shader::RootConstantsPlan {
+        constant_buffer_size: 32,
+        binding_index: 0,
+    };
+    assert_eq!(plan.constant_buffer_size, 32);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// t16_6 — DXIL parser: malformed container offsets / oversized chunks
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn t16_6_dxil_parser_malformed_offsets() {
+    // Too short (<12 bytes) — fails header check
+    let too_short = b"DX";
+    let result = shader::parse_dxil_container(too_short);
+    assert!(result.is_err(), "expected Err, got {result:?}");
+
+    // Magic only but no version/part count (exactly 4 bytes)
+    let magic_only = b"DXIL";
+    let result = shader::parse_dxil_container(magic_only);
+    assert!(result.is_err(), "expected Err, got {result:?}");
+
+    // 12 bytes with valid magic but version != 1
+    let bad_version = {
+        let mut buf = Vec::from(b"DXIL");
+        buf.extend_from_slice(&2u32.to_le_bytes()); // version = 2
+        buf.extend_from_slice(&0u32.to_le_bytes()); // part count = 0
+        buf
+    };
+    let result = shader::parse_dxil_container(&bad_version);
+    assert!(result.is_err(), "expected Err, got {result:?}");
+
+    // Part count of 0 should be rejected
+    let zero_parts = {
+        let mut buf = Vec::from(b"DXIL");
+        buf.extend_from_slice(&1u32.to_le_bytes()); // version = 1
+        buf.extend_from_slice(&0u32.to_le_bytes()); // part count = 0
+        buf
+    };
+    let result = shader::parse_dxil_container(&zero_parts);
+    assert!(result.is_err(), "expected Err, got {result:?}");
+
+    // Part count exceeding MAX_PARTS (16) should be rejected
+    let too_many_parts = {
+        let mut buf = Vec::from(b"DXIL");
+        buf.extend_from_slice(&1u32.to_le_bytes()); // version = 1
+        buf.extend_from_slice(&20u32.to_le_bytes()); // part count = 20 (>16)
+        buf
+    };
+    let result = shader::parse_dxil_container(&too_many_parts);
+    assert!(result.is_err(), "expected Err, got {result:?}");
+
+    // Part offset overlapping header region should be rejected
+    let overlap_part = {
+        let mut buf = Vec::from(b"DXIL");
+        buf.extend_from_slice(&1u32.to_le_bytes()); // version = 1
+        buf.extend_from_slice(&1u32.to_le_bytes()); // part count = 1
+        // Part descriptor: kind="PROG", offset=0 (overlaps header), size=16
+        buf.extend_from_slice(b"PROG");
+        buf.extend_from_slice(&0u32.to_le_bytes()); // offset = 0 (bad)
+        buf.extend_from_slice(&16u32.to_le_bytes()); // size = 16
+        buf
+    };
+    let result = shader::parse_dxil_container(&overlap_part);
+    assert!(result.is_err(), "expected Err, got {result:?}");
+
+    // Verify existing fixture
+    let fixture = load_fixture("dxil_short");
+    let summary = shader::fuzz_summary(&fixture);
+    assert!(summary.starts_with("err:"));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// t16_7 — GLSL translation error tests (via GlslToMslTranslator)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn t16_7_glsl_translation_errors() {
+    use casa1::vkgl::{GlslShaderStage, GlslToMslTranslator};
+
+    // Empty source should still produce output
+    let result = GlslToMslTranslator::translate("", GlslShaderStage::Vertex);
+    assert!(result.is_ok(), "expected Ok, got {result:?}");
+
+    // Basic vertex shader translation
+    let vs_source = "void main() { gl_Position = vec4(0.0); }";
+    let result = GlslToMslTranslator::translate(vs_source, GlslShaderStage::Vertex);
+    assert!(result.is_ok(), "expected Ok, got {result:?}");
+    let msl = result.unwrap();
+    assert!(msl.contains("vertex"));
+
+    // Fragment shader translation
+    let fs_source = "void main() { gl_FragColor = vec4(1.0); }";
+    let result = GlslToMslTranslator::translate(fs_source, GlslShaderStage::Fragment);
+    assert!(result.is_ok(), "expected Ok, got {result:?}");
+    let msl = result.unwrap();
+    assert!(msl.contains("fragment"));
+
+    // Shader with uniforms should translate uniform lines
+    let uniform_source = "uniform float uTime; void main() {}";
+    let result = GlslToMslTranslator::translate(uniform_source, GlslShaderStage::Vertex);
+    assert!(result.is_ok(), "expected Ok, got {result:?}");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// t16_8 — Cbuffer packing and structured buffer packing
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn t16_8_cbuffer_and_structured_packing() {
+    use casa1::shader::{CbufferField, StructuredField};
+
+    // Pack a simple cbuffer with scalar fields
+    let fields = vec![
+        CbufferField {
+            name: "offsetA".into(),
+            rows: 1,
+            cols: 1,
+            row_major: false,
+            is_bool: false,
+            array_len: 0,
+        },
+        CbufferField {
+            name: "offsetB".into(),
+            rows: 1,
+            cols: 4,
+            row_major: false,
+            is_bool: false,
+            array_len: 0,
+        },
+    ];
+    let packed = shader::pack_cbuffer(&fields);
+    assert_eq!(packed.fields.len(), 2);
+    assert_eq!(packed.fields[0].name, "offsetA");
+    assert_eq!(packed.fields[1].name, "offsetB");
+
+    // Pack structured buffer fields
+    let struct_fields = vec![
+        StructuredField {
+            name: "pos".into(),
+            size_bytes: 12,
+            alignment: 4,
+        },
+        StructuredField {
+            name: "uv".into(),
+            size_bytes: 8,
+            alignment: 4,
+        },
+    ];
+    let packing = shader::pack_structured_fields(&struct_fields);
+    assert_eq!(packing.stride, 20);
 }

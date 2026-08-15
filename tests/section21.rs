@@ -68,7 +68,7 @@ fn t21_2_command_allocator_and_list() {
     assert!(pso > 0, "pipeline state ID should be non-zero");
 
     // Create command list
-    let list = runtime.create_graphics_command_list(allocator, pso);
+    let list = runtime.create_graphics_command_list(allocator, pso, false);
     assert!(list > 0, "command list ID should be non-zero");
 }
 
@@ -167,7 +167,7 @@ fn t21_4_command_list_recording() {
 
     // Create command allocator and list
     let allocator = runtime.create_command_allocator();
-    let list = runtime.create_graphics_command_list(allocator, pso);
+    let list = runtime.create_graphics_command_list(allocator, pso, false);
 
     // Record commands: begin render pass, clear RTV, draw, end render pass
     runtime
@@ -180,7 +180,9 @@ fn t21_4_command_list_recording() {
         )
         .expect("begin render pass");
 
-    runtime.record_clear_rtv(list, rtv_heap, 0).expect("clear RTV");
+    runtime
+        .record_clear_rtv(list, rtv_heap, 0)
+        .expect("clear RTV");
     runtime.record_draw(list, 3).expect("draw");
     runtime.end_render_pass(list).expect("end render pass");
 
@@ -195,7 +197,10 @@ fn t21_4_command_list_recording() {
         .expect("execute");
 
     assert_eq!(plan.render_passes.len(), 1, "should have 1 render pass");
-    assert_eq!(plan.render_passes[0].draw_calls, 1, "should have 1 draw call");
+    assert_eq!(
+        plan.render_passes[0].draw_calls, 1,
+        "should have 1 draw call"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -216,14 +221,19 @@ fn t21_5_fence_synchronization() {
     // Signal fence to value 1
     runtime.signal_fence(fence, 1).expect("signal fence");
 
-    let after_signal = runtime.fence_value(fence).expect("fence value after signal");
+    let after_signal = runtime
+        .fence_value(fence)
+        .expect("fence value after signal");
     assert_eq!(after_signal, 1, "fence value should be 1 after signal");
 
     // Signal to higher value
     runtime.signal_fence(fence, 42).expect("signal fence to 42");
 
     let final_value = runtime.fence_value(fence).expect("final fence value");
-    assert_eq!(final_value, 42, "fence value should be 42 after second signal");
+    assert_eq!(
+        final_value, 42,
+        "fence value should be 42 after second signal"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -359,18 +369,14 @@ fn t21_7_resource_creation() {
     assert!(texture > 0, "texture resource ID should be non-zero");
 
     // Verify resource states
-    let buffer_state = runtime
-        .resource_state(buffer, 0)
-        .expect("buffer state");
+    let buffer_state = runtime.resource_state(buffer, 0).expect("buffer state");
     assert_eq!(
         buffer_state,
         ResourceState::GenericRead,
         "buffer should be in GenericRead state"
     );
 
-    let texture_state = runtime
-        .resource_state(texture, 0)
-        .expect("texture state");
+    let texture_state = runtime.resource_state(texture, 0).expect("texture state");
     assert_eq!(
         texture_state,
         ResourceState::PixelShaderResource,
@@ -407,16 +413,24 @@ fn t21_7_resource_creation() {
     // Read back from the readback buffer
     let fence = runtime.create_fence(0);
     runtime.signal_fence(fence, 1).expect("signal");
-    let read_back = runtime
-        .readback(readback_buf, fence, 1)
-        .expect("readback");
-    assert_eq!(read_back.len(), 1024, "readback should return full buffer size");
-    assert_eq!(&read_back[..256], &data[..], "readback data should match uploaded data");
+    let read_back = runtime.readback(readback_buf, fence, 1).expect("readback");
+    assert_eq!(
+        read_back.len(),
+        1024,
+        "readback should return full buffer size"
+    );
+    assert_eq!(
+        &read_back[..256],
+        &data[..],
+        "readback data should match uploaded data"
+    );
 
     // Destroy resources
     runtime.destroy_resource(buffer).expect("destroy buffer");
     runtime.destroy_resource(texture).expect("destroy texture");
-    runtime.destroy_resource(readback_buf).expect("destroy readback buffer");
+    runtime
+        .destroy_resource(readback_buf)
+        .expect("destroy readback buffer");
 }
 
 // ---------------------------------------------------------------------------
@@ -444,7 +458,10 @@ fn t21_8_root_signature() {
     });
 
     assert!(root_sig2 > 0, "second root signature ID should be non-zero");
-    assert_ne!(root_sig, root_sig2, "root signatures should have unique IDs");
+    assert_ne!(
+        root_sig, root_sig2,
+        "root signatures should have unique IDs"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -517,7 +534,11 @@ fn t21_10_swapchain_creation() {
     let state = runtime.swapchain_state(swapchain).expect("swapchain state");
     assert_eq!(state.desc.width, 1280, "width should be 1280");
     assert_eq!(state.desc.height, 720, "height should be 720");
-    assert_eq!(state.desc.format, DxgiFormat::R8G8B8A8Unorm, "format should match");
+    assert_eq!(
+        state.desc.format,
+        DxgiFormat::R8G8B8A8Unorm,
+        "format should match"
+    );
     assert_eq!(state.desc.buffer_count, 2, "buffer count should be 2");
     assert_eq!(state.backbuffers.len(), 2, "should have 2 backbuffers");
 
@@ -528,6 +549,9 @@ fn t21_10_swapchain_creation() {
 
     // Present a frame
     let present = runtime.present(swapchain, 1, false).expect("present");
-    assert_eq!(present.effective_sync_interval, 1, "sync interval should be 1");
+    assert_eq!(
+        present.effective_sync_interval, 1,
+        "sync interval should be 1"
+    );
     assert_eq!(present.queued_frames, 1, "should have 1 queued frame");
 }

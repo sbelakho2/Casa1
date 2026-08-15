@@ -80,9 +80,16 @@ pub struct GeFsState {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum OverrideMatchRule {
-    ExeSha256 { sha256: String },
-    ProductVersion { product_name: String, file_version: String },
-    InstallPathWildcard { pattern: String },
+    ExeSha256 {
+        sha256: String,
+    },
+    ProductVersion {
+        product_name: String,
+        file_version: String,
+    },
+    InstallPathWildcard {
+        pattern: String,
+    },
     DefaultProfile,
 }
 
@@ -399,10 +406,14 @@ pub struct RegistryWatcher {
 
 impl RegistryWatcher {
     pub fn wait_for_change(&mut self, timeout: Duration) -> AppResult<bool> {
-        let mut sequence = self.inner.sequence.lock().expect("registry watcher lock poisoned");
+        let mut sequence = self
+            .inner
+            .sequence
+            .lock()
+            .expect("registry watcher lock poisoned");
         if *sequence > self.observed_sequence {
             self.observed_sequence = *sequence;
-            return Ok(true);
+            return Ok(true); // correct: sequence already advanced, change detected
         }
 
         let (updated_sequence, wait_result) = self
@@ -425,7 +436,11 @@ impl RegistryWatcher {
 impl GameEnvironment {
     pub fn create(name: &str, arch: GeArch, winver: &str) -> AppResult<Self> {
         let current = std::env::current_dir().map_err(|error| {
-            AppError::from_io(ReasonCode::RcIo, "failed to resolve current directory", &error)
+            AppError::from_io(
+                ReasonCode::RcIo,
+                "failed to resolve current directory",
+                &error,
+            )
         })?;
         // When CASA1_GES_ROOT is set, that root is authoritative: the caller has
         // explicitly chosen where game environments live, so we must NOT fall
@@ -446,13 +461,21 @@ impl GameEnvironment {
         if let Some(existing_root) = existing_root {
             return Err(AppError::new(
                 ReasonCode::RcGeExists,
-                format!("game environment {name} already exists at {}", existing_root.display()),
+                format!(
+                    "game environment {name} already exists at {}",
+                    existing_root.display()
+                ),
             ));
         }
         Self::create_in_root(root, name, arch, winver)
     }
 
-    pub fn create_in(base_root: impl AsRef<Path>, name: &str, arch: GeArch, winver: &str) -> AppResult<Self> {
+    pub fn create_in(
+        base_root: impl AsRef<Path>,
+        name: &str,
+        arch: GeArch,
+        winver: &str,
+    ) -> AppResult<Self> {
         let root = base_root.as_ref().join(name);
         Self::create_in_root(root, name, arch, winver)
     }
@@ -484,7 +507,11 @@ impl GameEnvironment {
 
     pub fn open(name: &str) -> AppResult<Self> {
         let current = std::env::current_dir().map_err(|error| {
-            AppError::from_io(ReasonCode::RcIo, "failed to resolve current directory", &error)
+            AppError::from_io(
+                ReasonCode::RcIo,
+                "failed to resolve current directory",
+                &error,
+            )
         })?;
         let candidate_roots = base_root_candidates_from_env_or(&current)?;
         for candidate in &candidate_roots {
@@ -599,7 +626,9 @@ impl GameEnvironment {
         requires_permission: bool,
     ) -> AppResult<()> {
         let normalized_drive = normalize_drive_letter(drive)?;
-        self.config.drive_mappings.retain(|mapping| mapping.drive != normalized_drive);
+        self.config
+            .drive_mappings
+            .retain(|mapping| mapping.drive != normalized_drive);
         self.config.drive_mappings.push(DriveMapping {
             drive: normalized_drive,
             target: target.display().to_string(),
@@ -607,7 +636,9 @@ impl GameEnvironment {
             enabled: true,
             requires_permission,
         });
-        self.config.drive_mappings.sort_by(|left, right| left.drive.cmp(&right.drive));
+        self.config
+            .drive_mappings
+            .sort_by(|left, right| left.drive.cmp(&right.drive));
         self.save_config()
     }
 
@@ -646,7 +677,11 @@ impl GameEnvironment {
         self.save_config()
     }
 
-    pub fn snapshot_files(&self, dtm: bool, epoch: SystemTime) -> AppResult<BTreeMap<String, FileSnapshotEntry>> {
+    pub fn snapshot_files(
+        &self,
+        dtm: bool,
+        epoch: SystemTime,
+    ) -> AppResult<BTreeMap<String, FileSnapshotEntry>> {
         let mut paths = Vec::new();
         let mut roots = self
             .active_drive_mappings()
@@ -690,7 +725,9 @@ impl GameEnvironment {
             let mut attrs = Vec::new();
             if let Some(record) = self.config.fs_state.entries.get(&path_norm) {
                 attrs = record.attributes.clone();
-                if record.kind == FsEntryKind::Directory && !attrs.iter().any(|value| value == "directory") {
+                if record.kind == FsEntryKind::Directory
+                    && !attrs.iter().any(|value| value == "directory")
+                {
                     attrs.push("directory".to_string());
                 }
             } else {
@@ -705,9 +742,21 @@ impl GameEnvironment {
             attrs.dedup();
             let times_norm = if let Some(record) = self.config.fs_state.entries.get(&path_norm) {
                 NormalizedTimes {
-                    created_ms: if dtm { 0 } else { record.creation_time_ticks / 10_000 },
-                    accessed_ms: if dtm { 0 } else { record.last_access_time_ticks / 10_000 },
-                    modified_ms: if dtm { 0 } else { record.last_write_time_ticks / 10_000 },
+                    created_ms: if dtm {
+                        0
+                    } else {
+                        record.creation_time_ticks / 10_000
+                    },
+                    accessed_ms: if dtm {
+                        0
+                    } else {
+                        record.last_access_time_ticks / 10_000
+                    },
+                    modified_ms: if dtm {
+                        0
+                    } else {
+                        record.last_write_time_ticks / 10_000
+                    },
                 }
             } else {
                 NormalizedTimes {
@@ -747,7 +796,8 @@ impl GameEnvironment {
                         value_type: value.value_type,
                         data_norm: normalize_registry_data(&value.data),
                     };
-                    let snapshot_key = format!("{}\\{}\\{}", entry.hive, entry.key_norm, entry.value);
+                    let snapshot_key =
+                        format!("{}\\{}\\{}", entry.hive, entry.key_norm, entry.value);
                     snapshot.insert(snapshot_key, entry);
                 }
             }
@@ -764,7 +814,8 @@ impl GameEnvironment {
     }
 
     pub fn create_directory(&mut self, windows_path: &str, dtm: bool) -> AppResult<String> {
-        let (parent, requested_name, normalized_path) = self.resolve_parent_for_create(windows_path, None)?;
+        let (parent, requested_name, normalized_path) =
+            self.resolve_parent_for_create(windows_path, None)?;
         let target = parent.host_path.join(&requested_name);
         fs::create_dir(&target).map_err(|error| {
             AppError::from_io(
@@ -773,12 +824,23 @@ impl GameEnvironment {
                 &error,
             )
         })?;
-        self.upsert_fs_entry(&normalized_path, &requested_name, FsEntryKind::Directory, dtm)?;
+        self.upsert_fs_entry(
+            &normalized_path,
+            &requested_name,
+            FsEntryKind::Directory,
+            dtm,
+        )?;
         Ok(normalized_path)
     }
 
-    pub fn write_file(&mut self, windows_path: &str, contents: &[u8], dtm: bool) -> AppResult<String> {
-        let (parent, requested_name, normalized_path) = self.resolve_parent_for_create(windows_path, None)?;
+    pub fn write_file(
+        &mut self,
+        windows_path: &str,
+        contents: &[u8],
+        dtm: bool,
+    ) -> AppResult<String> {
+        let (parent, requested_name, normalized_path) =
+            self.resolve_parent_for_create(windows_path, None)?;
         let target = parent.host_path.join(&requested_name);
         fs::write(&target, contents).map_err(|error| {
             AppError::from_io(
@@ -791,7 +853,12 @@ impl GameEnvironment {
         Ok(normalized_path)
     }
 
-    pub fn write_file_overwrite(&mut self, windows_path: &str, contents: &[u8], dtm: bool) -> AppResult<String> {
+    pub fn write_file_overwrite(
+        &mut self,
+        windows_path: &str,
+        contents: &[u8],
+        dtm: bool,
+    ) -> AppResult<String> {
         match self.resolve_existing_path(windows_path, None, 0) {
             Ok(resolved) => {
                 fs::write(&resolved.host_path, contents).map_err(|error| {
@@ -813,7 +880,12 @@ impl GameEnvironment {
                             .map(|value| value.to_string_lossy().to_string())
                             .unwrap_or_else(|| "file".to_string())
                     });
-                self.upsert_fs_entry(&resolved.normalized_path, &requested_name, FsEntryKind::File, dtm)?;
+                self.upsert_fs_entry(
+                    &resolved.normalized_path,
+                    &requested_name,
+                    FsEntryKind::File,
+                    dtm,
+                )?;
                 Ok(resolved.normalized_path)
             }
             Err(error) if error.code == ReasonCode::RcFsNotFound => {
@@ -842,7 +914,12 @@ impl GameEnvironment {
 
     pub fn set_file_attributes(&mut self, windows_path: &str, attrs: &[&str]) -> AppResult<()> {
         let resolved = self.resolve_existing_path(windows_path, None, 0)?;
-        if let Some(entry) = self.config.fs_state.entries.get_mut(&resolved.normalized_path) {
+        if let Some(entry) = self
+            .config
+            .fs_state
+            .entries
+            .get_mut(&resolved.normalized_path)
+        {
             entry.attributes = attrs.iter().map(|value| (*value).to_string()).collect();
             entry.attributes.sort();
             entry.attributes.dedup();
@@ -893,6 +970,7 @@ impl GameEnvironment {
                 } else {
                     Vec::new()
                 },
+                // fallback: use any provided time or current time as default
                 creation_time_ticks: fallback_ticks,
                 last_access_time_ticks: fallback_ticks,
                 last_write_time_ticks: fallback_ticks,
@@ -944,7 +1022,11 @@ impl GameEnvironment {
             },
         );
         if let Some(entry) = self.config.fs_state.entries.get_mut(&normalized_path) {
-            if !entry.attributes.iter().any(|value| value == "reparse_point") {
+            if !entry
+                .attributes
+                .iter()
+                .any(|value| value == "reparse_point")
+            {
                 entry.attributes.push("reparse_point".to_string());
                 entry.attributes.sort();
             }
@@ -953,7 +1035,9 @@ impl GameEnvironment {
     }
 
     pub fn resolve_sandboxed_path(&self, windows_path: &str) -> AppResult<String> {
-        Ok(self.resolve_existing_path(windows_path, None, 0)?.normalized_path)
+        Ok(self
+            .resolve_existing_path(windows_path, None, 0)?
+            .normalized_path)
     }
 
     pub fn open_file(
@@ -1016,7 +1100,9 @@ impl GameEnvironment {
             let normalized_path = runtime
                 .open_handles
                 .iter()
-                .find(|open_handle| open_handle.handle_id == handle.id && open_handle.owner_pid == pid)
+                .find(|open_handle| {
+                    open_handle.handle_id == handle.id && open_handle.owner_pid == pid
+                })
                 .map(|open_handle| open_handle.normalized_path.clone())
                 .ok_or_else(|| {
                     AppError::new(
@@ -1095,19 +1181,27 @@ impl GameEnvironment {
 
         let (actual_hive, actual_key) = self.redirect_registry_path(hive, key, view, false)?;
         let db = load_registry_db(&self.registry_file(&actual_hive))?;
-        Ok(db.get(&actual_key).and_then(|values| values.get(value_name)).cloned())
+        Ok(db
+            .get(&actual_key)
+            .and_then(|values| values.get(value_name))
+            .cloned())
     }
 
-    pub fn registry_key_exists(&self, hive: &str, key: &str, view: RegistryView) -> AppResult<bool> {
+    pub fn registry_key_exists(
+        &self,
+        hive: &str,
+        key: &str,
+        view: RegistryView,
+    ) -> AppResult<bool> {
         if normalize_hive(hive)? == "HKCR" {
             for (merged_hive, merged_key) in self.hkcr_merged_keys(key, view)? {
                 let db = load_registry_db(&self.registry_file(&merged_hive))?;
                 if db.contains_key(&merged_key) {
-                    return Ok(true);
+                    return Ok(true); // correct: merged key exists in registry
                 }
                 let prefix = format!("{}\\", normalize_registry_key(&merged_key));
                 if db.keys().any(|existing| existing.starts_with(&prefix)) {
-                    return Ok(true);
+                    return Ok(true); // correct: key prefix exists in registry
                 }
             }
             return Ok(false);
@@ -1116,13 +1210,18 @@ impl GameEnvironment {
         let (actual_hive, actual_key) = self.redirect_registry_path(hive, key, view, false)?;
         let db = load_registry_db(&self.registry_file(&actual_hive))?;
         if db.contains_key(&actual_key) {
-            return Ok(true);
+            return Ok(true); // correct: key exists in registry
         }
         let prefix = format!("{}\\", normalize_registry_key(&actual_key));
         Ok(db.keys().any(|existing| existing.starts_with(&prefix)))
     }
 
-    pub fn registry_create_key(&self, hive: &str, key: &str, view: RegistryView) -> AppResult<bool> {
+    pub fn registry_create_key(
+        &self,
+        hive: &str,
+        key: &str,
+        view: RegistryView,
+    ) -> AppResult<bool> {
         let (actual_hive, actual_key) = self.redirect_registry_path(hive, key, view, true)?;
         let path = self.registry_file(&actual_hive);
         let mut db = load_registry_db(&path)?;
@@ -1185,12 +1284,20 @@ impl GameEnvironment {
         Ok(())
     }
 
-    pub fn registry_enum_keys(&self, hive: &str, key: &str, view: RegistryView) -> AppResult<Vec<String>> {
+    pub fn registry_enum_keys(
+        &self,
+        hive: &str,
+        key: &str,
+        view: RegistryView,
+    ) -> AppResult<Vec<String>> {
         let normalized_hive = normalize_hive(hive)?;
         if normalized_hive == "HKCR" {
             let mut merged = BTreeSet::new();
             for (merged_hive, merged_key) in self.hkcr_merged_keys(key, view)? {
-                for child in enumerate_subkeys(&load_registry_db(&self.registry_file(&merged_hive))?, &merged_key) {
+                for child in enumerate_subkeys(
+                    &load_registry_db(&self.registry_file(&merged_hive))?,
+                    &merged_key,
+                ) {
                     merged.insert(child);
                 }
             }
@@ -1204,7 +1311,12 @@ impl GameEnvironment {
         ))
     }
 
-    pub fn registry_enum_values(&self, hive: &str, key: &str, view: RegistryView) -> AppResult<Vec<String>> {
+    pub fn registry_enum_values(
+        &self,
+        hive: &str,
+        key: &str,
+        view: RegistryView,
+    ) -> AppResult<Vec<String>> {
         let normalized_hive = normalize_hive(hive)?;
         if normalized_hive == "HKCR" {
             let mut merged = BTreeSet::new();
@@ -1229,7 +1341,13 @@ impl GameEnvironment {
         Ok(values)
     }
 
-    pub fn registry_watch(&self, hive: &str, key: &str, recursive: bool, view: RegistryView) -> AppResult<RegistryWatcher> {
+    pub fn registry_watch(
+        &self,
+        hive: &str,
+        key: &str,
+        recursive: bool,
+        view: RegistryView,
+    ) -> AppResult<RegistryWatcher> {
         let (actual_hive, actual_key) = self.redirect_registry_path(hive, key, view, false)?;
         let watcher = Arc::new(RegistryWatcherInner {
             ge_root: self.root.display().to_string(),
@@ -1256,11 +1374,19 @@ impl GameEnvironment {
         let product_name = pe_version
             .as_ref()
             .and_then(|version| version.product_name.clone())
-            .or_else(|| version_sidecar.as_ref().and_then(|sidecar| sidecar.product_name.clone()));
+            .or_else(|| {
+                version_sidecar
+                    .as_ref()
+                    .and_then(|sidecar| sidecar.product_name.clone())
+            });
         let file_version = pe_version
             .as_ref()
             .and_then(|version| version.file_version.clone())
-            .or_else(|| version_sidecar.as_ref().and_then(|sidecar| sidecar.file_version.clone()));
+            .or_else(|| {
+                version_sidecar
+                    .as_ref()
+                    .and_then(|sidecar| sidecar.file_version.clone())
+            });
         Ok(ExecutableIdentity {
             sha256: util::sha256_file(program)?,
             product_name,
@@ -1269,7 +1395,10 @@ impl GameEnvironment {
         })
     }
 
-    pub fn match_override_for_identity(&self, identity: &ExecutableIdentity) -> Option<&OverrideProfile> {
+    pub fn match_override_for_identity(
+        &self,
+        identity: &ExecutableIdentity,
+    ) -> Option<&OverrideProfile> {
         self.config
             .override_profiles
             .iter()
@@ -1307,15 +1436,31 @@ impl GameEnvironment {
         }
         for delete in &profile.payload.reg_delete {
             if let Some(value_name) = &delete.value {
-                let _ = self.registry_delete_value(&delete.hive, &delete.key, value_name, RegistryView::Native);
+                if let Err(e) = self.registry_delete_value(
+                    &delete.hive,
+                    &delete.key,
+                    value_name,
+                    RegistryView::Native,
+                ) {
+                    eprintln!("[ge] failed to delete registry value: {e}");
+                }
             } else {
-                let _ = self.registry_delete_key(&delete.hive, &delete.key, RegistryView::Native);
+                if let Err(e) =
+                    self.registry_delete_key(&delete.hive, &delete.key, RegistryView::Native)
+                {
+                    eprintln!("[ge] failed to delete registry key: {e}");
+                }
             }
         }
         if let Some(fs_profile) = &profile.payload.fs_profile {
             env.insert(
                 "CASA1_EFFECTIVE_LONG_PATHS_ENABLED".to_string(),
-                if fs_profile.long_paths_enabled { "1" } else { "0" }.to_string(),
+                if fs_profile.long_paths_enabled {
+                    "1"
+                } else {
+                    "0"
+                }
+                .to_string(),
             );
             env.insert(
                 "CASA1_EFFECTIVE_CASE_MODE".to_string(),
@@ -1339,9 +1484,12 @@ impl GameEnvironment {
         let mut directories = vec![
             self.drive_c().join("Windows/System32"),
             self.drive_c().join("Program Files"),
-            self.drive_c().join(format!("users/{}/AppData/Roaming", self.config.user_name)),
-            self.drive_c().join(format!("users/{}/AppData/Local", self.config.user_name)),
-            self.drive_c().join(format!("users/{}/AppData/LocalLow", self.config.user_name)),
+            self.drive_c()
+                .join(format!("users/{}/AppData/Roaming", self.config.user_name)),
+            self.drive_c()
+                .join(format!("users/{}/AppData/Local", self.config.user_name)),
+            self.drive_c()
+                .join(format!("users/{}/AppData/LocalLow", self.config.user_name)),
             self.root.join("fs"),
             self.root.join("registry"),
             self.root.join("cache/dbt"),
@@ -1382,7 +1530,10 @@ impl GameEnvironment {
     }
 
     fn write_config(&self) -> AppResult<()> {
-        write_reparse_db(&self.reparse_db_file(), &self.config.fs_state.reparse_points)?;
+        write_reparse_db(
+            &self.reparse_db_file(),
+            &self.config.fs_state.reparse_points,
+        )?;
         let mut persisted_config = self.config.clone();
         persisted_config.fs_state.reparse_points.clear();
         let contents = util::stable_json(&persisted_config)?;
@@ -1419,7 +1570,10 @@ impl GameEnvironment {
         if find_existing_child_case_insensitive(&parent.host_path, &requested_name)?.is_some() {
             return Err(AppError::new(
                 ReasonCode::RcFsAlreadyExists,
-                format!("{} already exists", build_drive_path(&drive, &parsed.components)),
+                format!(
+                    "{} already exists",
+                    build_drive_path(&drive, &parsed.components)
+                ),
             ));
         }
         let normalized_path = build_drive_path(
@@ -1468,12 +1622,16 @@ impl GameEnvironment {
 
         for (index, component) in parsed.components.iter().enumerate() {
             let prefix_components = parsed.components[..=index].to_vec();
-            let existing_child = find_existing_child_case_insensitive(&current_host, component)?.ok_or_else(|| {
-                AppError::new(
-                    ReasonCode::RcFsNotFound,
-                    format!("{} was not found", build_drive_path(&drive, &prefix_components)),
-                )
-            })?;
+            let existing_child = find_existing_child_case_insensitive(&current_host, component)?
+                .ok_or_else(|| {
+                    AppError::new(
+                        ReasonCode::RcFsNotFound,
+                        format!(
+                            "{} was not found",
+                            build_drive_path(&drive, &prefix_components)
+                        ),
+                    )
+                })?;
             current_host.push(&existing_child);
             walked_components.push(existing_child.clone());
             let normalized_prefix = build_drive_path(
@@ -1483,7 +1641,8 @@ impl GameEnvironment {
                     .map(|item| item.to_lowercase())
                     .collect::<Vec<_>>(),
             );
-            if let Some(reparse_point) = self.config.fs_state.reparse_points.get(&normalized_prefix) {
+            if let Some(reparse_point) = self.config.fs_state.reparse_points.get(&normalized_prefix)
+            {
                 let redirected_path = build_reparse_redirect(
                     &drive,
                     &walked_components[..walked_components.len() - 1],
@@ -1493,11 +1652,16 @@ impl GameEnvironment {
                 let redirected = self
                     .resolve_existing_path(&redirected_path, long_paths_override, depth + 1)
                     .map_err(|error| {
-                        if matches!(error.code, ReasonCode::RcFsPathInvalid | ReasonCode::RcFsNotFound)
-                        {
+                        if matches!(
+                            error.code,
+                            ReasonCode::RcFsPathInvalid | ReasonCode::RcFsNotFound
+                        ) {
                             AppError::new(
                                 ReasonCode::RcFsSandboxEscape,
-                                format!("reparse target {} escaped the GE sandbox", redirected_path),
+                                format!(
+                                    "reparse target {} escaped the GE sandbox",
+                                    redirected_path
+                                ),
                             )
                             .with_hint(error.message)
                         } else {
@@ -1692,7 +1856,10 @@ impl GameEnvironment {
                 || (watcher.recursive
                     && normalized_key.starts_with(&format!("{}\\", watcher.key_norm)))
             {
-                let mut sequence = watcher.sequence.lock().expect("registry watcher sequence poisoned");
+                let mut sequence = watcher
+                    .sequence
+                    .lock()
+                    .expect("registry watcher sequence poisoned");
                 *sequence += 1;
                 watcher.condvar.notify_all();
             }
@@ -1943,7 +2110,10 @@ fn parse_windows_path_impl(
     if !verbatim && !long_paths_enabled && normalized_path.len() > 260 {
         return Err(AppError::new(
             ReasonCode::RcFsPathTooLong,
-            format!("{} exceeds the 260-character Win32 path limit", normalized_path),
+            format!(
+                "{} exceeds the 260-character Win32 path limit",
+                normalized_path
+            ),
         ));
     }
 
@@ -2078,7 +2248,11 @@ fn normalize_drive_letter(drive: &str) -> AppResult<String> {
 }
 
 fn is_reserved_dos_name(component: &str) -> bool {
-    let base = component.split('.').next().unwrap_or(component).to_ascii_uppercase();
+    let base = component
+        .split('.')
+        .next()
+        .unwrap_or(component)
+        .to_ascii_uppercase();
     matches!(
         base.as_str(),
         "CON"
@@ -2106,7 +2280,10 @@ fn is_reserved_dos_name(component: &str) -> bool {
     )
 }
 
-fn find_existing_child_case_insensitive(parent: &Path, requested: &str) -> AppResult<Option<String>> {
+fn find_existing_child_case_insensitive(
+    parent: &Path,
+    requested: &str,
+) -> AppResult<Option<String>> {
     if !parent.exists() {
         return Ok(None);
     }
@@ -2162,7 +2339,11 @@ fn build_reparse_redirect(
     if remaining_components.is_empty() {
         base_path
     } else {
-        format!("{}\\{}", base_path.trim_end_matches('\\'), remaining_components.join("\\"))
+        format!(
+            "{}\\{}",
+            base_path.trim_end_matches('\\'),
+            remaining_components.join("\\")
+        )
     }
 }
 
@@ -2196,7 +2377,11 @@ fn join_registry_key(base: &str, suffix: &str) -> String {
     } else if base.is_empty() {
         normalize_registry_key(suffix)
     } else {
-        format!("{}\\{}", normalize_registry_key(base), normalize_registry_key(suffix))
+        format!(
+            "{}\\{}",
+            normalize_registry_key(base),
+            normalize_registry_key(suffix)
+        )
     }
 }
 
@@ -2227,12 +2412,9 @@ fn enumerate_subkeys(db: &RegistryDb, key: &str) -> Vec<String> {
 
 fn validate_registry_value_type(value_type: &str) -> AppResult<()> {
     match value_type {
-        "REG_SZ"
-        | "REG_EXPAND_SZ"
-        | "REG_MULTI_SZ"
-        | "REG_DWORD"
-        | "REG_QWORD"
-        | "REG_BINARY" => Ok(()),
+        "REG_SZ" | "REG_EXPAND_SZ" | "REG_MULTI_SZ" | "REG_DWORD" | "REG_QWORD" | "REG_BINARY" => {
+            Ok(())
+        }
         other => Err(AppError::new(
             ReasonCode::RcCliInvalid,
             format!("unsupported registry value type {other}"),
@@ -2264,12 +2446,14 @@ fn read_version_sidecar(program: &Path) -> AppResult<Option<VersionSidecar>> {
 
 fn override_matches(rule: &OverrideMatchRule, identity: &ExecutableIdentity) -> bool {
     match rule {
-        OverrideMatchRule::ExeSha256 { sha256 } => sha256.eq_ignore_ascii_case(&identity.sha256),
+        OverrideMatchRule::ExeSha256 { sha256 } => sha256.eq_ignore_ascii_case(&identity.sha256), // case-insensitive comparison
         OverrideMatchRule::ProductVersion {
             product_name,
             file_version,
-        } => identity.product_name.as_ref() == Some(product_name)
-            && identity.file_version.as_ref() == Some(file_version),
+        } => {
+            identity.product_name.as_ref() == Some(product_name)
+                && identity.file_version.as_ref() == Some(file_version)
+        }
         OverrideMatchRule::InstallPathWildcard { pattern } => wildcard_match(
             &pattern.to_lowercase(),
             &identity.normalized_install_path.to_lowercase(),
@@ -2294,7 +2478,8 @@ fn wildcard_match(pattern: &str, value: &str) -> bool {
                 '*' => dp[pattern_index - 1][value_index] || dp[pattern_index][value_index - 1],
                 '?' => dp[pattern_index - 1][value_index - 1],
                 current => {
-                    current == value_chars[value_index - 1] && dp[pattern_index - 1][value_index - 1]
+                    current == value_chars[value_index - 1]
+                        && dp[pattern_index - 1][value_index - 1]
                 }
             };
         }
@@ -2307,7 +2492,11 @@ fn registry_watchers() -> &'static Mutex<Vec<Weak<RegistryWatcherInner>>> {
     REGISTRY_WATCHERS.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-fn share_conflict(existing: &SharedOpenFileState, desired_access: FileAccess, share_mode: ShareMode) -> bool {
+fn share_conflict(
+    existing: &SharedOpenFileState,
+    desired_access: FileAccess,
+    share_mode: ShareMode,
+) -> bool {
     (desired_access.read && !existing.share_mode.read)
         || (desired_access.write && !existing.share_mode.write)
         || (desired_access.delete && !existing.share_mode.delete)
@@ -2316,7 +2505,12 @@ fn share_conflict(existing: &SharedOpenFileState, desired_access: FileAccess, sh
         || (existing.desired_access.delete && !share_mode.delete)
 }
 
-fn ranges_overlap(left_offset: u64, left_length: u64, right_offset: u64, right_length: u64) -> bool {
+fn ranges_overlap(
+    left_offset: u64,
+    left_length: u64,
+    right_offset: u64,
+    right_length: u64,
+) -> bool {
     let left_end = left_offset.saturating_add(left_length);
     let right_end = right_offset.saturating_add(right_length);
     left_offset < right_end && right_offset < left_end
@@ -2373,9 +2567,9 @@ fn write_reparse_db(path: &Path, reparse_points: &BTreeMap<String, ReparsePoint>
 }
 
 fn persist_shared_file_runtime(path: &Path, runtime: &mut SharedFileRuntimeState) -> AppResult<()> {
-    runtime
-        .open_handles
-        .sort_by(|left, right| (left.owner_pid, left.handle_id).cmp(&(right.owner_pid, right.handle_id)));
+    runtime.open_handles.sort_by(|left, right| {
+        (left.owner_pid, left.handle_id).cmp(&(right.owner_pid, right.handle_id))
+    });
     runtime.locks.sort_by(|left, right| {
         (left.owner_pid, left.handle_id, left.offset, left.length).cmp(&(
             right.owner_pid,
@@ -2389,7 +2583,9 @@ fn persist_shared_file_runtime(path: &Path, runtime: &mut SharedFileRuntimeState
 }
 
 fn cleanup_stale_runtime(runtime: &mut SharedFileRuntimeState) {
-    runtime.open_handles.retain(|state| process_alive(state.owner_pid));
+    runtime
+        .open_handles
+        .retain(|state| process_alive(state.owner_pid));
     runtime.locks.retain(|lock| {
         runtime
             .open_handles
@@ -2422,13 +2618,16 @@ fn simple_windows_casefold_char(character: char) -> char {
 
 fn process_alive(pid: u32) -> bool {
     if pid == std::process::id() {
-        return true;
+        return true; // correct: our own PID is always alive
     }
     let result = unsafe { libc::kill(pid as i32, 0) };
     if result == 0 {
         true
     } else {
-        matches!(std::io::Error::last_os_error().raw_os_error(), Some(libc::EPERM))
+        matches!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EPERM)
+        )
     }
 }
 
@@ -2510,8 +2709,12 @@ mod tests {
         .expect("write cargo manifest");
         fs::write(legacy_ge.join("ge.json"), "{}\n").expect("write ge.json");
 
-        let found = find_named_ge_in_workspace(&workspace_root, "casa1-live-tetris", &[workspace_root.join("ges")])
-            .expect("find ge");
+        let found = find_named_ge_in_workspace(
+            &workspace_root,
+            "casa1-live-tetris",
+            &[workspace_root.join("ges")],
+        )
+        .expect("find ge");
 
         assert_eq!(found, Some(legacy_ge));
     }
@@ -2532,8 +2735,12 @@ mod tests {
         fs::write(first.join("ge.json"), "{}\n").expect("write first ge.json");
         fs::write(second.join("ge.json"), "{}\n").expect("write second ge.json");
 
-        let error = find_named_ge_in_workspace(&workspace_root, "casa1-live-tetris", &[workspace_root.join("ges")])
-            .expect_err("ambiguous legacy ge lookup should fail");
+        let error = find_named_ge_in_workspace(
+            &workspace_root,
+            "casa1-live-tetris",
+            &[workspace_root.join("ges")],
+        )
+        .expect_err("ambiguous legacy ge lookup should fail");
 
         assert_eq!(error.code, ReasonCode::RcCliInvalid);
     }

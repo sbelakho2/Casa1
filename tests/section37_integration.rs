@@ -13,21 +13,17 @@
 
 mod support;
 
-use casa1::audio::{
-    AudioSamples, AudioSubsystem, SampleFormat, SourceBuffer, WaveFormat,
-};
-use casa1::cpu::{
-    execute_ir, CpuState, GuestArch, IrInstruction, MemoryImage, Register, XmmValue,
-};
+use casa1::audio::{AudioSamples, AudioSubsystem, SampleFormat, SourceBuffer, WaveFormat};
+use casa1::cpu::{CpuState, GuestArch, IrInstruction, MemoryImage, Register, XmmValue, execute_ir};
 use casa1::network::{
+    AddressFamily, Certificate, Cookie, HttpProtocolFlags, NetworkStack, QuicConfig, SockAddr,
     aes_128_cbc_decrypt, aes_128_cbc_encrypt, aes_256_gcm_decrypt, aes_256_gcm_encrypt,
     ecdsa_p256_verify, hmac_sha256, rsa_pkcs1v15_sign, rsa_pkcs1v15_verify, secure_random,
-    sha1_hash, sha256_hash, AddressFamily, Certificate, Cookie, HttpProtocolFlags, NetworkStack,
-    QuicConfig, SockAddr,
+    sha1_hash, sha256_hash,
 };
 use casa1::pe::{
-    apply_relocations, build_activation_context, map_image, parse, plan_lifecycle, resolve_imports,
-    select_image_base, ApiSetResolver, ExportSymbol, ExportTarget, ImportSymbol,
+    ApiSetResolver, ExportSymbol, ExportTarget, ImportSymbol, apply_relocations,
+    build_activation_context, map_image, parse, plan_lifecycle, resolve_imports, select_image_base,
 };
 use std::collections::BTreeMap;
 
@@ -53,7 +49,10 @@ fn e7_pe_full_lifecycle_parse_to_lifecycle_plan() {
 
     // Step 3: Map the image into memory
     let mut mapped = map_image(&bytes, &parsed, image_hash, true).expect("map image");
-    assert!(!mapped.memory.is_empty(), "mapped memory should be non-empty");
+    assert!(
+        !mapped.memory.is_empty(),
+        "mapped memory should be non-empty"
+    );
     // Verify entry point data is mapped
     let entry_rva = parsed.address_of_entry_point;
     let entry_offset = entry_rva as usize;
@@ -100,24 +99,28 @@ fn e7_pe_full_lifecycle_parse_to_lifecycle_plan() {
     );
     export_tables.insert(
         "ntdll.dll".to_string(),
-        vec![
-            ExportSymbol {
-                ordinal: 1,
-                name: Some("RtlNtStatusToDosError".to_string()),
-                target: ExportTarget::Rva(0x2000),
-            },
-        ],
+        vec![ExportSymbol {
+            ordinal: 1,
+            name: Some("RtlNtStatusToDosError".to_string()),
+            target: ExportTarget::Rva(0x2000),
+        }],
     );
-    let resolved = resolve_imports(&parsed, &export_tables, &resolver)
-        .expect("resolve imports");
-    assert!(!resolved.is_empty(), "should have resolved at least one import");
+    let resolved = resolve_imports(&parsed, &export_tables, &resolver).expect("resolve imports");
+    assert!(
+        !resolved.is_empty(),
+        "should have resolved at least one import"
+    );
     // Check that CreateFileW was resolved via api-ms-win-core-file-l1-1-0
-    let has_create_file = resolved.iter().any(|ri| {
-        matches!(&ri.symbol, ImportSymbol::ByName { name, .. } if name == "CreateFileW")
-    });
+    let has_create_file = resolved
+        .iter()
+        .any(|ri| matches!(&ri.symbol, ImportSymbol::ByName { name, .. } if name == "CreateFileW"));
     assert!(has_create_file, "should resolve CreateFileW");
     // All resolved modules should be kernel32.dll
-    assert!(resolved.iter().all(|ri| ri.resolved_module == "kernel32.dll"));
+    assert!(
+        resolved
+            .iter()
+            .all(|ri| ri.resolved_module == "kernel32.dll")
+    );
 
     // Step 6: Plan lifecycle — needs dependency map + TLS callbacks
     let mut dependencies: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -125,13 +128,16 @@ fn e7_pe_full_lifecycle_parse_to_lifecycle_plan() {
     dependencies.insert("kernel32.dll".to_string(), vec![]);
     let tls_callbacks: BTreeMap<String, Vec<u64>> = BTreeMap::new();
 
-    let plan = plan_lifecycle("test.exe", &dependencies, &tls_callbacks)
-        .expect("plan lifecycle");
-    assert!(!plan.load_order.is_empty(), "load order should have entries");
+    let plan = plan_lifecycle("test.exe", &dependencies, &tls_callbacks).expect("plan lifecycle");
+    assert!(
+        !plan.load_order.is_empty(),
+        "load order should have entries"
+    );
     // Should have DllMainProcessAttach for each module
-    let has_process_attach = plan.process_attach.iter().any(|ev| {
-        matches!(ev.stage, casa1::pe::LifecycleStage::DllMainProcessAttach)
-    });
+    let has_process_attach = plan
+        .process_attach
+        .iter()
+        .any(|ev| matches!(ev.stage, casa1::pe::LifecycleStage::DllMainProcessAttach));
     assert!(has_process_attach, "should have DllMainProcessAttach stage");
 }
 
@@ -172,16 +178,13 @@ fn e7_pe32_full_lifecycle_parse_to_lifecycle_plan() {
     );
     export_tables.insert(
         "ntdll.dll".to_string(),
-        vec![
-            ExportSymbol {
-                ordinal: 1,
-                name: Some("RtlNtStatusToDosError".to_string()),
-                target: ExportTarget::Rva(0x2000),
-            },
-        ],
+        vec![ExportSymbol {
+            ordinal: 1,
+            name: Some("RtlNtStatusToDosError".to_string()),
+            target: ExportTarget::Rva(0x2000),
+        }],
     );
-    let resolved = resolve_imports(&parsed, &export_tables, &resolver)
-        .expect("resolve imports");
+    let resolved = resolve_imports(&parsed, &export_tables, &resolver).expect("resolve imports");
     assert!(!resolved.is_empty());
 
     let mut dependencies: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -189,8 +192,7 @@ fn e7_pe32_full_lifecycle_parse_to_lifecycle_plan() {
     dependencies.insert("kernel32.dll".to_string(), vec![]);
     let tls_callbacks: BTreeMap<String, Vec<u64>> = BTreeMap::new();
 
-    let plan = plan_lifecycle("test.exe", &dependencies, &tls_callbacks)
-        .expect("plan lifecycle");
+    let plan = plan_lifecycle("test.exe", &dependencies, &tls_callbacks).expect("plan lifecycle");
     assert!(!plan.load_order.is_empty());
 }
 
@@ -205,8 +207,8 @@ fn e7_api_set_resolver_integration_with_pe_imports() {
     let _image_hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     // ApiSetResolver with explicit mapping
-    let resolver = ApiSetResolver::new()
-        .with_mapping("api-ms-win-core-file-l1-1-0", "kernel32.dll");
+    let resolver =
+        ApiSetResolver::new().with_mapping("api-ms-win-core-file-l1-1-0", "kernel32.dll");
 
     let mut export_tables: BTreeMap<String, Vec<ExportSymbol>> = BTreeMap::new();
     export_tables.insert(
@@ -236,19 +238,21 @@ fn e7_api_set_resolver_integration_with_pe_imports() {
     );
     export_tables.insert(
         "ntdll.dll".to_string(),
-        vec![
-            ExportSymbol {
-                ordinal: 1,
-                name: Some("RtlNtStatusToDosError".to_string()),
-                target: ExportTarget::Rva(0x2000),
-            },
-        ],
+        vec![ExportSymbol {
+            ordinal: 1,
+            name: Some("RtlNtStatusToDosError".to_string()),
+            target: ExportTarget::Rva(0x2000),
+        }],
     );
 
-    let resolved = resolve_imports(&parsed, &export_tables, &resolver)
-        .expect("resolve");
-    let kernel32_import = resolved.iter().find(|ri| ri.resolved_module == "kernel32.dll");
-    assert!(kernel32_import.is_some(), "imports should resolve to kernel32.dll");
+    let resolved = resolve_imports(&parsed, &export_tables, &resolver).expect("resolve");
+    let kernel32_import = resolved
+        .iter()
+        .find(|ri| ri.resolved_module == "kernel32.dll");
+    assert!(
+        kernel32_import.is_some(),
+        "imports should resolve to kernel32.dll"
+    );
 }
 
 #[test]
@@ -284,19 +288,20 @@ fn e7_api_set_resolver_without_explicit_mapping_still_resolves() {
     );
     export_tables.insert(
         "ntdll.dll".to_string(),
-        vec![
-            ExportSymbol {
-                ordinal: 1,
-                name: Some("RtlNtStatusToDosError".to_string()),
-                target: ExportTarget::Rva(0x2000),
-            },
-        ],
+        vec![ExportSymbol {
+            ordinal: 1,
+            name: Some("RtlNtStatusToDosError".to_string()),
+            target: ExportTarget::Rva(0x2000),
+        }],
     );
 
-    let resolved = resolve_imports(&parsed, &export_tables, &resolver)
-        .expect("resolve");
+    let resolved = resolve_imports(&parsed, &export_tables, &resolver).expect("resolve");
     // api-ms-win-core-file-l1-1-0 → kernel32.dll
-    assert!(resolved.iter().any(|ri| ri.resolved_module.contains("kernel32")));
+    assert!(
+        resolved
+            .iter()
+            .any(|ri| ri.resolved_module.contains("kernel32"))
+    );
 }
 
 #[test]
@@ -308,11 +313,16 @@ fn e7_build_activation_context_from_pe_manifest() {
         let plan = build_activation_context(manifest);
         // VC runtime detection from manifest — check vc_runtime_bindings
         let _has_vc_dlls = plan.vc_runtime_bindings.iter().any(|b| {
-            b.dlls.iter().any(|dll| dll.contains("msvcp") || dll.contains("vcruntime"))
+            b.dlls
+                .iter()
+                .any(|dll| dll.contains("msvcp") || dll.contains("vcruntime"))
         });
         // The sample PE has a VC141 manifest, so VC runtime should be detected
         // It's okay if not (depending on manifest contents), just verify no panic
-        assert!(plan.vc_runtime_bindings.len() <= 10, "activation context should be bounded");
+        assert!(
+            plan.vc_runtime_bindings.len() <= 10,
+            "activation context should be bounded"
+        );
     }
 }
 
@@ -457,7 +467,11 @@ fn e7_network_certificate_validation_pipeline() {
         },
     ];
     let result = network.validate_server_certificate("service.e7.test", &chain, false);
-    assert!(result.is_ok(), "valid cert chain should pass: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "valid cert chain should pass: {:?}",
+        result.err()
+    );
 
     // Expired leaf should fail
     network.set_current_day(3000);
@@ -487,12 +501,20 @@ fn e7_network_certificate_validation_pipeline() {
             supported_ciphers: vec![],
         },
     ];
-    let revoked_result = network.validate_server_certificate("service.e7.test", &revoked_chain, true);
-    assert!(revoked_result.is_err(), "revoked cert should fail with check");
+    let revoked_result =
+        network.validate_server_certificate("service.e7.test", &revoked_chain, true);
+    assert!(
+        revoked_result.is_err(),
+        "revoked cert should fail with check"
+    );
 
     // Without revocation check, revoked passes
-    let no_check_result = network.validate_server_certificate("service.e7.test", &revoked_chain, false);
-    assert!(no_check_result.is_ok(), "revoked cert should pass without check");
+    let no_check_result =
+        network.validate_server_certificate("service.e7.test", &revoked_chain, false);
+    assert!(
+        no_check_result.is_ok(),
+        "revoked cert should pass without check"
+    );
 }
 
 // ============================================================================
@@ -543,25 +565,31 @@ fn e7_audio_mastering_submix_source_chain() {
     // Submit audio data to source A (mono PCM16)
     let pcm16_data: Vec<i16> = (0..480).map(|i| (i as i16 % 256) - 128).collect();
     audio
-        .submit_source_buffer(source_a, SourceBuffer {
-            tag: "source_a_pcm16".to_string(),
-            samples: AudioSamples::Pcm16(pcm16_data),
-            loop_begin: None,
-            loop_length: None,
-            loop_count: None, // play once
-        })
+        .submit_source_buffer(
+            source_a,
+            SourceBuffer {
+                tag: "source_a_pcm16".to_string(),
+                samples: AudioSamples::Pcm16(pcm16_data),
+                loop_begin: None,
+                loop_length: None,
+                loop_count: None, // play once
+            },
+        )
         .expect("submit A");
 
     // Submit audio data to source B (stereo float32)
     let float_data: Vec<f32> = (0..960).map(|i| ((i % 100) as f32 / 100.0) - 0.5).collect();
     audio
-        .submit_source_buffer(source_b, SourceBuffer {
-            tag: "source_b_float".to_string(),
-            samples: AudioSamples::Float32(float_data),
-            loop_begin: None,
-            loop_length: None,
-            loop_count: None,
-        })
+        .submit_source_buffer(
+            source_b,
+            SourceBuffer {
+                tag: "source_b_float".to_string(),
+                samples: AudioSamples::Float32(float_data),
+                loop_begin: None,
+                loop_length: None,
+                loop_count: None,
+            },
+        )
         .expect("submit B");
 
     // Start both voices
@@ -603,13 +631,16 @@ fn e7_audio_format_conversion_in_pipeline() {
     // 44.1kHz PCM16 data (will be resampled to 48kHz and converted to float)
     let samples_44k: Vec<i16> = (0..882).map(|i| ((i * 100) % 32767) as i16).collect();
     audio
-        .submit_source_buffer(source, SourceBuffer {
-            tag: "resample_test".to_string(),
-            samples: AudioSamples::Pcm16(samples_44k),
-            loop_begin: None,
-            loop_length: None,
-            loop_count: None,
-        })
+        .submit_source_buffer(
+            source,
+            SourceBuffer {
+                tag: "resample_test".to_string(),
+                samples: AudioSamples::Pcm16(samples_44k),
+                loop_begin: None,
+                loop_length: None,
+                loop_count: None,
+            },
+        )
         .expect("submit");
     audio.start_voice(source).expect("start");
     // Destroy after submission — AudioSubsystem has no run_one_iteration
@@ -631,7 +662,10 @@ fn e7_crypto_sha_hmac_round_trip() {
 
     let sha256 = sha256_hash(data);
     assert_eq!(sha256.len(), 32, "SHA-256 is 32 bytes");
-    assert_ne!(sha1, sha256, "different hash functions produce different output");
+    assert_ne!(
+        sha1, sha256,
+        "different hash functions produce different output"
+    );
 
     // Deterministic: same input → same output
     assert_eq!(sha1, sha1_hash(data));
@@ -654,10 +688,14 @@ fn e7_crypto_hmac_sha256_produces_consistent_output() {
 
 #[test]
 fn e7_crypto_aes_128_cbc_encrypt_decrypt_round_trip() {
-    let key = [0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6,
-               0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf, 0x4f, 0x3c];
-    let iv = [0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
-              0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f];
+    let key = [
+        0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6, 0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf, 0x4f,
+        0x3c,
+    ];
+    let iv = [
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+        0x0f,
+    ];
     let plaintext = b"Hello Casa1 AES-CBC test!!"; // 24 bytes, block-aligned (multiple of 16)
 
     // Pad to 32 bytes to ensure block alignment
@@ -672,22 +710,23 @@ fn e7_crypto_aes_128_cbc_encrypt_decrypt_round_trip() {
     assert_eq!(ciphertext.len() % 16, 0, "CBC output is block-aligned");
 
     let decrypted = aes_128_cbc_decrypt(&key, &iv, &ciphertext).expect("decrypt");
-    assert_eq!(decrypted, padded, "decrypted matches original padded plaintext");
+    assert_eq!(
+        decrypted, padded,
+        "decrypted matches original padded plaintext"
+    );
 }
 
 #[test]
 fn e7_crypto_aes_256_gcm_encrypt_decrypt_round_trip() {
     let key = [0xfe_u8; 32]; // 32 bytes for AES-256
-    let iv = [0x01_u8; 12];  // 12 bytes typical for GCM
+    let iv = [0x01_u8; 12]; // 12 bytes typical for GCM
     let plaintext = b"AES-256-GCM integration test with authentication tag";
     let aad = b"additional authenticated data";
 
-    let (ciphertext, tag) = aes_256_gcm_encrypt(&key, &iv, plaintext, aad)
-        .expect("encrypt");
+    let (ciphertext, tag) = aes_256_gcm_encrypt(&key, &iv, plaintext, aad).expect("encrypt");
     assert_ne!(ciphertext, plaintext, "ciphertext differs from plaintext");
 
-    let decrypted = aes_256_gcm_decrypt(&key, &iv, &ciphertext, aad, &tag)
-        .expect("decrypt");
+    let decrypted = aes_256_gcm_decrypt(&key, &iv, &ciphertext, aad, &tag).expect("decrypt");
     assert_eq!(decrypted, plaintext, "decrypted matches original");
 }
 
@@ -707,7 +746,10 @@ fn e7_crypto_rsa_sign_verify() {
     // Tampered message should fail verification
     let tampered = b"Tampered message!!!";
     let bad_result = rsa_pkcs1v15_verify(RSA_PUBLIC_PEM, tampered, &signature);
-    assert!(bad_result.is_err(), "tampered message should fail verification");
+    assert!(
+        bad_result.is_err(),
+        "tampered message should fail verification"
+    );
 }
 
 #[test]
@@ -717,12 +759,16 @@ fn e7_crypto_ecdsa_p256_verify() {
     let message = b"ECDSA P-256 verification test";
     let valid_signature_der = hex::decode(
         "3044022066c6e5c8d7c8f6a8e8c9d8e7f6a5b4c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f8a7\
-         0220109a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b7c"
-    ).expect("hex decode");
+         0220109a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b7c",
+    )
+    .expect("hex decode");
     let result = ecdsa_p256_verify(ECDSA_PUBLIC_PEM, message, &valid_signature_der);
     // The test just ensures the function runs without panic and returns a result
     // Actual verification depends on the key/signature matching
-    assert!(result.is_ok() || result.is_err(), "ecdsa verify should return a result");
+    assert!(
+        result.is_ok() || result.is_err(),
+        "ecdsa verify should return a result"
+    );
 }
 
 #[test]
@@ -731,7 +777,10 @@ fn e7_crypto_secure_random_produces_unique_output() {
     let b = secure_random(32);
     assert_eq!(a.len(), 32);
     assert_eq!(b.len(), 32);
-    assert_ne!(a, b, "secure random should produce different output each call");
+    assert_ne!(
+        a, b,
+        "secure random should produce different output each call"
+    );
 }
 
 // ============================================================================
@@ -821,7 +870,10 @@ fn e7_pe_mapped_image_readable_by_cpu() {
     let pointer = cpu_memory
         .read_u64(reloc_target_addr)
         .expect("read relocation target");
-    assert!(pointer != 0, "relocation target should be non-zero after applying relocations");
+    assert!(
+        pointer != 0,
+        "relocation target should be non-zero after applying relocations"
+    );
 }
 
 // ============================================================================
@@ -889,12 +941,14 @@ fn e7_error_propagation_across_modules() {
     // Network socket error (no WSA startup)
     let mut network = NetworkStack::new();
     let sock_result = network.socket(AddressFamily::Ipv4);
-    assert!(sock_result.is_err());
+    assert!(sock_result.is_err(), "expected Err, got {sock_result:?}");
     assert_eq!(network.wsa_get_last_error(), 10093); // WSANOTINITIALISED
 
     // After startup, socket works
     network.wsa_startup();
-    let sock = network.socket(AddressFamily::Ipv4).expect("socket after startup");
+    let sock = network
+        .socket(AddressFamily::Ipv4)
+        .expect("socket after startup");
     assert!(sock >= 0x1000);
 
     // Crypto error (tampered AES-GCM tag)
@@ -938,10 +992,6 @@ fn e7_quic_protocol_flags_with_config() {
         force_disabled: true,
         ..Default::default()
     };
-    let (protocol2, _) = casa1::network::negotiate_http_protocol(
-        &flags,
-        &config_disabled,
-        &[],
-    );
+    let (protocol2, _) = casa1::network::negotiate_http_protocol(&flags, &config_disabled, &[]);
     assert_eq!(protocol2, casa1::network::HttpProtocol::Http11);
 }

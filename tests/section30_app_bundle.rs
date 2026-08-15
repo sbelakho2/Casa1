@@ -3,8 +3,6 @@
 //! Tests for Phase 1.1–1.2: icon resource parsing from PE files, ICO/ICNS
 //! conversion, and round-trip verification.
 
-use std::path::Path;
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Helper: construct a minimal PE file with embedded RT_GROUP_ICON + RT_ICON
 // resources for controlled unit-testing.
@@ -175,7 +173,7 @@ fn build_test_pe_with_icon() -> Vec<u8> {
     //     BMP info header + XOR mask + AND mask
 
     let section_rva = 0x1000u32;
-    let root_rva = section_rva;
+    let _root_rva = section_rva;
 
     // Helper to write u16 and u32 at an RVA offset (relative to section start)
     let data_start = 0x1000usize;
@@ -256,20 +254,20 @@ fn build_test_pe_with_icon() -> Vec<u8> {
     w32(&mut pe, 0x10CC, 0);
 
     // ── GRPICONDIR data at RVA 0x1100 ───────────────────────────────────────
-    w16(&mut pe, 0x1100, 0);     // Reserved
-    w16(&mut pe, 0x1102, 1);     // Type = ICO
-    w16(&mut pe, 0x1104, 1);     // Count = 1
+    w16(&mut pe, 0x1100, 0); // Reserved
+    w16(&mut pe, 0x1102, 1); // Type = ICO
+    w16(&mut pe, 0x1104, 1); // Count = 1
 
     // GRPICONDIRENTRY: width=32, height=32, colors=0, reserved=0,
     //                  planes=1, bpp=32, size_in_bytes, icon_id=2
-    pe[0x1106] = 32;             // width
-    pe[0x1107] = 32;             // height
-    pe[0x1108] = 0;              // colors
-    pe[0x1109] = 0;              // reserved
-    w16(&mut pe, 0x110A, 1);    // planes
-    w16(&mut pe, 0x110C, 32);   // bpp
+    pe[0x1106] = 32; // width
+    pe[0x1107] = 32; // height
+    pe[0x1108] = 0; // colors
+    pe[0x1109] = 0; // reserved
+    w16(&mut pe, 0x110A, 1); // planes
+    w16(&mut pe, 0x110C, 32); // bpp
     w32(&mut pe, 0x110E, 0x0A28); // size
-    w16(&mut pe, 0x1112, 2);    // icon_id (links to RT_ICON name ID)
+    w16(&mut pe, 0x1112, 2); // icon_id (links to RT_ICON name ID)
 
     // ── RT_ICON bitmap data at RVA 0x1200 ────────────────────────────────────
     // Build a minimal 32×32 32bpp DIB:
@@ -309,13 +307,13 @@ fn build_test_pe_with_icon() -> Vec<u8> {
             if pixel_off + 4 <= pe.len() {
                 // Create a red/blue checkerboard pattern
                 if (x + y) % 2 == 0 {
-                    pe[pixel_off] = 0;      // B
-                    pe[pixel_off + 1] = 0;  // G
+                    pe[pixel_off] = 0; // B
+                    pe[pixel_off + 1] = 0; // G
                     pe[pixel_off + 2] = 255; // R
                 } else {
-                    pe[pixel_off] = 255;     // B
-                    pe[pixel_off + 1] = 0;   // G
-                    pe[pixel_off + 2] = 0;   // R
+                    pe[pixel_off] = 255; // B
+                    pe[pixel_off + 1] = 0; // G
+                    pe[pixel_off + 2] = 0; // R
                 }
                 pe[pixel_off + 3] = 255; // A
             }
@@ -373,8 +371,8 @@ fn test_extract_all_icons_from_pe() {
 #[test]
 fn test_extract_icon_from_pe() {
     let pe_data = build_test_pe_with_icon();
-    let icons = casa1::pe::extract_icon_from_pe(&pe_data)
-        .expect("extract_icon_from_pe should succeed");
+    let icons =
+        casa1::pe::extract_icon_from_pe(&pe_data).expect("extract_icon_from_pe should succeed");
 
     assert!(!icons.is_empty(), "should extract at least one icon");
     // The extracted icon should be 32×32 (our test data)
@@ -402,10 +400,10 @@ fn test_icon_dir_entry_structure() {
     // Build a 16-byte entry: w=32, h=32, colors=0, reserved=0,
     // planes=1, bpp=32, size=4096, offset=22
     let raw: [u8; 16] = [
-        32,        // width
-        32,        // height
-        0,         // colors
-        0,         // reserved
+        32, // width
+        32, // height
+        0,  // colors
+        0,  // reserved
         0x01, 0x00, // planes = 1 (le)
         0x20, 0x00, // bpp = 32 (le)
         0x00, 0x10, 0x00, 0x00, // size = 4096 (le)
@@ -424,8 +422,7 @@ fn test_icon_dir_entry_structure() {
 #[test]
 fn test_icon_image_dimensions() {
     let pe_data = build_test_pe_with_icon();
-    let icons = casa1::pe::extract_all_icons_from_pe(&pe_data)
-        .expect("extract icons");
+    let icons = casa1::pe::extract_all_icons_from_pe(&pe_data).expect("extract icons");
 
     for icon in &icons {
         assert!(icon.width > 0, "width must be positive");
@@ -450,7 +447,7 @@ fn test_png_conversion_of_dib() {
     let width = 4u32;
     let height = 8u32;
     let bpp = 32u16;
-    let row_size = ((width * bpp as u32 + 31) / 32) * 4;
+    let row_size = (width * bpp as u32).div_ceil(32) * 4;
     let mut dib = vec![0u8; (row_size * height) as usize];
 
     // Write a bottom-up DIB: 4 rows of red pixels at top, blue at bottom
@@ -459,18 +456,19 @@ fn test_png_conversion_of_dib() {
         for x in 0..4 {
             let off = (src_y * row_size + x * 4) as usize;
             if off + 4 <= dib.len() {
-                dib[off] = 0;      // B
-                dib[off + 1] = 0;  // G
+                dib[off] = 0; // B
+                dib[off + 1] = 0; // G
                 dib[off + 2] = 255; // R
                 dib[off + 3] = 255; // A
             }
         }
     }
 
-    let png = casa1::icon::dib_to_png(&dib, width, height, bpp)
-        .expect("dib_to_png should succeed");
-    assert!(&png[0..8] == &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A],
-            "should produce valid PNG signature");
+    let png = casa1::icon::dib_to_png(&dib, width, height, bpp).expect("dib_to_png should succeed");
+    assert!(
+        png[0..8] == [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A],
+        "should produce valid PNG signature"
+    );
 }
 
 #[test]
@@ -497,7 +495,10 @@ fn test_icns_structure_generation() {
     ];
 
     let icns = icons_to_icns(&icons).expect("icons_to_icns should succeed");
-    assert!(validate_icns(&icns).unwrap_or(false), "ICNS should be valid");
+    assert!(
+        validate_icns(&icns).unwrap_or(false),
+        "ICNS should be valid"
+    );
 
     // Verify the icns magic
     assert_eq!(&icns[0..4], b"icns", "should start with icns magic");
@@ -510,21 +511,24 @@ fn test_icns_structure_generation() {
 #[test]
 fn test_round_trip_pe_to_icns() {
     let pe_data = build_test_pe_with_icon();
-    let icons = casa1::pe::extract_all_icons_from_pe(&pe_data)
-        .expect("extract icons from PE");
+    let icons = casa1::pe::extract_all_icons_from_pe(&pe_data).expect("extract icons from PE");
 
     assert!(!icons.is_empty(), "should have extracted icons");
 
     // Convert to ICNS
-    let icns = casa1::icon::icons_to_icns(&icons)
-        .expect("icons_to_icns should succeed");
+    let icns = casa1::icon::icons_to_icns(&icons).expect("icons_to_icns should succeed");
 
     // Validate ICNS structure
-    assert!(casa1::icon::validate_icns(&icns).unwrap_or(false),
-            "ICNS output should be structurally valid");
+    assert!(
+        casa1::icon::validate_icns(&icns).unwrap_or(false),
+        "ICNS output should be structurally valid"
+    );
 
     // Verify at least one ICNS entry is present (beyond the header)
-    assert!(icns.len() > 8, "ICNS should contain entries beyond the header");
+    assert!(
+        icns.len() > 8,
+        "ICNS should contain entries beyond the header"
+    );
 }
 
 #[test]
@@ -563,10 +567,10 @@ fn build_test_ico() -> Vec<u8> {
     let width = 16u32;
     let height = 16u32;
     let bpp = 32u16;
-    let row_size = ((width * bpp as u32 + 31) / 32) * 4;
+    let row_size = (width * bpp as u32).div_ceil(32) * 4;
     let pixel_data_size = (row_size * height) as usize;
     // AND mask size: row padded to 32 bits
-    let and_row_size = ((width + 31) / 32) * 4;
+    let and_row_size = width.div_ceil(32) * 4;
     let and_mask_size = (and_row_size * height) as usize;
     let dib_size = 40 + pixel_data_size + and_mask_size; // header + XOR + AND
 
@@ -576,12 +580,12 @@ fn build_test_ico() -> Vec<u8> {
     ico.extend_from_slice(&1u16.to_le_bytes()); // type = ICO
     ico.extend_from_slice(&1u16.to_le_bytes()); // count = 1
     // Directory entry
-    ico.push(width as u8);  // width
+    ico.push(width as u8); // width
     ico.push(height as u8); // height
-    ico.push(0);  // color count
-    ico.push(0);  // reserved
-    ico.extend_from_slice(&1u16.to_le_bytes());  // planes
-    ico.extend_from_slice(&bpp.to_le_bytes());   // bpp
+    ico.push(0); // color count
+    ico.push(0); // reserved
+    ico.extend_from_slice(&1u16.to_le_bytes()); // planes
+    ico.extend_from_slice(&bpp.to_le_bytes()); // bpp
     ico.extend_from_slice(&(dib_size as u32).to_le_bytes()); // size
     ico.extend_from_slice(&22u32.to_le_bytes()); // offset (after header + 1 entry)
 
@@ -591,7 +595,7 @@ fn build_test_ico() -> Vec<u8> {
     ico.extend_from_slice(&width.to_le_bytes()); // biWidth
     ico.extend_from_slice(&(height * 2).to_le_bytes()); // biHeight (XOR+AND)
     ico.extend_from_slice(&1u16.to_le_bytes()); // biPlanes
-    ico.extend_from_slice(&bpp.to_le_bytes());  // biBitCount
+    ico.extend_from_slice(&bpp.to_le_bytes()); // biBitCount
     ico.extend_from_slice(&0u32.to_le_bytes()); // biCompression = BI_RGB
     ico.extend_from_slice(&0u32.to_le_bytes()); // biSizeImage
     ico.extend_from_slice(&0u32.to_le_bytes()); // biXPelsPerMeter
@@ -606,11 +610,11 @@ fn build_test_ico() -> Vec<u8> {
         while ico.len() < 22 + 40 + row_start + (width as usize * 4) {
             ico.push(0);
         }
-        for x in 0..width as usize {
-            ico.push(0);     // B
-            ico.push(0);     // G
-            ico.push(255);   // R
-            ico.push(255);   // A
+        for _x in 0..width as usize {
+            ico.push(0); // B
+            ico.push(0); // G
+            ico.push(255); // R
+            ico.push(255); // A
         }
         // Row padding
         while ico.len() < 22 + 40 + row_start + row_size as usize {

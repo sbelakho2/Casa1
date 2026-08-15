@@ -1,0 +1,175 @@
+name: Release Checklist
+
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  check-compile:
+    name: Check Compilation
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo check
+        run: cargo check --all-targets
+
+  check-format:
+    name: Check Formatting
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+  check-clippy:
+    name: Check Clippy
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+  check-tests:
+    name: Check Tests
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test
+        run: cargo test --lib --bins
+
+  check-no-insecure-tls:
+    name: Check No Insecure TLS in Defaults
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify dev-insecure-tls is not in default features
+        run: |
+          if grep -A5 '^\[features\]' Cargo.toml | grep '^default' | grep -q 'dev-insecure-tls'; then
+            echo "::error::dev-insecure-tls must not be included in default features for release"
+            exit 1
+          fi
+          echo "✅ dev-insecure-tls is not in default features"
+
+  release-gate:
+    name: Release Gate
+    runs-on: macos-latest
+    needs:
+      - check-compile
+      - check-format
+      - check-clippy
+      - check-tests
+      - check-no-insecure-tls
+      - check-dependency-audit
+      - check-licenses
+      - check-reproducible
+      - release-smoke-tests
+      - check-checklist-gate
+    if: always()
+    steps:
+      - name: Evaluate checklist results
+        run: |
+          RESULTS=""
+          FAIL=0
+
+          for job in check-compile check-format check-clippy check-tests \
+                     check-no-insecure-tls check-dependency-audit \
+                     check-licenses check-reproducible release-smoke-tests \
+                     check-checklist-gate; do
+            STATUS=""
+            case "$job" in
+              check-compile)           STATUS="${{ needs.check-compile.result }}" ;;
+              check-format)            STATUS="${{ needs.check-format.result }}" ;;
+              check-clippy)            STATUS="${{ needs.check-clippy.result }}" ;;
+              check-tests)             STATUS="${{ needs.check-tests.result }}" ;;
+              check-no-insecure-tls)   STATUS="${{ needs.check-no-insecure-tls.result }}" ;;
+              check-dependency-audit)  STATUS="${{ needs.check-dependency-audit.result }}" ;;
+              check-licenses)          STATUS="${{ needs.check-licenses.result }}" ;;
+              check-reproducible)      STATUS="${{ needs.check-reproducible.result }}" ;;
+              release-smoke-tests)     STATUS="${{ needs.release-smoke-tests.result }}" ;;
+              check-checklist-gate)    STATUS="${{ needs.check-checklist-gate.result }}" ;;
+            esac
+
+            if [ "$STATUS" = "success" ]; then
+              RESULTS="$RESULTS\n✅ $job: PASSED"
+            else
+              RESULTS="$RESULTS\n❌ $job: FAILED ($STATUS)"
+              FAIL=1
+            fi
+          done
+
+          echo -e "$RESULTS"
+          echo ""
+
+          if [ "$FAIL" -eq 1 ]; then
+            echo "::error::Release checklist FAILED — one or more checks did not pass"
+            exit 1
+          else
+            echo "🎉 All release checklist checks PASSED"
+          fi
+
+  check-dependency-audit:
+    name: Dependency Audit
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-audit
+        run: cargo install cargo-audit
+      - name: Run dependency audit
+        run: ./ci/check_audit.sh
+
+  check-licenses:
+    name: License Check
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-license
+        run: cargo install cargo-license
+      - name: Run license check
+        run: ./ci/check_licenses.sh
+
+  check-reproducible:
+    name: Reproducible Build
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run reproducibility check
+        run: ./ci/check_reproducible.sh --skip-clean
+
+  release-smoke-tests:
+    name: Release Smoke Tests
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run release smoke tests
+        run: ./ci/check_release_smoke.sh
+
+  check-checklist-gate:
+    name: Release Gate Checklist
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify all checklist items are checked
+        run: ./ci/check_release_gate.sh

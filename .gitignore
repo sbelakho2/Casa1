@@ -22,7 +22,7 @@ coverage/
 tmp/
 
 # Runtime GE outputs under checked-in fixtures.
-# Keep ge.json and drive_c/ trackable; ignore generated runtime churn.
+# Keep ge.json, fs/, and trackable binaries; ignore generated runtime churn.
 ges/*/cache/
 ges/*/logs/
 ges/*/tmp/
@@ -30,3 +30,57 @@ ges/*/traces/
 ges/*/reports/
 ges/*/diagnostics/
 ges/*/registry/*.db
+
+# Game-level GE runtime artifacts (under games/*/ges/)
+games/*/ges/*/cache/
+games/*/ges/*/logs/
+games/*/ges/*/tmp/
+games/*/ges/*/traces/
+games/*/ges/*/reports/
+games/*/ges/*/diagnostics/
+games/*/ges/*/registry/*.db
+
+# Generated temp and crash files anywhere in drive_c/ (NSIS installer artifacts)
+ges/*/drive_c/**/*.tmp
+ges/*/drive_c/**/.crash
+ges/*/drive_c/**/Temp/
+games/*/ges/*/drive_c/**/*.tmp
+games/*/ges/*/drive_c/**/.crash
+games/*/ges/*/drive_c/**/Temp/
+
+# Steam runtime generated logs (bootstrap, %s pattern)
+ges/*/drive_c/**/logs/*.txt
+games/*/ges/*/drive_c/**/logs/*.txt
+
+# Steam package install markers (regenerated on each install)
+ges/*/drive_c/**/package/steam_client_win32.installed
+games/*/ges/*/drive_c/**/package/steam_client_win32.installed
+
+# User-specific Steam config
+ges/*/drive_c/**/config/config.vdf
+games/*/ges/*/drive_c/**/config/config.vdf
+
+# User data dirs (guest profiles)
+ges/*/drive_c/users/
+games/*/ges/*/drive_c/users/
+
+# Generated logs and run artifacts
+*.log
+runner_stderr.log
+runner_stdout.log
+steam_*.log
+steam_*.txt
+sample_output.txt
+steam_dis.txt
+cargo_errors.txt
+
+# Generated PDFs (keep test fixtures in tests/fixtures/)
+print_*.pdf
+
+# Python cache
+__pycache__/
+*.pyc
+
+# VS Code settings (keep .vscode/ for shared config)
+.vscode/settings.json
+.vscode/tasks.json

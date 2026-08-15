@@ -7,18 +7,20 @@
 //! Smoke tests execute Steam.exe with a small instruction budget to verify that
 //! basic imports work end-to-end through the full PE runtime.
 //!
-//! All tests are marked `#[ignore]` because they require the Steam GE at
-//! `ges/steam-live-run-x86/` with `Steam.exe`.
+//! These tests require the Steam GE at `ges/steam-live-run-x86/` with
+//! `Steam.exe`.  If the GE is not present, tests will be skipped at runtime
+//! with a clear message.
 //!
 //! Usage:
 //! ```bash
-//! cargo test t24_ -- --ignored --nocapture
+//! cargo test t24_ -- --nocapture
 //! ```
 
 use casa1::ge::GameEnvironment;
 use casa1::pe::{self, ApiSetResolver, ImportSymbol};
-use casa1::pe_runtime::{self, is_import_supported, PeExecutionOptions, PeExecutionResult};
+use casa1::pe_runtime::{self, PeExecutionOptions, PeExecutionResult, is_import_supported};
 use std::collections::BTreeMap;
+use std::path::Path;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Helper infrastructure
@@ -29,11 +31,36 @@ fn steam_ge_root() -> &'static str {
     "steam-live-run-x86"
 }
 
+/// Require that the Steam GE exists; skip the test with a clear message if not.
+///
+/// This replaces the former `#[ignore = "requires ges/steam-live-run-x86 with Steam.exe"]`
+/// attribute with a runtime check, so the test only skips when the environment
+/// is genuinely absent rather than unconditionally.
+fn require_steam_ge() {
+    let ge_path = Path::new("ges").join(steam_ge_root());
+    let steam_exe = ge_path.join("drive_c").join("Steam.exe");
+    if !steam_exe.is_file() {
+        panic!(
+            "SKIP: Steam GE not found at `{}`.\n\
+             The section24 integration tests require the Steam Game Environment\n\
+             at `ges/{}/` with `Steam.exe`.  Without this file the per-DLL\n\
+             import-coverage and smoke tests cannot run.\n\
+             \n\
+             To obtain the environment, run the Casa1 Steam setup workflow:\n\
+               cargo run --bin casa1 -- steam setup\n\
+             \n\
+             Once the GE is in place, re-run with:\n\
+               cargo test t24_ -- --nocapture",
+            steam_exe.display(),
+            steam_ge_root(),
+        );
+    }
+}
+
 /// Open the Steam GE, parse [`Steam.exe`](ges/steam-live-run-x86/drive_c/Steam.exe),
 /// and create an [`ApiSetResolver`].
 fn open_steam() -> (GameEnvironment, pe::ParsedPe, ApiSetResolver) {
-    let ge = GameEnvironment::open(steam_ge_root())
-        .expect("failed to open steam-live-run-x86 GE");
+    let ge = GameEnvironment::open(steam_ge_root()).expect("failed to open steam-live-run-x86 GE");
     let path = ge.root.join("drive_c").join("Steam.exe");
     assert!(path.is_file(), "Steam.exe not found at {path:?}");
     let image = pe::parse_from_file(&path).expect("failed to parse Steam.exe");
@@ -72,8 +99,7 @@ fn imports_for_dll(
 /// with the crash-workaround flag enabled (so the runtime is instrumented) and
 /// runs in deterministic mode (DTM).
 fn run_steam_with_budget(budget: u64) -> PeExecutionResult {
-    let ge =
-        GameEnvironment::open(steam_ge_root()).expect("failed to open steam-live-run-x86 GE");
+    let ge = GameEnvironment::open(steam_ge_root()).expect("failed to open steam-live-run-x86 GE");
     let path = ge.root.join("drive_c").join("Steam.exe");
     assert!(path.is_file(), "Steam.exe not found at {path:?}");
 
@@ -87,7 +113,7 @@ fn run_steam_with_budget(budget: u64) -> PeExecutionResult {
         &ge,
         &ge.root.join("drive_c"), // cwd
         &env,
-        true,  // dtm
+        true, // dtm
         "section24_smoke",
         PeExecutionOptions::default(),
     )
@@ -115,7 +141,10 @@ fn verify_dll_coverage(dll_name: &str) {
         imports.len(),
         unsupported.join("\n  "),
     );
-    eprintln!("  ✓ All {count}/{count} imports have HostThunk dispatch", count = imports.len());
+    eprintln!(
+        "  ✓ All {count}/{count} imports have HostThunk dispatch",
+        count = imports.len()
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -123,14 +152,14 @@ fn verify_dll_coverage(dll_name: &str) {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[test]
-#[ignore = "requires ges/steam-live-run-x86 with Steam.exe"]
 fn t24_01_kernel32_coverage() {
+    require_steam_ge();
     verify_dll_coverage("kernel32.dll");
 }
 
 #[test]
-#[ignore = "requires ges/steam-live-run-x86 with Steam.exe"]
 fn t24_01_kernel32_smoke() {
+    require_steam_ge();
     let result = run_steam_with_budget(200_000);
     eprintln!(
         "[kernel32 smoke] exit_code={}  trace_events={}  guest_exceptions={}",
@@ -151,14 +180,14 @@ fn t24_01_kernel32_smoke() {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[test]
-#[ignore = "requires ges/steam-live-run-x86 with Steam.exe"]
 fn t24_02_user32_coverage() {
+    require_steam_ge();
     verify_dll_coverage("user32.dll");
 }
 
 #[test]
-#[ignore = "requires ges/steam-live-run-x86 with Steam.exe"]
 fn t24_02_user32_smoke() {
+    require_steam_ge();
     let result = run_steam_with_budget(500_000);
     eprintln!(
         "[user32 smoke] exit_code={}  trace_events={}  guest_exceptions={}",
@@ -178,14 +207,14 @@ fn t24_02_user32_smoke() {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[test]
-#[ignore = "requires ges/steam-live-run-x86 with Steam.exe"]
 fn t24_03_ws2_32_coverage() {
+    require_steam_ge();
     verify_dll_coverage("ws2_32.dll");
 }
 
 #[test]
-#[ignore = "requires ges/steam-live-run-x86 with Steam.exe"]
 fn t24_03_ws2_32_smoke() {
+    require_steam_ge();
     let result = run_steam_with_budget(1_000_000);
     eprintln!(
         "[ws2_32 smoke] exit_code={}  trace_events={}  guest_exceptions={}",
@@ -204,14 +233,14 @@ fn t24_03_ws2_32_smoke() {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[test]
-#[ignore = "requires ges/steam-live-run-x86 with Steam.exe"]
 fn t24_04_gdi32_coverage() {
+    require_steam_ge();
     verify_dll_coverage("gdi32.dll");
 }
 
 #[test]
-#[ignore = "requires ges/steam-live-run-x86 with Steam.exe"]
 fn t24_04_gdi32_smoke() {
+    require_steam_ge();
     let result = run_steam_with_budget(1_000_000);
     eprintln!(
         "[gdi32 smoke] exit_code={}  trace_events={}  guest_exceptions={}",
@@ -230,14 +259,14 @@ fn t24_04_gdi32_smoke() {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[test]
-#[ignore = "requires ges/steam-live-run-x86 with Steam.exe"]
 fn t24_05_advapi32_coverage() {
+    require_steam_ge();
     verify_dll_coverage("advapi32.dll");
 }
 
 #[test]
-#[ignore = "requires ges/steam-live-run-x86 with Steam.exe"]
 fn t24_05_advapi32_smoke() {
+    require_steam_ge();
     let result = run_steam_with_budget(500_000);
     eprintln!(
         "[advapi32 smoke] exit_code={}  trace_events={}  guest_exceptions={}",
@@ -255,14 +284,14 @@ fn t24_05_advapi32_smoke() {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[test]
-#[ignore = "requires ges/steam-live-run-x86 with Steam.exe"]
 fn t24_06_crypt32_coverage() {
+    require_steam_ge();
     verify_dll_coverage("crypt32.dll");
 }
 
 #[test]
-#[ignore = "requires ges/steam-live-run-x86 with Steam.exe"]
 fn t24_06_crypt32_smoke() {
+    require_steam_ge();
     let result = run_steam_with_budget(1_000_000);
     eprintln!(
         "[crypt32 smoke] exit_code={}  trace_events={}  guest_exceptions={}",
@@ -281,14 +310,14 @@ fn t24_06_crypt32_smoke() {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[test]
-#[ignore = "requires ges/steam-live-run-x86 with Steam.exe"]
 fn t24_07_shell32_coverage() {
+    require_steam_ge();
     verify_dll_coverage("shell32.dll");
 }
 
 #[test]
-#[ignore = "requires ges/steam-live-run-x86 with Steam.exe"]
 fn t24_07_shell32_smoke() {
+    require_steam_ge();
     let result = run_steam_with_budget(1_000_000);
     eprintln!(
         "[shell32 smoke] exit_code={}  trace_events={}  guest_exceptions={}",
@@ -306,14 +335,14 @@ fn t24_07_shell32_smoke() {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[test]
-#[ignore = "requires ges/steam-live-run-x86 with Steam.exe"]
 fn t24_08_psapi_coverage() {
+    require_steam_ge();
     verify_dll_coverage("psapi.dll");
 }
 
 #[test]
-#[ignore = "requires ges/steam-live-run-x86 with Steam.exe"]
 fn t24_08_psapi_smoke() {
+    require_steam_ge();
     let result = run_steam_with_budget(1_000_000);
     eprintln!(
         "[psapi smoke] exit_code={}  trace_events={}  guest_exceptions={}",
@@ -332,14 +361,14 @@ fn t24_08_psapi_smoke() {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[test]
-#[ignore = "requires ges/steam-live-run-x86 with Steam.exe"]
 fn t24_09_bcrypt_coverage() {
+    require_steam_ge();
     verify_dll_coverage("bcrypt.dll");
 }
 
 #[test]
-#[ignore = "requires ges/steam-live-run-x86 with Steam.exe"]
 fn t24_09_bcrypt_smoke() {
+    require_steam_ge();
     let result = run_steam_with_budget(1_000_000);
     eprintln!(
         "[bcrypt smoke] exit_code={}  trace_events={}  guest_exceptions={}",
@@ -357,14 +386,14 @@ fn t24_09_bcrypt_smoke() {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[test]
-#[ignore = "requires ges/steam-live-run-x86 with Steam.exe"]
 fn t24_10_comctl32_coverage() {
+    require_steam_ge();
     verify_dll_coverage("comctl32.dll");
 }
 
 #[test]
-#[ignore = "requires ges/steam-live-run-x86 with Steam.exe"]
 fn t24_10_comctl32_smoke() {
+    require_steam_ge();
     let result = run_steam_with_budget(1_000_000);
     eprintln!(
         "[comctl32 smoke] exit_code={}  trace_events={}  guest_exceptions={}",
@@ -382,14 +411,14 @@ fn t24_10_comctl32_smoke() {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[test]
-#[ignore = "requires ges/steam-live-run-x86 with Steam.exe"]
 fn t24_11_ole32_coverage() {
+    require_steam_ge();
     verify_dll_coverage("ole32.dll");
 }
 
 #[test]
-#[ignore = "requires ges/steam-live-run-x86 with Steam.exe"]
 fn t24_11_ole32_smoke() {
+    require_steam_ge();
     let result = run_steam_with_budget(1_000_000);
     eprintln!(
         "[ole32 smoke] exit_code={}  trace_events={}  guest_exceptions={}",
@@ -407,14 +436,14 @@ fn t24_11_ole32_smoke() {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[test]
-#[ignore = "requires ges/steam-live-run-x86 with Steam.exe"]
 fn t24_12_oleaut32_coverage() {
+    require_steam_ge();
     verify_dll_coverage("oleaut32.dll");
 }
 
 #[test]
-#[ignore = "requires ges/steam-live-run-x86 with Steam.exe"]
 fn t24_12_oleaut32_smoke() {
+    require_steam_ge();
     let result = run_steam_with_budget(1_000_000);
     eprintln!(
         "[oleaut32 smoke] exit_code={}  trace_events={}  guest_exceptions={}",
@@ -432,14 +461,14 @@ fn t24_12_oleaut32_smoke() {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[test]
-#[ignore = "requires ges/steam-live-run-x86 with Steam.exe"]
 fn t24_13_version_coverage() {
+    require_steam_ge();
     verify_dll_coverage("version.dll");
 }
 
 #[test]
-#[ignore = "requires ges/steam-live-run-x86 with Steam.exe"]
 fn t24_13_version_smoke() {
+    require_steam_ge();
     let result = run_steam_with_budget(1_000_000);
     eprintln!(
         "[version smoke] exit_code={}  trace_events={}  guest_exceptions={}",
@@ -458,14 +487,14 @@ fn t24_13_version_smoke() {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[test]
-#[ignore = "requires ges/steam-live-run-x86 with Steam.exe"]
 fn t24_14_wsock32_coverage() {
+    require_steam_ge();
     verify_dll_coverage("wsock32.dll");
 }
 
 #[test]
-#[ignore = "requires ges/steam-live-run-x86 with Steam.exe"]
 fn t24_14_wsock32_smoke() {
+    require_steam_ge();
     let result = run_steam_with_budget(1_000_000);
     eprintln!(
         "[wsock32 smoke] exit_code={}  trace_events={}  guest_exceptions={}",
@@ -486,8 +515,8 @@ fn t24_14_wsock32_smoke() {
 // test module, so the per-DLL tests have a cross-reference.
 
 #[test]
-#[ignore = "requires ges/steam-live-run-x86 with Steam.exe"]
 fn t24_15_aggregate_coverage() {
+    require_steam_ge();
     let (_, image, resolver) = open_steam();
 
     let mut total_supported = 0_usize;
@@ -502,7 +531,9 @@ fn t24_15_aggregate_coverage() {
                 ImportSymbol::ByOrdinal { ordinal } => format!("ordinal#{ordinal}"),
             };
             let supported = is_import_supported(&resolved, &imp.symbol);
-            let entry = per_dll.entry(resolved.clone()).or_insert_with(|| (Vec::new(), Vec::new()));
+            let entry = per_dll
+                .entry(resolved.clone())
+                .or_insert_with(|| (Vec::new(), Vec::new()));
             if supported {
                 total_supported += 1;
                 entry.0.push(name);
@@ -545,18 +576,20 @@ fn t24_15_aggregate_coverage() {
 // sensible values.
 
 #[test]
-#[ignore = "requires ges/steam-live-run-x86 with Steam.exe"]
 fn t24_16_kernel32_key_functions() {
+    require_steam_ge();
     // Execute with tracing enabled for steam_api_init category.
-    let ge =
-        GameEnvironment::open(steam_ge_root()).expect("failed to open steam-live-run-x86 GE");
+    let ge = GameEnvironment::open(steam_ge_root()).expect("failed to open steam-live-run-x86 GE");
     let path = ge.root.join("drive_c").join("Steam.exe");
     assert!(path.is_file(), "Steam.exe not found at {path:?}");
 
     let mut env = BTreeMap::new();
     env.insert("CASA1_PE_RUNTIME_BUDGET".to_string(), "500_000".to_string());
     env.insert("CASA1_STEAM_CRASH_WORKAROUND".to_string(), "1".to_string());
-    env.insert("CASA1_TRACE_CATEGORIES".to_string(), "steam_api_init".to_string());
+    env.insert(
+        "CASA1_TRACE_CATEGORIES".to_string(),
+        "steam_api_init".to_string(),
+    );
 
     let result = pe_runtime::execute_with_options(
         &path,

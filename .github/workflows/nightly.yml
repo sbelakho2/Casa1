@@ -1,0 +1,99 @@
+name: Nightly
+
+on:
+  schedule:
+    - cron: "0 2 * * *" # UTC 02:00 daily
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  integration-tests:
+    name: Integration Tests
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run all integration tests
+        run: cargo test --tests
+
+  all-features-test:
+    name: All Features Test
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test with all features
+        run: cargo test --all-features
+
+  no-default-features:
+    name: No Default Features
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check with no default features
+        run: cargo check --no-default-features
+
+  check-metal:
+    name: Check Metal
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check with metal feature
+        run: cargo check --all-targets --features metal
+
+  check-vulkan:
+    name: Check Vulkan
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check with vulkan feature
+        run: cargo check --all-targets --features vulkan
+
+  check-opengl:
+    name: Check OpenGL
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check with opengl feature
+        run: cargo check --all-targets --features opengl
+
+  check-websocket:
+    name: Check WebSocket
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check with websocket feature
+        run: cargo check --all-targets --features websocket
+
+  nightly-sanitizer:
+    name: Nightly Sanitizer
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz
+      - name: Run nightly lib/bins tests
+        run: cargo +nightly test --lib --bins
+      - name: Build fuzz targets with nightly
+        run: cargo +nightly fuzz build --manifest-path fuzz/Cargo.toml
+      - name: Test nightly UBSAN if supported
+        run: ./ci/run_nightly_ubsan_if_supported.sh

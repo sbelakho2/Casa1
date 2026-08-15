@@ -93,7 +93,10 @@ impl BlockChainingCache {
         // First, read the current state
         let (is_chained, current_target) = {
             let block = self.blocks.get(&guest_address).ok_or_else(|| {
-                AppError::new(ReasonCode::RcUnimplInsn, format!("block at {guest_address:#x} not found"))
+                AppError::new(
+                    ReasonCode::RcUnimplInsn,
+                    format!("block at {guest_address:#x} not found"),
+                )
             })?;
             (block.is_chained, block.fallthrough_target)
         };
@@ -105,7 +108,10 @@ impl BlockChainingCache {
 
         // Update the block
         let block = self.blocks.get_mut(&guest_address).ok_or_else(|| {
-            AppError::new(ReasonCode::RcUnimplInsn, format!("block at {guest_address:#x} not found"))
+            AppError::new(
+                ReasonCode::RcUnimplInsn,
+                format!("block at {guest_address:#x} not found"),
+            )
         })?;
         block.execution_count += 1;
         block.fallthrough_target = Some(next_address);
@@ -117,7 +123,11 @@ impl BlockChainingCache {
     ///
     /// Returns true if chaining was successful.
     pub fn try_chain(&mut self, guest_address: u64) -> bool {
-        let target_address = match self.blocks.get(&guest_address).and_then(|b| b.fallthrough_target) {
+        let target_address = match self
+            .blocks
+            .get(&guest_address)
+            .and_then(|b| b.fallthrough_target)
+        {
             Some(addr) => addr,
             None => return false,
         };
@@ -128,7 +138,11 @@ impl BlockChainingCache {
         }
 
         // Check if execution count is high enough (hot path)
-        let execution_count = self.blocks.get(&guest_address).map(|b| b.execution_count).unwrap_or(0);
+        let execution_count = self
+            .blocks
+            .get(&guest_address)
+            .map(|b| b.execution_count)
+            .unwrap_or(0);
         if execution_count < 10 {
             return false;
         }
@@ -206,7 +220,9 @@ impl BlockChainingCache {
             if let Some(from_block) = self.blocks.get(&from_address) {
                 // The patch offset is the distance from the end of the current block
                 // to the start of the target block's host code.
-                let from_end = from_block.host_address.saturating_add(from_block.code_size as u64);
+                let from_end = from_block
+                    .host_address
+                    .saturating_add(from_block.code_size as u64);
                 if from_end <= target_block.host_address {
                     (target_block.host_address - from_end) as usize
                 } else {
@@ -297,15 +313,22 @@ impl LazyJitProfiler {
     }
 
     /// Record a block execution. Returns the recommended compilation tier.
-    pub fn record_execution(&mut self, guest_address: u64, instruction_count: usize) -> CompilationTier {
-        let profile = self.profiles.entry(guest_address).or_insert_with(|| BlockProfile {
-            guest_address,
-            execution_count: 0,
-            tier: CompilationTier::Uncompiled,
-            last_compiled: None,
-            compile_time_us: 0,
-            instruction_count,
-        });
+    pub fn record_execution(
+        &mut self,
+        guest_address: u64,
+        instruction_count: usize,
+    ) -> CompilationTier {
+        let profile = self
+            .profiles
+            .entry(guest_address)
+            .or_insert_with(|| BlockProfile {
+                guest_address,
+                execution_count: 0,
+                tier: CompilationTier::Uncompiled,
+                last_compiled: None,
+                compile_time_us: 0,
+                instruction_count,
+            });
 
         profile.execution_count += 1;
 
@@ -321,8 +344,14 @@ impl LazyJitProfiler {
     }
 
     /// Mark a block as compiled at a given tier.
-    pub fn mark_compiled(&mut self, guest_address: u64, tier: CompilationTier, compile_time_us: u64) {
-        self.total_compile_time_us.fetch_add(compile_time_us, Ordering::Relaxed);
+    pub fn mark_compiled(
+        &mut self,
+        guest_address: u64,
+        tier: CompilationTier,
+        compile_time_us: u64,
+    ) {
+        self.total_compile_time_us
+            .fetch_add(compile_time_us, Ordering::Relaxed);
         self.total_compiled.fetch_add(1, Ordering::Relaxed);
         if let Some(profile) = self.profiles.get_mut(&guest_address) {
             profile.tier = tier;
@@ -338,7 +367,10 @@ impl LazyJitProfiler {
 
     /// Get the compilation tier for a block.
     pub fn get_tier(&self, guest_address: u64) -> CompilationTier {
-        self.profiles.get(&guest_address).map(|p| p.tier).unwrap_or(CompilationTier::Uncompiled)
+        self.profiles
+            .get(&guest_address)
+            .map(|p| p.tier)
+            .unwrap_or(CompilationTier::Uncompiled)
     }
 
     /// Get the total number of profiled blocks.
@@ -430,11 +462,11 @@ impl AddressTranslationCache {
     /// cache is at capacity.
     pub fn insert(&mut self, guest_address: u64, host_address: u64, size: usize, protection: u32) {
         // Evict the LRU entry if at capacity
-        if self.translations.len() >= self.max_entries && !self.translations.contains_key(&guest_address) {
-            if let Some((&lru_key, _)) = self
-                .translations
-                .iter()
-                .min_by_key(|(_, v)| v.access_count)
+        if self.translations.len() >= self.max_entries
+            && !self.translations.contains_key(&guest_address)
+        {
+            if let Some((&lru_key, _)) =
+                self.translations.iter().min_by_key(|(_, v)| v.access_count)
             {
                 self.translations.remove(&lru_key);
             }
@@ -468,11 +500,7 @@ impl AddressTranslationCache {
         let hits = self.total_hits.load(Ordering::Relaxed) as f64;
         let misses = self.total_misses.load(Ordering::Relaxed) as f64;
         let total = hits + misses;
-        if total == 0.0 {
-            0.0
-        } else {
-            hits / total
-        }
+        if total == 0.0 { 0.0 } else { hits / total }
     }
 
     /// Get the number of cached entries.
@@ -487,7 +515,8 @@ impl AddressTranslationCache {
 
     /// Invalidate entries for a specific address range.
     pub fn invalidate_range(&mut self, start: u64, end: u64) {
-        self.translations.retain(|_, t| t.guest_address < start || t.guest_address >= end);
+        self.translations
+            .retain(|_, t| t.guest_address < start || t.guest_address >= end);
     }
 }
 
@@ -542,22 +571,28 @@ impl ParallelShaderCompiler {
     /// Submit a shader compilation job.
     pub fn submit_job(&mut self, shader_hash: String, stage: String, entry_point: String) -> u64 {
         let id = self.next_job_id.fetch_add(1, Ordering::Relaxed);
-        self.jobs.insert(id, ShaderCompileJob {
+        self.jobs.insert(
             id,
-            shader_hash,
-            stage,
-            entry_point,
-            status: ShaderCompileStatus::Pending,
-            submit_time: Instant::now(),
-            complete_time: None,
-        });
+            ShaderCompileJob {
+                id,
+                shader_hash,
+                stage,
+                entry_point,
+                status: ShaderCompileStatus::Pending,
+                submit_time: Instant::now(),
+                complete_time: None,
+            },
+        );
         id
     }
 
     /// Mark a job as compiling.
     pub fn mark_compiling(&mut self, job_id: u64) -> AppResult<()> {
         let job = self.jobs.get_mut(&job_id).ok_or_else(|| {
-            AppError::new(ReasonCode::RcDxilInvalid, format!("shader job {job_id} not found"))
+            AppError::new(
+                ReasonCode::RcDxilInvalid,
+                format!("shader job {job_id} not found"),
+            )
         })?;
         job.status = ShaderCompileStatus::Compiling;
         Ok(())
@@ -566,7 +601,10 @@ impl ParallelShaderCompiler {
     /// Mark a job as completed.
     pub fn mark_completed(&mut self, job_id: u64) -> AppResult<()> {
         let job = self.jobs.get_mut(&job_id).ok_or_else(|| {
-            AppError::new(ReasonCode::RcDxilInvalid, format!("shader job {job_id} not found"))
+            AppError::new(
+                ReasonCode::RcDxilInvalid,
+                format!("shader job {job_id} not found"),
+            )
         })?;
         job.status = ShaderCompileStatus::Completed;
         job.complete_time = Some(Instant::now());
@@ -577,7 +615,10 @@ impl ParallelShaderCompiler {
     /// Mark a job as failed.
     pub fn mark_failed(&mut self, job_id: u64, error: String) -> AppResult<()> {
         let job = self.jobs.get_mut(&job_id).ok_or_else(|| {
-            AppError::new(ReasonCode::RcDxilInvalid, format!("shader job {job_id} not found"))
+            AppError::new(
+                ReasonCode::RcDxilInvalid,
+                format!("shader job {job_id} not found"),
+            )
         })?;
         job.status = ShaderCompileStatus::Failed(error);
         job.complete_time = Some(Instant::now());
@@ -587,12 +628,15 @@ impl ParallelShaderCompiler {
 
     /// Get pending jobs that can be started (up to max_concurrent).
     pub fn pending_jobs(&self) -> Vec<&ShaderCompileJob> {
-        let compiling_count = self.jobs.values()
+        let compiling_count = self
+            .jobs
+            .values()
             .filter(|j| j.status == ShaderCompileStatus::Compiling)
             .count();
         let available = self.max_concurrent.saturating_sub(compiling_count);
 
-        self.jobs.values()
+        self.jobs
+            .values()
             .filter(|j| j.status == ShaderCompileStatus::Pending)
             .take(available)
             .collect()
@@ -805,20 +849,26 @@ impl GpuUploadStreamer {
     pub fn create_streaming_buffer(&mut self, size: usize) -> u64 {
         let id = self.next_buffer_id.fetch_add(1, Ordering::Relaxed);
         let frame = self.current_frame.load(Ordering::Relaxed);
-        self.buffers.insert(id, StreamingBuffer {
+        self.buffers.insert(
             id,
-            size,
-            frame_used: frame,
-            write_offset: 0,
-            total_uploaded: 0,
-        });
+            StreamingBuffer {
+                id,
+                size,
+                frame_used: frame,
+                write_offset: 0,
+                total_uploaded: 0,
+            },
+        );
         id
     }
 
     /// Allocate space from a streaming buffer for the current frame.
     pub fn allocate(&mut self, buffer_id: u64, size: usize) -> AppResult<usize> {
         let buffer = self.buffers.get_mut(&buffer_id).ok_or_else(|| {
-            AppError::new(ReasonCode::RcD3dInvalidState, format!("streaming buffer {buffer_id} not found"))
+            AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!("streaming buffer {buffer_id} not found"),
+            )
         })?;
 
         let frame = self.current_frame.load(Ordering::Relaxed);
@@ -837,7 +887,10 @@ impl GpuUploadStreamer {
             } else {
                 return Err(AppError::new(
                     ReasonCode::RcD3dInvalidState,
-                    format!("streaming allocation {size} exceeds buffer size {}", buffer.size),
+                    format!(
+                        "streaming allocation {size} exceeds buffer size {}",
+                        buffer.size
+                    ),
                 ));
             }
         }
@@ -860,7 +913,8 @@ impl GpuUploadStreamer {
         let offset = buffer.write_offset;
         buffer.write_offset += size;
         buffer.total_uploaded += size as u64;
-        self.total_bytes_uploaded.fetch_add(size as u64, Ordering::Relaxed);
+        self.total_bytes_uploaded
+            .fetch_add(size as u64, Ordering::Relaxed);
 
         Ok(offset)
     }
@@ -962,7 +1016,8 @@ impl FramePacer {
     /// Begin a new frame. Returns the time since last frame start.
     pub fn begin_frame(&mut self) -> Duration {
         let now = Instant::now();
-        let delta = self.last_frame_start
+        let delta = self
+            .last_frame_start
             .map(|last| now.duration_since(last))
             .unwrap_or(Duration::ZERO);
         self.last_frame_start = Some(now);
@@ -1278,7 +1333,10 @@ impl FileCache {
         if data_len > self.max_size_bytes {
             return Err(AppError::new(
                 ReasonCode::RcIo,
-                format!("file cache: data size {data_len} exceeds max cache size {}", self.max_size_bytes),
+                format!(
+                    "file cache: data size {data_len} exceeds max cache size {}",
+                    self.max_size_bytes
+                ),
             ));
         }
 
@@ -1464,11 +1522,19 @@ impl MmappedFile {
     /// loaded on demand (lazy page-in).
     pub fn open(path: &Path) -> AppResult<Self> {
         let file = std::fs::File::open(path).map_err(|e| {
-            AppError::from_io(ReasonCode::RcIo, format!("mmap: failed to open {}", path.display()), &e)
+            AppError::from_io(
+                ReasonCode::RcIo,
+                format!("mmap: failed to open {}", path.display()),
+                &e,
+            )
         })?;
 
         let metadata = file.metadata().map_err(|e| {
-            AppError::from_io(ReasonCode::RcIo, format!("mmap: failed to stat {}", path.display()), &e)
+            AppError::from_io(
+                ReasonCode::RcIo,
+                format!("mmap: failed to stat {}", path.display()),
+                &e,
+            )
         })?;
 
         let size = metadata.len() as usize;
@@ -1514,16 +1580,17 @@ impl MmappedFile {
     /// into the provided buffer.
     pub fn read(&self, offset: usize, buf: &mut [u8]) -> AppResult<()> {
         if !self.mapped || self.ptr.is_null() {
-            return Err(AppError::new(
-                ReasonCode::RcIo,
-                "mmap: file is not mapped",
-            ));
+            return Err(AppError::new(ReasonCode::RcIo, "mmap: file is not mapped"));
         }
 
         if offset.saturating_add(buf.len()) > self.size {
             return Err(AppError::new(
                 ReasonCode::RcMemoryAccessViolation,
-                format!("mmap: read at offset {offset} + {} exceeds file size {}", buf.len(), self.size),
+                format!(
+                    "mmap: read at offset {offset} + {} exceeds file size {}",
+                    buf.len(),
+                    self.size
+                ),
             ));
         }
 
@@ -1745,7 +1812,11 @@ mod tests {
     #[test]
     fn shader_compiler_submit_and_complete() {
         let mut compiler = ParallelShaderCompiler::new(4);
-        let id = compiler.submit_job("abc123".to_string(), "vertex".to_string(), "main".to_string());
+        let id = compiler.submit_job(
+            "abc123".to_string(),
+            "vertex".to_string(),
+            "main".to_string(),
+        );
         assert_eq!(compiler.job_count(), 1);
 
         compiler.mark_compiling(id).unwrap();
@@ -1759,10 +1830,16 @@ mod tests {
     #[test]
     fn shader_compiler_failed_job() {
         let mut compiler = ParallelShaderCompiler::new(4);
-        let id = compiler.submit_job("def456".to_string(), "fragment".to_string(), "main".to_string());
+        let id = compiler.submit_job(
+            "def456".to_string(),
+            "fragment".to_string(),
+            "main".to_string(),
+        );
 
         compiler.mark_compiling(id).unwrap();
-        compiler.mark_failed(id, "syntax error".to_string()).unwrap();
+        compiler
+            .mark_failed(id, "syntax error".to_string())
+            .unwrap();
 
         assert_eq!(compiler.failed_count(), 1);
         let job = compiler.get_job(id).unwrap();
@@ -1834,7 +1911,7 @@ mod tests {
         let stats = batcher.stats();
         assert_eq!(stats.total_draw_calls, 2);
         assert_eq!(stats.vertices_drawn, 500); // 100*1 + 200*2
-        assert_eq!(stats.indices_drawn, 250);  // 50*1 + 100*2
+        assert_eq!(stats.indices_drawn, 250); // 50*1 + 100*2
     }
 
     // --- GPU Upload Streaming Tests ---
@@ -1957,7 +2034,7 @@ mod tests {
         // Hit
         let data = cache.get("test.txt").unwrap();
         assert_eq!(data, &[1, 2, 3, 4]);
-        let (hits, misses, rate) = cache.stats();
+        let (hits, _misses, rate) = cache.stats();
         assert_eq!(hits, 1);
         assert!(rate > 0.0);
     }
@@ -1973,7 +2050,10 @@ mod tests {
         // Insert a third file — should evict the LRU (a.txt)
         cache.insert("c.txt", vec![0u8; 10]).unwrap();
         assert_eq!(cache.entry_count(), 2);
-        assert!(cache.get("a.txt").is_none(), "a.txt should have been evicted");
+        assert!(
+            cache.get("a.txt").is_none(),
+            "a.txt should have been evicted"
+        );
         assert!(cache.get("b.txt").is_some(), "b.txt should still be cached");
         assert!(cache.get("c.txt").is_some(), "c.txt should be cached");
     }
@@ -1993,7 +2073,7 @@ mod tests {
     fn file_cache_too_large() {
         let mut cache = FileCache::new(10);
         let result = cache.insert("big.txt", vec![0u8; 100]);
-        assert!(result.is_err());
+        assert!(result.is_err(), "expected Err, got {result:?}");
     }
 
     #[test]
@@ -2020,20 +2100,28 @@ mod tests {
         let call_count = std::sync::atomic::AtomicUsize::new(0);
 
         // First call — miss, resolver called
-        let result = cache.resolve("C:\\Users\\test.txt", |path| {
-            call_count.fetch_add(1, Ordering::Relaxed);
-            Ok(PathBuf::from(format!("/host{}", path.replace('\\', "/"))))
-        }).unwrap();
+        let result = cache
+            .resolve("C:\\Users\\test.txt", |path| {
+                call_count.fetch_add(1, Ordering::Relaxed);
+                Ok(PathBuf::from(format!("/host{}", path.replace('\\', "/"))))
+            })
+            .unwrap();
         assert_eq!(result, PathBuf::from("/hostC:/Users/test.txt"));
         assert_eq!(call_count.load(Ordering::Relaxed), 1);
 
         // Second call — hit, resolver NOT called
-        let result2 = cache.resolve("C:\\Users\\test.txt", |path| {
-            call_count.fetch_add(1, Ordering::Relaxed);
-            Ok(PathBuf::from(format!("/host{}", path.replace('\\', "/"))))
-        }).unwrap();
+        let result2 = cache
+            .resolve("C:\\Users\\test.txt", |path| {
+                call_count.fetch_add(1, Ordering::Relaxed);
+                Ok(PathBuf::from(format!("/host{}", path.replace('\\', "/"))))
+            })
+            .unwrap();
         assert_eq!(result2, result);
-        assert_eq!(call_count.load(Ordering::Relaxed), 1, "resolver should not be called on cache hit");
+        assert_eq!(
+            call_count.load(Ordering::Relaxed),
+            1,
+            "resolver should not be called on cache hit"
+        );
 
         let (hits, misses, _) = cache.stats();
         assert_eq!(hits, 1);
@@ -2044,9 +2132,15 @@ mod tests {
     fn path_resolution_cache_invalidate_prefix() {
         let mut cache = PathResolutionCache::new();
 
-        cache.resolve("C:\\Windows\\a.txt", |p| Ok(PathBuf::from(p))).unwrap();
-        cache.resolve("C:\\Windows\\b.txt", |p| Ok(PathBuf::from(p))).unwrap();
-        cache.resolve("C:\\Game\\c.txt", |p| Ok(PathBuf::from(p))).unwrap();
+        cache
+            .resolve("C:\\Windows\\a.txt", |p| Ok(PathBuf::from(p)))
+            .unwrap();
+        cache
+            .resolve("C:\\Windows\\b.txt", |p| Ok(PathBuf::from(p)))
+            .unwrap();
+        cache
+            .resolve("C:\\Game\\c.txt", |p| Ok(PathBuf::from(p)))
+            .unwrap();
 
         assert_eq!(cache.entry_count(), 3);
 
@@ -2093,7 +2187,7 @@ mod tests {
         let mut reader = AsyncFileReader::new();
         // Request for non-existent ID should timeout
         let result = reader.wait_for(99999, 10);
-        assert!(result.is_err());
+        assert!(result.is_err(), "expected Err, got {result:?}");
     }
 
     // --- Phase 7: Memory-Mapped File Tests ---
@@ -2129,7 +2223,7 @@ mod tests {
         let mf = MmappedFile::open(&path).unwrap();
         let mut buf = [0u8; 100];
         let result = mf.read(0, &mut buf);
-        assert!(result.is_err());
+        assert!(result.is_err(), "expected Err, got {result:?}");
 
         drop(mf);
         std::fs::remove_file(&path).ok();
@@ -2153,6 +2247,6 @@ mod tests {
     fn mmapped_file_nonexistent() {
         let path = std::path::PathBuf::from("/tmp/casa1_nonexistent_mmap_test_12345");
         let result = MmappedFile::open(&path);
-        assert!(result.is_err());
+        assert!(result.is_err(), "expected Err for nonexistent mmap file");
     }
 }

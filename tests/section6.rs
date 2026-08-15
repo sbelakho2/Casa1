@@ -1,21 +1,19 @@
 use casa1::d3d12::{
     D3D12BuildAccelerationStructureDesc, D3D12BuildRaytracingInputs, D3D12DispatchRaysDesc,
-    D3D12RaytracingGeometryDesc, D3D12RaytracingPipelineState, D3d12Runtime,
+    D3D12RaytracingGeometryDesc, D3d12Runtime,
 };
 use casa1::gfx::{
     D3D12DescriptorRangeType, D3D12ResourceBarrierDesc, D3D12ResourceBarrierFlags,
     D3D12ResourceBarrierType, D3D12ShaderVisibility, D3D12StaticSamplerDesc, DescriptorRange,
-    DxgiFormat, FeatureQuery, GraphicsBackend, HeapType, PipelineStateDesc, ResourceDesc,
-    ResourceState, ResourceUsageHint, RootParameter, RootSignatureDesc, SwapchainDesc,
-    ViewDescriptor,
+    DxgiFormat, FeatureQuery, PipelineStateDesc, ResourceState, RootParameter, RootSignatureDesc,
+    SwapchainDesc, ViewDescriptor,
 };
 use casa1::reason::ReasonCode;
 use casa1::user32::{
-    AxisCalibration, BatteryInfo, ControllerKind, ControllerSpec, ControllerTransport,
-    DeviceAxis, DirectInputDataFormat, DpiAwarenessContext, ForceFeedbackEffect,
-    FullscreenMode, KeyboardDevice, KeyboardLayoutId, KeyModifiers, KeyRepeatConfig,
-    KeyTranslation, Message, MessageKind, MouseButton, MouseButtonEvent, MouseDevice,
-    Rect, RumbleState, User32Subsystem, VirtualKey,
+    AxisCalibration, BatteryInfo, ControllerKind, ControllerSpec, ControllerTransport, DeviceAxis,
+    DirectInputDataFormat, DpiAwarenessContext, ForceFeedbackEffect, FullscreenMode, KeyModifiers,
+    KeyRepeatConfig, KeyTranslation, KeyboardDevice, KeyboardLayoutId, Message, MessageKind,
+    MouseButton, MouseButtonEvent, MouseDevice, Rect, RumbleState, User32Subsystem, VirtualKey,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -23,9 +21,13 @@ fn pump_messages(user32: &mut User32Subsystem) -> Vec<Message> {
     let mut observed = Vec::new();
     while let Some(message) = user32.get_message_w() {
         if message.kind == MessageKind::KeyDown {
-            user32.translate_message(&message).expect("translate keydown");
+            user32
+                .translate_message(&message)
+                .expect("translate keydown");
         }
-        user32.dispatch_message_w(&message).expect("dispatch message");
+        user32
+            .dispatch_message_w(&message)
+            .expect("dispatch message");
         observed.push(message);
     }
     observed
@@ -39,9 +41,10 @@ fn text_messages(messages: &[Message]) -> Vec<(MessageKind, char)> {
     messages
         .iter()
         .filter_map(|message| match message.kind {
-            MessageKind::Char | MessageKind::DeadChar => {
-                Some((message.kind, char::from_u32(message.wparam as u32).expect("valid char")))
-            }
+            MessageKind::Char | MessageKind::DeadChar => Some((
+                message.kind,
+                char::from_u32(message.wparam as u32).expect("valid char"),
+            )),
             _ => None,
         })
         .collect()
@@ -124,11 +127,22 @@ fn t6_1_message_ordering_oracle_matches_expected_focus_resize_and_input_sequence
     });
     user32.resize_window(hwnd, 1600, 900).expect("queue resize");
     user32
-        .inject_keyboard_input(hwnd, &keyboard_id, 0x10, KeyModifiers { shift: false, altgr: false })
+        .inject_keyboard_input(
+            hwnd,
+            &keyboard_id,
+            0x10,
+            KeyModifiers {
+                shift: false,
+                altgr: false,
+            },
+        )
         .expect("queue keyboard input");
 
     assert_eq!(
-        user32.peek_message_w(false).expect("peek first message").kind,
+        user32
+            .peek_message_w(false)
+            .expect("peek first message")
+            .kind,
         MessageKind::NcCreate
     );
     let observed = pump_messages(&mut user32);
@@ -148,7 +162,10 @@ fn t6_1_message_ordering_oracle_matches_expected_focus_resize_and_input_sequence
             MessageKind::Char,
         ]
     );
-    assert_eq!(message_kinds(user32.message_log()), message_kinds(&observed));
+    assert_eq!(
+        message_kinds(user32.message_log()),
+        message_kinds(&observed)
+    );
     assert_eq!(user32.get_foreground_window(), Some(hwnd));
     assert_eq!(user32.get_focus(), Some(hwnd));
     let window = user32.window_state(hwnd).expect("window state");
@@ -157,13 +174,18 @@ fn t6_1_message_ordering_oracle_matches_expected_focus_resize_and_input_sequence
     assert!(window.fullscreen.requested_exclusive);
     assert!(window.fullscreen.shim_applied);
     assert_eq!(window.monitor_id, 1);
-    assert_eq!(window.dpi, 144);
-    assert_eq!(user32.get_dpi_for_monitor(1).expect("monitor dpi"), (144, 144));
+    // DPI is host-dependent (96 on standard displays, 144 on 150% scaling, etc.)
+    let (dpi_x, dpi_y) = user32.get_dpi_for_monitor(1, 0);
+    assert_eq!(window.dpi, dpi_x, "window DPI should match monitor DPI");
+    assert_eq!(dpi_x, dpi_y, "monitor should report square pixels");
 
     user32
         .send_message_w(hwnd, MessageKind::Input, 7, 0)
         .expect("send message");
-    assert_eq!(user32.message_log().last().expect("message log tail").kind, MessageKind::Input);
+    assert_eq!(
+        user32.message_log().last().expect("message log tail").kind,
+        MessageKind::Input
+    );
 }
 
 #[test]
@@ -172,7 +194,10 @@ fn t6_2_layout_oracle_scancode_dead_keys_raw_ids_and_repeat_timing_match_referen
         (
             KeyboardLayoutId::Us,
             0x10,
-            KeyModifiers { shift: false, altgr: false },
+            KeyModifiers {
+                shift: false,
+                altgr: false,
+            },
             KeyTranslation {
                 vk: VirtualKey::Q,
                 output_char: Some('q'),
@@ -182,7 +207,10 @@ fn t6_2_layout_oracle_scancode_dead_keys_raw_ids_and_repeat_timing_match_referen
         (
             KeyboardLayoutId::Uk,
             0x28,
-            KeyModifiers { shift: false, altgr: false },
+            KeyModifiers {
+                shift: false,
+                altgr: false,
+            },
             KeyTranslation {
                 vk: VirtualKey::Oem7,
                 output_char: Some('\''),
@@ -192,7 +220,10 @@ fn t6_2_layout_oracle_scancode_dead_keys_raw_ids_and_repeat_timing_match_referen
         (
             KeyboardLayoutId::Fr,
             0x12,
-            KeyModifiers { shift: false, altgr: true },
+            KeyModifiers {
+                shift: false,
+                altgr: true,
+            },
             KeyTranslation {
                 vk: VirtualKey::E,
                 output_char: Some('€'),
@@ -202,7 +233,10 @@ fn t6_2_layout_oracle_scancode_dead_keys_raw_ids_and_repeat_timing_match_referen
         (
             KeyboardLayoutId::De,
             0x15,
-            KeyModifiers { shift: false, altgr: false },
+            KeyModifiers {
+                shift: false,
+                altgr: false,
+            },
             KeyTranslation {
                 vk: VirtualKey::Z,
                 output_char: Some('z'),
@@ -212,7 +246,10 @@ fn t6_2_layout_oracle_scancode_dead_keys_raw_ids_and_repeat_timing_match_referen
         (
             KeyboardLayoutId::Arabic,
             0x10,
-            KeyModifiers { shift: false, altgr: false },
+            KeyModifiers {
+                shift: false,
+                altgr: false,
+            },
             KeyTranslation {
                 vk: VirtualKey::Q,
                 output_char: Some('ض'),
@@ -222,7 +259,10 @@ fn t6_2_layout_oracle_scancode_dead_keys_raw_ids_and_repeat_timing_match_referen
         (
             KeyboardLayoutId::Turkish,
             0x12,
-            KeyModifiers { shift: false, altgr: true },
+            KeyModifiers {
+                shift: false,
+                altgr: true,
+            },
             KeyTranslation {
                 vk: VirtualKey::E,
                 output_char: Some('€'),
@@ -233,14 +273,39 @@ fn t6_2_layout_oracle_scancode_dead_keys_raw_ids_and_repeat_timing_match_referen
 
     for (layout, scancode, modifiers, expected) in cases {
         let user32 = User32Subsystem::new(layout);
-        assert_eq!(user32.translate_scancode(scancode, modifiers).expect("translate scancode"), expected);
+        assert_eq!(
+            user32
+                .translate_scancode(scancode, modifiers)
+                .expect("translate scancode"),
+            expected
+        );
     }
 
     let dead_key_cases = vec![
-        (KeyboardLayoutId::Fr, '^', vec![0x1a, 0x12], vec![(MessageKind::DeadChar, '^'), (MessageKind::Char, 'ê')]),
-        (KeyboardLayoutId::Es, '´', vec![0x1a, 0x12], vec![(MessageKind::DeadChar, '´'), (MessageKind::Char, 'é')]),
-        (KeyboardLayoutId::It, '`', vec![0x1a, 0x12], vec![(MessageKind::DeadChar, '`'), (MessageKind::Char, 'è')]),
-        (KeyboardLayoutId::Turkish, '^', vec![0x1a, 0x12], vec![(MessageKind::DeadChar, '^'), (MessageKind::Char, 'ê')]),
+        (
+            KeyboardLayoutId::Fr,
+            '^',
+            vec![0x1a, 0x12],
+            vec![(MessageKind::DeadChar, '^'), (MessageKind::Char, 'ê')],
+        ),
+        (
+            KeyboardLayoutId::Es,
+            '´',
+            vec![0x1a, 0x12],
+            vec![(MessageKind::DeadChar, '´'), (MessageKind::Char, 'é')],
+        ),
+        (
+            KeyboardLayoutId::It,
+            '`',
+            vec![0x1a, 0x12],
+            vec![(MessageKind::DeadChar, '`'), (MessageKind::Char, 'è')],
+        ),
+        (
+            KeyboardLayoutId::Turkish,
+            '^',
+            vec![0x1a, 0x12],
+            vec![(MessageKind::DeadChar, '^'), (MessageKind::Char, 'ê')],
+        ),
     ];
     for (layout, dead_char, scancodes, expected) in dead_key_cases {
         let mut user32 = User32Subsystem::new(layout);
@@ -256,7 +321,15 @@ fn t6_2_layout_oracle_scancode_dead_keys_raw_ids_and_repeat_timing_match_referen
         });
         for scancode in scancodes {
             user32
-                .inject_keyboard_input(hwnd, &keyboard_id, scancode, KeyModifiers { shift: false, altgr: false })
+                .inject_keyboard_input(
+                    hwnd,
+                    &keyboard_id,
+                    scancode,
+                    KeyModifiers {
+                        shift: false,
+                        altgr: false,
+                    },
+                )
                 .expect("inject keyboard sequence");
         }
         let observed = pump_messages(&mut user32);
@@ -296,7 +369,10 @@ fn t6_2_layout_oracle_scancode_dead_keys_raw_ids_and_repeat_timing_match_referen
             hwnd,
             &repeat_id,
             0x10,
-            KeyModifiers { shift: false, altgr: false },
+            KeyModifiers {
+                shift: false,
+                altgr: false,
+            },
             850,
         )
         .expect("synthesize repeats");
@@ -357,29 +433,47 @@ fn t6_3_raw_mouse_delta_clipcursor_and_1000hz_queue_stress_match_reference() {
     );
 
     assert_eq!(packets.len(), 1000);
-    assert_eq!(packets.iter().map(|packet| packet.raw_dx).sum::<i32>(), 1004);
+    assert_eq!(
+        packets.iter().map(|packet| packet.raw_dx).sum::<i32>(),
+        1004
+    );
     assert_eq!(packets.iter().map(|packet| packet.raw_dy).sum::<i32>(), 996);
     assert_eq!(user32.get_cursor_pos(), (100, 97));
 
     let observed = pump_messages(&mut user32);
     assert_eq!(
-        observed.iter().filter(|message| message.kind == MessageKind::RawInput).count(),
+        observed
+            .iter()
+            .filter(|message| message.kind == MessageKind::RawInput)
+            .count(),
         1000
     );
     assert_eq!(
-        observed.iter().filter(|message| message.kind == MessageKind::MouseMove).count(),
+        observed
+            .iter()
+            .filter(|message| message.kind == MessageKind::MouseMove)
+            .count(),
         1000
     );
     assert_eq!(
-        observed.iter().filter(|message| message.kind == MessageKind::MouseWheel).count(),
+        observed
+            .iter()
+            .filter(|message| message.kind == MessageKind::MouseWheel)
+            .count(),
         1
     );
     assert_eq!(
-        observed.iter().filter(|message| message.kind == MessageKind::MouseHWheel).count(),
+        observed
+            .iter()
+            .filter(|message| message.kind == MessageKind::MouseHWheel)
+            .count(),
         1
     );
     assert_eq!(
-        observed.iter().filter(|message| message.kind == MessageKind::XButtonDown).count(),
+        observed
+            .iter()
+            .filter(|message| message.kind == MessageKind::XButtonDown)
+            .count(),
         2
     );
     assert_eq!(user32.get_capture(), Some(hwnd));
@@ -469,7 +563,11 @@ fn t6_4_xinput_matrix_hotplug_notifications_and_ownership_model_match_reference(
 
     let mut guids = specs
         .into_iter()
-        .map(|spec| user32.add_controller(Some(hwnd), spec).expect("attach controller"))
+        .map(|spec| {
+            user32
+                .add_controller(Some(hwnd), spec)
+                .expect("attach controller")
+        })
         .collect::<Vec<_>>();
     let hotplug_messages = pump_messages(&mut user32);
     assert_eq!(
@@ -484,20 +582,44 @@ fn t6_4_xinput_matrix_hotplug_notifications_and_ownership_model_match_reference(
     let mut xinput_devices = devices
         .iter()
         .filter(|device| device.xinput_slot.is_some())
-        .map(|device| (device.guid.clone(), device.xinput_slot.expect("slot assigned")))
+        .map(|device| {
+            (
+                device.guid.clone(),
+                device.xinput_slot.expect("slot assigned"),
+            )
+        })
         .collect::<Vec<_>>();
     xinput_devices.sort_by(|left, right| left.0.cmp(&right.0));
-    assert_eq!(xinput_devices.iter().map(|(_, slot)| *slot).collect::<Vec<_>>(), vec![0, 1, 2]);
-    assert!(devices.iter().any(|device| device.xinput_slot.is_none() && device.name == "HID Only Pad"));
+    assert_eq!(
+        xinput_devices
+            .iter()
+            .map(|(_, slot)| *slot)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2]
+    );
+    assert!(
+        devices
+            .iter()
+            .any(|device| device.xinput_slot.is_none() && device.name == "HID Only Pad")
+    );
 
     for (_, slot) in &xinput_devices {
-        let capabilities = user32.xinput_get_capabilities(*slot).expect("xinput capabilities");
+        let capabilities = user32
+            .xinput_get_capabilities(*slot)
+            .expect("xinput capabilities");
         assert!(capabilities.supports_rumble);
         let state = user32.xinput_get_state(*slot).expect("xinput state");
         assert!(state.packet_number >= 1);
         assert!(!state.buttons.is_empty());
-        assert!(user32.xinput_get_keystroke(*slot).expect("xinput keystroke").is_some());
-        let _ = user32.xinput_get_battery_information(*slot).expect("battery information");
+        assert!(
+            user32
+                .xinput_get_keystroke(*slot)
+                .expect("xinput keystroke")
+                .is_some()
+        );
+        let _ = user32
+            .xinput_get_battery_information(*slot)
+            .expect("battery information");
     }
 
     let preferred_slot = xinput_devices[1].1;
@@ -505,7 +627,9 @@ fn t6_4_xinput_matrix_hotplug_notifications_and_ownership_model_match_reference(
         .xinput_set_state(preferred_slot, 40_000, 20_000)
         .expect("set xinput rumble state");
     assert_eq!(
-        user32.xinput_rumble_state(preferred_slot).expect("rumble state"),
+        user32
+            .xinput_rumble_state(preferred_slot)
+            .expect("rumble state"),
         RumbleState {
             left_motor: 40_000,
             right_motor: 20_000,
@@ -537,8 +661,12 @@ fn t6_5_directinput_joystick_axis_ranges_guid_stability_and_enumeration_match_re
     let spec = hotas_spec("HOTAS Warthog", "hotas-stable");
     let mut first = User32Subsystem::new(KeyboardLayoutId::Us);
     let mut second = User32Subsystem::new(KeyboardLayoutId::Us);
-    let guid_a = first.add_controller(None, spec.clone()).expect("attach first HOTAS");
-    let guid_b = second.add_controller(None, spec.clone()).expect("attach second HOTAS");
+    let guid_a = first
+        .add_controller(None, spec.clone())
+        .expect("attach first HOTAS");
+    let guid_b = second
+        .add_controller(None, spec.clone())
+        .expect("attach second HOTAS");
     assert_eq!(guid_a, guid_b);
 
     let other_guid = first
@@ -571,11 +699,29 @@ fn t6_5_directinput_joystick_axis_ranges_guid_stability_and_enumeration_match_re
     assert!(state.buttons.contains("trigger"));
     assert!(state.buttons.contains("thumb"));
 
-    let events = first.get_device_data(&handle).expect("directinput event data");
-    assert!(events.iter().any(|event| event.object == "axis::X" && event.value == 500));
-    assert!(events.iter().any(|event| event.object == "axis::Y" && event.value == -500));
-    assert!(events.iter().any(|event| event.object == "button::trigger" && event.value == 1));
-    assert!(events.iter().any(|event| event.object == "button::thumb" && event.value == 1));
+    let events = first
+        .get_device_data(&handle)
+        .expect("directinput event data");
+    assert!(
+        events
+            .iter()
+            .any(|event| event.object == "axis::X" && event.value == 500)
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.object == "axis::Y" && event.value == -500)
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.object == "button::trigger" && event.value == 1)
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.object == "button::thumb" && event.value == 1)
+    );
 }
 
 #[test]
@@ -665,7 +811,15 @@ fn t6_7_recorded_hid_stream_replays_exactly() {
     let _ = pump_messages(&mut first);
 
     first
-        .inject_keyboard_input(first_hwnd, &first_keyboard, 0x10, KeyModifiers { shift: false, altgr: false })
+        .inject_keyboard_input(
+            first_hwnd,
+            &first_keyboard,
+            0x10,
+            KeyModifiers {
+                shift: false,
+                altgr: false,
+            },
+        )
         .expect("record keyboard input");
     first
         .inject_mouse_input(
@@ -711,7 +865,9 @@ fn t6_7_recorded_hid_stream_replays_exactly() {
     assert_eq!(first_keyboard, replay_keyboard);
     assert_eq!(first_mouse, replay_mouse);
 
-    replay.replay_input_stream(&recorded).expect("replay recorded HID stream");
+    replay
+        .replay_input_stream(&recorded)
+        .expect("replay recorded HID stream");
     let replayed = pump_messages(&mut replay);
     assert_eq!(replayed, expected);
 }
@@ -763,7 +919,7 @@ fn t6_8_root_signature_round_trip() {
         static_samplers: vec![D3D12StaticSamplerDesc {
             shader_register: 0,
             register_space: 0,
-            filter: 0, // D3D12_FILER_MIN_MAG_MIP_POINT
+            filter: 0,    // D3D12_FILER_MIN_MAG_MIP_POINT
             address_u: 2, // WRAP
             address_v: 2,
             address_w: 2,
@@ -779,7 +935,9 @@ fn t6_8_root_signature_round_trip() {
     };
 
     let id = runtime.create_root_signature(desc.clone());
-    let stored = runtime.root_signature_desc(id).expect("root signature should be stored");
+    let stored = runtime
+        .root_signature_desc(id)
+        .expect("root signature should be stored");
 
     // Verify parameters round-trip
     assert_eq!(stored.parameters.len(), 3);
@@ -800,29 +958,25 @@ fn t6_8_root_signature_round_trip() {
 #[test]
 fn t6_9_static_sampler_filter_modes() {
     // Validate filter mode mapping
-    let (min_f, mag_f, mip_f, aniso, cmp) =
-        D3d12Runtime::map_d3d12_filter_to_metal(0); // MIN_MAG_MIP_POINT
+    let (min_f, mag_f, mip_f, aniso, cmp) = D3d12Runtime::map_d3d12_filter_to_metal(0); // MIN_MAG_MIP_POINT
     assert_eq!(min_f, "nearest");
     assert_eq!(mag_f, "nearest");
     assert_eq!(mip_f, "nearest");
     assert!(!aniso);
     assert!(!cmp);
 
-    let (min_f, mag_f, mip_f, aniso, cmp) =
-        D3d12Runtime::map_d3d12_filter_to_metal(0x14); // MIN_MAG_LINEAR_MIP_POINT
+    let (min_f, mag_f, mip_f, aniso, cmp) = D3d12Runtime::map_d3d12_filter_to_metal(0x14); // MIN_MAG_LINEAR_MIP_POINT
     assert_eq!(min_f, "linear");
     assert_eq!(mag_f, "linear");
     assert_eq!(mip_f, "nearest");
     assert!(!aniso);
     assert!(!cmp);
 
-    let (min_f, mag_f, mip_f, aniso, cmp) =
-        D3d12Runtime::map_d3d12_filter_to_metal(0x55); // ANISOTROPIC
+    let (_min_f, _mag_f, _mip_f, aniso, cmp) = D3d12Runtime::map_d3d12_filter_to_metal(0x55); // ANISOTROPIC
     assert!(aniso);
     assert!(!cmp);
 
-    let (min_f, mag_f, mip_f, aniso, cmp) =
-        D3d12Runtime::map_d3d12_filter_to_metal(0x80); // COMPARISON_MIN_MAG_MIP_POINT
+    let (_min_f, _mag_f, _mip_f, aniso, cmp) = D3d12Runtime::map_d3d12_filter_to_metal(0x80); // COMPARISON_MIN_MAG_MIP_POINT
     assert!(!aniso);
     assert!(cmp);
 
@@ -867,20 +1021,23 @@ fn t6_9_static_sampler_filter_modes() {
     assert!(metal_desc.contains("border_color::transparent_black"));
 
     // Validate static sampler validation
-    assert!(D3d12Runtime::validate_static_sampler(&sampler).is_ok());
+    let _result = D3d12Runtime::validate_static_sampler(&sampler);
+    assert!(_result.is_ok(), "expected Ok, got {_result:?}");
 
     let bad_sampler = D3D12StaticSamplerDesc {
         max_anisotropy: 32, // Exceeds Metal limit of 16
         ..sampler
     };
-    assert!(D3d12Runtime::validate_static_sampler(&bad_sampler).is_err());
+    let _result = D3d12Runtime::validate_static_sampler(&bad_sampler);
+    assert!(_result.is_err(), "expected Err, got {_result:?}");
 
     let bad_lod = D3D12StaticSamplerDesc {
         min_lod: 5.0,
         max_lod: 1.0, // min > max
         ..sampler
     };
-    assert!(D3d12Runtime::validate_static_sampler(&bad_lod).is_err());
+    let _result = D3d12Runtime::validate_static_sampler(&bad_lod);
+    assert!(_result.is_err(), "expected Err, got {_result:?}");
 }
 
 // -------------------------------------------------------------------------
@@ -915,7 +1072,7 @@ fn t6_10_root_constants_binding() {
             depth_format: None,
         },
     );
-    let list = runtime.create_graphics_command_list(allocator, pipeline_state);
+    let list = runtime.create_graphics_command_list(allocator, pipeline_state, false);
 
     // Record root constants
     runtime
@@ -964,7 +1121,7 @@ fn t6_11_resource_state_transition() {
             depth_format: None,
         },
     );
-    let list_id = runtime.create_graphics_command_list(allocator, pso);
+    let list_id = runtime.create_graphics_command_list(allocator, pso, false);
 
     // Verify initial state
     assert_eq!(
@@ -978,7 +1135,13 @@ fn t6_11_resource_state_transition() {
 
     // Transition subresource 0 to RenderTarget
     runtime
-        .record_transition(list_id, resource, 0, ResourceState::Common, ResourceState::RenderTarget)
+        .record_transition(
+            list_id,
+            resource,
+            0,
+            ResourceState::Common,
+            ResourceState::RenderTarget,
+        )
         .expect("transition");
 
     assert_eq!(
@@ -988,7 +1151,13 @@ fn t6_11_resource_state_transition() {
 
     // Transition subresource 1 to CopyDest
     runtime
-        .record_transition(list_id, resource, 1, ResourceState::Common, ResourceState::CopyDest)
+        .record_transition(
+            list_id,
+            resource,
+            1,
+            ResourceState::Common,
+            ResourceState::CopyDest,
+        )
         .expect("transition");
 
     assert_eq!(
@@ -1004,7 +1173,13 @@ fn t6_11_resource_state_transition() {
 
     // Transition back to Common
     runtime
-        .record_transition(list_id, resource, 0, ResourceState::RenderTarget, ResourceState::Common)
+        .record_transition(
+            list_id,
+            resource,
+            0,
+            ResourceState::RenderTarget,
+            ResourceState::Common,
+        )
         .expect("transition");
     assert_eq!(
         runtime.resource_state(resource, 0).expect("state"),
@@ -1043,11 +1218,17 @@ fn t6_12_split_barrier_begin_end() {
             depth_format: None,
         },
     );
-    let list = runtime.create_graphics_command_list(allocator, ps);
+    let list = runtime.create_graphics_command_list(allocator, ps, false);
 
     // Begin split barrier: Common -> RenderTarget
     runtime
-        .record_split_barrier_begin(list, resource, 0, ResourceState::Common, ResourceState::RenderTarget)
+        .record_split_barrier_begin(
+            list,
+            resource,
+            0,
+            ResourceState::Common,
+            ResourceState::RenderTarget,
+        )
         .expect("split begin");
     assert_eq!(runtime.pending_split_barrier_count(), 1);
 
@@ -1059,7 +1240,13 @@ fn t6_12_split_barrier_begin_end() {
 
     // End split barrier: Common -> RenderTarget
     runtime
-        .record_split_barrier_end(list, resource, 0, ResourceState::Common, ResourceState::RenderTarget)
+        .record_split_barrier_end(
+            list,
+            resource,
+            0,
+            ResourceState::Common,
+            ResourceState::RenderTarget,
+        )
         .expect("split end");
     assert_eq!(runtime.pending_split_barrier_count(), 0);
 
@@ -1113,7 +1300,7 @@ fn t6_13_aliasing_barrier() {
             depth_format: None,
         },
     );
-    let list = runtime.create_graphics_command_list(allocator, ps);
+    let list = runtime.create_graphics_command_list(allocator, ps, false);
 
     // Record aliasing barrier: resource_a before, resource_b after
     runtime
@@ -1172,7 +1359,7 @@ fn t6_14_uav_barrier() {
             depth_format: None,
         },
     );
-    let list = runtime.create_graphics_command_list(allocator, ps);
+    let list = runtime.create_graphics_command_list(allocator, ps, false);
 
     // Record a UAV barrier
     runtime
@@ -1328,7 +1515,11 @@ fn t6_17_resource_state_bitmask() {
     ];
 
     for (state, bits) in test_cases {
-        assert_eq!(state.to_d3d12_bits(), bits, "state {state:?} -> bits mismatch");
+        assert_eq!(
+            state.to_d3d12_bits(),
+            bits,
+            "state {state:?} -> bits mismatch"
+        );
         let round_trip = ResourceState::from_d3d12_bits(bits);
         assert!(
             round_trip.contains(&state),
@@ -1409,10 +1600,7 @@ fn t6_19_mesh_pipeline_dispatch() {
         .expect("swapchain state")
         .backbuffers[0];
 
-    let rtv_heap = runtime.create_descriptor_heap(
-        casa1::gfx::DescriptorHeapType::Rtv,
-        1,
-    );
+    let rtv_heap = runtime.create_descriptor_heap(casa1::gfx::DescriptorHeapType::Rtv, 1);
     runtime
         .write_descriptor(
             rtv_heap,
@@ -1442,7 +1630,7 @@ fn t6_19_mesh_pipeline_dispatch() {
 
     let queue = runtime.create_command_queue();
     let allocator = runtime.create_command_allocator();
-    let list = runtime.create_graphics_command_list(allocator, pipeline_state);
+    let list = runtime.create_graphics_command_list(allocator, pipeline_state, false);
 
     // DispatchMesh requires an active render pass (it generates geometry for rasterization)
     runtime
@@ -1485,10 +1673,7 @@ fn t6_20_mesh_dispatch_zero_dimensions_is_noop() {
         .expect("swapchain state")
         .backbuffers[0];
 
-    let rtv_heap = runtime.create_descriptor_heap(
-        casa1::gfx::DescriptorHeapType::Rtv,
-        1,
-    );
+    let rtv_heap = runtime.create_descriptor_heap(casa1::gfx::DescriptorHeapType::Rtv, 1);
     runtime
         .write_descriptor(
             rtv_heap,
@@ -1513,7 +1698,7 @@ fn t6_20_mesh_dispatch_zero_dimensions_is_noop() {
 
     let queue = runtime.create_command_queue();
     let allocator = runtime.create_command_allocator();
-    let list = runtime.create_graphics_command_list(allocator, pipeline_state);
+    let list = runtime.create_graphics_command_list(allocator, pipeline_state, false);
 
     runtime
         .record_begin_render_pass(
@@ -1526,7 +1711,8 @@ fn t6_20_mesh_dispatch_zero_dimensions_is_noop() {
         .expect("begin render pass");
 
     // Dispatch with zero dimensions should still be accepted
-    assert!(runtime.dispatch_mesh(list, 0, 0, 0).is_ok());
+    let _result = runtime.dispatch_mesh(list, 0, 0, 0);
+    assert!(_result.is_ok(), "expected Ok, got {_result:?}");
 
     let stream = runtime.close_command_list(list).expect("close list");
     let fence = runtime.create_fence(0);
@@ -1569,7 +1755,7 @@ fn t6_21_build_bottom_level_acceleration_structure() {
 
     let allocator = runtime.create_command_allocator();
     let root_sig = runtime.create_root_signature(RootSignatureDesc::default());
-    let list = runtime.create_graphics_command_list(allocator, root_sig);
+    let list = runtime.create_graphics_command_list(allocator, root_sig, false);
 
     let result = runtime.build_raytracing_acceleration_structure(list, &desc);
     assert!(result.is_ok(), "build BLAS should succeed");
@@ -1616,7 +1802,7 @@ fn t6_22_build_top_level_acceleration_structure() {
 
     let allocator = runtime.create_command_allocator();
     let root_sig = runtime.create_root_signature(RootSignatureDesc::default());
-    let list = runtime.create_graphics_command_list(allocator, root_sig);
+    let list = runtime.create_graphics_command_list(allocator, root_sig, false);
 
     runtime
         .build_raytracing_acceleration_structure(list, &blas_desc)
@@ -1653,7 +1839,7 @@ fn t6_23_dispatch_rays_shader_table_parsing() {
 
     let allocator = runtime.create_command_allocator();
     let root_sig = runtime.create_root_signature(RootSignatureDesc::default());
-    let list = runtime.create_graphics_command_list(allocator, root_sig);
+    let list = runtime.create_graphics_command_list(allocator, root_sig, false);
 
     // Set a raytracing pipeline state first
     let dxil = vec![0u8; 128];
@@ -1666,7 +1852,11 @@ fn t6_23_dispatch_rays_shader_table_parsing() {
     assert_eq!(pso.unwrap().dxil_bytecode.len(), 128);
     assert_eq!(pso.unwrap().payload_size, 32, "default payload size");
     assert_eq!(pso.unwrap().attribute_size, 8, "default attribute size");
-    assert_eq!(pso.unwrap().max_recursion_depth, 1, "default recursion depth");
+    assert_eq!(
+        pso.unwrap().max_recursion_depth,
+        1,
+        "default recursion depth"
+    );
 
     // Dispatch rays with valid shader table addresses
     let dispatch_desc = D3D12DispatchRaysDesc {
@@ -1757,7 +1947,7 @@ fn t6_24_raytracing_pipeline_state_and_feature_query() {
     // Set and query raytracing pipeline state
     let allocator = runtime.create_command_allocator();
     let root_sig = runtime.create_root_signature(RootSignatureDesc::default());
-    let list = runtime.create_graphics_command_list(allocator, root_sig);
+    let list = runtime.create_graphics_command_list(allocator, root_sig, false);
 
     let dxil = vec![42u8; 256];
     runtime

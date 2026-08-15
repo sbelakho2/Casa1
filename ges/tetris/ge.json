@@ -1,0 +1,45 @@
+{
+  "schema_version": 2,
+  "name": "tetris",
+  "arch": "x64",
+  "winver": "win11-23h2",
+  "user_name": "casa1",
+  "long_paths_enabled": false,
+  "drive_mappings": [
+    {
+      "drive": "C",
+      "target": "<GE>/drive_c",
+      "read_only": false,
+      "enabled": true,
+      "requires_permission": false
+    },
+    {
+      "drive": "Z",
+      "target": "/",
+      "read_only": true,
+      "enabled": false,
+      "requires_permission": true
+    }
+  ],
+  "override_profiles": [],
+  "fs_state": {
+    "entries": {
+      "C:\\users\\casa1\\appdata\\local\\temp\\casa1-tetris-smoke.exe": {
+        "kind": "File",
+        "original_case": "casa1-tetris-smoke.exe",
+        "attributes": [],
+        "creation_time_ticks": 134286172422704400,
+        "last_access_time_ticks": 134286172422704400,
+        "last_write_time_ticks": 134286172422704400
+      },
+      "C:\\users\\casa1\\appdata\\local\\temp\\casa1-tetris.exe": {
+        "kind": "File",
+        "original_case": "casa1-tetris.exe",
+        "attributes": [],
+        "creation_time_ticks": 134285289888966890,
+        "last_access_time_ticks": 134285289888966890,
+        "last_write_time_ticks": 134285289888966890
+      }
+    }
+  }
+}

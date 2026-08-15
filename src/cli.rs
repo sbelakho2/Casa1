@@ -1,14 +1,18 @@
-use crate::app_bundle::{create_app_bundle, AppBundleConfig, is_app_registered, list_installed_apps, register_with_launch_services, uninstall_app};
-use crate::diagnostics::{doctor, export_diagnostics};
+use crate::CLI_NAME;
+use crate::app_bundle::{
+    AppBundleConfig, create_app_bundle, list_installed_apps, register_with_launch_services,
+    uninstall_app,
+};
+use crate::diagnostics::{doctor, export_diagnostics, run_diagnostics};
 use crate::error::{AppError, AppResult, ErrorResponse};
 use crate::ge::{GameEnvironment, GeArch};
 use crate::icon::extract_icon_from_pe;
 use crate::reason::ReasonCode;
 use crate::runner::{RunIntent, RunnerJob, RunnerOutcome};
 use crate::security::audit_embedded_entitlements;
+use crate::steam_launch::{self, SteamLaunchProfile};
 use crate::trace;
 use crate::util;
-use crate::CLI_NAME;
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -148,6 +152,62 @@ enum HostCommand {
         #[arg(long)]
         app_name: String,
     },
+    #[command(name = "diagnostics")]
+    Diagnostics,
+    #[command(name = "steam:launch")]
+    SteamLaunch {
+        /// Name of the Game Environment to use (default: "steam").
+        #[arg(long, default_value = "steam")]
+        ge: String,
+        /// Create the GE if it does not exist.
+        #[arg(long, default_value = "true")]
+        create_ge: bool,
+        /// Disable Metal hardware-accelerated rendering.
+        #[arg(long)]
+        no_metal: bool,
+        /// Disable real audio output.
+        #[arg(long)]
+        no_audio: bool,
+        /// Disable CEF/WKWebView bridge for Steam web UI.
+        #[arg(long)]
+        no_cef: bool,
+        /// Disable Vulkan/OpenGL → Metal translation.
+        #[arg(long)]
+        no_vulkan: bool,
+        /// Enable offline mode.
+        #[arg(long)]
+        offline: bool,
+        /// Enable debug logging.
+        #[arg(long)]
+        debug: bool,
+        /// Disable JIT compilation.
+        #[arg(long)]
+        no_jit: bool,
+        /// Custom PE runtime instruction budget (0 = unlimited).
+        #[arg(long, default_value = "0")]
+        budget: u64,
+        /// Additional Steam launch arguments.
+        #[arg(long)]
+        steam_args: Option<String>,
+        /// Steam install directory name within drive_c (default: "Steam").
+        #[arg(long, default_value = "Steam")]
+        steam_dir: String,
+        /// Enable auto-login.
+        #[arg(long)]
+        auto_login: bool,
+        /// Disable HiDPI/Retina rendering.
+        #[arg(long)]
+        no_hidpi: bool,
+        /// Disable Steam Input device support.
+        #[arg(long)]
+        no_steam_input: bool,
+        /// Disable network access.
+        #[arg(long)]
+        no_network: bool,
+        /// Use performance-optimized profile.
+        #[arg(long)]
+        performance: bool,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -218,7 +278,10 @@ where
                 env,
                 dtm,
                 intent: RunIntent::Run,
-                trace_categories: resolve_trace_categories(trace_categories.as_deref(), RunIntent::Run)?,
+                trace_categories: resolve_trace_categories(
+                    trace_categories.as_deref(),
+                    RunIntent::Run,
+                )?,
                 test_id: format!("run-{}", executable_stem(&exe)),
             };
             let outcome = dispatch_runner(&ge, &job)?;
@@ -248,7 +311,10 @@ where
                 env,
                 dtm: false,
                 intent: RunIntent::Play,
-                trace_categories: resolve_trace_categories(trace_categories.as_deref(), RunIntent::Play)?,
+                trace_categories: resolve_trace_categories(
+                    trace_categories.as_deref(),
+                    RunIntent::Play,
+                )?,
                 test_id: format!("play-{}", executable_stem(&exe)),
             };
             let outcome = dispatch_runner(&ge, &job)?;
@@ -298,7 +364,10 @@ where
                 env,
                 dtm,
                 intent: RunIntent::Install,
-                trace_categories: resolve_trace_categories(trace_categories.as_deref(), RunIntent::Install)?,
+                trace_categories: resolve_trace_categories(
+                    trace_categories.as_deref(),
+                    RunIntent::Install,
+                )?,
                 test_id: format!("install-{}", executable_stem(&installer)),
             };
             let outcome = dispatch_runner(&ge, &job)?;
@@ -311,6 +380,10 @@ where
         HostCommand::Doctor { ge } => {
             let ge = GameEnvironment::open(&ge)?;
             util::stable_json(&doctor(&ge)?)
+        }
+        HostCommand::Diagnostics => {
+            let report = run_diagnostics()?;
+            util::stable_json(&report)
         }
         HostCommand::SecurityAuditEntitlements {
             jit_owner,
@@ -343,78 +416,168 @@ where
             skip_launch_services,
             url_schemes,
         } => {
-                let ge = GameEnvironment::open(&ge)?;
-                let name = app_name.unwrap_or_else(|| {
-                    exe.file_stem()
-                        .map(|s| s.to_string_lossy().to_string())
-                        .unwrap_or_else(|| "Unnamed".to_string())
-                });
-                let apps_dir = ge.root.join("apps");
-                fs::create_dir_all(&apps_dir).map_err(|e| {
-                    AppError::from_io(ReasonCode::RcIo, format!("failed to create apps dir"), &e)
-                })?;
-    
-                // Extract icon from the PE executable if no external icon source
-                let icon_data = if let Some(icon_path) = icon_source {
-                    Some(fs::read(&icon_path).map_err(|e| {
-                        AppError::from_io(ReasonCode::RcIo, format!("failed to read icon file"), &e)
-                    })?)
-                } else {
-                    extract_icon_from_pe(&exe)
-                        .ok()
-                        .flatten()
-                        .and_then(|icon_img| crate::icon::icons_to_icns(&[icon_img]).ok())
-                };
-    
-                let config = AppBundleConfig {
-                    app_name: name.clone(),
-                    executable_path: exe.to_string_lossy().to_string(),
-                    args,
-                    ge_name: ge.config.name.clone(),
-                    icon_data,
-                    bundle_id,
-                    min_system_version: None,
-                    high_resolution: None,
-                    url_schemes,
-                    app_category: None,
-                };
-    
-                let app_path = create_app_bundle(&config, &apps_dir)?;
-    
-                if !skip_launch_services {
-                    match register_with_launch_services(&app_path) {
-                        Ok(_) => {},
-                        Err(e) => {
-                            eprintln!("Warning: Launch Services registration failed: {:?}", e);
-                        }
+            let ge = GameEnvironment::open(&ge)?;
+            let name = app_name.unwrap_or_else(|| {
+                exe.file_stem()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "Unnamed".to_string())
+            });
+            let apps_dir = ge.root.join("apps");
+            fs::create_dir_all(&apps_dir).map_err(|e| {
+                AppError::from_io(ReasonCode::RcIo, format!("failed to create apps dir"), &e)
+            })?;
+
+            // Extract icon from the PE executable if no external icon source
+            let icon_data = if let Some(icon_path) = icon_source {
+                Some(fs::read(&icon_path).map_err(|e| {
+                    AppError::from_io(ReasonCode::RcIo, format!("failed to read icon file"), &e)
+                })?)
+            } else {
+                extract_icon_from_pe(&exe)
+                    .ok()
+                    .flatten()
+                    .and_then(|icon_img| crate::icon::icons_to_icns(&[icon_img]).ok())
+            };
+
+            let config = AppBundleConfig {
+                app_name: name.clone(),
+                executable_path: exe.to_string_lossy().to_string(),
+                args,
+                ge_name: ge.config.name.clone(),
+                icon_data,
+                bundle_id,
+                min_system_version: None,
+                high_resolution: None,
+                url_schemes,
+                app_category: None,
+            };
+
+            let app_path = create_app_bundle(&config, &apps_dir)?;
+
+            if !skip_launch_services {
+                match register_with_launch_services(&app_path) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        eprintln!("Warning: Launch Services registration failed: {:?}", e);
                     }
                 }
-    
-                util::stable_json(&serde_json::json!({
-                    "app_name": name,
-                    "app_path": app_path.to_string_lossy(),
-                    "launch_services_registered": !skip_launch_services,
-                }))
             }
-            HostCommand::AppsList => {
-                let apps_dir = find_apps_dir()?;
-                let apps = list_installed_apps(&apps_dir)?;
-                util::stable_json(&serde_json::json!({
-                    "apps": apps,
-                    "apps_dir": apps_dir.to_string_lossy(),
-                }))
+
+            util::stable_json(&serde_json::json!({
+                "app_name": name,
+                "app_path": app_path.to_string_lossy(),
+                "launch_services_registered": !skip_launch_services,
+            }))
+        }
+        HostCommand::AppsList => {
+            let apps_dir = find_apps_dir()?;
+            let apps = list_installed_apps(&apps_dir)?;
+            util::stable_json(&serde_json::json!({
+                "apps": apps,
+                "apps_dir": apps_dir.to_string_lossy(),
+            }))
+        }
+        HostCommand::AppsUninstall { app_name } => {
+            let apps_dir = find_apps_dir()?;
+            let app_path = apps_dir.join(&app_name).with_extension("app");
+            uninstall_app(&app_path)?;
+            util::stable_json(&serde_json::json!({
+                "app_name": app_name,
+                "uninstalled": true,
+            }))
+        }
+        HostCommand::SteamLaunch {
+            ge,
+            create_ge,
+            no_metal,
+            no_audio,
+            no_cef,
+            no_vulkan,
+            offline,
+            debug,
+            no_jit,
+            budget,
+            steam_args,
+            steam_dir,
+            auto_login,
+            no_hidpi,
+            no_steam_input,
+            no_network,
+            performance,
+        } => {
+            // Build the launch profile from CLI flags.
+            let mut profile = if performance {
+                SteamLaunchProfile::performance()
+            } else if debug {
+                SteamLaunchProfile::debug()
+            } else if offline {
+                SteamLaunchProfile::offline()
+            } else {
+                SteamLaunchProfile::default()
+            };
+
+            // Apply CLI overrides to the profile.
+            profile.ge_name = ge;
+            profile.create_ge = create_ge;
+            if no_metal {
+                profile.metal_rendering = false;
             }
-            HostCommand::AppsUninstall { app_name } => {
-                let apps_dir = find_apps_dir()?;
-                let app_path = apps_dir.join(&app_name).with_extension("app");
-                uninstall_app(&app_path)?;
-                util::stable_json(&serde_json::json!({
-                    "app_name": app_name,
-                    "uninstalled": true,
-                }))
+            if no_audio {
+                profile.real_audio = false;
             }
+            if no_cef {
+                profile.cef_bridge = false;
+            }
+            if no_vulkan {
+                profile.vulkan_opengl = false;
+            }
+            if offline {
+                profile.offline_mode = true;
+            }
+            if debug {
+                profile.debug_logging = true;
+            }
+            if no_jit {
+                profile.jit_enabled = false;
+            }
+            if budget > 0 {
+                profile.instruction_budget = budget;
+            }
+            if auto_login {
+                profile.auto_login = true;
+            }
+            if no_hidpi {
+                profile.hidpi = false;
+            }
+            if no_steam_input {
+                profile.steam_input = false;
+            }
+            if no_network {
+                profile.network_enabled = false;
+            }
+            profile.steam_install_dir = steam_dir;
+            if let Some(args) = steam_args {
+                profile.extra_args = shlex::split(&args).unwrap_or_default();
+            }
+
+            // Execute the Steam launch pipeline.
+            let (launch_result, job) = steam_launch::prepare_steam_launch(&profile)?;
+            let ge = GameEnvironment::open(&launch_result.ge_name)?;
+            let outcome = dispatch_runner(&ge, &job)?;
+
+            // Merge launch result with runner outcome.
+            util::stable_json(&serde_json::json!({
+                "launch": launch_result,
+                "outcome": {
+                    "report_path": outcome.report_path,
+                    "trace_path": outcome.trace_path,
+                    "log_path": outcome.log_path,
+                    "exit_code": outcome.canonical_output.exit_code,
+                },
+            }))
         }
     }
+}
 
 fn dispatch_runner(ge: &GameEnvironment, job: &RunnerJob) -> AppResult<RunnerOutcome> {
     let runner_binary = util::sibling_binary("casa1-runner")?;
@@ -436,7 +599,8 @@ fn dispatch_runner(ge: &GameEnvironment, job: &RunnerJob) -> AppResult<RunnerOut
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         if let Ok(response) = serde_json::from_str::<ErrorResponse>(&stderr) {
             return Err(AppError {
-                code: ReasonCode::from_u32(response.reason_code).unwrap_or(ReasonCode::RcRunnerProtocolInvalid),
+                code: ReasonCode::from_u32(response.reason_code)
+                    .unwrap_or(ReasonCode::RcRunnerProtocolInvalid),
                 message: response.message,
                 reproduction_hints: response.reproduction_hints,
             });
@@ -459,18 +623,32 @@ fn dispatch_runner(ge: &GameEnvironment, job: &RunnerJob) -> AppResult<RunnerOut
 
 fn ensure_runner_binary_is_current(runner_binary: &Path) -> AppResult<()> {
     let current_executable = std::env::current_exe().map_err(|error| {
-        AppError::from_io(ReasonCode::RcIo, "failed to resolve current executable", &error)
+        AppError::from_io(
+            ReasonCode::RcIo,
+            "failed to resolve current executable",
+            &error,
+        )
     })?;
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     if !manifest_dir.join("Cargo.toml").is_file() {
         return Ok(());
     }
-    let runner_modified = fs::metadata(runner_binary)
-        .and_then(|metadata| metadata.modified())
-        .ok();
-    let current_modified = fs::metadata(&current_executable)
-        .and_then(|metadata| metadata.modified())
-        .ok();
+    let runner_modified = match fs::metadata(runner_binary).and_then(|metadata| metadata.modified())
+    {
+        Ok(m) => Some(m),
+        Err(e) => {
+            eprintln!("[cli] failed to get runner binary modified time: {e}");
+            None
+        }
+    };
+    let current_modified =
+        match fs::metadata(&current_executable).and_then(|metadata| metadata.modified()) {
+            Ok(m) => Some(m),
+            Err(e) => {
+                eprintln!("[cli] failed to get current binary modified time: {e}");
+                None
+            }
+        };
     let Some(runner_modified) = runner_modified else {
         return Ok(());
     };
@@ -560,10 +738,13 @@ fn detect_installer_silent_args(bytes: &[u8]) -> Vec<String> {
 fn contains_ascii_marker(haystack: &[u8], needle: &[u8]) -> bool {
     haystack
         .windows(needle.len())
-        .any(|window| window.eq_ignore_ascii_case(needle))
+        .any(|window| window.eq_ignore_ascii_case(needle)) // case-insensitive comparison
 }
 
-fn resolve_trace_categories(raw: Option<&str>, intent: RunIntent) -> AppResult<Vec<trace::TraceCategory>> {
+fn resolve_trace_categories(
+    raw: Option<&str>,
+    intent: RunIntent,
+) -> AppResult<Vec<trace::TraceCategory>> {
     match raw {
         Some(value) => trace::parse_categories(Some(value)),
         None if intent == RunIntent::Play => trace::parse_categories(Some("process")),
@@ -571,7 +752,10 @@ fn resolve_trace_categories(raw: Option<&str>, intent: RunIntent) -> AppResult<V
     }
 }
 
-fn insert_input_replay(env: &mut BTreeMap<String, String>, input_replay: Option<&Path>) -> AppResult<()> {
+fn insert_input_replay(
+    env: &mut BTreeMap<String, String>,
+    input_replay: Option<&Path>,
+) -> AppResult<()> {
     if let Some(input_replay) = input_replay {
         env.insert(
             "CASA1_KEYBOARD_REPLAY_JSON".to_string(),
@@ -622,7 +806,10 @@ fn insert_steam_zero_touch_inputs(
         )
         .with_hint("provide both --steam-library-root and --steam-library-host-root to map a guest Steam library drive onto an external host path"));
     }
-    if steam_library_host_map.is_some() && steam_library_root.is_none() && steam_libraryfolders.is_none() {
+    if steam_library_host_map.is_some()
+        && steam_library_root.is_none()
+        && steam_libraryfolders.is_none()
+    {
         return Err(AppError::new(
             ReasonCode::RcCliInvalid,
             "Steam library host map requires --steam-library-root or --steam-libraryfolders",
@@ -652,7 +839,10 @@ fn insert_steam_zero_touch_inputs(
     );
     env.insert(
         "CASA1_STEAM_INSTALLSCRIPT_PATH".to_string(),
-        steam_installscript.expect("validated").display().to_string(),
+        steam_installscript
+            .expect("validated")
+            .display()
+            .to_string(),
     );
     env.insert(
         "CASA1_STEAM_PAYLOAD_ROOT".to_string(),
@@ -719,13 +909,11 @@ fn find_apps_dir() -> AppResult<PathBuf> {
         })?;
         return Ok(path);
     }
-    let home = std::env::var("HOME").map_err(|_| {
-        AppError::new(ReasonCode::RcIo, "HOME not set")
-    })?;
+    let home =
+        std::env::var("HOME").map_err(|_| AppError::new(ReasonCode::RcIo, "HOME not set"))?;
     let apps_dir = PathBuf::from(home).join(".casa1").join("apps");
-    fs::create_dir_all(&apps_dir).map_err(|e| {
-        AppError::from_io(ReasonCode::RcIo, "failed to create ~/.casa1/apps", &e)
-    })?;
+    fs::create_dir_all(&apps_dir)
+        .map_err(|e| AppError::from_io(ReasonCode::RcIo, "failed to create ~/.casa1/apps", &e))?;
     Ok(apps_dir)
 }
 
@@ -779,19 +967,22 @@ mod tests {
 
     #[test]
     fn ge_play_defaults_to_process_trace_only() {
-        let categories = resolve_trace_categories(None, RunIntent::Play).expect("default play trace categories");
+        let categories =
+            resolve_trace_categories(None, RunIntent::Play).expect("default play trace categories");
         assert_eq!(categories, vec![trace::TraceCategory::Process]);
     }
 
     #[test]
     fn ge_run_defaults_to_all_trace_categories() {
-        let categories = resolve_trace_categories(None, RunIntent::Run).expect("default run trace categories");
+        let categories =
+            resolve_trace_categories(None, RunIntent::Run).expect("default run trace categories");
         assert_eq!(categories, trace::all_categories());
     }
 
     #[test]
     fn detect_installer_silent_args_prefers_nsis_switches() {
-        let args = detect_installer_silent_args(b"Nullsoft.NSIS.exehead\0Nullsoft Install System v3.0");
+        let args =
+            detect_installer_silent_args(b"Nullsoft.NSIS.exehead\0Nullsoft Install System v3.0");
         assert_eq!(args, vec!["/S".to_string()]);
     }
 }

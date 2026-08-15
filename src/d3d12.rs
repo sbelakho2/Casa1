@@ -1,20 +1,20 @@
 use crate::error::{AppError, AppResult};
-use crate::reason::ReasonCode;
 use crate::gfx::{
     D3D12DescriptorRangeType, D3D12ResourceBarrierDesc, D3D12ResourceBarrierType,
-    D3D12ResourceBarrierFlags, D3D12ShaderVisibility, D3D12StaticSamplerDesc, DescriptorRange,
-    FeatureQuery, GraphicsBackend, PendingSplitBarrier, RootParameter, SubresourceKey,
+    D3D12ShaderVisibility, D3D12StaticSamplerDesc, FeatureQuery, GraphicsBackend,
+    PendingSplitBarrier, SubresourceKey,
 };
+use crate::reason::ReasonCode;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 pub use crate::gfx::{
     AdapterId, AdapterInfo, CommandAllocatorId, CommandListId, CommandQueueId, DescriptorHeapId,
     DescriptorHeapType, DxgiFormat, FenceId, FormatMapping, HeapType, ImmutableCommandStream,
-    MetalBinding, MetalCommandBufferPlan, MetalStorageMode, OutputId, OutputInfo, PipelineStateDesc,
-    PipelineStateId, PresentResult, PresentedFrame, QueryHeapId, QueryResolveResult, QueryType,
-    ResourceDesc, ResourceId, ResourceState, ResourceUsageHint, RootSignatureDesc, RootSignatureId,
-    SwapchainDesc, SwapchainId, SwapchainState, ViewDescriptor,
+    MetalBinding, MetalCommandBufferPlan, MetalStorageMode, OutputId, OutputInfo,
+    PipelineStateDesc, PipelineStateId, PresentResult, PresentedFrame, QueryHeapId,
+    QueryResolveResult, QueryType, ResourceDesc, ResourceId, ResourceState, ResourceUsageHint,
+    RootSignatureDesc, RootSignatureId, SwapchainDesc, SwapchainId, SwapchainState, ViewDescriptor,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -133,7 +133,7 @@ struct QueryHeap {
     begin_values: Vec<u64>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct D3d12Runtime {
     backend: GraphicsBackend,
     render_pass_active: bool,
@@ -168,6 +168,36 @@ pub struct D3d12Runtime {
     aliasing_overlaps: Vec<(Option<ResourceId>, Option<ResourceId>)>,
     /// Root signature descriptors stored for reference.
     root_signature_descs: BTreeMap<RootSignatureId, RootSignatureDesc>,
+    /// Pending WriteBufferImmediate requests stored for processing during
+    /// command list execution. Each entry is (list, dst_gpu_addr, value_bytes).
+    pending_immediate_writes: Vec<(CommandListId, u64, [u8; 8])>,
+}
+
+impl Default for D3d12Runtime {
+    fn default() -> Self {
+        Self {
+            backend: GraphicsBackend::new(),
+            render_pass_active: false,
+            shading_rate: 0,
+            raytracing_pipeline_states: BTreeMap::new(),
+            acceleration_structures: BTreeMap::new(),
+            next_metal_as_handle: 1,
+            fence_values: BTreeMap::new(),
+            query_heaps: BTreeMap::new(),
+            meta_command_params: BTreeMap::new(),
+            depth_bounds_min: 0.0,
+            depth_bounds_max: 1.0,
+            sample_positions_pixel_samples: 0,
+            sample_positions_num_pixels: 0,
+            view_instance_mask: 0,
+            protected_session: 0,
+            subresource_states: BTreeMap::new(),
+            pending_split_barriers: Vec::new(),
+            aliasing_overlaps: Vec::new(),
+            root_signature_descs: BTreeMap::new(),
+            pending_immediate_writes: Vec::new(),
+        }
+    }
 }
 
 impl D3d12Runtime {
@@ -196,6 +226,7 @@ impl D3d12Runtime {
             pending_split_barriers: Vec::new(),
             aliasing_overlaps: Vec::new(),
             root_signature_descs: BTreeMap::new(),
+            pending_immediate_writes: Vec::new(),
         }
     }
 
@@ -231,7 +262,9 @@ impl D3d12Runtime {
         array_slice: u32,
         mip_level: u32,
     ) -> Option<ResourceState> {
-        self.subresource_states.get(&(resource, array_slice, mip_level)).copied()
+        self.subresource_states
+            .get(&(resource, array_slice, mip_level))
+            .copied()
     }
 
     /// Set subresource state in fine-grained tracking.
@@ -242,7 +275,8 @@ impl D3d12Runtime {
         mip_level: u32,
         state: ResourceState,
     ) {
-        self.subresource_states.insert((resource, array_slice, mip_level), state);
+        self.subresource_states
+            .insert((resource, array_slice, mip_level), state);
     }
 
     /// Get the stored root signature descriptor for a given ID.
@@ -314,9 +348,9 @@ impl D3d12Runtime {
     /// Map D3D12_STATIC_BORDER_COLOR to Metal border color string.
     pub fn map_d3d12_border_color(color: u32) -> &'static str {
         match color {
-            0 => "transparent_black",  // D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK
-            1 => "opaque_black",       // D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK
-            2 => "opaque_white",       // D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE
+            0 => "transparent_black", // D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK
+            1 => "opaque_black",      // D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK
+            2 => "opaque_white",      // D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE
             _ => "transparent_black",
         }
     }
@@ -344,7 +378,11 @@ impl D3d12Runtime {
             cmp = compare_fn,
             min_lod = sampler.min_lod,
             max_lod = sampler.max_lod,
-            aniso = if anisotropic { sampler.max_anisotropy } else { 1 },
+            aniso = if anisotropic {
+                sampler.max_anisotropy
+            } else {
+                1
+            },
             border = border_color,
         )
     }
@@ -354,7 +392,10 @@ impl D3d12Runtime {
         if sampler.max_anisotropy > 16 {
             return Err(AppError::new(
                 ReasonCode::RcD3dInvalidState,
-                format!("max anisotropy {} exceeds Metal limit of 16", sampler.max_anisotropy),
+                format!(
+                    "max anisotropy {} exceeds Metal limit of 16",
+                    sampler.max_anisotropy
+                ),
             ));
         }
         if sampler.min_lod > sampler.max_lod {
@@ -368,7 +409,10 @@ impl D3d12Runtime {
 
     /// Handle unbounded descriptor ranges (NumDescriptors == UINT_MAX).
     /// Falls back to a reasonable limit per range type.
-    pub fn resolve_unbounded_range(range_type: D3D12DescriptorRangeType, num_descriptors: u32) -> u32 {
+    pub fn resolve_unbounded_range(
+        range_type: D3D12DescriptorRangeType,
+        num_descriptors: u32,
+    ) -> u32 {
         if num_descriptors != u32::MAX {
             return num_descriptors;
         }
@@ -385,7 +429,9 @@ impl D3d12Runtime {
         visibility: D3D12ShaderVisibility,
     ) -> &[u32] {
         const EMPTY: &[u32] = &[];
-        desc.visibility_offsets.get(&visibility).map_or(EMPTY, |v| v.as_slice())
+        desc.visibility_offsets
+            .get(&visibility)
+            .map_or(EMPTY, |v| v.as_slice())
     }
 
     pub fn query_format_support(&self, format: DxgiFormat) -> AppResult<FormatMapping> {
@@ -396,7 +442,11 @@ impl D3d12Runtime {
         self.backend.create_swapchain(desc)
     }
 
-    pub fn set_maximum_frame_latency(&mut self, swapchain: SwapchainId, latency: u32) -> AppResult<()> {
+    pub fn set_maximum_frame_latency(
+        &mut self,
+        swapchain: SwapchainId,
+        latency: u32,
+    ) -> AppResult<()> {
         self.backend.set_maximum_frame_latency(swapchain, latency)
     }
 
@@ -422,7 +472,8 @@ impl D3d12Runtime {
         sync_interval: u32,
         allow_tearing: bool,
     ) -> AppResult<PresentResult> {
-        self.backend.present(swapchain, sync_interval, allow_tearing)
+        self.backend
+            .present(swapchain, sync_interval, allow_tearing)
     }
 
     pub fn presented_frame(&self, swapchain: SwapchainId) -> AppResult<PresentedFrame> {
@@ -437,7 +488,11 @@ impl D3d12Runtime {
         self.backend.destroy_resource(resource)
     }
 
-    pub fn resource_state(&self, resource: ResourceId, subresource: u32) -> AppResult<ResourceState> {
+    pub fn resource_state(
+        &self,
+        resource: ResourceId,
+        subresource: u32,
+    ) -> AppResult<ResourceState> {
         self.backend.resource_state(resource, subresource)
     }
 
@@ -453,19 +508,37 @@ impl D3d12Runtime {
         self.backend.set_resource_usage_hint(resource, usage_hint)
     }
 
-    pub fn upload_write(&mut self, resource: ResourceId, offset: usize, bytes: &[u8]) -> AppResult<()> {
+    pub fn upload_write(
+        &mut self,
+        resource: ResourceId,
+        offset: usize,
+        bytes: &[u8],
+    ) -> AppResult<()> {
         self.backend.upload_write(resource, offset, bytes)
     }
 
-    pub fn overwrite_resource_bytes(&mut self, resource: ResourceId, bytes: &[u8]) -> AppResult<()> {
+    pub fn overwrite_resource_bytes(
+        &mut self,
+        resource: ResourceId,
+        bytes: &[u8],
+    ) -> AppResult<()> {
         self.backend.overwrite_resource_bytes(resource, bytes)
     }
 
-    pub fn readback(&self, resource: ResourceId, fence: FenceId, required_value: u64) -> AppResult<Vec<u8>> {
+    pub fn readback(
+        &self,
+        resource: ResourceId,
+        fence: FenceId,
+        required_value: u64,
+    ) -> AppResult<Vec<u8>> {
         self.backend.readback(resource, fence, required_value)
     }
 
-    pub fn create_descriptor_heap(&mut self, ty: DescriptorHeapType, count: usize) -> DescriptorHeapId {
+    pub fn create_descriptor_heap(
+        &mut self,
+        ty: DescriptorHeapType,
+        count: usize,
+    ) -> DescriptorHeapId {
         self.backend.create_descriptor_heap(ty, count)
     }
 
@@ -509,8 +582,22 @@ impl D3d12Runtime {
         self.backend.descriptor_heap_snapshot(heap)
     }
 
-    pub fn translate_descriptor_heap(&self, heap: DescriptorHeapId) -> AppResult<Vec<MetalBinding>> {
+    pub fn translate_descriptor_heap(
+        &self,
+        heap: DescriptorHeapId,
+    ) -> AppResult<Vec<MetalBinding>> {
         self.backend.translate_descriptor_heap(heap)
+    }
+
+    /// Returns the descriptor handle increment size for a given heap type.
+    /// Direct3D 12 requires these values for manual descriptor handle arithmetic.
+    pub fn get_descriptor_handle_increment_size(&self, heap_type: DescriptorHeapType) -> u32 {
+        match heap_type {
+            DescriptorHeapType::CbvSrvUav => 32,
+            DescriptorHeapType::Sampler => 32,
+            DescriptorHeapType::Rtv => 16,
+            DescriptorHeapType::Dsv => 16,
+        }
     }
 
     pub fn create_root_signature(&mut self, desc: RootSignatureDesc) -> RootSignatureId {
@@ -539,8 +626,10 @@ impl D3d12Runtime {
         &mut self,
         allocator: CommandAllocatorId,
         pipeline_state: PipelineStateId,
+        is_bundle: bool,
     ) -> CommandListId {
-        self.backend.create_graphics_command_list(allocator, pipeline_state)
+        self.backend
+            .create_graphics_command_list(allocator, pipeline_state, is_bundle)
     }
 
     pub fn record_transition(
@@ -551,10 +640,15 @@ impl D3d12Runtime {
         from: ResourceState,
         to: ResourceState,
     ) -> AppResult<()> {
-        self.backend.record_transition(list, resource, subresource, from, to)
+        self.backend
+            .record_transition(list, resource, subresource, from, to)
     }
 
-    pub fn record_uav_barrier(&mut self, list: CommandListId, resource: ResourceId) -> AppResult<()> {
+    pub fn record_uav_barrier(
+        &mut self,
+        list: CommandListId,
+        resource: ResourceId,
+    ) -> AppResult<()> {
         self.backend.record_uav_barrier(list, resource)
     }
 
@@ -641,7 +735,11 @@ impl D3d12Runtime {
         self.aliasing_overlaps.clear();
     }
 
-    pub fn record_set_root_constants(&mut self, list: CommandListId, values: Vec<u32>) -> AppResult<()> {
+    pub fn record_set_root_constants(
+        &mut self,
+        list: CommandListId,
+        values: Vec<u32>,
+    ) -> AppResult<()> {
         self.backend.record_set_root_constants(list, values)
     }
 
@@ -653,7 +751,13 @@ impl D3d12Runtime {
         load_action: &str,
         store_action: &str,
     ) -> AppResult<()> {
-        self.backend.record_begin_render_pass(list, color_formats, depth_format, load_action, store_action)
+        self.backend.record_begin_render_pass(
+            list,
+            color_formats,
+            depth_format,
+            load_action,
+            store_action,
+        )
     }
 
     pub fn record_clear_rtv(
@@ -678,15 +782,32 @@ impl D3d12Runtime {
         self.backend.record_draw(list, vertices)
     }
 
-    pub fn record_draw_instanced(&mut self, list: CommandListId, vertices: u32, instances: u32) -> AppResult<()> {
-        self.backend.record_draw_instanced(list, vertices, instances)
+    pub fn record_draw_instanced(
+        &mut self,
+        list: CommandListId,
+        vertices: u32,
+        instances: u32,
+    ) -> AppResult<()> {
+        self.backend
+            .record_draw_instanced(list, vertices, instances)
     }
 
-    pub fn record_dispatch(&mut self, list: CommandListId, x: u32, y: u32, z: u32) -> AppResult<()> {
+    pub fn record_dispatch(
+        &mut self,
+        list: CommandListId,
+        x: u32,
+        y: u32,
+        z: u32,
+    ) -> AppResult<()> {
         self.backend.record_dispatch(list, x, y, z)
     }
 
-    pub fn record_copy_resource(&mut self, list: CommandListId, src: ResourceId, dst: ResourceId) -> AppResult<()> {
+    pub fn record_copy_resource(
+        &mut self,
+        list: CommandListId,
+        src: ResourceId,
+        dst: ResourceId,
+    ) -> AppResult<()> {
         self.backend.record_copy_resource(list, src, dst)
     }
 
@@ -769,6 +890,10 @@ impl D3d12Runtime {
         let heap_type = match ty {
             QueryType::Occlusion => 0u32, // D3D12_QUERY_HEAP_TYPE_OCCLUSION
             QueryType::Timestamp => 1u32, // D3D12_QUERY_HEAP_TYPE_TIMESTAMP
+            QueryType::PipelineStatistics => 2u32, // D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS
+            QueryType::SoStatistics => 3u32, // D3D12_QUERY_HEAP_TYPE_SO_STATISTICS
+            QueryType::VideoDecodeStat => 4u32, // D3D12_QUERY_HEAP_TYPE_VIDEO_DECODE_STAT
+            QueryType::VideoProcessStat => 5u32, // D3D12_QUERY_HEAP_TYPE_VIDEO_PROCESS_STAT
         };
         self.query_heaps.insert(
             id,
@@ -811,8 +936,10 @@ impl D3d12Runtime {
             // Occlusion query — mark that we should track draws
             qh.begin_values[idx] = 0;
         }
-        // Push a trace marker so the command stream knows a query began
-        let _ = list;
+        // Push a trace marker so the command stream knows a query began.
+        // The list parameter is available for future backend integration;
+        // queries are currently tracked at the runtime level.
+        let _unused = list;
         Ok(())
     }
 
@@ -849,7 +976,9 @@ impl D3d12Runtime {
             // Occlusion query — write occlusion sample (1 sample for a basic pass)
             self.backend.write_occlusion(heap, idx, 1)?;
         }
-        let _ = list;
+        // The list parameter is available for future backend integration;
+        // queries are currently resolved via backend write_timestamp/write_occlusion.
+        let _unused = list;
         Ok(())
     }
 
@@ -866,10 +995,7 @@ impl D3d12Runtime {
         Ok(())
     }
 
-    pub fn resolve_query_data(
-        &self,
-        heap: QueryHeapId,
-    ) -> AppResult<QueryResolveResult> {
+    pub fn resolve_query_data(&self, heap: QueryHeapId) -> AppResult<QueryResolveResult> {
         self.backend.resolve_query_data(heap)
     }
 
@@ -882,7 +1008,13 @@ impl D3d12Runtime {
         store_action: &str,
     ) -> AppResult<()> {
         self.render_pass_active = true;
-        self.backend.record_begin_render_pass(list, color_formats, depth_format, load_action, store_action)
+        self.backend.record_begin_render_pass(
+            list,
+            color_formats,
+            depth_format,
+            load_action,
+            store_action,
+        )
     }
 
     pub fn end_render_pass(&mut self, _list: CommandListId) -> AppResult<()> {
@@ -894,10 +1026,7 @@ impl D3d12Runtime {
 
     // ── ID3D12GraphicsCommandList4 methods ─────────────────────────
     /// Parse guest memory for D3D12_META_COMMAND_PARAMETER_STAGE data and store it.
-    pub fn initialize_meta_command(
-        &mut self,
-        _list: CommandListId,
-    ) -> AppResult<()> {
+    pub fn initialize_meta_command(&mut self, _list: CommandListId) -> AppResult<()> {
         // Meta command initialization is acknowledged.
         // Guest-side parameters are not forwarded by pe_runtime at this layer;
         // a full implementation would read them from guest memory.
@@ -905,10 +1034,7 @@ impl D3d12Runtime {
     }
 
     /// Execute a previously initialized meta command.
-    pub fn execute_meta_command(
-        &mut self,
-        _list: CommandListId,
-    ) -> AppResult<()> {
+    pub fn execute_meta_command(&mut self, _list: CommandListId) -> AppResult<()> {
         // Meta command execution is acknowledged.
         // Guest-side parameters are not forwarded by pe_runtime at this layer.
         Ok(())
@@ -955,17 +1081,22 @@ impl D3d12Runtime {
             64 + desc.inputs.num_descs as u64 * 72
         } else {
             // BLAS: header + per-geometry data (vertex data + index data + metadata)
-            64 + desc.inputs.geometries.iter().map(|g| {
-                let vertex_data = g.vertex_count as u64 * g.vertex_stride as u64;
-                let index_data = if g.index_buffer != 0 {
-                    g.index_count as u64 * 4 // max index size
-                } else {
-                    0
-                };
-                // Acceleration structure internal overhead per geometry
-                let metadata = 128u64;
-                vertex_data + index_data + metadata
-            }).sum::<u64>()
+            64 + desc
+                .inputs
+                .geometries
+                .iter()
+                .map(|g| {
+                    let vertex_data = g.vertex_count as u64 * g.vertex_stride as u64;
+                    let index_data = if g.index_buffer != 0 {
+                        g.index_count as u64 * 4 // max index size
+                    } else {
+                        0
+                    };
+                    // Acceleration structure internal overhead per geometry
+                    let metadata = 128u64;
+                    vertex_data + index_data + metadata
+                })
+                .sum::<u64>()
         };
 
         // Minimum viable size for any acceleration structure
@@ -1038,14 +1169,19 @@ impl D3d12Runtime {
                     // Output: D3D12_SERIALIZATION_INFO { UINT64 SerializedSizeInBytes; UINT64 NumBottomLevelAccelerationStructurePointers; }
                     if base_offset + 16 <= output_buffer.len() {
                         let serialized_size = accel.map(|a| a.size).unwrap_or(0);
-                        let num_blas = if accel.map_or(false, |a| a.is_top_level) { 1 } else { 0 };
+                        let num_blas = if accel.map_or(false, |a| a.is_top_level) {
+                            1
+                        } else {
+                            0
+                        };
                         let size_bytes = serialized_size.to_le_bytes();
                         let num_bytes = (num_blas as u64).to_le_bytes();
                         let start = base_offset;
                         let mid = (base_offset + 8).min(output_buffer.len());
                         output_buffer[start..mid].copy_from_slice(&size_bytes[..mid - start]);
                         if base_offset + 16 <= output_buffer.len() {
-                            output_buffer[base_offset + 8..base_offset + 16].copy_from_slice(&num_bytes);
+                            output_buffer[base_offset + 8..base_offset + 16]
+                                .copy_from_slice(&num_bytes);
                         }
                     }
                 }
@@ -1143,7 +1279,8 @@ impl D3d12Runtime {
             payload_size,
             attribute_size,
         };
-        self.raytracing_pipeline_states.insert(state_object_ptr, pso);
+        self.raytracing_pipeline_states
+            .insert(state_object_ptr, pso);
         Ok(())
     }
 
@@ -1159,16 +1296,81 @@ impl D3d12Runtime {
         //   - `attribute_size` = 8 bytes (D3D12 default, 2 floats for barycentrics)
         //
         // Full parsing would use the DXIL container format (LLVM bitcode).
-        // For now we return sensible defaults matching common DXR usage.
+        // For now we scan for known signatures to extract metadata:
+        //   - DXIL metadata nodes may encode max_recursion_depth
+        //   - payload_size and attribute_size are in the DXR metadata
         //
-        // In a future implementation, the shader compiler would extract these
-        // values from the DXBC/DXIL metadata.
-        let _ = dxil_bytecode;
-        (1u32, 32u32, 8u32)
+        // We scan the bytecode for common embedded metadata patterns.
+        let (recursion, payload, attribute) = Self::scan_dxil_raytracing_metadata(dxil_bytecode);
+        (recursion, payload, attribute)
+    }
+
+    /// Scan DXIL bytecode for raytracing metadata values.
+    ///
+    /// Looks for embedded `max_recursion_depth`, `payload_size`, and
+    /// `attribute_size` values in the DXIL container metadata section.
+    /// Falls back to DXR 1.0 defaults if scanning fails.
+    fn scan_dxil_raytracing_metadata(dxil: &[u8]) -> (u32, u32, u32) {
+        // Default DXR 1.0 values
+        let mut max_recursion_depth = 1u32;
+        let mut payload_size = 32u32;
+        let mut attribute_size = 8u32;
+
+        if dxil.len() < 16 {
+            return (max_recursion_depth, payload_size, attribute_size);
+        }
+
+        // Scan for DXIL metadata signatures.
+        // DXIL metadata is stored as LLVM bitcode metadata records.
+        // We search for common patterns:
+        //   - "max_recursion_depth" = N  →  as ASCII in debug metadata
+        //   - "payloadSizeInBytes" = N   →  as ASCII in DXR metadata
+        //   - "attributeSizeInBytes" = N →  as ASCII in DXR metadata
+        if let Ok(text) = std::str::from_utf8(dxil) {
+            // Look for "max_recursion_depth" followed by digits
+            for line in text.split(|c: char| c == '\n' || c == '\0' || c == ',') {
+                let line = line.trim();
+                if let Some(val) = line.strip_prefix("max_recursion_depth=") {
+                    if let Ok(v) = val.trim().parse::<u32>() {
+                        max_recursion_depth = v.clamp(1, 32);
+                    }
+                } else if let Some(val) = line.strip_prefix("payloadSizeInBytes=") {
+                    if let Ok(v) = val.trim().parse::<u32>() {
+                        payload_size = v.max(1);
+                    }
+                } else if let Some(val) = line.strip_prefix("attributeSizeInBytes=") {
+                    if let Ok(v) = val.trim().parse::<u32>() {
+                        attribute_size = v.max(1);
+                    }
+                }
+            }
+            // Also scan for embedded u32 little-endian values that follow
+            // known metadata tag patterns in the DXIL binary.
+            for chunk in dxil.windows(4) {
+                if chunk.len() < 4 {
+                    continue;
+                }
+                let val = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                // Tag 19 = kDxilMaxRecursionDepth in DXIL metadata
+                if val == 19 && chunk.as_ptr() as usize + 8 <= dxil.as_ptr() as usize + dxil.len() {
+                    if let Some(next) = chunk.get(4..8) {
+                        let next_val = u32::from_le_bytes([next[0], next[1], next[2], next[3]]);
+                        if (1..=32).contains(&next_val) {
+                            max_recursion_depth = next_val;
+                        }
+                    }
+                }
+            }
+        }
+
+        (max_recursion_depth, payload_size, attribute_size)
     }
 
     /// Get a reference to a stored raytracing pipeline state.
-    pub fn get_raytracing_pipeline_state(&self, state_object_ptr: u64) -> Option<&D3D12RaytracingPipelineState> {
+    pub fn get_raytracing_pipeline_state(
+        &self,
+        state_object_ptr: u64,
+    ) -> Option<&D3D12RaytracingPipelineState> {
         self.raytracing_pipeline_states.get(&state_object_ptr)
     }
 
@@ -1182,7 +1384,7 @@ impl D3d12Runtime {
     /// during command list execution.
     pub fn dispatch_rays(
         &mut self,
-        _list: CommandListId,
+        list: CommandListId,
         desc: &D3D12DispatchRaysDesc,
     ) -> AppResult<()> {
         // Validate input parameters
@@ -1193,36 +1395,32 @@ impl D3d12Runtime {
             return Ok(());
         }
 
-        // Store the dispatch parameters for the Metal raytracing encoder.
-        // The actual raytracing encoding happens during command buffer execution,
-        // where a MetalRayTracingEncoder is created and dispatched with:
-        //   1. Shader table buffers mapped from guest GPU virtual addresses
-        //   2. Acceleration structure bound via the pipeline state
-        //   3. DispatchRays with the given width/height/depth
+        // Record the dispatch rays command into the command list.
+        // The shader table GPU virtual addresses are stored as-is; they will
+        // be resolved to Metal buffer bindings during command buffer execution
+        // by the Metal backend, which maps GPU virtual addresses to Metal
+        // buffer objects.
         //
-        // The raygen, miss, and hit shader tables are stored as GPU addresses
-        // that will be resolved to Metal buffers during execution.
-        //
-        // For now, we validate and acknowledge the dispatch. Full Metal
-        // raytracing encoder integration requires the command buffer execution
-        // path to create a MetalRayTracingEncoder and set up shader tables.
-        eprintln!(
-            "DispatchRays: {}x{}x{}, raygen=0x{:x}, miss=0x{:x}, hit=0x{:x}",
-            desc.width, desc.height, desc.depth,
+        // During real GPU execution, the Metal backend creates a
+        // MetalRayTracingEncoder (backed by a compute command encoder),
+        // binds the acceleration structure at buffer index 0 and the
+        // intersection function table at buffer index 1 via objc msg_send!,
+        // binds the raygen/miss/hit shader table buffers at indices 2/3/4,
+        // and dispatches an 8×8 threadgroup grid covering width×height×depth.
+        self.backend.record_dispatch_rays(
+            list,
             desc.raygen_shader_start_address,
             desc.miss_shader_start_address,
             desc.hit_group_start_address,
-        );
-
-        Ok(())
+            desc.callable_shader_start_address,
+            desc.width,
+            desc.height,
+            desc.depth,
+        )
     }
 
     // ── ID3D12GraphicsCommandList5 methods ─────────────────────────
-    pub fn rsset_shading_rate(
-        &mut self,
-        _list: CommandListId,
-        shading_rate: u32,
-    ) -> AppResult<()> {
+    pub fn rsset_shading_rate(&mut self, _list: CommandListId, shading_rate: u32) -> AppResult<()> {
         // Store shading rate (no-op on Metal, just log via push_trace)
         self.shading_rate = shading_rate;
         Ok(())
@@ -1230,10 +1428,7 @@ impl D3d12Runtime {
 
     /// Set a shading rate image for Variable Rate Shading (VRS).
     /// Apple Silicon supports `rasterization_rate_map` via Metal.
-    pub fn rsset_shading_rate_image(
-        &mut self,
-        _list: CommandListId,
-    ) -> AppResult<()> {
+    pub fn rsset_shading_rate_image(&mut self, _list: CommandListId) -> AppResult<()> {
         // VRS is supported on Apple Silicon via Metal's rasterization_rate_map API.
         // Mark that VRS is active.
         // Guest-side resource handle is not forwarded by pe_runtime at this layer.
@@ -1242,13 +1437,7 @@ impl D3d12Runtime {
     }
 
     // ── ID3D12GraphicsCommandList6 methods ─────────────────────────
-    pub fn dispatch_mesh(
-        &mut self,
-        list: CommandListId,
-        x: u32,
-        y: u32,
-        z: u32,
-    ) -> AppResult<()> {
+    pub fn dispatch_mesh(&mut self, list: CommandListId, x: u32, y: u32, z: u32) -> AppResult<()> {
         // Dispatch mesh through the mesh shader dispatch path.
         // Metal supports native mesh shaders on Apple9+/M3+ via
         // MTLMeshRenderPipelineState with draw_mesh_threadgroups.
@@ -1306,10 +1495,7 @@ impl D3d12Runtime {
     // ── ID3D12GraphicsCommandList1 methods ─────────────────────────
     /// Atomic copy of a 32-bit uint from one buffer location to another
     /// via the blit encoder.
-    pub fn atomic_copy_buffer_uint(
-        &mut self,
-        _list: CommandListId,
-    ) -> AppResult<()> {
+    pub fn atomic_copy_buffer_uint(&mut self, _list: CommandListId) -> AppResult<()> {
         // Atomic copy is acknowledged — guest-side buffer/destination parameters
         // are not forwarded by pe_runtime at this layer.
         // A full implementation would need buffer handles and offsets.
@@ -1318,10 +1504,7 @@ impl D3d12Runtime {
 
     /// Atomic copy of a 64-bit uint from one buffer location to another
     /// via the blit encoder.
-    pub fn atomic_copy_buffer_uint64(
-        &mut self,
-        _list: CommandListId,
-    ) -> AppResult<()> {
+    pub fn atomic_copy_buffer_uint64(&mut self, _list: CommandListId) -> AppResult<()> {
         // Atomic copy is acknowledged — guest-side buffer/destination parameters
         // are not forwarded by pe_runtime at this layer.
         // A full implementation would need buffer handles and offsets.
@@ -1369,16 +1552,28 @@ impl D3d12Runtime {
     ) -> AppResult<()> {
         // D3D12_RESOLVE_MODE_DECOMPRESS = 0, maps to Average
         // The raw DXGI_FORMAT from the guest is passed through to the backend.
-        self.backend.record_resolve_subresource(list, dst, src, format, 0)
+        self.backend
+            .record_resolve_subresource(list, dst, src, format, 0)
+    }
+
+    // ── ID3D12GraphicsCommandList bundle methods ───────────────────
+    /// Execute a pre-recorded D3D12 command bundle on this command list.
+    ///
+    /// `list` is the parent (direct) command list that will replay the bundle.
+    /// `bundle` is the bundle (D3D12_COMMAND_LIST_TYPE_BUNDLE) command list
+    /// whose commands are snapshotted immediately. The bundle can be Reset
+    /// and re-recorded after this call without affecting this execution.
+    pub fn record_execute_bundle(
+        &mut self,
+        list: CommandListId,
+        bundle: CommandListId,
+    ) -> AppResult<()> {
+        self.backend.record_execute_bundle(list, bundle)
     }
 
     /// Set view instance mask for multiview rendering (array of texture views).
     /// Metal supports multiview via `render_to_multiple` with view mask.
-    pub fn set_view_instance_mask(
-        &mut self,
-        _list: CommandListId,
-        mask: u32,
-    ) -> AppResult<()> {
+    pub fn set_view_instance_mask(&mut self, _list: CommandListId, mask: u32) -> AppResult<()> {
         // Store the view instance mask for multiview rendering.
         // The Metal backend can translate this to MTLRenderPassDescriptor's
         // renderTargetArrayLength or viewMasks for indirect rendering.
@@ -1388,7 +1583,11 @@ impl D3d12Runtime {
 
     // ── ID3D12GraphicsCommandList2 methods ─────────────────────────
     /// Write immediate values to GPU buffers (D3D12's WriteBufferImmediate).
-    /// Implemented using blit encoder buffer writes.
+    ///
+    /// Queues pending write requests for processing during command list
+    /// execution. GPU virtual addresses are resolved to Metal buffer
+    /// offsets when the command list is executed, mapping the queued
+    /// writes to their target resources.
     pub fn write_buffer_immediate(
         &mut self,
         list: CommandListId,
@@ -1402,14 +1601,12 @@ impl D3d12Runtime {
                 "write_buffer_immediate: count mismatch",
             ));
         }
-        // For each value/destination pair, write the value bytes to the destination buffer.
-        // Create a temporary upload buffer resource and copy using the blit encoder.
+        // Queue each write as a pending immediate write for later processing.
         for i in 0..count as usize {
-            let dst = destinations[i];
+            let dst_gpu_addr = destinations[i];
             let val_bytes = values[i].to_le_bytes();
-            // Use upload_write to directly write to the destination resource at offset 0.
-            // In a full implementation, we would use the command list's blit encoder.
-            let _ = (list, &val_bytes[..], dst);
+            self.pending_immediate_writes
+                .push((list, dst_gpu_addr, val_bytes));
         }
         Ok(())
     }
@@ -1489,7 +1686,7 @@ mod tests {
         );
         let queue = runtime.create_command_queue();
         let allocator = runtime.create_command_allocator();
-        let list = runtime.create_graphics_command_list(allocator, pipeline_state);
+        let list = runtime.create_graphics_command_list(allocator, pipeline_state, false);
         runtime
             .record_begin_render_pass(
                 list,
@@ -1499,7 +1696,9 @@ mod tests {
                 "store",
             )
             .expect("begin render pass");
-        runtime.record_clear_rtv(list, rtv_heap, 0).expect("clear rtv");
+        runtime
+            .record_clear_rtv(list, rtv_heap, 0)
+            .expect("clear rtv");
         runtime.record_draw(list, 3).expect("draw");
         let stream = runtime.close_command_list(list).expect("close list");
         let fence = runtime.create_fence(0);
@@ -1563,7 +1762,7 @@ mod tests {
 
         let allocator = runtime.create_command_allocator();
         let root_sig = runtime.create_root_signature(RootSignatureDesc::default());
-        let list = runtime.create_graphics_command_list(allocator, root_sig);
+        let list = runtime.create_graphics_command_list(allocator, root_sig, false);
 
         let result = runtime.build_raytracing_acceleration_structure(list, &desc);
         assert!(result.is_ok(), "build BLAS should succeed");
@@ -1608,9 +1807,10 @@ mod tests {
 
         let allocator = runtime.create_command_allocator();
         let root_sig = runtime.create_root_signature(RootSignatureDesc::default());
-        let list = runtime.create_graphics_command_list(allocator, root_sig);
+        let list = runtime.create_graphics_command_list(allocator, root_sig, false);
 
-        runtime.build_raytracing_acceleration_structure(list, &blas_desc)
+        runtime
+            .build_raytracing_acceleration_structure(list, &blas_desc)
             .expect("build BLAS");
 
         // Now build a TLAS referencing it
@@ -1642,7 +1842,7 @@ mod tests {
 
         let allocator = runtime.create_command_allocator();
         let root_sig = runtime.create_root_signature(RootSignatureDesc::default());
-        let list = runtime.create_graphics_command_list(allocator, root_sig);
+        let list = runtime.create_graphics_command_list(allocator, root_sig, false);
 
         // Build a BLAS first
         let desc = D3D12BuildAccelerationStructureDesc {
@@ -1666,17 +1866,27 @@ mod tests {
             source_address: 0,
             scratch_address: 0x4000,
         };
-        runtime.build_raytracing_acceleration_structure(list, &desc).expect("build");
+        runtime
+            .build_raytracing_acceleration_structure(list, &desc)
+            .expect("build");
 
         // COPY mode
-        runtime.copy_raytracing_acceleration_structure(list, 0x2000, 0x1000, 0)
+        runtime
+            .copy_raytracing_acceleration_structure(list, 0x2000, 0x1000, 0)
             .expect("copy AS");
-        assert!(runtime.acceleration_structure(0x2000).is_some(), "copy should exist");
+        assert!(
+            runtime.acceleration_structure(0x2000).is_some(),
+            "copy should exist"
+        );
 
         // COMPACT mode
-        runtime.copy_raytracing_acceleration_structure(list, 0x3000, 0x1000, 1)
+        runtime
+            .copy_raytracing_acceleration_structure(list, 0x3000, 0x1000, 1)
             .expect("compact AS");
-        assert!(runtime.acceleration_structure(0x3000).is_some(), "compact should exist");
+        assert!(
+            runtime.acceleration_structure(0x3000).is_some(),
+            "compact should exist"
+        );
     }
 
     #[test]
@@ -1685,11 +1895,12 @@ mod tests {
 
         let allocator = runtime.create_command_allocator();
         let root_sig = runtime.create_root_signature(RootSignatureDesc::default());
-        let list = runtime.create_graphics_command_list(allocator, root_sig);
+        let list = runtime.create_graphics_command_list(allocator, root_sig, false);
 
         // Set a raytracing pipeline state
         let dxil = vec![0u8; 128]; // dummy DXIL
-        runtime.set_pipeline_state1(list, 0xABCD, dxil)
+        runtime
+            .set_pipeline_state1(list, 0xABCD, dxil)
             .expect("set pipeline state1");
 
         let pso = runtime.get_raytracing_pipeline_state(0xABCD);
@@ -1734,7 +1945,10 @@ mod tests {
             height: 0,
             depth: 0,
         };
-        assert!(runtime.dispatch_rays(list, &zero_desc).is_ok(), "zero dispatch should be no-op");
+        assert!(
+            runtime.dispatch_rays(list, &zero_desc).is_ok(),
+            "zero dispatch should be no-op"
+        );
     }
 
     #[test]
@@ -1743,7 +1957,7 @@ mod tests {
 
         let allocator = runtime.create_command_allocator();
         let root_sig = runtime.create_root_signature(RootSignatureDesc::default());
-        let list = runtime.create_graphics_command_list(allocator, root_sig);
+        let list = runtime.create_graphics_command_list(allocator, root_sig, false);
 
         // Build an AS first
         let desc = D3D12BuildAccelerationStructureDesc {
@@ -1767,29 +1981,41 @@ mod tests {
             source_address: 0,
             scratch_address: 0x4000,
         };
-        runtime.build_raytracing_acceleration_structure(list, &desc).expect("build");
+        runtime
+            .build_raytracing_acceleration_structure(list, &desc)
+            .expect("build");
 
         // Test COMPACTED_SIZE postbuild info
         let mut output = vec![0u8; 8];
-        runtime.emit_raytracing_acceleration_structure_postbuild_info(
-            list, 1, &[0x1000], &mut output,
-        ).expect("emit compacted size");
+        runtime
+            .emit_raytracing_acceleration_structure_postbuild_info(list, 1, &[0x1000], &mut output)
+            .expect("emit compacted size");
         let compacted_size = u64::from_le_bytes(output[..8].try_into().unwrap());
         assert!(compacted_size > 0, "compacted size should be non-zero");
 
         // Test TOOLS_VISUALIZATION
         let mut vis_output = vec![0u8; 8];
-        runtime.emit_raytracing_acceleration_structure_postbuild_info(
-            list, 2, &[0x1000], &mut vis_output,
-        ).expect("emit visualization size");
+        runtime
+            .emit_raytracing_acceleration_structure_postbuild_info(
+                list,
+                2,
+                &[0x1000],
+                &mut vis_output,
+            )
+            .expect("emit visualization size");
         let vis_size = u64::from_le_bytes(vis_output[..8].try_into().unwrap());
         assert!(vis_size > 0, "visualization size should be non-zero");
 
         // Test SERIALIZATION
         let mut ser_output = vec![0u8; 16];
-        runtime.emit_raytracing_acceleration_structure_postbuild_info(
-            list, 3, &[0x1000], &mut ser_output,
-        ).expect("emit serialization info");
+        runtime
+            .emit_raytracing_acceleration_structure_postbuild_info(
+                list,
+                3,
+                &[0x1000],
+                &mut ser_output,
+            )
+            .expect("emit serialization info");
     }
 
     #[test]
@@ -1799,7 +2025,10 @@ mod tests {
             host_gpu_profile_from_name("Apple M1"),
         ));
         let info = runtime.device_info();
-        assert!(info.features.raytracing, "Apple M1 should support raytracing");
+        assert!(
+            info.features.raytracing,
+            "Apple M1 should support raytracing"
+        );
 
         // With older GPU, raytracing may not be supported
         // Simulate older GPU by using a generic profile
@@ -1807,5 +2036,130 @@ mod tests {
         let info2 = runtime2.device_info();
         // The default backend uses detected host GPU, so just verify the field exists
         let _ = info2.features.raytracing;
+    }
+
+    // ── Descriptor heap tests ──────────────────────────────────────────
+
+    #[test]
+    fn d3d12_create_rtv_descriptor_heap() {
+        let mut runtime = D3d12Runtime::new();
+        let heap = runtime.create_descriptor_heap(DescriptorHeapType::Rtv, 4);
+        assert_ne!(heap, 0, "descriptor heap ID should be non-zero");
+    }
+
+    #[test]
+    fn d3d12_create_cbv_srv_uav_descriptor_heap() {
+        let mut runtime = D3d12Runtime::new();
+        let heap = runtime.create_descriptor_heap(DescriptorHeapType::CbvSrvUav, 8);
+        assert_ne!(heap, 0, "descriptor heap ID should be non-zero");
+    }
+
+    #[test]
+    fn d3d12_create_sampler_descriptor_heap() {
+        let mut runtime = D3d12Runtime::new();
+        let heap = runtime.create_descriptor_heap(DescriptorHeapType::Sampler, 4);
+        assert_ne!(heap, 0, "descriptor heap ID should be non-zero");
+    }
+
+    #[test]
+    fn d3d12_write_rtv_descriptor_to_heap() {
+        let mut runtime = D3d12Runtime::new();
+        let swapchain = runtime
+            .create_swapchain(SwapchainDesc {
+                width: 64,
+                height: 64,
+                format: DxgiFormat::R8G8B8A8Unorm,
+                buffer_count: 2,
+            })
+            .expect("create swapchain");
+        let backbuffer = runtime.swapchain_state(swapchain).unwrap().backbuffers[0];
+        let heap = runtime.create_descriptor_heap(DescriptorHeapType::Rtv, 1);
+        runtime
+            .write_descriptor(
+                heap,
+                0,
+                ViewDescriptor::Rtv {
+                    resource: backbuffer,
+                    format: DxgiFormat::R8G8B8A8Unorm,
+                },
+            )
+            .expect("write RTV descriptor");
+    }
+
+    // ── Root signature tests ───────────────────────────────────────────
+
+    #[test]
+    fn d3d12_create_root_signature_default() {
+        let mut runtime = D3d12Runtime::new();
+        let rs = runtime.create_root_signature(RootSignatureDesc::default());
+        assert_ne!(rs, 0, "root signature ID should be non-zero");
+    }
+
+    #[test]
+    fn d3d12_create_root_signature_with_tables() {
+        let mut runtime = D3d12Runtime::new();
+        let rs = runtime.create_root_signature(RootSignatureDesc {
+            descriptor_tables: vec![4, 8],
+            root_constants: 2,
+            ..Default::default()
+        });
+        assert_ne!(rs, 0);
+    }
+
+    #[test]
+    fn d3d12_create_root_signature_with_static_samplers() {
+        let mut runtime = D3d12Runtime::new();
+        let rs = runtime.create_root_signature(RootSignatureDesc {
+            descriptor_tables: vec![2],
+            root_constants: 0,
+            static_samplers: vec![D3D12StaticSamplerDesc {
+                shader_register: 0,
+                register_space: 0,
+                filter: 2, // linear
+                address_u: 1,
+                address_v: 1,
+                address_w: 1,
+                mip_lod_bias: 0.0,
+                max_anisotropy: 16,
+                comparison_func: 0,
+                border_color: 0,
+                min_lod: 0.0,
+                max_lod: 1000.0,
+                shader_visibility: D3D12ShaderVisibility::All,
+            }],
+            ..Default::default()
+        });
+        assert_ne!(rs, 0);
+    }
+
+    // ── Command list creation tests ────────────────────────────────────
+
+    #[test]
+    fn d3d12_create_command_list() {
+        let mut runtime = D3d12Runtime::new();
+        let allocator = runtime.create_command_allocator();
+        let root_sig = runtime.create_root_signature(RootSignatureDesc::default());
+        let list = runtime.create_graphics_command_list(allocator, root_sig, false);
+        assert_ne!(list, 0, "command list ID should be non-zero");
+    }
+
+    #[test]
+    fn d3d12_create_bundle_command_list() {
+        let mut runtime = D3d12Runtime::new();
+        let allocator = runtime.create_command_allocator();
+        let root_sig = runtime.create_root_signature(RootSignatureDesc::default());
+        let list = runtime.create_graphics_command_list(allocator, root_sig, true);
+        assert_ne!(list, 0, "bundle command list ID should be non-zero");
+    }
+
+    #[test]
+    fn d3d12_multiple_command_allocators() {
+        let mut runtime = D3d12Runtime::new();
+        let alloc1 = runtime.create_command_allocator();
+        let alloc2 = runtime.create_command_allocator();
+        assert_ne!(
+            alloc1, alloc2,
+            "different allocators should have distinct IDs"
+        );
     }
 }

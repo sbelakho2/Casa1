@@ -148,6 +148,36 @@ pub struct ArgumentBinding {
     pub binding_index: u32,
 }
 
+// ---------------------------------------------------------------------------
+// Shared instruction representation for the DXIL→MSL pipeline
+// ---------------------------------------------------------------------------
+
+/// A single translated DXIL instruction, ready to be inlined into an
+/// MSL entry point body by [`MslShaderGenerator`].
+///
+/// This struct bridges the gap between `dxil_opcode_to_msl()` (which
+/// produces raw MSL statement strings) and the entry point generators
+/// in `shader_compiler.rs` that need to consume those statements.
+#[derive(Debug, Clone, Default)]
+pub struct TranslatedInstruction {
+    /// The MSL statement(s) for this instruction (e.g. `_t0 = _t1 + _t2;`).
+    pub msl_body: String,
+    /// Destination register / temporary variable name.
+    pub dst: String,
+    /// Source operand references (register names or immediates).
+    pub operands: Vec<String>,
+    /// True if this instruction is a barrier/sync operation.
+    pub is_barrier: bool,
+    /// Barrier flags for threadgroup/device memory (empty if not a barrier).
+    pub barrier_flags: Vec<String>,
+    /// True if this instruction accesses a UAV (Unordered Access View).
+    pub is_uav_access: bool,
+    /// Address space hint: "device", "threadgroup", "constant", or "".
+    pub address_space: String,
+    /// True if this instruction allocates or accesses threadgroup (groupshared) memory.
+    pub is_threadgroup_mem: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ArgumentBufferLayout {
     pub table_index: u32,
@@ -460,8 +490,11 @@ impl OfflineCompiler {
         let mut found = Vec::new();
         for entry in WalkDir::new(root) {
             let entry = entry.map_err(|error| {
-                AppError::new(ReasonCode::RcIo, format!("failed to walk {}", root.display()))
-                    .with_hint(error.to_string())
+                AppError::new(
+                    ReasonCode::RcIo,
+                    format!("failed to walk {}", root.display()),
+                )
+                .with_hint(error.to_string())
             })?;
             if entry.file_type().is_file()
                 && entry.path().extension().is_some_and(|ext| ext == "dxil")
@@ -481,11 +514,7 @@ impl OfflineCompiler {
 
     /// Produce an offline compilation plan.
     pub fn schedule(&self, cpu_cap_percent: u8, max_threads: usize) -> OfflineCompilationPlan {
-        let mut scheduled_keys = self
-            .runtime_shader_keys
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>();
+        let mut scheduled_keys = self.runtime_shader_keys.iter().cloned().collect::<Vec<_>>();
         scheduled_keys.sort();
         OfflineCompilationPlan {
             total_shaders: self.discovered_files.len() + scheduled_keys.len(),
@@ -955,7 +984,11 @@ impl<'a> LlvmBitcodeReader<'a> {
             if magic == LLVM_WRAPPER_MAGIC {
                 // Wrapper format: magic(4) + size(4) + BC magic(4) + ...
                 self.pos += 4;
-                let _wrapper_size = self.read_u32(); // big-endian size
+                let wrapper_size = self.read_u32(); // big-endian size of the wrapped bitcode
+                // Validate there's at least enough data for the wrapped bitcode
+                if self.remaining() < wrapper_size as usize {
+                    return false;
+                }
                 return true;
             }
         }
@@ -974,6 +1007,11 @@ impl<'a> LlvmBitcodeReader<'a> {
             ]);
             if magic == LLVM_BC_MAGIC {
                 self.pos += 4;
+                // After consuming the BC magic, there must be at least a
+                // block header (4 bytes) to be a valid bitcode stream.
+                if self.remaining() < 4 {
+                    return false;
+                }
                 return true;
             }
         }
@@ -1176,10 +1214,7 @@ impl<'a> LlvmBitcodeReader<'a> {
                             // The operands encode the abbreviation: each operand is
                             // (kind << 3) | value where kind is the AbbrevOp type
                             let abbrev = self.parse_abbrev_from_operands(&record.operands)?;
-                            let abbrevs = self
-                                .block_abbrevs
-                                .entry(current_block_id)
-                                .or_default();
+                            let abbrevs = self.block_abbrevs.entry(current_block_id).or_default();
                             abbrevs.push(abbrev);
                         }
                         BLOCKINFO_CODE_UNABBREV => {
@@ -1216,7 +1251,7 @@ impl<'a> LlvmBitcodeReader<'a> {
                     return Err(AppError::new(
                         ReasonCode::RcDxilInvalid,
                         format!("unknown abbreviation operand kind {}", kind),
-                    ))
+                    ));
                 }
             };
             operands.push(abbrev_op);
@@ -1251,7 +1286,10 @@ impl<'a> LlvmBitcodeReader<'a> {
                                 .operands
                                 .iter()
                                 .map(|&c| {
-                                    if c < 128 && char::from_u32(c).map_or(false, |ch| ch.is_ascii_alphanumeric()) {
+                                    if c < 128
+                                        && char::from_u32(c)
+                                            .map_or(false, |ch| ch.is_ascii_alphanumeric())
+                                    {
                                         c as u8 as char
                                     } else {
                                         '?'
@@ -1270,7 +1308,8 @@ impl<'a> LlvmBitcodeReader<'a> {
                         }
                         TYPE_CODE_POINTER => {
                             // Pointer: operands[0] = pointee type index
-                            let pointee_idx = record.operands.first().copied().unwrap_or(0) as usize;
+                            let pointee_idx =
+                                record.operands.first().copied().unwrap_or(0) as usize;
                             if pointee_idx < types.len() {
                                 format!("{}*", types[pointee_idx])
                             } else {
@@ -1307,7 +1346,8 @@ impl<'a> LlvmBitcodeReader<'a> {
                                     let name: String = record.operands[1..]
                                         .iter()
                                         .filter_map(|&c| {
-                                            if (c as u8).is_ascii_alphanumeric() || c as u8 == b'_' {
+                                            if (c as u8).is_ascii_alphanumeric() || c as u8 == b'_'
+                                            {
                                                 Some(c as u8 as char)
                                             } else {
                                                 None
@@ -1324,9 +1364,7 @@ impl<'a> LlvmBitcodeReader<'a> {
                                 }
                             }
                         }
-                        TYPE_CODE_FUNCTION_OLD | TYPE_CODE_FUNCTION_NEW => {
-                            "function".to_string()
-                        }
+                        TYPE_CODE_FUNCTION_OLD | TYPE_CODE_FUNCTION_NEW => "function".to_string(),
                         _ => format!("type_{}", record.id),
                     };
                     types.push(type_name);
@@ -1364,8 +1402,7 @@ impl<'a> LlvmBitcodeReader<'a> {
             if let Some(sub_block_id) = self.enter_block() {
                 match sub_block_id {
                     BLOCKID_FUNCTION => {
-                        let (count, _name, parsed_func) =
-                            parse_function_block(self)?;
+                        let (count, _name, parsed_func) = parse_function_block(self)?;
                         instruction_count += count;
                         if let Some(func) = parsed_func {
                             functions.push(func);
@@ -1438,7 +1475,7 @@ struct DxilBasicBlock {
 
 /// A parsed DXIL function with named basic blocks.
 #[derive(Debug, Clone)]
-struct DxilFunction {
+pub struct DxilFunction {
     name: String,
     basic_blocks: Vec<DxilBasicBlock>,
     num_instructions: u32,
@@ -1517,10 +1554,11 @@ pub fn dxil_opcode_to_msl(
 
     match opcode {
         // --- Arithmetic operations (LLVM binary ops) ---
-        0 | 1 => binop("+"),   // add / fadd
-        2 | 3 => binop("-"),   // sub / fsub
-        4 | 5 => binop("*"),   // mul / fmul
-        6 | 7 | 8 => {         // udiv / sdiv / fdiv
+        0 | 1 => binop("+"), // add / fadd
+        2 | 3 => binop("-"), // sub / fsub
+        4 | 5 => binop("*"), // mul / fmul
+        6 | 7 | 8 => {
+            // udiv / sdiv / fdiv
             if is_float {
                 binop("/")
             } else if is_signed {
@@ -1529,57 +1567,58 @@ pub fn dxil_opcode_to_msl(
                 binop("/")
             }
         }
-        9 | 10 => {           // urem / srem
-            if is_signed {
-                binop("%")
-            } else {
-                binop("%")
-            }
+        9 | 10 => {
+            // urem / srem
+            if is_signed { binop("%") } else { binop("%") }
         }
-        11 => binop("&"),     // and
-        12 => binop("|"),     // or
-        13 => binop("^"),     // xor
-        14 => binop("<<"),    // shl
-        15 => binop(">>"),    // lshr (logical shift right)
-        16 => binop(">>"),    // ashr (arithmetic shift right — same for now)
+        11 => binop("&"),  // and
+        12 => binop("|"),  // or
+        13 => binop("^"),  // xor
+        14 => binop("<<"), // shl
+        15 => binop(">>"), // lshr (logical shift right)
+        16 => binop(">>"), // ashr — arithmetic shift right (MSL uses type‑based >> semantics;
+        //        signed → arithmetic, unsigned → logical)
         17 => fcall("fma", 3), // fma
 
         // --- Comparison operations ---
         18..=29 => {
             let cmp_op = match opcode {
-                18 => "==",  // icmp_eq
-                19 => "!=",  // icmp_ne
-                20 => ">",   // icmp_ugt
-                21 => ">=",  // icmp_uge
-                22 => "<",   // icmp_ult
-                23 => "<=",  // icmp_ule
-                24 => ">",   // icmp_sgt
-                25 => ">=",  // icmp_sge
-                26 => "<",   // icmp_slt
-                27 => "<=",  // icmp_sle
-                28 => "==",  // fcmp_oeq
-                29 => "!=",  // fcmp_one
+                18 => "==", // icmp_eq
+                19 => "!=", // icmp_ne
+                20 => ">",  // icmp_ugt
+                21 => ">=", // icmp_uge
+                22 => "<",  // icmp_ult
+                23 => "<=", // icmp_ule
+                24 => ">",  // icmp_sgt
+                25 => ">=", // icmp_sge
+                26 => "<",  // icmp_slt
+                27 => "<=", // icmp_sle
+                28 => "==", // fcmp_oeq
+                29 => "!=", // fcmp_one
                 _ => "==",
             };
             binop(cmp_op)
         }
 
         // --- Conversion operations ---
-        30 => { // bitcast
+        30 => {
+            // bitcast
             if args.len() >= 1 {
                 format!("{} = as_type<typeof({})>({});", dst, args[0], args[0])
             } else {
                 format!("{} = 0;", dst)
             }
         }
-        31 => { // ptrtoint
+        31 => {
+            // ptrtoint
             if args.len() >= 1 {
                 format!("{} = reinterpret_cast<uintptr_t>({});", dst, args[0])
             } else {
                 format!("{} = 0;", dst)
             }
         }
-        32 => { // inttoptr
+        32 => {
+            // inttoptr
             if args.len() >= 1 {
                 format!("{} = reinterpret_cast<void*>({});", dst, args[0])
             } else {
@@ -1587,7 +1626,8 @@ pub fn dxil_opcode_to_msl(
             }
         }
         33 => unop("int32_t"), // zext (zero-extend)
-        34 => { // sext (sign-extend)
+        34 => {
+            // sext (sign-extend)
             if is_signed && args.len() >= 1 {
                 format!("{} = int64_t({});", dst, args[0])
             } else if args.len() >= 1 {
@@ -1596,7 +1636,8 @@ pub fn dxil_opcode_to_msl(
                 format!("{} = 0;", dst)
             }
         }
-        35 => { // trunc
+        35 => {
+            // trunc
             if args.len() >= 1 {
                 format!("{} = int32_t({});", dst, args[0])
             } else {
@@ -1605,14 +1646,16 @@ pub fn dxil_opcode_to_msl(
         }
 
         // --- Control flow ---
-        36 => { // br (unconditional)
+        36 => {
+            // br (unconditional)
             if args.len() >= 1 {
                 format!("goto {};", args[0])
             } else {
                 String::from("// branch (no target)")
             }
         }
-        37 => { // br (conditional)
+        37 => {
+            // br (conditional)
             if args.len() >= 3 {
                 format!(
                     "if ({}) {{ goto {}; }} else {{ goto {}; }}",
@@ -1622,28 +1665,32 @@ pub fn dxil_opcode_to_msl(
                 String::from("// conditional branch (incomplete)")
             }
         }
-        38 => { // switch
+        38 => {
+            // switch
             if args.len() >= 1 {
                 format!("// switch({}) handled above", args[0])
             } else {
                 String::from("// switch")
             }
         }
-        39 => { // phi
+        39 => {
+            // phi
             if args.len() >= 2 {
                 format!("{} = {}; // phi merged", dst, args[0])
             } else {
                 format!("{} = 0; // phi empty", dst)
             }
         }
-        40 => { // ret
+        40 => {
+            // ret
             if args.is_empty() {
                 "return;".to_string()
             } else {
                 format!("return {};", args[0])
             }
         }
-        41 => { // call
+        41 => {
+            // call
             // args[0] = callee index, args[1..] = call arguments
             if args.len() >= 1 {
                 format!("{} = _fn_{}({});", dst, args[0], args[1..].join(", "))
@@ -1653,61 +1700,75 @@ pub fn dxil_opcode_to_msl(
         }
 
         // --- Memory operations ---
-        42 => { // alloca
+        42 => {
+            // alloca
             format!("// {} = alloca (see declaration above)", dst)
         }
-        43 => { // load
+        43 => {
+            // load
             if args.len() >= 1 {
                 format!("{} = {}[0];", dst, args[0])
             } else {
                 format!("{} = 0;", dst)
             }
         }
-        44 => { // store
+        44 => {
+            // store
             if args.len() >= 2 {
                 format!("{}[0] = {};", args[0], args[1])
             } else {
                 "// store (no args)".to_string()
             }
         }
-        45 => { // getelementptr (GEP)
+        45 => {
+            // getelementptr (GEP)
             if args.len() >= 2 {
                 format!("{} = &({}[{}]);", dst, args[0], args[1])
             } else {
                 format!("{} = {};", dst, args.first().unwrap_or(&"0".to_string()))
             }
         }
-        46 => { // select
+        46 => {
+            // select
             if args.len() >= 3 {
                 format!("{} = {} ? {} : {};", dst, args[0], args[1], args[2])
             } else {
                 format!("{} = 0;", dst)
             }
         }
-        47 => { // extractvalue
+        47 => {
+            // extractvalue
             if args.len() >= 2 {
                 format!("{} = {}.field{};", dst, args[0], args[1])
             } else {
                 format!("{} = 0;", dst)
             }
         }
-        48 => { // insertvalue
+        48 => {
+            // insertvalue
             if args.len() >= 2 {
-                format!("{}.field{} = {};", args[0], args[1], args.last().unwrap_or(&"0".to_string()))
+                format!(
+                    "{}.field{} = {};",
+                    args[0],
+                    args[1],
+                    args.last().unwrap_or(&"0".to_string())
+                )
             } else {
                 String::from("// insertvalue (no args)")
             }
         }
 
         // --- Vector element operations (LLVM opcodes 49-52) ---
-        49 => { // extractelement
+        49 => {
+            // extractelement
             if args.len() >= 2 {
                 format!("{} = {}[{}];", dst, args[0], args[1])
             } else {
                 format!("{} = 0; // extractelement (no args)", dst)
             }
         }
-        50 => { // insertelement
+        50 => {
+            // insertelement
             if args.len() >= 3 {
                 format!(
                     "{} = {}; {}[{}] = {}; // insertelement",
@@ -1717,7 +1778,8 @@ pub fn dxil_opcode_to_msl(
                 format!("{} = 0; // insertelement (no args)", dst)
             }
         }
-        51 => { // shufflevector
+        51 => {
+            // shufflevector
             if args.len() >= 3 {
                 format!(
                     "{} = {}.{}; // shufflevector({}, {})",
@@ -1727,7 +1789,8 @@ pub fn dxil_opcode_to_msl(
                 format!("{} = 0; // shufflevector", dst)
             }
         }
-        52 => { // unreachable
+        52 => {
+            // unreachable
             String::from("// unreachable")
         }
 
@@ -1789,7 +1852,12 @@ pub fn dxil_opcode_to_msl(
         DXIL_INTRIN_REVERSEBITS => unop("reverse_bits"),
         DXIL_INTRIN_SINCOS => {
             if args.len() >= 1 {
-                format!("sincos({}, &{}, &{});", args[0], dst, args.get(1).map_or(dst, |v| v))
+                format!(
+                    "sincos({}, &{}, &{});",
+                    args[0],
+                    dst,
+                    args.get(1).map_or(dst, |v| v)
+                )
             } else {
                 format!("{} = 0;", dst)
             }
@@ -1872,7 +1940,12 @@ pub fn dxil_opcode_to_msl(
         }
         DXIL_INTRIN_STORE | DXIL_INTRIN_TEXTURESTORE => {
             if args.len() >= 2 {
-                format!("{}.write({}, {});", args[0], args[1], args.get(2).unwrap_or(&"0".to_string()))
+                format!(
+                    "{}.write({}, {});",
+                    args[0],
+                    args[1],
+                    args.get(2).unwrap_or(&"0".to_string())
+                )
             } else {
                 String::from("// texture store (no args)")
             }
@@ -2166,7 +2239,10 @@ pub fn dxil_opcode_to_msl(
         }
         DXIL_INTRIN_WAVEPREFIX => {
             if args.len() >= 2 {
-                format!("{} = simd_prefix_exclusive_sum({}); // WavePrefix", dst, args[1])
+                format!(
+                    "{} = simd_prefix_exclusive_sum({}); // WavePrefix",
+                    dst, args[1]
+                )
             } else {
                 format!("{} = 0;", dst)
             }
@@ -2210,7 +2286,10 @@ pub fn dxil_opcode_to_msl(
         }
         DXIL_INTRIN_WAVEALLEQUAL => {
             if args.len() >= 1 {
-                format!("{} = simd_all({} == simd_broadcast_first({}));", dst, args[0], args[0])
+                format!(
+                    "{} = simd_all({} == simd_broadcast_first({}));",
+                    dst, args[0], args[0]
+                )
             } else {
                 format!("{} = 0;", dst)
             }
@@ -2294,49 +2373,72 @@ pub fn dxil_opcode_to_msl(
         }
         DXIL_INTRIN_WAVEMULTIPREFIXSUM => {
             if args.len() >= 2 {
-                format!("{} = simd_prefix_exclusive_sum({}); // MultiPrefix", dst, args[1])
+                format!(
+                    "{} = simd_prefix_exclusive_sum({}); // MultiPrefix",
+                    dst, args[1]
+                )
             } else {
                 format!("{} = 0;", dst)
             }
         }
         DXIL_INTRIN_WAVEMULTIPREFIXPRODUCT => {
             if args.len() >= 2 {
-                format!("{} = simd_prefix_exclusive_product({}); // MultiPrefix", dst, args[1])
+                format!(
+                    "{} = simd_prefix_exclusive_product({}); // MultiPrefix",
+                    dst, args[1]
+                )
             } else {
                 format!("{} = 0;", dst)
             }
         }
         DXIL_INTRIN_WAVEMULTIPREFIXBITAND => {
             if args.len() >= 2 {
-                format!("{} = simd_prefix_exclusive_and({}); // MultiPrefix", dst, args[1])
+                format!(
+                    "{} = simd_prefix_exclusive_and({}); // MultiPrefix",
+                    dst, args[1]
+                )
             } else {
                 format!("{} = 0;", dst)
             }
         }
         DXIL_INTRIN_WAVEMULTIPREFIXBITOR => {
             if args.len() >= 2 {
-                format!("{} = simd_prefix_exclusive_or({}); // MultiPrefix", dst, args[1])
+                format!(
+                    "{} = simd_prefix_exclusive_or({}); // MultiPrefix",
+                    dst, args[1]
+                )
             } else {
                 format!("{} = 0;", dst)
             }
         }
         DXIL_INTRIN_WAVEMULTIPREFIXBITXOR => {
             if args.len() >= 2 {
-                format!("{} = simd_prefix_exclusive_xor({}); // MultiPrefix", dst, args[1])
+                format!(
+                    "{} = simd_prefix_exclusive_xor({}); // MultiPrefix",
+                    dst, args[1]
+                )
             } else {
                 format!("{} = 0;", dst)
             }
         }
         DXIL_INTRIN_WAVEMULTIPREFIXBITCOUNT => {
             if args.len() >= 2 {
-                format!("{} = popcount(simd_prefix_exclusive_or({})); // MultiPrefix", dst, args[1])
+                format!(
+                    "{} = popcount(simd_prefix_exclusive_or({})); // MultiPrefix",
+                    dst, args[1]
+                )
             } else {
                 format!("{} = 0;", dst)
             }
         }
         DXIL_INTRIN_WAVEMATCH => {
             if args.len() >= 1 {
-                format!("{} = simd_vote({} == {}); // WaveMatch emulation", dst, args[0], args.get(1).unwrap_or(&args[0]))
+                format!(
+                    "{} = simd_vote({} == {}); // WaveMatch emulation",
+                    dst,
+                    args[0],
+                    args.get(1).unwrap_or(&args[0])
+                )
             } else {
                 format!("{} = 0;", dst)
             }
@@ -2366,14 +2468,20 @@ pub fn dxil_opcode_to_msl(
         }
         DXIL_INTRIN_FIRSTBITHIGH => {
             if args.len() >= 1 {
-                format!("{} = (clz({}) == 32) ? -1 : (31 - (int)clz({}));", dst, args[0], args[0])
+                format!(
+                    "{} = (clz({}) == 32) ? -1 : (31 - (int)clz({}));",
+                    dst, args[0], args[0]
+                )
             } else {
                 format!("{} = 0;", dst)
             }
         }
         DXIL_INTRIN_FIRSTBITLOW => {
             if args.len() >= 1 {
-                format!("{} = (ctz({}) == 32) ? -1 : (int)ctz({});", dst, args[0], args[0])
+                format!(
+                    "{} = (ctz({}) == 32) ? -1 : (int)ctz({});",
+                    dst, args[0], args[0]
+                )
             } else {
                 format!("{} = 0;", dst)
             }
@@ -2480,7 +2588,10 @@ pub fn dxil_opcode_to_msl(
         }
         DXIL_INTRIN_CALCULATELODUNCLAMPED => {
             if args.len() >= 2 {
-                format!("{} = {}.calculate_lod({}); // Note: MSL does not support unclamped LOD", dst, args[0], args[1])
+                format!(
+                    "{} = {}.calculate_lod({}); // Note: MSL does not support unclamped LOD",
+                    dst, args[0], args[1]
+                )
             } else {
                 format!("{} = 0.0;", dst)
             }
@@ -2499,14 +2610,20 @@ pub fn dxil_opcode_to_msl(
         }
         DXIL_INTRIN_EVALUATEATTRIBUTEATSAMPLE => {
             if args.len() >= 2 {
-                format!("{} = {}; // EvaluateAttributeAtSample({})", dst, args[0], args[1])
+                format!(
+                    "{} = {}; // EvaluateAttributeAtSample({})",
+                    dst, args[0], args[1]
+                )
             } else {
                 format!("{} = 0.0;", dst)
             }
         }
         DXIL_INTRIN_EVALUATEATTRIBUTEATCONSTANT => {
             if args.len() >= 2 {
-                format!("{} = {}; // EvaluateAttributeAtConstant({})", dst, args[0], args[1])
+                format!(
+                    "{} = {}; // EvaluateAttributeAtConstant({})",
+                    dst, args[0], args[1]
+                )
             } else {
                 format!("{} = 0.0;", dst)
             }
@@ -2522,14 +2639,46 @@ pub fn dxil_opcode_to_msl(
         }
 
         // --- Geometry shader intrinsics ---
+        // In Metal, geometry shaders are emulated via compute shaders.
+        // EmitVertex appends vertex data to a stream output buffer.
+        // CutStream finalizes the current primitive in the stream.
+        // EmitThenCutStream emits a vertex and immediately starts a new primitive.
         DXIL_INTRIN_EMITSTREAM => {
-            format!("// EmitStream({})", args.first().map_or("0", |v| v))
+            let stream_id = args.first().map_or("0", |v| v);
+            format!(
+                "// EmitStream({stream_id}): append vertex to stream output\n\
+                {{ uint _gs_vert_idx = atomic_fetch_add_explicit(\n\
+                \x20   (volatile device atomic_uint*)_gs_prim_count, 1u, memory_order_relaxed);\n\
+                \x20 device float4* _gs_vtx = _gs_stream + _gs_vert_idx * {};\n\
+                \x20 // Write vertex attributes to stream output\n\
+                \x20 _gs_vtx[0] = _gs_position;  // position\n\
+                \x20 _gs_vtx[1] = _gs_normal;    // normal\n\
+                \x20 _gs_vtx[2] = _gs_texcoord;  // texcoord\n\
+                }}",
+                3 // position + normal + texcoord = 3 float4 slots per vertex
+            )
         }
         DXIL_INTRIN_CUTSTREAM => {
-            format!("// CutStream({})", args.first().map_or("0", |v| v))
+            let stream_id = args.first().map_or("0", |v| v);
+            format!(
+                "// CutStream({stream_id}): finalize current primitive\n\
+                {{ /* primitive finalized; next EmitVertex starts new primitive */ }}"
+            )
         }
         DXIL_INTRIN_EMITTHENCUTSTREAM => {
-            format!("// EmitThenCutStream({})", args.first().map_or("0", |v| v))
+            let stream_id = args.first().map_or("0", |v| v);
+            format!(
+                "// EmitThenCutStream({stream_id}): emit then cut\n\
+                {{ uint _gs_vert_idx = atomic_fetch_add_explicit(\n\
+                \x20   (volatile device atomic_uint*)_gs_prim_count, 1u, memory_order_relaxed);\n\
+                \x20 device float4* _gs_vtx = _gs_stream + _gs_vert_idx * {};\n\
+                \x20 _gs_vtx[0] = _gs_position;\n\
+                \x20 _gs_vtx[1] = _gs_normal;\n\
+                \x20 _gs_vtx[2] = _gs_texcoord;\n\
+                \x20 // primitive finalized after emit\n\
+                }}",
+                3
+            )
         }
 
         // --- Resource handle creation (resource array indexing) ---
@@ -2555,8 +2704,10 @@ pub fn dxil_opcode_to_msl(
                     format!("_res_array_{}[{}]", res_class, index)
                 };
                 // Store the resolved handle name so later instructions can use it
-                format!("{} = {}; // CreateHandle(resClass={}, rangeId={}, index={})",
-                    dst, binding, args[0], args[1], args[2])
+                format!(
+                    "{} = {}; // CreateHandle(resClass={}, rangeId={}, index={})",
+                    dst, binding, args[0], args[1], args[2]
+                )
             } else {
                 format!("{} = 0; // CreateHandle (no args)", dst)
             }
@@ -2580,8 +2731,10 @@ pub fn dxil_opcode_to_msl(
                 } else {
                     format!("_res_array_{}[{}]", res_class, index)
                 };
-                format!("{} = {}; // CreateHandleForBinding(resClass={}, rangeId={}, index={}, nonUniform={})",
-                    dst, binding, args[0], args[1], args[2], args[3])
+                format!(
+                    "{} = {}; // CreateHandleForBinding(resClass={}, rangeId={}, index={}, nonUniform={})",
+                    dst, binding, args[0], args[1], args[2], args[3]
+                )
             } else {
                 format!("{} = 0; // CreateHandleForBinding (no args)", dst)
             }
@@ -2620,59 +2773,59 @@ fn is_groupshared_ptr(ptr: &str) -> bool {
 pub fn map_dxil_intrinsic_id(dxil_intrinsic_id: u32) -> Option<u32> {
     match dxil_intrinsic_id {
         // Arithmetic intrinsics (HLSL intrinsic mapping)
-        6 => Some(DXIL_INTRIN_ABS),       // abs/absi/f
-        7 => Some(DXIL_INTRIN_SATURATE),  // saturate
-        8 => Some(DXIL_INTRIN_MAD),       // mad/fma
-        9 => Some(DXIL_INTRIN_MIN),       // min
-        10 => Some(DXIL_INTRIN_MAX),      // max
-        11 => Some(DXIL_INTRIN_CLAMP),    // clamp
-        12 => Some(DXIL_INTRIN_SIN),      // sin
-        13 => Some(DXIL_INTRIN_COS),      // cos
-        14 => Some(DXIL_INTRIN_TAN),      // tan
-        15 => Some(DXIL_INTRIN_SQRT),     // sqrt
-        16 => Some(DXIL_INTRIN_RSQRT),    // rsqrt
-        17 => Some(DXIL_INTRIN_FRAC),     // frac
-        18 => Some(DXIL_INTRIN_FLOOR),    // floor
-        19 => Some(DXIL_INTRIN_CEIL),     // ceil
-        20 => Some(DXIL_INTRIN_ROUND),    // round
-        21 => Some(DXIL_INTRIN_EXP),      // exp
-        22 => Some(DXIL_INTRIN_EXP2),     // exp2
-        23 => Some(DXIL_INTRIN_LOG),      // log
-        24 => Some(DXIL_INTRIN_LOG2),     // log2
-        25 => Some(DXIL_INTRIN_LOG10),    // log10
-        26 => Some(DXIL_INTRIN_POW),      // pow
-        27 => Some(DXIL_INTRIN_DOT),      // dot
-        28 => Some(DXIL_INTRIN_MUL),      // mul
-        29 => Some(DXIL_INTRIN_LERP),     // lerp
-        30 => Some(DXIL_INTRIN_NORMALIZE), // normalize
-        31 => Some(DXIL_INTRIN_CROSS),    // cross
-        32 => Some(DXIL_INTRIN_TRANSPOSE), // transpose
-        33 => Some(DXIL_INTRIN_DETERMINANT), // determinant
-        34 => Some(DXIL_INTRIN_REFLECT),  // reflect
-        35 => Some(DXIL_INTRIN_REFRACT),  // refract
-        36 => Some(DXIL_INTRIN_ISFINITE), // isfinite
-        37 => Some(DXIL_INTRIN_ISINF),    // isinf
-        38 => Some(DXIL_INTRIN_ISNAN),    // isnan
-        39 => Some(DXIL_INTRIN_SIGN),     // sign
-        40 => Some(DXIL_INTRIN_COUNTBITS), // countbits
-        41 => Some(DXIL_INTRIN_REVERSEBITS), // reversebits
-        42 => Some(DXIL_INTRIN_RCP),      // rcp
-        43 => Some(DXIL_INTRIN_DISTANCE), // distance
-        44 => Some(DXIL_INTRIN_LENGTH),   // length
-        45 => Some(DXIL_INTRIN_SMOOTHSTEP), // smoothstep
-        46 => Some(DXIL_INTRIN_STEP),     // step
-        47 => Some(DXIL_INTRIN_SINCOS),   // sincos
-        48 => Some(DXIL_INTRIN_ATAN2),    // atan2
-        49 => Some(DXIL_INTRIN_ATAN),     // atan
-        50 => Some(DXIL_INTRIN_ASIN),     // asin
-        51 => Some(DXIL_INTRIN_ACOS),     // acos
-        52 => Some(DXIL_INTRIN_TANH),     // tanh
-        53 => Some(DXIL_INTRIN_SINH),     // sinh
-        54 => Some(DXIL_INTRIN_COSH),     // cosh
-        55 => Some(DXIL_INTRIN_FWIDTH),   // fwidth
-        56 => Some(DXIL_INTRIN_ASFLOAT),  // asfloat
-        57 => Some(DXIL_INTRIN_ASINT),    // asint
-        58 => Some(DXIL_INTRIN_ASUINT),   // asuint
+        6 => Some(DXIL_INTRIN_ABS),           // abs/absi/f
+        7 => Some(DXIL_INTRIN_SATURATE),      // saturate
+        8 => Some(DXIL_INTRIN_MAD),           // mad/fma
+        9 => Some(DXIL_INTRIN_MIN),           // min
+        10 => Some(DXIL_INTRIN_MAX),          // max
+        11 => Some(DXIL_INTRIN_CLAMP),        // clamp
+        12 => Some(DXIL_INTRIN_SIN),          // sin
+        13 => Some(DXIL_INTRIN_COS),          // cos
+        14 => Some(DXIL_INTRIN_TAN),          // tan
+        15 => Some(DXIL_INTRIN_SQRT),         // sqrt
+        16 => Some(DXIL_INTRIN_RSQRT),        // rsqrt
+        17 => Some(DXIL_INTRIN_FRAC),         // frac
+        18 => Some(DXIL_INTRIN_FLOOR),        // floor
+        19 => Some(DXIL_INTRIN_CEIL),         // ceil
+        20 => Some(DXIL_INTRIN_ROUND),        // round
+        21 => Some(DXIL_INTRIN_EXP),          // exp
+        22 => Some(DXIL_INTRIN_EXP2),         // exp2
+        23 => Some(DXIL_INTRIN_LOG),          // log
+        24 => Some(DXIL_INTRIN_LOG2),         // log2
+        25 => Some(DXIL_INTRIN_LOG10),        // log10
+        26 => Some(DXIL_INTRIN_POW),          // pow
+        27 => Some(DXIL_INTRIN_DOT),          // dot
+        28 => Some(DXIL_INTRIN_MUL),          // mul
+        29 => Some(DXIL_INTRIN_LERP),         // lerp
+        30 => Some(DXIL_INTRIN_NORMALIZE),    // normalize
+        31 => Some(DXIL_INTRIN_CROSS),        // cross
+        32 => Some(DXIL_INTRIN_TRANSPOSE),    // transpose
+        33 => Some(DXIL_INTRIN_DETERMINANT),  // determinant
+        34 => Some(DXIL_INTRIN_REFLECT),      // reflect
+        35 => Some(DXIL_INTRIN_REFRACT),      // refract
+        36 => Some(DXIL_INTRIN_ISFINITE),     // isfinite
+        37 => Some(DXIL_INTRIN_ISINF),        // isinf
+        38 => Some(DXIL_INTRIN_ISNAN),        // isnan
+        39 => Some(DXIL_INTRIN_SIGN),         // sign
+        40 => Some(DXIL_INTRIN_COUNTBITS),    // countbits
+        41 => Some(DXIL_INTRIN_REVERSEBITS),  // reversebits
+        42 => Some(DXIL_INTRIN_RCP),          // rcp
+        43 => Some(DXIL_INTRIN_DISTANCE),     // distance
+        44 => Some(DXIL_INTRIN_LENGTH),       // length
+        45 => Some(DXIL_INTRIN_SMOOTHSTEP),   // smoothstep
+        46 => Some(DXIL_INTRIN_STEP),         // step
+        47 => Some(DXIL_INTRIN_SINCOS),       // sincos
+        48 => Some(DXIL_INTRIN_ATAN2),        // atan2
+        49 => Some(DXIL_INTRIN_ATAN),         // atan
+        50 => Some(DXIL_INTRIN_ASIN),         // asin
+        51 => Some(DXIL_INTRIN_ACOS),         // acos
+        52 => Some(DXIL_INTRIN_TANH),         // tanh
+        53 => Some(DXIL_INTRIN_SINH),         // sinh
+        54 => Some(DXIL_INTRIN_COSH),         // cosh
+        55 => Some(DXIL_INTRIN_FWIDTH),       // fwidth
+        56 => Some(DXIL_INTRIN_ASFLOAT),      // asfloat
+        57 => Some(DXIL_INTRIN_ASINT),        // asint
+        58 => Some(DXIL_INTRIN_ASUINT),       // asuint
         59 => Some(DXIL_INTRIN_FIRSTBITHIGH), // firstbithigh
         60 => Some(DXIL_INTRIN_FIRSTBITLOW),  // firstbitlow
 
@@ -2844,9 +2997,7 @@ fn scan_bitcode_blocks(bytes: &[u8]) -> AppResult<BitcodeScanResult> {
                                 }
                                 BLOCKID_IDENTIFICATION => {
                                     // Parse entry name from identification block
-                                    if let Some(name) =
-                                        parse_identification_block(&mut reader)?
-                                    {
+                                    if let Some(name) = parse_identification_block(&mut reader)? {
                                         entry_name = name;
                                     }
                                 }
@@ -3331,6 +3482,11 @@ fn generate_msl_from_parsed_dxil(
         );
     }
 
+    // Set threadgroup size from reflection (for compute shaders)
+    if let Some(ref tgs) = reflection.threadgroup_size {
+        generator.set_threadgroup_size(tgs.x, tgs.y, tgs.z);
+    }
+
     // Build MSL from parsed DXIL instructions
     let mut msl_lines: Vec<String> = Vec::new();
     msl_lines.push(format!("// DXIL->MSL for {}", metal_function_name));
@@ -3340,7 +3496,8 @@ fn generate_msl_from_parsed_dxil(
         parsed_program.instruction_count
     ));
 
-    // Generate MSL for each function
+    // Also build structured TranslatedInstruction entries for the generator
+    let mut translated_instructions: Vec<TranslatedInstruction> = Vec::new();
     let mut var_counter = 0u32;
     for func in &parsed_program.functions {
         if !msl_lines.is_empty() {
@@ -3372,19 +3529,47 @@ fn generate_msl_from_parsed_dxil(
                 let msl_stmt =
                     dxil_opcode_to_msl(instr.opcode, &dst, &arg_strs, is_signed, is_float);
                 msl_lines.push(format!("        {} // opcode={}", msl_stmt, instr.opcode));
+
+                // Build TranslatedInstruction entry
+                let is_barrier = matches!(
+                    instr.opcode,
+                    74 | 75 | 76 | 77 | 78 | 79 // DXIL barrier opcodes
+                );
+                let barrier_flags = if is_barrier {
+                    vec!["mem_threadgroup".to_string(), "mem_device".to_string()]
+                } else {
+                    Vec::new()
+                };
+                let is_uav = false; // Could be refined with type analysis
+                let is_tg_mem = false; // Could be refined with type analysis
+                let addr_space = if is_uav {
+                    "device".to_string()
+                } else {
+                    String::new()
+                };
+
+                translated_instructions.push(TranslatedInstruction {
+                    msl_body: msl_stmt.clone(),
+                    dst: dst.clone(),
+                    operands: arg_strs.clone(),
+                    is_barrier,
+                    barrier_flags,
+                    is_uav_access: is_uav,
+                    address_space: addr_space,
+                    is_threadgroup_mem: is_tg_mem,
+                });
             }
             msl_lines.push("    }".to_string());
         }
     }
 
-    // Generate the base MSL source using the generator
-    let mut base_msl = generator.generate();
+    // Pass the translated instructions to the generator so entry point
+    // generators can inline them into proper MSL function bodies.
+    generator.set_instructions(translated_instructions);
 
-    // Insert the instruction body into the generated function
-    if let Some(body_start) = base_msl.rfind('{') {
-        let body_content: String = msl_lines.join("\n");
-        base_msl.insert_str(body_start + 1, &format!("\n{}", body_content));
-    }
+    // Generate the complete MSL source using the generator (which now has
+    // instruction bodies to inline into each stage-specific entry point).
+    let base_msl = generator.generate();
 
     Ok(base_msl)
 }
@@ -3402,7 +3587,9 @@ fn generate_msl_from_parsed_dxil(
 /// 4. Builds argument buffer mappings from root signature
 /// 5. Generates complete MSL source with proper function declarations
 /// 6. Wraps the result as a `ShaderTranslationOutput`
-pub fn translate_shader(input: &ShaderTranslationInput) -> Result<ShaderTranslationOutput, ShaderError> {
+pub fn translate_shader(
+    input: &ShaderTranslationInput,
+) -> Result<ShaderTranslationOutput, ShaderError> {
     let dxil_hash = util::sha256_bytes(&input.dxil);
     let root_info = parse_root_signature(&input.root_signature)
         .map_err(|error| shader_error(input, &dxil_hash, "root_signature", error))?;
@@ -3487,10 +3674,8 @@ fn find_prog_part_offset(dxil: &[u8]) -> Option<usize> {
     let mut off = 12;
     while off + 12 <= dxil.len() {
         if off + 4 <= dxil.len() && &dxil[off..off + 4] == b"PROG" {
-            let part_off =
-                u32::from_le_bytes(dxil[off + 4..off + 8].try_into().unwrap()) as usize;
-            let _part_sz =
-                u32::from_le_bytes(dxil[off + 8..off + 12].try_into().unwrap()) as usize;
+            let part_off = u32::from_le_bytes(dxil[off + 4..off + 8].try_into().unwrap()) as usize;
+            let _part_sz = u32::from_le_bytes(dxil[off + 8..off + 12].try_into().unwrap()) as usize;
             let prog_start = part_off + 24; // skip PROG part header (24 bytes of program header)
             if prog_start + 4 <= dxil.len() {
                 return Some(prog_start);
@@ -3539,7 +3724,9 @@ pub fn parse_dxil_container(bytes: &[u8]) -> AppResult<ParsedDxilContainer> {
     let mut parts = BTreeMap::new();
     for index in 0..part_count {
         let offset = 12 + index * 12;
-        let kind = bytes[offset..offset + 4].try_into().expect("4-byte part kind");
+        let kind = bytes[offset..offset + 4]
+            .try_into()
+            .expect("4-byte part kind");
         let descriptor = PartDescriptor {
             kind,
             offset: read_u32(bytes, offset + 4, "part offset")?,
@@ -3620,9 +3807,11 @@ pub fn parse_dxil_container(bytes: &[u8]) -> AppResult<ParsedDxilContainer> {
         entry_name,
         instruction_count: parsed_program.instruction_count,
         ir_size: parsed_program.ir_size,
-        root_signature_part: parts
-            .get("ROOT")
-            .map(|descriptor| part_slice(bytes, descriptor).expect("valid root range").to_vec()),
+        root_signature_part: parts.get("ROOT").map(|descriptor| {
+            part_slice(bytes, descriptor)
+                .expect("valid root range")
+                .to_vec()
+        }),
         reflection_present: reflection.is_some(),
         input_signature_hash,
         output_signature_hash,
@@ -3720,8 +3909,7 @@ pub fn pack_cbuffer(fields: &[CbufferField]) -> PackedCbuffer {
                 element_size
             }
         };
-        if is_matrix || array_len > 1 || (register_usage != 0 && register_usage + field_size > 16)
-        {
+        if is_matrix || array_len > 1 || (register_usage != 0 && register_usage + field_size > 16) {
             offset = align16(offset);
         }
         packed.push(PackedField {
@@ -3762,7 +3950,10 @@ pub fn pack_structured_fields(fields: &[StructuredField]) -> StructuredPacking {
             .expect("structured fields are serializable")
             .as_bytes(),
     );
-    StructuredPacking { stride, packing_hash }
+    StructuredPacking {
+        stride,
+        packing_hash,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3858,7 +4049,8 @@ pub fn compile_with_cache(
         stats.misses += 1;
         stats.compile_stalls += 1;
         if let Ok(output) = translate_shader(input) {
-            let entry = build_cache_entry(&key, &output, cache.clock + 1, None).expect("cache entry");
+            let entry =
+                build_cache_entry(&key, &output, cache.clock + 1, None).expect("cache entry");
             cache.insert(entry);
         }
     }
@@ -4026,9 +4218,11 @@ fn cross_check_reflection(
         .uses
         .iter()
         .filter_map(|use_entry| match use_entry.kind {
-            ProgramBindingKind::Cbuffer => {
-                Some((use_entry.register, use_entry.space, use_entry.size_bytes.unwrap_or(0)))
-            }
+            ProgramBindingKind::Cbuffer => Some((
+                use_entry.register,
+                use_entry.space,
+                use_entry.size_bytes.unwrap_or(0),
+            )),
             _ => None,
         })
         .collect::<BTreeSet<_>>();
@@ -4163,9 +4357,7 @@ fn entry_size(entry: &ShaderCacheEntry) -> usize {
 }
 
 fn checksum_payload(payload: &CachePayload) -> AppResult<String> {
-    Ok(util::sha256_bytes(
-        util::stable_json(payload)?.as_bytes(),
-    ))
+    Ok(util::sha256_bytes(util::stable_json(payload)?.as_bytes()))
 }
 
 fn parse_root_kind(byte: u8) -> AppResult<RootBindingKind> {
@@ -4317,7 +4509,7 @@ mod tests {
         data.extend_from_slice(&1u32.to_le_bytes()); // threadgroup y
         data.extend_from_slice(&1u32.to_le_bytes()); // threadgroup z
         data.extend_from_slice(&0u32.to_le_bytes()); // resource use count
-                                                     // LLVM bitcode magic for the embedded bitcode
+        // LLVM bitcode magic for the embedded bitcode
         data.extend_from_slice(&LLVM_BC_MAGIC.to_be_bytes());
 
         // SIGN part payload
@@ -4455,7 +4647,13 @@ mod tests {
 
     #[test]
     fn t_dxil_opcode_add_translation() {
-        let stmt = dxil_opcode_to_msl(0, "_t0", &["_t1".to_string(), "_t2".to_string()], false, false);
+        let stmt = dxil_opcode_to_msl(
+            0,
+            "_t0",
+            &["_t1".to_string(), "_t2".to_string()],
+            false,
+            false,
+        );
         assert!(stmt.contains("+"), "add should produce + operator");
         assert!(stmt.contains("_t0"), "should assign to destination");
     }
@@ -4463,7 +4661,8 @@ mod tests {
     #[test]
     fn t_dxil_opcode_select_translation() {
         let stmt = dxil_opcode_to_msl(
-            46, "_t0",
+            46,
+            "_t0",
             &["cond".to_string(), "a".to_string(), "b".to_string()],
             false,
             false,
@@ -4518,7 +4717,11 @@ mod tests {
     fn t_parse_dxil_container_valid() {
         let dxil = make_test_dxil(5);
         let result = parse_dxil_container(&dxil);
-        assert!(result.is_ok(), "valid DXIL should parse: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "valid DXIL should parse: {:?}",
+            result.err()
+        );
         let parsed = result.unwrap();
         assert_eq!(parsed.entry_name, "main");
         assert!(parsed.instruction_count > 0);
@@ -4528,7 +4731,7 @@ mod tests {
     fn t_parse_dxil_container_invalid_magic() {
         let data = b"XXXX\x01\x00\x00\x00\x00\x00\x00\x00";
         let result = parse_dxil_container(data);
-        assert!(result.is_err());
+        assert!(result.is_err(), "expected Err, got {result:?}");
     }
 
     #[test]
@@ -4582,7 +4785,10 @@ mod tests {
     #[test]
     fn t_fuzz_summary_invalid() {
         let summary = fuzz_summary(b"\x00\x00\x00\x00");
-        assert!(summary.starts_with("err:"), "invalid DXIL should give error summary");
+        assert!(
+            summary.starts_with("err:"),
+            "invalid DXIL should give error summary"
+        );
     }
 
     #[test]
@@ -4639,127 +4845,253 @@ mod tests {
 
     #[test]
     fn t_dxil_opcode_wave_any_true() {
-        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_WAVEANYTRUE, "_r", &["cond".to_string()], false, false);
+        let stmt = dxil_opcode_to_msl(
+            DXIL_INTRIN_WAVEANYTRUE,
+            "_r",
+            &["cond".to_string()],
+            false,
+            false,
+        );
         assert!(stmt.contains("simd_any(cond)"));
     }
 
     #[test]
     fn t_dxil_opcode_wave_all_true() {
-        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_WAVEALLTRUE, "_r", &["cond".to_string()], false, false);
+        let stmt = dxil_opcode_to_msl(
+            DXIL_INTRIN_WAVEALLTRUE,
+            "_r",
+            &["cond".to_string()],
+            false,
+            false,
+        );
         assert!(stmt.contains("simd_all(cond)"));
     }
 
     #[test]
     fn t_dxil_opcode_wave_all_equal() {
-        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_WAVEALLEQUAL, "_r", &["val".to_string()], false, false);
+        let stmt = dxil_opcode_to_msl(
+            DXIL_INTRIN_WAVEALLEQUAL,
+            "_r",
+            &["val".to_string()],
+            false,
+            false,
+        );
         assert!(stmt.contains("simd_all(val == simd_broadcast_first(val)"));
     }
 
     #[test]
     fn t_dxil_opcode_wave_ballot() {
-        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_WAVEBALLOT, "_r", &["cond".to_string()], false, false);
+        let stmt = dxil_opcode_to_msl(
+            DXIL_INTRIN_WAVEBALLOT,
+            "_r",
+            &["cond".to_string()],
+            false,
+            false,
+        );
         assert!(stmt.contains("simd_ballot(cond)"));
     }
 
     #[test]
     fn t_dxil_opcode_wave_read_lane_at() {
-        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_WAVEREADLANEAT, "_r", &["val".to_string(), "lane".to_string()], false, false);
+        let stmt = dxil_opcode_to_msl(
+            DXIL_INTRIN_WAVEREADLANEAT,
+            "_r",
+            &["val".to_string(), "lane".to_string()],
+            false,
+            false,
+        );
         assert!(stmt.contains("simd_broadcast(val, lane)"));
     }
 
     #[test]
     fn t_dxil_opcode_wave_read_lane_first() {
-        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_WAVEREADLANEFIRST, "_r", &["val".to_string()], false, false);
+        let stmt = dxil_opcode_to_msl(
+            DXIL_INTRIN_WAVEREADLANEFIRST,
+            "_r",
+            &["val".to_string()],
+            false,
+            false,
+        );
         assert!(stmt.contains("simd_broadcast_first(val)"));
     }
 
     #[test]
     fn t_dxil_opcode_wave_active_bitand() {
-        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_WAVEACTIVEBITAND, "_r", &["val".to_string()], false, false);
+        let stmt = dxil_opcode_to_msl(
+            DXIL_INTRIN_WAVEACTIVEBITAND,
+            "_r",
+            &["val".to_string()],
+            false,
+            false,
+        );
         assert!(stmt.contains("simd_and(val)"));
     }
 
     #[test]
     fn t_dxil_opcode_wave_active_bitor() {
-        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_WAVEACTIVEBITOR, "_r", &["val".to_string()], false, false);
+        let stmt = dxil_opcode_to_msl(
+            DXIL_INTRIN_WAVEACTIVEBITOR,
+            "_r",
+            &["val".to_string()],
+            false,
+            false,
+        );
         assert!(stmt.contains("simd_or(val)"));
     }
 
     #[test]
     fn t_dxil_opcode_wave_active_bitxor() {
-        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_WAVEACTIVEBITXOR, "_r", &["val".to_string()], false, false);
+        let stmt = dxil_opcode_to_msl(
+            DXIL_INTRIN_WAVEACTIVEBITXOR,
+            "_r",
+            &["val".to_string()],
+            false,
+            false,
+        );
         assert!(stmt.contains("simd_xor(val)"));
     }
 
     #[test]
     fn t_dxil_opcode_wave_active_countbits() {
-        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_WAVEACTIVECOUNTBITS, "_r", &["val".to_string()], false, false);
+        let stmt = dxil_opcode_to_msl(
+            DXIL_INTRIN_WAVEACTIVECOUNTBITS,
+            "_r",
+            &["val".to_string()],
+            false,
+            false,
+        );
         assert!(stmt.contains("popcount(simd_ballot(val)"));
     }
 
     #[test]
     fn t_dxil_opcode_wave_active_sum() {
-        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_WAVEACTIVESUM, "_r", &["val".to_string()], false, false);
+        let stmt = dxil_opcode_to_msl(
+            DXIL_INTRIN_WAVEACTIVESUM,
+            "_r",
+            &["val".to_string()],
+            false,
+            false,
+        );
         assert!(stmt.contains("simd_sum(val)"));
     }
 
     #[test]
     fn t_dxil_opcode_wave_active_product() {
-        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_WAVEACTIVEPRODUCT, "_r", &["val".to_string()], false, false);
+        let stmt = dxil_opcode_to_msl(
+            DXIL_INTRIN_WAVEACTIVEPRODUCT,
+            "_r",
+            &["val".to_string()],
+            false,
+            false,
+        );
         assert!(stmt.contains("simd_product(val)"));
     }
 
     #[test]
     fn t_dxil_opcode_wave_active_min() {
-        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_WAVEACTIVEMIN, "_r", &["val".to_string()], false, false);
+        let stmt = dxil_opcode_to_msl(
+            DXIL_INTRIN_WAVEACTIVEMIN,
+            "_r",
+            &["val".to_string()],
+            false,
+            false,
+        );
         assert!(stmt.contains("simd_min(val)"));
     }
 
     #[test]
     fn t_dxil_opcode_wave_active_max() {
-        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_WAVEACTIVEMAX, "_r", &["val".to_string()], false, false);
+        let stmt = dxil_opcode_to_msl(
+            DXIL_INTRIN_WAVEACTIVEMAX,
+            "_r",
+            &["val".to_string()],
+            false,
+            false,
+        );
         assert!(stmt.contains("simd_max(val)"));
     }
 
     #[test]
     fn t_dxil_opcode_wave_multiprefix_sum() {
-        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_WAVEMULTIPREFIXSUM, "_r", &["mask".to_string(), "val".to_string()], false, false);
+        let stmt = dxil_opcode_to_msl(
+            DXIL_INTRIN_WAVEMULTIPREFIXSUM,
+            "_r",
+            &["mask".to_string(), "val".to_string()],
+            false,
+            false,
+        );
         assert!(stmt.contains("simd_prefix_exclusive_sum(val)"));
     }
 
     #[test]
     fn t_dxil_opcode_wave_multiprefix_product() {
-        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_WAVEMULTIPREFIXPRODUCT, "_r", &["mask".to_string(), "val".to_string()], false, false);
+        let stmt = dxil_opcode_to_msl(
+            DXIL_INTRIN_WAVEMULTIPREFIXPRODUCT,
+            "_r",
+            &["mask".to_string(), "val".to_string()],
+            false,
+            false,
+        );
         assert!(stmt.contains("simd_prefix_exclusive_product(val)"));
     }
 
     #[test]
     fn t_dxil_opcode_wave_multiprefix_bitand() {
-        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_WAVEMULTIPREFIXBITAND, "_r", &["mask".to_string(), "val".to_string()], false, false);
+        let stmt = dxil_opcode_to_msl(
+            DXIL_INTRIN_WAVEMULTIPREFIXBITAND,
+            "_r",
+            &["mask".to_string(), "val".to_string()],
+            false,
+            false,
+        );
         assert!(stmt.contains("simd_prefix_exclusive_and(val)"));
     }
 
     #[test]
     fn t_dxil_opcode_wave_multiprefix_bitor() {
-        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_WAVEMULTIPREFIXBITOR, "_r", &["mask".to_string(), "val".to_string()], false, false);
+        let stmt = dxil_opcode_to_msl(
+            DXIL_INTRIN_WAVEMULTIPREFIXBITOR,
+            "_r",
+            &["mask".to_string(), "val".to_string()],
+            false,
+            false,
+        );
         assert!(stmt.contains("simd_prefix_exclusive_or(val)"));
     }
 
     #[test]
     fn t_dxil_opcode_wave_multiprefix_bitxor() {
-        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_WAVEMULTIPREFIXBITXOR, "_r", &["mask".to_string(), "val".to_string()], false, false);
+        let stmt = dxil_opcode_to_msl(
+            DXIL_INTRIN_WAVEMULTIPREFIXBITXOR,
+            "_r",
+            &["mask".to_string(), "val".to_string()],
+            false,
+            false,
+        );
         assert!(stmt.contains("simd_prefix_exclusive_xor(val)"));
     }
 
     #[test]
     fn t_dxil_opcode_wave_multiprefix_bitcount() {
-        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_WAVEMULTIPREFIXBITCOUNT, "_r", &["mask".to_string(), "val".to_string()], false, false);
+        let stmt = dxil_opcode_to_msl(
+            DXIL_INTRIN_WAVEMULTIPREFIXBITCOUNT,
+            "_r",
+            &["mask".to_string(), "val".to_string()],
+            false,
+            false,
+        );
         assert!(stmt.contains("popcount(simd_prefix_exclusive_or(val)"));
     }
 
     #[test]
     fn t_dxil_opcode_wave_match() {
-        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_WAVEMATCH, "_r", &["a".to_string()], false, false);
+        let stmt = dxil_opcode_to_msl(
+            DXIL_INTRIN_WAVEMATCH,
+            "_r",
+            &["a".to_string()],
+            false,
+            false,
+        );
         assert!(stmt.contains("simd_vote(a == a)"));
     }
 
@@ -4769,7 +5101,13 @@ mod tests {
 
     #[test]
     fn t_dxil_opcode_asfloat() {
-        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_ASFLOAT, "_r", &["val".to_string()], false, false);
+        let stmt = dxil_opcode_to_msl(
+            DXIL_INTRIN_ASFLOAT,
+            "_r",
+            &["val".to_string()],
+            false,
+            false,
+        );
         assert!(stmt.contains("as_type<float>(val)"));
     }
 
@@ -4787,14 +5125,26 @@ mod tests {
 
     #[test]
     fn t_dxil_opcode_firstbithigh() {
-        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_FIRSTBITHIGH, "_r", &["val".to_string()], false, false);
+        let stmt = dxil_opcode_to_msl(
+            DXIL_INTRIN_FIRSTBITHIGH,
+            "_r",
+            &["val".to_string()],
+            false,
+            false,
+        );
         assert!(stmt.contains("clz(val)"));
         assert!(stmt.contains("31 - (int)clz(val)"));
     }
 
     #[test]
     fn t_dxil_opcode_firstbitlow() {
-        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_FIRSTBITLOW, "_r", &["val".to_string()], false, false);
+        let stmt = dxil_opcode_to_msl(
+            DXIL_INTRIN_FIRSTBITLOW,
+            "_r",
+            &["val".to_string()],
+            false,
+            false,
+        );
         assert!(stmt.contains("ctz(val)"));
     }
 
@@ -4810,14 +5160,26 @@ mod tests {
 
     #[test]
     fn t_dxil_opcode_dot4addi8packed() {
-        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_DOT4ADDI8PACKED, "_r", &["a".to_string(), "b".to_string()], false, false);
+        let stmt = dxil_opcode_to_msl(
+            DXIL_INTRIN_DOT4ADDI8PACKED,
+            "_r",
+            &["a".to_string(), "b".to_string()],
+            false,
+            false,
+        );
         assert!(stmt.contains("Dot4AddI8Packed"));
         assert!(stmt.contains("(int)((a >> 0) & 0xFF)"));
     }
 
     #[test]
     fn t_dxil_opcode_dot4addu8packed() {
-        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_DOT4ADDU8PACKED, "_r", &["a".to_string(), "b".to_string()], false, false);
+        let stmt = dxil_opcode_to_msl(
+            DXIL_INTRIN_DOT4ADDU8PACKED,
+            "_r",
+            &["a".to_string(), "b".to_string()],
+            false,
+            false,
+        );
         assert!(stmt.contains("Dot4AddU8Packed"));
         assert!(stmt.contains("uint((a >> 0) & 0xFF)"));
     }
@@ -4828,43 +5190,88 @@ mod tests {
 
     #[test]
     fn t_dxil_opcode_tess_quad_avg() {
-        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_PROCESS2DQUADTESSSFACTORSAVG, "_r",
-            &["a".to_string(), "b".to_string(), "c".to_string(), "d".to_string()], false, true);
+        let stmt = dxil_opcode_to_msl(
+            DXIL_INTRIN_PROCESS2DQUADTESSSFACTORSAVG,
+            "_r",
+            &[
+                "a".to_string(),
+                "b".to_string(),
+                "c".to_string(),
+                "d".to_string(),
+            ],
+            false,
+            true,
+        );
         assert!(stmt.contains("(a + b + c + d) / 4.0"));
     }
 
     #[test]
     fn t_dxil_opcode_tess_quad_max() {
-        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_PROCESS2DQUADTESSFACTORSMAX, "_r",
-            &["a".to_string(), "b".to_string(), "c".to_string(), "d".to_string()], false, true);
+        let stmt = dxil_opcode_to_msl(
+            DXIL_INTRIN_PROCESS2DQUADTESSFACTORSMAX,
+            "_r",
+            &[
+                "a".to_string(),
+                "b".to_string(),
+                "c".to_string(),
+                "d".to_string(),
+            ],
+            false,
+            true,
+        );
         assert!(stmt.contains("fmax(fmax(a, b), fmax(c, d))"));
     }
 
     #[test]
     fn t_dxil_opcode_tess_quad_min() {
-        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_PROCESS2DQUADTESSFACTORSMIN, "_r",
-            &["a".to_string(), "b".to_string(), "c".to_string(), "d".to_string()], false, true);
+        let stmt = dxil_opcode_to_msl(
+            DXIL_INTRIN_PROCESS2DQUADTESSFACTORSMIN,
+            "_r",
+            &[
+                "a".to_string(),
+                "b".to_string(),
+                "c".to_string(),
+                "d".to_string(),
+            ],
+            false,
+            true,
+        );
         assert!(stmt.contains("fmin(fmin(a, b), fmin(c, d))"));
     }
 
     #[test]
     fn t_dxil_opcode_tess_tri_avg() {
-        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_PROCESS2DTRIANGLEFACTORSAVG, "_r",
-            &["a".to_string(), "b".to_string(), "c".to_string()], false, true);
+        let stmt = dxil_opcode_to_msl(
+            DXIL_INTRIN_PROCESS2DTRIANGLEFACTORSAVG,
+            "_r",
+            &["a".to_string(), "b".to_string(), "c".to_string()],
+            false,
+            true,
+        );
         assert!(stmt.contains("(a + b + c) / 3.0"));
     }
 
     #[test]
     fn t_dxil_opcode_tess_tri_max() {
-        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_PROCESS2DTRIANGLEFACTORSMAX, "_r",
-            &["a".to_string(), "b".to_string(), "c".to_string()], false, true);
+        let stmt = dxil_opcode_to_msl(
+            DXIL_INTRIN_PROCESS2DTRIANGLEFACTORSMAX,
+            "_r",
+            &["a".to_string(), "b".to_string(), "c".to_string()],
+            false,
+            true,
+        );
         assert!(stmt.contains("fmax(fmax(a, b), c)"));
     }
 
     #[test]
     fn t_dxil_opcode_tess_tri_min() {
-        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_PROCESS2DTRIANGLEFACTORSMIN, "_r",
-            &["a".to_string(), "b".to_string(), "c".to_string()], false, true);
+        let stmt = dxil_opcode_to_msl(
+            DXIL_INTRIN_PROCESS2DTRIANGLEFACTORSMIN,
+            "_r",
+            &["a".to_string(), "b".to_string(), "c".to_string()],
+            false,
+            true,
+        );
         assert!(stmt.contains("fmin(fmin(a, b), c)"));
     }
 
@@ -4874,15 +5281,25 @@ mod tests {
 
     #[test]
     fn t_dxil_opcode_calculate_lod() {
-        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_CALCULATELOD, "_r",
-            &["tex".to_string(), "coord".to_string()], false, true);
+        let stmt = dxil_opcode_to_msl(
+            DXIL_INTRIN_CALCULATELOD,
+            "_r",
+            &["tex".to_string(), "coord".to_string()],
+            false,
+            true,
+        );
         assert!(stmt.contains("tex.calculate_lod(coord)"));
     }
 
     #[test]
     fn t_dxil_opcode_calculate_lod_unclamped() {
-        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_CALCULATELODUNCLAMPED, "_r",
-            &["tex".to_string(), "coord".to_string()], false, true);
+        let stmt = dxil_opcode_to_msl(
+            DXIL_INTRIN_CALCULATELODUNCLAMPED,
+            "_r",
+            &["tex".to_string(), "coord".to_string()],
+            false,
+            true,
+        );
         assert!(stmt.contains("tex.calculate_lod(coord)"));
     }
 
@@ -4899,21 +5316,37 @@ mod tests {
 
     #[test]
     fn t_dxil_opcode_eval_attr_centroid() {
-        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_EVALUATEATTRIBUTEATCENTROID, "_r", &["attr".to_string()], false, true);
+        let stmt = dxil_opcode_to_msl(
+            DXIL_INTRIN_EVALUATEATTRIBUTEATCENTROID,
+            "_r",
+            &["attr".to_string()],
+            false,
+            true,
+        );
         assert!(stmt.contains("EvaluateAttributeAtCentroid"));
     }
 
     #[test]
     fn t_dxil_opcode_eval_attr_sample() {
-        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_EVALUATEATTRIBUTEATSAMPLE, "_r",
-            &["attr".to_string(), "idx".to_string()], false, true);
+        let stmt = dxil_opcode_to_msl(
+            DXIL_INTRIN_EVALUATEATTRIBUTEATSAMPLE,
+            "_r",
+            &["attr".to_string(), "idx".to_string()],
+            false,
+            true,
+        );
         assert!(stmt.contains("EvaluateAttributeAtSample(idx)"));
     }
 
     #[test]
     fn t_dxil_opcode_eval_attr_constant() {
-        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_EVALUATEATTRIBUTEATCONSTANT, "_r",
-            &["attr".to_string(), "idx".to_string()], false, true);
+        let stmt = dxil_opcode_to_msl(
+            DXIL_INTRIN_EVALUATEATTRIBUTEATCONSTANT,
+            "_r",
+            &["attr".to_string(), "idx".to_string()],
+            false,
+            true,
+        );
         assert!(stmt.contains("EvaluateAttributeAtConstant(idx)"));
     }
 
@@ -4957,7 +5390,13 @@ mod tests {
 
     #[test]
     fn t_dxil_opcode_emit_then_cut_stream() {
-        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_EMITTHENCUTSTREAM, "", &["0".to_string()], false, false);
+        let stmt = dxil_opcode_to_msl(
+            DXIL_INTRIN_EMITTHENCUTSTREAM,
+            "",
+            &["0".to_string()],
+            false,
+            false,
+        );
         assert!(stmt.contains("EmitThenCutStream(0)"));
     }
 
@@ -4967,16 +5406,33 @@ mod tests {
 
     #[test]
     fn t_dxil_opcode_create_handle() {
-        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_CREATEHANDLE, "_r",
-            &["0".to_string(), "1".to_string(), "2".to_string()], false, false);
+        let stmt = dxil_opcode_to_msl(
+            DXIL_INTRIN_CREATEHANDLE,
+            "_r",
+            &["0".to_string(), "1".to_string(), "2".to_string()],
+            false,
+            false,
+        );
         assert!(stmt.contains("CreateHandle(resClass=0, rangeId=1, index=2)"));
     }
 
     #[test]
     fn t_dxil_opcode_create_handle_for_binding() {
-        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_CREATEHANDLEFORBINDING, "_r",
-            &["0".to_string(), "1".to_string(), "2".to_string(), "0".to_string()], false, false);
-        assert!(stmt.contains("CreateHandleForBinding(resClass=0, rangeId=1, index=2, nonUniform=0)"));
+        let stmt = dxil_opcode_to_msl(
+            DXIL_INTRIN_CREATEHANDLEFORBINDING,
+            "_r",
+            &[
+                "0".to_string(),
+                "1".to_string(),
+                "2".to_string(),
+                "0".to_string(),
+            ],
+            false,
+            false,
+        );
+        assert!(
+            stmt.contains("CreateHandleForBinding(resClass=0, rangeId=1, index=2, nonUniform=0)")
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -4986,7 +5442,11 @@ mod tests {
     #[test]
     fn t_dxil_opcode_barrier_default() {
         let stmt = dxil_opcode_to_msl(DXIL_INTRIN_BARRIER, "", &[], false, false);
-        assert!(stmt.contains("threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device)"));
+        assert!(
+            stmt.contains(
+                "threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device)"
+            )
+        );
     }
 
     #[test]
@@ -5015,30 +5475,55 @@ mod tests {
 
     #[test]
     fn t_dxil_opcode_atomic_add_device() {
-        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_ATOMICADD, "_r",
-            &["buf".to_string(), "ptr".to_string(), "1".to_string()], false, false);
+        let stmt = dxil_opcode_to_msl(
+            DXIL_INTRIN_ATOMICADD,
+            "_r",
+            &["buf".to_string(), "ptr".to_string(), "1".to_string()],
+            false,
+            false,
+        );
         assert!(stmt.contains("device atomic_int*"));
         assert!(!stmt.contains("threadgroup atomic_int*"));
     }
 
     #[test]
     fn t_dxil_opcode_atomic_add_groupshared() {
-        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_ATOMICADD, "_r",
-            &["buf".to_string(), "_gs_ptr".to_string(), "1".to_string()], false, false);
+        let stmt = dxil_opcode_to_msl(
+            DXIL_INTRIN_ATOMICADD,
+            "_r",
+            &["buf".to_string(), "_gs_ptr".to_string(), "1".to_string()],
+            false,
+            false,
+        );
         assert!(stmt.contains("threadgroup atomic_int*"));
     }
 
     #[test]
     fn t_dxil_opcode_atomic_exchange_groupshared() {
-        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_ATOMICEXCHANGE, "_r",
-            &["buf".to_string(), "gs_val".to_string(), "1".to_string()], false, false);
+        let stmt = dxil_opcode_to_msl(
+            DXIL_INTRIN_ATOMICEXCHANGE,
+            "_r",
+            &["buf".to_string(), "gs_val".to_string(), "1".to_string()],
+            false,
+            false,
+        );
         assert!(stmt.contains("threadgroup atomic_int*"));
     }
 
     #[test]
     fn t_dxil_opcode_atomic_compare_exchange_groupshared() {
-        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_ATOMICCOMPAREEXCHANGE, "_r",
-            &["buf".to_string(), "groupshared_ptr".to_string(), "0".to_string(), "1".to_string()], false, false);
+        let stmt = dxil_opcode_to_msl(
+            DXIL_INTRIN_ATOMICCOMPAREEXCHANGE,
+            "_r",
+            &[
+                "buf".to_string(),
+                "groupshared_ptr".to_string(),
+                "0".to_string(),
+                "1".to_string(),
+            ],
+            false,
+            false,
+        );
         assert!(stmt.contains("threadgroup atomic_int*"));
         assert!(stmt.contains("atomic_compare_exchange_weak_explicit"));
     }
@@ -5077,39 +5562,63 @@ mod tests {
         assert_eq!(map_dxil_intrinsic_id(120), Some(DXIL_INTRIN_SAMPLE));
         assert_eq!(map_dxil_intrinsic_id(121), Some(DXIL_INTRIN_SAMPLELEVEL));
         assert_eq!(map_dxil_intrinsic_id(126), Some(DXIL_INTRIN_CALCULATELOD));
-        assert_eq!(map_dxil_intrinsic_id(127), Some(DXIL_INTRIN_CALCULATELODUNCLAMPED));
+        assert_eq!(
+            map_dxil_intrinsic_id(127),
+            Some(DXIL_INTRIN_CALCULATELODUNCLAMPED)
+        );
     }
 
     #[test]
     fn t_map_dxil_intrinsic_id_atomics() {
         assert_eq!(map_dxil_intrinsic_id(136), Some(DXIL_INTRIN_ATOMICADD));
-        assert_eq!(map_dxil_intrinsic_id(143), Some(DXIL_INTRIN_ATOMICCOMPAREEXCHANGE));
+        assert_eq!(
+            map_dxil_intrinsic_id(143),
+            Some(DXIL_INTRIN_ATOMICCOMPAREEXCHANGE)
+        );
     }
 
     #[test]
     fn t_map_dxil_intrinsic_id_wave() {
         assert_eq!(map_dxil_intrinsic_id(190), Some(DXIL_INTRIN_WAVEACTIVE));
-        assert_eq!(map_dxil_intrinsic_id(193), Some(DXIL_INTRIN_WAVEGETLANEINDEX));
+        assert_eq!(
+            map_dxil_intrinsic_id(193),
+            Some(DXIL_INTRIN_WAVEGETLANEINDEX)
+        );
         assert_eq!(map_dxil_intrinsic_id(198), Some(DXIL_INTRIN_WAVEBALLOT));
-        assert_eq!(map_dxil_intrinsic_id(210), Some(DXIL_INTRIN_WAVEMULTIPREFIXSUM));
+        assert_eq!(
+            map_dxil_intrinsic_id(210),
+            Some(DXIL_INTRIN_WAVEMULTIPREFIXSUM)
+        );
     }
 
     #[test]
     fn t_map_dxil_intrinsic_id_tessellation() {
-        assert_eq!(map_dxil_intrinsic_id(230), Some(DXIL_INTRIN_PROCESS2DQUADTESSSFACTORSAVG));
-        assert_eq!(map_dxil_intrinsic_id(235), Some(DXIL_INTRIN_PROCESS2DTRIANGLEFACTORSMIN));
+        assert_eq!(
+            map_dxil_intrinsic_id(230),
+            Some(DXIL_INTRIN_PROCESS2DQUADTESSSFACTORSAVG)
+        );
+        assert_eq!(
+            map_dxil_intrinsic_id(235),
+            Some(DXIL_INTRIN_PROCESS2DTRIANGLEFACTORSMIN)
+        );
     }
 
     #[test]
     fn t_map_dxil_intrinsic_id_geometry() {
         assert_eq!(map_dxil_intrinsic_id(240), Some(DXIL_INTRIN_EMITSTREAM));
-        assert_eq!(map_dxil_intrinsic_id(242), Some(DXIL_INTRIN_EMITTHENCUTSTREAM));
+        assert_eq!(
+            map_dxil_intrinsic_id(242),
+            Some(DXIL_INTRIN_EMITTHENCUTSTREAM)
+        );
     }
 
     #[test]
     fn t_map_dxil_intrinsic_id_create_handle() {
         assert_eq!(map_dxil_intrinsic_id(253), Some(DXIL_INTRIN_CREATEHANDLE));
-        assert_eq!(map_dxil_intrinsic_id(254), Some(DXIL_INTRIN_CREATEHANDLEFORBINDING));
+        assert_eq!(
+            map_dxil_intrinsic_id(254),
+            Some(DXIL_INTRIN_CREATEHANDLEFORBINDING)
+        );
     }
 
     #[test]
@@ -5124,16 +5633,26 @@ mod tests {
 
     #[test]
     fn t_dxil_opcode_quad_read() {
-        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_QUADREAD, "_r",
-            &["val".to_string(), "lane".to_string()], false, false);
+        let stmt = dxil_opcode_to_msl(
+            DXIL_INTRIN_QUADREAD,
+            "_r",
+            &["val".to_string(), "lane".to_string()],
+            false,
+            false,
+        );
         assert!(stmt.contains("quad_broadcast(val, lane)"));
     }
 
     #[test]
     fn t_dxil_opcode_quad_write() {
         // QuadWrite requires 3+ args to reach the quad_vote emulation
-        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_QUADWRITE, "_r",
-            &["val".to_string(), "lane".to_string(), "mask".to_string()], false, false);
+        let stmt = dxil_opcode_to_msl(
+            DXIL_INTRIN_QUADWRITE,
+            "_r",
+            &["val".to_string(), "lane".to_string(), "mask".to_string()],
+            false,
+            false,
+        );
         assert!(stmt.contains("quad_vote"));
     }
 
@@ -5159,13 +5678,25 @@ mod tests {
 
     #[test]
     fn t_dxil_opcode_derivative_coarse() {
-        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_DERIVATIVE_COARSE, "_r", &["v".to_string()], false, true);
+        let stmt = dxil_opcode_to_msl(
+            DXIL_INTRIN_DERIVATIVE_COARSE,
+            "_r",
+            &["v".to_string()],
+            false,
+            true,
+        );
         assert!(stmt.contains("dfdx_coarse(v)"));
     }
 
     #[test]
     fn t_dxil_opcode_derivative_fine() {
-        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_DERIVATIVE_FINE, "_r", &["v".to_string()], false, true);
+        let stmt = dxil_opcode_to_msl(
+            DXIL_INTRIN_DERIVATIVE_FINE,
+            "_r",
+            &["v".to_string()],
+            false,
+            true,
+        );
         assert!(stmt.contains("dfdx_fine(v)"));
     }
 
@@ -5175,7 +5706,13 @@ mod tests {
 
     #[test]
     fn t_dxil_opcode_extractelement() {
-        let stmt = dxil_opcode_to_msl(49, "_r", &["vec".to_string(), "3".to_string()], false, false);
+        let stmt = dxil_opcode_to_msl(
+            49,
+            "_r",
+            &["vec".to_string(), "3".to_string()],
+            false,
+            false,
+        );
         assert!(stmt.contains("_r = vec[3]"));
         // Test fallback when args are missing
         let fallback = dxil_opcode_to_msl(49, "_r", &[], false, false);
@@ -5184,7 +5721,13 @@ mod tests {
 
     #[test]
     fn t_dxil_opcode_insertelement() {
-        let stmt = dxil_opcode_to_msl(50, "_r", &["vec".to_string(), "2".to_string(), "val".to_string()], false, false);
+        let stmt = dxil_opcode_to_msl(
+            50,
+            "_r",
+            &["vec".to_string(), "2".to_string(), "val".to_string()],
+            false,
+            false,
+        );
         assert!(stmt.contains("_r = vec;"));
         assert!(stmt.contains("vec[2] = val;"));
         assert!(stmt.contains("insertelement"));
@@ -5195,7 +5738,13 @@ mod tests {
 
     #[test]
     fn t_dxil_opcode_shufflevector() {
-        let stmt = dxil_opcode_to_msl(51, "_r", &["a".to_string(), "b".to_string(), "2".to_string()], false, false);
+        let stmt = dxil_opcode_to_msl(
+            51,
+            "_r",
+            &["a".to_string(), "b".to_string(), "2".to_string()],
+            false,
+            false,
+        );
         assert!(stmt.contains("shufflevector(a, b)"));
         // Test fallback when args are missing
         let fallback = dxil_opcode_to_msl(51, "_r", &[], false, false);
@@ -5214,16 +5763,31 @@ mod tests {
 
     #[test]
     fn t_dxil_opcode_create_handle_dynamic() {
-        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_CREATEHANDLE, "_r",
-            &["0".to_string(), "1".to_string(), "idx".to_string()], false, false);
+        let stmt = dxil_opcode_to_msl(
+            DXIL_INTRIN_CREATEHANDLE,
+            "_r",
+            &["0".to_string(), "1".to_string(), "idx".to_string()],
+            false,
+            false,
+        );
         assert!(stmt.contains("_res_array_0[idx]"));
         assert!(stmt.contains("CreateHandle(resClass=0, rangeId=1, index=idx)"));
     }
 
     #[test]
     fn t_dxil_opcode_create_handle_for_binding_dynamic() {
-        let stmt = dxil_opcode_to_msl(DXIL_INTRIN_CREATEHANDLEFORBINDING, "_r",
-            &["1".to_string(), "2".to_string(), "nonconst".to_string(), "1".to_string()], false, false);
+        let stmt = dxil_opcode_to_msl(
+            DXIL_INTRIN_CREATEHANDLEFORBINDING,
+            "_r",
+            &[
+                "1".to_string(),
+                "2".to_string(),
+                "nonconst".to_string(),
+                "1".to_string(),
+            ],
+            false,
+            false,
+        );
         assert!(stmt.contains("_res_array_1[nonconst]"));
         assert!(stmt.contains("CreateHandleForBinding(resClass=1, rangeId=2"));
     }
@@ -5283,5 +5847,130 @@ mod tests {
         assert!(stmt.starts_with("memory_barrier("));
         assert!(stmt.contains("mem_flags::mem_device"));
         assert!(!stmt.contains("mem_threadgroup"));
+    }
+
+    // ── DXIL malformed container tests ─────────────────────────────────
+
+    #[test]
+    fn t_dxil_oversized_chunk_rejected() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"DXIL");
+        data.extend_from_slice(&1u32.to_le_bytes()); // version
+        data.extend_from_slice(&1u32.to_le_bytes()); // part count = 1
+
+        // Part descriptor: offset=24 (past header), size = 0xFFFF_FFFF (oversized)
+        data.extend_from_slice(b"PROG");
+        data.extend_from_slice(&24u32.to_le_bytes()); // offset
+        data.extend_from_slice(&u32::MAX.to_le_bytes()); // size — way beyond buffer
+
+        let result = parse_dxil_container(&data);
+        assert!(result.is_err(), "oversized chunk should be rejected");
+    }
+
+    #[test]
+    fn t_dxil_invalid_part_offset_rejected() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"DXIL");
+        data.extend_from_slice(&1u32.to_le_bytes()); // version
+        data.extend_from_slice(&1u32.to_le_bytes()); // part count = 1
+
+        // Part descriptor: offset=0 (overlaps header), size=10
+        data.extend_from_slice(b"PROG");
+        data.extend_from_slice(&0u32.to_le_bytes()); // offset — overlaps header
+        data.extend_from_slice(&10u32.to_le_bytes());
+
+        let result = parse_dxil_container(&data);
+        assert!(
+            result.is_err(),
+            "part overlapping header should be rejected"
+        );
+    }
+
+    #[test]
+    fn t_dxil_part_offset_beyond_buffer_rejected() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"DXIL");
+        data.extend_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(&1u32.to_le_bytes());
+
+        // Part descriptor: offset way past the buffer
+        data.extend_from_slice(b"PROG");
+        data.extend_from_slice(&0xFFFF_0000u32.to_le_bytes()); // offset
+        data.extend_from_slice(&4u32.to_le_bytes()); // size
+
+        let result = parse_dxil_container(&data);
+        assert!(
+            result.is_err(),
+            "part offset beyond buffer should be rejected"
+        );
+    }
+
+    #[test]
+    fn t_dxil_zero_part_count_rejected() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"DXIL");
+        data.extend_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes()); // part count = 0
+
+        let result = parse_dxil_container(&data);
+        assert!(result.is_err(), "zero part count should be rejected");
+    }
+
+    #[test]
+    fn t_dxil_excessive_part_count_rejected() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"DXIL");
+        data.extend_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(&100u32.to_le_bytes()); // part count = 100 (> MAX_PARTS=16)
+
+        let result = parse_dxil_container(&data);
+        assert!(result.is_err(), "excessive part count should be rejected");
+    }
+
+    #[test]
+    fn t_dxil_wrong_version_rejected() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"DXIL");
+        data.extend_from_slice(&99u32.to_le_bytes()); // wrong version
+        data.extend_from_slice(&1u32.to_le_bytes());
+
+        let result = parse_dxil_container(&data);
+        assert!(result.is_err(), "wrong version should be rejected");
+    }
+
+    #[test]
+    fn t_dxil_missing_prog_part_rejected() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"DXIL");
+        data.extend_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(&1u32.to_le_bytes());
+
+        // Only a SIGN part, no PROG
+        data.extend_from_slice(b"SIGN");
+        data.extend_from_slice(&24u32.to_le_bytes());
+        data.extend_from_slice(&4u32.to_le_bytes());
+        data.extend_from_slice(b"SIG1");
+
+        let result = parse_dxil_container(&data);
+        assert!(result.is_err(), "missing PROG part should be rejected");
+    }
+
+    #[test]
+    fn t_dxil_truncated_part_descriptor_table() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"DXIL");
+        data.extend_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(&2u32.to_le_bytes()); // 2 parts → 24 bytes of descriptors needed
+
+        // Only provide 8 bytes of descriptor (1 part descriptor instead of 2)
+        data.extend_from_slice(b"PROG");
+        data.extend_from_slice(&36u32.to_le_bytes());
+        data.extend_from_slice(&4u32.to_le_bytes());
+
+        let result = parse_dxil_container(&data);
+        assert!(
+            result.is_err(),
+            "truncated descriptor table should be rejected"
+        );
     }
 }

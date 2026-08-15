@@ -1,9 +1,9 @@
 use casa1::cpu::{
-    map_host_signal, BlockCacheKey, CpuEngineConfig, CpuExecutionEngine, CpuState,
+    BlockCacheKey, CpuEngineConfig, CpuExecutionEngine, CpuState, EXCEPTION_ACCESS_VIOLATION,
+    EXCEPTION_BREAKPOINT, EXCEPTION_ILLEGAL_INSTRUCTION, EXCEPTION_INT_DIVIDE_BY_ZERO,
     ExceptionDisposition, ExceptionHandler, ExecutionSummary, Flags, GuestArch, HostSignal,
     IrInstruction, MemoryImage, Register, TranslationTier, WindowsException, X87RoundingMode,
-    XmmValue, EXCEPTION_ACCESS_VIOLATION, EXCEPTION_BREAKPOINT, EXCEPTION_ILLEGAL_INSTRUCTION,
-    EXCEPTION_INT_DIVIDE_BY_ZERO,
+    XmmValue, map_host_signal,
 };
 use casa1::ge::CpuProfile;
 use std::collections::{BTreeMap, BTreeSet};
@@ -16,8 +16,7 @@ fn decode_crt_byte_compare_and_store_sequences() {
     let decoded = engine
         .decode_block(
             &[
-                0x80, 0x3D, 0x84, 0x77, 0x02, 0x00, 0x00,
-                0xC6, 0x05, 0x11, 0x22, 0x33, 0x44, 0x01,
+                0x80, 0x3D, 0x84, 0x77, 0x02, 0x00, 0x00, 0xC6, 0x05, 0x11, 0x22, 0x33, 0x44, 0x01,
             ],
             0x1400_000000,
         )
@@ -26,7 +25,11 @@ fn decode_crt_byte_compare_and_store_sequences() {
     assert_eq!(decoded.len(), 2);
     assert_eq!(decoded[0].size, 7);
     assert_eq!(decoded[1].size, 7);
-    assert!(decoded.iter().all(|instruction| instruction.precise_faulting_memory));
+    assert!(
+        decoded
+            .iter()
+            .all(|instruction| instruction.precise_faulting_memory)
+    );
 }
 
 #[test]
@@ -55,7 +58,10 @@ fn memory_indirect_call_updates_rip_and_stack() {
 
     assert_eq!(state.rip, 0x4455_6677_8899_aabb);
     assert_eq!(state.get(Register::Rsp), 0x2ff8);
-    assert_eq!(memory.read_u64(0x2ff8).expect("return address on stack"), 0x1400_000002);
+    assert_eq!(
+        memory.read_u64(0x2ff8).expect("return address on stack"),
+        0x1400_000002
+    );
 }
 
 #[test]
@@ -148,6 +154,7 @@ fn instruction_vectors_vs_independent_reference_exact_flags_fp_and_cpuid() {
                 rip_base: 0x4010,
                 segment: None,
                 address_size_32: false,
+                absolute_address: None,
             },
             width: 8,
         },
@@ -223,13 +230,8 @@ fn winmain_style_prologue_and_epilogue_decode_and_execute() {
         .expect("build CPU config");
     let engine = CpuExecutionEngine::new(config);
     let bytes = [
-        0x55,
-        0x48, 0x83, 0xEC, 0x20,
-        0x48, 0x8D, 0x6C, 0x24, 0x20,
-        0x31, 0xC9,
-        0x48, 0x83, 0xC4, 0x20,
-        0x5D,
-        0xC3,
+        0x55, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8D, 0x6C, 0x24, 0x20, 0x31, 0xC9, 0x48, 0x83, 0xC4,
+        0x20, 0x5D, 0xC3,
     ];
     let decoded = engine
         .decode_block(&bytes, 0x1400_001000)
@@ -254,7 +256,10 @@ fn winmain_style_prologue_and_epilogue_decode_and_execute() {
     assert_eq!(state.get(Register::Rsp), 0x1008);
     assert_eq!(state.get(Register::Rbp), 0xABCD_EF01_2345_6789);
     assert_eq!(state.get(Register::Rcx), 0);
-    assert_eq!(memory.read_u64(0x0ff8).expect("saved rbp"), 0xABCD_EF01_2345_6789);
+    assert_eq!(
+        memory.read_u64(0x0ff8).expect("saved rbp"),
+        0xABCD_EF01_2345_6789
+    );
 }
 
 #[test]
@@ -267,8 +272,14 @@ fn sse_extension_vectors_match_independent_reference() {
     state.set(Register::Rcx, 0x89AB_CDEF_0102_0304);
     state.set_xmm(2, f32x4_to_xmm([1.0, 2.0, 3.0, 4.0]));
     state.set_xmm(3, f32x4_to_xmm([5.0, 6.0, 7.0, 8.0]));
-    state.set_xmm(4, bytes_to_xmm([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]));
-    state.set_xmm(5, bytes_to_xmm([15, 14, 13, 12, 11, 10, 9, 8, 0x80, 7, 6, 5, 4, 3, 2, 1]));
+    state.set_xmm(
+        4,
+        bytes_to_xmm([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]),
+    );
+    state.set_xmm(
+        5,
+        bytes_to_xmm([15, 14, 13, 12, 11, 10, 9, 8, 0x80, 7, 6, 5, 4, 3, 2, 1]),
+    );
     state.set_xmm(6, u32x4_to_xmm([10, 20, 30, 40]));
     state.set_xmm(7, u32x4_to_xmm([100, 200, 300, 400]));
     let mut memory = MemoryImage::default();
@@ -296,7 +307,10 @@ fn sse_extension_vectors_match_independent_reference() {
         [15, 14, 13, 12, 11, 10, 9, 8, 0, 7, 6, 5, 4, 3, 2, 1]
     );
     assert_eq!(u32x4(state.get_xmm(6)), [10, 200, 30, 400]);
-    assert_eq!(state.get(Register::Rax), reference_crc32(0x1234_5678, 0x89AB_CDEF_0102_0304) as u64);
+    assert_eq!(
+        state.get(Register::Rax),
+        reference_crc32(0x1234_5678, 0x89AB_CDEF_0102_0304) as u64
+    );
 }
 
 #[test]
@@ -325,13 +339,17 @@ fn random_sequences_vs_independent_reference_and_tiered_cache() {
         assert_eq!(state.flags, expected.flags);
     }
 
-    let bytes = [0x48, 0xB8, 0x44, 0x33, 0x22, 0x11, 0, 0, 0, 0, 0x48, 0x05, 0x01, 0, 0, 0];
+    let bytes = [
+        0x48, 0xB8, 0x44, 0x33, 0x22, 0x11, 0, 0, 0, 0, 0x48, 0x05, 0x01, 0, 0, 0,
+    ];
     let translated = engine
         .translate_block(&bytes, 0x9000)
         .expect("translate block");
     assert_eq!(translated.tier, TranslationTier::Tier0);
     assert!(!translated.persistent);
-    engine.promote_trace(&translated.key).expect("promote translated block");
+    engine
+        .promote_trace(&translated.key)
+        .expect("promote translated block");
     let promoted = engine
         .cache
         .blocks
@@ -339,7 +357,13 @@ fn random_sequences_vs_independent_reference_and_tiered_cache() {
         .expect("translated block in cache");
     assert_eq!(promoted.tier, TranslationTier::Tier1);
     assert!(promoted.persistent);
-    assert!(promoted.arm64.instructions.iter().any(|line| line.contains("movz")));
+    assert!(
+        promoted
+            .arm64
+            .instructions
+            .iter()
+            .any(|line| line.contains("movz"))
+    );
     assert!(promoted.arm64.policy.map_jit_preferred);
     assert!(promoted.arm64.policy.uses_wx_toggle);
     assert!(!promoted.arm64.policy.rwx_enabled);
@@ -365,16 +389,17 @@ fn atomic_torture_and_barrier_ordering_match_reference_hash() {
         rip_base: 0,
         segment: None,
         address_size_32: false,
+        absolute_address: None,
     };
     let program = vec![
         IrInstruction::LockXadd {
-            address: addr_a000.clone(),
+            address: addr_a000,
             src: Register::Rax,
             width: 8,
         },
         IrInstruction::Mfence,
         IrInstruction::LockXadd {
-            address: addr_a000.clone(),
+            address: addr_a000,
             src: Register::Rcx,
             width: 8,
         },
@@ -384,7 +409,10 @@ fn atomic_torture_and_barrier_ordering_match_reference_hash() {
         .execute_ir_with_memory_hash(&mut state, &mut memory, &program)
         .expect("execute atomic torture");
     let expected = reference_atomic(19, &[3, 7]);
-    assert_eq!(memory.read_u64(0xA000).expect("read final atomic value"), expected.final_value);
+    assert_eq!(
+        memory.read_u64(0xA000).expect("read final atomic value"),
+        expected.final_value
+    );
     assert_eq!(summary.memory_hash, expected.memory_hash);
     assert_eq!(summary.ordering_log, expected.ordering_log);
     assert_eq!(state.get(Register::Rax), 19);
@@ -402,10 +430,18 @@ fn fault_mapping_seh_dispatch_and_unwind_registration_match_reference() {
     assert!(engine.cache.unwind_registry.contains_key(&translated.key));
 
     let faults = [
-        (HostSignal::Segv, 0xDEAD_BEEF_u64, EXCEPTION_ACCESS_VIOLATION),
+        (
+            HostSignal::Segv,
+            0xDEAD_BEEF_u64,
+            EXCEPTION_ACCESS_VIOLATION,
+        ),
         (HostSignal::Bus, 0xABCD_u64, EXCEPTION_ACCESS_VIOLATION),
         (HostSignal::Ill, 0x10_u64, EXCEPTION_ILLEGAL_INSTRUCTION),
-        (HostSignal::FpeIntDivideByZero, 0x20_u64, EXCEPTION_INT_DIVIDE_BY_ZERO),
+        (
+            HostSignal::FpeIntDivideByZero,
+            0x20_u64,
+            EXCEPTION_INT_DIVIDE_BY_ZERO,
+        ),
         (HostSignal::Trap, 0x30_u64, EXCEPTION_BREAKPOINT),
     ];
     for (signal, address, code) in faults {
@@ -435,7 +471,11 @@ fn fault_mapping_seh_dispatch_and_unwind_registration_match_reference() {
     });
     assert_eq!(
         divide_dispatch.visited,
-        vec!["veh:veh-search".to_string(), "seh:seh-av".to_string(), "seh:seh-div0".to_string()]
+        vec![
+            "veh:veh-search".to_string(),
+            "seh:seh-av".to_string(),
+            "seh:seh-div0".to_string()
+        ]
     );
     assert_eq!(
         divide_dispatch.result,
@@ -467,8 +507,9 @@ fn smc_invalidation_matches_reference_behavior() {
         cpuid_mask: String::new(),
         dbt_flags: vec!["compat32".to_string()],
     };
-    let x86_config = CpuEngineConfig::from_profile(GuestArch::X86, "22631", "0.1.0", Some(&x86_profile))
-        .expect("build x86 CPU config");
+    let x86_config =
+        CpuEngineConfig::from_profile(GuestArch::X86, "22631", "0.1.0", Some(&x86_profile))
+            .expect("build x86 CPU config");
     assert!(!x86_config.virtualization.features.baseline_x86_64);
     assert!(x86_config.virtualization.features.sse2);
 }
@@ -561,7 +602,12 @@ fn reference_execute(
     for instruction in program {
         match instruction {
             IrInstruction::LoadMemory { dst, address, .. } if address.rip_relative => {
-                gpr.insert(*dst, *memory.get(&(rip + address.displacement as i64 as u64)).unwrap());
+                gpr.insert(
+                    *dst,
+                    *memory
+                        .get(&(rip + address.displacement as i64 as u64))
+                        .unwrap(),
+                );
             }
             IrInstruction::AddImm { dst, value, .. } => {
                 let lhs = *gpr.get(dst).unwrap();
@@ -760,6 +806,7 @@ fn build_random_program(seed: &mut u64, address: u64) -> Vec<IrInstruction> {
                     rip_base: 0,
                     segment: None,
                     address_size_32: false,
+                    absolute_address: None,
                 },
                 src: Register::Rax,
                 width: 8,
@@ -812,7 +859,7 @@ fn reference_logic_flags(result: u64, width: usize) -> Flags {
 }
 
 fn reference_parity(value: u8) -> bool {
-    value.count_ones() % 2 == 0
+    value.count_ones().is_multiple_of(2)
 }
 
 fn reference_pdep(mut source: u64, mut mask: u64) -> u64 {
@@ -893,8 +940,8 @@ fn xmm_to_bytes(value: XmmValue) -> [u8; 16] {
 }
 
 fn effective_address(mem: &casa1::cpu::MemoryOperand) -> u64 {
-    let base = mem.base.map_or(0, |r| 0 /* not used in these tests */);
-    let index = mem.index.map_or(0, |r| 0 /* not used in these tests */);
+    let base = mem.base.map_or(0, |_r| 0 /* not used in these tests */);
+    let index = mem.index.map_or(0, |_r| 0 /* not used in these tests */);
     base + index * mem.scale as u64 + mem.displacement as i64 as u64
 }
 

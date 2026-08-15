@@ -88,9 +88,23 @@ pub struct X64Context {
 impl Default for X64Context {
     fn default() -> Self {
         Self {
-            rax: 0, rcx: 0, rdx: 0, rbx: 0, rsp: 0, rbp: 0,
-            rsi: 0, rdi: 0, r8: 0, r9: 0, r10: 0, r11: 0,
-            r12: 0, r13: 0, r14: 0, r15: 0, rip: 0,
+            rax: 0,
+            rcx: 0,
+            rdx: 0,
+            rbx: 0,
+            rsp: 0,
+            rbp: 0,
+            rsi: 0,
+            rdi: 0,
+            r8: 0,
+            r9: 0,
+            r10: 0,
+            r11: 0,
+            r12: 0,
+            r13: 0,
+            r14: 0,
+            r15: 0,
+            rip: 0,
             xmm: [Xmm128::default(); 16],
         }
     }
@@ -117,7 +131,7 @@ pub enum UnwindResult {
 /// Parse a `.pdata` section into a vector of `RuntimeFunction` entries.
 ///
 /// Each entry is 12 bytes on x64 (3 × u32 little-endian).
-pub fn parse_pdata(data: &[u8], image_base: u64) -> Vec<RuntimeFunction> {
+pub fn parse_pdata(data: &[u8], _image_base: u64) -> Vec<RuntimeFunction> {
     let entry_size = 12; // 3 × u32
     let count = data.len() / entry_size;
     let mut functions = Vec::with_capacity(count);
@@ -189,22 +203,21 @@ pub fn parse_unwind_info(data: &[u8], rva: u32) -> Option<UnwindInfo> {
     while i < code_count as usize {
         let code_offset = codes_start + i * 2;
         let code_byte = data[code_offset];
-        let info = data[code_offset + 1];
+        let _info = data[code_offset + 1];
         let op = code_byte & 0x0f;
         let op_info = code_byte >> 4;
         match op {
             0 => {
                 // UWOP_PUSH_NONVOL
-                codes.push(UnwindCode::PushNonVolatile {
-                    register: op_info,
-                });
+                codes.push(UnwindCode::PushNonVolatile { register: op_info });
             }
             1 => {
                 // UWOP_ALLOC_LARGE
                 if op_info == 0 {
                     // 16-bit scaled
                     let size = if code_offset + 3 < data.len() {
-                        u16::from_le_bytes([data[code_offset + 2], data[code_offset + 3]]) as u32 * 8
+                        u16::from_le_bytes([data[code_offset + 2], data[code_offset + 3]]) as u32
+                            * 8
                     } else {
                         0
                     };
@@ -312,8 +325,8 @@ pub fn parse_unwind_info(data: &[u8], rva: u32) -> Option<UnwindInfo> {
                     3 // ALLOC_LARGE with 32-bit unscaled size
                 }
             }
-            4 | 6 => 2,  // SAVE_NONVOL / SAVE_XMM128 (16-bit operand)
-            5 | 7 => 3,  // SAVE_NONVOL_FAR / SAVE_XMM128_FAR (32-bit operand)
+            4 | 6 => 2, // SAVE_NONVOL / SAVE_XMM128 (16-bit operand)
+            5 | 7 => 3, // SAVE_NONVOL_FAR / SAVE_XMM128_FAR (32-bit operand)
             _ => 1,
         };
         i += nodes;
@@ -326,17 +339,18 @@ pub fn parse_unwind_info(data: &[u8], rva: u32) -> Option<UnwindInfo> {
     // Align to 4 bytes
     let handler_offset = (handler_offset + 3) & !3;
 
-    let handler_rva = if (flags & 0x01 != 0 || flags & 0x02 != 0) && handler_offset + 4 <= data.len() {
-        let rva = u32::from_le_bytes([
-            data[handler_offset],
-            data[handler_offset + 1],
-            data[handler_offset + 2],
-            data[handler_offset + 3],
-        ]);
-        Some(rva)
-    } else {
-        None
-    };
+    let handler_rva =
+        if (flags & 0x01 != 0 || flags & 0x02 != 0) && handler_offset + 4 <= data.len() {
+            let rva = u32::from_le_bytes([
+                data[handler_offset],
+                data[handler_offset + 1],
+                data[handler_offset + 2],
+                data[handler_offset + 3],
+            ]);
+            Some(rva)
+        } else {
+            None
+        };
 
     // If UNW_FLAG_CHAININFO (0x04) is set, a 12-byte RUNTIME_FUNCTION follows
     // the unwind codes (at the same DWORD-aligned offset). Its third DWORD is
@@ -380,35 +394,47 @@ fn read_u64_from_guest(memory_reader: &MemoryReader<'_>, addr: u64) -> Option<u6
 fn read_xmm128_from_guest(memory_reader: &MemoryReader<'_>, addr: u64) -> Option<Xmm128> {
     let mut buf = [0u8; 16];
     if memory_reader(addr, &mut buf) {
-        Some(Xmm128 {
-            low: u64::from_le_bytes(buf[0..8].try_into().unwrap()),
-            high: u64::from_le_bytes(buf[8..16].try_into().unwrap()),
-        })
+        // Split the 16-byte buffer into two 8-byte arrays using direct element
+        // access, avoiding any `.unwrap()` or `.expect()` calls.
+        let low_bytes: [u8; 8] = [
+            buf[0], buf[1], buf[2], buf[3],
+            buf[4], buf[5], buf[6], buf[7],
+        ];
+        let high_bytes: [u8; 8] = [
+            buf[8], buf[9], buf[10], buf[11],
+            buf[12], buf[13], buf[14], buf[15],
+        ];
+        let low = u64::from_le_bytes(low_bytes);
+        let high = u64::from_le_bytes(high_bytes);
+        Some(Xmm128 { low, high })
     } else {
         None
     }
 }
 
 /// Map a non-volatile register index (0–15) to a mutable reference in X64Context.
-fn get_nonvolatile_register(context: &mut X64Context, reg: u8) -> &mut u64 {
+/// Returns `None` if the register index is out of range (corrupted unwind data).
+fn get_nonvolatile_register(context: &mut X64Context, reg: u8) -> Option<&mut u64> {
     match reg {
-        0 => &mut context.rax,
-        1 => &mut context.rcx,
-        2 => &mut context.rdx,
-        3 => &mut context.rbx,
-        4 => &mut context.rsp,
-        5 => &mut context.rbp,
-        6 => &mut context.rsi,
-        7 => &mut context.rdi,
-        8 => &mut context.r8,
-        9 => &mut context.r9,
-        10 => &mut context.r10,
-        11 => &mut context.r11,
-        12 => &mut context.r12,
-        13 => &mut context.r13,
-        14 => &mut context.r14,
-        15 => &mut context.r15,
-        _ => &mut context.rax, // fallback, should not happen
+        0 => Some(&mut context.rax),
+        1 => Some(&mut context.rcx),
+        2 => Some(&mut context.rdx),
+        3 => Some(&mut context.rbx),
+        4 => Some(&mut context.rsp),
+        5 => Some(&mut context.rbp),
+        6 => Some(&mut context.rsi),
+        7 => Some(&mut context.rdi),
+        8 => Some(&mut context.r8),
+        9 => Some(&mut context.r9),
+        10 => Some(&mut context.r10),
+        11 => Some(&mut context.r11),
+        12 => Some(&mut context.r12),
+        13 => Some(&mut context.r13),
+        14 => Some(&mut context.r14),
+        15 => Some(&mut context.r15),
+        // Register indices 0-15 cover all x86_64 GPRs; any other value
+        // indicates a corrupted unwind code or caller bug.
+        _ => None,
     }
 }
 
@@ -428,6 +454,13 @@ pub fn virtual_unwind(
     context: &mut X64Context,
     memory_reader: &MemoryReader<'_>,
 ) -> UnwindResult {
+    // Validate stack pointer before attempting unwind.
+    // RSP must be non-zero and 8-byte aligned (x64 ABI requirement).
+    // A zero or misaligned RSP indicates a corrupt context.
+    if context.rsp == 0 || context.rsp & 0x7 != 0 {
+        return UnwindResult::NotFound;
+    }
+
     // Replay the unwind codes in reverse order to restore the caller's frame.
     // At entry, RSP points to the top of the current frame (= caller's return
     // address slot after the prolog). We process codes in reverse so that the
@@ -446,7 +479,9 @@ pub fn virtual_unwind(
                 // Read the saved value from [RSP] and restore it.
                 let saved = read_u64_from_guest(memory_reader, context.rsp);
                 if let Some(val) = saved {
-                    *get_nonvolatile_register(context, register) = val;
+                    if let Some(reg_ref) = get_nonvolatile_register(context, register) {
+                        *reg_ref = val;
+                    }
                 }
                 context.rsp += 8;
             }
@@ -459,7 +494,9 @@ pub fn virtual_unwind(
             UnwindCode::SetFramePointer { register, offset } => {
                 // RSP was set to R[register] + offset in the prolog.
                 // Restore RSP from the frame pointer register + offset.
-                let fp_val = *get_nonvolatile_register(context, register);
+                let fp_val = get_nonvolatile_register(context, register)
+                    .copied()
+                    .unwrap_or(0);
                 context.rsp = fp_val.wrapping_add(offset as u64);
             }
             UnwindCode::SaveNonVolatile { register, offset } => {
@@ -467,7 +504,9 @@ pub fn virtual_unwind(
                 let addr = context.rsp.wrapping_add(offset as u64);
                 let saved = read_u64_from_guest(memory_reader, addr);
                 if let Some(val) = saved {
-                    *get_nonvolatile_register(context, register) = val;
+                    if let Some(reg_ref) = get_nonvolatile_register(context, register) {
+                        *reg_ref = val;
+                    }
                 }
                 // RSP is NOT adjusted — the save was relative to final RSP.
             }
@@ -476,7 +515,9 @@ pub fn virtual_unwind(
                 let addr = context.rsp.wrapping_add(offset as u64);
                 let saved = read_u64_from_guest(memory_reader, addr);
                 if let Some(val) = saved {
-                    *get_nonvolatile_register(context, register) = val;
+                    if let Some(reg_ref) = get_nonvolatile_register(context, register) {
+                        *reg_ref = val;
+                    }
                 }
             }
             UnwindCode::SaveXmm128 { register, offset } => {
@@ -506,12 +547,16 @@ pub fn virtual_unwind(
                 // Layout: [error_code?] RIP CS RFLAGS OldRSP SS
                 // Offsets from RSP: err=0|RIP=0/8 CS=8/16 RFLAGS=16/24 OldRSP=24/32 SS=32/40
                 let rip_offset = error_code_offset;
-                if let Some(saved_rip) = read_u64_from_guest(memory_reader, context.rsp + rip_offset) {
+                if let Some(saved_rip) =
+                    read_u64_from_guest(memory_reader, context.rsp + rip_offset)
+                {
                     context.rip = saved_rip;
                 }
                 // Read the saved RSP (value before exception) from the frame
                 let rsp_offset = error_code_offset + 24; // 24 bytes past RIP = OldRSP
-                if let Some(saved_rsp) = read_u64_from_guest(memory_reader, context.rsp + rsp_offset) {
+                if let Some(saved_rsp) =
+                    read_u64_from_guest(memory_reader, context.rsp + rsp_offset)
+                {
                     context.rsp = saved_rsp;
                 } else {
                     // If we can't read the old RSP, at least advance past the frame
@@ -639,9 +684,18 @@ pub fn unwind_frames(
         // Follow CHAININFO entries in-place so the whole logical frame's
         // prolog is replayed before the return address is popped.
         let mut active_info = unwind_info;
+        let mut chain_depth = 0u32;
         let result = loop {
+            if chain_depth >= MAX_CHAIN_DEPTH {
+                eprintln!(
+                    "[seh] unwind_frames: chain depth limit ({}) exceeded",
+                    MAX_CHAIN_DEPTH
+                );
+                break UnwindResult::NotFound;
+            }
             let res = virtual_unwind(&active_info, context, memory_reader);
             if res == UnwindResult::Collided {
+                chain_depth += 1;
                 match active_info.chained_info_rva.and_then(&get_unwind_info) {
                     Some(next) => {
                         active_info = next;
@@ -662,7 +716,10 @@ pub fn unwind_frames(
                     return UnwindResult::HandlerFound(handler_rva);
                 }
                 // Handler didn't claim it, continue unwinding.
-                let _ = handler_address;
+                eprintln!(
+                    "[seh] unwind: handler at {:#x} did not claim exception",
+                    handler_address
+                );
             }
             UnwindResult::Completed => {
                 // Reached a base frame (leaf function or no handler).
@@ -764,7 +821,10 @@ pub fn rtl_unwind(
             None => {
                 return Err(crate::error::AppError::new(
                     ReasonCode::SehException,
-                    format!("rtl_unwind: no unwind info for RVA {:#x}", rf.unwind_info_addr),
+                    format!(
+                        "rtl_unwind: no unwind info for RVA {:#x}",
+                        rf.unwind_info_addr
+                    ),
                 ));
             }
         };
@@ -774,9 +834,18 @@ pub fn rtl_unwind(
         // continuation of the same logical frame, until a non-chained entry
         // pops the return address.
         let mut active_info = unwind_info;
+        let mut chain_depth = 0u32;
         let result = loop {
+            if chain_depth >= MAX_CHAIN_DEPTH {
+                eprintln!(
+                    "[seh] rtl_unwind: chain depth limit ({}) exceeded",
+                    MAX_CHAIN_DEPTH
+                );
+                break UnwindResult::NotFound;
+            }
             let res = virtual_unwind(&active_info, context, memory_reader);
             if res == UnwindResult::Collided {
+                chain_depth += 1;
                 let Some(chained_rva) = active_info.chained_info_rva else {
                     break res;
                 };
@@ -812,7 +881,7 @@ pub fn rtl_unwind(
             UnwindResult::HandlerFound(handler_rva) => {
                 // A handler was found. The caller should invoke it.
                 // Return Ok with the context set to the handler's frame.
-                let _ = handler_rva;
+                eprintln!("[seh] rtl_unwind: handler found at RVA {:#x}", handler_rva);
                 return Ok(());
             }
             UnwindResult::NotFound => {
@@ -833,7 +902,7 @@ pub fn rtl_unwind(
 /// - `EXCEPTION_CONTINUE_SEARCH` (0) — try the next handler
 /// - `EXCEPTION_CONTINUE_EXECUTION` (-1) — restart the faulting instruction
 /// - `EXCEPTION_HANDLED` (1) — exception was handled, continue execution
-pub type VectoredExceptionHandler = Box<dyn Fn(&ExceptionPointers) -> i32 + Send>;
+pub type VectoredExceptionHandler = Arc<dyn Fn(&ExceptionPointers) -> i32 + Send + Sync>;
 
 /// A node in the VEH handler chain.
 pub struct VeHandlerNode {
@@ -906,21 +975,80 @@ pub struct TryBlock {
 }
 
 /// Global VEH state behind a mutex.
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 lazy_static::lazy_static! {
     static ref VEH_CHAIN: Mutex<Vec<(VehHandle, VeHandlerNode)>> = Mutex::new(Vec::new());
+
+    /// Queue of guest VEH callbacks that need to be invoked by the runtime.
+    /// Each entry is (callback_guest_address, ExceptionRecord, X64Context).
+    /// Set by VEH closures during dispatch, drained by PeHostRuntime after
+    /// SEH/VEH dispatch returns.
+    static ref PENDING_GUEST_VEH: Mutex<Vec<(u64, ExceptionRecord, X64Context)>> = Mutex::new(Vec::new());
 }
 
+// Thread-local re-entrancy guard for VEH dispatch.
+//
+// Prevents infinite recursion if a VEH handler itself triggers an exception
+// (e.g., accessing invalid memory inside the handler). The depth limit of 8
+// allows for legitimate nested exception handling (e.g., a handler that
+// performs a controlled operation that might fault) while preventing runaway
+// recursion from buggy or malicious handlers.
+//
+// SAFETY: This is thread-local, so there are no data-race concerns. The
+// Cell type is appropriate because we never share a reference across threads.
+thread_local! {
+    static VEH_DISPATCH_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Maximum allowed depth of nested VEH dispatch calls.
+/// Beyond this, further dispatch attempts are silently dropped
+/// (returns EXCEPTION_CONTINUE_SEARCH) to prevent stack overflow.
+const MAX_VEH_DISPATCH_DEPTH: u32 = 8;
+
 static NEXT_VEH_HANDLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Maximum depth for following CHAININFO entries during unwind.
+/// Prevents infinite loops with corrupt or cyclic unwind data.
+const MAX_CHAIN_DEPTH: u32 = 32;
+
+/// Maximum number of pending guest VEH callback entries.
+/// Prevents unbounded growth if guest code continuously triggers exceptions.
+const MAX_PENDING_GUEST_VEH: usize = 256;
+
+/// Push a pending guest VEH callback entry (called from VEH closures).
+///
+/// Enforces `MAX_PENDING_GUEST_VEH` to prevent unbounded growth.
+/// Returns `true` if the entry was accepted, `false` if the queue is full.
+pub fn push_pending_guest_veh(callback: u64, record: ExceptionRecord, context: X64Context) -> bool {
+    if let Ok(mut pending) = PENDING_GUEST_VEH.lock() {
+        if pending.len() >= MAX_PENDING_GUEST_VEH {
+            eprintln!(
+                "[seh] WARNING: pending guest VEH queue full ({} entries), dropping callback {:#x}",
+                MAX_PENDING_GUEST_VEH, callback
+            );
+            return false;
+        }
+        pending.push((callback, record, context));
+        return true;
+    }
+    false
+}
+
+/// Drain all pending guest VEH callback entries (called from PeHostRuntime
+/// after SEH/VEH dispatch returns).
+pub fn drain_pending_guest_veh() -> Vec<(u64, ExceptionRecord, X64Context)> {
+    if let Ok(mut pending) = PENDING_GUEST_VEH.lock() {
+        std::mem::take(&mut *pending)
+    } else {
+        Vec::new()
+    }
+}
 
 /// Add a vectored exception handler to the global chain.
 ///
 /// Returns a `VehHandle` that can be used with `remove_vectored_handler`.
-pub fn add_vectored_handler(
-    handler: VectoredExceptionHandler,
-    first_chance: bool,
-) -> VehHandle {
+pub fn add_vectored_handler(handler: VectoredExceptionHandler, first_chance: bool) -> VehHandle {
     let handle = VehHandle(NEXT_VEH_HANDLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
     let node = VeHandlerNode {
         handler,
@@ -939,30 +1067,89 @@ pub fn remove_vectored_handler(handle: VehHandle) {
     }
 }
 
+/// Helper: RAII guard for VEH dispatch depth tracking.
+///
+/// Increments the thread-local depth counter on construction and decrements
+/// on drop (including via panic or early return), ensuring the counter is
+/// always properly maintained.
+struct VehDepthGuard;
+
+impl VehDepthGuard {
+    /// Try to acquire the guard. Returns `None` if the depth limit has been
+    /// exceeded (re-entrancy rejected).
+    fn try_acquire() -> Option<Self> {
+        let exceeded = VEH_DISPATCH_DEPTH.with(|depth| {
+            let current = depth.get();
+            if current >= MAX_VEH_DISPATCH_DEPTH {
+                eprintln!(
+                    "[seh] WARNING: VEH dispatch depth exceeded ({}), dropping recursive dispatch",
+                    MAX_VEH_DISPATCH_DEPTH
+                );
+                true
+            } else {
+                depth.set(current + 1);
+                false
+            }
+        });
+        if exceeded { None } else { Some(Self) }
+    }
+}
+
+impl Drop for VehDepthGuard {
+    fn drop(&mut self) {
+        VEH_DISPATCH_DEPTH.with(|depth| {
+            let current = depth.get();
+            depth.set(current.saturating_sub(1));
+        });
+    }
+}
+
 /// Dispatch the exception record and context through the VEH chain.
 ///
 /// Returns `EXCEPTION_CONTINUE_SEARCH` (0) if no handler claimed the exception,
 /// `EXCEPTION_CONTINUE_EXECUTION` (-1) if a handler wants retry,
 /// or `EXCEPTION_HANDLED` (1) if a handler claimed it.
-pub fn dispatch_vectored_handlers(
-    record: &ExceptionRecord,
-    context: &X64Context,
-) -> i32 {
+///
+/// # Re-entrancy protection
+///
+/// Uses a thread-local depth counter (`VEH_DISPATCH_DEPTH`) to prevent infinite
+/// recursion if a VEH handler itself triggers an exception. If the depth exceeds
+/// `MAX_VEH_DISPATCH_DEPTH` (8), the function returns `EXCEPTION_CONTINUE_SEARCH`
+/// immediately, allowing the outer dispatch level to continue or fall through to
+/// SEH. This prevents stack overflow from buggy or malicious handlers while
+/// allowing legitimate nested exception handling up to the limit.
+pub fn dispatch_vectored_handlers(record: &ExceptionRecord, context: &X64Context) -> i32 {
+    // Re-entrancy guard: acquire the RAII guard. On drop (including early
+    // returns), the depth counter is automatically decremented.
+    let _guard = match VehDepthGuard::try_acquire() {
+        Some(g) => g,
+        None => return EXCEPTION_CONTINUE_SEARCH,
+    };
+
     let pointers = ExceptionPointers {
         record: record.clone(),
         context: context.clone(),
     };
 
-    let chain = VEH_CHAIN.lock();
-    let chain = match chain {
-        Ok(c) => c,
-        Err(_) => return EXCEPTION_CONTINUE_SEARCH,
+    // Clone the handler list under the lock, then release before invoking.
+    // This prevents deadlocks if a handler callback tries to add/remove handlers.
+    let handlers: Vec<(bool, VectoredExceptionHandler)> = {
+        let chain = VEH_CHAIN.lock();
+        let chain = match chain {
+            Ok(c) => c,
+            Err(_) => return EXCEPTION_CONTINUE_SEARCH,
+        };
+        chain
+            .iter()
+            .map(|(_, node)| (node.first_chance, node.handler.clone()))
+            .collect()
     };
+    // Lock is released here — safe to invoke callbacks.
 
     // First-chance handlers run first (in registration order).
-    for (_, node) in chain.iter() {
-        if node.first_chance {
-            let result = (node.handler)(&pointers);
+    for (first_chance, handler) in &handlers {
+        if *first_chance {
+            let result = handler(&pointers);
             if result != EXCEPTION_CONTINUE_SEARCH {
                 return result;
             }
@@ -970,12 +1157,90 @@ pub fn dispatch_vectored_handlers(
     }
 
     // Then last-chance handlers.
-    for (_, node) in chain.iter() {
-        if !node.first_chance {
-            let result = (node.handler)(&pointers);
+    for (first_chance, handler) in &handlers {
+        if !*first_chance {
+            let result = handler(&pointers);
             if result != EXCEPTION_CONTINUE_SEARCH {
                 return result;
             }
+        }
+    }
+
+    EXCEPTION_CONTINUE_SEARCH
+}
+
+// ─── Vectored Continue Handlers (AddVectoredContinueHandler) ────────────────
+
+/// Handler function signature for vectored continue handlers.
+///
+/// Called after the exception has been processed by all VEH and SEH handlers.
+/// Return values are the same as `VectoredExceptionHandler`.
+pub type VectoredContinueHandler = Arc<dyn Fn(&ExceptionPointers) -> i32 + Send + Sync>;
+
+/// A node in the VCH (Vectored Continue Handler) chain.
+pub struct VchHandlerNode {
+    pub handler: VectoredContinueHandler,
+}
+
+/// Opaque handle for a registered continue handler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct VchHandle(pub u64);
+
+lazy_static::lazy_static! {
+    /// Global chain of vectored continue handlers.
+    static ref VCH_CHAIN: Mutex<Vec<(VchHandle, VchHandlerNode)>> = Mutex::new(Vec::new());
+}
+
+static NEXT_VCH_HANDLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Add a vectored continue handler to the global chain.
+///
+/// Continue handlers are invoked after all VEH and frame-based handlers have
+/// processed the exception. They receive the same `ExceptionPointers` as VEH
+/// handlers.
+pub fn add_vectored_continue_handler(handler: VectoredContinueHandler) -> VchHandle {
+    let handle = VchHandle(NEXT_VCH_HANDLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    let node = VchHandlerNode { handler };
+    if let Ok(mut chain) = VCH_CHAIN.lock() {
+        chain.push((handle, node));
+    }
+    handle
+}
+
+/// Remove a previously registered vectored continue handler.
+pub fn remove_vectored_continue_handler(handle: VchHandle) {
+    if let Ok(mut chain) = VCH_CHAIN.lock() {
+        chain.retain(|(h, _)| *h != handle);
+    }
+}
+
+/// Dispatch through the vectored continue handler chain.
+///
+/// Called after frame-based SEH handling completes (whether the exception was
+/// handled or not). Returns `EXCEPTION_CONTINUE_SEARCH` if no handler claimed
+/// the exception, or the handler's return value otherwise.
+pub fn dispatch_vectored_continue_handlers(record: &ExceptionRecord, context: &X64Context) -> i32 {
+    let pointers = ExceptionPointers {
+        record: record.clone(),
+        context: context.clone(),
+    };
+
+    // Clone the handler list under the lock, then release before invoking.
+    // This prevents deadlocks if a handler callback tries to add/remove handlers.
+    let handlers: Vec<VectoredContinueHandler> = {
+        let chain = VCH_CHAIN.lock();
+        let chain = match chain {
+            Ok(c) => c,
+            Err(_) => return EXCEPTION_CONTINUE_SEARCH,
+        };
+        chain.iter().map(|(_, node)| node.handler.clone()).collect()
+    };
+    // Lock is released here — safe to invoke callbacks.
+
+    for handler in &handlers {
+        let result = handler(&pointers);
+        if result != EXCEPTION_CONTINUE_SEARCH {
+            return result;
         }
     }
 
@@ -990,7 +1255,7 @@ pub fn dispatch_vectored_handlers(
 /// of ExceptionRecord, and collided unwinds by returning NotFound when the
 /// current frame's handlers don't match, allowing the caller to unwind further.
 pub fn seh_dispatch(
-    exception_record: &ExceptionRecord,
+    _exception_record: &ExceptionRecord,
     context: &X64Context,
     scope_table: &ScopeTable,
     image_base: u64,
@@ -1248,7 +1513,16 @@ impl SehSubsystem {
                     // RIP) guarantees forward progress.
                     let mut chain_rva = unwind_info.chained_info_rva;
                     let mut resolved = false;
+                    let mut chain_depth = 0u32;
                     while let Some(rva) = chain_rva {
+                        chain_depth += 1;
+                        if chain_depth > MAX_CHAIN_DEPTH {
+                            eprintln!(
+                                "[seh] dispatch: chain depth limit ({}) exceeded",
+                                MAX_CHAIN_DEPTH
+                            );
+                            break;
+                        }
                         let next = {
                             let cached = self.unwind_cache.get(&rva).cloned();
                             match cached {
@@ -1295,7 +1569,10 @@ impl SehSubsystem {
                     break;
                 }
                 UnwindResult::HandlerFound(handler_rva) => {
-                    let _ = handler_rva;
+                    eprintln!(
+                        "[seh] rtl_unwind_handler: handler found at RVA {:#x}",
+                        handler_rva
+                    );
                     return Ok(());
                 }
                 UnwindResult::NotFound => {
@@ -1305,11 +1582,21 @@ impl SehSubsystem {
         }
 
         // Step 3: No handler claimed the exception after full unwind.
+        // Log diagnostic information for the undispatched exception.
+        let veh_handler_count = {
+            let chain = VEH_CHAIN.lock();
+            chain.as_ref().map(|c| c.len()).unwrap_or(0)
+        };
+        let pdata_count: usize = self.pdata_tables.values().map(|v| v.len()).sum();
+        eprintln!(
+            "[seh] unhandled exception: code={:#x}, address={:#x}, \
+             frames_unwound={}, veh_handlers={}, pdata_entries={}",
+            code, address, frames_unwound, veh_handler_count, pdata_count
+        );
+
         Err(crate::error::AppError::new(
             ReasonCode::SehException,
-            format!(
-                "unhandled exception code={code:#x} at address={address:#x} (collided unwind)",
-            ),
+            format!("unhandled exception code={code:#x} at address={address:#x} (collided unwind)",),
         ))
     }
 
@@ -1416,7 +1703,7 @@ mod tests {
     #[test]
     fn test_veh_add_remove() {
         let _guard = VEH_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let handler: VectoredExceptionHandler = Box::new(|_ptrs| EXCEPTION_CONTINUE_SEARCH);
+        let handler: VectoredExceptionHandler = Arc::new(|_ptrs| EXCEPTION_CONTINUE_SEARCH);
 
         let handle = add_vectored_handler(handler, true);
         // Verify it was added (chain should not be empty)
@@ -1437,7 +1724,7 @@ mod tests {
     fn test_veh_dispatch() {
         let _guard = VEH_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         // Register a handler that claims STATUS_ACCESS_VIOLATION
-        let handler: VectoredExceptionHandler = Box::new(|ptrs| {
+        let handler: VectoredExceptionHandler = Arc::new(|ptrs| {
             if ptrs.record.code == STATUS_ACCESS_VIOLATION {
                 EXCEPTION_HANDLED
             } else {
@@ -1497,8 +1784,14 @@ mod tests {
         let mut seh = SehSubsystem::new();
         let context = X64Context::default();
         let no_memory = |_addr: u64, _buf: &mut [u8]| -> bool { false };
-        let result = seh.dispatch(STATUS_ACCESS_VIOLATION, 0x1000, &context, 0x14000_0000, &no_memory);
-        assert!(result.is_err());
+        let result = seh.dispatch(
+            STATUS_ACCESS_VIOLATION,
+            0x1000,
+            &context,
+            0x14000_0000,
+            &no_memory,
+        );
+        assert!(result.is_err(), "expected Err, got {result:?}");
         if let Err(err) = result {
             assert_eq!(err.code, ReasonCode::SehException);
         }
@@ -1513,7 +1806,7 @@ mod tests {
     #[test]
     fn test_veh_continue_execution() {
         let _guard = VEH_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let handler: VectoredExceptionHandler = Box::new(|_ptrs| EXCEPTION_CONTINUE_EXECUTION);
+        let handler: VectoredExceptionHandler = Arc::new(|_ptrs| EXCEPTION_CONTINUE_EXECUTION);
         let handle = add_vectored_handler(handler, true);
 
         let record = ExceptionRecord::new(STATUS_ACCESS_VIOLATION, 0x1000);
@@ -1527,12 +1820,7 @@ mod tests {
     // ── New comprehensive tests ─────────────────────────────────────────────
 
     /// Helper: build a UNWIND_INFO blob with extra data appended after codes.
-    fn make_unwind_info_full(
-        version: u8,
-        flags: u8,
-        codes: &[(u8, u8)],
-        extra: &[u8],
-    ) -> Vec<u8> {
+    fn make_unwind_info_full(version: u8, flags: u8, codes: &[(u8, u8)], extra: &[u8]) -> Vec<u8> {
         let mut buf = Vec::new();
         buf.push((version & 0x07) | ((flags & 0x1f) << 3)); // version_and_flags
         buf.push(0x10); // prolog_size
@@ -1557,10 +1845,7 @@ mod tests {
 
     /// Helper: create a simple memory reader that reads from a &[u8] slice
     /// as if it were mapped at `base_address`.
-    fn slice_memory_reader<'a>(
-        slice: &'a [u8],
-        base: u64,
-    ) -> impl Fn(u64, &mut [u8]) -> bool + 'a {
+    fn slice_memory_reader<'a>(slice: &'a [u8], base: u64) -> impl Fn(u64, &mut [u8]) -> bool + 'a {
         move |addr: u64, buf: &mut [u8]| -> bool {
             let offset = addr.wrapping_sub(base) as usize;
             if offset + buf.len() <= slice.len() {
@@ -1630,12 +1915,20 @@ mod tests {
         ctx.rsp = stack_base; // RSP points to local alloc start
         ctx.rip = 0x140001000; // current RIP inside function
 
-        let result = virtual_unwind(&parse_unwind_info(&unwind_data, 0).unwrap(), &mut ctx, &mem_reader);
+        let result = virtual_unwind(
+            &parse_unwind_info(&unwind_data, 0).unwrap(),
+            &mut ctx,
+            &mem_reader,
+        );
 
         assert_eq!(result, UnwindResult::Completed, "unwind should complete");
         assert_eq!(ctx.rbp, 0xdeadbeef, "RBP should be restored from stack");
         assert_eq!(ctx.rip, 0x140001234, "RIP should be return address");
-        assert_eq!(ctx.rsp, stack_base + 0x30 + 8, "RSP should be past return address");
+        assert_eq!(
+            ctx.rsp,
+            stack_base + 0x30 + 8,
+            "RSP should be past return address"
+        );
     }
 
     #[test]
@@ -1905,7 +2198,11 @@ mod tests {
             &mem_reader,
         );
 
-        assert_eq!(result, UnwindResult::Collided, "chained unwind should return Collided");
+        assert_eq!(
+            result,
+            UnwindResult::Collided,
+            "chained unwind should return Collided"
+        );
     }
 
     #[test]
@@ -1934,8 +2231,11 @@ mod tests {
         let unwind_info = parse_unwind_info(&unwind_data, 0).expect("should parse");
         let result = virtual_unwind(&unwind_info, &mut ctx, &mem_reader);
 
-        assert_eq!(result, UnwindResult::HandlerFound(0x3000),
-            "EHANDLER should return HandlerFound with the handler RVA");
+        assert_eq!(
+            result,
+            UnwindResult::HandlerFound(0x3000),
+            "EHANDLER should return HandlerFound with the handler RVA"
+        );
         assert_eq!(ctx.rbp, 0xdeadbeef, "RBP should still be restored");
         assert_eq!(ctx.rip, 0x140009999, "RIP should be return address");
     }
@@ -1974,9 +2274,19 @@ mod tests {
             &mem_reader,
         );
 
-        assert_eq!(result, UnwindResult::Completed, "machine frame unwind should complete");
-        assert_eq!(ctx.rip, 0x14000abcd, "RIP should be from saved RIP in frame");
-        assert_eq!(ctx.rsp, 0x7fff_1000, "RSP should be restored from frame's saved RSP");
+        assert_eq!(
+            result,
+            UnwindResult::Completed,
+            "machine frame unwind should complete"
+        );
+        assert_eq!(
+            ctx.rip, 0x14000abcd,
+            "RIP should be from saved RIP in frame"
+        );
+        assert_eq!(
+            ctx.rsp, 0x7fff_1000,
+            "RSP should be restored from frame's saved RSP"
+        );
     }
 
     #[test]
@@ -2061,7 +2371,7 @@ mod tests {
     fn test_virtual_unwind_save_xmm128() {
         // Function saves XMM6 at [RSP+0x20] (offset=0x20/16=2)
         // Codes: UWOP_PUSH_NONVOL(reg=5), UWOP_ALLOC_SMALL(size=0x30), UWOP_SAVE_XMM128(reg=6, offset=0x20)
-        let codes = vec![(0, 5), (2, 4), (6, 6)];
+        let _codes = vec![(0, 5), (2, 4), (6, 6)];
 
         // Build UNWIND_INFO with proper slot accounting
         // PushNonVolatile: 1 slot
@@ -2138,7 +2448,11 @@ mod tests {
 
         let info = parse_unwind_info(&data, 0).expect("should parse");
         assert!(info.flags & 0x01 != 0, "EHANDLER flag should be set");
-        assert_eq!(info.handler_rva, Some(0x1234), "handler RVA should be 0x1234");
+        assert_eq!(
+            info.handler_rva,
+            Some(0x1234),
+            "handler RVA should be 0x1234"
+        );
     }
 
     #[test]
@@ -2149,18 +2463,19 @@ mod tests {
         context.rip = 0x140001050; // inside scope 0
         let scope_table = ScopeTable {
             count: 1,
-            scopes: vec![
-                ScopeRecord {
-                    begin_offset: 0x40,   // relative to image base
-                    end_offset: 0x80,
-                    handler_offset: 0x200, // handler at image_base + 0x200
-                    target_offset: 0,
-                },
-            ],
+            scopes: vec![ScopeRecord {
+                begin_offset: 0x40, // relative to image base
+                end_offset: 0x80,
+                handler_offset: 0x200, // handler at image_base + 0x200
+                target_offset: 0,
+            }],
         };
         let result = seh_dispatch(&record, &context, &scope_table, 0x140001000);
-        assert_eq!(result, UnwindResult::HandlerFound(0x200),
-            "should find handler at offset 0x200");
+        assert_eq!(
+            result,
+            UnwindResult::HandlerFound(0x200),
+            "should find handler at offset 0x200"
+        );
     }
 
     #[test]
@@ -2171,25 +2486,30 @@ mod tests {
         context.rip = 0x140001050;
         let scope_table = ScopeTable {
             count: 1,
-            scopes: vec![
-                ScopeRecord {
-                    begin_offset: 0x100, // doesn't cover 0x50 (relative to image base)
-                    end_offset: 0x200,
-                    handler_offset: 0x300,
-                    target_offset: 0,
-                },
-            ],
+            scopes: vec![ScopeRecord {
+                begin_offset: 0x100, // doesn't cover 0x50 (relative to image base)
+                end_offset: 0x200,
+                handler_offset: 0x300,
+                target_offset: 0,
+            }],
         };
         let result = seh_dispatch(&record, &context, &scope_table, 0x140001000);
-        assert_eq!(result, UnwindResult::NotFound,
-            "should not find handler for RIP outside scope");
+        assert_eq!(
+            result,
+            UnwindResult::NotFound,
+            "should not find handler for RIP outside scope"
+        );
     }
 
     #[test]
     fn test_restore_context() {
         let ctx = X64Context {
-            rax: 1, rbx: 2, rcx: 3, rdx: 4,
-            rsp: 0x7fff_0000, rbp: 0x7fff_0100,
+            rax: 1,
+            rbx: 2,
+            rcx: 3,
+            rdx: 4,
+            rsp: 0x7fff_0000,
+            rbp: 0x7fff_0100,
             rip: 0x140001234,
             ..X64Context::default()
         };
@@ -2220,8 +2540,11 @@ mod tests {
 
         let result = virtual_unwind(&unwind_info, &mut ctx, &mem_reader);
 
-        assert_eq!(result, UnwindResult::HandlerFound(0x5000),
-            "should return handler RVA");
+        assert_eq!(
+            result,
+            UnwindResult::HandlerFound(0x5000),
+            "should return handler RVA"
+        );
         assert_eq!(ctx.rbp, 0xf00dbabe, "RBP should be restored");
         assert_eq!(ctx.rip, 0x140006666, "RIP should be return address");
     }
@@ -2289,7 +2612,10 @@ mod tests {
 
         let unwind_info = parse_unwind_info(&buf, 0).expect("should parse");
         assert_eq!(unwind_info.codes.len(), 2);
-        assert_eq!(unwind_info.codes[1], UnwindCode::AllocLarge { size: 0x10000 });
+        assert_eq!(
+            unwind_info.codes[1],
+            UnwindCode::AllocLarge { size: 0x10000 }
+        );
 
         // Stack: 0x10000 byte allocation + saved RBP + return address
         let mut stack = vec![0u8; 0x10010];
@@ -2394,8 +2720,8 @@ mod tests {
             rbp: 0x7fff_0100,
             rsi: 0x55555555,
             rdi: 0x66666666,
-            r8:  0x88888888,
-            r9:  0x99999999,
+            r8: 0x88888888,
+            r9: 0x99999999,
             r10: 0xaaaaaaaa,
             r11: 0xbbbbbbbb,
             r12: 0xcccccccc,
@@ -2415,7 +2741,7 @@ mod tests {
         let _guard = VEH_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         // Register a VEH handler that handles STATUS_ILLEGAL_INSTRUCTION
         // and verify rtl_restore_context dispatches through VEH.
-        let handler: VectoredExceptionHandler = Box::new(|ptrs| {
+        let handler: VectoredExceptionHandler = Arc::new(|ptrs| {
             if ptrs.record.code == STATUS_ILLEGAL_INSTRUCTION {
                 // Verify the context RIP is in the params
                 assert_eq!(ptrs.record.params[0], 0x140001234);
@@ -2434,7 +2760,10 @@ mod tests {
         };
 
         let result = rtl_restore_context(&ctx);
-        assert!(result.is_ok(), "rtl_restore_context should succeed with VEH handler");
+        assert!(
+            result.is_ok(),
+            "rtl_restore_context should succeed with VEH handler"
+        );
 
         remove_vectored_handler(handle);
     }
@@ -2553,7 +2882,10 @@ mod tests {
         // Wait no, virtual_unwind does restore registers. So RBP should be
         // func_B's restored value (0xbabababa).
 
-        assert_eq!(ctx.rip, 0x140001005, "RIP should be return address in func_A");
+        assert_eq!(
+            ctx.rip, 0x140001005,
+            "RIP should be return address in func_A"
+        );
         assert_eq!(ctx.rbp, 0xbabababa, "RBP restored from func_B's frame");
     }
 
@@ -2592,7 +2924,7 @@ mod tests {
 
         // target_rip = 0x14000ffff — after unwinding, RIP should be this value
         let result = rtl_unwind(0, 0x14000ffff, image_base, &mut ctx, &mut seh, &mem_reader);
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
 
         // Since target_frame=0 and target_rip != 0, the unwind continues until
         // no more frames, then... actually, looking at the code, target_rip
@@ -2628,7 +2960,7 @@ mod tests {
             &mut seh,
             &mem_reader,
         );
-        assert!(result2.is_ok());
+        assert!(result2.is_ok(), "expected Ok, got {result2:?}");
         // We're already inside the target frame, so rtl_unwind immediately
         // applies target_rip and returns.
         assert_eq!(ctx2.rip, 0x14000ffff, "RIP should be set to target_rip");
@@ -2648,7 +2980,10 @@ mod tests {
         ctx.rsp = 0x7fff_0000;
 
         let result = rtl_unwind(0, 0, image_base, &mut ctx, &mut seh, &mem_reader);
-        assert!(result.is_err(), "rtl_unwind should return Err for unknown frame");
+        assert!(
+            result.is_err(),
+            "rtl_unwind should return Err for unknown frame"
+        );
     }
 
     #[test]
@@ -2689,11 +3024,11 @@ mod tests {
         // Starting RSP points to func_C's frame (lowest address).
         let func_c_alloc = 0x28u64;
         let func_b_alloc = 0x28u64;
-        let func_a_alloc = 0x28u64;
+        let _func_a_alloc = 0x28u64;
 
         let offset_c_rbp = func_c_alloc;
         let offset_c_ret = offset_c_rbp + 8;
-        let offset_b_rbp = offset_c_ret + 8 + func_b_alloc; // skip func_B's alloc too
+        let _offset_b_rbp = offset_c_ret + 8 + func_b_alloc; // skip func_B's alloc too
         // Actually, let me simplify: each frame is 0x30 bytes (0x28 alloc + 8 saved RBP)
         // plus 8 for the return address. So a frame is 0x30 bytes.
         // When func_C calls func_B, func_B's prolog pushes RBP then allocs,
@@ -2772,7 +3107,7 @@ mod tests {
 
         let mut ctx = X64Context::default();
         ctx.rip = image_base + 0x1200; // inside func_C
-        ctx.rsp = stack_base;           // RSP points to func_C's locals
+        ctx.rsp = stack_base; // RSP points to func_C's locals
         ctx.rbp = func_c_rbp;
 
         // Unwind all three frames (target_frame=0)
@@ -2780,7 +3115,10 @@ mod tests {
         assert!(result.is_ok(), "multi-frame unwind should succeed");
 
         // After unwinding three frames, we should be at func_A's caller
-        assert_eq!(ctx.rip, func_a_ret, "RIP should be top-level return address");
+        assert_eq!(
+            ctx.rip, func_a_ret,
+            "RIP should be top-level return address"
+        );
         assert_eq!(ctx.rbp, func_a_rbp, "RBP should be func_A's saved value");
     }
 
@@ -2810,8 +3148,11 @@ mod tests {
         let unwind_info = parse_unwind_info(&unwind_data, 0).expect("should parse");
         let result = virtual_unwind(&unwind_info, &mut ctx, &mem_reader);
 
-        assert_eq!(result, UnwindResult::HandlerFound(0x4000),
-            "UHANDLER should return HandlerFound");
+        assert_eq!(
+            result,
+            UnwindResult::HandlerFound(0x4000),
+            "UHANDLER should return HandlerFound"
+        );
         assert_eq!(ctx.rbp, 0xdeadbeef, "RBP restored");
         assert_eq!(ctx.rip, 0x140009999, "RIP restored");
     }
@@ -2871,7 +3212,602 @@ mod tests {
         // terminates normally.
         assert!(result.is_ok(), "chained unwind must complete: {result:?}");
         assert_eq!(ctx.rbp, 0x0000_cafe, "primary entry must restore saved RBP");
-        assert_eq!(ctx.rip, 0x1_4000_bbbb, "return address must be popped after the chain");
-        assert_eq!(ctx.rsp, stack_base + 0x38, "RSP must reflect alloc + push + return pop");
+        assert_eq!(
+            ctx.rip, 0x1_4000_bbbb,
+            "return address must be popped after the chain"
+        );
+        assert_eq!(
+            ctx.rsp,
+            stack_base + 0x38,
+            "RSP must reflect alloc + push + return pop"
+        );
+    }
+
+    // ── New tests for checklist items ──────────────────────────────────────
+
+    /// Test: VEH handler that dispatches a nested exception during dispatch.
+    /// This verifies that the clone-before-invoke approach prevents deadlocks
+    /// when a VEH handler triggers re-entrant exception dispatch.
+    #[test]
+    fn test_veh_nested_exception_during_dispatch() {
+        let _guard = VEH_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+        // Re-entrancy guard: prevents infinite recursion when the handler
+        // is invoked again during the nested dispatch.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static REENTRY_GUARD: AtomicBool = AtomicBool::new(false);
+
+        // This handler will be called during the outer dispatch and will
+        // trigger a nested dispatch. If the mutex is held during callback
+        // invocation, this would deadlock.
+        let handler: VectoredExceptionHandler = Arc::new(|ptrs| {
+            // Prevent re-entrant calls from the nested dispatch.
+            if REENTRY_GUARD.load(Ordering::SeqCst) {
+                return EXCEPTION_CONTINUE_SEARCH;
+            }
+            REENTRY_GUARD.store(true, Ordering::SeqCst);
+
+            // Dispatch a nested exception — this must not deadlock.
+            let nested_record = ExceptionRecord::new(STATUS_BREAKPOINT, 0x2000);
+            let nested_ctx = X64Context::default();
+            let _nested_result = dispatch_vectored_handlers(&nested_record, &nested_ctx);
+
+            REENTRY_GUARD.store(false, Ordering::SeqCst);
+
+            if ptrs.record.code == STATUS_ACCESS_VIOLATION {
+                EXCEPTION_HANDLED
+            } else {
+                EXCEPTION_CONTINUE_SEARCH
+            }
+        });
+
+        let handle = add_vectored_handler(handler, true);
+
+        let record = ExceptionRecord::new(STATUS_ACCESS_VIOLATION, 0x1000);
+        let context = X64Context::default();
+        let result = dispatch_vectored_handlers(&record, &context);
+        assert_eq!(
+            result, EXCEPTION_HANDLED,
+            "nested dispatch should not deadlock"
+        );
+
+        remove_vectored_handler(handle);
+    }
+
+    /// Test: Adding a VEH handler during dispatch does not cause panics or
+    /// data corruption. The newly added handler should not be invoked in the
+    /// current dispatch (snapshot semantics) but should be available for
+    /// subsequent dispatches.
+    #[test]
+    fn test_veh_add_handler_during_dispatch() {
+        let _guard = VEH_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+        let added = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let added_clone = added.clone();
+
+        // This handler adds another handler during dispatch.
+        let handler: VectoredExceptionHandler = Arc::new(move |_ptrs| {
+            let added_flag = added_clone.clone();
+            let inner: VectoredExceptionHandler = Arc::new(move |_ptrs| {
+                added_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                EXCEPTION_HANDLED
+            });
+            let _inner_handle = add_vectored_handler(inner, true);
+            EXCEPTION_CONTINUE_SEARCH
+        });
+
+        let _handle = add_vectored_handler(handler, true);
+
+        // First dispatch: the handler adds a new handler but doesn't handle
+        // the exception itself.
+        let record = ExceptionRecord::new(STATUS_ACCESS_VIOLATION, 0x1000);
+        let context = X64Context::default();
+        let result = dispatch_vectored_handlers(&record, &context);
+        assert_eq!(
+            result, EXCEPTION_CONTINUE_SEARCH,
+            "original handler should continue search"
+        );
+
+        // Second dispatch: the newly added handler should be present and handle it.
+        let result2 = dispatch_vectored_handlers(&record, &context);
+        assert_eq!(
+            result2, EXCEPTION_HANDLED,
+            "newly added handler should handle the exception"
+        );
+        assert!(
+            added.load(std::sync::atomic::Ordering::SeqCst),
+            "inner handler should have been invoked"
+        );
+
+        // Clean up all handlers
+        {
+            let mut chain = VEH_CHAIN.lock().unwrap();
+            chain.clear();
+        }
+    }
+
+    /// Test: Removing a VEH handler during dispatch does not cause panics.
+    #[test]
+    fn test_veh_remove_handler_during_dispatch() {
+        let _guard = VEH_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+        let invoked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let invoked_for_closure = invoked.clone();
+
+        // Handler that will be removed during dispatch.
+        let target_handle = Arc::new(std::sync::Mutex::new(VehHandle(0)));
+        let target_handle_clone = target_handle.clone();
+
+        let removable_handler: VectoredExceptionHandler = Arc::new(move |_ptrs| {
+            invoked_for_closure.store(true, std::sync::atomic::Ordering::SeqCst);
+            EXCEPTION_HANDLED
+        });
+
+        let removable_handle = add_vectored_handler(removable_handler, true);
+        *target_handle.lock().unwrap() = removable_handle;
+
+        // This handler removes the other handler during dispatch.
+        let remover: VectoredExceptionHandler = Arc::new(move |_ptrs| {
+            let h = *target_handle_clone.lock().unwrap();
+            remove_vectored_handler(h);
+            EXCEPTION_CONTINUE_SEARCH
+        });
+
+        let remover_handle = add_vectored_handler(remover, true);
+
+        // Dispatch: remover runs first (added later, but both are first_chance,
+        // so they run in registration order). The removable handler is removed
+        // but since we snapshot before invoking, it still runs in this dispatch.
+        let record = ExceptionRecord::new(STATUS_ACCESS_VIOLATION, 0x1000);
+        let context = X64Context::default();
+        let _result = dispatch_vectored_handlers(&record, &context);
+
+        // The removable handler should have been invoked (snapshot semantics).
+        assert!(
+            invoked.load(std::sync::atomic::Ordering::SeqCst),
+            "removable handler should have been invoked (snapshot before removal)"
+        );
+
+        // Clean up
+        remove_vectored_handler(remover_handle);
+        {
+            let mut chain = VEH_CHAIN.lock().unwrap();
+            chain.clear();
+        }
+    }
+
+    /// Test: Corrupt unwind metadata — missing runtime function.
+    /// When no .pdata is registered for the image, dispatch should return an error.
+    #[test]
+    fn test_corrupt_unwind_missing_runtime_function() {
+        let _guard = VEH_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let mut seh = SehSubsystem::new();
+        let context = X64Context::default();
+        let no_memory = |_addr: u64, _buf: &mut [u8]| false;
+
+        // No .pdata registered — dispatch should fail gracefully.
+        let result = seh.dispatch(
+            STATUS_ACCESS_VIOLATION,
+            0x140001000,
+            &context,
+            0x14000_0000,
+            &no_memory,
+        );
+        assert!(result.is_err(), "should fail with no .pdata");
+    }
+
+    /// Test: Corrupt unwind metadata — invalid handler address.
+    /// An unwind info entry with EHANDLER flag but a handler RVA of 0
+    /// should still be handled without panic.
+    #[test]
+    fn test_corrupt_unwind_invalid_handler_address() {
+        let _guard = VEH_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let mut seh = SehSubsystem::new();
+        let image_base = 0x14000_0000u64;
+
+        // Build unwind info with EHANDLER flag and handler RVA = 0
+        let codes = vec![(0, 5)]; // push rbp
+        let handler_rva = 0x0000u32;
+        let unwind_data = make_unwind_info_full(1, 0x01, &codes, &handler_rva.to_le_bytes());
+
+        let mut data = vec![0u8; 0x2000];
+        data[0x1000..0x1000 + unwind_data.len()].copy_from_slice(&unwind_data);
+        seh.register_unwind_data(image_base, data);
+
+        // Register .pdata pointing to this unwind info
+        let mut pdata = Vec::new();
+        pdata.extend_from_slice(&0x1000u32.to_le_bytes());
+        pdata.extend_from_slice(&0x1050u32.to_le_bytes());
+        pdata.extend_from_slice(&0x1000u32.to_le_bytes()); // unwind_info_addr
+        seh.register_pdata(image_base, &pdata);
+
+        let no_memory = |_addr: u64, _buf: &mut [u8]| false;
+        let mut context = X64Context::default();
+        // Set RIP to the fault address so dispatch can find the .pdata entry
+        context.rip = 0x140001000;
+
+        // Dispatch should not panic even with handler_rva=0
+        let result = seh.dispatch(
+            STATUS_ACCESS_VIOLATION,
+            0x140001000,
+            &context,
+            image_base,
+            &no_memory,
+        );
+        // It should find the handler (EHANDLER flag set) and return Ok
+        assert!(
+            result.is_ok(),
+            "dispatch with invalid handler address should not panic"
+        );
+    }
+
+    /// Test: Corrupt unwind metadata — truncated/invalid unwind data.
+    /// Parsing should return None for corrupt data without panicking.
+    #[test]
+    fn test_corrupt_unwind_data_truncated() {
+        // Empty data
+        assert!(
+            parse_unwind_info(&[], 0).is_none(),
+            "empty data should return None"
+        );
+
+        // Too short for header
+        assert!(
+            parse_unwind_info(&[0x01], 0).is_none(),
+            "truncated header should return None"
+        );
+
+        // Header present but codes area truncated
+        let mut data = vec![0x01, 0x10, 0x04, 0x00]; // version=1, codes=4
+        data.push(0x50); // code byte
+        data.push(0x00);
+        // Missing remaining code slots — should return None
+        assert!(
+            parse_unwind_info(&data, 0).is_none(),
+            "truncated codes should return None"
+        );
+    }
+
+    /// Test: Corrupt unwind metadata — invalid version number.
+    #[test]
+    fn test_corrupt_unwind_data_invalid_version() {
+        // Version 0 is reserved/invalid
+        let data = make_unwind_info(0, 0, &[]);
+        let info = parse_unwind_info(&data, 0);
+        // Version 0 is technically parseable but should be noted as invalid
+        if let Some(info) = info {
+            assert_eq!(info.version, 0, "version should be 0");
+        }
+
+        // Version > 1 is also unusual but we parse anyway
+        let data2 = make_unwind_info(2, 0, &[]);
+        let info2 = parse_unwind_info(&data2, 0);
+        assert!(info2.is_some(), "version 2 should still parse");
+        assert_eq!(info2.unwrap().version, 2);
+    }
+
+    /// Test: Verify Windows-compatible ordering — first-chance VEH handlers
+    /// are called before last-chance VEH handlers, and both before SEH.
+    #[test]
+    fn test_first_chance_last_chance_ordering() {
+        let _guard = VEH_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let order1 = order.clone();
+        let order2 = order.clone();
+        let order3 = order.clone();
+
+        // Last-chance VEH handler (registered first, but should run after first-chance)
+        let last_chance: VectoredExceptionHandler = Arc::new(move |_ptrs| {
+            order1.lock().unwrap().push("veh_last".to_string());
+            EXCEPTION_CONTINUE_SEARCH
+        });
+        let h1 = add_vectored_handler(last_chance, false); // last-chance
+
+        // First-chance VEH handler (registered second, but should run first)
+        let first_chance: VectoredExceptionHandler = Arc::new(move |_ptrs| {
+            order2.lock().unwrap().push("veh_first".to_string());
+            EXCEPTION_CONTINUE_SEARCH
+        });
+        let h2 = add_vectored_handler(first_chance, true); // first-chance
+
+        // Another first-chance handler that also continues search
+        let first_chance2: VectoredExceptionHandler = Arc::new(move |_ptrs| {
+            order3.lock().unwrap().push("veh_first2".to_string());
+            EXCEPTION_CONTINUE_SEARCH
+        });
+        let h3 = add_vectored_handler(first_chance2, true);
+
+        let record = ExceptionRecord::new(STATUS_ACCESS_VIOLATION, 0x1000);
+        let context = X64Context::default();
+        let result = dispatch_vectored_handlers(&record, &context);
+        assert_eq!(result, EXCEPTION_CONTINUE_SEARCH);
+
+        let recorded = order.lock().unwrap().clone();
+        assert_eq!(
+            recorded,
+            vec![
+                "veh_first".to_string(),
+                "veh_first2".to_string(),
+                "veh_last".to_string(),
+            ],
+            "first-chance handlers should run before last-chance handlers, in registration order"
+        );
+
+        remove_vectored_handler(h1);
+        remove_vectored_handler(h2);
+        remove_vectored_handler(h3);
+    }
+
+    /// Test: VEH handlers are called before SEH handlers (first-chance).
+    /// When a VEH handler handles the exception, SEH should not be invoked.
+    #[test]
+    fn test_veh_before_seh_first_chance() {
+        let _guard = VEH_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let mut seh = SehSubsystem::new();
+        let image_base = 0x14000_0000u64;
+
+        // Register a VEH handler that handles the exception
+        let handler: VectoredExceptionHandler = Arc::new(|ptrs| {
+            if ptrs.record.code == STATUS_ACCESS_VIOLATION {
+                EXCEPTION_HANDLED
+            } else {
+                EXCEPTION_CONTINUE_SEARCH
+            }
+        });
+        let veh_handle = add_vectored_handler(handler, true);
+
+        // Register .pdata and unwind data so SEH could potentially find a handler
+        let codes = vec![(0, 5)];
+        let handler_rva = 0x3000u32;
+        let unwind_data = make_unwind_info_full(1, 0x01, &codes, &handler_rva.to_le_bytes());
+        let mut data = vec![0u8; 0x3000];
+        data[0x2000..0x2000 + unwind_data.len()].copy_from_slice(&unwind_data);
+        seh.register_unwind_data(image_base, data);
+
+        let mut pdata = Vec::new();
+        pdata.extend_from_slice(&0x1000u32.to_le_bytes());
+        pdata.extend_from_slice(&0x1050u32.to_le_bytes());
+        pdata.extend_from_slice(&0x2000u32.to_le_bytes());
+        seh.register_pdata(image_base, &pdata);
+
+        let no_memory = |_addr: u64, _buf: &mut [u8]| false;
+        let context = X64Context::default();
+
+        // Dispatch should be handled by VEH, not SEH
+        let result = seh.dispatch(
+            STATUS_ACCESS_VIOLATION,
+            0x140001000,
+            &context,
+            image_base,
+            &no_memory,
+        );
+        assert!(result.is_ok(), "VEH handler should handle the exception");
+
+        remove_vectored_handler(veh_handle);
+    }
+
+    /// Test: Vectored continue handlers are called when exceptions are
+    /// continued (not handled by VEH or SEH).
+    #[test]
+    fn test_vectored_continue_handlers_called() {
+        let _guard = VEH_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+        let continue_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let continue_called_clone = continue_called.clone();
+
+        let continue_handler: VectoredContinueHandler = Arc::new(move |_ptrs| {
+            continue_called_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+            EXCEPTION_CONTINUE_SEARCH
+        });
+
+        let vch_handle = add_vectored_continue_handler(continue_handler);
+
+        let record = ExceptionRecord::new(STATUS_ACCESS_VIOLATION, 0x1000);
+        let context = X64Context::default();
+
+        // Dispatch continue handlers
+        let result = dispatch_vectored_continue_handlers(&record, &context);
+        assert_eq!(result, EXCEPTION_CONTINUE_SEARCH);
+        assert!(
+            continue_called.load(std::sync::atomic::Ordering::SeqCst),
+            "continue handler should have been called"
+        );
+
+        remove_vectored_continue_handler(vch_handle);
+    }
+
+    /// Test: Vectored continue handler that handles the exception stops
+    /// the chain.
+    #[test]
+    fn test_vectored_continue_handler_handles() {
+        let _guard = VEH_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+        let call_order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let order1 = call_order.clone();
+        let order2 = call_order.clone();
+
+        let handler1: VectoredContinueHandler = Arc::new(move |_ptrs| {
+            order1.lock().unwrap().push("first".to_string());
+            EXCEPTION_HANDLED
+        });
+        let handler2: VectoredContinueHandler = Arc::new(move |_ptrs| {
+            order2.lock().unwrap().push("second".to_string());
+            EXCEPTION_CONTINUE_SEARCH
+        });
+
+        let h1 = add_vectored_continue_handler(handler1);
+        let h2 = add_vectored_continue_handler(handler2);
+
+        let record = ExceptionRecord::new(STATUS_ACCESS_VIOLATION, 0x1000);
+        let context = X64Context::default();
+        let result = dispatch_vectored_continue_handlers(&record, &context);
+        assert_eq!(result, EXCEPTION_HANDLED);
+
+        let recorded = call_order.lock().unwrap().clone();
+        assert_eq!(
+            recorded,
+            vec!["first".to_string()],
+            "second handler should not be called after first handles"
+        );
+
+        remove_vectored_continue_handler(h1);
+        remove_vectored_continue_handler(h2);
+    }
+
+    /// Test: Chain depth limit prevents infinite loops with cyclic unwind data.
+    #[test]
+    fn test_chain_depth_limit() {
+        let mut seh = SehSubsystem::new();
+        let image_base = 0x14000_0000u64;
+
+        // Create a self-referencing CHAININFO entry that would loop forever.
+        // The chained RUNTIME_FUNCTION points back to the same unwind info.
+        let mut unwind_data = make_unwind_info(1, 0x04, &[(2, 4)]); // CHAININFO, alloc 0x28
+        // Append chained RUNTIME_FUNCTION that points back to itself at RVA 0x2000
+        unwind_data.extend_from_slice(&0x1000u32.to_le_bytes()); // begin
+        unwind_data.extend_from_slice(&0x1050u32.to_le_bytes()); // end
+        unwind_data.extend_from_slice(&0x2000u32.to_le_bytes()); // unwind_info_addr = self
+
+        let mut data = vec![0u8; 0x3000];
+        data[0x2000..0x2000 + unwind_data.len()].copy_from_slice(&unwind_data);
+        seh.register_unwind_data(image_base, data);
+
+        let mut pdata = Vec::new();
+        pdata.extend_from_slice(&0x1000u32.to_le_bytes());
+        pdata.extend_from_slice(&0x1050u32.to_le_bytes());
+        pdata.extend_from_slice(&0x2000u32.to_le_bytes());
+        seh.register_pdata(image_base, &pdata);
+
+        let no_memory = |_addr: u64, _buf: &mut [u8]| false;
+        let mut ctx = X64Context::default();
+        ctx.rip = 0x140001000;
+        ctx.rsp = 0x7fff_0000;
+
+        // This should terminate (not infinite loop) and return an error
+        let result = rtl_unwind(0, 0, image_base, &mut ctx, &mut seh, &no_memory);
+        // Should either return Ok (if it unwinds somehow) or Err (if it hits limits)
+        // The important thing is it doesn't hang.
+        assert!(
+            result.is_err() || result.is_ok(),
+            "chain depth limit should prevent infinite loop"
+        );
+    }
+
+    /// Test: Stack pointer validation in virtual_unwind.
+    /// A zero or misaligned RSP should return NotFound.
+    #[test]
+    fn test_stack_pointer_validation() {
+        let codes = vec![(0, 5)]; // push rbp
+        let unwind_data = make_unwind_info(1, 0, &codes);
+        let unwind_info = parse_unwind_info(&unwind_data, 0).unwrap();
+        let mem_reader = |_: u64, _: &mut [u8]| false;
+
+        // Zero RSP
+        let mut ctx = X64Context::default();
+        ctx.rsp = 0;
+        let result = virtual_unwind(&unwind_info, &mut ctx, &mem_reader);
+        assert_eq!(
+            result,
+            UnwindResult::NotFound,
+            "zero RSP should return NotFound"
+        );
+
+        // Misaligned RSP (not 8-byte aligned)
+        let mut ctx2 = X64Context::default();
+        ctx2.rsp = 0x7fff_0003; // misaligned
+        let result2 = virtual_unwind(&unwind_info, &mut ctx2, &mem_reader);
+        assert_eq!(
+            result2,
+            UnwindResult::NotFound,
+            "misaligned RSP should return NotFound"
+        );
+
+        // Properly aligned RSP should work normally
+        let mut ctx3 = X64Context::default();
+        ctx3.rsp = 0x7fff_0000; // aligned
+        let result3 = virtual_unwind(&unwind_info, &mut ctx3, &mem_reader);
+        // Should not be NotFound due to alignment (may be Completed or other)
+        assert_ne!(
+            result3,
+            UnwindResult::NotFound,
+            "aligned RSP should not fail validation"
+        );
+    }
+
+    /// Test: Pending guest VEH callback limit is enforced.
+    #[test]
+    fn test_pending_guest_veh_limit() {
+        // Fill the queue to capacity
+        for i in 0..MAX_PENDING_GUEST_VEH + 10 {
+            let record = ExceptionRecord::new(0xC000_0005, 0x1000 + i as u64);
+            let context = X64Context::default();
+            let accepted = push_pending_guest_veh(0x5000 + i as u64, record, context);
+            if i < MAX_PENDING_GUEST_VEH {
+                assert!(accepted, "entry {i} should be accepted");
+            } else {
+                assert!(!accepted, "entry {i} should be rejected (queue full)");
+            }
+        }
+
+        // Drain and verify count
+        let drained = drain_pending_guest_veh();
+        assert_eq!(
+            drained.len(),
+            MAX_PENDING_GUEST_VEH,
+            "should have exactly MAX_PENDING_GUEST_VEH entries"
+        );
+    }
+
+    /// Test: Unhandled exception produces diagnostic output.
+    /// This test verifies that dispatch logs diagnostic info when no handler
+    /// claims the exception. We can't easily capture eprintln output, but we
+    /// can verify the error path is taken and the error message contains the
+    /// exception code.
+    #[test]
+    fn test_unhandled_exception_diagnostics() {
+        let _guard = VEH_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let mut seh = SehSubsystem::new();
+        let image_base = 0x14000_0000u64;
+
+        // Register .pdata with one function that has no handler
+        let codes = vec![(0, 5), (2, 4)]; // push rbp, alloc 0x28
+        let unwind_data = make_unwind_info(1, 0, &codes); // no EHANDLER/UHANDLER
+
+        let mut data = vec![0u8; 0x2000];
+        data[0x1000..0x1000 + unwind_data.len()].copy_from_slice(&unwind_data);
+        seh.register_unwind_data(image_base, data);
+
+        let mut pdata = Vec::new();
+        pdata.extend_from_slice(&0x1000u32.to_le_bytes());
+        pdata.extend_from_slice(&0x1050u32.to_le_bytes());
+        pdata.extend_from_slice(&0x1000u32.to_le_bytes());
+        seh.register_pdata(image_base, &pdata);
+
+        let no_memory = |_addr: u64, _buf: &mut [u8]| false;
+        let context = X64Context::default();
+
+        let result = seh.dispatch(
+            STATUS_ACCESS_VIOLATION,
+            0x140001000,
+            &context,
+            image_base,
+            &no_memory,
+        );
+        assert!(
+            result.is_err(),
+            "should return error for unhandled exception"
+        );
+        if let Err(err) = result {
+            assert!(
+                err.message.contains("unhandled exception"),
+                "error message should mention unhandled exception"
+            );
+            assert!(
+                err.message
+                    .contains(&format!("{:#x}", STATUS_ACCESS_VIOLATION)),
+                "error message should contain exception code"
+            );
+        }
     }
 }

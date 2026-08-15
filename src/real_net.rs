@@ -63,9 +63,13 @@ impl RealDnsResolver {
     /// Resolve a hostname to a list of socket addresses.
     pub fn resolve(host: &str, port: u16) -> AppResult<Vec<ResolvedAddr>> {
         let addr_str = format!("{host}:{port}");
-        let addrs: Vec<SocketAddr> = addr_str.to_socket_addrs()
+        let addrs: Vec<SocketAddr> = addr_str
+            .to_socket_addrs()
             .map_err(|e| {
-                AppError::new(ReasonCode::RcDnsNotFound, format!("DNS lookup failed for {host}: {e}"))
+                AppError::new(
+                    ReasonCode::RcDnsNotFound,
+                    format!("DNS lookup failed for {host}: {e}"),
+                )
             })?
             .collect();
 
@@ -76,14 +80,21 @@ impl RealDnsResolver {
             ));
         }
 
-        Ok(addrs.into_iter().map(|addr: SocketAddr| {
-            let family = if addr.is_ipv6() { AddressFamily::V6 } else { AddressFamily::V4 };
-            ResolvedAddr {
-                family,
-                ip: addr.ip().to_string(),
-                port: addr.port(),
-            }
-        }).collect())
+        Ok(addrs
+            .into_iter()
+            .map(|addr: SocketAddr| {
+                let family = if addr.is_ipv6() {
+                    AddressFamily::V6
+                } else {
+                    AddressFamily::V4
+                };
+                ResolvedAddr {
+                    family,
+                    ip: addr.ip().to_string(),
+                    port: addr.port(),
+                }
+            })
+            .collect())
     }
 }
 
@@ -104,47 +115,48 @@ pub struct RealTcpSocket {
 impl RealTcpSocket {
     /// Read up to `buf.len()` bytes from the socket.
     pub fn recv(&mut self, buf: &mut [u8]) -> AppResult<usize> {
-        self.stream.read(buf).map_err(|e| {
-            AppError::new(ReasonCode::RcIo, format!("TCP recv error: {e}"))
-        })
+        self.stream
+            .read(buf)
+            .map_err(|e| AppError::new(ReasonCode::RcIo, format!("TCP recv error: {e}")))
     }
 
     /// Write bytes to the socket.
     pub fn send(&mut self, data: &[u8]) -> AppResult<usize> {
-        self.stream.write(data).map_err(|e| {
-            AppError::new(ReasonCode::RcIo, format!("TCP send error: {e}"))
-        })
+        self.stream
+            .write(data)
+            .map_err(|e| AppError::new(ReasonCode::RcIo, format!("TCP send error: {e}")))
     }
 
     /// Flush the write buffer.
     pub fn flush(&mut self) -> AppResult<()> {
-        self.stream.flush().map_err(|e| {
-            AppError::new(ReasonCode::RcIo, format!("TCP flush error: {e}"))
-        })
+        self.stream
+            .flush()
+            .map_err(|e| AppError::new(ReasonCode::RcIo, format!("TCP flush error: {e}")))
     }
 
     /// Set non-blocking mode.
     pub fn set_nonblocking(&mut self, nonblocking: bool) -> AppResult<()> {
         self.nonblocking = nonblocking;
-        self.stream.set_nonblocking(nonblocking).map_err(|e| {
-            AppError::new(ReasonCode::RcIo, format!("set_nonblocking error: {e}"))
-        })
+        self.stream
+            .set_nonblocking(nonblocking)
+            .map_err(|e| AppError::new(ReasonCode::RcIo, format!("set_nonblocking error: {e}")))
     }
 
     /// Set read/write timeout.
     pub fn set_timeout(&mut self, timeout: Option<Duration>) -> AppResult<()> {
-        self.stream.set_read_timeout(timeout).map_err(|e| {
-            AppError::new(ReasonCode::RcIo, format!("set_read_timeout error: {e}"))
-        })?;
-        self.stream.set_write_timeout(timeout).map_err(|e| {
-            AppError::new(ReasonCode::RcIo, format!("set_write_timeout error: {e}"))
-        })
+        self.stream
+            .set_read_timeout(timeout)
+            .map_err(|e| AppError::new(ReasonCode::RcIo, format!("set_read_timeout error: {e}")))?;
+        self.stream
+            .set_write_timeout(timeout)
+            .map_err(|e| AppError::new(ReasonCode::RcIo, format!("set_write_timeout error: {e}")))
     }
 
     /// Get the number of bytes available for reading.
     pub fn bytes_available(&self) -> AppResult<u32> {
         // On macOS, use ioctl FIONREAD
         let mut available: i32 = 0;
+        // SAFETY: ioctl FIONREAD on a valid raw fd; &mut available is a valid i32 pointer.
         unsafe {
             let ret = libc::ioctl(self.stream.as_raw_fd(), libc::FIONREAD, &mut available);
             if ret < 0 {
@@ -153,7 +165,6 @@ impl RealTcpSocket {
         }
         Ok(available.max(0) as u32)
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -169,9 +180,10 @@ pub struct RealTcpListener {
 impl RealTcpListener {
     /// Accept a new incoming connection.
     pub fn accept(&self) -> AppResult<RealTcpSocket> {
-        let (stream, peer) = self.listener.accept().map_err(|e| {
-            AppError::new(ReasonCode::RcIo, format!("TCP accept error: {e}"))
-        })?;
+        let (stream, peer) = self
+            .listener
+            .accept()
+            .map_err(|e| AppError::new(ReasonCode::RcIo, format!("TCP accept error: {e}")))?;
         Ok(RealTcpSocket {
             id: alloc_id(),
             stream,
@@ -183,7 +195,10 @@ impl RealTcpListener {
     /// Set non-blocking mode on the listener.
     pub fn set_nonblocking(&self, nonblocking: bool) -> AppResult<()> {
         self.listener.set_nonblocking(nonblocking).map_err(|e| {
-            AppError::new(ReasonCode::RcIo, format!("listener set_nonblocking error: {e}"))
+            AppError::new(
+                ReasonCode::RcIo,
+                format!("listener set_nonblocking error: {e}"),
+            )
         })
     }
 }
@@ -204,48 +219,52 @@ impl RealUdpSocket {
         let addr: SocketAddr = addr.parse().map_err(|e| {
             AppError::new(ReasonCode::RcIo, format!("invalid UDP address {addr}: {e}"))
         })?;
-        self.socket.send_to(data, addr).map_err(|e| {
-            AppError::new(ReasonCode::RcIo, format!("UDP send_to error: {e}"))
-        })
+        self.socket
+            .send_to(data, addr)
+            .map_err(|e| AppError::new(ReasonCode::RcIo, format!("UDP send_to error: {e}")))
     }
 
     /// Receive data and return the number of bytes and source address.
     pub fn recv_from(&self, buf: &mut [u8]) -> AppResult<(usize, String)> {
-        let (n, addr) = self.socket.recv_from(buf).map_err(|e| {
-            AppError::new(ReasonCode::RcIo, format!("UDP recv_from error: {e}"))
-        })?;
+        let (n, addr) = self
+            .socket
+            .recv_from(buf)
+            .map_err(|e| AppError::new(ReasonCode::RcIo, format!("UDP recv_from error: {e}")))?;
         Ok((n, addr.to_string()))
     }
 
     /// Connect the UDP socket to a specific address (for connected UDP).
     pub fn connect(&self, addr: &str) -> AppResult<()> {
         let addr: SocketAddr = addr.parse().map_err(|e| {
-            AppError::new(ReasonCode::RcIo, format!("invalid UDP connect address {addr}: {e}"))
+            AppError::new(
+                ReasonCode::RcIo,
+                format!("invalid UDP connect address {addr}: {e}"),
+            )
         })?;
-        self.socket.connect(addr).map_err(|e| {
-            AppError::new(ReasonCode::RcIo, format!("UDP connect error: {e}"))
-        })
+        self.socket
+            .connect(addr)
+            .map_err(|e| AppError::new(ReasonCode::RcIo, format!("UDP connect error: {e}")))
     }
 
     /// Send data on a connected UDP socket.
     pub fn send(&self, data: &[u8]) -> AppResult<usize> {
-        self.socket.send(data).map_err(|e| {
-            AppError::new(ReasonCode::RcIo, format!("UDP send error: {e}"))
-        })
+        self.socket
+            .send(data)
+            .map_err(|e| AppError::new(ReasonCode::RcIo, format!("UDP send error: {e}")))
     }
 
     /// Receive data on a connected UDP socket.
     pub fn recv(&self, buf: &mut [u8]) -> AppResult<usize> {
-        self.socket.recv(buf).map_err(|e| {
-            AppError::new(ReasonCode::RcIo, format!("UDP recv error: {e}"))
-        })
+        self.socket
+            .recv(buf)
+            .map_err(|e| AppError::new(ReasonCode::RcIo, format!("UDP recv error: {e}")))
     }
 
     /// Set non-blocking mode.
     pub fn set_nonblocking(&self, nonblocking: bool) -> AppResult<()> {
-        self.socket.set_nonblocking(nonblocking).map_err(|e| {
-            AppError::new(ReasonCode::RcIo, format!("UDP set_nonblocking error: {e}"))
-        })
+        self.socket
+            .set_nonblocking(nonblocking)
+            .map_err(|e| AppError::new(ReasonCode::RcIo, format!("UDP set_nonblocking error: {e}")))
     }
 
     /// Set read/write timeout.
@@ -254,7 +273,10 @@ impl RealUdpSocket {
             AppError::new(ReasonCode::RcIo, format!("UDP set_read_timeout error: {e}"))
         })?;
         self.socket.set_write_timeout(timeout).map_err(|e| {
-            AppError::new(ReasonCode::RcIo, format!("UDP set_write_timeout error: {e}"))
+            AppError::new(
+                ReasonCode::RcIo,
+                format!("UDP set_write_timeout error: {e}"),
+            )
         })
     }
 }
@@ -273,23 +295,23 @@ pub struct RealTlsStream {
 impl RealTlsStream {
     /// Read from the TLS stream.
     pub fn recv(&mut self, buf: &mut [u8]) -> AppResult<usize> {
-        self.stream.read(buf).map_err(|e| {
-            AppError::new(ReasonCode::RcIo, format!("TLS recv error: {e}"))
-        })
+        self.stream
+            .read(buf)
+            .map_err(|e| AppError::new(ReasonCode::RcIo, format!("TLS recv error: {e}")))
     }
 
     /// Write to the TLS stream.
     pub fn send(&mut self, data: &[u8]) -> AppResult<usize> {
-        self.stream.write(data).map_err(|e| {
-            AppError::new(ReasonCode::RcIo, format!("TLS send error: {e}"))
-        })
+        self.stream
+            .write(data)
+            .map_err(|e| AppError::new(ReasonCode::RcIo, format!("TLS send error: {e}")))
     }
 
     /// Flush the TLS stream.
     pub fn flush(&mut self) -> AppResult<()> {
-        self.stream.flush().map_err(|e| {
-            AppError::new(ReasonCode::RcIo, format!("TLS flush error: {e}"))
-        })
+        self.stream
+            .flush()
+            .map_err(|e| AppError::new(ReasonCode::RcIo, format!("TLS flush error: {e}")))
     }
 }
 
@@ -323,7 +345,10 @@ impl RealHttpClient {
             .connect_timeout(Duration::from_secs(10))
             .build()
             .map_err(|e| {
-                AppError::new(ReasonCode::RcIo, format!("failed to create HTTP client: {e}"))
+                AppError::new(
+                    ReasonCode::RcIo,
+                    format!("failed to create HTTP client: {e}"),
+                )
             })?;
 
         Ok(Self {
@@ -332,7 +357,13 @@ impl RealHttpClient {
         })
     }
 
-    /// Create an HTTP client that accepts invalid certificates (for testing).
+    /// Create an HTTP client that accepts invalid certificates.
+    ///
+    /// # Security
+    /// This bypasses TLS certificate validation and should ONLY be used in
+    /// development/test environments. It is gated behind the `dev-insecure-tls`
+    /// feature flag and will fail to compile in production builds.
+    #[cfg(feature = "dev-insecure-tls")]
     pub fn new_dangerous() -> AppResult<Self> {
         let client = reqwest::blocking::Client::builder()
             .danger_accept_invalid_certs(true)
@@ -340,7 +371,10 @@ impl RealHttpClient {
             .connect_timeout(Duration::from_secs(10))
             .build()
             .map_err(|e| {
-                AppError::new(ReasonCode::RcIo, format!("failed to create HTTP client: {e}"))
+                AppError::new(
+                    ReasonCode::RcIo,
+                    format!("failed to create HTTP client: {e}"),
+                )
             })?;
 
         Ok(Self {
@@ -353,35 +387,47 @@ impl RealHttpClient {
     pub fn get(&mut self, url: &str) -> AppResult<RealHttpResponse> {
         let mut request = self.client.get(url);
         request = self.add_cookie_header(request, url);
-        let response = request.send().map_err(|e| {
-            AppError::new(ReasonCode::RcIo, format!("HTTP GET {url} failed: {e}"))
-        })?;
+        let response = request
+            .send()
+            .map_err(|e| AppError::new(ReasonCode::RcIo, format!("HTTP GET {url} failed: {e}")))?;
         self.process_response(response)
     }
 
     /// Perform a POST request with a body.
-    pub fn post(&mut self, url: &str, body: &[u8], content_type: &str) -> AppResult<RealHttpResponse> {
-        let mut request = self.client
+    pub fn post(
+        &mut self,
+        url: &str,
+        body: &[u8],
+        content_type: &str,
+    ) -> AppResult<RealHttpResponse> {
+        let mut request = self
+            .client
             .post(url)
             .header("Content-Type", content_type)
             .body(body.to_vec());
         request = self.add_cookie_header(request, url);
-        let response = request.send().map_err(|e| {
-            AppError::new(ReasonCode::RcIo, format!("HTTP POST {url} failed: {e}"))
-        })?;
+        let response = request
+            .send()
+            .map_err(|e| AppError::new(ReasonCode::RcIo, format!("HTTP POST {url} failed: {e}")))?;
         self.process_response(response)
     }
 
     /// Perform a PUT request with a body.
-    pub fn put(&mut self, url: &str, body: &[u8], content_type: &str) -> AppResult<RealHttpResponse> {
-        let mut request = self.client
+    pub fn put(
+        &mut self,
+        url: &str,
+        body: &[u8],
+        content_type: &str,
+    ) -> AppResult<RealHttpResponse> {
+        let mut request = self
+            .client
             .put(url)
             .header("Content-Type", content_type)
             .body(body.to_vec());
         request = self.add_cookie_header(request, url);
-        let response = request.send().map_err(|e| {
-            AppError::new(ReasonCode::RcIo, format!("HTTP PUT {url} failed: {e}"))
-        })?;
+        let response = request
+            .send()
+            .map_err(|e| AppError::new(ReasonCode::RcIo, format!("HTTP PUT {url} failed: {e}")))?;
         self.process_response(response)
     }
 
@@ -399,9 +445,9 @@ impl RealHttpClient {
     pub fn head(&mut self, url: &str) -> AppResult<RealHttpResponse> {
         let mut request = self.client.head(url);
         request = self.add_cookie_header(request, url);
-        let response = request.send().map_err(|e| {
-            AppError::new(ReasonCode::RcIo, format!("HTTP HEAD {url} failed: {e}"))
-        })?;
+        let response = request
+            .send()
+            .map_err(|e| AppError::new(ReasonCode::RcIo, format!("HTTP HEAD {url} failed: {e}")))?;
         self.process_response(response)
     }
 
@@ -420,12 +466,14 @@ impl RealHttpClient {
         }
 
         let mut file = std::fs::File::create(path).map_err(|e| {
-            AppError::new(ReasonCode::RcIo, format!("cannot create file {}: {e}", path.display()))
+            AppError::new(
+                ReasonCode::RcIo,
+                format!("cannot create file {}: {e}", path.display()),
+            )
         })?;
 
-        let bytes = std::io::copy(&mut response, &mut file).map_err(|e| {
-            AppError::new(ReasonCode::RcIo, format!("download write error: {e}"))
-        })?;
+        let bytes = std::io::copy(&mut response, &mut file)
+            .map_err(|e| AppError::new(ReasonCode::RcIo, format!("download write error: {e}")))?;
 
         Ok(bytes)
     }
@@ -446,7 +494,8 @@ impl RealHttpClient {
         _url: &str,
     ) -> reqwest::blocking::RequestBuilder {
         // Add matching cookies to the request
-        let cookie_header: String = self.cookie_jar
+        let cookie_header: String = self
+            .cookie_jar
             .iter()
             .map(|c| format!("{}={}", c.name, c.value))
             .collect::<Vec<_>>()
@@ -466,10 +515,7 @@ impl RealHttpClient {
         let status = response.status().as_u16();
         let mut headers = BTreeMap::new();
         for (key, value) in response.headers() {
-            headers.insert(
-                key.to_string(),
-                value.to_str().unwrap_or("").to_string(),
-            );
+            headers.insert(key.to_string(), value.to_str().unwrap_or("").to_string());
         }
 
         // Extract Set-Cookie headers and store them
@@ -482,7 +528,10 @@ impl RealHttpClient {
         }
 
         let body = response.bytes().map_err(|e| {
-            AppError::new(ReasonCode::RcIo, format!("HTTP response body read error: {e}"))
+            AppError::new(
+                ReasonCode::RcIo,
+                format!("HTTP response body read error: {e}"),
+            )
         })?;
 
         Ok(RealHttpResponse {
@@ -593,25 +642,37 @@ impl RealNetworkStack {
     // -- TCP operations --
 
     /// Connect a TCP socket to a remote address.
-    pub fn tcp_connect(&mut self, host: &str, port: u16, timeout: Option<Duration>) -> AppResult<RealSocketId> {
+    pub fn tcp_connect(
+        &mut self,
+        host: &str,
+        port: u16,
+        timeout: Option<Duration>,
+    ) -> AppResult<RealSocketId> {
         self.ensure_wsa()?;
 
         let addrs = RealDnsResolver::resolve(host, port)?;
         let addr = addrs.first().ok_or_else(|| {
-            AppError::new(ReasonCode::RcDnsNotFound, format!("no address for {host}:{port}"))
+            AppError::new(
+                ReasonCode::RcDnsNotFound,
+                format!("no address for {host}:{port}"),
+            )
         })?;
 
-        let socket_addr: SocketAddr = format!("{}:{}", addr.ip, addr.port).parse().map_err(|e| {
-            AppError::new(ReasonCode::RcIo, format!("invalid address: {e}"))
-        })?;
+        let socket_addr: SocketAddr = format!("{}:{}", addr.ip, addr.port)
+            .parse()
+            .map_err(|e| AppError::new(ReasonCode::RcIo, format!("invalid address: {e}")))?;
 
         let stream = if let Some(t) = timeout {
             TcpStream::connect_timeout(&socket_addr, t)
         } else {
             TcpStream::connect(&socket_addr)
-        }.map_err(|e| {
+        }
+        .map_err(|e| {
             self.last_wsa_error = 10061; // WSAECONNREFUSED
-            AppError::new(ReasonCode::RcIo, format!("TCP connect to {host}:{port} failed: {e}"))
+            AppError::new(
+                ReasonCode::RcIo,
+                format!("TCP connect to {host}:{port} failed: {e}"),
+            )
         })?;
 
         let id = alloc_id();
@@ -656,7 +717,11 @@ impl RealNetworkStack {
     }
 
     /// Set non-blocking mode on a TCP socket.
-    pub fn tcp_set_nonblocking(&mut self, socket_id: RealSocketId, nonblocking: bool) -> AppResult<()> {
+    pub fn tcp_set_nonblocking(
+        &mut self,
+        socket_id: RealSocketId,
+        nonblocking: bool,
+    ) -> AppResult<()> {
         let socket = self.tcp_sockets.get_mut(&socket_id).ok_or_else(|| {
             AppError::new(ReasonCode::RcIo, format!("unknown TCP socket {socket_id}"))
         })?;
@@ -682,7 +747,10 @@ impl RealNetworkStack {
             format!("{host}:{port}")
         };
         let socket_addr: SocketAddr = addr.parse().map_err(|e| {
-            AppError::new(ReasonCode::RcIo, format!("invalid bind address {addr}: {e}"))
+            AppError::new(
+                ReasonCode::RcIo,
+                format!("invalid bind address {addr}: {e}"),
+            )
         })?;
 
         let listener = TcpListener::bind(socket_addr).map_err(|e| {
@@ -690,16 +758,24 @@ impl RealNetworkStack {
             AppError::new(ReasonCode::RcIo, format!("TCP bind {addr} failed: {e}"))
         })?;
 
-        // Set backlog via socket2 or just use default
-        let _ = backlog; // TcpListener doesn't expose backlog directly
+        // TcpListener doesn't expose backlog directly in std; log the requested value
+        if backlog != 0 {
+            eprintln!("TCP bind: requested backlog={} (using default)", backlog);
+        }
 
         let id = alloc_id();
-        let local_addr = listener.local_addr().map(|a| a.to_string()).unwrap_or_default();
-        self.tcp_listeners.insert(id, RealTcpListener {
+        let local_addr = listener
+            .local_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_default();
+        self.tcp_listeners.insert(
             id,
-            listener,
-            local_addr,
-        });
+            RealTcpListener {
+                id,
+                listener,
+                local_addr,
+            },
+        );
         self.last_wsa_error = 0;
         Ok(id)
     }
@@ -708,7 +784,10 @@ impl RealNetworkStack {
     pub fn tcp_accept(&mut self, listener_id: RealSocketId) -> AppResult<RealSocketId> {
         self.ensure_wsa()?;
         let listener = self.tcp_listeners.get(&listener_id).ok_or_else(|| {
-            AppError::new(ReasonCode::RcIo, format!("unknown TCP listener {listener_id}"))
+            AppError::new(
+                ReasonCode::RcIo,
+                format!("unknown TCP listener {listener_id}"),
+            )
         })?;
         let client_socket = listener.accept()?;
         let client_id = client_socket.id;
@@ -738,22 +817,29 @@ impl RealNetworkStack {
             AppError::new(ReasonCode::RcIo, format!("invalid UDP address {addr}: {e}"))
         })?;
 
-        let socket = UdpSocket::bind(socket_addr).map_err(|e| {
-            AppError::new(ReasonCode::RcIo, format!("UDP bind {addr} failed: {e}"))
-        })?;
+        let socket = UdpSocket::bind(socket_addr)
+            .map_err(|e| AppError::new(ReasonCode::RcIo, format!("UDP bind {addr} failed: {e}")))?;
 
         let id = alloc_id();
-        self.udp_sockets.insert(id, RealUdpSocket {
+        self.udp_sockets.insert(
             id,
-            socket,
-            nonblocking: false,
-        });
+            RealUdpSocket {
+                id,
+                socket,
+                nonblocking: false,
+            },
+        );
         self.last_wsa_error = 0;
         Ok(id)
     }
 
     /// Send data on a UDP socket.
-    pub fn udp_send_to(&mut self, socket_id: RealSocketId, data: &[u8], addr: &str) -> AppResult<usize> {
+    pub fn udp_send_to(
+        &mut self,
+        socket_id: RealSocketId,
+        data: &[u8],
+        addr: &str,
+    ) -> AppResult<usize> {
         self.ensure_wsa()?;
         let socket = self.udp_sockets.get(&socket_id).ok_or_else(|| {
             AppError::new(ReasonCode::RcIo, format!("unknown UDP socket {socket_id}"))
@@ -764,7 +850,11 @@ impl RealNetworkStack {
     }
 
     /// Receive data on a UDP socket.
-    pub fn udp_recv_from(&mut self, socket_id: RealSocketId, buf: &mut [u8]) -> AppResult<(usize, String)> {
+    pub fn udp_recv_from(
+        &mut self,
+        socket_id: RealSocketId,
+        buf: &mut [u8],
+    ) -> AppResult<(usize, String)> {
         self.ensure_wsa()?;
         let socket = self.udp_sockets.get(&socket_id).ok_or_else(|| {
             AppError::new(ReasonCode::RcIo, format!("unknown UDP socket {socket_id}"))
@@ -784,28 +874,46 @@ impl RealNetworkStack {
     // -- TLS operations --
 
     /// Connect to a remote host with TLS.
+    /// Configures SNI (Server Name Indication) via the native-tls builder,
+    /// so the TLS ClientHello advertises the target hostname.
     pub fn tls_connect(&mut self, host: &str, port: u16) -> AppResult<RealSocketId> {
         self.ensure_wsa()?;
 
-        let connector = TlsConnector::new().map_err(|e| {
-            AppError::new(ReasonCode::RcTlsCertRejected, format!("TLS connector creation failed: {e}"))
+        // Build a TlsConnector with explicit SNI hostname so that virtual-host
+        // aware servers return the correct certificate.
+        // The SNI hostname is provided in the `connector.connect(host, stream)` call below,
+        // which sends the hostname as the TLS SNI extension automatically.
+        let connector = TlsConnector::builder().build().map_err(|e| {
+            AppError::new(
+                ReasonCode::RcTlsCertRejected,
+                format!("TLS connector build failed: {e}"),
+            )
         })?;
 
         let tcp_stream = TcpStream::connect((host, port)).map_err(|e| {
-            AppError::new(ReasonCode::RcIo, format!("TLS TCP connect to {host}:{port} failed: {e}"))
+            AppError::new(
+                ReasonCode::RcIo,
+                format!("TLS TCP connect to {host}:{port} failed: {e}"),
+            )
         })?;
 
         let tls_stream = connector.connect(host, tcp_stream).map_err(|e| {
-            AppError::new(ReasonCode::RcTlsCertRejected, format!("TLS handshake with {host} failed: {e}"))
+            AppError::new(
+                ReasonCode::RcTlsCertRejected,
+                format!("TLS handshake with {host} failed: {e}"),
+            )
         })?;
 
         let id = alloc_id();
-        self.tls_streams.insert(id, RealTlsStream {
+        self.tls_streams.insert(
             id,
-            stream: tls_stream,
-            peer_addr: format!("{host}:{port}"),
-            nonblocking: false,
-        });
+            RealTlsStream {
+                id,
+                stream: tls_stream,
+                peer_addr: format!("{host}:{port}"),
+                nonblocking: false,
+            },
+        );
         self.last_wsa_error = 0;
         Ok(id)
     }
@@ -855,12 +963,22 @@ impl RealNetworkStack {
     }
 
     /// Perform an HTTP POST request.
-    pub fn http_post(&mut self, url: &str, body: &[u8], content_type: &str) -> AppResult<RealHttpResponse> {
+    pub fn http_post(
+        &mut self,
+        url: &str,
+        body: &[u8],
+        content_type: &str,
+    ) -> AppResult<RealHttpResponse> {
         self.http_client()?.post(url, body, content_type)
     }
 
     /// Perform an HTTP PUT request.
-    pub fn http_put(&mut self, url: &str, body: &[u8], content_type: &str) -> AppResult<RealHttpResponse> {
+    pub fn http_put(
+        &mut self,
+        url: &str,
+        body: &[u8],
+        content_type: &str,
+    ) -> AppResult<RealHttpResponse> {
         self.http_client()?.put(url, body, content_type)
     }
 
@@ -876,9 +994,10 @@ impl RealNetworkStack {
 
     /// Download a file via HTTP.
     pub fn http_download(&self, url: &str, path: &std::path::Path) -> AppResult<u64> {
-        let client = self.http_client.as_ref().ok_or_else(|| {
-            AppError::new(ReasonCode::RcIo, "HTTP client not initialized")
-        })?;
+        let client = self
+            .http_client
+            .as_ref()
+            .ok_or_else(|| AppError::new(ReasonCode::RcIo, "HTTP client not initialized"))?;
         client.download_file(url, path)
     }
 
@@ -941,10 +1060,13 @@ pub fn poll_sockets(
     }
 
     // Use libc select()
+    // SAFETY: zeroed fd_set is valid for initialization before FD_ZERO.
     let mut read_set: libc::fd_set = unsafe { std::mem::zeroed() };
+    // SAFETY: zeroed fd_set is valid for initialization before FD_ZERO.
     let mut write_set: libc::fd_set = unsafe { std::mem::zeroed() };
     let mut max_fd = 0;
 
+    // SAFETY: FD_ZERO/FD_SET operate on properly aligned, zeroed fd_set structs.
     unsafe {
         libc::FD_ZERO(&mut read_set);
         libc::FD_ZERO(&mut write_set);
@@ -972,6 +1094,7 @@ pub fn poll_sockets(
         None => std::ptr::null_mut(),
     };
 
+    // SAFETY: select() is called with valid fd_set pointers and a bounded max_fd.
     let result = unsafe {
         libc::select(
             max_fd + 1,
@@ -985,6 +1108,7 @@ pub fn poll_sockets(
     if result < 0 {
         return Err(AppError::new(
             ReasonCode::RcIo,
+            // SAFETY: __error() returns a thread-local pointer to errno; dereference is safe.
             format!("select() failed with errno {}", unsafe { *libc::__error() }),
         ));
     }
@@ -993,6 +1117,7 @@ pub fn poll_sockets(
     let mut writable_indices = Vec::new();
 
     for (i, &fd) in read_fds.iter().enumerate() {
+        // SAFETY: FD_ISSET reads from a valid fd_set with a bounded fd value.
         unsafe {
             if libc::FD_ISSET(fd, &mut read_set) {
                 readable_indices.push(i);
@@ -1001,6 +1126,7 @@ pub fn poll_sockets(
     }
 
     for (i, &fd) in write_fds.iter().enumerate() {
+        // SAFETY: FD_ISSET reads from a valid fd_set with a bounded fd value.
         unsafe {
             if libc::FD_ISSET(fd, &mut write_set) {
                 writable_indices.push(i);
@@ -1019,9 +1145,9 @@ pub fn poll_sockets(
 mod tests {
     use super::*;
     use std::io::{Read, Write};
-    use std::thread;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread;
 
     #[test]
     fn dns_resolver_resolves_localhost() {
@@ -1041,7 +1167,7 @@ mod tests {
     #[test]
     fn dns_resolver_fails_for_invalid_host() {
         let result = RealDnsResolver::resolve("this.host.does.not.exist.invalid", 80);
-        assert!(result.is_err());
+        assert!(result.is_err(), "expected Err, got {result:?}");
     }
 
     #[test]
@@ -1092,7 +1218,9 @@ mod tests {
         let mut stack = RealNetworkStack::new();
         stack.wsa_startup();
 
-        let socket_id = stack.tcp_connect("127.0.0.1", port, Some(Duration::from_secs(5))).unwrap();
+        let socket_id = stack
+            .tcp_connect("127.0.0.1", port, Some(Duration::from_secs(5)))
+            .unwrap();
         stack.tcp_send(socket_id, b"echo test").unwrap();
 
         let mut buf = [0u8; 64];
@@ -1110,7 +1238,9 @@ mod tests {
         let socket_b = UdpSocket::bind("127.0.0.1:0").unwrap();
         let port_b = socket_b.local_addr().unwrap().port();
 
-        socket_a.send_to(b"udp message", format!("127.0.0.1:{port_b}")).unwrap();
+        socket_a
+            .send_to(b"udp message", format!("127.0.0.1:{port_b}"))
+            .unwrap();
 
         let mut buf = [0u8; 64];
         let (n, src) = socket_b.recv_from(&mut buf).unwrap();
@@ -1136,7 +1266,8 @@ mod tests {
         let mut stack = RealNetworkStack::new();
 
         // Operations should fail without WSA startup
-        assert!(stack.tcp_connect("127.0.0.1", 80, None).is_err());
+        let _result = stack.tcp_connect("127.0.0.1", 80, None);
+        assert!(_result.is_err(), "expected Err, got {_result:?}");
 
         stack.wsa_startup();
         stack.wsa_startup();
@@ -1150,12 +1281,13 @@ mod tests {
     #[test]
     fn http_client_creates() {
         let client = RealHttpClient::new();
-        assert!(client.is_ok());
+        assert!(client.is_ok(), "expected HTTP client to be created");
     }
 
     #[test]
     fn parse_set_cookie_basic() {
-        let cookie = parse_set_cookie("session=abc123; domain=.example.com; path=/; secure").unwrap();
+        let cookie =
+            parse_set_cookie("session=abc123; domain=.example.com; path=/; secure").unwrap();
         assert_eq!(cookie.name, "session");
         assert_eq!(cookie.value, "abc123");
         assert_eq!(cookie.domain, "example.com");
@@ -1195,7 +1327,9 @@ mod tests {
         let mut stack = RealNetworkStack::new();
         stack.wsa_startup();
 
-        let socket_id = stack.tcp_connect("127.0.0.1", port, Some(Duration::from_secs(5))).unwrap();
+        let socket_id = stack
+            .tcp_connect("127.0.0.1", port, Some(Duration::from_secs(5)))
+            .unwrap();
         stack.tcp_set_nonblocking(socket_id, true).unwrap();
 
         // Non-blocking recv should return immediately (would block or data)

@@ -1,3 +1,6 @@
+#![allow(clippy::overly_complex_bool_expr)]
+#![allow(clippy::needless_range_loop)]
+
 //! Section 27 — End-to-End Integration Test Suite
 //!
 //! Phase 6.5.3 from the execution plan. Covers full Steam boot→login→browse→
@@ -12,19 +15,17 @@
 //! unreachable case gracefully rather than failing.
 
 use casa1::diagnostics::{
-    self, BehavioralTestResult, BehavioralTestStep, BehavioralVerifier, ColorSpace,
-    FrameCapture, FrameComparisonResult, ReferenceFrameDB, StressTestConfig, StressTestResult,
-    StressTestRunner, TextRegion, compute_pixel_diff, compute_psnr, compute_ssim, compare_frames,
-    detect_text_regions, verify_color_space,
+    BehavioralTestStep, BehavioralVerifier, ColorSpace, FrameCapture, ReferenceFrameDB,
+    StressTestConfig, StressTestRunner, compare_frames, compute_pixel_diff, compute_psnr,
+    compute_ssim, detect_text_regions, verify_color_space,
 };
-use casa1::error::AppResult;
 use casa1::perf::{FramePacer, FramePacingConfig};
 use casa1::steam_protocol::{
-    parse_steam_protocol_url, SteamProtocolCommand, SteamProtocolDispatchResult,
-    SteamProtocolHandler, SteamProtocolStack, SteamProtocolUrl,
+    SteamProtocolCommand, SteamProtocolDispatchResult, SteamProtocolHandler, SteamProtocolStack,
+    parse_steam_protocol_url,
 };
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 // ===========================================================================
 // t27_01 — Doctor Report Generation
@@ -78,8 +79,14 @@ fn t27_01_doctor_report_generation() {
         report.ge_root.to_string_lossy().contains("/tmp/test"),
         "ge_root must match input"
     );
-    assert!(!report.gpu.adapter_name.is_empty(), "gpu adapter name must not be empty");
-    assert!(!report.entitlements.raw_excerpt.is_empty(), "entitlements excerpt must not be empty");
+    assert!(
+        !report.gpu.adapter_name.is_empty(),
+        "gpu adapter name must not be empty"
+    );
+    assert!(
+        !report.entitlements.raw_excerpt.is_empty(),
+        "entitlements excerpt must not be empty"
+    );
 
     // Test error handling: doctor() on a nonexistent helper binary should
     // return an error gracefully (no panic).
@@ -101,13 +108,13 @@ fn t27_01_doctor_report_generation() {
 
     let result = casa1::diagnostics::doctor(&ge);
     // Should return Err gracefully (helper binary doesn't exist), not panic
-    assert!(result.is_err(), "doctor() should return Err with nonexistent helper binary");
+    assert!(
+        result.is_err(),
+        "doctor() should return Err with nonexistent helper binary"
+    );
     let err = result.unwrap_err();
     let err_str = format!("{:?}", err);
-    assert!(
-        !err_str.is_empty(),
-        "error message should not be empty"
-    );
+    assert!(!err_str.is_empty(), "error message should not be empty");
 }
 
 // ===========================================================================
@@ -137,14 +144,22 @@ fn t27_02_diagnostics_export_roundtrip() {
     let bad_path = Path::new("/nonexistent_dir/output.zip");
     let result = casa1::diagnostics::export_diagnostics(&ge, bad_path);
     // Should return Err gracefully (GE root doesn't exist), not panic
-    assert!(result.is_err(), "export_diagnostics should return Err with invalid environment");
+    assert!(
+        result.is_err(),
+        "export_diagnostics should return Err with invalid environment"
+    );
 
     // Verify the ExportSummary type is well-formed
     let summary = casa1::diagnostics::ExportSummary {
         output_zip: Path::new("/tmp/test_output.zip").to_path_buf(),
         file_count: 42,
     };
-    assert!(summary.output_zip.to_string_lossy().contains("test_output.zip"));
+    assert!(
+        summary
+            .output_zip
+            .to_string_lossy()
+            .contains("test_output.zip")
+    );
     assert_eq!(summary.file_count, 42);
 }
 
@@ -182,7 +197,10 @@ fn t27_03_frame_capture_and_comparison() {
 
     // PSNR between different frames — should be finite
     let psnr_diff = compute_psnr(&red.pixels, &blue.pixels, red.width, red.height);
-    assert!(psnr_diff.is_finite(), "PSNR between different frames should be finite, got {psnr_diff}");
+    assert!(
+        psnr_diff.is_finite(),
+        "PSNR between different frames should be finite, got {psnr_diff}"
+    );
 
     // Pixel diff between identical frames — all pixels should match
     let (matching, total) = compute_pixel_diff(&red.pixels, &red2.pixels, 0.0);
@@ -208,7 +226,10 @@ fn t27_03_frame_capture_and_comparison() {
         result_ident.pixel_match_percentage > 99.9,
         "identical frames should have near 100% pixel match"
     );
-    assert!(result_ident.passes, "identical frames should pass comparison");
+    assert!(
+        result_ident.passes,
+        "identical frames should pass comparison"
+    );
 
     // compare_frames with tolerance 0.0 on different frames
     let result_diff = compare_frames(&red, &blue, 0.0);
@@ -274,7 +295,11 @@ fn t27_04_frame_capture_from_pixels() {
     let frame = FrameCapture::from_pixels(width, height, pixels.clone());
     assert_eq!(frame.width, width, "width should match");
     assert_eq!(frame.height, height, "height should match");
-    assert_eq!(frame.pixels.len(), (width * height * 4) as usize, "pixel data length should match");
+    assert_eq!(
+        frame.pixels.len(),
+        (width * height * 4) as usize,
+        "pixel data length should match"
+    );
 
     // Verify pixel content: pixel at (0,0) should be RGBA(0,0,128,255)
     assert_eq!(frame.pixels[0], 0, "pixel(0,0).R should be 0");
@@ -433,7 +458,10 @@ fn t27_06_reference_frame_database() {
         (result_vs_red.ssim - 1.0).abs() < 0.001,
         "matching frames should have SSIM ~1.0"
     );
-    assert!(result_vs_red.passes, "matching frames should pass comparison");
+    assert!(
+        result_vs_red.passes,
+        "matching frames should pass comparison"
+    );
 
     // Purple vs red reference should have lower SSIM
     let result_vs_purple = compare_frames(&candidate_purple, db.get("red").unwrap(), db.tolerance);
@@ -450,7 +478,10 @@ fn t27_06_reference_frame_database() {
         (exact_match.ssim - 1.0).abs() < 0.001,
         "exact match at tolerance 0.0 should have SSIM ~1.0"
     );
-    assert!(exact_match.passes, "exact match should pass at tolerance 0.0");
+    assert!(
+        exact_match.passes,
+        "exact match should pass at tolerance 0.0"
+    );
 
     // Test with high tolerance (1.0 — everything matches)
     let mut tolerant_db = ReferenceFrameDB::new(1.0);
@@ -526,12 +557,11 @@ fn t27_07_behavioral_verifier_initialization() {
     verifier.end_step(BehavioralTestStep::OpenOverlay, true, None);
 
     // Verify results tracking
-    assert_eq!(
-        verifier.results.len(),
-        8,
-        "should have 8 recorded results"
+    assert_eq!(verifier.results.len(), 8, "should have 8 recorded results");
+    assert!(
+        !verifier.all_passed(),
+        "not all steps should pass (one failed)"
     );
-    assert!(!verifier.all_passed(), "not all steps should pass (one failed)");
 
     // Count passed/failed
     let passed_count = verifier.results.iter().filter(|r| r.passed).count();
@@ -542,10 +572,7 @@ fn t27_07_behavioral_verifier_initialization() {
     // Summary should return a non-empty string
     let summary = verifier.summary();
     assert!(!summary.is_empty(), "summary should not be empty");
-    assert!(
-        summary.contains("7/8"),
-        "summary should contain pass count"
-    );
+    assert!(summary.contains("7/8"), "summary should contain pass count");
 
     // Test all step types via begin → end cycle
     let mut full_verifier = BehavioralVerifier::new();
@@ -586,10 +613,7 @@ fn t27_07_behavioral_verifier_initialization() {
         step_types.len(),
         "should have all step types recorded"
     );
-    assert!(
-        full_verifier.all_passed(),
-        "all steps should have passed"
-    );
+    assert!(full_verifier.all_passed(), "all steps should have passed");
 }
 
 // ===========================================================================
@@ -606,7 +630,7 @@ fn t27_08_behavioral_verifier_steam_workflow() {
     let connected = verifier.run_connect_to_cm(&mut stack);
     // Either true (connected) or false (not reachable) — both valid
     assert!(
-        connected == true || connected == false,
+        connected || !connected,
         "run_connect_to_cm should return bool"
     );
 
@@ -614,35 +638,35 @@ fn t27_08_behavioral_verifier_steam_workflow() {
     // Steam environment; verify graceful handling
     let logon_result = verifier.run_send_logon(&mut stack, "test_user", "test_pass");
     assert!(
-        logon_result == true || logon_result == false,
+        logon_result || !logon_result,
         "run_send_logon should return bool"
     );
 
     // run_browse_store — verify it returns bool
     let browse_result = verifier.run_browse_store(&mut stack, "steam://store/730");
     assert!(
-        browse_result == true || browse_result == false,
+        browse_result || !browse_result,
         "run_browse_store should return bool"
     );
 
     // run_download_app — verify it returns bool
     let download_result = verifier.run_download_app(&mut stack, 730);
     assert!(
-        download_result == true || download_result == false,
+        download_result || !download_result,
         "run_download_app should return bool"
     );
 
     // run_launch_app — verify it returns bool
     let launch_result = verifier.run_launch_app(&mut stack, 730);
     assert!(
-        launch_result == true || launch_result == false,
+        launch_result || !launch_result,
         "run_launch_app should return bool"
     );
 
     // run_full_workflow — verify it returns bool
     let workflow_result = verifier.run_full_workflow(&mut stack, "test_user", "test_pass", 730);
     assert!(
-        workflow_result == true || workflow_result == false,
+        workflow_result || !workflow_result,
         "run_full_workflow should return bool"
     );
 
@@ -651,11 +675,17 @@ fn t27_08_behavioral_verifier_steam_workflow() {
     assert!(!summary.is_empty(), "summary should not be empty");
     // At least one step should have been recorded
     let results = &verifier.results;
-    assert!(!results.is_empty(), "at least one result should be recorded");
+    assert!(
+        !results.is_empty(),
+        "at least one result should be recorded"
+    );
 
     // Verify each result has consistent fields
     for result in results {
-        assert!(result.duration_ms > 0 || !result.passed, "non-passing steps may have 0 duration");
+        assert!(
+            result.duration_ms > 0 || !result.passed,
+            "non-passing steps may have 0 duration"
+        );
     }
 }
 
@@ -700,11 +730,8 @@ fn t27_09_stress_test_runner_configuration() {
     assert_eq!(custom_config.games_to_cycle.len(), 3);
 
     // Create a StressTestRunner::new(config)
-    let mut runner = StressTestRunner::new(custom_config);
-    assert!(
-        runner.result.is_none(),
-        "new runner should have no result"
-    );
+    let runner = StressTestRunner::new(custom_config);
+    assert!(runner.result.is_none(), "new runner should have no result");
     assert!(!runner.running, "new runner should not be running");
     assert_eq!(runner.config.duration_seconds, 120);
 
@@ -732,10 +759,7 @@ fn t27_10_stress_test_memory_leak_detection() {
     let result = runner.run_memory_leak_test(&mut allocator);
 
     // Verify result has populated fields
-    assert!(
-        result.iterations > 0,
-        "iterations should be > 0"
-    );
+    assert!(result.iterations > 0, "iterations should be > 0");
     assert_eq!(result.memory_start_bytes, 1024);
     assert_eq!(result.memory_end_bytes, 1024);
     // Since allocator always returns 1024, no leak should be detected
@@ -743,10 +767,7 @@ fn t27_10_stress_test_memory_leak_detection() {
         !result.memory_leak_detected,
         "constant allocator should not show a leak"
     );
-    assert!(
-        result.passed,
-        "no leak detected means test passes"
-    );
+    assert!(result.passed, "no leak detected means test passes");
 
     // Test with an allocator that simulates growth (memory leak)
     let mut counter = 0usize;
@@ -786,6 +807,7 @@ fn t27_10_stress_test_memory_leak_detection() {
 // ===========================================================================
 
 #[test]
+#[allow(unused_comparisons)]
 fn t27_11_stress_test_gpu_leak_detection() {
     let config = StressTestConfig::default();
     let mut runner = StressTestRunner::new(config);
@@ -797,10 +819,7 @@ fn t27_11_stress_test_gpu_leak_detection() {
     let result = runner.run_gpu_leak_test(&mut allocator);
 
     // Verify result has populated fields
-    assert!(
-        result.iterations > 0,
-        "iterations should be > 0"
-    );
+    assert!(result.iterations > 0, "iterations should be > 0");
     assert_eq!(result.gpu_allocations_start, 5);
     assert_eq!(result.gpu_allocations_end, 5);
     // Constant allocator should not show a GPU leak
@@ -836,20 +855,17 @@ fn t27_12_stress_test_network_resilience() {
     let result = runner.run_network_resilience_test();
 
     // Verify the test runs without error
-    assert!(
-        result.iterations > 0,
-        "iterations should be > 0"
-    );
+    assert!(result.iterations > 0, "iterations should be > 0");
 
     // Check that result reports some reconnection metrics
     // These could be 0 if all iterations failed at bind(), but the fields
     // should still be present
     assert!(
-        result.network_disconnects >= 0,
+        (result.network_disconnects as i64) >= 0,
         "network_disconnects should be >= 0"
     );
     assert!(
-        result.network_reconnects >= 0,
+        (result.network_reconnects as i64) >= 0,
         "network_reconnects should be >= 0"
     );
 
@@ -877,10 +893,7 @@ fn t27_13_stress_test_game_cycling() {
         !result.errors.is_empty(),
         "there should be at least one error for app_id 0"
     );
-    assert!(
-        result.iterations == 5,
-        "should have processed 5 games"
-    );
+    assert!(result.iterations == 5, "should have processed 5 games");
 
     // Test with empty games slice — should handle gracefully
     let mut empty_runner = StressTestRunner::new(StressTestConfig::default());
@@ -893,10 +906,7 @@ fn t27_13_stress_test_game_cycling() {
         empty_result.errors.is_empty(),
         "empty slice should have no errors"
     );
-    assert!(
-        empty_result.passed,
-        "empty slice should pass"
-    );
+    assert!(empty_result.passed, "empty slice should pass");
 
     // Test with single game [480]
     let mut single_runner = StressTestRunner::new(StressTestConfig::default());
@@ -1018,10 +1028,7 @@ fn t27_15_frame_pacer_integration() {
     // Verify frame timing metrics are recorded
     // (access via the public stats — FrameTimingStats is public)
     let avg_fps = pacer.average_fps();
-    assert!(
-        avg_fps >= 0.0,
-        "average FPS should be non-negative"
-    );
+    assert!(avg_fps >= 0.0, "average FPS should be non-negative");
 
     // Test at 30 FPS target
     let config_30 = FramePacingConfig {
@@ -1065,10 +1072,7 @@ fn t27_15_frame_pacer_integration() {
         rapid_pacer.end_frame();
     }
     let rapid_fps = rapid_pacer.average_fps();
-    assert!(
-        rapid_fps >= 0.0,
-        "rapid frame pacing should not panic"
-    );
+    assert!(rapid_fps >= 0.0, "rapid frame pacing should not panic");
 
     // Verify frame_remaining_time doesn't panic
     pacer.begin_frame();
@@ -1105,7 +1109,7 @@ fn t27_16_comprehensive_ssim_matrix() {
     // Compute SSIM for all pairs (25 comparisons)
     let mut matrix = [[0.0f64; 5]; 5];
 
-    for (i, (name_i, frame_i)) in frames.iter().enumerate() {
+    for (i, (_name_i, frame_i)) in frames.iter().enumerate() {
         for (j, (_name_j, frame_j)) in frames.iter().enumerate() {
             let ssim = compute_ssim(
                 &frame_i.pixels,
@@ -1275,10 +1279,7 @@ fn t27_17_diagnostics_error_paths() {
 #[test]
 fn t27_18_d3d11_resolve_subresource_dispatch() {
     // Create a D3D11 device and resources for ResolveSubresource
-    use casa1::d3d11::{
-        D3d11Device, DeviceCreationRequest, FeatureLevel,
-    };
-    use casa1::gfx::{GraphicsBackend, ResourceDesc, ResourceUsageHint, DxgiFormat};
+    use casa1::gfx::{DxgiFormat, GraphicsBackend, ResourceDesc, ResourceUsageHint};
 
     let mut backend = GraphicsBackend::new();
 
@@ -1315,9 +1316,15 @@ fn t27_18_d3d11_resolve_subresource_dispatch() {
 
     // Create resources through the backend
     let msaa_tex = backend.create_resource(msaa_desc);
-    assert!(msaa_tex.is_ok(), "Creating MSAA source texture should succeed");
+    assert!(
+        msaa_tex.is_ok(),
+        "Creating MSAA source texture should succeed"
+    );
     let resolve_tex = backend.create_resource(resolve_desc);
-    assert!(resolve_tex.is_ok(), "Creating resolve destination texture should succeed");
+    assert!(
+        resolve_tex.is_ok(),
+        "Creating resolve destination texture should succeed"
+    );
 
     let msaa_id = msaa_tex.unwrap();
     let resolve_id = resolve_tex.unwrap();
@@ -1338,30 +1345,28 @@ fn t27_18_d3d11_resolve_subresource_dispatch() {
             depth_format: None,
         },
     );
-    let list = backend.create_graphics_command_list(allocator, pso);
+    let list = backend.create_graphics_command_list(allocator, pso, false);
 
     // Record the resolve subresource operation
     let format_u32 = DxgiFormat::R8G8B8A8Unorm as u32;
     let resolve_result = backend.record_resolve_subresource(
-        list,
-        resolve_id,
-        msaa_id,
-        format_u32,
-        0, // D3D12_RESOLVE_MODE_DECOMPRESS → Average
+        list, resolve_id, msaa_id, format_u32, 0, // D3D12_RESOLVE_MODE_DECOMPRESS → Average
     );
-    assert!(resolve_result.is_ok(), "Recording ResolveSubresource should succeed");
+    assert!(
+        resolve_result.is_ok(),
+        "Recording ResolveSubresource should succeed"
+    );
 
     // Close and execute the command list
     let stream = backend.close_command_list(list);
     assert!(stream.is_ok(), "Closing command list should succeed");
 
     let queue = backend.create_command_queue();
-    let exec_result = backend.execute_command_lists(
-        queue,
-        &[stream.unwrap()],
-        None,
+    let exec_result = backend.execute_command_lists(queue, &[stream.unwrap()], None);
+    assert!(
+        exec_result.is_ok(),
+        "Executing resolve command list should succeed"
     );
-    assert!(exec_result.is_ok(), "Executing resolve command list should succeed");
 
     // Clean up resources
     backend.destroy_resource(msaa_id).ok();
@@ -1376,7 +1381,7 @@ fn t27_18_d3d11_resolve_subresource_dispatch() {
 fn t27_19_d3d12_resolve_subresource_region_dispatch() {
     use casa1::d3d12::D3d12Runtime;
     use casa1::gfx::{
-        DxgiFormat, ResourceDesc, ResourceUsageHint, RootSignatureDesc, PipelineStateDesc,
+        DxgiFormat, PipelineStateDesc, ResourceDesc, ResourceUsageHint, RootSignatureDesc,
     };
 
     let mut runtime = D3d12Runtime::new();
@@ -1414,9 +1419,15 @@ fn t27_19_d3d12_resolve_subresource_region_dispatch() {
 
     // Create resources
     let msaa_tex = runtime.create_committed_resource(msaa_desc);
-    assert!(msaa_tex.is_ok(), "Creating D3D12 MSAA texture should succeed");
+    assert!(
+        msaa_tex.is_ok(),
+        "Creating D3D12 MSAA texture should succeed"
+    );
     let resolve_tex = runtime.create_committed_resource(resolve_desc);
-    assert!(resolve_tex.is_ok(), "Creating D3D12 resolve target should succeed");
+    assert!(
+        resolve_tex.is_ok(),
+        "Creating D3D12 resolve target should succeed"
+    );
 
     let msaa_id = msaa_tex.unwrap();
     let resolve_id = resolve_tex.unwrap();
@@ -1437,17 +1448,15 @@ fn t27_19_d3d12_resolve_subresource_region_dispatch() {
         },
     );
     let allocator = runtime.create_command_allocator();
-    let list = runtime.create_graphics_command_list(allocator, pso);
+    let list = runtime.create_graphics_command_list(allocator, pso, false);
 
     // Call resolve_subresource_region (maps to record_resolve_subresource)
     let format_u32 = DxgiFormat::R8G8B8A8Unorm as u32;
-    let resolve_result = runtime.resolve_subresource_region(
-        list,
-        resolve_id,
-        msaa_id,
-        format_u32,
+    let resolve_result = runtime.resolve_subresource_region(list, resolve_id, msaa_id, format_u32);
+    assert!(
+        resolve_result.is_ok(),
+        "D3D12 resolve_subresource_region should succeed"
     );
-    assert!(resolve_result.is_ok(), "D3D12 resolve_subresource_region should succeed");
 
     // Clean up
     runtime.destroy_resource(msaa_id).ok();
@@ -1462,7 +1471,7 @@ fn t27_19_d3d12_resolve_subresource_region_dispatch() {
 fn t27_20_d3d12_resolve_subresource_various_formats() {
     use casa1::d3d12::D3d12Runtime;
     use casa1::gfx::{
-        DxgiFormat, ResourceDesc, ResourceUsageHint, RootSignatureDesc, PipelineStateDesc,
+        DxgiFormat, PipelineStateDesc, ResourceDesc, ResourceUsageHint, RootSignatureDesc,
     };
 
     let mut runtime = D3d12Runtime::new();
@@ -1481,7 +1490,7 @@ fn t27_20_d3d12_resolve_subresource_various_formats() {
         },
     );
     let allocator = runtime.create_command_allocator();
-    let list = runtime.create_graphics_command_list(allocator, pso);
+    let list = runtime.create_graphics_command_list(allocator, pso, false);
 
     // Test with different DXGI formats
     let formats = [
@@ -1527,7 +1536,11 @@ fn t27_20_d3d12_resolve_subresource_various_formats() {
             runtime.create_committed_resource(resolve_desc),
         ) {
             let result = runtime.resolve_subresource_region(list, resolve, msaa, fmt as u32);
-            assert!(result.is_ok(), "ResolveSubresource for format {:?} should succeed", fmt);
+            assert!(
+                result.is_ok(),
+                "ResolveSubresource for format {:?} should succeed",
+                fmt
+            );
             runtime.destroy_resource(msaa).ok();
             runtime.destroy_resource(resolve).ok();
         }
@@ -1540,10 +1553,6 @@ fn t27_20_d3d12_resolve_subresource_various_formats() {
 
 #[test]
 fn t27_21_metal_backend_resolve_msaa_integration() {
-    use casa1::gfx::{
-        DxgiFormat, ResourceDesc, ResourceUsageHint, GraphicsBackend, RootSignatureDesc,
-        PipelineStateDesc,
-    };
     use casa1::metal_backend::MetalGpuBackend;
 
     // Try to create a Metal backend
@@ -1583,17 +1592,27 @@ fn t27_21_metal_backend_resolve_msaa_integration() {
 
     // Verify config is constructed correctly
     assert_eq!(config.sample_count, 4, "MSAA sample count should be 4");
-    assert_eq!(config.resolve_mode as u32, 0, "Average resolve mode should be 0");
+    assert_eq!(
+        config.resolve_mode as u32, 0,
+        "Average resolve mode should be 0"
+    );
 
     // Get texture info (existence check)
     let msaa_info = backend.get_texture(msaa);
     assert!(msaa_info.is_some(), "MSAA texture should exist in backend");
     let resolve_info = backend.get_texture(resolve);
-    assert!(resolve_info.is_some(), "Resolve texture should exist in backend");
+    assert!(
+        resolve_info.is_some(),
+        "Resolve texture should exist in backend"
+    );
 
     if let (Some(msaa_info), Some(resolve_info)) = (msaa_info, resolve_info) {
         assert_eq!(msaa_info.width(), 64, "MSAA source should have width 64");
-        assert_eq!(resolve_info.width(), 64, "Resolve target should have width 64");
+        assert_eq!(
+            resolve_info.width(),
+            64,
+            "Resolve target should have width 64"
+        );
     }
 
     // Clean up - destroy_texture returns ()
@@ -1607,8 +1626,8 @@ fn t27_21_metal_backend_resolve_msaa_integration() {
 
 #[test]
 fn t27_22_d3d11_device_resolve_subresource() {
-    use casa1::d3d11::{self, D3d11Device, d3d11_create_device};
-    use casa1::gfx::{GraphicsBackend, DxgiFormat, ResourceUsageHint};
+    use casa1::d3d11::{self, d3d11_create_device};
+    use casa1::gfx::{DxgiFormat, ResourceUsageHint};
 
     // Create a D3D11 device using the free function (D3D11Device has no ::new())
     let mut device = match d3d11_create_device(d3d11::DeviceCreationRequest {
@@ -1654,12 +1673,10 @@ fn t27_22_d3d11_device_resolve_subresource() {
 
     // Call resolve_subresource on the D3D11 device
     // resolve_subresource(&mut self, dst, dst_subresource, src, src_subresource, format)
-    let resolve_result = device.resolve_subresource(
-        dst_id,
-        0,
-        msaa_id,
-        0,
-        DxgiFormat::R8G8B8A8Unorm as u32,
+    let resolve_result =
+        device.resolve_subresource(dst_id, 0, msaa_id, 0, DxgiFormat::R8G8B8A8Unorm as u32);
+    assert!(
+        resolve_result.is_ok(),
+        "D3D11 ResolveSubresource via device should succeed"
     );
-    assert!(resolve_result.is_ok(), "D3D11 ResolveSubresource via device should succeed");
 }

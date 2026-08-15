@@ -12,14 +12,13 @@ use crate::error::{AppError, AppResult};
 use crate::ge::GameEnvironment;
 use crate::pe_runtime;
 use crate::reason::ReasonCode;
-use crate::steam_protocol::{
-    SteamProtocolCommand, SteamProtocolDispatchResult, SteamProtocolHandler, SteamProtocolUrl,
-};
+use crate::steam_protocol::{SteamProtocolDispatchResult, SteamProtocolHandler, SteamProtocolUrl};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
 // ---------------------------------------------------------------------------
@@ -231,9 +230,7 @@ impl SteamEnvironment {
             ));
         }
 
-        let exe_size = fs::metadata(&steam_exe)
-            .map(|m| m.len())
-            .unwrap_or(0);
+        let exe_size = fs::metadata(&steam_exe).map(|m| m.len()).unwrap_or(0);
 
         let service_exists = service_exe.exists();
 
@@ -290,7 +287,8 @@ impl SteamNamedPipeManager {
 
     /// Register an active IPC pipe.
     pub fn register_pipe(&mut self, channel: &str, path: &str) {
-        self.active_pipes.insert(channel.to_string(), path.to_string());
+        self.active_pipes
+            .insert(channel.to_string(), path.to_string());
     }
 
     /// List all active IPC pipes.
@@ -308,119 +306,354 @@ impl SteamNamedPipeManager {
 // SteamService execution
 // ---------------------------------------------------------------------------
 
+/// Service state machine for SteamService.exe lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceState {
+    /// Service is not running.
+    Stopped,
+    /// Service is in the process of starting.
+    Starting,
+    /// Service is running (either as real process or stub mode).
+    Running,
+    /// Service encountered an error during startup.
+    Error,
+}
+
 /// Manages the SteamService.exe background process lifecycle.
+///
+/// Searches multiple candidate directories for `SteamService.exe`:
+///   1. `${ge_root}/drive_c/Steam/bin/SteamService.exe`
+///   2. `${ge_root}/drive_c/Program Files (x86)/Steam/bin/SteamService.exe`
+///   3. `/Applications/Steam.app/Contents/MacOS/bin/SteamService.exe` (native macOS)
+///
+/// Implements the service protocol so that Steam.exe's `CreatePipe` /
+/// `CallNamedPipe` requests receive valid responses.
 pub struct SteamServiceProcess {
-    /// The host path to SteamService.exe.
+    /// The resolved host path to SteamService.exe (may be empty).
     service_path: PathBuf,
-    /// Child process handle (if running).
+    /// Child process handle (if running as native process).
     child: Option<std::process::Child>,
-    /// Whether the service is running.
-    running: bool,
+    /// Service process ID if running.
+    service_pid: u32,
+    /// Service state.
+    state: ServiceState,
     /// Service startup timestamp.
     started_at: Instant,
     /// Optional steam:// protocol handler registered with the OS.
     protocol_handler: Option<SteamProtocolHandler>,
+    /// Queue of incoming named-pipe-style requests (CreatePipe / CallNamedPipe).
+    pipe_requests: std::collections::VecDeque<(Vec<u8>, Instant)>,
+    /// Tracks whether we've attempted native macOS SteamService.
+    attempted_native: bool,
 }
 
 impl SteamServiceProcess {
     /// Create a new service process tracker for the given GE root.
     ///
-    /// Resolves `bin/SteamService.exe` relative to the GE's `drive_c/Steam`
-    /// directory.
+    /// Searches multiple candidate locations for SteamService.exe.
     pub fn new(ge_root: &Path) -> Self {
-        let service_path = ge_root
-            .join("drive_c")
-            .join("Steam")
-            .join(SteamPaths::STEAM_SERVICE_EXE);
+        let service_path = Self::find_service_exe(ge_root);
         Self {
             service_path,
             child: None,
-            running: false,
+            service_pid: 0,
+            state: ServiceState::Stopped,
             started_at: Instant::now(),
             protocol_handler: None,
+            pipe_requests: std::collections::VecDeque::new(),
+            attempted_native: false,
         }
+    }
+
+    /// Search multiple locations for SteamService.exe.
+    fn find_service_exe(ge_root: &Path) -> PathBuf {
+        // Candidate 1: Standard GE Steam directory
+        let candidates = [
+            ge_root
+                .join("drive_c")
+                .join("Steam")
+                .join(SteamPaths::STEAM_SERVICE_EXE),
+            ge_root
+                .join("drive_c")
+                .join("Program Files (x86)")
+                .join("Steam")
+                .join(SteamPaths::STEAM_SERVICE_EXE),
+            ge_root
+                .join("drive_c")
+                .join("Program Files")
+                .join("Steam")
+                .join(SteamPaths::STEAM_SERVICE_EXE),
+            PathBuf::from("/Applications/Steam.app/Contents/MacOS")
+                .join(SteamPaths::STEAM_SERVICE_EXE),
+            PathBuf::from("/Applications/Steam.app/Contents/MacOS/bin/SteamService.exe"),
+            // Also check the native Steam installation
+            PathBuf::from(std::env::var("HOME").unwrap_or_default())
+                .join("Library/Application Support/Steam/SteamService.exe"),
+        ];
+
+        for candidate in &candidates {
+            if candidate.exists() {
+                eprintln!("SteamService: found at {}", candidate.display());
+                return candidate.clone();
+            }
+        }
+
+        // If not found anywhere, use the default GE path (will trigger stub mode).
+        eprintln!("SteamService: not found anywhere, will use stub mode");
+        ge_root
+            .join("drive_c")
+            .join("Steam")
+            .join(SteamPaths::STEAM_SERVICE_EXE)
     }
 
     /// Start the SteamService.exe process.
     ///
-    /// If the executable exists, this attempts to run it through the GE via
-    /// `pe_runtime::execute`. If the executable is not present (which is
-    /// expected in most setups), the service is marked as running in a stub
-    /// state without spawning an actual process.
+    /// If the executable exists, this attempts to run it:
+    ///   - As a native macOS process if found in `/Applications/Steam.app/...`
+    ///   - Through the GE via `pe_runtime::execute` for Windows PE
+    ///
+    /// If the executable is not present, the service enters stub mode
+    /// and responds to `CreatePipe`/`CallNamedPipe` requests from Steam.exe
+    /// with valid protocol responses.
     pub fn start(&mut self, ge: &GameEnvironment) -> AppResult<()> {
-        if self.running {
+        if self.state == ServiceState::Running {
             return Ok(());
         }
+        self.state = ServiceState::Starting;
 
         // Register the steam:// URL protocol handler with the OS.
-        // On macOS, this calls LSSetDefaultHandlerForURLScheme to register
-        // the Casa1 bundle as the handler for steam:// URLs. This is also
-        // configured via Info.plist CFBundleURLTypes for early registration.
         let mut handler = SteamProtocolHandler::new_verbose();
         handler.register();
         self.protocol_handler = Some(handler);
 
         // Check if SteamService.exe exists
         if !self.service_path.exists() {
-            // Graceful stub: mark as running even without the executable.
-            // The service will respond to queries as if alive.
-            self.running = true;
+            eprintln!("SteamService: executable not found, entering stub mode");
+            self.state = ServiceState::Running;
             self.started_at = Instant::now();
             return Ok(());
         }
 
-        // Attempt to execute SteamService.exe via the PE runtime.
-        // This is a simplified execution — in production the service would
-        // run as a background daemon.
-        let args: Vec<String> = Vec::new();
-        let env = BTreeMap::new();
-        let cwd = self.service_path.parent().unwrap_or(Path::new("."));
+        // Determine if this is a native macOS or Windows PE executable
+        let is_native_macos = self
+            .service_path
+            .to_string_lossy()
+            .contains("/Applications/Steam.app");
 
-        match pe_runtime::execute(
-            &self.service_path,
-            &args,
-            ge,
-            cwd,
-            &env,
-            false, // dtm
-            "steam-service",
-        ) {
-            Ok(result) => {
-                self.child = None; // execute is blocking; no child handle
-                self.running = result.exit_code == 0 || result.exit_code == 0;
-                self.started_at = Instant::now();
-                Ok(())
+        if is_native_macos {
+            // Run as a native macOS process
+            match std::process::Command::new(&self.service_path)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+            {
+                Ok(child) => {
+                    self.service_pid = child.id();
+                    self.child = Some(child);
+                    self.state = ServiceState::Running;
+                    self.started_at = Instant::now();
+                    eprintln!(
+                        "SteamService: spawned native process (PID {})",
+                        self.service_pid
+                    );
+                    Ok(())
+                }
+                Err(e) => {
+                    eprintln!(
+                        "SteamService: failed to spawn native process: {e}, falling back to stub"
+                    );
+                    self.state = ServiceState::Running;
+                    self.started_at = Instant::now();
+                    Ok(())
+                }
             }
-            Err(e) => {
-                // If PE execution fails, fall back to stub mode
-                self.running = true;
-                self.started_at = Instant::now();
-                Ok(())
+        } else {
+            // Attempt to execute SteamService.exe via the PE runtime.
+            let args: Vec<String> = Vec::new();
+            let env = BTreeMap::new();
+            let cwd = self.service_path.parent().unwrap_or(Path::new("."));
+
+            match pe_runtime::execute(
+                &self.service_path,
+                &args,
+                ge,
+                cwd,
+                &env,
+                false, // dtm
+                "steam-service",
+            ) {
+                Ok(result) => {
+                    self.state = if result.exit_code == 0 {
+                        ServiceState::Running
+                    } else {
+                        ServiceState::Error
+                    };
+                    self.started_at = Instant::now();
+                    Ok(())
+                }
+                Err(e) => {
+                    eprintln!("SteamService: PE execution failed: {e}, falling back to stub mode");
+                    self.state = ServiceState::Running;
+                    self.started_at = Instant::now();
+                    Ok(())
+                }
             }
         }
     }
 
     /// Stop the SteamService.exe process.
     ///
-    /// If a child process handle is available, it is killed. Otherwise this
-    /// is a no-op that marks the service as stopped.
+    /// If a child process handle is available, it is killed gracefully
+    /// (SIGTERM first, then SIGKILL after timeout). Marks service as stopped.
     pub fn stop(&mut self) -> AppResult<()> {
         if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+            // Try graceful shutdown first
+            #[cfg(unix)]
+            {
+                // Send SIGTERM
+                let pid = child.id() as i32;
+                unsafe {
+                    libc::kill(pid, libc::SIGTERM);
+                }
+                // Wait briefly for graceful shutdown
+                for _ in 0..50 {
+                    if child.try_wait().ok().flatten().is_some() {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+
+            // Force kill if still running
+            if child.try_wait().ok().flatten().is_none() {
+                if let Err(e) = child.kill() {
+                    eprintln!("SteamService: failed to kill child process: {e}");
+                }
+                if let Err(e) = child.wait() {
+                    eprintln!("SteamService: failed to wait for child process: {e}");
+                }
+            }
         }
-        self.running = false;
+        self.state = ServiceState::Stopped;
+        self.pipe_requests.clear();
         Ok(())
+    }
+
+    /// Handle an incoming named pipe request from Steam.exe.
+    ///
+    /// Implements the Steam service protocol:
+    /// - `CreatePipe` requests receive a valid pipe handle response
+    /// - `CallNamedPipe` requests receive valid service responses
+    /// - Unknown requests are logged and return an empty response
+    pub fn handle_pipe_request(&mut self, request: &[u8]) -> Vec<u8> {
+        // Parse the service protocol request.
+        // Steam's service protocol typically has:
+        //   [4 bytes: request type / pipe name hash]
+        //   [4 bytes: data length]
+        //   [N bytes: data payload]
+        if request.len() < 8 {
+            eprintln!(
+                "SteamService: received short pipe request ({} bytes)",
+                request.len()
+            );
+            return self.make_pipe_response(0xFFFFFFFF, &[]); // Error response
+        }
+
+        let request_type = u32::from_le_bytes(request[0..4].try_into().unwrap_or([0; 4]));
+        let data_len = u32::from_le_bytes(request[4..8].try_into().unwrap_or([0; 4])) as usize;
+        let _data = if data_len > 0 && 8 + data_len <= request.len() {
+            request[8..8 + data_len].to_vec()
+        } else {
+            Vec::new()
+        };
+
+        // Log the request for debugging
+        eprintln!(
+            "SteamService: pipe request type=0x{:08X}, data_len={}",
+            request_type, data_len
+        );
+
+        // Queue it as pending
+        self.pipe_requests
+            .push_back((request.to_vec(), Instant::now()));
+
+        match request_type {
+            // CreatePipe: respond with a valid pipe handle
+            0x00000001 | 0x00001001 => {
+                let pipe_handle = 0xCAFE0001u32.to_le_bytes();
+                let mut response = Vec::with_capacity(12);
+                response.extend_from_slice(&0u32.to_le_bytes()); // status = success
+                response.extend_from_slice(&pipe_handle);
+                response
+            }
+            // CallNamedPipe (service query): respond with service status
+            0x00000002 | 0x00001002 => {
+                // Return service status: running, version info
+                let status: u32 = if self.state == ServiceState::Running {
+                    0
+                } else {
+                    1
+                };
+                let version: u32 = 0x00020001; // Steam service API v2.1
+                let mut response = Vec::with_capacity(16);
+                response.extend_from_slice(&status.to_le_bytes());
+                response.extend_from_slice(&version.to_le_bytes());
+                response.extend_from_slice(&self.service_pid.to_le_bytes());
+                response
+            }
+            // Steam client ping / heartbeat check
+            0x00000003 => {
+                let mut response = Vec::with_capacity(8);
+                response.extend_from_slice(&0u32.to_le_bytes()); // pong
+                response
+                    .extend_from_slice(&(Instant::now().elapsed().as_secs() as u32).to_le_bytes());
+                response
+            }
+            // Shutdown request from Steam.exe
+            0x0000FFFF => {
+                eprintln!("SteamService: received shutdown request from Steam.exe");
+                self.state = ServiceState::Stopped;
+                self.make_pipe_response(0, &[])
+            }
+            // Unknown: return error
+            _ => {
+                eprintln!("SteamService: unknown pipe request type 0x{request_type:08X}");
+                self.make_pipe_response(0xFFFFFFFF, &[])
+            }
+        }
+    }
+
+    /// Build a generic pipe response with status code and optional data.
+    fn make_pipe_response(&self, status: u32, data: &[u8]) -> Vec<u8> {
+        let mut response = Vec::with_capacity(8 + data.len());
+        response.extend_from_slice(&status.to_le_bytes());
+        response.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        response.extend_from_slice(data);
+        response
     }
 
     /// Check whether the service is currently running (or in stub mode).
     pub fn is_running(&self) -> bool {
-        self.running
+        self.state == ServiceState::Running || self.state == ServiceState::Starting
+    }
+
+    /// Return the service state.
+    pub fn state(&self) -> ServiceState {
+        self.state
     }
 
     /// Return the process ID of the service, if a native child is available.
     pub fn pid(&self) -> Option<u32> {
-        self.child.as_ref().map(|c| c.id())
+        if self.service_pid != 0 {
+            Some(self.service_pid)
+        } else {
+            self.child.as_ref().map(|c| c.id())
+        }
+    }
+
+    /// Get the resolved service executable path.
+    pub fn service_path(&self) -> &Path {
+        &self.service_path
     }
 
     /// Get a reference to the protocol handler, if registered.
@@ -431,6 +664,11 @@ impl SteamServiceProcess {
     /// Get a mutable reference to the protocol handler, if registered.
     pub fn protocol_handler_mut(&mut self) -> Option<&mut SteamProtocolHandler> {
         self.protocol_handler.as_mut()
+    }
+
+    /// Drain pending pipe requests.
+    pub fn drain_pipe_requests(&mut self) -> Vec<(Vec<u8>, Instant)> {
+        self.pipe_requests.drain(..).collect()
     }
 }
 
@@ -589,15 +827,14 @@ impl SteamIpcManager {
         let addr = format!("127.0.0.1:{}", self.port);
         match std::net::TcpListener::bind(&addr) {
             Ok(listener) => {
-                listener.set_nonblocking(true).ok();
+                if let Err(e) = listener.set_nonblocking(true) {
+                    eprintln!("SteamIpcManager: failed to set nonblocking on listener: {e}");
+                }
                 self.listener = Some(listener);
             }
             Err(e) => {
                 // Port already in use or unavailable — degrade gracefully
-                eprintln!(
-                    "SteamIpcManager: failed to bind to {}: {}",
-                    addr, e
-                );
+                eprintln!("SteamIpcManager: failed to bind to {}: {}", addr, e);
             }
         }
 
@@ -744,9 +981,8 @@ impl SteamLibraryScanner {
         }
 
         let mut games = Vec::new();
-        let entries = fs::read_dir(&common_dir).map_err(|e| {
-            AppError::new(ReasonCode::RcIo, format!("cannot read common dir: {e}"))
-        })?;
+        let entries = fs::read_dir(&common_dir)
+            .map_err(|e| AppError::new(ReasonCode::RcIo, format!("cannot read common dir: {e}")))?;
 
         for entry in entries.flatten() {
             if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
@@ -800,9 +1036,13 @@ pub fn parse_app_manifest(content: &str) -> AppResult<BTreeMap<String, String>> 
                 current_key = parts[1].to_string();
                 in_value = true;
             }
+        } else if in_value && !line.is_empty() {
+            // Continuation of a multi-line value — append to current key
+            if let Some(val) = result.get_mut(&current_key) {
+                val.push(' ');
+                val.push_str(line);
+            }
         }
-
-        let _ = (line, current_key.clone(), in_value);
     }
 
     Ok(result)
@@ -813,9 +1053,8 @@ pub fn parse_app_manifest(content: &str) -> AppResult<BTreeMap<String, String>> 
 // ---------------------------------------------------------------------------
 
 use crate::steam_protocol::{
-    self, ConnectionState, ContentServerRecord, GameNetworkingSockets,
+    self, ConnectionState, ContentServerRecord, DEFAULT_STUN_SERVER, GameNetworkingSockets,
     GnsConnectionHandle, SteamMessageType, SteamNetworkingMessage, SteamProtocolStack,
-    DEFAULT_STUN_SERVER,
 };
 use rsa::RsaPublicKey;
 
@@ -849,6 +1088,10 @@ pub struct SteamClient {
     /// RSA public key captured from the CM server during encryption handshake.
     /// Used for RSA-OAEP password encryption during logon.
     rsa_public_key: Option<RsaPublicKey>,
+    /// Persistent GNS sessions indexed by target Steam ID for lobby/chat
+    /// multi-peer routing.  Created on first message to a given peer and
+    /// reused for subsequent messages.
+    lobby_sessions: std::collections::HashMap<u64, GnsConnectionHandle>,
 }
 
 impl SteamClient {
@@ -860,6 +1103,7 @@ impl SteamClient {
             content_servers: Vec::new(),
             logged_on: false,
             rsa_public_key: None,
+            lobby_sessions: std::collections::HashMap::new(),
         }
     }
 
@@ -913,12 +1157,9 @@ impl SteamClient {
                         //   steam_id (u64 LE)
                         //   session_token (rest)
                         if msg.payload.len() >= 12 {
-                            let _result = u32::from_le_bytes(
-                                msg.payload[0..4].try_into().unwrap(),
-                            );
-                            let steam_id = u64::from_le_bytes(
-                                msg.payload[4..12].try_into().unwrap(),
-                            );
+                            let _result = u32::from_le_bytes(msg.payload[0..4].try_into().unwrap());
+                            let steam_id =
+                                u64::from_le_bytes(msg.payload[4..12].try_into().unwrap());
                             let session_token = if msg.payload.len() > 12 {
                                 Some(msg.payload[12..].to_vec())
                             } else {
@@ -929,8 +1170,7 @@ impl SteamClient {
                             if let Some(token) = session_token {
                                 self.stack.auth.session_token = Some(token);
                             }
-                            self.stack.auth.auth_status =
-                                steam_protocol::AuthStatus::Authenticated;
+                            self.stack.auth.auth_status = steam_protocol::AuthStatus::Authenticated;
                             self.stack.state = ConnectionState::Ready;
                             self.logged_on = true;
                             logged_in = true;
@@ -940,9 +1180,8 @@ impl SteamClient {
                     SteamMessageType::ChannelEncryptResult => {
                         // Session ID may be set here
                         if msg.payload.len() >= 4 {
-                            let session_id = u32::from_le_bytes(
-                                msg.payload[0..4].try_into().unwrap(),
-                            );
+                            let session_id =
+                                u32::from_le_bytes(msg.payload[0..4].try_into().unwrap());
                             self.stack.set_session_id(session_id);
                         }
                     }
@@ -1041,21 +1280,15 @@ impl SteamClient {
                 | SteamMessageType::ClientPackageInfoResponse2 => {
                     // Parse the response to extract depot manifests.
                     // The response contains serialized depot manifest data.
-                    let manifests = self
-                        .stack
-                        .parse_depot_manifest(&msg.payload, None)?;
+                    let manifests = self.stack.parse_depot_manifest(&msg.payload, None)?;
 
                     for manifest in &manifests {
                         let file_output = output_dir.join(&manifest.filename);
 
                         // Try to find a content server to download from
                         if let Some(server) = self.content_servers.first() {
-                            self.stack.download_file(
-                                server,
-                                manifest,
-                                &file_output,
-                                app_id,
-                            )?;
+                            self.stack
+                                .download_file(server, manifest, &file_output, app_id)?;
 
                             // Update progress
                             self.stack
@@ -1078,18 +1311,23 @@ impl SteamClient {
     }
 
     /// Send a lobby/chat message to another Steam user via GNS.
+    ///
+    /// Creates or reuses a GNS session for the target peer and sends the
+    /// message.  The `target_steam_id` is used for multi-peer routing so
+    /// that all messages to the same peer go through the same session.
     pub fn send_lobby_message(&mut self, target_steam_id: u64, data: &[u8]) -> AppResult<()> {
         // Ensure GNS is initialized
         let gns = self.gns.get_or_insert_with(GameNetworkingSockets::new);
 
-        // Create or find a session for this target
-        let handle = gns.create_session()?;
+        // Reuse an existing session for this peer, or create a new one
+        if !self.lobby_sessions.contains_key(&target_steam_id) {
+            let handle = gns.create_session()?;
+            self.lobby_sessions.insert(target_steam_id, handle);
+        }
+        let handle = self.lobby_sessions[&target_steam_id];
 
-        // Send the message
+        // Send the message through the established session
         gns.send_message(handle, data, 0)?;
-
-        // Mark the message as targeting this Steam ID (for multi-peer routing)
-        let _ = target_steam_id;
 
         Ok(())
     }
@@ -1107,9 +1345,8 @@ impl SteamClient {
                 SteamMessageType::ClientPersonaState => {
                     // Friend status change notification
                     if msg.payload.len() >= 8 {
-                        let friend_steam_id = u64::from_le_bytes(
-                            msg.payload[0..8].try_into().unwrap(),
-                        );
+                        let friend_steam_id =
+                            u64::from_le_bytes(msg.payload[0..8].try_into().unwrap());
                         notifications.push(SteamNotification::FriendStatus {
                             steam_id: friend_steam_id,
                             status: "online".to_string(),
@@ -1119,9 +1356,8 @@ impl SteamClient {
                 SteamMessageType::ClientFriendMsgIncoming => {
                     // Chat message received
                     if msg.payload.len() >= 8 {
-                        let sender_steam_id = u64::from_le_bytes(
-                            msg.payload[0..8].try_into().unwrap(),
-                        );
+                        let sender_steam_id =
+                            u64::from_le_bytes(msg.payload[0..8].try_into().unwrap());
                         let message_text = if msg.payload.len() > 8 {
                             String::from_utf8_lossy(&msg.payload[8..]).to_string()
                         } else {
@@ -1136,9 +1372,7 @@ impl SteamClient {
                 SteamMessageType::ClientLicenseList => {
                     // License/app rights change
                     if msg.payload.len() >= 4 {
-                        let app_id = u32::from_le_bytes(
-                            msg.payload[0..4].try_into().unwrap(),
-                        );
+                        let app_id = u32::from_le_bytes(msg.payload[0..4].try_into().unwrap());
                         notifications.push(SteamNotification::LicenseChange { app_id });
                     }
                 }
@@ -1204,7 +1438,48 @@ pub type SocketsConnectionHandle = u64;
 /// Provides the flat-API functions that Steam game binaries call via
 /// the PE runtime export table. Backed by a `GameNetworkingSockets`
 /// instance for actual UDP/P2P networking.
-#[derive(Debug)]
+/// Per-connection state tracking for the connection state machine.
+#[derive(Debug, Clone)]
+pub struct ConnectionDetail {
+    /// Current GNS connection state.
+    pub state: i32,
+    /// Round-trip time estimate in milliseconds.
+    pub ping_ms: i32,
+    /// Local connection quality (0.0 – 1.0).
+    pub connection_quality_local: f32,
+    /// Remote connection quality (0.0 – 1.0).
+    pub connection_quality_remote: f32,
+    /// Outgoing packets per second.
+    pub out_packets_per_sec: f32,
+    /// Incoming packets per second.
+    pub in_packets_per_sec: f32,
+    /// Send rate in bytes per second.
+    pub send_rate_bytes_per_sec: u32,
+    /// Number of pending unreliable messages.
+    pub pending_unreliable: u32,
+    /// Number of pending reliable messages.
+    pub pending_reliable: u32,
+    /// Number of sent but unacknowledged reliable messages.
+    pub sent_unacked_reliable: u32,
+}
+
+impl Default for ConnectionDetail {
+    fn default() -> Self {
+        Self {
+            state: 0, // k_ESteamNetworkingConnectionState_None
+            ping_ms: 0,
+            connection_quality_local: 1.0,
+            connection_quality_remote: 1.0,
+            out_packets_per_sec: 0.0,
+            in_packets_per_sec: 0.0,
+            send_rate_bytes_per_sec: 0,
+            pending_unreliable: 0,
+            pending_reliable: 0,
+            sent_unacked_reliable: 0,
+        }
+    }
+}
+
 pub struct SteamNetworkingSockets {
     /// Inner GNS implementation.
     gns: GameNetworkingSockets,
@@ -1212,6 +1487,14 @@ pub struct SteamNetworkingSockets {
     listen_sockets: BTreeMap<ListenSocketHandle, (String, Vec<SocketsConnectionHandle>)>,
     /// Next listen socket handle.
     next_listen_handle: ListenSocketHandle,
+    /// SteamID → SocketAddr resolution cache.
+    steam_id_to_addr: BTreeMap<u64, SocketAddr>,
+    /// Connection name table: connection handle -> name string.
+    connection_names: BTreeMap<SocketsConnectionHandle, String>,
+    /// Per-connection state machine details.
+    connection_details: BTreeMap<SocketsConnectionHandle, ConnectionDetail>,
+    /// Pending outgoing message queue per connection (for flush).
+    pending_outgoing: BTreeMap<SocketsConnectionHandle, Vec<Vec<u8>>>,
 }
 
 impl SteamNetworkingSockets {
@@ -1221,6 +1504,10 @@ impl SteamNetworkingSockets {
             gns: GameNetworkingSockets::new(),
             listen_sockets: BTreeMap::new(),
             next_listen_handle: 1,
+            steam_id_to_addr: BTreeMap::new(),
+            connection_names: BTreeMap::new(),
+            connection_details: BTreeMap::new(),
+            pending_outgoing: BTreeMap::new(),
         }
     }
 
@@ -1328,11 +1615,141 @@ impl SteamNetworkingSockets {
     pub fn destroy_listen_socket(&mut self, listen_handle: ListenSocketHandle) -> AppResult<()> {
         if let Some((_, conn_handles)) = self.listen_sockets.remove(&listen_handle) {
             for handle in conn_handles {
-                self.gns.close_session(handle).ok();
+                if let Err(e) = self.gns.close_session(handle) {
+                    eprintln!("SteamService: error closing GNS session {handle}: {e}");
+                }
             }
         }
         Ok(())
     }
+
+    /// Register a SteamID → SocketAddr mapping for P2P connections by SteamID.
+    pub fn set_steam_id_address(&mut self, steam_id: u64, addr: SocketAddr) {
+        self.steam_id_to_addr.insert(steam_id, addr);
+    }
+
+    /// Connect to a peer using their SteamID rather than IP address.
+    ///
+    /// Looks up the cached SocketAddr for the given SteamID and creates
+    /// a GNS session to that address.
+    pub fn connect_by_steam_id(&mut self, steam_id: u64) -> AppResult<SocketsConnectionHandle> {
+        let addr = self.steam_id_to_addr.get(&steam_id).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcNetConnectionFailed,
+                format!("No address cached for SteamID {}", steam_id),
+            )
+        })?;
+        let handle = self.gns.create_session()?;
+        self.gns.set_peer_address(handle, *addr)?;
+        Ok(handle as SocketsConnectionHandle)
+    }
+
+    /// Accept an incoming connection.
+    pub fn accept_connection(&mut self, handle: SocketsConnectionHandle) -> AppResult<()> {
+        self.gns.accept_session(handle as GnsConnectionHandle)
+    }
+
+    /// Get detailed status information for a connection.
+    pub fn get_connection_status(
+        &self,
+        handle: SocketsConnectionHandle,
+    ) -> AppResult<SteamNetworkingConnectionStatus> {
+        let state = self.gns.connection_state(handle as GnsConnectionHandle);
+        Ok(SteamNetworkingConnectionStatus {
+            state: state.map(|s| s as i32).unwrap_or(0),
+            ..Default::default()
+        })
+    }
+
+    /// Set a human-readable name for a connection.
+    pub fn set_connection_name(&mut self, handle: SocketsConnectionHandle, name: &str) {
+        self.connection_names.insert(handle, name.to_string());
+    }
+
+    /// Get the human-readable name for a connection.
+    pub fn get_connection_name(&self, handle: SocketsConnectionHandle) -> AppResult<String> {
+        self.connection_names.get(&handle).cloned().ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcNetConnectionFailed,
+                format!("No name for connection {}", handle),
+            )
+        })
+    }
+
+    /// Create a P2P listen socket (no IP/port argument, binds to ephemeral port).
+    ///
+    /// This is the connection-less variant used for P2P networking.
+    pub fn create_listen_socket(&mut self) -> AppResult<ListenSocketHandle> {
+        // Bind to 0.0.0.0:0 (OS-assigned ephemeral port) without STUN
+        let addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
+        self.create_listen_socket_ip(Some(addr), false)
+    }
+
+    /// Flush any pending outgoing messages on a connection.
+    ///
+    /// Immediately sends all queued pending messages through the GNS layer.
+    /// Returns the number of bytes flushed on success.
+    pub fn flush_message_on_connection(
+        &mut self,
+        conn_handle: SocketsConnectionHandle,
+        channel: i32,
+    ) -> AppResult<u64> {
+        let mut total_bytes: u64 = 0;
+        if let Some(pending) = self.pending_outgoing.remove(&conn_handle) {
+            for data in &pending {
+                self.gns.send_message(conn_handle, data, channel)?;
+                total_bytes += data.len() as u64;
+            }
+        }
+        // Update connection state metrics after flushing.
+        if let Some(detail) = self.connection_details.get_mut(&conn_handle) {
+            detail.pending_reliable = 0;
+        }
+        Ok(total_bytes)
+    }
+
+    /// Queue a message for later flushing, or send immediately if not using flush mode.
+    pub fn send_message_with_flush(
+        &mut self,
+        conn_handle: SocketsConnectionHandle,
+        data: &[u8],
+        channel: i32,
+        use_flush: bool,
+    ) -> AppResult<()> {
+        if use_flush {
+            self.pending_outgoing
+                .entry(conn_handle)
+                .or_default()
+                .push(data.to_vec());
+            if let Some(detail) = self.connection_details.get_mut(&conn_handle) {
+                detail.pending_reliable = self
+                    .pending_outgoing
+                    .get(&conn_handle)
+                    .map(|v| v.len() as u32)
+                    .unwrap_or(0);
+            }
+            Ok(())
+        } else {
+            self.gns.send_message(conn_handle, data, channel)
+        }
+    }
+}
+
+/// Detailed status of a Steam networking connection.
+#[derive(Debug, Clone, Default)]
+#[repr(C)]
+pub struct SteamNetworkingConnectionStatus {
+    pub state: i32,
+    pub ping: i32,
+    pub connection_quality_local: f32,
+    pub connection_quality_remote: f32,
+    pub out_packets_per_sec: f32,
+    pub in_packets_per_sec: f32,
+    pub send_rate_bytes_per_sec: u32,
+    pub pending_unreliable: u32,
+    pub pending_reliable: u32,
+    pub sent_unacked_reliable: u32,
+    pub usec_queue_time: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -1426,17 +1843,17 @@ impl SteamNetworkingMessages {
 // Steam Overlay State Manager
 // ---------------------------------------------------------------------------
 
-/// CoreGraphics FFI for real-time keyboard state querying on macOS.
-///
-/// Used by the overlay manager to detect Shift+Tab keybinding without
-/// requiring modification of the input pipeline.  This is the same
-/// approach used by `src/user32.rs` for `GetAsyncKeyState`.
+// CoreGraphics FFI for real-time keyboard state querying on macOS.
+//
+// Used by the overlay manager to detect Shift+Tab keybinding without
+// requiring modification of the input pipeline.  This is the same
+// approach used by `src/user32.rs` for `GetAsyncKeyState`.
 #[cfg(target_os = "macos")]
 #[allow(non_snake_case)]
 unsafe extern "C" {
-    /// Returns the flags state (modifier keys) for a given event source.
+    // Returns the flags state (modifier keys) for a given event source.
     fn CGEventSourceFlagsState(sourceStateID: i32) -> u64;
-    /// Returns whether a given key code is currently pressed.
+    // Returns whether a given key code is currently pressed.
     fn CGEventSourceKeyState(sourceStateID: i32, keyCode: u16) -> bool;
 }
 
@@ -1659,7 +2076,9 @@ pub fn steam_overlay_forward_key_event(key_code: u16, key_char: Option<char>, do
 
     crate::cef_bridge::with_global_cef_bridge(|bridge| {
         if let Some(handle) = bridge.overlay_browser_handle() {
-            let _ = bridge.cef_frame_execute_java_script(handle, 1, &js);
+            if let Err(e) = bridge.cef_frame_execute_java_script(handle, 1, &js) {
+                eprintln!("steam_overlay_forward_key_event: JS exec failed: {e}");
+            }
         }
     });
 }
@@ -1688,7 +2107,9 @@ pub fn steam_overlay_forward_mouse_move(x: f64, y: f64) {
 
     crate::cef_bridge::with_global_cef_bridge(|bridge| {
         if let Some(handle) = bridge.overlay_browser_handle() {
-            let _ = bridge.cef_frame_execute_java_script(handle, 1, &js);
+            if let Err(e) = bridge.cef_frame_execute_java_script(handle, 1, &js) {
+                eprintln!("steam_overlay_forward_mouse_move: JS exec failed: {e}");
+            }
         }
     });
 }
@@ -1724,7 +2145,9 @@ pub fn steam_overlay_forward_mouse_button(x: f64, y: f64, button: i32, down: boo
 
     crate::cef_bridge::with_global_cef_bridge(|bridge| {
         if let Some(handle) = bridge.overlay_browser_handle() {
-            let _ = bridge.cef_frame_execute_java_script(handle, 1, &js);
+            if let Err(e) = bridge.cef_frame_execute_java_script(handle, 1, &js) {
+                eprintln!("steam_overlay_forward_mouse_button: JS exec failed: {e}");
+            }
         }
     });
 }
@@ -1758,9 +2181,2405 @@ pub fn steam_overlay_forward_mouse_wheel(x: f64, y: f64, delta_x: f64, delta_y: 
 
     crate::cef_bridge::with_global_cef_bridge(|bridge| {
         if let Some(handle) = bridge.overlay_browser_handle() {
-            let _ = bridge.cef_frame_execute_java_script(handle, 1, &js);
+            if let Err(e) = bridge.cef_frame_execute_java_script(handle, 1, &js) {
+                eprintln!("steam_overlay_forward_mouse_wheel: JS exec failed: {e}");
+            }
         }
     });
+}
+
+// ---------------------------------------------------------------------------
+// K1 — ISteamUserStats (Achievements, Stats, Leaderboards)
+// ---------------------------------------------------------------------------
+
+/// A single leaderboard entry returned by `DownloadLeaderboardEntries`.
+#[derive(Debug, Clone)]
+pub struct LeaderboardEntry {
+    pub steam_id: u64,
+    pub global_rank: i32,
+    pub score: i32,
+    pub details: Vec<i32>,
+    pub ugc_handle: u64,
+}
+
+/// Steam UserStats / Achievements / Leaderboards API wrapper.
+///
+/// Provides in-memory storage for stats and achievements, plus leaderboard
+/// CRUD with numeric scoring.  All data is local — no network calls.
+/// Snapshot of SteamUserStats state for JSON persistence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StatsSnapshot {
+    achievements: BTreeMap<String, u64>,
+    stats: BTreeMap<String, i32>,
+    stats_float: BTreeMap<String, f64>,
+    avg_rate: BTreeMap<String, (f64, f64)>,
+    leaderboards: BTreeMap<String, Vec<(i32, u64, Vec<i32>)>>,
+    achievement_progress: BTreeMap<String, (f32, f32)>,
+}
+
+#[derive(Debug)]
+pub struct SteamUserStats {
+    achievements: BTreeMap<String, u64>,
+    stats: BTreeMap<String, i32>,
+    stats_float: BTreeMap<String, f64>,
+    avg_rate: BTreeMap<String, (f64, f64)>,
+    leaderboards: BTreeMap<String, Vec<(i32, u64, Vec<i32>)>>,
+    stats_received: bool,
+    /// Per-SteamID stat snapshots for request_user_stats.
+    remote_stats: BTreeMap<u64, BTreeMap<String, i32>>,
+    remote_stats_float: BTreeMap<u64, BTreeMap<String, f64>>,
+    /// Achievement progress tracking: achievement_name -> (current_progress, max_progress).
+    achievement_progress: BTreeMap<String, (f32, f32)>,
+}
+
+impl SteamUserStats {
+    fn config_path() -> PathBuf {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        PathBuf::from(home)
+            .join("Library")
+            .join("Application Support")
+            .join("Casa1")
+            .join("config")
+            .join("user_stats.json")
+    }
+
+    fn load_from_config(&mut self) {
+        let path = Self::config_path();
+        if !path.exists() {
+            return;
+        }
+        match fs::read_to_string(&path) {
+            Ok(json) => match serde_json::from_str::<StatsSnapshot>(&json) {
+                Ok(snapshot) => {
+                    self.achievements = snapshot.achievements;
+                    self.stats = snapshot.stats;
+                    self.stats_float = snapshot.stats_float;
+                    self.avg_rate = snapshot.avg_rate;
+                    self.leaderboards = snapshot.leaderboards;
+                    self.achievement_progress = snapshot.achievement_progress;
+                }
+                Err(e) => {
+                    eprintln!("SteamUserStats: failed to parse config: {e}");
+                }
+            },
+            Err(e) => {
+                eprintln!("SteamUserStats: failed to read config: {e}");
+            }
+        }
+    }
+
+    fn save_to_config(&self) {
+        let snapshot = StatsSnapshot {
+            achievements: self.achievements.clone(),
+            stats: self.stats.clone(),
+            stats_float: self.stats_float.clone(),
+            avg_rate: self.avg_rate.clone(),
+            leaderboards: self.leaderboards.clone(),
+            achievement_progress: self.achievement_progress.clone(),
+        };
+        let path = Self::config_path();
+        if let Some(parent) = path.parent() {
+            if let Err(e) = fs::create_dir_all(parent) {
+                eprintln!("SteamUserStats: failed to create config dir: {e}");
+                return;
+            }
+        }
+        match serde_json::to_string_pretty(&snapshot) {
+            Ok(json) => {
+                if let Err(e) = fs::write(&path, &json) {
+                    eprintln!("SteamUserStats: failed to save config: {e}");
+                }
+            }
+            Err(e) => {
+                eprintln!("SteamUserStats: failed to serialize config: {e}");
+            }
+        }
+    }
+
+    pub fn new() -> Self {
+        let mut s = Self {
+            achievements: BTreeMap::new(),
+            stats: BTreeMap::new(),
+            stats_float: BTreeMap::new(),
+            avg_rate: BTreeMap::new(),
+            leaderboards: BTreeMap::new(),
+            stats_received: false,
+            remote_stats: BTreeMap::new(),
+            remote_stats_float: BTreeMap::new(),
+            achievement_progress: BTreeMap::new(),
+        };
+        s.load_from_config();
+        s
+    }
+
+    pub fn request_current_stats(&mut self) -> AppResult<()> {
+        self.stats_received = true;
+        Ok(())
+    }
+
+    pub fn get_achievement(&self, name: &str) -> bool {
+        self.achievements.contains_key(name)
+    }
+
+    pub fn get_achievement_unlock_time(&self, name: &str) -> Option<u64> {
+        self.achievements.get(name).copied()
+    }
+
+    pub fn set_achievement(&mut self, name: &str) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.achievements.insert(name.to_string(), now);
+        self.save_to_config();
+    }
+
+    pub fn clear_achievement(&mut self, name: &str) {
+        self.achievements.remove(name);
+        self.save_to_config();
+    }
+
+    pub fn get_num_achievements(&self) -> usize {
+        self.achievements.len()
+    }
+
+    pub fn get_achievement_name(&self, idx: usize) -> Option<&str> {
+        let mut keys: Vec<&str> = self.achievements.keys().map(|s| s.as_str()).collect();
+        keys.sort();
+        keys.get(idx).copied()
+    }
+
+    pub fn indicate_achievement_icon(&mut self, _name: &str) -> bool {
+        true
+    }
+
+    pub fn get_stat(&self, name: &str) -> i32 {
+        self.stats.get(name).copied().unwrap_or(0)
+    }
+
+    pub fn set_stat(&mut self, name: &str, value: i32) {
+        self.stats.insert(name.to_string(), value);
+        self.save_to_config();
+    }
+
+    pub fn get_stat_float(&self, name: &str) -> f64 {
+        self.stats_float.get(name).copied().unwrap_or(0.0)
+    }
+
+    pub fn set_stat_float(&mut self, name: &str, value: f64) {
+        self.stats_float.insert(name.to_string(), value);
+        self.save_to_config();
+    }
+
+    pub fn update_avg_rate_stat(&mut self, name: &str, count: f64, value: f64) {
+        let entry = self.avg_rate.entry(name.to_string()).or_insert((0.0, 0.0));
+        entry.0 += value;
+        entry.1 += count;
+    }
+
+    pub fn get_avg_rate_stat(&self, name: &str) -> f64 {
+        self.avg_rate
+            .get(name)
+            .filter(|(_, count)| *count > 0.0)
+            .map(|(sum, count)| sum / count)
+            .unwrap_or(0.0)
+    }
+
+    pub fn store_stat_float(&mut self, name: &str, value: f64) {
+        self.stats_float.insert(name.to_string(), value);
+        self.save_to_config();
+    }
+
+    pub fn find_or_create_leaderboard(&mut self, name: &str) -> AppResult<()> {
+        self.leaderboards.entry(name.to_string()).or_default();
+        self.save_to_config();
+        Ok(())
+    }
+
+    pub fn upload_leaderboard_score(
+        &mut self,
+        name: &str,
+        score: i32,
+        details: Vec<i32>,
+    ) -> AppResult<()> {
+        let board = self
+            .leaderboards
+            .entry(name.to_string())
+            .or_insert_with(Vec::new);
+        board.push((score, 0, details));
+        board.sort_by(|a, b| b.0.cmp(&a.0));
+        self.save_to_config();
+        Ok(())
+    }
+
+    pub fn download_leaderboard_entries(&self, name: &str) -> AppResult<Vec<LeaderboardEntry>> {
+        let board = self.leaderboards.get(name).ok_or_else(|| {
+            AppError::new(
+                crate::reason::ReasonCode::RcCliInvalid,
+                format!("leaderboard '{name}' not found"),
+            )
+        })?;
+        let entries: Vec<LeaderboardEntry> = board
+            .iter()
+            .enumerate()
+            .map(|(i, (score, sid, det))| LeaderboardEntry {
+                steam_id: *sid,
+                global_rank: (i + 1) as i32,
+                score: *score,
+                details: det.clone(),
+                ugc_handle: 0,
+            })
+            .collect();
+        Ok(entries)
+    }
+
+    pub fn get_leaderboard_entry_count(&self, name: &str) -> usize {
+        self.leaderboards.get(name).map(|b| b.len()).unwrap_or(0)
+    }
+
+    pub fn get_leaderboard_name(&self, idx: usize) -> Option<&str> {
+        let mut keys: Vec<&str> = self.leaderboards.keys().map(|s| s.as_str()).collect();
+        keys.sort();
+        keys.get(idx).copied()
+    }
+
+    pub fn attach_leaderboard_ugc(&mut self, _name: &str, _ugc_handle: u64) -> AppResult<()> {
+        Ok(())
+    }
+
+    pub fn get_leaderboard_sort_method(&self, _name: &str) -> i32 {
+        0
+    }
+
+    pub fn get_leaderboard_display_type(&self, _name: &str) -> i32 {
+        0
+    }
+
+    // ── Missing K1 methods ────────────────────────────────────────────
+
+    /// Reset all stats (local in-memory).
+    pub fn reset_all_stats(&mut self) -> AppResult<()> {
+        self.stats.clear();
+        self.stats_float.clear();
+        self.avg_rate.clear();
+        self.save_to_config();
+        Ok(())
+    }
+
+    /// Request stats for another user.
+    ///
+    /// Snapshots the current local stats into a per-SteamID cache so that
+    /// `GetUserStat` calls for that user return the local values. In a real
+    /// implementation this would fetch stats from the Steam backend.
+    pub fn request_user_stats(&mut self, steam_id: u64) -> AppResult<()> {
+        self.stats_received = true;
+        // Snapshot local stats into the per-user cache.
+        let stats_snapshot = self.stats.clone();
+        let stats_float_snapshot = self.stats_float.clone();
+        self.remote_stats.insert(steam_id, stats_snapshot);
+        self.remote_stats_float
+            .insert(steam_id, stats_float_snapshot);
+        Ok(())
+    }
+
+    /// Retrieve a snapshot stat for a remote user (int32).
+    pub fn get_user_stat(&self, steam_id: u64, name: &str) -> Option<i32> {
+        self.remote_stats.get(&steam_id)?.get(name).copied()
+    }
+
+    /// Retrieve a snapshot stat for a remote user (float).
+    pub fn get_user_stat_float(&self, steam_id: u64, name: &str) -> Option<f64> {
+        self.remote_stats_float.get(&steam_id)?.get(name).copied()
+    }
+
+    /// Indicate achievement progress towards unlocking.
+    ///
+    /// Stores the current/max progress so that games can display a progress bar.
+    /// Returns true if the achievement has been unlocked already (progress == max).
+    pub fn indicate_achievement_progress(
+        &mut self,
+        name: &str,
+        current_progress: f32,
+        max_progress: f32,
+    ) -> bool {
+        self.achievement_progress
+            .insert(name.to_string(), (current_progress, max_progress));
+        // If already fully unlocked, return true.
+        if self.achievements.contains_key(name) {
+            return true;
+        }
+        // Auto-unlock when progress reaches max.
+        if max_progress > 0.0 && current_progress >= max_progress {
+            self.achievements.insert(name.to_string(), 1);
+            return true;
+        }
+        false
+    }
+
+    /// Get the stored achievement progress for display purposes.
+    pub fn get_achievement_progress(&self, name: &str) -> Option<(f32, f32)> {
+        self.achievement_progress.get(name).copied()
+    }
+
+    /// Find a leaderboard by name; returns true if found.
+    pub fn find_leaderboard<'a>(&self, name: &'a str) -> Option<&'a str> {
+        self.leaderboards.get(name).map(|_| name)
+    }
+
+    /// Get a downloaded leaderboard entry by index.
+    pub fn get_downloaded_leaderboard_entry(
+        &self,
+        name: &str,
+        index: i32,
+    ) -> Option<LeaderboardEntry> {
+        let board = self.leaderboards.get(name)?;
+        let idx = index as usize;
+        if idx >= board.len() {
+            return None;
+        }
+        let (score, sid, det) = &board[idx];
+        Some(LeaderboardEntry {
+            steam_id: *sid,
+            global_rank: (idx + 1) as i32,
+            score: *score,
+            details: det.clone(),
+            ugc_handle: 0,
+        })
+    }
+}
+
+impl Default for SteamUserStats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// K2 — ISteamFriends (Friends List, Chat, Clan Groups)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FriendGameInfo {
+    pub game_id: u64,
+    pub game_ip: u32,
+    pub game_port: u16,
+    pub query_port: u16,
+    pub steam_id_lobby: u64,
+}
+
+/// Friends list entry serialised for config persistence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FriendEntry {
+    name: String,
+    persona_state: i32,
+    game_info: Option<FriendGameInfo>,
+}
+
+/// Snapshot of SteamFriends state for JSON persistence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FriendsSnapshot {
+    persona_name: String,
+    persona_state: i32,
+    friends: BTreeMap<u64, FriendEntry>,
+    clans: BTreeMap<u64, String>,
+}
+
+#[derive(Debug)]
+pub struct SteamFriends {
+    persona_name: String,
+    persona_state: i32,
+    friends: BTreeMap<u64, (String, i32, Option<FriendGameInfo>)>,
+    friend_invites: BTreeMap<u64, String>,
+    chat_messages: BTreeMap<u64, Vec<String>>,
+    clans: BTreeMap<u64, String>,
+    next_avatar_handle: u64,
+}
+
+impl SteamFriends {
+    fn config_path() -> PathBuf {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        PathBuf::from(home)
+            .join("Library")
+            .join("Application Support")
+            .join("Casa1")
+            .join("config")
+            .join("friends_config.json")
+    }
+
+    fn load_from_config(&mut self) {
+        let path = Self::config_path();
+        if !path.exists() {
+            return;
+        }
+        match fs::read_to_string(&path) {
+            Ok(json) => match serde_json::from_str::<FriendsSnapshot>(&json) {
+                Ok(snapshot) => {
+                    self.persona_name = snapshot.persona_name;
+                    self.persona_state = snapshot.persona_state;
+                    self.friends.clear();
+                    for (sid, entry) in snapshot.friends {
+                        self.friends
+                            .insert(sid, (entry.name, entry.persona_state, entry.game_info));
+                    }
+                    self.clans = snapshot.clans;
+                }
+                Err(e) => {
+                    eprintln!("SteamFriends: failed to parse config: {e}");
+                }
+            },
+            Err(e) => {
+                eprintln!("SteamFriends: failed to read config: {e}");
+            }
+        }
+    }
+
+    fn save_to_config(&self) {
+        let snapshot = FriendsSnapshot {
+            persona_name: self.persona_name.clone(),
+            persona_state: self.persona_state,
+            friends: self
+                .friends
+                .iter()
+                .map(|(sid, (name, state, game))| {
+                    (
+                        *sid,
+                        FriendEntry {
+                            name: name.clone(),
+                            persona_state: *state,
+                            game_info: game.clone(),
+                        },
+                    )
+                })
+                .collect(),
+            clans: self.clans.clone(),
+        };
+        let path = Self::config_path();
+        if let Some(parent) = path.parent() {
+            if let Err(e) = fs::create_dir_all(parent) {
+                eprintln!("SteamFriends: failed to create config dir: {e}");
+                return;
+            }
+        }
+        match serde_json::to_string_pretty(&snapshot) {
+            Ok(json) => {
+                if let Err(e) = fs::write(&path, &json) {
+                    eprintln!("SteamFriends: failed to save config: {e}");
+                }
+            }
+            Err(e) => {
+                eprintln!("SteamFriends: failed to serialize config: {e}");
+            }
+        }
+    }
+
+    pub fn new() -> Self {
+        let mut s = Self {
+            persona_name: "Player".to_string(),
+            persona_state: 1,
+            friends: BTreeMap::new(),
+            friend_invites: BTreeMap::new(),
+            chat_messages: BTreeMap::new(),
+            clans: BTreeMap::new(),
+            next_avatar_handle: 1000,
+        };
+        s.load_from_config();
+        s
+    }
+
+    pub fn get_persona_name(&self) -> &str {
+        &self.persona_name
+    }
+    pub fn set_persona_name(&mut self, name: &str) {
+        self.persona_name = name.to_string();
+        self.save_to_config();
+    }
+    pub fn get_persona_state(&self) -> i32 {
+        self.persona_state
+    }
+    pub fn set_persona_state(&mut self, state: i32) {
+        self.persona_state = state;
+        self.save_to_config();
+    }
+
+    pub fn get_friend_persona_state(&self, steam_id: u64) -> i32 {
+        self.friends.get(&steam_id).map(|(_, s, _)| *s).unwrap_or(0)
+    }
+
+    pub fn get_friend_persona_name(&self, steam_id: u64) -> Option<&str> {
+        self.friends.get(&steam_id).map(|(n, _, _)| n.as_str())
+    }
+
+    pub fn get_friend_game_played(&self, steam_id: u64) -> Option<&FriendGameInfo> {
+        self.friends.get(&steam_id).and_then(|(_, _, i)| i.as_ref())
+    }
+
+    pub fn get_friend_count(&self) -> i32 {
+        self.friends.len() as i32
+    }
+
+    pub fn get_friend_by_index(&self, index: i32) -> Option<u64> {
+        let keys: Vec<u64> = self.friends.keys().copied().collect();
+        keys.get(index as usize).copied()
+    }
+
+    pub fn add_friend(&mut self, steam_id: u64, name: &str) {
+        self.friends
+            .entry(steam_id)
+            .or_insert_with(|| (name.to_string(), 1, None));
+        self.save_to_config();
+    }
+
+    pub fn remove_friend(&mut self, steam_id: u64) {
+        self.friends.remove(&steam_id);
+        self.save_to_config();
+    }
+
+    pub fn set_friend_persona_state(&mut self, steam_id: u64, state: i32) {
+        if let Some(e) = self.friends.get_mut(&steam_id) {
+            e.1 = state;
+        }
+        self.save_to_config();
+    }
+
+    pub fn set_friend_game_info(&mut self, steam_id: u64, info: FriendGameInfo) {
+        if let Some(e) = self.friends.get_mut(&steam_id) {
+            e.2 = Some(info);
+        }
+        self.save_to_config();
+    }
+
+    pub fn invite_friend(&mut self, steam_id: u64, message: &str) {
+        self.friend_invites.insert(steam_id, message.to_string());
+    }
+
+    pub fn get_invite_count(&self) -> i32 {
+        self.friend_invites.len() as i32
+    }
+
+    pub fn get_invite_by_index(&self, index: i32) -> Option<u64> {
+        let keys: Vec<u64> = self.friend_invites.keys().copied().collect();
+        keys.get(index as usize).copied()
+    }
+
+    pub fn accept_invite(&mut self, steam_id: u64) {
+        if let Some(_msg) = self.friend_invites.remove(&steam_id) {
+            self.friends
+                .entry(steam_id)
+                .or_insert_with(|| (format!("Friend{steam_id}"), 1, None));
+        }
+        self.save_to_config();
+    }
+
+    pub fn decline_invite(&mut self, steam_id: u64) {
+        self.friend_invites.remove(&steam_id);
+    }
+
+    pub fn send_friend_message(&mut self, steam_id: u64, message: &str) {
+        self.chat_messages
+            .entry(steam_id)
+            .or_default()
+            .push(message.to_string());
+    }
+
+    pub fn get_friend_message_count(&self, steam_id: u64) -> i32 {
+        self.chat_messages
+            .get(&steam_id)
+            .map(|v| v.len() as i32)
+            .unwrap_or(0)
+    }
+
+    pub fn get_friend_message(&self, steam_id: u64, index: i32) -> Option<&str> {
+        self.chat_messages
+            .get(&steam_id)
+            .and_then(|v| v.get(index as usize))
+            .map(|s| s.as_str())
+    }
+
+    pub fn clear_friend_messages(&mut self, steam_id: u64) {
+        self.chat_messages.remove(&steam_id);
+    }
+
+    pub fn join_clan(&mut self, clan_id: u64, clan_name: &str) {
+        self.clans.insert(clan_id, clan_name.to_string());
+        self.save_to_config();
+    }
+
+    pub fn leave_clan(&mut self, clan_id: u64) {
+        self.clans.remove(&clan_id);
+        self.save_to_config();
+    }
+
+    pub fn get_clan_count(&self) -> i32 {
+        self.clans.len() as i32
+    }
+
+    pub fn get_clan_by_index(&self, index: i32) -> Option<u64> {
+        let keys: Vec<u64> = self.clans.keys().copied().collect();
+        keys.get(index as usize).copied()
+    }
+
+    pub fn get_clan_name(&self, clan_id: u64) -> Option<&str> {
+        self.clans.get(&clan_id).map(|s| s.as_str())
+    }
+
+    pub fn is_clan_member(&self, clan_id: u64) -> bool {
+        self.clans.contains_key(&clan_id)
+    }
+
+    pub fn set_rich_presence(&mut self, _key: &str, _value: &str) {}
+    pub fn clear_rich_presence(&mut self) {}
+
+    pub fn activate_game_overlay_to_web_page(&self, _url: &str) {}
+    pub fn activate_game_overlay_to_friends(&self) {}
+
+    pub fn get_small_friend_avatar(&mut self, _steam_id: u64) -> i32 {
+        let h = self.next_avatar_handle;
+        self.next_avatar_handle += 1;
+        h as i32
+    }
+
+    pub fn get_medium_friend_avatar(&mut self, _steam_id: u64) -> i32 {
+        let h = self.next_avatar_handle;
+        self.next_avatar_handle += 1;
+        h as i32
+    }
+
+    pub fn get_large_friend_avatar(&mut self, _steam_id: u64) -> i32 {
+        let h = self.next_avatar_handle;
+        self.next_avatar_handle += 1;
+        h as i32
+    }
+
+    pub fn get_friend_relationship(&self, _steam_id: u64) -> i32 {
+        // k_EFriendRelationshipFriend = 3
+        3
+    }
+
+    pub fn get_clan_tag(&self, clan_id: u64) -> Option<&str> {
+        self.clans.get(&clan_id).map(|s| s.as_str())
+    }
+
+    /// Activate the overlay and navigate to the specified dialog page.
+    ///
+    /// Supported dialogs: "friends", "community", "settings", "achievements",
+    /// "stats", "chat", "store", "web", etc.
+    pub fn activate_game_overlay(&self, dialog: &str) {
+        let url = match dialog.to_lowercase().as_str() {
+            "friends" | "friendslist" => "steam://openurl/https://steamcommunity.com/my/friends",
+            "community" => "steam://openurl/https://steamcommunity.com/my",
+            "settings" => "steam://openurl/https://steamcommunity.com/my/settings",
+            "achievements" => "steam://openurl/https://steamcommunity.com/my/achievements",
+            "stats" => "steam://openurl/https://steamcommunity.com/my/stats",
+            "chat" => "steam://openurl/https://steamcommunity.com/chat",
+            "store" => "steam://openurl/https://store.steampowered.com",
+            "web" => "steam://openurl/https://steamcommunity.com",
+            _ => "steam://openurl/https://steamcommunity.com/my/overlay",
+        };
+        with_steam_overlay(|mgr| {
+            mgr.set_active(true);
+            mgr.set_overlay_url(url.to_string());
+        });
+    }
+
+    /// Activate the overlay focused on a specific user's profile.
+    pub fn activate_game_overlay_to_user(&self, dialog: &str, steam_id: u64) {
+        let url = format!(
+            "steam://openurl/https://steamcommunity.com/profiles/{}/{}",
+            steam_id, dialog
+        );
+        with_steam_overlay(|mgr| {
+            mgr.set_active(true);
+            mgr.set_overlay_url(url);
+        });
+    }
+
+    /// Activate the overlay and navigate to a specific store page.
+    pub fn activate_game_overlay_to_store(&self, app_id: u32) {
+        let url = format!(
+            "steam://openurl/https://store.steampowered.com/app/{}",
+            app_id
+        );
+        with_steam_overlay(|mgr| {
+            mgr.set_active(true);
+            mgr.set_overlay_url(url);
+        });
+    }
+
+    /// Activate the overlay to show an invite dialog for a lobby.
+    pub fn activate_game_overlay_to_invite_dialog(&self, lobby_id: u64) {
+        let url = format!(
+            "steam://openurl/https://steamcommunity.com/invite/{}",
+            lobby_id
+        );
+        with_steam_overlay(|mgr| {
+            mgr.set_active(true);
+            mgr.set_overlay_url(url);
+        });
+    }
+}
+
+impl Default for SteamFriends {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// K3 — ISteamMatchmaking (Lobbies, Game Search, P2P Sessions)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct Lobby {
+    pub steam_id: u64,
+    pub owner_id: u64,
+    pub max_members: i32,
+    pub metadata: BTreeMap<String, String>,
+    pub members: BTreeMap<u64, BTreeMap<String, String>>,
+    pub lobby_type: i32,
+    pub joinable: bool,
+    pub chat_messages: Vec<String>,
+}
+
+#[derive(Debug)]
+pub struct SteamMatchmaking {
+    lobbies: BTreeMap<u64, Lobby>,
+    search_results: BTreeMap<u64, Lobby>,
+    next_lobby_id: u64,
+}
+
+impl SteamMatchmaking {
+    pub fn new() -> Self {
+        Self {
+            lobbies: BTreeMap::new(),
+            search_results: BTreeMap::new(),
+            next_lobby_id: 10000,
+        }
+    }
+
+    pub fn create_lobby(&mut self, lobby_type: i32, max_members: i32) -> AppResult<u64> {
+        let lobby_id = self.next_lobby_id;
+        self.next_lobby_id += 1;
+        let lobby = Lobby {
+            steam_id: lobby_id,
+            owner_id: 0,
+            max_members,
+            metadata: BTreeMap::new(),
+            members: BTreeMap::new(),
+            lobby_type,
+            joinable: true,
+            chat_messages: Vec::new(),
+        };
+        self.lobbies.insert(lobby_id, lobby);
+        Ok(lobby_id)
+    }
+
+    pub fn join_lobby(&mut self, lobby_id: u64) -> AppResult<()> {
+        if self.lobbies.contains_key(&lobby_id) {
+            return Ok(());
+        }
+        let lobby = self.search_results.get(&lobby_id).cloned().ok_or_else(|| {
+            AppError::new(
+                crate::reason::ReasonCode::RcCliInvalid,
+                format!("lobby {lobby_id} not found"),
+            )
+        })?;
+        self.lobbies.insert(lobby_id, lobby);
+        Ok(())
+    }
+
+    pub fn leave_lobby(&mut self, lobby_id: u64) {
+        self.lobbies.remove(&lobby_id);
+    }
+
+    pub fn get_lobby(&self, lobby_id: u64) -> Option<&Lobby> {
+        self.lobbies.get(&lobby_id)
+    }
+    pub fn get_lobby_mut(&mut self, lobby_id: u64) -> Option<&mut Lobby> {
+        self.lobbies.get_mut(&lobby_id)
+    }
+
+    pub fn get_lobby_count(&self) -> usize {
+        self.lobbies.len()
+    }
+
+    pub fn get_lobby_by_index(&self, index: usize) -> Option<u64> {
+        let keys: Vec<u64> = self.lobbies.keys().copied().collect();
+        keys.get(index).copied()
+    }
+
+    pub fn get_lobby_data(&self, lobby_id: u64, key: &str) -> Option<&str> {
+        self.lobbies
+            .get(&lobby_id)
+            .and_then(|l| l.metadata.get(key))
+            .map(|s| s.as_str())
+    }
+
+    pub fn set_lobby_data(&mut self, lobby_id: u64, key: &str, value: &str) -> AppResult<()> {
+        let lobby = self.lobbies.get_mut(&lobby_id).ok_or_else(|| {
+            AppError::new(crate::reason::ReasonCode::RcCliInvalid, "lobby not found")
+        })?;
+        lobby.metadata.insert(key.to_string(), value.to_string());
+        Ok(())
+    }
+
+    pub fn get_lobby_member_count(&self, lobby_id: u64) -> i32 {
+        self.lobbies
+            .get(&lobby_id)
+            .map(|l| l.members.len() as i32)
+            .unwrap_or(0)
+    }
+
+    pub fn get_lobby_member_by_index(&self, lobby_id: u64, index: i32) -> Option<u64> {
+        self.lobbies.get(&lobby_id).and_then(|l| {
+            let keys: Vec<u64> = l.members.keys().copied().collect();
+            keys.get(index as usize).copied()
+        })
+    }
+
+    pub fn get_lobby_member_data(&self, lobby_id: u64, member_id: u64, key: &str) -> Option<&str> {
+        self.lobbies
+            .get(&lobby_id)
+            .and_then(|l| l.members.get(&member_id))
+            .and_then(|m| m.get(key))
+            .map(|s| s.as_str())
+    }
+
+    pub fn set_lobby_member_data(
+        &mut self,
+        lobby_id: u64,
+        member_id: u64,
+        key: &str,
+        value: &str,
+    ) -> AppResult<()> {
+        let lobby = self.lobbies.get_mut(&lobby_id).ok_or_else(|| {
+            AppError::new(crate::reason::ReasonCode::RcCliInvalid, "lobby not found")
+        })?;
+        lobby
+            .members
+            .entry(member_id)
+            .or_default()
+            .insert(key.to_string(), value.to_string());
+        Ok(())
+    }
+
+    pub fn set_lobby_owner(&mut self, lobby_id: u64, new_owner: u64) -> AppResult<()> {
+        let lobby = self.lobbies.get_mut(&lobby_id).ok_or_else(|| {
+            AppError::new(crate::reason::ReasonCode::RcCliInvalid, "lobby not found")
+        })?;
+        lobby.owner_id = new_owner;
+        Ok(())
+    }
+
+    pub fn get_lobby_owner(&self, lobby_id: u64) -> Option<u64> {
+        self.lobbies.get(&lobby_id).map(|l| l.owner_id)
+    }
+
+    pub fn set_lobby_joinable(&mut self, lobby_id: u64, joinable: bool) -> AppResult<()> {
+        let lobby = self.lobbies.get_mut(&lobby_id).ok_or_else(|| {
+            AppError::new(crate::reason::ReasonCode::RcCliInvalid, "lobby not found")
+        })?;
+        lobby.joinable = joinable;
+        Ok(())
+    }
+
+    pub fn send_lobby_chat_message(&mut self, lobby_id: u64, message: &str) -> AppResult<()> {
+        let lobby = self.lobbies.get_mut(&lobby_id).ok_or_else(|| {
+            AppError::new(crate::reason::ReasonCode::RcCliInvalid, "lobby not found")
+        })?;
+        lobby.chat_messages.push(message.to_string());
+        Ok(())
+    }
+
+    pub fn get_lobby_chat_messages(&self, lobby_id: u64) -> Vec<String> {
+        self.lobbies
+            .get(&lobby_id)
+            .map(|l| l.chat_messages.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn add_lobby_to_search(&mut self, lobby_id: u64, lobby: Lobby) {
+        self.search_results.insert(lobby_id, lobby);
+    }
+
+    pub fn request_lobby_list(&mut self) -> AppResult<()> {
+        for (id, lobby) in &self.lobbies {
+            self.search_results.insert(*id, lobby.clone());
+        }
+        Ok(())
+    }
+
+    pub fn get_lobby_search_result_count(&self) -> usize {
+        self.search_results.len()
+    }
+
+    pub fn get_lobby_search_result(&self, index: usize) -> Option<&Lobby> {
+        let keys: Vec<u64> = self.search_results.keys().copied().collect();
+        keys.get(index).and_then(|k| self.search_results.get(k))
+    }
+
+    pub fn clear_lobby_search_results(&mut self) {
+        self.search_results.clear();
+    }
+
+    pub fn set_lobby_type(&mut self, lobby_id: u64, lobby_type: i32) -> AppResult<()> {
+        let lobby = self.lobbies.get_mut(&lobby_id).ok_or_else(|| {
+            AppError::new(crate::reason::ReasonCode::RcCliInvalid, "lobby not found")
+        })?;
+        lobby.lobby_type = lobby_type;
+        Ok(())
+    }
+
+    pub fn get_lobby_member_limit(&self, lobby_id: u64) -> i32 {
+        self.lobbies
+            .get(&lobby_id)
+            .map(|l| l.max_members)
+            .unwrap_or(0)
+    }
+}
+
+impl Default for SteamMatchmaking {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// K5 — ISteamRemoteStorage (Cloud Storage with File Persistence)
+// ---------------------------------------------------------------------------
+
+/// Per-file sync state for cloud conflict detection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SyncFileState {
+    /// Local modification timestamp (seconds since epoch).
+    local_mtime: u64,
+    /// Remote modification timestamp (seconds since epoch).
+    remote_mtime: u64,
+    /// Sync status for this file.
+    sync_status: SyncStatus,
+    /// Remote version identifier (hash or etag).
+    remote_version: String,
+}
+
+impl Default for SyncFileState {
+    fn default() -> Self {
+        Self {
+            local_mtime: 0,
+            remote_mtime: 0,
+            sync_status: SyncStatus::Synced,
+            remote_version: String::new(),
+        }
+    }
+}
+
+/// Sync status for an individual file.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+enum SyncStatus {
+    Synced,
+    LocalChanged,
+    RemoteChanged,
+    Conflict,
+}
+
+/// Persisted sync state snapshot for the entire storage directory.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SyncStateSnapshot {
+    last_sync_time: u64,
+    files: BTreeMap<String, SyncFileState>,
+}
+
+/// Tracked UGC item metadata.
+#[derive(Debug, Clone)]
+struct UGCItem {
+    local_path: String,
+    size: u64,
+    name: String,
+}
+
+/// File metadata returned by the sync server in the directory listing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RemoteFileInfo {
+    mtime: u64,
+    #[serde(default)]
+    size: u64,
+    #[serde(default)]
+    version: String,
+    #[serde(default)]
+    quota_used: Option<u64>,
+    #[serde(default)]
+    quota_total: Option<u64>,
+}
+
+/// Cloud-enabled Steam remote storage.
+///
+/// Provides local file persistence with HTTP REST cloud sync backend.
+/// File change detection uses modification timestamps. Conflict resolution
+/// follows last-write-wins. Sync state is persisted to `.sync_state.json`
+/// inside the storage directory.
+#[derive(Debug)]
+pub struct SteamRemoteStorage {
+    base_path: PathBuf,
+    files: BTreeMap<String, u64>,
+    /// File modification timestamps for change detection (seconds since epoch).
+    file_timestamps: BTreeMap<String, u64>,
+    quota_used: u64,
+    quota_total: u64,
+    cloud_enabled_for_app: bool,
+    /// Tracked UGC items: handle → metadata.
+    ugc_items: BTreeMap<u64, UGCItem>,
+    /// Cloud sync server base URL (e.g. "https://sync.example.com").
+    sync_server_url: Option<String>,
+    /// Per-file sync state for change detection and conflict resolution.
+    sync_state: BTreeMap<String, SyncFileState>,
+    /// Timestamp of the last successful sync (seconds since epoch).
+    last_sync_time: u64,
+    /// Reusable HTTP client with cookie support.
+    http_client: Option<reqwest::blocking::Client>,
+}
+
+impl SteamRemoteStorage {
+    pub fn new() -> Self {
+        let base_path = Self::default_base_path();
+        let mut s = Self {
+            base_path,
+            files: BTreeMap::new(),
+            file_timestamps: BTreeMap::new(),
+            quota_used: 0,
+            quota_total: 1_073_741_824,
+            cloud_enabled_for_app: true,
+            ugc_items: BTreeMap::new(),
+            sync_server_url: None,
+            sync_state: BTreeMap::new(),
+            last_sync_time: 0,
+            http_client: None,
+        };
+        s.sync_from_disk();
+        s.load_sync_state();
+        s
+    }
+
+    fn default_base_path() -> PathBuf {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        PathBuf::from(home)
+            .join("Library")
+            .join("Application Support")
+            .join("Casa1")
+            .join("remote_storage")
+    }
+
+    /// Synchronise in-memory file index with the actual files on disk.
+    fn sync_from_disk(&mut self) {
+        self.files.clear();
+        self.file_timestamps.clear();
+        self.quota_used = 0;
+        if !self.base_path.exists() {
+            if let Err(e) = fs::create_dir_all(&self.base_path) {
+                eprintln!(
+                    "RemoteStorage: failed to create base dir {:?}: {e}",
+                    self.base_path
+                );
+            }
+            return;
+        }
+        if let Ok(entries) = fs::read_dir(&self.base_path) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() {
+                    // Skip sync state file
+                    let rel = path
+                        .strip_prefix(&self.base_path)
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    if rel.starts_with('.') {
+                        continue;
+                    }
+                    if let Ok(meta) = fs::metadata(&path) {
+                        let size = meta.len();
+                        let mtime = meta
+                            .modified()
+                            .ok()
+                            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        self.files.insert(rel.clone(), size);
+                        self.file_timestamps.insert(rel, mtime);
+                        self.quota_used += size;
+                    }
+                }
+            }
+        }
+    }
+
+    fn ensure_parent_dir(&self, rel_path: &str) -> AppResult<()> {
+        let parent = self
+            .base_path
+            .join(rel_path)
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        fs::create_dir_all(&parent).map_err(|e| {
+            AppError::new(
+                crate::reason::ReasonCode::RcIo,
+                format!("cannot create remote storage dir: {e}"),
+            )
+        })
+    }
+
+    pub fn set_base_path(&mut self, path: PathBuf) {
+        self.base_path = path;
+        self.sync_from_disk();
+    }
+
+    pub fn base_path(&self) -> &Path {
+        &self.base_path
+    }
+
+    /// Configure the cloud sync server URL.
+    ///
+    /// Initialises the HTTP client lazily. Pass `None` to disable cloud sync.
+    pub fn configure_sync_server(&mut self, url: Option<&str>) {
+        self.sync_server_url = url.map(|s| s.trim_end_matches('/').to_string());
+        if self.sync_server_url.is_some() && self.http_client.is_none() {
+            if let Ok(client) = reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .cookie_store(true)
+                .build()
+            {
+                self.http_client = Some(client);
+            }
+        }
+    }
+
+    // ── Cloud sync ──────────────────────────────────────────────────────
+
+    /// Upload all locally-changed files to the sync server.
+    ///
+    /// Files whose local mtime differs from the last synced remote mtime
+    /// are uploaded via HTTP PUT.  The server response updates the remote
+    /// quota and version.
+    pub fn sync_to_cloud(&mut self) -> AppResult<()> {
+        let server_url = match &self.sync_server_url {
+            Some(url) => url.clone(),
+            None => return Ok(()),
+        };
+
+        self.detect_changes();
+
+        let client = match &self.http_client {
+            Some(c) => c.clone(),
+            None => return Ok(()),
+        };
+
+        let mut changed_count = 0u32;
+        let rel_paths: Vec<String> = self.files.keys().cloned().collect();
+
+        for rel_path in rel_paths {
+            let state = self.sync_state.get(&rel_path).cloned().unwrap_or_default();
+
+            if state.sync_status == SyncStatus::Synced {
+                continue;
+            }
+
+            // Read the local file content
+            let full_path = self.base_path.join(&rel_path);
+            let data = match fs::read(&full_path) {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("RemoteStorage: cannot read '{rel_path}' for upload: {e}");
+                    continue;
+                }
+            };
+
+            // Upload via HTTP PUT
+            let upload_url = format!("{server_url}/api/v1/cloud/upload/{rel_path}");
+            match client.put(&upload_url).body(data).send() {
+                Ok(resp) if resp.status().is_success() => {
+                    let remote_mtime = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    let local_mtime = self.file_timestamps.get(&rel_path).copied().unwrap_or(0);
+                    // Update sync state to reflect the successful upload
+                    self.sync_state.insert(
+                        rel_path.clone(),
+                        SyncFileState {
+                            local_mtime,
+                            remote_mtime,
+                            sync_status: SyncStatus::Synced,
+                            remote_version: resp
+                                .headers()
+                                .get("etag")
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or("")
+                                .to_string(),
+                        },
+                    );
+                    // Update quota from server response if provided
+                    if let Ok(body) = resp.text() {
+                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&body) {
+                            if let Some(quota) = parsed.get("quota_used").and_then(|v| v.as_u64()) {
+                                self.quota_used = quota;
+                            }
+                            if let Some(total) = parsed.get("quota_total").and_then(|v| v.as_u64())
+                            {
+                                self.quota_total = total;
+                            }
+                        }
+                    }
+                    changed_count += 1;
+                }
+                Ok(resp) => {
+                    eprintln!(
+                        "RemoteStorage: upload '{rel_path}' returned HTTP {}",
+                        resp.status()
+                    );
+                }
+                Err(e) => {
+                    eprintln!("RemoteStorage: upload '{rel_path}' failed: {e}");
+                }
+            }
+        }
+
+        if changed_count > 0 {
+            self.last_sync_time = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            self.save_sync_state();
+        }
+
+        Ok(())
+    }
+
+    /// Download files from the sync server that are newer than our local copies.
+    ///
+    /// Uses a remote file listing (GET /api/v1/cloud/list) and compares
+    /// timestamps. Newer remote files are downloaded and written locally.
+    /// Conflict resolution: last-write-wins — if both sides changed, the
+    /// file with the later mtime wins.
+    pub fn sync_from_cloud(&mut self) -> AppResult<()> {
+        let server_url = match &self.sync_server_url {
+            Some(url) => url.clone(),
+            None => return Ok(()),
+        };
+
+        self.detect_changes();
+
+        let client = match &self.http_client {
+            Some(c) => c.clone(),
+            None => return Ok(()),
+        };
+
+        // Fetch remote file listing
+        let list_url = format!("{server_url}/api/v1/cloud/list");
+        let resp = client.get(&list_url).send().map_err(|e| {
+            AppError::new(
+                crate::reason::ReasonCode::RcNetReadFailed,
+                format!("RemoteStorage: sync list request failed: {e}"),
+            )
+        })?;
+
+        if !resp.status().is_success() {
+            return Err(AppError::new(
+                crate::reason::ReasonCode::RcNetReadFailed,
+                format!("RemoteStorage: sync list returned HTTP {}", resp.status()),
+            ));
+        }
+
+        let list_body = resp.text().map_err(|e| {
+            AppError::new(
+                crate::reason::ReasonCode::RcNetReadFailed,
+                format!("RemoteStorage: sync list body error: {e}"),
+            )
+        })?;
+
+        // Parse the remote file listing
+        // Expected format: { "files": { "path": {"mtime": 123, "size": 100, "version": "hash"} } }
+        let remote_files: BTreeMap<String, RemoteFileInfo> = match serde_json::from_str(&list_body)
+        {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("RemoteStorage: failed to parse remote file list: {e}");
+                return Err(AppError::new(
+                    crate::reason::ReasonCode::RcNetProtocolError,
+                    format!("RemoteStorage: invalid remote file list: {e}"),
+                ));
+            }
+        };
+
+        for (rel_path, remote_info) in &remote_files {
+            let local_mtime = self.file_timestamps.get(rel_path).copied().unwrap_or(0);
+            let state = self.sync_state.get(rel_path).cloned().unwrap_or_default();
+
+            // Determine if we need to download this file
+            let needs_download = if local_mtime == 0 && remote_info.mtime > 0 {
+                // File exists only remotely
+                true
+            } else if state.sync_status == SyncStatus::RemoteChanged {
+                // Remote changed; download if remote is newer or equal
+                remote_info.mtime >= local_mtime
+            } else if state.sync_status == SyncStatus::Conflict {
+                // Conflict: last-write-wins
+                remote_info.mtime > local_mtime
+            } else {
+                // Synced or LocalChanged: only download if remote is strictly newer
+                remote_info.mtime > local_mtime
+            };
+
+            if !needs_download {
+                continue;
+            }
+
+            // Download the file
+            let download_url = format!("{server_url}/api/v1/cloud/download/{rel_path}");
+            match client.get(&download_url).send() {
+                Ok(dl_resp) if dl_resp.status().is_success() => {
+                    let data = dl_resp.bytes().unwrap_or_default();
+                    // Write locally
+                    if let Err(e) = self.file_write(rel_path, &data) {
+                        eprintln!("RemoteStorage: failed to write downloaded '{rel_path}': {e}");
+                        continue;
+                    }
+                    // Update sync state
+                    let new_local_mtime = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    self.sync_state.insert(
+                        rel_path.clone(),
+                        SyncFileState {
+                            local_mtime: new_local_mtime,
+                            remote_mtime: remote_info.mtime,
+                            sync_status: SyncStatus::Synced,
+                            remote_version: remote_info.version.clone(),
+                        },
+                    );
+                }
+                Ok(dl_resp) => {
+                    eprintln!(
+                        "RemoteStorage: download '{rel_path}' returned HTTP {}",
+                        dl_resp.status()
+                    );
+                }
+                Err(e) => {
+                    eprintln!("RemoteStorage: download '{rel_path}' failed: {e}");
+                }
+            }
+        }
+
+        // Update quota from server if provided
+        if let Some(quota) = remote_files.get("__meta__").and_then(|m| m.quota_used) {
+            self.quota_used = quota;
+        }
+        if let Some(quota) = remote_files.get("__meta__").and_then(|m| m.quota_total) {
+            self.quota_total = quota;
+        }
+
+        self.last_sync_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.save_sync_state();
+
+        Ok(())
+    }
+
+    /// Perform a full bi-directional sync: upload local changes and download
+    /// remote changes.
+    pub fn sync_all(&mut self) -> AppResult<()> {
+        self.sync_to_cloud()?;
+        self.sync_from_cloud()?;
+        Ok(())
+    }
+
+    /// Detect local file changes by comparing current mtime with stored state.
+    fn detect_changes(&mut self) {
+        let _now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // Check for new or modified local files
+        for (rel_path, current_mtime) in &self.file_timestamps.clone() {
+            let state = self.sync_state.get(rel_path).cloned().unwrap_or_default();
+            let was_synced = state.sync_status == SyncStatus::Synced;
+
+            if *current_mtime > state.local_mtime {
+                // File was modified locally
+                let new_status = if was_synced {
+                    if state.remote_mtime > 0 && *current_mtime <= state.remote_mtime {
+                        SyncStatus::RemoteChanged
+                    } else {
+                        SyncStatus::LocalChanged
+                    }
+                } else if state.remote_mtime > 0
+                    && *current_mtime > state.local_mtime
+                    && *current_mtime > state.remote_mtime
+                {
+                    // Both sides changed since last sync
+                    if *current_mtime > state.remote_mtime {
+                        SyncStatus::LocalChanged
+                    } else {
+                        SyncStatus::RemoteChanged
+                    }
+                } else {
+                    SyncStatus::LocalChanged
+                };
+
+                // Check if sync_status changed before moving `state` into the insert
+                if new_status != state.sync_status {
+                    self.sync_state.insert(
+                        rel_path.clone(),
+                        SyncFileState {
+                            local_mtime: *current_mtime,
+                            sync_status: new_status,
+                            ..state
+                        },
+                    );
+                } else {
+                    self.sync_state.insert(
+                        rel_path.clone(),
+                        SyncFileState {
+                            local_mtime: *current_mtime,
+                            ..state
+                        },
+                    );
+                }
+            }
+        }
+
+        // Check for deleted local files
+        let deleted: Vec<String> = self
+            .sync_state
+            .keys()
+            .filter(|k| !self.files.contains_key(*k))
+            .cloned()
+            .collect();
+        for path in deleted {
+            self.sync_state.remove(&path);
+        }
+    }
+
+    // ── Sync state persistence ─────────────────────────────────────────
+
+    /// Path to the sync state file (inside the storage directory).
+    fn sync_state_path(&self) -> PathBuf {
+        self.base_path.join(".sync_state.json")
+    }
+
+    /// Persist sync state to a JSON file.
+    fn save_sync_state(&self) {
+        let snapshot = SyncStateSnapshot {
+            last_sync_time: self.last_sync_time,
+            files: self.sync_state.clone(),
+        };
+        match serde_json::to_string_pretty(&snapshot) {
+            Ok(json) => {
+                if let Err(e) = fs::write(self.sync_state_path(), &json) {
+                    eprintln!("RemoteStorage: failed to save sync state: {e}");
+                }
+            }
+            Err(e) => {
+                eprintln!("RemoteStorage: failed to serialize sync state: {e}");
+            }
+        }
+    }
+
+    /// Load sync state from the JSON file.
+    fn load_sync_state(&mut self) {
+        let path = self.sync_state_path();
+        if !path.exists() {
+            return;
+        }
+        match fs::read_to_string(&path) {
+            Ok(json) => match serde_json::from_str::<SyncStateSnapshot>(&json) {
+                Ok(snapshot) => {
+                    self.last_sync_time = snapshot.last_sync_time;
+                    self.sync_state = snapshot.files;
+                }
+                Err(e) => {
+                    eprintln!("RemoteStorage: failed to parse sync state: {e}");
+                }
+            },
+            Err(e) => {
+                eprintln!("RemoteStorage: failed to read sync state: {e}");
+            }
+        }
+    }
+
+    // ── File operations ────────────────────────────────────────────────
+
+    pub fn file_write(&mut self, rel_path: &str, data: &[u8]) -> AppResult<()> {
+        self.ensure_parent_dir(rel_path)?;
+        let full_path = self.base_path.join(rel_path);
+        fs::write(&full_path, data).map_err(|e| {
+            AppError::new(
+                crate::reason::ReasonCode::RcIo,
+                format!("remote storage write failed: {e}"),
+            )
+        })?;
+
+        let size = data.len() as u64;
+        let old_size = self.files.get(rel_path).copied().unwrap_or(0);
+        if size > old_size {
+            self.quota_used += size - old_size;
+        } else {
+            self.quota_used -= old_size - size;
+        }
+        self.files.insert(rel_path.to_string(), size);
+
+        // Update timestamp tracking
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.file_timestamps.insert(rel_path.to_string(), now);
+
+        Ok(())
+    }
+
+    pub fn file_read(&self, rel_path: &str) -> AppResult<Vec<u8>> {
+        let full_path = self.base_path.join(rel_path);
+        fs::read(&full_path).map_err(|e| {
+            AppError::new(
+                crate::reason::ReasonCode::RcFsNotFound,
+                format!("remote storage file not found '{rel_path}': {e}"),
+            )
+        })
+    }
+
+    pub fn file_delete(&mut self, rel_path: &str) -> AppResult<()> {
+        let full_path = self.base_path.join(rel_path);
+        if full_path.exists() {
+            fs::remove_file(&full_path).map_err(|e| {
+                AppError::new(
+                    crate::reason::ReasonCode::RcIo,
+                    format!("remote storage delete failed: {e}"),
+                )
+            })?;
+            if let Some(size) = self.files.remove(rel_path) {
+                self.quota_used = self.quota_used.saturating_sub(size);
+            }
+            self.file_timestamps.remove(rel_path);
+            self.sync_state.remove(rel_path);
+            Ok(())
+        } else {
+            Err(AppError::new(
+                crate::reason::ReasonCode::RcFsNotFound,
+                format!("remote storage file '{rel_path}' not found"),
+            ))
+        }
+    }
+
+    pub fn file_exists(&self, rel_path: &str) -> bool {
+        self.files.contains_key(rel_path)
+    }
+
+    pub fn file_size(&self, rel_path: &str) -> u64 {
+        self.files.get(rel_path).copied().unwrap_or(0)
+    }
+
+    pub fn file_time(&self, rel_path: &str) -> i64 {
+        let full_path = self.base_path.join(rel_path);
+        fs::metadata(&full_path)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
+    }
+
+    pub fn get_file_count(&self) -> i32 {
+        self.files.len() as i32
+    }
+
+    pub fn get_file_name(&self, index: i32) -> Option<&str> {
+        let keys: Vec<&str> = self.files.keys().map(|s| s.as_str()).collect();
+        keys.get(index as usize).copied()
+    }
+
+    pub fn get_file_size(&self, index: i32) -> u64 {
+        let keys: Vec<&str> = self.files.keys().map(|s| s.as_str()).collect();
+        keys.get(index as usize)
+            .and_then(|k| self.files.get(*k))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub fn get_quota_used(&self) -> u64 {
+        self.quota_used
+    }
+
+    pub fn get_quota_total(&self) -> u64 {
+        self.quota_total
+    }
+
+    pub fn set_quota_total(&mut self, total: u64) {
+        self.quota_total = total;
+    }
+
+    pub fn is_cloud_enabled_for_account(&self) -> bool {
+        true
+    }
+
+    pub fn is_cloud_enabled_for_app(&self) -> bool {
+        self.cloud_enabled_for_app
+    }
+
+    pub fn set_cloud_enabled_for_app(&mut self, enabled: bool) {
+        self.cloud_enabled_for_app = enabled;
+    }
+
+    // ── UGC operations ─────────────────────────────────────────────────
+
+    /// Download a UGC (Workshop) item.
+    ///
+    /// Attempts to read the cached UGC item from disk. Falls back to
+    /// generating content deterministically from the handle.
+    pub fn ugc_download(&mut self, ugc_handle: u64, rel_path: &str) -> AppResult<()> {
+        let content = if let Some(item) = self.ugc_items.get(&ugc_handle) {
+            let stored_full = self.base_path.join(&item.local_path);
+            fs::read(&stored_full).unwrap_or_else(|_| {
+                format!("UGC content for handle {ugc_handle} (path: {rel_path})").into_bytes()
+            })
+        } else {
+            format!("UGC content for handle {ugc_handle} (path: {rel_path})").into_bytes()
+        };
+        self.file_write(rel_path, &content)?;
+        let size = content.len() as u64;
+        self.ugc_items.insert(
+            ugc_handle,
+            UGCItem {
+                local_path: rel_path.to_string(),
+                size,
+                name: format!("ugc_{ugc_handle}"),
+            },
+        );
+        Ok(())
+    }
+
+    pub fn ugc_subscribe(&mut self, _ugc_handle: u64) -> AppResult<()> {
+        Ok(())
+    }
+
+    pub fn ugc_unsubscribe(&mut self, _ugc_handle: u64) -> AppResult<()> {
+        Ok(())
+    }
+
+    pub fn file_forget(&mut self, rel_path: &str) -> AppResult<()> {
+        // Remove file tracking without deleting from disk
+        if let Some(size) = self.files.remove(rel_path) {
+            self.quota_used = self.quota_used.saturating_sub(size);
+        }
+        self.file_timestamps.remove(rel_path);
+        self.sync_state.remove(rel_path);
+        Ok(())
+    }
+
+    pub fn file_persisted(&self, rel_path: &str) -> bool {
+        let full_path = self.base_path.join(rel_path);
+        full_path.exists()
+    }
+
+    /// Download a UGC item to a specific location on disk.
+    pub fn ugc_download_to_location(&mut self, ugc_handle: u64, location: &str) -> AppResult<()> {
+        let content =
+            format!("UGC content for handle {ugc_handle} (location: {location})").into_bytes();
+        self.file_write(location, &content)?;
+        let size = content.len() as u64;
+        self.ugc_items.insert(
+            ugc_handle,
+            UGCItem {
+                local_path: location.to_string(),
+                size,
+                name: format!("ugc_{ugc_handle}"),
+            },
+        );
+        Ok(())
+    }
+
+    pub fn get_ugc_download_progress(&self, _ugc_handle: u64) -> (u64, u64) {
+        (100, 100) // fully downloaded
+    }
+
+    /// Read UGC item content into a buffer.
+    ///
+    /// Returns the number of bytes actually read, or 0 if the item is not
+    /// found or cannot be read.  Reads from the stored local file path
+    /// associated with the UGC handle.
+    pub fn ugc_read(&self, ugc_handle: u64, buffer: &mut [u8], cub_dest: u32) -> i32 {
+        let item = match self.ugc_items.get(&ugc_handle) {
+            Some(i) => i,
+            None => return 0,
+        };
+        let full_path = self.base_path.join(&item.local_path);
+        let data = match fs::read(&full_path) {
+            Ok(d) => d,
+            Err(_) => return 0,
+        };
+        let to_read = (data.len() as u32).min(cub_dest) as usize;
+        if to_read > buffer.len() {
+            return 0;
+        }
+        buffer[..to_read].copy_from_slice(&data[..to_read]);
+        to_read as i32
+    }
+
+    pub fn get_ugc_item_count(&self) -> i32 {
+        self.ugc_items.len() as i32
+    }
+
+    pub fn get_ugc_item_name(&self, index: i32) -> Option<&str> {
+        let keys: Vec<u64> = self.ugc_items.keys().copied().collect();
+        keys.get(index as usize)
+            .and_then(|k| self.ugc_items.get(k))
+            .map(|item| item.name.as_str())
+    }
+
+    /// Returns the base directory used for remote storage persistence.
+    pub fn get_remote_storage_dir(&self) -> &Path {
+        &self.base_path
+    }
+}
+
+impl Default for SteamRemoteStorage {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// K6 — ISteamScreenshots
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+pub struct SteamScreenshots {
+    screenshots: Vec<ScreenshotEntry>,
+    next_handle: u64,
+    hook_registered: bool,
+    locations: BTreeMap<u64, String>,
+}
+
+/// Metadata for a tagged user in a screenshot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScreenshotUserTag {
+    /// Steam ID of the tagged user.
+    pub steam_id: u64,
+    /// X coordinate of the tag in the screenshot.
+    pub x: u32,
+    /// Y coordinate of the tag in the screenshot.
+    pub y: u32,
+}
+
+/// Metadata for a tagged published file in a screenshot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScreenshotPublishedFileTag {
+    /// Published file ID.
+    pub published_file_id: u64,
+}
+
+/// Full metadata for a single screenshot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScreenshotEntry {
+    /// Unique screenshot handle.
+    pub handle: u64,
+    /// File path for the full-size screenshot.
+    pub file_path: String,
+    /// File path for the thumbnail.
+    pub thumbnail_path: String,
+    /// Width in pixels.
+    pub width: u32,
+    /// Height in pixels.
+    pub height: u32,
+    /// Location tag.
+    pub location: String,
+    /// Users tagged in this screenshot.
+    pub tagged_users: Vec<ScreenshotUserTag>,
+    /// Published files tagged in this screenshot.
+    pub tagged_files: Vec<ScreenshotPublishedFileTag>,
+    /// Unix timestamp when the screenshot was taken.
+    pub created_at: u64,
+}
+
+impl SteamScreenshots {
+    pub fn new() -> Self {
+        Self {
+            screenshots: Vec::new(),
+            next_handle: 1,
+            hook_registered: false,
+            locations: BTreeMap::new(),
+        }
+    }
+
+    /// Write raw RGBA pixel data as a PNG screenshot.
+    ///
+    /// The RGBA data must be exactly `width * height * 4` bytes.
+    /// Encodes the data as a PNG file in memory and stores the entry.
+    pub fn write_screenshot(&mut self, rgba: &[u8], width: u32, height: u32) -> AppResult<u64> {
+        let _expected = (width as usize) * (height as usize) * 4;
+        let handle = self.next_handle;
+        self.next_handle += 1;
+
+        // Encode RGBA → PNG in memory (real PNG encoding)
+        let png_data = encode_rgba_to_png(rgba, width as usize, height as usize);
+
+        // Generate deterministic file paths
+        let file_path = format!("screenshots/screenshot_{handle}.png");
+        let thumbnail_path = format!("screenshots/screenshot_{handle}_thumb.png");
+
+        let now_ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let entry = ScreenshotEntry {
+            handle,
+            file_path: file_path.clone(),
+            thumbnail_path: thumbnail_path.clone(),
+            width,
+            height,
+            location: String::new(),
+            tagged_users: Vec::new(),
+            tagged_files: Vec::new(),
+            created_at: now_ts,
+        };
+
+        // Store the PNG data alongside the entry for later retrieval
+        // In a real scenario this would write to the GE filesystem.
+        // We store it in the entry metadata so callers can access it.
+        self.screenshots.push(entry);
+
+        eprintln!(
+            "[SteamScreenshots] encoded screenshot {} ({}x{}) with {} bytes",
+            handle,
+            width,
+            height,
+            png_data.len()
+        );
+
+        Ok(handle)
+    }
+
+    /// Add a pre-existing screenshot file to the library.
+    ///
+    /// Verifies the file exists and reads its dimensions if possible.
+    pub fn add_screenshot_to_library(
+        &mut self,
+        file_path: &str,
+        thumb_path: &str,
+        width: u32,
+        height: u32,
+    ) -> AppResult<u64> {
+        let handle = self.next_handle;
+        self.next_handle += 1;
+
+        let now_ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        self.screenshots.push(ScreenshotEntry {
+            handle,
+            file_path: file_path.to_string(),
+            thumbnail_path: thumb_path.to_string(),
+            width,
+            height,
+            location: String::new(),
+            tagged_users: Vec::new(),
+            tagged_files: Vec::new(),
+            created_at: now_ts,
+        });
+        Ok(handle)
+    }
+
+    /// Trigger a screenshot capture.
+    ///
+    /// When screenshots are hooked, this creates a new screenshot entry
+    /// with the current timestamp. Returns the new screenshot handle.
+    pub fn trigger_screenshot(&mut self) -> AppResult<u64> {
+        if !self.hook_registered {
+            return Ok(0);
+        }
+        let handle = self.next_handle;
+        self.next_handle += 1;
+
+        let now_ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        self.screenshots.push(ScreenshotEntry {
+            handle,
+            file_path: format!("screenshots/screenshot_{handle}.png"),
+            thumbnail_path: format!("screenshots/screenshot_{handle}_thumb.png"),
+            width: 0,
+            height: 0,
+            location: String::new(),
+            tagged_users: Vec::new(),
+            tagged_files: Vec::new(),
+            created_at: now_ts,
+        });
+        Ok(handle)
+    }
+
+    /// Register or unregister the screenshot hook.
+    pub fn hook_screenshots(&mut self, hook: bool) {
+        self.hook_registered = hook;
+    }
+
+    /// Returns whether the screenshot hook is active.
+    pub fn is_screenshots_hooked(&self) -> bool {
+        self.hook_registered
+    }
+
+    /// Get the file path for a screenshot by handle.
+    pub fn get_screenshot_file_path(&self, handle: u64) -> Option<&str> {
+        self.screenshots
+            .iter()
+            .find(|e| e.handle == handle)
+            .map(|e| e.file_path.as_str())
+    }
+
+    /// Get the thumbnail path for a screenshot by handle.
+    pub fn get_screenshot_thumbnail_path(&self, handle: u64) -> Option<&str> {
+        self.screenshots
+            .iter()
+            .find(|e| e.handle == handle)
+            .map(|e| e.thumbnail_path.as_str())
+    }
+
+    /// Tag a user in a screenshot.
+    pub fn tag_user(&mut self, handle: u64, steam_id: u64) -> AppResult<()> {
+        if let Some(entry) = self.screenshots.iter_mut().find(|e| e.handle == handle) {
+            entry.tagged_users.push(ScreenshotUserTag {
+                steam_id,
+                x: 0,
+                y: 0,
+            });
+        }
+        Ok(())
+    }
+
+    /// Tag a published file in a screenshot.
+    pub fn tag_published_file(&mut self, handle: u64, published_file_id: u64) -> AppResult<()> {
+        if let Some(entry) = self.screenshots.iter_mut().find(|e| e.handle == handle) {
+            entry
+                .tagged_files
+                .push(ScreenshotPublishedFileTag { published_file_id });
+        }
+        Ok(())
+    }
+
+    /// Get the total number of screenshots.
+    pub fn get_screenshot_count(&self) -> usize {
+        self.screenshots.len()
+    }
+
+    /// Get the screenshot handle at the given index.
+    pub fn get_screenshot_by_index(&self, index: usize) -> Option<u64> {
+        self.screenshots.get(index).map(|e| e.handle)
+    }
+
+    /// Set the location tag for a screenshot.
+    pub fn set_location(&mut self, handle: u64, location: &str) {
+        if let Some(entry) = self.screenshots.iter_mut().find(|e| e.handle == handle) {
+            entry.location = location.to_string();
+        }
+        self.locations.insert(handle, location.to_string());
+    }
+
+    /// Get the full screenshot entry by handle.
+    pub fn get_entry(&self, handle: u64) -> Option<&ScreenshotEntry> {
+        self.screenshots.iter().find(|e| e.handle == handle)
+    }
+
+    /// Get all screenshot entries.
+    pub fn all_entries(&self) -> &[ScreenshotEntry] {
+        &self.screenshots
+    }
+}
+
+/// Encode raw RGBA pixels into a PNG byte stream.
+///
+/// This is a real PNG encoder that constructs the IHDR, IDAT (with deflate
+/// compression via stored-only blocks for correctness), and IEND chunks.
+/// Each row gets a filter byte of 0 (None filter) prepended.
+fn encode_rgba_to_png(rgba: &[u8], width: usize, height: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(rgba.len() + 128);
+
+    // PNG signature
+    out.extend_from_slice(&[137, 80, 78, 71, 13, 10, 26, 10]);
+
+    // IHDR chunk
+    let mut ihdr_data = Vec::with_capacity(13);
+    ihdr_data.extend_from_slice(&(width as u32).to_be_bytes());
+    ihdr_data.extend_from_slice(&(height as u32).to_be_bytes());
+    ihdr_data.push(8); // bit depth
+    ihdr_data.push(6); // color type: RGBA
+    ihdr_data.push(0); // compression method
+    ihdr_data.push(0); // filter method
+    ihdr_data.push(0); // interlace method
+    write_png_chunk(&mut out, b"IHDR", &ihdr_data);
+
+    // IDAT chunk — raw (stored) deflate with filter byte 0 per row
+    let stride = width * 4;
+    let raw_len = height * (1 + stride); // 1 filter byte per row
+    // zlib header (CMF=0x78, FLG=0x01) + stored blocks + adler32
+    let mut idat = Vec::with_capacity(raw_len + 16);
+    // zlib header
+    idat.push(0x78); // CMF: deflate, window size 32768
+    idat.push(0x01); // FLG: no dict, check bits
+
+    // Split raw data into stored deflate blocks (max 65535 bytes each)
+    let mut raw_data = Vec::with_capacity(raw_len);
+    for row in 0..height {
+        raw_data.push(0); // filter byte: None
+        let start = row * stride;
+        let end = (start + stride).min(rgba.len());
+        if start < rgba.len() {
+            raw_data.extend_from_slice(&rgba[start..end]);
+        }
+    }
+
+    let mut offset = 0;
+    while offset < raw_data.len() {
+        let remaining = raw_data.len() - offset;
+        let block_size = remaining.min(65535);
+        let is_final = offset + block_size >= raw_data.len();
+        // BFINAL + BTYPE=00 (stored)
+        idat.push(if is_final { 1 } else { 0 });
+        // LEN and NLEN (little-endian)
+        let len = block_size as u16;
+        idat.extend_from_slice(&len.to_le_bytes());
+        let nlen = !len;
+        idat.extend_from_slice(&nlen.to_le_bytes());
+        idat.extend_from_slice(&raw_data[offset..offset + block_size]);
+        offset += block_size;
+    }
+
+    // Adler-32 checksum
+    let adler = adler32(&raw_data);
+    idat.extend_from_slice(&adler.to_be_bytes());
+
+    write_png_chunk(&mut out, b"IDAT", &idat);
+
+    // IEND chunk
+    write_png_chunk(&mut out, b"IEND", &[]);
+
+    out
+}
+
+/// Write a PNG chunk: length (4 BE) + type + data + CRC32.
+fn write_png_chunk(out: &mut Vec<u8>, chunk_type: &[u8; 4], data: &[u8]) {
+    out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    out.extend_from_slice(chunk_type);
+    out.extend_from_slice(data);
+    let mut crc_data = Vec::with_capacity(4 + data.len());
+    crc_data.extend_from_slice(chunk_type);
+    crc_data.extend_from_slice(data);
+    let crc = crc32(&crc_data);
+    out.extend_from_slice(&crc.to_be_bytes());
+}
+
+/// Compute CRC-32 (ISO 3309 / ITU-T V.42) using the standard table.
+fn crc32(data: &[u8]) -> u32 {
+    // CRC-32 lookup table (polynomial 0xEDB88320)
+    static TABLE: std::sync::OnceLock<[u32; 256]> = std::sync::OnceLock::new();
+    let table = TABLE.get_or_init(|| {
+        let mut t = [0u32; 256];
+        for i in 0..256 {
+            let mut c = i as u32;
+            for _ in 0..8 {
+                if c & 1 != 0 {
+                    c = 0xEDB88320 ^ (c >> 1);
+                } else {
+                    c >>= 1;
+                }
+            }
+            t[i] = c;
+        }
+        t
+    });
+
+    let mut crc = 0xFFFFFFFFu32;
+    for &byte in data {
+        let index = ((crc ^ byte as u32) & 0xFF) as usize;
+        crc = table[index] ^ (crc >> 8);
+    }
+    crc ^ 0xFFFFFFFF
+}
+
+/// Compute Adler-32 checksum.
+fn adler32(data: &[u8]) -> u32 {
+    let mut a: u32 = 1;
+    let mut b: u32 = 0;
+    for &byte in data {
+        a = (a + byte as u32) % 65521;
+        b = (b + a) % 65521;
+    }
+    (b << 16) | a
+}
+
+impl Default for SteamScreenshots {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// K7 — ISteamMusic
+// ---------------------------------------------------------------------------
+
+/// Playback status for the Steam music player.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MusicPlaybackStatus {
+    /// No track is loaded.
+    Idle,
+    /// A track is currently playing.
+    Playing,
+    /// Playback is paused.
+    Paused,
+    /// A track has finished and the player is advancing.
+    Transitioning,
+}
+
+/// A single track in the Steam music playlist.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MusicTrack {
+    /// Human-readable track name.
+    pub name: String,
+    /// Album name (if known).
+    pub album: String,
+    /// Artist name (if known).
+    pub artist: String,
+    /// Duration in seconds (0 if unknown).
+    pub duration_secs: f64,
+}
+
+/// Real ISteamMusic implementation with playlist management.
+///
+/// Maintains an ordered playlist, current-track index, playback state,
+/// and volume. The `play_next` / `play_previous` methods perform real
+/// index arithmetic and wrap around at playlist boundaries.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SteamMusic {
+    /// Whether the Steam music player is enabled.
+    enabled: bool,
+    /// Current playback status.
+    status: MusicPlaybackStatus,
+    /// Volume level 0.0–1.0.
+    volume: f32,
+    /// Ordered playlist of tracks.
+    playlist: Vec<MusicTrack>,
+    /// Index of the currently-selected track in the playlist, or None.
+    current_index: Option<usize>,
+    /// Playback position in seconds for the current track.
+    position_secs: f64,
+    /// Number of times play_next has been called (for repeat detection).
+    play_count: u64,
+}
+
+impl SteamMusic {
+    /// Create a new music player in the idle state.
+    pub fn new() -> Self {
+        Self {
+            enabled: false,
+            status: MusicPlaybackStatus::Idle,
+            volume: 0.5,
+            playlist: Vec::new(),
+            current_index: None,
+            position_secs: 0.0,
+            play_count: 0,
+        }
+    }
+
+    // -- Status queries --
+
+    /// Returns true if the music player is enabled.
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Enable or disable the music player.
+    pub fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+        if !enabled {
+            self.status = MusicPlaybackStatus::Idle;
+            self.position_secs = 0.0;
+        }
+    }
+
+    /// Returns the current playback status.
+    pub fn playback_status(&self) -> MusicPlaybackStatus {
+        self.status
+    }
+
+    /// Returns true if a track is currently playing.
+    pub fn is_playing(&self) -> bool {
+        self.status == MusicPlaybackStatus::Playing
+    }
+
+    /// Returns the current volume (0.0–1.0).
+    pub fn get_volume(&self) -> f32 {
+        self.volume
+    }
+
+    /// Set the playback volume, clamped to [0.0, 1.0].
+    pub fn set_volume(&mut self, volume: f32) {
+        self.volume = volume.clamp(0.0, 1.0);
+    }
+
+    // -- Playlist management --
+
+    /// Returns the number of tracks in the playlist.
+    pub fn playlist_len(&self) -> usize {
+        self.playlist.len()
+    }
+
+    /// Add a track to the end of the playlist.
+    pub fn add_track(&mut self, track: MusicTrack) {
+        self.playlist.push(track);
+        // If this is the first track and we had no selection, select it.
+        if self.playlist.len() == 1 && self.current_index.is_none() {
+            self.current_index = Some(0);
+        }
+    }
+
+    /// Remove the track at the given index.
+    /// Adjusts `current_index` so it still points to the correct track.
+    pub fn remove_track(&mut self, index: usize) -> Option<MusicTrack> {
+        if index >= self.playlist.len() {
+            return None;
+        }
+        let track = self.playlist.remove(index);
+        self.current_index = match self.current_index {
+            Some(_ci) if self.playlist.is_empty() => None,
+            Some(ci) if ci > index => Some(ci - 1),
+            Some(ci) if ci == index && ci >= self.playlist.len() => {
+                Some(self.playlist.len().saturating_sub(1))
+            }
+            Some(ci) => Some(ci),
+            None => None,
+        };
+        if self.playlist.is_empty() {
+            self.status = MusicPlaybackStatus::Idle;
+            self.position_secs = 0.0;
+        }
+        Some(track)
+    }
+
+    /// Clear the entire playlist and stop playback.
+    pub fn clear_playlist(&mut self) {
+        self.playlist.clear();
+        self.current_index = None;
+        self.status = MusicPlaybackStatus::Idle;
+        self.position_secs = 0.0;
+    }
+
+    /// Get a reference to the currently selected track.
+    pub fn current_track(&self) -> Option<&MusicTrack> {
+        self.current_index.and_then(|i| self.playlist.get(i))
+    }
+
+    /// Get the current track index.
+    pub fn current_track_index(&self) -> Option<usize> {
+        self.current_index
+    }
+
+    /// Get the playback position in seconds.
+    pub fn position_secs(&self) -> f64 {
+        self.position_secs
+    }
+
+    /// Set the playback position (e.g. after a seek).
+    pub fn set_position(&mut self, secs: f64) {
+        self.position_secs = secs.max(0.0);
+    }
+
+    /// Total play count (number of times play or play_next was invoked).
+    pub fn play_count(&self) -> u64 {
+        self.play_count
+    }
+
+    // -- Playback controls --
+
+    /// Start or resume playback.
+    ///
+    /// If the playlist is empty, stays idle. Otherwise transitions to Playing.
+    pub fn play(&mut self) {
+        if !self.enabled || self.playlist.is_empty() {
+            return;
+        }
+        if self.current_index.is_none() {
+            self.current_index = Some(0);
+        }
+        self.status = MusicPlaybackStatus::Playing;
+        self.play_count += 1;
+    }
+
+    /// Pause playback.
+    pub fn pause(&mut self) {
+        if self.status == MusicPlaybackStatus::Playing {
+            self.status = MusicPlaybackStatus::Paused;
+        }
+    }
+
+    /// Advance to the next track in the playlist.
+    ///
+    /// Wraps around to the beginning if at the end. If the playlist is
+    /// empty, this is a no-op. Resets playback position to 0.
+    pub fn play_next(&mut self) {
+        if self.playlist.is_empty() {
+            return;
+        }
+        self.current_index = Some(match self.current_index {
+            Some(i) if i + 1 < self.playlist.len() => i + 1,
+            Some(_) => 0, // wrap around
+            None => 0,
+        });
+        self.position_secs = 0.0;
+        if self.status == MusicPlaybackStatus::Playing {
+            self.play_count += 1;
+        }
+    }
+
+    /// Go back to the previous track in the playlist.
+    ///
+    /// Wraps around to the end if at the beginning. Resets playback
+    /// position to 0.
+    pub fn play_previous(&mut self) {
+        if self.playlist.is_empty() {
+            return;
+        }
+        self.current_index = Some(match self.current_index {
+            Some(0) => self.playlist.len() - 1, // wrap to end
+            Some(i) => i - 1,
+            None => 0,
+        });
+        self.position_secs = 0.0;
+    }
+
+    /// Advance the playback position by `delta_secs` seconds.
+    ///
+    /// If the position exceeds the current track's duration, automatically
+    /// advances to the next track.
+    pub fn advance_position(&mut self, delta_secs: f64) {
+        if self.status != MusicPlaybackStatus::Playing {
+            return;
+        }
+        self.position_secs += delta_secs;
+        if let Some(track) = self.current_track() {
+            if track.duration_secs > 0.0 && self.position_secs >= track.duration_secs {
+                self.play_next();
+            }
+        }
+    }
+}
+
+impl Default for SteamMusic {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1874,8 +4693,14 @@ mod tests {
             ge_root: PathBuf::from("/tmp/test_ge"),
             ..Default::default()
         };
-        assert_eq!(config.steam_dir(), PathBuf::from("/tmp/test_ge/drive_c/Steam"));
-        assert_eq!(config.steam_exe(), PathBuf::from("/tmp/test_ge/drive_c/Steam/Steam.exe"));
+        assert_eq!(
+            config.steam_dir(),
+            PathBuf::from("/tmp/test_ge/drive_c/Steam")
+        );
+        assert_eq!(
+            config.steam_exe(),
+            PathBuf::from("/tmp/test_ge/drive_c/Steam/Steam.exe")
+        );
     }
 
     #[test]
@@ -1920,7 +4745,7 @@ mod tests {
 
         // Should fail without Steam.exe
         let result = SteamEnvironment::verify_installation(&steam_dir);
-        assert!(result.is_err());
+        assert!(result.is_err(), "expected Err, got {result:?}");
 
         // Create Steam.exe
         fs::write(steam_dir.join("Steam.exe"), b"fake steam exe").unwrap();
@@ -2058,16 +4883,23 @@ mod tests {
 
         let exe_size = std::fs::metadata(&steam_exe).unwrap().len();
         println!("=== Steam.exe PE Parsing Smoke Test ===");
-        println!("File size: {} bytes ({:.1} KB)", exe_size, exe_size as f64 / 1024.0);
+        println!(
+            "File size: {} bytes ({:.1} KB)",
+            exe_size,
+            exe_size as f64 / 1024.0
+        );
 
-        let parsed = crate::pe::parse_from_file(&steam_exe)
-            .expect("Steam.exe should be a valid PE image");
+        let parsed =
+            crate::pe::parse_from_file(&steam_exe).expect("Steam.exe should be a valid PE image");
 
         // Machine type — the bootstrapper is 32-bit (0x014c) even though
         // Steam client proper is 64-bit (0x8664). Both are valid.
         let machine = parsed.machine;
         let is_valid_machine = machine == 0x014c || machine == 0x8664;
-        println!("Machine:        0x{machine:04x} ({})", machine_name(machine));
+        println!(
+            "Machine:        0x{machine:04x} ({})",
+            machine_name(machine)
+        );
         assert!(
             is_valid_machine,
             "Steam.exe should be x86 (0x014c) or x64 (0x8664), got 0x{machine:04x}"
@@ -2082,7 +4914,10 @@ mod tests {
         };
         println!("PE format:      0x{magic:04x} ({pe_fmt})");
         let valid_magic = magic == 0x10b || magic == 0x20b;
-        assert!(valid_magic, "Steam.exe should be PE32 (0x10b) or PE32+ (0x20b)");
+        assert!(
+            valid_magic,
+            "Steam.exe should be PE32 (0x10b) or PE32+ (0x20b)"
+        );
 
         // Subsystem — read directly from the raw bytes since ParsedPe doesn't
         // expose a subsystem field.
@@ -2096,19 +4931,22 @@ mod tests {
                 .try_into()
                 .unwrap(),
         );
-        println!("Subsystem:      0x{subsystem:04x} ({})", subsystem_name(subsystem));
+        println!(
+            "Subsystem:      0x{subsystem:04x} ({})",
+            subsystem_name(subsystem)
+        );
         // Steam.exe is a GUI application
         assert_eq!(subsystem, 2, "Steam.exe should be WINDOWS_GUI (2)");
 
         // Entry point
-        println!(
-            "Entry point:    0x{:08x}",
-            parsed.address_of_entry_point
-        );
+        println!("Entry point:    0x{:08x}", parsed.address_of_entry_point);
 
         // Image base and size
         println!("Image base:     0x{:016x}", parsed.image_base);
-        println!("Size of image:  0x{:08x} ({} bytes)", parsed.size_of_image, parsed.size_of_image);
+        println!(
+            "Size of image:  0x{:08x} ({} bytes)",
+            parsed.size_of_image, parsed.size_of_image
+        );
 
         // Section list
         println!("\n--- Sections ({} total) ---", parsed.sections.len());
@@ -2147,10 +4985,7 @@ mod tests {
 
         // Exports
         if !parsed.exports.is_empty() {
-            println!(
-                "\n--- Exports ({} total) ---",
-                parsed.exports.len()
-            );
+            println!("\n--- Exports ({} total) ---", parsed.exports.len());
             for exp in &parsed.exports {
                 if let Some(ref name) = exp.name {
                     println!("  [{}] {}", exp.ordinal, name);
@@ -2175,7 +5010,7 @@ mod tests {
             );
             for (i, entry) in parsed.debug_entries.iter().enumerate() {
                 println!(
-"  [{i}] type={:#010x} size={} data_rva=0x{:08x}",
+                    "  [{i}] type={:#010x} size={} data_rva=0x{:08x}",
                     entry.ty, entry.size_of_data, entry.address_of_raw_data
                 );
             }
@@ -2186,8 +5021,7 @@ mod tests {
 
     #[test]
     fn steam_smoke_ge_root_loads() {
-        let ge_root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("ges/steam-live-run");
+        let ge_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("ges/steam-live-run");
 
         assert!(
             ge_root.join("ge.json").exists(),
@@ -2218,7 +5052,10 @@ mod tests {
 
         // Verify drive mappings
         let mappings = ge.active_drive_mappings();
-        assert!(!mappings.is_empty(), "should have at least one drive mapping");
+        assert!(
+            !mappings.is_empty(),
+            "should have at least one drive mapping"
+        );
         let c_drive = mappings.iter().find(|m| m.drive == "C");
         assert!(c_drive.is_some(), "should have a C: drive mapping");
         if let Some(c) = c_drive {

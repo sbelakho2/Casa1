@@ -15,16 +15,117 @@
 //! - Input layout → same desc as D3D11
 
 use crate::d3d11::{
-    self, BlendStateDesc, BlendStateId, D3d11ResourceId, D3d11ViewId,
+    self, BlendStateDesc, BlendStateId, D3d11Device, D3d11ResourceId, D3d11ViewId,
     DepthStencilStateDesc, DepthStencilStateId, DeviceCreationRequest, FeatureLevel,
-    InputLayoutDesc, InputLayoutId, RasterizerStateDesc, RasterizerStateId,
-    SamplerStateDesc, SamplerStateId, ShaderId, ShaderModuleDesc, ShaderStage,
-    Viewport, ScissorRect, D3d11Device,
+    InputLayoutDesc, InputLayoutId, RasterizerStateDesc, RasterizerStateId, SamplerStateDesc,
+    SamplerStateId, ScissorRect, ShaderId, ShaderModuleDesc, ShaderStage, Viewport,
 };
 use crate::error::{AppError, AppResult};
 use crate::gfx::{DxgiFormat, ResourceUsageHint, SwapchainDesc};
 use crate::reason::ReasonCode;
 
+// ---------------------------------------------------------------------------
+// D3D10 DXBC shader bytecode parsing
+// ---------------------------------------------------------------------------
+
+/// Magic bytes for DXBC containers.
+const DXBC_MAGIC: &[u8; 4] = b"DXBC";
+/// Magic bytes for DXIL containers (D3D11 shader model 5.0+).
+const DXIL_MAGIC: &[u8; 4] = b"DXIL";
+
+/// Shader program type values from the version token in SHDR/SHEX chunks.
+const D3D10_PROGRAM_TYPE_VS: u32 = 0; // Vertex shader
+const D3D10_PROGRAM_TYPE_PS: u32 = 1; // Pixel shader
+const D3D10_PROGRAM_TYPE_GS: u32 = 2; // Geometry shader
+
+/// Parse a D3D10/D3D11 DXBC container to extract the shader stage and entry
+/// point name. Returns `(ShaderStage, entry_point_name)`.
+///
+/// The DXBC container format is:
+///   [0..4)  magic         "DXBC" or "DXIL"
+///   [4..8)  version       u32 (typically 1)
+///   [8..12) total_size    u32
+///   [12..16) chunk_count  u32
+///   [16..)  chunk descriptors (12 bytes each: 4 byte fourCC, 4 byte offset, 4 byte size)
+fn parse_dxbc_bytecode(bytecode: &[u8]) -> AppResult<(ShaderStage, String)> {
+    if bytecode.len() < 16 {
+        return Err(AppError::new(
+            ReasonCode::RcD3dFeatureUnsupported,
+            "D3D10: shader bytecode too small for DXBC header",
+        ));
+    }
+    // Accept both DXBC and DXIL magic
+    let magic = &bytecode[..4];
+    if magic != DXBC_MAGIC && magic != DXIL_MAGIC {
+        return Err(AppError::new(
+            ReasonCode::RcD3dFeatureUnsupported,
+            format!(
+                "D3D10: invalid shader bytecode magic (expected DXBC/DXIL, got {:02x?})",
+                magic
+            ),
+        ));
+    }
+    let chunk_count = u32::from_le_bytes(bytecode[12..16].try_into().unwrap()) as usize;
+    if chunk_count == 0 || chunk_count > 32 {
+        return Err(AppError::new(
+            ReasonCode::RcD3dFeatureUnsupported,
+            "D3D10: invalid chunk count in shader bytecode",
+        ));
+    }
+    // Scan chunk descriptors for SHDR or SHEX
+    let mut stage: Option<ShaderStage> = None;
+    for i in 0..chunk_count {
+        let desc_offset = 16 + i * 12;
+        if desc_offset + 12 > bytecode.len() {
+            break;
+        }
+        let four_cc = &bytecode[desc_offset..desc_offset + 4];
+        // SHDR = shader model 4.0, SHEX = shader model 4.1+
+        if four_cc == b"SHDR" || four_cc == b"SHEX" {
+            let chunk_off =
+                u32::from_le_bytes(bytecode[desc_offset + 4..desc_offset + 8].try_into().unwrap())
+                    as usize;
+            let chunk_sz =
+                u32::from_le_bytes(bytecode[desc_offset + 8..desc_offset + 12].try_into().unwrap())
+                    as usize;
+            if chunk_off + 4 > bytecode.len() || chunk_sz < 4 {
+                continue;
+            }
+            // First DWORD of the chunk is the version token:
+            //   bits 0-7:   minor version
+            //   bits 8-15:  major version
+            //   bits 16-23: program type (0=VS, 1=PS, 2=GS, ...)
+            //   bits 24-31: 0xFF
+            let version_token =
+                u32::from_le_bytes(bytecode[chunk_off..chunk_off + 4].try_into().unwrap());
+            let program_type = (version_token >> 16) & 0xFF;
+            stage = Some(match program_type {
+                D3D10_PROGRAM_TYPE_VS => ShaderStage::Vs,
+                D3D10_PROGRAM_TYPE_PS => ShaderStage::Ps,
+                D3D10_PROGRAM_TYPE_GS => ShaderStage::Gs,
+                _ => {
+                    return Err(AppError::new(
+                        ReasonCode::RcD3dFeatureUnsupported,
+                        format!(
+                            "D3D10: unsupported shader program type {}",
+                            program_type
+                        ),
+                    ));
+                }
+            });
+            break;
+        }
+    }
+    let stage = stage.ok_or_else(|| {
+        AppError::new(
+            ReasonCode::RcD3dFeatureUnsupported,
+            "D3D10: no SHDR/SHEX chunk found in shader bytecode",
+        )
+    })?;
+    // Default entry point is "main" for HLSL-compiled shaders.
+    // Advanced parsing could extract the real entry name from metadata chunks.
+    Ok((stage, "main".to_string()))
+}
 // ── D3D10 Constants ─────────────────────────────────────────────────────────
 
 /// D3D10_SDK_VERSION
@@ -321,7 +422,7 @@ impl From<D3d10Rect> for ScissorRect {
 #[derive(Debug, Clone)]
 pub struct D3d10ShaderResourceViewDesc {
     pub format: DxgiFormat,
-    pub view_dimension: u32,  // D3D10_SRV_DIMENSION
+    pub view_dimension: u32, // D3D10_SRV_DIMENSION
     pub most_detailed_mip: u32,
     pub mip_levels: u32,
 }
@@ -330,7 +431,7 @@ pub struct D3d10ShaderResourceViewDesc {
 #[derive(Debug, Clone)]
 pub struct D3d10RenderTargetViewDesc {
     pub format: DxgiFormat,
-    pub view_dimension: u32,  // D3D10_RTV_DIMENSION
+    pub view_dimension: u32, // D3D10_RTV_DIMENSION
     pub mip_slice: u32,
 }
 
@@ -338,7 +439,7 @@ pub struct D3d10RenderTargetViewDesc {
 #[derive(Debug, Clone)]
 pub struct D3d10DepthStencilViewDesc {
     pub format: DxgiFormat,
-    pub view_dimension: u32,  // D3D10_DSV_DIMENSION
+    pub view_dimension: u32, // D3D10_DSV_DIMENSION
     pub mip_slice: u32,
 }
 
@@ -375,18 +476,29 @@ impl Default for D3d10SamplerDesc {
 }
 
 impl D3d10SamplerDesc {
-    /// Convert to D3D11 SamplerStateDesc
+    /// Convert to D3D11 SamplerStateDesc with full field mapping.
     pub fn to_d3d11(&self) -> SamplerStateDesc {
         SamplerStateDesc {
             filter: self.d3d10_filter_to_d3d11(),
             address_u: self.map_address_mode(self.address_u),
             address_v: self.map_address_mode(self.address_v),
+            address_w: self.map_address_mode(self.address_w),
+            mip_lod_bias: self.mip_lod_bias,
+            max_anisotropy: self.max_anisotropy,
+            comparison_func: self.comparison_func,
+            border_color: self.border_color,
+            min_lod: self.min_lod,
+            max_lod: self.max_lod,
         }
     }
 
     fn d3d10_filter_to_d3d11(&self) -> crate::gfx::FilterMode {
-        // Map D3D10 filter to the closest FilterMode
-        match self.filter {
+        // Map D3D10 filter to the closest FilterMode.
+        // Comparison filters map to the corresponding non-comparison filter mode
+        // since FilterMode doesn't have comparison variants. The comparison_func
+        // field captures the comparison semantics separately.
+        let raw = self.filter & 0x7F; // Mask off comparison bit (0x80)
+        match raw {
             D3D10_FILTER_MIN_MAG_MIP_POINT
             | D3D10_FILTER_MIN_MAG_POINT_MIP_LINEAR
             | D3D10_FILTER_MIN_POINT_MAG_LINEAR_MIP_POINT
@@ -428,9 +540,31 @@ pub struct D3d10BlendDesc {
 
 impl D3d10BlendDesc {
     pub fn to_d3d11(&self) -> BlendStateDesc {
+        // Map D3D10 blend/op constants to the u32 values used by D3D11
+        // (they are the same numeric values for the standard blend factors)
+        let map_rt = |i: usize| crate::d3d11::RenderTargetBlendDesc {
+            blend_enable: self.blend_enable[i],
+            src_blend: self.src_blend[i],
+            dest_blend: self.dest_blend[i],
+            blend_op: self.blend_op[i],
+            src_blend_alpha: self.src_blend_alpha[i],
+            dest_blend_alpha: self.dest_blend_alpha[i],
+            blend_op_alpha: self.blend_op_alpha[i],
+            render_target_write_mask: self.render_target_write_mask[i],
+        };
         BlendStateDesc {
-            blend_enable: self.blend_enable[0] != false,
-            alpha_to_coverage: self.alpha_to_coverage_enable,
+            alpha_to_coverage_enable: self.alpha_to_coverage_enable,
+            independent_blend_enable: false, // D3D10 does not support independent blend
+            render_target: [
+                map_rt(0),
+                map_rt(1),
+                map_rt(2),
+                map_rt(3),
+                map_rt(4),
+                map_rt(5),
+                map_rt(6),
+                map_rt(7),
+            ],
         }
     }
 }
@@ -478,6 +612,14 @@ impl D3d10RasterizerDesc {
                 D3D10_CULL_FRONT => "front".to_string(),
                 _ => "back".to_string(),
             },
+            front_counter_clockwise: self.front_counter_clockwise,
+            depth_bias: self.depth_bias,
+            depth_bias_clamp: self.depth_bias_clamp,
+            slope_scaled_depth_bias: self.slope_scaled_depth_bias,
+            depth_clip_enable: self.depth_clip_enable,
+            scissor_enable: self.scissor_enable,
+            multisample_enable: self.multisample_enable,
+            antialiased_line_enable: self.antialiased_line_enable,
         }
     }
 }
@@ -503,7 +645,7 @@ impl Default for D3d10RasterizerDesc {
 #[derive(Debug, Clone)]
 pub struct D3d10DepthStencilDesc {
     pub depth_enable: bool,
-    pub depth_write_mask: u8,    // D3D10_DEPTH_WRITE_MASK_ALL=1, ZERO=0
+    pub depth_write_mask: u8, // D3D10_DEPTH_WRITE_MASK_ALL=1, ZERO=0
     pub depth_func: u32,
     pub stencil_enable: bool,
     pub stencil_read_mask: u8,
@@ -522,7 +664,19 @@ impl D3d10DepthStencilDesc {
     pub fn to_d3d11(&self) -> DepthStencilStateDesc {
         DepthStencilStateDesc {
             depth_enable: self.depth_enable,
-            depth_write: self.depth_write_mask != 0,
+            depth_write_mask: self.depth_write_mask,
+            depth_func: self.depth_func,
+            stencil_enable: self.stencil_enable,
+            stencil_read_mask: self.stencil_read_mask,
+            stencil_write_mask: self.stencil_write_mask,
+            front_stencil_fail_op: self.front_stencil_fail_op,
+            front_stencil_depth_fail_op: self.front_stencil_depth_fail_op,
+            front_stencil_pass_op: self.front_stencil_pass_op,
+            front_stencil_func: self.front_stencil_func,
+            back_stencil_fail_op: self.back_stencil_fail_op,
+            back_stencil_depth_fail_op: self.back_stencil_depth_fail_op,
+            back_stencil_pass_op: self.back_stencil_pass_op,
+            back_stencil_func: self.back_stencil_func,
         }
     }
 }
@@ -556,7 +710,7 @@ pub struct D3d10InputElementDesc {
     pub format: DxgiFormat,
     pub input_slot: u32,
     pub aligned_byte_offset: u32,
-    pub input_slot_class: u32,  // D3D10_INPUT_PER_VERTEX_DATA=0, D3D10_INPUT_PER_INSTANCE_DATA=1
+    pub input_slot_class: u32, // D3D10_INPUT_PER_VERTEX_DATA=0, D3D10_INPUT_PER_INSTANCE_DATA=1
     pub instance_data_step_rate: u32,
 }
 
@@ -705,7 +859,8 @@ impl D3d10Device {
         _desc: Option<&D3d10RenderTargetViewDesc>,
     ) -> AppResult<D3d11ViewId> {
         let d3d11_id = self.get_d3d11_resource_id(resource_id)?;
-        self.d3d11_device.create_render_target_view(d3d11_id, crate::gfx::DxgiFormat::R8G8B8A8Unorm)
+        self.d3d11_device
+            .create_render_target_view(d3d11_id, crate::gfx::DxgiFormat::R8G8B8A8Unorm)
     }
 
     /// ID3D10Device::CreateDepthStencilView
@@ -715,7 +870,8 @@ impl D3d10Device {
         _desc: Option<&D3d10DepthStencilViewDesc>,
     ) -> AppResult<D3d11ViewId> {
         let d3d11_id = self.get_d3d11_resource_id(resource_id)?;
-        self.d3d11_device.create_depth_stencil_view(d3d11_id, crate::gfx::DxgiFormat::D24UnormS8Uint)
+        self.d3d11_device
+            .create_depth_stencil_view(d3d11_id, crate::gfx::DxgiFormat::D24UnormS8Uint)
     }
 
     /// ID3D10Device::CreateShaderResourceView
@@ -725,34 +881,60 @@ impl D3d10Device {
         _desc: Option<&D3d10ShaderResourceViewDesc>,
     ) -> AppResult<D3d11ViewId> {
         let d3d11_id = self.get_d3d11_resource_id(resource_id)?;
-        self.d3d11_device.create_shader_resource_view(d3d11_id, crate::gfx::DxgiFormat::R8G8B8A8Unorm)
+        self.d3d11_device
+            .create_shader_resource_view(d3d11_id, crate::gfx::DxgiFormat::R8G8B8A8Unorm)
     }
 
     // ── Shader Creation ────────────────────────────────────────────────────
 
+    /// Parse D3D10 DXBC shader bytecode and create a Metal function via the
+    /// D3D11 translation pipeline.
+    ///
+    /// Returns the entry point name extracted from the bytecode (defaults to
+    /// "main" for standard HLSL-compiled shaders).
+    fn create_shader_from_bytecode(
+        &mut self,
+        bytecode: &[u8],
+        expected_stage: ShaderStage,
+    ) -> AppResult<ShaderId> {
+        let (detected_stage, entry) = parse_dxbc_bytecode(bytecode)?;
+        // Verify the bytecode shader type matches the expected D3D10 API call
+        if detected_stage != expected_stage {
+            return Err(AppError::new(
+                ReasonCode::RcD3dFeatureUnsupported,
+                format!(
+                    "D3D10: shader bytecode stage {:?} does not match expected {:?}",
+                    detected_stage, expected_stage
+                ),
+            ));
+        }
+        let desc = ShaderModuleDesc {
+            stage: detected_stage,
+            entry,
+        };
+        // Route through the D3D11 DXIL translation pipeline. For native D3D10
+        // bytecode (shader model 4.0/4.1 tokens wrapped in DXBC) the
+        // translate_shader pipeline will attempt DXIL parsing; if the bytecode
+        // is actually DXIL (D3D11 shader model 5.0+), full Metal translation
+        // will occur. For D3D10 token bytecode, translation will fall through
+        // and the shader is stored without a Metal artifact (deferred).
+        self.d3d11_device
+            .create_shader_from_dxil(desc, bytecode.to_vec(), Vec::new())
+    }
+
     /// ID3D10Device::CreateVertexShader
-    pub fn create_vertex_shader(&mut self, bytecode: &[u8]) -> ShaderId {
-        // Shader bytecode compilation is deferred; store the stage only
-        self.d3d11_device.create_shader(ShaderModuleDesc {
-            stage: ShaderStage::Vs,
-            entry: String::new(),
-        })
+    pub fn create_vertex_shader(&mut self, bytecode: &[u8]) -> AppResult<ShaderId> {
+        self.create_shader_from_bytecode(bytecode, ShaderStage::Vs)
     }
 
     /// ID3D10Device::CreatePixelShader
-    pub fn create_pixel_shader(&mut self, bytecode: &[u8]) -> ShaderId {
-        self.d3d11_device.create_shader(ShaderModuleDesc {
-            stage: ShaderStage::Ps,
-            entry: String::new(),
-        })
+    pub fn create_pixel_shader(&mut self, bytecode: &[u8]) -> AppResult<ShaderId> {
+        self.create_shader_from_bytecode(bytecode, ShaderStage::Ps)
     }
 
     /// ID3D10Device::CreateGeometryShader
-    pub fn create_geometry_shader(&mut self, bytecode: &[u8]) -> ShaderId {
-        self.d3d11_device.create_shader(ShaderModuleDesc {
-            stage: ShaderStage::Gs,
-            entry: String::new(),
-        })
+    pub fn create_geometry_shader(&mut self, bytecode: &[u8]) -> AppResult<ShaderId> {
+        self.create_shader_from_bytecode(bytecode, ShaderStage::Gs)
     }
 
     // ── State Object Creation ──────────────────────────────────────────────
@@ -768,8 +950,12 @@ impl D3d10Device {
     }
 
     /// ID3D10Device::CreateDepthStencilState
-    pub fn create_depth_stencil_state(&mut self, desc: &D3d10DepthStencilDesc) -> DepthStencilStateId {
-        self.d3d11_device.create_depth_stencil_state(desc.to_d3d11())
+    pub fn create_depth_stencil_state(
+        &mut self,
+        desc: &D3d10DepthStencilDesc,
+    ) -> DepthStencilStateId {
+        self.d3d11_device
+            .create_depth_stencil_state(desc.to_d3d11())
     }
 
     /// ID3D10Device::CreateSamplerState
@@ -794,7 +980,8 @@ impl D3d10Device {
         render_targets: Vec<D3d11ViewId>,
         depth_target: Option<D3d11ViewId>,
     ) {
-        self.d3d11_device.om_set_render_targets(render_targets, depth_target);
+        self.d3d11_device
+            .om_set_render_targets(render_targets, depth_target);
     }
 
     /// ID3D10Device::OMSetBlendState
@@ -891,12 +1078,14 @@ impl D3d10Device {
 
     /// ID3D10Device::DrawInstanced
     pub fn draw_instanced(&mut self, vertex_count_per_instance: u32, instance_count: u32) {
-        self.d3d11_device.draw_instanced(vertex_count_per_instance, instance_count);
+        self.d3d11_device
+            .draw_instanced(vertex_count_per_instance, instance_count);
     }
 
     /// ID3D10Device::DrawIndexedInstanced
     pub fn draw_indexed_instanced(&mut self, index_count_per_instance: u32, instance_count: u32) {
-        self.d3d11_device.draw_indexed_instanced(index_count_per_instance, instance_count);
+        self.d3d11_device
+            .draw_indexed_instanced(index_count_per_instance, instance_count);
     }
 
     /// ID3D10Device::ClearRenderTargetView
@@ -922,15 +1111,12 @@ impl D3d10Device {
         } else {
             0
         };
-        self.d3d11_device.clear_depth_stencil_view(view, depth_val, stencil_val)
+        self.d3d11_device
+            .clear_depth_stencil_view(view, depth_val, stencil_val)
     }
 
     /// ID3D10Device::UpdateSubresource
-    pub fn update_subresource(
-        &mut self,
-        resource_id: u64,
-        data: &[u8],
-    ) -> AppResult<()> {
+    pub fn update_subresource(&mut self, resource_id: u64, data: &[u8]) -> AppResult<()> {
         let d3d11_id = self.get_d3d11_resource_id(resource_id)?;
         self.d3d11_device.update_subresource(d3d11_id, data)
     }
@@ -986,8 +1172,8 @@ impl D3d10Device {
     }
 
     /// ID3D10Device::GenerateMips
-    pub fn generate_mips(&mut self, _view_srv: D3d11ViewId) {
-        // No-op in software backend (same as D3D11)
+    pub fn generate_mips(&mut self, view_srv: D3d11ViewId) {
+        self.d3d11_device.generate_mips(view_srv);
     }
 
     /// ID3D10Device::Submit (execute immediate commands)
@@ -997,7 +1183,7 @@ impl D3d10Device {
 
     /// ID3D10Device::Present (via swapchain)
     pub fn present(&mut self) -> AppResult<()> {
-        // Present is handled via swapchain; the D3D11 device manages it
+        self.d3d11_device.present_swapchain(0, false, true)?;
         Ok(())
     }
 
@@ -1007,7 +1193,7 @@ impl D3d10Device {
         &self,
         usage: u32,
         bind_flags: u32,
-        cpu_access_flags: u32,
+        _cpu_access_flags: u32,
     ) -> ResourceUsageHint {
         let is_depth_stencil = (bind_flags & D3D10_BIND_DEPTH_STENCIL) != 0;
         let is_render_target = (bind_flags & D3D10_BIND_RENDER_TARGET) != 0;
@@ -1131,37 +1317,82 @@ pub struct D3d10Iid;
 
 impl D3d10Iid {
     /// IID_ID3D10Device: {9B7E4C0F-342C-4106-A19F-4F2704F689F0}
-    pub const ID3D10DEVICE: [u8; 16] = [0x0F, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89, 0xF0];
+    pub const ID3D10DEVICE: [u8; 16] = [
+        0x0F, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89,
+        0xF0,
+    ];
     /// IID_ID3D10DeviceContext: does not exist in D3D10 (device IS context), but for compatibility
     /// we define IID_ID3D10Device1: {9B7E4C8F-342C-4106-A19F-4F2704F689F0}
     /// IID_ID3D10Texture2D: {9B7E4C80-342C-4106-A19F-4F2704F689F0}
-    pub const ID3D10TEXTURE2D: [u8; 16] = [0x80, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89, 0xF0];
+    pub const ID3D10TEXTURE2D: [u8; 16] = [
+        0x80, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89,
+        0xF0,
+    ];
     /// IID_ID3D10Buffer: {9B7E4C81-342C-4106-A19F-4F2704F689F0}
-    pub const ID3D10BUFFER: [u8; 16] = [0x81, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89, 0xF0];
+    pub const ID3D10BUFFER: [u8; 16] = [
+        0x81, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89,
+        0xF0,
+    ];
     /// IID_ID3D10RenderTargetView: {9B7E4C82-342C-4106-A19F-4F2704F689F0}
-    pub const ID3D10RENDERTARGETVIEW: [u8; 16] = [0x82, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89, 0xF0];
+    pub const ID3D10RENDERTARGETVIEW: [u8; 16] = [
+        0x82, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89,
+        0xF0,
+    ];
     /// IID_ID3D10DepthStencilView: {9B7E4C83-342C-4106-A19F-4F2704F689F0}
-    pub const ID3D10DEPTHSTENCILVIEW: [u8; 16] = [0x83, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89, 0xF0];
+    pub const ID3D10DEPTHSTENCILVIEW: [u8; 16] = [
+        0x83, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89,
+        0xF0,
+    ];
     /// IID_ID3D10ShaderResourceView: {9B7E4C84-342C-4106-A19F-4F2704F689F0}
-    pub const ID3D10SHADERRESOURCEVIEW: [u8; 16] = [0x84, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89, 0xF0];
+    pub const ID3D10SHADERRESOURCEVIEW: [u8; 16] = [
+        0x84, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89,
+        0xF0,
+    ];
     /// IID_ID3D10VertexShader: {9B7E4C85-342C-4106-A19F-4F2704F689F0}
-    pub const ID3D10VERTEXSHADER: [u8; 16] = [0x85, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89, 0xF0];
+    pub const ID3D10VERTEXSHADER: [u8; 16] = [
+        0x85, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89,
+        0xF0,
+    ];
     /// IID_ID3D10PixelShader: {9B7E4C86-342C-4106-A19F-4F2704F689F0}
-    pub const ID3D10PIXELSHADER: [u8; 16] = [0x86, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89, 0xF0];
+    pub const ID3D10PIXELSHADER: [u8; 16] = [
+        0x86, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89,
+        0xF0,
+    ];
     /// IID_ID3D10GeometryShader: {9B7E4C87-342C-4106-A19F-4F2704F689F0}
-    pub const ID3D10GEOMETRYSHADER: [u8; 16] = [0x87, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89, 0xF0];
+    pub const ID3D10GEOMETRYSHADER: [u8; 16] = [
+        0x87, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89,
+        0xF0,
+    ];
     /// IID_ID3D10InputLayout: {9B7E4C88-342C-4106-A19F-4F2704F689F0}
-    pub const ID3D10INPUTLAYOUT: [u8; 16] = [0x88, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89, 0xF0];
+    pub const ID3D10INPUTLAYOUT: [u8; 16] = [
+        0x88, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89,
+        0xF0,
+    ];
     /// IID_ID3D10SamplerState: {9B7E4C89-342C-4106-A19F-4F2704F689F0}
-    pub const ID3D10SAMPLERSTATE: [u8; 16] = [0x89, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89, 0xF0];
+    pub const ID3D10SAMPLERSTATE: [u8; 16] = [
+        0x89, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89,
+        0xF0,
+    ];
     /// IID_ID3D10BlendState: {9B7E4C8A-342C-4106-A19F-4F2704F689F0}
-    pub const ID3D10BLENDSTATE: [u8; 16] = [0x8A, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89, 0xF0];
+    pub const ID3D10BLENDSTATE: [u8; 16] = [
+        0x8A, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89,
+        0xF0,
+    ];
     /// IID_ID3D10RasterizerState: {9B7E4C8B-342C-4106-A19F-4F2704F689F0}
-    pub const ID3D10RASTERIZERSTATE: [u8; 16] = [0x8B, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89, 0xF0];
+    pub const ID3D10RASTERIZERSTATE: [u8; 16] = [
+        0x8B, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89,
+        0xF0,
+    ];
     /// IID_ID3D10DepthStencilState: {9B7E4C8C-342C-4106-A19F-4F2704F689F0}
-    pub const ID3D10DEPTHSTENCILSTATE: [u8; 16] = [0x8C, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89, 0xF0];
+    pub const ID3D10DEPTHSTENCILSTATE: [u8; 16] = [
+        0x8C, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89,
+        0xF0,
+    ];
     /// IID_ID3D10MultisampleState: {9B7E4C8D-342C-4106-A19F-4F2704F689F0}
-    pub const ID3D10MULTISAMPLESTATE: [u8; 16] = [0x8D, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89, 0xF0];
+    pub const ID3D10MULTISAMPLESTATE: [u8; 16] = [
+        0x8D, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89,
+        0xF0,
+    ];
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────
@@ -1173,15 +1404,9 @@ mod tests {
     /// Test that D3D10CreateDevice produces a usable device.
     #[test]
     fn test_d3d10_create_device() {
-        let device = d3d10_create_device(
-            0,
-            D3d10DriverType::Hardware,
-            0,
-            0,
-            &[],
-            D3D10_SDK_VERSION,
-        )
-        .expect("D3D10CreateDevice should succeed");
+        let device =
+            d3d10_create_device(0, D3d10DriverType::Hardware, 0, 0, &[], D3D10_SDK_VERSION)
+                .expect("D3D10CreateDevice should succeed");
         assert_eq!(device.feature_level(), D3d10FeatureLevel::Level10_1);
     }
 
@@ -1210,15 +1435,9 @@ mod tests {
     /// Test creating a D3D10 texture and verifying it maps to D3D11.
     #[test]
     fn test_d3d10_create_texture2d() {
-        let mut device = d3d10_create_device(
-            0,
-            D3d10DriverType::Hardware,
-            0,
-            0,
-            &[],
-            D3D10_SDK_VERSION,
-        )
-        .expect("create device");
+        let mut device =
+            d3d10_create_device(0, D3d10DriverType::Hardware, 0, 0, &[], D3D10_SDK_VERSION)
+                .expect("create device");
 
         let desc = D3d10Texture2dDesc {
             width: 64,
@@ -1226,7 +1445,10 @@ mod tests {
             mip_levels: 1,
             array_size: 1,
             format: DxgiFormat::R8G8B8A8Unorm,
-            sample_desc: D3d10SampleDesc { count: 1, quality: 0 },
+            sample_desc: D3d10SampleDesc {
+                count: 1,
+                quality: 0,
+            },
             usage: D3D10_USAGE_DEFAULT,
             bind_flags: D3D10_BIND_RENDER_TARGET,
             cpu_access_flags: 0,
@@ -1238,8 +1460,13 @@ mod tests {
             .expect("create texture 2d");
         assert!(resource_id > 0);
 
-        let d3d11_id = device.get_d3d11_resource_id(resource_id).expect("get d3d11 id");
-        let desc_info = device.d3d11_device().resource_desc(d3d11_id).expect("resource desc");
+        let d3d11_id = device
+            .get_d3d11_resource_id(resource_id)
+            .expect("get d3d11 id");
+        let desc_info = device
+            .d3d11_device()
+            .resource_desc(d3d11_id)
+            .expect("resource desc");
         assert_eq!(desc_info.width, 64);
         assert_eq!(desc_info.height, 64);
     }
@@ -1247,15 +1474,9 @@ mod tests {
     /// Test creating a D3D10 buffer.
     #[test]
     fn test_d3d10_create_buffer() {
-        let mut device = d3d10_create_device(
-            0,
-            D3d10DriverType::Hardware,
-            0,
-            0,
-            &[],
-            D3D10_SDK_VERSION,
-        )
-        .expect("create device");
+        let mut device =
+            d3d10_create_device(0, D3d10DriverType::Hardware, 0, 0, &[], D3D10_SDK_VERSION)
+                .expect("create device");
 
         let desc = D3d10BufferDesc {
             byte_width: 1024,
@@ -1265,24 +1486,16 @@ mod tests {
             misc_flags: 0,
         };
 
-        let resource_id = device
-            .create_buffer(&desc, None)
-            .expect("create buffer");
+        let resource_id = device.create_buffer(&desc, None).expect("create buffer");
         assert!(resource_id > 0);
     }
 
     /// Test basic state creation and setting.
     #[test]
     fn test_d3d10_render_state_setup() {
-        let mut device = d3d10_create_device(
-            0,
-            D3d10DriverType::Hardware,
-            0,
-            0,
-            &[],
-            D3D10_SDK_VERSION,
-        )
-        .expect("create device");
+        let mut device =
+            d3d10_create_device(0, D3d10DriverType::Hardware, 0, 0, &[], D3D10_SDK_VERSION)
+                .expect("create device");
 
         // Create rasterizer state
         let rs_desc = D3d10RasterizerDesc {
@@ -1353,14 +1566,21 @@ mod tests {
             mip_levels: 1,
             array_size: 1,
             format: DxgiFormat::R8G8B8A8Unorm,
-            sample_desc: D3d10SampleDesc { count: 1, quality: 0 },
+            sample_desc: D3d10SampleDesc {
+                count: 1,
+                quality: 0,
+            },
             usage: D3D10_USAGE_DEFAULT,
             bind_flags: D3D10_BIND_RENDER_TARGET,
             cpu_access_flags: 0,
             misc_flags: 0,
         };
-        let rt_id = device.create_texture_2d(&tex_desc, None).expect("create RT texture");
-        let rtv = device.create_render_target_view(rt_id, None).expect("create RTV");
+        let rt_id = device
+            .create_texture_2d(&tex_desc, None)
+            .expect("create RT texture");
+        let rtv = device
+            .create_render_target_view(rt_id, None)
+            .expect("create RTV");
 
         let ds_tex_desc = D3d10Texture2dDesc {
             width: 256,
@@ -1368,14 +1588,21 @@ mod tests {
             mip_levels: 1,
             array_size: 1,
             format: DxgiFormat::D24UnormS8Uint,
-            sample_desc: D3d10SampleDesc { count: 1, quality: 0 },
+            sample_desc: D3d10SampleDesc {
+                count: 1,
+                quality: 0,
+            },
             usage: D3D10_USAGE_DEFAULT,
             bind_flags: D3D10_BIND_DEPTH_STENCIL,
             cpu_access_flags: 0,
             misc_flags: 0,
         };
-        let ds_id = device.create_texture_2d(&ds_tex_desc, None).expect("create DS texture");
-        let dsv = device.create_depth_stencil_view(ds_id, None).expect("create DSV");
+        let ds_id = device
+            .create_texture_2d(&ds_tex_desc, None)
+            .expect("create DS texture");
+        let dsv = device
+            .create_depth_stencil_view(ds_id, None)
+            .expect("create DSV");
 
         // Set render targets
         device.om_set_render_targets(vec![rtv], Some(dsv));
@@ -1396,21 +1623,17 @@ mod tests {
             D3D10_SDK_VERSION,
         )
         .expect("create device with BGRA support");
-        assert_eq!(device.creation_flags & D3D10_CREATE_DEVICE_BGRA_SUPPORT, D3D10_CREATE_DEVICE_BGRA_SUPPORT);
+        assert_eq!(
+            device.creation_flags & D3D10_CREATE_DEVICE_BGRA_SUPPORT,
+            D3D10_CREATE_DEVICE_BGRA_SUPPORT
+        );
     }
 
     /// Test D3D10CreateDevice with WARP driver type.
     #[test]
     fn test_d3d10_create_device_warp() {
-        let device = d3d10_create_device(
-            0,
-            D3d10DriverType::Warp,
-            0,
-            0,
-            &[],
-            D3D10_SDK_VERSION,
-        )
-        .expect("create device with WARP driver");
+        let device = d3d10_create_device(0, D3d10DriverType::Warp, 0, 0, &[], D3D10_SDK_VERSION)
+            .expect("create device with WARP driver");
         assert_eq!(device.feature_level(), D3d10FeatureLevel::Level10_1);
     }
 }

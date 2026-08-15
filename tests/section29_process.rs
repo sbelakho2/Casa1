@@ -9,8 +9,8 @@ mod support;
 use casa1::ge::{GameEnvironment, GeArch};
 use casa1::reason::ReasonCode;
 use casa1::win32::{
-    self, build_environment_block_utf16, windows_command_line_to_argv, CreateProcessResult,
-    WaitStatus, Win32Subsystem,
+    self, CreateProcessResult, WaitStatus, Win32Subsystem, build_environment_block_utf16,
+    windows_command_line_to_argv,
 };
 use std::collections::BTreeMap;
 use std::sync::{Arc, Condvar, Mutex};
@@ -131,7 +131,9 @@ fn test_create_process_w_state() {
     let result = create_test_process(&mut win32, "C:\\test.exe", "test.exe", false);
 
     // Check process state via process_state()
-    let state = win32.process_state(result.process_handle).expect("process_state");
+    let state = win32
+        .process_state(result.process_handle)
+        .expect("process_state");
     assert_eq!(state.process_id, result.process_id);
     assert_eq!(state.executable, "C:\\test.exe");
     assert_eq!(state.cwd, "C:\\");
@@ -161,16 +163,24 @@ fn test_create_process_w_inherit_handles_true() {
     let (_evt_no_inherit, _) = win32.create_event(true, false, false, None);
 
     let result = create_test_process(&mut win32, "C:\\test.exe", "test.exe", true);
-    let state = win32.process_state(result.process_handle).expect("process_state");
+    let state = win32
+        .process_state(result.process_handle)
+        .expect("process_state");
 
     // The inherited_handles should contain an Event descriptor with inheritable == true.
     assert!(
-        state.inherited_handles.iter().any(|h| h.object_type == win32::ObjectType::Event && h.inheritable),
+        state
+            .inherited_handles
+            .iter()
+            .any(|h| h.object_type == win32::ObjectType::Event && h.inheritable),
         "inheritable event descriptor must appear in inherited_handles"
     );
     // The non-inheritable event descriptor must NOT appear.
     assert!(
-        !state.inherited_handles.iter().any(|h| h.object_type == win32::ObjectType::Event && !h.inheritable),
+        !state
+            .inherited_handles
+            .iter()
+            .any(|h| h.object_type == win32::ObjectType::Event && !h.inheritable),
         "non-inheritable event descriptor must NOT appear in inherited_handles"
     );
 }
@@ -182,7 +192,9 @@ fn test_create_process_w_inherit_handles_false() {
     let (_evt, _) = win32.create_event(true, true, true, None);
 
     let result = create_test_process(&mut win32, "C:\\test.exe", "test.exe", false);
-    let state = win32.process_state(result.process_handle).expect("process_state");
+    let state = win32
+        .process_state(result.process_handle)
+        .expect("process_state");
     // When inherit_handles is false, inherited_handles should be empty.
     assert!(
         state.inherited_handles.is_empty(),
@@ -200,12 +212,18 @@ fn test_set_process_exit_code() {
     let result = create_test_process(&mut win32, "C:\\test.exe", "test.exe", false);
 
     // Initially no exit code.
-    let state = win32.process_state(result.process_handle).expect("process_state");
+    let state = win32
+        .process_state(result.process_handle)
+        .expect("process_state");
     assert_eq!(state.exit_code, None);
 
     // Set exit code.
-    win32.set_process_exit_code(result.process_handle, 42).expect("set exit code");
-    let state = win32.process_state(result.process_handle).expect("process_state");
+    win32
+        .set_process_exit_code(result.process_handle, 42)
+        .expect("set exit code");
+    let state = win32
+        .process_state(result.process_handle)
+        .expect("process_state");
     assert_eq!(state.exit_code, Some(42));
 }
 
@@ -243,13 +261,13 @@ fn test_wait_for_single_object_process_with_exit_sync() {
     // and notify all waiters.
     let sync_clone = sync.clone();
     std::thread::spawn(move || {
-            let (lock, cvar) = &*sync_clone;
-            let mut guard = lock.lock().unwrap();
-            *guard = Some(0);
-            cvar.notify_all();
-        })
-        .join()
-        .expect("notify thread");
+        let (lock, cvar) = &*sync_clone;
+        let mut guard = lock.lock().unwrap();
+        *guard = Some(0);
+        cvar.notify_all();
+    })
+    .join()
+    .expect("notify thread");
 
     // Now wait should succeed with WAIT_OBJECT_0 (the exit sync was triggered).
     let status = win32
@@ -261,7 +279,9 @@ fn test_wait_for_single_object_process_with_exit_sync() {
     // to return Object0; it does NOT update the process object's exit_code field.
     // The exit code must be set explicitly via set_process_exit_code (which
     // is tested separately in test_set_process_exit_code_and_notify).
-    let state = win32.process_state(result.process_handle).expect("process_state");
+    let state = win32
+        .process_state(result.process_handle)
+        .expect("process_state");
     assert_eq!(state.exit_code, None);
 }
 
@@ -344,11 +364,19 @@ fn test_create_process_w_round_trip_with_env_and_cwd() {
     assert!(result.process_id > 0);
 
     // Verify process state includes the custom env and cwd.
-    let state = win32.process_state(result.process_handle).expect("process_state");
+    let state = win32
+        .process_state(result.process_handle)
+        .expect("process_state");
     assert_eq!(state.executable, "C:\\tools\\my_app.exe");
     assert_eq!(state.cwd, "C:\\workdir");
-    assert_eq!(state.environment.get("MY_VAR"), Some(&"my_value".to_string()));
-    assert_eq!(state.environment.get("PATH"), Some(&"C:\\Windows".to_string()));
+    assert_eq!(
+        state.environment.get("MY_VAR"),
+        Some(&"my_value".to_string())
+    );
+    assert_eq!(
+        state.environment.get("PATH"),
+        Some(&"C:\\Windows".to_string())
+    );
 
     // The environment block UTF-16 output should include both entries.
     let block_str = String::from_utf16_lossy(&result.environment_block_utf16);
@@ -359,7 +387,9 @@ fn test_create_process_w_round_trip_with_env_and_cwd() {
     win32
         .set_process_exit_code(result.process_handle, 7)
         .expect("set exit code");
-    let state = win32.process_state(result.process_handle).expect("process_state");
+    let state = win32
+        .process_state(result.process_handle)
+        .expect("process_state");
     assert_eq!(state.exit_code, Some(7));
 }
 
@@ -381,13 +411,13 @@ fn test_set_process_exit_code_and_notify() {
     // Spawn a waiter thread.
     let sync_clone = sync.clone();
     let waiter = std::thread::spawn(move || {
-            let (lock, cvar) = &*sync_clone;
-            let mut guard = lock.lock().unwrap();
-            while guard.is_none() {
-                guard = cvar.wait(guard).unwrap();
-            }
-            guard.unwrap()
-        });
+        let (lock, cvar) = &*sync_clone;
+        let mut guard = lock.lock().unwrap();
+        while guard.is_none() {
+            guard = cvar.wait(guard).unwrap();
+        }
+        guard.unwrap()
+    });
 
     // Notify from the main thread.
     win32
@@ -397,7 +427,9 @@ fn test_set_process_exit_code_and_notify() {
     let exit_code = waiter.join().expect("waiter thread");
     assert_eq!(exit_code, 99);
 
-    let state = win32.process_state(result.process_handle).expect("process_state");
+    let state = win32
+        .process_state(result.process_handle)
+        .expect("process_state");
     assert_eq!(state.exit_code, Some(99));
 }
 

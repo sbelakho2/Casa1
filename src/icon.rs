@@ -39,8 +39,8 @@ pub struct IcoDirEntry {
     pub height: u8,      // 0 means 256
     pub color_count: u8, // 0 means >= 256 colors
     pub reserved: u8,
-    pub planes: u16,     // For ICO, should be 0 or 1
-    pub bpp: u16,        // Bits per pixel
+    pub planes: u16, // For ICO, should be 0 or 1
+    pub bpp: u16,    // Bits per pixel
     pub size: u32,
     pub offset: u32,
 }
@@ -51,7 +51,7 @@ pub struct IconImage {
     pub width: u32,
     pub height: u32,
     pub bpp: u16,
-    pub data: Vec<u8>,         // Raw BGRA pixel data or PNG data
+    pub data: Vec<u8>, // Raw BGRA pixel data or PNG data
     pub is_png_compressed: bool,
     /// XOR mask (icon transparency) — 1 bit per pixel, row-padded to 32 bits
     pub xor_mask: Option<Vec<u8>>,
@@ -109,8 +109,13 @@ impl IcnsType {
 ///
 /// Delegates to [`crate::pe::extract_icon_from_pe`] for the actual PE parsing.
 pub fn extract_icon_from_pe(path: &Path) -> AppResult<Option<IconImage>> {
-    let bytes = std::fs::read(path)
-        .map_err(|e| AppError::from_io(ReasonCode::RcIo, format!("failed to read PE file: {}", path.display()), &e))?;
+    let bytes = std::fs::read(path).map_err(|e| {
+        AppError::from_io(
+            ReasonCode::RcIo,
+            format!("failed to read PE file: {}", path.display()),
+            &e,
+        )
+    })?;
     let icons = crate::pe::extract_icon_from_pe(&bytes)?;
     // pe::extract_icon_from_pe already returns the largest icon in a Vec,
     // so take the first element if present.
@@ -121,8 +126,13 @@ pub fn extract_icon_from_pe(path: &Path) -> AppResult<Option<IconImage>> {
 ///
 /// Delegates to [`crate::pe::extract_all_icons_from_pe`] for the actual PE parsing.
 pub fn extract_all_icons_from_pe(path: &Path) -> AppResult<Vec<IconImage>> {
-    let bytes = std::fs::read(path)
-        .map_err(|e| AppError::from_io(ReasonCode::RcIo, format!("failed to read PE file: {}", path.display()), &e))?;
+    let bytes = std::fs::read(path).map_err(|e| {
+        AppError::from_io(
+            ReasonCode::RcIo,
+            format!("failed to read PE file: {}", path.display()),
+            &e,
+        )
+    })?;
     crate::pe::extract_all_icons_from_pe(&bytes)
 }
 
@@ -142,9 +152,9 @@ pub fn dib_to_png(data: &[u8], width: u32, height: u32, bpp: u16) -> AppResult<V
             let dst_pixel = (y as usize * width as usize + x) * 4;
             if src_pixel + 4 <= data.len() {
                 // DIB is BGRA
-                rgba[dst_pixel as usize] = data[src_pixel + 2];     // R
+                rgba[dst_pixel as usize] = data[src_pixel + 2]; // R
                 rgba[dst_pixel as usize + 1] = data[src_pixel + 1]; // G
-                rgba[dst_pixel as usize + 2] = data[src_pixel];     // B
+                rgba[dst_pixel as usize + 2] = data[src_pixel]; // B
                 if bpp == 32 {
                     rgba[dst_pixel as usize + 3] = data[src_pixel + 3]; // A
                 } else {
@@ -176,13 +186,15 @@ fn encode_png(data: &[u8], width: u32, height: u32) -> AppResult<Vec<u8>> {
         encoder.set_depth(png::BitDepth::Eight);
         encoder.set_compression(png::Compression::Default);
 
-        let mut writer = encoder
-            .write_header()
-            .map_err(|e| AppError::new(ReasonCode::RcPeParseInvalid, "png write_header failed").with_hint(e.to_string()))?;
+        let mut writer = encoder.write_header().map_err(|e| {
+            AppError::new(ReasonCode::RcPeParseInvalid, "png write_header failed")
+                .with_hint(e.to_string())
+        })?;
 
-        writer
-            .write_image_data(data)
-            .map_err(|e| AppError::new(ReasonCode::RcPeParseInvalid, "png write_image_data failed").with_hint(e.to_string()))?;
+        writer.write_image_data(data).map_err(|e| {
+            AppError::new(ReasonCode::RcPeParseInvalid, "png write_image_data failed")
+                .with_hint(e.to_string())
+        })?;
     }
     Ok(png_bytes)
 }
@@ -191,7 +203,10 @@ fn encode_png(data: &[u8], width: u32, height: u32) -> AppResult<Vec<u8>> {
 /// Takes an ICO file's bytes and produces a valid `.icns` file.
 pub fn ico_to_icns(ico_data: &[u8]) -> AppResult<Vec<u8>> {
     if ico_data.len() < 6 {
-        return Err(AppError::new(ReasonCode::RcPeParseInvalid, "ICO data too short"));
+        return Err(AppError::new(
+            ReasonCode::RcPeParseInvalid,
+            "ICO data too short",
+        ));
     }
     let _reserved = u16::from_le_bytes([ico_data[0], ico_data[1]]);
     let _icon_type = u16::from_le_bytes([ico_data[2], ico_data[3]]);
@@ -212,12 +227,16 @@ pub fn ico_to_icns(ico_data: &[u8]) -> AppResult<Vec<u8>> {
             planes: u16::from_le_bytes([ico_data[off + 4], ico_data[off + 5]]),
             bpp: u16::from_le_bytes([ico_data[off + 6], ico_data[off + 7]]),
             size: u32::from_le_bytes([
-                ico_data[off + 8], ico_data[off + 9],
-                ico_data[off + 10], ico_data[off + 11],
+                ico_data[off + 8],
+                ico_data[off + 9],
+                ico_data[off + 10],
+                ico_data[off + 11],
             ]),
             offset: u32::from_le_bytes([
-                ico_data[off + 12], ico_data[off + 13],
-                ico_data[off + 14], ico_data[off + 15],
+                ico_data[off + 12],
+                ico_data[off + 13],
+                ico_data[off + 14],
+                ico_data[off + 15],
             ]),
         };
         let data_start = entry.offset as usize;
@@ -234,8 +253,16 @@ pub fn ico_to_icns(ico_data: &[u8]) -> AppResult<Vec<u8>> {
     icns.extend_from_slice(&[0; 4]);
 
     for (entry, image_data) in &entries {
-        let display_width = if entry.width == 0 { 256u32 } else { entry.width as u32 };
-        let display_height = if entry.height == 0 { 256u32 } else { entry.height as u32 };
+        let display_width = if entry.width == 0 {
+            256u32
+        } else {
+            entry.width as u32
+        };
+        let display_height = if entry.height == 0 {
+            256u32
+        } else {
+            entry.height as u32
+        };
 
         // Determine the best ICNS icon type for this size
         let icns_type = match (display_width, display_height) {
@@ -348,7 +375,9 @@ pub fn validate_icns(data: &[u8]) -> AppResult<bool> {
     let mut pos = 8;
     while pos + 8 <= data.len() {
         let _ostype = &data[pos..pos + 4];
-        let entry_size = u32::from_be_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]]) as usize;
+        let entry_size =
+            u32::from_be_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]])
+                as usize;
         if entry_size < 8 || pos + entry_size > data.len() {
             return Ok(false);
         }
@@ -365,12 +394,14 @@ mod tests {
     fn test_png_encoding() {
         // Create a simple 2x2 RGBA image
         let data = vec![
-            255, 0, 0, 255, 0, 255, 0, 255,
-            0, 0, 255, 255, 255, 255, 0, 255,
+            255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255,
         ];
         let png = encode_png(&data, 2, 2).unwrap();
         // Check PNG signature
-        assert_eq!(&png[0..8], &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+        assert_eq!(
+            &png[0..8],
+            &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]
+        );
         // Check IHDR chunk present
         assert!(png.windows(4).any(|w| w == b"IHDR"));
         // Check IEND chunk exists
@@ -383,28 +414,32 @@ mod tests {
         // even with an empty-ish ICO (just the header)
         let ico = vec![0, 0, 1, 0, 0, 0]; // ICO header with 0 icons
         let result = ico_to_icns(&ico);
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "ico_to_icns should succeed for minimal ICO");
         let icns = result.unwrap();
-        assert!(validate_icns(&icns).unwrap_or(false));
+        assert!(
+            validate_icns(&icns).expect("validate_icns should not error on valid ICNS"),
+            "generated ICNS should be valid"
+        );
         assert_eq!(&icns[0..4], b"icns");
     }
 
     #[test]
     fn test_icons_to_icns() {
-        let icons = vec![
-            IconImage {
-                width: 16,
-                height: 16,
-                bpp: 32,
-                data: vec![0u8; 16 * 16 * 4], // transparent black
-                is_png_compressed: false,
-                xor_mask: None,
-            },
-        ];
+        let icons = vec![IconImage {
+            width: 16,
+            height: 16,
+            bpp: 32,
+            data: vec![0u8; 16 * 16 * 4], // transparent black
+            is_png_compressed: false,
+            xor_mask: None,
+        }];
         let result = icons_to_icns(&icons);
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "icons_to_icns should succeed");
         let icns = result.unwrap();
-        assert!(validate_icns(&icns).unwrap_or(false));
+        assert!(
+            validate_icns(&icns).expect("validate_icns should not error on generated ICNS"),
+            "generated ICNS should be valid"
+        );
     }
 
     #[test]
@@ -421,7 +456,7 @@ mod tests {
             for x in 0..4 {
                 let off = ((height - 1 - y) * row_size + x * 4) as usize;
                 if off + 4 <= dib.len() {
-                    dib[off] = 0;     // B
+                    dib[off] = 0; // B
                     dib[off + 1] = 0; // G
                     dib[off + 2] = 255; // R
                     dib[off + 3] = 255; // A
@@ -429,14 +464,58 @@ mod tests {
             }
         }
         let result = dib_to_png(&dib, width, height, bpp);
-        assert!(result.is_ok());
+        assert!(
+            result.is_ok(),
+            "dib_to_png should succeed for valid DIB data"
+        );
         let png = result.unwrap();
         assert!(&png[0..8] == &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
     }
 
     #[test]
     fn test_validate_icns_empty() {
-        assert!(!validate_icns(b"").unwrap_or(false));
-        assert!(!validate_icns(b"icns").unwrap_or(false));
+        assert!(
+            !validate_icns(b"").expect("validate_icns should not error on empty input"),
+            "empty data should not be valid ICNS"
+        );
+        assert!(
+            !validate_icns(b"icns").expect("validate_icns should not error on truncated input"),
+            "truncated ICNS header should not be valid"
+        );
+    }
+
+    #[test]
+    fn test_validate_icns_malformed_size() {
+        // ICNS header with mismatched size field
+        let mut data = b"icns".to_vec();
+        data.extend_from_slice(&100u32.to_be_bytes()); // claims 100 bytes but only 8 present
+        assert!(
+            !validate_icns(&data).expect("validate_icns should not error on malformed ICNS"),
+            "ICNS with wrong size should be invalid"
+        );
+    }
+
+    #[test]
+    fn test_ico_to_icns_too_short() {
+        let result = ico_to_icns(&[0, 0, 1]);
+        assert!(result.is_err(), "ICO data shorter than 6 bytes should fail");
+    }
+
+    #[test]
+    fn test_icon_to_png_already_compressed() {
+        let icon = IconImage {
+            width: 16,
+            height: 16,
+            bpp: 32,
+            data: vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A], // fake PNG header
+            is_png_compressed: true,
+            xor_mask: None,
+        };
+        let result = icon_to_png(&icon);
+        assert!(
+            result.is_ok(),
+            "icon_to_png should succeed for PNG-compressed icons"
+        );
+        assert_eq!(result.unwrap(), icon.data);
     }
 }

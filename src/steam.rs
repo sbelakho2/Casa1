@@ -1,7 +1,10 @@
 use crate::audio::AudioSubsystem;
 use crate::error::{AppError, AppResult};
 use crate::ge::{GameEnvironment, RegistryView};
-use crate::installer::{GuiWindowPlan, InstallerEngine, InstallerFramework, InstallerSpec, InstallerTelemetry, RuntimeAssembly};
+use crate::installer::{
+    GuiWindowPlan, InstallerEngine, InstallerFramework, InstallerSpec, InstallerTelemetry,
+    RuntimeAssembly,
+};
 use crate::network::{Certificate, NetworkStack, SimpleHttpResponse};
 use crate::reason::ReasonCode;
 use crate::security::{detect_driver_requirement_paths, driver_requirement_error};
@@ -10,7 +13,7 @@ use crate::steam_protocol::{
     DepotManifest as ProtoDepotManifest,
 };
 use crate::user32::{
-    KeyboardDevice, KeyboardLayoutId, KeyModifiers, MessageKind, MouseDevice, User32Subsystem,
+    KeyModifiers, KeyboardDevice, KeyboardLayoutId, MessageKind, MouseDevice, User32Subsystem,
 };
 use crate::util;
 use serde::{Deserialize, Serialize};
@@ -350,7 +353,8 @@ impl SteamClient {
         for (path, bytes) in &installer_spec.files {
             self.write_file(path, bytes.clone());
         }
-        self.logs.push(format!("steam-install:{normalized_download}"));
+        self.logs
+            .push(format!("steam-install:{normalized_download}"));
         self.logs.push(format!(
             "steam-install-silent:{}",
             result.telemetry.silent_flags.join(" ")
@@ -368,7 +372,9 @@ impl SteamClient {
     ) -> AppResult<SteamZeroTouchLaunchResult> {
         let install_telemetry =
             self.install_downloaded_steam_executable(downloaded_installer_path, installer_bytes)?;
-        let _ = self.boot()?;
+        // Warm-up boot: initializes the environment before self-update.
+        // The full boot result is obtained after self_update below.
+        self.boot()?;
         self.self_update(update_plan)?;
         let boot = self.boot()?;
         if let Some(root) = certificate_chain.last().cloned() {
@@ -395,14 +401,21 @@ impl SteamClient {
     }
 
     pub fn boot(&mut self) -> AppResult<SteamBootResult> {
-        if !self.files.contains_key(&format!("{}/steam.exe", self.ge_root)) {
+        if !self
+            .files
+            .contains_key(&format!("{}/steam.exe", self.ge_root))
+        {
             return Err(AppError::new(
                 ReasonCode::RcSteamUpdateFailed,
                 "Steam.exe missing after update",
             ));
         }
         self.ui.register_class_ex_w("SteamMainWindow");
-        let title = if self.logged_in { "Steam" } else { "Steam Login" };
+        let title = if self.logged_in {
+            "Steam"
+        } else {
+            "Steam Login"
+        };
         let hwnd = self.ui.create_window_ex_w(
             "SteamMainWindow",
             title,
@@ -468,7 +481,12 @@ impl SteamClient {
         );
     }
 
-    pub fn ipc_roundtrip(&mut self, pipe_name: &str, shared_region: &str, payload: &[u8]) -> AppResult<IpcRoundtrip> {
+    pub fn ipc_roundtrip(
+        &mut self,
+        pipe_name: &str,
+        shared_region: &str,
+        payload: &[u8],
+    ) -> AppResult<IpcRoundtrip> {
         let key = (pipe_name.to_string(), shared_region.to_string());
         let channel = self.ipc_channels.get(&key).ok_or_else(|| {
             AppError::new(ReasonCode::RcIo, format!("steam IPC hang on {pipe_name}"))
@@ -487,9 +505,9 @@ impl SteamClient {
     }
 
     pub fn login(&mut self, certificate_chain: &[Certificate]) -> AppResult<SteamLoginResult> {
-        let cipher = self
-            .network
-            .validate_server_certificate("api.example.com", certificate_chain, true)?;
+        let cipher =
+            self.network
+                .validate_server_certificate("api.example.com", certificate_chain, true)?;
         self.network.add_route(
             "https",
             "api.example.com",
@@ -603,7 +621,8 @@ impl SteamClient {
             },
         );
         self.logs.push(format!("depot-install:{app_id}"));
-        self.logs.push(format!("appmanifest-write:{app_id}:{app_manifest_path}"));
+        self.logs
+            .push(format!("appmanifest-write:{app_id}:{app_manifest_path}"));
         self.refresh_libraryfolders_file();
         Ok(DepotInstallResult {
             normalized_tree_hash,
@@ -612,9 +631,10 @@ impl SteamClient {
     }
 
     pub fn verify_integrity(&self, app_id: u32) -> AppResult<DepotInstallResult> {
-        let depot = self.installed_depots.get(&app_id).ok_or_else(|| {
-            AppError::new(ReasonCode::RcIo, format!("unknown depot {app_id}"))
-        })?;
+        let depot = self
+            .installed_depots
+            .get(&app_id)
+            .ok_or_else(|| AppError::new(ReasonCode::RcIo, format!("unknown depot {app_id}")))?;
         let normalized_install_root = normalize_path(&depot.install_root);
         let actual = self
             .files
@@ -636,9 +656,10 @@ impl SteamClient {
     }
 
     pub fn launch_game(&mut self, app_id: u32) -> AppResult<GameLaunchResult> {
-        let depot = self.installed_depots.get(&app_id).cloned().ok_or_else(|| {
-            AppError::new(ReasonCode::RcIo, format!("unknown depot {app_id}"))
-        })?;
+        let depot =
+            self.installed_depots.get(&app_id).cloned().ok_or_else(|| {
+                AppError::new(ReasonCode::RcIo, format!("unknown depot {app_id}"))
+            })?;
         self.ensure_depot_prerequisites(&depot.manifest)?;
         let executable = join_path(&depot.install_root, &depot.manifest.launch_exe);
         let executable_normalized = normalize_path(&executable);
@@ -684,7 +705,8 @@ impl SteamClient {
                 altgr: false,
             },
         )?;
-        self.ui.inject_mouse_input(hwnd, &mouse_id, 12, 8, &[], 0, 0)?;
+        self.ui
+            .inject_mouse_input(hwnd, &mouse_id, 12, 8, &[], 0, 0)?;
         let mut input_ok = false;
         while let Some(message) = self.ui.get_message_w() {
             if matches!(message.kind, MessageKind::KeyDown | MessageKind::MouseMove) {
@@ -695,9 +717,9 @@ impl SteamClient {
         let audio_ok = !self.audio.devices().is_empty();
 
         let session = self.network.win_http_open("Steam Game Runtime");
-        let connection = self
-            .network
-            .win_http_connect(session, "launcher.example.com", 80, false)?;
+        let connection =
+            self.network
+                .win_http_connect(session, "launcher.example.com", 80, false)?;
         let request = self
             .network
             .win_http_open_request(connection, "GET", "/presence")?;
@@ -713,8 +735,12 @@ impl SteamClient {
         self.steamworks_ready.insert(app_id);
         let window_title = self.ui.window_state(hwnd)?.title;
         let checkpoint_hash = util::sha256_bytes(
-            format!("{executable}|{}|{window_title}|{}", parent_dir(&executable), util::sha256_bytes(&body))
-                .as_bytes(),
+            format!(
+                "{executable}|{}|{window_title}|{}",
+                parent_dir(&executable),
+                util::sha256_bytes(&body)
+            )
+            .as_bytes(),
         );
         Ok(GameLaunchResult {
             executable,
@@ -722,7 +748,10 @@ impl SteamClient {
             env: BTreeMap::from([
                 ("SteamAppId".to_string(), app_id.to_string()),
                 ("SteamGameId".to_string(), app_id.to_string()),
-                ("SteamPath".to_string(), self.path_case[&format!("{}/steam.exe", self.ge_root)].clone()),
+                (
+                    "SteamPath".to_string(),
+                    self.path_case[&format!("{}/steam.exe", self.ge_root)].clone(),
+                ),
                 ("SteamLibraryPath".to_string(), depot.library_root.clone()),
             ]),
             window_title,
@@ -739,7 +768,10 @@ impl SteamClient {
 
     pub fn overlay_command(&mut self, app_id: u32, command: &str) -> AppResult<i32> {
         if !self.installed_depots.contains_key(&app_id) {
-            return Err(AppError::new(ReasonCode::RcIo, format!("unknown depot {app_id}")));
+            return Err(AppError::new(
+                ReasonCode::RcIo,
+                format!("unknown depot {app_id}"),
+            ));
         }
         match command {
             "activate" => {
@@ -750,7 +782,11 @@ impl SteamClient {
                 self.overlay_active.remove(&app_id);
                 Ok(0)
             }
-            "pump" => Ok(if self.overlay_active.contains(&app_id) { 1 } else { 0 }),
+            "pump" => Ok(if self.overlay_active.contains(&app_id) {
+                1
+            } else {
+                0
+            }),
             other => Err(AppError::new(
                 ReasonCode::RcIo,
                 format!("unknown overlay command {other}"),
@@ -862,16 +898,19 @@ pub fn install_official_steam_setup_into_ge(
             .filter_map(Result::ok)
             .filter(|entry| entry.file_type().is_file())
         {
-            let relative = entry.path().strip_prefix(&extraction_root).map_err(|error| {
-                AppError::new(
-                    ReasonCode::RcIo,
-                    format!(
-                        "failed to resolve extracted Steam payload path {}",
-                        entry.path().display()
-                    ),
-                )
-                .with_hint(error.to_string())
-            })?;
+            let relative = entry
+                .path()
+                .strip_prefix(&extraction_root)
+                .map_err(|error| {
+                    AppError::new(
+                        ReasonCode::RcIo,
+                        format!(
+                            "failed to resolve extracted Steam payload path {}",
+                            entry.path().display()
+                        ),
+                    )
+                    .with_hint(error.to_string())
+                })?;
             let relative = normalize_relative(&relative.to_string_lossy());
             let Some(target_path) = steam_install_target_path(&relative) else {
                 continue;
@@ -879,7 +918,10 @@ pub fn install_official_steam_setup_into_ge(
             let bytes = fs::read(entry.path()).map_err(|error| {
                 AppError::from_io(
                     ReasonCode::RcIo,
-                    format!("failed to read extracted Steam payload {}", entry.path().display()),
+                    format!(
+                        "failed to read extracted Steam payload {}",
+                        entry.path().display()
+                    ),
                     &error,
                 )
             })?;
@@ -924,7 +966,12 @@ pub fn install_official_steam_setup_into_ge(
             file_list,
         })
     })();
-    let _ = fs::remove_dir_all(&extraction_root);
+    if let Err(e) = fs::remove_dir_all(&extraction_root) {
+        eprintln!(
+            "install_official_steam_setup_into_ge: failed to remove extraction dir {}: {e}",
+            extraction_root.display()
+        );
+    }
     result
 }
 
@@ -959,7 +1006,8 @@ pub fn load_depot_manifest_from_disk(
 
     let appmanifest = parse_appmanifest(&appmanifest_text)?;
     let installscript = parse_installscript(&installscript_text)?;
-    let library_root = load_library_root_from_libraryfolders(appmanifest.app_id, libraryfolders_path)?;
+    let library_root =
+        load_library_root_from_libraryfolders(appmanifest.app_id, libraryfolders_path)?;
 
     Ok(DepotManifest {
         app_id: appmanifest.app_id,
@@ -982,10 +1030,7 @@ fn steam_install_files(ge_root: &str) -> BTreeMap<String, Vec<u8>> {
             format!("{}/package/steamui.dll", ge_root),
             b"steam-ui".to_vec(),
         ),
-        (
-            format!("{}/logs/bootstrap.log", ge_root),
-            b"boot".to_vec(),
-        ),
+        (format!("{}/logs/bootstrap.log", ge_root), b"boot".to_vec()),
         (
             format!("{}/steamapps/libraryfolders.vdf", ge_root),
             steam_libraryfolders_bytes(&[ge_root.to_string()], &BTreeMap::new()),
@@ -1082,10 +1127,12 @@ where
 fn parse_appmanifest(contents: &str) -> AppResult<ParsedAppManifest> {
     let root = parse_vdf_document(contents)?;
     let app_state = object_field(&root, "AppState")?;
-    let app_id = string_field(app_state, "appid")?.parse::<u32>().map_err(|error| {
-        AppError::new(ReasonCode::RcIo, "Steam appmanifest appid must be numeric")
-            .with_hint(error.to_string())
-    })?;
+    let app_id = string_field(app_state, "appid")?
+        .parse::<u32>()
+        .map_err(|error| {
+            AppError::new(ReasonCode::RcIo, "Steam appmanifest appid must be numeric")
+                .with_hint(error.to_string())
+        })?;
     Ok(ParsedAppManifest {
         app_id,
         game_name: string_field(app_state, "name")?.to_string(),
@@ -1129,7 +1176,10 @@ fn parse_installscript(contents: &str) -> AppResult<ParsedInstallScript> {
     })
 }
 
-fn load_library_root_from_libraryfolders(app_id: u32, path: Option<&Path>) -> AppResult<Option<String>> {
+fn load_library_root_from_libraryfolders(
+    app_id: u32,
+    path: Option<&Path>,
+) -> AppResult<Option<String>> {
     let Some(path) = path else {
         return Ok(None);
     };
@@ -1185,7 +1235,10 @@ fn collect_payload_files(payload_root: &Path) -> AppResult<BTreeMap<String, Vec<
         let relative = entry.path().strip_prefix(payload_root).map_err(|error| {
             AppError::new(
                 ReasonCode::RcIo,
-                format!("failed to normalize payload file {}", entry.path().display()),
+                format!(
+                    "failed to normalize payload file {}",
+                    entry.path().display()
+                ),
             )
             .with_hint(error.to_string())
         })?;
@@ -1256,11 +1309,10 @@ fn tokenize_vdf(contents: &str) -> AppResult<Vec<VdfToken>> {
                 index += 1;
             }
             _ => {
-                return Err(AppError::new(
-                    ReasonCode::RcIo,
-                    "unsupported token in Steam metadata",
-                )
-                .with_hint(format!("byte offset {index}")));
+                return Err(
+                    AppError::new(ReasonCode::RcIo, "unsupported token in Steam metadata")
+                        .with_hint(format!("byte offset {index}")),
+                );
             }
         }
     }
@@ -1312,7 +1364,10 @@ fn parse_vdf_map(tokens: &[VdfToken], index: &mut usize) -> AppResult<BTreeMap<S
     Ok(map)
 }
 
-fn object_field<'a>(map: &'a BTreeMap<String, VdfNode>, key: &str) -> AppResult<&'a BTreeMap<String, VdfNode>> {
+fn object_field<'a>(
+    map: &'a BTreeMap<String, VdfNode>,
+    key: &str,
+) -> AppResult<&'a BTreeMap<String, VdfNode>> {
     match map.get(key) {
         Some(VdfNode::Object(object)) => Ok(object),
         Some(VdfNode::String(_)) => Err(AppError::new(
@@ -1378,7 +1433,9 @@ fn ensure_ge_drive_mapping(ge: &mut GameEnvironment, windows_path: &str) -> AppR
         return Ok(());
     }
 
-    let target = ge.root.join(format!("drive_{}", drive.to_ascii_lowercase()));
+    let target = ge
+        .root
+        .join(format!("drive_{}", drive.to_ascii_lowercase()));
     ge.add_drive_mapping(&drive, &target, false, false)
 }
 
@@ -1399,6 +1456,20 @@ fn split_registry_entry(entry_path: &str) -> AppResult<(String, String, String)>
     let value_name = parts.last().cloned().expect("validated");
     let key = parts[1..parts.len() - 1].join("\\");
     Ok((hive, key, value_name))
+}
+
+/// Produce a short summary from registry entry path data (useful for fuzzing).
+///
+/// Returns `"ok:hive:key:vname"` on success or `"err:code:msg"` on failure.
+pub fn registry_path_fuzz_summary(data: &[u8]) -> String {
+    let s = match std::str::from_utf8(data) {
+        Ok(s) => s,
+        Err(_) => return "err:utf8:invalid_utf8".into(),
+    };
+    match split_registry_entry(s) {
+        Ok((hive, key, value)) => format!("ok:{hive}:{key}:{value}"),
+        Err(e) => format!("err:{}:{}", e.code.as_u32(), e.message),
+    }
 }
 
 fn create_native_steam_extract_dir() -> AppResult<PathBuf> {
@@ -1452,7 +1523,11 @@ fn extract_archive_with_7z(installer_path: &Path, extraction_root: &Path) -> App
 }
 
 fn locate_7z_binary() -> AppResult<PathBuf> {
-    for candidate in [PathBuf::from("7z"), PathBuf::from("7zz"), PathBuf::from("/opt/homebrew/bin/7z")] {
+    for candidate in [
+        PathBuf::from("7z"),
+        PathBuf::from("7zz"),
+        PathBuf::from("/opt/homebrew/bin/7z"),
+    ] {
         match Command::new(&candidate).arg("-h").output() {
             Ok(_) => return Ok(candidate),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -1525,7 +1600,11 @@ fn normalize_relative(path: &str) -> String {
 }
 
 fn join_path(left: &str, right: &str) -> String {
-    format!("{}/{}", left.trim_end_matches('/'), normalize_relative(right))
+    format!(
+        "{}/{}",
+        left.trim_end_matches('/'),
+        normalize_relative(right)
+    )
 }
 
 fn tree_hash(files: &BTreeMap<String, Vec<u8>>) -> String {
@@ -1645,7 +1724,10 @@ impl ContentServerList {
 
     /// Populate the server list from protocol-level records.
     pub fn populate(&mut self, records: Vec<ProtoContentServerRecord>) {
-        self.servers = records.into_iter().map(ContentServerRecord::from_proto).collect();
+        self.servers = records
+            .into_iter()
+            .map(ContentServerRecord::from_proto)
+            .collect();
         self.fetched_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -1657,7 +1739,7 @@ impl ContentServerList {
         let records: Vec<ProtoContentServerRecord> = DEFAULT_CONTENT_SERVERS
             .iter()
             .enumerate()
-            .map(|(i, host)| ProtoContentServerRecord {
+            .map(|(_i, host)| ProtoContentServerRecord {
                 host: host.to_string(),
                 port: 443,
                 https: true,
@@ -1882,7 +1964,9 @@ impl DownloadSession {
 
     /// Check whether all files have been downloaded.
     pub fn is_complete(&self) -> bool {
-        self.files.iter().all(|f| f.state == DownloadState::Completed)
+        self.files
+            .iter()
+            .all(|f| f.state == DownloadState::Completed)
     }
 
     /// Check whether any file has failed.
@@ -2068,9 +2152,10 @@ impl ContentManager {
         }
 
         // Fall back to round-robin
-        self.server_list.next_healthy().map(|s| s.base_url()).ok_or_else(|| {
-            AppError::new(ReasonCode::RcIo, "no healthy content servers available")
-        })
+        self.server_list
+            .next_healthy()
+            .map(|s| s.base_url())
+            .ok_or_else(|| AppError::new(ReasonCode::RcIo, "no healthy content servers available"))
     }
 
     // -----------------------------------------------------------------------
@@ -2080,7 +2165,7 @@ impl ContentManager {
     /// Fetch a depot manifest from the content server.
     pub fn fetch_depot_manifest(
         &mut self,
-        app_id: u32,
+        _app_id: u32,
         depot_id: u32,
         manifest_id: u64,
         depot_key: Option<&[u8; 32]>,
@@ -2132,7 +2217,11 @@ impl ContentManager {
 
         let data = response.body;
         let compressed_size = chunk.compressed_size;
-        let expected_size = if compressed_size > 0 { compressed_size as usize } else { chunk.size as usize };
+        let expected_size = if compressed_size > 0 {
+            compressed_size as usize
+        } else {
+            chunk.size as usize
+        };
 
         // Verify chunk size
         if data.len() != expected_size {
@@ -2154,10 +2243,7 @@ impl ContentManager {
         // Verify SHA-1 hash of the chunk data
         let actual_hash = crate::network::sha1_hash(&chunk_data);
         if actual_hash.as_slice() != chunk.chunk_id {
-            return Err(AppError::new(
-                ReasonCode::RcIo,
-                "chunk SHA-1 hash mismatch",
-            ));
+            return Err(AppError::new(ReasonCode::RcIo, "chunk SHA-1 hash mismatch"));
         }
 
         Ok(chunk_data)
@@ -2226,10 +2312,7 @@ impl ContentManager {
         // Verify the complete file checksum
         let file_hash = crate::network::sha1_hash(&assembled);
         if file_hash.as_slice() != checksum {
-            return Err(AppError::new(
-                ReasonCode::RcIo,
-                "file SHA-1 mismatch",
-            ));
+            return Err(AppError::new(ReasonCode::RcIo, "file SHA-1 mismatch"));
         }
 
         Ok(assembled)
@@ -2277,7 +2360,10 @@ impl ContentManager {
             // Scope the borrow of self.downloads
             {
                 let session = self.downloads.get(&app_id).ok_or_else(|| {
-                    AppError::new(ReasonCode::RcIo, format!("no active session for app {app_id}"))
+                    AppError::new(
+                        ReasonCode::RcIo,
+                        format!("no active session for app {app_id}"),
+                    )
                 })?;
 
                 if session.paused || session.is_complete() {
@@ -2289,7 +2375,9 @@ impl ContentManager {
                     .files
                     .iter()
                     .enumerate()
-                    .filter(|(_, f)| matches!(f.state, DownloadState::Pending | DownloadState::Failed))
+                    .filter(|(_, f)| {
+                        matches!(f.state, DownloadState::Pending | DownloadState::Failed)
+                    })
                     .map(|(i, _)| i)
                     .collect();
             }
@@ -2297,7 +2385,7 @@ impl ContentManager {
             for idx in file_indices {
                 // Remove the file from the session to avoid borrow conflicts,
                 // then process it and put it back.
-                let mut file = self
+                let file = self
                     .downloads
                     .get_mut(&app_id)
                     .and_then(|s| s.files.get_mut(idx))
@@ -2313,7 +2401,7 @@ impl ContentManager {
                 let file_chunks = file.chunks.clone();
                 let file_checksum = file.checksum;
                 let file_size = file.size;
-                let filename = file.filename.clone();
+                let _filename = file.filename.clone();
 
                 // Call the download method - this borrows self mutably again
                 // To avoid the conflict, we use a temporary extraction pattern
@@ -2340,11 +2428,7 @@ impl ContentManager {
                                 f.state = DownloadState::Failed;
                             }
                         }
-                        self.server_list.report_health(
-                            &server_url,
-                            false,
-                            None,
-                        );
+                        self.server_list.report_health(&server_url, false, None);
                         return Err(e);
                     }
                 }
@@ -2352,7 +2436,10 @@ impl ContentManager {
 
             // Check if session is complete
             let session = self.downloads.get(&app_id).ok_or_else(|| {
-                AppError::new(ReasonCode::RcIo, format!("session vanished for app {app_id}"))
+                AppError::new(
+                    ReasonCode::RcIo,
+                    format!("session vanished for app {app_id}"),
+                )
             })?;
 
             if session.is_complete() {
@@ -2373,7 +2460,10 @@ impl ContentManager {
     /// Pause an active download session.
     pub fn pause_download(&mut self, app_id: u32) -> AppResult<()> {
         let session = self.downloads.get_mut(&app_id).ok_or_else(|| {
-            AppError::new(ReasonCode::RcIo, format!("no active download for app {app_id}"))
+            AppError::new(
+                ReasonCode::RcIo,
+                format!("no active download for app {app_id}"),
+            )
         })?;
         session.paused = true;
         session.state = DownloadState::Paused;
@@ -2383,7 +2473,10 @@ impl ContentManager {
     /// Resume a paused download session.
     pub fn resume_download(&mut self, app_id: u32) -> AppResult<()> {
         let session = self.downloads.get_mut(&app_id).ok_or_else(|| {
-            AppError::new(ReasonCode::RcIo, format!("no active download for app {app_id}"))
+            AppError::new(
+                ReasonCode::RcIo,
+                format!("no active download for app {app_id}"),
+            )
         })?;
         session.paused = false;
         session.state = DownloadState::Downloading;
@@ -2504,7 +2597,8 @@ impl ContentManager {
             offset += 4;
             let flags = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
             offset += 4;
-            let name_len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+            let name_len =
+                u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
             offset += 4;
 
             if offset + name_len > data.len() {
@@ -2652,7 +2746,10 @@ impl ContentManager {
         launch_exe: &str,
     ) -> AppResult<Option<DepotManifest>> {
         let session = self.downloads.get(&app_id).ok_or_else(|| {
-            AppError::new(ReasonCode::RcIo, format!("no download session for app {app_id}"))
+            AppError::new(
+                ReasonCode::RcIo,
+                format!("no download session for app {app_id}"),
+            )
         })?;
 
         if !session.is_complete() {
@@ -2697,7 +2794,7 @@ impl ContentManager {
         game_name: &str,
         install_dir: &str,
         launch_exe: &str,
-        depot_manifests: &[ProtoDepotManifest],
+        _depot_manifests: &[ProtoDepotManifest],
         downloaded_files: &BTreeMap<String, Vec<u8>>,
     ) -> DepotManifest {
         DepotManifest {
@@ -2716,7 +2813,11 @@ impl ContentManager {
     // -----------------------------------------------------------------------
 
     /// Perform an HTTP GET request with retry and exponential backoff.
-    fn http_get_with_retry(&mut self, url: &str, max_retries: u32) -> AppResult<SimpleHttpResponse> {
+    fn http_get_with_retry(
+        &mut self,
+        url: &str,
+        max_retries: u32,
+    ) -> AppResult<SimpleHttpResponse> {
         let mut last_error = None;
 
         for attempt in 0..=max_retries {
@@ -2733,7 +2834,10 @@ impl ContentManager {
         }
 
         Err(last_error.unwrap_or_else(|| {
-            AppError::new(ReasonCode::RcIo, format!("HTTP GET failed after {max_retries} retries: {url}"))
+            AppError::new(
+                ReasonCode::RcIo,
+                format!("HTTP GET failed after {max_retries} retries: {url}"),
+            )
         }))
     }
 }

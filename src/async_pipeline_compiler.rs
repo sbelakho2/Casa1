@@ -212,12 +212,15 @@ impl AsyncPipelineCompiler {
     /// If an identical pipeline already exists in the cache, the returned
     /// ID will be available immediately in the next [`poll`](Self::poll)
     /// call.
-    pub fn submit_render(&mut self, descriptor: &metal::RenderPipelineDescriptorRef) -> PipelineRequestId {
+    pub fn submit_render(
+        &mut self,
+        descriptor: &metal::RenderPipelineDescriptorRef,
+    ) -> PipelineRequestId {
         let key = PipelineCacheKey::from_render_descriptor(descriptor);
 
         // Allocate a request ID first so we can use it in the block.
         let id = {
-            let mut s = self.state.lock().unwrap();
+            let mut s = self.state.lock().unwrap(); // lock(): panic on poison is acceptable
             let id = s.next_id;
             s.next_id += 1;
             id
@@ -225,11 +228,11 @@ impl AsyncPipelineCompiler {
 
         // Check cache — if already cached, inject an immediately-ready result.
         {
-            let cache = self.cache.lock().unwrap();
+            let cache = self.cache.lock().unwrap(); // lock(): panic on poison is acceptable
             if let Some(cached) = cache.get(&key) {
                 let cloned = cached.clone();
                 drop(cache);
-                let mut s = self.state.lock().unwrap();
+                let mut s = self.state.lock().unwrap(); // lock(): panic on poison is acceptable
                 s.ready.push(PipelineReady {
                     id,
                     state: PipelineState::Render(cloned),
@@ -306,9 +309,12 @@ impl AsyncPipelineCompiler {
     ///
     /// Returns a [`PipelineRequestId`] that can be used with
     /// [`wait_for`](Self::wait_for) or [`cancel`](Self::cancel).
-    pub fn submit_compute(&mut self, descriptor: &metal::ComputePipelineDescriptorRef) -> PipelineRequestId {
+    pub fn submit_compute(
+        &mut self,
+        descriptor: &metal::ComputePipelineDescriptorRef,
+    ) -> PipelineRequestId {
         let id = {
-            let mut s = self.state.lock().unwrap();
+            let mut s = self.state.lock().unwrap(); // lock(): panic on poison is acceptable
             let id = s.next_id;
             s.next_id += 1;
             id
@@ -365,7 +371,7 @@ impl AsyncPipelineCompiler {
     /// from the in‑flight queue.
     pub fn poll(&mut self) -> Vec<PipelineReady> {
         let ready = {
-            let mut s = self.state.lock().unwrap();
+            let mut s = self.state.lock().unwrap(); // lock(): panic on poison is acceptable
             std::mem::take(&mut s.ready)
         };
 
@@ -394,7 +400,7 @@ impl AsyncPipelineCompiler {
         let state_arc = self.state.clone();
         loop {
             std::thread::yield_now();
-            let mut s = state_arc.lock().unwrap();
+            let mut s = state_arc.lock().unwrap(); // lock(): panic on poison is acceptable
             if let Some(pos) = s.ready.iter().position(|r| r.id == id) {
                 let ready = s.ready.remove(pos);
                 self.in_flight.retain(|req| req.id != id);
@@ -444,12 +450,12 @@ impl AsyncPipelineCompiler {
 
     /// Number of pipelines currently in the cache.
     pub fn cache_size(&self) -> usize {
-        self.cache.lock().unwrap().len()
+        self.cache.lock().unwrap().len() // lock(): panic on poison is acceptable
     }
 
     /// Clear the pipeline cache.
     pub fn clear_cache(&mut self) {
-        self.cache.lock().unwrap().clear();
+        self.cache.lock().unwrap().clear(); // lock(): panic on poison is acceptable
     }
 
     // ------------------------------------------------------------------
@@ -465,7 +471,7 @@ impl AsyncPipelineCompiler {
         desc: &metal::RenderPipelineDescriptorRef,
     ) -> Option<metal::RenderPipelineState> {
         let key = PipelineCacheKey::from_render_descriptor(desc);
-        let cache = self.cache.lock().unwrap();
+        let cache = self.cache.lock().unwrap(); // lock(): panic on poison is acceptable
         cache.get(&key).cloned()
     }
 
@@ -477,7 +483,7 @@ impl AsyncPipelineCompiler {
         pipeline: &metal::RenderPipelineState,
     ) {
         let key = PipelineCacheKey::from_render_descriptor(desc);
-        let mut cache = self.cache.lock().unwrap();
+        let mut cache = self.cache.lock().unwrap(); // lock(): panic on poison is acceptable
         cache.insert(key, pipeline.to_owned());
     }
 }

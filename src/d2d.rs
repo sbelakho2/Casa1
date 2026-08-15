@@ -1,17 +1,23 @@
 //! Direct2D (D2D) implementation.
 //!
 //! This module provides D2D-compatible primitives and render targets.
-//! Actual pixel output delegates to the existing software rasterizer in
-//! [`gdiplus_render`](crate::gdiplus_render).
+//! Pixel output delegates to the software rasterizer in
+//! [`gdiplus_render`](crate::gdiplus_render) by default. When a
+//! [`MetalD2DRenderer`](crate::metal_backend::MetalD2DRenderer) is attached,
+//! rendering is hardware-accelerated via Metal.
 
 use std::collections::HashMap;
 
 use crate::gdiplus_render;
-use crate::user32::{GDIPLUS_COMPOSITING_MODE_SOURCE_COPY, GDIPLUS_COMPOSITING_MODE_SOURCE_OVER};
+use crate::metal_backend::MetalD2DRenderer;
+use crate::user32::{
+    GDIPLUS_COMPOSITING_MODE_SOURCE_COPY, GDIPLUS_COMPOSITING_MODE_SOURCE_OVER,
+    GDIPLUS_SMOOTHING_MODE_ANTI_ALIAS,
+};
 
 // ── Forward declarations from dwrite ────────────────────────────────────
 
-use crate::dwrite::{DWriteFactory, DWriteTextFormat, DWriteTextLayout};
+use crate::dwrite::{DWriteFactory, DWriteTextFormat};
 
 // ── Constants ───────────────────────────────────────────────────────────
 
@@ -51,13 +57,11 @@ pub const D2D1_FACTORY_TYPE_MULTI_THREADED: u32 = 1;
 
 /// IID for ID2D1Factory
 pub const IID_ID2D1Factory: [u8; 16] = [
-    0x06, 0x15, 0x22, 0x06, 0x84, 0xC0, 0xD4, 0x47, 0x84, 0xA3, 0xB4, 0x4B, 0x4F, 0x6C, 0x14,
-    0xAF,
+    0x06, 0x15, 0x22, 0x06, 0x84, 0xC0, 0xD4, 0x47, 0x84, 0xA3, 0xB4, 0x4B, 0x4F, 0x6C, 0x14, 0xAF,
 ];
 /// IID for ID2D1HwndRenderTarget
 pub const IID_ID2D1HwndRenderTarget: [u8; 16] = [
-    0x38, 0x8A, 0x73, 0xA4, 0xC0, 0x83, 0x4C, 0x44, 0x84, 0xF5, 0x4A, 0x17, 0xFD, 0x07, 0x66,
-    0x32,
+    0x38, 0x8A, 0x73, 0xA4, 0xC0, 0x83, 0x4C, 0x44, 0x84, 0xF5, 0x4A, 0x17, 0xFD, 0x07, 0x66, 0x32,
 ];
 
 // ── Core types ──────────────────────────────────────────────────────────
@@ -215,7 +219,8 @@ impl D2DBrush {
             D2DBrush::RadialGradient(rb) => {
                 let dx = _px - rb.center.0;
                 let dy = _py - rb.center.1;
-                let t = ((dx * dx) / (rb.radius_x * rb.radius_x) + (dy * dy) / (rb.radius_y * rb.radius_y))
+                let t = ((dx * dx) / (rb.radius_x * rb.radius_x)
+                    + (dy * dy) / (rb.radius_y * rb.radius_y))
                     .sqrt()
                     .min(1.0);
                 let color = if rb.stops.is_empty() {
@@ -259,7 +264,15 @@ impl D2DBrush {
 // ── Render target types ─────────────────────────────────────────────────
 
 /// A hardware (or software) render target for HWND-based rendering.
-#[derive(Debug, Clone)]
+///
+/// When `hw_renderer` is `Some`, all drawing operations are accelerated
+/// via Metal. The software `pixels` buffer is used as a readback target
+/// for compatibility with callers that expect CPU-accessible pixel data.
+///
+/// To enable hardware acceleration, call
+/// [`attach_hardware_renderer`](HwndRenderTarget::attach_hardware_renderer)
+/// before [`begin_draw`](HwndRenderTarget::begin_draw).
+#[derive(Debug)]
 pub struct HwndRenderTarget {
     pub width: u32,
     pub height: u32,
@@ -268,9 +281,29 @@ pub struct HwndRenderTarget {
     pub pixel_format: D2DPixelFormat,
     pub transform: D2DMatrix,
     pub state: RenderState,
-    /// Internal pixel buffer (software rasterizer surface)
+    /// Software pixel buffer (used as fallback or readback target).
     pub pixels: Vec<u8>,
     pub stride: i32,
+    /// Optional Metal-accelerated hardware renderer.
+    pub hw_renderer: Option<MetalD2DRenderer>,
+}
+
+// Manual Clone implementation: MetalD2DRenderer is not Clone.
+impl Clone for HwndRenderTarget {
+    fn clone(&self) -> Self {
+        Self {
+            width: self.width,
+            height: self.height,
+            hwnd: self.hwnd,
+            dpi: self.dpi,
+            pixel_format: self.pixel_format,
+            transform: self.transform,
+            state: self.state.clone(),
+            pixels: self.pixels.clone(),
+            stride: self.stride,
+            hw_renderer: None, // Hardware renderer is not cloned.
+        }
+    }
 }
 
 /// A device-context render target.
@@ -329,9 +362,11 @@ impl D2DFactory {
             state: RenderState::default(),
             pixels: vec![0u8; pixel_count],
             stride,
+            hw_renderer: None,
         };
 
-        self.render_targets.insert(id, D2DRenderTarget::Hwnd(target));
+        self.render_targets
+            .insert(id, D2DRenderTarget::Hwnd(target));
         id
     }
 
@@ -382,12 +417,59 @@ impl D2DFactory {
 // ── HwndRenderTarget methods ────────────────────────────────────────────
 
 impl HwndRenderTarget {
+    /// Attach a Metal hardware renderer, enabling GPU-accelerated drawing.
+    ///
+    /// The renderer is created with the same dimensions as this target.
+    /// Call this before [`begin_draw`] to use the hardware path.
+    ///
+    /// Returns an error if the Metal device cannot create the renderer.
+    pub fn attach_hardware_renderer(
+        &mut self,
+        device: &crate::metal_backend::MetalDevice,
+    ) -> crate::error::AppResult<()> {
+        let renderer = MetalD2DRenderer::new(device, self.width, self.height)?;
+        self.hw_renderer = Some(renderer);
+        Ok(())
+    }
+
+    /// Detach and drop the hardware renderer, falling back to software.
+    pub fn detach_hardware_renderer(&mut self) {
+        self.hw_renderer = None;
+    }
+
+    /// Returns `true` if hardware acceleration is active.
+    pub fn is_hardware_accelerated(&self) -> bool {
+        self.hw_renderer.is_some()
+    }
+
+    /// Flush the hardware renderer: end the current frame and read back
+    /// pixels into the software buffer so that callers can access pixel data.
+    ///
+    /// Called automatically by [`end_draw`] when the hardware renderer is
+    /// active. Can also be called manually to force a flush.
+    pub fn flush_hardware(&mut self) {
+        if let Some(ref mut hw) = self.hw_renderer {
+            hw.end_frame();
+            // Read back pixel data for compatibility
+            if let Ok((_, _, stride, data)) = hw.readback() {
+                self.pixels = data;
+                self.stride = stride;
+            }
+        }
+    }
+
     pub fn begin_draw(&mut self) {
         self.state.drawing = true;
+        // Start a hardware frame if hardware acceleration is available.
+        if let Some(ref mut hw) = self.hw_renderer {
+            hw.begin_frame();
+        }
     }
 
     pub fn end_draw(&mut self) {
         self.state.drawing = false;
+        // Flush the hardware renderer (commit GPU commands, read back pixels).
+        self.flush_hardware();
     }
 
     pub fn clear(&mut self, color: (f32, f32, f32, f32)) {
@@ -398,19 +480,29 @@ impl HwndRenderTarget {
         let a = (color.3 * 255.0) as u8;
         let argb_color = (a as u32) << 24 | (r as u32) << 16 | (g as u32) << 8 | b as u32;
 
-        // Fill entire surface with the color
-        for y in 0..self.height as i32 {
-            for x in 0..self.width as i32 {
-                gdiplus_render::put_pixel(
-                    &mut self.pixels,
-                    self.width,
-                    self.height,
-                    self.stride,
-                    x,
-                    y,
-                    argb_color,
-                    GDIPLUS_COMPOSITING_MODE_SOURCE_COPY,
-                );
+        if let Some(ref mut hw) = self.hw_renderer {
+            // Hardware clear via Metal render-pass load action.
+            hw.clear(
+                r as f32 / 255.0,
+                g as f32 / 255.0,
+                b as f32 / 255.0,
+                a as f32 / 255.0,
+            );
+        } else {
+            // Software fallback: fill entire surface with the color.
+            for y in 0..self.height as i32 {
+                for x in 0..self.width as i32 {
+                    gdiplus_render::put_pixel(
+                        &mut self.pixels,
+                        self.width,
+                        self.height,
+                        self.stride,
+                        x,
+                        y,
+                        argb_color,
+                        GDIPLUS_COMPOSITING_MODE_SOURCE_COPY,
+                    );
+                }
             }
         }
     }
@@ -421,40 +513,54 @@ impl HwndRenderTarget {
         p2: (f32, f32),
         brush_id: u64,
         stroke_width: f32,
-        _brushes: &HashMap<u64, D2DBrush>,
+        brushes: &HashMap<u64, D2DBrush>,
     ) {
-        // For now, use solid color approximation. In a full implementation,
-        // we'd look up the brush by ID.
-        let color = 0xFF000000; // Black default
-        gdiplus_render::draw_line(
-            &mut self.pixels,
-            self.width,
-            self.height,
-            self.stride,
-            p1.0,
-            p1.1,
-            p2.0,
-            p2.1,
-            color,
-            stroke_width,
-            GDIPLUS_COMPOSITING_MODE_SOURCE_OVER,
-        );
+        let color = brush_color_or_default(brush_id, brushes, p1.0, p1.1);
+
+        if let Some(ref hw) = self.hw_renderer {
+            hw.draw_line(p1.0, p1.1, p2.0, p2.1, stroke_width, color);
+        } else {
+            gdiplus_render::draw_line(
+                &mut self.pixels,
+                self.width,
+                self.height,
+                self.stride,
+                p1.0,
+                p1.1,
+                p2.0,
+                p2.1,
+                color,
+                stroke_width,
+                GDIPLUS_COMPOSITING_MODE_SOURCE_OVER,
+                GDIPLUS_SMOOTHING_MODE_ANTI_ALIAS,
+            );
+        }
     }
 
-    pub fn fill_rectangle(&mut self, rect: (f32, f32, f32, f32), brush_id: u64, brushes: &HashMap<u64, D2DBrush>) {
+    pub fn fill_rectangle(
+        &mut self,
+        rect: (f32, f32, f32, f32),
+        brush_id: u64,
+        brushes: &HashMap<u64, D2DBrush>,
+    ) {
         let color = brush_color_or_default(brush_id, brushes, rect.0, rect.1);
-        gdiplus_render::fill_rect(
-            &mut self.pixels,
-            self.width,
-            self.height,
-            self.stride,
-            rect.0,
-            rect.1,
-            rect.2,
-            rect.3,
-            color,
-            GDIPLUS_COMPOSITING_MODE_SOURCE_OVER,
-        );
+
+        if let Some(ref hw) = self.hw_renderer {
+            hw.fill_rect(rect.0, rect.1, rect.2, rect.3, color);
+        } else {
+            gdiplus_render::fill_rect(
+                &mut self.pixels,
+                self.width,
+                self.height,
+                self.stride,
+                rect.0,
+                rect.1,
+                rect.2,
+                rect.3,
+                color,
+                GDIPLUS_COMPOSITING_MODE_SOURCE_OVER,
+            );
+        }
     }
 
     pub fn draw_rectangle(
@@ -465,19 +571,35 @@ impl HwndRenderTarget {
         brushes: &HashMap<u64, D2DBrush>,
     ) {
         let color = brush_color_or_default(brush_id, brushes, rect.0, rect.1);
-        gdiplus_render::draw_rect(
-            &mut self.pixels,
-            self.width,
-            self.height,
-            self.stride,
-            rect.0,
-            rect.1,
-            rect.2,
-            rect.3,
-            color,
-            stroke_width,
-            GDIPLUS_COMPOSITING_MODE_SOURCE_OVER,
-        );
+
+        if let Some(ref hw) = self.hw_renderer {
+            // Outline rectangle as 4 separate line segments.
+            let (x, y, w, h) = rect;
+            let sw = stroke_width;
+            // Top edge
+            hw.draw_line(x, y, x + w, y, sw, color);
+            // Bottom edge
+            hw.draw_line(x, y + h, x + w, y + h, sw, color);
+            // Left edge
+            hw.draw_line(x, y, x, y + h, sw, color);
+            // Right edge
+            hw.draw_line(x + w, y, x + w, y + h, sw, color);
+        } else {
+            gdiplus_render::draw_rect(
+                &mut self.pixels,
+                self.width,
+                self.height,
+                self.stride,
+                rect.0,
+                rect.1,
+                rect.2,
+                rect.3,
+                color,
+                stroke_width,
+                GDIPLUS_COMPOSITING_MODE_SOURCE_OVER,
+                GDIPLUS_SMOOTHING_MODE_ANTI_ALIAS,
+            );
+        }
     }
 
     pub fn fill_ellipse(
@@ -488,24 +610,29 @@ impl HwndRenderTarget {
         brush_id: u64,
         brushes: &HashMap<u64, D2DBrush>,
     ) {
-        // gdiplus_render::fill_ellipse uses (x, y, w, h) bounding rect
-        let x = center.0 - radius_x;
-        let y = center.1 - radius_y;
-        let w = radius_x * 2.0;
-        let h = radius_y * 2.0;
         let color = brush_color_or_default(brush_id, brushes, center.0, center.1);
-        gdiplus_render::fill_ellipse(
-            &mut self.pixels,
-            self.width,
-            self.height,
-            self.stride,
-            x,
-            y,
-            w,
-            h,
-            color,
-            GDIPLUS_COMPOSITING_MODE_SOURCE_OVER,
-        );
+
+        if let Some(ref hw) = self.hw_renderer {
+            hw.fill_ellipse(center.0, center.1, radius_x, radius_y, color, 32);
+        } else {
+            // gdiplus_render::fill_ellipse uses (x, y, w, h) bounding rect
+            let x = center.0 - radius_x;
+            let y = center.1 - radius_y;
+            let w = radius_x * 2.0;
+            let h = radius_y * 2.0;
+            gdiplus_render::fill_ellipse(
+                &mut self.pixels,
+                self.width,
+                self.height,
+                self.stride,
+                x,
+                y,
+                w,
+                h,
+                color,
+                GDIPLUS_COMPOSITING_MODE_SOURCE_OVER,
+            );
+        }
     }
 
     pub fn draw_ellipse(
@@ -517,24 +644,42 @@ impl HwndRenderTarget {
         stroke_width: f32,
         brushes: &HashMap<u64, D2DBrush>,
     ) {
-        let x = center.0 - radius_x;
-        let y = center.1 - radius_y;
-        let w = radius_x * 2.0;
-        let h = radius_y * 2.0;
         let color = brush_color_or_default(brush_id, brushes, center.0, center.1);
-        gdiplus_render::draw_ellipse(
-            &mut self.pixels,
-            self.width,
-            self.height,
-            self.stride,
-            x,
-            y,
-            w,
-            h,
-            color,
-            stroke_width,
-            GDIPLUS_COMPOSITING_MODE_SOURCE_OVER,
-        );
+
+        if let Some(ref hw) = self.hw_renderer {
+            // Approximate an outlined ellipse by tessellating it as a thick line.
+            // We draw line segments around the perimeter.
+            let segments = 32;
+            let (cx, cy, rx, ry) = (center.0, center.1, radius_x, radius_y);
+            for i in 0..segments {
+                let a1 = (i as f32) * std::f32::consts::TAU / segments as f32;
+                let a2 = ((i + 1) as f32) * std::f32::consts::TAU / segments as f32;
+                let x1 = cx + rx * a1.cos();
+                let y1 = cy + ry * a1.sin();
+                let x2 = cx + rx * a2.cos();
+                let y2 = cy + ry * a2.sin();
+                hw.draw_line(x1, y1, x2, y2, stroke_width, color);
+            }
+        } else {
+            let x = center.0 - radius_x;
+            let y = center.1 - radius_y;
+            let w = radius_x * 2.0;
+            let h = radius_y * 2.0;
+            gdiplus_render::draw_ellipse(
+                &mut self.pixels,
+                self.width,
+                self.height,
+                self.stride,
+                x,
+                y,
+                w,
+                h,
+                color,
+                stroke_width,
+                GDIPLUS_COMPOSITING_MODE_SOURCE_OVER,
+                GDIPLUS_SMOOTHING_MODE_ANTI_ALIAS,
+            );
+        }
     }
 
     pub fn draw_text(
@@ -543,18 +688,23 @@ impl HwndRenderTarget {
         format_id: u64,
         rect: (f32, f32, f32, f32),
         brush_id: u64,
-        dwrite_factory: &DWriteFactory,
+        _dwrite_factory: &DWriteFactory,
         formats: &HashMap<u64, DWriteTextFormat>,
         brushes: &HashMap<u64, D2DBrush>,
     ) {
+        // Text rendering always uses the software path because glyph-level
+        // hardware rendering requires a glyph atlas and signed-distance-field
+        // shaders. The flush_hardware() call in end_draw() ensures any
+        // preceding hardware draws are committed before text is blended.
+        if self.hw_renderer.is_some() {
+            self.flush_hardware();
+        }
+
         // Look up the text format
         let format = match formats.get(&format_id) {
             Some(f) => f,
             None => return,
         };
-
-        // Create a text layout to get glyph positions
-        let layout = dwrite_factory.create_text_layout(text, format, rect.2, rect.3);
 
         // Get brush color
         let color = brush_color_or_default(brush_id, brushes, rect.0, rect.1);
@@ -586,22 +736,34 @@ impl HwndRenderTarget {
             None => return,
         };
 
-        // Use the gdiplus_render image drawing with scaling
-        gdiplus_render::draw_image_rect(
-            &mut self.pixels,
-            self.width,
-            self.height,
-            self.stride,
-            &bitmap.data,
-            bitmap.width,
-            bitmap.height,
-            bitmap.stride as i32,
-            dest_rect.0,
-            dest_rect.1,
-            dest_rect.2,
-            dest_rect.3,
-            GDIPLUS_COMPOSITING_MODE_SOURCE_OVER,
-        );
+        if let Some(ref hw) = self.hw_renderer {
+            hw.draw_bitmap(
+                &bitmap.data,
+                bitmap.width,
+                bitmap.height,
+                dest_rect.0,
+                dest_rect.1,
+                dest_rect.2,
+                dest_rect.3,
+                opacity,
+            );
+        } else {
+            gdiplus_render::draw_image_rect(
+                &mut self.pixels,
+                self.width,
+                self.height,
+                self.stride,
+                &bitmap.data,
+                bitmap.width,
+                bitmap.height,
+                bitmap.stride as i32,
+                dest_rect.0,
+                dest_rect.1,
+                dest_rect.2,
+                dest_rect.3,
+                GDIPLUS_COMPOSITING_MODE_SOURCE_OVER,
+            );
+        }
     }
 
     pub fn set_transform(&mut self, matrix: &D2DMatrix) {
@@ -620,7 +782,12 @@ impl HwndRenderTarget {
 // ── Helpers ─────────────────────────────────────────────────────────────
 
 /// Resolve a brush's colour or return a default (black).
-fn brush_color_or_default(brush_id: u64, brushes: &HashMap<u64, D2DBrush>, px: f32, py: f32) -> u32 {
+fn brush_color_or_default(
+    brush_id: u64,
+    brushes: &HashMap<u64, D2DBrush>,
+    px: f32,
+    py: f32,
+) -> u32 {
     match brushes.get(&brush_id) {
         Some(brush) => brush.color_at(px, py),
         None => 0xFF000000, // Black default
@@ -705,7 +872,6 @@ pub fn d2d_invert_matrix(matrix: &mut D2DMatrix) -> bool {
     true
 }
 
-
 // ── Tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -722,13 +888,8 @@ mod tests {
     #[test]
     fn test_d2d1_create_rendertarget() {
         let mut factory = D2DFactory::new();
-        let id = factory.create_hwnd_render_target(
-            0x12345,
-            640,
-            480,
-            96.0,
-            D2DPixelFormat::default(),
-        );
+        let id =
+            factory.create_hwnd_render_target(0x12345, 640, 480, 96.0, D2DPixelFormat::default());
         assert_eq!(id, 1);
         let target = factory.hwnd_target(id);
         assert!(target.is_some());

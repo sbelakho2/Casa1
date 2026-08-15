@@ -1,3 +1,6 @@
+#![allow(clippy::unnecessary_sort_by)]
+#![allow(clippy::type_complexity)]
+
 //! Phase 1 — Steam Bootstrap Crash Diagnostic Test
 //!
 //! This test runs Steam.exe with comprehensive API call tracing enabled
@@ -69,8 +72,7 @@ fn trace_env() -> BTreeMap<String, String> {
 #[ignore = "manual diagnostic — requires ges/steam-live-run-x86 with Steam.exe"]
 fn t23_1_steam_bootstrap_diagnostic() {
     // 1. Open the game environment.
-    let ge = GameEnvironment::open(&steam_ge_root())
-        .expect("failed to open steam-live-run-x86 GE");
+    let ge = GameEnvironment::open(&steam_ge_root()).expect("failed to open steam-live-run-x86 GE");
 
     // 2. Locate the host Steam.exe.
     let steam_host_path = ge.root.join("drive_c").join("Steam.exe");
@@ -82,9 +84,7 @@ fn t23_1_steam_bootstrap_diagnostic() {
 
     // 3. Build execution options.
     let env = trace_env();
-    let options = PeExecutionOptions {
-        live_session: None,
-    };
+    let options = PeExecutionOptions { live_session: None };
 
     // 4. Execute Steam.exe with tracing.
     let result = pe_runtime::execute_with_options(
@@ -161,21 +161,21 @@ fn t23_1_steam_bootstrap_diagnostic() {
                 .collect();
 
             if !process_events.is_empty() {
-                eprintln!("\n=== Process Trace Events ({} events) ===", process_events.len());
+                eprintln!(
+                    "\n=== Process Trace Events ({} events) ===",
+                    process_events.len()
+                );
                 for event in &process_events {
                     let params_str: Vec<String> = event
                         .parameters
                         .iter()
-                        .map(|(k, v)| {
-                            format!(
-                                "{k}={}",
-                                v.as_str().unwrap_or(&v.to_string())
-                            )
-                        })
+                        .map(|(k, v)| format!("{k}={}", v.as_str().unwrap_or(&v.to_string())))
                         .collect();
                     eprintln!(
                         "  [{:>4}] {}  {}",
-                        event.event_index, event.call_id, params_str.join(", "),
+                        event.event_index,
+                        event.call_id,
+                        params_str.join(", "),
                     );
                 }
             }
@@ -240,18 +240,17 @@ fn t23_1_steam_bootstrap_diagnostic() {
                     .next();
                 if let Some(base) = mapped_base {
                     eprintln!("  ==> mapped_image_base = {base:#x}");
-                    if let Some((_, rip_str)) = ctx.split_once("rip=") {
-                        if let Some(rip_val) = rip_str.split_whitespace().next() {
-                            if let Ok(rip) = u64::from_str_radix(rip_val.trim_start_matches("0x"), 16) {
-                                let rva = rip.saturating_sub(base);
-                                eprintln!("  ==> current RIP RVA = {rva:#x} (relative to base {base:#x})");
-                                let in_image = rva < 0x800_000; // typical image < 8MB
-                                eprintln!(
-                                    "  ==> RIP is {} the mapped image",
-                                    if in_image { "WITHIN" } else { "OUTSIDE" }
-                                );
-                            }
-                        }
+                    if let Some((_, rip_str)) = ctx.split_once("rip=")
+                        && let Some(rip_val) = rip_str.split_whitespace().next()
+                        && let Ok(rip) = u64::from_str_radix(rip_val.trim_start_matches("0x"), 16)
+                    {
+                        let rva = rip.saturating_sub(base);
+                        eprintln!("  ==> current RIP RVA = {rva:#x} (relative to base {base:#x})");
+                        let in_image = rva < 0x800_000; // typical image < 8MB
+                        eprintln!(
+                            "  ==> RIP is {} the mapped image",
+                            if in_image { "WITHIN" } else { "OUTSIDE" }
+                        );
                     }
                 }
             } else {
@@ -261,7 +260,7 @@ fn t23_1_steam_bootstrap_diagnostic() {
             // Check for budget-exceeded — this is a soft failure we can learn from.
             if error_msg.contains("exceeded the instruction budget") {
                 eprintln!(
-                    "[ANALYSIS] The instruction budget ({}) was exhausted.\n\
+                    "[ANALYSIS] The instruction budget (25,000,000 (default)) was exhausted.\n\
                      The error above may include a 'guest-crash-context' hint with the\n\
                      mapped base address, current RIP, and the decoded instructions of the\n\
                      block that exceeded the budget.\n\
@@ -269,8 +268,7 @@ fn t23_1_steam_bootstrap_diagnostic() {
                      call/jump to a non-image address (heap, data, etc.).  The 'ImageExit'\n\
                      process trace event (emitted on first exit from the image) would have\n\
                      logged the last in-image block RVAs — but this event is only accessible\n\
-                     on the success path.  Re-run with lower budget or add stderr logging.",
-                     "25,000,000 (default)"
+                     on the success path.  Re-run with lower budget or add stderr logging."
                 );
             }
 
@@ -290,8 +288,7 @@ fn t23_2_steam_import_coverage() {
     use casa1::ge::GameEnvironment;
     use casa1::pe::{self, ApiSetResolver, ImportSymbol};
 
-    let ge = GameEnvironment::open(&steam_ge_root())
-        .expect("failed to open steam-live-run-x86 GE");
+    let ge = GameEnvironment::open(&steam_ge_root()).expect("failed to open steam-live-run-x86 GE");
     let steam_host_path = ge.root.join("drive_c").join("Steam.exe");
     assert!(steam_host_path.is_file(), "Steam.exe not found");
 
@@ -299,11 +296,23 @@ fn t23_2_steam_import_coverage() {
     let resolver = ApiSetResolver::new();
 
     eprintln!("=== Steam.exe Import Coverage Report ===\n");
-    eprintln!("Machine: {:#x} ({})", image.machine,
-        if image.machine == 0x14c { "x86" } else if image.machine == 0x8664 { "x64" } else { "unknown" });
+    eprintln!(
+        "Machine: {:#x} ({})",
+        image.machine,
+        if image.machine == 0x14c {
+            "x86"
+        } else if image.machine == 0x8664 {
+            "x64"
+        } else {
+            "unknown"
+        }
+    );
     eprintln!("Image base: {:#x}", image.image_base);
     eprintln!("Entry point RVA: {:#x}", image.address_of_entry_point);
-    eprintln!("Size of image: {:#x} ({} bytes)", image.size_of_image, image.size_of_image);
+    eprintln!(
+        "Size of image: {:#x} ({} bytes)",
+        image.size_of_image, image.size_of_image
+    );
     eprintln!();
 
     // Collect all imports (regular + delayed)
@@ -318,12 +327,19 @@ fn t23_2_steam_import_coverage() {
                 ImportSymbol::ByName { name, .. } => name.clone(),
                 ImportSymbol::ByOrdinal { ordinal } => format!("ordinal #{ordinal}"),
             };
-            all_imports.entry(dll_key.clone()).or_default().push(symbol_name);
+            all_imports
+                .entry(dll_key.clone())
+                .or_default()
+                .push(symbol_name);
             total_imports += 1;
         }
     }
 
-    eprintln!("Total imports: {} from {} DLLs\n", total_imports, all_imports.len());
+    eprintln!(
+        "Total imports: {} from {} DLLs\n",
+        total_imports,
+        all_imports.len()
+    );
     eprintln!("{:<40} {:>6}  Functions", "DLL", "Count");
     eprintln!("{}", "-".repeat(80));
 
@@ -331,7 +347,12 @@ fn t23_2_steam_import_coverage() {
     sorted_dlls.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
 
     for (dll, functions) in &sorted_dlls {
-        eprintln!("{:<40} {:>6}  {}", dll, functions.len(), functions.join(", "));
+        eprintln!(
+            "{:<40} {:>6}  {}",
+            dll,
+            functions.len(),
+            functions.join(", ")
+        );
     }
 
     eprintln!();
@@ -352,8 +373,7 @@ fn t23_3_import_coverage_matrix() {
     use casa1::pe::{self, ApiSetResolver, ImportSymbol};
     use casa1::pe_runtime::is_import_supported;
 
-    let ge = GameEnvironment::open(&steam_ge_root())
-        .expect("failed to open steam-live-run-x86 GE");
+    let ge = GameEnvironment::open(&steam_ge_root()).expect("failed to open steam-live-run-x86 GE");
     let steam_host_path = ge.root.join("drive_c").join("Steam.exe");
     assert!(steam_host_path.is_file(), "Steam.exe not found");
 
@@ -375,7 +395,9 @@ fn t23_3_import_coverage_matrix() {
                 ImportSymbol::ByOrdinal { ordinal } => format!("ordinal #{ordinal}"),
             };
             let supported = is_import_supported(&resolved, &thunk.symbol);
-            let entry = dll_coverage.entry(resolved.clone()).or_insert_with(|| (Vec::new(), Vec::new()));
+            let entry = dll_coverage
+                .entry(resolved.clone())
+                .or_insert_with(|| (Vec::new(), Vec::new()));
             if supported {
                 total_supported += 1;
                 entry.0.push(symbol_name);
@@ -396,13 +418,16 @@ fn t23_3_import_coverage_matrix() {
     eprintln!();
 
     // Per-DLL breakdown
-    eprintln!("{:<45} {:>5}/{:<5}  {:>6}  Missing", "DLL", "Ok", "Total", "Pct");
+    eprintln!(
+        "{:<45} {:>5}/{:<5}  {:>6}  Missing",
+        "DLL", "Ok", "Total", "Pct"
+    );
     eprintln!("{}", "-".repeat(100));
 
     let mut sorted_dlls: Vec<_> = dll_coverage.iter().collect();
     sorted_dlls.sort_by(|a, b| {
-        let a_missing = a.1 .1.len();
-        let b_missing = b.1 .1.len();
+        let a_missing = a.1.1.len();
+        let b_missing = b.1.1.len();
         b_missing.cmp(&a_missing)
     });
 
@@ -414,7 +439,14 @@ fn t23_3_import_coverage_matrix() {
         } else {
             unsupported.join(", ")
         };
-        eprintln!("{:<45} {:>5}/{:<5}  {:>5.1}%  {}", dll, supported.len(), total_dll, pct, missing_str);
+        eprintln!(
+            "{:<45} {:>5}/{:<5}  {:>5.1}%  {}",
+            dll,
+            supported.len(),
+            total_dll,
+            pct,
+            missing_str
+        );
     }
 
     eprintln!();
@@ -434,7 +466,9 @@ fn t23_3_import_coverage_matrix() {
 
     eprintln!();
     eprintln!("=== Coverage Matrix Complete ===");
-    eprintln!("Phase 1.3.2 result: {total_supported}/{total} ({coverage_pct:.1}%) imports have HostThunk dispatch coverage");
+    eprintln!(
+        "Phase 1.3.2 result: {total_supported}/{total} ({coverage_pct:.1}%) imports have HostThunk dispatch coverage"
+    );
 
     // Assert minimum coverage — 100% as of Phase 1.3.3.
     assert!(
@@ -466,8 +500,8 @@ fn t23_3_import_coverage_matrix() {
 fn t23_4_steam_regression() {
     // 1. Execute Steam.exe with DTM enabled and a small budget.
     let result = pe_runtime::regression_test_steam_bootstrap(
-        100_000,   // budget — enough for early startup
-        true,      // dtm — deterministic mode
+        100_000,            // budget — enough for early startup
+        true,               // dtm — deterministic mode
         Some(&["process"]), // trace categories for record-table events
     );
 
@@ -558,27 +592,41 @@ fn t23_4_steam_regression() {
 #[test]
 #[ignore = "manual diagnostic — requires ges/steam-live-run-x86 with Steam.exe"]
 fn t23_5_x86_decode_coverage() {
-    use casa1::cpu::{decode_block, DecodedOpcode, GuestArch};
+    use casa1::cpu::{GuestArch, decode_block};
     use casa1::ge::GameEnvironment;
     use casa1::pe;
     use std::collections::HashMap;
 
     // ── 1. Load the PE image ──────────────────────────────────────────
-    let ge =
-        GameEnvironment::open(&steam_ge_root()).expect("failed to open steam-live-run-x86 GE");
+    let ge = GameEnvironment::open(&steam_ge_root()).expect("failed to open steam-live-run-x86 GE");
     let steam_host_path = ge.root.join("drive_c").join("Steam.exe");
-    assert!(steam_host_path.is_file(), "Steam.exe not found at {:?}", steam_host_path);
+    assert!(
+        steam_host_path.is_file(),
+        "Steam.exe not found at {:?}",
+        steam_host_path
+    );
 
-    let pe_bytes = std::fs::read(&steam_host_path)
-        .expect("failed to read Steam.exe");
+    let pe_bytes = std::fs::read(&steam_host_path).expect("failed to read Steam.exe");
     let image = pe::parse(&pe_bytes).expect("failed to parse Steam.exe PE headers");
 
     eprintln!("=== t23_5: x86 Instruction Decode Coverage ===\n");
-    eprintln!("Machine: {:#x} ({})", image.machine,
-        if image.machine == 0x14c { "x86" } else if image.machine == 0x8664 { "x64" } else { "unknown" });
+    eprintln!(
+        "Machine: {:#x} ({})",
+        image.machine,
+        if image.machine == 0x14c {
+            "x86"
+        } else if image.machine == 0x8664 {
+            "x64"
+        } else {
+            "unknown"
+        }
+    );
     eprintln!("Image base: {:#x}", image.image_base);
     eprintln!("Entry point RVA: {:#x}", image.address_of_entry_point);
-    eprintln!("Size of image: {:#x} ({} bytes)", image.size_of_image, image.size_of_image);
+    eprintln!(
+        "Size of image: {:#x} ({} bytes)",
+        image.size_of_image, image.size_of_image
+    );
     eprintln!("Number of sections: {}", image.number_of_sections);
 
     // ── 2. Determine the guest architecture from the machine field ──
@@ -596,12 +644,8 @@ fn t23_5_x86_decode_coverage() {
     // ── 3. Decode each executable section ────────────────────────────
     // Use HashMap<String, usize> because DecodedOpcode does not implement Ord/Hash.
     // We convert opcodes to their debug string representation for map keys.
-    let mut section_results: Vec<(
-        String,
-        usize,
-        HashMap<String, usize>,
-        Vec<(usize, String)>,
-    )> = Vec::new();
+    let mut section_results: Vec<(String, usize, HashMap<String, usize>, Vec<(usize, String)>)> =
+        Vec::new();
 
     let mut total_instructions = 0usize;
     let mut total_decode_errors = 0usize;
@@ -609,7 +653,10 @@ fn t23_5_x86_decode_coverage() {
 
     // Outline for the report table
     eprintln!("{:-<120}", "");
-    eprintln!("{:<20} {:>12} {:>12} {:>12}  {}", "Section", "Offset", "Size", "Insns", "Executable");
+    eprintln!(
+        "{:<20} {:>12} {:>12} {:>12}  Executable",
+        "Section", "Offset", "Size", "Insns"
+    );
     eprintln!("{:-<120}", "");
 
     for section in &image.sections {
@@ -630,12 +677,14 @@ fn t23_5_x86_decode_coverage() {
         if is_exec && raw_len > 0 && raw_start < pe_bytes.len() {
             let preview_end = (raw_start + 16).min(pe_bytes.len());
             let preview = &pe_bytes[raw_start..preview_end];
-            let hex: String = preview.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ");
+            let hex: String = preview
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<Vec<_>>()
+                .join(" ");
             eprintln!(
                 "  raw_data_ptr={:#x} virtual_address={:#x} first_bytes: {}",
-                section.raw_data_ptr,
-                section.virtual_address,
-                hex,
+                section.raw_data_ptr, section.virtual_address, hex,
             );
         }
 
@@ -700,9 +749,7 @@ fn t23_5_x86_decode_coverage() {
                             .join(" ");
                         eprintln!(
                             "  [DEBUG] First error at offset +{:#x}: opcode_byte={:#04x} bytes=[{}]",
-                            cursor,
-                            section_bytes[cursor],
-                            debug_bytes,
+                            cursor, section_bytes[cursor], debug_bytes,
                         );
                     }
                     errors.push((cursor, format!("{err:?}")));
@@ -744,7 +791,8 @@ fn t23_5_x86_decode_coverage() {
         if !errors.is_empty() {
             eprintln!("\n  ⚠  DECODE ERRORS ({})", errors.len());
             for (offset, msg) in errors.iter().take(20) {
-                let bytes_hex: String = section_bytes_for_error(section_name, *offset, &pe_bytes, &image);
+                let bytes_hex: String =
+                    section_bytes_for_error(section_name, *offset, &pe_bytes, &image);
                 eprintln!("    @+{:#x}: {}  [bytes: {}]", offset, msg, bytes_hex);
             }
             if errors.len() > 20 {
@@ -780,7 +828,10 @@ fn t23_5_x86_decode_coverage() {
         let pct = (**count as f64 / total_instructions as f64) * 100.0;
         cumul += **count;
         let cumul_pct = (cumul as f64 / total_instructions as f64) * 100.0;
-        eprintln!("{:>8}  {:>5.1}%  {:>6.1}%  {}", count, pct, cumul_pct, opcode);
+        eprintln!(
+            "{:>8}  {:>5.1}%  {:>6.1}%  {}",
+            count, pct, cumul_pct, opcode
+        );
     }
 
     // Opcodes NEVER encountered (zero count)
@@ -803,8 +854,12 @@ fn t23_5_x86_decode_coverage() {
     }
 
     eprintln!("\n=== Decode coverage audit complete ===");
-    eprintln!("{} instructions across {} executable sections, {} unique opcodes.",
-        total_instructions, section_results.len(), all_opcodes.len());
+    eprintln!(
+        "{} instructions across {} executable sections, {} unique opcodes.",
+        total_instructions,
+        section_results.len(),
+        all_opcodes.len()
+    );
     if total_decode_errors > 0 {
         eprintln!("\n⚠  {total_decode_errors} decode error(s) encountered — review the");
         eprintln!("   error details above.  Each error represents an unrecognised");

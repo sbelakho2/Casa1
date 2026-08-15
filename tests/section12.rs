@@ -1,6 +1,6 @@
 use casa1::installer::{
-    CustomAction, GuiWindowPlan, InstallerEngine, InstallerFramework, InstallerSpec,
-    MsiComponent, MsiInstallOptions, MsiPackage, PatchOperation, RuntimeAssembly,
+    CustomAction, GuiWindowPlan, InstallerEngine, InstallerFramework, InstallerSpec, MsiComponent,
+    MsiInstallOptions, MsiPackage, PatchOperation, RuntimeAssembly,
 };
 use casa1::reason::ReasonCode;
 use std::collections::BTreeMap;
@@ -41,14 +41,24 @@ fn t12_1_installer_farm_compare_file_and_registry_manifests_against_reference() 
             },
         ],
         files: BTreeMap::from([
-            ("C:/Games/TestGame/game.exe".to_string(), b"game-binary".to_vec()),
-            ("C:/Games/TestGame/data.pak".to_string(), b"data-pak".to_vec()),
+            (
+                "C:/Games/TestGame/game.exe".to_string(),
+                b"game-binary".to_vec(),
+            ),
+            (
+                "C:/Games/TestGame/data.pak".to_string(),
+                b"data-pak".to_vec(),
+            ),
         ]),
         registry: BTreeMap::from([(
             "HKLM\\Software\\Casa1\\TestGame\\InstallPath".to_string(),
             "C:/Games/TestGame".to_string(),
         )]),
-        logs: vec!["launch-ui".to_string(), "copy-files".to_string(), "write-registry".to_string()],
+        logs: vec![
+            "launch-ui".to_string(),
+            "copy-files".to_string(),
+            "write-registry".to_string(),
+        ],
     };
     let inno = InstallerSpec {
         id: "inno-tools".to_string(),
@@ -89,10 +99,17 @@ fn t12_1_installer_farm_compare_file_and_registry_manifests_against_reference() 
         logs: vec!["custom-flags-fallback".to_string()],
     };
 
-    let nsis_run = engine.run_gui_installer(&nsis, None).expect("run NSIS installer");
-    let inno_run = engine.run_gui_installer(&inno, None).expect("run Inno installer");
+    let nsis_run = engine
+        .run_gui_installer(&nsis, None)
+        .expect("run NSIS installer");
+    let inno_run = engine
+        .run_gui_installer(&inno, None)
+        .expect("run Inno installer");
     let custom_run = engine
-        .run_gui_installer(&custom, Some(vec!["/headless".to_string(), "/skip-eula".to_string()]))
+        .run_gui_installer(
+            &custom,
+            Some(vec!["/headless".to_string(), "/skip-eula".to_string()]),
+        )
         .expect("run custom installer");
 
     assert_eq!(nsis_run.telemetry.silent_flags, vec!["/S"]);
@@ -100,8 +117,14 @@ fn t12_1_installer_farm_compare_file_and_registry_manifests_against_reference() 
         inno_run.telemetry.silent_flags,
         vec!["/VERYSILENT", "/SUPPRESSMSGBOXES"]
     );
-    assert_eq!(custom_run.telemetry.silent_flags, vec!["/headless", "/skip-eula"]);
-    assert_eq!(nsis_run.telemetry.window_titles, vec!["Setup Wizard", "Install Complete"]);
+    assert_eq!(
+        custom_run.telemetry.silent_flags,
+        vec!["/headless", "/skip-eula"]
+    );
+    assert_eq!(
+        nsis_run.telemetry.window_titles,
+        vec!["Setup Wizard", "Install Complete"]
+    );
 
     let expected = expected_manifest_hash(
         &[
@@ -191,14 +214,17 @@ fn t12_2_msi_rollback_torture_restores_preinstall_snapshot_exactly() {
     assert_eq!(error.code, ReasonCode::RcIo);
     assert_eq!(engine.files(), &before_files);
     assert_eq!(engine.registry(), &before_registry);
-    assert!(error
-        .reproduction_hints
-        .iter()
-        .any(|hint| hint.contains("remove-file:core.dll")));
+    assert!(
+        error
+            .reproduction_hints
+            .iter()
+            .any(|hint| hint.contains("remove-file:core.dll"))
+    );
 }
 
 #[test]
-fn t12_3_redist_verification_activates_vc_runtime_provides_d3dcompiler_and_rejects_unsupported_dotnet() {
+fn t12_3_redist_verification_activates_vc_runtime_provides_d3dcompiler_and_rejects_unsupported_dotnet()
+ {
     let mut engine = InstallerEngine::new();
     engine.install_vc_runtime(RuntimeAssembly {
         version: "vc143".to_string(),
@@ -211,8 +237,11 @@ fn t12_3_redist_verification_activates_vc_runtime_provides_d3dcompiler_and_rejec
     assert!(engine.activate_vc_runtime("vc143", &["msvcp140.dll", "vcruntime140.dll"]));
     assert!(engine.has_directx_component("d3dcompiler_47.dll"));
     assert!(engine.has_directx_component("D3DX9_43.DLL"));
-    assert!(engine.require_dotnet("net8.0").is_ok());
-    let unsupported = engine.require_dotnet("netfx35").expect_err("unsupported .NET must fail");
+    let _result = engine.require_dotnet("net8.0");
+    assert!(_result.is_ok(), "expected Ok, got {_result:?}");
+    let unsupported = engine
+        .require_dotnet("netfx35")
+        .expect_err("unsupported .NET must fail");
     assert_eq!(unsupported.code, ReasonCode::RcDotnetUnsupported);
 
     let service_package = MsiPackage {
@@ -236,15 +265,17 @@ fn t12_3_redist_verification_activates_vc_runtime_provides_d3dcompiler_and_rejec
         .msiexec_install(service_package.clone(), &MsiInstallOptions::default())
         .expect_err("service install CA must be blocked outside SCM VM mode");
     assert_eq!(blocked.code, ReasonCode::RcMsiCustomActionServiceBlocked);
-    assert!(engine
-        .msiexec_install(
-            service_package,
-            &MsiInstallOptions {
-                fail_after_custom_action: None,
-                scm_vm_mode: true,
-            },
-        )
-        .is_ok());
+    assert!(
+        engine
+            .msiexec_install(
+                service_package,
+                &MsiInstallOptions {
+                    fail_after_custom_action: None,
+                    scm_vm_mode: true,
+                },
+            )
+            .is_ok()
+    );
 }
 
 #[test]
@@ -258,8 +289,14 @@ fn t12_4_patch_cycle_handles_atomic_replace_delete_on_close_and_case_insensitive
                 framework: InstallerFramework::Custom,
                 gui_windows: vec![],
                 files: BTreeMap::from([
-                    ("C:/Games/PatchGame/game.exe".to_string(), b"v1-game".to_vec()),
-                    ("C:/Games/PatchGame/data.pak".to_string(), b"v1-data".to_vec()),
+                    (
+                        "C:/Games/PatchGame/game.exe".to_string(),
+                        b"v1-game".to_vec(),
+                    ),
+                    (
+                        "C:/Games/PatchGame/data.pak".to_string(),
+                        b"v1-data".to_vec(),
+                    ),
                 ]),
                 registry: BTreeMap::new(),
                 logs: vec![],
@@ -275,8 +312,16 @@ fn t12_4_patch_cycle_handles_atomic_replace_delete_on_close_and_case_insensitive
                 expected_old: b"v1-game".to_vec(),
                 replacement: b"v2-game".to_vec(),
                 download_chunks: vec![
-                    ("c:/games/patchgame/GAME.EXE".to_string(), 0, b"v2-".to_vec()),
-                    ("C:/Games/PatchGame/game.exe".to_string(), 3, b"game".to_vec()),
+                    (
+                        "c:/games/patchgame/GAME.EXE".to_string(),
+                        0,
+                        b"v2-".to_vec(),
+                    ),
+                    (
+                        "C:/Games/PatchGame/game.exe".to_string(),
+                        3,
+                        b"game".to_vec(),
+                    ),
                 ],
             },
             PatchOperation {
@@ -284,17 +329,27 @@ fn t12_4_patch_cycle_handles_atomic_replace_delete_on_close_and_case_insensitive
                 expected_old: b"v1-data".to_vec(),
                 replacement: b"v2-data".to_vec(),
                 download_chunks: vec![
-                    ("C:/GAMES/PATCHGAME/DATA.PAK".to_string(), 0, b"v2-".to_vec()),
-                    ("c:/games/patchgame/data.pak".to_string(), 3, b"data".to_vec()),
+                    (
+                        "C:/GAMES/PATCHGAME/DATA.PAK".to_string(),
+                        0,
+                        b"v2-".to_vec(),
+                    ),
+                    (
+                        "c:/games/patchgame/data.pak".to_string(),
+                        3,
+                        b"data".to_vec(),
+                    ),
                 ],
             },
         ])
         .expect("apply patch cycle");
 
-    assert!(result
-        .operation_log
-        .iter()
-        .any(|entry| entry == "delete_on_close:c:/games/patchgame/data.pak"));
+    assert!(
+        result
+            .operation_log
+            .iter()
+            .any(|entry| entry == "delete_on_close:c:/games/patchgame/data.pak")
+    );
     let expected_hash = expected_manifest_hash(
         &[
             ("c:/games/patchgame/game.exe", b"v2-game"),
@@ -323,7 +378,11 @@ fn t12_4_patch_cycle_handles_atomic_replace_delete_on_close_and_case_insensitive
         .msiexec_install(repair_package.clone(), &MsiInstallOptions::default())
         .expect("install repair package");
     engine.remove_file("C:/Games/PatchGame/repair.dll");
-    let repair = engine.msiexec_repair("{GUID-REPAIR}").expect("repair package");
+    let repair = engine
+        .msiexec_repair("{GUID-REPAIR}")
+        .expect("repair package");
     assert_eq!(repair.created_files, vec!["c:/games/patchgame/repair.dll"]);
-    engine.msiexec_uninstall("{GUID-REPAIR}").expect("uninstall repair package");
+    engine
+        .msiexec_uninstall("{GUID-REPAIR}")
+        .expect("uninstall repair package");
 }

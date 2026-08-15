@@ -2,37 +2,28 @@
 //! Registry Change Notifications (P3.4), XAPO Audio Effects (P3.5),
 //! Named Pipes (P3.6), InstallShield (P3.7).
 
-use casa1::winhttp::{
-    WinHttpStack, WinHttpWebSocketBufferType, WinHttpWebSocketCloseStatus,
-};
-use casa1::real_fs::{
-    parse_ntfs_path, ads_sidecar_path_for, ads_sidecar_to_stream,
-    backup_read_file, backup_write_file,
-    ADS_STREAM_TYPE_DATA,
-    RealFilesystem, WindowsPathResolver,
-};
-use casa1::real_win32::{
-    RegistryChangeTracker, RegNotifyResult,
-    REG_NOTIFY_CHANGE_NAME, REG_NOTIFY_CHANGE_ATTRIBUTES,
-    REG_NOTIFY_CHANGE_LAST_SET, REG_NOTIFY_CHANGE_SECURITY,
-    reg_notify_change_key_value,
-};
-use casa1::real_audio::{
-    XapoManager, XapoEqualizer, XapoEffect, XapoEffectChain, VoiceEffectChain,
-    EqualizerParameters, ReverbParameters, CompressorParameters, EchoParameters,
-    XAPO_FLAG_INPLACE,
-};
-use casa1::win32::{
-    pipe_name_to_uds_path, PIPE_SOCKET_BASE_DIR,
-    PIPE_ACCESS_DUPLEX, PIPE_ACCESS_INBOUND, PIPE_ACCESS_OUTBOUND,
-    PIPE_WAIT, PIPE_NOWAIT, Win32Subsystem,
-};
 use casa1::ge::{GameEnvironment, GeArch};
 use casa1::installer::{
-    IssScript, IssCommand, ISSetupDllStub, ISSetupActionType,
-    InstallShieldEngine,
+    ISSetupActionType, ISSetupDllStub, InstallShieldEngine, IssCommand, IssScript,
 };
-use std::path::PathBuf;
+use casa1::real_audio::{
+    CompressorParameters, EchoParameters, EqualizerParameters, ReverbParameters, VoiceEffectChain,
+    XAPO_FLAG_INPLACE, XapoEffect, XapoEffectChain, XapoEqualizer, XapoManager,
+};
+use casa1::real_fs::{
+    RealFilesystem, WindowsPathResolver, ads_sidecar_path_for, ads_sidecar_to_stream,
+    backup_read_file, parse_ntfs_path,
+};
+use casa1::real_win32::{
+    REG_NOTIFY_CHANGE_ATTRIBUTES, REG_NOTIFY_CHANGE_LAST_SET, REG_NOTIFY_CHANGE_NAME,
+    REG_NOTIFY_CHANGE_SECURITY, RegNotifyResult, RegistryChangeTracker,
+    reg_notify_change_key_value,
+};
+use casa1::win32::{
+    PIPE_ACCESS_DUPLEX, PIPE_ACCESS_INBOUND, PIPE_ACCESS_OUTBOUND, PIPE_NOWAIT, PIPE_WAIT,
+    Win32Subsystem, pipe_name_to_uds_path,
+};
+use casa1::winhttp::{WinHttpStack, WinHttpWebSocketBufferType, WinHttpWebSocketCloseStatus};
 use tempfile::TempDir;
 
 /// Helper: create a temporary GameEnvironment and Win32Subsystem for named pipe tests.
@@ -50,15 +41,39 @@ fn setup_win32(label: &str) -> (TempDir, Win32Subsystem) {
 
 #[test]
 fn t34_websocket_close_status_from_code() {
-    assert_eq!(WinHttpWebSocketCloseStatus::from_code(1000), WinHttpWebSocketCloseStatus::Success);
-    assert_eq!(WinHttpWebSocketCloseStatus::from_code(1001), WinHttpWebSocketCloseStatus::EndpointUnavailable);
-    assert_eq!(WinHttpWebSocketCloseStatus::from_code(1002), WinHttpWebSocketCloseStatus::ProtocolError);
-    assert_eq!(WinHttpWebSocketCloseStatus::from_code(1003), WinHttpWebSocketCloseStatus::InvalidDataType);
-    assert_eq!(WinHttpWebSocketCloseStatus::from_code(1008), WinHttpWebSocketCloseStatus::PolicyViolation);
-    assert_eq!(WinHttpWebSocketCloseStatus::from_code(1009), WinHttpWebSocketCloseStatus::MessageTooBig);
-    assert_eq!(WinHttpWebSocketCloseStatus::from_code(1011), WinHttpWebSocketCloseStatus::InternalError);
+    assert_eq!(
+        WinHttpWebSocketCloseStatus::from_code(1000),
+        WinHttpWebSocketCloseStatus::Success
+    );
+    assert_eq!(
+        WinHttpWebSocketCloseStatus::from_code(1001),
+        WinHttpWebSocketCloseStatus::EndpointUnavailable
+    );
+    assert_eq!(
+        WinHttpWebSocketCloseStatus::from_code(1002),
+        WinHttpWebSocketCloseStatus::ProtocolError
+    );
+    assert_eq!(
+        WinHttpWebSocketCloseStatus::from_code(1003),
+        WinHttpWebSocketCloseStatus::InvalidDataType
+    );
+    assert_eq!(
+        WinHttpWebSocketCloseStatus::from_code(1008),
+        WinHttpWebSocketCloseStatus::PolicyViolation
+    );
+    assert_eq!(
+        WinHttpWebSocketCloseStatus::from_code(1009),
+        WinHttpWebSocketCloseStatus::MessageTooBig
+    );
+    assert_eq!(
+        WinHttpWebSocketCloseStatus::from_code(1011),
+        WinHttpWebSocketCloseStatus::InternalError
+    );
     // Unknown code defaults to InternalError
-    assert_eq!(WinHttpWebSocketCloseStatus::from_code(9999), WinHttpWebSocketCloseStatus::InternalError);
+    assert_eq!(
+        WinHttpWebSocketCloseStatus::from_code(9999),
+        WinHttpWebSocketCloseStatus::InternalError
+    );
 }
 
 #[test]
@@ -79,8 +94,12 @@ fn t34_websocket_buffer_types() {
 fn t34_websocket_upgrade_creates_state() {
     let mut stack = WinHttpStack::new();
     let session = stack.win_http_open(Some("Test"), 0, None, None);
-    let conn = stack.win_http_connect(session, "example.com", 80, false).expect("connect");
-    let req = stack.win_http_open_request(conn, "GET", "/ws", None).expect("open request");
+    let conn = stack
+        .win_http_connect(session, "example.com", 80, false)
+        .expect("connect");
+    let req = stack
+        .win_http_open_request(conn, "GET", "/ws", None)
+        .expect("open request");
 
     // Complete the request to get it into Complete state
     stack.win_http_send_request(req, None, None).expect("send");
@@ -91,7 +110,9 @@ fn t34_websocket_upgrade_creates_state() {
     assert!(ws_handle > 0);
 
     // Verify state
-    let ws_state = stack.websocket_query_close_status(ws_handle).expect("query");
+    let ws_state = stack
+        .websocket_query_close_status(ws_handle)
+        .expect("query");
     assert_eq!(ws_state.0, WinHttpWebSocketCloseStatus::Success);
 }
 
@@ -99,42 +120,66 @@ fn t34_websocket_upgrade_creates_state() {
 fn t34_websocket_send_and_close() {
     let mut stack = WinHttpStack::new();
     let session = stack.win_http_open(Some("Test"), 0, None, None);
-    let conn = stack.win_http_connect(session, "example.com", 80, false).expect("connect");
-    let req = stack.win_http_open_request(conn, "GET", "/ws", None).expect("open request");
+    let conn = stack
+        .win_http_connect(session, "example.com", 80, false)
+        .expect("connect");
+    let req = stack
+        .win_http_open_request(conn, "GET", "/ws", None)
+        .expect("open request");
     stack.win_http_send_request(req, None, None).expect("send");
     stack.win_http_receive_response(req).expect("receive");
 
     let ws = stack.websocket_complete_upgrade(req).expect("upgrade");
 
     // Send binary data
-    stack.websocket_send(ws, WinHttpWebSocketBufferType::BinaryMessageBuffer, b"hello").expect("send");
+    stack
+        .websocket_send(
+            ws,
+            WinHttpWebSocketBufferType::BinaryMessageBuffer,
+            b"hello",
+        )
+        .expect("send");
 
     // Send text data
-    stack.websocket_send(ws, WinHttpWebSocketBufferType::Utf8MessageBuffer, b"world").expect("send text");
+    stack
+        .websocket_send(ws, WinHttpWebSocketBufferType::Utf8MessageBuffer, b"world")
+        .expect("send text");
 
     // Close
-    stack.websocket_close(ws, WinHttpWebSocketCloseStatus::Success, Some("done")).expect("close");
+    stack
+        .websocket_close(ws, WinHttpWebSocketCloseStatus::Success, Some("done"))
+        .expect("close");
 
     // Verify can't send after close
-    assert!(stack.websocket_send(ws, WinHttpWebSocketBufferType::BinaryMessageBuffer, b"fail").is_err());
+    assert!(
+        stack
+            .websocket_send(ws, WinHttpWebSocketBufferType::BinaryMessageBuffer, b"fail")
+            .is_err()
+    );
 }
 
 #[test]
 fn t34_websocket_close_handle_cleans_up() {
     let mut stack = WinHttpStack::new();
     let session = stack.win_http_open(Some("Test"), 0, None, None);
-    let conn = stack.win_http_connect(session, "example.com", 80, false).expect("connect");
-    let req = stack.win_http_open_request(conn, "GET", "/ws", None).expect("open request");
+    let conn = stack
+        .win_http_connect(session, "example.com", 80, false)
+        .expect("connect");
+    let req = stack
+        .win_http_open_request(conn, "GET", "/ws", None)
+        .expect("open request");
     stack.win_http_send_request(req, None, None).expect("send");
     stack.win_http_receive_response(req).expect("receive");
 
     let ws = stack.websocket_complete_upgrade(req).expect("upgrade");
 
     // Close the handle
-    assert!(stack.win_http_close_handle(ws).is_ok());
+    let _result = stack.win_http_close_handle(ws);
+    assert!(_result.is_ok(), "expected Ok, got {_result:?}");
 
     // Double close should fail
-    assert!(stack.win_http_close_handle(ws).is_err());
+    let _result = stack.win_http_close_handle(ws);
+    assert!(_result.is_err(), "expected Err, got {_result:?}");
 }
 
 // ===========================================================================
@@ -145,8 +190,11 @@ fn t34_websocket_close_handle_cleans_up() {
 fn t34_ntfs_parse_simple_ads_path() {
     let (file, stream) = parse_ntfs_path("file.exe:Zone.Identifier");
     assert_eq!(file, "file.exe");
-    assert!(stream.is_some());
-    let s = stream.unwrap();
+    assert!(
+        stream.is_some(),
+        "stream should be present for known sidecar format"
+    );
+    let s = stream.expect("stream should be Some");
     assert_eq!(s.stream_name, "Zone.Identifier");
     assert_eq!(s.stream_type, "$DATA");
 }
@@ -180,7 +228,11 @@ fn t34_ntfs_sidecar_path_format() {
     let real_path = std::path::Path::new("/data/ge/drive_c/file.txt");
     let sidecar = ads_sidecar_path_for(real_path, "Zone.Identifier");
     assert!(sidecar.to_string_lossy().contains(".casa1_ads"));
-    assert!(sidecar.to_string_lossy().contains("file.txt__Zone.Identifier"));
+    assert!(
+        sidecar
+            .to_string_lossy()
+            .contains("file.txt__Zone.Identifier")
+    );
 }
 
 #[test]
@@ -207,7 +259,9 @@ fn t34_ntfs_backup_read_write() {
     rfs.initialize().unwrap();
 
     // Write a file
-    let mut file = rfs.open_file("C:\\test_backup.txt", false, true, true, false).unwrap();
+    let mut file = rfs
+        .open_file("C:\\test_backup.txt", false, true, true, false)
+        .unwrap();
     file.write(b"main data").unwrap();
     file.flush().unwrap();
     drop(file);
@@ -218,7 +272,8 @@ fn t34_ntfs_backup_read_write() {
     assert_eq!(result.main_stream().unwrap().data, b"main data");
 
     // Write an ADS
-    rfs.write_alternate_stream("C:\\test_backup.txt", "Zone.Identifier", b"[ZoneTransfer]").unwrap();
+    rfs.write_alternate_stream("C:\\test_backup.txt", "Zone.Identifier", b"[ZoneTransfer]")
+        .unwrap();
 
     // Backup read again - should include ADS
     let result2 = backup_read_file(&rfs, "C:\\test_backup.txt").unwrap();
@@ -316,7 +371,12 @@ fn t34_reg_notify_async_pending() {
 #[test]
 fn t34_reg_notify_subscribe_unsubscribe() {
     let mut tracker = RegistryChangeTracker::new();
-    tracker.subscribe("HKLM\\Software\\Test", 42, REG_NOTIFY_CHANGE_LAST_SET, false);
+    tracker.subscribe(
+        "HKLM\\Software\\Test",
+        42,
+        REG_NOTIFY_CHANGE_LAST_SET,
+        false,
+    );
     let subs = tracker.subscriptions_for_key("HKLM\\Software\\Test");
     assert_eq!(subs.len(), 1);
     assert_eq!(subs[0].0, 42);
@@ -395,10 +455,14 @@ fn t34_xapo_effect_chain_process() {
     mgr.register_builtins();
 
     // Create two effect instances
-    let reverb_clsid = [0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
-    let echo_clsid = [0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+    let reverb_clsid = [
+        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x01,
+    ];
+    let echo_clsid = [
+        0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x04,
+    ];
 
     let reverb_id = mgr.create_instance(&reverb_clsid).expect("create reverb");
     let echo_id = mgr.create_instance(&echo_clsid).expect("create echo");
@@ -444,8 +508,10 @@ fn t34_xapo_voice_effect_chain() {
     assert!(!vec.is_enabled());
 
     // Add an effect to the chain
-    let eq_clsid = [0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07];
+    let eq_clsid = [
+        0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x07,
+    ];
     let eq_id = mgr.create_instance(&eq_clsid).expect("create eq");
     vec.chain_mut().push(eq_id);
     assert_eq!(vec.chain().len(), 1);
@@ -492,36 +558,40 @@ fn t34_pipe_constants() {
 #[test]
 fn t34_create_named_pipe_w_creates_pipe() {
     let (_tmp, mut win32) = setup_win32("create-pipe");
-    let handle = win32.create_named_pipe_w(
-        "\\\\.\\pipe\\TestPipe",
-        PIPE_ACCESS_DUPLEX,
-        PIPE_WAIT,
-        1,
-        4096,
-        4096,
-        5000,
-        false,
-        None,
-        None,
-    ).expect("create named pipe");
+    let handle = win32
+        .create_named_pipe_w(
+            "\\\\.\\pipe\\TestPipe",
+            PIPE_ACCESS_DUPLEX,
+            PIPE_WAIT,
+            1,
+            4096,
+            4096,
+            5000,
+            false,
+            None,
+            None,
+        )
+        .expect("create named pipe");
     assert!(handle > 0);
 }
 
 #[test]
 fn t34_named_pipe_connect_disconnect() {
     let (_tmp, mut win32) = setup_win32("connect-pipe");
-    let handle = win32.create_named_pipe_w(
-        "\\\\.\\pipe\\ConnTest",
-        PIPE_ACCESS_DUPLEX,
-        PIPE_WAIT,
-        1,
-        4096,
-        4096,
-        5000,
-        false,
-        None,
-        None,
-    ).expect("create pipe");
+    let handle = win32
+        .create_named_pipe_w(
+            "\\\\.\\pipe\\ConnTest",
+            PIPE_ACCESS_DUPLEX,
+            PIPE_WAIT,
+            1,
+            4096,
+            4096,
+            5000,
+            false,
+            None,
+            None,
+        )
+        .expect("create pipe");
 
     win32.connect_named_pipe(handle).expect("connect");
     win32.disconnect_named_pipe(handle).expect("disconnect");
@@ -530,18 +600,20 @@ fn t34_named_pipe_connect_disconnect() {
 #[test]
 fn t34_named_pipe_duplicate_creation_fails() {
     let (_tmp, mut win32) = setup_win32("dup-pipe");
-    let _h1 = win32.create_named_pipe_w(
-        "\\\\.\\pipe\\DupTest",
-        PIPE_ACCESS_DUPLEX,
-        PIPE_WAIT,
-        1,
-        4096,
-        4096,
-        5000,
-        false,
-        None,
-        None,
-    ).expect("create first");
+    let _h1 = win32
+        .create_named_pipe_w(
+            "\\\\.\\pipe\\DupTest",
+            PIPE_ACCESS_DUPLEX,
+            PIPE_WAIT,
+            1,
+            4096,
+            4096,
+            5000,
+            false,
+            None,
+            None,
+        )
+        .expect("create first");
 
     let result = win32.create_named_pipe_w(
         "\\\\.\\pipe\\DupTest",
@@ -555,65 +627,75 @@ fn t34_named_pipe_duplicate_creation_fails() {
         None,
         None,
     );
-    assert!(result.is_err());
+    assert!(result.is_err(), "expected Err, got {result:?}");
 }
 
 #[test]
 fn t34_named_pipe_wait_available() {
     let (_tmp, mut win32) = setup_win32("wait-pipe");
-    let _handle = win32.create_named_pipe_w(
-        "\\\\.\\pipe\\WaitTest",
-        PIPE_ACCESS_DUPLEX,
-        PIPE_WAIT,
-        1,
-        4096,
-        4096,
-        5000,
-        false,
-        None,
-        None,
-    ).expect("create pipe");
+    let _handle = win32
+        .create_named_pipe_w(
+            "\\\\.\\pipe\\WaitTest",
+            PIPE_ACCESS_DUPLEX,
+            PIPE_WAIT,
+            1,
+            4096,
+            4096,
+            5000,
+            false,
+            None,
+            None,
+        )
+        .expect("create pipe");
 
-    win32.wait_named_pipe_w("\\\\.\\pipe\\WaitTest", 5000).expect("wait");
+    win32
+        .wait_named_pipe_w("\\\\.\\pipe\\WaitTest", 5000)
+        .expect("wait");
 }
 
 #[test]
 fn t34_named_pipe_set_mode() {
     let (_tmp, mut win32) = setup_win32("mode-pipe");
-    let handle = win32.create_named_pipe_w(
-        "\\\\.\\pipe\\ModeTest",
-        PIPE_ACCESS_DUPLEX,
-        PIPE_WAIT,
-        1,
-        4096,
-        4096,
-        5000,
-        false,
-        None,
-        None,
-    ).expect("create pipe");
+    let handle = win32
+        .create_named_pipe_w(
+            "\\\\.\\pipe\\ModeTest",
+            PIPE_ACCESS_DUPLEX,
+            PIPE_WAIT,
+            1,
+            4096,
+            4096,
+            5000,
+            false,
+            None,
+            None,
+        )
+        .expect("create pipe");
 
     // Set to non-blocking mode
-    win32.set_named_pipe_handle_state(handle, Some(PIPE_NOWAIT), None, None).expect("set mode");
+    win32
+        .set_named_pipe_handle_state(handle, Some(PIPE_NOWAIT), None, None)
+        .expect("set mode");
 }
 
 #[test]
 fn t34_named_pipe_get_info() {
     let (_tmp, mut win32) = setup_win32("info-pipe");
-    let handle = win32.create_named_pipe_w(
-        "\\\\.\\pipe\\InfoTest",
-        PIPE_ACCESS_DUPLEX,
-        PIPE_WAIT,
-        1,
-        8192,
-        4096,
-        5000,
-        false,
-        None,
-        None,
-    ).expect("create pipe");
+    let handle = win32
+        .create_named_pipe_w(
+            "\\\\.\\pipe\\InfoTest",
+            PIPE_ACCESS_DUPLEX,
+            PIPE_WAIT,
+            1,
+            8192,
+            4096,
+            5000,
+            false,
+            None,
+            None,
+        )
+        .expect("create pipe");
 
-    let (mode, max_inst, out_buf, in_buf) = win32.get_named_pipe_info(handle).expect("get info");
+    let (_mode, _max_inst, out_buf, in_buf) = win32.get_named_pipe_info(handle).expect("get info");
     assert!(out_buf >= 4096);
     assert!(in_buf >= 4096);
 }
@@ -621,20 +703,24 @@ fn t34_named_pipe_get_info() {
 #[test]
 fn t34_named_pipe_client_connect() {
     let (_tmp, mut win32) = setup_win32("client-pipe");
-    let server = win32.create_named_pipe_w(
-        "\\\\.\\pipe\\ClientTest",
-        PIPE_ACCESS_DUPLEX,
-        PIPE_WAIT,
-        1,
-        4096,
-        4096,
-        5000,
-        false,
-        None,
-        None,
-    ).expect("create server");
+    let server = win32
+        .create_named_pipe_w(
+            "\\\\.\\pipe\\ClientTest",
+            PIPE_ACCESS_DUPLEX,
+            PIPE_WAIT,
+            1,
+            4096,
+            4096,
+            5000,
+            false,
+            None,
+            None,
+        )
+        .expect("create server");
 
-    let client = win32.open_named_pipe_client("\\\\.\\pipe\\ClientTest", false).expect("open client");
+    let client = win32
+        .open_named_pipe_client("\\\\.\\pipe\\ClientTest", false)
+        .expect("open client");
     assert!(client > 0);
     assert_ne!(server, client);
 }
@@ -711,7 +797,9 @@ Key=Value
 "#;
     let parsed = IssScript::parse(script);
     assert!(parsed.is_valid);
-    let comments: Vec<_> = parsed.commands.iter()
+    let comments: Vec<_> = parsed
+        .commands
+        .iter()
         .filter(|c| matches!(c, IssCommand::Comment(_)))
         .collect();
     assert_eq!(comments.len(), 3);

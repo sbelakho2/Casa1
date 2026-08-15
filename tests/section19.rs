@@ -162,11 +162,7 @@ fn t19_4_javascript_execution() {
     };
 
     let handle = bridge
-        .cef_browser_host_create_browser(
-            window_info,
-            "about:blank",
-            CefBrowserSettings::default(),
-        )
+        .cef_browser_host_create_browser(window_info, "about:blank", CefBrowserSettings::default())
         .expect("create browser");
 
     // Execute JavaScript
@@ -207,11 +203,7 @@ fn t19_5_frame_snapshot() {
     };
 
     let handle = bridge
-        .cef_browser_host_create_browser(
-            window_info,
-            "about:blank",
-            CefBrowserSettings::default(),
-        )
+        .cef_browser_host_create_browser(window_info, "about:blank", CefBrowserSettings::default())
         .expect("create browser");
 
     // Get the browser host
@@ -253,11 +245,7 @@ fn t19_6_browser_resize() {
     };
 
     let handle = bridge
-        .cef_browser_host_create_browser(
-            window_info,
-            "about:blank",
-            CefBrowserSettings::default(),
-        )
+        .cef_browser_host_create_browser(window_info, "about:blank", CefBrowserSettings::default())
         .expect("create browser");
 
     // Resize to 200x200
@@ -306,11 +294,7 @@ fn t19_7_concurrent_browsers() {
             external_begin_frame_enabled: false,
         };
         let handle = bridge
-            .cef_browser_host_create_browser(
-                window_info,
-                url,
-                CefBrowserSettings::default(),
-            )
+            .cef_browser_host_create_browser(window_info, url, CefBrowserSettings::default())
             .expect("create browser");
         handles.push(handle);
     }
@@ -371,11 +355,7 @@ fn t19_8_browser_close_lifecycle() {
     };
 
     let handle = bridge
-        .cef_browser_host_create_browser(
-            window_info,
-            "about:blank",
-            CefBrowserSettings::default(),
-        )
+        .cef_browser_host_create_browser(window_info, "about:blank", CefBrowserSettings::default())
         .expect("create browser");
 
     assert!(
@@ -394,7 +374,10 @@ fn t19_8_browser_close_lifecycle() {
 
     // Navigation should fail on closed browser
     let nav_result = bridge.cef_frame_load_url(handle, "https://example.com");
-    assert!(nav_result.is_err(), "navigation should fail on closed browser");
+    assert!(
+        nav_result.is_err(),
+        "navigation should fail on closed browser"
+    );
 
     bridge.cef_shutdown().expect("shutdown");
 }
@@ -450,7 +433,9 @@ fn t19_10_wkwebview_manager_creation() {
                 assert_eq!(manager.active_count(), 1, "should have 1 active view");
 
                 // Navigate
-                manager.navigate(h, "https://example.com").expect("navigate");
+                manager
+                    .navigate(h, "https://example.com")
+                    .expect("navigate");
 
                 // Verify URL
                 assert_eq!(
@@ -468,7 +453,11 @@ fn t19_10_wkwebview_manager_creation() {
 
                 // Close
                 manager.close(h);
-                assert_eq!(manager.active_count(), 0, "should have 0 active views after close");
+                assert_eq!(
+                    manager.active_count(),
+                    0,
+                    "should have 0 active views after close"
+                );
             }
             Err(_) => {
                 // WKWebView creation failed — acceptable in headless environments

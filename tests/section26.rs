@@ -15,19 +15,16 @@
 //! case by returning early with a clear reason rather than failing.
 
 use casa1::canonical::GfxFrame;
-use casa1::d3d11::{DeviceCreationRequest, FeatureLevel, InputLayoutDesc};
 use casa1::d3d12::D3d12Runtime;
-use casa1::error::AppResult;
 use casa1::gfx::{
     self, DxgiFormat, GraphicsBackend, HeapType, MetalCapabilities, PipelineStateDesc,
-    ResourceDesc, ResourceState, ResourceUsageHint, RootSignatureDesc, SceneSpec,
+    ResourceDesc, ResourceState, ResourceUsageHint, SceneSpec,
 };
-use casa1::metal_backend::{MetalDevice, MetalGpuBackend};
+use casa1::metal_backend::MetalGpuBackend;
 use casa1::shader::{
-    build_argument_buffers, parse_dxil_container, parse_root_signature, translate_shader,
-    CompileFlags, RootSignatureInfo, ShaderCache, ShaderStage, ShaderTranslationInput,
+    ShaderCache, ShaderStage, build_argument_buffers, parse_dxil_container, parse_root_signature,
 };
-use casa1::shader_compiler::{dxil_hash, MslShaderGenerator};
+use casa1::shader_compiler::{MslShaderGenerator, dxil_hash};
 use casa1::vkgl;
 use std::collections::BTreeMap;
 
@@ -218,7 +215,7 @@ fn t26_04_dxil_parser_sm6() {
     let mut bad_ver = Vec::from(b"DXIL" as &[u8]);
     bad_ver.extend_from_slice(&999u32.to_le_bytes()); // version = 999 (unsupported)
     bad_ver.extend_from_slice(&1u32.to_le_bytes()); // part_count = 1
-                                                    // Need at least 12 bytes of part descriptors to get past the initial checks
+    // Need at least 12 bytes of part descriptors to get past the initial checks
     bad_ver.extend_from_slice(&[0u8; 12]); // one part descriptor
     assert!(
         parse_dxil_container(&bad_ver).is_err(),
@@ -347,7 +344,10 @@ fn t26_06_shader_translation_d3d12_to_metal() {
 
     // get should retrieve the stored entry.
     let retrieved = cache.get(test_hash);
-    assert!(retrieved.is_some(), "get should return Some for existing key");
+    assert!(
+        retrieved.is_some(),
+        "get should return Some for existing key"
+    );
     assert_eq!(
         retrieved.as_ref().unwrap().payload.mtl_library_bytes,
         test_data.to_vec()
@@ -359,17 +359,27 @@ fn t26_06_shader_translation_d3d12_to_metal() {
 
     // Verify cache size tracking.
     assert_eq!(cache.len(), 1, "cache should have 1 entry");
-    assert!(cache.total_size_bytes() > 0, "cache size should be positive");
+    assert!(
+        cache.total_size_bytes() > 0,
+        "cache size should be positive"
+    );
 
     // Encode round-trip — verify entry can be serialized to JSON bytes.
     if let Some(entry) = cache.get(test_hash) {
         let encoded = entry.encode();
         assert!(encoded.is_ok(), "encode should succeed");
         let encoded_bytes = encoded.unwrap();
-        assert!(!encoded_bytes.is_empty(), "encoded bytes should not be empty");
+        assert!(
+            !encoded_bytes.is_empty(),
+            "encoded bytes should not be empty"
+        );
         // Verify it's valid JSON by parsing it back.
-        let parsed: Result<casa1::shader::ShaderCacheEntry, _> = serde_json::from_slice(&encoded_bytes);
-        assert!(parsed.is_ok(), "encoded bytes should be valid JSON for ShaderCacheEntry");
+        let parsed: Result<casa1::shader::ShaderCacheEntry, _> =
+            serde_json::from_slice(&encoded_bytes);
+        assert!(
+            parsed.is_ok(),
+            "encoded bytes should be valid JSON for ShaderCacheEntry"
+        );
     }
 }
 
@@ -432,9 +442,9 @@ fn t26_08_metal_texture_operations() {
 
     // Verify the texture can be retrieved.
     let tex = backend.get_texture(tex_id);
-    assert!(tex.is_some(), "texture must be accessible by handle");
-    assert_eq!(tex.unwrap().width(), 4);
-    assert_eq!(tex.unwrap().height(), 4);
+    let tex_ref = tex.as_ref().expect("texture must be accessible by handle");
+    assert_eq!(tex_ref.width(), 4);
+    assert_eq!(tex_ref.height(), 4);
 
     // Destroy the texture.
     backend.destroy_texture(tex_id);
@@ -483,15 +493,18 @@ fn t26_09_metal_buffer_operations() {
 
     // Verify the buffer is accessible and has the correct contents.
     let buf = backend.get_buffer(buf_id);
-    assert!(buf.is_some(), "buffer must be accessible by handle");
-    assert_eq!(buf.unwrap().length() as usize, written.len());
+    let buf_ref = buf.as_ref().expect("buffer must be accessible by handle");
+    assert_eq!(buf_ref.length() as usize, written.len());
 
     // Create an empty buffer.
     let empty_id = backend.create_empty_buffer(128, metal::MTLResourceOptions::StorageModeShared);
     assert!(empty_id > 0, "empty buffer handle must be non-zero");
     let empty_buf = backend.get_buffer(empty_id);
-    assert!(empty_buf.is_some());
-    assert_eq!(empty_buf.unwrap().length(), 128);
+    assert!(empty_buf.is_some(), "empty buffer should be accessible");
+    assert_eq!(
+        empty_buf.expect("empty buffer should be Some").length(),
+        128
+    );
 
     // Destroy buffers.
     backend.destroy_buffer(buf_id);
@@ -587,11 +600,11 @@ fn t26_11_shader_feature_detection() {
 
     // Verify format support reports mappings for common formats.
     let fmt_rgba = gfx::format_mapping(DxgiFormat::R8G8B8A8Unorm);
-    assert!(fmt_rgba.is_ok());
+    assert!(fmt_rgba.is_ok(), "expected Ok, got {fmt_rgba:?}");
     let fmt_bgra = gfx::format_mapping(DxgiFormat::B8G8R8A8Unorm);
-    assert!(fmt_bgra.is_ok());
+    assert!(fmt_bgra.is_ok(), "expected Ok, got {fmt_bgra:?}");
     let fmt_depth = gfx::format_mapping(DxgiFormat::D32Float);
-    assert!(fmt_depth.is_ok());
+    assert!(fmt_depth.is_ok(), "expected Ok, got {fmt_depth:?}");
 
     // Invalid/unknown feature queries should not panic.
     // (FeatureQuery is an enum so all variants are valid.)
@@ -852,9 +865,7 @@ fn t26_14_canonical_frame_allocation() {
 // module: path parsing with stream name, read/write alternate streams,
 // and listing all streams on a file.
 
-use casa1::real_fs::{
-    parse_ntfs_path, is_ads_path, AlternateStreamName, RealFilesystem, WindowsPathResolver,
-};
+use casa1::real_fs::{RealFilesystem, WindowsPathResolver, is_ads_path, parse_ntfs_path};
 use tempfile::TempDir;
 
 // ---------------------------------------------------------------------------
@@ -931,12 +942,27 @@ fn t26_19_parse_ntfs_path_windows_full_with_type() {
 
 #[test]
 fn t26_20_is_ads_path_detection() {
-    assert!(is_ads_path("file.exe:Zone.Identifier"), "file.exe:Zone.Identifier is ADS");
-    assert!(is_ads_path("C:\\path\\file.exe:MyStream"), "C:\\path\\file.exe:MyStream is ADS");
-    assert!(!is_ads_path("file.exe"), "file.exe without colon is not ADS");
-    assert!(!is_ads_path("C:\\Windows\\System32\\kernel32.dll"), "Standard Windows path is not ADS");
+    assert!(
+        is_ads_path("file.exe:Zone.Identifier"),
+        "file.exe:Zone.Identifier is ADS"
+    );
+    assert!(
+        is_ads_path("C:\\path\\file.exe:MyStream"),
+        "C:\\path\\file.exe:MyStream is ADS"
+    );
+    assert!(
+        !is_ads_path("file.exe"),
+        "file.exe without colon is not ADS"
+    );
+    assert!(
+        !is_ads_path("C:\\Windows\\System32\\kernel32.dll"),
+        "Standard Windows path is not ADS"
+    );
     assert!(!is_ads_path(""), "Empty string is not ADS");
-    assert!(is_ads_path("data.bin:alternate:$DATA"), "data.bin:alternate:$DATA is ADS");
+    assert!(
+        is_ads_path("data.bin:alternate:$DATA"),
+        "data.bin:alternate:$DATA is ADS"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -979,14 +1005,17 @@ fn t26_23_alternate_stream_write_and_read() {
     fs.initialize().unwrap();
 
     // Create a base file
-    let mut file = fs.open_file("C:\\test_ads.txt", false, true, true, false).unwrap();
+    let mut file = fs
+        .open_file("C:\\test_ads.txt", false, true, true, false)
+        .unwrap();
     file.write(b"main content").unwrap();
     file.flush().unwrap();
     drop(file);
 
     // Write an alternate stream
     let stream_data = b"Zone.Identifier content with Mark-of-the-Web";
-    let write_result = fs.write_alternate_stream("C:\\test_ads.txt", "Zone.Identifier", stream_data);
+    let write_result =
+        fs.write_alternate_stream("C:\\test_ads.txt", "Zone.Identifier", stream_data);
     // On macOS this uses xattr, on other platforms uses sidecar files
     // It may fail if the platform doesn't support xattr, which is acceptable
     if let Ok(()) = write_result {
@@ -994,14 +1023,20 @@ fn t26_23_alternate_stream_write_and_read() {
         let read_result = fs.read_alternate_stream("C:\\test_ads.txt", "Zone.Identifier");
         assert!(read_result.is_ok(), "Should read back the alternate stream");
         let read_data = read_result.unwrap();
-        assert_eq!(read_data.as_slice(), stream_data, "Stream data should match");
+        assert_eq!(
+            read_data.as_slice(),
+            stream_data,
+            "Stream data should match"
+        );
 
         // List streams
         let list_result = fs.list_alternate_streams("C:\\test_ads.txt");
         assert!(list_result.is_ok(), "Should list alternate streams");
         let streams = list_result.unwrap();
-        assert!(streams.contains(&"Zone.Identifier".to_string()),
-            "Zone.Identifier should be in the stream list");
+        assert!(
+            streams.contains(&"Zone.Identifier".to_string()),
+            "Zone.Identifier should be in the stream list"
+        );
 
         // Delete the stream
         let delete_result = fs.delete_alternate_stream("C:\\test_ads.txt", "Zone.Identifier");
@@ -1009,7 +1044,10 @@ fn t26_23_alternate_stream_write_and_read() {
 
         // Verify deletion
         let read_after = fs.read_alternate_stream("C:\\test_ads.txt", "Zone.Identifier");
-        assert!(read_after.is_err(), "Stream should not exist after deletion");
+        assert!(
+            read_after.is_err(),
+            "Stream should not exist after deletion"
+        );
     }
     // If write_alternate_stream fails (e.g., xattr not supported on this platform),
     // we just skip the readback assertions — the test is still considered passing
@@ -1029,16 +1067,24 @@ fn t26_24_list_alternate_streams_empty() {
     fs.initialize().unwrap();
 
     // Create a file with no streams
-    let mut file = fs.open_file("C:\\plain.txt", false, true, true, false).unwrap();
+    let mut file = fs
+        .open_file("C:\\plain.txt", false, true, true, false)
+        .unwrap();
     file.write(b"no streams here").unwrap();
     file.flush().unwrap();
     drop(file);
 
     // List streams — should be empty
     let list_result = fs.list_alternate_streams("C:\\plain.txt");
-    assert!(list_result.is_ok(), "Should list streams on file without ADS");
+    assert!(
+        list_result.is_ok(),
+        "Should list streams on file without ADS"
+    );
     let streams = list_result.unwrap();
-    assert!(streams.is_empty(), "File with no ADS should have empty stream list");
+    assert!(
+        streams.is_empty(),
+        "File with no ADS should have empty stream list"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1054,7 +1100,9 @@ fn t26_25_multiple_alternate_streams() {
     fs.initialize().unwrap();
 
     // Create a base file
-    let mut file = fs.open_file("C:\\multi_ads.txt", false, true, true, false).unwrap();
+    let mut file = fs
+        .open_file("C:\\multi_ads.txt", false, true, true, false)
+        .unwrap();
     file.write(b"main").unwrap();
     file.flush().unwrap();
     drop(file);
@@ -1069,16 +1117,31 @@ fn t26_25_multiple_alternate_streams() {
         let list_result = fs.list_alternate_streams("C:\\multi_ads.txt");
         assert!(list_result.is_ok(), "Should list multiple streams");
         let streams = list_result.unwrap();
-        assert!(streams.contains(&"Stream1".to_string()), "Stream1 should be listed");
-        assert!(streams.contains(&"Stream2".to_string()), "Stream2 should be listed");
-        assert!(streams.contains(&"Stream3".to_string()), "Stream3 should be listed");
+        assert!(
+            streams.contains(&"Stream1".to_string()),
+            "Stream1 should be listed"
+        );
+        assert!(
+            streams.contains(&"Stream2".to_string()),
+            "Stream2 should be listed"
+        );
+        assert!(
+            streams.contains(&"Stream3".to_string()),
+            "Stream3 should be listed"
+        );
 
         // Verify each stream's data
-        let d1 = fs.read_alternate_stream("C:\\multi_ads.txt", "Stream1").unwrap();
+        let d1 = fs
+            .read_alternate_stream("C:\\multi_ads.txt", "Stream1")
+            .unwrap();
         assert_eq!(d1, b"data1");
-        let d2 = fs.read_alternate_stream("C:\\multi_ads.txt", "Stream2").unwrap();
+        let d2 = fs
+            .read_alternate_stream("C:\\multi_ads.txt", "Stream2")
+            .unwrap();
         assert_eq!(d2, b"data2");
-        let d3 = fs.read_alternate_stream("C:\\multi_ads.txt", "Stream3").unwrap();
+        let d3 = fs
+            .read_alternate_stream("C:\\multi_ads.txt", "Stream3")
+            .unwrap();
         assert_eq!(d3, b"data3");
     }
     // If ADS operations are not supported, just skip assertions

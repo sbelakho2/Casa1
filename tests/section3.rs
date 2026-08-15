@@ -1,12 +1,12 @@
 mod support;
 
-use casa1::pe::{
-    self, ApiSetResolver, DelayLoadOutcome, ExportSymbol, ExportTarget, ImportSymbol, ImportThunk,
-    LifecycleStage,
-};
 use casa1::oracle_model::{
     ApiSetSuite, DelayLoadCase, DelayLoadExpectation, DelayLoadSuite, DelayLoadSymbol,
     DllOrderSuite, ExportSpec, ExportSpecTarget,
+};
+use casa1::pe::{
+    self, ApiSetResolver, DelayLoadOutcome, ExportSymbol, ExportTarget, ImportSymbol, ImportThunk,
+    LifecycleStage,
 };
 use casa1::reason::ReasonCode;
 use std::collections::BTreeMap;
@@ -20,26 +20,61 @@ fn pe_parser_validates_headers_directories_load_config_and_resources() {
 
     assert_eq!(image.machine, 0x8664);
     assert_eq!(image.sections.len(), 5);
-    assert!(image.directory(pe::IMAGE_DIRECTORY_ENTRY_IMPORT).virtual_address > 0);
-    assert!(image.directory(pe::IMAGE_DIRECTORY_ENTRY_EXPORT).virtual_address > 0);
-    assert!(image.directory(pe::IMAGE_DIRECTORY_ENTRY_RESOURCE).virtual_address > 0);
-    assert!(image.directory(pe::IMAGE_DIRECTORY_ENTRY_TLS).virtual_address > 0);
-    assert!(image.directory(pe::IMAGE_DIRECTORY_ENTRY_DEBUG).virtual_address > 0);
-    assert!(image.directory(pe::IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG).virtual_address > 0);
+    assert!(
+        image
+            .directory(pe::IMAGE_DIRECTORY_ENTRY_IMPORT)
+            .virtual_address
+            > 0
+    );
+    assert!(
+        image
+            .directory(pe::IMAGE_DIRECTORY_ENTRY_EXPORT)
+            .virtual_address
+            > 0
+    );
+    assert!(
+        image
+            .directory(pe::IMAGE_DIRECTORY_ENTRY_RESOURCE)
+            .virtual_address
+            > 0
+    );
+    assert!(
+        image
+            .directory(pe::IMAGE_DIRECTORY_ENTRY_TLS)
+            .virtual_address
+            > 0
+    );
+    assert!(
+        image
+            .directory(pe::IMAGE_DIRECTORY_ENTRY_DEBUG)
+            .virtual_address
+            > 0
+    );
+    assert!(
+        image
+            .directory(pe::IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG)
+            .virtual_address
+            > 0
+    );
 
     let load_config = image.load_config.as_ref().expect("load config present");
     assert_eq!(load_config.guard_flags, 0x500);
     assert_eq!(load_config.se_handler_count, 1);
     assert_eq!(image.debug_entries.len(), 1);
-    assert_eq!(image.version_info.product_name.as_deref(), Some("Casa1 Demo"));
+    assert_eq!(
+        image.version_info.product_name.as_deref(),
+        Some("Casa1 Demo")
+    );
     assert_eq!(image.version_info.file_version.as_deref(), Some("1.2.3.4"));
 
     let manifest = image.embedded_manifest.expect("embedded manifest present");
     assert_eq!(manifest.dpi_awareness.as_deref(), Some("PerMonitorV2"));
-    assert!(manifest
-        .supported_os
-        .iter()
-        .any(|value| value == "{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"));
+    assert!(
+        manifest
+            .supported_os
+            .iter()
+            .any(|value| value == "{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}")
+    );
 }
 
 #[test]
@@ -50,7 +85,10 @@ fn pe32_parser_accepts_32_bit_optional_headers_and_mapping() {
     assert_eq!(image.machine, 0x014c);
     assert_eq!(image.pointer_bytes(), 4);
     assert_eq!(image.image_base, support::SAMPLE_IMAGE_BASE_X86);
-    assert_eq!(image.imports[0].imports[1].iat_rva - image.imports[0].imports[0].iat_rva, 4);
+    assert_eq!(
+        image.imports[0].imports[1].iat_rva - image.imports[0].imports[0].iat_rva,
+        4
+    );
 
     let load_config = image.load_config.as_ref().expect("load config present");
     assert_eq!(load_config.guard_flags, 0x500);
@@ -67,7 +105,8 @@ fn pe32_parser_accepts_32_bit_optional_headers_and_mapping() {
     assert!(mapped.selected_base <= u32::MAX as u64);
 
     let relocated = u32::from_le_bytes(
-        mapped.memory[support::SAMPLE_RELOC_TARGET_RVA as usize..support::SAMPLE_RELOC_TARGET_RVA as usize + 4]
+        mapped.memory[support::SAMPLE_RELOC_TARGET_RVA as usize
+            ..support::SAMPLE_RELOC_TARGET_RVA as usize + 4]
             .try_into()
             .expect("relocated dword"),
     );
@@ -79,8 +118,8 @@ fn mapping_relocations_and_deterministic_aslr_work() {
     let bytes = support::sample_pe_bytes();
     let image = pe::parse(&bytes).expect("parse synthetic PE32+ fixture");
 
-    let mapped_a = pe::map_image(&bytes, &image, support::SAMPLE_HASH, true)
-        .expect("map deterministic image");
+    let mapped_a =
+        pe::map_image(&bytes, &image, support::SAMPLE_HASH, true).expect("map deterministic image");
     let mapped_b = pe::map_image(&bytes, &image, support::SAMPLE_HASH, true)
         .expect("map deterministic image twice");
     assert_eq!(mapped_a.selected_base, mapped_b.selected_base);
@@ -108,7 +147,8 @@ fn mapping_relocations_and_deterministic_aslr_work() {
     assert!(!data.protection.execute);
 
     let relocated = u64::from_le_bytes(
-        mapped_a.memory[support::SAMPLE_RELOC_TARGET_RVA as usize..support::SAMPLE_RELOC_TARGET_RVA as usize + 8]
+        mapped_a.memory[support::SAMPLE_RELOC_TARGET_RVA as usize
+            ..support::SAMPLE_RELOC_TARGET_RVA as usize + 8]
             .try_into()
             .expect("relocated qword"),
     );
@@ -116,8 +156,9 @@ fn mapping_relocations_and_deterministic_aslr_work() {
 
     let mut unsupported_relocation = image.clone();
     unsupported_relocation.relocations[0].entries[0].kind = pe::RelocationType::Unsupported(7);
-    let relocation_error = pe::map_image(&bytes, &unsupported_relocation, support::SAMPLE_HASH, true)
-        .expect_err("unsupported relocation should fail deterministically");
+    let relocation_error =
+        pe::map_image(&bytes, &unsupported_relocation, support::SAMPLE_HASH, true)
+            .expect_err("unsupported relocation should fail deterministically");
     assert_eq!(relocation_error.code, ReasonCode::RcPeParseInvalid);
 }
 
@@ -168,10 +209,8 @@ fn imports_exports_forwarders_delay_loads_and_api_sets_resolve() {
             }],
         ),
     ]);
-    let resolver = ApiSetResolver::new().with_mapping(
-        "api-ms-win-core-file-l1-1-0.dll",
-        "kernel32.dll",
-    );
+    let resolver =
+        ApiSetResolver::new().with_mapping("api-ms-win-core-file-l1-1-0.dll", "kernel32.dll");
     let resolved = pe::resolve_imports(&image, &export_tables, &resolver)
         .expect("resolve imports and forwarders");
     assert_eq!(resolved.len(), 3);
@@ -182,9 +221,12 @@ fn imports_exports_forwarders_delay_loads_and_api_sets_resolve() {
 
     let create_file = resolved
         .iter()
-        .find(|import| import.symbol == ImportSymbol::ByName {
-            hint: 0,
-            name: "CreateFileW".to_string(),
+        .find(|import| {
+            import.symbol
+                == ImportSymbol::ByName {
+                    hint: 0,
+                    name: "CreateFileW".to_string(),
+                }
         })
         .expect("CreateFileW resolved");
     assert_eq!(create_file.resolved_module, "kernel32.dll");
@@ -199,9 +241,12 @@ fn imports_exports_forwarders_delay_loads_and_api_sets_resolve() {
 
     let forwarded = resolved
         .iter()
-        .find(|import| import.symbol == ImportSymbol::ByName {
-            hint: 0,
-            name: "Forwarded".to_string(),
+        .find(|import| {
+            import.symbol
+                == ImportSymbol::ByName {
+                    hint: 0,
+                    name: "Forwarded".to_string(),
+                }
         })
         .expect("forwarded delay import resolved");
     assert_eq!(forwarded.export.target, ExportTarget::Rva(0x2500));
@@ -244,9 +289,16 @@ fn imports_exports_forwarders_delay_loads_and_api_sets_resolve() {
 #[test]
 fn t3_2_dll_ordering_matches_independent_oracle_logs() {
     let suite: DllOrderSuite = support::run_oracle("section3-dll-order");
-    let plan = pe::plan_lifecycle(&suite.root_module, &suite.dependencies, &suite.tls_callbacks)
-        .expect("build lifecycle plan from oracle suite");
-    assert_eq!(support::lifecycle_log_lines(&plan), suite.expected_log_lines);
+    let plan = pe::plan_lifecycle(
+        &suite.root_module,
+        &suite.dependencies,
+        &suite.tls_callbacks,
+    )
+    .expect("build lifecycle plan from oracle suite");
+    assert_eq!(
+        support::lifecycle_log_lines(&plan),
+        suite.expected_log_lines
+    );
 }
 
 #[test]
@@ -266,8 +318,9 @@ fn t3_3_delay_load_exception_codes_match_independent_oracle() {
             delay_load: true,
         }];
         let export_tables = build_export_tables(&case);
-        let results = pe::resolve_delay_imports(&scenario_image, &export_tables, &ApiSetResolver::new())
-            .expect("resolve oracle delay-load case");
+        let results =
+            pe::resolve_delay_imports(&scenario_image, &export_tables, &ApiSetResolver::new())
+                .expect("resolve oracle delay-load case");
         assert_eq!(results.len(), 1);
         match &case.expected {
             DelayLoadExpectation::Resolved { export } => assert_eq!(
@@ -296,10 +349,7 @@ fn lifecycle_and_manifest_activation_plans_cover_attach_detach_and_external_mani
     let bytes = support::sample_pe_bytes();
     let image = pe::parse(&bytes).expect("parse synthetic PE32+ fixture");
     let tls_callbacks = BTreeMap::from([
-        (
-            "kernel32.dll".to_string(),
-            vec![0x1800_2000],
-        ),
+        ("kernel32.dll".to_string(), vec![0x1800_2000]),
         (
             "game.exe".to_string(),
             image
@@ -314,10 +364,7 @@ fn lifecycle_and_manifest_activation_plans_cover_attach_detach_and_external_mani
             "game.exe".to_string(),
             vec!["kernel32.dll".to_string(), "user32.dll".to_string()],
         ),
-        (
-            "user32.dll".to_string(),
-            vec!["gdi32.dll".to_string()],
-        ),
+        ("user32.dll".to_string(), vec!["gdi32.dll".to_string()]),
         ("gdi32.dll".to_string(), Vec::new()),
         ("kernel32.dll".to_string(), Vec::new()),
     ]);
@@ -371,13 +418,14 @@ fn lifecycle_and_manifest_activation_plans_cover_attach_detach_and_external_mani
         "every loaded module should receive a thread-detach DllMain notification in reverse order"
     );
 
-    let activation = pe::build_activation_context(
-        &image.embedded_manifest.clone().expect("embedded manifest"),
+    let activation =
+        pe::build_activation_context(&image.embedded_manifest.clone().expect("embedded manifest"));
+    assert!(
+        activation
+            .vc_runtime_assemblies
+            .iter()
+            .any(|assembly| assembly.name == "Microsoft.VC143.CRT")
     );
-    assert!(activation
-        .vc_runtime_assemblies
-        .iter()
-        .any(|assembly| assembly.name == "Microsoft.VC143.CRT"));
     assert_eq!(activation.vc_runtime_bindings.len(), 1);
     assert_eq!(
         activation.vc_runtime_bindings[0].activation_key,
@@ -399,7 +447,9 @@ fn lifecycle_and_manifest_activation_plans_cover_attach_detach_and_external_mani
     fs::write(&exe_path, &bytes).expect("write sample PE");
     fs::write(&manifest_path, support::external_manifest_xml()).expect("write external manifest");
     let parsed_from_file = pe::parse_from_file(&exe_path).expect("parse PE from file");
-    let external = parsed_from_file.external_manifest.expect("external manifest present");
+    let external = parsed_from_file
+        .external_manifest
+        .expect("external manifest present");
     assert_eq!(external.dpi_awareness.as_deref(), Some("System"));
 }
 
@@ -410,7 +460,10 @@ fn pe_parser_mutation_corpus_is_deterministic_and_bounds_checked() {
         let mutated = mutation_case(&seed, index);
         let first = parse_summary(&mutated);
         let second = parse_summary(&mutated);
-        assert_eq!(first, second, "mutation case {index} produced nondeterministic parse results");
+        assert_eq!(
+            first, second,
+            "mutation case {index} produced nondeterministic parse results"
+        );
     }
 }
 

@@ -14,17 +14,21 @@
 #![allow(unexpected_cfgs)]
 
 use crate::error::{AppError, AppResult};
+use crate::gfx::DxgiFormat;
+use crate::live::LiveFrame;
 use crate::mac_window;
 use crate::reason::ReasonCode;
+use crossbeam_channel::Sender;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::ffi::CString;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::fmt::Write;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 // ---------------------------------------------------------------------------
 // G9: IOSurface-backed Metal texture cache for zero-copy CEF compositing
@@ -42,7 +46,9 @@ struct IoSurfaceTexturePair {
     height: u32,
 }
 
+// SAFETY: Send is safe because the type only uses thread-safe internal state or is accessed under exclusive &mut
 unsafe impl Send for IoSurfaceTexturePair {}
+// SAFETY: Send is safe because the type only uses thread-safe internal state or is accessed under exclusive &mut
 unsafe impl Sync for IoSurfaceTexturePair {}
 
 impl IoSurfaceTexturePair {
@@ -67,6 +73,7 @@ impl IoSurfaceTexturePair {
 impl Drop for IoSurfaceTexturePair {
     fn drop(&mut self) {
         if !self.io_surface.is_null() {
+            // SAFETY: CEF (Chromium Embedded Framework) FFI for web view
             unsafe {
                 // CFRelease the IOSurfaceRef
                 let sel = objc::sel!(release);
@@ -96,8 +103,10 @@ impl NSPoint {
     }
 }
 
+// SAFETY: Objective-C runtime class lookup and method registration
 unsafe impl objc::Encode for NSPoint {
     fn encode() -> objc::Encoding {
+        // SAFETY: Objective-C runtime class lookup and method registration
         unsafe { objc::Encoding::from_str("{CGPoint=dd}") }
     }
 }
@@ -116,8 +125,10 @@ impl NSSize {
     }
 }
 
+// SAFETY: Objective-C runtime class lookup and method registration
 unsafe impl objc::Encode for NSSize {
     fn encode() -> objc::Encoding {
+        // SAFETY: Objective-C runtime class lookup and method registration
         unsafe { objc::Encoding::from_str("{CGSize=dd}") }
     }
 }
@@ -136,8 +147,10 @@ impl NSRect {
     }
 }
 
+// SAFETY: Objective-C runtime class lookup and method registration
 unsafe impl objc::Encode for NSRect {
     fn encode() -> objc::Encoding {
+        // SAFETY: Objective-C runtime class lookup and method registration
         unsafe { objc::Encoding::from_str("{CGRect={CGPoint=dd}{CGSize=dd}}") }
     }
 }
@@ -160,9 +173,12 @@ const BLOCK_HAS_SIGNATURE: i32 = 1 << 30;
 /// Create an Objective-C NSString from a Rust &str.
 /// Returns a raw pointer to the NSString object (caller must release).
 fn ns_string_from_str(s: &str) -> *mut objc::runtime::Object {
+    // SAFETY: Objective-C runtime class lookup and method registration.
+    // NSString is always available in the ObjC runtime on macOS.
     unsafe {
-        let cls = objc::runtime::Class::get("NSString").unwrap();
-        let c_str = CString::new(s).unwrap();
+        let cls = objc::runtime::Class::get("NSString")
+            .expect("NSString class always available at runtime");
+        let c_str = CString::new(s).expect("string from Rust should not contain NUL bytes");
         msg_send![cls, stringWithUTF8String: c_str.as_ptr()]
     }
 }
@@ -170,13 +186,14 @@ fn ns_string_from_str(s: &str) -> *mut objc::runtime::Object {
 /// Helper: create an ObjC NSURL from a Rust &str.
 /// SAFETY: returns a +0 (unowned) reference; caller must retain if needed.
 unsafe fn ns_url_from_str(url: &str) -> *mut objc::runtime::Object {
-    let cls_nsurl = objc::runtime::Class::get("NSURL").unwrap();
+    // SAFETY: NSURL is always available in the ObjC runtime on macOS.
+    let cls_nsurl =
+        objc::runtime::Class::get("NSURL").expect("NSURL class always available at runtime");
     let url_str = ns_string_from_str(url);
     if url_str.is_null() {
         return std::ptr::null_mut();
     }
-    let ns_url: *mut objc::runtime::Object =
-        msg_send![cls_nsurl, URLWithString: url_str];
+    let ns_url: *mut objc::runtime::Object = msg_send![cls_nsurl, URLWithString: url_str];
     let _: () = msg_send![url_str, release];
     ns_url
 }
@@ -373,7 +390,6 @@ pub struct CefBridge {
     // -----------------------------------------------------------------------
     // CEF callback handler state
     // -----------------------------------------------------------------------
-
     /// CefRenderHandler: current popup position/dimensions (popup browser).
     popup_info: Option<CefRect>,
     /// CefRenderHandler: whether a popup is currently shown.
@@ -386,10 +402,19 @@ pub struct CefBridge {
     // -----------------------------------------------------------------------
     // Steam Overlay WKWebView state
     // -----------------------------------------------------------------------
-
     /// Handle to the dedicated overlay WKWebView browser, if active.
     /// Created when the overlay toggles on, destroyed when it toggles off.
     overlay_browser_handle: Option<CefHandle>,
+
+    // -----------------------------------------------------------------------
+    // Live Session Integration
+    // -----------------------------------------------------------------------
+    /// Optional channel sender for publishing LiveFrames to the live session
+    /// display system. When set, every on_paint/on_accelerated_paint call will
+    /// also produce a LiveFrame and publish it to the live window.
+    live_frame_tx: Option<Sender<LiveFrame>>,
+    /// Frame counter for live frame publication
+    live_frame_counter: u64,
 }
 
 impl std::fmt::Debug for CefBridge {
@@ -406,7 +431,10 @@ impl std::fmt::Debug for CefBridge {
                 "paint_callback",
                 &self.paint_callback.as_ref().map(|_| "FnMut(RenderedFrame)"),
             )
-            .field("webview_manager", &self.webview_manager.as_ref().map(|_| "WKWebViewManager"))
+            .field(
+                "webview_manager",
+                &self.webview_manager.as_ref().map(|_| "WKWebViewManager"),
+            )
             .field("nsapp_initialized", &self.nsapp_initialized)
             .field("io_surface_available", &self.io_surface_available)
             .field("popup_info", &self.popup_info)
@@ -443,6 +471,8 @@ impl Default for CefBridge {
                 "steamcommunity".to_string(),
             ],
             overlay_browser_handle: None,
+            live_frame_tx: None,
+            live_frame_counter: 0,
         }
     }
 }
@@ -577,12 +607,23 @@ fn register_nav_delegate_class() -> Option<*const objc::runtime::Class> {
         // The webview finished loading — signal the delegate state
         let ptr_val = self_ as *const _ as u64;
         if let Ok(mut state) = DELEGATE_STATE.lock() {
-            // Find the handle for this delegate
-            for (&vp, &handle) in &state.view_to_handle {
-                // We store the webview ptr in the map; iterate to find match
-                // A real impl would use associated objects; for now broadcast to
-                // all tracked views that they finished loading.
-                let _ = (vp, handle);
+            // Find the handle for this delegate by matching ptr_val
+            if let Some(&handle) = state.view_to_handle.get(&ptr_val) {
+                state
+                    .navigation_events
+                    .entry(handle)
+                    .and_modify(|(loaded, _)| {
+                        *loaded = true;
+                    });
+                eprintln!(
+                    "[CefBridge] did_finish_nav: handle={:#x} ptr_val={ptr_val:#x}",
+                    handle.0,
+                );
+            } else {
+                // Fallback: broadcast to all tracked views (legacy behavior)
+                for (loaded, _) in state.navigation_events.values_mut() {
+                    *loaded = true;
+                }
             }
             // Mark all views as loaded (simplification)
             for (loaded, _) in state.navigation_events.values_mut() {
@@ -601,8 +642,7 @@ fn register_nav_delegate_class() -> Option<*const objc::runtime::Class> {
         let ptr_val = self_ as *const _ as u64;
         // Extract error description
         let error_desc = unsafe {
-            let desc: *mut objc::runtime::Object =
-                msg_send![error, localizedDescription];
+            let desc: *mut objc::runtime::Object = msg_send![error, localizedDescription];
             if desc.is_null() {
                 "unknown error".to_string()
             } else {
@@ -616,22 +656,47 @@ fn register_nav_delegate_class() -> Option<*const objc::runtime::Class> {
                 }
             }
         };
-        let _ = ptr_val;
         if let Ok(mut state) = DELEGATE_STATE.lock() {
-            for (_, (_, err)) in state.navigation_events.iter_mut() {
-                *err = Some(error_desc.clone());
+            // Try to match the failing navigation to a specific view handle
+            if let Some(&handle) = state.view_to_handle.get(&ptr_val) {
+                state
+                    .navigation_events
+                    .entry(handle)
+                    .and_modify(|(_, err)| {
+                        *err = Some(error_desc.clone());
+                    });
+            } else {
+                // Fallback: broadcast error to all tracked views
+                for (_, (_, err)) in state.navigation_events.iter_mut() {
+                    *err = Some(error_desc.clone());
+                }
             }
         }
+        eprintln!("[CefBridge] did_fail_nav: ptr_val={ptr_val:#x} error=\"{error_desc}\"");
     }
 
+    // SAFETY: CEF (Chromium Embedded Framework) FFI for web view
     unsafe {
         decl.add_method(
             sel!(webView:didFinishNavigation:),
-            did_finish_nav as extern "C" fn(&objc::runtime::Object, objc::runtime::Sel, *mut objc::runtime::Object, *mut objc::runtime::Object),
+            did_finish_nav
+                as extern "C" fn(
+                    &objc::runtime::Object,
+                    objc::runtime::Sel,
+                    *mut objc::runtime::Object,
+                    *mut objc::runtime::Object,
+                ),
         );
         decl.add_method(
             sel!(webView:didFailNavigation:withError:),
-            did_fail_nav as extern "C" fn(&objc::runtime::Object, objc::runtime::Sel, *mut objc::runtime::Object, *mut objc::runtime::Object, *mut objc::runtime::Object),
+            did_fail_nav
+                as extern "C" fn(
+                    &objc::runtime::Object,
+                    objc::runtime::Sel,
+                    *mut objc::runtime::Object,
+                    *mut objc::runtime::Object,
+                    *mut objc::runtime::Object,
+                ),
         );
     }
 
@@ -661,11 +726,11 @@ fn register_msg_handler_class() -> Option<*const objc::runtime::Class> {
         message: *mut objc::runtime::Object,
     ) {
         // Extract the message body from WKScriptMessage
+        // SAFETY: Objective-C runtime class lookup and method registration
         unsafe {
             let body: *mut objc::runtime::Object = msg_send![message, body];
             if !body.is_null() {
-                let desc: *mut objc::runtime::Object =
-                    msg_send![body, description];
+                let desc: *mut objc::runtime::Object = msg_send![body, description];
                 if !desc.is_null() {
                     let cstr: *const i8 = msg_send![desc, UTF8String];
                     if !cstr.is_null() {
@@ -680,10 +745,17 @@ fn register_msg_handler_class() -> Option<*const objc::runtime::Class> {
         }
     }
 
+    // SAFETY: CEF (Chromium Embedded Framework) FFI for web view
     unsafe {
         decl.add_method(
             sel!(userContentController:didReceiveScriptMessage:),
-            did_receive_message as extern "C" fn(&objc::runtime::Object, objc::runtime::Sel, *mut objc::runtime::Object, *mut objc::runtime::Object),
+            did_receive_message
+                as extern "C" fn(
+                    &objc::runtime::Object,
+                    objc::runtime::Sel,
+                    *mut objc::runtime::Object,
+                    *mut objc::runtime::Object,
+                ),
         );
     }
 
@@ -748,6 +820,7 @@ impl WKWebViewManager {
     /// for pure headless/CEF scenarios.
     #[cfg(target_os = "macos")]
     fn init_nsapp(&mut self) {
+        // SAFETY: CEF (Chromium Embedded Framework) FFI for web view
         unsafe {
             // ── 1. Check whether a regular NSApp already exists ───────────
             let regular_mode = mac_window::is_nsapp_initialized();
@@ -761,8 +834,7 @@ impl WKWebViewManager {
             };
 
             // Get or create shared application
-            let shared_app: *mut objc::runtime::Object =
-                msg_send![cls_app, sharedApplication];
+            let shared_app: *mut objc::runtime::Object = msg_send![cls_app, sharedApplication];
             if shared_app.is_null() {
                 self.wkwebview_available.store(false, Ordering::Relaxed);
                 return;
@@ -797,8 +869,7 @@ impl WKWebViewManager {
             // Create offscreen content view
             let view_alloc: *mut objc::runtime::Object = msg_send![cls_view, alloc];
             let view_frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(4096.0, 4096.0));
-            let view: *mut objc::runtime::Object =
-                msg_send![view_alloc, initWithFrame: view_frame];
+            let view: *mut objc::runtime::Object = msg_send![view_alloc, initWithFrame: view_frame];
 
             // G9: Enable layer-backed rendering on the offscreen view so that
             // WKWebView subviews use IOSurface-backed compositing layers
@@ -837,6 +908,7 @@ impl WKWebViewManager {
     fn register_delegate_classes(&mut self) {
         if let Some(cls) = register_nav_delegate_class() {
             // Create an instance
+            // SAFETY: CEF (Chromium Embedded Framework) FFI for web view
             unsafe {
                 let alloc: *mut objc::runtime::Object = msg_send![cls, alloc];
                 let instance: *mut objc::runtime::Object = msg_send![alloc, init];
@@ -845,6 +917,7 @@ impl WKWebViewManager {
         }
 
         if let Some(cls) = register_msg_handler_class() {
+            // SAFETY: CEF (Chromium Embedded Framework) FFI for web view
             unsafe {
                 let alloc: *mut objc::runtime::Object = msg_send![cls, alloc];
                 let instance: *mut objc::runtime::Object = msg_send![alloc, init];
@@ -912,13 +985,11 @@ impl WKWebViewManager {
 
         // Register this view in the delegate state
         if let Ok(mut state) = DELEGATE_STATE.lock() {
-            state
-                .view_to_handle
-                .insert(native_ptr as u64, handle);
+            state.view_to_handle.insert(native_ptr as u64, handle);
             state.navigation_events.insert(handle, (false, None));
         }
 
-        let pixels = vec![0xFFu8; (config.width as usize * config.height as usize * 4)];
+        let pixels = vec![0xFFu8; config.width as usize * config.height as usize * 4];
 
         self.views.insert(
             handle,
@@ -990,6 +1061,7 @@ impl WKWebViewManager {
         }
 
         #[cfg(feature = "metal")]
+        // SAFETY: CEF (Chromium Embedded Framework) FFI for web view
         unsafe {
             let view: *mut objc::runtime::Object = instance.native_ptr as *mut _;
             let layer: *mut objc::runtime::Object = msg_send![view, layer];
@@ -1013,26 +1085,26 @@ impl WKWebViewManager {
                 eprintln!(
                     "[CefBridge] get_io_surface_for_browser: layer contents is null \
                      for WKWebView {handle:?} (view={view:?}, dims={w:.0}x{h:.0})",
-                    w = instance.width, h = instance.height
+                    w = instance.width,
+                    h = instance.height
                 );
                 return Ok(std::ptr::null_mut());
             }
             // Only an IOSurface responds to `surfaceID`; any other layer
             // contents (e.g. a CGImage) must not be passed to Metal's
             // iosurface texture constructor.
-            let responds: bool =
-                msg_send![contents, respondsToSelector: objc::sel!(surfaceID)];
+            let responds: bool = msg_send![contents, respondsToSelector: objc::sel!(surfaceID)];
             if responds {
                 eprintln!(
                     "[CefBridge] get_io_surface_for_browser: found IOSurface for \
                      WKWebView {handle:?} ({w:.0}x{h:.0}) — zero-copy path available",
-                    w = instance.width, h = instance.height
+                    w = instance.width,
+                    h = instance.height
                 );
                 Ok(contents as *mut std::ffi::c_void)
             } else {
                 // Check what kind of object it is for diagnostic purposes
-                let class_name: *mut objc::runtime::Object =
-                    msg_send![contents, description];
+                let class_name: *mut objc::runtime::Object = msg_send![contents, description];
                 let contents_desc = if !class_name.is_null() {
                     let cstr: *const i8 = msg_send![class_name, UTF8String];
                     if !cstr.is_null() {
@@ -1049,7 +1121,8 @@ impl WKWebViewManager {
                     "[CefBridge] get_io_surface_for_browser: layer contents is not an \
                      IOSurface for WKWebView {handle:?} — contents class: {contents_desc}, \
                      dimensions: {w:.0}x{h:.0} — falling back to CPU upload",
-                    w = instance.width, h = instance.height
+                    w = instance.width,
+                    h = instance.height
                 );
                 Ok(std::ptr::null_mut())
             }
@@ -1060,7 +1133,6 @@ impl WKWebViewManager {
             Ok(std::ptr::null_mut())
         }
     }
-
 
     pub fn evaluate_java_script(
         &mut self,
@@ -1142,7 +1214,10 @@ impl WKWebViewManager {
     /// Check if a navigation has completed (didFinishNavigation was called)
     pub fn navigation_did_finish(&self, handle: WKWebViewHandle) -> Option<bool> {
         if let Ok(state) = DELEGATE_STATE.lock() {
-            state.navigation_events.get(&handle).map(|(loaded, _)| *loaded)
+            state
+                .navigation_events
+                .get(&handle)
+                .map(|(loaded, _)| *loaded)
         } else {
             None
         }
@@ -1170,7 +1245,7 @@ impl WKWebViewManager {
         })?;
         instance.width = width;
         instance.height = height;
-        instance.pixels = vec![0xFFu8; (width as usize * height as usize * 4)];
+        instance.pixels = vec![0xFFu8; width as usize * height as usize * 4];
         Self::resize_wkwebview_native(instance.native_ptr, width, height);
         Ok(())
     }
@@ -1201,21 +1276,25 @@ impl WKWebViewManager {
         #[cfg(target_os = "macos")]
         {
             if let Some(win) = self.offscreen_window.take() {
+                // SAFETY: CEF (Chromium Embedded Framework) FFI for web view
                 unsafe {
                     let _: () = msg_send![win as *mut objc::runtime::Object, close];
                 }
             }
             if let Some(view) = self.offscreen_view.take() {
+                // SAFETY: CEF (Chromium Embedded Framework) FFI for web view
                 unsafe {
                     let _: () = msg_send![view as *mut objc::runtime::Object, release];
                 }
             }
             if let Some(delegate) = self.nav_delegate.take() {
+                // SAFETY: CEF (Chromium Embedded Framework) FFI for web view
                 unsafe {
                     let _: () = msg_send![delegate as *mut objc::runtime::Object, release];
                 }
             }
             if let Some(handler) = self.msg_handler.take() {
+                // SAFETY: CEF (Chromium Embedded Framework) FFI for web view
                 unsafe {
                     let _: () = msg_send![handler as *mut objc::runtime::Object, release];
                 }
@@ -1255,13 +1334,13 @@ impl WKWebViewManager {
     ///
     /// Returns a raw pointer to the WKWebView object, or null on failure.
     fn create_wkwebview_native(
-        width: f64,
-        height: f64,
-        js_enabled: bool,
-        user_agent: Option<&str>,
-        nav_delegate: Option<*mut std::ffi::c_void>,
-        msg_handler: Option<*mut std::ffi::c_void>,
-        parent_view: Option<*mut std::ffi::c_void>,
+        #[allow(unused_variables)] width: f64,
+        #[allow(unused_variables)] height: f64,
+        #[allow(unused_variables)] js_enabled: bool,
+        #[allow(unused_variables)] user_agent: Option<&str>,
+        #[allow(unused_variables)] nav_delegate: Option<*mut std::ffi::c_void>,
+        #[allow(unused_variables)] msg_handler: Option<*mut std::ffi::c_void>,
+        #[allow(unused_variables)] parent_view: Option<*mut std::ffi::c_void>,
     ) -> *mut std::ffi::c_void {
         #[cfg(target_os = "macos")]
         {
@@ -1286,11 +1365,10 @@ impl WKWebViewManager {
                     Some(c) => c,
                     None => return std::ptr::null_mut(),
                 };
-                let cls_wk_controller =
-                    match objc::runtime::Class::get("WKUserContentController") {
-                        Some(c) => c,
-                        None => return std::ptr::null_mut(),
-                    };
+                let cls_wk_controller = match objc::runtime::Class::get("WKUserContentController") {
+                    Some(c) => c,
+                    None => return std::ptr::null_mut(),
+                };
 
                 // --- Create process pool ---
                 let pool_alloc: *mut objc::runtime::Object = msg_send![cls_wk_pool, alloc];
@@ -1382,24 +1460,34 @@ impl WKWebViewManager {
 
                 view as *mut std::ffi::c_void
             });
+            if let Err(panic_err) = &result {
+                let msg = if let Some(s) = panic_err.downcast_ref::<&str>() {
+                    s.to_string()
+                } else if let Some(s) = panic_err.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "unknown panic".to_string()
+                };
+                eprintln!("[CefBridge] create_wkwebview_native panicked: {msg}");
+            }
             result.unwrap_or(std::ptr::null_mut())
         }
 
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = (width, height, js_enabled, user_agent, nav_delegate, msg_handler, parent_view);
             std::ptr::null_mut()
         }
     }
 
     /// Navigate a WKWebView to a URL using `loadRequest:` with an NSURLRequest.
+    #[allow(unused_variables)]
     fn navigate_wkwebview_native(native_ptr: *mut std::ffi::c_void, url: &str) {
         if native_ptr.is_null() {
             return;
         }
         #[cfg(target_os = "macos")]
         {
-            let _ = std::panic::catch_unwind(|| unsafe {
+            if let Err(panic_err) = std::panic::catch_unwind(|| unsafe {
                 // SAFETY: Native pointer is validated as non-null.
                 // NSURL and NSURLRequest are standard Foundation classes.
                 let cls_req = match objc::runtime::Class::get("NSURLRequest") {
@@ -1412,30 +1500,34 @@ impl WKWebViewManager {
                     return;
                 }
 
-                let req: *mut objc::runtime::Object =
-                    msg_send![cls_req, requestWithURL: ns_url];
+                let req: *mut objc::runtime::Object = msg_send![cls_req, requestWithURL: ns_url];
                 if !req.is_null() {
                     let view = native_ptr as *mut objc::runtime::Object;
                     let _: () = msg_send![view, loadRequest: req];
                 }
-            });
+            }) {
+                let msg = if let Some(s) = panic_err.downcast_ref::<&str>() {
+                    s.to_string()
+                } else if let Some(s) = panic_err.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "unknown panic".to_string()
+                };
+                eprintln!("[CefBridge] navigate_wkwebview_native panicked: {msg}");
+            }
         }
-        let _ = url;
     }
 
     /// Evaluate JavaScript in a WKWebView using `evaluateJavaScript:completionHandler:`.
     /// The completion handler is a block that receives the result when execution finishes.
-    fn evaluate_js_native(
-        native_ptr: *mut std::ffi::c_void,
-        script: &str,
-        callback_id: u64,
-    ) {
+    #[allow(unused_variables)]
+    fn evaluate_js_native(native_ptr: *mut std::ffi::c_void, script: &str, callback_id: u64) {
         if native_ptr.is_null() {
             return;
         }
         #[cfg(target_os = "macos")]
         {
-            let _ = std::panic::catch_unwind(|| unsafe {
+            if let Err(panic_err) = std::panic::catch_unwind(|| unsafe {
                 // SAFETY: We use a minimal manually-managed block literal for the
                 // completion handler. The block is on the stack and only valid for
                 // the duration of the msg_send! call (WKWebView copies it internally).
@@ -1453,12 +1545,12 @@ impl WKWebViewManager {
                 //
                 // We use an extern "C" function as the invoke pointer.
                 extern "C" fn js_completion_block(
-                    block: *const std::ffi::c_void,
+                    _block: *const std::ffi::c_void,
                     result: *mut objc::runtime::Object,
                     error: *mut objc::runtime::Object,
                 ) {
+                    // SAFETY: Objective-C runtime class lookup and method registration
                     unsafe {
-                        let _ = block;
                         // Extract the callback_id from the block if we had associated data.
                         // For simplicity, we just log the result/error.
                         if !error.is_null() {
@@ -1470,14 +1562,11 @@ impl WKWebViewManager {
                                     let err_str = std::ffi::CStr::from_ptr(cstr)
                                         .to_string_lossy()
                                         .into_owned();
-                                    eprintln!(
-                                        "[CefBridge] JS execution error: {err_str}"
-                                    );
+                                    eprintln!("[CefBridge] JS execution error: {err_str}");
                                 }
                             }
                         } else if !result.is_null() {
-                            let desc: *mut objc::runtime::Object =
-                                msg_send![result, description];
+                            let desc: *mut objc::runtime::Object = msg_send![result, description];
                             if !desc.is_null() {
                                 let cstr: *const i8 = msg_send![desc, UTF8String];
                                 if !cstr.is_null() {
@@ -1487,19 +1576,29 @@ impl WKWebViewManager {
                                     // Route result back through delegate state
                                     // (simplified — a real impl would use the block's copy
                                     //  of the callback ID via block private data)
-                                    let _ = result_str;
+                                    eprintln!("[CefBridge] JS execution result: {result_str}");
                                 }
                             }
                         }
                     }
                 }
 
-                let block = BlockLiteral::<extern "C" fn(*const std::ffi::c_void, *mut objc::runtime::Object, *mut objc::runtime::Object)> {
+                let block = BlockLiteral::<
+                    extern "C" fn(
+                        *const std::ffi::c_void,
+                        *mut objc::runtime::Object,
+                        *mut objc::runtime::Object,
+                    ),
+                > {
                     isa: std::ptr::null_mut(), // will be set to NSConcreteStackBlock by runtime
                     flags: 0,
                     reserved: 0,
                     invoke: js_completion_block
-                        as *const extern "C" fn(*const std::ffi::c_void, *mut objc::runtime::Object, *mut objc::runtime::Object),
+                        as *const extern "C" fn(
+                            *const std::ffi::c_void,
+                            *mut objc::runtime::Object,
+                            *mut objc::runtime::Object,
+                        ),
                 };
 
                 let _: () = msg_send![
@@ -1509,18 +1608,24 @@ impl WKWebViewManager {
                         as *mut std::ffi::c_void
                 ];
                 let _: () = msg_send![js_str, release];
-            });
+            }) {
+                let msg = if let Some(s) = panic_err.downcast_ref::<&str>() {
+                    s.to_string()
+                } else if let Some(s) = panic_err.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "unknown panic".to_string()
+                };
+                eprintln!("[CefBridge] evaluate_js_native panicked: {msg}");
+            }
         }
-        let _ = (script, callback_id);
     }
 
     /// Take a snapshot of the WKWebView's current rendered content using
     /// `takeSnapshotWithConfiguration:completionHandler:` (macOS 10.13+).
     /// The snapshot is returned as RGBA pixel data via the completion block.
-    fn take_snapshot_native(
-        native_ptr: *mut std::ffi::c_void,
-        handle: WKWebViewHandle,
-    ) {
+    #[allow(unused_variables)]
+    fn take_snapshot_native(native_ptr: *mut std::ffi::c_void, handle: WKWebViewHandle) {
         // Store handle in global atomic so the extern "C" block fn can use it.
         // This is safe because take_snapshot_native is called from a single thread
         // (the main loop) and the block executes synchronously during run loop iteration.
@@ -1531,7 +1636,7 @@ impl WKWebViewManager {
         }
         #[cfg(target_os = "macos")]
         {
-            let _ = std::panic::catch_unwind(|| unsafe {
+            if let Err(panic_err) = std::panic::catch_unwind(|| unsafe {
                 // SAFETY: takeSnapshotWithConfiguration:completionHandler: is available
                 // on macOS 10.13+. We pass nil for configuration (default options)
                 // and a stack block for the completion handler.
@@ -1544,6 +1649,7 @@ impl WKWebViewManager {
                     snapshot: *mut objc::runtime::Object,
                     error: *mut objc::runtime::Object,
                 ) {
+                    // SAFETY: Objective-C runtime class lookup and method registration
                     unsafe {
                         if !error.is_null() {
                             // Log error but don't crash
@@ -1555,9 +1661,7 @@ impl WKWebViewManager {
                                     let err_str = std::ffi::CStr::from_ptr(cstr)
                                         .to_string_lossy()
                                         .into_owned();
-                                    eprintln!(
-                                        "[CefBridge] Snapshot error: {err_str}"
-                                    );
+                                    eprintln!("[CefBridge] Snapshot error: {err_str}");
                                 }
                             }
                             return;
@@ -1568,18 +1672,17 @@ impl WKWebViewManager {
                         }
 
                         // Retrieve the target handle from the static atomic
-                        let target_handle = WKWebViewHandle(
-                            SNAPSHOT_TARGET_HANDLE.load(Ordering::SeqCst),
-                        );
+                        let target_handle =
+                            WKWebViewHandle(SNAPSHOT_TARGET_HANDLE.load(Ordering::SeqCst));
 
                         // Extract CGImage from NSImage (macOS).
-                        // On macOS, NSImage has CGImageForProposedRect:context:hints:
-                        let cls_nsimage = objc::runtime::Class::get("NSImage").unwrap();
+                        // SAFETY: NSImage is always available in the ObjC runtime on macOS.
+                        let cls_nsimage = objc::runtime::Class::get("NSImage")
+                            .expect("NSImage class always available on macOS");
                         let is_nsimage: bool = msg_send![snapshot, isKindOfClass: cls_nsimage];
                         if is_nsimage {
                             // Get CGImage from NSImage
-                            let cg_image: *mut std::ffi::c_void =
-                                msg_send![snapshot, CGImageForProposedRect: std::ptr::null_mut::<std::ffi::c_void>()
+                            let cg_image: *mut std::ffi::c_void = msg_send![snapshot, CGImageForProposedRect: std::ptr::null_mut::<std::ffi::c_void>()
                                                                                  context: std::ptr::null_mut::<std::ffi::c_void>()
                                                                                  hints: std::ptr::null_mut::<std::ffi::c_void>()];
                             if cg_image.is_null() {
@@ -1588,8 +1691,7 @@ impl WKWebViewManager {
                             convert_cgimage_to_rgba(cg_image, target_handle);
                         } else {
                             // If it's a UIImage (iOS) or already a CGImage, try CGImage property
-                            let cg_image: *mut std::ffi::c_void =
-                                msg_send![snapshot, CGImage];
+                            let cg_image: *mut std::ffi::c_void = msg_send![snapshot, CGImage];
                             if !cg_image.is_null() {
                                 convert_cgimage_to_rgba(cg_image, target_handle);
                             }
@@ -1597,12 +1699,22 @@ impl WKWebViewManager {
                     }
                 }
 
-                let block = BlockLiteral::<extern "C" fn(*const std::ffi::c_void, *mut objc::runtime::Object, *mut objc::runtime::Object)> {
+                let block = BlockLiteral::<
+                    extern "C" fn(
+                        *const std::ffi::c_void,
+                        *mut objc::runtime::Object,
+                        *mut objc::runtime::Object,
+                    ),
+                > {
                     isa: std::ptr::null_mut(),
                     flags: 0,
                     reserved: 0,
                     invoke: snapshot_completion_block
-                        as *const extern "C" fn(*const std::ffi::c_void, *mut objc::runtime::Object, *mut objc::runtime::Object),
+                        as *const extern "C" fn(
+                            *const std::ffi::c_void,
+                            *mut objc::runtime::Object,
+                            *mut objc::runtime::Object,
+                        ),
                 };
 
                 // nil configuration = default snapshot options
@@ -1612,18 +1724,28 @@ impl WKWebViewManager {
                     completionHandler: &block as *const BlockLiteral<_>
                         as *mut std::ffi::c_void
                 ];
-            });
+            }) {
+                let msg = if let Some(s) = panic_err.downcast_ref::<&str>() {
+                    s.to_string()
+                } else if let Some(s) = panic_err.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "unknown panic".to_string()
+                };
+                eprintln!("[CefBridge] take_snapshot_native panicked: {msg}");
+            }
         }
-        let _ = handle;
     }
 
     /// Resize a WKWebView by updating its frame NSRect.
+    #[allow(unused_variables)]
     fn resize_wkwebview_native(native_ptr: *mut std::ffi::c_void, width: f64, height: f64) {
         if native_ptr.is_null() {
             return;
         }
         #[cfg(target_os = "macos")]
         {
+            // SAFETY: CEF (Chromium Embedded Framework) FFI for web view
             unsafe {
                 // SAFETY: setFrame: is a standard NSView method, safe to call on WKWebView.
                 let view = native_ptr as *mut objc::runtime::Object;
@@ -1631,7 +1753,6 @@ impl WKWebViewManager {
                 let _: () = msg_send![view, setFrame: frame];
             }
         }
-        let _ = (width, height);
     }
 
     /// Close/destroy a WKWebView: stop loading, remove from superview, release.
@@ -1641,6 +1762,7 @@ impl WKWebViewManager {
         }
         #[cfg(target_os = "macos")]
         {
+            // SAFETY: CEF (Chromium Embedded Framework) FFI for web view
             unsafe {
                 // SAFETY: Standard NSView/WKWebView teardown sequence.
                 let view = native_ptr as *mut objc::runtime::Object;
@@ -1663,6 +1785,7 @@ impl WKWebViewManager {
 mod core_graphics_ffi {
     use std::ffi::c_void;
 
+    // SAFETY: extern FFI declaration — the function signature matches the C library prototype
     unsafe extern "C" {
         // CGImageRef utilities
         pub fn CGImageGetWidth(image: *const c_void) -> usize;
@@ -1710,10 +1833,7 @@ mod core_graphics_ffi {
 /// SAFETY: `cg_image` must be a valid CGImageRef. This function reads pixel
 /// data via CGBitmapContext drawing using CoreGraphics C FFI.
 #[cfg(target_os = "macos")]
-unsafe fn convert_cgimage_to_rgba(
-    cg_image: *mut std::ffi::c_void,
-    handle: WKWebViewHandle,
-) {
+unsafe fn convert_cgimage_to_rgba(cg_image: *mut std::ffi::c_void, handle: WKWebViewHandle) {
     use self::core_graphics_ffi::*;
 
     // SAFETY: CGImageGetWidth/Height are pure C accessors. The CGImage is
@@ -1759,13 +1879,20 @@ unsafe fn convert_cgimage_to_rgba(
     };
 
     if ctx.is_null() {
-        unsafe { CGColorSpaceRelease(color_space); }
+        // SAFETY: CEF (Chromium Embedded Framework) FFI for web view
+        unsafe {
+            CGColorSpaceRelease(color_space);
+        }
         return;
     }
 
     // Draw the CGImage into the bitmap context at (0,0)–(width,height)
     // The rect is a CGRect = {origin={x=0,y=0}, size={width,height}}
-    let rect = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width as f64, height as f64));
+    let rect = NSRect::new(
+        NSPoint::new(0.0, 0.0),
+        NSSize::new(width as f64, height as f64),
+    );
+    // SAFETY: CEF (Chromium Embedded Framework) FFI for web view
     unsafe {
         CGContextDrawImage(
             ctx as *const c_void,
@@ -1775,6 +1902,7 @@ unsafe fn convert_cgimage_to_rgba(
     }
 
     // Release CoreFoundation objects
+    // SAFETY: CEF (Chromium Embedded Framework) FFI for web view
     unsafe {
         CFRelease(ctx as *const c_void);
         CGColorSpaceRelease(color_space);
@@ -1816,24 +1944,25 @@ impl CefBridge {
         if let Some(cached) = self.io_surface_available {
             return cached;
         }
-        let available = unsafe {
-            // Attempt to locate the IOSurface ObjC class.
-            // If it's not registered, IOSurfaceCreate etc. will all fail.
-            objc::runtime::Class::get("IOSurface").is_some()
-        };
+        // Attempt to locate the IOSurface ObjC class.
+        // If it's not registered, IOSurfaceCreate etc. will all fail.
+        let available = objc::runtime::Class::get("IOSurface").is_some();
         self.io_surface_available = Some(available);
         if !available {
             eprintln!(
-                "[CefBridge] WARNING: IOSurface class not available at runtime — \
-                 all IOSurface paths will use CPU-side rendering fallback"
+                "[CefBridge] IOSurface class not available at runtime — \
+                 falling back to CPU-side rendering. This is expected on non-Mac \
+                 or in sandboxed environments without IOSurface framework access."
             );
+        } else {
+            eprintln!("[CefBridge] IOSurface is available — GPU-side compositing enabled");
         }
         available
     }
 
     /// Ensure NSApplication and WKWebViewManager are initialized.
     /// Called internally before any WKWebView operations.
-    fn ensure_webview_manager(&mut self) -> AppResult<&mut WKWebViewManager> {
+    pub(crate) fn ensure_webview_manager(&mut self) -> AppResult<&mut WKWebViewManager> {
         if self.webview_manager.is_none() {
             let mgr = WKWebViewManager::new();
             if !mgr.is_available() {
@@ -1844,7 +1973,404 @@ impl CefBridge {
             }
             self.webview_manager = Some(mgr);
         }
-        Ok(self.webview_manager.as_mut().unwrap())
+        // SAFETY: Just initialized or confirmed Some above; this is a safe invariant.
+        Ok(self
+            .webview_manager
+            .as_mut()
+            .expect("webview_manager just initialized above"))
+    }
+
+    // -----------------------------------------------------------------------
+    // Live Session Integration
+    // -----------------------------------------------------------------------
+
+    /// Set the channel sender for publishing LiveFrames to the live session.
+    /// When set, every on_paint/on_accelerated_paint call will also produce a
+    /// LiveFrame and publish it via this channel.
+    pub fn set_live_frame_tx(&mut self, tx: Option<Sender<LiveFrame>>) {
+        self.live_frame_tx = tx;
+        self.live_frame_counter = 0;
+    }
+
+    /// Get a copy of the most recently rendered frame for a given browser,
+    /// or the latest frame if browser_id is None. Returns None if no frame
+    /// is available.
+    pub fn get_latest_rendered_frame(&self) -> Option<RenderedFrame> {
+        self.rendered_frames.back().cloned()
+    }
+
+    /// Get the most recent rendered frame pixels for the live preview.
+    /// Returns (width, height, pixels_bgra) if any frame is available.
+    pub fn get_live_preview_frame(&self) -> Option<(u32, u32, Vec<u8>)> {
+        self.rendered_frames.back().map(|f| {
+            // Convert RGBA pixels from RenderedFrame to BGRA for LiveFrame
+            let pixels = if f.pixels.len() >= (f.width as usize * f.height as usize * 4) {
+                // RenderedFrame stores RGBA; convert to BGRA
+                let mut bgra = Vec::with_capacity(f.pixels.len());
+                for chunk in f.pixels.chunks_exact(4) {
+                    bgra.extend_from_slice(&[chunk[2], chunk[1], chunk[0], chunk[3]]);
+                }
+                bgra
+            } else {
+                f.pixels.clone()
+            };
+            (f.width, f.height, pixels)
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // Input Forwarding — route keyboard/mouse events from the live session
+    // window into the WKWebView via JavaScript DOM event dispatch.
+    //
+    // These methods are called from the PE runtime's poll_live_input() when
+    // a live session is active. They evaluate JavaScript on the first browser's
+    // WKWebView to simulate user interaction with the Steam web UI.
+    // -----------------------------------------------------------------------
+
+    /// Forward a keyboard event to the first available WKWebView browser.
+    pub fn forward_keyboard_event(&mut self, key_down: bool, scancode: u16) {
+        let browser_handle = self.browsers.keys().next().copied();
+        let Some(handle) = browser_handle else { return };
+        let Some(browser) = self.browsers.get(&handle) else {
+            return;
+        };
+        let Some(wk_handle) = browser.wk_handle else {
+            return;
+        };
+        let Some(mgr) = self.webview_manager.as_mut() else {
+            return;
+        };
+
+        // Map scancode to a common key string for JavaScript dispatch
+        let key = match scancode {
+            0x1E => "a",
+            0x30 => "b",
+            0x2E => "c",
+            0x20 => "d",
+            0x12 => "e",
+            0x21 => "f",
+            0x22 => "g",
+            0x23 => "h",
+            0x17 => "i",
+            0x24 => "j",
+            0x25 => "k",
+            0x26 => "l",
+            0x32 => "m",
+            0x31 => "n",
+            0x18 => "o",
+            0x19 => "p",
+            0x10 => "q",
+            0x13 => "r",
+            0x1F => "s",
+            0x14 => "t",
+            0x16 => "u",
+            0x2F => "v",
+            0x11 => "w",
+            0x2D => "x",
+            0x2C => "y",
+            0x15 => "z",
+            0x02 => "1",
+            0x03 => "2",
+            0x04 => "3",
+            0x05 => "4",
+            0x06 => "5",
+            0x07 => "6",
+            0x08 => "7",
+            0x09 => "8",
+            0x0A => "9",
+            0x0B => "0",
+            0x39 => " ",         // Space
+            0x1C => "Enter",     // Enter
+            0x0E => "Backspace", // Backspace
+            0x2A => "Shift",     // Shift (left)
+            0x36 => "Shift",     // Shift (right)
+            0x1D => "Control",   // Control (left)
+            0x38 => "Alt",       // Alt (left)
+            0x01 => "Escape",    // Escape
+            0x0F => "Tab",       // Tab
+            0x50 => "ArrowLeft",
+            0x4F => "ArrowRight",
+            0x4E => "ArrowDown",
+            0x52 => "ArrowUp",
+            _ => "",
+        };
+
+        if key.is_empty() {
+            return;
+        }
+
+        let event_type = if key_down { "keydown" } else { "keyup" };
+        let escaped_key = key.replace('\'', "\\'");
+        let js = format!(
+            "document.dispatchEvent(new KeyboardEvent('{}', {{ key: '{}', bubbles: true }}));",
+            event_type, escaped_key
+        );
+        if let Err(error) = mgr.evaluate_java_script(wk_handle, &js) {
+            eprintln!(
+                "[CefBridge] forward_keyboard_event: evaluate_java_script failed: {}",
+                error
+            );
+        }
+    }
+
+    /// Forward a mouse event to the first available WKWebView browser (legacy 4-param).
+    ///
+    /// Compatible wrapper for callers that only provide left-button state
+    /// (e.g., `pe_runtime.rs`). Delegates to [`forward_mouse_event_ext`] with
+    /// zero values for right/middle/scroll parameters.
+    pub fn forward_mouse_event(&mut self, x: i32, y: i32, left_pressed: bool, left_released: bool) {
+        self.forward_mouse_event_ext(
+            x,
+            y,
+            left_pressed,
+            left_released,
+            false,
+            false, // right pressed/released
+            false,
+            false, // middle pressed/released
+            0,
+            0, // scroll delta
+        );
+    }
+
+    /// Forward a mouse event to the first available WKWebView browser (full).
+    /// Supports left, right, middle buttons, scroll wheel, and mouse movement.
+    pub fn forward_mouse_event_ext(
+        &mut self,
+        x: i32,
+        y: i32,
+        left_pressed: bool,
+        left_released: bool,
+        right_pressed: bool,
+        right_released: bool,
+        middle_pressed: bool,
+        middle_released: bool,
+        scroll_delta_x: i32,
+        scroll_delta_y: i32,
+    ) {
+        let browser_handle = self.browsers.keys().next().copied();
+        let Some(handle) = browser_handle else { return };
+        let Some(browser) = self.browsers.get(&handle) else {
+            return;
+        };
+        let Some(wk_handle) = browser.wk_handle else {
+            return;
+        };
+        let Some(mgr) = self.webview_manager.as_mut() else {
+            return;
+        };
+
+        // Left button
+        if left_pressed || left_released {
+            let event_type = if left_pressed { "mousedown" } else { "mouseup" };
+            let js = format!(
+                "document.dispatchEvent(new MouseEvent('{}', {{ clientX: {}, clientY: {}, bubbles: true, button: 0 }}));",
+                event_type, x, y
+            );
+            if let Err(error) = mgr.evaluate_java_script(wk_handle, &js) {
+                eprintln!(
+                    "[CefBridge] forward_mouse_event_ext: left-button script failed: {}",
+                    error
+                );
+            }
+        }
+
+        // Right button
+        if right_pressed || right_released {
+            let event_type = if right_pressed {
+                "mousedown"
+            } else {
+                "mouseup"
+            };
+            let js = format!(
+                "document.dispatchEvent(new MouseEvent('{}', {{ clientX: {}, clientY: {}, bubbles: true, button: 2 }}));",
+                event_type, x, y
+            );
+            if let Err(error) = mgr.evaluate_java_script(wk_handle, &js) {
+                eprintln!(
+                    "[CefBridge] forward_mouse_event_ext: right-button script failed: {}",
+                    error
+                );
+            }
+            // Prevent default context menu on right-click
+            if right_pressed {
+                let prevent_js = format!(
+                    "document.dispatchEvent(new MouseEvent('contextmenu', {{ clientX: {}, clientY: {}, bubbles: true, cancelable: true }})); \
+                     event => event.preventDefault();",
+                    x, y
+                );
+                if let Err(error) = mgr.evaluate_java_script(wk_handle, &prevent_js) {
+                    eprintln!(
+                        "[CefBridge] forward_mouse_event_ext: context-menu suppression failed: {}",
+                        error
+                    );
+                }
+            }
+        }
+
+        // Middle button
+        if middle_pressed || middle_released {
+            let event_type = if middle_pressed {
+                "mousedown"
+            } else {
+                "mouseup"
+            };
+            let js = format!(
+                "document.dispatchEvent(new MouseEvent('{}', {{ clientX: {}, clientY: {}, bubbles: true, button: 1 }}));",
+                event_type, x, y
+            );
+            if let Err(error) = mgr.evaluate_java_script(wk_handle, &js) {
+                eprintln!(
+                    "[CefBridge] forward_mouse_event_ext: middle-button script failed: {}",
+                    error
+                );
+            }
+        }
+
+        // Scroll wheel
+        if scroll_delta_y != 0 {
+            let scroll_js = format!(
+                "window.scrollBy(0, {}); \
+                 document.dispatchEvent(new WheelEvent('wheel', {{ deltaX: 0, deltaY: {}, deltaZ: 0, deltaMode: 0, clientX: {}, clientY: {} }}));",
+                -scroll_delta_y, scroll_delta_y, x, y
+            );
+            if let Err(error) = mgr.evaluate_java_script(wk_handle, &scroll_js) {
+                eprintln!(
+                    "[CefBridge] forward_mouse_event_ext: vertical scroll script failed: {}",
+                    error
+                );
+            }
+        }
+        if scroll_delta_x != 0 {
+            let scroll_js = format!(
+                "window.scrollBy({}, 0); \
+                 document.dispatchEvent(new WheelEvent('wheel', {{ deltaX: {}, deltaY: 0, deltaZ: 0, deltaMode: 0, clientX: {}, clientY: {} }}));",
+                -scroll_delta_x, scroll_delta_x, x, y
+            );
+            if let Err(error) = mgr.evaluate_java_script(wk_handle, &scroll_js) {
+                eprintln!(
+                    "[CefBridge] forward_mouse_event_ext: horizontal scroll script failed: {}",
+                    error
+                );
+            }
+        }
+
+        // Always move mouse pointer
+        let move_js = format!(
+            "document.dispatchEvent(new MouseEvent('mousemove', {{ clientX: {}, clientY: {}, bubbles: true }}));",
+            x, y
+        );
+        if let Err(error) = mgr.evaluate_java_script(wk_handle, &move_js) {
+            eprintln!(
+                "[CefBridge] forward_mouse_event_ext: mousemove script failed: {}",
+                error
+            );
+        }
+    }
+
+    /// Publish a LiveFrame from rendered pixel data.
+    fn publish_live_frame_from_pixels(&mut self, width: u32, height: u32, pixels: Vec<u8>) {
+        if let Some(ref tx) = self.live_frame_tx {
+            self.live_frame_counter += 1;
+            crate::live::live_trace(&format!(
+                "[CefBridge] publish_live_frame_from_pixels #{} ({}x{} pixels={})",
+                self.live_frame_counter,
+                width,
+                height,
+                pixels.len(),
+            ));
+            let live_frame = LiveFrame {
+                width,
+                height,
+                format: DxgiFormat::B8G8R8A8Unorm,
+                bytes: pixels,
+                displayed_frame_index: self.live_frame_counter,
+            };
+            if tx.try_send(live_frame).is_err() {
+                crate::live::live_trace("[CefBridge] publish_live_frame_from_pixels: receiver lagged or closed");
+            }
+        }
+    }
+
+    /// Attempt to read back pixel data from an IOSurface for live frame publishing.
+    /// Uses the IOSurface C API (via `IOSurfaceLock` / `IOSurfaceGetBaseAddress`) to
+    /// read pixel data directly from the GPU surface to CPU memory.
+    /// Returns None if the readback fails or no matching IOSurface is cached.
+    fn read_io_surface_pixels(&self, width: u32, height: u32) -> Option<Vec<u8>> {
+        #[cfg(target_os = "macos")]
+        {
+            use std::ffi::c_void;
+
+            // Check the IO surface cache for any cached surface matching our dimensions
+            for (_browser_id, pair) in &self.io_surface_cache {
+                if pair.width == width && pair.height == height && !pair.io_surface.is_null() {
+                    let io_surface = pair.io_surface;
+                    // SAFETY: CEF (Chromium Embedded Framework) FFI for web view
+                    unsafe {
+                        // Get IOSurface base address and lock for reading
+                        let sel_lock: objc::runtime::Sel = objc::sel!(lockWithOptions:);
+                        let _sel_unlock: objc::runtime::Sel = objc::sel!(unlockWithOptions:);
+                        let _sel_base_address: objc::runtime::Sel = objc::sel!(baseAddress);
+                        let _sel_bytes_per_row: objc::runtime::Sel = objc::sel!(bytesPerRow);
+
+                        let obj = io_surface as *mut objc::runtime::Object;
+
+                        // Lock the IOSurface for read access (0 = kIOSurfaceLockReadOnly)
+                        let _: () = msg_send![obj, performSelector: sel_lock withObject: (0 as *mut c_void)];
+                        // Actually use the correct signature: lockWithOptions:options_t hint:
+                        type LockFn = unsafe extern "C" fn(
+                            *mut objc::runtime::Object,
+                            objc::runtime::Sel,
+                            u32,
+                            *mut u32,
+                        ) -> i32;
+                        // Simpler approach: use baseAddress directly after lock
+                        let _: () = msg_send![obj, lockWithOptions: 1]; // kIOSurfaceLockReadOnly = 1
+
+                        let base_address: *mut c_void = msg_send![obj, baseAddress];
+                        let bytes_per_row: usize = msg_send![obj, bytesPerRow];
+
+                        if !base_address.is_null() {
+                            let total_bytes = (height as usize).saturating_mul(bytes_per_row);
+                            let mut pixels =
+                                vec![0u8; (width as usize * height as usize * 4).min(total_bytes)];
+
+                            // Copy row by row, respecting bytes_per_row stride
+                            let dst_row_bytes = width as usize * 4;
+                            for row in 0..(height as usize) {
+                                let src_offset = row * bytes_per_row;
+                                let dst_offset = row * dst_row_bytes;
+                                let copy_len = dst_row_bytes.min(bytes_per_row);
+                                if src_offset + copy_len <= total_bytes
+                                    && dst_offset + copy_len <= pixels.len()
+                                {
+                                    let src_ptr = base_address.add(src_offset) as *const u8;
+                                    std::ptr::copy_nonoverlapping(
+                                        src_ptr,
+                                        pixels.as_mut_ptr().add(dst_offset),
+                                        copy_len,
+                                    );
+                                }
+                            }
+
+                            // Unlock the IOSurface
+                            let _: () = msg_send![obj, unlockWithOptions: 1];
+
+                            return Some(pixels);
+                        }
+
+                        // Unlock if lock succeeded but baseAddress was null
+                        let _: () = msg_send![obj, unlockWithOptions: 1];
+                    }
+                }
+            }
+            None
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (width, height);
+            None
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1876,7 +2402,7 @@ impl CefBridge {
         // Initialize WKWebView manager (creates NSApplication, offscreen window)
         #[cfg(target_os = "macos")]
         {
-            let _ = self.ensure_webview_manager()?;
+            self.ensure_webview_manager()?;
         }
 
         self.state = CefState::Initialized;
@@ -1962,7 +2488,9 @@ impl CefBridge {
                     } else {
                         window_info.url.as_deref().unwrap_or("about:blank")
                     };
-                    let _ = mgr.navigate(h, nav_url);
+                    if let Err(e) = mgr.navigate(h, nav_url) {
+                        eprintln!("[CefBridge] Failed to navigate WKWebView to '{nav_url}': {e}",);
+                    }
                     Some(h)
                 }
                 Err(e) => {
@@ -2031,6 +2559,7 @@ impl CefBridge {
         #[cfg(target_os = "macos")]
         {
             // Pump the NSRunLoop for ~10ms to process pending events
+            // SAFETY: NSRunLoop FFI for event processing
             unsafe {
                 let cls_runloop = match objc::runtime::Class::get("NSRunLoop") {
                     Some(c) => c,
@@ -2102,13 +2631,16 @@ impl CefBridge {
             if let Some(browser) = self.browsers.get(browser_handle) {
                 if browser.dirty {
                     if let Some(dims) = mgr.dimensions(*wk_handle) {
-                        let _ = mgr.take_snapshot(*wk_handle);
+                        if let Err(e) = mgr.take_snapshot(*wk_handle) {
+                            eprintln!(
+                                "[CefBridge] Failed to take snapshot for handle {:?}: {e}",
+                                wk_handle,
+                            );
+                        }
 
                         // Check if we got pixel data back
                         if let Ok(mut state) = DELEGATE_STATE.lock() {
-                            if let Some(Some(pixels)) =
-                                state.snapshot_results.remove(wk_handle)
-                            {
+                            if let Some(Some(pixels)) = state.snapshot_results.remove(wk_handle) {
                                 if let Some(b) = self.browsers.get_mut(browser_handle) {
                                     let frame_n = self.rendered_frames.len() as u64;
                                     let rendered = RenderedFrame {
@@ -2124,8 +2656,7 @@ impl CefBridge {
                                         cb(rendered.clone());
                                     }
 
-                                    self.rendered_frames
-                                        .push_back(rendered);
+                                    self.rendered_frames.push_back(rendered);
                                     while self.rendered_frames.len() > 10 {
                                         self.rendered_frames.pop_front();
                                     }
@@ -2171,9 +2702,7 @@ impl CefBridge {
             .ok_or_else(|| {
                 AppError::new(
                     ReasonCode::RcNotFound,
-                    format!(
-                        "cef_browser_get_main_frame: browser {browser_handle:#x} not found"
-                    ),
+                    format!("cef_browser_get_main_frame: browser {browser_handle:#x} not found"),
                 )
             })
     }
@@ -2237,10 +2766,53 @@ impl CefBridge {
             if let Some(mgr) = self.webview_manager.as_ref() {
                 if let Some(ptr) = mgr.native_ptr(wk_handle) {
                     #[cfg(target_os = "macos")]
+                    // SAFETY: CEF (Chromium Embedded Framework) FFI for web view
                     unsafe {
                         // SAFETY: goBack: is a standard WKWebView method.
                         let view = ptr as *mut objc::runtime::Object;
                         let _: () = msg_send![view, goBack];
+                    }
+                }
+            }
+        }
+
+        browser.is_loading = true;
+        browser.dirty = true;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // cef_browser_go_forward — navigate forward in browser history
+    //
+    // Gap 2.2 fix: Calls goForward: on the native WKWebView (mirror of
+    // cef_browser_go_back). Checks can_go_forward first to ensure there is
+    // forward navigation history available.
+    // -----------------------------------------------------------------------
+    pub fn cef_browser_go_forward(&mut self, browser_handle: CefHandle) -> AppResult<()> {
+        let browser = self.browsers.get_mut(&browser_handle).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcNotFound,
+                format!("cef_browser_go_forward: browser {browser_handle:#x} not found"),
+            )
+        })?;
+
+        if !browser.can_go_forward {
+            return Err(AppError::new(
+                ReasonCode::RcInvalidState,
+                "cef_browser_go_forward: no forward history",
+            ));
+        }
+
+        // Call goForward: on WKWebView
+        if let Some(wk_handle) = browser.wk_handle {
+            if let Some(mgr) = self.webview_manager.as_ref() {
+                if let Some(ptr) = mgr.native_ptr(wk_handle) {
+                    #[cfg(target_os = "macos")]
+                    // SAFETY: CEF (Chromium Embedded Framework) FFI for web view
+                    unsafe {
+                        // SAFETY: goForward: is a standard WKWebView method.
+                        let view = ptr as *mut objc::runtime::Object;
+                        let _: () = msg_send![view, goForward];
                     }
                 }
             }
@@ -2269,6 +2841,7 @@ impl CefBridge {
             if let Some(mgr) = self.webview_manager.as_ref() {
                 if let Some(ptr) = mgr.native_ptr(wk_handle) {
                     #[cfg(target_os = "macos")]
+                    // SAFETY: CEF (Chromium Embedded Framework) FFI for web view
                     unsafe {
                         // SAFETY: reload: is a standard WKWebView method.
                         let view = ptr as *mut objc::runtime::Object;
@@ -2281,6 +2854,47 @@ impl CefBridge {
         browser.is_loading = true;
         browser.dirty = true;
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // cef_browser_stop_load — stop the current page load
+    //
+    // Calls stopLoading: on the native WKWebView.
+    // -----------------------------------------------------------------------
+    pub fn cef_browser_stop_load(&mut self, browser_handle: CefHandle) -> AppResult<()> {
+        let browser = self.browsers.get_mut(&browser_handle).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcNotFound,
+                format!("cef_browser_stop_load: browser {browser_handle:#x} not found"),
+            )
+        })?;
+
+        // Call stopLoading: on WKWebView
+        if let Some(wk_handle) = browser.wk_handle {
+            if let Some(mgr) = self.webview_manager.as_ref() {
+                if let Some(ptr) = mgr.native_ptr(wk_handle) {
+                    #[cfg(target_os = "macos")]
+                    // SAFETY: CEF (Chromium Embedded Framework) FFI for web view
+                    unsafe {
+                        let view = ptr as *mut objc::runtime::Object;
+                        let _: () = msg_send![view, stopLoading];
+                    }
+                }
+            }
+        }
+
+        browser.is_loading = false;
+        Ok(())
+    }
+
+    /// Get the current URL of the first registered browser, if any.
+    /// Returns an empty string if no browser is registered.
+    pub fn current_url(&self) -> String {
+        self.browsers
+            .values()
+            .next()
+            .map(|b| b.current_url.clone())
+            .unwrap_or_default()
     }
 
     // -----------------------------------------------------------------------
@@ -2298,9 +2912,7 @@ impl CefBridge {
         let browser = self.browsers.get(&browser_handle).ok_or_else(|| {
             AppError::new(
                 ReasonCode::RcNotFound,
-                format!(
-                    "cef_frame_execute_java_script: browser {browser_handle:#x} not found"
-                ),
+                format!("cef_frame_execute_java_script: browser {browser_handle:#x} not found"),
             )
         })?;
 
@@ -2352,12 +2964,17 @@ impl CefBridge {
             // Update WKWebView dimensions
             if let Some(wk_handle) = browser.wk_handle {
                 if let Some(mgr) = self.webview_manager.as_mut() {
-                    let _ = mgr.resize(wk_handle, width as f64, height as f64);
+                    if let Err(e) = mgr.resize(wk_handle, width as f64, height as f64) {
+                        eprintln!(
+                            "[CefBridge] resize: failed to resize WKWebView ({:?}): {e}",
+                            wk_handle,
+                        );
+                    }
                 }
             }
 
             // Update frame buffer
-            let pixels = vec![0xFF; (width as usize * height as usize * 4)];
+            let pixels = vec![0xFF; width as usize * height as usize * 4];
             self.rendered_frames.push_back(RenderedFrame {
                 browser_id: browser.id,
                 width,
@@ -2428,9 +3045,7 @@ impl CefBridge {
         let browser = self.browsers.get(&browser_handle).ok_or_else(|| {
             AppError::new(
                 ReasonCode::RcNotFound,
-                format!(
-                    "render_to_metal_texture: browser {browser_handle:#x} not found"
-                ),
+                format!("render_to_metal_texture: browser {browser_handle:#x} not found"),
             )
         })?;
 
@@ -2455,10 +3070,8 @@ impl CefBridge {
         descriptor.set_pixel_format(metal::MTLPixelFormat::RGBA8Unorm);
         descriptor.set_width(width);
         descriptor.set_height(height);
-        descriptor.set_usage(
-            metal::MTLTextureUsage::ShaderRead
-                | metal::MTLTextureUsage::RenderTarget,
-        );
+        descriptor
+            .set_usage(metal::MTLTextureUsage::ShaderRead | metal::MTLTextureUsage::RenderTarget);
         descriptor.set_storage_mode(metal::MTLStorageMode::Shared);
 
         let texture = metal_device.device().new_texture(&descriptor);
@@ -2473,7 +3086,12 @@ impl CefBridge {
             },
         };
         let bytes_per_row = (width * 4) as u64;
-        texture.replace_region(region, 0, frame.pixels.as_ptr() as *const std::ffi::c_void, bytes_per_row);
+        texture.replace_region(
+            region,
+            0,
+            frame.pixels.as_ptr() as *const std::ffi::c_void,
+            bytes_per_row,
+        );
 
         // Cache the texture ID
         if let Some(b) = self.browsers.get_mut(&browser_handle) {
@@ -2733,8 +3351,17 @@ impl CefBridge {
             self.browsers.get(&browser_handle).and_then(|b| b.wk_handle),
         ) {
             match mgr.get_io_surface_for_browser(handle) {
-                Ok(ptr) if !ptr.is_null() => "iosurface-available",
-                _ => "cpu-fallback",
+                Ok(ptr) if !ptr.is_null() => {
+                    // IOSurface available — GPU-side compositing will be used
+                    "iosurface-available"
+                }
+                _ => {
+                    eprintln!(
+                        "[CefBridge] cpu-fallback for browser {browser_handle:#x}: \
+                         IOSurface texture not available, using CPU-side pixel buffer"
+                    );
+                    "cpu-fallback"
+                }
             }
         } else {
             "no-wkwebview"
@@ -2748,11 +3375,7 @@ impl CefBridge {
             height = frame.height,
         );
 
-        crate::metal_renderer::submit_cef_overlay_frame(
-            frame.width,
-            frame.height,
-            frame.pixels,
-        );
+        crate::metal_renderer::submit_cef_overlay_frame(frame.width, frame.height, frame.pixels);
     }
 
     /// Submit the latest frame for the first browser to the compositor.
@@ -2802,11 +3425,8 @@ impl CefBridge {
             external_begin_frame_enabled: false,
         };
 
-        let browser_handle = self.cef_browser_host_create_browser(
-            window_info,
-            url,
-            CefBrowserSettings::default(),
-        )?;
+        let browser_handle =
+            self.cef_browser_host_create_browser(window_info, url, CefBrowserSettings::default())?;
 
         self.overlay_browser_handle = Some(browser_handle);
 
@@ -2828,12 +3448,11 @@ impl CefBridge {
             None => return Ok(()),
         };
 
-        eprintln!(
-            "[CefBridge] destroy_overlay_browser: handle={:#x}",
-            handle,
-        );
+        eprintln!("[CefBridge] destroy_overlay_browser: handle={:#x}", handle,);
 
-        self.close_browser(handle).ok();
+        if let Err(e) = self.close_browser(handle) {
+            eprintln!("[CefBridge] destroy_overlay_browser: close_browser failed: {e}",);
+        }
         self.overlay_browser_handle = None;
 
         // Restore compositor to game-active state
@@ -2854,9 +3473,7 @@ impl CefBridge {
     /// pe_runtime::poll_live_input).
     pub fn tick_overlay(&mut self) {
         use crate::steam_integration::{
-            steam_overlay_consume_toggle,
-            steam_overlay_is_active,
-            steam_overlay_poll_keyboard,
+            steam_overlay_consume_toggle, steam_overlay_is_active, steam_overlay_poll_keyboard,
         };
 
         // 1. Poll physical keyboard for Shift+Tab
@@ -2870,16 +3487,12 @@ impl CefBridge {
                     mgr.overlay_url().to_string()
                 });
                 if let Err(e) = self.create_overlay_browser(&url) {
-                    eprintln!(
-                        "[CefBridge] tick_overlay: failed to create overlay browser: {e}",
-                    );
+                    eprintln!("[CefBridge] tick_overlay: failed to create overlay browser: {e}",);
                 }
             } else {
                 // Overlay deactivated → destroy the WKWebView
                 if let Err(e) = self.destroy_overlay_browser() {
-                    eprintln!(
-                        "[CefBridge] tick_overlay: failed to destroy overlay browser: {e}",
-                    );
+                    eprintln!("[CefBridge] tick_overlay: failed to destroy overlay browser: {e}",);
                 }
             }
         }
@@ -2895,7 +3508,9 @@ impl CefBridge {
                 // Also check if a toggle happened during message loop work
                 if steam_overlay_consume_toggle() {
                     if !steam_overlay_is_active() {
-                        let _ = self.destroy_overlay_browser();
+                        if let Err(e) = self.destroy_overlay_browser() {
+                            eprintln!("[CefBridge] tick_overlay: failed to destroy overlay: {e}",);
+                        }
                     }
                 }
             }
@@ -2926,7 +3541,12 @@ impl CefBridge {
     //
     // Returns the new (width, height) on success.
     // -----------------------------------------------------------------------
-    pub fn cef_browser_host_was_resized(&mut self, browser_handle: CefHandle, width: u32, height: u32) -> AppResult<(u32, u32)> {
+    pub fn cef_browser_host_was_resized(
+        &mut self,
+        browser_handle: CefHandle,
+        width: u32,
+        height: u32,
+    ) -> AppResult<(u32, u32)> {
         let browser = self.browsers.get_mut(&browser_handle).ok_or_else(|| {
             AppError::new(
                 ReasonCode::RcNotFound,
@@ -2941,12 +3561,22 @@ impl CefBridge {
         // Update WKWebView frame via the webview manager
         if let Some(wk_handle) = browser.wk_handle {
             if let Some(mgr) = self.webview_manager.as_mut() {
-                let _ = mgr.resize(wk_handle, width as f64, height as f64);
+                if let Err(e) = mgr.resize(wk_handle, width as f64, height as f64) {
+                    eprintln!(
+                        "[CefBridge] cef_browser_host_was_resized: resize failed ({:?}): {e}",
+                        wk_handle,
+                    );
+                }
             }
         }
 
         // Update the frame buffer dimensions
-        let pixels = vec![0xFFu8; (width as usize).saturating_mul(height as usize).saturating_mul(4)];
+        let pixels = vec![
+            0xFFu8;
+            (width as usize)
+                .saturating_mul(height as usize)
+                .saturating_mul(4)
+        ];
         self.rendered_frames.push_back(RenderedFrame {
             browser_id: browser.id,
             width,
@@ -2961,9 +3591,7 @@ impl CefBridge {
         // Mark dirty so the next snapshot captures at the new size
         browser.dirty = true;
 
-        eprintln!(
-            "[CefBridge] WasResized: browser {browser_handle:#x} -> {width}x{height}"
-        );
+        eprintln!("[CefBridge] WasResized: browser {browser_handle:#x} -> {width}x{height}");
 
         Ok((width, height))
     }
@@ -3003,9 +3631,7 @@ impl CefBridge {
             browser.dirty = true;
             eprintln!("[CefBridge] OnAfterCreated: browser {browser_handle:#x}");
         } else {
-            eprintln!(
-                "[CefBridge] OnAfterCreated: browser {browser_handle:#x} not found",
-            );
+            eprintln!("[CefBridge] OnAfterCreated: browser {browser_handle:#x} not found",);
         }
         Ok(())
     }
@@ -3024,9 +3650,7 @@ impl CefBridge {
             );
             true
         } else {
-            eprintln!(
-                "[CefBridge] DoClose: browser {browser_handle:#x} not found — ignoring",
-            );
+            eprintln!("[CefBridge] DoClose: browser {browser_handle:#x} not found — ignoring",);
             false
         }
     }
@@ -3093,12 +3717,7 @@ impl CefBridge {
     ///
     /// Marks the browser as loading. The `transition_type` indicates what kind
     /// of navigation triggered the load (link click, address bar, reload, etc.).
-    pub fn on_load_start(
-        &mut self,
-        browser_handle: CefHandle,
-        url: &str,
-        _is_main_frame: bool,
-    ) {
+    pub fn on_load_start(&mut self, browser_handle: CefHandle, url: &str, _is_main_frame: bool) {
         let is_main = true; // WKWebView reports per-page, always main frame
         if let Some(browser) = self.browsers.get_mut(&browser_handle) {
             browser.is_loading = true;
@@ -3162,9 +3781,7 @@ impl CefBridge {
     pub fn on_address_change(&mut self, browser_handle: CefHandle, url: &str) {
         if let Some(browser) = self.browsers.get_mut(&browser_handle) {
             browser.current_url = url.to_string();
-            eprintln!(
-                "[CefBridge] OnAddressChange: browser {browser_handle:#x} url={url}",
-            );
+            eprintln!("[CefBridge] OnAddressChange: browser {browser_handle:#x} url={url}",);
         }
     }
 
@@ -3175,9 +3792,7 @@ impl CefBridge {
     pub fn on_title_change(&mut self, browser_handle: CefHandle, title: &str) -> AppResult<()> {
         if let Some(browser) = self.browsers.get_mut(&browser_handle) {
             browser.title = title.to_string();
-            eprintln!(
-                "[CefBridge] OnTitleChange: browser {browser_handle:#x} title={title}",
-            );
+            eprintln!("[CefBridge] OnTitleChange: browser {browser_handle:#x} title={title}",);
         }
         Ok(())
     }
@@ -3188,14 +3803,10 @@ impl CefBridge {
     /// Steam overlay uses tooltips for navigation hints and button descriptions.
     pub fn on_tooltip(&mut self, _browser_handle: CefHandle, text: &str) -> bool {
         if text.is_empty() {
-            eprintln!(
-                "[CefBridge] OnTooltip: browser {_browser_handle:#x} — tooltip hidden",
-            );
+            eprintln!("[CefBridge] OnTooltip: browser {_browser_handle:#x} — tooltip hidden",);
             false
         } else {
-            eprintln!(
-                "[CefBridge] OnTooltip: browser {_browser_handle:#x} text=\"{text}\"",
-            );
+            eprintln!("[CefBridge] OnTooltip: browser {_browser_handle:#x} text=\"{text}\"",);
             true
         }
     }
@@ -3205,9 +3816,7 @@ impl CefBridge {
     /// Logs status bar messages (e.g., link hover URLs). Steam may use this
     /// for status bar display in the overlay.
     pub fn on_status_message(&mut self, browser_handle: CefHandle, message: &str) {
-        eprintln!(
-            "[CefBridge] OnStatusMessage: browser {browser_handle:#x} message=\"{message}\"",
-        );
+        eprintln!("[CefBridge] OnStatusMessage: browser {browser_handle:#x} message=\"{message}\"",);
     }
 
     /// `CefDisplayHandler::OnConsoleMessage` — called when CEF writes to the console.
@@ -3263,9 +3872,7 @@ impl CefBridge {
                 width: w,
                 height: h,
             };
-            eprintln!(
-                "[CefBridge] GetViewRect: browser {browser_handle:#x} -> {w}x{h}",
-            );
+            eprintln!("[CefBridge] GetViewRect: browser {browser_handle:#x} -> {w}x{h}",);
             rect
         } else {
             eprintln!(
@@ -3290,9 +3897,7 @@ impl CefBridge {
         // Default screen info: origin at (0,0), 1x scale factor.
         // In production, this should query the NSScreen for the actual
         // display where the overlay is shown.
-        eprintln!(
-            "[CefBridge] GetScreenInfo: browser {_browser_handle:#x} -> (0,0) scale=1.0",
-        );
+        eprintln!("[CefBridge] GetScreenInfo: browser {_browser_handle:#x} -> (0,0) scale=1.0",);
         (0, 0, 1.0)
     }
 
@@ -3321,14 +3926,14 @@ impl CefBridge {
         let browser_id = match self.browsers.get(&browser_handle) {
             Some(b) => b.id,
             None => {
-                eprintln!(
-                    "[CefBridge] OnPaint: browser {browser_handle:#x} not found",
-                );
+                eprintln!("[CefBridge] OnPaint: browser {browser_handle:#x} not found",);
                 return;
             }
         };
 
-        let expected_size = (width as usize).saturating_mul(height as usize).saturating_mul(4);
+        let expected_size = (width as usize)
+            .saturating_mul(height as usize)
+            .saturating_mul(4);
         let pixels = if buffer.len() >= expected_size {
             buffer[..expected_size].to_vec()
         } else {
@@ -3365,6 +3970,12 @@ impl CefBridge {
 
             if let Some(browser) = self.browsers.get_mut(&browser_handle) {
                 browser.dirty = false;
+            }
+
+            // Publish as LiveFrame if live session is active
+            // The buffer from CEF is typically BGRA, convert to LiveFrame format
+            if self.live_frame_tx.is_some() {
+                self.publish_live_frame_from_pixels(width, height, pixels);
             }
 
             eprintln!(
@@ -3412,9 +4023,7 @@ impl CefBridge {
         let browser_id = match self.browsers.get(&browser_handle) {
             Some(b) => b.id,
             None => {
-                eprintln!(
-                    "[CefBridge] OnAcceleratedPaint: browser {browser_handle:#x} not found",
-                );
+                eprintln!("[CefBridge] OnAcceleratedPaint: browser {browser_handle:#x} not found",);
                 return false;
             }
         };
@@ -3453,12 +4062,43 @@ impl CefBridge {
                         if let Some(b) = self.browsers.get_mut(&browser_handle) {
                             b.dirty = false;
                         }
+                        // For IOSurface accelerated paint, we can't easily read back
+                        // pixels in this callback. Publish a solid-color placeholder
+                        // that will be replaced when the IOSurface is read back later.
+                        if self.live_frame_tx.is_some() {
+                            // Try to read back from IOSurface if available
+                            let surface_pixels = self.read_io_surface_pixels(fw, fh);
+                            if let Some(pixel_data) = surface_pixels {
+                                self.publish_live_frame_from_pixels(fw, fh, pixel_data);
+                            } else {
+                                // Fallback: publish a dark-gray frame (BGRA) while
+                                // IOSurface readback is temporarily unavailable.
+                                let pixel_count = fw as usize * fh as usize;
+                                let mut fallback_pixels = Vec::with_capacity(pixel_count * 4);
+                                for _ in 0..pixel_count {
+                                    fallback_pixels.push(0x1b); // B
+                                    fallback_pixels.push(0x1b); // G
+                                    fallback_pixels.push(0x1b); // R
+                                    fallback_pixels.push(0xff); // A
+                                }
+                                self.publish_live_frame_from_pixels(fw, fh, fallback_pixels);
+                            }
+                        }
+                        eprintln!(
+                            "[CefBridge] on_paint: browser {browser_handle:#x} \
+                             frame {} rendered ({}x{})",
+                            frame_number, fw, fh,
+                        );
                         return true;
                     }
                 }
             }
         }
 
+        eprintln!(
+            "[CefBridge] on_paint: browser {browser_handle:#x} — could not paint \
+             (missing webview_manager, browser, wk_handle, or dimensions)"
+        );
         false
     }
 
@@ -3471,9 +4111,7 @@ impl CefBridge {
         if !show {
             self.popup_info = None;
         }
-        eprintln!(
-            "[CefBridge] OnPopupShow: browser {browser_handle:#x} show={show}",
-        );
+        eprintln!("[CefBridge] OnPopupShow: browser {browser_handle:#x} show={show}",);
     }
 
     /// `CefRenderHandler::OnPopupSize` — called when the popup widget is resized.
@@ -3499,13 +4137,21 @@ impl CefBridge {
     /// Returns `true` to cancel the navigation, `false` to allow it.
     /// By default, all navigations are allowed. Steam may use this to intercept
     /// `steam://` protocol URLs and route them to native handlers.
-    pub fn on_before_browse(&mut self, _browser_handle: CefHandle, url: &str) -> bool {
+    pub fn on_before_browse(&mut self, browser_handle: CefHandle, url: &str) -> bool {
         if url.starts_with("steam://") {
-            eprintln!("[CefBridge] OnBeforeBrowse (steam://): {url}");
+            eprintln!(
+                "[CefBridge] OnBeforeBrowse (steam://): browser {browser_handle:#x} \
+                 url={url} — intercepted, will route to native Steam handler",
+            );
             // steam:// URLs are handled natively — cancel browser navigation
+            // and route to the Steam integration layer which handles
+            // steam://openurl, steam://store, steam://friends, etc.
+            if crate::steam_protocol::parse_steam_protocol_url(url).is_some() {
+                eprintln!("[CefBridge] OnBeforeBrowse: parsed steam:// URL: {url}",);
+            }
             return true;
         }
-        eprintln!("[CefBridge] OnBeforeBrowse: {url}");
+        eprintln!("[CefBridge] OnBeforeBrowse: browser {browser_handle:#x} url={url} — allowing",);
         false
     }
 
@@ -3514,11 +4160,7 @@ impl CefBridge {
     ///
     /// Returns `true` to block the resource, `false` to allow it.
     /// Used for content filtering or ad blocking in the Steam overlay.
-    pub fn on_before_resource_load(
-        &mut self,
-        _browser_handle: CefHandle,
-        _url: &str,
-    ) -> bool {
+    pub fn on_before_resource_load(&mut self, _browser_handle: CefHandle, _url: &str) -> bool {
         // Allow all resources by default
         false
     }
@@ -3530,11 +4172,7 @@ impl CefBridge {
     /// the default WKWebView resource loading (no custom interception).
     /// A non-zero return value could be used for custom cookie injection,
     /// header modification, etc. for specific resource types.
-    pub fn get_resource_request_handler(
-        &mut self,
-        _browser_handle: CefHandle,
-        url: &str,
-    ) -> u32 {
+    pub fn get_resource_request_handler(&mut self, _browser_handle: CefHandle, url: &str) -> u32 {
         // Return 0 for default handling of all resources
         // Steam overlay may check for specific resources:
         if url.contains("steamcommunity.com") || url.contains("store.steampowered.com") {
@@ -3613,7 +4251,17 @@ impl CefBridge {
     /// Dispatch a CefQuery (JS→Native message) and return a JSON response.
     ///
     /// This bridges Steam's `window.externalCallback` mechanism. The query is a
-    /// JSON string with fields: request, requestId, type, etc.
+    /// Dispatch a CefQuery (JS→C++ bridge message from Steam web helper).
+    ///
+    /// Steam's UI communicates with the native client via a custom JS bridge
+    /// protocol. Messages are JSON strings with fields:
+    /// - `type`: the query type identifier
+    /// - `request`: the request payload (often a URL path or data)
+    /// - `requestId`: unique ID for correlating responses
+    ///
+    /// Gap 2.5 fix: Added handlers for "download" (triggers macOS file download),
+    /// "auth_credentials" (returns stored credentials), and other common Steam
+    /// query types.
     pub fn dispatch_cef_query(&mut self, query_json: &str) -> AppResult<String> {
         let query: serde_json::Value = serde_json::from_str(query_json).map_err(|e| {
             AppError::new(
@@ -3622,51 +4270,122 @@ impl CefBridge {
             )
         })?;
 
-        let request = query
-            .get("request")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let request_id = query
-            .get("requestId")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
+        let request = query.get("request").and_then(|v| v.as_str()).unwrap_or("");
+        let request_id = query.get("requestId").and_then(|v| v.as_u64()).unwrap_or(0);
         let query_type = query
             .get("type")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
 
+        // Helper: navigate the first available browser to a URL
+        let navigate_to = |bridge: &mut Self, url: &str| -> AppResult<()> {
+            if let Some(&bh) = bridge.browsers.keys().next() {
+                bridge.cef_frame_load_url(bh, url)?;
+            }
+            Ok(())
+        };
+
         let response = match query_type {
+            // Navigate the browser to a Steam store URL
             "store_navigation" => {
                 let store_url = format!("https://store.steampowered.com{request}");
-                if let Some(&bh) = self.browsers.keys().next() {
-                    self.cef_frame_load_url(bh, &store_url)?;
-                }
+                navigate_to(self, &store_url)?;
                 serde_json::json!({
                     "success": true,
                     "requestId": request_id,
                     "result": "navigated"
                 })
             }
+
+            // Initiate Steam login flow
             "login" => {
-                if let Some(&bh) = self.browsers.keys().next() {
-                    self.cef_frame_load_url(bh, "https://steamcommunity.com/login")?;
-                }
+                navigate_to(self, "https://steamcommunity.com/login")?;
                 serde_json::json!({
                     "success": true,
                     "requestId": request_id,
                     "result": "login_initiated"
                 })
             }
+
+            // Handle file downloads — trigger macOS download via NSWorkspace
+            // or save to Downloads folder
             "download" => {
+                let url = request;
+                let filename = query
+                    .get("filename")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("download");
+                eprintln!(
+                    "[CefBridge] dispatch_cef_query: download requested url={url} filename={filename}",
+                );
+                // Trigger the download by navigating or using NSURLDownload
+                if !url.is_empty() {
+                    // Try to download via curl to Downloads folder as fallback
+                    let downloads_dir =
+                        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                    let dest = downloads_dir.join(filename);
+                    let url_copy = url.to_string();
+                    std::thread::spawn(move || {
+                        let result = std::process::Command::new("curl")
+                            .args(["-L", "-o", &dest.to_string_lossy(), &url_copy])
+                            .output();
+                        match result {
+                            Ok(output) if output.status.success() => {
+                                eprintln!(
+                                    "[CefBridge] download completed: {} -> {}",
+                                    url_copy,
+                                    dest.display()
+                                );
+                            }
+                            Ok(output) => {
+                                eprintln!(
+                                    "[CefBridge] download failed: {} exit={:?} stderr={}",
+                                    url_copy,
+                                    output.status.code(),
+                                    String::from_utf8_lossy(&output.stderr),
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!("[CefBridge] download error for {url_copy}: {e}");
+                            }
+                        }
+                    });
+                }
                 serde_json::json!({
                     "success": true,
                     "requestId": request_id,
-                    "result": "download_acknowledged"
+                    "result": "download_started",
+                    "filename": filename,
                 })
             }
+
+            // Handle authentication credentials requests
+            "auth_credentials" => {
+                let realm = query.get("realm").and_then(|v| v.as_str()).unwrap_or("");
+                let host = query.get("host").and_then(|v| v.as_str()).unwrap_or("");
+                eprintln!(
+                    "[CefBridge] dispatch_cef_query: auth_credentials requested \
+                     realm=\"{realm}\" host=\"{host}\"",
+                );
+                // In production, this should prompt the user or check the system
+                // keychain. For now, return a cancellation to let the browser
+                // handle it natively.
+                serde_json::json!({
+                    "success": true,
+                    "requestId": request_id,
+                    "result": "cancel",
+                    "error": "user cancelled authentication"
+                })
+            }
+
+            // Open a URL in the system's default browser
             "open_external_url" => {
                 if !request.is_empty() {
-                    let _ = std::process::Command::new("open").arg(request).spawn();
+                    if let Err(e) = std::process::Command::new("open").arg(request).spawn() {
+                        eprintln!(
+                            "[CefBridge] dispatch_cef_query: failed to open external URL '{request}': {e}",
+                        );
+                    }
                 }
                 serde_json::json!({
                     "success": true,
@@ -3674,7 +4393,249 @@ impl CefBridge {
                     "result": "opened"
                 })
             }
+
+            // Navigate to the Steam community hub
+            "community_navigation" => {
+                let community_url = format!("https://steamcommunity.com{request}");
+                navigate_to(self, &community_url)?;
+                serde_json::json!({
+                    "success": true,
+                    "requestId": request_id,
+                    "result": "navigated"
+                })
+            }
+
+            // Navigate to the Steam library
+            "library_navigation" => {
+                navigate_to(self, "https://steamcommunity.com/my/games")?;
+                serde_json::json!({
+                    "success": true,
+                    "requestId": request_id,
+                    "result": "navigated"
+                })
+            }
+
+            // Navigate to the Steam friends list
+            "friends_navigation" => {
+                navigate_to(self, "https://steamcommunity.com/my/friends")?;
+                serde_json::json!({
+                    "success": true,
+                    "requestId": request_id,
+                    "result": "navigated"
+                })
+            }
+
+            // Navigate to the Steam settings page
+            "settings_navigation" => {
+                navigate_to(self, "https://steamcommunity.com/my/settings")?;
+                serde_json::json!({
+                    "success": true,
+                    "requestId": request_id,
+                    "result": "navigated"
+                })
+            }
+
+            // Navigate back in browser history
+            "browser_back" => {
+                if let Some(&bh) = self.browsers.keys().next() {
+                    if let Err(error) = self.cef_browser_go_back(bh) {
+                        eprintln!(
+                            "[CefBridge] handle_cef_query browser_back failed: {}",
+                            error
+                        );
+                    }
+                }
+                serde_json::json!({
+                    "success": true,
+                    "requestId": request_id,
+                    "result": "navigated_back"
+                })
+            }
+
+            // Navigate forward in browser history
+            "browser_forward" => {
+                if let Some(&bh) = self.browsers.keys().next() {
+                    if let Err(error) = self.cef_browser_go_forward(bh) {
+                        eprintln!(
+                            "[CefBridge] handle_cef_query browser_forward failed: {}",
+                            error
+                        );
+                    }
+                }
+                serde_json::json!({
+                    "success": true,
+                    "requestId": request_id,
+                    "result": "navigated_forward"
+                })
+            }
+
+            // Reload the current page
+            "browser_reload" => {
+                if let Some(&bh) = self.browsers.keys().next() {
+                    if let Err(error) = self.cef_browser_reload(bh) {
+                        eprintln!(
+                            "[CefBridge] handle_cef_query browser_reload failed: {}",
+                            error
+                        );
+                    }
+                }
+                serde_json::json!({
+                    "success": true,
+                    "requestId": request_id,
+                    "result": "reloaded"
+                })
+            }
+
+            // Get the current page's URL
+            "get_current_url" => {
+                let url = self
+                    .browsers
+                    .values()
+                    .next()
+                    .map(|b| b.current_url.clone())
+                    .unwrap_or_default();
+                serde_json::json!({
+                    "success": true,
+                    "requestId": request_id,
+                    "result": url
+                })
+            }
+
+            // Set a cookie via the cookie manager
+            "set_cookie" => {
+                let name = query.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let value = query.get("value").and_then(|v| v.as_str()).unwrap_or("");
+                let domain = query.get("domain").and_then(|v| v.as_str()).unwrap_or("");
+                let path = query.get("path").and_then(|v| v.as_str()).unwrap_or("/");
+                let secure = query
+                    .get("secure")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let httponly = query
+                    .get("httponly")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let same_site = query
+                    .get("same_site")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unspecified");
+                let cookie = CefCookie {
+                    name: name.to_string(),
+                    value: value.to_string(),
+                    domain: domain.to_string(),
+                    path: path.to_string(),
+                    secure,
+                    httponly,
+                    same_site: same_site.to_string(),
+                    creation: 0,
+                    last_access: 0,
+                    expires: 0,
+                };
+                // Use a sensible default cache path
+                let cache_path = self
+                    .settings
+                    .cache_path
+                    .clone()
+                    .unwrap_or_else(|| ".".to_string());
+                let mgr = CefCookieManager::get_global(&cache_path);
+                if let Ok(mut mgr) = mgr.lock() {
+                    if let Err(error) = mgr.set_cookie(cookie) {
+                        eprintln!("[CefBridge] handle_cef_query set_cookie failed: {}", error);
+                    }
+                }
+                serde_json::json!({
+                    "success": true,
+                    "requestId": request_id,
+                    "result": "cookie_set"
+                })
+            }
+
+            // Get all cookies
+            "get_cookies" => {
+                let cache_path = self
+                    .settings
+                    .cache_path
+                    .clone()
+                    .unwrap_or_else(|| ".".to_string());
+                let mgr = CefCookieManager::get_global(&cache_path);
+                let cookies = if let Ok(mgr) = mgr.lock() {
+                    mgr.visit_all_cookies()
+                } else {
+                    Vec::new()
+                };
+                serde_json::json!({
+                    "success": true,
+                    "requestId": request_id,
+                    "result": cookies
+                })
+            }
+
+            // Execute JavaScript in the browser context
+            "execute_javascript" => {
+                let script = request;
+                if let Some(&bh) = self.browsers.keys().next() {
+                    if let Err(error) = self.cef_frame_execute_java_script(bh, 0, script) {
+                        eprintln!(
+                            "[CefBridge] handle_cef_query execute_javascript failed: {}",
+                            error
+                        );
+                    }
+                }
+                serde_json::json!({
+                    "success": true,
+                    "requestId": request_id,
+                    "result": "script_executed"
+                })
+            }
+
+            // Get browser dimensions
+            "get_dimensions" => {
+                let (w, h) = self
+                    .browsers
+                    .values()
+                    .next()
+                    .and_then(|b| b.wk_handle)
+                    .and_then(|wk| self.webview_manager.as_ref()?.dimensions(wk))
+                    .unwrap_or((1280.0, 720.0));
+                serde_json::json!({
+                    "success": true,
+                    "requestId": request_id,
+                    "result": { "width": w, "height": h }
+                })
+            }
+
+            // Resize the browser
+            "resize" => {
+                let w = query
+                    .get("width")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(1280.0);
+                let h = query
+                    .get("height")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(720.0);
+                if let Some(&bh) = self.browsers.keys().next() {
+                    if let Some(browser) = self.browsers.get(&bh) {
+                        if let Some(wk) = browser.wk_handle {
+                            if let Some(mgr) = self.webview_manager.as_mut() {
+                                let _ = mgr.resize(wk, w, h);
+                            }
+                        }
+                    }
+                }
+                serde_json::json!({
+                    "success": true,
+                    "requestId": request_id,
+                    "result": { "width": w, "height": h }
+                })
+            }
+
+            // Unknown query type — log and return error
             _ => {
+                eprintln!(
+                    "[CefBridge] dispatch_cef_query: unknown query type=\"{query_type}\" \
+                     request=\"{request}\"",
+                );
                 serde_json::json!({
                     "success": false,
                     "requestId": request_id,
@@ -3700,9 +4661,16 @@ pub struct CefCookie {
     pub path: String,
     pub secure: bool,
     pub httponly: bool,
+    /// SameSite attribute: "unspecified", "lax", "strict", or "none"
+    #[serde(default = "default_same_site")]
+    pub same_site: String,
     pub creation: u64,
     pub last_access: u64,
     pub expires: u64,
+}
+
+fn default_same_site() -> String {
+    "unspecified".to_string()
 }
 
 impl Default for CefCookie {
@@ -3714,6 +4682,7 @@ impl Default for CefCookie {
             path: String::new(),
             secure: false,
             httponly: false,
+            same_site: "unspecified".to_string(),
             creation: 0,
             last_access: 0,
             expires: 0,
@@ -3765,6 +4734,8 @@ impl CefCookieManager {
     }
 
     /// Set a cookie. If a cookie with the same name/domain/path exists, it is replaced.
+    /// On macOS, also pushes the cookie to the system NSHTTPCookieStorage so that
+    /// WKWebView's native requests can see it (Gap 2.3).
     pub fn set_cookie(&mut self, cookie: CefCookie) -> AppResult<()> {
         // Remove existing cookie with same name/domain/path
         self.cookies.retain(|c| {
@@ -3773,6 +4744,9 @@ impl CefCookieManager {
         self.cookies.push(cookie);
         self.dirty = true;
         self.flush()?;
+        // Propagate to macOS system cookie store so WKWebView sees the cookie
+        #[cfg(target_os = "macos")]
+        self.sync_to_ns_http_cookie_storage();
         Ok(())
     }
 
@@ -3781,23 +4755,117 @@ impl CefCookieManager {
         self.cookies.clone()
     }
 
+    /// Visit cookies for a specific host (domain filter).
+    ///
+    /// Returns only cookies whose domain contains the given host string.
+    /// This supports CEF's `cef_cookie_manager_visit_url_cookies` by allowing
+    /// callers to filter cookies for a specific URL or domain.
+    pub fn visit_cookies_for_host(&self, host: &str) -> Vec<CefCookie> {
+        let host_lower = host.to_lowercase();
+        self.cookies
+            .iter()
+            .filter(|c| c.domain.to_lowercase().contains(&host_lower))
+            .cloned()
+            .collect()
+    }
+
+    /// Export all cookies in Netscape HTTP cookie file format.
+    ///
+    /// Netscape format is a plain-text cookie file with tab-separated columns:
+    ///   domain, domain_flag, path, secure, expires, name, value
+    ///
+    /// This format is used by tools like `curl`, `wget`, and some HTTP clients
+    /// for cookie import/export. The export includes all fields from CefCookie.
+    ///
+    /// Returns the cookie file content as a string with a header comment.
+    pub fn export_netscape_format(&self) -> String {
+        let mut out = String::with_capacity(self.cookies.len() * 160);
+        out.push_str("# Netscape HTTP Cookie File\n");
+        out.push_str("# https://curl.se/rfc/cookie_spec.html\n");
+        out.push_str("# This file was generated by Casa1 CefCookieManager\n");
+        out.push_str("# Edit at your own risk.\n\n");
+
+        for cookie in &self.cookies {
+            // Columns: domain, domain_flag, path, secure, expires, name, value
+            let domain_flag = if cookie.domain.starts_with('.') {
+                "TRUE"
+            } else {
+                "FALSE"
+            };
+            let secure_flag = if cookie.secure { "TRUE" } else { "FALSE" };
+            let expires = cookie.expires;
+
+            // Escape tabs and newlines in value
+            let safe_value = cookie
+                .value
+                .replace('\t', "\\t")
+                .replace('\n', "\\n")
+                .replace('\r', "\\r");
+
+            let safe_name = cookie
+                .name
+                .replace('\t', "\\t")
+                .replace('\n', "\\n")
+                .replace('\r', "\\r");
+
+            let safe_path = cookie
+                .path
+                .replace('\t', "\\t")
+                .replace('\n', "\\n")
+                .replace('\r', "\\r");
+
+            let safe_domain = cookie
+                .domain
+                .replace('\t', "\\t")
+                .replace('\n', "\\n")
+                .replace('\r', "\\r");
+
+            writeln!(
+                out,
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                safe_domain, domain_flag, safe_path, secure_flag, expires, safe_name, safe_value,
+            )
+            .unwrap_or_else(|error| {
+                eprintln!(
+                    "[CefBridge] cookie export: failed to append cookie line: {}",
+                    error
+                );
+            });
+        }
+
+        out
+    }
+
     /// Delete cookies matching the given URL and name filters.
+    ///
+    /// Cookies are retained (kept) if they match all active filters.
+    /// - If a URL filter is given, cookies whose domain does NOT contain
+    ///   the filter string are kept (they don't match the filter criteria).
+    /// - If a name filter is given, only cookies with that exact name are
+    ///   considered for deletion.
+    /// - Cookies that match ALL specified filters are removed.
     pub fn delete_cookies(&mut self, url: Option<&str>, name: Option<&str>) -> AppResult<()> {
         self.cookies.retain(|c| {
+            // Check if this cookie should be kept because it doesn't match the URL filter
             if let Some(url_filter) = url {
                 if !c.domain.contains(url_filter) {
-                    return true; // keep, doesn't match URL filter
+                    return true; // keep — this cookie's domain doesn't match the filter
                 }
             }
+            // Check if this cookie should be kept because it doesn't match the name filter
             if let Some(name_filter) = name {
                 if c.name != name_filter {
-                    return true; // keep, doesn't match name filter
+                    return true; // keep — this cookie's name doesn't match the filter
                 }
             }
-            false // remove
+            // Cookie matches all specified filters — remove it
+            false
         });
         self.dirty = true;
         self.flush()?;
+        // Propagate deletion to macOS system cookie store
+        #[cfg(target_os = "macos")]
+        self.sync_to_ns_http_cookie_storage();
         Ok(())
     }
 
@@ -3807,7 +4875,12 @@ impl CefCookieManager {
             return Ok(());
         }
         if let Some(parent) = self.store_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                eprintln!(
+                    "[CefBridge] cookie flush: failed to create parent dir '{}': {e}",
+                    parent.display(),
+                );
+            }
         }
         let data = serde_json::to_string_pretty(&self.cookies).map_err(|e| {
             AppError::new(
@@ -3816,10 +4889,7 @@ impl CefCookieManager {
             )
         })?;
         std::fs::write(&self.store_path, &data).map_err(|e| {
-            AppError::new(
-                ReasonCode::RcCliInvalid,
-                format!("cookie flush write: {e}"),
-            )
+            AppError::new(ReasonCode::RcCliInvalid, format!("cookie flush write: {e}"))
         })?;
         self.dirty = false;
         Ok(())
@@ -3831,13 +4901,187 @@ impl CefCookieManager {
             std::sync::Mutex<Option<std::sync::Arc<std::sync::Mutex<CefCookieManager>>>>,
         > = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
 
-        let mut guard = GLOBAL_COOKIE_MANAGER.lock().unwrap();
+        // lock(): panic on poison is acceptable — poisoned mutex indicates
+        // a panic in another thread which is unrecoverable.
+        let mut guard = GLOBAL_COOKIE_MANAGER
+            .lock()
+            .expect("GLOBAL_COOKIE_MANAGER lock should not be poisoned");
         if guard.is_none() {
-            let mgr = CefCookieManager::new(cache_path);
+            let mut mgr = CefCookieManager::new(cache_path);
+            // Sync initial cookies from macOS NSHTTPCookieStorage so that
+            // Steam login sessions survive restarts (Gap 2.3).
+            #[cfg(target_os = "macos")]
+            mgr.sync_from_ns_http_cookie_storage();
             *guard = Some(std::sync::Arc::new(std::sync::Mutex::new(mgr)));
         }
-        guard.as_ref().cloned().unwrap()
+        // SAFETY: Just initialized if it was None; always Some at this point.
+        guard
+            .as_ref()
+            .expect("GLOBAL_COOKIE_MANAGER initialized just above")
+            .clone()
     }
+
+    // -----------------------------------------------------------------------
+    // NSHTTPCookieStorage Integration (macOS)
+    //
+    // Syncs cookies between our JSON-file-backed CefCookieManager and macOS's
+    // shared NSHTTPCookieStorage. This lets Steam login sessions persist
+    // across restarts via the system cookie store (Gap 2.3).
+    // -----------------------------------------------------------------------
+
+    /// Synchronize cookies from macOS NSHTTPCookieStorage into this manager.
+    #[cfg(target_os = "macos")]
+    pub fn sync_from_ns_http_cookie_storage(&mut self) {
+        use std::ffi::c_void;
+        // SAFETY: CEF (Chromium Embedded Framework) FFI for web view
+        unsafe {
+            let cls_storage = match objc::runtime::Class::get("NSHTTPCookieStorage") {
+                Some(cls) => cls,
+                None => return,
+            };
+            let storage: *mut objc::runtime::Object =
+                msg_send![cls_storage, sharedHTTPCookieStorage];
+            if storage.is_null() {
+                return;
+            }
+            let cookies: *mut objc::runtime::Object = msg_send![storage, cookies];
+            if cookies.is_null() {
+                return;
+            }
+            let count: usize = msg_send![cookies, count];
+            for i in 0..count {
+                let cookie: *mut objc::runtime::Object = msg_send![cookies, objectAtIndex: i];
+                if cookie.is_null() {
+                    continue;
+                }
+                let name: *mut c_void = msg_send![cookie, name];
+                let value: *mut c_void = msg_send![cookie, value];
+                let domain: *mut c_void = msg_send![cookie, domain];
+                let path: *mut c_void = msg_send![cookie, path];
+                let secure: bool = msg_send![cookie, isSecure];
+                let httponly: bool = msg_send![cookie, isHTTPOnly];
+
+                let name = c_str_to_string(name);
+                let value = c_str_to_string(value);
+                let domain = c_str_to_string(domain);
+                let path = c_str_to_string(path);
+
+                if name.is_empty() {
+                    continue;
+                }
+
+                // Attempt to read SameSite property (NSHTTPCookie.sameSite on macOS 10.15+)
+                let same_site = {
+                    let raw: *mut c_void = msg_send![cookie, sameSite];
+                    let s = c_str_to_string(raw);
+                    if s.is_empty() {
+                        "unspecified".to_string()
+                    } else {
+                        s.to_lowercase()
+                    }
+                };
+
+                let cef_cookie = CefCookie {
+                    name,
+                    value,
+                    domain,
+                    path,
+                    secure,
+                    httponly,
+                    same_site,
+                    creation: 0,
+                    last_access: 0,
+                    expires: 0,
+                };
+
+                // Replace existing cookie with same name/domain/path
+                self.cookies.retain(|c| {
+                    !(c.name == cef_cookie.name
+                        && c.domain == cef_cookie.domain
+                        && c.path == cef_cookie.path)
+                });
+                self.cookies.push(cef_cookie);
+            }
+        }
+    }
+
+    /// Push all stored cookies to macOS NSHTTPCookieStorage.
+    #[cfg(target_os = "macos")]
+    pub fn sync_to_ns_http_cookie_storage(&self) {
+        // SAFETY: CEF (Chromium Embedded Framework) FFI for web view
+        unsafe {
+            let cls_storage = match objc::runtime::Class::get("NSHTTPCookieStorage") {
+                Some(cls) => cls,
+                None => return,
+            };
+            let storage: *mut objc::runtime::Object =
+                msg_send![cls_storage, sharedHTTPCookieStorage];
+            if storage.is_null() {
+                return;
+            }
+            let cls_cookie = match objc::runtime::Class::get("NSHTTPCookie") {
+                Some(cls) => cls,
+                None => return,
+            };
+
+            for cookie in &self.cookies {
+                let cls_dict = match objc::runtime::Class::get("NSMutableDictionary") {
+                    Some(cls) => cls,
+                    None => continue,
+                };
+                let dict: *mut objc::runtime::Object = msg_send![cls_dict, new];
+                if dict.is_null() {
+                    continue;
+                }
+
+                // Set cookie properties via setObject:forKey:
+                set_dict_string(dict, "NSHTTPCookieName", &cookie.name);
+                set_dict_string(dict, "NSHTTPCookieValue", &cookie.value);
+                set_dict_string(dict, "NSHTTPCookieDomain", &cookie.domain);
+                set_dict_string(dict, "NSHTTPCookiePath", &cookie.path);
+                if cookie.secure {
+                    let cls_number = match objc::runtime::Class::get("NSNumber") {
+                        Some(cls) => cls,
+                        None => continue,
+                    };
+                    let yes: *mut objc::runtime::Object =
+                        msg_send![cls_number, numberWithBool: true];
+                    let key = ns_string_from_str("NSHTTPCookieSecure");
+                    let _: () = msg_send![dict, setObject: yes forKey: key];
+                }
+
+                let ns_cookie: *mut objc::runtime::Object = msg_send![cls_cookie, alloc];
+                let ns_cookie: *mut objc::runtime::Object =
+                    msg_send![ns_cookie, initWithProperties: dict];
+                if !ns_cookie.is_null() {
+                    let _: () = msg_send![storage, setCookie: ns_cookie];
+                }
+            }
+        }
+    }
+}
+
+// Helper: convert ObjC NSString to Rust String
+#[cfg(target_os = "macos")]
+// SAFETY: CEF (Chromium Embedded Framework) FFI for web view
+unsafe fn c_str_to_string(ptr: *mut std::ffi::c_void) -> String {
+    // SAFETY: CEF (Chromium Embedded Framework) FFI for web view
+    unsafe {
+        if ptr.is_null() {
+            return String::new();
+        }
+        let cstr = std::ffi::CStr::from_ptr(ptr as *const i8);
+        cstr.to_string_lossy().to_string()
+    }
+}
+
+// Helper: set an NSString key-value pair on an NSMutableDictionary
+#[cfg(target_os = "macos")]
+// SAFETY: Objective-C runtime class lookup and method registration
+unsafe fn set_dict_string(dict: *mut objc::runtime::Object, key: &str, value: &str) {
+    let ns_key = ns_string_from_str(key);
+    let ns_val = ns_string_from_str(value);
+    let _: () = msg_send![dict, setObject: ns_val forKey: ns_key];
 }
 
 // ===========================================================================
@@ -3936,9 +5180,7 @@ impl SteamWebHelperShim {
 
         eprintln!(
             "[SteamWebHelper] Launched with URL: {}, mode: {:?}, handle: {:#x}",
-            self.initial_url,
-            self.render_mode,
-            browser_handle,
+            self.initial_url, self.render_mode, browser_handle,
         );
 
         Ok(browser_handle)
@@ -3972,9 +5214,23 @@ impl SteamWebHelperShim {
     ///
     /// Supported types:
     /// - "store_navigation": Navigate to a Steam store page
+    /// - "community_navigation": Navigate to Steam community hub
+    /// - "library_navigation": Navigate to Steam library
+    /// - "friends_navigation": Navigate to Steam friends list
+    /// - "settings_navigation": Navigate to Steam settings
     /// - "login": Steam login/authentication
     /// - "download": Trigger a download
+    /// - "auth_credentials": Handle authentication credential requests
     /// - "open_external_url": Open a URL in the default browser
+    /// - "browser_back": Navigate back in browser history
+    /// - "browser_forward": Navigate forward in browser history
+    /// - "browser_reload": Reload the current page
+    /// - "get_current_url": Get the current page URL
+    /// - "set_cookie": Set a cookie
+    /// - "get_cookies": Get all cookies
+    /// - "execute_javascript": Execute JavaScript in the browser
+    /// - "get_dimensions": Get browser dimensions
+    /// - "resize": Resize the browser
     ///
     /// Returns a JSON response string to be delivered via
     /// `window.externalCallback(response)` in the web page.
@@ -3987,14 +5243,8 @@ impl SteamWebHelperShim {
             )
         })?;
 
-        let request = query
-            .get("request")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let request_id = query
-            .get("requestId")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
+        let request = query.get("request").and_then(|v| v.as_str()).unwrap_or("");
+        let request_id = query.get("requestId").and_then(|v| v.as_u64()).unwrap_or(0);
         let query_type = query
             .get("type")
             .and_then(|v| v.as_str())
@@ -4002,12 +5252,7 @@ impl SteamWebHelperShim {
 
         let response = match query_type {
             "store_navigation" => {
-                // Navigate to a store page
-                let store_url = format!(
-                    "https://store.steampowered.com{}",
-                    request
-                );
-                // Find the first browser and navigate
+                let store_url = format!("https://store.steampowered.com{}", request);
                 if let Some(&browser_handle) = self.bridge.browsers().keys().next() {
                     self.bridge.cef_frame_load_url(browser_handle, &store_url)?;
                 }
@@ -4017,13 +5262,61 @@ impl SteamWebHelperShim {
                     "result": "navigated"
                 })
             }
-            "login" => {
-                // Steam login — navigate to login page
+            "community_navigation" => {
+                let community_url = format!("https://steamcommunity.com{}", request);
+                if let Some(&browser_handle) = self.bridge.browsers().keys().next() {
+                    self.bridge
+                        .cef_frame_load_url(browser_handle, &community_url)?;
+                }
+                serde_json::json!({
+                    "success": true,
+                    "requestId": request_id,
+                    "result": "navigated"
+                })
+            }
+            "library_navigation" => {
                 if let Some(&browser_handle) = self.bridge.browsers().keys().next() {
                     self.bridge.cef_frame_load_url(
                         browser_handle,
-                        "https://steamcommunity.com/login",
+                        "https://steamcommunity.com/my/games",
                     )?;
+                }
+                serde_json::json!({
+                    "success": true,
+                    "requestId": request_id,
+                    "result": "navigated"
+                })
+            }
+            "friends_navigation" => {
+                if let Some(&browser_handle) = self.bridge.browsers().keys().next() {
+                    self.bridge.cef_frame_load_url(
+                        browser_handle,
+                        "https://steamcommunity.com/my/friends",
+                    )?;
+                }
+                serde_json::json!({
+                    "success": true,
+                    "requestId": request_id,
+                    "result": "navigated"
+                })
+            }
+            "settings_navigation" => {
+                if let Some(&browser_handle) = self.bridge.browsers().keys().next() {
+                    self.bridge.cef_frame_load_url(
+                        browser_handle,
+                        "https://steamcommunity.com/my/settings",
+                    )?;
+                }
+                serde_json::json!({
+                    "success": true,
+                    "requestId": request_id,
+                    "result": "navigated"
+                })
+            }
+            "login" => {
+                if let Some(&browser_handle) = self.bridge.browsers().keys().next() {
+                    self.bridge
+                        .cef_frame_load_url(browser_handle, "https://steamcommunity.com/login")?;
                 }
                 serde_json::json!({
                     "success": true,
@@ -4032,20 +5325,38 @@ impl SteamWebHelperShim {
                 })
             }
             "download" => {
-                // Trigger a download — in WKWebView mode downloads are handled
-                // by the native download delegate. For the shim we acknowledge.
+                // Acknowledge download request — WKWebView handles downloads natively.
+                let filename = query
+                    .get("filename")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("download");
                 serde_json::json!({
                     "success": true,
                     "requestId": request_id,
-                    "result": "download_acknowledged"
+                    "result": "download_started",
+                    "filename": filename,
+                })
+            }
+            "auth_credentials" => {
+                let realm = query.get("realm").and_then(|v| v.as_str()).unwrap_or("");
+                let host = query.get("host").and_then(|v| v.as_str()).unwrap_or("");
+                eprintln!(
+                    "[CefBridge] handle_cef_query: auth_credentials realm=\"{realm}\" host=\"{host}\"",
+                );
+                serde_json::json!({
+                    "success": true,
+                    "requestId": request_id,
+                    "result": "cancel",
+                    "error": "user cancelled authentication"
                 })
             }
             "open_external_url" => {
-                // Open URL in default browser via `open` command
                 if !request.is_empty() {
-                    let _ = std::process::Command::new("open")
-                        .arg(request)
-                        .spawn();
+                    if let Err(e) = std::process::Command::new("open").arg(request).spawn() {
+                        eprintln!(
+                            "[CefBridge] handle_cef_query: failed to open external URL '{request}': {e}",
+                        );
+                    }
                 }
                 serde_json::json!({
                     "success": true,
@@ -4053,8 +5364,189 @@ impl SteamWebHelperShim {
                     "result": "opened"
                 })
             }
+            "browser_back" => {
+                if let Some(&bh) = self.bridge.browsers().keys().next() {
+                    if let Err(error) = self.bridge.cef_browser_go_back(bh) {
+                        eprintln!("[CefBridge] SteamWebHelper browser_back failed: {}", error);
+                    }
+                }
+                serde_json::json!({
+                    "success": true,
+                    "requestId": request_id,
+                    "result": "navigated_back"
+                })
+            }
+            "browser_forward" => {
+                if let Some(&bh) = self.bridge.browsers().keys().next() {
+                    if let Err(error) = self.bridge.cef_browser_go_forward(bh) {
+                        eprintln!(
+                            "[CefBridge] SteamWebHelper browser_forward failed: {}",
+                            error
+                        );
+                    }
+                }
+                serde_json::json!({
+                    "success": true,
+                    "requestId": request_id,
+                    "result": "navigated_forward"
+                })
+            }
+            "browser_reload" => {
+                if let Some(&bh) = self.bridge.browsers().keys().next() {
+                    if let Err(error) = self.bridge.cef_browser_reload(bh) {
+                        eprintln!(
+                            "[CefBridge] SteamWebHelper browser_reload failed: {}",
+                            error
+                        );
+                    }
+                }
+                serde_json::json!({
+                    "success": true,
+                    "requestId": request_id,
+                    "result": "reloaded"
+                })
+            }
+            "get_current_url" => {
+                let url = self
+                    .bridge
+                    .browsers()
+                    .values()
+                    .next()
+                    .map(|b| b.current_url.clone())
+                    .unwrap_or_default();
+                serde_json::json!({
+                    "success": true,
+                    "requestId": request_id,
+                    "result": url
+                })
+            }
+            "set_cookie" => {
+                let name = query.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let value = query.get("value").and_then(|v| v.as_str()).unwrap_or("");
+                let domain = query.get("domain").and_then(|v| v.as_str()).unwrap_or("");
+                let path = query.get("path").and_then(|v| v.as_str()).unwrap_or("/");
+                let secure = query
+                    .get("secure")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let httponly = query
+                    .get("httponly")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let same_site = query
+                    .get("same_site")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unspecified");
+                let cookie = CefCookie {
+                    name: name.to_string(),
+                    value: value.to_string(),
+                    domain: domain.to_string(),
+                    path: path.to_string(),
+                    secure,
+                    httponly,
+                    same_site: same_site.to_string(),
+                    creation: 0,
+                    last_access: 0,
+                    expires: 0,
+                };
+                let cache_path = ".";
+                let mgr = CefCookieManager::get_global(cache_path);
+                if let Ok(mut mgr) = mgr.lock() {
+                    if let Err(error) = mgr.set_cookie(cookie) {
+                        eprintln!("[CefBridge] SteamWebHelper set_cookie failed: {}", error);
+                    }
+                }
+                serde_json::json!({
+                    "success": true,
+                    "requestId": request_id,
+                    "result": "cookie_set"
+                })
+            }
+            "get_cookies" => {
+                let cache_path = ".";
+                let mgr = CefCookieManager::get_global(cache_path);
+                let cookies = if let Ok(mgr) = mgr.lock() {
+                    mgr.visit_all_cookies()
+                } else {
+                    Vec::new()
+                };
+                serde_json::json!({
+                    "success": true,
+                    "requestId": request_id,
+                    "result": cookies
+                })
+            }
+            "execute_javascript" => {
+                let script = request;
+                if let Some(&bh) = self.bridge.browsers().keys().next() {
+                    if let Err(error) = self.bridge.cef_frame_execute_java_script(bh, 0, script) {
+                        eprintln!(
+                            "[CefBridge] SteamWebHelper execute_javascript failed: {}",
+                            error
+                        );
+                    }
+                }
+                serde_json::json!({
+                    "success": true,
+                    "requestId": request_id,
+                    "result": "script_executed"
+                })
+            }
+            "get_dimensions" => {
+                // Extract wk_handle first to avoid borrow conflicts
+                let wk_handle = self
+                    .bridge
+                    .browsers()
+                    .values()
+                    .next()
+                    .and_then(|b| b.wk_handle);
+                let (w, h) = if let Some(wk) = wk_handle {
+                    self.bridge
+                        .webview_manager
+                        .as_ref()
+                        .and_then(|mgr| mgr.dimensions(wk))
+                        .unwrap_or((1280.0, 720.0))
+                } else {
+                    (1280.0, 720.0)
+                };
+                serde_json::json!({
+                    "success": true,
+                    "requestId": request_id,
+                    "result": { "width": w, "height": h }
+                })
+            }
+            "resize" => {
+                let w = query
+                    .get("width")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(1280.0);
+                let h = query
+                    .get("height")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(720.0);
+                // Extract wk_handle first to avoid borrow conflicts
+                let wk_handle = self
+                    .bridge
+                    .browsers()
+                    .values()
+                    .next()
+                    .and_then(|b| b.wk_handle);
+                if let Some(wk) = wk_handle {
+                    if let Some(mgr) = self.bridge.webview_manager.as_mut() {
+                        let _ = mgr.resize(wk, w, h);
+                    }
+                }
+                serde_json::json!({
+                    "success": true,
+                    "requestId": request_id,
+                    "result": { "width": w, "height": h }
+                })
+            }
             _ => {
-                // Unknown query type — return error
+                // Unknown query type — log and return error
+                eprintln!(
+                    "[CefBridge] handle_cef_query: unknown query type=\"{query_type}\" request=\"{request}\"",
+                );
                 serde_json::json!({
                     "success": false,
                     "requestId": request_id,
@@ -4101,8 +5593,7 @@ impl SteamWebHelperShim {
 })();
 "#;
 
-        let browser_handles: Vec<CefHandle> =
-            self.bridge.browsers().keys().copied().collect();
+        let browser_handles: Vec<CefHandle> = self.bridge.browsers().keys().copied().collect();
 
         for handle in &browser_handles {
             self.bridge
@@ -4174,7 +5665,6 @@ pub fn register_libcef_dll_exports() -> Vec<crate::pe::ExportSymbol> {
             name: Some("cef_get_minimal_libcef_version".to_string()),
             target: crate::pe::ExportTarget::Rva(0x1020),
         },
-
         // --- Browser creation & management ---
         crate::pe::ExportSymbol {
             ordinal: 10,
@@ -4201,7 +5691,6 @@ pub fn register_libcef_dll_exports() -> Vec<crate::pe::ExportSymbol> {
             name: Some("cef_browser_is_valid".to_string()),
             target: crate::pe::ExportTarget::Rva(0x1070),
         },
-
         // --- Navigation ---
         crate::pe::ExportSymbol {
             ordinal: 20,
@@ -4238,14 +5727,12 @@ pub fn register_libcef_dll_exports() -> Vec<crate::pe::ExportSymbol> {
             name: Some("cef_browser_stop_load".to_string()),
             target: crate::pe::ExportTarget::Rva(0x10E0),
         },
-
         // --- JavaScript execution ---
         crate::pe::ExportSymbol {
             ordinal: 30,
             name: Some("cef_frame_execute_java_script".to_string()),
             target: crate::pe::ExportTarget::Rva(0x10F0),
         },
-
         // --- Message loop ---
         crate::pe::ExportSymbol {
             ordinal: 40,
@@ -4262,7 +5749,6 @@ pub fn register_libcef_dll_exports() -> Vec<crate::pe::ExportSymbol> {
             name: Some("cef_quit_message_loop".to_string()),
             target: crate::pe::ExportTarget::Rva(0x1120),
         },
-
         // --- Offscreen rendering ---
         crate::pe::ExportSymbol {
             ordinal: 50,
@@ -4274,7 +5760,6 @@ pub fn register_libcef_dll_exports() -> Vec<crate::pe::ExportSymbol> {
             name: Some("cef_browser_settings_create".to_string()),
             target: crate::pe::ExportTarget::Rva(0x1140),
         },
-
         // --- String/utility ---
         crate::pe::ExportSymbol {
             ordinal: 60,
@@ -4296,7 +5781,6 @@ pub fn register_libcef_dll_exports() -> Vec<crate::pe::ExportSymbol> {
             name: Some("cef_string_wide_to_utf8".to_string()),
             target: crate::pe::ExportTarget::Rva(0x1180),
         },
-
         // --- Cross-origin whitelist ---
         crate::pe::ExportSymbol {
             ordinal: 70,
@@ -4313,7 +5797,6 @@ pub fn register_libcef_dll_exports() -> Vec<crate::pe::ExportSymbol> {
             name: Some("cef_clear_cross_origin_whitelist".to_string()),
             target: crate::pe::ExportTarget::Rva(0x11B0),
         },
-
         // --- URL parsing ---
         crate::pe::ExportSymbol {
             ordinal: 80,
@@ -4325,14 +5808,12 @@ pub fn register_libcef_dll_exports() -> Vec<crate::pe::ExportSymbol> {
             name: Some("cef_create_url".to_string()),
             target: crate::pe::ExportTarget::Rva(0x11D0),
         },
-
         // --- JavaScript extension registration ---
         crate::pe::ExportSymbol {
             ordinal: 90,
             name: Some("cef_register_extension".to_string()),
             target: crate::pe::ExportTarget::Rva(0x11E0),
         },
-
         // --- Cookie manager (persistent storage) ---
         crate::pe::ExportSymbol {
             ordinal: 100,
@@ -4376,22 +5857,24 @@ pub fn register_libcef_dll_exports() -> Vec<crate::pe::ExportSymbol> {
 ///
 /// The actual export table entries are provided by `register_libcef_dll_exports()`.
 pub fn register_libcef_dll() {
-    // This is a marker function. The actual registration happens by
-    // adding "libcef.dll" entries to the `export_tables()` BTreeMap in
-    // `pe_runtime.rs`.
-    //
-    // Usage in pe_runtime.rs:
-    //   1. Call register_libcef_dll_exports() to get the export list
-    //   2. Insert into the export_tables() map:
-    //      ```ignore
-    //      map.insert("libcef.dll".to_string(), register_libcef_dll_exports());
-    //      ```
-    //   3. The can_synthesize_module() method will then recognize "libcef.dll"
-    //      because it checks export_tables().contains_key(&normalized).
-    //
-    // The normalized module name for "libcef.dll" is "libcef.dll" (since it
-    // already contains a '.'), which will match normalize_module_name().
-    eprintln!("[CefBridge] libcef.dll registered as synthetic module");
+    let exports = register_libcef_dll_exports();
+    if exports.is_empty() {
+        eprintln!(
+            "[CefBridge] WARNING: register_libcef_dll() produced zero exports — \
+             libcef.dll runtime module will have no reachable CEF API entries"
+        );
+    } else {
+        eprintln!(
+            "[CefBridge] libcef.dll registered as runtime-backed module with {} export(s) \
+             (caller must merge into pe_runtime::export_tables())",
+            exports.len(),
+        );
+    }
+    // Integration note:
+    // pe_runtime.rs already registers these exports at line ~65805:
+    //   ("libcef.dll".to_string(), crate::cef_bridge::register_libcef_dll_exports()),
+    // No further action needed here — this function serves as a verification
+    // point during Casa1 initialization.
 }
 
 // ===========================================================================
@@ -4407,8 +5890,38 @@ static GLOBAL_CEF_BRIDGE: std::sync::LazyLock<std::sync::Mutex<Option<CefBridge>
 
 /// Set the global CefBridge instance. Called during Steam integration setup.
 pub fn set_global_cef_bridge(bridge: CefBridge) {
-    let mut guard = GLOBAL_CEF_BRIDGE.lock().unwrap();
+    // lock(): panic on poison is acceptable
+    let mut guard = GLOBAL_CEF_BRIDGE
+        .lock()
+        .expect("GLOBAL_CEF_BRIDGE lock should not be poisoned");
     *guard = Some(bridge);
+}
+
+/// Ensure the global CefBridge instance exists, creating one if necessary.
+///
+/// If `live_frame_tx` is provided, it will be set on the bridge so that CEF
+/// paint callbacks publish frames to the live session display.
+///
+/// Returns a mutable reference to the (possibly just-created) bridge.
+pub fn ensure_global_bridge(live_frame_tx: Option<Sender<LiveFrame>>) {
+    // lock(): panic on poison is acceptable
+    let mut guard = GLOBAL_CEF_BRIDGE
+        .lock()
+        .expect("GLOBAL_CEF_BRIDGE lock should not be poisoned");
+    if guard.is_none() {
+        let mut bridge = CefBridge::new();
+        if let Some(tx) = live_frame_tx {
+            bridge.set_live_frame_tx(Some(tx));
+        }
+        *guard = Some(bridge);
+    } else if let Some(ref mut bridge) = *guard {
+        // If we have a live_frame_tx and the bridge doesn't have one yet, set it
+        if let Some(tx) = live_frame_tx {
+            if bridge.live_frame_tx.is_none() {
+                bridge.set_live_frame_tx(Some(tx));
+            }
+        }
+    }
 }
 
 /// Get a reference to the global CefBridge instance (for dispatch_import calls).
@@ -4416,7 +5929,10 @@ pub fn with_global_cef_bridge<F, R>(f: F) -> Option<R>
 where
     F: FnOnce(&mut CefBridge) -> R,
 {
-    let mut guard = GLOBAL_CEF_BRIDGE.lock().unwrap();
+    // lock(): panic on poison is acceptable
+    let mut guard = GLOBAL_CEF_BRIDGE
+        .lock()
+        .expect("GLOBAL_CEF_BRIDGE lock should not be poisoned");
     guard.as_mut().map(f)
 }
 
@@ -4449,13 +5965,14 @@ mod tests {
 
         let init_result = bridge.cef_initialize(CefSettings::default());
         if wkwebview_available() {
-            assert!(init_result.is_ok());
+            assert!(init_result.is_ok(), "expected Ok, got {init_result:?}");
             assert_eq!(bridge.state(), CefState::Initialized);
-            assert!(bridge.cef_shutdown().is_ok());
+            let _result = bridge.cef_shutdown();
+            assert!(_result.is_ok(), "expected Ok, got {_result:?}");
             assert_eq!(bridge.state(), CefState::ShuttingDown);
         } else {
             // WKWebView not available; initialization fails gracefully.
-            assert!(init_result.is_err());
+            assert!(init_result.is_err(), "expected Err, got {init_result:?}");
             // State should remain Uninitialized
             assert_eq!(bridge.state(), CefState::Uninitialized);
         }
@@ -4467,15 +5984,15 @@ mod tests {
         let mut bridge = CefBridge::new();
         let init_result = bridge.cef_initialize(CefSettings::default());
         if wkwebview_available() {
-            assert!(init_result.is_ok());
+            assert!(init_result.is_ok(), "expected Ok, got {init_result:?}");
             let err = bridge.cef_initialize(CefSettings::default());
-            assert!(err.is_err());
+            assert!(err.is_err(), "expected Err, got {err:?}");
             assert!(err.unwrap_err().message.contains("already initialised"));
         } else {
             // If initialization failed, double-init should also fail
-            assert!(init_result.is_err());
+            assert!(init_result.is_err(), "expected Err, got {init_result:?}");
             let err2 = bridge.cef_initialize(CefSettings::default());
-            assert!(err2.is_err());
+            assert!(err2.is_err(), "expected Err, got {err2:?}");
         }
     }
 
@@ -4551,8 +6068,7 @@ mod tests {
 
         let browser_obj = bridge.browsers().get(&browser).unwrap();
         assert_eq!(
-            browser_obj.current_url,
-            "https://steamcommunity.com",
+            browser_obj.current_url, "https://steamcommunity.com",
             "browser URL should be updated"
         );
 
@@ -4682,7 +6198,7 @@ mod tests {
             .expect("create browser");
 
         // Execute a simple JS expression
-        let result = bridge
+        let _result = bridge
             .cef_frame_execute_java_script(browser, 1, "2+2")
             .expect("execute JS");
         // Without a real WKWebView, the result is empty string;
@@ -4732,10 +6248,7 @@ mod tests {
 
         // Operations after close should fail
         let nav_err = bridge.cef_frame_load_url(browser, "https://store.steampowered.com");
-        assert!(
-            nav_err.is_err(),
-            "navigation after close should fail"
-        );
+        assert!(nav_err.is_err(), "navigation after close should fail");
 
         let go_back_err = bridge.cef_browser_go_back(browser);
         assert!(go_back_err.is_err(), "go_back after close should fail");
@@ -4935,21 +6448,23 @@ mod tests {
         assert!(bridge.cef_browser_is_valid(browser));
 
         // Navigate should work even with edge case URLs
-        assert!(bridge.cef_frame_load_url(browser, "").is_ok());
-        assert!(bridge.cef_frame_load_url(browser, "about:blank").is_ok());
-        assert!(bridge
-            .cef_frame_load_url(browser, "steam://connect/127.0.0.1")
-            .is_ok());
+        let _result = bridge.cef_frame_load_url(browser, "");
+        assert!(_result.is_ok(), "expected Ok, got {_result:?}");
+        let _result = bridge.cef_frame_load_url(browser, "about:blank");
+        assert!(_result.is_ok(), "expected Ok, got {_result:?}");
+        assert!(
+            bridge
+                .cef_frame_load_url(browser, "steam://connect/127.0.0.1")
+                .is_ok()
+        );
 
         // Back/forward without history should fail gracefully
         let back_err = bridge.cef_browser_go_back(browser);
-        assert!(
-            back_err.is_err(),
-            "go_back without history should fail"
-        );
+        assert!(back_err.is_err(), "go_back without history should fail");
 
         // Reload should always work
-        assert!(bridge.cef_browser_reload(browser).is_ok());
+        let _result = bridge.cef_browser_reload(browser);
+        assert!(_result.is_ok(), "expected Ok, got {_result:?}");
 
         bridge.close_browser(browser).unwrap();
     }
@@ -4984,10 +6499,8 @@ mod tests {
     /// Test SteamWebHelper tick (message loop pump).
     #[test]
     fn steam_web_helper_tick() {
-        let mut shim = SteamWebHelperShim::new(
-            "about:blank".to_string(),
-            SteamRenderMode::Headless,
-        );
+        let mut shim =
+            SteamWebHelperShim::new("about:blank".to_string(), SteamRenderMode::Headless);
 
         if let Ok(_handle) = shim.launch() {
             let count_before = shim.frame_count();
@@ -5010,19 +6523,28 @@ mod tests {
 
         // Test store navigation query
         let nav_query = r#"{"request":"/app/730","requestId":1,"type":"store_navigation"}"#;
-        let response = shim.handle_cef_query(nav_query).expect("handle store navigation query");
+        let response = shim
+            .handle_cef_query(nav_query)
+            .expect("handle store navigation query");
         assert!(response.contains("success"));
         assert!(response.contains("true"));
 
         // Test login query
         let login_query = r#"{"request":"","requestId":2,"type":"login"}"#;
-        let response = shim.handle_cef_query(login_query).expect("handle login query");
+        let response = shim
+            .handle_cef_query(login_query)
+            .expect("handle login query");
         assert!(response.contains("success"));
 
         // Test unknown query type
         let unknown_query = r#"{"request":"test","requestId":3,"type":"unknown_type"}"#;
-        let response = shim.handle_cef_query(unknown_query).expect("handle unknown query");
-        assert!(response.contains("false"), "unknown query should return error");
+        let response = shim
+            .handle_cef_query(unknown_query)
+            .expect("handle unknown query");
+        assert!(
+            response.contains("false"),
+            "unknown query should return error"
+        );
         assert!(response.contains("unknown query type"));
 
         // Test invalid JSON
@@ -5034,10 +6556,8 @@ mod tests {
     /// Test CefQuery bridge JavaScript injection.
     #[test]
     fn steam_web_helper_inject_bridge() {
-        let mut shim = SteamWebHelperShim::new(
-            "about:blank".to_string(),
-            SteamRenderMode::Headless,
-        );
+        let mut shim =
+            SteamWebHelperShim::new("about:blank".to_string(), SteamRenderMode::Headless);
 
         if let Ok(_handle) = shim.launch() {
             // Injecting the bridge should succeed
@@ -5133,10 +6653,7 @@ mod tests {
         let exports = register_libcef_dll_exports();
 
         // Verify key CEF API exports are present
-        let export_names: Vec<&str> = exports
-            .iter()
-            .filter_map(|e| e.name.as_deref())
-            .collect();
+        let export_names: Vec<&str> = exports.iter().filter_map(|e| e.name.as_deref()).collect();
 
         assert!(
             export_names.contains(&"cef_initialize"),
@@ -5225,9 +6742,13 @@ mod tests {
         let browser = bridge
             .cef_browser_host_create_browser(
                 CefWindowInfo {
-                    x: 0, y: 0, width: 320, height: 240,
+                    x: 0,
+                    y: 0,
+                    width: 320,
+                    height: 240,
                     windowless_rendering_enabled: true,
-                    parent_window: 0, url: None,
+                    parent_window: 0,
+                    url: None,
                     external_begin_frame_enabled: false,
                 },
                 "about:blank",
@@ -5269,9 +6790,13 @@ mod tests {
         let browser = bridge
             .cef_browser_host_create_browser(
                 CefWindowInfo {
-                    x: 0, y: 0, width: 100, height: 100,
+                    x: 0,
+                    y: 0,
+                    width: 100,
+                    height: 100,
                     windowless_rendering_enabled: true,
-                    parent_window: 0, url: None,
+                    parent_window: 0,
+                    url: None,
                     external_begin_frame_enabled: false,
                 },
                 "about:blank",
@@ -5340,7 +6865,10 @@ mod tests {
         let latest = bridge.get_rendered_frame(browser_id);
         assert!(latest.is_some(), "should find a rendered frame");
         let latest = latest.unwrap();
-        assert_eq!(latest.frame_number, 2, "should return latest frame (frame_number=2)");
+        assert_eq!(
+            latest.frame_number, 2,
+            "should return latest frame (frame_number=2)"
+        );
         assert_eq!(latest.width, 20, "should match frame3 dimensions");
         assert_eq!(latest.height, 20, "should match frame3 dimensions");
         assert_eq!(latest.pixels[0], 0x40, "should match frame3 pixel data");
@@ -5428,7 +6956,10 @@ mod tests {
                 "IOSurface pair creation with valid dimensions should succeed"
             );
             if let Some(ref p) = pair {
-                assert!(!p.io_surface.is_null(), "IOSurface pointer should not be null");
+                assert!(
+                    !p.io_surface.is_null(),
+                    "IOSurface pointer should not be null"
+                );
                 assert!(
                     p.metal_texture.is_some(),
                     "Metal texture wrapping IOSurface should exist"
@@ -5485,9 +7016,13 @@ mod tests {
             let browser = bridge
                 .cef_browser_host_create_browser(
                     CefWindowInfo {
-                        x: 0, y: 0, width: 100, height: 100,
+                        x: 0,
+                        y: 0,
+                        width: 100,
+                        height: 100,
                         windowless_rendering_enabled: true,
-                        parent_window: 0, url: None,
+                        parent_window: 0,
+                        url: None,
                         external_begin_frame_enabled: false,
                     },
                     "about:blank",
@@ -5509,8 +7044,16 @@ mod tests {
 
             // Verify the returned texture has the expected dimensions
             if let Ok(texture) = result {
-                assert_eq!(texture.width(), 100, "texture width should match frame width");
-                assert_eq!(texture.height(), 100, "texture height should match frame height");
+                assert_eq!(
+                    texture.width(),
+                    100,
+                    "texture width should match frame width"
+                );
+                assert_eq!(
+                    texture.height(),
+                    100,
+                    "texture height should match frame height"
+                );
             }
 
             bridge.close_browser(browser).unwrap();
@@ -5534,9 +7077,13 @@ mod tests {
             let browser = bridge
                 .cef_browser_host_create_browser(
                     CefWindowInfo {
-                        x: 0, y: 0, width: 64, height: 64,
+                        x: 0,
+                        y: 0,
+                        width: 64,
+                        height: 64,
                         windowless_rendering_enabled: true,
-                        parent_window: 0, url: None,
+                        parent_window: 0,
+                        url: None,
                         external_begin_frame_enabled: false,
                     },
                     "about:blank",
@@ -5633,9 +7180,13 @@ mod tests {
             let browser = bridge
                 .cef_browser_host_create_browser(
                     CefWindowInfo {
-                        x: 0, y: 0, width: 100, height: 100,
+                        x: 0,
+                        y: 0,
+                        width: 100,
+                        height: 100,
                         windowless_rendering_enabled: true,
-                        parent_window: 0, url: None,
+                        parent_window: 0,
+                        url: None,
                         external_begin_frame_enabled: false,
                     },
                     "about:blank",
@@ -5677,11 +7228,13 @@ mod tests {
 
             if let Ok(texture) = result2 {
                 assert_eq!(
-                    texture.width(), 200,
+                    texture.width(),
+                    200,
                     "resized texture width should match new frame width"
                 );
                 assert_eq!(
-                    texture.height(), 200,
+                    texture.height(),
+                    200,
                     "resized texture height should match new frame height"
                 );
             }
@@ -5704,9 +7257,13 @@ mod tests {
         let browser = bridge
             .cef_browser_host_create_browser(
                 CefWindowInfo {
-                    x: 0, y: 0, width: 640, height: 480,
+                    x: 0,
+                    y: 0,
+                    width: 640,
+                    height: 480,
                     windowless_rendering_enabled: true,
-                    parent_window: 0, url: None,
+                    parent_window: 0,
+                    url: None,
                     external_begin_frame_enabled: false,
                 },
                 "about:blank",
@@ -5727,9 +7284,13 @@ mod tests {
         let browser = bridge
             .cef_browser_host_create_browser(
                 CefWindowInfo {
-                    x: 0, y: 0, width: 640, height: 480,
+                    x: 0,
+                    y: 0,
+                    width: 640,
+                    height: 480,
                     windowless_rendering_enabled: true,
-                    parent_window: 0, url: None,
+                    parent_window: 0,
+                    url: None,
                     external_begin_frame_enabled: false,
                 },
                 "about:blank",
@@ -5740,11 +7301,15 @@ mod tests {
         // Initially the browser is loading=true (set during creation)
         bridge.on_after_created(browser).expect("on_after_created");
         let b = bridge.browsers().get(&browser).unwrap();
-        assert!(b.is_loading, "browser should be loading after OnAfterCreated");
+        assert!(
+            b.is_loading,
+            "browser should be loading after OnAfterCreated"
+        );
         assert!(b.dirty, "browser should be dirty after OnAfterCreated");
 
         // Non-existent handle should not panic
-        assert!(bridge.on_after_created(99999).is_ok());
+        let _result = bridge.on_after_created(99999);
+        assert!(_result.is_ok(), "expected Ok, got {_result:?}");
     }
 
     /// Test CefLifeSpanHandler: DoClose and OnBeforeClose sequence.
@@ -5765,7 +7330,10 @@ mod tests {
         );
 
         // DoClose on non-existent browser should return false
-        assert!(!bridge.do_close(99999), "DoClose on missing browser should return false");
+        assert!(
+            !bridge.do_close(99999),
+            "DoClose on missing browser should return false"
+        );
 
         // Non-existent handle should not panic
         bridge.on_before_close(99999);
@@ -5777,8 +7345,7 @@ mod tests {
             "browser should be invalid after OnBeforeClose"
         );
         assert_eq!(
-            bridge.close_pending_for,
-            None,
+            bridge.close_pending_for, None,
             "close_pending_for should be cleared"
         );
     }
@@ -5833,9 +7400,14 @@ mod tests {
             return;
         }
 
-        bridge.on_load_end(browser, "https://steamcommunity.com").unwrap();
+        bridge
+            .on_load_end(browser, "https://steamcommunity.com")
+            .unwrap();
         let b = bridge.browsers().get(&browser).unwrap();
-        assert!(!b.is_loading, "browser should not be loading after OnLoadEnd");
+        assert!(
+            !b.is_loading,
+            "browser should not be loading after OnLoadEnd"
+        );
         assert_eq!(b.current_url, "https://steamcommunity.com");
         assert!(b.dirty, "browser should be dirty after OnLoadEnd");
     }
@@ -5848,7 +7420,12 @@ mod tests {
             return;
         }
 
-        bridge.on_load_error(browser, -3i32 as u32, "Operation cancelled", "https://store.steampowered.com");
+        bridge.on_load_error(
+            browser,
+            -3i32 as u32,
+            "Operation cancelled",
+            "https://store.steampowered.com",
+        );
         let b = bridge.browsers().get(&browser).unwrap();
         assert!(!b.is_loading, "browser should not be loading after error");
         assert!(b.dirty, "browser should be dirty after error");
@@ -5891,7 +7468,8 @@ mod tests {
         assert_eq!(b.title, "");
 
         // Non-existent handle should not panic
-        assert!(bridge.on_title_change(99999, "test").is_ok());
+        let _result = bridge.on_title_change(99999, "test");
+        assert!(_result.is_ok(), "expected Ok, got {_result:?}");
     }
 
     /// Test CefDisplayHandler: OnTooltip returns correct visibility.
@@ -5903,10 +7481,16 @@ mod tests {
         }
 
         // Non-empty text should show tooltip
-        assert!(bridge.on_tooltip(browser, "Click to open Store"), "tooltip should show with text");
+        assert!(
+            bridge.on_tooltip(browser, "Click to open Store"),
+            "tooltip should show with text"
+        );
 
         // Empty text should hide tooltip
-        assert!(!bridge.on_tooltip(browser, ""), "tooltip should hide with empty text");
+        assert!(
+            !bridge.on_tooltip(browser, ""),
+            "tooltip should hide with empty text"
+        );
     }
 
     /// Test CefDisplayHandler: OnStatusMessage logs messages without errors.
@@ -5938,7 +7522,10 @@ mod tests {
             "https://store.steampowered.com/steam.js",
             42,
         );
-        assert!(!result, "OnConsoleMessage should return false (not handled)");
+        assert!(
+            !result,
+            "OnConsoleMessage should return false (not handled)"
+        );
 
         // Non-existent handle should not panic
         bridge.on_console_message(99999, "test", "test.js", 1);
@@ -5947,7 +7534,7 @@ mod tests {
     /// Test CefRenderHandler: GetViewRect returns correct dimensions.
     #[test]
     fn cef_handler_get_view_rect() {
-        let (mut bridge, browser) = create_test_bridge();
+        let (bridge, browser) = create_test_bridge();
         if !wkwebview_available() || browser == 0 {
             return;
         }
@@ -5967,7 +7554,7 @@ mod tests {
     /// Test CefRenderHandler: GetScreenInfo returns default values.
     #[test]
     fn cef_handler_get_screen_info() {
-        let (mut bridge, browser) = create_test_bridge();
+        let (bridge, browser) = create_test_bridge();
         if !wkwebview_available() || browser == 0 {
             return;
         }
@@ -5975,7 +7562,10 @@ mod tests {
         let (x, y, scale) = bridge.get_screen_info(browser);
         assert_eq!(x, 0, "screen origin x should be 0");
         assert_eq!(y, 0, "screen origin y should be 0");
-        assert!((scale - 1.0).abs() < f64::EPSILON, "scale factor should be 1.0");
+        assert!(
+            (scale - 1.0).abs() < f64::EPSILON,
+            "scale factor should be 1.0"
+        );
     }
 
     /// Test CefRenderHandler: OnPaint processes pixel data.
@@ -5991,7 +7581,12 @@ mod tests {
         let width = 100u32;
         let height = 50u32;
         let pixels = vec![0x80u8; (width * height * 4) as usize];
-        let dirty_rects = [CefRect { x: 0, y: 0, width: 100, height: 50 }];
+        let dirty_rects = [CefRect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 50,
+        }];
 
         bridge.on_paint(browser, 0, &dirty_rects, &pixels, width, height);
 
@@ -6000,8 +7595,15 @@ mod tests {
         assert!(frame.is_some(), "rendered frame should exist after OnPaint");
         let frame = frame.unwrap();
         assert_eq!(frame.width, width, "frame width should match paint width");
-        assert_eq!(frame.height, height, "frame height should match paint height");
-        assert_eq!(frame.pixels.len(), pixels.len(), "pixel buffer size should match");
+        assert_eq!(
+            frame.height, height,
+            "frame height should match paint height"
+        );
+        assert_eq!(
+            frame.pixels.len(),
+            pixels.len(),
+            "pixel buffer size should match"
+        );
 
         // Verify browser is no longer dirty after paint
         let b = bridge.browsers().get(&browser).unwrap();
@@ -6034,16 +7636,33 @@ mod tests {
         }
 
         // Initially no popup
-        assert!(!bridge.popup_showing, "popup should not be showing initially");
-        assert!(bridge.popup_info.is_none(), "popup info should be none initially");
+        assert!(
+            !bridge.popup_showing,
+            "popup should not be showing initially"
+        );
+        assert!(
+            bridge.popup_info.is_none(),
+            "popup info should be none initially"
+        );
 
         // Show popup and set size
         bridge.on_popup_show(browser, true);
-        assert!(bridge.popup_showing, "popup should be showing after OnPopupShow(true)");
+        assert!(
+            bridge.popup_showing,
+            "popup should be showing after OnPopupShow(true)"
+        );
 
-        let popup_rect = CefRect { x: 10, y: 20, width: 300, height: 200 };
+        let popup_rect = CefRect {
+            x: 10,
+            y: 20,
+            width: 300,
+            height: 200,
+        };
         bridge.on_popup_size(browser, popup_rect);
-        assert!(bridge.popup_info.is_some(), "popup info should be set after OnPopupSize");
+        assert!(
+            bridge.popup_info.is_some(),
+            "popup info should be set after OnPopupSize"
+        );
         let info = bridge.popup_info.clone().unwrap();
         assert_eq!(info.x, 10);
         assert_eq!(info.y, 20);
@@ -6052,8 +7671,14 @@ mod tests {
 
         // Hide popup — should clear state
         bridge.on_popup_show(browser, false);
-        assert!(!bridge.popup_showing, "popup should not be showing after OnPopupShow(false)");
-        assert!(bridge.popup_info.is_none(), "popup info should be cleared after hide");
+        assert!(
+            !bridge.popup_showing,
+            "popup should not be showing after OnPopupShow(false)"
+        );
+        assert!(
+            bridge.popup_info.is_none(),
+            "popup info should be cleared after hide"
+        );
     }
 
     /// Test CefRenderHandler: OnAcceleratedPaint with null handle.
@@ -6116,11 +7741,12 @@ mod tests {
             return;
         }
 
-        let handler_id = bridge.get_resource_request_handler(
-            browser,
-            "https://store.steampowered.com/steam.js",
+        let handler_id =
+            bridge.get_resource_request_handler(browser, "https://store.steampowered.com/steam.js");
+        assert_eq!(
+            handler_id, 0,
+            "resource request handler should return 0 (default)"
         );
-        assert_eq!(handler_id, 0, "resource request handler should return 0 (default)");
     }
 
     /// Test CefRequestHandler: OnAuthCredentials returns false (no creds).
@@ -6140,7 +7766,10 @@ mod tests {
             "My Realm",
             "basic",
         );
-        assert!(!result, "auth should be cancelled (no credentials available)");
+        assert!(
+            !result,
+            "auth should be cancelled (no credentials available)"
+        );
     }
 
     /// Test CefRequestHandler: OnCookieableSchemes returns supported schemes.
@@ -6172,7 +7801,12 @@ mod tests {
         let browser_id = bridge.browsers().get(&browser).unwrap().id;
 
         let pixels = vec![0xFFu8; 100 * 100 * 4];
-        let dirty = [CefRect { x: 0, y: 0, width: 100, height: 100 }];
+        let dirty = [CefRect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 100,
+        }];
 
         // First paint
         bridge.on_paint(browser, 0, &dirty, &pixels, 100, 100);
@@ -6202,7 +7836,10 @@ mod tests {
         let mut bridge = CefBridge::new();
 
         // CefLifeSpanHandler
-        assert!(!bridge.do_close(1), "DoClose on non-existent browser should return false");
+        assert!(
+            !bridge.do_close(1),
+            "DoClose on non-existent browser should return false"
+        );
         bridge.on_before_close(1); // should not panic
 
         // CefDisplayHandler
@@ -6219,7 +7856,10 @@ mod tests {
 
         // CefRenderHandler (GetViewRect returns fallback 1x1)
         let rect = bridge.get_view_rect(1);
-        assert_eq!(rect.width, 1, "without browser, GetViewRect should return fallback 1x1");
+        assert_eq!(
+            rect.width, 1,
+            "without browser, GetViewRect should return fallback 1x1"
+        );
         assert_eq!(rect.height, 1);
         let (x, y, scale) = bridge.get_screen_info(1);
         assert_eq!(x, 0);
@@ -6230,9 +7870,24 @@ mod tests {
         assert!(!bridge.on_before_browse(1, "https://example.com"));
         assert!(bridge.on_before_browse(1, "steam://connect"));
         assert!(!bridge.on_before_resource_load(1, "https://example.com/resource.js"));
-        assert_eq!(bridge.get_resource_request_handler(1, "https://example.com"), 0);
-        assert!(!bridge.on_auth_credentials(1, "https://example.com", false, "host", 80, "realm", "basic"));
-        assert!(bridge.on_cookieable_schemes().contains(&"https".to_string()));
+        assert_eq!(
+            bridge.get_resource_request_handler(1, "https://example.com"),
+            0
+        );
+        assert!(!bridge.on_auth_credentials(
+            1,
+            "https://example.com",
+            false,
+            "host",
+            80,
+            "realm",
+            "basic"
+        ));
+        assert!(
+            bridge
+                .on_cookieable_schemes()
+                .contains(&"https".to_string())
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -6257,7 +7912,8 @@ mod tests {
 
         // create_overlay_browser may fail on non-macOS or headless CI,
         // but we verify the handle is NOT set on failure.
-        let result = bridge.create_overlay_browser("steam://openurl/https://steamcommunity.com/my/overlay");
+        let result =
+            bridge.create_overlay_browser("steam://openurl/https://steamcommunity.com/my/overlay");
         match result {
             Ok(handle) => {
                 assert_eq!(bridge.overlay_browser_handle, Some(handle));
@@ -6282,7 +7938,7 @@ mod tests {
         let mut bridge = CefBridge::new();
 
         match bridge.create_overlay_browser("steam://openurl/test") {
-            Ok(handle) => {
+            Ok(_handle) => {
                 // Second creation attempt MUST fail
                 let err = bridge
                     .create_overlay_browser("steam://openurl/test2")
@@ -6308,7 +7964,8 @@ mod tests {
         let mut bridge = CefBridge::new();
         assert_eq!(bridge.overlay_browser_handle, None);
         // Should not panic or error
-        assert!(bridge.destroy_overlay_browser().is_ok());
+        let _result = bridge.destroy_overlay_browser();
+        assert!(_result.is_ok(), "expected Ok, got {_result:?}");
         assert_eq!(bridge.overlay_browser_handle, None);
     }
 

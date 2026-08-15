@@ -17,7 +17,9 @@ fn engine() -> CpuExecutionEngine {
 }
 
 fn run(engine: &CpuExecutionEngine, bytes: &[u8], state: &mut CpuState, memory: &mut MemoryImage) {
-    let decoded = engine.decode_block(bytes, 0x1400_000000).expect("decode block");
+    let decoded = engine
+        .decode_block(bytes, 0x1400_000000)
+        .expect("decode block");
     let ir = casa1::cpu::lower_to_ir(&decoded).expect("lower to IR");
     engine
         .execute_ir(state, memory, &ir)
@@ -37,8 +39,20 @@ fn fxsave_fxrstor_round_trip_preserves_xmm_mxcsr_and_x87() {
     let base = 0x20_0000u64;
     memory.map_bytes(base, &[0u8; 1024]);
     state.set(Register::Rax, base);
-    state.set_xmm(0, XmmValue { low: 0xAABB_CCDD_1122_3344, high: 0x5566_7788_99AA_BBCC });
-    state.set_xmm(7, XmmValue { low: 0x0102_0304_0506_0708, high: 0x1112_1314_1516_1718 });
+    state.set_xmm(
+        0,
+        XmmValue {
+            low: 0xAABB_CCDD_1122_3344,
+            high: 0x5566_7788_99AA_BBCC,
+        },
+    );
+    state.set_xmm(
+        7,
+        XmmValue {
+            low: 0x0102_0304_0506_0708,
+            high: 0x1112_1314_1516_1718,
+        },
+    );
     state.mxcsr = 0x0000_1F80;
     // 1.5 and 2.5 are exactly representable as f64 → f80 → f64.
     state.x87.stack = vec![1.5, 2.5, -3.25];
@@ -51,8 +65,14 @@ fn fxsave_fxrstor_round_trip_preserves_xmm_mxcsr_and_x87() {
     // MXCSR_MASK at base+28.
     assert_eq!(memory.read_u32(base + 28).expect("mxcsr mask"), 0x0000_FFFF);
     // XMM0 at base+160.
-    assert_eq!(memory.read_u64(base + 160).expect("xmm0 low"), 0xAABB_CCDD_1122_3344);
-    assert_eq!(memory.read_u64(base + 168).expect("xmm0 high"), 0x5566_7788_99AA_BBCC);
+    assert_eq!(
+        memory.read_u64(base + 160).expect("xmm0 low"),
+        0xAABB_CCDD_1122_3344
+    );
+    assert_eq!(
+        memory.read_u64(base + 168).expect("xmm0 high"),
+        0x5566_7788_99AA_BBCC
+    );
 
     // Clobber all the saved state.
     state.set_xmm(0, XmmValue::default());
@@ -79,8 +99,17 @@ fn xsave_xrstor_round_trip_preserves_ymm_upper() {
     let base = 0x30_0000u64;
     memory.map_bytes(base, &[0u8; 1024]);
     state.set(Register::Rax, base);
-    state.set_xmm(1, XmmValue { low: 0xDEAD_BEEF_0000_0001, high: 0x0000_0000_CAFE_BABE });
-    state.ymm_upper[1] = XmmValue { low: 0x1111_2222_3333_4444, high: 0x5555_6666_7777_8888 };
+    state.set_xmm(
+        1,
+        XmmValue {
+            low: 0xDEAD_BEEF_0000_0001,
+            high: 0x0000_0000_CAFE_BABE,
+        },
+    );
+    state.ymm_upper[1] = XmmValue {
+        low: 0x1111_2222_3333_4444,
+        high: 0x5555_6666_7777_8888,
+    };
     state.mxcsr = 0x0000_9FC0;
 
     // XSAVE [rax]  (0F AE /4, modrm 0x20 → [rax])
@@ -89,8 +118,14 @@ fn xsave_xrstor_round_trip_preserves_ymm_upper() {
     // XSTATE_BV header at base+512 announces x87 | SSE | AVX.
     assert_eq!(memory.read_u64(base + 512).expect("xstate_bv"), 0b111);
     // YMM1 upper half at base+576+16.
-    assert_eq!(memory.read_u64(base + 592).expect("ymm1 upper low"), 0x1111_2222_3333_4444);
-    assert_eq!(memory.read_u64(base + 600).expect("ymm1 upper high"), 0x5555_6666_7777_8888);
+    assert_eq!(
+        memory.read_u64(base + 592).expect("ymm1 upper low"),
+        0x1111_2222_3333_4444
+    );
+    assert_eq!(
+        memory.read_u64(base + 600).expect("ymm1 upper high"),
+        0x5555_6666_7777_8888
+    );
 
     // Clobber.
     state.set_xmm(1, XmmValue::default());
@@ -210,7 +245,9 @@ fn hlt_terminates_with_halted_reason() {
     let mut state = CpuState::new(GuestArch::X64);
     let mut memory = MemoryImage::default();
 
-    let decoded = engine.decode_block(&[0xF4], 0x1400_000000).expect("decode HLT");
+    let decoded = engine
+        .decode_block(&[0xF4], 0x1400_000000)
+        .expect("decode HLT");
     let ir = casa1::cpu::lower_to_ir(&decoded).expect("lower HLT");
     let err = engine
         .execute_ir(&mut state, &mut memory, &ir)

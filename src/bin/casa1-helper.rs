@@ -37,9 +37,7 @@ mod macos_url_handler {
 
             // Set the handler for kAEGetURL events.
             // sel_registerName expects *const i8
-            let selector = sel_registerName(
-                "handleGetURLEvent:withReplyEvent:\0".as_ptr() as *const i8,
-            );
+            let selector = sel_registerName(c"handleGetURLEvent:withReplyEvent:".as_ptr());
             let _: () = msg_send![shared_mgr,
                 setEventHandler: shared_app
                 andSelector: selector

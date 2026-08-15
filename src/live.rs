@@ -1,15 +1,27 @@
 use crate::audio::WaveFormat;
 use crate::error::{AppError, AppResult};
 use crate::gfx::DxgiFormat;
+#[cfg(target_os = "macos")]
+use crate::mac_window;
 use crate::reason::ReasonCode;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
-use minifb::{Key, KeyRepeat, MouseButton as MinifbMouseButton, MouseMode, Scale, Window, WindowOptions};
-use std::fs;
+use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
+use minifb::{
+    Key, KeyRepeat, MouseButton as MinifbMouseButton, MouseMode, Scale, Window, WindowOptions,
+};
 use std::collections::{BTreeSet, VecDeque};
+use std::fs;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+
+/// Diagnostic trace: append a line (with newline) to /tmp/casa1_trace.log.
+/// Each open/close is deliberately per-call so the file is always flushed
+/// and readable from another process in real time.
+#[allow(dead_code)]
+pub fn live_trace(_line: &str) {
+    // Disabled — file I/O per call was a massive performance bottleneck.
+}
 
 const PLACEHOLDER_FRAME_WIDTH: usize = 160;
 const PLACEHOLDER_FRAME_HEIGHT: usize = 90;
@@ -47,6 +59,16 @@ pub enum LiveInputEvent {
         y: i32,
         left_pressed: bool,
         left_released: bool,
+        right_pressed: bool,
+        right_released: bool,
+        middle_pressed: bool,
+        middle_released: bool,
+    },
+    MouseScroll {
+        x: i32,
+        y: i32,
+        delta_x: i32,
+        delta_y: i32,
     },
     CloseRequested,
 }
@@ -101,36 +123,62 @@ pub fn run_live_host_session<T>(
     let mut latest_frame: Option<LiveFrame> = None;
     let mut close_requested = false;
     let mut held_scancodes = BTreeSet::new();
-    let mut showing_placeholder = true;
     let mut previous_mouse_pos = None;
     let mut left_mouse_down = false;
+    let mut right_mouse_down = false;
+    let mut middle_mouse_down = false;
+    let mut previous_scroll = (0i32, 0i32);
 
     window
         .update_with_buffer(&frame_buffer, frame_width, frame_height)
         .map_err(|error| {
             AppError::new(
                 ReasonCode::RcIo,
-                format!("failed to draw initial live placeholder frame: {error}"),
+                format!("failed to draw initial frame: {error}"),
             )
         })?;
 
+    let mut trace_no_frame_counter: u64 = 0;
+    let mut last_jit_watchdog = std::time::Instant::now();
     loop {
+        // Pump pending main-thread work (AppKit calls queued by the PE
+        // runtime worker via run_on_main).  This must happen before any
+        // frame processing so that window creation, layer attachment, and
+        // event polling dispatched from the worker thread are serviced
+        // promptly.
+        #[cfg(target_os = "macos")]
+        mac_window::pump_main_queue();
+
         audio.drain(&session.audio_rx);
+        let mut frames_this_iteration = 0u32;
         while let Ok(frame) = session.frame_rx.try_recv() {
             latest_frame = Some(frame);
+            frames_this_iteration += 1;
+        }
+
+        if frames_this_iteration > 0 {
+            live_trace(&format!("[live] received {frames_this_iteration} frame(s) — showing content now"));
+            trace_no_frame_counter = 0;
+        } else {
+            trace_no_frame_counter += 1;
+            if trace_no_frame_counter % 1000 == 0 {
+                live_trace(&format!(
+                    "[live] no frames yet after {} loop iterations (worker_finished={})",
+                    trace_no_frame_counter,
+                    worker.is_finished(),
+                ));
+            }
         }
 
         if latest_frame.is_none() && worker.is_finished() {
+            live_trace("[live] worker finished without producing any frames — exiting");
             break;
         }
 
         let mut frame_changed = false;
 
         if let Some(frame) = latest_frame.take() {
-            if showing_placeholder
-                || frame.width as usize != frame_width
-                || frame.height as usize != frame_height
-            {
+            if frame.width as usize != frame_width || frame.height as usize != frame_height {
                 window = create_window(title, frame.width as usize, frame.height as usize)?;
                 frame_width = frame.width as usize;
                 frame_height = frame.height as usize;
@@ -140,7 +188,6 @@ pub fn run_live_host_session<T>(
             }
             decode_frame_buffer_into(&frame, &mut frame_buffer)?;
             frame_changed = true;
-            showing_placeholder = false;
         }
 
         pump_keyboard(&window, &session.input_tx, &mut held_scancodes);
@@ -149,10 +196,15 @@ pub fn run_live_host_session<T>(
             &session.input_tx,
             &mut previous_mouse_pos,
             &mut left_mouse_down,
+            &mut right_mouse_down,
+            &mut middle_mouse_down,
+            &mut previous_scroll,
         );
         if window.is_key_down(Key::Escape) && !close_requested {
             release_held_keys(&session.input_tx, &mut held_scancodes);
-            let _ = session.input_tx.send(LiveInputEvent::CloseRequested);
+            if let Err(e) = session.input_tx.send(LiveInputEvent::CloseRequested) {
+                eprintln!("[live] failed to send CloseRequested (Escape): {e}");
+            }
             close_requested = true;
         }
 
@@ -167,29 +219,79 @@ pub fn run_live_host_session<T>(
                 })?;
         } else {
             window.update();
+
+            // ── JIT watchdog: force chain-breaking across threads ────────────
+            // If the PE runtime worker is stuck inside JIT-compiled block
+            // chains (pure ARM64 B instructions that never return to the
+            // dispatcher), neither the main loop's yield check NOR its
+            // chain-break timer will ever fire.
+            //
+            // This watchdog calls `force_break_all_chains()` every ~500 ms,
+            // which physically writes RET instructions over every chain patch
+            // location in the compiled code.  On the next chained-block
+            // boundary, execution will return to the dispatcher where the
+            // CPU yield and GDI frame pipeline can run.
+            //
+            // Also set `JIT_CHAIN_BREAK_REQUESTED` so that `chain_blocks()`
+            // (called from `get_or_compile`) refuses to form new chains
+            // until the flag is cleared by the main loop.
+            if last_jit_watchdog.elapsed().as_millis() >= 500 {
+                crate::jit::JIT_CHAIN_BREAK_REQUESTED
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                crate::jit::force_break_all_chains();
+                last_jit_watchdog = std::time::Instant::now();
+                // permission toggle occurs. The race window is microseconds.
+                let sigbus_total = crate::jit::SIGBUS_TOTAL_EVENTS
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let storm = crate::jit::JIT_FAULT_STORM_DISABLED
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                live_trace(&format!(
+                    "[live] jit watchdog: requested chain break (sigbus_total={sigbus_total} storm_disabled={storm})"
+                ));
+            }
+
+            // Yield the CPU when no new frame is available to prevent
+            // 99% CPU usage from tight polling in the live session loop.
+            // An 8 ms sleep limits the idle poll rate to ~125 Hz, which
+            // is more than enough for UI responsiveness while keeping
+            // CPU usage near zero when Steam is rendering through its
+            // own native windows (not through the live frame pipeline).
+            std::thread::sleep(std::time::Duration::from_millis(8));
         }
 
         if !window.is_open() && !close_requested {
             release_held_keys(&session.input_tx, &mut held_scancodes);
-            let _ = session.input_tx.send(LiveInputEvent::CloseRequested);
+            if let Err(e) = session.input_tx.send(LiveInputEvent::CloseRequested) {
+                eprintln!("[live] failed to send CloseRequested (window closed): {e}");
+            }
             close_requested = true;
         }
 
         if worker.is_finished() {
+            live_trace("[live] worker finished — exiting main loop");
             break;
         }
     }
 
-    worker
-        .join()
-        .map_err(|_| AppError::new(ReasonCode::RcRunnerProtocolInvalid, "live PE worker panicked"))?
+    live_trace("[live] run_live_host_session exiting — joining worker thread");
+
+    worker.join().map_err(|_| {
+        live_trace("[live] worker thread panicked!");
+        AppError::new(
+            ReasonCode::RcRunnerProtocolInvalid,
+            "live PE worker panicked",
+        )
+    })?
 }
 
 fn create_window(title: &str, width: usize, height: usize) -> AppResult<Window> {
+    let window_title = if title.is_empty() {
+        "Casa1".to_string()
+    } else {
+        title.to_string()
+    };
     let mut window = Window::new(
-        &format!(
-            "{title}  |  A/D move  S soft drop  W/Q rotate  Space hard drop  Enter start  P pause  N/R new  Esc quit"
-        ),
+        &window_title,
         width,
         height,
         WindowOptions {
@@ -209,7 +311,6 @@ fn create_window(title: &str, width: usize, height: usize) -> AppResult<Window> 
         window.topmost(true);
         window.set_position(LIVE_WINDOW_OFFSET, LIVE_WINDOW_OFFSET);
     }
-    window.set_target_fps(240);
     Ok(window)
 }
 
@@ -218,33 +319,13 @@ where
     F: FnMut(Key) -> bool,
 {
     let mut scancodes = BTreeSet::new();
-
-    if is_key_down(Key::A) || is_key_down(Key::Left) {
-        scancodes.insert(0x1e);
-    }
-    if is_key_down(Key::D) || is_key_down(Key::Right) {
-        scancodes.insert(0x20);
-    }
-    if is_key_down(Key::S) || is_key_down(Key::Down) {
-        scancodes.insert(0x1f);
-    }
-
-    for key in [
-        Key::W,
-        Key::Up,
-        Key::Q,
-        Key::C,
-        Key::P,
-        Key::N,
-        Key::R,
-        Key::Enter,
-        Key::Space,
-    ] {
-        if let Some(scancode) = map_action_key_to_scancode(key).filter(|_| is_key_down(key)) {
-            scancodes.insert(scancode);
+    for key in ALL_MAPPED_KEYS {
+        if is_key_down(*key) {
+            if let Some(scancode) = map_key_to_scancode(*key) {
+                scancodes.insert(scancode);
+            }
         }
     }
-
     scancodes
 }
 
@@ -256,10 +337,7 @@ where
     collect_scancodes_for_frame(|key| keys.contains(&key))
 }
 
-fn scancode_transitions(
-    previous: &BTreeSet<u16>,
-    current: &BTreeSet<u16>,
-) -> (Vec<u16>, Vec<u16>) {
+fn scancode_transitions(previous: &BTreeSet<u16>, current: &BTreeSet<u16>) -> (Vec<u16>, Vec<u16>) {
     let pressed = current.difference(previous).copied().collect();
     let released = previous.difference(current).copied().collect();
     (pressed, released)
@@ -291,7 +369,11 @@ fn scancode_events_for_frame(
     (pressed, released)
 }
 
-fn pump_keyboard(window: &Window, input_tx: &Sender<LiveInputEvent>, held_scancodes: &mut BTreeSet<u16>) {
+fn pump_keyboard(
+    window: &Window,
+    input_tx: &Sender<LiveInputEvent>,
+    held_scancodes: &mut BTreeSet<u16>,
+) {
     let shift = window.is_key_down(Key::LeftShift) || window.is_key_down(Key::RightShift);
     let altgr = window.is_key_down(Key::RightAlt);
     let current_scancodes = collect_scancodes_for_frame(|key| window.is_key_down(key));
@@ -319,43 +401,91 @@ fn pump_mouse(
     input_tx: &Sender<LiveInputEvent>,
     previous_mouse_pos: &mut Option<(i32, i32)>,
     left_mouse_down: &mut bool,
+    right_mouse_down: &mut bool,
+    middle_mouse_down: &mut bool,
+    previous_scroll: &mut (i32, i32),
 ) {
     let current_mouse_pos = window
         .get_mouse_pos(MouseMode::Clamp)
         .map(|(x, y)| (x.round() as i32, y.round() as i32));
     let current_left_down = window.get_mouse_down(MinifbMouseButton::Left);
+    let current_right_down = window.get_mouse_down(MinifbMouseButton::Right);
+    let current_middle_down = window.get_mouse_down(MinifbMouseButton::Middle);
     let left_pressed = current_left_down && !*left_mouse_down;
     let left_released = !current_left_down && *left_mouse_down;
+    let right_pressed = current_right_down && !*right_mouse_down;
+    let right_released = !current_right_down && *right_mouse_down;
+    let middle_pressed = current_middle_down && !*middle_mouse_down;
+    let middle_released = !current_middle_down && *middle_mouse_down;
+
+    // Scroll wheel
+    if let Some(scroll) = window.get_scroll_wheel() {
+        let scroll_delta_y = scroll.1 - previous_scroll.1 as f32;
+        let scroll_delta_x = scroll.0 - previous_scroll.0 as f32;
+        if scroll_delta_y.abs() >= 1.0 || scroll_delta_x.abs() >= 1.0 {
+            if let Some((x, y)) = current_mouse_pos {
+                if let Err(e) = input_tx.send(LiveInputEvent::MouseScroll {
+                    x,
+                    y,
+                    delta_x: scroll_delta_x as i32,
+                    delta_y: scroll_delta_y as i32,
+                }) {
+                    eprintln!("[live] failed to send mouse scroll event: {e}");
+                }
+            }
+        }
+        *previous_scroll = (scroll.0 as i32, scroll.1 as i32);
+    }
+
+    let mouse_changed = current_mouse_pos != *previous_mouse_pos
+        || left_pressed
+        || left_released
+        || right_pressed
+        || right_released
+        || middle_pressed
+        || middle_released;
 
     if let Some((x, y)) = current_mouse_pos {
-        if current_mouse_pos != *previous_mouse_pos || left_pressed || left_released {
-            let _ = input_tx.send(LiveInputEvent::MouseInput {
+        if mouse_changed {
+            if let Err(e) = input_tx.send(LiveInputEvent::MouseInput {
                 x,
                 y,
                 left_pressed,
                 left_released,
-            });
+                right_pressed,
+                right_released,
+                middle_pressed,
+                middle_released,
+            }) {
+                eprintln!("[live] failed to send mouse input event: {e}");
+            }
         }
     }
 
     *previous_mouse_pos = current_mouse_pos;
     *left_mouse_down = current_left_down;
+    *right_mouse_down = current_right_down;
+    *middle_mouse_down = current_middle_down;
 }
 
 fn send_key_down(input_tx: &Sender<LiveInputEvent>, scancode: u16, shift: bool, altgr: bool) {
-    let _ = input_tx.send(LiveInputEvent::KeyDown {
+    if let Err(e) = input_tx.send(LiveInputEvent::KeyDown {
         scancode,
         shift,
         altgr,
-    });
+    }) {
+        eprintln!("[live] failed to send KeyDown scancode={scancode}: {e}");
+    }
 }
 
 fn send_key_up(input_tx: &Sender<LiveInputEvent>, scancode: u16, shift: bool, altgr: bool) {
-    let _ = input_tx.send(LiveInputEvent::KeyUp {
+    if let Err(e) = input_tx.send(LiveInputEvent::KeyUp {
         scancode,
         shift,
         altgr,
-    });
+    }) {
+        eprintln!("[live] failed to send KeyUp scancode={scancode}: {e}");
+    }
 }
 
 fn release_held_keys(input_tx: &Sender<LiveInputEvent>, held_scancodes: &mut BTreeSet<u16>) {
@@ -365,16 +495,233 @@ fn release_held_keys(input_tx: &Sender<LiveInputEvent>, held_scancodes: &mut BTr
     held_scancodes.clear();
 }
 
-fn map_action_key_to_scancode(key: Key) -> Option<u16> {
+/// All keys we track for scancode mapping.
+const ALL_MAPPED_KEYS: &[Key] = &[
+    // Letters
+    Key::A,
+    Key::B,
+    Key::C,
+    Key::D,
+    Key::E,
+    Key::F,
+    Key::G,
+    Key::H,
+    Key::I,
+    Key::J,
+    Key::K,
+    Key::L,
+    Key::M,
+    Key::N,
+    Key::O,
+    Key::P,
+    Key::Q,
+    Key::R,
+    Key::S,
+    Key::T,
+    Key::U,
+    Key::V,
+    Key::W,
+    Key::X,
+    Key::Y,
+    Key::Z,
+    // Numbers (top row)
+    Key::Key0,
+    Key::Key1,
+    Key::Key2,
+    Key::Key3,
+    Key::Key4,
+    Key::Key5,
+    Key::Key6,
+    Key::Key7,
+    Key::Key8,
+    Key::Key9,
+    // Function keys
+    Key::F1,
+    Key::F2,
+    Key::F3,
+    Key::F4,
+    Key::F5,
+    Key::F6,
+    Key::F7,
+    Key::F8,
+    Key::F9,
+    Key::F10,
+    Key::F11,
+    Key::F12,
+    // Navigation
+    Key::Up,
+    Key::Down,
+    Key::Left,
+    Key::Right,
+    Key::Home,
+    Key::End,
+    Key::PageUp,
+    Key::PageDown,
+    Key::Insert,
+    Key::Delete,
+    // Modifiers
+    Key::LeftShift,
+    Key::RightShift,
+    Key::LeftCtrl,
+    Key::RightCtrl,
+    Key::LeftAlt,
+    Key::RightAlt,
+    // Punctuation / symbols
+    Key::Space,
+    Key::Enter,
+    Key::Backspace,
+    Key::Tab,
+    Key::Escape,
+    Key::Backquote,
+    Key::Minus,
+    Key::Equal,
+    Key::LeftBracket,
+    Key::RightBracket,
+    Key::Backslash,
+    Key::Semicolon,
+    Key::Apostrophe,
+    Key::Comma,
+    Key::Period,
+    Key::Slash,
+    // Keypad
+    Key::NumPad0,
+    Key::NumPad1,
+    Key::NumPad2,
+    Key::NumPad3,
+    Key::NumPad4,
+    Key::NumPad5,
+    Key::NumPad6,
+    Key::NumPad7,
+    Key::NumPad8,
+    Key::NumPad9,
+    Key::NumPadPlus,
+    Key::NumPadMinus,
+    Key::NumPadAsterisk,
+    Key::NumPadSlash,
+    Key::NumPadDot,
+    Key::NumPadEnter,
+    // Lock keys
+    Key::CapsLock,
+    Key::NumLock,
+    Key::ScrollLock,
+    // Misc
+    Key::Pause,
+    Key::Menu,
+];
+
+fn map_key_to_scancode(key: Key) -> Option<u16> {
     match key {
-        Key::W | Key::Up => Some(0x11),
-        Key::Q => Some(0x10),
+        // Letters (PC scancodes, set 1)
+        Key::A => Some(0x1e),
+        Key::B => Some(0x30),
         Key::C => Some(0x2e),
-        Key::P => Some(0x19),
+        Key::D => Some(0x20),
+        Key::E => Some(0x12),
+        Key::F => Some(0x21),
+        Key::G => Some(0x22),
+        Key::H => Some(0x23),
+        Key::I => Some(0x17),
+        Key::J => Some(0x24),
+        Key::K => Some(0x25),
+        Key::L => Some(0x26),
+        Key::M => Some(0x32),
         Key::N => Some(0x31),
+        Key::O => Some(0x18),
+        Key::P => Some(0x19),
+        Key::Q => Some(0x10),
         Key::R => Some(0x13),
-        Key::Enter => Some(0x1c),
+        Key::S => Some(0x1f),
+        Key::T => Some(0x14),
+        Key::U => Some(0x16),
+        Key::V => Some(0x2f),
+        Key::W => Some(0x11),
+        Key::X => Some(0x2d),
+        Key::Y => Some(0x15),
+        Key::Z => Some(0x2c),
+        // Numbers (top row)
+        Key::Key0 => Some(0x0b),
+        Key::Key1 => Some(0x02),
+        Key::Key2 => Some(0x03),
+        Key::Key3 => Some(0x04),
+        Key::Key4 => Some(0x05),
+        Key::Key5 => Some(0x06),
+        Key::Key6 => Some(0x07),
+        Key::Key7 => Some(0x08),
+        Key::Key8 => Some(0x09),
+        Key::Key9 => Some(0x0a),
+        // Function keys
+        Key::F1 => Some(0x3b),
+        Key::F2 => Some(0x3c),
+        Key::F3 => Some(0x3d),
+        Key::F4 => Some(0x3e),
+        Key::F5 => Some(0x3f),
+        Key::F6 => Some(0x40),
+        Key::F7 => Some(0x41),
+        Key::F8 => Some(0x42),
+        Key::F9 => Some(0x43),
+        Key::F10 => Some(0x44),
+        Key::F11 => Some(0x57),
+        Key::F12 => Some(0x58),
+        // Navigation (arrow keys alias to WASD for movement)
+        Key::Up => Some(0x11),    // W
+        Key::Down => Some(0x1f),  // S
+        Key::Left => Some(0x1e),  // A
+        Key::Right => Some(0x20), // D
+        Key::Home => Some(0x47),
+        Key::End => Some(0x4f),
+        Key::PageUp => Some(0x49),
+        Key::PageDown => Some(0x51),
+        Key::Insert => Some(0x52),
+        Key::Delete => Some(0x53),
+        // Modifiers
+        Key::LeftShift => Some(0x2a),
+        Key::RightShift => Some(0x36),
+        Key::LeftCtrl => Some(0x1d),
+        Key::RightCtrl => Some(0x1d), // Ctrl scancode same, distinguished by extended bit
+        Key::LeftAlt => Some(0x38),
+        Key::RightAlt => Some(0x38), // Alt scancode same, distinguished by extended bit
+        // Action keys
         Key::Space => Some(0x39),
+        Key::Enter => Some(0x1c),
+        Key::Backspace => Some(0x0e),
+        Key::Tab => Some(0x0f),
+        Key::Escape => Some(0x01),
+        // Punctuation / symbols
+        Key::Backquote => Some(0x29),
+        Key::Minus => Some(0x0c),
+        Key::Equal => Some(0x0d),
+        Key::LeftBracket => Some(0x1a),
+        Key::RightBracket => Some(0x1b),
+        Key::Backslash => Some(0x2b),
+        Key::Semicolon => Some(0x27),
+        Key::Apostrophe => Some(0x28),
+        Key::Comma => Some(0x33),
+        Key::Period => Some(0x34),
+        Key::Slash => Some(0x35),
+        // Keypad
+        Key::NumPad0 => Some(0x52),
+        Key::NumPad1 => Some(0x4f),
+        Key::NumPad2 => Some(0x50),
+        Key::NumPad3 => Some(0x51),
+        Key::NumPad4 => Some(0x4b),
+        Key::NumPad5 => Some(0x4c),
+        Key::NumPad6 => Some(0x4d),
+        Key::NumPad7 => Some(0x47),
+        Key::NumPad8 => Some(0x48),
+        Key::NumPad9 => Some(0x49),
+        Key::NumPadPlus => Some(0x4e),
+        Key::NumPadMinus => Some(0x4a),
+        Key::NumPadAsterisk => Some(0x37),
+        Key::NumPadSlash => Some(0x35), // extended
+        Key::NumPadDot => Some(0x53),
+        Key::NumPadEnter => Some(0x1c), // extended
+        // Lock keys
+        Key::CapsLock => Some(0x3a),
+        Key::NumLock => Some(0x45),
+        Key::ScrollLock => Some(0x46),
+        // Misc
+        Key::Pause => Some(0x45), // Ctrl+Pause = 0x46 for Break
+        Key::Menu => Some(0x5d),  // Application key (extended)
         _ => None,
     }
 }
@@ -383,7 +730,12 @@ fn decode_frame_buffer_into(frame: &LiveFrame, buffer: &mut Vec<u32>) -> AppResu
     let expected_bytes = (frame.width as usize)
         .checked_mul(frame.height as usize)
         .and_then(|pixel_count| pixel_count.checked_mul(4))
-        .ok_or_else(|| AppError::new(ReasonCode::RcD3dInvalidState, "live frame dimensions overflow"))?;
+        .ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                "live frame dimensions overflow",
+            )
+        })?;
     if frame.bytes.len() < expected_bytes {
         return Err(AppError::new(
             ReasonCode::RcD3dInvalidState,
@@ -411,7 +763,7 @@ fn decode_frame_buffer_into(frame: &LiveFrame, buffer: &mut Vec<u32>) -> AppResu
             return Err(AppError::new(
                 ReasonCode::RcD3dInvalidState,
                 format!("live frame presentation does not support {other:?}"),
-            ))
+            ));
         }
     }
     Ok(())
@@ -430,7 +782,12 @@ fn export_live_frame(frame: &LiveFrame, path: &Path) -> AppResult<()> {
     let expected_bytes = (frame.width as usize)
         .checked_mul(frame.height as usize)
         .and_then(|pixel_count| pixel_count.checked_mul(4))
-        .ok_or_else(|| AppError::new(ReasonCode::RcD3dInvalidState, "live frame dimensions overflow"))?;
+        .ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                "live frame dimensions overflow",
+            )
+        })?;
     if frame.bytes.len() < expected_bytes {
         return Err(AppError::new(
             ReasonCode::RcD3dInvalidState,
@@ -458,7 +815,7 @@ fn export_live_frame(frame: &LiveFrame, path: &Path) -> AppResult<()> {
             return Err(AppError::new(
                 ReasonCode::RcD3dInvalidState,
                 format!("live frame export does not support {other:?}"),
-            ))
+            ));
         }
     }
 
@@ -481,7 +838,10 @@ impl LiveAudioOutput {
     fn new() -> AppResult<Self> {
         let host = cpal::default_host();
         let device = host.default_output_device().ok_or_else(|| {
-            AppError::new(ReasonCode::RcAudioUnsupported, "no host audio output device is available")
+            AppError::new(
+                ReasonCode::RcAudioUnsupported,
+                "no host audio output device is available",
+            )
         })?;
         let supported_config = device.default_output_config().map_err(|error| {
             AppError::new(
@@ -494,7 +854,9 @@ impl LiveAudioOutput {
         let queue = Arc::new(Mutex::new(VecDeque::new()));
         let callback_queue = Arc::clone(&queue);
         let error_callback = |error| {
-            eprintln!("{{\"reason_code\":1017,\"reason_name\":\"RC_AUDIO_UNSUPPORTED\",\"message\":\"live audio stream error: {error}\",\"reproduction_hints\":[]}}");
+            eprintln!(
+                "{{\"reason_code\":1017,\"reason_name\":\"RC_AUDIO_UNSUPPORTED\",\"message\":\"live audio stream error: {error}\",\"reproduction_hints\":[]}}"
+            );
         };
         let stream_config = supported_config.config();
         let stream = match supported_config.sample_format() {
@@ -520,7 +882,7 @@ impl LiveAudioOutput {
                 return Err(AppError::new(
                     ReasonCode::RcAudioUnsupported,
                     format!("unsupported host audio sample format {other:?}"),
-                ))
+                ));
             }
         }
         .map_err(|error| {
@@ -618,7 +980,8 @@ fn adapt_audio_chunk(
     let output_frames = if input_sample_rate == output_sample_rate {
         input_frames
     } else {
-        ((input_frames as u64 * output_sample_rate as u64) / input_sample_rate as u64).max(1) as usize
+        ((input_frames as u64 * output_sample_rate as u64) / input_sample_rate as u64).max(1)
+            as usize
     };
     let mut output = vec![0.0; output_frames * output_channels];
     for output_frame in 0..output_frames {
@@ -630,7 +993,8 @@ fn adapt_audio_chunk(
         .min(input_frames - 1);
         let source = &samples[input_frame * input_channels..(input_frame + 1) * input_channels];
         for channel in 0..output_channels {
-            output[output_frame * output_channels + channel] = remap_channel(source, channel, output_channels);
+            output[output_frame * output_channels + channel] =
+                remap_channel(source, channel, output_channels);
         }
     }
     output
@@ -656,7 +1020,10 @@ mod tests {
 
         let scancodes = collect_scancodes_for_frame(|key| held.contains(&key));
 
-        assert_eq!(scancodes.into_iter().collect::<Vec<_>>(), vec![0x19, 0x1e, 0x1f, 0x39]);
+        assert_eq!(
+            scancodes.into_iter().collect::<Vec<_>>(),
+            vec![0x19, 0x1e, 0x1f, 0x39]
+        );
     }
 
     #[test]

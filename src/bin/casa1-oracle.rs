@@ -69,7 +69,10 @@ fn section2_path_suite() -> PathEdgeSuite {
     );
     PathEdgeSuite {
         cases: vec![
-            ("C:\\Alpha\\Beta\\.\\Gamma\\..\\File.txt. ".to_string(), false),
+            (
+                "C:\\Alpha\\Beta\\.\\Gamma\\..\\File.txt. ".to_string(),
+                false,
+            ),
             ("\\\\?\\C:\\Alpha\\Beta. ".to_string(), false),
             ("\\\\.\\pipe\\steam".to_string(), false),
             ("C:\\Temp\\NUL".to_string(), false),
@@ -179,10 +182,7 @@ fn section3_dll_order_suite() -> DllOrderSuite {
             "game.exe".to_string(),
             vec!["kernel32.dll".to_string(), "user32.dll".to_string()],
         ),
-        (
-            "user32.dll".to_string(),
-            vec!["gdi32.dll".to_string()],
-        ),
+        ("user32.dll".to_string(), vec!["gdi32.dll".to_string()]),
         ("gdi32.dll".to_string(), Vec::new()),
         ("kernel32.dll".to_string(), Vec::new()),
     ]);
@@ -296,7 +296,9 @@ impl OracleDirectory {
     }
 
     fn resolve(&self, requested: &str) -> Option<String> {
-        self.by_folded_name.get(&oracle_fold_key(requested)).cloned()
+        self.by_folded_name
+            .get(&oracle_fold_key(requested))
+            .cloned()
     }
 
     fn enumeration(&self) -> Vec<String> {
@@ -417,7 +419,11 @@ fn oracle_fold_key(value: &str) -> String {
     folded
 }
 
-fn share_conflict(existing: &OracleOpenState, desired_access: OracleFileAccess, share_mode: OracleShareMode) -> bool {
+fn share_conflict(
+    existing: &OracleOpenState,
+    desired_access: OracleFileAccess,
+    share_mode: OracleShareMode,
+) -> bool {
     (desired_access.read && !existing.share_mode.read)
         || (desired_access.write && !existing.share_mode.write)
         || (desired_access.delete && !existing.share_mode.delete)
@@ -426,13 +432,21 @@ fn share_conflict(existing: &OracleOpenState, desired_access: OracleFileAccess, 
         || (existing.desired_access.delete && !share_mode.delete)
 }
 
-fn ranges_overlap(left_offset: u64, left_length: u64, right_offset: u64, right_length: u64) -> bool {
+fn ranges_overlap(
+    left_offset: u64,
+    left_length: u64,
+    right_offset: u64,
+    right_length: u64,
+) -> bool {
     let left_end = left_offset.saturating_add(left_length);
     let right_end = right_offset.saturating_add(right_length);
     left_offset < right_end && right_offset < left_end
 }
 
-fn oracle_load_order(root_module: &str, dependencies: &BTreeMap<String, Vec<String>>) -> Vec<String> {
+fn oracle_load_order(
+    root_module: &str,
+    dependencies: &BTreeMap<String, Vec<String>>,
+) -> Vec<String> {
     let mut visiting = BTreeSet::new();
     let mut visited = BTreeSet::new();
     let mut order = Vec::new();
@@ -525,7 +539,13 @@ fn resolve_delay_expectation(
             code: STATUS_DLL_NOT_FOUND,
         };
     };
-    match oracle_lookup_export(symbol, &resolved_module, exports, provider_exports, &mut BTreeSet::new()) {
+    match oracle_lookup_export(
+        symbol,
+        &resolved_module,
+        exports,
+        provider_exports,
+        &mut BTreeSet::new(),
+    ) {
         Some(export) => DelayLoadExpectation::Resolved { export },
         None => DelayLoadExpectation::StructuredException {
             code: STATUS_ENTRYPOINT_NOT_FOUND,
@@ -559,7 +579,13 @@ fn oracle_lookup_export(
         ExportSpecTarget::Forwarder { value } => {
             let (module_name, forwarded_symbol) = parse_forwarder(value)?;
             let exports = provider_exports.get(&module_name)?;
-            oracle_lookup_export(&forwarded_symbol, &module_name, exports, provider_exports, visited)
+            oracle_lookup_export(
+                &forwarded_symbol,
+                &module_name,
+                exports,
+                provider_exports,
+                visited,
+            )
         }
     }
 }
@@ -568,7 +594,10 @@ fn parse_forwarder(value: &str) -> Option<(String, DelayLoadSymbol)> {
     let (module, symbol) = value.split_once('.')?;
     if let Some(rest) = symbol.strip_prefix('#') {
         let ordinal = rest.parse::<u16>().ok()?;
-        Some((normalize_module_name(module), DelayLoadSymbol::ByOrdinal { ordinal }))
+        Some((
+            normalize_module_name(module),
+            DelayLoadSymbol::ByOrdinal { ordinal },
+        ))
     } else {
         Some((
             normalize_module_name(module),
@@ -587,7 +616,9 @@ fn oracle_api_set_resolve(dll_name: &str) -> String {
     if normalized.starts_with("api-ms-win-crt-") {
         return "ucrtbase.dll".to_string();
     }
-    if normalized.starts_with("api-ms-win-security-") || normalized.starts_with("api-ms-win-service-") {
+    if normalized.starts_with("api-ms-win-security-")
+        || normalized.starts_with("api-ms-win-service-")
+    {
         return "advapi32.dll".to_string();
     }
     if normalized.starts_with("api-ms-win-shell-") {

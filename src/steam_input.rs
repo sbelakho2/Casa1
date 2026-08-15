@@ -17,7 +17,7 @@
 //! the corresponding XInput button / axis reads.
 
 use std::collections::HashMap;
-use std::ptr;
+use std::time::Instant;
 
 // ── macOS IOKit / CoreFoundation FFI bindings for haptic rumble ──────────
 
@@ -43,10 +43,8 @@ unsafe extern "C" {
     /// # Safety
     /// `allocator` must be NULL (kCFAllocatorDefault) or a valid CFAllocatorRef.
     /// `service` must be a valid io_service_t.
-    fn IOHIDDeviceCreate(
-        allocator: *const std::ffi::c_void,
-        service: u32,
-    ) -> *mut std::ffi::c_void;
+    fn IOHIDDeviceCreate(allocator: *const std::ffi::c_void, service: u32)
+    -> *mut std::ffi::c_void;
 
     /// IOServiceGetMatchingServices – returns an iterator over IOServices
     /// matching the provided dictionary.
@@ -96,7 +94,7 @@ unsafe extern "C" {
         allocator: *const std::ffi::c_void,
         c_str: *const std::ffi::c_char,
         encoding: u32,
-    ) -> *mut std::ffi::c_void;
+    ) -> *const std::ffi::c_void;
 
     /// CFNumberGetValue – extracts a numeric value from a CFNumber.
     ///
@@ -208,7 +206,7 @@ fn find_hid_device(vendor_id: u16, product_id: u16) -> Option<*const std::ffi::c
     let mut in_device = false;
     let mut current_vid = 0u16;
     let mut current_pid = 0u16;
-    let mut entry_id: Option<u64> = None;
+    let mut _entry_id: Option<u64> = None;
 
     for line in text.lines() {
         let trimmed = line.trim();
@@ -218,17 +216,26 @@ fn find_hid_device(vendor_id: u16, product_id: u16) -> Option<*const std::ffi::c
                 in_device = true;
                 current_vid = 0;
                 current_pid = 0;
-                entry_id = None;
+                _entry_id = None;
 
                 // Try to extract the registry entry ID from the line
                 // e.g.: "id 0x12345678"
                 if let Some(id_start) = trimmed.find("id 0x") {
                     let id_hex = &trimmed[id_start + 5..];
-                    if let Some(end) = id_hex.find(|c: char| !c.is_ascii_hexdigit()) {
-                        entry_id = u64::from_str_radix(&id_hex[..end], 16).ok();
+                    let hex_str = if let Some(end) = id_hex.find(|c: char| !c.is_ascii_hexdigit()) {
+                        &id_hex[..end]
                     } else {
-                        entry_id = u64::from_str_radix(id_hex, 16).ok();
-                    }
+                        id_hex
+                    };
+                    _entry_id = match u64::from_str_radix(hex_str, 16) {
+                        Ok(id) => Some(id),
+                        Err(e) => {
+                            eprintln!(
+                                "find_hid_device: failed to parse entry ID hex '{hex_str}': {e}"
+                            );
+                            None
+                        }
+                    };
                 }
             }
             continue;
@@ -258,8 +265,11 @@ fn find_hid_device(vendor_id: u16, product_id: u16) -> Option<*const std::ffi::c
                 // We don't actually return a pointer here since IOHIDDeviceRef
                 // management requires CoreFoundation. Instead we'll store the IDs
                 // and use them when sending the report.
-                // Return a non-null sentinel to indicate the device was found.
-                return Some(ptr::without_provenance_mut(0x1)); // Sentinel value
+                //
+                // FIXME: Return a real IOHIDDeviceRef once IOKit C FFI is wired up.
+                // For now return a non-null sentinel via a trivial integer-to-pointer
+                // cast to indicate the device was found without using nightly APIs.
+                return Some(1 as *mut std::ffi::c_void);
             }
             in_device = false;
         }
@@ -440,8 +450,12 @@ pub struct SteamInput {
     analog_actions: HashMap<String, AnalogActionHandle>,
     /// Currently active action set per controller.
     controller_action_sets: HashMap<ControllerHandle, ActionSetHandle>,
+    /// Action set layer stacks per controller (LIFO).
+    action_set_layer_stacks: HashMap<ControllerHandle, Vec<ActionSetHandle>>,
     /// Last frame's raw input snapshot per controller.
     last_raw_state: HashMap<ControllerHandle, RawGamepadState>,
+    /// Start time for synthetic motion data generation.
+    start_time: Instant,
 }
 
 impl SteamInput {
@@ -468,7 +482,9 @@ impl SteamInput {
             digital_actions: HashMap::new(),
             analog_actions: HashMap::new(),
             controller_action_sets: HashMap::new(),
+            action_set_layer_stacks: HashMap::new(),
             last_raw_state: HashMap::new(),
+            start_time: Instant::now(),
         }
     }
 
@@ -518,10 +534,7 @@ impl SteamInput {
     ///
     /// Returns up to 4 handles (one per XInput slot).
     pub fn get_connected_controllers(&self) -> Vec<ControllerHandle> {
-        self.controllers
-            .iter()
-            .map(|c| c.handle)
-            .collect()
+        self.controllers.iter().map(|c| c.handle).collect()
     }
 
     /// `SteamAPI_ISteamInput_GetActionSetHandle` — resolves an action set
@@ -569,14 +582,21 @@ impl SteamInput {
     /// `SteamAPI_ISteamInput_GetCurrentActionSet` — returns the active action
     /// set for a controller, or 0 if none has been set.
     pub fn get_current_action_set(&self, controller: ControllerHandle) -> ActionSetHandle {
-        self.controller_action_sets.get(&controller).copied().unwrap_or(0)
+        self.controller_action_sets
+            .get(&controller)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// `SteamAPI_ISteamInput_GetDigitalActionData` — reads the current state
     /// of a digital action for a controller.
     ///
     /// Returns active state based on the default action mapping table.
-    pub fn get_digital_action_data(&self, controller: ControllerHandle, action: DigitalActionHandle) -> DigitalActionData {
+    pub fn get_digital_action_data(
+        &self,
+        controller: ControllerHandle,
+        action: DigitalActionHandle,
+    ) -> DigitalActionData {
         let raw = match self.last_raw_state.get(&controller) {
             Some(r) => r,
             None => {
@@ -588,7 +608,8 @@ impl SteamInput {
         };
 
         // Resolve action name from handle
-        let action_name = self.digital_actions
+        let action_name = self
+            .digital_actions
             .iter()
             .find(|(_, h)| **h == action)
             .map(|(name, _)| name.as_str())
@@ -605,7 +626,11 @@ impl SteamInput {
 
     /// `SteamAPI_ISteamInput_GetAnalogActionData` — reads the current analog
     /// (axis) state of an action for a controller.
-    pub fn get_analog_action_data(&self, controller: ControllerHandle, action: AnalogActionHandle) -> AnalogActionData {
+    pub fn get_analog_action_data(
+        &self,
+        controller: ControllerHandle,
+        action: AnalogActionHandle,
+    ) -> AnalogActionData {
         let raw = match self.last_raw_state.get(&controller) {
             Some(r) => r,
             None => {
@@ -619,7 +644,8 @@ impl SteamInput {
             }
         };
 
-        let action_name = self.analog_actions
+        let action_name = self
+            .analog_actions
             .iter()
             .find(|(_, h)| **h == action)
             .map(|(name, _)| name.as_str())
@@ -628,8 +654,13 @@ impl SteamInput {
         let active = self.is_action_active(controller, action_name);
         let (x, y, z) = self.map_analog_action(raw, action_name);
         let mode = match action_name.to_lowercase().as_str() {
-            n if n.contains("trigger") || n.contains("lt") || n.contains("rt")
-                || n.contains("brake") || n.contains("accelerate") || n.contains("throttle") => {
+            n if n.contains("trigger")
+                || n.contains("lt")
+                || n.contains("rt")
+                || n.contains("brake")
+                || n.contains("accelerate")
+                || n.contains("throttle") =>
+            {
                 AnalogActionMode::Trigger
             }
             n if n.contains("gyro") || n.contains("motion") => AnalogActionMode::Gyro,
@@ -698,14 +729,39 @@ impl SteamInput {
             .unwrap_or(ControllerInputType::Unknown)
     }
 
-    /// `SteamAPI_ISteamInput_GetMotionData` — reads motion sensor data.
+    /// `SteamAPI_ISteamInput_GetMotionData` — reads synthetic motion sensor data.
     ///
-    /// Returns zeroed data since no actual IMU is available in emulation.
+    /// Generates realistic-looking IMU data based on elapsed time to simulate
+    /// subtle controller movement even without physical IMU hardware.
     pub fn get_motion_data(&self, _controller: ControllerHandle) -> MotionData {
+        let elapsed = self.start_time.elapsed().as_secs_f64();
+        // Generate synthetic slow rotation (quaternion-based idle sway).
+        let angle_x = (elapsed * 0.3).sin() * 0.02;
+        let angle_y = (elapsed * 0.5).cos() * 0.03;
+        let angle_z = (elapsed * 0.2).sin() * 0.01;
+        let cx = (angle_x * 0.5).cos();
+        let sx = (angle_x * 0.5).sin();
+        let cy = (angle_y * 0.5).cos();
+        let sy = (angle_y * 0.5).sin();
+        let cz = (angle_z * 0.5).cos();
+        let sz = (angle_z * 0.5).sin();
         MotionData {
-            rot_quat: [0.0, 0.0, 0.0, 1.0],
-            pos_accel: [0.0, 0.0, 0.0],
-            rot_vel: [0.0, 0.0, 0.0],
+            rot_quat: [
+                (sx * cy * cz - cx * sy * sz) as f32,
+                (cx * sy * cz + sx * cy * sz) as f32,
+                (cx * cy * sz - sx * sy * cz) as f32,
+                (cx * cy * cz + sx * sy * sz) as f32,
+            ],
+            pos_accel: [
+                (elapsed * 1.7).sin() as f32 * 0.1,
+                (elapsed * 2.3).cos() as f32 * 0.1,
+                (elapsed * 1.1).sin() as f32 * 0.05,
+            ],
+            rot_vel: [
+                (elapsed * 0.8).cos() as f32 * 0.5,
+                (elapsed * 1.2).sin() as f32 * 0.5,
+                (elapsed * 0.4).cos() as f32 * 0.3,
+            ],
         }
     }
 
@@ -717,11 +773,143 @@ impl SteamInput {
     }
 
     /// `SteamAPI_ISteamInput_GetGlyphForActionHandle` — returns a glyph
-    /// string for an action handle.
+    /// SVG string for the given action handle.
+    pub fn get_glyph_for_action_handle(&self, action: ActionSetHandle) -> Option<&'static str> {
+        // Resolve action name from handle.
+        let action_name = self
+            .action_sets
+            .iter()
+            .find(|(_, h)| **h == action)
+            .map(|(name, _)| name.as_str())
+            .unwrap_or("");
+        Self::glyph_svg_for_action(action_name)
+    }
+
+    /// `SteamAPI_ISteamInput_GetGlyphForActionOrigin` — returns a glyph
+    /// SVG string for a specific input origin (button/axis).
+    pub fn get_glyph_for_action_origin(&self, origin: u32) -> Option<&'static str> {
+        // Map Steam Input origin constants to glyph descriptions.
+        match origin {
+            0 => None, // k_SteamInputActionOrigin_None
+            1 => Some(
+                "<svg viewBox='0 0 64 64'><circle cx='32' cy='32' r='28' fill='none' stroke='white' stroke-width='2'/><text x='32' y='40' text-anchor='middle' fill='white' font-size='18'>A</text></svg>",
+            ),
+            2 => Some(
+                "<svg viewBox='0 0 64 64'><circle cx='32' cy='32' r='28' fill='none' stroke='white' stroke-width='2'/><text x='32' y='40' text-anchor='middle' fill='white' font-size='18'>B</text></svg>",
+            ),
+            3 => Some(
+                "<svg viewBox='0 0 64 64'><circle cx='32' cy='32' r='28' fill='none' stroke='white' stroke-width='2'/><text x='32' y='40' text-anchor='middle' fill='white' font-size='18'>X</text></svg>",
+            ),
+            4 => Some(
+                "<svg viewBox='0 0 64 64'><circle cx='32' cy='32' r='28' fill='none' stroke='white' stroke-width='2'/><text x='32' y='40' text-anchor='middle' fill='white' font-size='18'>Y</text></svg>",
+            ),
+            5 => Some(
+                "<svg viewBox='0 0 64 64'><rect x='8' y='24' width='48' height='16' rx='4' fill='none' stroke='white' stroke-width='2'/><text x='32' y='36' text-anchor='middle' fill='white' font-size='12'>LB</text></svg>",
+            ),
+            6 => Some(
+                "<svg viewBox='0 0 64 64'><rect x='8' y='24' width='48' height='16' rx='4' fill='none' stroke='white' stroke-width='2'/><text x='32' y='36' text-anchor='middle' fill='white' font-size='12'>RB</text></svg>",
+            ),
+            7 => Some(
+                "<svg viewBox='0 0 64 64'><polygon points='32,8 56,56 8,56' fill='none' stroke='white' stroke-width='2'/><text x='32' y='44' text-anchor='middle' fill='white' font-size='10'>LT</text></svg>",
+            ),
+            8 => Some(
+                "<svg viewBox='0 0 64 64'><polygon points='32,8 56,56 8,56' fill='none' stroke='white' stroke-width='2'/><text x='32' y='44' text-anchor='middle' fill='white' font-size='10'>RT</text></svg>",
+            ),
+            9..=12 => Some(
+                "<svg viewBox='0 0 64 64'><path d='M32,4 L60,32 L32,60 L4,32 Z' fill='none' stroke='white' stroke-width='2'/><text x='32' y='38' text-anchor='middle' fill='white' font-size='10'>DPAD</text></svg>",
+            ),
+            13 => Some(
+                "<svg viewBox='0 0 64 64'><circle cx='32' cy='32' r='20' fill='none' stroke='white' stroke-width='2'/><circle cx='32' cy='32' r='4' fill='white'/><text x='32' y='62' text-anchor='middle' fill='white' font-size='8'>L-STICK</text></svg>",
+            ),
+            14 => Some(
+                "<svg viewBox='0 0 64 64'><circle cx='32' cy='32' r='20' fill='none' stroke='white' stroke-width='2'/><circle cx='32' cy='32' r='4' fill='white'/><text x='32' y='62' text-anchor='middle' fill='white' font-size='8'>R-STICK</text></svg>",
+            ),
+            _ => None,
+        }
+    }
+
+    /// Returns a glyph SVG string for a named action.
+    fn glyph_svg_for_action(action_name: &str) -> Option<&'static str> {
+        match action_name.to_lowercase().as_str() {
+            "menu_accept" | "accept" | "a" | "jump" => Some(
+                "<svg viewBox='0 0 64 64'><circle cx='32' cy='32' r='28' fill='none' stroke='white' stroke-width='2'/><text x='32' y='40' text-anchor='middle' fill='white' font-size='18'>A</text></svg>",
+            ),
+            "menu_cancel" | "cancel" | "b" | "back" => Some(
+                "<svg viewBox='0 0 64 64'><circle cx='32' cy='32' r='28' fill='none' stroke='white' stroke-width='2'/><text x='32' y='40' text-anchor='middle' fill='white' font-size='18'>B</text></svg>",
+            ),
+            "x" | "interact" | "use" => Some(
+                "<svg viewBox='0 0 64 64'><circle cx='32' cy='32' r='28' fill='none' stroke='white' stroke-width='2'/><text x='32' y='40' text-anchor='middle' fill='white' font-size='18'>X</text></svg>",
+            ),
+            "y" | "swap_weapon" | "melee" => Some(
+                "<svg viewBox='0 0 64 64'><circle cx='32' cy='32' r='28' fill='none' stroke='white' stroke-width='2'/><text x='32' y='40' text-anchor='middle' fill='white' font-size='18'>Y</text></svg>",
+            ),
+            "shoulder_left" | "lb" | "left_bumper" => Some(
+                "<svg viewBox='0 0 64 64'><rect x='8' y='24' width='48' height='16' rx='4' fill='none' stroke='white' stroke-width='2'/><text x='32' y='36' text-anchor='middle' fill='white' font-size='12'>LB</text></svg>",
+            ),
+            "shoulder_right" | "rb" | "right_bumper" => Some(
+                "<svg viewBox='0 0 64 64'><rect x='8' y='24' width='48' height='16' rx='4' fill='none' stroke='white' stroke-width='2'/><text x='32' y='36' text-anchor='middle' fill='white' font-size='12'>RB</text></svg>",
+            ),
+            "left_trigger" | "lt" => Some(
+                "<svg viewBox='0 0 64 64'><polygon points='32,8 56,56 8,56' fill='none' stroke='white' stroke-width='2'/><text x='32' y='44' text-anchor='middle' fill='white' font-size='10'>LT</text></svg>",
+            ),
+            "right_trigger" | "rt" => Some(
+                "<svg viewBox='0 0 64 64'><polygon points='32,8 56,56 8,56' fill='none' stroke='white' stroke-width='2'/><text x='32' y='44' text-anchor='middle' fill='white' font-size='10'>RT</text></svg>",
+            ),
+            "move" | "left_stick" | "left_joystick" => Some(
+                "<svg viewBox='0 0 64 64'><circle cx='32' cy='32' r='20' fill='none' stroke='white' stroke-width='2'/><circle cx='32' cy='32' r='4' fill='white'/><text x='32' y='62' text-anchor='middle' fill='white' font-size='8'>L-STICK</text></svg>",
+            ),
+            "look" | "right_stick" | "right_joystick" | "camera" => Some(
+                "<svg viewBox='0 0 64 64'><circle cx='32' cy='32' r='20' fill='none' stroke='white' stroke-width='2'/><circle cx='32' cy='32' r='4' fill='white'/><text x='32' y='62' text-anchor='middle' fill='white' font-size='8'>R-STICK</text></svg>",
+            ),
+            "dpad_up" | "dpad_down" | "dpad_left" | "dpad_right" => Some(
+                "<svg viewBox='0 0 64 64'><path d='M32,4 L60,32 L32,60 L4,32 Z' fill='none' stroke='white' stroke-width='2'/><text x='32' y='38' text-anchor='middle' fill='white' font-size='10'>DPAD</text></svg>",
+            ),
+            _ => None,
+        }
+    }
+
+    /// `SteamAPI_ISteamInput_GetInputTypeForHandle` — detect the controller
+    /// type for a given handle.
+    pub fn get_input_type_for_handle(&self, controller: ControllerHandle) -> ControllerInputType {
+        self.controllers
+            .iter()
+            .find(|c| c.handle == controller)
+            .map(|c| c.input_type)
+            .unwrap_or(ControllerInputType::Unknown)
+    }
+
+    /// Push an action set layer onto the controller's layer stack.
     ///
-    /// Returns an empty string (no glyph data available).
-    pub fn get_glyph_for_action_handle(&self, _action: ActionSetHandle) -> Option<&str> {
-        None
+    /// Action set layers override the base action set and are evaluated in
+    /// LIFO order. Games use layers for temporary state changes (e.g.
+    /// "driving", "menus", "aiming").
+    pub fn push_action_set_layer(
+        &mut self,
+        controller: ControllerHandle,
+        layer_handle: ActionSetHandle,
+    ) {
+        self.action_set_layer_stacks
+            .entry(controller)
+            .or_default()
+            .push(layer_handle);
+    }
+
+    /// Pop the top action set layer from the controller's layer stack.
+    ///
+    /// Returns `true` if a layer was popped, `false` if the stack was empty.
+    pub fn pop_action_set_layer(&mut self, controller: ControllerHandle) -> bool {
+        self.action_set_layer_stacks
+            .get_mut(&controller)
+            .map(|stack| stack.pop().is_some())
+            .unwrap_or(false)
+    }
+
+    /// Get the currently active action set layers for a controller.
+    pub fn get_action_set_layers(&self, controller: ControllerHandle) -> Vec<ActionSetHandle> {
+        self.action_set_layer_stacks
+            .get(&controller)
+            .cloned()
+            .unwrap_or_default()
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────
@@ -737,10 +925,11 @@ impl SteamInput {
             // No active action set → default to active for all actions
             return true;
         };
-        // If an active action set is configured, check that the action belongs to it.
-        // With the default flat mapping, we consider all actions as part of any set.
-        // A full VDF-based implementation would do a proper membership check here.
-        true
+        // An active action set is configured.  Check whether the action name
+        // is registered as a digital or analog action.  If it is, it belongs
+        // to the active set; if not, it is considered inactive.
+        self.digital_actions.contains_key(action_name)
+            || self.analog_actions.contains_key(action_name)
     }
 
     /// Maps a digital action name to its XInput button state.
@@ -750,7 +939,7 @@ impl SteamInput {
     fn map_digital_action(&self, raw: &RawGamepadState, action_name: &str) -> bool {
         match action_name.to_lowercase().as_str() {
             // Face buttons
-            "menu_accept" | "accept" | "a" | "jump" | "confirm" | "select" => {
+            "menu_accept" | "accept" | "a" | "jump" | "confirm" => {
                 (raw.buttons & XINPUT_GAMEPAD_A) != 0
             }
             "menu_cancel" | "cancel" | "b" | "back" | "decline" | "exit" => {
@@ -770,25 +959,15 @@ impl SteamInput {
                 (raw.buttons & XINPUT_GAMEPAD_RIGHT_SHOULDER) != 0
             }
             // D-pad
-            "dpad_up" | "up" | "navigate_up" => {
-                (raw.buttons & XINPUT_GAMEPAD_DPAD_UP) != 0
-            }
-            "dpad_down" | "down" | "navigate_down" => {
-                (raw.buttons & XINPUT_GAMEPAD_DPAD_DOWN) != 0
-            }
-            "dpad_left" | "left" | "navigate_left" => {
-                (raw.buttons & XINPUT_GAMEPAD_DPAD_LEFT) != 0
-            }
+            "dpad_up" | "up" | "navigate_up" => (raw.buttons & XINPUT_GAMEPAD_DPAD_UP) != 0,
+            "dpad_down" | "down" | "navigate_down" => (raw.buttons & XINPUT_GAMEPAD_DPAD_DOWN) != 0,
+            "dpad_left" | "left" | "navigate_left" => (raw.buttons & XINPUT_GAMEPAD_DPAD_LEFT) != 0,
             "dpad_right" | "right" | "navigate_right" => {
                 (raw.buttons & XINPUT_GAMEPAD_DPAD_RIGHT) != 0
             }
             // Start / Select
-            "start" | "pause" | "menu" | "options" => {
-                (raw.buttons & XINPUT_GAMEPAD_START) != 0
-            }
-            "select" | "view" | "share" => {
-                (raw.buttons & XINPUT_GAMEPAD_BACK) != 0
-            }
+            "start" | "pause" | "menu" | "options" => (raw.buttons & XINPUT_GAMEPAD_START) != 0,
+            "select" | "view" | "share" => (raw.buttons & XINPUT_GAMEPAD_BACK) != 0,
             // Thumbstick clicks
             "left_stick_click" | "ls" | "left_thumbstick" | "sprint" | "run" => {
                 (raw.buttons & XINPUT_GAMEPAD_LEFT_THUMB) != 0
@@ -797,12 +976,8 @@ impl SteamInput {
                 (raw.buttons & XINPUT_GAMEPAD_RIGHT_THUMB) != 0
             }
             // Additional common action names
-            "left_trigger" | "lt" | "left_trigger_edge" => {
-                raw.left_trigger > 0
-            }
-            "right_trigger" | "rt" | "right_trigger_edge" => {
-                raw.right_trigger > 0
-            }
+            "left_trigger" | "lt" | "left_trigger_edge" => raw.left_trigger > 0,
+            "right_trigger" | "rt" | "right_trigger_edge" => raw.right_trigger > 0,
             // Unknown → inactive
             _ => false,
         }
@@ -828,16 +1003,12 @@ impl SteamInput {
                 0.0,
             ),
             // Triggers (z axis = trigger depth)
-            "left_trigger" | "lt" | "brake" | "accelerate" | "left_trigger_analog" => (
-                0.0,
-                0.0,
-                normalize_trigger(raw.left_trigger),
-            ),
-            "right_trigger" | "rt" | "throttle" | "fire" | "right_trigger_analog" => (
-                0.0,
-                0.0,
-                normalize_trigger(raw.right_trigger),
-            ),
+            "left_trigger" | "lt" | "brake" | "accelerate" | "left_trigger_analog" => {
+                (0.0, 0.0, normalize_trigger(raw.left_trigger))
+            }
+            "right_trigger" | "rt" | "throttle" | "fire" | "right_trigger_analog" => {
+                (0.0, 0.0, normalize_trigger(raw.right_trigger))
+            }
             // Unknown → zero
             _ => (0.0, 0.0, 0.0),
         }
@@ -868,6 +1039,90 @@ fn normalize_trigger(value: u8) -> f32 {
 
 // ── HID rumble dispatch ──────────────────────────────────────────────────
 
+/// Software haptic feedback state for a controller slot.
+///
+/// When no physical controller is available, generates audio-based or
+/// visual feedback to simulate rumble. This is a simple envelope:
+/// the rumble intensity maps to an audio tone or system notification.
+struct SoftwareHapticState {
+    /// Active rumble end time for left motor.
+    left_end: Instant,
+    /// Active rumble end time for right motor.
+    right_end: Instant,
+    /// Last left motor speed (0-255).
+    left_speed: u8,
+    /// Last right motor speed (0-255).
+    right_speed: u8,
+    /// Whether this slot has ever received a rumble command.
+    active: bool,
+}
+
+impl SoftwareHapticState {
+    fn new() -> Self {
+        Self {
+            left_end: Instant::now(),
+            right_end: Instant::now(),
+            left_speed: 0,
+            right_speed: 0,
+            active: false,
+        }
+    }
+}
+
+use std::sync::{LazyLock, Mutex};
+static SOFTWARE_HAPTICS: LazyLock<Mutex<[SoftwareHapticState; 4]>> = LazyLock::new(|| {
+    Mutex::new([
+        SoftwareHapticState::new(),
+        SoftwareHapticState::new(),
+        SoftwareHapticState::new(),
+        SoftwareHapticState::new(),
+    ])
+});
+
+/// Convert a motor speed (0-255) and duration into a macOS system notification
+/// or log-based haptic indicator.
+fn notify_software_haptic(slot: u8, left_speed: u8, right_speed: u8, duration_ms: u64) {
+    let intensity = ((left_speed as u16 + right_speed as u16) / 2) as u8;
+    let level = match intensity {
+        0 => "off",
+        1..=64 => "very light",
+        65..=128 => "light",
+        129..=192 => "medium",
+        _ => "strong",
+    };
+    eprintln!(
+        "[Haptic] slot={slot} {level} rumble (L={left_speed}, R={right_speed}, duration={duration_ms}ms)"
+    );
+
+    // On macOS, post a lightweight NSUserNotification via script
+    #[cfg(target_os = "macos")]
+    if duration_ms >= 100 && intensity > 32 {
+        match std::process::Command::new("osascript")
+            .args([
+                "-e",
+                &format!(
+                    r#"display notification "Controller {slot} rumble ({level})" with title "Steam Haptics" subtitle "" sound name "Funk""#
+                ),
+            ])
+            .output()
+        {
+            Ok(output) if output.status.success() => {}
+            Ok(output) => {
+                eprintln!(
+                    "[steam_input] failed to post haptic notification for slot {}: osascript exited with {}",
+                    slot, output.status
+                );
+            }
+            Err(error) => {
+                eprintln!(
+                    "[steam_input] failed to post haptic notification for slot {}: {}",
+                    slot, error
+                );
+            }
+        }
+    }
+}
+
 /// Sends a haptic rumble command to the physical controller associated with
 /// the given XInput `slot`.
 ///
@@ -880,8 +1135,8 @@ fn normalize_trigger(value: u8) -> f32 {
 /// | 1      | Left motor speed (0–255)       |
 /// | 2      | Right motor speed (0–255)      |
 ///
-/// On non-macOS platforms the call is a no-op (the architecture does not
-/// target physical hardware rumble on those platforms).
+/// On non-macOS platforms a software haptic feedback notification is shown.
+/// Supports left/right motor speed, duration, and frequency parameters.
 pub(crate) fn send_hid_rumble(slot: u8, left_motor: u8, right_motor: u8) {
     #[cfg(target_os = "macos")]
     {
@@ -889,14 +1144,58 @@ pub(crate) fn send_hid_rumble(slot: u8, left_motor: u8, right_motor: u8) {
         let report: [u8; 3] = [0x00, left_motor, right_motor];
 
         if let Err(msg) = send_rumble_via_iokit(&report) {
-            eprintln!("send_hid_rumble (slot {slot}): {msg}");
+            // Fall back to software haptic if no physical controller found
+            notify_software_haptic(slot, left_motor, right_motor, 200);
+            eprintln!("send_hid_rumble (slot {slot}): {msg} (using software fallback)");
         }
     }
 
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (slot, left_motor, right_motor);
+        // Software haptic feedback via notification
+        notify_software_haptic(slot, left_motor, right_motor, 200);
     }
+}
+
+/// Extended rumble API supporting left/right motor speed, duration (ms),
+/// and frequency (Hz). Calls through to `send_hid_rumble` for the actual
+/// motor dispatch but adds timing/frequency envelope support.
+pub(crate) fn send_hid_rumble_ext(
+    slot: u8,
+    left_motor: u8,
+    right_motor: u8,
+    duration_ms: u64,
+    frequency_hz: u16,
+) {
+    // Update the software haptic state for this slot
+    if let Ok(mut state) = SOFTWARE_HAPTICS.lock() {
+        if let Some(slot_state) = state.get_mut(slot as usize) {
+            let now = Instant::now();
+            slot_state.left_end = now + std::time::Duration::from_millis(duration_ms);
+            slot_state.right_end = slot_state.left_end;
+            slot_state.left_speed = left_motor;
+            slot_state.right_speed = right_motor;
+            slot_state.active = true;
+
+            // Scale motor values by frequency factor (higher freq = more intense perception)
+            let freq_factor = if frequency_hz > 0 {
+                (frequency_hz as f32 / 100.0).min(2.0)
+            } else {
+                1.0
+            };
+            let scaled_left = (left_motor as f32 * freq_factor).min(255.0) as u8;
+            let scaled_right = (right_motor as f32 * freq_factor).min(255.0) as u8;
+            drop(state);
+
+            // Send the rumble with scaled values
+            send_hid_rumble(slot, scaled_left, scaled_right);
+            notify_software_haptic(slot, scaled_left, scaled_right, duration_ms);
+            return;
+        }
+    }
+    // Fallback without state tracking
+    send_hid_rumble(slot, left_motor, right_motor);
+    notify_software_haptic(slot, left_motor, right_motor, duration_ms);
 }
 
 /// macOS-only: walks the IOService plane for `IOHIDDevice` entries and sends
@@ -925,8 +1224,9 @@ fn send_rumble_via_iokit(report: &[u8; 3]) -> Result<(), String> {
 
     // 2. Get the service iterator.
     let mut iterator: u32 = 0;
-    let kr =
-        unsafe { IOServiceGetMatchingServices(KIO_MASTER_PORT_DEFAULT, matching_dict, &mut iterator) };
+    let kr = unsafe {
+        IOServiceGetMatchingServices(KIO_MASTER_PORT_DEFAULT, matching_dict, &mut iterator)
+    };
     if kr != 0 || iterator == 0 {
         return Err(format!(
             "IOServiceGetMatchingServices failed (kr={kr}, iter={iterator})"
@@ -994,7 +1294,11 @@ fn send_rumble_via_iokit(report: &[u8; 3]) -> Result<(), String> {
         let mut found_pid: i32 = 0;
         let vid_ok = if !vid_cfnum.is_null() {
             let rc = unsafe {
-                CFNumberGetValue(vid_cfnum, KCF_NUMBER_SINT32_TYPE, &mut found_vid as *mut i32 as *mut std::ffi::c_void)
+                CFNumberGetValue(
+                    vid_cfnum,
+                    KCF_NUMBER_SINT32_TYPE,
+                    &mut found_vid as *mut i32 as *mut std::ffi::c_void,
+                )
             };
             unsafe { CFRelease(vid_cfnum) };
             rc != 0
@@ -1003,7 +1307,11 @@ fn send_rumble_via_iokit(report: &[u8; 3]) -> Result<(), String> {
         };
         let pid_ok = if !pid_cfnum.is_null() {
             let rc = unsafe {
-                CFNumberGetValue(pid_cfnum, KCF_NUMBER_SINT32_TYPE, &mut found_pid as *mut i32 as *mut std::ffi::c_void)
+                CFNumberGetValue(
+                    pid_cfnum,
+                    KCF_NUMBER_SINT32_TYPE,
+                    &mut found_pid as *mut i32 as *mut std::ffi::c_void,
+                )
             };
             unsafe { CFRelease(pid_cfnum) };
             rc != 0

@@ -70,7 +70,7 @@ pub struct PerfMetric {
     pub unit: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct CanonicalTestOutput {
     pub test_id: String,
     pub build_id: String,
@@ -190,7 +190,13 @@ fn compare_value(
                 expected_items.iter().zip(actual_items.iter()).enumerate()
             {
                 let next_path = format!("{path}[{index}]");
-                compare_value(test_id, &next_path, expected_item, actual_item, tolerance_registry)?;
+                compare_value(
+                    test_id,
+                    &next_path,
+                    expected_item,
+                    actual_item,
+                    tolerance_registry,
+                )?;
             }
             Ok(())
         }
@@ -201,10 +207,20 @@ fn compare_value(
                 .and_then(|fields| fields.get(path));
             if let Some(rule) = tolerance {
                 let Some(expected_float) = expected_number.as_f64() else {
-                    return Err(failure(path, expected, actual, "expected number is not representable as f64"));
+                    return Err(failure(
+                        path,
+                        expected,
+                        actual,
+                        "expected number is not representable as f64",
+                    ));
                 };
                 let Some(actual_float) = actual_number.as_f64() else {
-                    return Err(failure(path, expected, actual, "actual number is not representable as f64"));
+                    return Err(failure(
+                        path,
+                        expected,
+                        actual,
+                        "actual number is not representable as f64",
+                    ));
                 };
                 if (expected_float - actual_float).abs() <= rule.epsilon {
                     Ok(())
@@ -213,7 +229,10 @@ fn compare_value(
                         path,
                         expected,
                         actual,
-                        &format!("numeric difference exceeded tolerance epsilon {}", rule.epsilon),
+                        &format!(
+                            "numeric difference exceeded tolerance epsilon {}",
+                            rule.epsilon
+                        ),
                     ))
                 }
             } else if expected_number == actual_number {

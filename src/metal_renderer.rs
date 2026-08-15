@@ -8,12 +8,13 @@
 //! to the Metal GPU backend from `src/metal_backend.rs`.
 
 use crate::error::{AppError, AppResult};
-use crate::reason::ReasonCode;
 use crate::gfx::DxgiFormat;
 use crate::metal_backend::{
+    MetalDevice, MetalSwapchain,
     async_pipeline_compiler::{AsyncPipelineCompiler, PipelineState},
-    MetalDevice, MetalSwapchain, dxgi_to_metal_format,
+    dxgi_to_metal_format,
 };
+use crate::reason::ReasonCode;
 use std::collections::BTreeMap;
 
 // ---------------------------------------------------------------------------
@@ -296,15 +297,21 @@ impl MetalRenderContext {
         })
     }
 
-    /// Create a swapchain for rendering.
+    /// Create a swapchain for rendering with default flip model (Discard) and colour space (sRGB).
     pub fn create_swapchain(&mut self, width: u32, height: u32) {
-        self.swapchain = Some(MetalSwapchain::new(self.device.device(), width as u64, height as u64));
+        self.swapchain = Some(MetalSwapchain::new(
+            self.device.device(),
+            width as u64,
+            height as u64,
+            crate::metal_backend::FlipModel::Discard,
+            crate::metal_backend::ColorSpace::SRGB,
+        ));
     }
 
-    /// Resize the swapchain.
+    /// Resize the swapchain, recreating back-buffer textures at the new size.
     pub fn resize_swapchain(&mut self, width: u32, height: u32) {
         if let Some(ref mut swapchain) = self.swapchain {
-            swapchain.resize(width as u64, height as u64);
+            swapchain.resize(self.device.device(), width as u64, height as u64);
         }
     }
 
@@ -338,15 +345,11 @@ impl MetalRenderContext {
         let key = format!("{depth_enable}_{depth_write_enable}_{:?}", depth_func);
         if !self.depth_stencil_states.contains_key(&key) {
             let state = if depth_enable {
-                self.device.create_depth_stencil_state(
-                    depth_func.to_metal(),
-                    depth_write_enable,
-                )
+                self.device
+                    .create_depth_stencil_state(depth_func.to_metal(), depth_write_enable)
             } else {
-                self.device.create_depth_stencil_state(
-                    metal::MTLCompareFunction::Always,
-                    false,
-                )
+                self.device
+                    .create_depth_stencil_state(metal::MTLCompareFunction::Always, false)
             };
             self.depth_stencil_states.insert(key.clone(), state);
         }
@@ -355,7 +358,8 @@ impl MetalRenderContext {
 
     /// Begin a new frame.
     pub fn begin_frame(&mut self) -> AppResult<FrameContext> {
-        let (width, height) = self.swapchain
+        let (width, height) = self
+            .swapchain
             .as_ref()
             .map(|s| s.size())
             .unwrap_or((800, 600));
@@ -395,9 +399,10 @@ impl MetalRenderContext {
         }
 
         // Standard present without overlay compositing
-        let swapchain = self.swapchain.as_ref().ok_or_else(|| {
-            AppError::new(ReasonCode::RcIo, "no swapchain created")
-        })?;
+        let swapchain = self
+            .swapchain
+            .as_ref()
+            .ok_or_else(|| AppError::new(ReasonCode::RcIo, "no swapchain created"))?;
 
         let drawable = swapchain.next_drawable()?;
         let cmd_buffer = self.create_command_buffer();
@@ -419,9 +424,7 @@ impl MetalRenderContext {
     /// Upload the latest CEF overlay frame (from the global compositor) into a
     /// cached Metal texture. Call this once per frame *before* compositing.
     pub fn upload_cef_overlay_if_needed(&mut self) -> AppResult<()> {
-        let frame_data = with_global_cef_compositor(|compositor| {
-            compositor.take_pending_frame()
-        });
+        let frame_data = with_global_cef_compositor(|compositor| compositor.take_pending_frame());
         let Some(frame) = frame_data else {
             return Ok(());
         };
@@ -451,15 +454,17 @@ impl MetalRenderContext {
         }
 
         // Re-allocate texture if dimensions changed
-        if self.cef_texture_width != width || self.cef_texture_height != height || self.cef_overlay_texture.is_none() {
+        if self.cef_texture_width != width
+            || self.cef_texture_height != height
+            || self.cef_overlay_texture.is_none()
+        {
             let descriptor = metal::TextureDescriptor::new();
             descriptor.set_texture_type(metal::MTLTextureType::D2);
             descriptor.set_pixel_format(metal::MTLPixelFormat::RGBA8Unorm);
             descriptor.set_width(width as u64);
             descriptor.set_height(height as u64);
             descriptor.set_usage(
-                metal::MTLTextureUsage::ShaderRead
-                    | metal::MTLTextureUsage::RenderTarget,
+                metal::MTLTextureUsage::ShaderRead | metal::MTLTextureUsage::RenderTarget,
             );
             descriptor.set_storage_mode(metal::MTLStorageMode::Shared);
             let texture = self.device.device().new_texture(&descriptor);
@@ -525,11 +530,25 @@ impl MetalRenderContext {
             }
 
             // Compile the shader library and extract functions.
-            let library = self.device.compile_shader_library(CEF_OVERLAY_SHADER_SOURCE)?;
-            let vertex_fn = library.get_function("cef_overlay_vertex", None)
-                .map_err(|_| AppError::new(ReasonCode::RcIo, "failed to find cef_overlay_vertex in MSL library"))?;
-            let fragment_fn = library.get_function("cef_overlay_fragment", None)
-                .map_err(|_| AppError::new(ReasonCode::RcIo, "failed to find cef_overlay_fragment in MSL library"))?;
+            let library = self
+                .device
+                .compile_shader_library(CEF_OVERLAY_SHADER_SOURCE)?;
+            let vertex_fn = library
+                .get_function("cef_overlay_vertex", None)
+                .map_err(|_| {
+                    AppError::new(
+                        ReasonCode::RcIo,
+                        "failed to find cef_overlay_vertex in MSL library",
+                    )
+                })?;
+            let fragment_fn = library
+                .get_function("cef_overlay_fragment", None)
+                .map_err(|_| {
+                    AppError::new(
+                        ReasonCode::RcIo,
+                        "failed to find cef_overlay_fragment in MSL library",
+                    )
+                })?;
 
             let pipeline_desc = build_cef_pipeline_descriptor(&vertex_fn, &fragment_fn);
 
@@ -555,18 +574,35 @@ impl MetalRenderContext {
                     self.cef_overlay_pipeline = Some(ps);
                 }
                 Err(e) => {
-                    eprintln!("sync fallback for CEF overlay pipeline failed: {e:?}");
+                    return Err(AppError::new(
+                        ReasonCode::RcIo,
+                        format!("sync fallback for CEF overlay pipeline failed: {e:?}"),
+                    ));
                 }
             }
             return Ok(());
         }
 
         // No async compiler — original synchronous path.
-        let library = self.device.compile_shader_library(CEF_OVERLAY_SHADER_SOURCE)?;
-        let vertex_fn = library.get_function("cef_overlay_vertex", None)
-            .map_err(|_| AppError::new(ReasonCode::RcIo, "failed to find cef_overlay_vertex in MSL library"))?;
-        let fragment_fn = library.get_function("cef_overlay_fragment", None)
-            .map_err(|_| AppError::new(ReasonCode::RcIo, "failed to find cef_overlay_fragment in MSL library"))?;
+        let library = self
+            .device
+            .compile_shader_library(CEF_OVERLAY_SHADER_SOURCE)?;
+        let vertex_fn = library
+            .get_function("cef_overlay_vertex", None)
+            .map_err(|_| {
+                AppError::new(
+                    ReasonCode::RcIo,
+                    "failed to find cef_overlay_vertex in MSL library",
+                )
+            })?;
+        let fragment_fn = library
+            .get_function("cef_overlay_fragment", None)
+            .map_err(|_| {
+                AppError::new(
+                    ReasonCode::RcIo,
+                    "failed to find cef_overlay_fragment in MSL library",
+                )
+            })?;
 
         let pipeline_desc = build_cef_pipeline_descriptor(&vertex_fn, &fragment_fn);
 
@@ -604,9 +640,10 @@ impl MetalRenderContext {
         // Get the drawable after all mutable operations — this borrows self
         // immutably for the rest of the function, so it must be last.
         let drawable = {
-            let swapchain = self.swapchain.as_ref().ok_or_else(|| {
-                AppError::new(ReasonCode::RcIo, "no swapchain created")
-            })?;
+            let swapchain = self
+                .swapchain
+                .as_ref()
+                .ok_or_else(|| AppError::new(ReasonCode::RcIo, "no swapchain created"))?;
             swapchain.next_drawable()?
         };
 
@@ -722,7 +759,9 @@ fragment float4 cef_overlay_fragment(VertexOut in [[stage_in]],
 /// semantics and can be used from any thread).
 #[derive(Clone, Copy)]
 struct IoSurfacePtr(*mut std::ffi::c_void);
+// SAFETY: Send is safe because the type only uses thread-safe internal state or is accessed under exclusive &mut
 unsafe impl Send for IoSurfacePtr {}
+// SAFETY: Send is safe because the type only uses thread-safe internal state or is accessed under exclusive &mut
 unsafe impl Sync for IoSurfacePtr {}
 
 /// Thread-safe pending frame data exchanged between the CEF bridge and the
@@ -778,7 +817,12 @@ impl CefMetalCompositor {
     ///
     /// # Safety
     /// `io_surface_ptr` must be a valid IOSurfaceRef with matching dimensions.
-    pub unsafe fn submit_io_surface_frame(&mut self, width: u32, height: u32, io_surface_ptr: *mut std::ffi::c_void) {
+    pub unsafe fn submit_io_surface_frame(
+        &mut self,
+        width: u32,
+        height: u32,
+        io_surface_ptr: *mut std::ffi::c_void,
+    ) {
         self.pending_width = width;
         self.pending_height = height;
         self.pending_io_surface = Some(IoSurfacePtr(io_surface_ptr));
@@ -884,9 +928,13 @@ pub fn submit_cef_overlay_frame(width: u32, height: u32, pixels: Vec<u8>) {
 ///
 /// # Safety
 /// `io_surface_ptr` must be a valid IOSurfaceRef.
-pub unsafe fn submit_cef_overlay_io_surface(width: u32, height: u32, io_surface_ptr: *mut std::ffi::c_void) {
-    with_global_cef_compositor(|compositor| {
-        unsafe { compositor.submit_io_surface_frame(width, height, io_surface_ptr); }
+pub unsafe fn submit_cef_overlay_io_surface(
+    width: u32,
+    height: u32,
+    io_surface_ptr: *mut std::ffi::c_void,
+) {
+    with_global_cef_compositor(|compositor| unsafe {
+        compositor.submit_io_surface_frame(width, height, io_surface_ptr);
     });
 }
 
@@ -906,6 +954,8 @@ pub fn set_cef_compositor_game_active(active: bool) {
 fn mach_absolute_time() -> u64 {
     #[cfg(target_os = "macos")]
     {
+        #[allow(deprecated)]
+        // SAFETY: Objective-C FFI for Metal rendering pipeline
         unsafe {
             let mut timebase: libc::mach_timebase_info = std::mem::zeroed();
             libc::mach_timebase_info(&mut timebase);
@@ -1049,23 +1099,23 @@ pub fn is_format_supported(format: DxgiFormat, usage: FormatUsage) -> bool {
         FormatUsage::RenderTarget => matches!(
             mtl_format,
             metal::MTLPixelFormat::RGBA8Unorm
-            | metal::MTLPixelFormat::BGRA8Unorm
-            | metal::MTLPixelFormat::R16Float
-            | metal::MTLPixelFormat::R32Float
-            | metal::MTLPixelFormat::RGB10A2Unorm
+                | metal::MTLPixelFormat::BGRA8Unorm
+                | metal::MTLPixelFormat::R16Float
+                | metal::MTLPixelFormat::R32Float
+                | metal::MTLPixelFormat::RGB10A2Unorm
         ),
         FormatUsage::DepthStencil => matches!(
             mtl_format,
             metal::MTLPixelFormat::Depth24Unorm_Stencil8
-            | metal::MTLPixelFormat::Depth32Float
-            | metal::MTLPixelFormat::Depth16Unorm
+                | metal::MTLPixelFormat::Depth32Float
+                | metal::MTLPixelFormat::Depth16Unorm
         ),
         FormatUsage::ShaderResource => true, // Most formats are readable
         FormatUsage::UnorderedAccess => matches!(
             mtl_format,
             metal::MTLPixelFormat::RGBA8Unorm
-            | metal::MTLPixelFormat::R32Float
-            | metal::MTLPixelFormat::BGRA8Unorm
+                | metal::MTLPixelFormat::R32Float
+                | metal::MTLPixelFormat::BGRA8Unorm
         ),
     }
 }
@@ -1089,7 +1139,7 @@ mod tests {
     #[test]
     fn render_context_creation() {
         let ctx = MetalRenderContext::new();
-        assert!(ctx.is_ok());
+        assert!(ctx.is_ok(), "expected Metal render context to be created");
         let ctx = ctx.unwrap();
         assert!(!ctx.device_name().is_empty());
     }
@@ -1133,35 +1183,74 @@ mod tests {
 
     #[test]
     fn comparison_func_translation() {
-        assert_eq!(ComparisonFunc::Less.to_metal(), metal::MTLCompareFunction::Less);
-        assert_eq!(ComparisonFunc::Always.to_metal(), metal::MTLCompareFunction::Always);
-        assert_eq!(ComparisonFunc::Greater.to_metal(), metal::MTLCompareFunction::Greater);
+        assert_eq!(
+            ComparisonFunc::Less.to_metal(),
+            metal::MTLCompareFunction::Less
+        );
+        assert_eq!(
+            ComparisonFunc::Always.to_metal(),
+            metal::MTLCompareFunction::Always
+        );
+        assert_eq!(
+            ComparisonFunc::Greater.to_metal(),
+            metal::MTLCompareFunction::Greater
+        );
     }
 
     #[test]
     fn primitive_topology_translation() {
-        assert_eq!(PrimitiveTopology::TriangleList.to_metal(), metal::MTLPrimitiveType::Triangle);
-        assert_eq!(PrimitiveTopology::LineList.to_metal(), metal::MTLPrimitiveType::Line);
-        assert_eq!(PrimitiveTopology::PointList.to_metal(), metal::MTLPrimitiveType::Point);
+        assert_eq!(
+            PrimitiveTopology::TriangleList.to_metal(),
+            metal::MTLPrimitiveType::Triangle
+        );
+        assert_eq!(
+            PrimitiveTopology::LineList.to_metal(),
+            metal::MTLPrimitiveType::Line
+        );
+        assert_eq!(
+            PrimitiveTopology::PointList.to_metal(),
+            metal::MTLPrimitiveType::Point
+        );
     }
 
     #[test]
     fn blend_factor_translation() {
-        assert_eq!(blend_factor_to_metal(BlendFactor::SrcAlpha), metal::MTLBlendFactor::SourceAlpha);
-        assert_eq!(blend_factor_to_metal(BlendFactor::InvSrcAlpha), metal::MTLBlendFactor::OneMinusSourceAlpha);
-        assert_eq!(blend_factor_to_metal(BlendFactor::Zero), metal::MTLBlendFactor::Zero);
+        assert_eq!(
+            blend_factor_to_metal(BlendFactor::SrcAlpha),
+            metal::MTLBlendFactor::SourceAlpha
+        );
+        assert_eq!(
+            blend_factor_to_metal(BlendFactor::InvSrcAlpha),
+            metal::MTLBlendFactor::OneMinusSourceAlpha
+        );
+        assert_eq!(
+            blend_factor_to_metal(BlendFactor::Zero),
+            metal::MTLBlendFactor::Zero
+        );
     }
 
     #[test]
     fn blend_op_translation() {
-        assert_eq!(blend_op_to_metal(BlendOp::Add), metal::MTLBlendOperation::Add);
-        assert_eq!(blend_op_to_metal(BlendOp::Subtract), metal::MTLBlendOperation::Subtract);
+        assert_eq!(
+            blend_op_to_metal(BlendOp::Add),
+            metal::MTLBlendOperation::Add
+        );
+        assert_eq!(
+            blend_op_to_metal(BlendOp::Subtract),
+            metal::MTLBlendOperation::Subtract
+        );
     }
 
     #[test]
     fn fill_mode_translation() {
-        assert_eq!(fill_mode_to_metal(FillMode::Solid), metal::MTLTriangleFillMode::Fill);
-        assert_eq!(fill_mode_to_metal(FillMode::Wireframe), metal::MTLTriangleFillMode::Lines);
+        assert_eq!(
+            fill_mode_to_metal(FillMode::Solid),
+            metal::MTLTriangleFillMode::Fill
+        );
+        assert_eq!(
+            fill_mode_to_metal(FillMode::Wireframe),
+            metal::MTLTriangleFillMode::Lines
+        );
     }
 
     #[test]
@@ -1172,15 +1261,30 @@ mod tests {
 
     #[test]
     fn format_support_render_target() {
-        assert!(is_format_supported(DxgiFormat::B8G8R8A8Unorm, FormatUsage::RenderTarget));
-        assert!(is_format_supported(DxgiFormat::R8G8B8A8Unorm, FormatUsage::RenderTarget));
-        assert!(!is_format_supported(DxgiFormat::D24UnormS8Uint, FormatUsage::RenderTarget));
+        assert!(is_format_supported(
+            DxgiFormat::B8G8R8A8Unorm,
+            FormatUsage::RenderTarget
+        ));
+        assert!(is_format_supported(
+            DxgiFormat::R8G8B8A8Unorm,
+            FormatUsage::RenderTarget
+        ));
+        assert!(!is_format_supported(
+            DxgiFormat::D24UnormS8Uint,
+            FormatUsage::RenderTarget
+        ));
     }
 
     #[test]
     fn format_support_depth() {
-        assert!(is_format_supported(DxgiFormat::D24UnormS8Uint, FormatUsage::DepthStencil));
-        assert!(!is_format_supported(DxgiFormat::B8G8R8A8Unorm, FormatUsage::DepthStencil));
+        assert!(is_format_supported(
+            DxgiFormat::D24UnormS8Uint,
+            FormatUsage::DepthStencil
+        ));
+        assert!(!is_format_supported(
+            DxgiFormat::B8G8R8A8Unorm,
+            FormatUsage::DepthStencil
+        ));
     }
 
     #[test]
