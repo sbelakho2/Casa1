@@ -12,7 +12,7 @@ use std::fs::OpenOptions;
 use std::os::fd::AsRawFd;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ValueEnum)]
@@ -564,21 +564,17 @@ impl GameEnvironment {
     /// Marks the in-memory config as changed; the actual `ge.json` rewrite is
     /// deferred to the next `flush_config_if_due` / `save_config` call.
     fn mark_config_dirty(&self) {
-        config_flush_states()
-            .entry(self.root.clone())
-            .or_default()
-            .dirty = true;
+        let mut flush_states = config_flush_states();
+        let state = flush_states.entry(self.root.clone()).or_default();
+        state.dirty = true;
+        state.dirty_seq = state.dirty_seq.saturating_add(1);
     }
 
-    /// Flushes pending config changes, but at most once per
-    /// [`CONFIG_FLUSH_INTERVAL`]. Called by per-syscall hot paths so per-frame
-    /// guest file writes do not rewrite the whole config (and reparse DB)
-    /// on every operation.
+    /// Flushes pending config changes synchronously. State changes must be
+    /// durable immediately: callers (and tests) read the persisted ge.json /
+    /// reparse DB right after mutating operations, and a debounced write
+    /// would drop those changes on reopen or crash.
     fn flush_config_if_due(&self) -> AppResult<()> {
-        // State changes must be durable synchronously: callers (and tests)
-        // read the persisted ge.json / reparse DB immediately after
-        // mutating operations, and a debounced write would drop those
-        // changes on reopen or crash.
         {
             let flush_states = config_flush_states();
             let Some(state) = flush_states.get(&self.root) else {
@@ -1009,12 +1005,20 @@ impl GameEnvironment {
             .or(last_access_time_ticks)
             .or(last_write_time_ticks)
             .unwrap_or_else(|| current_windows_ticks(false));
+        let is_new_entry = !self.config.fs_state.entries.contains_key(&resolved.normalized_path);
         let entry = self
             .config
             .fs_state
             .entries
             .entry(resolved.normalized_path)
-            .or_insert_with(|| FsMetadataRecord {
+            .or_insert_with(|| {
+                if is_new_entry {
+                    config_flush_states()
+                        .entry(self.root.clone())
+                        .or_default()
+                        .prune_pending = true;
+                }
+                FsMetadataRecord {
                 kind: kind.clone(),
                 original_case,
                 attributes: if kind == FsEntryKind::Directory {
@@ -1026,7 +1030,9 @@ impl GameEnvironment {
                 creation_time_ticks: fallback_ticks,
                 last_access_time_ticks: fallback_ticks,
                 last_write_time_ticks: fallback_ticks,
+            }
             });
+
         if let Some(value) = creation_time_ticks {
             entry.creation_time_ticks = value;
         }
@@ -1627,11 +1633,14 @@ impl GameEnvironment {
     }
 
     fn write_config(&self) -> AppResult<()> {
-        let mut flush_states = config_flush_states();
-        let state = flush_states.entry(self.root.clone()).or_default();
-        if !state.dirty {
-            return Ok(());
-        }
+        let observed_seq = {
+            let mut flush_states = config_flush_states();
+            let state = flush_states.entry(self.root.clone()).or_default();
+            if !state.dirty {
+                return Ok(());
+            }
+            state.dirty_seq
+        };
 
         // Hold the flush-state lock across the IO so concurrent callers do
         // not double-write; the dirty flag is cleared only on success so a
@@ -1639,11 +1648,19 @@ impl GameEnvironment {
         let result = (|| {
             // Skip the reparse-DB rewrite when the in-memory DB is unchanged.
             let reparse_json = util::stable_json(&self.config.fs_state.reparse_points)?;
-            if state.last_reparse_json.as_ref() != Some(&reparse_json) {
+            let skip_reparse_write = {
+                let flush_states = config_flush_states();
+                flush_states
+                    .get(&self.root)
+                    .is_some_and(|state| state.last_reparse_json.as_ref() == Some(&reparse_json))
+            };
+            if !skip_reparse_write {
                 write_reparse_db(
                     &self.reparse_db_file(),
                     &self.config.fs_state.reparse_points,
                 )?;
+                let mut flush_states = config_flush_states();
+                let state = flush_states.entry(self.root.clone()).or_default();
                 state.last_reparse_json = Some(reparse_json);
             }
 
@@ -1651,25 +1668,44 @@ impl GameEnvironment {
             persisted_config.fs_state.reparse_points.clear();
             // Prune metadata records whose host paths no longer exist so the
             // persisted config does not grow without bound and deleted-then-
-            // recreated paths do not resurrect stale attributes/times.
-            let entries = std::mem::take(&mut persisted_config.fs_state.entries);
-            persisted_config.fs_state.entries = entries
-                .into_iter()
-                .filter(|(path, _)| {
-                    self.fs_entry_host_path(path)
-                        .map(|host| host.exists())
-                        .unwrap_or(true) // unresolvable entries (unmapped drive) are kept
-                })
-                .collect();
+            // recreated paths do not resurrect stale attributes/times. The
+            // prune needs a stat per entry, so it only runs when new entries
+            // were created since the last flush.
+            let prune_pending = {
+                let flush_states = config_flush_states();
+                flush_states
+                    .get(&self.root)
+                    .is_some_and(|state| state.prune_pending)
+            };
+            if prune_pending {
+                let entries = std::mem::take(&mut persisted_config.fs_state.entries);
+                persisted_config.fs_state.entries = entries
+                    .into_iter()
+                    .filter(|(path, _)| {
+                        self.fs_entry_host_path(path)
+                            .map(|host| host.exists())
+                            .unwrap_or(true) // unresolvable entries (unmapped drive) are kept
+                    })
+                    .collect();
+            }
             let contents = util::stable_json(&persisted_config)?;
             util::write_string(&self.root.join("ge.json"), &contents)
         })();
         match &result {
             Ok(()) => {
-                state.dirty = false;
-                state.last_flush = Some(Instant::now());
+                // Clear dirty only if no mutation arrived while we were
+                // writing; otherwise keep it set so the next flush persists
+                // the update (a concurrent writer would otherwise lose it).
+                let mut flush_states = config_flush_states();
+                let state = flush_states.entry(self.root.clone()).or_default();
+                if state.dirty_seq == observed_seq {
+                    state.dirty = false;
+                }
+                state.prune_pending = false;
             }
             Err(_) => {
+                let mut flush_states = config_flush_states();
+                let state = flush_states.entry(self.root.clone()).or_default();
                 state.dirty = true;
             }
         }
@@ -1963,6 +1999,10 @@ impl GameEnvironment {
         dtm: bool,
     ) -> AppResult<()> {
         let ticks = current_windows_ticks(dtm);
+        config_flush_states()
+            .entry(self.root.clone())
+            .or_default()
+            .prune_pending = true;
         self.config.fs_state.entries.insert(
             normalized_path.to_string(),
             FsMetadataRecord {
@@ -2445,8 +2485,14 @@ const FILE_TIME_EPOCH_OFFSET_TICKS: u64 = 116444736000000000;
 struct ConfigFlushState {
     /// Whether in-memory config changes await persistence.
     dirty: bool,
-    /// When the last full flush completed.
-    last_flush: Option<Instant>,
+    /// Monotonic counter bumped on every mutation; a flush only clears
+    /// `dirty` when no mutation arrived during the write (otherwise the
+    /// pending change would be lost).
+    dirty_seq: u64,
+    /// Set when new fs_state entries were created since the last flush; the
+    /// (per-entry stat) prune loop only runs when this is set, keeping the
+    /// per-mutation flush O(1) for attribute/time-only changes.
+    prune_pending: bool,
     /// Last serialized reparse-point DB, used to skip redundant rewrites.
     last_reparse_json: Option<String>,
 }

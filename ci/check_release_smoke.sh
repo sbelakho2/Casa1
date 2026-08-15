@@ -259,40 +259,38 @@ fi
 info ""
 info "4. Checking code signing (macOS only) ..."
 if command -v codesign &>/dev/null; then
-  # Ad-hoc sign every release binary the way a release build would (casa1-runner
-  # carries its JIT entitlements plist), then verify each one is signed.
+  # Verify the as-built signature is present and valid. The release process is
+  # responsible for signing (Developer ID, hardened runtime, JIT entitlements);
+  # this gate must NOT re-sign the artifacts, or it would only ever verify its
+  # own manufactured signature and mask a broken release signing step.
   SIGN_FAILED=false
   for binary in "${BINARIES[@]}"; do
     BINARY_PATH="$RELEASE_DIR/$binary"
-    if [[ "$binary" == "casa1-runner" && -f "$REPO_ROOT/ci/entitlements/casa1-runner.plist" ]]; then
-      /usr/bin/codesign --force --sign - \
-        --entitlements "$REPO_ROOT/ci/entitlements/casa1-runner.plist" \
-        "$BINARY_PATH" &>/dev/null || SIGN_FAILED=true
+    if [[ ! -x "$BINARY_PATH" ]]; then
+      continue
+    fi
+    if ! /usr/bin/codesign --verify --strict "$BINARY_PATH" &>/dev/null; then
+      fail "  ❌ $binary: signature invalid or missing (as built by the release)"
+      SIGN_FAILED=true
     else
-      /usr/bin/codesign --force --sign - "$BINARY_PATH" &>/dev/null || SIGN_FAILED=true
+      info "  ✅ $binary: signature valid"
     fi
   done
 
   if [[ "$SIGN_FAILED" == "true" ]]; then
-    fail "  ❌ codesign failed for one or more release binaries"
+    fail "  ❌ codesign verification failed for one or more release binaries"
     FAIL=$((FAIL + 1))
-  else
-    info "  All binaries ad-hoc signed"
   fi
 
-  # Verify the signature is actually present and valid
-  for binary in "${BINARIES[@]}"; do
-    BINARY_PATH="$RELEASE_DIR/$binary"
-    if [[ -x "$BINARY_PATH" ]]; then
-      SIGN_INFO="$(codesign -d -vvv "$BINARY_PATH" 2>&1 || true)"
-      if echo "$SIGN_INFO" | grep -q "adhoc\|designated"; then
-        info "  ✅ $binary: signed"
-      else
-        fail "  ❌ $binary: not signed"
-        FAIL=$((FAIL + 1))
-      fi
-    fi
-  done
+  # casa1-runner must carry the JIT entitlement (allow-jit) in its embedded
+  # signature; without it the runner cannot JIT-compile on macOS.
+  RUNNER_PATH="$RELEASE_DIR/casa1-runner"
+  if [[ -x "$RUNNER_PATH" ]] && /usr/bin/codesign -d --entitlements - "$RUNNER_PATH" 2>/dev/null | grep -q "allow-jit"; then
+    info "  ✅ casa1-runner: allow-jit entitlement present"
+  elif [[ -x "$RUNNER_PATH" ]]; then
+    fail "  ❌ casa1-runner: allow-jit entitlement missing"
+    FAIL=$((FAIL + 1))
+  fi
 else
   info "  codesign not available — skipping signing check"
   PASS=$((PASS + 1))

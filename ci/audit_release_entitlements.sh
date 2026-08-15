@@ -72,9 +72,12 @@ echo "Checking Cargo.toml for insecure default features..."
 # Extract the default = [...] array from [features] and ensure dev-insecure-tls
 # is not present. This prevents accidental inclusion of TLS bypass in release.
 # (POSIX tools only — grep -P/-Pzo are GNU extensions unavailable on macOS.)
-if awk '
+# The scan never `exit`s early (a `[features.x]` sub-table must not disable
+# the check), and it fails closed when no top-level default array is found.
+default_features="$(
+  awk '
     /^\[features\]/ { in_features = 1; next }
-    in_features && /^\[/ { exit }
+    in_features && /^\[/ { in_features = 0 }
     in_features && /^default[[:space:]]*=/ { found = 1; depth = 0 }
     found {
         depth += gsub(/\[/, "[")
@@ -82,7 +85,14 @@ if awk '
         print
         if (depth <= 0) { found = 0 }
     }
-' Cargo.toml | grep -q 'dev-insecure-tls'; then
+' Cargo.toml
+)"
+if [ -z "$default_features" ]; then
+  echo "ERROR: could not locate the top-level [features] default array in Cargo.toml." >&2
+  echo "Refusing to gate a release on an unverifiable feature list." >&2
+  exit 1
+fi
+if echo "$default_features" | grep -q 'dev-insecure-tls'; then
   echo "ERROR: 'dev-insecure-tls' found in default features in Cargo.toml." >&2
   echo "Remove it before cutting a release." >&2
   exit 1

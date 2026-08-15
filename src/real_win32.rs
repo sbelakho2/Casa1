@@ -4913,46 +4913,6 @@ fn variant_to_f64(v: &Variant) -> f64 {
     }
 }
 
-/// Convert a VARIANT to its string representation.
-fn variant_to_string(v: &Variant) -> String {
-    let vt = v.vt & VT_TYPEMASK;
-    // Copy the data field to avoid unaligned reference on packed struct
-    // Safety: u64 is Copy; reading from a packed struct field is safe via direct access
-    let data = v.data;
-    match vt {
-        VT_EMPTY => String::new(),
-        VT_NULL => "NULL".to_string(),
-        VT_I1 => format!("{}", data as i8),
-        VT_UI1 => format!("{}", data as u8),
-        VT_I2 => format!("{}", data as i16),
-        VT_UI2 => format!("{}", data as u16),
-        VT_I4 | VT_INT => format!("{}", data as i32),
-        VT_UI4 | VT_UINT => format!("{}", data as u32),
-        VT_I8 => format!("{}", data as i64),
-        VT_UI8 => format!("{}", data),
-        VT_R4 => format!("{}", f32::from_bits(data as u32)),
-        VT_R8 => format!("{}", f64::from_bits(data)),
-        VT_BOOL => {
-            if data != 0 {
-                "True".to_string()
-            } else {
-                "False".to_string()
-            }
-        }
-        VT_BSTR | VT_LPWSTR => {
-            // Would dereference guest memory; callers that need the string
-            // must read it from guest memory themselves.
-            String::new()
-        }
-        VT_ERROR => format!("0x{:08X}", data as u32),
-        VT_CY => format!("{}", (data as i64) as f64 / 10000.0),
-        VT_DATE => format!("{}", f64::from_bits(data)),
-        VT_UNKNOWN => format!("IUnknown(0x{:X})", data),
-        VT_DISPATCH => format!("IDispatch(0x{:X})", data),
-        VT_DECIMAL => format!("DECIMAL({})", v.data as u32),
-        _ => format!("VT({})", vt),
-    }
-}
 
 /// SAFEARRAYBOUND structure.
 #[repr(C)]

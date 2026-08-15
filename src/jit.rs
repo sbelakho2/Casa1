@@ -2255,20 +2255,11 @@ impl JitCompiler {
                 self.emit_helper_store(arm_sp, 22, w, arch);
             }
 
-            IrInstruction::PushFlags { width } => {
-                // Push the flags register — approximate as pushing 0 (the JIT
-                // doesn't maintain an EFLAGS word; JumpIf conditions are
-                // evaluated in the dispatcher from state.flags).
-                let arm_sp = regmap::guest_to_arm(4);
-                let w = *width as u64;
-                self.emitter.sub_imm(arm_sp, arm_sp, w as u32);
-                self.emitter.mov_imm64(22, 0);
-                self.emit_helper_store(arm_sp, 22, w, arch);
-            }
-
-            IrInstruction::PopFlags { width: _ } => {
-                let arm_sp = regmap::guest_to_arm(4);
-                self.emitter.add_imm(arm_sp, arm_sp, 8);
+            // PushFlags / PopFlags are routed to the interpreter: the JIT
+            // does not maintain an EFLAGS word, and pushing 0 / popping 8
+            // would diverge from the interpreter's pack_eflags semantics.
+            IrInstruction::PushFlags { .. } | IrInstruction::PopFlags { .. } => {
+                self.emit_interpreter_fallback(insn, arch)?;
             }
 
             // ── Register-register ALU ops ──────────────────────────────
@@ -2278,8 +2269,8 @@ impl JitCompiler {
             IrInstruction::XorReg { dst, src, width }
             | IrInstruction::OrReg { dst, src, width }
             | IrInstruction::AndReg { dst, src, width } => {
-                let arm_dst = regmap::guest_to_arm(dst.index());
                 if let crate::cpu::CompareOperand::Register(src_reg) = src {
+                    let arm_dst = regmap::guest_to_arm(dst.index());
                     let arm_src = regmap::guest_to_arm(src_reg.index());
                     // Save lhs (dst) for flags, do the op, then set flags.
                     self.emitter.mov_reg(27, arm_dst); // lhs
@@ -2292,6 +2283,10 @@ impl JitCompiler {
                     if *width == 4 { self.emitter.uxtw_reg(arm_dst, arm_dst); }
                     // Set flags: op=2 (logic), result=dst, lhs=x27, rhs=arm_src
                     self.emit_set_flags(arm_dst, 27, arm_src, 2, *width as u64, arch);
+                } else {
+                    // Memory/immediate operands: route to the interpreter,
+                    // which resolves them via read_compare_operand.
+                    self.emit_interpreter_fallback(insn, arch)?;
                 }
             }
 
@@ -2602,32 +2597,39 @@ impl JitCompiler {
                 self.emit_epilogue();
             }
 
-            // For instructions the JIT compiler cannot handle, return an error.
-            // This prevents the block from being cached and causes the caller
-            // Universal catch-all: for any instruction without a dedicated JIT
-            // arm, emit a call to jit_helper_execute_insn(state, memory, &insn).
-            // The instruction is stored in self.helper_insns so its pointer
-            // remains valid for the lifetime of the JitCompiler.  The helper
-            // executes the single instruction directly on CpuState+MemoryImage.
-            _ => {
-                // Store a boxed copy so the address is stable across Vec growth.
-                let boxed = Box::new(insn.clone());
-                let insn_ptr = &*boxed as *const IrInstruction as u64;
-                self.helper_insns.push(boxed);
-                // Save guest GPRs to CpuState, call helper, reload.
-                self.emit_store_guest_registers(arch);
-                self.emitter.mov_reg(24, 0);  // save CpuState
-                self.emitter.mov_reg(28, 2);  // save MemoryImage ptr
-                self.emitter.mov_reg(0, 24);           // x0 = CpuState
-                self.emitter.mov_reg(1, 28);           // x1 = MemoryImage
-                self.emitter.mov_imm64(2, insn_ptr);   // x2 = &insn
-                self.emit_bl_to(jit_helper_execute_insn as *const () as usize);
-                self.emitter.mov_reg(0, 24);           // restore CpuState
-                self.emit_load_guest_registers(arch);
-                self.emitter.mov_reg(2, 28);           // restore MemoryImage ptr
-            }
+            // Universal catch-all: for any instruction without a dedicated
+            // JIT arm, emit a call to jit_helper_execute_insn(state, memory,
+            // &insn) so the interpreter executes it with identical semantics.
+            _ => self.emit_interpreter_fallback(insn, arch)?,
         }
 
+        Ok(())
+    }
+
+    /// Emit a call to `jit_helper_execute_insn` for an IR instruction the JIT
+    /// does not compile natively. The instruction is stored in
+    /// `self.helper_insns` so its pointer remains valid for the lifetime of
+    /// the JitCompiler; guest registers are saved/restored around the call.
+    fn emit_interpreter_fallback(
+        &mut self,
+        insn: &IrInstruction,
+        arch: GuestArch,
+    ) -> AppResult<()> {
+        // Store a boxed copy so the address is stable across Vec growth.
+        let boxed = Box::new(insn.clone());
+        let insn_ptr = &*boxed as *const IrInstruction as u64;
+        self.helper_insns.push(boxed);
+        // Save guest GPRs to CpuState, call helper, reload.
+        self.emit_store_guest_registers(arch);
+        self.emitter.mov_reg(24, 0);  // save CpuState
+        self.emitter.mov_reg(28, 2);  // save MemoryImage ptr
+        self.emitter.mov_reg(0, 24);           // x0 = CpuState
+        self.emitter.mov_reg(1, 28);           // x1 = MemoryImage
+        self.emitter.mov_imm64(2, insn_ptr);   // x2 = &insn
+        self.emit_bl_to(jit_helper_execute_insn as *const () as usize);
+        self.emitter.mov_reg(0, 24);           // restore CpuState
+        self.emit_load_guest_registers(arch);
+        self.emitter.mov_reg(2, 28);           // restore MemoryImage ptr
         Ok(())
     }
 

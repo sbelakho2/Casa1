@@ -1067,22 +1067,21 @@ pub fn register_installed_app(
     install_path: &str,
     uninstall_cmd: &str,
 ) -> AppResult<()> {
-    let key = normalize_path(&format!(
-        "HKLM/SOFTWARE/Microsoft/Windows/CurrentVersion/Uninstall/{}",
-        name
+    let key = normalize_registry_key(&format!(
+        "HKLM/SOFTWARE/Microsoft/Windows/CurrentVersion/Uninstall/{name}"
     ));
     engine
         .registry
-        .insert(format!("{key}/displayname"), name.to_string());
+        .insert(format!("{key}\\displayname"), name.to_string());
     engine
         .registry
-        .insert(format!("{key}/installlocation"), install_path.to_string());
+        .insert(format!("{key}\\installlocation"), install_path.to_string());
     engine
         .registry
-        .insert(format!("{key}/uninstallstring"), uninstall_cmd.to_string());
+        .insert(format!("{key}\\uninstallstring"), uninstall_cmd.to_string());
     engine
         .registry
-        .insert(format!("{key}/displayversion"), "1.0.0".to_string());
+        .insert(format!("{key}\\displayversion"), "1.0.0".to_string());
     Ok(())
 }
 
@@ -1535,9 +1534,10 @@ impl InstallShieldEngine {
         }
 
         // Remove registry keys
+        let normalized_uninstall_key = normalize_registry_key(&uninstall_key);
         engine
             .registry
-            .retain(|k, _| !k.starts_with(&uninstall_key.to_ascii_lowercase()));
+            .retain(|k, _| !k.starts_with(&normalized_uninstall_key));
 
         let telemetry = InstallerTelemetry {
             installer_id: format!("installshield-uninstall:{name}"),
@@ -2072,15 +2072,15 @@ impl ISSetupDllStub {
                 };
 
                 // Update registry to reflect COM registration
-                let com_key = format!(
+                let com_key = normalize_registry_key(&format!(
                     "hklm/software/classes/clsid/{}",
                     util::sha256_bytes(path.as_bytes())
-                );
+                ));
                 engine
                     .registry
-                    .insert(format!("{com_key}/inprocserver32"), path.clone());
+                    .insert(format!("{com_key}\\inprocserver32"), path.clone());
                 engine.registry.insert(
-                    format!("{com_key}/inprocserver32/threadingmodel"),
+                    format!("{com_key}\\inprocserver32\\threadingmodel"),
                     "apartment".to_string(),
                 );
                 registered.push(format!("{version}:{path}"));
@@ -2463,9 +2463,10 @@ impl NsisEngine {
         }
 
         // Remove registry keys
+        let normalized_uninstall_key = normalize_registry_key(&uninstall_key);
         engine
             .registry
-            .retain(|k, _| !k.starts_with(&uninstall_key.to_ascii_lowercase()));
+            .retain(|k, _| !k.starts_with(&normalized_uninstall_key));
 
         let telemetry = InstallerTelemetry {
             installer_id: format!("nsis-uninstall:{name}"),
@@ -2593,7 +2594,7 @@ impl InnoSetupEngine {
 
         // A partial install will have some files but missing the uninstall entry
         let has_uninstall_entry = engine.registry.keys().any(|k| {
-            k.contains("windows/currentversion/uninstall")
+            k.contains("windows\\currentversion\\uninstall")
                 && (k.contains("steam") || k.contains("steam setup"))
         });
 
@@ -2644,14 +2645,17 @@ impl InnoSetupEngine {
                 );
                 engine
                     .registry
-                    .insert(format!("{com_key}/inprocserver32"), value.clone());
+                    .insert(
+                        normalize_registry_key(&format!("{com_key}/inprocserver32")),
+                        value.clone(),
+                    );
                 logs.push(format!("ISDone: registered DLL {value}"));
             }
         }
 
         // Simulate ISDone.dll progress: write a marker that extraction is done
         engine.registry.insert(
-            format!("{}/isdone/extract_complete", normalize_path(setup_dir)),
+            normalize_registry_key(&format!("{}/isdone/extract_complete", normalize_path(setup_dir))),
             "true".to_string(),
         );
         logs.push("ISDone: extraction complete marker written".to_string());
@@ -2887,11 +2891,11 @@ impl InnoSetupEngine {
                 if !has_steam_exe {
                     // Log that we need to re-extract core Steam files
                     engine.registry.insert(
-                        "hklm/software/steam/recovery/partial_files".to_string(),
+                        normalize_registry_key("hklm/software/steam/recovery/partial_files"),
                         partial_count.to_string(),
                     );
                     engine.registry.insert(
-                        "hklm/software/steam/recovery/needs_resume".to_string(),
+                        normalize_registry_key("hklm/software/steam/recovery/needs_resume"),
                         "true".to_string(),
                     );
                 }
@@ -2899,11 +2903,11 @@ impl InnoSetupEngine {
 
             // Write Steam-specific registry entries
             engine.registry.insert(
-                "hklm/software/steam/installpath".to_string(),
+                normalize_registry_key("hklm/software/steam/installpath"),
                 install_dir.to_ascii_lowercase(),
             );
             engine.registry.insert(
-                "hklm/software/steam/installcomplete".to_string(),
+                normalize_registry_key("hklm/software/steam/installcomplete"),
                 "true".to_string(),
             );
 
@@ -3567,7 +3571,7 @@ mod tests {
             vec![1, 2, 3],
         );
         state.registry.insert(
-            "hklm/software/microsoft/windows/currentversion/uninstall/myapp/displayname"
+            "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\MyApp\\displayname"
                 .to_string(),
             "MyApp".to_string(),
         );
@@ -3595,7 +3599,7 @@ mod tests {
             vec![1, 2, 3],
         );
         state.registry.insert(
-            "hklm/software/microsoft/windows/currentversion/uninstall/mynsisapp/displayname"
+            "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\MyNSISApp\\displayname"
                 .to_string(),
             "MyNSISApp".to_string(),
         );
@@ -3679,17 +3683,17 @@ mod tests {
 
         let reg = state.registry();
         assert!(reg.contains_key(
-            "hklm/software/microsoft/windows/currentversion/uninstall/testapp/displayname"
+            "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\TestApp\\displayname"
         ));
         assert_eq!(
             reg.get(
-                "hklm/software/microsoft/windows/currentversion/uninstall/testapp/installlocation"
+                "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\TestApp\\installlocation"
             ),
             Some(&"C:/TestApp".to_string())
         );
         assert_eq!(
             reg.get(
-                "hklm/software/microsoft/windows/currentversion/uninstall/testapp/uninstallstring"
+                "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\TestApp\\uninstallstring"
             ),
             Some(&"C:/TestApp/uninstall.exe".to_string())
         );

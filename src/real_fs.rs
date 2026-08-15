@@ -317,34 +317,48 @@ impl WindowsPathResolver {
             // under it and there is nothing on disk to escape through.
             return Ok(());
         };
-        let mut probe = path.to_path_buf();
+        // Find the deepest existing ancestor using symlink_metadata (lstat),
+        // which succeeds for dangling symlinks too. Walking with exists()
+        // would silently skip dangling links and approve the path, allowing
+        // a later create to follow the link outside the root.
+        let mut ancestor = path.to_path_buf();
         loop {
-            if let Ok(canon) = fs::canonicalize(&probe) {
-                if canon.starts_with(&root) {
-                    return Ok(());
-                }
-                return Err(AppError::new(
-                    ReasonCode::RcFsSandboxEscape,
-                    format!(
-                        "path {} escapes the GE root via a symlink (resolves to {})",
-                        path.display(),
-                        canon.display()
-                    ),
-                ));
+            if fs::symlink_metadata(&ancestor).is_ok() {
+                break;
             }
-            if !probe.pop() {
+            if !ancestor.pop() {
                 return Err(AppError::new(
                     ReasonCode::RcFsSandboxEscape,
                     format!("path {} has no existing ancestor inside the GE root", path.display()),
                 ));
             }
             // Defense in depth: never walk lexically above the GE root.
-            if !probe.starts_with(&self.ge_root) {
+            if !ancestor.starts_with(&self.ge_root) {
                 return Err(AppError::new(
                     ReasonCode::RcFsSandboxEscape,
                     format!("path {} leaves the GE root", path.display()),
                 ));
             }
+        }
+        // The deepest existing ancestor must canonicalize cleanly (no dangling
+        // symlink in its chain) and resolve inside the canonicalized root.
+        match fs::canonicalize(&ancestor) {
+            Ok(canon) if canon.starts_with(&root) => Ok(()),
+            Ok(canon) => Err(AppError::new(
+                ReasonCode::RcFsSandboxEscape,
+                format!(
+                    "path {} escapes the GE root via a symlink (resolves to {})",
+                    path.display(),
+                    canon.display()
+                ),
+            )),
+            Err(_) => Err(AppError::new(
+                ReasonCode::RcFsSandboxEscape,
+                format!(
+                    "path {} contains a dangling symlink whose target cannot be verified inside the GE root",
+                    path.display()
+                ),
+            )),
         }
     }
 
@@ -455,7 +469,15 @@ impl ShareRegistry {
     fn release(&self, path: &Path, claim: HandleClaim) {
         let mut handles = self.handles.lock().unwrap();
         if let Some(claims) = handles.get_mut(path) {
-            claims.retain(|c| !(c.access == claim.access && c.share == claim.share));
+            // Remove only the first matching claim: two handles opened with
+            // the same (access, share) pair are independent leases, and
+            // closing one must not release the other.
+            if let Some(pos) = claims
+                .iter()
+                .position(|c| c.access == claim.access && c.share == claim.share)
+            {
+                claims.remove(pos);
+            }
             if claims.is_empty() {
                 handles.remove(path);
             }
@@ -703,8 +725,8 @@ impl RealFilesystem {
         if can_write {
             self.authorize_path(windows_path, true)?;
         }
+        // resolve() already verifies containment; do not re-verify here.
         let real_path = self.resolver.resolve(windows_path)?;
-        self.resolver.verify_within_root(&real_path)?;
 
         // Enforce Windows share-mode semantics before touching the file.
         let access = (if can_read { ACCESS_READ } else { 0 }) | (if can_write { ACCESS_WRITE } else { 0 });
@@ -720,7 +742,8 @@ impl RealFilesystem {
             ));
         }
 
-        // Ensure parent directory exists (containment was verified above).
+        // Ensure parent directory exists (containment was verified in
+        // resolve() above; the parent creation cannot escape the root).
         if let Some(parent) = real_path.parent() {
             fs::create_dir_all(parent).map_err(|e| {
                 AppError::new(
@@ -729,7 +752,6 @@ impl RealFilesystem {
                 )
             })?;
         }
-        self.resolver.verify_within_root(&real_path)?;
 
         // Open existing only (create/truncate are gated on write access).
         let mut open_options = fs::OpenOptions::new();
@@ -924,16 +946,46 @@ impl RealFilesystem {
         Ok(())
     }
 
-    /// Escape a sidecar component so the `__` separator is unambiguous.
-    /// Every `_` is encoded as `_u`; the result never contains a bare `__`,
-    /// so the first `__` in a sidecar name is always the separator.
+    /// Escape a sidecar component so the `__` separator is unambiguous and
+    /// the encoding is injective. `_` maps to `_5f` and `%` to `_25`; the
+    /// result never contains a bare `__` (since every `_` is encoded), so the
+    /// first `__` in a sidecar name is always the separator.
     fn escape_sidecar_component(component: &str) -> String {
-        component.replace('_', "_u")
+        let mut out = String::with_capacity(component.len());
+        for c in component.chars() {
+            match c {
+                '_' => out.push_str("_5f"),
+                '%' => out.push_str("_25"),
+                _ => out.push(c),
+            }
+        }
+        out
     }
 
-    /// Inverse of [`Self::escape_sidecar_component`].
+    /// Inverse of [`Self::escape_sidecar_component`] (injective pair).
     fn unescape_sidecar_component(component: &str) -> String {
-        component.replace("_u", "_")
+        let mut out = String::with_capacity(component.len());
+        let mut chars = component.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '_' {
+                match (chars.next(), chars.next()) {
+                    (Some('5'), Some('f')) => out.push('_'),
+                    (Some('2'), Some('5')) => out.push('%'),
+                    (a, b) => {
+                        out.push(c);
+                        if let Some(x) = a {
+                            out.push(x);
+                        }
+                        if let Some(x) = b {
+                            out.push(x);
+                        }
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
     }
 
     /// Read from an alternate data stream.
@@ -2250,6 +2302,35 @@ mod tests {
         assert!(fs.exists("C:\\alias\\data.txt"));
         let meta = fs.metadata("C:\\alias\\data.txt");
         assert!(meta.is_ok(), "in-root symlink should be allowed, got {meta:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_symlink_creation_is_rejected() {
+        let (tmp, _fs) = setup_fs();
+
+        // A symlink whose target does NOT exist yet (e.g. a not-yet-mounted
+        // Steam library folder). Creation through it must be rejected: the
+        // OS would follow the link and create the file at the target,
+        // outside the GE root.
+        let outside_dir = tmp.path().join("outside_target");
+        let link = tmp.path().join("drive_c").join("dangling_link");
+        std::os::unix::fs::symlink(&outside_dir, &link).unwrap();
+        assert!(!outside_dir.exists(), "precondition: target must not exist");
+
+        let resolver = WindowsPathResolver::new(tmp.path());
+        let result = resolver.resolve("C:\\dangling_link\\new_file.txt");
+        assert!(
+            result.is_err(),
+            "creation through a dangling symlink must be rejected, got {result:?}"
+        );
+        assert!(
+            !outside_dir.exists(),
+            "the symlink target must not be created outside the GE root"
+        );
+
+        // A plain new path (no symlinks) still resolves for creation.
+        assert!(resolver.resolve("C:\\fresh\\new_dir\\file.txt").is_ok());
     }
 
     // -----------------------------------------------------------------------

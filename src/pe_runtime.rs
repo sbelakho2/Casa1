@@ -4803,7 +4803,6 @@ pub fn execute_with_options(
             &mut runtime.basic_block_cache_generation,
             BASIC_BLOCK_CACHE_LIMIT,
             state.rip,
-            runtime.jit_runtime.as_mut(),
         )
         .map_err(|error| annotate_guest_fault(error, &memory, &state))?;
         if block_count <= 10 {
@@ -47532,7 +47531,6 @@ impl PeHostRuntime {
                 &mut self.basic_block_cache_generation,
                 BASIC_BLOCK_CACHE_LIMIT,
                 state.rip,
-                self.jit_runtime.as_mut(),
             )
             .map_err(|error| annotate_guest_fault(error, memory, state))?;
             let consumed_instructions = cached_block.translated.decoded.len().max(1) as u64;
@@ -64976,9 +64974,17 @@ fn decode_current_instruction_cached(
     if let Some(cached) = instruction_cache.get_mut(&rip) {
         // Verify the cached instruction still matches guest memory so
         // self-modifying code refreshes the cache. The check is a single
-        // short read (≤15 bytes) per hit.
-        let mut live = vec![0u8; cached.cached.decoded.size];
-        if memory.read_into_slice(rip, &mut live).is_ok() && live == cached.cached.bytes {
+        // short read (≤15 bytes, the x86 max instruction length) on a stack
+        // buffer — no heap allocation on the decode hot path.
+        let size = cached.cached.decoded.size;
+        let live_matches = if size <= 15 {
+            let mut live = [0u8; 15];
+            memory.read_into_slice(rip, &mut live[..size]).is_ok()
+                && live[..size] == cached.cached.bytes[..]
+        } else {
+            false
+        };
+        if live_matches {
             *instruction_cache_generation = instruction_cache_generation.saturating_add(1);
             cached.generation = *instruction_cache_generation;
             instruction_cache_lru.push_back((rip, cached.generation));
@@ -65023,7 +65029,6 @@ fn decode_basic_block_cached(
     basic_block_cache_generation: &mut u64,
     basic_block_cache_limit: usize,
     rip: u64,
-    _jit_runtime: Option<&mut crate::jit::JitRuntime>,
 ) -> AppResult<Arc<CachedBlock>> {
     if let Some(cached) = basic_block_cache.get_mut(&rip) {
         // Skip read_window_matches verification for performance —
@@ -70028,7 +70033,6 @@ mod tests {
             &mut basic_block_cache_generation,
             BASIC_BLOCK_CACHE_LIMIT,
             rip,
-            None,
         )
         .expect("decode cached block");
         let second = decode_basic_block_cached(
@@ -70043,7 +70047,6 @@ mod tests {
             &mut basic_block_cache_generation,
             BASIC_BLOCK_CACHE_LIMIT,
             rip,
-            None,
         )
         .expect("reuse cached block");
 
