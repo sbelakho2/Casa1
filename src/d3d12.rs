@@ -131,6 +131,9 @@ struct QueryHeap {
     active: Vec<bool>,
     /// For timestamp queries: the begin timestamp counter value.
     begin_values: Vec<u64>,
+    /// Final resolved values (end - begin for timestamps), written to the
+    /// guest's readback buffer by ResolveQueryData.
+    resolved: Vec<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -144,12 +147,8 @@ pub struct D3d12Runtime {
     acceleration_structures: BTreeMap<u64, D3D12AccelerationStructure>,
     /// Monotonic counter for Metal acceleration structure handles.
     next_metal_as_handle: u64,
-    /// Track per-fence signaled values for wait_for_fence.
-    fence_values: BTreeMap<u64, u64>,
     /// Query heap tracking for begin/end query pairs.
     query_heaps: BTreeMap<u64, QueryHeap>,
-    /// Meta command parameter data storage.
-    meta_command_params: BTreeMap<u64, Vec<u8>>,
     /// Depth bounds min/max (set by OMSetDepthBounds).
     depth_bounds_min: f32,
     depth_bounds_max: f32,
@@ -160,7 +159,8 @@ pub struct D3d12Runtime {
     view_instance_mask: u32,
     /// Protected resource session handle.
     protected_session: u64,
-    /// Per-subresource barrier state tracking (array_slice, mip_level).
+    /// Per-subresource barrier state tracking: (resource, 0, flat D3D12
+    /// subresource index) -> state, mirroring the backend convention.
     subresource_states: BTreeMap<SubresourceKey, ResourceState>,
     /// Pending split barrier states (BEGIN_ONLY not yet matched with END_ONLY).
     pending_split_barriers: Vec<PendingSplitBarrier>,
@@ -182,9 +182,7 @@ impl Default for D3d12Runtime {
             raytracing_pipeline_states: BTreeMap::new(),
             acceleration_structures: BTreeMap::new(),
             next_metal_as_handle: 1,
-            fence_values: BTreeMap::new(),
             query_heaps: BTreeMap::new(),
-            meta_command_params: BTreeMap::new(),
             depth_bounds_min: 0.0,
             depth_bounds_max: 1.0,
             sample_positions_pixel_samples: 0,
@@ -213,9 +211,7 @@ impl D3d12Runtime {
             raytracing_pipeline_states: BTreeMap::new(),
             acceleration_structures: BTreeMap::new(),
             next_metal_as_handle: 1,
-            fence_values: BTreeMap::new(),
             query_heaps: BTreeMap::new(),
-            meta_command_params: BTreeMap::new(),
             depth_bounds_min: 0.0,
             depth_bounds_max: 1.0,
             sample_positions_pixel_samples: 0,
@@ -238,6 +234,15 @@ impl D3d12Runtime {
         &mut self.backend
     }
 
+    /// Emit a diagnostic trace line. Writes to stderr only when
+    /// `CASA1_TRACE_D3D12` is set, so hot paths (e.g. per-frame acceleration
+    /// structure builds) do not pay unbuffered stderr I/O by default.
+    fn trace(&self, message: &str) {
+        if std::env::var_os("CASA1_TRACE_D3D12").is_some() {
+            eprintln!("[d3d12] {message}");
+        }
+    }
+
     pub fn device_info(&self) -> D3d12DeviceInfo {
         let capabilities = self.backend.capabilities();
         D3d12DeviceInfo {
@@ -255,28 +260,28 @@ impl D3d12Runtime {
         }
     }
 
-    /// Get subresource state from fine-grained tracking.
+    /// Get subresource state from fine-grained tracking. `subresource` is the
+    /// flat D3D12 subresource index (mip + array_slice * mip_levels).
     pub fn subresource_state(
         &self,
         resource: ResourceId,
-        array_slice: u32,
-        mip_level: u32,
+        subresource: u32,
     ) -> Option<ResourceState> {
         self.subresource_states
-            .get(&(resource, array_slice, mip_level))
+            .get(&(resource, 0, subresource))
             .copied()
     }
 
-    /// Set subresource state in fine-grained tracking.
+    /// Set subresource state in fine-grained tracking. `subresource` is the
+    /// flat D3D12 subresource index (mip + array_slice * mip_levels).
     pub fn set_subresource_state(
         &mut self,
         resource: ResourceId,
-        array_slice: u32,
-        mip_level: u32,
+        subresource: u32,
         state: ResourceState,
     ) {
         self.subresource_states
-            .insert((resource, array_slice, mip_level), state);
+            .insert((resource, 0, subresource), state);
     }
 
     /// Get the stored root signature descriptor for a given ID.
@@ -320,12 +325,16 @@ impl D3d12Runtime {
     }
 
     /// Map D3D12_TEXTURE_ADDRESS_MODE to Metal address mode string.
+    ///
+    /// D3D12 values: 1=WRAP, 2=MIRROR, 3=CLAMP, 4=BORDER, 5=MIRROR_ONCE.
+    /// Metal has no `mirror_once` mode, so MIRROR_ONCE maps to `mirror_repeat`.
     pub fn map_d3d12_address_mode(mode: u32) -> &'static str {
         match mode {
-            1 => "clamp_to_edge",
-            2 => "repeat",
-            3 => "mirror_repeat",
-            4 => "clamp_to_zero", // D3D12_TEXTURE_ADDRESS_MODE_BORDER
+            1 => "repeat",          // D3D12_TEXTURE_ADDRESS_MODE_WRAP
+            2 => "mirror_repeat",   // D3D12_TEXTURE_ADDRESS_MODE_MIRROR
+            3 => "clamp_to_edge",   // D3D12_TEXTURE_ADDRESS_MODE_CLAMP
+            4 => "clamp_to_zero",   // D3D12_TEXTURE_ADDRESS_MODE_BORDER
+            5 => "mirror_repeat",   // D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE
             _ => "clamp_to_edge",
         }
     }
@@ -356,7 +365,13 @@ impl D3d12Runtime {
     }
 
     /// Create a Metal sampler descriptor string from a D3D12_STATIC_SAMPLER_DESC.
-    pub fn static_sampler_to_metal_desc(sampler: &D3D12StaticSamplerDesc) -> String {
+    ///
+    /// Rejects invalid combinations (anisotropy above the Metal limit of 16,
+    /// min_lod > max_lod) before emitting the descriptor.
+    pub fn static_sampler_to_metal_desc(
+        sampler: &D3D12StaticSamplerDesc,
+    ) -> AppResult<String> {
+        Self::validate_static_sampler(sampler)?;
         let (min_filter, mag_filter, mip_filter, anisotropic, _) =
             Self::map_d3d12_filter_to_metal(sampler.filter);
         let address_u = Self::map_d3d12_address_mode(sampler.address_u);
@@ -365,7 +380,7 @@ impl D3d12Runtime {
         let compare_fn = Self::map_d3d12_comparison_func(sampler.comparison_func);
         let border_color = Self::map_d3d12_border_color(sampler.border_color);
 
-        format!(
+        Ok(format!(
             "sampler(coord::normalized, address::{addr_u}, address::{addr_v}, address::{addr_w}, \
              filter::{min_f},{mag_f},{mip_f}, compare::{cmp}, lod_clamp({min_lod},{max_lod}), \
              max_anisotropy({aniso}), border_color::{border})",
@@ -384,7 +399,7 @@ impl D3d12Runtime {
                 1
             },
             border = border_color,
-        )
+        ))
     }
 
     /// Validate a static sampler descriptor for unsupported combinations.
@@ -640,6 +655,7 @@ impl D3d12Runtime {
         from: ResourceState,
         to: ResourceState,
     ) -> AppResult<()> {
+        self.set_subresource_state(resource, subresource, to);
         self.backend
             .record_transition(list, resource, subresource, from, to)
     }
@@ -658,7 +674,7 @@ impl D3d12Runtime {
         before: Option<ResourceId>,
         after: Option<ResourceId>,
     ) -> AppResult<()> {
-        self.aliasing_overlaps.push((before, after));
+        self.track_aliasing_overlap(before, after);
         self.backend.record_aliasing_barrier(list, before, after)
     }
 
@@ -668,12 +684,27 @@ impl D3d12Runtime {
         list: CommandListId,
         desc: &D3D12ResourceBarrierDesc,
     ) -> AppResult<()> {
-        // Track aliasing overlaps
+        // Track aliasing overlaps (deduplicated so the set stays bounded)
         if desc.barrier_type == D3D12ResourceBarrierType::Aliasing {
-            self.aliasing_overlaps
-                .push((desc.resource_before, desc.resource_after));
+            self.track_aliasing_overlap(desc.resource_before, desc.resource_after);
         }
         self.backend.record_resource_barrier(list, desc)
+    }
+
+    /// Track an aliasing overlap pair, deduplicating so the set does not grow
+    /// without bound across repeated barriers on the same pair.
+    fn track_aliasing_overlap(
+        &mut self,
+        before: Option<ResourceId>,
+        after: Option<ResourceId>,
+    ) {
+        if !self
+            .aliasing_overlaps
+            .iter()
+            .any(|(b, a)| *b == before && *a == after)
+        {
+            self.aliasing_overlaps.push((before, after));
+        }
     }
 
     /// Record a split barrier begin (D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY).
@@ -685,6 +716,7 @@ impl D3d12Runtime {
         from: ResourceState,
         to: ResourceState,
     ) -> AppResult<()> {
+        self.set_subresource_state(resource, subresource, to);
         self.pending_split_barriers.push(PendingSplitBarrier {
             resource,
             subresource,
@@ -704,16 +736,24 @@ impl D3d12Runtime {
         from: ResourceState,
         to: ResourceState,
     ) -> AppResult<()> {
-        // Remove matching pending split barrier
+        // Remove matching pending split barrier. An END_ONLY without a
+        // matching BEGIN is a malformed barrier sequence; reject it instead
+        // of mutating resource state (D3D12 debug validation rejects it).
         let pos = self.pending_split_barriers.iter().position(|pending| {
             pending.resource == resource
                 && pending.subresource == subresource
                 && pending.state_before == from
                 && pending.state_after == to
         });
-        if let Some(index) = pos {
-            self.pending_split_barriers.remove(index);
-        }
+        let index = pos.ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!(
+                    "split barrier END without matching BEGIN for resource {resource} subresource {subresource}"
+                ),
+            )
+        })?;
+        self.pending_split_barriers.remove(index);
         self.backend
             .record_split_barrier_end(list, resource, subresource, from, to)
     }
@@ -824,6 +864,7 @@ impl D3d12Runtime {
             .record_copy_buffer_region(list, dst, dst_offset, src, src_offset, size)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn record_copy_resource_region(
         &mut self,
         list: CommandListId,
@@ -864,6 +905,10 @@ impl D3d12Runtime {
         streams: &[ImmutableCommandStream],
         signal: Option<(FenceId, u64)>,
     ) -> AppResult<MetalCommandBufferPlan> {
+        // Drain queued WriteBufferImmediate requests; the aliasing overlap
+        // set is also reset so both stay bounded across frames.
+        self.drain_pending_immediate_writes();
+        self.clear_aliasing_overlaps();
         self.backend.execute_command_lists(queue, streams, signal)
     }
 
@@ -902,6 +947,7 @@ impl D3d12Runtime {
                 count: count as u32,
                 active: vec![false; count],
                 begin_values: vec![0; count],
+                resolved: vec![0; count],
             },
         );
         id
@@ -909,7 +955,7 @@ impl D3d12Runtime {
 
     pub fn record_begin_query(
         &mut self,
-        list: CommandListId,
+        _list: CommandListId,
         heap: QueryHeapId,
         index: u32,
     ) -> AppResult<()> {
@@ -926,26 +972,27 @@ impl D3d12Runtime {
                 format!("query index {index} out of range (count {})", qh.count),
             ));
         }
+        if qh.active[idx] {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!("query {heap}[{index}] begun twice"),
+            ));
+        }
         qh.active[idx] = true;
-        // Record a timestamp via the backend as a baseline for the begin value
         if qh.heap_type == 1 {
-            // Timestamp query — capture current timestamp
-            let ts = self.backend.write_timestamp(heap, idx).unwrap_or(0);
+            // Timestamp query — capture the begin timestamp.
+            let ts = self.backend.write_timestamp(heap, idx)?;
             qh.begin_values[idx] = ts;
         } else if qh.heap_type == 0 {
             // Occlusion query — mark that we should track draws
             qh.begin_values[idx] = 0;
         }
-        // Push a trace marker so the command stream knows a query began.
-        // The list parameter is available for future backend integration;
-        // queries are currently tracked at the runtime level.
-        let _unused = list;
         Ok(())
     }
 
     pub fn record_end_query(
         &mut self,
-        list: CommandListId,
+        _list: CommandListId,
         heap: QueryHeapId,
         index: u32,
     ) -> AppResult<()> {
@@ -970,15 +1017,19 @@ impl D3d12Runtime {
         }
         qh.active[idx] = false;
         if qh.heap_type == 1 {
-            // Timestamp query — write end timestamp via backend
-            self.backend.write_timestamp(heap, idx)?;
+            // Timestamp query — the resolved value is end minus begin, which
+            // is what the guest reads back. Store the delta in both the
+            // runtime heap and the backend heap (so resolve_query_data
+            // reports the same value).
+            let end_ts = self.backend.write_timestamp(heap, idx)?;
+            let delta = end_ts.saturating_sub(qh.begin_values[idx]);
+            qh.resolved[idx] = delta;
+            self.backend.write_timestamp_value(heap, idx, delta)?;
         } else if qh.heap_type == 0 {
             // Occlusion query — write occlusion sample (1 sample for a basic pass)
             self.backend.write_occlusion(heap, idx, 1)?;
+            qh.resolved[idx] = 1;
         }
-        // The list parameter is available for future backend integration;
-        // queries are currently resolved via backend write_timestamp/write_occlusion.
-        let _unused = list;
         Ok(())
     }
 
@@ -986,13 +1037,38 @@ impl D3d12Runtime {
         &mut self,
         _list: CommandListId,
         heap: QueryHeapId,
-        _start: u32,
-        _count: u32,
-        _dst: ResourceId,
+        start: u32,
+        count: u32,
+        dst: ResourceId,
     ) -> AppResult<()> {
-        // Resolve all values from the heap (backend ignores start/count for resolve)
-        self.backend.resolve_query_data(heap)?;
-        Ok(())
+        let qh = self.query_heaps.get(&heap).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!("unknown query heap {heap}"),
+            )
+        })?;
+        let start_idx = start as usize;
+        let count = count as usize;
+        let end_idx = start_idx.checked_add(count).ok_or_else(|| {
+            AppError::new(ReasonCode::RcD3dInvalidState, "resolve query range overflow")
+        })?;
+        if end_idx > qh.count as usize {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!(
+                    "resolve query range [{start}, {}) out of range (count {})",
+                    start + count as u32,
+                    qh.count
+                ),
+            ));
+        }
+        // Write the resolved values (8 bytes each) into the destination
+        // resource, which is the guest's readback buffer.
+        let mut bytes = Vec::with_capacity(count * 8);
+        for value in &qh.resolved[start_idx..end_idx] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        self.backend.write_resource_bytes(dst, 0, &bytes)
     }
 
     pub fn resolve_query_data(&self, heap: QueryHeapId) -> AppResult<QueryResolveResult> {
@@ -1007,14 +1083,17 @@ impl D3d12Runtime {
         load_action: &str,
         store_action: &str,
     ) -> AppResult<()> {
-        self.render_pass_active = true;
+        // Set the flag only after the fallible backend call succeeds so a
+        // failure does not desync is_render_pass_active()/reset_render_pass_state().
         self.backend.record_begin_render_pass(
             list,
             color_formats,
             depth_format,
             load_action,
             store_action,
-        )
+        )?;
+        self.render_pass_active = true;
+        Ok(())
     }
 
     pub fn end_render_pass(&mut self, _list: CommandListId) -> AppResult<()> {
@@ -1030,6 +1109,7 @@ impl D3d12Runtime {
         // Meta command initialization is acknowledged.
         // Guest-side parameters are not forwarded by pe_runtime at this layer;
         // a full implementation would read them from guest memory.
+        self.trace("initialize_meta_command: acknowledged (no-op, parameters not forwarded)");
         Ok(())
     }
 
@@ -1037,6 +1117,7 @@ impl D3d12Runtime {
     pub fn execute_meta_command(&mut self, _list: CommandListId) -> AppResult<()> {
         // Meta command execution is acknowledged.
         // Guest-side parameters are not forwarded by pe_runtime at this layer.
+        self.trace("execute_meta_command: acknowledged (no-op, parameters not forwarded)");
         Ok(())
     }
 
@@ -1112,12 +1193,12 @@ impl D3d12Runtime {
 
         self.acceleration_structures.insert(gpu_address, accel);
 
-        eprintln!(
+        self.trace(&format!(
             "BuildAccelerationStructure: addr=0x{gpu_address:x} {} size={} geoms={}",
             if is_tlas { "TLAS" } else { "BLAS" },
             size_estimate,
             desc.inputs.geometries.len(),
-        );
+        ));
 
         // Return the GPU virtual address where the structure "resides"
         Ok(gpu_address)
@@ -1165,25 +1246,22 @@ impl D3d12Runtime {
                         output_buffer[start..end].copy_from_slice(&bytes[..end - start]);
                     }
                 }
-                D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_SERIALIZATION => {
+                D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_SERIALIZATION
+                    if base_offset + 16 <= output_buffer.len() =>
+                {
                     // Output: D3D12_SERIALIZATION_INFO { UINT64 SerializedSizeInBytes; UINT64 NumBottomLevelAccelerationStructurePointers; }
-                    if base_offset + 16 <= output_buffer.len() {
-                        let serialized_size = accel.map(|a| a.size).unwrap_or(0);
-                        let num_blas = if accel.map_or(false, |a| a.is_top_level) {
-                            1
-                        } else {
-                            0
-                        };
-                        let size_bytes = serialized_size.to_le_bytes();
-                        let num_bytes = (num_blas as u64).to_le_bytes();
-                        let start = base_offset;
-                        let mid = (base_offset + 8).min(output_buffer.len());
-                        output_buffer[start..mid].copy_from_slice(&size_bytes[..mid - start]);
-                        if base_offset + 16 <= output_buffer.len() {
-                            output_buffer[base_offset + 8..base_offset + 16]
-                                .copy_from_slice(&num_bytes);
-                        }
-                    }
+                    let serialized_size = accel.map(|a| a.size).unwrap_or(0);
+                    let num_blas = if accel.is_some_and(|a| a.is_top_level) {
+                        1
+                    } else {
+                        0
+                    };
+                    let size_bytes = serialized_size.to_le_bytes();
+                    let num_bytes = (num_blas as u64).to_le_bytes();
+                    let start = base_offset;
+                    let mid = base_offset + 8;
+                    output_buffer[start..mid].copy_from_slice(&size_bytes);
+                    output_buffer[mid..base_offset + 16].copy_from_slice(&num_bytes);
                 }
                 _ => {
                     // Unknown info type — skip
@@ -1307,9 +1385,11 @@ impl D3d12Runtime {
 
     /// Scan DXIL bytecode for raytracing metadata values.
     ///
-    /// Looks for embedded `max_recursion_depth`, `payload_size`, and
-    /// `attribute_size` values in the DXIL container metadata section.
-    /// Falls back to DXR 1.0 defaults if scanning fails.
+    /// DXIL is LLVM bitcode, so the binary is almost never valid UTF-8; the
+    /// ASCII scan below only matches debug metadata that embeds the names as
+    /// text, and values are clamped to sane ranges so garbage cannot produce
+    /// absurd defaults. Real metadata parsing would require an LLVM bitcode
+    /// reader; without it we fall back to the DXR 1.0 defaults.
     fn scan_dxil_raytracing_metadata(dxil: &[u8]) -> (u32, u32, u32) {
         // Default DXR 1.0 values
         let mut max_recursion_depth = 1u32;
@@ -1320,45 +1400,21 @@ impl D3d12Runtime {
             return (max_recursion_depth, payload_size, attribute_size);
         }
 
-        // Scan for DXIL metadata signatures.
-        // DXIL metadata is stored as LLVM bitcode metadata records.
-        // We search for common patterns:
-        //   - "max_recursion_depth" = N  →  as ASCII in debug metadata
-        //   - "payloadSizeInBytes" = N   →  as ASCII in DXR metadata
-        //   - "attributeSizeInBytes" = N →  as ASCII in DXR metadata
         if let Ok(text) = std::str::from_utf8(dxil) {
-            // Look for "max_recursion_depth" followed by digits
-            for line in text.split(|c: char| c == '\n' || c == '\0' || c == ',') {
+            for line in text.split(['\n', '\0', ',']) {
                 let line = line.trim();
                 if let Some(val) = line.strip_prefix("max_recursion_depth=") {
                     if let Ok(v) = val.trim().parse::<u32>() {
                         max_recursion_depth = v.clamp(1, 32);
                     }
-                } else if let Some(val) = line.strip_prefix("payloadSizeInBytes=") {
-                    if let Ok(v) = val.trim().parse::<u32>() {
-                        payload_size = v.max(1);
-                    }
-                } else if let Some(val) = line.strip_prefix("attributeSizeInBytes=") {
-                    if let Ok(v) = val.trim().parse::<u32>() {
-                        attribute_size = v.max(1);
-                    }
-                }
-            }
-            // Also scan for embedded u32 little-endian values that follow
-            // known metadata tag patterns in the DXIL binary.
-            for chunk in dxil.windows(4) {
-                if chunk.len() < 4 {
-                    continue;
-                }
-                let val = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                // Tag 19 = kDxilMaxRecursionDepth in DXIL metadata
-                if val == 19 && chunk.as_ptr() as usize + 8 <= dxil.as_ptr() as usize + dxil.len() {
-                    if let Some(next) = chunk.get(4..8) {
-                        let next_val = u32::from_le_bytes([next[0], next[1], next[2], next[3]]);
-                        if (1..=32).contains(&next_val) {
-                            max_recursion_depth = next_val;
-                        }
-                    }
+                } else if let Some(val) = line.strip_prefix("payloadSizeInBytes=")
+                    && let Ok(v) = val.trim().parse::<u32>()
+                {
+                    payload_size = v.clamp(1, 1024 * 1024);
+                } else if let Some(val) = line.strip_prefix("attributeSizeInBytes=")
+                    && let Ok(v) = val.trim().parse::<u32>()
+                {
+                    attribute_size = v.clamp(1, 1024 * 1024);
                 }
             }
         }
@@ -1464,10 +1520,18 @@ impl D3d12Runtime {
     pub fn omset_front_and_back_stencil_ref(
         &mut self,
         _list: CommandListId,
-        _front_ref: u32,
-        _back_ref: u32,
+        front_ref: u32,
+        back_ref: u32,
     ) -> AppResult<()> {
-        // Stub — separate front/back stencil ref, Metal only has single stencil ref
+        // Stub — Metal only has a single stencil ref; separate front/back
+        // refs cannot be expressed. Trace when the guest relies on the
+        // unsupported difference.
+        if front_ref != back_ref {
+            self.trace(&format!(
+                "omset_front_and_back_stencil_ref: front {front_ref} != back {back_ref} \
+                 (Metal supports a single stencil ref; results may differ)"
+            ));
+        }
         Ok(())
     }
 
@@ -1475,20 +1539,32 @@ impl D3d12Runtime {
     pub fn rsset_depth_bias(
         &mut self,
         _list: CommandListId,
-        _depth_bias: i32,
-        _depth_bias_clamp: f32,
-        _slope_scaled_depth_bias: f32,
+        depth_bias: i32,
+        depth_bias_clamp: f32,
+        slope_scaled_depth_bias: f32,
     ) -> AppResult<()> {
-        // Stub — depth bias
+        // Stub — depth bias does not reach the Metal plan. Trace when the
+        // guest sets a non-default bias so the gap is observable.
+        if depth_bias != 0 || depth_bias_clamp != 0.0 || slope_scaled_depth_bias != 0.0 {
+            self.trace(&format!(
+                "rsset_depth_bias: bias {depth_bias} clamp {depth_bias_clamp} slope \
+                 {slope_scaled_depth_bias} (not applied to Metal plan)"
+            ));
+        }
         Ok(())
     }
 
     pub fn iaset_index_buffer_strip_cut_value(
         &mut self,
         _list: CommandListId,
-        _cut_value: u32,
+        cut_value: u32,
     ) -> AppResult<()> {
-        // Stub — strip cut value for indexed strip topology
+        // Stub — strip cut value for indexed strip topology.
+        if cut_value != 0 {
+            self.trace(&format!(
+                "iaset_index_buffer_strip_cut_value: cut {cut_value} (not applied to Metal plan)"
+            ));
+        }
         Ok(())
     }
 
@@ -1498,7 +1574,7 @@ impl D3d12Runtime {
     pub fn atomic_copy_buffer_uint(&mut self, _list: CommandListId) -> AppResult<()> {
         // Atomic copy is acknowledged — guest-side buffer/destination parameters
         // are not forwarded by pe_runtime at this layer.
-        // A full implementation would need buffer handles and offsets.
+        self.trace("atomic_copy_buffer_uint: acknowledged (no-op, parameters not forwarded)");
         Ok(())
     }
 
@@ -1507,7 +1583,7 @@ impl D3d12Runtime {
     pub fn atomic_copy_buffer_uint64(&mut self, _list: CommandListId) -> AppResult<()> {
         // Atomic copy is acknowledged — guest-side buffer/destination parameters
         // are not forwarded by pe_runtime at this layer.
-        // A full implementation would need buffer handles and offsets.
+        self.trace("atomic_copy_buffer_uint64: acknowledged (no-op, parameters not forwarded)");
         Ok(())
     }
 
@@ -1538,6 +1614,12 @@ impl D3d12Runtime {
         pixel_samples: u32,
         num_pixels: u32,
     ) -> AppResult<()> {
+        if pixel_samples != 0 || num_pixels != 0 {
+            self.trace(&format!(
+                "set_sample_positions: {pixel_samples} samples x {num_pixels} pixels \
+                 (Metal has no custom sample positions; tracked for state only)"
+            ));
+        }
         self.sample_positions_pixel_samples = pixel_samples;
         self.sample_positions_num_pixels = num_pixels;
         Ok(())
@@ -1601,7 +1683,18 @@ impl D3d12Runtime {
                 "write_buffer_immediate: count mismatch",
             ));
         }
-        // Queue each write as a pending immediate write for later processing.
+        // Bound the pending queue so a guest calling WriteBufferImmediate
+        // every frame cannot grow memory without limit. The queue is drained
+        // on the next execute_command_lists.
+        const MAX_PENDING_WRITES: usize = 4096;
+        if self.pending_immediate_writes.len() + count as usize > MAX_PENDING_WRITES {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                "write_buffer_immediate: too many pending writes",
+            ));
+        }
+        // Queue each write as a pending immediate write for processing during
+        // command list execution.
         for i in 0..count as usize {
             let dst_gpu_addr = destinations[i];
             let val_bytes = values[i].to_le_bytes();
@@ -1609,6 +1702,14 @@ impl D3d12Runtime {
                 .push((list, dst_gpu_addr, val_bytes));
         }
         Ok(())
+    }
+
+    /// Drain the pending WriteBufferImmediate queue. The writes are dropped
+    /// (the queue is bounded and this layer has no GPU-virtual-address to
+    /// resource mapping to apply them against); draining keeps memory usage
+    /// bounded across frames.
+    fn drain_pending_immediate_writes(&mut self) {
+        self.pending_immediate_writes.clear();
     }
 
     // ── ID3D12GraphicsCommandList3 methods ─────────────────────────

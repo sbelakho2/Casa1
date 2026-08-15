@@ -1015,7 +1015,8 @@ fn t6_9_static_sampler_filter_modes() {
         max_lod: 1000.0,
         shader_visibility: D3D12ShaderVisibility::All,
     };
-    let metal_desc = D3d12Runtime::static_sampler_to_metal_desc(&sampler);
+    let metal_desc = D3d12Runtime::static_sampler_to_metal_desc(&sampler)
+        .expect("static sampler descriptor should validate");
     assert!(metal_desc.contains("address::repeat"));
     assert!(metal_desc.contains("filter::nearest,nearest,nearest"));
     assert!(metal_desc.contains("border_color::transparent_black"));
@@ -1562,24 +1563,25 @@ fn t6_18_subresource_state_tracking() {
         })
         .expect("create resource");
 
-    // Track per-subresource states using array_slice + mip_level
-    runtime.set_subresource_state(resource, 0, 0, ResourceState::RenderTarget);
-    runtime.set_subresource_state(resource, 0, 1, ResourceState::UnorderedAccess);
-    runtime.set_subresource_state(resource, 1, 0, ResourceState::CopyDest);
+    // Track per-subresource states using the flat D3D12 subresource index
+    // (mip + array_slice * mip_levels; 2 slices x 3 mips here)
+    runtime.set_subresource_state(resource, 0, ResourceState::RenderTarget);
+    runtime.set_subresource_state(resource, 1, ResourceState::UnorderedAccess);
+    runtime.set_subresource_state(resource, 3, ResourceState::CopyDest);
 
     assert_eq!(
-        runtime.subresource_state(resource, 0, 0),
+        runtime.subresource_state(resource, 0),
         Some(ResourceState::RenderTarget)
     );
     assert_eq!(
-        runtime.subresource_state(resource, 0, 1),
+        runtime.subresource_state(resource, 1),
         Some(ResourceState::UnorderedAccess)
     );
     assert_eq!(
-        runtime.subresource_state(resource, 1, 0),
+        runtime.subresource_state(resource, 3),
         Some(ResourceState::CopyDest)
     );
-    assert_eq!(runtime.subresource_state(resource, 1, 1), None);
+    assert_eq!(runtime.subresource_state(resource, 4), None);
 }
 
 // ── Phase 2.3: Mesh Shader tests ────────────────────────────────────

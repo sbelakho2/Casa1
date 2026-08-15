@@ -146,11 +146,22 @@ fn t35_05_d3d10_copy_subresource_region() {
         .create_buffer(&desc, None)
         .expect("create dst buffer");
 
-    // Copy from src to dst (whole buffer)
-    let src_box: [u32; 6] = [0, 0, 0, 512, 1, 1];
+    // Copy from src to dst (whole buffer; the D3D10 box is in bytes for
+    // buffers, so a full copy spans the entire byte width)
+    let src_box: [u32; 6] = [0, 0, 0, 1024, 1, 1];
     device
         .copy_subresource_region(dst, 0, 0, 0, 0, src, 0, Some(src_box))
         .expect("copy_subresource_region should succeed");
+
+    // Partial boxes are not supported by the translation layer and must be
+    // rejected rather than silently copying the whole resource.
+    let partial_box: [u32; 6] = [0, 0, 0, 512, 1, 1];
+    assert!(
+        device
+            .copy_subresource_region(dst, 0, 0, 0, 0, src, 0, Some(partial_box))
+            .is_err(),
+        "partial region copies should be rejected"
+    );
 }
 
 /// D3D10 invalid resource ID returns an error.
@@ -579,11 +590,16 @@ fn t35_23_d3d12_aliasing_barrier() {
 // Item 170 — DXGI format conversion edge cases
 // ============================================================================
 
-/// DXGI_FORMAT_UNKNOWN maps to Unknown variant.
+/// DXGI_FORMAT_UNKNOWN (0) has no usable typed variant; the checked
+/// conversion rejects it and the infallible one falls back.
 #[test]
 fn t35_24_dxgi_format_unknown() {
+    assert!(
+        DxgiFormat::from_u32_checked(0).is_err(),
+        "UNKNOWN format should be rejected by the checked conversion"
+    );
     let fmt = DxgiFormat::from_u32(0);
-    assert_eq!(format!("{:?}", fmt), "Unknown");
+    assert_eq!(format!("{:?}", fmt), "R8G8B8A8Unorm");
 }
 
 /// Common DXGI formats can be created from raw values.
@@ -695,7 +711,7 @@ fn t35_32_resource_state_read_only() {
 #[test]
 fn t35_33_resource_state_to_d3d12_bits() {
     assert_eq!(ResourceState::Common.to_d3d12_bits(), 0);
-    assert_eq!(ResourceState::PixelShaderResource.to_d3d12_bits(), 0x8);
+    assert_eq!(ResourceState::PixelShaderResource.to_d3d12_bits(), 0x80);
     assert_eq!(ResourceState::RenderTarget.to_d3d12_bits(), 0x4);
 }
 
@@ -736,11 +752,11 @@ fn t35_35_descriptor_range_type_to_metal() {
 fn t35_36_subresource_state_tracking() {
     let mut rt = D3d12Runtime::new();
 
-    assert_eq!(rt.subresource_state(1, 0, 0), None);
+    assert_eq!(rt.subresource_state(1, 0), None);
 
-    rt.set_subresource_state(1, 0, 0, ResourceState::RenderTarget);
+    rt.set_subresource_state(1, 0, ResourceState::RenderTarget);
     assert_eq!(
-        rt.subresource_state(1, 0, 0),
+        rt.subresource_state(1, 0),
         Some(ResourceState::RenderTarget)
     );
 }
@@ -755,8 +771,8 @@ fn t35_37_d3d10_constants() {
     assert_eq!(D3D10_BIND_INDEX_BUFFER, 2);
     assert_eq!(D3D10_BIND_CONSTANT_BUFFER, 4);
     assert_eq!(D3D10_BIND_SHADER_RESOURCE, 8);
-    assert_eq!(D3D10_BIND_RENDER_TARGET, 16);
-    assert_eq!(D3D10_BIND_DEPTH_STENCIL, 32);
+    assert_eq!(D3D10_BIND_RENDER_TARGET, 32);
+    assert_eq!(D3D10_BIND_DEPTH_STENCIL, 64);
     assert_eq!(D3D10_CPU_ACCESS_WRITE, 0x10000);
     assert_eq!(D3D10_CPU_ACCESS_READ, 0x20000);
     assert_eq!(D3D10_MAX_TEXTURE_DIMENSION, 8192);

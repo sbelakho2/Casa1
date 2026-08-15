@@ -42,11 +42,15 @@ const D3D10_PROGRAM_TYPE_GS: u32 = 2; // Geometry shader
 /// point name. Returns `(ShaderStage, entry_point_name)`.
 ///
 /// The DXBC container format is:
-///   [0..4)  magic         "DXBC" or "DXIL"
+///   [0..4)  magic         "DXBC"
 ///   [4..8)  version       u32 (typically 1)
 ///   [8..12) total_size    u32
 ///   [12..16) chunk_count  u32
 ///   [16..)  chunk descriptors (12 bytes each: 4 byte fourCC, 4 byte offset, 4 byte size)
+///
+/// DXIL containers (D3D11 shader model 5.0+) are rejected: they have no
+/// DXBC chunk descriptor table, and D3D10 only supports DXBC shader model
+/// 4.x bytecode.
 fn parse_dxbc_bytecode(bytecode: &[u8]) -> AppResult<(ShaderStage, String)> {
     if bytecode.len() < 16 {
         return Err(AppError::new(
@@ -54,13 +58,18 @@ fn parse_dxbc_bytecode(bytecode: &[u8]) -> AppResult<(ShaderStage, String)> {
             "D3D10: shader bytecode too small for DXBC header",
         ));
     }
-    // Accept both DXBC and DXIL magic
     let magic = &bytecode[..4];
-    if magic != DXBC_MAGIC && magic != DXIL_MAGIC {
+    if magic == DXIL_MAGIC {
+        return Err(AppError::new(
+            ReasonCode::RcD3dFeatureUnsupported,
+            "D3D10: DXIL (shader model 5.0+) bytecode is not supported; D3D10 requires DXBC shader model 4.x",
+        ));
+    }
+    if magic != DXBC_MAGIC {
         return Err(AppError::new(
             ReasonCode::RcD3dFeatureUnsupported,
             format!(
-                "D3D10: invalid shader bytecode magic (expected DXBC/DXIL, got {:02x?})",
+                "D3D10: invalid shader bytecode magic (expected DXBC, got {:02x?})",
                 magic
             ),
         ));
@@ -139,6 +148,8 @@ pub const D3D10_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS: u32 = 0x
 pub const D3D10_CREATE_DEVICE_ALLOW_NULL_FROM_MAP: u32 = 0x00000010;
 pub const D3D10_CREATE_DEVICE_BGRA_SUPPORT: u32 = 0x00000020;
 pub const D3D10_CREATE_DEVICE_PREVENT_ALTERING_LAYER_SETTINGS_FROM_REGISTRY: u32 = 0x00000080;
+pub const D3D10_CREATE_DEVICE_STRICT_VALIDATION: u32 = 0x00000200;
+pub const D3D10_CREATE_DEVICE_DEBUGGABLE: u32 = 0x00000400;
 
 /// D3D10_RESOURCE_MISC_FLAG
 pub const D3D10_RESOURCE_MISC_GENERATE_MIPS: u32 = 0x00000001;
@@ -469,8 +480,8 @@ impl Default for D3d10SamplerDesc {
             max_anisotropy: 1,
             comparison_func: D3D10_COMPARISON_NEVER,
             border_color: [1.0, 1.0, 1.0, 1.0],
-            min_lod: -std::f32::MAX,
-            max_lod: std::f32::MAX,
+            min_lod: -f32::MAX,
+            max_lod: f32::MAX,
         }
     }
 }
@@ -715,6 +726,15 @@ pub struct D3d10InputElementDesc {
 }
 
 impl D3d10InputElementDesc {
+    /// Convert to the D3D11 input element representation.
+    ///
+    /// Note: `crate::d3d11::InputElementDesc` only carries the semantic,
+    /// format and input slot — `aligned_byte_offset`, `input_slot_class`
+    /// (per-instance data) and `instance_data_step_rate` have no D3D11
+    /// counterpart yet. The D3D10 layer therefore keeps the full element
+    /// list in [`D3d10Device::input_layouts`] so the information is not
+    /// lost, and instanced draws must be fed through a future extension of
+    /// the D3D11 input layout description.
     pub fn to_d3d11(&self) -> crate::d3d11::InputElementDesc {
         crate::d3d11::InputElementDesc {
             semantic: format!("{}{}", self.semantic_name, self.semantic_index),
@@ -738,6 +758,12 @@ pub struct D3d10Device {
     /// Resource tracking for D3D10→D3D11 resource ID mapping
     next_resource_id: u64,
     resources: std::collections::BTreeMap<u64, D3d10Resource>,
+    /// Full D3D10 input layouts preserved by id (the D3D11 input element
+    /// representation cannot carry offset/slot-class/step-rate yet).
+    input_layouts: std::collections::BTreeMap<InputLayoutId, Vec<D3d10InputElementDesc>>,
+    /// The swapchain created by `d3d10_create_device_and_swapchain`, used by
+    /// `present`.
+    swapchain_id: Option<crate::gfx::SwapchainId>,
 }
 
 /// Resource tracked in the D3D10 layer.
@@ -783,6 +809,15 @@ impl D3d10Device {
         desc: &D3d10Texture2dDesc,
         initial_data: Option<&[u8]>,
     ) -> AppResult<u64> {
+        if desc.sample_desc.count > 1 {
+            return Err(AppError::new(
+                ReasonCode::RcD3dFeatureUnsupported,
+                format!(
+                    "D3D10: multisampled textures (sample count {}) are not supported",
+                    desc.sample_desc.count
+                ),
+            ));
+        }
         let resource_id = self.d3d11_device.create_texture_2d_with_usage(
             &format!("d3d10-texture2d-{}", self.next_resource_id),
             desc.width,
@@ -856,33 +891,49 @@ impl D3d10Device {
     pub fn create_render_target_view(
         &mut self,
         resource_id: u64,
-        _desc: Option<&D3d10RenderTargetViewDesc>,
+        desc: Option<&D3d10RenderTargetViewDesc>,
     ) -> AppResult<D3d11ViewId> {
         let d3d11_id = self.get_d3d11_resource_id(resource_id)?;
+        let format = self.resolve_view_format(d3d11_id, desc.map(|d| d.format))?;
         self.d3d11_device
-            .create_render_target_view(d3d11_id, crate::gfx::DxgiFormat::R8G8B8A8Unorm)
+            .create_render_target_view(d3d11_id, format)
     }
 
     /// ID3D10Device::CreateDepthStencilView
     pub fn create_depth_stencil_view(
         &mut self,
         resource_id: u64,
-        _desc: Option<&D3d10DepthStencilViewDesc>,
+        desc: Option<&D3d10DepthStencilViewDesc>,
     ) -> AppResult<D3d11ViewId> {
         let d3d11_id = self.get_d3d11_resource_id(resource_id)?;
+        let format = self.resolve_view_format(d3d11_id, desc.map(|d| d.format))?;
         self.d3d11_device
-            .create_depth_stencil_view(d3d11_id, crate::gfx::DxgiFormat::D24UnormS8Uint)
+            .create_depth_stencil_view(d3d11_id, format)
     }
 
     /// ID3D10Device::CreateShaderResourceView
     pub fn create_shader_resource_view(
         &mut self,
         resource_id: u64,
-        _desc: Option<&D3d10ShaderResourceViewDesc>,
+        desc: Option<&D3d10ShaderResourceViewDesc>,
     ) -> AppResult<D3d11ViewId> {
         let d3d11_id = self.get_d3d11_resource_id(resource_id)?;
+        let format = self.resolve_view_format(d3d11_id, desc.map(|d| d.format))?;
         self.d3d11_device
-            .create_shader_resource_view(d3d11_id, crate::gfx::DxgiFormat::R8G8B8A8Unorm)
+            .create_shader_resource_view(d3d11_id, format)
+    }
+
+    /// Resolve the view format: the caller's view-desc format when provided,
+    /// otherwise the resource's own format.
+    fn resolve_view_format(
+        &self,
+        d3d11_resource_id: D3d11ResourceId,
+        requested: Option<DxgiFormat>,
+    ) -> AppResult<DxgiFormat> {
+        match requested {
+            Some(format) => Ok(format),
+            None => Ok(self.d3d11_device.resource_desc(d3d11_resource_id)?.format),
+        }
     }
 
     // ── Shader Creation ────────────────────────────────────────────────────
@@ -967,9 +1018,11 @@ impl D3d10Device {
     pub fn create_input_layout(&mut self, elements: &[D3d10InputElementDesc]) -> InputLayoutId {
         let d3d11_elements: Vec<crate::d3d11::InputElementDesc> =
             elements.iter().map(|e| e.to_d3d11()).collect();
-        self.d3d11_device.create_input_layout(InputLayoutDesc {
+        let id = self.d3d11_device.create_input_layout(InputLayoutDesc {
             elements: d3d11_elements,
-        })
+        });
+        self.input_layouts.insert(id, elements.to_vec());
+        id
     }
 
     // ── Device Context Methods (D3D10 merges device + context) ─────────────
@@ -1101,8 +1154,12 @@ impl D3d10Device {
         depth: f32,
         stencil: u8,
     ) -> AppResult<()> {
+        // The D3D11 layer stores the depth as the raw 4 bytes written into
+        // the depth resource, which is the IEEE-754 bit pattern of the f32
+        // clear value (e.g. 0.5 -> 0x3F000000). A plain `as u32` cast would
+        // truncate fractional depths to their integer part.
         let depth_val = if clear_flags & D3D10_CLEAR_DEPTH != 0 {
-            depth as u32
+            depth.to_bits()
         } else {
             0
         };
@@ -1129,20 +1186,52 @@ impl D3d10Device {
     }
 
     /// ID3D10Device::CopySubresourceRegion
+    #[allow(clippy::too_many_arguments)]
     pub fn copy_subresource_region(
         &mut self,
         dst: u64,
-        _dst_subresource: u32,
-        _dst_x: u32,
-        _dst_y: u32,
-        _dst_z: u32,
+        dst_subresource: u32,
+        dst_x: u32,
+        dst_y: u32,
+        dst_z: u32,
         src: u64,
-        _src_subresource: u32,
-        _src_box: Option<[u32; 6]>,
+        src_subresource: u32,
+        src_box: Option<[u32; 6]>,
     ) -> AppResult<()> {
         let src_id = self.get_d3d11_resource_id(src)?;
         let dst_id = self.get_d3d11_resource_id(dst)?;
-        self.d3d11_device.copy_resource(src_id, dst_id)
+        let src_desc = self.d3d11_device.resource_desc(src_id)?;
+        // A NULL source box means the entire source subresource is copied.
+        // A box spanning the whole source, with zero destination offsets and
+        // matching subresources, is equivalent to CopyResource and is the
+        // only case this translation layer can represent exactly.
+        let copies_whole = match src_box {
+            None => true,
+            Some(box_) => {
+                let (left, top, front, right, bottom, back) =
+                    (box_[0], box_[1], box_[2], box_[3], box_[4], box_[5]);
+                left == 0
+                    && top == 0
+                    && front == 0
+                    && right >= src_desc.width
+                    && bottom >= src_desc.height
+                    && back >= src_desc.depth
+            }
+        };
+        if copies_whole
+            && dst_x == 0
+            && dst_y == 0
+            && dst_z == 0
+            && dst_subresource == src_subresource
+        {
+            self.d3d11_device.copy_resource(src_id, dst_id)
+        } else {
+            Err(AppError::new(
+                ReasonCode::RcD3dFeatureUnsupported,
+                "D3D10 CopySubresourceRegion with a partial source box, nonzero \
+                 destination offset, or differing subresources is not supported",
+            ))
+        }
     }
 
     /// ID3D10Device::ResolveSubresource
@@ -1183,6 +1272,16 @@ impl D3d10Device {
 
     /// ID3D10Device::Present (via swapchain)
     pub fn present(&mut self) -> AppResult<()> {
+        // Present the swapchain this device was created with (if any).
+        // The D3D11 layer presents the device's own swapchain; this check
+        // keeps the D3D10 contract honest instead of silently presenting
+        // a nonexistent swapchain.
+        if self.swapchain_id.is_none() {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                "D3D10 device has no swapchain to present",
+            ));
+        }
         self.d3d11_device.present_swapchain(0, false, true)?;
         Ok(())
     }
@@ -1193,14 +1292,19 @@ impl D3d10Device {
         &self,
         usage: u32,
         bind_flags: u32,
-        _cpu_access_flags: u32,
+        cpu_access_flags: u32,
     ) -> ResourceUsageHint {
         let is_depth_stencil = (bind_flags & D3D10_BIND_DEPTH_STENCIL) != 0;
         let is_render_target = (bind_flags & D3D10_BIND_RENDER_TARGET) != 0;
         let is_constant = (bind_flags & D3D10_BIND_CONSTANT_BUFFER) != 0;
         let is_shader_resource = (bind_flags & D3D10_BIND_SHADER_RESOURCE) != 0;
 
-        let cpu_write_frequent = matches!(usage, D3D10_USAGE_DYNAMIC | D3D10_USAGE_STAGING);
+        // STAGING resources are CPU-accessible copies used for both upload
+        // and readback; honor the CPU access flags so a read-oriented
+        // staging buffer is not given a write-oriented placement.
+        let cpu_write_frequent = matches!(usage, D3D10_USAGE_DYNAMIC)
+            || (usage == D3D10_USAGE_STAGING
+                && cpu_access_flags & D3D10_CPU_ACCESS_READ == 0);
 
         if is_depth_stencil {
             ResourceUsageHint::DepthStencil
@@ -1216,7 +1320,7 @@ impl D3d10Device {
                 role: crate::gfx::BufferRole::Constant,
                 cpu_write_frequent: false,
             }
-        } else if cpu_write_frequent {
+        } else if is_shader_resource && cpu_write_frequent {
             ResourceUsageHint::Buffer {
                 role: crate::gfx::BufferRole::Generic,
                 cpu_write_frequent: true,
@@ -1227,6 +1331,11 @@ impl D3d10Device {
                 render_target: false,
                 depth_stencil: false,
                 cpu_write_frequent,
+            }
+        } else if cpu_write_frequent {
+            ResourceUsageHint::Buffer {
+                role: crate::gfx::BufferRole::Generic,
+                cpu_write_frequent: true,
             }
         } else {
             ResourceUsageHint::Generic
@@ -1259,18 +1368,15 @@ pub fn d3d10_create_device(
     driver_type: D3d10DriverType,
     _software_rasterizer: u64,
     flags: u32,
-    _feature_levels: &[D3d10FeatureLevel],
+    feature_levels: &[D3d10FeatureLevel],
     _sdk_version: u32,
 ) -> AppResult<D3d10Device> {
-    // D3D10 driver type determines our feature level request
-    let _use_warp = matches!(driver_type, D3d10DriverType::Warp);
+    validate_driver_type(driver_type)?;
+    validate_creation_flags(flags)?;
 
     let request = DeviceCreationRequest {
-        requested_feature_levels: vec![FeatureLevel::Level10_1],
+        requested_feature_levels: vec![requested_d3d10_feature_level(feature_levels)],
     };
-
-    // If BGRA support is requested, we use a swapchain-compatible format
-    let _bgra_support = (flags & D3D10_CREATE_DEVICE_BGRA_SUPPORT) != 0;
 
     let d3d11_device = d3d11::d3d11_create_device(request)?;
 
@@ -1279,6 +1385,8 @@ pub fn d3d10_create_device(
         creation_flags: flags,
         next_resource_id: 1,
         resources: std::collections::BTreeMap::new(),
+        input_layouts: std::collections::BTreeMap::new(),
+        swapchain_id: None,
     })
 }
 
@@ -1290,24 +1398,72 @@ pub fn d3d10_create_device_and_swapchain(
     driver_type: D3d10DriverType,
     _software_rasterizer: u64,
     flags: u32,
-    _feature_levels: &[D3d10FeatureLevel],
+    feature_levels: &[D3d10FeatureLevel],
     _sdk_version: u32,
     swapchain_desc: &SwapchainDesc,
 ) -> AppResult<D3d10Device> {
-    let _use_warp = matches!(driver_type, D3d10DriverType::Warp);
+    validate_driver_type(driver_type)?;
+    validate_creation_flags(flags)?;
 
     let request = DeviceCreationRequest {
-        requested_feature_levels: vec![FeatureLevel::Level10_1],
+        requested_feature_levels: vec![requested_d3d10_feature_level(feature_levels)],
     };
 
     let d3d11_device = d3d11::d3d11_create_device_and_swapchain(request, swapchain_desc.clone())?;
+    let swapchain_id = d3d11_device.swapchain_state().map(|state| state.id);
 
     Ok(D3d10Device {
         d3d11_device,
         creation_flags: flags,
         next_resource_id: 1,
         resources: std::collections::BTreeMap::new(),
+        input_layouts: std::collections::BTreeMap::new(),
+        swapchain_id,
     })
+}
+
+/// Validate the D3D10 driver type: only hardware, reference and WARP are
+/// realizable on top of the D3D11/Metal translation layer.
+fn validate_driver_type(driver_type: D3d10DriverType) -> AppResult<()> {
+    match driver_type {
+        D3d10DriverType::Hardware | D3d10DriverType::Reference | D3d10DriverType::Warp => Ok(()),
+        D3d10DriverType::Null | D3d10DriverType::Software => Err(AppError::new(
+            ReasonCode::RcD3dFeatureUnsupported,
+            format!("D3D10 driver type {driver_type:?} is not supported"),
+        )),
+    }
+}
+
+/// Validate D3D10 creation flags against the defined D3D10_CREATE_DEVICE_FLAG
+/// values; unknown bits are rejected instead of silently ignored.
+fn validate_creation_flags(flags: u32) -> AppResult<()> {
+    const KNOWN_FLAGS: u32 = D3D10_CREATE_DEVICE_SINGLETHREADED
+        | D3D10_CREATE_DEVICE_DEBUG
+        | D3D10_CREATE_DEVICE_SWITCH_TO_REF
+        | D3D10_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS
+        | D3D10_CREATE_DEVICE_ALLOW_NULL_FROM_MAP
+        | D3D10_CREATE_DEVICE_BGRA_SUPPORT
+        | D3D10_CREATE_DEVICE_PREVENT_ALTERING_LAYER_SETTINGS_FROM_REGISTRY
+        | D3D10_CREATE_DEVICE_STRICT_VALIDATION
+        | D3D10_CREATE_DEVICE_DEBUGGABLE;
+    if flags & !KNOWN_FLAGS != 0 {
+        return Err(AppError::new(
+            ReasonCode::RcD3dInvalidState,
+            format!("unknown D3D10 creation flag bits 0x{:x}", flags & !KNOWN_FLAGS),
+        ));
+    }
+    Ok(())
+}
+
+/// Resolve the requested feature level: the most preferred level from the
+/// caller's array (the first entry), falling back to 10_1. D3D10 only
+/// supports 10_0 and 10_1, which both translate to the D3D11 10_1 level.
+fn requested_d3d10_feature_level(feature_levels: &[D3d10FeatureLevel]) -> FeatureLevel {
+    feature_levels
+        .first()
+        .copied()
+        .unwrap_or(D3d10FeatureLevel::Level10_1)
+        .to_d3d11()
 }
 
 // ── D3D10 Interface IIDs (for COM QueryInterface) ────────────────────────
@@ -1316,82 +1472,125 @@ pub fn d3d10_create_device_and_swapchain(
 pub struct D3d10Iid;
 
 impl D3d10Iid {
+    /// IID_ID3D10DeviceChild: {9B7E4C00-342C-4106-A19F-4F2704F689F0}
+    pub const ID3D10DEVICECHILD: [u8; 16] = [
+        0x00, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89,
+        0xF0,
+    ];
+    /// IID_ID3D10Resource: {9B7E4C01-342C-4106-A19F-4F2704F689F0}
+    pub const ID3D10RESOURCE: [u8; 16] = [
+        0x01, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89,
+        0xF0,
+    ];
+    /// IID_ID3D10Buffer: {9B7E4C02-342C-4106-A19F-4F2704F689F0}
+    pub const ID3D10BUFFER: [u8; 16] = [
+        0x02, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89,
+        0xF0,
+    ];
+    /// IID_ID3D10Texture1D: {9B7E4C03-342C-4106-A19F-4F2704F689F0}
+    pub const ID3D10TEXTURE1D: [u8; 16] = [
+        0x03, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89,
+        0xF0,
+    ];
+    /// IID_ID3D10Texture2D: {9B7E4C04-342C-4106-A19F-4F2704F689F0}
+    pub const ID3D10TEXTURE2D: [u8; 16] = [
+        0x04, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89,
+        0xF0,
+    ];
+    /// IID_ID3D10Texture3D: {9B7E4C05-342C-4106-A19F-4F2704F689F0}
+    pub const ID3D10TEXTURE3D: [u8; 16] = [
+        0x05, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89,
+        0xF0,
+    ];
+    /// IID_ID3D10View: {C902B03F-60A7-49BA-9936-2A3AB37A7E33}
+    pub const ID3D10VIEW: [u8; 16] = [
+        0x3F, 0xB0, 0x02, 0xC9, 0xA7, 0x60, 0xBA, 0x49, 0x99, 0x36, 0x2A, 0x3A, 0xB3, 0x7A, 0x7E,
+        0x33,
+    ];
+    /// IID_ID3D10ShaderResourceView: {9B7E4C07-342C-4106-A19F-4F2704F689F0}
+    pub const ID3D10SHADERRESOURCEVIEW: [u8; 16] = [
+        0x07, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89,
+        0xF0,
+    ];
+    /// IID_ID3D10RenderTargetView: {9B7E4C08-342C-4106-A19F-4F2704F689F0}
+    pub const ID3D10RENDERTARGETVIEW: [u8; 16] = [
+        0x08, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89,
+        0xF0,
+    ];
+    /// IID_ID3D10DepthStencilView: {9B7E4C09-342C-4106-A19F-4F2704F689F0}
+    pub const ID3D10DEPTHSTENCILVIEW: [u8; 16] = [
+        0x09, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89,
+        0xF0,
+    ];
+    /// IID_ID3D10VertexShader: {9B7E4C0A-342C-4106-A19F-4F2704F689F0}
+    pub const ID3D10VERTEXSHADER: [u8; 16] = [
+        0x0A, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89,
+        0xF0,
+    ];
+    /// IID_ID3D10InputLayout: {9B7E4C0B-342C-4106-A19F-4F2704F689F0}
+    pub const ID3D10INPUTLAYOUT: [u8; 16] = [
+        0x0B, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89,
+        0xF0,
+    ];
+    /// IID_ID3D10SamplerState: {9B7E4C0C-342C-4106-A19F-4F2704F689F0}
+    pub const ID3D10SAMPLERSTATE: [u8; 16] = [
+        0x0C, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89,
+        0xF0,
+    ];
+    /// IID_ID3D10Asynchronous: {9B7E4C0D-342C-4106-A19F-4F2704F689F0}
+    pub const ID3D10ASYNCHRONOUS: [u8; 16] = [
+        0x0D, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89,
+        0xF0,
+    ];
+    /// IID_ID3D10Query: {9B7E4C0E-342C-4106-A19F-4F2704F689F0}
+    pub const ID3D10QUERY: [u8; 16] = [
+        0x0E, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89,
+        0xF0,
+    ];
     /// IID_ID3D10Device: {9B7E4C0F-342C-4106-A19F-4F2704F689F0}
     pub const ID3D10DEVICE: [u8; 16] = [
         0x0F, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89,
         0xF0,
     ];
-    /// IID_ID3D10DeviceContext: does not exist in D3D10 (device IS context), but for compatibility
-    /// we define IID_ID3D10Device1: {9B7E4C8F-342C-4106-A19F-4F2704F689F0}
-    /// IID_ID3D10Texture2D: {9B7E4C80-342C-4106-A19F-4F2704F689F0}
-    pub const ID3D10TEXTURE2D: [u8; 16] = [
-        0x80, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89,
+    /// IID_ID3D10Predicate: {9B7E4C10-342C-4106-A19F-4F2704F689F0}
+    pub const ID3D10PREDICATE: [u8; 16] = [
+        0x10, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89,
         0xF0,
     ];
-    /// IID_ID3D10Buffer: {9B7E4C81-342C-4106-A19F-4F2704F689F0}
-    pub const ID3D10BUFFER: [u8; 16] = [
-        0x81, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89,
+    /// IID_ID3D10Counter: {9B7E4C11-342C-4106-A19F-4F2704F689F0}
+    pub const ID3D10COUNTER: [u8; 16] = [
+        0x11, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89,
         0xF0,
     ];
-    /// IID_ID3D10RenderTargetView: {9B7E4C82-342C-4106-A19F-4F2704F689F0}
-    pub const ID3D10RENDERTARGETVIEW: [u8; 16] = [
-        0x82, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89,
+    /// IID_ID3D10Multithread: {9B7E4E00-342C-4106-A19F-4F2704F689F0}
+    pub const ID3D10MULTITHREAD: [u8; 16] = [
+        0x00, 0x4E, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89,
         0xF0,
     ];
-    /// IID_ID3D10DepthStencilView: {9B7E4C83-342C-4106-A19F-4F2704F689F0}
-    pub const ID3D10DEPTHSTENCILVIEW: [u8; 16] = [
-        0x83, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89,
-        0xF0,
-    ];
-    /// IID_ID3D10ShaderResourceView: {9B7E4C84-342C-4106-A19F-4F2704F689F0}
-    pub const ID3D10SHADERRESOURCEVIEW: [u8; 16] = [
-        0x84, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89,
-        0xF0,
-    ];
-    /// IID_ID3D10VertexShader: {9B7E4C85-342C-4106-A19F-4F2704F689F0}
-    pub const ID3D10VERTEXSHADER: [u8; 16] = [
-        0x85, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89,
-        0xF0,
-    ];
-    /// IID_ID3D10PixelShader: {9B7E4C86-342C-4106-A19F-4F2704F689F0}
-    pub const ID3D10PIXELSHADER: [u8; 16] = [
-        0x86, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89,
-        0xF0,
-    ];
-    /// IID_ID3D10GeometryShader: {9B7E4C87-342C-4106-A19F-4F2704F689F0}
-    pub const ID3D10GEOMETRYSHADER: [u8; 16] = [
-        0x87, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89,
-        0xF0,
-    ];
-    /// IID_ID3D10InputLayout: {9B7E4C88-342C-4106-A19F-4F2704F689F0}
-    pub const ID3D10INPUTLAYOUT: [u8; 16] = [
-        0x88, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89,
-        0xF0,
-    ];
-    /// IID_ID3D10SamplerState: {9B7E4C89-342C-4106-A19F-4F2704F689F0}
-    pub const ID3D10SAMPLERSTATE: [u8; 16] = [
-        0x89, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89,
-        0xF0,
-    ];
-    /// IID_ID3D10BlendState: {9B7E4C8A-342C-4106-A19F-4F2704F689F0}
+    /// IID_ID3D10BlendState: {EDAD8D19-8A35-4D6D-8566-2EA276CDE161}
     pub const ID3D10BLENDSTATE: [u8; 16] = [
-        0x8A, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89,
-        0xF0,
+        0x19, 0x8D, 0xAD, 0xED, 0x35, 0x8A, 0x6D, 0x4D, 0x85, 0x66, 0x2E, 0xA2, 0x76, 0xCD, 0xE1,
+        0x61,
     ];
-    /// IID_ID3D10RasterizerState: {9B7E4C8B-342C-4106-A19F-4F2704F689F0}
-    pub const ID3D10RASTERIZERSTATE: [u8; 16] = [
-        0x8B, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89,
-        0xF0,
-    ];
-    /// IID_ID3D10DepthStencilState: {9B7E4C8C-342C-4106-A19F-4F2704F689F0}
+    /// IID_ID3D10DepthStencilState: {2B4B1CC8-A4AD-41F8-8322-CA86FC3EC675}
     pub const ID3D10DEPTHSTENCILSTATE: [u8; 16] = [
-        0x8C, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89,
-        0xF0,
+        0xC8, 0x1C, 0x4B, 0x2B, 0xAD, 0xA4, 0xF8, 0x41, 0x83, 0x22, 0xCA, 0x86, 0xFC, 0x3E, 0xC6,
+        0x75,
     ];
-    /// IID_ID3D10MultisampleState: {9B7E4C8D-342C-4106-A19F-4F2704F689F0}
-    pub const ID3D10MULTISAMPLESTATE: [u8; 16] = [
-        0x8D, 0x4C, 0x7E, 0x9B, 0x2C, 0x34, 0x06, 0x41, 0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89,
-        0xF0,
+    /// IID_ID3D10GeometryShader: {6316BE88-54CD-4040-AB44-20461BC81F68}
+    pub const ID3D10GEOMETRYSHADER: [u8; 16] = [
+        0x88, 0xBE, 0x16, 0x63, 0xCD, 0x54, 0x40, 0x40, 0xAB, 0x44, 0x20, 0x46, 0x1B, 0xC8, 0x1F,
+        0x68,
+    ];
+    /// IID_ID3D10PixelShader: {4968B601-9D00-4CDE-8346-8E7F675819B6}
+    pub const ID3D10PIXELSHADER: [u8; 16] = [
+        0x01, 0xB6, 0x68, 0x49, 0x00, 0x9D, 0xDE, 0x4C, 0x83, 0x46, 0x8E, 0x7F, 0x67, 0x58, 0x19,
+        0xB6,
+    ];
+    /// IID_ID3D10RasterizerState: {A2A07292-89AF-4345-BE2E-C53D9FBB6E9F}
+    pub const ID3D10RASTERIZERSTATE: [u8; 16] = [
+        0x92, 0x72, 0xA0, 0xA2, 0xAF, 0x89, 0x45, 0x43, 0xBE, 0x2E, 0xC5, 0x3D, 0x9F, 0xBB, 0x6E,
+        0x9F,
     ];
 }
 

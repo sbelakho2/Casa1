@@ -73,78 +73,107 @@ pub enum DxgiFormat {
 }
 
 impl DxgiFormat {
+    /// Map a raw `DXGI_FORMAT` enum value (as passed by the guest) to the
+    /// closest usable [`DxgiFormat`]. The table follows the canonical ABI
+    /// values from `dxgiformat.h`; typeless/SINT/video formats map to the
+    /// closest typed variant. Unknown values fall back to `R8G8B8A8Unorm`;
+    /// use [`from_u32_checked`](Self::from_u32_checked) when an unknown
+    /// format must be rejected instead.
     pub fn from_u32(value: u32) -> Self {
-        match value {
-            0 => DxgiFormat::R32G32B32A32Float,
-            1 => DxgiFormat::R32G32B32A32Uint,
-            4 => DxgiFormat::R32G32B32A32Uint,
-            5 => DxgiFormat::R16G16B16A16Unorm,
-            6 => DxgiFormat::R16G16B16A16Uint,
-            7 => DxgiFormat::R16G16B16A16Float,
-            8 => DxgiFormat::R32G32Float,
-            9 => DxgiFormat::R32G32Uint,
-            11 => DxgiFormat::R16G16Float,
-            12 => DxgiFormat::R16G16Unorm,
-            13 => DxgiFormat::R16G16Uint,
-            14 => DxgiFormat::R16G16Snorm,
-            16 => DxgiFormat::R32Float,
-            17 => DxgiFormat::R32Uint,
-            18 => DxgiFormat::R32Sint,
-            19 => DxgiFormat::R8G8B8A8Unorm,
-            20 => DxgiFormat::R8G8B8A8Uint,
-            21 => DxgiFormat::R8G8B8A8UnormSrgb,
-            24 => DxgiFormat::R16Float,
-            25 => DxgiFormat::R16Unorm,
-            26 => DxgiFormat::R16Uint,
-            27 => DxgiFormat::R16Snorm,
-            29 => DxgiFormat::R8Unorm,
-            30 => DxgiFormat::R8Uint,
-            36 => DxgiFormat::R10G10B10A2Unorm,
-            37 => DxgiFormat::R10G10B10A2Unorm,
-            38 => DxgiFormat::R10G10B10A2Uint,
-            39 => DxgiFormat::R11G11B10Float,
-            41 => DxgiFormat::R8G8B8A8UnormSrgb,
-            42 => DxgiFormat::B8G8R8A8UnormSrgb,
-            43 => DxgiFormat::B8G8R8X8Unorm,
-            47 => DxgiFormat::B5G6R5Unorm,
-            55 => DxgiFormat::B8G8R8A8Unorm,
-            56 => DxgiFormat::B8G8R8A8UnormSrgb,
-            62 => DxgiFormat::R16G16B16A16Float,
-            64 => DxgiFormat::R16G16B16A16Unorm,
-            65 => DxgiFormat::R16G16B16A16Uint,
-            68 => DxgiFormat::R32G32Float,
-            69 => DxgiFormat::R32G32Uint,
-            72 => DxgiFormat::R16G16Unorm,
-            73 => DxgiFormat::R16G16Uint,
-            76 => DxgiFormat::R32Float,
-            77 => DxgiFormat::R32Uint,
-            78 => DxgiFormat::R32Sint,
-            79 => DxgiFormat::R8G8B8A8Unorm,
-            80 => DxgiFormat::R8G8B8A8Uint,
-            81 => DxgiFormat::R8G8B8A8UnormSrgb,
-            84 => DxgiFormat::R16Float,
-            85 => DxgiFormat::R16Unorm,
-            86 => DxgiFormat::R16Uint,
-            87 => DxgiFormat::R16Snorm,
-            89 => DxgiFormat::R8Unorm,
-            90 => DxgiFormat::R8Uint,
-            99 => DxgiFormat::R8Unorm,
-            100 => DxgiFormat::D24UnormS8Uint,
-            101 => DxgiFormat::R32Float,
-            102 => DxgiFormat::D32FloatS8Uint,
-            105 => DxgiFormat::D32Float,
-            112 => DxgiFormat::Bc1Unorm,
-            113 => DxgiFormat::Bc1UnormSrgb,
-            114 => DxgiFormat::Bc2Unorm,
-            115 => DxgiFormat::Bc2UnormSrgb,
-            116 => DxgiFormat::Bc3Unorm,
-            117 => DxgiFormat::Bc3UnormSrgb,
-            118 => DxgiFormat::Bc4Unorm,
-            119 => DxgiFormat::Bc5Unorm,
-            127 => DxgiFormat::Bc7Unorm,
-            128 => DxgiFormat::Bc7UnormSrgb,
-            _ => DxgiFormat::R8G8B8A8Unorm,
-        }
+        Self::from_u32_checked(value).unwrap_or(DxgiFormat::R8G8B8A8Unorm)
+    }
+
+    /// Map a raw `DXGI_FORMAT` enum value to the closest usable
+    /// [`DxgiFormat`], returning an error for values that are not part of
+    /// the DXGI ABI. The table follows the canonical values from
+    /// `dxgiformat.h`; typeless/SINT/video formats map to the closest typed
+    /// variant.
+    pub fn from_u32_checked(value: u32) -> AppResult<Self> {
+        let format = match value {
+            // 0: DXGI_FORMAT_UNKNOWN
+            1 | 2 | 5 | 6 => DxgiFormat::R32G32B32A32Float, // R32G32B32A32_TYPELESS/FLOAT, R32G32B32_TYPELESS/FLOAT
+            3 | 7 => DxgiFormat::R32G32B32A32Uint, // R32G32B32A32_UINT, R32G32B32_UINT
+            4 | 8 => DxgiFormat::R32G32B32A32Uint, // R32G32B32A32_SINT, R32G32B32_SINT (closest: Uint)
+            9 | 11 | 13 => DxgiFormat::R16G16B16A16Unorm, // R16G16B16A16_TYPELESS/UNORM/SNORM
+            10 => DxgiFormat::R16G16B16A16Float, // R16G16B16A16_FLOAT
+            12 => DxgiFormat::R16G16B16A16Uint, // R16G16B16A16_UINT
+            14 => DxgiFormat::R16G16B16A16Uint, // R16G16B16A16_SINT (closest: Uint)
+            15 | 16 => DxgiFormat::R32G32Float, // R32G32_TYPELESS/FLOAT
+            17 => DxgiFormat::R32G32Uint,       // R32G32_UINT
+            18 => DxgiFormat::R32G32Uint,       // R32G32_SINT (closest: Uint)
+            19 => DxgiFormat::D32FloatS8Uint,   // R32G8X24_TYPELESS (closest: depth-stencil)
+            20 => DxgiFormat::D32FloatS8Uint,   // D32_FLOAT_S8X24_UINT
+            21 => DxgiFormat::D32FloatS8Uint,   // R32_FLOAT_X8X24_TYPELESS
+            22 => DxgiFormat::D32FloatS8Uint,   // X32_TYPELESS_G8X24_UINT
+            23 | 24 => DxgiFormat::R10G10B10A2Unorm, // R10G10B10A2_TYPELESS/UNORM
+            25 => DxgiFormat::R10G10B10A2Uint,  // R10G10B10A2_UINT
+            26 => DxgiFormat::R11G11B10Float,   // R11G11B10_FLOAT
+            27 | 28 => DxgiFormat::R8G8B8A8Unorm, // R8G8B8A8_TYPELESS/UNORM
+            29 => DxgiFormat::R8G8B8A8UnormSrgb, // R8G8B8A8_UNORM_SRGB
+            30 => DxgiFormat::R8G8B8A8Uint,     // R8G8B8A8_UINT
+            31 => DxgiFormat::R8G8B8A8Unorm,    // R8G8B8A8_SNORM (closest: Unorm)
+            32 => DxgiFormat::R8G8B8A8Uint,     // R8G8B8A8_SINT (closest: Uint)
+            33 | 35 => DxgiFormat::R16G16Unorm, // R16G16_TYPELESS/UNORM
+            34 => DxgiFormat::R16G16Float,      // R16G16_FLOAT
+            36 => DxgiFormat::R16G16Uint,       // R16G16_UINT
+            37 => DxgiFormat::R16G16Snorm,      // R16G16_SNORM
+            38 => DxgiFormat::R16G16Uint,       // R16G16_SINT (closest: Uint)
+            39 | 41 => DxgiFormat::R32Float,    // R32_TYPELESS/R32_FLOAT
+            40 => DxgiFormat::D32Float,         // D32_FLOAT
+            42 => DxgiFormat::R32Uint,          // R32_UINT
+            43 => DxgiFormat::R32Sint,          // R32_SINT
+            44 | 45 => DxgiFormat::D24UnormS8Uint, // R24G8_TYPELESS/D24_UNORM_S8_UINT
+            46 | 47 => DxgiFormat::D24UnormS8Uint, // R24_UNORM_X8_TYPELESS/X24_TYPELESS_G8_UINT
+            48 | 49 => DxgiFormat::R16G16Unorm, // R8G8_TYPELESS/UNORM (closest: 2×16)
+            50 => DxgiFormat::R16G16Uint,       // R8G8_UINT
+            51 => DxgiFormat::R16G16Snorm,      // R8G8_SNORM
+            52 => DxgiFormat::R16G16Uint,       // R8G8_SINT (closest: Uint)
+            53 | 56 => DxgiFormat::R16Unorm,    // R16_TYPELESS/R16_UNORM
+            54 => DxgiFormat::R16Float,         // R16_FLOAT
+            55 => DxgiFormat::R16Unorm,         // D16_UNORM (closest: R16)
+            57 => DxgiFormat::R16Uint,          // R16_UINT
+            58 => DxgiFormat::R16Snorm,         // R16_SNORM
+            59 => DxgiFormat::R16Uint,          // R16_SINT (closest: Uint)
+            60 | 61 => DxgiFormat::R8Unorm,     // R8_TYPELESS/R8_UNORM
+            62 => DxgiFormat::R8Uint,           // R8_UINT
+            63 => DxgiFormat::R8Unorm,          // R8_SNORM (closest: Unorm)
+            64 => DxgiFormat::R8Uint,           // R8_SINT (closest: Uint)
+            65 => DxgiFormat::R8Unorm,          // A8_UNORM
+            66 => DxgiFormat::R8Unorm,          // R1_UNORM (closest: R8)
+            67 => DxgiFormat::R11G11B10Float,   // R9G9B9E5_SHAREDEXP (closest: packed float)
+            68 | 69 => DxgiFormat::R8G8B8A8Unorm, // R8G8_B8G8_UNORM/G8R8_G8B8_UNORM
+            70 | 71 => DxgiFormat::Bc1Unorm,    // BC1_TYPELESS/BC1_UNORM
+            72 => DxgiFormat::Bc1UnormSrgb,     // BC1_UNORM_SRGB
+            73 | 74 => DxgiFormat::Bc2Unorm,    // BC2_TYPELESS/BC2_UNORM
+            75 => DxgiFormat::Bc2UnormSrgb,     // BC2_UNORM_SRGB
+            76 | 77 => DxgiFormat::Bc3Unorm,    // BC3_TYPELESS/BC3_UNORM
+            78 => DxgiFormat::Bc3UnormSrgb,     // BC3_UNORM_SRGB
+            79 | 80 => DxgiFormat::Bc4Unorm,    // BC4_TYPELESS/BC4_UNORM
+            81 => DxgiFormat::Bc4Unorm,         // BC4_SNORM (closest: Unorm)
+            82 | 83 => DxgiFormat::Bc5Unorm,    // BC5_TYPELESS/BC5_UNORM
+            84 => DxgiFormat::Bc5Unorm,         // BC5_SNORM (closest: Unorm)
+            85 => DxgiFormat::B5G6R5Unorm,      // B5G6R5_UNORM
+            86 => DxgiFormat::B5G6R5Unorm,      // B5G5R5A1_UNORM (closest: B5G6R5)
+            87 => DxgiFormat::B8G8R8A8Unorm,    // B8G8R8A8_UNORM
+            88 => DxgiFormat::B8G8R8X8Unorm,    // B8G8R8X8_UNORM
+            89 => DxgiFormat::R10G10B10A2Unorm, // R10G10B10_XR_BIAS_A2_UNORM (closest)
+            90 => DxgiFormat::B8G8R8A8Unorm,    // B8G8R8A8_TYPELESS
+            91 => DxgiFormat::B8G8R8A8UnormSrgb, // B8G8R8A8_UNORM_SRGB
+            92 => DxgiFormat::B8G8R8X8Unorm,    // B8G8R8X8_TYPELESS
+            93 => DxgiFormat::B8G8R8A8UnormSrgb, // B8G8R8X8_UNORM_SRGB (closest: sRGB BGRA)
+            94..=96 => DxgiFormat::Bc7Unorm, // BC6H_TYPELESS/UF16/SF16 (closest: same block size)
+            97 | 98 => DxgiFormat::Bc7Unorm,    // BC7_TYPELESS/BC7_UNORM
+            99 => DxgiFormat::Bc7UnormSrgb,     // BC7_UNORM_SRGB
+            100 | 101 | 102 | 103 | 104 | 105 | 106 | 107 | 108 | 109 | 110 | 111 | 112
+            | 113 | 114 | 115 | 130 | 131 | 132 => DxgiFormat::R8G8B8A8Unorm, // AYUV/video formats
+            _ => {
+                return Err(AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    format!("unknown DXGI_FORMAT value {value}"),
+                ));
+            }
+        };
+        Ok(format)
     }
 }
 
@@ -483,11 +512,12 @@ impl ResourceState {
         if bits & 0x4000 != 0 {
             result.push(ResourceState::RaytracingAccelerationStructure);
         }
+        // D3D12_RESOURCE_STATE_SHADING_RATE_SOURCE (0x10000) and
+        // D3D12_RESOURCE_STATE_VIDEO_DECODE_READ (0x00010000) alias to the
+        // same bit in d3d12.h (mutually exclusive contexts), so only one
+        // variant is reported.
         if bits & 0x10000 != 0 {
             result.push(ResourceState::ShadingRateSource);
-        }
-        if bits & 0x00010000 != 0 {
-            result.push(ResourceState::VideoDecodeRead);
         }
         if bits & 0x00020000 != 0 {
             result.push(ResourceState::VideoDecodeWrite);
@@ -680,9 +710,10 @@ impl D3D12DescriptorRangeType {
 }
 
 /// D3D12_SHADER_VISIBILITY — which shader stages a root parameter applies to.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum D3D12ShaderVisibility {
+    #[default]
     All,
     Vertex,
     Hull,
@@ -691,12 +722,6 @@ pub enum D3D12ShaderVisibility {
     Pixel,
     Amplification,
     Mesh,
-}
-
-impl Default for D3D12ShaderVisibility {
-    fn default() -> Self {
-        D3D12ShaderVisibility::All
-    }
 }
 
 /// A single descriptor range within a descriptor table.
@@ -750,7 +775,7 @@ pub enum RootParameter {
 }
 
 /// Expanded root signature descriptor with full D3D12 parameter mapping.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct RootSignatureDesc {
     pub descriptor_tables: Vec<u32>,
     pub root_constants: u32,
@@ -760,18 +785,6 @@ pub struct RootSignatureDesc {
     pub static_samplers: Vec<D3D12StaticSamplerDesc>,
     /// Per-shader-visibility descriptor table offset state.
     pub visibility_offsets: BTreeMap<D3D12ShaderVisibility, Vec<u32>>,
-}
-
-impl Default for RootSignatureDesc {
-    fn default() -> Self {
-        Self {
-            descriptor_tables: Vec::new(),
-            root_constants: 0,
-            parameters: Vec::new(),
-            static_samplers: Vec::new(),
-            visibility_offsets: BTreeMap::new(),
-        }
-    }
 }
 
 /// D3D12_RESOURCE_BARRIER_TYPE — which type of barrier is being issued.
@@ -1059,7 +1072,6 @@ struct ResourceRecord {
     states: Vec<ResourceState>,
     bytes: Vec<u8>,
     storage_mode: MetalStorageMode,
-    live: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1112,7 +1124,9 @@ pub struct GraphicsBackend {
     root_signatures: BTreeMap<RootSignatureId, RootSignatureDesc>,
     pipeline_states: BTreeMap<PipelineStateId, PipelineStateDesc>,
     timestamps: u64,
-    /// Per-subresource barrier state tracking: (resource, array_slice, mip_level) -> state.
+    /// Per-subresource barrier state tracking: (resource, 0, flat D3D12
+    /// subresource index) -> state. The flat index follows the D3D12
+    /// convention (mip + array_slice * mip_levels).
     subresource_states: BTreeMap<SubresourceKey, ResourceState>,
     /// Pending split barriers (BEGIN_ONLY that have not yet been END_ONLY'd).
     pending_split_barriers: Vec<PendingSplitBarrier>,
@@ -1180,6 +1194,17 @@ impl Default for GraphicsBackend {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Mutable state accumulated while executing a command stream.
+struct ExecutionPlanState {
+    active_pass: Option<RenderPassPlan>,
+    render_passes: Vec<RenderPassPlan>,
+    compute_passes: u32,
+    blit_passes: u32,
+    raytrace_passes: u32,
+    validation_errors: Vec<String>,
+    root_constants_log: Vec<Vec<u32>>,
 }
 
 impl GraphicsBackend {
@@ -1351,7 +1376,13 @@ impl GraphicsBackend {
         let displayed_frame_index = {
             let record = self.swapchain_mut(swapchain)?;
             record.next_present_index += 1;
-            record.presented_backbuffer_index = 0;
+            // Rotate to the next backbuffer so presented_frame() reports the
+            // buffer the guest most recently rendered into (the one that was
+            // just displayed). With a single backbuffer the index stays 0.
+            if !record.state.backbuffers.is_empty() {
+                record.presented_backbuffer_index =
+                    (record.presented_backbuffer_index + 1) % record.state.backbuffers.len();
+            }
             record.state.queued_frames =
                 (record.state.queued_frames + 1).min(record.state.max_frame_latency);
             record.next_present_index
@@ -1370,10 +1401,10 @@ impl GraphicsBackend {
                 None
             }
         };
-        if let Some(ref mut cb) = self.frame_published_callback {
-            if let Some(presented) = presented_frame {
-                cb(presented);
-            }
+        if let (Some(ref mut cb), Some(presented)) =
+            (self.frame_published_callback.as_mut(), presented_frame)
+        {
+            cb(presented);
         }
 
         // Read final queued_frames count after any callback side-effects
@@ -1464,10 +1495,14 @@ impl GraphicsBackend {
         height: u32,
         format: DxgiFormat,
     ) -> AppResult<()> {
-        let old_backbuffers = self.swapchain(swapchain)?.state.backbuffers.clone();
-        for resource in old_backbuffers {
-            self.destroy_resource(resource)?;
+        if buffer_count < 2 {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                "swapchain buffer count must be at least 2",
+            ));
         }
+        // Allocate the new backbuffers first so a failure leaves the
+        // existing swapchain state (and its backbuffers) intact.
         let backbuffers = (0..buffer_count)
             .map(|index| {
                 self.create_resource(ResourceDesc {
@@ -1481,6 +1516,10 @@ impl GraphicsBackend {
                 })
             })
             .collect::<AppResult<Vec<_>>>()?;
+        let old_backbuffers = self.swapchain(swapchain)?.state.backbuffers.clone();
+        for resource in old_backbuffers {
+            let _ = self.destroy_resource(resource);
+        }
         let record = self.swapchain_mut(swapchain)?;
         record.state.desc = SwapchainDesc {
             width,
@@ -1514,7 +1553,6 @@ impl GraphicsBackend {
                 bytes: vec![0; desc.size],
                 storage_mode,
                 desc,
-                live: true,
             },
         );
         Ok(id)
@@ -1527,11 +1565,73 @@ impl GraphicsBackend {
             .ok_or_else(|| AppError::new(ReasonCode::RcD3dInvalidState, "unknown resource"))
     }
 
+    /// Destroy a swapchain and its backbuffer resources.
+    pub fn destroy_swapchain(&mut self, swapchain: SwapchainId) -> AppResult<()> {
+        let record = self
+            .swapchains
+            .remove(&swapchain)
+            .ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    format!("unknown swapchain {swapchain}"),
+                )
+            })?;
+        for backbuffer in record.state.backbuffers {
+            let _ = self.destroy_resource(backbuffer);
+        }
+        Ok(())
+    }
+
+    /// Destroy a descriptor heap.
+    pub fn destroy_descriptor_heap(&mut self, heap: DescriptorHeapId) -> AppResult<()> {
+        self.descriptor_heaps
+            .remove(&heap)
+            .map(|_| ())
+            .ok_or_else(|| AppError::new(ReasonCode::RcD3dInvalidState, "unknown descriptor heap"))
+    }
+
+    /// Destroy a command list (drops its recorded commands).
+    pub fn destroy_command_list(&mut self, list: CommandListId) -> AppResult<()> {
+        self.command_lists
+            .remove(&list)
+            .map(|_| ())
+            .ok_or_else(|| AppError::new(ReasonCode::RcD3dInvalidState, "unknown command list"))
+    }
+
+    /// Destroy a fence.
+    pub fn destroy_fence(&mut self, fence: FenceId) -> AppResult<()> {
+        self.fences
+            .remove(&fence)
+            .map(|_| ())
+            .ok_or_else(|| AppError::new(ReasonCode::RcD3dInvalidState, "unknown fence"))
+    }
+
+    /// Destroy a query heap.
+    pub fn destroy_query_heap(&mut self, heap: QueryHeapId) -> AppResult<()> {
+        self.query_heaps
+            .remove(&heap)
+            .map(|_| ())
+            .ok_or_else(|| AppError::new(ReasonCode::RcD3dInvalidState, "unknown query heap"))
+    }
+
+    /// Destroy a root signature.
+    pub fn destroy_root_signature(&mut self, root_signature: RootSignatureId) -> AppResult<()> {
+        self.root_signatures
+            .remove(&root_signature)
+            .map(|_| ())
+            .ok_or_else(|| AppError::new(ReasonCode::RcD3dInvalidState, "unknown root signature"))
+    }
+
+    /// Destroy a pipeline state object.
+    pub fn destroy_pipeline_state(&mut self, pipeline_state: PipelineStateId) -> AppResult<()> {
+        self.pipeline_states
+            .remove(&pipeline_state)
+            .map(|_| ())
+            .ok_or_else(|| AppError::new(ReasonCode::RcD3dInvalidState, "unknown pipeline state"))
+    }
+
     pub fn live_resource_count(&self) -> usize {
-        self.resources
-            .values()
-            .filter(|resource| resource.live)
-            .count()
+        self.resources.len()
     }
 
     pub fn resource_state(
@@ -1572,7 +1672,7 @@ impl GraphicsBackend {
             ));
         }
         *state = to;
-        // Also track in subresource_states
+        // Also track in subresource_states under the flat subresource index.
         self.subresource_states
             .insert((resource_id, 0, subresource), to);
         Ok(())
@@ -1735,6 +1835,9 @@ impl GraphicsBackend {
         from: ResourceState,
         to: ResourceState,
     ) -> AppResult<()> {
+        // Validate the command list (and that it is open) before mutating
+        // resource state, so a failed record leaves the state unchanged.
+        self.command_list_mut(list)?;
         self.transition_resource(resource, subresource, from, to)?;
         self.command_list_mut(list)?
             .commands
@@ -1788,6 +1891,8 @@ impl GraphicsBackend {
         to: ResourceState,
     ) -> AppResult<()> {
         self.resource(resource)?;
+        // Validate the command list before recording the pending barrier.
+        self.command_list_mut(list)?;
         self.pending_split_barriers.push(PendingSplitBarrier {
             resource,
             subresource,
@@ -1816,16 +1921,26 @@ impl GraphicsBackend {
         to: ResourceState,
     ) -> AppResult<()> {
         self.resource(resource)?;
-        // Find and remove matching pending split barrier
+        // Validate the command list before mutating state.
+        self.command_list_mut(list)?;
+        // Find and remove matching pending split barrier; an END_ONLY without
+        // a matching BEGIN is a malformed barrier sequence and must not
+        // mutate resource state (D3D12 debug validation rejects it).
         let pos = self.pending_split_barriers.iter().position(|pending| {
             pending.resource == resource
                 && pending.subresource == subresource
                 && pending.state_before == from
                 && pending.state_after == to
         });
-        if let Some(index) = pos {
-            self.pending_split_barriers.remove(index);
-        }
+        let index = pos.ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!(
+                    "split barrier END without matching BEGIN for resource {resource} subresource {subresource}"
+                ),
+            )
+        })?;
+        self.pending_split_barriers.remove(index);
         // Apply the actual state transition on end
         self.transition_resource_internal(resource, subresource, to)?;
         self.command_list_mut(list)?
@@ -1914,34 +2029,34 @@ impl GraphicsBackend {
                 AppError::new(ReasonCode::RcD3dInvalidState, "invalid subresource index")
             })?;
         *state = to;
-        // Also track in subresource_states for array-slice+mip-level tracking
+        // Also track in subresource_states for flat subresource index tracking
         let key = (resource, 0, subresource);
         self.subresource_states.insert(key, to);
         Ok(())
     }
 
-    /// Get subresource state from the fine-grained tracking map.
+    /// Get subresource state from the fine-grained tracking map. `subresource`
+    /// is the flat D3D12 subresource index (mip + array_slice * mip_levels).
     pub fn subresource_state(
         &self,
         resource: ResourceId,
-        array_slice: u32,
-        mip_level: u32,
+        subresource: u32,
     ) -> Option<ResourceState> {
         self.subresource_states
-            .get(&(resource, array_slice, mip_level))
+            .get(&(resource, 0, subresource))
             .copied()
     }
 
-    /// Set subresource state in the fine-grained tracking map.
+    /// Set subresource state in the fine-grained tracking map. `subresource`
+    /// is the flat D3D12 subresource index (mip + array_slice * mip_levels).
     pub fn set_subresource_state(
         &mut self,
         resource: ResourceId,
-        array_slice: u32,
-        mip_level: u32,
+        subresource: u32,
         state: ResourceState,
     ) {
         self.subresource_states
-            .insert((resource, array_slice, mip_level), state);
+            .insert((resource, 0, subresource), state);
     }
 
     /// Return the number of pending split barriers.
@@ -2069,6 +2184,7 @@ impl GraphicsBackend {
     /// Stores the shader table GPU virtual addresses and dispatch dimensions.
     /// The actual Metal ray traversal encoding is performed when the command
     /// list is executed on the Metal backend.
+    #[allow(clippy::too_many_arguments)]
     pub fn record_dispatch_rays(
         &mut self,
         list: CommandListId,
@@ -2131,6 +2247,7 @@ impl GraphicsBackend {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn record_copy_resource_region(
         &mut self,
         list: CommandListId,
@@ -2214,6 +2331,12 @@ impl GraphicsBackend {
 
     pub fn close_command_list(&mut self, list: CommandListId) -> AppResult<ImmutableCommandStream> {
         let record = self.command_list_mut(list)?;
+        if record.closed {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!("command list {list} is already closed"),
+            ));
+        }
         record.closed = true;
         Ok(ImmutableCommandStream {
             id: list,
@@ -2221,6 +2344,8 @@ impl GraphicsBackend {
         })
     }
 
+    /// Mutable state accumulated while executing a command stream.
+    ///
     /// Process a single [`Command`] during [`execute_command_lists`], driving the
     /// render-pass / compute-pass / blit-pass planning state machine.
     ///
@@ -2231,13 +2356,7 @@ impl GraphicsBackend {
         &mut self,
         command: &Command,
         pipeline: &PipelineStateDesc,
-        active_pass: &mut Option<RenderPassPlan>,
-        render_passes: &mut Vec<RenderPassPlan>,
-        compute_passes: &mut u32,
-        blit_passes: &mut u32,
-        raytrace_passes: &mut u32,
-        validation_errors: &mut Vec<String>,
-        root_constants_log: &mut Vec<Vec<u32>>,
+        plan: &mut ExecutionPlanState,
     ) -> AppResult<()> {
         match command {
             Command::Transition { .. }
@@ -2245,15 +2364,15 @@ impl GraphicsBackend {
             | Command::SplitBarrierEnd { .. }
             | Command::UavBarrier { .. }
             | Command::AliasingBarrier { .. } => {
-                if let Some(pass) = active_pass.take() {
-                    render_passes.push(pass);
+                if let Some(pass) = plan.active_pass.take() {
+                    plan.render_passes.push(pass);
                 }
             }
             Command::SetRootConstants { values } => {
-                if let Some(pass) = active_pass.take() {
-                    render_passes.push(pass);
+                if let Some(pass) = plan.active_pass.take() {
+                    plan.render_passes.push(pass);
                 }
-                root_constants_log.push(values.clone());
+                plan.root_constants_log.push(values.clone());
             }
             Command::BeginRenderPass {
                 color_formats,
@@ -2268,20 +2387,19 @@ impl GraphicsBackend {
                 let mapped_depth_format = depth_format
                     .map(|format| format_mapping(format).map(|mapping| mapping.metal))
                     .transpose()?;
-                match active_pass {
+                match &mut plan.active_pass {
                     Some(pass)
-                        if self.capabilities.mesh_shaders
-                            && pass.can_merge_with(
-                                &mapped_color_formats,
-                                mapped_depth_format,
-                                load_action,
-                            ) =>
+                        if pass.can_merge_with(
+                            &mapped_color_formats,
+                            mapped_depth_format,
+                            load_action,
+                        ) =>
                     {
                         pass.merge_store_action(store_action);
                     }
                     Some(_) => {
-                        render_passes.push(active_pass.take().expect("active pass"));
-                        *active_pass = Some(RenderPassPlan {
+                        plan.render_passes.push(plan.active_pass.take().expect("active pass"));
+                        plan.active_pass = Some(RenderPassPlan {
                             color_formats: mapped_color_formats,
                             depth_format: mapped_depth_format,
                             draw_calls: 0,
@@ -2290,7 +2408,7 @@ impl GraphicsBackend {
                         });
                     }
                     None => {
-                        *active_pass = Some(RenderPassPlan {
+                        plan.active_pass = Some(RenderPassPlan {
                             color_formats: mapped_color_formats,
                             depth_format: mapped_depth_format,
                             draw_calls: 0,
@@ -2303,7 +2421,7 @@ impl GraphicsBackend {
             Command::ClearRtv { heap, index } => {
                 let descriptor = self.descriptor_at(*heap, *index)?;
                 let ViewDescriptor::Rtv { format, .. } = descriptor else {
-                    validation_errors.push("invalid RTV attachment".to_string());
+                    plan.validation_errors.push("invalid RTV attachment".to_string());
                     return Ok(());
                 };
                 let mapping = format_mapping(format)?;
@@ -2312,13 +2430,13 @@ impl GraphicsBackend {
                     .map(format_mapping)
                     .transpose()?
                     .map(|mapping| mapping.metal);
-                match active_pass {
+                match &mut plan.active_pass {
                     Some(pass) => {
                         if pass.color_formats != vec![mapping.metal]
                             || pass.depth_format != depth_format
                         {
-                            render_passes.push(active_pass.take().expect("active pass"));
-                            *active_pass = Some(RenderPassPlan {
+                            plan.render_passes.push(plan.active_pass.take().expect("active pass"));
+                            plan.active_pass = Some(RenderPassPlan {
                                 color_formats: vec![mapping.metal],
                                 depth_format,
                                 draw_calls: 0,
@@ -2330,7 +2448,7 @@ impl GraphicsBackend {
                         }
                     }
                     None => {
-                        *active_pass = Some(RenderPassPlan {
+                        plan.active_pass = Some(RenderPassPlan {
                             color_formats: vec![mapping.metal],
                             depth_format,
                             draw_calls: 0,
@@ -2340,36 +2458,76 @@ impl GraphicsBackend {
                     }
                 }
             }
-            Command::ClearDsv { .. } => {}
+            Command::ClearDsv { heap, index } => {
+                let descriptor = self.descriptor_at(*heap, *index)?;
+                let ViewDescriptor::Dsv { format, .. } = descriptor else {
+                    plan.validation_errors.push("invalid DSV attachment".to_string());
+                    return Ok(());
+                };
+                let mapping = format_mapping(format)?;
+                let color_format = pipeline
+                    .render_target_formats
+                    .first()
+                    .map(|format| format_mapping(*format))
+                    .transpose()?
+                    .map(|mapping| mapping.metal);
+                let color_formats = color_format.map(|f| vec![f]).unwrap_or_default();
+                match &mut plan.active_pass {
+                    Some(pass)
+                        if pass.depth_format == Some(mapping.metal)
+                            && pass.color_formats == color_formats =>
+                    {
+                        pass.load_action = "clear".to_string();
+                    }
+                    Some(_) => {
+                        plan.render_passes.push(plan.active_pass.take().expect("active pass"));
+                        plan.active_pass = Some(RenderPassPlan {
+                            color_formats,
+                            depth_format: Some(mapping.metal),
+                            draw_calls: 0,
+                            load_action: "clear".to_string(),
+                            store_action: "store".to_string(),
+                        });
+                    }
+                    None => {
+                        plan.active_pass = Some(RenderPassPlan {
+                            color_formats,
+                            depth_format: Some(mapping.metal),
+                            draw_calls: 0,
+                            load_action: "clear".to_string(),
+                            store_action: "store".to_string(),
+                        });
+                    }
+                }
+            }
             Command::Draw { .. } | Command::DrawInstanced { .. } => {
-                if let Some(pass) = active_pass {
+                if let Some(pass) = &mut plan.active_pass {
                     pass.draw_calls += 1;
                 } else {
-                    validation_errors.push("draw without active render pass".to_string());
+                    plan.validation_errors.push("draw without active render pass".to_string());
                 }
             }
             Command::Dispatch { .. } => {
-                if let Some(pass) = active_pass.take() {
-                    render_passes.push(pass);
+                if let Some(pass) = plan.active_pass.take() {
+                    plan.render_passes.push(pass);
                 }
-                *compute_passes += 1;
+                plan.compute_passes += 1;
             }
             Command::DispatchMesh { .. } => {
                 // Mesh shader dispatches require an active render pass
                 // (they generate geometry for rasterization).
-                if let Some(pass) = active_pass {
+                if let Some(pass) = &mut plan.active_pass {
                     pass.draw_calls += 1;
                 } else {
-                    validation_errors.push("dispatch mesh without active render pass".to_string());
+                    plan.validation_errors.push("dispatch mesh without active render pass".to_string());
                 }
             }
             Command::CopyResource { src, dst } => {
-                if let Some(pass) = active_pass.take() {
-                    render_passes.push(pass);
+                if let Some(pass) = plan.active_pass.take() {
+                    plan.render_passes.push(pass);
                 }
-                *blit_passes += 1;
-                let src_bytes = self.resource(*src)?.bytes.clone();
-                self.resource_mut(*dst)?.bytes = src_bytes;
+                plan.blit_passes += 1;
+                self.copy_resource_bytes(*src, *dst)?;
             }
             Command::CopyBufferRegion {
                 dst,
@@ -2378,92 +2536,136 @@ impl GraphicsBackend {
                 src_offset,
                 size,
             } => {
-                if let Some(pass) = active_pass.take() {
-                    render_passes.push(pass);
+                if let Some(pass) = plan.active_pass.take() {
+                    plan.render_passes.push(pass);
                 }
-                *blit_passes += 1;
+                plan.blit_passes += 1;
                 let src_bytes = self.resource(*src)?.bytes.clone();
                 let dst_bytes = self.resource_mut(*dst)?;
-                let src_start = *src_offset as usize;
-                let dst_start = *dst_offset as usize;
-                let len = *size as usize;
-                if src_start + len <= src_bytes.len() && dst_start + len <= dst_bytes.bytes.len() {
-                    dst_bytes.bytes[dst_start..dst_start + len]
-                        .copy_from_slice(&src_bytes[src_start..src_start + len]);
+                let src_start = usize::try_from(*src_offset).map_err(|_| {
+                    AppError::new(ReasonCode::RcD3dInvalidState, "copy source offset out of range")
+                })?;
+                let dst_start = usize::try_from(*dst_offset).map_err(|_| {
+                    AppError::new(ReasonCode::RcD3dInvalidState, "copy dest offset out of range")
+                })?;
+                let len = usize::try_from(*size).map_err(|_| {
+                    AppError::new(ReasonCode::RcD3dInvalidState, "copy size out of range")
+                })?;
+                let src_end = src_start.checked_add(len).ok_or_else(|| {
+                    AppError::new(ReasonCode::RcD3dInvalidState, "copy source range overflow")
+                })?;
+                let dst_end = dst_start.checked_add(len).ok_or_else(|| {
+                    AppError::new(ReasonCode::RcD3dInvalidState, "copy dest range overflow")
+                })?;
+                if src_end > src_bytes.len() || dst_end > dst_bytes.bytes.len() {
+                    return Err(AppError::new(
+                        ReasonCode::RcD3dInvalidState,
+                        "copy buffer region out of bounds",
+                    ));
                 }
+                dst_bytes.bytes[dst_start..dst_end]
+                    .copy_from_slice(&src_bytes[src_start..src_end]);
             }
             Command::CopyResourceRegion {
                 dst,
-                dst_x: _,
+                dst_x,
                 dst_y,
                 dst_z: _,
                 src,
-                src_x: _,
-                src_y: _,
+                src_x,
+                src_y,
                 src_z: _,
                 width,
                 height,
                 depth: _,
             } => {
-                if let Some(pass) = active_pass.take() {
-                    render_passes.push(pass);
+                if let Some(pass) = plan.active_pass.take() {
+                    plan.render_passes.push(pass);
                 }
-                *blit_passes += 1;
-                // For buffer-to-buffer copies, treat as a flat byte copy
-                // using the offset/size from the region parameters.
-                // Texture region copies (texture sub-rectangle) are approximated
-                // by copying the full region as a contiguous block.
+                plan.blit_passes += 1;
+                // For buffer-to-buffer copies this treats the region as a
+                // row-oriented byte copy: each row is `width` pixels of 4
+                // bytes. The source row is selected by `src_y` and the
+                // destination row by `dst_y`, honoring the x offsets in
+                // both. All arithmetic is checked so guest-controlled
+                // coordinates cannot panic or wrap.
                 let src_bytes = self.resource(*src)?.bytes.clone();
                 let dst_bytes = self.resource_mut(*dst)?;
-                let src_stride = *width as usize;
-                let dst_stride = *width as usize;
+                let bpp = 4usize;
                 let row_count = *height as usize;
-                let src_offset = (*dst_y as usize) * src_stride; // approximate
-                let dst_offset = (*dst_y as usize) * dst_stride;
+                let src_stride = (*width as usize)
+                    .checked_mul(bpp)
+                    .ok_or_else(|| AppError::new(ReasonCode::RcD3dInvalidState, "copy width overflow"))?;
+                let dst_stride = (*width as usize)
+                    .checked_mul(bpp)
+                    .ok_or_else(|| AppError::new(ReasonCode::RcD3dInvalidState, "copy width overflow"))?;
+                let src_x_off = (*src_x as usize)
+                    .checked_mul(bpp)
+                    .ok_or_else(|| AppError::new(ReasonCode::RcD3dInvalidState, "copy src_x overflow"))?;
+                let dst_x_off = (*dst_x as usize)
+                    .checked_mul(bpp)
+                    .ok_or_else(|| AppError::new(ReasonCode::RcD3dInvalidState, "copy dst_x overflow"))?;
+                let src_row_base = (*src_y as usize)
+                    .checked_mul(src_stride)
+                    .and_then(|v| v.checked_add(src_x_off))
+                    .ok_or_else(|| AppError::new(ReasonCode::RcD3dInvalidState, "copy source offset overflow"))?;
+                let dst_row_base = (*dst_y as usize)
+                    .checked_mul(dst_stride)
+                    .and_then(|v| v.checked_add(dst_x_off))
+                    .ok_or_else(|| AppError::new(ReasonCode::RcD3dInvalidState, "copy dest offset overflow"))?;
                 for row in 0..row_count {
-                    let src_row_start = src_offset + row * src_stride;
-                    let dst_row_start = dst_offset + row * dst_stride;
-                    if src_row_start + src_stride <= src_bytes.len()
-                        && dst_row_start + dst_stride <= dst_bytes.bytes.len()
-                    {
-                        dst_bytes.bytes[dst_row_start..dst_row_start + src_stride]
-                            .copy_from_slice(&src_bytes[src_row_start..src_row_start + src_stride]);
+                    let src_row_start = src_row_base
+                        .checked_add(row.checked_mul(src_stride).ok_or_else(|| {
+                            AppError::new(ReasonCode::RcD3dInvalidState, "copy row offset overflow")
+                        })?)
+                        .ok_or_else(|| {
+                            AppError::new(ReasonCode::RcD3dInvalidState, "copy row offset overflow")
+                        })?;
+                    let dst_row_start = dst_row_base
+                        .checked_add(row.checked_mul(dst_stride).ok_or_else(|| {
+                            AppError::new(ReasonCode::RcD3dInvalidState, "copy row offset overflow")
+                        })?)
+                        .ok_or_else(|| {
+                            AppError::new(ReasonCode::RcD3dInvalidState, "copy row offset overflow")
+                        })?;
+                    let src_row_end = src_row_start.checked_add(src_stride).ok_or_else(|| {
+                        AppError::new(ReasonCode::RcD3dInvalidState, "copy row range overflow")
+                    })?;
+                    let dst_row_end = dst_row_start.checked_add(dst_stride).ok_or_else(|| {
+                        AppError::new(ReasonCode::RcD3dInvalidState, "copy row range overflow")
+                    })?;
+                    if src_row_end > src_bytes.len() || dst_row_end > dst_bytes.bytes.len() {
+                        return Err(AppError::new(
+                            ReasonCode::RcD3dInvalidState,
+                            "copy resource region out of bounds",
+                        ));
                     }
+                    dst_bytes.bytes[dst_row_start..dst_row_end]
+                        .copy_from_slice(&src_bytes[src_row_start..src_row_end]);
                 }
             }
             Command::ResolveSubresource { dst, src, .. } => {
-                if let Some(pass) = active_pass.take() {
-                    render_passes.push(pass);
+                if let Some(pass) = plan.active_pass.take() {
+                    plan.render_passes.push(pass);
                 }
-                *blit_passes += 1;
-                let src_bytes = self.resource(*src)?.bytes.clone();
-                self.resource_mut(*dst)?.bytes = src_bytes;
+                plan.blit_passes += 1;
+                self.copy_resource_bytes(*src, *dst)?;
             }
             Command::ExecuteBundle { bundle_commands } => {
                 // Recursively process each command in the bundle. Bundle
                 // commands inherit the parent list's pipeline state and
                 // render-pass context — they execute as if inlined.
                 for cmd in bundle_commands {
-                    self.process_execution_command(
-                        cmd,
-                        pipeline,
-                        active_pass,
-                        render_passes,
-                        compute_passes,
-                        blit_passes,
-                        raytrace_passes,
-                        validation_errors,
-                        root_constants_log,
-                    )?;
+                    self.process_execution_command(cmd, pipeline, plan)?;
                 }
             }
             Command::DispatchRays { .. } => {
                 // Raytracing dispatches are independent of render passes.
                 // End any active render pass and count as a raytrace pass.
-                if let Some(pass) = active_pass.take() {
-                    render_passes.push(pass);
+                if let Some(pass) = plan.active_pass.take() {
+                    plan.render_passes.push(pass);
                 }
-                *raytrace_passes += 1;
+                plan.raytrace_passes += 1;
             }
         }
         Ok(())
@@ -2475,13 +2677,15 @@ impl GraphicsBackend {
         lists: &[ImmutableCommandStream],
         signal_fence: Option<(FenceId, u64)>,
     ) -> AppResult<MetalCommandBufferPlan> {
-        let mut render_passes = Vec::new();
-        let mut compute_passes = 0;
-        let mut blit_passes = 0;
-        let mut raytrace_passes = 0;
-        let mut validation_errors = Vec::new();
-        let mut root_constants_log = Vec::new();
-        let mut active_pass: Option<RenderPassPlan> = None;
+        let mut plan = ExecutionPlanState {
+            active_pass: None,
+            render_passes: Vec::new(),
+            compute_passes: 0,
+            blit_passes: 0,
+            raytrace_passes: 0,
+            validation_errors: Vec::new(),
+            root_constants_log: Vec::new(),
+        };
 
         for stream in lists {
             let pipeline = self
@@ -2503,21 +2707,11 @@ impl GraphicsBackend {
                 })?
                 .clone();
             for command in &stream.commands {
-                self.process_execution_command(
-                    command,
-                    &pipeline,
-                    &mut active_pass,
-                    &mut render_passes,
-                    &mut compute_passes,
-                    &mut blit_passes,
-                    &mut raytrace_passes,
-                    &mut validation_errors,
-                    &mut root_constants_log,
-                )?;
+                self.process_execution_command(command, &pipeline, &mut plan)?;
             }
         }
-        if let Some(pass) = active_pass.take() {
-            render_passes.push(pass);
+        if let Some(pass) = plan.active_pass.take() {
+            plan.render_passes.push(pass);
         }
 
         let mut signaled_fences = Vec::new();
@@ -2527,12 +2721,12 @@ impl GraphicsBackend {
         }
 
         Ok(MetalCommandBufferPlan {
-            render_passes,
-            compute_passes,
-            blit_passes,
-            raytrace_passes,
-            validation_errors,
-            root_constants_log,
+            render_passes: plan.render_passes,
+            compute_passes: plan.compute_passes,
+            blit_passes: plan.blit_passes,
+            raytrace_passes: plan.raytrace_passes,
+            validation_errors: plan.validation_errors,
+            root_constants_log: plan.root_constants_log,
             signaled_fences,
         })
     }
@@ -2557,9 +2751,26 @@ impl GraphicsBackend {
         Ok(self.fence(fence)?.value)
     }
 
-    pub fn wait_for_fence(&self, fence: FenceId, value: u64, _timeout_ns: u64) -> AppResult<bool> {
-        let current = self.fence_value(fence)?;
-        Ok(current >= value)
+    pub fn wait_for_fence(&self, fence: FenceId, value: u64, timeout_ns: u64) -> AppResult<bool> {
+        // Fences are CPU-emulated and completed synchronously by
+        // `signal_fence`, so a satisfied fence is answered immediately. When
+        // the fence is not yet satisfied and a timeout is provided, poll
+        // briefly instead of busy-returning; a zero timeout performs a
+        // non-blocking check.
+        let start = std::time::Instant::now();
+        loop {
+            let current = self.fence_value(fence)?;
+            if current >= value {
+                return Ok(true);
+            }
+            if timeout_ns == 0 {
+                return Ok(false);
+            }
+            if start.elapsed().as_nanos() as u64 >= timeout_ns {
+                return Ok(false);
+            }
+            std::thread::sleep(std::time::Duration::from_micros(100));
+        }
     }
 
     pub fn upload_write(
@@ -2575,7 +2786,9 @@ impl GraphicsBackend {
                 "resource is not in an upload heap",
             ));
         }
-        let end = offset + bytes.len();
+        let end = offset.checked_add(bytes.len()).ok_or_else(|| {
+            AppError::new(ReasonCode::RcD3dInvalidState, "upload write range overflow")
+        })?;
         if end > resource.bytes.len() {
             return Err(AppError::new(
                 ReasonCode::RcD3dInvalidState,
@@ -2689,6 +2902,51 @@ impl GraphicsBackend {
             AppError::new(ReasonCode::RcD3dInvalidState, "query index out of bounds")
         })?;
         *slot = samples;
+        Ok(())
+    }
+
+    /// Store an arbitrary timestamp value at `index`. Used to record the
+    /// end-minus-begin delta for D3D12 timestamp query pairs.
+    pub fn write_timestamp_value(
+        &mut self,
+        heap: QueryHeapId,
+        index: usize,
+        value: u64,
+    ) -> AppResult<()> {
+        let query_heap = self.query_heap_mut(heap)?;
+        if query_heap.ty != QueryType::Timestamp {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                "query heap is not a timestamp heap",
+            ));
+        }
+        let slot = query_heap.values.get_mut(index).ok_or_else(|| {
+            AppError::new(ReasonCode::RcD3dInvalidState, "query index out of bounds")
+        })?;
+        *slot = value;
+        Ok(())
+    }
+
+    /// Write `bytes` at `offset` into a resource's CPU-side storage, with
+    /// checked bounds. Unlike `upload_write` this works for any heap type
+    /// (used to fill readback buffers from query resolves).
+    pub fn write_resource_bytes(
+        &mut self,
+        resource: ResourceId,
+        offset: usize,
+        bytes: &[u8],
+    ) -> AppResult<()> {
+        let resource = self.resource_mut(resource)?;
+        let end = offset.checked_add(bytes.len()).ok_or_else(|| {
+            AppError::new(ReasonCode::RcD3dInvalidState, "resource write range overflow")
+        })?;
+        if end > resource.bytes.len() {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                "resource write out of bounds",
+            ));
+        }
+        resource.bytes[offset..end].copy_from_slice(bytes);
         Ok(())
     }
 
@@ -2863,6 +3121,41 @@ impl GraphicsBackend {
         })
     }
 
+    /// Copy the contents of `src` into `dst` in place (`copy_from_slice`),
+    /// avoiding the intermediate full-buffer allocation of a clone.
+    fn copy_resource_bytes(&mut self, src: ResourceId, dst: ResourceId) -> AppResult<()> {
+        if src == dst {
+            return Ok(());
+        }
+        // Temporarily remove the destination so the source can be borrowed
+        // immutably while the destination is mutated in place; the entry is
+        // restored even on failure.
+        let mut dst_record = self.resources.remove(&dst).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!("unknown resource {dst}"),
+            )
+        })?;
+        let copy_result = (|| -> AppResult<()> {
+            let src_record = self.resources.get(&src).ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    format!("unknown resource {src}"),
+                )
+            })?;
+            if src_record.bytes.len() != dst_record.bytes.len() {
+                return Err(AppError::new(
+                    ReasonCode::RcD3dInvalidState,
+                    "copy resource size mismatch",
+                ));
+            }
+            dst_record.bytes.copy_from_slice(&src_record.bytes);
+            Ok(())
+        })();
+        self.resources.insert(dst, dst_record);
+        copy_result
+    }
+
     fn descriptor_heap(&self, heap: DescriptorHeapId) -> AppResult<&DescriptorHeapRecord> {
         self.descriptor_heaps.get(&heap).ok_or_else(|| {
             AppError::new(
@@ -2894,12 +3187,19 @@ impl GraphicsBackend {
     }
 
     fn command_list_mut(&mut self, list: CommandListId) -> AppResult<&mut CommandListRecord> {
-        self.command_lists.get_mut(&list).ok_or_else(|| {
+        let record = self.command_lists.get_mut(&list).ok_or_else(|| {
             AppError::new(
                 ReasonCode::RcD3dInvalidState,
                 format!("unknown command list {list}"),
             )
-        })
+        })?;
+        if record.closed {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!("command list {list} is closed"),
+            ));
+        }
+        Ok(record)
     }
 
     fn fence(&self, fence: FenceId) -> AppResult<&FenceRecord> {
