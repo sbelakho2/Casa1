@@ -3770,6 +3770,12 @@ pub struct IntegrityCheckEmulator {
 /// and the history would otherwise grow without bound over long sessions.
 const CHECK_HISTORY_CAP: usize = 1024;
 
+impl Default for IntegrityCheckEmulator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl IntegrityCheckEmulator {
     /// Creates a new `IntegrityCheckEmulator` with no registered regions.
     pub fn new() -> Self {
@@ -3781,15 +3787,7 @@ impl IntegrityCheckEmulator {
             next_region_id: 1,
         }
     }
-}
 
-impl Default for IntegrityCheckEmulator {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl IntegrityCheckEmulator {
     /// Registers a memory region for integrity checking.
     pub fn register_region(&mut self, base: u64, size: u64, expected_hash: [u8; 32]) -> u32 {
         let id = self.next_region_id;
@@ -3893,8 +3891,6 @@ impl IntegrityCheckEmulator {
 // ===========================================================================
 // 5. Anti-Debugging API Stubs
 // ===========================================================================
-// 5. Anti-Debugging API Stubs
-// ===========================================================================
 
 /// NT process information class constants.
 const PROCESS_DEBUG_PORT: u32 = 7;
@@ -3929,6 +3925,12 @@ pub struct AntiDebugState {
     pub ntdll_base: u64,
 }
 
+impl Default for AntiDebugState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AntiDebugState {
     /// Creates a new `AntiDebugState` with all values set to indicate "no debugger present".
     pub fn new() -> Self {
@@ -3944,15 +3946,7 @@ impl AntiDebugState {
             ntdll_base: 0x7FFE_0000,
         }
     }
-}
 
-impl Default for AntiDebugState {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl AntiDebugState {
     /// Returns `false` to indicate no debugger is present.
     pub fn is_debugger_present(&self) -> bool {
         false
@@ -7080,15 +7074,6 @@ pub struct CertificateStoreManager {
     next_handle: u64,
 }
 
-impl CertificateStoreManager {
-    pub fn new() -> Self {
-        CertificateStoreManager {
-            stores: BTreeMap::new(),
-            next_handle: 1,
-        }
-    }
-}
-
 impl Default for CertificateStoreManager {
     fn default() -> Self {
         Self::new()
@@ -7096,6 +7081,13 @@ impl Default for CertificateStoreManager {
 }
 
 impl CertificateStoreManager {
+    pub fn new() -> Self {
+        CertificateStoreManager {
+            stores: BTreeMap::new(),
+            next_handle: 1,
+        }
+    }
+
     /// Open a certificate store by name. Creates it if it doesn't exist.
     pub fn open_store(&mut self, name: &str) -> u64 {
         // Check if store already exists
