@@ -27,6 +27,7 @@ const kCGEventFlagMaskAlternate: u64 = 0x0008_0000;
 #[cfg(target_os = "macos")]
 const kCGEventFlagMaskCommand: u64 = 0x0010_0000;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::sync::OnceLock;
 
 // ── Window style constants ──────────────────────────────────────────────
 pub const WS_OVERLAPPED: u32 = 0x0000_0000;
@@ -588,17 +589,20 @@ pub const QS_ALLEVENTS: u32 =
     QS_INPUT | QS_POSTMESSAGE | QS_TIMER | QS_PAINT | QS_SENDMESSAGE | QS_HOTKEY;
 pub const QS_ALLINPUT: u32 = QS_ALLEVENTS | QS_ALLPOSTMESSAGE;
 
-// ── Touch Input structure (96 bytes on x64) ──────────────────────────────
+// ── Touch Input structure (48 bytes on x64 / 44 on x86 — Win32 TOUCHINPUT) ─
 #[derive(Debug, Clone, Copy)]
-#[repr(C, packed)]
+#[repr(C)]
 pub struct TouchInput {
     pub x: i32,
     pub y: i32,
-    pub source: u32, // 0=unspecified, 1=touch, 2=pen
+    pub source: u32, // hSource truncated to 32 bits (emulator never sets high bits)
     pub id: u32,
     pub flags: u32,
     pub mask: u32,
     pub time: u32,
+    // Win32 x64 aligns ULONG_PTR dwExtraInfo to 8 bytes (offset 32); the
+    // packed 44-byte layout previously placed it unaligned at 28 (UB).
+    pub pad: u32,
     pub extra_info: usize,
     pub cx: u32, // contact area width
     pub cy: u32, // contact area height
@@ -693,12 +697,12 @@ pub struct PointerFrameInfo {
 pub struct TouchState {
     /// HWNDs that called RegisterTouchWindow
     pub registered_windows: Vec<u32>,
-    /// (hwnd, TouchInput) pairs pending retrieval by GetTouchInputInfo
-    pub touch_inputs: Vec<(u32, TouchInput)>,
     /// Handle → touch inputs stored for GetTouchInputInfo
     pub touch_handles: BTreeMap<u32, Vec<TouchInput>>,
     /// Next handle value for touch input storage
     pub next_touch_handle: u32,
+    /// Monotonically increasing pointer frame id (GetPointerFrameInfo).
+    pub next_frame_id: u32,
     /// Initialized pointer device handles
     pub pointer_devices: Vec<u32>,
     /// Stored PointerInfo indexed by pointer_id
@@ -755,10 +759,21 @@ pub struct Rect {
 
 impl Rect {
     pub fn confine(&self, x: i32, y: i32) -> (i32, i32) {
-        (
-            x.clamp(self.left, self.right),
-            y.clamp(self.top, self.bottom),
-        )
+        // clamp() panics when the bounds are inverted (left > right or
+        // top > bottom), and guest code can supply arbitrary rects
+        // (ClipCursor / SetCursorPos). Return the raw point for
+        // degenerate rects instead of aborting the process.
+        let cx = if self.left <= self.right {
+            x.clamp(self.left, self.right)
+        } else {
+            x
+        };
+        let cy = if self.top <= self.bottom {
+            y.clamp(self.top, self.bottom)
+        } else {
+            y
+        };
+        (cx, cy)
     }
 }
 
@@ -1138,8 +1153,6 @@ pub struct WindowPreview {
 #[derive(Debug, Clone)]
 struct WindowClass {
     atom: Atom,
-    #[allow(dead_code)]
-    name: String,
     info: WindowClassInfo,
 }
 
@@ -1339,7 +1352,8 @@ pub struct User32Subsystem {
     window_longs: BTreeMap<(Hwnd, i32), u64>,
     message_queue: VecDeque<Message>,
     thread_message_queues: BTreeMap<u32, VecDeque<Message>>,
-    message_log: Vec<Message>,
+    /// Ring buffer of recently dispatched messages (capped to bound memory).
+    message_log: VecDeque<Message>,
     capture: Option<Hwnd>,
     foreground: Option<Hwnd>,
     focus: Option<Hwnd>,
@@ -1381,8 +1395,10 @@ pub struct User32Subsystem {
     hooks: HashMap<i32, HookInfo>,
     /// Next hook ID to assign.
     next_hook_id: i32,
-    /// Active timers: (hwnd, timer_id) → expiry time.
-    timers: BTreeMap<(Hwnd, usize), std::time::SystemTime>,
+    /// Active timers: (hwnd, timer_id) → (expiry, interval_ms). An interval
+    /// of 0 marks a one-shot timer; positive intervals are periodic and are
+    /// re-armed by poll_timers after each expiry (Win32 SetTimer semantics).
+    timers: BTreeMap<(Hwnd, usize), (std::time::SystemTime, u64)>,
     /// Clipboard open state (OpenClipboard/CloseClipboard tracking).
     clipboard_open: bool,
     /// Window that currently owns the clipboard.
@@ -1574,7 +1590,7 @@ impl User32Subsystem {
             window_longs: BTreeMap::new(),
             message_queue: VecDeque::new(),
             thread_message_queues: BTreeMap::new(),
-            message_log: Vec::new(),
+            message_log: VecDeque::new(),
             capture: None,
             foreground: None,
             focus: None,
@@ -1668,17 +1684,96 @@ impl User32Subsystem {
         if let Some(existing) = self.classes.get(class_name) {
             return existing.atom;
         }
-        let atom = self.next_atom;
-        self.next_atom += 1;
+        let atom = self.alloc_atom();
         self.classes.insert(
             class_name.to_string(),
-            WindowClass {
-                atom,
-                name: class_name.to_string(),
-                info,
-            },
+            WindowClass { atom, info },
         );
         atom
+    }
+
+    /// Allocate the next free atom (u16): skips 0 (invalid atom) and atoms
+    /// already handed out so the counter cannot wrap onto a live class.
+    fn alloc_atom(&mut self) -> Atom {
+        let start = self.next_atom;
+        loop {
+            let atom = self.next_atom;
+            self.next_atom = self.next_atom.wrapping_add(1);
+            if self.next_atom == 0 {
+                self.next_atom = 1;
+            }
+            if atom != 0 && !self.classes.values().any(|class| class.atom == atom) {
+                return atom;
+            }
+            if self.next_atom == start {
+                break;
+            }
+        }
+        // Table exhausted: fall back to the next value (unreachable in practice).
+        let atom = self.next_atom;
+        self.next_atom = self.next_atom.wrapping_add(1);
+        atom
+    }
+
+    /// Allocate the next free HWND: skips 0 and handles still in use so a
+    /// wrapped counter cannot alias a live window.
+    fn alloc_hwnd(&mut self) -> Hwnd {
+        let start = self.next_hwnd;
+        loop {
+            let hwnd = self.next_hwnd;
+            self.next_hwnd = self.next_hwnd.wrapping_add(1);
+            if self.next_hwnd == 0 {
+                self.next_hwnd = 1;
+            }
+            if hwnd != 0 && !self.windows.contains_key(&hwnd) {
+                return hwnd;
+            }
+            if self.next_hwnd == start {
+                break;
+            }
+        }
+        // Table exhausted: fall back to the next value (unreachable in practice).
+        let hwnd = self.next_hwnd;
+        self.next_hwnd = self.next_hwnd.wrapping_add(1);
+        hwnd
+    }
+
+    /// Allocate the next free menu handle, skipping 0 and live handles.
+    fn alloc_menu_handle(&mut self) -> u32 {
+        let start = self.next_menu_handle;
+        loop {
+            let handle = self.next_menu_handle;
+            self.next_menu_handle = self.next_menu_handle.wrapping_add(1);
+            if handle != 0 && !self.menu_items.contains_key(&handle) {
+                return handle;
+            }
+            if self.next_menu_handle == start {
+                break;
+            }
+        }
+        // Table exhausted: fall back to the next value (unreachable in practice).
+        let handle = self.next_menu_handle;
+        self.next_menu_handle = self.next_menu_handle.wrapping_add(1);
+        handle
+    }
+
+    /// Allocate the next free touch input handle, skipping 0 and live handles.
+    fn alloc_touch_handle(&mut self) -> u32 {
+        let start = self.touch_state.next_touch_handle;
+        loop {
+            let handle = self.touch_state.next_touch_handle;
+            self.touch_state.next_touch_handle = self.touch_state.next_touch_handle.wrapping_add(1);
+            if handle != 0 && !self.touch_state.touch_handles.contains_key(&handle) {
+                return handle;
+            }
+            if self.touch_state.next_touch_handle == start {
+                break;
+            }
+        }
+        // Table exhausted: fall back to the next value (unreachable in practice).
+        let handle = self.touch_state.next_touch_handle;
+        self.touch_state.next_touch_handle = self.touch_state.next_touch_handle.wrapping_add(1);
+        handle
     }
 
     pub fn class_info(&self, class_name: &str) -> Option<WindowClassInfo> {
@@ -1695,6 +1790,7 @@ impl User32Subsystem {
         None
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn create_window_ex_w(
         &mut self,
         class_name: &str,
@@ -1721,6 +1817,7 @@ impl User32Subsystem {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn create_window_ex_styled(
         &mut self,
         class_name: &str,
@@ -1744,8 +1841,7 @@ impl User32Subsystem {
         let class_info = self.classes.get(class_name).map(|class| class.info);
         // atom is verified via ensure_class_available above; only needed for its side effect
         let _atom = atom;
-        let hwnd = self.next_hwnd;
-        self.next_hwnd += 1;
+        let hwnd = self.alloc_hwnd();
         let fullscreen = self.map_fullscreen_state(title, requested_exclusive_fullscreen);
         let dpi = self.effective_dpi(monitor_id)?;
 
@@ -1818,66 +1914,83 @@ impl User32Subsystem {
         } else {
             self.z_order.push(hwnd);
         }
-        if let Some(class_info) = class_info {
-            if class_info.wnd_proc != 0 {
-                self.window_longs
-                    .insert((hwnd, GWL_WNDPROC), class_info.wnd_proc);
-            }
+        if let Some(class_info) = class_info.filter(|info| info.wnd_proc != 0) {
+            self.window_longs
+                .insert((hwnd, GWL_WNDPROC), class_info.wnd_proc);
         }
         // Associate owner window
-        if let Some(owner_hwnd) = owner {
-            if !self.windows.contains_key(&owner_hwnd) {
-                if let Some(window) = self.windows.get_mut(&hwnd) {
-                    window.owner = None;
-                }
-            }
+        if owner.is_some_and(|h| !self.windows.contains_key(&h))
+            && let Some(window) = self.windows.get_mut(&hwnd)
+        {
+            window.owner = None;
         }
-        self.enqueue(Message {
-            hwnd: Some(hwnd),
-            kind: MessageKind::NcCreate,
-            wparam: 0,
-            lparam: 0,
-            translated: false,
-            device_id: None,
-        })?;
-        self.enqueue(Message {
-            hwnd: Some(hwnd),
-            kind: MessageKind::Create,
-            wparam: 0,
-            lparam: 0,
-            translated: false,
-            device_id: None,
-        })?;
-        if visible {
+        // Queue the creation messages. On failure, roll back everything so a
+        // failed creation leaves no live half-created record behind.
+        let enqueue_result = (|| -> AppResult<()> {
             self.enqueue(Message {
                 hwnd: Some(hwnd),
-                kind: MessageKind::ShowWindow,
-                wparam: 1,
+                kind: MessageKind::NcCreate,
+                wparam: 0,
                 lparam: 0,
                 translated: false,
                 device_id: None,
             })?;
-            self.queue_resize(hwnd, width, height)?;
-            if self.foreground.is_none() {
-                self.foreground = Some(hwnd);
-                self.focus = Some(hwnd);
+            self.enqueue(Message {
+                hwnd: Some(hwnd),
+                kind: MessageKind::Create,
+                wparam: 0,
+                lparam: 0,
+                translated: false,
+                device_id: None,
+            })?;
+            if visible {
                 self.enqueue(Message {
                     hwnd: Some(hwnd),
-                    kind: MessageKind::Activate,
+                    kind: MessageKind::ShowWindow,
                     wparam: 1,
                     lparam: 0,
                     translated: false,
                     device_id: None,
                 })?;
-                self.enqueue(Message {
-                    hwnd: Some(hwnd),
-                    kind: MessageKind::SetFocus,
-                    wparam: 0,
-                    lparam: 0,
-                    translated: false,
-                    device_id: None,
-                })?;
+                self.queue_resize(hwnd, width, height)?;
+                if self.foreground.is_none() {
+                    self.foreground = Some(hwnd);
+                    self.focus = Some(hwnd);
+                    self.enqueue(Message {
+                        hwnd: Some(hwnd),
+                        kind: MessageKind::Activate,
+                        wparam: 1,
+                        lparam: 0,
+                        translated: false,
+                        device_id: None,
+                    })?;
+                    self.enqueue(Message {
+                        hwnd: Some(hwnd),
+                        kind: MessageKind::SetFocus,
+                        wparam: 0,
+                        lparam: 0,
+                        translated: false,
+                        device_id: None,
+                    })?;
+                }
             }
+            Ok(())
+        })();
+        if let Err(e) = enqueue_result {
+            if self.foreground == Some(hwnd) {
+                self.foreground = None;
+            }
+            if self.focus == Some(hwnd) {
+                self.focus = None;
+            }
+            self.windows.remove(&hwnd);
+            self.z_order.retain(|h| *h != hwnd);
+            self.window_longs.retain(|(h, _), _| *h != hwnd);
+            if !ns_window.is_null() {
+                mac_window::close_nswindow(ns_window);
+                mac_window::remove_hwnd_nswindow(hwnd);
+            }
+            return Err(e);
         }
         Ok(hwnd)
     }
@@ -1951,10 +2064,10 @@ impl User32Subsystem {
         }
 
         // Real macOS window: show or hide the NSWindow
-        if let Ok(window) = self.window(hwnd) {
-            if !window.ns_window.is_null() {
-                mac_window::show_nswindow(window.ns_window, should_show);
-            }
+        if let Ok(window) = self.window(hwnd).map(|w| w.ns_window)
+            && !window.is_null()
+        {
+            mac_window::show_nswindow(window, should_show);
         }
 
         Ok(was_visible)
@@ -2048,34 +2161,65 @@ impl User32Subsystem {
         }
         // Clean up CEF browser association
         self.cef_browser_handles.remove(&hwnd);
+
+        // Release any DWM blur-behind view still attached to this window so
+        // the view is freed with the window (no leak, no later UAF).
+        if let Some(view_ptr) = self.blur_effect_views.remove(&hwnd) {
+            #[cfg(target_os = "macos")]
+            unsafe {
+                use objc::runtime::Object;
+                let ve_view = view_ptr as *mut Object;
+                let _: () = msg_send![ve_view, removeFromSuperview];
+                let _: () = msg_send![ve_view, release];
+            }
+            #[cfg(not(target_os = "macos"))]
+            let _ = view_ptr;
+        }
+
+        // Drop all per-window state so destroyed windows cannot accumulate
+        // unbounded entries in these maps (window churn otherwise leaks).
+        self.window_longs.retain(|(h, _), _| *h != hwnd);
+        self.dwm_attributes.remove(&hwnd);
+        self.flashing_windows.remove(&hwnd);
+        self.scroll_info.retain(|(h, _), _| *h != hwnd);
+        self.window_menus.remove(&hwnd);
+        self.timers.retain(|(h, _), _| *h != hwnd);
+        self.dialog_items.retain(|(h, _), _| *h != hwnd);
+        self.touch_state.registered_windows.retain(|h| *h != hwnd);
+        self.touch_state.pointer_devices.retain(|h| *h != hwnd);
+        self.z_order.retain(|h| *h != hwnd);
         if let Some(window) = self.windows.get_mut(&hwnd) {
             window.destroyed = true;
-        }
-        self.z_order.retain(|h| *h != hwnd);
-        self.enqueue(Message {
-            hwnd: Some(hwnd),
-            kind: MessageKind::Destroy,
-            wparam: 0,
-            lparam: 0,
-            translated: false,
-            device_id: None,
-        })?;
-        self.enqueue(Message {
-            hwnd: Some(hwnd),
-            kind: MessageKind::NcDestroy,
-            wparam: 0,
-            lparam: 0,
-            translated: false,
-            device_id: None,
-        })?;
-
-        // Close the real NSWindow if it exists
-        if let Some(window) = self.windows.get(&hwnd) {
+            // Close the real NSWindow exactly once and null the pointer so
+            // no later path (e.g. the queued WM_NCDESTROY dispatch) closes
+            // or updates it again (double-close / use-after-free).
             if !window.ns_window.is_null() {
                 mac_window::close_nswindow(window.ns_window);
                 mac_window::remove_hwnd_nswindow(hwnd);
+                window.ns_window = std::ptr::null_mut();
             }
         }
+
+        // Best-effort destruction notifications. Failure to queue them (full
+        // queue) must not resurrect the window or leave stale records behind.
+        for kind in [MessageKind::Destroy, MessageKind::NcDestroy] {
+            if let Err(e) = self.enqueue(Message {
+                hwnd: Some(hwnd),
+                kind,
+                wparam: 0,
+                lparam: 0,
+                translated: false,
+                device_id: None,
+            }) {
+                eprintln!(
+                    "[User32] destroy_window: failed to enqueue {kind:?} for hwnd {hwnd}: {e}"
+                );
+            }
+        }
+
+        // Remove the record immediately: WM_NCDESTROY dispatch is not
+        // guaranteed on all paths, and stale records otherwise accumulate.
+        self.windows.remove(&hwnd);
 
         Ok(true)
     }
@@ -2107,6 +2251,7 @@ impl User32Subsystem {
     }
 
     /// Set window position (SetWindowPos Win32 API equivalent).
+    #[allow(clippy::too_many_arguments)]
     pub fn set_window_pos(
         &mut self,
         hwnd: Hwnd,
@@ -2151,12 +2296,15 @@ impl User32Subsystem {
         if !window.ns_window.is_null() {
             let new_x = if flags & SWP_NOMOVE == 0 { x } else { window.x };
             let new_y = if flags & SWP_NOMOVE == 0 { y } else { window.y };
-            let new_w = if flags & SWP_NOSIZE == 0 {
+            // Guard the size exactly like the record fields above: a guest
+            // passing cx/cy <= 0 must not resize the real window to 4 GiB
+            // or 0 while the internal record keeps the old size.
+            let new_w = if flags & SWP_NOSIZE == 0 && cx > 0 && cy > 0 {
                 cx as u32
             } else {
                 window.width
             };
-            let new_h = if flags & SWP_NOSIZE == 0 {
+            let new_h = if flags & SWP_NOSIZE == 0 && cx > 0 && cy > 0 {
                 cy as u32
             } else {
                 window.height
@@ -2199,9 +2347,15 @@ impl User32Subsystem {
                 }
                 other_hwnd => {
                     if self.has_window(other_hwnd) {
-                        self.z_order.retain(|h| *h == hwnd || *h != other_hwnd);
+                        // Insert `hwnd` directly after `other_hwnd` WITHOUT
+                        // removing the target from the z-order (the previous
+                        // code deleted other_hwnd and then could never find
+                        // it again, so the reinsert never ran).
+                        self.z_order.retain(|h| *h != hwnd);
                         if let Some(pos) = self.z_order.iter().position(|h| *h == other_hwnd) {
                             self.z_order.insert(pos + 1, hwnd);
+                        } else {
+                            self.z_order.insert(0, hwnd);
                         }
                     }
                 }
@@ -2215,13 +2369,14 @@ impl User32Subsystem {
         let Some(window) = self.windows.get(&hwnd) else {
             return Ok(false);
         };
+        // Never touch the NSWindow of a destroyed window: it may already be
+        // closed/freed (use-after-free).
+        if window.destroyed {
+            return Ok(false);
+        }
         let ns_window = window.ns_window;
-        let destroyed = window.destroyed;
         if !ns_window.is_null() {
             mac_window::update_nswindow(ns_window);
-        }
-        if destroyed {
-            return Ok(false);
         }
         // UpdateWindow should trigger WM_PAINT dispatch for an existing window
         // even in headless/hidden test setups.
@@ -2257,8 +2412,7 @@ impl User32Subsystem {
 
     /// KillTimer — destroy a timer.
     pub fn kill_timer(&mut self, hwnd: Hwnd, timer_id: usize) -> bool {
-        let removed = self.timers.remove(&(hwnd, timer_id)).is_some();
-        removed
+        self.timers.remove(&(hwnd, timer_id)).is_some()
     }
 
     /// UnregisterClassW — unregister a window class.
@@ -2268,9 +2422,10 @@ impl User32Subsystem {
 
     /// Set a timer (called from the dispatch side for SetTimer).
     pub fn set_timer(&mut self, hwnd: Hwnd, timer_id: usize, timeout_ms: u32) -> bool {
+        let interval = timeout_ms as u64;
         let expiry =
-            std::time::SystemTime::now() + std::time::Duration::from_millis(timeout_ms as u64);
-        self.timers.insert((hwnd, timer_id), expiry);
+            std::time::SystemTime::now() + std::time::Duration::from_millis(interval);
+        self.timers.insert((hwnd, timer_id), (expiry, interval));
         true
     }
 
@@ -2278,14 +2433,22 @@ impl User32Subsystem {
     pub fn poll_timers(&mut self) -> Vec<(Hwnd, usize)> {
         let now = std::time::SystemTime::now();
         let mut expired = Vec::new();
-        self.timers.retain(|&(hwnd, id), expiry| {
+        let mut rearmed: BTreeMap<(Hwnd, usize), (std::time::SystemTime, u64)> = BTreeMap::new();
+        self.timers.retain(|&(hwnd, id), (expiry, period)| {
             if *expiry <= now {
                 expired.push((hwnd, id));
+                // Periodic timers (interval > 0) re-arm themselves so
+                // animation/game timers keep firing until KillTimer.
+                if *period > 0 {
+                    let next = now + std::time::Duration::from_millis(*period);
+                    rearmed.insert((hwnd, id), (next, *period));
+                }
                 false
             } else {
                 true
             }
         });
+        self.timers.extend(rearmed);
         expired
     }
 
@@ -2308,7 +2471,7 @@ impl User32Subsystem {
                 }
                 MessageKind::Paint => QS_PAINT,
                 // WM_TIMER (0x0113) is represented as Other(0x0113) when no dedicated variant exists
-                MessageKind::Other(id) if id == 0x0113 => QS_TIMER,
+                MessageKind::Other(0x0113) => QS_TIMER,
                 MessageKind::Other(_) => QS_POSTMESSAGE,
                 _ => continue,
             };
@@ -2427,7 +2590,7 @@ impl User32Subsystem {
         }
         if format == 0 {
             // Return the first format
-            *formats.first().unwrap()
+            formats.first().copied().unwrap_or(0)
         } else {
             // Return the next format after the given one
             let pos = formats.iter().position(|f| *f == format);
@@ -2454,17 +2617,18 @@ impl User32Subsystem {
                     if self.capture == Some(hwnd) {
                         self.capture = None;
                     }
-                    if window.enabled && window.class_name.eq_ignore_ascii_case("button") {
-                        if let Some(parent) = window.parent {
-                            self.enqueue(Message {
-                                hwnd: Some(parent),
-                                kind: MessageKind::Command,
-                                wparam: i64::from(window.control_id),
-                                lparam: i64::from(window.hwnd),
-                                translated: false,
-                                device_id: message.device_id.clone(),
-                            })?;
-                        }
+                    if window.enabled
+                        && window.class_name.eq_ignore_ascii_case("button")
+                        && let Some(parent) = window.parent
+                    {
+                        self.enqueue(Message {
+                            hwnd: Some(parent),
+                            kind: MessageKind::Command,
+                            wparam: i64::from(window.control_id),
+                            lparam: i64::from(window.hwnd),
+                            translated: false,
+                            device_id: message.device_id.clone(),
+                        })?;
                     }
                 }
                 _ => {
@@ -2558,15 +2722,13 @@ impl User32Subsystem {
                 }
                 continue;
             }
-            if let Some(expected) = class_name {
-                if !window.class_name.eq_ignore_ascii_case(expected) {
-                    continue;
-                }
+            if class_name
+                .is_some_and(|expected| !window.class_name.eq_ignore_ascii_case(expected))
+            {
+                continue;
             }
-            if let Some(expected) = title {
-                if window.title != expected {
-                    continue;
-                }
+            if title.is_some_and(|expected| window.title != expected) {
+                continue;
             }
             return Some(hwnd);
         }
@@ -2584,8 +2746,7 @@ impl User32Subsystem {
             return Ok(Some(*existing));
         }
 
-        let hwnd = self.next_hwnd;
-        self.next_hwnd += 1;
+        let hwnd = self.alloc_hwnd();
         self.windows.insert(
             hwnd,
             WindowRecord {
@@ -2644,8 +2805,12 @@ impl User32Subsystem {
 
     /// DialogBoxParam — creates a modal dialog box.
     /// Creates a window of class "#32770" (dialog), optionally registers it,
-    /// and runs a modal message loop until EndDialog is called.
-    /// Returns the dialog result code.
+    /// and returns the dialog result code.
+    ///
+    /// The modal dispatch loop is owned by pe_runtime (it executes guest
+    /// callbacks); this entry point shows the dialog and returns any result
+    /// already produced by EndDialog (e.g. during WM_INITDIALOG), or 0 if
+    /// the dialog is still live and its result is pending.
     pub fn dialog_box_param(
         &mut self,
         template_name: &str,
@@ -2674,7 +2839,9 @@ impl User32Subsystem {
         }
         // Show the dialog
         self.show_window(hwnd, 5)?; // SW_SHOW
-        Ok(hwnd as i64)
+        // Return the dialog result (not the HWND): EndDialog results are
+        // consumed via take_dialog_result once the modal loop completes.
+        Ok(self.take_dialog_result(hwnd).unwrap_or(0))
     }
 
     /// DefDlgProcW — default dialog window procedure.
@@ -2738,7 +2905,9 @@ impl User32Subsystem {
                 match vk {
                     0x09 => {
                         // VK_TAB
-                        let shift = (msg.wparam as u32) & 0x8000_0000 != 0;
+                        // Internal KeyDown messages carry KeyModifiers::to_bits()
+                        // (bits 0-1), not the Win32 0x80000000 bit-31 flag.
+                        let shift = KeyModifiers::from_bits(msg.wparam).shift;
                         // Find next/previous control in dialog
                         let parent = hwnd;
                         let children: Vec<Hwnd> = self
@@ -2767,12 +2936,12 @@ impl User32Subsystem {
                         } else {
                             0
                         };
-                        if let Some(&next_focus) = children.get(next_idx) {
-                            if let Err(e) = self.set_focus(next_focus) {
-                                eprintln!(
-                                    "[User32] def_dlg_proc_w(VK_TAB): set_focus failed for hwnd {next_focus}: {e}"
-                                );
-                            }
+                        if let Some(&next_focus) = children.get(next_idx)
+                            && let Err(e) = self.set_focus(next_focus)
+                        {
+                            eprintln!(
+                                "[User32] def_dlg_proc_w(VK_TAB): set_focus failed for hwnd {next_focus}: {e}"
+                            );
                         }
                         Ok(true)
                     }
@@ -2945,10 +3114,10 @@ impl User32Subsystem {
             .and_then(|queue| queue.front())
             .cloned()
         {
-            if remove {
-                if let Some(queue) = self.thread_message_queues.get_mut(&thread_id) {
-                    queue.pop_front();
-                }
+            if remove
+                && let Some(queue) = self.thread_message_queues.get_mut(&thread_id)
+            {
+                queue.pop_front();
             }
             return Some(message);
         }
@@ -2964,10 +3133,12 @@ impl User32Subsystem {
     }
 
     pub fn get_message_for_thread(&mut self, thread_id: u32) -> Option<Message> {
-        if let Some(queue) = self.thread_message_queues.get_mut(&thread_id) {
-            if let Some(message) = queue.pop_front() {
-                return Some(message);
-            }
+        if let Some(queue) = self
+            .thread_message_queues
+            .get_mut(&thread_id)
+            .filter(|queue| !queue.is_empty())
+        {
+            return queue.pop_front();
         }
         self.message_queue.pop_front()
     }
@@ -3016,26 +3187,35 @@ impl User32Subsystem {
 
     pub fn dispatch_message_w(&mut self, message: &Message) -> AppResult<i64> {
         let result = self.def_window_proc_w(message)?;
-        self.message_log.push(message.clone());
-        if message.kind == MessageKind::NcDestroy {
-            if let Some(hwnd) = message.hwnd {
-                // Clean up the real NSWindow
-                if let Some(window) = self.windows.get(&hwnd) {
-                    if !window.ns_window.is_null() {
-                        mac_window::close_nswindow(window.ns_window);
-                        mac_window::remove_hwnd_nswindow(hwnd);
-                    }
-                }
-                self.windows.remove(&hwnd);
-                self.z_order.retain(|h| *h != hwnd);
-                self.cef_browser_handles.remove(&hwnd);
+        // Keep the message log bounded: long-running guests dispatch many
+        // messages per frame, and an unbounded Vec grows forever.
+        const MESSAGE_LOG_CAP: usize = 4096;
+        if self.message_log.len() == MESSAGE_LOG_CAP {
+            self.message_log.pop_front();
+        }
+        self.message_log.push_back(message.clone());
+        if message.kind == MessageKind::NcDestroy
+            && let Some(hwnd) = message.hwnd
+        {
+            // Destroyed windows are fully cleaned up in destroy_window;
+            // this path only handles NcDestroy queued directly.
+            if let Some(window) = self
+                .windows
+                .get(&hwnd)
+                .filter(|window| !window.ns_window.is_null())
+            {
+                mac_window::close_nswindow(window.ns_window);
+                mac_window::remove_hwnd_nswindow(hwnd);
             }
+            self.windows.remove(&hwnd);
+            self.z_order.retain(|h| *h != hwnd);
+            self.cef_browser_handles.remove(&hwnd);
         }
         Ok(result)
     }
 
-    pub fn message_log(&self) -> &[Message] {
-        &self.message_log
+    pub fn message_log(&mut self) -> &[Message] {
+        self.message_log.make_contiguous()
     }
 
     pub fn resize_window(&mut self, hwnd: Hwnd, width: u32, height: u32) -> AppResult<()> {
@@ -3150,10 +3330,15 @@ impl User32Subsystem {
         self.window(hwnd)?;
         self.z_order.retain(|h| *h != hwnd);
         self.z_order.insert(0, hwnd);
-        // If the window has an owner, bring the owner to top too
+        // If the window has an owner, raise the owner too but keep it BEHIND
+        // the owned window (Win32 raises the owner without covering it).
         if let Some(owner) = self.windows.get(&hwnd).and_then(|w| w.owner) {
             self.z_order.retain(|h| *h != owner);
-            self.z_order.insert(0, owner);
+            if let Some(pos) = self.z_order.iter().position(|h| *h == hwnd) {
+                self.z_order.insert(pos + 1, owner);
+            } else {
+                self.z_order.insert(0, owner);
+            }
         }
         self.foreground = Some(hwnd);
         Ok(())
@@ -3166,13 +3351,13 @@ impl User32Subsystem {
             self.z_order.iter().copied().find(|h| {
                 self.windows
                     .get(h)
-                    .map_or(false, |w| w.parent == Some(parent) && !w.destroyed)
+                    .is_some_and(|w| w.parent == Some(parent) && !w.destroyed)
             })
         } else {
             self.z_order
                 .first()
                 .copied()
-                .filter(|h| !self.windows[h].destroyed)
+                .filter(|h| self.windows.get(h).is_some_and(|w| !w.destroyed))
         }
     }
 
@@ -3185,7 +3370,7 @@ impl User32Subsystem {
                 self.z_order
                     .get(pos + 1)
                     .copied()
-                    .filter(|h| !self.windows[h].destroyed)
+                    .filter(|h| self.windows.get(h).is_some_and(|w| !w.destroyed))
             }
             GW_HWNDPREV => {
                 // GW_HWNDPREV (3): window above in z-order
@@ -3193,7 +3378,7 @@ impl User32Subsystem {
                     self.z_order
                         .get(pos - 1)
                         .copied()
-                        .filter(|h| !self.windows[h].destroyed)
+                        .filter(|h| self.windows.get(h).is_some_and(|w| !w.destroyed))
                 } else {
                     None
                 }
@@ -3210,19 +3395,19 @@ impl User32Subsystem {
                 self.z_order.iter().copied().find(|h| {
                     self.windows
                         .get(h)
-                        .map_or(false, |w| w.parent == Some(hwnd) && !w.destroyed)
+                        .is_some_and(|w| w.parent == Some(hwnd) && !w.destroyed)
                 })
             }
             GW_OWNER => self
                 .windows
                 .get(&hwnd)
                 .and_then(|w| w.owner)
-                .filter(|h| !self.windows[h].destroyed),
+                .filter(|h| self.windows.get(h).is_some_and(|w| !w.destroyed)),
             GW_HWNDNEXT | GW_HWNDPREV => self.get_next_window(hwnd, cmd),
             GW_ENABLEDPOPUP => {
                 // Return the topmost enabled popup owned by hwnd
                 self.z_order.iter().copied().find(|h| {
-                    self.windows.get(h).map_or(false, |w| {
+                    self.windows.get(h).is_some_and(|w| {
                         !w.destroyed
                             && w.enabled
                             && w.owner == Some(hwnd)
@@ -3241,7 +3426,11 @@ impl User32Subsystem {
     }
 
     pub fn get_window_text_length_w(&self, hwnd: Hwnd) -> Option<i32> {
-        self.windows.get(&hwnd).map(|w| w.title.len() as i32)
+        // Win32 GetWindowTextLengthW returns the number of WCHARs, not the
+        // UTF-8 byte length (non-ASCII titles would size buffers wrongly).
+        self.windows
+            .get(&hwnd)
+            .map(|w| w.title.encode_utf16().count() as i32)
     }
 
     // ── Update rectangle management ───────────────────────────────────────────
@@ -3362,8 +3551,13 @@ impl User32Subsystem {
         if let Some(monitor) = self.monitors.get(&monitor_id) {
             (monitor.dpi_x, monitor.dpi_y)
         } else {
-            let primary = self.monitors.values().next().unwrap();
-            (primary.dpi_x, primary.dpi_y)
+            let primary = self
+                .monitors
+                .values()
+                .next()
+                .map(|monitor| (monitor.dpi_x, monitor.dpi_y))
+                .unwrap_or((96, 96));
+            (primary.0, primary.1)
         }
     }
 
@@ -3414,20 +3608,24 @@ impl User32Subsystem {
     ) -> u32 {
         let base_dpi = 96;
         let scale = dpi as f64 / base_dpi as f64;
-        // Approximate frame borders and title bar, scaled by DPI
+        // Approximate frame borders and title bar, scaled by DPI. Use
+        // saturating arithmetic: guest rects can hold extreme coordinates
+        // and plain -= would overflow (panicking in debug builds).
         let border = (4_f64 * scale) as i32;
         let title = (23_f64 * scale) as i32;
-        rect.left -= border;
-        rect.top -= border + title;
-        rect.right += border;
-        rect.bottom += border;
+        rect.left = rect.left.saturating_sub(border);
+        rect.top = rect.top.saturating_sub(border.saturating_add(title));
+        rect.right = rect.right.saturating_add(border);
+        rect.bottom = rect.bottom.saturating_add(border);
         1 // TRUE
     }
 
     /// MonitorFromRect — finds the monitor that has the largest intersection with the given rect.
     pub fn monitor_from_rect(&self, rect: &Rect, flags: u32) -> u32 {
-        let rect_center_x = (rect.left + rect.right) / 2;
-        let rect_center_y = (rect.top + rect.bottom) / 2;
+        // Compute the center in i64: guest-supplied rects can overflow i32
+        // addition (right=INT_MAX, left=INT_MIN).
+        let rect_center_x = ((rect.left as i64 + rect.right as i64) / 2) as i32;
+        let rect_center_y = ((rect.top as i64 + rect.bottom as i64) / 2) as i32;
         for (id, mon) in &self.monitors {
             if rect_center_x >= mon.bounds.left
                 && rect_center_x < mon.bounds.right
@@ -3438,8 +3636,10 @@ impl User32Subsystem {
             }
         }
         match flags {
-            1 => 0, // MONITOR_DEFAULTTONULL
-            _ => self.monitors.values().next().map(|m| m.id).unwrap_or(0),
+            // MONITOR_DEFAULTTONULL = 0
+            0 => 0,
+            // MONITOR_DEFAULTTOPRIMARY = 1, MONITOR_DEFAULTTONEAREST = 2
+            _ => self.primary_monitor_id(),
         }
     }
 
@@ -3456,8 +3656,10 @@ impl User32Subsystem {
             }
         }
         match flags {
-            1 => 0, // MONITOR_DEFAULTTONULL
-            _ => self.monitors.values().next().map(|m| m.id).unwrap_or(0),
+            // MONITOR_DEFAULTTONULL = 0
+            0 => 0,
+            // MONITOR_DEFAULTTOPRIMARY = 1, MONITOR_DEFAULTTONEAREST = 2
+            _ => self.primary_monitor_id(),
         }
     }
 
@@ -3470,13 +3672,21 @@ impl User32Subsystem {
         _callback: u32,
         _context: u32,
     ) -> u32 {
-        // Full guest callback dispatch is done in pe_runtime.rs.
-        // Here we just return TRUE, indicating enumeration can proceed.
+        // NOTE: The guest callback enumeration is performed by pe_runtime
+        // (which has access to guest memory to invoke the callback); this
+        // entry point intentionally returns TRUE so enumeration can proceed.
         1 // TRUE
     }
 
     pub fn primary_monitor_id(&self) -> u32 {
-        self.monitors.keys().next().copied().unwrap_or(0)
+        // Return the monitor flagged as primary (not merely the smallest id:
+        // enumeration order is display-dependent).
+        self.monitors
+            .values()
+            .find(|m| m.is_primary)
+            .map(|m| m.id)
+            .or_else(|| self.monitors.keys().next().copied())
+            .unwrap_or(0)
     }
 
     pub fn monitor_info(&self, monitor_id: u32) -> Option<MonitorInfo> {
@@ -3508,16 +3718,14 @@ impl User32Subsystem {
 
     /// CreateMenu — creates a new menu handle.
     pub fn create_menu(&mut self) -> u32 {
-        let handle = self.next_menu_handle;
-        self.next_menu_handle += 1;
+        let handle = self.alloc_menu_handle();
         self.menu_items.insert(handle, Vec::new());
         handle
     }
 
     /// CreatePopupMenu — creates a new popup (drop-down) menu handle.
     pub fn create_popup_menu(&mut self) -> u32 {
-        let handle = self.next_menu_handle;
-        self.next_menu_handle += 1;
+        let handle = self.alloc_menu_handle();
         self.menu_items.insert(handle, Vec::new());
         handle
     }
@@ -3762,6 +3970,7 @@ impl User32Subsystem {
 
     /// SetScrollInfo — sets the parameters of a scroll bar.
     /// Returns the current scroll position.
+    #[allow(clippy::too_many_arguments)]
     pub fn set_scroll_info(
         &mut self,
         hwnd: Hwnd,
@@ -3857,6 +4066,9 @@ impl User32Subsystem {
     }
 
     /// ScrollWindow — scrolls the contents of a window's client area.
+    /// NOTE: simplified — the scroll rects are ignored and the window is
+    /// invalidated so it repaints at the new position; the guest's BITBLT
+    /// of the scrolled area is not performed (acceptable approximation).
     pub fn scroll_window(
         &mut self,
         hwnd: Hwnd,
@@ -3876,6 +4088,7 @@ impl User32Subsystem {
     }
 
     /// ScrollWindowEx — scrolls the contents of a window's client area with extended options.
+    #[allow(clippy::too_many_arguments)]
     pub fn scroll_window_ex(
         &mut self,
         hwnd: Hwnd,
@@ -3940,6 +4153,11 @@ impl User32Subsystem {
         _blur_region: u32,
         _transition: bool,
     ) -> u32 {
+        // Bail out for unknown/destroyed windows: the stored visual-effect
+        // view pointer may reference a freed view (use-after-free).
+        if self.windows.get(&hwnd).is_none_or(|w| w.destroyed) {
+            return 0x80070057_u32; // E_INVALIDARG
+        }
         // Store the blur state in the DWM attributes
         let attrs = self.dwm_attributes.entry(hwnd).or_default();
         attrs.blur_behind_enabled = enable;
@@ -3983,13 +4201,18 @@ impl User32Subsystem {
                         let _: () = msg_send![content_view, addSubview: ve_view positioned: 0u64 relativeTo: std::ptr::null_mut::<Object>()];
                         // NSWindowBelow = 0
 
-                        self.blur_effect_views.insert(hwnd, ve_view as u64);
+                        self.blur_effect_views
+                            .entry(hwnd)
+                            .or_insert(ve_view as u64);
                     }
                 } else {
-                    // Remove the visual effect view
+                    // Remove the visual effect view, then release the +1 we
+                    // hold from alloc/initWithFrame: (removeFromSuperview
+                    // alone would leak the view on every enable/disable cycle).
                     if let Some(view_ptr) = self.blur_effect_views.remove(&hwnd) {
                         let ve_view = view_ptr as *mut Object;
                         let _: () = msg_send![ve_view, removeFromSuperview];
+                        let _: () = msg_send![ve_view, release];
                     }
                 }
             }
@@ -4024,26 +4247,64 @@ impl User32Subsystem {
     /// Falls back to a default blue (0xCC0000) if NSColor is unavailable.
     pub fn dwm_get_colorization_color(&self) -> (u32, u32) {
         #[cfg(target_os = "macos")]
-        unsafe {
-            use objc::runtime::Object;
-            if let Some(nscolor_cls) = objc::runtime::Class::get("NSColor") {
-                let accent: *mut Object = msg_send![nscolor_cls, controlAccentColor];
-                if !accent.is_null() {
-                    // Convert NSColor to RGBA components
-                    let color_space: *mut Object = msg_send![accent, colorUsingColorSpaceName: "NSCalibratedRGBColorSpace".as_ptr() as *const Object];
-                    if !color_space.is_null() {
+        {
+            unsafe {
+                use objc::runtime::Object;
+                // NSColor accessors return autoreleased objects; without an
+                // enclosing autorelease pool (Rust has none by default) they
+                // leak per call, so create and drain a pool here.
+                let Some(pool_cls) = objc::runtime::Class::get("NSAutoreleasePool") else {
+                    return (0x00_CC_00_00, 0xFF);
+                };
+                let pool: *mut Object = msg_send![pool_cls, new];
+                let color = if let Some(nscolor_cls) = objc::runtime::Class::get("NSColor") {
+                    let accent: *mut Object = msg_send![nscolor_cls, controlAccentColor];
+                    if accent.is_null() {
+                        None
+                    } else {
+                        // Convert to sRGB via the shared NSColorSpace instance
+                        // (a real Objective-C object — never a raw C string
+                        // cast to `id`, which would crash the runtime).
+                        let space_cls = objc::runtime::Class::get("NSColorSpace");
+                        let converted: *mut Object = if let Some(space_cls) = space_cls {
+                            let color_space: *mut Object = msg_send![space_cls, sRGBColorSpace];
+                            if color_space.is_null() {
+                                std::ptr::null_mut()
+                            } else {
+                                msg_send![accent, colorUsingColorSpace: color_space]
+                            }
+                        } else {
+                            std::ptr::null_mut()
+                        };
+                        let color = if converted.is_null() {
+                            accent
+                        } else {
+                            converted
+                        };
                         let mut red: f64 = 0.0;
                         let mut green: f64 = 0.0;
                         let mut blue: f64 = 0.0;
                         let mut alpha: f64 = 0.0;
-                        let _: () = msg_send![color_space, getRed: &mut red green: &mut green blue: &mut blue alpha: &mut alpha];
-                        let r = (red.clamp(0.0, 1.0) * 255.0) as u32;
-                        let g = (green.clamp(0.0, 1.0) * 255.0) as u32;
-                        let b = (blue.clamp(0.0, 1.0) * 255.0) as u32;
-                        let a = (alpha.clamp(0.0, 1.0) * 255.0) as u32;
-                        let color = (b << 16) | (g << 8) | r; // BGR like Windows DWM
-                        return (color, a);
+                        let ok: bool = msg_send![
+                            color,
+                            getRed: &mut red green: &mut green blue: &mut blue alpha: &mut alpha
+                        ];
+                        if ok {
+                            let r = (red.clamp(0.0, 1.0) * 255.0) as u32;
+                            let g = (green.clamp(0.0, 1.0) * 255.0) as u32;
+                            let b = (blue.clamp(0.0, 1.0) * 255.0) as u32;
+                            let a = (alpha.clamp(0.0, 1.0) * 255.0) as u32;
+                            Some(((b << 16) | (g << 8) | r, a)) // BGR like Windows DWM
+                        } else {
+                            None
+                        }
                     }
+                } else {
+                    None
+                };
+                let _: () = msg_send![pool, drain];
+                if let Some((color, alpha)) = color {
+                    return (color, alpha);
                 }
             }
         }
@@ -4072,6 +4333,9 @@ impl User32Subsystem {
                 // value encodes a RECT (left, top, right, bottom) packed into u32s
                 // In practice this is stored via the attribute pointer mechanism in pe_runtime
                 // We store it as a boolean flag that bounds were set
+                // NOTE: The RECT payload is written to guest memory by pe_runtime's
+                // DwmSetWindowAttribute pointer path; this arm intentionally stores
+                // nothing beyond accepting the attribute (S_OK).
             }
             DWMWA_NONCLIENT_RTL_LAYOUT => {
                 attrs.nonclient_rtl_layout = value != 0;
@@ -4254,8 +4518,10 @@ impl User32Subsystem {
     /// DrawAnimatedRects — approximates the minimize/restore transition by
     /// applying the target rect to the window and forcing a refresh.
     pub fn draw_animated_rects(&mut self, hwnd: Hwnd, rect_from: &Rect, rect_to: &Rect) -> bool {
-        let target_width = (rect_to.right - rect_to.left).max(0) as u32;
-        let target_height = (rect_to.bottom - rect_to.top).max(0) as u32;
+        // Guest rects are untrusted: right - left can overflow i32 for
+        // extreme coordinates, so compute widths in i64.
+        let target_width = (rect_to.right as i64 - rect_to.left as i64).max(0) as u32;
+        let target_height = (rect_to.bottom as i64 - rect_to.top as i64).max(0) as u32;
         if target_width == 0 || target_height == 0 {
             return false;
         }
@@ -4269,8 +4535,8 @@ impl User32Subsystem {
                 let ns_window = window.ns_window;
                 let visible = window.visible;
                 if visible && !ns_window.is_null() {
-                    let source_width = (rect_from.right - rect_from.left).max(0) as u32;
-                    let source_height = (rect_from.bottom - rect_from.top).max(0) as u32;
+                    let source_width = (rect_from.right as i64 - rect_from.left as i64).max(0) as u32;
+                    let source_height = (rect_from.bottom as i64 - rect_from.top as i64).max(0) as u32;
                     if source_width > 0 && source_height > 0 {
                         mac_window::set_nswindow_frame(
                             ns_window,
@@ -4484,7 +4750,12 @@ impl User32Subsystem {
             return Ok(Vec::new());
         }
         let repeat_window_ms = held_ms - self.key_repeat.delay_ms;
-        let count = (repeat_window_ms as u64 * self.key_repeat.rate_hz as u64 / 1000) as usize;
+        // Bound the generated repeat count: held_ms is guest/timing
+        // controlled, and an unbounded count (e.g. held_ms = u32::MAX at
+        // 31 Hz ≈ 133M messages) would OOM the process.
+        const MAX_REPEATS: usize = 64;
+        let count = ((repeat_window_ms as u64 * self.key_repeat.rate_hz as u64 / 1000) as usize)
+            .min(MAX_REPEATS);
         Ok((0..count)
             .map(|_| Message {
                 hwnd: Some(hwnd),
@@ -4558,7 +4829,7 @@ impl User32Subsystem {
 
         // ── Update key state tracking ──────────────────────────────────
         let is_down = matches!(kind, MessageKind::KeyDown);
-        self.update_key_state_for_scancode(scancode as u8, is_down);
+        self.update_key_state_for_scancode(scancode, is_down);
         if modifiers.shift {
             self.update_single_key_state(VK_SHIFT as u8, is_down);
             self.update_single_key_state(VK_LSHIFT as u8, is_down);
@@ -4579,7 +4850,7 @@ impl User32Subsystem {
     }
 
     /// Update key_state for a given scancode (maps scancode → VK internally).
-    fn update_key_state_for_scancode(&mut self, scancode: u8, down: bool) {
+    fn update_key_state_for_scancode(&mut self, scancode: u16, down: bool) {
         let vk = self.scancode_to_vk_code(scancode);
         if vk < 256 {
             self.update_single_key_state(vk as u8, down);
@@ -4603,25 +4874,26 @@ impl User32Subsystem {
     }
 
     /// Convert a scancode to its Windows VK code using the current layout.
-    fn scancode_to_vk_code(&self, scancode: u8) -> u32 {
-        // Determine if extended (E0-prefixed)
-        if scancode & 0x80 != 0 {
-            let idx = (scancode & 0x7F) as usize;
-            if idx < 128 && SCANCODE_TO_VK_US_EXT[idx] != 0 {
-                return SCANCODE_TO_VK_US_EXT[idx] as u32;
-            }
-        }
-        let idx = scancode as usize;
-        if idx < 128 {
-            let vk = SCANCODE_TO_VK_US[idx];
+    /// Extended keys arrive either E0-prefixed (0xE0xx, high byte 0xE0) or
+    /// with the 0x80 extended-bit convention on the low byte; carrying the
+    /// full u16 through avoids truncating the extended flag to u8.
+    fn scancode_to_vk_code(&self, scancode: u16) -> u32 {
+        let extended = scancode >= 0x100 || (scancode & 0x80) != 0;
+        let low = (scancode & 0xFF) as usize;
+        if extended {
+            let vk = SCANCODE_TO_VK_US_EXT.get(low).copied().unwrap_or(0);
             if vk != 0 {
                 return vk as u32;
             }
         }
+        let vk = SCANCODE_TO_VK_US.get(low).copied().unwrap_or(0);
+        if vk != 0 {
+            return vk as u32;
+        }
         // Fallback: try the layout table
         if let Some(entry) = layout_tables()
             .get(&self.layout)
-            .and_then(|table| table.get(&(scancode as u16)))
+            .and_then(|table| table.get(&(low as u16)))
         {
             return virtual_key_to_win32_vk(&entry.vk);
         }
@@ -4647,15 +4919,16 @@ impl User32Subsystem {
 
     /// Get a character for a VK code under the current layout (lowercase / unshifted).
     fn vk_code_to_char(&self, vk: u32) -> Option<char> {
-        // Search the layout tables for a matching VK with a plain (unshifted) char
-        for table in layout_tables().values() {
-            for entry in table.values() {
-                if virtual_key_to_win32_vk(&entry.vk) == vk {
-                    return entry.plain;
-                }
-            }
-        }
-        None
+        // Search only the ACTIVE layout: iterating every layout can return a
+        // character from a non-active layout for multi-layout guests.
+        layout_tables()
+            .get(&self.layout)
+            .and_then(|table| {
+                table
+                    .values()
+                    .find(|entry| virtual_key_to_win32_vk(&entry.vk) == vk)
+                    .and_then(|entry| entry.plain)
+            })
     }
 
     /// Query modifier key state from macOS CoreGraphics (modifier keys only).
@@ -4664,10 +4937,10 @@ impl User32Subsystem {
         // Use CGEventSourceFlagsState to check physical modifier key state
         let flags = unsafe { CGEventSourceFlagsState(kCGEventSourceStateCombinedSessionState) };
         match vk as i32 {
-            VK_SHIFT | VK_LSHIFT | VK_RSHIFT => (flags & kCGEventFlagMaskShift as u64) != 0,
-            VK_CONTROL | VK_LCONTROL | VK_RCONTROL => (flags & kCGEventFlagMaskControl as u64) != 0,
-            VK_MENU | VK_LMENU | VK_RMENU => (flags & kCGEventFlagMaskAlternate as u64) != 0,
-            VK_LWIN | VK_RWIN => (flags & kCGEventFlagMaskCommand as u64) != 0,
+            VK_SHIFT | VK_LSHIFT | VK_RSHIFT => (flags & kCGEventFlagMaskShift) != 0,
+            VK_CONTROL | VK_LCONTROL | VK_RCONTROL => (flags & kCGEventFlagMaskControl) != 0,
+            VK_MENU | VK_LMENU | VK_RMENU => (flags & kCGEventFlagMaskAlternate) != 0,
+            VK_LWIN | VK_RWIN => (flags & kCGEventFlagMaskCommand) != 0,
             _ => false,
         }
     }
@@ -4719,9 +4992,7 @@ impl User32Subsystem {
         // For modifier keys on macOS, query CGEventSource for real state
         #[cfg(target_os = "macos")]
         {
-            if self.query_modifier_key_state(v_key as u32) {
-                result |= 0x8000u16 as i16;
-            } else if self.key_state[vk] & 0x80 != 0 {
+            if self.query_modifier_key_state(v_key as u32) || self.key_state[vk] & 0x80 != 0 {
                 result |= 0x8000u16 as i16;
             }
         }
@@ -4772,23 +5043,26 @@ impl User32Subsystem {
                     .unwrap_or(0)
             }
             MAPVK_VSC_TO_VK => {
-                // scancode → VK
-                self.scancode_to_vk_code(code as u8)
+                // scancode → VK (extended keys arrive E0-prefixed or with
+                // the 0x80 convention; keep the full value, not `as u8`)
+                self.scancode_to_vk_code(code as u16)
             }
             MAPVK_VK_TO_CHAR => {
                 // VK → lowercase character
                 self.vk_code_to_char(code).map(|c| c as u32).unwrap_or(0)
             }
             MAPVK_VSC_TO_VK_EX => {
-                // Extended scancode → VK
-                let scancode = (code as u8) | 0x80; // Mark as extended
-                self.scancode_to_vk_code(scancode)
+                // Extended scancode → VK. Try the plain mapping first (only
+                // E0-prefixed values mark extended) — forcing 0x80 on every
+                // scancode made ordinary keys (e.g. 0x1E) return 0.
+                self.scancode_to_vk_code(code as u16)
             }
             MAPVK_VK_TO_VSC_EX => {
-                // VK → extended scancode
+                // VK → extended scancode, E0-prefixed convention (0xE0<<8|sc),
+                // decoded symmetrically by MAPVK_VSC_TO_VK_EX above.
                 self.vk_code_to_scancode(code)
                     .filter(|sc| *sc & 0x80 != 0)
-                    .map(|sc| (sc & 0x7F) as u32)
+                    .map(|sc| 0xE0 << 8 | (sc & 0x7F) as u32)
                     .unwrap_or(0)
             }
             _ => 0,
@@ -4798,8 +5072,9 @@ impl User32Subsystem {
     // ── VkKeyScanW ──────────────────────────────────────────────────────
     /// Translates a character to the corresponding virtual-key code and
     /// shift state. Returns a SHORT where:
-    ///   - Low byte  = virtual-key code (scancode)
+    ///   - Low byte  = virtual-key code (NOT the scancode)
     ///   - High byte = shift state (bit 0 = shift, bit 1 = ctrl, bit 2 = alt)
+    ///
     /// Returns -1 if no character value can be found.
     pub fn vk_key_scan_w(&self, ch: u16) -> i16 {
         let ch_char = char::from_u32(ch as u32).unwrap_or('\0');
@@ -4808,15 +5083,17 @@ impl User32Subsystem {
             Some(t) => t,
             None => return -1,
         };
-        for (scancode, entry) in table.iter() {
+        for entry in table.values() {
             if entry.plain == Some(ch_char) {
-                return *scancode as i16; // no shift
+                // VkKeyScanW returns the VIRTUAL-KEY code in the low byte
+                // (e.g. VK_Q = 0x51), not the scancode (0x10).
+                return virtual_key_to_win32_vk(&entry.vk) as i16; // no shift
             }
             if entry.shifted == Some(ch_char) {
-                return *scancode as i16 | 0x0100; // shift pressed
+                return virtual_key_to_win32_vk(&entry.vk) as i16 | 0x0100; // shift pressed
             }
             if entry.altgr == Some(ch_char) {
-                return *scancode as i16 | 0x0200; // altgr/ctrl+alt pressed
+                return virtual_key_to_win32_vk(&entry.vk) as i16 | 0x0200; // altgr/ctrl+alt pressed
             }
         }
         -1
@@ -4825,6 +5102,10 @@ impl User32Subsystem {
     // ── SetWindowsHookExW / CallNextHookEx ─────────────────────────────
     /// Installs a hook procedure into the hook chain.
     /// Returns the hook handle (id) on success, or 0 on failure.
+    ///
+    /// NOTE: hook callbacks are recorded here but guest hook invocation is
+    /// not yet wired into message dispatch (that requires guest callback
+    /// execution from pe_runtime); CallNextHookEx therefore returns 0.
     pub fn set_windows_hook_ex_w(
         &mut self,
         hook_type: i32,
@@ -4832,8 +5113,13 @@ impl User32Subsystem {
         module: u64,
         thread_id: u32,
     ) -> i32 {
-        let id = self.next_hook_id;
-        self.next_hook_id += 1;
+        if !(0..=WH_MOUSE_LL).contains(&hook_type) {
+            return 0;
+        }
+        if callback == 0 {
+            return 0;
+        }
+        let id = self.alloc_hook_id();
         self.hooks.insert(
             id,
             HookInfo {
@@ -4847,9 +5133,31 @@ impl User32Subsystem {
         id
     }
 
+    fn alloc_hook_id(&mut self) -> i32 {
+        let start = self.next_hook_id;
+        loop {
+            let id = self.next_hook_id;
+            self.next_hook_id = self.next_hook_id.wrapping_add(1);
+            if id != 0 && !self.hooks.contains_key(&id) {
+                return id;
+            }
+            if self.next_hook_id == start {
+                break;
+            }
+        }
+        // Table exhausted: fall back to the next value (unreachable in practice).
+        let id = self.next_hook_id;
+        self.next_hook_id = self.next_hook_id.wrapping_add(1);
+        id
+    }
+
     /// Passes the hook information to the next hook procedure in the
     /// current hook chain. Returns the value returned by the next hook,
     /// or 0 if no next hook exists.
+    ///
+    /// NOTE: hook chains are recorded (see [`set_windows_hook_ex_w`]) but
+    /// guest hook invocation is not wired into message dispatch yet, so
+    /// this returns 0 — the documented empty-chain result.
     pub fn call_next_hook_ex(
         &self,
         _id: i32,
@@ -4857,8 +5165,6 @@ impl User32Subsystem {
         _wparam: usize,
         _lparam: isize,
     ) -> usize {
-        // Simplified: return 0 to indicate no further processing needed.
-        // In a full implementation this would chain to the next hook.
         0
     }
 
@@ -4867,6 +5173,7 @@ impl User32Subsystem {
         self.hooks.remove(&id).is_some()
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn inject_mouse_input(
         &mut self,
         hwnd: Hwnd,
@@ -4889,6 +5196,7 @@ impl User32Subsystem {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn inject_mouse_input_internal(
         &mut self,
         hwnd: Hwnd,
@@ -5068,8 +5376,13 @@ impl User32Subsystem {
         Ok(())
     }
 
-    pub fn xinput_get_state(&self, slot: u8) -> AppResult<XInputState> {
-        let controller = self.controller_by_xinput_slot(slot)?;
+    pub fn xinput_get_state(&mut self, slot: u8) -> AppResult<XInputState> {
+        let guid = self.controller_guid_by_xinput_slot(slot)?;
+        let controller = self.controller_mut(&guid)?;
+        // Bump the packet number on each read: guests poll XInputGetState to
+        // detect state changes, and a packet number that only changes on
+        // rumble writes would never signal fresh button/axis data.
+        controller.packet_number = controller.packet_number.wrapping_add(1);
         Ok(XInputState {
             packet_number: controller.packet_number,
             buttons: controller.spec.buttons.clone(),
@@ -5225,6 +5538,16 @@ impl User32Subsystem {
                 format!("{effect:?} force feedback is unsupported for {guid}"),
             ));
         }
+        // Apply the effect: map the DirectInput magnitude (0–10000) to motor
+        // intensities so the effect actually reaches the controller instead
+        // of being validated and dropped.
+        let controller = self.controller_mut(guid)?;
+        let intensity = (magnitude.clamp(0, 10_000) as u32 * 65_535 / 10_000) as u16;
+        controller.rumble = RumbleState {
+            left_motor: intensity,
+            right_motor: intensity,
+        };
+        controller.packet_number = controller.packet_number.wrapping_add(1);
         Ok(ForceFeedbackPlan {
             effect,
             magnitude,
@@ -5276,13 +5599,22 @@ impl User32Subsystem {
     /// Return the number of bytes needed for a RAWINPUT structure matching
     /// the given command (RID_HEADER, RID_INPUT, or RID_DEVICE_INFO).
     pub fn raw_input_data_size(&self, command: u32) -> AppResult<u32> {
+        // Real Win32 constants (winuser.h):
+        //   RID_INPUT = 0x10000003, RID_DEVICE_INFO = 0x10000004,
+        //   RID_HEADER = 0x10000005.
+        // The previous 0x10000001/0x10000002 values matched nothing, so any
+        // guest passing the real constants got the wrong size. The legacy
+        // values are still accepted defensively.
         match command {
             // RID_HEADER → sizeof(RAWINPUTHEADER) = 24 (x64) / 20 (x86)
-            0x10000001 => Ok(24),
-            // RID_INPUT → sizeof(RAWINPUT) = 40+ for mouse/keyboard/HID
-            0x10000002 => Ok(48),
+            0x10000005 | 0x10000001 => Ok(24),
+            // RID_INPUT → sizeof(RAWINPUT): 48 for mouse, 40 for keyboard,
+            // 36 + report length for HID. The device type is not known from
+            // the command alone, so return the largest fixed size (mouse);
+            // HID callers must size from their report length.
+            0x10000003 | 0x10000002 => Ok(48),
             // RID_DEVICE_INFO → sizeof(RID_DEVICE_INFO) = 24
-            0x10000003 => Ok(24),
+            0x10000004 => Ok(24),
             _ => Err(AppError::new(
                 crate::reason::ReasonCode::RcInputUnsupported,
                 format!("unknown raw input command {command:#x}"),
@@ -5298,11 +5630,16 @@ impl User32Subsystem {
     /// Copy registered raw input devices into the output slice, returning the
     /// number written (or the required count if output is too small).
     pub fn get_registered_raw_input_devices(&self, output: &mut [RawInputRegistration]) -> usize {
-        let count = output.len().min(self.raw_input_devices.len());
-        for (i, dev) in self.raw_input_devices.iter().enumerate().take(count) {
+        let total = self.raw_input_devices.len();
+        if output.len() < total {
+            // Win32 two-pass pattern: call once to learn the required count,
+            // allocate, call again.
+            return total;
+        }
+        for (i, dev) in self.raw_input_devices.iter().enumerate() {
             output[i] = dev.clone();
         }
-        count
+        total
     }
 
     /// Return the number of bytes needed for a RID_DEVICE_INFO structure for
@@ -5469,7 +5806,7 @@ impl User32Subsystem {
             DpiAwarenessContext::Unaware => 96,
             DpiAwarenessContext::SystemAware => self
                 .monitors
-                .get(&1)
+                .get(&self.primary_monitor_id())
                 .map(|primary| primary.dpi_x)
                 .unwrap_or(96),
             DpiAwarenessContext::PerMonitorAware => monitor.dpi_x,
@@ -5655,7 +5992,44 @@ impl User32Subsystem {
         }
 
         for controller in removed {
-            self.remove_controller(self.foreground, &controller.identifier)?;
+            // add_controller derives the storage guid from
+            // deterministic_guid(vendor, product, serial, name, kind) — the
+            // raw HID identifier is NOT the guid. Reproduce the guid here,
+            // falling back to a serial match for controllers registered
+            // through a different path, so disconnected controllers actually
+            // get removed instead of erroring out of the hotplug poll.
+            let kind = if controller.xinput_capable {
+                ControllerKind::Xbox
+            } else {
+                ControllerKind::ThirdPartyXInput
+            };
+            let guid = util::deterministic_guid(
+                &format!(
+                    "{:04x}:{:04x}:{}:{}:{:?}",
+                    controller.vendor_id,
+                    controller.product_id,
+                    controller.identifier,
+                    controller.name,
+                    kind
+                ),
+                true,
+            );
+            if self.remove_controller(self.foreground, &guid).is_err() {
+                let fallback = self
+                    .controllers
+                    .iter()
+                    .find(|(_, c)| c.spec.serial == controller.identifier)
+                    .map(|(guid, _)| guid.clone());
+                match fallback {
+                    Some(guid) => {
+                        let _ = self.remove_controller(self.foreground, &guid);
+                    }
+                    None => eprintln!(
+                        "[User32] poll_controller_hotplug: no registered controller matches removed device '{}'",
+                        controller.identifier
+                    ),
+                }
+            }
         }
 
         Ok(())
@@ -5708,14 +6082,9 @@ impl User32Subsystem {
 
     /// Store touch inputs under a handle for later retrieval by GetTouchInputInfo.
     /// Returns the handle that was allocated.
-    pub fn store_touch_inputs(&mut self, hwnd: u32, inputs: Vec<TouchInput>) -> u32 {
-        let handle = self.touch_state.next_touch_handle;
-        self.touch_state.next_touch_handle += 1;
+    pub fn store_touch_inputs(&mut self, _hwnd: u32, inputs: Vec<TouchInput>) -> u32 {
+        let handle = self.alloc_touch_handle();
         self.touch_state.touch_handles.insert(handle, inputs);
-        // Also store as pending
-        for input in &self.touch_state.touch_handles[&handle] {
-            self.touch_state.touch_inputs.push((hwnd, *input));
-        }
         handle
     }
 
@@ -5736,9 +6105,6 @@ impl User32Subsystem {
     /// Close a touch input handle (CloseTouchInputHandle).
     pub fn close_touch_input_handle(&mut self, handle: u32) -> AppResult<()> {
         self.touch_state.touch_handles.remove(&handle);
-        self.touch_state
-            .touch_inputs
-            .retain(|(_, ti)| ti.id != handle);
         Ok(())
     }
 
@@ -5821,7 +6187,7 @@ impl User32Subsystem {
     /// Returns touch capabilities for a simulated touch device.
     pub fn get_pointer_device_caps(&self) -> PointerDeviceCaps {
         PointerDeviceCaps {
-            monitor: 1,               // primary monitor
+            monitor: self.primary_monitor_id(),
             supports_display_time: 1, // supports display time
             pointer_device_type: 1,   // touch
             max_contacts: 10,         // 10 simultaneous contacts
@@ -5837,17 +6203,21 @@ impl User32Subsystem {
             right: 1920,
             bottom: 1080,
         };
-        let primary = self.monitors.get(&1).cloned().unwrap_or(MonitorInfo {
-            id: 1,
-            name: "Primary".to_string(),
-            dpi_x: 96,
-            dpi_y: 96,
-            bounds: default_bounds,
-            work_rect: default_bounds,
-            is_primary: true,
-        });
-        let w = primary.bounds.right - primary.bounds.left;
-        let h = primary.bounds.bottom - primary.bounds.top;
+        let primary = self
+            .monitors
+            .get(&self.primary_monitor_id())
+            .cloned()
+            .unwrap_or(MonitorInfo {
+                id: self.primary_monitor_id(),
+                name: "Primary".to_string(),
+                dpi_x: 96,
+                dpi_y: 96,
+                bounds: default_bounds,
+                work_rect: default_bounds,
+                is_primary: true,
+            });
+        let w = (primary.bounds.right as i64 - primary.bounds.left as i64).clamp(0, i32::MAX as i64) as i32;
+        let h = (primary.bounds.bottom as i64 - primary.bounds.top as i64).clamp(0, i32::MAX as i64) as i32;
         let display_rect = PointerDeviceRect {
             left: 0,
             top: 0,
@@ -5869,7 +6239,7 @@ impl User32Subsystem {
         let info = PointerFrameInfo {
             current_pointer_count: self.touch_state.pointer_infos.len() as u32,
             pointers_in_frame: self.touch_state.pointer_infos.len() as u32,
-            frame_id: 1,
+            frame_id: self.touch_state.next_frame_id,
             pointer_flags: 0,
             display_time: 0,
             performance_count: 0,
@@ -5886,6 +6256,9 @@ impl User32Subsystem {
         target_hwnd: u32,
         touch_points: &[TouchPoint],
     ) -> AppResult<()> {
+        // Bump the frame counter once per dispatched touch frame.
+        self.touch_state.next_frame_id = self.touch_state.next_frame_id.wrapping_add(1);
+        let frame_id = self.touch_state.next_frame_id;
         let mut touch_inputs: Vec<TouchInput> = Vec::new();
         for tp in touch_points {
             let flags = match tp.phase {
@@ -5900,18 +6273,22 @@ impl User32Subsystem {
             // Convert f64 coordinates to i32 (in hundredths of a pixel, per TouchInput spec)
             let x = (tp.x * 100.0) as i32;
             let y = (tp.y * 100.0) as i32;
-            let _pressure = (tp.pressure.min(1.0).max(0.0) * 1024.0) as u32;
+            // Win32 TOUCHINPUT has no pressure field: scale the reported
+            // contact area by pressure instead of claiming TOUCHINPUTMASKF_PRESSURE.
+            let pressure = (tp.pressure.clamp(0.0, 1.0) * 1024.0) as u32;
+            let contact = 10u32.saturating_add(pressure / 128);
             touch_inputs.push(TouchInput {
                 x,
                 y,
                 source,
                 id: tp.id,
                 flags,
-                mask: TOUCHINPUTMASKF_PRESSURE | TOUCHINPUTMASKF_CONTACTAREA,
+                mask: TOUCHINPUTMASKF_CONTACTAREA,
                 time: 0,
+                pad: 0,
                 extra_info: 0,
-                cx: 10, // default contact area
-                cy: 10,
+                cx: contact, // contact area grows with pressure
+                cy: contact,
             });
             // Also store PointerInfo for WM_POINTER dispatch
             let pointer_flags = POINTER_FLAG_INRANGE
@@ -5924,7 +6301,7 @@ impl User32Subsystem {
             let pointer_info = PointerInfo {
                 pointer_type: if tp.is_pen { 2 } else { 1 },
                 pointer_id: tp.id,
-                frame_id: 0,
+                frame_id,
                 pointer_flags,
                 source_device: 0,
                 hwnd_target: target_hwnd as isize,
@@ -6260,8 +6637,9 @@ mod tests {
             source: 1,
             id: 42,
             flags: TOUCHEVENTF_DOWN | TOUCHEVENTF_INRANGE | TOUCHEVENTF_PRIMARY,
-            mask: TOUCHINPUTMASKF_PRESSURE,
+            mask: TOUCHINPUTMASKF_CONTACTAREA,
             time: 0,
+            pad: 0,
             extra_info: 0,
             cx: 10,
             cy: 10,
@@ -6297,6 +6675,7 @@ mod tests {
             flags: TOUCHEVENTF_DOWN,
             mask: 0,
             time: 0,
+            pad: 0,
             extra_info: 0,
             cx: 10,
             cy: 10,
@@ -6313,9 +6692,15 @@ mod tests {
 
     #[test]
     fn touch_input_struct_size() {
-        // With #[repr(C, packed)], TouchInput has no padding.
-        // Fields: x(4) + y(4) + source(4) + id(4) + flags(4) + mask(4) + time(4) + extra_info(8) + cx(4) + cy(4) = 44
-        assert_eq!(std::mem::size_of::<TouchInput>(), 44);
+        // Win32 TOUCHINPUT: 48 bytes on x64 (dwExtraInfo aligned at 32),
+        // 44 on x86. The packed 44-byte layout was wrong on x64 and read
+        // dwExtraInfo unaligned (UB).
+        let expected = if cfg!(target_pointer_width = "64") {
+            48
+        } else {
+            44
+        };
+        assert_eq!(std::mem::size_of::<TouchInput>(), expected);
     }
 
     #[test]
@@ -6680,14 +7065,14 @@ mod tests {
     fn test_vk_key_scan() {
         let user32 = User32Subsystem::new(KeyboardLayoutId::Us);
 
-        // 'q' (0x71) → scancode 0x10, no shift
+        // 'q' → VK_Q (0x51), no shift
         let result = user32.vk_key_scan_w('q' as u16);
-        assert_eq!(result & 0x00FF, 0x10, "'q' should map to scancode 0x10");
+        assert_eq!(result & 0x00FF, 0x51, "'q' should map to VK_Q (0x51)");
         assert_eq!(result >> 8, 0, "'q' should not require shift");
 
-        // 'Q' → scancode 0x10, shift bit set
+        // 'Q' → VK_Q (0x51), shift bit set
         let result = user32.vk_key_scan_w('Q' as u16);
-        assert_eq!(result & 0x00FF, 0x10, "'Q' should map to scancode 0x10");
+        assert_eq!(result & 0x00FF, 0x51, "'Q' should map to VK_Q (0x51)");
         assert_ne!(result >> 8 & 0x01, 0, "'Q' should require shift");
 
         // Unknown character → -1
@@ -6819,6 +7204,24 @@ mod tests {
             "long timer should not expire immediately"
         );
         assert_eq!(user32.timer_count(), 1, "timer should still be active");
+    }
+
+    #[test]
+    fn test_poll_timers_rearms_periodic_timer() {
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        // Positive intervals are periodic: after firing, the timer is
+        // re-armed (Win32 SetTimer semantics) until KillTimer.
+        user32.set_timer(1, 7, 1);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let fired = user32.poll_timers();
+        assert!(fired.contains(&(1, 7)), "periodic timer should fire");
+        assert_eq!(
+            user32.timer_count(),
+            1,
+            "periodic timer should be re-armed after firing"
+        );
+        assert!(user32.kill_timer(1, 7), "kill_timer should succeed");
+        assert_eq!(user32.timer_count(), 0, "timer removed after kill");
     }
 
     // ── MessageQueue QS_* flag tests ────────────────────────────────────────
@@ -7229,9 +7632,8 @@ mod tests {
         let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
         let result = user32.update_window(999);
         assert!(result.is_ok(), "update_window should not fail");
-        assert_eq!(
-            result.unwrap(),
-            false,
+        assert!(
+            !result.unwrap(),
             "update_window for non-existent hwnd should return false"
         );
     }
@@ -7248,9 +7650,8 @@ mod tests {
 
         let result = user32.update_window(hwnd);
         assert!(result.is_ok(), "update_window should succeed");
-        assert_eq!(
+        assert!(
             result.unwrap(),
-            true,
             "update_window for existing hwnd should return true"
         );
 
@@ -7580,7 +7981,16 @@ fn virtual_key_to_win32_vk(vk: &VirtualKey) -> u32 {
     }
 }
 
-fn layout_tables() -> BTreeMap<KeyboardLayoutId, BTreeMap<u16, LayoutEntry>> {
+/// Keyboard layout tables, built once. The previous version rebuilt the
+/// entire map (8 layouts × entries, with allocations) on every keystroke —
+/// a hot-path allocation hazard on every translate/map call.
+fn layout_tables() -> &'static BTreeMap<KeyboardLayoutId, BTreeMap<u16, LayoutEntry>> {
+    static TABLES: OnceLock<BTreeMap<KeyboardLayoutId, BTreeMap<u16, LayoutEntry>>> =
+        OnceLock::new();
+    TABLES.get_or_init(build_layout_tables)
+}
+
+fn build_layout_tables() -> BTreeMap<KeyboardLayoutId, BTreeMap<u16, LayoutEntry>> {
     BTreeMap::from([
         (
             KeyboardLayoutId::Us,
@@ -7988,9 +8398,11 @@ pub enum GdiplusStatus {
     FontStyleNotFound = 15,
     NotTrueTypeFont = 16,
     UnsupportedGdiplusVersion = 17,
-    PropertyNotFound = 19,
-    PropertyNotSupported = 20,
-    ProfileNotFound = 21,
+    // Discriminants per GdiplusTypes.h: PropertyNotFound = 18,
+    // PropertyNotSupported = 19, ProfileNotFound = 20 (previously off by one).
+    PropertyNotFound = 18,
+    PropertyNotSupported = 19,
+    ProfileNotFound = 20,
 }
 
 impl GdiplusStatus {
@@ -8399,12 +8811,17 @@ pub enum GdiplusObject {
 }
 
 /// GDI+ startup input structure.
+/// Matches the Win32 GdiplusStartupInput layout: the two BOOL flags sit at
+/// offsets 16 and 20 (size 24). Rust `bool` is 1 byte, so an explicit pad
+/// keeps `suppress_external_codecs` at offset 20 (it was at 17, misaligning
+/// any guest ABI marshalling of the struct).
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
 pub struct GdiplusStartupInput {
     pub gdiplus_version: u32,
     pub debug_event_callback: u64,
     pub suppress_background_thread: bool,
+    pub pad: [u8; 3],
     pub suppress_external_codecs: bool,
 }
 
@@ -8414,6 +8831,7 @@ impl Default for GdiplusStartupInput {
             gdiplus_version: 1,
             debug_event_callback: 0,
             suppress_background_thread: false,
+            pad: [0; 3],
             suppress_external_codecs: false,
         }
     }
@@ -8447,8 +8865,19 @@ impl Default for GdiplusState {
 
 impl GdiplusState {
     pub fn alloc_handle(&mut self, obj: GdiplusObject) -> u64 {
-        let handle = self.next_handle;
-        self.next_handle = self.next_handle.wrapping_add(1);
+        // Probe for a free handle: a wrapping counter could otherwise
+        // collide with a live object, aliasing two GDI+ objects.
+        let start = self.next_handle;
+        let handle = loop {
+            let candidate = self.next_handle;
+            self.next_handle = self.next_handle.wrapping_add(1);
+            if !self.objects.contains_key(&candidate) {
+                break candidate;
+            }
+            if self.next_handle == start {
+                break candidate; // table exhausted (unreachable in practice)
+            }
+        };
         self.objects.insert(handle, obj);
         handle
     }
@@ -8620,7 +9049,9 @@ impl RawInputData {
         Self {
             header: RawInputHeader {
                 dw_type: 2, // RIM_TYPEHID
-                dw_size: 32 + report.len() as u32,
+                // Serialized layout: 24-byte RAWINPUTHEADER + 12-byte RAWHID
+                // (dwSizeHid + dwCount) + raw data = 36 + len.
+                dw_size: 36 + report.len() as u32,
                 h_device: device,
                 w_param: hwnd,
             },
@@ -8810,7 +9241,7 @@ impl User32Subsystem {
                 vendor_id: 0x05AC,  // Apple vendor ID
                 version: 1,
                 pointer_device_type: 1, // touch
-                monitor: 1,
+                monitor: self.primary_monitor_id(),
                 max_contacts: 10,
                 supports_pressure: true,
                 supports_tilt: false,
