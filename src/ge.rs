@@ -6,13 +6,13 @@ use crate::util;
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::fs::OpenOptions;
 use std::os::fd::AsRawFd;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ValueEnum)]
@@ -416,7 +416,7 @@ impl RegistryWatcher {
             return Ok(true); // correct: sequence already advanced, change detected
         }
 
-        let (updated_sequence, wait_result) = self
+        let (updated_sequence, _wait_result) = self
             .inner
             .condvar
             .wait_timeout(sequence, timeout)
@@ -425,8 +425,6 @@ impl RegistryWatcher {
         if *sequence > self.observed_sequence {
             self.observed_sequence = *sequence;
             Ok(true)
-        } else if wait_result.timed_out() {
-            Ok(false)
         } else {
             Ok(false)
         }
@@ -501,7 +499,7 @@ impl GameEnvironment {
         };
         let ge = Self { root, config };
         ge.ensure_layout()?;
-        ge.write_config()?;
+        ge.save_config()?;
         Ok(ge)
     }
 
@@ -554,6 +552,42 @@ impl GameEnvironment {
     }
 
     pub fn save_config(&self) -> AppResult<()> {
+        // Explicit persistence point (CLI, win32 layer): always force a full
+        // flush, even if a throttled write already cleared the dirty flag.
+        config_flush_states()
+            .entry(self.root.clone())
+            .or_default()
+            .dirty = true;
+        self.write_config()
+    }
+
+    /// Marks the in-memory config as changed; the actual `ge.json` rewrite is
+    /// deferred to the next `flush_config_if_due` / `save_config` call.
+    fn mark_config_dirty(&self) {
+        config_flush_states()
+            .entry(self.root.clone())
+            .or_default()
+            .dirty = true;
+    }
+
+    /// Flushes pending config changes, but at most once per
+    /// [`CONFIG_FLUSH_INTERVAL`]. Called by per-syscall hot paths so per-frame
+    /// guest file writes do not rewrite the whole config (and reparse DB)
+    /// on every operation.
+    fn flush_config_if_due(&self) -> AppResult<()> {
+        {
+            let mut flush_states = config_flush_states();
+            let state = flush_states.entry(self.root.clone()).or_default();
+            if !state.dirty {
+                return Ok(());
+            }
+            if state
+                .last_flush
+                .is_some_and(|last| last.elapsed() < CONFIG_FLUSH_INTERVAL)
+            {
+                return Ok(());
+            }
+        }
         self.write_config()
     }
 
@@ -714,13 +748,13 @@ impl GameEnvironment {
 
         let mut snapshot = BTreeMap::new();
         for path in paths {
-            let metadata = fs::metadata(&path).map_err(|error| {
-                AppError::from_io(
-                    ReasonCode::RcIo,
-                    format!("failed to stat {}", path.display()),
-                    &error,
-                )
-            })?;
+            let metadata = match fs::metadata(&path) {
+                Ok(metadata) => metadata,
+                // The entry vanished between the walk and the stat (e.g. a
+                // cache file deleted by the guest mid-snapshot); skip it
+                // instead of aborting the whole snapshot.
+                Err(_) => continue,
+            };
             let path_norm = self.normalize_host_path(&path);
             let mut attrs = Vec::new();
             if let Some(record) = self.config.fs_state.entries.get(&path_norm) {
@@ -745,17 +779,17 @@ impl GameEnvironment {
                     created_ms: if dtm {
                         0
                     } else {
-                        record.creation_time_ticks / 10_000
+                        filetime_ticks_ms_since(record.creation_time_ticks, epoch)
                     },
                     accessed_ms: if dtm {
                         0
                     } else {
-                        record.last_access_time_ticks / 10_000
+                        filetime_ticks_ms_since(record.last_access_time_ticks, epoch)
                     },
                     modified_ms: if dtm {
                         0
                     } else {
-                        record.last_write_time_ticks / 10_000
+                        filetime_ticks_ms_since(record.last_write_time_ticks, epoch)
                     },
                 }
             } else {
@@ -765,15 +799,21 @@ impl GameEnvironment {
                     modified_ms: util::elapsed_offset_ms(epoch, metadata.modified().ok(), dtm),
                 }
             };
+            let digest = if metadata.is_dir() {
+                util::sha256_bytes(b"directory")
+            } else {
+                match util::sha256_file(&path) {
+                    Ok(digest) => digest,
+                    // Same race as the stat above: the file disappeared in
+                    // between, so drop it from this snapshot.
+                    Err(_) => continue,
+                }
+            };
             snapshot.insert(
                 path_norm.clone(),
                 FileSnapshotEntry {
                     path_norm,
-                    sha256: if metadata.is_dir() {
-                        util::sha256_bytes(b"directory")
-                    } else {
-                        util::sha256_file(&path)?
-                    },
+                    sha256: digest,
                     size: if metadata.is_dir() { 0 } else { metadata.len() },
                     times_norm,
                     attrs,
@@ -814,6 +854,7 @@ impl GameEnvironment {
     }
 
     pub fn create_directory(&mut self, windows_path: &str, dtm: bool) -> AppResult<String> {
+        self.reject_write_to_read_only_drive(windows_path)?;
         let (parent, requested_name, normalized_path) =
             self.resolve_parent_for_create(windows_path, None)?;
         let target = parent.host_path.join(&requested_name);
@@ -839,6 +880,7 @@ impl GameEnvironment {
         contents: &[u8],
         dtm: bool,
     ) -> AppResult<String> {
+        self.reject_write_to_read_only_drive(windows_path)?;
         let (parent, requested_name, normalized_path) =
             self.resolve_parent_for_create(windows_path, None)?;
         let target = parent.host_path.join(&requested_name);
@@ -859,6 +901,7 @@ impl GameEnvironment {
         contents: &[u8],
         dtm: bool,
     ) -> AppResult<String> {
+        self.reject_write_to_read_only_drive(windows_path)?;
         match self.resolve_existing_path(windows_path, None, 0) {
             Ok(resolved) => {
                 fs::write(&resolved.host_path, contents).map_err(|error| {
@@ -897,22 +940,29 @@ impl GameEnvironment {
 
     pub fn enumerate_directory(&self, windows_path: &str) -> AppResult<Vec<String>> {
         let resolved = self.resolve_existing_path(windows_path, None, 0)?;
-        let mut entries = fs::read_dir(&resolved.host_path)
-            .map_err(|error| {
+        let mut entries = Vec::new();
+        for entry in fs::read_dir(&resolved.host_path).map_err(|error| {
+            AppError::from_io(
+                ReasonCode::RcFsNotFound,
+                format!("failed to enumerate {}", resolved.host_path.display()),
+                &error,
+            )
+        })? {
+            let entry = entry.map_err(|error| {
                 AppError::from_io(
-                    ReasonCode::RcFsNotFound,
+                    ReasonCode::RcIo,
                     format!("failed to enumerate {}", resolved.host_path.display()),
                     &error,
                 )
-            })?
-            .filter_map(Result::ok)
-            .map(|entry| entry.file_name().to_string_lossy().to_string())
-            .collect::<Vec<_>>();
+            })?;
+            entries.push(entry.file_name().to_string_lossy().to_string());
+        }
         entries.sort();
         Ok(entries)
     }
 
     pub fn set_file_attributes(&mut self, windows_path: &str, attrs: &[&str]) -> AppResult<()> {
+        self.reject_write_to_read_only_drive(windows_path)?;
         let resolved = self.resolve_existing_path(windows_path, None, 0)?;
         if let Some(entry) = self
             .config
@@ -924,7 +974,8 @@ impl GameEnvironment {
             entry.attributes.sort();
             entry.attributes.dedup();
         }
-        self.save_config()
+        self.mark_config_dirty();
+        self.flush_config_if_due()
     }
 
     pub fn set_file_times(
@@ -934,6 +985,7 @@ impl GameEnvironment {
         last_access_time_ticks: Option<u64>,
         last_write_time_ticks: Option<u64>,
     ) -> AppResult<()> {
+        self.reject_write_to_read_only_drive(windows_path)?;
         let resolved = self.resolve_existing_path(windows_path, None, 0)?;
         let host_metadata = fs::metadata(&resolved.host_path).map_err(|error| {
             AppError::from_io(
@@ -984,22 +1036,56 @@ impl GameEnvironment {
         if let Some(value) = last_write_time_ticks {
             entry.last_write_time_ticks = value;
         }
-        self.save_config()
+        self.mark_config_dirty();
+        self.flush_config_if_due()
     }
 
     pub fn get_file_metadata(&self, windows_path: &str) -> AppResult<FsMetadataRecord> {
         let resolved = self.resolve_existing_path(windows_path, None, 0)?;
-        self.config
-            .fs_state
-            .entries
-            .get(&resolved.normalized_path)
-            .cloned()
-            .ok_or_else(|| {
-                AppError::new(
-                    ReasonCode::RcFsNotFound,
-                    format!("missing metadata for {}", resolved.normalized_path),
-                )
-            })
+        if let Some(record) = self.config.fs_state.entries.get(&resolved.normalized_path) {
+            return Ok(record.clone());
+        }
+        // No persisted record (e.g. pre-existing GE content): synthesize one
+        // from host metadata so callers do not see files vanish from the FS
+        // layer just because the guest never touched them.
+        let host_metadata = fs::metadata(&resolved.host_path).map_err(|error| {
+            AppError::from_io(
+                ReasonCode::RcFsNotFound,
+                format!("failed to stat {}", resolved.host_path.display()),
+                &error,
+            )
+        })?;
+        let kind = if host_metadata.is_dir() {
+            FsEntryKind::Directory
+        } else {
+            FsEntryKind::File
+        };
+        let mut attributes = Vec::new();
+        if kind == FsEntryKind::Directory {
+            attributes.push("directory".to_string());
+        }
+        if host_metadata.permissions().readonly() {
+            attributes.push("readonly".to_string());
+        }
+        Ok(FsMetadataRecord {
+            kind,
+            original_case: resolved
+                .host_path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default()
+                .to_string(),
+            attributes,
+            creation_time_ticks: system_time_to_filetime_ticks(
+                host_metadata.created().unwrap_or(SystemTime::now()),
+            ),
+            last_access_time_ticks: system_time_to_filetime_ticks(
+                host_metadata.accessed().unwrap_or(SystemTime::now()),
+            ),
+            last_write_time_ticks: system_time_to_filetime_ticks(
+                host_metadata.modified().unwrap_or(SystemTime::now()),
+            ),
+        })
     }
 
     pub fn create_reparse_point(
@@ -1009,6 +1095,7 @@ impl GameEnvironment {
         kind: ReparseKind,
         dtm: bool,
     ) -> AppResult<()> {
+        self.reject_write_to_read_only_drive(windows_path)?;
         let normalized_path = if self.resolve_existing_path(windows_path, None, 0).is_ok() {
             self.parse_windows_path(windows_path, None)?.normalized_path
         } else {
@@ -1022,16 +1109,12 @@ impl GameEnvironment {
             },
         );
         if let Some(entry) = self.config.fs_state.entries.get_mut(&normalized_path) {
-            if !entry
-                .attributes
-                .iter()
-                .any(|value| value == "reparse_point")
-            {
-                entry.attributes.push("reparse_point".to_string());
-                entry.attributes.sort();
-            }
+            entry.attributes.retain(|value| value != "reparse_point");
+            entry.attributes.push("reparse_point".to_string());
+            entry.attributes.sort();
         }
-        self.save_config()
+        self.mark_config_dirty();
+        self.flush_config_if_due()
     }
 
     pub fn resolve_sandboxed_path(&self, windows_path: &str) -> AppResult<String> {
@@ -1046,6 +1129,9 @@ impl GameEnvironment {
         desired_access: FileAccess,
         share_mode: ShareMode,
     ) -> AppResult<FileHandle> {
+        if desired_access.write || desired_access.delete {
+            self.reject_write_to_read_only_drive(windows_path)?;
+        }
         let resolved = self.resolve_existing_path(windows_path, None, 0)?;
         let pid = std::process::id();
         self.with_shared_file_runtime(|runtime| {
@@ -1170,10 +1256,11 @@ impl GameEnvironment {
         if normalize_hive(hive)? == "HKCR" {
             for (merged_hive, merged_key) in self.hkcr_merged_keys(key, view)? {
                 let db = load_registry_db(&self.registry_file(&merged_hive))?;
-                if let Some(values) = db.get(&merged_key) {
-                    if let Some(value) = values.get(value_name) {
-                        return Ok(Some(value.clone()));
-                    }
+                if let Some(value) = db
+                    .get(&merged_key)
+                    .and_then(|values| values.get(value_name))
+                {
+                    return Ok(Some(value.clone()));
                 }
             }
             return Ok(None);
@@ -1251,7 +1338,17 @@ impl GameEnvironment {
                 format!("missing registry key {}\\{}", actual_hive, actual_key),
             )
         })?;
-        values.remove(value_name);
+        // Windows returns ERROR_FILE_NOT_FOUND when the value does not exist.
+        let removed = values.remove(value_name).is_some();
+        if !removed {
+            return Err(AppError::new(
+                ReasonCode::RcRegistryNotFound,
+                format!(
+                    "missing registry value {}\\{}\\{}",
+                    actual_hive, actual_key, value_name
+                ),
+            ));
+        }
         if values.is_empty() {
             db.remove(&actual_key);
         }
@@ -1530,14 +1627,69 @@ impl GameEnvironment {
     }
 
     fn write_config(&self) -> AppResult<()> {
-        write_reparse_db(
-            &self.reparse_db_file(),
-            &self.config.fs_state.reparse_points,
-        )?;
-        let mut persisted_config = self.config.clone();
-        persisted_config.fs_state.reparse_points.clear();
-        let contents = util::stable_json(&persisted_config)?;
-        util::write_string(&self.root.join("ge.json"), &contents)
+        let mut flush_states = config_flush_states();
+        let state = flush_states.entry(self.root.clone()).or_default();
+        if !state.dirty {
+            return Ok(());
+        }
+
+        // Hold the flush-state lock across the IO so concurrent callers do
+        // not double-write; the dirty flag is cleared only on success so a
+        // failed flush is retried by the next caller.
+        let result = (|| {
+            // Skip the reparse-DB rewrite when the in-memory DB is unchanged.
+            let reparse_json = util::stable_json(&self.config.fs_state.reparse_points)?;
+            if state.last_reparse_json.as_ref() != Some(&reparse_json) {
+                write_reparse_db(
+                    &self.reparse_db_file(),
+                    &self.config.fs_state.reparse_points,
+                )?;
+                state.last_reparse_json = Some(reparse_json);
+            }
+
+            let mut persisted_config = self.config.clone();
+            persisted_config.fs_state.reparse_points.clear();
+            // Prune metadata records whose host paths no longer exist so the
+            // persisted config does not grow without bound and deleted-then-
+            // recreated paths do not resurrect stale attributes/times.
+            let entries = std::mem::take(&mut persisted_config.fs_state.entries);
+            persisted_config.fs_state.entries = entries
+                .into_iter()
+                .filter(|(path, _)| {
+                    self.fs_entry_host_path(path)
+                        .map(|host| host.exists())
+                        .unwrap_or(true) // unresolvable entries (unmapped drive) are kept
+                })
+                .collect();
+            let contents = util::stable_json(&persisted_config)?;
+            util::write_string(&self.root.join("ge.json"), &contents)
+        })();
+        match &result {
+            Ok(()) => {
+                state.dirty = false;
+                state.last_flush = Some(Instant::now());
+            }
+            Err(_) => {
+                state.dirty = true;
+            }
+        }
+        result
+    }
+
+    /// Maps a normalized guest-visible path back to its host path using the
+    /// current drive mappings, or `None` if the path cannot be resolved.
+    fn fs_entry_host_path(&self, normalized_path: &str) -> Option<PathBuf> {
+        let parsed = self.parse_windows_path(normalized_path, None).ok()?;
+        if parsed.device_namespace {
+            return None;
+        }
+        let drive = parsed.drive?;
+        let mapping = self.resolve_drive_mapping(&drive).ok()?;
+        let mut host_path = self.resolve_drive_target(&mapping);
+        for component in parsed.components {
+            host_path.push(component);
+        }
+        Some(host_path)
     }
 
     fn resolve_parent_for_create(
@@ -1712,13 +1864,53 @@ impl GameEnvironment {
         }
     }
 
+    fn reject_write_to_read_only_drive(&self, windows_path: &str) -> AppResult<()> {
+        let parsed = self.parse_windows_path(windows_path, None)?;
+        let drive = parsed.drive.clone().ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcFsPathInvalid,
+                format!("missing drive designator in {windows_path}"),
+            )
+        })?;
+        let mapping = self.resolve_drive_mapping(&drive)?;
+        if mapping.read_only || mapping.requires_permission {
+            return Err(AppError::new(
+                ReasonCode::RcSandboxPathViolation,
+                format!(
+                    "drive {}: is mapped read-only (or requires permission) and cannot be modified",
+                    mapping.drive
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     fn ensure_within_allowed_roots(&self, path: &Path) -> AppResult<()> {
         let allowed_roots = self
             .active_drive_mappings()
             .into_iter()
             .map(|mapping| self.resolve_drive_target(&mapping))
             .collect::<Vec<_>>();
-        if allowed_roots.iter().any(|root| path.starts_with(root)) {
+        // Canonicalize the final path so that host symlinks inside the GE tree
+        // cannot be used to escape the sandbox: a link resolving outside every
+        // allowed root fails the lexical prefix check below and is rejected.
+        let canonical_path = fs::canonicalize(path).map_err(|error| {
+            AppError::new(
+                ReasonCode::RcFsSandboxEscape,
+                format!(
+                    "{} escapes the GE sandbox (cannot resolve symlinks)",
+                    path.display()
+                ),
+            )
+            .with_hint(error.to_string())
+        })?;
+        let allowed = allowed_roots.iter().any(|root| {
+            // A root that no longer exists cannot be canonicalized; fall back
+            // to its lexical form so the prefix comparison stays meaningful.
+            let canonical_root = fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+            canonical_path.starts_with(&canonical_root)
+        });
+        if allowed {
             Ok(())
         } else {
             Err(AppError::new(
@@ -1736,6 +1928,7 @@ impl GameEnvironment {
         let state_path = self.tmp_dir().join("fs_runtime.json");
         let lock_file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&lock_path)
@@ -1785,7 +1978,8 @@ impl GameEnvironment {
                 last_write_time_ticks: ticks,
             },
         );
-        self.save_config()
+        self.mark_config_dirty();
+        self.flush_config_if_due()
     }
 
     fn redirect_registry_path(
@@ -1807,8 +2001,12 @@ impl GameEnvironment {
             return Ok((normalized_hive, normalized_key));
         }
 
+        // A 32-bit process accessing HKLM\Software without an explicit
+        // 64-bit view is redirected to Software\WOW6432Node on real Windows.
+        // `Native` (the no-flag default) and `Wow6432` both redirect for x86
+        // guests; only `Native64` escapes the redirection.
         let redirected_key = if self.config.arch == GeArch::X86
-            && view == RegistryView::Wow6432
+            && view != RegistryView::Native64
             && normalized_hive == "HKLM"
             && starts_with_registry_segment(&normalized_key, "Software")
             && !starts_with_registry_segment(&normalized_key, "Software\\Classes")
@@ -1843,19 +2041,34 @@ impl GameEnvironment {
 
     fn notify_registry_watchers(&self, hive: &str, key: &str) {
         let normalized_key = normalize_registry_key(key);
+        // HKCR reads are merged from HKCU\Software\Classes and the HKLM
+        // branch, but HKCR writes are redirected to HKCU\Software\Classes.
+        // Expand writes on those backing hives into HKCR watcher
+        // notifications so watchers on the merged hive actually fire.
+        let mut notification_pairs = vec![(hive.to_string(), normalized_key.clone())];
+        if hive == "HKCU" || hive == "HKLM" {
+            if normalized_key == "Software\\Classes" {
+                notification_pairs.push(("HKCR".to_string(), String::new()));
+            } else if let Some(suffix) = normalized_key.strip_prefix("Software\\Classes\\") {
+                notification_pairs.push(("HKCR".to_string(), suffix.to_string()));
+            }
+        }
         let ge_root = self.root.display().to_string();
         let mut registry_watchers = registry_watchers()
             .lock()
             .expect("registry watchers lock poisoned");
         registry_watchers.retain(|watcher| watcher.upgrade().is_some());
         for watcher in registry_watchers.iter().filter_map(Weak::upgrade) {
-            if watcher.ge_root != ge_root || watcher.hive != hive {
+            if watcher.ge_root != ge_root {
                 continue;
             }
-            if normalized_key == watcher.key_norm
-                || (watcher.recursive
-                    && normalized_key.starts_with(&format!("{}\\", watcher.key_norm)))
-            {
+            let notify = notification_pairs.iter().any(|(pair_hive, pair_key)| {
+                watcher.hive == *pair_hive
+                    && (pair_key == &watcher.key_norm
+                        || (watcher.recursive
+                            && pair_key.starts_with(&format!("{}\\", watcher.key_norm))))
+            });
+            if notify {
                 let mut sequence = watcher
                     .sequence
                     .lock()
@@ -2107,7 +2320,9 @@ fn parse_windows_path_impl(
                 .collect::<Vec<_>>(),
         )
     };
-    if !verbatim && !long_paths_enabled && normalized_path.len() > 260 {
+    // MAX_PATH (260) includes the terminating null, so a path of exactly 260
+    // characters is already too long.
+    if !verbatim && !long_paths_enabled && normalized_path.len() >= 260 {
         return Err(AppError::new(
             ReasonCode::RcFsPathTooLong,
             format!(
@@ -2215,6 +2430,39 @@ fn find_named_ge_in_workspace(
     }
 }
 
+/// Number of 100 ns ticks between 1601-01-01 (FILETIME epoch) and
+/// 1970-01-01 (Unix epoch). Windows FILETIME values are 100 ns units since
+/// 1601-01-01; the host clock is measured from 1970, so this offset must be
+/// added whenever host time is exposed to the guest.
+const FILE_TIME_EPOCH_OFFSET_TICKS: u64 = 116444736000000000;
+
+/// Minimum interval between full `ge.json` + reparse-DB rewrites triggered by
+/// guest file operations. Per-frame guest writes (logs, caches, save games)
+/// are coalesced to at most one serialization per interval instead of one
+/// full rewrite per syscall.
+const CONFIG_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Per-GE persistence bookkeeping. Kept in a process-global registry keyed by
+/// GE root so `GameEnvironment`'s public shape stays unchanged.
+#[derive(Default)]
+struct ConfigFlushState {
+    /// Whether in-memory config changes await persistence.
+    dirty: bool,
+    /// When the last full flush completed.
+    last_flush: Option<Instant>,
+    /// Last serialized reparse-point DB, used to skip redundant rewrites.
+    last_reparse_json: Option<String>,
+}
+
+fn config_flush_states() -> std::sync::MutexGuard<'static, HashMap<PathBuf, ConfigFlushState>> {
+    static CONFIG_FLUSH_STATES: OnceLock<Mutex<HashMap<PathBuf, ConfigFlushState>>> =
+        OnceLock::new();
+    CONFIG_FLUSH_STATES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("config flush state lock poisoned")
+}
+
 fn current_windows_ticks(dtm: bool) -> u64 {
     if dtm {
         0
@@ -2224,7 +2472,31 @@ fn current_windows_ticks(dtm: bool) -> u64 {
             .unwrap_or_default()
             .as_nanos()
             .div_euclid(100) as u64
+            + FILE_TIME_EPOCH_OFFSET_TICKS
     }
+}
+
+/// Converts a host `SystemTime` into guest-visible FILETIME ticks
+/// (100 ns units since 1601-01-01). Times before the Unix epoch fall back to
+/// the current time.
+fn system_time_to_filetime_ticks(time: SystemTime) -> u64 {
+    match time.duration_since(UNIX_EPOCH) {
+        Ok(duration) => {
+            duration.as_nanos().div_euclid(100) as u64 + FILE_TIME_EPOCH_OFFSET_TICKS
+        }
+        Err(_) => current_windows_ticks(false),
+    }
+}
+
+/// Converts guest-visible FILETIME ticks into milliseconds elapsed since the
+/// given reference `epoch`, saturating at zero for times that predate it.
+fn filetime_ticks_ms_since(ticks: u64, epoch: SystemTime) -> u64 {
+    let epoch_ticks = match epoch.duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_nanos().div_euclid(100) as u64 + FILE_TIME_EPOCH_OFFSET_TICKS,
+        // The epoch predates the Unix epoch; fall back to absolute ms.
+        Err(_) => return ticks.div_euclid(10_000),
+    };
+    ticks.saturating_sub(epoch_ticks).div_euclid(10_000)
 }
 
 fn build_drive_path(drive: &str, components: &[String]) -> String {
@@ -2317,9 +2589,10 @@ fn build_reparse_redirect(
     remaining_components: &[String],
 ) -> String {
     let target = reparse_point.target.replace('/', "\\");
-    let base_path = if target.starts_with("\\\\?\\") || target.starts_with("\\\\.\\") {
-        target
-    } else if target.len() >= 2 && target.as_bytes()[1] == b':' {
+    let base_path = if target.starts_with("\\\\?\\")
+        || target.starts_with("\\\\.\\")
+        || (target.len() >= 2 && target.as_bytes()[1] == b':')
+    {
         target
     } else if target.starts_with('\\') {
         format!("{}:{}", drive.to_ascii_uppercase(), target)
@@ -2393,18 +2666,15 @@ fn enumerate_subkeys(db: &RegistryDb, key: &str) -> Vec<String> {
     };
     let mut subkeys = BTreeSet::new();
     for existing_key in db.keys() {
-        if prefix.is_empty() {
-            if let Some(segment) = existing_key.split('\\').next() {
-                if !segment.is_empty() {
-                    subkeys.insert(segment.to_string());
-                }
-            }
-        } else if let Some(remainder) = existing_key.strip_prefix(&prefix) {
-            if let Some(segment) = remainder.split('\\').next() {
-                if !segment.is_empty() {
-                    subkeys.insert(segment.to_string());
-                }
-            }
+        let first_segment = if prefix.is_empty() {
+            existing_key.split('\\').next()
+        } else {
+            existing_key
+                .strip_prefix(&prefix)
+                .and_then(|remainder| remainder.split('\\').next())
+        };
+        if let Some(segment) = first_segment.filter(|segment| !segment.is_empty()) {
+            subkeys.insert(segment.to_string());
         }
     }
     subkeys.into_iter().collect()
@@ -2511,8 +2781,17 @@ fn ranges_overlap(
     right_offset: u64,
     right_length: u64,
 ) -> bool {
-    let left_end = left_offset.saturating_add(left_length);
-    let right_end = right_offset.saturating_add(right_length);
+    // A zero-length range means "from the offset to end of file" on Windows.
+    let left_end = if left_length == 0 {
+        u64::MAX
+    } else {
+        left_offset.saturating_add(left_length)
+    };
+    let right_end = if right_length == 0 {
+        u64::MAX
+    } else {
+        right_offset.saturating_add(right_length)
+    };
     left_offset < right_end && right_offset < left_end
 }
 

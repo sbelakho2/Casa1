@@ -16,14 +16,17 @@
 //! maps common action names (e.g. `"menu_accept"`, `"jump"`, `"move"`) to
 //! the corresponding XInput button / axis reads.
 
-use std::collections::HashMap;
-use std::time::Instant;
+use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 // ── macOS IOKit / CoreFoundation FFI bindings for haptic rumble ──────────
+//
+// Each framework gets its own extern block with a single `#[link]`
+// attribute so the adjacent-framework link attributes are not flagged as
+// duplicated.
 
 #[cfg(target_os = "macos")]
 #[link(name = "IOKit", kind = "framework")]
-#[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
     /// IOHIDDeviceSetReport – sends an HID report to a device.
     ///
@@ -84,7 +87,11 @@ unsafe extern "C" {
         allocator: *const std::ffi::c_void,
         options: u32,
     ) -> *mut std::ffi::c_void;
+}
 
+#[cfg(target_os = "macos")]
+#[link(name = "CoreFoundation", kind = "framework")]
+unsafe extern "C" {
     /// CFStringCreateWithCString – creates a CFString from a C string.
     ///
     /// # Safety
@@ -142,141 +149,6 @@ const KIO_HID_REPORT_TYPE_OUTPUT: u32 = 1;
 /// IOKit matching dictionary keys.
 #[cfg(target_os = "macos")]
 const KIO_MASTER_PORT_DEFAULT: u32 = 0;
-
-/// Retrieve the IOHIDDeviceRef for a controller by its vendor/product ID.
-///
-/// Uses IOKit's HID manager to find the first HID device matching the given
-/// vendor and product identifiers. Returns a retained `IOHIDDeviceRef` that
-/// the caller must release, or `None` if no matching device was found.
-#[cfg(target_os = "macos")]
-fn find_hid_device(vendor_id: u16, product_id: u16) -> Option<*const std::ffi::c_void> {
-    // Use IOKit C FFI via `IOKitLib.h` functions available on macOS.
-    // We bridge through `IORegistryEntryCreateCFProperty`-style access,
-    // using `IOServiceGetMatchingServices` with a matching dictionary.
-    //
-    // On macOS 10.15+ the recommended approach is `IOHIDManagerCreate`
-    // with `IOHIDManagerSetDeviceMatching`. However, for simplicity and
-    // broad compatibility we use the IORegistry-based approach that
-    // the existing `real_hid` module already leverages via `ioreg`.
-    //
-    // Since direct IOKit C FFI from Rust requires careful lifetime management
-    // of CoreFoundation objects (CFDictionary, CFNumber, etc.), and since
-    // we already have `real_hid.rs` that enumerates controllers successfully
-    // via `ioreg`, we take a practical approach:
-    //
-    // 1. Query ioreg to get the registry entry path for the matching device
-    // 2. Use `IOServiceGetMatchingServices` + `IOIteratorNext` to iterate
-    // 3. Call `IOHIDDeviceSetReport` on the found device
-    //
-    // However, to avoid complex CF/CoreFoundation type management in Rust
-    // (which requires `core-foundation-rs` crate or manual CFRetain/CFRelease),
-    // we instead shell out to a small inline helper via `std::process::Command`
-    // that sends the rumble command using Apple's `IOKit` command-line tools.
-    //
-    // The `IOKit.framework` FFI above is declared for direct use when a
-    // compatible C-Rust bridge is available (e.g., via the `iohid` family
-    // of functions). For the current implementation we find the device
-    // registry path and use a lightweight `IOKit` call.
-
-    // Build a matching vendor/product ID pair for the HID device search.
-    let ioreg_output = std::process::Command::new("ioreg")
-        .args(["-r", "-c", "IOHIDDevice", "-a"])
-        .output()
-        .ok()?;
-
-    if !ioreg_output.status.success() {
-        return None;
-    }
-
-    let text = String::from_utf8_lossy(&ioreg_output.stdout);
-    let target_vid = vendor_id;
-    let target_pid = product_id;
-
-    // Find the registry entry path for a device matching our VID/PID.
-    // The output has entries like:
-    //   +-o IOHIDDevice  <class IOHIDDevice, id 0x12345678, registered, matched, active, busy 0, retain count 7>
-    //   {
-    //     "VendorID" = 1118
-    //     "ProductID" = 736
-    //     ...
-    //   }
-    //
-    // We look for the IORegistry entry ID from the first matching device.
-
-    let mut in_device = false;
-    let mut current_vid = 0u16;
-    let mut current_pid = 0u16;
-    let mut _entry_id: Option<u64> = None;
-
-    for line in text.lines() {
-        let trimmed = line.trim();
-
-        if !in_device {
-            if trimmed.starts_with("+-o") && trimmed.contains("IOHIDDevice") {
-                in_device = true;
-                current_vid = 0;
-                current_pid = 0;
-                _entry_id = None;
-
-                // Try to extract the registry entry ID from the line
-                // e.g.: "id 0x12345678"
-                if let Some(id_start) = trimmed.find("id 0x") {
-                    let id_hex = &trimmed[id_start + 5..];
-                    let hex_str = if let Some(end) = id_hex.find(|c: char| !c.is_ascii_hexdigit()) {
-                        &id_hex[..end]
-                    } else {
-                        id_hex
-                    };
-                    _entry_id = match u64::from_str_radix(hex_str, 16) {
-                        Ok(id) => Some(id),
-                        Err(e) => {
-                            eprintln!(
-                                "find_hid_device: failed to parse entry ID hex '{hex_str}': {e}"
-                            );
-                            None
-                        }
-                    };
-                }
-            }
-            continue;
-        }
-
-        // Parse key = value pairs inside the block
-        if let Some(eq_pos) = trimmed.find('=') {
-            let key = trimmed[..eq_pos].trim().trim_matches('"').to_string();
-            let raw_val = trimmed[eq_pos + 1..].trim();
-            let val = raw_val.trim_matches('"');
-
-            match key.as_str() {
-                "VendorID" | "idVendor" => {
-                    current_vid = val.parse().unwrap_or(0);
-                }
-                "ProductID" | "idProduct" => {
-                    current_pid = val.parse().unwrap_or(0);
-                }
-                _ => {}
-            }
-        }
-
-        // Check for closing brace - end of device block
-        if trimmed == "}" || trimmed == "}," {
-            if current_vid == target_vid && current_pid == target_pid {
-                // Found our device - use the entry ID
-                // We don't actually return a pointer here since IOHIDDeviceRef
-                // management requires CoreFoundation. Instead we'll store the IDs
-                // and use them when sending the report.
-                //
-                // FIXME: Return a real IOHIDDeviceRef once IOKit C FFI is wired up.
-                // For now return a non-null sentinel via a trivial integer-to-pointer
-                // cast to indicate the device was found without using nightly APIs.
-                return Some(1 as *mut std::ffi::c_void);
-            }
-            in_device = false;
-        }
-    }
-
-    None
-}
 
 // ── XInput button bitmask constants ──────────────────────────────────────
 pub const XINPUT_GAMEPAD_DPAD_UP: u16 = 0x0001;
@@ -412,7 +284,6 @@ pub struct RawGamepadState {
 #[derive(Debug, Clone)]
 pub struct SteamInputController {
     pub handle: ControllerHandle,
-    pub active_action_set: Option<ActionSetHandle>,
     pub gamepad_index: i32,
     pub input_type: ControllerInputType,
 }
@@ -454,19 +325,36 @@ pub struct SteamInput {
     action_set_layer_stacks: HashMap<ControllerHandle, Vec<ActionSetHandle>>,
     /// Last frame's raw input snapshot per controller.
     last_raw_state: HashMap<ControllerHandle, RawGamepadState>,
+    /// Frame counter, incremented on every `run_frame` call.
+    frame_count: u64,
+    /// Last frame in which each controller handle delivered raw state.
+    last_seen_frame: HashMap<ControllerHandle, u64>,
+    /// Action names registered while a given action set was active
+    /// (`None` = registered before any action set was activated).
+    action_set_members: HashMap<Option<ActionSetHandle>, HashSet<String>>,
+    /// The most recently activated action set (used as the owning set for
+    /// actions registered after activation).
+    last_activated_set: Option<ActionSetHandle>,
     /// Start time for synthetic motion data generation.
     start_time: Instant,
 }
+
+/// How many consecutive `run_frame` calls a controller may miss before its
+/// raw state is considered stale and dropped.
+const STALE_FRAME_GRACE: u64 = 2;
+
+/// Maximum number of action set layers a game may push onto one controller
+/// without popping (real Steam Input has a small bounded layer stack).
+const MAX_ACTION_SET_LAYERS: usize = 8;
 
 impl SteamInput {
     /// Creates a new uninitialized Steam Input state machine.
     ///
     /// Call [`init()`](Self::init) before issuing any other commands.
     pub fn new() -> Self {
-        let controllers = (0..4)
+        let controllers = (0..4u64)
             .map(|i| SteamInputController {
-                handle: CONTROLLER_HANDLE_BASE + i as u64,
-                active_action_set: None,
+                handle: CONTROLLER_HANDLE_BASE + i,
                 gamepad_index: i as i32,
                 input_type: ControllerInputType::Xbox360,
             })
@@ -484,6 +372,10 @@ impl SteamInput {
             controller_action_sets: HashMap::new(),
             action_set_layer_stacks: HashMap::new(),
             last_raw_state: HashMap::new(),
+            frame_count: 0,
+            last_seen_frame: HashMap::new(),
+            action_set_members: HashMap::new(),
+            last_activated_set: None,
             start_time: Instant::now(),
         }
     }
@@ -495,7 +387,7 @@ impl SteamInput {
 
     /// Returns the XInput slot index for a controller handle, or `None`.
     pub fn slot_for_handle(handle: ControllerHandle) -> Option<u8> {
-        if handle >= CONTROLLER_HANDLE_BASE && handle < CONTROLLER_HANDLE_BASE + 4 {
+        if (CONTROLLER_HANDLE_BASE..CONTROLLER_HANDLE_BASE + 4).contains(&handle) {
             Some((handle - CONTROLLER_HANDLE_BASE) as u8)
         } else {
             None
@@ -516,6 +408,7 @@ impl SteamInput {
     pub fn shutdown(&mut self) {
         self.initialized = false;
         self.last_raw_state.clear();
+        self.last_seen_frame.clear();
         self.controller_action_sets.clear();
     }
 
@@ -523,18 +416,37 @@ impl SteamInput {
     ///
     /// Synchronises the internal raw state snapshot with the current controller
     /// state provided via `raw_states`. Call this once per frame.
+    ///
+    /// Only the four known slot handles are tracked; state for controllers
+    /// that stop being polled for several consecutive frames is dropped so
+    /// disconnected controllers cannot keep their last input forever.
     pub fn run_frame(&mut self, raw_states: Vec<(ControllerHandle, RawGamepadState)>) {
+        self.frame_count += 1;
         for (handle, state) in raw_states {
+            if Self::slot_for_handle(handle).is_none() {
+                continue;
+            }
             self.last_raw_state.insert(handle, state);
+            self.last_seen_frame.insert(handle, self.frame_count);
         }
+        let cutoff = self.frame_count.saturating_sub(STALE_FRAME_GRACE);
+        self.last_seen_frame
+            .retain(|handle, seen| *seen >= cutoff && self.last_raw_state.contains_key(handle));
+        self.last_raw_state
+            .retain(|handle, _| self.last_seen_frame.contains_key(handle));
     }
 
     /// `SteamAPI_ISteamInput_GetConnectedControllers` — returns the handles
     /// of all connected controllers.
     ///
-    /// Returns up to 4 handles (one per XInput slot).
+    /// Returns up to 4 handles (one per XInput slot); only slots that have
+    /// delivered fresh raw state in recent frames are reported as connected.
     pub fn get_connected_controllers(&self) -> Vec<ControllerHandle> {
-        self.controllers.iter().map(|c| c.handle).collect()
+        self.controllers
+            .iter()
+            .filter(|controller| self.last_raw_state.contains_key(&controller.handle))
+            .map(|controller| controller.handle)
+            .collect()
     }
 
     /// `SteamAPI_ISteamInput_GetActionSetHandle` — resolves an action set
@@ -551,6 +463,10 @@ impl SteamInput {
 
     /// `SteamAPI_ISteamInput_GetDigitalActionHandle` — resolves a digital
     /// action name to a handle, registering it if not already known.
+    ///
+    /// The action is recorded as a member of the action set that was most
+    /// recently activated (if any), which is how action-set membership is
+    /// tracked without a parsed VDF manifest.
     pub fn get_digital_action_handle(&mut self, name: &str) -> DigitalActionHandle {
         if let Some(&handle) = self.digital_actions.get(name) {
             return handle;
@@ -558,11 +474,15 @@ impl SteamInput {
         let handle = self.next_digital_action_handle;
         self.next_digital_action_handle += 1;
         self.digital_actions.insert(name.to_string(), handle);
+        self.record_action_set_membership(name);
         handle
     }
 
     /// `SteamAPI_ISteamInput_GetAnalogActionHandle` — resolves an analog
     /// action name to a handle, registering it if not already known.
+    ///
+    /// The action is recorded as a member of the action set that was most
+    /// recently activated (if any).
     pub fn get_analog_action_handle(&mut self, name: &str) -> AnalogActionHandle {
         if let Some(&handle) = self.analog_actions.get(name) {
             return handle;
@@ -570,12 +490,23 @@ impl SteamInput {
         let handle = self.next_analog_action_handle;
         self.next_analog_action_handle += 1;
         self.analog_actions.insert(name.to_string(), handle);
+        self.record_action_set_membership(name);
         handle
+    }
+
+    /// Records `name` as a member of the most recently activated action set,
+    /// or of the implicit default set when no set has been activated yet.
+    fn record_action_set_membership(&mut self, name: &str) {
+        self.action_set_members
+            .entry(self.last_activated_set)
+            .or_default()
+            .insert(name.to_string());
     }
 
     /// `SteamAPI_ISteamInput_ActivateActionSet` — sets the active action set
     /// for a given controller.
     pub fn activate_action_set(&mut self, controller: ControllerHandle, handle: ActionSetHandle) {
+        self.last_activated_set = Some(handle);
         self.controller_action_sets.insert(controller, handle);
     }
 
@@ -698,10 +629,10 @@ impl SteamInput {
         // left/right motor speed values, so we synthesize them from the
         // repetition parameters:
         //   - A higher pulse_count + longer duration → stronger rumble
-        let intensity = (pulse_count.min(100) as u32)
+        let intensity = pulse_count
+            .min(100)
             .saturating_mul(duration_ms.min(5000))
-            .min(65535)
-            .max(1) as u16;
+            .clamp(1, 65535) as u16;
 
         let (left_speed, right_speed) = match target {
             HapticTarget::Left => (intensity, 0u16),
@@ -774,13 +705,28 @@ impl SteamInput {
 
     /// `SteamAPI_ISteamInput_GetGlyphForActionHandle` — returns a glyph
     /// SVG string for the given action handle.
-    pub fn get_glyph_for_action_handle(&self, action: ActionSetHandle) -> Option<&'static str> {
+    ///
+    /// Resolves the handle against action sets, digital actions and analog
+    /// actions.
+    pub fn get_glyph_for_action_handle(&self, action: u64) -> Option<&'static str> {
         // Resolve action name from handle.
         let action_name = self
             .action_sets
             .iter()
             .find(|(_, h)| **h == action)
             .map(|(name, _)| name.as_str())
+            .or_else(|| {
+                self.digital_actions
+                    .iter()
+                    .find(|(_, h)| **h == action)
+                    .map(|(name, _)| name.as_str())
+            })
+            .or_else(|| {
+                self.analog_actions
+                    .iter()
+                    .find(|(_, h)| **h == action)
+                    .map(|(name, _)| name.as_str())
+            })
             .unwrap_or("");
         Self::glyph_svg_for_action(action_name)
     }
@@ -883,15 +829,22 @@ impl SteamInput {
     /// Action set layers override the base action set and are evaluated in
     /// LIFO order. Games use layers for temporary state changes (e.g.
     /// "driving", "menus", "aiming").
+    ///
+    /// The stack is capped at [`MAX_ACTION_SET_LAYERS`] entries; pushes beyond
+    /// the cap are ignored so a game that never pops cannot grow the stack
+    /// without bound.
     pub fn push_action_set_layer(
         &mut self,
         controller: ControllerHandle,
         layer_handle: ActionSetHandle,
     ) {
-        self.action_set_layer_stacks
+        let stack = self
+            .action_set_layer_stacks
             .entry(controller)
-            .or_default()
-            .push(layer_handle);
+            .or_default();
+        if stack.len() < MAX_ACTION_SET_LAYERS {
+            stack.push(layer_handle);
+        }
     }
 
     /// Pop the top action set layer from the controller's layer stack.
@@ -920,16 +873,42 @@ impl SteamInput {
     }
 
     /// Returns whether the named action is in the currently active action set.
+    ///
+    /// An action is active when it belongs to the controller's active set or
+    /// any of its active layers, or to the implicit default set (actions
+    /// registered before any action set was activated). Actions registered
+    /// under a different action set report inactive — matching real Steam
+    /// Input's behaviour for games that switch between sets.
     fn is_action_active(&self, controller: ControllerHandle, action_name: &str) -> bool {
-        let Some(_current_set) = self.controller_action_sets.get(&controller) else {
-            // No active action set → default to active for all actions
+        let Some(current_set) = self.controller_action_sets.get(&controller) else {
+            // No active action set → default to active for all actions.
             return true;
         };
-        // An active action set is configured.  Check whether the action name
-        // is registered as a digital or analog action.  If it is, it belongs
-        // to the active set; if not, it is considered inactive.
-        self.digital_actions.contains_key(action_name)
-            || self.analog_actions.contains_key(action_name)
+        // The action is active if it is a member of the active set, any
+        // active layer, or the implicit default set.
+        self.action_set_members
+            .get(&Some(*current_set))
+            .map(|members| members.contains(action_name))
+            .unwrap_or(false)
+            || self
+                .action_set_layer_stacks
+                .get(&controller)
+                .map(|layers| {
+                    layers
+                        .iter()
+                        .any(|layer| {
+                            self.action_set_members
+                                .get(&Some(*layer))
+                                .map(|members| members.contains(action_name))
+                                .unwrap_or(false)
+                        })
+                })
+                .unwrap_or(false)
+            || self
+                .action_set_members
+                .get(&None)
+                .map(|members| members.contains(action_name))
+                .unwrap_or(false)
     }
 
     /// Maps a digital action name to its XInput button state.
@@ -1081,6 +1060,11 @@ static SOFTWARE_HAPTICS: LazyLock<Mutex<[SoftwareHapticState; 4]>> = LazyLock::n
 
 /// Convert a motor speed (0-255) and duration into a macOS system notification
 /// or log-based haptic indicator.
+///
+/// The `osascript` notification is rate-limited per slot (at most one spawn
+/// per [`SOFTWARE_HAPTIC_MIN_INTERVAL`]) and spawned asynchronously so a game
+/// firing repeated pulses never blocks the calling thread on a synchronous
+/// process spawn.
 fn notify_software_haptic(slot: u8, left_speed: u8, right_speed: u8, duration_ms: u64) {
     let intensity = ((left_speed as u16 + right_speed as u16) / 2) as u8;
     let level = match intensity {
@@ -1097,22 +1081,23 @@ fn notify_software_haptic(slot: u8, left_speed: u8, right_speed: u8, duration_ms
     // On macOS, post a lightweight NSUserNotification via script
     #[cfg(target_os = "macos")]
     if duration_ms >= 100 && intensity > 32 {
-        match std::process::Command::new("osascript")
-            .args([
-                "-e",
-                &format!(
-                    r#"display notification "Controller {slot} rumble ({level})" with title "Steam Haptics" subtitle "" sound name "Funk""#
-                ),
-            ])
-            .output()
-        {
-            Ok(output) if output.status.success() => {}
-            Ok(output) => {
-                eprintln!(
-                    "[steam_input] failed to post haptic notification for slot {}: osascript exited with {}",
-                    slot, output.status
-                );
-            }
+        let mut last_notifications = SOFTWARE_HAPTIC_LAST_NOTIFICATIONS.lock().unwrap_or_else(
+            |poisoned| poisoned.into_inner(),
+        );
+        let now = Instant::now();
+        let slot_index = usize::from(slot).min(last_notifications.len() - 1);
+        let last = last_notifications[slot_index];
+        if now.duration_since(last) < SOFTWARE_HAPTIC_MIN_INTERVAL {
+            return;
+        }
+        last_notifications[slot_index] = now;
+        drop(last_notifications);
+
+        let script = format!(
+            r#"display notification "Controller {slot} rumble ({level})" with title "Steam Haptics" subtitle "" sound name "Funk""#
+        );
+        match std::process::Command::new("osascript").args(["-e", &script]).spawn() {
+            Ok(_) => {}
             Err(error) => {
                 eprintln!(
                     "[steam_input] failed to post haptic notification for slot {}: {}",
@@ -1123,11 +1108,28 @@ fn notify_software_haptic(slot: u8, left_speed: u8, right_speed: u8, duration_ms
     }
 }
 
+/// Minimum interval between `osascript` haptic notifications per slot.
+#[cfg(target_os = "macos")]
+const SOFTWARE_HAPTIC_MIN_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Per-slot timestamp of the last `osascript` haptic notification.
+#[cfg(target_os = "macos")]
+static SOFTWARE_HAPTIC_LAST_NOTIFICATIONS: LazyLock<Mutex<[Instant; 4]>> = LazyLock::new(|| {
+    Mutex::new([Instant::now(); 4])
+});
+
 /// Sends a haptic rumble command to the physical controller associated with
 /// the given XInput `slot`.
 ///
 /// On **macOS** this function uses the IOKit framework to locate a matching
-/// HID device and deliver a 3-byte output report:
+/// HID device and deliver an output report. Only devices that present
+/// themselves as game controllers (HID usage page 1, usage Joystick/Game
+/// Pad) are considered, so keyboards, trackpads and other HID peripherals
+/// are never sent rumble reports. Microsoft Xbox 360-family controllers
+/// receive their native 8-byte rumble report; everything else gets a generic
+/// report:
+///
+/// Generic (3 bytes):
 ///
 /// | Offset | Meaning                        |
 /// |--------|--------------------------------|
@@ -1140,10 +1142,7 @@ fn notify_software_haptic(slot: u8, left_speed: u8, right_speed: u8, duration_ms
 pub(crate) fn send_hid_rumble(slot: u8, left_motor: u8, right_motor: u8) {
     #[cfg(target_os = "macos")]
     {
-        // Build the HID output report payload.
-        let report: [u8; 3] = [0x00, left_motor, right_motor];
-
-        if let Err(msg) = send_rumble_via_iokit(&report) {
+        if let Err(msg) = send_rumble_via_iokit(left_motor, right_motor) {
             // Fall back to software haptic if no physical controller found
             notify_software_haptic(slot, left_motor, right_motor, 200);
             eprintln!("send_hid_rumble (slot {slot}): {msg} (using software fallback)");
@@ -1160,6 +1159,10 @@ pub(crate) fn send_hid_rumble(slot: u8, left_motor: u8, right_motor: u8) {
 /// Extended rumble API supporting left/right motor speed, duration (ms),
 /// and frequency (Hz). Calls through to `send_hid_rumble` for the actual
 /// motor dispatch but adds timing/frequency envelope support.
+///
+/// Software haptic notifications are emitted only by `send_hid_rumble`'s
+/// fallback path (i.e. when no physical device received the report), so the
+/// fallback cannot double-notify.
 pub(crate) fn send_hid_rumble_ext(
     slot: u8,
     left_motor: u8,
@@ -1167,50 +1170,55 @@ pub(crate) fn send_hid_rumble_ext(
     duration_ms: u64,
     frequency_hz: u16,
 ) {
+    let freq_factor = if frequency_hz > 0 {
+        (frequency_hz as f32 / 100.0).min(2.0)
+    } else {
+        1.0
+    };
+    let scaled_left = (left_motor as f32 * freq_factor).min(255.0) as u8;
+    let scaled_right = (right_motor as f32 * freq_factor).min(255.0) as u8;
+
     // Update the software haptic state for this slot
-    if let Ok(mut state) = SOFTWARE_HAPTICS.lock() {
-        if let Some(slot_state) = state.get_mut(slot as usize) {
-            let now = Instant::now();
-            slot_state.left_end = now + std::time::Duration::from_millis(duration_ms);
-            slot_state.right_end = slot_state.left_end;
-            slot_state.left_speed = left_motor;
-            slot_state.right_speed = right_motor;
-            slot_state.active = true;
+    let Ok(mut state) = SOFTWARE_HAPTICS.lock() else {
+        send_hid_rumble(slot, left_motor, right_motor);
+        return;
+    };
+    let Some(slot_state) = state.get_mut(slot as usize) else {
+        drop(state);
+        send_hid_rumble(slot, left_motor, right_motor);
+        return;
+    };
+    let now = Instant::now();
+    slot_state.left_end = now + Duration::from_millis(duration_ms);
+    slot_state.right_end = slot_state.left_end;
+    slot_state.left_speed = left_motor;
+    slot_state.right_speed = right_motor;
+    slot_state.active = true;
+    drop(state);
 
-            // Scale motor values by frequency factor (higher freq = more intense perception)
-            let freq_factor = if frequency_hz > 0 {
-                (frequency_hz as f32 / 100.0).min(2.0)
-            } else {
-                1.0
-            };
-            let scaled_left = (left_motor as f32 * freq_factor).min(255.0) as u8;
-            let scaled_right = (right_motor as f32 * freq_factor).min(255.0) as u8;
-            drop(state);
-
-            // Send the rumble with scaled values
-            send_hid_rumble(slot, scaled_left, scaled_right);
-            notify_software_haptic(slot, scaled_left, scaled_right, duration_ms);
-            return;
-        }
-    }
-    // Fallback without state tracking
-    send_hid_rumble(slot, left_motor, right_motor);
-    notify_software_haptic(slot, left_motor, right_motor, duration_ms);
+    // Send the rumble with scaled values
+    send_hid_rumble(slot, scaled_left, scaled_right);
 }
 
 /// macOS-only: walks the IOService plane for `IOHIDDevice` entries and sends
-/// the provided HID output report to the *first* matching device.
+/// the rumble output report to the first **game controller** device.
 ///
 /// The function:
 /// 1. Calls `IOServiceMatching("IOHIDDevice")` to build a matching dictionary.
 /// 2. Iterates services with `IOIteratorNext`.
-/// 3. For each service, reads the `VendorID` / `ProductID` properties via
+/// 3. For each service, reads the `VendorID` / `ProductID` /
+///    `PrimaryUsagePage` / `PrimaryUsage` properties via
 ///    `IORegistryEntryCreateCFProperty` + `CFNumberGetValue`.
-/// 4. Creates an `IOHIDDeviceRef` with `IOHIDDeviceCreate`.
-/// 5. Calls `IOHIDDeviceSetReport` with `kIOHIDReportTypeOutput`.
+/// 4. Accepts only devices with a present VID/PID **and** HID usage
+///    page 1 with usage Joystick (4) or Game Pad (5) — keyboards, trackpads
+///    and other HID peripherals are skipped so the rumble report never goes
+///    to the wrong device.
+/// 5. Creates an `IOHIDDeviceRef` with `IOHIDDeviceCreate` and sends the
+///    report (Xbox 360-family devices get their native 8-byte rumble
+///    report; other game controllers get the generic 3-byte report).
 /// 6. Releases all IOKit / CF objects.
 #[cfg(target_os = "macos")]
-fn send_rumble_via_iokit(report: &[u8; 3]) -> Result<(), String> {
+fn send_rumble_via_iokit(left_motor: u8, right_motor: u8) -> Result<(), String> {
     use std::ffi::CString;
 
     // 1. Create a matching dictionary for IOHIDDevice services.
@@ -1234,117 +1242,134 @@ fn send_rumble_via_iokit(report: &[u8; 3]) -> Result<(), String> {
     }
 
     // Pre-create CFString keys for property lookups.
-    let vid_key = CString::new("VendorID").map_err(|e| e.to_string())?;
-    let pid_key = CString::new("ProductID").map_err(|e| e.to_string())?;
-
-    let vid_cfstr = unsafe {
-        CFStringCreateWithCString(
-            KCF_ALLOCATOR_DEFAULT,
-            vid_key.as_ptr(),
-            KCF_STRING_ENCODING_UTF8,
-        )
-    };
-    let pid_cfstr = unsafe {
-        CFStringCreateWithCString(
-            KCF_ALLOCATOR_DEFAULT,
-            pid_key.as_ptr(),
-            KCF_STRING_ENCODING_UTF8,
-        )
-    };
-
-    if vid_cfstr.is_null() || pid_cfstr.is_null() {
-        // Clean up what we can.
-        if !vid_cfstr.is_null() {
-            unsafe { CFRelease(vid_cfstr) };
+    let prop_keys = [
+        "VendorID",
+        "ProductID",
+        "PrimaryUsagePage",
+        "PrimaryUsage",
+    ];
+    let mut cf_keys = Vec::with_capacity(prop_keys.len());
+    for key in prop_keys {
+        let key_cstr = CString::new(key).map_err(|e| e.to_string())?;
+        let cfstr = unsafe {
+            CFStringCreateWithCString(
+                KCF_ALLOCATOR_DEFAULT,
+                key_cstr.as_ptr(),
+                KCF_STRING_ENCODING_UTF8,
+            )
+        };
+        if cfstr.is_null() {
+            for cfkey in &cf_keys {
+                unsafe { CFRelease(*cfkey) };
+            }
+            unsafe { IOObjectRelease(iterator) };
+            return Err(format!("Failed to create CFString key {key}"));
         }
-        if !pid_cfstr.is_null() {
-            unsafe { CFRelease(pid_cfstr) };
+        cf_keys.push(cfstr);
+    }
+    let (vid_key, pid_key, usage_page_key, usage_key) =
+        (cf_keys[0], cf_keys[1], cf_keys[2], cf_keys[3]);
+
+    /// Reads an SInt32 registry property, returning `None` when absent.
+    fn read_sint32_property(
+        service: u32,
+        key: *const std::ffi::c_void,
+    ) -> Result<Option<i32>, String> {
+        let cfnum = unsafe {
+            IORegistryEntryCreateCFProperty(
+                service,
+                key,
+                KCF_ALLOCATOR_DEFAULT,
+                KCF_PROPERTY_LIST_IMMUTABLE,
+            )
+        };
+        if cfnum.is_null() {
+            return Ok(None);
         }
-        unsafe { IOObjectRelease(iterator) };
-        return Err("Failed to create CFString keys".into());
+        let mut value: i32 = 0;
+        let ok = unsafe {
+            CFNumberGetValue(
+                cfnum,
+                KCF_NUMBER_SINT32_TYPE,
+                &mut value as *mut i32 as *mut std::ffi::c_void,
+            )
+        } != 0;
+        unsafe { CFRelease(cfnum) };
+        if ok {
+            Ok(Some(value))
+        } else {
+            Ok(None)
+        }
     }
 
     // 3. Iterate services.
     let mut device_ref: *mut std::ffi::c_void = std::ptr::null_mut();
+    let mut found_vid: i32 = 0;
+    let mut found_pid: i32 = 0;
     loop {
         let service = unsafe { IOIteratorNext(iterator) };
         if service == 0 {
             break;
         }
 
-        // Read VendorID via IORegistryEntryCreateCFProperty.
-        let vid_cfnum = unsafe {
-            IORegistryEntryCreateCFProperty(
-                service,
-                vid_cfstr,
-                KCF_ALLOCATOR_DEFAULT,
-                KCF_PROPERTY_LIST_IMMUTABLE,
-            )
-        };
-        let pid_cfnum = unsafe {
-            IORegistryEntryCreateCFProperty(
-                service,
-                pid_cfstr,
-                KCF_ALLOCATOR_DEFAULT,
-                KCF_PROPERTY_LIST_IMMUTABLE,
-            )
-        };
+        let vid = read_sint32_property(service, vid_key);
+        let pid = read_sint32_property(service, pid_key);
+        let usage_page = read_sint32_property(service, usage_page_key);
+        let usage = read_sint32_property(service, usage_key);
 
-        let mut found_vid: i32 = 0;
-        let mut found_pid: i32 = 0;
-        let vid_ok = if !vid_cfnum.is_null() {
-            let rc = unsafe {
-                CFNumberGetValue(
-                    vid_cfnum,
-                    KCF_NUMBER_SINT32_TYPE,
-                    &mut found_vid as *mut i32 as *mut std::ffi::c_void,
-                )
-            };
-            unsafe { CFRelease(vid_cfnum) };
-            rc != 0
-        } else {
-            false
-        };
-        let pid_ok = if !pid_cfnum.is_null() {
-            let rc = unsafe {
-                CFNumberGetValue(
-                    pid_cfnum,
-                    KCF_NUMBER_SINT32_TYPE,
-                    &mut found_pid as *mut i32 as *mut std::ffi::c_void,
-                )
-            };
-            unsafe { CFRelease(pid_cfnum) };
-            rc != 0
-        } else {
-            false
-        };
-
-        // We accept *any* HID device with both VendorID and ProductID
-        // properties (i.e. a game controller). If properties aren't present
-        // we skip this service.
-        if vid_ok && pid_ok && found_vid > 0 && found_pid > 0 {
-            // Create IOHIDDeviceRef from this service.
-            let candidate = unsafe { IOHIDDeviceCreate(KCF_ALLOCATOR_DEFAULT, service) };
-            if !candidate.is_null() {
-                device_ref = candidate;
+        let (vid, pid, usage_page, usage) = match (vid, pid, usage_page, usage) {
+            (Ok(vid), Ok(pid), Ok(usage_page), Ok(usage)) => (vid, pid, usage_page, usage),
+            _ => {
                 unsafe { IOObjectRelease(service) };
-                break;
+                continue;
             }
-        }
+        };
 
+        // Only accept devices that present themselves as game controllers:
+        // HID usage page 1 (Generic Desktop) with usage 4 (Joystick) or
+        // 5 (Game Pad), with a vendor/product pair.
+        let is_gamepad = matches!(
+            (vid, pid, usage_page, usage),
+            (Some(v), Some(p), Some(1), Some(4 | 5)) if v > 0 && p > 0
+        );
+        if !is_gamepad {
+            unsafe { IOObjectRelease(service) };
+            continue;
+        }
+        found_vid = vid.unwrap_or(0);
+        found_pid = pid.unwrap_or(0);
+
+        // 4. Create IOHIDDeviceRef from this service.
+        let candidate = unsafe { IOHIDDeviceCreate(KCF_ALLOCATOR_DEFAULT, service) };
         unsafe { IOObjectRelease(service) };
+        if !candidate.is_null() {
+            device_ref = candidate;
+            break;
+        }
     }
 
     // Release CF strings and iterator.
-    unsafe { CFRelease(vid_cfstr) };
-    unsafe { CFRelease(pid_cfstr) };
+    for cfkey in &cf_keys {
+        unsafe { CFRelease(*cfkey) };
+    }
     unsafe { IOObjectRelease(iterator) };
 
     if device_ref.is_null() {
-        return Err("No matching HID device found for rumble output".into());
+        return Err("No matching HID game controller found for rumble output".into());
     }
 
-    // 4. Send the HID output report.
+    // 5. Build the per-vendor HID output report.
+    //    Xbox 360 family (Microsoft VID 0x045E): report ID 0x00, magnitude
+    //    selector 0x08, then big/small motor bytes in the native 8-byte
+    //    layout. Other game controllers get the generic 3-byte report.
+    let xbox_360_pids = [0x028E, 0x028F, 0x0719]; // wired, wireless, wireless receiver
+    let is_xbox_360 = found_vid == 0x045E && xbox_360_pids.contains(&found_pid);
+    let report: Vec<u8> = if is_xbox_360 {
+        vec![0x00, 0x08, 0x00, 0x00, left_motor, right_motor, 0x00, 0x00]
+    } else {
+        vec![0x00, left_motor, right_motor]
+    };
+
     let kr2 = unsafe {
         IOHIDDeviceSetReport(
             device_ref,
@@ -1355,7 +1380,7 @@ fn send_rumble_via_iokit(report: &[u8; 3]) -> Result<(), String> {
         )
     };
 
-    // 5. Release the device reference.
+    // 6. Release the device reference.
     unsafe { CFRelease(device_ref) };
 
     if kr2 != 0 {
