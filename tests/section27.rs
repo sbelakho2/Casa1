@@ -21,7 +21,7 @@ use casa1::diagnostics::{
 };
 use casa1::perf::{FramePacer, FramePacingConfig};
 use casa1::steam_protocol::{
-    SteamProtocolCommand, SteamProtocolDispatchResult, SteamProtocolHandler, SteamProtocolStack,
+    SteamProtocolCommand, SteamProtocolDispatchResult, SteamProtocolHandler,
     parse_steam_protocol_url,
 };
 use std::path::Path;
@@ -188,11 +188,11 @@ fn t27_03_frame_capture_and_comparison() {
         "SSIM between identical frames should be ~1.0, got {ssim_same}"
     );
 
-    // PSNR between identical frames — should be INFINITY
+    // PSNR between identical frames — should be exactly INFINITY (mse == 0)
     let psnr_same = compute_psnr(&red.pixels, &red2.pixels, red.width, red.height);
-    assert!(
-        psnr_same.is_finite() || psnr_same.is_infinite(),
-        "PSNR should be finite or infinite, got {psnr_same}"
+    assert_eq!(
+        psnr_same, f64::INFINITY,
+        "PSNR between identical frames must be +inf, got {psnr_same}"
     );
 
     // PSNR between different frames — should be finite
@@ -237,10 +237,19 @@ fn t27_03_frame_capture_and_comparison() {
         result_diff.ssim < 1.0,
         "different frames should have SSIM < 1.0"
     );
-    // They should NOT pass with 0.0 tolerance
+    // Red vs blue at 0.0 tolerance matches 0% of pixels, so the comparison
+    // must FAIL (compare_frames passes only at >= 95% pixel match and
+    // SSIM >= 0.9) — a vacuous "may not pass" assertion is not enough.
     assert!(
-        !result_diff.passes || result_diff.ssim >= 0.9,
-        "different frames at 0.0 tolerance may not pass"
+        !result_diff.passes,
+        "solid red vs solid blue at 0.0 tolerance must not pass (ssim={}, match={:.2}%)",
+        result_diff.ssim,
+        result_diff.pixel_match_percentage
+    );
+    assert!(
+        result_diff.pixel_match_percentage < 1.0,
+        "red vs blue must match virtually no pixels at tolerance 0.0, got {:.2}%",
+        result_diff.pixel_match_percentage
     );
 
     // detect_text_regions on a simple solid-color frame (should return empty
@@ -265,11 +274,24 @@ fn t27_03_frame_capture_and_comparison() {
         }
     }
     let regions2 = detect_text_regions(&varied);
-    // May or may not detect regions depending on implementation;
-    // just verify no panic and it returns a Vec<TextRegion>
+    // The 10x10 white block sits inside the single 32x32 grid block at (0,0):
+    // gray(128) vs white(255) yields contrast 127 (> 80) with a mean of ~140,
+    // so exactly one text region is detected at the block's bounds. This pins
+    // the detector's grid semantics instead of accepting any count < 100.
+    assert_eq!(
+        regions2.len(),
+        1,
+        "the single high-contrast block must produce exactly one region, got {regions2:?}"
+    );
+    let region = &regions2[0];
+    assert_eq!(region.x, 0);
+    assert_eq!(region.y, 0);
+    assert_eq!(region.width, 32);
+    assert_eq!(region.height, 32);
     assert!(
-        regions2.len() < 100,
-        "text regions should be a reasonable count"
+        (region.confidence - (127.0 / 255.0)).abs() < 0.01,
+        "confidence must reflect the measured contrast, got {}",
+        region.confidence
     );
 }
 
@@ -410,15 +432,30 @@ fn t27_05_color_space_verification() {
     );
 
     // Verify the function returns consistent results across different color
-    // space inputs for the same frame
+    // space inputs for the same frame, and that re-verification is
+    // deterministic.
     let test_frame = FrameCapture::new_solid(16, 16, 128, 128, 128, 255);
     let r1 = verify_color_space(&test_frame, ColorSpace::SRGB).unwrap();
     let r2 = verify_color_space(&test_frame, ColorSpace::LinearSRGB).unwrap();
     let r3 = verify_color_space(&test_frame, ColorSpace::DisplayP3).unwrap();
-    // All should be bool
-    assert!(r1 == r1, "result should be consistent");
-    assert!(r2 == r2, "result should be consistent");
-    assert!(r3 == r3, "result should be consistent");
+    assert!(r1, "solid mid-gray must pass sRGB verification");
+    assert!(r2, "uniform mid-gray must pass LinearSRGB verification");
+    assert!(r3, "solid mid-gray must pass DisplayP3 verification");
+    assert_eq!(
+        r1,
+        verify_color_space(&test_frame, ColorSpace::SRGB).unwrap(),
+        "re-verification must be deterministic"
+    );
+    assert_eq!(
+        r2,
+        verify_color_space(&test_frame, ColorSpace::LinearSRGB).unwrap(),
+        "re-verification must be deterministic"
+    );
+    assert_eq!(
+        r3,
+        verify_color_space(&test_frame, ColorSpace::DisplayP3).unwrap(),
+        "re-verification must be deterministic"
+    );
 }
 
 // ===========================================================================
@@ -622,71 +659,58 @@ fn t27_07_behavioral_verifier_initialization() {
 
 #[test]
 fn t27_08_behavioral_verifier_steam_workflow() {
+    // The `run_*` workflow helpers connect to the real Steam CM servers, which
+    // must never be contacted in unit tests (src/steam_protocol.rs
+    // `steam_zero_touch_default_servers_not_contacted`). The verifier's own
+    // contract — step recording, pass/fail accounting, and reporting — is
+    // fully deterministic and is what this test pins.
+
     let mut verifier = BehavioralVerifier::new();
-    let mut stack = SteamProtocolStack::new();
-
-    // run_connect_to_cm — may fail if no Steam CM server reachable; verify
-    // graceful handling
-    let connected = verifier.run_connect_to_cm(&mut stack);
-    // Either true (connected) or false (not reachable) — both valid
     assert!(
-        connected || !connected,
-        "run_connect_to_cm should return bool"
+        !verifier.all_passed(),
+        "a verifier with no steps must not report success"
     );
+    assert!(verifier.results.is_empty(), "no steps recorded yet");
 
-    // run_send_logon with test credentials — will likely fail without a real
-    // Steam environment; verify graceful handling
-    let logon_result = verifier.run_send_logon(&mut stack, "test_user", "test_pass");
+    // Record a passing step: all_passed must flip to true and the summary
+    // must report exactly one passed step.
+    verifier.begin_step(BehavioralTestStep::ConnectToCM);
+    verifier.end_step(BehavioralTestStep::ConnectToCM, true, None);
+    assert!(verifier.all_passed(), "one passing step must pass the verifier");
+    assert_eq!(verifier.results.len(), 1);
+    assert!(verifier.results[0].passed);
+    assert!(verifier.summary().contains("1/1 steps passed"));
+
+    // Record a failing step: all_passed must flip back to false, the error
+    // must be recorded, and the summary must report 1/2 with the failure.
+    verifier.begin_step(BehavioralTestStep::SendLogon {
+        username: "test_user".to_string(),
+    });
+    verifier.end_step(
+        BehavioralTestStep::SendLogon {
+            username: "test_user".to_string(),
+        },
+        false,
+        Some("logon rejected".to_string()),
+    );
     assert!(
-        logon_result || !logon_result,
-        "run_send_logon should return bool"
+        !verifier.all_passed(),
+        "a failed step must fail the verifier"
     );
-
-    // run_browse_store — verify it returns bool
-    let browse_result = verifier.run_browse_store(&mut stack, "steam://store/730");
-    assert!(
-        browse_result || !browse_result,
-        "run_browse_store should return bool"
+    assert_eq!(verifier.results.len(), 2);
+    assert!(!verifier.results[1].passed);
+    assert_eq!(
+        verifier.results[1].error.as_deref(),
+        Some("logon rejected")
     );
-
-    // run_download_app — verify it returns bool
-    let download_result = verifier.run_download_app(&mut stack, 730);
-    assert!(
-        download_result || !download_result,
-        "run_download_app should return bool"
-    );
-
-    // run_launch_app — verify it returns bool
-    let launch_result = verifier.run_launch_app(&mut stack, 730);
-    assert!(
-        launch_result || !launch_result,
-        "run_launch_app should return bool"
-    );
-
-    // run_full_workflow — verify it returns bool
-    let workflow_result = verifier.run_full_workflow(&mut stack, "test_user", "test_pass", 730);
-    assert!(
-        workflow_result || !workflow_result,
-        "run_full_workflow should return bool"
-    );
-
-    // summary should reflect all attempted steps
     let summary = verifier.summary();
-    assert!(!summary.is_empty(), "summary should not be empty");
-    // At least one step should have been recorded
-    let results = &verifier.results;
-    assert!(
-        !results.is_empty(),
-        "at least one result should be recorded"
-    );
+    assert!(summary.contains("1/2 steps passed"), "got: {summary}");
+    assert!(summary.contains("FAIL"), "got: {summary}");
 
-    // Verify each result has consistent fields
-    for result in results {
-        assert!(
-            result.duration_ms > 0 || !result.passed,
-            "non-passing steps may have 0 duration"
-        );
-    }
+    // Every recorded step carries a duration_ms field. The exact value is
+    // intentionally not asserted: begin/end on a fast step is sub-millisecond
+    // and wall-clock timing must not be pinned.
+    assert_eq!(verifier.results.len(), 2, "both steps must be recorded");
 }
 
 // ===========================================================================
@@ -698,10 +722,17 @@ fn t27_09_stress_test_runner_configuration() {
     // Create a StressTestConfig::default()
     let config = StressTestConfig::default();
 
-    // Verify default values are reasonable
+    // Verify default values are reasonable. The exact default duration is
+    // intentionally not pinned (it has changed across releases); the
+    // documented invariants are that a default config is non-trivial and
+    // strictly longer than one cycle interval.
     assert!(
-        config.duration_seconds > 0,
-        "default duration should be > 0"
+        config.duration_seconds >= config.cycle_interval_seconds,
+        "default duration must be at least one cycle interval"
+    );
+    assert!(
+        config.duration_seconds >= 30,
+        "default duration must be a realistic stress-run length"
     );
     assert!(
         config.memory_leak_detection,
@@ -738,8 +769,12 @@ fn t27_09_stress_test_runner_configuration() {
     // Verify the runner initializes correctly with default config
     let default_runner = StressTestRunner::new(StressTestConfig::default());
     assert_eq!(
-        default_runner.config.duration_seconds, 60,
-        "default runner should have 60s duration"
+        default_runner.config.cycle_interval_seconds, 5,
+        "default runner must keep the documented default cycle interval"
+    );
+    assert!(
+        default_runner.config.duration_seconds >= 30,
+        "default runner must keep a realistic default duration"
     );
 }
 
@@ -869,11 +904,10 @@ fn t27_12_stress_test_network_resilience() {
         "network_reconnects should be >= 0"
     );
 
-    // Verify StressTestResult fields are populated
-    assert!(
-        result.elapsed_seconds == 0,
-        "elapsed_seconds should be 0 for this test"
-    );
+    // Verify StressTestResult fields are populated.
+    // `elapsed_seconds` is a u64 (whole seconds, cannot be negative); the
+    // exact value is intentionally not asserted (wall-clock timing).
+    let _elapsed = result.elapsed_seconds;
 }
 
 // ===========================================================================
@@ -1016,10 +1050,12 @@ fn t27_15_frame_pacer_integration() {
 
     // Begin a frame
     let delta = pacer.begin_frame();
-    // First frame delta should be zero
-    assert!(
-        delta.is_zero() || delta > Duration::ZERO,
-        "first frame delta should be zero or positive"
+    // The first frame has no previous frame, so the delta is exactly zero
+    // (a pacer that fabricates a nonzero delta on the first frame fails).
+    assert_eq!(
+        delta,
+        Duration::ZERO,
+        "first frame delta must be exactly zero"
     );
 
     // End the frame
@@ -1553,7 +1589,10 @@ fn t27_20_d3d12_resolve_subresource_various_formats() {
 
 #[test]
 fn t27_21_metal_backend_resolve_msaa_integration() {
-    use casa1::metal_backend::MetalGpuBackend;
+    use casa1::metal_backend::{
+        MetalGpuBackend, MetalRenderEncoder, MetalTexture, MsaaResolveConfig, MsaaResolveMode,
+        create_render_pass_descriptor, resolve_msaa,
+    };
 
     // Try to create a Metal backend
     let mut backend = match MetalGpuBackend::new() {
@@ -1565,7 +1604,6 @@ fn t27_21_metal_backend_resolve_msaa_integration() {
     };
 
     // Create MSAA source and resolve destination textures.
-    // create_texture takes (width, height, pixel_format, usage) and returns u64.
     let msaa = backend.create_texture(
         64,
         64,
@@ -1580,40 +1618,68 @@ fn t27_21_metal_backend_resolve_msaa_integration() {
         metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead,
     );
 
-    // The resolve_msaa function in metal_backend requires a MetalRenderEncoder.
-    // We verify the types exist and the resolve configuration is accessible.
-    // For a full integration test, this would be done within a render pass.
-    use casa1::metal_backend::{MsaaResolveConfig, MsaaResolveMode};
+    let src_info = backend
+        .get_texture(msaa)
+        .expect("MSAA texture should exist in backend");
+    let resolve_info = backend
+        .get_texture(resolve)
+        .expect("Resolve texture should exist in backend");
+    assert_eq!(src_info.width(), 64, "MSAA source should have width 64");
+    assert_eq!(
+        resolve_info.width(),
+        64,
+        "Resolve target should have width 64"
+    );
+
+    // Exercise the real resolve path end-to-end: build a render encoder from
+    // the backend's command queue, wrap the textures, and call resolve_msaa.
+    // Previously this test only created textures and never called the resolve.
+    let cmd_buffer = backend.command_queue().new_command_buffer();
+    let descriptor = create_render_pass_descriptor(src_info, None);
+    let mut encoder = MetalRenderEncoder::new(cmd_buffer, descriptor)
+        .expect("render encoder must be creatable");
+
     let config = MsaaResolveConfig {
         sample_count: 4,
         resolve_mode: MsaaResolveMode::Average,
         custom_resolve_shader: None,
     };
+    let src_wrapped = MetalTexture {
+        handle: msaa,
+        texture: src_info.to_owned(),
+        width: 64,
+        height: 64,
+        format: casa1::metal_backend::PixelFormat::Bgra8Unorm,
+    };
+    let dst_wrapped = MetalTexture {
+        handle: resolve,
+        texture: resolve_info.to_owned(),
+        width: 64,
+        height: 64,
+        format: casa1::metal_backend::PixelFormat::Bgra8Unorm,
+    };
 
-    // Verify config is constructed correctly
-    assert_eq!(config.sample_count, 4, "MSAA sample count should be 4");
+    resolve_msaa(&mut encoder, &src_wrapped, &dst_wrapped, &config)
+        .expect("average resolve must succeed on matching textures");
+
+    // Dimension mismatch must be rejected by the resolve path itself.
+    let bad_dst = MetalTexture {
+        handle: 0,
+        texture: resolve_info.to_owned(),
+        width: 32,
+        height: 32,
+        format: casa1::metal_backend::PixelFormat::Bgra8Unorm,
+    };
+    let mismatch = resolve_msaa(&mut encoder, &src_wrapped, &bad_dst, &config)
+        .expect_err("resolve with mismatched dimensions must fail");
     assert_eq!(
-        config.resolve_mode as u32, 0,
-        "Average resolve mode should be 0"
+        mismatch.code,
+        casa1::reason::ReasonCode::RcCliInvalid,
+        "dimension mismatch must be reported with RcCliInvalid"
     );
 
-    // Get texture info (existence check)
-    let msaa_info = backend.get_texture(msaa);
-    assert!(msaa_info.is_some(), "MSAA texture should exist in backend");
-    let resolve_info = backend.get_texture(resolve);
-    assert!(
-        resolve_info.is_some(),
-        "Resolve texture should exist in backend"
-    );
-
-    if let (Some(msaa_info), Some(resolve_info)) = (msaa_info, resolve_info) {
-        assert_eq!(msaa_info.width(), 64, "MSAA source should have width 64");
-        assert_eq!(
-            resolve_info.width(),
-            64,
-            "Resolve target should have width 64"
-        );
-    }
+    encoder.end_encoding();
+    cmd_buffer.commit();
 
     // Clean up - destroy_texture returns ()
     backend.destroy_texture(msaa);

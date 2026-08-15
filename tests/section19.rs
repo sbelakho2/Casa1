@@ -12,18 +12,23 @@ use casa1::cef_bridge::{
     CefBridge, CefBrowserSettings, CefSettings, CefWindowInfo, WKWebViewConfig, WKWebViewManager,
 };
 
-/// Helper: create and initialize a CefBridge. Returns `None` (and prints a
-/// skip note) when WKWebView is unavailable so the calling test can return
-/// early without failing.
+/// Helper: create and initialize a CefBridge.
+///
+/// Gating is done on an explicit capability probe (`WKWebViewManager::is_available` —
+/// the same probe `cef_initialize` consults internally), NOT on the init result:
+/// previously any `cef_initialize` failure silently passed the whole CEF suite. If the
+/// probe reports WKWebView available but initialization still fails, that is a real
+/// failure and the calling test fails.
 fn init_cef() -> Option<CefBridge> {
-    let mut bridge = CefBridge::new();
-    match bridge.cef_initialize(CefSettings::default()) {
-        Ok(()) => Some(bridge),
-        Err(e) => {
-            eprintln!("note: CEF test skipped — WKWebView unavailable ({:?})", e);
-            None
-        }
+    if !WKWebViewManager::new().is_available() {
+        eprintln!("note: CEF test skipped — WKWebView unavailable");
+        return None;
     }
+    let mut bridge = CefBridge::new();
+    bridge
+        .cef_initialize(CefSettings::default())
+        .expect("CEF init must succeed when the availability probe reports available");
+    Some(bridge)
 }
 
 // ---------------------------------------------------------------------------
@@ -139,6 +144,33 @@ fn t19_3_navigation_history() {
     // In our simulated mode, can_go_back starts as false
     assert!(result.is_err(), "go_back should fail when no back history");
 
+    // Drive the load-handler callback the way a completed WKWebView navigation
+    // would: the delegate reports that back-navigation history now exists.
+    bridge.on_loading_state_change(handle, false, true, false);
+
+    // Back must now succeed, and forward must still be rejected.
+    assert!(
+        bridge.cef_browser_go_back(handle).is_ok(),
+        "go_back must succeed once back history exists"
+    );
+    assert!(
+        bridge.cef_browser_go_forward(handle).is_err(),
+        "go_forward must fail when no forward history"
+    );
+
+    // A forward navigation makes forward history available again.
+    bridge.on_loading_state_change(handle, false, false, true);
+    assert!(
+        bridge.cef_browser_go_forward(handle).is_ok(),
+        "go_forward must succeed once forward history exists"
+    );
+
+    // The browser must remain valid through the navigation cycle.
+    assert!(
+        bridge.cef_browser_is_valid(handle),
+        "browser must remain valid after navigation"
+    );
+
     bridge.cef_shutdown().expect("shutdown");
 }
 
@@ -170,12 +202,16 @@ fn t19_4_javascript_execution() {
         .cef_frame_execute_java_script(handle, 1, "1+1")
         .expect("execute JS");
 
-    // In simulated mode, the result may be empty (no real JS engine)
-    // but the call should succeed without error
-    assert!(
-        result.is_empty() || result == "2",
-        "JS execution should succeed, got: {result}"
-    );
+    // Documented contract for the JS result: with a real WKWebView that delivers a
+    // synchronous evaluation result, "1+1" must evaluate to "2". In the simulated
+    // software-buffer mode there is no JS engine and the documented result is the
+    // empty string. Anything else (a no-op engine, an error string, partial output)
+    // is a failure.
+    match result.as_str() {
+        "2" => {}
+        "" => {}
+        other => panic!("unexpected JS result {other:?} for 1+1"),
+    }
 
     bridge.cef_shutdown().expect("shutdown");
 }
@@ -388,14 +424,16 @@ fn t19_8_browser_close_lifecycle() {
 
 #[test]
 fn t19_9_cef_double_init_rejected() {
-    let mut bridge = CefBridge::new();
-
-    // First initialization — may fail in headless environments
-    let first = bridge.cef_initialize(CefSettings::default());
-    if first.is_err() {
+    if !WKWebViewManager::new().is_available() {
         eprintln!("note: t19_9 skipped — WKWebView unavailable");
         return;
     }
+    let mut bridge = CefBridge::new();
+
+    // First initialization must succeed when the probe reports availability.
+    bridge
+        .cef_initialize(CefSettings::default())
+        .expect("first init must succeed when WKWebView is available");
 
     // Second initialization should fail
     let result = bridge.cef_initialize(CefSettings::default());
@@ -414,56 +452,53 @@ fn t19_10_wkwebview_manager_creation() {
 
     // On macOS, WKWebView may or may not be available depending on the test
     // environment. On CI or headless systems, it may not be available.
-    // We just verify the manager can be created without panicking.
-    let _ = manager.is_available();
-
-    // If WKWebView is available, try creating a webview
-    if manager.is_available() {
-        let config = WKWebViewConfig {
-            width: 800.0,
-            height: 600.0,
-            java_script_enabled: true,
-            user_agent: Some("Casa1 Test Agent".to_string()),
-        };
-
-        let handle = manager.create_webview(config);
-        match handle {
-            Ok(h) => {
-                assert!(h.0 > 0, "WKWebView handle should be non-zero");
-                assert_eq!(manager.active_count(), 1, "should have 1 active view");
-
-                // Navigate
-                manager
-                    .navigate(h, "https://example.com")
-                    .expect("navigate");
-
-                // Verify URL
-                assert_eq!(
-                    manager.current_url(h),
-                    Some("https://example.com"),
-                    "URL should be set after navigation"
-                );
-
-                // Check dimensions
-                let dims = manager.dimensions(h);
-                assert!(dims.is_some(), "dimensions should be available");
-                let (w, h_val) = dims.unwrap();
-                assert_eq!(w, 800.0, "width should be 800");
-                assert_eq!(h_val, 600.0, "height should be 600");
-
-                // Close
-                manager.close(h);
-                assert_eq!(
-                    manager.active_count(),
-                    0,
-                    "should have 0 active views after close"
-                );
-            }
-            Err(_) => {
-                // WKWebView creation failed — acceptable in headless environments
-            }
-        }
+    if !manager.is_available() {
+        eprintln!("note: t19_10 skipped — WKWebView unavailable");
+        manager.close_all();
+        return;
     }
+
+    let config = WKWebViewConfig {
+        width: 800.0,
+        height: 600.0,
+        java_script_enabled: true,
+        user_agent: Some("Casa1 Test Agent".to_string()),
+    };
+
+    // The probe reported WKWebView available, so view creation must succeed —
+    // a broken manager must not pass silently.
+    let handle = manager
+        .create_webview(config)
+        .expect("create_webview must succeed when WKWebView is available");
+    assert!(handle.0 > 0, "WKWebView handle should be non-zero");
+    assert_eq!(manager.active_count(), 1, "should have 1 active view");
+
+    // Navigate
+    manager
+        .navigate(handle, "https://example.com")
+        .expect("navigate");
+
+    // Verify URL
+    assert_eq!(
+        manager.current_url(handle),
+        Some("https://example.com"),
+        "URL should be set after navigation"
+    );
+
+    // Check dimensions
+    let dims = manager.dimensions(handle);
+    assert!(dims.is_some(), "dimensions should be available");
+    let (w, h_val) = dims.unwrap();
+    assert_eq!(w, 800.0, "width should be 800");
+    assert_eq!(h_val, 600.0, "height should be 600");
+
+    // Close
+    manager.close(handle);
+    assert_eq!(
+        manager.active_count(),
+        0,
+        "should have 0 active views after close"
+    );
 
     manager.close_all();
 }

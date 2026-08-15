@@ -523,15 +523,19 @@ fn t26_09_metal_buffer_operations() {
 }
 
 // ===========================================================================
-// t26_10 — Vulkan Shader Compilation (via MoltenVK)
+// t26_10 — Vulkan loader reporting contract (via MoltenVK)
 // ===========================================================================
 
 #[test]
-fn t26_10_vulkan_shader_compilation() {
-    // Access the Vulkan loader via the vkgl module.
+fn t26_10_vulkan_loader_reporting_contract() {
+    // There is no runtime MoltenVK shader compiler in the emulated stack, so
+    // this test pins the loader's *reporting contract* and its behavioral
+    // consequences: the advertised capability constants, the consistency of
+    // the enumeration accessors with the loader's own state, and the
+    // render-sample rejection of unadvertised extensions.
     let loader = vkgl::vulkan_loader();
 
-    // Verify the loader reports valid capabilities.
+    // Documented loader-reporting contract values.
     assert!(loader.supported, "Vulkan loader should report supported");
     assert_eq!(
         loader.backend,
@@ -547,26 +551,58 @@ fn t26_10_vulkan_shader_compilation() {
         "physical device name must not be empty"
     );
 
-    // Verify instance and device extensions are populated.
-    let instance_exts = loader.enumerate_instance_extension_properties();
-    assert!(
-        !instance_exts.is_empty(),
-        "must report at least one instance extension"
+    // Enumeration accessors must be consistent with the loader's state, not
+    // independently fabricated.
+    assert_eq!(
+        loader.enumerate_instance_extension_properties(),
+        loader.instance_extensions,
+        "instance extension enumeration must reflect the loader state"
     );
-    let device_exts = loader.enumerate_physical_devices();
-    assert!(
-        !device_exts.is_empty(),
-        "must report at least one physical device"
+    assert_eq!(
+        loader.enumerate_physical_devices(),
+        vec![loader.physical_device_name.clone()],
+        "physical device enumeration must reflect the loader state"
     );
 
-    // Test loading with supported=false returns Err.
+    // Behavioral consequence: a sample that only requests advertised
+    // extensions must render; one that requests an unadvertised extension
+    // must be rejected with the documented reason code.
+    let ok_sample = vkgl::VulkanSample {
+        name: "contract-probe".to_string(),
+        required_instance_extensions: vec!["VK_KHR_surface".to_string()],
+        required_device_extensions: vec!["VK_KHR_swapchain".to_string()],
+        clear_color: [0, 0, 0, 255],
+        draw_calls: 1,
+        compute_dispatches: 0,
+    };
+    assert!(
+        loader.render_sample(&ok_sample).is_ok(),
+        "sample with advertised extensions must render"
+    );
+
+    let bad_sample = vkgl::VulkanSample {
+        name: "contract-probe-bad".to_string(),
+        required_instance_extensions: vec!["VK_KHR_surface".to_string()],
+        required_device_extensions: vec!["VK_EXT_mesh_shader".to_string()],
+        clear_color: [0, 0, 0, 255],
+        draw_calls: 1,
+        compute_dispatches: 0,
+    };
+    assert_eq!(
+        loader.render_sample(&bad_sample).expect_err("must reject").code,
+        casa1::reason::ReasonCode::RcVulkanNotSupported,
+        "unadvertised extensions must be rejected with RcVulkanNotSupported"
+    );
+
+    // Negative check: loading with supported=false returns the documented
+    // error.
     let unsupported = vkgl::load_vulkan_loader(false);
-    assert!(
-        unsupported.is_err(),
-        "loading with supported=false should return Err"
+    assert_eq!(
+        unsupported.expect_err("supported=false must fail").code,
+        casa1::reason::ReasonCode::RcVulkanNotSupported
     );
 
-    // Test OpenGL driver access.
+    // OpenGL driver reporting contract.
     let gl = vkgl::opengl_driver();
     assert!(gl.supported, "OpenGL driver should report supported");
     assert!(!gl.version.is_empty(), "OpenGL version must not be empty");
@@ -586,17 +622,34 @@ fn t26_11_shader_feature_detection() {
     let backend = GraphicsBackend::new();
     let caps: &MetalCapabilities = backend.capabilities();
 
-    // Verify basic capability fields are accessible without panicking.
-    let _unified = caps.unified_memory;
-    let _arg_bufs = caps.argument_buffers;
-    let _memoryless = caps.memoryless_render_targets;
-    let _ts = caps.timestamp_queries;
-    let _ms = caps.mesh_shaders;
+    // Documented feature-query contract (src/gfx.rs `query_feature`):
+    // Tearing is always reported, and every other query must mirror its
+    // capability bit.
+    assert!(
+        backend.query_feature(gfx::FeatureQuery::Tearing),
+        "Tearing is a documented always-on feature"
+    );
+    assert_eq!(
+        backend.query_feature(gfx::FeatureQuery::TimestampQueries),
+        caps.timestamp_queries,
+        "timestamp query support must mirror the capability bit"
+    );
+    assert_eq!(
+        backend.query_feature(gfx::FeatureQuery::MeshShaders),
+        caps.mesh_shaders,
+        "mesh shader support must mirror the capability bit"
+    );
+    assert_eq!(
+        backend.query_feature(gfx::FeatureQuery::Raytracing),
+        caps.raytracing,
+        "raytracing support must mirror the capability bit"
+    );
 
-    // FeatureQuery enum values can be queried.
-    let _tearing = backend.query_feature(gfx::FeatureQuery::Tearing);
-    let _timestamps = backend.query_feature(gfx::FeatureQuery::TimestampQueries);
-    let _mesh = backend.query_feature(gfx::FeatureQuery::MeshShaders);
+    // Argument buffers are a documented baseline capability of the backend.
+    assert!(
+        caps.argument_buffers,
+        "argument buffers must be supported"
+    );
 
     // Verify format support reports mappings for common formats.
     let fmt_rgba = gfx::format_mapping(DxgiFormat::R8G8B8A8Unorm);
@@ -606,8 +659,20 @@ fn t26_11_shader_feature_detection() {
     let fmt_depth = gfx::format_mapping(DxgiFormat::D32Float);
     assert!(fmt_depth.is_ok(), "expected Ok, got {fmt_depth:?}");
 
-    // Invalid/unknown feature queries should not panic.
-    // (FeatureQuery is an enum so all variants are valid.)
+    // The mapping must be a real mapping: the Metal pixel format differs from
+    // the DXGI format for BC7-sRGB (block-compressed, converted in shaders).
+    let bc7 = gfx::format_mapping(DxgiFormat::Bc7UnormSrgb)
+        .expect("BC7 sRGB must map");
+    assert_eq!(
+        bc7.metal,
+        casa1::gfx::MtlPixelFormat::Bc7RgbaUnormSrgb,
+        "BC7 sRGB must map to its Metal block-compressed format"
+    );
+    assert_eq!(
+        bc7.strategy,
+        casa1::gfx::EmulationStrategy::ConversionShader,
+        "block-compressed formats require a conversion shader"
+    );
 }
 
 // ===========================================================================
@@ -737,8 +802,9 @@ fn t26_13_dxil_container_reflection() {
     let rs_bytes: Vec<u8> = vec![
         0x02, 0x00, 0x00, 0x00, // descriptor_count = 2
         0x04, 0x00, 0x00, 0x00, // root_constants_count = 4
-        // descriptor 0: CBV at register 0, space 0
-        0x03, 0x00, 0x00, 0x01, 0x00, 0x00, // descriptor 1: SRV at register 1, space 0
+        // descriptor 0 (bytes 8..14): kind=3 (CBV), register=0, space=0, count=1, arg_buf=0, binding=0
+        0x03, 0x00, 0x00, 0x01, 0x00, 0x00,
+        // descriptor 1 (bytes 14..20): kind=1 (SRV), register=1, space=0, count=1, arg_buf=0, binding=1
         0x01, 0x01, 0x00, 0x01, 0x00, 0x01,
     ];
     let rs = parse_root_signature(&rs_bytes);
@@ -1016,42 +1082,56 @@ fn t26_23_alternate_stream_write_and_read() {
     let stream_data = b"Zone.Identifier content with Mark-of-the-Web";
     let write_result =
         fs.write_alternate_stream("C:\\test_ads.txt", "Zone.Identifier", stream_data);
-    // On macOS this uses xattr, on other platforms uses sidecar files
-    // It may fail if the platform doesn't support xattr, which is acceptable
-    if let Ok(()) = write_result {
-        // Read the stream back
-        let read_result = fs.read_alternate_stream("C:\\test_ads.txt", "Zone.Identifier");
-        assert!(read_result.is_ok(), "Should read back the alternate stream");
-        let read_data = read_result.unwrap();
-        assert_eq!(
-            read_data.as_slice(),
-            stream_data,
-            "Stream data should match"
-        );
+    match write_result {
+        Ok(()) => {
+            // Read the stream back
+            let read_result = fs.read_alternate_stream("C:\\test_ads.txt", "Zone.Identifier");
+            assert!(read_result.is_ok(), "Should read back the alternate stream");
+            let read_data = read_result.unwrap();
+            assert_eq!(
+                read_data.as_slice(),
+                stream_data,
+                "Stream data should match"
+            );
 
-        // List streams
-        let list_result = fs.list_alternate_streams("C:\\test_ads.txt");
-        assert!(list_result.is_ok(), "Should list alternate streams");
-        let streams = list_result.unwrap();
-        assert!(
-            streams.contains(&"Zone.Identifier".to_string()),
-            "Zone.Identifier should be in the stream list"
-        );
+            // List streams
+            let list_result = fs.list_alternate_streams("C:\\test_ads.txt");
+            assert!(list_result.is_ok(), "Should list alternate streams");
+            let streams = list_result.unwrap();
+            assert!(
+                streams.contains(&"Zone.Identifier".to_string()),
+                "Zone.Identifier should be in the stream list"
+            );
 
-        // Delete the stream
-        let delete_result = fs.delete_alternate_stream("C:\\test_ads.txt", "Zone.Identifier");
-        assert!(delete_result.is_ok(), "Should delete the alternate stream");
+            // Delete the stream
+            let delete_result = fs.delete_alternate_stream("C:\\test_ads.txt", "Zone.Identifier");
+            assert!(delete_result.is_ok(), "Should delete the alternate stream");
 
-        // Verify deletion
-        let read_after = fs.read_alternate_stream("C:\\test_ads.txt", "Zone.Identifier");
-        assert!(
-            read_after.is_err(),
-            "Stream should not exist after deletion"
-        );
+            // Verify deletion
+            let read_after = fs.read_alternate_stream("C:\\test_ads.txt", "Zone.Identifier");
+            assert!(
+                read_after.is_err(),
+                "Stream should not exist after deletion"
+            );
+        }
+        Err(error) => {
+            // Documented platform-limitation path: the failure must use the
+            // documented reason code for unsupported ADS operations, and the
+            // base file must be unaffected (no partial stream state).
+            assert_eq!(
+                error.code,
+                casa1::reason::ReasonCode::RcUnimplInsn,
+                "unsupported ADS writes must fail with the documented reason code: {error:?}"
+            );
+            let streams = fs
+                .list_alternate_streams("C:\\test_ads.txt")
+                .expect("listing must still work");
+            assert!(
+                streams.is_empty(),
+                "a failed write must not leave partial stream state"
+            );
+        }
     }
-    // If write_alternate_stream fails (e.g., xattr not supported on this platform),
-    // we just skip the readback assertions — the test is still considered passing
-    // as the ADS layer correctly reports platform limitations.
 }
 
 // ---------------------------------------------------------------------------
@@ -1107,42 +1187,56 @@ fn t26_25_multiple_alternate_streams() {
     file.flush().unwrap();
     drop(file);
 
-    // Write multiple alternate streams
-    let r1 = fs.write_alternate_stream("C:\\multi_ads.txt", "Stream1", b"data1");
-    let r2 = fs.write_alternate_stream("C:\\multi_ads.txt", "Stream2", b"data2");
-    let r3 = fs.write_alternate_stream("C:\\multi_ads.txt", "Stream3", b"data3");
-
-    // If any write succeeded, verify listing
-    if r1.is_ok() && r2.is_ok() && r3.is_ok() {
-        let list_result = fs.list_alternate_streams("C:\\multi_ads.txt");
-        assert!(list_result.is_ok(), "Should list multiple streams");
-        let streams = list_result.unwrap();
-        assert!(
-            streams.contains(&"Stream1".to_string()),
-            "Stream1 should be listed"
-        );
-        assert!(
-            streams.contains(&"Stream2".to_string()),
-            "Stream2 should be listed"
-        );
-        assert!(
-            streams.contains(&"Stream3".to_string()),
-            "Stream3 should be listed"
-        );
-
-        // Verify each stream's data
-        let d1 = fs
-            .read_alternate_stream("C:\\multi_ads.txt", "Stream1")
-            .unwrap();
-        assert_eq!(d1, b"data1");
-        let d2 = fs
-            .read_alternate_stream("C:\\multi_ads.txt", "Stream2")
-            .unwrap();
-        assert_eq!(d2, b"data2");
-        let d3 = fs
-            .read_alternate_stream("C:\\multi_ads.txt", "Stream3")
-            .unwrap();
-        assert_eq!(d3, b"data3");
+    // Write multiple alternate streams, tracking which writes actually
+    // succeeded so the assertions verify per-stream independence: every
+    // successfully written stream must be listed and must round-trip its own
+    // data, and no phantom streams may appear.
+    let writes = [
+        ("Stream1", b"data1".as_slice()),
+        ("Stream2", b"data2".as_slice()),
+        ("Stream3", b"data3".as_slice()),
+    ];
+    let mut written = Vec::new();
+    for (name, data) in &writes {
+        match fs.write_alternate_stream("C:\\multi_ads.txt", name, data) {
+            Ok(()) => written.push(*name),
+            Err(error) => {
+                assert_eq!(
+                    error.code,
+                    casa1::reason::ReasonCode::RcUnimplInsn,
+                    "unsupported ADS writes must use the documented reason code: {error:?}"
+                );
+            }
+        }
     }
-    // If ADS operations are not supported, just skip assertions
+
+    let list_result = fs.list_alternate_streams("C:\\multi_ads.txt");
+    assert!(list_result.is_ok(), "Should list multiple streams");
+    let streams = list_result.unwrap();
+
+    for name in &written {
+        assert!(
+            streams.contains(&name.to_string()),
+            "{name} should be listed after its successful write"
+        );
+        let data = fs
+            .read_alternate_stream("C:\\multi_ads.txt", name)
+            .unwrap_or_else(|e| panic!("read {name} back: {e:?}"));
+        let expected = writes
+            .iter()
+            .find(|(n, _)| *n == *name)
+            .map(|(_, d)| *d)
+            .unwrap();
+        assert_eq!(
+            data, expected,
+            "each stream must round-trip exactly its own data"
+        );
+    }
+
+    // No streams beyond the ones written may appear.
+    assert_eq!(
+        streams.len(),
+        written.len(),
+        "stream listing must contain exactly the successfully written streams, got {streams:?}"
+    );
 }

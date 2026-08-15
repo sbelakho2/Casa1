@@ -99,12 +99,13 @@ fn build_test_pe_with_icon() -> Vec<u8> {
     let section_offset = 0x138usize;
     // Name: ".rsrc\0\0\0"
     pe[section_offset..section_offset + 8].copy_from_slice(b".rsrc\0\0\0");
-    // VirtualSize = 0x0C28 (must cover group icon at 0x1100 + icon DIB at 0x1200..0x1C28)
-    pe[section_offset + 8..section_offset + 12].copy_from_slice(&0x0C28u32.to_le_bytes());
+    // VirtualSize = 0x12A8 (must cover group icon at 0x1100 and the full icon DIB
+    // at 0x1200..0x22A8: 40-byte header + 4096 pixels + 128-byte AND mask = 0x10A8)
+    pe[section_offset + 8..section_offset + 12].copy_from_slice(&0x12A8u32.to_le_bytes());
     // VirtualAddress = 0x1000
     pe[section_offset + 12..section_offset + 16].copy_from_slice(&0x1000u32.to_le_bytes());
-    // SizeOfRawData = 0x0C28 (match VirtualSize so pe.rs can read all referenced data)
-    pe[section_offset + 16..section_offset + 20].copy_from_slice(&0x0C28u32.to_le_bytes());
+    // SizeOfRawData = 0x12A8 (match VirtualSize so pe.rs can read all referenced data)
+    pe[section_offset + 16..section_offset + 20].copy_from_slice(&0x12A8u32.to_le_bytes());
     // PointerToRawData = 0x1000
     pe[section_offset + 20..section_offset + 24].copy_from_slice(&0x1000u32.to_le_bytes());
     // Characteristics = IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE | IMAGE_SCN_CNT_INITIALIZED_DATA
@@ -249,7 +250,9 @@ fn build_test_pe_with_icon() -> Vec<u8> {
 
     // ── Data entry for RT_ICON at 0x10C0 ─────────────────────────────────────
     w32(&mut pe, 0x10C0, 0x1200); // Data RVA → icon pixels at 0x1200
-    w32(&mut pe, 0x10C4, 0x0A28); // Size = 2600 bytes (approx for 32×32 32bpp DIB)
+    // Size = 0x10A8 (4264 bytes): 40-byte BITMAPINFOHEADER + 4096 pixels +
+    // 128-byte AND mask — must match the bytes actually written below.
+    w32(&mut pe, 0x10C4, 0x10A8);
     w32(&mut pe, 0x10C8, 0);
     w32(&mut pe, 0x10CC, 0);
 
@@ -266,7 +269,7 @@ fn build_test_pe_with_icon() -> Vec<u8> {
     pe[0x1109] = 0; // reserved
     w16(&mut pe, 0x110A, 1); // planes
     w16(&mut pe, 0x110C, 32); // bpp
-    w32(&mut pe, 0x110E, 0x0A28); // size
+    w32(&mut pe, 0x110E, 0x10A8); // size (matches the RT_ICON data entry)
     w16(&mut pe, 0x1112, 2); // icon_id (links to RT_ICON name ID)
 
     // ── RT_ICON bitmap data at RVA 0x1200 ────────────────────────────────────
@@ -275,8 +278,8 @@ fn build_test_pe_with_icon() -> Vec<u8> {
     //   Pixel data (32*32*4 = 4096 bytes)  — BGRA, bottom-up
     //   AND mask (32*4 = 128 bytes) — 1bpp, row-padded to 32 bits
     let bmp_header_offset = data_start + (0x1200 - section_rva) as usize;
-    // Ensure space
-    pe.resize(bmp_header_offset + 0x0A28, 0);
+    // Ensure space for the full DIB: 40 + 4096 + 128 = 0x10A8 bytes
+    pe.resize(bmp_header_offset + 0x10A8, 0);
 
     // BITMAPINFOHEADER (40 bytes)
     // biSize = 40

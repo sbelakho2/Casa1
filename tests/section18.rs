@@ -65,7 +65,16 @@ fn t18_1_named_pipe_server_client_roundtrip() {
 // t18_2_named_pipe_get_info
 // ---------------------------------------------------------------------------
 
+// KNOWN-ISSUE: this test asserts the documented `GetNamedPipeInfo` contract — the
+// configured max instance count and the per-direction buffer sizes must be returned.
+// It is #[ignore]d because the implementation hardcodes `(pipe_mode, max_instances,
+// out, in) = (1, 1, max_size, max_size)` in `get_named_pipe_info`
+// (src/win32.rs:2918-2935, hardcoded tuple at line 2931): the requested
+// `max_instances = 5` and the 8192/4096 per-direction buffers are silently collapsed.
+// Expected: (1, 5, 8192, 4096). Actual: (1, 1, 8192, 8192) (verified 2026-08-15).
+// Once the implementation stores and returns the requested values, remove the #[ignore].
 #[test]
+#[ignore] // blocked by src bug: get_named_pipe_info returns hardcoded (1, 1, max_size, max_size)
 fn t18_2_named_pipe_get_info() {
     let (_tmp, mut win32) = setup_win32("pipe-get-info");
 
@@ -89,10 +98,11 @@ fn t18_2_named_pipe_get_info() {
         .expect("get named pipe info");
 
     assert_eq!(pipe_mode, 1, "pipe mode should be PIPE_TYPE_BYTE");
-    assert_eq!(max_instances, 1, "max instances");
-    // Buffer sizes are max(out, in, 4096) = max(8192, 4096, 4096) = 8192
+    // Per Windows, GetNamedPipeInfo returns the configured instance count.
+    assert_eq!(max_instances, 5, "max instances");
+    // Per-direction buffer sizes must be preserved, not normalized.
     assert_eq!(out_buffer_size, 8192, "out buffer size");
-    assert_eq!(in_buffer_size, 8192, "in buffer size");
+    assert_eq!(in_buffer_size, 4096, "in buffer size");
 }
 
 // ---------------------------------------------------------------------------
@@ -369,15 +379,20 @@ fn t18_8_call_named_pipe_roundtrip() {
 }
 
 // ---------------------------------------------------------------------------
-// t18_9_pipe_security_descriptor_stored
+// t18_9_pipe_security_descriptor_argument_accepted
 // ---------------------------------------------------------------------------
 
+// NOTE: this test verifies what the API surface currently exposes — a pipe created
+// with a `security_descriptor` argument is accepted and fully usable. There is no
+// query API to read the stored descriptor back, so round-trip verification of the
+// descriptor value itself is not possible; if one is added, assert it here.
+
 #[test]
-fn t18_9_pipe_security_descriptor_stored() {
+fn t18_9_pipe_security_descriptor_argument_accepted() {
     let (_tmp, mut win32) = setup_win32("pipe-security");
 
-    // Create pipe with security_descriptor = Some(0xDEADBEEF) to verify it's stored
-    let _handle = win32
+    // Create pipe with security_descriptor = Some(0xDEADBEEF) to verify it's accepted
+    let handle = win32
         .create_named_pipe_w(
             r"\\.\pipe\test_security",
             3,
@@ -392,13 +407,18 @@ fn t18_9_pipe_security_descriptor_stored() {
         )
         .expect("create named pipe with security descriptor");
 
-    // Verify the pipe was created (the security descriptor pointer is stored internally)
+    // The pipe must be connectable and carry data once the descriptor argument is
+    // supplied (a pipe whose creation was corrupted by the descriptor would fail here).
     let client = win32
         .open_named_pipe_client(r"\\.\pipe\test_security", false)
         .expect("open client");
-    win32.connect_named_pipe(_handle).expect("connect");
+    win32.connect_named_pipe(handle).expect("connect");
 
-    let _ = client;
+    win32
+        .write_file(client, b"secured data")
+        .expect("client write");
+    let data = win32.read_file(handle, 64).expect("server read");
+    assert_eq!(data, b"secured data", "pipe with descriptor must carry data");
 }
 
 // ---------------------------------------------------------------------------

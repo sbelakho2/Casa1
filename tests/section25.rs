@@ -6,8 +6,11 @@
 //! `steam://` URL parsing, GameNetworkingSockets lifecycle, heartbeat
 //! management, and round-trip property tests.
 //!
-//! Network-dependent tests handle the case where no Steam CM server is
-//! reachable by returning early rather than failing.
+//! Connect-dependent behavior is exercised deterministically against a closed
+//! loopback port (no external network). Real Steam CM connectivity is only
+//! attempted when the `STEAM_LIVE_TEST` env var is set — the default CM
+//! servers must never be contacted in unit tests
+//! (src/steam_protocol.rs `steam_zero_touch_default_servers_not_contacted`).
 
 use casa1::steam_protocol::{
     ConnectionState, GameNetworkingSockets, GnsConnectionState, SessionCipher, SteamMessage,
@@ -15,6 +18,21 @@ use casa1::steam_protocol::{
     parse_steam_protocol_url, serialize_message,
 };
 use std::io::Write;
+
+/// Whether live Steam CM connectivity tests are enabled (opt-in via the
+/// `STEAM_LIVE_TEST` env var, matching the src unit-test policy).
+fn steam_live_tests_enabled() -> bool {
+    std::env::var("STEAM_LIVE_TEST").is_ok()
+}
+
+/// Bind a loopback TCP listener, capture its port, and close it so that a
+/// subsequent connect attempt fails fast with connection refused.
+fn closed_loopback_addr() -> std::net::SocketAddr {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let addr = listener.local_addr().expect("local addr");
+    drop(listener);
+    addr
+}
 
 // ===========================================================================
 // t25_01 — CM Connect / Disconnect
@@ -31,30 +49,37 @@ fn t25_01_cm_connect_disconnect() {
         "new SteamProtocolStack should be in Disconnected state"
     );
 
-    // Attempt connection — may fail if no Steam CM server is reachable
-    let result = stack.connect(None);
-    if let Err(ref _e) = result {
-        // No server reachable; skip the network-dependent part gracefully
-        return;
-    }
-
-    // If we connected successfully, disconnect and reconnect
-    assert!(result.is_ok(), "connect(None) should succeed or be skipped");
+    // Deterministic, network-free exercise of the connect state machine: a
+    // closed loopback port fails fast, drives the stack into Error state,
+    // and disconnect() restores the idle state.
+    let closed = closed_loopback_addr();
+    let failed = stack
+        .connect(Some(&closed.to_string()))
+        .expect_err("connect to a closed port must fail");
+    assert_eq!(
+        failed.code,
+        casa1::reason::ReasonCode::RcNetConnectionFailed
+    );
+    assert_eq!(
+        stack.state,
+        ConnectionState::Error,
+        "failed connect must leave the stack in Error"
+    );
     stack.disconnect().expect("disconnect should succeed");
     assert_eq!(stack.state, ConnectionState::Disconnected);
 
-    // Can connect again
-    let result2 = stack.connect(None);
-    if let Err(ref _e) = result2 {
-        return;
+    // Live path (opt-in only): real CM connect → disconnect → reconnect.
+    if steam_live_tests_enabled() {
+        stack.connect(None).expect("live connect must succeed");
+        assert_eq!(stack.state, ConnectionState::Connected);
+        stack.disconnect().expect("disconnect should succeed");
+        assert_eq!(stack.state, ConnectionState::Disconnected);
+
+        stack.connect(None).expect("second live connect must succeed");
+        stack
+            .disconnect()
+            .expect("second disconnect should succeed");
     }
-    assert!(
-        result2.is_ok(),
-        "second connect should succeed or be skipped"
-    );
-    stack
-        .disconnect()
-        .expect("second disconnect should succeed");
 }
 
 // ===========================================================================
@@ -710,6 +735,56 @@ fn t25_08_steam_protocol_url_parsing() {
         parse_steam_protocol_url("").is_none(),
         "empty string should return None"
     );
+
+    // Friend-related variants (merged from the former t25_14): without a
+    // trailing slash, via the open/ command, and with query parameters.
+    let result = parse_steam_protocol_url("steam://friends").expect("steam://friends should parse");
+    assert_eq!(
+        result.command,
+        SteamProtocolCommand::Friends,
+        "steam://friends should map to Friends"
+    );
+
+    let result = parse_steam_protocol_url("steam://open/friends")
+        .expect("steam://open/friends should parse");
+    assert_eq!(
+        result.command,
+        SteamProtocolCommand::OpenFriends,
+        "steam://open/friends should map to OpenFriends"
+    );
+
+    let result = parse_steam_protocol_url("steam://open/friends/")
+        .expect("steam://open/friends/ should parse");
+    assert_eq!(
+        result.command,
+        SteamProtocolCommand::OpenFriends,
+        "steam://open/friends/ should map to OpenFriends"
+    );
+
+    let result = parse_steam_protocol_url("steam://friends/?invite=1")
+        .expect("steam://friends/?invite=1 should parse");
+    assert_eq!(
+        result.command,
+        SteamProtocolCommand::Friends,
+        "steam://friends/ with query params should map to Friends"
+    );
+    assert!(
+        result.query_params.contains_key("invite"),
+        "query parameter 'invite' should be present"
+    );
+
+    // Unrecognized commands still parse (into Unknown) and non-steam URLs
+    // are rejected.
+    assert!(
+        parse_steam_protocol_url("https://steamcommunity.com/").is_none(),
+        "https:// URL should return None"
+    );
+    let unknown = parse_steam_protocol_url("steam://invalidcommand")
+        .expect("steam://invalidcommand should parse into Unknown");
+    assert_eq!(
+        unknown.command,
+        SteamProtocolCommand::Unknown("invalidcommand".to_string())
+    );
 }
 
 // ===========================================================================
@@ -856,34 +931,9 @@ fn t25_10_gns_multiple_sessions() {
 fn t25_11_frame_encryption_sequence() {
     let mut stack = SteamProtocolStack::new();
 
-    // `perform_encryption_handshake()` is private (called internally by
-    // `connect()`).  We test the full connect → handshake flow by calling
-    // `connect(None)`, which performs RSA key-wrap → AES session key
-    // establishment if a server is reachable.
-
-    let result = stack.connect(None);
-    if let Err(ref _e) = result {
-        // No server reachable — skip gracefully
-        return;
-    }
-
-    assert!(
-        result.is_ok(),
-        "connect(None) should succeed when a CM server is reachable"
-    );
-
-    // If connection succeeded, the encryption handshake was performed
-    // internally.  Verify that a session key was established.
-    assert!(
-        stack.session_key().is_some(),
-        "session key should be established after successful connect/handshake"
-    );
-    assert!(
-        stack.session_id() != 0,
-        "session ID should be non-zero after handshake"
-    );
-
-    // Verify we can encrypt and decrypt through the stack
+    // Deterministic part (always runs): without a session, payload
+    // encryption/decryption is passthrough and round-trips, and no session
+    // key exists before any connect.
     let payload = b"encrypted frame test";
     let encrypted = stack.encrypt_payload(payload);
     let decrypted = stack.decrypt_payload(&encrypted);
@@ -891,10 +941,51 @@ fn t25_11_frame_encryption_sequence() {
         decrypted, payload,
         "encrypt/decrypt through stack should round-trip"
     );
+    assert!(
+        stack.session_key().is_none(),
+        "no session key before connect"
+    );
 
-    stack
-        .disconnect()
-        .expect("disconnect after handshake should succeed");
+    if steam_live_tests_enabled() {
+        // Live path (opt-in only): a real connect performs the RSA key-wrap
+        // → AES session-key establishment handshake.
+        stack.connect(None).expect("live connect must succeed");
+        assert!(
+            stack.session_key().is_some(),
+            "session key should be established after successful connect/handshake"
+        );
+        assert!(
+            stack.session_id() != 0,
+            "session ID should be non-zero after handshake"
+        );
+
+        // Verify we can encrypt and decrypt through the stack
+        let encrypted = stack.encrypt_payload(payload);
+        let decrypted = stack.decrypt_payload(&encrypted);
+        assert_eq!(
+            decrypted, payload,
+            "encrypt/decrypt through stack should round-trip"
+        );
+
+        stack
+            .disconnect()
+            .expect("disconnect after handshake should succeed");
+    } else {
+        // Deterministic no-network part: a failed connect must not
+        // fabricate a session key.
+        let closed = closed_loopback_addr();
+        let failed = stack
+            .connect(Some(&closed.to_string()))
+            .expect_err("connect to a closed port must fail");
+        assert_eq!(
+            failed.code,
+            casa1::reason::ReasonCode::RcNetConnectionFailed
+        );
+        assert!(
+            stack.session_key().is_none(),
+            "no session key after failed connect"
+        );
+    }
 }
 
 // ===========================================================================
@@ -927,30 +1018,35 @@ fn t25_12_heartbeat_interval() {
         "heartbeat_needed should still return true after failed send"
     );
 
-    // Connect (if possible) and verify heartbeat state changes
-    let result = stack.connect(None);
-    if let Err(ref _e) = result {
-        // No server reachable — nothing more to test
-        return;
+    if steam_live_tests_enabled() {
+        // Live path (opt-in only): after a real connect, the heartbeat state
+        // changes.
+        stack.connect(None).expect("live connect must succeed");
+        assert!(
+            !stack.heartbeat_needed(),
+            "heartbeat_needed should return false shortly after connect"
+        );
+
+        // Send a heartbeat manually
+        stack
+            .send_heartbeat()
+            .expect("send_heartbeat should succeed when connected");
+        assert!(
+            !stack.heartbeat_needed(),
+            "heartbeat_needed should return false after sending heartbeat"
+        );
+
+        stack.disconnect().expect("disconnect should succeed");
+    } else {
+        // Deterministic no-network part: a failed connect attempt must not
+        // alter the heartbeat state (no last_heartbeat is recorded).
+        let closed = closed_loopback_addr();
+        let _ = stack.connect(Some(&closed.to_string()));
+        assert!(
+            stack.heartbeat_needed(),
+            "heartbeat_needed must remain true after a failed connect"
+        );
     }
-
-    // After connect, last_heartbeat was set, so heartbeat_needed should
-    // return false (assuming we check within the 30-second interval).
-    assert!(
-        !stack.heartbeat_needed(),
-        "heartbeat_needed should return false shortly after connect"
-    );
-
-    // Send a heartbeat manually
-    stack
-        .send_heartbeat()
-        .expect("send_heartbeat should succeed when connected");
-    assert!(
-        !stack.heartbeat_needed(),
-        "heartbeat_needed should return false after sending heartbeat"
-    );
-
-    stack.disconnect().expect("disconnect should succeed");
 }
 
 // ===========================================================================
@@ -1078,95 +1174,9 @@ fn t25_13_serialize_deserialize_roundtrip_properties() {
 }
 
 // ===========================================================================
-// t25_14 — Steam Friends Connectivity
+// t25_15 — GNS UDP socket creation and binding
 // ===========================================================================
 
-#[test]
-fn t25_14_steam_friends_connectivity() {
-    // steam://friends/ → Friends
-    let result =
-        parse_steam_protocol_url("steam://friends/").expect("steam://friends/ should parse");
-    assert_eq!(
-        result.command,
-        SteamProtocolCommand::Friends,
-        "steam://friends/ should map to Friends"
-    );
-
-    // steam://friends → Friends (without trailing slash)
-    let result = parse_steam_protocol_url("steam://friends").expect("steam://friends should parse");
-    assert_eq!(
-        result.command,
-        SteamProtocolCommand::Friends,
-        "steam://friends should map to Friends"
-    );
-
-    // steam://friends/add/76561197960287930 → Friends
-    let result = parse_steam_protocol_url("steam://friends/add/76561197960287930")
-        .expect("steam://friends/add/... should parse");
-    assert_eq!(
-        result.command,
-        SteamProtocolCommand::Friends,
-        "steam://friends/add/... should map to Friends"
-    );
-
-    // steam://open/friends → OpenFriends
-    let result = parse_steam_protocol_url("steam://open/friends")
-        .expect("steam://open/friends should parse");
-    assert_eq!(
-        result.command,
-        SteamProtocolCommand::OpenFriends,
-        "steam://open/friends should map to OpenFriends"
-    );
-
-    // steam://open/friends/ → OpenFriends (as above, "friends" segment matched)
-    let result = parse_steam_protocol_url("steam://open/friends/")
-        .expect("steam://open/friends/ should parse");
-    assert_eq!(
-        result.command,
-        SteamProtocolCommand::OpenFriends,
-        "steam://open/friends/ should map to OpenFriends"
-    );
-
-    // Friend-related URLs with query parameters
-    let result = parse_steam_protocol_url("steam://friends/?invite=1")
-        .expect("steam://friends/?invite=1 should parse");
-    assert_eq!(
-        result.command,
-        SteamProtocolCommand::Friends,
-        "steam://friends/ with query params should map to Friends"
-    );
-    assert!(
-        result.query_params.contains_key("invite"),
-        "query parameter 'invite' should be present"
-    );
-
-    // Non-steam URLs should return None
-    assert!(
-        parse_steam_protocol_url("https://steamcommunity.com/").is_none(),
-        "https:// URL should return None"
-    );
-    assert!(
-        parse_steam_protocol_url("steam://invalidcommand").is_some(),
-        "steam:// with unrecognized command should still parse (returns Unknown)"
-    );
-
-    // Verify the unrecognized command case
-    let unknown_result = parse_steam_protocol_url("steam://invalidcommand");
-    assert!(
-        unknown_result.is_some(),
-        "steam://invalidcommand should parse into Unknown"
-    );
-    if let Some(url) = unknown_result {
-        assert_eq!(
-            url.command,
-            SteamProtocolCommand::Unknown("invalidcommand".to_string())
-        );
-    }
-}
-
-// ---------------------------------------------------------------------------
-// t25_15: GNS UDP socket creation and binding
-// ---------------------------------------------------------------------------
 
 #[test]
 fn t25_15_gns_udp_socket_creation() {
@@ -1274,15 +1284,13 @@ fn t25_18_gns_session_with_peer_routing() {
     let peer_addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
     gns.set_peer_address(handle, peer_addr).unwrap();
 
-    // Send a message (will try to send over UDP to 127.0.0.1:9999,
-    // which will likely fail with a Connection Refused, but the send
-    // call itself returns Ok after writing to the socket)
+    // Send a message (will try to send over UDP to 127.0.0.1:9999, which is
+    // unreachable — but UDP is connectionless, so send_to on a bound socket
+    // succeeds regardless; the datagram simply goes out on the wire)
     let send_result = gns.send_message(handle, b"test message", 0);
-    // This might succeed or fail depending on whether the socket write succeeds
-    // Both outcomes are valid for the test
     assert!(
-        send_result.is_ok() || send_result.is_err(),
-        "UDP send may succeed or fail on unreachable peer"
+        send_result.is_ok(),
+        "UDP send_to to a loopback address must succeed: {send_result:?}"
     );
 
     // Poll for incoming messages (should be empty)
@@ -1352,31 +1360,60 @@ fn t25_20_gns_message_encryption_decryption_roundtrip() {
     // Create session with auto-generated keys
     let handle = gns.create_session().unwrap();
 
+    // Bind a UDP socket so send_message takes the encrypted wire path
+    // (without a socket, everything falls back to the plaintext queue).
+    gns.bind_udp(Some("0.0.0.0:0".parse().unwrap())).unwrap();
+
     // Set a peer address (required for send_message)
     let peer_addr: SocketAddr = "127.0.0.1:9998".parse().unwrap();
     gns.set_peer_address(handle, peer_addr).unwrap();
 
-    // Send a message — uses internal encryption with auto-generated keys
+    // Send a message — with a peer address and a bound UDP socket the message
+    // is encrypted (AES-256-GCM with the session key) and sent over the wire.
     let plaintext = b"Hello, GNS secure world! This message should be encrypted.";
     let send_result = gns.send_message(handle, plaintext, 0);
     assert!(
-        send_result.is_ok() || send_result.is_err(),
-        "Message send over UDP may or may not reach peer"
+        send_result.is_ok(),
+        "UDP send_to to a loopback address must succeed: {send_result:?}"
     );
 
-    // Poll messages — in local mode without a real peer, this drains the
-    // in-memory fallback queue. Since we sent over UDP (which may fail),
-    // the in-memory queue should not contain the message.
+    // The wire-path message must NOT land in the in-memory fallback queue,
+    // which is the plaintext path: if the encrypted send leaked plaintext
+    // locally, this assertion fails.
     let messages = gns.poll_incoming_messages().unwrap();
-    // If the send succeeded over the wire, no local messages;
-    // if it fell back, there might be messages
-    // Both are acceptable outcomes
     assert!(
-        messages.is_empty() || messages.len() == 1,
-        "In-memory fallback may contain our sent message"
+        messages.is_empty(),
+        "wire-path send must not appear in the plaintext fallback queue"
+    );
+
+    // Control case: a session with no peer address takes the in-memory
+    // fallback path, proving the queue is only fed by the fallback path and
+    // that the wire path above really did go out over UDP.
+    let h2 = gns.create_session().unwrap();
+    gns.send_message(h2, plaintext, 0)
+        .expect("fallback send must succeed");
+    let fallback = gns.poll_incoming_messages().unwrap();
+    assert_eq!(fallback.len(), 1, "fallback must deliver exactly one message");
+    assert_eq!(
+        fallback[0].data, plaintext,
+        "fallback delivers the plaintext message"
+    );
+    assert_eq!(fallback[0].conn, h2, "message must carry its session handle");
+
+    // Encryption itself: the wire payload is encrypted with the session key —
+    // ciphertext must differ from the plaintext and must decrypt back to it.
+    let mut cipher = SessionCipher::new(&[0xAB; 32]);
+    let wire_enc = cipher.encrypt(plaintext);
+    assert_ne!(wire_enc, plaintext, "encrypted bytes must differ from plaintext");
+    let mut decipher = SessionCipher::new(&[0xAB; 32]);
+    assert_eq!(
+        decipher.encrypt(&wire_enc),
+        plaintext,
+        "decryption must recover the plaintext"
     );
 
     gns.close_session(handle).unwrap();
+    gns.close_session(h2).unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -1394,20 +1431,34 @@ fn t25_21_gns_session_key_generation() {
     // These sessions have distinct handles
     assert_ne!(h1, h2, "Session handles should be unique");
 
-    // We can't directly inspect the keys (they're private), but we can
-    // verify that sessions work independently by sending messages on both
+    // We can't directly inspect the keys (they're private), so we verify
+    // that sessions work independently by sending messages on both and
+    // asserting deterministic queue contents: each message must be delivered
+    // with its own session handle and payload (session isolation).
     use std::net::SocketAddr;
 
-    // Use in-memory mode (no UDP socket)
+    // Use in-memory mode (no UDP socket), so both sends land in the fallback
+    // queue.
     let peer_addr: SocketAddr = "127.0.0.1:9997".parse().unwrap();
     gns.set_peer_address(h1, peer_addr).unwrap();
     gns.set_peer_address(h2, peer_addr).unwrap();
 
     // Send on both sessions
-    let r1 = gns.send_message(h1, b"data for session 1", 0);
-    let r2 = gns.send_message(h2, b"data for session 2", 0);
-    assert!(r1.is_ok() || r1.is_err(), "Session 1 send should proceed");
-    assert!(r2.is_ok() || r2.is_err(), "Session 2 send should proceed");
+    gns.send_message(h1, b"data for session 1", 0)
+        .expect("Session 1 send must succeed");
+    gns.send_message(h2, b"data for session 2", 0)
+        .expect("Session 2 send must succeed");
+
+    let messages = gns.poll_incoming_messages().unwrap();
+    assert_eq!(
+        messages.len(),
+        2,
+        "both sessions' messages must be delivered exactly once"
+    );
+    assert_eq!(messages[0].conn, h1, "message 0 must carry session 1's handle");
+    assert_eq!(messages[0].data, b"data for session 1");
+    assert_eq!(messages[1].conn, h2, "message 1 must carry session 2's handle");
+    assert_eq!(messages[1].data, b"data for session 2");
 
     gns.close_session(h1).unwrap();
     gns.close_session(h2).unwrap();
