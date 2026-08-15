@@ -123,11 +123,12 @@ impl BlockChainingCache {
     ///
     /// Returns true if chaining was successful.
     pub fn try_chain(&mut self, guest_address: u64) -> bool {
-        let target_address = match self
-            .blocks
-            .get(&guest_address)
-            .and_then(|b| b.fallthrough_target)
-        {
+        let block = match self.blocks.get(&guest_address) {
+            // Already chained: never push a duplicate chain entry.
+            Some(block) if !block.is_chained => block,
+            _ => return false,
+        };
+        let target_address = match block.fallthrough_target {
             Some(addr) => addr,
             None => return false,
         };
@@ -138,12 +139,7 @@ impl BlockChainingCache {
         }
 
         // Check if execution count is high enough (hot path)
-        let execution_count = self
-            .blocks
-            .get(&guest_address)
-            .map(|b| b.execution_count)
-            .unwrap_or(0);
-        if execution_count < 10 {
+        if block.execution_count < 10 {
             return false;
         }
 
@@ -166,13 +162,18 @@ impl BlockChainingCache {
     }
 
     /// Break an existing chain from a block.
+    ///
+    /// Inactive chains are pruned immediately so the `chains` vector stays
+    /// bounded and breaks stay cheap.
     pub fn break_chain(&mut self, from_address: u64) {
-        for chain in &mut self.chains {
+        self.chains.retain(|chain| {
             if chain.from_address == from_address && chain.is_active {
-                chain.is_active = false;
                 self.total_chains_broken += 1;
+                false
+            } else {
+                true
             }
-        }
+        });
         if let Some(block) = self.blocks.get_mut(&from_address) {
             block.is_chained = false;
         }
@@ -251,10 +252,31 @@ impl BlockChainingCache {
             .copied()
             .collect();
 
+        for addr in &to_remove {
+            self.break_chain(*addr);
+        }
+        // Deactivate and prune chains whose *target* block was invalidated
+        // even when the source block survived the range, so no chain points
+        // at removed code.
+        let in_range = |addr: u64| addr >= start && addr < end;
+        self.chains.retain(|chain| {
+            if chain.is_active && (in_range(chain.from_address) || in_range(chain.to_address)) {
+                self.total_chains_broken += 1;
+                false
+            } else {
+                true
+            }
+        });
+
         for addr in to_remove {
-            self.break_chain(addr);
             self.blocks.remove(&addr);
         }
+    }
+}
+
+impl Default for BlockChainingCache {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -332,15 +354,13 @@ impl LazyJitProfiler {
 
         profile.execution_count += 1;
 
-        let recommended_tier = if profile.execution_count >= self.optimize_threshold {
+        if profile.execution_count >= self.optimize_threshold {
             CompilationTier::Optimized
         } else if profile.execution_count >= self.hot_threshold {
             CompilationTier::Baseline
         } else {
             CompilationTier::Uncompiled
-        };
-
-        recommended_tier
+        }
     }
 
     /// Mark a block as compiled at a given tier.
@@ -423,8 +443,14 @@ pub struct AddressTranslation {
 /// Cache for guest-to-host address translations.
 ///
 /// Avoids repeated page table walks by caching the most recent translations.
+/// Eviction uses a clock (second-chance) scan over a `VecDeque` of keys, so
+/// inserts are amortized O(1) instead of rescanning every entry.
 pub struct AddressTranslationCache {
     translations: HashMap<u64, AddressTranslation>,
+    /// Clock/second-chance order of keys (front = next eviction candidate).
+    order: VecDeque<u64>,
+    /// Reference bits for the clock hand.
+    referenced: HashMap<u64, bool>,
     /// Maximum cache entries before eviction.
     max_entries: usize,
     total_hits: AtomicU64,
@@ -435,6 +461,8 @@ impl AddressTranslationCache {
     pub fn new(max_entries: usize) -> Self {
         Self {
             translations: HashMap::new(),
+            order: VecDeque::new(),
+            referenced: HashMap::new(),
             max_entries,
             total_hits: AtomicU64::new(0),
             total_misses: AtomicU64::new(0),
@@ -443,33 +471,27 @@ impl AddressTranslationCache {
 
     /// Look up a guest address in the cache.
     ///
-    /// Increments the access counter for LRU tracking.
+    /// Sets the reference bit for clock eviction and increments the access
+    /// counters. Single hash probe per lookup.
     pub fn lookup(&mut self, guest_address: u64) -> Option<&AddressTranslation> {
-        // Check existence first to avoid borrow conflicts
-        if self.translations.contains_key(&guest_address) {
-            if let Some(entry) = self.translations.get_mut(&guest_address) {
-                entry.access_count += 1;
-                entry.hits += 1;
-            }
+        if let Some(entry) = self.translations.get_mut(&guest_address) {
+            entry.access_count += 1;
+            entry.hits += 1;
+            self.referenced.insert(guest_address, true);
+            Some(entry)
+        } else {
+            None
         }
-        // Return immutable reference (mutable borrow is released)
-        self.translations.get(&guest_address)
     }
 
     /// Insert a translation into the cache.
     ///
-    /// Evicts the least-recently-used entry (lowest `access_count`) when the
-    /// cache is at capacity.
+    /// Evicts via the clock hand when the cache is at capacity.
     pub fn insert(&mut self, guest_address: u64, host_address: u64, size: usize, protection: u32) {
-        // Evict the LRU entry if at capacity
         if self.translations.len() >= self.max_entries
             && !self.translations.contains_key(&guest_address)
         {
-            if let Some((&lru_key, _)) =
-                self.translations.iter().min_by_key(|(_, v)| v.access_count)
-            {
-                self.translations.remove(&lru_key);
-            }
+            self.evict_clock();
         }
 
         self.translations.insert(
@@ -483,6 +505,30 @@ impl AddressTranslationCache {
                 access_count: 0,
             },
         );
+        self.order.push_back(guest_address);
+        self.referenced.insert(guest_address, true);
+    }
+
+    /// Second-chance (clock) eviction: walk the ring from the hand, clearing
+    /// reference bits until an unreferenced entry is found and evicted.
+    fn evict_clock(&mut self) {
+        while self.translations.len() >= self.max_entries && !self.translations.is_empty() {
+            let Some(key) = self.order.pop_front() else {
+                break;
+            };
+            if !self.translations.contains_key(&key) {
+                // Stale key whose translation was invalidated; clean up.
+                self.referenced.remove(&key);
+                continue;
+            }
+            if self.referenced.remove(&key).unwrap_or(false) {
+                // Second chance: clear the reference bit and keep the entry.
+                self.order.push_back(key);
+            } else {
+                self.translations.remove(&key);
+                break;
+            }
+        }
     }
 
     /// Record a cache hit.
@@ -511,12 +557,17 @@ impl AddressTranslationCache {
     /// Invalidate all entries.
     pub fn invalidate_all(&mut self) {
         self.translations.clear();
+        self.order.clear();
+        self.referenced.clear();
     }
 
     /// Invalidate entries for a specific address range.
     pub fn invalidate_range(&mut self, start: u64, end: u64) {
         self.translations
             .retain(|_, t| t.guest_address < start || t.guest_address >= end);
+        self.referenced
+            .retain(|key, _| *key < start || *key >= end);
+        // `order` may hold stale keys; the clock eviction skips them.
     }
 }
 
@@ -549,23 +600,64 @@ pub struct ShaderCompileJob {
 ///
 /// Shader compilation is CPU-intensive and can be parallelized across
 /// multiple threads. Jobs are submitted to a queue and processed in order.
+/// Terminal (`Completed`/`Failed`) jobs are pruned beyond a bounded cap so
+/// the job table cannot grow without limit over long sessions.
 pub struct ParallelShaderCompiler {
     jobs: BTreeMap<u64, ShaderCompileJob>,
     next_job_id: AtomicU64,
     max_concurrent: usize,
+    max_retained_jobs: usize,
     completed_count: AtomicU32,
     failed_count: AtomicU32,
 }
 
 impl ParallelShaderCompiler {
+    /// Default cap on terminal jobs retained for inspection; older terminal
+    /// jobs are pruned first (job ids increase monotonically).
+    pub const DEFAULT_MAX_RETAINED_JOBS: usize = 256;
+
     pub fn new(max_concurrent: usize) -> Self {
         Self {
             jobs: BTreeMap::new(),
             next_job_id: AtomicU64::new(1),
             max_concurrent,
+            max_retained_jobs: Self::DEFAULT_MAX_RETAINED_JOBS,
             completed_count: AtomicU32::new(0),
             failed_count: AtomicU32::new(0),
         }
+    }
+
+    /// Set the maximum number of terminal jobs retained for inspection.
+    pub fn set_max_retained_jobs(&mut self, max_retained_jobs: usize) {
+        self.max_retained_jobs = max_retained_jobs;
+        self.prune_terminal_jobs();
+    }
+
+    /// Prune the oldest terminal jobs once the retained cap is exceeded.
+    fn prune_terminal_jobs(&mut self) {
+        let terminal_count = self
+            .jobs
+            .values()
+            .filter(|job| {
+                job.status != ShaderCompileStatus::Pending
+                    && job.status != ShaderCompileStatus::Compiling
+            })
+            .count();
+        let overflow = terminal_count.saturating_sub(self.max_retained_jobs);
+        if overflow == 0 {
+            return;
+        }
+        let mut pruned = 0usize;
+        self.jobs.retain(|_, job| {
+            let terminal = job.status != ShaderCompileStatus::Pending
+                && job.status != ShaderCompileStatus::Compiling;
+            if terminal && pruned < overflow {
+                pruned += 1;
+                false
+            } else {
+                true
+            }
+        });
     }
 
     /// Submit a shader compilation job.
@@ -583,6 +675,7 @@ impl ParallelShaderCompiler {
                 complete_time: None,
             },
         );
+        self.prune_terminal_jobs();
         id
     }
 
@@ -609,6 +702,7 @@ impl ParallelShaderCompiler {
         job.status = ShaderCompileStatus::Completed;
         job.complete_time = Some(Instant::now());
         self.completed_count.fetch_add(1, Ordering::Relaxed);
+        self.prune_terminal_jobs();
         Ok(())
     }
 
@@ -623,6 +717,7 @@ impl ParallelShaderCompiler {
         job.status = ShaderCompileStatus::Failed(error);
         job.complete_time = Some(Instant::now());
         self.failed_count.fetch_add(1, Ordering::Relaxed);
+        self.prune_terminal_jobs();
         Ok(())
     }
 
@@ -775,10 +870,11 @@ impl MetalCommandBatcher {
     /// Flush the current batch, starting a new render pass.
     pub fn flush_current_batch(&mut self) {
         if let Some(batch) = self.current_batch.take() {
-            if !batch.draw_calls.is_empty() {
-                self.completed_batches.push(batch);
-                self.stats.render_pass_breaks += 1;
+            if batch.draw_calls.is_empty() {
+                return;
             }
+            self.completed_batches.push(batch);
+            self.stats.render_pass_breaks += 1;
         }
     }
 
@@ -863,6 +959,11 @@ impl GpuUploadStreamer {
     }
 
     /// Allocate space from a streaming buffer for the current frame.
+    ///
+    /// The write cursor only wraps on a frame boundary: reusing offsets that
+    /// are still in flight within the same frame would let later uploads
+    /// overwrite live data. When the current frame's remaining space is
+    /// insufficient, an error is returned instead of silently overlapping.
     pub fn allocate(&mut self, buffer_id: u64, size: usize) -> AppResult<usize> {
         let buffer = self.buffers.get_mut(&buffer_id).ok_or_else(|| {
             AppError::new(
@@ -879,39 +980,39 @@ impl GpuUploadStreamer {
             buffer.frame_used = frame;
         }
 
-        // Check if there's enough space in the buffer
-        if buffer.write_offset + size > buffer.size {
-            // Wrap around if possible
-            if size <= buffer.size {
-                buffer.write_offset = 0;
-            } else {
-                return Err(AppError::new(
-                    ReasonCode::RcD3dInvalidState,
-                    format!(
-                        "streaming allocation {size} exceeds buffer size {}",
-                        buffer.size
-                    ),
-                ));
-            }
+        // The usable capacity is bounded by both the buffer's own size and
+        // the ring pool it was allocated from.
+        let capacity = buffer.size.min(self.ring_buffer_size);
+        if size > capacity {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!(
+                    "streaming allocation {size} exceeds buffer capacity {capacity}"
+                ),
+            ));
         }
 
-        // Validate that the allocation does not exceed the ring buffer total
-        if buffer.write_offset + size > self.ring_buffer_size {
-            if size <= self.ring_buffer_size {
-                buffer.write_offset = 0;
-            } else {
+        let end = match buffer.write_offset.checked_add(size) {
+            Some(end) => end,
+            None => {
                 return Err(AppError::new(
                     ReasonCode::RcD3dInvalidState,
-                    format!(
-                        "streaming allocation {size} exceeds ring buffer size {}",
-                        self.ring_buffer_size
-                    ),
+                    format!("streaming allocation {size} overflows the write offset"),
                 ));
             }
+        };
+        if end > capacity {
+            return Err(AppError::new(
+                ReasonCode::RcD3dInvalidState,
+                format!(
+                    "streaming buffer {buffer_id}: {size} bytes at offset {} exceed frame capacity {capacity}; call advance_frame() before allocating more",
+                    buffer.write_offset
+                ),
+            ));
         }
 
         let offset = buffer.write_offset;
-        buffer.write_offset += size;
+        buffer.write_offset = end;
         buffer.total_uploaded += size as u64;
         self.total_bytes_uploaded
             .fetch_add(size as u64, Ordering::Relaxed);
@@ -1189,17 +1290,22 @@ impl AsyncFileReader {
         );
 
         let handle = std::thread::spawn(move || {
+            use std::io::{Read, Seek, SeekFrom};
             let start = Instant::now();
-            let data = match std::fs::read(&path) {
-                Ok(contents) => {
-                    let start_idx = offset as usize;
-                    let end_idx = (offset as usize).saturating_add(size).min(contents.len());
-                    if start_idx < contents.len() {
-                        contents[start_idx..end_idx].to_vec()
-                    } else {
-                        Vec::new()
+            // Read only the requested range instead of slurping the whole
+            // file: `std::fs::read` would make memory and I/O proportional
+            // to the file size, defeating the offset/size API.
+            let data = match std::fs::File::open(&path) {
+                Ok(mut file) => match file.seek(SeekFrom::Start(offset)) {
+                    Ok(_) => {
+                        let mut data = Vec::with_capacity(size);
+                        match file.take(size as u64).read_to_end(&mut data) {
+                            Ok(_) => data,
+                            Err(_) => Vec::new(),
+                        }
                     }
-                }
+                    Err(_) => Vec::new(),
+                },
                 Err(_) => Vec::new(),
             };
             let elapsed_us = start.elapsed().as_micros() as u64;
@@ -1258,6 +1364,12 @@ impl AsyncFileReader {
     }
 }
 
+impl Default for AsyncFileReader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ===========================================================================
 // Phase 7: File Caching
 // ===========================================================================
@@ -1283,6 +1395,9 @@ pub struct FileCacheEntry {
 pub struct FileCache {
     /// Cached entries keyed by file path.
     pub entries: BTreeMap<String, FileCacheEntry>,
+    /// Ordered index over `(last_access, path)` so eviction can pop the
+    /// least-recently-used entry in O(log n) instead of rescanning the map.
+    lru_index: BTreeMap<(u64, String), ()>,
     /// Maximum total cache size in bytes.
     pub max_size_bytes: usize,
     /// Currently used bytes.
@@ -1300,6 +1415,7 @@ impl FileCache {
     pub fn new(max_size_bytes: usize) -> Self {
         Self {
             entries: BTreeMap::new(),
+            lru_index: BTreeMap::new(),
             max_size_bytes,
             used_bytes: 0,
             hits: 0,
@@ -1314,8 +1430,10 @@ impl FileCache {
     pub fn get(&mut self, path: &str) -> Option<&[u8]> {
         self.access_counter += 1;
         if let Some(entry) = self.entries.get_mut(path) {
+            self.lru_index.remove(&(entry.last_access, path.to_string()));
             entry.last_access = self.access_counter;
             entry.access_count += 1;
+            self.lru_index.insert((entry.last_access, path.to_string()), ());
             self.hits += 1;
             Some(&entry.data)
         } else {
@@ -1343,24 +1461,23 @@ impl FileCache {
         // Remove old entry if present
         if let Some(old) = self.entries.remove(path) {
             self.used_bytes = self.used_bytes.saturating_sub(old.data.len());
+            self.lru_index.remove(&(old.last_access, path.to_string()));
         }
 
         // Evict LRU entries until we have space
-        while self.used_bytes + data_len > self.max_size_bytes && !self.entries.is_empty() {
-            let lru_key = self
-                .entries
-                .iter()
-                .min_by_key(|(_, e)| e.last_access)
-                .map(|(k, _)| k.clone());
-            if let Some(key) = lru_key {
-                if let Some(old) = self.entries.remove(&key) {
-                    self.used_bytes = self.used_bytes.saturating_sub(old.data.len());
-                }
+        while self.used_bytes.saturating_add(data_len) > self.max_size_bytes {
+            let Some(((_, key), _)) = self.lru_index.pop_first() else {
+                break;
+            };
+            if let Some(old) = self.entries.remove(&key) {
+                self.used_bytes = self.used_bytes.saturating_sub(old.data.len());
             }
         }
 
         self.access_counter += 1;
         self.used_bytes += data_len;
+        self.lru_index
+            .insert((self.access_counter, path.to_string()), ());
         self.entries.insert(
             path.to_string(),
             FileCacheEntry {
@@ -1377,12 +1494,14 @@ impl FileCache {
     pub fn invalidate(&mut self, path: &str) {
         if let Some(old) = self.entries.remove(path) {
             self.used_bytes = self.used_bytes.saturating_sub(old.data.len());
+            self.lru_index.remove(&(old.last_access, path.to_string()));
         }
     }
 
     /// Invalidate all cached files.
     pub fn invalidate_all(&mut self) {
         self.entries.clear();
+        self.lru_index.clear();
         self.used_bytes = 0;
     }
 
@@ -1487,6 +1606,12 @@ impl PathResolutionCache {
     }
 }
 
+impl Default for PathResolutionCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ===========================================================================
 // Phase 7: Memory-Mapped File Support
 // ===========================================================================
@@ -1503,15 +1628,18 @@ pub struct MmappedFile {
     pub path: PathBuf,
     /// Size of the mapped region in bytes.
     pub size: usize,
-    /// Pointer to the mapped memory.
-    pub ptr: *mut u8,
+    /// Pointer to the mapped memory. Private: callers must go through the
+    /// bounds-checked [`Self::read`], so the pointer can never be copied out
+    /// and dereferenced after `close()`/`drop()` has munmapped it.
+    ptr: *mut u8,
     /// Whether the file is currently mapped.
     pub mapped: bool,
 }
 
-// Safety: MmappedFile is safe to send between threads as long as no two
-// threads mutate the mapping simultaneously. The read method only requires
-// &self, so concurrent reads are safe.
+// Safety: `MmappedFile` is safe to send and share across threads as long as
+// callers only use the bounds-checked `read`/`close` API. The raw pointer is
+// private (no way to alias it out), reads take `&self`, and `close` takes
+// `&mut self`, so no concurrent mutation of the mapping is possible.
 unsafe impl Send for MmappedFile {}
 unsafe impl Sync for MmappedFile {}
 
@@ -1698,6 +1826,48 @@ mod tests {
     }
 
     #[test]
+    fn block_chaining_does_not_create_duplicate_chains() {
+        let mut cache = BlockChainingCache::new();
+        cache.register_block(0x1000, 0x2000, 64, 10);
+        cache.register_block(0x2000, 0x3000, 32, 5);
+
+        for _ in 0..10 {
+            cache.record_execution(0x1000, 0x2000).unwrap();
+        }
+        assert!(cache.try_chain(0x1000));
+        // Repeated attempts must not push duplicate chain entries.
+        assert!(!cache.try_chain(0x1000));
+        assert!(!cache.try_chain(0x1000));
+        assert_eq!(cache.active_chain_count(), 1);
+        assert_eq!(cache.total_chains_created(), 1);
+    }
+
+    #[test]
+    fn block_chaining_break_prunes_inactive_chains() {
+        let mut cache = BlockChainingCache::new();
+        cache.register_block(0x1000, 0x2000, 64, 10);
+        cache.register_block(0x2000, 0x3000, 32, 5);
+        cache.register_block(0x3000, 0x4000, 48, 8);
+
+        for _ in 0..10 {
+            cache.record_execution(0x1000, 0x2000).unwrap();
+        }
+        for _ in 0..10 {
+            cache.record_execution(0x2000, 0x3000).unwrap();
+        }
+        cache.try_chain(0x1000);
+        cache.try_chain(0x2000);
+        assert_eq!(cache.active_chain_count(), 2);
+
+        cache.break_chain(0x1000);
+        // The inactive chain is removed, not merely flagged.
+        assert_eq!(cache.active_chain_count(), 1);
+        // Re-chaining after a break works and stays a single entry.
+        assert!(cache.try_chain(0x1000));
+        assert_eq!(cache.active_chain_count(), 2);
+    }
+
+    #[test]
     fn block_chaining_invalidate_range() {
         let mut cache = BlockChainingCache::new();
         cache.register_block(0x1000, 0x2000, 64, 10);
@@ -1860,6 +2030,52 @@ mod tests {
         assert_eq!(pending.len(), 1);
     }
 
+    #[test]
+    fn shader_compiler_prunes_terminal_jobs() {
+        let mut compiler = ParallelShaderCompiler::new(4);
+        compiler.set_max_retained_jobs(2);
+
+        let mut ids = Vec::new();
+        for i in 0..5 {
+            let id = compiler.submit_job(format!("hash{i}"), "vertex".to_string(), "main".to_string());
+            compiler.mark_compiling(id).unwrap();
+            compiler.mark_completed(id).unwrap();
+            ids.push(id);
+        }
+
+        // Only the newest terminal jobs are retained.
+        assert_eq!(compiler.job_count(), 2);
+        assert!(compiler.get_job(ids[0]).is_none());
+        assert!(compiler.get_job(ids[3]).is_some());
+        assert!(compiler.get_job(ids[4]).is_some());
+        // Counters are unaffected by pruning.
+        assert_eq!(compiler.completed_count(), 5);
+    }
+
+    #[test]
+    fn block_chaining_invalidate_range_breaks_target_chains() {
+        let mut cache = BlockChainingCache::new();
+        cache.register_block(0x1000, 0x2000, 64, 10);
+        cache.register_block(0x2000, 0x3000, 32, 5);
+        cache.register_block(0x3000, 0x4000, 48, 8);
+
+        for _ in 0..10 {
+            cache.record_execution(0x1000, 0x2000).unwrap();
+        }
+        for _ in 0..10 {
+            cache.record_execution(0x2000, 0x3000).unwrap();
+        }
+        cache.try_chain(0x1000); // 0x1000 -> 0x2000
+        cache.try_chain(0x2000); // 0x2000 -> 0x3000
+        assert_eq!(cache.active_chain_count(), 2);
+
+        // Invalidate the target of the 0x1000 chain; the chain must be
+        // deactivated even though the source block survives.
+        cache.invalidate_range(0x2000, 0x3000);
+        assert_eq!(cache.active_chain_count(), 0);
+        assert_eq!(cache.block_count(), 2); // 0x1000 and 0x3000 remain
+    }
+
     // --- Metal Command Batching Tests ---
 
     #[test]
@@ -1938,9 +2154,33 @@ mod tests {
         streamer.allocate(buf, 512).unwrap();
         streamer.allocate(buf, 512).unwrap();
 
-        // Buffer is full, next allocation wraps
+        // Buffer is full; allocating more within the same frame must fail
+        // instead of silently reusing offsets that are still in flight.
+        assert!(streamer.allocate(buf, 256).is_err());
+
+        // After advancing to a new frame the ring wraps to the start.
+        streamer.advance_frame();
         let offset = streamer.allocate(buf, 256).unwrap();
         assert_eq!(offset, 0);
+    }
+
+    #[test]
+    fn upload_streamer_allocation_larger_than_buffer() {
+        let mut streamer = GpuUploadStreamer::new(4096);
+        let buf = streamer.create_streaming_buffer(1024);
+
+        assert!(streamer.allocate(buf, 2048).is_err());
+    }
+
+    #[test]
+    fn upload_streamer_respects_ring_capacity() {
+        let mut streamer = GpuUploadStreamer::new(4096);
+        let buf = streamer.create_streaming_buffer(8192);
+
+        // The buffer claims more than the ring pool it came from; the ring
+        // size caps allocations.
+        assert!(streamer.allocate(buf, 8192).is_err());
+        assert_eq!(streamer.allocate(buf, 3000).unwrap(), 0);
     }
 
     #[test]

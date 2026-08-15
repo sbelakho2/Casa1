@@ -8,7 +8,7 @@ use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -204,12 +204,31 @@ pub fn export_diagnostics(ge: &GameEnvironment, output_zip: &Path) -> AppResult<
     })?;
     let mut writer = ZipWriter::new(file);
     let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+    // Exclude the archive being written (and any previous export zips living
+    // next to it) from the walk: archiving the output into itself nests every
+    // prior export into the new one and grows the tree without bound.
+    let output_zip_canonical = output_zip
+        .canonicalize()
+        .unwrap_or_else(|_| output_zip.to_path_buf());
+    let output_dir_canonical = output_zip
+        .parent()
+        .and_then(|parent| parent.canonicalize().ok())
+        .unwrap_or_else(|| output_zip.to_path_buf());
     let mut paths = WalkDir::new(&ge.root)
         .sort_by_file_name()
         .into_iter()
         .filter_map(Result::ok)
         .map(|entry| entry.into_path())
         .filter(|path| path != &ge.root)
+        .filter(|path| {
+            let canonical = path
+                .canonicalize()
+                .unwrap_or_else(|_| path.to_path_buf());
+            canonical != output_zip_canonical
+                && !(path.is_file()
+                    && path.extension().is_some_and(|ext| ext == "zip")
+                    && canonical.parent() == Some(output_dir_canonical.as_path()))
+        })
         .collect::<Vec<_>>();
     paths.sort();
     let mut file_count = 0;
@@ -232,15 +251,9 @@ pub fn export_diagnostics(ge: &GameEnvironment, output_zip: &Path) -> AppResult<
                 &error,
             )
         })?;
-        let mut buffer = Vec::new();
-        input.read_to_end(&mut buffer).map_err(|error| {
-            AppError::from_io(
-                ReasonCode::RcDiagnosticsExportFailed,
-                format!("failed to read {}", path.display()),
-                &error,
-            )
-        })?;
-        writer.write_all(&buffer).map_err(|error| {
+        // Stream the file into the archive instead of slurping it into
+        // memory: a GE tree with multi-GB logs must not spike RSS.
+        std::io::copy(&mut input, &mut writer).map_err(|error| {
             AppError::from_io(
                 ReasonCode::RcDiagnosticsExportFailed,
                 format!("failed to write zip payload for {}", path.display()),
@@ -591,9 +604,10 @@ fn sysctl_u64(name: &str) -> Option<u64> {
 
 fn probe_filesystem(path: &Path) -> AppResult<HelperFilesystemProbe> {
     let readable = fs::read_dir(path).is_ok();
-    let probe_path = path
-        .join("tmp")
-        .join(format!("helper-probe-{}.tmp", std::process::id()));
+    // Probe the GE root itself rather than a `<root>/tmp` subdirectory: a
+    // missing `tmp` dir would report false negatives, and the probe is
+    // removed on both the success and the error path so no litter is left.
+    let probe_path = path.join(format!("helper-probe-{}.tmp", std::process::id()));
     let writable = util::write_string(&probe_path, "probe")
         .and_then(|_| {
             fs::remove_file(&probe_path).map_err(|error| {
@@ -603,6 +617,10 @@ fn probe_filesystem(path: &Path) -> AppResult<HelperFilesystemProbe> {
                     &error,
                 )
             })
+        })
+        .inspect_err(|_| {
+            // Clean up the probe file on the error path too.
+            let _ = fs::remove_file(&probe_path);
         })
         .is_ok();
     let executable = fs::metadata(path)
@@ -788,11 +806,17 @@ pub enum ColorSpace {
 /// Uses a simplified SSIM with an 8×8 sliding window over luminance values.
 /// Returns a value in [0.0, 1.0] where 1.0 means identical.
 pub fn compute_ssim(a: &[u8], b: &[u8], width: u32, height: u32) -> f64 {
-    let pixel_count = (width as usize) * (height as usize);
+    let pixel_count = match (width as usize).checked_mul(height as usize) {
+        Some(count) => count,
+        None => return 0.0,
+    };
     if pixel_count == 0 {
         return 1.0;
     }
-    let expected_len = pixel_count * 4;
+    let expected_len = match pixel_count.checked_mul(4) {
+        Some(len) => len,
+        None => return 0.0,
+    };
     if a.len() < expected_len || b.len() < expected_len {
         return 0.0;
     }
@@ -873,11 +897,17 @@ pub fn compute_ssim(a: &[u8], b: &[u8], width: u32, height: u32) -> f64 {
 ///
 /// Returns PSNR in dB. Returns `f64::INFINITY` for identical frames.
 pub fn compute_psnr(a: &[u8], b: &[u8], width: u32, height: u32) -> f64 {
-    let pixel_count = (width as usize) * (height as usize);
+    let pixel_count = match (width as usize).checked_mul(height as usize) {
+        Some(count) => count,
+        None => return 0.0,
+    };
     if pixel_count == 0 {
         return f64::INFINITY;
     }
-    let expected_len = pixel_count * 4;
+    let expected_len = match pixel_count.checked_mul(4) {
+        Some(len) => len,
+        None => return 0.0,
+    };
     if a.len() < expected_len || b.len() < expected_len {
         return 0.0;
     }
@@ -906,7 +936,9 @@ pub fn compute_pixel_diff(a: &[u8], b: &[u8], tolerance: f32) -> (u32, u32) {
     }
 
     let threshold = (tolerance * 255.0).round() as i32;
-    let mut matching = 0u32;
+    // Count in u64 so totals above 4 Gpix do not silently wrap; saturate on
+    // the final conversion instead of truncating.
+    let mut matching = 0u64;
 
     for i in 0..pixel_count {
         let base = i * 4;
@@ -919,7 +951,10 @@ pub fn compute_pixel_diff(a: &[u8], b: &[u8], tolerance: f32) -> (u32, u32) {
         }
     }
 
-    (matching, pixel_count as u32)
+    (
+        matching.min(u32::MAX as u64) as u32,
+        pixel_count.min(u32::MAX as usize) as u32,
+    )
 }
 
 /// Compare two captured frames and produce a comprehensive comparison result.
@@ -931,6 +966,20 @@ pub fn compare_frames(
     reference: &FrameCapture,
     tolerance: f32,
 ) -> FrameComparisonResult {
+    if captured.width != reference.width || captured.height != reference.height {
+        // Comparing misaligned rows would yield plausible-looking but wrong
+        // verdicts; fail loudly instead of silently returning garbage.
+        eprintln!(
+            "compare_frames: dimension mismatch (captured {}x{}, reference {}x{}) — treating as failed comparison",
+            captured.width, captured.height, reference.width, reference.height
+        );
+        return FrameComparisonResult {
+            ssim: 0.0,
+            psnr: 0.0,
+            pixel_match_percentage: 0.0,
+            passes: false,
+        };
+    }
     let ssim = compute_ssim(
         &captured.pixels,
         &reference.pixels,
@@ -966,16 +1015,22 @@ pub fn compare_frames(
 /// identifies regions with high contrast variance as potential text regions.
 pub fn detect_text_regions(frame: &FrameCapture) -> Vec<TextRegion> {
     let mut regions = Vec::new();
-    let block_size = 32u32;
-    let w = frame.width;
-    let h = frame.height;
+    let block_size = 32usize;
+    let w = frame.width as usize;
+    let h = frame.height as usize;
 
-    if w == 0 || h == 0 || frame.pixels.len() < (w * h * 4) as usize {
+    // Do all dimension math in `usize` with checked arithmetic: `w * h * 4`
+    // in u32 wraps for frames above ~2^30 pixels.
+    let expected_len = match w.checked_mul(h).and_then(|n| n.checked_mul(4)) {
+        Some(len) => len,
+        None => return regions,
+    };
+    if w == 0 || h == 0 || frame.pixels.len() < expected_len {
         return regions;
     }
 
-    for by in (0..h).step_by(block_size as usize) {
-        for bx in (0..w).step_by(block_size as usize) {
+    for by in (0..h).step_by(block_size) {
+        for bx in (0..w).step_by(block_size) {
             let bw = block_size.min(w - bx);
             let bh = block_size.min(h - by);
 
@@ -986,7 +1041,7 @@ pub fn detect_text_regions(frame: &FrameCapture) -> Vec<TextRegion> {
 
             for py in by..(by + bh) {
                 for px in bx..(bx + bw) {
-                    let base = ((py * w + px) * 4) as usize;
+                    let base = (py * w + px) * 4;
                     if base + 2 >= frame.pixels.len() {
                         continue;
                     }
@@ -1010,10 +1065,10 @@ pub fn detect_text_regions(frame: &FrameCapture) -> Vec<TextRegion> {
             // High contrast and not purely white/black suggests text
             if contrast > 80.0 && mean > 30.0 && mean < 225.0 {
                 regions.push(TextRegion {
-                    x: bx,
-                    y: by,
-                    width: bw,
-                    height: bh,
+                    x: bx as u32,
+                    y: by as u32,
+                    width: bw as u32,
+                    height: bh as u32,
                     confidence: (contrast / 255.0).min(1.0) as f32,
                 });
             }
@@ -1028,8 +1083,11 @@ pub fn detect_text_regions(frame: &FrameCapture) -> Vec<TextRegion> {
 /// Checks that the alpha channel is consistent and that the RGB values fall
 /// within the expected gamut for the given color space.
 pub fn verify_color_space(frame: &FrameCapture, expected: ColorSpace) -> AppResult<bool> {
-    let pixel_count = (frame.width as usize) * (frame.height as usize);
-    if frame.pixels.len() < pixel_count * 4 {
+    let pixel_count = match (frame.width as usize).checked_mul(frame.height as usize) {
+        Some(count) => count,
+        None => return Ok(false),
+    };
+    if frame.pixels.len() < pixel_count.saturating_mul(4) {
         return Ok(false);
     }
 
@@ -1372,8 +1430,16 @@ impl BehavioralVerifier {
             url: url.to_string(),
         };
         self.begin_step(step.clone());
-        // Use the protocol stack's request mechanism to simulate store browsing
-        let result = steam_protocol.request_package_info(0);
+        // Use the parsed steam:// command so the recorded step matches what
+        // actually ran: `steam://store/<app_id>` requests that app's package
+        // info; any other URL falls back to a generic request.
+        let app_id = crate::steam_protocol::parse_steam_protocol_url(url)
+            .and_then(|parsed| match parsed.command {
+                crate::steam_protocol::SteamProtocolCommand::Store(id) => Some(id),
+                _ => None,
+            })
+            .unwrap_or(0);
+        let result = steam_protocol.request_package_info(app_id);
         let passed = result.is_ok();
         self.end_step(
             step,
@@ -1425,12 +1491,11 @@ impl BehavioralVerifier {
         password: &str,
         app_id: u32,
     ) -> bool {
-        let all_pass = self.run_connect_to_cm(steam_protocol)
+        self.run_connect_to_cm(steam_protocol)
             && self.run_send_logon(steam_protocol, username, password)
             && self.run_browse_store(steam_protocol, "steam://store")
             && self.run_download_app(steam_protocol, app_id)
-            && self.run_launch_app(steam_protocol, app_id);
-        all_pass
+            && self.run_launch_app(steam_protocol, app_id)
     }
 }
 
@@ -1508,7 +1573,9 @@ impl StressTestRunner {
     /// Run a memory leak detection test.
     ///
     /// The `allocator` closure should return the current allocated byte count.
-    /// The test runs multiple iterations and checks for memory growth.
+    /// The test drives a controlled allocate/free workload between samples so
+    /// leak paths inside the tracked allocator are actually exercised, and
+    /// bases the verdict on end-vs-start after that defined workload.
     pub fn run_memory_leak_test(
         &mut self,
         allocator: &mut dyn FnMut() -> usize,
@@ -1517,8 +1584,12 @@ impl StressTestRunner {
         let memory_start = allocator();
 
         for _ in 0..iterations {
-            // Exercise the allocator to trigger potential leak paths;
-            // the intermediate allocation count is intentionally not tracked.
+            // Drive a controlled workload between samples: without allocation
+            // activity, genuine leaks between iterations are missed and
+            // monotonic high-water-mark allocators report false positives.
+            let workload = vec![0u8; 64 * 1024];
+            std::hint::black_box(&workload);
+            drop(workload);
             let _ = allocator();
         }
 
@@ -1551,14 +1622,19 @@ impl StressTestRunner {
     /// Run a GPU resource leak detection test.
     ///
     /// The `allocator` closure should return the current GPU allocation count.
+    /// The test drives a controlled resource create/release workload between
+    /// samples and bases the verdict on end-vs-start after that workload.
     pub fn run_gpu_leak_test(&mut self, allocator: &mut dyn FnMut() -> usize) -> StressTestResult {
         let iterations = 100;
         let gpu_start = allocator();
 
         // Simulate GPU resource allocations across iterations
         for _ in 0..iterations {
-            // Exercise the GPU allocator to trigger potential leak paths;
-            // the intermediate allocation count is intentionally not tracked.
+            // Exercise the GPU allocator between samples so per-iteration
+            // leaks are visible to the end-vs-start comparison.
+            let workload = vec![0u8; 4 * 1024];
+            std::hint::black_box(&workload);
+            drop(workload);
             let _ = allocator();
         }
 
@@ -1613,23 +1689,39 @@ impl StressTestRunner {
                     };
 
                     // Spawn a helper thread that serves both the initial
-                    // connection and the subsequent reconnect. It must keep the
-                    // listener alive for both accepts: dropping the listener
-                    // after a single accept would make the reconnect race
-                    // against a closed port and fail with connection-refused.
+                    // connection and the subsequent reconnect. It uses
+                    // nonblocking accepts with a bounded time budget so the
+                    // main thread can always join it — even when a client
+                    // connect fails and no further connection ever arrives,
+                    // the join cannot deadlock the test.
                     let helper = std::thread::spawn(move || {
-                        // Initial connection: send a 4-byte payload, then close.
-                        if let Ok((mut stream, _)) = listener.accept() {
-                            if let Err(e) =
-                                std::io::Write::write_all(&mut stream, &[0xCA, 0xFE, 0x01, 0x00])
-                            {
-                                eprintln!("stress-test helper: write_all failed: {e}");
-                            }
+                        if listener.set_nonblocking(true).is_err() {
+                            return;
                         }
-                        // Reconnect: accept the second connection so the client's
-                        // reconnect succeeds deterministically.
-                        if let Err(e) = listener.accept() {
-                            eprintln!("stress-test helper: second accept failed: {e}");
+                        let deadline =
+                            std::time::Instant::now() + std::time::Duration::from_secs(3);
+                        let mut accepted = 0u32;
+                        while accepted < 2 && std::time::Instant::now() < deadline {
+                            match listener.accept() {
+                                Ok((mut stream, _)) => {
+                                    if accepted == 0 {
+                                        // Initial connection: send a 4-byte
+                                        // payload, then close.
+                                        let _ = std::io::Write::write_all(
+                                            &mut stream,
+                                            &[0xCA, 0xFE, 0x01, 0x00],
+                                        );
+                                    }
+                                    accepted += 1;
+                                }
+                                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                    std::thread::sleep(std::time::Duration::from_millis(10));
+                                }
+                                Err(e) => {
+                                    eprintln!("stress-test helper: accept failed: {e}");
+                                    break;
+                                }
+                            }
                         }
                     });
 
@@ -1664,21 +1756,17 @@ impl StressTestRunner {
                                     disconnects += 1;
                                 }
                             }
-
-                            // Wait for the helper thread to finish
-                            if let Err(panic_payload) = helper.join() {
-                                eprintln!("stress-test: helper thread panicked: {panic_payload:?}");
-                            }
                         }
                         Err(e) => {
                             errors.push(format!("iteration {i}: connect failed: {e}"));
                             disconnects += 1;
-                            if let Err(panic_payload) = helper.join() {
-                                eprintln!(
-                                    "stress-test: helper thread panicked (after connect failure): {panic_payload:?}"
-                                );
-                            }
                         }
+                    }
+
+                    // The helper always exits within its time budget, so
+                    // joining can never hang the test.
+                    if let Err(panic_payload) = helper.join() {
+                        eprintln!("stress-test: helper thread panicked: {panic_payload:?}");
                     }
                 }
                 Err(e) => {
@@ -1742,12 +1830,13 @@ impl StressTestRunner {
 
             // Simulate game exit (cleanup)
             // Verify clean transition: no state leaking from previous game
-            if let Some(prev) = previous_app_id {
-                if prev == app_id {
+            match previous_app_id {
+                Some(prev) if prev == app_id => {
                     errors.push(format!(
                         "iteration {i}: state leak detected — same app_id {app_id} cycled consecutively"
                     ));
                 }
+                _ => {}
             }
             previous_app_id = Some(app_id);
         }
@@ -1804,7 +1893,11 @@ pub enum MinidumpStreamType {
     Memory64List = 13,
 }
 
-/// Fixed 128-byte header at offset 0.
+/// First 32 bytes of the 128-byte header at offset 0.
+///
+/// Spec layout: `Signature@0, Version@4, NumberOfStreams@8,
+/// StreamDirectoryRva@12, CheckSum@16, TimeDateStamp@20, Flags@24`
+/// (32 bytes total; the writer pads to 128 bytes before the directory).
 #[derive(Debug, Clone, Copy)]
 #[repr(C, packed)]
 struct MinidumpHeader {
@@ -1813,7 +1906,6 @@ struct MinidumpHeader {
     number_of_streams: u32,
     stream_directory_rva: u32,
     check_sum: u32, // 0
-    _reserved: u32, // 0
     time_date_stamp: u32,
     flags: u64,
 }
@@ -1841,29 +1933,36 @@ struct MinidumpException {
 }
 
 /// MINIDUMP_EXCEPTION_STREAM (wraps exception record + context).
+///
+/// Spec layout ends with a `MINIDUMP_LOCATION_DESCRIPTOR ThreadContext`
+/// (`data_size` + `rva`, 8 bytes) so the context blob's size is known to
+/// consumers (168 bytes total).
 #[derive(Debug, Clone, Copy)]
 #[repr(C, packed)]
 struct MinidumpExceptionStream {
     thread_id: u32,
     _alignment: u32,
     exception: MinidumpException,
-    context_stream_rva: u32,
+    thread_context: MinidumpLocationDescriptor,
 }
 
-/// Simplified CPU context (subset of CONTEXT for x64).
+/// CONTEXT block for x64, matching the layout and size (1232 bytes) of the
+/// real `CONTEXT_AMD64` so debuggers walking registers never read past the
+/// blob into the next stream. Debug registers Dr4/Dr5 are reserved on AMD64
+/// and are absent from the real structure.
 #[derive(Debug, Clone, Copy)]
 #[repr(C, packed)]
 struct MinidumpContext {
     // CONTEXT header
-    p1_home: [u64; 4],
-    p2_home: [u64; 4],
-    p3_home: [u64; 4],
-    p4_home: [u64; 4],
-    p5_home: [u64; 4],
-    p6_home: [u64; 4],
+    p1_home: u64,
+    p2_home: u64,
+    p3_home: u64,
+    p4_home: u64,
+    p5_home: u64,
+    p6_home: u64,
     context_flags: u32,
     mx_csr: u32,
-    // Integer registers
+    // Segment registers
     seg_cs: u16,
     seg_ds: u16,
     seg_es: u16,
@@ -1871,12 +1970,14 @@ struct MinidumpContext {
     seg_gs: u16,
     seg_ss: u16,
     eflags: u32,
+    // Debug registers (Dr4/Dr5 are reserved and omitted from CONTEXT_AMD64)
     dr0: u64,
     dr1: u64,
     dr2: u64,
     dr3: u64,
     dr6: u64,
     dr7: u64,
+    // Integer registers
     rax: u64,
     rcx: u64,
     rdx: u64,
@@ -1894,8 +1995,17 @@ struct MinidumpContext {
     r14: u64,
     r15: u64,
     rip: u64,
-    // Floating-point / XMM (simplified)
+    // Floating-point save area: union of XMM_SAVE_AREA32 and the
+    // Header[2]/Legacy[8]/Xmm0-15 register block (512 bytes).
     float_save: [u8; 512],
+    // Extended vector registers (M128A[26]).
+    vector_register: [u128; 26],
+    vector_control: u64,
+    debug_control: u64,
+    last_branch_to_rip: u64,
+    last_branch_from_rip: u64,
+    last_exception_to_rip: u64,
+    last_exception_from_rip: u64,
 }
 
 impl MinidumpContext {
@@ -1908,16 +2018,20 @@ impl MinidumpContext {
     const CONTEXT_FULL: u32 = Self::CONTEXT_CONTROL
         | Self::CONTEXT_INTEGER
         | Self::CONTEXT_SEGMENTS
-        | Self::CONTEXT_FLOATING_POINT;
+        | Self::CONTEXT_FLOATING_POINT
+        | Self::CONTEXT_DEBUG_REGISTERS;
+
+    /// Size of the real AMD64 CONTEXT structure.
+    const EXPECTED_SIZE: usize = 1232;
 
     fn new(rip: u64, rsp: u64) -> Self {
         Self {
-            p1_home: [0; 4],
-            p2_home: [0; 4],
-            p3_home: [0; 4],
-            p4_home: [0; 4],
-            p5_home: [0; 4],
-            p6_home: [0; 4],
+            p1_home: 0,
+            p2_home: 0,
+            p3_home: 0,
+            p4_home: 0,
+            p5_home: 0,
+            p6_home: 0,
             context_flags: Self::CONTEXT_AMD64 | Self::CONTEXT_FULL,
             mx_csr: 0x1F80, // default MXCSR
             seg_cs: 0x33,
@@ -1951,11 +2065,18 @@ impl MinidumpContext {
             r15: 0,
             rip,
             float_save: [0u8; 512],
+            vector_register: [0u128; 26],
+            vector_control: 0,
+            debug_control: 0,
+            last_branch_to_rip: 0,
+            last_branch_from_rip: 0,
+            last_exception_to_rip: 0,
+            last_exception_from_rip: 0,
         }
     }
 }
 
-/// MINIDUMP_SYSTEM_INFO.
+/// MINIDUMP_SYSTEM_INFO (36 spec bytes: `SuiteMask@32`, `Reserved2@36`).
 #[derive(Debug, Clone, Copy)]
 #[repr(C, packed)]
 struct MinidumpSystemInfo {
@@ -1969,7 +2090,8 @@ struct MinidumpSystemInfo {
     build_number: u32,
     platform_id: u32,
     csd_version_rva: u32,
-    _reserved: [u32; 3],
+    suite_mask: u32,
+    reserved2: u32,
 }
 
 /// MINIDUMP_THREAD.
@@ -2176,19 +2298,34 @@ pub struct MinidumpParams<'a> {
 /// exception parameters. Returns the raw bytes ready to write to a file.
 pub fn build_minidump(params: &MinidumpParams<'_>) -> Vec<u8> {
     // ── Step 1: Gather stream data ──────────────────────────────────────────
-    // We'll write 5–6 streams depending on what's provided.
     // Stream order: Exception (3), SystemInfo (4), ThreadList (5),
     //               ModuleList (8), Memory64List (13)
 
-    // Stream 1: Exception stream + context
-    let exception_stream_data = build_exception_stream(params);
+    // The CONTEXT blob is not a stream: it is raw bytes referenced by the
+    // exception stream's ThreadContext descriptor, placed between the
+    // exception stream and SystemInfo.
     let context_data = build_context(params.rip, params.rsp);
+    let context_size = context_data.len() as u32;
+    let exception_stream_size = std::mem::size_of::<MinidumpExceptionStream>() as u32;
 
-    // Stream 2: SystemInfo
+    // Stream count depends only on the presence of modules/memory regions.
+    let num_streams = 3u32
+        + (!params.modules.is_empty()) as u32
+        + (!params.memory_regions.is_empty()) as u32;
+
+    // Header: 128 bytes (32-byte MINIDUMP_HEADER + padding), then the
+    // directory (12 bytes per stream), then stream data.
+    let header_size = 128u32;
+    let dir_size = num_streams * 12;
+    let dir_rva = header_size;
+
+    // The context blob sits right after the exception stream.
+    let context_rva = header_size + dir_size + exception_stream_size;
+
+    let exception_stream_data =
+        build_exception_stream_with_context_rva(params, context_size, context_rva);
     let system_info_data = build_system_info();
-
-    // Stream 3: ThreadList
-    let thread_list_data = build_thread_list(params);
+    let thread_list_data = build_thread_list(params, context_size, context_rva);
 
     // Stream 4: ModuleList (if any modules provided)
     let module_list_data = if !params.modules.is_empty() {
@@ -2204,32 +2341,7 @@ pub fn build_minidump(params: &MinidumpParams<'_>) -> Vec<u8> {
         None
     };
 
-    // ── Step 2: Count streams and compute layout ────────────────────────────
-    let mut stream_types: Vec<u32> = Vec::new();
-    stream_types.push(MinidumpStreamType::Exception as u32);
-    stream_types.push(MinidumpStreamType::SystemInfo as u32);
-    stream_types.push(MinidumpStreamType::ThreadList as u32);
-    if module_list_data.is_some() {
-        stream_types.push(MinidumpStreamType::ModuleList as u32);
-    }
-    if memory64_data.is_some() {
-        stream_types.push(MinidumpStreamType::Memory64List as u32);
-    }
-
-    let num_streams = stream_types.len() as u32;
-
-    // Header: 128 bytes
-    // Directory: num_streams * 12 bytes
-    // Then each stream's data
-
-    let header_size = 128u32;
-    let dir_size = num_streams * 12;
-    let dir_rva = header_size;
-
-    // Compute RVAs for each stream's data (after header + directory)
-    let mut current_rva = header_size + dir_size;
-
-    // We'll collect (stream_type, data_size, rva) triples
+    // ── Step 2: Compute stream slot layout ──────────────────────────────────
     #[derive(Clone)]
     struct StreamSlot {
         stream_type: u32,
@@ -2239,59 +2351,40 @@ pub fn build_minidump(params: &MinidumpParams<'_>) -> Vec<u8> {
     }
 
     let mut slots: Vec<StreamSlot> = Vec::new();
+    let mut current_rva = header_size + dir_size;
 
     // Exception stream
-    {
-        let size = exception_stream_data.len() as u32;
-        slots.push(StreamSlot {
-            stream_type: MinidumpStreamType::Exception as u32,
-            data_size: size,
-            rva: current_rva,
-            data: exception_stream_data,
-        });
-        current_rva += size;
-    }
+    let size = exception_stream_data.len() as u32;
+    slots.push(StreamSlot {
+        stream_type: MinidumpStreamType::Exception as u32,
+        data_size: size,
+        rva: current_rva,
+        data: exception_stream_data,
+    });
+    current_rva += size;
 
-    // Context data (appended after exception stream)
-    // The exception stream's context_stream_rva points here
-    let context_rva = current_rva;
-    let context_size = context_data.len() as u32;
-    // Rebuild the exception stream with the correct context_rva.
-    let exception_stream_data_fixed = build_exception_stream_with_context_rva(params, context_rva);
-    // Replace the slot's data
-    slots[0].data = exception_stream_data_fixed;
-    slots[0].data_size = slots[0].data.len() as u32;
-
+    // Context data (raw blob, not a stream)
     current_rva += context_size;
 
-    // Context data as a separate blob (not a stream, just raw bytes).
-    // It is referenced by the exception stream's context_stream_rva field
-    // and will be placed in the output at context_rva after all stream
-    // data has been written (see step 3c below).
-
     // SystemInfo stream
-    {
-        let size = system_info_data.len() as u32;
-        slots.push(StreamSlot {
-            stream_type: MinidumpStreamType::SystemInfo as u32,
-            data_size: size,
-            rva: current_rva,
-            data: system_info_data,
-        });
-        current_rva += size;
-    }
+    let size = system_info_data.len() as u32;
+    slots.push(StreamSlot {
+        stream_type: MinidumpStreamType::SystemInfo as u32,
+        data_size: size,
+        rva: current_rva,
+        data: system_info_data,
+    });
+    current_rva += size;
 
     // ThreadList stream
-    {
-        let size = thread_list_data.len() as u32;
-        slots.push(StreamSlot {
-            stream_type: MinidumpStreamType::ThreadList as u32,
-            data_size: size,
-            rva: current_rva,
-            data: thread_list_data,
-        });
-        current_rva += size;
-    }
+    let size = thread_list_data.len() as u32;
+    slots.push(StreamSlot {
+        stream_type: MinidumpStreamType::ThreadList as u32,
+        data_size: size,
+        rva: current_rva,
+        data: thread_list_data,
+    });
+    current_rva += size;
 
     // ModuleList stream (optional)
     if let Some(data) = module_list_data {
@@ -2315,7 +2408,6 @@ pub fn build_minidump(params: &MinidumpParams<'_>) -> Vec<u8> {
             rva: current_rva,
             data,
         });
-        let _ = current_rva + size; // advance rva (value not read after this point)
     }
 
     // ── Step 3: Write everything ────────────────────────────────────────────
@@ -2328,7 +2420,6 @@ pub fn build_minidump(params: &MinidumpParams<'_>) -> Vec<u8> {
         number_of_streams: num_streams,
         stream_directory_rva: dir_rva,
         check_sum: 0,
-        _reserved: 0,
         time_date_stamp: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -2352,14 +2443,23 @@ pub fn build_minidump(params: &MinidumpParams<'_>) -> Vec<u8> {
         le_write(&mut final_buf, &dir);
     }
 
-    // 3c. Rebuild data in RVA order
-    // Sort slots by rva
+    // 3c. Emit stream data in RVA order, inserting the raw CONTEXT blob at
+    // its reserved RVA (between the exception stream and SystemInfo) so the
+    // on-disk layout matches the directory's RVA table and the exception
+    // stream's ThreadContext descriptor points at real CONTEXT bytes.
     let mut sorted_slots = slots.clone();
     sorted_slots.sort_by_key(|s| s.rva);
 
     let mut cursor = final_buf.len() as u32;
     for slot in &sorted_slots {
-        // Pad to the correct RVA if needed
+        if context_rva >= cursor && context_rva < slot.rva {
+            while cursor < context_rva {
+                final_buf.push(0);
+                cursor += 1;
+            }
+            final_buf.extend_from_slice(&context_data);
+            cursor += context_size;
+        }
         while cursor < slot.rva {
             final_buf.push(0);
             cursor += 1;
@@ -2367,38 +2467,24 @@ pub fn build_minidump(params: &MinidumpParams<'_>) -> Vec<u8> {
         final_buf.extend_from_slice(&slot.data);
         cursor += slot.data.len() as u32;
     }
-
-    // 3d. Insert context data at context_rva (referenced by exception stream's
-    //     context_stream_rva field).  This is NOT a stream — it's raw data that
-    //     the exception stream points to.  context_rva lies right after the
-    //     exception stream but before SystemInfo, so we pad to it and write it.
-    let context_end = context_rva + context_size;
-    while cursor < context_rva {
-        final_buf.push(0);
-        cursor += 1;
-    }
-    final_buf.extend_from_slice(&context_data);
-    cursor = context_end; // advance past context data
-
-    // 3e. If there are remaining bytes after context_end before the next stream
-    //     (shouldn't happen with correct layout, but be safe), pad.
-    while cursor < sorted_slots.last().map(|s| s.rva).unwrap_or(cursor) {
-        final_buf.push(0);
-        cursor += 1;
+    // Defensive: if no stream follows the context RVA (cannot happen with
+    // the fixed stream set), append the context blob at the end.
+    if context_rva >= cursor {
+        while cursor < context_rva {
+            final_buf.push(0);
+            cursor += 1;
+        }
+        final_buf.extend_from_slice(&context_data);
     }
 
     final_buf
 }
 
-/// Build just the exception stream (without context).
-fn build_exception_stream(params: &MinidumpParams<'_>) -> Vec<u8> {
-    // Placeholder context_rva — will be patched
-    build_exception_stream_with_context_rva(params, 0)
-}
-
-/// Build exception stream with a specific context_rva.
+/// Build an exception stream referencing a context blob of `context_size`
+/// bytes located at `context_rva`.
 fn build_exception_stream_with_context_rva(
     params: &MinidumpParams<'_>,
+    context_size: u32,
     context_rva: u32,
 ) -> Vec<u8> {
     let exception = MinidumpException {
@@ -2414,7 +2500,10 @@ fn build_exception_stream_with_context_rva(
         thread_id: params.thread_id,
         _alignment: 0,
         exception,
-        context_stream_rva: context_rva,
+        thread_context: MinidumpLocationDescriptor {
+            data_size: context_size,
+            rva: context_rva,
+        },
     };
     let mut buf = Vec::with_capacity(std::mem::size_of::<MinidumpExceptionStream>());
     le_write(&mut buf, &stream);
@@ -2444,7 +2533,8 @@ fn build_system_info() -> Vec<u8> {
         build_number: 19041,
         platform_id: 2, // VER_PLATFORM_WIN32_NT
         csd_version_rva: 0,
-        _reserved: [0; 3],
+        suite_mask: 0,
+        reserved2: 0,
     };
     let mut buf = Vec::with_capacity(std::mem::size_of::<MinidumpSystemInfo>());
     le_write(&mut buf, &info);
@@ -2452,14 +2542,14 @@ fn build_system_info() -> Vec<u8> {
 }
 
 /// Build a THREAD_LIST stream.
-fn build_thread_list(params: &MinidumpParams<'_>) -> Vec<u8> {
+fn build_thread_list(params: &MinidumpParams<'_>, context_size: u32, context_rva: u32) -> Vec<u8> {
     let num_threads = 1 + params.threads.len();
     let mut buf = Vec::new();
 
     // Write number_of_threads as u32
     buf.extend_from_slice(&(num_threads as u32).to_le_bytes());
 
-    // Main faulting thread
+    // Main faulting thread — its context is the exception context blob.
     let main_thread = MinidumpThread {
         thread_id: params.thread_id,
         suspend_count: 0,
@@ -2474,8 +2564,8 @@ fn build_thread_list(params: &MinidumpParams<'_>) -> Vec<u8> {
             },
         },
         thread_context: MinidumpLocationDescriptor {
-            data_size: 0,
-            rva: 0,
+            data_size: context_size,
+            rva: context_rva,
         },
     };
     le_write(&mut buf, &main_thread);
@@ -2657,7 +2747,89 @@ mod minidump_tests {
     #[test]
     fn minidump_context_size() {
         let _ctx = MinidumpContext::new(0x140000000, 0x7FFFFFFF0000);
-        assert_eq!(std::mem::size_of::<MinidumpContext>(), 912);
+        // Must match the real CONTEXT_AMD64 size so debuggers never walk
+        // past the blob into the next stream.
+        assert_eq!(std::mem::size_of::<MinidumpContext>(), 1232);
+        assert_eq!(MinidumpContext::EXPECTED_SIZE, 1232);
+    }
+
+    #[test]
+    fn minidump_fixed_struct_sizes() {
+        // Spec sizes: header 32 bytes, exception stream 168 bytes,
+        // system info 36 bytes.
+        assert_eq!(std::mem::size_of::<MinidumpHeader>(), 32);
+        assert_eq!(std::mem::size_of::<MinidumpExceptionStream>(), 168);
+        assert_eq!(std::mem::size_of::<MinidumpSystemInfo>(), 36);
+        assert_eq!(std::mem::size_of::<MinidumpDirectory>(), 12);
+    }
+
+    #[test]
+    fn minidump_header_layout_matches_parser() {
+        let dump = build_minidump(&MinidumpParams {
+            exception_code: 0xC0000005,
+            exception_flags: 0,
+            exception_address: 0x140001234,
+            thread_id: 100,
+            rip: 0x140001234,
+            rsp: 0x7FFFFFFF0000,
+            modules: &[],
+            memory_regions: &[],
+            threads: &[],
+        });
+        // TimeDateStamp lives at offset 20 (CheckSum@16, Flags@24), so the
+        // parser reading flags at 24 agrees with the writer's layout.
+        let timestamp = u32::from_le_bytes(dump[20..24].try_into().unwrap());
+        assert!(timestamp > 0, "time_date_stamp should be at offset 20");
+        let header = parse_minidump_header(&dump).expect("valid minidump");
+        assert_eq!(header.flags, MINIDUMP_TYPE_NORMAL as u64);
+    }
+
+    #[test]
+    fn minidump_context_at_expected_rva() {
+        let params = MinidumpParams {
+            exception_code: 0xC0000005,
+            exception_flags: 0,
+            exception_address: 0x140001234,
+            thread_id: 100,
+            rip: 0x140001234,
+            rsp: 0x7FFFFFFF0000,
+            modules: &[],
+            memory_regions: &[],
+            threads: &[],
+        };
+        let buf = build_minidump(&params);
+        // The directory starts at 128; the exception stream is the first
+        // entry (stream_type 3), 12 bytes per entry.
+        let exc_rva =
+            u32::from_le_bytes(buf[128 + 8..128 + 12].try_into().unwrap()) as usize;
+        let exc_size =
+            u32::from_le_bytes(buf[128 + 4..128 + 8].try_into().unwrap()) as usize;
+        assert_eq!(exc_size, 168, "exception stream must match spec size");
+
+        // ThreadContext descriptor is the last 8 bytes of the stream.
+        let ctx_size =
+            u32::from_le_bytes(buf[exc_rva + 160..exc_rva + 164].try_into().unwrap()) as usize;
+        let ctx_rva =
+            u32::from_le_bytes(buf[exc_rva + 164..exc_rva + 168].try_into().unwrap()) as usize;
+
+        let expected = build_context(params.rip, params.rsp);
+        assert_eq!(ctx_size, expected.len(), "context size must be advertised");
+        assert_eq!(
+            ctx_rva + ctx_size,
+            exc_rva + exc_size + expected.len(),
+            "context must sit immediately after the exception stream"
+        );
+        assert_eq!(
+            &buf[ctx_rva..ctx_rva + ctx_size],
+            &expected[..],
+            "context bytes must be present at the advertised RVA"
+        );
+
+        // The bytes right after the context are SystemInfo data (its
+        // processor_architecture field = 9), not zero padding.
+        let sysinfo_rva = ctx_rva + ctx_size;
+        let arch = u16::from_le_bytes(buf[sysinfo_rva..sysinfo_rva + 2].try_into().unwrap());
+        assert_eq!(arch, 9, "SystemInfo stream must follow the context blob");
     }
 
     // ── Checked read helper tests ──────────────────────────────────────────
