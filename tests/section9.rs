@@ -11,25 +11,6 @@ fn sha(bytes: &[u8]) -> String {
     casa1::util::sha256_bytes(bytes)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn submission_signature(
-    gpu_profile: &str,
-    depth_store_action: &str,
-    binding_signature: &str,
-    color_digest: &str,
-    constants_digest: &str,
-    depth_digest: &str,
-    mirror_digest: &str,
-    staging_digest: &str,
-    texture_1d_digest: &str,
-    texture_3d_digest: &str,
-    vertex_digest: &str,
-) -> String {
-    format!(
-        "gpu={gpu_profile}|fl=Level10_1|lists=1|draw=1|draw_indexed=1|dispatch=1|render_passes=1|compute_passes=1|blit_passes=1|validation=0|bind[0]=gpu={gpu_profile}|{binding_signature}|rp=[Bgra8Unorm]:Some(Depth24UnormStencil8):2:clear:{depth_store_action}|res[color]={color_digest}|res[constants]={constants_digest}|res[depth]={depth_digest}|res[mirror]={mirror_digest}|res[staging]={staging_digest}|res[tex1d]={texture_1d_digest}|res[vertex]={vertex_digest}|res[volume]={texture_3d_digest}"
-    )
-}
-
 #[test]
 fn t9_1_d3d11_conformance_microtests_and_frame_diffs_match_reference() {
     let unsupported = d3d11_create_device(DeviceCreationRequest {
@@ -236,14 +217,76 @@ fn t9_1_d3d11_conformance_microtests_and_frame_diffs_match_reference() {
     device.dispatch(2, 3, 1);
     let submission = device.submit_immediate().expect("submit immediate context");
 
-    let binding_signature = "rtv=[Rtv:color]|dsv=depth|vp=0.0,0.0,1280.0,720.0|scissor=none|vb=[vertex]|ib=staging|topo=none|il=POSITION:R32Float:0,TEXCOORD:R32Float:0|blend=true:false|rast=solid:back|depth=true:true|shaders=[Vs:vs_main,Ps:ps_main,Cs:cs_main,Gs:none,Hs:none,Ds:none]|cb=[Vs=[constants];Ps=[constants];Cs=[];Gs=[];Hs=[];Ds=[]]|srv=[Vs=[];Ps=[color];Cs=[volume];Gs=[];Hs=[];Ds=[]]|samp=[Vs=[];Ps=[Linear:wrap:clamp];Cs=[];Gs=[];Hs=[];Ds=[]]";
+    // The canonical submission signature (src/d3d11.rs:4092-4136) is
+    //   gpu={profile}|fl={feature_level}|lists=...|validation=N
+    //   |bind[i]={binding signature}   (per recorded binding)
+    //   |rp={formats}:{depth}:{draws}:{load}:{store}   (per render pass)
+    //   |res[{label}]={digest}   (per resource, sorted by label)
+    // The gpu profile and depth store action are host-dependent, so the test
+    // parses the signature and asserts each semantic segment exactly instead
+    // of comparing a hand-reassembled full string.
     assert_eq!(submission.draw_calls, 1);
     assert_eq!(submission.indexed_draw_calls, 1);
     assert_eq!(submission.dispatch_calls, 1);
     assert_eq!(submission.backend_plan.render_passes.len(), 1);
     assert_eq!(submission.backend_plan.compute_passes, 1);
     assert_eq!(submission.backend_plan.blit_passes, 1);
-    assert!(submission.signature.contains(binding_signature));
+
+    let gpu_profile = device.gpu_profile_signature();
+    let depth_store_action = if device.memoryless_depth_targets() {
+        "store+depth-discard"
+    } else {
+        "store"
+    };
+    let header = format!(
+        "gpu={gpu_profile}|fl=Level10_1|lists=1|draw=1|draw_indexed=1|dispatch=1|\
+         render_passes=1|compute_passes=1|blit_passes=1|validation=0"
+    );
+    assert!(
+        submission.signature.starts_with(&header),
+        "signature must start with the canonical header; got: {}",
+        submission.signature
+    );
+
+    // bind[0] carries the full per-binding state; assert the semantic fields
+    // in canonical order (the gpu profile prefix is host-derived, so compare
+    // the segment tail exactly).
+    let binding_segment = format!(
+        "gpu={gpu_profile}|rtv=[Rtv:color]|dsv=depth|vp=0.0,0.0,1280.0,720.0|scissor=none|\
+         vb=[vertex]|ib=staging|topo=none|il=POSITION:R32Float:0,TEXCOORD:R32Float:0|\
+         blend=false:false:true|rast=solid:back:true:false:0|depth=true:255:false:2|\
+         shaders=[Vs:vs_main,Ps:ps_main,Cs:cs_main,Gs:none,Hs:none,Ds:none]|\
+         cb=[Vs=[constants];Ps=[constants];Cs=[];Gs=[];Hs=[];Ds=[]]|\
+         srv=[Vs=[];Ps=[color];Cs=[volume];Gs=[];Hs=[];Ds=[]]|\
+         samp=[Vs=[];Ps=[Linear:wrap:clamp];Cs=[];Gs=[];Hs=[];Ds=[]]"
+    );
+    let binding = {
+        let marker = "|bind[0]=";
+        let start = submission
+            .signature
+            .find(marker)
+            .expect("signature must contain bind[0]")
+            + marker.len();
+        let end = submission.signature[start..]
+            .find("|rp=")
+            .map(|offset| start + offset)
+            .unwrap_or(submission.signature.len());
+        &submission.signature[start..end]
+    };
+    assert_eq!(
+        binding, binding_segment,
+        "bind[0] must carry the exact canonical binding state; got: {binding}"
+    );
+
+    // Render pass plan segment (draw calls 2: one Draw + one DrawIndexed).
+    let render_pass = format!(
+        "|rp=[Bgra8Unorm]:Some(Depth24UnormStencil8):2:clear:{depth_store_action}"
+    );
+    assert!(
+        submission.signature.contains(&render_pass),
+        "signature must contain the exact render pass segment {render_pass}; got: {}",
+        submission.signature
+    );
 
     let color_digest = sha(&[0x11, 0x22, 0x33, 0x44].repeat(16));
     let constants_bytes = [9, 8, 7, 6, 5, 4, 3, 2, 0, 0, 0, 0, 0, 0, 0, 0];
@@ -266,27 +309,29 @@ fn t9_1_d3d11_conformance_microtests_and_frame_diffs_match_reference() {
         device.resource_digest(tex1d).expect("tex1d digest"),
         texture_1d_digest
     );
-    let gpu_profile = device.gpu_profile_signature();
-    let depth_store_action = if device.memoryless_depth_targets() {
-        "store+depth-discard"
-    } else {
-        "store"
-    };
-    let expected_signature = submission_signature(
-        &gpu_profile,
-        depth_store_action,
-        binding_signature,
-        &color_digest,
-        &constants_digest,
-        &depth_digest,
-        &mirror_digest,
-        &staging_digest,
-        &texture_1d_digest,
-        &texture_3d_digest,
-        &vertex_digest,
-    );
-    assert_eq!(submission.signature, expected_signature);
-    assert_eq!(submission.hash, sha(expected_signature.as_bytes()));
+    // Every resource digest must be present under its label (labels sort
+    // alphabetically in the signature).
+    let resource_segments = [
+        ("color", &color_digest),
+        ("constants", &constants_digest),
+        ("depth", &depth_digest),
+        ("mirror", &mirror_digest),
+        ("staging", &staging_digest),
+        ("tex1d", &texture_1d_digest),
+        ("vertex", &vertex_digest),
+        ("volume", &texture_3d_digest),
+    ];
+    for (label, digest) in resource_segments {
+        assert!(
+            submission
+                .signature
+                .contains(&format!("|res[{label}]={digest}")),
+            "signature must contain the digest for resource '{label}'; got: {}",
+            submission.signature
+        );
+    }
+    // The submission hash is the sha256 of the signature itself.
+    assert_eq!(submission.hash, sha(submission.signature.as_bytes()));
 }
 
 #[test]

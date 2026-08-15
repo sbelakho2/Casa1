@@ -452,25 +452,79 @@ fn t8_4_cache_keys_entries_and_corruption_handling_are_deterministic() {
     let entry_b = build_cache_entry(&output_b.cache_key, &output_b, 42, Some(vec![1, 2, 3]))
         .expect("second cache entry");
     assert_eq!(entry_a.checksum, entry_b.checksum);
+    // pso_cache_key content: the documented payload is
+    // "vs||ps||cs||sha256(render_state)||sha256(formats)||sample_count||topology"
+    // hashed with sha256 (src/shader.rs:3992-4002). Pin the concrete value so
+    // a key that ignores its inputs cannot pass.
+    let render_state = b"render-state";
+    let formats = b"formats";
+    let expected_pso_key = casa1::util::sha256_bytes(
+        format!(
+            "{}||{}||||{}||{}||1||triangle",
+            output_a.cache_key,
+            output_a.cache_key,
+            casa1::util::sha256_bytes(render_state),
+            casa1::util::sha256_bytes(formats),
+        )
+        .as_bytes(),
+    );
     assert_eq!(
         pso_cache_key(
             Some(&output_a.cache_key),
             Some(&output_a.cache_key),
             None,
-            b"render-state",
-            b"formats",
+            render_state,
+            formats,
+            1,
+            "triangle",
+        ),
+        expected_pso_key,
+        "pso_cache_key must hash the documented payload"
+    );
+    // Deliberately different inputs must produce different keys: a cache key
+    // that ignores its inputs (e.g., always returning the same hash) is
+    // caught by this inequality.
+    assert_ne!(
+        pso_cache_key(
+            Some(&output_a.cache_key),
+            Some(&output_a.cache_key),
+            None,
+            render_state,
+            formats,
             1,
             "triangle",
         ),
         pso_cache_key(
-            Some(&output_b.cache_key),
-            Some(&output_b.cache_key),
+            Some(&output_a.cache_key),
+            Some(&output_a.cache_key),
             None,
-            b"render-state",
-            b"formats",
+            render_state,
+            b"different-formats",
             1,
             "triangle",
-        )
+        ),
+        "pso_cache_key must distinguish different input blobs"
+    );
+    assert_ne!(
+        pso_cache_key(
+            Some(&output_a.cache_key),
+            Some(&output_a.cache_key),
+            None,
+            render_state,
+            formats,
+            1,
+            "triangle",
+        ),
+        pso_cache_key(
+            Some(&output_a.cache_key),
+            Some(&output_a.cache_key),
+            Some(&output_a.cache_key),
+            render_state,
+            formats,
+            1,
+            "triangle",
+        ),
+        "pso_cache_key must distinguish different shader stages"
     );
 
     let mut cache = ShaderCache::new(4096);
@@ -493,7 +547,8 @@ fn t8_5_cache_effectiveness_and_offline_compilation_scheduling_match_reference()
     assert_eq!(first_run.misses, 20);
     assert_eq!(second_run.hits, 20);
     assert_eq!(second_run.compile_stalls, 0);
-    assert!((second_run.hits as f32 / inputs.len() as f32) >= 0.95);
+    // (The 95% hit-ratio assertion was redundant with the exact hits==20
+    // equality above and was removed.)
 
     let temp_dir = TempDir::new().expect("temp dir for offline compile scan");
     let discovered_a = temp_dir.path().join("alpha.dxil");

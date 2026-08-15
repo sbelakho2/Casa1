@@ -21,6 +21,13 @@ fn expected_manifest_hash(files: &[(&str, &[u8])], registry: &[(&str, &str)]) ->
     casa1::util::sha256_bytes(entries.join("\n").as_bytes())
 }
 
+/// Checked-in golden manifest hash for the cumulative installer-farm state
+/// (4 files + 3 registry entries below), computed independently of the
+/// engine. Guards against silent changes to the hashing convention itself
+/// (normalization, separators, sort order).
+const GOLDEN_CUMULATIVE_MANIFEST_HASH: &str =
+    "d39f5e3eb7cb858e5260bb7a0e6763f1e7af3083f091b90d75af6cabc6db6a1f";
+
 #[test]
 fn t12_1_installer_farm_compare_file_and_registry_manifests_against_reference() {
     let mut engine = InstallerEngine::new();
@@ -143,6 +150,14 @@ fn t12_1_installer_farm_compare_file_and_registry_manifests_against_reference() 
         ],
     );
     assert_eq!(custom_run.manifest_hash, expected);
+    // Golden check: the cumulative farm state must hash to the checked-in
+    // value; a change in the hashing convention itself (normalization,
+    // separators, sort key) is caught here even though both sides of the
+    // algorithmic check above would agree.
+    assert_eq!(
+        custom_run.manifest_hash, GOLDEN_CUMULATIVE_MANIFEST_HASH,
+        "cumulative manifest hash must match the checked-in golden value"
+    );
     assert_eq!(engine.telemetry_log().len(), 3);
 }
 

@@ -1,43 +1,49 @@
 use casa1::gfx::{
     Command, DescriptorHeapType, DxgiFormat, EmulationStrategy, FeatureQuery, FilterMode,
-    FrameArtifact, GraphicsBackend, HeapType, PipelineStateDesc, QueryType, ResourceDesc,
-    ResourceState, ResourceUsageHint, RootSignatureDesc, SceneSpec, SwapchainDesc, ViewDescriptor,
-    format_mapping,
+    GraphicsBackend, HeapType, PipelineStateDesc, QueryType, ResourceDesc, ResourceState,
+    ResourceUsageHint, RootSignatureDesc, SceneSpec, SwapchainDesc, ViewDescriptor,
 };
 use casa1::reason::ReasonCode;
 use std::fs;
 use tempfile::tempdir;
 
-fn reference_frame_hash(scene: &SceneSpec) -> String {
-    let mapping = format_mapping(scene.format).expect("format mapping");
-    let signature = format!(
-        "{}|{:?}|{:02x}{:02x}{:02x}{:02x}|{}|{}|{:?}",
-        scene.name,
-        scene.format,
-        scene.clear_color[0],
-        scene.clear_color[1],
-        scene.clear_color[2],
-        scene.clear_color[3],
-        scene.draw_calls,
-        scene.compute_dispatches,
-        mapping.strategy,
-    );
-    casa1::util::sha256_bytes(signature.as_bytes())
-}
-
 #[test]
 fn t7_1_dxgi_swapchain_oracle_suite_matches_expected_present_resize_and_latency_behavior() {
     let mut backend = GraphicsBackend::new();
-    assert_eq!(backend.adapter().vendor_id, 0x106b);
-    assert!(backend.adapter().device_id >= 0x1000);
+    // The adapter is derived from the real host GPU (detected_host_gpu_profile,
+    // src/gfx.rs:1186-1187), so vendor/device assertions must be
+    // environment-agnostic: any of the three supported vendors, a non-zero
+    // device id, and a Metal-family tag.
+    assert!(
+        matches!(backend.adapter().vendor_id, 0x106b | 0x10de | 0x1002),
+        "adapter vendor must be Apple/NVIDIA/AMD; got {:#x}",
+        backend.adapter().vendor_id
+    );
+    assert_ne!(backend.adapter().device_id, 0, "device id must be populated");
+    assert!(
+        backend.adapter().metal_family.starts_with("apple"),
+        "metal family must be apple<family>; got {}",
+        backend.adapter().metal_family
+    );
+    // Output topology is fixed by the backend profile (two hardcoded outputs).
     assert_eq!(backend.outputs().len(), 2);
     assert_eq!(backend.outputs()[0].modes[0].width, 2560);
     assert_eq!(backend.outputs()[0].modes[0].refresh_numerator, 60_000);
     assert!(backend.query_feature(FeatureQuery::Tearing));
     assert!(backend.query_feature(FeatureQuery::TimestampQueries));
+    // Mesh shaders follow the documented family contract: family >= 9
+    // (src/gfx.rs:3325). Parse the family from the adapter tag and pin the
+    // feature mapping against it.
+    let family = backend
+        .adapter()
+        .metal_family
+        .strip_prefix("apple")
+        .and_then(|value| value.parse::<u8>().ok())
+        .expect("parse metal family");
     assert_eq!(
         backend.query_feature(FeatureQuery::MeshShaders),
-        backend.adapter().metal_family != "apple7" && backend.adapter().metal_family != "apple8"
+        family >= 9,
+        "MeshShaders must be reported exactly for Metal family >= 9"
     );
     assert_eq!(
         backend
@@ -439,41 +445,146 @@ fn t7_3_frame_hash_and_ssim_suite_matches_reference_frames() {
         },
     ];
 
-    for scene in scenes {
+    // Checked-in golden signatures for the scene-hash format documented at
+    // src/gfx.rs:2705-2716 (`name|format|clear_color|draws|dispatches|strategy`).
+    // These are literal constants, not re-derived through engine functions, so
+    // any change to the canonical format or the format-mapping strategy breaks
+    // the test.
+    let golden_hashes = [
+        "e996c1581ca75d935636706f021c9c5cd3d66efb65363095c9db07c39f5cb9e7",
+        "89a76eeb4a57fa5fd0499d679ab958b456156c9cbd730d2d73a874688dc35b03",
+        "d9a9e1808e297ff255d1fa49592b92abbc4831c41d581e80f97c8aa084840105",
+    ];
+
+    for (scene, golden) in scenes.into_iter().zip(golden_hashes) {
         let artifact = backend.render_scene(&scene).expect("render modeled scene");
-        assert_eq!(artifact.hash, reference_frame_hash(&scene));
-        assert!((artifact.ssim - 1.0).abs() < f32::EPSILON);
+        assert_eq!(
+            artifact.hash, golden,
+            "scene {:?} hash must match the checked-in golden value",
+            scene.name
+        );
     }
+    // NOTE: `ssim` is not asserted. render_scene hardcodes ssim: 1.0 and never
+    // renders actual pixels (src/gfx.rs:2717-2721), so asserting ssim ≈ 1.0
+    // would only enshrine the stub. A real SSIM check requires an actual
+    // rasterized frame, which the current backend does not produce.
 }
 
 #[test]
-fn t7_4_metal_validation_gate_reports_zero_errors_across_scene_suite() {
-    let backend = GraphicsBackend::new();
-    let scenes = vec![
-        SceneSpec {
-            name: "validation-a".to_string(),
-            format: DxgiFormat::B8G8R8A8Unorm,
-            clear_color: [1, 1, 1, 255],
-            draw_calls: 1,
-            compute_dispatches: 1,
-        },
-        SceneSpec {
-            name: "validation-b".to_string(),
-            format: DxgiFormat::B5G6R5Unorm,
-            clear_color: [4, 8, 16, 255],
-            draw_calls: 4,
-            compute_dispatches: 0,
-        },
-    ];
+fn t7_4_metal_validation_gate_reports_errors_for_invalid_scenes() {
+    // The Metal validation gate lives in execute_command_lists
+    // (src/gfx.rs:2472-2537), not in render_scene (which always reports zero
+    // validation errors, src/gfx.rs:2717-2721). Exercise the real gate: valid
+    // command streams must validate clean, invalid ones must produce errors.
 
-    for scene in scenes {
-        let FrameArtifact {
-            validation_errors, ..
-        } = backend
-            .render_scene(&scene)
-            .expect("render validation scene");
-        assert!(validation_errors.is_empty());
-    }
+    let mut backend = GraphicsBackend::new();
+    let color = backend
+        .create_resource(ResourceDesc {
+            name: "validation-color".to_string(),
+            format: DxgiFormat::B8G8R8A8Unorm,
+            heap: HeapType::Default,
+            size: 64,
+            subresources: 1,
+            initial_state: ResourceState::Common,
+            usage_hint: ResourceUsageHint::Generic,
+        })
+        .expect("create validation color resource");
+
+    // Valid scene: begin render pass, clear RTV, draw.
+    let rtv_heap = backend.create_descriptor_heap(DescriptorHeapType::Rtv, 1);
+    backend
+        .write_descriptor(
+            rtv_heap,
+            0,
+            ViewDescriptor::Rtv {
+                resource: color,
+                format: DxgiFormat::B8G8R8A8Unorm,
+            },
+        )
+        .expect("write validation RTV");
+    let root_signature = backend.create_root_signature(RootSignatureDesc::default());
+    let pipeline_state = backend.create_pipeline_state(
+        root_signature,
+        PipelineStateDesc {
+            label: "validation".to_string(),
+            compute: false,
+            render_target_formats: vec![DxgiFormat::B8G8R8A8Unorm],
+            depth_format: None,
+        },
+    );
+    let queue = backend.create_command_queue();
+    let allocator = backend.create_command_allocator();
+    let list = backend.create_graphics_command_list(allocator, pipeline_state, false);
+    backend
+        .record_begin_render_pass(
+            list,
+            vec![DxgiFormat::B8G8R8A8Unorm],
+            None,
+            "clear",
+            "store",
+        )
+        .expect("begin render pass");
+    backend
+        .record_clear_rtv(list, rtv_heap, 0)
+        .expect("clear RTV");
+    backend.record_draw(list, 3).expect("record draw");
+    let closed = backend
+        .close_command_list(list)
+        .expect("close valid command list");
+    let fence = backend.create_fence(0);
+    let valid_plan = backend
+        .execute_command_lists(queue, &[closed], Some((fence, 1)))
+        .expect("execute valid command list");
+    assert!(
+        valid_plan.validation_errors.is_empty(),
+        "valid command stream must validate clean; got {:?}",
+        valid_plan.validation_errors
+    );
+
+    // Invalid scene 1: draw without an active render pass.
+    let allocator = backend.create_command_allocator();
+    let list = backend.create_graphics_command_list(allocator, pipeline_state, false);
+    backend.record_draw(list, 3).expect("record orphan draw");
+    let closed = backend
+        .close_command_list(list)
+        .expect("close invalid command list");
+    let fence = backend.create_fence(0);
+    let invalid_plan = backend
+        .execute_command_lists(queue, &[closed], Some((fence, 2)))
+        .expect("execute invalid command list");
+    assert!(
+        invalid_plan
+            .validation_errors
+            .iter()
+            .any(|error| error.contains("draw without active render pass")),
+        "orphan draw must be reported by the validation gate; got {:?}",
+        invalid_plan.validation_errors
+    );
+
+    // Invalid scene 2: clearing an RTV slot that holds a non-RTV descriptor
+    // is rejected eagerly at record time by the descriptor validation gate
+    // (record_clear_rtv -> validate_rtv_descriptor, src/gfx.rs:1987-1998).
+    let sampler_heap = backend.create_descriptor_heap(DescriptorHeapType::Sampler, 1);
+    backend
+        .write_descriptor(
+            sampler_heap,
+            0,
+            ViewDescriptor::Sampler {
+                filter: FilterMode::Point,
+            },
+        )
+        .expect("write sampler descriptor");
+    let allocator = backend.create_command_allocator();
+    let list = backend.create_graphics_command_list(allocator, pipeline_state, false);
+    let misattached = backend.record_clear_rtv(list, sampler_heap, 0);
+    assert!(
+        misattached.is_err(),
+        "clear on a non-RTV descriptor must be rejected; got {misattached:?}"
+    );
+    assert_eq!(
+        misattached.expect_err("misattached clear").code,
+        ReasonCode::RcD3dInvalidState
+    );
 }
 
 #[test]
@@ -511,7 +622,10 @@ fn t7_5_resource_create_destroy_soak_keeps_live_set_bounded_and_frame_times_stab
         );
     }
     assert_eq!(backend.live_resource_count(), 2);
-    let min = *frame_times.iter().min().expect("min frame time");
-    let max = *frame_times.iter().max().expect("max frame time");
-    assert_eq!(min, max);
+    // frame_time_us is a pure function of the sync interval (16_666 µs per
+    // vsync frame, src/gfx.rs:1390-1393), so pin the value rather than
+    // asserting min == max on a constant sequence.
+    for frame_time_us in &frame_times {
+        assert_eq!(*frame_time_us, 16_666);
+    }
 }

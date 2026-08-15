@@ -90,51 +90,11 @@ fn ge_layout_and_drive_mapping_table_match_section2_requirements() {
     assert!(d_drive.requires_permission);
 }
 
-#[test]
-fn windows_path_parsing_handles_normalization_devices_long_paths_and_reserved_names() {
-    let temp_dir = TempDir::new().expect("temp dir");
-    create_ge(&temp_dir, "paths", "x64");
-    let mut ge = open_ge(&temp_dir, "paths");
-
-    let normalized = ge
-        .parse_windows_path("C:\\Alpha\\Beta\\.\\Gamma\\..\\File.txt. ", None)
-        .expect("normalize path");
-    assert_eq!(normalized.normalized_path, "C:\\alpha\\beta\\file.txt");
-
-    let verbatim = ge
-        .parse_windows_path("\\\\?\\C:\\Alpha\\Beta. ", None)
-        .expect("verbatim path");
-    assert_eq!(verbatim.normalized_path, "\\\\?\\C:\\Alpha\\Beta. ");
-    assert!(verbatim.verbatim);
-
-    let device = ge
-        .parse_windows_path("\\\\.\\pipe\\steam", None)
-        .expect("device namespace");
-    assert!(device.device_namespace);
-    assert_eq!(device.normalized_path, "\\\\.\\pipe\\steam");
-
-    let reserved = ge
-        .parse_windows_path("C:\\Temp\\NUL", None)
-        .expect_err("reserved DOS name should fail");
-    assert_eq!(reserved.code, ReasonCode::RcFsReservedName);
-
-    let long_path = format!(
-        "C:\\{}",
-        (0..40)
-            .map(|index| format!("segment{index:02}"))
-            .collect::<Vec<_>>()
-            .join("\\")
-    );
-    let too_long = ge
-        .parse_windows_path(&long_path, None)
-        .expect_err("long path should fail without policy");
-    assert_eq!(too_long.code, ReasonCode::RcFsPathTooLong);
-
-    ge.config.long_paths_enabled = true;
-    ge.save_config().expect("save long path policy");
-    let _result = ge.parse_windows_path(&long_path, None);
-    assert!(_result.is_ok(), "expected Ok, got {_result:?}");
-}
+// The hand-written path-parsing cases (normalization, verbatim, device
+// namespace, reserved names, long paths with/without policy) are pure
+// duplicates of the oracle-driven `t2_1_path_edge_suite_matches_independent_oracle`
+// below — the oracle encodes the same six expectations, so the hand-written
+// copy was deleted to keep a single source of truth.
 
 #[test]
 fn t2_1_path_edge_suite_matches_independent_oracle() {
@@ -653,10 +613,12 @@ fn registry_watchers_receive_change_notifications() {
         RegistryView::Native,
     )
     .expect("first change");
+    // Wait for the notification with a generous deadline instead of a single
+    // short timeout: the watcher is driven by a condvar, so a loaded CI
+    // machine may deliver the wake long after the change was recorded.
     assert!(
-        watcher
-            .wait_for_change(Duration::from_millis(100))
-            .expect("first watcher wake")
+        wait_for_change_with_budget(&mut watcher),
+        "first watcher wake"
     );
 
     ge.registry_set_value(
@@ -669,15 +631,35 @@ fn registry_watchers_receive_change_notifications() {
     )
     .expect("second change");
     assert!(
-        watcher
-            .wait_for_change(Duration::from_millis(100))
-            .expect("second watcher wake")
+        wait_for_change_with_budget(&mut watcher),
+        "second watcher wake"
     );
+    // No further writes happen, so a short negative probe is deterministic.
     assert!(
         !watcher
-            .wait_for_change(Duration::from_millis(20))
+            .wait_for_change(Duration::from_millis(100))
             .expect("no more changes")
     );
+}
+
+/// Poll `wait_for_change` with short timeouts until a change is observed or a
+/// 5-second budget is exhausted. Converts timeout-gated flakiness into a
+/// bounded deadline wait on the watcher's condvar.
+fn wait_for_change_with_budget(watcher: &mut casa1::ge::RegistryWatcher) -> bool {
+    let budget = Duration::from_secs(5);
+    let poll = Duration::from_millis(25);
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        if watcher
+            .wait_for_change(poll)
+            .expect("registry watcher wait")
+        {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+    }
 }
 
 #[test]
@@ -716,10 +698,10 @@ fn t2_4_registry_notify_suite_matches_independent_oracle_counts() {
                 .registry_delete_value(&suite.hive, &suite.key, &value, RegistryView::Native)
                 .expect("oracle registry delete"),
         }
-        if watcher
-            .wait_for_change(Duration::from_millis(50))
-            .expect("oracle watcher wait")
-        {
+        // Each operation must produce exactly one wake. Wait with a bounded
+        // budget rather than a single 50 ms timeout so slow CI scheduling
+        // cannot make a correct watcher look broken.
+        if wait_for_change_with_budget(&mut watcher) {
             wake_count += 1;
         }
     }
