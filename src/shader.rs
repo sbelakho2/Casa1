@@ -305,6 +305,9 @@ pub struct CacheRunStats {
     pub hits: usize,
     pub misses: usize,
     pub compile_stalls: usize,
+    /// Number of shaders whose translation failed; they are counted as misses
+    /// but not inserted into the cache.
+    pub failures: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -338,6 +341,9 @@ pub struct ShaderCache {
     max_size_bytes: usize,
     clock: u64,
     entries: BTreeMap<String, ShaderCacheEntry>,
+    /// Running total of `entry_size` over all entries, kept in sync on insert
+    /// and eviction so the eviction loop is O(k) instead of O(n·k).
+    total_bytes: usize,
     logs: Vec<ReasonCode>,
 }
 
@@ -428,6 +434,11 @@ impl ShaderCache {
         self.entries.len()
     }
 
+    /// True when the cache holds no entries.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
     /// Total estimated byte size of all cached entries.
     pub fn total_size_bytes(&self) -> usize {
         self.entries.values().map(entry_size).sum()
@@ -435,11 +446,13 @@ impl ShaderCache {
 
     /// Look up a cache entry by key (SHA-256 of raw DXIL bytecode).
     /// Returns `None` if the key is not present. Updates LRU timestamp on hit.
-    pub fn get(&mut self, key: &str) -> Option<ShaderCacheEntry> {
+    /// The returned reference borrows the cache; callers that only need a
+    /// hit/miss check should use `.is_some()`.
+    pub fn get(&mut self, key: &str) -> Option<&ShaderCacheEntry> {
         let entry = self.entries.get_mut(key)?;
         self.clock += 1;
         entry.header.last_used_ts = self.clock;
-        Some(entry.clone())
+        Some(entry)
     }
 
     /// Insert a new entry into the cache. If adding the entry would exceed
@@ -449,17 +462,29 @@ impl ShaderCache {
         self.clock += 1;
         entry.header.created_ts = self.clock;
         entry.header.last_used_ts = self.clock;
-        let entry_size = entry_size(&entry);
-        // Evict LRU entries while over capacity
-        while self.total_size_bytes() + entry_size > self.max_size_bytes && self.entries.len() > 1 {
+        let new_size = entry_size(&entry);
+        // Replace any existing entry for the same key first.
+        if let Some(old) = self.entries.get(&entry.header.key) {
+            self.total_bytes = self.total_bytes.saturating_sub(entry_size(old));
+        }
+        // Evict LRU entries while over capacity.
+        while self.total_bytes.saturating_add(new_size) > self.max_size_bytes
+            && self.entries.len() > 1
+        {
             let lru_key = self
                 .entries
                 .values()
                 .min_by_key(|value| value.header.last_used_ts)
-                .map(|value| value.header.key.clone())
-                .expect("cache is not empty");
-            self.entries.remove(&lru_key);
+                .map(|value| value.header.key.clone());
+            if let Some(lru_key) = lru_key {
+                if let Some(evicted) = self.entries.remove(&lru_key) {
+                    self.total_bytes = self.total_bytes.saturating_sub(entry_size(&evicted));
+                }
+            } else {
+                break;
+            }
         }
+        self.total_bytes = self.total_bytes.saturating_add(new_size);
         self.entries.insert(entry.header.key.clone(), entry);
     }
 
@@ -518,7 +543,7 @@ impl OfflineCompiler {
         scheduled_keys.sort();
         OfflineCompilationPlan {
             total_shaders: self.discovered_files.len() + scheduled_keys.len(),
-            worker_count: max_threads.max(1).min(4),
+            worker_count: max_threads.clamp(1, 4),
             cpu_cap_percent,
             io_priority_low: true,
             blocks_ui_thread: false,
@@ -547,17 +572,20 @@ impl OfflineCompiler {
 // LLVM bitcode constants
 // ---------------------------------------------------------------------------
 
-/// LLVM bitcode magic: 'BC' 0x0 0x1E 0x0B
-const LLVM_BC_MAGIC: u32 = 0x0B1E_0BC0u32.to_be();
+/// LLVM bitcode magic: bytes 'B', 'C', 0xC0, 0xDE.
+///
+/// The reader compares against `u32::from_be_bytes`, so the constant is the
+/// big-endian interpretation of those four bytes.
+const LLVM_BC_MAGIC: u32 = 0x4243_C0DE;
 
-/// LLVM bitcode wrapper magic: 0xDEC04342
-const LLVM_WRAPPER_MAGIC: u32 = 0xDEC0_4342u32.to_be();
+/// LLVM bitcode wrapper magic (stored little-endian): 0x0B17C0DE.
+const LLVM_WRAPPER_MAGIC: u32 = 0x0B17_C0DE;
 
 /// DXIL version constants
 const DXIL_VERSION_MAJOR: u32 = 1;
 const DXIL_VERSION_MINOR: u32 = 0;
 
-// LLVM bitcode block/record IDs (u32 to match enter_block() return type)
+// LLVM bitcode block/record IDs (u32, matching the bitstream entry codes)
 const BLOCKID_BLOCKINFO: u32 = 0;
 const BLOCKID_MODULE: u32 = 8;
 const BLOCKID_PARAMATTR: u32 = 9;
@@ -573,18 +601,17 @@ const BLOCKID_OPERAND_BUNDLE_TAGS: u32 = 18;
 
 // Record codes within BLOCKINFO
 const BLOCKINFO_CODE_SETBID: u32 = 1;
-const BLOCKINFO_CODE_ABBREV: u32 = 2;
-const BLOCKINFO_CODE_UNABBREV: u32 = 3;
+const BLOCKINFO_CODE_BLOCKNAME: u32 = 2;
+const BLOCKINFO_CODE_SETRECORDNAME: u32 = 3;
 
 // Module-level record codes
 const MODULE_CODE_VERSION: u32 = 1;
 const MODULE_CODE_TRIPLE: u32 = 2;
 const MODULE_CODE_DATALAYOUT: u32 = 3;
-const MODULE_CODE_VSTMT: u32 = 6;
-const MODULE_CODE_FUNCTION: u32 = 8;
 const MODULE_CODE_GLOBALVAR: u32 = 7;
+const MODULE_CODE_FUNCTION: u32 = 8;
 
-// Type block record codes
+// Type block record codes (per the LLVM bitcode format; DXC writes these)
 const TYPE_CODE_NUMENTRY: u32 = 1;
 const TYPE_CODE_VOID: u32 = 2;
 const TYPE_CODE_FLOAT: u32 = 3;
@@ -593,35 +620,50 @@ const TYPE_CODE_LABEL: u32 = 5;
 const TYPE_CODE_OPAQUE: u32 = 6;
 const TYPE_CODE_INTEGER: u32 = 7;
 const TYPE_CODE_POINTER: u32 = 8;
-const TYPE_CODE_ARRAY: u32 = 9;
-const TYPE_CODE_VECTOR: u32 = 10;
-const TYPE_CODE_STRUCT: u32 = 11;
-const TYPE_CODE_FUNCTION_OLD: u32 = 12;
-const TYPE_CODE_HALF: u32 = 13;
-const TYPE_CODE_FUNCTION_NEW: u32 = 14;
+const TYPE_CODE_FUNCTION_OLD: u32 = 9;
+const TYPE_CODE_HALF: u32 = 10;
+const TYPE_CODE_ARRAY: u32 = 11;
+const TYPE_CODE_VECTOR: u32 = 12;
+const TYPE_CODE_X86_FP80: u32 = 13;
+const TYPE_CODE_FP128: u32 = 14;
+const TYPE_CODE_PPC_FP128: u32 = 15;
+const TYPE_CODE_METADATA: u32 = 16;
+const TYPE_CODE_X86_MMX: u32 = 17;
+const TYPE_CODE_STRUCT_ANON: u32 = 18;
+const TYPE_CODE_STRUCT_NAME: u32 = 19;
+const TYPE_CODE_STRUCT_NAMED: u32 = 20;
+const TYPE_CODE_FUNCTION: u32 = 21;
 
-// Function block record codes
+// Function block record codes (per the LLVM 3.7 / DXC bitcode format)
 const FUNC_CODE_DECLAREBLOCKS: u32 = 0;
-const FUNC_CODE_INST_BINOP: u32 = 1;
-const FUNC_CODE_INST_CAST: u32 = 2;
-const FUNC_CODE_INST_GEP: u32 = 3;
-const FUNC_CODE_INST_SELECT: u32 = 4;
-const FUNC_CODE_INST_EXTRACTVAL: u32 = 5;
-const FUNC_CODE_INST_INSERTVAL: u32 = 6;
-const FUNC_CODE_INST_CMP: u32 = 7;
-const FUNC_CODE_INST_RET: u32 = 8;
-const FUNC_CODE_INST_BR: u32 = 9;
-const FUNC_CODE_INST_SWITCH: u32 = 10;
-const FUNC_CODE_INST_ALLOCA: u32 = 11;
-const FUNC_CODE_INST_LOAD: u32 = 12;
-const FUNC_CODE_INST_STORE: u32 = 13;
-const FUNC_CODE_INST_PHI: u32 = 14;
-const FUNC_CODE_INST_CALL: u32 = 15;
-const FUNC_CODE_INST_UNREACHABLE: u32 = 16;
-const FUNC_CODE_INST_EXTRACTELT: u32 = 22;
-const FUNC_CODE_INST_INSERTELT: u32 = 23;
-const FUNC_CODE_INST_SHUFFLE: u32 = 24;
-const FUNC_CODE_INST_CMP2: u32 = 25;
+const FUNC_CODE_INST_BINOP: u32 = 2; // [op0, op1, opc, flags?]
+const FUNC_CODE_INST_CAST: u32 = 3; // [op0, result_ty, cast_opc]
+const FUNC_CODE_INST_GEP_OLD: u32 = 4;
+const FUNC_CODE_INST_SELECT: u32 = 5;
+const FUNC_CODE_INST_EXTRACTELT: u32 = 6;
+const FUNC_CODE_INST_INSERTELT: u32 = 7;
+const FUNC_CODE_INST_SHUFFLEVEC: u32 = 8;
+const FUNC_CODE_INST_CMP: u32 = 9; // legacy: [opty, op0, op1, pred]
+const FUNC_CODE_INST_RET: u32 = 10;
+const FUNC_CODE_INST_BR: u32 = 11; // [bb#, bb#, cond] or [bb#]
+const FUNC_CODE_INST_SWITCH: u32 = 12; // [opty, cond, default_bb, (case, bb)...]
+const FUNC_CODE_INST_INVOKE: u32 = 13;
+const FUNC_CODE_INST_UNREACHABLE: u32 = 15;
+const FUNC_CODE_INST_PHI: u32 = 16; // [ty, (val#signed, bb)...]
+const FUNC_CODE_INST_ALLOCA: u32 = 19; // [instty, opty, size, align]
+const FUNC_CODE_INST_LOAD: u32 = 20; // [ptr, result_ty, align, vol]
+const FUNC_CODE_INST_VAARG: u32 = 23;
+const FUNC_CODE_INST_STORE_OLD: u32 = 24;
+const FUNC_CODE_INST_EXTRACTVAL: u32 = 26;
+const FUNC_CODE_INST_INSERTVAL: u32 = 27;
+const FUNC_CODE_INST_CMP2: u32 = 28; // [op0, op1, pred, flags?]
+const FUNC_CODE_INST_VSELECT: u32 = 29; // [cond, false_val, true_val]
+const FUNC_CODE_INST_INBOUNDS_GEP_OLD: u32 = 30;
+const FUNC_CODE_INST_INDIRECTBR: u32 = 31;
+const FUNC_CODE_INST_CALL: u32 = 34; // [attr, cc, fnty, fn, args...]
+const FUNC_CODE_INST_FENCE: u32 = 36;
+const FUNC_CODE_INST_GEP: u32 = 43; // [inbounds, srcty, ops...]
+const FUNC_CODE_INST_STORE: u32 = 44; // [ptr, val, align, vol]
 
 // DXIL intrinsic opcodes (HLSL intrinsics)
 const DXIL_INTRIN_ABS: u32 = 400;
@@ -784,6 +826,36 @@ const DXIL_INTRIN_EMITTHENCUTSTREAM: u32 = 652;
 const DXIL_INTRIN_CREATEHANDLE: u32 = 660;
 const DXIL_INTRIN_CREATEHANDLEFORBINDING: u32 = 661;
 
+// Additional HLSL intrinsics
+const DXIL_INTRIN_DISCARD: u32 = 598;
+const DXIL_INTRIN_WAVEISFIRSTLANE: u32 = 599;
+
+// Internal comparison opcodes for the remaining fcmp predicates
+// (icmp predicates map to 18..=27, fcmp_oeq/one to 28/29).
+const CMP_FCMP_OGT: u32 = 61;
+const CMP_FCMP_OGE: u32 = 62;
+const CMP_FCMP_OLT: u32 = 63;
+const CMP_FCMP_OLE: u32 = 64;
+const CMP_FCMP_UNE: u32 = 65;
+const CMP_FCMP_ORD: u32 = 66;
+const CMP_FCMP_UNO: u32 = 67;
+const CMP_FCMP_FALSE: u32 = 68;
+const CMP_FCMP_TRUE: u32 = 69;
+const CMP_FCMP_UGT: u32 = 70;
+const CMP_FCMP_UGE: u32 = 71;
+const CMP_FCMP_ULT: u32 = 72;
+const CMP_FCMP_ULE: u32 = 73;
+
+// Internal cast opcodes for the float/pointer conversions that the original
+// 30..=35 range (bitcast/ptrtoint/inttoptr/zext/sext/trunc) did not cover.
+const CAST_FPTOUI: u32 = 90;
+const CAST_FPTOSI: u32 = 91;
+const CAST_UITOFP: u32 = 92;
+const CAST_SITOFP: u32 = 93;
+const CAST_FPTRUNC: u32 = 94;
+const CAST_FPEXT: u32 = 95;
+const CAST_ADDRSPACECAST: u32 = 96;
+
 // ---------------------------------------------------------------------------
 // LLVM Bitcode Reader
 // ---------------------------------------------------------------------------
@@ -805,6 +877,46 @@ struct AbbrevDef {
     operands: Vec<AbbrevOp>,
 }
 
+/// Simplified type descriptor derived from the TYPE_BLOCK type table.
+///
+/// Used to decide signedness/floatness of translated operations and to emit
+/// declarations for `alloca` results. `is_signed` refers to integer
+/// operands; pointers and vectors inherit the element characteristics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TypeDesc {
+    is_float: bool,
+    is_signed: bool,
+    is_pointer: bool,
+    is_void: bool,
+    is_vector: bool,
+    width: u32,
+    vector_len: u32,
+}
+
+impl Default for TypeDesc {
+    fn default() -> Self {
+        Self {
+            is_float: false,
+            is_signed: true,
+            is_pointer: false,
+            is_void: false,
+            is_vector: false,
+            width: 32,
+            vector_len: 1,
+        }
+    }
+}
+
+/// The next element in a bitstream: end of block, sub-block entry, inline
+/// abbreviation definition, or a data record.
+#[derive(Debug, Clone)]
+enum BitcodeEntry {
+    EndBlock,
+    SubBlock(u32),
+    DefineAbbrev(AbbrevDef),
+    Record(BitcodeRecord),
+}
+
 /// Parsed LLVM bitcode record: (record_id, operands).
 #[derive(Debug, Clone)]
 struct BitcodeRecord {
@@ -816,10 +928,10 @@ struct BitcodeRecord {
 /// LLVM bitcode reader with full abbreviation and block nesting support.
 ///
 /// Reads the LLVM bitstream format used by DXIL. Supports:
-/// - BLOCKINFO_BLOCK parsing (SETBID, ABBREV, UNABBREV records)
+/// - BLOCKINFO_BLOCK parsing (SETBID, DEFINE_ABBREV records)
 /// - Abbreviation-based operand decoding (Fixed, VBR, Literal, Array, Blob)
 /// - Block nesting via enter/exit_block
-/// - Wrapper format detection (0xDEC04342 magic)
+/// - Wrapper format detection (0x0B17C0DE magic)
 #[derive(Debug, Clone)]
 struct LlvmBitcodeReader<'a> {
     /// Raw byte slice of the bitcode.
@@ -833,10 +945,12 @@ struct LlvmBitcodeReader<'a> {
     /// Abbreviation definitions from BLOCKINFO blocks, keyed by block_id.
     /// Each block has a list of (abbrev_id -> AbbrevDef).
     block_abbrevs: BTreeMap<u32, Vec<AbbrevDef>>,
-    /// Block nesting stack: (block_id, abbrev_list_for_block).
-    block_stack: Vec<(u32, Vec<AbbrevDef>)>,
+    /// Block nesting stack: (block_id, abbrev_list_for_block, abbrev_width).
+    block_stack: Vec<(u32, Vec<AbbrevDef>, u32)>,
     /// Current abbreviation width for the active block (default 2).
     abbrev_width: u32,
+    /// Type table built from the TYPE_BLOCK (block id 17).
+    type_table: Vec<TypeDesc>,
 }
 
 impl<'a> LlvmBitcodeReader<'a> {
@@ -849,6 +963,7 @@ impl<'a> LlvmBitcodeReader<'a> {
             block_abbrevs: BTreeMap::new(),
             block_stack: Vec::new(),
             abbrev_width: 2,
+            type_table: Vec::new(),
         }
     }
 
@@ -868,41 +983,65 @@ impl<'a> LlvmBitcodeReader<'a> {
     }
 
     /// Read a VBR (Variable Bit Rate) encoded unsigned integer.
+    ///
+    /// Each chunk is `width` bits: `width - 1` value bits plus a continuation
+    /// bit. Chunks may straddle 32-bit word boundaries; the field state is
+    /// tracked across words so the continuation bit is read from the correct
+    /// position. Returns 0 for malformed widths and stops after 64 chunks so
+    /// hostile streams cannot loop forever.
     fn read_vbr_uint(&mut self, width: u32) -> u32 {
+        if width == 0 || width > 32 {
+            return 0;
+        }
+        let value_bits = width - 1;
+        let value_mask = if value_bits >= 32 {
+            u32::MAX
+        } else {
+            (1u32 << value_bits) - 1
+        };
         let mut result: u32 = 0;
         let mut shift: u32 = 0;
+        let mut chunk: u32 = 0;
+        let mut chunk_bits: u32 = 0;
+        let mut chunks: u32 = 0;
         loop {
             if self.bit_pos >= 32 {
                 self.current_word = self.read_u32();
                 self.bit_pos = 0;
             }
             let bits_avail = 32 - self.bit_pos;
-            let chunk_bits = width.min(bits_avail);
-            let mask = if chunk_bits >= 32 {
-                0xFFFFFFFF
+            let n = (width - chunk_bits).min(bits_avail);
+            let mask = if n >= 32 {
+                u32::MAX
             } else {
-                (1u32 << chunk_bits) - 1
+                (1u32 << n) - 1
             };
-            let chunk = (self.current_word >> self.bit_pos) & mask;
-            self.bit_pos += chunk_bits;
-            let continuation = (chunk >> (width - 1)) & 1;
-            let value_bits = width - 1;
-            let value_mask = if value_bits >= 32 {
-                0xFFFFFFFF
-            } else {
-                (1u32 << value_bits) - 1
-            };
-            result |= (chunk & value_mask) << shift;
+            chunk |= ((self.current_word >> self.bit_pos) & mask) << chunk_bits;
+            self.bit_pos += n;
+            chunk_bits += n;
+            if chunk_bits < width {
+                continue;
+            }
+            // A full chunk has been assembled; the high bit is the
+            // continuation marker.
+            let continuation = (chunk >> value_bits) & 1;
+            if shift < 32 {
+                result |= (chunk & value_mask) << shift;
+            }
             shift += value_bits;
-            if continuation == 0 || shift > 64 {
+            chunks += 1;
+            if continuation == 0 || chunks > 64 {
                 break;
             }
+            chunk = 0;
+            chunk_bits = 0;
         }
         result
     }
 
     /// Read a fixed-width unsigned integer.
     fn read_fixed_uint(&mut self, width: u32) -> u32 {
+        let width = width.min(32);
         let mut result: u32 = 0;
         let mut bits_read: u32 = 0;
         while bits_read < width {
@@ -913,12 +1052,14 @@ impl<'a> LlvmBitcodeReader<'a> {
             let bits_avail = 32 - self.bit_pos;
             let chunk_bits = (width - bits_read).min(bits_avail);
             let mask = if chunk_bits >= 32 {
-                0xFFFFFFFF
+                u32::MAX
             } else {
                 (1u32 << chunk_bits) - 1
             };
             let chunk = (self.current_word >> self.bit_pos) & mask;
-            result |= chunk << bits_read;
+            if bits_read < 32 {
+                result |= chunk << bits_read;
+            }
             self.bit_pos += chunk_bits;
             bits_read += chunk_bits;
         }
@@ -957,13 +1098,16 @@ impl<'a> LlvmBitcodeReader<'a> {
         }
     }
 
-    /// Read a Char6-encoded character (6-bit: 0-9, a-z, A-Z, ., _).
+    /// Read a Char6-encoded character.
+    ///
+    /// Per the LLVM bitstream format: 'a'..'z' = 0..25, 'A'..'Z' = 26..51,
+    /// '0'..'9' = 52..61, '.' = 62, '_' = 63.
     fn read_char6(&mut self) -> char {
         let val = self.read_fixed_uint(6);
         match val {
-            0..=9 => (b'0' + val as u8) as char,
-            10..=35 => (b'a' + (val - 10) as u8) as char,
-            36..=61 => (b'A' + (val - 36) as u8) as char,
+            0..=25 => (b'a' + val as u8) as char,
+            26..=51 => (b'A' + (val - 26) as u8) as char,
+            52..=61 => (b'0' + (val - 52) as u8) as char,
             62 => '.',
             63 => '_',
             _ => '?',
@@ -971,28 +1115,57 @@ impl<'a> LlvmBitcodeReader<'a> {
     }
 
     /// Skip the LLVM bitcode wrapper format if present.
-    /// Returns true if wrapper was found and skipped.
-    fn skip_wrapper(&mut self) -> bool {
-        // Check for wrapper magic (0xDEC04342 BE)
-        if self.remaining() >= 4 {
-            let magic = u32::from_be_bytes([
-                self.data[self.pos],
-                self.data[self.pos + 1],
-                self.data[self.pos + 2],
-                self.data[self.pos + 3],
-            ]);
-            if magic == LLVM_WRAPPER_MAGIC {
-                // Wrapper format: magic(4) + size(4) + BC magic(4) + ...
-                self.pos += 4;
-                let wrapper_size = self.read_u32(); // big-endian size of the wrapped bitcode
-                // Validate there's at least enough data for the wrapped bitcode
-                if self.remaining() < wrapper_size as usize {
-                    return false;
-                }
-                return true;
-            }
+    ///
+    /// The documented wrapper layout is:
+    /// `[Magic#32, Version#32, Offset#32, Size#32, CPUType#32]`, all fields
+    /// little-endian, with `Magic == 0x0B17C0DE`. `Offset` points at the
+    /// embedded bitcode stream and `Size` gives its length.
+    ///
+    /// Returns `Ok(true)` when a wrapper was found and skipped, `Ok(false)`
+    /// when the stream is not wrapped, and `Err` for a malformed wrapper.
+    fn skip_wrapper(&mut self) -> AppResult<bool> {
+        if self.remaining() < 20 {
+            return Ok(false);
         }
-        false
+        let magic = u32::from_le_bytes([
+            self.data[self.pos],
+            self.data[self.pos + 1],
+            self.data[self.pos + 2],
+            self.data[self.pos + 3],
+        ]);
+        if magic != LLVM_WRAPPER_MAGIC {
+            return Ok(false);
+        }
+        let version = u32::from_le_bytes([
+            self.data[self.pos + 4],
+            self.data[self.pos + 5],
+            self.data[self.pos + 6],
+            self.data[self.pos + 7],
+        ]);
+        let offset = u32::from_le_bytes([
+            self.data[self.pos + 8],
+            self.data[self.pos + 9],
+            self.data[self.pos + 10],
+            self.data[self.pos + 11],
+        ]);
+        let size = u32::from_le_bytes([
+            self.data[self.pos + 12],
+            self.data[self.pos + 13],
+            self.data[self.pos + 14],
+            self.data[self.pos + 15],
+        ]);
+        // The wrapper header itself is 20 bytes; the embedded stream must be
+        // fully contained in the file.
+        let stream_start = offset as usize;
+        let stream_end = stream_start
+            .checked_add(size as usize)
+            .ok_or_else(|| dxil_invalid("LLVM bitcode wrapper size overflows"))?;
+        if version != 0 || stream_end > self.data.len() {
+            return Err(dxil_invalid("malformed LLVM bitcode wrapper header"));
+        }
+        // Skip the wrapper header; check_magic() validates the embedded magic.
+        self.pos = stream_start;
+        Ok(true)
     }
 
     /// Check and consume the LLVM bitcode magic (0x0B1E_0BC0 BE).
@@ -1018,439 +1191,355 @@ impl<'a> LlvmBitcodeReader<'a> {
         false
     }
 
-    /// Enter a sub-block. Returns the block_id, or None for END_BLOCK.
-    fn enter_block(&mut self) -> Option<u32> {
-        self.align_to_word();
-        if self.remaining() < 4 {
-            return None;
-        }
-        let header = self.read_word();
-        let kind = header & 0x3;
-        if kind == 0 {
-            // END_BLOCK
-            None
-        } else if kind == 1 {
-            // ENTER_SUBBLOCK
-            let block_id = (header >> 2) & 0xFFFF;
-            let abbrev_len = (header >> 18) & 0x3; // 2-bit width of abbrev IDs
-            self.abbrev_width = match abbrev_len {
-                0 => 2,
-                1 => 3,
-                2 => 4,
-                3 => 5,
-                _ => 2,
-            };
-            // Push current block's abbrevs onto stack
-            let block_abbrevs = self
-                .block_abbrevs
-                .get(&block_id)
-                .cloned()
-                .unwrap_or_default();
-            self.block_stack.push((block_id, block_abbrevs));
-            Some(block_id)
-        } else {
-            // Unsupported block kind
-            None
+    /// Advance to the next entry in the bitstream.
+    ///
+    /// The stream is a sequence of aligned 32-bit words; each block entry
+    /// starts with an abbreviation code of `abbrev_width` bits:
+    /// 0 = END_BLOCK, 1 = ENTER_SUBBLOCK, 2 = DEFINE_ABBREV,
+    /// 3 = UNABBREV_RECORD, 4+ = abbreviated record.
+    ///
+    /// Inline DEFINE_ABBREV records are normally processed transparently
+    /// (their definition is added to the active block's abbreviation list).
+    /// The BLOCKINFO reader passes `autoprocess = false` so it can attribute
+    /// the definition to the block selected by the most recent SETBID record.
+    fn next_entry(&mut self, autoprocess_abbrevs: bool) -> Option<BitcodeEntry> {
+        loop {
+            self.align_to_word();
+            if self.remaining() < 4 {
+                return None;
+            }
+            let header = self.read_word();
+            self.current_word = header;
+            self.bit_pos = 0;
+            let code = self.read_fixed_uint(self.abbrev_width);
+            match code {
+                0 => {
+                    // END_BLOCK
+                    return Some(BitcodeEntry::EndBlock);
+                }
+                1 => {
+                    // ENTER_SUBBLOCK: [blockid#vbr8, newabbrevlen#vbr4,
+                    //                 <align32>, blocklen#32]
+                    let block_id = self.read_vbr_uint(8);
+                    let code_len = self.read_vbr_uint(4);
+                    // The abbreviation width must be sane; 0 means the block
+                    // cannot be parsed, and oversized widths are malformed.
+                    if code_len == 0 || code_len > 8 {
+                        return None;
+                    }
+                    self.align_to_word();
+                    let _block_len = self.read_word();
+                    let block_abbrevs = self
+                        .block_abbrevs
+                        .get(&block_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    self.block_stack
+                        .push((block_id, block_abbrevs, self.abbrev_width));
+                    self.abbrev_width = code_len;
+                    return Some(BitcodeEntry::SubBlock(block_id));
+                }
+                2 => {
+                    // DEFINE_ABBREV
+                    let abbrev = self.parse_abbrev_record()?;
+                    if autoprocess_abbrevs {
+                        if let Some((_, abbrevs, _)) = self.block_stack.last_mut() {
+                            abbrevs.push(abbrev);
+                        }
+                    } else {
+                        return Some(BitcodeEntry::DefineAbbrev(abbrev));
+                    }
+                }
+                3 => {
+                    // UNABBREV_RECORD: [code#vbr6, numops#vbr6, op0#vbr6, ...]
+                    let record_id = self.read_vbr_uint(6);
+                    let num_ops = self.read_vbr_uint(6);
+                    if num_ops > 4096 {
+                        return None;
+                    }
+                    let mut ops = Vec::with_capacity(num_ops as usize);
+                    for _ in 0..num_ops {
+                        ops.push(self.read_vbr_uint(6));
+                    }
+                    return Some(BitcodeEntry::Record(BitcodeRecord {
+                        id: record_id,
+                        operands: ops,
+                        blob: None,
+                    }));
+                }
+                _ => {
+                    // ABBREVIATED RECORD
+                    let idx = (code - 4) as usize;
+                    let abbrev = self
+                        .block_stack
+                        .last()
+                        .and_then(|(_, abbrevs, _)| abbrevs.get(idx))
+                        .cloned();
+                    match abbrev {
+                        Some(abbrev) => {
+                            let record = self
+                                .decode_abbrev_record(&abbrev)
+                                .unwrap_or_else(|| BitcodeRecord {
+                                    id: 0xFFFF,
+                                    operands: Vec::new(),
+                                    blob: None,
+                                });
+                            return Some(BitcodeEntry::Record(record));
+                        }
+                        None => {
+                            // Unknown abbreviation: skip the record by
+                            // returning a marker record that parsers ignore.
+                            return Some(BitcodeEntry::Record(BitcodeRecord {
+                                id: 0xFFFF,
+                                operands: Vec::new(),
+                                blob: None,
+                            }));
+                        }
+                    }
+                }
+            }
         }
     }
 
-    /// Exit the current block (pop from stack).
+    /// Exit the current block (pop from stack) and restore the enclosing
+    /// block's abbreviation width.
     fn exit_block(&mut self) {
         self.block_stack.pop();
-    }
-
-    /// Read the next record from the current block.
-    /// Returns None for END_BLOCK or ENTER_SUBBLOCK.
-    fn read_record(&mut self) -> Option<BitcodeRecord> {
-        self.align_to_word();
-        if self.remaining() < 4 {
-            return None;
-        }
-        let header = self.read_word();
-        let kind = header & 0x3;
-
-        match kind {
-            0 => {
-                // END_BLOCK
-                None
-            }
-            1 => {
-                // ENTER_SUBBLOCK — not expected here, caller uses enter_block
-                None
-            }
-            2 => {
-                // ABBREVIATED RECORD — decode using abbreviation definition
-                let abbrev_width = self.abbrev_width;
-                // Read abbrev_id from the next abbrev_width bits
-                self.bit_pos = 0;
-                self.current_word = header;
-                let abbrev_id = self.read_fixed_uint(abbrev_width);
-
-                // Get the abbreviation definition for the current block
-                let abbrevs = self
-                    .block_stack
-                    .last()
-                    .map(|(_, abvs)| abvs.clone())
-                    .unwrap_or_default();
-
-                if (abbrev_id as usize) < abbrevs.len() {
-                    let abbrev = &abbrevs[abbrev_id as usize];
-                    self.decode_abbrev_record(abbrev)
-                } else {
-                    // Unknown abbreviation — skip remaining bits in word
-                    self.bit_pos = 32;
-                    Some(BitcodeRecord {
-                        id: 0xFFFF,
-                        operands: Vec::new(),
-                        blob: None,
-                    })
-                }
-            }
-            3 => {
-                // UNABBREV_RECORD
-                let record_id = (header >> 2) & 0x1FFF; // 13 bits
-                let num_ops = (header >> 15) & 0x3FFF; // 14 bits (actually 6 bits for VBR6 encoded count)
-                let mut ops = Vec::with_capacity(num_ops as usize);
-                for _ in 0..num_ops {
-                    ops.push(self.read_vbr_uint(6));
-                }
-                Some(BitcodeRecord {
-                    id: record_id,
-                    operands: ops,
-                    blob: None,
-                })
-            }
-            _ => None,
-        }
+        self.abbrev_width = self
+            .block_stack
+            .last()
+            .map_or(2, |(_, _, width)| *width);
     }
 
     /// Decode an abbreviated record using the given abbreviation definition.
+    ///
+    /// The first operand of the abbreviation encodes the record code (as a
+    /// literal or as a Fixed/VBR/Char6 field); the remaining operands are the
+    /// record's value operands. Array/Blob operands must be the last operand
+    /// (optionally followed by the Array element encoding).
     fn decode_abbrev_record(&mut self, abbrev: &AbbrevDef) -> Option<BitcodeRecord> {
-        let mut record_id: Option<u32> = None;
+        let mut iter = abbrev.operands.iter();
+        let first = iter.next()?;
+        let record_id = match first {
+            AbbrevOp::Literal(val) => *val,
+            AbbrevOp::Fixed(width) => self.read_fixed_uint(*width),
+            AbbrevOp::Vbr(width) => self.read_vbr_uint(*width),
+            AbbrevOp::Char6 => self.read_char6() as u32,
+            AbbrevOp::Array | AbbrevOp::Blob => return None,
+        };
         let mut operands = Vec::new();
         let mut blob: Option<Vec<u8>> = None;
-
-        for op in &abbrev.operands {
+        while let Some(op) = iter.next() {
             match op {
-                AbbrevOp::Literal(val) => {
-                    // Literal values are inline; first one is usually the record_id
-                    if record_id.is_none() {
-                        record_id = Some(*val);
-                    } else {
-                        operands.push(*val);
-                    }
-                }
-                AbbrevOp::Fixed(width) => {
-                    let val = self.read_fixed_uint(*width);
-                    if record_id.is_none() {
-                        record_id = Some(val);
-                    } else {
-                        operands.push(val);
-                    }
-                }
-                AbbrevOp::Vbr(width) => {
-                    let val = self.read_vbr_uint(*width);
-                    if record_id.is_none() {
-                        record_id = Some(val);
-                    } else {
-                        operands.push(val);
-                    }
-                }
+                AbbrevOp::Literal(val) => operands.push(*val),
+                AbbrevOp::Fixed(width) => operands.push(self.read_fixed_uint(*width)),
+                AbbrevOp::Vbr(width) => operands.push(self.read_vbr_uint(*width)),
+                AbbrevOp::Char6 => operands.push(self.read_char6() as u32),
                 AbbrevOp::Array => {
-                    // Array: encoded as VBR6 length followed by repeated element
-                    let len = self.read_vbr_uint(6) as usize;
-                    // The next operand in the abbrev defines the element encoding
-                    // For now, read elements as VBR6
-                    for _ in 0..len {
-                        operands.push(self.read_vbr_uint(6));
+                    // Array: vbr6 length, then elements encoded with the
+                    // element encoding that follows in the abbreviation.
+                    let len = self.read_vbr_uint(6);
+                    if len > 4096 {
+                        return None;
                     }
-                }
-                AbbrevOp::Char6 => {
-                    let c = self.read_char6();
-                    if record_id.is_none() {
-                        record_id = Some(c as u32);
-                    } else {
-                        operands.push(c as u32);
+                    let elem = match iter.next() {
+                        Some(elem) => elem.clone(),
+                        None => return None,
+                    };
+                    for _ in 0..len {
+                        let value = match &elem {
+                            AbbrevOp::Literal(val) => *val,
+                            AbbrevOp::Fixed(width) => self.read_fixed_uint(*width),
+                            AbbrevOp::Vbr(width) => self.read_vbr_uint(*width),
+                            AbbrevOp::Char6 => self.read_char6() as u32,
+                            _ => return None,
+                        };
+                        operands.push(value);
                     }
                 }
                 AbbrevOp::Blob => {
-                    // Blob: align to word, read VBR6 length, then read that many bytes
+                    // Blob: vbr6 length, align to 32 bits, bytes, tail padding
+                    // to a 4-byte multiple.
+                    let len = self.read_vbr_uint(6);
+                    if len > (1 << 20) {
+                        return None;
+                    }
                     self.align_to_word();
-                    let len = self.read_vbr_uint(6) as usize;
-                    let mut bytes = Vec::with_capacity(len);
+                    let mut bytes = Vec::with_capacity(len as usize);
                     for _ in 0..len {
                         bytes.push(self.read_fixed_uint(8) as u8);
                     }
+                    self.align_to_word();
                     blob = Some(bytes);
                 }
             }
         }
-
         Some(BitcodeRecord {
-            id: record_id.unwrap_or(0),
+            id: record_id,
             operands,
             blob,
         })
     }
 
+    /// Read a DEFINE_ABBREV record body from the stream.
+    ///
+    /// Layout: [numabbrevops#vbr5, abbrevop0, abbrevop1, ...] where each
+    /// abbrevop is a 1-bit literal flag; literals are followed by a vbr8
+    /// value, encodings by a 3-bit code (1=Fixed, 2=VBR, 3=Array, 4=Char6,
+    /// 5=Blob) and, for Fixed/VBR, a vbr5 width. Fixed(0) and VBR(0) are
+    /// treated as literal zeros per the LLVM reader.
+    fn parse_abbrev_record(&mut self) -> Option<AbbrevDef> {
+        let num_ops = self.read_vbr_uint(5);
+        if num_ops == 0 || num_ops > 64 {
+            return None;
+        }
+        let mut operands = Vec::with_capacity(num_ops as usize);
+        for _ in 0..num_ops {
+            let is_literal = self.read_fixed_uint(1);
+            if is_literal == 1 {
+                operands.push(AbbrevOp::Literal(self.read_vbr_uint(8)));
+                continue;
+            }
+            match self.read_fixed_uint(3) {
+                1 => {
+                    let width = self.read_vbr_uint(5);
+                    if width == 0 {
+                        operands.push(AbbrevOp::Literal(0));
+                    } else {
+                        operands.push(AbbrevOp::Fixed(width));
+                    }
+                }
+                2 => {
+                    let width = self.read_vbr_uint(5);
+                    if width == 0 {
+                        operands.push(AbbrevOp::Literal(0));
+                    } else {
+                        operands.push(AbbrevOp::Vbr(width));
+                    }
+                }
+                3 => operands.push(AbbrevOp::Array),
+                4 => operands.push(AbbrevOp::Char6),
+                5 => operands.push(AbbrevOp::Blob),
+                _ => return None,
+            }
+        }
+        Some(AbbrevDef { operands })
+    }
+
     /// Parse a BLOCKINFO block to extract abbreviation definitions.
-    /// This reads SETBID, ABBREV, and UNABBREV records.
+    ///
+    /// SETBID records select the block whose abbreviation list is extended by
+    /// subsequent DEFINE_ABBREV entries. BLOCKNAME/SETRECORDNAME records are
+    /// ignored.
     fn read_block_info_block(&mut self) -> AppResult<()> {
         // We should already be inside BLOCKINFO_BLOCK (block_id 0)
         let mut current_block_id: u32 = 0;
-
-        loop {
-            match self.read_record() {
-                Some(record) => {
-                    match record.id {
-                        BLOCKINFO_CODE_SETBID => {
-                            // SETBID — sets the block for subsequent abbreviation definitions
-                            if let Some(&block_id) = record.operands.first() {
-                                current_block_id = block_id;
-                            }
-                        }
-                        BLOCKINFO_CODE_ABBREV => {
-                            // ABBREV — defines a new abbreviation for current_block_id
-                            // The operands encode the abbreviation: each operand is
-                            // (kind << 3) | value where kind is the AbbrevOp type
-                            let abbrev = self.parse_abbrev_from_operands(&record.operands)?;
-                            let abbrevs = self.block_abbrevs.entry(current_block_id).or_default();
-                            abbrevs.push(abbrev);
-                        }
-                        BLOCKINFO_CODE_UNABBREV => {
-                            // UNABBREV — marks the block as using unabbreviated records
-                            // (handled automatically by read_record)
-                        }
-                        _ => {
-                            // Unknown BLOCKINFO record, skip
-                        }
+        while let Some(entry) = self.next_entry(false) {
+            match entry {
+                BitcodeEntry::EndBlock => break,
+                BitcodeEntry::SubBlock(_) => {
+                    // BLOCKINFO contains no sub-blocks; skip defensively.
+                    self.skip_block();
+                }
+                BitcodeEntry::DefineAbbrev(abbrev) => {
+                    let abbrevs = self.block_abbrevs.entry(current_block_id).or_default();
+                    abbrevs.push(abbrev);
+                }
+                BitcodeEntry::Record(record) => {
+                    if record.id == BLOCKINFO_CODE_SETBID
+                        && let Some(&block_id) = record.operands.first()
+                    {
+                        current_block_id = block_id;
                     }
                 }
-                None => break, // END_BLOCK
             }
         }
-
         Ok(())
     }
 
-    /// Parse an abbreviation definition from BLOCKINFO ABBREV record operands.
-    /// The operand encoding is: each u32 has (kind << 3) | value.
-    fn parse_abbrev_from_operands(&self, ops: &[u32]) -> AppResult<AbbrevDef> {
-        let mut operands = Vec::with_capacity(ops.len());
-        for &op in ops {
-            let kind = (op >> 3) & 0x7;
-            let value = op & 0x7;
-            let abbrev_op = match kind {
-                0 => AbbrevOp::Literal(value),
-                1 => AbbrevOp::Fixed(value),
-                2 => AbbrevOp::Vbr(value),
-                3 => AbbrevOp::Array,
-                4 => AbbrevOp::Char6,
-                5 => AbbrevOp::Blob,
-                _ => {
-                    return Err(AppError::new(
-                        ReasonCode::RcDxilInvalid,
-                        format!("unknown abbreviation operand kind {}", kind),
-                    ));
-                }
-            };
-            operands.push(abbrev_op);
-        }
-        Ok(AbbrevDef { operands })
-    }
-
-    /// Read the type table from a TYPE_BLOCK (block_id 17).
-    /// Returns a vector of type descriptors.
-    fn read_type_table(&mut self) -> AppResult<Vec<String>> {
-        let mut types = Vec::new();
-
-        loop {
-            match self.read_record() {
-                Some(record) => {
-                    let type_name = match record.id {
-                        TYPE_CODE_NUMENTRY => {
-                            // Number of types — used for preallocation
-                            if let Some(&count) = record.operands.first() {
-                                types.reserve(count as usize);
-                            }
-                            continue;
-                        }
-                        TYPE_CODE_VOID => "void".to_string(),
-                        TYPE_CODE_HALF => "half".to_string(),
-                        TYPE_CODE_FLOAT => "float".to_string(),
-                        TYPE_CODE_DOUBLE => "double".to_string(),
-                        TYPE_CODE_LABEL => "label".to_string(),
-                        TYPE_CODE_OPAQUE => {
-                            // Opaque type: operands[0] is the name (as Char6)
-                            let name: String = record
-                                .operands
-                                .iter()
-                                .map(|&c| {
-                                    if c < 128
-                                        && char::from_u32(c)
-                                            .map_or(false, |ch| ch.is_ascii_alphanumeric())
-                                    {
-                                        c as u8 as char
-                                    } else {
-                                        '?'
-                                    }
-                                })
-                                .collect();
-                            if name.is_empty() {
-                                "opaque".to_string()
-                            } else {
-                                name
-                            }
-                        }
-                        TYPE_CODE_INTEGER => {
-                            let width = record.operands.first().copied().unwrap_or(32);
-                            format!("i{}", width)
-                        }
-                        TYPE_CODE_POINTER => {
-                            // Pointer: operands[0] = pointee type index
-                            let pointee_idx =
-                                record.operands.first().copied().unwrap_or(0) as usize;
-                            if pointee_idx < types.len() {
-                                format!("{}*", types[pointee_idx])
-                            } else {
-                                "ptr".to_string()
+    /// Parse the TYPE_BLOCK (block id 17) into `self.type_table`.
+    fn read_type_block(&mut self) -> AppResult<()> {
+        let mut types: Vec<TypeDesc> = Vec::new();
+        while let Some(entry) = self.next_entry(true) {
+            match entry {
+                BitcodeEntry::EndBlock => break,
+                BitcodeEntry::SubBlock(_) => self.skip_block(),
+                BitcodeEntry::DefineAbbrev(_) => {}
+                BitcodeEntry::Record(record) => {
+                    let desc = match record.id {
+                        TYPE_CODE_NUMENTRY => continue,
+                        TYPE_CODE_VOID => TypeDesc {
+                            is_void: true,
+                            ..TypeDesc::default()
+                        },
+                        TYPE_CODE_HALF => TypeDesc {
+                            is_float: true,
+                            width: 16,
+                            ..TypeDesc::default()
+                        },
+                        TYPE_CODE_FLOAT => TypeDesc {
+                            is_float: true,
+                            ..TypeDesc::default()
+                        },
+                        TYPE_CODE_DOUBLE => TypeDesc {
+                            is_float: true,
+                            width: 64,
+                            ..TypeDesc::default()
+                        },
+                        TYPE_CODE_INTEGER => TypeDesc {
+                            width: record.operands.first().copied().unwrap_or(32),
+                            ..TypeDesc::default()
+                        },
+                        TYPE_CODE_POINTER => TypeDesc {
+                            is_pointer: true,
+                            is_signed: false,
+                            ..TypeDesc::default()
+                        },
+                        TYPE_CODE_VECTOR => {
+                            let count = record.operands.first().copied().unwrap_or(1);
+                            let elem = record.operands.get(1).copied().unwrap_or(0) as usize;
+                            let base = types.get(elem).copied().unwrap_or_default();
+                            TypeDesc {
+                                is_vector: true,
+                                vector_len: count,
+                                ..base
                             }
                         }
                         TYPE_CODE_ARRAY => {
-                            // Array: operands[0] = element type index
-                            let elem_idx = record.operands.first().copied().unwrap_or(0) as usize;
-                            if elem_idx < types.len() {
-                                format!("[{}]", types[elem_idx])
-                            } else {
-                                "[?]".to_string()
-                            }
+                            let elem = record.operands.get(1).copied().unwrap_or(0) as usize;
+                            types.get(elem).copied().unwrap_or_default()
                         }
-                        TYPE_CODE_VECTOR => {
-                            // Vector: operands[0] = element type index, operands[1] = count
-                            let elem_idx = record.operands.first().copied().unwrap_or(0) as usize;
-                            let count = record.operands.get(1).copied().unwrap_or(1);
-                            if elem_idx < types.len() {
-                                format!("vector<{}, {}>", types[elem_idx], count)
-                            } else {
-                                format!("vector<?, {}>", count)
-                            }
-                        }
-                        TYPE_CODE_STRUCT => {
-                            // Struct: named/unnamed struct
-                            if record.operands.is_empty() {
-                                "struct".to_string()
-                            } else {
-                                let has_name = record.operands[0] != 0;
-                                if has_name && record.operands.len() > 1 {
-                                    // The name is encoded in remaining operands as Char6
-                                    let name: String = record.operands[1..]
-                                        .iter()
-                                        .filter_map(|&c| {
-                                            if (c as u8).is_ascii_alphanumeric() || c as u8 == b'_'
-                                            {
-                                                Some(c as u8 as char)
-                                            } else {
-                                                None
-                                            }
-                                        })
-                                        .collect();
-                                    if name.is_empty() {
-                                        "struct".to_string()
-                                    } else {
-                                        name
-                                    }
-                                } else {
-                                    "struct".to_string()
-                                }
-                            }
-                        }
-                        TYPE_CODE_FUNCTION_OLD | TYPE_CODE_FUNCTION_NEW => "function".to_string(),
-                        _ => format!("type_{}", record.id),
+                        TYPE_CODE_FUNCTION
+                        | TYPE_CODE_FUNCTION_OLD
+                        | TYPE_CODE_STRUCT_ANON
+                        | TYPE_CODE_STRUCT_NAME
+                        | TYPE_CODE_STRUCT_NAMED
+                        | TYPE_CODE_OPAQUE
+                        | TYPE_CODE_LABEL
+                        | TYPE_CODE_METADATA
+                        | TYPE_CODE_X86_FP80
+                        | TYPE_CODE_FP128
+                        | TYPE_CODE_PPC_FP128
+                        | TYPE_CODE_X86_MMX => TypeDesc::default(),
+                        _ => TypeDesc::default(),
                     };
-                    types.push(type_name);
+                    types.push(desc);
                 }
-                None => break, // END_BLOCK
             }
         }
-
-        Ok(types)
-    }
-
-    /// Parse metadata records from a METADATA block (block_id 15).
-    /// Returns a map of metadata node IDs to their string representations.
-    fn read_metadata_records(&mut self) -> AppResult<BTreeMap<u32, String>> {
-        let mut metadata = BTreeMap::new();
-
-        loop {
-            match self.read_record() {
-                Some(record) => {
-                    let meta_str = format!("!{} = !MDNode({})", record.id, record.operands.len());
-                    metadata.insert(record.id, meta_str);
-                }
-                None => break,
-            }
-        }
-
-        Ok(metadata)
-    }
-
-    /// Parse a MODULE_BLOCK (block_id 8). Returns the instruction count.
-    fn parse_module_block(&mut self, functions: &mut Vec<DxilFunction>) -> AppResult<u32> {
-        let mut instruction_count = 0;
-
-        loop {
-            if let Some(sub_block_id) = self.enter_block() {
-                match sub_block_id {
-                    BLOCKID_FUNCTION => {
-                        let (count, _name, parsed_func) = parse_function_block(self)?;
-                        instruction_count += count;
-                        if let Some(func) = parsed_func {
-                            functions.push(func);
-                        }
-                    }
-                    BLOCKID_CONSTANTS => {
-                        // Skip constants sub-block
-                        self.skip_block();
-                    }
-                    BLOCKID_METADATA => {
-                        // Skip metadata sub-block
-                        self.skip_block();
-                    }
-                    BLOCKID_VALUE_SYMTAB => {
-                        // Skip value symtab sub-block
-                        self.skip_block();
-                    }
-                    BLOCKID_PARAMATTR | BLOCKID_PARAMATTR_GROUP => {
-                        self.skip_block();
-                    }
-                    BLOCKID_METADATA_ATTACHMENT => {
-                        self.skip_block();
-                    }
-                    _ => {
-                        // Unknown sub-block, skip it
-                        self.skip_block();
-                    }
-                }
-            } else {
-                // END_BLOCK for module
-                break;
-            }
-        }
-
-        Ok(instruction_count)
+        self.type_table = types;
+        Ok(())
     }
 
     /// Skip all records in the current block until END_BLOCK.
     fn skip_block(&mut self) {
-        loop {
-            if self.enter_block().is_none() {
-                // END_BLOCK
-                break;
+        while let Some(entry) = self.next_entry(true) {
+            match entry {
+                BitcodeEntry::EndBlock => break,
+                BitcodeEntry::SubBlock(_) => self.skip_block(),
+                _ => {}
             }
-            // Entered a sub-block within this block — skip it recursively
-            self.skip_block();
         }
-        // Exit the block
         self.exit_block();
     }
 }
@@ -1464,6 +1553,9 @@ impl<'a> LlvmBitcodeReader<'a> {
 struct DxilInstruction {
     opcode: u32,
     operands: Vec<u32>,
+    /// Result type descriptor when the record carried an explicit type
+    /// operand (casts, loads, allocas, phis); derived from the type table.
+    ty: Option<TypeDesc>,
 }
 
 /// A basic block in a DXIL function.
@@ -1478,7 +1570,6 @@ struct DxilBasicBlock {
 pub struct DxilFunction {
     name: String,
     basic_blocks: Vec<DxilBasicBlock>,
-    num_instructions: u32,
 }
 
 /// The result of parsing a DXIL program from LLVM bitcode.
@@ -1487,21 +1578,6 @@ pub struct ParsedDxilProgram {
     pub entry_name: String,
     pub functions: Vec<DxilFunction>,
     pub instruction_count: u32,
-}
-
-// ---------------------------------------------------------------------------
-// HLSL type dimensions and component counts
-// ---------------------------------------------------------------------------
-
-/// Return the component count for a named HLSL type.
-fn hlsl_type_components(typ: &str) -> u32 {
-    match typ {
-        "float" | "int" | "uint" | "half" | "bool" | "double" => 1,
-        "float2" | "int2" | "uint2" | "half2" | "bool2" | "double2" => 2,
-        "float3" | "int3" | "uint3" | "half3" | "bool3" | "double3" => 3,
-        "float4" | "int4" | "uint4" | "half4" | "bool4" | "double4" => 4,
-        _ => 1,
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1536,7 +1612,7 @@ pub fn dxil_opcode_to_msl(
     };
 
     let unop = |op: &str| -> String {
-        if args.len() >= 1 {
+        if !args.is_empty() {
             format!("{} = {}({});", dst, op, args[0])
         } else {
             format!("{} = 0;", dst)
@@ -1553,35 +1629,27 @@ pub fn dxil_opcode_to_msl(
     };
 
     match opcode {
-        // --- Arithmetic operations (LLVM binary ops) ---
-        0 | 1 => binop("+"), // add / fadd
-        2 | 3 => binop("-"), // sub / fsub
-        4 | 5 => binop("*"), // mul / fmul
-        6 | 7 | 8 => {
-            // udiv / sdiv / fdiv
-            if is_float {
-                binop("/")
-            } else if is_signed {
-                binop("/")
-            } else {
-                binop("/")
-            }
-        }
-        9 | 10 => {
-            // urem / srem
-            if is_signed { binop("%") } else { binop("%") }
-        }
-        11 => binop("&"),  // and
-        12 => binop("|"),  // or
-        13 => binop("^"),  // xor
-        14 => binop("<<"), // shl
-        15 => binop(">>"), // lshr (logical shift right)
-        16 => binop(">>"), // ashr — arithmetic shift right (MSL uses type‑based >> semantics;
-        //        signed → arithmetic, unsigned → logical)
+        // --- Arithmetic operations (LLVM IR BinaryOps numbering) ---
+        0..=1 => binop("+"), // add / fadd
+        2..=3 => binop("-"), // sub / fsub
+        4..=5 => binop("*"), // mul / fmul
+        6..=8 => binop("/"), // udiv / sdiv / fdiv — MSL `/` is type-driven
+        9..=10 => binop("%"), // urem / srem
+        11 => binop("<<"), // shl
+        12 => binop(">>"), // lshr (logical shift right)
+        13 => binop(">>"), // ashr — arithmetic shift right (MSL uses
+        //                  type-based >> semantics; signed → arithmetic,
+        //                  unsigned → logical)
+        14 => binop("&"), // and
+        15 => binop("|"), // or
+        16 => binop("^"), // xor
         17 => fcall("fma", 3), // fma
 
         // --- Comparison operations ---
-        18..=29 => {
+        // icmp predicates (LLVM CmpInst: ICMP_EQ=32 .. ICMP_SLE=41) map to
+        // 18..=27; fcmp_oeq/one map to 28/29; the remaining fcmp predicates
+        // map to 61..=73.
+        18..=27 => {
             let cmp_op = match opcode {
                 18 => "==", // icmp_eq
                 19 => "!=", // icmp_ne
@@ -1593,17 +1661,40 @@ pub fn dxil_opcode_to_msl(
                 25 => ">=", // icmp_sge
                 26 => "<",  // icmp_slt
                 27 => "<=", // icmp_sle
-                28 => "==", // fcmp_oeq
-                29 => "!=", // fcmp_one
                 _ => "==",
             };
             binop(cmp_op)
         }
+        28 => binop("=="), // fcmp_oeq
+        29 => binop("!="), // fcmp_one
+        CMP_FCMP_OGT | CMP_FCMP_UGT => binop(">"),
+        CMP_FCMP_OGE | CMP_FCMP_UGE => binop(">="),
+        CMP_FCMP_OLT | CMP_FCMP_ULT => binop("<"),
+        CMP_FCMP_OLE | CMP_FCMP_ULE => binop("<="),
+        CMP_FCMP_UNE => binop("!="),
+        CMP_FCMP_ORD => {
+            // Both operands are ordered (not NaN).
+            if args.len() >= 2 {
+                format!("{} = !isnan({}) && !isnan({});", dst, args[0], args[1])
+            } else {
+                format!("{} = 0;", dst)
+            }
+        }
+        CMP_FCMP_UNO => {
+            // At least one operand is NaN.
+            if args.len() >= 2 {
+                format!("{} = isnan({}) || isnan({});", dst, args[0], args[1])
+            } else {
+                format!("{} = 0;", dst)
+            }
+        }
+        CMP_FCMP_FALSE => format!("{} = false;", dst),
+        CMP_FCMP_TRUE => format!("{} = true;", dst),
 
         // --- Conversion operations ---
         30 => {
             // bitcast
-            if args.len() >= 1 {
+            if !args.is_empty() {
                 format!("{} = as_type<typeof({})>({});", dst, args[0], args[0])
             } else {
                 format!("{} = 0;", dst)
@@ -1611,7 +1702,7 @@ pub fn dxil_opcode_to_msl(
         }
         31 => {
             // ptrtoint
-            if args.len() >= 1 {
+            if !args.is_empty() {
                 format!("{} = reinterpret_cast<uintptr_t>({});", dst, args[0])
             } else {
                 format!("{} = 0;", dst)
@@ -1619,7 +1710,7 @@ pub fn dxil_opcode_to_msl(
         }
         32 => {
             // inttoptr
-            if args.len() >= 1 {
+            if !args.is_empty() {
                 format!("{} = reinterpret_cast<void*>({});", dst, args[0])
             } else {
                 format!("{} = 0;", dst)
@@ -1628,9 +1719,9 @@ pub fn dxil_opcode_to_msl(
         33 => unop("int32_t"), // zext (zero-extend)
         34 => {
             // sext (sign-extend)
-            if is_signed && args.len() >= 1 {
+            if is_signed && !args.is_empty() {
                 format!("{} = int64_t({});", dst, args[0])
-            } else if args.len() >= 1 {
+            } else if !args.is_empty() {
                 format!("{} = uint64_t({});", dst, args[0])
             } else {
                 format!("{} = 0;", dst)
@@ -1638,8 +1729,50 @@ pub fn dxil_opcode_to_msl(
         }
         35 => {
             // trunc
-            if args.len() >= 1 {
+            if !args.is_empty() {
                 format!("{} = int32_t({});", dst, args[0])
+            } else {
+                format!("{} = 0;", dst)
+            }
+        }
+        CAST_FPTOUI => {
+            if !args.is_empty() {
+                format!("{} = (uint)({});", dst, args[0])
+            } else {
+                format!("{} = 0;", dst)
+            }
+        }
+        CAST_FPTOSI => {
+            if !args.is_empty() {
+                format!("{} = (int)({});", dst, args[0])
+            } else {
+                format!("{} = 0;", dst)
+            }
+        }
+        CAST_UITOFP | CAST_SITOFP => {
+            if !args.is_empty() {
+                format!("{} = (float)({});", dst, args[0])
+            } else {
+                format!("{} = 0;", dst)
+            }
+        }
+        CAST_FPTRUNC => {
+            if !args.is_empty() {
+                format!("{} = (float)({});", dst, args[0])
+            } else {
+                format!("{} = 0;", dst)
+            }
+        }
+        CAST_FPEXT => {
+            if !args.is_empty() {
+                format!("{} = (double)({});", dst, args[0])
+            } else {
+                format!("{} = 0;", dst)
+            }
+        }
+        CAST_ADDRSPACECAST => {
+            if !args.is_empty() {
+                format!("{} = {}; // addrspacecast", dst, args[0])
             } else {
                 format!("{} = 0;", dst)
             }
@@ -1648,7 +1781,7 @@ pub fn dxil_opcode_to_msl(
         // --- Control flow ---
         36 => {
             // br (unconditional)
-            if args.len() >= 1 {
+            if !args.is_empty() {
                 format!("goto {};", args[0])
             } else {
                 String::from("// branch (no target)")
@@ -1666,17 +1799,25 @@ pub fn dxil_opcode_to_msl(
             }
         }
         38 => {
-            // switch
-            if args.len() >= 1 {
-                format!("// switch({}) handled above", args[0])
+            // switch: [cond, default_bb, (case, bb)...]
+            if args.len() >= 2 {
+                let mut stmt = format!("switch ({}) {{\n", args[0]);
+                let mut idx = 2;
+                while idx + 1 < args.len() {
+                    stmt.push_str(&format!("        case {}: goto {};\n", args[idx], args[idx + 1]));
+                    idx += 2;
+                }
+                stmt.push_str(&format!("        default: goto {};\n    }}", args[1]));
+                stmt
             } else {
-                String::from("// switch")
+                String::from("// switch (incomplete)")
             }
         }
         39 => {
-            // phi
-            if args.len() >= 2 {
-                format!("{} = {}; // phi merged", dst, args[0])
+            // phi: the values are assigned on incoming edges by the code
+            // generator; this site is a no-op placeholder.
+            if !args.is_empty() {
+                format!("{} = {}; // phi fallback", dst, args[0])
             } else {
                 format!("{} = 0; // phi empty", dst)
             }
@@ -1692,7 +1833,7 @@ pub fn dxil_opcode_to_msl(
         41 => {
             // call
             // args[0] = callee index, args[1..] = call arguments
-            if args.len() >= 1 {
+            if !args.is_empty() {
                 format!("{} = _fn_{}({});", dst, args[0], args[1..].join(", "))
             } else {
                 format!("{} = 0; // call(no args)", dst)
@@ -1706,7 +1847,7 @@ pub fn dxil_opcode_to_msl(
         }
         43 => {
             // load
-            if args.len() >= 1 {
+            if !args.is_empty() {
                 format!("{} = {}[0];", dst, args[0])
             } else {
                 format!("{} = 0;", dst)
@@ -1851,12 +1992,12 @@ pub fn dxil_opcode_to_msl(
         DXIL_INTRIN_COUNTBITS => unop("popcount"),
         DXIL_INTRIN_REVERSEBITS => unop("reverse_bits"),
         DXIL_INTRIN_SINCOS => {
-            if args.len() >= 1 {
+            if !args.is_empty() {
+                // DXIL sincos writes both results through pointers; emit
+                // local block-scoped temps and assign the sine to dst.
                 format!(
-                    "sincos({}, &{}, &{});",
-                    args[0],
-                    dst,
-                    args.get(1).map_or(dst, |v| v)
+                    "{{ float _sincos_s = 0.0f; float _sincos_c = 0.0f; sincos({}, &_sincos_s, &_sincos_c); {} = _sincos_s; }}",
+                    args[0], dst
                 )
             } else {
                 format!("{} = 0;", dst)
@@ -1972,27 +2113,24 @@ pub fn dxil_opcode_to_msl(
 
         // --- Thread/buffer identity intrinsics ---
         DXIL_INTRIN_THREADID => {
-            if args.len() >= 1 {
-                let dim = args[0].parse::<u32>().unwrap_or(0);
-                let coord = ["x", "y", "z"][dim as usize].min("z");
+            if !args.is_empty() {
+                let coord = thread_dim_coord(&args[0]);
                 format!("{} = thread_position_in_grid.{};", dst, coord)
             } else {
                 format!("{} = 0; // ThreadId", dst)
             }
         }
         DXIL_INTRIN_GROUPID => {
-            if args.len() >= 1 {
-                let dim = args[0].parse::<u32>().unwrap_or(0);
-                let coord = ["x", "y", "z"][dim as usize].min("z");
+            if !args.is_empty() {
+                let coord = thread_dim_coord(&args[0]);
                 format!("{} = threadgroup_position_in_grid.{};", dst, coord)
             } else {
                 format!("{} = 0; // GroupId", dst)
             }
         }
         DXIL_INTRIN_THREADGROUPID => {
-            if args.len() >= 1 {
-                let dim = args[0].parse::<u32>().unwrap_or(0);
-                let coord = ["x", "y", "z"][dim as usize].min("z");
+            if !args.is_empty() {
+                let coord = thread_dim_coord(&args[0]);
                 format!("{} = thread_position_in_threadgroup.{};", dst, coord)
             } else {
                 format!("{} = 0; // ThreadGroupId", dst)
@@ -2002,9 +2140,8 @@ pub fn dxil_opcode_to_msl(
             format!("{} = thread_index_in_threadgroup;", dst)
         }
         DXIL_INTRIN_DISPATCHTHREADID => {
-            if args.len() >= 1 {
-                let dim = args[0].parse::<u32>().unwrap_or(0);
-                let coord = ["x", "y", "z"][dim as usize].min("z");
+            if !args.is_empty() {
+                let coord = thread_dim_coord(&args[0]);
                 format!("{} = thread_position_in_grid.{};", dst, coord)
             } else {
                 format!("{} = 0; // DispatchThreadId", dst)
@@ -2205,21 +2342,21 @@ pub fn dxil_opcode_to_msl(
 
         // --- Derivative intrinsics ---
         DXIL_INTRIN_DERIVATIVE => {
-            if args.len() >= 1 {
+            if !args.is_empty() {
                 format!("{} = dfdx({});", dst, args[0])
             } else {
                 format!("{} = 0;", dst)
             }
         }
         DXIL_INTRIN_DERIVATIVE_COARSE => {
-            if args.len() >= 1 {
+            if !args.is_empty() {
                 format!("{} = dfdx_coarse({});", dst, args[0])
             } else {
                 format!("{} = 0;", dst)
             }
         }
         DXIL_INTRIN_DERIVATIVE_FINE => {
-            if args.len() >= 1 {
+            if !args.is_empty() {
                 format!("{} = dfdx_fine({});", dst, args[0])
             } else {
                 format!("{} = 0;", dst)
@@ -2228,21 +2365,20 @@ pub fn dxil_opcode_to_msl(
 
         // --- Wave intrinsics ---
         DXIL_INTRIN_WAVEACTIVE => {
-            format!("{} = simd_active(true); // WaveActive", dst)
+            format!("{} = simd_active_mask() != 0; // WaveActiveBool", dst)
         }
         DXIL_INTRIN_WAVEACTIVEBIT => {
-            if args.len() >= 2 {
-                format!("{} = simd_ballot({} != 0); // WaveActiveBit", dst, args[1])
+            if !args.is_empty() {
+                format!("{} = simd_ballot({} != 0); // WaveActiveBit", dst, args[0])
             } else {
                 format!("{} = 0;", dst)
             }
         }
         DXIL_INTRIN_WAVEPREFIX => {
-            if args.len() >= 2 {
-                format!(
-                    "{} = simd_prefix_exclusive_sum({}); // WavePrefix",
-                    dst, args[1]
-                )
+            // WavePrefixSum/Product/And/Or/Xor take a single value argument;
+            // the 2-argument form belongs to the MultiPrefix variants.
+            if !args.is_empty() {
+                format!("{} = simd_prefix_exclusive_sum({}); // WavePrefix", dst, args[0])
             } else {
                 format!("{} = 0;", dst)
             }
@@ -2271,21 +2407,21 @@ pub fn dxil_opcode_to_msl(
             format!("{} = simd_lane_count();", dst)
         }
         DXIL_INTRIN_WAVEANYTRUE => {
-            if args.len() >= 1 {
+            if !args.is_empty() {
                 format!("{} = simd_any({});", dst, args[0])
             } else {
                 format!("{} = 0;", dst)
             }
         }
         DXIL_INTRIN_WAVEALLTRUE => {
-            if args.len() >= 1 {
+            if !args.is_empty() {
                 format!("{} = simd_all({});", dst, args[0])
             } else {
                 format!("{} = 0;", dst)
             }
         }
         DXIL_INTRIN_WAVEALLEQUAL => {
-            if args.len() >= 1 {
+            if !args.is_empty() {
                 format!(
                     "{} = simd_all({} == simd_broadcast_first({}));",
                     dst, args[0], args[0]
@@ -2295,7 +2431,7 @@ pub fn dxil_opcode_to_msl(
             }
         }
         DXIL_INTRIN_WAVEBALLOT => {
-            if args.len() >= 1 {
+            if !args.is_empty() {
                 format!("{} = simd_ballot({});", dst, args[0])
             } else {
                 format!("{} = 0;", dst)
@@ -2309,63 +2445,63 @@ pub fn dxil_opcode_to_msl(
             }
         }
         DXIL_INTRIN_WAVEREADLANEFIRST => {
-            if args.len() >= 1 {
+            if !args.is_empty() {
                 format!("{} = simd_broadcast_first({});", dst, args[0])
             } else {
                 format!("{} = 0;", dst)
             }
         }
         DXIL_INTRIN_WAVEACTIVEBITAND => {
-            if args.len() >= 1 {
+            if !args.is_empty() {
                 format!("{} = simd_and({});", dst, args[0])
             } else {
                 format!("{} = 0;", dst)
             }
         }
         DXIL_INTRIN_WAVEACTIVEBITOR => {
-            if args.len() >= 1 {
+            if !args.is_empty() {
                 format!("{} = simd_or({});", dst, args[0])
             } else {
                 format!("{} = 0;", dst)
             }
         }
         DXIL_INTRIN_WAVEACTIVEBITXOR => {
-            if args.len() >= 1 {
+            if !args.is_empty() {
                 format!("{} = simd_xor({});", dst, args[0])
             } else {
                 format!("{} = 0;", dst)
             }
         }
         DXIL_INTRIN_WAVEACTIVECOUNTBITS => {
-            if args.len() >= 1 {
+            if !args.is_empty() {
                 format!("{} = popcount(simd_ballot({}));", dst, args[0])
             } else {
                 format!("{} = 0;", dst)
             }
         }
         DXIL_INTRIN_WAVEACTIVESUM => {
-            if args.len() >= 1 {
+            if !args.is_empty() {
                 format!("{} = simd_sum({});", dst, args[0])
             } else {
                 format!("{} = 0;", dst)
             }
         }
         DXIL_INTRIN_WAVEACTIVEPRODUCT => {
-            if args.len() >= 1 {
+            if !args.is_empty() {
                 format!("{} = simd_product({});", dst, args[0])
             } else {
                 format!("{} = 0;", dst)
             }
         }
         DXIL_INTRIN_WAVEACTIVEMIN => {
-            if args.len() >= 1 {
+            if !args.is_empty() {
                 format!("{} = simd_min({});", dst, args[0])
             } else {
                 format!("{} = 0;", dst)
             }
         }
         DXIL_INTRIN_WAVEACTIVEMAX => {
-            if args.len() >= 1 {
+            if !args.is_empty() {
                 format!("{} = simd_max({});", dst, args[0])
             } else {
                 format!("{} = 0;", dst)
@@ -2432,42 +2568,49 @@ pub fn dxil_opcode_to_msl(
             }
         }
         DXIL_INTRIN_WAVEMATCH => {
-            if args.len() >= 1 {
+            if !args.is_empty() {
+                // WaveMatch(value) returns a mask of lanes whose value equals
+                // the current lane's value. Broadcast the current lane's value
+                // and ballot the per-lane comparison.
                 format!(
-                    "{} = simd_vote({} == {}); // WaveMatch emulation",
-                    dst,
-                    args[0],
-                    args.get(1).unwrap_or(&args[0])
+                    "{} = simd_ballot(simd_broadcast({}, simd_lane_id()) == {}); // WaveMatch",
+                    dst, args[0], args[0]
                 )
             } else {
                 format!("{} = 0;", dst)
             }
         }
+        DXIL_INTRIN_WAVEISFIRSTLANE => {
+            format!("{} = simd_is_first();", dst)
+        }
+        DXIL_INTRIN_DISCARD => {
+            "discard_fragment(); // Discard".to_string()
+        }
 
         // --- Conversion/bit intrinsics ---
         DXIL_INTRIN_ASFLOAT => {
-            if args.len() >= 1 {
+            if !args.is_empty() {
                 format!("{} = as_type<float>({});", dst, args[0])
             } else {
                 format!("{} = 0;", dst)
             }
         }
         DXIL_INTRIN_ASINT => {
-            if args.len() >= 1 {
+            if !args.is_empty() {
                 format!("{} = as_type<int>({});", dst, args[0])
             } else {
                 format!("{} = 0;", dst)
             }
         }
         DXIL_INTRIN_ASUINT => {
-            if args.len() >= 1 {
+            if !args.is_empty() {
                 format!("{} = as_type<uint>({});", dst, args[0])
             } else {
                 format!("{} = 0;", dst)
             }
         }
         DXIL_INTRIN_FIRSTBITHIGH => {
-            if args.len() >= 1 {
+            if !args.is_empty() {
                 format!(
                     "{} = (clz({}) == 32) ? -1 : (31 - (int)clz({}));",
                     dst, args[0], args[0]
@@ -2477,7 +2620,7 @@ pub fn dxil_opcode_to_msl(
             }
         }
         DXIL_INTRIN_FIRSTBITLOW => {
-            if args.len() >= 1 {
+            if !args.is_empty() {
                 format!(
                     "{} = (ctz({}) == 32) ? -1 : (int)ctz({});",
                     dst, args[0], args[0]
@@ -2487,7 +2630,7 @@ pub fn dxil_opcode_to_msl(
             }
         }
         DXIL_INTRIN_LOG10 => {
-            if args.len() >= 1 {
+            if !args.is_empty() {
                 format!("{} = log10({});", dst, args[0])
             } else {
                 format!("{} = 0;", dst)
@@ -2497,8 +2640,10 @@ pub fn dxil_opcode_to_msl(
         // --- Packed dot-product intrinsics ---
         DXIL_INTRIN_DOT4ADDI8PACKED => {
             if args.len() >= 2 {
+                // The i8 lanes are signed: cast to int32 first so the shifts
+                // are arithmetic and each byte is sign-extended.
                 format!(
-                    "{} = (int)(({} >> 0) & 0xFF) * (int)(({} >> 0) & 0xFF) + (int)(({} >> 8) & 0xFF) * (int)(({} >> 8) & 0xFF) + (int)(({} >> 16) & 0xFF) * (int)(({} >> 16) & 0xFF) + (int)(({} >> 24) & 0xFF) * (int)(({} >> 24) & 0xFF); // Dot4AddI8Packed",
+                    "{} = (int)(((int){} << 24) >> 24) * (int)(((int){} << 24) >> 24) + (int)(((int){} << 16) >> 24) * (int)(((int){} << 16) >> 24) + (int)(((int){} << 8) >> 24) * (int)(((int){} << 8) >> 24) + (int)((int){} >> 24) * (int)((int){} >> 24); // Dot4AddI8Packed",
                     dst, args[0], args[1], args[0], args[1], args[0], args[1], args[0], args[1]
                 )
             } else {
@@ -2602,7 +2747,7 @@ pub fn dxil_opcode_to_msl(
             format!("{} = 1; // CheckAccessFullyMapped", dst)
         }
         DXIL_INTRIN_EVALUATEATTRIBUTEATCENTROID => {
-            if args.len() >= 1 {
+            if !args.is_empty() {
                 format!("{} = {}; // EvaluateAttributeAtCentroid", dst, args[0])
             } else {
                 format!("{} = 0.0;", dst)
@@ -2644,7 +2789,7 @@ pub fn dxil_opcode_to_msl(
         // CutStream finalizes the current primitive in the stream.
         // EmitThenCutStream emits a vertex and immediately starts a new primitive.
         DXIL_INTRIN_EMITSTREAM => {
-            let stream_id = args.first().map_or("0", |v| v);
+            let stream_id = args.first().map_or("0", String::as_str);
             format!(
                 "// EmitStream({stream_id}): append vertex to stream output\n\
                 {{ uint _gs_vert_idx = atomic_fetch_add_explicit(\n\
@@ -2659,14 +2804,14 @@ pub fn dxil_opcode_to_msl(
             )
         }
         DXIL_INTRIN_CUTSTREAM => {
-            let stream_id = args.first().map_or("0", |v| v);
+            let stream_id = args.first().map_or("0", String::as_str);
             format!(
                 "// CutStream({stream_id}): finalize current primitive\n\
                 {{ /* primitive finalized; next EmitVertex starts new primitive */ }}"
             )
         }
         DXIL_INTRIN_EMITTHENCUTSTREAM => {
-            let stream_id = args.first().map_or("0", |v| v);
+            let stream_id = args.first().map_or("0", String::as_str);
             format!(
                 "// EmitThenCutStream({stream_id}): emit then cut\n\
                 {{ uint _gs_vert_idx = atomic_fetch_add_explicit(\n\
@@ -2753,6 +2898,17 @@ pub fn dxil_opcode_to_msl(
 // DXIL intrinsic mapping helpers
 // ---------------------------------------------------------------------------
 
+/// Map a thread-dimension operand (0 = x, 1 = y, everything else = z) to the
+/// corresponding vector component name. Values >= 3 come from untrusted
+/// bytecode and must never index an array.
+fn thread_dim_coord(operand: &str) -> &'static str {
+    match operand.parse::<u32>().unwrap_or(0) {
+        0 => "x",
+        1 => "y",
+        _ => "z",
+    }
+}
+
 /// Heuristic: check if a pointer argument refers to groupshared memory by
 /// looking for common patterns in temporary variable names used for groupshared
 /// accesses.
@@ -2765,178 +2921,110 @@ fn is_groupshared_ptr(ptr: &str) -> bool {
 /// Map a DXIL intrinsic function ID (from the DXIL spec's intrinsic numbering)
 /// to this implementation's internal opcode constants.
 ///
-/// DXIL intrinsic IDs are the first operand of a call to a DXIL intrinsic
-/// function (e.g., `@dx.op.call`). This function maps them to the internal
-/// opcode space used by `dxil_opcode_to_msl`.
-///
-/// Returns `None` for unknown intrinsic IDs, which fall back to a generic call.
+/// The numbers below were cross-checked against DXC's `DXIL.h`/`DxilConstants.h`
+/// opcode table (e.g. `ThreadId = 93`, `Sample = 60`, `AtomicCompareExchange =
+/// 79`, `Dot4AddI8Packed = 163`). IDs that exist in DXIL but have no faithful
+/// MSL translation here (atomics with a runtime operation selector, ray
+/// tracing, `WavePrefixOp` variants, ...) deliberately return `None` so the
+/// caller can fail loudly instead of emitting a bogus generic call.
 pub fn map_dxil_intrinsic_id(dxil_intrinsic_id: u32) -> Option<u32> {
     match dxil_intrinsic_id {
-        // Arithmetic intrinsics (HLSL intrinsic mapping)
-        6 => Some(DXIL_INTRIN_ABS),           // abs/absi/f
-        7 => Some(DXIL_INTRIN_SATURATE),      // saturate
-        8 => Some(DXIL_INTRIN_MAD),           // mad/fma
-        9 => Some(DXIL_INTRIN_MIN),           // min
-        10 => Some(DXIL_INTRIN_MAX),          // max
-        11 => Some(DXIL_INTRIN_CLAMP),        // clamp
-        12 => Some(DXIL_INTRIN_SIN),          // sin
-        13 => Some(DXIL_INTRIN_COS),          // cos
-        14 => Some(DXIL_INTRIN_TAN),          // tan
-        15 => Some(DXIL_INTRIN_SQRT),         // sqrt
-        16 => Some(DXIL_INTRIN_RSQRT),        // rsqrt
-        17 => Some(DXIL_INTRIN_FRAC),         // frac
-        18 => Some(DXIL_INTRIN_FLOOR),        // floor
-        19 => Some(DXIL_INTRIN_CEIL),         // ceil
-        20 => Some(DXIL_INTRIN_ROUND),        // round
-        21 => Some(DXIL_INTRIN_EXP),          // exp
-        22 => Some(DXIL_INTRIN_EXP2),         // exp2
-        23 => Some(DXIL_INTRIN_LOG),          // log
-        24 => Some(DXIL_INTRIN_LOG2),         // log2
-        25 => Some(DXIL_INTRIN_LOG10),        // log10
-        26 => Some(DXIL_INTRIN_POW),          // pow
-        27 => Some(DXIL_INTRIN_DOT),          // dot
-        28 => Some(DXIL_INTRIN_MUL),          // mul
-        29 => Some(DXIL_INTRIN_LERP),         // lerp
-        30 => Some(DXIL_INTRIN_NORMALIZE),    // normalize
-        31 => Some(DXIL_INTRIN_CROSS),        // cross
-        32 => Some(DXIL_INTRIN_TRANSPOSE),    // transpose
-        33 => Some(DXIL_INTRIN_DETERMINANT),  // determinant
-        34 => Some(DXIL_INTRIN_REFLECT),      // reflect
-        35 => Some(DXIL_INTRIN_REFRACT),      // refract
-        36 => Some(DXIL_INTRIN_ISFINITE),     // isfinite
-        37 => Some(DXIL_INTRIN_ISINF),        // isinf
-        38 => Some(DXIL_INTRIN_ISNAN),        // isnan
-        39 => Some(DXIL_INTRIN_SIGN),         // sign
-        40 => Some(DXIL_INTRIN_COUNTBITS),    // countbits
-        41 => Some(DXIL_INTRIN_REVERSEBITS),  // reversebits
-        42 => Some(DXIL_INTRIN_RCP),          // rcp
-        43 => Some(DXIL_INTRIN_DISTANCE),     // distance
-        44 => Some(DXIL_INTRIN_LENGTH),       // length
-        45 => Some(DXIL_INTRIN_SMOOTHSTEP),   // smoothstep
-        46 => Some(DXIL_INTRIN_STEP),         // step
-        47 => Some(DXIL_INTRIN_SINCOS),       // sincos
-        48 => Some(DXIL_INTRIN_ATAN2),        // atan2
-        49 => Some(DXIL_INTRIN_ATAN),         // atan
-        50 => Some(DXIL_INTRIN_ASIN),         // asin
-        51 => Some(DXIL_INTRIN_ACOS),         // acos
-        52 => Some(DXIL_INTRIN_TANH),         // tanh
-        53 => Some(DXIL_INTRIN_SINH),         // sinh
-        54 => Some(DXIL_INTRIN_COSH),         // cosh
-        55 => Some(DXIL_INTRIN_FWIDTH),       // fwidth
-        56 => Some(DXIL_INTRIN_ASFLOAT),      // asfloat
-        57 => Some(DXIL_INTRIN_ASINT),        // asint
-        58 => Some(DXIL_INTRIN_ASUINT),       // asuint
-        59 => Some(DXIL_INTRIN_FIRSTBITHIGH), // firstbithigh
-        60 => Some(DXIL_INTRIN_FIRSTBITLOW),  // firstbitlow
-
-        // Texture/sample intrinsics
-        120 => Some(DXIL_INTRIN_SAMPLE),
-        121 => Some(DXIL_INTRIN_SAMPLELEVEL),
-        122 => Some(DXIL_INTRIN_SAMPLEGRAD),
-        123 => Some(DXIL_INTRIN_SAMPLEBIAS),
-        124 => Some(DXIL_INTRIN_SAMPLECMP),
-        125 => Some(DXIL_INTRIN_GATHER),
-        126 => Some(DXIL_INTRIN_CALCULATELOD),
-        127 => Some(DXIL_INTRIN_CALCULATELODUNCLAMPED),
-
-        // Buffer/load/store intrinsics
-        130 => Some(DXIL_INTRIN_LOAD),
-        131 => Some(DXIL_INTRIN_STORE),
-        132 => Some(DXIL_INTRIN_BUFFERLOAD),
-        133 => Some(DXIL_INTRIN_BUFFERSTORE),
-        134 => Some(DXIL_INTRIN_TEXTURELOAD),
-        135 => Some(DXIL_INTRIN_TEXTURESTORE),
-
-        // Atomic intrinsics
-        136 => Some(DXIL_INTRIN_ATOMICADD),
-        137 => Some(DXIL_INTRIN_ATOMICAND),
-        138 => Some(DXIL_INTRIN_ATOMICOR),
-        139 => Some(DXIL_INTRIN_ATOMICXOR),
-        140 => Some(DXIL_INTRIN_ATOMICMIN),
-        141 => Some(DXIL_INTRIN_ATOMICMAX),
-        142 => Some(DXIL_INTRIN_ATOMICEXCHANGE),
-        143 => Some(DXIL_INTRIN_ATOMICCOMPAREEXCHANGE),
-
-        // Thread/buffer identity intrinsics
-        150 => Some(DXIL_INTRIN_INSTANCEID),
-        151 => Some(DXIL_INTRIN_VERTEXID),
-        152 => Some(DXIL_INTRIN_PRIMITIVEID),
-        153 => Some(DXIL_INTRIN_THREADID),
-        154 => Some(DXIL_INTRIN_GROUPID),
-        155 => Some(DXIL_INTRIN_THREADGROUPID),
-        156 => Some(DXIL_INTRIN_GROUPINDEX),
-        157 => Some(DXIL_INTRIN_DISPATCHTHREADID),
-
-        // Barrier/sync intrinsics
-        158 => Some(DXIL_INTRIN_BARRIER),
-        159 => Some(DXIL_INTRIN_GROUPMEMORYBARRIER),
-        160 => Some(DXIL_INTRIN_DEVICEMEMORYBARRIER),
-
-        // Derivative intrinsics
-        161 => Some(DXIL_INTRIN_DERIVATIVE),
-        162 => Some(DXIL_INTRIN_DERIVATIVE_COARSE),
-        163 => Some(DXIL_INTRIN_DERIVATIVE_FINE),
-
-        // Arithmetic intrinsics (continued)
-        164 => Some(DXIL_INTRIN_DOT4ADDI8PACKED),
-        165 => Some(DXIL_INTRIN_DOT4ADDU8PACKED),
-
-        // Wave intrinsics
-        190 => Some(DXIL_INTRIN_WAVEACTIVE),
-        191 => Some(DXIL_INTRIN_WAVEACTIVEBIT),
-        192 => Some(DXIL_INTRIN_WAVEPREFIX),
-        193 => Some(DXIL_INTRIN_WAVEGETLANEINDEX),
-        194 => Some(DXIL_INTRIN_WAVEGETLANECOUNT),
-        195 => Some(DXIL_INTRIN_WAVEANYTRUE),
-        196 => Some(DXIL_INTRIN_WAVEALLTRUE),
-        197 => Some(DXIL_INTRIN_WAVEALLEQUAL),
-        198 => Some(DXIL_INTRIN_WAVEBALLOT),
-        199 => Some(DXIL_INTRIN_WAVEREADLANEAT),
-        200 => Some(DXIL_INTRIN_WAVEREADLANEFIRST),
-        201 => Some(DXIL_INTRIN_WAVEACTIVESUM),
-        202 => Some(DXIL_INTRIN_WAVEACTIVEPRODUCT),
-        203 => Some(DXIL_INTRIN_WAVEACTIVEMIN),
-        204 => Some(DXIL_INTRIN_WAVEACTIVEMAX),
-        205 => Some(DXIL_INTRIN_WAVEACTIVEBITAND),
-        206 => Some(DXIL_INTRIN_WAVEACTIVEBITOR),
-        207 => Some(DXIL_INTRIN_WAVEACTIVEBITXOR),
-        208 => Some(DXIL_INTRIN_WAVEACTIVECOUNTBITS),
-        209 => Some(DXIL_INTRIN_WAVEMATCH),
-        210 => Some(DXIL_INTRIN_WAVEMULTIPREFIXSUM),
-        211 => Some(DXIL_INTRIN_WAVEMULTIPREFIXPRODUCT),
-        212 => Some(DXIL_INTRIN_WAVEMULTIPREFIXBITAND),
-        213 => Some(DXIL_INTRIN_WAVEMULTIPREFIXBITOR),
-        214 => Some(DXIL_INTRIN_WAVEMULTIPREFIXBITXOR),
-        215 => Some(DXIL_INTRIN_WAVEMULTIPREFIXBITCOUNT),
-
-        // Quad read/write intrinsics
-        216 => Some(DXIL_INTRIN_QUADREAD),
-        217 => Some(DXIL_INTRIN_QUADWRITE),
-
-        // Tessellation intrinsics
-        230 => Some(DXIL_INTRIN_PROCESS2DQUADTESSSFACTORSAVG),
-        231 => Some(DXIL_INTRIN_PROCESS2DQUADTESSFACTORSMAX),
-        232 => Some(DXIL_INTRIN_PROCESS2DQUADTESSFACTORSMIN),
-        233 => Some(DXIL_INTRIN_PROCESS2DTRIANGLEFACTORSAVG),
-        234 => Some(DXIL_INTRIN_PROCESS2DTRIANGLEFACTORSMAX),
-        235 => Some(DXIL_INTRIN_PROCESS2DTRIANGLEFACTORSMIN),
-
-        // Geometry shader intrinsics
-        240 => Some(DXIL_INTRIN_EMITSTREAM),
-        241 => Some(DXIL_INTRIN_CUTSTREAM),
-        242 => Some(DXIL_INTRIN_EMITTHENCUTSTREAM),
-
-        // Attribute evaluation intrinsics
-        250 => Some(DXIL_INTRIN_EVALUATEATTRIBUTEATCENTROID),
-        251 => Some(DXIL_INTRIN_EVALUATEATTRIBUTEATSAMPLE),
-        252 => Some(DXIL_INTRIN_EVALUATEATTRIBUTEATCONSTANT),
+        // Arithmetic intrinsics (DXIL 1.0 numbering)
+        6 => Some(DXIL_INTRIN_ABS),        // FAbs
+        7 => Some(DXIL_INTRIN_SATURATE),   // Saturate
+        8 => Some(DXIL_INTRIN_ISNAN),      // IsNaN
+        9 => Some(DXIL_INTRIN_ISINF),      // IsInf
+        10 => Some(DXIL_INTRIN_ISFINITE),  // IsFinite
+        12 => Some(DXIL_INTRIN_COS),       // Cos
+        13 => Some(DXIL_INTRIN_SIN),       // Sin
+        14 => Some(DXIL_INTRIN_TAN),       // Tan
+        15 => Some(DXIL_INTRIN_ACOS),      // Acos
+        16 => Some(DXIL_INTRIN_ASIN),      // Asin
+        17 => Some(DXIL_INTRIN_ATAN),      // Atan
+        18 => Some(DXIL_INTRIN_COSH),      // Hcos
+        19 => Some(DXIL_INTRIN_SINH),      // Hsin
+        20 => Some(DXIL_INTRIN_TANH),      // Htan
+        21 => Some(DXIL_INTRIN_EXP),       // Exp
+        22 => Some(DXIL_INTRIN_FRAC),      // Frc
+        23 => Some(DXIL_INTRIN_LOG),       // Log
+        24 => Some(DXIL_INTRIN_SQRT),      // Sqrt
+        25 => Some(DXIL_INTRIN_RSQRT),     // Rsqrt
+        26..=29 => Some(DXIL_INTRIN_ROUND), // Round_ne/ni/pi/z
+        30 => Some(DXIL_INTRIN_REVERSEBITS), // Bfrev
+        31 => Some(DXIL_INTRIN_COUNTBITS), // Countbits
+        32 => Some(DXIL_INTRIN_FIRSTBITLOW), // FirstbitLo
+        33 => Some(DXIL_INTRIN_FIRSTBITHIGH), // FirstbitHi
+        34 => Some(DXIL_INTRIN_FIRSTBITHIGH), // FirstbitSHi
+        35 | 37 | 39 => Some(DXIL_INTRIN_MAX), // FMax / IMax / UMax
+        36 | 38 | 40 => Some(DXIL_INTRIN_MIN), // FMin / IMin / UMin
+        41 | 42 => Some(DXIL_INTRIN_MUL),    // IMul / UMul
+        46 => Some(DXIL_INTRIN_MAD),         // FMad
+        47 => Some(DXIL_INTRIN_FMA),         // Fma
+        48 | 49 => Some(DXIL_INTRIN_MAD),    // IMad / UMad
+        54..=56 => Some(DXIL_INTRIN_DOT),    // Dot2 / Dot3 / Dot4
 
         // Resource handle creation
-        253 => Some(DXIL_INTRIN_CREATEHANDLE),
-        254 => Some(DXIL_INTRIN_CREATEHANDLEFORBINDING),
+        57 => Some(DXIL_INTRIN_CREATEHANDLE),
 
-        // CheckAccessFullyMapped
-        255 => Some(DXIL_INTRIN_CHECKACCESSFULLYMAPPED),
+        // Texture/buffer intrinsics
+        60 => Some(DXIL_INTRIN_SAMPLE),
+        62 => Some(DXIL_INTRIN_SAMPLELEVEL),
+        63 => Some(DXIL_INTRIN_SAMPLEGRAD),
+        64 | 65 => Some(DXIL_INTRIN_SAMPLECMP), // SampleCmp / SampleCmpLevelZero
+        66 => Some(DXIL_INTRIN_TEXTURELOAD),
+        67 => Some(DXIL_INTRIN_TEXTURESTORE),
+        68 => Some(DXIL_INTRIN_BUFFERLOAD),
+        69 => Some(DXIL_INTRIN_BUFFERSTORE),
+        71 => Some(DXIL_INTRIN_CHECKACCESSFULLYMAPPED),
+        73 => Some(DXIL_INTRIN_GATHER),
+
+        // Atomics — AtomicBinOp (78) carries its operation in a constant
+        // operand and is intentionally left unmapped rather than guessing.
+        79 => Some(DXIL_INTRIN_ATOMICCOMPAREEXCHANGE),
+
+        // Barriers and derivatives
+        80 => Some(DXIL_INTRIN_BARRIER),
+        81 => Some(DXIL_INTRIN_CALCULATELOD),
+        82 => Some(DXIL_INTRIN_DISCARD),
+        83 | 84 => Some(DXIL_INTRIN_DERIVATIVE_COARSE), // DerivCoarseX/Y
+        85 | 86 => Some(DXIL_INTRIN_DERIVATIVE_FINE),   // DerivFineX/Y
+        88 => Some(DXIL_INTRIN_EVALUATEATTRIBUTEATSAMPLE), // EvalSampleIndex
+        89 => Some(DXIL_INTRIN_EVALUATEATTRIBUTEATCENTROID), // EvalCentroid
+
+        // Thread/group identity
+        93 => Some(DXIL_INTRIN_THREADID),       // SV_DispatchThreadID
+        94 => Some(DXIL_INTRIN_GROUPID),        // SV_GroupID
+        95 => Some(DXIL_INTRIN_THREADGROUPID),  // SV_GroupThreadID
+        96 => Some(DXIL_INTRIN_GROUPINDEX),     // SV_GroupIndex
+
+        // Geometry shaders
+        97 => Some(DXIL_INTRIN_EMITSTREAM),
+        98 => Some(DXIL_INTRIN_CUTSTREAM),
+        99 => Some(DXIL_INTRIN_EMITTHENCUTSTREAM),
+        108 => Some(DXIL_INTRIN_PRIMITIVEID),  // SV_PrimitiveID
+
+        // Wave intrinsics
+        110 => Some(DXIL_INTRIN_WAVEISFIRSTLANE),
+        111 => Some(DXIL_INTRIN_WAVEGETLANEINDEX),
+        112 => Some(DXIL_INTRIN_WAVEGETLANECOUNT),
+        113 => Some(DXIL_INTRIN_WAVEANYTRUE),
+        114 => Some(DXIL_INTRIN_WAVEALLTRUE),
+        115 => Some(DXIL_INTRIN_WAVEALLEQUAL), // WaveActiveAllEqual
+        116 => Some(DXIL_INTRIN_WAVEBALLOT),   // WaveActiveBallot
+        117 => Some(DXIL_INTRIN_WAVEREADLANEAT),
+        118 => Some(DXIL_INTRIN_WAVEREADLANEFIRST),
+        122 => Some(DXIL_INTRIN_QUADREAD),     // QuadReadLaneAt
+
+        // Raw buffer access
+        139 => Some(DXIL_INTRIN_BUFFERLOAD),   // RawBufferLoad
+        140 => Some(DXIL_INTRIN_BUFFERSTORE),  // RawBufferStore
+
+        // Packed dot products
+        163 => Some(DXIL_INTRIN_DOT4ADDI8PACKED),
+        164 => Some(DXIL_INTRIN_DOT4ADDU8PACKED),
+
+        // Resource handle creation from binding
+        217 => Some(DXIL_INTRIN_CREATEHANDLEFORBINDING),
 
         _ => None,
     }
@@ -2954,14 +3042,14 @@ pub fn map_dxil_intrinsic_id(dxil_intrinsic_id: u32) -> Option<u32> {
 fn scan_bitcode_blocks(bytes: &[u8]) -> AppResult<BitcodeScanResult> {
     let mut reader = LlvmBitcodeReader::new(bytes);
 
-    // Skip wrapper format if present
-    reader.skip_wrapper();
+    // Skip wrapper format if present; a malformed wrapper is an error.
+    reader.skip_wrapper()?;
 
     // Check LLVM bitcode magic
     if !reader.check_magic() {
         return Err(AppError::new(
             ReasonCode::RcDxilInvalid,
-            "missing LLVM bitcode magic (0x0B1E_0BC0)",
+            "missing LLVM bitcode magic (0x4243C0DE)",
         ));
     }
 
@@ -2971,82 +3059,92 @@ fn scan_bitcode_blocks(bytes: &[u8]) -> AppResult<BitcodeScanResult> {
     let mut block_depth = 0;
 
     loop {
-        if let Some(block_id) = reader.enter_block() {
-            block_depth += 1;
-            match block_id {
-                BLOCKID_BLOCKINFO => {
-                    // Parse BLOCKINFO for abbreviation definitions
-                    reader.read_block_info_block()?;
-                    reader.exit_block();
-                    block_depth -= 1;
-                    continue;
-                }
-                BLOCKID_MODULE => {
-                    // Parse the module block, which contains FUNCTION sub-blocks
-                    // We need to manually enter/exit function blocks
-                    loop {
-                        if let Some(sub_id) = reader.enter_block() {
-                            match sub_id {
-                                BLOCKID_FUNCTION => {
-                                    let (fn_instr_count, _fn_name, parsed_func) =
-                                        parse_function_block(&mut reader)?;
-                                    instruction_count += fn_instr_count;
-                                    if let Some(func) = parsed_func {
-                                        functions.push(func);
+        match reader.next_entry(true) {
+            Some(BitcodeEntry::SubBlock(block_id)) => {
+                block_depth += 1;
+                match block_id {
+                    BLOCKID_BLOCKINFO => {
+                        // Parse BLOCKINFO for abbreviation definitions
+                        reader.read_block_info_block()?;
+                        reader.exit_block();
+                        block_depth -= 1;
+                        continue;
+                    }
+                    BLOCKID_TYPE => {
+                        // Build the type table used for operand typing.
+                        reader.read_type_block()?;
+                        block_depth -= 1;
+                        continue;
+                    }
+                    BLOCKID_MODULE => {
+                        // Parse the module block, which contains FUNCTION
+                        // sub-blocks.
+                        loop {
+                            match reader.next_entry(true) {
+                                Some(BitcodeEntry::SubBlock(sub_id)) => match sub_id {
+                                    BLOCKID_FUNCTION => {
+                                        let (fn_instr_count, _fn_name, parsed_func) =
+                                            parse_function_block(&mut reader)?;
+                                        instruction_count += fn_instr_count;
+                                        if let Some(func) = parsed_func {
+                                            functions.push(func);
+                                        }
                                     }
-                                }
-                                BLOCKID_IDENTIFICATION => {
-                                    // Parse entry name from identification block
-                                    if let Some(name) = parse_identification_block(&mut reader)? {
-                                        entry_name = name;
+                                    BLOCKID_IDENTIFICATION => {
+                                        // Parse entry name from identification block
+                                        if let Some(name) =
+                                            parse_identification_block(&mut reader)?
+                                        {
+                                            entry_name = name;
+                                        }
                                     }
-                                }
-                                _ => {
-                                    // Skip other sub-blocks (constants, metadata, etc.)
-                                    reader.skip_block();
-                                }
+                                    _ => {
+                                        // Skip other sub-blocks (constants, metadata, etc.)
+                                        reader.skip_block();
+                                    }
+                                },
+                                Some(BitcodeEntry::EndBlock) => break,
+                                _ => {}
                             }
-                            reader.exit_block();
-                        } else {
-                            // END_BLOCK for module
-                            break;
                         }
+                        reader.exit_block();
+                        block_depth -= 1;
                     }
-                    reader.exit_block();
-                    block_depth -= 1;
-                }
-                BLOCKID_FUNCTION => {
-                    // Handle top-level function block (rare)
-                    let (fn_instr_count, _fn_name, parsed_func) =
-                        parse_function_block(&mut reader)?;
-                    instruction_count += fn_instr_count;
-                    if let Some(func) = parsed_func {
-                        functions.push(func);
+                    BLOCKID_FUNCTION => {
+                        // Handle top-level function block (rare)
+                        let (fn_instr_count, _fn_name, parsed_func) =
+                            parse_function_block(&mut reader)?;
+                        instruction_count += fn_instr_count;
+                        if let Some(func) = parsed_func {
+                            functions.push(func);
+                        }
+                        reader.exit_block();
+                        block_depth -= 1;
                     }
-                    reader.exit_block();
-                    block_depth -= 1;
-                }
-                BLOCKID_IDENTIFICATION => {
-                    if let Some(name) = parse_identification_block(&mut reader)? {
-                        entry_name = name;
+                    BLOCKID_IDENTIFICATION => {
+                        if let Some(name) = parse_identification_block(&mut reader)? {
+                            entry_name = name;
+                        }
+                        reader.exit_block();
+                        block_depth -= 1;
                     }
-                    reader.exit_block();
-                    block_depth -= 1;
-                }
-                _ => {
-                    // Skip unknown blocks
-                    reader.skip_block();
-                    block_depth -= 1;
+                    _ => {
+                        // Skip unknown blocks
+                        reader.skip_block();
+                        block_depth -= 1;
+                    }
                 }
             }
-        } else {
-            // END_BLOCK
-            if block_depth > 0 {
-                reader.exit_block();
-                block_depth -= 1;
-            } else {
-                break;
+            Some(BitcodeEntry::EndBlock) => {
+                if block_depth > 0 {
+                    reader.exit_block();
+                    block_depth -= 1;
+                } else {
+                    break;
+                }
             }
+            None => break,
+            _ => {}
         }
 
         // Safety limit
@@ -3069,10 +3167,117 @@ struct BitcodeScanResult {
     entry_name: String,
 }
 
+/// Whether an instruction produces a value (and therefore consumes a value ID
+/// in the bitcode's relative operand encoding). Terminators, stores, barriers
+/// and void intrinsics do not.
+fn instruction_is_void(opcode: u32) -> bool {
+    matches!(
+        opcode,
+        36 | 37 | 38 | 40 | 44 | 52
+            | DXIL_INTRIN_BARRIER
+            | DXIL_INTRIN_GROUPMEMORYBARRIER
+            | DXIL_INTRIN_DEVICEMEMORYBARRIER
+            | DXIL_INTRIN_BUFFERSTORE
+            | DXIL_INTRIN_TEXTURESTORE
+            | DXIL_INTRIN_EMITSTREAM
+            | DXIL_INTRIN_CUTSTREAM
+            | DXIL_INTRIN_EMITTHENCUTSTREAM
+    )
+}
+
+/// Map an encoded LLVM binary opcode (DXC: 0..=12) to this module's internal
+/// IR BinaryOps numbering (0..=16, float ops interleaved).
+fn map_encoded_binop(encoded: u32) -> u32 {
+    match encoded {
+        0 => 0,  // add
+        1 => 2,  // sub
+        2 => 4,  // mul
+        3 => 6,  // udiv
+        4 => 7,  // sdiv / fdiv
+        5 => 9,  // urem
+        6 => 10, // srem / frem
+        7 => 11, // shl
+        8 => 12, // lshr
+        9 => 13, // ashr
+        10 => 14, // and
+        11 => 15, // or
+        12 => 16, // xor
+        _ => 0,
+    }
+}
+
+/// Map an encoded LLVM cast opcode (0..=12) to this module's internal cast
+/// opcode numbering (30..=35 plus 90..=96).
+fn map_encoded_cast(encoded: u32) -> u32 {
+    match encoded {
+        0 => 35,                 // trunc
+        1 => 33,                 // zext
+        2 => 34,                 // sext
+        3 => CAST_FPTOUI,        // fptoui
+        4 => CAST_FPTOSI,        // fptosi
+        5 => CAST_UITOFP,        // uitofp
+        6 => CAST_SITOFP,        // sitofp
+        7 => CAST_FPTRUNC,       // fptrunc
+        8 => CAST_FPEXT,         // fpext
+        9 => 31,                 // ptrtoint
+        10 => 32,                // inttoptr
+        11 => 30,                // bitcast
+        12 => CAST_ADDRSPACECAST, // addrspacecast
+        _ => 30,
+    }
+}
+
+/// Map an LLVM `CmpInst` predicate to an internal comparison opcode.
+///
+/// ICMP_EQ=32 .. ICMP_SLE=41 map to 18..=27; the fcmp predicates 0..=15 map
+/// to 28/29 and 61..=73.
+fn map_cmp_predicate(pred: u32) -> u32 {
+    match pred {
+        32 => 18, // icmp_eq
+        33 => 19, // icmp_ne
+        34 => 20, // icmp_ugt
+        35 => 21, // icmp_uge
+        36 => 22, // icmp_ult
+        37 => 23, // icmp_ule
+        38 => 24, // icmp_sgt
+        39 => 25, // icmp_sge
+        40 => 26, // icmp_slt
+        41 => 27, // icmp_sle
+        1 => 28,  // fcmp_oeq
+        6 => 29,  // fcmp_one
+        2 => CMP_FCMP_OGT,
+        3 => CMP_FCMP_OGE,
+        4 => CMP_FCMP_OLT,
+        5 => CMP_FCMP_OLE,
+        14 => CMP_FCMP_UNE,
+        7 => CMP_FCMP_ORD,
+        8 => CMP_FCMP_UNO,
+        0 => CMP_FCMP_FALSE,
+        15 => CMP_FCMP_TRUE,
+        10 => CMP_FCMP_UGT,
+        11 => CMP_FCMP_UGE,
+        12 => CMP_FCMP_ULT,
+        13 => CMP_FCMP_ULE,
+        _ => 18,
+    }
+}
+
+/// True when a relative value operand is a forward reference, in which case
+/// the record contains an appended type operand (per `PushValueAndType`).
+fn is_forward_ref(value: u32) -> bool {
+    value == 0 || (value as i32) < 0
+}
+
 /// Parse a FUNCTION_BLOCK (block_id 12): extract basic blocks and instructions.
 ///
-/// Each function block contains DECLAREBLOCKS records followed by instruction
-/// records. Returns the instruction count and (if available) the function name.
+/// Each function block starts with a DECLAREBLOCKS record giving the number of
+/// basic blocks; instruction records follow, with blocks delimited by
+/// terminator instructions. Instruction operands use the bitcode v1 relative
+/// value encoding: an operand `v` refers to the value defined `v` non-void
+/// instructions earlier. Forward references (phi) use signed VBR and are
+/// resolved by the code generator.
+///
+/// Returns the instruction count and (if available) the function name.
 fn parse_function_block(
     reader: &mut LlvmBitcodeReader,
 ) -> AppResult<(u32, String, Option<DxilFunction>)> {
@@ -3082,247 +3287,358 @@ fn parse_function_block(
     let mut block_index = 0u32;
     let fn_name = String::new();
 
-    loop {
-        match reader.read_record() {
-            Some(record) => {
-                match record.id {
-                    FUNC_CODE_DECLAREBLOCKS => {
-                        // DECLAREBLOCKS: marks start of a new basic block
-                        // Flush previous block
-                        if let Some(bb) = current_bb.take() {
-                            basic_blocks.push(bb);
-                        }
-                        let label = format!("bb{}", block_index);
-                        block_index += 1;
-                        current_bb = Some(DxilBasicBlock {
-                            label,
-                            instructions: Vec::new(),
-                        });
-                    }
-                    FUNC_CODE_INST_BINOP => {
-                        // Binary operation: operands[0] = opcode, operands[1..] = args
-                        instruction_count += 1;
-                        let opcode = record.operands.first().copied().unwrap_or(0);
-                        let instr = DxilInstruction {
-                            opcode,
-                            operands: record.operands[1..].to_vec(),
-                        };
-                        if let Some(ref mut bb) = current_bb {
-                            bb.instructions.push(instr);
-                        }
-                    }
-                    FUNC_CODE_INST_CAST => {
-                        // Cast operation
-                        instruction_count += 1;
-                        let opcode = record.operands.first().copied().unwrap_or(30);
-                        let instr = DxilInstruction {
-                            opcode,
-                            operands: record.operands[1..].to_vec(),
-                        };
-                        if let Some(ref mut bb) = current_bb {
-                            bb.instructions.push(instr);
-                        }
-                    }
-                    FUNC_CODE_INST_RET => {
-                        instruction_count += 1;
-                        let instr = DxilInstruction {
-                            opcode: 40, // ret
-                            operands: record.operands.clone(),
-                        };
-                        if let Some(ref mut bb) = current_bb {
-                            bb.instructions.push(instr);
-                        }
-                    }
-                    FUNC_CODE_INST_BR => {
-                        instruction_count += 1;
-                        let opcode = if record.operands.len() >= 3 {
-                            37 // conditional branch
-                        } else {
-                            36 // unconditional branch
-                        };
-                        let instr = DxilInstruction {
-                            opcode,
-                            operands: record.operands.clone(),
-                        };
-                        if let Some(ref mut bb) = current_bb {
-                            bb.instructions.push(instr);
-                        }
-                    }
-                    FUNC_CODE_INST_SWITCH => {
-                        instruction_count += 1;
-                        let instr = DxilInstruction {
-                            opcode: 38, // switch
-                            operands: record.operands.clone(),
-                        };
-                        if let Some(ref mut bb) = current_bb {
-                            bb.instructions.push(instr);
-                        }
-                    }
-                    FUNC_CODE_INST_PHI => {
-                        instruction_count += 1;
-                        let instr = DxilInstruction {
-                            opcode: 39, // phi
-                            operands: record.operands.clone(),
-                        };
-                        if let Some(ref mut bb) = current_bb {
-                            bb.instructions.push(instr);
-                        }
-                    }
-                    FUNC_CODE_INST_ALLOCA => {
-                        instruction_count += 1;
-                        let instr = DxilInstruction {
-                            opcode: 42, // alloca
-                            operands: record.operands.clone(),
-                        };
-                        if let Some(ref mut bb) = current_bb {
-                            bb.instructions.push(instr);
-                        }
-                    }
-                    FUNC_CODE_INST_LOAD => {
-                        instruction_count += 1;
-                        let instr = DxilInstruction {
-                            opcode: 43, // load
-                            operands: record.operands.clone(),
-                        };
-                        if let Some(ref mut bb) = current_bb {
-                            bb.instructions.push(instr);
-                        }
-                    }
-                    FUNC_CODE_INST_STORE => {
-                        instruction_count += 1;
-                        let instr = DxilInstruction {
-                            opcode: 44, // store
-                            operands: record.operands.clone(),
-                        };
-                        if let Some(ref mut bb) = current_bb {
-                            bb.instructions.push(instr);
-                        }
-                    }
-                    FUNC_CODE_INST_GEP => {
-                        instruction_count += 1;
-                        let instr = DxilInstruction {
-                            opcode: 45, // getelementptr
-                            operands: record.operands.clone(),
-                        };
-                        if let Some(ref mut bb) = current_bb {
-                            bb.instructions.push(instr);
-                        }
-                    }
-                    FUNC_CODE_INST_CALL => {
-                        instruction_count += 1;
-                        // Try to detect DXIL intrinsic calls.
-                        // In DXIL, intrinsic calls have a function index as the first
-                        // operand and the DXIL intrinsic ID as the second operand.
-                        // If we can map the intrinsic ID, use our opcode constant;
-                        // otherwise fall back to generic call (opcode 41).
-                        let opcode = if record.operands.len() >= 2 {
-                            let dxil_intrinsic_id = record.operands[1];
-                            map_dxil_intrinsic_id(dxil_intrinsic_id).unwrap_or(41)
-                        } else {
-                            41
-                        };
-                        let instr = DxilInstruction {
-                            opcode,
-                            operands: record.operands.clone(),
-                        };
-                        if let Some(ref mut bb) = current_bb {
-                            bb.instructions.push(instr);
-                        }
-                    }
-                    FUNC_CODE_INST_SELECT => {
-                        instruction_count += 1;
-                        let instr = DxilInstruction {
-                            opcode: 46, // select
-                            operands: record.operands.clone(),
-                        };
-                        if let Some(ref mut bb) = current_bb {
-                            bb.instructions.push(instr);
-                        }
-                    }
-                    FUNC_CODE_INST_CMP | FUNC_CODE_INST_CMP2 => {
-                        instruction_count += 1;
-                        // Comparison: operands[0] = comparison predicate
-                        let pred = record.operands.first().copied().unwrap_or(0);
-                        // Map predicate to our opcode space (18-29)
-                        let opcode = 18 + pred.min(11);
-                        let instr = DxilInstruction {
-                            opcode,
-                            operands: record.operands[1..].to_vec(),
-                        };
-                        if let Some(ref mut bb) = current_bb {
-                            bb.instructions.push(instr);
-                        }
-                    }
-                    FUNC_CODE_INST_EXTRACTVAL => {
-                        instruction_count += 1;
-                        let instr = DxilInstruction {
-                            opcode: 47, // extractvalue
-                            operands: record.operands.clone(),
-                        };
-                        if let Some(ref mut bb) = current_bb {
-                            bb.instructions.push(instr);
-                        }
-                    }
-                    FUNC_CODE_INST_INSERTVAL => {
-                        instruction_count += 1;
-                        let instr = DxilInstruction {
-                            opcode: 48, // insertvalue
-                            operands: record.operands.clone(),
-                        };
-                        if let Some(ref mut bb) = current_bb {
-                            bb.instructions.push(instr);
-                        }
-                    }
-                    FUNC_CODE_INST_EXTRACTELT => {
-                        instruction_count += 1;
-                        let instr = DxilInstruction {
-                            opcode: 49, // extractelement
-                            operands: record.operands.clone(),
-                        };
-                        if let Some(ref mut bb) = current_bb {
-                            bb.instructions.push(instr);
-                        }
-                    }
-                    FUNC_CODE_INST_INSERTELT => {
-                        instruction_count += 1;
-                        let instr = DxilInstruction {
-                            opcode: 50, // insertelement
-                            operands: record.operands.clone(),
-                        };
-                        if let Some(ref mut bb) = current_bb {
-                            bb.instructions.push(instr);
-                        }
-                    }
-                    FUNC_CODE_INST_SHUFFLE => {
-                        instruction_count += 1;
-                        let instr = DxilInstruction {
-                            opcode: 51, // shufflevector
-                            operands: record.operands.clone(),
-                        };
-                        if let Some(ref mut bb) = current_bb {
-                            bb.instructions.push(instr);
-                        }
-                    }
-                    FUNC_CODE_INST_UNREACHABLE => {
-                        instruction_count += 1;
-                        let instr = DxilInstruction {
-                            opcode: 52, // unreachable
-                            operands: Vec::new(),
-                        };
-                        if let Some(ref mut bb) = current_bb {
-                            bb.instructions.push(instr);
-                        }
-                    }
-                    _ => {
-                        // Unknown function record - ignore
-                        // But still count it as an instruction to avoid infinite loops
-                        if record.id != 0xFFFF {
-                            instruction_count += 1;
-                        }
-                    }
+    // Push an instruction into the active basic block, starting a new block
+    // after terminators and handling the single DECLAREBLOCKS record that
+    // precedes the first instruction.
+    let mut push_instr = |instr: DxilInstruction| {
+        let is_terminator = matches!(instr.opcode, 36 | 37 | 38 | 40 | 52);
+        if current_bb.is_none() || is_terminator {
+            if let Some(bb) = current_bb.take() {
+                basic_blocks.push(bb);
+            }
+            current_bb.replace(DxilBasicBlock {
+                label: format!("bb{}", block_index),
+                instructions: Vec::new(),
+            });
+            block_index += 1;
+        }
+        if let Some(bb) = current_bb.as_mut() {
+            bb.instructions.push(instr);
+        }
+        // Terminators end the block: the next instruction starts a new one.
+        if is_terminator
+            && let Some(bb) = current_bb.take()
+        {
+            basic_blocks.push(bb);
+        }
+    };
+
+    while let Some(entry) = reader.next_entry(true) {
+        let BitcodeEntry::Record(record) = entry else {
+            break;
+        };
+        if record.id == 0xFFFF {
+            continue;
+        }
+        match record.id {
+            FUNC_CODE_DECLAREBLOCKS => {
+                // The number of basic blocks; blocks themselves are delimited
+                // by terminators in the instruction stream.
+                if let Some(&count) = record.operands.first()
+                    && count > 4096
+                {
+                    return Err(dxil_invalid(
+                        "DXIL function declares too many basic blocks",
+                    ));
                 }
             }
-            None => break, // END_BLOCK for function
+            FUNC_CODE_INST_BINOP => {
+                // [op0(+ty?), op1, opc, flags?]
+                let mut ops = Vec::new();
+                let idx = take_value_operands(&record.operands, 0, 2, &mut ops);
+                let opc = record.operands.get(idx).copied().unwrap_or(0);
+                let instr = DxilInstruction {
+                    opcode: map_encoded_binop(opc),
+                    operands: ops,
+                    ty: None,
+                };
+                instruction_count += 1;
+                push_instr(instr);
+            }
+            FUNC_CODE_INST_CAST => {
+                // [op0(+ty?), result_ty, cast_opc]
+                let cast_opc = record.operands.last().copied().unwrap_or(11);
+                let result_ty = record.operands.get(record.operands.len() - 2).copied();
+                let mut ops = Vec::new();
+                take_value_operands(&record.operands, 0, 1, &mut ops);
+                let instr = DxilInstruction {
+                    opcode: map_encoded_cast(cast_opc),
+                    operands: ops,
+                    ty: result_ty.and_then(|t| type_desc(reader, t)),
+                };
+                instruction_count += 1;
+                push_instr(instr);
+            }
+            FUNC_CODE_INST_GEP | FUNC_CODE_INST_GEP_OLD | FUNC_CODE_INST_INBOUNDS_GEP_OLD => {
+                // GEP: [inbounds, srcty, op0(+ty?), op1(+ty?)...]
+                // GEP_OLD/INBOUNDS_GEP_OLD: [n x operands]
+                let mut ops = Vec::new();
+                let start = if record.id == FUNC_CODE_INST_GEP { 2 } else { 0 };
+                take_value_operands(&record.operands, start, usize::MAX, &mut ops);
+                let instr = DxilInstruction {
+                    opcode: 45,
+                    operands: ops,
+                    ty: Some(TypeDesc {
+                        is_pointer: true,
+                        is_signed: false,
+                        ..TypeDesc::default()
+                    }),
+                };
+                instruction_count += 1;
+                push_instr(instr);
+            }
+            FUNC_CODE_INST_VSELECT | FUNC_CODE_INST_SELECT => {
+                // VSELECT: [cond(+ty?), false_val, true_val(+ty?)]
+                // SELECT (legacy): [ty, cond, a, b]
+                let mut ops = Vec::new();
+                let start = if record.id == FUNC_CODE_INST_SELECT { 1 } else { 0 };
+                take_value_operands(&record.operands, start, 3, &mut ops);
+                // The writer emits [cond, b, a]; the emitter wants
+                // [cond, a, b].
+                if ops.len() == 3 {
+                    ops.swap(1, 2);
+                }
+                let instr = DxilInstruction {
+                    opcode: 46,
+                    operands: ops,
+                    ty: None,
+                };
+                instruction_count += 1;
+                push_instr(instr);
+            }
+            FUNC_CODE_INST_EXTRACTELT => {
+                let mut ops = Vec::new();
+                take_value_operands(&record.operands, 0, 2, &mut ops);
+                let instr = DxilInstruction {
+                    opcode: 49,
+                    operands: ops,
+                    ty: None,
+                };
+                instruction_count += 1;
+                push_instr(instr);
+            }
+            FUNC_CODE_INST_INSERTELT => {
+                let mut ops = Vec::new();
+                take_value_operands(&record.operands, 0, 3, &mut ops);
+                let instr = DxilInstruction {
+                    opcode: 50,
+                    operands: ops,
+                    ty: None,
+                };
+                instruction_count += 1;
+                push_instr(instr);
+            }
+            FUNC_CODE_INST_SHUFFLEVEC => {
+                let mut ops = Vec::new();
+                take_value_operands(&record.operands, 0, 3, &mut ops);
+                let instr = DxilInstruction {
+                    opcode: 51,
+                    operands: ops,
+                    ty: None,
+                };
+                instruction_count += 1;
+                push_instr(instr);
+            }
+            FUNC_CODE_INST_CMP | FUNC_CODE_INST_CMP2 => {
+                // CMP2: [op0(+ty?), op1, pred, flags?]
+                // CMP (legacy): [opty, op0, op1, pred]
+                let mut ops = Vec::new();
+                let pred;
+                if record.id == FUNC_CODE_INST_CMP {
+                    pred = record.operands.last().copied().unwrap_or(32);
+                    take_value_operands(&record.operands, 1, 2, &mut ops);
+                } else {
+                    // The predicate follows the two value operands (and any
+                    // appended forward-reference type).
+                    let idx = take_value_operands(&record.operands, 0, 2, &mut ops);
+                    pred = record.operands.get(idx).copied().unwrap_or(32);
+                }
+                let instr = DxilInstruction {
+                    opcode: map_cmp_predicate(pred),
+                    operands: ops,
+                    // The result of a comparison is i1 (or a vector of i1).
+                    ty: Some(TypeDesc {
+                        width: 1,
+                        ..TypeDesc::default()
+                    }),
+                };
+                instruction_count += 1;
+                push_instr(instr);
+            }
+            FUNC_CODE_INST_RET => {
+                let mut ops = Vec::new();
+                take_value_operands(&record.operands, 0, usize::MAX, &mut ops);
+                let instr = DxilInstruction {
+                    opcode: 40, // ret
+                    operands: ops,
+                    ty: None,
+                };
+                instruction_count += 1;
+                push_instr(instr);
+            }
+            FUNC_CODE_INST_BR => {
+                // BR: [bb#, bb#, cond] or [bb#]
+                let instr = if record.operands.len() >= 3 {
+                    let cond = record.operands[2];
+                    DxilInstruction {
+                        opcode: 37, // conditional branch
+                        operands: vec![cond, record.operands[0], record.operands[1]],
+                        ty: None,
+                    }
+                } else {
+                    DxilInstruction {
+                        opcode: 36, // unconditional branch
+                        operands: record.operands.clone(),
+                        ty: None,
+                    }
+                };
+                instruction_count += 1;
+                push_instr(instr);
+            }
+            FUNC_CODE_INST_SWITCH => {
+                // SWITCH: [opty, cond, default_bb, (caseval, bb)...]
+                let mut ops = Vec::new();
+                if let Some(&cond) = record.operands.get(1) {
+                    ops.push(cond);
+                }
+                if let Some(&default_bb) = record.operands.get(2) {
+                    ops.push(default_bb);
+                }
+                for k in (3..record.operands.len()).step_by(2) {
+                    if let (Some(&case_val), Some(&dest_bb)) =
+                        (record.operands.get(k), record.operands.get(k + 1))
+                    {
+                        ops.push(case_val);
+                        ops.push(dest_bb);
+                    }
+                }
+                let instr = DxilInstruction {
+                    opcode: 38, // switch
+                    operands: ops,
+                    ty: None,
+                };
+                instruction_count += 1;
+                push_instr(instr);
+            }
+            FUNC_CODE_INST_PHI => {
+                // PHI: [ty, (val#signed, bb)...]
+                let ty = record.operands.first().copied();
+                let ops = record.operands[1..].to_vec();
+                let instr = DxilInstruction {
+                    opcode: 39, // phi
+                    operands: ops,
+                    ty: ty.and_then(|t| type_desc(reader, t)),
+                };
+                instruction_count += 1;
+                push_instr(instr);
+            }
+            FUNC_CODE_INST_ALLOCA => {
+                // ALLOCA: [instty, opty, size, align]
+                let ty = record.operands.first().copied();
+                let instr = DxilInstruction {
+                    opcode: 42, // alloca
+                    operands: record.operands.clone(),
+                    ty: ty.and_then(|t| type_desc(reader, t)),
+                };
+                instruction_count += 1;
+                push_instr(instr);
+            }
+            FUNC_CODE_INST_LOAD => {
+                // LOAD: [ptr(+ty?), result_ty, align, vol]
+                let mut ops = Vec::new();
+                take_value_operands(&record.operands, 0, 1, &mut ops);
+                let result_ty = if is_forward_ref(record.operands.first().copied().unwrap_or(0)) {
+                    record.operands.get(2).copied()
+                } else {
+                    record.operands.get(1).copied()
+                };
+                let instr = DxilInstruction {
+                    opcode: 43, // load
+                    operands: ops,
+                    ty: result_ty.and_then(|t| type_desc(reader, t)),
+                };
+                instruction_count += 1;
+                push_instr(instr);
+            }
+            FUNC_CODE_INST_STORE | FUNC_CODE_INST_STORE_OLD => {
+                // STORE: [ptr(+ty?), val(+ty?), align, vol]
+                let mut ops = Vec::new();
+                take_value_operands(&record.operands, 0, 2, &mut ops);
+                let instr = DxilInstruction {
+                    opcode: 44, // store
+                    operands: ops,
+                    ty: None,
+                };
+                instruction_count += 1;
+                push_instr(instr);
+            }
+            FUNC_CODE_INST_CALL => {
+                // CALL: [attr, cc, fnty, fn(+ty?), args...]
+                // DXIL intrinsic calls have a function index as the first
+                // operand and the DXIL intrinsic ID as the second operand.
+                // Unmapped intrinsic IDs are a hard error instead of a
+                // silently broken generic call.
+                let opcode = if record.operands.len() >= 2 {
+                    let dxil_intrinsic_id = record.operands[1];
+                    map_dxil_intrinsic_id(dxil_intrinsic_id).ok_or_else(|| {
+                        AppError::new(
+                            ReasonCode::RcDxilInvalid,
+                            format!("unsupported DXIL intrinsic ID {}", dxil_intrinsic_id),
+                        )
+                    })?
+                } else {
+                    41
+                };
+                // Intrinsic calls pass their argument list to the emitter;
+                // generic calls keep the callee index at operands[0].
+                let operands = if opcode == 41 {
+                    record.operands.clone()
+                } else {
+                    record.operands[2..].to_vec()
+                };
+                let instr = DxilInstruction {
+                    opcode,
+                    operands,
+                    ty: None,
+                };
+                instruction_count += 1;
+                push_instr(instr);
+            }
+            FUNC_CODE_INST_EXTRACTVAL => {
+                // EXTRACTVAL: [agg(+ty?), idx0, idx1...]
+                let mut ops = Vec::new();
+                take_value_operands(&record.operands, 0, 1, &mut ops);
+                let start = 1 + usize::from(
+                    is_forward_ref(record.operands.first().copied().unwrap_or(0)),
+                );
+                ops.extend_from_slice(&record.operands[start..]);
+                let instr = DxilInstruction {
+                    opcode: 47, // extractvalue
+                    operands: ops,
+                    ty: None,
+                };
+                instruction_count += 1;
+                push_instr(instr);
+            }
+            FUNC_CODE_INST_INSERTVAL => {
+                // INSERTVAL: [agg(+ty?), val(+ty?), idx0...]
+                let mut ops = Vec::new();
+                let idx = take_value_operands(&record.operands, 0, 2, &mut ops);
+                ops.extend_from_slice(&record.operands[idx..]);
+                let instr = DxilInstruction {
+                    opcode: 48, // insertvalue
+                    operands: ops,
+                    ty: None,
+                };
+                instruction_count += 1;
+                push_instr(instr);
+            }
+            FUNC_CODE_INST_UNREACHABLE => {
+                let instr = DxilInstruction {
+                    opcode: 52, // unreachable
+                    operands: Vec::new(),
+                    ty: None,
+                };
+                instruction_count += 1;
+                push_instr(instr);
+            }
+            _ => {
+                // Unknown function record - ignore. The reader's marker
+                // records for undecodable abbreviations have id 0xFFFF.
+                if record.id != 0xFFFF {
+                    instruction_count += 1;
+                }
+            }
         }
     }
 
@@ -3335,12 +3651,11 @@ fn parse_function_block(
     let func = if !basic_blocks.is_empty() {
         Some(DxilFunction {
             name: if fn_name.is_empty() {
-                format!("_fn_0")
+                "_fn_0".to_string()
             } else {
                 fn_name.clone()
             },
             basic_blocks,
-            num_instructions: instruction_count,
         })
     } else {
         None
@@ -3349,32 +3664,57 @@ fn parse_function_block(
     Ok((instruction_count, fn_name, func))
 }
 
+/// Copy up to `count` value operands from `ops` starting at `start`, skipping
+/// the type operand that `PushValueAndType` appends after forward references.
+/// Returns the index just past the consumed operands.
+fn take_value_operands(ops: &[u32], start: usize, count: usize, out: &mut Vec<u32>) -> usize {
+    let mut idx = start;
+    let mut taken = 0usize;
+    while taken < count && idx < ops.len() {
+        let value = ops[idx];
+        out.push(value);
+        idx += 1;
+        taken += 1;
+        if is_forward_ref(value) {
+            idx += 1; // appended type id
+        }
+    }
+    idx
+}
+
+/// Resolve a type-table index to a descriptor, defaulting on out-of-range.
+fn type_desc(reader: &LlvmBitcodeReader, index: u32) -> Option<TypeDesc> {
+    reader
+        .type_table
+        .get(index as usize)
+        .copied()
+        .or(Some(TypeDesc::default()))
+}
+
 /// Parse an IDENTIFICATION block (block_id 13) — DXIL stores the entry function name here.
 fn parse_identification_block(reader: &mut LlvmBitcodeReader) -> AppResult<Option<String>> {
     let mut entry_name = None;
 
-    loop {
-        match reader.read_record() {
-            Some(record) => {
-                if record.id == 1 && !record.operands.is_empty() {
-                    // Entry name encoded as VBR6 characters
-                    let name: String = record
-                        .operands
-                        .iter()
-                        .map(|&c| {
-                            if c > 0 && c < 128 {
-                                c as u8 as char
-                            } else {
-                                '?'
-                            }
-                        })
-                        .collect();
-                    if !name.is_empty() {
-                        entry_name = Some(name);
+    while let Some(entry) = reader.next_entry(true) {
+        let BitcodeEntry::Record(record) = entry else {
+            break;
+        };
+        if record.id == 1 && !record.operands.is_empty() {
+            // Entry name encoded as VBR6 characters
+            let name: String = record
+                .operands
+                .iter()
+                .map(|&c| {
+                    if c > 0 && c < 128 {
+                        c as u8 as char
+                    } else {
+                        '?'
                     }
-                }
+                })
+                .collect();
+            if !name.is_empty() {
+                entry_name = Some(name);
             }
-            None => break,
         }
     }
 
@@ -3504,36 +3844,195 @@ fn generate_msl_from_parsed_dxil(
             msl_lines.push(String::new());
         }
         msl_lines.push(format!("    // function: {}", func.name));
-        for bb in &func.basic_blocks {
-            msl_lines.push(format!("    {{ // block: {}", bb.label));
+
+        // Basic-block CFG derived from the terminator instructions, used to
+        // lower phi nodes on their incoming edges.
+        let block_count = func.basic_blocks.len();
+        let mut predecessors: Vec<Vec<u32>> = vec![Vec::new(); block_count];
+        for (bi, bb) in func.basic_blocks.iter().enumerate() {
+            let terminator = bb
+                .instructions
+                .iter()
+                .rev()
+                .find(|i| matches!(i.opcode, 36..=38));
+            if let Some(term) = terminator {
+                let succs: Vec<u32> = match term.opcode {
+                    36 => term.operands.first().copied().into_iter().collect(),
+                    37 => term.operands[1..].to_vec(),
+                    _ => {
+                        let mut succs = term.operands.get(1).copied().into_iter().collect::<Vec<_>>();
+                        for k in (2..term.operands.len()).step_by(2) {
+                            if let Some(&dest) = term.operands.get(k + 1) {
+                                succs.push(dest);
+                            }
+                        }
+                        succs
+                    }
+                };
+                for succ in succs {
+                    if (succ as usize) < block_count {
+                        predecessors[succ as usize].push(bi as u32);
+                    }
+                }
+            }
+        }
+
+        // Value-ID registry: relative operands resolve to the temp of the
+        // instruction defined `v` non-void instructions earlier. Types are
+        // tracked alongside so signedness/floatness can be passed to the
+        // emitter instead of being guessed.
+        let mut value_ids: BTreeMap<u32, String> = BTreeMap::new();
+        let mut value_types: BTreeMap<u32, TypeDesc> = BTreeMap::new();
+        let mut cur_ordinal = 0u32;
+
+        // Resolve a relative value operand at the current ordinal.
+        let resolve_value = |value: u32, cur: u32, ids: &BTreeMap<u32, String>| -> String {
+            if value != 0 && value <= cur {
+                let def = cur - value;
+                if let Some(name) = ids.get(&def) {
+                    return name.clone();
+                }
+            }
+            // Constants, parameters and forward references: emit the raw id.
+            value.to_string()
+        };
+
+        // Resolve a signed phi operand (relative, signed VBR) at the current
+        // ordinal: def = cur - diff.
+        let resolve_phi_value = |raw: u32, cur: u32, ids: &BTreeMap<u32, String>| -> String {
+            let diff = if raw & 1 == 1 {
+                -((raw >> 1) as i64)
+            } else {
+                (raw >> 1) as i64
+            };
+            let def = cur as i64 - diff;
+            if def >= 0
+                && def < cur as i64
+                && let Some(name) = ids.get(&(def as u32))
+            {
+                return name.clone();
+            }
+            raw.to_string()
+        };
+
+        // Phi edge assignments to emit at the end of each predecessor block:
+        // (pred_block_index, [(dst, value_str)...]).
+        let mut phi_edges: Vec<Vec<(String, String)>> = vec![Vec::new(); block_count];
+
+        for (bi, bb) in func.basic_blocks.iter().enumerate() {
+            msl_lines.push(format!("    bb{}:", bi));
             for instr in &bb.instructions {
                 let dst = format!("_t{}", var_counter);
                 var_counter += 1;
-                let arg_strs: Vec<String> = instr
-                    .operands
-                    .iter()
-                    .enumerate()
-                    .map(|(i, &op)| {
-                        // Try to reference previous temporary values
-                        if (i as u32) < var_counter.saturating_sub(1) {
-                            format!("_t{}", i)
-                        } else {
-                            op.to_string()
+                let opcode = instr.opcode;
+                let mut arg_strs: Vec<String> = Vec::new();
+                match opcode {
+                    // Unconditional branch: [dest_bb]
+                    36 => {
+                        arg_strs = instr.operands.iter().map(|d| format!("bb{}", d)).collect();
+                    }
+                    // Conditional branch: [cond, then_bb, else_bb]
+                    37 => {
+                        if let Some(&cond) = instr.operands.first() {
+                            arg_strs.push(resolve_value(cond, cur_ordinal, &value_ids));
                         }
-                    })
-                    .collect();
-                let is_signed = false; // Could be determined from type analysis
-                let is_float = instr.opcode >= 1 && instr.opcode <= 8
-                    || (instr.opcode >= 13 && instr.opcode <= 17)
-                    || (instr.opcode >= 28 && instr.opcode <= 29);
-                let msl_stmt =
-                    dxil_opcode_to_msl(instr.opcode, &dst, &arg_strs, is_signed, is_float);
-                msl_lines.push(format!("        {} // opcode={}", msl_stmt, instr.opcode));
+                        arg_strs.push(format!("bb{}", instr.operands.get(1).copied().unwrap_or(0)));
+                        arg_strs.push(format!("bb{}", instr.operands.get(2).copied().unwrap_or(0)));
+                    }
+                    // Switch: [cond, default_bb, (case, dest_bb)...]
+                    38 => {
+                        if let Some(&cond) = instr.operands.first() {
+                            arg_strs.push(resolve_value(cond, cur_ordinal, &value_ids));
+                        }
+                        arg_strs.push(format!("bb{}", instr.operands.get(1).copied().unwrap_or(0)));
+                        for k in (2..instr.operands.len()).step_by(2) {
+                            arg_strs.push(instr.operands[k].to_string());
+                            arg_strs.push(format!(
+                                "bb{}",
+                                instr.operands.get(k + 1).copied().unwrap_or(0)
+                            ));
+                        }
+                    }
+                    // Phi: [(val#signed, pred_bb)...]; values are assigned on
+                    // the incoming edges below.
+                    39 => {
+                        let mut pairs: Vec<(String, u32)> = Vec::new();
+                        let mut k = 0;
+                        while k + 1 < instr.operands.len() {
+                            let value =
+                                resolve_phi_value(instr.operands[k], cur_ordinal, &value_ids);
+                            pairs.push((value, instr.operands[k + 1]));
+                            k += 2;
+                        }
+                        // Emit edge assignments in each predecessor, and a
+                        // fallback assignment when the incoming block is not
+                        // in the CFG (e.g. the entry block).
+                        if let Some(first_value) = pairs.first().map(|(v, _)| v) {
+                            let preds = predecessors.get(bi).cloned().unwrap_or_default();
+                            if preds.is_empty() {
+                                arg_strs.push(first_value.clone());
+                            } else {
+                                for pred in &preds {
+                                    let value = pairs
+                                        .iter()
+                                        .find(|(_, bb_idx)| bb_idx == pred)
+                                        .map(|(v, _)| v.clone())
+                                        .unwrap_or_else(|| first_value.clone());
+                                    phi_edges[*pred as usize].push((dst.clone(), value));
+                                }
+                            }
+                        }
+                    }
+                    _ => {
+                        // Value operands (relative encoding).
+                        arg_strs = instr
+                            .operands
+                            .iter()
+                            .map(|&v| resolve_value(v, cur_ordinal, &value_ids))
+                            .collect();
+                    }
+                }
+
+                // Signedness/floatness: prefer the record's explicit type,
+                // otherwise derive from the first value operand's definition.
+                let (is_signed, is_float) = match instr.ty {
+                    Some(ty) => (ty.is_signed, ty.is_float),
+                    None => {
+                        let ty = instr
+                            .operands
+                            .first()
+                            .copied()
+                            .filter(|&v| v != 0 && v <= cur_ordinal)
+                            .and_then(|v| value_types.get(&(cur_ordinal - v)).copied())
+                            .unwrap_or_default();
+                        (ty.is_signed, ty.is_float)
+                    }
+                };
+
+                let msl_stmt = if opcode == 42 {
+                    // alloca: emit an actual declaration so later loads and
+                    // stores can index it.
+                    let ty = msl_type_name(&instr.ty.unwrap_or_default());
+                    format!("{} {}[1]; // alloca", ty, dst)
+                } else {
+                    dxil_opcode_to_msl(opcode, &dst, &arg_strs, is_signed, is_float)
+                };
+                msl_lines.push(format!("        {} // opcode={}", msl_stmt, opcode));
+
+                // Register this instruction's temp and type for later
+                // operand resolution. Void instructions consume no value ID.
+                if !instruction_is_void(opcode) {
+                    value_ids.insert(cur_ordinal, dst.clone());
+                    value_types.insert(cur_ordinal, instr.ty.unwrap_or_else(|| TypeDesc {
+                        is_float,
+                        is_signed,
+                        ..TypeDesc::default()
+                    }));
+                    cur_ordinal += 1;
+                }
 
                 // Build TranslatedInstruction entry
-                let is_barrier = matches!(
-                    instr.opcode,
-                    74 | 75 | 76 | 77 | 78 | 79 // DXIL barrier opcodes
+                let is_barrier = matches!(instr.opcode, 74..=79 // DXIL barrier opcodes
                 );
                 let barrier_flags = if is_barrier {
                     vec!["mem_threadgroup".to_string(), "mem_device".to_string()]
@@ -3559,7 +4058,14 @@ fn generate_msl_from_parsed_dxil(
                     is_threadgroup_mem: is_tg_mem,
                 });
             }
-            msl_lines.push("    }".to_string());
+
+            // Phi edge assignments for successors of this block: emitted
+            // before the terminator so the values are live on entry.
+            if let Some(edges) = phi_edges.get(bi) {
+                for (dst, value) in edges {
+                    msl_lines.push(format!("        {} = {}; // phi edge", dst, value));
+                }
+            }
         }
     }
 
@@ -3572,6 +4078,32 @@ fn generate_msl_from_parsed_dxil(
     let base_msl = generator.generate();
 
     Ok(base_msl)
+}
+
+/// Map a type descriptor to a scalar MSL type name.
+fn msl_type_name(desc: &TypeDesc) -> String {
+    let base = if desc.is_float {
+        match desc.width {
+            16 => "half",
+            64 => "double",
+            _ => "float",
+        }
+    } else if desc.is_pointer {
+        "uintptr_t"
+    } else {
+        match desc.width {
+            1 | 8 => "char",
+            16 => "short",
+            64 => "long",
+            _ => "int",
+        }
+    };
+    if desc.is_vector {
+        let len = desc.vector_len.clamp(2, 4);
+        format!("{}{}", base, len)
+    } else {
+        base.to_string()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3615,24 +4147,39 @@ pub fn translate_shader(
     let mut function_mapping = BTreeMap::new();
     function_mapping.insert(entry_name.clone(), metal_function.clone());
 
-    // Parse the DXIL program bitcode for actual instruction-level translation
-    let parsed_program_result = if parsed.instruction_count > 0 && input.dxil.len() > 64 {
-        let prog_offset = find_prog_part_offset(&input.dxil);
-        if let Some(prog_start) = prog_offset {
-            let bitcode_bytes = &input.dxil[prog_start..];
-            parse_dxil_program_bitcode(bitcode_bytes).ok()
-        } else {
-            None
+    // Parse the DXIL program bitcode for actual instruction-level translation.
+    // Real LLVM bitcode that fails to parse is a hard error (failing_pass
+    // "bitcode_parse"); containers whose PROG part carries no bitcode at all
+    // produce an empty program instead of failing translation.
+    let parsed_program = if parsed.instruction_count > 0 && input.dxil.len() > 64 {
+        match find_prog_part_offset(&input.dxil) {
+            Some(prog_start) => {
+                let bitcode_bytes = &input.dxil[prog_start..];
+                if bitcode_bytes.starts_with(b"BC\xc0\xde") {
+                    parse_dxil_program_bitcode(bitcode_bytes).map_err(|error| {
+                        shader_error(input, &dxil_hash, "bitcode_parse", error)
+                    })?
+                } else {
+                    ParsedDxilProgram {
+                        entry_name: entry_name.clone(),
+                        functions: Vec::new(),
+                        instruction_count: parsed.instruction_count,
+                    }
+                }
+            }
+            None => ParsedDxilProgram {
+                entry_name: entry_name.clone(),
+                functions: Vec::new(),
+                instruction_count: parsed.instruction_count,
+            },
         }
     } else {
-        None
+        ParsedDxilProgram {
+            entry_name: entry_name.clone(),
+            functions: Vec::new(),
+            instruction_count: parsed.instruction_count,
+        }
     };
-
-    let parsed_program = parsed_program_result.unwrap_or_else(|| ParsedDxilProgram {
-        entry_name: entry_name.clone(),
-        functions: Vec::new(),
-        instruction_count: parsed.instruction_count,
-    });
 
     let msl_source = generate_msl_from_parsed_dxil(
         &parsed,
@@ -3670,13 +4217,21 @@ pub fn translate_shader(
 }
 
 /// Find the offset of the PROG part payload (the LLVM bitcode) within a DXIL blob.
+///
+/// This pipeline uses a pinned custom PROG payload layout: the part payload is
+/// a 24-byte program header (instruction count, IR size, threadgroup size,
+/// resource use count) followed by the use table and the LLVM bitcode. The
+/// container part descriptor's offset points at that 24-byte header, so the
+/// bitcode starts at `part_off + 24`. (Standard DXIL containers carry a
+/// 12-byte part header before the program header; this format intentionally
+/// does not, and `parse_program_part` validates the header fields.)
 fn find_prog_part_offset(dxil: &[u8]) -> Option<usize> {
     let mut off = 12;
     while off + 12 <= dxil.len() {
         if off + 4 <= dxil.len() && &dxil[off..off + 4] == b"PROG" {
             let part_off = u32::from_le_bytes(dxil[off + 4..off + 8].try_into().unwrap()) as usize;
             let _part_sz = u32::from_le_bytes(dxil[off + 8..off + 12].try_into().unwrap()) as usize;
-            let prog_start = part_off + 24; // skip PROG part header (24 bytes of program header)
+            let prog_start = part_off.checked_add(24)?; // skip the 24-byte program header
             if prog_start + 4 <= dxil.len() {
                 return Some(prog_start);
             }
@@ -3687,12 +4242,21 @@ fn find_prog_part_offset(dxil: &[u8]) -> Option<usize> {
     None
 }
 
-/// Compile MSL source to a Metal library (invokes metal compiler or uses cached).
+/// Compile MSL source to a Metal library.
+///
+/// Contract: this function is a placeholder that does not invoke the `metal`
+/// compiler. It returns the source wrapped in a recognizable, versioned
+/// format — `MTLCOMPILED|v1|<len>|<source>` — so callers can detect that no
+/// real compilation happened (the absence of the `MTLCOMPILED|` prefix means
+/// the bytes are a real compiled library). Wiring in the async Metal compiler
+/// (async_pipeline_compiler) is future work.
 pub fn compile_msl_source(msl_source: &str, _entry_point: &str) -> AppResult<Vec<u8>> {
-    // In production, this would invoke `metal` command-line compiler or
-    // use Metal's runtime compilation APIs. For now, return the source
-    // wrapped in a recognizable format.
-    Ok(format!("MTLCOMPILED|{}|{}", msl_source.len(), msl_source).into_bytes())
+    Ok(format!(
+        "MTLCOMPILED|v1|{}|{}",
+        msl_source.len(),
+        msl_source
+    )
+    .into_bytes())
 }
 
 // ---------------------------------------------------------------------------
@@ -3832,7 +4396,10 @@ pub fn parse_root_signature(bytes: &[u8]) -> AppResult<RootSignatureInfo> {
     }
     let descriptor_count = read_u32(bytes, 0, "root descriptor count")? as usize;
     let root_constants_count = read_u32(bytes, 4, "root constant count")?;
-    checked_range(bytes, 8, descriptor_count * 6, "root descriptors")?;
+    let table_size = descriptor_count
+        .checked_mul(6)
+        .ok_or_else(|| dxil_invalid("root descriptor table is too large"))?;
+    checked_range(bytes, 8, table_size, "root descriptors")?;
     let mut descriptors = Vec::with_capacity(descriptor_count);
     for index in 0..descriptor_count {
         let offset = 8 + index * 6;
@@ -3885,6 +4452,11 @@ pub fn build_argument_buffers(root: &RootSignatureInfo) -> Vec<ArgumentBufferLay
 // ---------------------------------------------------------------------------
 
 /// Pack cbuffer fields into an MSL-compatible struct layout.
+///
+/// Follows HLSL cbuffer packing: scalars are packed 4 per 16-byte register,
+/// so `float data[N]` occupies `ceil(N * components / 4) * 16` bytes rather
+/// than `16 * N`. All arithmetic is checked; absurd field sizes saturate
+/// instead of wrapping.
 pub fn pack_cbuffer(fields: &[CbufferField]) -> PackedCbuffer {
     let mut offset = 0_u32;
     let mut register_usage = 0_u32;
@@ -3899,17 +4471,27 @@ pub fn pack_cbuffer(fields: &[CbufferField]) -> PackedCbuffer {
             } else {
                 field.cols
             };
-            16 * vector_count * array_len
+            16u32
+                .checked_mul(vector_count)
+                .and_then(|size| size.checked_mul(array_len))
+                .unwrap_or(u32::MAX)
         } else {
             let component_count = field.rows.max(field.cols).max(1);
             let element_size = component_count * scalar_size;
             if array_len > 1 {
-                16 * array_len
+                // ceil(array_len * components / 4) registers of 16 bytes
+                let scalars = array_len.saturating_mul(component_count);
+                scalars.div_ceil(4).saturating_mul(16)
             } else {
                 element_size
             }
         };
-        if is_matrix || array_len > 1 || (register_usage != 0 && register_usage + field_size > 16) {
+        if is_matrix
+            || array_len > 1
+            || register_usage
+                .checked_add(field_size)
+                .is_some_and(|total| total > 16)
+        {
             offset = align16(offset);
         }
         packed.push(PackedField {
@@ -3917,7 +4499,7 @@ pub fn pack_cbuffer(fields: &[CbufferField]) -> PackedCbuffer {
             offset,
             size_bytes: field_size,
         });
-        offset += field_size;
+        offset = offset.saturating_add(field_size);
         register_usage = if is_matrix || array_len > 1 {
             0
         } else {
@@ -3942,7 +4524,7 @@ pub fn pack_structured_fields(fields: &[StructuredField]) -> StructuredPacking {
     let mut offset = 0_u32;
     for field in fields {
         offset = align_up(offset, field.alignment.max(4));
-        offset += field.size_bytes;
+        offset = offset.saturating_add(field.size_bytes);
     }
     let stride = align_up(offset, 16);
     let packing_hash = util::sha256_bytes(
@@ -4039,19 +4621,30 @@ pub fn compile_with_cache(
         hits: 0,
         misses: 0,
         compile_stalls: 0,
+        failures: 0,
     };
     for input in inputs {
-        let key = shader_cache_key(input).expect("cache key");
+        let Ok(key) = shader_cache_key(input) else {
+            stats.failures += 1;
+            continue;
+        };
         if cache.get(&key).is_some() {
             stats.hits += 1;
             continue;
         }
         stats.misses += 1;
         stats.compile_stalls += 1;
-        if let Ok(output) = translate_shader(input) {
-            let entry =
-                build_cache_entry(&key, &output, cache.clock + 1, None).expect("cache entry");
-            cache.insert(entry);
+        match translate_shader(input) {
+            Ok(output) => {
+                if let Ok(entry) = build_cache_entry(&key, &output, cache.clock + 1, None) {
+                    cache.insert(entry);
+                } else {
+                    stats.failures += 1;
+                }
+            }
+            Err(_) => {
+                stats.failures += 1;
+            }
         }
     }
     stats
@@ -4074,7 +4667,13 @@ pub fn fuzz_summary(data: &[u8]) -> String {
             parsed.uses.len(),
             parsed.reflection_present,
         ),
-        Err(error) => format!("err:{}:{}", error.code.as_u32(), error.message),
+        Err(error) => {
+            // Error messages may embed untrusted length/format details; cap
+            // the length so the summary stays bounded and deterministic.
+            let mut message = error.message;
+            message.truncate(128);
+            format!("err:{}:{}", error.code.as_u32(), message)
+        }
     }
 }
 
@@ -4082,6 +4681,14 @@ pub fn fuzz_summary(data: &[u8]) -> String {
 // Internal parsing helpers
 // ---------------------------------------------------------------------------
 
+/// Parse the PROG part payload of the pinned custom container format.
+///
+/// Layout: `instruction_count(4) | ir_size(4) | threadgroup_x(4) |
+/// threadgroup_y(4) | threadgroup_z(4) | use_count(4) | use table
+/// (use_count × 8-byte entries) | LLVM bitcode`.
+///
+/// All header fields are validated against safety bounds; counts come from
+/// untrusted bytes so every byte extent is computed with checked arithmetic.
 fn parse_program_part(bytes: &[u8]) -> AppResult<ParsedProgram> {
     checked_range(bytes, 0, 24, "program header")?;
     let instruction_count = read_u32(bytes, 0, "instruction count")?;
@@ -4091,8 +4698,23 @@ fn parse_program_part(bytes: &[u8]) -> AppResult<ParsedProgram> {
         y: read_u32(bytes, 12, "threadgroup y")?,
         z: read_u32(bytes, 16, "threadgroup z")?,
     };
+    if instruction_count > MAX_INSTRUCTIONS {
+        return Err(dxil_invalid("DXIL instruction count exceeds safety limit"));
+    }
+    if ir_size > MAX_IR_SIZE {
+        return Err(dxil_invalid("DXIL IR size exceeds safety limit"));
+    }
+    if threadgroup_size.x > 1024 || threadgroup_size.y > 1024 || threadgroup_size.z > 1024 {
+        return Err(dxil_invalid("DXIL threadgroup size exceeds safety limit"));
+    }
     let use_count = read_u32(bytes, 20, "resource use count")? as usize;
-    checked_range(bytes, 24, use_count * 8, "resource use table")?;
+    if use_count > 4096 {
+        return Err(dxil_invalid("DXIL resource use count exceeds safety limit"));
+    }
+    let table_size = use_count
+        .checked_mul(8)
+        .ok_or_else(|| dxil_invalid("DXIL resource use table is too large"))?;
+    checked_range(bytes, 24, table_size, "resource use table")?;
     let mut uses = Vec::with_capacity(use_count);
     for index in 0..use_count {
         let offset = 24 + index * 8;
@@ -4132,7 +4754,11 @@ fn parse_reflection_part(
 ) -> AppResult<ReflectionTable> {
     checked_range(bytes, 0, 4, "reflection resource count")?;
     let resource_count = read_u32(bytes, 0, "reflection resource count")? as usize;
-    checked_range(bytes, 4, resource_count * 7 + 4, "reflection resources")?;
+    let resources_size = resource_count
+        .checked_mul(7)
+        .and_then(|size| size.checked_add(4))
+        .ok_or_else(|| dxil_invalid("reflection resource table is too large"))?;
+    checked_range(bytes, 4, resources_size, "reflection resources")?;
     let mut resources = Vec::with_capacity(resource_count);
     for index in 0..resource_count {
         let offset = 4 + index * 7;
@@ -4146,14 +4772,18 @@ fn parse_reflection_part(
             format: parse_format_code(bytes[offset + 6]).to_string(),
         });
     }
-    let cbuffer_base = 4 + resource_count * 7;
+    let cbuffer_base = 4usize
+        .checked_add(
+            resource_count
+                .checked_mul(7)
+                .ok_or_else(|| dxil_invalid("reflection resource table is too large"))?,
+        )
+        .ok_or_else(|| dxil_invalid("reflection resource table is too large"))?;
     let cbuffer_count = read_u32(bytes, cbuffer_base, "reflection cbuffer count")? as usize;
-    checked_range(
-        bytes,
-        cbuffer_base + 4,
-        cbuffer_count * 8,
-        "reflection cbuffers",
-    )?;
+    let cbuffers_size = cbuffer_count
+        .checked_mul(8)
+        .ok_or_else(|| dxil_invalid("reflection cbuffer table is too large"))?;
+    checked_range(bytes, cbuffer_base + 4, cbuffers_size, "reflection cbuffers")?;
     let mut cbuffers = Vec::with_capacity(cbuffer_count);
     for index in 0..cbuffer_count {
         let offset = cbuffer_base + 4 + index * 8;
@@ -4188,6 +4818,9 @@ fn cross_check_reflection(
     parsed: &ParsedDxilContainer,
     reflection: &ReflectionTable,
 ) -> AppResult<()> {
+    // Every resource used by the bytecode must be present in the reflection
+    // table; extra reflection entries (benign drift between the custom use
+    // table and the RFLX part) are tolerated.
     let expected_resources = parsed
         .uses
         .iter()
@@ -4209,32 +4842,30 @@ fn cross_check_reflection(
         .iter()
         .map(|resource| (resource.kind, resource.register, resource.space))
         .collect::<BTreeSet<_>>();
-    if expected_resources != actual_resources {
+    if !expected_resources.is_subset(&actual_resources) {
         return Err(dxil_invalid(
             "reflection/resources do not match DXIL bytecode usage",
         ));
     }
-    let expected_cbuffers = parsed
-        .uses
-        .iter()
-        .filter_map(|use_entry| match use_entry.kind {
-            ProgramBindingKind::Cbuffer => Some((
-                use_entry.register,
-                use_entry.space,
-                use_entry.size_bytes.unwrap_or(0),
-            )),
-            _ => None,
-        })
-        .collect::<BTreeSet<_>>();
-    let actual_cbuffers = reflection
-        .cbuffers
-        .iter()
-        .map(|cbuffer| (cbuffer.register, cbuffer.space, cbuffer.size_bytes))
-        .collect::<BTreeSet<_>>();
-    if expected_cbuffers != actual_cbuffers {
-        return Err(dxil_invalid(
-            "reflection/cbuffer usage does not match DXIL bytecode usage",
-        ));
+    // Cbuffers: every use must be reflected; the size comparison is relaxed
+    // when the use table carries no size for the entry.
+    for use_entry in parsed.uses.iter().filter(|use_entry| {
+        matches!(use_entry.kind, ProgramBindingKind::Cbuffer)
+    }) {
+        let Some(actual) = reflection.cbuffers.iter().find(|cbuffer| {
+            cbuffer.register == use_entry.register && cbuffer.space == use_entry.space
+        }) else {
+            return Err(dxil_invalid(
+                "reflection/cbuffer usage does not match DXIL bytecode usage",
+            ));
+        };
+        if let Some(size) = use_entry.size_bytes
+            && actual.size_bytes != size
+        {
+            return Err(dxil_invalid(
+                "reflection/cbuffer size does not match DXIL bytecode usage",
+            ));
+        }
     }
     Ok(())
 }
@@ -4409,7 +5040,9 @@ fn parse_format_code(byte: u8) -> &'static str {
 
 fn part_slice<'a>(bytes: &'a [u8], descriptor: &PartDescriptor) -> AppResult<&'a [u8]> {
     let start = descriptor.offset as usize;
-    let end = start + descriptor.size as usize;
+    let end = start
+        .checked_add(descriptor.size as usize)
+        .ok_or_else(|| dxil_invalid("DXIL part range is out of bounds"))?;
     bytes.get(start..end).ok_or_else(|| {
         AppError::new(
             ReasonCode::RcDxilInvalid,
@@ -4449,12 +5082,13 @@ fn align16(value: u32) -> u32 {
     align_up(value, 16)
 }
 
+/// Round `value` up to a multiple of `alignment` using checked arithmetic;
+/// overflow saturates to `u32::MAX` instead of wrapping.
 fn align_up(value: u32, alignment: u32) -> u32 {
     if alignment == 0 {
-        value
-    } else {
-        ((value + alignment - 1) / alignment) * alignment
+        return value;
     }
+    value.div_ceil(alignment).saturating_mul(alignment)
 }
 
 // ---------------------------------------------------------------------------
@@ -4561,6 +5195,7 @@ mod tests {
         let retrieved = cache.get("test_key");
         assert!(retrieved.is_some());
         assert_eq!(retrieved.unwrap().payload.mtl_library_bytes, vec![1, 2, 3]);
+        assert!(!cache.is_empty());
     }
 
     #[test]
@@ -4811,11 +5446,24 @@ mod tests {
         let encoded = entry.encode().unwrap();
         assert!(!encoded.is_empty());
 
+        // A dummy checksum must be rejected by load_encoded.
         let mut cache = ShaderCache::new(10000);
         let decoded = cache.load_encoded("test", &encoded);
-        // This will fail because checksum won't match (we set a dummy checksum)
-        // But that's expected behavior
-        assert!(decoded.is_none() || decoded.is_some());
+        assert!(decoded.is_none(), "dummy checksum should be rejected");
+
+        // A real checksum must round-trip with matching fields.
+        let valid = ShaderCacheEntry {
+            checksum: checksum_payload(&entry.payload).unwrap(),
+            ..entry
+        };
+        let encoded = valid.encode().unwrap();
+        let mut cache = ShaderCache::new(10000);
+        let decoded = cache
+            .load_encoded("test", &encoded)
+            .expect("valid checksum should decode");
+        assert_eq!(decoded.payload.mtl_library_bytes, vec![1, 2, 3]);
+        assert_eq!(decoded.payload.reflection_json, "{}");
+        assert_eq!(decoded.header.key, "test");
     }
 
     #[test]
@@ -5092,7 +5740,7 @@ mod tests {
             false,
             false,
         );
-        assert!(stmt.contains("simd_vote(a == a)"));
+        assert!(stmt.contains("simd_ballot(simd_broadcast(a, simd_lane_id()) == a)"));
     }
 
     // -----------------------------------------------------------------------
@@ -5168,7 +5816,9 @@ mod tests {
             false,
         );
         assert!(stmt.contains("Dot4AddI8Packed"));
-        assert!(stmt.contains("(int)((a >> 0) & 0xFF)"));
+        // Sign extension: the byte is shifted left and back through an
+        // arithmetic shift before multiplying.
+        assert!(stmt.contains("(int)(((int)a << 24) >> 24)"));
     }
 
     #[test]
@@ -5551,73 +6201,86 @@ mod tests {
     fn t_map_dxil_intrinsic_id_arithmetic() {
         assert_eq!(map_dxil_intrinsic_id(6), Some(DXIL_INTRIN_ABS));
         assert_eq!(map_dxil_intrinsic_id(7), Some(DXIL_INTRIN_SATURATE));
-        assert_eq!(map_dxil_intrinsic_id(8), Some(DXIL_INTRIN_MAD));
-        assert_eq!(map_dxil_intrinsic_id(56), Some(DXIL_INTRIN_ASFLOAT));
-        assert_eq!(map_dxil_intrinsic_id(57), Some(DXIL_INTRIN_ASINT));
-        assert_eq!(map_dxil_intrinsic_id(58), Some(DXIL_INTRIN_ASUINT));
+        assert_eq!(map_dxil_intrinsic_id(8), Some(DXIL_INTRIN_ISNAN));
+        assert_eq!(map_dxil_intrinsic_id(13), Some(DXIL_INTRIN_SIN));
+        assert_eq!(map_dxil_intrinsic_id(12), Some(DXIL_INTRIN_COS));
+        assert_eq!(map_dxil_intrinsic_id(56), Some(DXIL_INTRIN_DOT));
     }
 
     #[test]
     fn t_map_dxil_intrinsic_id_texture() {
-        assert_eq!(map_dxil_intrinsic_id(120), Some(DXIL_INTRIN_SAMPLE));
-        assert_eq!(map_dxil_intrinsic_id(121), Some(DXIL_INTRIN_SAMPLELEVEL));
-        assert_eq!(map_dxil_intrinsic_id(126), Some(DXIL_INTRIN_CALCULATELOD));
-        assert_eq!(
-            map_dxil_intrinsic_id(127),
-            Some(DXIL_INTRIN_CALCULATELODUNCLAMPED)
-        );
+        assert_eq!(map_dxil_intrinsic_id(60), Some(DXIL_INTRIN_SAMPLE));
+        assert_eq!(map_dxil_intrinsic_id(62), Some(DXIL_INTRIN_SAMPLELEVEL));
+        assert_eq!(map_dxil_intrinsic_id(63), Some(DXIL_INTRIN_SAMPLEGRAD));
+        assert_eq!(map_dxil_intrinsic_id(81), Some(DXIL_INTRIN_CALCULATELOD));
+        assert_eq!(map_dxil_intrinsic_id(66), Some(DXIL_INTRIN_TEXTURELOAD));
     }
 
     #[test]
     fn t_map_dxil_intrinsic_id_atomics() {
-        assert_eq!(map_dxil_intrinsic_id(136), Some(DXIL_INTRIN_ATOMICADD));
         assert_eq!(
-            map_dxil_intrinsic_id(143),
+            map_dxil_intrinsic_id(79),
             Some(DXIL_INTRIN_ATOMICCOMPAREEXCHANGE)
         );
+        // AtomicBinOp carries its operation in a constant operand and is
+        // deliberately left unmapped rather than guessed.
+        assert_eq!(map_dxil_intrinsic_id(78), None);
+    }
+
+    #[test]
+    fn t_map_dxil_intrinsic_id_thread_and_barrier() {
+        assert_eq!(map_dxil_intrinsic_id(93), Some(DXIL_INTRIN_THREADID));
+        assert_eq!(map_dxil_intrinsic_id(94), Some(DXIL_INTRIN_GROUPID));
+        assert_eq!(map_dxil_intrinsic_id(95), Some(DXIL_INTRIN_THREADGROUPID));
+        assert_eq!(map_dxil_intrinsic_id(96), Some(DXIL_INTRIN_GROUPINDEX));
+        assert_eq!(map_dxil_intrinsic_id(80), Some(DXIL_INTRIN_BARRIER));
     }
 
     #[test]
     fn t_map_dxil_intrinsic_id_wave() {
-        assert_eq!(map_dxil_intrinsic_id(190), Some(DXIL_INTRIN_WAVEACTIVE));
         assert_eq!(
-            map_dxil_intrinsic_id(193),
+            map_dxil_intrinsic_id(111),
             Some(DXIL_INTRIN_WAVEGETLANEINDEX)
         );
-        assert_eq!(map_dxil_intrinsic_id(198), Some(DXIL_INTRIN_WAVEBALLOT));
         assert_eq!(
-            map_dxil_intrinsic_id(210),
-            Some(DXIL_INTRIN_WAVEMULTIPREFIXSUM)
+            map_dxil_intrinsic_id(112),
+            Some(DXIL_INTRIN_WAVEGETLANECOUNT)
         );
-    }
-
-    #[test]
-    fn t_map_dxil_intrinsic_id_tessellation() {
-        assert_eq!(
-            map_dxil_intrinsic_id(230),
-            Some(DXIL_INTRIN_PROCESS2DQUADTESSSFACTORSAVG)
-        );
-        assert_eq!(
-            map_dxil_intrinsic_id(235),
-            Some(DXIL_INTRIN_PROCESS2DTRIANGLEFACTORSMIN)
-        );
+        assert_eq!(map_dxil_intrinsic_id(116), Some(DXIL_INTRIN_WAVEBALLOT));
+        assert_eq!(map_dxil_intrinsic_id(122), Some(DXIL_INTRIN_QUADREAD));
+        // Variant-carrying wave ops (WaveActiveOp etc.) are unmapped.
+        assert_eq!(map_dxil_intrinsic_id(119), None);
+        assert_eq!(map_dxil_intrinsic_id(121), None);
     }
 
     #[test]
     fn t_map_dxil_intrinsic_id_geometry() {
-        assert_eq!(map_dxil_intrinsic_id(240), Some(DXIL_INTRIN_EMITSTREAM));
+        assert_eq!(map_dxil_intrinsic_id(97), Some(DXIL_INTRIN_EMITSTREAM));
+        assert_eq!(map_dxil_intrinsic_id(98), Some(DXIL_INTRIN_CUTSTREAM));
         assert_eq!(
-            map_dxil_intrinsic_id(242),
+            map_dxil_intrinsic_id(99),
             Some(DXIL_INTRIN_EMITTHENCUTSTREAM)
         );
     }
 
     #[test]
     fn t_map_dxil_intrinsic_id_create_handle() {
-        assert_eq!(map_dxil_intrinsic_id(253), Some(DXIL_INTRIN_CREATEHANDLE));
+        assert_eq!(map_dxil_intrinsic_id(57), Some(DXIL_INTRIN_CREATEHANDLE));
         assert_eq!(
-            map_dxil_intrinsic_id(254),
+            map_dxil_intrinsic_id(217),
             Some(DXIL_INTRIN_CREATEHANDLEFORBINDING)
+        );
+    }
+
+    #[test]
+    fn t_map_dxil_intrinsic_id_dot4() {
+        assert_eq!(
+            map_dxil_intrinsic_id(163),
+            Some(DXIL_INTRIN_DOT4ADDI8PACKED)
+        );
+        assert_eq!(
+            map_dxil_intrinsic_id(164),
+            Some(DXIL_INTRIN_DOT4ADDU8PACKED)
         );
     }
 
@@ -5625,6 +6288,8 @@ mod tests {
     fn t_map_dxil_intrinsic_id_unknown() {
         assert_eq!(map_dxil_intrinsic_id(0), None);
         assert_eq!(map_dxil_intrinsic_id(999), None);
+        assert_eq!(map_dxil_intrinsic_id(120), None);
+        assert_eq!(map_dxil_intrinsic_id(230), None);
     }
 
     // -----------------------------------------------------------------------
