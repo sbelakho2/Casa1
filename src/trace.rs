@@ -214,10 +214,20 @@ pub fn merge_events(
         .iter()
         .map(|category| category.as_str().to_string())
         .collect::<BTreeSet<_>>();
-    let mut merged = runner_events
+
+    // Runner and guest traces each carry their own `event_index` sequence,
+    // so a single interleaved timeline cannot be reconstructed from the
+    // indices alone. Within each source the events are ordered by their
+    // original index (restoring chronology after category filtering), and
+    // the merged output keeps runner events first, then guest events.
+    // `event_index` is then re-assigned in that merged order.
+    let mut runner_events = runner_events
         .into_iter()
         .filter(|event| allowed.contains(&event.category))
         .collect::<Vec<_>>();
+    runner_events.sort_by_key(|event| event.event_index);
+
+    let mut merged = runner_events;
 
     if guest_trace_path.exists() {
         let guest_contents = fs::read_to_string(guest_trace_path).map_err(|error| {
@@ -227,7 +237,7 @@ pub fn merge_events(
                 &error,
             )
         })?;
-        let guest_events =
+        let mut guest_events =
             serde_json::from_str::<Vec<TraceEvent>>(&guest_contents).map_err(|error| {
                 AppError::new(
                     ReasonCode::RcIo,
@@ -235,6 +245,7 @@ pub fn merge_events(
                 )
                 .with_hint(error.to_string())
             })?;
+        guest_events.sort_by_key(|event| event.event_index);
         merged.extend(
             guest_events
                 .into_iter()
@@ -530,7 +541,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bad_utf8_trace.json");
         // Write invalid UTF-8 bytes
-        std::fs::write(&path, &[0xFF, 0xFE, 0x00, 0x01]).unwrap();
+        std::fs::write(&path, [0xFF, 0xFE, 0x00, 0x01]).unwrap();
         let result = load_trace(&path);
         assert!(result.is_err(), "loading invalid UTF-8 should fail");
     }

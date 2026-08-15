@@ -1,10 +1,12 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 // ---------------------------------------------------------------------------
 // Data structures
@@ -66,23 +68,12 @@ pub struct GapPrioritizationItem {
 }
 
 /// The full telemetry data set, serialisable to JSON.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TelemetryData {
     pub unsupported_imports: BTreeMap<String, UnsupportedImportEntry>,
     pub unsupported_methods: BTreeMap<String, UnsupportedMethodEntry>,
     pub shader_models: BTreeMap<String, ShaderModelEntry>,
     pub unimplemented_instructions: BTreeMap<String, UnimplementedInstructionEntry>,
-}
-
-impl Default for TelemetryData {
-    fn default() -> Self {
-        Self {
-            unsupported_imports: BTreeMap::new(),
-            unsupported_methods: BTreeMap::new(),
-            shader_models: BTreeMap::new(),
-            unimplemented_instructions: BTreeMap::new(),
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -94,12 +85,23 @@ impl Default for TelemetryData {
 ///
 /// All recording methods take `&self` because they synchronise internally
 /// via `std::sync::Mutex`.  The collector can optionally persist its state
-/// to a JSON file on disk at a configurable path.
+/// to a JSON file on disk at a configurable path. Persistence is batched:
+/// the full dataset is serialized at most once per
+/// [`AUTO_PERSIST_INTERVAL`], plus on explicit [`TelemetryCollector::persist_to`]
+/// and on `Drop`, so recorders on hot failure paths never pay O(dataset) I/O
+/// per event.
 pub struct TelemetryCollector {
     data: Mutex<TelemetryData>,
     persistence_path: Mutex<Option<String>>,
-    enabled: Mutex<bool>,
+    enabled: AtomicBool,
+    /// Set when in-memory data changed since the last successful persist.
+    dirty: AtomicBool,
+    /// When the last persist ran, for throttling.
+    last_persist: Mutex<Instant>,
 }
+
+/// Minimum interval between automatic background persists.
+const AUTO_PERSIST_INTERVAL: Duration = Duration::from_secs(2);
 
 impl TelemetryCollector {
     /// Creates a new collector with telemetry **disabled** by default.
@@ -110,17 +112,22 @@ impl TelemetryCollector {
         Self {
             data: Mutex::new(TelemetryData::default()),
             persistence_path: Mutex::new(None),
-            enabled: Mutex::new(false),
+            enabled: AtomicBool::new(false),
+            dirty: AtomicBool::new(false),
+            last_persist: Mutex::new(Instant::now()),
         }
     }
 
     /// Creates a new collector that will automatically persist to `path`
-    /// after every recording call.  Telemetry is **disabled** by default.
+    /// (throttled, see [`AUTO_PERSIST_INTERVAL`]).  Telemetry is **disabled**
+    /// by default.
     pub fn with_persistence_path(path: &str) -> Self {
         Self {
             data: Mutex::new(TelemetryData::default()),
             persistence_path: Mutex::new(Some(path.to_string())),
-            enabled: Mutex::new(false),
+            enabled: AtomicBool::new(false),
+            dirty: AtomicBool::new(false),
+            last_persist: Mutex::new(Instant::now()),
         }
     }
 
@@ -129,28 +136,28 @@ impl TelemetryCollector {
         Self {
             data: Mutex::new(TelemetryData::default()),
             persistence_path: Mutex::new(None),
-            enabled: Mutex::new(true),
+            enabled: AtomicBool::new(true),
+            dirty: AtomicBool::new(false),
+            last_persist: Mutex::new(Instant::now()),
         }
     }
 
     /// Opt in to telemetry collection.  After calling this, all `record_*`
     /// methods will store entries.
     pub fn opt_in(&self) {
-        let mut enabled = self.enabled.lock().unwrap();
-        *enabled = true;
+        self.enabled.store(true, Ordering::Relaxed);
     }
 
     /// Opt out of telemetry collection.  After calling this, all `record_*`
     /// methods become no-ops.  Previously recorded data is retained (call
     /// [`clear`] to remove it).
     pub fn opt_out(&self) {
-        let mut enabled = self.enabled.lock().unwrap();
-        *enabled = false;
+        self.enabled.store(false, Ordering::Relaxed);
     }
 
     /// Returns `true` if telemetry collection is currently enabled.
     pub fn is_enabled(&self) -> bool {
-        *self.enabled.lock().unwrap()
+        self.enabled.load(Ordering::Relaxed)
     }
 
     /// Sets (or clears) the persistence path.
@@ -171,25 +178,27 @@ impl TelemetryCollector {
     /// Records an unsupported PE import (`dll!symbol`).
     /// No-op if telemetry is disabled.
     pub fn record_unsupported_import(&self, dll: &str, symbol: &str) {
-        if !self.is_enabled() {
+        if !self.enabled.load(Ordering::Relaxed) {
             return;
         }
         let now = now_secs();
-        let mut data = self.data.lock().unwrap();
-        let key = format!("{}!{}", dll, symbol);
-        let entry = data
-            .unsupported_imports
-            .entry(key)
-            .or_insert_with(|| UnsupportedImportEntry {
-                dll: dll.to_string(),
-                symbol: symbol.to_string(),
-                frequency: 0,
-                first_seen: now,
-                last_seen: now,
-            });
-        entry.frequency += 1;
-        entry.last_seen = now;
-        drop(data);
+        {
+            let mut data = self.data.lock().unwrap();
+            let key = format!("{}!{}", dll, symbol);
+            let entry = data
+                .unsupported_imports
+                .entry(key)
+                .or_insert_with(|| UnsupportedImportEntry {
+                    dll: dll.to_string(),
+                    symbol: symbol.to_string(),
+                    frequency: 0,
+                    first_seen: now,
+                    last_seen: now,
+                });
+            entry.frequency += 1;
+            entry.last_seen = now;
+        }
+        self.dirty.store(true, Ordering::Relaxed);
         self.maybe_persist();
     }
 
@@ -198,71 +207,77 @@ impl TelemetryCollector {
     ///
     /// `name` is conventionally `"InterfaceName::MethodName"`.
     pub fn record_unsupported_method(&self, name: &str) {
-        if !self.is_enabled() {
+        if !self.enabled.load(Ordering::Relaxed) {
             return;
         }
         let now = now_secs();
-        let mut data = self.data.lock().unwrap();
-        let entry = data
-            .unsupported_methods
-            .entry(name.to_string())
-            .or_insert_with(|| UnsupportedMethodEntry {
-                method_name: name.to_string(),
-                frequency: 0,
-                first_seen: now,
-                last_seen: now,
-            });
-        entry.frequency += 1;
-        entry.last_seen = now;
-        drop(data);
+        {
+            let mut data = self.data.lock().unwrap();
+            let entry = data
+                .unsupported_methods
+                .entry(name.to_string())
+                .or_insert_with(|| UnsupportedMethodEntry {
+                    method_name: name.to_string(),
+                    frequency: 0,
+                    first_seen: now,
+                    last_seen: now,
+                });
+            entry.frequency += 1;
+            entry.last_seen = now;
+        }
+        self.dirty.store(true, Ordering::Relaxed);
         self.maybe_persist();
     }
 
     /// Records an unsupported shader-model request.
     /// No-op if telemetry is disabled.
     pub fn record_unsupported_shader_model(&self, requested: u32, supported: u32) {
-        if !self.is_enabled() {
+        if !self.enabled.load(Ordering::Relaxed) {
             return;
         }
         let now = now_secs();
-        let mut data = self.data.lock().unwrap();
-        let key = format!("shader_model_0x{requested:02x}_0x{supported:02x}");
-        let entry = data
-            .shader_models
-            .entry(key)
-            .or_insert_with(|| ShaderModelEntry {
-                requested,
-                supported,
-                frequency: 0,
-                first_seen: now,
-                last_seen: now,
-            });
-        entry.frequency += 1;
-        entry.last_seen = now;
-        drop(data);
+        {
+            let mut data = self.data.lock().unwrap();
+            let key = format!("shader_model_0x{requested:02x}_0x{supported:02x}");
+            let entry = data
+                .shader_models
+                .entry(key)
+                .or_insert_with(|| ShaderModelEntry {
+                    requested,
+                    supported,
+                    frequency: 0,
+                    first_seen: now,
+                    last_seen: now,
+                });
+            entry.frequency += 1;
+            entry.last_seen = now;
+        }
+        self.dirty.store(true, Ordering::Relaxed);
         self.maybe_persist();
     }
 
     /// Records an unimplemented CPU instruction.
     /// No-op if telemetry is disabled.
     pub fn record_unimplemented_instruction(&self, description: &str) {
-        if !self.is_enabled() {
+        if !self.enabled.load(Ordering::Relaxed) {
             return;
         }
         let now = now_secs();
-        let mut data = self.data.lock().unwrap();
-        let entry = data
-            .unimplemented_instructions
-            .entry(description.to_string())
-            .or_insert_with(|| UnimplementedInstructionEntry {
-                description: description.to_string(),
-                frequency: 0,
-                first_seen: now,
-                last_seen: now,
-            });
-        entry.frequency += 1;
-        entry.last_seen = now;
-        drop(data);
+        {
+            let mut data = self.data.lock().unwrap();
+            let entry = data
+                .unimplemented_instructions
+                .entry(description.to_string())
+                .or_insert_with(|| UnimplementedInstructionEntry {
+                    description: description.to_string(),
+                    frequency: 0,
+                    first_seen: now,
+                    last_seen: now,
+                });
+            entry.frequency += 1;
+            entry.last_seen = now;
+        }
+        self.dirty.store(true, Ordering::Relaxed);
         self.maybe_persist();
     }
 
@@ -275,10 +290,19 @@ impl TelemetryCollector {
         let data = self.data.lock().unwrap();
         let json_str = serde_json::to_string_pretty(&*data)
             .map_err(|e| format!("telemetry serialisation error: {e}"))?;
-        // Atomically write via a temporary file.
-        let tmp = format!("{}.tmp", path);
-        fs::write(&tmp, &json_str).map_err(|e| format!("telemetry write error: {e}"))?;
-        fs::rename(&tmp, path).map_err(|e| format!("telemetry rename error: {e}"))?;
+        // Atomically write via a unique temporary file: a fixed `{path}.tmp`
+        // would let concurrent processes clobber each other's temp file and
+        // rename half-written data into place. The temp file is removed on
+        // any failure.
+        let tmp = format!("{path}.{}.{}.tmp", std::process::id(), unique_tmp_suffix());
+        if let Err(e) = fs::write(&tmp, &json_str) {
+            let _ = fs::remove_file(&tmp);
+            return Err(format!("telemetry write error: {e}"));
+        }
+        if let Err(e) = fs::rename(&tmp, path) {
+            let _ = fs::remove_file(&tmp);
+            return Err(format!("telemetry rename error: {e}"));
+        }
         Ok(())
     }
 
@@ -330,20 +354,20 @@ impl TelemetryCollector {
 
         // --- unsupported imports ---
         let mut imports: Vec<&UnsupportedImportEntry> = data.unsupported_imports.values().collect();
-        imports.sort_by(|a, b| b.frequency.cmp(&a.frequency));
+        imports.sort_by_key(|e| Reverse(e.frequency));
 
         // --- unsupported methods ---
         let mut methods: Vec<&UnsupportedMethodEntry> = data.unsupported_methods.values().collect();
-        methods.sort_by(|a, b| b.frequency.cmp(&a.frequency));
+        methods.sort_by_key(|e| Reverse(e.frequency));
 
         // --- shader models ---
         let mut shader_models: Vec<&ShaderModelEntry> = data.shader_models.values().collect();
-        shader_models.sort_by(|a, b| b.frequency.cmp(&a.frequency));
+        shader_models.sort_by_key(|e| Reverse(e.frequency));
 
         // --- unimplemented instructions ---
         let mut insns: Vec<&UnimplementedInstructionEntry> =
             data.unimplemented_instructions.values().collect();
-        insns.sort_by(|a, b| b.frequency.cmp(&a.frequency));
+        insns.sort_by_key(|e| Reverse(e.frequency));
 
         json!({
             "generated_at": now_secs(),
@@ -451,7 +475,7 @@ impl TelemetryCollector {
         }
 
         // Sort by frequency descending
-        items.sort_by(|a, b| b.frequency.cmp(&a.frequency));
+        items.sort_by_key(|a| Reverse(a.frequency));
         items
     }
 
@@ -511,11 +535,53 @@ impl TelemetryCollector {
     // ------------------------------------------------------------------
 
     fn maybe_persist(&self) {
+        // Batch persistence: serialize and write the full dataset at most
+        // once per interval, so recorders on hot emulation failure paths
+        // never pay O(dataset) I/O per event. The dirty flag keeps the
+        // in-memory state durable across throttled intervals and on Drop.
+        if !self.dirty.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut last = self.last_persist.lock().unwrap();
+        let now = Instant::now();
+        if now.duration_since(*last) < AUTO_PERSIST_INTERVAL {
+            return;
+        }
+        *last = now;
+        drop(last);
+
         let path = self.persistence_path.lock().unwrap().clone();
-        if let Some(p) = path {
-            if let Err(e) = self.persist_to(&p) {
+        let Some(p) = path else {
+            self.dirty.store(false, Ordering::Relaxed);
+            return;
+        };
+        match self.persist_to(&p) {
+            Ok(()) => {
+                self.dirty.store(false, Ordering::Relaxed);
+            }
+            Err(e) => {
+                // Keep the dirty flag so a later flush retries the write.
                 eprintln!("[telemetry] failed to persist telemetry data: {e}");
             }
+        }
+    }
+}
+
+impl Drop for TelemetryCollector {
+    fn drop(&mut self) {
+        // Best-effort final flush so a batched session's tail is not lost.
+        if !self.dirty.load(Ordering::Relaxed) {
+            return;
+        }
+        let Ok(path) = self.persistence_path.lock() else {
+            return;
+        };
+        let Some(p) = path.clone() else {
+            return;
+        };
+        drop(path);
+        if let Err(e) = self.persist_to(&p) {
+            eprintln!("[telemetry] failed to flush telemetry data at drop: {e}");
         }
     }
 }
@@ -643,7 +709,7 @@ pub fn map_import_to_gap(dll: &str, symbol: &str) -> (Vec<String>, String) {
             vec!["7.2".to_string()],
             "Implement D3D12 thunk (Gap 7.2)".to_string(),
         ),
-        _ if dll_lower.contains("d3d10") || dll_lower.contains("d3d10") => (
+        _ if dll_lower.contains("d3d10") => (
             vec!["7.3".to_string()],
             "Implement D3D10 thunk (Gap 7.3)".to_string(),
         ),
@@ -774,6 +840,18 @@ fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+/// A cheap unique suffix for temporary persistence files: the monotonic
+/// clock mixed with a process-global counter, so concurrent writers (even in
+/// different processes) never target the same temp path.
+fn unique_tmp_suffix() -> u64 {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    now ^ COUNTER.fetch_add(1, Ordering::Relaxed).rotate_left(16)
 }
 
 // ===========================================================================
@@ -1040,7 +1118,7 @@ mod tests {
         let report = c.generate_gap_analysis_report();
         assert!(report["total_unsupported_calls"].as_u64().unwrap() > 0);
         assert!(report["unique_unsupported_items"].as_u64().unwrap() > 0);
-        assert!(report["gaps"].as_array().unwrap().len() > 0);
+        assert!(!report["gaps"].as_array().unwrap().is_empty());
     }
 
     // ── Opt-in / opt-out behavior tests ─────────────────────────────────────
