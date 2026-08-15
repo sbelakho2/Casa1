@@ -35,9 +35,11 @@ pub enum AddressFamily {
 }
 
 impl From<AddressFamily> for net::SocketAddr {
-    fn from(_af: AddressFamily) -> Self {
-        // Default to V4 any
-        net::SocketAddr::from(([0, 0, 0, 0], 0))
+    fn from(af: AddressFamily) -> Self {
+        match af {
+            AddressFamily::V4 => net::SocketAddr::from(([0, 0, 0, 0], 0)),
+            AddressFamily::V6 => net::SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], 0)),
+        }
     }
 }
 
@@ -62,7 +64,13 @@ pub struct RealDnsResolver;
 impl RealDnsResolver {
     /// Resolve a hostname to a list of socket addresses.
     pub fn resolve(host: &str, port: u16) -> AppResult<Vec<ResolvedAddr>> {
-        let addr_str = format!("{host}:{port}");
+        // Unbracketed IPv6 hosts must be bracketed for ToSocketAddrs.
+        let host_str = if host.contains(':') && !host.starts_with('[') {
+            format!("[{host}]")
+        } else {
+            host.to_string()
+        };
+        let addr_str = format!("{host_str}:{port}");
         let addrs: Vec<SocketAddr> = addr_str
             .to_socket_addrs()
             .map_err(|e| {
@@ -175,25 +183,46 @@ pub struct RealTcpListener {
     pub id: RealSocketId,
     pub listener: TcpListener,
     pub local_addr: String,
+    pub nonblocking: bool,
 }
 
 impl RealTcpListener {
     /// Accept a new incoming connection.
-    pub fn accept(&self) -> AppResult<RealTcpSocket> {
-        let (stream, peer) = self
-            .listener
-            .accept()
-            .map_err(|e| AppError::new(ReasonCode::RcIo, format!("TCP accept error: {e}")))?;
+    ///
+    /// Accepted sockets inherit the listener's non-blocking mode, and a
+    /// WouldBlock error on a non-blocking listener is reported with
+    /// [`ReasonCode::RcWinsockWouldBlock`] so callers can map it to
+    /// WSAEWOULDBLOCK.
+    pub fn accept(&mut self) -> AppResult<RealTcpSocket> {
+        let (stream, peer) = self.listener.accept().map_err(|e| {
+            if e.kind() == std::io::ErrorKind::WouldBlock {
+                AppError::new(
+                    ReasonCode::RcWinsockWouldBlock,
+                    "non-blocking accept would block",
+                )
+            } else {
+                AppError::new(ReasonCode::RcIo, format!("TCP accept error: {e}"))
+            }
+        })?;
+        if self.nonblocking {
+            stream.set_nonblocking(true).map_err(|e| {
+                AppError::new(
+                    ReasonCode::RcIo,
+                    format!("accepted socket set_nonblocking error: {e}"),
+                )
+            })?;
+        }
         Ok(RealTcpSocket {
             id: alloc_id(),
             stream,
             peer_addr: Some(peer.to_string()),
-            nonblocking: false,
+            nonblocking: self.nonblocking,
         })
     }
 
     /// Set non-blocking mode on the listener.
-    pub fn set_nonblocking(&self, nonblocking: bool) -> AppResult<()> {
+    pub fn set_nonblocking(&mut self, nonblocking: bool) -> AppResult<()> {
+        self.nonblocking = nonblocking;
         self.listener.set_nonblocking(nonblocking).map_err(|e| {
             AppError::new(
                 ReasonCode::RcIo,
@@ -313,6 +342,29 @@ impl RealTlsStream {
             .flush()
             .map_err(|e| AppError::new(ReasonCode::RcIo, format!("TLS flush error: {e}")))
     }
+
+    /// Set non-blocking mode on the underlying TCP stream.
+    pub fn set_nonblocking(&mut self, nonblocking: bool) -> AppResult<()> {
+        self.nonblocking = nonblocking;
+        self.stream
+            .get_mut()
+            .set_nonblocking(nonblocking)
+            .map_err(|e| {
+                AppError::new(
+                    ReasonCode::RcIo,
+                    format!("TLS set_nonblocking error: {e}"),
+                )
+            })
+    }
+
+    /// Set read/write timeout on the underlying TCP stream.
+    pub fn set_timeout(&mut self, timeout: Option<Duration>) -> AppResult<()> {
+        let tcp = self.stream.get_mut();
+        tcp.set_read_timeout(timeout)
+            .map_err(|e| AppError::new(ReasonCode::RcIo, format!("TLS set_read_timeout error: {e}")))?;
+        tcp.set_write_timeout(timeout)
+            .map_err(|e| AppError::new(ReasonCode::RcIo, format!("TLS set_write_timeout error: {e}")))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -334,6 +386,17 @@ pub struct RealHttpResponse {
 pub struct RealHttpClient {
     client: reqwest::blocking::Client,
     cookie_jar: Vec<crate::network::Cookie>,
+    /// Expiry timestamps (Unix seconds) for cookies, keyed by
+    /// [`cookie_key`]. Kept out of the shared `Cookie` type.
+    cookie_expiries: BTreeMap<String, u64>,
+}
+
+/// Composite key identifying a cookie in the jar.
+fn cookie_key(cookie: &crate::network::Cookie) -> String {
+    format!(
+        "{}\u{0}{}\u{0}{}",
+        cookie.name, cookie.domain, cookie.path
+    )
 }
 
 impl RealHttpClient {
@@ -354,6 +417,7 @@ impl RealHttpClient {
         Ok(Self {
             client,
             cookie_jar: Vec::new(),
+            cookie_expiries: BTreeMap::new(),
         })
     }
 
@@ -380,6 +444,7 @@ impl RealHttpClient {
         Ok(Self {
             client,
             cookie_jar: Vec::new(),
+            cookie_expiries: BTreeMap::new(),
         })
     }
 
@@ -390,7 +455,7 @@ impl RealHttpClient {
         let response = request
             .send()
             .map_err(|e| AppError::new(ReasonCode::RcIo, format!("HTTP GET {url} failed: {e}")))?;
-        self.process_response(response)
+        self.process_response(response, url)
     }
 
     /// Perform a POST request with a body.
@@ -409,7 +474,7 @@ impl RealHttpClient {
         let response = request
             .send()
             .map_err(|e| AppError::new(ReasonCode::RcIo, format!("HTTP POST {url} failed: {e}")))?;
-        self.process_response(response)
+        self.process_response(response, url)
     }
 
     /// Perform a PUT request with a body.
@@ -428,7 +493,7 @@ impl RealHttpClient {
         let response = request
             .send()
             .map_err(|e| AppError::new(ReasonCode::RcIo, format!("HTTP PUT {url} failed: {e}")))?;
-        self.process_response(response)
+        self.process_response(response, url)
     }
 
     /// Perform a DELETE request.
@@ -438,7 +503,7 @@ impl RealHttpClient {
         let response = request.send().map_err(|e| {
             AppError::new(ReasonCode::RcIo, format!("HTTP DELETE {url} failed: {e}"))
         })?;
-        self.process_response(response)
+        self.process_response(response, url)
     }
 
     /// Perform a HEAD request.
@@ -448,12 +513,13 @@ impl RealHttpClient {
         let response = request
             .send()
             .map_err(|e| AppError::new(ReasonCode::RcIo, format!("HTTP HEAD {url} failed: {e}")))?;
-        self.process_response(response)
+        self.process_response(response, url)
     }
 
     /// Download a file to disk.
     pub fn download_file(&self, url: &str, path: &std::path::Path) -> AppResult<u64> {
-        let mut response = self.client.get(url).send().map_err(|e| {
+        let request = self.add_cookie_header(self.client.get(url), url);
+        let mut response = request.send().map_err(|e| {
             AppError::new(ReasonCode::RcIo, format!("HTTP download {url} failed: {e}"))
         })?;
 
@@ -486,21 +552,39 @@ impl RealHttpClient {
     /// Load cookies from a snapshot.
     pub fn load_cookies(&mut self, cookies: Vec<crate::network::Cookie>) {
         self.cookie_jar = cookies;
+        // Snapshot cookies carry no expiry information.
+        self.cookie_expiries.clear();
     }
 
+    /// Attach a `Cookie` header containing only the cookies that match the
+    /// request origin (domain, path, secure) and are not yet expired.
     fn add_cookie_header(
         &self,
         request: reqwest::blocking::RequestBuilder,
-        _url: &str,
+        url: &str,
     ) -> reqwest::blocking::RequestBuilder {
-        // Add matching cookies to the request
-        let cookie_header: String = self
-            .cookie_jar
-            .iter()
-            .map(|c| format!("{}={}", c.name, c.value))
-            .collect::<Vec<_>>()
-            .join("; ");
+        let matching: Vec<String> = url::Url::parse(url)
+            .map(|parsed| {
+                let host = parsed.host_str().unwrap_or_default().to_lowercase();
+                let path = parsed.path().to_string();
+                let secure = parsed.scheme() == "https";
+                let now = unix_now_secs();
+                self.cookie_jar
+                    .iter()
+                    .filter(|cookie| {
+                        self.cookie_expiries
+                            .get(&cookie_key(cookie))
+                            .is_none_or(|expires| *expires > now)
+                            && crate::network::cookie_matches_origin(
+                                cookie, &host, &path, secure,
+                            )
+                    })
+                    .map(|cookie| format!("{}={}", cookie.name, cookie.value))
+                    .collect()
+            })
+            .unwrap_or_default();
 
+        let cookie_header = matching.join("; ");
         if cookie_header.is_empty() {
             request
         } else {
@@ -511,6 +595,7 @@ impl RealHttpClient {
     fn process_response(
         &mut self,
         response: reqwest::blocking::Response,
+        url: &str,
     ) -> AppResult<RealHttpResponse> {
         let status = response.status().as_u16();
         let mut headers = BTreeMap::new();
@@ -518,73 +603,267 @@ impl RealHttpClient {
             headers.insert(key.to_string(), value.to_str().unwrap_or("").to_string());
         }
 
-        // Extract Set-Cookie headers and store them
-        if let Some(set_cookies) = headers.get("set-cookie").cloned() {
-            for cookie_str in set_cookies.split(',') {
-                if let Some(cookie) = parse_set_cookie(cookie_str) {
-                    self.store_cookie(cookie);
+        // Collect Set-Cookie headers via get_all so duplicate headers are not
+        // overwritten by the BTreeMap fold above.
+        let default_host = url::Url::parse(url)
+            .ok()
+            .and_then(|parsed| parsed.host_str().map(str::to_string));
+        for cookie_str in response.headers().get_all("set-cookie") {
+            let value = match cookie_str.to_str() {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            for fragment in split_set_cookie_values(value) {
+                if let Some((cookie, expires_at)) =
+                    parse_set_cookie(&fragment, default_host.as_deref())
+                {
+                    self.store_cookie(cookie, expires_at);
                 }
             }
         }
 
-        let body = response.bytes().map_err(|e| {
-            AppError::new(
-                ReasonCode::RcIo,
-                format!("HTTP response body read error: {e}"),
-            )
-        })?;
+        // Bound the body read: a malicious server must not be able to exhaust
+        // host memory.
+        let mut body = Vec::new();
+        let mut limited = response.take(MAX_REAL_HTTP_BODY as u64 + 1);
+        let mut buf = [0u8; 16384];
+        loop {
+            match limited.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    body.extend_from_slice(&buf[..n]);
+                    if body.len() > MAX_REAL_HTTP_BODY {
+                        return Err(AppError::new(
+                            ReasonCode::RcBufferLimitExceeded,
+                            format!("HTTP response body exceeds {MAX_REAL_HTTP_BODY} bytes"),
+                        ));
+                    }
+                }
+                Err(e) => {
+                    return Err(AppError::new(
+                        ReasonCode::RcIo,
+                        format!("HTTP response body read error: {e}"),
+                    ));
+                }
+            }
+        }
 
         Ok(RealHttpResponse {
             status,
             headers,
-            body: body.to_vec(),
+            body,
         })
     }
 
-    fn store_cookie(&mut self, cookie: crate::network::Cookie) {
+    fn store_cookie(&mut self, cookie: crate::network::Cookie, expires_at: Option<u64>) {
+        let now = unix_now_secs();
+        if expires_at.is_some_and(|expires| expires <= now) {
+            return;
+        }
+        let key = cookie_key(&cookie);
         self.cookie_jar.retain(|existing| {
             !(existing.name == cookie.name
                 && existing.domain == cookie.domain
                 && existing.path == cookie.path)
         });
+        match expires_at {
+            Some(expires) => {
+                self.cookie_expiries.insert(key, expires);
+            }
+            None => {
+                self.cookie_expiries.remove(&key);
+            }
+        }
         self.cookie_jar.push(cookie);
+        if self.cookie_jar.len() > MAX_REAL_COOKIES {
+            let evicted = self.cookie_jar.remove(0);
+            self.cookie_expiries.remove(&cookie_key(&evicted));
+        }
     }
 }
 
+/// Maximum HTTP response body accepted by the real HTTP client (256 MB).
+const MAX_REAL_HTTP_BODY: usize = 256 * 1024 * 1024;
+/// Maximum number of cookies retained in the real cookie jar.
+const MAX_REAL_COOKIES: usize = 1024;
+
+/// Split a raw `Set-Cookie` header value into individual cookie strings.
+///
+/// Multiple cookies may be joined with `,` (RFC 7230 header combining), but a
+/// comma may also legitimately appear inside an attribute value such as
+/// `Expires=Wed, 09 Jun 2026 12:00:00 GMT`. A comma only separates cookies
+/// when the next segment (up to the next `,` or `;`) starts with a
+/// `name=value` token; a date fragment never does.
+fn split_set_cookie_values(header: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut chars = header.char_indices().peekable();
+    for (index, ch) in chars.by_ref() {
+        match ch {
+            '"' => {
+                in_quotes = !in_quotes;
+                current.push(ch);
+            }
+            ',' if !in_quotes => {
+                let rest = &header[index + 1..];
+                let next_segment = rest.split([';', ',']).next().unwrap_or("");
+                let first_token = next_segment.split_whitespace().next().unwrap_or("");
+                if first_token.contains('=') {
+                    if !current.trim().is_empty() {
+                        values.push(std::mem::take(&mut current).trim().to_string());
+                    }
+                    continue;
+                }
+                current.push(ch);
+            }
+            _ => current.push(ch),
+        }
+    }
+    if !current.trim().is_empty() {
+        values.push(current.trim().to_string());
+    }
+    values
+}
+
 /// Parse a Set-Cookie header value into a Cookie struct.
-fn parse_set_cookie(header: &str) -> Option<crate::network::Cookie> {
-    let parts: Vec<&str> = header.split(';').collect();
-    let name_value = parts.first()?;
+///
+/// Attribute names are compared case-insensitively (RFC 6265), `Max-Age` and
+/// `Expires` are honored, and `default_host` is used as the cookie domain when
+/// the header omits `Domain`. Already-expired cookies return `None`.
+fn parse_set_cookie(
+    header: &str,
+    default_host: Option<&str>,
+) -> Option<(crate::network::Cookie, Option<u64>)> {
+    let mut parts = header.split(';').map(str::trim);
+    let name_value = parts.next()?;
     let eq_pos = name_value.find('=')?;
     let name = name_value[..eq_pos].trim().to_string();
     let value = name_value[eq_pos + 1..].trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
 
-    let mut domain = String::new();
+    let mut domain: Option<String> = None;
     let mut path = "/".to_string();
     let mut secure = false;
+    let mut max_age: Option<u64> = None;
+    let mut expires: Option<u64> = None;
 
-    for part in &parts[1..] {
-        let part = part.trim();
-        if let Some(val) = part.strip_prefix("domain=") {
-            domain = val.trim_start_matches('.').to_string();
-        } else if let Some(val) = part.strip_prefix("path=") {
-            path = val.to_string();
-        } else if part == "secure" {
+    for part in parts {
+        let lower = part.to_ascii_lowercase();
+        if let Some(val) = lower.strip_prefix("domain=") {
+            domain = Some(val.trim_start_matches('.').to_string());
+        } else if let Some(val) = lower.strip_prefix("path=") {
+            if !val.is_empty() {
+                path = val.to_string();
+            }
+        } else if lower == "secure" {
             secure = true;
+        } else if let Some(val) = lower.strip_prefix("max-age=") {
+            max_age = val.parse::<u64>().ok();
+        } else if let Some(val) = lower.strip_prefix("expires=") {
+            expires = parse_http_date(val);
         }
     }
 
-    if domain.is_empty() {
-        domain = ".unknown".to_string();
+    let now = unix_now_secs();
+    let expires_at = match (max_age, expires) {
+        (Some(seconds), _) => Some(now.saturating_add(seconds)),
+        (None, Some(timestamp)) => Some(timestamp),
+        (None, None) => None,
+    };
+    if expires_at.is_some_and(|expires| expires <= now) {
+        return None;
     }
 
-    Some(crate::network::Cookie {
-        name,
-        value,
-        domain,
-        path,
-        secure,
-    })
+    let domain = match domain {
+        Some(domain) if !domain.is_empty() => domain,
+        // Without a Domain attribute the cookie belongs to the request host;
+        // a cookie with no known host is stored under a name that can never
+        // match, so it is never re-sent.
+        _ => default_host.unwrap_or("unknown").to_string(),
+    };
+
+    Some((
+        crate::network::Cookie {
+            name,
+            value,
+            domain,
+            path,
+            secure,
+        },
+        expires_at,
+    ))
+}
+
+/// Current Unix time in seconds.
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// Parse an RFC 7231 IMF-fixdate HTTP date (e.g. `Sun, 06 Nov 1994 08:49:37 GMT`)
+/// into Unix seconds.
+fn parse_http_date(value: &str) -> Option<u64> {
+    let value = value.trim();
+    let rest = value.rsplit_once(',').map(|(_, r)| r).unwrap_or(value);
+    let mut tokens = rest.split_whitespace();
+    let day: u32 = tokens.next()?.parse().ok()?;
+    let month = match tokens.next()? {
+        "Jan" => 1,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
+        _ => return None,
+    };
+    let year: u32 = tokens.next()?.parse().ok()?;
+    let time = tokens.next()?;
+    let mut time_parts = time.split(':');
+    let hour: u32 = time_parts.next()?.parse().ok()?;
+    let minute: u32 = time_parts.next()?.parse().ok()?;
+    let second: u32 = time_parts.next()?.parse().ok()?;
+    if hour > 23 || minute > 59 || second > 60 || day == 0 || day > 31 {
+        return None;
+    }
+    date_to_unix_secs(year, month, day, hour, minute, second)
+}
+
+/// Convert a calendar date to Unix seconds (Howard Hinnant's algorithm).
+fn date_to_unix_secs(
+    year: u32,
+    month: u32,
+    day: u32,
+    hour: u32,
+    minute: u32,
+    second: u32,
+) -> Option<u64> {
+    let (y, m) = if month <= 2 {
+        (year as i64 - 1, month + 12)
+    } else {
+        (year as i64, month)
+    };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (m as i64 - 3) + 2) / 5 + day as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    if days < 0 {
+        return None;
+    }
+    (days as u64)
+        .checked_mul(86400)?
+        .checked_add(hour as u64 * 3600 + minute as u64 * 60 + second as u64)
 }
 
 // ---------------------------------------------------------------------------
@@ -614,7 +893,15 @@ impl RealNetworkStack {
             http_client: None,
         }
     }
+}
 
+impl Default for RealNetworkStack {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RealNetworkStack {
     // -- WSA lifecycle --
 
     pub fn wsa_startup(&mut self) {
@@ -631,9 +918,9 @@ impl RealNetworkStack {
         self.last_wsa_error
     }
 
-    fn ensure_wsa(&self) -> AppResult<()> {
+    fn ensure_wsa(&mut self) -> AppResult<()> {
         if self.wsa_refcount == 0 {
-            self.last_wsa_error;
+            self.last_wsa_error = 10093; // WSANOTINITIALISED
             return Err(AppError::new(ReasonCode::RcIo, "Winsock not initialized"));
         }
         Ok(())
@@ -642,6 +929,9 @@ impl RealNetworkStack {
     // -- TCP operations --
 
     /// Connect a TCP socket to a remote address.
+    ///
+    /// Tries each resolved address in order (family/order fallback) and maps
+    /// connect failures to their WinSock error codes.
     pub fn tcp_connect(
         &mut self,
         host: &str,
@@ -650,29 +940,51 @@ impl RealNetworkStack {
     ) -> AppResult<RealSocketId> {
         self.ensure_wsa()?;
 
-        let addrs = RealDnsResolver::resolve(host, port)?;
-        let addr = addrs.first().ok_or_else(|| {
-            AppError::new(
-                ReasonCode::RcDnsNotFound,
-                format!("no address for {host}:{port}"),
-            )
-        })?;
+        let addrs = match RealDnsResolver::resolve(host, port) {
+            Ok(addrs) => addrs,
+            Err(e) => {
+                self.last_wsa_error = 11001; // WSAHOST_NOT_FOUND
+                return Err(e);
+            }
+        };
 
-        let socket_addr: SocketAddr = format!("{}:{}", addr.ip, addr.port)
-            .parse()
-            .map_err(|e| AppError::new(ReasonCode::RcIo, format!("invalid address: {e}")))?;
-
-        let stream = if let Some(t) = timeout {
-            TcpStream::connect_timeout(&socket_addr, t)
-        } else {
-            TcpStream::connect(&socket_addr)
+        let mut last_error: Option<AppError> = None;
+        let mut stream = None;
+        for addr in &addrs {
+            let socket_addr: SocketAddr = match format!("{}:{}", addr.ip, addr.port).parse() {
+                Ok(socket_addr) => socket_addr,
+                Err(e) => {
+                    last_error =
+                        Some(AppError::new(ReasonCode::RcIo, format!("invalid address: {e}")));
+                    continue;
+                }
+            };
+            let attempt = if let Some(t) = timeout {
+                TcpStream::connect_timeout(&socket_addr, t)
+            } else {
+                TcpStream::connect(socket_addr)
+            };
+            match attempt {
+                Ok(s) => {
+                    stream = Some(s);
+                    break;
+                }
+                Err(e) => {
+                    self.last_wsa_error = map_connect_error_kind(e.kind());
+                    last_error = Some(AppError::new(
+                        ReasonCode::RcIo,
+                        format!("TCP connect to {host}:{port} failed: {e}"),
+                    ));
+                }
+            }
         }
-        .map_err(|e| {
-            self.last_wsa_error = 10061; // WSAECONNREFUSED
-            AppError::new(
-                ReasonCode::RcIo,
-                format!("TCP connect to {host}:{port} failed: {e}"),
-            )
+        let stream = stream.ok_or_else(|| {
+            last_error.unwrap_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcIo,
+                    format!("no address for {host}:{port}"),
+                )
+            })
         })?;
 
         let id = alloc_id();
@@ -758,9 +1070,23 @@ impl RealNetworkStack {
             AppError::new(ReasonCode::RcIo, format!("TCP bind {addr} failed: {e}"))
         })?;
 
-        // TcpListener doesn't expose backlog directly in std; log the requested value
-        if backlog != 0 {
-            eprintln!("TCP bind: requested backlog={} (using default)", backlog);
+        // Honor the requested backlog via listen(2) (std's TcpListener uses
+        // its own default). Windows `listen(backlog)` semantics are capped at
+        // SOMAXCONN.
+        if backlog > 0 {
+            let capped_backlog = backlog.min(libc::SOMAXCONN);
+            // SAFETY: `listener` owns a valid descriptor; listen(2) only
+            // adjusts the backlog of an already-bound socket.
+            let ret = unsafe { libc::listen(listener.as_raw_fd(), capped_backlog) };
+            if ret != 0 {
+                return Err(AppError::new(
+                    ReasonCode::RcIo,
+                    format!(
+                        "listen(backlog={backlog}) failed: {}",
+                        std::io::Error::last_os_error()
+                    ),
+                ));
+            }
         }
 
         let id = alloc_id();
@@ -774,6 +1100,7 @@ impl RealNetworkStack {
                 id,
                 listener,
                 local_addr,
+                nonblocking: false,
             },
         );
         self.last_wsa_error = 0;
@@ -783,7 +1110,7 @@ impl RealNetworkStack {
     /// Accept a new connection on a listener.
     pub fn tcp_accept(&mut self, listener_id: RealSocketId) -> AppResult<RealSocketId> {
         self.ensure_wsa()?;
-        let listener = self.tcp_listeners.get(&listener_id).ok_or_else(|| {
+        let listener = self.tcp_listeners.get_mut(&listener_id).ok_or_else(|| {
             AppError::new(
                 ReasonCode::RcIo,
                 format!("unknown TCP listener {listener_id}"),
@@ -890,10 +1217,34 @@ impl RealNetworkStack {
             )
         })?;
 
-        let tcp_stream = TcpStream::connect((host, port)).map_err(|e| {
+        let addrs: Vec<SocketAddr> = (host, port)
+            .to_socket_addrs()
+            .map_err(|e| {
+                AppError::new(
+                    ReasonCode::RcIo,
+                    format!("TLS DNS resolution for {host}:{port} failed: {e}"),
+                )
+            })?
+            .collect();
+
+        let mut last_error: Option<String> = None;
+        let mut tcp_stream = None;
+        for addr in addrs {
+            match TcpStream::connect_timeout(&addr, Duration::from_secs(15)) {
+                Ok(stream) => {
+                    tcp_stream = Some(stream);
+                    break;
+                }
+                Err(e) => last_error = Some(e.to_string()),
+            }
+        }
+        let tcp_stream = tcp_stream.ok_or_else(|| {
             AppError::new(
                 ReasonCode::RcIo,
-                format!("TLS TCP connect to {host}:{port} failed: {e}"),
+                format!(
+                    "TLS TCP connect to {host}:{port} failed: {}",
+                    last_error.unwrap_or_default()
+                ),
             )
         })?;
 
@@ -951,10 +1302,8 @@ impl RealNetworkStack {
 
     /// Get or create the HTTP client.
     pub fn http_client(&mut self) -> AppResult<&mut RealHttpClient> {
-        if self.http_client.is_none() {
-            self.http_client = Some(RealHttpClient::new()?);
-        }
-        Ok(self.http_client.as_mut().unwrap())
+        let client = self.http_client.get_or_insert(RealHttpClient::new()?);
+        Ok(client)
     }
 
     /// Perform an HTTP GET request.
@@ -993,11 +1342,8 @@ impl RealNetworkStack {
     }
 
     /// Download a file via HTTP.
-    pub fn http_download(&self, url: &str, path: &std::path::Path) -> AppResult<u64> {
-        let client = self
-            .http_client
-            .as_ref()
-            .ok_or_else(|| AppError::new(ReasonCode::RcIo, "HTTP client not initialized"))?;
+    pub fn http_download(&mut self, url: &str, path: &std::path::Path) -> AppResult<u64> {
+        let client = self.http_client()?;
         client.download_file(url, path)
     }
 
@@ -1057,6 +1403,31 @@ pub fn poll_sockets(
 
     if read_fds.is_empty() && write_fds.is_empty() {
         return Ok((Vec::new(), Vec::new()));
+    }
+
+    // Guard every descriptor: FD_SET writes past the fixed-size fd_set for
+    // fds >= FD_SETSIZE (1024 on macOS), which is stack corruption.
+    for &fd in &read_fds {
+        if fd < 0 || fd as usize >= libc::FD_SETSIZE {
+            return Err(AppError::new(
+                ReasonCode::RcIo,
+                format!(
+                    "socket fd {fd} exceeds FD_SETSIZE ({})",
+                    libc::FD_SETSIZE
+                ),
+            ));
+        }
+    }
+    for &fd in &write_fds {
+        if fd < 0 || fd as usize >= libc::FD_SETSIZE {
+            return Err(AppError::new(
+                ReasonCode::RcIo,
+                format!(
+                    "socket fd {fd} exceeds FD_SETSIZE ({})",
+                    libc::FD_SETSIZE
+                ),
+            ));
+        }
     }
 
     // Use libc select()
@@ -1119,7 +1490,7 @@ pub fn poll_sockets(
     for (i, &fd) in read_fds.iter().enumerate() {
         // SAFETY: FD_ISSET reads from a valid fd_set with a bounded fd value.
         unsafe {
-            if libc::FD_ISSET(fd, &mut read_set) {
+            if libc::FD_ISSET(fd, &read_set) {
                 readable_indices.push(i);
             }
         }
@@ -1128,13 +1499,34 @@ pub fn poll_sockets(
     for (i, &fd) in write_fds.iter().enumerate() {
         // SAFETY: FD_ISSET reads from a valid fd_set with a bounded fd value.
         unsafe {
-            if libc::FD_ISSET(fd, &mut write_set) {
+            if libc::FD_ISSET(fd, &write_set) {
                 writable_indices.push(i);
             }
         }
     }
 
     Ok((readable_indices, writable_indices))
+}
+
+/// Map an `io::ErrorKind` to a WinSock error code for connect failures.
+fn map_connect_error_kind(kind: std::io::ErrorKind) -> i32 {
+    match kind {
+        std::io::ErrorKind::WouldBlock => 10035, // WSAEWOULDBLOCK
+        std::io::ErrorKind::AddrInUse => 10048,  // WSAEADDRINUSE
+        std::io::ErrorKind::ConnectionRefused => 10061, // WSAECONNREFUSED
+        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe => 10054, // WSAECONNRESET
+        std::io::ErrorKind::NotConnected => 10057, // WSAENOTCONN
+        std::io::ErrorKind::TimedOut => 10060,   // WSAETIMEDOUT
+        std::io::ErrorKind::HostUnreachable => 10065, // WSAEHOSTUNREACH
+        std::io::ErrorKind::NetworkUnreachable => 10051, // WSAENETUNREACH
+        _ => 10022, // WSAEINVAL
+    }
+}
+
+impl RealNetworkStack {
+    fn wsa_refcount_check(&self) -> u32 {
+        self.wsa_refcount
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1145,8 +1537,7 @@ pub fn poll_sockets(
 mod tests {
     use super::*;
     use std::io::{Read, Write};
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
     use std::thread;
 
     #[test]
@@ -1165,6 +1556,14 @@ mod tests {
     }
 
     #[test]
+    fn dns_resolver_resolves_unbracketed_ipv6() {
+        let addrs = RealDnsResolver::resolve("::1", 8080).unwrap();
+        assert!(!addrs.is_empty());
+        assert_eq!(addrs[0].ip, "::1");
+        assert_eq!(addrs[0].port, 8080);
+    }
+
+    #[test]
     fn dns_resolver_fails_for_invalid_host() {
         let result = RealDnsResolver::resolve("this.host.does.not.exist.invalid", 80);
         assert!(result.is_err(), "expected Err, got {result:?}");
@@ -1172,15 +1571,11 @@ mod tests {
 
     #[test]
     fn tcp_connect_and_exchange_data() {
-        let ready = Arc::new(AtomicBool::new(false));
-        let ready_clone = ready.clone();
-
-        // Start a listener in a background thread
+        let (tx, rx) = mpsc::channel();
         let handle = thread::spawn(move || {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            let local_addr = listener.local_addr().unwrap();
-            let port = local_addr.port();
-            ready_clone.store(true, Ordering::SeqCst);
+            let port = listener.local_addr().unwrap().port();
+            tx.send(port).unwrap();
 
             let (mut stream, _addr) = listener.accept().unwrap();
             let mut buf = [0u8; 64];
@@ -1189,16 +1584,17 @@ mod tests {
 
             stream.write_all(b"hello from server").unwrap();
             stream.flush().unwrap();
-            (port, listener)
+            port
         });
 
-        // Wait for the listener to be ready
-        while !ready.load(Ordering::SeqCst) {
-            thread::yield_now();
-        }
-
-        // This test is covered by tcp_loopback_with_known_port below
-        drop(handle);
+        // Wait for the listener port deterministically (no busy-spin).
+        let port = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        client.write_all(b"hello from client").unwrap();
+        let mut buf = [0u8; 64];
+        let n = client.read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"hello from server");
+        assert_eq!(handle.join().unwrap(), port);
     }
 
     #[test]
@@ -1286,21 +1682,54 @@ mod tests {
 
     #[test]
     fn parse_set_cookie_basic() {
-        let cookie =
-            parse_set_cookie("session=abc123; domain=.example.com; path=/; secure").unwrap();
+        let (cookie, expires_at) = parse_set_cookie(
+            "session=abc123; domain=.example.com; path=/; secure",
+            None,
+        )
+        .unwrap();
         assert_eq!(cookie.name, "session");
         assert_eq!(cookie.value, "abc123");
         assert_eq!(cookie.domain, "example.com");
         assert_eq!(cookie.path, "/");
         assert!(cookie.secure);
+        assert!(expires_at.is_none());
     }
 
     #[test]
     fn parse_set_cookie_minimal() {
-        let cookie = parse_set_cookie("key=value").unwrap();
+        let (cookie, _) = parse_set_cookie("key=value", None).unwrap();
         assert_eq!(cookie.name, "key");
         assert_eq!(cookie.value, "value");
         assert!(!cookie.secure);
+    }
+
+    #[test]
+    fn parse_set_cookie_case_insensitive_attributes() {
+        let (cookie, expires_at) = parse_set_cookie(
+            "key=value; DOMAIN=Example.COM; PATH=/; SECURE; Max-Age=3600",
+            Some("example.com"),
+        )
+        .unwrap();
+        assert_eq!(cookie.domain, "example.com");
+        assert_eq!(cookie.path, "/");
+        assert!(cookie.secure);
+        assert!(expires_at.is_some());
+    }
+
+    #[test]
+    fn parse_set_cookie_expired_returns_none() {
+        let cookie = parse_set_cookie("key=value; Max-Age=0", None);
+        assert!(cookie.is_none());
+    }
+
+    #[test]
+    fn split_set_cookie_preserves_expires_comma() {
+        let values = split_set_cookie_values(
+            "a=1; Expires=Wed, 09 Jun 2026 12:00:00 GMT, b=2; Path=/",
+        );
+        assert_eq!(values.len(), 2);
+        assert!(values[0].contains("Expires=Wed, 09 Jun 2026"));
+        assert_eq!(values[1], "b=2; Path=/");
     }
 
     #[test]
@@ -1341,10 +1770,16 @@ mod tests {
         stack.tcp_close(socket_id).unwrap();
         server.join().unwrap();
     }
-}
 
-impl RealNetworkStack {
-    fn wsa_refcount_check(&self) -> u32 {
-        self.wsa_refcount
+    #[test]
+    fn poll_sockets_rejects_oversized_fds() {
+        use std::os::fd::FromRawFd;
+        // SAFETY: the fd is never used — the FD_SETSIZE guard must reject it
+        // before any syscall touches it. `mem::forget` avoids dropping an
+        // owned fd that was never actually opened.
+        let fake = unsafe { TcpStream::from_raw_fd(5000) };
+        let result = poll_sockets(&[&fake], &[], None);
+        std::mem::forget(fake);
+        assert!(result.is_err(), "expected Err for fd >= FD_SETSIZE");
     }
 }

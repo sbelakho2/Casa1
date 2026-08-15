@@ -18,13 +18,13 @@ use rsa::{RsaPrivateKey, RsaPublicKey};
 use serde::{Deserialize, Serialize};
 use sha1::{Digest as _, Sha1};
 use sha2::Sha256;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::ffi::{CStr, CString};
 use std::io::{Read, Write};
 use std::net::{
     Shutdown as NetShutdown, SocketAddr as NetSocketAddr, TcpStream, ToSocketAddrs, UdpSocket,
 };
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::raw::{c_char, c_void};
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,9 +32,9 @@ use x509_cert::Certificate as X509Certificate;
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// ---------------------------------------------------------------------------
-/// QUIC/HTTP3 Support
-/// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// QUIC/HTTP3 Support
+// ---------------------------------------------------------------------------
 
 /// Protocol flags matching Windows WINHTTP_PROTOCOL_FLAGS
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,25 +77,13 @@ pub struct AltSvcEntry {
 }
 
 /// Configuration for QUIC/HTTP3 support.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct QuicConfig {
     /// Whether QUIC/HTTP3 is force-enabled (if true, an error is raised when
     /// HTTP/3 is requested but unavailable).
     pub force_enabled: bool,
     /// Whether QUIC/HTTP3 is force-disabled (if true, HTTP/3 is never used).
     pub force_disabled: bool,
-    /// Whether to log QUIC fallback events.
-    pub log_fallback: bool,
-}
-
-impl Default for QuicConfig {
-    fn default() -> Self {
-        Self {
-            force_enabled: false,
-            force_disabled: false,
-            log_fallback: true,
-        }
-    }
 }
 
 /// The current protocol being used for an HTTP connection.
@@ -122,6 +110,7 @@ pub type HttpConnectionId = u64;
 pub type HttpRequestId = u64;
 
 const WSAEWOULDBLOCK: i32 = 10035;
+const WSAEINVAL: i32 = 10022;
 const WSAEADDRINUSE: i32 = 10048;
 const WSAECONNRESET: i32 = 10054;
 const WSAENOTCONN: i32 = 10057;
@@ -150,6 +139,14 @@ pub const MAX_HTTP_HEADER_COUNT: usize = 128;
 pub const MAX_HTTP_HEADER_BYTES: usize = 256 * 1024;
 /// Maximum pending accept queue length for listening sockets.
 pub const MAX_PENDING_ACCEPT_QUEUE: usize = 128;
+/// Maximum HTTP response body size accepted by `http_get` (256 MB).
+const MAX_HTTP_RESPONSE_BODY: usize = 256 * 1024 * 1024;
+/// Read timeout for blocking HTTP responses.
+const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(15);
+/// Maximum number of retained HTTP traces and cipher-log entries.
+const MAX_HTTP_TRACE_ENTRIES: usize = 1024;
+/// Maximum number of cookies retained in a jar.
+const MAX_COOKIE_JAR_SIZE: usize = 1024;
 
 // ---------------------------------------------------------------------------
 // G8: Certificate pinning — HPKP-style public key pinning
@@ -293,6 +290,11 @@ impl PinnedCertificates {
     pub fn len(&self) -> usize {
         self.pins.len()
     }
+
+    /// Whether no pins are configured.
+    pub fn is_empty(&self) -> bool {
+        self.pins.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -361,6 +363,8 @@ struct SocketRecord {
     bound_addr: Option<SockAddr>,
     state: SocketState,
     recv_queue: VecDeque<u8>,
+    /// Whether the peer has closed the real stream (EOF observed).
+    real_eof: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -370,6 +374,8 @@ enum SocketState {
     Listening { _addr: SockAddr, _backlog: usize },
     Connected { peer: SocketId },
     ConnectedReal { _peer: SockAddr },
+    /// A non-blocking connect that is still in progress.
+    ConnectingReal { peer: SockAddr },
     Shutdown,
     Closed,
 }
@@ -581,6 +587,15 @@ impl NetworkStack {
                     format!("NetworkStack: TLS handshake with {host} failed: {e}"),
                 )
             })?;
+            tls_stream
+                .get_mut()
+                .set_read_timeout(Some(HTTP_READ_TIMEOUT))
+                .map_err(|e| {
+                    AppError::new(
+                        ReasonCode::RcNetReadFailed,
+                        format!("NetworkStack: TLS read-timeout setup failed: {e}"),
+                    )
+                })?;
 
             let request = format!(
                 "GET {request_path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nUser-Agent: Casa1/0.1.0\r\nAccept: */*\r\n\r\n"
@@ -597,8 +612,23 @@ impl NetworkStack {
             loop {
                 match tls_stream.read(&mut buf) {
                     Ok(0) => break,
-                    Ok(n) => response.extend_from_slice(&buf[..n]),
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Ok(n) => {
+                        response.extend_from_slice(&buf[..n]);
+                        if response.len() > MAX_HTTP_RESPONSE_BODY {
+                            return Err(AppError::new(
+                                ReasonCode::RcBufferLimitExceeded,
+                                format!(
+                                    "NetworkStack: HTTP response exceeds {MAX_HTTP_RESPONSE_BODY} bytes"
+                                ),
+                            ));
+                        }
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        return Err(AppError::new(
+                            ReasonCode::RcNetReadFailed,
+                            "NetworkStack: TLS read timed out",
+                        ));
+                    }
                     Err(e) => {
                         return Err(AppError::new(
                             ReasonCode::RcNetReadFailed,
@@ -612,6 +642,12 @@ impl NetworkStack {
 
         // Plain HTTP
         let mut tcp_stream = stream;
+        tcp_stream.set_read_timeout(Some(HTTP_READ_TIMEOUT)).map_err(|e| {
+            AppError::new(
+                ReasonCode::RcNetReadFailed,
+                format!("NetworkStack: HTTP read-timeout setup failed: {e}"),
+            )
+        })?;
         let request = format!(
             "GET {request_path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nUser-Agent: Casa1/0.1.0\r\nAccept: */*\r\n\r\n"
         );
@@ -627,8 +663,23 @@ impl NetworkStack {
         loop {
             match tcp_stream.read(&mut buf) {
                 Ok(0) => break,
-                Ok(n) => response.extend_from_slice(&buf[..n]),
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Ok(n) => {
+                    response.extend_from_slice(&buf[..n]);
+                    if response.len() > MAX_HTTP_RESPONSE_BODY {
+                        return Err(AppError::new(
+                            ReasonCode::RcBufferLimitExceeded,
+                            format!(
+                                "NetworkStack: HTTP response exceeds {MAX_HTTP_RESPONSE_BODY} bytes"
+                            ),
+                        ));
+                    }
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    return Err(AppError::new(
+                        ReasonCode::RcNetReadFailed,
+                        "NetworkStack: HTTP read timed out",
+                    ));
+                }
                 Err(e) => {
                     return Err(AppError::new(
                         ReasonCode::RcNetReadFailed,
@@ -643,7 +694,15 @@ impl NetworkStack {
 
 /// Parse an HTTP response into a SimpleHttpResponse.
 pub fn parse_http_response(raw: &[u8]) -> AppResult<SimpleHttpResponse> {
-    let response_str = String::from_utf8_lossy(raw);
+    // Locate the header/body separator on the raw bytes: converting to a lossy
+    // String first would skew offsets (each invalid UTF-8 byte becomes a 3-byte
+    // replacement char), which could push `body_start` past `raw.len()`.
+    let header_end = raw
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .unwrap_or(raw.len());
+    let header_bytes = &raw[..header_end];
+    let response_str = String::from_utf8_lossy(header_bytes);
 
     // Parse status line: HTTP/1.1 200 OK
     let status = if let Some(end_of_line) = response_str.find("\r\n") {
@@ -663,15 +722,11 @@ pub fn parse_http_response(raw: &[u8]) -> AppResult<SimpleHttpResponse> {
         0
     };
 
-    // Find headers and body separator
+    // Parse headers (skip the status line)
     let mut headers = BTreeMap::new();
-    let body_start;
-
-    if let Some(header_end) = response_str.find("\r\n\r\n") {
-        let header_section = &response_str[..header_end];
-        // Skip the status line, parse headers
+    if header_end < raw.len() {
         let mut header_total_bytes: usize = 0;
-        for line in header_section.lines().skip(1) {
+        for line in response_str.lines().skip(1) {
             if headers.len() >= MAX_HTTP_HEADER_COUNT {
                 return Err(AppError::new(
                     ReasonCode::RcHttpHeaderLimitExceeded,
@@ -691,11 +746,13 @@ pub fn parse_http_response(raw: &[u8]) -> AppResult<SimpleHttpResponse> {
                 headers.insert(key.to_lowercase(), value);
             }
         }
-        body_start = header_end + 4;
-    } else {
-        body_start = response_str.len();
-    };
+    }
 
+    let body_start = if header_end == raw.len() {
+        raw.len()
+    } else {
+        header_end + 4
+    };
     let body = raw[body_start..].to_vec();
 
     Ok(SimpleHttpResponse {
@@ -707,16 +764,13 @@ pub fn parse_http_response(raw: &[u8]) -> AppResult<SimpleHttpResponse> {
 
 impl Clone for NetworkStack {
     fn clone(&self) -> Self {
+        // Streams that fail to duplicate (e.g. already closed) are skipped
+        // rather than panicking the clone.
         let real_tcp_streams = self
             .real_tcp_streams
             .iter()
-            .map(|(socket, stream)| {
-                (
-                    *socket,
-                    stream
-                        .try_clone()
-                        .expect("failed to clone host TCP stream for NetworkStack"),
-                )
+            .filter_map(|(socket, stream)| {
+                stream.try_clone().ok().map(|cloned| (*socket, cloned))
             })
             .collect();
         Self {
@@ -913,6 +967,7 @@ impl NetworkStack {
         &self.cipher_log
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn add_route(
         &mut self,
         scheme: &str,
@@ -990,6 +1045,7 @@ impl NetworkStack {
                 bound_addr: None,
                 state: SocketState::Created,
                 recv_queue: VecDeque::new(),
+                real_eof: false,
             },
         );
         self.last_wsa_error = 0;
@@ -1074,6 +1130,7 @@ impl NetworkStack {
                     bound_addr: Some(addr.clone()),
                     state: SocketState::Connected { peer: socket },
                     recv_queue: VecDeque::new(),
+                    real_eof: false,
                 },
             );
             let record = self.socket_record_mut(socket)?;
@@ -1116,23 +1173,57 @@ impl NetworkStack {
                     ),
                 )
             })?;
-        let stream = TcpStream::connect(candidate).map_err(|error| {
-            self.last_wsa_error = map_wsa_error(&error);
-            AppError::new(
-                ReasonCode::RcIo,
-                format!("TCP connect to {}:{} failed: {error}", addr.host, addr.port),
-            )
-        })?;
-        stream.set_nonblocking(nonblocking).map_err(|error| {
-            self.last_wsa_error = map_wsa_error(&error);
-            AppError::new(
-                ReasonCode::RcIo,
-                format!(
-                    "failed to set nonblocking mode on {}:{}: {error}",
-                    addr.host, addr.port
-                ),
-            )
-        })?;
+
+        if nonblocking {
+            // Non-blocking connect: start the connect and return WSAEWOULDBLOCK
+            // immediately when it is still in progress, matching WinSock
+            // semantics. Completion is observed via SO_ERROR in select/recv/send.
+            let (stream, in_progress) = nonblocking_connect(&candidate).map_err(|error| {
+                self.last_wsa_error = map_wsa_error(&error);
+                AppError::new(
+                    ReasonCode::RcIo,
+                    format!("TCP connect to {}:{} failed: {error}", addr.host, addr.port),
+                )
+            })?;
+            if in_progress {
+                let local_addr = stream.local_addr().ok().map(sockaddr_from_std);
+                self.real_tcp_streams.insert(socket, stream);
+                let record = self.socket_record_mut(socket)?;
+                if record.bound_addr.is_none() {
+                    record.bound_addr = local_addr.or_else(|| Some(default_sockaddr(family)));
+                }
+                record.state = SocketState::ConnectingReal { peer: addr.clone() };
+                self.last_wsa_error = WSAEWOULDBLOCK;
+                return Err(AppError::new(
+                    ReasonCode::RcWinsockWouldBlock,
+                    format!(
+                        "non-blocking connect to {}:{} in progress",
+                        addr.host, addr.port
+                    ),
+                ));
+            }
+            let local_addr = stream.local_addr().ok().map(sockaddr_from_std);
+            self.real_tcp_streams.insert(socket, stream);
+            let record = self.socket_record_mut(socket)?;
+            if record.bound_addr.is_none() {
+                record.bound_addr = local_addr.or_else(|| Some(default_sockaddr(family)));
+            }
+            record.state = SocketState::ConnectedReal { _peer: addr };
+            self.last_wsa_error = 0;
+            return Ok(());
+        }
+
+        // Blocking connect: bound it so an unreachable host cannot stall the
+        // caller indefinitely.
+        let stream = TcpStream::connect_timeout(&candidate, Duration::from_secs(15)).map_err(
+            |error| {
+                self.last_wsa_error = map_wsa_error(&error);
+                AppError::new(
+                    ReasonCode::RcIo,
+                    format!("TCP connect to {}:{} failed: {error}", addr.host, addr.port),
+                )
+            },
+        )?;
         let local_addr = stream.local_addr().ok().map(sockaddr_from_std);
         self.real_tcp_streams.insert(socket, stream);
 
@@ -1158,6 +1249,7 @@ impl NetworkStack {
 
     pub fn send(&mut self, socket: SocketId, bytes: &[u8]) -> AppResult<usize> {
         self.ensure_wsa_started()?;
+        self.maybe_finish_connect(socket)?;
         if let Some(stream) = self.real_tcp_streams.get_mut(&socket) {
             let written = stream.write(bytes).map_err(|error| {
                 self.last_wsa_error = map_wsa_error(&error);
@@ -1200,8 +1292,18 @@ impl NetworkStack {
 
     pub fn recv(&mut self, socket: SocketId, length: usize) -> AppResult<Vec<u8>> {
         self.ensure_wsa_started()?;
+        // A zero-length recv must return immediately without touching the
+        // stream (Windows returns 0 without blocking).
+        if length == 0 {
+            self.last_wsa_error = 0;
+            return Ok(Vec::new());
+        }
+        self.maybe_finish_connect(socket)?;
         if let Some(stream) = self.real_tcp_streams.get_mut(&socket) {
-            let mut bytes = vec![0; length.max(1)];
+            // Cap the allocation: the guest-supplied length is untrusted and a
+            // huge value would OOM the host.
+            let capped = length.min(MAX_SOCKET_RECEIVE_QUEUE);
+            let mut bytes = vec![0; capped];
             let read = stream.read(&mut bytes).map_err(|error| {
                 self.last_wsa_error = map_wsa_error(&error);
                 AppError::new(
@@ -1210,6 +1312,9 @@ impl NetworkStack {
                 )
             })?;
             bytes.truncate(read);
+            if read == 0 {
+                let _ = self.socket_record_mut(socket).map(|record| record.real_eof = true);
+            }
             self.last_wsa_error = 0;
             return Ok(bytes);
         }
@@ -1229,7 +1334,10 @@ impl NetworkStack {
         let count = length.min(record.recv_queue.len());
         let mut bytes = Vec::with_capacity(count);
         for _ in 0..count {
-            bytes.push(record.recv_queue.pop_front().expect("recv queue entry"));
+            match record.recv_queue.pop_front() {
+                Some(byte) => bytes.push(byte),
+                None => break,
+            }
         }
         self.last_wsa_error = 0;
         Ok(bytes)
@@ -1269,10 +1377,27 @@ impl NetworkStack {
     pub fn closesocket(&mut self, socket: SocketId) -> AppResult<()> {
         self.ensure_wsa_started()?;
         if let Some(stream) = self.real_tcp_streams.remove(&socket) {
-            if let Err(e) = stream.shutdown(NetShutdown::Both) {
-                // Socket may already be closed or not connected; log but don't fail
-                eprintln!("closesocket: shutdown failed for socket {socket}: {e}");
+            match stream.shutdown(NetShutdown::Both) {
+                Ok(()) => {}
+                Err(e) => {
+                    // Socket may already be closed or not connected; log but don't fail
+                    eprintln!("closesocket: shutdown failed for socket {socket}: {e}");
+                }
             }
+        }
+        // Drop the listener registration so the address can be re-bound, and
+        // discard its pending-accept queue (those client sockets can never be
+        // accepted once the listener is gone).
+        self.listeners.retain(|_addr, id| *id != socket);
+        if let Some(queued) = self.pending_accept.remove(&socket) {
+            for client in queued {
+                self.sockets.remove(&client);
+                self.real_tcp_streams.remove(&client);
+            }
+        }
+        // Purge this socket from other listeners' pending-accept queues.
+        for queue in self.pending_accept.values_mut() {
+            queue.retain(|queued_id| *queued_id != socket);
         }
         self.socket_record_mut(socket)?.state = SocketState::Closed;
         self.sockets.remove(&socket);
@@ -1317,21 +1442,34 @@ impl NetworkStack {
         let mut writable = Vec::new();
         for socket in sockets {
             let record = self.socket_record(*socket)?;
-            let can_read = if let Some(stream) = self.real_tcp_streams.get(socket) {
-                bytes_available(stream)? > 0
-            } else {
-                !record.recv_queue.is_empty()
-                    || self
-                        .pending_accept
-                        .get(socket)
-                        .is_some_and(|pending| !pending.is_empty())
-            };
-            let can_write = matches!(
-                record.state,
-                SocketState::Connected { .. }
-                    | SocketState::ConnectedReal { .. }
-                    | SocketState::Listening { .. }
-            );
+            let (can_read, can_write) =
+                if let SocketState::ConnectingReal { .. } = record.state {
+                    // A non-blocking connect in progress: report writable once
+                    // it completes, and both readable+writable on failure,
+                    // matching WinSock select semantics.
+                    match self.real_tcp_streams.get(socket).map(connect_state) {
+                        Some(ConnectState::Complete) => (false, true),
+                        Some(ConnectState::Failed(_)) => (true, true),
+                        _ => (false, false),
+                    }
+                } else {
+                    let can_read = if let Some(stream) = self.real_tcp_streams.get(socket) {
+                        bytes_available(stream)? > 0 || record.real_eof
+                    } else {
+                        !record.recv_queue.is_empty()
+                            || self
+                                .pending_accept
+                                .get(socket)
+                                .is_some_and(|pending| !pending.is_empty())
+                    };
+                    let can_write = matches!(
+                        record.state,
+                        SocketState::Connected { .. }
+                            | SocketState::ConnectedReal { .. }
+                            | SocketState::Listening { .. }
+                    );
+                    (can_read, can_write)
+                };
             if can_read {
                 readable.push(*socket);
             }
@@ -1344,6 +1482,8 @@ impl NetworkStack {
 
     pub fn wsa_poll(&self, sockets: &[SocketId]) -> AppResult<Vec<PollState>> {
         let (readable, writable) = self.select(sockets)?;
+        let readable: HashSet<SocketId> = readable.into_iter().collect();
+        let writable: HashSet<SocketId> = writable.into_iter().collect();
         Ok(sockets
             .iter()
             .map(|socket| PollState {
@@ -1518,10 +1658,36 @@ impl NetworkStack {
     }
 
     pub fn close_handle(&mut self, handle: u64) {
-        self.http_requests.remove(&handle);
-        self.http_connections.remove(&handle);
-        self.http_sessions.remove(&handle);
+        if self.http_sessions.remove(&handle).is_some() {
+            let connections: Vec<HttpConnectionId> = self
+                .http_connections
+                .iter()
+                .filter(|(_id, conn)| conn.session == handle)
+                .map(|(id, _)| *id)
+                .collect();
+            for connection in connections {
+                self.close_handle(connection);
+            }
+        }
+        if self.http_connections.remove(&handle).is_some() {
+            let requests: Vec<HttpRequestId> = self
+                .http_requests
+                .iter()
+                .filter(|(_id, req)| req.connection == handle)
+                .map(|(id, _)| *id)
+                .collect();
+            for request in requests {
+                self.close_http_request(request);
+            }
+        }
+        self.close_http_request(handle);
         self.websockets.remove(&handle);
+    }
+
+    fn close_http_request(&mut self, request: HttpRequestId) {
+        self.http_requests.remove(&request);
+        self.websockets
+            .retain(|_handle, ws| ws.request_handle != request);
     }
 
     // -----------------------------------------------------------------------
@@ -1563,6 +1729,15 @@ impl NetworkStack {
             return Err(AppError::new(
                 ReasonCode::RcInvalidState,
                 "websocket_send: WebSocket is closed",
+            ));
+        }
+        let new_len = ws.send_buffer.len().saturating_add(data.len());
+        if new_len > MAX_WEBSOCKET_SEND_BUFFER {
+            return Err(AppError::new(
+                ReasonCode::RcSocketReceiveQueueFull,
+                format!(
+                    "websocket_send: send buffer exceeds limit ({MAX_WEBSOCKET_SEND_BUFFER} bytes)"
+                ),
             ));
         }
         ws.send_buffer.extend_from_slice(data);
@@ -1758,6 +1933,7 @@ impl NetworkStack {
                 proxy_override: None,
             },
         );
+        self.session_protocol_flags.insert(id, HttpProtocolFlags::new());
         id
     }
 
@@ -1779,6 +1955,7 @@ impl NetworkStack {
                 secure,
             },
         );
+        self.connection_protocols.insert(id, HttpProtocol::Http11);
         Ok(id)
     }
 
@@ -1806,10 +1983,10 @@ impl NetworkStack {
     fn send_request(
         &mut self,
         request: HttpRequestId,
-        _headers: BTreeMap<String, String>,
+        headers: BTreeMap<String, String>,
         _body: &[u8],
     ) -> AppResult<()> {
-        let (path, stack, host, secure, proxy_override) = {
+        let (path, stack, host, secure, proxy_override, connection_id) = {
             let request_record = self.http_request(request)?;
             let connection = self.http_connection(request_record.connection)?;
             let session = self.http_session(connection.session)?;
@@ -1819,6 +1996,7 @@ impl NetworkStack {
                 connection.host.clone(),
                 connection.secure,
                 session.proxy_override.clone(),
+                request_record.connection,
             )
         };
         let scheme = if secure { "https" } else { "http" };
@@ -1844,7 +2022,7 @@ impl NetworkStack {
         let cipher_suite = if secure {
             let suite =
                 self.validate_server_certificate(&host, &template.certificate_chain, true)?;
-            self.cipher_log.push(format!("{host}:{suite}"));
+            self.push_cipher_log(format!("{host}:{suite}"));
             Some(suite)
         } else {
             None
@@ -1857,7 +2035,20 @@ impl NetworkStack {
             headers: template.headers.clone(),
             body: template.body.clone(),
         });
-        self.http_traces.push(HttpTrace {
+        // Record the negotiated protocol for this connection and any Alt-Svc
+        // advertisements present in the request headers.
+        self.connection_protocols
+            .insert(connection_id, HttpProtocol::Http11);
+        if let Some(alt_svc_value) = headers.get("alt-svc") {
+            let entries = parse_alt_svc_header(alt_svc_value);
+            if !entries.is_empty() {
+                self.alt_svc_entries
+                    .entry(host.clone())
+                    .or_default()
+                    .extend(entries);
+            }
+        }
+        self.push_http_trace(HttpTrace {
             stack,
             host,
             path,
@@ -1878,7 +2069,16 @@ impl NetworkStack {
                 .ok_or_else(|| AppError::new(ReasonCode::RcIo, "request has no response"))?;
             (response.body.clone(), record.read_offset)
         };
-        let end = (read_offset + count).min(body.len());
+        // Saturating arithmetic: the guest-controlled count must not be able to
+        // overflow `read_offset + count` and panic (debug) or wrap into an
+        // out-of-bounds slice (release).
+        let end = read_offset.saturating_add(count).min(body.len());
+        if end < read_offset {
+            return Err(AppError::new(
+                ReasonCode::RcIo,
+                "read_body: invalid byte range",
+            ));
+        }
         self.http_request_mut(request)?.read_offset = end;
         Ok(body[read_offset..end].to_vec())
     }
@@ -1890,6 +2090,9 @@ impl NetworkStack {
                 && existing.path == cookie.path)
         });
         self.cookie_jar.push(cookie);
+        if self.cookie_jar.len() > MAX_COOKIE_JAR_SIZE {
+            self.cookie_jar.remove(0);
+        }
     }
 
     fn cookie_header_for_request(&self, host: &str, path: &str, secure: bool) -> String {
@@ -1899,6 +2102,22 @@ impl NetworkStack {
             .map(|cookie| format!("{}={}", cookie.name, cookie.value))
             .collect::<Vec<_>>()
             .join("; ")
+    }
+
+    fn push_http_trace(&mut self, trace: HttpTrace) {
+        self.http_traces.push(trace);
+        if self.http_traces.len() > MAX_HTTP_TRACE_ENTRIES {
+            self.http_traces
+                .drain(..self.http_traces.len() - MAX_HTTP_TRACE_ENTRIES);
+        }
+    }
+
+    fn push_cipher_log(&mut self, entry: String) {
+        self.cipher_log.push(entry);
+        if self.cipher_log.len() > MAX_HTTP_TRACE_ENTRIES {
+            self.cipher_log
+                .drain(..self.cipher_log.len() - MAX_HTTP_TRACE_ENTRIES);
+        }
     }
 
     fn ensure_wsa_started(&mut self) -> AppResult<()> {
@@ -1955,6 +2174,45 @@ impl NetworkStack {
         self.http_requests.get_mut(&request).ok_or_else(|| {
             AppError::new(ReasonCode::RcIo, format!("unknown HTTP request {request}"))
         })
+    }
+
+    /// Complete an in-flight non-blocking connect, if any.
+    ///
+    /// Returns `Ok(())` when the socket is not connecting or the connect has
+    /// finished successfully; errors with WSAEWOULDBLOCK while still in
+    /// progress and with the mapped OS error if the connect failed.
+    fn maybe_finish_connect(&mut self, socket: SocketId) -> AppResult<()> {
+        let state = self.socket_record(socket)?.state.clone();
+        let SocketState::ConnectingReal { peer } = &state else {
+            return Ok(());
+        };
+        let peer = peer.clone();
+        let progress = self
+            .real_tcp_streams
+            .get(&socket)
+            .map(connect_state)
+            .unwrap_or(ConnectState::InProgress);
+        match progress {
+            ConnectState::Complete => {
+                self.socket_record_mut(socket)?.state =
+                    SocketState::ConnectedReal { _peer: peer };
+                Ok(())
+            }
+            ConnectState::Failed(errno) => {
+                self.last_wsa_error = map_errno_to_wsa(errno);
+                Err(AppError::new(
+                    ReasonCode::RcIo,
+                    format!("TCP connect failed with OS error {errno}"),
+                ))
+            }
+            ConnectState::InProgress => {
+                self.last_wsa_error = WSAEWOULDBLOCK;
+                Err(AppError::new(
+                    ReasonCode::RcWinsockWouldBlock,
+                    "TCP connect still in progress",
+                ))
+            }
+        }
     }
 
     fn alloc_id(&mut self) -> u64 {
@@ -2018,7 +2276,146 @@ fn map_wsa_error(error: &std::io::Error) -> i32 {
         std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe => WSAECONNRESET,
         std::io::ErrorKind::NotConnected => WSAENOTCONN,
         std::io::ErrorKind::TimedOut => WSAETIMEDOUT,
-        _ => 0,
+        _ => WSAEINVAL,
+    }
+}
+
+/// Map a POSIX errno to a WinSock error code.
+fn map_errno_to_wsa(errno: i32) -> i32 {
+    match errno {
+        libc::EINPROGRESS | libc::EAGAIN => WSAEWOULDBLOCK,
+        libc::EADDRINUSE => WSAEADDRINUSE,
+        libc::ECONNREFUSED => WSAECONNREFUSED,
+        libc::ECONNRESET | libc::EPIPE => WSAECONNRESET,
+        libc::ENOTCONN => WSAENOTCONN,
+        libc::ETIMEDOUT => WSAETIMEDOUT,
+        _ => WSAEINVAL,
+    }
+}
+
+/// Query SO_ERROR for a stream, if available.
+fn so_error(stream: &TcpStream) -> Option<i32> {
+    let mut error: i32 = 0;
+    let mut len = std::mem::size_of::<i32>() as libc::socklen_t;
+    // SAFETY: getsockopt(2) with valid pointers to a stack-allocated i32.
+    let ret = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_ERROR,
+            &mut error as *mut i32 as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if ret == 0 {
+        Some(error)
+    } else {
+        None
+    }
+}
+
+/// The state of a non-blocking connect.
+enum ConnectState {
+    /// The connect is still in progress.
+    InProgress,
+    /// The connect completed successfully.
+    Complete,
+    /// The connect failed with the given errno.
+    Failed(i32),
+}
+
+/// Determine the state of a non-blocking connect via `poll(POLLOUT, 0)`.
+///
+/// `SO_ERROR` alone cannot distinguish "still connecting" from "finished":
+/// both read as 0. Polling for writability is the reliable check.
+fn connect_state(stream: &TcpStream) -> ConnectState {
+    let mut fds = [libc::pollfd {
+        fd: stream.as_raw_fd(),
+        events: libc::POLLOUT,
+        revents: 0,
+    }];
+    // SAFETY: poll(2) with a single valid descriptor and zero timeout.
+    let ret = unsafe { libc::poll(fds.as_mut_ptr(), 1, 0) };
+    if ret <= 0 {
+        return ConnectState::InProgress;
+    }
+    if fds[0].revents & (libc::POLLOUT | libc::POLLERR | libc::POLLHUP) == 0 {
+        return ConnectState::InProgress;
+    }
+    match so_error(stream) {
+        Some(0) => ConnectState::Complete,
+        Some(errno) => ConnectState::Failed(errno),
+        None => ConnectState::InProgress,
+    }
+}
+
+/// Start a non-blocking TCP connect.
+///
+/// Returns the (already non-blocking) stream and whether the connect is still
+/// in progress (EINPROGRESS). Completion is observed via `SO_ERROR` by
+/// [`NetworkStack::select`] and [`NetworkStack::maybe_finish_connect`].
+fn nonblocking_connect(addr: &NetSocketAddr) -> std::io::Result<(TcpStream, bool)> {
+    let domain = if addr.is_ipv4() {
+        libc::AF_INET
+    } else {
+        libc::AF_INET6
+    };
+    // SAFETY: socket(2) with valid constants; the descriptor is owned below.
+    // Note: macOS does not accept O_CLOEXEC/SOCK_CLOEXEC here (EINVAL), so the
+    // type is plain SOCK_STREAM.
+    let fd = unsafe { libc::socket(domain, libc::SOCK_STREAM, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: fd is a valid, owned socket descriptor from socket(2) above.
+    let stream = unsafe { TcpStream::from_raw_fd(fd) };
+    stream.set_nonblocking(true)?;
+
+    let ret = match addr {
+        NetSocketAddr::V4(v4) => {
+            let mut sa: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+            sa.sin_family = libc::AF_INET as libc::sa_family_t;
+            sa.sin_port = v4.port().to_be();
+            sa.sin_addr = libc::in_addr {
+                // `in_addr.s_addr` stores the address in network byte order, so
+                // the octets are written verbatim (little-endian hosts).
+                s_addr: u32::from_le_bytes(v4.ip().octets()),
+            };
+            // SAFETY: `sa` is a valid sockaddr_in for the lifetime of the call.
+            unsafe {
+                libc::connect(
+                    fd,
+                    &sa as *const libc::sockaddr_in as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                )
+            }
+        }
+        NetSocketAddr::V6(v6) => {
+            let mut sa: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+            sa.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+            sa.sin6_port = v6.port().to_be();
+            sa.sin6_addr = libc::in6_addr {
+                s6_addr: v6.ip().octets(),
+            };
+            sa.sin6_scope_id = v6.scope_id();
+            // SAFETY: `sa` is a valid sockaddr_in6 for the lifetime of the call.
+            unsafe {
+                libc::connect(
+                    fd,
+                    &sa as *const libc::sockaddr_in6 as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+                )
+            }
+        }
+    };
+    if ret == 0 {
+        return Ok((stream, false));
+    }
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(code) if code == libc::EINPROGRESS => Ok((stream, true)),
+        Some(code) if code == libc::EISCONN => Ok((stream, false)),
+        _ => Err(error),
     }
 }
 
@@ -2185,6 +2582,12 @@ fn cookie_matches(cookie: &Cookie, host: &str, path: &str, secure: bool) -> bool
     let path_matches = path.starts_with(&cookie.path);
     let secure_matches = !cookie.secure || secure;
     domain_matches && path_matches && secure_matches
+}
+
+/// Whether a cookie applies to the given request origin/path. Shared with the
+/// real networking stack (`real_net`).
+pub(crate) fn cookie_matches_origin(cookie: &Cookie, host: &str, path: &str, secure: bool) -> bool {
+    cookie_matches(cookie, host, path, secure)
 }
 
 /// ---------------------------------------------------------------------------
@@ -2403,9 +2806,9 @@ mod gssapi_ffi {
 
     type gss_OID_set = *mut c_void;
 
-    // Name types
-    pub static mut GSS_C_NT_USER_NAME: gss_OID = std::ptr::null_mut();
-    pub static mut GSS_C_NT_HOSTBASED_SERVICE: gss_OID = std::ptr::null_mut();
+    // GSS-API status types for gss_display_status
+    pub const GSS_C_GSS_CODE: c_int = 1;
+    pub const GSS_C_MECH_CODE: c_int = 2;
 
     // SAFETY: GSS-API FFI for Kerberos authentication
     #[link(name = "GSS", kind = "framework")]
@@ -2431,6 +2834,12 @@ mod gssapi_ffi {
             output_token: *mut gss_buffer_desc,
             ret_flags: *mut u32,
             time_rec: *mut u32,
+        ) -> u32;
+
+        pub fn gss_delete_sec_context(
+            minor_status: *mut u32,
+            context_handle: *mut gss_ctx_id_t,
+            output_token: *mut gss_buffer_desc,
         ) -> u32;
 
         pub fn gss_release_buffer(minor_status: *mut u32, buffer: *mut gss_buffer_desc) -> u32;
@@ -2468,11 +2877,13 @@ pub(crate) fn kerberos_get_ticket_impl(service: &str, username: &str) -> Option<
 fn kerberos_get_ticket_macos(service: &str, _username: &str) -> Option<Vec<u8>> {
     use self::gssapi_ffi::*;
 
-    // Build the service principal name (e.g., "HTTP@server.example.com")
+    // Build the service principal name (e.g., "HTTP@server.example.com").
+    // The CString is kept alive for the whole call: GSS-API copies the buffer
+    // during import, so ownership never transfers and into_raw must not be used.
     let spn = CString::new(service).ok()?;
     let mut name_buf = gss_buffer_desc {
-        length: spn.to_bytes().len(),
-        value: spn.into_raw() as *mut c_void,
+        length: spn.as_bytes().len(),
+        value: spn.as_ptr() as *mut c_void,
     };
 
     let mut target_name: gss_name_t = std::ptr::null_mut();
@@ -2494,6 +2905,12 @@ fn kerberos_get_ticket_macos(service: &str, _username: &str) -> Option<Vec<u8>> 
         eprintln!(
             "Kerberos: gss_import_name failed for service '{service}': maj={maj:#x}, min={minor_status}"
         );
+        // SAFETY: release any partially-imported name before returning.
+        unsafe {
+            if !target_name.is_null() {
+                gss_release_name(&mut minor_status, &mut target_name);
+            }
+        }
         return None;
     }
 
@@ -2549,7 +2966,7 @@ fn kerberos_get_ticket_macos(service: &str, _username: &str) -> Option<Vec<u8>> 
             gss_display_status(
                 &mut minor_status,
                 maj,
-                0, // GSS_C_GSS_CODE
+                GSS_C_GSS_CODE,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
                 &mut msg_buf,
@@ -2571,7 +2988,8 @@ fn kerberos_get_ticket_macos(service: &str, _username: &str) -> Option<Vec<u8>> 
         None
     };
 
-    // Cleanup
+    // Cleanup: release the output token, target name, and the security context
+    // (which holds ticket/credential material).
     // SAFETY: FFI for network socket operations
     unsafe {
         if !output_token.value.is_null() {
@@ -2580,9 +2998,38 @@ fn kerberos_get_ticket_macos(service: &str, _username: &str) -> Option<Vec<u8>> 
         if !target_name.is_null() {
             gss_release_name(&mut minor_status, &mut target_name);
         }
+        if !context.is_null() {
+            gss_delete_sec_context(&mut minor_status, &mut context, std::ptr::null_mut());
+        }
     }
 
     result
+}
+
+/// Read a DER length field at `offset` (advancing it), rejecting malformed
+/// long-form lengths (indefinite, oversized, or truncated).
+fn read_der_length(token: &[u8], offset: &mut usize) -> Option<usize> {
+    if *offset >= token.len() {
+        return None;
+    }
+    let first = token[*offset];
+    *offset += 1;
+    if first & 0x80 == 0 {
+        return Some(first as usize);
+    }
+    let num_bytes = (first & 0x7F) as usize;
+    if num_bytes == 0 || num_bytes > std::mem::size_of::<usize>() {
+        return None;
+    }
+    let mut length = 0usize;
+    for _ in 0..num_bytes {
+        if *offset >= token.len() {
+            return None;
+        }
+        length = (length << 8) | token[*offset] as usize;
+        *offset += 1;
+    }
+    Some(length)
 }
 
 /// Parse a SPNEGO token (RFC 4178) to extract the Kerberos ticket from
@@ -2606,28 +3053,11 @@ pub fn parse_spnego_token(spnego_token: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
     offset += 1;
-    if offset >= spnego_token.len() {
+    let outer_len = read_der_length(spnego_token, &mut offset)?;
+    let end = offset.checked_add(outer_len)?;
+    if end > spnego_token.len() {
         return None;
     }
-    // Skip length
-    let len = if spnego_token[offset] & 0x80 != 0 {
-        let num_bytes = (spnego_token[offset] & 0x7F) as usize;
-        offset += 1;
-        let mut l = 0usize;
-        for _ in 0..num_bytes {
-            if offset >= spnego_token.len() {
-                return None;
-            }
-            l = (l << 8) | spnego_token[offset] as usize;
-            offset += 1;
-        }
-        l
-    } else {
-        let l = spnego_token[offset] as usize;
-        offset += 1;
-        l
-    };
-    let _end = offset + len;
 
     // Scan for [2] CONTEXT-SPECIFIC (mechToken)
     while offset + 4 < spnego_token.len() {
@@ -2635,53 +3065,16 @@ pub fn parse_spnego_token(spnego_token: &[u8]) -> Option<Vec<u8>> {
         if spnego_token[offset] == 0xA2 {
             offset += 1;
             // Skip inner length
-            if offset >= spnego_token.len() {
+            let token_len = read_der_length(spnego_token, &mut offset)?;
+            if offset.checked_add(token_len)? > spnego_token.len() {
                 return None;
             }
-            let token_len = if spnego_token[offset] & 0x80 != 0 {
-                let num_bytes = (spnego_token[offset] & 0x7F) as usize;
+            // The content should be an OCTET STRING containing the Kerberos ticket
+            if offset < spnego_token.len() && spnego_token[offset] == 0x04 {
                 offset += 1;
-                let mut l = 0usize;
-                for _ in 0..num_bytes {
-                    if offset >= spnego_token.len() {
-                        return None;
-                    }
-                    l = (l << 8) | spnego_token[offset] as usize;
-                    offset += 1;
-                }
-                l
-            } else {
-                let l = spnego_token[offset] as usize;
-                offset += 1;
-                l
-            };
-            if offset + token_len <= spnego_token.len() {
-                // The content should be an OCTET STRING containing the Kerberos ticket
-                if offset < spnego_token.len() && spnego_token[offset] == 0x04 {
-                    offset += 1;
-                    if offset >= spnego_token.len() {
-                        return None;
-                    }
-                    let mech_token_len = if spnego_token[offset] & 0x80 != 0 {
-                        let num_bytes = (spnego_token[offset] & 0x7F) as usize;
-                        offset += 1;
-                        let mut l = 0usize;
-                        for _ in 0..num_bytes {
-                            if offset >= spnego_token.len() {
-                                return None;
-                            }
-                            l = (l << 8) | spnego_token[offset] as usize;
-                            offset += 1;
-                        }
-                        l
-                    } else {
-                        let l = spnego_token[offset] as usize;
-                        offset += 1;
-                        l
-                    };
-                    if offset + mech_token_len <= spnego_token.len() {
-                        return Some(spnego_token[offset..offset + mech_token_len].to_vec());
-                    }
+                let mech_token_len = read_der_length(spnego_token, &mut offset)?;
+                if offset.checked_add(mech_token_len)? <= spnego_token.len() {
+                    return Some(spnego_token[offset..offset + mech_token_len].to_vec());
                 }
             }
             return None;
@@ -2692,64 +3085,85 @@ pub fn parse_spnego_token(spnego_token: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
-/// Build a SPNEGO wrapper around a raw Kerberos ticket for HTTP Negotiate auth.
-pub fn build_spnego_token(kerberos_ticket: &[u8]) -> Vec<u8> {
-    // Build a minimal SPNEGO token: wrap the Kerberos ticket in the
-    // appropriate ASN.1 structure for HTTP Negotiate authentication.
-    //
-    // Structure:
-    // SEQUENCE {
-    //   OID (1.3.6.1.5.5.2 - SPNEGO)
-    //   [0] EXPLICIT {
-    //     SEQUENCE {
-    //       [0] CONTEXT-SPECIFIC { OID (1.2.840.113554.1.2.2 - Kerberos 5) }
-    //       [2] CONTEXT-SPECIFIC { OCTET STRING (Kerberos ticket) }
-    //     }
-    //   }
-    // }
-
-    let mut token = Vec::new();
-
-    // Build the mechToken OCTET STRING
-    let mut mech_token = vec![0x04]; // OCTET STRING tag
-    if kerberos_ticket.len() <= 127 {
-        mech_token.push(kerberos_ticket.len() as u8);
-    } else {
-        mech_token.push(0x80 | 0x02);
-        mech_token.extend_from_slice(&(kerberos_ticket.len() as u16).to_be_bytes());
+/// Encode a DER length field (short or long form) without truncating.
+fn der_length_bytes(len: usize) -> Vec<u8> {
+    if len < 0x80 {
+        return vec![len as u8];
     }
-    mech_token.extend_from_slice(kerberos_ticket);
+    let mut bytes = len.to_be_bytes().to_vec();
+    while bytes.len() > 1 && bytes[0] == 0 {
+        bytes.remove(0);
+    }
+    let mut out = vec![0x80 | bytes.len() as u8];
+    out.extend_from_slice(&bytes);
+    out
+}
 
-    // Build the inner SEQUENCE with mechTypes and mechToken
-    // OID for Kerberos 5: 1.2.840.113554.1.2.2
-    let krb5_oid = [
+/// Build a SPNEGO wrapper around a raw Kerberos ticket for HTTP Negotiate auth.
+///
+/// Produces a spec-compliant RFC 4178 `NegTokenInit`:
+///
+/// ```text
+/// [APPLICATION 0] SEQUENCE {
+///   OBJECT IDENTIFIER 1.3.6.1.5.5.2 (SPNEGO)
+///   [0] EXPLICIT {                    -- NegTokenInit
+///     SEQUENCE {
+///       [0] { SEQUENCE { OBJECT IDENTIFIER 1.2.840.113554.1.2.2 (Kerberos 5) } }
+///       [2] { OCTET STRING (Kerberos ticket) }
+///     }
+///   }
+/// }
+/// ```
+pub fn build_spnego_token(kerberos_ticket: &[u8]) -> Vec<u8> {
+    // Kerberos 5 mechanism OID: 1.2.840.113554.1.2.2
+    const KRB5_OID: &[u8] = &[
         0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x12, 0x01, 0x02, 0x02,
     ];
-    let mut inner = vec![0xa0, krb5_oid.len() as u8]; // [0] CONTEXT-SPECIFIC
-    inner.extend_from_slice(&krb5_oid);
+    // SPNEGO mechanism OID: 1.3.6.1.5.5.2
+    const SPNEGO_OID: &[u8] = &[0x06, 0x06, 0x2b, 0x06, 0x01, 0x05, 0x05, 0x02];
 
-    // [2] CONTEXT-SPECIFIC wrapper for mechToken
-    if mech_token.len() <= 127 {
-        inner.push(0xa2);
-        inner.push(mech_token.len() as u8);
-    } else {
-        inner.push(0xa2);
-        inner.push(0x80 | 0x02);
-        inner.extend_from_slice(&(mech_token.len() as u16).to_be_bytes());
-    }
-    inner.extend_from_slice(&mech_token);
+    // mechTypes: [0] { SEQUENCE OF OID }
+    let mech_list = {
+        let mut oid = vec![0x30];
+        oid.extend_from_slice(&der_length_bytes(KRB5_OID.len()));
+        oid.extend_from_slice(KRB5_OID);
+        let mut out = vec![0xa0];
+        out.extend_from_slice(&der_length_bytes(oid.len()));
+        out.extend_from_slice(&oid);
+        out
+    };
 
-    // Wrap in SEQUENCE
-    if inner.len() <= 127 {
-        token.push(0x30);
-        token.push(inner.len() as u8);
-    } else {
-        token.push(0x30);
-        token.push(0x80 | 0x02);
-        token.extend_from_slice(&(inner.len() as u16).to_be_bytes());
-    }
-    token.extend_from_slice(&inner);
+    // mechToken: [2] { OCTET STRING }
+    let mech_token = {
+        let mut octet_string = vec![0x04];
+        octet_string.extend_from_slice(&der_length_bytes(kerberos_ticket.len()));
+        octet_string.extend_from_slice(kerberos_ticket);
+        let mut out = vec![0xa2];
+        out.extend_from_slice(&der_length_bytes(octet_string.len()));
+        out.extend_from_slice(&octet_string);
+        out
+    };
 
+    // NegTokenInit: SEQUENCE { mechTypes, mechToken }
+    let neg_token_init = {
+        let mut inner = mech_list;
+        inner.extend_from_slice(&mech_token);
+        let mut out = vec![0x30];
+        out.extend_from_slice(&der_length_bytes(inner.len()));
+        out.extend_from_slice(&inner);
+        out
+    };
+
+    // GSS-API wrapper: [APPLICATION 0] SEQUENCE { SPNEGO OID, [0] { NegTokenInit } }
+    let mut body = Vec::with_capacity(SPNEGO_OID.len() + neg_token_init.len() + 8);
+    body.extend_from_slice(SPNEGO_OID);
+    body.push(0xa0);
+    body.extend_from_slice(&der_length_bytes(neg_token_init.len()));
+    body.extend_from_slice(&neg_token_init);
+
+    let mut token = vec![0x60];
+    token.extend_from_slice(&der_length_bytes(body.len()));
+    token.extend_from_slice(&body);
     token
 }
 
@@ -2800,7 +3214,9 @@ struct QuicState {
     listeners: BTreeMap<u64, quinn::Endpoint>,
     connections: BTreeMap<u64, quinn::Connection>,
     udp_sockets: BTreeMap<u64, std::net::UdpSocket>,
-    next_id: u64,
+    /// Accept-loop tasks per listener handle, so closing a listener can stop
+    /// its background accept task.
+    listener_tasks: BTreeMap<u64, tokio::task::JoinHandle<()>>,
 }
 
 impl QuicState {
@@ -2809,7 +3225,7 @@ impl QuicState {
             listeners: BTreeMap::new(),
             connections: BTreeMap::new(),
             udp_sockets: BTreeMap::new(),
-            next_id: 1,
+            listener_tasks: BTreeMap::new(),
         }
     }
 }
@@ -2817,12 +3233,38 @@ impl QuicState {
 lazy_static::lazy_static! {
     static ref QUIC_STATE: Mutex<QuicState> = Mutex::new(QuicState::new());
     /// A shared tokio runtime for blocking QUIC operations.
+    ///
+    /// This crate's tokio features only provide the current-thread scheduler,
+    /// so a dedicated pump thread drives the runtime continuously. Caller
+    /// threads submit work via `spawn` and wait with bounded `recv_timeout`s;
+    /// spawned futures (quinn driver tasks, stream I/O, the accept loop) make
+    /// progress on the pump. Never mix an undriven `spawn` with an unbounded
+    /// blocking `recv()` — that deadlocks forever.
     static ref QUIC_RUNTIME: tokio::runtime::Runtime =
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("QUIC tokio runtime creation failed");
 }
+
+/// Ensure the QUIC runtime is being driven by the dedicated pump thread.
+fn quic_ensure_pump() {
+    static PUMP: std::sync::OnceLock<std::thread::JoinHandle<()>> = std::sync::OnceLock::new();
+    PUMP.get_or_init(|| {
+        let runtime = &*QUIC_RUNTIME;
+        std::thread::spawn(move || {
+            // Drive the current-thread runtime forever. Never returns.
+            runtime.block_on(std::future::pending::<()>());
+        })
+    });
+}
+
+/// QUIC handshake timeout.
+const QUIC_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+/// QUIC stream I/O timeout.
+const QUIC_IO_TIMEOUT: Duration = Duration::from_secs(10);
+/// Slack added to channel waits so the in-task timeout always wins.
+const QUIC_WAIT_SLACK: Duration = Duration::from_secs(5);
 
 static QUIC_HANDLE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -2897,16 +3339,16 @@ fn load_native_certs() -> Vec<rustls::pki_types::CertificateDer<'static>> {
         }
     }
     // On macOS, try the Keychain via security command-line tool
-    if let Ok(output) = std::process::Command::new("security")
+    if let Some(output) = std::process::Command::new("security")
         .args(["find-certificate", "-a", "-p"])
         .output()
+        .ok()
+        .filter(|output| output.status.success())
     {
-        if output.status.success() {
-            let mut slice = output.stdout.as_slice();
-            let pem_certs = rustls_pemfile::certs(&mut slice);
-            for c in pem_certs.flatten() {
-                certs.push(c);
-            }
+        let mut slice = output.stdout.as_slice();
+        let pem_certs = rustls_pemfile::certs(&mut slice);
+        for c in pem_certs.flatten() {
+            certs.push(c);
         }
     }
     if certs.is_empty() {
@@ -2915,15 +3357,24 @@ fn load_native_certs() -> Vec<rustls::pki_types::CertificateDer<'static>> {
     certs
 }
 
-/// Build a root certificate store from the system's trust store.
+/// Cached native root store: loading it forks a `security` process and reads
+/// cert files, so it must not happen per connection.
+static NATIVE_ROOT_CERTS: std::sync::OnceLock<rustls::RootCertStore> =
+    std::sync::OnceLock::new();
+
+/// Build a root certificate store from the system's trust store (cached).
 fn quic_root_certs() -> rustls::RootCertStore {
-    let mut roots = rustls::RootCertStore::empty();
-    for cert in load_native_certs() {
-        if let Err(error) = roots.add(cert) {
-            eprintln!("[network] failed to add native QUIC root cert: {error}");
-        }
-    }
-    roots
+    NATIVE_ROOT_CERTS
+        .get_or_init(|| {
+            let mut roots = rustls::RootCertStore::empty();
+            for cert in load_native_certs() {
+                if let Err(error) = roots.add(cert) {
+                    eprintln!("[network] failed to add native QUIC root cert: {error}");
+                }
+            }
+            roots
+        })
+        .clone()
 }
 
 /// Build a Quinn client configuration with TLS 1.3.
@@ -2987,15 +3438,21 @@ fn quic_server_config() -> Result<quinn::ServerConfig, AppError> {
 }
 
 /// Combine SSL scalers for QUIC socket acceleration.
-/// Returns the number of scalers that were combined.
+/// Returns the number of scalers that were combined, capped at the platform
+/// maximum.
 pub fn http_socket_combine_ssl_scalers(socket_handle: u64, scaler_count: usize) -> usize {
-    let _ = (socket_handle, scaler_count);
-    scaler_count
+    let _ = socket_handle;
+    scaler_count.min(HTTP_SOCKET_MAX_COMBINE_SSL_SCALERS)
 }
 
 /// Create a QUIC listener on the given address.
 /// Returns a handle that can be used to accept incoming connections.
+///
+/// The listener runs a background accept loop on the shared runtime: accepted
+/// connections are parked in the global QUIC state (keyed by fresh handles)
+/// where they can be driven by [`quic_udp_send`]/[`quic_udp_recv`].
 pub fn quic_create_listener(addr: &str) -> Result<u64, AppError> {
+    quic_ensure_pump();
     let server_config = quic_server_config()?;
     let socket = std::net::UdpSocket::bind(addr).map_err(|e| {
         AppError::new(
@@ -3004,47 +3461,82 @@ pub fn quic_create_listener(addr: &str) -> Result<u64, AppError> {
         )
     })?;
 
-    let endpoint = quinn::Endpoint::new(
-        quinn::EndpointConfig::default(),
-        Some(server_config),
-        socket,
-        Arc::new(quinn::TokioRuntime),
-    )
-    .map_err(|e| {
-        AppError::new(
-            ReasonCode::RcIo,
-            format!("QUIC endpoint creation failed: {e}"),
-        )
-    })?;
-
     let handle = next_quic_handle();
+
+    // Endpoint creation must run inside a runtime context: quinn spawns its
+    // driver tasks via `tokio::spawn`. The pump thread executes it.
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    QUIC_RUNTIME.spawn(async move {
+        let result = quinn::Endpoint::new(
+            quinn::EndpointConfig::default(),
+            Some(server_config),
+            socket,
+            Arc::new(quinn::TokioRuntime),
+        )
+        .map_err(|e| AppError::new(ReasonCode::RcIo, format!("QUIC endpoint creation failed: {e}")));
+        if result_tx.send(result).is_err() {
+            eprintln!("[network] QUIC listener receiver dropped before endpoint creation");
+        }
+    });
+    let endpoint = result_rx
+        .recv_timeout(QUIC_IO_TIMEOUT.saturating_add(QUIC_WAIT_SLACK))
+        .map_err(|_| AppError::new(ReasonCode::RcIo, "QUIC endpoint creation timed out"))??;
+
+    // Drive the accept loop on the runtime; the task is aborted when the
+    // listener is closed.
+    let accept_endpoint = endpoint.clone();
+    let task = QUIC_RUNTIME.spawn(async move {
+        while let Some(incoming) = accept_endpoint.accept().await {
+            match incoming.await {
+                Ok(connection) => match QUIC_STATE.lock() {
+                    Ok(mut state) => {
+                        let conn_handle = next_quic_handle();
+                        state.connections.insert(conn_handle, connection);
+                    }
+                    Err(_) => {
+                        eprintln!("[network] QUIC state lock poisoned; listener accept loop exiting");
+                        break;
+                    }
+                },
+                Err(e) => eprintln!("[network] QUIC accept failed: {e}"),
+            }
+        }
+    });
+
     let mut state = lock_quic_state()?;
     state.listeners.insert(handle, endpoint);
+    state.listener_tasks.insert(handle, task);
     Ok(handle)
 }
 
 /// Parse a `host:port` string into (hostname, port), correctly handling
-/// IPv6 bracket notation (e.g. `[::1]:443`).
+/// IPv6 bracket notation (e.g. `[::1]:443`) and unbracketed IPv6 (e.g. `::1`).
 fn parse_host_port(input: &str, default_port: u16) -> (&str, u16) {
     // Check for IPv6 bracket notation: [::1]:port
     if input.starts_with('[') {
-        if let Some(bracket_end) = input.find(']') {
-            let hostname = &input[1..bracket_end];
-            let rest = &input[bracket_end + 1..];
-            // Rest should be ":port" or empty
-            let port = if rest.starts_with(':') {
-                rest[1..].parse().unwrap_or(default_port)
-            } else {
-                default_port
-            };
-            return (hostname, port);
+        match input.find(']') {
+            Some(bracket_end) => {
+                let hostname = &input[1..bracket_end];
+                let rest = &input[bracket_end + 1..];
+                let port = rest
+                    .strip_prefix(':')
+                    .and_then(|port_str| port_str.parse::<u16>().ok())
+                    .unwrap_or(default_port);
+                return (hostname, port);
+            }
+            // Malformed (unterminated bracket) — treat the whole input as a host
+            None => return (input, default_port),
         }
     }
+    // Unbracketed IPv6 (e.g. "::1") — treat the whole input as the host.
+    if input.matches(':').count() >= 2 {
+        return (input, default_port);
+    }
     // Standard host:port or bare host
-    if let Some((hostname, port_str)) = input.rsplit_once(':') {
-        if let Ok(port) = port_str.parse::<u16>() {
-            return (hostname, port);
-        }
+    if let Some((hostname, port_str)) = input.rsplit_once(':')
+        && let Ok(port) = port_str.parse::<u16>()
+    {
+        return (hostname, port);
     }
     // No port found — use default
     (input, default_port)
@@ -3053,6 +3545,7 @@ fn parse_host_port(input: &str, default_port: u16) -> (&str, u16) {
 /// Create a QUIC connection to the given remote host.
 /// Returns a connection handle.
 pub fn quic_create_connection(host: &str) -> Result<u64, AppError> {
+    quic_ensure_pump();
     let (hostname, port) = parse_host_port(host, 443);
 
     let client_config = quic_client_config()?;
@@ -3064,19 +3557,6 @@ pub fn quic_create_connection(host: &str) -> Result<u64, AppError> {
 
     let socket = std::net::UdpSocket::bind(bind_addr)
         .map_err(|e| AppError::new(ReasonCode::RcIo, format!("QUIC connect bind failed: {e}")))?;
-
-    let endpoint = quinn::Endpoint::new(
-        quinn::EndpointConfig::default(),
-        None,
-        socket,
-        Arc::new(quinn::TokioRuntime),
-    )
-    .map_err(|e| {
-        AppError::new(
-            ReasonCode::RcIo,
-            format!("QUIC endpoint creation failed: {e}"),
-        )
-    })?;
 
     // Reconstruct for ToSocketAddrs which expects bracket notation for IPv6
     let remote_addr_str = if hostname.contains(':') {
@@ -3101,35 +3581,71 @@ pub fn quic_create_connection(host: &str) -> Result<u64, AppError> {
             )
         })?;
 
-    // Establish the connection asynchronously
-    let connecting = endpoint
-        .connect_with(client_config, remote_addr, hostname)
-        .map_err(|e| {
-            AppError::new(
-                ReasonCode::RcNetConnectionFailed,
-                format!("QUIC connect to {host} failed: {e}"),
-            )
-        })?;
+    // The host is borrowed for error messages inside the spawned task.
+    let host_owned = host.to_string();
+    let hostname_owned = hostname.to_string();
 
-    let (conn_tx, conn_rx) = std::sync::mpsc::channel();
+    // Endpoint creation and the handshake run on the shared runtime (driven
+    // by the pump thread) with a bounded wait: spawning on an undriven runtime
+    // and blocking forever on a channel would hang the caller.
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
     QUIC_RUNTIME.spawn(async move {
-        let result = connecting.await;
-        if conn_tx.send(result).is_err() {
-            eprintln!(
-                "[network] QUIC connect channel receiver dropped before handshake completion"
-            );
+        let result = async {
+            // Endpoint creation must run inside a runtime context: quinn
+            // spawns its driver tasks via `tokio::spawn`.
+            let endpoint = quinn::Endpoint::new(
+                quinn::EndpointConfig::default(),
+                None,
+                socket,
+                Arc::new(quinn::TokioRuntime),
+            )
+            .map_err(|e| {
+                AppError::new(
+                    ReasonCode::RcIo,
+                    format!("QUIC endpoint creation failed: {e}"),
+                )
+            })?;
+
+            let connecting = endpoint
+                .connect_with(client_config, remote_addr, &hostname_owned)
+                .map_err(|e| {
+                    AppError::new(
+                        ReasonCode::RcNetConnectionFailed,
+                        format!("QUIC connect to {host_owned} failed: {e}"),
+                    )
+                })?;
+
+            let connection = tokio::time::timeout(QUIC_HANDSHAKE_TIMEOUT, connecting)
+                .await
+                .map_err(|_| {
+                    AppError::new(
+                        ReasonCode::RcNetConnectionFailed,
+                        format!("QUIC handshake with {host_owned} timed out"),
+                    )
+                })?
+                .map_err(|e| {
+                    AppError::new(
+                        ReasonCode::RcNetConnectionFailed,
+                        format!("QUIC handshake with {host_owned} failed: {e}"),
+                    )
+                })?;
+
+            Ok::<(quinn::Endpoint, quinn::Connection), AppError>((endpoint, connection))
+        }
+        .await;
+        if result_tx.send(result).is_err() {
+            eprintln!("[network] QUIC connect receiver dropped before handshake completion");
         }
     });
 
-    let connection = conn_rx
-        .recv()
-        .map_err(|_| AppError::new(ReasonCode::RcIo, "QUIC connect channel closed"))?
-        .map_err(|e| {
+    let (endpoint, connection) = result_rx
+        .recv_timeout(QUIC_HANDSHAKE_TIMEOUT.saturating_add(QUIC_WAIT_SLACK))
+        .map_err(|_| {
             AppError::new(
                 ReasonCode::RcNetConnectionFailed,
-                format!("QUIC handshake with {host} failed: {e}"),
+                format!("QUIC handshake with {host} timed out"),
             )
-        })?;
+        })??;
 
     let handle = next_quic_handle();
     let mut state = lock_quic_state()?;
@@ -3171,6 +3687,7 @@ pub fn quic_udp_create_socket(addr: &str) -> Result<u64, AppError> {
 
 /// Send data over an established QUIC connection by opening a bi-directional stream.
 pub fn quic_udp_send(conn_handle: u64, data: &[u8]) -> Result<usize, AppError> {
+    quic_ensure_pump();
     let connection = {
         let state = lock_quic_state()?;
         state
@@ -3189,32 +3706,42 @@ pub fn quic_udp_send(conn_handle: u64, data: &[u8]) -> Result<usize, AppError> {
     let (result_tx, result_rx) = std::sync::mpsc::channel();
     QUIC_RUNTIME.spawn(async move {
         let result = async {
-            let (mut send, _recv) = connection.open_bi().await.map_err(|e| {
-                AppError::new(ReasonCode::RcIo, format!("QUIC: open stream failed: {e}"))
-            })?;
-            let written = send.write(&data_owned).await.map_err(|e| {
-                AppError::new(
-                    ReasonCode::RcNetWriteFailed,
-                    format!("QUIC send failed: {e}"),
-                )
-            })?;
-            send.finish()
-                .map_err(|e| AppError::new(ReasonCode::RcIo, format!("QUIC finish failed: {e}")))?;
-            Ok::<usize, AppError>(written)
+            tokio::time::timeout(QUIC_IO_TIMEOUT, async {
+                let (mut send, _recv) = connection.open_bi().await.map_err(|e| {
+                    AppError::new(ReasonCode::RcIo, format!("QUIC: open stream failed: {e}"))
+                })?;
+                let written = send.write(&data_owned).await.map_err(|e| {
+                    AppError::new(
+                        ReasonCode::RcNetWriteFailed,
+                        format!("QUIC send failed: {e}"),
+                    )
+                })?;
+                send.finish().map_err(|e| {
+                    AppError::new(ReasonCode::RcIo, format!("QUIC finish failed: {e}"))
+                })?;
+                Ok::<usize, AppError>(written)
+            })
+            .await
+            .map_err(|_| AppError::new(ReasonCode::RcIo, "QUIC send timed out"))?
         }
         .await;
         if result_tx.send(result).is_err() {
-            eprintln!("[network] QUIC send result receiver dropped before completion");
+            eprintln!("[network] QUIC send receiver dropped before completion");
         }
     });
 
     result_rx
-        .recv()
-        .map_err(|_| AppError::new(ReasonCode::RcIo, "QUIC send channel closed"))?
+        .recv_timeout(QUIC_IO_TIMEOUT.saturating_add(QUIC_WAIT_SLACK))
+        .map_err(|_| AppError::new(ReasonCode::RcIo, "QUIC send timed out"))?
 }
 
-/// Receive data on a QUIC connection by accepting an incoming stream.
+/// Receive data on a QUIC connection by accepting an incoming bi-directional
+/// stream (matching the sender's `open_bi`).
 pub fn quic_udp_recv(conn_handle: u64, buf: &mut [u8]) -> Result<usize, AppError> {
+    if buf.is_empty() {
+        return Ok(0);
+    }
+    quic_ensure_pump();
     let connection = {
         let state = lock_quic_state()?;
         state
@@ -3229,38 +3756,42 @@ pub fn quic_udp_recv(conn_handle: u64, buf: &mut [u8]) -> Result<usize, AppError
             })?
     };
 
-    let (result_tx, result_rx) = std::sync::mpsc::channel();
     let buf_len = buf.len();
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
     QUIC_RUNTIME.spawn(async move {
         let result = async {
-            let mut recv = connection.accept_uni().await.map_err(|e| {
-                AppError::new(
-                    ReasonCode::RcNetReadFailed,
-                    format!("QUIC: accept stream failed: {e}"),
-                )
-            })?;
-            let mut read_buf = vec![0u8; buf_len];
-            let n = recv
-                .read(&mut read_buf)
-                .await
-                .map_err(|e| {
+            tokio::time::timeout(QUIC_IO_TIMEOUT, async {
+                let (_send, mut recv) = connection.accept_bi().await.map_err(|e| {
                     AppError::new(
                         ReasonCode::RcNetReadFailed,
-                        format!("QUIC recv failed: {e}"),
+                        format!("QUIC: accept stream failed: {e}"),
                     )
-                })?
-                .unwrap_or(0);
-            Ok::<(Vec<u8>, usize), AppError>((read_buf, n))
+                })?;
+                let mut read_buf = vec![0u8; buf_len];
+                let n = recv
+                    .read(&mut read_buf)
+                    .await
+                    .map_err(|e| {
+                        AppError::new(
+                            ReasonCode::RcNetReadFailed,
+                            format!("QUIC recv failed: {e}"),
+                        )
+                    })?
+                    .unwrap_or(0);
+                Ok::<(Vec<u8>, usize), AppError>((read_buf, n))
+            })
+            .await
+            .map_err(|_| AppError::new(ReasonCode::RcIo, "QUIC recv timed out"))?
         }
         .await;
         if result_tx.send(result).is_err() {
-            eprintln!("[network] QUIC recv result receiver dropped before completion");
+            eprintln!("[network] QUIC recv receiver dropped before completion");
         }
     });
 
     let (read_buf, n) = result_rx
-        .recv()
-        .map_err(|_| AppError::new(ReasonCode::RcIo, "QUIC recv channel closed"))??;
+        .recv_timeout(QUIC_IO_TIMEOUT.saturating_add(QUIC_WAIT_SLACK))
+        .map_err(|_| AppError::new(ReasonCode::RcIo, "QUIC recv timed out"))??;
 
     let actual_n = n.min(buf.len());
     buf[..actual_n].copy_from_slice(&read_buf[..actual_n]);
@@ -3281,14 +3812,18 @@ pub fn quic_udp_close(conn_handle: u64) {
     }
     state.listeners.remove(&conn_handle);
     state.udp_sockets.remove(&conn_handle);
+    if let Some(task) = state.listener_tasks.remove(&conn_handle) {
+        task.abort();
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         AddressFamily, AltSvcEntry, Certificate, HttpProtocol, HttpProtocolFlags, NetworkStack,
-        PinnedCertificates, QUIC_STATE, QuicConfig, SockAddr, is_quic_alpn,
-        negotiate_http_protocol, parse_alt_svc_header, recover_quic_state,
+        PinnedCertificates, QUIC_STATE, QuicConfig, SockAddr, build_spnego_token, is_quic_alpn,
+        negotiate_http_protocol, parse_alt_svc_header, parse_host_port, parse_spnego_token,
+        recover_quic_state,
     };
     use std::collections::BTreeMap;
     use std::io::{Read, Write};
@@ -4132,9 +4667,8 @@ mod tests {
         let result = network.getaddrinfo("unknown-host-xyz.test", 80);
         // May either fail (DNS not found) or succeed via system DNS
         // We just check it doesn't panic
-        match result {
-            Ok(addrs) => assert!(!addrs.is_empty()),
-            Err(_) => {}
+        if let Ok(addrs) = result {
+            assert!(!addrs.is_empty());
         }
     }
 
@@ -4733,5 +5267,192 @@ mod tests {
         // Calling recover_quic_state twice should be safe.
         assert!(recover_quic_state().is_ok());
         assert!(recover_quic_state().is_ok());
+    }
+
+    // --- Hardening regression tests ---
+
+    #[test]
+    fn parse_host_port_handles_unbracketed_ipv6() {
+        assert_eq!(parse_host_port("::1", 443), ("::1", 443));
+        assert_eq!(parse_host_port("example.com", 443), ("example.com", 443));
+        assert_eq!(parse_host_port("example.com:8080", 443), ("example.com", 8080));
+        assert_eq!(parse_host_port("[::1]:8443", 443), ("::1", 8443));
+    }
+
+    #[test]
+    fn spnego_token_round_trip_extracts_ticket() {
+        let ticket = b"kerberos-ticket-bytes";
+        let token = build_spnego_token(ticket);
+        // [APPLICATION 0] SEQUENCE wrapper
+        assert_eq!(token[0], 0x60);
+        assert_eq!(parse_spnego_token(&token), Some(ticket.to_vec()));
+    }
+
+    #[test]
+    fn spnego_token_handles_large_tickets() {
+        // Longer than 65535 bytes: the old length encoding truncated.
+        let ticket = vec![0xABu8; 70_000];
+        let token = build_spnego_token(&ticket);
+        assert_eq!(parse_spnego_token(&token), Some(ticket));
+    }
+
+    #[test]
+    fn read_body_with_huge_count_does_not_panic() {
+        let mut network = NetworkStack::new();
+        network.wsa_startup();
+        let session = network.win_http_open("test");
+        let conn = network
+            .win_http_connect(session, "api.example.com", 443, true)
+            .expect("connect");
+        let req = network
+            .win_http_open_request(conn, "GET", "/login")
+            .expect("open");
+        network
+            .win_http_send_request(req, BTreeMap::new(), &[])
+            .expect("send");
+        let body = network
+            .win_http_read_data(req, usize::MAX)
+            .expect("huge read must not panic");
+        assert_eq!(body, br#"{"ok":true}"#);
+        network.close_handle(req);
+        network.close_handle(conn);
+        network.close_handle(session);
+    }
+
+    #[test]
+    fn recv_zero_length_returns_immediately() {
+        let mut network = NetworkStack::new();
+        network.wsa_startup();
+        let listener = network.socket(AddressFamily::Ipv4).expect("listener");
+        let addr = SockAddr {
+            family: AddressFamily::Ipv4,
+            host: "127.0.0.1".to_string(),
+            port: 27021,
+        };
+        network.bind(listener, addr.clone()).expect("bind");
+        network.listen(listener, 1).expect("listen");
+        let client = network.socket(AddressFamily::Ipv4).expect("client");
+        network.connect(client, addr).expect("connect");
+        let server = network.accept(listener).expect("accept");
+        network.send(client, b"data").expect("send");
+        assert_eq!(network.recv(server, 0).expect("zero-length recv"), Vec::<u8>::new());
+        assert_eq!(network.recv(server, 4).expect("recv"), b"data");
+    }
+
+    #[test]
+    fn recv_caps_guest_length_for_real_streams() {
+        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = std_listener.local_addr().expect("local addr");
+        let worker = std::thread::spawn(move || {
+            let (mut stream, _) = std_listener.accept().expect("accept");
+            stream.write_all(b"ping").expect("write");
+        });
+
+        let mut network = NetworkStack::new();
+        network.wsa_startup();
+        let socket = network.socket(AddressFamily::Ipv4).expect("socket");
+        network
+            .connect(
+                socket,
+                SockAddr {
+                    family: AddressFamily::Ipv4,
+                    host: addr.ip().to_string(),
+                    port: addr.port(),
+                },
+            )
+            .expect("connect");
+        // A huge guest length must not trigger a giant allocation.
+        let bytes = network.recv(socket, usize::MAX).expect("capped recv");
+        assert_eq!(bytes, b"ping");
+        worker.join().expect("join");
+    }
+
+    #[test]
+    fn nonblocking_connect_returns_wouldblock_and_completes() {
+        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = std_listener.local_addr().expect("local addr");
+        let worker = std::thread::spawn(move || {
+            let (mut stream, _) = std_listener.accept().expect("accept");
+            let mut buf = [0u8; 4];
+            let _ = stream.read(&mut buf);
+            stream.write_all(b"pong").expect("write");
+        });
+
+        let mut network = NetworkStack::new();
+        network.wsa_startup();
+        let socket = network.socket(AddressFamily::Ipv4).expect("socket");
+        network
+            .ioctlsocket_fionbio(socket, true)
+            .expect("set nonblocking");
+        let result = network.connect(
+            socket,
+            SockAddr {
+                family: AddressFamily::Ipv4,
+                host: addr.ip().to_string(),
+                port: addr.port(),
+            },
+        );
+        // Either the connect completed immediately or it is in progress and
+        // reported WSAEWOULDBLOCK. Both are valid for a loopback connect.
+        match result {
+            Ok(()) => {}
+            Err(_) => assert_eq!(network.wsa_get_last_error(), 10035), // WSAEWOULDBLOCK
+        }
+        // As a guest would, wait (bounded) for writability via select before
+        // using the socket.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let (_readable, writable) = network.select(&[socket]).expect("select");
+            if writable.contains(&socket) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "non-blocking connect did not complete in time"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // Once complete, the socket must be usable for a send/recv exchange.
+        network.send(socket, b"ping").expect("send");
+        let mut got = Vec::new();
+        while got.is_empty() {
+            match network.recv(socket, 4) {
+                Ok(bytes) => got = bytes,
+                Err(_) => {
+                    assert_eq!(network.wsa_get_last_error(), 10035); // WSAEWOULDBLOCK
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "recv did not deliver data in time"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }
+        assert_eq!(got, b"pong");
+        worker.join().expect("join");
+    }
+
+    #[test]
+    fn closesocket_releases_listener_address() {
+        let mut network = NetworkStack::new();
+        network.wsa_startup();
+        let listener = network.socket(AddressFamily::Ipv4).expect("listener");
+        let addr = SockAddr {
+            family: AddressFamily::Ipv4,
+            host: "127.0.0.1".to_string(),
+            port: 27022,
+        };
+        network.bind(listener, addr.clone()).expect("bind");
+        network.listen(listener, 1).expect("listen");
+        // Queue a client connection, then close the listener.
+        let client = network.socket(AddressFamily::Ipv4).expect("client");
+        network.connect(client, addr.clone()).expect("connect");
+        network.closesocket(listener).expect("close listener");
+        // The address must be re-bindable now.
+        let listener2 = network.socket(AddressFamily::Ipv4).expect("listener2");
+        network.bind(listener2, addr).expect("re-bind address");
+        // Accepting on the closed listener must fail.
+        let result = network.accept(listener);
+        assert!(result.is_err(), "expected Err, got {result:?}");
     }
 }
