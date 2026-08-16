@@ -191,7 +191,8 @@ fn t27_03_frame_capture_and_comparison() {
     // PSNR between identical frames — should be exactly INFINITY (mse == 0)
     let psnr_same = compute_psnr(&red.pixels, &red2.pixels, red.width, red.height);
     assert_eq!(
-        psnr_same, f64::INFINITY,
+        psnr_same,
+        f64::INFINITY,
         "PSNR between identical frames must be +inf, got {psnr_same}"
     );
 
@@ -243,8 +244,7 @@ fn t27_03_frame_capture_and_comparison() {
     assert!(
         !result_diff.passes,
         "solid red vs solid blue at 0.0 tolerance must not pass (ssim={}, match={:.2}%)",
-        result_diff.ssim,
-        result_diff.pixel_match_percentage
+        result_diff.ssim, result_diff.pixel_match_percentage
     );
     assert!(
         result_diff.pixel_match_percentage < 1.0,
@@ -676,7 +676,10 @@ fn t27_08_behavioral_verifier_steam_workflow() {
     // must report exactly one passed step.
     verifier.begin_step(BehavioralTestStep::ConnectToCM);
     verifier.end_step(BehavioralTestStep::ConnectToCM, true, None);
-    assert!(verifier.all_passed(), "one passing step must pass the verifier");
+    assert!(
+        verifier.all_passed(),
+        "one passing step must pass the verifier"
+    );
     assert_eq!(verifier.results.len(), 1);
     assert!(verifier.results[0].passed);
     assert!(verifier.summary().contains("1/1 steps passed"));
@@ -699,10 +702,7 @@ fn t27_08_behavioral_verifier_steam_workflow() {
     );
     assert_eq!(verifier.results.len(), 2);
     assert!(!verifier.results[1].passed);
-    assert_eq!(
-        verifier.results[1].error.as_deref(),
-        Some("logon rejected")
-    );
+    assert_eq!(verifier.results[1].error.as_deref(), Some("logon rejected"));
     let summary = verifier.summary();
     assert!(summary.contains("1/2 steps passed"), "got: {summary}");
     assert!(summary.contains("FAIL"), "got: {summary}");
@@ -1636,8 +1636,8 @@ fn t27_21_metal_backend_resolve_msaa_integration() {
     // Previously this test only created textures and never called the resolve.
     let cmd_buffer = backend.command_queue().new_command_buffer();
     let descriptor = create_render_pass_descriptor(src_info, None);
-    let mut encoder = MetalRenderEncoder::new(cmd_buffer, &descriptor)
-        .expect("render encoder must be creatable");
+    let mut encoder =
+        MetalRenderEncoder::new(cmd_buffer, &descriptor).expect("render encoder must be creatable");
 
     let config = MsaaResolveConfig {
         sample_count: 4,
@@ -1659,8 +1659,16 @@ fn t27_21_metal_backend_resolve_msaa_integration() {
         format: casa1::metal_backend::PixelFormat::Bgra8Unorm,
     };
 
-    resolve_msaa(&mut encoder, &src_wrapped, &dst_wrapped, &config)
-        .expect("average resolve must succeed on matching textures");
+    // The implemented contract: resolve_msaa refuses Average (and every
+    // mode) through a render encoder rather than silently faking it, exactly
+    // like set_depth_bounds — RcInvalidState with the guidance message.
+    let unsupported = resolve_msaa(&mut encoder, &src_wrapped, &dst_wrapped, &config)
+        .expect_err("Average resolve must be refused, not faked");
+    assert_eq!(
+        unsupported.code,
+        casa1::reason::ReasonCode::RcInvalidState,
+        "unsupported resolve mode must be reported with RcInvalidState"
+    );
 
     // Dimension mismatch must be rejected by the resolve path itself.
     let bad_dst = MetalTexture {

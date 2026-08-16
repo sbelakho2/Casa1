@@ -41,6 +41,114 @@ pub use crate::async_pipeline_compiler;
 
 static NEXT_GPU_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Process-wide encoder balance counters. The invariant
+/// `encoders_created == encoders_ended` must hold after every completed or
+/// aborted frame; `end_encoding()` (explicit or via Drop) increments ENDED.
+pub static METAL_ENCODERS_CREATED: AtomicU64 = AtomicU64::new(0);
+pub static METAL_ENCODERS_ENDED: AtomicU64 = AtomicU64::new(0);
+
+/// Common contract for Metal command encoders that must be ended exactly
+/// once before release.
+pub trait MetalEncoderLifecycle {
+    fn end_encoding(&self);
+}
+
+/// Obtain the raw Objective-C object pointer for either a metal crate
+/// *Ref* (which IS the object pointer) or an owned wrapper (which holds it).
+trait EncoderObjcPtr {
+    fn objc_ptr(&self) -> *mut objc::runtime::Object;
+}
+
+macro_rules! impl_encoder_objc_ptr_ref {
+    ($ty:ty) => {
+        impl EncoderObjcPtr for $ty {
+            fn objc_ptr(&self) -> *mut objc::runtime::Object {
+                self as *const _ as *mut objc::runtime::Object
+            }
+        }
+    };
+}
+
+macro_rules! impl_encoder_objc_ptr_owned {
+    ($ty:ty) => {
+        impl EncoderObjcPtr for $ty {
+            fn objc_ptr(&self) -> *mut objc::runtime::Object {
+                metal::foreign_types::ForeignType::as_ptr(self) as *mut objc::runtime::Object
+            }
+        }
+    };
+}
+
+impl_encoder_objc_ptr_ref!(metal::RenderCommandEncoderRef);
+impl_encoder_objc_ptr_ref!(metal::ComputeCommandEncoderRef);
+impl_encoder_objc_ptr_ref!(metal::BlitCommandEncoderRef);
+impl_encoder_objc_ptr_ref!(metal::AccelerationStructureCommandEncoderRef);
+impl_encoder_objc_ptr_owned!(metal::RenderCommandEncoder);
+impl_encoder_objc_ptr_owned!(metal::ComputeCommandEncoder);
+impl_encoder_objc_ptr_owned!(metal::BlitCommandEncoder);
+impl_encoder_objc_ptr_owned!(metal::AccelerationStructureCommandEncoder);
+
+macro_rules! impl_encoder_lifecycle {
+    ($ty:ty) => {
+        impl MetalEncoderLifecycle for $ty {
+            fn end_encoding(&self) {
+                let obj = self.objc_ptr();
+                unsafe {
+                    let _: () = msg_send![obj, endEncoding];
+                }
+            }
+        }
+    };
+}
+
+impl_encoder_lifecycle!(metal::RenderCommandEncoderRef);
+impl_encoder_lifecycle!(metal::ComputeCommandEncoderRef);
+impl_encoder_lifecycle!(metal::BlitCommandEncoderRef);
+impl_encoder_lifecycle!(metal::AccelerationStructureCommandEncoderRef);
+impl_encoder_lifecycle!(metal::RenderCommandEncoder);
+impl_encoder_lifecycle!(metal::ComputeCommandEncoder);
+impl_encoder_lifecycle!(metal::BlitCommandEncoder);
+impl_encoder_lifecycle!(metal::AccelerationStructureCommandEncoder);
+
+/// RAII guard for raw Metal encoders not wrapped in the typed wrapper
+/// structs: ends encoding exactly once, on explicit `end()` or on drop, so
+/// the "Command encoder released without endEncoding" Metal assertion can
+/// never fire even on early-return/error paths.
+pub struct AutoEndEncoder<T: MetalEncoderLifecycle> {
+    encoder: T,
+    ended: std::cell::Cell<bool>,
+}
+
+impl<T: MetalEncoderLifecycle> AutoEndEncoder<T> {
+    pub fn new(encoder: T) -> Self {
+        METAL_ENCODERS_CREATED.fetch_add(1, Ordering::Relaxed);
+        Self {
+            encoder,
+            ended: std::cell::Cell::new(false),
+        }
+    }
+
+    pub fn end(&self) {
+        if !self.ended.replace(true) {
+            self.encoder.end_encoding();
+            METAL_ENCODERS_ENDED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn encoder_ref(&self) -> &T {
+        &self.encoder
+    }
+}
+
+impl<T: MetalEncoderLifecycle> Drop for AutoEndEncoder<T> {
+    fn drop(&mut self) {
+        if !self.ended.get() {
+            self.encoder.end_encoding();
+            METAL_ENCODERS_ENDED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
 fn alloc_gpu_id() -> u64 {
     NEXT_GPU_ID.fetch_add(1, Ordering::Relaxed)
 }
@@ -1863,18 +1971,27 @@ pub struct MetalSampler {
 /// dispatch, resource binding, and acceleration structure builds.
 pub struct MetalComputeEncoder {
     encoder: metal::ComputeCommandEncoder,
+    ended: std::cell::Cell<bool>,
 }
 
 impl MetalComputeEncoder {
     /// Create a new compute encoder from a command buffer.
     pub fn new(command_buffer: &metal::CommandBufferRef) -> AppResult<Self> {
         let encoder = command_buffer.new_compute_command_encoder().to_owned();
-        Ok(Self { encoder })
+        METAL_ENCODERS_CREATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(Self {
+            encoder,
+            ended: std::cell::Cell::new(false),
+        })
     }
 
     /// Create a new compute encoder from a raw Metal compute command encoder.
     pub fn from_raw(encoder: metal::ComputeCommandEncoder) -> Self {
-        Self { encoder }
+        METAL_ENCODERS_CREATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self {
+            encoder,
+            ended: std::cell::Cell::new(false),
+        }
     }
 
     /// Get a reference to the underlying Metal compute encoder.
@@ -1889,7 +2006,19 @@ impl MetalComputeEncoder {
 
     /// End encoding.
     pub fn end_encoding(&self) {
-        self.encoder.end_encoding()
+        if !self.ended.replace(true) {
+            self.encoder.end_encoding();
+            METAL_ENCODERS_ENDED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+impl Drop for MetalComputeEncoder {
+    fn drop(&mut self) {
+        if !self.ended.get() {
+            self.encoder.end_encoding();
+            METAL_ENCODERS_ENDED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
 
@@ -1899,6 +2028,7 @@ impl MetalComputeEncoder {
 /// draw calls, resource binding, and pipeline state management.
 pub struct MetalRenderEncoder {
     encoder: metal::RenderCommandEncoder,
+    ended: std::cell::Cell<bool>,
     /// Whether the pipeline currently bound to the encoder is a native mesh
     /// render pipeline (`MTLMeshRenderPipelineState`). Set by callers via
     /// [`set_mesh_pipeline_bound`] when a mesh pipeline is bound; used by
@@ -1918,16 +2048,20 @@ impl MetalRenderEncoder {
         let encoder = command_buffer
             .new_render_command_encoder(descriptor)
             .to_owned();
+        METAL_ENCODERS_CREATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(Self {
             encoder,
+            ended: std::cell::Cell::new(false),
             mesh_pipeline_bound: false,
         })
     }
 
     /// Create a new render encoder from a raw Metal render command encoder.
     pub fn from_raw(encoder: metal::RenderCommandEncoder) -> Self {
+        METAL_ENCODERS_CREATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Self {
             encoder,
+            ended: std::cell::Cell::new(false),
             mesh_pipeline_bound: false,
         }
     }
@@ -1954,7 +2088,19 @@ impl MetalRenderEncoder {
 
     /// End encoding.
     pub fn end_encoding(&self) {
-        self.encoder.end_encoding()
+        if !self.ended.replace(true) {
+            self.encoder.end_encoding();
+            METAL_ENCODERS_ENDED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+impl Drop for MetalRenderEncoder {
+    fn drop(&mut self) {
+        if !self.ended.get() {
+            self.encoder.end_encoding();
+            METAL_ENCODERS_ENDED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
 
@@ -1963,6 +2109,7 @@ impl MetalRenderEncoder {
 /// Used for building and refitting ray tracing acceleration structures.
 pub struct MetalAccelerationStructureEncoder {
     encoder: metal::AccelerationStructureCommandEncoder,
+    ended: std::cell::Cell<bool>,
 }
 
 impl MetalAccelerationStructureEncoder {
@@ -1971,7 +2118,11 @@ impl MetalAccelerationStructureEncoder {
         let encoder = command_buffer
             .new_acceleration_structure_command_encoder()
             .to_owned();
-        Ok(Self { encoder })
+        METAL_ENCODERS_CREATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(Self {
+            encoder,
+            ended: std::cell::Cell::new(false),
+        })
     }
 
     /// Get a reference to the underlying Metal acceleration structure encoder.
@@ -1981,7 +2132,19 @@ impl MetalAccelerationStructureEncoder {
 
     /// End encoding.
     pub fn end_encoding(&self) {
-        self.encoder.end_encoding()
+        if !self.ended.replace(true) {
+            self.encoder.end_encoding();
+            METAL_ENCODERS_ENDED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+impl Drop for MetalAccelerationStructureEncoder {
+    fn drop(&mut self) {
+        if !self.ended.get() {
+            self.encoder.end_encoding();
+            METAL_ENCODERS_ENDED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
 
@@ -1997,13 +2160,18 @@ impl MetalAccelerationStructureEncoder {
 /// function table bindings, which are not directly exposed by the crate.
 pub struct MetalRayTracingEncoder {
     encoder: metal::ComputeCommandEncoder,
+    ended: std::cell::Cell<bool>,
 }
 
 impl MetalRayTracingEncoder {
     /// Create a new raytracing encoder backed by a compute command encoder.
     pub fn new(command_buffer: &metal::CommandBufferRef) -> AppResult<Self> {
         let encoder = command_buffer.new_compute_command_encoder().to_owned();
-        Ok(Self { encoder })
+        METAL_ENCODERS_CREATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(Self {
+            encoder,
+            ended: std::cell::Cell::new(false),
+        })
     }
 
     /// Get a reference to the underlying Metal compute encoder.
@@ -2108,7 +2276,19 @@ impl MetalRayTracingEncoder {
 
     /// End encoding of the underlying compute encoder.
     pub fn end_encoding(&self) {
-        self.encoder.end_encoding();
+        if !self.ended.replace(true) {
+            self.encoder.end_encoding();
+            METAL_ENCODERS_ENDED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+impl Drop for MetalRayTracingEncoder {
+    fn drop(&mut self) {
+        if !self.ended.get() {
+            self.encoder.end_encoding();
+            METAL_ENCODERS_ENDED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
 
@@ -2479,9 +2659,7 @@ fragment float4 d2d_tex_ps(VOutFrag in [[stage_in]],
             pool_cursor: std::cell::Cell::new(0),
             pool_buffer: std::cell::Cell::new(0),
             frame_index: 0,
-            frame_slots: std::sync::Arc::new(FrameSlotSemaphore::new(
-                POOL_BUFFER_COUNT as u32,
-            )),
+            frame_slots: std::sync::Arc::new(FrameSlotSemaphore::new(POOL_BUFFER_COUNT as u32)),
         })
     }
 
@@ -2855,10 +3033,10 @@ fragment float4 d2d_tex_ps(VOutFrag in [[stage_in]],
         );
 
         let scratch_cmd = self.queue.new_command_buffer();
-        let blit_enc = scratch_cmd.new_blit_command_encoder();
+        let blit_enc = AutoEndEncoder::new(scratch_cmd.new_blit_command_encoder().to_owned());
         let src_size = metal::MTLSize::new(bmp_width as u64, bmp_height as u64, 1);
         let bytes_per_row = 4u64 * bmp_width as u64;
-        blit_enc.copy_from_buffer_to_texture(
+        blit_enc.encoder_ref().copy_from_buffer_to_texture(
             &upload_buf,
             0,
             bytes_per_row,
@@ -2870,7 +3048,7 @@ fragment float4 d2d_tex_ps(VOutFrag in [[stage_in]],
             metal::MTLOrigin { x: 0, y: 0, z: 0 },
             metal::MTLBlitOption::None,
         );
-        blit_enc.end_encoding();
+        blit_enc.end();
         scratch_cmd.commit();
 
         // Clip-space quad vertices with UV coordinates.
@@ -2988,13 +3166,13 @@ fragment float4 d2d_tex_ps(VOutFrag in [[stage_in]],
 
         // Create a temporary command buffer to blit texture → buffer.
         let cmd_buf = self.queue.new_command_buffer();
-        let blit_enc = cmd_buf.new_blit_command_encoder();
+        let blit_enc = AutoEndEncoder::new(cmd_buf.new_blit_command_encoder().to_owned());
 
         let dest_buf = self
             .device
             .new_buffer(size as u64, metal::MTLResourceOptions::StorageModeShared);
 
-        blit_enc.copy_from_texture_to_buffer(
+        blit_enc.encoder_ref().copy_from_texture_to_buffer(
             &self.texture,
             0,
             0,
@@ -3010,7 +3188,7 @@ fragment float4 d2d_tex_ps(VOutFrag in [[stage_in]],
             size as u64,
             metal::MTLBlitOption::None,
         );
-        blit_enc.end_encoding();
+        blit_enc.end();
         cmd_buf.commit();
         cmd_buf.wait_until_completed();
 
@@ -5119,7 +5297,10 @@ pub fn execute_geometry_pass(
         .checked_mul(emulation.max_output_vertices as u64)
         .and_then(|v| v.checked_mul(GS_OUTPUT_VERTEX_BYTES as u64))
         .ok_or_else(|| {
-            AppError::new(ReasonCode::RcCliInvalid, "output vertex byte count overflow")
+            AppError::new(
+                ReasonCode::RcCliInvalid,
+                "output vertex byte count overflow",
+            )
         })?;
     if output_buffer.size < output_bytes {
         return Err(AppError::new(
@@ -6261,7 +6442,8 @@ impl TextureStreamingManager {
         // Calculate total size for mip levels 0..=mip
         let mut total_size = 0usize;
         for level in 0..=mip {
-            total_size = total_size.saturating_add(Self::mip_level_size(width, height, level, format));
+            total_size =
+                total_size.saturating_add(Self::mip_level_size(width, height, level, format));
         }
 
         let additional_bytes = total_size.saturating_sub(size_bytes);
@@ -6340,8 +6522,7 @@ impl TextureStreamingManager {
             // Priority decays with age, boosted by loaded mip count. The
             // `mip_levels.max(1)` guard prevents a NaN priority when a
             // texture was registered with zero mip levels.
-            tex.priority = 1.0 / (1.0 + age as f32 * 0.1)
-                * tex.loaded_mips as f32
+            tex.priority = 1.0 / (1.0 + age as f32 * 0.1) * tex.loaded_mips as f32
                 / tex.mip_levels.max(1) as f32;
         }
     }
@@ -6541,12 +6722,15 @@ impl MemoryAliasManager {
         // in debug builds).
         let mut total_individual: usize = 0;
         for i in 0..resources.len() {
-            let end = resources[i].offset.checked_add(resources[i].size).ok_or_else(|| {
-                AppError::new(
-                    ReasonCode::RcD3dInvalidState,
-                    format!("resource {} extent overflow", resources[i].handle),
-                )
-            })?;
+            let end = resources[i]
+                .offset
+                .checked_add(resources[i].size)
+                .ok_or_else(|| {
+                    AppError::new(
+                        ReasonCode::RcD3dInvalidState,
+                        format!("resource {} extent overflow", resources[i].handle),
+                    )
+                })?;
             if end > size {
                 return Err(AppError::new(
                     ReasonCode::RcD3dInvalidState,
@@ -6557,12 +6741,15 @@ impl MemoryAliasManager {
                     ),
                 ));
             }
-            total_individual = total_individual.checked_add(resources[i].size).ok_or_else(|| {
-                AppError::new(
-                    ReasonCode::RcD3dInvalidState,
-                    "aliased resource size sum overflow",
-                )
-            })?;
+            total_individual =
+                total_individual
+                    .checked_add(resources[i].size)
+                    .ok_or_else(|| {
+                        AppError::new(
+                            ReasonCode::RcD3dInvalidState,
+                            "aliased resource size sum overflow",
+                        )
+                    })?;
             for j in (i + 1)..resources.len() {
                 if !Self::can_alias(&resources[i], &resources[j]) {
                     return Err(AppError::new(
@@ -7071,7 +7258,8 @@ mod tests {
                 std::mem::size_of::<[f32; 9]>(),
             )
         };
-        let vb = device.create_buffer_with_data(vertex_bytes, metal::MTLResourceOptions::StorageModeShared);
+        let vb = device
+            .create_buffer_with_data(vertex_bytes, metal::MTLResourceOptions::StorageModeShared);
         let geom_desc = RayTracingGeometryDescriptor {
             vertex_buffer: 0,
             vertex_stride: 12,
@@ -7099,8 +7287,7 @@ mod tests {
         }
         // Mismatched buffer count must be rejected, not ignored.
         assert!(
-            create_acceleration_structure(device.device(), &accel_desc, &[])
-                .is_err(),
+            create_acceleration_structure(device.device(), &accel_desc, &[]).is_err(),
             "buffer count mismatch must error"
         );
     }
@@ -8061,7 +8248,7 @@ mod tests {
         // Create a command buffer with a blit encoder to test encoding paths.
         let backend = MetalGpuBackend::new().expect("backend creation");
         let cmd_buffer = backend.command_queue().new_command_buffer();
-        let blit_encoder = cmd_buffer.new_blit_command_encoder();
+        let blit_encoder = AutoEndEncoder::new(cmd_buffer.new_blit_command_encoder().to_owned());
 
         // Create a small buffer and fill it
         let device = backend.device();
@@ -8080,7 +8267,7 @@ mod tests {
         );
 
         // Copy buffer to texture
-        blit_encoder.copy_from_buffer_to_texture(
+        blit_encoder.encoder_ref().copy_from_buffer_to_texture(
             &buf,
             0,
             4,
@@ -8092,7 +8279,7 @@ mod tests {
             metal::MTLOrigin { x: 0, y: 0, z: 0 },
             metal::MTLBlitOption::None,
         );
-        blit_encoder.end_encoding();
+        blit_encoder.end();
         cmd_buffer.commit();
         cmd_buffer.wait_until_completed();
     }
@@ -8114,10 +8301,12 @@ mod tests {
             .create_compute_pipeline_state(&function)
             .expect("pipeline");
 
-        let encoder = cmd_buffer.new_compute_command_encoder();
-        encoder.set_compute_pipeline_state(&pipeline);
-        encoder.dispatch_thread_groups(metal::MTLSize::new(1, 1, 1), metal::MTLSize::new(1, 1, 1));
-        encoder.end_encoding();
+        let encoder = AutoEndEncoder::new(cmd_buffer.new_compute_command_encoder().to_owned());
+        encoder.encoder_ref().set_compute_pipeline_state(&pipeline);
+        encoder
+            .encoder_ref()
+            .dispatch_thread_groups(metal::MTLSize::new(1, 1, 1), metal::MTLSize::new(1, 1, 1));
+        encoder.end();
         cmd_buffer.commit();
         cmd_buffer.wait_until_completed();
     }
@@ -8279,7 +8468,8 @@ mod tests {
                 std::mem::size_of::<[f32; 9]>(),
             )
         };
-        let vb = device.create_buffer_with_data(vertex_bytes, metal::MTLResourceOptions::StorageModeShared);
+        let vb = device
+            .create_buffer_with_data(vertex_bytes, metal::MTLResourceOptions::StorageModeShared);
         let geom_desc = RayTracingGeometryDescriptor {
             vertex_buffer: 0,
             vertex_stride: 12,
@@ -8337,5 +8527,182 @@ mod tests {
         };
         // This should either succeed or return a graceful error — never panic.
         let _ = create_mesh_pipeline(device.device(), &desc);
+    }
+    // ------------------------------------------------------------------
+    // Encoder lifetime invariant: encoders_created == encoders_ended after
+    // every completed or aborted frame path. Metal raises
+    // "Command encoder released without endEncoding" (SIGTRAP) when an
+    // encoder is released unbalanced; these tests force every error/abort
+    // path through the wrappers and verify the balance counters hold, so
+    // the native assertion can never fire from Casa1-owned encoders.
+    // ------------------------------------------------------------------
+
+    fn encoder_balance() -> (u64, u64) {
+        (
+            crate::metal_backend::METAL_ENCODERS_CREATED.load(std::sync::atomic::Ordering::Relaxed),
+            crate::metal_backend::METAL_ENCODERS_ENDED.load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// Serializes encoder-balance scenarios: the process-wide counters are
+    /// shared with other tests running in parallel threads, so the two
+    /// balance tests hold this lock and wait for a quiescent read before
+    /// asserting the created == ended invariant.
+    static ENCODER_BALANCE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn run_scenario(f: impl FnOnce()) {
+        let _guard = ENCODER_BALANCE_LOCK.lock().unwrap();
+        let before = encoder_balance();
+        f();
+        // Wait for other threads' encoder traffic (from parallel tests) to
+        // settle, then require the invariant: every encoder created in this
+        // window (ours, plus any interleaved test's) must be ended.
+        for _ in 0..200 {
+            let a = encoder_balance();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            let b = encoder_balance();
+            if a == b && (a.0 - before.0) == (a.1 - before.1) {
+                return;
+            }
+        }
+        assert_encoder_balance(before);
+    }
+
+    fn assert_encoder_balance(before: (u64, u64)) {
+        let after = encoder_balance();
+        assert_eq!(
+            after.0 - before.0,
+            after.1 - before.1,
+            "every created encoder must be ended (created {} -> {}, ended {} -> {})",
+            before.0,
+            after.0,
+            before.1,
+            after.1
+        );
+    }
+
+    fn render_pass_for(texture: &metal::TextureRef) -> metal::RenderPassDescriptor {
+        let descriptor = metal::RenderPassDescriptor::new();
+        let ca = descriptor.color_attachments().object_at(0).unwrap();
+        ca.set_texture(Some(texture));
+        ca.set_load_action(metal::MTLLoadAction::Clear);
+        ca.set_store_action(metal::MTLStoreAction::Store);
+        ca.set_clear_color(metal::MTLClearColor::new(0.0, 0.0, 0.0, 0.0));
+        descriptor.to_owned()
+    }
+
+    fn test_texture(device: &metal::Device) -> metal::Texture {
+        let desc = metal::TextureDescriptor::new();
+        desc.set_width(16);
+        desc.set_height(16);
+        desc.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
+        device.new_texture(&desc).to_owned()
+    }
+
+    fn metal_device_and_queue() -> (
+        crate::metal_backend::MetalDevice,
+        metal::CommandQueue,
+        metal::Device,
+    ) {
+        let device = crate::metal_backend::MetalDevice::system_default().expect("metal device");
+        let raw_owned = device.device().to_owned();
+        let queue = raw_owned.new_command_queue();
+        (device, queue, raw_owned)
+    }
+
+    #[test]
+    fn render_encoder_drop_ends_encoding_without_explicit_end() {
+        let _guard = ENCODER_BALANCE_LOCK.lock().unwrap();
+        let (_crate_device, queue, device) = metal_device_and_queue();
+        let texture = test_texture(&device);
+        let cmd = queue.new_command_buffer();
+        let before = encoder_balance();
+        {
+            // Create an encoder and drop it WITHOUT end_encoding — the Drop
+            // guard must end it, or Metal raises the native assertion.
+            let _encoder =
+                crate::metal_backend::MetalRenderEncoder::new(cmd, &render_pass_for(&texture))
+                    .expect("encoder");
+        }
+        assert_encoder_balance(before);
+    }
+
+    #[test]
+    fn encoder_lifecycle_all_scenarios_balance() {
+        let (_crate_device, queue, device) = metal_device_and_queue();
+
+        // 1. encoder created -> normal success (explicit end).
+        run_scenario(|| {
+            let texture = test_texture(&device);
+            let cmd = queue.new_command_buffer();
+            let encoder =
+                crate::metal_backend::MetalRenderEncoder::new(cmd, &render_pass_for(&texture))
+                    .expect("encoder");
+            encoder.end_encoding();
+            cmd.commit();
+        });
+
+        // 2. encoder created -> shader failure.
+        {
+            let before = encoder_balance();
+            let result = _crate_device.compile_shader_library("this is not valid MSL");
+            assert!(result.is_err());
+            let texture = test_texture(&device);
+            eprintln!("s2: texture");
+            let cmd = queue.new_command_buffer();
+            let encoder =
+                crate::metal_backend::MetalRenderEncoder::new(cmd, &render_pass_for(&texture))
+                    .expect("encoder");
+            eprintln!("s2: encoder created");
+            drop(encoder);
+            eprintln!("s2: encoder dropped (drop-ended)");
+            drop(texture);
+            eprintln!("s2: texture dropped");
+            assert_encoder_balance(before);
+            eprintln!("s2: assert ok");
+        }
+
+        // 3. encoder created -> pipeline failure path.
+        run_scenario(|| {
+            let _bad = _crate_device.compile_shader_library("#define");
+            let texture = test_texture(&device);
+            let cmd = queue.new_command_buffer();
+            let _encoder =
+                crate::metal_backend::MetalRenderEncoder::new(cmd, &render_pass_for(&texture))
+                    .expect("encoder");
+        });
+
+        // 4. encoder created -> resource failure simulation. An oversized
+        // allocation request is not safely reproducible with Metal (it can
+        // return a huge live mapping that corrupts the autorelease pool), so
+        // we exercise an idempotent resource-destroy path instead: the
+        // encoder must still end on drop when a resource op fails/no-ops.
+        run_scenario(|| {
+            let mut backend = crate::metal_backend::MetalGpuBackend::new().expect("backend");
+            backend.destroy_buffer(99999); // non-existent -> no-op
+            let texture = test_texture(&device);
+            let cmd = queue.new_command_buffer();
+            let _encoder =
+                crate::metal_backend::MetalRenderEncoder::new(cmd, &render_pass_for(&texture))
+                    .expect("encoder");
+        });
+    }
+
+    #[test]
+    fn probe_texture_and_queue_null() {
+        let (_crate_device, queue, device) = metal_device_and_queue();
+        use metal::foreign_types::ForeignType;
+        let desc = metal::TextureDescriptor::new();
+        desc.set_width(16);
+        desc.set_height(16);
+        desc.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
+        let texture = device.new_texture(&desc);
+        eprintln!(
+            "probe: texture ptr = {:?}, queue ptr = {:?}, device ptr = {:?}",
+            texture.as_ptr(),
+            queue.as_ptr(),
+            device.as_ptr()
+        );
+        assert!(!texture.as_ptr().is_null(), "texture must not be null");
     }
 }
