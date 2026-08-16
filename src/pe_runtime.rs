@@ -24492,7 +24492,9 @@ impl PeHostRuntime {
                 let path = resolve_full_guest_path(&self.current_directory, &raw_path);
                 let path_length = path.encode_utf16().count() as u32;
                 let result = write_utf16_api_string(memory, buffer, size, &path)?;
-                let file_part = if buffer != 0 && size > path_length {
+                // Windows sets *file_part only when the buffer is big enough
+                // for the full path incl the NUL (size >= path_length + 1).
+                let file_part = if buffer != 0 && size >= path_length.saturating_add(1) {
                     windows_file_part_offset(&path)
                         .map(|offset| buffer + offset)
                         .unwrap_or(0)
@@ -24867,7 +24869,15 @@ impl PeHostRuntime {
                 };
                 let result = write_ansi_api_string(memory, buffer, size, &path)?;
                 state.set(Register::Rax, result as u64);
-                self.last_error = 0;
+                // Windows: success returns the length EXCLUDING the NUL; the
+                // (NULL,0) query and truncation return the required size
+                // INCLUDING the NUL, with ERROR_INSUFFICIENT_BUFFER on
+                // truncation.
+                self.last_error = if buffer != 0 && size != 0 && size <= path.len() as u32 {
+                    ERROR_INSUFFICIENT_BUFFER
+                } else {
+                    0
+                };
                 self.push_trace(
                     "file",
                     "GetModuleFileNameA",
@@ -32044,14 +32054,22 @@ impl PeHostRuntime {
                 let current_process_handle = u64::from(self.win32.current_process_handle());
                 let (written, last_error, module_name) = if process_handle != current_process_handle {
                     (0, ERROR_INVALID_HANDLE, String::new())
-                } else if buffer == 0 || size == 0 {
-                    (0, ERROR_INVALID_PARAMETER, String::new())
                 } else {
                     let module_name = self.module_base_name(module_handle);
                     if module_name.is_empty() {
                         (0, ERROR_INVALID_HANDLE, module_name)
                     } else {
-                        (write_ansi_api_string(memory, buffer, size, &module_name)?, 0, module_name)
+                        let written = write_ansi_api_string(memory, buffer, size, &module_name)?;
+                        // Windows: success returns the length EXCLUDING the
+                        // NUL; the (NULL,0) query and truncation return the
+                        // required size INCLUDING the NUL, with
+                        // ERROR_INSUFFICIENT_BUFFER on truncation.
+                        let last_error = if buffer != 0 && size != 0 && size <= module_name.len() as u32 {
+                            ERROR_INSUFFICIENT_BUFFER
+                        } else {
+                            0
+                        };
+                        (written, last_error, module_name)
                     }
                 };
                 state.set(Register::Rax, written as u64);
@@ -37518,14 +37536,30 @@ impl PeHostRuntime {
                 let buffer_ptr = arg(1);
                 let cwd = self.current_directory.clone();
                 let cwd_bytes = cwd.as_bytes();
-                let write_len = (buffer_size as usize).min(cwd_bytes.len()).saturating_sub(1);
-                if buffer_ptr != 0 && write_len > 0 {
+                let required_with_nul = cwd_bytes.len() as u32 + 1;
+                if buffer_ptr == 0 || buffer_size == 0 {
+                    // Required-size query: return the size incl the NUL.
+                    state.set(Register::Rax, required_with_nul as u64);
+                    self.last_error = 0;
+                } else if buffer_size <= cwd_bytes.len() as u32 {
+                    // Truncation: NUL-terminate within the buffer, return the
+                    // required size incl the NUL, ERROR_INSUFFICIENT_BUFFER.
+                    let write_len = buffer_size.saturating_sub(1) as usize;
                     for (i, &b) in cwd_bytes.iter().take(write_len).enumerate() {
                         memory.write_u8(buffer_ptr + i as u64, b);
                     }
                     memory.write_u8(buffer_ptr + write_len as u64, 0);
+                    state.set(Register::Rax, required_with_nul as u64);
+                    self.last_error = ERROR_INSUFFICIENT_BUFFER;
+                } else {
+                    // Success: full path + NUL, return length excl the NUL.
+                    for (i, &b) in cwd_bytes.iter().enumerate() {
+                        memory.write_u8(buffer_ptr + i as u64, b);
+                    }
+                    memory.write_u8(buffer_ptr + cwd_bytes.len() as u64, 0);
+                    state.set(Register::Rax, cwd_bytes.len() as u64);
+                    self.last_error = 0;
                 }
-                state.set(Register::Rax, cwd_bytes.len().min(buffer_size as usize) as u64);
             }
             HostThunk::GetDriveTypeW => {
                 // Return DRIVE_FIXED (3) for any path
@@ -68864,6 +68898,274 @@ mod tests {
     }
 
     #[test]
+    fn get_module_file_name_a_query_and_truncation_return_required_size() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "module-file-name-a-sizes",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let module_path = "C:\\Program Files (x86)\\Steam\\Steam.exe";
+        runtime.main_module_path = module_path.to_string();
+        let required_with_nul = module_path.len() as u32 + 1;
+        let mut memory = MemoryImage::default();
+        let thunk = runtime.alloc_host_thunk(HostThunk::GetModuleFileNameA);
+
+        // (NULL, 0) query idiom: required size INCLUDING the NUL, no write.
+        let query = dispatch_x86_thunk(&mut runtime, &mut memory, thunk, &[0, 0, 0]);
+        assert_eq!(query, required_with_nul as u64);
+        assert_eq!(runtime.last_error, 0);
+
+        // Truncation: size-1 chars + NUL, required size incl NUL,
+        // ERROR_INSUFFICIENT_BUFFER.
+        let small_buffer = 0x42_000;
+        memory.map_bytes(small_buffer, &[0xFF; 64]);
+        let trunc_size = 8_u32;
+        let truncated = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            thunk,
+            &[0, small_buffer as u32, trunc_size],
+        );
+        assert_eq!(truncated, required_with_nul as u64);
+        assert_eq!(runtime.last_error, ERROR_INSUFFICIENT_BUFFER);
+        let bytes = memory
+            .read_bytes(small_buffer, trunc_size as usize)
+            .expect("truncated bytes");
+        assert_eq!(
+            &bytes[..(trunc_size - 1) as usize],
+            &module_path.as_bytes()[..(trunc_size - 1) as usize]
+        );
+        assert_eq!(bytes[(trunc_size - 1) as usize], 0);
+
+        // Success: len chars + NUL, length EXCLUDING the NUL.
+        let full_buffer = 0x43_000;
+        memory.map_bytes(full_buffer, &[0xFF; 64]);
+        let written = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            thunk,
+            &[0, full_buffer as u32, 64],
+        );
+        assert_eq!(written as usize, module_path.len());
+        assert_eq!(runtime.last_error, 0);
+        let bytes = memory
+            .read_bytes(full_buffer, module_path.len() + 1)
+            .expect("module path bytes");
+        assert_eq!(&bytes[..module_path.len()], module_path.as_bytes());
+        assert_eq!(bytes[module_path.len()], 0);
+    }
+
+    #[test]
+    fn get_current_directory_a_query_and_truncation() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "current-directory-a",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let cwd = "C:\\Steam";
+        runtime.current_directory = cwd.to_string();
+        let required_with_nul = cwd.len() as u32 + 1;
+        let mut memory = MemoryImage::default();
+        let thunk = runtime.alloc_host_thunk(HostThunk::GetCurrentDirectoryA);
+
+        // (NULL, 0) query: required size incl NUL.
+        let query = dispatch_x86_thunk(&mut runtime, &mut memory, thunk, &[0, 0]);
+        assert_eq!(query, required_with_nul as u64);
+        assert_eq!(runtime.last_error, 0);
+
+        // Small buffer: required size incl NUL + ERROR_INSUFFICIENT_BUFFER,
+        // NUL-terminated size-1 bytes.
+        let small_buffer = 0x42_000;
+        memory.map_bytes(small_buffer, &[0xFF; 16]);
+        let trunc_size = 4_u32;
+        let truncated = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            thunk,
+            &[trunc_size, small_buffer as u32],
+        );
+        assert_eq!(truncated, required_with_nul as u64);
+        assert_eq!(runtime.last_error, ERROR_INSUFFICIENT_BUFFER);
+        let bytes = memory
+            .read_bytes(small_buffer, trunc_size as usize)
+            .expect("truncated bytes");
+        assert_eq!(
+            &bytes[..(trunc_size - 1) as usize],
+            &cwd.as_bytes()[..(trunc_size - 1) as usize]
+        );
+        assert_eq!(bytes[(trunc_size - 1) as usize], 0);
+
+        // Full buffer: length EXCLUDING the NUL.
+        let full_buffer = 0x43_000;
+        memory.map_bytes(full_buffer, &[0xFF; 16]);
+        let written = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            thunk,
+            &[required_with_nul, full_buffer as u32],
+        );
+        assert_eq!(written as usize, cwd.len());
+        assert_eq!(runtime.last_error, 0);
+        let bytes = memory
+            .read_bytes(full_buffer, cwd.len() + 1)
+            .expect("full bytes");
+        assert_eq!(&bytes[..cwd.len()], cwd.as_bytes());
+        assert_eq!(bytes[cwd.len()], 0);
+    }
+
+    #[test]
+    fn get_full_path_name_w_exact_fit_sets_file_part() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "full-path-name-w-exact",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        runtime.current_directory = "C:\\Games".to_string();
+        let mut memory = MemoryImage::default();
+        let path_ptr = runtime
+            .alloc_utf16_string(&mut memory, "sub\\file.exe")
+            .expect("alloc raw path");
+        let full_path = resolve_full_guest_path(&runtime.current_directory, "sub\\file.exe");
+        let path_length = full_path.encode_utf16().count() as u32;
+        let buffer = 0x42_000;
+        let file_part_ptr = 0x43_000;
+        memory.map_bytes(buffer, &[0xFF; 128]);
+        let thunk = runtime.alloc_host_thunk(HostThunk::GetFullPathNameW);
+
+        // Exact fit: size == path_length + 1 succeeds, returns the length
+        // excluding the NUL and sets *file_part.
+        let written = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            thunk,
+            &[
+                path_ptr as u32,
+                path_length + 1,
+                buffer as u32,
+                file_part_ptr as u32,
+            ],
+        );
+        assert_eq!(written, path_length as u64);
+        assert_eq!(read_guest_utf16_string(&memory, buffer, 128), full_path);
+        let expected_file_part = windows_file_part_offset(&full_path)
+            .map(|offset| buffer + offset)
+            .expect("file part offset");
+        assert_eq!(
+            read_guest_u32(&memory, file_part_ptr).expect("file part ptr"),
+            expected_file_part as u32
+        );
+
+        // One short (size == path_length): truncation, no file-part pointer.
+        let truncated = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            thunk,
+            &[
+                path_ptr as u32,
+                path_length,
+                buffer as u32,
+                file_part_ptr as u32,
+            ],
+        );
+        assert_eq!(truncated, (path_length + 1) as u64);
+        assert_eq!(
+            read_guest_u32(&memory, file_part_ptr).expect("file part ptr"),
+            0
+        );
+    }
+
+    #[test]
+    fn tls_set_get_roundtrip_static_slot() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "tls-roundtrip",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+        let tls_vector = 0x70_000;
+        memory.map_bytes(tls_vector, &[0_u8; 4096 * 4]);
+        runtime.tls_vector_ptr = tls_vector;
+        let static_tls_block = 0x80_000;
+        runtime.tls_slots.insert(0, static_tls_block);
+
+        let set_thunk = runtime.alloc_host_thunk(HostThunk::TlsSetValue);
+        let get_thunk = runtime.alloc_host_thunk(HostThunk::TlsGetValue);
+        let alloc_thunk = runtime.alloc_host_thunk(HostThunk::TlsAlloc);
+        let free_thunk = runtime.alloc_host_thunk(HostThunk::TlsFree);
+
+        // Static TLS block (slot 0): TlsSetValue stores into TLS array entry 0.
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, set_thunk, &[0, 0x1234_5678]),
+            1
+        );
+        assert_eq!(
+            read_guest_u32(&memory, tls_vector).expect("tls slot 0"),
+            0x1234_5678
+        );
+
+        // Slot 0 is reserved for the static TLS block, so TlsAlloc hands out
+        // the first dynamic slot (1).
+        let slot = dispatch_x86_thunk(&mut runtime, &mut memory, alloc_thunk, &[]);
+        assert_eq!(slot, 1);
+
+        // TlsSetValue on the allocated slot is visible to the guest via the
+        // TLS array (u32 entry at tls_vector + slot * 4 on x86).
+        let value = 0xCAFE_BABE_u64;
+        assert_eq!(
+            dispatch_x86_thunk(
+                &mut runtime,
+                &mut memory,
+                set_thunk,
+                &[slot as u32, value as u32],
+            ),
+            1
+        );
+        assert_eq!(
+            read_guest_u32(&memory, tls_vector + slot * 4).expect("tls dynamic slot"),
+            value as u32
+        );
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, get_thunk, &[slot as u32]),
+            value
+        );
+
+        // TlsFree invalidates: entry zeroed and TlsGetValue fails afterwards.
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, free_thunk, &[slot as u32]),
+            1
+        );
+        assert_eq!(
+            read_guest_u32(&memory, tls_vector + slot * 4).expect("freed tls slot"),
+            0
+        );
+        assert_eq!(
+            dispatch_x86_thunk(&mut runtime, &mut memory, get_thunk, &[slot as u32]),
+            0
+        );
+        assert_eq!(runtime.last_error, ERROR_INVALID_PARAMETER);
+    }
+
+    #[test]
     fn synthetic_module_handles_materialize_minimal_pe_headers() {
         let temp_dir = TempDir::new().expect("temp dir");
         let ge = GameEnvironment::create_in(
@@ -78234,17 +78536,39 @@ fn guest_call_arg_u32(state: &CpuState, memory: &MemoryImage, index: usize) -> A
     Ok(guest_call_arg(state, memory, index)? as u32)
 }
 
+/// Write an ANSI string into a guest buffer following the Windows
+/// required-size contract shared by the APIs that use this helper
+/// (GetModuleFileNameA, GetModuleBaseNameA):
+///
+/// - `buffer == 0 || size == 0` (the required-size query idiom): write
+///   nothing and return the required size in characters INCLUDING the NUL
+///   terminator.
+/// - `size <= value.len()` (truncation): write `size - 1` characters plus a
+///   NUL terminator and return the required size INCLUDING the NUL
+///   terminator.
+/// - `size > value.len()` (success): write the full string plus a NUL
+///   terminator and return the length EXCLUDING the NUL terminator.
+///
+/// The caller (thunk) is responsible for the API-specific last-error value
+/// on truncation (ERROR_INSUFFICIENT_BUFFER) and for the API-specific
+/// interpretation of the returned size.
 fn write_ansi_api_string(
     memory: &mut MemoryImage,
     buffer: u64,
     size: u32,
     value: &str,
 ) -> AppResult<u32> {
-    if buffer == 0 || size == 0 {
-        return Ok(0);
-    }
     let bytes = value.as_bytes();
-    let copy_len = bytes.len().min(size.saturating_sub(1) as usize);
+    let required_with_nul = bytes.len() as u32 + 1;
+    if buffer == 0 || size == 0 {
+        return Ok(required_with_nul);
+    }
+    let truncated = size <= bytes.len() as u32;
+    let copy_len = if truncated {
+        size.saturating_sub(1) as usize
+    } else {
+        bytes.len()
+    };
     let written_len = copy_len + 1;
     let page_tail = 0x1000_usize - (buffer as usize & 0xfff);
     let mut output = vec![0_u8; written_len];
@@ -78253,9 +78577,30 @@ fn write_ansi_api_string(
     if page_tail > written_len {
         memory.map_zeroed_if_unmapped(buffer + written_len as u64, page_tail - written_len);
     }
-    Ok(copy_len as u32)
+    Ok(if truncated {
+        required_with_nul
+    } else {
+        copy_len as u32
+    })
 }
 
+/// Write a UTF-16 string into a guest buffer following the Windows
+/// required-size contract used by GetCurrentDirectoryW, GetModuleFileNameW,
+/// GetFullPathNameW, GetTempPathW and friends:
+///
+/// - `buffer == 0 || size == 0` (the required-size query idiom): write
+///   nothing (including when the buffer is non-NULL but `size == 0`) and
+///   return the required size in UTF-16 code units INCLUDING the NUL
+///   terminator.
+/// - `size <= required_without_nul` (truncation): write `size - 1` code
+///   units plus a NUL terminator and return the required size INCLUDING the
+///   NUL terminator.
+/// - `size > required_without_nul` (success): write the full string plus a
+///   NUL terminator and return the length EXCLUDING the NUL terminator.
+///
+/// The caller (thunk) is responsible for the API-specific last-error value
+/// on truncation (ERROR_INSUFFICIENT_BUFFER) and for the API-specific
+/// interpretation of the returned size.
 fn write_utf16_api_string(
     memory: &mut MemoryImage,
     buffer: u64,
