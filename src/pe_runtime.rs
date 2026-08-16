@@ -288,6 +288,9 @@ fn emit_window_msg_debug(message: String) {
 }
 const OPEN_ALWAYS: u32 = 4;
 const TRUNCATE_EXISTING: u32 = 5;
+/// Maximum UTF-16 code units accepted for a CreateFileW path. 32,768 units
+/// comfortably covers `\\?\` extended-length paths.
+const MAX_CREATE_FILE_PATH_UTF16_UNITS: usize = 32_768;
 const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
 const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
 const ERROR_FILE_NOT_FOUND: u32 = 2;
@@ -3573,7 +3576,6 @@ struct PeHostRuntime {
     common_controls_flags: u32,
     /// Animation settings (from SystemParametersInfoW SPI_GETANIMATION/SETANIMATION)
     animation_settings: u32,
-    recent_wide_writes: BTreeMap<u64, String>,
     error_mode: u32,
     last_error: u32,
     invalid_parameter_handler: u64,
@@ -8192,7 +8194,6 @@ impl PeHostRuntime {
             common_controls_initialized: false,
             common_controls_flags: 0,
             animation_settings: 0,
-            recent_wide_writes: BTreeMap::new(),
             error_mode: 0,
             last_error: 0,
             invalid_parameter_handler: 0,
@@ -26671,38 +26672,6 @@ impl PeHostRuntime {
                     std::cmp::Ordering::Equal => 0,
                     std::cmp::Ordering::Greater => 1,
                 };
-                if self.guest_arch == GuestArch::X86 {
-                    let return_address = read_guest_u32(memory, state.get(Register::Rsp))
-                        .ok()
-                        .map(u64::from);
-                    if return_address == Some(0x401a01) {
-                        let record_address = read_guest_u32(memory, state.get(Register::Rbp) + 8)
-                            .ok()
-                            .map(u64::from);
-                        let record_base = read_guest_u32(memory, 0x42a270).ok().map(u64::from);
-                        let record_index = record_address.and_then(|address| {
-                            record_base.and_then(|base| {
-                                address
-                                    .checked_sub(base)
-                                    .map(|offset| offset / 0x1c)
-                            })
-                        });
-                        if record_index == Some(0x6ac) && result != 0 {
-                            return Err(AppError::new(
-                                ReasonCode::RcUnimplInsn,
-                                format!(
-                                    "steam opcode 0x1a compare mismatched for record 0x6ac: left={left:?} right={right:?} result={result}"
-                                ),
-                            )
-                            .with_hint(format!(
-                                "steam-0x1a compare record_address={} left_ptr={left_ptr:#x} right_ptr={right_ptr:#x}",
-                                record_address
-                                    .map(|value| format!("{value:#x}"))
-                                    .unwrap_or_else(|| "<unavailable>".to_string())
-                            )));
-                        }
-                    }
-                }
                 state.set(Register::Rax, result as i64 as u64);
                 self.last_error = 0;
             }
@@ -26792,10 +26761,6 @@ impl PeHostRuntime {
                     }
                     bytes.extend_from_slice(&0_u16.to_le_bytes());
                     memory.map_bytes(destination, &bytes);
-                    self.recent_wide_writes.insert(
-                        destination,
-                        String::from_utf16_lossy(&units[..copy_count]),
-                    );
                 }
                 state.set(Register::Rax, destination);
                 self.last_error = 0;
@@ -26835,7 +26800,6 @@ impl PeHostRuntime {
                     }
                     bytes.extend_from_slice(&0_u16.to_le_bytes());
                     memory.map_bytes(destination, &bytes);
-                    self.recent_wide_writes.insert(destination, combined.clone());
                 }
                 state.set(Register::Rax, destination);
                 self.last_error = 0;
@@ -26967,7 +26931,6 @@ impl PeHostRuntime {
                                 .flat_map(|unit| unit.to_le_bytes())
                                 .collect::<Vec<_>>();
                             memory.map_bytes(buffer_ptr, &bytes);
-                            self.recent_wide_writes.insert(buffer_ptr, value.clone());
                             state.set(Register::Rax, value.encode_utf16().count() as u64);
                             self.last_error = 0;
                         }
@@ -28420,21 +28383,13 @@ impl PeHostRuntime {
             }
             HostThunk::CreateFileW => {
                 let path_ptr = guest_call_arg(state, memory, 0)?;
-                let raw_path = read_utf16_string(memory, path_ptr)?;
-                let recovered_raw_path = if return_address == 0x405d7f {
-                    windows_drive_prefix(&raw_path)
-                        .filter(|_| raw_path[2..].is_empty())
-                        .and_then(|drive_prefix| self.recent_wide_writes.get(&path_ptr).cloned().filter(|candidate| {
-                            candidate.len() > raw_path.len()
-                                && windows_drive_prefix(candidate)
-                                    .map(|candidate_drive| candidate_drive.eq_ignore_ascii_case(drive_prefix))
-                                    .unwrap_or(false)
-                        }))
-                } else {
-                    None
-                };
-                let effective_raw_path = recovered_raw_path.as_deref().unwrap_or(&raw_path);
-                let path = resolve_guest_path(&self.current_directory, effective_raw_path);
+                // Read the path with the authoritative, fully validating
+                // reader: guest strings written immediately before the call
+                // are visible directly (same address space, no caching), so
+                // no caller-address-specific recovery is needed. 32,768 code
+                // units comfortably covers `\\?\` extended-length paths.
+                let raw_path = read_utf16z(memory, path_ptr, MAX_CREATE_FILE_PATH_UTF16_UNITS)?;
+                let path = resolve_guest_path(&self.current_directory, &raw_path);
                 let desired_access_raw = guest_call_arg_u32(state, memory, 1)?;
                 let share_mode_raw = guest_call_arg_u32(state, memory, 2)?;
                 let security_attributes = guest_call_arg(state, memory, 3)?;
@@ -28451,8 +28406,8 @@ impl PeHostRuntime {
                 };
 
                 // Route `\\.\pipe\*` paths to the named-pipe client opener.
-                if effective_raw_path.starts_with("\\\\.\\pipe\\") || effective_raw_path.starts_with("\\\\?\\pipe\\") {
-                    match self.win32.open_named_pipe_client(effective_raw_path, inheritable) {
+                if raw_path.starts_with("\\\\.\\pipe\\") || raw_path.starts_with("\\\\?\\pipe\\") {
+                    match self.win32.open_named_pipe_client(&raw_path, inheritable) {
                         Ok(handle) => {
                             state.set(Register::Rax, handle as u64);
                             self.last_error = 0;
@@ -28463,8 +28418,7 @@ impl PeHostRuntime {
                                     ("caller_rip".to_string(), json!(format!("{return_address:#x}"))),
                                     ("path_ptr".to_string(), json!(format!("{path_ptr:#x}"))),
                                     ("path_raw".to_string(), json!(raw_path)),
-                                    ("path_recovered".to_string(), json!(recovered_raw_path)),
-                                    ("path".to_string(), json!(effective_raw_path)),
+                                    ("path".to_string(), json!(path.clone())),
                                     ("cwd".to_string(), json!(self.current_directory.clone())),
                                     ("desired_access".to_string(), json!(desired_access_raw)),
                                     ("share_mode".to_string(), json!(share_mode_raw)),
@@ -28485,8 +28439,7 @@ impl PeHostRuntime {
                                     ("caller_rip".to_string(), json!(format!("{return_address:#x}"))),
                                     ("path_ptr".to_string(), json!(format!("{path_ptr:#x}"))),
                                     ("path_raw".to_string(), json!(raw_path)),
-                                    ("path_recovered".to_string(), json!(recovered_raw_path)),
-                                    ("path".to_string(), json!(effective_raw_path)),
+                                    ("path".to_string(), json!(path)),
                                     ("cwd".to_string(), json!(self.current_directory.clone())),
                                     ("desired_access".to_string(), json!(desired_access_raw)),
                                     ("share_mode".to_string(), json!(share_mode_raw)),
@@ -28499,147 +28452,264 @@ impl PeHostRuntime {
                             );
                         }
                     }
-                } else if template_file != 0 {
-                    state.set(Register::Rax, INVALID_HANDLE_VALUE);
-                    self.last_error = ERROR_INVALID_PARAMETER;
-                    self.push_trace(
-                        "file",
-                        "CreateFileW",
-                        BTreeMap::from([
-                            ("caller_rip".to_string(), json!(format!("{return_address:#x}"))),
-                            ("path_ptr".to_string(), json!(format!("{path_ptr:#x}"))),
-                            ("path_raw".to_string(), json!(raw_path.clone())),
-                            ("path_recovered".to_string(), json!(recovered_raw_path.clone())),
-                            ("path".to_string(), json!(path.clone())),
-                            ("cwd".to_string(), json!(self.current_directory.clone())),
-                            ("desired_access".to_string(), json!(desired_access_raw)),
-                            ("share_mode".to_string(), json!(share_mode_raw)),
-                            ("creation_disposition".to_string(), json!(creation_raw)),
-                            ("inheritable".to_string(), json!(inheritable)),
-                            ("error".to_string(), json!(ERROR_INVALID_PARAMETER)),
-                        ]),
-                        json!(INVALID_HANDLE_VALUE),
-                    );
                 } else {
-                    let (base_guest_path, ads_stream) = parse_ntfs_path(&path);
-                    if let Some(stream) = ads_stream {
-                        // NTFS Alternate Data Stream path detected.
-                        // Open the base file and register the ADS handle mapping.
-                        match creation_disposition_from_win32(creation_raw).and_then(|creation| {
-                            self.win32.create_file_w(
-                                &base_guest_path,
-                                desired_access,
-                                share_mode,
-                                creation,
-                                inheritable,
-                                flags_and_attributes & FILE_FLAG_OVERLAPPED != 0,
-                                flags_and_attributes & FILE_FLAG_BACKUP_SEMANTICS != 0,
-                            )
-                        }) {
-                            Ok(handle) => {
-                                self.ads_handles.insert(handle, (base_guest_path.clone(), stream.stream_name.clone()));
-                                state.set(Register::Rax, handle as u64);
-                                self.last_error = 0;
-                                self.push_trace(
-                                    "file",
-                                    "CreateFileW",
-                                    BTreeMap::from([
-                                        ("caller_rip".to_string(), json!(format!("{return_address:#x}"))),
-                                        ("path_ptr".to_string(), json!(format!("{path_ptr:#x}"))),
-                                        ("path_raw".to_string(), json!(raw_path)),
-                                        ("path_recovered".to_string(), json!(recovered_raw_path.clone())),
-                                        ("path".to_string(), json!(path)),
-                                        ("cwd".to_string(), json!(self.current_directory.clone())),
-                                        ("desired_access".to_string(), json!(desired_access_raw)),
-                                        ("share_mode".to_string(), json!(share_mode_raw)),
-                                        ("creation_disposition".to_string(), json!(creation_raw)),
-                                        ("inheritable".to_string(), json!(inheritable)),
-                                        ("ads".to_string(), json!(true)),
-                                        ("stream".to_string(), json!(stream.stream_name)),
-                                    ]),
-                                    json!(handle),
-                                );
-                            }
-                            Err(error) => {
-                                state.set(Register::Rax, INVALID_HANDLE_VALUE);
-                                self.last_error = last_error_from_app_error(&error);
-                                self.push_trace(
-                                    "file",
-                                    "CreateFileW",
-                                    BTreeMap::from([
-                                        ("caller_rip".to_string(), json!(format!("{return_address:#x}"))),
-                                        ("path_ptr".to_string(), json!(format!("{path_ptr:#x}"))),
-                                        ("path_raw".to_string(), json!(raw_path)),
-                                        ("path_recovered".to_string(), json!(recovered_raw_path)),
-                                        ("path".to_string(), json!(path)),
-                                        ("cwd".to_string(), json!(self.current_directory.clone())),
-                                        ("desired_access".to_string(), json!(desired_access_raw)),
-                                        ("share_mode".to_string(), json!(share_mode_raw)),
-                                        ("creation_disposition".to_string(), json!(creation_raw)),
-                                        ("inheritable".to_string(), json!(inheritable)),
-                                        ("error".to_string(), json!(self.last_error)),
-                                        ("ads".to_string(), json!(true)),
-                                        ("stream".to_string(), json!(stream.stream_name)),
-                                    ]),
-                                    json!(INVALID_HANDLE_VALUE),
-                                );
-                            }
-                        }
+                    // hTemplateFile (arg 6) resolution, per Win32 semantics:
+                    // - 0 (NULL): no template file; plain create/open.
+                    // - Non-zero: must be a valid file handle in the object
+                    //   table whose metadata can be read (the docs require
+                    //   GENERIC_READ access to the template file). Any
+                    //   failure — unknown handle, non-file object, or
+                    //   unreadable metadata — fails the call with
+                    //   ERROR_INVALID_HANDLE (6).
+                    // - The template's attributes are copied to the file ONLY
+                    //   when the disposition creates a NEW file (CREATE_NEW,
+                    //   CREATE_ALWAYS, or OPEN_ALWAYS on a file that does not
+                    //   yet exist). When the call merely opens an existing
+                    //   file (OPEN_EXISTING, TRUNCATE_EXISTING, or
+                    //   OPEN_ALWAYS on an existing file), hTemplateFile is
+                    //   ignored, per the docs.
+                    let template_attributes = if template_file == 0 {
+                        Ok(None)
                     } else {
-                        // Normal (non-ADS) file creation
-                        match creation_disposition_from_win32(creation_raw).and_then(|creation| {
-                            self.win32.create_file_w(
-                                &path,
-                                desired_access,
-                                share_mode,
-                                creation,
-                                inheritable,
-                                flags_and_attributes & FILE_FLAG_OVERLAPPED != 0,
-                                flags_and_attributes & FILE_FLAG_BACKUP_SEMANTICS != 0,
-                            )
-                        }) {
-                            Ok(handle) => {
-                                state.set(Register::Rax, handle as u64);
-                                self.last_error = 0;
-                                self.push_trace(
-                                    "file",
-                                    "CreateFileW",
-                                    BTreeMap::from([
-                                        ("caller_rip".to_string(), json!(format!("{return_address:#x}"))),
-                                        ("path_ptr".to_string(), json!(format!("{path_ptr:#x}"))),
-                                        ("path_raw".to_string(), json!(raw_path)),
-                                        ("path_recovered".to_string(), json!(recovered_raw_path.clone())),
-                                        ("path".to_string(), json!(path)),
-                                        ("cwd".to_string(), json!(self.current_directory.clone())),
-                                        ("desired_access".to_string(), json!(desired_access_raw)),
-                                        ("share_mode".to_string(), json!(share_mode_raw)),
-                                        ("creation_disposition".to_string(), json!(creation_raw)),
-                                        ("inheritable".to_string(), json!(inheritable)),
-                                    ]),
-                                    json!(handle),
-                                );
-                            }
-                            Err(error) => {
-                                state.set(Register::Rax, INVALID_HANDLE_VALUE);
-                                self.last_error = last_error_from_app_error(&error);
-                                self.push_trace(
-                                    "file",
-                                    "CreateFileW",
-                                    BTreeMap::from([
-                                        ("caller_rip".to_string(), json!(format!("{return_address:#x}"))),
-                                        ("path_ptr".to_string(), json!(format!("{path_ptr:#x}"))),
-                                        ("path_raw".to_string(), json!(raw_path)),
-                                        ("path_recovered".to_string(), json!(recovered_raw_path)),
-                                        ("path".to_string(), json!(path)),
-                                        ("cwd".to_string(), json!(self.current_directory.clone())),
-                                        ("desired_access".to_string(), json!(desired_access_raw)),
-                                        ("share_mode".to_string(), json!(share_mode_raw)),
-                                        ("creation_disposition".to_string(), json!(creation_raw)),
-                                        ("inheritable".to_string(), json!(inheritable)),
-                                        ("error".to_string(), json!(self.last_error)),
-                                    ]),
-                                    json!(INVALID_HANDLE_VALUE),
-                                );
+                        self.win32
+                            .file_state(template_file as u32)
+                            .and_then(|state| {
+                                self.win32.get_file_attributes_w(&state.normalized_path)
+                            })
+                            .map(Some)
+                    };
+                    match template_attributes {
+                        Err(_) => {
+                            state.set(Register::Rax, INVALID_HANDLE_VALUE);
+                            self.last_error = ERROR_INVALID_HANDLE;
+                            self.push_trace(
+                                "file",
+                                "CreateFileW",
+                                BTreeMap::from([
+                                    ("caller_rip".to_string(), json!(format!("{return_address:#x}"))),
+                                    ("path_ptr".to_string(), json!(format!("{path_ptr:#x}"))),
+                                    ("path_raw".to_string(), json!(raw_path.clone())),
+                                    ("path".to_string(), json!(path.clone())),
+                                    ("cwd".to_string(), json!(self.current_directory.clone())),
+                                    ("desired_access".to_string(), json!(desired_access_raw)),
+                                    ("share_mode".to_string(), json!(share_mode_raw)),
+                                    ("creation_disposition".to_string(), json!(creation_raw)),
+                                    ("template_file".to_string(), json!(format!("{template_file:#x}"))),
+                                    ("inheritable".to_string(), json!(inheritable)),
+                                    ("error".to_string(), json!(ERROR_INVALID_HANDLE)),
+                                ]),
+                                json!(INVALID_HANDLE_VALUE),
+                            );
+                        }
+                        Ok(template_attributes) => {
+                            // A template only applies when the disposition
+                            // produces a brand-new file.
+                            let creates_new_file = match creation_raw {
+                                CREATE_NEW | CREATE_ALWAYS => true,
+                                OPEN_ALWAYS => self.win32.get_file_attributes_w(&path).is_err(),
+                                _ => false,
+                            };
+                            let (base_guest_path, ads_stream) = parse_ntfs_path(&path);
+                            if let Some(stream) = ads_stream {
+                                // NTFS Alternate Data Stream path detected.
+                                // Open the base file and register the ADS handle mapping.
+                                match creation_disposition_from_win32(creation_raw).and_then(|creation| {
+                                    self.win32.create_file_w(
+                                        &base_guest_path,
+                                        desired_access,
+                                        share_mode,
+                                        creation,
+                                        inheritable,
+                                        flags_and_attributes & FILE_FLAG_OVERLAPPED != 0,
+                                        flags_and_attributes & FILE_FLAG_BACKUP_SEMANTICS != 0,
+                                    )
+                                }) {
+                                    Ok(handle) => {
+                                        // Copy the template's attributes onto the
+                                        // newly created file.
+                                        let attribute_apply = if creates_new_file {
+                                            match &template_attributes {
+                                                Some(attributes) => {
+                                                    let attribute_refs = attributes
+                                                        .iter()
+                                                        .map(String::as_str)
+                                                        .collect::<Vec<_>>();
+                                                    self.win32.set_file_attributes_w(&base_guest_path, &attribute_refs)
+                                                }
+                                                None => Ok(()),
+                                            }
+                                        } else {
+                                            Ok(())
+                                        };
+                                        match attribute_apply {
+                                            Ok(()) => {
+                                                self.ads_handles.insert(handle, (base_guest_path.clone(), stream.stream_name.clone()));
+                                                state.set(Register::Rax, handle as u64);
+                                                self.last_error = 0;
+                                                self.push_trace(
+                                                    "file",
+                                                    "CreateFileW",
+                                                    BTreeMap::from([
+                                                        ("caller_rip".to_string(), json!(format!("{return_address:#x}"))),
+                                                        ("path_ptr".to_string(), json!(format!("{path_ptr:#x}"))),
+                                                        ("path_raw".to_string(), json!(raw_path)),
+                                                        ("path".to_string(), json!(path)),
+                                                        ("cwd".to_string(), json!(self.current_directory.clone())),
+                                                        ("desired_access".to_string(), json!(desired_access_raw)),
+                                                        ("share_mode".to_string(), json!(share_mode_raw)),
+                                                        ("creation_disposition".to_string(), json!(creation_raw)),
+                                                        ("inheritable".to_string(), json!(inheritable)),
+                                                        ("ads".to_string(), json!(true)),
+                                                        ("stream".to_string(), json!(stream.stream_name)),
+                                                    ]),
+                                                    json!(handle),
+                                                );
+                                            }
+                                            Err(error) => {
+                                                state.set(Register::Rax, INVALID_HANDLE_VALUE);
+                                                self.last_error = last_error_from_app_error(&error);
+                                                self.push_trace(
+                                                    "file",
+                                                    "CreateFileW",
+                                                    BTreeMap::from([
+                                                        ("caller_rip".to_string(), json!(format!("{return_address:#x}"))),
+                                                        ("path_ptr".to_string(), json!(format!("{path_ptr:#x}"))),
+                                                        ("path_raw".to_string(), json!(raw_path)),
+                                                        ("path".to_string(), json!(path)),
+                                                        ("cwd".to_string(), json!(self.current_directory.clone())),
+                                                        ("desired_access".to_string(), json!(desired_access_raw)),
+                                                        ("share_mode".to_string(), json!(share_mode_raw)),
+                                                        ("creation_disposition".to_string(), json!(creation_raw)),
+                                                        ("inheritable".to_string(), json!(inheritable)),
+                                                        ("error".to_string(), json!(self.last_error)),
+                                                        ("ads".to_string(), json!(true)),
+                                                        ("stream".to_string(), json!(stream.stream_name)),
+                                                    ]),
+                                                    json!(INVALID_HANDLE_VALUE),
+                                                );
+                                            }
+                                        }
+                                    }
+                                    Err(error) => {
+                                        state.set(Register::Rax, INVALID_HANDLE_VALUE);
+                                        self.last_error = last_error_from_app_error(&error);
+                                        self.push_trace(
+                                            "file",
+                                            "CreateFileW",
+                                            BTreeMap::from([
+                                                ("caller_rip".to_string(), json!(format!("{return_address:#x}"))),
+                                                ("path_ptr".to_string(), json!(format!("{path_ptr:#x}"))),
+                                                ("path_raw".to_string(), json!(raw_path)),
+                                                ("path".to_string(), json!(path)),
+                                                ("cwd".to_string(), json!(self.current_directory.clone())),
+                                                ("desired_access".to_string(), json!(desired_access_raw)),
+                                                ("share_mode".to_string(), json!(share_mode_raw)),
+                                                ("creation_disposition".to_string(), json!(creation_raw)),
+                                                ("inheritable".to_string(), json!(inheritable)),
+                                                ("error".to_string(), json!(self.last_error)),
+                                                ("ads".to_string(), json!(true)),
+                                                ("stream".to_string(), json!(stream.stream_name)),
+                                            ]),
+                                            json!(INVALID_HANDLE_VALUE),
+                                        );
+                                    }
+                                }
+                            } else {
+                                // Normal (non-ADS) file creation
+                                match creation_disposition_from_win32(creation_raw).and_then(|creation| {
+                                    self.win32.create_file_w(
+                                        &path,
+                                        desired_access,
+                                        share_mode,
+                                        creation,
+                                        inheritable,
+                                        flags_and_attributes & FILE_FLAG_OVERLAPPED != 0,
+                                        flags_and_attributes & FILE_FLAG_BACKUP_SEMANTICS != 0,
+                                    )
+                                }) {
+                                    Ok(handle) => {
+                                        // Copy the template's attributes onto the
+                                        // newly created file.
+                                        let attribute_apply = if creates_new_file {
+                                            match &template_attributes {
+                                                Some(attributes) => {
+                                                    let attribute_refs = attributes
+                                                        .iter()
+                                                        .map(String::as_str)
+                                                        .collect::<Vec<_>>();
+                                                    self.win32.set_file_attributes_w(&path, &attribute_refs)
+                                                }
+                                                None => Ok(()),
+                                            }
+                                        } else {
+                                            Ok(())
+                                        };
+                                        match attribute_apply {
+                                            Ok(()) => {
+                                                state.set(Register::Rax, handle as u64);
+                                                self.last_error = 0;
+                                                self.push_trace(
+                                                    "file",
+                                                    "CreateFileW",
+                                                    BTreeMap::from([
+                                                        ("caller_rip".to_string(), json!(format!("{return_address:#x}"))),
+                                                        ("path_ptr".to_string(), json!(format!("{path_ptr:#x}"))),
+                                                        ("path_raw".to_string(), json!(raw_path)),
+                                                        ("path".to_string(), json!(path)),
+                                                        ("cwd".to_string(), json!(self.current_directory.clone())),
+                                                        ("desired_access".to_string(), json!(desired_access_raw)),
+                                                        ("share_mode".to_string(), json!(share_mode_raw)),
+                                                        ("creation_disposition".to_string(), json!(creation_raw)),
+                                                        ("inheritable".to_string(), json!(inheritable)),
+                                                    ]),
+                                                    json!(handle),
+                                                );
+                                            }
+                                            Err(error) => {
+                                                state.set(Register::Rax, INVALID_HANDLE_VALUE);
+                                                self.last_error = last_error_from_app_error(&error);
+                                                self.push_trace(
+                                                    "file",
+                                                    "CreateFileW",
+                                                    BTreeMap::from([
+                                                        ("caller_rip".to_string(), json!(format!("{return_address:#x}"))),
+                                                        ("path_ptr".to_string(), json!(format!("{path_ptr:#x}"))),
+                                                        ("path_raw".to_string(), json!(raw_path)),
+                                                        ("path".to_string(), json!(path)),
+                                                        ("cwd".to_string(), json!(self.current_directory.clone())),
+                                                        ("desired_access".to_string(), json!(desired_access_raw)),
+                                                        ("share_mode".to_string(), json!(share_mode_raw)),
+                                                        ("creation_disposition".to_string(), json!(creation_raw)),
+                                                        ("inheritable".to_string(), json!(inheritable)),
+                                                        ("error".to_string(), json!(self.last_error)),
+                                                    ]),
+                                                    json!(INVALID_HANDLE_VALUE),
+                                                );
+                                            }
+                                        }
+                                    }
+                                    Err(error) => {
+                                        state.set(Register::Rax, INVALID_HANDLE_VALUE);
+                                        self.last_error = last_error_from_app_error(&error);
+                                        self.push_trace(
+                                            "file",
+                                            "CreateFileW",
+                                            BTreeMap::from([
+                                                ("caller_rip".to_string(), json!(format!("{return_address:#x}"))),
+                                                ("path_ptr".to_string(), json!(format!("{path_ptr:#x}"))),
+                                                ("path_raw".to_string(), json!(raw_path)),
+                                                ("path".to_string(), json!(path)),
+                                                ("cwd".to_string(), json!(self.current_directory.clone())),
+                                                ("desired_access".to_string(), json!(desired_access_raw)),
+                                                ("share_mode".to_string(), json!(share_mode_raw)),
+                                                ("creation_disposition".to_string(), json!(creation_raw)),
+                                                ("inheritable".to_string(), json!(inheritable)),
+                                                ("error".to_string(), json!(self.last_error)),
+                                            ]),
+                                            json!(INVALID_HANDLE_VALUE),
+                                        );
+                                    }
+                                }
                             }
                         }
                     }
@@ -30597,7 +30667,6 @@ impl PeHostRuntime {
                 }
                 bytes.extend_from_slice(&0_u16.to_le_bytes());
                 memory.map_bytes(buffer, &bytes);
-                self.recent_wide_writes.insert(buffer, rendered.clone());
                 state.set(Register::Rax, rendered.encode_utf16().count() as u64);
                 self.last_error = 0;
                 self.push_trace(
@@ -37284,28 +37353,82 @@ impl PeHostRuntime {
                             self.last_error = last_error_from_app_error(&error);
                         }
                     }
-                } else if template_file != 0 {
-                    state.set(Register::Rax, INVALID_HANDLE_VALUE);
-                    self.last_error = ERROR_INVALID_PARAMETER;
                 } else {
-                    match creation_disposition_from_win32(creation_raw).and_then(|creation| {
-                        self.win32.create_file_w(
-                            &path,
-                            desired_access,
-                            share_mode,
-                            creation,
-                            inheritable,
-                            flags_and_attributes & FILE_FLAG_OVERLAPPED != 0,
-                            flags_and_attributes & FILE_FLAG_BACKUP_SEMANTICS != 0,
-                        )
-                    }) {
-                        Ok(handle) => {
-                            state.set(Register::Rax, handle as u64);
-                            self.last_error = 0;
-                        }
-                        Err(error) => {
+                    // hTemplateFile (arg 6) resolution — same Win32 semantics
+                    // as CreateFileW: NULL means no template; a non-NULL value
+                    // must be a valid file handle with readable metadata,
+                    // otherwise ERROR_INVALID_HANDLE (6). The template's
+                    // attributes are copied to the file only when the
+                    // disposition creates a NEW file (CREATE_NEW,
+                    // CREATE_ALWAYS, or OPEN_ALWAYS on a not-yet-existing
+                    // file); it is ignored when merely opening an existing
+                    // file (OPEN_EXISTING, TRUNCATE_EXISTING, or OPEN_ALWAYS
+                    // on an existing file).
+                    let template_attributes = if template_file == 0 {
+                        Ok(None)
+                    } else {
+                        self.win32
+                            .file_state(template_file as u32)
+                            .and_then(|state| {
+                                self.win32.get_file_attributes_w(&state.normalized_path)
+                            })
+                            .map(Some)
+                    };
+                    match template_attributes {
+                        Err(_) => {
                             state.set(Register::Rax, INVALID_HANDLE_VALUE);
-                            self.last_error = last_error_from_app_error(&error);
+                            self.last_error = ERROR_INVALID_HANDLE;
+                        }
+                        Ok(template_attributes) => {
+                            let creates_new_file = match creation_raw {
+                                CREATE_NEW | CREATE_ALWAYS => true,
+                                OPEN_ALWAYS => self.win32.get_file_attributes_w(&path).is_err(),
+                                _ => false,
+                            };
+                            match creation_disposition_from_win32(creation_raw).and_then(|creation| {
+                                self.win32.create_file_w(
+                                    &path,
+                                    desired_access,
+                                    share_mode,
+                                    creation,
+                                    inheritable,
+                                    flags_and_attributes & FILE_FLAG_OVERLAPPED != 0,
+                                    flags_and_attributes & FILE_FLAG_BACKUP_SEMANTICS != 0,
+                                )
+                            }) {
+                                Ok(handle) => {
+                                    // Copy the template's attributes onto the
+                                    // newly created file.
+                                    let attribute_apply = if creates_new_file {
+                                        match &template_attributes {
+                                            Some(attributes) => {
+                                                let attribute_refs = attributes
+                                                    .iter()
+                                                    .map(String::as_str)
+                                                    .collect::<Vec<_>>();
+                                                self.win32.set_file_attributes_w(&path, &attribute_refs)
+                                            }
+                                            None => Ok(()),
+                                        }
+                                    } else {
+                                        Ok(())
+                                    };
+                                    match attribute_apply {
+                                        Ok(()) => {
+                                            state.set(Register::Rax, handle as u64);
+                                            self.last_error = 0;
+                                        }
+                                        Err(error) => {
+                                            state.set(Register::Rax, INVALID_HANDLE_VALUE);
+                                            self.last_error = last_error_from_app_error(&error);
+                                        }
+                                    }
+                                }
+                                Err(error) => {
+                                    state.set(Register::Rax, INVALID_HANDLE_VALUE);
+                                    self.last_error = last_error_from_app_error(&error);
+                                }
+                            }
                         }
                     }
                 }
@@ -48806,8 +48929,6 @@ impl PeHostRuntime {
             .collect::<Vec<_>>();
         if !encoded.is_empty() {
             memory.map_bytes(destination_ptr, &encoded);
-            self.recent_wide_writes
-                .insert(destination_ptr, String::from_utf16_lossy(&mapped_units));
         }
         self.last_error = 0;
         Ok(required as u64)
@@ -66375,6 +66496,71 @@ fn read_utf16_string(memory: &MemoryImage, address: u64) -> AppResult<String> {
     Ok(String::from_utf16_lossy(&code_units))
 }
 
+/// Read a NUL-terminated UTF-16 guest string with full validation.
+///
+/// - Stops at the first NUL unit (the terminator is not included).
+/// - Reads at most `max_chars` UTF-16 code units (excluding the NUL);
+///   exceeding the limit is an error (`RcGuestPointerOutOfRange`).
+/// - Handles page boundaries (reads via the page-aware memory accessors).
+/// - Returns a guest-visible error (Err(AppError)) on any unmapped page or
+///   unmapped range rather than silently truncating.
+/// - Handles unaligned pointers (byte-wise reads; Windows permits unaligned
+///   UTF-16 string pointers for x86).
+/// - Handles x86 (32-bit) pointer width: the pointer value is the zero-
+///   extended guest address already; nothing further is required.
+/// - Validates surrogate pairs: well-formed pairs (e.g. U+1F600) round-trip
+///   losslessly through `String::from_utf16_lossy`; lone surrogates are
+///   replaced lossily (U+FFFD) where only a Rust `String` is representable.
+///
+/// A NULL pointer yields an empty string, matching the existing
+/// `read_utf16_string` behavior. Strings written by the guest immediately
+/// before the call are visible directly (same address space, no cache).
+fn read_utf16z(
+    memory: &MemoryImage,
+    ptr: u64,
+    max_chars: usize,
+) -> AppResult<String> {
+    if ptr == 0 {
+        return Ok(String::new());
+    }
+    let mut code_units = Vec::new();
+    let mut cursor = ptr;
+    let mut count = 0_usize;
+    loop {
+        // One more non-NUL unit than the limit means the string exceeds it.
+        if count > max_chars {
+            return Err(AppError::new(
+                ReasonCode::RcGuestPointerOutOfRange,
+                format!(
+                    "UTF-16 string at {ptr:#x} exceeds the {max_chars}-unit limit"
+                ),
+            ));
+        }
+        let low_address = cursor;
+        let high_address = cursor.checked_add(1).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcGuestPointerOutOfRange,
+                format!("UTF-16 string pointer overflow at {cursor:#x}"),
+            )
+        })?;
+        let low = memory.read_u8(low_address)?;
+        let high = memory.read_u8(high_address)?;
+        let code_unit = u16::from_le_bytes([low, high]);
+        if code_unit == 0 {
+            break;
+        }
+        code_units.push(code_unit);
+        cursor = cursor.checked_add(2).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcGuestPointerOutOfRange,
+                format!("UTF-16 string pointer overflow at {cursor:#x}"),
+            )
+        })?;
+        count += 1;
+    }
+    Ok(String::from_utf16_lossy(&code_units))
+}
+
 /// Read a null-terminated ANSI string from guest memory.
 fn read_ansi_string(memory: &MemoryImage, address: u64) -> String {
     if address == 0 {
@@ -67600,6 +67786,289 @@ mod tests {
                 .win32
                 .ge()
                 .host_path_for_windows_path("C:\\package\\zero-access.tmp")
+                .expect("host path")
+                .exists()
+        );
+    }
+
+    fn utf16_bytes(value: &str) -> Vec<u8> {
+        value
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .flat_map(|unit| unit.to_le_bytes())
+            .collect()
+    }
+
+    #[test]
+    fn read_utf16z_nul_terminated() {
+        let mut memory = MemoryImage::default();
+        memory.map_bytes(0x10_000, &utf16_bytes("hello world"));
+        assert_eq!(
+            read_utf16z(&memory, 0x10_000, 1024).expect("read"),
+            "hello world"
+        );
+    }
+
+    #[test]
+    fn read_utf16z_max_chars_limit_exceeded_is_error() {
+        let mut memory = MemoryImage::default();
+        memory.map_bytes(0x10_000, &utf16_bytes("abcdef"));
+        let error = read_utf16z(&memory, 0x10_000, 4).expect_err("must exceed limit");
+        assert_eq!(error.code, ReasonCode::RcGuestPointerOutOfRange);
+        // A string exactly at the limit (plus its NUL) still succeeds.
+        assert_eq!(
+            read_utf16z(&memory, 0x10_000, 6).expect("exact limit"),
+            "abcdef"
+        );
+    }
+
+    #[test]
+    fn read_utf16z_string_ending_exactly_at_page_boundary() {
+        let mut memory = MemoryImage::default();
+        // Four code units = 8 bytes; the NUL unit straddles the page edge and
+        // map_bytes maps it into the following page.
+        let content = "abcd";
+        let base = 0x10_000 + 4096 - 8;
+        memory.map_bytes(base, &utf16_bytes(content));
+        assert_eq!(read_utf16z(&memory, base, 1024).expect("read"), content);
+    }
+
+    #[test]
+    fn read_utf16z_string_crossing_page_boundary() {
+        let mut memory = MemoryImage::default();
+        let content = "x".repeat(3000);
+        let base = 0x10_000 + 4000;
+        memory.map_bytes(base, &utf16_bytes(&content));
+        assert_eq!(read_utf16z(&memory, base, 8192).expect("read"), content);
+    }
+
+    #[test]
+    fn read_utf16z_unmapped_page_mid_string_is_error() {
+        let mut memory = MemoryImage::default();
+        // Map only the content (no NUL): the "c" unit straddles the page
+        // edge and its high byte lies in the unmapped following page. An
+        // unmapped range mid-string must error, not truncate.
+        let base = 0x10_000 + 4096 - 5;
+        memory.map_bytes(base, &utf16_bytes("abc")[..5]);
+        let error = read_utf16z(&memory, base, 1024).expect_err("unmapped mid-string");
+        assert_eq!(error.code, ReasonCode::RcUnimplInsn);
+    }
+
+    #[test]
+    fn read_utf16z_unaligned_pointer() {
+        let mut memory = MemoryImage::default();
+        memory.map_bytes(0x10_001, &utf16_bytes("xyz"));
+        assert_eq!(
+            read_utf16z(&memory, 0x10_001, 1024).expect("read"),
+            "xyz"
+        );
+    }
+
+    #[test]
+    fn read_utf16z_null_pointer_returns_empty() {
+        let memory = MemoryImage::default();
+        assert_eq!(read_utf16z(&memory, 0, 64).expect("read"), "");
+    }
+
+    #[test]
+    fn read_utf16z_surrogate_pair_round_trip() {
+        let mut memory = MemoryImage::default();
+        memory.map_bytes(0x10_000, &utf16_bytes("\u{1F600}"));
+        assert_eq!(
+            read_utf16z(&memory, 0x10_000, 8).expect("read"),
+            "\u{1F600}"
+        );
+    }
+
+    #[test]
+    fn read_utf16z_nul_at_unmapped_page_edge_is_error() {
+        let mut memory = MemoryImage::default();
+        // Map only the content (no NUL): "ab" occupies the page's last four
+        // bytes, so the NUL unit straddles the edge — its first byte at
+        // page_end-1 is readable and its second byte is unmapped. The NUL
+        // itself must be read (attempted) through the page-aware path before
+        // failing — it is not a silent truncation point.
+        let base = 0x10_000 + 4096 - 5;
+        memory.map_bytes(base, &utf16_bytes("ab")[..4]);
+        let error = read_utf16z(&memory, base, 1024).expect_err("NUL read must error");
+        assert_eq!(error.code, ReasonCode::RcUnimplInsn);
+    }
+
+    #[test]
+    fn create_file_w_opens_guest_written_wide_path_without_recovery() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "create-file-guest-written-path",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        runtime
+            .win32
+            .create_directory_w(r"C:\package")
+            .expect("create package dir");
+
+        let create_file = runtime.alloc_host_thunk(HostThunk::CreateFileW);
+        // The wide path lives at a fixed guest address, written by plain
+        // memory writes immediately before the call — exactly what the
+        // removed Steam recovery hack used to paper over. No recovery magic:
+        // the authoritative read must see it directly.
+        let path_address = 0x40_000_u64;
+        memory.map_bytes(
+            path_address,
+            &utf16_bytes(r"C:\package\steam_client_win32.installed"),
+        );
+
+        let handle = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_file,
+            &[
+                path_address as u32,
+                GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                0,
+                CREATE_ALWAYS,
+                0,
+                0,
+            ],
+        );
+
+        assert_ne!(handle, INVALID_HANDLE_VALUE);
+        assert_eq!(runtime.last_error, 0);
+        assert!(
+            runtime
+                .win32
+                .ge()
+                .host_path_for_windows_path(r"C:\package\steam_client_win32.installed")
+                .expect("host path")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn create_file_w_accepts_valid_template_handle() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "create-file-template",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        runtime
+            .win32
+            .create_directory_w(r"C:\package")
+            .expect("create package dir");
+
+        let create_file = runtime.alloc_host_thunk(HostThunk::CreateFileW);
+        let template_path = runtime
+            .alloc_utf16_string(&mut memory, r"C:\package\template.tmp")
+            .expect("template path");
+        let template_handle = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_file,
+            &[
+                template_path as u32,
+                GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                0,
+                CREATE_ALWAYS,
+                0,
+                0,
+            ],
+        );
+        assert_ne!(template_handle, INVALID_HANDLE_VALUE);
+        // Give the template distinctive attributes to observe copying.
+        runtime
+            .win32
+            .set_file_attributes_w(r"C:\package\template.tmp", &["hidden"])
+            .expect("set template attributes");
+
+        let target_path = runtime
+            .alloc_utf16_string(&mut memory, r"C:\package\copy.tmp")
+            .expect("target path");
+        let target_handle = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_file,
+            &[
+                target_path as u32,
+                GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                0,
+                CREATE_NEW,
+                0,
+                template_handle as u32,
+            ],
+        );
+
+        assert_ne!(target_handle, INVALID_HANDLE_VALUE);
+        assert_eq!(runtime.last_error, 0);
+        let target_attributes = runtime
+            .win32
+            .get_file_attributes_w(r"C:\package\copy.tmp")
+            .expect("target attributes");
+        assert_eq!(target_attributes, vec!["hidden".to_string()]);
+    }
+
+    #[test]
+    fn create_file_w_rejects_invalid_template_handle() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "create-file-invalid-template",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        runtime
+            .win32
+            .create_directory_w(r"C:\package")
+            .expect("create package dir");
+
+        let create_file = runtime.alloc_host_thunk(HostThunk::CreateFileW);
+        let path = runtime
+            .alloc_utf16_string(&mut memory, r"C:\package\bogus-template.tmp")
+            .expect("path");
+
+        let handle = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_file,
+            &[
+                path as u32,
+                GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                0,
+                CREATE_NEW,
+                0,
+                0xDEAD_BEEF,
+            ],
+        );
+
+        // x86 dispatch truncates INVALID_HANDLE_VALUE (u64::MAX) to 32 bits.
+        assert_eq!(handle, u32::MAX as u64);
+        assert_eq!(runtime.last_error, ERROR_INVALID_HANDLE);
+        assert!(
+            !runtime
+                .win32
+                .ge()
+                .host_path_for_windows_path(r"C:\package\bogus-template.tmp")
                 .expect("host path")
                 .exists()
         );
