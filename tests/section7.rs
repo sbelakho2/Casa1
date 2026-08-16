@@ -622,10 +622,23 @@ fn t7_5_resource_create_destroy_soak_keeps_live_set_bounded_and_frame_times_stab
         );
     }
     assert_eq!(backend.live_resource_count(), 2);
-    // frame_time_us is a pure function of the sync interval (16_666 µs per
-    // vsync frame, src/gfx.rs:1390-1393), so pin the value rather than
-    // asserting min == max on a constant sequence.
-    for frame_time_us in &frame_times {
-        assert_eq!(*frame_time_us, 16_666);
+    // frame_time_us is now MEASURED wall-clock time since the previous
+    // present on the same swapchain (src/gfx.rs present()): the first
+    // present has no predecessor (0 µs) and every later present reports
+    // its real elapsed time, which in this tight loop is far below one
+    // vsync interval.
+    assert_eq!(
+        frame_times[0], 0,
+        "the first present has no previous timestamp to measure against"
+    );
+    for frame_time_us in frame_times.iter().skip(1) {
+        assert!(
+            *frame_time_us > 0,
+            "every later present must report a measured frame time"
+        );
+        assert!(
+            *frame_time_us < 16_666 * 16,
+            "measured frame times must stay bounded, got {frame_time_us}"
+        );
     }
 }

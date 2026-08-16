@@ -23,8 +23,6 @@ pub fn live_trace(_line: &str) {
     // Disabled — file I/O per call was a massive performance bottleneck.
 }
 
-const PLACEHOLDER_FRAME_WIDTH: usize = 160;
-const PLACEHOLDER_FRAME_HEIGHT: usize = 90;
 const LIVE_WINDOW_OFFSET: isize = 32;
 
 /// Maximum window dimension for live presentation. Guest-provided frame
@@ -163,10 +161,14 @@ fn run_live_host_loop<T>(
     let export_live_frame_path = std::env::var(EXPORT_LIVE_FRAME_ENV)
         .ok()
         .filter(|value| !value.trim().is_empty());
-    let mut window = create_window(title, PLACEHOLDER_FRAME_WIDTH, PLACEHOLDER_FRAME_HEIGHT)?;
-    let mut frame_buffer = vec![0; PLACEHOLDER_FRAME_WIDTH * PLACEHOLDER_FRAME_HEIGHT];
-    let mut frame_width = PLACEHOLDER_FRAME_WIDTH;
-    let mut frame_height = PLACEHOLDER_FRAME_HEIGHT;
+    // No window is created at startup: the live window only exists once a
+    // real guest frame arrives, and is sized to that frame's validated
+    // dimensions.  If the worker finishes without ever producing a frame,
+    // the loop exits cleanly below without creating any window.
+    let mut window: Option<Window> = None;
+    let mut frame_buffer = Vec::new();
+    let mut frame_width = 0usize;
+    let mut frame_height = 0usize;
     let mut latest_frame: Option<LiveFrame> = None;
     let mut close_requested = false;
     let mut held_scancodes = BTreeSet::new();
@@ -174,15 +176,6 @@ fn run_live_host_loop<T>(
     let mut left_mouse_down = false;
     let mut right_mouse_down = false;
     let mut middle_mouse_down = false;
-
-    window
-        .update_with_buffer(&frame_buffer, frame_width, frame_height)
-        .map_err(|error| {
-            AppError::new(
-                ReasonCode::RcIo,
-                format!("failed to draw initial frame: {error}"),
-            )
-        })?;
 
     let mut trace_no_frame_counter: u64 = 0;
     let mut last_jit_watchdog = std::time::Instant::now();
@@ -216,6 +209,8 @@ fn run_live_host_loop<T>(
             }
         }
 
+        // Worker finished with zero frames ever received: exit cleanly,
+        // never having created a window.
         if latest_frame.is_none() && worker.is_finished() {
             live_trace("[live] worker finished without producing any frames — exiting");
             break;
@@ -224,7 +219,7 @@ fn run_live_host_loop<T>(
         let mut frame_changed = false;
 
         if let Some(frame) = latest_frame.take() {
-            if frame.width as usize != frame_width || frame.height as usize != frame_height {
+            if window.is_none() || frame.width as usize != frame_width || frame.height as usize != frame_height {
                 let width = frame.width as usize;
                 let height = frame.height as usize;
                 // The frame dimensions come from the guest frame pipeline
@@ -232,7 +227,7 @@ fn run_live_host_loop<T>(
                 // minifb, which would otherwise try to allocate unbounded
                 // window buffers.
                 validate_presentable_dims(width, height)?;
-                window = create_window(title, width, height)?;
+                window = Some(create_window(title, width, height)?);
                 frame_width = width;
                 frame_height = height;
             }
@@ -243,79 +238,83 @@ fn run_live_host_loop<T>(
             frame_changed = true;
         }
 
-        pump_keyboard(&window, &session.input_tx, &mut held_scancodes);
-        pump_mouse(
-            &window,
-            &session.input_tx,
-            &mut previous_mouse_pos,
-            &mut left_mouse_down,
-            &mut right_mouse_down,
-            &mut middle_mouse_down,
-        );
-        if window.is_key_down(Key::Escape) && !close_requested {
-            release_held_keys(&session.input_tx, &mut held_scancodes);
-            if let Err(e) = session.input_tx.send(LiveInputEvent::CloseRequested) {
-                eprintln!("[live] failed to send CloseRequested (Escape): {e}");
+        if let Some(window) = window.as_mut() {
+            pump_keyboard(window, &session.input_tx, &mut held_scancodes);
+            pump_mouse(
+                window,
+                &session.input_tx,
+                &mut previous_mouse_pos,
+                &mut left_mouse_down,
+                &mut right_mouse_down,
+                &mut middle_mouse_down,
+            );
+            if window.is_key_down(Key::Escape) && !close_requested {
+                release_held_keys(&session.input_tx, &mut held_scancodes);
+                if let Err(e) = session.input_tx.send(LiveInputEvent::CloseRequested) {
+                    eprintln!("[live] failed to send CloseRequested (Escape): {e}");
+                }
+                close_requested = true;
             }
-            close_requested = true;
+
+            if frame_changed {
+                window
+                    .update_with_buffer(&frame_buffer, frame_width, frame_height)
+                    .map_err(|error| {
+                        AppError::new(
+                            ReasonCode::RcIo,
+                            format!("failed to present live frame: {error}"),
+                        )
+                    })?;
+            } else {
+                window.update();
+            }
+
+            if !window.is_open() && !close_requested {
+                release_held_keys(&session.input_tx, &mut held_scancodes);
+                if let Err(e) = session.input_tx.send(LiveInputEvent::CloseRequested) {
+                    eprintln!("[live] failed to send CloseRequested (window closed): {e}");
+                }
+                close_requested = true;
+            }
         }
 
-        if frame_changed {
-            window
-                .update_with_buffer(&frame_buffer, frame_width, frame_height)
-                .map_err(|error| {
-                    AppError::new(
-                        ReasonCode::RcIo,
-                        format!("failed to present live frame: {error}"),
-                    )
-                })?;
-        } else {
-            window.update();
+        // ── JIT watchdog: force chain-breaking across threads ────────────
+        // If the PE runtime worker is stuck inside JIT-compiled block
+        // chains (pure ARM64 B instructions that never return to the
+        // dispatcher), neither the main loop's yield check NOR its
+        // chain-break timer will ever fire.
+        //
+        // This watchdog calls `force_break_all_chains()` every ~500 ms,
+        // which physically writes RET instructions over every chain patch
+        // location in the compiled code.  On the next chained-block
+        // boundary, execution will return to the dispatcher where the
+        // CPU yield and GDI frame pipeline can run.
+        //
+        // Also set `JIT_CHAIN_BREAK_REQUESTED` so that `chain_blocks()`
+        // (called from `get_or_compile`) refuses to form new chains
+        // until the flag is cleared by the main loop.
+        if last_jit_watchdog.elapsed().as_millis() >= 500 {
+            crate::jit::JIT_CHAIN_BREAK_REQUESTED
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            crate::jit::force_break_all_chains();
+            last_jit_watchdog = std::time::Instant::now();
+            let sigbus_total = crate::jit::SIGBUS_TOTAL_EVENTS
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let storm = crate::jit::JIT_FAULT_STORM_DISABLED
+                .load(std::sync::atomic::Ordering::Relaxed);
+            live_trace(&format!(
+                "[live] jit watchdog: requested chain break (sigbus_total={sigbus_total} storm_disabled={storm})"
+            ));
+        }
 
-            // ── JIT watchdog: force chain-breaking across threads ────────────
-            // If the PE runtime worker is stuck inside JIT-compiled block
-            // chains (pure ARM64 B instructions that never return to the
-            // dispatcher), neither the main loop's yield check NOR its
-            // chain-break timer will ever fire.
-            //
-            // This watchdog calls `force_break_all_chains()` every ~500 ms,
-            // which physically writes RET instructions over every chain patch
-            // location in the compiled code.  On the next chained-block
-            // boundary, execution will return to the dispatcher where the
-            // CPU yield and GDI frame pipeline can run.
-            //
-            // Also set `JIT_CHAIN_BREAK_REQUESTED` so that `chain_blocks()`
-            // (called from `get_or_compile`) refuses to form new chains
-            // until the flag is cleared by the main loop.
-            if last_jit_watchdog.elapsed().as_millis() >= 500 {
-                crate::jit::JIT_CHAIN_BREAK_REQUESTED
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
-                crate::jit::force_break_all_chains();
-                last_jit_watchdog = std::time::Instant::now();
-                let sigbus_total = crate::jit::SIGBUS_TOTAL_EVENTS
-                    .load(std::sync::atomic::Ordering::Relaxed);
-                let storm = crate::jit::JIT_FAULT_STORM_DISABLED
-                    .load(std::sync::atomic::Ordering::Relaxed);
-                live_trace(&format!(
-                    "[live] jit watchdog: requested chain break (sigbus_total={sigbus_total} storm_disabled={storm})"
-                ));
-            }
-
-            // Yield the CPU when no new frame is available to prevent
-            // 99% CPU usage from tight polling in the live session loop.
-            // An 8 ms sleep limits the idle poll rate to ~125 Hz, which
-            // is more than enough for UI responsiveness while keeping
-            // CPU usage near zero when Steam is rendering through its
-            // own native windows (not through the live frame pipeline).
+        // Yield the CPU when no new frame is available to prevent
+        // 99% CPU usage from tight polling in the live session loop.
+        // An 8 ms sleep limits the idle poll rate to ~125 Hz, which
+        // is more than enough for UI responsiveness while keeping
+        // CPU usage near zero when Steam is rendering through its
+        // own native windows (not through the live frame pipeline).
+        if !frame_changed {
             std::thread::sleep(std::time::Duration::from_millis(8));
-        }
-
-        if !window.is_open() && !close_requested {
-            release_held_keys(&session.input_tx, &mut held_scancodes);
-            if let Err(e) = session.input_tx.send(LiveInputEvent::CloseRequested) {
-                eprintln!("[live] failed to send CloseRequested (window closed): {e}");
-            }
-            close_requested = true;
         }
 
         if worker.is_finished() {

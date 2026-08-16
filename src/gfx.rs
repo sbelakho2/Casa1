@@ -378,12 +378,53 @@ pub struct PresentResult {
     pub frame_time_us: u64,
 }
 
+/// Origin of a presented frame.  Every `PresentedFrame` is labelled with the
+/// API that produced its pixels; no synthetic frames are ever published.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FrameSource {
+    /// 32-bit GDI window content (real window surfaces only).
+    Gdi,
+    /// GDI+ rendered content.
+    GdiPlus,
+    /// Chromium Embedded Framework software-rendered content.
+    CefSoftware,
+    /// Chromium Embedded Framework accelerated content.
+    CefAccelerated,
+    /// Direct3D 9 swapchain present.
+    D3D9,
+    /// DXGI swapchain presented through a D3D10 device.
+    DxgiD3D10,
+    /// DXGI swapchain presented through a D3D11 device.
+    DxgiD3D11,
+    /// DXGI swapchain presented through a D3D12 device.
+    DxgiD3D12,
+    /// Vulkan swapchain present.
+    Vulkan,
+    /// OpenGL backbuffer present.
+    OpenGL,
+}
+
+fn presented_frame_default_timestamp() -> std::time::Instant {
+    std::time::Instant::now()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PresentedFrame {
     pub width: u32,
     pub height: u32,
     pub format: DxgiFormat,
     pub bytes: Vec<u8>,
+    /// API that produced this frame (see [`FrameSource`]).
+    pub source: FrameSource,
+    /// Bytes per pixel row of `bytes` (0 when the row pitch is unknown).
+    pub stride: usize,
+    /// Monotonic present sequence number for the presenting swapchain.
+    pub sequence: u64,
+    /// Host-side capture time of this frame.  Excluded from serialization
+    /// because `std::time::Instant` is not serializable.
+    #[serde(skip, default = "presented_frame_default_timestamp")]
+    pub timestamp: std::time::Instant,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1085,6 +1126,9 @@ struct SwapchainRecord {
     state: SwapchainState,
     next_present_index: u64,
     presented_backbuffer_index: usize,
+    /// Host timestamp of the previous `present()` — used to measure real
+    /// frame timing instead of fabricating a fixed interval.
+    last_present_at: Option<std::time::Instant>,
 }
 
 #[derive(Debug, Clone)]
@@ -1134,6 +1178,9 @@ pub struct GraphicsBackend {
     /// Enables connecting D3D swapchain presents to the live display pipeline.
     /// The callback receives the current backbuffer bytes, width, height, and format.
     frame_published_callback: Option<Box<dyn FnMut(PresentedFrame) + Send>>,
+    /// API that presents through this backend; labels every `PresentedFrame`
+    /// produced by [`presented_frame`](Self::presented_frame).
+    frame_source: FrameSource,
 }
 
 impl std::fmt::Debug for GraphicsBackend {
@@ -1161,6 +1208,7 @@ impl std::fmt::Debug for GraphicsBackend {
                     .as_ref()
                     .map(|_| "FnMut(PresentedFrame)"),
             )
+            .field("frame_source", &self.frame_source)
             .finish()
     }
 }
@@ -1186,6 +1234,7 @@ impl Clone for GraphicsBackend {
             subresource_states: self.subresource_states.clone(),
             pending_split_barriers: self.pending_split_barriers.clone(),
             frame_published_callback: None,
+            frame_source: self.frame_source,
         }
     }
 }
@@ -1217,6 +1266,7 @@ impl GraphicsBackend {
             next_id: 1,
             adapter: profile.adapter,
             frame_published_callback: None,
+            frame_source: FrameSource::DxgiD3D11,
             capabilities: profile.capabilities,
             outputs: vec![
                 OutputInfo {
@@ -1337,6 +1387,7 @@ impl GraphicsBackend {
                 },
                 next_present_index: 0,
                 presented_backbuffer_index: 0,
+                last_present_at: None,
             },
         );
         Ok(id)
@@ -1370,6 +1421,21 @@ impl GraphicsBackend {
         }
         let tearing_allowed =
             allow_tearing && sync_interval == 0 && self.query_feature(FeatureQuery::Tearing);
+
+        // Measure real frame timing: `frame_time_us` is the elapsed wall-clock
+        // time since the previous present on this swapchain (0 on the first).
+        let present_started_at = std::time::Instant::now();
+        let frame_time_us = {
+            let record = self.swapchain_mut(swapchain)?;
+            let elapsed = record.last_present_at.map(|previous| {
+                present_started_at
+                    .duration_since(previous)
+                    .as_micros()
+                    .min(u64::MAX as u128) as u64
+            });
+            record.last_present_at = Some(present_started_at);
+            elapsed.unwrap_or(0)
+        };
 
         // Update swapchain state in a block scope so the mutable borrow ends
         // before we access self for the callback and result construction.
@@ -1416,10 +1482,7 @@ impl GraphicsBackend {
             effective_sync_interval: sync_interval,
             tearing_allowed,
             displayed_frame_index,
-            frame_time_us: match sync_interval {
-                0 => 5_000,
-                value => 16_666 * value as u64,
-            },
+            frame_time_us,
         })
     }
 
@@ -1451,6 +1514,14 @@ impl GraphicsBackend {
             height: record.state.desc.height,
             format: record.state.desc.format,
             bytes: resource.bytes.clone(),
+            source: self.frame_source,
+            stride: resource
+                .bytes
+                .len()
+                .checked_div(record.state.desc.height.max(1) as usize)
+                .unwrap_or(0),
+            sequence: record.next_present_index,
+            timestamp: std::time::Instant::now(),
         })
     }
 
@@ -1539,6 +1610,17 @@ impl GraphicsBackend {
         callback: Option<Box<dyn FnMut(PresentedFrame) + Send>>,
     ) {
         self.frame_published_callback = callback;
+    }
+
+    /// Declare which API presents through this backend.  Every
+    /// [`PresentedFrame`] produced afterwards is labelled with this source.
+    pub fn set_frame_source(&mut self, source: FrameSource) {
+        self.frame_source = source;
+    }
+
+    /// The source currently assigned to this backend's presented frames.
+    pub fn frame_source(&self) -> FrameSource {
+        self.frame_source
     }
 
     pub fn create_resource(&mut self, desc: ResourceDesc) -> AppResult<ResourceId> {

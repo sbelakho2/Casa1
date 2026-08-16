@@ -3651,12 +3651,19 @@ struct PeHostRuntime {
     steam_reported_image_exit: bool,
     next_frame_index: u32,
     next_audio_buffer_tag: u64,
-    published_live_frame: bool,
-    /// Cached GDI window preview frame for periodic republishing during the
-    /// pre-D3D bootstrapper phase.  Once `published_live_frame` becomes true
-    /// (D3D swapchain present has fired), periodic republishing stops so that
-    /// D3D-captured frames are never overwritten by synthetic GDI previews.
-    last_gdi_preview_frame: Option<LiveFrame>,
+    /// Set only when a real guest swapchain present has produced a frame
+    /// (D3D9 device present, D3D9 swapchain present, D3D11 present, D3D12
+    /// present).  Never set from the GDI preview path, builtin window
+    /// painting, or any synthetic path.
+    first_real_guest_frame_seen: bool,
+    /// Most recent frame extracted from REAL guest GDI pixels (a guest-driven
+    /// `BitBlt`/`StretchBlt` into a window surface, or a real memory-DC
+    /// conversion).  Never assigned synthetic chrome/theme composition.
+    last_real_gdi_frame: Option<LiveFrame>,
+    /// Count of real guest swapchain presents (incremented only at the four
+    /// real present sites: D3D9 device present, D3D9 swapchain present,
+    /// D3D11 present, D3D12 present).  GDI window pixels do not increment it.
+    real_guest_frames: u64,
     /// Timestamp of the last GDI window preview publish — used for rate-limiting
     /// `publish_live_window_preview_if_needed()` to at most 1 frame per 33 ms
     /// (~30 FPS) so that GDI previews never flood the live frame channel.
@@ -4372,44 +4379,6 @@ pub fn execute_with_options(
     ));
     diag("3:before main loop");
 
-    // ── Placeholder GDI preview frame ─────────────────────────────────────
-    // Publish a minimal placeholder frame immediately so the live window
-    // shows *something* even before the guest creates any windows or calls
-    // any GDI thunks.  Without this, the live window stays black (or shows
-    // the initial "no frames" placeholder) until the bootstrapper reaches
-    // GDI operations — which may never happen if it enters a JIT-chained
-    // tight loop.
-    //
-    // Once real GDI preview frames arrive via
-    // publish_live_window_preview_if_needed() they will replace this
-    // placeholder.  If D3D presents arrive later, published_live_frame
-    // becomes true and republish_gdi_preview() stops re‑sending the
-    // cached frame.
-    if let Some(session) = &runtime.live_session {
-        // Dark blue placeholder so user can see the window is alive.
-        let placeholder_bytes: Vec<u8> = [[0x6a, 0x2a, 0x1a, 0xff]].repeat(160 * 90).concat();
-        let placeholder = LiveFrame {
-            width: 160,
-            height: 90,
-            format: DxgiFormat::B8G8R8A8Unorm,
-            bytes: placeholder_bytes,
-            displayed_frame_index: 0,
-        };
-        // Cache for republish_gdi_preview() → re‑sends every ~50 ms.
-        runtime.last_gdi_preview_frame = Some(placeholder.clone());
-        runtime.last_gdi_preview_publish = std::time::Instant::now();
-        let result = session.frame_tx.try_send(placeholder);
-        if result.is_err() {
-            crate::live::live_trace(
-                "[pe] placeholder frame — channel full, frame dropped"
-            );
-        } else {
-            crate::live::live_trace(
-                "[pe] placeholder frame published — 160×90 slate-blue frame"
-            );
-        }
-    }
-
     let mut exit_code = 0_i32;
     let mut steps = 0_u64;
     let mut block_count: u64 = 0;
@@ -4450,7 +4419,7 @@ pub fn execute_with_options(
             //
             // This ensures that even when JIT-compiled blocks are chained
             // together, execution periodically returns to the dispatcher where
-            // the yield check fires and `republish_gdi_preview()` runs.
+            // the yield check fires and the frame pipeline can run.
             //
             // Without this, a tight guest loop that gets fully JIT-compiled
             // and chained will never return to the main loop, starving both
@@ -4459,7 +4428,7 @@ pub fn execute_with_options(
                 last_chain_break = std::time::Instant::now();
 
                 // Clear the chain-break flag only when D3D11 presents are
-                // flowing (published_live_frame == true).  During the
+                // flowing (first_real_guest_frame_seen == true).  During the
                 // bootstrapping phase (pure GDI, no D3D swapchain yet), keep
                 // the flag asserted so the JIT refuses to form new chains.
                 // Every block will return to the dispatcher where the CPU
@@ -4475,7 +4444,8 @@ pub fn execute_with_options(
                 // worker thread and a blank live window.
                 //
                 // During pure-GDI bootstrapping (before a D3D swapchain
-                // is created), `published_live_frame` is always false, so
+                // is created), `first_real_guest_frame_seen` is always
+                // false, so
                 // the flag would stay asserted permanently — starving the
                 // bootstrapper of JIT block chains and reducing throughput
                 // to ~1500 steps/sec (every block returns to the dispatcher
@@ -4488,16 +4458,6 @@ pub fn execute_with_options(
                 crate::jit::JIT_CHAIN_BREAK_REQUESTED
                     .store(false, std::sync::atomic::Ordering::Relaxed);
             }
-        }
-
-        // ── Periodic GDI window preview re‑publication ──────────────────────
-        // During the pure‑GDI bootstrapper phase (before the 64‑bit Steam
-        // client creates a D3D swapchain), re‑publish the most recent GDI
-        // window preview frame every ~50 ms so that the live window never
-        // goes blank between sporadic GDI operations.
-        // Only republish every 1s, not every iteration
-        if runtime.live_session.is_some() && last_progress_log.elapsed().as_millis() >= 1000 {
-            runtime.republish_gdi_preview();
         }
 
         // Infinite loop detection: track consecutive same-RIP iterations.
@@ -8279,8 +8239,9 @@ impl PeHostRuntime {
             steam_reported_image_exit: false,
             next_frame_index: 0,
             next_audio_buffer_tag: 1,
-            published_live_frame: false,
-            last_gdi_preview_frame: None,
+            first_real_guest_frame_seen: false,
+            last_real_gdi_frame: None,
+            real_guest_frames: 0,
             last_gdi_preview_publish: std::time::Instant::now(),
             delivering_guest_exception: false,
             dtm,
@@ -9934,20 +9895,19 @@ impl PeHostRuntime {
         }
     }
 
+    /// Publish the current real GDI window content to the live frame channel,
+    /// rate-limited to ~30 FPS.  Only frames composed of REAL guest GDI pixels
+    /// (window surfaces populated by guest-driven blits) are published: if no
+    /// real window surface exists, nothing is sent and the cached frame is
+    /// cleared.  Synthetic chrome/theme composition never feeds the channel.
     fn publish_live_window_preview_if_needed(&mut self) {
         if self.live_session.is_none() {
             return;
         }
 
-        // Rate-limit GDI window preview publication to at most ~30 FPS
-        // (one frame per 33 ms).  This prevents GDI previews from flooding
-        // the live frame channel when rendering is driven by GDI operations
-        // (e.g. the 32‑bit Steam bootstrapper).  The rate limit also
-        // prevents GDI previews from overwhelming D3D‑captured frames once
-        // the 64‑bit Steam client starts producing D3D presents.
         let now = std::time::Instant::now();
         let elapsed = now.duration_since(self.last_gdi_preview_publish);
-        if elapsed.as_millis() < 33 && self.last_gdi_preview_frame.is_some() {
+        if elapsed.as_millis() < 33 && self.last_real_gdi_frame.is_some() {
             return;
         }
 
@@ -9956,61 +9916,20 @@ impl PeHostRuntime {
             self.user32.window_previews().len(),
         ));
 
-        // Fetch CEF/WKWebView pixel data (if any) to overlay actual browser
-        // content onto the window preview's client area.
-        let cef_preview =
-            crate::cef_bridge::with_global_cef_bridge(|bridge| bridge.get_live_preview_frame())
-                .unwrap_or(None);
-
         let previews = self.user32.window_previews();
-        // Render the window preview with window chrome decorations, and
-        // overlay CEF content (nearest-neighbour scaled) into the client
-        // area when available.
-        if let Some(frame) = render_live_window_preview(
-            &previews,
-            &self.window_surfaces,
-            cef_preview
-                .as_ref()
-                .map(|(w, h, pix)| (*w, *h, pix.as_slice())),
-        ) {
+        // Compose only the REAL window surfaces (guest-driven blits).  When
+        // no real surface exists, `render_live_window_preview` returns None
+        // and nothing is published.
+        if let Some(frame) = render_live_window_preview(&previews, &self.window_surfaces) {
             self.last_gdi_preview_publish = now;
-            self.last_gdi_preview_frame = Some(frame.clone());
+            self.last_real_gdi_frame = Some(frame.clone());
             self.publish_live_frame(frame);
         } else {
-            crate::live::live_trace("[pe] publish_live_window_preview_if_needed — render_live_window_preview returned None");
+            // No real GDI pixels: do not fabricate a frame.  Drop any cached
+            // value so a stale surface never re-publishes as if it were fresh.
+            self.last_real_gdi_frame = None;
+            crate::live::live_trace("[pe] publish_live_window_preview_if_needed — render_live_window_preview returned None (no real GDI surface)");
         }
-    }
-
-    /// Re‑publish the most recent GDI window preview frame if:
-    ///
-    /// 1. D3D has **not** started producing frames yet
-    ///    („published_live_frame“ is still false — we are still in the
-    ///    pure‑GDI bootstrapper phase).
-    /// 2. At least 50 ms have elapsed since the last publish, so the
-    ///    live window does not go blank between sporadic GDI operations.
-    ///
-    /// Once `published_live_frame` becomes true (the 64‑bit Steam client
-    /// has started and its D3D swapchain presents are flowing), this
-    /// method becomes a no‑op so that D3D‑captured frames are never
-    /// overwritten by synthetic GDI previews.
-    fn republish_gdi_preview(&mut self) {
-        let Some(cached) = &self.last_gdi_preview_frame else {
-            return;
-        };
-        if self.published_live_frame {
-            return;
-        }
-        let now = std::time::Instant::now();
-        let elapsed = now.duration_since(self.last_gdi_preview_publish);
-        if elapsed.as_millis() < 50 {
-            return;
-        }
-        self.last_gdi_preview_publish = now;
-        crate::live::live_trace(&format!(
-            "[pe] republish_gdi_preview — re‑sending cached frame ({}×{})",
-            cached.width, cached.height,
-        ));
-        self.publish_live_frame(cached.clone());
     }
 
     fn window_preview(&self, hwnd: u32) -> Option<WindowPreview> {
@@ -10151,6 +10070,17 @@ impl PeHostRuntime {
                     }
                 }
             }
+            // A guest-driven copy just landed real GDI pixels in a window
+            // surface: this is the only place (besides the real memory-DC
+            // conversion in `gather_dc_pixels`) where `last_real_gdi_frame`
+            // may be assigned.  No synthetic content is ever cached here.
+            self.last_real_gdi_frame = Some(LiveFrame {
+                width: surf_w as u32,
+                height: surface.height as u32,
+                format: DxgiFormat::B8G8R8A8Unorm,
+                bytes: surface.bytes.clone(),
+                displayed_frame_index: 0,
+            });
         } else {
             // Dest is a memory DC: write into its selected bitmap.
             let Some(object) = self.dc_selected_objects.get(&hdc_dest).copied() else {
@@ -10266,6 +10196,17 @@ impl PeHostRuntime {
                 }
             }
         }
+        // Real memory-DC pixel extraction: cache the converted pixels so the
+        // live pipeline can publish them.  This is one of exactly two real
+        // GDI extraction sites (the other is the guest-driven blit in
+        // `blit_dc_to_dc`); synthetic frames are never cached here.
+        self.last_real_gdi_frame = Some(LiveFrame {
+            width: w as u32,
+            height: h as u32,
+            format: DxgiFormat::B8G8R8A8Unorm,
+            bytes: out.clone(),
+            displayed_frame_index: 0,
+        });
         Some((w, h, out))
     }
 
@@ -10460,7 +10401,10 @@ impl PeHostRuntime {
         } else {
             return Ok(false);
         }
-        self.publish_live_window_preview_if_needed();
+        // A builtin control paint renders synthetic chrome into the window
+        // surface for guest-visible behavior; it is NOT a real guest frame,
+        // so it never publishes to the live channel and never counts as a
+        // real guest present.
         Ok(true)
     }
 
@@ -14953,7 +14897,12 @@ impl PeHostRuntime {
                                     ]),
                                     json!(0),
                                 );
-                                if self.live_session.is_some() && !self.published_live_frame {
+                                // Real D3D9 guest present: count it, and on
+                                // the first one mark the first real guest
+                                // frame (published only when live).  This
+                                // flag is set ONLY by real presents.
+                                self.real_guest_frames += 1;
+                                if self.live_session.is_some() && !self.first_real_guest_frame_seen {
                                     let live_frame = LiveFrame {
                                         width: frame.width,
                                         height: frame.height,
@@ -14962,7 +14911,7 @@ impl PeHostRuntime {
                                         displayed_frame_index: 0,
                                     };
                                     self.publish_live_frame(live_frame);
-                                    self.published_live_frame = true;
+                                    self.first_real_guest_frame_seen = true;
                                 }
                             }
                             Err(_) => {
@@ -16116,21 +16065,34 @@ impl PeHostRuntime {
                 //                 DWORD dwFlags)
                 let swapchain_object = state.get(Register::Rcx);
                 if let Some(device_object) = self.d3d9_swapchains.get(&swapchain_object).copied() {
-                    if let Some(shim) = self.d3d9_shim.as_mut()
-                        && let Some(dev) = self.d3d9_devices.get(&device_object)
-                            && let Ok(frame) = shim.present(dev.id)
-                                && self.live_session.is_some() && !self.published_live_frame {
-                                    let live_frame = LiveFrame {
-                                        width: frame.width,
-                                        height: frame.height,
-                                        format: DxgiFormat::B8G8R8A8Unorm,
-                                        bytes: frame.pixels,
-                                        displayed_frame_index: 0,
-                                    };
-                                    self.publish_live_frame(live_frame);
-                                    self.published_live_frame = true;
-                                }
-                    state.set(Register::Rax, 0);
+                    let presented = {
+                        let shim = self.d3d9_shim.as_mut();
+                        let dev = self.d3d9_devices.get(&device_object);
+                        match (shim, dev) {
+                            (Some(shim), Some(dev)) => shim.present(dev.id).ok(),
+                            _ => None,
+                        }
+                    };
+                    if let Some(frame) = presented {
+                        // Real D3D9 swapchain present: count it, and on the
+                        // first one mark the first real guest frame
+                        // (published only when live).
+                        self.real_guest_frames += 1;
+                        if self.live_session.is_some() && !self.first_real_guest_frame_seen {
+                            let live_frame = LiveFrame {
+                                width: frame.width,
+                                height: frame.height,
+                                format: DxgiFormat::B8G8R8A8Unorm,
+                                bytes: frame.pixels,
+                                displayed_frame_index: 0,
+                            };
+                            self.publish_live_frame(live_frame);
+                            self.first_real_guest_frame_seen = true;
+                        }
+                        state.set(Register::Rax, 0);
+                    } else {
+                        state.set(Register::Rax, D3DERR_INVALIDCALL);
+                    }
                 } else {
                     state.set(Register::Rax, D3DERR_INVALIDCALL);
                 }
@@ -54449,15 +54411,15 @@ impl PeHostRuntime {
         state: &mut CpuState,
     ) -> AppResult<()> {
         if self.live_session.is_some() {
-            if !self.published_live_frame {
+            if !self.first_real_guest_frame_seen {
                 crate::live::live_trace(&format!(
                     "casa1-live-dxgi first-present api=d3d11 sync_interval={} allow_tearing={} swapchain={:#x}",
                     sync_interval, allow_tearing, swapchain_object
                 ));
             }
             crate::live::live_trace(&format!(
-                "casa1-live-dxgi present api=d3d11 sync_interval={} swapchain={:#x} published_live_frame={}",
-                sync_interval, swapchain_object, self.published_live_frame
+                "casa1-live-dxgi present api=d3d11 sync_interval={} swapchain={:#x} first_real_guest_frame_seen={}",
+                sync_interval, swapchain_object, self.first_real_guest_frame_seen
             ));
         }
         let device_object = self.d3d11_swapchain(swapchain_object)?.device_object;
@@ -54493,6 +54455,7 @@ impl PeHostRuntime {
                 Some((
                     hash,
                     BTreeMap::from([
+                        ("source".to_string(), "dxgi_d3d11".to_string()),
                         ("submission_hash".to_string(), submission.hash),
                         ("width".to_string(), state.desc.width.to_string()),
                         ("height".to_string(), state.desc.height.to_string()),
@@ -54520,14 +54483,16 @@ impl PeHostRuntime {
         };
         if let Some(frame) = live_frame {
             self.publish_live_frame(frame);
-            self.published_live_frame = true;
+            self.first_real_guest_frame_seen = true;
         }
+        // Real D3D11 guest present — count it regardless of live mode.
+        self.real_guest_frames += 1;
         if let Some((frame_hash, metadata)) = frame_record {
             self.gfx_frames.push(GfxFrame {
                 scene_id: "pe-runtime-d3d11".to_string(),
                 frame_index: self.next_frame_index,
                 hash: frame_hash,
-                ssim: 1.0,
+                ssim: 0.0,
                 metadata,
             });
             self.next_frame_index = self.next_frame_index.saturating_add(1);
@@ -54555,22 +54520,25 @@ impl PeHostRuntime {
         state: &mut CpuState,
     ) -> AppResult<()> {
         if self.live_session.is_some() {
-            if !self.published_live_frame {
+            if !self.first_real_guest_frame_seen {
                 crate::live::live_trace(&format!(
                     "casa1-live-dxgi first-present api=d3d12 sync_interval={} allow_tearing={} swapchain={:#x}",
                     sync_interval, allow_tearing, swapchain_object
                 ));
             }
             crate::live::live_trace(&format!(
-                "casa1-live-dxgi present api=d3d12 sync_interval={} swapchain={:#x} published_live_frame={}",
-                sync_interval, swapchain_object, self.published_live_frame
+                "casa1-live-dxgi present api=d3d12 sync_interval={} swapchain={:#x} first_real_guest_frame_seen={}",
+                sync_interval, swapchain_object, self.first_real_guest_frame_seen
             ));
         }
         let swapchain_id = self.d3d12_swapchain(swapchain_object)?.swapchain_id;
         let present = self
             .d3d12_runtime
             .present(swapchain_id, sync_interval, allow_tearing)?;
-        let frame = self.d3d12_runtime.presented_frame(swapchain_id)?;
+        let mut frame = self.d3d12_runtime.presented_frame(swapchain_id)?;
+        // The d3d12 runtime's backend defaults to a D3D11 source label;
+        // correct it here so the frame is marked with its real origin.
+        frame.source = crate::gfx::FrameSource::DxgiD3D12;
         let displayed_frame_index = present.displayed_frame_index;
         let queued_frames = present.queued_frames;
         let live_frame = LiveFrame {
@@ -54580,16 +54548,19 @@ impl PeHostRuntime {
             bytes: frame.bytes.clone(),
             displayed_frame_index,
         };
+        // Real D3D12 guest present — count it regardless of live mode.
+        self.real_guest_frames += 1;
         if self.live_session.is_some() {
             self.publish_live_frame(live_frame);
-            self.published_live_frame = true;
+            self.first_real_guest_frame_seen = true;
         } else {
             self.gfx_frames.push(GfxFrame {
                 scene_id: "pe-runtime-d3d12".to_string(),
                 frame_index: self.next_frame_index,
                 hash: util::sha256_bytes(&frame.bytes),
-                ssim: 1.0,
+                ssim: 0.0,
                 metadata: BTreeMap::from([
+                    ("source".to_string(), "dxgi_d3d12".to_string()),
                     ("width".to_string(), frame.width.to_string()),
                     ("height".to_string(), frame.height.to_string()),
                     ("format".to_string(), format!("{:?}", frame.format)),
@@ -74577,6 +74548,96 @@ mod tests {
             HostThunk::Unsupported { .. }
         ));
     }
+
+    #[test]
+    fn live_pipeline_reports_zero_real_frames_before_guest_paint() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge =
+            GameEnvironment::create_in(temp_dir.path(), "live-real-frames", GeArch::X86, "win11-23h2")
+                .expect("create ge");
+        let (host_session, live_session) = crate::live::new_live_session();
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), Some(live_session), None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        // A fresh runtime has never seen a real guest frame of any kind.
+        assert_eq!(runtime.real_guest_frames, 0);
+        assert!(runtime.last_real_gdi_frame.is_none());
+        assert!(!runtime.first_real_guest_frame_seen);
+        // Nothing may have been sent on the live channel yet.
+        assert!(host_session.frame_rx.try_recv().is_err());
+
+        // Synthetic paths must not count: no real window surfaces exist, so
+        // the preview publisher sends nothing and leaves no cached frame.
+        runtime.publish_live_window_preview_if_needed();
+        assert_eq!(runtime.real_guest_frames, 0);
+        assert!(runtime.last_real_gdi_frame.is_none());
+        assert!(!runtime.first_real_guest_frame_seen);
+        assert!(host_session.frame_rx.try_recv().is_err());
+
+        // Real GDI extraction (memory-DC conversion) is real GDI pixels but
+        // NOT a guest present: it caches a frame without counting one.
+        runtime.dc_selected_objects.insert(0x100, 0x200);
+        runtime.gdi_bitmaps.insert(
+            0x200,
+            MemoryBitmap {
+                width: 2,
+                height: 1,
+                bpp: 4,
+                bytes: vec![0x11, 0x22, 0x33, 0xff, 0x44, 0x55, 0x66, 0xff],
+                guest_pixel_ptr: 0,
+            },
+        );
+        let gathered = runtime.gather_dc_pixels(&mut memory, 0x100);
+        assert!(gathered.is_some(), "real memory-DC pixels must be extractable");
+        let (w, h, pixels) = gathered.unwrap();
+        assert_eq!((w, h), (2, 1));
+        assert_eq!(&pixels[..4], &[0x11, 0x22, 0x33, 0xff]);
+        assert!(runtime.last_real_gdi_frame.is_some());
+        assert_eq!(runtime.real_guest_frames, 0, "GDI pixels are not presents");
+        assert!(!runtime.first_real_guest_frame_seen);
+        assert!(host_session.frame_rx.try_recv().is_err());
+
+        // A real D3D11 guest present counts as a real guest frame and flips
+        // the first-frame flag; the live channel receives the presented frame.
+        let device = d3d11_create_device_and_swapchain(
+            DeviceCreationRequest {
+                requested_feature_levels: vec![FeatureLevel::Level10_1],
+            },
+            SwapchainDesc {
+                width: 2,
+                height: 1,
+                format: DxgiFormat::B8G8R8A8Unorm,
+                buffer_count: 2,
+            },
+        )
+        .expect("create d3d11 device and swapchain");
+        runtime.d3d11_devices.insert(
+            0x1000,
+            GuestD3d11Device {
+                device,
+                context_object: 0,
+                swapchain_object: Some(0x2000),
+                backbuffer_objects: BTreeMap::new(),
+            },
+        );
+        runtime
+            .d3d11_swapchains
+            .insert(0x2000, GuestDxgiSwapChain { device_object: 0x1000 });
+        let mut state = CpuState::new(GuestArch::X64);
+        runtime
+            .dispatch_d3d11_swapchain_present(1, false, 0x2000, &mut state)
+            .expect("d3d11 present");
+
+        assert_eq!(runtime.real_guest_frames, 1);
+        assert!(runtime.first_real_guest_frame_seen);
+        let live_frame = host_session
+            .frame_rx
+            .try_recv()
+            .expect("a real present must publish a live frame");
+        assert_eq!(live_frame.width, 2);
+        assert_eq!(live_frame.height, 1);
+    }
 }
 
 fn read_d3d12_command_queue_desc(
@@ -75712,190 +75773,31 @@ fn message_kind(message_id: u32) -> AppResult<MessageKind> {
 const PREVIEW_CLIENT_ORIGIN_X: usize = 12;
 const PREVIEW_CLIENT_ORIGIN_Y: usize = 36;
 
+/// Compose the live frame from REAL guest GDI window surfaces only.
+///
+/// Synthetic chrome/theme/text composition is deliberately NOT used here:
+/// the published frame must contain real guest pixels.  When no real window
+/// surface exists (nothing has been blitted into a guest window yet), this
+/// returns `None` and nothing is published.
 fn render_live_window_preview(
     previews: &[WindowPreview],
     window_surfaces: &BTreeMap<u32, WindowSurface>,
-    cef_preview: Option<(u32, u32, &[u8])>,
 ) -> Option<LiveFrame> {
     let layout = build_preview_layout(previews)?;
+
+    // Real frames only: zero real guest surfaces means no frame to publish.
+    let has_real_surface = window_surfaces.contains_key(&layout.root.hwnd)
+        || layout
+            .children
+            .iter()
+            .any(|(child, _)| window_surfaces.contains_key(&child.hwnd));
+    if !has_real_surface {
+        return None;
+    }
+
     let mut bytes = vec![0_u8; layout.width.checked_mul(layout.height)?.checked_mul(4)?];
 
-    // Detect Steam BootstrapUpdateUIClass for themed rendering
-    let is_steam = layout
-        .root
-        .class_name
-        .to_ascii_lowercase()
-        .contains("bootstrapupdateui")
-        || layout
-            .root
-            .class_name
-            .to_ascii_lowercase()
-            .contains("steam");
-
-    // Client area bounds (same for both themes)
-    let (client_x, client_y, client_w, client_h) = if is_steam {
-        (
-            1usize,
-            31usize,
-            layout.width.saturating_sub(2),
-            layout.height.saturating_sub(32),
-        )
-    } else {
-        (
-            4usize,
-            32usize,
-            layout.width.saturating_sub(8),
-            layout.height.saturating_sub(36),
-        )
-    };
-
-    if is_steam {
-        // Steam-style dark theme
-        // Outer border
-        fill_bgra_rect(
-            &mut bytes,
-            layout.width,
-            0,
-            0,
-            layout.width,
-            layout.height,
-            [0x1b, 0x1b, 0x1b, 0xff],
-        );
-        // Title bar – Steam dark gradient (solid dark blue-gray)
-        fill_bgra_rect(
-            &mut bytes,
-            layout.width,
-            1,
-            1,
-            layout.width.saturating_sub(2),
-            30,
-            [0x1e, 0x2a, 0x3a, 0xff],
-        );
-        // Client area — fill with dark charcoal (will be overlaid with CEF content)
-        fill_bgra_rect(
-            &mut bytes,
-            layout.width,
-            client_x,
-            client_y,
-            client_w,
-            client_h,
-            [0x1b, 0x28, 0x38, 0xff],
-        );
-        // Title bar gradient highlight line
-        fill_bgra_rect(
-            &mut bytes,
-            layout.width,
-            1,
-            28,
-            layout.width.saturating_sub(2),
-            2,
-            [0x4c, 0x6e, 0x8c, 0xff],
-        );
-        let title = if layout.root.title.trim().is_empty() {
-            layout.root.class_name.as_str()
-        } else {
-            layout.root.title.as_str()
-        };
-        draw_text_bgra(
-            &mut bytes,
-            layout.width,
-            12,
-            10,
-            title,
-            [0xd0, 0xd8, 0xe0, 0xff],
-            2,
-        );
-    } else {
-        // Standard Windows-style chrome
-        // Outer border
-        fill_bgra_rect(
-            &mut bytes,
-            layout.width,
-            0,
-            0,
-            layout.width,
-            layout.height,
-            [0x40, 0x40, 0x40, 0xff],
-        );
-        // Client area — fill with light gray (will be overlaid with CEF content)
-        fill_bgra_rect(
-            &mut bytes,
-            layout.width,
-            client_x,
-            client_y,
-            client_w,
-            client_h,
-            [0xf8, 0xfa, 0xfc, 0xff],
-        );
-        // Title bar
-        fill_bgra_rect(
-            &mut bytes,
-            layout.width,
-            4,
-            4,
-            layout.width.saturating_sub(8),
-            28,
-            [0x7d, 0x53, 0x1f, 0xff],
-        );
-        // Title bar highlight
-        fill_bgra_rect(
-            &mut bytes,
-            layout.width,
-            18,
-            12,
-            layout.width.saturating_sub(36),
-            6,
-            [0xd8, 0xe6, 0xf5, 0xff],
-        );
-        let title = if layout.root.title.trim().is_empty() {
-            layout.root.class_name.as_str()
-        } else {
-            layout.root.title.as_str()
-        };
-        draw_text_bgra(
-            &mut bytes,
-            layout.width,
-            12,
-            12,
-            title,
-            [0xf8, 0xfa, 0xfc, 0xff],
-            2,
-        );
-    }
-
-    // If CEF/WKWebView pixel data is available, blit it into the client area,
-    // nearest-neighbor-scaled to fit. This overlays actual browser content
-    // (e.g. Steam login / store pages) onto the window preview instead of a
-    // solid-colored rectangle.
-    if let Some((cef_w, cef_h, cef_pixels)) = cef_preview {
-        let cef_w = cef_w as usize;
-        let cef_h = cef_h as usize;
-        // Only blit if we have reasonable pixel data
-        if cef_w > 0
-            && cef_h > 0
-            && cef_pixels.len() >= cef_w * cef_h * 4
-            && client_w > 0
-            && client_h > 0
-        {
-            for dst_y in 0..client_h {
-                for dst_x in 0..client_w {
-                    // Nearest-neighbor mapping: CEF pixel -> preview pixel
-                    let src_x = (dst_x * cef_w) / client_w;
-                    let src_y = (dst_y * cef_h) / client_h;
-                    let src_idx = (src_y * cef_w + src_x) * 4;
-                    let dst_px = (dst_y + client_y) * layout.width + (dst_x + client_x);
-                    let dst_idx = dst_px * 4;
-                    // BGRA copy
-                    bytes[dst_idx] = cef_pixels[src_idx]; // B
-                    bytes[dst_idx + 1] = cef_pixels[src_idx + 1]; // G
-                    bytes[dst_idx + 2] = cef_pixels[src_idx + 2]; // R
-                    bytes[dst_idx + 3] = cef_pixels[src_idx + 3]; // A
-                }
-            }
-        }
-    }
-
-    // Blit the root window's GDI-rendered surface (if Steam's WndProc painted)
+    // Blit the root window's GDI-rendered surface (real guest pixels).
     if let Some(surface) = window_surfaces.get(&layout.root.hwnd) {
         blit_window_surface(
             &mut bytes,
@@ -75906,181 +75808,11 @@ fn render_live_window_preview(
         );
     }
 
+    // Blit each child window surface at its real position (guest-driven
+    // blits landed here via BitBlt/StretchBlt on the child's DC).
     for (child, rect) in &layout.children {
-        // If the child has a surface (painted by GDI thunks), blit it directly
         if let Some(surface) = window_surfaces.get(&child.hwnd) {
             blit_window_surface(&mut bytes, layout.width, rect.x, rect.y, surface);
-            continue;
-        }
-        let class_name = child.class_name.to_ascii_lowercase();
-
-        if is_steam {
-            // Steam-themed child controls
-            if class_name.contains("progress") {
-                // Steam progress: dark track with green fill
-                fill_bgra_rect(
-                    &mut bytes,
-                    layout.width,
-                    rect.x,
-                    rect.y,
-                    rect.width,
-                    rect.height,
-                    [0x0e, 0x1a, 0x26, 0xff],
-                );
-                fill_bgra_rect(
-                    &mut bytes,
-                    layout.width,
-                    rect.x + 1,
-                    rect.y + 1,
-                    rect.width.saturating_sub(2),
-                    rect.height.saturating_sub(2),
-                    [0x16, 0x24, 0x34, 0xff],
-                );
-                fill_bgra_rect(
-                    &mut bytes,
-                    layout.width,
-                    rect.x + 2,
-                    rect.y + 2,
-                    rect.width.saturating_mul(2) / 3,
-                    rect.height.saturating_sub(4),
-                    [0x5c, 0xb8, 0x5c, 0xff], // Steam green
-                );
-            } else if class_name.contains("button") {
-                // Steam button: dark with lighter hover-like fill
-                fill_bgra_rect(
-                    &mut bytes,
-                    layout.width,
-                    rect.x,
-                    rect.y,
-                    rect.width,
-                    rect.height,
-                    [0x2a, 0x3d, 0x50, 0xff],
-                );
-                fill_bgra_rect(
-                    &mut bytes,
-                    layout.width,
-                    rect.x + 1,
-                    rect.y + 1,
-                    rect.width.saturating_sub(2),
-                    rect.height.saturating_sub(2),
-                    [0x36, 0x4d, 0x63, 0xff],
-                );
-                if !child.title.is_empty() {
-                    draw_text_bgra(
-                        &mut bytes,
-                        layout.width,
-                        rect.x + 8,
-                        rect.y + rect.height.saturating_div(2).saturating_sub(5),
-                        &child.title,
-                        [0xc0, 0xd0, 0xe0, 0xff],
-                        1,
-                    );
-                }
-            } else {
-                // Static text on dark background
-                if !child.title.is_empty() {
-                    draw_text_bgra(
-                        &mut bytes,
-                        layout.width,
-                        rect.x + 4,
-                        rect.y + rect.height.saturating_div(2).saturating_sub(4),
-                        &child.title,
-                        [0xb0, 0xc0, 0xd0, 0xff],
-                        1,
-                    );
-                }
-            }
-        } else {
-            // Standard Windows-themed child controls
-            if class_name.contains("progress") {
-                fill_bgra_rect(
-                    &mut bytes,
-                    layout.width,
-                    rect.x,
-                    rect.y,
-                    rect.width,
-                    rect.height,
-                    [0xdc, 0xe3, 0xea, 0xff],
-                );
-                fill_bgra_rect(
-                    &mut bytes,
-                    layout.width,
-                    rect.x + 2,
-                    rect.y + 2,
-                    rect.width.saturating_sub(4),
-                    rect.height.saturating_sub(4),
-                    [0xf9, 0xfb, 0xfd, 0xff],
-                );
-                fill_bgra_rect(
-                    &mut bytes,
-                    layout.width,
-                    rect.x + 3,
-                    rect.y + 3,
-                    rect.width.saturating_mul(2) / 3,
-                    rect.height.saturating_sub(6),
-                    [0x9a, 0xc8, 0x4b, 0xff],
-                );
-            } else if class_name.contains("button") {
-                fill_bgra_rect(
-                    &mut bytes,
-                    layout.width,
-                    rect.x,
-                    rect.y,
-                    rect.width,
-                    rect.height,
-                    [0xb9, 0xc4, 0xd1, 0xff],
-                );
-                fill_bgra_rect(
-                    &mut bytes,
-                    layout.width,
-                    rect.x + 1,
-                    rect.y + 1,
-                    rect.width.saturating_sub(2),
-                    rect.height.saturating_sub(2),
-                    [0xe7, 0xed, 0xf4, 0xff],
-                );
-                if !child.title.is_empty() {
-                    draw_text_bgra(
-                        &mut bytes,
-                        layout.width,
-                        rect.x + 8,
-                        rect.y + rect.height.saturating_div(2).saturating_sub(5),
-                        &child.title,
-                        [0x42, 0x4e, 0x5c, 0xff],
-                        1,
-                    );
-                }
-            } else {
-                fill_bgra_rect(
-                    &mut bytes,
-                    layout.width,
-                    rect.x,
-                    rect.y,
-                    rect.width,
-                    rect.height,
-                    [0xff, 0xff, 0xff, 0xff],
-                );
-                fill_bgra_rect(
-                    &mut bytes,
-                    layout.width,
-                    rect.x,
-                    rect.y,
-                    rect.width,
-                    1,
-                    [0xcc, 0xd6, 0xe0, 0xff],
-                );
-                if !child.title.is_empty() {
-                    draw_text_bgra(
-                        &mut bytes,
-                        layout.width,
-                        rect.x + 4,
-                        rect.y + rect.height.saturating_div(2).saturating_sub(4),
-                        &child.title,
-                        [0x56, 0x56, 0x56, 0xff],
-                        1,
-                    );
-                }
-            }
         }
     }
 

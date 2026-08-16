@@ -2218,9 +2218,15 @@ impl D3d11Device {
                         )
                     };
                     let resource = self.resource_mut(resource_id)?;
+                    // The clear colour arrives in RGBA byte order (D3D11
+                    // ClearRenderTargetView semantics); the resource stores
+                    // pixels in its declared format layout, so reorder the
+                    // bytes before writing (B8G8R8A8 targets must be
+                    // [b, g, r, a], or the clear would swap R/B).
+                    let stored_color = clear_color_bytes_for_format(*color, resource.desc.format);
                     for chunk in resource.bytes.chunks_mut(4) {
                         let len = chunk.len().min(4);
-                        chunk[..len].copy_from_slice(&color[..len]);
+                        chunk[..len].copy_from_slice(&stored_color[..len]);
                     }
                     resource.digest = None;
                     self.backend.record_clear_rtv(list, heap, 0)?;
@@ -3688,6 +3694,23 @@ impl DeferredContext {
 
 // ── Deferred-context validation helpers ──────────────────────────────────
 
+/// Convert a `ClearRenderTargetView` clear colour — carried in RGBA byte
+/// order (the D3D11 `ColorRGBA` convention, floats scaled to bytes) — into
+/// the byte order declared by the destination resource's format.  Writing
+/// RGBA bytes raw into a B8G8R8A8 backbuffer would swap R and B.
+fn clear_color_bytes_for_format(rgba: [u8; 4], format: DxgiFormat) -> [u8; 4] {
+    match format {
+        DxgiFormat::B8G8R8A8Unorm
+        | DxgiFormat::B8G8R8A8UnormSrgb
+        | DxgiFormat::B8G8R8X8Unorm => [rgba[2], rgba[1], rgba[0], rgba[3]],
+        DxgiFormat::R8G8B8A8Unorm
+        | DxgiFormat::R8G8B8A8UnormSrgb
+        | DxgiFormat::R8G8B8A8Uint => rgba,
+        // Best-effort for every other format: keep the RGBA byte order.
+        _ => rgba,
+    }
+}
+
 /// Validate that all resource and view references in a recorded command
 /// are still valid on the device (i.e. have not been destroyed).
 fn validate_command_resources(command: &RecordedCommand, device: &D3d11Device) -> AppResult<()> {
@@ -4745,6 +4768,52 @@ mod tests {
         assert_eq!(frame.width, 2);
         assert_eq!(frame.height, 1);
         assert_eq!(&frame.bytes[..uploaded.len()], &uploaded);
+    }
+
+    #[test]
+    fn clear_render_target_view_writes_declared_channel_order_for_b8g8r8a8_backbuffer() {
+        let mut device = d3d11_create_device_and_swapchain(
+            DeviceCreationRequest {
+                requested_feature_levels: vec![FeatureLevel::Level10_1],
+            },
+            SwapchainDesc {
+                width: 2,
+                height: 1,
+                format: DxgiFormat::B8G8R8A8Unorm,
+                buffer_count: 2,
+            },
+        )
+        .expect("create device and swapchain");
+
+        let backbuffer = device
+            .swapchain_backbuffer(0)
+            .expect("swapchain backbuffer");
+        let rtv = device
+            .create_render_target_view(backbuffer, DxgiFormat::B8G8R8A8Unorm)
+            .expect("create render target view");
+
+        // ClearRenderTargetView takes the clear colour as RGBA floats:
+        // (1.0, 0.0, 0.0, 1.0) = red.  A B8G8R8A8 backbuffer must store
+        // [b, g, r, a] = [0x00, 0x00, 0xff, 0xff] — the bytes must be
+        // reordered at the source, not copied raw.
+        device
+            .clear_render_target_view(rtv, [255, 0, 0, 255])
+            .expect("clear red");
+        device
+            .present_swapchain(1, false, true)
+            .expect("present swapchain");
+
+        let frame = device.presented_frame().expect("presented frame");
+        assert_eq!(
+            &frame.bytes[..4],
+            &[0x00, 0x00, 0xff, 0xff],
+            "B8G8R8A8 backbuffer must store the clear colour as [b, g, r, a]"
+        );
+        assert_eq!(
+            &frame.bytes[4..8],
+            &[0x00, 0x00, 0xff, 0xff],
+            "second pixel must also be [b, g, r, a]"
+        );
     }
 
     #[test]
