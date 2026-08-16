@@ -107,11 +107,6 @@ const LIVE_UI_DEBUG_LIMIT: usize = 32;
 const WINDOW_MSG_DEBUG_LIMIT: usize = 128;
 const STACK_BASE: u64 = 0x0000_7fff_1000_0000;
 
-/// `MOV EDI, EDI` — the 2-byte NOP prefix used for hot-patch support.
-/// When a function is compiled with /hotpatch, this instruction occupies the
-/// first 2 bytes of the function. A 5-byte `JMP rel32` overwrites bytes -5..0
-/// (5 bytes before entry) or bytes -2..+3 to redirect execution.
-const HOT_PATCH_MOV_EDI_EDI: [u8; 2] = [0x8B, 0xFF];
 const X86_STACK_BASE: u64 = 0x7000_0000;
 /// Main thread stack size.  64 KB was far too small for complex apps like
 /// Steam — the guest stack overflows almost immediately, the guest RSP
@@ -3780,9 +3775,6 @@ struct PeHostRuntime {
     /// When true, the application directory is searched first for all DLL loads
     /// (Windows "local redirection" / activation context isolation).
     local_redirect_active: bool,
-    /// Phase M6: Tracks addresses of functions that have been hot-patched via
-    /// WriteProcessMemory (MOV EDI, EDI prefix detected, JMP rel32 written).
-    hot_patched_functions: BTreeSet<u64>,
     /// Phase L — maps ShellItem guest object addresses to their associated
     /// path string (used by ShellFolderBindToObject -> SHCreateItemFromParsingName).
     shell_item_paths: HashMap<u64, String>,
@@ -8350,7 +8342,6 @@ impl PeHostRuntime {
             next_activation_context_handle: 0xE0000001,
             comctl32_v6_active: false,
             local_redirect_active: false,
-            hot_patched_functions: BTreeSet::new(),
             shell_item_paths: HashMap::new(),
             // ── Phase L1: Shell folder paths / EnumIDList state ───────────────
             shell_folder_paths: HashMap::new(),
@@ -9632,6 +9623,17 @@ impl PeHostRuntime {
         environment: &BTreeMap<String, String>,
     ) -> AppResult<u64> {
         let mut bytes = Vec::new();
+        // Real Windows prepends hidden per-drive current-directory entries such
+        // as `=C:=C:\Steam`; the first one names the process's current drive.
+        let drive = self
+            .current_directory
+            .get(..2)
+            .filter(|prefix| prefix.ends_with(':'))
+            .unwrap_or("C:");
+        for unit in format!("={drive}={}", self.current_directory).encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
         for (key, value) in environment {
             for unit in format!("{key}={value}").encode_utf16() {
                 bytes.extend_from_slice(&unit.to_le_bytes());
@@ -11065,11 +11067,32 @@ impl PeHostRuntime {
         let fmode_ptr = self.alloc_u32(memory, 0)?;
         let peb_base = self.alloc_zeroed(memory, 0x100, 16)?;
         let teb_base = self.alloc_zeroed(memory, 0x100, 16)?;
+        // Main-thread stack bounds — same region the loader maps for the main
+        // thread (see the main-run path: stack_base_for_arch + STACK_SIZE).
+        let stack_bottom = stack_base_for_arch(self.guest_arch);
+        let stack_top = stack_bottom + STACK_SIZE as u64;
         if self.guest_arch == GuestArch::X86 {
             write_u32(memory, teb_base, X86_EXCEPTION_CHAIN_END as u32);
+            write_u32(memory, teb_base + 0x04, stack_top as u32);
+            write_u32(memory, teb_base + 0x08, stack_bottom as u32);
             write_guest_pointer(memory, teb_base + 0x30, peb_base, self.guest_arch)?;
             write_guest_pointer(memory, teb_base + 0x18, teb_base, self.guest_arch)?;
             write_guest_pointer(memory, peb_base + 0x08, mapped_image_base, self.guest_arch)?;
+            // Minimal PEB_LDR_DATA (x86 layout): Length@0, Initialized@4,
+            // SsHandle@8, InLoadOrderModuleList@0x0c, InMemoryOrderModuleList@0x14,
+            // InInitializationOrderModuleList@0x1c.  Each list head is
+            // self-referential so Ldr walks terminate on empty-but-valid lists
+            // instead of a NULL pointer.
+            let peb_ldr_base = self.alloc_zeroed(memory, 0x40, 16)?;
+            write_u32(memory, peb_ldr_base, 0x24);
+            memory.write_u8(peb_ldr_base + 0x04, 1);
+            write_u32(memory, peb_ldr_base + 0x08, 0);
+            for list_offset in [0x0c_u64, 0x14, 0x1c] {
+                let list_head = peb_ldr_base + list_offset;
+                write_guest_pointer(memory, list_head, list_head, self.guest_arch)?;
+                write_guest_pointer(memory, list_head + 4, list_head, self.guest_arch)?;
+            }
+            write_guest_pointer(memory, peb_base + 0x0c, peb_ldr_base, self.guest_arch)?;
             write_guest_pointer(
                 memory,
                 peb_base + 0x18,
@@ -11086,6 +11109,9 @@ impl PeHostRuntime {
         } else {
             write_guest_pointer(memory, teb_base + 0x30, teb_base, self.guest_arch)?;
             write_guest_pointer(memory, teb_base + 0x60, peb_base, self.guest_arch)?;
+            // x64 TEB: StackBase at +0x08, StackLimit at +0x10.
+            write_guest_pointer(memory, teb_base + 0x08, stack_top, self.guest_arch)?;
+            write_guest_pointer(memory, teb_base + 0x10, stack_bottom, self.guest_arch)?;
             write_guest_pointer(memory, peb_base + 0x10, mapped_image_base, self.guest_arch)?;
             write_guest_pointer(
                 memory,
@@ -11311,42 +11337,6 @@ impl PeHostRuntime {
             ]),
             json!(format!("{cookie:#x}")),
         );
-        Ok(())
-    }
-
-    /// Check if a function entry point has the hot-patch `MOV EDI, EDI` prefix.
-    fn has_hot_patch_prefix(&self, memory: &MemoryImage, func_addr: u64) -> AppResult<bool> {
-        if func_addr < 5 {
-            return Ok(false);
-        }
-        match memory.read_bytes(func_addr, 2) {
-            Ok(bytes) if bytes == HOT_PATCH_MOV_EDI_EDI => Ok(true),
-            _ => Ok(false),
-        }
-    }
-
-    /// Write a 5-byte `JMP rel32` relative jump to patch a hot-patchable function.
-    ///
-    /// The jump is written at `target_addr` (5 bytes before the original entry)
-    /// and redirects to `new_func_addr`. The 2-byte `MOV EDI, EDI` prefix at
-    /// the original entry serves as a NOP sled that, combined with the 3 bytes
-    /// following it, provides the 5 bytes needed for the JMP.
-    fn patch_hot_patch_function(
-        &mut self,
-        memory: &mut MemoryImage,
-        original_entry: u64,
-        new_func_addr: u64,
-    ) -> AppResult<()> {
-        // The JMP instruction is written at original_entry - 5
-        // and occupies 5 bytes: 0xE9 + 4-byte relative offset.
-        // The relative offset is from (original_entry - 5 + 5) = original_entry.
-        let jmp_location = original_entry.wrapping_sub(5);
-        let relative_offset = new_func_addr.wrapping_sub(jmp_location).wrapping_sub(5);
-        let mut jmp_bytes = vec![0xE9u8]; // JMP rel32
-        jmp_bytes.extend_from_slice(&(relative_offset as i32).to_le_bytes());
-
-        // Map the 5-byte JMP into guest memory
-        memory.map_bytes(jmp_location, &jmp_bytes);
         Ok(())
     }
 
@@ -26153,7 +26143,7 @@ impl PeHostRuntime {
                 } else {
                     read_utf16_string(memory, command_line_ptr)?
                 };
-                let argv = util::split_command_line(&command_line)?;
+                let argv = crate::win32::windows_command_line_to_argv(&command_line);
                 let mut argv_values = Vec::with_capacity(argv.len() + 1);
                 for arg in &argv {
                     argv_values.push(self.alloc_utf16_string(memory, arg)?);
@@ -32928,10 +32918,18 @@ impl PeHostRuntime {
                 );
             }
             HostThunk::GetVersion => {
-                const WINDOWS_10_BUILD_22H2: u32 = (19045u32 << 16) | 10u32;
-                state.set(Register::Rax, WINDOWS_10_BUILD_22H2 as u64);
+                // Deprecated API: the low-order word contains (major << 8) | minor,
+                // the high-order word holds the build number, and bit 31 is set on
+                // Windows NT. Derive from the GE winver profile so this stays
+                // consistent with VerifyVersionInfoW.
+                let version = guest_version_info_from_profile(&self.win32.ge().config.winver)?;
+                let packed = (version.build << 16)
+                    | ((version.major & 0xff) << 8)
+                    | (version.minor & 0xff)
+                    | 0x8000_0000;
+                state.set(Register::Rax, u64::from(packed));
                 self.last_error = 0;
-                self.push_trace("kernel32", "GetVersion", BTreeMap::new(), json!(WINDOWS_10_BUILD_22H2));
+                self.push_trace("kernel32", "GetVersion", BTreeMap::new(), json!(packed));
             }
             HostThunk::GetVersionExW => {
                 // OSVERSIONINFOEXW layout (x86):
@@ -32950,14 +32948,17 @@ impl PeHostRuntime {
                 const OSVERSIONINFOW_SIZE: u32 = 0x114; // 276 bytes — base struct
                 const OSVERSIONINFOEXW_SIZE: u32 = 0x11C; // 284 bytes — extended struct
                 let info_ptr = guest_call_arg(state, memory, 0)?;
+                // Derive the reported version from the GE winver profile, exactly
+                // like VerifyVersionInfoW, so the two APIs never disagree.
+                let version = guest_version_info_from_profile(&self.win32.ge().config.winver)?;
+                let major: u32 = version.major;
+                let minor: u32 = version.minor;
+                let build: u32 = version.build;
                 if info_ptr == 0 {
                     state.set(Register::Rax, 0);
                     self.last_error = ERROR_INVALID_PARAMETER;
                 } else {
                     let reported_size = read_u32(memory, info_ptr)?;
-                    let major: u32 = 10;
-                    let minor: u32 = 0;
-                    let build: u32 = 19045;
                     write_u32(memory, info_ptr + 0x04, major);
                     write_u32(memory, info_ptr + 0x08, minor);
                     write_u32(memory, info_ptr + 0x0C, build);
@@ -32967,10 +32968,10 @@ impl PeHostRuntime {
                         memory.write_u16(info_ptr + offset, 0);
                     }
                     if reported_size >= OSVERSIONINFOEXW_SIZE {
-                        write_u16(memory, info_ptr + 0x114, 0); // wServicePackMajor
-                        write_u16(memory, info_ptr + 0x116, 0); // wServicePackMinor
-                        write_u16(memory, info_ptr + 0x118, 0x0100); // wSuiteMask (VER_SUITE_SINGLEUSERUTILS)
-                        memory.write_u8(info_ptr + 0x11A, 1); // wProductType = VER_NT_WORKSTATION
+                        write_u16(memory, info_ptr + 0x114, version.service_pack_major); // wServicePackMajor
+                        write_u16(memory, info_ptr + 0x116, version.service_pack_minor); // wServicePackMinor
+                        write_u16(memory, info_ptr + 0x118, version.suite_mask); // wSuiteMask (0 for all GE profiles)
+                        memory.write_u8(info_ptr + 0x11A, version.product_type); // wProductType
                         memory.write_u8(info_ptr + 0x11B, 0); // wReserved
                     }
                     // Restore the original dwOSVersionInfoSize
@@ -32983,9 +32984,9 @@ impl PeHostRuntime {
                     "GetVersionExW",
                     BTreeMap::from([
                         ("info_ptr".to_string(), json!(format!("{info_ptr:#x}"))),
-                        ("major".to_string(), json!(10)),
-                        ("minor".to_string(), json!(0)),
-                        ("build".to_string(), json!(19045)),
+                        ("major".to_string(), json!(major)),
+                        ("minor".to_string(), json!(minor)),
+                        ("build".to_string(), json!(build)),
                     ]),
                     json!(1),
                 );
@@ -33045,9 +33046,19 @@ impl PeHostRuntime {
             }
             HostThunk::TlsGetValue => {
                 let slot = guest_call_arg_u32(state, memory, 0)?;
-                let value = self.tls_slots.get(&slot).copied().unwrap_or(0);
-                state.set(Register::Rax, value);
-                self.last_error = 0;
+                let value = self.tls_slots.get(&slot).copied();
+                match value {
+                    Some(value) => {
+                        state.set(Register::Rax, value);
+                        self.last_error = 0;
+                    }
+                    None => {
+                        // Callers distinguish a failed lookup from a stored 0
+                        // via GetLastError, so set ERROR_INVALID_PARAMETER.
+                        state.set(Register::Rax, 0);
+                        self.last_error = ERROR_INVALID_PARAMETER;
+                    }
+                }
             }
             HostThunk::TlsSetValue => {
                 let slot = guest_call_arg_u32(state, memory, 0)?;
@@ -33100,9 +33111,19 @@ impl PeHostRuntime {
             }
             HostThunk::FlsGetValue => {
                 let slot = guest_call_arg_u32(state, memory, 0)?;
-                let value = self.fls_slots.get(&slot).copied().unwrap_or(0);
-                state.set(Register::Rax, value);
-                self.last_error = 0;
+                let value = self.fls_slots.get(&slot).copied();
+                match value {
+                    Some(value) => {
+                        state.set(Register::Rax, value);
+                        self.last_error = 0;
+                    }
+                    None => {
+                        // Callers distinguish a failed lookup from a stored 0
+                        // via GetLastError, so set ERROR_INVALID_PARAMETER.
+                        state.set(Register::Rax, 0);
+                        self.last_error = ERROR_INVALID_PARAMETER;
+                    }
+                }
             }
             HostThunk::FlsSetValue => {
                 let slot = guest_call_arg_u32(state, memory, 0)?;
@@ -33334,35 +33355,10 @@ impl PeHostRuntime {
                         }
                     };
 
-                    // ── Phase M6: Hot-patching support ────────────────────────────
-                    // Check if this write targets a hot-patchable function entry
-                    // (detected by the 2-byte MOV EDI, EDI prefix at the target address).
-                    let is_hot_patch_target = self.has_hot_patch_prefix(memory, lp_base_address)
-                        .unwrap_or(false);
-
-                    if is_hot_patch_target && n_size >= 5 {
-                        // Write the new function code at the target address first
-                        memory.map_bytes(lp_base_address, &data);
-
-                        // Patch the 5-byte JMP rel32 before the function entry.
-                        // The JMP at (lp_base_address - 5) redirects to the new function
-                        // code that was just written. If the caller wrote a full function
-                        // replacement, the new code starts at lp_base_address.
-                        // If data[0..2] is already a valid JMP rel32 (0xE9), skip patching
-                        // since the caller may be doing a deliberate self-rewrite.
-                        let already_patched = data.first().copied() == Some(0xE9)
-                            && n_size >= 5;
-                        if !already_patched {
-                            let new_func_addr = lp_base_address;
-                            let _ = self.patch_hot_patch_function(memory, lp_base_address, new_func_addr);
-                        }
-
-                        // Track this address as hot-patched
-                        self.hot_patched_functions.insert(lp_base_address);
-                    } else {
-                        // Normal write — no hot-patch detection
-                        memory.map_bytes(lp_base_address, &data);
-                    }
+                    // Plain write: every WriteProcessMemory call is honored
+                    // verbatim. Guest self-patching (e.g. Steam's bootstrapper)
+                    // must not be intercepted or rewritten.
+                    memory.map_bytes(lp_base_address, &data);
 
                     // Write back the number of bytes transferred
                     if lp_number_of_bytes_written != 0 {
@@ -33380,7 +33376,6 @@ impl PeHostRuntime {
                             ("lp_base_address".to_string(), json!(format!("{lp_base_address:#x}"))),
                             ("n_size".to_string(), json!(n_size)),
                             ("bytes_written".to_string(), json!(n_size)),
-                            ("hot_patch".to_string(), json!(is_hot_patch_target)),
                         ]),
                         json!(1),
                     );
@@ -45690,10 +45685,9 @@ impl PeHostRuntime {
             }
             // ── Phase L: COM/Shell Completion dispatch handlers ─────────────────
             HostThunk::SHGetDesktopFolder => {
-                // Returns IShellFolder* for the desktop namespace.
+                // HRESULT SHGetDesktopFolder(IShellFolder **ppshf)
                 // We create a lightweight ShellFolderObject on the heap and return a PIDL pointer.
-                let _reserved = guest_call_arg(state, memory, 0)?;
-                let out_ptr = guest_call_arg(state, memory, 1)?;
+                let out_ptr = guest_call_arg(state, memory, 0)?;
                 if out_ptr == 0 {
                     state.set(Register::Rax, 0x80070057); // E_INVALIDARG
                     self.last_error = 0x57;
@@ -47670,6 +47664,27 @@ impl PeHostRuntime {
         let initial_rsp = stack_base.wrapping_sub(self.guest_arch.pointer_bytes() as u64);
         write_guest_pointer(memory, initial_rsp, 0, self.guest_arch)?;
         thread_state.set(Register::Rsp, initial_rsp);
+        // The first pump runs the thread through execute_guest_callback_inner,
+        // whose x86 branch pushes a synthetic return address of 0 and the
+        // thread parameter above the thread's initial stack top (the pump
+        // always passes exactly one argument — the CreateThread parameter):
+        //   callback_rsp = initial_rsp - (1 arg + 1 ret) * ptr
+        //   [callback_rsp]     = 0       (return address)
+        //   [callback_rsp + 4] = param   (lpParameter)
+        // Give the thread a conventional EBP frame pointing at that synthetic
+        // frame (saved EBP at [ebp], return address at [ebp+4], thread
+        // parameter at [ebp+8]). Thread starts that are mid-function labels
+        // (e.g. Steam's bootstrapper at 0x4dcee0, inside `pushl 0x54(%eax)`)
+        // address locals via [ebp±x] before ever running a prologue; with
+        // EBP left at 0 every [ebp-x] access fetches from low unmapped
+        // memory. A frame pointer into the thread's own fresh stack keeps
+        // those accesses within the mapped stack area.
+        let thread_callback_args: u64 = 1;
+        let callback_rsp = initial_rsp.wrapping_sub(
+            (thread_callback_args + 1) * self.guest_arch.pointer_bytes() as u64,
+        );
+        let thread_frame_ebp = callback_rsp.wrapping_sub(self.guest_arch.pointer_bytes() as u64);
+        thread_state.set(Register::Rbp, thread_frame_ebp);
 
         Ok(PendingGuestThread {
             handle: thread_handle,
@@ -63672,7 +63687,6 @@ impl HostThunk {
             | Self::GetCurrentProcess
             | Self::GetProcessHeap
             | Self::GetTickCount
-            | Self::WsprintfW
             | Self::OleUninitialize
             | Self::GetCommandLineA
             | Self::GetCommandLineW
@@ -63680,39 +63694,42 @@ impl HostThunk {
             | Self::IsUserAnAdmin
             | Self::GetACP
             | Self::GetOEMCP
-            | Self::PArgc
-            | Self::PArgv
-            | Self::Cexit
-            | Self::InitializeNarrowEnvironment
-            | Self::Abort
-            | Self::PCommode
-            | Self::PFmode
-            | Self::PEnviron
-            | Self::Calloc
-            | Self::Free
-            | Self::Malloc
-            | Self::Realloc
-            | Self::SetNewMode
-            | Self::ConfigureNarrowArgv
-            | Self::CrtAtExit
-            | Self::Initterm
-            | Self::InittermE
-            | Self::SetAppType
-            | Self::SetInvalidParameterHandler
-            | Self::Signal
-            | Self::AcrtIobFunc
-            | Self::Fwrite
-            | Self::Strlen
-            | Self::Strncmp
             | Self::GetMessagePos
             | Self::CreatePopupMenu
             | Self::SetUserMathErr
             | Self::AreFileApisANSI
             | Self::TlsAlloc
             | Self::WsaCleanup
-            | Self::WsaGetLastError => 0,
-            Self::SetEnvironmentVariableW | Self::Freeaddrinfo => 4,
-            Self::GetEnvironmentVariableW => 12,
+            | Self::WsaGetLastError
+            | Self::IsDebuggerPresent
+            | Self::InitCommonControls
+            | Self::ImageList_EndDrag
+            | Self::ImageList_GetDragImage
+            | Self::CoUninitialize
+            | Self::SetProcessDPIAware
+            | Self::GetThreadDpiAwarenessContext
+            | Self::SwitchToThread
+            | Self::DebugBreak
+            | Self::GetConsoleCP
+            | Self::ConvertFiberToThread
+            | Self::GetDesktopWindow
+            | Self::EmptyClipboard
+            | Self::GetProcessWindowStation
+            | Self::SteamVR_Shutdown
+            | Self::SteamVR_IsHmdPresent
+            | Self::SteamVR_IsRuntimeInstalled
+            | Self::SteamVR_RuntimePath
+            | Self::SteamAPI_Init
+            | Self::SteamAPI_Shutdown
+            | Self::SteamAPI_RunCallbacks
+            | Self::SteamAPI_GetSteamInstallPath
+            | Self::WaveOutGetNumDevs
+            | Self::WaveInGetNumDevs
+            | Self::MidiOutGetNumDevs
+            | Self::TimeGetTime
+            | Self::DwmFlush
+            | Self::CreateMenu
+            | Self::DelayLoadResolve { .. } => 0,
             Self::QueryPerformanceCounter
             | Self::QueryPerformanceFrequency
             | Self::IsProcessorFeaturePresent
@@ -63732,79 +63749,35 @@ impl HostThunk {
             | Self::Ntohl
             | Self::Ntohs
             | Self::GetStockObject
-            | Self::CreateSolidBrush => 4,
-            Self::GetCPInfo
-            | Self::SystemFunction036
-            | Self::LocaleNameToLCID
-            | Self::SetFileCompletionNotificationModes
-            | Self::WsaStartup
-            | Self::Shutdown
-            | Self::WsaFdIsSet
-            | Self::Setlocale
-            | Self::InternetGetConnectedState => 8,
-            Self::SetHandleInformation
-            | Self::Ioctlsocket
-            | Self::Socket
-            | Self::GetModuleHandleExA
-            | Self::GetModuleHandleExW => 12,
-            Self::Bind | Self::Connect | Self::Getsockname => 12,
-            Self::DuplicateHandle => 28,
-            Self::DisconnectEx => 16,
-            Self::GetStringTypeW => 16,
-            Self::LCMapStringW | Self::Send | Self::Recv => 16,
-            Self::WsaSocketA => 24,
-            Self::Setsockopt => 20,
-            Self::Getaddrinfo => 16,
-            Self::WsaRecv | Self::WsaSend => 28,
-            Self::WsaRecvFrom | Self::WsaSendTo => 36,
-            Self::LCMapStringEx => 36,
-            Self::CreateIoCompletionPort | Self::PostQueuedCompletionStatus => 16,
-            Self::GetQueuedCompletionStatus => 20,
-            Self::GetQueuedCompletionStatusEx => 24,
-            Self::CreateEventA | Self::CreateEventW => 16,
-            Self::OpenEventA | Self::OpenEventW => 12,
-            Self::IsDebuggerPresent => 0,
-            Self::Select => 20,
-            Self::InitOnceBeginInitialize => 16,
-            Self::InitOnceComplete => 12,
-            Self::InitOnceExecuteOnce => 16,
-            Self::InitializeSRWLock
+            | Self::CreateSolidBrush
+            | Self::InitializeSRWLock
             | Self::AcquireSRWLockExclusive
             | Self::ReleaseSRWLockExclusive
             | Self::AcquireSRWLockShared
             | Self::ReleaseSRWLockShared
             | Self::TryAcquireSRWLockExclusive
-            | Self::TryAcquireSRWLockShared => 4,
-            Self::SetEvent | Self::ResetEvent | Self::FlsAlloc => 4,
-            Self::GetProcessHeaps => 8,
-            Self::HeapAlloc | Self::HeapFree | Self::HeapSize => 12,
-            Self::HeapReAlloc => 16,
-            Self::GetCurrentPackageId => 8,
-            Self::InitializeCriticalSectionAndSpinCount => 8,
-            Self::InitializeCriticalSectionEx
-            | Self::SleepConditionVariableCS
-            | Self::GetFileAttributesExW => 12,
-            Self::GetSystemTimeAsFileTime
+            | Self::TryAcquireSRWLockShared
+            | Self::SetEvent
+            | Self::ResetEvent
+            | Self::FlsAlloc
+            | Self::GetSystemTimeAsFileTime
             | Self::GetSystemTimePreciseAsFileTime
-            | Self::GetTimeZoneInformation => 4,
-            Self::SetFileAttributesW | Self::FindFirstFileW | Self::FindNextFileW => 8,
-            Self::FindClose => 4,
-            Self::ShellLinkAddRef | Self::ShellLinkRelease | Self::ShellLinkPersistIsDirty => 4,
-            Self::SetCurrentDirectoryW => 4,
-            Self::GetCurrentDirectoryW => 8,
-            Self::GetFullPathNameW => 16,
-            Self::GetFileAttributesW
+            | Self::GetTimeZoneInformation
+            | Self::FindClose
+            | Self::ShellLinkAddRef
+            | Self::ShellLinkRelease
+            | Self::ShellLinkPersistIsDirty
+            | Self::SetCurrentDirectoryW
+            | Self::GetFileAttributesW
             | Self::SetErrorMode
             | Self::SetDefaultDllDirectories
             | Self::FreeLibrary
             | Self::RegisterClassW
             | Self::RegisterClassExW
             | Self::IsWindowEnabled
-            | Self::GetWindowLongW
             | Self::GetModuleHandleA
             | Self::GetModuleHandleW
             | Self::CloseHandle
-            | Self::CrtExit
             | Self::DeleteCriticalSection
             | Self::EnterCriticalSection
             | Self::TryEnterCriticalSection
@@ -63813,7 +63786,6 @@ impl HostThunk {
             | Self::WakeAllConditionVariable
             | Self::UnhandledExceptionFilter
             | Self::SetUnhandledExceptionFilter
-            | Self::AddVectoredExceptionHandler
             | Self::RemoveVectoredExceptionHandler
             | Self::Sleep
             | Self::ExitProcess
@@ -63836,38 +63808,234 @@ impl HostThunk {
             | Self::OutputDebugStringA
             | Self::OutputDebugStringW
             | Self::LoadLibraryA
-            | Self::LoadLibraryW => 4,
-            // --- I4: Common Controls (ImageList) argument sizes ---
-            Self::InitCommonControls | Self::ImageList_EndDrag | Self::ImageList_GetDragImage => 0,
-            Self::InitCommonControlsEx
+            | Self::LoadLibraryW
+            | Self::InitCommonControlsEx
             | Self::ImageList_Destroy
             | Self::ImageList_GetImageCount
             | Self::ImageList_GetBkColor
-            | Self::ImageList_DragShowNolock => 4,
-            Self::ImageList_Remove
-            | Self::ImageList_SetImageCount
-            | Self::ImageList_GetImageInfo => 8,
-            Self::ImageList_Add
+            | Self::ImageList_DragShowNolock
             | Self::ImageList_DragLeave
-            | Self::ImageList_DragMove
-            | Self::ImageList_SetBkColor => 12,
-            Self::ImageList_Create => 16,
-            Self::ImageList_BeginDrag | Self::ImageList_DragEnter => 16,
-            Self::ImageList_SetDragCursorImage | Self::ImageList_ReplaceIcon => 12,
-            Self::ImageList_Draw => 20,
-            Self::ImageList_DrawEx => 36,
-            Self::MonitorFromWindow | Self::GetMonitorInfoW | Self::MonitorFromRect => 8,
-            Self::EnumDisplayMonitors | Self::EnumDisplayDevicesW => 16,
-            Self::ProcessIdToSessionId => 8,
-            Self::EnumProcesses => 12,
-            Self::TlsGetValue
+            | Self::TlsGetValue
             | Self::TlsFree
             | Self::FlsGetValue
             | Self::FlsFree
-            | Self::RtlNtStatusToDosError => 4,
-            Self::TlsSetValue | Self::FlsSetValue => 8,
-            Self::MessageBoxIndirectW => 4,
-            Self::CSpecificHandler
+            | Self::RtlNtStatusToDosError
+            | Self::MessageBoxIndirectW
+            | Self::GetTextColor
+            | Self::GetBkColor
+            | Self::GetBkMode
+            | Self::DestroyWindow
+            | Self::TranslateMessage
+            | Self::DispatchMessageW
+            | Self::LocalLock
+            | Self::LocalUnlock
+            | Self::LocalFree
+            | Self::GlobalLock
+            | Self::GlobalUnlock
+            | Self::GlobalFree
+            | Self::RegCloseKey
+            | Self::FlushFileBuffers
+            | Self::DisconnectNamedPipe
+            | Self::UnmapViewOfFile
+            | Self::GetNativeSystemInfo
+            | Self::GetSystemInfo
+            | Self::GetVersionExW
+            | Self::ShellExecuteExW
+            | Self::GetDpiForWindow
+            | Self::SetProcessDPIAwareness
+            | Self::SetThreadDpiAwarenessContext
+            | Self::EnableNonClientDpiScaling
+            | Self::BringWindowToTop
+            | Self::GetTopWindow
+            | Self::GetWindowTextLengthW
+            | Self::GetParent
+            | Self::SetEndOfFile
+            | Self::RemoveDirectoryA
+            | Self::GetFileAttributesA
+            | Self::GetDriveTypeW
+            | Self::GlobalMemoryStatusEx
+            | Self::SuspendThread
+            | Self::ResumeThread
+            | Self::LockResource
+            | Self::GetSystemTime
+            | Self::ConvertThreadToFiber
+            | Self::DeleteFiber
+            | Self::SwitchToFiber
+            | Self::CreateActCtxW
+            | Self::ReleaseActCtx
+            | Self::UpdateWindow
+            | Self::OpenClipboard
+            | Self::CloseClipboard
+            | Self::GetClipboardData
+            | Self::IsClipboardFormatAvailable
+            | Self::EnumClipboardFormats
+            | Self::GetWindowTextLengthA
+            | Self::AllowSetForegroundWindow
+            | Self::RemoveFontMemResourceEx
+            | Self::DeleteDC
+            | Self::CreateCompatibleDC
+            | Self::SwapBuffers
+            | Self::DeregisterEventSource
+            | Self::BCryptDestroyHash
+            | Self::BCryptDestroyKey
+            | Self::CertFreeCertificateContext
+            | Self::CertFreeCertificateChain
+            | Self::CertDuplicateCertificateContext
+            | Self::CertDeleteCertificateFromStore
+            | Self::PFXIsPFXBlob
+            | Self::IsProtectedProcess
+            | Self::IsProtectedProcessLight
+            | Self::XAudio2SourceVoiceDiscontinuity
+            | Self::XAudio2SourceVoiceExitLoop
+            | Self::XAudio2CommitChanges
+            | Self::XAudio2RegisterForCallbacks
+            | Self::XAudio2UnregisterForCallbacks
+            | Self::XAudio2GetPerformanceData
+            | Self::XAudio2SetDebugConfiguration
+            | Self::XAPO_UnlockForProcess
+            | Self::DirectInputDevice8Acquire
+            | Self::DirectInputDevice8Unacquire
+            | Self::DirectInputDevice8Poll
+            | Self::DirectInputDevice8UnacquireObj
+            | Self::UnregisterTouchWindow
+            | Self::CloseTouchInputHandle
+            | Self::InitializePointerDevice
+            | Self::SkipPointerFrame
+            | Self::XInputEnable
+            | Self::SteamAPI_ISteamInput_Init
+            | Self::SteamAPI_ISteamInput_Shutdown
+            | Self::SteamVR_GetStringForHmdError
+            | Self::SteamVR_IVRCompositor_GetFrameTimeRemaining
+            | Self::SteamVR_IVRCompositor_CanRenderScene
+            | Self::SteamVR_IVRChaperone_GetCalibrationState
+            | Self::SteamAPI_ISteamNetworkingSockets_CreateListenSocket
+            | Self::SteamAPI_RestartAppIfNecessary
+            | Self::SteamAPI_UnregisterCallback
+            | Self::SteamAPI_SetMiniDumpComment
+            | Self::SteamInternal_CreateInterface
+            | Self::SteamInternal_ContextInit
+            | Self::SteamAPI_ISteamUserStats_RequestCurrentStats
+            | Self::SteamAPI_ISteamUserStats_GetNumAchievements
+            | Self::SteamAPI_ISteamFriends_GetPersonaName
+            | Self::SteamAPI_ISteamFriends_GetPersonaState
+            | Self::SteamAPI_ISteamFriends_GetInviteCount
+            | Self::SteamAPI_ISteamFriends_GetClanCount
+            | Self::SteamAPI_ISteamFriends_ClearRichPresence
+            | Self::SteamAPI_ISteamFriends_ActivateGameOverlayToFriends
+            | Self::SteamAPI_ISteamMatchmaking_RequestLobbyList
+            | Self::SteamAPI_ISteamMatchmaking_GetLobbyCount
+            | Self::SteamAPI_ISteamRemoteStorage_GetFileCount
+            | Self::SteamAPI_ISteamRemoteStorage_GetQuotaUsed
+            | Self::SteamAPI_ISteamRemoteStorage_GetQuotaTotal
+            | Self::SteamAPI_ISteamRemoteStorage_IsCloudEnabledForAccount
+            | Self::SteamAPI_ISteamRemoteStorage_IsCloudEnabledForApp
+            | Self::SteamAPI_ISteamScreenshots_TriggerScreenshot
+            | Self::SteamAPI_ISteamScreenshots_IsScreenshotsHooked
+            | Self::SteamAPI_ISteamScreenshots_GetScreenshotCount
+            | Self::SteamAPI_ISteamMusic_IsEnabled
+            | Self::SteamAPI_ISteamMusic_IsPlaying
+            | Self::SteamAPI_ISteamMusic_Play
+            | Self::SteamAPI_ISteamMusic_Pause
+            | Self::SteamAPI_ISteamMusic_PlayNext
+            | Self::SteamAPI_ISteamMusic_PlayPrevious
+            | Self::SteamAPI_ISteamMusic_GetVolume
+            | Self::SteamVR_IVRRenderModels_GetRenderModelCount
+            | Self::ReleaseMutex
+            | Self::PulseEvent
+            | Self::InitializeConditionVariable
+            | Self::WakeConditionVariable
+            | Self::GetThreadPriority
+            | Self::SubmitThreadpoolWork
+            | Self::CloseThreadpoolWork
+            | Self::CloseThreadpoolTimer
+            | Self::CloseThreadpoolWait
+            | Self::CoRevokeClassObject
+            | Self::CoCreateGuid
+            | Self::SysAllocString
+            | Self::SysFreeString
+            | Self::SysStringLen
+            | Self::VariantInit
+            | Self::SafeArrayDestroy
+            | Self::SafeArrayUnaccessData
+            | Self::ScriptStringFree
+            | Self::ScriptString_pSize
+            | Self::ScriptFreeCache
+            | Self::GdiplusShutdown
+            | Self::GdipDeleteGraphics
+            | Self::GdipDeleteBrush
+            | Self::GdipDeletePen
+            | Self::GdipDeletePath
+            | Self::GdipClosePathFigure
+            | Self::GdipStartPathFigure
+            | Self::GdipCreateMatrix
+            | Self::GdipDeleteMatrix
+            | Self::GdipInvertMatrix
+            | Self::GdipResetWorldTransform
+            | Self::GdipResetClip
+            | Self::GdipDisposeImage
+            | Self::GdipDeleteFont
+            | Self::GdipDeleteFontFamily
+            | Self::GdipCreateImageAttributes
+            | Self::GdipDisposeImageAttributes
+            | Self::GdipImageForceValidation
+            | Self::WaveOutClose
+            | Self::WaveOutReset
+            | Self::WaveInClose
+            | Self::WaveInStart
+            | Self::WaveInStop
+            | Self::MidiOutClose
+            | Self::MidiOutReset
+            | Self::MidiInClose
+            | Self::MidiInStart
+            | Self::MidiInStop
+            | Self::MidiInReset
+            | Self::TimeBeginPeriod
+            | Self::TimeEndPeriod
+            | Self::DwmIsCompositionEnabled
+            | Self::DwmEnableComposition
+            | Self::DwmUnregisterThumbnail
+            | Self::WinHttpGetIEProxyConfigForCurrentUser
+            | Self::DestroyMenu
+            | Self::GetMenu
+            | Self::GetMenuItemCount
+            | Self::DrawMenuBar
+            | Self::LoadMenuIndirectW
+            | Self::SHGetDesktopFolder
+            | Self::SHBrowseForFolderW
+            | Self::ILCreateFromPathW
+            | Self::ILFree
+            | Self::SHSimpleIDListFromPath
+            | Self::Freeaddrinfo
+            | Self::DragFinish => 4,
+            Self::SetEnvironmentVariableW
+            | Self::GetCPInfo
+            | Self::SystemFunction036
+            | Self::LocaleNameToLCID
+            | Self::SetFileCompletionNotificationModes
+            | Self::WsaStartup
+            | Self::Shutdown
+            | Self::WsaFdIsSet
+            | Self::InternetGetConnectedState
+            | Self::GetProcessHeaps
+            | Self::GetCurrentPackageId
+            | Self::InitializeCriticalSectionAndSpinCount
+            | Self::SetFileAttributesW
+            | Self::FindFirstFileW
+            | Self::FindNextFileW
+            | Self::GetCurrentDirectoryW
+            | Self::GetWindowLongW
+            | Self::AddVectoredExceptionHandler
+            | Self::ImageList_Remove
+            | Self::ImageList_SetImageCount
+            | Self::ImageList_DragMove
+            | Self::ImageList_SetBkColor
+            | Self::MonitorFromWindow
+            | Self::GetMonitorInfoW
+            | Self::MonitorFromRect
+            | Self::ProcessIdToSessionId
+            | Self::TlsSetValue
+            | Self::FlsSetValue
+            | Self::CSpecificHandler
             | Self::Beep
             | Self::GetProcAddress
             | Self::GetFileSize
@@ -63900,20 +64068,292 @@ impl HostThunk {
             | Self::CopyRect
             | Self::CreateDirectoryW
             | Self::WaitForSingleObject
-            | Self::WaitForMultipleObjects
             | Self::ExitWindowsEx
             | Self::GetExitCodeThread
             | Self::GetExitCodeProcess
             | Self::TerminateProcess
-            | Self::OpenProcess => 8,
-            Self::EnumProcessModules | Self::GetModuleBaseNameA => 16,
-            Self::GetSystemDirectoryW
+            | Self::GetSystemDirectoryW
             | Self::GetWindowsDirectoryW
             | Self::GetTempPathW
-            | Self::GetTempPath2W => 8,
-            Self::GetModuleFileNameA | Self::GetModuleFileNameW => 12,
-            Self::GetTempFileNameW => 16,
-            Self::LoadLibraryExA
+            | Self::GetTempPath2W
+            | Self::ShowWindow
+            | Self::GetDlgItem
+            | Self::BeginPaint
+            | Self::EndPaint
+            | Self::SetWindowTextW
+            | Self::InitializeSecurityDescriptor
+            | Self::ShellLinkGetIDList
+            | Self::ShellLinkSetIDList
+            | Self::ShellLinkPersistGetClassID
+            | Self::ShellLinkPersistGetCurFile
+            | Self::ShellLinkGetHotkey
+            | Self::ShellLinkSetHotkey
+            | Self::ShellLinkGetShowCmd
+            | Self::ShellLinkSetShowCmd
+            | Self::ShellLinkSetDescriptionW
+            | Self::ShellLinkSetWorkingDirectoryW
+            | Self::ShellLinkSetArgumentsW
+            | Self::ShellLinkPersistSaveCompleted
+            | Self::ShellLinkSetPathW
+            | Self::CommandLineToArgvW
+            | Self::SHGetPathFromIDListW
+            | Self::RegDeleteKeyW
+            | Self::RegDeleteValueW
+            | Self::GetUserNameW
+            | Self::GetComputerNameW
+            | Self::GetFileVersionInfoSizeW
+            | Self::ConnectNamedPipe
+            | Self::WaitNamedPipeW
+            | Self::CoInitializeEx
+            | Self::IsWow64Process
+            | Self::SetWindowCompositionAttribute
+            | Self::GetWindowPlacement
+            | Self::SetWindowPlacement
+            | Self::ShellNotifyIconW
+            | Self::GetNextWindow
+            | Self::GetWindow
+            | Self::GetUpdateRect
+            | Self::ValidateRect
+            | Self::GetWindowLongPtrW
+            | Self::SetParent
+            | Self::GetFileSizeEx
+            | Self::SleepEx
+            | Self::GetCurrentDirectoryA
+            | Self::HeapWalk
+            | Self::IsBadWritePtr
+            | Self::SetThreadPriority
+            | Self::TerminateThread
+            | Self::SetThreadAffinityMask
+            | Self::RtlRestoreContext
+            | Self::GetConsoleMode
+            | Self::SetConsoleMode
+            | Self::SetStdHandle
+            | Self::SetProcessAffinityMask
+            | Self::InterlockedPushEntrySList
+            | Self::SizeofResource
+            | Self::LoadResource
+            | Self::SystemTimeToFileTime
+            | Self::FileTimeToSystemTime
+            | Self::SetConsoleCtrlHandler
+            | Self::ActivateActCtx
+            | Self::DeactivateActCtx
+            | Self::GetWindowThreadProcessId
+            | Self::KillTimer
+            | Self::UnregisterClassW
+            | Self::IsDialogMessageW
+            | Self::SetClipboardData
+            | Self::EnumWindows
+            | Self::GetScrollPos
+            | Self::ChoosePixelFormat
+            | Self::RegisterEventSourceW
+            | Self::BCryptCloseAlgorithmProvider
+            | Self::BCryptFinalizeKeyPair
+            | Self::CertCloseStore
+            | Self::CertOpenSystemStoreW
+            | Self::CertEnumCertificatesInStore
+            | Self::RtlIsProtectedProcess
+            | Self::RtlIsProtectedProcessLight
+            | Self::CredIsProtected
+            | Self::XAudio2VoiceGetVoiceDetails
+            | Self::XAudio2VoiceSetOutputVoices
+            | Self::XAudio2VoiceSetEffectChain
+            | Self::XAudio2VoiceEnableEffect
+            | Self::XAudio2VoiceDisableEffect
+            | Self::XAudio2VoiceSetFilterParameters
+            | Self::XAudio2VoiceGetFilterParameters
+            | Self::XAudio2VoiceSetOutputFilterParameters
+            | Self::XAudio2VoiceGetOutputFilterParameters
+            | Self::XAudio2VoiceSetVolume
+            | Self::XAudio2VoiceGetVolume
+            | Self::XAudio2SourceVoiceGetState
+            | Self::XAudio2SourceVoiceSetFrequencyRatio
+            | Self::XAudio2SourceVoiceGetFrequencyRatio
+            | Self::XAudio2SourceVoiceSetSourceSampleRate
+            | Self::XAPO_GetRegistrationProperties
+            | Self::XAPO_LockForProcess
+            | Self::DirectInputDevice8SetDataFormat
+            | Self::DirectInputDevice8GetCapabilities
+            | Self::DirectInputDevice8SendForceFeedbackCommand
+            | Self::DirectInputDevice8SetForceFeedbackState
+            | Self::RegisterTouchWindow
+            | Self::GetPointerInfo
+            | Self::GetPointerPenInfo
+            | Self::GetPointerDeviceCaps
+            | Self::GetPointerFrameInfo
+            | Self::XInputGetState
+            | Self::XInputSetState
+            | Self::SteamAPI_ISteamInput_RunFrame
+            | Self::SteamAPI_ISteamInput_GetActionSetHandle
+            | Self::SteamAPI_ISteamInput_GetDigitalActionHandle
+            | Self::SteamAPI_ISteamInput_GetAnalogActionHandle
+            | Self::SteamAPI_ISteamInput_GetCurrentActionSet
+            | Self::SteamAPI_ISteamInput_GetControllerInputType
+            | Self::SteamAPI_ISteamInput_GetMotionData
+            | Self::SteamAPI_ISteamInput_ShowBindingPanel
+            | Self::SteamAPI_ISteamInput_GetGlyphForActionHandle
+            | Self::SteamVR_Init
+            | Self::SteamVR_GetGenericInterface
+            | Self::SteamVR_IVRSystem_GetTrackedDeviceClass
+            | Self::SteamVR_IVRSystem_IsTrackedDeviceConnected
+            | Self::SteamVR_IVRCompositor_GetCumulativeStats
+            | Self::SteamVR_IVRCompositor_SetExplicitTimingMode
+            | Self::SteamVR_IVRCompositor_SetExplicitTimingLastPose
+            | Self::SteamVR_IVRChaperone_GetPlayAreaRect
+            | Self::SteamAPI_ISteamNetworkingSockets_ConnectByIPAddress
+            | Self::SteamAPI_ISteamNetworkingSockets_ConnectBySteamID
+            | Self::SteamAPI_ISteamNetworkingSockets_AcceptConnection
+            | Self::SteamAPI_ISteamNetworkingMessages_CloseSessionWithUser
+            | Self::SteamAPI_RegisterCallback
+            | Self::SteamAPI_RegisterCallResult
+            | Self::SteamAPI_UnregisterCallResult
+            | Self::SteamInternal_FindOrCreateUserInterface
+            | Self::SteamInternal_FindOrCreateGameInterface
+            | Self::SteamAPI_ISteamUserStats_SetAchievement
+            | Self::SteamAPI_ISteamUserStats_ClearAchievement
+            | Self::SteamAPI_ISteamUserStats_GetAchievementName
+            | Self::SteamAPI_ISteamUserStats_GetLeaderboardEntryCount
+            | Self::SteamAPI_ISteamUserStats_GetLeaderboardName
+            | Self::SteamAPI_ISteamUserStats_GetLeaderboardSortMethod
+            | Self::SteamAPI_ISteamUserStats_GetLeaderboardDisplayType
+            | Self::SteamAPI_ISteamFriends_SetPersonaName
+            | Self::SteamAPI_ISteamFriends_SetPersonaState
+            | Self::SteamAPI_ISteamFriends_GetFriendCount
+            | Self::SteamAPI_ISteamFriends_GetFriendByIndex
+            | Self::SteamAPI_ISteamFriends_RemoveFriend
+            | Self::SteamAPI_ISteamFriends_AcceptInvite
+            | Self::SteamAPI_ISteamFriends_DeclineInvite
+            | Self::SteamAPI_ISteamFriends_GetInviteByIndex
+            | Self::SteamAPI_ISteamFriends_GetFriendMessageCount
+            | Self::SteamAPI_ISteamFriends_LeaveClan
+            | Self::SteamAPI_ISteamFriends_GetClanByIndex
+            | Self::SteamAPI_ISteamFriends_GetClanName
+            | Self::SteamAPI_ISteamFriends_IsClanMember
+            | Self::SteamAPI_ISteamFriends_ActivateGameOverlayToWebPage
+            | Self::SteamAPI_ISteamFriends_ActivateGameOverlay
+            | Self::SteamAPI_ISteamFriends_ActivateGameOverlayToStore
+            | Self::SteamAPI_ISteamFriends_ActivateGameOverlayToInviteDialog
+            | Self::SteamAPI_ISteamMatchmaking_JoinLobby
+            | Self::SteamAPI_ISteamMatchmaking_LeaveLobby
+            | Self::SteamAPI_ISteamMatchmaking_GetLobbyMemberCount
+            | Self::SteamAPI_ISteamMatchmaking_GetLobbyOwner
+            | Self::SteamAPI_ISteamMatchmaking_GetLobbyByIndex
+            | Self::SteamAPI_ISteamRemoteStorage_FileDelete
+            | Self::SteamAPI_ISteamRemoteStorage_FileExists
+            | Self::SteamAPI_ISteamRemoteStorage_FileSize
+            | Self::SteamAPI_ISteamRemoteStorage_FileTime
+            | Self::SteamAPI_ISteamRemoteStorage_GetFileName
+            | Self::SteamAPI_ISteamRemoteStorage_GetFileSize
+            | Self::SteamAPI_ISteamRemoteStorage_UGCSubscribe
+            | Self::SteamAPI_ISteamRemoteStorage_UGCUnsubscribe
+            | Self::SteamAPI_ISteamScreenshots_HookScreenshots
+            | Self::SteamAPI_ISteamScreenshots_GetScreenshotByIndex
+            | Self::SteamAPI_ISteamScreenshots_GetScreenshotFilePath
+            | Self::SteamAPI_ISteamScreenshots_GetScreenshotThumbnailPath
+            | Self::SteamAPI_ISteamMusic_SetEnabled
+            | Self::SteamAPI_ISteamMusic_SetVolume
+            | Self::SteamVR_IVRRenderModels_FreeRenderModel
+            | Self::SteamVR_IVRRenderModels_GetRenderModelName
+            | Self::SteamVR_IVRRenderModels_GetRenderModelNameByIndex
+            | Self::SteamVR_IVRRenderModels_GetRenderModelThumbnail
+            | Self::WaitForThreadpoolWorkCallbacks
+            | Self::SysReAllocString
+            | Self::SysAllocStringLen
+            | Self::VariantCopy
+            | Self::SafeArrayAccessData
+            | Self::SafeArrayCreateVector
+            | Self::ScriptGetProperties
+            | Self::ScriptRecordDigitSubstitution
+            | Self::GdipCreateFromHDC
+            | Self::GdipCreateSolidFill
+            | Self::GdipSetPenWidth
+            | Self::GdipGetPenWidth
+            | Self::GdipSetPenColor
+            | Self::GdipGetPenColor
+            | Self::GdipSetPenDashStyle
+            | Self::GdipGetPenDashStyle
+            | Self::GdipSetPenLineJoin
+            | Self::GdipSetPenStartCap
+            | Self::GdipSetPenEndCap
+            | Self::GdipCreatePath
+            | Self::GdipSetPathFillMode
+            | Self::GdipGetMatrixElements
+            | Self::GdipSetWorldTransform
+            | Self::GdipGetWorldTransform
+            | Self::GdipGetClipBounds
+            | Self::GdipGetClip
+            | Self::GdipSaveGraphics
+            | Self::GdipRestoreGraphics
+            | Self::GdipEndContainer
+            | Self::GdipCreateBitmapFromFile
+            | Self::GdipGetImageWidth
+            | Self::GdipGetImageHeight
+            | Self::GdipGetImagePixelFormat
+            | Self::GdipBitmapUnlockBits
+            | Self::GdipSetTextRenderingHint
+            | Self::GdipSetSmoothingMode
+            | Self::GdipGetSmoothingMode
+            | Self::GdipSetCompositingMode
+            | Self::GdipGetCompositingMode
+            | Self::GdipSetCompositingQuality
+            | Self::GdipGetCompositingQuality
+            | Self::GdipSetInterpolationMode
+            | Self::GdipGetInterpolationMode
+            | Self::GdipSetPixelOffsetMode
+            | Self::GdipGetPixelOffsetMode
+            | Self::GdipGetImageType
+            | Self::GdipGetImageRawFormat
+            | Self::GdipCloneImage
+            | Self::GdipCreateBitmapFromStream
+            | Self::GdipCreateHICONFromBitmap
+            | Self::GdipCreateImageFromFile
+            | Self::WaveOutGetVolume
+            | Self::WaveOutSetVolume
+            | Self::MidiOutShortMsg
+            | Self::MmioClose
+            | Self::MmioAscend
+            | Self::MmioStringToFOURCCW
+            | Self::DwmEnableBlurBehindWindow
+            | Self::DwmExtendFrameIntoClientArea
+            | Self::DwmGetColorizationColor
+            | Self::DwmUpdateThumbnailProperties
+            | Self::DwmSetIconicThumbnail
+            | Self::FtpDeleteFileW
+            | Self::FtpSetCurrentDirectoryW
+            | Self::FtpCreateDirectoryW
+            | Self::FtpRemoveDirectoryW
+            | Self::SetMenu
+            | Self::GetSubMenu
+            | Self::GetMenuItemID
+            | Self::LoadMenuW
+            | Self::RegisterDragDrop
+            | Self::DragAcceptFiles => 8,
+            Self::GetEnvironmentVariableW
+            | Self::SetHandleInformation
+            | Self::Ioctlsocket
+            | Self::Socket
+            | Self::GetModuleHandleExA
+            | Self::GetModuleHandleExW
+            | Self::Bind
+            | Self::Connect
+            | Self::Getsockname
+            | Self::OpenEventA
+            | Self::OpenEventW
+            | Self::InitOnceComplete
+            | Self::HeapAlloc
+            | Self::HeapFree
+            | Self::HeapSize
+            | Self::InitializeCriticalSectionEx
+            | Self::SleepConditionVariableCS
+            | Self::GetFileAttributesExW
+            | Self::ImageList_GetImageInfo
+            | Self::ImageList_Add
+            | Self::ImageList_DragEnter
+            | Self::ImageList_ReplaceIcon
+            | Self::EnumProcesses
+            | Self::OpenProcess
+            | Self::GetModuleFileNameA
+            | Self::GetModuleFileNameW
+            | Self::LoadLibraryExA
             | Self::LoadLibraryExW
             | Self::GetClassInfoW
             | Self::GetClassInfoExW
@@ -63927,93 +64367,15 @@ impl HostThunk {
             | Self::CreatePen
             | Self::InflateRect
             | Self::OffsetRect
-            | Self::GetTextColor
-            | Self::GetBkColor
-            | Self::GetBkMode
             | Self::LineTo
             | Self::CheckDlgButton
             | Self::MulDiv
             | Self::VirtualQuery
             | Self::VirtualFree
-            | Self::FindWindowExW
-            | Self::AppendMenuW
             | Self::AnimateWindow
-            | Self::SystemParametersInfoW
-            | Self::LstrcpynW => 12,
-            Self::WriteProcessMemory => 20,
-            Self::MessageBoxW
-            | Self::VirtualAlloc
-            | Self::VirtualProtect
-            | Self::GetDlgItemTextW
-            | Self::WritePrivateProfileStringW
-            | Self::GetTextExtentPoint32A
-            | Self::GetTextExtentPoint32W
-            | Self::CreateRectRgn
-            | Self::Rectangle
-            | Self::MoveToEx
-            | Self::DrawAnimatedRects => 16,
-            Self::VerSetConditionMask => 16,
-            Self::VerifyVersionInfoW => 16,
-            Self::CreateFontW => 56,
-            Self::CreateWindowExW => 48,
-            Self::CreateProcessW | Self::CreateProcessA => 40,
-            Self::CreateThread | Self::PatBlt => 24,
-            Self::DrawTextW | Self::DrawTextA | Self::SetRect => 20,
-            Self::CallWindowProcW => 20,
-            Self::DialogBoxParamW => 20,
-            Self::CreateDialogParamW => 20,
-            Self::GetDiskFreeSpaceW => 20,
-            Self::GetDiskFreeSpaceExW => 16,
-            Self::SetFileTime => 16,
-            Self::ShowWindow => 8,
-            Self::GetDlgItem => 8,
-            Self::BeginPaint | Self::EndPaint => 8,
-            Self::RedrawWindow => 16,
-            Self::DestroyWindow => 4,
-            Self::SetWindowTextW => 8,
-            Self::LoadImageW | Self::CreateRoundRectRgn => 24,
-            Self::GetMessageW => 16,
-            Self::TranslateMessage => 4,
-            Self::DispatchMessageW => 4,
-            Self::SendMessageW => 16,
-            Self::PostThreadMessageW => 16,
-            Self::SetTimer => 16,
-            Self::LocalLock
-            | Self::LocalUnlock
-            | Self::LocalFree
-            | Self::GlobalLock
-            | Self::GlobalUnlock
-            | Self::GlobalFree => 4,
-            Self::PeekMessageW => 20,
-            Self::RegCreateKeyExA | Self::RegCreateKeyExW => 36,
-            Self::RegOpenKeyA => 12,
-            Self::RegOpenKeyExA | Self::RegOpenKeyExW => 20,
-            Self::RegSetValueExA | Self::RegSetValueExW => 24,
-            Self::RegQueryValueExA | Self::RegQueryValueExW => 24,
-            Self::RegCloseKey => 4,
-            Self::InitializeSecurityDescriptor => 8,
-            Self::SetSecurityDescriptorDacl => 16,
-            Self::SetFilePointer => 16,
-            Self::FlushFileBuffers => 4,
-            Self::ReadFile
-            | Self::WriteFile
-            | Self::SHGetFileInfoW
-            | Self::SHGetFolderPathW
-            | Self::CoCreateInstance
-            | Self::ShellLinkGetPathW => 20,
-            Self::ShellLinkGetIDList
-            | Self::ShellLinkSetIDList
-            | Self::ShellLinkPersistGetClassID
-            | Self::ShellLinkPersistGetCurFile
-            | Self::ShellLinkGetHotkey
-            | Self::ShellLinkSetHotkey
-            | Self::ShellLinkGetShowCmd
-            | Self::ShellLinkSetShowCmd
-            | Self::ShellLinkSetDescriptionW
-            | Self::ShellLinkSetWorkingDirectoryW
-            | Self::ShellLinkSetArgumentsW
-            | Self::ShellLinkPersistSaveCompleted => 8,
-            Self::ShellLinkQueryInterface
+            | Self::LstrcpynW
+            | Self::RegOpenKeyA
+            | Self::ShellLinkQueryInterface
             | Self::ShellLinkGetDescriptionW
             | Self::ShellLinkGetWorkingDirectoryW
             | Self::ShellLinkGetArgumentsW
@@ -64021,838 +64383,468 @@ impl HostThunk {
             | Self::ShellLinkSetRelativePath
             | Self::ShellLinkResolve
             | Self::ShellLinkPersistLoad
-            | Self::ShellLinkPersistSave => 12,
-            Self::ShellLinkGetIconLocationW => 16,
-            Self::ShellLinkSetPathW => 8,
-            Self::CommandLineToArgvW | Self::SHGetPathFromIDListW => 8,
-            Self::CreateFileW
+            | Self::ShellLinkPersistSave
+            | Self::SHGetSpecialFolderLocation
+            | Self::GetLongPathNameW
+            | Self::GetShortPathNameW
+            | Self::SetWindowRgn
+            | Self::PrintWindow
+            | Self::GetWindowTextW
+            | Self::InvalidateRgn
+            | Self::SetWindowLongPtrW
+            | Self::CopyFileW
+            | Self::MoveFileExW
+            | Self::HeapValidate
+            | Self::HeapLock
+            | Self::HeapUnlock
+            | Self::OpenThread
+            | Self::GetProcessAffinityMask
+            | Self::FindResourceA
+            | Self::SystemTimeToTzSpecificLocalTime
+            | Self::WaitForSingleObjectEx
+            | Self::CreateFiber
+            | Self::SetDlgItemTextA
+            | Self::MonitorFromPoint
+            | Self::EnumChildWindows
+            | Self::GetScrollInfo
+            | Self::ShowScrollBar
+            | Self::EnableScrollBar
+            | Self::SetPixelFormat
+            | Self::GetProcessMemoryInfo
+            | Self::BCryptGenRandom
+            | Self::CertCreateCertificateContext
+            | Self::PFXImportCertStore
+            | Self::CertFindExtension
+            | Self::XAudio2VoiceGetEffectState
+            | Self::XAudio2VoiceSetChannelVolumes
+            | Self::XAudio2VoiceGetChannelVolumes
+            | Self::DirectInput8CreateDevice
+            | Self::DirectInputDevice8SetCooperativeLevel
+            | Self::DirectInputDevice8GetDeviceState
+            | Self::RegisterRawInputDevices
+            | Self::GetRegisteredRawInputDevices
+            | Self::InitializeTouchInjection
+            | Self::GetPointerDeviceRects
+            | Self::XInputGetCapabilities
+            | Self::XInputGetDSoundAudioDeviceGuids
+            | Self::XInputGetBatteryInformation
+            | Self::XInputGetKeystroke
+            | Self::SteamAPI_ISteamInput_GetConnectedControllers
+            | Self::SteamAPI_ISteamInput_ActivateActionSet
+            | Self::SteamAPI_ISteamInput_GetDigitalActionData
+            | Self::SteamAPI_ISteamInput_GetAnalogActionData
+            | Self::SteamVR_IVRSystem_GetBoolTrackedDeviceProperty
+            | Self::SteamVR_IVRSystem_GetFloatTrackedDeviceProperty
+            | Self::SteamVR_IVRSystem_GetInt32TrackedDeviceProperty
+            | Self::SteamVR_IVRSystem_GetUint64TrackedDeviceProperty
+            | Self::SteamVR_IVRSystem_GetRecommendedRenderTargetSize
+            | Self::SteamVR_IVRSystem_GetEyeToHeadTransform
+            | Self::SteamVR_IVRSystem_PollNextEvent
+            | Self::SteamVR_IVRCompositor_GetFrameTiming
+            | Self::SteamVR_IVRChaperone_GetPlayAreaSize
+            | Self::SteamAPI_ISteamNetworkingSockets_DestroyListenSocket
+            | Self::SteamAPI_ISteamNetworkingSockets_GetConnectionStatus
+            | Self::SteamAPI_WriteMiniDump
+            | Self::SteamAPI_ISteamUserStats_GetStat
+            | Self::SteamAPI_ISteamUserStats_SetStat
+            | Self::SteamAPI_ISteamUserStats_GetStatFloat
+            | Self::SteamAPI_ISteamUserStats_SetStatFloat
+            | Self::SteamAPI_ISteamUserStats_GetAchievement
+            | Self::SteamAPI_ISteamUserStats_AttachLeaderboardUGC
+            | Self::SteamAPI_ISteamFriends_GetFriendPersonaName
+            | Self::SteamAPI_ISteamFriends_GetFriendPersonaState
+            | Self::SteamAPI_ISteamFriends_SetFriendPersonaState
+            | Self::SteamAPI_ISteamFriends_AddFriend
+            | Self::SteamAPI_ISteamFriends_GetSmallFriendAvatar
+            | Self::SteamAPI_ISteamFriends_GetMediumFriendAvatar
+            | Self::SteamAPI_ISteamFriends_GetLargeFriendAvatar
+            | Self::SteamAPI_ISteamFriends_InviteFriend
+            | Self::SteamAPI_ISteamFriends_JoinClan
+            | Self::SteamAPI_ISteamFriends_SetRichPresence
+            | Self::SteamAPI_ISteamFriends_ActivateGameOverlayToUser
+            | Self::SteamAPI_ISteamMatchmaking_CreateLobby
+            | Self::SteamAPI_ISteamMatchmaking_GetLobbyMemberByIndex
+            | Self::SteamAPI_ISteamMatchmaking_SetLobbyJoinable
+            | Self::SteamAPI_ISteamMatchmaking_SendLobbyChatMessage
+            | Self::SteamAPI_ISteamRemoteStorage_UGCDownload
+            | Self::CreateMutexW
+            | Self::CreateMutexA
+            | Self::OpenMutexW
+            | Self::OpenSemaphoreW
+            | Self::ReleaseSemaphore
+            | Self::QueueUserAPC
+            | Self::QueueUserWorkItem
+            | Self::CreateThreadpoolWork
+            | Self::CreateThreadpoolTimer
+            | Self::CreateThreadpoolWait
+            | Self::SetThreadpoolWait
+            | Self::SafeArrayCreate
+            | Self::SafeArrayGetElement
+            | Self::SafeArrayPutElement
+            | Self::SafeArrayGetLBound
+            | Self::SafeArrayGetUBound
+            | Self::ScriptCacheGetHeight
+            | Self::GdiplusStartup
+            | Self::GdipCreateTextureBrush
+            | Self::GdipFillRegion
+            | Self::GdipDrawPath
+            | Self::GdipFillPath
+            | Self::GdipRotateMatrix
+            | Self::GdipMultiplyMatrix
+            | Self::GdipSetClipPath
+            | Self::GdipSetClipRegion
+            | Self::GdipCreateBitmapFromHBITMAP
+            | Self::GdipCreateFontFamilyFromName
+            | Self::GdipCreateHBITMAPFromBitmap
+            | Self::GdipGetFontHeight
+            | Self::GdipCreateBitmapFromGdiDib
+            | Self::WaveOutPrepareHeader
+            | Self::WaveOutUnprepareHeader
+            | Self::WaveOutWrite
+            | Self::WaveOutGetDevCapsW
+            | Self::WaveInPrepareHeader
+            | Self::WaveInUnprepareHeader
+            | Self::WaveInAddBuffer
+            | Self::WaveInGetDevCapsW
+            | Self::MidiOutLongMsg
+            | Self::MidiOutGetDevCapsW
+            | Self::MmioOpenW
+            | Self::MmioRead
+            | Self::MmioWrite
+            | Self::MmioDescend
+            | Self::MmioCreateChunk
+            | Self::DwmRegisterThumbnail
+            | Self::FtpRenameFileW
+            | Self::FtpGetCurrentDirectoryW
+            | Self::RemoveMenu
+            | Self::GetMenuState
+            | Self::CheckMenuItem
+            | Self::SHCreateItemFromIDList
+            | Self::CreateURLMoniker => 12,
+            Self::GetStringTypeW
+            | Self::DisconnectEx
+            | Self::Send
+            | Self::Recv
+            | Self::Getaddrinfo
+            | Self::CreateIoCompletionPort
+            | Self::PostQueuedCompletionStatus
+            | Self::CreateEventA
+            | Self::CreateEventW
+            | Self::InitOnceBeginInitialize
+            | Self::InitOnceExecuteOnce
+            | Self::HeapReAlloc
+            | Self::GetFullPathNameW
+            | Self::ImageList_BeginDrag
+            | Self::ImageList_SetDragCursorImage
+            | Self::EnumDisplayMonitors
+            | Self::EnumDisplayDevicesW
+            | Self::WaitForMultipleObjects
+            | Self::EnumProcessModules
+            | Self::GetModuleBaseNameA
+            | Self::GetTempFileNameW
+            | Self::FindWindowExW
+            | Self::AppendMenuW
+            | Self::SystemParametersInfoW
+            | Self::MessageBoxW
+            | Self::VirtualAlloc
+            | Self::VirtualProtect
+            | Self::GetDlgItemTextW
+            | Self::WritePrivateProfileStringW
+            | Self::GetTextExtentPoint32A
+            | Self::GetTextExtentPoint32W
+            | Self::CreateRectRgn
+            | Self::MoveToEx
+            | Self::DrawAnimatedRects
+            | Self::VerSetConditionMask
+            | Self::VerifyVersionInfoW
+            | Self::GetDiskFreeSpaceExW
+            | Self::SetFileTime
+            | Self::RedrawWindow
+            | Self::GetMessageW
+            | Self::SendMessageW
+            | Self::PostThreadMessageW
+            | Self::SetTimer
+            | Self::SetSecurityDescriptorDacl
+            | Self::SetFilePointer
+            | Self::ShellLinkGetIconLocationW
+            | Self::CreatePipe
+            | Self::GetFileVersionInfoW
+            | Self::VerQueryValueW
+            | Self::SHGetKnownFolderPath
+            | Self::GetNamedPipeInfo
+            | Self::SetNamedPipeHandleState
+            | Self::GetDpiForMonitor
+            | Self::SetLayeredWindowAttributes
+            | Self::GetFileTime
+            | Self::HeapSetInformation
+            | Self::HeapQueryInformation
+            | Self::RaiseException
+            | Self::RtlUnwind
+            | Self::SetDlgItemInt
+            | Self::GetDlgItemInt
+            | Self::DefDlgProcW
+            | Self::MapWindowPoints
+            | Self::MessageBoxA
+            | Self::SetScrollInfo
+            | Self::SetScrollPos
+            | Self::GetScrollRange
+            | Self::AddFontMemResourceEx
+            | Self::CreateICW
+            | Self::GetModuleFileNameExW
+            | Self::GetModuleInformation
+            | Self::BCryptOpenAlgorithmProvider
+            | Self::BCryptGenerateKeyPair
+            | Self::BCryptHashData
+            | Self::BCryptSecretAgreement
+            | Self::CertAddCertificateContextToStore
+            | Self::CertGetIntendedKeyUsage
+            | Self::XAudio2VoiceSetEffectParameters
+            | Self::XAudio2VoiceGetEffectParameters
+            | Self::XAudio2VoiceSetOutputMatrix
+            | Self::XAudio2VoiceGetOutputMatrix
+            | Self::DirectInputDevice8EnumObjects
+            | Self::DirectInputDevice8SetProperty
+            | Self::GetRawInputDeviceInfoW
+            | Self::GetTouchInputInfo
+            | Self::SteamAPI_ISteamNetworkingSockets_ReceiveMessagesOnListenSocket
+            | Self::SteamAPI_ISteamNetworkingSockets_GetConnectionName
+            | Self::SteamAPI_ISteamUserStats_FindOrCreateLeaderboard
+            | Self::SteamAPI_ISteamMatchmaking_SetLobbyData
+            | Self::SteamAPI_ISteamFriends_GetFriendGamePlayed
+            | Self::SteamAPI_ISteamMatchmaking_GetLobbyData
+            | Self::SteamAPI_ISteamRemoteStorage_FileWrite
+            | Self::SteamAPI_ISteamRemoteStorage_FileRead
+            | Self::SteamVR_IVRRenderModels_LoadRenderModel
+            | Self::CreateSemaphoreW
+            | Self::CreateSemaphoreA
+            | Self::SetThreadpoolTimer
+            | Self::VariantChangeType
+            | Self::ScriptLayout
+            | Self::ScriptBreak
+            | Self::ScriptApplyDigitSubstitution
+            | Self::GdipDrawLines
+            | Self::GdipDrawPolygon
+            | Self::GdipCreatePen1
+            | Self::GdipCreatePen2
+            | Self::GdipTranslateMatrix
+            | Self::GdipScaleMatrix
+            | Self::GdipCreateBitmapFromGraphics
+            | Self::GdipBitmapGetPixel
+            | Self::GdipBitmapSetPixel
+            | Self::GdipDrawImage
+            | Self::GdipSaveImageToFile
+            | Self::GdipSaveImageToStream
+            | Self::PlaySoundW
+            | Self::DwmGetWindowAttribute
+            | Self::DwmSetWindowAttribute
+            | Self::DwmSetIconicLivePreviewBitmap
+            | Self::WinHttpWebSocketSend
+            | Self::WinHttpWebSocketClose
+            | Self::WinHttpWebSocketQueryCloseStatus
+            | Self::WinHttpQueryOption
+            | Self::WinHttpGetProxyForUrl
+            | Self::FtpPutFileW
+            | Self::FtpOpenFileW
+            | Self::FtpFindFirstFileW
+            | Self::InsertMenuItemW
+            | Self::HiliteMenuItem
+            | Self::SHCreateItemFromParsingName
+            | Self::SHBindToParent
+            | Self::SHGetSpecialFolderPathW
+            | Self::DoDragDrop
+            | Self::DragQueryFileW
+            | Self::CreateAsyncBindCtx
+            | Self::RegisterBindStatusCallback => 16,
+            Self::Setsockopt
+            | Self::GetQueuedCompletionStatus
+            | Self::Select
+            | Self::ImageList_Create
+            | Self::WriteProcessMemory
+            | Self::Rectangle
+            | Self::DrawTextW
+            | Self::DrawTextA
+            | Self::SetRect
+            | Self::CallWindowProcW
+            | Self::DialogBoxParamW
+            | Self::CreateDialogParamW
+            | Self::GetDiskFreeSpaceW
+            | Self::PeekMessageW
+            | Self::RegOpenKeyExA
+            | Self::RegOpenKeyExW
+            | Self::ReadFile
+            | Self::WriteFile
+            | Self::SHGetFileInfoW
+            | Self::SHGetFolderPathW
+            | Self::CoCreateInstance
+            | Self::ShellLinkGetPathW
+            | Self::MapViewOfFile
+            | Self::GetProductInfo
+            | Self::AdjustWindowRectExForDpi
+            | Self::SetFilePointerEx
+            | Self::WriteConsoleW
+            | Self::ReadConsoleA
+            | Self::ReadConsoleW
+            | Self::GetDiskFreeSpaceA
+            | Self::FindActCtxSectionStringW
+            | Self::MsgWaitForMultipleObjects
+            | Self::DialogBoxParamA
+            | Self::SendDlgItemMessageW
+            | Self::GetUserObjectInformationW
+            | Self::SetScrollRange
+            | Self::ScrollWindow
+            | Self::TextOutW
+            | Self::BCryptSetProperty
+            | Self::CertOpenStore
+            | Self::CertVerifyCertificateChainPolicy
+            | Self::CredUnprotectW
+            | Self::NtQueryInformationProcess
+            | Self::XAudio2CreateSubmixVoice
+            | Self::DirectInput8Create
+            | Self::DirectInput8EnumDevices
+            | Self::DirectInputDevice8GetDeviceData
+            | Self::GetRawInputData
+            | Self::SteamVR_IVRSystem_GetProjectionMatrix
+            | Self::SteamVR_IVRSystem_GetDeviceToAbsoluteTrackingPose
+            | Self::SteamVR_IVRCompositor_Submit
+            | Self::SteamVR_IVRCompositor_WaitGetPoses
+            | Self::SteamAPI_ISteamNetworkingSockets_CreateListenSocketIP
+            | Self::SteamAPI_ISteamNetworkingSockets_CloseConnection
+            | Self::SteamAPI_ISteamNetworkingMessages_ReceiveMessagesOnChannel
+            | Self::SteamAPI_ISteamMatchmaking_SetLobbyMemberData
+            | Self::SteamAPI_ISteamFriends_SendFriendMessage
+            | Self::SteamAPI_ISteamMatchmaking_SetLobbyOwner
+            | Self::SteamAPI_ISteamScreenshots_TagUser
+            | Self::SteamAPI_ISteamScreenshots_TagPublishedFile
+            | Self::SteamAPI_ISteamScreenshots_WriteScreenshot
+            | Self::SteamAPI_ISteamScreenshots_AddScreenshotToLibrary
+            | Self::CoGetClassObject
+            | Self::CoRegisterClassObject
+            | Self::GdipFillPolygon
+            | Self::GdipDrawCurve
+            | Self::GdipDrawClosedCurve
+            | Self::GdipAddPathLine
+            | Self::GdipAddPathRectangle
+            | Self::GdipAddPathEllipse
+            | Self::GdipBeginContainer
+            | Self::GdipBitmapLockBits
+            | Self::GdipCreateFont
+            | Self::GdipSetImageAttributesColorKeys
+            | Self::MidiOutOpen
+            | Self::MidiInOpen
+            | Self::WinHttpWebSocketReceive
+            | Self::FtpGetFileW
+            | Self::InsertMenuW
+            | Self::ModifyMenuW
+            | Self::GetMenuStringW
+            | Self::SHParseDisplayName
+            | Self::SHGetDataFromIDListW => 20,
+            Self::LCMapStringW
+            | Self::WsaSocketA
+            | Self::GetQueuedCompletionStatusEx
+            | Self::ImageList_Draw
+            | Self::CreateThread
+            | Self::PatBlt
+            | Self::LoadImageW
+            | Self::CreateRoundRectRgn
+            | Self::RegSetValueExA
+            | Self::RegSetValueExW
+            | Self::RegQueryValueExA
+            | Self::RegQueryValueExW
+            | Self::MultiByteToWideChar
+            | Self::RegEnumKeyExW
+            | Self::PeekNamedPipe
+            | Self::CreateFileMappingW
+            | Self::CompareStringW
+            | Self::GetDateFormatW
+            | Self::GetTimeFormatW
+            | Self::FindFirstFileExW
+            | Self::MoveWindow
+            | Self::CreateDIBSection
+            | Self::BCryptGetProperty
+            | Self::CertFindCertificateInStore
+            | Self::CertGetNameStringW
+            | Self::CryptAcquireCertificatePrivateKey
+            | Self::CredProtectW
+            | Self::XAPO_Process
+            | Self::SteamVR_IVRSystem_GetStringTrackedDeviceProperty
+            | Self::SteamVR_IVRSystem_GetProjectionRaw
+            | Self::SteamAPI_ISteamNetworkingSockets_SendMessageToConnection
+            | Self::SteamAPI_ISteamNetworkingMessages_SendMessageToUser
+            | Self::SteamAPI_ISteamUserStats_UploadLeaderboardScore
+            | Self::SteamAPI_ISteamUserStats_DownloadLeaderboardEntries
+            | Self::CoCreateInstanceEx
+            | Self::GdipDrawLine
+            | Self::GdipDrawRectangle
+            | Self::GdipFillRectangle
+            | Self::GdipDrawEllipse
+            | Self::GdipFillEllipse
+            | Self::GdipSetClipRect
+            | Self::GdipSetImageAttributesColorMatrix
+            | Self::GdipDrawImageRect
+            | Self::GdipCreateBitmapFromScan0
+            | Self::WaveOutOpen
+            | Self::SteamAPI_ISteamFriends_GetFriendMessage
+            | Self::SteamAPI_ISteamMatchmaking_GetLobbyMemberData
+            | Self::WaveInOpen => 24,
+            Self::DuplicateHandle
+            | Self::WsaRecv
+            | Self::WsaSend
+            | Self::CreateFileW
             | Self::ConnectEx
-            | Self::StdioCommonVfprintf
             | Self::SetWindowPos
             | Self::TrackPopupMenu
             | Self::SendMessageTimeoutW
-            | Self::GetTextExtentExPointW => 28,
-            Self::WsaIoctl => 36,
-            Self::MultiByteToWideChar => 24,
-            Self::WideCharToMultiByte | Self::ExtTextOutW => 32,
-            Self::SHGetSpecialFolderLocation => 12,
-            Self::RegEnumKeyExW => 24,
-            Self::RegDeleteKeyW | Self::RegDeleteValueW => 8,
-            Self::GetUserNameW | Self::GetComputerNameW => 8,
-            Self::GetLongPathNameW | Self::GetShortPathNameW => 12,
-            Self::CreatePipe
-            | Self::GetFileVersionInfoSizeW
-            | Self::GetFileVersionInfoW
-            | Self::VerQueryValueW
-            | Self::SHGetKnownFolderPath => 16,
-            Self::CreateNamedPipeW => 32,
-            Self::ConnectNamedPipe => 8,
-            Self::DisconnectNamedPipe | Self::UnmapViewOfFile => 4,
-            Self::CallNamedPipeW => 24,
-            Self::WaitNamedPipeW => 8,
-            Self::GetNamedPipeInfo => 16,
-            Self::SetNamedPipeHandleState => 16,
-            Self::PeekNamedPipe => 24,
-            Self::CreateFileMappingW => 28,
-            Self::MapViewOfFile => 20,
-            Self::GetNativeSystemInfo | Self::GetSystemInfo | Self::GetVersionExW => 4,
-            Self::CoInitializeEx => 8,
-            Self::CoUninitialize => 0,
-            Self::ShellExecuteExW => 4,
-            Self::IsWow64Process => 8,
-            Self::GetProductInfo => 20,
-            // -- Window Manager Enhancements (Phase 2.2) ---
-            Self::SetProcessDPIAware => 0,
-            Self::GetDpiForWindow => 4,
-            Self::SetProcessDPIAwareness => 4,
-            Self::GetDpiForMonitor => 16,
-            Self::SetThreadDpiAwarenessContext => 8,
-            Self::GetThreadDpiAwarenessContext => 0,
-            Self::EnableNonClientDpiScaling => 4,
-            Self::AdjustWindowRectExForDpi => 20,
-            Self::SetWindowRgn
-            | Self::PrintWindow
-            | Self::SetWindowCompositionAttribute
-            | Self::GetWindowPlacement
-            | Self::SetWindowPlacement
-            | Self::ShellNotifyIconW => 8,
-            // -- Phase 2.3: user32.dll window management arg bytes -----------------
-            Self::BringWindowToTop => 4,
-            Self::GetTopWindow => 4,
-            Self::GetNextWindow => 8,
-            Self::GetWindow => 8,
-            Self::GetWindowTextW => 12,
-            Self::GetWindowTextLengthW => 4,
-            Self::GetUpdateRect => 8,
-            Self::ValidateRect => 8,
-            Self::InvalidateRgn => 12,
-            Self::SetWindowLongPtrW => 12,
-            Self::GetWindowLongPtrW => 8,
-            Self::GetParent => 4,
-            Self::SetParent => 8,
-            Self::SetLayeredWindowAttributes => 16,
-            Self::UpdateLayeredWindow => 36,
-            // -- Phase 1.3.3: kernel32.dll arg bytes ------------------------------------
-            Self::SetFilePointerEx => 20,
-            Self::GetFileSizeEx => 8,
-            Self::GetFileTime => 20,
-            Self::SetEndOfFile => 4,
-            Self::SleepEx => 8,
-            Self::CopyFileW => 12,
-            Self::MoveFileExW => 12,
-            Self::CreateFileA => 28,
-            Self::RemoveDirectoryA => 4,
-            Self::GetFileAttributesA => 4,
-            Self::GetCurrentDirectoryA => 8,
-            Self::GetDriveTypeW => 4,
-            Self::CompareStringW => 24,
-            Self::GlobalMemoryStatusEx => 4,
-            Self::HeapValidate | Self::HeapLock | Self::HeapUnlock => 12,
-            Self::HeapSetInformation => 16,
-            Self::HeapWalk => 8,
-            Self::HeapQueryInformation => 16,
-            Self::IsBadWritePtr => 8,
-            Self::SwitchToThread => 0,
-            Self::OpenThread => 12,
-            Self::SetThreadPriority => 8,
-            Self::TerminateThread => 8,
-            Self::SuspendThread | Self::ResumeThread => 4,
-            Self::SetThreadAffinityMask => 8,
-            Self::GetProcessAffinityMask => 12,
-            Self::DebugBreak => 0,
-            Self::RaiseException => 16,
-            Self::RtlUnwind => 16,
-            Self::RtlRestoreContext => 16,
-            Self::GetConsoleMode => 8,
-            Self::SetConsoleMode => 8,
-            Self::WriteConsoleW => 20,
-            Self::ReadConsoleA | Self::ReadConsoleW => 20,
-            Self::GetConsoleCP => 0,
-            Self::SetStdHandle => 8,
-            Self::DeviceIoControl => 32,
-            Self::SetProcessAffinityMask => 8,
-            Self::InterlockedPushEntrySList => 8,
-            Self::FindResourceA
-            | Self::SizeofResource
-            | Self::LoadResource
-            | Self::LockResource => 12,
-            Self::SystemTimeToFileTime => 8,
-            Self::GetSystemTime => 4,
-            Self::FileTimeToSystemTime => 8,
-            Self::SystemTimeToTzSpecificLocalTime => 12,
-            Self::GetDateFormatW | Self::GetTimeFormatW => 24,
-            Self::WaitForSingleObjectEx => 12,
-            Self::FindFirstFileExW => 24,
-            Self::GetDiskFreeSpaceA => 20,
-            Self::SetConsoleCtrlHandler => 8,
-            Self::ConvertThreadToFiber => 4,
-            Self::ConvertFiberToThread => 0,
-            Self::CreateFiber => 16,
-            Self::DeleteFiber => 4,
-            Self::SwitchToFiber => 4,
-            // -- Phase M4: SxS Activation Context API (kernel32.dll) arg bytes ----------
-            Self::CreateActCtxW => 4,
-            Self::ActivateActCtx => 8,
-            Self::DeactivateActCtx => 8,
-            Self::ReleaseActCtx => 4,
-            Self::FindActCtxSectionStringW => 24,
-            // -- Phase 1.3.3: user32.dll arg bytes --------------------------------------
-            Self::GetWindowThreadProcessId => 8,
-            Self::KillTimer => 8,
-            Self::MoveWindow => 24,
-            Self::GetDesktopWindow => 0,
-            Self::MsgWaitForMultipleObjects => 20,
-            Self::UpdateWindow => 4,
-            Self::UnregisterClassW => 8,
-            Self::WsprintfA => 44,
-            Self::DialogBoxParamA => 20,
-            Self::SetDlgItemInt => 16,
-            Self::GetDlgItemInt => 16,
-            Self::SetDlgItemTextA => 12,
-            Self::IsDialogMessageW => 8,
-            Self::SendDlgItemMessageW => 20,
-            Self::DefDlgProcW => 16,
-            Self::OpenClipboard | Self::CloseClipboard => 4,
-            Self::SetClipboardData => 12,
-            Self::EmptyClipboard => 0,
-            Self::GetClipboardData => 4,
-            Self::IsClipboardFormatAvailable => 4,
-            Self::EnumClipboardFormats => 4,
-            Self::GetWindowTextLengthA => 4,
-            Self::GetProcessWindowStation => 0,
-            Self::EnumWindows => 8,
-            Self::MonitorFromPoint => 12,
-            Self::EnumChildWindows => 12,
-            Self::MapWindowPoints => 16,
-            Self::GetUserObjectInformationW => 20,
-            Self::AllowSetForegroundWindow => 4,
-            Self::MessageBoxA => 16,
-            // --- I3: Scrollbars ---
-            Self::SetScrollInfo => 16,   // hwnd, bar, lpsi, redraw
-            Self::GetScrollInfo => 16,   // hwnd, bar, lpsi
-            Self::SetScrollPos => 16,    // hwnd, bar, pos, redraw
-            Self::GetScrollPos => 8,     // hwnd, bar
-            Self::SetScrollRange => 20,  // hwnd, bar, min, max, redraw
-            Self::GetScrollRange => 12,  // hwnd, bar, lpMinPos, lpMaxPos
-            Self::ShowScrollBar => 12,   // hwnd, bar, show
-            Self::EnableScrollBar => 12, // hwnd, flags, arrows
-            Self::ScrollWindow => 20,    // hwnd, dx, dy, lprcScroll, lprcClip
-            Self::ScrollDC => 28, // hdc, dx, dy, lprcScroll, lprcClip, hrgnUpdate, lprcUpdate
-            Self::ScrollWindowEx => 32, // hwnd, dx, dy, lprcScroll, lprcClip, hrgnUpdate, lprcUpdate, flags
-            // -- Phase 1.3.3: gdi32.dll arg bytes ---------------------------------------
-            Self::AddFontMemResourceEx => 16,
-            Self::RemoveFontMemResourceEx => 4,
-            Self::TextOutW => 20,
-            Self::CreateDIBSection => 24,
-            Self::DeleteDC => 4,
-            Self::CreateICW => 12,
-            Self::CreateCompatibleDC => 4,
-            Self::SwapBuffers => 4,
-            Self::SetPixelFormat => 12,
-            Self::ChoosePixelFormat => 8,
-            // -- Phase 1.3.3: advapi32.dll arg bytes ------------------------------------
-            Self::RegisterEventSourceW => 12,
-            Self::DeregisterEventSource => 4,
-            Self::ReportEventW => 36,
-            // -- Phase 1.3.3: psapi.dll arg bytes ---------------------------------------
-            Self::GetModuleFileNameExW => 16,
-            Self::GetModuleInformation => 16,
-            Self::GetProcessMemoryInfo => 12,
-            // -- Phase 1.3.3: bcrypt.dll arg bytes --------------------------------------
-            Self::BCryptGenRandom => 12,
-            // -- Phase O1: bcrypt.dll arg bytes (full suite) ------------------------------
-            Self::BCryptOpenAlgorithmProvider => 16,
-            Self::BCryptCloseAlgorithmProvider => 8,
-            Self::BCryptGenerateSymmetricKey => 28,
-            Self::BCryptGenerateKeyPair => 16,
-            Self::BCryptFinalizeKeyPair => 8,
-            Self::BCryptEncrypt => 40,
-            Self::BCryptDecrypt => 40,
-            Self::BCryptHash => 28,
-            Self::BCryptHashData => 16,
-            Self::BCryptCreateHash => 28,
-            Self::BCryptDestroyHash => 4,
-            Self::BCryptDestroyKey => 4,
-            Self::BCryptGetProperty => 24,
-            Self::BCryptSetProperty => 20,
-            Self::BCryptDeriveKey => 28,
-            Self::BCryptSecretAgreement => 16,
-            Self::BCryptImportKey => 36,
-            Self::BCryptSignHash => 32,
-            Self::BCryptVerifySignature => 28,
-            // -- Phase 1.3.3: crypt32.dll arg bytes -------------------------------------
-            Self::CertOpenStore => 20,
-            Self::CertCloseStore => 8,
-            Self::CertGetCertificateChain => 20,
-            Self::CertCreateCertificateContext => 8,
-            Self::CertFreeCertificateContext => 4,
-            Self::CertAddCertificateContextToStore => 16,
-            Self::CertFreeCertificateChain => 4,
-            // -- Phase O2: Extended crypt32.dll arg bytes ------------------------------------
-            Self::CertOpenSystemStoreW => 8,
-            Self::CertFindCertificateInStore => 24,
-            Self::CertGetNameStringW => 24,
-            Self::CertDuplicateCertificateContext => 4,
-            Self::CertVerifyCertificateChainPolicy => 20,
-            Self::CertEnumCertificatesInStore => 8,
-            Self::CertDeleteCertificateFromStore => 4,
-            Self::CryptAcquireCertificatePrivateKey => 24,
-            Self::PFXImportCertStore => 12,
-            Self::PFXIsPFXBlob => 4,
-            Self::CertFindExtension => 12,
-            Self::CertGetIntendedKeyUsage => 16,
-            // -- Phase O4: PPL detection arg bytes --------------------------------------------
-            Self::IsProtectedProcess => 4,
-            Self::IsProtectedProcessLight => 4,
-            Self::RtlIsProtectedProcess => 8,
-            Self::RtlIsProtectedProcessLight => 8,
-            // -- Phase O5: Credential guard arg bytes ------------------------------------------
-            Self::CredIsProtected => 8,
-            Self::CredProtectW => 24,
-            Self::CredUnprotectW => 20,
-            // -- Phase O3: Code integrity enforcement arg bytes ------------------------------------
-            Self::NtQueryInformationProcess => 20,
-            // -- XAudio2 arg bytes (Phase 4.3): COM methods, params excluding this --
-            Self::XAudio2VoiceGetVoiceDetails => 8,
-            Self::XAudio2VoiceSetOutputVoices => 8,
-            Self::XAudio2VoiceSetEffectChain => 8,
-            Self::XAudio2VoiceEnableEffect => 8,
-            Self::XAudio2VoiceDisableEffect => 8,
-            Self::XAudio2VoiceGetEffectState => 12,
-            Self::XAudio2VoiceSetEffectParameters => 16,
-            Self::XAudio2VoiceGetEffectParameters => 16,
-            Self::XAudio2VoiceSetFilterParameters => 8,
-            Self::XAudio2VoiceGetFilterParameters => 8,
-            Self::XAudio2VoiceSetOutputFilterParameters => 8,
-            Self::XAudio2VoiceGetOutputFilterParameters => 8,
-            Self::XAudio2VoiceSetVolume => 8,
-            Self::XAudio2VoiceGetVolume => 8,
-            Self::XAudio2VoiceSetChannelVolumes => 12,
-            Self::XAudio2VoiceGetChannelVolumes => 12,
-            Self::XAudio2VoiceSetOutputMatrix => 16,
-            Self::XAudio2VoiceGetOutputMatrix => 16,
-            Self::XAudio2SourceVoiceDiscontinuity => 4,
-            Self::XAudio2SourceVoiceExitLoop => 4,
-            Self::XAudio2SourceVoiceGetState => 8,
-            Self::XAudio2SourceVoiceSetFrequencyRatio => 8,
-            Self::XAudio2SourceVoiceGetFrequencyRatio => 8,
-            Self::XAudio2SourceVoiceSetSourceSampleRate => 8,
-            Self::XAudio2CreateSubmixVoice => 20,
-            Self::XAudio2CommitChanges => 4,
-            // -- XAudio2 no-op / stub methods --
-            Self::XAudio2RegisterForCallbacks => 4,
-            Self::XAudio2UnregisterForCallbacks => 4,
-            Self::XAudio2GetPerformanceData => 4,
-            Self::XAudio2SetDebugConfiguration => 4,
-            // -- IXAPO arg bytes (Phase 4.3.1): COM method params excluding this --
-            Self::XAPO_GetRegistrationProperties => 8,
-            Self::XAPO_LockForProcess => 8,
-            Self::XAPO_UnlockForProcess => 4,
-            Self::XAPO_Process => 24,
-            // -- DirectInput8 arg bytes (Phase 4.3) --
-            Self::DirectInput8Create => 20,
-            Self::DirectInput8CreateDevice => 12,
-            Self::DirectInput8EnumDevices => 16,
-            Self::DirectInputDevice8SetDataFormat => 8,
-            Self::DirectInputDevice8SetCooperativeLevel => 12,
-            Self::DirectInputDevice8Acquire => 4,
-            Self::DirectInputDevice8Unacquire => 4,
-            Self::DirectInputDevice8GetDeviceState => 12,
-            Self::DirectInputDevice8GetDeviceData => 16,
-            Self::DirectInputDevice8EnumObjects => 16,
-            Self::DirectInputDevice8GetCapabilities => 8,
-            Self::DirectInputDevice8SetProperty => 16,
-            Self::DirectInputDevice8Poll => 4,
-            Self::DirectInputDevice8UnacquireObj => 4,
-            Self::DirectInputDevice8SendForceFeedbackCommand => 8,
-            Self::DirectInputDevice8SetForceFeedbackState => 8,
-            // -- Raw Input arg bytes (Phase 4.3) --
-            Self::RegisterRawInputDevices => 12,
-            Self::GetRawInputData => 20,
-            Self::GetRawInputDeviceInfoW => 16,
-            Self::GetRegisteredRawInputDevices => 12,
-            // -- Touch / Pointer arg bytes (Phase 6.x) --
-            Self::RegisterTouchWindow => 8,
-            Self::UnregisterTouchWindow => 4,
-            Self::GetTouchInputInfo => 16,
-            Self::CloseTouchInputHandle => 4,
-            Self::InitializeTouchInjection => 12,
-            Self::InitializePointerDevice => 4,
-            Self::GetPointerInfo => 8,
-            Self::GetPointerPenInfo => 8,
-            Self::SkipPointerFrame => 4,
-            Self::GetPointerDeviceCaps => 8,
-            Self::GetPointerDeviceRects => 12,
-            Self::GetPointerFrameInfo => 8,
-            // -- XInput arg bytes (Phase 5.2.1) --
-            Self::XInputGetState => 8,
-            Self::XInputSetState => 8,
-            Self::XInputGetCapabilities => 12,
-            Self::XInputGetDSoundAudioDeviceGuids => 12,
-            Self::XInputGetBatteryInformation => 12,
-            Self::XInputGetKeystroke => 12,
-            Self::XInputEnable => 4,
-            // -- Steam Input API (Phase 5.2.4) --
-            Self::SteamAPI_ISteamInput_Init => 4,
-            Self::SteamAPI_ISteamInput_Shutdown => 4,
-            Self::SteamAPI_ISteamInput_RunFrame => 8,
-            Self::SteamAPI_ISteamInput_GetConnectedControllers => 12,
-            Self::SteamAPI_ISteamInput_GetActionSetHandle => 8,
-            Self::SteamAPI_ISteamInput_GetDigitalActionHandle => 8,
-            Self::SteamAPI_ISteamInput_GetAnalogActionHandle => 8,
-            Self::SteamAPI_ISteamInput_ActivateActionSet => 12,
-            Self::SteamAPI_ISteamInput_GetCurrentActionSet => 8,
-            Self::SteamAPI_ISteamInput_GetDigitalActionData => 12,
-            Self::SteamAPI_ISteamInput_GetAnalogActionData => 12,
-            Self::SteamAPI_ISteamInput_TriggerRepeatedHapticPulse => 28,
-            Self::SteamAPI_ISteamInput_GetControllerInputType => 8,
-            Self::SteamAPI_ISteamInput_GetMotionData => 8,
-            Self::SteamAPI_ISteamInput_ShowBindingPanel => 8,
-            Self::SteamAPI_ISteamInput_GetGlyphForActionHandle => 8,
-            // -- SteamVR / OpenVR (Phase 5.3.1) --
-            Self::SteamVR_Init => 8,
-            Self::SteamVR_Shutdown => 0,
-            Self::SteamVR_IsHmdPresent => 0,
-            Self::SteamVR_IsRuntimeInstalled => 0,
-            Self::SteamVR_GetStringForHmdError => 4,
-            Self::SteamVR_RuntimePath => 0,
-            Self::SteamVR_GetGenericInterface => 8,
-            Self::SteamVR_IVRSystem_GetTrackedDeviceClass => 8,
-            Self::SteamVR_IVRSystem_IsTrackedDeviceConnected => 8,
-            Self::SteamVR_IVRSystem_GetStringTrackedDeviceProperty => 24,
-            Self::SteamVR_IVRSystem_GetBoolTrackedDeviceProperty => 12,
-            Self::SteamVR_IVRSystem_GetFloatTrackedDeviceProperty => 12,
-            Self::SteamVR_IVRSystem_GetInt32TrackedDeviceProperty => 12,
-            Self::SteamVR_IVRSystem_GetUint64TrackedDeviceProperty => 12,
-            Self::SteamVR_IVRSystem_GetRecommendedRenderTargetSize => 12,
-            Self::SteamVR_IVRSystem_GetProjectionMatrix => 24,
-            Self::SteamVR_IVRSystem_GetProjectionRaw => 28,
-            Self::SteamVR_IVRSystem_GetEyeToHeadTransform => 12,
-            Self::SteamVR_IVRSystem_GetDeviceToAbsoluteTrackingPose => 24,
-            Self::SteamVR_IVRSystem_PollNextEvent => 12,
-            Self::SteamVR_IVRCompositor_Submit => 24,
-            Self::SteamVR_IVRCompositor_WaitGetPoses => 24,
-            Self::SteamVR_IVRCompositor_GetFrameTiming => 12,
-            Self::SteamVR_IVRCompositor_GetFrameTimeRemaining => 4,
-            Self::SteamVR_IVRCompositor_GetCumulativeStats => 8,
-            Self::SteamVR_IVRCompositor_CanRenderScene => 4,
-            Self::SteamVR_IVRCompositor_SetExplicitTimingMode => 8,
-            Self::SteamVR_IVRCompositor_SetExplicitTimingLastPose => 8,
-            Self::SteamVR_IVRChaperone_GetCalibrationState => 4,
-            Self::SteamVR_IVRChaperone_GetPlayAreaSize => 12,
-            Self::SteamVR_IVRChaperone_GetPlayAreaRect => 8,
-            // -- Steam Networking Sockets (Phase 5.4) --
-            Self::SteamAPI_ISteamNetworkingSockets_CreateListenSocketIP => 20,
-            Self::SteamAPI_ISteamNetworkingSockets_ConnectByIPAddress => 8,
-            Self::SteamAPI_ISteamNetworkingSockets_SendMessageToConnection => 24,
-            Self::SteamAPI_ISteamNetworkingSockets_ReceiveMessagesOnListenSocket => 16,
-            Self::SteamAPI_ISteamNetworkingSockets_CloseConnection => 20,
-            Self::SteamAPI_ISteamNetworkingSockets_DestroyListenSocket => 12,
-            Self::SteamAPI_ISteamNetworkingSockets_CreateListenSocket => 4,
-            Self::SteamAPI_ISteamNetworkingSockets_ConnectBySteamID => 8,
-            Self::SteamAPI_ISteamNetworkingSockets_AcceptConnection => 8,
-            Self::SteamAPI_ISteamNetworkingSockets_GetConnectionStatus => 12,
-            Self::SteamAPI_ISteamNetworkingSockets_GetConnectionName => 16,
-            // -- Steam Networking Messages (Phase 5.5) --
-            Self::SteamAPI_ISteamNetworkingMessages_SendMessageToUser => 24,
-            Self::SteamAPI_ISteamNetworkingMessages_ReceiveMessagesOnChannel => 20,
-            Self::SteamAPI_ISteamNetworkingMessages_CloseSessionWithUser => 8,
-            // -- Steam API flat exports (Phase B3) --
-            Self::SteamAPI_Init => 0,
-            Self::SteamAPI_Shutdown => 0,
-            Self::SteamAPI_RestartAppIfNecessary => 4,
-            Self::SteamAPI_RegisterCallback => 8,
-            Self::SteamAPI_UnregisterCallback => 4,
-            Self::SteamAPI_RegisterCallResult => 12,
-            Self::SteamAPI_UnregisterCallResult => 12,
-            Self::SteamAPI_RunCallbacks => 0,
-            Self::SteamAPI_GetSteamInstallPath => 0,
-            Self::SteamAPI_WriteMiniDump => 16,
-            Self::SteamAPI_SetMiniDumpComment => 4,
-            Self::SteamInternal_CreateInterface => 4,
-            Self::SteamInternal_FindOrCreateUserInterface => 8,
-            Self::SteamInternal_FindOrCreateGameInterface => 8,
-            Self::SteamInternal_ContextInit => 4,
-            // -- K1: ISteamUserStats (achievements, stats, leaderboards) --
-            Self::SteamAPI_ISteamUserStats_RequestCurrentStats => 4,
-            Self::SteamAPI_ISteamUserStats_GetStat => 12,
-            Self::SteamAPI_ISteamUserStats_SetStat => 12,
-            Self::SteamAPI_ISteamUserStats_GetStatFloat => 12,
-            Self::SteamAPI_ISteamUserStats_SetStatFloat => 12,
-            Self::SteamAPI_ISteamUserStats_GetAchievement => 12,
-            Self::SteamAPI_ISteamUserStats_SetAchievement => 8,
-            Self::SteamAPI_ISteamUserStats_ClearAchievement => 8,
-            Self::SteamAPI_ISteamUserStats_GetAchievementName => 8,
-            Self::SteamAPI_ISteamUserStats_GetNumAchievements => 4,
-            Self::SteamAPI_ISteamUserStats_FindOrCreateLeaderboard => 16,
-            Self::SteamAPI_ISteamUserStats_UploadLeaderboardScore => 24,
-            Self::SteamAPI_ISteamUserStats_DownloadLeaderboardEntries => 24,
-            Self::SteamAPI_ISteamUserStats_GetLeaderboardEntryCount => 8,
-            Self::SteamAPI_ISteamUserStats_GetLeaderboardName => 8,
-            Self::SteamAPI_ISteamUserStats_GetLeaderboardSortMethod => 8,
-            Self::SteamAPI_ISteamUserStats_GetLeaderboardDisplayType => 8,
-            Self::SteamAPI_ISteamUserStats_AttachLeaderboardUGC => 16,
-            // -- K2: ISteamFriends --
-            Self::SteamAPI_ISteamFriends_GetPersonaName => 4,
-            Self::SteamAPI_ISteamFriends_SetPersonaName => 8,
-            Self::SteamAPI_ISteamFriends_GetPersonaState => 4,
-            Self::SteamAPI_ISteamFriends_SetPersonaState => 8,
-            Self::SteamAPI_ISteamFriends_GetFriendCount => 4,
-            Self::SteamAPI_ISteamFriends_GetFriendByIndex => 8,
-            Self::SteamAPI_ISteamFriends_GetFriendPersonaName => 12,
-            Self::SteamAPI_ISteamFriends_GetFriendPersonaState => 12,
-            Self::SteamAPI_ISteamFriends_GetFriendGamePlayed => 12,
-            Self::SteamAPI_ISteamFriends_SetFriendPersonaState => 12,
-            Self::SteamAPI_ISteamFriends_AddFriend => 8,
-            Self::SteamAPI_ISteamFriends_RemoveFriend => 8,
-            Self::SteamAPI_ISteamFriends_InviteFriend => 12,
-            Self::SteamAPI_ISteamFriends_AcceptInvite => 8,
-            Self::SteamAPI_ISteamFriends_DeclineInvite => 8,
-            Self::SteamAPI_ISteamFriends_GetInviteCount => 4,
-            Self::SteamAPI_ISteamFriends_GetInviteByIndex => 8,
-            Self::SteamAPI_ISteamFriends_SendFriendMessage => 12,
-            Self::SteamAPI_ISteamFriends_GetFriendMessage => 16,
-            Self::SteamAPI_ISteamFriends_GetFriendMessageCount => 8,
-            Self::SteamAPI_ISteamFriends_JoinClan => 12,
-            Self::SteamAPI_ISteamFriends_LeaveClan => 8,
-            Self::SteamAPI_ISteamFriends_GetClanCount => 4,
-            Self::SteamAPI_ISteamFriends_GetClanByIndex => 8,
-            Self::SteamAPI_ISteamFriends_GetClanName => 8,
-            Self::SteamAPI_ISteamFriends_IsClanMember => 8,
-            Self::SteamAPI_ISteamFriends_SetRichPresence => 12,
-            Self::SteamAPI_ISteamFriends_ClearRichPresence => 4,
-            Self::SteamAPI_ISteamFriends_ActivateGameOverlayToWebPage => 8,
-            Self::SteamAPI_ISteamFriends_ActivateGameOverlayToFriends => 4,
-            Self::SteamAPI_ISteamFriends_ActivateGameOverlay => 8,
-            Self::SteamAPI_ISteamFriends_ActivateGameOverlayToUser => 16,
-            Self::SteamAPI_ISteamFriends_ActivateGameOverlayToStore => 8,
-            Self::SteamAPI_ISteamFriends_ActivateGameOverlayToInviteDialog => 12,
-            Self::SteamAPI_ISteamFriends_GetSmallFriendAvatar => 8,
-            Self::SteamAPI_ISteamFriends_GetMediumFriendAvatar => 8,
-            Self::SteamAPI_ISteamFriends_GetLargeFriendAvatar => 8,
-            // -- K3: ISteamMatchmaking (lobbies) --
-            Self::SteamAPI_ISteamMatchmaking_CreateLobby => 12,
-            Self::SteamAPI_ISteamMatchmaking_JoinLobby => 8,
-            Self::SteamAPI_ISteamMatchmaking_LeaveLobby => 8,
-            Self::SteamAPI_ISteamMatchmaking_GetLobbyData => 12,
-            Self::SteamAPI_ISteamMatchmaking_SetLobbyData => 16,
-            Self::SteamAPI_ISteamMatchmaking_GetLobbyMemberCount => 8,
-            Self::SteamAPI_ISteamMatchmaking_GetLobbyMemberByIndex => 12,
-            Self::SteamAPI_ISteamMatchmaking_GetLobbyMemberData => 20,
-            Self::SteamAPI_ISteamMatchmaking_SetLobbyMemberData => 24,
-            Self::SteamAPI_ISteamMatchmaking_GetLobbyOwner => 8,
-            Self::SteamAPI_ISteamMatchmaking_SetLobbyOwner => 16,
-            Self::SteamAPI_ISteamMatchmaking_SetLobbyJoinable => 12,
-            Self::SteamAPI_ISteamMatchmaking_SendLobbyChatMessage => 12,
-            Self::SteamAPI_ISteamMatchmaking_RequestLobbyList => 4,
-            Self::SteamAPI_ISteamMatchmaking_GetLobbyByIndex => 8,
-            Self::SteamAPI_ISteamMatchmaking_GetLobbyCount => 4,
-            // -- K5: ISteamRemoteStorage (cloud storage) --
-            Self::SteamAPI_ISteamRemoteStorage_FileWrite => 16,
-            Self::SteamAPI_ISteamRemoteStorage_FileRead => 16,
-            Self::SteamAPI_ISteamRemoteStorage_FileDelete => 8,
-            Self::SteamAPI_ISteamRemoteStorage_FileExists => 8,
-            Self::SteamAPI_ISteamRemoteStorage_FileSize => 8,
-            Self::SteamAPI_ISteamRemoteStorage_FileTime => 8,
-            Self::SteamAPI_ISteamRemoteStorage_GetFileCount => 4,
-            Self::SteamAPI_ISteamRemoteStorage_GetFileName => 8,
-            Self::SteamAPI_ISteamRemoteStorage_GetFileSize => 8,
-            Self::SteamAPI_ISteamRemoteStorage_GetQuotaUsed => 4,
-            Self::SteamAPI_ISteamRemoteStorage_GetQuotaTotal => 4,
-            Self::SteamAPI_ISteamRemoteStorage_IsCloudEnabledForAccount => 4,
-            Self::SteamAPI_ISteamRemoteStorage_IsCloudEnabledForApp => 4,
-            Self::SteamAPI_ISteamRemoteStorage_UGCDownload => 12,
-            Self::SteamAPI_ISteamRemoteStorage_UGCSubscribe => 8,
-            Self::SteamAPI_ISteamRemoteStorage_UGCUnsubscribe => 8,
-            // -- K6: ISteamScreenshots --
-            Self::SteamAPI_ISteamScreenshots_WriteScreenshot => 16,
-            Self::SteamAPI_ISteamScreenshots_AddScreenshotToLibrary => 20,
-            Self::SteamAPI_ISteamScreenshots_TriggerScreenshot => 4,
-            Self::SteamAPI_ISteamScreenshots_HookScreenshots => 8,
-            Self::SteamAPI_ISteamScreenshots_IsScreenshotsHooked => 4,
-            Self::SteamAPI_ISteamScreenshots_GetScreenshotCount => 4,
-            Self::SteamAPI_ISteamScreenshots_GetScreenshotByIndex => 8,
-            Self::SteamAPI_ISteamScreenshots_GetScreenshotFilePath => 8,
-            Self::SteamAPI_ISteamScreenshots_GetScreenshotThumbnailPath => 8,
-            Self::SteamAPI_ISteamScreenshots_TagUser => 16,
-            Self::SteamAPI_ISteamScreenshots_TagPublishedFile => 16,
-            // -- K7: ISteamMusic (stubs) --
-            Self::SteamAPI_ISteamMusic_IsEnabled => 4,
-            Self::SteamAPI_ISteamMusic_SetEnabled => 8,
-            Self::SteamAPI_ISteamMusic_IsPlaying => 4,
-            Self::SteamAPI_ISteamMusic_Play => 4,
-            Self::SteamAPI_ISteamMusic_Pause => 4,
-            Self::SteamAPI_ISteamMusic_PlayNext => 4,
-            Self::SteamAPI_ISteamMusic_PlayPrevious => 4,
-            Self::SteamAPI_ISteamMusic_SetVolume => 8,
-            Self::SteamAPI_ISteamMusic_GetVolume => 4,
-            // -- K9: IVRRenderModels --
-            Self::SteamVR_IVRRenderModels_LoadRenderModel => 16,
-            Self::SteamVR_IVRRenderModels_FreeRenderModel => 12,
-            Self::SteamVR_IVRRenderModels_GetRenderModelName => 8,
-            Self::SteamVR_IVRRenderModels_GetRenderModelCount => 4,
-            Self::SteamVR_IVRRenderModels_GetRenderModelNameByIndex => 8,
-            Self::SteamVR_IVRRenderModels_GetRenderModelThumbnail => 8,
-            // -- Phase 4.4: Synchronization primitive arg bytes -------------------------
-            Self::CreateMutexW | Self::CreateMutexA => 16,
-            Self::OpenMutexW => 12,
-            Self::ReleaseMutex => 4,
-            Self::CreateSemaphoreW | Self::CreateSemaphoreA => 16,
-            Self::OpenSemaphoreW => 12,
-            Self::ReleaseSemaphore => 12,
-            Self::PulseEvent => 4,
-            Self::InitializeConditionVariable => 4,
-            Self::WakeConditionVariable => 4,
-            Self::GetThreadPriority => 4,
-            Self::CreateRemoteThread => 24,
-            Self::QueueUserAPC => 12,
-            // -- Phase 4.4: Thread pool arg bytes ---------------------------------------
-            Self::QueueUserWorkItem => 12,
-            Self::CreateThreadpoolWork => 12,
-            Self::SubmitThreadpoolWork => 4,
-            Self::WaitForThreadpoolWorkCallbacks => 12,
-            Self::CloseThreadpoolWork => 4,
-            Self::CreateThreadpoolTimer => 12,
-            Self::SetThreadpoolTimer => 20,
-            Self::CloseThreadpoolTimer => 4,
-            Self::CreateThreadpoolWait => 12,
-            Self::SetThreadpoolWait => 12,
-            Self::CloseThreadpoolWait => 4,
-            // -- COM / OLE Automation (Phase P0.1) arg bytes -------------------------------
-            Self::CoGetClassObject => 20,
-            Self::CoRegisterClassObject => 20,
-            Self::CoRevokeClassObject => 4,
-            Self::CoCreateInstanceEx => 24,
-            Self::CoCreateGuid => 4,
-            Self::SysAllocString => 4,
-            Self::SysReAllocString => 8,
-            Self::SysFreeString => 4,
-            Self::SysAllocStringLen => 8,
-            Self::SysStringLen => 4,
-            Self::VariantInit => 4,
-            Self::VariantCopy => 8,
-            Self::VariantChangeType => 12,
-            Self::SafeArrayCreate => 12,
-            Self::SafeArrayDestroy => 4,
-            Self::SafeArrayAccessData => 8,
-            Self::SafeArrayUnaccessData => 4,
-            Self::SafeArrayGetElement => 12,
-            Self::SafeArrayPutElement => 16,
-            Self::SafeArrayGetLBound => 8,
-            Self::SafeArrayGetUBound => 8,
-            Self::SafeArrayCreateVector => 8,
-            // -- usp10.dll Uniscribe (P0.3) arg bytes --------------------------------
-            Self::ScriptStringFree | Self::ScriptString_pSize | Self::ScriptFreeCache => 4,
-            Self::ScriptGetProperties | Self::ScriptRecordDigitSubstitution => 8,
-            Self::ScriptCacheGetHeight => 12,
-            Self::ScriptLayout | Self::ScriptBreak | Self::ScriptApplyDigitSubstitution => 16,
-            Self::ScriptStringAnalyse => 28,
-            Self::ScriptItemize => 28,
-            Self::ScriptStringOut => 32,
-            Self::ScriptPlace => 32,
-            Self::ScriptShape => 40,
-            // ── Phase 2.7: GDI+ (gdiplus.dll) arg bytes ──────────────────────────
-            // Most GDI+ functions take (handle, ...) with 4 bytes per handle/pointer
-            Self::GdiplusStartup => 12,
-            Self::GdiplusShutdown => 4,
-            Self::GdipCreateFromHDC => 8,
-            Self::GdipDeleteGraphics => 4,
-            Self::GdipDrawLine => 20,
-            Self::GdipDrawLines => 12,
-            Self::GdipDrawRectangle => 20,
-            Self::GdipFillRectangle => 20,
-            Self::GdipDrawEllipse => 20,
-            Self::GdipFillEllipse => 20,
-            Self::GdipDrawPie => 36,
-            Self::GdipFillPie => 36,
-            Self::GdipDrawPolygon => 12,
-            Self::GdipFillPolygon => 16,
-            Self::GdipDrawArc => 36,
-            Self::GdipDrawCurve => 20,
-            Self::GdipDrawClosedCurve => 20,
-            Self::GdipDrawString => 28,
-            Self::GdipCreateSolidFill => 8,
-            Self::GdipCreateLineBrush => 32,
-            Self::GdipCreateTextureBrush => 16,
-            Self::GdipDeleteBrush => 4,
-            Self::GdipFillRegion => 12,
-            Self::GdipCreatePen1 => 16,
-            Self::GdipCreatePen2 => 12,
-            Self::GdipSetPenWidth => 8,
-            Self::GdipGetPenWidth => 8,
-            Self::GdipSetPenColor => 8,
-            Self::GdipGetPenColor => 8,
-            Self::GdipSetPenDashStyle => 8,
-            Self::GdipGetPenDashStyle => 8,
-            Self::GdipSetPenLineJoin => 8,
-            Self::GdipSetPenStartCap => 8,
-            Self::GdipSetPenEndCap => 8,
-            Self::GdipDeletePen => 4,
-            Self::GdipCreatePath => 12,
-            Self::GdipDeletePath => 4,
-            Self::GdipAddPathLine => 20,
-            Self::GdipAddPathRectangle => 20,
-            Self::GdipAddPathEllipse => 20,
-            Self::GdipAddPathArc => 36,
-            Self::GdipAddPathBezier => 36,
-            Self::GdipClosePathFigure => 4,
-            Self::GdipStartPathFigure => 4,
-            Self::GdipSetPathFillMode => 8,
-            Self::GdipDrawPath => 12,
-            Self::GdipFillPath => 12,
-            Self::GdipCreateMatrix => 4,
-            Self::GdipDeleteMatrix => 4,
-            Self::GdipSetMatrixElements => 20,
-            Self::GdipGetMatrixElements => 8,
-            Self::GdipTranslateMatrix => 12,
-            Self::GdipRotateMatrix => 12,
-            Self::GdipScaleMatrix => 16,
-            Self::GdipInvertMatrix => 4,
-            Self::GdipMultiplyMatrix => 12,
-            Self::GdipSetWorldTransform => 8,
-            Self::GdipResetWorldTransform => 4,
-            Self::GdipGetWorldTransform => 8,
-            Self::GdipSetClipRect => 24,
-            Self::GdipSetClipPath => 12,
-            Self::GdipSetClipRegion => 12,
-            Self::GdipResetClip => 4,
-            Self::GdipGetClipBounds => 8,
-            Self::GdipGetClip => 12,
-            Self::GdipSaveGraphics => 8,
-            Self::GdipRestoreGraphics => 8,
-            Self::GdipBeginContainer => 28,
-            Self::GdipEndContainer => 12,
-            Self::GdipCreateBitmapFromHBITMAP => 16,
-            Self::GdipCreateBitmapFromFile => 8,
-            Self::GdipCreateBitmapFromGraphics => 12,
-            Self::GdipDisposeImage => 4,
-            Self::GdipGetImageWidth => 8,
-            Self::GdipGetImageHeight => 8,
-            Self::GdipGetImagePixelFormat => 8,
-            Self::GdipBitmapGetPixel => 20,
-            Self::GdipBitmapSetPixel => 20,
-            Self::GdipBitmapLockBits => 28,
-            Self::GdipBitmapUnlockBits => 12,
-            Self::GdipCreateFont => 28,
-            Self::GdipDeleteFont => 4,
-            Self::GdipCreateFontFamilyFromName => 16,
-            Self::GdipDeleteFontFamily => 4,
-            Self::GdipSetTextRenderingHint => 8,
-            Self::GdipMeasureString => 36,
-            Self::GdipMeasureCharacterRanges => 32,
-            Self::GdipCreateImageAttributes => 4,
-            Self::GdipDisposeImageAttributes => 4,
-            Self::GdipSetImageAttributesColorKeys => 20,
-            Self::GdipSetImageAttributesColorMatrix => 24,
-            Self::GdipSetSmoothingMode => 8,
-            Self::GdipGetSmoothingMode => 8,
-            Self::GdipSetCompositingMode => 8,
-            Self::GdipGetCompositingMode => 8,
-            Self::GdipSetCompositingQuality => 8,
-            Self::GdipGetCompositingQuality => 8,
-            Self::GdipSetInterpolationMode => 8,
-            Self::GdipGetInterpolationMode => 8,
-            Self::GdipSetPixelOffsetMode => 8,
-            Self::GdipGetPixelOffsetMode => 8,
-            Self::GdipDrawImage => 16,
-            Self::GdipDrawImageRect => 20,
-            Self::GdipDrawImageRectRect => 52,
-            Self::GdipGetImageType => 8,
-            Self::GdipGetImageRawFormat => 12,
-            Self::GdipCloneImage => 8,
-            Self::GdipSaveImageToFile => 16,
-            Self::GdipSaveImageToStream => 16,
-            Self::GdipCreateBitmapFromStream => 8,
-            Self::GdipCreateBitmapFromScan0 => 32,
-            Self::GdipCreateHICONFromBitmap => 8,
-            Self::GdipCreateHBITMAPFromBitmap => 12,
-            Self::GdipCreateImageFromFile => 8,
-            Self::GdipImageForceValidation => 4,
-            Self::GdipGetFontHeight => 12,
-            Self::GdipCreateBitmapFromGdiDib => 12,
-            // -- WinMM (Windows Multimedia) audio (Phase 2.5) --
-            Self::WaveOutOpen => 24,
-            Self::WaveOutClose => 4,
-            Self::WaveOutPrepareHeader => 12,
-            Self::WaveOutUnprepareHeader => 12,
-            Self::WaveOutWrite => 12,
-            Self::WaveOutReset => 4,
-            Self::WaveOutGetVolume => 8,
-            Self::WaveOutSetVolume => 8,
-            Self::WaveOutGetDevCapsW => 12,
-            Self::WaveOutGetNumDevs => 0,
-            Self::WaveInOpen => 24,
-            Self::WaveInClose => 4,
-            Self::WaveInPrepareHeader => 12,
-            Self::WaveInUnprepareHeader => 12,
-            Self::WaveInAddBuffer => 12,
-            Self::WaveInStart => 4,
-            Self::WaveInStop => 4,
-            Self::WaveInGetDevCapsW => 12,
-            Self::WaveInGetNumDevs => 0,
-            Self::MidiOutOpen => 12,
-            Self::MidiOutClose => 4,
-            Self::MidiOutShortMsg => 8,
-            Self::MidiOutLongMsg => 12,
-            Self::MidiOutReset => 4,
-            Self::MidiOutGetDevCapsW => 12,
-            Self::MidiOutGetNumDevs => 0,
-            Self::MidiInOpen => 24,
-            Self::MidiInClose => 4,
-            Self::MidiInStart => 4,
-            Self::MidiInStop => 4,
-            Self::MidiInReset => 4,
-            Self::TimeGetTime => 0,
-            Self::TimeBeginPeriod => 4,
-            Self::TimeEndPeriod => 4,
-            Self::PlaySoundW => 16,
-            Self::MmioOpenW => 12,
-            Self::MmioClose => 8,
-            Self::MmioRead => 12,
-            Self::MmioWrite => 12,
-            Self::MmioAscend => 8,
-            Self::MmioDescend => 12,
-            Self::MmioCreateChunk => 12,
-            Self::MmioStringToFOURCCW => 8,
-            // -- DWM (Desktop Window Manager) arg bytes --
-            Self::DwmIsCompositionEnabled => 4, // BOOL *pfEnabled
-            Self::DwmEnableComposition => 4,    // DWORD fEnable
-            Self::DwmEnableBlurBehindWindow => 8, // HWND hwnd, DWM_BLURBEHIND *blur
-            Self::DwmExtendFrameIntoClientArea => 8, // HWND hwnd, MARGINS *margins
-            Self::DwmGetColorizationColor => 8, // DWORD *color, BOOL *opaque
-            Self::DwmGetWindowAttribute => 16,  // HWND, DWORD attr, void *val, DWORD size
-            Self::DwmSetWindowAttribute => 16,  // HWND, DWORD attr, void *val, DWORD size
-            Self::DwmFlush => 0,                // void
-            Self::DwmRegisterThumbnail => 12,   // HWND, HWND, PHTHUMBNAIL
-            Self::DwmUpdateThumbnailProperties => 8, // HTHUMBNAIL, DWM_THUMBNAIL_PROPERTIES
-            Self::DwmUnregisterThumbnail => 4,  // HTHUMBNAIL
-            Self::DwmSetIconicThumbnail => 8,   // HWND, HBITMAP
-            Self::DwmSetIconicLivePreviewBitmap => 12, // HWND, HBITMAP, POINT *client, DWORD flags
-            // -- J1: WinHTTP WebSocket extensions (Phase J1) --
-            Self::WinHttpWebSocketCompleteUpgrade => 28, // hRequest, pData, dwDataLength, pContext, pCompletionRoutine, pBytesWritten, phWebSocket
-            Self::WinHttpWebSocketSend => 16, // hWebSocket, eBufferType, pBuffer, dwBufferLength
-            Self::WinHttpWebSocketReceive => 12, // hWebSocket, pBuffer, dwBufferLength
-            Self::WinHttpWebSocketClose => 16, // hWebSocket, usStatus, pReason, dwReasonLength
-            Self::WinHttpWebSocketQueryCloseStatus => 16, // hWebSocket, pusStatus, pReason, pdwReasonLength
-            // -- J6: WinHTTP QueryOption & Proxy (Phase J6) --
-            Self::WinHttpQueryOption => 16, // hHandle, dwOption, pBuffer, pdwBufferLength
-            Self::WinHttpGetProxyForUrl => 16, // hSession, lpcwszUrl, pProxyInfo, pError
-            Self::WinHttpGetIEProxyConfigForCurrentUser => 4, // pProxyConfig
-            // -- J3: WinINet FTP operations (Phase J3) --
-            Self::FtpGetFileW => 20, // hConnect, pRemoteFile, pNewFile, fFailIfExists, dwFlagsAndAttributes
-            Self::FtpPutFileW => 16, // hConnect, pLocalFile, pRemoteFile, dwFlags
-            Self::FtpOpenFileW => 16, // hConnect, pFileName, dwAccess, dwFlags
-            Self::FtpFindFirstFileW => 16, // hConnect, pSearchFile, pFindFileData, dwFlags
-            Self::FtpDeleteFileW => 8, // hConnect, pFileName
-            Self::FtpRenameFileW => 12, // hConnect, pExisting, pNew
-            Self::FtpSetCurrentDirectoryW => 8, // hConnect, pDirName
-            Self::FtpGetCurrentDirectoryW => 12, // hConnect, pCurrentDirectory, lpdwCurrentDirectory
-            Self::FtpCreateDirectoryW => 8,      // hConnect, pDirName
-            Self::FtpRemoveDirectoryW => 8,      // hConnect, pDirName
-            // I2 — Menus arg bytes
-            Self::CreateMenu => 0,
-            Self::DestroyMenu => 4,
-            Self::InsertMenuW => 16,
-            Self::InsertMenuItemW => 24,
-            Self::ModifyMenuW => 16,
-            Self::RemoveMenu => 8,
-            Self::GetMenu => 4,
-            Self::SetMenu => 8,
-            Self::GetSubMenu => 8,
-            Self::GetMenuItemCount => 4,
-            Self::GetMenuItemID => 8,
-            Self::GetMenuState => 12,
-            Self::GetMenuStringW => 20,
-            Self::DrawMenuBar => 4,
-            Self::CheckMenuItem => 8,
-            Self::HiliteMenuItem => 8,
-            Self::LoadMenuW => 8,
-            Self::LoadMenuIndirectW => 4,
-            // -- Phase M2: Delay-load import hooking -- zero arg bytes (forwards via call)
-            Self::DelayLoadResolve { .. } => 0,
-            // ── Phase L: COM/Shell Completion arg bytes ──────────────────────────
-            // L1 — IShellFolder
-            Self::SHGetDesktopFolder => 4,
-            Self::SHBrowseForFolderW => 4,
-            Self::ILCreateFromPathW => 4,
-            Self::ILFree => 4,
-            Self::SHParseDisplayName => 8,
-            Self::SHCreateItemFromParsingName => 16,
-            Self::SHCreateItemFromIDList => 12,
-            Self::SHGetDataFromIDListW => 16,
-            Self::SHBindToParent => 16,
-            Self::SHGetSpecialFolderPathW => 16,
-            Self::SHSimpleIDListFromPath => 4,
-            // L3 — Drag-and-drop
-            Self::RegisterDragDrop => 8,
-            Self::DoDragDrop => 16,
-            Self::DragAcceptFiles => 8,
-            Self::DragQueryFileW => 16,
-            Self::DragFinish => 4,
-            // L8 — URL moniker binding
-            Self::CreateURLMoniker => 12,
-            Self::CreateAsyncBindCtx => 16,
-            Self::RegisterBindStatusCallback => 16,
+            | Self::GetTextExtentExPointW
+            | Self::CallNamedPipeW
+            | Self::CreateFileA
+            | Self::ScrollDC
+            | Self::BCryptGenerateSymmetricKey
+            | Self::BCryptHash
+            | Self::BCryptCreateHash
+            | Self::BCryptDeriveKey
+            | Self::BCryptVerifySignature
+            | Self::SteamAPI_ISteamInput_TriggerRepeatedHapticPulse
+            | Self::CreateRemoteThread
+            | Self::ScriptStringAnalyse
+            | Self::ScriptItemize
+            | Self::GdipDrawString
+            | Self::GdipAddPathArc
+            | Self::GdipSetMatrixElements
+            | Self::WinHttpWebSocketCompleteUpgrade => 28,
+            Self::WideCharToMultiByte
+            | Self::ExtTextOutW
+            | Self::CreateNamedPipeW
+            | Self::DeviceIoControl
+            | Self::ScrollWindowEx
+            | Self::BCryptSignHash
+            | Self::CertGetCertificateChain
+            | Self::ScriptStringOut
+            | Self::ScriptPlace
+            | Self::GdipDrawPie
+            | Self::GdipFillPie
+            | Self::GdipDrawArc
+            | Self::GdipCreateLineBrush => 32,
+            Self::WsaRecvFrom
+            | Self::WsaSendTo
+            | Self::LCMapStringEx
+            | Self::RegCreateKeyExA
+            | Self::RegCreateKeyExW
+            | Self::WsaIoctl
+            | Self::UpdateLayeredWindow
+            | Self::ReportEventW
+            | Self::BCryptImportKey
+            | Self::GdipAddPathBezier
+            | Self::GdipMeasureString
+            | Self::GdipMeasureCharacterRanges => 36,
+            Self::ImageList_DrawEx
+            | Self::CreateProcessW
+            | Self::CreateProcessA
+            | Self::BCryptEncrypt
+            | Self::BCryptDecrypt
+            | Self::ScriptShape => 40,
+            Self::CreateWindowExW => 48,
+            Self::CreateFontW
+            | Self::GdipDrawImageRectRect => 56,
             _ => 0,
         }
     }
@@ -65031,18 +65023,28 @@ fn decode_basic_block_cached(
     rip: u64,
 ) -> AppResult<Arc<CachedBlock>> {
     if let Some(cached) = basic_block_cache.get_mut(&rip) {
-        // Skip read_window_matches verification for performance —
-        // self-modifying code is extremely rare.  The block cache is
-        // invalidated explicitly by invalidate_code_write when guest code
-        // writes to code pages.  Trust the cache unless invalidated.
-        {
+        // Verify the cached block still matches guest memory so
+        // self-modifying code refreshes the cache. The check is a single
+        // bounded read (≤ BASIC_BLOCK_MAX_BYTES = 512) into a stack
+        // buffer — no heap allocation on the decode hot path.
+        let len = cached.cached.bytes.len();
+        let mut live = [0u8; BASIC_BLOCK_MAX_BYTES];
+        let live_matches = len > 0
+            && memory.read_into_slice(rip, &mut live[..len]).is_ok()
+            && live[..len] == cached.cached.bytes[..];
+        if live_matches {
             *basic_block_cache_generation = basic_block_cache_generation.saturating_add(1);
             cached.generation = *basic_block_cache_generation;
             basic_block_cache_lru.push_back((rip, cached.generation));
             return Ok(Arc::clone(&cached.cached));
         }
-        // Cache hit path returns above; JIT blocks are invalidated
-        // explicitly by invalidate_code_write when guest code pages change.
+        // Memory changed — evict the stale entry (with its LRU records) and
+        // fall through to re-decode below.
+        let stale_generation = cached.generation;
+        basic_block_cache_lru.retain(|(entry_rip, entry_generation)| {
+            *entry_rip != rip || *entry_generation != stale_generation
+        });
+        basic_block_cache.remove(&rip);
     }
 
     let mut current_rip = rip;
@@ -68673,8 +68675,14 @@ mod tests {
 
         let environment_ptr =
             u64::from(read_u32(&memory, process_parameters + 0x48).expect("environment pointer"));
+        // Real Windows prepends the hidden per-drive current-directory entry
+        // (`=C:=<cwd>`); the process variables follow it in the block.
+        let first_entry =
+            read_utf16_string(&memory, environment_ptr).expect("hidden cwd environment entry");
+        assert_eq!(first_entry, format!("=C:={}", runtime.current_directory));
+        let second_entry_ptr = environment_ptr + (first_entry.encode_utf16().count() as u64 + 1) * 2;
         assert_eq!(
-            read_utf16_string(&memory, environment_ptr).expect("environment"),
+            read_utf16_string(&memory, second_entry_ptr).expect("environment entry"),
             "FOO=BAR"
         );
     }
@@ -69218,6 +69226,84 @@ mod tests {
             Some(7)
         );
         assert!(runtime.pending_guest_threads.is_empty());
+    }
+
+    #[test]
+    fn pumped_guest_thread_real_steam_midfunction_start_reports_fault() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "steam-boot-thread",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        configure_runtime_for_test_arch(&mut runtime, GuestArch::X86);
+        let mut memory = MemoryImage::default();
+
+        let steam_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("ges")
+            .join("steam")
+            .join("drive_c")
+            .join("Steam")
+            .join("Steam.exe");
+        if !steam_path.exists() {
+            return;
+        }
+        let bytes = fs::read(&steam_path).expect("read real steam exe");
+        let image = crate::pe::parse_from_file(&steam_path).expect("parse steam exe");
+        let image_hash = util::sha256_bytes(&bytes);
+        let mapped = crate::pe::map_image(&bytes, &image, &image_hash, true).expect("map steam exe");
+        memory.map_bytes(mapped.selected_base, &mapped.memory);
+        let thread_start = mapped.selected_base + 0xdcee0;
+
+        runtime
+            .seed_process_state(
+                &mut memory,
+                "C:\\Steam\\Steam.exe",
+                &[],
+                mapped.selected_base,
+                image.size_of_image as u64,
+            )
+            .expect("seed process state");
+
+        let resolver = ApiSetResolver::new();
+        let resolved_imports = resolve_imports_for_runtime(&image, &resolver);
+        runtime
+            .bind_imports(mapped.selected_base, &mut memory, &resolved_imports)
+            .expect("bind imports");
+
+        let create_thread = runtime.alloc_host_thunk(HostThunk::CreateThread);
+        let param = runtime
+            .alloc_heap(&mut memory, 0x40, true)
+            .expect("alloc param block");
+        let thread_handle = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            create_thread,
+            &[0, 0, thread_start as u32, param as u32, 0, 0],
+        );
+        assert_ne!(thread_handle, 0);
+        assert_eq!(runtime.pending_guest_threads.len(), 1);
+
+        let pumped = runtime.pump_pending_guest_thread(&mut memory);
+        let error = match pumped {
+            Ok(_) => panic!("pumped thread should derail into a guest fault, not succeed"),
+            Err(error) => error,
+        };
+        // The thread starts at a mid-function label (RVA 0xdcee0 = byte 0x70,
+        // the trailing byte of `pushl 0x54(%eax)` at 0x4dcedf). It can never
+        // run to completion, but the initial EBP frame must keep [ebp±x]
+        // accesses inside the thread's own stack: the derailment must be the
+        // ESI-relative fetch at 0x4dceeb/0x4dcf7c (`mov 0xcc(%esi),%eax` with
+        // ESI unset → address 0xcc), not an [ebp-x] access at 0xffffffb4.
+        let message = format!("{error}");
+        assert!(
+            message.contains("unmapped guest memory at 0xcc"),
+            "unexpected derailment: {message}"
+        );
+        assert!(message.contains("rbp=0x7"), "EBP frame missing: {message}");
     }
 
     #[test]
@@ -70054,6 +70140,69 @@ mod tests {
     }
 
     #[test]
+    fn decode_basic_block_cache_refreshes_when_block_bytes_change() {
+        let rip = 0xE000;
+        let config = CpuEngineConfig::from_profile(
+            GuestArch::X64,
+            "win11-23h2",
+            env!("CARGO_PKG_VERSION"),
+            None,
+        )
+        .expect("cpu config");
+        let mut engine = CpuExecutionEngine::new(config);
+        let mut memory = MemoryImage::default();
+        let mut instruction_cache = U64Map::default();
+        let mut instruction_cache_lru = VecDeque::new();
+        let mut instruction_cache_generation = 0;
+        let mut basic_block_cache = U64Map::default();
+        let mut basic_block_cache_lru = VecDeque::new();
+        let mut basic_block_cache_generation = 0;
+
+        let mut bytes = vec![0x90; 32];
+        bytes[2] = 0xC3;
+        memory.map_bytes(rip, &bytes);
+        let first = decode_basic_block_cached(
+            &mut engine,
+            &memory,
+            &mut instruction_cache,
+            &mut instruction_cache_lru,
+            &mut instruction_cache_generation,
+            INSTRUCTION_CACHE_LIMIT,
+            &mut basic_block_cache,
+            &mut basic_block_cache_lru,
+            &mut basic_block_cache_generation,
+            BASIC_BLOCK_CACHE_LIMIT,
+            rip,
+        )
+        .expect("decode cached block");
+        assert_eq!(first.bytes, vec![0x90, 0x90, 0xC3]);
+
+        memory.map_bytes(
+            rip,
+            &[0xB8, 0x78, 0x56, 0x34, 0x12, 0xC3, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+              0x90, 0x90, 0x90],
+        );
+        let second = decode_basic_block_cached(
+            &mut engine,
+            &memory,
+            &mut instruction_cache,
+            &mut instruction_cache_lru,
+            &mut instruction_cache_generation,
+            INSTRUCTION_CACHE_LIMIT,
+            &mut basic_block_cache,
+            &mut basic_block_cache_lru,
+            &mut basic_block_cache_generation,
+            BASIC_BLOCK_CACHE_LIMIT,
+            rip,
+        )
+        .expect("re-decode after self-modification");
+
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert_eq!(second.bytes, vec![0xB8, 0x78, 0x56, 0x34, 0x12, 0xC3]);
+        assert_eq!(second.end_rip - second.start_rip, 6);
+    }
+
+    #[test]
     fn pe_runtime_d3d11_pixel_shader_thunks_translate_and_bind_dxil() {
         let temp_dir = TempDir::new().expect("temp dir");
         let ge =
@@ -70719,7 +70868,7 @@ mod tests {
         let stack_base = 0x40_000;
         let argc_ptr = 0x41_000;
 
-        runtime.command_line = "\"C:\\\\Program Files\\\\Steam\\\\Steam.exe\" -silent".to_string();
+        runtime.command_line = "\"C:\\Program Files\\Steam\\Steam.exe\" -silent".to_string();
 
         memory.map_bytes(stack_base, &vec![0_u8; 0x100]);
         memory.map_bytes(argc_ptr, &[0; 4]);
