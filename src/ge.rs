@@ -548,7 +548,14 @@ impl GameEnvironment {
         } else {
             sidecar_reparse_points
         };
-        Ok(Self { root, config })
+        let ge = Self { root, config };
+        // Host-init provisioning: bring a pre-existing GE up to the current
+        // layout (e.g. the guest temp directory) when it is opened.  This is
+        // the GE supplying its own infrastructure — NOT guest-driven repair:
+        // the guest filesystem layer never creates directories in response
+        // to a guest operation.
+        ge.ensure_layout()?;
+        Ok(ge)
     }
 
     pub fn save_config(&self) -> AppResult<()> {
@@ -1606,6 +1613,8 @@ impl GameEnvironment {
             self.drive_c()
                 .join(format!("users/{}/AppData/Local", self.config.user_name)),
             self.drive_c()
+                .join(format!("users/{}/AppData/Local/Temp", self.config.user_name)),
+            self.drive_c()
                 .join(format!("users/{}/AppData/LocalLow", self.config.user_name)),
             self.root.join("fs"),
             self.root.join("registry"),
@@ -1789,7 +1798,7 @@ impl GameEnvironment {
         Ok((parent, requested_name, normalized_path))
     }
 
-    fn resolve_existing_path(
+    pub(crate) fn resolve_existing_path(
         &self,
         windows_path: &str,
         long_paths_override: Option<bool>,

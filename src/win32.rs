@@ -826,6 +826,32 @@ struct ComRegistration {
     threading_model: ComThreadingModel,
 }
 
+// ── Filesystem operation contract ───────────────────────────────────────────
+//
+// The guest filesystem layer NEVER creates directories behind the guest's
+// back.  Windows `CreateFileW`/`MoveFileExW`/`CopyFileExW` do not manufacture
+// missing parent directories, and Steam probes failing operations to infer
+// installation state — silent host repair produces impossible guest-visible
+// behavior.
+//
+// * Path resolution (`resolve_host_path`, GE `resolve_existing_path`) is
+//   READ-ONLY: it must never create or repair anything.
+// * Directory creation happens ONLY through the explicit dispositions
+//   (CREATE_NEW / CREATE_ALWAYS / OPEN_ALWAYS), the `create_directory`
+//   entry point, and the explicit move/copy operations — and even those
+//   require the PARENT directory to already exist.
+// * A missing parent directory is a guest-visible error
+//   (ERROR_PATH_NOT_FOUND), never repaired.  The one exception is host
+//   infrastructure that exists independently of any guest operation
+//   (the pipe-socket base directory, GE layout provisioning, staging a
+//   host file into a GE-provisioned temp directory).
+//
+// Error-code contract for missing paths (surfaced via `RcFsPathInvalid` →
+// ERROR_PATH_NOT_FOUND and `RcFsNotFound` → ERROR_FILE_NOT_FOUND at the
+// thunk layer):
+//   * parent missing        → ERROR_PATH_NOT_FOUND
+//   * file missing, parent present → ERROR_FILE_NOT_FOUND
+
 #[derive(Debug, Clone)]
 pub struct Win32Subsystem {
     ge: GameEnvironment,
@@ -1812,6 +1838,12 @@ impl Win32Subsystem {
     /// BEFORE any destructive disposition (CREATE_ALWAYS / TRUNCATE_EXISTING
     /// truncate the file only after the sharing check passes), so a failed
     /// open never destroys file contents.
+    ///
+    /// Missing-parent contract (see the module operation contract): creating
+    /// dispositions never manufacture the parent directory — a missing parent
+    /// is ERROR_PATH_NOT_FOUND, and OPEN_EXISTING / TRUNCATE_EXISTING
+    /// distinguish a missing parent (ERROR_PATH_NOT_FOUND) from a missing
+    /// file inside a present parent (ERROR_FILE_NOT_FOUND).
     #[allow(clippy::too_many_arguments)]
     pub fn create_file_w_extended(
         &mut self,
@@ -1867,7 +1899,11 @@ impl Win32Subsystem {
             ));
         }
         // Fail-fast disposition checks that never touch the filesystem and
-        // short-circuit before any share interaction.
+        // short-circuit before any share interaction.  Windows does not
+        // manufacture missing parent directories: a missing PARENT is
+        // ERROR_PATH_NOT_FOUND, a missing FILE inside a present parent is
+        // ERROR_FILE_NOT_FOUND (see the operation contract above).
+        let parent_resolves = self.parent_directory_exists(&normalized_path);
         match creation {
             CreationDisposition::CreateNew if exists => {
                 return Err(AppError::new(
@@ -1875,13 +1911,34 @@ impl Win32Subsystem {
                     format!("{} already exists", normalized_path),
                 ));
             }
-            CreationDisposition::OpenExisting | CreationDisposition::TruncateExisting
-                if !exists =>
+            CreationDisposition::CreateNew
+            | CreationDisposition::CreateAlways
+            | CreationDisposition::OpenAlways
+                if !exists && !parent_resolves =>
             {
                 return Err(AppError::new(
-                    ReasonCode::RcFsNotFound,
-                    format!("{} does not exist", normalized_path),
+                    ReasonCode::RcFsPathInvalid,
+                    format!(
+                        "parent directory of {} does not exist",
+                        normalized_path
+                    ),
                 ));
+            }
+            CreationDisposition::OpenExisting | CreationDisposition::TruncateExisting if !exists => {
+                return Err(if parent_resolves {
+                    AppError::new(
+                        ReasonCode::RcFsNotFound,
+                        format!("{} does not exist", normalized_path),
+                    )
+                } else {
+                    AppError::new(
+                        ReasonCode::RcFsPathInvalid,
+                        format!(
+                            "parent directory of {} does not exist",
+                            normalized_path
+                        ),
+                    )
+                });
             }
             _ => {}
         }
@@ -1902,7 +1959,8 @@ impl Win32Subsystem {
                 | CreationDisposition::CreateNew
                     if !host_path.exists() =>
                 {
-                    self.ensure_parent_exists(&host_path)?;
+                    // The fail-fast parent check above already verified the
+                    // parent resolves; a plain create must never repair it.
                     fs::write(&host_path, []).map_err(|error| {
                         AppError::from_io(
                             ReasonCode::RcIo,
@@ -2615,7 +2673,21 @@ impl Win32Subsystem {
     ) -> AppResult<()> {
         let (from_norm, from_host) = self.resolve_host_path(from)?;
         let (to_norm, to_host) = self.resolve_host_path(to)?;
-        self.ensure_parent_exists(&to_host)?;
+        // Windows does not create the destination's parent directory: a
+        // missing source is ERROR_FILE_NOT_FOUND, a missing destination
+        // parent is ERROR_PATH_NOT_FOUND (see the operation contract).
+        if !from_host.exists() {
+            return Err(AppError::new(
+                ReasonCode::RcFsNotFound,
+                format!("{} does not exist", from_norm),
+            ));
+        }
+        if !self.parent_directory_exists(&to_norm) {
+            return Err(AppError::new(
+                ReasonCode::RcFsPathInvalid,
+                format!("parent directory of {} does not exist", to_norm),
+            ));
+        }
         if replace_existing && to_host.exists() {
             if to_host.is_dir() {
                 fs::remove_dir_all(&to_host).map_err(|error| {
@@ -2657,7 +2729,21 @@ impl Win32Subsystem {
                 format!("{} already exists", to_norm),
             ));
         }
-        self.ensure_parent_exists(&to_host)?;
+        // Windows does not create the destination's parent directory: a
+        // missing source is ERROR_FILE_NOT_FOUND, a missing destination
+        // parent is ERROR_PATH_NOT_FOUND.
+        if !from_host.exists() {
+            return Err(AppError::new(
+                ReasonCode::RcFsNotFound,
+                format!("{} does not exist", from_norm),
+            ));
+        }
+        if !self.parent_directory_exists(&to_norm) {
+            return Err(AppError::new(
+                ReasonCode::RcFsPathInvalid,
+                format!("parent directory of {} does not exist", to_norm),
+            ));
+        }
         let copied = fs::copy(&from_host, &to_host).map_err(|error| {
             AppError::from_io(
                 ReasonCode::RcIo,
@@ -2675,14 +2761,17 @@ impl Win32Subsystem {
             "C:\\users\\{}\\AppData\\Local\\Temp\\",
             self.ge.config.user_name
         );
-        let (_, host_path) = self.resolve_host_path(path.trim_end_matches(['\\', '/']))?;
-        fs::create_dir_all(&host_path).map_err(|error| {
-            AppError::from_io(
-                ReasonCode::RcIo,
-                format!("failed to create {}", host_path.display()),
-                &error,
-            )
-        })?;
+        let (normalized_path, host_path) =
+            self.resolve_host_path(path.trim_end_matches(['\\', '/']))?;
+        // GetTempPathW must not create the directory; the GE provisions the
+        // guest temp directory (see `GameEnvironment::ensure_layout`).  A
+        // missing directory is a guest-visible ERROR_PATH_NOT_FOUND.
+        if !host_path.exists() {
+            return Err(AppError::new(
+                ReasonCode::RcFsPathInvalid,
+                format!("temp directory {} does not exist", normalized_path),
+            ));
+        }
         Ok(path)
     }
 
@@ -2694,13 +2783,14 @@ impl Win32Subsystem {
         };
         let (normalized_directory, host_directory) =
             self.resolve_host_path(temp_path.trim_end_matches(['\\', '/']))?;
-        fs::create_dir_all(&host_directory).map_err(|error| {
-            AppError::from_io(
-                ReasonCode::RcIo,
-                format!("failed to create {}", host_directory.display()),
-                &error,
-            )
-        })?;
+        // GetTempFileNameW does not create directories either: the target
+        // directory must already exist, otherwise ERROR_PATH_NOT_FOUND.
+        if !host_directory.exists() {
+            return Err(AppError::new(
+                ReasonCode::RcFsPathInvalid,
+                format!("directory {} does not exist", normalized_directory),
+            ));
+        }
         // A dedicated monotonic counter keeps consecutive calls unique even
         // when no handle is created in between (Windows guarantees unique
         // names; `next_handle` only advances on handle creation).
@@ -2725,7 +2815,6 @@ impl Win32Subsystem {
             }
         };
         self.next_temp_file_serial = serial.wrapping_add(1);
-        self.ensure_parent_exists(&host_path)?;
         fs::write(&host_path, []).map_err(|error| {
             AppError::from_io(
                 ReasonCode::RcIo,
@@ -3598,7 +3687,10 @@ impl Win32Subsystem {
         // Compute UDS path if not explicitly provided
         let uds_path = uds_socket_path.unwrap_or_else(|| pipe_name_to_uds_path(&normalized));
 
-        // Ensure the socket base directory exists
+        // Ensure the socket base directory exists.  HOST-internal
+        // infrastructure, not a guest-visible path: the pipe-socket base
+        // lives outside the guest drive layout and is created independently
+        // of any guest operation (see the filesystem operation contract).
         if let Err(e) = std::fs::create_dir_all(PIPE_SOCKET_BASE_DIR) {
             eprintln!(
                 "[win32] failed to create pipe socket base dir '{}': {e}",
@@ -4530,6 +4622,22 @@ impl Win32Subsystem {
         Ok((parsed.normalized_path, root))
     }
 
+    /// Whether the guest-visible PARENT directory of `normalized_path`
+    /// resolves through the GE — i.e. exists from the guest's point of
+    /// view.  This discriminates ERROR_PATH_NOT_FOUND (missing parent)
+    /// from ERROR_FILE_NOT_FOUND (missing file inside a present parent).
+    /// Read-only: resolution must never create anything.
+    fn parent_directory_exists(&self, normalized_path: &str) -> bool {
+        let Some(parent) = normalized_path.rsplit_once('\\').map(|(p, _)| p) else {
+            return false;
+        };
+        self.ge.resolve_existing_path(parent, None, 0).is_ok()
+    }
+
+    /// Host-internal helper used ONLY by `stage_host_file_w` (staging a
+    /// host-side payload — e.g. the main module — into the GE-provisioned
+    /// guest temp directory).  Guest-visible operations must never call
+    /// this: a missing parent is a guest-visible ERROR_PATH_NOT_FOUND.
     fn ensure_parent_exists(&self, path: &Path) -> AppResult<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|error| {
@@ -5239,6 +5347,8 @@ mod tests {
         let host_path = ge
             .host_path_for_windows_path("C:\\logs\\bootstrap_log.txt")
             .expect("resolve host path");
+        // Host-internal test setup: seed the log file directly (the guest
+        // filesystem layer never creates this directory itself).
         fs::create_dir_all(host_path.parent().expect("log parent")).expect("create log dir");
         fs::write(&host_path, b"log").expect("write log file");
 
@@ -5727,6 +5837,207 @@ mod tests {
         assert!(
             result.is_err(),
             "OpenExisting on missing file should fail, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn create_new_missing_parent_returns_path_not_found() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "cfpn01", GeArch::X86, "win11-23h2")
+            .expect("create game environment");
+        let mut win32 = Win32Subsystem::new(ge, false);
+
+        // CREATE_NEW at a path whose parent does not exist must fail with
+        // ERROR_PATH_NOT_FOUND (3) — and must NOT create the parent.
+        for disposition in [
+            CreationDisposition::CreateNew,
+            CreationDisposition::CreateAlways,
+            CreationDisposition::OpenAlways,
+        ] {
+            let result = win32.create_file_w(
+                "C:\\nonexistent_dir\\file.txt",
+                FileAccess::read_write(),
+                ShareMode::none(),
+                disposition,
+                false,
+                false,
+                false,
+            );
+            let error = result.expect_err("missing parent must fail");
+            assert_eq!(
+                error.code, ReasonCode::RcFsPathInvalid,
+                "missing parent must surface as ERROR_PATH_NOT_FOUND (3) for {disposition:?}"
+            );
+            let host_parent = win32
+                .guest_path_to_host_path("C:\\nonexistent_dir")
+                .expect("resolve host parent");
+            assert!(
+                !host_parent.exists(),
+                "host parent must not be created behind the guest's back"
+            );
+        }
+    }
+
+    #[test]
+    fn open_existing_missing_parent_returns_path_not_found() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "oepn01", GeArch::X86, "win11-23h2")
+            .expect("create game environment");
+        let mut win32 = Win32Subsystem::new(ge, false);
+
+        // Parent missing → ERROR_PATH_NOT_FOUND (3).
+        let result = win32.create_file_w(
+            "C:\\no_parent_dir\\file.txt",
+            FileAccess::read_only(),
+            ShareMode::read_only(),
+            CreationDisposition::OpenExisting,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(
+            result.expect_err("missing parent must fail").code,
+            ReasonCode::RcFsPathInvalid,
+            "OpenExisting with a missing parent must be ERROR_PATH_NOT_FOUND"
+        );
+
+        // File missing, parent present → ERROR_FILE_NOT_FOUND (2).
+        let result = win32.create_file_w(
+            "C:\\no_such_file.dat",
+            FileAccess::read_only(),
+            ShareMode::read_only(),
+            CreationDisposition::OpenExisting,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(
+            result.expect_err("missing file must fail").code,
+            ReasonCode::RcFsNotFound,
+            "OpenExisting with a present parent must be ERROR_FILE_NOT_FOUND"
+        );
+    }
+
+    #[test]
+    fn truncate_existing_missing_file_returns_file_not_found() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "tep01", GeArch::X86, "win11-23h2")
+            .expect("create game environment");
+        let mut win32 = Win32Subsystem::new(ge, false);
+
+        // TRUNCATE_EXISTING on a missing file (parent present) is
+        // ERROR_FILE_NOT_FOUND (2) — same as OPEN_EXISTING.
+        let result = win32.create_file_w(
+            "C:\\missing_for_truncate.txt",
+            FileAccess::read_write(),
+            ShareMode::none(),
+            CreationDisposition::TruncateExisting,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(
+            result.expect_err("missing file must fail").code,
+            ReasonCode::RcFsNotFound,
+            "TruncateExisting on a missing file must be ERROR_FILE_NOT_FOUND"
+        );
+    }
+
+    #[test]
+    fn create_new_with_existing_parent_still_works() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "cpep01", GeArch::X86, "win11-23h2")
+            .expect("create game environment");
+        let mut win32 = Win32Subsystem::new(ge, false);
+
+        win32
+            .create_directory_w("C:\\existing_dir")
+            .expect("create parent directory");
+
+        let h = win32
+            .create_file_w(
+                "C:\\existing_dir\\fresh.txt",
+                FileAccess::read_write(),
+                ShareMode::none(),
+                CreationDisposition::CreateNew,
+                false,
+                false,
+                false,
+            )
+            .expect("CREATE_NEW with an existing parent must create the file");
+        win32.close_handle(h).expect("close");
+        assert!(
+            win32
+                .guest_path_to_host_path("C:\\existing_dir\\fresh.txt")
+                .expect("resolve host path")
+                .exists(),
+            "created file must exist on the host"
+        );
+
+        // CREATE_NEW on the now-existing file is ERROR_ALREADY_EXISTS.
+        let result = win32.create_file_w(
+            "C:\\existing_dir\\fresh.txt",
+            FileAccess::read_write(),
+            ShareMode::none(),
+            CreationDisposition::CreateNew,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(
+            result.expect_err("existing file must fail").code,
+            ReasonCode::RcFsAlreadyExists,
+            "CREATE_NEW on an existing file must be ERROR_ALREADY_EXISTS"
+        );
+    }
+
+    #[test]
+    fn move_file_ex_destination_parent_missing_returns_path_not_found() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "mvpn01", GeArch::X86, "win11-23h2")
+            .expect("create game environment");
+        let mut win32 = Win32Subsystem::new(ge, false);
+
+        let h = win32
+            .create_file_w(
+                "C:\\src.txt",
+                FileAccess::read_write(),
+                ShareMode::none(),
+                CreationDisposition::CreateAlways,
+                false,
+                false,
+                false,
+            )
+            .expect("seed source file");
+        win32.close_handle(h).expect("close");
+
+        let result = win32.move_file_ex_w("C:\\src.txt", "C:\\no_dest_parent\\dst.txt", false);
+        assert_eq!(
+            result.expect_err("missing destination parent must fail").code,
+            ReasonCode::RcFsPathInvalid,
+            "MoveFileEx with a missing destination parent must be ERROR_PATH_NOT_FOUND"
+        );
+        assert!(
+            win32
+                .guest_path_to_host_path("C:\\src.txt")
+                .expect("resolve host path")
+                .exists(),
+            "source must survive a failed move"
+        );
+        assert!(
+            !win32
+                .guest_path_to_host_path("C:\\no_dest_parent")
+                .expect("resolve host path")
+                .exists(),
+            "destination parent must not be created"
+        );
+
+        // A missing SOURCE is ERROR_FILE_NOT_FOUND.
+        let result = win32.move_file_ex_w("C:\\no_such_src.txt", "C:\\dst.txt", false);
+        assert_eq!(
+            result.expect_err("missing source must fail").code,
+            ReasonCode::RcFsNotFound,
+            "MoveFileEx with a missing source must be ERROR_FILE_NOT_FOUND"
         );
     }
 

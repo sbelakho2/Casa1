@@ -649,6 +649,11 @@ impl RealFilesystem {
     }
 
     /// Initialize the filesystem by creating required directories.
+    ///
+    /// HOST-init infrastructure: this runs once at setup, independent of any
+    /// guest operation, to provide the standard guest drive layout.  Guest
+    /// operations themselves never create directories (see the win32 layer
+    /// operation contract).
     pub fn initialize(&self) -> AppResult<()> {
         let root = self.resolver.ge_root();
         let dirs = [
@@ -710,6 +715,11 @@ impl RealFilesystem {
     /// enforced against other open handles; `options.delete_on_close`
     /// implements `FILE_FLAG_DELETE_ON_CLOSE` (the file is removed when the
     /// handle drops).
+    ///
+    /// Windows semantics: opening NEVER creates parent directories.  A
+    /// missing parent is a guest-visible error (ERROR_PATH_NOT_FOUND) and
+    /// is never repaired; the caller must have created it explicitly with
+    /// `create_directory`.
     pub fn open_file_with_options(
         &self,
         windows_path: &str,
@@ -742,18 +752,9 @@ impl RealFilesystem {
             ));
         }
 
-        // Ensure parent directory exists (containment was verified in
-        // resolve() above; the parent creation cannot escape the root).
-        if let Some(parent) = real_path.parent() {
-            fs::create_dir_all(parent).map_err(|e| {
-                AppError::new(
-                    ReasonCode::RcCliInvalid,
-                    format!("cannot create parent dir: {e}"),
-                )
-            })?;
-        }
-
         // Open existing only (create/truncate are gated on write access).
+        // Deliberately NO parent creation here: Windows open semantics never
+        // manufacture missing parents (see the doc comment above).
         let mut open_options = fs::OpenOptions::new();
         open_options.read(can_read).write(can_write);
 
@@ -818,40 +819,28 @@ impl RealFilesystem {
     }
 
     /// Move/rename a file.
+    ///
+    /// Windows semantics: the destination's parent directory must already
+    /// exist; it is never created here.
     pub fn move_file(&self, src: &str, dst: &str) -> AppResult<()> {
         self.authorize_path(src, false)?;
         self.authorize_path(dst, true)?;
         let src_path = self.resolver.resolve(src)?;
         let dst_path = self.resolver.resolve(dst)?;
 
-        if let Some(parent) = dst_path.parent() {
-            fs::create_dir_all(parent).map_err(|e| {
-                AppError::new(
-                    ReasonCode::RcCliInvalid,
-                    format!("cannot create parent dir: {e}"),
-                )
-            })?;
-        }
-
         fs::rename(&src_path, &dst_path)
             .map_err(|e| AppError::new(ReasonCode::RcIo, format!("cannot move file: {e}")))
     }
 
     /// Copy a file.
+    ///
+    /// Windows semantics: the destination's parent directory must already
+    /// exist; it is never created here.
     pub fn copy_file(&self, src: &str, dst: &str) -> AppResult<u64> {
         self.authorize_path(src, false)?;
         self.authorize_path(dst, true)?;
         let src_path = self.resolver.resolve(src)?;
         let dst_path = self.resolver.resolve(dst)?;
-
-        if let Some(parent) = dst_path.parent() {
-            fs::create_dir_all(parent).map_err(|e| {
-                AppError::new(
-                    ReasonCode::RcCliInvalid,
-                    format!("cannot create parent dir: {e}"),
-                )
-            })?;
-        }
 
         fs::copy(&src_path, &dst_path)
             .map_err(|e| AppError::new(ReasonCode::RcIo, format!("cannot copy file: {e}")))
@@ -1168,6 +1157,9 @@ impl RealFilesystem {
         let real_path = self.resolver.resolve(path)?;
         let ads_path = Self::ads_sidecar_path(&real_path, stream_name);
 
+        // HOST-internal infrastructure: the `.casa1_ads` sidecar directory is
+        // a host bookkeeping area, not a guest-visible path — creating it is
+        // not guest-driven repair.
         if let Some(parent) = ads_path.parent() {
             fs::create_dir_all(parent).map_err(|e| {
                 AppError::new(
@@ -2336,6 +2328,41 @@ mod tests {
     // -----------------------------------------------------------------------
     // Share-mode and delete-on-close tests
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn open_file_with_options_does_not_create_parents() {
+        let (tmp, fs) = setup_fs();
+
+        // create=true must NOT manufacture the missing parent directory:
+        // the open fails and the host parent stays absent.
+        let result = fs.open_file_with_options(
+            "C:\\missing_dir\\file.txt",
+            false,
+            true,
+            true,
+            false,
+            OpenFileOptions::default(),
+        );
+        assert!(
+            result.is_err(),
+            "open with a missing parent must fail, got {result:?}"
+        );
+        assert!(
+            !tmp.path().join("drive_c").join("missing_dir").exists(),
+            "opening must not create the parent directory"
+        );
+
+        // move/copy into a missing parent also fail without creating it.
+        fs.create_directory("C:\\sub").unwrap();
+        {
+            let mut f = fs.open_file("C:\\sub\\data.txt", false, true, true, false).unwrap();
+            f.write(b"data").unwrap();
+        }
+        assert!(fs.move_file("C:\\sub\\data.txt", "C:\\no_move_dir\\out.txt").is_err());
+        assert!(fs.copy_file("C:\\sub\\data.txt", "C:\\no_copy_dir\\out.txt").is_err());
+        assert!(!tmp.path().join("drive_c").join("no_move_dir").exists());
+        assert!(!tmp.path().join("drive_c").join("no_copy_dir").exists());
+    }
 
     #[test]
     fn open_file_enforces_share_modes() {
